@@ -825,6 +825,9 @@ $(error You did not select a library that handles bootstrapping! (e.g., ukboot))
 endif
 
 ifeq ($(CONFIG_OPTIMIZE_LTO), y)
+ifeq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
+$(error PARTIAL_LINKER_TYPE=raw does not support link-time optimization; disable CONFIG_OPTIMIZE_LTO or use a driver partial linker)
+endif
 ifeq ($(call have_gcc),y)
 ifneq ($(call gcc_version_ge,6,1),y)
 $(error Your gcc version does not support incremental link time optimisation)
