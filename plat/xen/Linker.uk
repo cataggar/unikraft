@@ -52,6 +52,23 @@ XEN_LD_SCRIPT_FLAGS += $(addprefix -Wl$(comma)-T$(comma),\
 XEN_LD_SCRIPT_DEPS := $(XEN_LD_SCRIPT_INPUTS)
 endif
 
+$(eval $(call add_build_graph_link_stage,xen,partial-link,partial-link,\
+	$(XEN_IMAGE).ld.o))
+$(eval $(call add_build_graph_link_inputs,xen,partial-link,object,\
+	$(XEN_OLIBS) $(XEN_OLIBS-y) $(UK_OLIBS) $(UK_OLIBS-y)))
+$(eval $(call add_build_graph_link_inputs,xen,partial-link,archive,\
+	$(XEN_ALIBS) $(XEN_ALIBS-y) $(UK_ALIBS) $(UK_ALIBS-y)))
+$(eval $(call add_build_graph_link_stage,xen,localize,objcopy-localize,\
+	$(XEN_IMAGE).o))
+$(eval $(call add_build_graph_link_inputs,xen,localize,intermediate,\
+	$(XEN_IMAGE).ld.o))
+$(eval $(call add_build_graph_link_stage,xen,final-link,link,\
+	$(XEN_DEBUG_IMAGE)))
+$(eval $(call add_build_graph_link_inputs,xen,final-link,linker-script,\
+	$(XEN_LD_SCRIPT_DEPS)))
+$(eval $(call add_build_graph_link_inputs,xen,final-link,intermediate,\
+	$(XEN_IMAGE).o))
+
 $(XEN_DEBUG_IMAGE): $(XEN_ALIBS) $(XEN_ALIBS-y) $(XEN_OLIBS) $(XEN_OLIBS-y) \
 		    $(UK_ALIBS) $(UK_ALIBS-y) $(UK_OLIBS) $(UK_OLIBS-y) \
 		    $(XEN_LD_SCRIPT_DEPS) $(UK_LDEPS)
