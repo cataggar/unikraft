@@ -592,6 +592,8 @@ unexport CONFIG_CROSS_COMPILE
 unexport CONFIG_LLVM_TARGET_ARCH
 unexport CONFIG_COMPILER
 unexport CONFIG_LINKER
+unexport CONFIG_PARTIAL_LINKER
+unexport CONFIG_PARTIAL_LINKER_TYPE
 unexport CONFIG_COMPILER_TARGETED
 #unexport CC
 #unexport LD
@@ -641,6 +643,22 @@ else
 	CONFIG_LINKER := $(CONFIG_COMPILER)
 endif
 
+ifneq ("$(origin PARTIAL_LINKER)","undefined")
+	CONFIG_PARTIAL_LINKER := $(PARTIAL_LINKER:"%"=%)
+else
+	CONFIG_PARTIAL_LINKER := $(CONFIG_LINKER)
+endif
+
+ifneq ("$(origin PARTIAL_LINKER_TYPE)","undefined")
+	CONFIG_PARTIAL_LINKER_TYPE := $(PARTIAL_LINKER_TYPE:"%"=%)
+else
+	CONFIG_PARTIAL_LINKER_TYPE := driver
+endif
+
+ifneq ($(filter $(CONFIG_PARTIAL_LINKER_TYPE),driver raw),$(CONFIG_PARTIAL_LINKER_TYPE))
+$(error Unsupported PARTIAL_LINKER_TYPE '$(CONFIG_PARTIAL_LINKER_TYPE)' (expected 'driver' or 'raw'))
+endif
+
 # COMPILER_TARGETED=y declares that the compiler command selects its target
 # itself instead of being an architecture-prefixed executable, for example
 # `zig cc -target aarch64-freestanding-none`. Such a command must not be
@@ -663,8 +681,19 @@ else
 CONFIG_COMPILER_CROSS_COMPILE := $(CONFIG_CROSS_COMPILE)
 endif
 
-# Make variables (CC, etc...)
+# Make variables (CC, etc...). A multiword tool command already identifies the
+# executable to run and must not have a cross prefix inserted into its first
+# word (for example, `zig ld.lld`).
+ifneq ($(word 2,$(CONFIG_LINKER)),)
+LD		:= $(CONFIG_LINKER)
+else
 LD		:= $(CONFIG_CROSS_COMPILE)$(CONFIG_LINKER)
+endif
+ifneq ($(word 2,$(CONFIG_PARTIAL_LINKER)),)
+PARTIAL_LD	:= $(CONFIG_PARTIAL_LINKER)
+else
+PARTIAL_LD	:= $(CONFIG_CROSS_COMPILE)$(CONFIG_PARTIAL_LINKER)
+endif
 CC		:= $(CONFIG_COMPILER_CROSS_COMPILE)$(CONFIG_COMPILER)
 CPP		:= $(CC)
 CXX		:= $(CPP)
@@ -678,6 +707,7 @@ RUSTC		:= rustc
 endif
 AS		:= $(CC)
 AR		:= $(CONFIG_CROSS_COMPILE)gcc-ar
+RANLIB		:= $(CONFIG_CROSS_COMPILE)gcc-ranlib
 NM		:= $(CONFIG_CROSS_COMPILE)gcc-nm
 READELF		:= $(CONFIG_CROSS_COMPILE)readelf
 STRIP		:= $(CONFIG_CROSS_COMPILE)strip
@@ -1262,6 +1292,9 @@ endif
 	@echo '                            skipped if its path was specified with `E=` at the same time.)'
 	@echo '  COMPILER=[COMMAND]      - C compiler command (default: gcc)'
 	@echo '  LINKER=[COMMAND]        - linker driver command (default: COMPILER)'
+	@echo '  PARTIAL_LINKER=[COMMAND] - relocatable library linker command (default: LINKER)'
+	@echo '  PARTIAL_LINKER_TYPE=TYPE - interface used by PARTIAL_LINKER: driver or raw'
+	@echo '                            (default: driver)'
 	@echo '  COMPILER_TARGETED=[y|n] - the COMPILER command already selects its target (e.g.'
 	@echo '                            `zig cc -target aarch64-freestanding-none`). CROSS_COMPILE is then'
 	@echo '                            not prepended to it and no architecture default target flag is added.'

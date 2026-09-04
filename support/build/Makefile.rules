@@ -354,6 +354,18 @@ $(if $(shell $(MKDIR) -p "$(_d)" && cd "$(_d)" >/dev/null && pwd),,\
      $(error could not create directory "$(_d)"))
 endef
 
+# Raw linkers do not understand compiler-driver-only options or the driver's
+# -Wl,<option>,<argument> forwarding syntax.
+partial_linker_driver_only_flags := -nostdlib -nostdinc -no-pie
+partial_linker_start_group_flag = -Wl$(comma)--start-group
+partial_linker_end_group_flag = -Wl$(comma)--end-group
+partial_linker_raw_flag = $(if $(filter -Wl$(comma)%,$(1)),\
+	$(subst $(comma),$(space),$(patsubst -Wl$(comma)%,%,$(1))),\
+	$(if $(filter $(partial_linker_driver_only_flags),$(1)),,$(1)))
+partial_linker_flags = $(if $(filter raw,$(CONFIG_PARTIAL_LINKER_TYPE)),\
+	$(strip $(foreach _flag,$(1),$(call partial_linker_raw_flag,$(_flag)))),\
+	$(1))
+
 ################################################################################
 #
 # Command calling
@@ -1030,19 +1042,20 @@ $(call libname2preolib,$(1)): $$($(call vprefix_lib,$(1),OBJS)) \
 			      $$($(call vprefix_lib,$(1),LDEPS)) \
 			      $$($(call vprefix_lib,$(1),LDEPS-y))
 	$(call build_cmd,LD,,$(call libname2preolib,$(1)),\
-		$(LD) $$(LIBLDFLAGS) $$(LIBLDFLAGS-y) \
+		$(PARTIAL_LD) $$(call partial_linker_flags,\
+		      $$(LIBLDFLAGS) $$(LIBLDFLAGS-y) \
 		      $$($(call vprefix_lib,$(1),LDFLAGS)) \
-		      $$($(call vprefix_lib,$(1),LDFLAGS-y)) \
+		      $$($(call vprefix_lib,$(1),LDFLAGS-y))) \
 		      $$($(call vprefix_lib,$(1),OBJS)) \
 		      $$($(call vprefix_lib,$(1),OBJS-y)) \
 		      $$(EACHOLIB_OBJS) \
 		      $$(EACHOLIB_OBJS-y) \
-		      -Wl$(comma)--start-group \
+		      $$(call partial_linker_flags,$$(partial_linker_start_group_flag)) \
 		      $$($(call vprefix_lib,$(1),ALIBS)) \
 		      $$($(call vprefix_lib,$(1),ALIBS-y)) \
 		      $$(EACHOLIB_ALIBS) \
 		      $$(EACHOLIB_ALIBS-y) \
-		      -Wl$(comma)--end-group \
+		      $$(call partial_linker_flags,$$(partial_linker_end_group_flag)) \
 		      -o $(call libname2preolib,$(1)))
 
 $(call libname2olib,$(1)): $(call libname2preolib,$(1)) \

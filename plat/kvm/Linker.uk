@@ -1,13 +1,17 @@
 ifeq (x86_64,$(CONFIG_UK_ARCH))
 ifeq ($(CONFIG_KVM_BOOT_PROTO_MULTIBOOT),y)
+ifneq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
 KVM_LDFLAGS-y += -Wl,-m,elf_x86_64
+endif
 KVM_LDFLAGS-y += -Wl,--entry=_multiboot_entry
 ELF64_TO_32 = y
 else ifeq ($(CONFIG_KVM_BOOT_PROTO_LXBOOT),y)
 KVM_LDFLAGS-y += -Wl,--entry=_lxboot_entry
 else ifeq ($(CONFIG_KVM_BOOT_PROTO_EFI_STUB),y)
 KVM_LDFLAGS-y += -Wl,--entry=uk_efi_entry64
+ifneq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
 KVM_LDFLAGS-y += -Wl,-m,elf_x86_64
+endif
 endif
 else ifeq (arm64,$(CONFIG_UK_ARCH))
 ifeq ($(CONFIG_KVM_BOOT_PROTO_LXBOOT),y)
@@ -15,11 +19,15 @@ LINUX_HDR_ARM64 := y
 endif
 ifeq ($(CONFIG_KVM_BOOT_PROTO_EFI_STUB),y)
 KVM_LDFLAGS-y += -Wl,--entry=uk_efi_entry64
+ifneq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
 KVM_LDFLAGS-y += -Wl,-m,aarch64elf
+endif
 KVM_LDLIBS-y += -lgcc
 else
 KVM_LDFLAGS-y += -Wl,--entry=_libkvmplat_entry
+ifneq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
 KVM_LDFLAGS-y += -Wl,-m,aarch64elf
+endif
 KVM_LDLIBS-y += -lgcc
 endif
 endif
@@ -43,15 +51,33 @@ endif
 KVM_DEBUG_IMAGE := $(KVM_IMAGE).dbg
 KVM_COMPILE_DB_IMAGE := $(BUILD_DIR)/compile_commands.json
 
+KVM_LD_SCRIPT_INPUTS := $(UK_PLAT_KVM_DEF_LDS) \
+			$(KVM_LD_SCRIPT-y) $(EXTRA_LD_SCRIPT-y)
+
+# Some compiler drivers that need a raw partial linker retain only the last
+# -T option. Merge supplemental INSERT scripts into the platform script.
+ifeq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
+KVM_COMBINED_LD_SCRIPT := $(BUILD_DIR)/kvm-combined.lds
+KVM_LD_SCRIPT_MERGER := $(CONFIG_UK_BASE)/support/build/merge-linker-scripts.py
+
+$(KVM_COMBINED_LD_SCRIPT): $(KVM_LD_SCRIPT_INPUTS) $(KVM_LD_SCRIPT_MERGER)
+	$(call build_cmd,GEN,,$@,\
+		$(PYTHON) $(KVM_LD_SCRIPT_MERGER) \
+			$(KVM_COMBINED_LD_SCRIPT) $(KVM_LD_SCRIPT_INPUTS))
+
+KVM_LD_SCRIPT_FLAGS := -Wl$(comma)-T$(comma)$(KVM_COMBINED_LD_SCRIPT)
+KVM_LD_SCRIPT_DEPS := $(KVM_COMBINED_LD_SCRIPT)
+else
 KVM_LD_SCRIPT_FLAGS := $(addprefix -Wl$(comma)-dT$(comma),\
 			 $(UK_PLAT_KVM_DEF_LDS))
 KVM_LD_SCRIPT_FLAGS += $(addprefix -Wl$(comma)-T$(comma),\
 			$(KVM_LD_SCRIPT-y) $(EXTRA_LD_SCRIPT-y))
+KVM_LD_SCRIPT_DEPS := $(KVM_LD_SCRIPT_INPUTS)
+endif
 
 $(KVM_DEBUG_IMAGE): $(KVM_ALIBS) $(KVM_ALIBS-y) $(KVM_OLIBS) $(KVM_OLIBS-y) \
 		    $(UK_ALIBS) $(UK_ALIBS-y) $(UK_OLIBS) $(UK_OLIBS-y) \
-		    $(KVM_LD_SCRIPT-y) $(EXTRA_LD_SCRIPT-y) \
-		    $(UK_PLAT_KVM_DEF_LDS) $(UK_LDEPS)
+		    $(KVM_LD_SCRIPT_DEPS) $(UK_LDEPS)
 	$(call build_cmd,LD,,$@,\
 	       $(LD) \
 			$(KVM_LDFLAGS) $(KVM_LDFLAGS-y) \
@@ -112,3 +138,4 @@ endif
 
 # ...for cleaning:
 LIBKVMPLAT_CLEAN += $(call build_clean,$(KVM_DEBUG_IMAGE).bootinfo)
+LIBKVMPLAT_CLEAN += $(call build_clean,$(KVM_COMBINED_LD_SCRIPT))
