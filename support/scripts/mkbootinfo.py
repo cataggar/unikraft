@@ -5,12 +5,14 @@
 # You may not use this file except in compliance with the License.
 
 import argparse
-import subprocess
 import re
 import os
 
+from elf_tools import configured_tool, tool_output
+
 SECINFO_EXP = r"^\s*\d+\s+\.uk_bootinfo\s+([0-9,a-f]+)"
 PHDRS_EXP = r"^\s+LOAD.+vaddr\s(0x[0-9,a-f]+).+\n.+memsz\s(0x[0-9,a-f]+)\sflags\s([rwx|-]{3})$"
+OBJDUMP = configured_tool("OBJDUMP", "objdump")
 
 # Memory region types (see include/uk/plat/memory.h)
 UKPLAT_MEMRT_KERNEL = 0x0004  # Kernel binary segment
@@ -73,7 +75,7 @@ def main():
     # Check for the presence and size of the .uk_bootinfo section. We want
     # to create a binary blob that has exactly this size so we can replace it
     # in the binary.
-    out = subprocess.check_output(["objdump", "-h", opt.kernel])
+    out = tool_output(OBJDUMP, "-h", opt.kernel)
     match = re.findall(SECINFO_EXP, out.decode("utf-8"), re.MULTILINE)
 
     if len(match) != 1:
@@ -82,7 +84,7 @@ def main():
     bootsec_size = int(match[0], 16)
 
     # Retrieve info about ELF segments in unikernel
-    out = subprocess.check_output(["objdump", "-p", opt.kernel])
+    out = tool_output(OBJDUMP, "-p", opt.kernel)
     phdrs = re.findall(PHDRS_EXP, out.decode("utf-8"), re.MULTILINE)
 
     # Make sure they are sorted by their addresses
