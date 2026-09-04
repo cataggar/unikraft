@@ -592,6 +592,7 @@ unexport CONFIG_CROSS_COMPILE
 unexport CONFIG_LLVM_TARGET_ARCH
 unexport CONFIG_COMPILER
 unexport CONFIG_LINKER
+unexport CONFIG_COMPILER_TARGETED
 #unexport CC
 #unexport LD
 #unexport AR
@@ -640,11 +641,31 @@ else
 	CONFIG_LINKER := $(CONFIG_COMPILER)
 endif
 
+# COMPILER_TARGETED=y declares that the compiler command selects its target
+# itself instead of being an architecture-prefixed executable, for example
+# `zig cc -target aarch64-freestanding-none`. Such a command must not be
+# prefixed with CONFIG_CROSS_COMPILE and architectures must not inject their
+# own default target flag. The linker driver and the binutils keep using
+# CONFIG_CROSS_COMPILE.
+ifneq ("$(origin COMPILER_TARGETED)","undefined")
+	CONFIG_COMPILER_TARGETED := $(COMPILER_TARGETED:"%"=%)
+else
+	CONFIG_COMPILER_TARGETED := n
+endif
+
 $(eval $(call verbose_include,$(CONFIG_UK_BASE)/arch/$(UK_FAMILY)/Compiler.uk))
+
+# Cross prefix of the compiler command. It is dropped for target-aware
+# compiler commands, all other tools keep CONFIG_CROSS_COMPILE.
+ifeq ($(CONFIG_COMPILER_TARGETED),y)
+CONFIG_COMPILER_CROSS_COMPILE :=
+else
+CONFIG_COMPILER_CROSS_COMPILE := $(CONFIG_CROSS_COMPILE)
+endif
 
 # Make variables (CC, etc...)
 LD		:= $(CONFIG_CROSS_COMPILE)$(CONFIG_LINKER)
-CC		:= $(CONFIG_CROSS_COMPILE)$(CONFIG_COMPILER)
+CC		:= $(CONFIG_COMPILER_CROSS_COMPILE)$(CONFIG_COMPILER)
 CPP		:= $(CC)
 CXX		:= $(CPP)
 GOC		:= $(CONFIG_CROSS_COMPILE)gccgo
@@ -1241,6 +1262,10 @@ endif
 	@echo '                            skipped if its path was specified with `E=` at the same time.)'
 	@echo '  COMPILER=[COMMAND]      - C compiler command (default: gcc)'
 	@echo '  LINKER=[COMMAND]        - linker driver command (default: COMPILER)'
+	@echo '  COMPILER_TARGETED=[y|n] - the COMPILER command already selects its target (e.g.'
+	@echo '                            `zig cc -target aarch64-freestanding-none`). CROSS_COMPILE is then'
+	@echo '                            not prepended to it and no architecture default target flag is added.'
+	@echo '                            LINKER and the binutils keep using CROSS_COMPILE. (default: n)'
 	@echo ''
 	@echo 'Environment variables:'
 	@echo '  UK_ASFLAGS             - explicit Unikraft-specific additions to the assembler flags (the ASFLAGS variable is ignored)'

@@ -39,6 +39,12 @@ define have_clang =
 $(if $(filter Clang,$(CC_NAME)),y,n)
 endef
 
+# test if the compiler command selects its target itself (COMPILER_TARGETED=y),
+# e.g. `zig cc -target aarch64-freestanding-none`
+define have_compiler_target =
+$(if $(filter y,$(CONFIG_COMPILER_TARGETED)),y,n)
+endef
+
 # Return the first argument when the compiler supports it, otherwise the second.
 # cc-option $option,$fallback
 define cc-option =
