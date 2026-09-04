@@ -17,7 +17,24 @@ jobs:
         run: echo "PR_NUMBER=$(echo ${{ github.event.number }} | sed 's/\//\\\//g')" >> "$GITHUB_ENV"
         shell: bash
 
+      # governctl authenticates as a bot user, which only exists on the
+      # upstream repository. Forks have no such account, so skip cleanly
+      # rather than failing every pull request.
+      - name: Check governctl configuration
+        id: config
+        run: |
+          if [ -n "${GOVERN_GITHUB_USER}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=governctl::GH_CHECKPATCH_ACTOR is not configured for ${GITHUB_REPOSITORY}; skipping label sync."
+          fi
+        shell: bash
+        env:
+          GOVERN_GITHUB_USER: ${{ secrets.GH_CHECKPATCH_ACTOR }}
+
       - name: Install governctl
+        if: steps.config.outputs.configured == 'true'
         run: |
           set -xe
           wget -q "https://github.com/unikraft/governance/releases/download/v${GOVERN_VERSION}/governance_${GOVERN_VERSION}_linux_amd64.deb"
@@ -26,7 +43,8 @@ jobs:
           GOVERN_VERSION: 0.1.9
 
       - name: Label PR
-        run: governctl pr sync labels "unikraft/unikraft/${PR_NUMBER}" --labels-dir .github/labels
+        if: steps.config.outputs.configured == 'true'
+        run: governctl pr sync labels "${GITHUB_REPOSITORY}/${PR_NUMBER}" --labels-dir .github/labels
         env:
           GOVERN_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOVERN_GITHUB_USER: ${{ secrets.GH_CHECKPATCH_ACTOR }}
