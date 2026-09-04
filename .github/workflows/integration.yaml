@@ -7,7 +7,7 @@ on:
 
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [staging]
+    branches: [staging, zig16]
     paths-ignore: ['*.md']
 
 jobs:
@@ -261,6 +261,97 @@ jobs:
         output="${RUNNER_TEMP}/zig-qemu.log"
         set +e
         timeout 30s qemu-system-x86_64 \
+          -kernel "${image}" \
+          -nographic \
+          -no-reboot \
+          2>&1 | tee "${output}"
+        status=${PIPESTATUS[0]}
+        set -e
+        test "${status}" -eq 0
+        grep --fixed-strings --quiet 'Hello world!' "${output}"
+
+  zig-helloworld-arm64:
+    name: zig-helloworld-arm64
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Load configuration
+      uses: ./.github/actions/ci-versions
+
+    - name: Fetch helloworld
+      uses: actions/checkout@v4
+      with:
+        repository: unikraft/app-helloworld
+        fetch-depth: 1
+        path: _helloworld
+
+    # The runner stays x86_64: Zig cross-compiles to AArch64, while the GNU
+    # linker driver and binutils have to be the AArch64 cross-toolchain.
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          bison \
+          flex \
+          libncurses-dev \
+          gcc-aarch64-linux-gnu \
+          binutils-aarch64-linux-gnu \
+          qemu-system-arm
+
+    - name: Install Zig
+      run: |
+        archive="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
+        directory="${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}"
+        curl --fail --location --silent --show-error \
+          "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+          --output "${archive}"
+        echo "${ZIG_X86_64_LINUX_SHA256}  ${archive}" | sha256sum --check
+        tar --extract --xz --file "${archive}" --directory "${RUNNER_TEMP}"
+        echo "${directory}" >> "${GITHUB_PATH}"
+
+    - name: Build helloworld with Zig
+      run: |
+        test "$(zig version)" = "${ZIG_VERSION}"
+        rm -rf "${RUNNER_TEMP}/build-zig-arm64"
+        make \
+          A="${GITHUB_WORKSPACE}/_helloworld" \
+          O="${RUNNER_TEMP}/build-zig-arm64" \
+          UK_DEFCONFIG="${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-arm64" \
+          defconfig
+        make \
+          A="${GITHUB_WORKSPACE}/_helloworld" \
+          O="${RUNNER_TEMP}/build-zig-arm64" \
+          COMPILER='zig cc -target aarch64-freestanding-none' \
+          COMPILER_TARGETED=y \
+          LINKER=gcc \
+          UK_CFLAGS=-std=gnu17 \
+          -j"$(nproc)"
+
+    - name: Inspect Zig image
+      run: |
+        image="${RUNNER_TEMP}/build-zig-arm64/helloworld_qemu-arm64.dbg"
+        file "${image}"
+        readelf --file-header "${image}" | grep --quiet 'Class:.*ELF64'
+        readelf --file-header "${image}" | grep --quiet 'Machine:.*AArch64'
+        ! readelf --program-headers "${image}" | grep --quiet INTERP
+        ! readelf --dynamic "${image}" 2>/dev/null | grep --quiet NEEDED
+        # Column 7 is the section index, column 8 the symbol name. The unnamed
+        # null symbol is always undefined and is therefore skipped.
+        undefined="$(readelf --wide --symbols "${image}" | awk '$7 == "UND" && $8 != ""')"
+        test -z "${undefined}"
+
+    - name: Boot Zig image
+      run: |
+        image="${RUNNER_TEMP}/build-zig-arm64/helloworld_qemu-arm64"
+        output="${RUNNER_TEMP}/zig-qemu-arm64.log"
+        set +e
+        timeout 30s qemu-system-aarch64 \
+          -machine virt \
+          -cpu cortex-a53 \
           -kernel "${image}" \
           -nographic \
           -no-reboot \
