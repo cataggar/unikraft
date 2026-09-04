@@ -591,6 +591,7 @@ ifeq ($(UK_HAVE_DOT_CONFIG),y)
 unexport CONFIG_CROSS_COMPILE
 unexport CONFIG_LLVM_TARGET_ARCH
 unexport CONFIG_COMPILER
+unexport CONFIG_LINKER
 #unexport CC
 #unexport LD
 #unexport AR
@@ -633,11 +634,16 @@ else
 	CONFIG_COMPILER := gcc
 endif
 
+ifneq ("$(origin LINKER)","undefined")
+	CONFIG_LINKER := $(LINKER:"%"=%)
+else
+	CONFIG_LINKER := $(CONFIG_COMPILER)
+endif
 
 $(eval $(call verbose_include,$(CONFIG_UK_BASE)/arch/$(UK_FAMILY)/Compiler.uk))
 
 # Make variables (CC, etc...)
-LD		:= $(CONFIG_CROSS_COMPILE)$(CONFIG_COMPILER)
+LD		:= $(CONFIG_CROSS_COMPILE)$(CONFIG_LINKER)
 CC		:= $(CONFIG_CROSS_COMPILE)$(CONFIG_COMPILER)
 CPP		:= $(CC)
 CXX		:= $(CPP)
@@ -1233,6 +1239,8 @@ endif
 	@echo '                            is applied to every internal and external import of libraries, platforms,'
 	@echo '                            and applications. For example, an external library (via `L=`) will also be'
 	@echo '                            skipped if its path was specified with `E=` at the same time.)'
+	@echo '  COMPILER=[COMMAND]      - C compiler command (default: gcc)'
+	@echo '  LINKER=[COMMAND]        - linker driver command (default: COMPILER)'
 	@echo ''
 	@echo 'Environment variables:'
 	@echo '  UK_ASFLAGS             - explicit Unikraft-specific additions to the assembler flags (the ASFLAGS variable is ignored)'

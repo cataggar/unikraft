@@ -39,6 +39,12 @@ define have_clang =
 $(if $(filter Clang,$(CC_NAME)),y,n)
 endef
 
+# Return the first argument when the compiler supports it, otherwise the second.
+# cc-option $option,$fallback
+define cc-option =
+$(shell if $(CC) $(1) -Werror -x c -c /dev/null -o /dev/null >/dev/null 2>&1; then printf '%s' '$(1)'; else printf '%s' '$(2)'; fi)
+endef
+
 # test whether CC version is greater than or equal to the minimum requirement
 # cc_version_ge $cc_major,$cc_minor
 define cc_version_ge =

@@ -25,8 +25,9 @@ ISR_ARCHFLAGS-$(call gcc_version_ge,7,1) += -mgeneral-regs-only
 
 ARCHFLAGS-$(CONFIG_MARCH_X86_64_NATIVE)         += -march=native
 ISR_ARCHFLAGS-$(CONFIG_MARCH_X86_64_NATIVE)     += -march=native
-ARCHFLAGS-$(CONFIG_MARCH_X86_64_GENERIC)        += -mtune=generic
-ISR_ARCHFLAGS-$(CONFIG_MARCH_X86_64_GENERIC)    += -mtune=generic
+X86_64_GENERIC_TUNE := $(call cc-option,-mtune=generic)
+ARCHFLAGS-$(CONFIG_MARCH_X86_64_GENERIC)        += $(X86_64_GENERIC_TUNE)
+ISR_ARCHFLAGS-$(CONFIG_MARCH_X86_64_GENERIC)    += $(X86_64_GENERIC_TUNE)
 ARCHFLAGS-$(CONFIG_MARCH_X86_64_NOCONA)         += -march=nocona
 ISR_ARCHFLAGS-$(CONFIG_MARCH_X86_64_NOCONA)     += -march=nocona
 ARCHFLAGS-$(CONFIG_MARCH_X86_64_CORE2)          += -march=core2
