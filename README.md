@@ -181,18 +181,25 @@ rejected and must use dedicated facade options where available.
 
 Invoke only one Make-backed named step per `zig build` command. A portable,
 non-blocking file lock rejects overlapping Make processes rather than allowing
-selected steps such as `clean all` to race. All facade invocations use the same
-`unikraft-zig-facade.lock` in the canonical OS runtime directory (`TMPDIR`,
-`TEMP`, or `TMP`, with the platform default as fallback), so parent/nested
-outputs, different Zig caches, applications, and checkouts cannot overlap. The
-runtime directory must be outside every output tree; the persistent lock file
-is never unlinked while held. Before invoking Make, the runner makes the locked
-descriptor inheritable and replaces its own process image with the backend.
-Make and its descendants therefore retain the same lock even if the original
-runner PID is killed; the lock is released normally after the complete backend
-tree exits. Hosts without process-image replacement are refused rather than
-running without this lifetime guarantee. Run separate commands when multiple
-phases are needed.
+selected steps such as `clean all` to race. For each effective UID, facade
+invocations use one lock in a private `unikraft-zig-facade-<uid>` directory
+beneath the OS runtime root (`TMPDIR`, `TEMP`, or `TMP`, with the platform
+default as fallback). The facade requires that directory to be owned by the
+current user with mode `0700`, and the regular, single-link lock to have mode
+`0600`; symlinks and unsafe ownership or permissions are refused. The
+surrounding runtime root must itself be an owner-secure directory or a
+root-owned sticky shared directory. This preserves same-user serialization
+across parent/nested outputs, caches, applications, and checkouts without
+allowing one user to lock out another.
+
+The private runtime directory must be outside every output tree; its persistent
+lock file is never unlinked while held. Before invoking Make, the runner makes
+the locked descriptor inheritable and replaces its own process image with the
+backend. Make and its descendants therefore retain the same lock even if the
+original runner PID is killed; the lock is released normally after the complete
+backend tree exits. Hosts without process-image replacement are refused rather
+than running without this lifetime guarantee. Run separate commands when
+multiple phases are needed.
 
 Non-destructive builds may use an external `-Dconfig`. The `distclean` step is
 stricter because Make deletes the configuration and sibling metadata: every
@@ -201,7 +208,8 @@ the facade refuses `distclean` and leaves manual cleanup to the user.
 `zig build test` runs the facade's path, argument, and lock unit checks.
 `python3 -m unittest -v support.scripts.tests.test_zig_facade` adds
 end-to-end metacharacter, cross-checkout parent/nested output, and orphaned
-backend-tree lock-lifetime coverage.
+backend-tree lock-lifetime coverage, including hostile pre-existing runtime
+entries and fallback temporary-root selection.
 
 The experimental QEMU/x86_64 Zig compiler setup becomes:
 

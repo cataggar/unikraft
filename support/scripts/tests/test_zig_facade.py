@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
 
+import fcntl
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import time
 import unittest
@@ -31,6 +33,7 @@ class ZigFacadeIntegrationTest(unittest.TestCase):
         cls.log = cls.work / "make-events.jsonl"
         for path in (cls.runtime, cls.global_cache, cls.app):
             path.mkdir(parents=True)
+        cls.runtime.chmod(0o755)
 
         cls.make = cls.work / "fake-make.py"
         cls.make.write_text(
@@ -122,15 +125,17 @@ with log.open("a", encoding="utf-8") as stream:
             *extra,
         ]
 
-    def facade_env(self, **overrides):
+    def facade_env(self, runtime_variable="TMPDIR", **overrides):
         env = os.environ.copy()
+        for name in ("TMPDIR", "TEMP", "TMP"):
+            env.pop(name, None)
         env.update(
             {
-                "TMPDIR": str(self.runtime),
                 "ZIG_GLOBAL_CACHE_DIR": str(self.global_cache),
                 "ZIG_FACADE_TEST_LOG": str(self.log),
             }
         )
+        env[runtime_variable] = str(self.runtime)
         env.update(overrides)
         return env
 
@@ -279,7 +284,11 @@ with log.open("a", encoding="utf-8") as stream:
             first_stdout, _ = first.communicate(timeout=15)
         self.assertEqual(first.returncode, 0, first_stdout)
 
-        lock = self.runtime.resolve() / "unikraft-zig-facade.lock"
+        lock = (
+            self.runtime.resolve()
+            / f"unikraft-zig-facade-{os.geteuid()}"
+            / "build.lock"
+        )
         self.assertTrue(lock.is_file())
         self.assertFalse(lock.is_relative_to(parent_output.resolve()))
 
@@ -352,6 +361,167 @@ with log.open("a", encoding="utf-8") as stream:
             len([e for e in self.read_events() if e["event"] == "START"]),
             2,
         )
+
+    def test_uid_private_runtime_rejects_unsafe_preexisting_state(self):
+        checkout = self.checkouts[0]
+        cache = self.work / "secure-runtime-cache"
+        output = self.work / "outputs" / "secure-runtime"
+        private = self.runtime / f"unikraft-zig-facade-{os.geteuid()}"
+        simulated_other = self.runtime / f"unikraft-zig-facade-{os.geteuid() + 1}"
+
+        simulated_other.mkdir(mode=0o700)
+        other_lock = simulated_other / "build.lock"
+        other_lock.touch(mode=0o600)
+        other_lock.chmod(0o600)
+        default_env = self.facade_env(runtime_variable="TEMP")
+        invocation = self.work / "invoke-secure-runtime"
+        invocation.mkdir(exist_ok=True)
+
+        with other_lock.open("r+", encoding="utf-8") as other_stream:
+            fcntl.flock(other_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            first = subprocess.run(
+                self.facade_command(checkout, cache, output),
+                cwd=invocation,
+                env=default_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=60,
+                check=False,
+            )
+        self.assertEqual(first.returncode, 0, first.stdout)
+        lock = private / "build.lock"
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o700)
+        self.assertEqual(private.stat().st_uid, os.geteuid())
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        self.assertEqual(lock.stat().st_uid, os.geteuid())
+        self.assertEqual(lock.stat().st_nlink, 1)
+        inode = lock.stat().st_ino
+
+        repeated = subprocess.run(
+            self.facade_command(checkout, cache, output),
+            cwd=invocation,
+            env=default_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stdout)
+        self.assertEqual(lock.stat().st_ino, inode)
+
+        shutil.rmtree(private)
+        symlink_target = self.work / "symlink-directory-target"
+        symlink_target.mkdir()
+        private.symlink_to(symlink_target, target_is_directory=True)
+        symlink_directory = subprocess.run(
+            self.facade_command(checkout, cache, output),
+            cwd=invocation,
+            env=default_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertNotEqual(symlink_directory.returncode, 0)
+        self.assertIn("insecure UID-scoped", symlink_directory.stdout)
+        private.unlink()
+
+        private.mkdir(mode=0o755)
+        private.chmod(0o755)
+        wrong_directory_mode = subprocess.run(
+            self.facade_command(checkout, cache, output),
+            cwd=invocation,
+            env=default_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertNotEqual(wrong_directory_mode.returncode, 0)
+        self.assertIn("current-user-owned 0700", wrong_directory_mode.stdout)
+        private.chmod(0o700)
+
+        lock_target = self.work / "symlink-lock-target"
+        lock_target.write_text("do not follow", encoding="utf-8")
+        lock.symlink_to(lock_target)
+        symlink_lock = subprocess.run(
+            self.facade_command(checkout, cache, output),
+            cwd=invocation,
+            env=default_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertNotEqual(symlink_lock.returncode, 0)
+        self.assertIn("insecure Zig facade lock file", symlink_lock.stdout)
+        lock.unlink()
+
+        lock.touch(mode=0o644)
+        lock.chmod(0o644)
+        wrong_lock_mode = subprocess.run(
+            self.facade_command(checkout, cache, output),
+            cwd=invocation,
+            env=default_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertNotEqual(wrong_lock_mode.returncode, 0)
+        self.assertIn("current-user-owned 0600", wrong_lock_mode.stdout)
+        lock.chmod(0o600)
+
+        hardlink = private / "build-link"
+        os.link(lock, hardlink)
+        hardlinked_lock = subprocess.run(
+            self.facade_command(checkout, cache, output),
+            cwd=invocation,
+            env=default_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertNotEqual(hardlinked_lock.returncode, 0)
+        self.assertIn("with one link", hardlinked_lock.stdout)
+        hardlink.unlink()
+        lock.unlink()
+
+        self.runtime.chmod(0o777)
+        unsafe_temp_root = subprocess.run(
+            self.facade_command(checkout, cache, output),
+            cwd=invocation,
+            env=default_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertNotEqual(unsafe_temp_root.returncode, 0)
+        self.assertIn("refusing insecure temporary root", unsafe_temp_root.stdout)
+        self.runtime.chmod(0o755)
+
+        shutil.rmtree(private)
+        recovered = subprocess.run(
+            self.facade_command(checkout, cache, output),
+            cwd=invocation,
+            env=default_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stdout)
 
 
 if __name__ == "__main__":
