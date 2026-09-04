@@ -4,6 +4,11 @@ import argparse
 import subprocess
 import re
 
+from elf_tools import configured_tool, tool_output
+
+NM = configured_tool("NM", "nm")
+READELF = configured_tool("READELF", "readelf")
+
 ELF_MACHINE = {"x86_64": 62, "arm64": 183}  # EM_X86_64  # EM_AARCH64
 
 PE_MACHINE = {
@@ -106,7 +111,7 @@ def elf_phdr_to_pe_sec(base_addr, phdr):
 # Get the absolute value of symbol, as seen through `nm`
 def get_sym_val(elf, sym):
     exp = r"^\s*" + r"([a-f0-9]+)" + r"\s+[A-Za-z]\s+" + sym + r"$"
-    out = subprocess.check_output(["nm", elf])  # nosec
+    out = tool_output(NM, elf)
 
     re_out = re.findall(exp, out.decode("ASCII"), re.MULTILINE)
     if len(re_out) != 1:
@@ -149,8 +154,7 @@ def get_loadable_phdrs(elf):
         + HEXNUM_EXP
         + r"$"
     )
-    args = ["readelf", "-l", elf]
-    out = subprocess.check_output(args, stderr=subprocess.DEVNULL)  # nosec
+    out = tool_output(READELF, "-l", elf, stderr=subprocess.DEVNULL)
     re_out = re.findall(exp, out.decode("ASCII"), re.MULTILINE)
 
     return [

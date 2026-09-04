@@ -5,18 +5,20 @@
 
 import os
 import argparse
-import subprocess
 import re
 from struct import unpack
 
+from elf_tools import configured_tool, tool_output
+
 ELF64_EHDR_LEN = 64
 ELF64_SHDR_LEN = 64
+NM = configured_tool("NM", "nm")
 
 
 def get_sym_val(elf, sym):
     """Get the absolute value of symbol, as seen through `nm`"""
     exp = r"^\s*" + r"([a-f0-9]+)" + r"\s+[A-Za-z]\s+" + sym + r"$"
-    out = subprocess.check_output(["nm", elf])  # nosec
+    out = tool_output(NM, elf)
 
     re_out = re.findall(exp, out.decode("ASCII"), re.MULTILINE)
     if len(re_out) != 1:

@@ -5,8 +5,12 @@
 # You may not use this file except in compliance with the License.
 
 import argparse
-import subprocess
 import re
+
+from elf_tools import configured_tool, tool_output
+
+NM = configured_tool("NM", "nm")
+READELF = configured_tool("READELF", "readelf")
 
 # Generic regex for the type of an ELF section's entry
 TYPE_EXP = r"[a-zA-Z0-9_]+"
@@ -73,7 +77,7 @@ def get_rela_dyn_sec_exp():
 # value in hexadecimal.
 def get_rela_dyn_secs(elf):
     rela_dyn_sec_exp = get_rela_dyn_sec_exp()
-    out = subprocess.check_output(["readelf", "-r", elf])
+    out = tool_output(READELF, "-r", elf)
     re_out = re.findall(rela_dyn_sec_exp, out.decode("ASCII"), re.MULTILINE)
 
     rela_dyn_secs = []
@@ -151,7 +155,7 @@ def get_shdr_exp():
 # Return a dictionary only with the relevant fields described above
 def get_shdrs(elf):
     sh_exp = get_shdr_exp()
-    out = subprocess.check_output(["readelf", "-S", elf])
+    out = tool_output(READELF, "-S", elf)
     re_out = re.findall(sh_exp, out.decode("ASCII"), re.MULTILINE)
 
     shdrs = []
@@ -201,7 +205,7 @@ def get_dyn_sec_exp():
 # Return a dictionary only with the relevant fields described above
 def get_dyn_secs(elf):
     dyn_sec_exp = get_dyn_sec_exp()
-    out = subprocess.check_output(["readelf", "-d", elf])
+    out = tool_output(READELF, "-d", elf)
     re_out = re.findall(dyn_sec_exp, out.decode("ASCII"), re.MULTILINE)
 
     dyn_secs = []
@@ -241,7 +245,7 @@ x86_ignore_sym_substring = "_start16"
 
 def get_nm_syms(elf, sym):
     nm_sym_exp = get_nm_sym_exp(sym)
-    out = subprocess.check_output(["nm", elf])
+    out = tool_output(NM, elf)
 
     _nm_syms = re.findall(nm_sym_exp, out.decode("ASCII"), re.MULTILINE)
 

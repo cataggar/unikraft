@@ -309,12 +309,14 @@ jobs:
 
         # A command may begin a file or follow a shell separator. Requiring
         # that boundary avoids treating GCC-like source path components as
-        # executables.
-        gcc_command='(^|[;&|]|:=)[[:space:]]*(env([[:space:]]+[^[:space:]=]+=[^[:space:]]+)*)?[[:space:]]*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\+\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)'
+        # executables. Check environment tool selections separately because
+        # the selected command is executed later by a Python image script.
+        gcc_command="(^|[;&|])[[:space:]]*(env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)[[:space:]]+)*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)"
+        gcc_assignment="(^|[;&|])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=['\"]?(env[[:space:]]+([^[:space:]=]+=[^[:space:]]+[[:space:]]+)*)?((ccache|command)[[:space:]]+)?([^[:space:]\"';|&]*/)?([^/[:space:]\"';|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:]\"';|&]|$)"
         gcc_found=0
         for command_file in "${command_files[@]}"; do
           if grep --with-filename --line-number --extended-regexp \
-            "${gcc_command}" "${command_file}"; then
+            "${gcc_command}|${gcc_assignment}" "${command_file}"; then
             gcc_found=1
           fi
         done

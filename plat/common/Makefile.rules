@@ -10,17 +10,20 @@ endif
 
 define build_bootinfo =
 	$(call build_cmd,UKBI,,$(1).bootinfo,\
-		$(SCRIPTS_DIR)/mkbootinfo.py $(1) $(1).bootinfo $(BINFO_FLAGS) && \
+		OBJDUMP="$(OBJDUMP)" $(SCRIPTS_DIR)/mkbootinfo.py \
+			$(1) $(1).bootinfo $(BINFO_FLAGS) && \
 		$(OBJCOPY) $(1) --update-section .uk_bootinfo=$(1).bootinfo)
 endef
 
 define build_efi =
-	$(call build_cmd,MKEFI,,$(1).efi,$(SCRIPTS_DIR)/mkefi.py $(1))
+	$(call build_cmd,MKEFI,,$(1).efi,\
+		NM="$(NM)" READELF="$(READELF)" $(SCRIPTS_DIR)/mkefi.py $(1))
 endef
 
 define build_linux =
 	$(call build_cmd,OBJCOPY,,$(1).bin, $(OBJCOPY) -O binary $(1))
-	$(call build_cmd,MKLINUX,,$(1).img, $(SCRIPTS_DIR)/mklinux.py $(1) $(2))
+	$(call build_cmd,MKLINUX,,$(1).img,\
+		NM="$(NM)" $(SCRIPTS_DIR)/mklinux.py $(1) $(2))
 endef
 
 define build_compile_db =
