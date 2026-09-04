@@ -220,6 +220,7 @@ jobs:
           libncurses-dev \
           llvm \
           make \
+          python3 \
           qemu-system-x86 \
           tar \
           xz-utils
@@ -273,6 +274,8 @@ jobs:
           "O=${build}"
           "HOSTCC=zig cc"
           "HOSTCXX=zig c++"
+          # Kconfig's kernel-style list sentinel is intentionally null-derived.
+          "HOSTCFLAGS=-fno-sanitize=null"
           "COMPILER=zig cc -target x86_64-freestanding-none"
           "PARTIAL_LINKER=zig ld.lld"
           "PARTIAL_LINKER_TYPE=raw"
@@ -293,10 +296,29 @@ jobs:
         build_status=("${PIPESTATUS[@]}")
         set -e
 
-        # Match GCC only where a shell could execute it, not in source paths or
-        # compiler diagnostics that merely mention its name.
-        gcc_command='(^|[;&|])[[:space:]]*(env([[:space:]]+[^[:space:]=]+=[^[:space:]]+)*)?[[:space:]]*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\+\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)'
-        if grep --line-number --extended-regexp "${gcc_command}" "${log}"; then
+        mapfile -d '' command_files < <(
+          find "${build}" -type f -name '*.cmd' \
+            ! -path "${build}/kconfig/*" \
+            ! -path "${build}/include/config/*" \
+            -size +0c -print0
+        )
+        if [ "${#command_files[@]}" -eq 0 ]; then
+          echo "The target build generated no command files to audit." >&2
+          exit 1
+        fi
+
+        # A command may begin a file or follow a shell separator. Requiring
+        # that boundary avoids treating GCC-like source path components as
+        # executables.
+        gcc_command='(^|[;&|]|:=)[[:space:]]*(env([[:space:]]+[^[:space:]=]+=[^[:space:]]+)*)?[[:space:]]*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\+\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)'
+        gcc_found=0
+        for command_file in "${command_files[@]}"; do
+          if grep --with-filename --line-number --extended-regexp \
+            "${gcc_command}" "${command_file}"; then
+            gcc_found=1
+          fi
+        done
+        if [ "${gcc_found}" -ne 0 ]; then
           echo "The target build invoked a GCC command." >&2
           exit 1
         fi
@@ -351,9 +373,10 @@ jobs:
           -nographic \
           -no-reboot \
           2>&1 | tee "${output}"
-        status=${PIPESTATUS[0]}
+        status=("${PIPESTATUS[@]}")
         set -e
-        test "${status}" -eq 0
+        test "${status[1]}" -eq 0
+        test "${status[0]}" -eq 0
         grep --fixed-strings --quiet 'Hello world!' "${output}"
 
   zig-helloworld-arm64:

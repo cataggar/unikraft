@@ -143,6 +143,7 @@ make \
   PARTIAL_LINKER_TYPE=raw \
   HOSTCC='zig cc' \
   HOSTCXX='zig c++' \
+  HOSTCFLAGS='-fno-sanitize=null' \
   AR='zig ar' \
   NM=llvm-nm \
   OBJCOPY=llvm-objcopy \
@@ -155,9 +156,11 @@ make \
 
 Omitting `LINKER` makes the final link use Zig's compiler driver, while
 `PARTIAL_LINKER` uses Zig's bundled LLD for relocatable links. The x86_64 build
-does not require GCC, but it does require the LLVM binary tools listed above
-(`llvm` on Debian and Ubuntu). Pass `HOSTCC='zig cc'` and `HOSTCXX='zig c++'`
-to configuration targets such as `defconfig` as well as to the build.
+does not require GCC, but it does require Python 3 and the LLVM binary tools
+listed above (`python3` and `llvm` on Debian and Ubuntu). The narrow
+`HOSTCFLAGS` exception accommodates Kconfig's kernel-style, null-derived list
+sentinel. Pass the host compiler settings and flag to configuration targets
+such as `defconfig` as well as to the build.
 
 For QEMU/ARM64, `COMPILER_TARGETED=y` tells the build that the compiler command
 already selects its own target, so the AArch64 cross prefix is not prepended to
