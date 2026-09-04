@@ -17,17 +17,26 @@ The JSON document is deterministic and has `schema_version: 1`. It contains:
   image-name override;
 - selected platforms and their registered platform libraries;
 - all enabled libraries, source definitions, parsed preprocessing suffixes,
-  variants, object paths, generated outputs, and exposed dependencies;
+  variants, object and archive inputs, generated outputs, and exposed
+  dependencies;
 - preprocessing outputs, compiler dependency-file paths, and link
   dependencies;
 - linker scripts; and
 - final debug and image outputs, with auxiliary outputs (such as the compile
   database) identified separately.
 
-Lists and object keys are sorted. Absolute paths below the build, Unikraft,
-application, and external library/platform roots use stable placeholders such
-as `$BUILD_DIR`, `$UK_BASE`, `$APP_DIR`, and `$LIB_FOO_BASE`. This avoids
-embedding checkout-specific paths while preserving path identity.
+Entity indexes (`libraries` and `platforms`) and object keys are sorted. Arrays
+whose order affects linking retain registration order and use stable
+first-occurrence de-duplication. These include source variants, library object
+and archive inputs, platform libraries, and `final_link.inputs`.
+
+Absolute paths below the build, Unikraft, application, and external
+library/platform roots use stable placeholders. Built-in placeholders are
+`$BUILD_DIR`, `$UK_BASE`, and `$APP_DIR`. External component placeholders
+encode the component name without loss (for example, library `lib-a` uses
+`$LIB_6C69622D61_BASE`) and are described by `path_roots`. This avoids
+checkout-specific paths and prevents distinct component names from collapsing
+onto one token.
 
 The Make backend emits an internal ten-column, tab-separated record stream to
 `O/.build-graph.records`. `support/scripts/build-graph.py` is the sole

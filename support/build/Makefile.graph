@@ -83,13 +83,20 @@ $(foreach P,$(BUILD_GRAPH_PLATFORMS),\
 	$(if $(filter $(1),$($(call uc,$(P))_LIBS) $($(call uc,$(P))_LIBS-y)),\
 		$(call build_graph_emit,library-platform,$(1),$(P))))\
 $(foreach O,$($(call uc,$(1))_OBJS) $($(call uc,$(1))_OBJS-y),\
-	$(call build_graph_emit,library-object,$(1),$(O)))\
+	$(call build_graph_emit,library-object,$(1),$(O))\
+	$(call build_graph_emit,library-link-input,$(1),partial,object,$(O),library))\
+$(foreach O,$(EACHOLIB_OBJS) $(EACHOLIB_OBJS-y),\
+	$(call build_graph_emit,library-link-input,$(1),partial,object,$(O),each-library))\
+$(foreach A,$($(call uc,$(1))_ALIBS) $($(call uc,$(1))_ALIBS-y),\
+	$(call build_graph_emit,library-archive,$(1),$(A))\
+	$(call build_graph_emit,library-link-input,$(1),partial,archive,$(A),library))\
+$(foreach A,$(EACHOLIB_ALIBS) $(EACHOLIB_ALIBS-y),\
+	$(call build_graph_emit,library-link-input,$(1),partial,archive,$(A),each-library))\
 $(foreach L,$($(call uc,$(1))_LDS) $($(call uc,$(1))_LDS-y),\
 	$(call build_graph_emit,library-linker-script,$(1),$(L)))\
 $(foreach D,$($(call uc,$(1))_LDEPS) $($(call uc,$(1))_LDEPS-y),\
 	$(call build_graph_emit,library-link-dependency,$(1),$(D)))\
-$(foreach S,$($(call uc,$(1))_SRCS) $($(call uc,$(1))_SRCS-y) \
-	    $(EACHOLIB_SRCS) $(EACHOLIB_SRCS-y),\
+$(foreach S,$($(call uc,$(1))_BUILD_GRAPH_SRCS),\
 	$(call build_graph_emit_source,$(1),$(S)))
 endef
 
@@ -109,6 +116,10 @@ build-graph:
 			$(UK_PLAT_$(call uc,$(P))_LINKER))\
 		$(foreach L,$($(call uc,$(P))_LIBS) $($(call uc,$(P))_LIBS-y),\
 			$(call build_graph_emit,platform-library,$(P),$(L)))\
+		$(foreach O,$($(call uc,$(P))_OLIBS) $($(call uc,$(P))_OLIBS-y),\
+			$(call build_graph_emit,platform-object-input,$(P),$(O)))\
+		$(foreach A,$($(call uc,$(P))_ALIBS) $($(call uc,$(P))_ALIBS-y),\
+			$(call build_graph_emit,platform-archive-input,$(P),$(A)))\
 		$(foreach L,$(UK_PLAT_$(call uc,$(P))_DEF_LDS) \
 			    $($(call uc,$(P))_LD_SCRIPT) \
 			    $($(call uc,$(P))_LD_SCRIPT-y) \
@@ -121,6 +132,19 @@ build-graph:
 		$(call build_graph_emit,preprocess-output,$(P)))
 	$(foreach D,$(UK_DEPS) $(UK_DEPS-y),\
 		$(call build_graph_emit,dependency-file,$(D)))
+	$(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+		$(foreach O,$($(call uc,$(P))_OLIBS) $($(call uc,$(P))_OLIBS-y),\
+			$(call build_graph_emit,final-link-input,object,$(O),platform,$(P))))
+	$(foreach O,$(UK_OLIBS) $(UK_OLIBS-y),\
+		$(call build_graph_emit,final-link-input,object,$(O),global))
+	$(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+		$(foreach A,$($(call uc,$(P))_ALIBS) $($(call uc,$(P))_ALIBS-y),\
+			$(call build_graph_emit,final-link-input,archive,$(A),platform,$(P))))
+	$(foreach A,$(UK_ALIBS) $(UK_ALIBS-y),\
+		$(call build_graph_emit,final-link-input,archive,$(A),global))
+	$(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+		$(foreach L,$($(call uc,$(P))_LD_SCRIPT_DEPS),\
+			$(call build_graph_emit,final-link-input,linker-script,$(L),platform,$(P))))
 	$(foreach D,$(UK_LDEPS) \
 	    $(foreach P,$(BUILD_GRAPH_PLATFORMS),\
 		$($(call uc,$(P))_LD_SCRIPT_DEPS)),\

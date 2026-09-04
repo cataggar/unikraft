@@ -23,10 +23,14 @@
 #
 #################################################
 
+# Snapshot each expanded source definition before rule installation can mutate
+# variables referenced by recursive source lists (notably platform *.lds.S).
+
 ifneq ($(call qstrip,$(UK_LIBS) $(UK_LIBS-y)),)
 $(foreach L,$(UK_LIBS) $(UK_LIBS-y), \
 $(foreach S,$($(call uc,$(L))_SRCS) $($(call uc,$(L))_SRCS-y) \
 	    $(EACHOLIB_SRCS) $(EACHOLIB_SRCS-y), \
+$(eval $(call vprefix_lib,$(L),BUILD_GRAPH_SRCS) += $(S)) \
 $(eval $(call buildrule_libobj_multitarget,$(L),$(S))) \
 ); \
 $(if $(call qstrip,$($(call uc,$(L))_OBJS) $($(call uc,$(L))_OBJS-y)), \
@@ -51,6 +55,7 @@ $(if $(call qstrip,$($(call uc,$(P))_LIBS) $($(call uc,$(P))_LIBS-y)), \
 $(foreach L,$($(call uc,$(P))_LIBS) $($(call uc,$(P))_LIBS-y), \
 $(foreach S,$($(call uc,$(L))_SRCS) $($(call uc,$(L))_SRCS-y) \
 	    $(EACHOLIB_SRCS) $(EACHOLIB_SRCS-y), \
+$(eval $(call vprefix_lib,$(L),BUILD_GRAPH_SRCS) += $(S)) \
 $(eval $(call buildrule_libobj_multitarget,$(L),$(S))) \
 ); \
 $(if $(call qstrip,$($(call uc,$(L))_OBJS) $($(call uc,$(L))_OBJS-y)), \
