@@ -198,8 +198,33 @@ jobs:
   zig-helloworld:
     name: zig-helloworld
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    defaults:
+      run:
+        shell: bash
 
     steps:
+    - name: Install checkout and build dependencies
+      run: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          bison \
+          ca-certificates \
+          curl \
+          file \
+          flex \
+          git \
+          libncurses-dev \
+          llvm \
+          make \
+          qemu-system-x86 \
+          tar \
+          xz-utils
+        rm -rf /var/lib/apt/lists/*
+
     - uses: actions/checkout@v4
       with:
         submodules: recursive
@@ -214,17 +239,19 @@ jobs:
         fetch-depth: 1
         path: _helloworld
 
-    - name: Install build dependencies
+    - name: Verify GCC is unavailable
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          bison \
-          flex \
-          libncurses-dev \
-          qemu-system-x86
+        set -euo pipefail
+        for command in gcc g++ gcc-ar gcc-nm; do
+          if command -v "${command}" >/dev/null 2>&1; then
+            echo "Unexpected GCC command on PATH: ${command}" >&2
+            exit 1
+          fi
+        done
 
     - name: Install Zig
       run: |
+        set -euo pipefail
         archive="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
         directory="${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}"
         curl --fail --location --silent --show-error \
@@ -236,31 +263,86 @@ jobs:
 
     - name: Build helloworld with Zig
       run: |
+        set -euo pipefail
         test "$(zig version)" = "${ZIG_VERSION}"
-        make \
-          A="${GITHUB_WORKSPACE}/_helloworld" \
-          O="${RUNNER_TEMP}/build-zig" \
+        build="${RUNNER_TEMP}/build-zig"
+        log="${RUNNER_TEMP}/zig-build.log"
+        rm -rf "${build}"
+        make_args=(
+          "A=${GITHUB_WORKSPACE}/_helloworld"
+          "O=${build}"
+          "HOSTCC=zig cc"
+          "HOSTCXX=zig c++"
+          "COMPILER=zig cc -target x86_64-freestanding-none"
+          "PARTIAL_LINKER=zig ld.lld"
+          "PARTIAL_LINKER_TYPE=raw"
+          "AR=zig ar"
+          "NM=llvm-nm"
+          "OBJCOPY=llvm-objcopy"
+          "OBJDUMP=llvm-objdump"
+          "READELF=llvm-readelf"
+          "STRIP=llvm-strip"
+          "UK_CFLAGS=-std=gnu17"
+          "UK_LDFLAGS=-rtlib=compiler-rt"
+        )
+        make "${make_args[@]}" \
           UK_DEFCONFIG="${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-x86_64" \
           defconfig
-        make \
-          A="${GITHUB_WORKSPACE}/_helloworld" \
-          O="${RUNNER_TEMP}/build-zig" \
-          COMPILER='zig cc -target x86_64-freestanding-none' \
-          LINKER=gcc \
-          UK_CFLAGS=-std=gnu17 \
-          -j"$(nproc)"
+        set +e
+        make "${make_args[@]}" V=1 -j"$(nproc)" 2>&1 | tee "${log}"
+        build_status=("${PIPESTATUS[@]}")
+        set -e
+
+        # Match GCC only where a shell could execute it, not in source paths or
+        # compiler diagnostics that merely mention its name.
+        gcc_command='(^|[;&|])[[:space:]]*(env([[:space:]]+[^[:space:]=]+=[^[:space:]]+)*)?[[:space:]]*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\+\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)'
+        if grep --line-number --extended-regexp "${gcc_command}" "${log}"; then
+          echo "The target build invoked a GCC command." >&2
+          exit 1
+        fi
+        test "${build_status[1]}" -eq 0
+        test "${build_status[0]}" -eq 0
 
     - name: Inspect Zig image
       run: |
+        set -euo pipefail
         image="${RUNNER_TEMP}/build-zig/helloworld_qemu-x86_64.dbg"
         file "${image}"
-        readelf --file-header "${image}" | grep --quiet 'Class:.*ELF64'
-        readelf --file-header "${image}" | grep --quiet 'Machine:.*X86-64'
-        ! readelf --program-headers "${image}" | grep --quiet INTERP
-        ! readelf --dynamic "${image}" 2>/dev/null | grep --quiet NEEDED
+        header="$(llvm-readelf --file-header "${image}")"
+        printf '%s\n' "${header}"
+        grep --quiet 'Class:.*ELF64' <<< "${header}"
+        grep --quiet 'Machine:.*X86-64' <<< "${header}"
+
+        program_headers="$(llvm-readelf --program-headers "${image}")"
+        if grep --quiet INTERP <<< "${program_headers}"; then
+          echo "The Zig image has a program interpreter." >&2
+          exit 1
+        fi
+        dynamic="$(llvm-readelf --wide --dynamic "${image}" 2>/dev/null)"
+        if grep --quiet NEEDED <<< "${dynamic}"; then
+          echo "The Zig image has a dynamic dependency." >&2
+          exit 1
+        fi
+
+        undefined="$(llvm-nm --undefined-only --format=posix "${image}")"
+        if [ -n "${undefined}" ]; then
+          echo "The Zig image has unresolved symbols:" >&2
+          printf '%s\n' "${undefined}" >&2
+          exit 1
+        fi
+        symbols="$(llvm-nm --format=posix "${image}")"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The Zig image has a libgcc symbol reference." >&2
+          exit 1
+        fi
+        if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
+          echo "The Zig image has a libgcc dependency." >&2
+          exit 1
+        fi
 
     - name: Boot Zig image
       run: |
+        set -euo pipefail
         image="${RUNNER_TEMP}/build-zig/helloworld_qemu-x86_64"
         output="${RUNNER_TEMP}/zig-qemu.log"
         set +e
