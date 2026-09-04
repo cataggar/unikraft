@@ -225,7 +225,7 @@ with log.open("a", encoding="utf-8") as stream:
                     checkout,
                     cache,
                     f"{self.work}/outputs/victim{suffix}",
-                    goal="properclean" if suffix == ";true" else "all",
+                    goal="all",
                 )
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("Make-safe character allowlist", result.stdout)
@@ -267,7 +267,7 @@ with log.open("a", encoding="utf-8") as stream:
                 first_checkout,
                 first_cache,
                 parent_output,
-                goal="properclean",
+                goal="all",
             ),
             cwd=first_invocation,
             env=self.facade_env(
@@ -636,6 +636,69 @@ with log.open("a", encoding="utf-8") as stream:
             marker.unlink()
         recovered = self.run_facade(checkout, cache, output)
         self.assertEqual(recovered.returncode, 0, recovered.stdout)
+
+    def test_destructive_steps_refuse_intermediate_path_replacement(self):
+        checkout = self.checkouts[0]
+        cache = self.work / "destructive-refusal-cache"
+        output_parent = self.work / "destructive-output-parent"
+        output = output_parent / "build"
+        output_victim = self.work / "destructive-output-victim"
+        output_victim.mkdir()
+        output_sentinel = output_victim / "must-survive"
+        output_sentinel.write_text("output-safe", encoding="utf-8")
+
+        initial = self.run_facade(checkout, cache, output)
+        self.assertEqual(initial.returncode, 0, initial.stdout)
+        before = self.read_events()
+
+        moved_output_parent = self.work / "destructive-output-parent-moved"
+        output_parent.rename(moved_output_parent)
+        output_parent.symlink_to(output_victim, target_is_directory=True)
+        properclean = self.run_facade(
+            checkout,
+            cache,
+            output,
+            goal="properclean",
+        )
+        self.assertNotEqual(properclean.returncode, 0)
+        self.assertTrue(output_sentinel.is_file())
+        self.assertEqual(output_sentinel.read_text(encoding="utf-8"), "output-safe")
+        self.assertEqual(self.read_events(), before)
+
+        output_parent.unlink()
+        moved_output_parent.rename(output_parent)
+        for goal in ("clean", "clean-libs", "properclean"):
+            clean = self.run_facade(checkout, cache, output, goal=goal)
+            self.assertNotEqual(clean.returncode, 0)
+            self.assertIn("intentionally refused", clean.stdout)
+            self.assertEqual(self.read_events(), before)
+
+        config_parent = self.app / "config-parent"
+        config_parent.mkdir()
+        config = config_parent / ".config"
+        config.write_text("CONFIG_SAFE=y\n", encoding="utf-8")
+        config_victim_parent = self.work / "destructive-config-victim"
+        config_victim_parent.mkdir()
+        config_victim = config_victim_parent / ".config"
+        config_victim.write_text("CONFIG_VICTIM=y\n", encoding="utf-8")
+        moved_config_parent = self.app / "config-parent-moved"
+        config_parent.rename(moved_config_parent)
+        config_parent.symlink_to(config_victim_parent, target_is_directory=True)
+
+        distclean = self.run_facade(
+            checkout,
+            cache,
+            output,
+            f"-Dconfig={config}",
+            goal="distclean",
+        )
+        self.assertNotEqual(distclean.returncode, 0)
+        self.assertIn("intentionally refused", distclean.stdout)
+        self.assertEqual(
+            config_victim.read_text(encoding="utf-8"),
+            "CONFIG_VICTIM=y\n",
+        )
+        self.assertEqual(self.read_events(), before)
 
 
 if __name__ == "__main__":

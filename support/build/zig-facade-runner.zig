@@ -32,7 +32,7 @@ const Metadata = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len < 4) {
+    if (args.len < 5) {
         std.debug.print("error: internal Zig facade invocation is missing the output or Make command\n", .{});
         std.process.exit(2);
     }
@@ -44,6 +44,22 @@ pub fn main(init: std.process.Init) !void {
         );
         std.process.exit(2);
     }
+
+    if (isDestructiveGoal(args[4])) {
+        std.debug.print(
+            "error: destructive Make goal '{s}' is refused by the Zig facade because mutable pathnames cannot provide descriptor-relative deletion safety\n",
+            .{args[4]},
+        );
+        std.process.exit(2);
+    }
+
+    validateCanonicalMakeArguments(allocator, init.io, args[2..]) catch {
+        std.debug.print(
+            "error: a Make-facing A/O/C/L/P/E path no longer resolves to the canonical identity validated by build.zig; retry from a stable filesystem state\n",
+            .{},
+        );
+        std.process.exit(2);
+    };
 
     const uid = std.posix.system.geteuid();
     var runtime = prepareRuntimeDirectory(
@@ -137,11 +153,69 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     };
 
+    validateCanonicalMakeArguments(allocator, init.io, args[2..]) catch {
+        std.debug.print(
+            "error: a Make-facing A/O/C/L/P/E path changed identity immediately before backend execution; refusing delegation\n",
+            .{},
+        );
+        std.process.exit(2);
+    };
+
     // Exec keeps the locked descriptor in Make and every normally spawned descendant.
     try setCloseOnExec(lock, false);
     const replace_error = std.process.replace(init.io, .{ .argv = args[2..] });
     setCloseOnExec(lock, true) catch {};
     return replace_error;
+}
+
+fn isDestructiveGoal(goal: []const u8) bool {
+    return std.mem.eql(u8, goal, "clean") or
+        std.mem.eql(u8, goal, "clean-libs") or
+        std.mem.eql(u8, goal, "properclean") or
+        std.mem.eql(u8, goal, "distclean");
+}
+
+fn validateCanonicalMakeArguments(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    arguments: []const []const u8,
+) !void {
+    for (arguments) |argument| {
+        const separator = std.mem.indexOfScalar(u8, argument, '=') orelse continue;
+        const name = argument[0..separator];
+        const value = argument[separator + 1 ..];
+        const is_list = std.mem.eql(u8, name, "L") or
+            std.mem.eql(u8, name, "P") or
+            std.mem.eql(u8, name, "E");
+        const is_path = is_list or
+            std.mem.eql(u8, name, "A") or
+            std.mem.eql(u8, name, "O") or
+            std.mem.eql(u8, name, "C");
+        if (!is_path) continue;
+
+        if (is_list) {
+            var iterator = std.mem.splitScalar(u8, value, ':');
+            while (iterator.next()) |path| {
+                try validateCanonicalPath(allocator, io, path);
+            }
+        } else {
+            try validateCanonicalPath(allocator, io, value);
+        }
+    }
+}
+
+fn validateCanonicalPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    const canonical = try facade_paths.canonicalizeNearestExisting(
+        allocator,
+        io,
+        path,
+    );
+    defer allocator.free(canonical.path);
+    if (!std.mem.eql(u8, canonical.path, path)) return error.PathIdentityChanged;
 }
 
 fn acquireLock(
@@ -575,4 +649,54 @@ test "build marker creation is repeatable and rejects symlinks without writes" {
     );
     defer std.testing.allocator.free(victim);
     try std.testing.expectEqualStrings("unchanged", victim);
+}
+
+test "destructive Make goals are refused defensively" {
+    try std.testing.expect(isDestructiveGoal("clean"));
+    try std.testing.expect(isDestructiveGoal("clean-libs"));
+    try std.testing.expect(isDestructiveGoal("properclean"));
+    try std.testing.expect(isDestructiveGoal("distclean"));
+    try std.testing.expect(!isDestructiveGoal("all"));
+}
+
+test "canonical Make path validation detects intermediate replacement" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "base/app");
+    try temporary.dir.createDirPath(std.testing.io, "external/app");
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    const app = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_length], "base/app" },
+    );
+    defer std.testing.allocator.free(app);
+    const assignment = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "A={s}",
+        .{app},
+    );
+    defer std.testing.allocator.free(assignment);
+    try validateCanonicalMakeArguments(
+        std.testing.allocator,
+        std.testing.io,
+        &.{assignment},
+    );
+
+    try temporary.dir.rename("base", temporary.dir, "moved", std.testing.io);
+    try temporary.dir.symLink(
+        std.testing.io,
+        "external",
+        "base",
+        .{ .is_directory = true },
+    );
+    try std.testing.expectError(
+        error.PathIdentityChanged,
+        validateCanonicalMakeArguments(
+            std.testing.allocator,
+            std.testing.io,
+            &.{assignment},
+        ),
+    );
 }

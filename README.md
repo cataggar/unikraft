@@ -153,8 +153,9 @@ from source trees.
 
 The default step delegates to Make's `all` target. Named steps include
 `images`, `libs`, `objs`, `preprocess`, `prepare`, `fetch`, configuration
-targets such as `menuconfig` and `defconfig`, and `clean`, `properclean`, and
-`distclean`. For example:
+targets such as `menuconfig` and `defconfig`. The compatibility names `clean`,
+`clean-libs`, `properclean`, and `distclean` are registered but intentionally
+refuse to run; see the cleanup safety limitation below. For example:
 
 ```shell
 zig build menuconfig -Dapp=/absolute/path/to/app
@@ -164,14 +165,16 @@ zig build images -Dapp=/absolute/path/to/app -Dverbose=1
 `-Dapp`, `-Doutput`, `-Dconfig`, and `-Dimage-name` map to Make's `A`, `O`,
 `C`, and `N` variables. Repeat `-Dexternal-lib`, `-Dexternal-platform`, or
 `-Dexclude` to construct the `L`, `P`, or `E` path lists. Relative paths are
-resolved from the Unikraft repository root. Because the existing Make backend
-does not quote these values end to end, the facade applies a conservative
-ASCII allowlist before invoking Make. Paths accept letters, digits, `/`,
-`-_.+@`; joined `L`, `P`, and `E` lists additionally use `:` as their
-intentional separator. Image names accept letters, digits, and `-_.+@`.
-Tool/flag values additionally accept spaces, `:`, `,`, and `=`. Whitespace in
-paths and Make/shell syntax such as quotes, backslashes, `$()`, backticks,
-`;&|<>`, globs, `#`, `%`, and control characters are rejected.
+resolved from the Unikraft repository root and canonicalized before they are
+forwarded. The runner revalidates `A`, `O`, `C`, `L`, `P`, and `E` immediately
+before executing a non-destructive Make target and refuses changed path
+identities. Because the existing Make backend does not quote these values end
+to end, the facade also applies a conservative ASCII allowlist. Paths accept
+letters, digits, `/`, `-_.+@`; joined `L`, `P`, and `E` lists additionally use
+`:` as their intentional separator. Image names accept letters, digits, and
+`-_.+@`. Tool/flag values additionally accept spaces, `:`, `,`, and `=`.
+Whitespace in paths and Make/shell syntax such as quotes, backslashes, `$()`,
+backticks, `;&|<>`, globs, `#`, `%`, and control characters are rejected.
 Additional Make assignments can be forwarded as individual, safely separated
 arguments with repeated `-Dmake-arg=NAME=VALUE`. This option uses a strict
 allowlist for compiler flags and non-path tools such as `AR`, `NM`, `OBJCOPY`,
@@ -208,15 +211,20 @@ must be current-user-owned, single-link regular files with safe permissions and
 the exact expected contents. No-follow, descriptor-relative operations prevent
 marker symlinks or replacement races from redirecting writes.
 
-Non-destructive builds may use an external `-Dconfig`. The `distclean` step is
-stricter because Make deletes the configuration and sibling metadata: every
-canonical deletion target must remain inside the application tree. Otherwise,
-the facade refuses `distclean` and leaves manual cleanup to the user.
+Non-destructive builds may use an external `-Dconfig`. Destructive Make targets
+cannot safely consume mutable pathnames after Zig's validation: `properclean`
+recursively removes `O`, `distclean` also removes `C` and companion metadata,
+and configured `clean`/`clean-libs` rules contain further generated paths.
+Until cleanup is implemented using portable descriptor-relative deletion, the
+facade refuses all four steps instead of exposing a check-then-delete race. Use
+manual cleanup, or invoke GNU Make directly only after independently ensuring
+the application, output, and configuration path components cannot be replaced.
 `zig build test` runs the facade's path, argument, and lock unit checks.
 `python3 -m unittest -v support.scripts.tests.test_zig_facade` adds
-end-to-end metacharacter, cross-checkout parent/nested output, and orphaned
-backend-tree lock-lifetime coverage, including hostile runtime and build-marker
-entries and differing temporary-directory environments.
+end-to-end metacharacter, cross-checkout parent/nested output, destructive path
+replacement refusal, and orphaned backend-tree lock-lifetime coverage,
+including hostile runtime and build-marker entries and differing
+temporary-directory environments.
 
 The experimental QEMU/x86_64 Zig compiler setup becomes:
 

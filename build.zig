@@ -63,6 +63,7 @@ const targets = [_]Target{
     .{ .name = "olddefconfig", .make_target = "olddefconfig", .description = "Resolve new configuration symbols using defaults" },
     .{ .name = "syncconfig", .make_target = "syncconfig", .description = "Synchronize configuration and dependencies" },
     .{ .name = "savedefconfig", .make_target = "savedefconfig", .description = "Save a minimal default configuration" },
+    .{ .name = "clean-libs", .make_target = "clean-libs", .description = "Remove configured library build products" },
     .{ .name = "clean", .make_target = "clean", .description = "Remove configured build products" },
     .{ .name = "properclean", .make_target = "properclean", .description = "Remove the build output directory" },
     .{ .name = "distclean", .make_target = "distclean", .description = "Remove build output and configuration" },
@@ -145,7 +146,7 @@ pub fn build(b: *std.Build) void {
     };
     const output = output_result.path;
 
-    const options = MakeOptions{
+    var options = MakeOptions{
         .command = b.option([]const u8, "make-command", "GNU Make executable (default: make)") orelse "make",
         .app = app,
         .output = output,
@@ -179,6 +180,12 @@ pub fn build(b: *std.Build) void {
         .forwarded = b.option([]const []const u8, "make-arg", "Allowlisted NAME=VALUE tool/flag assignment; may be repeated") orelse &.{},
     };
 
+    canonicalizeMakePaths(b.allocator, b.graph.io, &options) catch |err| {
+        validation_message = b.fmt(
+            "unable to canonicalize a Make-facing path immediately before delegation: {s}",
+            .{@errorName(err)},
+        );
+    };
     if (validation_message == null) {
         validation_message = validatePaths(b, root, options, output_result);
     }
@@ -212,13 +219,13 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    const config_path = options.config orelse resolvePath(b.allocator, app, ".config");
-    const distclean_error = validateDistcleanConfig(b, app, config_path);
-
     for (targets) |target| {
         const step = b.step(target.name, target.description);
-        if (std.mem.eql(u8, target.name, "distclean") and distclean_error != null) {
-            const fail = b.addFail(distclean_error.?);
+        if (isDestructiveTarget(target.name)) {
+            const fail = b.addFail(b.fmt(
+                "Zig facade step '{s}' is intentionally refused: GNU Make re-resolves mutable A/O/C paths before deletion, and this compatibility facade cannot provide descriptor-relative cleanup portably; verify paths and use GNU Make or manual cleanup explicitly",
+                .{target.name},
+            ));
             step.dependOn(&fail.step);
         } else {
             const run = addMakeCommand(
@@ -299,6 +306,71 @@ fn resolvePathList(
         resolved.append(resolvePath(allocator, root, path)) catch @panic("out of memory");
     }
     return std.mem.join(allocator, ":", resolved.items) catch @panic("out of memory");
+}
+
+fn canonicalizeMakePaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: *MakeOptions,
+) !void {
+    options.app = (try facade_paths.canonicalizeNearestExisting(
+        allocator,
+        io,
+        options.app,
+    )).path;
+    options.output = (try facade_paths.canonicalizeNearestExisting(
+        allocator,
+        io,
+        options.output,
+    )).path;
+    if (options.config) |config| {
+        options.config = (try facade_paths.canonicalizeNearestExisting(
+            allocator,
+            io,
+            config,
+        )).path;
+    }
+    options.external_libraries = try canonicalizePathList(
+        allocator,
+        io,
+        options.external_libraries,
+    );
+    options.external_platforms = try canonicalizePathList(
+        allocator,
+        io,
+        options.external_platforms,
+    );
+    options.exclusions = try canonicalizePathList(
+        allocator,
+        io,
+        options.exclusions,
+    );
+}
+
+fn canonicalizePathList(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    value: ?[]const u8,
+) !?[]const u8 {
+    const paths = value orelse return null;
+    var canonical = std.array_list.Managed([]const u8).init(allocator);
+    defer canonical.deinit();
+    var iterator = std.mem.splitScalar(u8, paths, ':');
+    while (iterator.next()) |path| {
+        try canonical.append((try facade_paths.canonicalizeNearestExisting(
+            allocator,
+            io,
+            path,
+        )).path);
+    }
+    return try std.mem.join(allocator, ":", canonical.items);
+}
+
+fn isDestructiveTarget(name: []const u8) bool {
+    return std.mem.eql(u8, name, "clean-libs") or
+        std.mem.eql(u8, name, "clean") or
+        std.mem.eql(u8, name, "properclean") or
+        std.mem.eql(u8, name, "distclean");
 }
 
 fn validatePaths(
