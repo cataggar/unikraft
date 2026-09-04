@@ -59,23 +59,19 @@ pub fn main(init: std.process.Init) !void {
         .data = facade_paths.marker_contents,
     });
 
-    var child = try std.process.spawn(init.io, .{ .argv = args[2..] });
-    const term = try child.wait(init.io);
-    switch (term) {
-        .exited => |code| std.process.exit(code),
-        .signal => |signal| {
-            std.debug.print("error: Make terminated by signal {d}\n", .{@intFromEnum(signal)});
-            std.process.exit(1);
-        },
-        .stopped => |signal| {
-            std.debug.print("error: Make stopped by signal {d}\n", .{@intFromEnum(signal)});
-            std.process.exit(1);
-        },
-        .unknown => |status| {
-            std.debug.print("error: Make terminated with unknown status {d}\n", .{status});
-            std.process.exit(1);
-        },
+    if (comptime !std.process.can_replace) {
+        std.debug.print(
+            "error: this host cannot safely replace the Zig facade runner with the Make backend while retaining the build lock\n",
+            .{},
+        );
+        std.process.exit(2);
     }
+
+    // Exec keeps the locked descriptor in Make and every normally spawned descendant.
+    try setCloseOnExec(lock, false);
+    const replace_error = std.process.replace(init.io, .{ .argv = args[2..] });
+    setCloseOnExec(lock, true) catch {};
+    return replace_error;
 }
 
 fn acquireLock(
@@ -88,6 +84,21 @@ fn acquireLock(
         .lock = .exclusive,
         .lock_nonblocking = true,
     });
+}
+
+fn setCloseOnExec(file: std.Io.File, enabled: bool) !void {
+    const flags: usize = if (enabled) std.posix.FD_CLOEXEC else 0;
+    while (true) {
+        switch (std.posix.errno(std.posix.system.fcntl(
+            file.handle,
+            std.posix.F.SETFD,
+            flags,
+        ))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
 }
 
 fn expectConcurrentInvocationRejected() !void {

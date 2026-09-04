@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import time
 import unittest
@@ -37,15 +38,39 @@ class ZigFacadeIntegrationTest(unittest.TestCase):
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 
+child_sleep = os.environ.get("ZIG_FACADE_TEST_CHILD_SLEEP")
 event = {
     "event": "START",
     "pid": os.getpid(),
     "argv": sys.argv[1:],
 }
 log = Path(os.environ["ZIG_FACADE_TEST_LOG"])
+if child_sleep:
+    child_code = '''
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+log = Path(sys.argv[1])
+with log.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps({"event": "CHILD_START", "pid": os.getpid()}) + "\\\\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+time.sleep(float(sys.argv[2]))
+with log.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps({"event": "CHILD_END", "pid": os.getpid()}) + "\\\\n")
+'''
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(log), child_sleep],
+        close_fds=False,
+    )
+    event["child_pid"] = child.pid
 with log.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(event) + "\\n")
     stream.flush()
@@ -257,6 +282,76 @@ with log.open("a", encoding="utf-8") as stream:
         lock = self.runtime.resolve() / "unikraft-zig-facade.lock"
         self.assertTrue(lock.is_file())
         self.assertFalse(lock.is_relative_to(parent_output.resolve()))
+
+    def test_backend_tree_retains_lock_after_runner_pid_is_killed(self):
+        first_checkout, second_checkout = self.checkouts
+        first_cache = self.work / "lifetime-cache-one"
+        second_cache = self.work / "lifetime-cache-two"
+        output = self.work / "outputs" / "lifetime"
+
+        for checkout, cache in (
+            (first_checkout, first_cache),
+            (second_checkout, second_cache),
+        ):
+            result = self.run_facade(checkout, cache, output)
+            self.assertEqual(result.returncode, 0, result.stdout)
+
+        self.log.unlink(missing_ok=True)
+        invocation = self.work / "invoke-lifetime"
+        invocation.mkdir(exist_ok=True)
+        first = subprocess.Popen(
+            self.facade_command(first_checkout, first_cache, output),
+            cwd=invocation,
+            env=self.facade_env(
+                ZIG_FACADE_TEST_SLEEP="30",
+                ZIG_FACADE_TEST_CHILD_SLEEP="4",
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            start = None
+            while time.monotonic() < deadline:
+                start = next(
+                    (e for e in self.read_events() if e["event"] == "START"),
+                    None,
+                )
+                if start is not None and start.get("child_pid"):
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("backend did not start its sleeping child")
+
+            os.kill(start["pid"], signal.SIGKILL)
+            time.sleep(0.1)
+            os.kill(start["child_pid"], 0)
+            blocked = self.run_facade(second_checkout, second_cache, output)
+            self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
+            self.assertIn("another Make-backed Zig facade process", blocked.stdout)
+            self.assertEqual(
+                len([e for e in self.read_events() if e["event"] == "START"]),
+                1,
+            )
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if any(e["event"] == "CHILD_END" for e in self.read_events()):
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("orphaned backend child did not finish")
+        finally:
+            first_stdout, _ = first.communicate(timeout=10)
+        self.assertNotEqual(first.returncode, 0, first_stdout)
+
+        recovered = self.run_facade(second_checkout, second_cache, output)
+        self.assertEqual(recovered.returncode, 0, recovered.stdout)
+        self.assertEqual(
+            len([e for e in self.read_events() if e["event"] == "START"]),
+            2,
+        )
 
 
 if __name__ == "__main__":

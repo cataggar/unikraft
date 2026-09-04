@@ -186,8 +186,13 @@ selected steps such as `clean all` to race. All facade invocations use the same
 `TEMP`, or `TMP`, with the platform default as fallback), so parent/nested
 outputs, different Zig caches, applications, and checkouts cannot overlap. The
 runtime directory must be outside every output tree; the persistent lock file
-is never unlinked while held. Run separate commands when multiple phases are
-needed.
+is never unlinked while held. Before invoking Make, the runner makes the locked
+descriptor inheritable and replaces its own process image with the backend.
+Make and its descendants therefore retain the same lock even if the original
+runner PID is killed; the lock is released normally after the complete backend
+tree exits. Hosts without process-image replacement are refused rather than
+running without this lifetime guarantee. Run separate commands when multiple
+phases are needed.
 
 Non-destructive builds may use an external `-Dconfig`. The `distclean` step is
 stricter because Make deletes the configuration and sibling metadata: every
@@ -195,7 +200,8 @@ canonical deletion target must remain inside the application tree. Otherwise,
 the facade refuses `distclean` and leaves manual cleanup to the user.
 `zig build test` runs the facade's path, argument, and lock unit checks.
 `python3 -m unittest -v support.scripts.tests.test_zig_facade` adds
-end-to-end metacharacter and cross-checkout parent/nested output coverage.
+end-to-end metacharacter, cross-checkout parent/nested output, and orphaned
+backend-tree lock-lifetime coverage.
 
 The experimental QEMU/x86_64 Zig compiler setup becomes:
 
