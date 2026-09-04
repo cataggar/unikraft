@@ -139,9 +139,25 @@ For QEMU/x86_64:
 ```shell
 make \
   COMPILER='zig cc -target x86_64-freestanding-none' \
-  LINKER=gcc \
-  UK_CFLAGS=-std=gnu17
+  PARTIAL_LINKER='zig ld.lld' \
+  PARTIAL_LINKER_TYPE=raw \
+  HOSTCC='zig cc' \
+  HOSTCXX='zig c++' \
+  AR='zig ar' \
+  NM=llvm-nm \
+  OBJCOPY=llvm-objcopy \
+  OBJDUMP=llvm-objdump \
+  READELF=llvm-readelf \
+  STRIP=llvm-strip \
+  UK_CFLAGS=-std=gnu17 \
+  UK_LDFLAGS=-rtlib=compiler-rt
 ```
+
+Omitting `LINKER` makes the final link use Zig's compiler driver, while
+`PARTIAL_LINKER` uses Zig's bundled LLD for relocatable links. The x86_64 build
+does not require GCC, but it does require the LLVM binary tools listed above
+(`llvm` on Debian and Ubuntu). Pass `HOSTCC='zig cc'` and `HOSTCXX='zig c++'`
+to configuration targets such as `defconfig` as well as to the build.
 
 For QEMU/ARM64, `COMPILER_TARGETED=y` tells the build that the compiler command
 already selects its own target, so the AArch64 cross prefix is not prepended to
@@ -160,10 +176,9 @@ The ARM64 build additionally requires an AArch64 GNU cross-toolchain
 because `LINKER` and the binutils keep using the `aarch64-linux-gnu-` prefix.
 
 This support is experimental, limited to the GNU Make build of QEMU/x86_64 and
-QEMU/ARM64, and does not support LTO. Neither target is a pure Zig toolchain:
-Zig compiles the target sources, while the GCC linker driver and GNU binutils
-are still required because Zig 0.16 does not support the relocatable links used
-by the Unikraft build.
+QEMU/ARM64, and does not support LTO. The x86_64 configuration is GCC-free and
+uses Zig plus LLVM binary tools. The ARM64 configuration still requires its
+existing GCC linker driver and GNU cross-binutils.
 
 ### Toolchain Installation
 
