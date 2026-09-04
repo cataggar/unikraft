@@ -141,9 +141,12 @@ From the Unikraft repository, build an application with:
 ```shell
 zig build \
   -Dapp=/absolute/path/to/app \
-  -Doutput=/absolute/path/to/app/build \
   -Dconfig=/absolute/path/to/app/.config
 ```
+
+When `-Doutput` is omitted, it safely defaults to `<app>/build`. The facade
+rejects output paths that could cause `properclean` or `distclean` to delete
+the application or Unikraft repository tree.
 
 The default step delegates to Make's `all` target. Named steps include
 `images`, `libs`, `objs`, `preprocess`, `prepare`, `fetch`, configuration
@@ -158,10 +161,18 @@ zig build images -Dapp=/absolute/path/to/app -Dverbose=1
 `-Dapp`, `-Doutput`, `-Dconfig`, and `-Dimage-name` map to Make's `A`, `O`,
 `C`, and `N` variables. Repeat `-Dexternal-lib`, `-Dexternal-platform`, or
 `-Dexclude` to construct the `L`, `P`, or `E` path lists. Relative paths are
-resolved from the Unikraft repository root. Additional Make assignments can be
-forwarded as individual, safely separated arguments with repeated
-`-Dmake-arg=NAME=VALUE`; facade-managed variables must use their dedicated
-options.
+resolved from the Unikraft repository root. The Make backend cannot correctly
+handle whitespace in `A`, `O`, `C`, `L`, `P`, or `E` paths, so the facade
+rejects those paths with an error instead of attempting an unsafe build.
+Additional Make assignments can be forwarded as individual, safely separated
+arguments with repeated `-Dmake-arg=NAME=VALUE`; facade-managed variables must
+use their dedicated options.
+
+Invoke only one Make-backed named step per `zig build` command. A portable,
+non-blocking file lock rejects overlapping Make processes rather than allowing
+selected steps such as `clean all` to race over one output tree. Run separate
+commands when multiple phases are needed. `zig build test` runs the facade's
+path, argument, and concurrency checks.
 
 The experimental QEMU/x86_64 Zig compiler setup becomes:
 

@@ -23,7 +23,7 @@ const PartialLinkerType = enum {
 const MakeOptions = struct {
     command: []const u8,
     app: []const u8,
-    output: ?[]const u8,
+    output: []const u8,
     config: ?[]const u8,
     image_name: ?[]const u8,
     external_libraries: ?[]const u8,
@@ -69,10 +69,21 @@ const targets = [_]Target{
 
 pub fn build(b: *std.Build) void {
     const root = b.pathFromRoot(".");
+    const app = resolvePath(b.allocator, root, b.option([]const u8, "app", "Application directory (Make A=)") orelse root);
+    const output_option = b.option([]const u8, "output", "Build output directory (Make O=)");
+    var validation_message: ?[]const u8 = null;
+    const output = if (output_option) |value| output: {
+        validateOutputValue(value) catch {
+            validation_message = "invalid -Doutput: the value is empty; omit it to use <app>/build or provide a dedicated build directory";
+            break :output resolvePath(b.allocator, app, "build");
+        };
+        break :output resolvePath(b.allocator, root, value);
+    } else resolvePath(b.allocator, app, "build");
+
     const options = MakeOptions{
         .command = b.option([]const u8, "make-command", "GNU Make executable (default: make)") orelse "make",
-        .app = resolvePath(b.allocator, root, b.option([]const u8, "app", "Application directory (Make A=)") orelse root),
-        .output = resolveOptionalPath(b, root, "output", "Build output directory (Make O=)"),
+        .app = app,
+        .output = output,
         .config = resolveOptionalPath(b, root, "config", "Configuration file (Make C=)"),
         .image_name = b.option([]const u8, "image-name", "Image/application name override (Make N=)"),
         .external_libraries = resolvePathList(
@@ -103,6 +114,10 @@ pub fn build(b: *std.Build) void {
         .forwarded = b.option([]const []const u8, "make-arg", "Additional NAME=VALUE Make assignment; may be repeated") orelse &.{},
     };
 
+    if (validation_message == null) {
+        validation_message = validatePaths(b, root, options);
+    }
+
     var invalid_assignment: ?[]const u8 = null;
     for (options.forwarded) |assignment| {
         validateForwardedAssignment(assignment) catch {
@@ -111,23 +126,35 @@ pub fn build(b: *std.Build) void {
         };
     }
 
-    if (invalid_assignment) |assignment| {
-        const fail = b.addFail(b.fmt(
-            "invalid -Dmake-arg '{s}': expected an unreserved NAME=VALUE assignment",
-            .{assignment},
-        ));
-        for (targets) |target| {
-            const step = b.step(target.name, target.description);
-            step.dependOn(&fail.step);
-            if (std.mem.eql(u8, target.name, "all")) {
-                b.default_step = step;
-            }
-        }
+    if (validation_message) |message| {
+        addFailedTargets(b, message);
         return;
     }
 
+    if (invalid_assignment) |assignment| {
+        addFailedTargets(b, b.fmt(
+            "invalid -Dmake-arg '{s}': expected an unreserved NAME=VALUE assignment",
+            .{assignment},
+        ));
+        return;
+    }
+
+    const make_runner = b.addExecutable(.{
+        .name = "unikraft-zig-make",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/zig-facade-runner.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const cache_root = resolvePath(b.allocator, root, b.cache_root.path orelse ".zig-cache");
+    const lock_file = std.fs.path.join(
+        b.allocator,
+        &.{ cache_root, "unikraft-make.lock" },
+    ) catch @panic("out of memory");
+
     for (targets) |target| {
-        const run = addMakeCommand(b, root, target.make_target, options);
+        const run = addMakeCommand(b, make_runner, lock_file, root, target.make_target, options);
         const step = b.step(target.name, target.description);
         step.dependOn(&run.step);
         if (std.mem.eql(u8, target.name, "all")) {
@@ -143,8 +170,29 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_facade_tests = b.addRunArtifact(facade_tests);
+    const runner_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/zig-facade-runner.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_runner_tests = b.addRunArtifact(runner_tests);
+    run_runner_tests.setCwd(.{ .cwd_relative = cache_root });
     const test_step = b.step("test", "Test facade path and Make argument construction");
     test_step.dependOn(&run_facade_tests.step);
+    test_step.dependOn(&run_runner_tests.step);
+}
+
+fn addFailedTargets(b: *std.Build, message: []const u8) void {
+    const fail = b.addFail(message);
+    for (targets) |target| {
+        const step = b.step(target.name, target.description);
+        step.dependOn(&fail.step);
+        if (std.mem.eql(u8, target.name, "all")) {
+            b.default_step = step;
+        }
+    }
 }
 
 fn resolveOptionalPath(
@@ -178,14 +226,91 @@ fn resolvePathList(
     return std.mem.join(allocator, ":", resolved.items) catch @panic("out of memory");
 }
 
+fn validatePaths(b: *std.Build, repository: []const u8, options: MakeOptions) ?[]const u8 {
+    if (findWhitespacePath(options)) |path| {
+        return b.fmt(
+            "invalid {s} path '{s}': the GNU Make backend does not support whitespace in A/O/C/L/P/E paths; choose a whitespace-free path",
+            .{ path.make_name, path.value },
+        );
+    }
+
+    validateOutputPath(repository, options.app, options.output) catch |err| {
+        const protected_name = switch (err) {
+            error.ProtectsRepository => "Unikraft repository",
+            error.ProtectsApplication => "application",
+        };
+        return b.fmt(
+            "unsafe -Doutput '{s}': properclean deletes the entire output directory, which would delete or contain the {s}; use a dedicated path such as '{s}{s}build'",
+            .{ options.output, protected_name, options.app, std.fs.path.sep_str },
+        );
+    };
+    return null;
+}
+
+const NamedPath = struct {
+    make_name: []const u8,
+    value: []const u8,
+};
+
+fn findWhitespacePath(options: MakeOptions) ?NamedPath {
+    const paths = [_]struct {
+        make_name: []const u8,
+        value: ?[]const u8,
+    }{
+        .{ .make_name = "A", .value = options.app },
+        .{ .make_name = "O", .value = options.output },
+        .{ .make_name = "C", .value = options.config },
+        .{ .make_name = "L", .value = options.external_libraries },
+        .{ .make_name = "P", .value = options.external_platforms },
+        .{ .make_name = "E", .value = options.exclusions },
+    };
+    for (paths) |path| {
+        const value = path.value orelse continue;
+        validateNoWhitespace(value) catch {
+            return .{ .make_name = path.make_name, .value = value };
+        };
+    }
+    return null;
+}
+
+fn validateNoWhitespace(path: []const u8) error{UnsupportedWhitespace}!void {
+    for (path) |character| {
+        if (std.ascii.isWhitespace(character)) return error.UnsupportedWhitespace;
+    }
+}
+
+fn validateOutputValue(value: []const u8) error{EmptyOutput}!void {
+    if (value.len == 0) return error.EmptyOutput;
+}
+
+fn validateOutputPath(
+    repository: []const u8,
+    app: []const u8,
+    output: []const u8,
+) error{ ProtectsRepository, ProtectsApplication }!void {
+    if (isSameOrAncestor(output, repository)) return error.ProtectsRepository;
+    if (isSameOrAncestor(output, app)) return error.ProtectsApplication;
+}
+
+fn isSameOrAncestor(ancestor: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, ancestor, path)) return true;
+    if (!std.mem.startsWith(u8, path, ancestor) or ancestor.len == 0) return false;
+    if (std.fs.path.isSep(ancestor[ancestor.len - 1])) return true;
+    return path.len > ancestor.len and std.fs.path.isSep(path[ancestor.len]);
+}
+
 fn addMakeCommand(
     b: *std.Build,
+    make_runner: *std.Build.Step.Compile,
+    lock_file: []const u8,
     root: []const u8,
     target: []const u8,
     options: MakeOptions,
 ) *std.Build.Step.Run {
     const argv = makeArguments(b.allocator, target, options);
-    const run = b.addSystemCommand(argv);
+    const run = b.addRunArtifact(make_runner);
+    run.addArg(lock_file);
+    run.addArgs(argv);
     run.setCwd(.{ .cwd_relative = root });
     return run;
 }
@@ -201,7 +326,7 @@ fn makeArguments(
     argv.append(target) catch @panic("out of memory");
 
     appendAssignment(allocator, &argv, "A", options.app);
-    appendOptionalAssignment(allocator, &argv, "O", options.output);
+    appendAssignment(allocator, &argv, "O", options.output);
     appendOptionalAssignment(allocator, &argv, "C", options.config);
     appendOptionalAssignment(allocator, &argv, "N", options.image_name);
     appendOptionalAssignment(allocator, &argv, "L", options.external_libraries);
@@ -294,14 +419,14 @@ fn isReservedAssignment(name: []const u8) bool {
     return false;
 }
 
-test "Make arguments preserve spaces as single arguments" {
+test "Make assignments remain single arguments" {
     const options = MakeOptions{
         .command = "gmake",
-        .app = "/workspace/app with spaces",
-        .output = "/workspace/output with spaces",
-        .config = "/workspace/configs/test config",
+        .app = "/workspace/app",
+        .output = "/workspace/output",
+        .config = "/workspace/configs/test",
         .image_name = "hello",
-        .external_libraries = "/workspace/lib one:/workspace/lib two",
+        .external_libraries = "/workspace/lib-one:/workspace/lib-two",
         .external_platforms = null,
         .exclusions = null,
         .verbosity = .@"2",
@@ -326,11 +451,11 @@ test "Make arguments preserve spaces as single arguments" {
         "gmake",
         "--no-print-directory",
         "images",
-        "A=/workspace/app with spaces",
-        "O=/workspace/output with spaces",
-        "C=/workspace/configs/test config",
+        "A=/workspace/app",
+        "O=/workspace/output",
+        "C=/workspace/configs/test",
         "N=hello",
-        "L=/workspace/lib one:/workspace/lib two",
+        "L=/workspace/lib-one:/workspace/lib-two",
         "V=2",
         "COMPILER=zig cc -target x86_64-freestanding-none",
         "PARTIAL_LINKER=zig ld.lld",
@@ -347,16 +472,101 @@ test "Make arguments preserve spaces as single arguments" {
     }
 }
 
+test "output path rejects repository and application deletion hazards" {
+    const repository = "/workspace/unikraft";
+    const app = "/workspace/apps/hello";
+
+    try std.testing.expectError(
+        error.ProtectsRepository,
+        validateOutputPath(repository, app, repository),
+    );
+    try std.testing.expectError(
+        error.ProtectsRepository,
+        validateOutputPath(repository, app, "/workspace"),
+    );
+    try std.testing.expectError(
+        error.ProtectsApplication,
+        validateOutputPath(repository, app, app),
+    );
+    try std.testing.expectError(
+        error.ProtectsApplication,
+        validateOutputPath(repository, app, "/workspace/apps"),
+    );
+
+    try validateOutputPath(repository, app, "/workspace/build");
+    try validateOutputPath(repository, app, "/workspace/unikraft/build");
+    try validateOutputPath(repository, app, "/workspace/apps/hello/build");
+}
+
+test "missing output defaults to a safe app build directory" {
+    const app = "/workspace/apps/hello";
+    const output = resolvePath(std.testing.allocator, app, "build");
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings("/workspace/apps/hello/build", output);
+    try validateOutputPath("/workspace/unikraft", app, output);
+}
+
+test "dot and parent output values resolve to protected paths" {
+    const repository = "/workspace/unikraft";
+    const app = "/workspace/apps/hello";
+    const dot = resolvePath(std.testing.allocator, repository, ".");
+    defer std.testing.allocator.free(dot);
+    const parent = resolvePath(std.testing.allocator, repository, "..");
+    defer std.testing.allocator.free(parent);
+
+    try std.testing.expectError(
+        error.ProtectsRepository,
+        validateOutputPath(repository, app, dot),
+    );
+    try std.testing.expectError(
+        error.ProtectsRepository,
+        validateOutputPath(repository, app, parent),
+    );
+}
+
+test "empty output and whitespace paths are rejected" {
+    try std.testing.expectError(error.EmptyOutput, validateOutputValue(""));
+    try validateOutputValue("/workspace/apps/hello/build");
+
+    const Field = enum { app, output, config, libraries, platforms, exclusions };
+    const cases = [_]struct {
+        field: Field,
+        make_name: []const u8,
+    }{
+        .{ .field = .app, .make_name = "A" },
+        .{ .field = .output, .make_name = "O" },
+        .{ .field = .config, .make_name = "C" },
+        .{ .field = .libraries, .make_name = "L" },
+        .{ .field = .platforms, .make_name = "P" },
+        .{ .field = .exclusions, .make_name = "E" },
+    };
+    for (cases) |case| {
+        var options = testingMakeOptions();
+        switch (case.field) {
+            .app => options.app = "/workspace/app path",
+            .output => options.output = "/workspace/output path",
+            .config => options.config = "/workspace/config path",
+            .libraries => options.external_libraries = "/workspace/library path",
+            .platforms => options.external_platforms = "/workspace/platform path",
+            .exclusions => options.exclusions = "/workspace/excluded path",
+        }
+        const invalid = findWhitespacePath(options).?;
+        try std.testing.expectEqualStrings(case.make_name, invalid.make_name);
+    }
+    try std.testing.expect(findWhitespacePath(testingMakeOptions()) == null);
+}
+
 test "path lists resolve from the repository root" {
     const actual = resolvePathList(
         std.testing.allocator,
         "/workspace/unikraft",
-        &.{ "libs/lib one", "/opt/platform" },
+        &.{ "libs/lib-one", "/opt/platform" },
     ).?;
     defer std.testing.allocator.free(actual);
 
     try std.testing.expectEqualStrings(
-        "/workspace/unikraft/libs/lib one:/opt/platform",
+        "/workspace/unikraft/libs/lib-one:/opt/platform",
         actual,
     );
 }
@@ -367,4 +577,28 @@ test "forwarded Make assignments require safe unreserved names" {
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("not-an-assignment"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("-j=8"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("A=../app"));
+}
+
+fn testingMakeOptions() MakeOptions {
+    return .{
+        .command = "make",
+        .app = "/workspace/apps/hello",
+        .output = "/workspace/apps/hello/build",
+        .config = "/workspace/apps/hello/.config",
+        .image_name = null,
+        .external_libraries = "/workspace/libs",
+        .external_platforms = "/workspace/platforms",
+        .exclusions = "/workspace/excluded",
+        .verbosity = null,
+        .cross_compile = null,
+        .compiler = null,
+        .linker = null,
+        .partial_linker = null,
+        .partial_linker_type = null,
+        .compiler_targeted = null,
+        .host_cc = null,
+        .host_cxx = null,
+        .host_cflags = null,
+        .forwarded = &.{},
+    };
 }
