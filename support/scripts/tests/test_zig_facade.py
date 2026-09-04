@@ -355,6 +355,142 @@ with log.open("a", encoding="utf-8") as stream:
                     f"{channel} rewrote fetch into properclean",
                 )
 
+    def test_backend_executable_uses_only_sanitized_search_path(self):
+        checkout = self.checkouts[0]
+        cache = self.work / "executable-resolution-cache"
+        invocation = self.work / "invoke-executable-resolution"
+        invocation.mkdir(exist_ok=True)
+        (checkout / "Makefile").write_text(
+            'fetch:\n\t@printf "%s" "$$PATH" > $(O)/backend-path\n',
+            encoding="utf-8",
+        )
+        system_make = shutil.which("make")
+        self.assertIsNotNone(system_make)
+        self.assertEqual(Path(system_make).resolve(), Path("/usr/bin/make"))
+        system_zig = shutil.which("zig")
+        self.assertIsNotNone(system_zig)
+
+        hostile_hit = self.work / "hostile-make-ran"
+        hostile_bin = self.work / "hostile;rejected-bin"
+        hostile_bin.mkdir()
+        hostile_make = hostile_bin / "make"
+        hostile_make.write_text(
+            "#!/bin/sh\n"
+            f"printf hostile > {str(hostile_hit)!r}\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        hostile_make.chmod(0o700)
+
+        safe_hit = self.work / "safe-make-ran"
+        safe_bin = self.work / "safe-bin"
+        safe_bin.mkdir()
+        safe_make = safe_bin / "make"
+        safe_make.write_text(
+            "#!/bin/sh\n"
+            f"printf safe > {str(safe_hit)!r}\n"
+            f"exec {system_make} \"$@\"\n",
+            encoding="utf-8",
+        )
+        safe_make.chmod(0o700)
+        non_executable = safe_bin / "not-executable"
+        non_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        non_executable.chmod(0o600)
+        symlink_make = safe_bin / "symlink-make"
+        symlink_make.symlink_to(system_make)
+
+        def command_for(output, make_command):
+            command = self.facade_command(
+                checkout,
+                cache,
+                output,
+                goal="fetch",
+            )
+            command[0] = system_zig
+            command[
+                next(
+                    index
+                    for index, argument in enumerate(command)
+                    if argument.startswith("-Dmake-command=")
+                )
+            ] = f"-Dmake-command={make_command}"
+            return command
+
+        rejected_output = self.work / "outputs" / "rejected-path"
+        rejected_path = subprocess.run(
+            command_for(rejected_output, "make"),
+            cwd=invocation,
+            env=self.facade_env(
+                PATH=f"{hostile_bin}:/usr/bin:/bin",
+            ),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(rejected_path.returncode, 0, rejected_path.stdout)
+        self.assertFalse(hostile_hit.exists())
+        self.assertEqual(
+            (rejected_output / "backend-path").read_text(encoding="utf-8"),
+            "/usr/bin:/bin",
+        )
+
+        safe_output = self.work / "outputs" / "safe-path"
+        safe_path = subprocess.run(
+            command_for(safe_output, "make"),
+            cwd=invocation,
+            env=self.facade_env(PATH=str(safe_bin)),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(safe_path.returncode, 0, safe_path.stdout)
+        self.assertEqual(safe_hit.read_text(encoding="utf-8"), "safe")
+        self.assertEqual(
+            (safe_output / "backend-path").read_text(encoding="utf-8"),
+            str(safe_bin),
+        )
+
+        for name, make_command, expected_error in (
+            ("missing", "missing-make", "BackendExecutableNotFound"),
+            ("non-executable", "not-executable", "UnsafeBackendExecutable"),
+            ("symlink", "symlink-make", "UnsafeBackendExecutable"),
+        ):
+            with self.subTest(candidate=name):
+                failed = subprocess.run(
+                    command_for(self.work / "outputs" / name, make_command),
+                    cwd=invocation,
+                    env=self.facade_env(PATH=str(safe_bin)),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn(expected_error, failed.stdout)
+
+        absolute_output = self.work / "outputs" / "absolute-command"
+        absolute = subprocess.run(
+            command_for(absolute_output, system_make),
+            cwd=invocation,
+            env=self.facade_env(PATH=f"{hostile_bin}:/usr/bin:/bin"),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(absolute.returncode, 0, absolute.stdout)
+        self.assertFalse(hostile_hit.exists())
+        self.assertEqual(
+            (absolute_output / "backend-path").read_text(encoding="utf-8"),
+            "/usr/bin:/bin",
+        )
+
     def test_parent_and_nested_outputs_share_one_persistent_lock(self):
         first_checkout, second_checkout = self.checkouts
         first_cache = self.work / "cache-one"

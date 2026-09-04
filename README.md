@@ -193,7 +193,12 @@ absolute-entry `PATH` (or `/usr/bin:/bin` fallback), and validated
 `MAKELEVEL`, jobserver/restart/terminal state, compiler variables, and internal
 build variables therefore cannot rewrite goals or bypass the facade's
 assignment allowlist. Toolchain and flag overrides must use the dedicated Zig
-options or an allowlisted `-Dmake-arg`.
+options or an allowlisted `-Dmake-arg`. Before process replacement, the runner
+resolves a bare Make command itself using only that validated child `PATH`;
+commands containing `/` are canonicalized directly. The selected backend must
+be an absolute, non-symlink regular executable owned by root or the current
+user, without group/other write access. The absolute result is passed to Zig so
+the runner's original inherited `PATH` is never consulted for execution.
 
 Invoke only one Make-backed named step per `zig build` command. A portable,
 non-blocking file lock rejects overlapping Make processes rather than allowing
