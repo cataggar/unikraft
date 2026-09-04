@@ -191,6 +191,85 @@ jobs:
           - platform: ${{ matrix.plat }}
             architecture: ${{ matrix.arch }}
 
+  zig-helloworld:
+    name: zig-helloworld
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Load configuration
+      uses: ./.github/actions/ci-versions
+
+    - name: Fetch helloworld
+      uses: actions/checkout@v4
+      with:
+        repository: unikraft/app-helloworld
+        fetch-depth: 1
+        path: _helloworld
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          bison \
+          flex \
+          libncurses-dev \
+          qemu-system-x86
+
+    - name: Install Zig
+      run: |
+        archive="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
+        directory="${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}"
+        curl --fail --location --silent --show-error \
+          "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+          --output "${archive}"
+        echo "${ZIG_X86_64_LINUX_SHA256}  ${archive}" | sha256sum --check
+        tar --extract --xz --file "${archive}" --directory "${RUNNER_TEMP}"
+        echo "${directory}" >> "${GITHUB_PATH}"
+
+    - name: Build helloworld with Zig
+      run: |
+        test "$(zig version)" = "${ZIG_VERSION}"
+        make \
+          A="${GITHUB_WORKSPACE}/_helloworld" \
+          O="${RUNNER_TEMP}/build-zig" \
+          UK_DEFCONFIG="${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-x86_64" \
+          defconfig
+        make \
+          A="${GITHUB_WORKSPACE}/_helloworld" \
+          O="${RUNNER_TEMP}/build-zig" \
+          COMPILER='zig cc -target x86_64-freestanding-none' \
+          LINKER=gcc \
+          UK_CFLAGS=-std=gnu17 \
+          -j"$(nproc)"
+
+    - name: Inspect Zig image
+      run: |
+        image="${RUNNER_TEMP}/build-zig/helloworld_qemu-x86_64.dbg"
+        file "${image}"
+        readelf --file-header "${image}" | grep --quiet 'Class:.*ELF64'
+        readelf --file-header "${image}" | grep --quiet 'Machine:.*X86-64'
+        ! readelf --program-headers "${image}" | grep --quiet INTERP
+        ! readelf --dynamic "${image}" 2>/dev/null | grep --quiet NEEDED
+
+    - name: Boot Zig image
+      run: |
+        image="${RUNNER_TEMP}/build-zig/helloworld_qemu-x86_64"
+        output="${RUNNER_TEMP}/zig-qemu.log"
+        set +e
+        timeout 30s qemu-system-x86_64 \
+          -kernel "${image}" \
+          -nographic \
+          -no-reboot \
+          2>&1 | tee "${output}"
+        status=${PIPESTATUS[0]}
+        set -e
+        test "${status}" -eq 0
+        grep --fixed-strings --quiet 'Hello world!' "${output}"
+
   static-analysis:
     name: static-analysis
     runs-on: ubuntu-latest
