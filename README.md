@@ -129,59 +129,81 @@ There are two ways to get started with Unikraft:
 
 2. Using the GNU Make-based system.  For this, see our [advanced usage guide][unikraft-guides-advanced].
 
-### Experimental Zig C compiler support
+### Zig build facade and experimental Zig C compiler support
 
-Zig 0.16.0 can compile GNU Make-configured QEMU/x86_64 and QEMU/ARM64
-applications by using its Clang-compatible C compiler driver.
+Zig 0.16.0 provides a compatibility facade for the existing GNU Make build.
+GNU Make remains the backend; this facade only maps Zig build steps and options
+to Make targets and assignments. It does not yet model Unikraft's components
+as a native Zig build graph.
 
-For QEMU/x86_64:
-
-```shell
-make \
-  COMPILER='zig cc -target x86_64-freestanding-none' \
-  PARTIAL_LINKER='zig ld.lld' \
-  PARTIAL_LINKER_TYPE=raw \
-  HOSTCC='zig cc' \
-  HOSTCXX='zig c++' \
-  HOSTCFLAGS='-fno-sanitize=null' \
-  AR='zig ar' \
-  NM=llvm-nm \
-  OBJCOPY=llvm-objcopy \
-  OBJDUMP=llvm-objdump \
-  READELF=llvm-readelf \
-  STRIP=llvm-strip \
-  UK_CFLAGS=-std=gnu17 \
-  UK_LDFLAGS=-rtlib=compiler-rt
-```
-
-Omitting `LINKER` makes the final link use Zig's compiler driver, while
-`PARTIAL_LINKER` uses Zig's bundled LLD for relocatable links. The x86_64 build
-does not require GCC, but it does require Python 3 and the LLVM binary tools
-listed above (`python3` and `llvm` on Debian and Ubuntu). The narrow
-`HOSTCFLAGS` exception accommodates Kconfig's kernel-style, null-derived list
-sentinel. Pass the host compiler settings and flag to configuration targets
-such as `defconfig` as well as to the build.
-
-For QEMU/ARM64, `COMPILER_TARGETED=y` tells the build that the compiler command
-already selects its own target, so the AArch64 cross prefix is not prepended to
-it and no architecture default target flag is added:
+From the Unikraft repository, build an application with:
 
 ```shell
-make \
-  COMPILER='zig cc -target aarch64-freestanding-none' \
-  COMPILER_TARGETED=y \
-  LINKER=gcc \
-  UK_CFLAGS=-std=gnu17
+zig build \
+  -Dapp=/absolute/path/to/app \
+  -Doutput=/absolute/path/to/app/build \
+  -Dconfig=/absolute/path/to/app/.config
 ```
 
-The ARM64 build additionally requires an AArch64 GNU cross-toolchain
-(`gcc-aarch64-linux-gnu` and `binutils-aarch64-linux-gnu` on Debian and Ubuntu),
-because `LINKER` and the binutils keep using the `aarch64-linux-gnu-` prefix.
+The default step delegates to Make's `all` target. Named steps include
+`images`, `libs`, `objs`, `preprocess`, `prepare`, `fetch`, configuration
+targets such as `menuconfig` and `defconfig`, and `clean`, `properclean`, and
+`distclean`. For example:
 
-This support is experimental, limited to the GNU Make build of QEMU/x86_64 and
-QEMU/ARM64, and does not support LTO. The x86_64 configuration is GCC-free and
-uses Zig plus LLVM binary tools. The ARM64 configuration still requires its
-existing GCC linker driver and GNU cross-binutils.
+```shell
+zig build menuconfig -Dapp=/absolute/path/to/app
+zig build images -Dapp=/absolute/path/to/app -Dverbose=1
+```
+
+`-Dapp`, `-Doutput`, `-Dconfig`, and `-Dimage-name` map to Make's `A`, `O`,
+`C`, and `N` variables. Repeat `-Dexternal-lib`, `-Dexternal-platform`, or
+`-Dexclude` to construct the `L`, `P`, or `E` path lists. Relative paths are
+resolved from the Unikraft repository root. Additional Make assignments can be
+forwarded as individual, safely separated arguments with repeated
+`-Dmake-arg=NAME=VALUE`; facade-managed variables must use their dedicated
+options.
+
+The experimental QEMU/x86_64 Zig compiler setup becomes:
+
+```shell
+zig build \
+  -Dapp=/absolute/path/to/app \
+  '-Dcompiler=zig cc -target x86_64-freestanding-none' \
+  '-Dpartial-linker=zig ld.lld' \
+  -Dpartial-linker-type=raw \
+  '-Dhost-cc=zig cc' \
+  '-Dhost-cxx=zig c++' \
+  -Dhost-cflags=-fno-sanitize=null \
+  '-Dmake-arg=AR=zig ar' \
+  -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf \
+  -Dmake-arg=STRIP=llvm-strip \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17 \
+  -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
+```
+
+Omitting `-Dlinker` makes the final link use the compiler driver. The x86_64
+build requires Python 3 and the listed LLVM binary tools, but not GCC. The
+`host-cflags` exception accommodates Kconfig's kernel-style, null-derived list
+sentinel.
+
+For QEMU/ARM64, use a target-selecting compiler and keep the existing GNU
+linker and binutils, for example:
+
+```shell
+zig build \
+  -Dapp=/absolute/path/to/app \
+  '-Dcompiler=zig cc -target aarch64-freestanding-none' \
+  -Dcompiler-targeted=true \
+  -Dlinker=gcc \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17
+```
+
+ARM64 additionally requires an AArch64 GNU cross-toolchain. This compiler
+support remains experimental, is limited to GNU Make-configured QEMU/x86_64
+and QEMU/ARM64 applications, and does not support LTO.
 
 ### Toolchain Installation
 
