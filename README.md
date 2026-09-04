@@ -129,6 +129,23 @@ There are two ways to get started with Unikraft:
 
 2. Using the GNU Make-based system.  For this, see our [advanced usage guide][unikraft-guides-advanced].
 
+### Experimental Zig C compiler support
+
+Zig 0.16.0 can compile a GNU Make-configured QEMU/x86_64 application by using
+its Clang-compatible C compiler driver:
+
+```shell
+make \
+  COMPILER='zig cc -target x86_64-freestanding-none' \
+  LINKER=gcc \
+  UK_CFLAGS=-std=gnu17
+```
+
+This support is experimental and limited to QEMU/x86_64 without LTO. Zig
+compiles the target sources, while the GCC linker driver and GNU binutils are
+still required because Zig 0.16 does not support the relocatable links used by
+the Unikraft build.
+
 ### Toolchain Installation
 
 You can install the companion command-line client [`kraft`][kraft] by using the interactive installer:
