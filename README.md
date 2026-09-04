@@ -131,8 +131,10 @@ There are two ways to get started with Unikraft:
 
 ### Experimental Zig C compiler support
 
-Zig 0.16.0 can compile a GNU Make-configured QEMU/x86_64 application by using
-its Clang-compatible C compiler driver:
+Zig 0.16.0 can compile GNU Make-configured QEMU/x86_64 and QEMU/ARM64
+applications by using its Clang-compatible C compiler driver.
+
+For QEMU/x86_64:
 
 ```shell
 make \
@@ -141,10 +143,27 @@ make \
   UK_CFLAGS=-std=gnu17
 ```
 
-This support is experimental and limited to QEMU/x86_64 without LTO. Zig
-compiles the target sources, while the GCC linker driver and GNU binutils are
-still required because Zig 0.16 does not support the relocatable links used by
-the Unikraft build.
+For QEMU/ARM64, `COMPILER_TARGETED=y` tells the build that the compiler command
+already selects its own target, so the AArch64 cross prefix is not prepended to
+it and no architecture default target flag is added:
+
+```shell
+make \
+  COMPILER='zig cc -target aarch64-freestanding-none' \
+  COMPILER_TARGETED=y \
+  LINKER=gcc \
+  UK_CFLAGS=-std=gnu17
+```
+
+The ARM64 build additionally requires an AArch64 GNU cross-toolchain
+(`gcc-aarch64-linux-gnu` and `binutils-aarch64-linux-gnu` on Debian and Ubuntu),
+because `LINKER` and the binutils keep using the `aarch64-linux-gnu-` prefix.
+
+This support is experimental, limited to the GNU Make build of QEMU/x86_64 and
+QEMU/ARM64, and does not support LTO. Neither target is a pure Zig toolchain:
+Zig compiles the target sources, while the GCC linker driver and GNU binutils
+are still required because Zig 0.16 does not support the relocatable links used
+by the Unikraft build.
 
 ### Toolchain Installation
 
