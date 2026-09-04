@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 
 const lock_name = "build.lock";
 const runtime_prefix = "unikraft-zig-facade-";
+const stable_temp_root = if (builtin.os.tag == .macos) "/private/tmp" else "/tmp";
 
 const RuntimeDirectory = struct {
     dir: std.Io.Dir,
@@ -12,14 +13,20 @@ const RuntimeDirectory = struct {
 
 const MetadataRole = enum {
     temp_root,
+    isolated_temp_root,
     runtime_directory,
     lock_file,
+    output_directory,
+    marker_file,
 };
+
+const stable_temp_root_role: MetadataRole = .temp_root;
 
 const Metadata = struct {
     mode: u32,
     uid: u64,
     nlink: u64,
+    size: u64,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -38,28 +45,25 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    const temp_root = init.environ_map.get("TMPDIR") orelse
-        init.environ_map.get("TEMP") orelse
-        init.environ_map.get("TMP") orelse
-        defaultTempRoot();
     const uid = std.posix.system.geteuid();
     var runtime = prepareRuntimeDirectory(
         allocator,
         init.io,
-        temp_root,
+        stable_temp_root,
         uid,
+        stable_temp_root_role,
     ) catch |err| switch (err) {
         error.UnsafeTempRoot => {
             std.debug.print(
-                "error: refusing insecure temporary root '{s}': it must be a real directory owned by this user without group/other write access, or a root-owned sticky shared directory\n",
-                .{temp_root},
+                "error: refusing insecure stable temporary root '{s}': it must be a real, root-owned sticky shared directory\n",
+                .{stable_temp_root},
             );
             std.process.exit(2);
         },
         error.UnsafeRuntimeDirectory => {
             std.debug.print(
                 "error: refusing insecure UID-scoped Zig facade runtime directory below '{s}': expected a real, current-user-owned 0700 directory\n",
-                .{temp_root},
+                .{stable_temp_root},
             );
             std.process.exit(2);
         },
@@ -68,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
     defer runtime.dir.close(init.io);
     if (facade_paths.isSameOrAncestor(args[1], runtime.path)) {
         std.debug.print(
-            "error: the Zig facade runtime directory '{s}' is inside output '{s}'; set TMPDIR to a stable directory outside every Make output tree\n",
+            "error: the Zig facade runtime directory '{s}' is inside output '{s}'\n",
             .{ runtime.path, args[1] },
         );
         std.process.exit(2);
@@ -99,12 +103,39 @@ pub fn main(init: std.process.Init) !void {
     };
     defer lock.close(init.io);
 
-    try std.Io.Dir.cwd().createDirPath(init.io, args[1]);
-    const marker = try facade_paths.markerPath(allocator, args[1]);
-    try std.Io.Dir.cwd().writeFile(init.io, .{
-        .sub_path = marker,
-        .data = facade_paths.marker_contents,
-    });
+    _ = try std.Io.Dir.cwd().createDirPathStatus(
+        init.io,
+        args[1],
+        .fromMode(0o700),
+    );
+    var output = std.Io.Dir.cwd().openDir(init.io, args[1], .{
+        .follow_symlinks = false,
+    }) catch {
+        std.debug.print(
+            "error: refusing unsafe output directory '{s}': expected a real, current-user-owned directory without group/other write access\n",
+            .{args[1]},
+        );
+        std.process.exit(2);
+    };
+    defer output.close(init.io);
+    validateMetadata(
+        try metadataForHandle(output.handle),
+        uid,
+        .output_directory,
+    ) catch {
+        std.debug.print(
+            "error: refusing unsafe output directory '{s}': expected a real, current-user-owned directory without group/other write access\n",
+            .{args[1]},
+        );
+        std.process.exit(2);
+    };
+    ensureBuildMarker(output, init.io, uid) catch {
+        std.debug.print(
+            "error: refusing unsafe build marker '{s}' in output '{s}': expected a real, current-user-owned, single-link regular file with safe permissions and exact facade marker content\n",
+            .{ facade_paths.marker_name, args[1] },
+        );
+        std.process.exit(2);
+    };
 
     // Exec keeps the locked descriptor in Make and every normally spawned descendant.
     try setCloseOnExec(lock, false);
@@ -146,10 +177,6 @@ fn acquireLock(
     return file;
 }
 
-fn defaultTempRoot() []const u8 {
-    return if (builtin.os.tag == .windows) "." else "/tmp";
-}
-
 fn runtimeDirectoryName(
     allocator: std.mem.Allocator,
     uid: std.posix.uid_t,
@@ -162,13 +189,14 @@ fn prepareRuntimeDirectory(
     io: std.Io,
     temp_root: []const u8,
     uid: std.posix.uid_t,
+    temp_root_role: MetadataRole,
 ) !RuntimeDirectory {
     const absolute_root = try std.fs.path.resolve(allocator, &.{temp_root});
     var root = std.Io.Dir.cwd().openDir(io, absolute_root, .{
         .follow_symlinks = false,
     }) catch return error.UnsafeTempRoot;
     defer root.close(io);
-    try validateMetadata(try metadataForHandle(root.handle), uid, .temp_root);
+    try validateMetadata(try metadataForHandle(root.handle), uid, temp_root_role);
 
     const runtime_name = try runtimeDirectoryName(allocator, uid);
     root.createDir(io, runtime_name, .fromMode(0o700)) catch |err| switch (err) {
@@ -221,6 +249,7 @@ fn metadataForHandle(handle: std.posix.fd_t) !Metadata {
                         .mode = metadata.mode,
                         .uid = metadata.uid,
                         .nlink = metadata.nlink,
+                        .size = metadata.size,
                     };
                 },
                 .INTR => continue,
@@ -235,6 +264,7 @@ fn metadataForHandle(handle: std.posix.fd_t) !Metadata {
                     .mode = @intCast(metadata.mode),
                     .uid = @intCast(metadata.uid),
                     .nlink = @intCast(metadata.nlink),
+                    .size = @intCast(metadata.size),
                 },
                 .INTR => continue,
                 else => |err| return std.posix.unexpectedErrno(err),
@@ -257,12 +287,16 @@ fn validateMetadata(
                 metadata.uid == 0 and
                 permissions & 0o1000 != 0 and
                 permissions & 0o003 == 0o003;
+            if (!root_owned_sticky) return error.UnsafeTempRoot;
+        },
+        .isolated_temp_root => {
+            if (metadata.mode & std.posix.S.IFMT != std.posix.S.IFDIR)
+                return error.UnsafeTempRoot;
             const user_owned_private =
                 metadata.uid == @as(u64, uid) and
                 permissions & 0o700 == 0o700 and
                 permissions & 0o022 == 0;
-            if (!root_owned_sticky and !user_owned_private)
-                return error.UnsafeTempRoot;
+            if (!user_owned_private) return error.UnsafeTempRoot;
         },
         .runtime_directory => {
             if (metadata.mode & std.posix.S.IFMT != std.posix.S.IFDIR or
@@ -281,6 +315,91 @@ fn validateMetadata(
                 return error.UnsafeLockFile;
             }
         },
+        .output_directory => {
+            if (metadata.mode & std.posix.S.IFMT != std.posix.S.IFDIR or
+                metadata.uid != @as(u64, uid) or
+                permissions & 0o700 != 0o700 or
+                permissions & 0o022 != 0)
+            {
+                return error.UnsafeOutputDirectory;
+            }
+        },
+        .marker_file => {
+            if (metadata.mode & std.posix.S.IFMT != std.posix.S.IFREG or
+                metadata.uid != @as(u64, uid) or
+                permissions & 0o600 != 0o600 or
+                permissions & 0o022 != 0 or
+                metadata.nlink != 1)
+            {
+                return error.UnsafeMarkerFile;
+            }
+        },
+    }
+}
+
+fn ensureBuildMarker(
+    output: std.Io.Dir,
+    io: std.Io,
+    uid: std.posix.uid_t,
+) !void {
+    const marker = output.createFile(io, facade_paths.marker_name, .{
+        .read = true,
+        .truncate = false,
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+        .resolve_beneath = true,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            const path_metadata = output.statFile(
+                io,
+                facade_paths.marker_name,
+                .{ .follow_symlinks = false },
+            ) catch return error.UnsafeMarkerFile;
+            if (path_metadata.kind != .file) return error.UnsafeMarkerFile;
+            const existing = try openExistingMarker(output);
+            defer existing.close(io);
+            const metadata = try metadataForHandle(existing.handle);
+            try validateMetadata(metadata, uid, .marker_file);
+            if (metadata.size != facade_paths.marker_contents.len)
+                return error.UnsafeMarkerFile;
+            var contents: [facade_paths.marker_contents.len]u8 = undefined;
+            const count = try existing.readPositionalAll(io, &contents, 0);
+            if (count != contents.len or
+                !std.mem.eql(u8, &contents, facade_paths.marker_contents))
+            {
+                return error.UnsafeMarkerFile;
+            }
+            return;
+        },
+        else => return err,
+    };
+    defer marker.close(io);
+    try validateMetadata(try metadataForHandle(marker.handle), uid, .marker_file);
+    try marker.writePositionalAll(io, facade_paths.marker_contents, 0);
+}
+
+fn openExistingMarker(output: std.Io.Dir) !std.Io.File {
+    const flags: std.posix.O = .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+    };
+    while (true) {
+        const result = std.posix.system.openat(
+            output.handle,
+            facade_paths.marker_name,
+            flags,
+            @as(std.posix.mode_t, 0),
+        );
+        switch (std.posix.errno(result)) {
+            .SUCCESS => return .{
+                .handle = @intCast(result),
+                .flags = .{ .nonblocking = true },
+            },
+            .INTR => continue,
+            else => return error.UnsafeMarkerFile,
+        }
     }
 }
 
@@ -334,10 +453,9 @@ test "runtime directory names are UID scoped" {
     try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
-test "default POSIX temporary root is system scoped" {
-    if (builtin.os.tag != .windows) {
-        try std.testing.expectEqualStrings("/tmp", defaultTempRoot());
-    }
+test "stable POSIX temporary root ignores process environment" {
+    const expected = if (builtin.os.tag == .macos) "/private/tmp" else "/tmp";
+    try std.testing.expectEqualStrings(expected, stable_temp_root);
 }
 
 test "temporary roots require trusted ownership and permissions" {
@@ -346,12 +464,13 @@ test "temporary roots require trusted ownership and permissions" {
         .mode = std.posix.S.IFDIR | 0o755,
         .uid = @as(u64, uid),
         .nlink = 2,
+        .size = 0,
     };
-    try validateMetadata(metadata, uid, .temp_root);
+    try validateMetadata(metadata, uid, .isolated_temp_root);
     metadata.mode = std.posix.S.IFDIR | 0o775;
     try std.testing.expectError(
         error.UnsafeTempRoot,
-        validateMetadata(metadata, uid, .temp_root),
+        validateMetadata(metadata, uid, .isolated_temp_root),
     );
 
     metadata.mode = std.posix.S.IFDIR | 0o1777;
@@ -392,4 +511,68 @@ test "private runtime metadata rejects unsafe ownership permissions and links" {
         error.UnsafeLockFile,
         validateMetadata(metadata, uid, .lock_file),
     );
+
+    metadata.mode = std.posix.S.IFCHR | 0o600;
+    metadata.nlink = 1;
+    try std.testing.expectError(
+        error.UnsafeMarkerFile,
+        validateMetadata(metadata, uid, .marker_file),
+    );
+
+    metadata.mode = std.posix.S.IFREG | 0o600;
+    metadata.uid = @as(u64, uid) + 1;
+    try std.testing.expectError(
+        error.UnsafeMarkerFile,
+        validateMetadata(metadata, uid, .marker_file),
+    );
+
+    metadata.mode = std.posix.S.IFDIR | 0o700;
+    metadata.uid = @as(u64, uid);
+    try validateMetadata(metadata, uid, .output_directory);
+    metadata.mode = std.posix.S.IFDIR | 0o722;
+    try std.testing.expectError(
+        error.UnsafeOutputDirectory,
+        validateMetadata(metadata, uid, .output_directory),
+    );
+}
+
+test "build marker creation is repeatable and rejects symlinks without writes" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const uid = std.posix.system.geteuid();
+
+    try ensureBuildMarker(temporary.dir, std.testing.io, uid);
+    try ensureBuildMarker(temporary.dir, std.testing.io, uid);
+    const contents = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        facade_paths.marker_name,
+        std.testing.allocator,
+        .limited(facade_paths.marker_contents.len + 1),
+    );
+    defer std.testing.allocator.free(contents);
+    try std.testing.expectEqualStrings(facade_paths.marker_contents, contents);
+
+    try temporary.dir.deleteFile(std.testing.io, facade_paths.marker_name);
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "victim",
+        .data = "unchanged",
+    });
+    try temporary.dir.symLink(
+        std.testing.io,
+        "victim",
+        facade_paths.marker_name,
+        .{},
+    );
+    try std.testing.expectError(
+        error.UnsafeMarkerFile,
+        ensureBuildMarker(temporary.dir, std.testing.io, uid),
+    );
+    const victim = try temporary.dir.readFileAlloc(
+        std.testing.io,
+        "victim",
+        std.testing.allocator,
+        .limited(32),
+    );
+    defer std.testing.allocator.free(victim);
+    try std.testing.expectEqualStrings("unchanged", victim);
 }

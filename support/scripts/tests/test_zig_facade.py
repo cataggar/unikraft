@@ -9,6 +9,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import threading
 import time
 import unittest
 
@@ -99,6 +100,29 @@ with log.open("a", encoding="utf-8") as stream:
                 destination = checkout / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / relative, destination)
+            runner = checkout / "support/build/zig-facade-runner.zig"
+            runner_source = runner.read_text(encoding="utf-8")
+            production_root = (
+                'const stable_temp_root = if (builtin.os.tag == .macos) '
+                '"/private/tmp" else "/tmp";'
+            )
+            if production_root not in runner_source:
+                raise AssertionError("runner stable temporary root declaration changed")
+            production_role = (
+                "const stable_temp_root_role: MetadataRole = .temp_root;"
+            )
+            if production_role not in runner_source:
+                raise AssertionError("runner stable temporary root policy changed")
+            runner.write_text(
+                runner_source.replace(
+                    production_root,
+                    f'const stable_temp_root = "{cls.runtime}";',
+                ).replace(
+                    production_role,
+                    "const stable_temp_root_role: MetadataRole = .isolated_temp_root;",
+                ),
+                encoding="utf-8",
+            )
             cls.checkouts.append(checkout)
 
     @classmethod
@@ -246,7 +270,10 @@ with log.open("a", encoding="utf-8") as stream:
                 goal="properclean",
             ),
             cwd=first_invocation,
-            env=self.facade_env(ZIG_FACADE_TEST_SLEEP="5"),
+            env=self.facade_env(
+                TMPDIR=str(self.work / "ignored-temp-one"),
+                ZIG_FACADE_TEST_SLEEP="5",
+            ),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -267,7 +294,9 @@ with log.open("a", encoding="utf-8") as stream:
                     nested_output,
                 ),
                 cwd=second_invocation,
-                env=self.facade_env(),
+                env=self.facade_env(
+                    TMPDIR=str(self.work / "ignored-temp-two"),
+                ),
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -507,7 +536,7 @@ with log.open("a", encoding="utf-8") as stream:
             check=False,
         )
         self.assertNotEqual(unsafe_temp_root.returncode, 0)
-        self.assertIn("refusing insecure temporary root", unsafe_temp_root.stdout)
+        self.assertIn("refusing insecure stable temporary root", unsafe_temp_root.stdout)
         self.runtime.chmod(0o755)
 
         shutil.rmtree(private)
@@ -521,6 +550,91 @@ with log.open("a", encoding="utf-8") as stream:
             timeout=60,
             check=False,
         )
+        self.assertEqual(recovered.returncode, 0, recovered.stdout)
+
+    def test_build_marker_attacks_fail_without_target_modification(self):
+        checkout = self.checkouts[0]
+        cache = self.work / "marker-cache"
+        output = self.app / "build"
+        marker = output / ".unikraft-zig-build"
+        victim = self.work / "marker-victim"
+        victim.write_text("unchanged", encoding="utf-8")
+        victim.chmod(0o600)
+
+        initial = self.run_facade(checkout, cache, output)
+        self.assertEqual(initial.returncode, 0, initial.stdout)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "unikraft-zig-build-v1\n")
+
+        marker.unlink()
+        marker.symlink_to(victim)
+        symlink_result = self.run_facade(checkout, cache, output)
+        self.assertNotEqual(symlink_result.returncode, 0)
+        self.assertIn("refusing unsafe build marker", symlink_result.stdout)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "unchanged")
+        marker.unlink()
+
+        os.link(victim, marker)
+        hardlink_result = self.run_facade(checkout, cache, output)
+        self.assertNotEqual(hardlink_result.returncode, 0)
+        self.assertIn("single-link regular file", hardlink_result.stdout)
+        self.assertEqual(victim.read_text(encoding="utf-8"), "unchanged")
+        marker.unlink()
+
+        marker.mkdir()
+        directory_result = self.run_facade(checkout, cache, output)
+        self.assertNotEqual(directory_result.returncode, 0)
+        self.assertIn("refusing unsafe build marker", directory_result.stdout)
+        marker.rmdir()
+
+        os.mkfifo(marker, mode=0o600)
+        fifo_result = self.run_facade(checkout, cache, output)
+        self.assertNotEqual(fifo_result.returncode, 0)
+        self.assertIn("refusing unsafe build marker", fifo_result.stdout)
+        marker.unlink()
+
+        marker.write_text("wrong marker\n", encoding="utf-8")
+        marker.chmod(0o600)
+        content_result = self.run_facade(checkout, cache, output)
+        self.assertNotEqual(content_result.returncode, 0)
+        self.assertIn("exact facade marker content", content_result.stdout)
+        marker.unlink()
+
+        marker.write_text("unikraft-zig-build-v1\n", encoding="utf-8")
+        marker.chmod(0o622)
+        mode_result = self.run_facade(checkout, cache, output)
+        self.assertNotEqual(mode_result.returncode, 0)
+        self.assertIn("safe permissions", mode_result.stdout)
+        marker.unlink()
+
+        race_target = self.work / "marker-race-victim"
+        race_target.write_text("race-unchanged", encoding="utf-8")
+        stop = threading.Event()
+
+        def replace_marker():
+            while not stop.is_set():
+                try:
+                    marker.unlink(missing_ok=True)
+                    marker.symlink_to(race_target)
+                    marker.unlink(missing_ok=True)
+                    marker.write_text("unikraft-zig-build-v1\n", encoding="utf-8")
+                    marker.chmod(0o600)
+                except FileExistsError:
+                    pass
+
+        attacker = threading.Thread(target=replace_marker)
+        attacker.start()
+        try:
+            race_result = self.run_facade(checkout, cache, output)
+            self.assertIn(race_result.returncode, (0, 1))
+        finally:
+            stop.set()
+            attacker.join(timeout=5)
+        self.assertFalse(attacker.is_alive())
+        self.assertEqual(race_target.read_text(encoding="utf-8"), "race-unchanged")
+
+        if marker.is_symlink() or marker.is_file():
+            marker.unlink()
+        recovered = self.run_facade(checkout, cache, output)
         self.assertEqual(recovered.returncode, 0, recovered.stdout)
 
 

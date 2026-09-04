@@ -183,14 +183,15 @@ Invoke only one Make-backed named step per `zig build` command. A portable,
 non-blocking file lock rejects overlapping Make processes rather than allowing
 selected steps such as `clean all` to race. For each effective UID, facade
 invocations use one lock in a private `unikraft-zig-facade-<uid>` directory
-beneath the OS runtime root (`TMPDIR`, `TEMP`, or `TMP`, with the platform
-default as fallback). The facade requires that directory to be owned by the
-current user with mode `0700`, and the regular, single-link lock to have mode
-`0600`; symlinks and unsafe ownership or permissions are refused. The
-surrounding runtime root must itself be an owner-secure directory or a
+beneath the fixed POSIX shared temporary root (`/tmp`, or `/private/tmp` on
+macOS). `TMPDIR`, `TEMP`, and `TMP` do not change this identity. The facade
+requires the private directory to be owned by the current user with mode
+`0700`, and the regular, single-link lock to have mode `0600`; symlinks and
+unsafe ownership or permissions are refused. The fixed root must itself be a
 root-owned sticky shared directory. This preserves same-user serialization
 across parent/nested outputs, caches, applications, and checkouts without
-allowing one user to lock out another.
+allowing one user to lock out another or split the lock through environment
+changes.
 
 The private runtime directory must be outside every output tree; its persistent
 lock file is never unlinked while held. Before invoking Make, the runner makes
@@ -201,6 +202,12 @@ backend tree exits. Hosts without process-image replacement are refused rather
 than running without this lifetime guarantee. Run separate commands when
 multiple phases are needed.
 
+The facade creates `.unikraft-zig-build` relative to a validated canonical
+output-directory handle. New markers use exclusive creation; existing markers
+must be current-user-owned, single-link regular files with safe permissions and
+the exact expected contents. No-follow, descriptor-relative operations prevent
+marker symlinks or replacement races from redirecting writes.
+
 Non-destructive builds may use an external `-Dconfig`. The `distclean` step is
 stricter because Make deletes the configuration and sibling metadata: every
 canonical deletion target must remain inside the application tree. Otherwise,
@@ -208,8 +215,8 @@ the facade refuses `distclean` and leaves manual cleanup to the user.
 `zig build test` runs the facade's path, argument, and lock unit checks.
 `python3 -m unittest -v support.scripts.tests.test_zig_facade` adds
 end-to-end metacharacter, cross-checkout parent/nested output, and orphaned
-backend-tree lock-lifetime coverage, including hostile pre-existing runtime
-entries and fallback temporary-root selection.
+backend-tree lock-lifetime coverage, including hostile runtime and build-marker
+entries and differing temporary-directory environments.
 
 The experimental QEMU/x86_64 Zig compiler setup becomes:
 
