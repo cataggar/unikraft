@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Deterministic build graph export. This file is included after all library,
+# platform, build, and linker registrations have completed.
+
+BUILD_GRAPH_INPUT := $(BUILD_DIR)/.build-graph.records
+BUILD_GRAPH_OUTPUT ?= $(BUILD_DIR)/build-graph.json
+
+BUILD_GRAPH_PLATFORMS := $(sort $(UK_PLATS) $(UK_PLATS-y))
+BUILD_GRAPH_PLATFORM_LIBS := $(sort \
+	$(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+		$($(call uc,$(P))_LIBS) $($(call uc,$(P))_LIBS-y)))
+BUILD_GRAPH_LIBS := $(sort $(UK_LIBS) $(UK_LIBS-y) \
+	$(BUILD_GRAPH_PLATFORM_LIBS))
+BUILD_GRAPH_OLIBS := $(UK_OLIBS) $(UK_OLIBS-y) \
+	$(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+		$($(call uc,$(P))_OLIBS) $($(call uc,$(P))_OLIBS-y))
+BUILD_GRAPH_AUX_OUTPUTS := $(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+	$($(call uc,$(P))_COMPILE_DB_IMAGE))
+BUILD_GRAPH_OBJECT_EXTS := S sx s c cp cc cpp CPP C c++ rs
+
+# All records have ten tab-separated columns. Empty trailing columns are
+# intentional. GNU Make paths and source words cannot contain tabs or newlines.
+define build_graph_emit =
+$(file >>$(BUILD_GRAPH_INPUT),$(strip $(1))	$(strip $(2))	$(strip $(3))	$(strip $(4))	$(strip $(5))	$(strip $(6))	$(strip $(7))	$(strip $(8))	$(strip $(9))	$(strip $(10)))
+endef
+
+define build_graph_emit_source_variant =
+$(eval _bg_definition := $(word 1,$(subst |, ,$(2))))\
+$(eval _bg_source := $(word 1,$(subst >, ,$(_bg_definition))))\
+$(eval _bg_suffix := $(word 2,$(subst >, ,$(_bg_definition))))\
+$(eval _bg_prep_subbuild := $($(call vprefix_src,$(1),$(_bg_source),$(3),SUBBUILD)))\
+$(eval _bg_generated := $(if $(_bg_suffix),\
+	$(call src2dst,$(1),$(_bg_source),$(_bg_suffix),$(3),$(_bg_prep_subbuild))))\
+$(eval _bg_effective := $(if $(_bg_generated),$(_bg_generated),$(_bg_source)))\
+$(eval _bg_subbuild := $($(call vprefix_src,$(1),$(_bg_effective),$(3),SUBBUILD)))\
+$(eval _bg_ext := $(call fileext,$(_bg_effective)))\
+$(eval _bg_output := $(if $(filter %.lds.S,$(_bg_effective)),\
+	$(call src2lds,$(1),$(_bg_effective),$(_bg_subbuild)),\
+	$(if $(filter %.dts,$(_bg_effective)),\
+		$(call dts2dtb,$(1),$(_bg_effective),$(_bg_subbuild)),\
+		$(if $(filter ld,$(_bg_ext)),$(_bg_effective),))))\
+$(eval _bg_object := $(if $(and \
+	$(filter $(BUILD_GRAPH_OBJECT_EXTS),$(_bg_ext)),\
+	$(filter-out %.lds.S,$(_bg_effective))),\
+	$(call src2obj,$(1),$(_bg_effective),$(3),$(_bg_subbuild))))\
+$(eval _bg_depfile := $(if $(_bg_object),$(call out2dep,$(_bg_object)),\
+	$(if $(filter %.lds,$(_bg_output)),$(call out2dep,$(_bg_output)))))\
+$(call build_graph_emit,source,$(1),$(2),$(_bg_source),$(_bg_suffix),$(3),\
+	$(_bg_generated),$(_bg_object),$(_bg_output),$(_bg_depfile))\
+$(if $(_bg_generated),\
+	$(call build_graph_emit,source-dependency,$(1),$(2),$(3),generated,$(_bg_source)))\
+$(if $(_bg_generated),\
+	$(if $(filter awk,$(call fileext,$(_bg_source))),\
+	$(foreach D,$($(call vprefix_lib,$(1),AWKINCLUDES)) \
+		    $($(call vprefix_lib,$(1),AWKINCLUDES-y)) \
+		    $($(call vprefix_src,$(1),$(_bg_source),,AWKINCLUDES)) \
+		    $($(call vprefix_src,$(1),$(_bg_source),,AWKINCLUDES-y)),\
+		$(call build_graph_emit,source-dependency,$(1),$(2),$(3),generated,$(D)))))\
+$(if $(_bg_generated),\
+	$(call build_graph_emit,source-dependency,$(1),$(2),$(3),generated,$(KCONFIG_AUTOHEADER)))\
+$(call build_graph_emit,source-dependency,$(1),$(2),$(3),build,$(_bg_effective))\
+$(foreach D,$($(call vprefix_src,$(1),$(_bg_effective),$(3),CDEPS)) \
+	    $($(call vprefix_src,$(1),$(_bg_effective),$(3),CDEPS-y)),\
+	$(call build_graph_emit,source-dependency,$(1),$(2),$(3),build,$(D)))\
+$(call build_graph_emit,source-dependency,$(1),$(2),$(3),build,$(KCONFIG_AUTOHEADER))
+endef
+
+define build_graph_emit_source =
+$(if $(wordlist 2,$(words $(subst |, ,$(2))),$(subst |, ,$(2))),\
+	$(foreach V,$(wordlist 2,$(words $(subst |, ,$(2))),$(subst |, ,$(2))),\
+		$(call build_graph_emit_source_variant,$(1),$(2),$(V))),\
+	$(call build_graph_emit_source_variant,$(1),$(2),))
+endef
+
+define build_graph_emit_library =
+$(call build_graph_emit,library,$(1),\
+	$(if $(filter $(1),$(BUILD_GRAPH_PLATFORM_LIBS)),platform,library),\
+	$($(call uc,$(1))_BASE),$($(call uc,$(1))_BUILD),\
+	$(if $(filter $(call libname2olib,$(1)),$(BUILD_GRAPH_OLIBS)),\
+		$(call libname2olib,$(1))),$($(call uc,$(1))_SRC))\
+$(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+	$(if $(filter $(1),$($(call uc,$(P))_LIBS) $($(call uc,$(P))_LIBS-y)),\
+		$(call build_graph_emit,library-platform,$(1),$(P))))\
+$(foreach O,$($(call uc,$(1))_OBJS) $($(call uc,$(1))_OBJS-y),\
+	$(call build_graph_emit,library-object,$(1),$(O)))\
+$(foreach L,$($(call uc,$(1))_LDS) $($(call uc,$(1))_LDS-y),\
+	$(call build_graph_emit,library-linker-script,$(1),$(L)))\
+$(foreach D,$($(call uc,$(1))_LDEPS) $($(call uc,$(1))_LDEPS-y),\
+	$(call build_graph_emit,library-link-dependency,$(1),$(D)))\
+$(foreach S,$($(call uc,$(1))_SRCS) $($(call uc,$(1))_SRCS-y) \
+	    $(EACHOLIB_SRCS) $(EACHOLIB_SRCS-y),\
+	$(call build_graph_emit_source,$(1),$(S)))
+endef
+
+.PHONY: build-graph
+build-graph:
+	$(file >$(BUILD_GRAPH_INPUT))
+	$(call build_graph_emit,format,1)
+	$(call build_graph_emit,root,build,$(BUILD_DIR))
+	$(call build_graph_emit,root,unikraft,$(CONFIG_UK_BASE))
+	$(call build_graph_emit,root,app,$(CONFIG_UK_APP))
+	$(call build_graph_emit,context,architecture,$(CONFIG_UK_ARCH))
+	$(call build_graph_emit,context,architecture_family,$(UK_FAMILY))
+	$(call build_graph_emit,context,image_name,$(CONFIG_UK_NAME))
+	$(call build_graph_emit,context,image_name_override,$(UK_IMAGE_NAME_OVERWRITE))
+	$(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+		$(call build_graph_emit,platform,$(P),$(UK_PLAT_$(call uc,$(P))_BASE),\
+			$(UK_PLAT_$(call uc,$(P))_LINKER))\
+		$(foreach L,$($(call uc,$(P))_LIBS) $($(call uc,$(P))_LIBS-y),\
+			$(call build_graph_emit,platform-library,$(P),$(L)))\
+		$(foreach L,$(UK_PLAT_$(call uc,$(P))_DEF_LDS) \
+			    $($(call uc,$(P))_LD_SCRIPT) \
+			    $($(call uc,$(P))_LD_SCRIPT-y) \
+			    $($(call uc,$(P))_LD_SCRIPT_INPUTS) \
+			    $($(call uc,$(P))_LD_SCRIPT_DEPS) \
+			    $($(call uc,$(P))_COMBINED_LD_SCRIPT),\
+			$(call build_graph_emit,platform-linker-script,$(P),$(L))))
+	$(foreach L,$(BUILD_GRAPH_LIBS),$(call build_graph_emit_library,$(L)))
+	$(foreach P,$(UK_PREPROCESS) $(UK_PREPROCESS-y),\
+		$(call build_graph_emit,preprocess-output,$(P)))
+	$(foreach D,$(UK_DEPS) $(UK_DEPS-y),\
+		$(call build_graph_emit,dependency-file,$(D)))
+	$(foreach D,$(UK_LDEPS) \
+	    $(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+		$($(call uc,$(P))_LD_SCRIPT_DEPS)),\
+		$(call build_graph_emit,link-dependency,$(D)))
+	$(foreach L,$(UK_LDS) $(UK_LDS-y) $(EXTRA_LD_SCRIPT) $(EXTRA_LD_SCRIPT-y) \
+	    $(foreach P,$(BUILD_GRAPH_PLATFORMS),\
+		$(UK_PLAT_$(call uc,$(P))_DEF_LDS) \
+		$($(call uc,$(P))_LD_SCRIPT) $($(call uc,$(P))_LD_SCRIPT-y) \
+		$($(call uc,$(P))_LD_SCRIPT_INPUTS) \
+		$($(call uc,$(P))_COMBINED_LD_SCRIPT)),\
+		$(call build_graph_emit,linker-script,$(L)))
+	$(foreach I,$(UK_DEBUG_IMAGES) $(UK_DEBUG_IMAGES-y),\
+		$(call build_graph_emit,debug-output,$(I)))
+	$(foreach I,$(filter-out $(BUILD_GRAPH_AUX_OUTPUTS),\
+	    $(UK_IMAGES) $(UK_IMAGES-y)),\
+		$(call build_graph_emit,image-output,$(I)))
+	$(foreach I,$(BUILD_GRAPH_AUX_OUTPUTS),\
+		$(call build_graph_emit,auxiliary-output,$(I)))
+	$(Q)$(PYTHON) $(SCRIPTS_DIR)/build-graph.py \
+		--input $(BUILD_GRAPH_INPUT) --output $(BUILD_GRAPH_OUTPUT)
+	@printf '%s\n' '$(BUILD_GRAPH_OUTPUT)'

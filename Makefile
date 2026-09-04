@@ -853,6 +853,10 @@ endif
 # include Makefile for platform linking (`Linker.uk`)
 $(foreach plat,$(UK_PLATS),$(eval $(call import_linker,$(plat))))
 
+# Install the normalized build graph export only after all registration files
+# and platform linker definitions have been evaluated.
+$(eval $(call verbose_include,$(CONFIG_UK_BASE)/support/build/Makefile.graph))
+
 .PHONY: prepare preprocess image libs objs clean
 
 fetch: $(UK_FETCH) $(UK_FETCH-y)
@@ -915,7 +919,7 @@ ukconfig: $(BUILD_DIR)/Makefile menuconfig
 
 all: ukconfig
 
-.PHONY: prepare image libs objs clean-libs clean ukconfig
+.PHONY: prepare image libs objs clean-libs clean ukconfig build-graph
 
 fetch: ukconfig
 
@@ -928,6 +932,9 @@ objs: ukconfig
 libs: ukconfig
 
 images: ukconfig
+
+build-graph:
+	$(error Do not have a configuration. Please run one of the configuration targets first)
 
 clean-libs clean:
 	$(error Do not know which files to clean without having a configuration. Did you mean 'properclean' or 'distclean'?)
@@ -1317,6 +1324,8 @@ endif
 	@echo '  print-lds              - print linker script enabled for the build'
 	@echo '  print-objs             - print object file names enabled for build'
 	@echo '  print-srcs             - print source file names enabled for build'
+	@echo '  build-graph            - export normalized build graph to O/build-graph.json'
+	@echo '                           (schema: support/build/build-graph.md)'
 	@echo '  print-vars             - prints all the variables currently defined in Makefile'
 	@echo '  print-loc              - print Lines-of-Code statistics for built unikernel image(s)'
 	@echo ''

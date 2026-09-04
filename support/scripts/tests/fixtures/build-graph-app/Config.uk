@@ -1,0 +1,4 @@
+config LIBGRAPHFIXTURE
+	bool "Build graph export fixture"
+	default y
+	select LIBUKSTORE
