@@ -75,6 +75,14 @@ KVM_LD_SCRIPT_FLAGS += $(addprefix -Wl$(comma)-T$(comma),\
 KVM_LD_SCRIPT_DEPS := $(KVM_LD_SCRIPT_INPUTS)
 endif
 
+$(eval $(call add_build_graph_link_stage,kvm,final-link,link,$(KVM_DEBUG_IMAGE)))
+$(eval $(call add_build_graph_link_inputs,kvm,final-link,object,\
+	$(KVM_OLIBS) $(KVM_OLIBS-y) $(UK_OLIBS) $(UK_OLIBS-y)))
+$(eval $(call add_build_graph_link_inputs,kvm,final-link,archive,\
+	$(KVM_ALIBS) $(KVM_ALIBS-y) $(UK_ALIBS) $(UK_ALIBS-y)))
+$(eval $(call add_build_graph_link_inputs,kvm,final-link,linker-script,\
+	$(KVM_LD_SCRIPT_DEPS)))
+
 $(KVM_DEBUG_IMAGE): $(KVM_ALIBS) $(KVM_ALIBS-y) $(KVM_OLIBS) $(KVM_OLIBS-y) \
 		    $(UK_ALIBS) $(UK_ALIBS-y) $(UK_OLIBS) $(UK_OLIBS-y) \
 		    $(KVM_LD_SCRIPT_DEPS) $(UK_LDEPS)

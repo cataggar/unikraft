@@ -45,6 +45,11 @@ def root_token(kind, name=None):
     return f"${prefix}_{encoded_name}_BASE"
 
 
+def shared_root_token(aliases):
+    identity = json.dumps(aliases, ensure_ascii=False, separators=(",", ":"))
+    return f"$EXT_{identity.encode('utf-8').hex().upper()}_BASE"
+
+
 def path_normalizer(records):
     configured = {}
     for row in records:
@@ -84,21 +89,38 @@ def path_normalizer(records):
             )
         component_roots[identity] = value
 
+    components_by_root = {}
+    for identity, value in component_roots.items():
+        components_by_root.setdefault(value, []).append(identity)
+
     tokens = {}
-    for (kind, name), value in sorted(component_roots.items()):
-        token = root_token(kind, name)
+    for value, identities in sorted(components_by_root.items()):
+        aliases = [
+            {"kind": kind, "name": name}
+            for kind, name in sorted(identities)
+        ]
+        if len(aliases) == 1:
+            token = root_token(aliases[0]["kind"], aliases[0]["name"])
+            metadata = {**aliases[0], "token": token}
+        else:
+            token = shared_root_token(aliases)
+            metadata = {
+                "aliases": aliases,
+                "kind": "external",
+                "token": token,
+            }
         previous = tokens.get(token)
-        if previous is not None and previous != (kind, name):
+        if previous is not None and previous != value:
             raise ValueError(
-                f"path token {token!r} is ambiguous for {previous!r} "
-                f"and {(kind, name)!r}"
+                f"path token {token!r} is ambiguous for roots "
+                f"{previous!r} and {value!r}"
             )
-        tokens[token] = (kind, name)
+        tokens[token] = value
         roots.append(
             (
                 value,
                 token,
-                {"kind": kind, "name": name, "token": token},
+                metadata,
             )
         )
 
@@ -151,7 +173,7 @@ def serialize(records):
     dependency_files = []
     link_dependencies = []
     linker_scripts = []
-    final_link_inputs = []
+    link_stages = {}
     debug_outputs = []
     image_outputs = []
     auxiliary_outputs = []
@@ -171,6 +193,7 @@ def serialize(records):
                 "object_inputs": [],
                 "archive_inputs": [],
                 "linker_scripts": [],
+                "link_stages": [],
             }
         elif kind == "platform-library":
             platforms[row[1]]["libraries"].append(row[2])
@@ -257,14 +280,23 @@ def serialize(records):
             link_dependencies.append(normalize(row[1]))
         elif kind == "linker-script":
             linker_scripts.append(normalize(row[1]))
-        elif kind == "final-link-input":
-            final_link_inputs.append(
-                {
-                    "kind": row[1],
-                    "path": normalize(row[2]),
-                    "scope": row[3],
-                    "platform": row[4] or None,
-                }
+        elif kind == "link-stage":
+            key = (row[1], row[2])
+            if key in link_stages:
+                raise ValueError(
+                    f"duplicate link stage {row[2]!r} for platform {row[1]!r}"
+                )
+            stage = {
+                "name": row[2],
+                "transformation": row[3],
+                "output": normalize(row[4]),
+                "inputs": [],
+            }
+            link_stages[key] = stage
+            platforms[row[1]]["link_stages"].append(stage)
+        elif kind == "link-stage-input":
+            link_stages[(row[1], row[2])]["inputs"].append(
+                {"kind": row[3], "path": normalize(row[4])}
             )
         elif kind == "debug-output":
             debug_outputs.append(normalize(row[1]))
@@ -306,6 +338,11 @@ def serialize(records):
         platform["object_inputs"] = ordered_unique(platform["object_inputs"])
         platform["archive_inputs"] = ordered_unique(platform["archive_inputs"])
         platform["linker_scripts"] = ordered_unique(platform["linker_scripts"])
+        for stage in platform["link_stages"]:
+            stage["inputs"] = ordered_unique(
+                stage["inputs"],
+                key=lambda item: (item["kind"], item["path"]),
+            )
 
     for library in libraries.values():
         library["platforms"] = ordered_unique(library["platforms"])
@@ -323,16 +360,6 @@ def serialize(records):
             ),
         )
 
-    final_link_inputs = ordered_unique(
-        final_link_inputs,
-        key=lambda item: (
-            item["kind"],
-            item["path"],
-            item["scope"],
-            item["platform"],
-        ),
-    )
-
     return {
         "schema_version": 1,
         "context": context,
@@ -343,24 +370,6 @@ def serialize(records):
         "dependency_files": ordered_unique(dependency_files),
         "link_dependencies": ordered_unique(link_dependencies),
         "linker_scripts": ordered_unique(linker_scripts),
-        "final_link": {
-            "inputs": final_link_inputs,
-            "objects": [
-                item["path"]
-                for item in final_link_inputs
-                if item["kind"] == "object"
-            ],
-            "archives": [
-                item["path"]
-                for item in final_link_inputs
-                if item["kind"] == "archive"
-            ],
-            "linker_scripts": [
-                item["path"]
-                for item in final_link_inputs
-                if item["kind"] == "linker-script"
-            ],
-        },
         "outputs": {
             "auxiliary": ordered_unique(auxiliary_outputs),
             "debug": ordered_unique(debug_outputs),

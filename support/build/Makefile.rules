@@ -246,6 +246,24 @@ vprefix_glb = $(if $(filter isr,$(1)),$(addprefix ISR_,$(2)),$(2))
 #
 ###############################################################################
 
+# Register an ordered platform image link stage for build graph export.
+# add_build_graph_link_stage $1:platform,$2:name,$3:transformation,$4:output
+build_graph_link_stage_prefix = BUILD_GRAPH_$(call uc,$(1))_LINK_STAGE_$(call uc,$(2))
+build_graph_link_input_key = $(subst -,_,$(call uc,$(1)))
+
+define add_build_graph_link_stage =
+$(eval BUILD_GRAPH_$(call uc,$(1))_LINK_STAGES += $(2))
+$(eval $(call build_graph_link_stage_prefix,$(1),$(2))_TRANSFORMATION := $(3))
+$(eval $(call build_graph_link_stage_prefix,$(1),$(2))_OUTPUT := $(4))
+endef
+
+# Append an ordered input group to a registered image link stage.
+# add_build_graph_link_inputs $1:platform,$2:stage,$3:kind,$4:inputs
+define add_build_graph_link_inputs =
+$(eval $(call build_graph_link_stage_prefix,$(1),$(2))_INPUT_KINDS += $(3))
+$(eval $(call build_graph_link_stage_prefix,$(1),$(2))_$(call build_graph_link_input_key,$(3))_INPUTS += $(4))
+endef
+
 # Include a sub-makefile
 # verbose_include $1:path
 define verbose_include =
