@@ -349,12 +349,15 @@ jobs:
         image="${RUNNER_TEMP}/build-zig-arm64/helloworld_qemu-arm64"
         output="${RUNNER_TEMP}/zig-qemu-arm64.log"
         set +e
+        # `-net none` drops the default virtio-net-pci device of the `virt`
+        # machine, whose option ROM is not shipped by `qemu-system-arm`.
         timeout 30s qemu-system-aarch64 \
           -machine virt \
           -cpu cortex-a53 \
           -kernel "${image}" \
           -nographic \
           -no-reboot \
+          -net none \
           2>&1 | tee "${output}"
         status=${PIPESTATUS[0]}
         set -e
