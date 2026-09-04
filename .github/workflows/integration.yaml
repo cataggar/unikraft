@@ -5,10 +5,14 @@ on:
     branches: [staging, stable]
     paths-ignore: ['*.md']
 
+  # No `paths-ignore` here: the job contexts of this workflow are meant to be
+  # required for every pull request, and skipped workflows never report a
+  # status, which would leave Markdown-only pull requests pending forever.
+  # GitHub cannot express a per-base-branch path filter, so we accept running
+  # the full matrix on documentation-only changes.
   pull_request:
     types: [opened, synchronize, reopened]
     branches: [staging, zig16]
-    paths-ignore: ['*.md']
 
 jobs:
   libc-test:
