@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const facade_paths = @import("support/build/zig-facade-paths.zig");
 
 const supported_zig = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
 
@@ -68,17 +69,64 @@ const targets = [_]Target{
 };
 
 pub fn build(b: *std.Build) void {
-    const root = b.pathFromRoot(".");
-    const app = resolvePath(b.allocator, root, b.option([]const u8, "app", "Application directory (Make A=)") orelse root);
+    const root_lexical = b.pathFromRoot(".");
+    const root_result = facade_paths.canonicalizeNearestExisting(
+        b.allocator,
+        b.graph.io,
+        root_lexical,
+    ) catch |err| {
+        addFailedTargets(b, b.fmt("unable to canonicalize the Unikraft repository '{s}': {s}", .{
+            root_lexical,
+            @errorName(err),
+        }));
+        return;
+    };
+    const root = root_result.path;
+    const app_lexical = resolvePath(
+        b.allocator,
+        root,
+        b.option([]const u8, "app", "Application directory (Make A=)") orelse root,
+    );
+    const app_result = facade_paths.canonicalizeNearestExisting(
+        b.allocator,
+        b.graph.io,
+        app_lexical,
+    ) catch |err| {
+        addFailedTargets(b, b.fmt("unable to canonicalize application path '{s}': {s}", .{
+            app_lexical,
+            @errorName(err),
+        }));
+        return;
+    };
+    if (!app_result.exists) {
+        addFailedTargets(b, b.fmt(
+            "invalid -Dapp '{s}': the application directory must already exist",
+            .{app_lexical},
+        ));
+        return;
+    }
+    const app = app_result.path;
     const output_option = b.option([]const u8, "output", "Build output directory (Make O=)");
     var validation_message: ?[]const u8 = null;
-    const output = if (output_option) |value| output: {
+    const output_lexical = if (output_option) |value| output: {
         validateOutputValue(value) catch {
             validation_message = "invalid -Doutput: the value is empty; omit it to use <app>/build or provide a dedicated build directory";
             break :output resolvePath(b.allocator, app, "build");
         };
         break :output resolvePath(b.allocator, root, value);
     } else resolvePath(b.allocator, app, "build");
+    const output_result = facade_paths.canonicalizeNearestExisting(
+        b.allocator,
+        b.graph.io,
+        output_lexical,
+    ) catch |err| {
+        addFailedTargets(b, b.fmt("unable to canonicalize output path '{s}': {s}", .{
+            output_lexical,
+            @errorName(err),
+        }));
+        return;
+    };
+    const output = output_result.path;
 
     const options = MakeOptions{
         .command = b.option([]const u8, "make-command", "GNU Make executable (default: make)") orelse "make",
@@ -111,11 +159,11 @@ pub fn build(b: *std.Build) void {
         .host_cc = b.option([]const u8, "host-cc", "Host C compiler command (Make HOSTCC=)"),
         .host_cxx = b.option([]const u8, "host-cxx", "Host C++ compiler command (Make HOSTCXX=)"),
         .host_cflags = b.option([]const u8, "host-cflags", "Host compiler flags (Make HOSTCFLAGS=)"),
-        .forwarded = b.option([]const []const u8, "make-arg", "Additional NAME=VALUE Make assignment; may be repeated") orelse &.{},
+        .forwarded = b.option([]const []const u8, "make-arg", "Allowlisted NAME=VALUE tool/flag assignment; may be repeated") orelse &.{},
     };
 
     if (validation_message == null) {
-        validation_message = validatePaths(b, root, options);
+        validation_message = validatePaths(b, root, options, output_result);
     }
 
     var invalid_assignment: ?[]const u8 = null;
@@ -133,7 +181,7 @@ pub fn build(b: *std.Build) void {
 
     if (invalid_assignment) |assignment| {
         addFailedTargets(b, b.fmt(
-            "invalid -Dmake-arg '{s}': expected an unreserved NAME=VALUE assignment",
+            "invalid -Dmake-arg '{s}': NAME must be an allowlisted toolchain, flag, or backend assignment; use dedicated facade options for paths and configuration",
             .{assignment},
         ));
         return;
@@ -147,16 +195,33 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    const cache_root = resolvePath(b.allocator, root, b.cache_root.path orelse ".zig-cache");
-    const lock_file = std.fs.path.join(
-        b.allocator,
-        &.{ cache_root, "unikraft-make.lock" },
-    ) catch @panic("out of memory");
+    const lock_file = facade_paths.makeLockPath(b.allocator, output) catch {
+        addFailedTargets(b, b.fmt(
+            "unable to derive a safe lock path for output '{s}'",
+            .{output},
+        ));
+        return;
+    };
+    const config_path = options.config orelse resolvePath(b.allocator, app, ".config");
+    const distclean_error = validateDistcleanConfig(b, app, config_path);
 
     for (targets) |target| {
-        const run = addMakeCommand(b, make_runner, lock_file, root, target.make_target, options);
         const step = b.step(target.name, target.description);
-        step.dependOn(&run.step);
+        if (std.mem.eql(u8, target.name, "distclean") and distclean_error != null) {
+            const fail = b.addFail(distclean_error.?);
+            step.dependOn(&fail.step);
+        } else {
+            const run = addMakeCommand(
+                b,
+                make_runner,
+                output,
+                lock_file,
+                root,
+                target.make_target,
+                options,
+            );
+            step.dependOn(&run.step);
+        }
         if (std.mem.eql(u8, target.name, "all")) {
             b.default_step = step;
         }
@@ -170,6 +235,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_facade_tests = b.addRunArtifact(facade_tests);
+    run_facade_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
     const runner_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/zig-facade-runner.zig"),
@@ -178,7 +244,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_runner_tests = b.addRunArtifact(runner_tests);
-    run_runner_tests.setCwd(.{ .cwd_relative = cache_root });
+    run_runner_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
     const test_step = b.step("test", "Test facade path and Make argument construction");
     test_step.dependOn(&run_facade_tests.step);
     test_step.dependOn(&run_runner_tests.step);
@@ -226,7 +292,12 @@ fn resolvePathList(
     return std.mem.join(allocator, ":", resolved.items) catch @panic("out of memory");
 }
 
-fn validatePaths(b: *std.Build, repository: []const u8, options: MakeOptions) ?[]const u8 {
+fn validatePaths(
+    b: *std.Build,
+    repository: []const u8,
+    options: MakeOptions,
+    output: facade_paths.CanonicalPath,
+) ?[]const u8 {
     if (findWhitespacePath(options)) |path| {
         return b.fmt(
             "invalid {s} path '{s}': the GNU Make backend does not support whitespace in A/O/C/L/P/E paths; choose a whitespace-free path",
@@ -234,13 +305,26 @@ fn validatePaths(b: *std.Build, repository: []const u8, options: MakeOptions) ?[
         );
     }
 
-    validateOutputPath(repository, options.app, options.output) catch |err| {
+    validateOutputTarget(
+        b.allocator,
+        b.graph.io,
+        repository,
+        options.app,
+        output,
+    ) catch |err| {
         const protected_name = switch (err) {
             error.ProtectsRepository => "Unikraft repository",
             error.ProtectsApplication => "application",
+            error.ExistingSourceDirectory => "existing source directory",
+            error.ExistingUndedicatedDirectory => "existing directory without a Unikraft build marker",
+            error.NotDirectory => "non-directory path",
+            else => return b.fmt(
+                "unable to validate canonical output '{s}': {s}",
+                .{ output.path, @errorName(err) },
+            ),
         };
         return b.fmt(
-            "unsafe -Doutput '{s}': properclean deletes the entire output directory, which would delete or contain the {s}; use a dedicated path such as '{s}{s}build'",
+            "unsafe -Doutput '{s}': canonical target is an {s} and properclean deletes it recursively; use a new dedicated path such as '{s}{s}build'",
             .{ options.output, protected_name, options.app, std.fs.path.sep_str },
         );
     };
@@ -283,25 +367,115 @@ fn validateOutputValue(value: []const u8) error{EmptyOutput}!void {
     if (value.len == 0) return error.EmptyOutput;
 }
 
-fn validateOutputPath(
+fn validateOutputTarget(
+    allocator: std.mem.Allocator,
+    io: std.Io,
     repository: []const u8,
     app: []const u8,
-    output: []const u8,
-) error{ ProtectsRepository, ProtectsApplication }!void {
-    if (isSameOrAncestor(output, repository)) return error.ProtectsRepository;
-    if (isSameOrAncestor(output, app)) return error.ProtectsApplication;
+    output: facade_paths.CanonicalPath,
+) !void {
+    if (facade_paths.isSameOrAncestor(output.path, repository)) return error.ProtectsRepository;
+    if (facade_paths.isSameOrAncestor(output.path, app)) return error.ProtectsApplication;
+    if (!output.exists) return;
+
+    const stat = try std.Io.Dir.cwd().statFile(io, output.path, .{});
+    if (stat.kind != .directory) return error.NotDirectory;
+
+    const app_build_lexical = try std.fs.path.join(allocator, &.{ app, "build" });
+    defer allocator.free(app_build_lexical);
+    const app_build = try facade_paths.canonicalizeNearestExisting(
+        allocator,
+        io,
+        app_build_lexical,
+    );
+    defer allocator.free(app_build.path);
+    const repository_build_lexical = try std.fs.path.join(allocator, &.{ repository, "build" });
+    defer allocator.free(repository_build_lexical);
+    const repository_build = try facade_paths.canonicalizeNearestExisting(
+        allocator,
+        io,
+        repository_build_lexical,
+    );
+    defer allocator.free(repository_build.path);
+
+    const is_dedicated =
+        (std.mem.eql(u8, app_build.path, app_build_lexical) and
+            facade_paths.isSameOrAncestor(app_build.path, output.path)) or
+        (std.mem.eql(u8, repository_build.path, repository_build_lexical) and
+            facade_paths.isSameOrAncestor(repository_build.path, output.path)) or
+        facade_paths.hasBuildMarker(allocator, io, output.path);
+    if (is_dedicated) return;
+
+    if (facade_paths.isDescendant(repository, output.path) or
+        facade_paths.isDescendant(app, output.path))
+    {
+        return error.ExistingSourceDirectory;
+    }
+    return error.ExistingUndedicatedDirectory;
 }
 
-fn isSameOrAncestor(ancestor: []const u8, path: []const u8) bool {
-    if (std.mem.eql(u8, ancestor, path)) return true;
-    if (!std.mem.startsWith(u8, path, ancestor) or ancestor.len == 0) return false;
-    if (std.fs.path.isSep(ancestor[ancestor.len - 1])) return true;
-    return path.len > ancestor.len and std.fs.path.isSep(path[ancestor.len]);
+fn validateDistcleanConfig(
+    b: *std.Build,
+    app: []const u8,
+    config: []const u8,
+) ?[]const u8 {
+    const safe = distcleanConfigIsSafe(
+        b.allocator,
+        b.graph.io,
+        app,
+        config,
+    ) catch |err| {
+        return b.fmt(
+            "distclean refused: unable to canonicalize configuration deletion targets for '{s}': {s}",
+            .{ config, @errorName(err) },
+        );
+    };
+    if (!safe) {
+        return b.fmt(
+            "distclean refused: configuration '{s}' or its metadata resolves outside application '{s}'; use an in-application -Dconfig path or remove it manually",
+            .{ config, app },
+        );
+    }
+    return null;
+}
+
+fn distcleanConfigIsSafe(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    app: []const u8,
+    config: []const u8,
+) !bool {
+    const config_dir = std.fs.path.dirname(config) orelse {
+        return false;
+    };
+    const config_basename = std.fs.path.basename(config);
+    const deletion_targets = [_][]const u8{
+        config,
+        try std.fmt.allocPrint(allocator, "{s}.old", .{config}),
+        try std.fmt.allocPrint(allocator, "{s}{s}.{s}.tmp", .{ config_dir, std.fs.path.sep_str, config_basename }),
+        try std.fmt.allocPrint(allocator, "{s}{s}.auto.deps", .{ config_dir, std.fs.path.sep_str }),
+    };
+    defer {
+        for (deletion_targets[1..]) |target| allocator.free(target);
+    }
+    for (deletion_targets) |target| {
+        const canonical = facade_paths.canonicalizeNearestExisting(
+            allocator,
+            io,
+            target,
+        ) catch |err| return err;
+        defer allocator.free(canonical.path);
+        if (!facade_paths.isDescendant(app, canonical.path)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn addMakeCommand(
     b: *std.Build,
     make_runner: *std.Build.Step.Compile,
+    output: []const u8,
     lock_file: []const u8,
     root: []const u8,
     target: []const u8,
@@ -309,6 +483,7 @@ fn addMakeCommand(
 ) *std.Build.Step.Run {
     const argv = makeArguments(b.allocator, target, options);
     const run = b.addRunArtifact(make_runner);
+    run.addArg(output);
     run.addArg(lock_file);
     run.addArgs(argv);
     run.setCwd(.{ .cwd_relative = root });
@@ -382,7 +557,7 @@ fn validateForwardedAssignment(assignment: []const u8) error{InvalidAssignment}!
     for (name[1..]) |character| {
         if (!isMakeNameContinue(character)) return error.InvalidAssignment;
     }
-    if (isReservedAssignment(name)) return error.InvalidAssignment;
+    if (!isAllowedAssignment(name)) return error.InvalidAssignment;
 }
 
 fn isMakeNameStart(character: u8) bool {
@@ -393,27 +568,33 @@ fn isMakeNameContinue(character: u8) bool {
     return isMakeNameStart(character) or std.ascii.isDigit(character);
 }
 
-fn isReservedAssignment(name: []const u8) bool {
-    const reserved = [_][]const u8{
-        "A",
-        "O",
-        "C",
-        "N",
-        "L",
-        "P",
-        "E",
-        "V",
-        "CROSS_COMPILE",
-        "COMPILER",
-        "LINKER",
-        "PARTIAL_LINKER",
-        "PARTIAL_LINKER_TYPE",
-        "COMPILER_TARGETED",
-        "HOSTCC",
-        "HOSTCXX",
-        "HOSTCFLAGS",
+fn isAllowedAssignment(name: []const u8) bool {
+    const allowed = [_][]const u8{
+        "ARCH",
+        "LLVM_TARGET_ARCH",
+        "AR",
+        "RANLIB",
+        "NM",
+        "READELF",
+        "STRIP",
+        "OBJCOPY",
+        "OBJDUMP",
+        "DTC",
+        "HOSTAR",
+        "HOSTAS",
+        "HOSTCPP",
+        "HOSTLD",
+        "HOSTLN",
+        "HOSTNM",
+        "HOSTOBJCOPY",
+        "HOSTRANLIB",
+        "UK_ASFLAGS",
+        "UK_CFLAGS",
+        "UK_CXXFLAGS",
+        "UK_GOCFLAGS",
+        "UK_LDFLAGS",
     };
-    for (reserved) |candidate| {
+    for (allowed) |candidate| {
         if (std.mem.eql(u8, name, candidate)) return true;
     }
     return false;
@@ -478,24 +659,66 @@ test "output path rejects repository and application deletion hazards" {
 
     try std.testing.expectError(
         error.ProtectsRepository,
-        validateOutputPath(repository, app, repository),
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = repository, .exists = true },
+        ),
     );
     try std.testing.expectError(
         error.ProtectsRepository,
-        validateOutputPath(repository, app, "/workspace"),
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = "/workspace", .exists = true },
+        ),
     );
     try std.testing.expectError(
         error.ProtectsApplication,
-        validateOutputPath(repository, app, app),
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = app, .exists = true },
+        ),
     );
     try std.testing.expectError(
         error.ProtectsApplication,
-        validateOutputPath(repository, app, "/workspace/apps"),
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = "/workspace/apps", .exists = true },
+        ),
     );
 
-    try validateOutputPath(repository, app, "/workspace/build");
-    try validateOutputPath(repository, app, "/workspace/unikraft/build");
-    try validateOutputPath(repository, app, "/workspace/apps/hello/build");
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        repository,
+        app,
+        .{ .path = "/workspace/build", .exists = false },
+    );
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        repository,
+        app,
+        .{ .path = "/workspace/unikraft/build", .exists = false },
+    );
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        repository,
+        app,
+        .{ .path = "/workspace/apps/hello/build", .exists = false },
+    );
 }
 
 test "missing output defaults to a safe app build directory" {
@@ -504,7 +727,13 @@ test "missing output defaults to a safe app build directory" {
     defer std.testing.allocator.free(output);
 
     try std.testing.expectEqualStrings("/workspace/apps/hello/build", output);
-    try validateOutputPath("/workspace/unikraft", app, output);
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        "/workspace/unikraft",
+        app,
+        .{ .path = output, .exists = false },
+    );
 }
 
 test "dot and parent output values resolve to protected paths" {
@@ -517,12 +746,206 @@ test "dot and parent output values resolve to protected paths" {
 
     try std.testing.expectError(
         error.ProtectsRepository,
-        validateOutputPath(repository, app, dot),
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = dot, .exists = true },
+        ),
     );
     try std.testing.expectError(
         error.ProtectsRepository,
-        validateOutputPath(repository, app, parent),
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = parent, .exists = true },
+        ),
     );
+}
+
+test "canonical output rejects source directories and symlink aliases" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "repo/lib");
+    try temporary.dir.createDirPath(std.testing.io, "repo/build");
+    try temporary.dir.createDirPath(std.testing.io, "app");
+    try temporary.dir.createDirPath(std.testing.io, "external");
+    try temporary.dir.symLink(std.testing.io, "repo/lib", "source-alias", .{ .is_directory = true });
+    try temporary.dir.symLink(std.testing.io, "../repo/lib", "app/build", .{ .is_directory = true });
+
+    const root = try testDirPath(std.testing.allocator, temporary.dir);
+    defer std.testing.allocator.free(root);
+    const repository = try std.fs.path.join(std.testing.allocator, &.{ root, "repo" });
+    defer std.testing.allocator.free(repository);
+    const app = try std.fs.path.join(std.testing.allocator, &.{ root, "app" });
+    defer std.testing.allocator.free(app);
+
+    const source_lexical = try std.fs.path.join(std.testing.allocator, &.{ repository, "lib" });
+    defer std.testing.allocator.free(source_lexical);
+    const source = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        source_lexical,
+    );
+    defer std.testing.allocator.free(source.path);
+    try std.testing.expectError(
+        error.ExistingSourceDirectory,
+        validateOutputTarget(std.testing.allocator, std.testing.io, repository, app, source),
+    );
+
+    const alias_lexical = try std.fs.path.join(std.testing.allocator, &.{ root, "source-alias" });
+    defer std.testing.allocator.free(alias_lexical);
+    const alias = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        alias_lexical,
+    );
+    defer std.testing.allocator.free(alias.path);
+    try std.testing.expectEqualStrings(source.path, alias.path);
+    try std.testing.expectError(
+        error.ExistingSourceDirectory,
+        validateOutputTarget(std.testing.allocator, std.testing.io, repository, app, alias),
+    );
+
+    const app_build_alias_lexical = try std.fs.path.join(std.testing.allocator, &.{ app, "build" });
+    defer std.testing.allocator.free(app_build_alias_lexical);
+    const app_build_alias = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        app_build_alias_lexical,
+    );
+    defer std.testing.allocator.free(app_build_alias.path);
+    try std.testing.expectError(
+        error.ExistingSourceDirectory,
+        validateOutputTarget(std.testing.allocator, std.testing.io, repository, app, app_build_alias),
+    );
+
+    const build_lexical = try std.fs.path.join(std.testing.allocator, &.{ repository, "build" });
+    defer std.testing.allocator.free(build_lexical);
+    const build_output = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        build_lexical,
+    );
+    defer std.testing.allocator.free(build_output.path);
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        repository,
+        app,
+        build_output,
+    );
+
+    const external_lexical = try std.fs.path.join(std.testing.allocator, &.{ root, "external" });
+    defer std.testing.allocator.free(external_lexical);
+    const external = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        external_lexical,
+    );
+    defer std.testing.allocator.free(external.path);
+    try std.testing.expectError(
+        error.ExistingUndedicatedDirectory,
+        validateOutputTarget(std.testing.allocator, std.testing.io, repository, app, external),
+    );
+}
+
+test "canonicalization follows symlinks through nearest existing ancestor" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "real");
+    try temporary.dir.symLink(std.testing.io, "real", "alias", .{ .is_directory = true });
+
+    const root = try testDirPath(std.testing.allocator, temporary.dir);
+    defer std.testing.allocator.free(root);
+    const requested = try std.fs.path.join(std.testing.allocator, &.{ root, "alias/missing/build" });
+    defer std.testing.allocator.free(requested);
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ root, "real/missing/build" });
+    defer std.testing.allocator.free(expected);
+    const canonical = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        requested,
+    );
+    defer std.testing.allocator.free(canonical.path);
+
+    try std.testing.expect(!canonical.exists);
+    try std.testing.expectEqualStrings(expected, canonical.path);
+}
+
+test "distclean configuration targets stay inside the canonical app tree" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "app");
+    try temporary.dir.createDirPath(std.testing.io, "external");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "external/config",
+        .data = "CONFIG_TEST=y\n",
+    });
+
+    const root = try testDirPath(std.testing.allocator, temporary.dir);
+    defer std.testing.allocator.free(root);
+    const app = try std.fs.path.join(std.testing.allocator, &.{ root, "app" });
+    defer std.testing.allocator.free(app);
+    const normal_config = try std.fs.path.join(std.testing.allocator, &.{ app, ".config" });
+    defer std.testing.allocator.free(normal_config);
+    try std.testing.expect(try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        normal_config,
+    ));
+
+    const external_config = try std.fs.path.join(std.testing.allocator, &.{ root, "external/config" });
+    defer std.testing.allocator.free(external_config);
+    try std.testing.expect(!try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        external_config,
+    ));
+    try std.testing.expect(!try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        "/etc/passwd",
+    ));
+
+    try temporary.dir.symLink(std.testing.io, "/etc/passwd", "app/.config", .{});
+    try std.testing.expect(!try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        normal_config,
+    ));
+
+    try temporary.dir.deleteFile(std.testing.io, "app/.config");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/.config",
+        .data = "CONFIG_TEST=y\n",
+    });
+    try temporary.dir.symLink(std.testing.io, "/etc/passwd", "app/.config.old", .{});
+    try std.testing.expect(!try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        normal_config,
+    ));
+}
+
+test "lock identity depends on canonical output, not Zig cache root" {
+    const output = "/workspace/apps/hello/build";
+    const first = try facade_paths.makeLockPath(std.testing.allocator, output);
+    defer std.testing.allocator.free(first);
+    const second = try facade_paths.makeLockPath(std.testing.allocator, output);
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.indexOf(u8, first, "cache-one") == null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "cache-two") == null);
 }
 
 test "empty output and whitespace paths are rejected" {
@@ -571,12 +994,19 @@ test "path lists resolve from the repository root" {
     );
 }
 
-test "forwarded Make assignments require safe unreserved names" {
+test "forwarded Make assignments require allowlisted names" {
     try validateForwardedAssignment("AR=zig ar");
     try validateForwardedAssignment("UK_CFLAGS=-std=gnu17");
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("not-an-assignment"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("-j=8"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("A=../app"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("BUILD_DIR=/etc"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("_O=/"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_CONFIG=/etc/passwd"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("CONFIG_DIR=/etc"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("C=/etc/passwd"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_CLEAN=/"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_LDEPS=/etc/passwd"));
 }
 
 fn testingMakeOptions() MakeOptions {
@@ -601,4 +1031,10 @@ fn testingMakeOptions() MakeOptions {
         .host_cflags = null,
         .forwarded = &.{},
     };
+}
+
+fn testDirPath(allocator: std.mem.Allocator, directory: std.Io.Dir) ![]u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try directory.realPath(std.testing.io, &buffer);
+    return allocator.dupe(u8, buffer[0..length]);
 }

@@ -1,14 +1,20 @@
 const std = @import("std");
+const facade_paths = @import("zig-facade-paths.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len < 4) {
-        std.debug.print("error: internal Zig facade invocation is missing the lock path or Make command\n", .{});
+    if (args.len < 5) {
+        std.debug.print("error: internal Zig facade invocation is missing the output, lock, or Make command\n", .{});
         std.process.exit(2);
     }
 
-    const lock = acquireLock(std.Io.Dir.cwd(), init.io, args[1]) catch |err| switch (err) {
+    const lock_parent = std.fs.path.dirname(args[2]) orelse {
+        std.debug.print("error: internal Zig facade lock path has no parent directory\n", .{});
+        std.process.exit(2);
+    };
+    try std.Io.Dir.cwd().createDirPath(init.io, lock_parent);
+    const lock = acquireLock(std.Io.Dir.cwd(), init.io, args[2]) catch |err| switch (err) {
         error.WouldBlock => {
             std.debug.print(
                 "error: another Make-backed Zig step is already using this build tree; invoke only one of clean/all/images/libs/objs/preprocess/prepare/fetch/configuration/cleanup per 'zig build' command\n",
@@ -27,7 +33,14 @@ pub fn main(init: std.process.Init) !void {
     };
     defer lock.close(init.io);
 
-    var child = try std.process.spawn(init.io, .{ .argv = args[2..] });
+    try std.Io.Dir.cwd().createDirPath(init.io, args[1]);
+    const marker = try facade_paths.markerPath(allocator, args[1]);
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = marker,
+        .data = facade_paths.marker_contents,
+    });
+
+    var child = try std.process.spawn(init.io, .{ .argv = args[3..] });
     const term = try child.wait(init.io);
     switch (term) {
         .exited => |code| std.process.exit(code),

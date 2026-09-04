@@ -145,8 +145,11 @@ zig build \
 ```
 
 When `-Doutput` is omitted, it safely defaults to `<app>/build`. The facade
-rejects output paths that could cause `properclean` or `distclean` to delete
-the application or Unikraft repository tree.
+canonicalizes existing symlinks and the nearest existing ancestor of new
+outputs. It rejects repository/application ancestors, existing source
+directories, filesystem roots, and unmarked existing directories. New output
+directories receive a small marker so subsequent builds can distinguish them
+from source trees.
 
 The default step delegates to Make's `all` target. Named steps include
 `images`, `libs`, `objs`, `preprocess`, `prepare`, `fetch`, configuration
@@ -165,14 +168,24 @@ resolved from the Unikraft repository root. The Make backend cannot correctly
 handle whitespace in `A`, `O`, `C`, `L`, `P`, or `E` paths, so the facade
 rejects those paths with an error instead of attempting an unsafe build.
 Additional Make assignments can be forwarded as individual, safely separated
-arguments with repeated `-Dmake-arg=NAME=VALUE`; facade-managed variables must
-use their dedicated options.
+arguments with repeated `-Dmake-arg=NAME=VALUE`. This option uses a strict
+allowlist for compiler flags and non-path tools such as `AR`, `NM`, `OBJCOPY`,
+`OBJDUMP`, `READELF`, `STRIP`, `UK_CFLAGS`, and `UK_LDFLAGS`.
+Facade-managed, path, cleanup, configuration, and internal graph variables are
+rejected and must use dedicated facade options where available.
 
 Invoke only one Make-backed named step per `zig build` command. A portable,
 non-blocking file lock rejects overlapping Make processes rather than allowing
-selected steps such as `clean all` to race over one output tree. Run separate
-commands when multiple phases are needed. `zig build test` runs the facade's
-path, argument, and concurrency checks.
+selected steps such as `clean all` to race over one output tree. Its identity
+comes from the canonical output path and is adjacent to that output, so
+different Zig caches and checkouts targeting the same `O` share one lock. Run
+separate commands when multiple phases are needed.
+
+Non-destructive builds may use an external `-Dconfig`. The `distclean` step is
+stricter because Make deletes the configuration and sibling metadata: every
+canonical deletion target must remain inside the application tree. Otherwise,
+the facade refuses `distclean` and leaves manual cleanup to the user.
+`zig build test` runs the facade's path, argument, and concurrency checks.
 
 The experimental QEMU/x86_64 Zig compiler setup becomes:
 
