@@ -71,19 +71,3 @@ pub fn hasBuildMarker(
     defer allocator.free(contents);
     return std.mem.eql(u8, contents, marker_contents);
 }
-
-pub fn makeLockPath(
-    allocator: std.mem.Allocator,
-    canonical_output: []const u8,
-) ![]const u8 {
-    const parent = std.fs.path.dirname(canonical_output) orelse return error.InvalidOutputPath;
-    const basename = std.fs.path.basename(canonical_output);
-    const hash = std.hash.Wyhash.hash(0, canonical_output);
-    const lock_name = try std.fmt.allocPrint(
-        allocator,
-        ".{s}.unikraft-{x}.lock",
-        .{ basename, hash },
-    );
-    defer allocator.free(lock_name);
-    return std.fs.path.join(allocator, &.{ parent, lock_name });
-}

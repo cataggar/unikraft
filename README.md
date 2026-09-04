@@ -164,9 +164,14 @@ zig build images -Dapp=/absolute/path/to/app -Dverbose=1
 `-Dapp`, `-Doutput`, `-Dconfig`, and `-Dimage-name` map to Make's `A`, `O`,
 `C`, and `N` variables. Repeat `-Dexternal-lib`, `-Dexternal-platform`, or
 `-Dexclude` to construct the `L`, `P`, or `E` path lists. Relative paths are
-resolved from the Unikraft repository root. The Make backend cannot correctly
-handle whitespace in `A`, `O`, `C`, `L`, `P`, or `E` paths, so the facade
-rejects those paths with an error instead of attempting an unsafe build.
+resolved from the Unikraft repository root. Because the existing Make backend
+does not quote these values end to end, the facade applies a conservative
+ASCII allowlist before invoking Make. Paths accept letters, digits, `/`,
+`-_.+@`; joined `L`, `P`, and `E` lists additionally use `:` as their
+intentional separator. Image names accept letters, digits, and `-_.+@`.
+Tool/flag values additionally accept spaces, `:`, `,`, and `=`. Whitespace in
+paths and Make/shell syntax such as quotes, backslashes, `$()`, backticks,
+`;&|<>`, globs, `#`, `%`, and control characters are rejected.
 Additional Make assignments can be forwarded as individual, safely separated
 arguments with repeated `-Dmake-arg=NAME=VALUE`. This option uses a strict
 allowlist for compiler flags and non-path tools such as `AR`, `NM`, `OBJCOPY`,
@@ -176,16 +181,21 @@ rejected and must use dedicated facade options where available.
 
 Invoke only one Make-backed named step per `zig build` command. A portable,
 non-blocking file lock rejects overlapping Make processes rather than allowing
-selected steps such as `clean all` to race over one output tree. Its identity
-comes from the canonical output path and is adjacent to that output, so
-different Zig caches and checkouts targeting the same `O` share one lock. Run
-separate commands when multiple phases are needed.
+selected steps such as `clean all` to race. All facade invocations use the same
+`unikraft-zig-facade.lock` in the canonical OS runtime directory (`TMPDIR`,
+`TEMP`, or `TMP`, with the platform default as fallback), so parent/nested
+outputs, different Zig caches, applications, and checkouts cannot overlap. The
+runtime directory must be outside every output tree; the persistent lock file
+is never unlinked while held. Run separate commands when multiple phases are
+needed.
 
 Non-destructive builds may use an external `-Dconfig`. The `distclean` step is
 stricter because Make deletes the configuration and sibling metadata: every
 canonical deletion target must remain inside the application tree. Otherwise,
 the facade refuses `distclean` and leaves manual cleanup to the user.
-`zig build test` runs the facade's path, argument, and concurrency checks.
+`zig build test` runs the facade's path, argument, and lock unit checks.
+`python3 -m unittest -v support.scripts.tests.test_zig_facade` adds
+end-to-end metacharacter and cross-checkout parent/nested output coverage.
 
 The experimental QEMU/x86_64 Zig compiler setup becomes:
 

@@ -82,10 +82,20 @@ pub fn build(b: *std.Build) void {
         return;
     };
     const root = root_result.path;
+    const app_option = b.option([]const u8, "app", "Application directory (Make A=)");
+    if (app_option) |value| {
+        if (firstUnsafePathByte(value, false)) |byte| {
+            addFailedTargets(b, b.fmt(
+                "invalid A value: byte 0x{x:0>2} is outside the facade's conservative Make-safe character allowlist",
+                .{byte},
+            ));
+            return;
+        }
+    }
     const app_lexical = resolvePath(
         b.allocator,
         root,
-        b.option([]const u8, "app", "Application directory (Make A=)") orelse root,
+        app_option orelse root,
     );
     const app_result = facade_paths.canonicalizeNearestExisting(
         b.allocator,
@@ -109,6 +119,13 @@ pub fn build(b: *std.Build) void {
     const output_option = b.option([]const u8, "output", "Build output directory (Make O=)");
     var validation_message: ?[]const u8 = null;
     const output_lexical = if (output_option) |value| output: {
+        if (firstUnsafePathByte(value, false)) |byte| {
+            validation_message = b.fmt(
+                "invalid O value: byte 0x{x:0>2} is outside the facade's conservative Make-safe character allowlist",
+                .{byte},
+            );
+            break :output resolvePath(b.allocator, app, "build");
+        }
         validateOutputValue(value) catch {
             validation_message = "invalid -Doutput: the value is empty; omit it to use <app>/build or provide a dedicated build directory";
             break :output resolvePath(b.allocator, app, "build");
@@ -179,10 +196,10 @@ pub fn build(b: *std.Build) void {
         return;
     }
 
-    if (invalid_assignment) |assignment| {
+    if (invalid_assignment != null) {
         addFailedTargets(b, b.fmt(
-            "invalid -Dmake-arg '{s}': NAME must be an allowlisted toolchain, flag, or backend assignment; use dedicated facade options for paths and configuration",
-            .{assignment},
+            "invalid -Dmake-arg: NAME must be an allowlisted toolchain, flag, or backend assignment and VALUE may contain only conservative Make-safe command characters; use dedicated facade options for paths and configuration",
+            .{},
         ));
         return;
     }
@@ -195,13 +212,6 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    const lock_file = facade_paths.makeLockPath(b.allocator, output) catch {
-        addFailedTargets(b, b.fmt(
-            "unable to derive a safe lock path for output '{s}'",
-            .{output},
-        ));
-        return;
-    };
     const config_path = options.config orelse resolvePath(b.allocator, app, ".config");
     const distclean_error = validateDistcleanConfig(b, app, config_path);
 
@@ -215,7 +225,6 @@ pub fn build(b: *std.Build) void {
                 b,
                 make_runner,
                 output,
-                lock_file,
                 root,
                 target.make_target,
                 options,
@@ -298,10 +307,10 @@ fn validatePaths(
     options: MakeOptions,
     output: facade_paths.CanonicalPath,
 ) ?[]const u8 {
-    if (findWhitespacePath(options)) |path| {
+    if (findUnsafeValue(options)) |value| {
         return b.fmt(
-            "invalid {s} path '{s}': the GNU Make backend does not support whitespace in A/O/C/L/P/E paths; choose a whitespace-free path",
-            .{ path.make_name, path.value },
+            "invalid {s} value: byte 0x{x:0>2} is outside the facade's conservative Make-safe character allowlist",
+            .{ value.name, value.byte },
         );
     }
 
@@ -331,36 +340,87 @@ fn validatePaths(
     return null;
 }
 
-const NamedPath = struct {
-    make_name: []const u8,
-    value: []const u8,
+const UnsafeValue = struct {
+    name: []const u8,
+    byte: u8,
 };
 
-fn findWhitespacePath(options: MakeOptions) ?NamedPath {
+fn findUnsafeValue(options: MakeOptions) ?UnsafeValue {
     const paths = [_]struct {
-        make_name: []const u8,
+        name: []const u8,
         value: ?[]const u8,
+        allow_colon: bool,
     }{
-        .{ .make_name = "A", .value = options.app },
-        .{ .make_name = "O", .value = options.output },
-        .{ .make_name = "C", .value = options.config },
-        .{ .make_name = "L", .value = options.external_libraries },
-        .{ .make_name = "P", .value = options.external_platforms },
-        .{ .make_name = "E", .value = options.exclusions },
+        .{ .name = "A", .value = options.app, .allow_colon = false },
+        .{ .name = "O", .value = options.output, .allow_colon = false },
+        .{ .name = "C", .value = options.config, .allow_colon = false },
+        .{ .name = "L", .value = options.external_libraries, .allow_colon = true },
+        .{ .name = "P", .value = options.external_platforms, .allow_colon = true },
+        .{ .name = "E", .value = options.exclusions, .allow_colon = true },
     };
     for (paths) |path| {
         const value = path.value orelse continue;
-        validateNoWhitespace(value) catch {
-            return .{ .make_name = path.make_name, .value = value };
-        };
+        if (firstUnsafePathByte(value, path.allow_colon)) |byte| {
+            return .{ .name = path.name, .byte = byte };
+        }
+    }
+
+    if (options.image_name) |value| {
+        if (firstUnsafeNameByte(value)) |byte| {
+            return .{ .name = "N", .byte = byte };
+        }
+    }
+    if (firstUnsafePathByte(options.command, false)) |byte| {
+        return .{ .name = "make-command", .byte = byte };
+    }
+
+    const commands = [_]struct {
+        name: []const u8,
+        value: ?[]const u8,
+    }{
+        .{ .name = "CROSS_COMPILE", .value = options.cross_compile },
+        .{ .name = "COMPILER", .value = options.compiler },
+        .{ .name = "LINKER", .value = options.linker },
+        .{ .name = "PARTIAL_LINKER", .value = options.partial_linker },
+        .{ .name = "HOSTCC", .value = options.host_cc },
+        .{ .name = "HOSTCXX", .value = options.host_cxx },
+        .{ .name = "HOSTCFLAGS", .value = options.host_cflags },
+    };
+    for (commands) |command| {
+        const value = command.value orelse continue;
+        if (firstUnsafeCommandByte(value)) |byte| {
+            return .{ .name = command.name, .byte = byte };
+        }
     }
     return null;
 }
 
-fn validateNoWhitespace(path: []const u8) error{UnsupportedWhitespace}!void {
-    for (path) |character| {
-        if (std.ascii.isWhitespace(character)) return error.UnsupportedWhitespace;
+fn firstUnsafePathByte(value: []const u8, allow_colon: bool) ?u8 {
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        if (std.mem.indexOfScalar(u8, "/._-+@", byte) != null) continue;
+        if (allow_colon and byte == ':') continue;
+        return byte;
     }
+    return null;
+}
+
+fn firstUnsafeNameByte(value: []const u8) ?u8 {
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        if (std.mem.indexOfScalar(u8, "._-+@", byte) != null) continue;
+        return byte;
+    }
+    return null;
+}
+
+fn firstUnsafeCommandByte(value: []const u8) ?u8 {
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == ' ') continue;
+        if (std.mem.indexOfScalar(u8, "/._-+@:,=", byte) != null) continue;
+        return byte;
+    }
+    return null;
 }
 
 fn validateOutputValue(value: []const u8) error{EmptyOutput}!void {
@@ -476,7 +536,6 @@ fn addMakeCommand(
     b: *std.Build,
     make_runner: *std.Build.Step.Compile,
     output: []const u8,
-    lock_file: []const u8,
     root: []const u8,
     target: []const u8,
     options: MakeOptions,
@@ -484,7 +543,6 @@ fn addMakeCommand(
     const argv = makeArguments(b.allocator, target, options);
     const run = b.addRunArtifact(make_runner);
     run.addArg(output);
-    run.addArg(lock_file);
     run.addArgs(argv);
     run.setCwd(.{ .cwd_relative = root });
     return run;
@@ -558,6 +616,7 @@ fn validateForwardedAssignment(assignment: []const u8) error{InvalidAssignment}!
         if (!isMakeNameContinue(character)) return error.InvalidAssignment;
     }
     if (!isAllowedAssignment(name)) return error.InvalidAssignment;
+    if (firstUnsafeCommandByte(assignment[separator + 1 ..]) != null) return error.InvalidAssignment;
 }
 
 fn isMakeNameStart(character: u8) bool {
@@ -936,19 +995,7 @@ test "distclean configuration targets stay inside the canonical app tree" {
     ));
 }
 
-test "lock identity depends on canonical output, not Zig cache root" {
-    const output = "/workspace/apps/hello/build";
-    const first = try facade_paths.makeLockPath(std.testing.allocator, output);
-    defer std.testing.allocator.free(first);
-    const second = try facade_paths.makeLockPath(std.testing.allocator, output);
-    defer std.testing.allocator.free(second);
-
-    try std.testing.expectEqualStrings(first, second);
-    try std.testing.expect(std.mem.indexOf(u8, first, "cache-one") == null);
-    try std.testing.expect(std.mem.indexOf(u8, second, "cache-two") == null);
-}
-
-test "empty output and whitespace paths are rejected" {
+test "empty output and unsafe facade values are rejected" {
     try std.testing.expectError(error.EmptyOutput, validateOutputValue(""));
     try validateOutputValue("/workspace/apps/hello/build");
 
@@ -974,10 +1021,81 @@ test "empty output and whitespace paths are rejected" {
             .platforms => options.external_platforms = "/workspace/platform path",
             .exclusions => options.exclusions = "/workspace/excluded path",
         }
-        const invalid = findWhitespacePath(options).?;
-        try std.testing.expectEqualStrings(case.make_name, invalid.make_name);
+        const invalid = findUnsafeValue(options).?;
+        try std.testing.expectEqualStrings(case.make_name, invalid.name);
     }
-    try std.testing.expect(findWhitespacePath(testingMakeOptions()) == null);
+    try std.testing.expect(findUnsafeValue(testingMakeOptions()) == null);
+
+    var image_options = testingMakeOptions();
+    image_options.image_name = "image#comment";
+    try std.testing.expectEqualStrings("N", findUnsafeValue(image_options).?.name);
+
+    var command_options = testingMakeOptions();
+    command_options.command = "make;true";
+    try std.testing.expectEqualStrings("make-command", findUnsafeValue(command_options).?.name);
+
+    const CommandField = enum {
+        cross_compile,
+        compiler,
+        linker,
+        partial_linker,
+        host_cc,
+        host_cxx,
+        host_cflags,
+    };
+    const command_cases = [_]struct {
+        field: CommandField,
+        make_name: []const u8,
+    }{
+        .{ .field = .cross_compile, .make_name = "CROSS_COMPILE" },
+        .{ .field = .compiler, .make_name = "COMPILER" },
+        .{ .field = .linker, .make_name = "LINKER" },
+        .{ .field = .partial_linker, .make_name = "PARTIAL_LINKER" },
+        .{ .field = .host_cc, .make_name = "HOSTCC" },
+        .{ .field = .host_cxx, .make_name = "HOSTCXX" },
+        .{ .field = .host_cflags, .make_name = "HOSTCFLAGS" },
+    };
+    for (command_cases) |case| {
+        var options = testingMakeOptions();
+        switch (case.field) {
+            .cross_compile => options.cross_compile = "tool;true",
+            .compiler => options.compiler = "tool;true",
+            .linker => options.linker = "tool;true",
+            .partial_linker => options.partial_linker = "tool;true",
+            .host_cc => options.host_cc = "tool;true",
+            .host_cxx => options.host_cxx = "tool;true",
+            .host_cflags => options.host_cflags = "flag;true",
+        }
+        try std.testing.expectEqualStrings(case.make_name, findUnsafeValue(options).?.name);
+    }
+}
+
+test "Make and shell metacharacters are rejected conservatively" {
+    const unsafe_values = [_][]const u8{
+        "/d/victim;true",
+        "/d/victim$(true)",
+        "/d/victim`true`",
+        "/d/victim*",
+        "/d/victim#comment",
+        "/d/victim%pattern",
+        "/d/victim\"quoted",
+        "/d/victim'quoted",
+        "/d/victim\\escaped",
+        "/d/victim\nnext",
+        "/d/victim&next",
+        "/d/victim|next",
+        "/d/victim<next",
+        "/d/victim>next",
+    };
+    for (unsafe_values) |value| {
+        try std.testing.expect(firstUnsafePathByte(value, false) != null);
+        try std.testing.expect(firstUnsafeCommandByte(value) != null);
+    }
+
+    try std.testing.expect(firstUnsafePathByte("/d/safe-_.+@/name", false) == null);
+    try std.testing.expect(firstUnsafePathByte("/d/lib-one:/d/lib_two", true) == null);
+    try std.testing.expect(firstUnsafeNameByte("safe-_.+@name") == null);
+    try std.testing.expect(firstUnsafeCommandByte("zig cc -target x86_64-freestanding-none") == null);
 }
 
 test "path lists resolve from the repository root" {
@@ -1007,6 +1125,9 @@ test "forwarded Make assignments require allowlisted names" {
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("C=/etc/passwd"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_CLEAN=/"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_LDEPS=/etc/passwd"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("AR=zig ar;true"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_CFLAGS=$(shell true)"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_LDFLAGS=-Wl,*"));
 }
 
 fn testingMakeOptions() MakeOptions {

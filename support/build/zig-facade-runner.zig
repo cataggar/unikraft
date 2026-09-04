@@ -1,23 +1,42 @@
 const std = @import("std");
 const facade_paths = @import("zig-facade-paths.zig");
+const builtin = @import("builtin");
+
+const lock_name = "unikraft-zig-facade.lock";
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len < 5) {
-        std.debug.print("error: internal Zig facade invocation is missing the output, lock, or Make command\n", .{});
+    if (args.len < 4) {
+        std.debug.print("error: internal Zig facade invocation is missing the output or Make command\n", .{});
         std.process.exit(2);
     }
 
-    const lock_parent = std.fs.path.dirname(args[2]) orelse {
-        std.debug.print("error: internal Zig facade lock path has no parent directory\n", .{});
+    const lock_root = init.environ_map.get("TMPDIR") orelse
+        init.environ_map.get("TEMP") orelse
+        init.environ_map.get("TMP") orelse
+        if (builtin.os.tag == .windows) "." else "/tmp";
+    try std.Io.Dir.cwd().createDirPath(init.io, lock_root);
+    const absolute_lock_root = try std.fs.path.resolve(allocator, &.{lock_root});
+    var lock_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const lock_root_length = try std.Io.Dir.realPathFileAbsolute(
+        init.io,
+        absolute_lock_root,
+        &lock_root_buffer,
+    );
+    const canonical_lock_root = lock_root_buffer[0..lock_root_length];
+    if (facade_paths.isSameOrAncestor(args[1], canonical_lock_root)) {
+        std.debug.print(
+            "error: the Zig facade runtime directory '{s}' is inside output '{s}'; set TMPDIR to a stable directory outside every Make output tree\n",
+            .{ canonical_lock_root, args[1] },
+        );
         std.process.exit(2);
-    };
-    try std.Io.Dir.cwd().createDirPath(init.io, lock_parent);
-    const lock = acquireLock(std.Io.Dir.cwd(), init.io, args[2]) catch |err| switch (err) {
+    }
+    const lock_path = try std.fs.path.join(allocator, &.{ canonical_lock_root, lock_name });
+    const lock = acquireLock(std.Io.Dir.cwd(), init.io, lock_path) catch |err| switch (err) {
         error.WouldBlock => {
             std.debug.print(
-                "error: another Make-backed Zig step is already using this build tree; invoke only one of clean/all/images/libs/objs/preprocess/prepare/fetch/configuration/cleanup per 'zig build' command\n",
+                "error: another Make-backed Zig facade process is running on this host; wait for it to finish and retry\n",
                 .{},
             );
             std.process.exit(2);
@@ -40,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
         .data = facade_paths.marker_contents,
     });
 
-    var child = try std.process.spawn(init.io, .{ .argv = args[3..] });
+    var child = try std.process.spawn(init.io, .{ .argv = args[2..] });
     const term = try child.wait(init.io);
     switch (term) {
         .exited => |code| std.process.exit(code),
@@ -89,5 +108,9 @@ test "clean all cannot execute concurrently" {
 }
 
 test "all images cannot execute concurrently" {
+    try expectConcurrentInvocationRejected();
+}
+
+test "parent and nested outputs share the host-wide lock" {
     try expectConcurrentInvocationRejected();
 }
