@@ -145,11 +145,14 @@ zig build \
 ```
 
 When `-Doutput` is omitted, it safely defaults to `<app>/build`. The facade
-canonicalizes existing symlinks and the nearest existing ancestor of new
-outputs. It rejects repository/application ancestors, existing source
-directories, filesystem roots, and unmarked existing directories. New output
-directories receive a small marker so subsequent builds can distinguish them
-from source trees.
+creates one fresh canonical output identity by resolving existing symlinks and
+the nearest existing ancestor of a new output. That same identity is used for
+validation, the runner argument, and Make's `O=` assignment; the runner
+requires those two arguments to match exactly before marker handling and again
+immediately before execution. The facade rejects repository/application
+ancestors, existing source directories, filesystem roots, and unmarked existing
+directories. New output directories receive a small marker so subsequent
+builds can distinguish them from source trees.
 
 The default step delegates to Make's `all` target. Named steps include
 `images`, `libs`, `objs`, `preprocess`, `prepare`, `fetch`, configuration
@@ -182,19 +185,33 @@ allowlist for compiler flags and non-path tools such as `AR`, `NM`, `OBJCOPY`,
 Facade-managed, path, cleanup, configuration, and internal graph variables are
 rejected and must use dedicated facade options where available.
 
+Make runs with a newly constructed environment rather than inheriting the
+caller's environment. Only the Make-safe canonical passwd `HOME`, a validated
+absolute-entry `PATH` (or `/usr/bin:/bin` fallback), and validated
+`LANG`/`LC_ALL` locale values are supplied. GNU Make control channels including
+`MAKEFLAGS`, `GNUMAKEFLAGS`, `MAKEFILES`, `MFLAGS`, `MAKEOVERRIDES`,
+`MAKELEVEL`, jobserver/restart/terminal state, compiler variables, and internal
+build variables therefore cannot rewrite goals or bypass the facade's
+assignment allowlist. Toolchain and flag overrides must use the dedicated Zig
+options or an allowlisted `-Dmake-arg`.
+
 Invoke only one Make-backed named step per `zig build` command. A portable,
 non-blocking file lock rejects overlapping Make processes rather than allowing
 selected steps such as `clean all` to race. For each effective UID, facade
 invocations use one lock in a private `unikraft-zig-facade-<uid>` directory
-beneath the fixed POSIX shared temporary root (`/tmp`, or `/private/tmp` on
-macOS). `TMPDIR`, `TEMP`, and `TMP` do not change this identity. The facade
-requires the private directory to be owned by the current user with mode
-`0700`, and the regular, single-link lock to have mode `0600`; symlinks and
-unsafe ownership or permissions are refused. The fixed root must itself be a
-root-owned sticky shared directory. This preserves same-user serialization
-across parent/nested outputs, caches, applications, and checkouts without
-allowing one user to lock out another or split the lock through environment
-changes.
+beneath a stable, trusted per-user namespace. Linux prefers
+`/run/user/<effective-uid>` and falls back to the canonical home directory from
+the passwd database. macOS uses its OS-provided per-user temporary directory;
+other supported POSIX hosts use the canonical passwd home. `HOME`,
+`XDG_RUNTIME_DIR`, `TMPDIR`, `TEMP`, and `TMP` do not select the lock root.
+Every production root and ancestor is opened without following its final
+component and must be owned by root or the current user without group/other
+write access; the per-user root must be current-user-owned. The private
+directory must have mode `0700`, and the regular, single-link lock mode `0600`;
+symlinks and unsafe ownership or permissions are refused. This preserves
+same-user serialization across parent/nested outputs, caches, applications,
+and checkouts without allowing shared-temporary-directory pre-creation or
+environment changes to lock out a user or split the lock.
 
 The private runtime directory must be outside every output tree; its persistent
 lock file is never unlinked while held. Before invoking Make, the runner makes
@@ -223,8 +240,8 @@ the application, output, and configuration path components cannot be replaced.
 `python3 -m unittest -v support.scripts.tests.test_zig_facade` adds
 end-to-end metacharacter, cross-checkout parent/nested output, destructive path
 replacement refusal, and orphaned backend-tree lock-lifetime coverage,
-including hostile runtime and build-marker entries and differing
-temporary-directory environments.
+including hostile inherited Make environments, output-identity replacement,
+runtime/build-marker entries, and differing temporary-directory environments.
 
 The experimental QEMU/x86_64 Zig compiler setup becomes:
 

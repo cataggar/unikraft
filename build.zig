@@ -217,6 +217,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("support/build/zig-facade-runner.zig"),
             .target = b.graph.host,
             .optimize = .ReleaseSafe,
+            .link_libc = true,
         }),
     });
     for (targets) |target| {
@@ -257,6 +258,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("support/build/zig-facade-runner.zig"),
             .target = b.graph.host,
             .optimize = .Debug,
+            .link_libc = true,
         }),
     });
     const run_runner_tests = b.addRunArtifact(runner_tests);
@@ -317,11 +319,6 @@ fn canonicalizeMakePaths(
         allocator,
         io,
         options.app,
-    )).path;
-    options.output = (try facade_paths.canonicalizeNearestExisting(
-        allocator,
-        io,
-        options.output,
     )).path;
     if (options.config) |config| {
         options.config = (try facade_paths.canonicalizeNearestExisting(
@@ -1005,6 +1002,46 @@ test "canonicalization follows symlinks through nearest existing ancestor" {
 
     try std.testing.expect(!canonical.exists);
     try std.testing.expectEqualStrings(expected, canonical.path);
+}
+
+test "Make path normalization preserves the single canonical output result" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "app");
+
+    const root = try testDirPath(std.testing.allocator, temporary.dir);
+    defer std.testing.allocator.free(root);
+    const requested = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "app/build" },
+    );
+    defer std.testing.allocator.free(requested);
+    const canonical = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        requested,
+    );
+    defer std.testing.allocator.free(canonical.path);
+    try std.testing.expect(!canonical.exists);
+
+    var options = testingMakeOptions();
+    const app_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "app" },
+    );
+    defer std.testing.allocator.free(app_path);
+    options.app = app_path;
+    options.output = canonical.path;
+    options.config = null;
+    options.external_libraries = null;
+    options.external_platforms = null;
+    options.exclusions = null;
+    const output_pointer = options.output.ptr;
+
+    try canonicalizeMakePaths(std.testing.allocator, std.testing.io, &options);
+    defer std.testing.allocator.free(options.app);
+    try std.testing.expectEqual(output_pointer, options.output.ptr);
+    try std.testing.expectEqualStrings(canonical.path, options.output);
 }
 
 test "distclean configuration targets stay inside the canonical app tree" {

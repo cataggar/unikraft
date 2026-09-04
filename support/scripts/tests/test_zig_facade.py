@@ -32,6 +32,8 @@ class ZigFacadeIntegrationTest(unittest.TestCase):
         cls.global_cache = cls.work / "global-cache"
         cls.app = cls.work / "app"
         cls.log = cls.work / "make-events.jsonl"
+        cls.sleep_control = cls.work / "backend-sleep"
+        cls.child_sleep_control = cls.work / "backend-child-sleep"
         for path in (cls.runtime, cls.global_cache, cls.app):
             path.mkdir(parents=True)
         cls.runtime.chmod(0o755)
@@ -46,13 +48,20 @@ import subprocess
 import sys
 import time
 
-child_sleep = os.environ.get("ZIG_FACADE_TEST_CHILD_SLEEP")
+log = Path(__LOG_PATH__)
+sleep_control = Path(__SLEEP_CONTROL__)
+child_sleep_control = Path(__CHILD_SLEEP_CONTROL__)
+child_sleep = (
+    child_sleep_control.read_text(encoding="utf-8").strip()
+    if child_sleep_control.exists()
+    else None
+)
 event = {
     "event": "START",
     "pid": os.getpid(),
     "argv": sys.argv[1:],
+    "environment": dict(os.environ),
 }
-log = Path(os.environ["ZIG_FACADE_TEST_LOG"])
 if child_sleep:
     child_code = '''
 import json
@@ -79,10 +88,20 @@ with log.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(event) + "\\n")
     stream.flush()
     os.fsync(stream.fileno())
-time.sleep(float(os.environ.get("ZIG_FACADE_TEST_SLEEP", "0")))
+sleep_seconds = (
+    float(sleep_control.read_text(encoding="utf-8").strip())
+    if sleep_control.exists()
+    else 0
+)
+time.sleep(sleep_seconds)
 with log.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps({"event": "END", "pid": os.getpid()}) + "\\n")
-""",
+""".replace("__LOG_PATH__", repr(str(cls.log)))
+            .replace("__SLEEP_CONTROL__", repr(str(cls.sleep_control)))
+            .replace(
+                "__CHILD_SLEEP_CONTROL__",
+                repr(str(cls.child_sleep_control)),
+            ),
             encoding="utf-8",
         )
         cls.make.chmod(0o755)
@@ -102,24 +121,13 @@ with log.open("a", encoding="utf-8") as stream:
                 shutil.copy2(REPO / relative, destination)
             runner = checkout / "support/build/zig-facade-runner.zig"
             runner_source = runner.read_text(encoding="utf-8")
-            production_root = (
-                'const stable_temp_root = if (builtin.os.tag == .macos) '
-                '"/private/tmp" else "/tmp";'
-            )
+            production_root = "const injected_runtime_root: ?[]const u8 = null;"
             if production_root not in runner_source:
-                raise AssertionError("runner stable temporary root declaration changed")
-            production_role = (
-                "const stable_temp_root_role: MetadataRole = .temp_root;"
-            )
-            if production_role not in runner_source:
-                raise AssertionError("runner stable temporary root policy changed")
+                raise AssertionError("runner runtime-root injection point changed")
             runner.write_text(
                 runner_source.replace(
                     production_root,
-                    f'const stable_temp_root = "{cls.runtime}";',
-                ).replace(
-                    production_role,
-                    "const stable_temp_root_role: MetadataRole = .isolated_temp_root;",
+                    f'const injected_runtime_root: ?[]const u8 = "{cls.runtime}";',
                 ),
                 encoding="utf-8",
             )
@@ -131,6 +139,8 @@ with log.open("a", encoding="utf-8") as stream:
 
     def setUp(self):
         self.log.unlink(missing_ok=True)
+        self.sleep_control.unlink(missing_ok=True)
+        self.child_sleep_control.unlink(missing_ok=True)
 
     def facade_command(self, checkout, cache, output, *extra, goal="all"):
         return [
@@ -156,7 +166,6 @@ with log.open("a", encoding="utf-8") as stream:
         env.update(
             {
                 "ZIG_GLOBAL_CACHE_DIR": str(self.global_cache),
-                "ZIG_FACADE_TEST_LOG": str(self.log),
             }
         )
         env[runtime_variable] = str(self.runtime)
@@ -243,6 +252,109 @@ with log.open("a", encoding="utf-8") as stream:
             1,
         )
 
+    def test_make_backend_receives_only_controlled_environment(self):
+        checkout = self.checkouts[0]
+        cache = self.work / "environment-cache"
+        output = self.work / "outputs" / "environment"
+        hostile = {
+            "MAKEFLAGS": "--eval=fetch\\: properclean",
+            "GNUMAKEFLAGS": "--eval=fetch\\: properclean",
+            "MAKEFILES": str(self.work / "hostile.mk"),
+            "MFLAGS": "-e",
+            "MAKEOVERRIDES": "O BUILD_DIR",
+            "MAKELEVEL": "99",
+            "MAKE_RESTARTS": "99",
+            "MAKE_TERMOUT": "hostile",
+            "MAKE_TERMERR": "hostile",
+            "CC": "hostile-cc",
+            "AR": "hostile-ar",
+            "BUILD_DIR": "/etc",
+            "_O": "/etc",
+            "UK_CONFIG": "/etc/passwd",
+            "CONFIG_DIR": "/etc",
+            "A": "/etc",
+            "O": "/etc",
+            "C": "/etc/passwd",
+            "HOME": str(self.work / "attacker-home"),
+        }
+        invocation = self.work / "invoke-environment"
+        invocation.mkdir(exist_ok=True)
+        result = subprocess.run(
+            self.facade_command(
+                checkout,
+                cache,
+                output,
+                "-Dmake-arg=AR=zig ar",
+                goal="fetch",
+            ),
+            cwd=invocation,
+            env=self.facade_env(**hostile),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        starts = [e for e in self.read_events() if e["event"] == "START"]
+        self.assertEqual(len(starts), 1)
+        event = starts[0]
+        self.assertIn("AR=zig ar", event["argv"])
+        for name in hostile:
+            if name == "HOME":
+                self.assertNotEqual(event["environment"].get(name), hostile[name])
+            else:
+                self.assertNotIn(name, event["environment"])
+        self.assertLessEqual(
+            set(event["environment"]),
+            {"HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE"},
+        )
+
+        real_make = shutil.which("make")
+        self.assertIsNotNone(real_make)
+        (checkout / "Makefile").write_text(
+            "fetch:\nproperclean:\n\t@rm -rf $(O)\n",
+            encoding="utf-8",
+        )
+        injected_makefile = self.work / "injected.mk"
+        injected_makefile.write_text("fetch: properclean\n", encoding="utf-8")
+        aliases = {
+            "MAKEFLAGS": r"--eval=fetch\:\ properclean",
+            "GNUMAKEFLAGS": r"--eval=fetch\:\ properclean",
+            "MAKEFILES": str(injected_makefile),
+        }
+        for channel, value in aliases.items():
+            with self.subTest(channel=channel):
+                alias_output = self.work / "outputs" / f"alias-{channel}"
+                command = self.facade_command(
+                    checkout,
+                    cache,
+                    alias_output,
+                    goal="fetch",
+                )
+                command[
+                    next(
+                        index
+                        for index, argument in enumerate(command)
+                        if argument.startswith("-Dmake-command=")
+                    )
+                ] = f"-Dmake-command={real_make}"
+                alias_result = subprocess.run(
+                    command,
+                    cwd=invocation,
+                    env=self.facade_env(**{channel: value}),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertEqual(alias_result.returncode, 0, alias_result.stdout)
+                self.assertTrue(
+                    (alias_output / ".unikraft-zig-build").is_file(),
+                    f"{channel} rewrote fetch into properclean",
+                )
+
     def test_parent_and_nested_outputs_share_one_persistent_lock(self):
         first_checkout, second_checkout = self.checkouts
         first_cache = self.work / "cache-one"
@@ -262,6 +374,7 @@ with log.open("a", encoding="utf-8") as stream:
         second_invocation = self.work / "invoke-concurrent-two"
         first_invocation.mkdir(exist_ok=True)
         second_invocation.mkdir(exist_ok=True)
+        self.sleep_control.write_text("5", encoding="utf-8")
         first = subprocess.Popen(
             self.facade_command(
                 first_checkout,
@@ -272,7 +385,6 @@ with log.open("a", encoding="utf-8") as stream:
             cwd=first_invocation,
             env=self.facade_env(
                 TMPDIR=str(self.work / "ignored-temp-one"),
-                ZIG_FACADE_TEST_SLEEP="5",
             ),
             text=True,
             stdout=subprocess.PIPE,
@@ -311,6 +423,7 @@ with log.open("a", encoding="utf-8") as stream:
             )
         finally:
             first_stdout, _ = first.communicate(timeout=15)
+            self.sleep_control.unlink(missing_ok=True)
         self.assertEqual(first.returncode, 0, first_stdout)
 
         lock = (
@@ -337,13 +450,12 @@ with log.open("a", encoding="utf-8") as stream:
         self.log.unlink(missing_ok=True)
         invocation = self.work / "invoke-lifetime"
         invocation.mkdir(exist_ok=True)
+        self.sleep_control.write_text("30", encoding="utf-8")
+        self.child_sleep_control.write_text("4", encoding="utf-8")
         first = subprocess.Popen(
             self.facade_command(first_checkout, first_cache, output),
             cwd=invocation,
-            env=self.facade_env(
-                ZIG_FACADE_TEST_SLEEP="30",
-                ZIG_FACADE_TEST_CHILD_SLEEP="4",
-            ),
+            env=self.facade_env(),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -382,6 +494,8 @@ with log.open("a", encoding="utf-8") as stream:
                 self.fail("orphaned backend child did not finish")
         finally:
             first_stdout, _ = first.communicate(timeout=10)
+            self.sleep_control.unlink(missing_ok=True)
+            self.child_sleep_control.unlink(missing_ok=True)
         self.assertNotEqual(first.returncode, 0, first_stdout)
 
         recovered = self.run_facade(second_checkout, second_cache, output)
@@ -402,12 +516,30 @@ with log.open("a", encoding="utf-8") as stream:
         other_lock = simulated_other / "build.lock"
         other_lock.touch(mode=0o600)
         other_lock.chmod(0o600)
-        default_env = self.facade_env(runtime_variable="TEMP")
+        attacker_temp = self.work / "attacker-selected-temp"
+        attacker_private = (
+            attacker_temp / f"unikraft-zig-facade-{os.geteuid()}"
+        )
+        attacker_private.mkdir(parents=True)
+        attacker_lock = attacker_private / "build.lock"
+        attacker_lock.touch(mode=0o600)
+        attacker_lock.chmod(0o600)
+        default_env = self.facade_env(
+            runtime_variable="TEMP",
+            TEMP=str(attacker_temp),
+            TMPDIR=str(self.work / "different-attacker-temp"),
+            HOME=str(self.work / "attacker-home"),
+            XDG_RUNTIME_DIR=str(self.work / "attacker-runtime"),
+        )
         invocation = self.work / "invoke-secure-runtime"
         invocation.mkdir(exist_ok=True)
 
-        with other_lock.open("r+", encoding="utf-8") as other_stream:
+        with (
+            other_lock.open("r+", encoding="utf-8") as other_stream,
+            attacker_lock.open("r+", encoding="utf-8") as attacker_stream,
+        ):
             fcntl.flock(other_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(attacker_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             first = subprocess.run(
                 self.facade_command(checkout, cache, output),
                 cwd=invocation,
@@ -536,7 +668,7 @@ with log.open("a", encoding="utf-8") as stream:
             check=False,
         )
         self.assertNotEqual(unsafe_temp_root.returncode, 0)
-        self.assertIn("refusing insecure stable temporary root", unsafe_temp_root.stdout)
+        self.assertIn("refusing insecure stable per-user runtime root", unsafe_temp_root.stdout)
         self.runtime.chmod(0o755)
 
         shutil.rmtree(private)
@@ -636,6 +768,78 @@ with log.open("a", encoding="utf-8") as stream:
             marker.unlink()
         recovered = self.run_facade(checkout, cache, output)
         self.assertEqual(recovered.returncode, 0, recovered.stdout)
+
+    def test_runner_rejects_output_mismatch_and_phase_replacement(self):
+        checkout = self.checkouts[0]
+        cache = self.work / "output-identity-cache"
+        parent = self.work / "output-identity-parent"
+        output = parent / "build"
+        initial = self.run_facade(checkout, cache, output)
+        self.assertEqual(initial.returncode, 0, initial.stdout)
+
+        runners = [
+            path
+            for path in cache.rglob("unikraft-zig-make")
+            if path.is_file() and os.access(path, os.X_OK)
+        ]
+        self.assertEqual(len(runners), 1, runners)
+        runner = runners[0]
+        self.log.unlink(missing_ok=True)
+
+        mismatch = subprocess.run(
+            [
+                str(runner),
+                str(output),
+                str(self.make),
+                "--no-print-directory",
+                "all",
+                f"A={self.app.resolve()}",
+                f"O={(self.work / 'different-output').resolve()}",
+            ],
+            cwd=self.work,
+            env=self.facade_env(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("output mismatch", mismatch.stdout)
+        self.assertEqual(self.read_events(), [])
+
+        moved = self.work / "output-identity-parent-moved"
+        victim = self.work / "output-identity-victim"
+        victim.mkdir()
+        sentinel = victim / "must-survive"
+        sentinel.write_text("unchanged", encoding="utf-8")
+        parent.rename(moved)
+        parent.symlink_to(victim, target_is_directory=True)
+        replaced = subprocess.run(
+            [
+                str(runner),
+                str(output),
+                str(self.make),
+                "--no-print-directory",
+                "all",
+                f"A={self.app.resolve()}",
+                f"O={output}",
+            ],
+            cwd=self.work,
+            env=self.facade_env(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(replaced.returncode, 0)
+        self.assertIn("output mismatch", replaced.stdout)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+        self.assertFalse((victim / "build").exists())
+        self.assertEqual(self.read_events(), [])
+        parent.unlink()
+        moved.rename(parent)
 
     def test_destructive_steps_refuse_intermediate_path_replacement(self):
         checkout = self.checkouts[0]

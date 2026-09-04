@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 
 const lock_name = "build.lock";
 const runtime_prefix = "unikraft-zig-facade-";
-const stable_temp_root = if (builtin.os.tag == .macos) "/private/tmp" else "/tmp";
+const injected_runtime_root: ?[]const u8 = null;
 
 const RuntimeDirectory = struct {
     dir: std.Io.Dir,
@@ -12,15 +12,14 @@ const RuntimeDirectory = struct {
 };
 
 const MetadataRole = enum {
-    temp_root,
     isolated_temp_root,
+    trusted_ancestor,
+    user_runtime_root,
     runtime_directory,
     lock_file,
     output_directory,
     marker_file,
 };
-
-const stable_temp_root_role: MetadataRole = .temp_root;
 
 const Metadata = struct {
     mode: u32,
@@ -53,6 +52,14 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    validateOutputIdentity(allocator, init.io, args[1], args[2..]) catch {
+        std.debug.print(
+            "error: internal Zig facade output mismatch: the canonical O= assignment must exactly match the runner output argument\n",
+            .{},
+        );
+        std.process.exit(2);
+    };
+
     validateCanonicalMakeArguments(allocator, init.io, args[2..]) catch {
         std.debug.print(
             "error: a Make-facing A/O/C/L/P/E path no longer resolves to the canonical identity validated by build.zig; retry from a stable filesystem state\n",
@@ -62,24 +69,30 @@ pub fn main(init: std.process.Init) !void {
     };
 
     const uid = std.posix.system.geteuid();
-    var runtime = prepareRuntimeDirectory(
+    const home = canonicalPasswdHome(allocator, init.io, uid) catch |err| {
+        std.debug.print(
+            "error: unable to obtain and validate the current user's canonical passwd home directory: {s}\n",
+            .{@errorName(err)},
+        );
+        std.process.exit(2);
+    };
+    var runtime = prepareSelectedRuntimeDirectory(
         allocator,
         init.io,
-        stable_temp_root,
         uid,
-        stable_temp_root_role,
+        home,
     ) catch |err| switch (err) {
-        error.UnsafeTempRoot => {
+        error.UnsafeRuntimeRoot => {
             std.debug.print(
-                "error: refusing insecure stable temporary root '{s}': it must be a real, root-owned sticky shared directory\n",
-                .{stable_temp_root},
+                "error: refusing insecure stable per-user runtime root: expected a canonical directory chain owned only by root or the current user without group/other write access\n",
+                .{},
             );
             std.process.exit(2);
         },
         error.UnsafeRuntimeDirectory => {
             std.debug.print(
-                "error: refusing insecure UID-scoped Zig facade runtime directory below '{s}': expected a real, current-user-owned 0700 directory\n",
-                .{stable_temp_root},
+                "error: refusing insecure UID-scoped Zig facade runtime directory: expected a real, current-user-owned 0700 directory\n",
+                .{},
             );
             std.process.exit(2);
         },
@@ -160,10 +173,25 @@ pub fn main(init: std.process.Init) !void {
         );
         std.process.exit(2);
     };
+    validateOutputIdentity(allocator, init.io, args[1], args[2..]) catch {
+        std.debug.print(
+            "error: the canonical output identity changed immediately before backend execution; refusing delegation\n",
+            .{},
+        );
+        std.process.exit(2);
+    };
 
     // Exec keeps the locked descriptor in Make and every normally spawned descendant.
     try setCloseOnExec(lock, false);
-    const replace_error = std.process.replace(init.io, .{ .argv = args[2..] });
+    var environment = try controlledMakeEnvironment(
+        allocator,
+        init.environ_map,
+        home,
+    );
+    const replace_error = std.process.replace(init.io, .{
+        .argv = args[2..],
+        .environ_map = &environment,
+    });
     setCloseOnExec(lock, true) catch {};
     return replace_error;
 }
@@ -173,6 +201,82 @@ fn isDestructiveGoal(goal: []const u8) bool {
         std.mem.eql(u8, goal, "clean-libs") or
         std.mem.eql(u8, goal, "properclean") or
         std.mem.eql(u8, goal, "distclean");
+}
+
+fn validateOutputIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: []const u8,
+    arguments: []const []const u8,
+) !void {
+    var make_output: ?[]const u8 = null;
+    for (arguments) |argument| {
+        if (!std.mem.startsWith(u8, argument, "O=")) continue;
+        if (make_output != null) return error.DuplicateOutputAssignment;
+        make_output = argument[2..];
+    }
+    const value = make_output orelse return error.MissingOutputAssignment;
+    if (!std.mem.eql(u8, output, value)) return error.OutputMismatch;
+
+    const canonical = try facade_paths.canonicalizeNearestExisting(
+        allocator,
+        io,
+        value,
+    );
+    defer allocator.free(canonical.path);
+    if (!std.mem.eql(u8, canonical.path, output))
+        return error.PathIdentityChanged;
+}
+
+fn controlledMakeEnvironment(
+    allocator: std.mem.Allocator,
+    inherited: *const std.process.Environ.Map,
+    canonical_home: []const u8,
+) !std.process.Environ.Map {
+    var environment = std.process.Environ.Map.init(allocator);
+    errdefer environment.deinit();
+
+    if (!isSafeEnvironmentPath(canonical_home, false))
+        return error.UnsafeEnvironmentValue;
+    try environment.put("HOME", canonical_home);
+    const inherited_path = inherited.get("PATH") orelse "";
+    const search_path = if (isSafeEnvironmentPath(inherited_path, true))
+        inherited_path
+    else
+        "/usr/bin:/bin";
+    try environment.put("PATH", search_path);
+    for ([_][]const u8{ "LANG", "LC_ALL" }) |name| {
+        const value = inherited.get(name) orelse continue;
+        if (isSafeLocale(value)) try environment.put(name, value);
+    }
+    return environment;
+}
+
+fn isSafeLocale(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.', '+', '@' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn isSafeEnvironmentPath(value: []const u8, allow_colon: bool) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '/', '-', '_', '.', '+', '@' => {},
+        ':' => if (!allow_colon) return false,
+        else => return false,
+    };
+    if (allow_colon) {
+        var entries = std.mem.splitScalar(u8, value, ':');
+        while (entries.next()) |entry| {
+            if (entry.len == 0 or !std.fs.path.isAbsolute(entry)) return false;
+        }
+    } else if (!std.fs.path.isAbsolute(value)) {
+        return false;
+    }
+    return true;
 }
 
 fn validateCanonicalMakeArguments(
@@ -258,19 +362,160 @@ fn runtimeDirectoryName(
     return std.fmt.allocPrint(allocator, "{s}{d}", .{ runtime_prefix, uid });
 }
 
+fn canonicalPasswdHome(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    uid: std.posix.uid_t,
+) ![]const u8 {
+    if (comptime builtin.os.tag == .windows)
+        return error.UnsupportedHost;
+
+    var entry: std.c.passwd = undefined;
+    var result: ?*std.c.passwd = null;
+    var buffer: [16 * 1024]u8 = undefined;
+    if (std.c.getpwuid_r(uid, &entry, &buffer, buffer.len, &result) != 0 or
+        result == null or entry.dir == null)
+    {
+        return error.PasswdLookupFailed;
+    }
+    const lexical = std.mem.span(entry.dir.?);
+    if (!std.fs.path.isAbsolute(lexical)) return error.UnsafeRuntimeRoot;
+
+    var canonical_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try std.Io.Dir.realPathFileAbsolute(
+        io,
+        lexical,
+        &canonical_buffer,
+    );
+    const canonical = canonical_buffer[0..length];
+    if (!isSafeEnvironmentPath(canonical, false))
+        return error.UnsafeRuntimeRoot;
+    try validateTrustedDirectoryChain(io, canonical, uid, true);
+    return allocator.dupe(u8, canonical);
+}
+
+fn prepareSelectedRuntimeDirectory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    uid: std.posix.uid_t,
+    canonical_home: []const u8,
+) !RuntimeDirectory {
+    if (injected_runtime_root) |root| {
+        return prepareRuntimeDirectory(
+            allocator,
+            io,
+            root,
+            uid,
+            .isolated_temp_root,
+        );
+    }
+
+    if (comptime builtin.os.tag == .linux) {
+        const run_user = try std.fmt.allocPrint(allocator, "/run/user/{d}", .{uid});
+        validateTrustedDirectoryChain(io, run_user, uid, true) catch |err| switch (err) {
+            error.FileNotFound => return prepareRuntimeDirectory(
+                allocator,
+                io,
+                canonical_home,
+                uid,
+                .user_runtime_root,
+            ),
+            else => return err,
+        };
+        return prepareRuntimeDirectory(
+            allocator,
+            io,
+            run_user,
+            uid,
+            .user_runtime_root,
+        );
+    }
+
+    if (comptime builtin.os.tag == .macos) {
+        const user_temp = try darwinUserTempDirectory(allocator);
+        const canonical = try facade_paths.canonicalizeNearestExisting(
+            allocator,
+            io,
+            user_temp,
+        );
+        if (!canonical.exists) return error.UnsafeRuntimeRoot;
+        try validateTrustedDirectoryChain(io, canonical.path, uid, true);
+        return prepareRuntimeDirectory(
+            allocator,
+            io,
+            canonical.path,
+            uid,
+            .user_runtime_root,
+        );
+    }
+
+    return prepareRuntimeDirectory(
+        allocator,
+        io,
+        canonical_home,
+        uid,
+        .user_runtime_root,
+    );
+}
+
+fn darwinUserTempDirectory(allocator: std.mem.Allocator) ![]const u8 {
+    if (comptime builtin.os.tag != .macos) return error.UnsupportedHost;
+    const darwin_user_temp_dir = 65537;
+    const needed = confstr(darwin_user_temp_dir, null, 0);
+    if (needed <= 1 or needed > std.fs.max_path_bytes)
+        return error.UnsafeRuntimeRoot;
+    const buffer = try allocator.alloc(u8, needed);
+    const actual = confstr(darwin_user_temp_dir, buffer.ptr, buffer.len);
+    if (actual != needed or buffer[needed - 1] != 0)
+        return error.UnsafeRuntimeRoot;
+    return buffer[0 .. needed - 1];
+}
+
+extern "c" fn confstr(name: c_int, buffer: ?[*]u8, length: usize) usize;
+
+fn validateTrustedDirectoryChain(
+    io: std.Io,
+    path: []const u8,
+    uid: std.posix.uid_t,
+    require_user_final: bool,
+) !void {
+    if (!std.fs.path.isAbsolute(path)) return error.UnsafeRuntimeRoot;
+    var current = path;
+    var final = true;
+    while (true) {
+        var directory = std.Io.Dir.cwd().openDir(io, current, .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            else => return error.UnsafeRuntimeRoot,
+        };
+        defer directory.close(io);
+        const role: MetadataRole = if (final and require_user_final)
+            .user_runtime_root
+        else
+            .trusted_ancestor;
+        try validateMetadata(try metadataForHandle(directory.handle), uid, role);
+
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        current = parent;
+        final = false;
+    }
+}
+
 fn prepareRuntimeDirectory(
     allocator: std.mem.Allocator,
     io: std.Io,
-    temp_root: []const u8,
+    runtime_root: []const u8,
     uid: std.posix.uid_t,
-    temp_root_role: MetadataRole,
+    runtime_root_role: MetadataRole,
 ) !RuntimeDirectory {
-    const absolute_root = try std.fs.path.resolve(allocator, &.{temp_root});
+    const absolute_root = try std.fs.path.resolve(allocator, &.{runtime_root});
     var root = std.Io.Dir.cwd().openDir(io, absolute_root, .{
         .follow_symlinks = false,
-    }) catch return error.UnsafeTempRoot;
+    }) catch return error.UnsafeRuntimeRoot;
     defer root.close(io);
-    try validateMetadata(try metadataForHandle(root.handle), uid, temp_root_role);
+    try validateMetadata(try metadataForHandle(root.handle), uid, runtime_root_role);
 
     const runtime_name = try runtimeDirectoryName(allocator, uid);
     root.createDir(io, runtime_name, .fromMode(0o700)) catch |err| switch (err) {
@@ -354,23 +599,31 @@ fn validateMetadata(
 ) !void {
     const permissions = metadata.mode & 0o7777;
     switch (role) {
-        .temp_root => {
-            if (metadata.mode & std.posix.S.IFMT != std.posix.S.IFDIR)
-                return error.UnsafeTempRoot;
-            const root_owned_sticky =
-                metadata.uid == 0 and
-                permissions & 0o1000 != 0 and
-                permissions & 0o003 == 0o003;
-            if (!root_owned_sticky) return error.UnsafeTempRoot;
-        },
         .isolated_temp_root => {
             if (metadata.mode & std.posix.S.IFMT != std.posix.S.IFDIR)
-                return error.UnsafeTempRoot;
+                return error.UnsafeRuntimeRoot;
             const user_owned_private =
                 metadata.uid == @as(u64, uid) and
                 permissions & 0o700 == 0o700 and
                 permissions & 0o022 == 0;
-            if (!user_owned_private) return error.UnsafeTempRoot;
+            if (!user_owned_private) return error.UnsafeRuntimeRoot;
+        },
+        .trusted_ancestor => {
+            if (metadata.mode & std.posix.S.IFMT != std.posix.S.IFDIR or
+                (metadata.uid != 0 and metadata.uid != @as(u64, uid)) or
+                permissions & 0o022 != 0)
+            {
+                return error.UnsafeRuntimeRoot;
+            }
+        },
+        .user_runtime_root => {
+            if (metadata.mode & std.posix.S.IFMT != std.posix.S.IFDIR or
+                metadata.uid != @as(u64, uid) or
+                permissions & 0o700 != 0o700 or
+                permissions & 0o022 != 0)
+            {
+                return error.UnsafeRuntimeRoot;
+            }
         },
         .runtime_directory => {
             if (metadata.mode & std.posix.S.IFMT != std.posix.S.IFDIR or
@@ -527,12 +780,11 @@ test "runtime directory names are UID scoped" {
     try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
-test "stable POSIX temporary root ignores process environment" {
-    const expected = if (builtin.os.tag == .macos) "/private/tmp" else "/tmp";
-    try std.testing.expectEqualStrings(expected, stable_temp_root);
+test "production runtime selection has no environment override" {
+    try std.testing.expect(injected_runtime_root == null);
 }
 
-test "temporary roots require trusted ownership and permissions" {
+test "runtime roots require trusted ownership and permissions" {
     const uid = std.posix.system.geteuid();
     var metadata = Metadata{
         .mode = std.posix.S.IFDIR | 0o755,
@@ -543,18 +795,72 @@ test "temporary roots require trusted ownership and permissions" {
     try validateMetadata(metadata, uid, .isolated_temp_root);
     metadata.mode = std.posix.S.IFDIR | 0o775;
     try std.testing.expectError(
-        error.UnsafeTempRoot,
+        error.UnsafeRuntimeRoot,
         validateMetadata(metadata, uid, .isolated_temp_root),
     );
 
-    metadata.mode = std.posix.S.IFDIR | 0o1777;
+    metadata.mode = std.posix.S.IFDIR | 0o755;
     metadata.uid = 0;
-    try validateMetadata(metadata, uid, .temp_root);
+    try validateMetadata(metadata, uid, .trusted_ancestor);
+    metadata.mode = std.posix.S.IFDIR | 0o775;
+    try std.testing.expectError(
+        error.UnsafeRuntimeRoot,
+        validateMetadata(metadata, uid, .trusted_ancestor),
+    );
+
+    metadata.mode = std.posix.S.IFDIR | 0o700;
+    metadata.uid = @as(u64, uid);
+    try validateMetadata(metadata, uid, .user_runtime_root);
     metadata.uid = @as(u64, uid) + 1;
     try std.testing.expectError(
-        error.UnsafeTempRoot,
-        validateMetadata(metadata, uid, .temp_root),
+        error.UnsafeRuntimeRoot,
+        validateMetadata(metadata, uid, .user_runtime_root),
     );
+}
+
+test "controlled Make environment excludes control and build variables" {
+    var inherited = std.process.Environ.Map.init(std.testing.allocator);
+    defer inherited.deinit();
+    try inherited.put("PATH", "/safe/bin");
+    try inherited.put("LANG", "en_US.UTF-8");
+    try inherited.put("LC_ALL", "bad;locale");
+    for ([_][]const u8{
+        "MAKEFLAGS",
+        "GNUMAKEFLAGS",
+        "MAKEFILES",
+        "MFLAGS",
+        "MAKEOVERRIDES",
+        "MAKELEVEL",
+        "CC",
+        "BUILD_DIR",
+        "UK_CONFIG",
+        "CONFIG_DIR",
+        "O",
+        "A",
+    }) |name| try inherited.put(name, "hostile");
+
+    var controlled = try controlledMakeEnvironment(
+        std.testing.allocator,
+        &inherited,
+        "/canonical/home",
+    );
+    defer controlled.deinit();
+    try std.testing.expectEqualStrings("/safe/bin", controlled.get("PATH").?);
+    try std.testing.expectEqualStrings("/canonical/home", controlled.get("HOME").?);
+    try std.testing.expectEqualStrings("en_US.UTF-8", controlled.get("LANG").?);
+    try std.testing.expect(controlled.get("LC_ALL") == null);
+    try std.testing.expectEqual(@as(usize, 3), controlled.keys().len);
+
+    try inherited.put("PATH", "/safe/bin;hostile");
+    var fallback = try controlledMakeEnvironment(
+        std.testing.allocator,
+        &inherited,
+        "/canonical/home",
+    );
+    defer fallback.deinit();
+    try std.testing.expectEqualStrings("/usr/bin:/bin", fallback.get("PATH").?);
+    try std.testing.expect(!isSafeEnvironmentPath("/bin::/usr/bin", true));
+    try std.testing.expect(!isSafeEnvironmentPath("/home/user;hostile", false));
 }
 
 test "private runtime metadata rejects unsafe ownership permissions and links" {
@@ -657,6 +963,50 @@ test "destructive Make goals are refused defensively" {
     try std.testing.expect(isDestructiveGoal("properclean"));
     try std.testing.expect(isDestructiveGoal("distclean"));
     try std.testing.expect(!isDestructiveGoal("all"));
+}
+
+test "runner output argument and Make O assignment have one identity" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "output");
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
+    const output = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_length], "output" },
+    );
+    defer std.testing.allocator.free(output);
+    const assignment = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "O={s}",
+        .{output},
+    );
+    defer std.testing.allocator.free(assignment);
+
+    try validateOutputIdentity(
+        std.testing.allocator,
+        std.testing.io,
+        output,
+        &.{ "make", "all", assignment },
+    );
+    try std.testing.expectError(
+        error.OutputMismatch,
+        validateOutputIdentity(
+            std.testing.allocator,
+            std.testing.io,
+            "/different/output",
+            &.{ "make", "all", assignment },
+        ),
+    );
+    try std.testing.expectError(
+        error.DuplicateOutputAssignment,
+        validateOutputIdentity(
+            std.testing.allocator,
+            std.testing.io,
+            output,
+            &.{ assignment, assignment },
+        ),
+    );
 }
 
 test "canonical Make path validation detects intermediate replacement" {
