@@ -26,19 +26,30 @@ class ZigFacadeIntegrationTest(unittest.TestCase):
             if configured_root
             else REPO / ".cache" / f"zig-facade-tests-{os.getpid()}"
         ).resolve()
+        configured_exec_root = os.environ.get("ZIG_FACADE_TEST_EXEC_ROOT")
+        cls.exec_root = (
+            Path(configured_exec_root)
+            if configured_exec_root
+            else cls.work / "executables"
+        ).resolve()
         shutil.rmtree(cls.work, ignore_errors=True)
+        if cls.exec_root != cls.work and not cls.exec_root.is_relative_to(cls.work):
+            shutil.rmtree(cls.exec_root, ignore_errors=True)
         cls.work.mkdir(parents=True)
+        cls.exec_root.mkdir(parents=True)
+        cls.exec_root.chmod(0o700)
         cls.runtime = cls.work / "runtime"
         cls.global_cache = cls.work / "global-cache"
         cls.app = cls.work / "app"
         cls.log = cls.work / "make-events.jsonl"
         cls.sleep_control = cls.work / "backend-sleep"
         cls.child_sleep_control = cls.work / "backend-child-sleep"
+        cls.exec_gate = cls.work / "exec-gate"
         for path in (cls.runtime, cls.global_cache, cls.app):
             path.mkdir(parents=True)
         cls.runtime.chmod(0o755)
 
-        cls.make = cls.work / "fake-make.py"
+        cls.make = cls.exec_root / "fake-make.py"
         cls.make.write_text(
             """#!/usr/bin/env python3
 import json
@@ -124,10 +135,16 @@ with log.open("a", encoding="utf-8") as stream:
             production_root = "const injected_runtime_root: ?[]const u8 = null;"
             if production_root not in runner_source:
                 raise AssertionError("runner runtime-root injection point changed")
+            production_gate = "const injected_pre_exec_gate: ?[]const u8 = null;"
+            if production_gate not in runner_source:
+                raise AssertionError("runner pre-exec gate injection point changed")
             runner.write_text(
                 runner_source.replace(
                     production_root,
                     f'const injected_runtime_root: ?[]const u8 = "{cls.runtime}";',
+                ).replace(
+                    production_gate,
+                    f'const injected_pre_exec_gate: ?[]const u8 = "{cls.exec_gate}";',
                 ),
                 encoding="utf-8",
             )
@@ -136,11 +153,14 @@ with log.open("a", encoding="utf-8") as stream:
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.work, ignore_errors=True)
+        if cls.exec_root != cls.work and not cls.exec_root.is_relative_to(cls.work):
+            shutil.rmtree(cls.exec_root, ignore_errors=True)
 
     def setUp(self):
         self.log.unlink(missing_ok=True)
         self.sleep_control.unlink(missing_ok=True)
         self.child_sleep_control.unlink(missing_ok=True)
+        shutil.rmtree(self.exec_gate, ignore_errors=True)
 
     def facade_command(self, checkout, cache, output, *extra, goal="all"):
         return [
@@ -371,8 +391,9 @@ with log.open("a", encoding="utf-8") as stream:
         self.assertIsNotNone(system_zig)
 
         hostile_hit = self.work / "hostile-make-ran"
-        hostile_bin = self.work / "hostile;rejected-bin"
+        hostile_bin = self.exec_root / "hostile;rejected-bin"
         hostile_bin.mkdir()
+        hostile_bin.chmod(0o700)
         hostile_make = hostile_bin / "make"
         hostile_make.write_text(
             "#!/bin/sh\n"
@@ -383,8 +404,9 @@ with log.open("a", encoding="utf-8") as stream:
         hostile_make.chmod(0o700)
 
         safe_hit = self.work / "safe-make-ran"
-        safe_bin = self.work / "safe-bin"
+        safe_bin = self.exec_root / "safe-bin"
         safe_bin.mkdir()
+        safe_bin.chmod(0o700)
         safe_make = safe_bin / "make"
         safe_make.write_text(
             "#!/bin/sh\n"
@@ -398,6 +420,14 @@ with log.open("a", encoding="utf-8") as stream:
         non_executable.chmod(0o600)
         symlink_make = safe_bin / "symlink-make"
         symlink_make.symlink_to(system_make)
+        writable_bin = self.exec_root / "writable-parent"
+        writable_bin.mkdir()
+        writable_bin.chmod(0o777)
+        writable_make = writable_bin / "make"
+        shutil.copy2(system_make, writable_make)
+        writable_make.chmod(0o700)
+        intermediate_link = self.exec_root / "intermediate-link"
+        intermediate_link.symlink_to(safe_bin, target_is_directory=True)
 
         def command_for(output, make_command):
             command = self.facade_command(
@@ -454,10 +484,32 @@ with log.open("a", encoding="utf-8") as stream:
             str(safe_bin),
         )
 
+        symlink_output = self.work / "outputs" / "safe-final-symlink"
+        symlink = subprocess.run(
+            command_for(symlink_output, "symlink-make"),
+            cwd=invocation,
+            env=self.facade_env(PATH=str(safe_bin)),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(symlink.returncode, 0, symlink.stdout)
+        self.assertEqual(
+            (symlink_output / "backend-path").read_text(encoding="utf-8"),
+            str(safe_bin),
+        )
+
         for name, make_command, expected_error in (
             ("missing", "missing-make", "BackendExecutableNotFound"),
             ("non-executable", "not-executable", "UnsafeBackendExecutable"),
-            ("symlink", "symlink-make", "UnsafeBackendExecutable"),
+            ("writable-parent", str(writable_make), "UnsafeBackendExecutable"),
+            (
+                "intermediate-symlink",
+                str(intermediate_link / "make"),
+                "UnsafeBackendExecutable",
+            ),
         ):
             with self.subTest(candidate=name):
                 failed = subprocess.run(
@@ -490,6 +542,88 @@ with log.open("a", encoding="utf-8") as stream:
             (absolute_output / "backend-path").read_text(encoding="utf-8"),
             "/usr/bin:/bin",
         )
+
+    def test_backend_descriptor_survives_final_entry_replacement(self):
+        checkout = self.checkouts[0]
+        cache = self.work / "executable-race-cache"
+        output = self.work / "outputs" / "executable-race"
+        result_file = self.work / "executable-race-result"
+        race_bin = self.exec_root / "race-bin"
+        race_bin.mkdir()
+        race_bin.chmod(0o700)
+        backend = race_bin / "make"
+        backend.write_text(
+            "#!/bin/sh\n"
+            f"printf old > {str(result_file)!r}\n",
+            encoding="utf-8",
+        )
+        backend.chmod(0o700)
+
+        self.exec_gate.mkdir()
+        (self.exec_gate / "arm").touch()
+        invocation = self.work / "invoke-executable-race"
+        invocation.mkdir(exist_ok=True)
+        command = self.facade_command(
+            checkout,
+            cache,
+            output,
+            goal="fetch",
+        )
+        command[
+            next(
+                index
+                for index, argument in enumerate(command)
+                if argument.startswith("-Dmake-command=")
+            )
+        ] = f"-Dmake-command={backend}"
+        process = subprocess.Popen(
+            command,
+            cwd=invocation,
+            env=self.facade_env(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if (self.exec_gate / "ready").exists():
+                    break
+                if process.poll() is not None:
+                    stdout, _ = process.communicate()
+                    self.fail(f"runner exited before pre-exec gate: {stdout}")
+                time.sleep(0.01)
+            else:
+                self.fail("runner did not reach the pre-exec gate")
+
+            backend.unlink()
+            backend.write_text(
+                "#!/bin/sh\n"
+                f"printf new > {str(result_file)!r}\n",
+                encoding="utf-8",
+            )
+            backend.chmod(0o700)
+            moved_race_bin = self.exec_root / "race-bin-moved"
+            race_bin.rename(moved_race_bin)
+            attacker_bin = self.exec_root / "race-bin-attacker"
+            attacker_bin.mkdir()
+            attacker_bin.chmod(0o700)
+            attacker_backend = attacker_bin / "make"
+            attacker_backend.write_text(
+                "#!/bin/sh\n"
+                f"printf attacker > {str(result_file)!r}\n",
+                encoding="utf-8",
+            )
+            attacker_backend.chmod(0o700)
+            race_bin.symlink_to(attacker_bin, target_is_directory=True)
+            (self.exec_gate / "release").touch()
+            stdout, _ = process.communicate(timeout=60)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stdout)
+        self.assertEqual(result_file.read_text(encoding="utf-8"), "old")
 
     def test_parent_and_nested_outputs_share_one_persistent_lock(self):
         first_checkout, second_checkout = self.checkouts

@@ -5,9 +5,19 @@ const builtin = @import("builtin");
 const lock_name = "build.lock";
 const runtime_prefix = "unikraft-zig-facade-";
 const injected_runtime_root: ?[]const u8 = null;
+const injected_pre_exec_gate: ?[]const u8 = null;
+const descriptor_exec_supported = switch (builtin.os.tag) {
+    .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
+    else => false,
+};
 
 const RuntimeDirectory = struct {
     dir: std.Io.Dir,
+    path: []const u8,
+};
+
+const BackendExecutable = struct {
+    file: std.Io.File,
     path: []const u8,
 };
 
@@ -82,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
         init.environ_map,
         home,
     );
-    const executable = resolveBackendExecutable(
+    var executable = resolveBackendExecutable(
         allocator,
         init.io,
         args[2],
@@ -95,9 +105,10 @@ pub fn main(init: std.process.Init) !void {
         );
         std.process.exit(2);
     };
+    defer executable.file.close(init.io);
     const backend_argv = try allocator.alloc([]const u8, args.len - 2);
     @memcpy(backend_argv, args[2..]);
-    backend_argv[0] = executable;
+    backend_argv[0] = executable.path;
 
     var runtime = prepareSelectedRuntimeDirectory(
         allocator,
@@ -203,13 +214,18 @@ pub fn main(init: std.process.Init) !void {
         );
         std.process.exit(2);
     };
+    try waitForInjectedPreExecGate(allocator, init.io);
 
     // Exec keeps the locked descriptor in Make and every normally spawned descendant.
     try setCloseOnExec(lock, false);
-    const replace_error = std.process.replace(init.io, .{
-        .argv = backend_argv,
-        .environ_map = &environment,
-    });
+    const replace_error = replaceBackend(
+        allocator,
+        init.io,
+        &executable,
+        backend_argv,
+        &environment,
+        uid,
+    );
     setCloseOnExec(lock, true) catch {};
     return replace_error;
 }
@@ -303,7 +319,7 @@ fn resolveBackendExecutable(
     command: []const u8,
     search_path: []const u8,
     uid: std.posix.uid_t,
-) ![]const u8 {
+) !BackendExecutable {
     if (command.len == 0) return error.InvalidBackendExecutable;
     const cwd = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(cwd);
@@ -336,7 +352,7 @@ fn validateBackendExecutable(
     io: std.Io,
     lexical: []const u8,
     uid: std.posix.uid_t,
-) ![]const u8 {
+) !BackendExecutable {
     const canonical = try facade_paths.canonicalizeNearestExisting(
         allocator,
         io,
@@ -344,23 +360,249 @@ fn validateBackendExecutable(
     );
     errdefer allocator.free(canonical.path);
     if (!canonical.exists) return error.BackendExecutableNotFound;
-    if (!std.mem.eql(u8, lexical, canonical.path))
-        return error.UnsafeBackendExecutable;
+    if (!std.mem.eql(u8, lexical, canonical.path)) {
+        const lexical_parent = std.fs.path.dirname(lexical) orelse
+            return error.UnsafeBackendExecutable;
+        const canonical_parent = try facade_paths.canonicalizeNearestExisting(
+            allocator,
+            io,
+            lexical_parent,
+        );
+        defer allocator.free(canonical_parent.path);
+        if (!canonical_parent.exists or
+            !std.mem.eql(u8, lexical_parent, canonical_parent.path))
+        {
+            return error.UnsafeBackendExecutable;
+        }
+        try validateBackendDirectoryOnly(
+            allocator,
+            io,
+            canonical_parent.path,
+            uid,
+        );
+    }
 
-    const executable = std.Io.Dir.cwd().openFile(io, canonical.path, .{
+    const executable = try openBackendExecutableDescriptorRelative(
+        allocator,
+        io,
+        canonical.path,
+        uid,
+    );
+    return .{ .file = executable, .path = canonical.path };
+}
+
+fn validateBackendDirectoryOnly(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    canonical_path: []const u8,
+    uid: std.posix.uid_t,
+) !void {
+    var ancestors = std.array_list.Managed(Metadata).init(allocator);
+    defer ancestors.deinit();
+    var directory = std.Io.Dir.cwd().openDir(io, "/", .{
+        .follow_symlinks = false,
+    }) catch return error.UnsafeBackendExecutable;
+    defer directory.close(io);
+    try ancestors.append(try metadataForHandle(directory.handle));
+
+    var components = std.mem.tokenizeScalar(u8, canonical_path, '/');
+    while (components.next()) |component| {
+        const child = directory.openDir(io, component, .{
+            .follow_symlinks = false,
+        }) catch return error.UnsafeBackendExecutable;
+        directory.close(io);
+        directory = child;
+        try ancestors.append(try metadataForHandle(directory.handle));
+    }
+
+    const leaf = ancestors.items[ancestors.items.len - 1];
+    const leaf_permissions = leaf.mode & 0o7777;
+    if (leaf.mode & std.posix.S.IFMT != std.posix.S.IFDIR or
+        (leaf.uid != 0 and leaf.uid != @as(u64, uid)) or
+        leaf_permissions & 0o022 != 0)
+    {
+        return error.UnsafeBackendExecutable;
+    }
+    var index = ancestors.items.len - 1;
+    while (index > 0) {
+        const child = ancestors.items[index];
+        index -= 1;
+        try validateBackendAncestor(ancestors.items[index], child, uid);
+    }
+}
+
+fn openBackendExecutableDescriptorRelative(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    canonical_path: []const u8,
+    uid: std.posix.uid_t,
+) !std.Io.File {
+    const parent_path = std.fs.path.dirname(canonical_path) orelse
+        return error.UnsafeBackendExecutable;
+    const basename = std.fs.path.basename(canonical_path);
+    if (basename.len == 0) return error.UnsafeBackendExecutable;
+
+    var ancestors = std.array_list.Managed(Metadata).init(allocator);
+    defer ancestors.deinit();
+    var directory = std.Io.Dir.cwd().openDir(io, "/", .{
+        .follow_symlinks = false,
+    }) catch return error.UnsafeBackendExecutable;
+    defer directory.close(io);
+    try ancestors.append(try metadataForHandle(directory.handle));
+
+    var components = std.mem.tokenizeScalar(u8, parent_path, '/');
+    while (components.next()) |component| {
+        const child = directory.openDir(io, component, .{
+            .follow_symlinks = false,
+        }) catch return error.UnsafeBackendExecutable;
+        directory.close(io);
+        directory = child;
+        try ancestors.append(try metadataForHandle(directory.handle));
+    }
+
+    const executable = directory.openFile(io, basename, .{
         .allow_directory = false,
         .follow_symlinks = false,
+        .resolve_beneath = true,
     }) catch |err| switch (err) {
         error.FileNotFound => return error.BackendExecutableNotFound,
         else => return error.UnsafeBackendExecutable,
     };
-    defer executable.close(io);
-    try validateMetadata(
-        try metadataForHandle(executable.handle),
+    errdefer executable.close(io);
+    const executable_metadata = try metadataForHandle(executable.handle);
+    try validateMetadata(executable_metadata, uid, .backend_executable);
+
+    var child_metadata = executable_metadata;
+    var index = ancestors.items.len;
+    while (index > 0) {
+        index -= 1;
+        const ancestor = ancestors.items[index];
+        try validateBackendAncestor(ancestor, child_metadata, uid);
+        child_metadata = ancestor;
+    }
+    return executable;
+}
+
+fn validateBackendAncestor(
+    ancestor: Metadata,
+    child: Metadata,
+    uid: std.posix.uid_t,
+) !void {
+    const permissions = ancestor.mode & 0o7777;
+    if (ancestor.mode & std.posix.S.IFMT != std.posix.S.IFDIR or
+        (ancestor.uid != 0 and ancestor.uid != @as(u64, uid)))
+    {
+        return error.UnsafeBackendExecutable;
+    }
+    if (permissions & 0o022 == 0) return;
+
+    const sticky_root =
+        ancestor.uid == 0 and
+        permissions & 0o7000 == 0o1000 and
+        permissions & 0o777 == 0o777;
+    const child_permissions = child.mode & 0o7777;
+    const trusted_sticky_entry =
+        (child.uid == 0 or child.uid == @as(u64, uid)) and
+        child_permissions & 0o022 == 0;
+    if (!sticky_root or !trusted_sticky_entry)
+        return error.UnsafeBackendExecutable;
+}
+
+fn replaceBackend(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable: *BackendExecutable,
+    argv: []const []const u8,
+    environment: *const std.process.Environ.Map,
+    uid: std.posix.uid_t,
+) !void {
+    if (comptime descriptor_exec_supported) {
+        const argv_buffer = try allocator.allocSentinel(
+            ?[*:0]const u8,
+            argv.len,
+            null,
+        );
+        for (argv, 0..) |argument, index| {
+            argv_buffer[index] = (try allocator.dupeZ(u8, argument)).ptr;
+        }
+        const environment_block = try environment.createPosixBlock(
+            allocator,
+            .{},
+        );
+
+        try setCloseOnExec(executable.file, false);
+        const result = fexecve(
+            executable.file.handle,
+            argv_buffer.ptr,
+            environment_block.slice.ptr,
+        );
+        setCloseOnExec(executable.file, true) catch {};
+        return switch (std.posix.errno(result)) {
+            .ACCES => error.AccessDenied,
+            .NOENT => error.FileNotFound,
+            .NOEXEC => error.InvalidExe,
+            .TXTBSY => error.FileBusy,
+            else => |err| std.posix.unexpectedErrno(err),
+        };
+    }
+
+    var revalidated = try validateBackendExecutable(
+        allocator,
+        io,
+        executable.path,
         uid,
-        .backend_executable,
     );
-    return canonical.path;
+    defer revalidated.file.close(io);
+    defer allocator.free(revalidated.path);
+    if (!std.mem.eql(u8, executable.path, revalidated.path))
+        return error.UnsafeBackendExecutable;
+    return std.process.replace(io, .{
+        .argv = argv,
+        .environ_map = environment,
+    });
+}
+
+extern "c" fn fexecve(
+    fd: c_int,
+    argv: [*:null]const ?[*:0]const u8,
+    environment: [*:null]const ?[*:0]const u8,
+) c_int;
+
+fn waitForInjectedPreExecGate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) !void {
+    const gate = injected_pre_exec_gate orelse return;
+    const arm_path = try std.fs.path.join(allocator, &.{ gate, "arm" });
+    const arm = std.Io.Dir.openFileAbsolute(io, arm_path, .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    arm.close(io);
+
+    const ready_path = try std.fs.path.join(allocator, &.{ gate, "ready" });
+    const ready = try std.Io.Dir.createFileAbsolute(io, ready_path, .{
+        .truncate = true,
+    });
+    ready.close(io);
+    const release_path = try std.fs.path.join(allocator, &.{ gate, "release" });
+    var attempts: usize = 0;
+    while (attempts < 3000) : (attempts += 1) {
+        const release = std.Io.Dir.openFileAbsolute(io, release_path, .{
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => {
+                try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        release.close(io);
+        return;
+    }
+    return error.TestGateTimeout;
 }
 
 fn validateCanonicalMakeArguments(
@@ -966,54 +1208,28 @@ test "controlled Make environment excludes control and build variables" {
 }
 
 test "backend executable resolution uses only validated paths" {
-    var temporary = std.testing.tmpDir(.{});
-    defer temporary.cleanup();
-    try temporary.dir.createDirPath(std.testing.io, "bin");
-    const executable = try temporary.dir.createFile(std.testing.io, "bin/make", .{
-        .permissions = .fromMode(0o700),
-    });
-    executable.close(std.testing.io);
-    const non_executable = try temporary.dir.createFile(
-        std.testing.io,
-        "bin/not-executable",
-        .{ .permissions = .fromMode(0o600) },
-    );
-    non_executable.close(std.testing.io);
-    try temporary.dir.symLink(std.testing.io, "make", "bin/make-link", .{});
-
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root_length = try temporary.dir.realPath(std.testing.io, &root_buffer);
-    const bin = try std.fs.path.join(
-        std.testing.allocator,
-        &.{ root_buffer[0..root_length], "bin" },
-    );
-    defer std.testing.allocator.free(bin);
-    const expected = try std.fs.path.join(
-        std.testing.allocator,
-        &.{ bin, "make" },
-    );
-    defer std.testing.allocator.free(expected);
     const uid = std.posix.system.geteuid();
-
-    const bare = try resolveBackendExecutable(
+    var bare = try resolveBackendExecutable(
         std.testing.allocator,
         std.testing.io,
         "make",
-        bin,
+        "/usr/bin",
         uid,
     );
-    defer std.testing.allocator.free(bare);
-    try std.testing.expectEqualStrings(expected, bare);
+    defer bare.file.close(std.testing.io);
+    defer std.testing.allocator.free(bare.path);
+    try std.testing.expectEqualStrings("/usr/bin/make", bare.path);
 
-    const absolute = try resolveBackendExecutable(
+    var absolute = try resolveBackendExecutable(
         std.testing.allocator,
         std.testing.io,
-        expected,
+        "/usr/bin/make",
         "/does/not/matter",
         uid,
     );
-    defer std.testing.allocator.free(absolute);
-    try std.testing.expectEqualStrings(expected, absolute);
+    defer absolute.file.close(std.testing.io);
+    defer std.testing.allocator.free(absolute.path);
+    try std.testing.expectEqualStrings("/usr/bin/make", absolute.path);
 
     try std.testing.expectError(
         error.BackendExecutableNotFound,
@@ -1021,7 +1237,7 @@ test "backend executable resolution uses only validated paths" {
             std.testing.allocator,
             std.testing.io,
             "missing",
-            bin,
+            "/usr/bin",
             uid,
         ),
     );
@@ -1030,21 +1246,48 @@ test "backend executable resolution uses only validated paths" {
         resolveBackendExecutable(
             std.testing.allocator,
             std.testing.io,
-            "not-executable",
-            bin,
+            "/etc/passwd",
+            "/does/not/matter",
             uid,
         ),
     );
+}
+
+test "backend ancestor policy rejects writable directories and handles sticky roots" {
+    const uid = std.posix.system.geteuid();
+    const executable = Metadata{
+        .mode = std.posix.S.IFREG | 0o700,
+        .uid = @as(u64, uid),
+        .nlink = 1,
+        .size = 0,
+    };
+    try validateBackendAncestor(.{
+        .mode = std.posix.S.IFDIR | 0o755,
+        .uid = 0,
+        .nlink = 1,
+        .size = 0,
+    }, executable, uid);
+    try validateBackendAncestor(.{
+        .mode = std.posix.S.IFDIR | 0o700,
+        .uid = @as(u64, uid),
+        .nlink = 1,
+        .size = 0,
+    }, executable, uid);
     try std.testing.expectError(
         error.UnsafeBackendExecutable,
-        resolveBackendExecutable(
-            std.testing.allocator,
-            std.testing.io,
-            "make-link",
-            bin,
-            uid,
-        ),
+        validateBackendAncestor(.{
+            .mode = std.posix.S.IFDIR | 0o777,
+            .uid = @as(u64, uid),
+            .nlink = 1,
+            .size = 0,
+        }, executable, uid),
     );
+    try validateBackendAncestor(.{
+        .mode = std.posix.S.IFDIR | 0o1777,
+        .uid = 0,
+        .nlink = 1,
+        .size = 0,
+    }, executable, uid);
 }
 
 test "private runtime metadata rejects unsafe ownership permissions and links" {

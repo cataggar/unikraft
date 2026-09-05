@@ -196,9 +196,18 @@ assignment allowlist. Toolchain and flag overrides must use the dedicated Zig
 options or an allowlisted `-Dmake-arg`. Before process replacement, the runner
 resolves a bare Make command itself using only that validated child `PATH`;
 commands containing `/` are canonicalized directly. The selected backend must
-be an absolute, non-symlink regular executable owned by root or the current
-user, without group/other write access. The absolute result is passed to Zig so
-the runner's original inherited `PATH` is never consulted for execution.
+resolve to an absolute regular executable owned by root or the current user,
+without group/other write access. A final symlink is accepted only when its
+non-symlink parent and fully resolved target chains are both trusted. Canonical
+directory chains are walked with descriptor-relative, no-follow opens;
+ancestors must be root- or current-user-owned and not group/other-writable. A
+root-owned `01777` sticky boundary is accepted only when its protected child
+entry is trusted and not group/other-writable. Linux, macOS, and supported BSD
+hosts retain the opened executable descriptor and use `fexecve`, so replacing
+the final directory entry cannot change the executed backend. Other supported
+hosts revalidate the trusted immutable chain immediately before passing an
+absolute path to Zig. The runner's original inherited `PATH` is never consulted
+for execution.
 
 Invoke only one Make-backed named step per `zig build` command. A portable,
 non-blocking file lock rejects overlapping Make processes rather than allowing
