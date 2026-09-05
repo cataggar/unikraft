@@ -1,0 +1,22 @@
+mainmenu "ARM64/KVM native configuration fixture"
+
+config ARCH_X86_64
+	bool "x86_64"
+config ARCH_ARM_64
+	bool "arm64"
+config ARCH_ARM_32
+	bool "arm"
+config PLAT_KVM
+	bool "KVM"
+config KVM_BOOT_PROTO_QEMU_VIRT
+	bool "QEMU virt"
+config HAVE_BOOTENTRY
+	bool "Boot entry"
+config UK_NAME
+	string "Image name"
+config FIXTURE_STRING
+	string "Fixture string"
+config FIXTURE_INT
+	int "Fixture integer"
+config FIXTURE_HEX
+	hex "Fixture hex"
