@@ -1,0 +1,8 @@
+.{
+    .name = .unikraft,
+    .version = "0.21.0",
+    .fingerprint = 0x77eedfefd66048ac, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{""},
+}

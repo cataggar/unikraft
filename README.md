@@ -129,59 +129,180 @@ There are two ways to get started with Unikraft:
 
 2. Using the GNU Make-based system.  For this, see our [advanced usage guide][unikraft-guides-advanced].
 
-### Experimental Zig C compiler support
+### Zig build facade and experimental Zig C compiler support
 
-Zig 0.16.0 can compile GNU Make-configured QEMU/x86_64 and QEMU/ARM64
-applications by using its Clang-compatible C compiler driver.
+Zig 0.16.0 provides a compatibility facade for the existing GNU Make build.
+GNU Make remains the backend; this facade only maps Zig build steps and options
+to Make targets and assignments. It does not yet model Unikraft's components
+as a native Zig build graph.
 
-For QEMU/x86_64:
-
-```shell
-make \
-  COMPILER='zig cc -target x86_64-freestanding-none' \
-  PARTIAL_LINKER='zig ld.lld' \
-  PARTIAL_LINKER_TYPE=raw \
-  HOSTCC='zig cc' \
-  HOSTCXX='zig c++' \
-  HOSTCFLAGS='-fno-sanitize=null' \
-  AR='zig ar' \
-  NM=llvm-nm \
-  OBJCOPY=llvm-objcopy \
-  OBJDUMP=llvm-objdump \
-  READELF=llvm-readelf \
-  STRIP=llvm-strip \
-  UK_CFLAGS=-std=gnu17 \
-  UK_LDFLAGS=-rtlib=compiler-rt
-```
-
-Omitting `LINKER` makes the final link use Zig's compiler driver, while
-`PARTIAL_LINKER` uses Zig's bundled LLD for relocatable links. The x86_64 build
-does not require GCC, but it does require Python 3 and the LLVM binary tools
-listed above (`python3` and `llvm` on Debian and Ubuntu). The narrow
-`HOSTCFLAGS` exception accommodates Kconfig's kernel-style, null-derived list
-sentinel. Pass the host compiler settings and flag to configuration targets
-such as `defconfig` as well as to the build.
-
-For QEMU/ARM64, `COMPILER_TARGETED=y` tells the build that the compiler command
-already selects its own target, so the AArch64 cross prefix is not prepended to
-it and no architecture default target flag is added:
+From the Unikraft repository, build an application with:
 
 ```shell
-make \
-  COMPILER='zig cc -target aarch64-freestanding-none' \
-  COMPILER_TARGETED=y \
-  LINKER=gcc \
-  UK_CFLAGS=-std=gnu17
+zig build \
+  -Dapp=/absolute/path/to/app \
+  -Dconfig=/absolute/path/to/app/.config
 ```
 
-The ARM64 build additionally requires an AArch64 GNU cross-toolchain
-(`gcc-aarch64-linux-gnu` and `binutils-aarch64-linux-gnu` on Debian and Ubuntu),
-because `LINKER` and the binutils keep using the `aarch64-linux-gnu-` prefix.
+When `-Doutput` is omitted, it safely defaults to `<app>/build`. The facade
+creates one fresh canonical output identity by resolving existing symlinks and
+the nearest existing ancestor of a new output. That same identity is used for
+validation, the runner argument, and Make's `O=` assignment; the runner
+requires those two arguments to match exactly before marker handling and again
+immediately before execution. The facade rejects repository/application
+ancestors, existing source directories, filesystem roots, and unmarked existing
+directories. New output directories receive a small marker so subsequent
+builds can distinguish them from source trees.
 
-This support is experimental, limited to the GNU Make build of QEMU/x86_64 and
-QEMU/ARM64, and does not support LTO. The x86_64 configuration is GCC-free and
-uses Zig plus LLVM binary tools. The ARM64 configuration still requires its
-existing GCC linker driver and GNU cross-binutils.
+The default step delegates to Make's `all` target. Named steps include
+`images`, `libs`, `objs`, `preprocess`, `prepare`, `fetch`, configuration
+targets such as `menuconfig` and `defconfig`. The compatibility names `clean`,
+`clean-libs`, `properclean`, and `distclean` are registered but intentionally
+refuse to run; see the cleanup safety limitation below. For example:
+
+```shell
+zig build menuconfig -Dapp=/absolute/path/to/app
+zig build images -Dapp=/absolute/path/to/app -Dverbose=1
+```
+
+`-Dapp`, `-Doutput`, `-Dconfig`, and `-Dimage-name` map to Make's `A`, `O`,
+`C`, and `N` variables. Repeat `-Dexternal-lib`, `-Dexternal-platform`, or
+`-Dexclude` to construct the `L`, `P`, or `E` path lists. Relative paths are
+resolved from the Unikraft repository root and canonicalized before they are
+forwarded. The runner revalidates `A`, `O`, `C`, `L`, `P`, and `E` immediately
+before executing a non-destructive Make target and refuses changed path
+identities. Because the existing Make backend does not quote these values end
+to end, the facade also applies a conservative ASCII allowlist. Paths accept
+letters, digits, `/`, `-_.+@`; joined `L`, `P`, and `E` lists additionally use
+`:` as their intentional separator. Image names accept letters, digits, and
+`-_.+@`. Tool/flag values additionally accept spaces, `:`, `,`, and `=`.
+Whitespace in paths and Make/shell syntax such as quotes, backslashes, `$()`,
+backticks, `;&|<>`, globs, `#`, `%`, and control characters are rejected.
+Additional Make assignments can be forwarded as individual, safely separated
+arguments with repeated `-Dmake-arg=NAME=VALUE`. This option uses a strict
+allowlist for compiler flags and non-path tools such as `AR`, `NM`, `OBJCOPY`,
+`OBJDUMP`, `READELF`, `STRIP`, `UK_CFLAGS`, and `UK_LDFLAGS`.
+Facade-managed, path, cleanup, configuration, and internal graph variables are
+rejected and must use dedicated facade options where available.
+
+Make runs with a newly constructed environment rather than inheriting the
+caller's environment. Only the Make-safe canonical passwd `HOME`, a validated
+absolute-entry `PATH` (or `/usr/bin:/bin` fallback), and validated
+`LANG`/`LC_ALL` locale values are supplied. GNU Make control channels including
+`MAKEFLAGS`, `GNUMAKEFLAGS`, `MAKEFILES`, `MFLAGS`, `MAKEOVERRIDES`,
+`MAKELEVEL`, jobserver/restart/terminal state, compiler variables, and internal
+build variables therefore cannot rewrite goals or bypass the facade's
+assignment allowlist. Toolchain and flag overrides must use the dedicated Zig
+options or an allowlisted `-Dmake-arg`. Before process replacement, the runner
+resolves a bare Make command itself using only that validated child `PATH`;
+commands containing `/` are canonicalized directly. The selected backend must
+resolve to an absolute regular executable owned by root or the current user,
+without group/other write access. A final symlink is accepted only when its
+non-symlink parent and fully resolved target chains are both trusted. Canonical
+directory chains are walked with descriptor-relative, no-follow opens;
+ancestors must be root- or current-user-owned and not group/other-writable. A
+root-owned `01777` sticky boundary is accepted only when its protected child
+entry is trusted and not group/other-writable. Linux retains the opened
+executable descriptor and uses `fexecve`, so replacing the final directory
+entry cannot change the executed backend. Zig 0.16's macOS and OpenBSD libc
+targets do not export `fexecve`, so descriptor execution is conservatively
+gated to Linux. Other supported hosts retain the original descriptor, re-open
+the fully trusted chain at the last possible point, require matching
+device/inode identity, and then replace the process using the canonical absolute
+path. The runner's original inherited `PATH` is never consulted for execution.
+
+Invoke only one Make-backed named step per `zig build` command. A portable,
+non-blocking file lock rejects overlapping Make processes rather than allowing
+selected steps such as `clean all` to race. For each effective UID, facade
+invocations use one lock in a private `unikraft-zig-facade-<uid>` directory
+beneath a stable, trusted per-user namespace. Linux prefers
+`/run/user/<effective-uid>` and falls back to the canonical home directory from
+the passwd database. macOS uses its OS-provided per-user temporary directory;
+other supported POSIX hosts use the canonical passwd home. `HOME`,
+`XDG_RUNTIME_DIR`, `TMPDIR`, `TEMP`, and `TMP` do not select the lock root.
+Every production root and ancestor is opened without following its final
+component and must be owned by root or the current user without group/other
+write access; the per-user root must be current-user-owned. The private
+directory must have mode `0700`, and the regular, single-link lock mode `0600`;
+symlinks and unsafe ownership or permissions are refused. This preserves
+same-user serialization across parent/nested outputs, caches, applications,
+and checkouts without allowing shared-temporary-directory pre-creation or
+environment changes to lock out a user or split the lock.
+
+The private runtime directory must be outside every output tree; its persistent
+lock file is never unlinked while held. Before invoking Make, the runner makes
+the locked descriptor inheritable and replaces its own process image with the
+backend. Make and its descendants therefore retain the same lock even if the
+original runner PID is killed; the lock is released normally after the complete
+backend tree exits. Hosts without process-image replacement are refused rather
+than running without this lifetime guarantee. Run separate commands when
+multiple phases are needed.
+
+The facade creates `.unikraft-zig-build` relative to a validated canonical
+output-directory handle. New markers use exclusive creation; existing markers
+must be current-user-owned, single-link regular files with safe permissions and
+the exact expected contents. No-follow, descriptor-relative operations prevent
+marker symlinks or replacement races from redirecting writes.
+
+Non-destructive builds may use an external `-Dconfig`. Destructive Make targets
+cannot safely consume mutable pathnames after Zig's validation: `properclean`
+recursively removes `O`, `distclean` also removes `C` and companion metadata,
+and configured `clean`/`clean-libs` rules contain further generated paths.
+Until cleanup is implemented using portable descriptor-relative deletion, the
+facade refuses all four steps instead of exposing a check-then-delete race. Use
+manual cleanup, or invoke GNU Make directly only after independently ensuring
+the application, output, and configuration path components cannot be replaced.
+`zig build test` runs the facade's path, argument, and lock unit checks.
+It also links the production runner for x86_64/aarch64 macOS and x86_64
+OpenBSD, catching target-libc symbol availability rather than stopping after
+code generation.
+`python3 -m unittest -v support.scripts.tests.test_zig_facade` adds
+end-to-end metacharacter, cross-checkout parent/nested output, destructive path
+replacement refusal, and orphaned backend-tree lock-lifetime coverage,
+including hostile inherited Make environments, output-identity replacement,
+runtime/build-marker entries, and differing temporary-directory environments.
+
+The experimental QEMU/x86_64 Zig compiler setup becomes:
+
+```shell
+zig build \
+  -Dapp=/absolute/path/to/app \
+  '-Dcompiler=zig cc -target x86_64-freestanding-none' \
+  '-Dpartial-linker=zig ld.lld' \
+  -Dpartial-linker-type=raw \
+  '-Dhost-cc=zig cc' \
+  '-Dhost-cxx=zig c++' \
+  -Dhost-cflags=-fno-sanitize=null \
+  '-Dmake-arg=AR=zig ar' \
+  -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf \
+  -Dmake-arg=STRIP=llvm-strip \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17 \
+  -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
+```
+
+Omitting `-Dlinker` makes the final link use the compiler driver. The x86_64
+build requires Python 3 and the listed LLVM binary tools, but not GCC. The
+`host-cflags` exception accommodates Kconfig's kernel-style, null-derived list
+sentinel.
+
+For QEMU/ARM64, use a target-selecting compiler and keep the existing GNU
+linker and binutils, for example:
+
+```shell
+zig build \
+  -Dapp=/absolute/path/to/app \
+  '-Dcompiler=zig cc -target aarch64-freestanding-none' \
+  -Dcompiler-targeted=true \
+  -Dlinker=gcc \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17
+```
+
+ARM64 additionally requires an AArch64 GNU cross-toolchain. This compiler
+support remains experimental, is limited to GNU Make-configured QEMU/x86_64
+and QEMU/ARM64 applications, and does not support LTO.
 
 ### Toolchain Installation
 
