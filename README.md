@@ -202,12 +202,14 @@ non-symlink parent and fully resolved target chains are both trusted. Canonical
 directory chains are walked with descriptor-relative, no-follow opens;
 ancestors must be root- or current-user-owned and not group/other-writable. A
 root-owned `01777` sticky boundary is accepted only when its protected child
-entry is trusted and not group/other-writable. Linux, macOS, and supported BSD
-hosts retain the opened executable descriptor and use `fexecve`, so replacing
-the final directory entry cannot change the executed backend. Other supported
-hosts revalidate the trusted immutable chain immediately before passing an
-absolute path to Zig. The runner's original inherited `PATH` is never consulted
-for execution.
+entry is trusted and not group/other-writable. Linux retains the opened
+executable descriptor and uses `fexecve`, so replacing the final directory
+entry cannot change the executed backend. Zig 0.16's macOS and OpenBSD libc
+targets do not export `fexecve`, so descriptor execution is conservatively
+gated to Linux. Other supported hosts retain the original descriptor, re-open
+the fully trusted chain at the last possible point, require matching
+device/inode identity, and then replace the process using the canonical absolute
+path. The runner's original inherited `PATH` is never consulted for execution.
 
 Invoke only one Make-backed named step per `zig build` command. A portable,
 non-blocking file lock rejects overlapping Make processes rather than allowing
@@ -251,6 +253,9 @@ facade refuses all four steps instead of exposing a check-then-delete race. Use
 manual cleanup, or invoke GNU Make directly only after independently ensuring
 the application, output, and configuration path components cannot be replaced.
 `zig build test` runs the facade's path, argument, and lock unit checks.
+It also links the production runner for x86_64/aarch64 macOS and x86_64
+OpenBSD, catching target-libc symbol availability rather than stopping after
+code generation.
 `python3 -m unittest -v support.scripts.tests.test_zig_facade` adds
 end-to-end metacharacter, cross-checkout parent/nested output, destructive path
 replacement refusal, and orphaned backend-tree lock-lifetime coverage,

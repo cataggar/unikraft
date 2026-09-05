@@ -6,10 +6,11 @@ const lock_name = "build.lock";
 const runtime_prefix = "unikraft-zig-facade-";
 const injected_runtime_root: ?[]const u8 = null;
 const injected_pre_exec_gate: ?[]const u8 = null;
-const descriptor_exec_supported = switch (builtin.os.tag) {
-    .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
-    else => false,
-};
+const descriptor_exec_supported = descriptorExecSupported(builtin.os.tag);
+
+fn descriptorExecSupported(os: std.Target.Os.Tag) bool {
+    return os == .linux;
+}
 
 const RuntimeDirectory = struct {
     dir: std.Io.Dir,
@@ -37,6 +38,8 @@ const Metadata = struct {
     uid: u64,
     nlink: u64,
     size: u64,
+    device: u64 = 0,
+    inode: u64 = 0,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -556,6 +559,13 @@ fn replaceBackend(
     defer allocator.free(revalidated.path);
     if (!std.mem.eql(u8, executable.path, revalidated.path))
         return error.UnsafeBackendExecutable;
+    const original_identity = try metadataForHandle(executable.file.handle);
+    const current_identity = try metadataForHandle(revalidated.file.handle);
+    if (original_identity.device != current_identity.device or
+        original_identity.inode != current_identity.inode)
+    {
+        return error.UnsafeBackendExecutable;
+    }
     return std.process.replace(io, .{
         .argv = argv,
         .environ_map = environment,
@@ -886,7 +896,8 @@ fn metadataForHandle(handle: std.posix.fd_t) !Metadata {
                     if (!metadata.mask.TYPE or
                         !metadata.mask.MODE or
                         !metadata.mask.UID or
-                        !metadata.mask.NLINK)
+                        !metadata.mask.NLINK or
+                        !metadata.mask.INO)
                     {
                         return error.IncompleteMetadata;
                     }
@@ -895,6 +906,9 @@ fn metadataForHandle(handle: std.posix.fd_t) !Metadata {
                         .uid = metadata.uid,
                         .nlink = metadata.nlink,
                         .size = metadata.size,
+                        .device = (@as(u64, metadata.dev_major) << 32) |
+                            metadata.dev_minor,
+                        .inode = metadata.ino,
                     };
                 },
                 .INTR => continue,
@@ -910,6 +924,8 @@ fn metadataForHandle(handle: std.posix.fd_t) !Metadata {
                     .uid = @intCast(metadata.uid),
                     .nlink = @intCast(metadata.nlink),
                     .size = @intCast(metadata.size),
+                    .device = @intCast(metadata.dev),
+                    .inode = @intCast(metadata.ino),
                 },
                 .INTR => continue,
                 else => |err| return std.posix.unexpectedErrno(err),
@@ -1288,6 +1304,13 @@ test "backend ancestor policy rejects writable directories and handles sticky ro
         .nlink = 1,
         .size = 0,
     }, executable, uid);
+}
+
+test "descriptor execution is limited to Zig libc targets that link fexecve" {
+    try std.testing.expect(descriptorExecSupported(.linux));
+    try std.testing.expect(!descriptorExecSupported(.macos));
+    try std.testing.expect(!descriptorExecSupported(.openbsd));
+    try std.testing.expect(!descriptorExecSupported(.windows));
 }
 
 test "private runtime metadata rejects unsafe ownership permissions and links" {

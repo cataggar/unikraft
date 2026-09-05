@@ -266,6 +266,35 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Test facade path and Make argument construction");
     test_step.dependOn(&run_facade_tests.step);
     test_step.dependOn(&run_runner_tests.step);
+    const runner_link_targets = [_]struct {
+        name: []const u8,
+        query: std.Target.Query,
+    }{
+        .{
+            .name = "x86_64-macos",
+            .query = .{ .cpu_arch = .x86_64, .os_tag = .macos },
+        },
+        .{
+            .name = "aarch64-macos",
+            .query = .{ .cpu_arch = .aarch64, .os_tag = .macos },
+        },
+        .{
+            .name = "x86_64-openbsd",
+            .query = .{ .cpu_arch = .x86_64, .os_tag = .openbsd },
+        },
+    };
+    for (runner_link_targets) |link_target| {
+        const runner_link_test = b.addExecutable(.{
+            .name = b.fmt("unikraft-zig-make-{s}", .{link_target.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("support/build/zig-facade-runner.zig"),
+                .target = b.resolveTargetQuery(link_target.query),
+                .optimize = .ReleaseSafe,
+                .link_libc = true,
+            }),
+        });
+        test_step.dependOn(&runner_link_test.step);
+    }
 }
 
 fn addFailedTargets(b: *std.Build, message: []const u8) void {
