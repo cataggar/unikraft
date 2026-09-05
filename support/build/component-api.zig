@@ -27,6 +27,8 @@ pub const Condition = union(enum) {
     config_enabled: []const u8,
     config_disabled: []const u8,
     config_equals: ConfigEquals,
+    all: []const Condition,
+    any: []const Condition,
 
     pub const ConfigEquals = struct {
         name: []const u8,
@@ -42,9 +44,25 @@ pub const Condition = union(enum) {
                 std.mem.eql(u8, actual, expected.value)
             else
                 false,
+            .all => |conditions| conditionsMatchAll(conditions, config),
+            .any => |conditions| conditionsMatchAny(conditions, config),
         };
     }
 };
+
+fn conditionsMatchAll(conditions: []const Condition, config: ConfigQuery) bool {
+    for (conditions) |condition| {
+        if (!condition.matches(config)) return false;
+    }
+    return true;
+}
+
+fn conditionsMatchAny(conditions: []const Condition, config: ConfigQuery) bool {
+    for (conditions) |condition| {
+        if (condition.matches(config)) return true;
+    }
+    return false;
+}
 
 pub const Architecture = enum {
     x86_64,
@@ -389,17 +407,63 @@ pub const Source = struct {
     preprocess: []const PreprocessStep = &.{},
     variants: []const SourceVariant = &.{},
 
-    pub fn effectiveInput(self: Source, variant: SourceVariant) []const u8 {
-        if (lastPreprocessOutput(variant.preprocess)) |output| return output;
-        if (lastPreprocessOutput(self.preprocess)) |output| return output;
-        return self.path;
+    pub fn isActive(self: Source, config: ConfigQuery) bool {
+        return self.condition.matches(config);
+    }
+
+    pub fn isVariantActive(
+        self: Source,
+        config: ConfigQuery,
+        variant: SourceVariant,
+    ) bool {
+        return self.isActive(config) and variant.condition.matches(config);
+    }
+
+    pub fn hasActiveVariant(self: Source, config: ConfigQuery) bool {
+        if (!self.isActive(config)) return false;
+        if (self.variants.len == 0) return true;
+        for (self.variants) |variant| {
+            if (self.isVariantActive(config, variant)) return true;
+        }
+        return false;
+    }
+
+    pub fn isSourcePreprocessStepActive(
+        self: Source,
+        config: ConfigQuery,
+        step: PreprocessStep,
+    ) bool {
+        return self.hasActiveVariant(config) and step.condition.matches(config);
+    }
+
+    pub fn isVariantPreprocessStepActive(
+        self: Source,
+        config: ConfigQuery,
+        variant: SourceVariant,
+        step: PreprocessStep,
+    ) bool {
+        return self.isVariantActive(config, variant) and step.condition.matches(config);
+    }
+
+    pub fn effectiveInput(
+        self: Source,
+        config: ConfigQuery,
+        variant: SourceVariant,
+    ) []const u8 {
+        if (!self.isVariantActive(config, variant)) return self.path;
+
+        var input = self.path;
+        for (self.preprocess) |step| {
+            if (self.isSourcePreprocessStepActive(config, step)) input = step.output;
+        }
+        for (variant.preprocess) |step| {
+            if (self.isVariantPreprocessStepActive(config, variant, step)) {
+                input = step.output;
+            }
+        }
+        return input;
     }
 };
-
-fn lastPreprocessOutput(steps: []const PreprocessStep) ?[]const u8 {
-    if (steps.len == 0) return null;
-    return steps[steps.len - 1].output;
-}
 
 pub const LibrarySpec = struct {
     name: []const u8,
@@ -1041,7 +1105,7 @@ pub const BuildContext = struct {
         }
         try self.validatePreprocess(library.name, source.name, "source", source.preprocess);
         const source_active = library.enable.matches(self.config) and
-            source.condition.matches(self.config);
+            source.hasActiveVariant(self.config);
         for (source.variants, 0..) |variant, index| {
             for (source.variants[0..index]) |previous| {
                 if (previous.name.eql(variant.name)) {
@@ -1053,12 +1117,14 @@ pub const BuildContext = struct {
                 }
             }
             try self.validatePreprocess(library.name, source.name, "variant", variant.preprocess);
-            if (source_active and variant.condition.matches(self.config)) {
+            if (library.enable.matches(self.config) and
+                source.isVariantActive(self.config, variant))
+            {
                 try self.validateDependencies(library.name, source.name, variant.dependencies);
             }
             for (variant.preprocess) |step| {
-                if (source_active and variant.condition.matches(self.config) and
-                    step.condition.matches(self.config))
+                if (library.enable.matches(self.config) and
+                    source.isVariantPreprocessStepActive(self.config, variant, step))
                 {
                     try self.validateDependencies(library.name, source.name, step.dependencies);
                 }
@@ -1068,7 +1134,7 @@ pub const BuildContext = struct {
             try self.validateDependencies(library.name, source.name, source.dependencies);
         }
         for (source.preprocess) |step| {
-            if (source_active and step.condition.matches(self.config)) {
+            if (source_active and source.isSourcePreprocessStepActive(self.config, step)) {
                 try self.validateDependencies(library.name, source.name, step.dependencies);
             }
         }
@@ -1454,16 +1520,16 @@ pub const BuildContext = struct {
                 }
             }
             for (library.sources) |source| {
-                if (!source.condition.matches(self.config)) continue;
+                if (!source.hasActiveVariant(self.config)) continue;
                 for (source.preprocess) |step| {
-                    if (step.condition.matches(self.config)) {
+                    if (source.isSourcePreprocessStepActive(self.config, step)) {
                         try self.recordOutput(&outputs, step.output);
                     }
                 }
                 for (source.variants) |variant| {
-                    if (!variant.condition.matches(self.config)) continue;
+                    if (!source.isVariantActive(self.config, variant)) continue;
                     for (variant.preprocess) |step| {
-                        if (step.condition.matches(self.config)) {
+                        if (source.isVariantPreprocessStepActive(self.config, variant, step)) {
                             try self.recordOutput(&outputs, step.output);
                         }
                     }
@@ -1525,15 +1591,15 @@ pub const BuildContext = struct {
         for (self.libraries.items) |library| {
             if (!library.enable.matches(self.config)) continue;
             for (library.sources) |source| {
-                if (!source.condition.matches(self.config)) continue;
+                if (!source.hasActiveVariant(self.config)) continue;
                 for (source.preprocess) |step| {
-                    if (step.condition.matches(self.config) and
+                    if (source.isSourcePreprocessStepActive(self.config, step) and
                         std.mem.eql(u8, step.output, path)) return true;
                 }
                 for (source.variants) |variant| {
-                    if (!variant.condition.matches(self.config)) continue;
+                    if (!source.isVariantActive(self.config, variant)) continue;
                     for (variant.preprocess) |step| {
-                        if (step.condition.matches(self.config) and
+                        if (source.isVariantPreprocessStepActive(self.config, variant, step) and
                             std.mem.eql(u8, step.output, path)) return true;
                     }
                     if (variant.output) |output| {
@@ -1559,15 +1625,15 @@ pub const BuildContext = struct {
                 std.mem.eql(u8, artifact.path, path)) return true;
         }
         for (library.sources) |source| {
-            if (!source.condition.matches(self.config)) continue;
+            if (!source.hasActiveVariant(self.config)) continue;
             for (source.preprocess) |step| {
-                if (step.condition.matches(self.config) and
+                if (source.isSourcePreprocessStepActive(self.config, step) and
                     std.mem.eql(u8, step.output, path)) return true;
             }
             for (source.variants) |variant| {
-                if (!variant.condition.matches(self.config)) continue;
+                if (!source.isVariantActive(self.config, variant)) continue;
                 for (variant.preprocess) |step| {
-                    if (step.condition.matches(self.config) and
+                    if (source.isVariantPreprocessStepActive(self.config, variant, step) and
                         std.mem.eql(u8, step.output, path)) return true;
                 }
                 if (variant.output) |output| {
@@ -1767,7 +1833,10 @@ fn copyIncludes(allocator: std.mem.Allocator, includes: []const Include) ![]cons
     return result;
 }
 
-fn copyCondition(allocator: std.mem.Allocator, condition: Condition) !Condition {
+fn copyCondition(
+    allocator: std.mem.Allocator,
+    condition: Condition,
+) error{OutOfMemory}!Condition {
     return switch (condition) {
         .always => .always,
         .config_enabled => |name| .{ .config_enabled = try allocator.dupe(u8, name) },
@@ -1776,7 +1845,20 @@ fn copyCondition(allocator: std.mem.Allocator, condition: Condition) !Condition 
             .name = try allocator.dupe(u8, expected.name),
             .value = try allocator.dupe(u8, expected.value),
         } },
+        .all => |conditions| .{ .all = try copyConditions(allocator, conditions) },
+        .any => |conditions| .{ .any = try copyConditions(allocator, conditions) },
     };
+}
+
+fn copyConditions(
+    allocator: std.mem.Allocator,
+    conditions: []const Condition,
+) error{OutOfMemory}![]const Condition {
+    const result = try allocator.alloc(Condition, conditions.len);
+    for (conditions, 0..) |condition, index| {
+        result[index] = try copyCondition(allocator, condition);
+    }
+    return result;
 }
 
 fn copyOrigin(allocator: std.mem.Allocator, origin: Origin) !Origin {
@@ -2187,8 +2269,19 @@ fn testConfigEnabledXen(_: ?*const anyopaque, name: []const u8) bool {
         std.mem.eql(u8, name, "CONFIG_OPTIMIZE_COMPRESS");
 }
 
+fn testConfigEnabledKvmArm64(_: ?*const anyopaque, name: []const u8) bool {
+    return std.mem.eql(u8, name, "CONFIG_PLAT_KVM") or
+        std.mem.eql(u8, name, "CONFIG_KVM_BOOT_PROTO_LXBOOT") or
+        std.mem.eql(u8, name, "CONFIG_OPTIMIZE_COMPRESS");
+}
+
 fn testConfigValue(_: ?*const anyopaque, name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "CONFIG_UK_ARCH")) return "x86_64";
+    return null;
+}
+
+fn testConfigValueArm64(_: ?*const anyopaque, name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "CONFIG_UK_ARCH")) return "arm64";
     return null;
 }
 
@@ -2203,6 +2296,20 @@ fn testXenConfig() ConfigQuery {
     return .{
         .is_enabled_fn = testConfigEnabledXen,
         .value_fn = testConfigValue,
+    };
+}
+
+fn testKvmArm64Config() ConfigQuery {
+    return .{
+        .is_enabled_fn = testConfigEnabledKvmArm64,
+        .value_fn = testConfigValueArm64,
+    };
+}
+
+fn testXenArm64Config() ConfigQuery {
+    return .{
+        .is_enabled_fn = testConfigEnabledXen,
+        .value_fn = testConfigValueArm64,
     };
 }
 
@@ -2240,10 +2347,17 @@ fn testToolchain() Toolchain {
     };
 }
 
-fn initTestContext(
+fn testArm64Toolchain() Toolchain {
+    var toolchain = testToolchain();
+    toolchain.target_triple = "aarch64-unknown-none";
+    return toolchain;
+}
+
+fn initTestContextForTarget(
     allocator: std.mem.Allocator,
     config: ConfigQuery,
     toolchain: Toolchain,
+    target: Target,
 ) !BuildContext {
     return BuildContext.init(allocator, .{
         .roots = .{
@@ -2252,17 +2366,39 @@ fn initTestContext(
             .output = "/src/app/build",
             .config = "/src/app/build/.config",
         },
-        .target = .{
-            .architecture = .x86_64,
-            .family = .x86,
-            .abi = "none",
-            .triple = "x86_64-unknown-none",
-        },
+        .target = target,
         .toolchain = toolchain,
         .global_flags = .{ .common = &.{"-ffreestanding"} },
         .global_includes = &.{.{ .path = "/src/unikraft/include" }},
         .config = config,
     });
+}
+
+fn initTestContext(
+    allocator: std.mem.Allocator,
+    config: ConfigQuery,
+    toolchain: Toolchain,
+) !BuildContext {
+    return initTestContextForTarget(allocator, config, toolchain, .{
+        .architecture = .x86_64,
+        .family = .x86,
+        .abi = "none",
+        .triple = "x86_64-unknown-none",
+    });
+}
+
+fn testArm64ContextWithConfig(config: ConfigQuery) !BuildContext {
+    return initTestContextForTarget(
+        std.testing.allocator,
+        config,
+        testArm64Toolchain(),
+        .{
+            .architecture = .arm64,
+            .family = .arm,
+            .abi = "none",
+            .triple = "aarch64-unknown-none",
+        },
+    );
 }
 
 fn testContextWithConfig(config: ConfigQuery) !BuildContext {
@@ -2377,12 +2513,185 @@ test "syscall AWK generated output wires dependencies" {
     const source = graph.libraries[0].sources[0];
     try std.testing.expectEqualStrings(
         "/src/app/build/libsyscall_shim/include/uk/bits/syscall_provided.h",
-        source.effectiveInput(source.variants[0]),
+        source.effectiveInput(context.config, source.variants[0]),
     );
     try std.testing.expect(source.variants[0].dependencies[0] == .generated_output);
 }
 
-fn registerRepresentativeModel(context: *BuildContext) !void {
+test "effective source input selects the last active preprocessing step" {
+    const config = testConfig();
+    const default_variant = SourceVariant{};
+
+    const disabled_final = Source{
+        .name = "disabled-final",
+        .path = "/src/input.c",
+        .language = .generated,
+        .preprocess = &.{
+            .{ .name = "active", .kind = .awk, .output = "/build/active.c" },
+            .{
+                .name = "disabled",
+                .kind = .m4,
+                .output = "/build/disabled.c",
+                .condition = .{ .config_enabled = "CONFIG_NEVER" },
+            },
+        },
+    };
+    try std.testing.expectEqualStrings(
+        "/build/active.c",
+        disabled_final.effectiveInput(config, default_variant),
+    );
+
+    const disabled_middle = Source{
+        .name = "disabled-middle",
+        .path = "/src/input.c",
+        .language = .generated,
+        .preprocess = &.{
+            .{ .name = "first", .kind = .awk, .output = "/build/first.c" },
+            .{
+                .name = "middle",
+                .kind = .m4,
+                .output = "/build/middle.c",
+                .condition = .{ .config_enabled = "CONFIG_NEVER" },
+            },
+            .{ .name = "last", .kind = .generated, .output = "/build/last.c" },
+        },
+    };
+    try std.testing.expectEqualStrings(
+        "/build/last.c",
+        disabled_middle.effectiveInput(config, default_variant),
+    );
+
+    const variant_source = Source{
+        .name = "variant",
+        .path = "/src/variant.c",
+        .language = .generated,
+        .preprocess = &.{.{
+            .name = "source",
+            .kind = .awk,
+            .output = "/build/source.c",
+        }},
+    };
+    const active_variant = SourceVariant{
+        .condition = .{ .config_enabled = "CONFIG_PLAT_KVM" },
+        .preprocess = &.{.{
+            .name = "variant",
+            .kind = .m4,
+            .output = "/build/variant.c",
+        }},
+    };
+    try std.testing.expectEqualStrings(
+        "/build/variant.c",
+        variant_source.effectiveInput(config, active_variant),
+    );
+    const inactive_variant = SourceVariant{
+        .condition = .{ .config_enabled = "CONFIG_NEVER" },
+        .preprocess = active_variant.preprocess,
+    };
+    try std.testing.expectEqualStrings(
+        "/src/variant.c",
+        variant_source.effectiveInput(config, inactive_variant),
+    );
+    const inactive_source = Source{
+        .name = "inactive-source",
+        .path = "/src/inactive.c",
+        .language = .generated,
+        .condition = .{ .config_enabled = "CONFIG_NEVER" },
+        .preprocess = variant_source.preprocess,
+    };
+    try std.testing.expectEqualStrings(
+        "/src/inactive.c",
+        inactive_source.effectiveInput(config, default_variant),
+    );
+
+    const no_active_step = Source{
+        .name = "none",
+        .path = "/src/original.c",
+        .language = .generated,
+        .preprocess = &.{.{
+            .name = "disabled",
+            .kind = .awk,
+            .output = "/build/disabled.c",
+            .condition = .{ .config_enabled = "CONFIG_NEVER" },
+        }},
+    };
+    try std.testing.expectEqualStrings(
+        "/src/original.c",
+        no_active_step.effectiveInput(config, default_variant),
+    );
+}
+
+test "conditional preprocessing references only active generated outputs" {
+    var valid = try testContext();
+    defer valid.deinit();
+    try valid.registerLibrary(.{
+        .name = "libgenerated",
+        .origin = .{ .internal = .library },
+        .layout = .{ .ordinary = .{ .build_subdir = "libgenerated" } },
+        .sources = &.{.{
+            .name = "generated",
+            .path = "/src/input.awk",
+            .language = .generated,
+            .preprocess = &.{
+                .{ .name = "active", .kind = .awk, .output = "/build/active.c" },
+                .{
+                    .name = "disabled-final",
+                    .kind = .m4,
+                    .output = "/build/disabled.c",
+                    .condition = .{ .config_enabled = "CONFIG_NEVER" },
+                },
+            },
+            .variants = &.{.{
+                .dependencies = &.{.{ .generated_output = "/build/active.c" }},
+                .output = .{ .path = "/build/generated.o", .kind = .object },
+            }},
+        }},
+    });
+    try valid.registerPlatform(.{
+        .name = "kvm",
+        .origin = .{ .internal = .platform },
+        .enable = .always,
+    });
+    _ = try valid.finalize();
+
+    var invalid = try testContext();
+    defer invalid.deinit();
+    try invalid.registerLibrary(.{
+        .name = "libgenerated",
+        .origin = .{ .internal = .library },
+        .layout = .{ .ordinary = .{ .build_subdir = "libgenerated" } },
+        .sources = &.{.{
+            .name = "generated",
+            .path = "/src/input.awk",
+            .language = .generated,
+            .preprocess = &.{.{
+                .name = "disabled",
+                .kind = .awk,
+                .output = "/build/disabled.c",
+                .condition = .{ .config_enabled = "CONFIG_NEVER" },
+            }},
+            .variants = &.{.{
+                .dependencies = &.{.{ .generated_output = "/build/disabled.c" }},
+                .output = .{ .path = "/build/generated.o", .kind = .object },
+            }},
+        }},
+    });
+    try invalid.registerPlatform(.{
+        .name = "kvm",
+        .origin = .{ .internal = .platform },
+        .enable = .always,
+    });
+    try std.testing.expectError(error.InvalidReference, invalid.finalize());
+}
+
+fn registerRepresentativeModel(
+    context: *BuildContext,
+    architecture: Architecture,
+) !void {
+    const xen_arm = architecture == .arm64 or architecture == .arm32;
+    const xen_image = if (xen_arm) "/build/app_xen.elf" else "/build/app_xen";
+    const xen_debug = if (xen_arm) "/build/app_xen.elf.dbg" else "/build/app_xen.dbg";
+    const xen_bootinfo = if (xen_arm) "/build/app_xen.elf.bootinfo" else "/build/app_xen.bootinfo";
+    const xen_symbols = if (xen_arm) "/build/app_xen.elf.sym" else "/build/app_xen.sym";
     try context.registerLibrary(.{
         .name = "libcore",
         .origin = .{ .internal = .core },
@@ -2568,12 +2877,12 @@ fn registerRepresentativeModel(context: *BuildContext) !void {
                     .output = "image",
                 } },
                 .effects = &.{
-                    .{ .mutate_input = .{ .name = "image", .role = .image } },
                     .{ .create = .{
                         .name = "bootinfo",
                         .path = "/build/app_kvm.bootinfo",
                         .role = .side,
                     } },
+                    .{ .mutate_input = .{ .name = "image", .role = .image } },
                 },
             },
             .{
@@ -2585,11 +2894,7 @@ fn registerRepresentativeModel(context: *BuildContext) !void {
                     .transformation = "bootinfo",
                     .output = "image",
                 } },
-                .effects = &.{.{ .create = .{
-                    .name = "multiboot",
-                    .path = "/build/app_kvm.multiboot",
-                    .role = .image,
-                } }},
+                .effects = &.{.{ .mutate_input = .{ .name = "image", .role = .image } }},
             },
             .{
                 .name = "efi",
@@ -2600,29 +2905,43 @@ fn registerRepresentativeModel(context: *BuildContext) !void {
                     .transformation = "bootinfo",
                     .output = "image",
                 } },
-                .effects = &.{.{ .create = .{
-                    .name = "efi",
-                    .path = "/build/app_kvm.efi",
-                    .role = .image,
+                .additional_inputs = &.{.{ .stage_output = .{
+                    .platform = "kvm",
+                    .stage = "final-link",
                 } }},
+                .effects = &.{.{ .mutate_input = .{ .name = "image", .role = .image } }},
             },
             .{
-                .name = "linux",
-                .kind = .linux_header,
-                .condition = .{ .config_enabled = "CONFIG_KVM_BOOT_PROTO_LXBOOT" },
+                .name = "linux-binary",
+                .kind = .objcopy_binary,
+                .condition = .{ .all = &.{
+                    .{ .config_enabled = "CONFIG_KVM_BOOT_PROTO_LXBOOT" },
+                    .{ .config_equals = .{ .name = "CONFIG_UK_ARCH", .value = "arm64" } },
+                } },
                 .input = .{ .post_process_output = .{
                     .platform = "kvm",
                     .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .mutate_input = .{ .name = "image", .role = .image } }},
+            },
+            .{
+                .name = "linux-header",
+                .kind = .linux_header,
+                .condition = .{ .all = &.{
+                    .{ .config_enabled = "CONFIG_KVM_BOOT_PROTO_LXBOOT" },
+                    .{ .config_equals = .{ .name = "CONFIG_UK_ARCH", .value = "arm64" } },
+                } },
+                .input = .{ .post_process_output = .{
+                    .platform = "kvm",
+                    .transformation = "linux-binary",
                     .output = "image",
                 } },
                 .additional_inputs = &.{.{ .stage_output = .{
                     .platform = "kvm",
                     .stage = "final-link",
                 } }},
-                .effects = &.{
-                    .{ .create = .{ .name = "bin", .path = "/build/app_kvm.bin", .role = .image } },
-                    .{ .create = .{ .name = "img", .path = "/build/app_kvm.img", .role = .image } },
-                },
+                .effects = &.{.{ .mutate_input = .{ .name = "image", .role = .image } }},
             },
             .{
                 .name = "symbols",
@@ -2723,7 +3042,7 @@ fn registerRepresentativeModel(context: *BuildContext) !void {
             .{
                 .name = "final-link",
                 .transformation = .final_link,
-                .output = "/build/app_xen.dbg",
+                .output = xen_debug,
                 .output_role = .debug,
                 .sequence = &.{
                     .{ .literal_flag = "-Wl,--build-id=none" },
@@ -2749,7 +3068,7 @@ fn registerRepresentativeModel(context: *BuildContext) !void {
                 .input = .{ .stage_output = .{ .platform = "xen", .stage = "final-link" } },
                 .effects = &.{.{ .create = .{
                     .name = "image",
-                    .path = "/build/app_xen",
+                    .path = xen_image,
                     .role = .image,
                 } }},
             },
@@ -2762,16 +3081,31 @@ fn registerRepresentativeModel(context: *BuildContext) !void {
                     .output = "image",
                 } },
                 .effects = &.{
-                    .{ .mutate_input = .{ .name = "image", .role = .image } },
                     .{ .create = .{
                         .name = "bootinfo",
-                        .path = "/build/app_xen.bootinfo",
+                        .path = xen_bootinfo,
                         .role = .side,
                     } },
+                    .{ .mutate_input = .{ .name = "image", .role = .image } },
                 },
             },
             .{
-                .name = "raw-image",
+                .name = "raw-image-arm",
+                .kind = .objcopy_binary,
+                .condition = .{ .config_equals = .{ .name = "CONFIG_UK_ARCH", .value = "arm" } },
+                .input = .{ .post_process_output = .{
+                    .platform = "xen",
+                    .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "raw",
+                    .path = "/build/app_xen",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "raw-image-arm64",
                 .kind = .objcopy_binary,
                 .condition = .{ .config_equals = .{ .name = "CONFIG_UK_ARCH", .value = "arm64" } },
                 .input = .{ .post_process_output = .{
@@ -2781,7 +3115,7 @@ fn registerRepresentativeModel(context: *BuildContext) !void {
                 } },
                 .effects = &.{.{ .create = .{
                     .name = "raw",
-                    .path = "/build/app_xen.bin",
+                    .path = "/build/app_xen",
                     .role = .image,
                 } }},
             },
@@ -2792,18 +3126,57 @@ fn registerRepresentativeModel(context: *BuildContext) !void {
                 .input = .{ .stage_output = .{ .platform = "xen", .stage = "final-link" } },
                 .effects = &.{.{ .create = .{
                     .name = "sym",
-                    .path = "/build/app_xen.sym",
+                    .path = xen_symbols,
                     .role = .image,
                 } }},
             },
             .{
-                .name = "gzip",
+                .name = "gzip-x86",
                 .kind = .gzip,
-                .condition = .{ .config_enabled = "CONFIG_OPTIMIZE_COMPRESS" },
+                .condition = .{ .all = &.{
+                    .{ .config_enabled = "CONFIG_OPTIMIZE_COMPRESS" },
+                    .{ .config_equals = .{ .name = "CONFIG_UK_ARCH", .value = "x86_64" } },
+                } },
                 .input = .{ .post_process_output = .{
                     .platform = "xen",
                     .transformation = "bootinfo",
                     .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "gz",
+                    .path = "/build/app_xen.gz",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "gzip-arm",
+                .kind = .gzip,
+                .condition = .{ .all = &.{
+                    .{ .config_enabled = "CONFIG_OPTIMIZE_COMPRESS" },
+                    .{ .config_equals = .{ .name = "CONFIG_UK_ARCH", .value = "arm" } },
+                } },
+                .input = .{ .post_process_output = .{
+                    .platform = "xen",
+                    .transformation = "raw-image-arm",
+                    .output = "raw",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "gz",
+                    .path = "/build/app_xen.gz",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "gzip-arm64",
+                .kind = .gzip,
+                .condition = .{ .all = &.{
+                    .{ .config_enabled = "CONFIG_OPTIMIZE_COMPRESS" },
+                    .{ .config_equals = .{ .name = "CONFIG_UK_ARCH", .value = "arm64" } },
+                } },
+                .input = .{ .post_process_output = .{
+                    .platform = "xen",
+                    .transformation = "raw-image-arm64",
+                    .output = "raw",
                 } },
                 .effects = &.{.{ .create = .{
                     .name = "gz",
@@ -2832,7 +3205,7 @@ fn registerRepresentativeModel(context: *BuildContext) !void {
 test "library and KVM pipelines preserve every ordered argument" {
     var context = try testContext();
     defer context.deinit();
-    try registerRepresentativeModel(&context);
+    try registerRepresentativeModel(&context, .x86_64);
 
     const graph = try context.finalize();
     try std.testing.expectEqualStrings("kvm", graph.selectedPlatform().name);
@@ -2868,20 +3241,27 @@ test "library and KVM pipelines preserve every ordered argument" {
     const kvm_post = graph.platforms[0].post_process;
     try std.testing.expectEqualStrings("strip", kvm_post[0].name);
     try std.testing.expectEqualStrings("bootinfo", kvm_post[1].name);
-    try std.testing.expect(kvm_post[1].effects[0] == .mutate_input);
+    try std.testing.expect(kvm_post[1].effects[0] == .create);
+    try std.testing.expect(kvm_post[1].effects[1] == .mutate_input);
     try std.testing.expectEqual(@as(usize, 1), kvm_post[2].effects.len);
-    try std.testing.expectEqual(@as(usize, 2), kvm_post[4].effects.len);
-    try std.testing.expectEqualStrings("/build/app_kvm.bin", kvm_post[4].effects[0].create.path);
-    try std.testing.expectEqualStrings("/build/app_kvm.img", kvm_post[4].effects[1].create.path);
-    try std.testing.expectEqualStrings("symbols", kvm_post[5].name);
-    try std.testing.expectEqualStrings("gzip", kvm_post[6].name);
+    try std.testing.expect(kvm_post[2].effects[0] == .mutate_input);
+    try std.testing.expectEqualStrings("efi", kvm_post[3].name);
+    try std.testing.expectEqual(@as(usize, 1), kvm_post[3].additional_inputs.len);
+    try std.testing.expect(kvm_post[3].effects[0] == .mutate_input);
+    try std.testing.expectEqualStrings("linux-binary", kvm_post[4].name);
+    try std.testing.expect(kvm_post[4].effects[0] == .mutate_input);
+    try std.testing.expectEqualStrings("linux-header", kvm_post[5].name);
+    try std.testing.expectEqual(@as(usize, 1), kvm_post[5].additional_inputs.len);
+    try std.testing.expect(kvm_post[5].effects[0] == .mutate_input);
+    try std.testing.expectEqualStrings("symbols", kvm_post[6].name);
+    try std.testing.expectEqualStrings("gzip", kvm_post[7].name);
     try std.testing.expectEqualStrings("compile-db", kvm_post[kvm_post.len - 1].name);
 }
 
 test "Xen pipeline and inactive KVM duplicate outputs validate" {
     var context = try testContextWithConfig(testXenConfig());
     defer context.deinit();
-    try registerRepresentativeModel(&context);
+    try registerRepresentativeModel(&context, .x86_64);
 
     const graph = try context.finalize();
     try std.testing.expectEqualStrings("xen", graph.selectedPlatform().name);
@@ -2897,6 +3277,11 @@ test "Xen pipeline and inactive KVM duplicate outputs validate" {
     try std.testing.expect(partial_sequence[6] == .group_end);
     const xen_post = graph.platforms[1].post_process;
     const kvm_post = graph.platforms[0].post_process;
+    try std.testing.expectEqualStrings("gzip-x86", xen_post[5].name);
+    try std.testing.expectEqualStrings(
+        "bootinfo",
+        xen_post[5].input.post_process_output.transformation,
+    );
     try std.testing.expectEqualStrings(
         "/build/compile_commands.json",
         xen_post[xen_post.len - 1].effects[0].create.path,
@@ -2905,6 +3290,54 @@ test "Xen pipeline and inactive KVM duplicate outputs validate" {
         kvm_post[kvm_post.len - 1].effects[0].create.path,
         xen_post[xen_post.len - 1].effects[0].create.path,
     );
+}
+
+test "arm64 KVM protocol and Linux header steps mutate the image in order" {
+    var context = try testArm64ContextWithConfig(testKvmArm64Config());
+    defer context.deinit();
+    try registerRepresentativeModel(&context, .arm64);
+
+    const graph = try context.finalize();
+    try std.testing.expect(graph.target.architecture == .arm64);
+    try std.testing.expectEqualStrings("kvm", graph.selectedPlatform().name);
+    const post = graph.platforms[0].post_process;
+    try std.testing.expectEqualStrings("linux-binary", post[4].name);
+    try std.testing.expect(post[4].condition.matches(context.config));
+    try std.testing.expect(post[4].effects[0] == .mutate_input);
+    try std.testing.expectEqualStrings(
+        "bootinfo",
+        post[4].input.post_process_output.transformation,
+    );
+    try std.testing.expectEqualStrings("linux-header", post[5].name);
+    try std.testing.expect(post[5].condition.matches(context.config));
+    try std.testing.expect(post[5].effects[0] == .mutate_input);
+    try std.testing.expectEqualStrings(
+        "linux-binary",
+        post[5].input.post_process_output.transformation,
+    );
+    try std.testing.expectEqual(@as(usize, 1), post[5].additional_inputs.len);
+    try std.testing.expect(post[5].additional_inputs[0] == .stage_output);
+}
+
+test "arm64 Xen gzip consumes the separate raw image" {
+    var context = try testArm64ContextWithConfig(testXenArm64Config());
+    defer context.deinit();
+    try registerRepresentativeModel(&context, .arm64);
+
+    const graph = try context.finalize();
+    try std.testing.expectEqualStrings("xen", graph.selectedPlatform().name);
+    const post = graph.platforms[1].post_process;
+    try std.testing.expectEqualStrings("/build/app_xen.elf", post[0].effects[0].create.path);
+    try std.testing.expectEqualStrings("raw-image-arm64", post[3].name);
+    try std.testing.expect(post[3].condition.matches(context.config));
+    try std.testing.expectEqualStrings("/build/app_xen", post[3].effects[0].create.path);
+    try std.testing.expectEqualStrings("gzip-arm64", post[7].name);
+    try std.testing.expect(post[7].condition.matches(context.config));
+    try std.testing.expectEqualStrings(
+        "raw-image-arm64",
+        post[7].input.post_process_output.transformation,
+    );
+    try std.testing.expectEqualStrings("/build/app_xen.gz", post[7].effects[0].create.path);
 }
 
 test "duplicate registration and validation failures are actionable" {

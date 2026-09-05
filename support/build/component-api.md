@@ -21,6 +21,19 @@ library arguments without regrouping them. Ordered post-processing
 transformations can create several named artifacts or declare an in-place
 mutation; later transformations refer to those named results.
 
+`Source.effectiveInput(config, variant)` resolves conditions and returns the
+last active source- or variant-level preprocessing output, or the original
+source when the source, variant, or every preprocessing step is inactive.
+Finalization uses the same active-step rules for generated references and
+output conflicts.
+
+Post-processing describes files, not Make log labels. In particular, the
+`.multiboot`, `.efi`, `.bin`, and `.img` labels in `plat/common/Makefile.rules`
+do not denote products: the Multiboot, EFI, and Linux helpers mutate the KVM
+image in place. Bootinfo additionally creates its real `.bootinfo` side file.
+Xen ARM/ARM64 alone creates a separate raw image, which is the input to gzip;
+Xen x86 gzip consumes the processed ELF image.
+
 ```zig
 const build = @import("component-api.zig");
 
