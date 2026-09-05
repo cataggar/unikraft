@@ -5,6 +5,7 @@ import argparse
 import os
 import platform
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -84,7 +85,23 @@ def version_environment(base):
     version = values.get("UK_VERSION", "")
     subversion = values.get("UK_SUBVERSION", "")
     extraversion = values.get("UK_EXTRAVERSION", "")
-    full = ".".join(part for part in (version, subversion) if part) + extraversion
+    if not version or not subversion:
+        raise ValueError(f"missing UK_VERSION or UK_SUBVERSION in '{version_file}'")
+    suffix_helper = base / "support" / "scripts" / "gitsha1"
+    suffix = subprocess.run(
+        [str(suffix_helper)],
+        cwd=base,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.rstrip("\r\n")
+    if "\n" in suffix or "\r" in suffix:
+        raise ValueError(f"invalid multiline gitsha1 suffix from '{suffix_helper}'")
+    full = f"{version}.{subversion}"
+    if extraversion:
+        full += f".{extraversion}"
+    full += suffix
     return full, values.get("UK_CODENAME", "")
 
 

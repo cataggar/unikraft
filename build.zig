@@ -345,9 +345,13 @@ pub fn build(b: *std.Build) void {
         root,
         b.cache_root.path orelse ".zig-cache",
     );
+    const acme_integration_output = std.fs.path.join(
+        b.allocator,
+        &.{ integration_output, "native-config-acme" },
+    ) catch @panic("out of memory");
     const integration_metadata = std.fs.path.join(
         b.allocator,
-        &.{ integration_output, "native-config-integration", "metadata.tsv" },
+        &.{ acme_integration_output, "metadata.tsv" },
     ) catch @panic("out of memory");
     const acme_config = resolvePath(
         b.allocator,
@@ -367,7 +371,7 @@ pub fn build(b: *std.Build) void {
         "--app",
         root,
         "--output",
-        integration_output,
+        acme_integration_output,
         "--config",
         acme_config,
         "--metadata",
@@ -407,13 +411,17 @@ pub fn build(b: *std.Build) void {
         root,
         "support/build/tests/native-config/x86_64-kvm.h",
     );
+    const x86_integration_output = std.fs.path.join(
+        b.allocator,
+        &.{ integration_output, "native-config-x86" },
+    ) catch @panic("out of memory");
     const x86_metadata = std.fs.path.join(
         b.allocator,
-        &.{ integration_output, "native-config-x86", "metadata.tsv" },
+        &.{ x86_integration_output, "metadata.tsv" },
     ) catch @panic("out of memory");
     const x86_generated_header = std.fs.path.join(
         b.allocator,
-        &.{ integration_output, "native-config-x86", "config.h" },
+        &.{ x86_integration_output, "config.h" },
     ) catch @panic("out of memory");
     const export_x86_metadata = b.addSystemCommand(&.{
         "python3",
@@ -423,7 +431,7 @@ pub fn build(b: *std.Build) void {
         "--app",
         fixture_app,
         "--output",
-        integration_output,
+        x86_integration_output,
         "--config",
         x86_config,
         "--metadata",
@@ -444,6 +452,84 @@ pub fn build(b: *std.Build) void {
     });
     compare_x86_header.step.dependOn(&generate_x86_header.step);
     test_step.dependOn(&compare_x86_header.step);
+    const version_integration_output = std.fs.path.join(
+        b.allocator,
+        &.{ integration_output, "native-config-version-test" },
+    ) catch @panic("out of memory");
+    const version_work_dir = std.fs.path.join(
+        b.allocator,
+        &.{ version_integration_output, "cases" },
+    ) catch @panic("out of memory");
+    const prepare_version_fragment = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/native-config/version-metadata-test.py",
+        "--base",
+        root,
+        "--work-dir",
+        version_work_dir,
+        "--prepare-output",
+        version_integration_output,
+    });
+    prepare_version_fragment.setCwd(.{ .cwd_relative = root });
+    prepare_version_fragment.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    const version_config = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/version-metadata.config",
+    );
+    const version_library = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/versioned-library",
+    );
+    const version_expected_header = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/version-metadata.h",
+    );
+    const version_metadata = std.fs.path.join(
+        b.allocator,
+        &.{ version_integration_output, "metadata.tsv" },
+    ) catch @panic("out of memory");
+    const version_generated_header = std.fs.path.join(
+        b.allocator,
+        &.{ version_integration_output, "config.h" },
+    ) catch @panic("out of memory");
+    const export_version_metadata = b.addSystemCommand(&.{
+        "python3",
+        "support/build/native-config-metadata.py",
+        "--base",
+        root,
+        "--app",
+        root,
+        "--output",
+        version_integration_output,
+        "--config",
+        version_config,
+        "--metadata",
+        version_metadata,
+        "--external-library",
+        version_library,
+    });
+    export_version_metadata.setCwd(.{ .cwd_relative = root });
+    export_version_metadata.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    export_version_metadata.step.dependOn(&prepare_version_fragment.step);
+    const generate_version_header = b.addRunArtifact(native_config_tool);
+    generate_version_header.addArgs(&.{
+        "header",
+        version_config,
+        version_metadata,
+        version_generated_header,
+    });
+    generate_version_header.setCwd(.{ .cwd_relative = root });
+    generate_version_header.step.dependOn(&export_version_metadata.step);
+    const compare_version_header = b.addSystemCommand(&.{
+        "cmp",
+        version_expected_header,
+        version_generated_header,
+    });
+    compare_version_header.step.dependOn(&generate_version_header.step);
+    test_step.dependOn(&compare_version_header.step);
     const runner_link_targets = [_]struct {
         name: []const u8,
         query: std.Target.Query,
