@@ -200,6 +200,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:24.04
+    permissions:
+      attestations: read
+      contents: read
     defaults:
       run:
         shell: bash
@@ -218,13 +221,42 @@ jobs:
           flex \
           git \
           libncurses-dev \
-          llvm \
           make \
           python3 \
-          qemu-system-x86 \
           tar \
           xz-utils
         rm -rf /var/lib/apt/lists/*
+
+    - name: Download LLVM and QEMU tools
+      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.8.0
+        tools: |
+          cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+        dest: ${{ runner.temp }}/zig-tools
+        extract: 'true'
+        strip-components: '1'
+
+    - name: Add LLVM and QEMU tools to PATH
+      run: |
+        set -euo pipefail
+        tools="${RUNNER_TEMP}/zig-tools"
+        for command in \
+          "${tools}/bin/llvm-nm" \
+          "${tools}/bin/llvm-objcopy" \
+          "${tools}/bin/llvm-objdump" \
+          "${tools}/bin/llvm-readelf" \
+          "${tools}/bin/llvm-strip" \
+          "${tools}/qemu-system-x86_64"; do
+          test -x "${command}"
+        done
+        {
+          echo "${tools}/bin"
+          echo "${tools}"
+        } >> "${GITHUB_PATH}"
 
     - uses: actions/checkout@v4
       with:
