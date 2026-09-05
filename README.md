@@ -147,12 +147,17 @@ zig build config-validate -Dapp=/absolute/path/to/app
 zig build config-header -Dapp=/absolute/path/to/app
 ```
 
-`config-inspect` prints the selected architecture and platform,
-`config-validate` checks the single-architecture, single-platform, and
-boot-entry invariants used by the current Make build, and `config-header`
-generates `<output>/include/uk/bits/config.h` without invoking Make. Use
-`-Dconfig` for a non-default `.config`, or `-Dprefix` to place the generated
-header below a prefix other than the build output.
+`config-inspect` prints the selected architecture and platform, and
+`config-validate` checks typed values plus the single-architecture and
+single-platform invariants. Boot-entry validation is intentionally deferred
+until native component registration can prove that the configured provider is
+present. `config-header` generates `<output>/include/uk/bits/config.h` without
+invoking Make. The steps use the existing Kconfiglib model only to export
+authoritative symbol types (including application and external component
+`Config.uk` files), and pair them with existing platform `addplat_s`
+registrations. Zig parses `.config` and writes the header deterministically.
+Use `-Dconfig` for a non-default `.config`, or `-Dprefix` to place the
+generated header below a prefix other than the build output.
 
 From the Unikraft repository, build an application with:
 

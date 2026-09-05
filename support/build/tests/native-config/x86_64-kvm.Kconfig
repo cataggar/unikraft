@@ -20,5 +20,5 @@ config FIXTURE_INT
 	int "Fixture integer"
 config FIXTURE_HEX
 	hex "Fixture hex"
-config UNKNOWN_FUTURE_SYMBOL
-	int "Unknown future symbol"
+config EXTERNAL_COUNT
+	int "External fixture count"

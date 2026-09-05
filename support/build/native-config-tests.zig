@@ -3,6 +3,7 @@ const kconfig = @import("kconfig.zig");
 
 fn checkFixture(
     source: []const u8,
+    metadata_source: []const u8,
     expected_header: []const u8,
     expected_architecture: []const u8,
     expected_family: []const u8,
@@ -11,10 +12,21 @@ fn checkFixture(
     const allocator = std.testing.allocator;
     var parse_diagnostic: kconfig.Diagnostic = .{};
     var validation_diagnostic: kconfig.ValidationDiagnostic = .{};
-    var config = try kconfig.parse(allocator, source, &parse_diagnostic);
+    var metadata = try kconfig.Metadata.parse(allocator, metadata_source);
+    defer metadata.deinit();
+    var config = try kconfig.parseWithMetadata(
+        allocator,
+        source,
+        &metadata,
+        &parse_diagnostic,
+    );
     defer config.deinit();
 
-    const target = try kconfig.deriveTarget(&config, &validation_diagnostic);
+    const target = try kconfig.deriveTargetWithPlatforms(
+        &config,
+        metadata.platforms.items,
+        &validation_diagnostic,
+    );
     try std.testing.expectEqualStrings(expected_architecture, target.architecture.name);
     try std.testing.expectEqualStrings(expected_family, target.architecture.family);
     try std.testing.expectEqualStrings(expected_platform, target.platform.name);
@@ -27,6 +39,7 @@ fn checkFixture(
 test "x86_64 KVM fixture matches current Kconfig header semantics" {
     try checkFixture(
         @embedFile("tests/native-config/x86_64-kvm.config"),
+        @embedFile("tests/native-config/x86_64-kvm.metadata"),
         @embedFile("tests/native-config/x86_64-kvm.h"),
         "x86_64",
         "x86",
@@ -37,6 +50,7 @@ test "x86_64 KVM fixture matches current Kconfig header semantics" {
 test "ARM64 KVM fixture matches current Kconfig header semantics" {
     try checkFixture(
         @embedFile("tests/native-config/arm64-kvm.config"),
+        @embedFile("tests/native-config/arm64-kvm.metadata"),
         @embedFile("tests/native-config/arm64-kvm.h"),
         "arm64",
         "arm",
@@ -47,9 +61,15 @@ test "ARM64 KVM fixture matches current Kconfig header semantics" {
 test "escaping fixture matches Kconfig unescape and header escape behavior" {
     const allocator = std.testing.allocator;
     var diagnostic: kconfig.Diagnostic = .{};
-    var config = try kconfig.parse(
+    var metadata = try kconfig.Metadata.parse(
+        allocator,
+        @embedFile("tests/native-config/escaping.metadata"),
+    );
+    defer metadata.deinit();
+    var config = try kconfig.parseWithMetadata(
         allocator,
         @embedFile("tests/native-config/escaping.config"),
+        &metadata,
         &diagnostic,
     );
     defer config.deinit();
@@ -76,7 +96,7 @@ test "duplicate fixture is rejected with both source locations" {
     try std.testing.expectEqual(@as(?usize, 1), diagnostic.previous_line);
 }
 
-test "target validation rejects ambiguous selections and missing boot entry" {
+test "inspection derives targets before boot-entry finalization" {
     const allocator = std.testing.allocator;
     var parse_diagnostic: kconfig.Diagnostic = .{};
     var validation_diagnostic: kconfig.ValidationDiagnostic = .{};
@@ -101,10 +121,13 @@ test "target validation rejects ambiguous selections and missing boot entry" {
         &parse_diagnostic,
     );
     defer no_boot.deinit();
-    try std.testing.expectError(
-        error.InvalidTarget,
-        kconfig.deriveTarget(&no_boot, &validation_diagnostic),
-    );
+    const target = try kconfig.deriveTarget(&no_boot, &validation_diagnostic);
+    try std.testing.expectEqualStrings("x86_64", target.architecture.name);
+    try std.testing.expectEqualStrings("kvm", target.platform.name);
+    try std.testing.expectError(error.InvalidTarget, kconfig.validateBootEntry(
+        &no_boot,
+        &validation_diagnostic,
+    ));
     try std.testing.expectEqual(
         kconfig.ValidationDiagnostic.Kind.missing_boot_entry,
         validation_diagnostic.kind,

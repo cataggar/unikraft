@@ -1,0 +1,12 @@
+unikraft-native-config-metadata-v1
+symbol	ARCH_ARM_32	bool
+symbol	ARCH_ARM_64	bool
+symbol	ARCH_X86_64	bool
+symbol	FIXTURE_HEX	hex
+symbol	FIXTURE_INT	int
+symbol	FIXTURE_STRING	string
+symbol	HAVE_BOOTENTRY	bool
+symbol	KVM_BOOT_PROTO_QEMU_VIRT	bool
+symbol	PLAT_KVM	bool
+symbol	UK_NAME	string
+platform	PLAT_KVM	kvm

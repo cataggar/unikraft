@@ -4,10 +4,32 @@ const kconfig = @import("kconfig.zig");
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len < 3) return usage();
+    if (args.len < 4) return usage();
 
     const command = args[1];
     const config_path = args[2];
+    const metadata_path = args[3];
+    const metadata_source = std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        metadata_path,
+        allocator,
+        .limited(64 * 1024 * 1024),
+    ) catch |err| {
+        std.debug.print("error: unable to read Kconfig metadata '{s}': {s}\n", .{
+            metadata_path,
+            @errorName(err),
+        });
+        std.process.exit(2);
+    };
+    var metadata = kconfig.Metadata.parse(allocator, metadata_source) catch |err| {
+        std.debug.print("error: invalid Kconfig metadata '{s}': {s}\n", .{
+            metadata_path,
+            @errorName(err),
+        });
+        std.process.exit(2);
+    };
+    defer metadata.deinit();
+
     const source = std.Io.Dir.cwd().readFileAlloc(
         init.io,
         config_path,
@@ -22,7 +44,12 @@ pub fn main(init: std.process.Init) !void {
     };
 
     var parse_diagnostic: kconfig.Diagnostic = .{};
-    var config = kconfig.parse(allocator, source, &parse_diagnostic) catch |err| switch (err) {
+    var config = kconfig.parseWithMetadata(
+        allocator,
+        source,
+        &metadata,
+        &parse_diagnostic,
+    ) catch |err| switch (err) {
         error.InvalidConfig => {
             printParseDiagnostic(config_path, parse_diagnostic);
             std.process.exit(2);
@@ -33,7 +60,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "inspect") or std.mem.eql(u8, command, "validate")) {
         var validation_diagnostic: kconfig.ValidationDiagnostic = .{};
-        const target = kconfig.deriveTarget(&config, &validation_diagnostic) catch {
+        const target = kconfig.deriveTargetWithPlatforms(
+            &config,
+            metadata.platforms.items,
+            &validation_diagnostic,
+        ) catch {
             printValidationDiagnostic(config_path, validation_diagnostic);
             std.process.exit(2);
         };
@@ -52,9 +83,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, command, "header")) {
-        if (args.len != 4) return usage();
-        try writeHeader(init.io, allocator, args[3], &config);
-        std.debug.print("generated {s}\n", .{args[3]});
+        if (args.len != 5) return usage();
+        try writeHeader(init.io, allocator, args[4], &config);
+        std.debug.print("generated {s}\n", .{args[4]});
         return;
     }
     return usage();
@@ -62,8 +93,8 @@ pub fn main(init: std.process.Init) !void {
 
 fn usage() noreturn {
     std.debug.print(
-        "usage: native-config-tool inspect|validate CONFIG\n" ++
-            "       native-config-tool header CONFIG OUTPUT\n",
+        "usage: native-config-tool inspect|validate CONFIG METADATA\n" ++
+            "       native-config-tool header CONFIG METADATA OUTPUT\n",
         .{},
     );
     std.process.exit(2);
@@ -102,6 +133,8 @@ fn printParseDiagnostic(path: []const u8, diagnostic: kconfig.Diagnostic) void {
         .invalid_symbol => "invalid symbol name; use letters, digits, and underscores",
         .invalid_value => "invalid value; expected y, m, n, a quoted string, decimal integer, or hexadecimal integer",
         .malformed_string => "malformed quoted string; escape embedded quotes and backslashes",
+        .ambiguous_numeric => "ambiguous bare numeric value; authoritative int/hex Kconfig metadata is required",
+        .type_mismatch => "value does not match the authoritative Kconfig symbol type",
         .duplicate_entry => "duplicate configuration entry",
         .conflicting_entry => "conflicting configuration entry",
     };

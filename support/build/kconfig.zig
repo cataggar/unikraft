@@ -6,6 +6,119 @@ pub const Tristate = enum {
     y,
 };
 
+pub const SymbolType = enum {
+    boolean,
+    tristate,
+    string,
+    integer,
+    hex,
+};
+
+pub const Platform = struct {
+    symbol: []const u8,
+    name: []const u8,
+};
+
+pub const SymbolMetadata = struct {
+    name: []const u8,
+    symbol_type: SymbolType,
+};
+
+pub const Metadata = struct {
+    allocator: std.mem.Allocator,
+    symbols: std.array_list.Managed(SymbolMetadata),
+    platforms: std.array_list.Managed(Platform),
+
+    pub fn init(allocator: std.mem.Allocator) Metadata {
+        return .{
+            .allocator = allocator,
+            .symbols = std.array_list.Managed(SymbolMetadata).init(allocator),
+            .platforms = std.array_list.Managed(Platform).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Metadata) void {
+        for (self.symbols.items) |symbol| self.allocator.free(symbol.name);
+        for (self.platforms.items) |platform| {
+            self.allocator.free(platform.symbol);
+            self.allocator.free(platform.name);
+        }
+        self.symbols.deinit();
+        self.platforms.deinit();
+        self.* = undefined;
+    }
+
+    pub fn addSymbol(
+        self: *Metadata,
+        name: []const u8,
+        symbol_type: SymbolType,
+    ) !void {
+        if (!validSymbol(name)) return error.InvalidMetadata;
+        for (self.symbols.items) |existing| {
+            if (!std.mem.eql(u8, existing.name, name)) continue;
+            if (existing.symbol_type != symbol_type) return error.ConflictingMetadata;
+            return error.DuplicateMetadata;
+        }
+        try self.symbols.append(.{
+            .name = try self.allocator.dupe(u8, name),
+            .symbol_type = symbol_type,
+        });
+    }
+
+    pub fn addPlatform(
+        self: *Metadata,
+        symbol: []const u8,
+        name: []const u8,
+    ) !void {
+        if (!validSymbol(symbol) or !validPlatformName(name)) return error.InvalidMetadata;
+        for (self.platforms.items) |existing| {
+            if (std.mem.eql(u8, existing.symbol, symbol)) {
+                if (!std.mem.eql(u8, existing.name, name)) return error.ConflictingMetadata;
+                return error.DuplicateMetadata;
+            }
+            if (std.mem.eql(u8, existing.name, name)) return error.ConflictingMetadata;
+        }
+        try self.platforms.append(.{
+            .symbol = try self.allocator.dupe(u8, symbol),
+            .name = try self.allocator.dupe(u8, name),
+        });
+    }
+
+    pub fn typeOf(self: *const Metadata, name: []const u8) ?SymbolType {
+        for (self.symbols.items) |symbol| {
+            if (std.mem.eql(u8, symbol.name, name)) return symbol.symbol_type;
+        }
+        return null;
+    }
+
+    pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Metadata {
+        var metadata = Metadata.init(allocator);
+        errdefer metadata.deinit();
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        const header = lines.next() orelse return error.InvalidMetadata;
+        if (!std.mem.eql(u8, std.mem.trimEnd(u8, header, "\r"), "unikraft-native-config-metadata-v1")) {
+            return error.InvalidMetadata;
+        }
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trimEnd(u8, raw_line, "\r");
+            if (line.len == 0) continue;
+            var fields = std.mem.splitScalar(u8, line, '\t');
+            const kind = fields.next() orelse return error.InvalidMetadata;
+            const first = fields.next() orelse return error.InvalidMetadata;
+            const second = fields.next() orelse return error.InvalidMetadata;
+            if (fields.next() != null) return error.InvalidMetadata;
+            if (std.mem.eql(u8, kind, "symbol")) {
+                try metadata.addSymbol(first, parseSymbolType(second) orelse return error.InvalidMetadata);
+            } else if (std.mem.eql(u8, kind, "platform")) {
+                try metadata.addPlatform(first, second);
+            } else {
+                return error.InvalidMetadata;
+            }
+        }
+        return metadata;
+    }
+};
+
 pub const Number = struct {
     value: i64,
     text: []const u8,
@@ -27,6 +140,7 @@ pub const Value = union(enum) {
 pub const Entry = struct {
     name: []const u8,
     value: Value,
+    symbol_type: ?SymbolType,
     line: usize,
 };
 
@@ -42,6 +156,8 @@ pub const Diagnostic = struct {
         invalid_symbol,
         invalid_value,
         malformed_string,
+        ambiguous_numeric,
+        type_mismatch,
         duplicate_entry,
         conflicting_entry,
     };
@@ -57,6 +173,7 @@ pub const AccessError = error{TypeMismatch};
 pub const Document = struct {
     allocator: std.mem.Allocator,
     entries: std.array_list.Managed(Entry),
+    authoritative_metadata: bool,
 
     pub fn deinit(self: *Document) void {
         for (self.entries.items) |entry| {
@@ -131,6 +248,8 @@ pub const Document = struct {
 
     pub fn renderHeader(self: *const Document, writer: *std.Io.Writer) !void {
         for (self.entries.items) |entry| {
+            // Current Kconfig generators omit stale symbols absent from the model.
+            if (self.authoritative_metadata and entry.symbol_type == null) continue;
             switch (entry.value) {
                 .unset => {},
                 .tristate => |value| switch (value) {
@@ -176,10 +295,20 @@ pub fn parse(
     source: []const u8,
     diagnostic: *Diagnostic,
 ) ParseError!Document {
+    return parseWithMetadata(allocator, source, null, diagnostic);
+}
+
+pub fn parseWithMetadata(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    metadata: ?*const Metadata,
+    diagnostic: *Diagnostic,
+) ParseError!Document {
     diagnostic.* = .{};
     var document = Document{
         .allocator = allocator,
         .entries = std.array_list.Managed(Entry).init(allocator),
+        .authoritative_metadata = metadata != null,
     };
     errdefer document.deinit();
 
@@ -199,7 +328,13 @@ pub fn parse(
             if (!validSymbol(name)) {
                 return fail(diagnostic, .invalid_symbol, line_number, "# CONFIG_".len + 1, name, null);
             }
-            try appendEntry(&document, diagnostic, name, .unset, line_number);
+            const symbol_type = if (metadata) |types| types.typeOf(name) else null;
+            if (symbol_type) |actual| {
+                if (actual != .boolean and actual != .tristate) {
+                    return fail(diagnostic, .type_mismatch, line_number, 1, name, null);
+                }
+            }
+            try appendEntry(&document, diagnostic, name, .unset, symbol_type, line_number);
             continue;
         }
         if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "#")) continue;
@@ -217,9 +352,18 @@ pub fn parse(
         if (text.len == 0) {
             return fail(diagnostic, .invalid_value, line_number, equals + 2, name, null);
         }
-        const value = try parseValue(allocator, text, diagnostic, line_number, equals + 2, name);
+        const symbol_type = if (metadata) |types| types.typeOf(name) else null;
+        const value = try parseValue(
+            allocator,
+            text,
+            symbol_type,
+            diagnostic,
+            line_number,
+            equals + 2,
+            name,
+        );
         errdefer freeValue(allocator, value);
-        try appendEntry(&document, diagnostic, name, value, line_number);
+        try appendEntry(&document, diagnostic, name, value, symbol_type, line_number);
     }
     return document;
 }
@@ -227,6 +371,7 @@ pub fn parse(
 fn parseValue(
     allocator: std.mem.Allocator,
     text: []const u8,
+    symbol_type: ?SymbolType,
     diagnostic: *Diagnostic,
     line: usize,
     column: usize,
@@ -234,13 +379,18 @@ fn parseValue(
 ) ParseError!Value {
     if (text.len == 1) {
         return switch (text[0]) {
-            'n' => .{ .tristate = .n },
-            'm' => .{ .tristate = .m },
-            'y' => .{ .tristate = .y },
-            else => parseNumber(allocator, text, diagnostic, line, column, name),
+            'n' => parseTristate(.n, symbol_type, diagnostic, line, column, name),
+            'm' => parseTristate(.m, symbol_type, diagnostic, line, column, name),
+            'y' => parseTristate(.y, symbol_type, diagnostic, line, column, name),
+            else => parseNumber(allocator, text, symbol_type, diagnostic, line, column, name),
         };
     }
     if (text[0] == '"') {
+        if (symbol_type) |actual| {
+            if (actual != .string) {
+                return fail(diagnostic, .type_mismatch, line, column, name, null);
+            }
+        }
         if (text.len < 2 or text[text.len - 1] != '"') {
             return fail(diagnostic, .malformed_string, line, column, name, null);
         }
@@ -265,17 +415,66 @@ fn parseValue(
         }
         return .{ .string = try decoded.toOwnedSlice() };
     }
-    return parseNumber(allocator, text, diagnostic, line, column, name);
+    return parseNumber(allocator, text, symbol_type, diagnostic, line, column, name);
 }
 
-fn parseNumber(
-    allocator: std.mem.Allocator,
-    text: []const u8,
+fn parseTristate(
+    value: Tristate,
+    symbol_type: ?SymbolType,
     diagnostic: *Diagnostic,
     line: usize,
     column: usize,
     name: []const u8,
 ) ParseError!Value {
+    if (symbol_type) |actual| {
+        if (actual != .boolean and actual != .tristate) {
+            return fail(diagnostic, .type_mismatch, line, column, name, null);
+        }
+        if (actual == .boolean and value == .m) {
+            return fail(diagnostic, .type_mismatch, line, column, name, null);
+        }
+    }
+    return .{ .tristate = value };
+}
+
+fn parseNumber(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    symbol_type: ?SymbolType,
+    diagnostic: *Diagnostic,
+    line: usize,
+    column: usize,
+    name: []const u8,
+) ParseError!Value {
+    if (symbol_type) |actual| {
+        switch (actual) {
+            .integer => {
+                const value = std.fmt.parseInt(i64, text, 10) catch
+                    return fail(diagnostic, .type_mismatch, line, column, name, null);
+                return .{ .integer = .{
+                    .value = value,
+                    .text = try allocator.dupe(u8, text),
+                } };
+            },
+            .hex => {
+                const digits = if (std.mem.startsWith(u8, text, "0x") or
+                    std.mem.startsWith(u8, text, "0X"))
+                    text[2..]
+                else
+                    text;
+                if (digits.len == 0) {
+                    return fail(diagnostic, .type_mismatch, line, column, name, null);
+                }
+                const value = std.fmt.parseInt(u64, digits, 16) catch
+                    return fail(diagnostic, .type_mismatch, line, column, name, null);
+                return .{ .hex = .{
+                    .value = value,
+                    .text = try allocator.dupe(u8, text),
+                } };
+            },
+            else => return fail(diagnostic, .type_mismatch, line, column, name, null),
+        }
+    }
     if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) {
         if (text.len == 2) return fail(diagnostic, .invalid_value, line, column, name, null);
         const value = std.fmt.parseInt(u64, text[2..], 16) catch
@@ -293,12 +492,24 @@ fn parseNumber(
             .text = try allocator.dupe(u8, text),
         } };
     }
+    if (isUnsignedDecimal(text)) {
+        return fail(diagnostic, .ambiguous_numeric, line, column, name, null);
+    }
     const value = std.fmt.parseInt(i64, text, 10) catch
         return fail(diagnostic, .invalid_value, line, column, name, null);
     return .{ .integer = .{
         .value = value,
         .text = try allocator.dupe(u8, text),
     } };
+}
+
+fn isUnsignedDecimal(text: []const u8) bool {
+    const digits = if (text.len != 0 and text[0] == '+') text[1..] else text;
+    if (digits.len == 0) return false;
+    for (digits) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+    }
+    return true;
 }
 
 fn isBareHex(text: []const u8) bool {
@@ -315,6 +526,7 @@ fn appendEntry(
     diagnostic: *Diagnostic,
     name: []const u8,
     value: Value,
+    symbol_type: ?SymbolType,
     line: usize,
 ) ParseError!void {
     for (document.entries.items) |entry| {
@@ -328,6 +540,7 @@ fn appendEntry(
     try document.entries.append(.{
         .name = try document.allocator.dupe(u8, name),
         .value = value,
+        .symbol_type = symbol_type,
         .line = line,
     });
 }
@@ -338,6 +551,27 @@ fn validSymbol(name: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
     }
     return true;
+}
+
+fn validPlatformName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (!(std.ascii.isAlphanumeric(byte) or
+            std.mem.indexOfScalar(u8, "._+-", byte) != null))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn parseSymbolType(text: []const u8) ?SymbolType {
+    if (std.mem.eql(u8, text, "bool")) return .boolean;
+    if (std.mem.eql(u8, text, "tristate")) return .tristate;
+    if (std.mem.eql(u8, text, "string")) return .string;
+    if (std.mem.eql(u8, text, "int")) return .integer;
+    if (std.mem.eql(u8, text, "hex")) return .hex;
+    return null;
 }
 
 fn valuesEqual(left: Value, right: Value) bool {
@@ -384,11 +618,6 @@ pub const Architecture = struct {
     family: []const u8,
 };
 
-pub const Platform = struct {
-    symbol: []const u8,
-    name: []const u8,
-};
-
 pub const Target = struct {
     architecture: Architecture,
     platform: Platform,
@@ -425,13 +654,12 @@ pub fn deriveTarget(
     config: *const Document,
     diagnostic: *ValidationDiagnostic,
 ) error{InvalidTarget}!Target {
-    return deriveTargetWithPlatforms(config, &builtin_platforms, true, diagnostic);
+    return deriveTargetWithPlatforms(config, &builtin_platforms, diagnostic);
 }
 
 pub fn deriveTargetWithPlatforms(
     config: *const Document,
     platforms: []const Platform,
-    require_boot_entry: bool,
     diagnostic: *ValidationDiagnostic,
 ) error{InvalidTarget}!Target {
     diagnostic.* = .{};
@@ -502,18 +730,35 @@ pub fn deriveTargetWithPlatforms(
         diagnostic.* = .{ .kind = .missing_platform };
         return error.InvalidTarget;
     };
-    if (require_boot_entry and !config.enabled("HAVE_BOOTENTRY")) {
-        diagnostic.* = .{ .kind = .missing_boot_entry, .symbol = "HAVE_BOOTENTRY" };
-        return error.InvalidTarget;
-    }
     return .{
         .architecture = selected_architecture,
         .platform = selected_platform,
     };
 }
 
+pub fn validateBootEntry(
+    config: *const Document,
+    diagnostic: *ValidationDiagnostic,
+) error{InvalidTarget}!void {
+    if (!config.enabled("HAVE_BOOTENTRY")) {
+        diagnostic.* = .{ .kind = .missing_boot_entry, .symbol = "HAVE_BOOTENTRY" };
+        return error.InvalidTarget;
+    }
+}
+
 test "typed values and Kconfig-compatible header semantics" {
     const allocator = std.testing.allocator;
+    var metadata = Metadata.init(allocator);
+    defer metadata.deinit();
+    try metadata.addSymbol("BOOL", .boolean);
+    try metadata.addSymbol("MODULE", .tristate);
+    try metadata.addSymbol("OFF", .boolean);
+    try metadata.addSymbol("TEXT", .string);
+    try metadata.addSymbol("NEGATIVE", .integer);
+    try metadata.addSymbol("ADDRESS", .hex);
+    try metadata.addSymbol("DIGIT_HEX", .hex);
+    try metadata.addSymbol("BARE_HEX", .hex);
+    try metadata.addSymbol("UNKNOWN_SYMBOL", .integer);
     const source =
         \\CONFIG_BOOL=y
         \\CONFIG_MODULE=m
@@ -521,12 +766,14 @@ test "typed values and Kconfig-compatible header semantics" {
         \\CONFIG_TEXT="quote: \" slash: \\ dropped: \q"
         \\CONFIG_NEGATIVE=-0042
         \\CONFIG_ADDRESS=0X00ff
+        \\CONFIG_DIGIT_HEX=40000000
         \\CONFIG_BARE_HEX=deAd
         \\CONFIG_UNKNOWN_SYMBOL=7
+        \\CONFIG_UNKNOWN_PREFIXED=0x7
         \\
     ;
     var diagnostic: Diagnostic = .{};
-    var config = try parse(allocator, source, &diagnostic);
+    var config = try parseWithMetadata(allocator, source, &metadata, &diagnostic);
     defer config.deinit();
 
     try std.testing.expectEqual(true, (try config.getBool("BOOL")).?);
@@ -538,8 +785,10 @@ test "typed values and Kconfig-compatible header semantics" {
     );
     try std.testing.expectEqual(@as(i64, -42), (try config.getInteger("NEGATIVE")).?);
     try std.testing.expectEqual(@as(u64, 255), (try config.getHex("ADDRESS")).?);
+    try std.testing.expectEqual(@as(u64, 0x40000000), (try config.getHex("DIGIT_HEX")).?);
     try std.testing.expectEqual(@as(u64, 0xdead), (try config.getHex("BARE_HEX")).?);
     try std.testing.expect(config.get("UNKNOWN_SYMBOL") != null);
+    try std.testing.expect(config.get("UNKNOWN_PREFIXED") != null);
 
     const header = try config.headerAlloc(allocator);
     defer allocator.free(header);
@@ -549,10 +798,65 @@ test "typed values and Kconfig-compatible header semantics" {
         \\#define CONFIG_TEXT "quote: \" slash: \\ dropped: q"
         \\#define CONFIG_NEGATIVE -0042
         \\#define CONFIG_ADDRESS 0X00ff
+        \\#define CONFIG_DIGIT_HEX 0x40000000
         \\#define CONFIG_BARE_HEX 0xdeAd
         \\#define CONFIG_UNKNOWN_SYMBOL 7
         \\
     , header);
+}
+
+test "digit-only numeric values require authoritative type metadata" {
+    const allocator = std.testing.allocator;
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(
+        error.InvalidConfig,
+        parse(allocator, "CONFIG_ADDRESS=40000000\n", &diagnostic),
+    );
+    try std.testing.expectEqual(Diagnostic.Kind.ambiguous_numeric, diagnostic.kind);
+
+    var metadata = Metadata.init(allocator);
+    defer metadata.deinit();
+    try metadata.addSymbol("ADDRESS", .hex);
+    try metadata.addSymbol("COUNT", .integer);
+    var config = try parseWithMetadata(
+        allocator,
+        "CONFIG_ADDRESS=40000000\nCONFIG_COUNT=40000000\n",
+        &metadata,
+        &diagnostic,
+    );
+    defer config.deinit();
+    try std.testing.expectEqual(@as(u64, 0x40000000), (try config.getHex("ADDRESS")).?);
+    try std.testing.expectEqual(@as(i64, 40000000), (try config.getInteger("COUNT")).?);
+
+    try std.testing.expectError(
+        error.InvalidConfig,
+        parseWithMetadata(
+            allocator,
+            "CONFIG_ADDRESS=-1\n",
+            &metadata,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(Diagnostic.Kind.type_mismatch, diagnostic.kind);
+}
+
+test "metadata rejects duplicate and conflicting platform mappings" {
+    const allocator = std.testing.allocator;
+    var metadata = Metadata.init(allocator);
+    defer metadata.deinit();
+    try metadata.addPlatform("PLAT_ACME", "acme");
+    try std.testing.expectError(
+        error.DuplicateMetadata,
+        metadata.addPlatform("PLAT_ACME", "acme"),
+    );
+    try std.testing.expectError(
+        error.ConflictingMetadata,
+        metadata.addPlatform("PLAT_ACME", "other"),
+    );
+    try std.testing.expectError(
+        error.ConflictingMetadata,
+        metadata.addPlatform("PLAT_OTHER", "acme"),
+    );
 }
 
 test "duplicates and conflicts have source diagnostics" {
@@ -643,7 +947,6 @@ test "callers can supply external platform symbols and Make names" {
     const target = try deriveTargetWithPlatforms(
         &config,
         &platforms,
-        true,
         &validation_diagnostic,
     );
     try std.testing.expectEqualStrings("acme", target.platform.name);

@@ -211,9 +211,42 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
+    const metadata_path = std.fs.path.join(
+        b.allocator,
+        &.{ context.output, "native-config", "metadata.tsv" },
+    ) catch @panic("out of memory");
+    const export_config_metadata = b.addSystemCommand(&.{
+        "python3",
+        "support/build/native-config-metadata.py",
+        "--base",
+        context.base,
+        "--app",
+        context.application,
+        "--output",
+        context.output,
+        "--config",
+        context.config,
+        "--metadata",
+        metadata_path,
+    });
+    export_config_metadata.setCwd(.{ .cwd_relative = root });
+    export_config_metadata.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    if (image_name_option) |image_name| {
+        export_config_metadata.addArgs(&.{ "--image-name", image_name });
+    }
+    for (context.external_libraries) |path| {
+        export_config_metadata.addArgs(&.{ "--external-library", path });
+    }
+    for (context.external_platforms) |path| {
+        export_config_metadata.addArgs(&.{ "--external-platform", path });
+    }
+    for (context.exclusions) |path| {
+        export_config_metadata.addArgs(&.{ "--exclude", path });
+    }
     const inspect_config = b.addRunArtifact(native_config_tool);
-    inspect_config.addArgs(&.{ "inspect", context.config });
+    inspect_config.addArgs(&.{ "inspect", context.config, metadata_path });
     inspect_config.setCwd(.{ .cwd_relative = root });
+    inspect_config.step.dependOn(&export_config_metadata.step);
     const inspect_config_step = b.step(
         "config-inspect",
         "Parse configuration and print the native architecture/platform selection",
@@ -221,18 +254,20 @@ pub fn build(b: *std.Build) void {
     inspect_config_step.dependOn(&inspect_config.step);
 
     const validate_config = b.addRunArtifact(native_config_tool);
-    validate_config.addArgs(&.{ "validate", context.config });
+    validate_config.addArgs(&.{ "validate", context.config, metadata_path });
     validate_config.setCwd(.{ .cwd_relative = root });
+    validate_config.step.dependOn(&export_config_metadata.step);
     const validate_config_step = b.step(
         "config-validate",
-        "Parse and validate native configuration invariants without solving Kconfig",
+        "Validate typed configuration values and target selection without solving Kconfig",
     );
     validate_config_step.dependOn(&validate_config.step);
 
     const header_path = context.headerPath() catch @panic("out of memory");
     const generate_config_header = b.addRunArtifact(native_config_tool);
-    generate_config_header.addArgs(&.{ "header", context.config, header_path });
+    generate_config_header.addArgs(&.{ "header", context.config, metadata_path, header_path });
     generate_config_header.setCwd(.{ .cwd_relative = root });
+    generate_config_header.step.dependOn(&export_config_metadata.step);
     const generate_config_header_step = b.step(
         "config-header",
         "Generate include/uk/bits/config.h directly from an existing solved .config",
@@ -305,6 +340,110 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_runner_tests.step);
     test_step.dependOn(&run_native_config_tests.step);
     test_step.dependOn(&run_context_tests.step);
+    const integration_output = resolvePath(
+        b.allocator,
+        root,
+        b.cache_root.path orelse ".zig-cache",
+    );
+    const integration_metadata = std.fs.path.join(
+        b.allocator,
+        &.{ integration_output, "native-config-integration", "metadata.tsv" },
+    ) catch @panic("out of memory");
+    const acme_config = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/x86_64-acme.config",
+    );
+    const acme_platform = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/external-platform/provider",
+    );
+    const export_integration_metadata = b.addSystemCommand(&.{
+        "python3",
+        "support/build/native-config-metadata.py",
+        "--base",
+        root,
+        "--app",
+        root,
+        "--output",
+        integration_output,
+        "--config",
+        acme_config,
+        "--metadata",
+        integration_metadata,
+        "--external-platform",
+        acme_platform,
+    });
+    export_integration_metadata.setCwd(.{ .cwd_relative = root });
+    export_integration_metadata.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    const inspect_acme_config = b.addRunArtifact(native_config_tool);
+    inspect_acme_config.addArgs(&.{ "inspect", acme_config, integration_metadata });
+    inspect_acme_config.setCwd(.{ .cwd_relative = root });
+    inspect_acme_config.step.dependOn(&export_integration_metadata.step);
+    test_step.dependOn(&inspect_acme_config.step);
+    const validate_acme_config = b.addRunArtifact(native_config_tool);
+    validate_acme_config.addArgs(&.{ "validate", acme_config, integration_metadata });
+    validate_acme_config.setCwd(.{ .cwd_relative = root });
+    validate_acme_config.step.dependOn(&export_integration_metadata.step);
+    test_step.dependOn(&validate_acme_config.step);
+    const fixture_app = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/fixture-app",
+    );
+    const fixture_library = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/external-library/libfixture",
+    );
+    const x86_config = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/x86_64-kvm.config",
+    );
+    const x86_expected_header = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/x86_64-kvm.h",
+    );
+    const x86_metadata = std.fs.path.join(
+        b.allocator,
+        &.{ integration_output, "native-config-x86", "metadata.tsv" },
+    ) catch @panic("out of memory");
+    const x86_generated_header = std.fs.path.join(
+        b.allocator,
+        &.{ integration_output, "native-config-x86", "config.h" },
+    ) catch @panic("out of memory");
+    const export_x86_metadata = b.addSystemCommand(&.{
+        "python3",
+        "support/build/native-config-metadata.py",
+        "--base",
+        root,
+        "--app",
+        fixture_app,
+        "--output",
+        integration_output,
+        "--config",
+        x86_config,
+        "--metadata",
+        x86_metadata,
+        "--external-library",
+        fixture_library,
+    });
+    export_x86_metadata.setCwd(.{ .cwd_relative = root });
+    export_x86_metadata.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    const generate_x86_header = b.addRunArtifact(native_config_tool);
+    generate_x86_header.addArgs(&.{ "header", x86_config, x86_metadata, x86_generated_header });
+    generate_x86_header.setCwd(.{ .cwd_relative = root });
+    generate_x86_header.step.dependOn(&export_x86_metadata.step);
+    const compare_x86_header = b.addSystemCommand(&.{
+        "cmp",
+        x86_expected_header,
+        x86_generated_header,
+    });
+    compare_x86_header.step.dependOn(&generate_x86_header.step);
+    test_step.dependOn(&compare_x86_header.step);
     const runner_link_targets = [_]struct {
         name: []const u8,
         query: std.Target.Query,
@@ -355,7 +494,7 @@ fn addFailedTargets(b: *std.Build, message: []const u8) void {
         },
         .{
             .name = "config-validate",
-            .description = "Parse and validate native configuration invariants without solving Kconfig",
+            .description = "Validate typed configuration values and target selection without solving Kconfig",
         },
         .{
             .name = "config-header",
