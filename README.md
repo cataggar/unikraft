@@ -136,6 +136,24 @@ GNU Make remains the backend; this facade only maps Zig build steps and options
 to Make targets and assignments. It does not yet model Unikraft's components
 as a native Zig build graph.
 
+The facade also exposes an isolated native configuration parser and header
+generator. It consumes an already solved Kconfig `.config`; it does not
+evaluate `Config.uk`, resolve dependencies/defaults, or replace the Kconfig
+solver. The non-destructive native steps are:
+
+```shell
+zig build config-inspect -Dapp=/absolute/path/to/app
+zig build config-validate -Dapp=/absolute/path/to/app
+zig build config-header -Dapp=/absolute/path/to/app
+```
+
+`config-inspect` prints the selected architecture and platform,
+`config-validate` checks the single-architecture, single-platform, and
+boot-entry invariants used by the current Make build, and `config-header`
+generates `<output>/include/uk/bits/config.h` without invoking Make. Use
+`-Dconfig` for a non-default `.config`, or `-Dprefix` to place the generated
+header below a prefix other than the build output.
+
 From the Unikraft repository, build an application with:
 
 ```shell

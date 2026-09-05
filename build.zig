@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const build_context = @import("support/build/build-context.zig");
 const facade_paths = @import("support/build/zig-facade-paths.zig");
 
 const supported_zig = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
@@ -93,80 +94,68 @@ pub fn build(b: *std.Build) void {
             return;
         }
     }
-    const app_lexical = resolvePath(
-        b.allocator,
-        root,
-        app_option orelse root,
-    );
-    const app_result = facade_paths.canonicalizeNearestExisting(
-        b.allocator,
-        b.graph.io,
-        app_lexical,
-    ) catch |err| {
-        addFailedTargets(b, b.fmt("unable to canonicalize application path '{s}': {s}", .{
-            app_lexical,
-            @errorName(err),
-        }));
-        return;
-    };
-    if (!app_result.exists) {
-        addFailedTargets(b, b.fmt(
-            "invalid -Dapp '{s}': the application directory must already exist",
-            .{app_lexical},
-        ));
-        return;
-    }
-    const app = app_result.path;
     const output_option = b.option([]const u8, "output", "Build output directory (Make O=)");
     var validation_message: ?[]const u8 = null;
-    const output_lexical = if (output_option) |value| output: {
+    if (output_option) |value| {
         if (firstUnsafePathByte(value, false)) |byte| {
             validation_message = b.fmt(
                 "invalid O value: byte 0x{x:0>2} is outside the facade's conservative Make-safe character allowlist",
                 .{byte},
             );
-            break :output resolvePath(b.allocator, app, "build");
         }
         validateOutputValue(value) catch {
             validation_message = "invalid -Doutput: the value is empty; omit it to use <app>/build or provide a dedicated build directory";
-            break :output resolvePath(b.allocator, app, "build");
         };
-        break :output resolvePath(b.allocator, root, value);
-    } else resolvePath(b.allocator, app, "build");
-    const output_result = facade_paths.canonicalizeNearestExisting(
-        b.allocator,
-        b.graph.io,
-        output_lexical,
-    ) catch |err| {
-        addFailedTargets(b, b.fmt("unable to canonicalize output path '{s}': {s}", .{
-            output_lexical,
+    }
+    const config_option = b.option([]const u8, "config", "Configuration file (Make C=)");
+    const image_name_option = b.option([]const u8, "image-name", "Image/application name override (Make N=)");
+    const external_library_options = b.option(
+        []const []const u8,
+        "external-lib",
+        "External library path; may be repeated (Make L=)",
+    ) orelse &.{};
+    const external_platform_options = b.option(
+        []const []const u8,
+        "external-platform",
+        "External platform path; may be repeated (Make P=)",
+    ) orelse &.{};
+    const exclusion_options = b.option(
+        []const []const u8,
+        "exclude",
+        "Excluded component path; may be repeated (Make E=)",
+    ) orelse &.{};
+    const context = build_context.Context.init(b.allocator, b.graph.io, .{
+        .base = root,
+        .application = app_option,
+        .output = output_option,
+        .prefix = b.option([]const u8, "prefix", "Native build installation/header prefix (defaults to output)"),
+        .config = config_option,
+        .external_libraries = external_library_options,
+        .external_platforms = external_platform_options,
+        .exclusions = exclusion_options,
+        .image_name = image_name_option,
+    }, null) catch |err| {
+        addFailedTargets(b, b.fmt("unable to create canonical Unikraft build context: {s}", .{
             @errorName(err),
         }));
         return;
     };
-    const output = output_result.path;
+    const app = context.application;
+    const output = context.output;
+    const output_result = facade_paths.CanonicalPath{
+        .path = context.output,
+        .exists = context.output_exists,
+    };
 
-    var options = MakeOptions{
+    const options = MakeOptions{
         .command = b.option([]const u8, "make-command", "GNU Make executable (default: make)") orelse "make",
         .app = app,
         .output = output,
-        .config = resolveOptionalPath(b, root, "config", "Configuration file (Make C=)"),
-        .image_name = b.option([]const u8, "image-name", "Image/application name override (Make N=)"),
-        .external_libraries = resolvePathList(
-            b.allocator,
-            root,
-            b.option([]const []const u8, "external-lib", "External library path; may be repeated (Make L=)"),
-        ),
-        .external_platforms = resolvePathList(
-            b.allocator,
-            root,
-            b.option([]const []const u8, "external-platform", "External platform path; may be repeated (Make P=)"),
-        ),
-        .exclusions = resolvePathList(
-            b.allocator,
-            root,
-            b.option([]const []const u8, "exclude", "Excluded component path; may be repeated (Make E=)"),
-        ),
+        .config = if (config_option != null) context.config else null,
+        .image_name = image_name_option,
+        .external_libraries = joinPathList(b.allocator, context.external_libraries),
+        .external_platforms = joinPathList(b.allocator, context.external_platforms),
+        .exclusions = joinPathList(b.allocator, context.exclusions),
         .verbosity = b.option(Verbosity, "verbose", "Make verbosity: 0, 1, or 2 (Make V=)"),
         .cross_compile = b.option([]const u8, "cross-compile", "Cross-toolchain prefix (Make CROSS_COMPILE=)"),
         .compiler = b.option([]const u8, "compiler", "C compiler command (Make COMPILER=)"),
@@ -180,12 +169,6 @@ pub fn build(b: *std.Build) void {
         .forwarded = b.option([]const []const u8, "make-arg", "Allowlisted NAME=VALUE tool/flag assignment; may be repeated") orelse &.{},
     };
 
-    canonicalizeMakePaths(b.allocator, b.graph.io, &options) catch |err| {
-        validation_message = b.fmt(
-            "unable to canonicalize a Make-facing path immediately before delegation: {s}",
-            .{@errorName(err)},
-        );
-    };
     if (validation_message == null) {
         validation_message = validatePaths(b, root, options, output_result);
     }
@@ -220,6 +203,42 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    const native_config_tool = b.addExecutable(.{
+        .name = "unikraft-native-config",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-config-tool.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const inspect_config = b.addRunArtifact(native_config_tool);
+    inspect_config.addArgs(&.{ "inspect", context.config });
+    inspect_config.setCwd(.{ .cwd_relative = root });
+    const inspect_config_step = b.step(
+        "config-inspect",
+        "Parse configuration and print the native architecture/platform selection",
+    );
+    inspect_config_step.dependOn(&inspect_config.step);
+
+    const validate_config = b.addRunArtifact(native_config_tool);
+    validate_config.addArgs(&.{ "validate", context.config });
+    validate_config.setCwd(.{ .cwd_relative = root });
+    const validate_config_step = b.step(
+        "config-validate",
+        "Parse and validate native configuration invariants without solving Kconfig",
+    );
+    validate_config_step.dependOn(&validate_config.step);
+
+    const header_path = context.headerPath() catch @panic("out of memory");
+    const generate_config_header = b.addRunArtifact(native_config_tool);
+    generate_config_header.addArgs(&.{ "header", context.config, header_path });
+    generate_config_header.setCwd(.{ .cwd_relative = root });
+    const generate_config_header_step = b.step(
+        "config-header",
+        "Generate include/uk/bits/config.h directly from an existing solved .config",
+    );
+    generate_config_header_step.dependOn(&generate_config_header.step);
+
     for (targets) |target| {
         const step = b.step(target.name, target.description);
         if (isDestructiveTarget(target.name)) {
@@ -263,9 +282,29 @@ pub fn build(b: *std.Build) void {
     });
     const run_runner_tests = b.addRunArtifact(runner_tests);
     run_runner_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
-    const test_step = b.step("test", "Test facade path and Make argument construction");
+    const native_config_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-config-tests.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_native_config_tests = b.addRunArtifact(native_config_tests);
+    run_native_config_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const context_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/build-context.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_context_tests = b.addRunArtifact(context_tests);
+    run_context_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const test_step = b.step("test", "Test facade and native configuration support");
     test_step.dependOn(&run_facade_tests.step);
     test_step.dependOn(&run_runner_tests.step);
+    test_step.dependOn(&run_native_config_tests.step);
+    test_step.dependOn(&run_context_tests.step);
     const runner_link_targets = [_]struct {
         name: []const u8,
         query: std.Target.Query,
@@ -306,6 +345,26 @@ fn addFailedTargets(b: *std.Build, message: []const u8) void {
             b.default_step = step;
         }
     }
+    const native_targets = [_]struct {
+        name: []const u8,
+        description: []const u8,
+    }{
+        .{
+            .name = "config-inspect",
+            .description = "Parse configuration and print the native architecture/platform selection",
+        },
+        .{
+            .name = "config-validate",
+            .description = "Parse and validate native configuration invariants without solving Kconfig",
+        },
+        .{
+            .name = "config-header",
+            .description = "Generate include/uk/bits/config.h directly from an existing solved .config",
+        },
+    };
+    for (native_targets) |target| {
+        b.step(target.name, target.description).dependOn(&fail.step);
+    }
 }
 
 fn resolveOptionalPath(
@@ -336,7 +395,16 @@ fn resolvePathList(
     for (values) |path| {
         resolved.append(resolvePath(allocator, root, path)) catch @panic("out of memory");
     }
+
     return std.mem.join(allocator, ":", resolved.items) catch @panic("out of memory");
+}
+
+fn joinPathList(
+    allocator: std.mem.Allocator,
+    paths: []const []const u8,
+) ?[]const u8 {
+    if (paths.len == 0) return null;
+    return std.mem.join(allocator, ":", paths) catch @panic("out of memory");
 }
 
 fn canonicalizeMakePaths(
