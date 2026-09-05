@@ -306,6 +306,14 @@ pub const RegisteredArtifact = struct {
     condition: Condition = .always,
 };
 
+pub const LinkProvenance = enum {
+    library_local,
+    each_library,
+    platform,
+    global,
+    direct,
+};
+
 pub const Dependency = union(enum) {
     file: []const u8,
     generated_output: []const u8,
@@ -408,6 +416,7 @@ pub const LibrarySpec = struct {
     custom_link_dependencies: []const RegisteredArtifact = &.{},
     linker_scripts: []const RegisteredArtifact = &.{},
     sources: []const Source = &.{},
+    object_pipeline: ?LibraryObjectPipeline = null,
 };
 
 pub const Library = LibrarySpec;
@@ -418,7 +427,10 @@ pub const ArtifactReference = union(enum) {
     path: []const u8,
     generated_output: []const u8,
     component_output: ComponentOutput,
+    library_partial_output: []const u8,
+    library_final_object: []const u8,
     stage_output: StageOutput,
+    post_process_output: PostProcessOutput,
 
     pub const ComponentOutput = struct {
         component: []const u8,
@@ -429,9 +441,15 @@ pub const ArtifactReference = union(enum) {
         platform: []const u8,
         stage: []const u8,
     };
+
+    pub const PostProcessOutput = struct {
+        platform: []const u8,
+        transformation: []const u8,
+        output: []const u8,
+    };
 };
 
-pub const LinkInputKind = enum {
+pub const LinkArtifactKind = enum {
     object,
     archive,
     linker_script,
@@ -439,9 +457,31 @@ pub const LinkInputKind = enum {
     custom_link_dependency,
 };
 
-pub const LinkInput = struct {
-    kind: LinkInputKind,
+pub const LinkArtifact = struct {
+    kind: LinkArtifactKind,
     artifact: ArtifactReference,
+    provenance: LinkProvenance = .direct,
+};
+
+pub const ToolModeFlag = struct {
+    driver: ?[]const u8,
+    raw: ?[]const u8,
+
+    pub fn forMode(self: ToolModeFlag, mode: PartialLinkMode) ?[]const u8 {
+        return switch (mode) {
+            .driver => self.driver,
+            .raw => self.raw,
+        };
+    }
+};
+
+pub const LinkSequenceItem = union(enum) {
+    artifact: LinkArtifact,
+    literal_flag: []const u8,
+    tool_mode_flag: ToolModeFlag,
+    group_start,
+    group_end,
+    library_argument: []const u8,
 };
 
 pub const LinkTransformation = union(enum) {
@@ -455,28 +495,85 @@ pub const LinkStage = struct {
     name: []const u8,
     transformation: LinkTransformation,
     output: []const u8,
+    output_role: ArtifactRole = .intermediate,
     condition: Condition = .always,
-    inputs: []const LinkInput = &.{},
-    flags: []const []const u8 = &.{},
+    sequence: []const LinkSequenceItem = &.{},
+};
+
+pub const SymbolTransformAction = enum {
+    keep_global,
+    localize,
+};
+
+pub const SymbolTransform = struct {
+    action: SymbolTransformAction,
+    symbols_file: []const u8,
+    provenance: LinkProvenance,
+    condition: Condition = .always,
+};
+
+pub const ObjectTransformItem = union(enum) {
+    symbol_file: SymbolTransform,
+    literal_flag: []const u8,
+};
+
+pub const LibraryObjectTransform = struct {
+    input: ArtifactReference,
+    output: []const u8,
+    sequence: []const ObjectTransformItem = &.{},
+};
+
+pub const LibraryObjectPipeline = struct {
+    partial_link_output: []const u8,
+    partial_link_sequence: []const LinkSequenceItem,
+    transform: LibraryObjectTransform,
 };
 
 pub const PostProcessKind = union(enum) {
     strip,
+    objcopy_binary,
     symbols,
     bootinfo,
     multiboot,
     efi,
     linux_header,
+    gzip,
     compile_database,
     custom: []const u8,
 };
 
-pub const PostProcessArtifact = struct {
+pub const ArtifactRole = enum {
+    image,
+    debug,
+    auxiliary,
+    side,
+    intermediate,
+};
+
+pub const PostProcessEffect = union(enum) {
+    create: Created,
+    mutate_input: Mutated,
+
+    pub const Created = struct {
+        name: []const u8,
+        path: []const u8,
+        role: ArtifactRole,
+    };
+
+    pub const Mutated = struct {
+        name: []const u8,
+        role: ArtifactRole,
+        input_index: usize = 0,
+    };
+};
+
+pub const PostProcessTransformation = struct {
     name: []const u8,
     kind: PostProcessKind,
     input: ArtifactReference,
-    output: []const u8,
+    additional_inputs: []const ArtifactReference = &.{},
     condition: Condition = .always,
+    effects: []const PostProcessEffect,
 };
 
 pub const PlatformSpec = struct {
@@ -490,7 +587,7 @@ pub const PlatformSpec = struct {
     linker_scripts: []const ArtifactReference = &.{},
     custom_link_dependencies: []const ArtifactReference = &.{},
     link_stages: []const LinkStage = &.{},
-    post_process: []const PostProcessArtifact = &.{},
+    post_process: []const PostProcessTransformation = &.{},
 };
 
 pub const Platform = PlatformSpec;
@@ -655,10 +752,6 @@ pub const BuildContext = struct {
 
     pub fn finalize(self: *BuildContext) ValidationError!FinalizedGraph {
         self.diagnostic = null;
-        try self.validateLibraries();
-        try self.validatePlatforms();
-        try self.validateOutputs();
-
         var selected_index: ?usize = null;
         for (self.platforms.items, 0..) |platform, index| {
             if (!platform.enable.matches(self.config)) continue;
@@ -675,6 +768,10 @@ pub const BuildContext = struct {
             try self.setDiagnostic("no platform is selected; exactly one platform must be enabled", .{});
             return error.NoSelectedPlatform;
         }
+
+        try self.validateLibraries();
+        try self.validatePlatforms(selected_index.?);
+        try self.validateOutputs(selected_index.?);
 
         self.finalized = true;
         return .{
@@ -748,9 +845,18 @@ pub const BuildContext = struct {
                 }
             }
             for (library.dependencies) |dependency| {
-                if (self.findLibrary(dependency.name) == null) {
+                if (!library.enable.matches(self.config) or
+                    !dependency.condition.matches(self.config)) continue;
+                const dependency_index = self.findLibrary(dependency.name) orelse {
                     try self.setDiagnostic(
                         "library '{s}' depends on unknown library '{s}'",
+                        .{ library.name, dependency.name },
+                    );
+                    return error.InvalidReference;
+                };
+                if (!self.libraries.items[dependency_index].enable.matches(self.config)) {
+                    try self.setDiagnostic(
+                        "active library '{s}' depends on inactive library '{s}'",
                         .{ library.name, dependency.name },
                     );
                     return error.InvalidReference;
@@ -759,6 +865,155 @@ pub const BuildContext = struct {
             for (library.sources) |source| {
                 try self.validateSource(library, source);
             }
+            if (library.object_pipeline) |pipeline| {
+                try self.validateLibraryPipeline(library, pipeline);
+            }
+        }
+    }
+
+    fn validateLibraryPipeline(
+        self: *BuildContext,
+        library: Library,
+        pipeline: LibraryObjectPipeline,
+    ) ValidationError!void {
+        if (pipeline.partial_link_output.len == 0 or pipeline.transform.output.len == 0) {
+            try self.setDiagnostic(
+                "library '{s}' object pipeline has an empty partial or final output",
+                .{library.name},
+            );
+            return error.InvalidModel;
+        }
+        switch (pipeline.transform.input) {
+            .library_partial_output => |name| {
+                if (!std.mem.eql(u8, name, library.name)) {
+                    try self.setDiagnostic(
+                        "library '{s}' object transform must consume its own partial-link output",
+                        .{library.name},
+                    );
+                    return error.InvalidReference;
+                }
+            },
+            else => {
+                try self.setDiagnostic(
+                    "library '{s}' object transform input must be a typed library partial output",
+                    .{library.name},
+                );
+                return error.InvalidReference;
+            },
+        }
+        try self.validateLinkSequence(
+            library.name,
+            null,
+            0,
+            pipeline.partial_link_sequence,
+            library.enable.matches(self.config),
+        );
+        for (pipeline.partial_link_sequence) |item| {
+            if (item != .artifact) continue;
+            switch (item.artifact.artifact) {
+                .library_partial_output, .library_final_object => |name| {
+                    if (std.mem.eql(u8, name, library.name)) {
+                        try self.setDiagnostic(
+                            "library '{s}' partial link cannot consume its own intermediate or final output",
+                            .{library.name},
+                        );
+                        return error.InvalidReference;
+                    }
+                },
+                else => {},
+            }
+        }
+        for (pipeline.transform.sequence) |item| {
+            switch (item) {
+                .symbol_file => |symbol| {
+                    if (symbol.symbols_file.len == 0) {
+                        try self.setDiagnostic(
+                            "library '{s}' has an empty symbol transform file",
+                            .{library.name},
+                        );
+                        return error.InvalidModel;
+                    }
+                },
+                .literal_flag => |flag| {
+                    if (flag.len == 0) {
+                        try self.setDiagnostic(
+                            "library '{s}' has an empty objcopy flag",
+                            .{library.name},
+                        );
+                        return error.InvalidModel;
+                    }
+                },
+            }
+        }
+    }
+
+    fn validateLinkSequence(
+        self: *BuildContext,
+        owner: []const u8,
+        current_platform: ?[]const u8,
+        before_stage_index: usize,
+        sequence: []const LinkSequenceItem,
+        validate_references: bool,
+    ) ValidationError!void {
+        var group_depth: usize = 0;
+        for (sequence) |item| {
+            switch (item) {
+                .artifact => |artifact| {
+                    if (validate_references) {
+                        try self.validateArtifactReference(
+                            current_platform,
+                            before_stage_index,
+                            0,
+                            artifact.artifact,
+                        );
+                    }
+                },
+                .literal_flag => |flag| {
+                    if (flag.len == 0) {
+                        try self.setDiagnostic(
+                            "link sequence '{s}' contains an empty literal flag",
+                            .{owner},
+                        );
+                        return error.InvalidModel;
+                    }
+                },
+                .tool_mode_flag => |flag| {
+                    if (flag.driver == null and flag.raw == null) {
+                        try self.setDiagnostic(
+                            "link sequence '{s}' has a tool-mode flag with no representation",
+                            .{owner},
+                        );
+                        return error.InvalidModel;
+                    }
+                },
+                .group_start => group_depth += 1,
+                .group_end => {
+                    if (group_depth == 0) {
+                        try self.setDiagnostic(
+                            "link sequence '{s}' closes an archive group before opening one",
+                            .{owner},
+                        );
+                        return error.InvalidModel;
+                    }
+                    group_depth -= 1;
+                },
+                .library_argument => |argument| {
+                    if (argument.len == 0) {
+                        try self.setDiagnostic(
+                            "link sequence '{s}' contains an empty library argument",
+                            .{owner},
+                        );
+                        return error.InvalidModel;
+                    }
+                },
+            }
+        }
+        if (group_depth != 0) {
+            try self.setDiagnostic(
+                "link sequence '{s}' has an unterminated archive group",
+                .{owner},
+            );
+            return error.InvalidModel;
         }
     }
 
@@ -785,6 +1040,8 @@ pub const BuildContext = struct {
             return error.InvalidModel;
         }
         try self.validatePreprocess(library.name, source.name, "source", source.preprocess);
+        const source_active = library.enable.matches(self.config) and
+            source.condition.matches(self.config);
         for (source.variants, 0..) |variant, index| {
             for (source.variants[0..index]) |previous| {
                 if (previous.name.eql(variant.name)) {
@@ -796,14 +1053,24 @@ pub const BuildContext = struct {
                 }
             }
             try self.validatePreprocess(library.name, source.name, "variant", variant.preprocess);
-            try self.validateDependencies(library.name, source.name, variant.dependencies);
+            if (source_active and variant.condition.matches(self.config)) {
+                try self.validateDependencies(library.name, source.name, variant.dependencies);
+            }
             for (variant.preprocess) |step| {
-                try self.validateDependencies(library.name, source.name, step.dependencies);
+                if (source_active and variant.condition.matches(self.config) and
+                    step.condition.matches(self.config))
+                {
+                    try self.validateDependencies(library.name, source.name, step.dependencies);
+                }
             }
         }
-        try self.validateDependencies(library.name, source.name, source.dependencies);
+        if (source_active) {
+            try self.validateDependencies(library.name, source.name, source.dependencies);
+        }
         for (source.preprocess) |step| {
-            try self.validateDependencies(library.name, source.name, step.dependencies);
+            if (source_active and step.condition.matches(self.config)) {
+                try self.validateDependencies(library.name, source.name, step.dependencies);
+            }
         }
     }
 
@@ -844,16 +1111,23 @@ pub const BuildContext = struct {
             switch (dependency) {
                 .file => {},
                 .component => |name| {
-                    if (self.findLibrary(name) == null) {
+                    const dependency_index = self.findLibrary(name) orelse {
                         try self.setDiagnostic(
                             "library '{s}' source '{s}' references unknown component dependency '{s}'",
+                            .{ library_name, source_name, name },
+                        );
+                        return error.InvalidReference;
+                    };
+                    if (!self.libraries.items[dependency_index].enable.matches(self.config)) {
+                        try self.setDiagnostic(
+                            "library '{s}' source '{s}' references inactive component '{s}'",
                             .{ library_name, source_name, name },
                         );
                         return error.InvalidReference;
                     }
                 },
                 .generated_output => |path| {
-                    if (!self.isGeneratedOutput(path)) {
+                    if (!self.isGeneratedOutputActive(path)) {
                         try self.setDiagnostic(
                             "library '{s}' source '{s}' references unknown generated output '{s}'",
                             .{ library_name, source_name, path },
@@ -865,30 +1139,11 @@ pub const BuildContext = struct {
         }
     }
 
-    fn validatePlatforms(self: *BuildContext) ValidationError!void {
-        for (self.platforms.items) |platform| {
+    fn validatePlatforms(self: *BuildContext, selected_platform_index: usize) ValidationError!void {
+        for (self.platforms.items, 0..) |platform, platform_index| {
             if (platform.name.len == 0) {
                 try self.setDiagnostic("platform names cannot be empty", .{});
                 return error.InvalidModel;
-            }
-            for (platform.libraries) |library_name| {
-                const library_index = self.findLibrary(library_name) orelse {
-                    try self.setDiagnostic(
-                        "platform '{s}' references unknown library '{s}'",
-                        .{ platform.name, library_name },
-                    );
-                    return error.InvalidReference;
-                };
-                const library = self.libraries.items[library_index];
-                if (library.kind != .platform_library or
-                    !containsString(library.platforms, platform.name))
-                {
-                    try self.setDiagnostic(
-                        "platform '{s}' and library '{s}' have conflicting platform-library registrations",
-                        .{ platform.name, library_name },
-                    );
-                    return error.ConflictingRegistration;
-                }
             }
             for (platform.libraries, 0..) |library_name, index| {
                 if (containsString(platform.libraries[0..index], library_name)) {
@@ -897,6 +1152,34 @@ pub const BuildContext = struct {
                         .{ platform.name, library_name },
                     );
                     return error.DuplicateName;
+                }
+            }
+            if (platform_index == selected_platform_index) {
+                for (platform.libraries) |library_name| {
+                    const library_index = self.findLibrary(library_name) orelse {
+                        try self.setDiagnostic(
+                            "selected platform '{s}' references unknown library '{s}'",
+                            .{ platform.name, library_name },
+                        );
+                        return error.InvalidReference;
+                    };
+                    const library = self.libraries.items[library_index];
+                    if (library.kind != .platform_library or
+                        !containsString(library.platforms, platform.name))
+                    {
+                        try self.setDiagnostic(
+                            "platform '{s}' and library '{s}' have conflicting platform-library registrations",
+                            .{ platform.name, library_name },
+                        );
+                        return error.ConflictingRegistration;
+                    }
+                    if (!library.enable.matches(self.config)) {
+                        try self.setDiagnostic(
+                            "selected platform '{s}' registers inactive platform library '{s}'",
+                            .{ platform.name, library_name },
+                        );
+                        return error.InvalidReference;
+                    }
                 }
             }
             for (platform.link_stages, 0..) |stage, stage_index| {
@@ -909,54 +1192,124 @@ pub const BuildContext = struct {
                         return error.DuplicateName;
                     }
                 }
-                for (stage.inputs) |input| {
-                    try self.validateArtifactReference(platform.name, stage_index, input.artifact);
+                if (platform_index == selected_platform_index and
+                    stage.condition.matches(self.config))
+                {
+                    try self.validateLinkSequence(
+                        stage.name,
+                        platform.name,
+                        stage_index,
+                        stage.sequence,
+                        true,
+                    );
                 }
             }
-            for (platform.post_process, 0..) |artifact, index| {
+            for (platform.post_process, 0..) |transformation, index| {
                 for (platform.post_process[0..index]) |previous| {
-                    if (std.mem.eql(u8, previous.name, artifact.name)) {
+                    if (std.mem.eql(u8, previous.name, transformation.name)) {
                         try self.setDiagnostic(
                             "platform '{s}' repeats post-processing name '{s}'",
-                            .{ platform.name, artifact.name },
+                            .{ platform.name, transformation.name },
                         );
                         return error.DuplicateName;
                     }
                 }
-                try self.validateArtifactReference(
-                    platform.name,
-                    platform.link_stages.len,
-                    artifact.input,
-                );
+                if (transformation.effects.len == 0) {
+                    try self.setDiagnostic(
+                        "platform '{s}' post-processing '{s}' declares no outputs or mutation",
+                        .{ platform.name, transformation.name },
+                    );
+                    return error.InvalidModel;
+                }
+                for (transformation.effects, 0..) |effect, effect_index| {
+                    const effect_name = postEffectName(effect);
+                    if (effect_name.len == 0) {
+                        try self.setDiagnostic(
+                            "platform '{s}' post-processing '{s}' has an unnamed output",
+                            .{ platform.name, transformation.name },
+                        );
+                        return error.InvalidModel;
+                    }
+                    switch (effect) {
+                        .create => |created| {
+                            if (created.path.len == 0) {
+                                try self.setDiagnostic(
+                                    "platform '{s}' post-processing '{s}' has an empty output path",
+                                    .{ platform.name, transformation.name },
+                                );
+                                return error.InvalidModel;
+                            }
+                        },
+                        .mutate_input => |mutated| {
+                            if (mutated.input_index > transformation.additional_inputs.len) {
+                                try self.setDiagnostic(
+                                    "platform '{s}' post-processing '{s}' mutates missing input index {d}",
+                                    .{ platform.name, transformation.name, mutated.input_index },
+                                );
+                                return error.InvalidReference;
+                            }
+                        },
+                    }
+                    for (transformation.effects[0..effect_index]) |previous| {
+                        if (std.mem.eql(u8, postEffectName(previous), effect_name)) {
+                            try self.setDiagnostic(
+                                "platform '{s}' post-processing '{s}' repeats output name '{s}'",
+                                .{ platform.name, transformation.name, effect_name },
+                            );
+                            return error.DuplicateName;
+                        }
+                    }
+                }
+                if (platform_index == selected_platform_index and
+                    transformation.condition.matches(self.config))
+                {
+                    try self.validateArtifactReference(
+                        platform.name,
+                        platform.link_stages.len,
+                        index,
+                        transformation.input,
+                    );
+                    for (transformation.additional_inputs) |input| {
+                        try self.validateArtifactReference(
+                            platform.name,
+                            platform.link_stages.len,
+                            index,
+                            input,
+                        );
+                    }
+                }
             }
-            for (platform.object_inputs) |artifact| {
-                try self.validateArtifactReference(platform.name, platform.link_stages.len, artifact);
-            }
-            for (platform.archive_inputs) |artifact| {
-                try self.validateArtifactReference(platform.name, platform.link_stages.len, artifact);
-            }
-            for (platform.linker_scripts) |artifact| {
-                try self.validateArtifactReference(platform.name, platform.link_stages.len, artifact);
-            }
-            for (platform.custom_link_dependencies) |artifact| {
-                try self.validateArtifactReference(platform.name, platform.link_stages.len, artifact);
+            if (platform_index == selected_platform_index) {
+                for (platform.object_inputs) |artifact| {
+                    try self.validateArtifactReference(platform.name, platform.link_stages.len, 0, artifact);
+                }
+                for (platform.archive_inputs) |artifact| {
+                    try self.validateArtifactReference(platform.name, platform.link_stages.len, 0, artifact);
+                }
+                for (platform.linker_scripts) |artifact| {
+                    try self.validateArtifactReference(platform.name, platform.link_stages.len, 0, artifact);
+                }
+                for (platform.custom_link_dependencies) |artifact| {
+                    try self.validateArtifactReference(platform.name, platform.link_stages.len, 0, artifact);
+                }
             }
         }
     }
 
     fn validateArtifactReference(
         self: *BuildContext,
-        current_platform: []const u8,
+        current_platform: ?[]const u8,
         before_stage_index: usize,
+        before_post_process_index: usize,
         reference: ArtifactReference,
     ) ValidationError!void {
         switch (reference) {
             .path => {},
             .generated_output => |path| {
-                if (!self.isGeneratedOutput(path)) {
+                if (!self.isGeneratedOutputActive(path)) {
                     try self.setDiagnostic(
-                        "platform '{s}' references unknown generated output '{s}'",
-                        .{ current_platform, path },
+                        "active link pipeline references unknown generated output '{s}'",
+                        .{path},
                     );
                     return error.InvalidReference;
                 }
@@ -964,24 +1317,51 @@ pub const BuildContext = struct {
             .component_output => |output| {
                 const library_index = self.findLibrary(output.component) orelse {
                     try self.setDiagnostic(
-                        "platform '{s}' references output from unknown library '{s}'",
-                        .{ current_platform, output.component },
+                        "active link pipeline references output from unknown library '{s}'",
+                        .{output.component},
                     );
                     return error.InvalidReference;
                 };
-                if (!libraryProduces(self.libraries.items[library_index], output.path)) {
+                const library = self.libraries.items[library_index];
+                if (!library.enable.matches(self.config) or
+                    !self.libraryProducesActive(library, output.path))
+                {
                     try self.setDiagnostic(
-                        "platform '{s}' references undeclared output '{s}' from library '{s}'",
-                        .{ current_platform, output.path, output.component },
+                        "active link pipeline references unavailable output '{s}' from library '{s}'",
+                        .{ output.path, output.component },
+                    );
+                    return error.InvalidReference;
+                }
+            },
+            .library_partial_output, .library_final_object => |component| {
+                const library_index = self.findLibrary(component) orelse {
+                    try self.setDiagnostic(
+                        "active link pipeline references object pipeline from unknown library '{s}'",
+                        .{component},
+                    );
+                    return error.InvalidReference;
+                };
+                const library = self.libraries.items[library_index];
+                if (!library.enable.matches(self.config) or library.object_pipeline == null) {
+                    try self.setDiagnostic(
+                        "active link pipeline references unavailable object pipeline from library '{s}'",
+                        .{component},
                     );
                     return error.InvalidReference;
                 }
             },
             .stage_output => |output| {
-                if (!std.mem.eql(u8, output.platform, current_platform)) {
+                const platform_name = current_platform orelse {
+                    try self.setDiagnostic(
+                        "library object pipelines cannot reference platform stage '{s}'",
+                        .{output.stage},
+                    );
+                    return error.InvalidReference;
+                };
+                if (!std.mem.eql(u8, output.platform, platform_name)) {
                     try self.setDiagnostic(
                         "platform '{s}' cannot consume stage output from platform '{s}'",
-                        .{ current_platform, output.platform },
+                        .{ platform_name, output.platform },
                     );
                     return error.InvalidReference;
                 }
@@ -1000,10 +1380,53 @@ pub const BuildContext = struct {
                         break;
                     }
                 }
-                if (found == null or found.? >= before_stage_index) {
+                if (found == null or found.? >= before_stage_index or
+                    !stages[found.?].condition.matches(self.config))
+                {
                     try self.setDiagnostic(
                         "platform '{s}' stage reference '{s}' must name an earlier stage",
-                        .{ current_platform, output.stage },
+                        .{ platform_name, output.stage },
+                    );
+                    return error.InvalidReference;
+                }
+            },
+            .post_process_output => |output| {
+                const platform_name = current_platform orelse {
+                    try self.setDiagnostic(
+                        "library object pipelines cannot reference post-processing output '{s}'",
+                        .{output.output},
+                    );
+                    return error.InvalidReference;
+                };
+                if (!std.mem.eql(u8, output.platform, platform_name)) {
+                    try self.setDiagnostic(
+                        "platform '{s}' cannot consume post-processing output from platform '{s}'",
+                        .{ platform_name, output.platform },
+                    );
+                    return error.InvalidReference;
+                }
+                const platform_index = self.findPlatform(output.platform) orelse {
+                    try self.setDiagnostic(
+                        "post-processing reference names unknown platform '{s}'",
+                        .{output.platform},
+                    );
+                    return error.InvalidReference;
+                };
+                const transformations = self.platforms.items[platform_index].post_process;
+                var found: ?usize = null;
+                for (transformations, 0..) |transformation, index| {
+                    if (std.mem.eql(u8, transformation.name, output.transformation)) {
+                        found = index;
+                        break;
+                    }
+                }
+                if (found == null or found.? >= before_post_process_index or
+                    !transformations[found.?].condition.matches(self.config) or
+                    !postEffectExists(transformations[found.?], output.output))
+                {
+                    try self.setDiagnostic(
+                        "platform '{s}' post-processing reference '{s}.{s}' must name an earlier active output",
+                        .{ platform_name, output.transformation, output.output },
                     );
                     return error.InvalidReference;
                 }
@@ -1011,27 +1434,72 @@ pub const BuildContext = struct {
         }
     }
 
-    fn validateOutputs(self: *BuildContext) ValidationError!void {
+    fn validateOutputs(
+        self: *BuildContext,
+        selected_platform_index: usize,
+    ) ValidationError!void {
         var outputs = std.array_list.Managed([]const u8).init(self.allocator);
         defer outputs.deinit();
 
         for (self.libraries.items) |library| {
-            for (library.archives) |artifact| try self.recordOutput(&outputs, artifact.path);
-            for (library.raw_objects) |artifact| try self.recordOutput(&outputs, artifact.path);
+            if (!library.enable.matches(self.config)) continue;
+            for (library.archives) |artifact| {
+                if (artifact.condition.matches(self.config)) {
+                    try self.recordOutput(&outputs, artifact.path);
+                }
+            }
+            for (library.raw_objects) |artifact| {
+                if (artifact.condition.matches(self.config)) {
+                    try self.recordOutput(&outputs, artifact.path);
+                }
+            }
             for (library.sources) |source| {
-                for (source.preprocess) |step| try self.recordOutput(&outputs, step.output);
+                if (!source.condition.matches(self.config)) continue;
+                for (source.preprocess) |step| {
+                    if (step.condition.matches(self.config)) {
+                        try self.recordOutput(&outputs, step.output);
+                    }
+                }
                 for (source.variants) |variant| {
-                    for (variant.preprocess) |step| try self.recordOutput(&outputs, step.output);
+                    if (!variant.condition.matches(self.config)) continue;
+                    for (variant.preprocess) |step| {
+                        if (step.condition.matches(self.config)) {
+                            try self.recordOutput(&outputs, step.output);
+                        }
+                    }
                     if (variant.output) |output| {
                         if (output.kind != .no_op) try self.recordOutput(&outputs, output.path);
                         if (output.dependency_file) |path| try self.recordOutput(&outputs, path);
                     }
                 }
             }
+            if (library.object_pipeline) |pipeline| {
+                try self.recordOutput(&outputs, pipeline.partial_link_output);
+                try self.recordOutput(&outputs, pipeline.transform.output);
+            }
         }
-        for (self.platforms.items) |platform| {
-            for (platform.link_stages) |stage| try self.recordOutput(&outputs, stage.output);
-            for (platform.post_process) |artifact| try self.recordOutput(&outputs, artifact.output);
+        const platform = self.platforms.items[selected_platform_index];
+        for (platform.link_stages) |stage| {
+            if (stage.condition.matches(self.config)) {
+                try self.recordOutput(&outputs, stage.output);
+            }
+        }
+        for (platform.post_process) |transformation| {
+            if (!transformation.condition.matches(self.config)) continue;
+            for (transformation.effects) |effect| {
+                switch (effect) {
+                    .create => |created| try self.recordOutput(&outputs, created.path),
+                    .mutate_input => |mutated| {
+                        if (mutated.name.len == 0) {
+                            try self.setDiagnostic(
+                                "platform '{s}' post-processing '{s}' has an unnamed in-place output",
+                                .{ platform.name, transformation.name },
+                            );
+                            return error.InvalidModel;
+                        }
+                    },
+                }
+            }
         }
     }
 
@@ -1053,21 +1521,63 @@ pub const BuildContext = struct {
         outputs.append(path) catch return error.OutOfMemory;
     }
 
-    fn isGeneratedOutput(self: BuildContext, path: []const u8) bool {
+    fn isGeneratedOutputActive(self: BuildContext, path: []const u8) bool {
         for (self.libraries.items) |library| {
+            if (!library.enable.matches(self.config)) continue;
             for (library.sources) |source| {
+                if (!source.condition.matches(self.config)) continue;
                 for (source.preprocess) |step| {
-                    if (std.mem.eql(u8, step.output, path)) return true;
+                    if (step.condition.matches(self.config) and
+                        std.mem.eql(u8, step.output, path)) return true;
                 }
                 for (source.variants) |variant| {
+                    if (!variant.condition.matches(self.config)) continue;
                     for (variant.preprocess) |step| {
-                        if (std.mem.eql(u8, step.output, path)) return true;
+                        if (step.condition.matches(self.config) and
+                            std.mem.eql(u8, step.output, path)) return true;
                     }
                     if (variant.output) |output| {
                         if (output.kind == .generated and std.mem.eql(u8, output.path, path)) return true;
                     }
                 }
             }
+        }
+        return false;
+    }
+
+    fn libraryProducesActive(
+        self: BuildContext,
+        library: Library,
+        path: []const u8,
+    ) bool {
+        for (library.archives) |artifact| {
+            if (artifact.condition.matches(self.config) and
+                std.mem.eql(u8, artifact.path, path)) return true;
+        }
+        for (library.raw_objects) |artifact| {
+            if (artifact.condition.matches(self.config) and
+                std.mem.eql(u8, artifact.path, path)) return true;
+        }
+        for (library.sources) |source| {
+            if (!source.condition.matches(self.config)) continue;
+            for (source.preprocess) |step| {
+                if (step.condition.matches(self.config) and
+                    std.mem.eql(u8, step.output, path)) return true;
+            }
+            for (source.variants) |variant| {
+                if (!variant.condition.matches(self.config)) continue;
+                for (variant.preprocess) |step| {
+                    if (step.condition.matches(self.config) and
+                        std.mem.eql(u8, step.output, path)) return true;
+                }
+                if (variant.output) |output| {
+                    if (std.mem.eql(u8, output.path, path)) return true;
+                }
+            }
+        }
+        if (library.object_pipeline) |pipeline| {
+            if (std.mem.eql(u8, pipeline.partial_link_output, path) or
+                std.mem.eql(u8, pipeline.transform.output, path)) return true;
         }
         return false;
     }
@@ -1097,6 +1607,23 @@ fn containsString(values: []const []const u8, wanted: []const u8) bool {
     return false;
 }
 
+fn postEffectName(effect: PostProcessEffect) []const u8 {
+    return switch (effect) {
+        .create => |created| created.name,
+        .mutate_input => |mutated| mutated.name,
+    };
+}
+
+fn postEffectExists(
+    transformation: PostProcessTransformation,
+    wanted: []const u8,
+) bool {
+    for (transformation.effects) |effect| {
+        if (std.mem.eql(u8, postEffectName(effect), wanted)) return true;
+    }
+    return false;
+}
+
 fn libraryProduces(library: Library, path: []const u8) bool {
     for (library.archives) |artifact| {
         if (std.mem.eql(u8, artifact.path, path)) return true;
@@ -1116,6 +1643,10 @@ fn libraryProduces(library: Library, path: []const u8) bool {
                 if (std.mem.eql(u8, output.path, path)) return true;
             }
         }
+    }
+    if (library.object_pipeline) |pipeline| {
+        if (std.mem.eql(u8, pipeline.partial_link_output, path) or
+            std.mem.eql(u8, pipeline.transform.output, path)) return true;
     }
     return false;
 }
@@ -1139,9 +1670,31 @@ fn copyTarget(allocator: std.mem.Allocator, target: Target) !Target {
 }
 
 fn copyTool(allocator: std.mem.Allocator, tool: Tool) !Tool {
+    const command = try allocator.dupe(u8, tool.command);
+    errdefer allocator.free(command);
     return .{
-        .command = try allocator.dupe(u8, tool.command),
-        .version = tool.version,
+        .command = command,
+        .version = if (tool.version) |version|
+            try copySemanticVersion(allocator, version)
+        else
+            null,
+    };
+}
+
+fn copySemanticVersion(
+    allocator: std.mem.Allocator,
+    version: std.SemanticVersion,
+) !std.SemanticVersion {
+    const pre = if (version.pre) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (pre) |value| allocator.free(value);
+    const build = if (version.build) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (build) |value| allocator.free(value);
+    return .{
+        .major = version.major,
+        .minor = version.minor,
+        .patch = version.patch,
+        .pre = pre,
+        .build = build,
     };
 }
 
@@ -1395,6 +1948,10 @@ fn copyLibrary(allocator: std.mem.Allocator, library: LibrarySpec) !Library {
         ),
         .linker_scripts = try copyRegisteredArtifacts(allocator, library.linker_scripts),
         .sources = try copySources(allocator, library.sources),
+        .object_pipeline = if (library.object_pipeline) |pipeline|
+            try copyLibraryObjectPipeline(allocator, pipeline)
+        else
+            null,
     };
 }
 
@@ -1409,9 +1966,20 @@ fn copyArtifactReference(
             .component = try allocator.dupe(u8, output.component),
             .path = try allocator.dupe(u8, output.path),
         } },
+        .library_partial_output => |component| .{
+            .library_partial_output = try allocator.dupe(u8, component),
+        },
+        .library_final_object => |component| .{
+            .library_final_object = try allocator.dupe(u8, component),
+        },
         .stage_output => |output| .{ .stage_output = .{
             .platform = try allocator.dupe(u8, output.platform),
             .stage = try allocator.dupe(u8, output.stage),
+        } },
+        .post_process_output => |output| .{ .post_process_output = .{
+            .platform = try allocator.dupe(u8, output.platform),
+            .transformation = try allocator.dupe(u8, output.transformation),
+            .output = try allocator.dupe(u8, output.output),
         } },
     };
 }
@@ -1439,26 +2007,87 @@ fn copyLinkTransformation(
     };
 }
 
+fn copyToolModeFlag(allocator: std.mem.Allocator, flag: ToolModeFlag) !ToolModeFlag {
+    return .{
+        .driver = if (flag.driver) |value| try allocator.dupe(u8, value) else null,
+        .raw = if (flag.raw) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn copyLinkSequence(
+    allocator: std.mem.Allocator,
+    sequence: []const LinkSequenceItem,
+) ![]const LinkSequenceItem {
+    const result = try allocator.alloc(LinkSequenceItem, sequence.len);
+    for (sequence, 0..) |item, index| {
+        result[index] = switch (item) {
+            .artifact => |artifact| .{ .artifact = .{
+                .kind = artifact.kind,
+                .artifact = try copyArtifactReference(allocator, artifact.artifact),
+                .provenance = artifact.provenance,
+            } },
+            .literal_flag => |flag| .{ .literal_flag = try allocator.dupe(u8, flag) },
+            .tool_mode_flag => |flag| .{ .tool_mode_flag = try copyToolModeFlag(allocator, flag) },
+            .group_start => .group_start,
+            .group_end => .group_end,
+            .library_argument => |argument| .{
+                .library_argument = try allocator.dupe(u8, argument),
+            },
+        };
+    }
+    return result;
+}
+
 fn copyLinkStages(allocator: std.mem.Allocator, stages: []const LinkStage) ![]const LinkStage {
     const result = try allocator.alloc(LinkStage, stages.len);
     for (stages, 0..) |stage, index| {
-        const inputs = try allocator.alloc(LinkInput, stage.inputs.len);
-        for (stage.inputs, 0..) |input, input_index| {
-            inputs[input_index] = .{
-                .kind = input.kind,
-                .artifact = try copyArtifactReference(allocator, input.artifact),
-            };
-        }
         result[index] = .{
             .name = try allocator.dupe(u8, stage.name),
             .transformation = try copyLinkTransformation(allocator, stage.transformation),
             .output = try allocator.dupe(u8, stage.output),
+            .output_role = stage.output_role,
             .condition = try copyCondition(allocator, stage.condition),
-            .inputs = inputs,
-            .flags = try copyStringList(allocator, stage.flags),
+            .sequence = try copyLinkSequence(allocator, stage.sequence),
         };
     }
     return result;
+}
+
+fn copyObjectTransformSequence(
+    allocator: std.mem.Allocator,
+    sequence: []const ObjectTransformItem,
+) ![]const ObjectTransformItem {
+    const result = try allocator.alloc(ObjectTransformItem, sequence.len);
+    for (sequence, 0..) |item, index| {
+        result[index] = switch (item) {
+            .symbol_file => |symbol| .{ .symbol_file = .{
+                .action = symbol.action,
+                .symbols_file = try allocator.dupe(u8, symbol.symbols_file),
+                .provenance = symbol.provenance,
+                .condition = try copyCondition(allocator, symbol.condition),
+            } },
+            .literal_flag => |flag| .{ .literal_flag = try allocator.dupe(u8, flag) },
+        };
+    }
+    return result;
+}
+
+fn copyLibraryObjectPipeline(
+    allocator: std.mem.Allocator,
+    pipeline: LibraryObjectPipeline,
+) !LibraryObjectPipeline {
+    return .{
+        .partial_link_output = try allocator.dupe(u8, pipeline.partial_link_output),
+        .partial_link_sequence = try copyLinkSequence(allocator, pipeline.partial_link_sequence),
+        .transform = .{
+            .input = try copyArtifactReference(allocator, pipeline.transform.input),
+            .output = try allocator.dupe(u8, pipeline.transform.output),
+            .sequence = try copyObjectTransformSequence(
+                allocator,
+                pipeline.transform.sequence,
+            ),
+        },
+    };
 }
 
 fn copyPostProcessKind(
@@ -1467,28 +2096,56 @@ fn copyPostProcessKind(
 ) !PostProcessKind {
     return switch (kind) {
         .strip => .strip,
+        .objcopy_binary => .objcopy_binary,
         .symbols => .symbols,
         .bootinfo => .bootinfo,
         .multiboot => .multiboot,
         .efi => .efi,
         .linux_header => .linux_header,
+        .gzip => .gzip,
         .compile_database => .compile_database,
         .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
     };
 }
 
+fn copyPostProcessEffects(
+    allocator: std.mem.Allocator,
+    effects: []const PostProcessEffect,
+) ![]const PostProcessEffect {
+    const result = try allocator.alloc(PostProcessEffect, effects.len);
+    for (effects, 0..) |effect, index| {
+        result[index] = switch (effect) {
+            .create => |created| .{ .create = .{
+                .name = try allocator.dupe(u8, created.name),
+                .path = try allocator.dupe(u8, created.path),
+                .role = created.role,
+            } },
+            .mutate_input => |mutated| .{ .mutate_input = .{
+                .name = try allocator.dupe(u8, mutated.name),
+                .role = mutated.role,
+                .input_index = mutated.input_index,
+            } },
+        };
+    }
+    return result;
+}
+
 fn copyPostProcess(
     allocator: std.mem.Allocator,
-    artifacts: []const PostProcessArtifact,
-) ![]const PostProcessArtifact {
-    const result = try allocator.alloc(PostProcessArtifact, artifacts.len);
-    for (artifacts, 0..) |artifact, index| {
+    transformations: []const PostProcessTransformation,
+) ![]const PostProcessTransformation {
+    const result = try allocator.alloc(PostProcessTransformation, transformations.len);
+    for (transformations, 0..) |transformation, index| {
         result[index] = .{
-            .name = try allocator.dupe(u8, artifact.name),
-            .kind = try copyPostProcessKind(allocator, artifact.kind),
-            .input = try copyArtifactReference(allocator, artifact.input),
-            .output = try allocator.dupe(u8, artifact.output),
-            .condition = try copyCondition(allocator, artifact.condition),
+            .name = try allocator.dupe(u8, transformation.name),
+            .kind = try copyPostProcessKind(allocator, transformation.kind),
+            .input = try copyArtifactReference(allocator, transformation.input),
+            .additional_inputs = try copyArtifactReferences(
+                allocator,
+                transformation.additional_inputs,
+            ),
+            .condition = try copyCondition(allocator, transformation.condition),
+            .effects = try copyPostProcessEffects(allocator, transformation.effects),
         };
     }
     return result;
@@ -1518,7 +2175,16 @@ fn copyPlatform(allocator: std.mem.Allocator, platform: PlatformSpec) !Platform 
 
 fn testConfigEnabled(_: ?*const anyopaque, name: []const u8) bool {
     return std.mem.eql(u8, name, "CONFIG_PLAT_KVM") or
-        std.mem.eql(u8, name, "CONFIG_LIBUKBOOT");
+        std.mem.eql(u8, name, "CONFIG_LIBUKBOOT") or
+        std.mem.eql(u8, name, "CONFIG_KVM_BOOT_PROTO_MULTIBOOT") or
+        std.mem.eql(u8, name, "CONFIG_OPTIMIZE_SYMFILE") or
+        std.mem.eql(u8, name, "CONFIG_OPTIMIZE_COMPRESS");
+}
+
+fn testConfigEnabledXen(_: ?*const anyopaque, name: []const u8) bool {
+    return std.mem.eql(u8, name, "CONFIG_PLAT_XEN") or
+        std.mem.eql(u8, name, "CONFIG_OPTIMIZE_SYMFILE") or
+        std.mem.eql(u8, name, "CONFIG_OPTIMIZE_COMPRESS");
 }
 
 fn testConfigValue(_: ?*const anyopaque, name: []const u8) ?[]const u8 {
@@ -1529,6 +2195,13 @@ fn testConfigValue(_: ?*const anyopaque, name: []const u8) ?[]const u8 {
 fn testConfig() ConfigQuery {
     return .{
         .is_enabled_fn = testConfigEnabled,
+        .value_fn = testConfigValue,
+    };
+}
+
+fn testXenConfig() ConfigQuery {
+    return .{
+        .is_enabled_fn = testConfigEnabledXen,
         .value_fn = testConfigValue,
     };
 }
@@ -1567,8 +2240,12 @@ fn testToolchain() Toolchain {
     };
 }
 
-fn testContext() !BuildContext {
-    return BuildContext.init(std.testing.allocator, .{
+fn initTestContext(
+    allocator: std.mem.Allocator,
+    config: ConfigQuery,
+    toolchain: Toolchain,
+) !BuildContext {
+    return BuildContext.init(allocator, .{
         .roots = .{
             .base = "/src/unikraft",
             .app = "/src/app",
@@ -1581,11 +2258,23 @@ fn testContext() !BuildContext {
             .abi = "none",
             .triple = "x86_64-unknown-none",
         },
-        .toolchain = testToolchain(),
+        .toolchain = toolchain,
         .global_flags = .{ .common = &.{"-ffreestanding"} },
         .global_includes = &.{.{ .path = "/src/unikraft/include" }},
-        .config = testConfig(),
+        .config = config,
     });
+}
+
+fn testContextWithConfig(config: ConfigQuery) !BuildContext {
+    return initTestContext(std.testing.allocator, config, testToolchain());
+}
+
+fn testContextWith(config: ConfigQuery, toolchain: Toolchain) !BuildContext {
+    return initTestContext(std.testing.allocator, config, toolchain);
+}
+
+fn testContext() !BuildContext {
+    return testContextWithConfig(testConfig());
 }
 
 test "ukboot variants retain registration order" {
@@ -1693,25 +2382,126 @@ test "syscall AWK generated output wires dependencies" {
     try std.testing.expect(source.variants[0].dependencies[0] == .generated_output);
 }
 
-test "KVM and Xen link pipelines preserve ordered inputs" {
-    var context = try testContext();
-    defer context.deinit();
-
+fn registerRepresentativeModel(context: *BuildContext) !void {
+    try context.registerLibrary(.{
+        .name = "libcore",
+        .origin = .{ .internal = .core },
+        .layout = .{ .ordinary = .{ .build_subdir = "libcore" } },
+        .exports = &.{"/src/unikraft/lib/core/exportsyms.uk"},
+        .locals = &.{"/src/unikraft/lib/core/localsyms.uk"},
+        .raw_objects = &.{.{ .path = "/build/libcore/main.o" }},
+        .archives = &.{.{ .path = "/build/libcore/local.a" }},
+        .object_pipeline = .{
+            .partial_link_output = "/build/libcore.ld.o",
+            .partial_link_sequence = &.{
+                .{ .tool_mode_flag = .{
+                    .driver = "-Wl,--gc-sections",
+                    .raw = "--gc-sections",
+                } },
+                .{ .artifact = .{
+                    .kind = .object,
+                    .artifact = .{ .component_output = .{
+                        .component = "libcore",
+                        .path = "/build/libcore/main.o",
+                    } },
+                    .provenance = .library_local,
+                } },
+                .{ .artifact = .{
+                    .kind = .object,
+                    .artifact = .{ .path = "/build/each-global.o" },
+                    .provenance = .each_library,
+                } },
+                .group_start,
+                .{ .artifact = .{
+                    .kind = .archive,
+                    .artifact = .{ .component_output = .{
+                        .component = "libcore",
+                        .path = "/build/libcore/local.a",
+                    } },
+                    .provenance = .library_local,
+                } },
+                .{ .artifact = .{
+                    .kind = .archive,
+                    .artifact = .{ .path = "/build/each-global.a" },
+                    .provenance = .each_library,
+                } },
+                .group_end,
+            },
+            .transform = .{
+                .input = .{ .library_partial_output = "libcore" },
+                .output = "/build/libcore.o",
+                .sequence = &.{
+                    .{ .symbol_file = .{
+                        .action = .keep_global,
+                        .symbols_file = "/src/unikraft/lib/core/exportsyms.uk",
+                        .provenance = .library_local,
+                    } },
+                    .{ .symbol_file = .{
+                        .action = .keep_global,
+                        .symbols_file = "/build/each-exportsyms.uk",
+                        .provenance = .each_library,
+                    } },
+                    .{ .symbol_file = .{
+                        .action = .localize,
+                        .symbols_file = "/src/unikraft/lib/core/localsyms.uk",
+                        .provenance = .library_local,
+                    } },
+                    .{ .literal_flag = "--wildcard" },
+                },
+            },
+        },
+    });
     try context.registerLibrary(.{
         .name = "libkvmplat",
         .kind = .platform_library,
         .origin = .{ .internal = .platform },
+        .enable = .{ .config_enabled = "CONFIG_PLAT_KVM" },
         .layout = .{ .ordinary = .{ .build_subdir = "libkvmplat" } },
         .platforms = &.{"kvm"},
         .archives = &.{.{ .path = "/build/libkvmplat.a" }},
+        .object_pipeline = .{
+            .partial_link_output = "/build/libkvmplat.ld.o",
+            .partial_link_sequence = &.{
+                .{ .artifact = .{
+                    .kind = .archive,
+                    .artifact = .{ .component_output = .{
+                        .component = "libkvmplat",
+                        .path = "/build/libkvmplat.a",
+                    } },
+                    .provenance = .library_local,
+                } },
+            },
+            .transform = .{
+                .input = .{ .library_partial_output = "libkvmplat" },
+                .output = "/build/libkvmplat.o",
+            },
+        },
     });
     try context.registerLibrary(.{
         .name = "libxenplat",
         .kind = .platform_library,
         .origin = .{ .internal = .platform },
+        .enable = .{ .config_enabled = "CONFIG_PLAT_XEN" },
         .layout = .{ .ordinary = .{ .build_subdir = "libxenplat" } },
         .platforms = &.{"xen"},
         .archives = &.{.{ .path = "/build/libxenplat.a" }},
+        .object_pipeline = .{
+            .partial_link_output = "/build/libxenplat.ld.o",
+            .partial_link_sequence = &.{
+                .{ .artifact = .{
+                    .kind = .archive,
+                    .artifact = .{ .component_output = .{
+                        .component = "libxenplat",
+                        .path = "/build/libxenplat.a",
+                    } },
+                    .provenance = .library_local,
+                } },
+            },
+            .transform = .{
+                .input = .{ .library_partial_output = "libxenplat" },
+                .output = "/build/libxenplat.o",
+            },
+        },
     });
     try context.registerPlatform(.{
         .name = "kvm",
@@ -1723,13 +2513,38 @@ test "KVM and Xen link pipelines preserve ordered inputs" {
                 .name = "final-link",
                 .transformation = .final_link,
                 .output = "/build/app_kvm.dbg",
-                .inputs = &.{
-                    .{ .kind = .object, .artifact = .{ .path = "/build/first.o" } },
-                    .{ .kind = .archive, .artifact = .{ .component_output = .{
-                        .component = "libkvmplat",
-                        .path = "/build/libkvmplat.a",
-                    } } },
-                    .{ .kind = .linker_script, .artifact = .{ .path = "/src/unikraft/plat/kvm/link64.lds" } },
+                .output_role = .debug,
+                .sequence = &.{
+                    .{ .literal_flag = "-Wl,--entry=_multiboot_entry" },
+                    .{ .artifact = .{
+                        .kind = .object,
+                        .artifact = .{ .library_final_object = "libkvmplat" },
+                        .provenance = .platform,
+                    } },
+                    .{ .artifact = .{
+                        .kind = .object,
+                        .artifact = .{ .library_final_object = "libcore" },
+                        .provenance = .global,
+                    } },
+                    .group_start,
+                    .{ .artifact = .{
+                        .kind = .archive,
+                        .artifact = .{ .path = "/build/kvm-platform.a" },
+                        .provenance = .platform,
+                    } },
+                    .{ .artifact = .{
+                        .kind = .archive,
+                        .artifact = .{ .path = "/build/global.a" },
+                        .provenance = .global,
+                    } },
+                    .group_end,
+                    .{ .library_argument = "-lgcc" },
+                    .{ .literal_flag = "-Wl,--build-id=none" },
+                    .{ .artifact = .{
+                        .kind = .linker_script,
+                        .artifact = .{ .path = "/src/unikraft/plat/kvm/link64.lds" },
+                        .provenance = .platform,
+                    } },
                 },
             },
         },
@@ -1738,7 +2553,116 @@ test "KVM and Xen link pipelines preserve ordered inputs" {
                 .name = "strip",
                 .kind = .strip,
                 .input = .{ .stage_output = .{ .platform = "kvm", .stage = "final-link" } },
-                .output = "/build/app_kvm",
+                .effects = &.{.{ .create = .{
+                    .name = "image",
+                    .path = "/build/app_kvm",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "bootinfo",
+                .kind = .bootinfo,
+                .input = .{ .post_process_output = .{
+                    .platform = "kvm",
+                    .transformation = "strip",
+                    .output = "image",
+                } },
+                .effects = &.{
+                    .{ .mutate_input = .{ .name = "image", .role = .image } },
+                    .{ .create = .{
+                        .name = "bootinfo",
+                        .path = "/build/app_kvm.bootinfo",
+                        .role = .side,
+                    } },
+                },
+            },
+            .{
+                .name = "multiboot",
+                .kind = .multiboot,
+                .condition = .{ .config_enabled = "CONFIG_KVM_BOOT_PROTO_MULTIBOOT" },
+                .input = .{ .post_process_output = .{
+                    .platform = "kvm",
+                    .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "multiboot",
+                    .path = "/build/app_kvm.multiboot",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "efi",
+                .kind = .efi,
+                .condition = .{ .config_enabled = "CONFIG_KVM_BOOT_PROTO_EFI_STUB" },
+                .input = .{ .post_process_output = .{
+                    .platform = "kvm",
+                    .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "efi",
+                    .path = "/build/app_kvm.efi",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "linux",
+                .kind = .linux_header,
+                .condition = .{ .config_enabled = "CONFIG_KVM_BOOT_PROTO_LXBOOT" },
+                .input = .{ .post_process_output = .{
+                    .platform = "kvm",
+                    .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .additional_inputs = &.{.{ .stage_output = .{
+                    .platform = "kvm",
+                    .stage = "final-link",
+                } }},
+                .effects = &.{
+                    .{ .create = .{ .name = "bin", .path = "/build/app_kvm.bin", .role = .image } },
+                    .{ .create = .{ .name = "img", .path = "/build/app_kvm.img", .role = .image } },
+                },
+            },
+            .{
+                .name = "symbols",
+                .kind = .symbols,
+                .condition = .{ .config_enabled = "CONFIG_OPTIMIZE_SYMFILE" },
+                .input = .{ .stage_output = .{ .platform = "kvm", .stage = "final-link" } },
+                .effects = &.{.{ .create = .{
+                    .name = "sym",
+                    .path = "/build/app_kvm.sym",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "gzip",
+                .kind = .gzip,
+                .condition = .{ .config_enabled = "CONFIG_OPTIMIZE_COMPRESS" },
+                .input = .{ .post_process_output = .{
+                    .platform = "kvm",
+                    .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "gz",
+                    .path = "/build/app_kvm.gz",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "compile-db",
+                .kind = .compile_database,
+                .input = .{ .post_process_output = .{
+                    .platform = "kvm",
+                    .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "database",
+                    .path = "/build/compile_commands.json",
+                    .role = .auxiliary,
+                } }},
             },
         },
     });
@@ -1752,46 +2676,235 @@ test "KVM and Xen link pipelines preserve ordered inputs" {
                 .name = "partial-link",
                 .transformation = .partial_link,
                 .output = "/build/app_xen.ld.o",
-                .inputs = &.{
-                    .{ .kind = .object, .artifact = .{ .path = "/build/xen-first.o" } },
-                    .{ .kind = .archive, .artifact = .{ .component_output = .{
-                        .component = "libxenplat",
-                        .path = "/build/libxenplat.a",
-                    } } },
+                .sequence = &.{
+                    .{ .tool_mode_flag = .{ .driver = "-Wl,-r", .raw = "-r" } },
+                    .{ .artifact = .{
+                        .kind = .object,
+                        .artifact = .{ .library_final_object = "libxenplat" },
+                        .provenance = .platform,
+                    } },
+                    .{ .artifact = .{
+                        .kind = .object,
+                        .artifact = .{ .library_final_object = "libcore" },
+                        .provenance = .global,
+                    } },
+                    .group_start,
+                    .{ .artifact = .{
+                        .kind = .archive,
+                        .artifact = .{ .path = "/build/xen-platform.a" },
+                        .provenance = .platform,
+                    } },
+                    .{ .artifact = .{
+                        .kind = .archive,
+                        .artifact = .{ .path = "/build/global.a" },
+                        .provenance = .global,
+                    } },
+                    .group_end,
+                    .{ .library_argument = "-lgcc" },
                 },
             },
             .{
                 .name = "localize",
                 .transformation = .objcopy_localize,
                 .output = "/build/app_xen.o",
-                .inputs = &.{.{ .kind = .intermediate, .artifact = .{ .stage_output = .{
-                    .platform = "xen",
-                    .stage = "partial-link",
-                } } }},
+                .sequence = &.{
+                    .{ .literal_flag = "-w" },
+                    .{ .literal_flag = "-G" },
+                    .{ .literal_flag = "xenos_*" },
+                    .{ .artifact = .{
+                        .kind = .intermediate,
+                        .artifact = .{ .stage_output = .{
+                            .platform = "xen",
+                            .stage = "partial-link",
+                        } },
+                    } },
+                },
             },
             .{
                 .name = "final-link",
                 .transformation = .final_link,
                 .output = "/build/app_xen.dbg",
-                .inputs = &.{
-                    .{ .kind = .linker_script, .artifact = .{ .path = "/src/unikraft/plat/xen/link64.lds" } },
-                    .{ .kind = .intermediate, .artifact = .{ .stage_output = .{
-                        .platform = "xen",
-                        .stage = "localize",
-                    } } },
+                .output_role = .debug,
+                .sequence = &.{
+                    .{ .literal_flag = "-Wl,--build-id=none" },
+                    .{ .artifact = .{
+                        .kind = .linker_script,
+                        .artifact = .{ .path = "/src/unikraft/plat/xen/link64.lds" },
+                        .provenance = .platform,
+                    } },
+                    .{ .artifact = .{
+                        .kind = .intermediate,
+                        .artifact = .{ .stage_output = .{
+                            .platform = "xen",
+                            .stage = "localize",
+                        } },
+                    } },
                 },
             },
         },
+        .post_process = &.{
+            .{
+                .name = "strip",
+                .kind = .strip,
+                .input = .{ .stage_output = .{ .platform = "xen", .stage = "final-link" } },
+                .effects = &.{.{ .create = .{
+                    .name = "image",
+                    .path = "/build/app_xen",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "bootinfo",
+                .kind = .bootinfo,
+                .input = .{ .post_process_output = .{
+                    .platform = "xen",
+                    .transformation = "strip",
+                    .output = "image",
+                } },
+                .effects = &.{
+                    .{ .mutate_input = .{ .name = "image", .role = .image } },
+                    .{ .create = .{
+                        .name = "bootinfo",
+                        .path = "/build/app_xen.bootinfo",
+                        .role = .side,
+                    } },
+                },
+            },
+            .{
+                .name = "raw-image",
+                .kind = .objcopy_binary,
+                .condition = .{ .config_equals = .{ .name = "CONFIG_UK_ARCH", .value = "arm64" } },
+                .input = .{ .post_process_output = .{
+                    .platform = "xen",
+                    .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "raw",
+                    .path = "/build/app_xen.bin",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "symbols",
+                .kind = .symbols,
+                .condition = .{ .config_enabled = "CONFIG_OPTIMIZE_SYMFILE" },
+                .input = .{ .stage_output = .{ .platform = "xen", .stage = "final-link" } },
+                .effects = &.{.{ .create = .{
+                    .name = "sym",
+                    .path = "/build/app_xen.sym",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "gzip",
+                .kind = .gzip,
+                .condition = .{ .config_enabled = "CONFIG_OPTIMIZE_COMPRESS" },
+                .input = .{ .post_process_output = .{
+                    .platform = "xen",
+                    .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "gz",
+                    .path = "/build/app_xen.gz",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "compile-db",
+                .kind = .compile_database,
+                .input = .{ .post_process_output = .{
+                    .platform = "xen",
+                    .transformation = "bootinfo",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "database",
+                    .path = "/build/compile_commands.json",
+                    .role = .auxiliary,
+                } }},
+            },
+        },
     });
+}
+
+test "library and KVM pipelines preserve every ordered argument" {
+    var context = try testContext();
+    defer context.deinit();
+    try registerRepresentativeModel(&context);
 
     const graph = try context.finalize();
     try std.testing.expectEqualStrings("kvm", graph.selectedPlatform().name);
+    const library_pipeline = graph.libraries[0].object_pipeline.?;
+    try std.testing.expect(library_pipeline.partial_link_sequence[0] == .tool_mode_flag);
+    try std.testing.expectEqualStrings(
+        "--gc-sections",
+        library_pipeline.partial_link_sequence[0].tool_mode_flag.forMode(.raw).?,
+    );
+    try std.testing.expect(
+        library_pipeline.partial_link_sequence[1].artifact.provenance == .library_local,
+    );
+    try std.testing.expect(
+        library_pipeline.partial_link_sequence[2].artifact.provenance == .each_library,
+    );
+    try std.testing.expect(library_pipeline.partial_link_sequence[3] == .group_start);
+    try std.testing.expect(library_pipeline.partial_link_sequence[6] == .group_end);
+    try std.testing.expectEqualStrings("/build/libcore.ld.o", library_pipeline.partial_link_output);
+    try std.testing.expectEqualStrings("/build/libcore.o", library_pipeline.transform.output);
+
     try std.testing.expectEqualStrings("final-link", graph.platforms[0].link_stages[0].name);
-    try std.testing.expect(graph.platforms[0].link_stages[0].inputs[0].kind == .object);
-    try std.testing.expect(graph.platforms[0].link_stages[0].inputs[1].kind == .archive);
+    const kvm_sequence = graph.platforms[0].link_stages[0].sequence;
+    try std.testing.expect(kvm_sequence[0] == .literal_flag);
+    try std.testing.expect(kvm_sequence[1].artifact.artifact == .library_final_object);
+    try std.testing.expectEqualStrings(
+        "libkvmplat",
+        kvm_sequence[1].artifact.artifact.library_final_object,
+    );
+    try std.testing.expect(kvm_sequence[3] == .group_start);
+    try std.testing.expect(kvm_sequence[6] == .group_end);
+    try std.testing.expect(kvm_sequence[7] == .library_argument);
+
+    const kvm_post = graph.platforms[0].post_process;
+    try std.testing.expectEqualStrings("strip", kvm_post[0].name);
+    try std.testing.expectEqualStrings("bootinfo", kvm_post[1].name);
+    try std.testing.expect(kvm_post[1].effects[0] == .mutate_input);
+    try std.testing.expectEqual(@as(usize, 1), kvm_post[2].effects.len);
+    try std.testing.expectEqual(@as(usize, 2), kvm_post[4].effects.len);
+    try std.testing.expectEqualStrings("/build/app_kvm.bin", kvm_post[4].effects[0].create.path);
+    try std.testing.expectEqualStrings("/build/app_kvm.img", kvm_post[4].effects[1].create.path);
+    try std.testing.expectEqualStrings("symbols", kvm_post[5].name);
+    try std.testing.expectEqualStrings("gzip", kvm_post[6].name);
+    try std.testing.expectEqualStrings("compile-db", kvm_post[kvm_post.len - 1].name);
+}
+
+test "Xen pipeline and inactive KVM duplicate outputs validate" {
+    var context = try testContextWithConfig(testXenConfig());
+    defer context.deinit();
+    try registerRepresentativeModel(&context);
+
+    const graph = try context.finalize();
+    try std.testing.expectEqualStrings("xen", graph.selectedPlatform().name);
     try std.testing.expectEqualStrings("partial-link", graph.platforms[1].link_stages[0].name);
     try std.testing.expectEqualStrings("localize", graph.platforms[1].link_stages[1].name);
     try std.testing.expectEqualStrings("final-link", graph.platforms[1].link_stages[2].name);
+    const partial_sequence = graph.platforms[1].link_stages[0].sequence;
+    try std.testing.expectEqualStrings(
+        "-r",
+        partial_sequence[0].tool_mode_flag.forMode(graph.toolchain.partial_linker.mode).?,
+    );
+    try std.testing.expect(partial_sequence[3] == .group_start);
+    try std.testing.expect(partial_sequence[6] == .group_end);
+    const xen_post = graph.platforms[1].post_process;
+    const kvm_post = graph.platforms[0].post_process;
+    try std.testing.expectEqualStrings(
+        "/build/compile_commands.json",
+        xen_post[xen_post.len - 1].effects[0].create.path,
+    );
+    try std.testing.expectEqualStrings(
+        kvm_post[kvm_post.len - 1].effects[0].create.path,
+        xen_post[xen_post.len - 1].effects[0].create.path,
+    );
 }
 
 test "duplicate registration and validation failures are actionable" {
@@ -1822,6 +2935,135 @@ test "duplicate registration and validation failures are actionable" {
 
     try std.testing.expectError(error.DuplicateOutput, context.finalize());
     try std.testing.expect(std.mem.indexOf(u8, context.lastDiagnostic().?, "/build/shared.o") != null);
+}
+
+test "post-processing rejects conflicting producers but permits in-place mutation" {
+    var valid = try testContext();
+    defer valid.deinit();
+    try valid.registerPlatform(.{
+        .name = "kvm",
+        .origin = .{ .internal = .platform },
+        .enable = .always,
+        .link_stages = &.{.{
+            .name = "link",
+            .transformation = .final_link,
+            .output = "/build/debug",
+        }},
+        .post_process = &.{
+            .{
+                .name = "strip",
+                .kind = .strip,
+                .input = .{ .stage_output = .{ .platform = "kvm", .stage = "link" } },
+                .effects = &.{.{ .create = .{
+                    .name = "image",
+                    .path = "/build/image",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "metadata",
+                .kind = .bootinfo,
+                .input = .{ .post_process_output = .{
+                    .platform = "kvm",
+                    .transformation = "strip",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .mutate_input = .{ .name = "image", .role = .image } }},
+            },
+        },
+    });
+    _ = try valid.finalize();
+
+    var conflict = try testContext();
+    defer conflict.deinit();
+    try conflict.registerPlatform(.{
+        .name = "kvm",
+        .origin = .{ .internal = .platform },
+        .enable = .always,
+        .link_stages = &.{.{
+            .name = "link",
+            .transformation = .final_link,
+            .output = "/build/debug",
+        }},
+        .post_process = &.{
+            .{
+                .name = "first",
+                .kind = .strip,
+                .input = .{ .stage_output = .{ .platform = "kvm", .stage = "link" } },
+                .effects = &.{.{ .create = .{
+                    .name = "image",
+                    .path = "/build/image",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "second",
+                .kind = .gzip,
+                .input = .{ .stage_output = .{ .platform = "kvm", .stage = "link" } },
+                .effects = &.{.{ .create = .{
+                    .name = "other",
+                    .path = "/build/image",
+                    .role = .image,
+                } }},
+            },
+        },
+    });
+    try std.testing.expectError(error.DuplicateOutput, conflict.finalize());
+}
+
+test "post-processing and typed library outputs reject forward or missing references" {
+    var forward = try testContext();
+    defer forward.deinit();
+    try forward.registerPlatform(.{
+        .name = "kvm",
+        .origin = .{ .internal = .platform },
+        .enable = .always,
+        .post_process = &.{
+            .{
+                .name = "first",
+                .kind = .gzip,
+                .input = .{ .post_process_output = .{
+                    .platform = "kvm",
+                    .transformation = "later",
+                    .output = "image",
+                } },
+                .effects = &.{.{ .create = .{
+                    .name = "gz",
+                    .path = "/build/image.gz",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "later",
+                .kind = .strip,
+                .input = .{ .path = "/build/debug" },
+                .effects = &.{.{ .create = .{
+                    .name = "image",
+                    .path = "/build/image",
+                    .role = .image,
+                } }},
+            },
+        },
+    });
+    try std.testing.expectError(error.InvalidReference, forward.finalize());
+
+    var missing_library = try testContext();
+    defer missing_library.deinit();
+    try missing_library.registerPlatform(.{
+        .name = "kvm",
+        .origin = .{ .internal = .platform },
+        .enable = .always,
+        .link_stages = &.{.{
+            .name = "link",
+            .transformation = .final_link,
+            .output = "/build/debug",
+            .sequence = &.{.{ .artifact = .{
+                .kind = .object,
+                .artifact = .{ .library_final_object = "libmissing" },
+            } }},
+        }},
+    });
+    try std.testing.expectError(error.InvalidReference, missing_library.finalize());
 }
 
 test "finalize requires exactly one selected platform and validates references" {
@@ -1878,4 +3120,103 @@ test "toolchain capability and version predicates use declared metadata" {
         .relation = .at_least,
         .version = .{ .major = 1, .minor = 0, .patch = 0 },
     }));
+}
+
+fn expectOwnedVersionMetadata(tool: Tool) !void {
+    const version = tool.version.?;
+    try std.testing.expectEqualStrings("rc.1", version.pre.?);
+    try std.testing.expectEqualStrings("vendor.7", version.build.?);
+}
+
+test "tool versions own prerelease and build metadata" {
+    const allocator = std.testing.allocator;
+    const pre = try allocator.dupe(u8, "rc.1");
+    const build = try allocator.dupe(u8, "vendor.7");
+    var inputs_freed = false;
+    defer if (!inputs_freed) {
+        allocator.free(pre);
+        allocator.free(build);
+    };
+
+    const version = std.SemanticVersion{
+        .major = 19,
+        .minor = 0,
+        .patch = 0,
+        .pre = pre,
+        .build = build,
+    };
+    var toolchain = testToolchain();
+    toolchain.compiler.tool.version = version;
+    toolchain.partial_linker.tool.version = version;
+    toolchain.final_linker.tool.version = version;
+    toolchain.binutils.ar.version = version;
+    toolchain.binutils.objcopy.version = version;
+    toolchain.binutils.strip.version = version;
+    toolchain.binutils.nm.version = version;
+    toolchain.binutils.objdump = .{ .command = "llvm-objdump", .version = version };
+    toolchain.host = .{
+        .cc = .{ .command = "cc", .version = version },
+        .cxx = .{ .command = "c++", .version = version },
+        .awk = .{ .command = "awk", .version = version },
+        .m4 = .{ .command = "m4", .version = version },
+        .dtc = .{ .command = "dtc", .version = version },
+        .python = .{ .command = "python3", .version = version },
+    };
+
+    var context = try testContextWith(testConfig(), toolchain);
+    defer context.deinit();
+
+    @memset(pre, 'x');
+    @memset(build, 'y');
+    allocator.free(pre);
+    allocator.free(build);
+    inputs_freed = true;
+
+    try expectOwnedVersionMetadata(context.toolchain.compiler.tool);
+    try expectOwnedVersionMetadata(context.toolchain.partial_linker.tool);
+    try expectOwnedVersionMetadata(context.toolchain.final_linker.tool);
+    try expectOwnedVersionMetadata(context.toolchain.binutils.ar);
+    try expectOwnedVersionMetadata(context.toolchain.binutils.objcopy);
+    try expectOwnedVersionMetadata(context.toolchain.binutils.strip);
+    try expectOwnedVersionMetadata(context.toolchain.binutils.nm);
+    try expectOwnedVersionMetadata(context.toolchain.binutils.objdump.?);
+    try expectOwnedVersionMetadata(context.toolchain.host.cc.?);
+    try expectOwnedVersionMetadata(context.toolchain.host.cxx.?);
+    try expectOwnedVersionMetadata(context.toolchain.host.awk.?);
+    try expectOwnedVersionMetadata(context.toolchain.host.m4.?);
+    try expectOwnedVersionMetadata(context.toolchain.host.dtc.?);
+    try expectOwnedVersionMetadata(context.toolchain.host.python.?);
+}
+
+fn exerciseVersionCopyFailurePaths(allocator: std.mem.Allocator) !void {
+    const version = std.SemanticVersion{
+        .major = 19,
+        .minor = 0,
+        .patch = 0,
+        .pre = "rc.1",
+        .build = "vendor.7",
+    };
+    var toolchain = testToolchain();
+    toolchain.compiler.tool.version = version;
+    toolchain.partial_linker.tool.version = version;
+    toolchain.final_linker.tool.version = version;
+    toolchain.binutils.ar.version = version;
+    toolchain.binutils.objcopy.version = version;
+    toolchain.binutils.strip.version = version;
+    toolchain.binutils.nm.version = version;
+    toolchain.binutils.objdump = .{ .command = "llvm-objdump", .version = version };
+    toolchain.host.cc = .{ .command = "cc", .version = version };
+    toolchain.host.python = .{ .command = "python3", .version = version };
+
+    var context = try initTestContext(allocator, testConfig(), toolchain);
+    defer context.deinit();
+    try expectOwnedVersionMetadata(context.toolchain.compiler.tool);
+}
+
+test "tool version partial-copy failures release all allocations" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseVersionCopyFailurePaths,
+        .{},
+    );
 }

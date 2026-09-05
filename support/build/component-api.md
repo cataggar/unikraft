@@ -12,6 +12,15 @@ variant, link-stage, and link-input slices retain registration order. The
 finalized graph's `registrations` slice also records the deterministic
 cross-category component/platform order.
 
+Library object production is explicit: `LibraryObjectPipeline` records the
+ordered partial-link command, provenance of local versus `EACHOLIB` inputs,
+the relocatable intermediate, symbol-localizing objcopy transformation, and
+the final typed library object. `LinkStage.sequence` interleaves artifacts,
+literal or driver/raw-translated flags, archive-group markers, and system
+library arguments without regrouping them. Ordered post-processing
+transformations can create several named artifacts or declare an in-place
+mutation; later transformations refer to those named results.
+
 ```zig
 const build = @import("component-api.zig");
 
@@ -49,6 +58,23 @@ try build.registerComponent(&context, .{
             .output = .{ .path = "/src/app/build/libhello/hello.o", .kind = .object },
         }},
     }},
+    .object_pipeline = .{
+        .partial_link_output = "/src/app/build/libhello.ld.o",
+        .partial_link_sequence = &.{
+            .{ .artifact = .{
+                .kind = .object,
+                .artifact = .{ .component_output = .{
+                    .component = "libhello",
+                    .path = "/src/app/build/libhello/hello.o",
+                } },
+                .provenance = .library_local,
+            } },
+        },
+        .transform = .{
+            .input = .{ .library_partial_output = "libhello" },
+            .output = "/src/app/build/libhello.o",
+        },
+    },
 });
 
 try build.registerPlatform(&context, .{
@@ -59,6 +85,33 @@ try build.registerPlatform(&context, .{
         .name = "final-link",
         .transformation = .final_link,
         .output = "/src/app/build/app_kvm.dbg",
+        .output_role = .debug,
+        .sequence = &.{
+            .{ .artifact = .{
+                .kind = .object,
+                .artifact = .{ .library_final_object = "libhello" },
+            } },
+            .group_start,
+            .{ .artifact = .{
+                .kind = .archive,
+                .artifact = .{ .path = "/src/app/build/runtime.a" },
+            } },
+            .group_end,
+            .{ .library_argument = "-lgcc" },
+        },
+    }},
+    .post_process = &.{.{
+        .name = "strip",
+        .kind = .strip,
+        .input = .{ .stage_output = .{
+            .platform = "kvm",
+            .stage = "final-link",
+        } },
+        .effects = &.{.{ .create = .{
+            .name = "image",
+            .path = "/src/app/build/app_kvm",
+            .role = .image,
+        } }},
     }},
 });
 
@@ -66,9 +119,12 @@ const graph = try context.finalize();
 _ = graph.selectedPlatform();
 ```
 
-Validation rejects duplicate names and outputs, inconsistent platform-library
-registrations, unknown component/generated/stage references, forward stage
-references, and configurations that select zero or multiple platforms.
+Validation first resolves the one selected platform and all conditions, then
+checks active references and producers. It rejects duplicate active outputs,
+inconsistent platform-library registrations, unknown or forward typed
+references, malformed archive groups, and configurations that select zero or
+multiple platforms. Inactive platform pipelines may intentionally name the
+same eventual output, such as `compile_commands.json`.
 `lastDiagnostic()` supplies the offending names or paths.
 
 Run the standalone, leak-checked unit tests with:
