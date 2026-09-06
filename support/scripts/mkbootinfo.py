@@ -5,8 +5,8 @@
 # You may not use this file except in compliance with the License.
 
 import argparse
-import re
 import os
+import re
 
 from elf_tools import configured_tool, tool_output
 
@@ -32,6 +32,32 @@ UKPLAT_BOOTINFO_VERSION = 0x01
 
 PAGE_SIZE = 4096
 PAGE_SHIFT = 12
+
+
+def normalize_load_regions(phdrs):
+    regions = []
+
+    for vaddr, memsz, flags in sorted(phdrs, key=lambda phdr: int(phdr[0], 16)):
+        pbase = int(vaddr, 16)
+        size = (int(memsz, 16) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1)
+        if size == 0:
+            continue
+
+        if regions and pbase < regions[-1][0] + regions[-1][1]:
+            previous_base, previous_size, previous_flags = regions[-1]
+            if flags != previous_flags:
+                raise ValueError(
+                    "overlapping ELF LOAD segments have incompatible flags: "
+                    f"{previous_flags} and {flags}"
+                )
+
+            end = max(previous_base + previous_size, pbase + size)
+            regions[-1] = (previous_base, end - previous_base, flags)
+            continue
+
+        regions.append((pbase, size, flags))
+
+    return regions
 
 
 def main():
@@ -86,9 +112,8 @@ def main():
     # Retrieve info about ELF segments in unikernel
     out = tool_output(OBJDUMP, "-p", opt.kernel)
     phdrs = re.findall(PHDRS_EXP, out.decode("utf-8"), re.MULTILINE)
-
-    # Make sure they are sorted by their addresses
-    phdrs = sorted(phdrs, key=lambda x: x[0])
+    phdrs = [phdr for phdr in phdrs if int(phdr[0], 16) >= opt.min_address]
+    regions = normalize_load_regions(phdrs)
 
     # The boot info is a struct ukplat_bootinfo
     # (see plat/common/include/uk/plat/common/bootinfo.h) followed by a list of
@@ -114,20 +139,13 @@ def main():
 
         assert secobj.tell() == UKPLAT_BOOTINFO_SIZE
 
-        for phdr in phdrs:
-            if len(phdr) != 3:
-                continue
-
-            pbase = int(phdr[0], base=16)
-            if pbase < opt.min_address:
-                continue
-
+        for pbase, size, phdr_flags in regions:
             flags = 0
-            if phdr[2][0] == "r":
+            if phdr_flags[0] == "r":
                 flags |= UKPLAT_MEMRF_READ
-            if phdr[2][1] == "w":
+            if phdr_flags[1] == "w":
                 flags |= UKPLAT_MEMRF_WRITE
-            if phdr[2][2] == "x":
+            if phdr_flags[2] == "x":
                 flags |= UKPLAT_MEMRF_EXECUTE
 
             # We have 1:1 mapping
@@ -135,10 +153,6 @@ def main():
             # Offset in the first page is equal to the start of the first page
             pg_off = 0
 
-            # Align size up to page size
-            size = (int(phdr[1], base=16) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1)
-            if size == 0:
-                continue
             pg_count = size >> PAGE_SHIFT
 
             assert nsecs < cap

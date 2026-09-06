@@ -311,21 +311,33 @@ build requires Python 3 and the listed LLVM binary tools, but not GCC. The
 `host-cflags` exception accommodates Kconfig's kernel-style, null-derived list
 sentinel.
 
-For QEMU/ARM64, use a target-selecting compiler and keep the existing GNU
-linker and binutils, for example:
+For QEMU/ARM64, use the same GCC-free tool contract with an explicit
+freestanding AArch64 target:
 
 ```shell
 zig build \
   -Dapp=/absolute/path/to/app \
   '-Dcompiler=zig cc -target aarch64-freestanding-none' \
   -Dcompiler-targeted=true \
-  -Dlinker=gcc \
-  -Dmake-arg=UK_CFLAGS=-std=gnu17
+  '-Dpartial-linker=zig ld.lld' \
+  -Dpartial-linker-type=raw \
+  '-Dhost-cc=zig cc' \
+  '-Dhost-cxx=zig c++' \
+  -Dhost-cflags=-fno-sanitize=null \
+  '-Dmake-arg=AR=zig ar' \
+  -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf \
+  -Dmake-arg=STRIP=llvm-strip \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17 \
+  -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
 ```
 
-ARM64 additionally requires an AArch64 GNU cross-toolchain. This compiler
-support remains experimental, is limited to GNU Make-configured QEMU/x86_64
-and QEMU/ARM64 applications, and does not support LTO.
+Neither target requires GCC or GNU cross-binutils. Both require Python 3 and
+the listed LLVM binary tools. This compiler support remains experimental, is
+limited to GNU Make-configured QEMU/x86_64 and QEMU/ARM64 applications, and
+does not support LTO.
 
 ### Toolchain Installation
 

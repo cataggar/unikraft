@@ -416,8 +416,66 @@ jobs:
   zig-helloworld-arm64:
     name: zig-helloworld-arm64
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
 
     steps:
+    - name: Install checkout and build dependencies
+      run: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          bison \
+          ca-certificates \
+          curl \
+          file \
+          flex \
+          git \
+          libncurses-dev \
+          make \
+          python3 \
+          tar \
+          xz-utils
+        rm -rf /var/lib/apt/lists/*
+
+    - name: Download LLVM and QEMU tools
+      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.8.0
+        tools: |
+          cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+        dest: ${{ runner.temp }}/zig-tools
+        extract: 'true'
+        strip-components: '1'
+
+    - name: Add LLVM and QEMU tools to PATH
+      run: |
+        set -euo pipefail
+        tools="${RUNNER_TEMP}/zig-tools"
+        for command in \
+          "${tools}/bin/llvm-nm" \
+          "${tools}/bin/llvm-objcopy" \
+          "${tools}/bin/llvm-objdump" \
+          "${tools}/bin/llvm-readelf" \
+          "${tools}/bin/llvm-strip" \
+          "${tools}/qemu-system-aarch64"; do
+          test -x "${command}"
+        done
+        {
+          echo "${tools}/bin"
+          echo "${tools}"
+        } >> "${GITHUB_PATH}"
+
     - uses: actions/checkout@v4
       with:
         submodules: recursive
@@ -432,21 +490,25 @@ jobs:
         fetch-depth: 1
         path: _helloworld
 
-    # The runner stays x86_64: Zig cross-compiles to AArch64, while the GNU
-    # linker driver and binutils have to be the AArch64 cross-toolchain.
-    - name: Install build dependencies
+    - name: Verify GNU cross tools are unavailable
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          bison \
-          flex \
-          libncurses-dev \
-          gcc-aarch64-linux-gnu \
-          binutils-aarch64-linux-gnu \
-          qemu-system-arm
+        set -euo pipefail
+        for command in \
+          gcc g++ gcc-ar gcc-nm \
+          aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ \
+          aarch64-linux-gnu-ld aarch64-linux-gnu-ar \
+          aarch64-linux-gnu-nm aarch64-linux-gnu-objcopy \
+          aarch64-linux-gnu-objdump aarch64-linux-gnu-readelf \
+          aarch64-linux-gnu-strip; do
+          if command -v "${command}" >/dev/null 2>&1; then
+            echo "Unexpected GNU tool on PATH: ${command}" >&2
+            exit 1
+          fi
+        done
 
     - name: Install Zig
       run: |
+        set -euo pipefail
         archive="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
         directory="${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}"
         curl --fail --location --silent --show-error \
@@ -458,42 +520,109 @@ jobs:
 
     - name: Build helloworld with Zig
       run: |
+        set -euo pipefail
         test "$(zig version)" = "${ZIG_VERSION}"
-        rm -rf "${RUNNER_TEMP}/build-zig-arm64"
-        make \
-          A="${GITHUB_WORKSPACE}/_helloworld" \
-          O="${RUNNER_TEMP}/build-zig-arm64" \
+        build="${RUNNER_TEMP}/build-zig-arm64"
+        log="${RUNNER_TEMP}/zig-arm64-build.log"
+        rm -rf "${build}"
+        make_args=(
+          "A=${GITHUB_WORKSPACE}/_helloworld"
+          "O=${build}"
+          "HOSTCC=zig cc"
+          "HOSTCXX=zig c++"
+          # Kconfig's kernel-style list sentinel is intentionally null-derived.
+          "HOSTCFLAGS=-fno-sanitize=null"
+          "COMPILER=zig cc -target aarch64-freestanding-none"
+          "COMPILER_TARGETED=y"
+          "PARTIAL_LINKER=zig ld.lld"
+          "PARTIAL_LINKER_TYPE=raw"
+          "AR=zig ar"
+          "NM=llvm-nm"
+          "OBJCOPY=llvm-objcopy"
+          "OBJDUMP=llvm-objdump"
+          "READELF=llvm-readelf"
+          "STRIP=llvm-strip"
+          "UK_CFLAGS=-std=gnu17"
+          "UK_LDFLAGS=-rtlib=compiler-rt"
+        )
+        make "${make_args[@]}" \
           UK_DEFCONFIG="${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-arm64" \
           defconfig
-        make \
-          A="${GITHUB_WORKSPACE}/_helloworld" \
-          O="${RUNNER_TEMP}/build-zig-arm64" \
-          COMPILER='zig cc -target aarch64-freestanding-none' \
-          COMPILER_TARGETED=y \
-          LINKER=gcc \
-          UK_CFLAGS=-std=gnu17 \
-          -j"$(nproc)"
+        set +e
+        make "${make_args[@]}" V=1 -j"$(nproc)" 2>&1 | tee "${log}"
+        build_status=("${PIPESTATUS[@]}")
+        set -e
+
+        mapfile -d '' command_files < <(
+          find "${build}" -type f -name '*.cmd' \
+            ! -path "${build}/kconfig/*" \
+            ! -path "${build}/include/config/*" \
+            -size +0c -print0
+        )
+        if [ "${#command_files[@]}" -eq 0 ]; then
+          echo "The target build generated no command files to audit." >&2
+          exit 1
+        fi
+
+        gcc_command="(^|[;&|])[[:space:]]*(env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)[[:space:]]+)*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)"
+        gcc_assignment="(^|[;&|])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=['\"]?(env[[:space:]]+([^[:space:]=]+=[^[:space:]]+[[:space:]]+)*)?((ccache|command)[[:space:]]+)?([^[:space:]\"';|&]*/)?([^/[:space:]\"';|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:]\"';|&]|$)"
+        gcc_found=0
+        for command_file in "${command_files[@]}"; do
+          if grep --with-filename --line-number --extended-regexp \
+            "${gcc_command}|${gcc_assignment}" "${command_file}"; then
+            gcc_found=1
+          fi
+        done
+        if [ "${gcc_found}" -ne 0 ]; then
+          echo "The target build invoked a GCC command." >&2
+          exit 1
+        fi
+        test "${build_status[1]}" -eq 0
+        test "${build_status[0]}" -eq 0
 
     - name: Inspect Zig image
       run: |
+        set -euo pipefail
         image="${RUNNER_TEMP}/build-zig-arm64/helloworld_qemu-arm64.dbg"
         file "${image}"
-        readelf --file-header "${image}" | grep --quiet 'Class:.*ELF64'
-        readelf --file-header "${image}" | grep --quiet 'Machine:.*AArch64'
-        ! readelf --program-headers "${image}" | grep --quiet INTERP
-        ! readelf --dynamic "${image}" 2>/dev/null | grep --quiet NEEDED
-        # Column 7 is the section index, column 8 the symbol name. The unnamed
-        # null symbol is always undefined and is therefore skipped.
-        undefined="$(readelf --wide --symbols "${image}" | awk '$7 == "UND" && $8 != ""')"
-        test -z "${undefined}"
+        header="$(llvm-readelf --file-header "${image}")"
+        printf '%s\n' "${header}"
+        grep --quiet 'Class:.*ELF64' <<< "${header}"
+        grep --quiet 'Machine:.*AArch64' <<< "${header}"
+
+        program_headers="$(llvm-readelf --program-headers "${image}")"
+        if grep --quiet INTERP <<< "${program_headers}"; then
+          echo "The Zig image has a program interpreter." >&2
+          exit 1
+        fi
+        dynamic="$(llvm-readelf --wide --dynamic "${image}" 2>/dev/null)"
+        if grep --quiet NEEDED <<< "${dynamic}"; then
+          echo "The Zig image has a dynamic dependency." >&2
+          exit 1
+        fi
+
+        undefined="$(llvm-nm --undefined-only --format=posix "${image}")"
+        if [ -n "${undefined}" ]; then
+          echo "The Zig image has unresolved symbols:" >&2
+          printf '%s\n' "${undefined}" >&2
+          exit 1
+        fi
+        symbols="$(llvm-nm --format=posix "${image}")"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The Zig image has a libgcc symbol reference." >&2
+          exit 1
+        fi
+        if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
+          echo "The Zig image has a libgcc dependency." >&2
+          exit 1
+        fi
 
     - name: Boot Zig image
       run: |
+        set -euo pipefail
         image="${RUNNER_TEMP}/build-zig-arm64/helloworld_qemu-arm64"
         output="${RUNNER_TEMP}/zig-qemu-arm64.log"
         set +e
-        # `-net none` drops the default virtio-net-pci device of the `virt`
-        # machine, whose option ROM is not shipped by `qemu-system-arm`.
         timeout 30s qemu-system-aarch64 \
           -machine virt \
           -cpu cortex-a53 \
@@ -502,9 +631,10 @@ jobs:
           -no-reboot \
           -net none \
           2>&1 | tee "${output}"
-        status=${PIPESTATUS[0]}
+        status=("${PIPESTATUS[@]}")
         set -e
-        test "${status}" -eq 0
+        test "${status[1]}" -eq 0
+        test "${status[0]}" -eq 0
         grep --fixed-strings --quiet 'Hello world!' "${output}"
 
   static-analysis:
