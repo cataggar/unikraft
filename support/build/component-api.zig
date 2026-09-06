@@ -702,12 +702,17 @@ pub const FinalizedGraph = struct {
     global_flags: FlagSet,
     global_includes: []const Include,
     libraries: []const Library,
+    active_libraries: []const bool,
     platforms: []const Platform,
     registrations: []const Registration,
     selected_platform_index: usize,
 
     pub fn selectedPlatform(self: FinalizedGraph) *const Platform {
         return &self.platforms[self.selected_platform_index];
+    }
+
+    pub fn libraryIsActive(self: FinalizedGraph, index: usize) bool {
+        return self.active_libraries[index];
     }
 };
 
@@ -837,6 +842,11 @@ pub const BuildContext = struct {
         try self.validatePlatforms(selected_index.?);
         try self.validateOutputs(selected_index.?);
 
+        const active_libraries = try self.arena.allocator().alloc(bool, self.libraries.items.len);
+        for (self.libraries.items, active_libraries) |library, *active| {
+            active.* = library.enable.matches(self.config);
+        }
+
         self.finalized = true;
         return .{
             .roots = self.roots,
@@ -845,6 +855,7 @@ pub const BuildContext = struct {
             .global_flags = self.global_flags,
             .global_includes = self.global_includes,
             .libraries = self.libraries.items,
+            .active_libraries = active_libraries,
             .platforms = self.platforms.items,
             .registrations = self.registrations.items,
             .selected_platform_index = selected_index.?,
@@ -3209,6 +3220,9 @@ test "library and KVM pipelines preserve every ordered argument" {
 
     const graph = try context.finalize();
     try std.testing.expectEqualStrings("kvm", graph.selectedPlatform().name);
+    try std.testing.expect(graph.libraryIsActive(0));
+    try std.testing.expect(graph.libraryIsActive(1));
+    try std.testing.expect(!graph.libraryIsActive(2));
     const library_pipeline = graph.libraries[0].object_pipeline.?;
     try std.testing.expect(library_pipeline.partial_link_sequence[0] == .tool_mode_flag);
     try std.testing.expectEqualStrings(
@@ -3265,6 +3279,9 @@ test "Xen pipeline and inactive KVM duplicate outputs validate" {
 
     const graph = try context.finalize();
     try std.testing.expectEqualStrings("xen", graph.selectedPlatform().name);
+    try std.testing.expect(graph.libraryIsActive(0));
+    try std.testing.expect(!graph.libraryIsActive(1));
+    try std.testing.expect(graph.libraryIsActive(2));
     try std.testing.expectEqualStrings("partial-link", graph.platforms[1].link_stages[0].name);
     try std.testing.expectEqualStrings("localize", graph.platforms[1].link_stages[1].name);
     try std.testing.expectEqualStrings("final-link", graph.platforms[1].link_stages[2].name);

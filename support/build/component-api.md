@@ -138,10 +138,25 @@ inconsistent platform-library registrations, unknown or forward typed
 references, malformed archive groups, and configurations that select zero or
 multiple platforms. Inactive platform pipelines may intentionally name the
 same eventual output, such as `compile_commands.json`.
+The finalized graph retains the resolved active-library bitmap so native
+executors do not need to retain or re-evaluate the borrowed configuration
+query.
 `lastDiagnostic()` supplies the offending names or paths.
+
+`native-library-link.zig` plans and materializes active library object
+pipelines. It uses the configured Zig executable as
+`zig cc -target <triple> -nostdlib -r`, passes ordered link inputs without a
+shell, validates the resulting ELF for forbidden `SHN_COMMON` symbols, and
+then runs the configured objcopy localization sequence. Generated and
+component outputs must be supplied as `PathBinding` values so their producing
+steps remain tracked; typed library outputs are connected automatically.
+Non-Zig compiler drivers are rejected instead of silently adopting Zig's
+COMMON-symbol behavior.
 
 Run the standalone, leak-checked unit tests with:
 
 ```sh
 zig test support/build/component-api.zig
+zig test support/build/native-library-link.zig
+zig test support/build/elf-common-validator.zig
 ```
