@@ -485,6 +485,63 @@ pub fn build(b: *std.Build) void {
         @panic(@errorName(err));
     });
     test_step.dependOn(&run_native_lto_tests.step);
+    const hyperv_runtime_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("plat/hyperv/hyperv_runtime.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(hyperv_runtime_tests).step);
+    const hyperv_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .freestanding,
+        .abi = .none,
+    });
+    const hyperv_runtime_object = b.addObject(.{
+        .name = "hyperv-runtime-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("plat/hyperv/hyperv_runtime.zig"),
+            .target = hyperv_target,
+            .optimize = .ReleaseFast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const hyperv_runtime_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    hyperv_runtime_link.addFileArg(hyperv_runtime_object.getEmittedBin());
+    hyperv_runtime_link.addArg("-o");
+    const hyperv_runtime_linked =
+        hyperv_runtime_link.addOutputFileArg("hyperv-runtime-linked.o");
+    const verify_hyperv_runtime = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/hyperv-runtime-test.py",
+        "--object",
+    });
+    verify_hyperv_runtime.addFileArg(hyperv_runtime_linked);
+    verify_hyperv_runtime.addArgs(&.{
+        "--nm",
+        "llvm-nm",
+        "--readelf",
+        "llvm-readelf",
+    });
+    verify_hyperv_runtime.setCwd(.{ .cwd_relative = root });
+    verify_hyperv_runtime.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    test_step.dependOn(&verify_hyperv_runtime.step);
     const lto_policy_tests = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/lto-symbol-policy-test.py",
@@ -1119,17 +1176,18 @@ fn nativeProfileMatchesConfig(
     profile: native_image_graph.Profile,
     config: *const NativeConfig,
 ) bool {
-    if (!nativeConfigEnabled(config, "CONFIG_PLAT_KVM")) return false;
     const architecture = nativeConfigValue(config, "CONFIG_UK_ARCH") orelse return false;
     return switch (profile) {
-        .@"qemu-x86_64" => std.mem.eql(u8, architecture, "x86_64") and
+        .@"qemu-x86_64" => nativeConfigEnabled(config, "CONFIG_PLAT_KVM") and
+            std.mem.eql(u8, architecture, "x86_64") and
             nativeConfigEnabled(config, "CONFIG_KVM_BOOT_PROTO_MULTIBOOT"),
-        .@"qemu-arm64" => std.mem.eql(u8, architecture, "arm64") and
+        .@"qemu-arm64" => nativeConfigEnabled(config, "CONFIG_PLAT_KVM") and
+            std.mem.eql(u8, architecture, "arm64") and
             nativeConfigEnabled(config, "CONFIG_KVM_BOOT_PROTO_LXBOOT"),
-        .@"hyperv-x86_64-efi" => std.mem.eql(u8, architecture, "x86_64") and
+        .@"hyperv-x86_64-efi" => nativeConfigEnabled(config, "CONFIG_PLAT_HYPERV") and
+            std.mem.eql(u8, architecture, "x86_64") and
             nativeConfigEnabled(config, "CONFIG_OPTIMIZE_PIE") and
-            nativeConfigEnabled(config, "CONFIG_LIBUKPAGING") and
-            nativeConfigEnabled(config, "CONFIG_KVM_BOOT_PROTO_EFI_STUB"),
+            nativeConfigEnabled(config, "CONFIG_LIBUKPAGING"),
     };
 }
 
@@ -1215,8 +1273,7 @@ test "native profiles require matching architecture and boot protocol" {
     };
     const hyperv = NativeConfig{ .source =
         \\CONFIG_UK_ARCH="x86_64"
-        \\CONFIG_PLAT_KVM=y
-        \\CONFIG_KVM_BOOT_PROTO_EFI_STUB=y
+        \\CONFIG_PLAT_HYPERV=y
         \\CONFIG_OPTIMIZE_PIE=y
         \\CONFIG_LIBUKPAGING=y
         \\

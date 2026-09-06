@@ -27,21 +27,30 @@ pub const Profile = struct {
     final_output: []const u8,
 };
 
-pub const x86_64_efi_kvm_objects = [_][]const u8{
-    "libkvmplat/efi_entry64.x86.o",
-    "libkvmplat/efi_post.isr.o",
-    "libkvmplat/pagetable64.o",
-    "libkvmplat/cpu_vectors_x86_64.o",
-    "libkvmplat/setup.o",
-    "libkvmplat/lcpu_start.o",
-    "libkvmplat/tscclock.o",
-    "libkvmplat/time.o",
-    "libkvmplat/qemu.x86.o",
-    "libkvmplat/memory.o",
-    "libkvmplat/memory.common.o",
-    "libkvmplat/efi.isr.o",
-    "libkvmplat/bootinfo.common.o",
-    "libkvmplat/libinfo.libuklibid.o",
+pub const x86_64_efi_hyperv_objects = [_][]const u8{
+    "libhypervplat/efi_entry64.x86.o",
+    "libhypervplat/efi_post.isr.o",
+    "libhypervplat/pagetable64.o",
+    "libhypervplat/cpu_vectors_x86_64.o",
+    "libhypervplat/setup.o",
+    "libhypervplat/lcpu_start.o",
+    "libhypervplat/memory.o",
+    "libhypervplat/memory.common.o",
+    "libhypervplat/efi.isr.o",
+    "libhypervplat/bootinfo.common.o",
+    "libhypervplat/platform.isr.o",
+    "libhypervplat/time.isr.o",
+    "libhypervplat/libinfo.libuklibid.o",
+};
+
+pub const x86_64_efi_hyperv_platform = Library{
+    .name = "libhypervplat",
+    .origin = .platform,
+    .objects = &x86_64_efi_hyperv_objects,
+    .linker_scripts = &.{
+        .{ .root = .output, .relative = "libhypervplat/link64.lds" },
+        .{ .root = .output, .relative = "libhypervplat/bootinfo.lds" },
+    },
 };
 
 pub const x86_64_efi_native_objects = [_][]const u8{

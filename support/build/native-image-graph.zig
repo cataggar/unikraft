@@ -128,6 +128,39 @@ fn registerLibraries(
     profile: data.Profile,
 ) Error!void {
     for (profile.libraries) |library| {
+        if (options.profile == .@"hyperv-x86_64-efi" and
+            std.mem.eql(u8, library.name, "libvgacons"))
+        {
+            continue;
+        }
+        if (options.profile == .@"hyperv-x86_64-efi" and
+            std.mem.eql(u8, library.name, "libkvmplat"))
+        {
+            const source = try joinPath(
+                allocator,
+                options.roots.base,
+                "plat/hyperv/hyperv_runtime.zig",
+            );
+            const output = try joinPath(
+                allocator,
+                options.roots.output,
+                "libhypervplat/hyperv_runtime.o",
+            );
+            try registerLibrary(
+                context,
+                allocator,
+                options,
+                data.x86_64_efi_hyperv_platform,
+                &.{.{
+                    .name = "hyperv-runtime",
+                    .root_source_file = source,
+                    .output = output,
+                    .optimize = .ReleaseFast,
+                    .pic = true,
+                }},
+            );
+            continue;
+        }
         if (options.profile == .@"hyperv-x86_64-efi") {
             if (std.mem.eql(u8, library.name, "libukallocstack")) {
                 try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[0], &.{});
@@ -143,52 +176,11 @@ fn registerLibraries(
         }
         var effective = library;
         if (options.profile == .@"hyperv-x86_64-efi" and
-            std.mem.eql(u8, library.name, "libkvmplat"))
-        {
-            effective.objects = &data.x86_64_efi_kvm_objects;
-        } else if (options.profile == .@"hyperv-x86_64-efi" and
             std.mem.eql(u8, library.name, "libukplat_native"))
         {
             effective.objects = &data.x86_64_efi_native_objects;
         }
         try registerLibrary(context, allocator, options, effective, &.{});
-    }
-    if (options.profile == .@"hyperv-x86_64-efi") {
-        const config_header = try joinPath(
-            allocator,
-            options.roots.output,
-            "include/uk/bits/config.h",
-        );
-        const generated_include = try joinPath(
-            allocator,
-            options.roots.output,
-            "include",
-        );
-        const source = try joinPath(
-            allocator,
-            options.roots.base,
-            "support/build/target/native-profile.zig",
-        );
-        const output = try joinPath(
-            allocator,
-            options.roots.output,
-            "libzigtarget/native-profile.o",
-        );
-        try registerLibrary(context, allocator, options, .{
-            .name = "libzigtarget",
-            .origin = .library,
-            .objects = &.{},
-        }, &.{.{
-            .name = "native-profile",
-            .root_source_file = source,
-            .output = output,
-            .includes = &.{.{
-                .path = generated_include,
-                .languages = &.{.zig},
-            }},
-            .dependencies = &.{config_header},
-            .pic = true,
-        }});
     }
 }
 
@@ -278,13 +270,13 @@ fn registerLibrary(
 
     try context.registerLibrary(.{
         .name = library.name,
-        .kind = if (std.mem.eql(u8, library.name, "libkvmplat"))
+        .kind = if (isPrimaryPlatformLibrary(library.name))
             .platform_library
         else
             .library,
         .origin = origin,
         .layout = .{ .ordinary = .{ .build_subdir = library.name } },
-        .platforms = if (std.mem.eql(u8, library.name, "libkvmplat"))
+        .platforms = if (isPrimaryPlatformLibrary(library.name))
             &.{platformName(options.profile)}
         else
             &.{},
@@ -329,7 +321,17 @@ fn registerPlatform(
         profile.linker_script_inputs.len + extra_script_count + 1,
     );
     for (profile.linker_script_inputs, 0..) |script, index| {
-        const path = try resolvePath(allocator, options.roots, script);
+        const path = if (options.profile == .@"hyperv-x86_64-efi" and index < 2)
+            try joinPath(
+                allocator,
+                options.roots.output,
+                if (index == 0)
+                    "libhypervplat/link64.lds"
+                else
+                    "libhypervplat/bootinfo.lds",
+            )
+        else
+            try resolvePath(allocator, options.roots, script);
         merge_sequence[index] = .{ .artifact = .{
             .kind = .linker_script,
             .artifact = .{ .path = path },
@@ -434,9 +436,22 @@ fn registerPlatform(
     try context.registerPlatform(.{
         .name = platformName(options.profile),
         .origin = .{ .internal = .platform },
-        .linker_definition = try joinPath(allocator, options.roots.base, "plat/kvm/Linker.uk"),
-        .libraries = &.{"libkvmplat"},
-        .object_inputs = &.{.{ .library_final_object = "libkvmplat" }},
+        .linker_definition = try joinPath(
+            allocator,
+            options.roots.base,
+            if (options.profile == .@"hyperv-x86_64-efi")
+                "plat/hyperv/Linker.uk"
+            else
+                "plat/kvm/Linker.uk",
+        ),
+        .libraries = if (options.profile == .@"hyperv-x86_64-efi")
+            &.{"libhypervplat"}
+        else
+            &.{"libkvmplat"},
+        .object_inputs = if (options.profile == .@"hyperv-x86_64-efi")
+            &.{.{ .library_final_object = "libhypervplat" }}
+        else
+            &.{.{ .library_final_object = "libkvmplat" }},
         .linker_scripts = platform_scripts,
         .link_stages = &.{
             .{
@@ -625,6 +640,11 @@ fn postProcess(
 
 fn platformName(profile: Profile) []const u8 {
     return if (profile == .@"hyperv-x86_64-efi") "hyperv" else "kvm";
+}
+
+fn isPrimaryPlatformLibrary(name: []const u8) bool {
+    return std.mem.eql(u8, name, "libkvmplat") or
+        std.mem.eql(u8, name, "libhypervplat");
 }
 
 fn copyEffects(
@@ -827,17 +847,25 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
         "x86_64-freestanding-none",
         registered.graph.target.triple,
     );
-    const zig_library = registered.graph.libraries[registered.graph.libraries.len - 1];
-    try std.testing.expectEqualStrings("libzigtarget", zig_library.name);
-    try std.testing.expectEqual(@as(usize, 0), zig_library.raw_objects.len);
+    var hyperv_library: ?component.Library = null;
+    for (registered.graph.libraries) |library| {
+        if (std.mem.eql(u8, library.name, "libhypervplat")) {
+            hyperv_library = library;
+            break;
+        }
+    }
+    const zig_library = hyperv_library orelse return error.TestUnexpectedResult;
+    try std.testing.expect(zig_library.raw_objects.len > 0);
     try std.testing.expectEqual(@as(usize, 1), zig_library.target_zig_objects.len);
     try std.testing.expect(zig_library.target_zig_objects[0].pic);
     try std.testing.expectEqualStrings(
-        "/build/include/uk/bits/config.h",
-        zig_library.target_zig_objects[0].dependencies[0],
+        "/src/unikraft/plat/hyperv/hyperv_runtime.zig",
+        zig_library.target_zig_objects[0].root_source_file,
     );
     try std.testing.expect(
-        zig_library.object_pipeline.?.partial_link_sequence[2].artifact.artifact ==
+        zig_library.object_pipeline.?.partial_link_sequence[
+            2 + data.x86_64_efi_hyperv_objects.len
+        ].artifact.artifact ==
             .component_output,
     );
 
@@ -855,7 +883,7 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
                 saw_zig_library = saw_zig_library or std.mem.eql(
                     u8,
                     artifact.artifact.library_final_object,
-                    "libzigtarget",
+                    "libhypervplat",
                 );
             }
         },

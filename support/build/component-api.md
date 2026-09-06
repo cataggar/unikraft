@@ -53,7 +53,7 @@ zig build native-link-graph \
 ```
 
 Use `qemu-arm64` for the ARM64 profile or `hyperv-x86_64-efi` for the
-x86_64 EFI profile. Other names fail explicitly. The older
+x86_64 standalone Hyper-V EFI platform. Other names fail explicitly. The older
 `-Dnative-qemu-graph` spelling remains an alias for the QEMU profiles. This
 step registers metadata only. The `native-images` step uses the same graph to ask
 Make for compile-time inputs, then executes the native library links, linker

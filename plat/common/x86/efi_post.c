@@ -12,9 +12,11 @@
 #include <uk/pm.h>
 
 /* Slave Controller Edge/Level Triggered Register */
+#if CONFIG_PLAT_KVM
 #define PIC2_ELCR2					0x4D1
 #define PIC2_ELCR2_IRQ11_ECL				(1 << 3)
 #define PIC2_ELCR2_IRQ10_ECL				(1 << 2)
+#endif
 
 /* Initial Count Register (for Timer) */
 #define LAPIC_TMICT					0xFEE00380
@@ -25,10 +27,12 @@
 #define LAPIC_BASE_EN					(1 << 11)
 
 /* Master/Slave PIC Data Registers */
+#if CONFIG_PLAT_KVM
 #define PIC1_DATA					0x21
 #define PIC1_DATA_DEFAULT_MASK				0xB8
 #define PIC2_DATA					0xA1
 #define PIC2_DATA_DEFAULT_MASK				0x8E
+#endif
 
 void lcpu_start64(void) __noreturn;
 void _ukplat_entry(struct ukplat_bootinfo *bi);
@@ -37,6 +41,7 @@ extern void *x86_bpt_pml4;
 
 static __u8 __align(16) uk_efi_bootstack[UK_PAGING_PAGE_SIZE];
 
+#if CONFIG_PLAT_KVM
 /* Unless UEFI CSM (now dropped from the specification) is activated, our PIC's
  * are masked
  */
@@ -45,6 +50,7 @@ static inline void unmask_8259_pic(void)
 	uk_arch_x86_64_outb(PIC1_DATA, PIC1_DATA_DEFAULT_MASK);
 	uk_arch_x86_64_outb(PIC2_DATA, PIC2_DATA_DEFAULT_MASK);
 }
+#endif
 
 /* UEFI enables the LAPIC Timer to run periodic routines, usually at 10KHz */
 static inline void lapic_timer_disable(void)
@@ -61,6 +67,7 @@ static inline void lapic_timer_disable(void)
 	*lapic_tmict = 0x0;
 }
 
+#if CONFIG_PLAT_KVM
 /* Unless UEFI CSM (now dropped from the specification) is activated, our PIC's
  * are masked and their interrupts mode are not configured.
  * TODO: Until we have a proper IRQ subsystem to transparently set IRQ type when
@@ -72,6 +79,7 @@ static inline void pic_8259_elcr2_level_irq10_11(void)
 	uk_arch_x86_64_outb(PIC2_ELCR2,
 			    PIC2_ELCR2_IRQ11_ECL | PIC2_ELCR2_IRQ10_ECL);
 }
+#endif
 
 void __noreturn uk_efi_jmp_to_kern()
 {
@@ -82,9 +90,13 @@ void __noreturn uk_efi_jmp_to_kern()
 
 	uk_lcpu_disable_irq();
 	uk_paging_pt_write_base((__paddr_t)&x86_bpt_pml4);
+#if CONFIG_PLAT_KVM
 	unmask_8259_pic();
+#endif
 	lapic_timer_disable();
+#if CONFIG_PLAT_KVM
 	pic_8259_elcr2_level_irq10_11();
+#endif
 
 	uk_pcpuvar_lval(0, UK_LCPU_SENTRY_SYM) = (__uptr)&_ukplat_entry;
 	uk_pcpuvar_lval(0, UK_LCPU_SSTACKP_SYM) = (__uptr)uk_efi_bootstack +
