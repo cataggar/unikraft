@@ -203,8 +203,8 @@ steps remain tracked; typed library outputs are connected automatically.
 Non-Zig compiler drivers are rejected instead of silently adopting Zig's
 COMMON-symbol behavior.
 
-When `CONFIG_OPTIMIZE_LTO=y` is active and the profile is `qemu-x86_64`, the
-per-library partial-link and objcopy stages are bypassed entirely.
+When `CONFIG_OPTIMIZE_LTO=y` is active and the native profile is `qemu-x86_64`,
+the per-library partial-link and objcopy stages are bypassed entirely.
 `native-lto.zig` collects all library object and archive inputs in registration
 order and passes them directly to a single `zig cc -flto` final link.
 `lto-symbol-policy.py` runs before that link: it invokes the configured NM
@@ -212,8 +212,9 @@ tool (`llvm-nm`) on each library's objects/archives, reads export-symbol files,
 detects private-symbol collisions and illegal cross-library private references
 (both are explicit failures), and writes a deterministic LLD version script
 with the global-symbol union and `local: *;`. The version script is passed via
-`-Wl,--version-script=<file>`. LTO is rejected at build time for `qemu-arm64`
-and `hyperv-x86_64-efi`; non-LTO ARM64 builds are unaffected.
+`-Wl,--version-script=<file>`. Within the native pipeline, LTO is rejected at
+build time for `qemu-arm64` and `hyperv-x86_64-efi`; non-LTO ARM64 builds and
+the GNU Make backend are unaffected.
 
 Run the standalone, leak-checked unit tests with:
 

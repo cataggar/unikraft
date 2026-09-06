@@ -378,37 +378,46 @@ and only then strips and converts the image to PE/COFF. Configuration and
 metadata inputs for target headers are content-tracked, so changing a solved
 configuration in place invalidates the generated header.
 
-#### Experimental LTO (QEMU/x86_64 only)
+#### Experimental LTO (QEMU/x86_64 native pipeline only)
 
-Full link-time optimization is supported for Zig 0.16 native images on
-QEMU/x86_64. It is **not** supported for QEMU/ARM64 or Hyper-V EFI; selecting
-`CONFIG_OPTIMIZE_LTO=y` with those profiles is detected at build time and
-rejected with an explicit error. Non-LTO QEMU/ARM64 builds remain fully
-supported.
+The Zig 0.16 `native-images` pipeline supports a whole-program flat LTO path
+for the `qemu-x86_64` profile. Selecting `CONFIG_OPTIMIZE_LTO=y` with the
+`qemu-arm64` or `hyperv-x86_64-efi` native profiles is detected at build time
+and rejected with an explicit error. Non-LTO QEMU/ARM64 builds remain fully
+supported. The GNU Make backend is not affected: it retains its existing
+compiler-specific per-library LTO behavior (e.g. `-flto` forwarded to GCC or
+Clang) unchanged.
 
-To enable LTO, add `CONFIG_OPTIMIZE_LTO=y` to the solved configuration and
-invoke the same `native-images` command documented above for QEMU/x86_64:
+To enable LTO for the QEMU/x86_64 native pipeline, copy the application
+x86_64 defconfig, append `CONFIG_OPTIMIZE_LTO=y`, run `zig build olddefconfig`
+to fill in remaining defaults, then run `zig build native-images` with the same
+tool arguments. Using a shell array avoids repeating the argument list:
 
 ```shell
-# Add to your solved-qemu-x86_64.config:
-#   CONFIG_OPTIMIZE_LTO=y
-zig build native-images \
-  -Dnative-profile=qemu-x86_64 \
-  -Dapp=/absolute/path/to/app \
-  -Dconfig=/absolute/path/to/solved-qemu-x86_64.config \
-  '-Dcompiler=zig cc -target x86_64-freestanding-none' \
-  -Dcompiler-targeted=true \
-  '-Dhost-cc=zig cc' \
-  '-Dhost-cxx=zig c++' \
-  -Dhost-cflags=-fno-sanitize=null \
-  '-Dmake-arg=AR=zig ar' \
-  -Dmake-arg=NM=llvm-nm \
-  -Dmake-arg=OBJCOPY=llvm-objcopy \
-  -Dmake-arg=OBJDUMP=llvm-objdump \
-  -Dmake-arg=READELF=llvm-readelf \
-  -Dmake-arg=STRIP=llvm-strip \
-  -Dmake-arg=UK_CFLAGS=-std=gnu17 \
-  -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
+config=/absolute/path/to/qemu-x86_64-lto.config
+cp /absolute/path/to/app/defconfigs/qemu-x86_64 "${config}"
+printf 'CONFIG_OPTIMIZE_LTO=y\n' >> "${config}"
+
+zig_args=(
+  "-Dapp=/absolute/path/to/app"
+  "-Dconfig=${config}"
+  "-Dcompiler=zig cc -target x86_64-freestanding-none"
+  "-Dcompiler-targeted=true"
+  "-Dhost-cc=zig cc"
+  "-Dhost-cxx=zig c++"
+  "-Dhost-cflags=-fno-sanitize=null"
+  "-Dmake-arg=AR=zig ar"
+  "-Dmake-arg=NM=llvm-nm"
+  "-Dmake-arg=OBJCOPY=llvm-objcopy"
+  "-Dmake-arg=OBJDUMP=llvm-objdump"
+  "-Dmake-arg=READELF=llvm-readelf"
+  "-Dmake-arg=STRIP=llvm-strip"
+  "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+  "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+)
+
+zig build olddefconfig "${zig_args[@]}"
+zig build native-images -Dnative-profile=qemu-x86_64 "${zig_args[@]}"
 ```
 
 When `CONFIG_OPTIMIZE_LTO=y` is active the per-library `zig cc -r` partial-link
@@ -466,12 +475,12 @@ workload and commit; they are **not** guaranteed thresholds and do not imply
 runtime speedup. Real applications may see different, smaller, or larger
 changes depending on their code and configuration:
 
-| Metric         | Delta   |
-|----------------|---------|
-| `.text`        | −0.22%  |
-| `.rodata`      | −6.89%  |
-| `.data`        | −45.57% |
-| Defined symbols| −10.89% |
+| Metric          | Delta    |
+|-----------------|----------|
+| `.text`         | -0.22%   |
+| `.rodata`       | -6.89%   |
+| `.data`         | -45.57%  |
+| Defined symbols | -10.89%  |
 
 The standalone Clang/LLVM 21.1.8 QEMU/ARM64 build uses the GNU Make backend
 directly:
