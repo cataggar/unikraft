@@ -339,6 +339,47 @@ the listed LLVM binary tools. This compiler support remains experimental, is
 limited to GNU Make-configured QEMU/x86_64 and QEMU/ARM64 applications, and
 does not support LTO.
 
+The standalone Clang/LLVM 21.1.8 QEMU/ARM64 build uses the GNU Make backend
+directly:
+
+```shell
+llvm=/absolute/path/to/llvm/bin
+app=/absolute/path/to/app
+build=/absolute/path/to/build
+make_args=(
+  "A=${app}"
+  "O=${build}"
+  "HOSTCC=${llvm}/clang"
+  "HOSTCXX=${llvm}/clang++"
+  "COMPILER=${llvm}/clang --target=aarch64-none-elf"
+  "COMPILER_TARGETED=y"
+  "LINKER=${llvm}/clang --target=aarch64-none-elf -fuse-ld=lld"
+  "PARTIAL_LINKER=${llvm}/ld.lld -m aarch64elf"
+  "PARTIAL_LINKER_TYPE=raw"
+  "AR=${llvm}/llvm-ar"
+  "NM=${llvm}/llvm-nm"
+  "OBJCOPY=${llvm}/llvm-objcopy"
+  "OBJDUMP=${llvm}/llvm-objdump"
+  "READELF=${llvm}/llvm-readelf"
+  "STRIP=${llvm}/llvm-strip"
+  "UK_CFLAGS=-std=gnu17"
+  "UK_LDFLAGS=-rtlib=compiler-rt"
+)
+make "${make_args[@]}" \
+  "UK_DEFCONFIG=${app}/defconfigs/qemu-arm64" \
+  defconfig
+make "${make_args[@]}" -j"$(nproc)"
+```
+
+Raw `ld.lld` partial links activate Unikraft's merged linker-script path; the
+final link still runs through the Clang driver. The build requires GNU Make,
+Bison, Flex, Python 3, ncurses headers, and LLVM's Clang, LLD, archive, and ELF
+tools. It does not require GCC, libgcc, or GNU cross-binutils. The x86_64 LLVM
+release does not ship an AArch64 compiler-rt archive, so applications that emit
+compiler builtin calls must also supply AArch64 compiler-rt objects. CI builds
+and links a forced 128-bit division builtin from the matching pinned
+compiler-rt source release.
+
 ### Toolchain Installation
 
 You can install the companion command-line client [`kraft`][kraft] by using the interactive installer:
