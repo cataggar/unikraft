@@ -363,6 +363,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_elf_common_validator_tests = b.addRunArtifact(elf_common_validator_tests);
     run_elf_common_validator_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const linker_script_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/linker-script.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_linker_script_tests = b.addRunArtifact(linker_script_tests);
+    run_linker_script_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const final_link_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/final-link.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_final_link_tests = b.addRunArtifact(final_link_tests);
+    run_final_link_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
     const native_qemu_graph_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/native-qemu-graph.zig"),
@@ -374,7 +392,7 @@ pub fn build(b: *std.Build) void {
     run_native_qemu_graph_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
     const test_step = b.step(
         "test",
-        "Test facade, native configuration, library linking, and QEMU graphs",
+        "Test facade, native configuration, native linking, and QEMU graphs",
     );
     test_step.dependOn(&run_facade_tests.step);
     test_step.dependOn(&run_runner_tests.step);
@@ -383,6 +401,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_native_library_link_tests.step);
     test_step.dependOn(&run_elf_common_validator_tests.step);
     test_step.dependOn(&run_native_qemu_graph_tests.step);
+    test_step.dependOn(&run_linker_script_tests.step);
+    test_step.dependOn(&run_final_link_tests.step);
     const integration_output = resolvePath(
         b.allocator,
         root,
