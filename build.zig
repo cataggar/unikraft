@@ -5,6 +5,7 @@ const component_api = @import("support/build/component-api.zig");
 const facade_paths = @import("support/build/zig-facade-paths.zig");
 const final_link = @import("support/build/final-link.zig");
 const native_library_link = @import("support/build/native-library-link.zig");
+const native_lto = @import("support/build/native-lto.zig");
 const native_postprocess = @import("support/build/native-postprocess.zig");
 const native_image_graph = @import("support/build/native-image-graph.zig");
 const native_target_object = @import("support/build/native-target-object.zig");
@@ -437,6 +438,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_native_target_object_tests = b.addRunArtifact(native_target_object_tests);
     run_native_target_object_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const native_lto_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-lto.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_native_lto_tests = b.addRunArtifact(native_lto_tests);
+    run_native_lto_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
     const test_step = b.step(
         "test",
         "Test facade, native configuration, native linking, QEMU graphs, and post-processing",
@@ -455,6 +465,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(native_target_object.addFixtureValidation(b) catch |err| {
         @panic(@errorName(err));
     });
+    test_step.dependOn(&run_native_lto_tests.step);
     const integration_output = resolvePath(
         b.allocator,
         root,
@@ -832,6 +843,45 @@ fn registerNativePipeline(
         )).step);
         return step;
     };
+
+    const cq = configQuery(config);
+    const link_mode = native_lto.LinkMode.detect(cq);
+
+    // LTO path: flat zig cc -flto final link, no per-library partial/objcopy.
+    if (link_mode == .lto) {
+        native_lto.requireLtoProfile(registered.profile) catch {
+            step.dependOn(&b.addFail(b.fmt(
+                "LTO is not supported for the '{s}' profile; only qemu-x86_64 is implemented",
+                .{@tagName(registered.profile)},
+            )).step);
+            return step;
+        };
+        const opt_level = native_lto.OptLevel.detect(cq);
+        const lto_resolver = final_link.ArtifactResolver.cwdRelative();
+        const lto_result = native_lto.executeLtoFinalLink(
+            b,
+            registered.graph,
+            lto_resolver,
+            &make_inputs.step,
+            opt_level,
+        ) catch |err| {
+            step.dependOn(&b.addFail(b.fmt(
+                "unable to execute LTO final link: {s}",
+                .{@errorName(err)},
+            )).step);
+            return step;
+        };
+        return finishNativeImages(
+            b,
+            step,
+            registered,
+            config,
+            lto_result.stage_name,
+            lto_result.output,
+        );
+    }
+
+    // Standard path: per-library partial-link + objcopy, then final link.
     const bindings = nativePathBindings(b, registered.graph, target_objects);
     const libraries = native_library_link.execute(b, registered.graph, .{
         .path_bindings = bindings,
@@ -869,9 +919,28 @@ fn registerNativePipeline(
         return step;
     }
 
+    return finishNativeImages(
+        b,
+        step,
+        registered,
+        config,
+        linked[0].stage_name,
+        linked[0].output,
+    );
+}
+
+/// Shared tail for both LTO and standard link paths: post-process and publish.
+fn finishNativeImages(
+    b: *std.Build,
+    step: *std.Build.Step,
+    registered: *native_image_graph.RegisteredGraph,
+    config: *const NativeConfig,
+    stage_name: []const u8,
+    link_output: std.Build.LazyPath,
+) *std.Build.Step {
     const final_reference = component_api.ArtifactReference{ .stage_output = .{
         .platform = registered.graph.selectedPlatform().name,
-        .stage = linked[0].stage_name,
+        .stage = stage_name,
     } };
     const post_plan = native_postprocess.planSelectedPlatform(
         b.allocator,
@@ -879,7 +948,7 @@ fn registerNativePipeline(
         configQuery(config),
         &.{.{
             .reference = final_reference,
-            .logical_path = finalStageOutput(registered.graph, linked[0].stage_name) orelse {
+            .logical_path = finalStageOutput(registered.graph, stage_name) orelse {
                 step.dependOn(&b.addFail(
                     "native QEMU graph final-link output is not registered",
                 ).step);
@@ -897,7 +966,7 @@ fn registerNativePipeline(
     const post = native_postprocess.execute(
         b,
         post_plan,
-        &.{linked[0].output},
+        &.{link_output},
         .{
             .python_executable = "python3",
             .strip = registered.graph.toolchain.binutils.strip.command,
@@ -929,8 +998,8 @@ fn registerNativePipeline(
     addPublishedOutput(
         b,
         step,
-        linked[0].output,
-        finalStageOutput(registered.graph, linked[0].stage_name).?,
+        link_output,
+        finalStageOutput(registered.graph, stage_name).?,
     );
     for (post.outputs, 0..) |output, index| {
         var superseded = false;
@@ -1109,6 +1178,38 @@ test "native profiles require matching architecture and boot protocol" {
     try std.testing.expect(!nativeProfileMatchesConfig(.@"qemu-x86_64", &arm64));
     try std.testing.expect(nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", &hyperv));
     try std.testing.expect(!nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", &x86));
+}
+
+test "LTO mode detection from solved config" {
+    const lto_config = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_KVM=y
+        \\CONFIG_KVM_BOOT_PROTO_MULTIBOOT=y
+        \\CONFIG_OPTIMIZE_LTO=y
+        \\CONFIG_OPTIMIZE_PERF=y
+        \\
+    };
+    const cq = configQuery(&lto_config);
+    try std.testing.expectEqual(native_lto.LinkMode.lto, native_lto.LinkMode.detect(cq));
+    try std.testing.expectEqual(native_lto.OptLevel.perf, native_lto.OptLevel.detect(cq));
+
+    const standard_config = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_KVM=y
+        \\CONFIG_KVM_BOOT_PROTO_MULTIBOOT=y
+        \\CONFIG_OPTIMIZE_PERF=y
+        \\
+    };
+    const sq = configQuery(&standard_config);
+    try std.testing.expectEqual(native_lto.LinkMode.standard, native_lto.LinkMode.detect(sq));
+}
+
+test "LTO rejects ARM64 profile" {
+    try native_lto.requireLtoProfile(.@"qemu-x86_64");
+    try std.testing.expectError(
+        error.UnsupportedLtoProfile,
+        native_lto.requireLtoProfile(.@"qemu-arm64"),
+    );
 }
 
 fn addFailedTargets(b: *std.Build, message: []const u8) void {

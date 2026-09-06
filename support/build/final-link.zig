@@ -235,7 +235,7 @@ pub const Executed = struct {
     step: *std.Build.Step.Run,
 };
 
-const MergedStage = struct {
+pub const MergedStage = struct {
     name: []const u8,
     output: std.Build.LazyPath,
 };
@@ -326,7 +326,7 @@ pub const Executor = struct {
         return executed;
     }
 
-    fn addMergeStages(
+    pub fn addMergeStages(
         self: Executor,
         graph: component.FinalizedGraph,
     ) PlanError![]const MergedStage {
@@ -365,7 +365,7 @@ pub const Executor = struct {
         return merged_stages.toOwnedSlice();
     }
 
-    fn resolveMergedScript(
+    pub fn resolveMergedScript(
         self: Executor,
         graph: component.FinalizedGraph,
         plan: Plan,
