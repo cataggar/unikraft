@@ -395,11 +395,13 @@ tool arguments. Using a shell array avoids repeating the argument list:
 
 ```shell
 config=/absolute/path/to/qemu-x86_64-lto.config
+output=/absolute/path/to/build-zig-lto
 cp /absolute/path/to/app/defconfigs/qemu-x86_64 "${config}"
 printf 'CONFIG_OPTIMIZE_LTO=y\n' >> "${config}"
 
 zig_args=(
   "-Dapp=/absolute/path/to/app"
+  "-Doutput=${output}"
   "-Dconfig=${config}"
   "-Dcompiler=zig cc -target x86_64-freestanding-none"
   "-Dcompiler-targeted=true"
