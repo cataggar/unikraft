@@ -151,6 +151,13 @@ pub fn executeLtoFinalLink(
     policy.addArg("--output");
     const version_script = policy.addOutputFileArg("lto-version-script.lds");
 
+    // Output: list of cross-library referenced symbols for diagnostics.
+    // The actual force-keep is done via -Wl,-u below (reading export files
+    // at graph construction time) since LLD's LTO does not reliably process
+    // EXTERN() or response files before internalization.
+    policy.addArg("--undefined-output");
+    _ = policy.addOutputFileArg("lto-extern-symbols.lds");
+
     // Add per-library arguments.
     for (graph.libraries, 0..) |library, library_index| {
         if (!graph.libraryIsActive(library_index)) continue;
@@ -201,6 +208,37 @@ pub fn executeLtoFinalLink(
         opt_level.flag(),
     });
 
+    // Force-keep ALL global symbols during LTO.  LLD's LTO pass may
+    // internalize and discard bitcode definitions before linker scripts or
+    // EXTERN() directives are processed.  The only reliable mechanism is
+    // -u per symbol on the command line.  We emit them for every global
+    // symbol (from the version script set) since the policy step already
+    // computed the full set; the count is bounded by the graph size.
+    for (graph.libraries, 0..) |library, library_index| {
+        if (!graph.libraryIsActive(library_index)) continue;
+        if (library.object_pipeline == null) continue;
+        // Emit -Wl,-u for each exported symbol from this library's export lists.
+        for (library.exports) |export_path| {
+            // We need to read the export file at graph time (it's a static path).
+            const content = std.Io.Dir.cwd().readFileAlloc(
+                b.graph.io,
+                export_path,
+                b.allocator,
+                .limited(1024 * 1024),
+            ) catch continue;
+            var lines = std.mem.splitScalar(u8, content, '\n');
+            while (lines.next()) |raw_line| {
+                const line = std.mem.trimEnd(u8, raw_line, " \t\r");
+                if (line.len == 0) continue;
+                if (line[0] == '#') continue;
+                link.addArg(b.fmt("-Wl,-u,{s}", .{line}));
+            }
+        }
+    }
+
+    // Apply version script to control symbol visibility in the final ELF.
+    link.addPrefixedFileArg("-Wl,--version-script=", version_script);
+
     // Walk the stage sequence for entry point, standard flags, and linker
     // scripts. library_final_object artifacts are replaced by the flattened
     // library inputs emitted below.
@@ -237,9 +275,6 @@ pub fn executeLtoFinalLink(
             },
         }
     }
-
-    // Apply version script.
-    link.addPrefixedFileArg("-Wl,--version-script=", version_script);
 
     // Flatten all active library inputs in registration order.
     var have_archives = false;
@@ -280,6 +315,9 @@ pub fn executeLtoFinalLink(
 
     if (have_archives) link.addArg("-Wl,--end-group");
 
+    // -o must precede the output path so zig cc does not try to interpret
+    // the .dbg extension as an input file type.
+    link.addArg("-o");
     const output = link.addOutputFileArg(std.fs.path.basename(stage.output));
 
     return .{

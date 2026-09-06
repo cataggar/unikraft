@@ -42,6 +42,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output", required=True, help="Output version-script path"
     )
+    parser.add_argument(
+        "--undefined-output", default=None,
+        help="Output file listing symbols needing -Wl,-u (one per line)"
+    )
     args, remaining = parser.parse_known_args(argv)
     args.spec = remaining
     return args
@@ -311,7 +315,20 @@ def validate_and_generate(nm_tool, libraries):
                     % (ld["name"], sym, private_only_defs[sym])
                 )
 
-    return sorted(global_symbols), errors
+    # Phase 4: compute symbols needing EXTERN() to prevent LTO DCE.
+    # Any symbol referenced (undefined) by any library must be force-kept
+    # if it might be provided by another object, archive, or linker script.
+    # LTO may otherwise internalize and discard definitions, especially for
+    # section-placed variables (per-CPU data) and linker-script-provided
+    # symbols (section boundaries, constructor tables).
+    force_undefined = set()
+    for ld in lib_data:
+        force_undefined |= ld["undefined"]
+    # Also include all global symbols -- they may be needed across TUs.
+    force_undefined |= global_symbols
+
+    return sorted(global_symbols), errors, sorted(force_undefined)
+
 
 
 def quote_version_script_symbol(name):
@@ -349,8 +366,11 @@ def main(argv=None):
 
     if not libraries:
         script = generate_version_script([])
+        force_undefined = []
     else:
-        global_symbols, errors = validate_and_generate(args.nm, libraries)
+        global_symbols, errors, force_undefined = validate_and_generate(
+            args.nm, libraries
+        )
         if errors:
             print(
                 "error: LTO symbol-policy violations detected:",
@@ -373,6 +393,26 @@ def main(argv=None):
             file=sys.stderr,
         )
         sys.exit(2)
+
+    if args.undefined_output:
+        try:
+            undef_dir = os.path.dirname(args.undefined_output)
+            if undef_dir:
+                os.makedirs(undef_dir, exist_ok=True)
+            with open(args.undefined_output, "w") as f:
+                f.write(
+                    "/* Force-keep cross-library referenced symbols "
+                    "during LTO. */\n"
+                )
+                for sym in force_undefined:
+                    f.write("EXTERN(%s)\n" % sym)
+        except OSError as e:
+            print(
+                "error: cannot write undefined output '%s': %s"
+                % (args.undefined_output, e),
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
 
 if __name__ == "__main__":
