@@ -459,9 +459,11 @@ jobs:
         )
         zig build olddefconfig "${zig_args[@]}"
         # Assert CONFIG_OPTIMIZE_LTO=y is active in the solved config before
-        # building; a trailing unsolved line in the seed is not sufficient.
-        if ! grep --quiet '^CONFIG_OPTIMIZE_LTO=y$' "${build}/.config"; then
-          echo "CONFIG_OPTIMIZE_LTO=y not found in ${build}/.config after olddefconfig." >&2
+        # building.  olddefconfig writes back to ${config} (reported as
+        # "configuration written to .../qemu-x86_64-lto.config"); ${build}/.config
+        # is not created at this stage.
+        if ! grep --quiet '^CONFIG_OPTIMIZE_LTO=y$' "${config}"; then
+          echo "CONFIG_OPTIMIZE_LTO=y not found in ${config} after olddefconfig." >&2
           exit 1
         fi
         set +e
