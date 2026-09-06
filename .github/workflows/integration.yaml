@@ -282,17 +282,14 @@ jobs:
           fi
         done
 
-    - name: Install Zig
-      run: |
-        set -euo pipefail
-        archive="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
-        directory="${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}"
-        curl --fail --location --silent --show-error \
-          "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
-          --output "${archive}"
-        echo "${ZIG_X86_64_LINUX_SHA256}  ${archive}" | sha256sum --check
-        tar --extract --xz --file "${archive}" --directory "${RUNNER_TEMP}"
-        echo "${directory}" >> "${GITHUB_PATH}"
+    - name: Install Zig with ghr
+      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.8.0
+        tools: |
+          cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
     - name: Build helloworld with Zig
       run: |
@@ -506,17 +503,14 @@ jobs:
           fi
         done
 
-    - name: Install Zig
-      run: |
-        set -euo pipefail
-        archive="${RUNNER_TEMP}/zig-${ZIG_VERSION}.tar.xz"
-        directory="${RUNNER_TEMP}/zig-x86_64-linux-${ZIG_VERSION}"
-        curl --fail --location --silent --show-error \
-          "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
-          --output "${archive}"
-        echo "${ZIG_X86_64_LINUX_SHA256}  ${archive}" | sha256sum --check
-        tar --extract --xz --file "${archive}" --directory "${RUNNER_TEMP}"
-        echo "${directory}" >> "${GITHUB_PATH}"
+    - name: Install Zig with ghr
+      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.8.0
+        tools: |
+          cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
     - name: Build helloworld with Zig
       run: |
