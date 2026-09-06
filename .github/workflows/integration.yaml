@@ -296,32 +296,36 @@ jobs:
         set -euo pipefail
         test "$(zig version)" = "${ZIG_VERSION}"
         build="${RUNNER_TEMP}/build-zig"
+        config="${RUNNER_TEMP}/qemu-x86_64.config"
         log="${RUNNER_TEMP}/zig-build.log"
+        export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-global-cache"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-local-cache-x86_64"
         rm -rf "${build}"
-        make_args=(
-          "A=${GITHUB_WORKSPACE}/_helloworld"
-          "O=${build}"
-          "HOSTCC=zig cc"
-          "HOSTCXX=zig c++"
+        cp "${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-x86_64" "${config}"
+        zig_args=(
+          "-Dapp=${GITHUB_WORKSPACE}/_helloworld"
+          "-Doutput=${build}"
+          "-Dconfig=${config}"
+          "-Dcompiler=zig cc -target x86_64-freestanding-none"
+          "-Dcompiler-targeted=true"
+          "-Dhost-cc=zig cc"
+          "-Dhost-cxx=zig c++"
           # Kconfig's kernel-style list sentinel is intentionally null-derived.
-          "HOSTCFLAGS=-fno-sanitize=null"
-          "COMPILER=zig cc -target x86_64-freestanding-none"
-          "PARTIAL_LINKER=zig ld.lld"
-          "PARTIAL_LINKER_TYPE=raw"
-          "AR=zig ar"
-          "NM=llvm-nm"
-          "OBJCOPY=llvm-objcopy"
-          "OBJDUMP=llvm-objdump"
-          "READELF=llvm-readelf"
-          "STRIP=llvm-strip"
-          "UK_CFLAGS=-std=gnu17"
-          "UK_LDFLAGS=-rtlib=compiler-rt"
+          "-Dhost-cflags=-fno-sanitize=null"
+          "-Dmake-arg=AR=zig ar"
+          "-Dmake-arg=NM=llvm-nm"
+          "-Dmake-arg=OBJCOPY=llvm-objcopy"
+          "-Dmake-arg=OBJDUMP=llvm-objdump"
+          "-Dmake-arg=READELF=llvm-readelf"
+          "-Dmake-arg=STRIP=llvm-strip"
+          "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+          "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
         )
-        make "${make_args[@]}" \
-          UK_DEFCONFIG="${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-x86_64" \
-          defconfig
+        zig build olddefconfig "${zig_args[@]}"
         set +e
-        make "${make_args[@]}" V=1 -j"$(nproc)" 2>&1 | tee "${log}"
+        zig build native-images \
+          -Dnative-qemu-graph=qemu-x86_64 \
+          "${zig_args[@]}" 2>&1 | tee "${log}"
         build_status=("${PIPESTATUS[@]}")
         set -e
 
@@ -351,6 +355,12 @@ jobs:
         done
         if [ "${gcc_found}" -ne 0 ]; then
           echo "The target build invoked a GCC command." >&2
+          exit 1
+        fi
+        if grep --with-filename --line-number --extended-regexp \
+          '(^|[[:space:]])zig[[:space:]]+ld\.lld([[:space:]]|$)' \
+          "${command_files[@]}" "${log}"; then
+          echo "The native target build invoked zig ld.lld directly." >&2
           exit 1
         fi
         test "${build_status[1]}" -eq 0
@@ -390,6 +400,12 @@ jobs:
         fi
         if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
           echo "The Zig image has a libgcc dependency." >&2
+          exit 1
+        fi
+        common="$(llvm-nm --format=posix "${image}" | awk '$2 == "C"')"
+        if [ -n "${common}" ]; then
+          echo "The Zig image has COMMON symbols:" >&2
+          printf '%s\n' "${common}" >&2
           exit 1
         fi
 
@@ -517,33 +533,36 @@ jobs:
         set -euo pipefail
         test "$(zig version)" = "${ZIG_VERSION}"
         build="${RUNNER_TEMP}/build-zig-arm64"
+        config="${RUNNER_TEMP}/qemu-arm64.config"
         log="${RUNNER_TEMP}/zig-arm64-build.log"
+        export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-global-cache"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-local-cache-arm64"
         rm -rf "${build}"
-        make_args=(
-          "A=${GITHUB_WORKSPACE}/_helloworld"
-          "O=${build}"
-          "HOSTCC=zig cc"
-          "HOSTCXX=zig c++"
+        cp "${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-arm64" "${config}"
+        zig_args=(
+          "-Dapp=${GITHUB_WORKSPACE}/_helloworld"
+          "-Doutput=${build}"
+          "-Dconfig=${config}"
+          "-Dcompiler=zig cc -target aarch64-freestanding-none"
+          "-Dcompiler-targeted=true"
+          "-Dhost-cc=zig cc"
+          "-Dhost-cxx=zig c++"
           # Kconfig's kernel-style list sentinel is intentionally null-derived.
-          "HOSTCFLAGS=-fno-sanitize=null"
-          "COMPILER=zig cc -target aarch64-freestanding-none"
-          "COMPILER_TARGETED=y"
-          "PARTIAL_LINKER=zig ld.lld"
-          "PARTIAL_LINKER_TYPE=raw"
-          "AR=zig ar"
-          "NM=llvm-nm"
-          "OBJCOPY=llvm-objcopy"
-          "OBJDUMP=llvm-objdump"
-          "READELF=llvm-readelf"
-          "STRIP=llvm-strip"
-          "UK_CFLAGS=-std=gnu17"
-          "UK_LDFLAGS=-rtlib=compiler-rt"
+          "-Dhost-cflags=-fno-sanitize=null"
+          "-Dmake-arg=AR=zig ar"
+          "-Dmake-arg=NM=llvm-nm"
+          "-Dmake-arg=OBJCOPY=llvm-objcopy"
+          "-Dmake-arg=OBJDUMP=llvm-objdump"
+          "-Dmake-arg=READELF=llvm-readelf"
+          "-Dmake-arg=STRIP=llvm-strip"
+          "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+          "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
         )
-        make "${make_args[@]}" \
-          UK_DEFCONFIG="${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-arm64" \
-          defconfig
+        zig build olddefconfig "${zig_args[@]}"
         set +e
-        make "${make_args[@]}" V=1 -j"$(nproc)" 2>&1 | tee "${log}"
+        zig build native-images \
+          -Dnative-qemu-graph=qemu-arm64 \
+          "${zig_args[@]}" 2>&1 | tee "${log}"
         build_status=("${PIPESTATUS[@]}")
         set -e
 
@@ -569,6 +588,12 @@ jobs:
         done
         if [ "${gcc_found}" -ne 0 ]; then
           echo "The target build invoked a GCC command." >&2
+          exit 1
+        fi
+        if grep --with-filename --line-number --extended-regexp \
+          '(^|[[:space:]])zig[[:space:]]+ld\.lld([[:space:]]|$)' \
+          "${command_files[@]}" "${log}"; then
+          echo "The native target build invoked zig ld.lld directly." >&2
           exit 1
         fi
         test "${build_status[1]}" -eq 0
@@ -608,6 +633,12 @@ jobs:
         fi
         if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
           echo "The Zig image has a libgcc dependency." >&2
+          exit 1
+        fi
+        common="$(llvm-nm --format=posix "${image}" | awk '$2 == "C"')"
+        if [ -n "${common}" ]; then
+          echo "The Zig image has COMMON symbols:" >&2
+          printf '%s\n' "${common}" >&2
           exit 1
         fi
 

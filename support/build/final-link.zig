@@ -244,8 +244,17 @@ pub const Executor = struct {
     b: *std.Build,
     merger: *std.Build.Step.Compile,
     resolver: ArtifactResolver,
+    prerequisite: ?*std.Build.Step,
 
     pub fn init(b: *std.Build, resolver: ArtifactResolver) Executor {
+        return initWithPrerequisite(b, resolver, null);
+    }
+
+    pub fn initWithPrerequisite(
+        b: *std.Build,
+        resolver: ArtifactResolver,
+        prerequisite: ?*std.Build.Step,
+    ) Executor {
         const merger = b.addExecutable(.{
             .name = "unikraft-linker-script",
             .root_module = b.createModule(.{
@@ -258,6 +267,7 @@ pub const Executor = struct {
             .b = b,
             .merger = merger,
             .resolver = resolver,
+            .prerequisite = prerequisite,
         };
     }
 
@@ -279,6 +289,9 @@ pub const Executor = struct {
             );
 
             const link = self.b.addSystemCommand(&.{plan.command});
+            if (self.prerequisite) |prerequisite| {
+                link.step.dependOn(prerequisite);
+            }
             var output: ?std.Build.LazyPath = null;
             for (plan.arguments, 0..) |argument, argument_index| {
                 switch (argument) {
@@ -328,6 +341,9 @@ pub const Executor = struct {
             if (!std.mem.eql(u8, custom, "merge-linker-scripts")) continue;
 
             const merge = self.b.addRunArtifact(self.merger);
+            if (self.prerequisite) |prerequisite| {
+                merge.step.dependOn(prerequisite);
+            }
             merge.setName(self.b.fmt("merge linker scripts for {s}", .{stage.name}));
             const output = merge.addOutputFileArg(std.fs.path.basename(stage.output));
             if (stage.sequence.len == 0) return error.MissingLinkerScript;
@@ -375,6 +391,9 @@ pub const Executor = struct {
         }
 
         const merge = self.b.addRunArtifact(self.merger);
+        if (self.prerequisite) |prerequisite| {
+            merge.step.dependOn(prerequisite);
+        }
         const merged = merge.addOutputFileArg(self.b.fmt(
             "{s}-{s}-combined.lds",
             .{ graph.selectedPlatform().name, plan.stage_name },

@@ -45,8 +45,18 @@ zig build native-link-graph \
 ```
 
 Use `qemu-arm64` for the ARM64 profile. Other names fail explicitly. This step
-registers metadata only; target compilation and link command execution are
-intentionally left to later integration. Fixtures under
+registers metadata only. The `native-images` step uses the same graph to ask
+Make for compile-time inputs, then executes the native library links, linker
+script merge, final link, post-processing, and output publication:
+
+```sh
+zig build native-images \
+  -Dapp=/absolute/path/to/app-helloworld \
+  -Dconfig=/absolute/path/to/solved.config \
+  -Dnative-qemu-graph=qemu-x86_64
+```
+
+Fixtures under
 `tests/native-qemu-graph/` are deterministic projections of `make build-graph`
 for the documented Zig/raw compatibility configurations and are checked by
 the module tests.

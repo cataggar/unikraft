@@ -857,7 +857,7 @@ $(foreach plat,$(UK_PLATS),$(eval $(call import_linker,$(plat))))
 # and platform linker definitions have been evaluated.
 $(eval $(call verbose_include,$(CONFIG_UK_BASE)/support/build/Makefile.graph))
 
-.PHONY: prepare preprocess image libs objs clean
+.PHONY: prepare preprocess image libs objs native-link-inputs clean
 
 fetch: $(UK_FETCH) $(UK_FETCH-y)
 
@@ -874,6 +874,8 @@ preprocess: $(UK_PREPROCESS) $(UK_PREPROCESS-y) | prepare
 objs: $(UK_OBJS) $(UK_OBJS-y)
 
 libs: $(UK_ALIBS) $(UK_ALIBS-y) $(UK_OLIBS) $(UK_OLIBS-y)
+
+native-link-inputs: $(UK_ALIBS) $(UK_ALIBS-y) $(UK_OBJS) $(UK_OBJS-y) $(UK_LDS) $(UK_LDS-y)
 
 images: $(UK_DEBUG_IMAGES) $(UK_DEBUG_IMAGES-y) $(UK_IMAGES) $(UK_IMAGES-y)
 
@@ -919,7 +921,7 @@ ukconfig: $(BUILD_DIR)/Makefile menuconfig
 
 all: ukconfig
 
-.PHONY: prepare image libs objs clean-libs clean ukconfig build-graph
+.PHONY: prepare image libs objs native-link-inputs clean-libs clean ukconfig build-graph
 
 fetch: ukconfig
 
@@ -930,6 +932,8 @@ preprocess: ukconfig
 objs: ukconfig
 
 libs: ukconfig
+
+native-link-inputs: ukconfig
 
 images: ukconfig
 
