@@ -350,10 +350,11 @@ configuration must select the standalone x86_64 `PLAT_HYPERV`, PIE, and
 `LIBUKPAGING`; GNU Make continues to provide the shared x86 UEFI C/assembly
 objects:
 
-The platform captures wall-clock time from UEFI before `ExitBootServices` and
-uses Hyper-V's partition reference counter for monotonic time. Synthetic
-interrupts and timers are intentionally deferred; blocking waits spin until
-that support is added.
+The platform captures wall-clock time from UEFI before `ExitBootServices`,
+uses the Hyper-V reference-TSC page when available (falling back to the
+partition reference counter), and uses SynIC STimer0 for one-shot scheduler
+wakeups. The initial implementation is intentionally uniprocessor because
+SynIC registers and shared pages are per-vCPU.
 
 ```shell
 zig build native-images \

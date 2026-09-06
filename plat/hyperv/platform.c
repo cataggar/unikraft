@@ -30,6 +30,10 @@ static const char *hyperv_detect_error(int rc)
 		return "AccessHypercallMsrs privilege is absent";
 	case HYPERV_DETECT_TIME_REF_PRIVILEGE:
 		return "AccessPartitionReferenceCounter privilege is absent";
+	case HYPERV_DETECT_SYNIC_PRIVILEGE:
+		return "AccessSynicRegs privilege is absent";
+	case HYPERV_DETECT_STIMER_PRIVILEGE:
+		return "AccessSyntheticTimerRegs privilege is absent";
 	default:
 		return "unknown discovery failure";
 	}
