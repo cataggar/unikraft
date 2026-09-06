@@ -9,7 +9,8 @@ runs:
       run: |
         set -eu
         {
-          echo 'CLANG_VERSION=21'
+          echo 'CLANG_VERSION=21.1.8'
+          echo 'COMPILER_RT_SRC_SHA256=dd54ae21aee1780fac59445b51ebff601ad016b31ac3a7de3b21126fd3ccb229'
           echo 'CODECHECKER_VERSION=6.27.3'
           echo 'ZIG_VERSION=0.16.0'
           echo 'ZIG_X86_64_LINUX_SHA256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00'

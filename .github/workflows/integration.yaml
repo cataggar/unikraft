@@ -637,6 +637,320 @@ jobs:
         test "${status[0]}" -eq 0
         grep --fixed-strings --quiet 'Hello world!' "${output}"
 
+  clang-helloworld-arm64:
+    name: clang-helloworld-arm64
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Install checkout and build dependencies
+      run: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          bison \
+          ca-certificates \
+          curl \
+          file \
+          flex \
+          git \
+          libedit2 \
+          libffi8 \
+          libncurses-dev \
+          libstdc++6 \
+          libtinfo6 \
+          libxml2 \
+          libz3-4 \
+          libzstd1 \
+          make \
+          python3 \
+          tar \
+          xz-utils \
+          zlib1g
+        rm -rf /var/lib/apt/lists/*
+
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Load configuration
+      uses: ./.github/actions/ci-versions
+
+    - name: Install Clang and LLVM
+      uses: KyleMayes/install-llvm-action@v2
+      with:
+        arch: x64
+        directory: ${{ runner.temp }}/clang-llvm
+        env: false
+        version: ${{ env.CLANG_VERSION }}
+
+    - name: Download QEMU
+      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.8.0
+        tools: cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+        dest: ${{ runner.temp }}/qemu-tools
+        extract: 'true'
+        strip-components: '1'
+
+    - name: Fetch helloworld
+      uses: actions/checkout@v4
+      with:
+        repository: unikraft/app-helloworld
+        fetch-depth: 1
+        path: _helloworld
+
+    - name: Verify standalone Clang and LLVM tools
+      run: |
+        set -euo pipefail
+        llvm="${RUNNER_TEMP}/clang-llvm/bin"
+        for command in \
+          "${llvm}/clang" \
+          "${llvm}/clang++" \
+          "${llvm}/ld.lld" \
+          "${llvm}/llvm-ar" \
+          "${llvm}/llvm-nm" \
+          "${llvm}/llvm-objcopy" \
+          "${llvm}/llvm-objdump" \
+          "${llvm}/llvm-readelf" \
+          "${llvm}/llvm-strip" \
+          "${RUNNER_TEMP}/qemu-tools/qemu-system-aarch64"; do
+          test -x "${command}"
+        done
+        "${llvm}/clang" --version
+        test "$("${llvm}/clang" -dumpversion)" = "${CLANG_VERSION}"
+
+        for command in \
+          gcc g++ gcc-ar gcc-nm \
+          aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ \
+          aarch64-linux-gnu-ld aarch64-linux-gnu-ar \
+          aarch64-linux-gnu-nm aarch64-linux-gnu-objcopy \
+          aarch64-linux-gnu-objdump aarch64-linux-gnu-readelf \
+          aarch64-linux-gnu-strip; do
+          if command -v "${command}" >/dev/null 2>&1; then
+            echo "Unexpected GNU tool on PATH: ${command}" >&2
+            exit 1
+          fi
+        done
+
+    - name: Verify AArch64 compiler-rt builtins
+      run: |
+        set -euo pipefail
+        llvm="${RUNNER_TEMP}/clang-llvm/bin"
+        archive="${RUNNER_TEMP}/compiler-rt-${CLANG_VERSION}.src.tar.xz"
+        source="${RUNNER_TEMP}/compiler-rt-${CLANG_VERSION}"
+        probe="${RUNNER_TEMP}/compiler-rt-probe"
+        curl --fail --location --silent --show-error \
+          "https://github.com/llvm/llvm-project/releases/download/llvmorg-${CLANG_VERSION}/compiler-rt-${CLANG_VERSION}.src.tar.xz" \
+          --output "${archive}"
+        echo "${COMPILER_RT_SRC_SHA256}  ${archive}" | sha256sum --check
+        rm -rf "${source}" "${probe}"
+        mkdir -p "${source}" "${probe}"
+        tar --extract --xz --file "${archive}" --directory "${source}" \
+          --strip-components=1
+        cat > "${probe}/probe.c" <<'EOF'
+        typedef unsigned __int128 uint128_t;
+
+        volatile uint128_t dividend = ((uint128_t)1 << 100) + 7;
+        volatile uint128_t divisor = 3;
+        volatile uint128_t result;
+
+        void _start(void)
+        {
+                result = dividend / divisor;
+        }
+        EOF
+
+        builtins="${source}/lib/builtins"
+        common=(
+          --target=aarch64-none-elf
+          -ffreestanding
+          -fno-stack-protector
+          "-I${builtins}"
+        )
+        "${llvm}/clang" "${common[@]}" -O0 \
+          -c "${probe}/probe.c" -o "${probe}/probe.o"
+        undefined="$("${llvm}/llvm-nm" --undefined-only --format=posix \
+          "${probe}/probe.o")"
+        grep --fixed-strings --quiet '__udivti3' <<< "${undefined}"
+
+        "${llvm}/clang" "${common[@]}" -O2 \
+          -c "${builtins}/udivti3.c" -o "${probe}/udivti3.o"
+        "${llvm}/clang" "${common[@]}" -O2 \
+          -c "${builtins}/udivmodti4.c" -o "${probe}/udivmodti4.o"
+        "${llvm}/clang" --target=aarch64-none-elf -fuse-ld=lld -nostdlib \
+          -Wl,--entry=_start \
+          "${probe}/probe.o" \
+          "${probe}/udivti3.o" \
+          "${probe}/udivmodti4.o" \
+          -o "${probe}/probe"
+
+        test -z "$("${llvm}/llvm-nm" --undefined-only --format=posix \
+          "${probe}/probe")"
+        symbols="$("${llvm}/llvm-nm" --format=posix "${probe}/probe")"
+        grep --extended-regexp --quiet '^__udivti3 [Tt] ' <<< "${symbols}"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The compiler-rt probe has a libgcc symbol reference." >&2
+          exit 1
+        fi
+
+    - name: Build helloworld with Clang
+      run: |
+        set -euo pipefail
+        llvm="${RUNNER_TEMP}/clang-llvm/bin"
+        build="${RUNNER_TEMP}/build-clang-arm64"
+        log="${RUNNER_TEMP}/clang-arm64-build.log"
+        rm -rf "${build}"
+        make_args=(
+          "A=${GITHUB_WORKSPACE}/_helloworld"
+          "O=${build}"
+          "HOSTCC=${llvm}/clang"
+          "HOSTCXX=${llvm}/clang++"
+          "COMPILER=${llvm}/clang --target=aarch64-none-elf"
+          "COMPILER_TARGETED=y"
+          "LINKER=${llvm}/clang --target=aarch64-none-elf -fuse-ld=lld"
+          "PARTIAL_LINKER=${llvm}/ld.lld -m aarch64elf"
+          "PARTIAL_LINKER_TYPE=raw"
+          "AR=${llvm}/llvm-ar"
+          "NM=${llvm}/llvm-nm"
+          "OBJCOPY=${llvm}/llvm-objcopy"
+          "OBJDUMP=${llvm}/llvm-objdump"
+          "READELF=${llvm}/llvm-readelf"
+          "STRIP=${llvm}/llvm-strip"
+          "UK_CFLAGS=-std=gnu17"
+          "UK_LDFLAGS=-rtlib=compiler-rt"
+        )
+        make "${make_args[@]}" \
+          UK_DEFCONFIG="${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-arm64" \
+          defconfig
+        set +e
+        make "${make_args[@]}" V=1 -j"$(nproc)" 2>&1 | tee "${log}"
+        build_status=("${PIPESTATUS[@]}")
+        set -e
+
+        mapfile -d '' command_files < <(
+          find "${build}" -type f -name '*.cmd' \
+            ! -path "${build}/kconfig/*" \
+            ! -path "${build}/include/config/*" \
+            -size +0c -print0
+        )
+        if [ "${#command_files[@]}" -eq 0 ]; then
+          echo "The target build generated no command files to audit." >&2
+          exit 1
+        fi
+
+        gnu_command="(^|[;&|])[[:space:]]*(env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)[[:space:]]+)*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm|aarch64-linux-gnu-(ld|ar|nm|objcopy|objdump|readelf|strip))(-[0-9.]+)?([[:space:];|&]|$)"
+        gnu_assignment="(^|[;&|])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=['\"]?(env[[:space:]]+([^[:space:]=]+=[^[:space:]]+[[:space:]]+)*)?((ccache|command)[[:space:]]+)?([^[:space:]\"';|&]*/)?([^/[:space:]\"';|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm|aarch64-linux-gnu-(ld|ar|nm|objcopy|objdump|readelf|strip))(-[0-9.]+)?([[:space:]\"';|&]|$)"
+        gnu_found=0
+        for command_file in "${command_files[@]}"; do
+          if grep --with-filename --line-number --extended-regexp \
+            "${gnu_command}|${gnu_assignment}" "${command_file}"; then
+            gnu_found=1
+          fi
+        done
+        if [ "${gnu_found}" -ne 0 ]; then
+          echo "The target build invoked a GNU compiler or cross-tool." >&2
+          exit 1
+        fi
+        test "${build_status[1]}" -eq 0
+        test "${build_status[0]}" -eq 0
+
+        normal_command="${build}/libukplat_native/lcpu_pm.o.cmd"
+        isr_command="${build}/libukplat_native/ectx.isr.o.cmd"
+        for command_file in "${normal_command}" "${isr_command}"; do
+          test "$(grep --only-matching -- '--target=aarch64-none-elf' \
+            "${command_file}" | wc -l)" -eq 1
+          grep --fixed-strings --quiet -- '-mgeneral-regs-only' "${command_file}"
+          grep --fixed-strings --quiet -- \
+            '-Xclang -target-feature -Xclang -fp-armv8' "${command_file}"
+          grep --fixed-strings --quiet -- \
+            '-Xclang -target-feature -Xclang -neon' "${command_file}"
+        done
+        grep --fixed-strings --quiet -- '-D__INTERRUPTSAFE__' "${isr_command}"
+
+        partial_command="${build}/libkvmplat.ld.o.cmd"
+        final_command="${build}/helloworld_qemu-arm64.dbg.cmd"
+        grep --fixed-strings --quiet -- \
+          "${llvm}/ld.lld -m aarch64elf" "${partial_command}"
+        grep --fixed-strings --quiet -- \
+          "${llvm}/clang --target=aarch64-none-elf -fuse-ld=lld" \
+          "${final_command}"
+        grep --fixed-strings --quiet -- '-rtlib=compiler-rt' "${final_command}"
+        grep --fixed-strings --quiet -- 'kvm-combined.lds' "${final_command}"
+        if grep --fixed-strings --quiet -- '-lgcc' "${final_command}"; then
+          echo "The final link requested libgcc." >&2
+          exit 1
+        fi
+
+    - name: Inspect Clang image
+      run: |
+        set -euo pipefail
+        llvm="${RUNNER_TEMP}/clang-llvm/bin"
+        image="${RUNNER_TEMP}/build-clang-arm64/helloworld_qemu-arm64.dbg"
+        file "${image}"
+        header="$("${llvm}/llvm-readelf" --file-header "${image}")"
+        printf '%s\n' "${header}"
+        grep --quiet 'Class:.*ELF64' <<< "${header}"
+        grep --quiet 'Machine:.*AArch64' <<< "${header}"
+
+        program_headers="$("${llvm}/llvm-readelf" --program-headers "${image}")"
+        if grep --quiet INTERP <<< "${program_headers}"; then
+          echo "The Clang image has a program interpreter." >&2
+          exit 1
+        fi
+        dynamic="$("${llvm}/llvm-readelf" --wide --dynamic "${image}" 2>/dev/null)"
+        if grep --quiet NEEDED <<< "${dynamic}"; then
+          echo "The Clang image has a dynamic dependency." >&2
+          exit 1
+        fi
+
+        undefined="$("${llvm}/llvm-nm" --undefined-only --format=posix \
+          "${image}")"
+        if [ -n "${undefined}" ]; then
+          echo "The Clang image has unresolved symbols:" >&2
+          printf '%s\n' "${undefined}" >&2
+          exit 1
+        fi
+        symbols="$("${llvm}/llvm-nm" --format=posix "${image}")"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The Clang image has a libgcc symbol reference." >&2
+          exit 1
+        fi
+        if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
+          echo "The Clang image has a libgcc dependency." >&2
+          exit 1
+        fi
+
+    - name: Boot Clang image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-clang-arm64/helloworld_qemu-arm64"
+        output="${RUNNER_TEMP}/clang-qemu-arm64.log"
+        set +e
+        timeout 30s "${RUNNER_TEMP}/qemu-tools/qemu-system-aarch64" \
+          -machine virt \
+          -cpu cortex-a53 \
+          -kernel "${image}" \
+          -nographic \
+          -no-reboot \
+          -net none \
+          2>&1 | tee "${output}"
+        status=("${PIPESTATUS[@]}")
+        set -e
+        test "${status[1]}" -eq 0
+        test "${status[0]}" -eq 0
+        grep --fixed-strings --quiet 'Hello world!' "${output}"
+
   static-analysis:
     name: static-analysis
     runs-on: ubuntu-latest
