@@ -335,11 +335,31 @@ pub fn build(b: *std.Build) void {
     });
     const run_context_tests = b.addRunArtifact(context_tests);
     run_context_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
-    const test_step = b.step("test", "Test facade and native configuration support");
+    const native_library_link_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-library-link.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_native_library_link_tests = b.addRunArtifact(native_library_link_tests);
+    run_native_library_link_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const elf_common_validator_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/elf-common-validator.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_elf_common_validator_tests = b.addRunArtifact(elf_common_validator_tests);
+    run_elf_common_validator_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const test_step = b.step("test", "Test facade, native configuration, and library linking");
     test_step.dependOn(&run_facade_tests.step);
     test_step.dependOn(&run_runner_tests.step);
     test_step.dependOn(&run_native_config_tests.step);
     test_step.dependOn(&run_context_tests.step);
+    test_step.dependOn(&run_native_library_link_tests.step);
+    test_step.dependOn(&run_elf_common_validator_tests.step);
     const integration_output = resolvePath(
         b.allocator,
         root,
