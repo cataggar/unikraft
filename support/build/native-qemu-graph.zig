@@ -8,6 +8,7 @@
 const std = @import("std");
 const component = @import("component-api.zig");
 const data = @import("native-qemu-data.zig");
+const native_final_link = @import("final-link.zig");
 const native_library_link = @import("native-library-link.zig");
 
 pub const Profile = enum {
@@ -88,7 +89,7 @@ fn toolchainFor(target: component.Target) component.Toolchain {
     return .{
         .target_triple = target.triple,
         .compiler = .{
-            .tool = .{ .command = "zig cc" },
+            .tool = .{ .command = "zig" },
             .kind = .zig_cc,
             .already_targets_triple = true,
         },
@@ -252,7 +253,7 @@ fn registerPlatform(
 
     const final_sequence = try allocator.alloc(
         component.LinkSequenceItem,
-        profile.libraries.len + 9,
+        profile.libraries.len + 8,
     );
     var sequence_index: usize = 0;
     final_sequence[sequence_index] = .{ .literal_flag = switch (options.profile) {
@@ -279,8 +280,6 @@ fn registerPlatform(
     final_sequence[sequence_index] = .{ .literal_flag = "-no-pie" };
     sequence_index += 1;
     final_sequence[sequence_index] = .{ .literal_flag = "-rtlib=compiler-rt" };
-    sequence_index += 1;
-    final_sequence[sequence_index] = .{ .literal_flag = "-Wl,-T" };
     sequence_index += 1;
     final_sequence[sequence_index] = .{ .artifact = .{
         .kind = .linker_script,
@@ -552,6 +551,7 @@ test "registered profiles use the native Zig library executor contract" {
         defer registered.deinit();
 
         try std.testing.expectEqualStrings("zig cc", registered.graph.toolchain.partial_linker.tool.command);
+        try std.testing.expectEqualStrings("zig", registered.graph.toolchain.compiler.tool.command);
         try std.testing.expect(registered.graph.toolchain.partial_linker.mode == .driver);
         var plan = try native_library_link.plan(std.testing.allocator, registered.graph);
         defer plan.deinit();
@@ -567,6 +567,47 @@ test "registered profiles use the native Zig library executor contract" {
                 try std.testing.expect(!std.mem.eql(u8, argument.literal, "-Wl,-d"));
             }
         }
+    }
+}
+
+test "registered profiles satisfy the native final-link planner contract" {
+    inline for (.{ Profile.@"qemu-x86_64", Profile.@"qemu-arm64" }) |profile| {
+        var registered = try RegisteredGraph.init(std.testing.allocator, .{
+            .roots = .{
+                .base = "/src/unikraft",
+                .app = "/src/app-helloworld",
+                .output = "/build",
+                .config = "/build/.config",
+            },
+            .profile = profile,
+        });
+        defer registered.deinit();
+
+        const plans = try native_final_link.planSelected(
+            std.testing.allocator,
+            registered.graph,
+        );
+        defer native_final_link.deinitPlans(std.testing.allocator, plans);
+        try std.testing.expectEqual(@as(usize, 1), plans.len);
+        try std.testing.expectEqual(@as(usize, 1), plans[0].linker_scripts.len);
+        try std.testing.expect(plans[0].linker_scripts[0].artifact == .stage_output);
+        try std.testing.expectEqualStrings(
+            "merge-linker-scripts",
+            plans[0].linker_scripts[0].artifact.stage_output.stage,
+        );
+
+        var merged_script_arguments: usize = 0;
+        for (plans[0].arguments) |argument| {
+            switch (argument) {
+                .merged_linker_script => merged_script_arguments += 1,
+                .literal => |literal| {
+                    try std.testing.expect(!std.mem.startsWith(u8, literal, "-Wl,-T"));
+                    try std.testing.expect(!std.mem.startsWith(u8, literal, "-Wl,-m"));
+                },
+                .artifact => {},
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), merged_script_arguments);
     }
 }
 

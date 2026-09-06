@@ -706,6 +706,7 @@ pub const FinalizedGraph = struct {
     platforms: []const Platform,
     registrations: []const Registration,
     selected_platform_index: usize,
+    active_link_stages: []const bool,
 
     pub fn selectedPlatform(self: FinalizedGraph) *const Platform {
         return &self.platforms[self.selected_platform_index];
@@ -713,6 +714,10 @@ pub const FinalizedGraph = struct {
 
     pub fn libraryIsActive(self: FinalizedGraph, index: usize) bool {
         return self.active_libraries[index];
+    }
+
+    pub fn linkStageIsActive(self: FinalizedGraph, index: usize) bool {
+        return self.active_link_stages[index];
     }
 };
 
@@ -846,6 +851,14 @@ pub const BuildContext = struct {
         for (self.libraries.items, active_libraries) |library, *active| {
             active.* = library.enable.matches(self.config);
         }
+        const selected_platform = self.platforms.items[selected_index.?];
+        const active_link_stages = try self.arena.allocator().alloc(
+            bool,
+            selected_platform.link_stages.len,
+        );
+        for (selected_platform.link_stages, active_link_stages) |stage, *active| {
+            active.* = stage.condition.matches(self.config);
+        }
 
         self.finalized = true;
         return .{
@@ -859,6 +872,7 @@ pub const BuildContext = struct {
             .platforms = self.platforms.items,
             .registrations = self.registrations.items,
             .selected_platform_index = selected_index.?,
+            .active_link_stages = active_link_stages,
         };
     }
 

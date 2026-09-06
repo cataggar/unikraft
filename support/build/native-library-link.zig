@@ -388,6 +388,7 @@ fn syntheticGraph(
         }},
         .registrations = &.{},
         .selected_platform_index = 0,
+        .active_link_stages = &.{},
     };
 }
 

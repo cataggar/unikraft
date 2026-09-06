@@ -168,9 +168,9 @@ inconsistent platform-library registrations, unknown or forward typed
 references, malformed archive groups, and configurations that select zero or
 multiple platforms. Inactive platform pipelines may intentionally name the
 same eventual output, such as `compile_commands.json`.
-The finalized graph retains the resolved active-library bitmap so native
-executors do not need to retain or re-evaluate the borrowed configuration
-query.
+The finalized graph retains resolved active-library and selected-platform
+link-stage bitmaps so native executors do not need to retain or re-evaluate
+the borrowed configuration query.
 `lastDiagnostic()` supplies the offending names or paths.
 
 `native-library-link.zig` plans and materializes active library object
@@ -190,3 +190,17 @@ zig test support/build/component-api.zig
 zig test support/build/native-library-link.zig
 zig test support/build/elf-common-validator.zig
 ```
+
+## Native final links
+
+`final-link.zig` plans active `final_link` stages from a `FinalizedGraph` and
+executes them through the configured Zig compiler driver. It preserves sequence
+order, resolves typed artifacts through a caller-supplied `LazyPath` resolver,
+tracks custom dependencies, and replaces all modeled linker scripts with one
+generated `-Wl,-T,<path>` argument.
+
+`linker-script.zig` creates that tracked artifact. The first script is the
+primary script; later scripts may only contribute ordered `PHDRS` entries or
+`SECTIONS { ... } INSERT BEFORE/AFTER <section>` blocks. Malformed scripts,
+unknown supplemental commands, duplicate program headers, and missing or
+ambiguous insertion anchors are rejected rather than ignored.
