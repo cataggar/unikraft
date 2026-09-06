@@ -1,0 +1,52 @@
+##
+## Hyper-V platform registration
+##
+$(eval $(call addplat_s,hyperv,$(CONFIG_PLAT_HYPERV)))
+$(eval $(call addplatlib,hyperv,libhypervplat))
+
+LIBHYPERVPLAT_ASINCLUDES-y += -I$(LIBHYPERVPLAT_BASE)/include
+LIBHYPERVPLAT_ASINCLUDES-y += -I$(UK_PLAT_COMMON_BASE)/include
+LIBHYPERVPLAT_CINCLUDES-y  += -I$(LIBHYPERVPLAT_BASE)/include
+LIBHYPERVPLAT_CINCLUDES-y  += -I$(UK_PLAT_COMMON_BASE)/include
+LIBHYPERVPLAT_CINCLUDES-y  += -I$(UK_PLAT_DRIVERS_BASE)/include
+
+LIBHYPERVPLAT_ASFLAGS += -DHYPERVPLAT -DUK_USE_SECTION_SEGMENTS
+LIBHYPERVPLAT_CFLAGS  += -DHYPERVPLAT -DUK_USE_SECTION_SEGMENTS
+LIBHYPERVPLAT_CXXFLAGS += -DHYPERVPLAT -DUK_USE_SECTION_SEGMENTS
+
+UK_PLAT_HYPERV_DEF_LDS := $(UK_PLAT_COMMON_BASE)/x86/link64.lds.S
+
+ifeq ($(CONFIG_HAVE_SYSCALL),y)
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/x86/syscall.S|common
+endif
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/x86/efi_entry64.S|x86
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/x86/efi_post.c|isr
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/x86/pagetable64.S
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/x86/cpu_vectors_x86_64.S
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/x86/setup.c
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/x86/lcpu_start.S
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/x86/memory.c
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/memory.c|common
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/efi.c|isr
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/bootinfo.c|common
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_COMMON_BASE)/bootinfo.lds.S|common
+LIBHYPERVPLAT_SRCS-y += $(UK_PLAT_HYPERV_DEF_LDS)
+LIBHYPERVPLAT_SRCS-y += $(LIBHYPERVPLAT_BASE)/platform.c|isr
+LIBHYPERVPLAT_SRCS-y += $(LIBHYPERVPLAT_BASE)/time.c|isr
+
+HYPERV_RUNTIME_OBJ := $(LIBHYPERVPLAT_BUILD)/hyperv_runtime.o
+HYPERV_ZIG_CACHE := $(LIBHYPERVPLAT_BUILD)/zig-cache
+HYPERV_ZIG_GLOBAL_CACHE := $(LIBHYPERVPLAT_BUILD)/zig-global-cache
+
+$(HYPERV_RUNTIME_OBJ): $(LIBHYPERVPLAT_BASE)/hyperv_runtime.zig
+	$(call build_cmd,ZIG,libhypervplat,$(notdir $@),\
+		mkdir -p $(HYPERV_ZIG_CACHE) $(HYPERV_ZIG_GLOBAL_CACHE) && \
+		zig build-obj -target x86_64-freestanding-none -OReleaseFast \
+			-fPIC -fsingle-threaded -mno-red-zone \
+			-fno-stack-check -fno-stack-protector -fno-unwind-tables \
+			--cache-dir $(HYPERV_ZIG_CACHE) \
+			--global-cache-dir $(HYPERV_ZIG_GLOBAL_CACHE) \
+			-femit-bin=$@ $<)
+
+UK_PREPARE-$(CONFIG_PLAT_HYPERV) += $(HYPERV_RUNTIME_OBJ)
+LIBHYPERVPLAT_OBJS-y += $(HYPERV_RUNTIME_OBJ)

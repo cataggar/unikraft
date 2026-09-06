@@ -25,6 +25,11 @@
 #include <uk/plat/common/sections.h>
 #include <uk/plat/common/bootinfo.h>
 
+__weak int ukplat_x86_platform_init(void)
+{
+	return 0;
+}
+
 #if CONFIG_HAVE_SYSCALL
 /* syscall entrance provided by platform library */
 void _ukplat_syscall(void);
@@ -166,6 +171,10 @@ void _ukplat_entry(struct ukplat_bootinfo *bi)
 	rc = ukplat_mem_init();
 	if (unlikely(rc))
 		UK_CRASH("Mem init failed: %d\n", rc);
+
+	rc = ukplat_x86_platform_init();
+	if (unlikely(rc))
+		UK_CRASH("Platform init failed: %d\n", rc);
 
 #ifdef CONFIG_HAVE_SYSCALL
 	_init_syscall();

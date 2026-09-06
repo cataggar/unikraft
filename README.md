@@ -346,8 +346,14 @@ The legacy `-Dnative-qemu-graph` option remains supported.
 
 The `hyperv-x86_64-efi` profile extends the same compatibility pipeline with
 first-class target-side Zig objects and EFI post-processing. Its solved
-configuration must select x86_64 KVM EFI, PIE, and `LIBUKPAGING`; GNU Make
-continues to provide the not-yet-migrated C/assembly objects:
+configuration must select the standalone x86_64 `PLAT_HYPERV`, PIE, and
+`LIBUKPAGING`; GNU Make continues to provide the shared x86 UEFI C/assembly
+objects:
+
+The platform captures wall-clock time from UEFI before `ExitBootServices` and
+uses Hyper-V's partition reference counter for monotonic time. Synthetic
+interrupts and timers are intentionally deferred; blocking waits spin until
+that support is added.
 
 ```shell
 zig build native-images \

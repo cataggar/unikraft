@@ -34,11 +34,11 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef __PLAT_KVM_X86_LCPU_HELPERS_S__
-#define __PLAT_KVM_X86_LCPU_HELPERS_S__
+#ifndef __PLAT_COMMON_X86_LCPU_HELPERS_S__
+#define __PLAT_COMMON_X86_LCPU_HELPERS_S__
 
 #include <uk/arch/x86_64.h>
-#include <kvm-x86/serial_console.h>
+#include <x86/serial_console.h>
 #include <uk/lcpu.h>
 
 /**
@@ -240,4 +240,4 @@ ldmxcsr_rval_addr:
 	jmp	0b
 1:
 .endm
-#endif /* __PLAT_KVM_X86_LCPU_HELPERS_S__ */
+#endif /* __PLAT_COMMON_X86_LCPU_HELPERS_S__ */

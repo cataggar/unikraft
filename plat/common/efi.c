@@ -38,9 +38,19 @@ static __u8 uk_efi_mat_present;
 #define UK_EFI_ABS_FNAME(f)					"\\EFI\\BOOT\\"f
 #define UK_EFI_SURPLUS_MEM_DESC_COUNT				10
 
+#if CONFIG_PLAT_HYPERV
+#define EFI_STUB_CMDLINE_FNAME	CONFIG_HYPERV_EFI_STUB_CMDLINE_FNAME
+#define EFI_STUB_INITRD_FNAME	CONFIG_HYPERV_EFI_STUB_INITRD_FNAME
+#define EFI_STUB_DTB_FNAME	CONFIG_HYPERV_EFI_STUB_DTB_FNAME
+#define EFI_STUB_RST_ATK_MITIGATION \
+	CONFIG_HYPERV_EFI_STUB_RST_ATK_MITIGATION
+#else
 #define EFI_STUB_CMDLINE_FNAME	CONFIG_KVM_BOOT_PROTO_EFI_STUB_CMDLINE_FNAME
 #define EFI_STUB_INITRD_FNAME	CONFIG_KVM_BOOT_PROTO_EFI_STUB_INITRD_FNAME
 #define EFI_STUB_DTB_FNAME	CONFIG_KVM_BOOT_PROTO_EFI_STUB_DTB_FNAME
+#define EFI_STUB_RST_ATK_MITIGATION \
+	CONFIG_KVM_BOOT_PROTO_EFI_STUB_RST_ATK_MITIGATION
+#endif
 
 #define UK_EFI_MAX_FMT_STR_LEN					256
 
@@ -76,6 +86,10 @@ static void uk_efi_printf(const char *str, ...)
 #endif /* !CONFIG_LIBUKDEBUG_PRINTD */
 
 void uk_efi_jmp_to_kern(void) __noreturn;
+
+__weak void ukplat_efi_pre_exit(struct uk_efi_runtime_services *rs __unused)
+{
+}
 
 /* Overlysimplified conversion from ASCII to UTF-16 */
 static __sz ascii_to_utf16(const char *str, char *str16, __sz max_len16)
@@ -361,7 +375,7 @@ static void uk_efi_rt_md_to_bi_mrds(struct ukplat_memregion_desc **rt_mrds,
 
 static void uk_efi_setup_bootinfo_mrds(struct ukplat_bootinfo *bi)
 {
-	struct ukplat_memregion_desc mrd = {0}, *rt_mrds;
+	struct ukplat_memregion_desc mrd = {0}, *rt_mrds = NULL;
 	struct uk_efi_mem_desc *map_start, *map_end, *md;
 	uk_efi_uintn_t map_sz, desc_sz;
 	__u32 rt_mrds_count = 0, i;
@@ -383,9 +397,11 @@ static void uk_efi_setup_bootinfo_mrds(struct ukplat_bootinfo *bi)
 	}
 
 	/* We no longer need the list of Runtime Services memory regions */
-	status = uk_efi_bs->free_pool(rt_mrds);
-	if (unlikely(status != UK_EFI_SUCCESS))
-		UK_EFI_CRASH("Failed to free rt_mrds\n");
+	if (rt_mrds) {
+		status = uk_efi_bs->free_pool(rt_mrds);
+		if (unlikely(status != UK_EFI_SUCCESS))
+			UK_EFI_CRASH("Failed to free rt_mrds\n");
+	}
 
 	/* Get memory map through GetMemoryMap and also exit Boot service.
 	 * NOTE: after exiting, EFI printing provided by BS is not available
@@ -628,7 +644,7 @@ static void uk_efi_setup_bootinfo(void)
  */
 static void uk_efi_reset_attack_mitigation_enable(void)
 {
-#ifdef CONFIG_KVM_BOOT_PROTO_EFI_STUB_RST_ATK_MITIGATION
+#if EFI_STUB_RST_ATK_MITIGATION
 	/* The UTF-16 encoding of the "MemoryOverwriteRequestControl" string */
 	char var_name[] = "M\0e\0m\0o\0r\0y\0O\0v\0e\0r\0w\0r\0i\0t\0e\0R\0e"
 			  "\0q\0u\0e\0s\0t\0C\0o\0n\0t\0r\0o\0l\0";
@@ -664,6 +680,7 @@ void __uk_efi_api __noreturn uk_efi_main(uk_efi_hndl_t self_hndl,
 	uk_efi_init_vars(self_hndl, sys_tbl);
 	uk_efi_cls();
 	uk_efi_reset_attack_mitigation_enable();
+	ukplat_efi_pre_exit(uk_efi_rs);
 
 	/* uk_efi_setup_bootinfo must be called last, since it will exit Boot
 	 * Service after obtaining EFI memory map
