@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! Direct metadata captured for the two registered hello-world QEMU profiles.
+//! Direct metadata for the registered hello-world native image profiles.
 //! The normalized GNU Make graph is retained separately as test fixtures.
 
 pub const PathRoot = enum { base, app, output };
@@ -25,6 +25,85 @@ pub const Profile = struct {
     libraries: []const Library,
     linker_script_inputs: []const Path,
     final_output: []const u8,
+};
+
+pub const x86_64_efi_kvm_objects = [_][]const u8{
+    "libkvmplat/efi_entry64.x86.o",
+    "libkvmplat/efi_post.isr.o",
+    "libkvmplat/pagetable64.o",
+    "libkvmplat/cpu_vectors_x86_64.o",
+    "libkvmplat/setup.o",
+    "libkvmplat/lcpu_start.o",
+    "libkvmplat/tscclock.o",
+    "libkvmplat/time.o",
+    "libkvmplat/qemu.x86.o",
+    "libkvmplat/memory.o",
+    "libkvmplat/memory.common.o",
+    "libkvmplat/efi.isr.o",
+    "libkvmplat/bootinfo.common.o",
+    "libkvmplat/libinfo.libuklibid.o",
+};
+
+pub const x86_64_efi_native_objects = [_][]const u8{
+    "libukplat_native/addr.isr.o",
+    "libukplat_native/paging.isr.o",
+    "libukplat_native/pt.isr.o",
+    "libukplat_native/ectx.isr.o",
+    "libukplat_native/except.isr.o",
+    "libukplat_native/sysctx_auxsp.o",
+    "libukplat_native/lcpu_pm.o",
+    "libukplat_native/start.o",
+    "libukplat_native/libinfo.libuklibid.o",
+};
+
+pub const x86_64_efi_libraries = [_]Library{
+    .{
+        .name = "libukreloc",
+        .origin = .library,
+        .objects = &.{
+            "libukreloc/reloc.o",
+            "libukreloc/libinfo.libuklibid.o",
+        },
+        .linker_scripts = &.{
+            .{ .root = .output, .relative = "libukreloc/reloc.lds" },
+        },
+    },
+    .{
+        .name = "libukefi",
+        .origin = .library,
+        .objects = &.{"libukefi/libinfo.libuklibid.o"},
+    },
+    .{
+        .name = "libukacpi",
+        .origin = .library,
+        .objects = &.{
+            "libukacpi/acpi.o",
+            "libukacpi/madt.o",
+            "libukacpi/libinfo.libuklibid.o",
+        },
+    },
+    .{
+        .name = "libukfalloc",
+        .origin = .library,
+        .objects = &.{"libukfalloc/libinfo.libuklibid.o"},
+    },
+    .{
+        .name = "libukfallocbuddy",
+        .origin = .library,
+        .objects = &.{
+            "libukfallocbuddy/fallocbuddy.isr.o",
+            "libukfallocbuddy/libinfo.libuklibid.o",
+        },
+    },
+    .{
+        .name = "libukpaging",
+        .origin = .library,
+        .objects = &.{
+            "libukpaging/paging.isr.o",
+            "libukpaging/arch.isr.o",
+            "libukpaging/libinfo.libuklibid.o",
+        },
+    },
 };
 
 pub const x86_64 = Profile{

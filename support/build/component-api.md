@@ -15,17 +15,24 @@ cross-category component/platform order.
 Library object production is explicit: `LibraryObjectPipeline` records the
 ordered partial-link command, provenance of local versus `EACHOLIB` inputs,
 the relocatable intermediate, symbol-localizing objcopy transformation, and
-the final typed library object. `LinkStage.sequence` interleaves artifacts,
+the final typed library object. `TargetZigObject` separately models Zig source
+compiled for the target, including its logical object output, optimization
+mode, C include roots/macros, generated-file dependencies, PIC setting, and
+frame-pointer policy. `native-target-object.zig` materializes those entries as
+`LazyPath` objects with libc disabled, no red zone, no stack checks or
+unwinding, single-threaded runtime assumptions, and trap-on-panic behavior.
+`LinkStage.sequence` interleaves artifacts,
 literal or driver/raw-translated flags, archive-group markers, and system
 library arguments without regrouping them. Ordered post-processing
 transformations can create several named artifacts or declare an in-place
 mutation; later transformations refer to those named results.
 
-## Registered native QEMU graphs
+## Registered native image graphs
 
-`native-qemu-graph.zig` registers production metadata for the documented
-hello-world `qemu-x86_64` and `qemu-arm64` configurations. The metadata is
-compiled into Zig through `native-qemu-data.zig`; it does not load a Make JSON
+`native-image-graph.zig` registers production metadata for the documented
+hello-world `qemu-x86_64`, `qemu-arm64`, and `hyperv-x86_64-efi`
+configurations. The metadata is compiled into Zig through
+`native-image-data.zig`; it does not load a Make JSON
 export at graph construction time. Each profile records:
 
 - every selected library in final-link order, with its ordered object/archive
@@ -33,7 +40,7 @@ export at graph construction time. Each profile records:
 - the ordered default and supplemental linker scripts, followed by an
   explicit merged-script stage;
 - the complete final-link sequence, including archive group boundaries; and
-- the architecture-specific strip, bootinfo, Multiboot/Linux Image, and
+- the architecture-specific strip, bootinfo, Multiboot/EFI/Linux Image, and
   compile-database declarations.
 
 Production `build.zig` constructs and validates one of these graphs with:
@@ -41,11 +48,13 @@ Production `build.zig` constructs and validates one of these graphs with:
 ```sh
 zig build native-link-graph \
   -Dapp=/absolute/path/to/app-helloworld \
-  -Dnative-qemu-graph=qemu-x86_64
+  -Dnative-profile=qemu-x86_64
 ```
 
-Use `qemu-arm64` for the ARM64 profile. Other names fail explicitly. This step
-registers metadata only. The `native-images` step uses the same graph to ask
+Use `qemu-arm64` for the ARM64 profile or `hyperv-x86_64-efi` for the
+x86_64 EFI profile. Other names fail explicitly. The older
+`-Dnative-qemu-graph` spelling remains an alias for the QEMU profiles. This
+step registers metadata only. The `native-images` step uses the same graph to ask
 Make for compile-time inputs, then executes the native library links, linker
 script merge, final link, post-processing, and output publication:
 
@@ -53,7 +62,7 @@ script merge, final link, post-processing, and output publication:
 zig build native-images \
   -Dapp=/absolute/path/to/app-helloworld \
   -Dconfig=/absolute/path/to/solved.config \
-  -Dnative-qemu-graph=qemu-x86_64
+  -Dnative-profile=qemu-x86_64
 ```
 
 Fixtures under

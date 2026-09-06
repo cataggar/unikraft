@@ -35,6 +35,7 @@ def main():
     runner = base / "support/build/native-postprocess-runner.py"
     bootinfo = base / "support/scripts/mkbootinfo.py"
     multiboot = base / "support/scripts/multiboot.py"
+    efi = base / "support/scripts/mkefi.py"
     linux = base / "support/scripts/mklinux.py"
     compile_database = base / "support/scripts/mkcompiledb.py"
 
@@ -48,7 +49,7 @@ def main():
             fake_strip,
             """#!/usr/bin/env python3
 import pathlib, shutil, sys
-shutil.copyfile(sys.argv[sys.argv.index("-s") + 1], sys.argv[sys.argv.index("-o") + 1])
+shutil.copyfile(sys.argv[sys.argv.index("-o") - 1], sys.argv[sys.argv.index("-o") + 1])
 """,
         )
         write_executable(
@@ -77,13 +78,24 @@ else:
             """#!/usr/bin/env python3
 print("0000000040000000 A _start_ram_addr")
 print("0000000040200040 A _base_addr")
+print("0000000040202f00 A __bss_start")
+print("0000000040200040 T uk_efi_entry64")
 print("0000000040200080 T _libkvmplat_entry")
+""",
+        )
+        fake_readelf = root / "readelf tool.py"
+        write_executable(
+            fake_readelf,
+            """#!/usr/bin/env python3
+print(" LOAD 0x000000 0x0000000040200000 0x0000000040200000 0x1000 0x1000 R E 0x1000")
+print(" LOAD 0x001000 0x0000000040201000 0x0000000040201000 0x1000 0x2000 RW  0x1000")
 """,
         )
         strip_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(fake_strip))}"
         objdump_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(fake_objdump))}"
         objcopy_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(fake_objcopy))}"
         nm_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(fake_nm))}"
+        readelf_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(fake_readelf))}"
 
         x86_debug = root / "x86 debug.elf"
         x86_image = root / "x86 stripped.elf"
@@ -113,6 +125,25 @@ print("0000000040200080 T _libkvmplat_entry")
         assert x86_data[:5] == b"\x7fELF\x01"
         assert x86_data[18:20] == (3).to_bytes(2, "little")
         assert x86_data[52:56] == (0x1BADB002).to_bytes(4, "little")
+
+        efi_image = root / "x86 EFI image.elf"
+        invoke(
+            runner,
+            "efi",
+            "--script",
+            efi,
+            "--nm",
+            nm_cmd,
+            "--readelf",
+            readelf_cmd,
+            x86_image,
+            x86_debug,
+            efi_image,
+        )
+        efi_data = efi_image.read_bytes()
+        assert efi_data[:2] == b"MZ"
+        assert efi_data[64:68] == b"PE\0\0"
+        assert efi_data[68:70] == (0x8664).to_bytes(2, "little")
 
         arm_debug = root / "arm debug.elf"
         arm_image = root / "arm stripped.elf"
