@@ -211,10 +211,13 @@ order and passes them directly to a single `zig cc -flto` final link.
 tool (`llvm-nm`) on each library's objects/archives, reads export-symbol files,
 detects private-symbol collisions and illegal cross-library private references
 (both are explicit failures), and writes a deterministic LLD version script
-with the global-symbol union and `local: *;`. The version script is passed via
-`-Wl,--version-script=<file>`. Within the native pipeline, LTO is rejected at
-build time for `qemu-arm64` and `hyperv-x86_64-efi`; non-LTO ARM64 builds and
-the GNU Make backend are unaffected.
+with the global-symbol union and `local: *;`. It also writes a compiler
+response file containing `-Wl,-u` force-keep arguments for the active export
+lists so required definitions survive LTO internalization. Both outputs are
+generated after the GNU Make input step, allowing export lists produced in a
+clean output tree. Within the native pipeline, LTO is rejected at build time
+for `qemu-arm64` and `hyperv-x86_64-efi`; non-LTO ARM64 builds and the GNU Make
+backend are unaffected.
 
 Run the standalone, leak-checked unit tests with:
 

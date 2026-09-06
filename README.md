@@ -430,15 +430,18 @@ optimization. The build applies only to the registered native graph scope;
 arbitrary application layouts outside the documented profiles are not
 guaranteed to work.
 
-**Symbol policy and version script.** Before the final link, `lto-symbol-policy.py`
-invokes the configured `llvm-nm` tool on each library's objects and archives,
-reads per-library export-symbol files, and validates cross-library symbol
-references. Private-symbol collisions (the same private name defined in
-multiple libraries) and illegal cross-library references to private symbols
-cause an explicit build failure. On success a deterministic LLD version script
-is generated with the global-symbol union and `local: *;`; it is passed to
-`zig cc` as `-Wl,--version-script=<file>` so that private definitions remain
-local in the final ELF even without per-library objcopy localization.
+**Symbol policy and linker arguments.** After GNU Make materializes the native
+link inputs, `lto-symbol-policy.py` invokes the configured `llvm-nm` tool on
+each library's objects and archives, reads per-library export-symbol files, and
+validates cross-library symbol references. Private-symbol collisions (the same
+private name defined in multiple libraries) and illegal cross-library
+references to private symbols cause an explicit build failure. On success it
+generates a deterministic LLD version script with the global-symbol union and
+`local: *;`, plus a response file containing `-Wl,-u` force-keep arguments for
+the active export lists. The version script keeps private definitions local,
+while the response arguments preserve required exports through LTO
+internalization. Generating both at execution time also supports a clean build
+output when an export list is itself produced by GNU Make.
 
 **Measurement tools.** Two scripts under `support/scripts/` assist in
 evaluating the effect of LTO. They must be run against images built from
@@ -477,12 +480,14 @@ workload and commit; they are **not** guaranteed thresholds and do not imply
 runtime speedup. Real applications may see different, smaller, or larger
 changes depending on their code and configuration:
 
-| Metric          | Delta    |
-|-----------------|----------|
-| `.text`         | -0.22%   |
-| `.rodata`       | -6.89%   |
-| `.data`         | -45.57%  |
-| Defined symbols | -10.89%  |
+| Metric              | Delta    |
+|---------------------|----------|
+| Debug ELF file size | +0.57%   |
+| `.text`             | -0.22%   |
+| `.rodata`           | -6.83%   |
+| `.data`             | -45.57%  |
+| `.bss`              | +0.00%   |
+| Defined symbols     | -10.89%  |
 
 The standalone Clang/LLVM 21.1.8 QEMU/ARM64 build uses the GNU Make backend
 directly:

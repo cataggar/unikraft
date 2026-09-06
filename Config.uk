@@ -123,8 +123,9 @@ config OPTIMIZE_LTO
 		build time and rejected explicitly; non-LTO ARM64 builds are
 		unaffected. For the native path, a Python-based symbol-policy
 		step validates per-library private/export symbol references before
-		the final link and generates an LLD version script that preserves
-		per-library symbol locality across the flat LTO link.
+		the final link and generates an LLD version script plus force-keep
+		response arguments that preserve per-library symbol locality and
+		required exports across the flat LTO link.
 		Private-symbol collisions and illegal cross-library private
 		references cause an explicit build failure.
 
