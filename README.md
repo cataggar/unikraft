@@ -349,8 +349,8 @@ build=/absolute/path/to/build
 make_args=(
   "A=${app}"
   "O=${build}"
-  "HOSTCC=${llvm}/clang -fuse-ld=lld"
-  "HOSTCXX=${llvm}/clang++ -fuse-ld=lld"
+  "HOSTCC=${llvm}/clang -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none"
+  "HOSTCXX=${llvm}/clang++ -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none"
   "COMPILER=${llvm}/clang --target=aarch64-none-elf"
   "COMPILER_TARGETED=y"
   "LINKER=${llvm}/clang --target=aarch64-none-elf -fuse-ld=lld"
