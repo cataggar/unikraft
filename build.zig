@@ -466,6 +466,13 @@ pub fn build(b: *std.Build) void {
         @panic(@errorName(err));
     });
     test_step.dependOn(&run_native_lto_tests.step);
+    const lto_policy_tests = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/lto-symbol-policy-test.py",
+    });
+    lto_policy_tests.setCwd(.{ .cwd_relative = root });
+    lto_policy_tests.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    test_step.dependOn(&lto_policy_tests.step);
     const integration_output = resolvePath(
         b.allocator,
         root,

@@ -13,12 +13,14 @@
 //! are collected in registration order and passed directly to a single
 //! `zig cc -flto` final link, allowing LLVM LTO cross-TU optimization.
 //!
-//! Symbol-export semantics: without per-library localization, all symbols are
-//! globally visible at final link. A pre-link validation step reads each
-//! library's export symbol list with `llvm-nm` (or equivalent) and detects
-//! actual duplicate *defined* symbols across libraries that the per-library
-//! localization would have prevented. If duplicates are found the build fails
-//! with an actionable error listing the conflicting symbols and libraries.
+//! Symbol-export semantics are preserved by a Python-based policy step
+//! (`lto-symbol-policy.py`) that runs before the final link. It invokes the
+//! configured NM tool on each library's objects/archives, reads export symbol
+//! lists, detects private-symbol collisions and cross-library private
+//! references, and generates a deterministic LLD version script with the
+//! allowed global-symbol union and `local: *;`. The version script is passed
+//! to the Zig driver via `-Wl,--version-script=<file>` so that private
+//! definitions remain local in the resulting ELF.
 
 const std = @import("std");
 const component = @import("component-api.zig");
@@ -31,7 +33,8 @@ const native_image_graph = @import("native-image-graph.zig");
 pub const LinkMode = enum {
     /// Per-library `zig cc -r` + `objcopy --keep-global-symbols`, then final link.
     standard,
-    /// Bypass per-library pipeline; flat `zig cc -flto` final link.
+    /// Bypass per-library pipeline; flat `zig cc -flto` final link with
+    /// a generated version script preserving per-library symbol locality.
     lto,
 
     /// Detect the link mode from a solved build configuration.
@@ -78,7 +81,9 @@ pub fn requireLtoProfile(profile: native_image_graph.Profile) ProfileError!void 
 
 // ── LTO execution (std.Build integration) ──────────────────────────────────
 
-/// Result of the LTO final link execution, matching the shape callers expect.
+pub const PlanError = final_link.PlanError;
+
+/// Result of the LTO final link execution.
 pub const LtoLinked = struct {
     stage_name: []const u8,
     output: std.Build.LazyPath,
@@ -89,21 +94,22 @@ pub const LtoLinked = struct {
 /// Execute a flat LTO final link for the selected platform.
 ///
 /// This replaces both `native_library_link.execute()` and
-/// `final_link.Executor.addSelected()` when LTO is active.
-///
-/// Reuses the `final_link.Executor` infrastructure for linker-script merging
-/// and artifact resolution, then emits a single `zig cc -flto` command with
-/// all library objects/archives flattened into it.
+/// `final_link.Executor.addSelected()` when LTO is active. It:
+///  1. Merges linker scripts using the existing `final_link.Executor`.
+///  2. Runs the `lto-symbol-policy.py` script to validate symbol policy
+///     and generate a version script.
+///  3. Emits a single `zig cc -flto` command with all library inputs
+///     flattened and the version script applied.
 pub fn executeLtoFinalLink(
     b: *std.Build,
     graph: component.FinalizedGraph,
     resolver: final_link.ArtifactResolver,
     prerequisite: ?*std.Build.Step,
     opt_level: OptLevel,
-) final_link.PlanError!LtoLinked {
+) PlanError!LtoLinked {
     if (graph.toolchain.compiler.kind != .zig_cc) return error.UnsupportedCompilerDriver;
 
-    // Reuse the existing Executor to create merge-linker-script stages.
+    // Reuse the existing Executor for linker-script merge stages.
     const executor = final_link.Executor.initWithPrerequisite(b, resolver, prerequisite);
 
     const platform = graph.selectedPlatform();
@@ -119,21 +125,67 @@ pub fn executeLtoFinalLink(
     }
     const stage = final_stage orelse return error.MissingLinkerScript;
 
-    // Plan the stage to get the merged linker scripts.
+    // Plan stage to extract merged-linker-script dependencies.
     const plans = try final_link.planSelected(b.allocator, graph);
     defer final_link.deinitPlans(b.allocator, plans);
     if (plans.len != 1) return error.MissingLinkerScript;
     const plan = plans[0];
 
-    // Get merged stages for linker-script resolution.
     const merged_stages = try executor.addMergeStages(graph);
     const merged_script = executor.resolveMergedScript(graph, plan, merged_stages);
 
-    // Build the LTO final link command.
+    // ── Symbol-policy step ─────────────────────────────────────────────
+    // Invoke lto-symbol-policy.py to validate and generate version script.
+    const policy = b.addSystemCommand(&.{
+        "python3",
+        "support/build/lto-symbol-policy.py",
+        "--nm",
+        graph.toolchain.binutils.nm.command,
+    });
+    policy.setName("LTO symbol-policy generator");
+    policy.setCwd(b.path("."));
+    policy.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    if (prerequisite) |p| policy.step.dependOn(p);
+
+    // Output: the generated version script (tracked LazyPath).
+    policy.addArg("--output");
+    const version_script = policy.addOutputFileArg("lto-version-script.lds");
+
+    // Add per-library arguments.
+    for (graph.libraries, 0..) |library, library_index| {
+        if (!graph.libraryIsActive(library_index)) continue;
+        const pipeline = library.object_pipeline orelse continue;
+
+        policy.addArgs(&.{ "--library", library.name });
+
+        // Export files.
+        for (library.exports) |export_path| {
+            policy.addArg("--export-file");
+            policy.addFileArg(resolver.resolve(.{ .path = export_path }, export_path));
+        }
+
+        // Object/archive inputs.
+        for (pipeline.partial_link_sequence) |seq_item| {
+            switch (seq_item) {
+                .artifact => |a| {
+                    const path = resolveArtifactPath(graph, a.artifact) orelse
+                        return error.UnresolvedArtifact;
+                    policy.addArg("--input");
+                    policy.addFileArg(resolver.resolve(a.artifact, path));
+                },
+                .literal_flag, .tool_mode_flag, .library_argument => {},
+                .group_start, .group_end => {},
+            }
+        }
+    }
+
+    // ── LTO final-link command ─────────────────────────────────────────
     const zig = graph.toolchain.compiler.tool.command;
     const link = b.addSystemCommand(&.{zig});
     link.setName("LTO final link");
     if (prerequisite) |p| link.step.dependOn(p);
+    // Depend on the policy step.
+    link.step.dependOn(&policy.step);
 
     link.addArgs(&.{
         "cc",
@@ -143,16 +195,27 @@ pub fn executeLtoFinalLink(
         opt_level.flag(),
     });
 
-    // Walk the stage sequence for entry point, standard flags, linker scripts.
-    // Skip library_final_object artifacts (replaced by flattened inputs below).
+    // Walk the stage sequence for entry point, standard flags, and linker
+    // scripts. library_final_object artifacts are replaced by the flattened
+    // library inputs emitted below.
     for (stage.sequence) |item| {
         switch (item) {
-            .literal_flag => |flag| link.addArg(flag),
+            .literal_flag => |flag| {
+                if (isForbiddenDriverFlag(flag)) return error.UnsupportedFinalLinkFlag;
+                link.addArg(flag);
+            },
             .tool_mode_flag => |tmf| {
-                if (tmf.driver) |driver_flag| link.addArg(driver_flag);
+                const driver_flag = tmf.driver orelse
+                    return error.UnsupportedFinalLinkFlag;
+                if (isForbiddenDriverFlag(driver_flag))
+                    return error.UnsupportedFinalLinkFlag;
+                link.addArg(driver_flag);
             },
             .group_start, .group_end => {},
-            .library_argument => |la| link.addArg(la),
+            .library_argument => |la| {
+                if (isForbiddenDriverFlag(la)) return error.UnsupportedFinalLinkFlag;
+                link.addArg(la);
+            },
             .artifact => |link_artifact| {
                 switch (link_artifact.artifact) {
                     .library_final_object => continue,
@@ -161,12 +224,16 @@ pub fn executeLtoFinalLink(
                 if (link_artifact.kind == .linker_script) {
                     link.addPrefixedFileArg("-Wl,-T,", merged_script);
                 } else {
-                    const path = resolveArtifactPath(graph, link_artifact.artifact) orelse continue;
+                    const path = resolveArtifactPath(graph, link_artifact.artifact) orelse
+                        return error.UnresolvedArtifact;
                     link.addFileArg(resolver.resolve(link_artifact.artifact, path));
                 }
             },
         }
     }
+
+    // Apply version script.
+    link.addPrefixedFileArg("-Wl,--version-script=", version_script);
 
     // Flatten all active library inputs in registration order.
     var have_archives = false;
@@ -190,10 +257,12 @@ pub fn executeLtoFinalLink(
         for (pipeline.partial_link_sequence) |seq_item| {
             switch (seq_item) {
                 .artifact => |a| {
-                    const path = resolveArtifactPath(graph, a.artifact) orelse continue;
+                    const path = resolveArtifactPath(graph, a.artifact) orelse
+                        return error.UnresolvedArtifact;
                     link.addFileArg(resolver.resolve(a.artifact, path));
                 },
-                else => {},
+                .literal_flag, .tool_mode_flag, .library_argument => {},
+                .group_start, .group_end => {},
             }
         }
     }
@@ -210,61 +279,15 @@ pub fn executeLtoFinalLink(
     };
 }
 
-// ── Symbol-collision validation build step ─────────────────────────────────
-
-/// Add a pre-link validation step that uses `llvm-nm` to detect duplicate
-/// defined symbols across library objects that would have been localized by
-/// the per-library `objcopy --keep-global-symbols` in the standard pipeline.
-///
-/// For each library that declares an export symbol list, all non-exported
-/// (private) defined symbols are collected. If two libraries define the same
-/// private symbol the build fails with an actionable diagnostic.
-///
-/// Libraries without export lists are skipped — all their symbols are
-/// intentionally global and duplicates will be caught by the linker itself.
-pub fn addSymbolValidation(
-    b: *std.Build,
-    graph: component.FinalizedGraph,
-    path_resolver: final_link.ArtifactResolver,
-    prerequisite: ?*std.Build.Step,
-) *std.Build.Step {
-    // Build a host-tool that reads export lists and NM output to detect
-    // collisions. Since we don't have a host-tool source yet, we emit a
-    // script-based validation step using llvm-nm.
-    const nm = graph.toolchain.binutils.nm.command;
-    const step = b.allocator.create(std.Build.Step) catch @panic("out of memory");
-    step.* = std.Build.Step.init(.{
-        .id = .custom,
-        .name = "LTO symbol-collision pre-check",
-        .owner = b,
-    });
-    if (prerequisite) |p| step.dependOn(p);
-
-    // For each library with export lists, add a validation command that:
-    // 1. Runs llvm-nm on each object to list defined symbols.
-    // 2. Filters against the export list.
-    // 3. Checks for cross-library private duplicates.
-    //
-    // We encode this as a series of per-object nm invocations whose outputs
-    // feed into a future host validator. For now, the step is a structural
-    // dependency placeholder — actual nm invocations are wired into the build
-    // graph so the linker's own duplicate-symbol diagnostics remain the
-    // primary safety net, with actionable errors.
-    _ = nm;
-    _ = path_resolver;
-
-    // Record which libraries have export lists for diagnostic purposes.
-    for (graph.libraries, 0..) |library, library_index| {
-        if (!graph.libraryIsActive(library_index)) continue;
-        if (library.exports.len == 0) continue;
-        // Libraries with export lists are the ones that would have had
-        // per-library localization. In LTO mode, their private symbols
-        // are globally visible. The linker itself will report any actual
-        // duplicate-symbol errors at link time, which is deterministic
-        // and actionable. A future enhancement can add nm-based pre-check.
-    }
-
-    return step;
+fn isForbiddenDriverFlag(flag: []const u8) bool {
+    return std.mem.eql(u8, flag, "-dT") or
+        std.mem.startsWith(u8, flag, "-T") or
+        std.mem.indexOf(u8, flag, "--default-script") != null or
+        std.mem.indexOf(u8, flag, "--script") != null or
+        std.mem.indexOf(u8, flag, "-Wl,-dT") != null or
+        std.mem.indexOf(u8, flag, "-Wl,--default-script") != null or
+        std.mem.indexOf(u8, flag, "-Wl,-T") != null or
+        std.mem.startsWith(u8, flag, "-Wl,-m");
 }
 
 fn resolveArtifactPath(
@@ -291,9 +314,9 @@ fn resolveArtifactPath(
             break :blk null;
         },
         .stage_output => |output| blk: {
-            for (graph.platforms) |platform| {
-                if (!std.mem.eql(u8, platform.name, output.platform)) continue;
-                for (platform.link_stages) |s| {
+            for (graph.platforms) |plat| {
+                if (!std.mem.eql(u8, plat.name, output.platform)) continue;
+                for (plat.link_stages) |s| {
                     if (std.mem.eql(u8, s.name, output.stage)) break :blk s.output;
                 }
             }
@@ -358,11 +381,10 @@ test "requireLtoProfile accepts x86_64 and rejects arm64" {
 }
 
 test "shared export list paths across libraries are valid for LTO" {
-    // libukboot and libukboot_main share lib/ukboot/exportsyms.uk.
-    // This must NOT be rejected — the path-based check was wrong.
-    // LTO mode simply relies on the linker for duplicate detection.
+    // libukboot and libukboot_main intentionally share lib/ukboot/exportsyms.uk.
+    // The symbol-policy step handles this correctly; duplicate export file
+    // paths are not rejected.
     const config = testConfig(true, "CONFIG_OPTIMIZE_PERF");
     try std.testing.expectEqual(LinkMode.lto, LinkMode.detect(config));
     try std.testing.expectEqual(OptLevel.perf, OptLevel.detect(config));
-    // No validation error — the test passes by not panicking.
 }
