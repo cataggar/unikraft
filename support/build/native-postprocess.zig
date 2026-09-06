@@ -43,10 +43,12 @@ pub const Helper = enum {
     bootinfo,
     multiboot,
     linux_header,
+    compile_database,
 };
 
 pub const Argument = union(enum) {
     literal: []const u8,
+    directory: []const u8,
     input: usize,
     output: usize,
     tool: ToolKind,
@@ -59,6 +61,7 @@ pub const OperationKind = enum {
     multiboot,
     objcopy_binary,
     linux_header,
+    compile_database,
 };
 
 pub const ArtifactSource = union(enum) {
@@ -255,6 +258,7 @@ fn operationKind(kind: api.PostProcessKind) ?OperationKind {
         .multiboot => .multiboot,
         .objcopy_binary => .objcopy_binary,
         .linux_header => .linux_header,
+        .compile_database => .compile_database,
         else => null,
     };
 }
@@ -293,6 +297,7 @@ fn validateShape(
             creates == 0 and mutations == 1 and primary_mutations == 1,
         .linux_header => input_count == 2 and creates == 0 and
             mutations == 1 and primary_mutations == 1,
+        .compile_database => input_count == 1 and creates == 1 and mutations == 0,
     };
     if (!valid) return error.MalformedTransformation;
 }
@@ -373,6 +378,18 @@ fn makeArguments(
                 .{ .tool = .nm },
                 .{ .input = inputs[0] },
                 .{ .input = inputs[1] },
+                .{ .output = outputs[0] },
+            });
+        },
+        .compile_database => {
+            const output = artifacts[outputs[0]];
+            try appendArgs(&args, &.{
+                .{ .literal = "compile-database" },
+                .{ .literal = "--script" },
+                .{ .helper = .compile_database },
+                .{ .literal = "--search-root" },
+                .{ .directory = std.fs.path.dirname(output.logical_path) orelse "." },
+                .{ .input = inputs[0] },
                 .{ .output = outputs[0] },
             });
         },
@@ -458,6 +475,7 @@ pub const ExecutorPaths = struct {
     bootinfo: std.Build.LazyPath,
     multiboot: std.Build.LazyPath,
     linux_header: std.Build.LazyPath,
+    compile_database: std.Build.LazyPath,
     elf_tools: std.Build.LazyPath,
 };
 
@@ -502,6 +520,7 @@ pub fn execute(
         for (operation.arguments) |argument| {
             switch (argument) {
                 .literal => |item| run.addArg(item),
+                .directory => |path| run.addDirectoryArg(.{ .cwd_relative = path }),
                 .input => |artifact_index| {
                     run.addFileArg(resolved[artifact_index] orelse
                         return error.InvalidReference);
@@ -517,6 +536,7 @@ pub fn execute(
                     .bootinfo => paths.bootinfo,
                     .multiboot => paths.multiboot,
                     .linux_header => paths.linux_header,
+                    .compile_database => paths.compile_database,
                 }),
             }
         }
@@ -791,4 +811,71 @@ test "planner rejects missing references, collisions, and unsupported active kin
             .logical_path = "/in.dbg",
         }}, .{ .architecture = .x86_64 }),
     );
+}
+
+test "production QEMU profiles plan through compile database generation" {
+    const native_qemu = @import("native-qemu-graph.zig");
+    inline for (.{ native_qemu.Profile.@"qemu-x86_64", native_qemu.Profile.@"qemu-arm64" }) |profile| {
+        var registered = try native_qemu.RegisteredGraph.init(std.testing.allocator, .{
+            .roots = .{
+                .base = "/src/unikraft",
+                .app = "/src/app",
+                .output = "/build output",
+                .config = "/build output/.config",
+            },
+            .profile = profile,
+        });
+        defer registered.deinit();
+
+        const platform = registered.graph.selectedPlatform();
+        var final_output: ?[]const u8 = null;
+        for (platform.link_stages) |stage| {
+            if (std.mem.eql(u8, stage.name, "final-link")) {
+                final_output = stage.output;
+                break;
+            }
+        }
+        var plan = try planSelectedPlatform(
+            std.testing.allocator,
+            registered.graph,
+            test_config,
+            &.{.{
+                .reference = .{ .stage_output = .{
+                    .platform = "kvm",
+                    .stage = "final-link",
+                } },
+                .logical_path = final_output orelse return error.TestUnexpectedResult,
+                .role = .debug,
+            }},
+        );
+        defer plan.deinit();
+
+        const expected_operations: usize = if (profile == .@"qemu-x86_64") 4 else 5;
+        try std.testing.expectEqual(expected_operations, plan.operations.len);
+        const compile_database = plan.operations[plan.operations.len - 1];
+        try std.testing.expectEqual(OperationKind.compile_database, compile_database.kind);
+        try std.testing.expectEqual(
+            plan.operations[plan.operations.len - 2].outputs[0],
+            compile_database.inputs[0],
+        );
+        try std.testing.expectEqualStrings(
+            "/build output/compile_commands.json",
+            plan.artifacts[compile_database.outputs[0]].logical_path,
+        );
+        try std.testing.expectEqual(
+            api.ArtifactRole.auxiliary,
+            plan.artifacts[compile_database.outputs[0]].role,
+        );
+        try std.testing.expect(!plan.artifacts[compile_database.outputs[0]].mutation);
+        try std.testing.expect(compile_database.arguments[2] == .helper);
+        try std.testing.expectEqual(
+            Helper.compile_database,
+            compile_database.arguments[2].helper,
+        );
+        try std.testing.expect(compile_database.arguments[4] == .directory);
+        try std.testing.expectEqualStrings(
+            "/build output",
+            compile_database.arguments[4].directory,
+        );
+    }
 }

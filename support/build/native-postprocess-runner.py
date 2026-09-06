@@ -55,6 +55,12 @@ def main():
     linux.add_argument("elf")
     linux.add_argument("output")
 
+    compile_database = subparsers.add_parser("compile-database")
+    compile_database.add_argument("--script", required=True)
+    compile_database.add_argument("--search-root", required=True)
+    compile_database.add_argument("input_dependency")
+    compile_database.add_argument("output")
+
     args = parser.parse_args()
 
     if args.action == "strip":
@@ -104,6 +110,16 @@ def main():
             ],
             env=env,
         )
+    elif args.action == "compile-database":
+        with open(args.output, "wb") as output:
+            run(
+                [
+                    *command(os.environ.get("PYTHON", "python3")),
+                    args.script,
+                    args.search_root,
+                ],
+                stdout=output,
+            )
 
 
 if __name__ == "__main__":

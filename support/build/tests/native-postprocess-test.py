@@ -36,6 +36,7 @@ def main():
     bootinfo = base / "support/scripts/mkbootinfo.py"
     multiboot = base / "support/scripts/multiboot.py"
     linux = base / "support/scripts/mklinux.py"
+    compile_database = base / "support/scripts/mkcompiledb.py"
 
     with tempfile.TemporaryDirectory(prefix="post process ", dir=work_root) as temp:
         root = pathlib.Path(temp)
@@ -161,6 +162,34 @@ print("0000000040200080 T _libkvmplat_entry")
         assert int.from_bytes(arm_data[8:16], "little") == 0x200000
         assert int.from_bytes(arm_data[24:32], "little") == 0xA
         assert arm_data[64:] == raw
+
+        compile_root = root / "compile database inputs"
+        nested = compile_root / "nested dir"
+        nested.mkdir(parents=True)
+        (compile_root / "first.ukcmpdb.json").write_text(
+            '{"directory":"/one","file":"one.c","command":"cc one.c"},\n',
+            encoding="utf-8",
+        )
+        (nested / "second.ukcmpdb.json").write_text(
+            '{"directory":"/two","file":"two.c","command":"cc two.c"},\n',
+            encoding="utf-8",
+        )
+        compile_output = root / "compile commands.json"
+        invoke(
+            runner,
+            "compile-database",
+            "--script",
+            compile_database,
+            "--search-root",
+            compile_root,
+            arm_final,
+            compile_output,
+        )
+        database = compile_output.read_text(encoding="utf-8")
+        assert database.startswith("[\n")
+        assert '"file":"one.c"' in database
+        assert '"file":"two.c"' in database
+        assert database.endswith("\n]\n")
 
 
 if __name__ == "__main__":
