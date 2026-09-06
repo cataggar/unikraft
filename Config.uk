@@ -106,9 +106,24 @@ config OPTIMIZE_LTO
 	bool "LTO - Link time optimizations (EXPERIMENTAL)"
 	default n
 	help
-		Enables GCC to do code optimizations during linking. This option
-		will increase overall building time but creates more efficient
-		Unikraft binaries.
+		Enables link-time optimization (LTO), allowing the compiler to
+		optimize across translation-unit boundaries at link time. This
+		increases build time but can reduce image size and improve
+		runtime performance by enabling cross-module inlining, dead-code
+		elimination, and whole-program analysis.
+
+		Currently supported only with the Zig 0.16 native QEMU/x86_64
+		image pipeline (zig build native-images -Dnative-profile=qemu-x86_64).
+		Selecting this option with the QEMU/ARM64 or Hyper-V EFI profiles
+		is detected at build time and rejected explicitly. The GNU Make
+		backend does not activate this path.
+
+		A Python-based symbol-policy step validates per-library
+		private/export symbol references before the final link and
+		generates an LLD version script that preserves per-library symbol
+		locality across the flat LTO link. Private-symbol collisions and
+		illegal cross-library private references cause an explicit build
+		failure.
 
 config OPTIMIZE_PIE
 	bool "Static-PIE - Position-independent binary"
