@@ -533,6 +533,7 @@ fn consumeSectionTrailer(clean: []const u8, limit: usize, initial: usize) usize 
         }
         if (clean[cursor] == '=') {
             cursor += 1;
+            skipWhitespaceLimited(clean, limit, &cursor);
             while (cursor < limit and
                 !std.ascii.isWhitespace(clean[cursor]) and
                 clean[cursor] != ';') : (cursor += 1)
@@ -686,6 +687,31 @@ test "supplemental PHDRS is added when the primary has none" {
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.startsWith(u8, result, "PHDRS\n{"));
     try expectOrdered(result, &.{ "text PT_LOAD;", ".text", ".meta" });
+}
+
+test "INSERT AFTER preserves a spaced section fill expression" {
+    const result = try mergeAlloc(
+        std.testing.allocator,
+        \\SECTIONS {
+        \\  .text : { *(.text) } :text = 0x9090
+        \\  .data : { *(.data) }
+        \\}
+        \\
+    ,
+        &.{"SECTIONS { .extra : { *(.extra) } } INSERT AFTER .text;"},
+    );
+    defer std.testing.allocator.free(result);
+
+    try expectOrdered(result, &.{
+        "} :text = 0x9090",
+        ".extra",
+        ".data",
+    });
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result,
+        "= \n.extra",
+    ) == null);
 }
 
 test "missing and ambiguous anchors are rejected" {
