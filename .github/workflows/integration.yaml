@@ -524,7 +524,7 @@ jobs:
         lto_zig_cmd_found=0
         for command_file in "${command_files[@]}"; do
           if grep --extended-regexp --quiet 'zig[[:space:]]+cc' "${command_file}" \
-              && grep --extended-regexp --quiet \
+              && grep --extended-regexp --quiet -- \
                 '-target[[:space:]]+x86_64-freestanding-none' "${command_file}" \
               && grep --quiet -- '-flto' "${command_file}"; then
             lto_zig_cmd_found=1
