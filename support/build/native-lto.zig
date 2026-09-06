@@ -151,13 +151,6 @@ pub fn executeLtoFinalLink(
     policy.addArg("--output");
     const version_script = policy.addOutputFileArg("lto-version-script.lds");
 
-    // Output: list of cross-library referenced symbols for diagnostics.
-    // The actual force-keep is done via -Wl,-u below (reading export files
-    // at graph construction time) since LLD's LTO does not reliably process
-    // EXTERN() or response files before internalization.
-    policy.addArg("--undefined-output");
-    _ = policy.addOutputFileArg("lto-extern-symbols.lds");
-
     // Add per-library arguments.
     for (graph.libraries, 0..) |library, library_index| {
         if (!graph.libraryIsActive(library_index)) continue;
@@ -208,24 +201,29 @@ pub fn executeLtoFinalLink(
         opt_level.flag(),
     });
 
-    // Force-keep ALL global symbols during LTO.  LLD's LTO pass may
-    // internalize and discard bitcode definitions before linker scripts or
-    // EXTERN() directives are processed.  The only reliable mechanism is
-    // -u per symbol on the command line.  We emit them for every global
-    // symbol (from the version script set) since the policy step already
-    // computed the full set; the count is bounded by the graph size.
+    // Force-keep exported symbols during LTO with -Wl,-u.  LLD's LTO
+    // internalization runs before linker-script EXTERN() is processed, so
+    // -u on the command line is the only reliable mechanism.  The set of
+    // exported symbols from library export files is the exact required set:
+    // the policy step rejects any cross-library reference to a non-exported
+    // symbol, so only exported symbols can be legally referenced across
+    // translation units after flattening.
     for (graph.libraries, 0..) |library, library_index| {
         if (!graph.libraryIsActive(library_index)) continue;
         if (library.object_pipeline == null) continue;
-        // Emit -Wl,-u for each exported symbol from this library's export lists.
         for (library.exports) |export_path| {
-            // We need to read the export file at graph time (it's a static path).
             const content = std.Io.Dir.cwd().readFileAlloc(
                 b.graph.io,
                 export_path,
                 b.allocator,
                 .limited(1024 * 1024),
-            ) catch continue;
+            ) catch |err| {
+                link.step.dependOn(&b.addFail(b.fmt(
+                    "LTO force-keep: cannot read export file '{s}': {s}",
+                    .{ export_path, @errorName(err) },
+                )).step);
+                return error.UnresolvedArtifact;
+            };
             var lines = std.mem.splitScalar(u8, content, '\n');
             while (lines.next()) |raw_line| {
                 const line = std.mem.trimEnd(u8, raw_line, " \t\r");

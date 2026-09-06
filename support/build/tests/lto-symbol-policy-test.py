@@ -260,7 +260,7 @@ class TestValidateAndGenerate(unittest.TestCase):
             {"name": "libA", "export_files": [exports_a], "inputs": [obj_a]},
             {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
         self.assertIn("api_a", globals_)
         self.assertIn("api_b", globals_)
@@ -279,7 +279,7 @@ class TestValidateAndGenerate(unittest.TestCase):
             {"name": "libA", "export_files": [shared], "inputs": [obj_a]},
             {"name": "libB", "export_files": [shared], "inputs": [obj_b]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         # shared_api is global in both, but priv_a and priv_b are each
         # private in only one library -> no collision.
         self.assertEqual(errors, [])
@@ -298,7 +298,7 @@ class TestValidateAndGenerate(unittest.TestCase):
             {"name": "libA", "export_files": [exports_a], "inputs": [obj_a]},
             {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         # Both global -- global+global is accepted.
         self.assertEqual(errors, [])
         self.assertIn("common_sym", globals_)
@@ -316,7 +316,7 @@ class TestValidateAndGenerate(unittest.TestCase):
             {"name": "libA", "export_files": [exports_a], "inputs": [obj_a]},
             {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("clash" in e for e in errors))
 
@@ -336,7 +336,7 @@ class TestValidateAndGenerate(unittest.TestCase):
             {"name": "libA", "export_files": [exports_a], "inputs": [obj_a]},
             {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("shared" in e for e in errors))
         # Error should mention both libraries.
@@ -356,7 +356,7 @@ class TestValidateAndGenerate(unittest.TestCase):
             {"name": "libA", "export_files": [], "inputs": [obj_a]},
             {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("helper_b" in e for e in errors))
         err_text = " ".join(errors)
@@ -375,7 +375,7 @@ class TestValidateAndGenerate(unittest.TestCase):
             {"name": "libA", "export_files": [], "inputs": [obj_a]},
             {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
         self.assertIn("everything", globals_)
         self.assertIn("global_too", globals_)
@@ -419,7 +419,7 @@ class TestValidateAndGenerate(unittest.TestCase):
         libs = [
             {"name": "libAr", "export_files": [], "inputs": [obj]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
         self.assertIn("foo_func", globals_)
         self.assertIn("bar_func", globals_)
@@ -431,7 +431,7 @@ class TestValidateAndGenerate(unittest.TestCase):
         libs = [
             {"name": "my lib", "export_files": [exports], "inputs": [obj]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
         self.assertIn("my_sym", globals_)
 
@@ -442,7 +442,7 @@ class TestValidateAndGenerate(unittest.TestCase):
         libs = [
             {"name": "libX", "export_files": [exports], "inputs": [obj]},
         ]
-        globals_, errors, force_undef = policy.validate_and_generate(nm, libs)
+        globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
         self.assertEqual(globals_, ["a_sym", "m_sym", "z_sym"])
 
