@@ -150,6 +150,8 @@ pub fn executeLtoFinalLink(
     // Output: the generated version script (tracked LazyPath).
     policy.addArg("--output");
     const version_script = policy.addOutputFileArg("lto-version-script.lds");
+    policy.addArg("--force-keep-output");
+    const force_keep_args = policy.addOutputFileArg("lto-force-keep.rsp");
 
     // Add per-library arguments.
     for (graph.libraries, 0..) |library, library_index| {
@@ -201,38 +203,11 @@ pub fn executeLtoFinalLink(
         opt_level.flag(),
     });
 
-    // Force-keep exported symbols during LTO with -Wl,-u.  LLD's LTO
-    // internalization runs before linker-script EXTERN() is processed, so
-    // -u on the command line is the only reliable mechanism.  The set of
-    // exported symbols from library export files is the exact required set:
-    // the policy step rejects any cross-library reference to a non-exported
-    // symbol, so only exported symbols can be legally referenced across
-    // translation units after flattening.
-    for (graph.libraries, 0..) |library, library_index| {
-        if (!graph.libraryIsActive(library_index)) continue;
-        if (library.object_pipeline == null) continue;
-        for (library.exports) |export_path| {
-            const content = std.Io.Dir.cwd().readFileAlloc(
-                b.graph.io,
-                export_path,
-                b.allocator,
-                .limited(1024 * 1024),
-            ) catch |err| {
-                link.step.dependOn(&b.addFail(b.fmt(
-                    "LTO force-keep: cannot read export file '{s}': {s}",
-                    .{ export_path, @errorName(err) },
-                )).step);
-                return error.UnresolvedArtifact;
-            };
-            var lines = std.mem.splitScalar(u8, content, '\n');
-            while (lines.next()) |raw_line| {
-                const line = std.mem.trimEnd(u8, raw_line, " \t\r");
-                if (line.len == 0) continue;
-                if (line[0] == '#') continue;
-                link.addArg(b.fmt("-Wl,-u,{s}", .{line}));
-            }
-        }
-    }
+    // LLD internalizes LTO symbols before linker-script EXTERN() handling, so
+    // exported definitions must also be forced undefined with -Wl,-u. Generate
+    // those arguments in the runtime policy step: some export lists are Make
+    // outputs and do not exist while Zig is constructing a clean build graph.
+    link.addPrefixedFileArg("@", force_keep_args);
 
     // Apply version script to control symbol visibility in the final ELF.
     link.addPrefixedFileArg("-Wl,--version-script=", version_script);

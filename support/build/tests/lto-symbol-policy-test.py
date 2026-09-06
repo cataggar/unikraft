@@ -238,6 +238,22 @@ class TestGenerateVersionScript(unittest.TestCase):
         script.encode("ascii")  # Raises if non-ASCII present.
 
 
+class TestGenerateForceKeepResponse(unittest.TestCase):
+    def test_deterministic_arguments(self):
+        response = policy.generate_force_keep_response(["z_sym", "a_sym"])
+        self.assertEqual(
+            response,
+            '"-Wl,-u,a_sym"\n"-Wl,-u,z_sym"\n',
+        )
+
+    def test_response_argument_escaping(self):
+        response = policy.generate_force_keep_response(
+            ['has"quote', r"has\slash"]
+        )
+        self.assertIn(r'"-Wl,-u,has\"quote"', response)
+        self.assertIn(r'"-Wl,-u,has\\slash"', response)
+
+
 def _make_python_mock_nm(tmpdir, mapping):
     """Create a Python-based mock NM script.
 
@@ -560,11 +576,13 @@ class TestMainIntegration(unittest.TestCase):
         exports = self._write("exports.uk", "api_sym\n")
         obj = self._write("lib.o", "")
         output = os.path.join(self._tmpdir, "out", "policy.lds")
+        force_keep = os.path.join(self._tmpdir, "out", "force-keep.rsp")
         nm = _make_python_mock_nm(
             self._tmpdir, {obj: "api_sym T\npriv_sym T\n"}
         )
         policy.main([
             "--nm", nm, "--output", output,
+            "--force-keep-output", force_keep,
             "--library", "libFoo",
             "--export-file", exports,
             "--input", obj,
@@ -576,14 +594,23 @@ class TestMainIntegration(unittest.TestCase):
         self.assertNotIn("priv_sym", content)
         self.assertIn("local:", content)
         self.assertIn("*;", content)
+        with open(force_keep) as f:
+            force_keep_content = f.read()
+        self.assertEqual(force_keep_content, '"-Wl,-u,api_sym"\n')
 
     def test_no_libraries(self):
         output = os.path.join(self._tmpdir, "empty.lds")
-        policy.main(["--nm", "unused", "--output", output])
+        force_keep = os.path.join(self._tmpdir, "empty.rsp")
+        policy.main([
+            "--nm", "unused", "--output", output,
+            "--force-keep-output", force_keep,
+        ])
         self.assertTrue(os.path.exists(output))
         with open(output) as f:
             content = f.read()
         self.assertIn("local:", content)
+        with open(force_keep) as f:
+            self.assertEqual(f.read(), "")
 
     def test_violation_exits_1(self):
         exports_a = self._write("a.uk", "api_a\n")

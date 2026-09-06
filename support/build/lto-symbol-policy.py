@@ -42,6 +42,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output", required=True, help="Output version-script path"
     )
+    parser.add_argument(
+        "--force-keep-output",
+        help="Optional output response file containing linker force-keep flags",
+    )
     args, remaining = parser.parse_known_args(argv)
     args.spec = remaining
     return args
@@ -379,10 +383,41 @@ def generate_version_script(global_symbols):
     return "\n".join(lines) + "\n"
 
 
+def quote_response_argument(value):
+    """Quote one compiler response-file argument."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return '"%s"' % escaped
+
+
+def generate_force_keep_response(global_symbols):
+    """Generate deterministic linker arguments that preserve LTO exports."""
+    return "".join(
+        "%s\n" % quote_response_argument("-Wl,-u,%s" % symbol)
+        for symbol in sorted(global_symbols)
+    )
+
+
+def write_output(path, content):
+    """Write a generated output, creating its parent directory if needed."""
+    try:
+        out_dir = os.path.dirname(path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+    except OSError as e:
+        print(
+            "error: cannot write output '%s': %s" % (path, e),
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+
 def main(argv=None):
     args = parse_args(argv)
     libraries = parse_library_specs(args.spec)
 
+    global_symbols = []
     if not libraries:
         script = generate_version_script([])
     else:
@@ -397,18 +432,12 @@ def main(argv=None):
             sys.exit(1)
         script = generate_version_script(global_symbols)
 
-    try:
-        out_dir = os.path.dirname(args.output)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        with open(args.output, "w") as f:
-            f.write(script)
-    except OSError as e:
-        print(
-            "error: cannot write output '%s': %s" % (args.output, e),
-            file=sys.stderr,
+    write_output(args.output, script)
+    if args.force_keep_output:
+        write_output(
+            args.force_keep_output,
+            generate_force_keep_response(global_symbols),
         )
-        sys.exit(2)
 
 
 if __name__ == "__main__":
