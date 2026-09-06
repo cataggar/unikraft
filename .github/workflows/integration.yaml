@@ -814,8 +814,8 @@ jobs:
         make_args=(
           "A=${GITHUB_WORKSPACE}/_helloworld"
           "O=${build}"
-          "HOSTCC=${llvm}/clang"
-          "HOSTCXX=${llvm}/clang++"
+          "HOSTCC=${llvm}/clang -fuse-ld=lld"
+          "HOSTCXX=${llvm}/clang++ -fuse-ld=lld"
           "COMPILER=${llvm}/clang --target=aarch64-none-elf"
           "COMPILER_TARGETED=y"
           "LINKER=${llvm}/clang --target=aarch64-none-elf -fuse-ld=lld"
