@@ -390,9 +390,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_native_qemu_graph_tests = b.addRunArtifact(native_qemu_graph_tests);
     run_native_qemu_graph_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const native_postprocess_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-postprocess.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_native_postprocess_tests = b.addRunArtifact(native_postprocess_tests);
+    run_native_postprocess_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
     const test_step = b.step(
         "test",
-        "Test facade, native configuration, native linking, and QEMU graphs",
+        "Test facade, native configuration, native linking, QEMU graphs, and post-processing",
     );
     test_step.dependOn(&run_facade_tests.step);
     test_step.dependOn(&run_runner_tests.step);
@@ -403,11 +412,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_native_qemu_graph_tests.step);
     test_step.dependOn(&run_linker_script_tests.step);
     test_step.dependOn(&run_final_link_tests.step);
+    test_step.dependOn(&run_native_postprocess_tests.step);
     const integration_output = resolvePath(
         b.allocator,
         root,
         b.cache_root.path orelse ".zig-cache",
     );
+    const native_postprocess_integration = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/native-postprocess-test.py",
+        "--work-dir",
+        integration_output,
+        "--base",
+        root,
+    });
+    native_postprocess_integration.setCwd(.{ .cwd_relative = root });
+    native_postprocess_integration.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    test_step.dependOn(&native_postprocess_integration.step);
     const acme_integration_output = std.fs.path.join(
         b.allocator,
         &.{ integration_output, "native-config-acme" },
