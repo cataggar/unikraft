@@ -520,61 +520,42 @@ jobs:
           exit 1
         fi
 
-        # Assert at least one C-compilation .cmd file records zig cc with both
-        # the explicit freestanding target and -flto.  Assembly .cmd files do
-        # not carry -flto and are automatically excluded from this check.
-        lto_zig_cmd_found=0
-        for command_file in "${command_files[@]}"; do
-          if grep --extended-regexp --quiet 'zig[[:space:]]+cc' "${command_file}" \
-              && grep --extended-regexp --quiet -- \
-                '-target[[:space:]]+x86_64-freestanding-none' "${command_file}" \
-              && grep --quiet -- '-flto' "${command_file}"; then
-            lto_zig_cmd_found=1
-            break
+        # Assert representative stable C-compilation records and objects.
+        # Broad .cmd scanning matched metadata/linker-script generator records
+        # (libinfo, earlytab.lds, pcpuvar.lds) and misidentified their ELF
+        # outputs as C bitcode.  Use explicit well-known paths instead.
+        for c_record in \
+            "${build}/apphelloworld/main.o.cmd" \
+            "${build}/libnolibc/string.o.cmd"; do
+          if [ ! -s "${c_record}" ]; then
+            echo "Expected C compile record not found or empty: ${c_record}" >&2
+            exit 1
           fi
+          if ! grep --extended-regexp --quiet 'zig[[:space:]]+cc' "${c_record}"; then
+            echo "C compile record does not invoke zig cc: ${c_record}" >&2
+            exit 1
+          fi
+          if ! grep --extended-regexp --quiet -- \
+              '-target[[:space:]]+x86_64-freestanding-none' "${c_record}"; then
+            echo "C compile record missing -target x86_64-freestanding-none: ${c_record}" >&2
+            exit 1
+          fi
+          if ! grep --quiet -- '-flto' "${c_record}"; then
+            echo "C compile record missing -flto: ${c_record}" >&2
+            exit 1
+          fi
+          c_obj="${c_record%.cmd}"
+          if [ ! -f "${c_obj}" ]; then
+            echo "Expected C object not found: ${c_obj}" >&2
+            exit 1
+          fi
+          obj_type="$(file -b "${c_obj}")"
+          if ! printf '%s' "${obj_type}" | grep --quiet 'LLVM IR bitcode'; then
+            echo "C object is not LLVM IR bitcode (${obj_type}): ${c_obj}" >&2
+            exit 1
+          fi
+          echo "LTO C bitcode verified: ${c_obj}"
         done
-        if [ "${lto_zig_cmd_found}" -eq 0 ]; then
-          echo "No .cmd file shows 'zig cc -target x86_64-freestanding-none ... -flto'." >&2
-          exit 1
-        fi
-
-        # Verify representative C objects are LLVM IR bitcode.
-        # Object names do not retain source extensions in this build (e.g.
-        # apphelloworld/main.o, libnolibc/string.o).  Identify C-compiled
-        # objects robustly by selecting .cmd files that record zig cc with
-        # -flto; assembly .cmd files lack -flto so their objects are excluded.
-        # .cmd files may be hidden (leading dot, e.g. .main.o.cmd → main.o).
-        c_objects_checked=0
-        c_bitcode_failures=0
-        while IFS= read -r -d '' cmd_file; do
-          if grep --extended-regexp --quiet 'zig[[:space:]]+cc' "${cmd_file}" \
-              && grep --quiet -- '-flto' "${cmd_file}"; then
-            dir="$(dirname "${cmd_file}")"
-            base="$(basename "${cmd_file}" .cmd)"
-            base="${base#.}"
-            obj="${dir}/${base}"
-            if [ -f "${obj}" ]; then
-              c_objects_checked=$((c_objects_checked + 1))
-              obj_type="$(file -b "${obj}")"
-              if ! printf '%s' "${obj_type}" | grep --quiet 'LLVM IR bitcode'; then
-                echo "C object is not LLVM IR bitcode (${obj_type}): ${obj}" >&2
-                c_bitcode_failures=$((c_bitcode_failures + 1))
-              fi
-            fi
-          fi
-        done < <(find "${build}" -type f -name '*.cmd' \
-            ! -path "${build}/kconfig/*" \
-            ! -path "${build}/include/config/*" \
-            -size +0c -print0)
-        if [ "${c_objects_checked}" -eq 0 ]; then
-          echo "No C objects derived from LTO .cmd records; cannot verify bitcode." >&2
-          exit 1
-        fi
-        if [ "${c_bitcode_failures}" -ne 0 ]; then
-          echo "${c_bitcode_failures} C object(s) are not LLVM IR bitcode." >&2
-          exit 1
-        fi
-        echo "LTO C bitcode: ${c_objects_checked} object(s) verified."
 
         test "${build_status[1]}" -eq 0
         test "${build_status[0]}" -eq 0
