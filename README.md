@@ -376,8 +376,118 @@ pipelines as `LazyPath` inputs. The EFI pipeline runs the repository's
 `mkukreloc.py` helper against the unstripped PIE image, updates `.uk_reloc`,
 and only then strips and converts the image to PE/COFF. Configuration and
 metadata inputs for target headers are content-tracked, so changing a solved
-configuration in place invalidates the generated header. This compiler support
-remains experimental and does not support LTO.
+configuration in place invalidates the generated header.
+
+#### Experimental LTO (QEMU/x86_64 native pipeline only)
+
+The Zig 0.16 `native-images` pipeline supports a whole-program flat LTO path
+for the `qemu-x86_64` profile. Selecting `CONFIG_OPTIMIZE_LTO=y` with the
+`qemu-arm64` or `hyperv-x86_64-efi` native profiles is detected at build time
+and rejected with an explicit error. Non-LTO QEMU/ARM64 builds remain fully
+supported. The GNU Make backend is not affected: it retains its existing
+compiler-specific per-library LTO behavior (e.g. `-flto` forwarded to GCC or
+Clang) unchanged.
+
+To enable LTO for the QEMU/x86_64 native pipeline, copy the application
+x86_64 defconfig, append `CONFIG_OPTIMIZE_LTO=y`, run `zig build olddefconfig`
+to fill in remaining defaults, then run `zig build native-images` with the same
+tool arguments. Using a shell array avoids repeating the argument list:
+
+```shell
+config=/absolute/path/to/qemu-x86_64-lto.config
+output=/absolute/path/to/build-zig-lto
+cp /absolute/path/to/app/defconfigs/qemu-x86_64 "${config}"
+printf 'CONFIG_OPTIMIZE_LTO=y\n' >> "${config}"
+
+zig_args=(
+  "-Dapp=/absolute/path/to/app"
+  "-Doutput=${output}"
+  "-Dconfig=${config}"
+  "-Dcompiler=zig cc -target x86_64-freestanding-none"
+  "-Dcompiler-targeted=true"
+  "-Dhost-cc=zig cc"
+  "-Dhost-cxx=zig c++"
+  "-Dhost-cflags=-fno-sanitize=null"
+  "-Dmake-arg=AR=zig ar"
+  "-Dmake-arg=NM=llvm-nm"
+  "-Dmake-arg=OBJCOPY=llvm-objcopy"
+  "-Dmake-arg=OBJDUMP=llvm-objdump"
+  "-Dmake-arg=READELF=llvm-readelf"
+  "-Dmake-arg=STRIP=llvm-strip"
+  "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+  "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+)
+
+zig build olddefconfig "${zig_args[@]}"
+zig build native-images -Dnative-profile=qemu-x86_64 "${zig_args[@]}"
+```
+
+When `CONFIG_OPTIMIZE_LTO=y` is active the per-library `zig cc -r` partial-link
+and `objcopy --keep-global-symbols` stages are bypassed. All library object and
+archive inputs are collected in registration order and passed directly to a
+single `zig cc -flto` final link, allowing LLVM LTO cross-translation-unit
+optimization. The build applies only to the registered native graph scope;
+arbitrary application layouts outside the documented profiles are not
+guaranteed to work.
+
+**Symbol policy and linker arguments.** After GNU Make materializes the native
+link inputs, `lto-symbol-policy.py` invokes the configured `llvm-nm` tool on
+each library's objects and archives, reads per-library export-symbol files, and
+validates cross-library symbol references. Private-symbol collisions (the same
+private name defined in multiple libraries) and illegal cross-library
+references to private symbols cause an explicit build failure. On success it
+generates a deterministic LLD version script with the global-symbol union and
+`local: *;`, plus a response file containing `-Wl,-u` force-keep arguments for
+the active export lists. The version script keeps private definitions local,
+while the response arguments preserve required exports through LTO
+internalization. Generating both at execution time also supports a clean build
+output when an export list is itself produced by GNU Make.
+
+**Measurement tools.** Two scripts under `support/scripts/` assist in
+evaluating the effect of LTO. They must be run against images built from
+identical configurations and identical source commits, differing only in the
+`CONFIG_OPTIMIZE_LTO` setting; results from differing commits or configs are
+not comparable.
+
+Verify that Zig performs cross-translation-unit LTO at all (compiles two
+separate C translation units and confirms the callee is inlined and eliminated):
+
+```shell
+python3 support/scripts/lto-proof.py \
+  --work-dir lto-proof-work \
+  --zig /path/to/zig \
+  --nm llvm-nm
+```
+
+Compare section sizes and defined-symbol counts between a baseline (non-LTO)
+and an LTO image:
+
+```shell
+python3 support/scripts/elf-size-diff.py \
+  --readelf llvm-readelf \
+  --nm llvm-nm \
+  /path/to/baseline.dbg \
+  /path/to/lto.dbg
+```
+
+Pass `--json` to get machine-readable output. The tool reports `file_size`,
+`.text`, `.rodata`, `.data`, `.bss`, and `symbol_count` deltas.
+
+**Representative observations.** The following measurements were recorded for
+a hello-world application on QEMU/x86_64 with identical configs differing only
+in `CONFIG_OPTIMIZE_LTO`. They are informational observations on a specific
+workload and commit; they are **not** guaranteed thresholds and do not imply
+runtime speedup. Real applications may see different, smaller, or larger
+changes depending on their code and configuration:
+
+| Metric              | Delta    |
+|---------------------|----------|
+| Debug ELF file size | +0.57%   |
+| `.text`             | -0.22%   |
+| `.rodata`           | -6.83%   |
+| `.data`             | -45.57%  |
+| `.bss`              | +0.00%   |
+| Defined symbols     | -10.89%  |
 
 The standalone Clang/LLVM 21.1.8 QEMU/ARM64 build uses the GNU Make backend
 directly:
