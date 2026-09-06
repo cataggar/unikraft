@@ -154,8 +154,7 @@ fn isForbiddenDriverFlag(flag: []const u8) bool {
         std.mem.indexOf(u8, flag, "-Wl,-dT") != null or
         std.mem.indexOf(u8, flag, "-Wl,--default-script") != null or
         std.mem.indexOf(u8, flag, "-Wl,-T") != null or
-        std.mem.eql(u8, flag, "-Wl,-m") or
-        std.mem.startsWith(u8, flag, "-Wl,-m,");
+        std.mem.startsWith(u8, flag, "-Wl,-m");
 }
 
 fn resolveArtifactPath(
@@ -541,6 +540,29 @@ test "planner rejects driver-incompatible linker script and emulation flags" {
         .output = "bad",
         .sequence = &.{
             .{ .literal_flag = "-Wl,-m,elf_x86_64" },
+            .{ .artifact = .{
+                .kind = .linker_script,
+                .artifact = .{ .path = "primary.lds" },
+            } },
+        },
+    }};
+    var platforms = [_]component.Platform{graph.platforms[0]};
+    platforms[0].link_stages = &stages;
+    graph.platforms = &platforms;
+    try std.testing.expectError(
+        error.UnsupportedFinalLinkFlag,
+        planSelected(std.testing.allocator, graph),
+    );
+}
+
+test "planner rejects attached linker emulation flags" {
+    var graph = fixtureGraph();
+    var stages = [_]component.LinkStage{.{
+        .name = "bad",
+        .transformation = .final_link,
+        .output = "bad",
+        .sequence = &.{
+            .{ .literal_flag = "-Wl,-melf_x86_64" },
             .{ .artifact = .{
                 .kind = .linker_script,
                 .artifact = .{ .path = "primary.lds" },
