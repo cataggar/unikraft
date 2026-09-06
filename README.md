@@ -285,14 +285,15 @@ replacement refusal, and orphaned backend-tree lock-lifetime coverage,
 including hostile inherited Make environments, output-identity replacement,
 runtime/build-marker entries, and differing temporary-directory environments.
 
-The experimental QEMU/x86_64 Zig compiler setup becomes:
+The experimental QEMU/x86_64 native Zig image pipeline becomes:
 
 ```shell
-zig build \
+zig build native-images \
+  -Dnative-qemu-graph=qemu-x86_64 \
   -Dapp=/absolute/path/to/app \
+  -Dconfig=/absolute/path/to/solved-qemu-x86_64.config \
   '-Dcompiler=zig cc -target x86_64-freestanding-none' \
-  '-Dpartial-linker=zig ld.lld' \
-  -Dpartial-linker-type=raw \
+  -Dcompiler-targeted=true \
   '-Dhost-cc=zig cc' \
   '-Dhost-cxx=zig c++' \
   -Dhost-cflags=-fno-sanitize=null \
@@ -306,21 +307,24 @@ zig build \
   -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
 ```
 
-Omitting `-Dlinker` makes the final link use the compiler driver. The x86_64
-build requires Python 3 and the listed LLVM binary tools, but not GCC. The
-`host-cflags` exception accommodates Kconfig's kernel-style, null-derived list
-sentinel.
+This step asks GNU Make only for compiled objects, generated linker scripts,
+and archives. `build.zig` executes the ordered `zig cc -r` library links,
+merges linker scripts, runs the final `zig cc` link, performs image
+post-processing, and publishes the image, debug image, bootinfo, and compile
+database under the build output directory. The x86_64 build requires Python 3
+and the listed LLVM binary tools, but not GCC. The `host-cflags` exception
+accommodates Kconfig's kernel-style, null-derived list sentinel.
 
 For QEMU/ARM64, use the same GCC-free tool contract with an explicit
 freestanding AArch64 target:
 
 ```shell
-zig build \
+zig build native-images \
+  -Dnative-qemu-graph=qemu-arm64 \
   -Dapp=/absolute/path/to/app \
+  -Dconfig=/absolute/path/to/solved-qemu-arm64.config \
   '-Dcompiler=zig cc -target aarch64-freestanding-none' \
   -Dcompiler-targeted=true \
-  '-Dpartial-linker=zig ld.lld' \
-  -Dpartial-linker-type=raw \
   '-Dhost-cc=zig cc' \
   '-Dhost-cxx=zig c++' \
   -Dhost-cflags=-fno-sanitize=null \
@@ -335,9 +339,12 @@ zig build \
 ```
 
 Neither target requires GCC or GNU cross-binutils. Both require Python 3 and
-the listed LLVM binary tools. This compiler support remains experimental, is
-limited to GNU Make-configured QEMU/x86_64 and QEMU/ARM64 applications, and
-does not support LTO.
+the listed LLVM binary tools. Passing `-Dnative-qemu-graph` also routes the
+`images` and default `all` steps through this native link pipeline. Other
+profiles and invocations without that option retain the GNU Make backend.
+This compiler support remains experimental, is limited to GNU
+Make-configured hello-world QEMU/x86_64 and QEMU/ARM64 applications, and does
+not support LTO.
 
 The standalone Clang/LLVM 21.1.8 QEMU/ARM64 build uses the GNU Make backend
 directly:
