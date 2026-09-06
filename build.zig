@@ -1043,17 +1043,14 @@ fn finishNativeImages(
         registered.graph,
         stage_name,
     ).?;
-    var linked_output_superseded = false;
-    for (post.outputs) |output| {
-        if (std.mem.eql(u8, output.logical_path, linked_logical_path)) {
-            linked_output_superseded = true;
-            break;
-        }
-    }
-    if (!linked_output_superseded) {
-        addPublishedOutput(b, step, link_output, linked_logical_path);
-    }
+    addPublishedOutput(
+        b,
+        step,
+        post.publicationPath(linked_logical_path, link_output),
+        linked_logical_path,
+    );
     for (post.outputs, 0..) |output, index| {
+        if (std.mem.eql(u8, output.logical_path, linked_logical_path)) continue;
         var superseded = false;
         for (post.outputs[index + 1 ..]) |later| {
             if (std.mem.eql(u8, output.logical_path, later.logical_path)) {

@@ -548,6 +548,25 @@ pub const TrackedOutput = struct {
 
 pub const Execution = struct {
     outputs: []const TrackedOutput,
+
+    pub fn latestOutput(self: Execution, logical_path: []const u8) ?TrackedOutput {
+        var index = self.outputs.len;
+        while (index != 0) {
+            index -= 1;
+            const output = self.outputs[index];
+            if (std.mem.eql(u8, output.logical_path, logical_path)) return output;
+        }
+        return null;
+    }
+
+    pub fn publicationPath(
+        self: Execution,
+        logical_path: []const u8,
+        fallback: std.Build.LazyPath,
+    ) std.Build.LazyPath {
+        const output = self.latestOutput(logical_path) orelse return fallback;
+        return output.path;
+    }
 };
 
 pub fn execute(
@@ -648,6 +667,24 @@ const test_config = api.ConfigQuery{
 
 test "all native postprocess declarations compile" {
     std.testing.refAllDecls(@This());
+}
+
+test "publication selects the latest mutated artifact instead of final-link output" {
+    const raw = std.Build.LazyPath{ .cwd_relative = "/cache/raw-final-link.dbg" };
+    const relocated = std.Build.LazyPath{ .cwd_relative = "/cache/relocated.dbg" };
+    const execution = Execution{ .outputs = &.{.{
+        .transformation = "uk-reloc",
+        .name = "debug",
+        .logical_path = "/build/hyperv.dbg",
+        .role = .debug,
+        .mutation = true,
+        .path = relocated,
+    }} };
+
+    const selected = execution.publicationPath("/build/hyperv.dbg", raw);
+    try std.testing.expect(selected == .cwd_relative);
+    try std.testing.expectEqualStrings("/cache/relocated.dbg", selected.cwd_relative);
+    try std.testing.expect(!std.mem.eql(u8, selected.cwd_relative, raw.cwd_relative));
 }
 
 test "x86 plan preserves side output and mutation chain order" {
