@@ -40,12 +40,20 @@ void ukplat_efi_pre_exit(struct uk_efi_runtime_services *rs)
 	struct uktimeconv_bmkclock date;
 	struct uk_efi_time now;
 	uk_efi_status_t status;
+	__u64 reference_time;
 	__u64 epoch_ns;
 	__s64 utc_ns;
+	int rc;
+
+	rc = hyperv_runtime_detect();
+	if (unlikely(rc != HYPERV_DETECT_OK))
+		UK_CRASH("Hyper-V discovery failed before ExitBootServices: %s\n",
+			 hyperv_detect_error(rc));
 
 	status = rs->get_time(&now, NULL);
 	if (unlikely(status != UK_EFI_SUCCESS))
 		UK_CRASH("Hyper-V: UEFI GetTime failed: 0x%lx\n", status);
+	reference_time = hyperv_time_ref_count();
 	if (unlikely(now.year < 1970 || now.month < 1 || now.month > 12 ||
 		     now.day < 1 || now.day > 31 || now.hour > 23 ||
 		     now.minute > 59 || now.second > 59 ||
@@ -67,7 +75,7 @@ void ukplat_efi_pre_exit(struct uk_efi_runtime_services *rs)
 	}
 	if (unlikely(utc_ns < 0))
 		UK_CRASH("Hyper-V: UEFI wall clock predates the Unix epoch\n");
-	hyperv_clock_set_efi_epoch((__u64)utc_ns);
+	hyperv_clock_set_efi_sample((__u64)utc_ns, reference_time);
 	hyperv_efi_rs = rs;
 }
 
