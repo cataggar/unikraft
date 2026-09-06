@@ -542,6 +542,27 @@ pub fn build(b: *std.Build) void {
     verify_hyperv_runtime.setCwd(.{ .cwd_relative = root });
     verify_hyperv_runtime.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     test_step.dependOn(&verify_hyperv_runtime.step);
+    const platform_correctness_tests = b.addExecutable(.{
+        .name = "platform-runtime-correctness-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    platform_correctness_tests.root_module.addIncludePath(
+        b.path("plat/common/include"),
+    );
+    platform_correctness_tests.root_module.addIncludePath(
+        b.path("plat/hyperv/include"),
+    );
+    platform_correctness_tests.root_module.addCSourceFile(.{
+        .file = b.path(
+            "support/build/tests/platform-runtime-correctness-test.c",
+        ),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    test_step.dependOn(&b.addRunArtifact(platform_correctness_tests).step);
     const lto_policy_tests = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/lto-symbol-policy-test.py",

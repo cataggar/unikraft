@@ -45,7 +45,7 @@ __u16 hyperv_status_kind(__u64 result);
 __u64 hyperv_msr_read(__u32 msr);
 void hyperv_msr_write(__u32 msr, __u64 value);
 __u64 hyperv_time_ref_count(void);
-void hyperv_clock_set_efi_epoch(__u64 epoch_ns);
+void hyperv_clock_set_efi_sample(__u64 epoch_ns, __u64 reference_time);
 
 _Static_assert(HYPERV_PAGE_SIZE == 4096U, "Hyper-V pages are 4 KiB");
 

@@ -1,19 +1,22 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <hyperv/hyperv.h>
+#include <hyperv/clock.h>
 #include <stdint.h>
 #include <uk/atomic.h>
 #include <uk/plat/time.h>
 
-#define HYPERV_100NS_TO_NS	100ULL
-
 static __u64 hyperv_epoch_ns;
+/* Paired with hyperv_epoch_ns before ExitBootServices. */
+static __u64 hyperv_efi_ref;
+/* Keeps the public monotonic clock anchored at ukplat_time_init(). */
 static __u64 hyperv_boot_ref;
 
 unsigned long sched_have_pending_events;
 
-void hyperv_clock_set_efi_epoch(__u64 epoch_ns)
+void hyperv_clock_set_efi_sample(__u64 epoch_ns, __u64 reference_time)
 {
 	hyperv_epoch_ns = epoch_ns;
+	hyperv_efi_ref = reference_time;
 }
 
 void ukplat_time_init(void)
@@ -23,13 +26,14 @@ void ukplat_time_init(void)
 
 __nsec ukplat_monotonic_clock(void)
 {
-	return (hyperv_time_ref_count() - hyperv_boot_ref) *
-	       HYPERV_100NS_TO_NS;
+	return hyperv_reference_delta_ns(hyperv_time_ref_count(),
+					 hyperv_boot_ref);
 }
 
 __nsec ukplat_wall_clock(void)
 {
-	return hyperv_epoch_ns + ukplat_monotonic_clock();
+	return hyperv_wall_time_ns(hyperv_epoch_ns, hyperv_efi_ref,
+				    hyperv_time_ref_count());
 }
 
 void ukplat_time_fini(void)
