@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2026, The Unikraft Authors.
-# Licensed under the BSD-3-Clause License (the "License").
-# You may not use this file except in compliance with the License.
 """
 elf-size-diff — compare section sizes and symbol counts between two ELF files.
-
-Reports the benefit (or cost) of link-time optimisation by diffing a baseline
-(non-LTO) ELF against an LTO ELF.
 
 Usage:
     python elf-size-diff.py [options] <baseline.elf> <lto.elf>
@@ -18,8 +13,7 @@ Options:
     --json          emit machine-readable JSON (default: human-readable table)
 
 Metrics: file_size, .text, .rodata, .data, .bss, symbol_count.
-
-Exit codes: 0 success, 1 tool or argument error.
+Exit codes: 0 success, 1 error.
 """
 
 import argparse
@@ -27,16 +21,14 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 
 from elf_tools import configured_tool, tool_output
 
-# Matches a single wide-format readelf section-header line:
-#   [Nr] Name Type Address Off Size ES ...
-# Requires Address and Off to be hex (to distinguish section-header lines from
-# other output), but captures the Size slot as any token so that non-hex values
-# trigger an explicit ValueError instead of being silently skipped.
-# Captures: group 1 = Name, group 2 = Size token (must be hex).
+# Matches a wide-format readelf section-header line ([Nr] Name Type Address Off Size ...).
+# Requires Address and Off to be hex to filter out non-header lines, but captures
+# the Size slot as any token so non-hex values raise ValueError explicitly.
 _SECTION_RE = re.compile(
     r"^\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+(\S+)"
 )
@@ -49,7 +41,7 @@ def read_sections(readelf, elf_path):
     """Return {section_name: byte_size} for every section in the ELF.
 
     Raises subprocess.CalledProcessError if readelf exits non-zero.
-    Raises ValueError if a size field cannot be parsed as hexadecimal.
+    Raises ValueError if a size field is not valid hexadecimal.
     """
     raw = tool_output(readelf, "-SW", str(elf_path), text=True)
     sections = {}
@@ -62,7 +54,7 @@ def read_sections(readelf, elf_path):
             sections[name] = int(size_hex, 16)
         except ValueError as exc:
             raise ValueError(
-                f"malformed size field {size_hex!r} in readelf output line: {line!r}"
+                f"malformed size field {size_hex!r} in readelf output: {line!r}"
             ) from exc
     return sections
 
@@ -89,9 +81,9 @@ def gather_metrics(readelf, nm, elf_path):
 
 
 def compute_delta(baseline_val, lto_val):
-    """Return (absolute_delta, percentage_delta_or_None).
+    """Return (absolute_delta, pct_or_None).
 
-    Percentage is None when baseline_val is zero (division undefined).
+    pct is None when baseline_val is zero (division undefined).
     """
     delta = lto_val - baseline_val
     pct = None if baseline_val == 0 else round(delta / baseline_val * 100.0, 2)
@@ -99,7 +91,7 @@ def compute_delta(baseline_val, lto_val):
 
 
 def compare(baseline_metrics, lto_metrics):
-    """Return an OrderedDict of metric comparisons preserving METRICS_ORDER."""
+    """Return a dict of metric comparisons in METRICS_ORDER."""
     result = {}
     for key in METRICS_ORDER:
         b = baseline_metrics[key]
@@ -110,12 +102,8 @@ def compare(baseline_metrics, lto_metrics):
 
 
 def emit_json(baseline_path, lto_path, comparison):
-    out = {
-        "baseline": str(baseline_path),
-        "lto": str(lto_path),
-        "metrics": comparison,
-    }
-    print(json.dumps(out, indent=2))
+    print(json.dumps({"baseline": str(baseline_path), "lto": str(lto_path),
+                      "metrics": comparison}, indent=2))
 
 
 def emit_table(comparison):
@@ -127,32 +115,24 @@ def emit_table(comparison):
         f"{'Delta':>{col_w[3]}}"
         f"{'%Delta':>{col_w[4]}}"
     )
-    sep = "-" * len(header)
     print(header)
-    print(sep)
+    print("-" * len(header))
     for key, vals in comparison.items():
-        b = vals["baseline"]
-        l = vals["lto"]
-        d = vals["delta"]
-        p = vals["pct"]
-        pct_str = f"{p:+.2f}%" if p is not None else "N/A"
+        pct_str = f"{vals['pct']:+.2f}%" if vals["pct"] is not None else "N/A"
         print(
             f"{key:<{col_w[0]}}"
-            f"{b:>{col_w[1]}}"
-            f"{l:>{col_w[2]}}"
-            f"{d:>+{col_w[3]}}"
+            f"{vals['baseline']:>{col_w[1]}}"
+            f"{vals['lto']:>{col_w[2]}}"
+            f"{vals['delta']:>+{col_w[3]}}"
             f"{pct_str:>{col_w[4]}}"
         )
 
 
 def _parse_tool(arg_value, env_var, default):
-    """Parse a shell-quoted tool command string into a list."""
     parts = shlex.split(arg_value) if arg_value else None
     if parts is not None:
         if not parts:
-            raise argparse.ArgumentTypeError(
-                f"tool command must not be empty"
-            )
+            raise ValueError(f"tool command must not be empty")
         return parts
     return configured_tool(env_var, default)
 
@@ -163,12 +143,8 @@ def main():
     )
     parser.add_argument("--readelf", metavar="CMD", help="readelf command (env: READELF)")
     parser.add_argument("--nm", metavar="CMD", help="nm command (env: NM)")
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="emit_json",
-        help="emit machine-readable JSON",
-    )
+    parser.add_argument("--json", action="store_true", dest="emit_json",
+                        help="emit machine-readable JSON")
     parser.add_argument("baseline", help="baseline ELF (built without LTO)")
     parser.add_argument("lto", help="LTO ELF (built with LTO)")
     args = parser.parse_args()
@@ -176,13 +152,21 @@ def main():
     try:
         readelf = _parse_tool(args.readelf, "READELF", "readelf")
         nm = _parse_tool(args.nm, "NM", "nm")
-    except (argparse.ArgumentTypeError, ValueError) as exc:
+    except ValueError as exc:
         parser.error(str(exc))
 
-    baseline_metrics = gather_metrics(readelf, nm, args.baseline)
-    lto_metrics = gather_metrics(readelf, nm, args.lto)
-    comparison = compare(baseline_metrics, lto_metrics)
+    try:
+        baseline_metrics = gather_metrics(readelf, nm, args.baseline)
+        lto_metrics = gather_metrics(readelf, nm, args.lto)
+    except FileNotFoundError as exc:
+        sys.exit(f"error: {exc}")
+    except subprocess.CalledProcessError as exc:
+        cmd_str = " ".join(str(a) for a in exc.cmd)
+        sys.exit(f"error: tool exited {exc.returncode}: {cmd_str}")
+    except ValueError as exc:
+        sys.exit(f"error: {exc}")
 
+    comparison = compare(baseline_metrics, lto_metrics)
     if args.emit_json:
         emit_json(args.baseline, args.lto, comparison)
     else:

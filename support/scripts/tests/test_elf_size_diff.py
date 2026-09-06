@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2026, The Unikraft Authors.
-# Licensed under the BSD-3-Clause License (the "License").
-# You may not use this file except in compliance with the License.
 """
 Tests for support/scripts/elf-size-diff.py.
 
@@ -599,6 +597,75 @@ class CLIFailureTest(_Base):
             stderr=subprocess.PIPE,
         )
         self.assertNotEqual(proc.returncode, 0)
+
+
+class CLIErrorFormatTest(_Base):
+    """Errors at the CLI boundary emit 'error:' prefix without tracebacks."""
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, str(_DIFF_SCRIPT), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def _assert_clean_error(self, proc):
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("error:", combined.lower(), "expected 'error:' prefix in output")
+        self.assertNotIn("Traceback", combined, "unexpected traceback in output")
+
+    def test_missing_elf_emits_clean_error(self):
+        proc = self._run(
+            "--readelf", "readelf",
+            "--nm", "nm",
+            "/nonexistent/baseline.elf",
+            "/nonexistent/lto.elf",
+        )
+        self._assert_clean_error(proc)
+
+    def test_readelf_failure_emits_clean_error(self):
+        belf = self._td / "b_ef.elf"
+        lelf = self._td / "l_ef.elf"
+        belf.write_bytes(b"\x00" * 64)
+        lelf.write_bytes(b"\x00" * 64)
+        bad = self._tool("re_ef.py", _failing_script())
+        nm_p = self._tool("nm_ef.py", _fake_nm_script(_NM_BODY_8))
+        proc = self._run(
+            "--readelf", shlex.quote(sys.executable) + " " + shlex.quote(str(bad)),
+            "--nm", shlex.quote(sys.executable) + " " + shlex.quote(str(nm_p)),
+            str(belf), str(lelf),
+        )
+        self._assert_clean_error(proc)
+
+    def test_nm_failure_emits_clean_error(self):
+        belf = self._td / "b_nf.elf"
+        lelf = self._td / "l_nf.elf"
+        belf.write_bytes(b"\x00" * 64)
+        lelf.write_bytes(b"\x00" * 64)
+        re_p = self._tool("re_nf.py", _fake_readelf_script(_READELF_BODY_A))
+        bad = self._tool("nm_nf.py", _failing_script())
+        proc = self._run(
+            "--readelf", shlex.quote(sys.executable) + " " + shlex.quote(str(re_p)),
+            "--nm", shlex.quote(sys.executable) + " " + shlex.quote(str(bad)),
+            str(belf), str(lelf),
+        )
+        self._assert_clean_error(proc)
+
+    def test_malformed_readelf_output_emits_clean_error(self):
+        belf = self._td / "b_mf.elf"
+        lelf = self._td / "l_mf.elf"
+        belf.write_bytes(b"\x00" * 64)
+        lelf.write_bytes(b"\x00" * 64)
+        re_p = self._tool("re_mf.py", _fake_readelf_script(_READELF_BODY_BAD))
+        nm_p = self._tool("nm_mf.py", _fake_nm_script(_NM_BODY_8))
+        proc = self._run(
+            "--readelf", shlex.quote(sys.executable) + " " + shlex.quote(str(re_p)),
+            "--nm", shlex.quote(sys.executable) + " " + shlex.quote(str(nm_p)),
+            str(belf), str(lelf),
+        )
+        self._assert_clean_error(proc)
 
 
 if __name__ == "__main__":
