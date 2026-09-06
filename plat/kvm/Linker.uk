@@ -22,12 +22,14 @@ KVM_LDFLAGS-y += -Wl,--entry=uk_efi_entry64
 ifneq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
 KVM_LDFLAGS-y += -Wl,-m,aarch64elf
 endif
-KVM_LDLIBS-y += -lgcc
 else
 KVM_LDFLAGS-y += -Wl,--entry=_libkvmplat_entry
 ifneq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
 KVM_LDFLAGS-y += -Wl,-m,aarch64elf
 endif
+endif
+# Freestanding Clang-compatible drivers select compiler-rt explicitly.
+ifeq ($(filter -rtlib=compiler-rt --rtlib=compiler-rt,$(LDFLAGS) $(LDFLAGS-y)),)
 KVM_LDLIBS-y += -lgcc
 endif
 endif
