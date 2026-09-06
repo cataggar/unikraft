@@ -119,27 +119,6 @@ print(" LOAD 0x001000 0x0000000040201000 0x0000000040201000 0x1000 0x2000 RW  0x
         x86_bootinfo = root / "x86 with boot info.elf"
         x86_final = root / "x86 multiboot image.elf"
         x86_debug.write_bytes(elf64(62))
-        x86_relocations = root / "x86 relocations.bin"
-        x86_relocated = root / "x86 relocated.elf"
-        invoke(
-            runner,
-            "uk-reloc",
-            "--script",
-            fake_reloc,
-            "--nm",
-            nm_cmd,
-            "--readelf",
-            readelf_cmd,
-            "--objcopy",
-            objcopy_cmd,
-            x86_debug,
-            x86_relocations,
-            x86_relocated,
-        )
-        assert x86_relocations.read_bytes()[:4] == (0x0BADB0B0).to_bytes(
-            4, "little"
-        )
-        assert x86_relocated.read_bytes().endswith(x86_relocations.read_bytes())
         invoke(runner, "strip", "--tool", strip_cmd, x86_debug, x86_image)
         invoke(
             runner,
@@ -163,7 +142,51 @@ print(" LOAD 0x001000 0x0000000040201000 0x0000000040201000 0x1000 0x2000 RW  0x
         assert x86_data[18:20] == (3).to_bytes(2, "little")
         assert x86_data[52:56] == (0x1BADB002).to_bytes(4, "little")
 
-        efi_image = root / "x86 EFI image.elf"
+        efi_debug = root / "EFI raw debug.elf"
+        efi_relocations = root / "EFI relocations.bin"
+        efi_relocated = root / "EFI relocated debug.elf"
+        efi_stripped = root / "EFI stripped.elf"
+        efi_side = root / "EFI boot info.bin"
+        efi_bootinfo = root / "EFI with boot info.elf"
+        efi_image = root / "x86 EFI image.efi"
+        efi_debug.write_bytes(elf64(62) + b"RAW-FINAL-LINK")
+        invoke(
+            runner,
+            "uk-reloc",
+            "--script",
+            fake_reloc,
+            "--nm",
+            nm_cmd,
+            "--readelf",
+            readelf_cmd,
+            "--objcopy",
+            objcopy_cmd,
+            efi_debug,
+            efi_relocations,
+            efi_relocated,
+        )
+        relocation_blob = efi_relocations.read_bytes()
+        assert relocation_blob[:4] == (0x0BADB0B0).to_bytes(4, "little")
+        assert relocation_blob not in efi_debug.read_bytes()
+        assert efi_relocated.read_bytes().endswith(relocation_blob)
+        invoke(runner, "strip", "--tool", strip_cmd, efi_relocated, efi_stripped)
+        assert efi_stripped.read_bytes().endswith(relocation_blob)
+        invoke(
+            runner,
+            "bootinfo",
+            "--script",
+            bootinfo,
+            "--objdump",
+            objdump_cmd,
+            "--objcopy",
+            objcopy_cmd,
+            "--arch",
+            "x86_64",
+            efi_stripped,
+            efi_side,
+            efi_bootinfo,
+        )
+        assert efi_bootinfo.read_bytes().endswith(relocation_blob)
         invoke(
             runner,
             "efi",
@@ -173,14 +196,15 @@ print(" LOAD 0x001000 0x0000000040201000 0x0000000040201000 0x1000 0x2000 RW  0x
             nm_cmd,
             "--readelf",
             readelf_cmd,
-            x86_image,
-            x86_debug,
+            efi_bootinfo,
+            efi_relocated,
             efi_image,
         )
         efi_data = efi_image.read_bytes()
         assert efi_data[:2] == b"MZ"
         assert efi_data[64:68] == b"PE\0\0"
         assert efi_data[68:70] == (0x8664).to_bytes(2, "little")
+        assert relocation_blob in efi_data
 
         arm_debug = root / "arm debug.elf"
         arm_image = root / "arm stripped.elf"
