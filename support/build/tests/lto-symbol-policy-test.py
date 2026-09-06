@@ -102,6 +102,38 @@ class TestReadExportSymbols(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+class TestCollectExportSymbols(unittest.TestCase):
+    def test_uses_only_explicit_export_lists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exports_a = os.path.join(tmpdir, "a.uk")
+            exports_b = os.path.join(tmpdir, "b.uk")
+            with open(exports_a, "w") as f:
+                f.write("shared\napi_a\n")
+            with open(exports_b, "w") as f:
+                f.write("shared\napi_b\n")
+            libraries = [
+                {
+                    "name": "libA",
+                    "export_files": [exports_a],
+                    "inputs": [],
+                },
+                {
+                    "name": "libB",
+                    "export_files": [exports_b],
+                    "inputs": [],
+                },
+                {
+                    "name": "app",
+                    "export_files": [],
+                    "inputs": [],
+                },
+            ]
+            self.assertEqual(
+                policy.collect_export_symbols(libraries),
+                ["api_a", "api_b", "shared"],
+            )
+
+
 class TestParseNmOutput(unittest.TestCase):
     def test_posix_format(self):
         output = "foo T\nbar D\nbaz U\n"

@@ -124,6 +124,15 @@ def read_export_symbols(path):
         sys.exit(2)
 
 
+def collect_export_symbols(libraries):
+    """Return the union of symbols named by all library export files."""
+    symbols = set()
+    for library in libraries:
+        for path in library["export_files"]:
+            symbols |= read_export_symbols(path)
+    return sorted(symbols)
+
+
 def run_nm(nm_tool, path):
     """Run nm -g --format=posix on path and return stdout."""
     cmd = [nm_tool, "-g", "--format=posix", path]
@@ -417,6 +426,7 @@ def main(argv=None):
     args = parse_args(argv)
     libraries = parse_library_specs(args.spec)
 
+    force_keep_symbols = collect_export_symbols(libraries)
     global_symbols = []
     if not libraries:
         script = generate_version_script([])
@@ -436,7 +446,7 @@ def main(argv=None):
     if args.force_keep_output:
         write_output(
             args.force_keep_output,
-            generate_force_keep_response(global_symbols),
+            generate_force_keep_response(force_keep_symbols),
         )
 
 
