@@ -90,7 +90,7 @@ static int uk_intctlr_xpic_handle_irq(void *data)
 	 * soon as we fully implement APIC and get rid of
 	 * PIC
 	 */
-	if (irq <= 16)
+	if (irq < 16)
 		pic_ack_irq(irq);
 #else   /* !CONFIG_LIBUKINTCTLR_APIC */
 	pic_ack_irq(irq);

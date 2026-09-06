@@ -28,21 +28,34 @@ def main() -> None:
         "hyperv_runtime_disable",
         "hyperv_hypercall",
         "hyperv_time_ref_count",
+        "hyperv_reference_time",
+        "hyperv_synic_enable",
+        "hyperv_synic_disable",
+        "hyperv_synic_message_take",
+        "hyperv_synic_event_take_word",
+        "hyperv_x86_irq_to_vector",
+        "hyperv_stimer0_arm",
+        "hyperv_stimer0_cancel",
     )
     for symbol in required:
         if symbol not in symbols:
             raise SystemExit(f"missing Hyper-V runtime symbol: {symbol}")
 
     sections = output(args.readelf, "-SW", args.object)
-    page_section = next(
-        (line for line in sections.splitlines()
-         if ".text.hyperv_hypercall_page" in line),
-        None,
-    )
-    if page_section is None or "001000" not in page_section:
-        raise SystemExit("Hyper-V hypercall page is not a 4 KiB section")
-    if not page_section.rstrip().endswith("4096"):
-        raise SystemExit("Hyper-V hypercall page section is not 4 KiB aligned")
+    for name in (
+        ".text.hyperv_hypercall_page",
+        ".bss.hyperv_simp_page",
+        ".bss.hyperv_siefp_page",
+        ".bss.hyperv_reference_tsc_page",
+    ):
+        page_section = next(
+            (line for line in sections.splitlines() if name in line),
+            None,
+        )
+        if page_section is None or "001000" not in page_section:
+            raise SystemExit(f"{name} is not a 4 KiB section")
+        if not page_section.rstrip().endswith("4096"):
+            raise SystemExit(f"{name} is not 4 KiB aligned")
 
 
 if __name__ == "__main__":
