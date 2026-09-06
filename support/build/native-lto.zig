@@ -27,7 +27,7 @@ const component = @import("component-api.zig");
 const final_link = @import("final-link.zig");
 const native_image_graph = @import("native-image-graph.zig");
 
-// ── Link mode ──────────────────────────────────────────────────────────────
+// -- Link mode --------------------------------------------------------------
 
 /// Selects the link pipeline strategy for the native build.
 pub const LinkMode = enum {
@@ -43,7 +43,7 @@ pub const LinkMode = enum {
     }
 };
 
-// ── Optimization level ─────────────────────────────────────────────────────
+// -- Optimization level -----------------------------------------------------
 
 /// LTO code-generation optimization level, propagated to the final link driver.
 pub const OptLevel = enum {
@@ -66,7 +66,7 @@ pub const OptLevel = enum {
     }
 };
 
-// ── Profile validation ─────────────────────────────────────────────────────
+// -- Profile validation -----------------------------------------------------
 
 pub const ProfileError = error{UnsupportedLtoProfile};
 
@@ -79,7 +79,7 @@ pub fn requireLtoProfile(profile: native_image_graph.Profile) ProfileError!void 
     }
 }
 
-// ── LTO execution (std.Build integration) ──────────────────────────────────
+// -- LTO execution (std.Build integration) ----------------------------------
 
 pub const PlanError = final_link.PlanError;
 
@@ -134,7 +134,7 @@ pub fn executeLtoFinalLink(
     const merged_stages = try executor.addMergeStages(graph);
     const merged_script = executor.resolveMergedScript(graph, plan, merged_stages);
 
-    // ── Symbol-policy step ─────────────────────────────────────────────
+    // -- Symbol-policy step ---------------------------------------------
     // Invoke lto-symbol-policy.py to validate and generate version script.
     const policy = b.addSystemCommand(&.{
         "python3",
@@ -164,7 +164,8 @@ pub fn executeLtoFinalLink(
             policy.addFileArg(resolver.resolve(.{ .path = export_path }, export_path));
         }
 
-        // Object/archive inputs.
+        // Object/archive inputs. Validate that non-artifact items are
+        // the known redundant partial-link flags/groups for this graph.
         for (pipeline.partial_link_sequence) |seq_item| {
             switch (seq_item) {
                 .artifact => |a| {
@@ -173,13 +174,18 @@ pub fn executeLtoFinalLink(
                     policy.addArg("--input");
                     policy.addFileArg(resolver.resolve(a.artifact, path));
                 },
-                .literal_flag, .tool_mode_flag, .library_argument => {},
+                .literal_flag => |flag| {
+                    if (!isKnownPartialLinkFlag(flag))
+                        return error.UnsupportedFinalLinkFlag;
+                },
+                .tool_mode_flag => {},
                 .group_start, .group_end => {},
+                .library_argument => return error.UnsupportedFinalLinkFlag,
             }
         }
     }
 
-    // ── LTO final-link command ─────────────────────────────────────────
+    // -- LTO final-link command -----------------------------------------
     const zig = graph.toolchain.compiler.tool.command;
     const link = b.addSystemCommand(&.{zig});
     link.setName("LTO final link");
@@ -261,8 +267,13 @@ pub fn executeLtoFinalLink(
                         return error.UnresolvedArtifact;
                     link.addFileArg(resolver.resolve(a.artifact, path));
                 },
-                .literal_flag, .tool_mode_flag, .library_argument => {},
+                .literal_flag => |flag| {
+                    if (!isKnownPartialLinkFlag(flag))
+                        return error.UnsupportedFinalLinkFlag;
+                },
+                .tool_mode_flag => {},
                 .group_start, .group_end => {},
+                .library_argument => return error.UnsupportedFinalLinkFlag,
             }
         }
     }
@@ -288,6 +299,16 @@ fn isForbiddenDriverFlag(flag: []const u8) bool {
         std.mem.indexOf(u8, flag, "-Wl,--default-script") != null or
         std.mem.indexOf(u8, flag, "-Wl,-T") != null or
         std.mem.startsWith(u8, flag, "-Wl,-m");
+}
+
+/// The per-library partial_link_sequence contains flags that are redundant
+/// in the LTO flat link because they also appear in the final-link stage
+/// sequence.  Only these known flags are permitted; any other literal or
+/// library_argument is rejected so that future metadata changes cannot be
+/// silently mislinked.
+fn isKnownPartialLinkFlag(flag: []const u8) bool {
+    return std.mem.eql(u8, flag, "-Wl,--build-id=none") or
+        std.mem.eql(u8, flag, "-no-pie");
 }
 
 fn resolveArtifactPath(
@@ -326,7 +347,7 @@ fn resolveArtifactPath(
     };
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────
+// -- Tests ------------------------------------------------------------------
 
 fn testConfig(
     comptime lto: bool,

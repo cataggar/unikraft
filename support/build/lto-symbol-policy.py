@@ -12,14 +12,14 @@ Usage:
     lto-symbol-policy.py --nm TOOL --output VERSION_SCRIPT \\
         [--library NAME [--export-file PATH] [--input PATH ...]] ...
 
-The NM tool must accept ``-g --defined-only --format=posix`` and
-``-g --undefined-only --format=posix`` for objects, and ``-g --format=posix``
-for archives.  ``llvm-nm`` satisfies this for both ELF and LLVM bitcode.
+The NM tool must accept ``-g --format=posix`` for both individual objects
+(ELF or LLVM bitcode) and archives.  ``llvm-nm`` satisfies this.  Archive
+member headings (lines ending with ``:``) are recognized and skipped.
 
 Exit codes:
     0  version script written successfully
     1  symbol-policy violation detected (message on stderr)
-    2  NM tool failure (message on stderr)
+    2  NM tool failure or I/O error (message on stderr)
     3  argument/usage error
 """
 
@@ -95,7 +95,7 @@ def parse_library_specs(spec_args):
                 sys.exit(3)
             current["inputs"].append(spec_args[i])
         else:
-            print(f"error: unexpected argument: {arg}", file=sys.stderr)
+            print("error: unexpected argument: %s" % arg, file=sys.stderr)
             sys.exit(3)
         i += 1
     return libraries
@@ -103,19 +103,26 @@ def parse_library_specs(spec_args):
 
 def read_export_symbols(path):
     """Read an exportsyms.uk file and return a set of symbol names."""
-    symbols = set()
-    with open(path) as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            symbols.add(line)
-    return symbols
+    try:
+        with open(path) as f:
+            symbols = set()
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                symbols.add(line)
+            return symbols
+    except OSError as e:
+        print(
+            "error: cannot read export file '%s': %s" % (path, e),
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
-def run_nm(nm_tool, path, flags):
-    """Run nm with the given flags and return stdout, or raise on failure."""
-    cmd = [nm_tool] + flags + [path]
+def run_nm(nm_tool, path):
+    """Run nm -g --format=posix on path and return stdout."""
+    cmd = [nm_tool, "-g", "--format=posix", path]
     try:
         result = subprocess.run(
             cmd,
@@ -126,65 +133,80 @@ def run_nm(nm_tool, path, flags):
         return result.stdout
     except FileNotFoundError:
         print(
-            f"error: nm tool not found: {nm_tool}",
+            "error: nm tool not found: %s" % nm_tool,
             file=sys.stderr,
         )
         sys.exit(2)
     except subprocess.CalledProcessError as e:
         print(
-            f"error: nm failed for '{path}':\n"
-            f"  command: {' '.join(cmd)}\n"
-            f"  stderr: {e.stderr.strip()}",
+            "error: nm failed for '%s':\n"
+            "  command: %s\n"
+            "  stderr: %s" % (path, " ".join(cmd), e.stderr.strip()),
             file=sys.stderr,
         )
         sys.exit(2)
 
 
-# POSIX nm format: "name type [value size]" or "name type" per line.
-# We only care about name and type.
-_NM_LINE = re.compile(r"^(\S+)\s+([A-Za-z?])")
+# llvm-nm POSIX format: "name type [value size]" per line.
+# Archive member headings are lines like "/path/to/archive.a(member.o):".
+# Blank lines separate archive members.
+_NM_SYMBOL = re.compile(r"^(\S+)\s+([A-Za-z?])(?:\s|$)")
+_NM_ARCHIVE_HEADING = re.compile(r"^.+:$")
 
 
-def parse_nm_output(output):
-    """Parse posix-format nm output into {name: type_char} dict."""
+class NmParseError(Exception):
+    """Raised when an NM output line cannot be classified."""
+
+    def __init__(self, path, line_number, line):
+        self.path = path
+        self.line_number = line_number
+        self.line = line
+        super().__init__(
+            "error: unrecognized nm output for '%s' line %d: %s"
+            % (path, line_number, repr(line))
+        )
+
+
+def parse_nm_output(output, path="<nm>"):
+    """Parse POSIX-format nm output into {name: type_char} dict.
+
+    Recognizes:
+      - Symbol lines: "name type [value [size]]"
+      - Archive member headings: lines ending with ":"
+      - Blank/whitespace-only lines
+
+    Raises NmParseError on any other non-empty line.
+    """
     symbols = {}
-    for line in output.splitlines():
-        line = line.strip()
+    for lineno, raw in enumerate(output.splitlines(), 1):
+        line = raw.strip()
         if not line:
             continue
-        m = _NM_LINE.match(line)
+        m = _NM_SYMBOL.match(line)
         if m:
             symbols[m.group(1)] = m.group(2)
+            continue
+        if _NM_ARCHIVE_HEADING.match(line):
+            continue
+        raise NmParseError(path, lineno, line)
     return symbols
-
-
-def nm_defined_symbols(nm_tool, path):
-    """Return the set of globally-defined symbol names in path."""
-    output = run_nm(nm_tool, path, ["-g", "--defined-only", "--format=posix"])
-    return set(parse_nm_output(output).keys())
-
-
-def nm_undefined_symbols(nm_tool, path):
-    """Return the set of undefined symbol names referenced by path."""
-    output = run_nm(nm_tool, path, ["-u", "--format=posix"])
-    return set(parse_nm_output(output).keys())
-
-
-def nm_all_global_symbols(nm_tool, path):
-    """Return {name: type_char} for all global symbols (defined+undefined)."""
-    output = run_nm(nm_tool, path, ["-g", "--format=posix"])
-    return parse_nm_output(output)
 
 
 def collect_library_symbols(nm_tool, library):
     """Collect defined and undefined symbols for a library.
 
     Returns (defined: set, undefined: set).
+    Raises NmParseError on malformed output. Calls sys.exit(2) on nm failure.
     """
     defined = set()
     undefined = set()
     for input_path in library["inputs"]:
-        all_syms = nm_all_global_symbols(nm_tool, input_path)
+        output = run_nm(nm_tool, input_path)
+        try:
+            all_syms = parse_nm_output(output, path=input_path)
+        except NmParseError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(2)
         for name, sym_type in all_syms.items():
             if sym_type in ("U", "w", "v"):
                 undefined.add(name)
@@ -201,11 +223,15 @@ def validate_and_generate(nm_tool, libraries):
 
     For each library with export lists:
       - Only exported symbols are global; everything else is private.
-      - Private definitions must not collide across libraries.
-      - No other library may reference a private symbol.
 
     For libraries without export lists:
       - All definitions are global (no localization was ever applied).
+
+    Rejects:
+      - Any multi-definition set containing at least one private provider,
+        because the standard pipeline permits local+global coexistence via
+        per-library objcopy while flat linking cannot represent this.
+      - Cross-library references to private symbols.
 
     Returns:
       global_symbols: sorted list of symbol names for the version script
@@ -236,11 +262,9 @@ def validate_and_generate(nm_tool, libraries):
 
     for ld in lib_data:
         if ld["has_policy"]:
-            # Only exported symbols become global.
             lib_globals = ld["defined"] & ld["exports"]
             lib_privates = ld["defined"] - ld["exports"]
         else:
-            # All definitions are global.
             lib_globals = ld["defined"]
             lib_privates = set()
 
@@ -253,35 +277,38 @@ def validate_and_generate(nm_tool, libraries):
     # Phase 3: validate.
     errors = []
 
-    # Check for private definition collisions.
-    for sym, providers in definition_map.items():
-        private_providers = [name for name, is_priv in providers if is_priv]
-        if len(private_providers) > 1:
+    # Reject any multi-definition set containing at least one private
+    # provider.  The standard pipeline uses per-library objcopy to permit
+    # local+global coexistence for the same name; flat linking cannot.
+    for sym, providers in sorted(definition_map.items()):
+        if len(providers) < 2:
+            continue
+        has_private = any(is_priv for _, is_priv in providers)
+        if has_private:
+            libs = ", ".join(
+                "%s(%s)" % (name, "private" if priv else "global")
+                for name, priv in sorted(providers)
+            )
             errors.append(
-                f"private symbol '{sym}' is defined in multiple "
-                f"libraries: {', '.join(sorted(private_providers))}"
+                "symbol '%s' has conflicting definitions that flat "
+                "linking cannot represent: %s" % (sym, libs)
             )
 
-    # Check for cross-library private references: if library A references
-    # symbol S, and S is only provided as private by library B, that
+    # Cross-library private references: if library A references symbol S,
+    # and S is only provided as private (no global provider), that
     # reference would break without localization.
-    private_defs = {}  # symbol -> library_name (only private defs)
+    private_only_defs = {}
     for sym, providers in definition_map.items():
-        private_only = [
-            name
-            for name, is_priv in providers
-            if is_priv
-            and not any(not p for _, p in providers)
-        ]
-        if private_only:
-            private_defs[sym] = private_only[0]
+        if all(is_priv for _, is_priv in providers):
+            private_only_defs[sym] = providers[0][0]
 
     for ld in lib_data:
-        for sym in ld["undefined"]:
-            if sym in private_defs and private_defs[sym] != ld["name"]:
+        for sym in sorted(ld["undefined"]):
+            if sym in private_only_defs and private_only_defs[sym] != ld["name"]:
                 errors.append(
-                    f"library '{ld['name']}' references private symbol "
-                    f"'{sym}' defined only in '{private_defs[sym]}'"
+                    "library '%s' references private symbol "
+                    "'%s' defined only in '%s'"
+                    % (ld["name"], sym, private_only_defs[sym])
                 )
 
     return sorted(global_symbols), errors
@@ -295,9 +322,8 @@ def quote_version_script_symbol(name):
     """
     if re.fullmatch(r"[A-Za-z_.$][A-Za-z0-9_.$]*", name):
         return name
-    # Quote: escape backslashes and double-quotes, then wrap.
     escaped = name.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    return '"%s"' % escaped
 
 
 def generate_version_script(global_symbols):
@@ -306,11 +332,11 @@ def generate_version_script(global_symbols):
     The script uses an anonymous version node with the global symbols
     listed explicitly and ``local: *;`` to internalize everything else.
     """
-    lines = ["/* Generated by lto-symbol-policy.py — do not edit. */"]
+    lines = ["/* Generated by lto-symbol-policy.py -- do not edit. */"]
     lines.append("{")
     lines.append("  global:")
     for sym in global_symbols:
-        lines.append(f"    {quote_version_script_symbol(sym)};")
+        lines.append("    %s;" % quote_version_script_symbol(sym))
     lines.append("  local:")
     lines.append("    *;")
     lines.append("};")
@@ -322,28 +348,31 @@ def main(argv=None):
     libraries = parse_library_specs(args.spec)
 
     if not libraries:
-        # No libraries — emit a permissive version script.
         script = generate_version_script([])
-        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    else:
+        global_symbols, errors = validate_and_generate(args.nm, libraries)
+        if errors:
+            print(
+                "error: LTO symbol-policy violations detected:",
+                file=sys.stderr,
+            )
+            for err in sorted(errors):
+                print("  %s" % err, file=sys.stderr)
+            sys.exit(1)
+        script = generate_version_script(global_symbols)
+
+    try:
+        out_dir = os.path.dirname(args.output)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         with open(args.output, "w") as f:
             f.write(script)
-        return
-
-    global_symbols, errors = validate_and_generate(args.nm, libraries)
-
-    if errors:
+    except OSError as e:
         print(
-            "error: LTO symbol-policy violations detected:",
+            "error: cannot write output '%s': %s" % (args.output, e),
             file=sys.stderr,
         )
-        for err in sorted(errors):
-            print(f"  {err}", file=sys.stderr)
-        sys.exit(1)
-
-    script = generate_version_script(global_symbols)
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    with open(args.output, "w") as f:
-        f.write(script)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

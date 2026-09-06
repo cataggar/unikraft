@@ -10,14 +10,12 @@ import tempfile
 import textwrap
 import unittest
 
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
-)
-
 # Import the module under test.
 import importlib.util
 
-_SCRIPT = os.path.join(os.path.dirname(__file__), os.pardir, "lto-symbol-policy.py")
+_SCRIPT = os.path.join(
+    os.path.dirname(__file__), os.pardir, "lto-symbol-policy.py"
+)
 _spec = importlib.util.spec_from_file_location("lto_symbol_policy", _SCRIPT)
 policy = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(policy)
@@ -97,25 +95,53 @@ class TestReadExportSymbols(unittest.TestCase):
         syms2 = policy.read_export_symbols(path)
         self.assertEqual(syms1, syms2)
 
+    def test_missing_file(self):
+        """Missing export file exits with code 2."""
+        with self.assertRaises(SystemExit) as cm:
+            policy.read_export_symbols("/nonexistent/export.uk")
+        self.assertEqual(cm.exception.code, 2)
+
 
 class TestParseNmOutput(unittest.TestCase):
     def test_posix_format(self):
-        output = textwrap.dedent("""\
-            foo T
-            bar D
-            baz U
-        """)
+        output = "foo T\nbar D\nbaz U\n"
         result = policy.parse_nm_output(output)
         self.assertEqual(result, {"foo": "T", "bar": "D", "baz": "U"})
+
+    def test_posix_with_value_and_size(self):
+        output = "main T 0000000000001000 0000000000000040\n"
+        result = policy.parse_nm_output(output)
+        self.assertEqual(result, {"main": "T"})
 
     def test_empty_output(self):
         self.assertEqual(policy.parse_nm_output(""), {})
         self.assertEqual(policy.parse_nm_output("\n\n"), {})
 
-    def test_malformed_lines_skipped(self):
-        output = "foo T\n!!garbage!!\nbar D\n"
+    def test_archive_member_headings(self):
+        output = (
+            "/path/to/libfoo.a(bar.o):\n"
+            "api_func T\n"
+            "\n"
+            "/path/to/libfoo.a(baz.o):\n"
+            "other_func T\n"
+        )
         result = policy.parse_nm_output(output)
-        self.assertEqual(result, {"foo": "T", "bar": "D"})
+        self.assertEqual(
+            result, {"api_func": "T", "other_func": "T"}
+        )
+
+    def test_malformed_line_raises(self):
+        output = "foo T\n!!garbage!!\nbar D\n"
+        with self.assertRaises(policy.NmParseError) as cm:
+            policy.parse_nm_output(output, path="test.o")
+        self.assertIn("test.o", str(cm.exception))
+        self.assertIn("line 2", str(cm.exception))
+
+    def test_malformed_with_path_diagnostic(self):
+        output = "bad line here\n"
+        with self.assertRaises(policy.NmParseError) as cm:
+            policy.parse_nm_output(output, path="/build/lib.o")
+        self.assertIn("/build/lib.o", str(cm.exception))
 
 
 class TestQuoteVersionScriptSymbol(unittest.TestCase):
@@ -147,11 +173,10 @@ class TestQuoteVersionScriptSymbol(unittest.TestCase):
 
 class TestGenerateVersionScript(unittest.TestCase):
     def test_deterministic_order(self):
-        script1 = policy.generate_version_script(["b_sym", "a_sym", "c_sym"])
-        script2 = policy.generate_version_script(["b_sym", "a_sym", "c_sym"])
+        script1 = policy.generate_version_script(["a_sym", "b_sym", "c_sym"])
+        script2 = policy.generate_version_script(["a_sym", "b_sym", "c_sym"])
         self.assertEqual(script1, script2)
-        # Symbols are listed in the order provided (pre-sorted by caller).
-        self.assertIn("b_sym", script1)
+        self.assertIn("a_sym", script1)
         self.assertIn("local:", script1)
         self.assertIn("*;", script1)
 
@@ -166,16 +191,50 @@ class TestGenerateVersionScript(unittest.TestCase):
         self.assertIn("normal;", script)
         self.assertIn('"has space";', script)
 
+    def test_no_non_ascii(self):
+        script = policy.generate_version_script(["sym"])
+        # Verify no non-ASCII bytes (e.g. em dashes).
+        script.encode("ascii")  # Raises if non-ASCII present.
+
+
+def _make_python_mock_nm(tmpdir, mapping):
+    """Create a Python-based mock NM script.
+
+    Portable: no shell required. Uses sys.executable.
+    mapping: {absolute_path: "nm_output_string"}
+    """
+    lines = [
+        "#!%s" % sys.executable,
+        "import sys",
+        "path = sys.argv[-1]",
+        "mapping = {",
+    ]
+    for path, output in mapping.items():
+        lines.append("    %r: %r," % (path, output))
+    lines.append("}")
+    lines.append("if path in mapping:")
+    lines.append("    sys.stdout.write(mapping[path])")
+    lines.append("else:")
+    lines.append(
+        "    sys.stderr.write('error: unknown input: %s\\n' % path)"
+    )
+    lines.append("    sys.exit(1)")
+
+    nm_path = os.path.join(tmpdir, "mock-nm.py")
+    with open(nm_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(nm_path, os.stat(nm_path).st_mode | stat.S_IEXEC)
+    return nm_path
+
 
 class TestValidateAndGenerate(unittest.TestCase):
-    """Test the core validation logic using a mock NM tool."""
+    """Test the core validation logic using a Python-based mock NM."""
 
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
 
     def tearDown(self):
         import shutil
-
         shutil.rmtree(self._tmpdir)
 
     def _write(self, name, content):
@@ -185,54 +244,21 @@ class TestValidateAndGenerate(unittest.TestCase):
             f.write(content)
         return path
 
-    def _make_mock_nm(self, mapping):
-        """Create a mock NM script that returns canned output per input file.
-
-        mapping: {absolute_path: "nm_output_string"}
-        """
-        cases = []
-        for path, output in mapping.items():
-            escaped_path = path.replace("\\", "\\\\").replace("'", "'\\''")
-            escaped_output = output.replace("\\", "\\\\").replace("'", "'\\''")
-            cases.append(
-                f"    '{escaped_path}') echo '{escaped_output}' ;;"
-            )
-        script_content = "#!/bin/sh\n"
-        script_content += "# Mock NM — returns canned output for last arg.\n"
-        script_content += 'INPUT="${@: -1}"\n'
-        script_content += 'case "$INPUT" in\n'
-        script_content += "\n".join(cases) + "\n"
-        script_content += "    *) echo 'error: unknown input' >&2; exit 1 ;;\n"
-        script_content += "esac\n"
-        path = os.path.join(self._tmpdir, "mock-nm")
-        with open(path, "w") as f:
-            f.write(script_content)
-        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
-        return path
+    def _nm(self, mapping):
+        return _make_python_mock_nm(self._tmpdir, mapping)
 
     def test_distinct_export_files_no_collision(self):
-        """Two libraries with distinct exports — no collision."""
         exports_a = self._write("a_exports.uk", "api_a\n")
         exports_b = self._write("b_exports.uk", "api_b\n")
         obj_a = self._write("a.o", "")
         obj_b = self._write("b.o", "")
-        nm = self._make_mock_nm(
-            {
-                obj_a: "api_a T\nhelper_a T",
-                obj_b: "api_b T\nhelper_b T",
-            }
-        )
+        nm = self._nm({
+            obj_a: "api_a T\nhelper_a T\n",
+            obj_b: "api_b T\nhelper_b T\n",
+        })
         libs = [
-            {
-                "name": "libA",
-                "export_files": [exports_a],
-                "inputs": [obj_a],
-            },
-            {
-                "name": "libB",
-                "export_files": [exports_b],
-                "inputs": [obj_b],
-            },
+            {"name": "libA", "export_files": [exports_a], "inputs": [obj_a]},
+            {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
         globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
@@ -242,139 +268,112 @@ class TestValidateAndGenerate(unittest.TestCase):
         self.assertNotIn("helper_b", globals_)
 
     def test_shared_export_file_path(self):
-        """Two libraries sharing the same export file — valid."""
         shared = self._write("shared.uk", "shared_api\n")
         obj_a = self._write("a.o", "")
         obj_b = self._write("b.o", "")
-        nm = self._make_mock_nm(
-            {
-                obj_a: "shared_api T\npriv_a T",
-                obj_b: "shared_api T\npriv_b T",
-            }
-        )
+        nm = self._nm({
+            obj_a: "shared_api T\npriv_a T\n",
+            obj_b: "shared_api T\npriv_b T\n",
+        })
         libs = [
-            {
-                "name": "libA",
-                "export_files": [shared],
-                "inputs": [obj_a],
-            },
-            {
-                "name": "libB",
-                "export_files": [shared],
-                "inputs": [obj_b],
-            },
+            {"name": "libA", "export_files": [shared], "inputs": [obj_a]},
+            {"name": "libB", "export_files": [shared], "inputs": [obj_b]},
         ]
         globals_, errors = policy.validate_and_generate(nm, libs)
+        # shared_api is global in both, but priv_a and priv_b are each
+        # private in only one library -> no collision.
         self.assertEqual(errors, [])
         self.assertIn("shared_api", globals_)
 
     def test_distinct_files_sharing_symbol_names(self):
-        """Two distinct export files both exporting same symbol — valid
-        (both make it global; linker resolves multiple definitions)."""
         exports_a = self._write("a.uk", "common_sym\n")
         exports_b = self._write("b.uk", "common_sym\n")
         obj_a = self._write("a.o", "")
         obj_b = self._write("b.o", "")
-        nm = self._make_mock_nm(
-            {
-                obj_a: "common_sym T",
-                obj_b: "common_sym T",
-            }
-        )
+        nm = self._nm({
+            obj_a: "common_sym T\n",
+            obj_b: "common_sym T\n",
+        })
         libs = [
-            {
-                "name": "libA",
-                "export_files": [exports_a],
-                "inputs": [obj_a],
-            },
-            {
-                "name": "libB",
-                "export_files": [exports_b],
-                "inputs": [obj_b],
-            },
+            {"name": "libA", "export_files": [exports_a], "inputs": [obj_a]},
+            {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
         globals_, errors = policy.validate_and_generate(nm, libs)
+        # Both global -- global+global is accepted.
         self.assertEqual(errors, [])
         self.assertIn("common_sym", globals_)
 
     def test_private_collision_detected(self):
-        """Two libraries with private definitions of the same symbol."""
         exports_a = self._write("a.uk", "api_a\n")
         exports_b = self._write("b.uk", "api_b\n")
         obj_a = self._write("a.o", "")
         obj_b = self._write("b.o", "")
-        nm = self._make_mock_nm(
-            {
-                obj_a: "api_a T\nclash T",
-                obj_b: "api_b T\nclash T",
-            }
-        )
+        nm = self._nm({
+            obj_a: "api_a T\nclash T\n",
+            obj_b: "api_b T\nclash T\n",
+        })
         libs = [
-            {
-                "name": "libA",
-                "export_files": [exports_a],
-                "inputs": [obj_a],
-            },
-            {
-                "name": "libB",
-                "export_files": [exports_b],
-                "inputs": [obj_b],
-            },
+            {"name": "libA", "export_files": [exports_a], "inputs": [obj_a]},
+            {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
         globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("clash" in e for e in errors))
 
+    def test_private_plus_global_collision_detected(self):
+        """A symbol that is global in one library and private in another
+        must be rejected: the standard pipeline permits local+global via
+        per-library objcopy, but flat linking cannot represent this."""
+        exports_a = self._write("a.uk", "shared\n")
+        exports_b = self._write("b.uk", "other\n")
+        obj_a = self._write("a.o", "")
+        obj_b = self._write("b.o", "")
+        nm = self._nm({
+            obj_a: "shared T\n",
+            obj_b: "shared T\nother T\n",
+        })
+        libs = [
+            {"name": "libA", "export_files": [exports_a], "inputs": [obj_a]},
+            {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
+        ]
+        globals_, errors = policy.validate_and_generate(nm, libs)
+        self.assertTrue(len(errors) > 0)
+        self.assertTrue(any("shared" in e for e in errors))
+        # Error should mention both libraries.
+        err_text = " ".join(errors)
+        self.assertIn("libA", err_text)
+        self.assertIn("libB", err_text)
+
     def test_cross_library_private_reference_detected(self):
-        """Library A references a private symbol from library B."""
         exports_b = self._write("b.uk", "api_b\n")
         obj_a = self._write("a.o", "")
         obj_b = self._write("b.o", "")
-        nm = self._make_mock_nm(
-            {
-                obj_a: "helper_b U",
-                obj_b: "api_b T\nhelper_b T",
-            }
-        )
+        nm = self._nm({
+            obj_a: "helper_b U\n",
+            obj_b: "api_b T\nhelper_b T\n",
+        })
         libs = [
-            {
-                "name": "libA",
-                "export_files": [],
-                "inputs": [obj_a],
-            },
-            {
-                "name": "libB",
-                "export_files": [exports_b],
-                "inputs": [obj_b],
-            },
+            {"name": "libA", "export_files": [], "inputs": [obj_a]},
+            {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
         globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertTrue(len(errors) > 0)
         self.assertTrue(any("helper_b" in e for e in errors))
-        self.assertTrue(any("libA" in e and "libB" in e for e in errors))
+        err_text = " ".join(errors)
+        self.assertIn("libA", err_text)
+        self.assertIn("libB", err_text)
 
     def test_library_without_exports_all_global(self):
-        """Library without export list — all symbols are global."""
         exports_b = self._write("b.uk", "api_b\n")
         obj_a = self._write("a.o", "")
         obj_b = self._write("b.o", "")
-        nm = self._make_mock_nm(
-            {
-                obj_a: "everything T\nglobal_too T",
-                obj_b: "api_b T\npriv_b T",
-            }
-        )
+        nm = self._nm({
+            obj_a: "everything T\nglobal_too T\n",
+            obj_b: "api_b T\npriv_b T\n",
+        })
         libs = [
-            {
-                "name": "libA",
-                "export_files": [],
-                "inputs": [obj_a],
-            },
-            {
-                "name": "libB",
-                "export_files": [exports_b],
-                "inputs": [obj_b],
-            },
+            {"name": "libA", "export_files": [], "inputs": [obj_a]},
+            {"name": "libB", "export_files": [exports_b], "inputs": [obj_b]},
         ]
         globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
@@ -384,48 +383,64 @@ class TestValidateAndGenerate(unittest.TestCase):
         self.assertNotIn("priv_b", globals_)
 
     def test_nm_tool_failure(self):
-        """NM tool failure produces exit code 2."""
         obj = self._write("bad.o", "")
-        bad_nm = self._write("bad-nm", "#!/bin/sh\nexit 1\n")
+        bad_nm = self._write("bad-nm.py", (
+            "#!%s\nimport sys\nsys.exit(1)\n" % sys.executable
+        ))
         os.chmod(bad_nm, os.stat(bad_nm).st_mode | stat.S_IEXEC)
         libs = [
-            {
-                "name": "libBad",
-                "export_files": [],
-                "inputs": [obj],
-            },
+            {"name": "libBad", "export_files": [], "inputs": [obj]},
         ]
         with self.assertRaises(SystemExit) as cm:
             policy.validate_and_generate(bad_nm, libs)
         self.assertEqual(cm.exception.code, 2)
 
+    def test_malformed_nm_output_fails(self):
+        obj = self._write("m.o", "")
+        nm = self._nm({obj: "foo T\n!!garbage!!\nbar D\n"})
+        libs = [
+            {"name": "libM", "export_files": [], "inputs": [obj]},
+        ]
+        with self.assertRaises(SystemExit) as cm:
+            policy.validate_and_generate(nm, libs)
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_archive_nm_output(self):
+        obj = self._write("lib.a", "")
+        nm = self._nm({
+            obj: (
+                "/path/lib.a(foo.o):\n"
+                "foo_func T\n"
+                "\n"
+                "/path/lib.a(bar.o):\n"
+                "bar_func T\n"
+            ),
+        })
+        libs = [
+            {"name": "libAr", "export_files": [], "inputs": [obj]},
+        ]
+        globals_, errors = policy.validate_and_generate(nm, libs)
+        self.assertEqual(errors, [])
+        self.assertIn("foo_func", globals_)
+        self.assertIn("bar_func", globals_)
+
     def test_paths_with_spaces(self):
-        """Paths containing spaces work correctly."""
         exports = self._write("my lib/exports.uk", "my_sym\n")
         obj = self._write("my lib/code.o", "")
-        nm = self._make_mock_nm({obj: "my_sym T\npriv T"})
+        nm = self._nm({obj: "my_sym T\npriv T\n"})
         libs = [
-            {
-                "name": "my lib",
-                "export_files": [exports],
-                "inputs": [obj],
-            },
+            {"name": "my lib", "export_files": [exports], "inputs": [obj]},
         ]
         globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
         self.assertIn("my_sym", globals_)
 
     def test_deterministic_output_order(self):
-        """Generated globals are sorted deterministically."""
         exports = self._write("e.uk", "z_sym\na_sym\nm_sym\n")
         obj = self._write("x.o", "")
-        nm = self._make_mock_nm({obj: "z_sym T\na_sym T\nm_sym T"})
+        nm = self._nm({obj: "z_sym T\na_sym T\nm_sym T\n"})
         libs = [
-            {
-                "name": "libX",
-                "export_files": [exports],
-                "inputs": [obj],
-            },
+            {"name": "libX", "export_files": [exports], "inputs": [obj]},
         ]
         globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
@@ -438,7 +453,6 @@ class TestMainIntegration(unittest.TestCase):
 
     def tearDown(self):
         import shutil
-
         shutil.rmtree(self._tmpdir)
 
     def _write(self, name, content, executable=False):
@@ -454,27 +468,18 @@ class TestMainIntegration(unittest.TestCase):
         exports = self._write("exports.uk", "api_sym\n")
         obj = self._write("lib.o", "")
         output = os.path.join(self._tmpdir, "out", "policy.lds")
-        nm = self._write(
-            "nm",
-            f"#!/bin/sh\necho 'api_sym T\npriv_sym T'\n",
-            executable=True,
+        nm = _make_python_mock_nm(
+            self._tmpdir, {obj: "api_sym T\npriv_sym T\n"}
         )
-        policy.main(
-            [
-                "--nm",
-                nm,
-                "--output",
-                output,
-                "--library",
-                "libFoo",
-                "--export-file",
-                exports,
-                "--input",
-                obj,
-            ]
-        )
+        policy.main([
+            "--nm", nm, "--output", output,
+            "--library", "libFoo",
+            "--export-file", exports,
+            "--input", obj,
+        ])
         self.assertTrue(os.path.exists(output))
-        content = open(output).read()
+        with open(output) as f:
+            content = f.read()
         self.assertIn("api_sym", content)
         self.assertNotIn("priv_sym", content)
         self.assertIn("local:", content)
@@ -484,8 +489,29 @@ class TestMainIntegration(unittest.TestCase):
         output = os.path.join(self._tmpdir, "empty.lds")
         policy.main(["--nm", "unused", "--output", output])
         self.assertTrue(os.path.exists(output))
-        content = open(output).read()
+        with open(output) as f:
+            content = f.read()
         self.assertIn("local:", content)
+
+    def test_violation_exits_1(self):
+        exports_a = self._write("a.uk", "api_a\n")
+        exports_b = self._write("b.uk", "api_b\n")
+        obj_a = self._write("a.o", "")
+        obj_b = self._write("b.o", "")
+        output = os.path.join(self._tmpdir, "bad.lds")
+        nm = _make_python_mock_nm(self._tmpdir, {
+            obj_a: "api_a T\nclash T\n",
+            obj_b: "api_b T\nclash T\n",
+        })
+        with self.assertRaises(SystemExit) as cm:
+            policy.main([
+                "--nm", nm, "--output", output,
+                "--library", "libA",
+                "--export-file", exports_a, "--input", obj_a,
+                "--library", "libB",
+                "--export-file", exports_b, "--input", obj_b,
+            ])
+        self.assertEqual(cm.exception.code, 1)
 
 
 if __name__ == "__main__":
