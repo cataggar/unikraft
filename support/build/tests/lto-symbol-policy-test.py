@@ -102,6 +102,38 @@ class TestReadExportSymbols(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+class TestCollectExportSymbols(unittest.TestCase):
+    def test_uses_only_explicit_export_lists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            exports_a = os.path.join(tmpdir, "a.uk")
+            exports_b = os.path.join(tmpdir, "b.uk")
+            with open(exports_a, "w") as f:
+                f.write("shared\napi_a\n")
+            with open(exports_b, "w") as f:
+                f.write("shared\napi_b\n")
+            libraries = [
+                {
+                    "name": "libA",
+                    "export_files": [exports_a],
+                    "inputs": [],
+                },
+                {
+                    "name": "libB",
+                    "export_files": [exports_b],
+                    "inputs": [],
+                },
+                {
+                    "name": "app",
+                    "export_files": [],
+                    "inputs": [],
+                },
+            ]
+            self.assertEqual(
+                policy.collect_export_symbols(libraries),
+                ["api_a", "api_b", "shared"],
+            )
+
+
 class TestParseNmOutput(unittest.TestCase):
     def test_posix_format(self):
         output = "foo T\nbar D\nbaz U\n"
@@ -236,6 +268,22 @@ class TestGenerateVersionScript(unittest.TestCase):
         script = policy.generate_version_script(["sym"])
         # Verify no non-ASCII bytes (e.g. em dashes).
         script.encode("ascii")  # Raises if non-ASCII present.
+
+
+class TestGenerateForceKeepResponse(unittest.TestCase):
+    def test_deterministic_arguments(self):
+        response = policy.generate_force_keep_response(["z_sym", "a_sym"])
+        self.assertEqual(
+            response,
+            '"-Wl,-u,a_sym"\n"-Wl,-u,z_sym"\n',
+        )
+
+    def test_response_argument_escaping(self):
+        response = policy.generate_force_keep_response(
+            ['has"quote', r"has\slash"]
+        )
+        self.assertIn(r'"-Wl,-u,has\"quote"', response)
+        self.assertIn(r'"-Wl,-u,has\\slash"', response)
 
 
 def _make_python_mock_nm(tmpdir, mapping):
@@ -560,11 +608,13 @@ class TestMainIntegration(unittest.TestCase):
         exports = self._write("exports.uk", "api_sym\n")
         obj = self._write("lib.o", "")
         output = os.path.join(self._tmpdir, "out", "policy.lds")
+        force_keep = os.path.join(self._tmpdir, "out", "force-keep.rsp")
         nm = _make_python_mock_nm(
             self._tmpdir, {obj: "api_sym T\npriv_sym T\n"}
         )
         policy.main([
             "--nm", nm, "--output", output,
+            "--force-keep-output", force_keep,
             "--library", "libFoo",
             "--export-file", exports,
             "--input", obj,
@@ -576,14 +626,23 @@ class TestMainIntegration(unittest.TestCase):
         self.assertNotIn("priv_sym", content)
         self.assertIn("local:", content)
         self.assertIn("*;", content)
+        with open(force_keep) as f:
+            force_keep_content = f.read()
+        self.assertEqual(force_keep_content, '"-Wl,-u,api_sym"\n')
 
     def test_no_libraries(self):
         output = os.path.join(self._tmpdir, "empty.lds")
-        policy.main(["--nm", "unused", "--output", output])
+        force_keep = os.path.join(self._tmpdir, "empty.rsp")
+        policy.main([
+            "--nm", "unused", "--output", output,
+            "--force-keep-output", force_keep,
+        ])
         self.assertTrue(os.path.exists(output))
         with open(output) as f:
             content = f.read()
         self.assertIn("local:", content)
+        with open(force_keep) as f:
+            self.assertEqual(f.read(), "")
 
     def test_violation_exits_1(self):
         exports_a = self._write("a.uk", "api_a\n")
