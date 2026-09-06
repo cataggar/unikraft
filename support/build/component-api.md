@@ -21,6 +21,36 @@ library arguments without regrouping them. Ordered post-processing
 transformations can create several named artifacts or declare an in-place
 mutation; later transformations refer to those named results.
 
+## Registered native QEMU graphs
+
+`native-qemu-graph.zig` registers production metadata for the documented
+hello-world `qemu-x86_64` and `qemu-arm64` configurations. The metadata is
+compiled into Zig through `native-qemu-data.zig`; it does not load a Make JSON
+export at graph construction time. Each profile records:
+
+- every selected library in final-link order, with its ordered object/archive
+  inputs, relocatable output, final object, and symbol-file transformations;
+- the ordered default and supplemental linker scripts, followed by an
+  explicit merged-script stage;
+- the complete final-link sequence, including archive group boundaries; and
+- the architecture-specific strip, bootinfo, Multiboot/Linux Image, and
+  compile-database declarations.
+
+Production `build.zig` constructs and validates one of these graphs with:
+
+```sh
+zig build native-link-graph \
+  -Dapp=/absolute/path/to/app-helloworld \
+  -Dnative-qemu-graph=qemu-x86_64
+```
+
+Use `qemu-arm64` for the ARM64 profile. Other names fail explicitly. This step
+registers metadata only; target compilation and link command execution are
+intentionally left to later integration. Fixtures under
+`tests/native-qemu-graph/` are deterministic projections of `make build-graph`
+for the documented Zig/raw compatibility configurations and are checked by
+the module tests.
+
 `Source.effectiveInput(config, variant)` resolves conditions and returns the
 last active source- or variant-level preprocessing output, or the original
 source when the source, variant, or every preprocessing step is inactive.

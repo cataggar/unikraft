@@ -1,0 +1,884 @@
+{
+  "libraries": [
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libkvmplat.o",
+      "name": "libkvmplat",
+      "objects": [
+        "$BUILD_DIR/libkvmplat/cache64.common.o",
+        "$BUILD_DIR/libkvmplat/time.common.o",
+        "$BUILD_DIR/libkvmplat/generic_timer.common.o",
+        "$BUILD_DIR/libkvmplat/qemu_bpt64.arm.o",
+        "$BUILD_DIR/libkvmplat/entry64.isr.o",
+        "$BUILD_DIR/libkvmplat/exceptions.isr.o",
+        "$BUILD_DIR/libkvmplat/pagetable64.isr.o",
+        "$BUILD_DIR/libkvmplat/setup.o",
+        "$BUILD_DIR/libkvmplat/memory.o",
+        "$BUILD_DIR/libkvmplat/memory.common.o",
+        "$BUILD_DIR/libkvmplat/bootinfo.common.o",
+        "$BUILD_DIR/libkvmplat/bootinfo_fdt.common.o",
+        "$BUILD_DIR/libkvmplat/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libkvmplat.ld.o",
+      "symbol_transforms": []
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/apphelloworld.o",
+      "name": "apphelloworld",
+      "objects": [
+        "$BUILD_DIR/apphelloworld/main.o",
+        "$BUILD_DIR/apphelloworld/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/apphelloworld.ld.o",
+      "symbol_transforms": []
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libfdt.o",
+      "name": "libfdt",
+      "objects": [
+        "$BUILD_DIR/libfdt/fdt.o",
+        "$BUILD_DIR/libfdt/fdt_addresses.o",
+        "$BUILD_DIR/libfdt/fdt_empty_tree.o",
+        "$BUILD_DIR/libfdt/fdt_overlay.o",
+        "$BUILD_DIR/libfdt/fdt_ro.o",
+        "$BUILD_DIR/libfdt/fdt_rw.o",
+        "$BUILD_DIR/libfdt/fdt_strerror.o",
+        "$BUILD_DIR/libfdt/fdt_sw.o",
+        "$BUILD_DIR/libfdt/fdt_wip.o",
+        "$BUILD_DIR/libfdt/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libfdt.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/fdt/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libisrlib.o",
+      "name": "libisrlib",
+      "objects": [
+        "$BUILD_DIR/libisrlib/string.isr.o",
+        "$BUILD_DIR/libisrlib/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libisrlib.ld.o",
+      "symbol_transforms": []
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libnolibc.o",
+      "name": "libnolibc",
+      "objects": [
+        "$BUILD_DIR/libnolibc/errno.o",
+        "$BUILD_DIR/libnolibc/stdio.o",
+        "$BUILD_DIR/libnolibc/ctype.o",
+        "$BUILD_DIR/libnolibc/stdlib.o",
+        "$BUILD_DIR/libnolibc/string.o",
+        "$BUILD_DIR/libnolibc/strsignal.o",
+        "$BUILD_DIR/libnolibc/strstr.o",
+        "$BUILD_DIR/libnolibc/psignal.o",
+        "$BUILD_DIR/libnolibc/__month_to_secs.o",
+        "$BUILD_DIR/libnolibc/__secs_to_tm.o",
+        "$BUILD_DIR/libnolibc/timegm.o",
+        "$BUILD_DIR/libnolibc/__tm_to_secs.o",
+        "$BUILD_DIR/libnolibc/__year_to_secs.o",
+        "$BUILD_DIR/libnolibc/htonl.o",
+        "$BUILD_DIR/libnolibc/ntohl.o",
+        "$BUILD_DIR/libnolibc/htons.o",
+        "$BUILD_DIR/libnolibc/ntohs.o",
+        "$BUILD_DIR/libnolibc/h_errno.o",
+        "$BUILD_DIR/libnolibc/getopt.o",
+        "$BUILD_DIR/libnolibc/sscanf.o",
+        "$BUILD_DIR/libnolibc/scanf.o",
+        "$BUILD_DIR/libnolibc/asprintf.o",
+        "$BUILD_DIR/libnolibc/random.o",
+        "$BUILD_DIR/libnolibc/qsort.o",
+        "$BUILD_DIR/libnolibc/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libnolibc.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/nolibc/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukalloc.o",
+      "name": "libukalloc",
+      "objects": [
+        "$BUILD_DIR/libukalloc/alloc.o",
+        "$BUILD_DIR/libukalloc/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukalloc.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukalloc/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukallocbbuddy.o",
+      "name": "libukallocbbuddy",
+      "objects": [
+        "$BUILD_DIR/libukallocbbuddy/bbuddy.o",
+        "$BUILD_DIR/libukallocbbuddy/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukallocbbuddy.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukallocbbuddy/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukargparse.o",
+      "name": "libukargparse",
+      "objects": [
+        "$BUILD_DIR/libukargparse/argparse.o",
+        "$BUILD_DIR/libukargparse/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukargparse.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukargparse/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukatomic.o",
+      "name": "libukatomic",
+      "objects": [
+        "$BUILD_DIR/libukatomic/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukatomic.ld.o",
+      "symbol_transforms": []
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukbitops.o",
+      "name": "libukbitops",
+      "objects": [
+        "$BUILD_DIR/libukbitops/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukbitops.ld.o",
+      "symbol_transforms": []
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukboot.o",
+      "name": "libukboot",
+      "objects": [
+        "$BUILD_DIR/libukboot/boot.o",
+        "$BUILD_DIR/libukboot/early_init.o",
+        "$BUILD_DIR/libukboot/version.o",
+        "$BUILD_DIR/libukboot/banner.o",
+        "$BUILD_DIR/libukboot/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukboot.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukboot/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukboot_main.o",
+      "name": "libukboot_main",
+      "objects": [
+        "$BUILD_DIR/libukboot_main/weak_main.o",
+        "$BUILD_DIR/libukboot_main/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukboot_main.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukboot/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukbus.o",
+      "name": "libukbus",
+      "objects": [
+        "$BUILD_DIR/libukbus/bus.o",
+        "$BUILD_DIR/libukbus/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukbus.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukbus/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukconsole.o",
+      "name": "libukconsole",
+      "objects": [
+        "$BUILD_DIR/libukconsole/console.isr.o",
+        "$BUILD_DIR/libukconsole/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukconsole.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukconsole/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukdebug.o",
+      "name": "libukdebug",
+      "objects": [
+        "$BUILD_DIR/libukdebug/crashsup.o",
+        "$BUILD_DIR/libukdebug/dumpsup.o",
+        "$BUILD_DIR/libukdebug/crashdump.o",
+        "$BUILD_DIR/libukdebug/crash.o",
+        "$BUILD_DIR/libukdebug/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukdebug.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukdebug/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libuklibid.o",
+      "name": "libuklibid",
+      "objects": [
+        "$BUILD_DIR/libuklibid/namemap.o",
+        "$BUILD_DIR/libuklibid/selfids.o",
+        "$BUILD_DIR/libuklibid/rtmap.o",
+        "$BUILD_DIR/libuklibid/libinfo.global.o",
+        "$BUILD_DIR/libuklibid/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libuklibid.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$BUILD_DIR/libuklibid/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukintctlr.o",
+      "name": "libukintctlr",
+      "objects": [
+        "$BUILD_DIR/libukintctlr/ukintctlr.o",
+        "$BUILD_DIR/libukintctlr/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukintctlr.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukintctlr/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libuklock.o",
+      "name": "libuklock",
+      "objects": [
+        "$BUILD_DIR/libuklock/semaphore.o",
+        "$BUILD_DIR/libuklock/mutex.o",
+        "$BUILD_DIR/libuklock/rwlock.o",
+        "$BUILD_DIR/libuklock/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libuklock.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/uklock/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukprint.o",
+      "name": "libukprint",
+      "objects": [
+        "$BUILD_DIR/libukprint/print.o",
+        "$BUILD_DIR/libukprint/print.isr.o",
+        "$BUILD_DIR/libukprint/snprintf.isr.o",
+        "$BUILD_DIR/libukprint/outf.o",
+        "$BUILD_DIR/libukprint/hexdump.o",
+        "$BUILD_DIR/libukprint/console.o",
+        "$BUILD_DIR/libukprint/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukprint.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukprint/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libuksched.o",
+      "name": "libuksched",
+      "objects": [
+        "$BUILD_DIR/libuksched/sched.o",
+        "$BUILD_DIR/libuksched/thread.o",
+        "$BUILD_DIR/libuksched/isrwake.isr.o",
+        "$BUILD_DIR/libuksched/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libuksched.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/uksched/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukschedcoop.o",
+      "name": "libukschedcoop",
+      "objects": [
+        "$BUILD_DIR/libukschedcoop/schedcoop.o",
+        "$BUILD_DIR/libukschedcoop/isrwoken.isr.o",
+        "$BUILD_DIR/libukschedcoop/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukschedcoop.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukschedcoop/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libuksglist.o",
+      "name": "libuksglist",
+      "objects": [
+        "$BUILD_DIR/libuksglist/sglist.o",
+        "$BUILD_DIR/libuksglist/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libuksglist.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/uksglist/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libuktimeconv.o",
+      "name": "libuktimeconv",
+      "objects": [
+        "$BUILD_DIR/libuktimeconv/timeconv.o",
+        "$BUILD_DIR/libuktimeconv/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libuktimeconv.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/uktimeconv/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukofw.o",
+      "name": "libukofw",
+      "objects": [
+        "$BUILD_DIR/libukofw/fdt.o",
+        "$BUILD_DIR/libukofw/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukofw.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukofw/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukallocstack.o",
+      "name": "libukallocstack",
+      "objects": [
+        "$BUILD_DIR/libukallocstack/stack.o",
+        "$BUILD_DIR/libukallocstack/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukallocstack.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukallocstack/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukpal.o",
+      "name": "libukpal",
+      "objects": [
+        "$BUILD_DIR/libukpal/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukpal.ld.o",
+      "symbol_transforms": []
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libuklcpu.o",
+      "name": "libuklcpu",
+      "objects": [
+        "$BUILD_DIR/libuklcpu/lcpu.o",
+        "$BUILD_DIR/libuklcpu/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libuklcpu.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/uklcpu/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukpm.o",
+      "name": "libukpm",
+      "objects": [
+        "$BUILD_DIR/libukpm/pm.o",
+        "$BUILD_DIR/libukpm/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukpm.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukpm/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukpcpuvar.o",
+      "name": "libukpcpuvar",
+      "objects": [
+        "$BUILD_DIR/libukpcpuvar/pcpuvar.o",
+        "$BUILD_DIR/libukpcpuvar/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukpcpuvar.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/lib/ukpcpuvar/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libarm64arch.o",
+      "name": "libarm64arch",
+      "objects": [
+        "$BUILD_DIR/libarm64arch/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libarm64arch.ld.o",
+      "symbol_transforms": []
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libcontext.o",
+      "name": "libcontext",
+      "objects": [
+        "$BUILD_DIR/libcontext/ctx.isr.o",
+        "$BUILD_DIR/libcontext/execenv.arm64.o",
+        "$BUILD_DIR/libcontext/ctx.arm64.o",
+        "$BUILD_DIR/libcontext/tls.arm64.o",
+        "$BUILD_DIR/libcontext/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libcontext.ld.o",
+      "symbol_transforms": []
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukbus_platform.o",
+      "name": "libukbus_platform",
+      "objects": [
+        "$BUILD_DIR/libukbus_platform/platform_bus.o",
+        "$BUILD_DIR/libukbus_platform/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukbus_platform.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/drivers/ukbus/platform/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libpl011.o",
+      "name": "libpl011",
+      "objects": [
+        "$BUILD_DIR/libpl011/pl011.isr.o",
+        "$BUILD_DIR/libpl011/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libpl011.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/drivers/ukconsole/pl011/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukintctlr_gic.o",
+      "name": "libukintctlr_gic",
+      "objects": [
+        "$BUILD_DIR/libukintctlr_gic/ukintctlr.o",
+        "$BUILD_DIR/libukintctlr_gic/gic-common.o",
+        "$BUILD_DIR/libukintctlr_gic/gic-v2.o",
+        "$BUILD_DIR/libukintctlr_gic/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukintctlr_gic.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/drivers/ukintctlr/gic/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukrtc_pl031.o",
+      "name": "libukrtc_pl031",
+      "objects": [
+        "$BUILD_DIR/libukrtc_pl031/pl031.o",
+        "$BUILD_DIR/libukrtc_pl031/rtc.o",
+        "$BUILD_DIR/libukrtc_pl031/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukrtc_pl031.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/drivers/ukrtc/pl031/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukpsci.o",
+      "name": "libukpsci",
+      "objects": [
+        "$BUILD_DIR/libukpsci/psci.o",
+        "$BUILD_DIR/libukpsci/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukpsci.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/drivers/firmware/ukpsci/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libuksmccc.o",
+      "name": "libuksmccc",
+      "objects": [
+        "$BUILD_DIR/libuksmccc/smccc.o",
+        "$BUILD_DIR/libuksmccc/smccc_invoke.o",
+        "$BUILD_DIR/libuksmccc/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libuksmccc.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/drivers/firmware/uksmccc/exportsyms.uk"
+        }
+      ]
+    },
+    {
+      "archives": [],
+      "final_output": "$BUILD_DIR/libukplat_native.o",
+      "name": "libukplat_native",
+      "objects": [
+        "$BUILD_DIR/libukplat_native/auxsp.o",
+        "$BUILD_DIR/libukplat_native/ectx.isr.o",
+        "$BUILD_DIR/libukplat_native/except.isr.o",
+        "$BUILD_DIR/libukplat_native/lcpu_pm.o",
+        "$BUILD_DIR/libukplat_native/sysctx.isr.o",
+        "$BUILD_DIR/libukplat_native/start.o",
+        "$BUILD_DIR/libukplat_native/libinfo.libuklibid.o"
+      ],
+      "partial_output": "$BUILD_DIR/libukplat_native.ld.o",
+      "symbol_transforms": [
+        {
+          "action": "keep-global",
+          "path": "$UK_BASE/plat/native/exportsyms.uk"
+        }
+      ]
+    }
+  ],
+  "library_order": [
+    "libkvmplat",
+    "apphelloworld",
+    "libfdt",
+    "libisrlib",
+    "libnolibc",
+    "libukalloc",
+    "libukallocbbuddy",
+    "libukargparse",
+    "libukatomic",
+    "libukbitops",
+    "libukboot",
+    "libukboot_main",
+    "libukbus",
+    "libukconsole",
+    "libukdebug",
+    "libuklibid",
+    "libukintctlr",
+    "libuklock",
+    "libukprint",
+    "libuksched",
+    "libukschedcoop",
+    "libuksglist",
+    "libuktimeconv",
+    "libukofw",
+    "libukallocstack",
+    "libukpal",
+    "libuklcpu",
+    "libukpm",
+    "libukpcpuvar",
+    "libarm64arch",
+    "libcontext",
+    "libukbus_platform",
+    "libpl011",
+    "libukintctlr_gic",
+    "libukrtc_pl031",
+    "libukpsci",
+    "libuksmccc",
+    "libukplat_native"
+  ],
+  "oracle": "GNU Make build-graph (documented Zig/raw compatibility configuration)",
+  "outputs": {
+    "auxiliary": [
+      "$BUILD_DIR/compile_commands.json"
+    ],
+    "debug": [
+      "$BUILD_DIR/helloworld_qemu-arm64.dbg"
+    ],
+    "images": [
+      "$BUILD_DIR/helloworld_qemu-arm64"
+    ]
+  },
+  "platform": {
+    "final_link": {
+      "inputs": [
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libkvmplat.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/apphelloworld.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libfdt.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libisrlib.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libnolibc.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukalloc.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukallocbbuddy.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukargparse.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukatomic.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukbitops.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukboot.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukboot_main.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukbus.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukconsole.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukdebug.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libuklibid.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukintctlr.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libuklock.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukprint.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libuksched.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukschedcoop.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libuksglist.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libuktimeconv.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukofw.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukallocstack.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukpal.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libuklcpu.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukpm.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukpcpuvar.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libarm64arch.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libcontext.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukbus_platform.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libpl011.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukintctlr_gic.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukrtc_pl031.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukpsci.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libuksmccc.o"
+        },
+        {
+          "kind": "object",
+          "path": "$BUILD_DIR/libukplat_native.o"
+        },
+        {
+          "kind": "linker-script",
+          "path": "$BUILD_DIR/kvm-combined.lds"
+        }
+      ],
+      "name": "final-link",
+      "output": "$BUILD_DIR/helloworld_qemu-arm64.dbg",
+      "transformation": "link"
+    },
+    "libraries": [
+      "libkvmplat"
+    ],
+    "linker_script_inputs": [
+      "$BUILD_DIR/libkvmplat/link64.lds",
+      "$BUILD_DIR/libkvmplat/bootinfo.lds",
+      "$BUILD_DIR/libukboot/earlytab.lds",
+      "$UK_BASE/lib/uklibid/infosec.ld",
+      "$UK_BASE/lib/uksched/extra.ld",
+      "$BUILD_DIR/libukpcpuvar/pcpuvar.lds"
+    ],
+    "merged_linker_script": "$BUILD_DIR/kvm-combined.lds",
+    "name": "kvm",
+    "post_process": [
+      "strip",
+      "bootinfo",
+      "linux-binary",
+      "linux-header",
+      "compile-db"
+    ]
+  },
+  "profile": "qemu-arm64",
+  "schema_version": 1,
+  "source_revisions": {
+    "app-helloworld": "1add85d53193c5cfc8d9285cbd6905a85ffcc309",
+    "unikraft": "8c172c74d6102982a393fb59bdbf0131c4e6a4e2"
+  }
+}

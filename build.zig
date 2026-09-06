@@ -2,6 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const build_context = @import("support/build/build-context.zig");
 const facade_paths = @import("support/build/zig-facade-paths.zig");
+const native_qemu_graph = @import("support/build/native-qemu-graph.zig");
 
 const supported_zig = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
 
@@ -194,6 +195,15 @@ pub fn build(b: *std.Build) void {
         return;
     }
 
+    const native_graph = registerNativeQemuGraph(b, context);
+    if (native_graph) |registered| {
+        std.debug.assert(std.mem.eql(
+            u8,
+            registered.graph.selectedPlatform().name,
+            "kvm",
+        ));
+    }
+
     const make_runner = b.addExecutable(.{
         .name = "unikraft-zig-make",
         .root_module = b.createModule(.{
@@ -353,13 +363,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_elf_common_validator_tests = b.addRunArtifact(elf_common_validator_tests);
     run_elf_common_validator_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
-    const test_step = b.step("test", "Test facade, native configuration, and library linking");
+    const native_qemu_graph_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-qemu-graph.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_native_qemu_graph_tests = b.addRunArtifact(native_qemu_graph_tests);
+    run_native_qemu_graph_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const test_step = b.step(
+        "test",
+        "Test facade, native configuration, library linking, and QEMU graphs",
+    );
     test_step.dependOn(&run_facade_tests.step);
     test_step.dependOn(&run_runner_tests.step);
     test_step.dependOn(&run_native_config_tests.step);
     test_step.dependOn(&run_context_tests.step);
     test_step.dependOn(&run_native_library_link_tests.step);
     test_step.dependOn(&run_elf_common_validator_tests.step);
+    test_step.dependOn(&run_native_qemu_graph_tests.step);
     const integration_output = resolvePath(
         b.allocator,
         root,
@@ -581,6 +604,56 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+fn registerNativeQemuGraph(
+    b: *std.Build,
+    context: build_context.Context,
+) ?*native_qemu_graph.RegisteredGraph {
+    const step = b.step(
+        "native-link-graph",
+        "Register the native hello-world QEMU link graph without executing it",
+    );
+    const profile_name = b.option(
+        []const u8,
+        "native-qemu-graph",
+        "Registered native graph: qemu-x86_64 or qemu-arm64",
+    ) orelse {
+        const fail = b.addFail(
+            "native-link-graph requires -Dnative-qemu-graph=qemu-x86_64 or qemu-arm64",
+        );
+        step.dependOn(&fail.step);
+        return null;
+    };
+    const profile = native_qemu_graph.parseProfile(profile_name) catch {
+        step.dependOn(&b.addFail(b.fmt(
+            "unsupported native QEMU graph '{s}'; registered graphs are qemu-x86_64 and qemu-arm64",
+            .{profile_name},
+        )).step);
+        return null;
+    };
+
+    const registration = b.allocator.create(native_qemu_graph.RegisteredGraph) catch {
+        step.dependOn(&b.addFail("unable to allocate the native QEMU graph").step);
+        return null;
+    };
+    registration.* = native_qemu_graph.RegisteredGraph.init(b.allocator, .{
+        .roots = .{
+            .base = context.base,
+            .app = context.application,
+            .output = context.output,
+            .config = context.config,
+        },
+        .profile = profile,
+    }) catch |err| {
+        step.dependOn(&b.addFail(b.fmt(
+            "unable to register native QEMU graph '{s}': {s}",
+            .{ @tagName(profile), @errorName(err) },
+        )).step);
+        return null;
+    };
+
+    return registration;
+}
+
 fn addFailedTargets(b: *std.Build, message: []const u8) void {
     const fail = b.addFail(message);
     for (targets) |target| {
@@ -605,6 +678,10 @@ fn addFailedTargets(b: *std.Build, message: []const u8) void {
         .{
             .name = "config-header",
             .description = "Generate include/uk/bits/config.h directly from an existing solved .config",
+        },
+        .{
+            .name = "native-link-graph",
+            .description = "Register the native hello-world QEMU link graph without executing it",
         },
     };
     for (native_targets) |target| {
