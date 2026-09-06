@@ -66,6 +66,9 @@ static inline void x2apic_ack_interrupt(void)
 #include "pic.h"
 
 static struct uk_intctlr_desc intctlr;
+#if CONFIG_LIBUKINTCTLR_APIC
+static int apic_ready;
+#endif /* CONFIG_LIBUKINTCTLR_APIC */
 
 static int configure_irq(struct uk_intctlr_irq *irq __unused)
 {
@@ -78,6 +81,10 @@ static int uk_intctlr_xpic_handle_irq(void *data)
 	__u32 irq;
 
 	ctx = data;
+#if CONFIG_LIBUKINTCTLR_APIC
+	if (unlikely(!apic_ready))
+		return UK_EVENT_NOT_HANDLED;
+#endif /* CONFIG_LIBUKINTCTLR_APIC */
 	uk_intctlr_irq_handle(ctx);
 
 	irq = uk_lcpu_except_irq_ctx_get_irq(ctx);
@@ -111,7 +118,10 @@ int uk_intctlr_probe(void)
 		return rc;
 
 #if CONFIG_LIBUKINTCTLR_APIC
-	apic_enable();
+	apic_ready = 0;
+	rc = apic_enable();
+	if (unlikely(rc))
+		return rc;
 	intctlr.name = "APIC";
 #else /* ! CONFIG_LIBUKINTCTLR_APIC */
 	intctlr.name = "PIC";
@@ -120,5 +130,10 @@ int uk_intctlr_probe(void)
 	intctlr.ops = ops;
 	intctlr.ops->configure_irq = configure_irq;
 
-	return uk_intctlr_register(&intctlr);
+	rc = uk_intctlr_register(&intctlr);
+#if CONFIG_LIBUKINTCTLR_APIC
+	if (likely(!rc))
+		apic_ready = 1;
+#endif /* CONFIG_LIBUKINTCTLR_APIC */
+	return rc;
 }
