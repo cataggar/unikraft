@@ -6,7 +6,8 @@ const facade_paths = @import("support/build/zig-facade-paths.zig");
 const final_link = @import("support/build/final-link.zig");
 const native_library_link = @import("support/build/native-library-link.zig");
 const native_postprocess = @import("support/build/native-postprocess.zig");
-const native_qemu_graph = @import("support/build/native-qemu-graph.zig");
+const native_image_graph = @import("support/build/native-image-graph.zig");
+const native_target_object = @import("support/build/native-target-object.zig");
 
 const supported_zig = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
 
@@ -76,6 +77,7 @@ const targets = [_]Target{
 };
 
 pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{});
     const root_lexical = b.pathFromRoot(".");
     const root_result = facade_paths.canonicalizeNearestExisting(
         b.allocator,
@@ -199,13 +201,9 @@ pub fn build(b: *std.Build) void {
         return;
     }
 
-    const native_graph = registerNativeQemuGraph(b, context);
+    const native_graph = registerNativeGraph(b, context);
     if (native_graph) |registered| {
-        std.debug.assert(std.mem.eql(
-            u8,
-            registered.graph.selectedPlatform().name,
-            "kvm",
-        ));
+        std.debug.assert(registered.graph.selectedPlatform().name.len != 0);
     }
 
     const make_runner = b.addExecutable(.{
@@ -277,16 +275,6 @@ pub fn build(b: *std.Build) void {
     );
     validate_config_step.dependOn(&validate_config.step);
 
-    const native_images_step = registerNativeQemuPipeline(
-        b,
-        root,
-        context,
-        options,
-        make_runner,
-        validate_config,
-        native_graph,
-    );
-
     const header_path = context.headerPath() catch @panic("out of memory");
     const generate_config_header = b.addRunArtifact(native_config_tool);
     generate_config_header.addArgs(&.{ "header", context.config, metadata_path, header_path });
@@ -297,6 +285,26 @@ pub fn build(b: *std.Build) void {
         "Generate include/uk/bits/config.h directly from an existing solved .config",
     );
     generate_config_header_step.dependOn(&generate_config_header.step);
+
+    const generate_target_config_header = b.addRunArtifact(native_config_tool);
+    generate_target_config_header.addArgs(&.{ "header", context.config, metadata_path });
+    const target_config_header = generate_target_config_header.addOutputFileArg(
+        "include/uk/bits/config.h",
+    );
+    generate_target_config_header.setCwd(.{ .cwd_relative = root });
+    generate_target_config_header.step.dependOn(&validate_config.step);
+
+    const native_images_step = registerNativePipeline(
+        b,
+        root,
+        context,
+        options,
+        optimize,
+        make_runner,
+        validate_config,
+        target_config_header,
+        native_graph,
+    );
 
     for (targets) |target| {
         const step = b.step(target.name, target.description);
@@ -402,15 +410,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_final_link_tests = b.addRunArtifact(final_link_tests);
     run_final_link_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
-    const native_qemu_graph_tests = b.addTest(.{
+    const native_image_graph_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("support/build/native-qemu-graph.zig"),
+            .root_source_file = b.path("support/build/native-image-graph.zig"),
             .target = b.graph.host,
             .optimize = .Debug,
         }),
     });
-    const run_native_qemu_graph_tests = b.addRunArtifact(native_qemu_graph_tests);
-    run_native_qemu_graph_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const run_native_image_graph_tests = b.addRunArtifact(native_image_graph_tests);
+    run_native_image_graph_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
     const native_postprocess_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/native-postprocess.zig"),
@@ -420,6 +428,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_native_postprocess_tests = b.addRunArtifact(native_postprocess_tests);
     run_native_postprocess_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const native_target_object_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-target-object.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_native_target_object_tests = b.addRunArtifact(native_target_object_tests);
+    run_native_target_object_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
     const test_step = b.step(
         "test",
         "Test facade, native configuration, native linking, QEMU graphs, and post-processing",
@@ -430,10 +447,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_context_tests.step);
     test_step.dependOn(&run_native_library_link_tests.step);
     test_step.dependOn(&run_elf_common_validator_tests.step);
-    test_step.dependOn(&run_native_qemu_graph_tests.step);
+    test_step.dependOn(&run_native_image_graph_tests.step);
     test_step.dependOn(&run_linker_script_tests.step);
     test_step.dependOn(&run_final_link_tests.step);
     test_step.dependOn(&run_native_postprocess_tests.step);
+    test_step.dependOn(&run_native_target_object_tests.step);
+    test_step.dependOn(native_target_object.addFixtureValidation(b) catch |err| {
+        @panic(@errorName(err));
+    });
     const integration_output = resolvePath(
         b.allocator,
         root,
@@ -666,38 +687,42 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-fn registerNativeQemuGraph(
+fn registerNativeGraph(
     b: *std.Build,
     context: build_context.Context,
-) ?*native_qemu_graph.RegisteredGraph {
+) ?*native_image_graph.RegisteredGraph {
     const step = b.step(
         "native-link-graph",
-        "Register the native hello-world QEMU link graph without executing it",
+        "Register a native hello-world image graph without executing it",
     );
     const profile_name = b.option(
         []const u8,
+        "native-profile",
+        "Registered native graph: qemu-x86_64, qemu-arm64, or hyperv-x86_64-efi",
+    ) orelse b.option(
+        []const u8,
         "native-qemu-graph",
-        "Registered native graph: qemu-x86_64 or qemu-arm64",
+        "Legacy alias for -Dnative-profile",
     ) orelse {
         const fail = b.addFail(
-            "native-link-graph requires -Dnative-qemu-graph=qemu-x86_64 or qemu-arm64",
+            "native-link-graph requires -Dnative-profile=qemu-x86_64, qemu-arm64, or hyperv-x86_64-efi",
         );
         step.dependOn(&fail.step);
         return null;
     };
-    const profile = native_qemu_graph.parseProfile(profile_name) catch {
+    const profile = native_image_graph.parseProfile(profile_name) catch {
         step.dependOn(&b.addFail(b.fmt(
-            "unsupported native QEMU graph '{s}'; registered graphs are qemu-x86_64 and qemu-arm64",
+            "unsupported native graph '{s}'; registered graphs are qemu-x86_64, qemu-arm64, and hyperv-x86_64-efi",
             .{profile_name},
         )).step);
         return null;
     };
 
-    const registration = b.allocator.create(native_qemu_graph.RegisteredGraph) catch {
+    const registration = b.allocator.create(native_image_graph.RegisteredGraph) catch {
         step.dependOn(&b.addFail("unable to allocate the native QEMU graph").step);
         return null;
     };
-    registration.* = native_qemu_graph.RegisteredGraph.init(b.allocator, .{
+    registration.* = native_image_graph.RegisteredGraph.init(b.allocator, .{
         .roots = .{
             .base = context.base,
             .app = context.application,
@@ -741,22 +766,24 @@ const NativeResolverContext = struct {
     }
 };
 
-fn registerNativeQemuPipeline(
+fn registerNativePipeline(
     b: *std.Build,
     root: []const u8,
     context: build_context.Context,
     options: MakeOptions,
+    optimize: std.builtin.OptimizeMode,
     make_runner: *std.Build.Step.Compile,
     validate_config: *std.Build.Step.Run,
-    registration: ?*native_qemu_graph.RegisteredGraph,
+    target_config_header: std.Build.LazyPath,
+    registration: ?*native_image_graph.RegisteredGraph,
 ) *std.Build.Step {
     const step = b.step(
         "native-images",
-        "Build QEMU images with Zig-owned native link and post-processing stages",
+        "Build images with Zig-owned native link and post-processing stages",
     );
     const registered = registration orelse {
         step.dependOn(&b.addFail(
-            "native-images requires -Dnative-qemu-graph=qemu-x86_64 or qemu-arm64",
+            "native-images requires -Dnative-profile=qemu-x86_64, qemu-arm64, or hyperv-x86_64-efi",
         ).step);
         return step;
     };
@@ -770,7 +797,7 @@ fn registerNativeQemuPipeline(
     };
     if (!nativeProfileMatchesConfig(registered.profile, config)) {
         step.dependOn(&b.addFail(b.fmt(
-            "native QEMU profile '{s}' does not match configuration '{s}'",
+            "native profile '{s}' does not match configuration '{s}'",
             .{ @tagName(registered.profile), context.config },
         )).step);
         return step;
@@ -789,7 +816,23 @@ fn registerNativeQemuPipeline(
     );
     make_inputs.step.dependOn(&validate_config.step);
 
-    const bindings = nativePathBindings(b, registered.graph);
+    const target_objects = native_target_object.execute(b, registered.graph, .{
+        .optimize = optimize,
+        .path_bindings = &.{.{
+            .logical_path = std.fs.path.join(
+                b.allocator,
+                &.{ context.output, "include", "uk", "bits", "config.h" },
+            ) catch @panic("out of memory"),
+            .lazy_path = target_config_header,
+        }},
+    }) catch |err| {
+        step.dependOn(&b.addFail(b.fmt(
+            "unable to compile native target Zig objects: {s}",
+            .{@errorName(err)},
+        )).step);
+        return step;
+    };
+    const bindings = nativePathBindings(b, registered.graph, target_objects);
     const libraries = native_library_link.execute(b, registered.graph, .{
         .path_bindings = bindings,
     }) catch |err| {
@@ -864,11 +907,13 @@ fn registerNativeQemuPipeline(
             else
                 null,
             .nm = registered.graph.toolchain.binutils.nm.command,
+            .readelf = "llvm-readelf",
         },
         .{
             .runner = b.path("support/build/native-postprocess-runner.py"),
             .bootinfo = b.path("support/scripts/mkbootinfo.py"),
             .multiboot = b.path("support/scripts/multiboot.py"),
+            .efi = b.path("support/scripts/mkefi.py"),
             .linux_header = b.path("support/scripts/mklinux.py"),
             .compile_database = b.path("support/scripts/mkcompiledb.py"),
             .elf_tools = b.path("support/scripts/elf_tools.py"),
@@ -953,7 +998,7 @@ fn nativeConfigRawValue(source: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn nativeProfileMatchesConfig(
-    profile: native_qemu_graph.Profile,
+    profile: native_image_graph.Profile,
     config: *const NativeConfig,
 ) bool {
     if (!nativeConfigEnabled(config, "CONFIG_PLAT_KVM")) return false;
@@ -963,12 +1008,17 @@ fn nativeProfileMatchesConfig(
             nativeConfigEnabled(config, "CONFIG_KVM_BOOT_PROTO_MULTIBOOT"),
         .@"qemu-arm64" => std.mem.eql(u8, architecture, "arm64") and
             nativeConfigEnabled(config, "CONFIG_KVM_BOOT_PROTO_LXBOOT"),
+        .@"hyperv-x86_64-efi" => std.mem.eql(u8, architecture, "x86_64") and
+            nativeConfigEnabled(config, "CONFIG_OPTIMIZE_PIE") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKPAGING") and
+            nativeConfigEnabled(config, "CONFIG_KVM_BOOT_PROTO_EFI_STUB"),
     };
 }
 
 fn nativePathBindings(
     b: *std.Build,
     graph: component_api.FinalizedGraph,
+    target_objects: native_target_object.Execution,
 ) []const native_library_link.PathBinding {
     var bindings = std.array_list.Managed(native_library_link.PathBinding).init(b.allocator);
     for (graph.libraries, 0..) |library, library_index| {
@@ -992,9 +1042,16 @@ fn nativePathBindings(
                 }
             }
             if (!duplicate) {
+                var lazy_path = std.Build.LazyPath{ .cwd_relative = path };
+                for (target_objects.outputs) |target_object| {
+                    if (std.mem.eql(u8, target_object.logical_path, path)) {
+                        lazy_path = target_object.lazy_path;
+                        break;
+                    }
+                }
                 bindings.append(.{
                     .logical_path = path,
-                    .lazy_path = .{ .cwd_relative = path },
+                    .lazy_path = lazy_path,
                 }) catch @panic("out of memory");
             }
         }
@@ -1025,7 +1082,7 @@ fn addPublishedOutput(
     parent.dependOn(&copy.step);
 }
 
-test "native QEMU profiles require matching architecture and boot protocol" {
+test "native profiles require matching architecture and boot protocol" {
     const x86 = NativeConfig{ .source =
         \\CONFIG_UK_ARCH="x86_64"
         \\CONFIG_PLAT_KVM=y
@@ -1038,10 +1095,20 @@ test "native QEMU profiles require matching architecture and boot protocol" {
         \\CONFIG_KVM_BOOT_PROTO_LXBOOT=y
         \\
     };
+    const hyperv = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_KVM=y
+        \\CONFIG_KVM_BOOT_PROTO_EFI_STUB=y
+        \\CONFIG_OPTIMIZE_PIE=y
+        \\CONFIG_LIBUKPAGING=y
+        \\
+    };
     try std.testing.expect(nativeProfileMatchesConfig(.@"qemu-x86_64", &x86));
     try std.testing.expect(!nativeProfileMatchesConfig(.@"qemu-arm64", &x86));
     try std.testing.expect(nativeProfileMatchesConfig(.@"qemu-arm64", &arm64));
     try std.testing.expect(!nativeProfileMatchesConfig(.@"qemu-x86_64", &arm64));
+    try std.testing.expect(nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", &hyperv));
+    try std.testing.expect(!nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", &x86));
 }
 
 fn addFailedTargets(b: *std.Build, message: []const u8) void {

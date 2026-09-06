@@ -37,11 +37,13 @@ pub const ToolKind = enum {
     objcopy,
     objdump,
     nm,
+    readelf,
 };
 
 pub const Helper = enum {
     bootinfo,
     multiboot,
+    efi,
     linux_header,
     compile_database,
 };
@@ -59,6 +61,7 @@ pub const OperationKind = enum {
     strip,
     bootinfo,
     multiboot,
+    efi,
     objcopy_binary,
     linux_header,
     compile_database,
@@ -229,6 +232,7 @@ pub fn planPlatform(
             owned,
             kind,
             options,
+            transformation.flags,
             inputs,
             outputs,
             artifacts.items,
@@ -256,6 +260,7 @@ fn operationKind(kind: api.PostProcessKind) ?OperationKind {
         .strip => .strip,
         .bootinfo => .bootinfo,
         .multiboot => .multiboot,
+        .efi => .efi,
         .objcopy_binary => .objcopy_binary,
         .linux_header => .linux_header,
         .compile_database => .compile_database,
@@ -295,6 +300,8 @@ fn validateShape(
             mutations == 1 and primary_mutations == 1,
         .multiboot, .objcopy_binary => input_count == 1 and
             creates == 0 and mutations == 1 and primary_mutations == 1,
+        .efi => input_count == 2 and creates == 0 and
+            mutations == 1 and primary_mutations == 1,
         .linux_header => input_count == 2 and creates == 0 and
             mutations == 1 and primary_mutations == 1,
         .compile_database => input_count == 1 and creates == 1 and mutations == 0,
@@ -306,6 +313,7 @@ fn makeArguments(
     allocator: std.mem.Allocator,
     kind: OperationKind,
     options: PlanOptions,
+    flags: []const []const u8,
     inputs: []const usize,
     outputs: []const usize,
     artifacts: []const Artifact,
@@ -317,6 +325,14 @@ fn makeArguments(
                 .{ .literal = "strip" },
                 .{ .literal = "--tool" },
                 .{ .tool = .strip },
+            });
+            for (flags) |section| {
+                try appendArgs(&args, &.{
+                    .{ .literal = "--remove-section" },
+                    .{ .literal = section },
+                });
+            }
+            try appendArgs(&args, &.{
                 .{ .input = inputs[0] },
                 .{ .output = outputs[0] },
             });
@@ -357,6 +373,20 @@ fn makeArguments(
                 .{ .literal = "--script" },
                 .{ .helper = .multiboot },
                 .{ .input = inputs[0] },
+                .{ .output = outputs[0] },
+            });
+        },
+        .efi => {
+            try appendArgs(&args, &.{
+                .{ .literal = "efi" },
+                .{ .literal = "--script" },
+                .{ .helper = .efi },
+                .{ .literal = "--nm" },
+                .{ .tool = .nm },
+                .{ .literal = "--readelf" },
+                .{ .tool = .readelf },
+                .{ .input = inputs[0] },
+                .{ .input = inputs[1] },
                 .{ .output = outputs[0] },
             });
         },
@@ -468,12 +498,14 @@ pub const ToolCommands = struct {
     objcopy: []const u8,
     objdump: ?[]const u8,
     nm: []const u8,
+    readelf: []const u8 = "llvm-readelf",
 };
 
 pub const ExecutorPaths = struct {
     runner: std.Build.LazyPath,
     bootinfo: std.Build.LazyPath,
     multiboot: std.Build.LazyPath,
+    efi: std.Build.LazyPath,
     linux_header: std.Build.LazyPath,
     compile_database: std.Build.LazyPath,
     elf_tools: std.Build.LazyPath,
@@ -513,7 +545,9 @@ pub fn execute(
             tools.python_command orelse tools.python_executable,
         );
         run.addFileArg(paths.runner);
-        if (operation.kind == .bootinfo or operation.kind == .linux_header) {
+        if (operation.kind == .bootinfo or operation.kind == .efi or
+            operation.kind == .linux_header)
+        {
             run.addFileInput(paths.elf_tools);
         }
 
@@ -535,6 +569,7 @@ pub fn execute(
                 .helper => |helper| run.addFileArg(switch (helper) {
                     .bootinfo => paths.bootinfo,
                     .multiboot => paths.multiboot,
+                    .efi => paths.efi,
                     .linux_header => paths.linux_header,
                     .compile_database => paths.compile_database,
                 }),
@@ -565,6 +600,7 @@ fn toolCommand(tools: ToolCommands, tool: ToolKind) Error![]const u8 {
         .objcopy => tools.objcopy,
         .objdump => tools.objdump orelse return error.MissingTool,
         .nm => tools.nm,
+        .readelf => tools.readelf,
     };
 }
 
@@ -733,6 +769,58 @@ test "arm64 plan orders binary conversion before Linux header and ELF dependency
     try std.testing.expect(args[7] == .output);
 }
 
+test "EFI plan strips PIE metadata before mutating the image with its debug input" {
+    const stage = api.ArtifactReference{ .stage_output = .{
+        .platform = "hyperv",
+        .stage = "final-link",
+    } };
+    const platform = api.Platform{
+        .name = "hyperv",
+        .origin = .{ .internal = .platform },
+        .post_process = &.{
+            .{
+                .name = "strip",
+                .kind = .strip,
+                .input = stage,
+                .flags = &.{ ".dynamic", ".dynsym", ".dynstr", ".rela.dyn" },
+                .effects = &.{.{ .create = .{
+                    .name = "image",
+                    .path = "/out/hyperv.efi",
+                    .role = .image,
+                } }},
+            },
+            .{
+                .name = "efi",
+                .kind = .efi,
+                .input = .{ .post_process_output = .{
+                    .platform = "hyperv",
+                    .transformation = "strip",
+                    .output = "image",
+                } },
+                .additional_inputs = &.{stage},
+                .effects = &.{.{ .mutate_input = .{
+                    .name = "image",
+                    .role = .image,
+                } }},
+            },
+        },
+    };
+    var plan = try planPlatform(std.testing.allocator, platform, test_config, &.{.{
+        .reference = stage,
+        .logical_path = "/out/hyperv.efi.dbg",
+        .role = .debug,
+    }}, .{ .architecture = .x86_64 });
+    defer plan.deinit();
+
+    try std.testing.expectEqual(OperationKind.efi, plan.operations[1].kind);
+    try std.testing.expectEqual(plan.operations[0].outputs[0], plan.operations[1].inputs[0]);
+    try std.testing.expectEqual(@as(usize, 0), plan.operations[1].inputs[1]);
+    try std.testing.expectEqualStrings("--remove-section", plan.operations[0].arguments[3].literal);
+    try std.testing.expectEqualStrings(".dynamic", plan.operations[0].arguments[4].literal);
+    try std.testing.expect(plan.operations[1].arguments[2] == .helper);
+    try std.testing.expectEqual(Helper.efi, plan.operations[1].arguments[2].helper);
+}
+
 test "planner rejects missing references, collisions, and unsupported active kinds" {
     const missing = api.Platform{
         .name = "kvm",
@@ -813,10 +901,14 @@ test "planner rejects missing references, collisions, and unsupported active kin
     );
 }
 
-test "production QEMU profiles plan through compile database generation" {
-    const native_qemu = @import("native-qemu-graph.zig");
-    inline for (.{ native_qemu.Profile.@"qemu-x86_64", native_qemu.Profile.@"qemu-arm64" }) |profile| {
-        var registered = try native_qemu.RegisteredGraph.init(std.testing.allocator, .{
+test "production native profiles plan through compile database generation" {
+    const native_graph = @import("native-image-graph.zig");
+    inline for (.{
+        native_graph.Profile.@"qemu-x86_64",
+        native_graph.Profile.@"qemu-arm64",
+        native_graph.Profile.@"hyperv-x86_64-efi",
+    }) |profile| {
+        var registered = try native_graph.RegisteredGraph.init(std.testing.allocator, .{
             .roots = .{
                 .base = "/src/unikraft",
                 .app = "/src/app",
@@ -841,7 +933,7 @@ test "production QEMU profiles plan through compile database generation" {
             test_config,
             &.{.{
                 .reference = .{ .stage_output = .{
-                    .platform = "kvm",
+                    .platform = platform.name,
                     .stage = "final-link",
                 } },
                 .logical_path = final_output orelse return error.TestUnexpectedResult,
@@ -850,7 +942,7 @@ test "production QEMU profiles plan through compile database generation" {
         );
         defer plan.deinit();
 
-        const expected_operations: usize = if (profile == .@"qemu-x86_64") 4 else 5;
+        const expected_operations: usize = if (profile == .@"qemu-arm64") 5 else 4;
         try std.testing.expectEqual(expected_operations, plan.operations.len);
         const compile_database = plan.operations[plan.operations.len - 1];
         try std.testing.expectEqual(OperationKind.compile_database, compile_database.kind);

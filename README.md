@@ -289,7 +289,7 @@ The experimental QEMU/x86_64 native Zig image pipeline becomes:
 
 ```shell
 zig build native-images \
-  -Dnative-qemu-graph=qemu-x86_64 \
+  -Dnative-profile=qemu-x86_64 \
   -Dapp=/absolute/path/to/app \
   -Dconfig=/absolute/path/to/solved-qemu-x86_64.config \
   '-Dcompiler=zig cc -target x86_64-freestanding-none' \
@@ -320,7 +320,7 @@ freestanding AArch64 target:
 
 ```shell
 zig build native-images \
-  -Dnative-qemu-graph=qemu-arm64 \
+  -Dnative-profile=qemu-arm64 \
   -Dapp=/absolute/path/to/app \
   -Dconfig=/absolute/path/to/solved-qemu-arm64.config \
   '-Dcompiler=zig cc -target aarch64-freestanding-none' \
@@ -339,12 +339,41 @@ zig build native-images \
 ```
 
 Neither target requires GCC or GNU cross-binutils. Both require Python 3 and
-the listed LLVM binary tools. Passing `-Dnative-qemu-graph` also routes the
+the listed LLVM binary tools. Passing `-Dnative-profile` also routes the
 `images` and default `all` steps through this native link pipeline. Other
 profiles and invocations without that option retain the GNU Make backend.
-This compiler support remains experimental, is limited to GNU
-Make-configured hello-world QEMU/x86_64 and QEMU/ARM64 applications, and does
-not support LTO.
+The legacy `-Dnative-qemu-graph` option remains supported.
+
+The `hyperv-x86_64-efi` profile extends the same compatibility pipeline with
+first-class target-side Zig objects and EFI post-processing. Its solved
+configuration must select x86_64 KVM EFI, PIE, and `LIBUKPAGING`; GNU Make
+continues to provide the not-yet-migrated C/assembly objects:
+
+```shell
+zig build native-images \
+  -Dnative-profile=hyperv-x86_64-efi \
+  -Dapp=/absolute/path/to/app \
+  -Dconfig=/absolute/path/to/solved-x86_64-efi.config \
+  '-Dcompiler=zig cc -target x86_64-freestanding-none' \
+  -Dcompiler-targeted=true \
+  '-Dhost-cc=zig cc' \
+  '-Dhost-cxx=zig c++' \
+  -Dhost-cflags=-fno-sanitize=null \
+  '-Dmake-arg=AR=zig ar' \
+  -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf \
+  -Dmake-arg=STRIP=llvm-strip \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17 \
+  -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
+```
+
+Target Zig modules receive generated Kconfig headers through tracked build
+dependencies and can opt into narrow Unikraft include roots for `@cImport`.
+The resulting objects feed the normal library partial-link and final-link
+pipelines as `LazyPath` inputs. This compiler support remains experimental and
+does not support LTO.
 
 The standalone Clang/LLVM 21.1.8 QEMU/ARM64 build uses the GNU Make backend
 directly:

@@ -339,6 +339,14 @@ pub fn execute(
     return .{ .libraries = result };
 }
 
+fn configDisabled(_: ?*const anyopaque, _: []const u8) bool {
+    return false;
+}
+
+fn configValue(_: ?*const anyopaque, _: []const u8) ?[]const u8 {
+    return null;
+}
+
 fn syntheticGraph(
     libraries: []const component.Library,
     active_libraries: []const bool,
@@ -380,6 +388,10 @@ fn syntheticGraph(
         },
         .global_flags = .{},
         .global_includes = &.{},
+        .config = .{
+            .is_enabled_fn = configDisabled,
+            .value_fn = configValue,
+        },
         .libraries = libraries,
         .active_libraries = active_libraries,
         .platforms = &.{.{

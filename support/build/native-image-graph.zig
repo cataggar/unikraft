@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! Native link metadata for the documented hello-world QEMU configurations.
+//! Native link metadata for the documented hello-world image profiles.
 //!
 //! This module registers link inputs and transformations only. Compilation and
 //! command execution remain separate concerns.
 
 const std = @import("std");
 const component = @import("component-api.zig");
-const data = @import("native-qemu-data.zig");
+const data = @import("native-image-data.zig");
 const native_final_link = @import("final-link.zig");
 const native_library_link = @import("native-library-link.zig");
 
 pub const Profile = enum {
     @"qemu-x86_64",
     @"qemu-arm64",
+    @"hyperv-x86_64-efi",
 };
 
 pub const Error = component.RegistrationError || component.ValidationError || error{
@@ -42,6 +43,7 @@ pub const RegisteredGraph = struct {
         const profile_data = switch (options.profile) {
             .@"qemu-x86_64" => data.x86_64,
             .@"qemu-arm64" => data.arm64,
+            .@"hyperv-x86_64-efi" => data.x86_64,
         };
         const target = targetFor(options.profile);
         var context = component.BuildContext.init(allocator, .{
@@ -52,7 +54,12 @@ pub const RegisteredGraph = struct {
         }) catch return error.OutOfMemory;
         errdefer context.deinit();
 
-        try registerLibraries(&context, scratch.allocator(), options.roots, profile_data);
+        try registerLibraries(
+            &context,
+            scratch.allocator(),
+            options,
+            profile_data,
+        );
         try registerPlatform(&context, scratch.allocator(), options, profile_data);
         const graph = try context.finalize();
         return .{
@@ -70,7 +77,7 @@ pub const RegisteredGraph = struct {
 
 fn targetFor(profile: Profile) component.Target {
     return switch (profile) {
-        .@"qemu-x86_64" => .{
+        .@"qemu-x86_64", .@"hyperv-x86_64-efi" => .{
             .architecture = .x86_64,
             .family = .x86,
             .abi = "none",
@@ -117,110 +124,193 @@ fn toolchainFor(target: component.Target) component.Toolchain {
 fn registerLibraries(
     context: *component.BuildContext,
     allocator: std.mem.Allocator,
-    roots: component.Roots,
+    options: Options,
     profile: data.Profile,
 ) Error!void {
     for (profile.libraries) |library| {
-        const objects = try allocator.alloc(component.RegisteredArtifact, library.objects.len);
-        const sequence = try allocator.alloc(
-            component.LinkSequenceItem,
-            2 + library.objects.len + library.archives.len + 2,
-        );
-        var sequence_index: usize = 0;
-        sequence[sequence_index] = .{ .literal_flag = "-Wl,--build-id=none" };
-        sequence_index += 1;
-        sequence[sequence_index] = .{ .literal_flag = "-no-pie" };
-        sequence_index += 1;
-
-        for (library.objects, 0..) |relative, index| {
-            const path = try joinPath(allocator, roots.output, relative);
-            objects[index] = .{ .path = path };
-            sequence[sequence_index] = .{ .artifact = .{
-                .kind = .object,
-                .artifact = .{ .component_output = .{
-                    .component = library.name,
-                    .path = path,
-                } },
-                .provenance = .library_local,
-            } };
-            sequence_index += 1;
+        if (options.profile == .@"hyperv-x86_64-efi") {
+            if (std.mem.eql(u8, library.name, "libukallocstack")) {
+                try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[0], &.{});
+            } else if (std.mem.eql(u8, library.name, "libuklibid")) {
+                try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[3], &.{});
+                try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[4], &.{});
+            } else if (std.mem.eql(u8, library.name, "libuklcpu")) {
+                try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[5], &.{});
+            } else if (std.mem.eql(u8, library.name, "libukplat_native")) {
+                try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[1], &.{});
+                try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[2], &.{});
+            }
         }
-        sequence[sequence_index] = .group_start;
-        sequence_index += 1;
-        for (library.archives) |archive| {
-            sequence[sequence_index] = .{ .artifact = .{
-                .kind = .archive,
-                .artifact = .{ .path = try resolvePath(allocator, roots, archive) },
-                .provenance = .library_local,
-            } };
-            sequence_index += 1;
+        var effective = library;
+        if (options.profile == .@"hyperv-x86_64-efi" and
+            std.mem.eql(u8, library.name, "libkvmplat"))
+        {
+            effective.objects = &data.x86_64_efi_kvm_objects;
+        } else if (options.profile == .@"hyperv-x86_64-efi" and
+            std.mem.eql(u8, library.name, "libukplat_native"))
+        {
+            effective.objects = &data.x86_64_efi_native_objects;
         }
-        sequence[sequence_index] = .group_end;
-
-        const exports = if (library.export_symbols) |symbol|
-            try allocator.dupe([]const u8, &.{try resolvePath(allocator, roots, symbol)})
-        else
-            &.{};
-        const transform_sequence = if (library.export_symbols) |symbol|
-            try allocator.dupe(component.ObjectTransformItem, &.{.{ .symbol_file = .{
-                .action = .keep_global,
-                .symbols_file = try resolvePath(allocator, roots, symbol),
-                .provenance = .library_local,
-            } }})
-        else
-            &.{};
-        const linker_scripts = try resolveRegisteredPaths(
+        try registerLibrary(context, allocator, options, effective, &.{});
+    }
+    if (options.profile == .@"hyperv-x86_64-efi") {
+        const config_header = try joinPath(
             allocator,
-            roots,
-            library.linker_scripts,
+            options.roots.output,
+            "include/uk/bits/config.h",
         );
-        const archives = try resolveRegisteredPaths(allocator, roots, library.archives);
-        const origin: component.Origin = switch (library.origin) {
-            .application => .{ .external = .{
-                .package_name = "helloworld",
-                .root = roots.app,
-            } },
-            .architecture => .{ .internal = .architecture },
-            .driver => .{ .internal = .driver },
-            .library => .{ .internal = .library },
-            .platform => .{ .internal = .platform },
-        };
+        const generated_include = try joinPath(
+            allocator,
+            options.roots.output,
+            "include",
+        );
+        const source = try joinPath(
+            allocator,
+            options.roots.base,
+            "support/build/target/native-profile.zig",
+        );
+        const output = try joinPath(
+            allocator,
+            options.roots.output,
+            "libzigtarget/native-profile.o",
+        );
+        try registerLibrary(context, allocator, options, .{
+            .name = "libzigtarget",
+            .origin = .library,
+            .objects = &.{},
+        }, &.{.{
+            .name = "native-profile",
+            .root_source_file = source,
+            .output = output,
+            .includes = &.{.{
+                .path = generated_include,
+                .languages = &.{.zig},
+            }},
+            .dependencies = &.{config_header},
+            .pic = true,
+        }});
+    }
+}
 
-        try context.registerLibrary(.{
-            .name = library.name,
-            .kind = if (std.mem.eql(u8, library.name, "libkvmplat"))
-                .platform_library
-            else
-                .library,
-            .origin = origin,
-            .layout = .{ .ordinary = .{ .build_subdir = library.name } },
-            .platforms = if (std.mem.eql(u8, library.name, "libkvmplat"))
-                &.{"kvm"}
-            else
-                &.{},
-            .exports = exports,
-            .archives = archives,
-            .raw_objects = objects,
-            .linker_scripts = linker_scripts,
-            .object_pipeline = .{
-                .partial_link_output = try joinPath(
+fn registerLibrary(
+    context: *component.BuildContext,
+    allocator: std.mem.Allocator,
+    options: Options,
+    library: data.Library,
+    target_zig_objects: []const component.TargetZigObject,
+) Error!void {
+    const roots = options.roots;
+    const objects = try allocator.alloc(component.RegisteredArtifact, library.objects.len);
+    const sequence = try allocator.alloc(
+        component.LinkSequenceItem,
+        2 + library.objects.len + target_zig_objects.len + library.archives.len + 2,
+    );
+    var sequence_index: usize = 0;
+    sequence[sequence_index] = .{ .literal_flag = "-Wl,--build-id=none" };
+    sequence_index += 1;
+    sequence[sequence_index] = .{ .literal_flag = "-no-pie" };
+    sequence_index += 1;
+
+    for (library.objects, 0..) |relative, index| {
+        const path = try joinPath(allocator, roots.output, relative);
+        objects[index] = .{ .path = path };
+        sequence[sequence_index] = .{ .artifact = .{
+            .kind = .object,
+            .artifact = .{ .component_output = .{
+                .component = library.name,
+                .path = path,
+            } },
+            .provenance = .library_local,
+        } };
+        sequence_index += 1;
+    }
+    for (target_zig_objects) |object| {
+        sequence[sequence_index] = .{ .artifact = .{
+            .kind = .object,
+            .artifact = .{ .component_output = .{
+                .component = library.name,
+                .path = object.output,
+            } },
+            .provenance = .library_local,
+        } };
+        sequence_index += 1;
+    }
+    sequence[sequence_index] = .group_start;
+    sequence_index += 1;
+    for (library.archives) |archive| {
+        sequence[sequence_index] = .{ .artifact = .{
+            .kind = .archive,
+            .artifact = .{ .path = try resolvePath(allocator, roots, archive) },
+            .provenance = .library_local,
+        } };
+        sequence_index += 1;
+    }
+    sequence[sequence_index] = .group_end;
+
+    const exports = if (library.export_symbols) |symbol|
+        try allocator.dupe([]const u8, &.{try resolvePath(allocator, roots, symbol)})
+    else
+        &.{};
+    const transform_sequence = if (library.export_symbols) |symbol|
+        try allocator.dupe(component.ObjectTransformItem, &.{.{ .symbol_file = .{
+            .action = .keep_global,
+            .symbols_file = try resolvePath(allocator, roots, symbol),
+            .provenance = .library_local,
+        } }})
+    else
+        &.{};
+    const linker_scripts = try resolveRegisteredPaths(
+        allocator,
+        roots,
+        library.linker_scripts,
+    );
+    const archives = try resolveRegisteredPaths(allocator, roots, library.archives);
+    const origin: component.Origin = switch (library.origin) {
+        .application => .{ .external = .{
+            .package_name = "helloworld",
+            .root = roots.app,
+        } },
+        .architecture => .{ .internal = .architecture },
+        .driver => .{ .internal = .driver },
+        .library => .{ .internal = .library },
+        .platform => .{ .internal = .platform },
+    };
+
+    try context.registerLibrary(.{
+        .name = library.name,
+        .kind = if (std.mem.eql(u8, library.name, "libkvmplat"))
+            .platform_library
+        else
+            .library,
+        .origin = origin,
+        .layout = .{ .ordinary = .{ .build_subdir = library.name } },
+        .platforms = if (std.mem.eql(u8, library.name, "libkvmplat"))
+            &.{platformName(options.profile)}
+        else
+            &.{},
+        .exports = exports,
+        .archives = archives,
+        .raw_objects = objects,
+        .target_zig_objects = target_zig_objects,
+        .linker_scripts = linker_scripts,
+        .object_pipeline = .{
+            .partial_link_output = try joinPath(
+                allocator,
+                roots.output,
+                try std.fmt.allocPrint(allocator, "{s}.ld.o", .{library.name}),
+            ),
+            .partial_link_sequence = sequence,
+            .transform = .{
+                .input = .{ .library_partial_output = library.name },
+                .output = try joinPath(
                     allocator,
                     roots.output,
-                    try std.fmt.allocPrint(allocator, "{s}.ld.o", .{library.name}),
+                    try std.fmt.allocPrint(allocator, "{s}.o", .{library.name}),
                 ),
-                .partial_link_sequence = sequence,
-                .transform = .{
-                    .input = .{ .library_partial_output = library.name },
-                    .output = try joinPath(
-                        allocator,
-                        roots.output,
-                        try std.fmt.allocPrint(allocator, "{s}.o", .{library.name}),
-                    ),
-                    .sequence = transform_sequence,
-                },
+                .sequence = transform_sequence,
             },
-        });
-    }
+        },
+    });
 }
 
 fn registerPlatform(
@@ -229,13 +319,14 @@ fn registerPlatform(
     options: Options,
     profile: data.Profile,
 ) Error!void {
+    const extra_script_count: usize = if (options.profile == .@"hyperv-x86_64-efi") 1 else 0;
     const merge_sequence = try allocator.alloc(
         component.LinkSequenceItem,
-        profile.linker_script_inputs.len,
+        profile.linker_script_inputs.len + extra_script_count,
     );
     const platform_scripts = try allocator.alloc(
         component.ArtifactReference,
-        profile.linker_script_inputs.len + 1,
+        profile.linker_script_inputs.len + extra_script_count + 1,
     );
     for (profile.linker_script_inputs, 0..) |script, index| {
         const path = try resolvePath(allocator, options.roots, script);
@@ -246,22 +337,37 @@ fn registerPlatform(
         } };
         platform_scripts[index] = .{ .path = path };
     }
-    platform_scripts[profile.linker_script_inputs.len] = .{ .stage_output = .{
-        .platform = "kvm",
+    if (options.profile == .@"hyperv-x86_64-efi") {
+        const reloc_script = try joinPath(
+            allocator,
+            options.roots.output,
+            "libukreloc/reloc.lds",
+        );
+        merge_sequence[profile.linker_script_inputs.len] = .{ .artifact = .{
+            .kind = .linker_script,
+            .artifact = .{ .path = reloc_script },
+            .provenance = .global,
+        } };
+        platform_scripts[profile.linker_script_inputs.len] = .{ .path = reloc_script };
+    }
+    platform_scripts[profile.linker_script_inputs.len + extra_script_count] = .{ .stage_output = .{
+        .platform = platformName(options.profile),
         .stage = "merge-linker-scripts",
     } };
 
+    const extra_final_flags: usize = if (options.profile == .@"hyperv-x86_64-efi") 4 else 0;
     const final_sequence = try allocator.alloc(
         component.LinkSequenceItem,
-        profile.libraries.len + 8,
+        context.libraries.items.len + 8 + extra_final_flags,
     );
     var sequence_index: usize = 0;
     final_sequence[sequence_index] = .{ .literal_flag = switch (options.profile) {
         .@"qemu-x86_64" => "-Wl,--entry=_multiboot_entry",
         .@"qemu-arm64" => "-Wl,--entry=_libkvmplat_entry",
+        .@"hyperv-x86_64-efi" => "-Wl,--entry=uk_efi_entry64",
     } };
     sequence_index += 1;
-    for (profile.libraries, 0..) |library, index| {
+    for (context.libraries.items, 0..) |library, index| {
         final_sequence[sequence_index] = .{ .artifact = .{
             .kind = .object,
             .artifact = .{ .library_final_object = library.name },
@@ -277,21 +383,48 @@ fn registerPlatform(
     sequence_index += 1;
     final_sequence[sequence_index] = .{ .literal_flag = "-Wl,--build-id=none" };
     sequence_index += 1;
-    final_sequence[sequence_index] = .{ .literal_flag = "-no-pie" };
-    sequence_index += 1;
+    if (options.profile == .@"hyperv-x86_64-efi") {
+        for ([_][]const u8{
+            "-static-pie",
+            "-z",
+            "notext",
+            "-z",
+            "norelro",
+        }) |flag| {
+            final_sequence[sequence_index] = .{ .literal_flag = flag };
+            sequence_index += 1;
+        }
+    } else {
+        final_sequence[sequence_index] = .{ .literal_flag = "-no-pie" };
+        sequence_index += 1;
+    }
     final_sequence[sequence_index] = .{ .literal_flag = "-rtlib=compiler-rt" };
     sequence_index += 1;
     final_sequence[sequence_index] = .{ .artifact = .{
         .kind = .linker_script,
         .artifact = .{ .stage_output = .{
-            .platform = "kvm",
+            .platform = platformName(options.profile),
             .stage = "merge-linker-scripts",
         } },
         .provenance = .platform,
     } };
 
-    const merged_script = try joinPath(allocator, options.roots.output, "kvm-combined.lds");
-    const final_output = try joinPath(allocator, options.roots.output, profile.final_output);
+    const merged_script = try joinPath(
+        allocator,
+        options.roots.output,
+        if (options.profile == .@"hyperv-x86_64-efi")
+            "hyperv-combined.lds"
+        else
+            "kvm-combined.lds",
+    );
+    const final_output = try joinPath(
+        allocator,
+        options.roots.output,
+        if (options.profile == .@"hyperv-x86_64-efi")
+            "helloworld_hyperv-x86_64-efi.dbg"
+        else
+            profile.final_output,
+    );
     const post_process = try postProcess(
         allocator,
         options.profile,
@@ -299,7 +432,7 @@ fn registerPlatform(
     );
 
     try context.registerPlatform(.{
-        .name = "kvm",
+        .name = platformName(options.profile),
         .origin = .{ .internal = .platform },
         .linker_definition = try joinPath(allocator, options.roots.base, "plat/kvm/Linker.uk"),
         .libraries = &.{"libkvmplat"},
@@ -332,6 +465,7 @@ fn postProcess(
     const image_relative = switch (profile) {
         .@"qemu-x86_64" => "helloworld_qemu-x86_64",
         .@"qemu-arm64" => "helloworld_qemu-arm64",
+        .@"hyperv-x86_64-efi" => "helloworld_hyperv-x86_64-efi",
     };
     const image = try joinPath(allocator, output_root, image_relative);
     const bootinfo = try std.fmt.allocPrint(allocator, "{s}.bootinfo", .{image});
@@ -339,15 +473,23 @@ fn postProcess(
     const protocol_name = switch (profile) {
         .@"qemu-x86_64" => "multiboot",
         .@"qemu-arm64" => "linux-header",
+        .@"hyperv-x86_64-efi" => "efi",
     };
     const transformations = try allocator.alloc(
         component.PostProcessTransformation,
-        if (profile == .@"qemu-x86_64") 4 else 5,
+        if (profile == .@"qemu-arm64") 5 else 4,
     );
     transformations[0] = .{
         .name = "strip",
         .kind = .strip,
-        .input = .{ .stage_output = .{ .platform = "kvm", .stage = "final-link" } },
+        .input = .{ .stage_output = .{
+            .platform = platformName(profile),
+            .stage = "final-link",
+        } },
+        .flags = if (profile == .@"hyperv-x86_64-efi")
+            &.{ ".dynamic", ".dynsym", ".dynstr", ".rela.dyn" }
+        else
+            &.{},
         .effects = try copyEffects(allocator, &.{.{ .create = .{
             .name = "image",
             .path = image,
@@ -358,7 +500,7 @@ fn postProcess(
         .name = "bootinfo",
         .kind = .bootinfo,
         .input = .{ .post_process_output = .{
-            .platform = "kvm",
+            .platform = platformName(profile),
             .transformation = "strip",
             .output = "image",
         } },
@@ -372,7 +514,7 @@ fn postProcess(
             .name = "multiboot",
             .kind = .multiboot,
             .input = .{ .post_process_output = .{
-                .platform = "kvm",
+                .platform = platformName(profile),
                 .transformation = "bootinfo",
                 .output = "image",
             } },
@@ -380,12 +522,12 @@ fn postProcess(
                 .mutate_input = .{ .name = "image", .role = .image },
             }}),
         };
-    } else {
+    } else if (profile == .@"qemu-arm64") {
         transformations[2] = .{
             .name = "linux-binary",
             .kind = .objcopy_binary,
             .input = .{ .post_process_output = .{
-                .platform = "kvm",
+                .platform = platformName(profile),
                 .transformation = "bootinfo",
                 .output = "image",
             } },
@@ -397,12 +539,29 @@ fn postProcess(
             .name = "linux-header",
             .kind = .linux_header,
             .input = .{ .post_process_output = .{
-                .platform = "kvm",
+                .platform = platformName(profile),
                 .transformation = "linux-binary",
                 .output = "image",
             } },
             .additional_inputs = try copyArtifactReferences(allocator, &.{.{ .stage_output = .{
-                .platform = "kvm",
+                .platform = platformName(profile),
+                .stage = "final-link",
+            } }}),
+            .effects = try copyEffects(allocator, &.{.{
+                .mutate_input = .{ .name = "image", .role = .image },
+            }}),
+        };
+    } else {
+        transformations[2] = .{
+            .name = "efi",
+            .kind = .efi,
+            .input = .{ .post_process_output = .{
+                .platform = platformName(profile),
+                .transformation = "bootinfo",
+                .output = "image",
+            } },
+            .additional_inputs = try copyArtifactReferences(allocator, &.{.{ .stage_output = .{
+                .platform = platformName(profile),
                 .stage = "final-link",
             } }}),
             .effects = try copyEffects(allocator, &.{.{
@@ -410,12 +569,12 @@ fn postProcess(
             }}),
         };
     }
-    const compile_index: usize = if (profile == .@"qemu-x86_64") 3 else 4;
+    const compile_index: usize = if (profile == .@"qemu-arm64") 4 else 3;
     transformations[compile_index] = .{
         .name = "compile-db",
         .kind = .compile_database,
         .input = .{ .post_process_output = .{
-            .platform = "kvm",
+            .platform = platformName(profile),
             .transformation = protocol_name,
             .output = "image",
         } },
@@ -426,6 +585,10 @@ fn postProcess(
         } }}),
     };
     return transformations;
+}
+
+fn platformName(profile: Profile) []const u8 {
+    return if (profile == .@"hyperv-x86_64-efi") "hyperv" else "kvm";
 }
 
 fn copyEffects(
@@ -609,6 +772,62 @@ test "registered profiles satisfy the native final-link planner contract" {
         }
         try std.testing.expectEqual(@as(usize, 1), merged_script_arguments);
     }
+}
+
+test "Hyper-V EFI profile registers source-built Zig objects and PIE link ordering" {
+    var registered = try RegisteredGraph.init(std.testing.allocator, .{
+        .roots = .{
+            .base = "/src/unikraft",
+            .app = "/src/app-helloworld",
+            .output = "/build",
+            .config = "/build/.config",
+        },
+        .profile = .@"hyperv-x86_64-efi",
+    });
+    defer registered.deinit();
+
+    try std.testing.expectEqualStrings("hyperv", registered.graph.selectedPlatform().name);
+    try std.testing.expectEqualStrings(
+        "x86_64-freestanding-none",
+        registered.graph.target.triple,
+    );
+    const zig_library = registered.graph.libraries[registered.graph.libraries.len - 1];
+    try std.testing.expectEqualStrings("libzigtarget", zig_library.name);
+    try std.testing.expectEqual(@as(usize, 0), zig_library.raw_objects.len);
+    try std.testing.expectEqual(@as(usize, 1), zig_library.target_zig_objects.len);
+    try std.testing.expect(zig_library.target_zig_objects[0].pic);
+    try std.testing.expectEqualStrings(
+        "/build/include/uk/bits/config.h",
+        zig_library.target_zig_objects[0].dependencies[0],
+    );
+    try std.testing.expect(
+        zig_library.object_pipeline.?.partial_link_sequence[2].artifact.artifact ==
+            .component_output,
+    );
+
+    const final_stage = registered.graph.selectedPlatform().link_stages[1];
+    var saw_entry = false;
+    var saw_static_pie = false;
+    var saw_zig_library = false;
+    for (final_stage.sequence) |item| switch (item) {
+        .literal_flag => |flag| {
+            saw_entry = saw_entry or std.mem.eql(u8, flag, "-Wl,--entry=uk_efi_entry64");
+            saw_static_pie = saw_static_pie or std.mem.eql(u8, flag, "-static-pie");
+        },
+        .artifact => |artifact| {
+            if (artifact.artifact == .library_final_object) {
+                saw_zig_library = saw_zig_library or std.mem.eql(
+                    u8,
+                    artifact.artifact.library_final_object,
+                    "libzigtarget",
+                );
+            }
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_entry);
+    try std.testing.expect(saw_static_pie);
+    try std.testing.expect(saw_zig_library);
 }
 
 test "registered profiles match normalized Make graph fixtures" {

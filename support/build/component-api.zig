@@ -90,6 +90,7 @@ pub const SourceLanguage = enum {
     c,
     cpp,
     assembler,
+    zig,
     rust,
     linker_script,
     dts,
@@ -114,6 +115,7 @@ pub const FlagSet = struct {
     c: []const []const u8 = &.{},
     cpp: []const []const u8 = &.{},
     assembler: []const []const u8 = &.{},
+    zig: []const []const u8 = &.{},
     rust: []const []const u8 = &.{},
     linker: []const []const u8 = &.{},
 };
@@ -324,6 +326,24 @@ pub const RegisteredArtifact = struct {
     condition: Condition = .always,
 };
 
+pub const TargetZigObject = struct {
+    name: []const u8,
+    root_source_file: []const u8,
+    output: []const u8,
+    condition: Condition = .always,
+    optimize: ?std.builtin.OptimizeMode = null,
+    includes: []const Include = &.{},
+    c_macros: []const CMacro = &.{},
+    dependencies: []const []const u8 = &.{},
+    pic: bool = false,
+    omit_frame_pointer: ?bool = null,
+
+    pub const CMacro = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+};
+
 pub const LinkProvenance = enum {
     library_local,
     each_library,
@@ -477,6 +497,7 @@ pub const LibrarySpec = struct {
     locals: []const []const u8 = &.{},
     archives: []const RegisteredArtifact = &.{},
     raw_objects: []const RegisteredArtifact = &.{},
+    target_zig_objects: []const TargetZigObject = &.{},
     custom_link_dependencies: []const RegisteredArtifact = &.{},
     linker_scripts: []const RegisteredArtifact = &.{},
     sources: []const Source = &.{},
@@ -637,6 +658,7 @@ pub const PostProcessTransformation = struct {
     input: ArtifactReference,
     additional_inputs: []const ArtifactReference = &.{},
     condition: Condition = .always,
+    flags: []const []const u8 = &.{},
     effects: []const PostProcessEffect,
 };
 
@@ -701,6 +723,7 @@ pub const FinalizedGraph = struct {
     toolchain: Toolchain,
     global_flags: FlagSet,
     global_includes: []const Include,
+    config: ConfigQuery,
     libraries: []const Library,
     active_libraries: []const bool,
     platforms: []const Platform,
@@ -867,6 +890,7 @@ pub const BuildContext = struct {
             .toolchain = self.toolchain,
             .global_flags = self.global_flags,
             .global_includes = self.global_includes,
+            .config = self.config,
             .libraries = self.libraries.items,
             .active_libraries = active_libraries,
             .platforms = self.platforms.items,
@@ -917,6 +941,37 @@ pub const BuildContext = struct {
                 }
             }
             try self.validateUniqueSourceNames(library);
+            for (library.target_zig_objects, 0..) |object, index| {
+                if (object.name.len == 0 or object.root_source_file.len == 0 or
+                    object.output.len == 0)
+                {
+                    try self.setDiagnostic(
+                        "library '{s}' has a target Zig object with an empty name, source, or output",
+                        .{library.name},
+                    );
+                    return error.InvalidModel;
+                }
+                for (library.target_zig_objects[0..index]) |previous| {
+                    if (std.mem.eql(u8, previous.name, object.name) or
+                        std.mem.eql(u8, previous.output, object.output))
+                    {
+                        try self.setDiagnostic(
+                            "library '{s}' repeats target Zig object name or output '{s}'",
+                            .{ library.name, object.name },
+                        );
+                        return error.DuplicateName;
+                    }
+                }
+                for (object.c_macros) |macro| {
+                    if (macro.name.len == 0) {
+                        try self.setDiagnostic(
+                            "library '{s}' target Zig object '{s}' has an empty C macro name",
+                            .{ library.name, object.name },
+                        );
+                        return error.InvalidModel;
+                    }
+                }
+            }
             for (library.platforms) |platform_name| {
                 const platform_index = self.findPlatform(platform_name) orelse {
                     try self.setDiagnostic(
@@ -1312,6 +1367,15 @@ pub const BuildContext = struct {
                     );
                     return error.InvalidModel;
                 }
+                for (transformation.flags) |flag| {
+                    if (flag.len == 0) {
+                        try self.setDiagnostic(
+                            "platform '{s}' post-processing '{s}' has an empty flag",
+                            .{ platform.name, transformation.name },
+                        );
+                        return error.InvalidModel;
+                    }
+                }
                 for (transformation.effects, 0..) |effect, effect_index| {
                     const effect_name = postEffectName(effect);
                     if (effect_name.len == 0) {
@@ -1544,6 +1608,11 @@ pub const BuildContext = struct {
                     try self.recordOutput(&outputs, artifact.path);
                 }
             }
+            for (library.target_zig_objects) |object| {
+                if (object.condition.matches(self.config)) {
+                    try self.recordOutput(&outputs, object.output);
+                }
+            }
             for (library.sources) |source| {
                 if (!source.hasActiveVariant(self.config)) continue;
                 for (source.preprocess) |step| {
@@ -1649,6 +1718,10 @@ pub const BuildContext = struct {
             if (artifact.condition.matches(self.config) and
                 std.mem.eql(u8, artifact.path, path)) return true;
         }
+        for (library.target_zig_objects) |object| {
+            if (object.condition.matches(self.config) and
+                std.mem.eql(u8, object.output, path)) return true;
+        }
         for (library.sources) |source| {
             if (!source.hasActiveVariant(self.config)) continue;
             for (source.preprocess) |step| {
@@ -1721,6 +1794,9 @@ fn libraryProduces(library: Library, path: []const u8) bool {
     }
     for (library.raw_objects) |artifact| {
         if (std.mem.eql(u8, artifact.path, path)) return true;
+    }
+    for (library.target_zig_objects) |object| {
+        if (std.mem.eql(u8, object.output, path)) return true;
     }
     for (library.sources) |source| {
         for (source.preprocess) |step| {
@@ -1841,6 +1917,7 @@ fn copyFlagSet(allocator: std.mem.Allocator, flags: FlagSet) !FlagSet {
         .c = try copyStringList(allocator, flags.c),
         .cpp = try copyStringList(allocator, flags.cpp),
         .assembler = try copyStringList(allocator, flags.assembler),
+        .zig = try copyStringList(allocator, flags.zig),
         .rust = try copyStringList(allocator, flags.rust),
         .linker = try copyStringList(allocator, flags.linker),
     };
@@ -2021,6 +2098,35 @@ fn copyRegisteredArtifacts(
     return result;
 }
 
+fn copyTargetZigObjects(
+    allocator: std.mem.Allocator,
+    objects: []const TargetZigObject,
+) ![]const TargetZigObject {
+    const result = try allocator.alloc(TargetZigObject, objects.len);
+    for (objects, 0..) |object, index| {
+        const macros = try allocator.alloc(TargetZigObject.CMacro, object.c_macros.len);
+        for (object.c_macros, 0..) |macro, macro_index| {
+            macros[macro_index] = .{
+                .name = try allocator.dupe(u8, macro.name),
+                .value = try allocator.dupe(u8, macro.value),
+            };
+        }
+        result[index] = .{
+            .name = try allocator.dupe(u8, object.name),
+            .root_source_file = try allocator.dupe(u8, object.root_source_file),
+            .output = try allocator.dupe(u8, object.output),
+            .condition = try copyCondition(allocator, object.condition),
+            .optimize = object.optimize,
+            .includes = try copyIncludes(allocator, object.includes),
+            .c_macros = macros,
+            .dependencies = try copyStringList(allocator, object.dependencies),
+            .pic = object.pic,
+            .omit_frame_pointer = object.omit_frame_pointer,
+        };
+    }
+    return result;
+}
+
 fn copyComponentDependencies(
     allocator: std.mem.Allocator,
     dependencies: []const ComponentDependency,
@@ -2049,6 +2155,10 @@ fn copyLibrary(allocator: std.mem.Allocator, library: LibrarySpec) !Library {
         .locals = try copyStringList(allocator, library.locals),
         .archives = try copyRegisteredArtifacts(allocator, library.archives),
         .raw_objects = try copyRegisteredArtifacts(allocator, library.raw_objects),
+        .target_zig_objects = try copyTargetZigObjects(
+            allocator,
+            library.target_zig_objects,
+        ),
         .custom_link_dependencies = try copyRegisteredArtifacts(
             allocator,
             library.custom_link_dependencies,
@@ -2252,6 +2362,7 @@ fn copyPostProcess(
                 transformation.additional_inputs,
             ),
             .condition = try copyCondition(allocator, transformation.condition),
+            .flags = try copyStringList(allocator, transformation.flags),
             .effects = try copyPostProcessEffects(allocator, transformation.effects),
         };
     }

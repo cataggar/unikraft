@@ -124,12 +124,12 @@ with log.open("a", encoding="utf-8") as stream:
             for relative in (
                 "build.zig",
                 "build.zig.zon",
-                "support/build/zig-facade-paths.zig",
-                "support/build/zig-facade-runner.zig",
             ):
                 destination = checkout / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / relative, destination)
+            for source in (REPO / "support/build").glob("*.zig"):
+                shutil.copy2(source, checkout / "support/build" / source.name)
             runner = checkout / "support/build/zig-facade-runner.zig"
             runner_source = runner.read_text(encoding="utf-8")
             production_root = "const injected_runtime_root: ?[]const u8 = null;"

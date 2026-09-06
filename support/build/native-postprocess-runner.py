@@ -25,6 +25,7 @@ def main():
 
     strip = subparsers.add_parser("strip")
     strip.add_argument("--tool", required=True)
+    strip.add_argument("--remove-section", action="append", default=[])
     strip.add_argument("input")
     strip.add_argument("output")
 
@@ -42,6 +43,14 @@ def main():
     multiboot.add_argument("--script", required=True)
     multiboot.add_argument("input")
     multiboot.add_argument("output")
+
+    efi = subparsers.add_parser("efi")
+    efi.add_argument("--script", required=True)
+    efi.add_argument("--nm", required=True)
+    efi.add_argument("--readelf", required=True)
+    efi.add_argument("input")
+    efi.add_argument("debug")
+    efi.add_argument("output")
 
     binary = subparsers.add_parser("objcopy-binary")
     binary.add_argument("--tool", required=True)
@@ -64,7 +73,8 @@ def main():
     args = parser.parse_args()
 
     if args.action == "strip":
-        run([*command(args.tool), "-s", args.input, "-o", args.output])
+        remove = [item for section in args.remove_section for item in ("-R", section)]
+        run([*command(args.tool), "-s", *remove, args.input, "-o", args.output])
     elif args.action == "bootinfo":
         env = os.environ.copy()
         env["OBJDUMP"] = args.objdump
@@ -94,6 +104,21 @@ def main():
                 args.script,
                 args.output,
             ]
+        )
+    elif args.action == "efi":
+        shutil.copyfile(args.input, args.output)
+        env = os.environ.copy()
+        env["NM"] = args.nm
+        env["READELF"] = args.readelf
+        run(
+            [
+                *command(os.environ.get("PYTHON", "python3")),
+                args.script,
+                "--debug",
+                args.debug,
+                args.output,
+            ],
+            env=env,
         )
     elif args.action == "objcopy-binary":
         run([*command(args.tool), "-O", "binary", args.input, args.output])

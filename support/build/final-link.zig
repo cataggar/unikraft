@@ -405,6 +405,14 @@ pub const Executor = struct {
     }
 };
 
+fn configDisabled(_: ?*const anyopaque, _: []const u8) bool {
+    return false;
+}
+
+fn configValue(_: ?*const anyopaque, _: []const u8) ?[]const u8 {
+    return null;
+}
+
 fn fixtureGraph() component.FinalizedGraph {
     const libraries = &.{component.Library{
         .name = "libcore",
@@ -505,6 +513,10 @@ fn fixtureGraph() component.FinalizedGraph {
         },
         .global_flags = .{},
         .global_includes = &.{},
+        .config = .{
+            .is_enabled_fn = configDisabled,
+            .value_fn = configValue,
+        },
         .libraries = libraries,
         .active_libraries = &.{true},
         .platforms = platforms,

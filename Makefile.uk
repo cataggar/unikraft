@@ -90,6 +90,7 @@ M4FLAGS      += -DUK_VERSION=$(UK_VERSION).$(UK_SUBVERSION)
 # override "pie" option, because some distributions will set
 # "--enable-default-pie" by default.
 ifeq ($(CONFIG_OPTIMIZE_PIE),y)
+COMPFLAGS				+= -ftls-model=local-exec
 ifeq ($(call have_gcc),y)
 $(call error_if_gcc_version_lt,7,0)
 endif
@@ -120,4 +121,3 @@ endif
 
 ASFLAGS-$(call have_clang)     += -mllvm -asm-macro-max-nesting-depth=1000
 COMPFLAGS-$(call have_clang)	+= -fno-builtin
-
