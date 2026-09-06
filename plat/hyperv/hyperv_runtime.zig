@@ -40,6 +40,7 @@ const stimer_auto_enable = @as(u64, 1) << 3;
 const stimer_sint_shift = 16;
 const reference_tick_ns = 100;
 const message_pending = @as(u8, 1);
+const message_completion_order: std.builtin.AtomicOrder = .seq_cst;
 const max_message_payload = 240;
 const sint_count = 16;
 const event_words_per_sint = 32;
@@ -569,6 +570,27 @@ fn messageSlot(sint: u32) ?*volatile Message {
     return &base[sint];
 }
 
+fn writeSynicEom() void {
+    wrmsr(msr_eom, 0);
+}
+
+fn completeMessageSlot(
+    message_type_ptr: *u32,
+    flags_ptr: *const u8,
+    comptime write_eom: fn () void,
+) void {
+    _ = @atomicRmw(
+        u32,
+        message_type_ptr,
+        .Xchg,
+        0,
+        message_completion_order,
+    );
+    const pending = @atomicLoad(u8, flags_ptr, .acquire) & message_pending;
+    if (pending != 0)
+        write_eom();
+}
+
 export fn hyperv_synic_message_take(
     sint: u32,
     output: *Message,
@@ -589,11 +611,8 @@ export fn hyperv_synic_message_take(
     for (0..@sizeOf(Message)) |i|
         dst[i] = src[i];
 
-    @atomicStore(u32, message_type_ptr, 0, .release);
     const flags_ptr: *const u8 = @ptrCast(@volatileCast(&slot.flags));
-    const pending = @atomicLoad(u8, flags_ptr, .acquire) & message_pending;
-    if (pending != 0)
-        wrmsr(msr_eom, 0);
+    completeMessageSlot(message_type_ptr, flags_ptr, writeSynicEom);
     return @intFromEnum(MessageResult.ready);
 }
 
@@ -717,15 +736,37 @@ test "SynIC and timer constants match TLFS" {
     try std.testing.expectEqual(@as(u64, 1 << 17), sint_auto_eoi);
 }
 
-test "message pending requires EOM only after a cleared occupied slot" {
-    const State = struct {
-        fn needsEom(occupied: bool, pending: bool) bool {
-            return occupied and pending;
+test "SIMP completion clears with a full barrier before conditional EOM" {
+    const Eom = struct {
+        var calls: usize = 0;
+        var message_type: *u32 = undefined;
+        var observed_type: u32 = std.math.maxInt(u32);
+
+        fn write() void {
+            calls += 1;
+            observed_type = @atomicLoad(u32, message_type, .seq_cst);
         }
     };
-    try std.testing.expect(!State.needsEom(false, true));
-    try std.testing.expect(!State.needsEom(true, false));
-    try std.testing.expect(State.needsEom(true, true));
+
+    try std.testing.expectEqual(
+        std.builtin.AtomicOrder.seq_cst,
+        message_completion_order,
+    );
+
+    var message_type: u32 = 1;
+    var flags: u8 = 0;
+    Eom.calls = 0;
+    Eom.message_type = &message_type;
+    completeMessageSlot(&message_type, &flags, Eom.write);
+    try std.testing.expectEqual(@as(u32, 0), message_type);
+    try std.testing.expectEqual(@as(usize, 0), Eom.calls);
+
+    message_type = 2;
+    flags = message_pending;
+    Eom.observed_type = std.math.maxInt(u32);
+    completeMessageSlot(&message_type, &flags, Eom.write);
+    try std.testing.expectEqual(@as(usize, 1), Eom.calls);
+    try std.testing.expectEqual(@as(u32, 0), Eom.observed_type);
 }
 
 test "teardown ordering keeps producers ahead of shared pages" {

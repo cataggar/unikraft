@@ -563,6 +563,25 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     test_step.dependOn(&b.addRunArtifact(platform_correctness_tests).step);
+    const xpic_correctness_tests = b.addExecutable(.{
+        .name = "xpic-runtime-correctness-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    xpic_correctness_tests.root_module.addIncludePath(
+        b.path("support/build/tests/xpic-fixture/include"),
+    );
+    xpic_correctness_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "drivers/ukintctlr/xpic/ukintctlr.c",
+            "support/build/tests/xpic-runtime-correctness-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    test_step.dependOn(&b.addRunArtifact(xpic_correctness_tests).step);
     const lto_policy_tests = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/lto-symbol-policy-test.py",
