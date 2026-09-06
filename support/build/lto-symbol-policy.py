@@ -175,6 +175,12 @@ def parse_nm_output(output, path="<nm>"):
       - Archive member headings: lines ending with ":"
       - Blank/whitespace-only lines
 
+    When the same symbol appears multiple times (common in archives where
+    one member defines a symbol and another references it), a defined
+    occurrence always takes precedence over an undefined one.  Among
+    defined occurrences, strong definitions (uppercase T/D/B/etc.)
+    dominate weak definitions (W/V).
+
     Raises NmParseError on any other non-empty line.
     """
     symbols = {}
@@ -184,12 +190,41 @@ def parse_nm_output(output, path="<nm>"):
             continue
         m = _NM_SYMBOL.match(line)
         if m:
-            symbols[m.group(1)] = m.group(2)
+            name, sym_type = m.group(1), m.group(2)
+            existing = symbols.get(name)
+            if existing is None:
+                symbols[name] = sym_type
+            else:
+                symbols[name] = _dominant_type(existing, sym_type)
             continue
         if _NM_ARCHIVE_HEADING.match(line):
             continue
         raise NmParseError(path, lineno, line)
     return symbols
+
+
+def _is_undefined(sym_type):
+    """True for undefined (U) and weak-undefined (w, v) type chars."""
+    return sym_type in ("U", "w", "v")
+
+
+def _is_weak_defined(sym_type):
+    """True for weak-defined (W, V) type chars."""
+    return sym_type in ("W", "V")
+
+
+def _dominant_type(a, b):
+    """Return the dominant type when a symbol appears with two type chars.
+
+    Precedence: strong-defined > weak-defined > undefined.
+    """
+    for t in (a, b):
+        if not _is_undefined(t) and not _is_weak_defined(t):
+            return t  # strong defined wins
+    for t in (a, b):
+        if not _is_undefined(t):
+            return t  # weak defined wins over undefined
+    return a  # both undefined, keep first
 
 
 def collect_library_symbols(nm_tool, library):
@@ -208,7 +243,7 @@ def collect_library_symbols(nm_tool, library):
             print(str(e), file=sys.stderr)
             sys.exit(2)
         for name, sym_type in all_syms.items():
-            if sym_type in ("U", "w", "v"):
+            if _is_undefined(sym_type):
                 undefined.add(name)
             else:
                 defined.add(name)

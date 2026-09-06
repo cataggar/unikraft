@@ -143,6 +143,47 @@ class TestParseNmOutput(unittest.TestCase):
             policy.parse_nm_output(output, path="/build/lib.o")
         self.assertIn("/build/lib.o", str(cm.exception))
 
+    def test_archive_defined_then_undefined_preserves_definition(self):
+        """Archive member 1 defines bar, member 2 references bar as U.
+        The definition must dominate."""
+        output = (
+            "lib.a(def.o):\n"
+            "bar T\n"
+            "\n"
+            "lib.a(ref.o):\n"
+            "bar U\n"
+        )
+        result = policy.parse_nm_output(output)
+        self.assertEqual(result["bar"], "T")
+
+    def test_archive_undefined_then_defined_preserves_definition(self):
+        """Archive member 1 references bar as U, member 2 defines bar.
+        The definition must dominate regardless of order."""
+        output = (
+            "lib.a(ref.o):\n"
+            "bar U\n"
+            "\n"
+            "lib.a(def.o):\n"
+            "bar T\n"
+        )
+        result = policy.parse_nm_output(output)
+        self.assertEqual(result["bar"], "T")
+
+    def test_strong_defined_dominates_weak_defined(self):
+        output = "sym W\nsym T\n"
+        result = policy.parse_nm_output(output)
+        self.assertEqual(result["sym"], "T")
+
+    def test_weak_defined_dominates_undefined(self):
+        output = "sym U\nsym W\n"
+        result = policy.parse_nm_output(output)
+        self.assertEqual(result["sym"], "W")
+
+    def test_weak_undefined_stays_undefined(self):
+        output = "sym w\n"
+        result = policy.parse_nm_output(output)
+        self.assertEqual(result["sym"], "w")
+
 
 class TestQuoteVersionScriptSymbol(unittest.TestCase):
     def test_plain_identifier(self):
@@ -445,6 +486,57 @@ class TestValidateAndGenerate(unittest.TestCase):
         globals_, errors = policy.validate_and_generate(nm, libs)
         self.assertEqual(errors, [])
         self.assertEqual(globals_, ["a_sym", "m_sym", "z_sym"])
+
+    def test_archive_T_then_U_exported_global_preserved(self):
+        """An archive where member 1 defines 'api' (T) and member 2
+        references 'api' (U).  'api' is exported and must appear in
+        the global set, not be misclassified as undefined."""
+        exports = self._write("e.uk", "api\n")
+        archive = self._write("lib.a", "")
+        nm = self._nm({
+            archive: (
+                "lib.a(impl.o):\n"
+                "api T\nhelper T\n"
+                "\n"
+                "lib.a(user.o):\n"
+                "api U\nfoo T\n"
+            ),
+        })
+        libs = [
+            {"name": "libA", "export_files": [exports], "inputs": [archive]},
+        ]
+        globals_, errors = policy.validate_and_generate(nm, libs)
+        self.assertEqual(errors, [])
+        self.assertIn("api", globals_)
+
+    def test_archive_U_then_T_no_false_cross_library_error(self):
+        """Archive in libB: member 1 references 'helper' (U), member 2
+        defines 'helper' (T).  'helper' is private in libB.  libA must
+        NOT get a false cross-library private-reference error for
+        'helper' since libB defines it internally."""
+        exports_a = self._write("a.uk", "api_a\n")
+        exports_b = self._write("b.uk", "api_b\n")
+        obj_a = self._write("a.o", "")
+        archive_b = self._write("b.a", "")
+        nm = self._nm({
+            obj_a: "api_a T\n",
+            archive_b: (
+                "b.a(ref.o):\n"
+                "helper U\napi_b T\n"
+                "\n"
+                "b.a(def.o):\n"
+                "helper T\n"
+            ),
+        })
+        libs = [
+            {"name": "libA", "export_files": [exports_a], "inputs": [obj_a]},
+            {"name": "libB", "export_files": [exports_b], "inputs": [archive_b]},
+        ]
+        globals_, errors = policy.validate_and_generate(nm, libs)
+        self.assertEqual(errors, [])
+        self.assertIn("api_a", globals_)
+        self.assertIn("api_b", globals_)
+        self.assertNotIn("helper", globals_)
 
 
 class TestMainIntegration(unittest.TestCase):
