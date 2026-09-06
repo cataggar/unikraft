@@ -224,10 +224,12 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
+    const config_input = std.Build.LazyPath{ .cwd_relative = context.config };
     const metadata_path = std.fs.path.join(
         b.allocator,
         &.{ context.output, "native-config", "metadata.tsv" },
     ) catch @panic("out of memory");
+    const metadata_input = std.Build.LazyPath{ .cwd_relative = metadata_path };
     const export_config_metadata = b.addSystemCommand(&.{
         "python3",
         "support/build/native-config-metadata.py",
@@ -238,10 +240,9 @@ pub fn build(b: *std.Build) void {
         "--output",
         context.output,
         "--config",
-        context.config,
-        "--metadata",
-        metadata_path,
     });
+    export_config_metadata.addFileArg(config_input);
+    export_config_metadata.addArgs(&.{ "--metadata", metadata_path });
     export_config_metadata.setCwd(.{ .cwd_relative = root });
     export_config_metadata.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     if (image_name_option) |image_name| {
@@ -257,7 +258,9 @@ pub fn build(b: *std.Build) void {
         export_config_metadata.addArgs(&.{ "--exclude", path });
     }
     const inspect_config = b.addRunArtifact(native_config_tool);
-    inspect_config.addArgs(&.{ "inspect", context.config, metadata_path });
+    inspect_config.addArg("inspect");
+    inspect_config.addFileArg(config_input);
+    inspect_config.addFileArg(metadata_input);
     inspect_config.setCwd(.{ .cwd_relative = root });
     inspect_config.step.dependOn(&export_config_metadata.step);
     const inspect_config_step = b.step(
@@ -267,7 +270,9 @@ pub fn build(b: *std.Build) void {
     inspect_config_step.dependOn(&inspect_config.step);
 
     const validate_config = b.addRunArtifact(native_config_tool);
-    validate_config.addArgs(&.{ "validate", context.config, metadata_path });
+    validate_config.addArg("validate");
+    validate_config.addFileArg(config_input);
+    validate_config.addFileArg(metadata_input);
     validate_config.setCwd(.{ .cwd_relative = root });
     validate_config.step.dependOn(&export_config_metadata.step);
     const validate_config_step = b.step(
@@ -278,7 +283,10 @@ pub fn build(b: *std.Build) void {
 
     const header_path = context.headerPath() catch @panic("out of memory");
     const generate_config_header = b.addRunArtifact(native_config_tool);
-    generate_config_header.addArgs(&.{ "header", context.config, metadata_path, header_path });
+    generate_config_header.addArg("header");
+    generate_config_header.addFileArg(config_input);
+    generate_config_header.addFileArg(metadata_input);
+    generate_config_header.addArg(header_path);
     generate_config_header.setCwd(.{ .cwd_relative = root });
     generate_config_header.step.dependOn(&export_config_metadata.step);
     const generate_config_header_step = b.step(
@@ -288,12 +296,23 @@ pub fn build(b: *std.Build) void {
     generate_config_header_step.dependOn(&generate_config_header.step);
 
     const generate_target_config_header = b.addRunArtifact(native_config_tool);
-    generate_target_config_header.addArgs(&.{ "header", context.config, metadata_path });
+    generate_target_config_header.addArg("header");
+    generate_target_config_header.addFileArg(config_input);
+    generate_target_config_header.addFileArg(metadata_input);
     const target_config_header = generate_target_config_header.addOutputFileArg(
         "include/uk/bits/config.h",
     );
     generate_target_config_header.setCwd(.{ .cwd_relative = root });
     generate_target_config_header.step.dependOn(&validate_config.step);
+    const install_target_config_header = b.addInstallFile(
+        target_config_header,
+        "target-config-header.h",
+    );
+    const target_config_header_step = b.step(
+        "target-config-header",
+        "Generate and install the content-tracked header used by target Zig objects",
+    );
+    target_config_header_step.dependOn(&install_target_config_header.step);
 
     const native_images_step = registerNativePipeline(
         b,
@@ -478,6 +497,23 @@ pub fn build(b: *std.Build) void {
         root,
         b.cache_root.path orelse ".zig-cache",
     );
+    const target_config_cache_work = std.fs.path.join(
+        b.allocator,
+        &.{ integration_output, "target-config-cache" },
+    ) catch @panic("out of memory");
+    const target_config_cache_test = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/target-config-cache-test.py",
+        "--base",
+        root,
+        "--work-dir",
+        target_config_cache_work,
+        "--zig",
+        b.graph.zig_exe,
+    });
+    target_config_cache_test.setCwd(.{ .cwd_relative = root });
+    target_config_cache_test.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    test_step.dependOn(&target_config_cache_test.step);
     const native_postprocess_integration = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/native-postprocess-test.py",
@@ -987,6 +1023,7 @@ fn finishNativeImages(
         },
         .{
             .runner = b.path("support/build/native-postprocess-runner.py"),
+            .uk_reloc = b.path("support/scripts/mkukreloc.py"),
             .bootinfo = b.path("support/scripts/mkbootinfo.py"),
             .multiboot = b.path("support/scripts/multiboot.py"),
             .efi = b.path("support/scripts/mkefi.py"),
@@ -1002,12 +1039,20 @@ fn finishNativeImages(
         return step;
     };
 
-    addPublishedOutput(
-        b,
-        step,
-        link_output,
-        finalStageOutput(registered.graph, stage_name).?,
-    );
+    const linked_logical_path = finalStageOutput(
+        registered.graph,
+        stage_name,
+    ).?;
+    var linked_output_superseded = false;
+    for (post.outputs) |output| {
+        if (std.mem.eql(u8, output.logical_path, linked_logical_path)) {
+            linked_output_superseded = true;
+            break;
+        }
+    }
+    if (!linked_output_superseded) {
+        addPublishedOutput(b, step, link_output, linked_logical_path);
+    }
     for (post.outputs, 0..) |output, index| {
         var superseded = false;
         for (post.outputs[index + 1 ..]) |later| {

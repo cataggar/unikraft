@@ -372,8 +372,12 @@ zig build native-images \
 Target Zig modules receive generated Kconfig headers through tracked build
 dependencies and can opt into narrow Unikraft include roots for `@cImport`.
 The resulting objects feed the normal library partial-link and final-link
-pipelines as `LazyPath` inputs. This compiler support remains experimental and
-does not support LTO.
+pipelines as `LazyPath` inputs. The EFI pipeline runs the repository's
+`mkukreloc.py` helper against the unstripped PIE image, updates `.uk_reloc`,
+and only then strips and converts the image to PE/COFF. Configuration and
+metadata inputs for target headers are content-tracked, so changing a solved
+configuration in place invalidates the generated header. This compiler support
+remains experimental and does not support LTO.
 
 The standalone Clang/LLVM 21.1.8 QEMU/ARM64 build uses the GNU Make backend
 directly:

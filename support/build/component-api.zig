@@ -615,6 +615,7 @@ pub const LibraryObjectPipeline = struct {
 };
 
 pub const PostProcessKind = union(enum) {
+    uk_reloc,
     strip,
     objcopy_binary,
     symbols,
@@ -2312,6 +2313,7 @@ fn copyPostProcessKind(
     kind: PostProcessKind,
 ) !PostProcessKind {
     return switch (kind) {
+        .uk_reloc => .uk_reloc,
         .strip => .strip,
         .objcopy_binary => .objcopy_binary,
         .symbols => .symbols,

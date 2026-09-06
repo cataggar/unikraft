@@ -29,6 +29,15 @@ def main():
     strip.add_argument("input")
     strip.add_argument("output")
 
+    uk_reloc = subparsers.add_parser("uk-reloc")
+    uk_reloc.add_argument("--script", required=True)
+    uk_reloc.add_argument("--nm", required=True)
+    uk_reloc.add_argument("--readelf", required=True)
+    uk_reloc.add_argument("--objcopy", required=True)
+    uk_reloc.add_argument("input")
+    uk_reloc.add_argument("relocations")
+    uk_reloc.add_argument("output")
+
     bootinfo = subparsers.add_parser("bootinfo")
     bootinfo.add_argument("--script", required=True)
     bootinfo.add_argument("--objdump", required=True)
@@ -72,7 +81,29 @@ def main():
 
     args = parser.parse_args()
 
-    if args.action == "strip":
+    if args.action == "uk-reloc":
+        shutil.copyfile(args.input, args.output)
+        env = os.environ.copy()
+        env["NM"] = args.nm
+        env["READELF"] = args.readelf
+        run(
+            [
+                *command(os.environ.get("PYTHON", "python3")),
+                args.script,
+                "--output",
+                args.relocations,
+                args.output,
+            ],
+            env=env,
+        )
+        run(
+            [
+                *command(args.objcopy),
+                f"--update-section=.uk_reloc={args.relocations}",
+                args.output,
+            ]
+        )
+    elif args.action == "strip":
         remove = [item for section in args.remove_section for item in ("-R", section)]
         run([*command(args.tool), "-s", *remove, args.input, "-o", args.output])
     elif args.action == "bootinfo":

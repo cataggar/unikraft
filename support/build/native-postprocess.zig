@@ -41,6 +41,7 @@ pub const ToolKind = enum {
 };
 
 pub const Helper = enum {
+    uk_reloc,
     bootinfo,
     multiboot,
     efi,
@@ -58,6 +59,7 @@ pub const Argument = union(enum) {
 };
 
 pub const OperationKind = enum {
+    uk_reloc,
     strip,
     bootinfo,
     multiboot,
@@ -257,6 +259,7 @@ pub fn planPlatform(
 
 fn operationKind(kind: api.PostProcessKind) ?OperationKind {
     return switch (kind) {
+        .uk_reloc => .uk_reloc,
         .strip => .strip,
         .bootinfo => .bootinfo,
         .multiboot => .multiboot,
@@ -295,6 +298,8 @@ fn validateShape(
     }
 
     const valid = switch (kind) {
+        .uk_reloc => input_count == 1 and creates == 1 and
+            mutations == 1 and primary_mutations == 1,
         .strip => input_count == 1 and creates == 1 and mutations == 0,
         .bootinfo => input_count == 1 and creates == 1 and
             mutations == 1 and primary_mutations == 1,
@@ -320,6 +325,26 @@ fn makeArguments(
 ) Error![]const Argument {
     var args = std.array_list.Managed(Argument).init(allocator);
     switch (kind) {
+        .uk_reloc => {
+            const created = findOutput(outputs, artifacts, false) orelse
+                return error.MalformedTransformation;
+            const mutated = findOutput(outputs, artifacts, true) orelse
+                return error.MalformedTransformation;
+            try appendArgs(&args, &.{
+                .{ .literal = "uk-reloc" },
+                .{ .literal = "--script" },
+                .{ .helper = .uk_reloc },
+                .{ .literal = "--nm" },
+                .{ .tool = .nm },
+                .{ .literal = "--readelf" },
+                .{ .tool = .readelf },
+                .{ .literal = "--objcopy" },
+                .{ .tool = .objcopy },
+                .{ .input = inputs[0] },
+                .{ .output = created },
+                .{ .output = mutated },
+            });
+        },
         .strip => {
             try appendArgs(&args, &.{
                 .{ .literal = "strip" },
@@ -503,6 +528,7 @@ pub const ToolCommands = struct {
 
 pub const ExecutorPaths = struct {
     runner: std.Build.LazyPath,
+    uk_reloc: std.Build.LazyPath,
     bootinfo: std.Build.LazyPath,
     multiboot: std.Build.LazyPath,
     efi: std.Build.LazyPath,
@@ -545,7 +571,8 @@ pub fn execute(
             tools.python_command orelse tools.python_executable,
         );
         run.addFileArg(paths.runner);
-        if (operation.kind == .bootinfo or operation.kind == .efi or
+        if (operation.kind == .uk_reloc or operation.kind == .bootinfo or
+            operation.kind == .efi or
             operation.kind == .linux_header)
         {
             run.addFileInput(paths.elf_tools);
@@ -567,6 +594,7 @@ pub fn execute(
                 },
                 .tool => |tool| run.addArg(try toolCommand(tools, tool)),
                 .helper => |helper| run.addFileArg(switch (helper) {
+                    .uk_reloc => paths.uk_reloc,
                     .bootinfo => paths.bootinfo,
                     .multiboot => paths.multiboot,
                     .efi => paths.efi,
@@ -769,7 +797,7 @@ test "arm64 plan orders binary conversion before Linux header and ELF dependency
     try std.testing.expect(args[7] == .output);
 }
 
-test "EFI plan strips PIE metadata before mutating the image with its debug input" {
+test "EFI plan populates relocation data before strip and EFI conversion" {
     const stage = api.ArtifactReference{ .stage_output = .{
         .platform = "hyperv",
         .stage = "final-link",
@@ -779,9 +807,29 @@ test "EFI plan strips PIE metadata before mutating the image with its debug inpu
         .origin = .{ .internal = .platform },
         .post_process = &.{
             .{
+                .name = "uk-reloc",
+                .kind = .uk_reloc,
+                .input = stage,
+                .effects = &.{
+                    .{ .create = .{
+                        .name = "relocations",
+                        .path = "/out/hyperv.efi.dbg.uk_reloc.bin",
+                        .role = .side,
+                    } },
+                    .{ .mutate_input = .{
+                        .name = "debug",
+                        .role = .debug,
+                    } },
+                },
+            },
+            .{
                 .name = "strip",
                 .kind = .strip,
-                .input = stage,
+                .input = .{ .post_process_output = .{
+                    .platform = "hyperv",
+                    .transformation = "uk-reloc",
+                    .output = "debug",
+                } },
                 .flags = &.{ ".dynamic", ".dynsym", ".dynstr", ".rela.dyn" },
                 .effects = &.{.{ .create = .{
                     .name = "image",
@@ -797,7 +845,11 @@ test "EFI plan strips PIE metadata before mutating the image with its debug inpu
                     .transformation = "strip",
                     .output = "image",
                 } },
-                .additional_inputs = &.{stage},
+                .additional_inputs = &.{.{ .post_process_output = .{
+                    .platform = "hyperv",
+                    .transformation = "uk-reloc",
+                    .output = "debug",
+                } }},
                 .effects = &.{.{ .mutate_input = .{
                     .name = "image",
                     .role = .image,
@@ -812,13 +864,18 @@ test "EFI plan strips PIE metadata before mutating the image with its debug inpu
     }}, .{ .architecture = .x86_64 });
     defer plan.deinit();
 
-    try std.testing.expectEqual(OperationKind.efi, plan.operations[1].kind);
-    try std.testing.expectEqual(plan.operations[0].outputs[0], plan.operations[1].inputs[0]);
-    try std.testing.expectEqual(@as(usize, 0), plan.operations[1].inputs[1]);
-    try std.testing.expectEqualStrings("--remove-section", plan.operations[0].arguments[3].literal);
-    try std.testing.expectEqualStrings(".dynamic", plan.operations[0].arguments[4].literal);
-    try std.testing.expect(plan.operations[1].arguments[2] == .helper);
-    try std.testing.expectEqual(Helper.efi, plan.operations[1].arguments[2].helper);
+    try std.testing.expectEqual(OperationKind.uk_reloc, plan.operations[0].kind);
+    try std.testing.expectEqual(OperationKind.strip, plan.operations[1].kind);
+    try std.testing.expectEqual(OperationKind.efi, plan.operations[2].kind);
+    try std.testing.expectEqual(plan.operations[0].outputs[1], plan.operations[1].inputs[0]);
+    try std.testing.expectEqual(plan.operations[1].outputs[0], plan.operations[2].inputs[0]);
+    try std.testing.expectEqual(plan.operations[0].outputs[1], plan.operations[2].inputs[1]);
+    try std.testing.expectEqualStrings("--remove-section", plan.operations[1].arguments[3].literal);
+    try std.testing.expectEqualStrings(".dynamic", plan.operations[1].arguments[4].literal);
+    try std.testing.expect(plan.operations[0].arguments[2] == .helper);
+    try std.testing.expectEqual(Helper.uk_reloc, plan.operations[0].arguments[2].helper);
+    try std.testing.expect(plan.operations[2].arguments[2] == .helper);
+    try std.testing.expectEqual(Helper.efi, plan.operations[2].arguments[2].helper);
 }
 
 test "planner rejects missing references, collisions, and unsupported active kinds" {
@@ -942,8 +999,16 @@ test "production native profiles plan through compile database generation" {
         );
         defer plan.deinit();
 
-        const expected_operations: usize = if (profile == .@"qemu-arm64") 5 else 4;
+        const expected_operations: usize = if (profile == .@"qemu-x86_64") 4 else 5;
         try std.testing.expectEqual(expected_operations, plan.operations.len);
+        if (profile == .@"hyperv-x86_64-efi") {
+            try std.testing.expectEqual(OperationKind.uk_reloc, plan.operations[0].kind);
+            try std.testing.expectEqual(OperationKind.strip, plan.operations[1].kind);
+            try std.testing.expectEqual(
+                plan.operations[0].outputs[1],
+                plan.operations[1].inputs[0],
+            );
+        }
         const compile_database = plan.operations[plan.operations.len - 1];
         try std.testing.expectEqual(OperationKind.compile_database, compile_database.kind);
         try std.testing.expectEqual(
