@@ -45,6 +45,7 @@ def main():
         fake_objdump = root / "objdump tool.py"
         fake_objcopy = root / "objcopy tool.py"
         fake_nm = root / "nm tool.py"
+        fake_reloc = root / "mkukreloc.py"
         write_executable(
             fake_strip,
             """#!/usr/bin/env python3
@@ -69,8 +70,23 @@ else:
 import pathlib, shutil, sys
 if "-O" in sys.argv:
     shutil.copyfile(sys.argv[-2], sys.argv[-1])
+elif sys.argv[1].startswith("--update-section=.uk_reloc="):
+    target = pathlib.Path(sys.argv[-1])
+    reloc = pathlib.Path(sys.argv[1].removeprefix("--update-section=.uk_reloc=")).read_bytes()
+    target.write_bytes(target.read_bytes() + reloc)
 else:
     shutil.copyfile(sys.argv[1], sys.argv[-1])
+""",
+        )
+        write_executable(
+            fake_reloc,
+            """#!/usr/bin/env python3
+import argparse, pathlib
+parser = argparse.ArgumentParser()
+parser.add_argument("--output", required=True)
+parser.add_argument("elf")
+args = parser.parse_args()
+pathlib.Path(args.output).write_bytes((0x0BADB0B0).to_bytes(4, "little") + bytes(24))
 """,
         )
         write_executable(
@@ -103,6 +119,27 @@ print(" LOAD 0x001000 0x0000000040201000 0x0000000040201000 0x1000 0x2000 RW  0x
         x86_bootinfo = root / "x86 with boot info.elf"
         x86_final = root / "x86 multiboot image.elf"
         x86_debug.write_bytes(elf64(62))
+        x86_relocations = root / "x86 relocations.bin"
+        x86_relocated = root / "x86 relocated.elf"
+        invoke(
+            runner,
+            "uk-reloc",
+            "--script",
+            fake_reloc,
+            "--nm",
+            nm_cmd,
+            "--readelf",
+            readelf_cmd,
+            "--objcopy",
+            objcopy_cmd,
+            x86_debug,
+            x86_relocations,
+            x86_relocated,
+        )
+        assert x86_relocations.read_bytes()[:4] == (0x0BADB0B0).to_bytes(
+            4, "little"
+        )
+        assert x86_relocated.read_bytes().endswith(x86_relocations.read_bytes())
         invoke(runner, "strip", "--tool", strip_cmd, x86_debug, x86_image)
         invoke(
             runner,

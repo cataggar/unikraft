@@ -40,8 +40,9 @@ export at graph construction time. Each profile records:
 - the ordered default and supplemental linker scripts, followed by an
   explicit merged-script stage;
 - the complete final-link sequence, including archive group boundaries; and
-- the architecture-specific strip, bootinfo, Multiboot/EFI/Linux Image, and
-  compile-database declarations.
+- the architecture-specific relocation, strip, bootinfo,
+  Multiboot/EFI/Linux Image, and compile-database declarations. PIE profiles
+  model `mkukreloc.py` as an ordered mutation before any section stripping.
 
 Production `build.zig` constructs and validates one of these graphs with:
 

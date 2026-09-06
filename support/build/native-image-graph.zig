@@ -385,7 +385,7 @@ fn registerPlatform(
     sequence_index += 1;
     if (options.profile == .@"hyperv-x86_64-efi") {
         for ([_][]const u8{
-            "-static-pie",
+            "-pie",
             "-z",
             "notext",
             "-z",
@@ -469,6 +469,8 @@ fn postProcess(
     };
     const image = try joinPath(allocator, output_root, image_relative);
     const bootinfo = try std.fmt.allocPrint(allocator, "{s}.bootinfo", .{image});
+    const debug_image = try std.fmt.allocPrint(allocator, "{s}.dbg", .{image});
+    const relocations = try std.fmt.allocPrint(allocator, "{s}.uk_reloc.bin", .{debug_image});
     const compile_database = try joinPath(allocator, output_root, "compile_commands.json");
     const protocol_name = switch (profile) {
         .@"qemu-x86_64" => "multiboot",
@@ -477,17 +479,46 @@ fn postProcess(
     };
     const transformations = try allocator.alloc(
         component.PostProcessTransformation,
-        if (profile == .@"qemu-arm64") 5 else 4,
+        if (profile == .@"qemu-x86_64") 4 else 5,
     );
-    transformations[0] = .{
+    const strip_index: usize = if (profile == .@"hyperv-x86_64-efi") 1 else 0;
+    if (profile == .@"hyperv-x86_64-efi") {
+        transformations[0] = .{
+            .name = "uk-reloc",
+            .kind = .uk_reloc,
+            .input = .{ .stage_output = .{
+                .platform = platformName(profile),
+                .stage = "final-link",
+            } },
+            .effects = try copyEffects(allocator, &.{
+                .{ .create = .{
+                    .name = "relocations",
+                    .path = relocations,
+                    .role = .side,
+                } },
+                .{ .mutate_input = .{
+                    .name = "debug",
+                    .role = .debug,
+                } },
+            }),
+        };
+    }
+    transformations[strip_index] = .{
         .name = "strip",
         .kind = .strip,
-        .input = .{ .stage_output = .{
-            .platform = platformName(profile),
-            .stage = "final-link",
-        } },
+        .input = if (profile == .@"hyperv-x86_64-efi")
+            .{ .post_process_output = .{
+                .platform = platformName(profile),
+                .transformation = "uk-reloc",
+                .output = "debug",
+            } }
+        else
+            .{ .stage_output = .{
+                .platform = platformName(profile),
+                .stage = "final-link",
+            } },
         .flags = if (profile == .@"hyperv-x86_64-efi")
-            &.{ ".dynamic", ".dynsym", ".dynstr", ".rela.dyn" }
+            &.{ ".dynamic", ".gnu.hash", ".hash", ".dynsym", ".dynstr", ".rela.dyn" }
         else
             &.{},
         .effects = try copyEffects(allocator, &.{.{ .create = .{
@@ -496,7 +527,8 @@ fn postProcess(
             .role = .image,
         } }}),
     };
-    transformations[1] = .{
+    const bootinfo_index = strip_index + 1;
+    transformations[bootinfo_index] = .{
         .name = "bootinfo",
         .kind = .bootinfo,
         .input = .{ .post_process_output = .{
@@ -509,8 +541,9 @@ fn postProcess(
             .{ .mutate_input = .{ .name = "image", .role = .image } },
         }),
     };
+    const protocol_index = bootinfo_index + 1;
     if (profile == .@"qemu-x86_64") {
-        transformations[2] = .{
+        transformations[protocol_index] = .{
             .name = "multiboot",
             .kind = .multiboot,
             .input = .{ .post_process_output = .{
@@ -523,7 +556,7 @@ fn postProcess(
             }}),
         };
     } else if (profile == .@"qemu-arm64") {
-        transformations[2] = .{
+        transformations[protocol_index] = .{
             .name = "linux-binary",
             .kind = .objcopy_binary,
             .input = .{ .post_process_output = .{
@@ -535,7 +568,7 @@ fn postProcess(
                 .mutate_input = .{ .name = "image", .role = .image },
             }}),
         };
-        transformations[3] = .{
+        transformations[protocol_index + 1] = .{
             .name = "linux-header",
             .kind = .linux_header,
             .input = .{ .post_process_output = .{
@@ -552,7 +585,7 @@ fn postProcess(
             }}),
         };
     } else {
-        transformations[2] = .{
+        transformations[protocol_index] = .{
             .name = "efi",
             .kind = .efi,
             .input = .{ .post_process_output = .{
@@ -560,16 +593,19 @@ fn postProcess(
                 .transformation = "bootinfo",
                 .output = "image",
             } },
-            .additional_inputs = try copyArtifactReferences(allocator, &.{.{ .stage_output = .{
-                .platform = platformName(profile),
-                .stage = "final-link",
-            } }}),
+            .additional_inputs = try copyArtifactReferences(allocator, &.{.{
+                .post_process_output = .{
+                    .platform = platformName(profile),
+                    .transformation = "uk-reloc",
+                    .output = "debug",
+                },
+            }}),
             .effects = try copyEffects(allocator, &.{.{
                 .mutate_input = .{ .name = "image", .role = .image },
             }}),
         };
     }
-    const compile_index: usize = if (profile == .@"qemu-arm64") 4 else 3;
+    const compile_index = transformations.len - 1;
     transformations[compile_index] = .{
         .name = "compile-db",
         .kind = .compile_database,
@@ -807,12 +843,12 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
 
     const final_stage = registered.graph.selectedPlatform().link_stages[1];
     var saw_entry = false;
-    var saw_static_pie = false;
+    var saw_pie = false;
     var saw_zig_library = false;
     for (final_stage.sequence) |item| switch (item) {
         .literal_flag => |flag| {
             saw_entry = saw_entry or std.mem.eql(u8, flag, "-Wl,--entry=uk_efi_entry64");
-            saw_static_pie = saw_static_pie or std.mem.eql(u8, flag, "-static-pie");
+            saw_pie = saw_pie or std.mem.eql(u8, flag, "-pie");
         },
         .artifact => |artifact| {
             if (artifact.artifact == .library_final_object) {
@@ -826,8 +862,25 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
         else => {},
     };
     try std.testing.expect(saw_entry);
-    try std.testing.expect(saw_static_pie);
+    try std.testing.expect(saw_pie);
     try std.testing.expect(saw_zig_library);
+
+    const post = registered.graph.selectedPlatform().post_process;
+    try std.testing.expectEqual(@as(usize, 5), post.len);
+    try std.testing.expect(post[0].kind == .uk_reloc);
+    try std.testing.expectEqualStrings("uk-reloc", post[0].name);
+    try std.testing.expect(post[1].kind == .strip);
+    try std.testing.expect(post[1].input == .post_process_output);
+    try std.testing.expectEqualStrings(
+        "uk-reloc",
+        post[1].input.post_process_output.transformation,
+    );
+    try std.testing.expect(post[3].kind == .efi);
+    try std.testing.expect(post[3].additional_inputs[0] == .post_process_output);
+    try std.testing.expectEqualStrings(
+        "uk-reloc",
+        post[3].additional_inputs[0].post_process_output.transformation,
+    );
 }
 
 test "registered profiles match normalized Make graph fixtures" {

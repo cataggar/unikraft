@@ -368,6 +368,10 @@ def main():
     parser.add_argument(
         "-b", "--big", action="store_true", help="use big endianness"
     )
+    parser.add_argument(
+        "--output",
+        help="relocation blob output (defaults to ELF + '.uk_reloc.bin')",
+    )
     opt = parser.parse_args()
 
     if opt.big:
@@ -447,7 +451,7 @@ def main():
         )
 
     # Write the binary blob with `struct uk_reloc` entries
-    with open(opt.elf + ".uk_reloc.bin", "wb") as ur_bin:
+    with open(opt.output or opt.elf + ".uk_reloc.bin", "wb") as ur_bin:
         ur_bin.write(UKRELOC_SIGNATURE.to_bytes(4, endianness))  # signature
 
         def write_uk_reloc_to_ur_bin(ur):
