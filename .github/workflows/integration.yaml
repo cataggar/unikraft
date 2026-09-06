@@ -426,6 +426,214 @@ jobs:
         test "${status[0]}" -eq 0
         grep --fixed-strings --quiet 'Hello world!' "${output}"
 
+    - name: Build helloworld with Zig LTO
+      run: |
+        set -euo pipefail
+        test "$(zig version)" = "${ZIG_VERSION}"
+        build="${RUNNER_TEMP}/build-zig-lto"
+        config="${RUNNER_TEMP}/qemu-x86_64-lto.config"
+        log="${RUNNER_TEMP}/zig-build-lto.log"
+        export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-global-cache"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-local-cache-x86_64-lto"
+        rm -rf "${build}"
+        cp "${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-x86_64" "${config}"
+        printf '\nCONFIG_OPTIMIZE_LTO=y\n' >> "${config}"
+        zig_args=(
+          "-Dapp=${GITHUB_WORKSPACE}/_helloworld"
+          "-Doutput=${build}"
+          "-Dconfig=${config}"
+          "-Dcompiler=zig cc -target x86_64-freestanding-none"
+          "-Dcompiler-targeted=true"
+          "-Dhost-cc=zig cc"
+          "-Dhost-cxx=zig c++"
+          # Kconfig's kernel-style list sentinel is intentionally null-derived.
+          "-Dhost-cflags=-fno-sanitize=null"
+          "-Dmake-arg=AR=zig ar"
+          "-Dmake-arg=NM=llvm-nm"
+          "-Dmake-arg=OBJCOPY=llvm-objcopy"
+          "-Dmake-arg=OBJDUMP=llvm-objdump"
+          "-Dmake-arg=READELF=llvm-readelf"
+          "-Dmake-arg=STRIP=llvm-strip"
+          "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+          "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+        )
+        zig build olddefconfig "${zig_args[@]}"
+        set +e
+        zig build native-images \
+          -Dnative-qemu-graph=qemu-x86_64 \
+          "${zig_args[@]}" 2>&1 | tee "${log}"
+        build_status=("${PIPESTATUS[@]}")
+        set -e
+
+        mapfile -d '' command_files < <(
+          find "${build}" -type f -name '*.cmd' \
+            ! -path "${build}/kconfig/*" \
+            ! -path "${build}/include/config/*" \
+            -size +0c -print0
+        )
+        if [ "${#command_files[@]}" -eq 0 ]; then
+          echo "The LTO target build generated no command files to audit." >&2
+          exit 1
+        fi
+
+        # A command may begin a file or follow a shell separator. Requiring
+        # that boundary avoids treating GCC-like source path components as
+        # executables. Check environment tool selections separately because
+        # the selected command is executed later by a Python image script.
+        gcc_command="(^|[;&|])[[:space:]]*(env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)[[:space:]]+)*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)"
+        gcc_assignment="(^|[;&|])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=['\"]?(env[[:space:]]+([^[:space:]=]+=[^[:space:]]+[[:space:]]+)*)?((ccache|command)[[:space:]]+)?([^[:space:]\"';|&]*/)?([^/[:space:]\"';|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:]\"';|&]|$)"
+        gcc_found=0
+        for command_file in "${command_files[@]}"; do
+          if grep --with-filename --line-number --extended-regexp \
+            "${gcc_command}|${gcc_assignment}" "${command_file}"; then
+            gcc_found=1
+          fi
+        done
+        if [ "${gcc_found}" -ne 0 ]; then
+          echo "The LTO target build invoked a GCC command." >&2
+          exit 1
+        fi
+        if grep --with-filename --line-number --extended-regexp \
+          '(^|[[:space:]])zig[[:space:]]+ld\.lld([[:space:]]|$)' \
+          "${command_files[@]}" "${log}"; then
+          echo "The LTO target build invoked zig ld.lld directly." >&2
+          exit 1
+        fi
+
+        # Assert the final link used -flto.
+        if ! grep --quiet -- '-flto' "${log}"; then
+          echo "The LTO build log does not show -flto; LTO link not confirmed." >&2
+          exit 1
+        fi
+
+        # Assert at least one C-compilation .cmd file shows Zig cc with -flto.
+        lto_zig_cmd_found=0
+        for command_file in "${command_files[@]}"; do
+          if grep --quiet -- '-flto' "${command_file}" \
+              && grep --quiet 'zig' "${command_file}"; then
+            lto_zig_cmd_found=1
+            break
+          fi
+        done
+        if [ "${lto_zig_cmd_found}" -eq 0 ]; then
+          echo "No .cmd file shows Zig cc compilation with -flto." >&2
+          exit 1
+        fi
+
+        # Verify C objects (.c.o) are LLVM IR bitcode.
+        # Assembly objects (.S.o, .s.o) are intentionally excluded from this
+        # check; LTO does not apply to assembled translation units.
+        c_objects_checked=0
+        c_bitcode_failures=0
+        while IFS= read -r -d '' obj; do
+          c_objects_checked=$((c_objects_checked + 1))
+          obj_type="$(file -b "${obj}")"
+          if ! printf '%s' "${obj_type}" | grep --quiet 'LLVM IR bitcode'; then
+            echo "C object is not LLVM IR bitcode (${obj_type}): ${obj}" >&2
+            c_bitcode_failures=$((c_bitcode_failures + 1))
+          fi
+        done < <(find "${build}" -type f -name '*.c.o' -print0)
+        if [ "${c_objects_checked}" -eq 0 ]; then
+          echo "No C object files (.c.o) found in LTO build; cannot verify bitcode." >&2
+          exit 1
+        fi
+        if [ "${c_bitcode_failures}" -ne 0 ]; then
+          echo "${c_bitcode_failures} C object(s) are not LLVM IR bitcode." >&2
+          exit 1
+        fi
+        echo "LTO C bitcode: ${c_objects_checked} object(s) verified."
+
+        test "${build_status[1]}" -eq 0
+        test "${build_status[0]}" -eq 0
+
+    - name: Inspect Zig LTO image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-zig-lto/helloworld_qemu-x86_64.dbg"
+        file "${image}"
+        header="$(llvm-readelf --file-header "${image}")"
+        printf '%s\n' "${header}"
+        grep --quiet 'Class:.*ELF64' <<< "${header}"
+        grep --quiet 'Machine:.*X86-64' <<< "${header}"
+
+        program_headers="$(llvm-readelf --program-headers "${image}")"
+        if grep --quiet INTERP <<< "${program_headers}"; then
+          echo "The Zig LTO image has a program interpreter." >&2
+          exit 1
+        fi
+        dynamic="$(llvm-readelf --wide --dynamic "${image}" 2>/dev/null)"
+        if grep --quiet NEEDED <<< "${dynamic}"; then
+          echo "The Zig LTO image has a dynamic dependency." >&2
+          exit 1
+        fi
+
+        undefined="$(llvm-nm --undefined-only --format=posix "${image}")"
+        if [ -n "${undefined}" ]; then
+          echo "The Zig LTO image has unresolved symbols:" >&2
+          printf '%s\n' "${undefined}" >&2
+          exit 1
+        fi
+        symbols="$(llvm-nm --format=posix "${image}")"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The Zig LTO image has a libgcc symbol reference." >&2
+          exit 1
+        fi
+        if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
+          echo "The Zig LTO image has a libgcc dependency." >&2
+          exit 1
+        fi
+        common="$(llvm-nm --format=posix "${image}" | awk '$2 == "C"')"
+        if [ -n "${common}" ]; then
+          echo "The Zig LTO image has COMMON symbols:" >&2
+          printf '%s\n' "${common}" >&2
+          exit 1
+        fi
+
+    - name: Boot Zig LTO image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-zig-lto/helloworld_qemu-x86_64"
+        output="${RUNNER_TEMP}/zig-lto-qemu.log"
+        set +e
+        timeout 30s qemu-system-x86_64 \
+          -kernel "${image}" \
+          -nographic \
+          -no-reboot \
+          2>&1 | tee "${output}"
+        status=("${PIPESTATUS[@]}")
+        set -e
+        test "${status[1]}" -eq 0
+        test "${status[0]}" -eq 0
+        grep --fixed-strings --quiet 'Hello world!' "${output}"
+
+    - name: Run LTO proof
+      run: |
+        set -euo pipefail
+        python3 "${GITHUB_WORKSPACE}/support/scripts/lto-proof.py" \
+          --work-dir "${RUNNER_TEMP}/lto-proof" \
+          --zig "$(command -v zig)" \
+          --nm "llvm-nm"
+
+    - name: ELF size diff
+      run: |
+        set -euo pipefail
+        baseline="${RUNNER_TEMP}/build-zig/helloworld_qemu-x86_64.dbg"
+        lto="${RUNNER_TEMP}/build-zig-lto/helloworld_qemu-x86_64.dbg"
+        diff_output="$(
+          python3 "${GITHUB_WORKSPACE}/support/scripts/elf-size-diff.py" \
+            --readelf "llvm-readelf" \
+            --nm "llvm-nm" \
+            "${baseline}" \
+            "${lto}"
+        )"
+        printf '%s\n' "${diff_output}"
+        {
+          echo '## Zig LTO ELF size diff (non-LTO vs LTO)'
+          echo '```'
+          printf '%s\n' "${diff_output}"
+          echo '```'
+        } >> "${GITHUB_STEP_SUMMARY}"
+
   zig-helloworld-arm64:
     name: zig-helloworld-arm64
     runs-on: ubuntu-latest
