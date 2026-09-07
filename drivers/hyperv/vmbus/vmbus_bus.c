@@ -18,6 +18,7 @@
 #include "vmbus_queue.h"
 #include "vmbus_release.h"
 #include "vmbus_teardown.h"
+#include "vmbus_worker_stop.h"
 
 #define VMBUS_REFERENCE_TICKS_PER_MS	10000ULL
 #define VMBUS_WORKER_SLEEP_NS		1000000ULL
@@ -779,33 +780,82 @@ static int start_worker(void)
 	return 0;
 }
 
+struct worker_stop_context {
+	unsigned long flags;
+};
+
+static int worker_stop_can_wait(void *arg __unused)
+{
+	return uk_sched_current() && !uk_lcpu_irqs_disabled();
+}
+
+static void worker_stop_lock(void *arg)
+{
+	struct worker_stop_context *context = arg;
+
+	ukplat_spin_lock_irqsave(&worker_lock, context->flags);
+}
+
+static void worker_stop_unlock(void *arg)
+{
+	struct worker_stop_context *context = arg;
+
+	ukplat_spin_unlock_irqrestore(&worker_lock, context->flags);
+}
+
+static int worker_stop_present_locked(void *arg __unused)
+{
+	return worker != NULL;
+}
+
+static int worker_stop_is_self_locked(void *arg __unused)
+{
+	return worker == uk_thread_current();
+}
+
+static void worker_stop_set_locked(void *arg __unused)
+{
+	worker_stop = 1;
+}
+
+static void worker_stop_wake_locked(void *arg __unused)
+{
+	uk_thread_wake(worker);
+}
+
+static int worker_stop_present(void *arg)
+{
+	int present;
+
+	worker_stop_lock(arg);
+	present = worker_stop_present_locked(arg);
+	worker_stop_unlock(arg);
+	return present;
+}
+
+static void worker_stop_wait(void *arg __unused)
+{
+	uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
+}
+
+static const struct vmbus_worker_stop_ops worker_stop_ops = {
+	.can_wait_before_lock = worker_stop_can_wait,
+	.lock = worker_stop_lock,
+	.unlock = worker_stop_unlock,
+	.worker_present_locked = worker_stop_present_locked,
+	.caller_is_worker_locked = worker_stop_is_self_locked,
+	.set_stop_locked = worker_stop_set_locked,
+	.wake_locked = worker_stop_wake_locked,
+	.worker_present = worker_stop_present,
+	.wait_once = worker_stop_wait,
+};
+
 static void stop_worker_locked(void)
 {
-	struct uk_thread *thread;
-	unsigned long flags;
-	unsigned int attempt;
+	struct worker_stop_context context;
 
-	ukplat_spin_lock_irqsave(&worker_lock, flags);
-	thread = __atomic_load_n(&worker, __ATOMIC_ACQUIRE);
-	if (!thread)
-		goto unlock;
-	__atomic_store_n(&worker_stop, 1, __ATOMIC_RELEASE);
-	if (thread == uk_thread_current() || !uk_sched_current() ||
-	    uk_lcpu_irqs_disabled())
-		goto unlock;
-	uk_thread_wake(thread);
-	ukplat_spin_unlock_irqrestore(&worker_lock, flags);
-	for (attempt = 0; attempt < VMBUS_TEARDOWN_WAIT_LIMIT; attempt++) {
-		if (!__atomic_load_n(&worker, __ATOMIC_ACQUIRE))
-			return;
-		uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
-	}
-	return;
-
-unlock:
-	ukplat_spin_unlock_irqrestore(&worker_lock, flags);
-	if (!thread)
-		return;
+	(void)vmbus_worker_stop_run(&worker_stop_ops, &context,
+				    VMBUS_TEARDOWN_WAIT_LIMIT);
 }
 
 static int acquire_control(void)

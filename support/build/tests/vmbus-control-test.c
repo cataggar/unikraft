@@ -6,6 +6,7 @@
 #include "vmbus_queue.h"
 #include "vmbus_release.h"
 #include "vmbus_teardown.h"
+#include "vmbus_worker_stop.h"
 
 enum test_message_type {
 	TEST_OFFER = 1,
@@ -303,6 +304,153 @@ static void test_relid_lifecycles(void)
 	assert(vmbus_relid_release_begin(entries, CAPACITY, 70) == 0);
 }
 
+struct worker_stop_test {
+	unsigned int waits;
+	unsigned int wake_count;
+	unsigned int present_checks;
+	unsigned int clear_after;
+	int schedulable;
+	int irq_disabled;
+	int locked;
+	int worker_present;
+	int self;
+	int stop;
+};
+
+static int stop_can_wait(void *arg)
+{
+	struct worker_stop_test *test = arg;
+
+	assert(!test->locked);
+	return test->schedulable && !test->irq_disabled;
+}
+
+static void stop_lock(void *arg)
+{
+	struct worker_stop_test *test = arg;
+
+	assert(!test->locked);
+	test->locked = 1;
+	/* Models ukplat_spin_lock_irqsave masking IRQs after the snapshot. */
+	test->irq_disabled = 1;
+}
+
+static void stop_unlock(void *arg)
+{
+	struct worker_stop_test *test = arg;
+
+	assert(test->locked);
+	test->locked = 0;
+}
+
+static int stop_present_locked(void *arg)
+{
+	struct worker_stop_test *test = arg;
+
+	assert(test->locked);
+	return test->worker_present;
+}
+
+static int stop_is_self_locked(void *arg)
+{
+	struct worker_stop_test *test = arg;
+
+	assert(test->locked);
+	return test->self;
+}
+
+static void stop_set_locked(void *arg)
+{
+	struct worker_stop_test *test = arg;
+
+	assert(test->locked);
+	test->stop = 1;
+}
+
+static void stop_wake_locked(void *arg)
+{
+	struct worker_stop_test *test = arg;
+
+	assert(test->locked);
+	test->wake_count++;
+}
+
+static int stop_present(void *arg)
+{
+	struct worker_stop_test *test = arg;
+
+	assert(!test->locked);
+	test->present_checks++;
+	return test->worker_present;
+}
+
+static void stop_wait(void *arg)
+{
+	struct worker_stop_test *test = arg;
+
+	assert(!test->locked);
+	test->waits++;
+	if (test->waits == test->clear_after)
+		test->worker_present = 0;
+}
+
+static const struct vmbus_worker_stop_ops worker_stop_test_ops = {
+	.can_wait_before_lock = stop_can_wait,
+	.lock = stop_lock,
+	.unlock = stop_unlock,
+	.worker_present_locked = stop_present_locked,
+	.caller_is_worker_locked = stop_is_self_locked,
+	.set_stop_locked = stop_set_locked,
+	.wake_locked = stop_wake_locked,
+	.worker_present = stop_present,
+	.wait_once = stop_wait,
+};
+
+static void test_worker_stop_policy(void)
+{
+	struct worker_stop_test test = {
+		.schedulable = 1,
+		.worker_present = 1,
+		.clear_after = 2,
+	};
+
+	assert(vmbus_worker_stop_run(&worker_stop_test_ops, &test, 4) ==
+	       VMBUS_WORKER_STOP_JOINED);
+	assert(test.stop && test.wake_count == 1 && test.waits == 2);
+	assert(!test.locked && test.irq_disabled);
+
+	test = (struct worker_stop_test){
+		.schedulable = 1,
+		.irq_disabled = 1,
+		.worker_present = 1,
+	};
+	assert(vmbus_worker_stop_run(&worker_stop_test_ops, &test, 4) ==
+	       VMBUS_WORKER_STOP_UNSCHEDULABLE);
+	assert(test.stop && test.wake_count == 0 && test.waits == 0);
+
+	test = (struct worker_stop_test){ .worker_present = 1 };
+	assert(vmbus_worker_stop_run(&worker_stop_test_ops, &test, 4) ==
+	       VMBUS_WORKER_STOP_UNSCHEDULABLE);
+	assert(test.stop && test.waits == 0);
+
+	test = (struct worker_stop_test){
+		.schedulable = 1,
+		.worker_present = 1,
+		.self = 1,
+	};
+	assert(vmbus_worker_stop_run(&worker_stop_test_ops, &test, 4) ==
+	       VMBUS_WORKER_STOP_SELF);
+	assert(test.stop && test.wake_count == 0 && test.waits == 0);
+
+	test = (struct worker_stop_test){
+		.schedulable = 1,
+		.worker_present = 1,
+	};
+	assert(vmbus_worker_stop_run(&worker_stop_test_ops, &test, 2) ==
+	       VMBUS_WORKER_STOP_TIMED_OUT);
+	assert(test.stop && test.wake_count == 1 && test.waits == 2);
+}
+
 int main(void)
 {
 	overflow_for_type(TEST_OFFER);
@@ -317,5 +465,6 @@ int main(void)
 	test_bounded_teardown();
 	test_context_aware_teardown();
 	test_relid_lifecycles();
+	test_worker_stop_policy();
 	return 0;
 }
