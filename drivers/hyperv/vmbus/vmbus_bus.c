@@ -19,6 +19,7 @@
 #include "vmbus_release.h"
 #include "vmbus_teardown.h"
 #include "vmbus_worker_stop.h"
+#include "vmbus_internal.h"
 
 #define VMBUS_REFERENCE_TICKS_PER_MS	10000ULL
 #define VMBUS_WORKER_SLEEP_NS		1000000ULL
@@ -230,15 +231,15 @@ static void post_backoff(void *arg __unused, __u32 usec)
 	}
 }
 
-static int transmit(const struct vmbus_action *action)
+int vmbus_control_transmit(const __u8 *message, size_t length)
 {
 	int rc;
 
-	if (!action->tx_len || action->tx_len > sizeof(action->tx))
+	if (!length || length > HYPERV_MESSAGE_PAYLOAD_SIZE)
 		return -EINVAL;
-	rc = vmbus_post_message(action->connection_id,
-				VMBUS_HV_MESSAGE_TYPE, action->tx,
-				action->tx_len, post_input_gpa,
+	rc = vmbus_post_message(vmbus_protocol_connection_id(),
+				VMBUS_HV_MESSAGE_TYPE, message,
+				length, post_input_gpa,
 				(__u8)hyperv_has_post_messages(),
 				CONFIG_LIBVMBUS_POST_RETRIES,
 				post_hypercall, post_backoff, NULL);
@@ -247,6 +248,18 @@ static int transmit(const struct vmbus_action *action)
 		return -EIO;
 	}
 	return 0;
+}
+
+static int transmit(const struct vmbus_action *action)
+{
+	if (action->connection_id != vmbus_protocol_connection_id())
+		return vmbus_post_message(action->connection_id,
+				VMBUS_HV_MESSAGE_TYPE, action->tx,
+				action->tx_len, post_input_gpa,
+				(__u8)hyperv_has_post_messages(),
+				CONFIG_LIBVMBUS_POST_RETRIES,
+				post_hypercall, post_backoff, NULL) ? -EIO : 0;
+	return vmbus_control_transmit(action->tx, action->tx_len);
 }
 
 static struct vmbus_driver *find_driver(const struct vmbus_guid *class_id)
@@ -357,6 +370,7 @@ static void copy_offer(struct vmbus_device *dev,
 	dev->dedicated = offer->dedicated;
 	copy_bytes(dev->user_data, offer->user_data, VMBUS_USER_DATA_SIZE);
 	dev->driver = NULL;
+	dev->channel = NULL;
 	dev->present = 1;
 }
 
@@ -423,6 +437,8 @@ static int rescind_offer(__u32 channel_id)
 				     channel_id);
 	if (!lifecycle)
 		return 0;
+	if (vmbus_channel_rescind(channel_id))
+		return -EIO;
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
 		if (devices[i].present &&
 		    devices[i].channel_id == channel_id) {
@@ -497,6 +513,17 @@ static int process_messages(void)
 	if (__atomic_load_n(&rx_state.lost, __ATOMIC_ACQUIRE))
 		return -EOVERFLOW;
 	while (dequeue_message(&entry)) {
+		__u32 type = (__u32)entry.data[0] |
+			((__u32)entry.data[1] << 8) |
+			((__u32)entry.data[2] << 16) |
+			((__u32)entry.data[3] << 24);
+
+		if (type == 6 || type == 10 || type == 12) {
+			rc = vmbus_channel_control_receive(entry.data, entry.len);
+			if (rc)
+				return rc;
+			continue;
+		}
 		vmbus_protocol_receive(entry.data, entry.len, entry.generation,
 				       hyperv_reference_time(), &action);
 		rc = handle_action(&action);
@@ -524,7 +551,7 @@ static void report_deferred_diagnostics(void)
 		uk_pr_warn("VMBus: event queue dropped %u event(s)\n", count);
 	count = 0;
 	while (dequeue_event(&event))
-		count++;
+		vmbus_channel_event(event), count++;
 	if (count)
 		uk_pr_debug("VMBus: deferred %u channel event(s); channel rings "
 			    "are not implemented\n", count);
@@ -632,6 +659,7 @@ static int disconnect_locked(void)
 
 	drain_queues();
 	__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
+	vmbus_channel_close_all();
 	clear_devices();
 	if (state != VMBUS_STATE_IDLE && state != VMBUS_STATE_DISCONNECTED) {
 		vmbus_protocol_unload(hyperv_reference_time(), &action);
@@ -644,6 +672,7 @@ static int disconnect_locked(void)
 	reset_release_records();
 	drain_queues();
 	vmbus_protocol_reset();
+	vmbus_channel_reset_all();
 	return rc;
 }
 
@@ -665,6 +694,7 @@ static int unwind_unload(void *arg __unused)
 
 	drain_queues();
 	__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
+	vmbus_channel_close_all();
 	if (state != VMBUS_STATE_IDLE && state != VMBUS_STATE_DISCONNECTED) {
 		vmbus_protocol_unload(hyperv_reference_time(), &action);
 		rc = handle_action(&action);
@@ -687,6 +717,7 @@ static void unwind_reset(void *arg __unused)
 	__atomic_store_n(&connection_failed, 0, __ATOMIC_RELEASE);
 	vmbus_queue_recover(&rx_state);
 	vmbus_protocol_reset();
+	vmbus_channel_reset_all();
 }
 
 static int probe_unwind_locked(int primary_error)
@@ -867,6 +898,55 @@ static int acquire_control(void)
 					 __ATOMIC_ACQUIRE))
 		return -EBUSY;
 	__atomic_store_n(&control_owner, uk_thread_current(), __ATOMIC_RELEASE);
+	return 0;
+}
+
+int vmbus_control_enter(int *acquired)
+{
+	if (__atomic_load_n(&control_busy, __ATOMIC_ACQUIRE) &&
+	    __atomic_load_n(&control_owner, __ATOMIC_ACQUIRE) ==
+		    uk_thread_current()) {
+		*acquired = 0;
+		return 0;
+	}
+	if (acquire_control())
+		return -EBUSY;
+	*acquired = 1;
+	return 0;
+}
+
+void vmbus_control_exit(int acquired)
+{
+	if (acquired)
+		release_control();
+}
+
+int vmbus_control_pump(void)
+{
+	return process_messages();
+}
+
+int vmbus_control_release_relid(__u32 channel_id)
+{
+	return release_channel(channel_id, 0);
+}
+
+void vmbus_control_fail(void)
+{
+	__atomic_store_n(&connection_failed, 1, __ATOMIC_RELEASE);
+}
+
+int vmbus_control_set_event(__u32 channel_id)
+{
+	__u32 word;
+	__u32 bit;
+	__u32 *send_page = (__u32 *)&interrupt_page[HYPERV_PAGE_SIZE / 2];
+
+	if (channel_id >= (HYPERV_PAGE_SIZE / 2) * 8)
+		return -ERANGE;
+	word = channel_id / 32;
+	bit = channel_id % 32;
+	__atomic_fetch_or(&send_page[word], 1U << bit, __ATOMIC_RELEASE);
 	return 0;
 }
 

@@ -35,4 +35,24 @@ config LIBVMBUS_POST_RETRIES
 	range 0 32
 	default 6
 
+config LIBVMBUS_MAX_TRANSACTIONS
+	int "Maximum concurrent channel transactions"
+	range 2 128
+	default 32
+
+config LIBVMBUS_MAX_GPADLS
+	int "Maximum live GPADLs"
+	range 1 128
+	default 32
+
+config LIBVMBUS_RING_PAGES
+	int "Static VMBus ring-page pool"
+	range 4 1024
+	default 128
+
+config LIBVMBUS_CHANNEL_TIMEOUT_MS
+	int "Channel control timeout (milliseconds)"
+	range 10 10000
+	default 1000
+
 endif

@@ -3,6 +3,8 @@
 #include <errno.h>
 
 #include "vmbus_lifecycle.h"
+#include "vmbus_channel_state.h"
+#include "vmbus_page_pool.h"
 #include "vmbus_queue.h"
 #include "vmbus_release.h"
 #include "vmbus_teardown.h"
@@ -451,6 +453,66 @@ static void test_worker_stop_policy(void)
 	assert(test.stop && test.wake_count == 1 && test.waits == 2);
 }
 
+static void test_channel_transaction_pool(void)
+{
+	struct vmbus_channel_transaction transactions[2] = { 0 };
+	struct vmbus_channel_transaction *first;
+	struct vmbus_channel_transaction *second;
+
+	first = vmbus_transaction_allocate(transactions, 2,
+			VMBUS_TRANSACTION_GPADL_CREATE, 7, 100);
+	second = vmbus_transaction_allocate(transactions, 2,
+			VMBUS_TRANSACTION_OPEN, 7, 200);
+	assert(first && second);
+	assert(!vmbus_transaction_allocate(transactions, 2,
+			VMBUS_TRANSACTION_OPEN, 8, 201));
+	assert(vmbus_transaction_complete(transactions, 2,
+			VMBUS_TRANSACTION_OPEN, 8, 200, 0) == -ENOENT);
+	assert(vmbus_transaction_complete(transactions, 2,
+			VMBUS_TRANSACTION_OPEN, 7, 200, 0) == 0);
+	assert(second->done);
+	assert(vmbus_transaction_complete(transactions, 2,
+			VMBUS_TRANSACTION_OPEN, 7, 200, 0) == -EALREADY);
+	assert(vmbus_transaction_timed_out(11, 10));
+	assert(!vmbus_transaction_timed_out(10, 10));
+	vmbus_transaction_release(first);
+	assert(vmbus_transaction_allocate(transactions, 2,
+			VMBUS_TRANSACTION_GPADL_TEARDOWN, 7, 100));
+	assert(vmbus_transaction_cancel_channel(transactions, 2, 7,
+			(__u32)-ECANCELED) == 2);
+}
+
+static void test_channel_lifecycle_races(void)
+{
+	__u8 state = CHANNEL_ALLOCATED;
+
+	assert(vmbus_channel_state_open_begin(&state) == -EPROTO);
+	assert(vmbus_channel_state_gpadl_created(&state) == 0);
+	assert(vmbus_channel_state_open_begin(&state) == 0);
+	assert(vmbus_channel_state_open_complete(&state, 1) == -EIO);
+	assert(state == CHANNEL_GPADL);
+	assert(vmbus_channel_state_open_begin(&state) == 0);
+	vmbus_channel_state_rescind(&state);
+	assert(vmbus_channel_state_open_complete(&state, 0) == -EPROTO);
+	assert(vmbus_channel_state_close_begin(&state) == -EPROTO);
+}
+
+static void test_ring_page_pool(void)
+{
+	unsigned char used[8] = { 0 };
+	unsigned int first;
+	unsigned int second;
+
+	assert(vmbus_page_pool_allocate(used, 8, 4, &first) == 0);
+	assert(first == 0);
+	assert(vmbus_page_pool_allocate(used, 8, 4, &second) == 0);
+	assert(second == 4);
+	assert(vmbus_page_pool_allocate(used, 8, 1, &second) == -ENOSPC);
+	vmbus_page_pool_free(used, 8, first, 4);
+	assert(vmbus_page_pool_allocate(used, 8, 2, &second) == 0);
+	assert(second == 0);
+}
+
 int main(void)
 {
 	overflow_for_type(TEST_OFFER);
@@ -466,5 +528,8 @@ int main(void)
 	test_context_aware_teardown();
 	test_relid_lifecycles();
 	test_worker_stop_policy();
+	test_channel_transaction_pool();
+	test_channel_lifecycle_races();
+	test_ring_page_pool();
 	return 0;
 }

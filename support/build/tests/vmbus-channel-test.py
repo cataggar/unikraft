@@ -18,27 +18,22 @@ def main() -> None:
     undefined = output(args.nm, "-u", args.object).strip()
     if undefined:
         raise SystemExit(
-            "VMBus protocol object has external/runtime dependencies:\n"
-            + undefined
+            "VMBus channel core has external/runtime dependencies:\n" + undefined
         )
-
     symbols = output(args.nm, "-n", args.object)
     for symbol in (
-        "vmbus_post_input",
-        "vmbus_post_message",
-        "vmbus_protocol_start",
-        "vmbus_protocol_receive",
-        "vmbus_protocol_tick",
-        "vmbus_protocol_unload",
-        "vmbus_protocol_release",
-        "vmbus_protocol_reset",
-        "vmbus_protocol_state",
-        "vmbus_protocol_generation",
-        "vmbus_protocol_version",
-        "vmbus_protocol_connection_id",
+        "vmbus_ring_initialize",
+        "vmbus_ring_write",
+        "vmbus_ring_read",
+        "vmbus_gpadl_header",
+        "vmbus_gpadl_body",
+        "vmbus_open_message",
+        "vmbus_close_message",
+        "vmbus_gpadl_teardown_message",
+        "vmbus_signal_event",
     ):
         if symbol not in symbols:
-            raise SystemExit(f"missing VMBus protocol symbol: {symbol}")
+            raise SystemExit(f"missing VMBus channel symbol: {symbol}")
 
 
 if __name__ == "__main__":

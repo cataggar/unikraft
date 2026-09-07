@@ -193,18 +193,37 @@ fn registerLibraries(
             options.roots.output,
             "libvmbus/vmbus_protocol.o",
         );
+        const channel_source = try joinPath(
+            allocator,
+            options.roots.base,
+            "drivers/hyperv/vmbus/vmbus_channel.zig",
+        );
+        const channel_output = try joinPath(
+            allocator,
+            options.roots.output,
+            "libvmbus/vmbus_channel_core.o",
+        );
         try registerLibrary(
             context,
             allocator,
             options,
             data.x86_64_efi_vmbus,
-            &.{.{
-                .name = "vmbus-protocol",
-                .root_source_file = source,
-                .output = output,
-                .optimize = .ReleaseFast,
-                .pic = true,
-            }},
+            &.{
+                .{
+                    .name = "vmbus-protocol",
+                    .root_source_file = source,
+                    .output = output,
+                    .optimize = .ReleaseFast,
+                    .pic = true,
+                },
+                .{
+                    .name = "vmbus-channel",
+                    .root_source_file = channel_source,
+                    .output = channel_output,
+                    .optimize = .ReleaseFast,
+                    .pic = true,
+                },
+            },
         );
     }
 }
@@ -902,10 +921,14 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
         }
     }
     const vmbus = vmbus_library orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 1), vmbus.target_zig_objects.len);
+    try std.testing.expectEqual(@as(usize, 2), vmbus.target_zig_objects.len);
     try std.testing.expectEqualStrings(
         "/src/unikraft/drivers/hyperv/vmbus/vmbus_protocol.zig",
         vmbus.target_zig_objects[0].root_source_file,
+    );
+    try std.testing.expectEqualStrings(
+        "/src/unikraft/drivers/hyperv/vmbus/vmbus_channel.zig",
+        vmbus.target_zig_objects[1].root_source_file,
     );
 
     const final_stage = registered.graph.selectedPlatform().link_stages[1];

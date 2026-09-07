@@ -696,6 +696,10 @@ export fn vmbus_protocol_version() callconv(.c) u32 {
     return context.selected_version;
 }
 
+export fn vmbus_protocol_connection_id() callconv(.c) u32 {
+    return context.message_connection_id;
+}
+
 fn makeMessage(kind: MessageType, len: usize) [240]u8 {
     var bytes = [_]u8{0} ** 240;
     putU32(bytes[0..], 0, @intFromEnum(kind));
