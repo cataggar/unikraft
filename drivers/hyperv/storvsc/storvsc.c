@@ -116,6 +116,13 @@ static int storvsc_receive_async(struct storvsc_device *device,
 				 int notify_user);
 static void storvsc_timeout_worker(void *arg) __attribute__((noreturn));
 
+#ifdef STORVSC_HOST_TEST
+void storvsc_host_pfn_copy_hook(__u64 transaction_id, const __u64 *pfns,
+				unsigned int written);
+void storvsc_host_recovery_begin_hook(void);
+void storvsc_host_reset_ack_hook(void);
+#endif
+
 static struct vmbus_channel *
 storvsc_channel_get(struct storvsc_device *device)
 {
@@ -130,7 +137,7 @@ static void storvsc_channel_set(struct storvsc_device *device,
 
 static int storvsc_build_gpa_range(
 	struct storvsc_request_binding *binding, const void *buffer,
-	__u32 length, struct vmbus_gpa_range *range)
+	__u32 length, __u64 transaction_id, struct vmbus_gpa_range *range)
 {
 	uintptr_t address = (uintptr_t)buffer;
 	uintptr_t page;
@@ -150,6 +157,9 @@ static int storvsc_build_gpa_range(
 	    page_count > VMBUS_GPA_DIRECT_MAX_PFNS)
 		return -E2BIG;
 	page = address & ~(uintptr_t)(STORVSC_PAGE_SIZE - 1);
+#ifdef STORVSC_HOST_TEST
+	storvsc_host_pfn_copy_hook(transaction_id, binding->pfns, 0);
+#endif
 	for (i = 0; i < page_count; i++) {
 		uintptr_t virtual_address;
 		__paddr_t physical;
@@ -166,6 +176,10 @@ static int storvsc_build_gpa_range(
 		    (physical & (STORVSC_PAGE_SIZE - 1)) != expected_offset)
 			return -EFAULT;
 		binding->pfns[i] = physical >> 12;
+#ifdef STORVSC_HOST_TEST
+		storvsc_host_pfn_copy_hook(transaction_id, binding->pfns,
+					   i + 1);
+#endif
 	}
 	range->byte_count = length;
 	range->byte_offset = offset;
@@ -196,7 +210,7 @@ static int storvsc_send_tx(struct storvsc_device *device,
 	if (!binding)
 		return -EINVAL;
 	rc = storvsc_build_gpa_range(binding, buffer, tx->transfer_len,
-				     &range);
+				     tx->transaction_id, &range);
 	if (rc)
 		return rc;
 	return vmbus_channel_send_gpa_direct_ex(channel,
@@ -501,7 +515,7 @@ static int storvsc_discover(struct storvsc_device *device,
 
 	memset(device->inquiry_data, 0, sizeof(device->inquiry_data));
 	storvsc_scsi_spec_init(&spec, 0x12, 6, STORVSC_DIRECTION_READ,
-			       sizeof(device->inquiry_data), 36, 1);
+			       sizeof(device->inquiry_data), 5, 1);
 	spec.cdb[4] = sizeof(device->inquiry_data);
 	rc = storvsc_execute_scsi(device, &spec, device->inquiry_data,
 				  &transferred);
@@ -565,6 +579,11 @@ static int storvsc_discover(struct storvsc_device *device,
 	if (rc != -EINVAL)
 		return rc;
 
+	/*
+	 * ukblkdev exposes a persistent access mode. Try both standard
+	 * headers, but do not attach as writable if neither can establish
+	 * whether the media is read-only.
+	 */
 	memset(device->mode_data, 0, sizeof(device->mode_data));
 	storvsc_scsi_spec_init(&spec, 0x5a, 10, STORVSC_DIRECTION_READ,
 			       sizeof(device->mode_data), 8, 1);
@@ -646,22 +665,23 @@ static int storvsc_close_channel(struct storvsc_device *device)
 	return rc;
 }
 
-static void storvsc_wait_active_sends(struct storvsc_device *device)
+static int storvsc_wait_active_sends(struct storvsc_device *device)
 {
 	unsigned long flags;
 	unsigned int attempt;
 	__u16 active;
 
-	if (!uk_sched_current() || uk_lcpu_irqs_disabled())
-		return;
 	for (attempt = 0; attempt < STORVSC_SEND_WAIT_LIMIT; attempt++) {
 		ukplat_spin_lock_irqsave(&device->lock, flags);
 		active = device->active_sends;
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		if (!active)
-			return;
+			return 0;
+		if (!uk_sched_current() || uk_lcpu_irqs_disabled())
+			return -EWOULDBLOCK;
 		uk_sched_thread_sleep(STORVSC_WORKER_SLEEP_NS);
 	}
+	return -ETIMEDOUT;
 }
 
 static void storvsc_wait_finish(struct storvsc_device *device)
@@ -688,7 +708,10 @@ static void storvsc_fail_after_quiesce(struct storvsc_device *device,
 	unsigned long flags;
 
 	(void)storvsc_close_channel(device);
-	storvsc_wait_active_sends(device);
+	if (storvsc_wait_active_sends(device)) {
+		uk_pr_err(DRIVER_NAME ": send quiesce timed out\n");
+		return;
+	}
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	device->online = 0;
 	device->recovering = 0;
@@ -715,6 +738,22 @@ static int storvsc_reset_timed_out_io(struct storvsc_device *device)
 	device->recovering = 1;
 	device->reset_done = 0;
 	device->reset_result = -ETIMEDOUT;
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+#ifdef STORVSC_HOST_TEST
+	storvsc_host_recovery_begin_hook();
+#endif
+	/*
+	 * Drain every request accepted before the recovering gate closed.
+	 * This orders all of their descriptor publications before RESET BUS.
+	 */
+	rc = storvsc_wait_active_sends(device);
+	if (rc)
+		return rc;
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	if (!device->online || device->removing) {
+		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+		return -ECANCELED;
+	}
 	rc = storvsc_core_begin_reset(device->core,
 		ukplat_monotonic_clock(), STORVSC_CONTROL_TIMEOUT_NS, &event);
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
@@ -751,6 +790,16 @@ static int storvsc_reset_timed_out_io(struct storvsc_device *device)
 	}
 	if (reset_result)
 		return reset_result;
+#ifdef STORVSC_HOST_TEST
+	storvsc_host_reset_ack_hook();
+#endif
+	/*
+	 * Keep the gate closed through cancellation and defensively verify that
+	 * no local descriptor publication re-entered the recovery window.
+	 */
+	rc = storvsc_wait_active_sends(device);
+	if (rc)
+		return rc;
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	(void)storvsc_core_cancel_all(device->core, -ETIMEDOUT);
 	device->recovering = 0;
@@ -872,6 +921,10 @@ static int storvsc_submit(struct uk_blkdev *blkdev,
 	if (!device->online || device->removing) {
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return -ENODEV;
+	}
+	if (device->recovering) {
+		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+		return -EAGAIN;
 	}
 	if (!queue->configured || !device->started || !queue->nb_desc) {
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
@@ -1370,7 +1423,10 @@ static void storvsc_remove_device(struct vmbus_device *vmbus_device)
 		vmbus_channel_set_callback(storvsc_channel_get(device),
 					   NULL, NULL);
 	storvsc_stop_timeout_worker(device);
-	storvsc_wait_active_sends(device);
+	if (storvsc_wait_active_sends(device)) {
+		uk_pr_err(DRIVER_NAME ": removal send quiesce timed out\n");
+		return;
+	}
 	storvsc_wait_finish(device);
 	storvsc_complete_remove(device);
 	ukplat_spin_lock_irqsave(&device->lock, flags);
@@ -1404,6 +1460,21 @@ struct uk_blkdev *storvsc_host_blkdev(void)
 int storvsc_host_receive(void)
 {
 	return storvsc_receive_async(&storvsc_devices[0], 1);
+}
+
+int storvsc_host_reset_timed_out_io(void)
+{
+	return storvsc_reset_timed_out_io(&storvsc_devices[0]);
+}
+
+int storvsc_host_start_timeout_worker(void)
+{
+	return storvsc_start_timeout_worker(&storvsc_devices[0]);
+}
+
+void storvsc_host_stop_timeout_worker(void)
+{
+	storvsc_stop_timeout_worker(&storvsc_devices[0]);
 }
 
 void storvsc_host_force_timeout(void)
