@@ -4,6 +4,7 @@
 #include <uk/bus.h>
 #include <uk/config.h>
 #include <uk/isr/thread.h>
+#include <uk/lcpu.h>
 #include <uk/paging.h>
 #include <uk/plat/time.h>
 #include <uk/print.h>
@@ -15,10 +16,14 @@
 #include "vmbus_lifecycle.h"
 #include "vmbus_queue.h"
 #include "vmbus_release.h"
+#include "vmbus_teardown.h"
 
 #define VMBUS_REFERENCE_TICKS_PER_MS	10000ULL
 #define VMBUS_WORKER_SLEEP_NS		1000000ULL
 #define VMBUS_EVENT_LIMIT		2048U
+#define VMBUS_TEARDOWN_WAIT_LIMIT	100U
+#define VMBUS_RELID_CAPACITY		(CONFIG_LIBVMBUS_MAX_DEVICES + \
+					 CONFIG_LIBVMBUS_RX_QUEUE)
 
 struct vmbus_rx_entry {
 	__u32 generation;
@@ -44,7 +49,7 @@ static struct vmbus_device devices[CONFIG_LIBVMBUS_MAX_DEVICES];
 static struct vmbus_driver *drivers[CONFIG_LIBVMBUS_MAX_DRIVERS];
 static struct vmbus_rx_entry rx_queue[CONFIG_LIBVMBUS_RX_QUEUE];
 static __u32 event_queue[CONFIG_LIBVMBUS_RX_QUEUE];
-static __u32 released_channels[CONFIG_LIBVMBUS_MAX_DEVICES];
+static struct vmbus_relid_lifecycle relids[VMBUS_RELID_CAPACITY];
 static __u8 interrupt_page[HYPERV_PAGE_SIZE] __align(HYPERV_PAGE_SIZE);
 static __u8 parent_to_child_monitor[HYPERV_PAGE_SIZE]
 	__align(HYPERV_PAGE_SIZE);
@@ -60,8 +65,8 @@ static __u32 rx_dropped;
 static __u32 event_dropped;
 static __u32 malformed_hv_messages;
 static __u64 post_input_gpa;
-static unsigned int released_count;
 static struct uk_thread *worker;
+static struct uk_thread *control_owner;
 static int worker_stop;
 static int control_busy;
 static int initialized;
@@ -129,7 +134,8 @@ void hyperv_vmbus_message(const struct hyperv_message *message)
 	__u32 ticket;
 	struct vmbus_rx_entry *entry;
 
-	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE) ||
+	if ((!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE) &&
+	     vmbus_protocol_state() != VMBUS_STATE_UNLOADING) ||
 	    __atomic_load_n(&rx_state.lost, __ATOMIC_ACQUIRE))
 		return;
 	if (message->message_type != VMBUS_HV_MESSAGE_TYPE ||
@@ -158,6 +164,8 @@ void hyperv_vmbus_event(__u32 event)
 {
 	__u32 head;
 
+	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE))
+		return;
 	if (event >= VMBUS_EVENT_LIMIT) {
 		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
 		signal_worker();
@@ -270,14 +278,17 @@ static void bind_device(struct vmbus_device *dev)
 
 static void remove_device(struct vmbus_device *dev)
 {
+	const struct vmbus_driver *driver;
+
 	if (!dev->present)
 		return;
-	if (dev->driver && dev->driver->remove_dev)
-		dev->driver->remove_dev(dev);
+	driver = dev->driver;
 	dev->driver = NULL;
 	dev->present = 0;
 	if (device_count)
 		device_count--;
+	if (driver && driver->remove_dev)
+		driver->remove_dev(dev);
 }
 
 static void clear_devices(void)
@@ -289,24 +300,35 @@ static void clear_devices(void)
 	device_count = 0;
 }
 
-static int release_channel(__u32 channel_id)
+static int release_channel(__u32 channel_id, int retain_claim)
 {
 	struct vmbus_action action;
 	int rc;
 
-	rc = vmbus_release_claim(released_channels, &released_count,
-				 CONFIG_LIBVMBUS_MAX_DEVICES, channel_id);
+	rc = vmbus_relid_release_begin(relids, VMBUS_RELID_CAPACITY,
+				       channel_id);
 	if (rc > 0)
+		return 0;
+	if (rc == -ENOENT)
 		return 0;
 	if (rc)
 		return rc;
 	vmbus_protocol_release(channel_id, &action);
-	return handle_action(&action);
+	rc = handle_action(&action);
+	vmbus_relid_release_finish(relids, VMBUS_RELID_CAPACITY,
+				   channel_id, !rc, retain_claim);
+	return rc;
 }
 
 static void reset_release_records(void)
 {
-	released_count = 0;
+	unsigned int i;
+
+	for (i = 0; i < VMBUS_RELID_CAPACITY; i++) {
+		relids[i].channel_id = 0;
+		relids[i].state = VMBUS_RELID_FREE;
+		relids[i].retained = 0;
+	}
 }
 
 static void copy_offer(struct vmbus_device *dev,
@@ -333,6 +355,7 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 	struct vmbus_device *free_slot = NULL;
 	struct vmbus_device *dev;
 	unsigned int i;
+	int rc;
 
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
 		dev = &devices[i];
@@ -347,11 +370,23 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 			free_slot = dev;
 	}
 	if (!free_slot) {
-		int rc = release_channel(offer->channel_id);
+		rc = vmbus_relid_offer(relids, VMBUS_RELID_CAPACITY,
+				       offer->channel_id, 0);
+		if (rc > 0)
+			return 0;
+		if (rc)
+			return rc;
+		rc = release_channel(offer->channel_id, 1);
 
 		return rc ? rc : -ENOSPC;
 	}
 
+	rc = vmbus_relid_offer(relids, VMBUS_RELID_CAPACITY,
+			       offer->channel_id, 1);
+	if (rc > 0)
+		return 0;
+	if (rc)
+		return rc;
 	copy_offer(free_slot, offer);
 	device_count++;
 	bind_device(free_slot);
@@ -370,15 +405,24 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 
 static int rescind_offer(__u32 channel_id)
 {
+	struct vmbus_relid_lifecycle *lifecycle;
 	unsigned int i;
 
+	lifecycle = vmbus_relid_find(relids, VMBUS_RELID_CAPACITY,
+				     channel_id);
+	if (!lifecycle)
+		return 0;
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
 		if (devices[i].present &&
 		    devices[i].channel_id == channel_id) {
 			remove_device(&devices[i]);
 			break;
 		}
-	return release_channel(channel_id);
+	if (lifecycle->state == VMBUS_RELID_RELEASED) {
+		vmbus_relid_forget(relids, VMBUS_RELID_CAPACITY, channel_id);
+		return 0;
+	}
+	return release_channel(channel_id, 0);
 }
 
 static int handle_action(const struct vmbus_action *action)
@@ -403,7 +447,13 @@ static int handle_action(const struct vmbus_action *action)
 	case VMBUS_ACTION_RESCIND:
 		return rescind_offer(action->channel_id);
 	case VMBUS_ACTION_REJECT_OFFER:
-		return release_channel(action->channel_id);
+		rc = vmbus_relid_offer(relids, VMBUS_RELID_CAPACITY,
+				       action->channel_id, 0);
+		if (rc > 0)
+			return 0;
+		if (rc)
+			return rc;
+		return release_channel(action->channel_id, 1);
 	case VMBUS_ACTION_OFFERS_COMPLETE:
 		uk_pr_info("VMBus: protocol %u.%u enumerated %u device(s)\n",
 			   vmbus_protocol_version() >> 16,
@@ -706,39 +756,120 @@ static void stop_worker_locked(void)
 {
 	struct uk_thread *thread =
 		__atomic_load_n(&worker, __ATOMIC_ACQUIRE);
+	unsigned int attempt;
 
 	if (!thread)
 		return;
 	__atomic_store_n(&worker_stop, 1, __ATOMIC_RELEASE);
+	if (thread == uk_thread_current() || !uk_sched_current() ||
+	    uk_lcpu_irqs_disabled())
+		return;
 	uk_thread_wake(thread);
-	while (__atomic_load_n(&worker, __ATOMIC_ACQUIRE))
+	for (attempt = 0; attempt < VMBUS_TEARDOWN_WAIT_LIMIT; attempt++) {
+		if (!__atomic_load_n(&worker, __ATOMIC_ACQUIRE))
+			return;
 		uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
+	}
 }
 
 static int acquire_control(void)
 {
 	int expected = 0;
 
-	return __atomic_compare_exchange_n(&control_busy, &expected, 1, 0,
-					   __ATOMIC_ACQ_REL,
-					   __ATOMIC_ACQUIRE) ? 0 : -EBUSY;
+	if (!__atomic_compare_exchange_n(&control_busy, &expected, 1, 0,
+					 __ATOMIC_ACQ_REL,
+					 __ATOMIC_ACQUIRE))
+		return -EBUSY;
+	__atomic_store_n(&control_owner, uk_thread_current(), __ATOMIC_RELEASE);
+	return 0;
 }
 
 static void release_control(void)
 {
+	__atomic_store_n(&control_owner, NULL, __ATOMIC_RELEASE);
 	__atomic_store_n(&control_busy, 0, __ATOMIC_RELEASE);
+}
+
+static void teardown_deactivate_rx(void *arg __unused)
+{
+	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+}
+
+static void teardown_signal_stop(void *arg __unused, int can_schedule)
+{
+	struct uk_thread *thread =
+		__atomic_load_n(&worker, __ATOMIC_ACQUIRE);
+
+	__atomic_store_n(&worker_stop, 1, __ATOMIC_RELEASE);
+	if (can_schedule && thread && thread != uk_thread_current())
+		uk_thread_wake(thread);
+}
+
+static int teardown_try_control(void *arg __unused)
+{
+	return acquire_control();
+}
+
+static int teardown_control_owned(void *arg __unused)
+{
+	return __atomic_load_n(&control_busy, __ATOMIC_ACQUIRE) &&
+	       __atomic_load_n(&control_owner, __ATOMIC_ACQUIRE) ==
+		       uk_thread_current();
+}
+
+static void teardown_release_control(void *arg __unused)
+{
+	release_control();
+}
+
+static int teardown_worker_present(void *arg __unused)
+{
+	return __atomic_load_n(&worker, __ATOMIC_ACQUIRE) != NULL;
+}
+
+static int teardown_caller_is_worker(void *arg __unused)
+{
+	struct uk_thread *thread =
+		__atomic_load_n(&worker, __ATOMIC_ACQUIRE);
+
+	return thread && thread == uk_thread_current();
+}
+
+static void teardown_wait(void *arg __unused)
+{
+	uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
+}
+
+static int teardown_enter(int *control_acquired)
+{
+	static const struct vmbus_teardown_ops ops = {
+		.deactivate_rx = teardown_deactivate_rx,
+		.signal_stop = teardown_signal_stop,
+		.try_acquire_control = teardown_try_control,
+		.control_owned_by_caller = teardown_control_owned,
+		.release_control = teardown_release_control,
+		.worker_present = teardown_worker_present,
+		.caller_is_worker = teardown_caller_is_worker,
+		.wait_once = teardown_wait,
+	};
+	int can_schedule = uk_sched_current() && !uk_lcpu_irqs_disabled();
+
+	return vmbus_teardown_enter(&ops, NULL, can_schedule,
+				    VMBUS_TEARDOWN_WAIT_LIMIT,
+				    control_acquired);
 }
 
 int vmbus_unload(void)
 {
+	int control_acquired;
 	int rc;
 
-	rc = acquire_control();
+	rc = teardown_enter(&control_acquired);
 	if (rc)
 		return rc;
-	stop_worker_locked();
 	rc = disconnect_locked();
-	release_control();
+	if (control_acquired)
+		release_control();
 	return rc;
 }
 
@@ -763,12 +894,14 @@ int vmbus_reconnect(void)
 
 void hyperv_vmbus_fini(void)
 {
-	while (acquire_control())
-		uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
-	stop_worker_locked();
-	(void)disconnect_locked();
+	int control_acquired;
+
+	if (!teardown_enter(&control_acquired)) {
+		(void)disconnect_locked();
+		if (control_acquired)
+			release_control();
+	}
 	initialized = 0;
-	release_control();
 }
 
 unsigned int vmbus_device_count(void)
