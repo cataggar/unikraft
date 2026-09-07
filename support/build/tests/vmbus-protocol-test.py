@@ -30,6 +30,8 @@ def main() -> None:
         "vmbus_protocol_receive",
         "vmbus_protocol_tick",
         "vmbus_protocol_unload",
+        "vmbus_protocol_release",
+        "vmbus_protocol_reset",
         "vmbus_protocol_state",
         "vmbus_protocol_generation",
         "vmbus_protocol_version",

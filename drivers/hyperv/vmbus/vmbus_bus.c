@@ -12,6 +12,9 @@
 #include <uk/vmbus.h>
 
 #include "vmbus_protocol.h"
+#include "vmbus_lifecycle.h"
+#include "vmbus_queue.h"
+#include "vmbus_release.h"
 
 #define VMBUS_REFERENCE_TICKS_PER_MS	10000ULL
 #define VMBUS_WORKER_SLEEP_NS		1000000ULL
@@ -41,6 +44,7 @@ static struct vmbus_device devices[CONFIG_LIBVMBUS_MAX_DEVICES];
 static struct vmbus_driver *drivers[CONFIG_LIBVMBUS_MAX_DRIVERS];
 static struct vmbus_rx_entry rx_queue[CONFIG_LIBVMBUS_RX_QUEUE];
 static __u32 event_queue[CONFIG_LIBVMBUS_RX_QUEUE];
+static __u32 released_channels[CONFIG_LIBVMBUS_MAX_DEVICES];
 static __u8 interrupt_page[HYPERV_PAGE_SIZE] __align(HYPERV_PAGE_SIZE);
 static __u8 parent_to_child_monitor[HYPERV_PAGE_SIZE]
 	__align(HYPERV_PAGE_SIZE);
@@ -49,22 +53,29 @@ static __u8 child_to_parent_monitor[HYPERV_PAGE_SIZE]
 
 static unsigned int driver_count;
 static unsigned int device_count;
-static __u32 rx_head;
-static __u32 rx_tail;
+static struct vmbus_queue_state rx_state;
 static __u32 event_head;
 static __u32 event_tail;
 static __u32 rx_dropped;
 static __u32 event_dropped;
 static __u32 malformed_hv_messages;
 static __u64 post_input_gpa;
+static unsigned int released_count;
 static struct uk_thread *worker;
 static int worker_stop;
 static int control_busy;
 static int initialized;
+static int rx_active;
+static int connection_failed;
 
 static int vmbus_bus_init(struct uk_alloc *a);
 static int vmbus_bus_probe(void);
 static void vmbus_worker(void *arg) __noreturn;
+static int handle_action(const struct vmbus_action *action);
+static int disconnect_locked(void);
+static int acquire_control(void);
+static void release_control(void);
+static void stop_worker_locked(void);
 
 static int guid_equal(const struct vmbus_guid *a,
 		      const struct vmbus_guid *b)
@@ -115,9 +126,12 @@ static void signal_worker(void)
 
 void hyperv_vmbus_message(const struct hyperv_message *message)
 {
-	__u32 head;
+	__u32 ticket;
 	struct vmbus_rx_entry *entry;
 
+	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&rx_state.lost, __ATOMIC_ACQUIRE))
+		return;
 	if (message->message_type != VMBUS_HV_MESSAGE_TYPE ||
 	    message->payload_size < 8 ||
 	    message->payload_size > HYPERV_MESSAGE_PAYLOAD_SIZE) {
@@ -126,18 +140,17 @@ void hyperv_vmbus_message(const struct hyperv_message *message)
 		return;
 	}
 
-	head = __atomic_load_n(&rx_head, __ATOMIC_RELAXED);
-	if (head - __atomic_load_n(&rx_tail, __ATOMIC_ACQUIRE) >=
-	    CONFIG_LIBVMBUS_RX_QUEUE) {
+	if (vmbus_queue_reserve(&rx_state, CONFIG_LIBVMBUS_RX_QUEUE,
+				&ticket)) {
 		__atomic_add_fetch(&rx_dropped, 1, __ATOMIC_RELAXED);
 		signal_worker();
 		return;
 	}
-	entry = &rx_queue[head % CONFIG_LIBVMBUS_RX_QUEUE];
+	entry = &rx_queue[ticket % CONFIG_LIBVMBUS_RX_QUEUE];
 	entry->generation = vmbus_protocol_generation();
 	entry->len = message->payload_size;
 	copy_bytes(entry->data, message->payload, entry->len);
-	__atomic_store_n(&rx_head, head + 1, __ATOMIC_RELEASE);
+	vmbus_queue_commit(&rx_state, ticket);
 	signal_worker();
 }
 
@@ -164,12 +177,11 @@ void hyperv_vmbus_event(__u32 event)
 
 static int dequeue_message(struct vmbus_rx_entry *entry)
 {
-	__u32 tail = __atomic_load_n(&rx_tail, __ATOMIC_RELAXED);
+	__u32 ticket;
 
-	if (tail == __atomic_load_n(&rx_head, __ATOMIC_ACQUIRE))
+	if (!vmbus_queue_take(&rx_state, &ticket))
 		return 0;
-	*entry = rx_queue[tail % CONFIG_LIBVMBUS_RX_QUEUE];
-	__atomic_store_n(&rx_tail, tail + 1, __ATOMIC_RELEASE);
+	*entry = rx_queue[ticket % CONFIG_LIBVMBUS_RX_QUEUE];
 	return 1;
 }
 
@@ -208,7 +220,8 @@ static int transmit(const struct vmbus_action *action)
 
 	if (!action->tx_len || action->tx_len > sizeof(action->tx))
 		return -EINVAL;
-	rc = vmbus_post_message(VMBUS_HV_MESSAGE_TYPE, action->tx,
+	rc = vmbus_post_message(action->connection_id,
+				VMBUS_HV_MESSAGE_TYPE, action->tx,
 				action->tx_len, post_input_gpa,
 				(__u8)hyperv_has_post_messages(),
 				CONFIG_LIBVMBUS_POST_RETRIES,
@@ -276,6 +289,26 @@ static void clear_devices(void)
 	device_count = 0;
 }
 
+static int release_channel(__u32 channel_id)
+{
+	struct vmbus_action action;
+	int rc;
+
+	rc = vmbus_release_claim(released_channels, &released_count,
+				 CONFIG_LIBVMBUS_MAX_DEVICES, channel_id);
+	if (rc > 0)
+		return 0;
+	if (rc)
+		return rc;
+	vmbus_protocol_release(channel_id, &action);
+	return handle_action(&action);
+}
+
+static void reset_release_records(void)
+{
+	released_count = 0;
+}
+
 static void copy_offer(struct vmbus_device *dev,
 		       const struct vmbus_decoded_offer *offer)
 {
@@ -313,8 +346,11 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 		if (!dev->present && !free_slot)
 			free_slot = dev;
 	}
-	if (!free_slot)
-		return -ENOSPC;
+	if (!free_slot) {
+		int rc = release_channel(offer->channel_id);
+
+		return rc ? rc : -ENOSPC;
+	}
 
 	copy_offer(free_slot, offer);
 	device_count++;
@@ -332,7 +368,7 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 	return 0;
 }
 
-static void rescind_offer(__u32 channel_id)
+static int rescind_offer(__u32 channel_id)
 {
 	unsigned int i;
 
@@ -340,8 +376,9 @@ static void rescind_offer(__u32 channel_id)
 		if (devices[i].present &&
 		    devices[i].channel_id == channel_id) {
 			remove_device(&devices[i]);
-			return;
+			break;
 		}
+	return release_channel(channel_id);
 }
 
 static int handle_action(const struct vmbus_action *action)
@@ -364,8 +401,9 @@ static int handle_action(const struct vmbus_action *action)
 				  action->offer.channel_id);
 		return rc;
 	case VMBUS_ACTION_RESCIND:
-		rescind_offer(action->channel_id);
-		return 0;
+		return rescind_offer(action->channel_id);
+	case VMBUS_ACTION_REJECT_OFFER:
+		return release_channel(action->channel_id);
 	case VMBUS_ACTION_OFFERS_COMPLETE:
 		uk_pr_info("VMBus: protocol %u.%u enumerated %u device(s)\n",
 			   vmbus_protocol_version() >> 16,
@@ -394,6 +432,8 @@ static int process_messages(void)
 	struct vmbus_action action;
 	int rc;
 
+	if (__atomic_load_n(&rx_state.lost, __ATOMIC_ACQUIRE))
+		return -EOVERFLOW;
 	while (dequeue_message(&entry)) {
 		vmbus_protocol_receive(entry.data, entry.len, entry.generation,
 				       hyperv_reference_time(), &action);
@@ -443,6 +483,8 @@ static int drive_until(int terminal_a, int terminal_b)
 	int rc;
 
 	for (;;) {
+		if (__atomic_load_n(&rx_state.lost, __ATOMIC_ACQUIRE))
+			return -EOVERFLOW;
 		rc = process_messages();
 		if (rc)
 			return rc;
@@ -480,11 +522,13 @@ static int connect_protocol(void)
 		return -EACCES;
 	}
 	clear_devices();
-	__atomic_store_n(&rx_tail, __atomic_load_n(&rx_head, __ATOMIC_ACQUIRE),
-			 __ATOMIC_RELEASE);
+	reset_release_records();
+	vmbus_queue_recover(&rx_state);
 	__atomic_store_n(&event_tail,
 			 __atomic_load_n(&event_head, __ATOMIC_ACQUIRE),
 			 __ATOMIC_RELEASE);
+	__atomic_store_n(&connection_failed, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&rx_active, 1, __ATOMIC_RELEASE);
 
 	gpa = page_gpa(interrupt_page);
 	if (gpa == UK_PAGING_PADDR_INV)
@@ -510,17 +554,131 @@ static int connect_protocol(void)
 	return drive_until(VMBUS_STATE_READY, VMBUS_STATE_FAILED);
 }
 
+static void drain_queues(void)
+{
+	vmbus_queue_drain(&rx_state);
+	__atomic_store_n(&event_tail,
+			 __atomic_load_n(&event_head, __ATOMIC_ACQUIRE),
+			 __ATOMIC_RELEASE);
+}
+
+static int disconnect_locked(void)
+{
+	struct vmbus_action action;
+	int state = vmbus_protocol_state();
+	int rc = 0;
+
+	drain_queues();
+	__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
+	clear_devices();
+	if (state != VMBUS_STATE_IDLE && state != VMBUS_STATE_DISCONNECTED) {
+		vmbus_protocol_unload(hyperv_reference_time(), &action);
+		rc = handle_action(&action);
+		if (!rc)
+			rc = drive_until(VMBUS_STATE_DISCONNECTED,
+					 VMBUS_STATE_FAILED);
+	}
+	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+	reset_release_records();
+	drain_queues();
+	vmbus_protocol_reset();
+	return rc;
+}
+
+static void unwind_stop(void *arg __unused)
+{
+	stop_worker_locked();
+}
+
+static void unwind_remove(void *arg __unused)
+{
+	clear_devices();
+}
+
+static int unwind_unload(void *arg __unused)
+{
+	struct vmbus_action action;
+	int state = vmbus_protocol_state();
+	int rc = 0;
+
+	drain_queues();
+	__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
+	if (state != VMBUS_STATE_IDLE && state != VMBUS_STATE_DISCONNECTED) {
+		vmbus_protocol_unload(hyperv_reference_time(), &action);
+		rc = handle_action(&action);
+		if (!rc)
+			rc = drive_until(VMBUS_STATE_DISCONNECTED,
+					 VMBUS_STATE_FAILED);
+	}
+	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+	return rc;
+}
+
+static void unwind_drain(void *arg __unused)
+{
+	drain_queues();
+}
+
+static void unwind_reset(void *arg __unused)
+{
+	reset_release_records();
+	__atomic_store_n(&connection_failed, 0, __ATOMIC_RELEASE);
+	vmbus_queue_recover(&rx_state);
+	vmbus_protocol_reset();
+}
+
+static int probe_unwind_locked(int primary_error)
+{
+	static const struct vmbus_unwind_ops ops = {
+		.stop_work = unwind_stop,
+		.remove_devices = unwind_remove,
+		.unload = unwind_unload,
+		.drain_queues = unwind_drain,
+		.reset_protocol = unwind_reset,
+	};
+
+	return vmbus_probe_unwind_run(&ops, NULL, primary_error);
+}
+
 static void vmbus_worker(void *arg __unused)
 {
 	struct vmbus_action action;
+	int rc;
 
 	for (;;) {
 		if (__atomic_load_n(&worker_stop, __ATOMIC_ACQUIRE))
 			break;
+		if (__atomic_load_n(&rx_state.lost, __ATOMIC_ACQUIRE) ||
+		    __atomic_load_n(&connection_failed, __ATOMIC_ACQUIRE)) {
+			if (!acquire_control()) {
+				uk_pr_err("VMBus: control state lost; reconnecting\n");
+				rc = disconnect_locked();
+				if (!rc)
+					rc = connect_protocol();
+				if (rc) {
+					(void)disconnect_locked();
+					__atomic_store_n(&connection_failed, 1,
+							 __ATOMIC_RELEASE);
+					__atomic_store_n(&rx_active, 0,
+							 __ATOMIC_RELEASE);
+					__atomic_store_n(&worker_stop, 1,
+							 __ATOMIC_RELEASE);
+					uk_pr_err("VMBus: overflow recovery failed "
+						  "(%d); bus disabled\n", rc);
+				}
+				release_control();
+			}
+			uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
+			continue;
+		}
 		if (!__atomic_load_n(&control_busy, __ATOMIC_ACQUIRE)) {
-			(void)process_messages();
+			rc = process_messages();
 			vmbus_protocol_tick(hyperv_reference_time(), &action);
-			(void)handle_action(&action);
+			if (!rc)
+				rc = handle_action(&action);
+			if (rc)
+				__atomic_store_n(&connection_failed, 1,
+						 __ATOMIC_RELEASE);
 			report_deferred_diagnostics();
 		}
 		uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
@@ -544,6 +702,19 @@ static int start_worker(void)
 	return 0;
 }
 
+static void stop_worker_locked(void)
+{
+	struct uk_thread *thread =
+		__atomic_load_n(&worker, __ATOMIC_ACQUIRE);
+
+	if (!thread)
+		return;
+	__atomic_store_n(&worker_stop, 1, __ATOMIC_RELEASE);
+	uk_thread_wake(thread);
+	while (__atomic_load_n(&worker, __ATOMIC_ACQUIRE))
+		uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
+}
+
 static int acquire_control(void)
 {
 	int expected = 0;
@@ -560,18 +731,13 @@ static void release_control(void)
 
 int vmbus_unload(void)
 {
-	struct vmbus_action action;
 	int rc;
 
 	rc = acquire_control();
 	if (rc)
 		return rc;
-	vmbus_protocol_unload(hyperv_reference_time(), &action);
-	rc = handle_action(&action);
-	if (!rc)
-		rc = drive_until(VMBUS_STATE_DISCONNECTED,
-				 VMBUS_STATE_FAILED);
-	clear_devices();
+	stop_worker_locked();
+	rc = disconnect_locked();
 	release_control();
 	return rc;
 }
@@ -587,18 +753,22 @@ int vmbus_reconnect(void)
 	if (rc)
 		return rc;
 	rc = connect_protocol();
+	if (!rc)
+		rc = start_worker();
+	if (rc)
+		(void)disconnect_locked();
 	release_control();
 	return rc;
 }
 
 void hyperv_vmbus_fini(void)
 {
-	if (!initialized)
-		return;
-	(void)vmbus_unload();
-	__atomic_store_n(&worker_stop, 1, __ATOMIC_RELEASE);
-	signal_worker();
+	while (acquire_control())
+		uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
+	stop_worker_locked();
+	(void)disconnect_locked();
 	initialized = 0;
+	release_control();
 }
 
 unsigned int vmbus_device_count(void)
@@ -658,14 +828,20 @@ static int vmbus_bus_probe(void)
 	if (rc)
 		return rc;
 	rc = connect_protocol();
-	release_control();
 	if (rc)
-		return rc;
+		goto failed;
 	rc = start_worker();
 	if (rc)
-		return rc;
+		goto failed;
 	initialized = 1;
+	release_control();
 	return (int)device_count;
+
+failed:
+	rc = probe_unwind_locked(rc);
+	initialized = 0;
+	release_control();
+	return rc;
 }
 
 static struct uk_bus vmbus_bus = {

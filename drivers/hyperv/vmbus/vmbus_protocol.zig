@@ -7,7 +7,8 @@
 const std = @import("std");
 
 pub const post_message_call: u64 = 0x005c;
-pub const vmbus_connection_id: u32 = 1;
+pub const legacy_message_connection_id: u32 = 1;
+pub const initiate_contact_connection_id: u32 = 4;
 pub const hyperv_channel_message_type: u32 = 1;
 pub const max_payload_size: usize = 240;
 pub const offer_size: usize = 196;
@@ -35,6 +36,7 @@ pub const MessageType = enum(u32) {
     rescind_channel_offer = 2,
     request_offers = 3,
     all_offers_delivered = 4,
+    relid_released = 13,
     initiate_contact = 14,
     version_response = 15,
     unload = 16,
@@ -61,6 +63,7 @@ pub const ActionKind = enum(c_int) {
     failed = 6,
     stale = 7,
     malformed = 8,
+    reject_offer = 9,
 };
 
 pub const ProtocolError = enum(c_int) {
@@ -115,6 +118,7 @@ pub const Action = extern struct {
     tx: [64]u8,
     offer: Offer,
     channel_id: u32,
+    connection_id: u32,
 };
 
 pub const StartConfig = extern struct {
@@ -182,6 +186,7 @@ const Context = struct {
     generation: u32 = 0,
     version_index: usize = 0,
     selected_version: u32 = 0,
+    message_connection_id: u32 = legacy_message_connection_id,
     deadline: u64 = 0,
     config: StartConfig = .{
         .target_vp = 0,
@@ -240,7 +245,13 @@ pub fn makeVersion(major: u16, minor: u16) u32 {
 }
 
 fn clearAction(action: *Action) void {
-    action.* = std.mem.zeroes(Action);
+    zeroObject(action);
+}
+
+fn zeroObject(object: anytype) void {
+    const bytes: [*]volatile u8 = @ptrCast(object);
+    for (0..@sizeOf(@TypeOf(object.*))) |i|
+        bytes[i] = 0;
 }
 
 fn putU16(bytes: []u8, offset: usize, value: u16) void {
@@ -294,16 +305,21 @@ fn header(action: *Action, kind: MessageType, len: usize) void {
     clearAction(action);
     action.kind = .transmit;
     action.generation = context.generation;
+    action.connection_id = context.message_connection_id;
     action.tx_len = @intCast(len);
     putU32(action.tx[0..], 0, @intFromEnum(kind));
 }
 
 fn initiate(now: u64, action: *Action) void {
     const version = versions[context.version_index];
+    context.message_connection_id = if (version >= makeVersion(5, 0))
+        initiate_contact_connection_id
+    else
+        legacy_message_connection_id;
     header(action, .initiate_contact, 40);
     putU32(action.tx[0..], 8, version);
     putU32(action.tx[0..], 12, context.config.target_vp);
-    const interrupt_info = if (version >= makeVersion(2, 4))
+    const interrupt_info = if (version >= makeVersion(5, 0))
         @as(u64, sint) | (@as(u64, vtl) << 8)
     else
         context.config.interrupt_page_gpa;
@@ -339,7 +355,7 @@ fn requestOffers(now: u64, action: *Action) void {
 fn decodeOffer(bytes: []const u8, offer: *Offer) bool {
     if (bytes.len < offer_size)
         return false;
-    offer.* = std.mem.zeroes(Offer);
+    zeroObject(offer);
     offer.class_id = decodeGuid(bytes[8..24]) orelse return false;
     offer.instance_id = decodeGuid(bytes[24..40]) orelse return false;
     offer.flags = readU16(bytes, 56);
@@ -380,6 +396,7 @@ fn receive(bytes: []const u8, generation: u32, now: u64, action: *Action) void {
         2 => .rescind_channel_offer,
         3 => .request_offers,
         4 => .all_offers_delivered,
+        13 => .relid_released,
         14 => .initiate_contact,
         15 => .version_response,
         16 => .unload,
@@ -412,6 +429,25 @@ fn receive(bytes: []const u8, generation: u32, now: u64, action: *Action) void {
                 return;
             }
             context.selected_version = versions[context.version_index];
+            if (context.selected_version >= makeVersion(5, 0)) {
+                if (bytes.len < 16) {
+                    context.state = .failed;
+                    action.kind = .malformed;
+                    action.err = .malformed;
+                    return;
+                }
+                context.message_connection_id = readU32(bytes, 12);
+                if (context.message_connection_id == 0 or
+                    (context.message_connection_id & 0xff000000) != 0)
+                {
+                    context.state = .failed;
+                    action.kind = .malformed;
+                    action.err = .malformed;
+                    return;
+                }
+            } else {
+                context.message_connection_id = legacy_message_connection_id;
+            }
             requestOffers(now, action);
         },
         .offer_channel => {
@@ -420,8 +456,13 @@ fn receive(bytes: []const u8, generation: u32, now: u64, action: *Action) void {
                 return;
             }
             if (!decodeOffer(bytes, &action.offer)) {
-                action.kind = .malformed;
-                action.err = .malformed;
+                if (bytes.len >= 188 and readU32(bytes, 184) != 0) {
+                    action.kind = .reject_offer;
+                    action.channel_id = readU32(bytes, 184);
+                } else {
+                    action.kind = .malformed;
+                    action.err = .malformed;
+                }
                 return;
             }
             action.kind = .offer;
@@ -473,7 +514,11 @@ fn tick(now: u64, action: *Action) void {
     if (now <= context.deadline)
         return;
     switch (context.state) {
-        .wait_version => nextVersion(now, action),
+        .wait_version => {
+            context.state = .failed;
+            action.kind = .failed;
+            action.err = .timeout;
+        },
         .wait_offers => {
             context.state = .failed;
             action.kind = .failed;
@@ -495,12 +540,37 @@ fn beginUnload(now: u64, action: *Action) void {
         action.kind = .cleanup;
         return;
     }
+
     context.generation +%= 1;
     if (context.generation == 0)
         context.generation = 1;
     header(action, .unload, 8);
     context.state = .unloading;
     context.deadline = now +| context.config.timeout_ticks;
+}
+
+fn releaseRelid(channel_id: u32, action: *Action) void {
+    clearAction(action);
+    if (channel_id == 0 or
+        (context.state != .wait_offers and context.state != .ready))
+    {
+        action.kind = .malformed;
+        action.err = .unexpected;
+        action.generation = context.generation;
+        return;
+    }
+    header(action, .relid_released, 12);
+    putU32(action.tx[0..], 8, channel_id);
+    action.channel_id = channel_id;
+}
+
+fn resetProtocol() void {
+    const next_generation = context.generation +% 1;
+    zeroObject(&context);
+    context.config.timeout_ticks = version_timeout_default;
+    context.message_connection_id = legacy_message_connection_id;
+    context.generation = if (next_generation == 0) 1 else next_generation;
+    context.state = .disconnected;
 }
 
 fn statusToResult(status: u16) PostResult {
@@ -522,6 +592,7 @@ export fn vmbus_post_input() callconv(.c) *anyopaque {
 }
 
 export fn vmbus_post_message(
+    connection_id: u32,
     message_type: u32,
     payload: [*]const u8,
     payload_len: usize,
@@ -534,6 +605,8 @@ export fn vmbus_post_message(
 ) callconv(.c) c_int {
     if (has_post_messages == 0)
         return @intFromEnum(PostResult.missing_privilege);
+    if (connection_id == 0 or (connection_id & 0xff000000) != 0)
+        return @intFromEnum(PostResult.invalid_connection);
     if (message_type == 0 or (message_type & 0x80000000) != 0)
         return @intFromEnum(PostResult.bad_message_type);
     if (payload_len > max_payload_size)
@@ -541,8 +614,8 @@ export fn vmbus_post_message(
     if ((input_gpa & 0xff) != 0)
         return @intFromEnum(PostResult.bad_alignment);
 
-    post_input = std.mem.zeroes(PostMessageInput);
-    post_input.connection_id = vmbus_connection_id;
+    zeroObject(&post_input);
+    post_input.connection_id = connection_id;
     post_input.message_type = message_type;
     post_input.payload_size = @intCast(payload_len);
     for (0..payload_len) |i|
@@ -566,7 +639,8 @@ export fn vmbus_protocol_start(
     config: *const StartConfig,
     action: *Action,
 ) callconv(.c) void {
-    context = .{};
+    zeroObject(&context);
+    context.message_connection_id = legacy_message_connection_id;
     context.config = config.*;
     if (context.config.timeout_ticks == 0)
         context.config.timeout_ticks = version_timeout_default;
@@ -597,6 +671,17 @@ export fn vmbus_protocol_tick(now: u64, action: *Action) callconv(.c) void {
 
 export fn vmbus_protocol_unload(now: u64, action: *Action) callconv(.c) void {
     beginUnload(now, action);
+}
+
+export fn vmbus_protocol_release(
+    channel_id: u32,
+    action: *Action,
+) callconv(.c) void {
+    releaseRelid(channel_id, action);
+}
+
+export fn vmbus_protocol_reset() callconv(.c) void {
+    resetProtocol();
 }
 
 export fn vmbus_protocol_state() callconv(.c) c_int {
@@ -661,33 +746,38 @@ test "PostMessage validates input, retries boundedly, and preserves failures" {
     Fake.status = 0x0013;
     try std.testing.expectEqual(
         @intFromEnum(PostResult.ok),
-        vmbus_post_message(1, &payload, payload.len, 0x1000, 1, 4, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, 1, 4, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(@as(u32, 3), Fake.calls);
     try std.testing.expectEqual(@as(u32, 2), Fake.delays);
+    try std.testing.expectEqual(@as(u32, 7), post_input.connection_id);
     Fake.calls = 0;
     Fake.delays = 0;
     try std.testing.expectEqual(
         @intFromEnum(PostResult.insufficient_buffers),
-        vmbus_post_message(1, &payload, payload.len, 0x1000, 1, 1, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, 1, 1, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(@as(u32, 2), Fake.calls);
     Fake.status = 0x0012;
     try std.testing.expectEqual(
         @intFromEnum(PostResult.invalid_connection),
-        vmbus_post_message(1, &payload, payload.len, 0x1000, 1, 2, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, 1, 2, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(
         @intFromEnum(PostResult.missing_privilege),
-        vmbus_post_message(1, &payload, payload.len, 0x1000, 0, 2, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, 0, 2, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(
         @intFromEnum(PostResult.bad_alignment),
-        vmbus_post_message(1, &payload, payload.len, 0x1008, 1, 2, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1008, 1, 2, Fake.call, Fake.delay, null),
+    );
+    try std.testing.expectEqual(
+        @intFromEnum(PostResult.invalid_connection),
+        vmbus_post_message(0, 1, &payload, payload.len, 0x1000, 1, 2, Fake.call, Fake.delay, null),
     );
 }
 
-test "version rejection falls back newest to oldest and timeout is bounded" {
+test "explicit version rejection falls back to a legacy 4.0 packet" {
     var action: Action = undefined;
     const config = StartConfig{
         .target_vp = 7,
@@ -700,19 +790,25 @@ test "version rejection falls back newest to oldest and timeout is bounded" {
     try std.testing.expectEqual(ActionKind.transmit, action.kind);
     try std.testing.expectEqual(versions[0], readU32(action.tx[0..], 8));
     try std.testing.expectEqual(@as(u32, 7), readU32(action.tx[0..], 12));
+    try std.testing.expectEqual(initiate_contact_connection_id, action.connection_id);
     var response = makeMessage(.version_response, 16);
     response[8] = 0;
-    const first_generation = context.generation;
-    vmbus_protocol_receive(&response, 16, first_generation, 101, &action);
+    for (1..7) |index| {
+        vmbus_protocol_receive(&response, 16, context.generation, 101 + index, &action);
+        try std.testing.expectEqual(ActionKind.transmit, action.kind);
+        try std.testing.expectEqual(versions[index], readU32(action.tx[0..], 8));
+    }
+    try std.testing.expectEqual(makeVersion(4, 0), readU32(action.tx[0..], 8));
+    try std.testing.expectEqual(@as(u64, 0x4000), readU64(action.tx[0..], 16));
+    try std.testing.expectEqual(legacy_message_connection_id, action.connection_id);
+
+    response[8] = 1;
+    vmbus_protocol_receive(&response, 10, context.generation, 110, &action);
     try std.testing.expectEqual(ActionKind.transmit, action.kind);
-    try std.testing.expectEqual(versions[1], readU32(action.tx[0..], 8));
-    try std.testing.expect(context.generation != first_generation);
-    vmbus_protocol_tick(112, &action);
-    try std.testing.expectEqual(ActionKind.transmit, action.kind);
-    try std.testing.expectEqual(versions[2], readU32(action.tx[0..], 8));
+    try std.testing.expectEqual(legacy_message_connection_id, action.connection_id);
 }
 
-test "all documented version attempts terminate without spinning" {
+test "all documented version attempts terminate on explicit rejection" {
     var action: Action = undefined;
     const config = StartConfig{
         .target_vp = 0,
@@ -722,19 +818,19 @@ test "all documented version attempts terminate without spinning" {
         .child_to_parent_monitor_gpa = 0,
     };
     vmbus_protocol_start(0, &config, &action);
-    var now: u64 = 2;
+    var response = makeMessage(.version_response, 16);
+    response[8] = 0;
     for (1..versions.len) |_| {
-        vmbus_protocol_tick(now, &action);
+        vmbus_protocol_receive(&response, 16, context.generation, 0, &action);
         try std.testing.expectEqual(ActionKind.transmit, action.kind);
-        now += 2;
     }
-    vmbus_protocol_tick(now, &action);
+    vmbus_protocol_receive(&response, 16, context.generation, 0, &action);
     try std.testing.expectEqual(ActionKind.failed, action.kind);
     try std.testing.expectEqual(ProtocolError.unsupported, action.err);
     try std.testing.expectEqual(State.failed, context.state);
 }
 
-test "stale responses are rejected by state and generation" {
+test "timeout fails closed and a delayed response is stale" {
     var action: Action = undefined;
     const config = StartConfig{
         .target_vp = 0,
@@ -744,37 +840,48 @@ test "stale responses are rejected by state and generation" {
         .child_to_parent_monitor_gpa = 0,
     };
     vmbus_protocol_start(0, &config, &action);
-    const old_generation = context.generation;
     vmbus_protocol_tick(11, &action);
+    try std.testing.expectEqual(ActionKind.failed, action.kind);
+    try std.testing.expectEqual(ProtocolError.timeout, action.err);
+    try std.testing.expectEqual(State.failed, context.state);
     var response = makeMessage(.version_response, 16);
     response[8] = 1;
-    vmbus_protocol_receive(&response, 16, old_generation, 12, &action);
-    try std.testing.expectEqual(ActionKind.stale, action.kind);
-    const current_generation = context.generation;
-    vmbus_protocol_receive(&response, 16, current_generation, 12, &action);
-    try std.testing.expectEqual(ActionKind.transmit, action.kind);
-    try std.testing.expectEqual(@intFromEnum(MessageType.request_offers), readU32(action.tx[0..], 0));
-    vmbus_protocol_receive(&response, 16, current_generation, 13, &action);
+    putU32(response[0..], 12, 0x44);
+    vmbus_protocol_receive(&response, 16, context.generation, 12, &action);
     try std.testing.expectEqual(ActionKind.stale, action.kind);
 }
 
-test "legacy QEMU version response length is accepted" {
+test "modern negotiation switches to the returned message connection ID" {
     var action: Action = undefined;
     const config = StartConfig{
         .target_vp = 0,
         .timeout_ticks = 10,
-        .interrupt_page_gpa = 0x1000,
+        .interrupt_page_gpa = 0x8877665544332211,
         .parent_to_child_monitor_gpa = 0x2000,
         .child_to_parent_monitor_gpa = 0x3000,
     };
     vmbus_protocol_start(0, &config, &action);
-    context.version_index = 6; // QEMU's current protocol version is 4.0.
-    var response = makeMessage(.version_response, 10);
+    try std.testing.expectEqual(initiate_contact_connection_id, action.connection_id);
+    try std.testing.expectEqual(@as(u64, 2), readU64(action.tx[0..], 16));
+    var response = makeMessage(.version_response, 16);
     response[8] = 1;
-    vmbus_protocol_receive(&response, 10, context.generation, 1, &action);
+    putU32(response[0..], 12, 0x1234);
+    vmbus_protocol_receive(&response, 16, context.generation, 1, &action);
     try std.testing.expectEqual(ActionKind.transmit, action.kind);
     try std.testing.expectEqual(State.wait_offers, context.state);
-    try std.testing.expectEqual(versions[6], context.selected_version);
+    try std.testing.expectEqual(versions[0], context.selected_version);
+    try std.testing.expectEqual(@as(u32, 0x1234), action.connection_id);
+
+    vmbus_protocol_release(9, &action);
+    try std.testing.expectEqual(ActionKind.transmit, action.kind);
+    try std.testing.expectEqual(@intFromEnum(MessageType.relid_released), readU32(action.tx[0..], 0));
+    try std.testing.expectEqual(@as(u32, 9), readU32(action.tx[0..], 8));
+    try std.testing.expectEqual(@as(u32, 0x1234), action.connection_id);
+
+    vmbus_protocol_unload(2, &action);
+    try std.testing.expectEqual(ActionKind.transmit, action.kind);
+    try std.testing.expectEqual(@intFromEnum(MessageType.unload), readU32(action.tx[0..], 0));
+    try std.testing.expectEqual(@as(u32, 0x1234), action.connection_id);
 }
 
 fn makeOffer(class_wire: [16]u8, channel_id: u32) [240]u8 {
@@ -809,6 +916,7 @@ test "offer rescind and all-offers transitions preserve unknown devices" {
     vmbus_protocol_start(0, &config, &action);
     var response = makeMessage(.version_response, 16);
     response[8] = 1;
+    putU32(response[0..], 12, 0x44);
     vmbus_protocol_receive(&response, 16, context.generation, 1, &action);
     const unknown_wire = [_]u8{
         0x44, 0x33, 0x22, 0x11, 0x66, 0x55, 0x88, 0x77,
@@ -848,13 +956,15 @@ test "malformed lengths fields and message types are rejected" {
     vmbus_protocol_receive(&response, 7, context.generation, 1, &action);
     try std.testing.expectEqual(ActionKind.malformed, action.kind);
     response[8] = 1;
+    putU32(response[0..], 12, 0x44);
     vmbus_protocol_receive(&response, 16, context.generation, 1, &action);
     var offer = makeOffer(.{0} ** 16, 1);
-    vmbus_protocol_receive(&offer, offer_size - 1, context.generation, 2, &action);
+    vmbus_protocol_receive(&offer, 187, context.generation, 2, &action);
     try std.testing.expectEqual(ActionKind.malformed, action.kind);
     offer[189] = 2;
     vmbus_protocol_receive(&offer, offer_size, context.generation, 2, &action);
-    try std.testing.expectEqual(ActionKind.malformed, action.kind);
+    try std.testing.expectEqual(ActionKind.reject_offer, action.kind);
+    try std.testing.expectEqual(@as(u32, 1), action.channel_id);
     var unknown = [_]u8{0} ** 8;
     putU32(unknown[0..], 0, 0xffff);
     vmbus_protocol_receive(&unknown, unknown.len, context.generation, 2, &action);
@@ -871,9 +981,10 @@ test "offer enumeration timeout is surfaced" {
         .child_to_parent_monitor_gpa = 0,
     };
     vmbus_protocol_start(0, &config, &action);
-    var response = makeMessage(.version_response, 10);
+    var response = makeMessage(.version_response, 16);
     response[8] = 1;
-    vmbus_protocol_receive(&response, 10, context.generation, 1, &action);
+    putU32(response[0..], 12, 0x44);
+    vmbus_protocol_receive(&response, 16, context.generation, 1, &action);
     vmbus_protocol_tick(12, &action);
     try std.testing.expectEqual(ActionKind.failed, action.kind);
     try std.testing.expectEqual(ProtocolError.timeout, action.err);
@@ -902,6 +1013,26 @@ test "unload response and timeout both clean transactions" {
     try std.testing.expectEqual(ActionKind.cleanup, action.kind);
     try std.testing.expectEqual(ProtocolError.timeout, action.err);
     try std.testing.expectEqual(State.disconnected, context.state);
+}
+
+test "forced reset invalidates queued protocol responses" {
+    var action: Action = undefined;
+    const config = StartConfig{
+        .target_vp = 0,
+        .timeout_ticks = 10,
+        .interrupt_page_gpa = 0,
+        .parent_to_child_monitor_gpa = 0,
+        .child_to_parent_monitor_gpa = 0,
+    };
+    vmbus_protocol_start(0, &config, &action);
+    const queued_generation = context.generation;
+    vmbus_protocol_reset();
+    try std.testing.expectEqual(State.disconnected, context.state);
+    var response = makeMessage(.version_response, 16);
+    response[8] = 1;
+    putU32(response[0..], 12, 0x44);
+    vmbus_protocol_receive(&response, 16, queued_generation, 1, &action);
+    try std.testing.expectEqual(ActionKind.stale, action.kind);
 }
 
 test "bounded inventory reports capacity and retains unknown offers" {

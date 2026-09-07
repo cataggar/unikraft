@@ -28,6 +28,7 @@ enum vmbus_action_kind {
 	VMBUS_ACTION_FAILED = 6,
 	VMBUS_ACTION_STALE = 7,
 	VMBUS_ACTION_MALFORMED = 8,
+	VMBUS_ACTION_REJECT_OFFER = 9,
 };
 
 struct vmbus_decoded_offer {
@@ -53,6 +54,7 @@ struct vmbus_action {
 	__u8 tx[VMBUS_ACTION_TX_SIZE];
 	struct vmbus_decoded_offer offer;
 	__u32 channel_id;
+	__u32 connection_id;
 };
 
 struct vmbus_start_config {
@@ -68,7 +70,8 @@ typedef __u64 (*vmbus_hypercall_fn)(void *arg, __u64 input_gpa);
 typedef void (*vmbus_backoff_fn)(void *arg, __u32 usec);
 
 void *vmbus_post_input(void);
-int vmbus_post_message(__u32 message_type, const __u8 *payload,
+int vmbus_post_message(__u32 connection_id, __u32 message_type,
+		       const __u8 *payload,
 		       size_t payload_len, __u64 input_gpa,
 		       __u8 has_post_messages, __u32 retry_limit,
 		       vmbus_hypercall_fn hypercall,
@@ -81,6 +84,9 @@ void vmbus_protocol_receive(const __u8 *payload, size_t payload_len,
 			    struct vmbus_action *action);
 void vmbus_protocol_tick(__u64 now, struct vmbus_action *action);
 void vmbus_protocol_unload(__u64 now, struct vmbus_action *action);
+void vmbus_protocol_release(__u32 channel_id,
+			    struct vmbus_action *action);
+void vmbus_protocol_reset(void);
 int vmbus_protocol_state(void);
 __u32 vmbus_protocol_generation(void);
 __u32 vmbus_protocol_version(void);
@@ -89,7 +95,7 @@ _Static_assert(sizeof(struct vmbus_decoded_offer) == 172,
 	       "decoded offer ABI mismatch");
 _Static_assert(offsetof(struct vmbus_decoded_offer, user_data) == 52,
 	       "decoded offer user-data offset mismatch");
-_Static_assert(sizeof(struct vmbus_action) == 256,
+_Static_assert(sizeof(struct vmbus_action) == 260,
 	       "protocol action ABI mismatch");
 _Static_assert(sizeof(struct vmbus_start_config) == 40,
 	       "protocol start configuration ABI mismatch");
