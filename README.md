@@ -393,6 +393,11 @@ while an ambiguous close quarantines GPA-direct buffers until the next
 connection generation. This preserves memory safety at the cost of a temporary
 interface outage when the host corrupts the shared ring.
 
+Receive-section bounds are computed from the validated start, slot size, and
+slot count; the host's unused `EndOffset` is treated as informational. Inbound
+transfer ranges may be unaligned or span multiple slots, but every range must
+remain wholly inside one validated receive section and its registered GPADL.
+
 Target Zig modules receive generated Kconfig headers through tracked build
 dependencies and can opt into narrow Unikraft include roots for `@cImport`.
 The resulting objects feed the normal library partial-link and final-link

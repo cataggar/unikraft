@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <uk/alloc.h>
 #include <uk/config.h>
 #include <uk/essentials.h>
@@ -65,6 +66,7 @@ struct mock_state {
 	size_t init_response_length;
 	size_t receive_response_length;
 	size_t send_response_length;
+	__u32 receive_end_offset;
 	unsigned int suppress_nvs_init;
 	unsigned int send_section_size;
 	unsigned int next_rx_slot;
@@ -77,6 +79,8 @@ struct mock_state {
 	unsigned int suppress_control_rndis;
 	unsigned int delay_tx;
 	unsigned int post_publish_error_once;
+	unsigned int reenter_send_once;
+	int data_send_error_once;
 	unsigned int fail_open;
 	unsigned int fail_close;
 	int receive_error_once;
@@ -115,6 +119,104 @@ static struct uk_alloc allocator;
 static struct uk_sched *scheduler = (struct uk_sched *)1;
 static struct host_netbuf rx_buffers[MOCK_NETBUF_COUNT];
 static int chained_receive;
+
+struct stage_gate {
+	pthread_mutex_t lock;
+	pthread_cond_t condition;
+	unsigned int target;
+	unsigned int reached;
+	unsigned int released;
+	__u64 transaction_id;
+	__u32 request_id;
+};
+
+static struct stage_gate tx_gate = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.condition = PTHREAD_COND_INITIALIZER,
+};
+static struct stage_gate control_gate = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.condition = PTHREAD_COND_INITIALIZER,
+};
+static struct stage_gate control_wait_gate = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.condition = PTHREAD_COND_INITIALIZER,
+};
+
+static void stage_gate_arm(struct stage_gate *gate, unsigned int target)
+{
+	pthread_mutex_lock(&gate->lock);
+	gate->target = target;
+	gate->reached = 0;
+	gate->released = 0;
+	gate->transaction_id = 0;
+	gate->request_id = 0;
+	pthread_mutex_unlock(&gate->lock);
+}
+
+static int stage_gate_wait(struct stage_gate *gate)
+{
+	struct timespec deadline;
+	int rc = 0;
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += 5;
+	pthread_mutex_lock(&gate->lock);
+	while (!gate->reached && !rc)
+		rc = pthread_cond_timedwait(&gate->condition, &gate->lock,
+					    &deadline);
+	pthread_mutex_unlock(&gate->lock);
+	return rc;
+}
+
+static void stage_gate_release(struct stage_gate *gate)
+{
+	pthread_mutex_lock(&gate->lock);
+	gate->released = 1;
+	pthread_cond_broadcast(&gate->condition);
+	pthread_mutex_unlock(&gate->lock);
+}
+
+static void stage_gate_ids(struct stage_gate *gate, __u64 *transaction_id,
+			   __u32 *request_id)
+{
+	pthread_mutex_lock(&gate->lock);
+	*transaction_id = gate->transaction_id;
+	if (request_id)
+		*request_id = gate->request_id;
+	pthread_mutex_unlock(&gate->lock);
+}
+
+static void stage_gate_enter(struct stage_gate *gate, unsigned int stage,
+			     __u64 transaction_id, __u32 request_id)
+{
+	pthread_mutex_lock(&gate->lock);
+	if (gate->target != stage) {
+		pthread_mutex_unlock(&gate->lock);
+		return;
+	}
+	gate->transaction_id = transaction_id;
+	gate->request_id = request_id;
+	gate->reached = 1;
+	pthread_cond_broadcast(&gate->condition);
+	while (!gate->released)
+		pthread_cond_wait(&gate->condition, &gate->lock);
+	gate->target = 0;
+	pthread_mutex_unlock(&gate->lock);
+}
+
+void netvsc_host_tx_stage(unsigned int stage, __u64 transaction_id)
+{
+	stage_gate_enter(&tx_gate, stage, transaction_id, 0);
+}
+
+void netvsc_host_control_stage(unsigned int stage, __u64 transaction_id,
+			       __u32 request_id)
+{
+	stage_gate_enter(stage == NETVSC_HOST_CONTROL_STAGE_WAIT_DONE ?
+			 &control_wait_gate : &control_gate,
+			 stage, transaction_id, request_id);
+}
 
 static __u32 get32(const __u8 *data)
 {
@@ -161,6 +263,15 @@ static void enqueue_completion(__u64 transaction_id, const __u8 *payload,
 	memcpy(queued->payload, payload, payload_length);
 }
 
+static void enqueue_rndis_send_complete(__u64 transaction_id)
+{
+	__u8 complete[8] = { 0 };
+
+	put32(complete, 108);
+	put32(complete + 4, 1);
+	enqueue_completion(transaction_id, complete, sizeof(complete));
+}
+
 static void enqueue_transfer(const __u8 *message, size_t message_length,
 			     __u32 channel_type)
 {
@@ -183,6 +294,49 @@ static void enqueue_transfer(const __u8 *message, size_t message_length,
 	put32(queued->descriptor + 12, offset);
 	put32(queued->payload, NETVSC_NVS_TYPE_SEND_RNDIS);
 	put32(queued->payload + 4, channel_type);
+	queued->payload_length = NETVSC_NVS_REQUEST_SIZE;
+	queued->packet.payload_size = NETVSC_NVS_REQUEST_SIZE;
+}
+
+static void enqueue_rndis_control_complete(__u32 type, __u32 request_id)
+{
+	__u8 complete[16] = { 0 };
+
+	put32(complete, type);
+	put32(complete + 4, sizeof(complete));
+	put32(complete + 8, request_id);
+	enqueue_transfer(complete, sizeof(complete),
+			 NETVSC_NVS_RNDIS_CONTROL);
+}
+
+static void enqueue_frame_range(const __u8 *frame, size_t frame_length,
+				__u32 range_offset, __u32 range_length)
+{
+	struct mock_packet *queued = queue_reserve();
+	__u8 *receive_buffer = netvsc_host_receive_buffer();
+	int header;
+
+	if (!queued || range_length > netvsc_host_receive_buffer_capacity() ||
+	    range_offset > netvsc_host_receive_buffer_capacity() -
+		    range_length)
+		abort();
+	memset(receive_buffer + range_offset, 0, range_length);
+	header = netvsc_rndis_build_packet_header(
+			receive_buffer + range_offset, range_length,
+			frame_length);
+	if (header < 0 || (size_t)header + frame_length > range_length)
+		abort();
+	memcpy(receive_buffer + range_offset + header, frame, frame_length);
+	queued->packet.type = VMBUS_PACKET_DATA_USING_TRANSFER_PAGES;
+	queued->packet.transaction_id = 0x91000000ULL + mock.next_rx_slot++;
+	queued->descriptor_length = 16;
+	queued->packet.descriptor_size = 16;
+	put16(queued->descriptor, NETVSC_NVS_RX_BUFFER_ID);
+	put32(queued->descriptor + 4, 1);
+	put32(queued->descriptor + 8, range_length);
+	put32(queued->descriptor + 12, range_offset);
+	put32(queued->payload, NETVSC_NVS_TYPE_SEND_RNDIS);
+	put32(queued->payload + 4, NETVSC_NVS_RNDIS_DATA);
 	queued->payload_length = NETVSC_NVS_REQUEST_SIZE;
 	queued->packet.payload_size = NETVSC_NVS_REQUEST_SIZE;
 }
@@ -214,7 +368,8 @@ static void enqueue_receive_complete(__u64 transaction_id)
 	put32(response + 12, 0);
 	put32(response + 16, MOCK_RX_SLOT_SIZE);
 	put32(response + 20, slots);
-	put32(response + 24, (__u32)receive_size);
+	put32(response + 24, mock.receive_end_offset ?
+	      mock.receive_end_offset : (__u32)receive_size);
 	enqueue_completion(transaction_id, response,
 			   mock.receive_response_length);
 }
@@ -680,10 +835,24 @@ int vmbus_channel_send_ex(struct vmbus_channel *channel, __u16 type,
 			  const void *payload, size_t payload_length,
 			  int *published)
 {
-	int rc = vmbus_channel_send(channel, type, flags, transaction_id,
+	int rc;
+
+	if (mock.data_send_error_once && payload_length >= 8 &&
+	    get32(payload) == NETVSC_NVS_TYPE_SEND_RNDIS &&
+	    get32((const __u8 *)payload + 4) == NETVSC_NVS_RNDIS_DATA) {
+		rc = mock.data_send_error_once;
+		mock.data_send_error_once = 0;
+		*published = 0;
+		return rc;
+	}
+	rc = vmbus_channel_send(channel, type, flags, transaction_id,
 			descriptor, descriptor_length, payload, payload_length);
 
 	*published = rc == 0;
+	if (!rc && mock.reenter_send_once) {
+		mock.reenter_send_once = 0;
+		mock_signal();
+	}
 	if (!rc && mock.post_publish_error_once) {
 		mock.post_publish_error_once = 0;
 		return -EIO;
@@ -711,11 +880,25 @@ int vmbus_channel_send_gpa_direct_ex(
 				  __u32 range_count, const void *payload,
 				  size_t payload_length, int *published)
 {
-	int rc = vmbus_channel_send_gpa_direct(channel, flags,
+	int rc;
+
+	if (mock.data_send_error_once && payload_length >= 8 &&
+	    get32(payload) == NETVSC_NVS_TYPE_SEND_RNDIS &&
+	    get32((const __u8 *)payload + 4) == NETVSC_NVS_RNDIS_DATA) {
+		rc = mock.data_send_error_once;
+		mock.data_send_error_once = 0;
+		*published = 0;
+		return rc;
+	}
+	rc = vmbus_channel_send_gpa_direct(channel, flags,
 			transaction_id, ranges, range_count, payload,
 			payload_length);
 
 	*published = rc == 0;
+	if (!rc && mock.reenter_send_once) {
+		mock.reenter_send_once = 0;
+		mock_signal();
+	}
 	if (!rc && mock.post_publish_error_once) {
 		mock.post_publish_error_once = 0;
 		return -EIO;
@@ -826,6 +1009,33 @@ static void prepare_tx_buffer(struct host_netbuf *buffer, __u8 seed,
 		((__u8 *)buffer->netbuf.data)[i] = seed + i;
 }
 
+struct tx_thread_args {
+	struct uk_netdev *netdev;
+	struct uk_netbuf *packet;
+	int result;
+};
+
+static void *tx_thread_main(void *argument)
+{
+	struct tx_thread_args *args = argument;
+
+	args->result = args->netdev->tx_one(args->netdev,
+			args->netdev->_tx_queue[0], args->packet);
+	return NULL;
+}
+
+struct control_thread_args {
+	int result;
+};
+
+static void *control_thread_main(void *argument)
+{
+	struct control_thread_args *args = argument;
+
+	args->result = netvsc_host_keepalive();
+	return NULL;
+}
+
 static void queue_frame_type(const __u8 *frame, size_t frame_length,
 			     __u32 channel_type)
 {
@@ -932,6 +1142,348 @@ static int test_tx_ownership_and_saturation(struct uk_netdev *netdev)
 	return 0;
 }
 
+static int test_tx_publication_stage(unsigned int stage, int gpa)
+{
+	struct vmbus_device offered = {
+		.channel_id = 80 + stage,
+		.connection_id = 180 + stage,
+		.present = 1,
+	};
+	struct uk_netdev_txqueue_conf tx_configuration = { 0 };
+	struct host_netbuf packet = { 0 };
+	struct host_netbuf blocked = { 0 };
+	struct tx_thread_args args;
+	struct uk_netdev *netdev;
+	pthread_t thread;
+	__u64 transaction_id;
+	__u32 duplicate_before;
+	__u32 malformed_before;
+	__u32 unknown_before;
+	int failure = 0;
+
+	netvsc_host_reset();
+	mock_reset();
+	if (gpa)
+		mock.send_section_size = 4;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	netdev->_tx_queue[0] = netdev->ops->txq_configure(
+			netdev, 0, 1, &tx_configuration);
+	CHECK(!PTRISERR(netdev->_tx_queue[0]));
+	mock.delay_tx = 1;
+	prepare_tx_buffer(&packet, (__u8)(0x20 + stage), 60);
+	prepare_tx_buffer(&blocked, (__u8)(0x40 + stage), 60);
+	args.netdev = netdev;
+	args.packet = &packet.netbuf;
+	args.result = -1;
+	stage_gate_arm(&tx_gate, stage);
+	if (pthread_create(&thread, NULL, tx_thread_main, &args))
+		return __LINE__;
+	if (stage_gate_wait(&tx_gate)) {
+		failure = __LINE__;
+		goto release;
+	}
+	stage_gate_ids(&tx_gate, &transaction_id, NULL);
+	if (!transaction_id || netvsc_host_tx_active() != 1 ||
+	    netvsc_host_tx_transaction(0) != transaction_id ||
+	    !netvsc_host_tx_state(0) || packet.free_count)
+		failure = __LINE__;
+	if (!failure &&
+	    netdev->tx_one(netdev, netdev->_tx_queue[0],
+			   &blocked.netbuf) != 0)
+		failure = __LINE__;
+	if (!failure && blocked.free_count)
+		failure = __LINE__;
+	duplicate_before = netvsc_host_duplicate_completions();
+	malformed_before = netvsc_host_malformed_messages();
+	unknown_before = netvsc_host_unknown_completions();
+	if (stage == NETVSC_HOST_TX_STAGE_BUILD_RANGES) {
+		__u8 malformed[4] = { 0 };
+
+		enqueue_completion(transaction_id, malformed,
+				   sizeof(malformed));
+	} else {
+		enqueue_rndis_send_complete(transaction_id);
+	}
+	enqueue_rndis_send_complete(transaction_id);
+	enqueue_rndis_send_complete(transaction_id ^ 0x100000000ULL);
+	mock_signal();
+	if (!failure &&
+	    (packet.free_count || netvsc_host_tx_active() != 1 ||
+	     netvsc_host_tx_transaction(0) != transaction_id))
+		failure = __LINE__;
+release:
+	stage_gate_release(&tx_gate);
+	pthread_join(thread, NULL);
+	if (failure)
+		return failure;
+	CHECK((args.result & UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK((args.result & UK_NETDEV_STATUS_MORE) != 0);
+	CHECK(packet.free_count == 1);
+	CHECK(netvsc_host_tx_active() == 0);
+	CHECK(netvsc_host_duplicate_completions() >= duplicate_before + 1);
+	CHECK(netvsc_host_unknown_completions() >= unknown_before + 1);
+	if (stage == NETVSC_HOST_TX_STAGE_BUILD_RANGES)
+		CHECK(netvsc_host_malformed_messages() ==
+		      malformed_before + 1);
+	mock_flush_tx();
+	CHECK(packet.free_count == 1);
+	CHECK(netvsc_host_duplicate_completions() >= duplicate_before + 2);
+	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
+			      &blocked.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	mock_flush_tx();
+	CHECK(blocked.free_count == 1);
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
+static int test_tx_publication_races(void)
+{
+	int rc;
+
+	rc = test_tx_publication_stage(NETVSC_HOST_TX_STAGE_BEFORE_COPY, 0);
+	if (rc)
+		return rc;
+	rc = test_tx_publication_stage(NETVSC_HOST_TX_STAGE_SECTION_COPY, 0);
+	if (rc)
+		return rc;
+	rc = test_tx_publication_stage(NETVSC_HOST_TX_STAGE_BUILD_RANGES, 1);
+	if (rc)
+		return rc;
+	return test_tx_publication_stage(
+			NETVSC_HOST_TX_STAGE_AFTER_PUBLISH, 0);
+}
+
+static int test_tx_unpublished_early_completion(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 87,
+		.connection_id = 187,
+		.present = 1,
+	};
+	struct host_netbuf packet = { 0 };
+	struct tx_thread_args args;
+	struct uk_netdev *netdev;
+	pthread_t thread;
+	__u64 transaction_id;
+	__u32 early_before;
+	int failure = 0;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	mock.delay_tx = 1;
+	mock.data_send_error_once = -EAGAIN;
+	prepare_tx_buffer(&packet, 0x61, 60);
+	args.netdev = netdev;
+	args.packet = &packet.netbuf;
+	args.result = -1;
+	early_before = netvsc_host_early_completions();
+	stage_gate_arm(&tx_gate, NETVSC_HOST_TX_STAGE_BEFORE_COPY);
+	if (pthread_create(&thread, NULL, tx_thread_main, &args))
+		return __LINE__;
+	if (stage_gate_wait(&tx_gate)) {
+		failure = __LINE__;
+		goto release;
+	}
+	stage_gate_ids(&tx_gate, &transaction_id, NULL);
+	enqueue_rndis_send_complete(transaction_id);
+	mock_signal();
+	if (packet.free_count || netvsc_host_tx_active() != 1)
+		failure = __LINE__;
+release:
+	stage_gate_release(&tx_gate);
+	pthread_join(thread, NULL);
+	if (failure)
+		return failure;
+	CHECK(args.result == 0);
+	CHECK(packet.free_count == 0);
+	CHECK(netvsc_host_tx_active() == 0);
+	CHECK(netvsc_host_early_completions() == early_before + 1);
+	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
+			      &packet.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	mock_flush_tx();
+	CHECK(packet.free_count == 1);
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
+static int find_control_slot(__u64 transaction_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < CONFIG_LIBNETVSC_CONTROL_SLOTS; i++)
+		if (netvsc_host_control_transaction(i) == transaction_id)
+			return (int)i;
+	return -1;
+}
+
+static int test_control_publication_reentry(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 88,
+		.connection_id = 188,
+		.present = 1,
+	};
+	struct uk_netdev *netdev;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	(void)netdev;
+	mock.reenter_send_once = 1;
+	CHECK(netvsc_host_keepalive() == 0);
+	CHECK(netvsc_host_control_in_use() == 0);
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
+static int test_control_waiter_generation_races(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 89,
+		.connection_id = 189,
+		.present = 1,
+	};
+	struct control_thread_args first = { .result = -1 };
+	struct control_thread_args second = { .result = -1 };
+	struct uk_netdev *netdev;
+	pthread_t first_thread;
+	pthread_t second_thread;
+	__u64 first_transaction;
+	__u64 second_transaction;
+	__u32 first_request;
+	__u32 second_request;
+	__u32 duplicate_before;
+	__u32 unknown_before;
+	int first_slot;
+	int second_slot;
+	int failure = 0;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	(void)netdev;
+
+	stage_gate_arm(&control_wait_gate,
+		       NETVSC_HOST_CONTROL_STAGE_WAIT_DONE);
+	if (pthread_create(&first_thread, NULL, control_thread_main, &first))
+		return __LINE__;
+	if (stage_gate_wait(&control_wait_gate)) {
+		failure = __LINE__;
+		goto release_waiter;
+	}
+	stage_gate_ids(&control_wait_gate, &first_transaction,
+		       &first_request);
+	first_slot = find_control_slot(first_transaction);
+	if (!first_transaction || !first_request || first_slot < 0 ||
+	    netvsc_host_control_in_use() != 1)
+		failure = __LINE__;
+	duplicate_before = netvsc_host_duplicate_completions();
+	unknown_before = netvsc_host_unknown_completions();
+	enqueue_rndis_send_complete(first_transaction);
+	enqueue_rndis_control_complete(NETVSC_RNDIS_KEEPALIVE_COMPLETE,
+				       first_request);
+	enqueue_rndis_send_complete(first_transaction ^ 0x100000000ULL);
+	enqueue_rndis_control_complete(NETVSC_RNDIS_KEEPALIVE_COMPLETE,
+				       first_request ^ 0x10000U);
+	mock_signal();
+	if (!failure &&
+	    (netvsc_host_control_in_use() != 1 ||
+	     netvsc_host_control_transaction(first_slot) !=
+		     first_transaction))
+		failure = __LINE__;
+release_waiter:
+	stage_gate_release(&control_wait_gate);
+	pthread_join(first_thread, NULL);
+	if (failure)
+		return failure;
+	CHECK(first.result == 0);
+	CHECK(netvsc_host_control_in_use() == 0);
+	CHECK(netvsc_host_duplicate_completions() >= duplicate_before + 2);
+	CHECK(netvsc_host_unknown_completions() >= unknown_before + 2);
+
+	mock.suppress_control_nvs = 1;
+	mock.suppress_control_rndis = 1;
+	stage_gate_arm(&control_gate,
+		       NETVSC_HOST_CONTROL_STAGE_CANCELLED);
+	first.result = -1;
+	if (pthread_create(&first_thread, NULL, control_thread_main, &first))
+		return __LINE__;
+	if (stage_gate_wait(&control_gate)) {
+		failure = __LINE__;
+		goto release_cancel;
+	}
+	stage_gate_ids(&control_gate, &first_transaction, &first_request);
+	first_slot = find_control_slot(first_transaction);
+	if (!first_transaction || !first_request || first_slot < 0 ||
+	    netvsc_host_control_in_use() != 1)
+		failure = __LINE__;
+	enqueue_rndis_send_complete(first_transaction);
+	mock_signal();
+	if (!failure && netvsc_host_control_in_use() != 0)
+		failure = __LINE__;
+
+	mock.suppress_control_nvs = 0;
+	mock.suppress_control_rndis = 0;
+	stage_gate_arm(&control_wait_gate,
+		       NETVSC_HOST_CONTROL_STAGE_WAIT_DONE);
+	if (pthread_create(&second_thread, NULL, control_thread_main, &second)) {
+		failure = __LINE__;
+		goto release_cancel;
+	}
+	if (stage_gate_wait(&control_wait_gate)) {
+		failure = __LINE__;
+		stage_gate_release(&control_wait_gate);
+		pthread_join(second_thread, NULL);
+		goto release_cancel;
+	}
+	stage_gate_ids(&control_wait_gate, &second_transaction,
+		       &second_request);
+	second_slot = find_control_slot(second_transaction);
+	if (!failure &&
+	    (!second_transaction || !second_request ||
+	     second_transaction == first_transaction ||
+	     second_request == first_request || second_slot != first_slot ||
+	     netvsc_host_control_in_use() != 1))
+		failure = __LINE__;
+	enqueue_rndis_send_complete(first_transaction);
+	enqueue_rndis_control_complete(NETVSC_RNDIS_KEEPALIVE_COMPLETE,
+				       first_request);
+	mock_signal();
+	if (!failure &&
+	    (netvsc_host_control_in_use() != 1 ||
+	     netvsc_host_control_transaction(second_slot) !=
+		     second_transaction))
+		failure = __LINE__;
+	stage_gate_release(&control_gate);
+	pthread_join(first_thread, NULL);
+	if (!failure &&
+	    (first.result != -ETIMEDOUT ||
+	     netvsc_host_control_in_use() != 1 ||
+	     netvsc_host_control_transaction(second_slot) !=
+		     second_transaction))
+		failure = __LINE__;
+	stage_gate_release(&control_wait_gate);
+	pthread_join(second_thread, NULL);
+	if (failure)
+		return failure;
+	CHECK(second.result == 0);
+	CHECK(netvsc_host_control_in_use() == 0);
+	netvsc_host_remove_device(&offered);
+	return 0;
+
+release_cancel:
+	stage_gate_release(&control_gate);
+	pthread_join(first_thread, NULL);
+	return failure;
+}
+
 static int test_rx_bounds_headroom_and_reentry(struct uk_netdev *netdev)
 {
 	__u8 frame[80];
@@ -993,6 +1545,16 @@ static int test_rx_bounds_headroom_and_reentry(struct uk_netdev *netdev)
 			uk_netbuf_free(packet);
 		}
 	}
+
+	/* RX ranges may start between slots and safely span multiple slots. */
+	enqueue_frame_range(frame, sizeof(frame), 3, 4097);
+	mock_signal();
+	status = netdev->rx_one(netdev, netdev->_rx_queue[0], &packet);
+	CHECK((status & UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(packet->len == sizeof(frame));
+	CHECK(memcmp(packet->data, frame, sizeof(frame)) == 0);
+	uk_netbuf_free(packet);
+	packet = NULL;
 
 	/* A saturated TX ring defers, then retries, the receive completion. */
 	mock.ack_eagain = 2;
@@ -1258,6 +1820,13 @@ static int test_nvs_response_sizes_and_fallback(void)
 	mock.init_response_length = 16;
 	mock.receive_response_length = 28;
 	mock.send_response_length = 12;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	netvsc_host_remove_device(&offered);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.nvs_accept_index = 0;
+	mock.receive_end_offset = 1;
 	CHECK(netvsc_host_add_device(&offered) == 0);
 	netvsc_host_remove_device(&offered);
 
@@ -1568,6 +2137,18 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = test_gpa_fallback();
+	if (rc)
+		return rc;
+	rc = test_tx_publication_races();
+	if (rc)
+		return rc;
+	rc = test_tx_unpublished_early_completion();
+	if (rc)
+		return rc;
+	rc = test_control_publication_reentry();
+	if (rc)
+		return rc;
+	rc = test_control_waiter_generation_races();
 	if (rc)
 		return rc;
 	rc = test_post_publish_failure_quarantines_tx();

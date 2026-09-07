@@ -442,7 +442,7 @@ export fn netvsc_nvs_parse_receive_buffer_complete(
         const start = get32(bytes, offset);
         const slot_size = get32(bytes, offset + 4);
         const slot_count = get32(bytes, offset + 8);
-        const host_end = get32(bytes, offset + 12);
+        // EndOffset is informational; the computed span bounds every access.
         if (slot_size == 0 or (slot_size & 3) != 0 or slot_count == 0 or
             start >= buffer_size or (start & 3) != 0)
             return @intFromEnum(Result.invalid);
@@ -450,7 +450,7 @@ export fn netvsc_nvs_parse_receive_buffer_complete(
             return @intFromEnum(Result.overflow);
         const end = std.math.add(u32, start, span) catch
             return @intFromEnum(Result.overflow);
-        if (end > buffer_size or host_end < end - 1 or host_end > buffer_size)
+        if (end > buffer_size)
             return @intFromEnum(Result.invalid);
         sections[index] = .{
             .start = start,
@@ -607,9 +607,6 @@ export fn netvsc_nvs_parse_transfer_range(
             return @intFromEnum(Result.invalid);
         if (range_offset < section.start or range_end > section.end)
             continue;
-        if ((range_offset - section.start) % section.slot_size != 0 or
-            range_length > section.slot_size)
-            return @intFromEnum(Result.invalid);
         result.offset = range_offset;
         result.length = range_length;
         result.section_index = @intCast(index);
@@ -1045,6 +1042,16 @@ test "receive section table and transfer ranges are bounded" {
         &count,
     ));
     try std.testing.expectEqual(@as(u32, 2), count);
+    put32(&response, 24, 1);
+    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_receive_buffer_complete(
+        &response,
+        response.len,
+        16384,
+        &sections,
+        sections.len,
+        &count,
+    ));
+    put32(&response, 24, 8191);
 
     var descriptor = [_]u8{0} ** 24;
     put16(&descriptor, 0, rx_buffer_id);
@@ -1095,6 +1102,30 @@ test "receive section table and transfer ranges are bounded" {
         &range,
     ));
     try std.testing.expectEqual(@as(u16, 1), range.section_index);
+
+    put32(&descriptor, 8, 4097);
+    put32(&descriptor, 12, 3);
+    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_transfer_range(
+        &descriptor,
+        descriptor.len,
+        0,
+        16384,
+        &sections,
+        count,
+        &range,
+    ));
+    try std.testing.expectEqual(@as(u16, 0), range.section_index);
+    put32(&descriptor, 8, 300);
+    put32(&descriptor, 12, 8000);
+    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_transfer_range(
+        &descriptor,
+        descriptor.len,
+        0,
+        16384,
+        &sections,
+        count,
+        &range,
+    ));
 
     put32(&descriptor, 20, 16380);
     try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_transfer_range(
