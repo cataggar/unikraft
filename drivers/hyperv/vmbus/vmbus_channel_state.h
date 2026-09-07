@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <uk/arch/types.h>
 
 enum vmbus_transaction_type {
@@ -21,6 +22,21 @@ enum vmbus_channel_state {
 	CHANNEL_CLOSING,
 	CHANNEL_RESCINDED,
 };
+
+struct vmbus_rescind_plan {
+	__u8 send_close;
+	__u8 send_gpadl_teardown;
+};
+
+static inline struct vmbus_rescind_plan
+vmbus_channel_rescind_plan(__u8 state, int has_gpadl)
+{
+	struct vmbus_rescind_plan plan = { 0 };
+
+	plan.send_close = state == CHANNEL_OPENING || state == CHANNEL_OPEN;
+	plan.send_gpadl_teardown = !!has_gpadl;
+	return plan;
+}
 
 static inline int vmbus_channel_state_gpadl_created(__u8 *state)
 {
@@ -147,6 +163,26 @@ vmbus_transaction_cancel_channel(
 		cancelled++;
 	}
 	return cancelled;
+}
+
+/* IDs are never reused, including across reconnect epochs. */
+static inline int vmbus_monotonic_id_allocate(__u32 *next, __u32 *id)
+{
+	if (!*next)
+		return -ENOSPC;
+	*id = *next;
+	*next = *next == UINT32_MAX ? 0 : *next + 1;
+	return 0;
+}
+
+static inline int
+vmbus_transaction_completion_policy(int result, __u32 *ignored)
+{
+	if (result == -ENOENT || result == -EALREADY) {
+		__atomic_add_fetch(ignored, 1, __ATOMIC_RELAXED);
+		return 0;
+	}
+	return result;
 }
 
 #endif /* __VMBUS_CHANNEL_STATE_H__ */

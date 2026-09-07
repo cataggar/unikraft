@@ -3,8 +3,12 @@
 #include <errno.h>
 
 #include "vmbus_lifecycle.h"
+#include "vmbus_legacy_events.h"
 #include "vmbus_channel_state.h"
+#include "vmbus_channel_args.h"
+#include "vmbus_event_route.h"
 #include "vmbus_page_pool.h"
+#include "vmbus_signal_policy.h"
 #include "vmbus_queue.h"
 #include "vmbus_release.h"
 #include "vmbus_teardown.h"
@@ -458,6 +462,9 @@ static void test_channel_transaction_pool(void)
 	struct vmbus_channel_transaction transactions[2] = { 0 };
 	struct vmbus_channel_transaction *first;
 	struct vmbus_channel_transaction *second;
+	__u32 next = UINT32_MAX - 1;
+	__u32 id;
+	__u32 ignored = 0;
 
 	first = vmbus_transaction_allocate(transactions, 2,
 			VMBUS_TRANSACTION_GPADL_CREATE, 7, 100);
@@ -480,11 +487,23 @@ static void test_channel_transaction_pool(void)
 			VMBUS_TRANSACTION_GPADL_TEARDOWN, 7, 100));
 	assert(vmbus_transaction_cancel_channel(transactions, 2, 7,
 			(__u32)-ECANCELED) == 2);
+
+	assert(vmbus_monotonic_id_allocate(&next, &id) == 0);
+	assert(id == UINT32_MAX - 1);
+	assert(vmbus_monotonic_id_allocate(&next, &id) == 0);
+	assert(id == UINT32_MAX && next == 0);
+	assert(vmbus_monotonic_id_allocate(&next, &id) == -ENOSPC);
+	assert(vmbus_transaction_completion_policy(-ENOENT, &ignored) == 0);
+	assert(vmbus_transaction_completion_policy(-EALREADY, &ignored) == 0);
+	assert(ignored == 2);
+	assert(vmbus_transaction_completion_policy(-EPROTO, &ignored) ==
+	       -EPROTO);
 }
 
 static void test_channel_lifecycle_races(void)
 {
 	__u8 state = CHANNEL_ALLOCATED;
+	struct vmbus_rescind_plan plan;
 
 	assert(vmbus_channel_state_open_begin(&state) == -EPROTO);
 	assert(vmbus_channel_state_gpadl_created(&state) == 0);
@@ -495,6 +514,21 @@ static void test_channel_lifecycle_races(void)
 	vmbus_channel_state_rescind(&state);
 	assert(vmbus_channel_state_open_complete(&state, 0) == -EPROTO);
 	assert(vmbus_channel_state_close_begin(&state) == -EPROTO);
+
+	plan = vmbus_channel_rescind_plan(CHANNEL_ALLOCATED, 0);
+	assert(!plan.send_close && !plan.send_gpadl_teardown);
+	plan = vmbus_channel_rescind_plan(CHANNEL_ALLOCATED, 1);
+	assert(!plan.send_close && plan.send_gpadl_teardown);
+	plan = vmbus_channel_rescind_plan(CHANNEL_GPADL, 1);
+	assert(!plan.send_close && plan.send_gpadl_teardown);
+	plan = vmbus_channel_rescind_plan(CHANNEL_OPENING, 1);
+	assert(plan.send_close && plan.send_gpadl_teardown);
+	plan = vmbus_channel_rescind_plan(CHANNEL_OPEN, 1);
+	assert(plan.send_close && plan.send_gpadl_teardown);
+	plan = vmbus_channel_rescind_plan(CHANNEL_CLOSING, 1);
+	assert(!plan.send_close && plan.send_gpadl_teardown);
+	plan = vmbus_channel_rescind_plan(CHANNEL_RESCINDED, 0);
+	assert(!plan.send_close && !plan.send_gpadl_teardown);
 }
 
 static void test_ring_page_pool(void)
@@ -511,6 +545,75 @@ static void test_ring_page_pool(void)
 	vmbus_page_pool_free(used, 8, first, 4);
 	assert(vmbus_page_pool_allocate(used, 8, 2, &second) == 0);
 	assert(second == 0);
+}
+
+static void test_open_data_boundaries(void)
+{
+	unsigned char data[120] = { 0 };
+
+	assert(vmbus_channel_validate_open_data(NULL, 0, sizeof(data)) == 0);
+	assert(vmbus_channel_validate_open_data(NULL, 1, sizeof(data)) ==
+	       -EINVAL);
+	assert(vmbus_channel_validate_open_data(data, sizeof(data),
+						 sizeof(data)) == 0);
+	assert(vmbus_channel_validate_open_data(data, sizeof(data) + 1,
+						 sizeof(data)) == -EINVAL);
+}
+
+static void test_signal_connection_policy(void)
+{
+	assert(vmbus_signal_connection_id(VMBUS_VERSION_WS2008, 99) == 2);
+	assert(vmbus_signal_connection_id((1U << 16) | 1U, 99) == 99);
+}
+
+struct legacy_event_test {
+	__u32 events[8];
+	unsigned int count;
+	__u64 *race_word;
+};
+
+static void collect_legacy_event(__u32 relid, void *arg)
+{
+	struct legacy_event_test *test = arg;
+
+	test->events[test->count++] = relid;
+	if (relid == 3 && test->race_word)
+		__atomic_fetch_or(test->race_word, 1ULL << 9, __ATOMIC_RELEASE);
+}
+
+static void test_legacy_event_fanout(void)
+{
+	__u64 words[4] = {
+		(1ULL << 0) | (1ULL << 3),
+		1ULL << 5,
+		0,
+		1ULL << 63,
+	};
+	struct legacy_event_test test = {
+		.race_word = &words[0],
+	};
+
+	assert(vmbus_legacy_event_scan(words, 4, 192,
+			collect_legacy_event, &test) == 2);
+	assert(test.count == 2 && test.events[0] == 3 &&
+	       test.events[1] == 69);
+	assert(words[0] == (1ULL << 9));
+	assert(words[1] == 0 && words[3] == 0);
+	test.race_word = NULL;
+	assert(vmbus_legacy_event_scan(words, 4, 192,
+			collect_legacy_event, &test) == 1);
+	assert(test.events[2] == 9 && words[0] == 0);
+
+	test = (struct legacy_event_test){ 0 };
+	assert(vmbus_event_route(VMBUS_EVENT_VERSION_WIN8, 77, words, 4,
+			192, collect_legacy_event, &test) == 1);
+	assert(test.count == 1 && test.events[0] == 77);
+	assert(vmbus_event_route(VMBUS_EVENT_VERSION_WIN8, 192, words, 4,
+			192, collect_legacy_event, &test) == -ERANGE);
+	assert(vmbus_event_route(VMBUS_EVENT_VERSION_WIN8, 0, words, 4,
+			192, collect_legacy_event, &test) == -ERANGE);
+	assert(vmbus_event_route(VMBUS_EVENT_VERSION_WIN8 - 1, 3, words, 4,
+			192, collect_legacy_event, &test) == -EINVAL);
 }
 
 int main(void)
@@ -531,5 +634,8 @@ int main(void)
 	test_channel_transaction_pool();
 	test_channel_lifecycle_races();
 	test_ring_page_pool();
+	test_open_data_boundaries();
+	test_signal_connection_policy();
+	test_legacy_event_fanout();
 	return 0;
 }

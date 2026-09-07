@@ -10,9 +10,12 @@
 #include <uk/vmbus.h>
 
 #include "vmbus_channel_core.h"
+#include "vmbus_channel_args.h"
 #include "vmbus_channel_state.h"
 #include "vmbus_internal.h"
 #include "vmbus_page_pool.h"
+#include "vmbus_protocol.h"
+#include "vmbus_signal_policy.h"
 
 #define VMBUS_PAGE_SIZE			4096U
 #define VMBUS_CONTROL_TICKS_PER_MS	10000ULL
@@ -36,6 +39,9 @@ struct vmbus_channel {
 	__u8 gpadl_live;
 	__spinlock tx_lock;
 	__spinlock rx_lock;
+	__spinlock signal_lock;
+	struct vmbus_signal_input_abi signal_input __align(8);
+	__u64 signal_input_gpa;
 	vmbus_channel_callback_t callback;
 	void *callback_arg;
 };
@@ -48,8 +54,8 @@ static __u8 ring_pages[CONFIG_LIBVMBUS_RING_PAGES][VMBUS_PAGE_SIZE]
 static __u8 ring_page_used[CONFIG_LIBVMBUS_RING_PAGES];
 static __u32 next_gpadl_id = 0x10000U;
 static __u32 next_open_id = 1U;
-static __u64 signal_input_gpa;
 static unsigned int live_gpadls;
+static __u32 ignored_responses;
 static const __u8 empty_input;
 static __u8 empty_output;
 
@@ -89,6 +95,7 @@ static struct vmbus_channel *allocate_channel(struct vmbus_device *device)
 		channels[i].state = CHANNEL_ALLOCATED;
 		ukarch_spin_init(&channels[i].tx_lock);
 		ukarch_spin_init(&channels[i].rx_lock);
+		ukarch_spin_init(&channels[i].signal_lock);
 		device->channel = &channels[i];
 		return &channels[i];
 	}
@@ -114,6 +121,7 @@ static void release_channel_object(struct vmbus_channel *channel)
 	channel->gpadl_live = 0;
 	channel->callback = NULL;
 	channel->callback_arg = NULL;
+	channel->signal_input_gpa = 0;
 }
 
 static int allocate_ring_pages(unsigned int count, unsigned int *start)
@@ -190,9 +198,10 @@ static int create_gpadl(struct vmbus_channel *channel)
 		return -EINVAL;
 	if (live_gpadls >= CONFIG_LIBVMBUS_MAX_GPADLS)
 		return -ENOSPC;
-	channel->gpadl_id = next_gpadl_id++;
-	if (!channel->gpadl_id)
-		channel->gpadl_id = next_gpadl_id++;
+	rc = vmbus_monotonic_id_allocate(&next_gpadl_id,
+					 &channel->gpadl_id);
+	if (rc)
+		return rc;
 	transaction = transaction_allocate(VMBUS_TRANSACTION_GPADL_CREATE,
 			channel->device->channel_id, channel->gpadl_id);
 	if (!transaction) {
@@ -268,6 +277,24 @@ static int teardown_gpadl(struct vmbus_channel *channel)
 	return rc;
 }
 
+static int teardown_gpadl_nowait(struct vmbus_channel *channel)
+{
+	__u8 message[16];
+	int length;
+	int rc;
+
+	if (!channel->gpadl_id)
+		return 0;
+	length = vmbus_gpadl_teardown_message(message, sizeof(message),
+			channel->device->channel_id, channel->gpadl_id);
+	rc = transmit_message(message, length);
+	channel->gpadl_id = 0;
+	if (channel->gpadl_live && live_gpadls)
+		live_gpadls--;
+	channel->gpadl_live = 0;
+	return rc;
+}
+
 static int open_channel_control(struct vmbus_channel *channel,
 				const void *user_data, size_t user_data_size)
 {
@@ -276,9 +303,9 @@ static int open_channel_control(struct vmbus_channel *channel,
 	int length;
 	int rc;
 
-	channel->open_id = next_open_id++;
-	if (!channel->open_id)
-		channel->open_id = next_open_id++;
+	rc = vmbus_monotonic_id_allocate(&next_open_id, &channel->open_id);
+	if (rc)
+		return rc;
 	transaction = transaction_allocate(VMBUS_TRANSACTION_OPEN,
 			channel->device->channel_id, channel->open_id);
 	if (!transaction)
@@ -293,7 +320,7 @@ static int open_channel_control(struct vmbus_channel *channel,
 	rc = transmit_message(message, length);
 	if (!rc)
 		rc = transaction_wait(transaction);
-	{
+	if (__atomic_load_n(&transaction->done, __ATOMIC_ACQUIRE)) {
 		int transition_rc =
 			vmbus_channel_state_open_complete(&channel->state, rc);
 
@@ -330,18 +357,31 @@ static int signal_channel(struct vmbus_channel *channel)
 
 	if (!hyperv_has_signal_events())
 		return -EACCES;
-	if (!signal_input_gpa) {
-		signal_input_gpa = uk_paging_virt_to_phys(
-			(__vaddr_t)vmbus_signal_input());
-		if (signal_input_gpa == UK_PAGING_PADDR_INV ||
-		    (signal_input_gpa & 7))
-			return -EINVAL;
+	ukarch_spin_lock(&channel->signal_lock);
+	if (!channel->signal_input_gpa) {
+		channel->signal_input_gpa = uk_paging_virt_to_phys(
+			(__vaddr_t)&channel->signal_input);
+		if (channel->signal_input_gpa == UK_PAGING_PADDR_INV ||
+		    (channel->signal_input_gpa & 7)) {
+			rc = -EINVAL;
+			goto out;
+		}
 	}
+	/*
+	 * The offer's dedicated flag controls host-to-guest interrupt routing.
+	 * Guest-to-host notification still publishes the shared send bit before
+	 * SignalEvent, matching the TLFS connection/event contract and FreeBSD.
+	 */
 	rc = vmbus_control_set_event(channel->device->channel_id);
 	if (rc && rc != -ERANGE)
-		return rc;
-	return vmbus_signal_event(channel->device->connection_id, 0,
-			signal_input_gpa, channel_hypercall, NULL);
+		goto out;
+	rc = vmbus_signal_event(&channel->signal_input,
+			vmbus_signal_connection_id(vmbus_protocol_version(),
+				channel->device->connection_id), 0,
+			channel->signal_input_gpa, channel_hypercall, NULL);
+out:
+	ukarch_spin_unlock(&channel->signal_lock);
+	return rc;
 }
 
 int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
@@ -356,7 +396,8 @@ int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
 	if (!device || !device->present || device->subchannel_index ||
 	    tx_pages < 2 || rx_pages < 2 ||
 	    (__u32)tx_pages + rx_pages > CONFIG_LIBVMBUS_RING_PAGES ||
-	    user_data_size > VMBUS_USER_DATA_SIZE)
+	    vmbus_channel_validate_open_data(user_data, user_data_size,
+					      VMBUS_USER_DATA_SIZE))
 		return -EINVAL;
 	rc = vmbus_control_enter(&acquired);
 	if (rc)
@@ -561,6 +602,7 @@ int vmbus_channel_receive(struct vmbus_channel *channel,
 	packet->descriptor_size = meta.descriptor_size;
 	packet->payload_size = meta.payload_size;
 	packet->total_size = meta.total_size;
+	packet->trailer_mismatch = meta.trailer_mismatch;
 	if (meta.need_signal && signal_channel(channel))
 		return -EIO;
 	return 0;
@@ -646,7 +688,13 @@ int vmbus_channel_control_receive(const __u8 *message, size_t length)
 	rc = vmbus_transaction_complete(transactions,
 			CONFIG_LIBVMBUS_MAX_TRANSACTIONS, expected,
 			channel_id, id, status);
+	rc = vmbus_transaction_completion_policy(rc, &ignored_responses);
 	return rc ? -EPROTO : 0;
+}
+
+__u32 vmbus_channel_take_ignored_responses(void)
+{
+	return __atomic_exchange_n(&ignored_responses, 0, __ATOMIC_ACQ_REL);
 }
 
 void vmbus_channel_event(__u32 event)
@@ -663,7 +711,9 @@ void vmbus_channel_event(__u32 event)
 int vmbus_channel_rescind(__u32 channel_id)
 {
 	struct vmbus_channel *channel = find_channel(channel_id);
+	struct vmbus_rescind_plan plan;
 	int rc;
+	int cleanup_rc;
 
 	if (!channel)
 		return 0;
@@ -671,15 +721,25 @@ int vmbus_channel_rescind(__u32 channel_id)
 	(void)vmbus_transaction_cancel_channel(transactions,
 			CONFIG_LIBVMBUS_MAX_TRANSACTIONS, channel_id,
 			(__u32)-ECANCELED);
-	rc = close_channel_control(channel);
-	if (!rc)
-		rc = teardown_gpadl(channel);
-	if (rc)
-		return rc;
+	plan = vmbus_channel_rescind_plan(channel->state,
+					 channel->gpadl_id != 0);
+	rc = 0;
+	if (plan.send_close) {
+		__u8 message[12];
+		int length = vmbus_close_message(message, sizeof(message),
+						 channel_id);
+
+		rc = transmit_message(message, length);
+	}
+	if (plan.send_gpadl_teardown) {
+		cleanup_rc = teardown_gpadl_nowait(channel);
+		if (!rc)
+			rc = cleanup_rc;
+	}
 	free_ring_pages(channel->page_start, channel->page_count);
 	vmbus_channel_state_rescind(&channel->state);
 	release_channel_object(channel);
-	return 0;
+	return rc;
 }
 
 void vmbus_channel_close_all(void)
@@ -712,6 +772,6 @@ void vmbus_channel_reset_all(void)
 		ring_page_used[i] = 0;
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
 		release_channel_object(&channels[i]);
-	signal_input_gpa = 0;
 	live_gpadls = 0;
+	__atomic_store_n(&ignored_responses, 0, __ATOMIC_RELEASE);
 }

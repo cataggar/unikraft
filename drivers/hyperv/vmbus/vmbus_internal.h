@@ -13,6 +13,7 @@ int vmbus_control_release_relid(__u32 channel_id);
 void vmbus_control_fail(void);
 int vmbus_control_set_event(__u32 channel_id);
 int vmbus_channel_control_receive(const __u8 *message, size_t length);
+__u32 vmbus_channel_take_ignored_responses(void);
 void vmbus_channel_event(__u32 event);
 int vmbus_channel_rescind(__u32 channel_id);
 void vmbus_channel_close_all(void);

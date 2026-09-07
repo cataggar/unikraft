@@ -43,6 +43,7 @@ pub const PacketMeta = extern struct {
     payload_size: u32,
     total_size: u32,
     need_signal: u8,
+    trailer_mismatch: u8,
 };
 
 pub const GpaRange = extern struct {
@@ -60,11 +61,6 @@ pub const SignalInput = extern struct {
 
 pub const Hypercall = *const fn (?*anyopaque, u64) callconv(.c) u64;
 
-var signal_input: SignalInput align(8) = .{
-    .connection_id = 0,
-    .event_flag = 0,
-    .reserved = 0,
-};
 var fence_byte: u8 = 0;
 
 comptime {
@@ -238,7 +234,9 @@ export fn vmbus_ring_initialize(base: [*]u8, total_size: usize) callconv(.c) c_i
     return @intFromEnum(RingResult.ok);
 }
 
-export fn vmbus_ring_write(
+const InterleaveHook = ?*const fn ([*]u8, usize) void;
+
+fn ringWrite(
     base: [*]u8,
     total_size: usize,
     packet_type: u16,
@@ -249,7 +247,8 @@ export fn vmbus_ring_write(
     payload: [*]const u8,
     payload_size: usize,
     need_signal: *u8,
-) callconv(.c) c_int {
+    interleave: InterleaveHook,
+) c_int {
     const data_size_usize = validateRing(total_size) orelse
         return @intFromEnum(RingResult.invalid_ring);
     const data_size: u32 = @intCast(data_size_usize);
@@ -311,15 +310,34 @@ export fn vmbus_ring_write(
     put64(&footer, 0, @as(u64, old_write) << 32);
     cursor = ringCopyTo(base, data_size_usize, cursor, &footer);
 
+    storeHeader(base, 12, 0, .release);
     fullFence();
     storeHeader(base, 0, @intCast(cursor), .release);
-    storeHeader(base, 12, 0, .release);
+    fullFence();
+    if (interleave) |hook|
+        hook(base, data_size_usize);
+    const post_read = loadHeader(base, 4, .acquire);
     const masked = loadHeader(base, 8, .acquire);
-    need_signal.* = @intFromBool(masked == 0 and old_write == read);
+    need_signal.* = @intFromBool(masked == 0 and old_write == post_read);
     return @intFromEnum(RingResult.ok);
 }
 
-export fn vmbus_ring_read(
+export fn vmbus_ring_write(
+    base: [*]u8,
+    total_size: usize,
+    packet_type: u16,
+    flags: u16,
+    transaction_id: u64,
+    descriptor: [*]const u8,
+    descriptor_size: usize,
+    payload: [*]const u8,
+    payload_size: usize,
+    need_signal: *u8,
+) callconv(.c) c_int {
+    return ringWrite(base, total_size, packet_type, flags, transaction_id, descriptor, descriptor_size, payload, payload_size, need_signal, null);
+}
+
+fn ringRead(
     base: [*]u8,
     total_size: usize,
     meta: *PacketMeta,
@@ -327,7 +345,8 @@ export fn vmbus_ring_read(
     descriptor_capacity: usize,
     payload_out: [*]u8,
     payload_capacity: usize,
-) callconv(.c) c_int {
+    interleave: InterleaveHook,
+) c_int {
     const data_size_usize = validateRing(total_size) orelse
         return @intFromEnum(RingResult.invalid_ring);
     const data_size: u32 = @intCast(data_size_usize);
@@ -373,17 +392,16 @@ export fn vmbus_ring_read(
     var footer: [8]u8 = undefined;
     const footer_index = (read + packet_size) % data_size_usize;
     _ = ringCopyFrom(base, data_size_usize, footer_index, &footer);
-    if (get64(&footer, 0) != (@as(u64, read) << 32))
-        return @intFromEnum(RingResult.malformed);
-
     const old_free = writable(read, write, data_size).?;
     const new_read: u32 = @intCast((read + total) % data_size_usize);
     fullFence();
     storeHeader(base, 4, new_read, .release);
+    fullFence();
+    if (interleave) |hook|
+        hook(base, data_size_usize);
     const pending = loadHeader(base, 12, .acquire);
     const feature = loadHeader(base, 64, .acquire);
     const new_free = writable(new_read, write, data_size).?;
-    const masked = loadHeader(base, 8, .acquire);
 
     zero(meta);
     meta.packet_type = raw_type;
@@ -392,10 +410,25 @@ export fn vmbus_ring_read(
     meta.descriptor_size = @intCast(descriptor_size);
     meta.payload_size = @intCast(payload_size);
     meta.total_size = @intCast(total);
-    meta.need_signal = @intFromBool(masked == 0 and
-        (feature & pending_size_feature) != 0 and pending != 0 and
+    // The footer is informational; descriptor lengths define safe progress.
+    meta.trailer_mismatch = @intFromBool(
+        get64(&footer, 0) != (@as(u64, read) << 32),
+    );
+    meta.need_signal = @intFromBool((feature & pending_size_feature) != 0 and pending != 0 and
         old_free <= pending and new_free > pending);
     return @intFromEnum(RingResult.ok);
+}
+
+export fn vmbus_ring_read(
+    base: [*]u8,
+    total_size: usize,
+    meta: *PacketMeta,
+    descriptor_out: [*]u8,
+    descriptor_capacity: usize,
+    payload_out: [*]u8,
+    payload_capacity: usize,
+) callconv(.c) c_int {
+    return ringRead(base, total_size, meta, descriptor_out, descriptor_capacity, payload_out, payload_capacity, null);
 }
 
 export fn vmbus_ring_set_interrupt_mask(
@@ -534,11 +567,8 @@ export fn vmbus_gpadl_teardown_message(
     return 16;
 }
 
-export fn vmbus_signal_input() callconv(.c) *anyopaque {
-    return @ptrCast(&signal_input);
-}
-
 export fn vmbus_signal_event(
+    signal: *SignalInput,
     connection_id: u32,
     event_flag: u16,
     input_gpa: u64,
@@ -549,9 +579,10 @@ export fn vmbus_signal_event(
         return -1;
     if ((input_gpa & 7) != 0)
         return -2;
-    signal_input.connection_id = connection_id;
-    signal_input.event_flag = event_flag;
-    signal_input.reserved = 0;
+    signal.connection_id = connection_id;
+    signal.event_flag = event_flag;
+    signal.reserved = 0;
+    fullFence();
     return if (@as(u16, @truncate(hypercall(user_context, input_gpa))) == 0) 0 else -3;
 }
 
@@ -614,6 +645,7 @@ test "ring empty write read and notification suppression" {
         &out,
         out.len,
     ));
+    try std.testing.expectEqual(@as(u8, 0), meta.trailer_mismatch);
     try std.testing.expectEqual(@as(u64, 42), meta.transaction_id);
     try std.testing.expectEqualStrings(payload, out[0..payload.len]);
     try std.testing.expectEqual(@as(u32, 0), vmbus_ring_readable(ring.ptr, ring.len));
@@ -689,10 +721,71 @@ test "pending send threshold requests notification" {
     _ = vmbus_ring_write(ring.ptr, ring.len, 6, 0, 1, payload[0..0].ptr, 0, &payload, payload.len, &signal);
     const before = writable(loadHeader(ring.ptr, 4, .acquire), loadHeader(ring.ptr, 0, .acquire), @intCast(ring.len - page_size)).?;
     storeHeader(ring.ptr, 12, before + 64, .release);
+    storeHeader(ring.ptr, 8, 1, .release);
     var meta: PacketMeta = undefined;
     var desc: [8]u8 = undefined;
     var out: [160]u8 = undefined;
     _ = vmbus_ring_read(ring.ptr, ring.len, &meta, &desc, desc.len, &out, out.len);
+    try std.testing.expectEqual(@as(u8, 1), meta.need_signal);
+
+    _ = vmbus_ring_write(ring.ptr, ring.len, 6, 0, 2, payload[0..0].ptr, 0, &payload, payload.len, &signal);
+    storeHeader(ring.ptr, 12, @intCast(ring.len - page_size), .release);
+    _ = vmbus_ring_read(ring.ptr, ring.len, &meta, &desc, desc.len, &out, out.len);
+    try std.testing.expectEqual(@as(u8, 0), meta.need_signal);
+}
+
+test "write notification rechecks host drain and unmask after publication" {
+    const Hooks = struct {
+        var read_value: u32 = 0;
+        fn drain(base: [*]u8, _: usize) void {
+            storeHeader(base, 4, read_value, .release);
+        }
+        fn unmask(base: [*]u8, _: usize) void {
+            storeHeader(base, 8, 0, .release);
+        }
+    };
+    const ring = testRing(2);
+    _ = vmbus_ring_initialize(ring.ptr, ring.len);
+    const payload = [_]u8{1} ** 16;
+    var signal: u8 = 0;
+    _ = ringWrite(ring.ptr, ring.len, 6, 0, 1, payload[0..0].ptr, 0, &payload, payload.len, &signal, null);
+    Hooks.read_value = loadHeader(ring.ptr, 0, .acquire);
+    signal = 0;
+    _ = ringWrite(ring.ptr, ring.len, 6, 0, 2, payload[0..0].ptr, 0, &payload, payload.len, &signal, Hooks.drain);
+    try std.testing.expectEqual(@as(u8, 1), signal);
+
+    storeHeader(ring.ptr, 4, loadHeader(ring.ptr, 0, .acquire), .release);
+    storeHeader(ring.ptr, 8, 1, .release);
+    signal = 0;
+    _ = ringWrite(ring.ptr, ring.len, 6, 0, 3, payload[0..0].ptr, 0, &payload, payload.len, &signal, Hooks.unmask);
+    try std.testing.expectEqual(@as(u8, 1), signal);
+}
+
+test "read notification observes pending store after read publication" {
+    const Hooks = struct {
+        fn pending(base: [*]u8, data_size: usize) void {
+            storeHeader(base, 12, @intCast(data_size - 100), .release);
+        }
+    };
+    const ring = testRing(2);
+    _ = vmbus_ring_initialize(ring.ptr, ring.len);
+    const payload = [_]u8{1} ** 128;
+    var signal: u8 = 0;
+    _ = vmbus_ring_write(ring.ptr, ring.len, 6, 0, 1, payload[0..0].ptr, 0, &payload, payload.len, &signal);
+    storeHeader(ring.ptr, 8, 1, .release);
+    var meta: PacketMeta = undefined;
+    var desc: [8]u8 = undefined;
+    var out: [160]u8 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), ringRead(
+        ring.ptr,
+        ring.len,
+        &meta,
+        &desc,
+        desc.len,
+        &out,
+        out.len,
+        Hooks.pending,
+    ));
     try std.testing.expectEqual(@as(u8, 1), meta.need_signal);
 }
 
@@ -772,7 +865,7 @@ test "GPA direct descriptor validates ranges and PFNs" {
     ));
 }
 
-test "transfer page and footer validation reject host corruption" {
+test "transfer page validation rejects corruption and footer mismatch progresses" {
     const ring = testRing(2);
     _ = vmbus_ring_initialize(ring.ptr, ring.len);
     var transfer: [16]u8 = [_]u8{0} ** 16;
@@ -801,7 +894,17 @@ test "transfer page and footer validation reject host corruption" {
     var meta: PacketMeta = undefined;
     var desc: [32]u8 = undefined;
     var out: [32]u8 = undefined;
-    try std.testing.expectEqual(@intFromEnum(RingResult.malformed), vmbus_ring_read(
+    try std.testing.expectEqual(@as(c_int, 0), vmbus_ring_read(
+        ring.ptr,
+        ring.len,
+        &meta,
+        &desc,
+        desc.len,
+        &out,
+        out.len,
+    ));
+    try std.testing.expectEqual(@as(u8, 1), meta.trailer_mismatch);
+    try std.testing.expectEqual(@intFromEnum(RingResult.empty), vmbus_ring_read(
         ring.ptr,
         ring.len,
         &meta,
@@ -862,10 +965,48 @@ test "SignalEvent validates alignment and status" {
             return status;
         }
     };
-    try std.testing.expectEqual(@as(c_int, 0), vmbus_signal_event(7, 2, 0x1000, Fake.call, null));
-    try std.testing.expectEqual(@as(u32, 7), signal_input.connection_id);
-    try std.testing.expectEqual(@as(u16, 2), signal_input.event_flag);
-    try std.testing.expectEqual(@as(c_int, -2), vmbus_signal_event(7, 2, 0x1001, Fake.call, null));
+    var input: SignalInput align(8) = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), vmbus_signal_event(&input, 7, 2, 0x1000, Fake.call, null));
+    try std.testing.expectEqual(@as(u32, 7), input.connection_id);
+    try std.testing.expectEqual(@as(u16, 2), input.event_flag);
+    try std.testing.expectEqual(@as(c_int, -2), vmbus_signal_event(&input, 7, 2, 0x1001, Fake.call, null));
     Fake.status = 5;
-    try std.testing.expectEqual(@as(c_int, -3), vmbus_signal_event(7, 2, 0x1000, Fake.call, null));
+    try std.testing.expectEqual(@as(c_int, -3), vmbus_signal_event(&input, 7, 2, 0x1000, Fake.call, null));
+}
+
+test "per-channel SignalEvent inputs remain immutable across interleaving" {
+    const Interleave = struct {
+        var first: *SignalInput = undefined;
+        var second: *SignalInput = undefined;
+        var nested = false;
+        fn call(_: ?*anyopaque, gpa: u64) callconv(.c) u64 {
+            if (gpa == 0x1000 and !nested) {
+                nested = true;
+                _ = vmbus_signal_event(second, 22, 4, 0x2000, call, null);
+                tryExpect(first.connection_id == 11 and first.event_flag == 3);
+            } else if (gpa == 0x2000) {
+                tryExpect(second.connection_id == 22 and second.event_flag == 4);
+            }
+            return 0;
+        }
+        fn tryExpect(ok: bool) void {
+            if (!ok)
+                @panic("SignalEvent input was overwritten");
+        }
+    };
+    var first: SignalInput align(8) = undefined;
+    var second: SignalInput align(8) = undefined;
+    Interleave.first = &first;
+    Interleave.second = &second;
+    Interleave.nested = false;
+    try std.testing.expectEqual(@as(c_int, 0), vmbus_signal_event(
+        &first,
+        11,
+        3,
+        0x1000,
+        Interleave.call,
+        null,
+    ));
+    try std.testing.expectEqual(@as(u32, 11), first.connection_id);
+    try std.testing.expectEqual(@as(u32, 22), second.connection_id);
 }

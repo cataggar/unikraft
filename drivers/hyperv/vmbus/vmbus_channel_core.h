@@ -13,9 +13,16 @@ struct vmbus_packet_meta_abi {
 	__u32 payload_size;
 	__u32 total_size;
 	__u8 need_signal;
+	__u8 trailer_mismatch;
 };
 
 typedef __u64 (*vmbus_channel_hypercall_fn)(void *, __u64);
+
+struct vmbus_signal_input_abi {
+	__u32 connection_id;
+	__u16 event_flag;
+	__u16 reserved;
+};
 
 int vmbus_ring_initialize(__u8 *base, size_t total_size);
 int vmbus_ring_write(__u8 *base, size_t total_size, __u16 packet_type,
@@ -43,12 +50,14 @@ int vmbus_open_message(__u8 *output, size_t capacity, __u32 channel_id,
 int vmbus_close_message(__u8 *output, size_t capacity, __u32 channel_id);
 int vmbus_gpadl_teardown_message(__u8 *output, size_t capacity,
 				 __u32 channel_id, __u32 gpadl_id);
-void *vmbus_signal_input(void);
-int vmbus_signal_event(__u32 connection_id, __u16 event_flag,
+int vmbus_signal_event(struct vmbus_signal_input_abi *input,
+		       __u32 connection_id, __u16 event_flag,
 		       __u64 input_gpa, vmbus_channel_hypercall_fn hypercall,
 		       void *arg);
 
 _Static_assert(sizeof(struct vmbus_packet_meta_abi) == 32,
 	       "VMBus packet metadata ABI mismatch");
+_Static_assert(sizeof(struct vmbus_signal_input_abi) == 8,
+	       "VMBus SignalEvent ABI mismatch");
 
 #endif /* __VMBUS_CHANNEL_CORE_H__ */

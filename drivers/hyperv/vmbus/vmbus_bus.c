@@ -15,6 +15,7 @@
 
 #include "vmbus_protocol.h"
 #include "vmbus_lifecycle.h"
+#include "vmbus_event_route.h"
 #include "vmbus_queue.h"
 #include "vmbus_release.h"
 #include "vmbus_teardown.h"
@@ -27,6 +28,7 @@
 #define VMBUS_TEARDOWN_WAIT_LIMIT	100U
 #define VMBUS_RELID_CAPACITY		(CONFIG_LIBVMBUS_MAX_DEVICES + \
 					 CONFIG_LIBVMBUS_RX_QUEUE)
+#define VMBUS_LEGACY_EVENT_WORDS	(VMBUS_EVENT_LIMIT / 64U)
 
 struct vmbus_rx_entry {
 	__u32 generation;
@@ -169,26 +171,35 @@ void hyperv_vmbus_message(const struct hyperv_message *message)
 	signal_worker();
 }
 
-void hyperv_vmbus_event(__u32 event)
+static void enqueue_event(__u32 event, void *arg __unused)
 {
 	__u32 head;
 
-	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE))
-		return;
 	if (event >= VMBUS_EVENT_LIMIT) {
 		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
-		signal_worker();
 		return;
 	}
 	head = __atomic_load_n(&event_head, __ATOMIC_RELAXED);
 	if (head - __atomic_load_n(&event_tail, __ATOMIC_ACQUIRE) >=
 	    CONFIG_LIBVMBUS_RX_QUEUE) {
 		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
-		signal_worker();
 		return;
 	}
 	event_queue[head % CONFIG_LIBVMBUS_RX_QUEUE] = event;
 	__atomic_store_n(&event_head, head + 1, __ATOMIC_RELEASE);
+}
+
+void hyperv_vmbus_event(__u32 event)
+{
+	int rc;
+
+	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE))
+		return;
+	rc = vmbus_event_route(vmbus_protocol_version(), event,
+			(__u64 *)interrupt_page, VMBUS_LEGACY_EVENT_WORDS,
+			VMBUS_EVENT_LIMIT, enqueue_event, NULL);
+	if (rc < 0)
+		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
 	signal_worker();
 }
 
@@ -432,13 +443,14 @@ static int rescind_offer(__u32 channel_id)
 {
 	struct vmbus_relid_lifecycle *lifecycle;
 	unsigned int i;
+	int channel_rc;
+	int release_rc;
 
 	lifecycle = vmbus_relid_find(relids, VMBUS_RELID_CAPACITY,
 				     channel_id);
 	if (!lifecycle)
 		return 0;
-	if (vmbus_channel_rescind(channel_id))
-		return -EIO;
+	channel_rc = vmbus_channel_rescind(channel_id);
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
 		if (devices[i].present &&
 		    devices[i].channel_id == channel_id) {
@@ -447,9 +459,10 @@ static int rescind_offer(__u32 channel_id)
 		}
 	if (lifecycle->state == VMBUS_RELID_RELEASED) {
 		vmbus_relid_forget(relids, VMBUS_RELID_CAPACITY, channel_id);
-		return 0;
+		return channel_rc;
 	}
-	return release_channel(channel_id, 0);
+	release_rc = release_channel(channel_id, 0);
+	return channel_rc ? channel_rc : release_rc;
 }
 
 static int handle_action(const struct vmbus_action *action)
@@ -555,6 +568,10 @@ static void report_deferred_diagnostics(void)
 	if (count)
 		uk_pr_debug("VMBus: deferred %u channel event(s); channel rings "
 			    "are not implemented\n", count);
+	count = vmbus_channel_take_ignored_responses();
+	if (count)
+		uk_pr_debug("VMBus: ignored %u late/duplicate channel "
+			    "response(s)\n", count);
 }
 
 static void wait_once(void)
