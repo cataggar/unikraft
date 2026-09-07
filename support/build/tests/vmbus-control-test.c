@@ -5,6 +5,7 @@
 #include "vmbus_lifecycle.h"
 #include "vmbus_queue.h"
 #include "vmbus_release.h"
+#include "vmbus_teardown.h"
 
 enum test_message_type {
 	TEST_OFFER = 1,
@@ -116,27 +117,173 @@ static void test_unload_failure_still_resets(void)
 	assert(test.reset == 5);
 }
 
+struct teardown_test {
+	unsigned int busy_attempts;
+	unsigned int worker_checks;
+	unsigned int waits;
+	unsigned int stop_signals;
+	unsigned int deactivations;
+	unsigned int releases;
+	unsigned int busy_until;
+	unsigned int worker_until;
+	int self;
+	int owner;
+};
+
+static void teardown_deactivate(void *arg)
+{
+	struct teardown_test *test = arg;
+
+	test->deactivations++;
+}
+
+static void teardown_stop(void *arg, int can_schedule)
+{
+	struct teardown_test *test = arg;
+
+	assert(can_schedule == 0 || can_schedule == 1);
+	test->stop_signals++;
+}
+
+static int teardown_acquire(void *arg)
+{
+	struct teardown_test *test = arg;
+
+	return test->busy_attempts++ < test->busy_until ? -EBUSY : 0;
+}
+
+static int teardown_owner(void *arg)
+{
+	return ((struct teardown_test *)arg)->owner;
+}
+
+static void teardown_release(void *arg)
+{
+	((struct teardown_test *)arg)->releases++;
+}
+
+static int teardown_worker(void *arg)
+{
+	struct teardown_test *test = arg;
+
+	return test->worker_checks++ < test->worker_until;
+}
+
+static int teardown_self(void *arg)
+{
+	return ((struct teardown_test *)arg)->self;
+}
+
+static void teardown_wait(void *arg)
+{
+	((struct teardown_test *)arg)->waits++;
+}
+
+static const struct vmbus_teardown_ops teardown_ops = {
+	.deactivate_rx = teardown_deactivate,
+	.signal_stop = teardown_stop,
+	.try_acquire_control = teardown_acquire,
+	.control_owned_by_caller = teardown_owner,
+	.release_control = teardown_release,
+	.worker_present = teardown_worker,
+	.caller_is_worker = teardown_self,
+	.wait_once = teardown_wait,
+};
+
+static void test_bounded_teardown(void)
+{
+	struct teardown_test test = { .busy_until = 4 };
+	int acquired;
+
+	assert(vmbus_teardown_enter(&teardown_ops, &test, 1, 2,
+				    &acquired) == -EBUSY);
+	assert(!acquired);
+	assert(test.deactivations == 1 && test.stop_signals == 1);
+	assert(test.waits == 2);
+
+	test = (struct teardown_test){ .worker_until = 10 };
+	assert(vmbus_teardown_enter(&teardown_ops, &test, 1, 2,
+				    &acquired) == -ETIMEDOUT);
+	assert(!acquired);
+	assert(test.releases == 1);
+	assert(test.waits == 2);
+}
+
+static void test_context_aware_teardown(void)
+{
+	struct teardown_test test = {
+		.worker_until = 1,
+		.self = 1,
+	};
+	int acquired;
+
+	assert(vmbus_teardown_enter(&teardown_ops, &test, 1, 2,
+				    &acquired) == 0);
+	assert(acquired);
+	assert(test.waits == 0);
+
+	test = (struct teardown_test){ .worker_until = 1 };
+	assert(vmbus_teardown_enter(&teardown_ops, &test, 0, 2,
+				    &acquired) == -EWOULDBLOCK);
+	assert(!acquired);
+	assert(test.releases == 1);
+	assert(test.waits == 0);
+
+	test = (struct teardown_test){ .owner = 1 };
+	assert(vmbus_teardown_enter(&teardown_ops, &test, 1, 2,
+				    &acquired) == -EDEADLK);
+	assert(!acquired);
+	assert(test.deactivations == 1 && test.stop_signals == 1);
+}
+
+static void test_relid_lifecycles(void)
+{
+	enum { CAPACITY = 2 };
+	struct vmbus_relid_lifecycle entries[CAPACITY] = { 0 };
+	unsigned int id;
+
+	assert(vmbus_relid_offer(entries, CAPACITY, 7, 1) == 0);
+	assert(vmbus_relid_release_begin(entries, CAPACITY, 7) == 0);
+	vmbus_relid_release_finish(entries, CAPACITY, 7, 1, 0);
+	assert(vmbus_relid_release_begin(entries, CAPACITY, 7) == -ENOENT);
+	assert(vmbus_relid_offer(entries, CAPACITY, 7, 1) == 0);
+	assert(vmbus_relid_release_begin(entries, CAPACITY, 7) == 0);
+	vmbus_relid_release_finish(entries, CAPACITY, 7, 1, 0);
+
+	for (id = 1; id <= 32; id++) {
+		assert(vmbus_relid_offer(entries, CAPACITY, id, 1) == 0);
+		assert(vmbus_relid_release_begin(entries, CAPACITY, id) == 0);
+		vmbus_relid_release_finish(entries, CAPACITY, id, 1, 0);
+	}
+
+	assert(vmbus_relid_offer(entries, CAPACITY, 41, 1) == 0);
+	assert(vmbus_relid_release_begin(entries, CAPACITY, 41) == 0);
+	vmbus_relid_release_finish(entries, CAPACITY, 41, 0, 0);
+	assert(vmbus_relid_release_begin(entries, CAPACITY, 41) == 0);
+	vmbus_relid_release_finish(entries, CAPACITY, 41, 1, 0);
+	assert(vmbus_relid_release_begin(entries, CAPACITY, 41) == -ENOENT);
+
+	assert(vmbus_relid_offer(entries, CAPACITY, 55, 0) == 0);
+	assert(vmbus_relid_release_begin(entries, CAPACITY, 55) == 0);
+	vmbus_relid_release_finish(entries, CAPACITY, 55, 1, 1);
+	assert(vmbus_relid_release_begin(entries, CAPACITY, 55) == 1);
+	assert(vmbus_relid_offer(entries, CAPACITY, 55, 0) == 0);
+	assert(vmbus_relid_release_begin(entries, CAPACITY, 55) == 0);
+}
+
 int main(void)
 {
-	__u32 released[2] = { 0 };
-	unsigned int released_count = 0;
-
 	overflow_for_type(TEST_OFFER);
 	overflow_for_type(TEST_RESCIND);
 	overflow_for_type(TEST_ALL_OFFERS);
-
-	assert(vmbus_release_claim(released, &released_count, 2, 17) == 0);
-	/* A failed post keeps the claim and cannot generate a duplicate send. */
-	assert(vmbus_release_claim(released, &released_count, 2, 17) == 1);
-	assert(released_count == 1);
-	assert(vmbus_release_claim(released, &released_count, 2, 18) == 0);
-	assert(vmbus_release_claim(released, &released_count, 2, 19) ==
-	       -ENOSPC);
 
 	/* Offer-pool, enumeration-timeout, and worker-create failures. */
 	test_probe_unwind(-ENOSPC);
 	test_probe_unwind(-ETIMEDOUT);
 	test_probe_unwind(-ENOMEM);
 	test_unload_failure_still_resets();
+	test_bounded_teardown();
+	test_context_aware_teardown();
+	test_relid_lifecycles();
 	return 0;
 }
