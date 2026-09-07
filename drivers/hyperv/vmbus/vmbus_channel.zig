@@ -224,7 +224,8 @@ fn validateTransferPagesDescriptor(desc: []const u8) bool {
     const ranges = get32(desc, 4);
     if (owns > 1 or reserved != 0 or ranges > (desc.len - 8) / 8)
         return false;
-    if (8 + @as(usize, ranges) * 8 != desc.len)
+    const required = 8 + @as(usize, ranges) * 8;
+    if (required > desc.len or (desc.len - required) % 4 != 0)
         return false;
     for (0..ranges) |i| {
         const off = 8 + i * 8;
@@ -962,6 +963,98 @@ test "transfer page validation rejects corruption and footer mismatch progresses
         &out,
         out.len,
     ));
+    var padded4: [20]u8 = [_]u8{0} ** 20;
+    @memcpy(padded4[0..transfer.len], &transfer);
+    @memset(padded4[transfer.len..], 0xcc);
+    var padded8: [24]u8 = [_]u8{0} ** 24;
+    @memcpy(padded8[0..transfer.len], &transfer);
+    @memset(padded8[transfer.len..], 0xdd);
+    try std.testing.expect(validateTransferPagesDescriptor(&transfer));
+    try std.testing.expect(validateTransferPagesDescriptor(&padded4));
+    try std.testing.expect(validateTransferPagesDescriptor(&padded8));
+    try std.testing.expect(!validateTransferPagesDescriptor(transfer[0..15]));
+    var misaligned: [17]u8 = [_]u8{0} ** 17;
+    @memcpy(misaligned[0..transfer.len], &transfer);
+    try std.testing.expect(!validateTransferPagesDescriptor(&misaligned));
+    put32(&padded8, 4, std.math.maxInt(u32));
+    try std.testing.expect(!validateTransferPagesDescriptor(&padded8));
+
+    try std.testing.expectEqual(@as(c_int, 0), vmbus_ring_write(
+        ring.ptr,
+        ring.len,
+        7,
+        0,
+        9,
+        &padded4,
+        padded4.len,
+        payload.ptr,
+        payload.len,
+        &signal,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), vmbus_ring_read(
+        ring.ptr,
+        ring.len,
+        &meta,
+        &desc,
+        desc.len,
+        &out,
+        out.len,
+    ));
+    try std.testing.expectEqual(@as(u32, 24), meta.descriptor_size);
+    try std.testing.expectEqualStrings(payload, out[0..payload.len]);
+
+    _ = vmbus_ring_initialize(ring.ptr, ring.len);
+    try std.testing.expectEqual(@as(c_int, 0), vmbus_ring_write(
+        ring.ptr,
+        ring.len,
+        7,
+        0,
+        10,
+        &transfer,
+        transfer.len,
+        payload.ptr,
+        payload.len,
+        &signal,
+    ));
+    put16(ring.ptr[page_size .. page_size + packet_header_size], 2, 3);
+    try std.testing.expectEqual(@intFromEnum(RingResult.malformed), vmbus_ring_read(
+        ring.ptr,
+        ring.len,
+        &meta,
+        &desc,
+        desc.len,
+        &out,
+        out.len,
+    ));
+
+    _ = vmbus_ring_initialize(ring.ptr, ring.len);
+    try std.testing.expectEqual(@as(c_int, 0), vmbus_ring_write(
+        ring.ptr,
+        ring.len,
+        7,
+        0,
+        11,
+        &transfer,
+        transfer.len,
+        payload.ptr,
+        payload.len,
+        &signal,
+    ));
+    put16(
+        ring.ptr[page_size .. page_size + packet_header_size],
+        2,
+        std.math.maxInt(u16),
+    );
+    try std.testing.expectEqual(@intFromEnum(RingResult.malformed), vmbus_ring_read(
+        ring.ptr,
+        ring.len,
+        &meta,
+        &desc,
+        desc.len,
+        &out,
+        out.len,
+    ));
+
     transfer[3] = 1;
     try std.testing.expectEqual(@intFromEnum(RingResult.malformed), vmbus_ring_write(
         ring.ptr,

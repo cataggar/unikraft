@@ -397,6 +397,17 @@ Receive-section bounds are computed from the validated start, slot size, and
 slot count; the host's unused `EndOffset` is treated as informational. Inbound
 transfer ranges may be unaligned or span multiple slots, but every range must
 remain wholly inside one validated receive section and its registered GPADL.
+Transfer-page descriptors may contain 4-byte-aligned trailing padding between
+the range array and payload; parsers ignore only that bounded padding.
+
+NetVSC completion callbacks mark TX contexts complete without freeing their
+`uk_netbuf`. The optional `uknetdev` post-return hook records that the public
+wrapper has finished statistics accounting. Reclaim waits until every
+concurrent successful wrapper has crossed that handoff, then runs from a
+later TX operation or quiesced teardown and frees each packet exactly once.
+Transaction sequences
+rotate to a fresh nonzero generation only with no live TX, control, NVS, or
+pending-ACK state; generation exhaustion takes the device offline.
 
 Target Zig modules receive generated Kconfig headers through tracked build
 dependencies and can opt into narrow Unikraft include roots for `@cImport`.

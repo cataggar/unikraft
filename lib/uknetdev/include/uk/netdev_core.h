@@ -395,6 +395,14 @@ typedef int (*uk_netdev_tx_one_t)(struct uk_netdev *dev,
 				  struct uk_netbuf *pkt);
 
 /**
+ * Driver callback after the public TX wrapper has finished reading a
+ * successfully submitted packet (including optional statistics accounting).
+ */
+typedef void (*uk_netdev_tx_returned_t)(struct uk_netdev *dev,
+				       struct uk_netdev_tx_queue *queue,
+				       struct uk_netbuf *pkt);
+
+/**
  * A structure containing the functions exported by a driver.
  */
 struct uk_netdev_ops {
@@ -426,6 +434,7 @@ struct uk_netdev_ops {
 	uk_netdev_txq_configure_t       txq_configure;
 	uk_netdev_rxq_configure_t       rxq_configure;
 	uk_netdev_start_t               start;
+	uk_netdev_tx_returned_t         tx_returned;      /* optional */
 };
 
 /**
