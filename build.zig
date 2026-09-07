@@ -753,6 +753,16 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     test_step.dependOn(&b.addRunArtifact(vmbus_control_tests).step);
+    const vmbus_protocol_host_object = b.addObject(.{
+        .name = "vmbus-protocol-host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
     const vmbus_production_tests = b.addExecutable(.{
         .name = "vmbus-channel-production-test",
         .root_module = b.createModule(.{
@@ -789,6 +799,50 @@ pub fn build(b: *std.Build) void {
     vmbus_production_tests.root_module.linkSystemLibrary("pthread", .{});
     vmbus_production_tests.link_gc_sections = true;
     test_step.dependOn(&b.addRunArtifact(vmbus_production_tests).step);
+    const vmbus_disconnect_tests = b.addExecutable(.{
+        .name = "vmbus-disconnect-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    inline for (.{
+        "support/build/tests/vmbus-host-include",
+        "support/build/tests/vmbus-include",
+        "drivers/hyperv/vmbus",
+    }) |path| vmbus_disconnect_tests.root_module.addIncludePath(
+        b.path(path),
+    );
+    vmbus_disconnect_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "drivers/hyperv/vmbus/vmbus_bus.c",
+            "drivers/hyperv/vmbus/vmbus_channel.c",
+            "support/build/tests/vmbus-channel-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DVMBUS_CHANNEL_HOST_TEST",
+            "-DVMBUS_BUS_HOST_TEST",
+            "-DVMBUS_REAL_PROTOCOL_TEST",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-function",
+            "-Wno-unused-variable",
+            "-Wno-ignored-attributes",
+            "-Wno-documentation",
+            "-pthread",
+        },
+    });
+    vmbus_disconnect_tests.root_module.addObject(
+        vmbus_protocol_host_object,
+    );
+    vmbus_disconnect_tests.root_module.linkSystemLibrary("pthread", .{});
+    vmbus_disconnect_tests.link_gc_sections = true;
+    test_step.dependOn(&b.addRunArtifact(vmbus_disconnect_tests).step);
     const storvsc_core_host_object = b.addObject(.{
         .name = "storvsc-core-host",
         .root_module = b.createModule(.{
@@ -820,6 +874,7 @@ pub fn build(b: *std.Build) void {
             "-std=gnu11",
             "-DVMBUS_BUS_HOST_TEST",
             "-DVMBUS_EPOCH_ONLY_HOST_TEST",
+            "-Dvmbus_device_bind_epoch=vmbus_epoch_object_bind_epoch",
             "-Dvmbus_device_bind_retry=vmbus_epoch_object_bind_retry",
             "-Dvmbus_device_bind_ready=vmbus_epoch_object_bind_ready",
             "-ffunction-sections",
@@ -867,6 +922,9 @@ pub fn build(b: *std.Build) void {
     );
     storvsc_production_tests.root_module.addObject(
         storvsc_vmbus_epoch_object,
+    );
+    storvsc_production_tests.root_module.addObject(
+        vmbus_protocol_host_object,
     );
     storvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
     storvsc_production_tests.link_gc_sections = true;

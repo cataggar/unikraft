@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <errno.h>
-#include <limits.h>
 #include <hyperv/hyperv.h>
 #include <uk/arch/spinlock.h>
 #include <uk/bus.h>
@@ -127,12 +126,25 @@ static int clearing_devices;
 static __spinlock bind_lock;
 
 #ifdef VMBUS_BUS_HOST_TEST
+enum host_unload_response_mode {
+	HOST_UNLOAD_NONE,
+	HOST_UNLOAD_MATCH,
+	HOST_UNLOAD_DUPLICATE,
+	HOST_UNLOAD_WRONG_GENERATION,
+};
+
 static int (*host_pump_hook)(void);
 static __u8 host_last_tx[HYPERV_MESSAGE_PAYLOAD_SIZE];
 static size_t host_last_tx_len;
 static int host_transmit_error;
-static int host_teardown_result = INT_MIN;
-static unsigned int host_teardown_calls;
+static enum host_unload_response_mode host_unload_response_mode;
+static unsigned int host_unload_posts;
+static unsigned int host_unload_injections;
+static int host_unload_injected_inactive;
+static void (*host_remove_hook)(void *);
+static void *host_remove_hook_arg;
+static void (*host_unload_post_hook)(void *);
+static void *host_unload_post_hook_arg;
 static unsigned int host_connection_fail_calls;
 #endif
 
@@ -314,6 +326,68 @@ static void post_backoff(void *arg __unused, __u32 usec)
 	}
 }
 
+#ifdef VMBUS_BUS_HOST_TEST
+static void host_queue_unload_response(int wrong_generation)
+{
+	struct hyperv_message message = { 0 };
+
+	message.message_type = VMBUS_HV_MESSAGE_TYPE;
+	message.payload_size = 8;
+	message.payload[0] = 17;
+	if (!wrong_generation) {
+		if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE) &&
+		    vmbus_protocol_state() == VMBUS_STATE_UNLOADING)
+			host_unload_injected_inactive = 1;
+		hyperv_vmbus_message(&message);
+		host_unload_injections++;
+		return;
+	}
+	{
+		struct vmbus_rx_entry *entry;
+		__u32 generation = vmbus_protocol_generation();
+		__u32 ticket;
+
+		if (vmbus_queue_reserve(&rx_state, CONFIG_LIBVMBUS_RX_QUEUE,
+					&ticket))
+			return;
+		entry = &rx_queue[ticket % CONFIG_LIBVMBUS_RX_QUEUE];
+		entry->generation = generation == UINT32_MAX ?
+			generation - 1 : generation + 1;
+		entry->len = message.payload_size;
+		copy_bytes(entry->data, message.payload, entry->len);
+		vmbus_queue_commit(&rx_state, ticket);
+		host_unload_injections++;
+	}
+}
+
+static void host_handle_unload_transmit(const __u8 *message, size_t length)
+{
+	enum host_unload_response_mode mode;
+	__u32 type;
+
+	if (length < 4)
+		return;
+	type = (__u32)message[0] | ((__u32)message[1] << 8) |
+		((__u32)message[2] << 16) | ((__u32)message[3] << 24);
+	if (type != 16)
+		return;
+	host_unload_posts++;
+	if (host_unload_post_hook)
+		host_unload_post_hook(host_unload_post_hook_arg);
+	mode = host_unload_response_mode;
+	host_unload_response_mode = HOST_UNLOAD_NONE;
+	if (mode == HOST_UNLOAD_WRONG_GENERATION) {
+		host_queue_unload_response(1);
+		return;
+	}
+	if (mode == HOST_UNLOAD_MATCH ||
+	    mode == HOST_UNLOAD_DUPLICATE)
+		host_queue_unload_response(0);
+	if (mode == HOST_UNLOAD_DUPLICATE)
+		host_queue_unload_response(0);
+}
+#endif
+
 int vmbus_control_transmit(const __u8 *message, size_t length)
 {
 #ifndef VMBUS_BUS_HOST_TEST
@@ -327,6 +401,7 @@ int vmbus_control_transmit(const __u8 *message, size_t length)
 	host_last_tx_len = length;
 	if (host_transmit_error)
 		return host_transmit_error;
+	host_handle_unload_transmit(message, length);
 	return 0;
 #else
 	rc = vmbus_post_message(vmbus_protocol_connection_id(),
@@ -1170,13 +1245,6 @@ static int disconnect_locked(void)
 		rc = connection_teardown_error;
 		goto out_reset;
 	}
-#ifdef VMBUS_BUS_HOST_TEST
-	if (host_teardown_result != INT_MIN) {
-		host_teardown_calls++;
-		rc = host_teardown_result;
-		goto out_proof;
-	}
-#endif
 	/*
 	 * A local parser reset to IDLE/DISCONNECTED is not host teardown.
 	 * Every negotiated generation requires CHANNELMSG_UNLOAD_RESPONSE;
@@ -1567,22 +1635,63 @@ void vmbus_control_channel_resource_released(void)
 		bind_state_unlock(flags);
 		return;
 	}
+	if (channel_resource_epoch == UINT64_MAX) {
+		bind_state_unlock(flags);
+		return;
+	}
 	channel_resource_epoch++;
-	if (!channel_resource_epoch)
-		channel_resource_epoch = 1;
 	__atomic_store_n(&bind_work_pending, 1, __ATOMIC_RELEASE);
 	bind_state_unlock(flags);
 	signal_worker();
 }
 
-int vmbus_device_bind_retry(struct vmbus_device *device)
+int vmbus_device_bind_epoch(struct vmbus_device *device,
+			    struct vmbus_device_bind_token *token)
 {
-	__u64 epoch = vmbus_control_channel_capacity_epoch(device);
+	struct vmbus_device_binding *binding = device_binding(device);
+	unsigned long flags;
+	int rc = 0;
 
-	if (!epoch)
+	if (!binding || !token)
 		return -EINVAL;
-	vmbus_control_note_channel_capacity(device, epoch);
-	return -ENOSPC;
+	bind_state_lock(&flags);
+	if (binding->state != VMBUS_BIND_ADDING || !binding->generation ||
+	    !bind_attempt_active || bind_attempt_binding != binding ||
+	    bind_attempt_owner != uk_thread_current()) {
+		rc = -ESTALE;
+	} else {
+		token->device_generation = binding->generation;
+		token->resource_epoch = channel_resource_epoch;
+	}
+	bind_state_unlock(flags);
+	return rc;
+}
+
+int vmbus_device_bind_retry(
+	struct vmbus_device *device,
+	const struct vmbus_device_bind_token *token)
+{
+	struct vmbus_device_binding *binding = device_binding(device);
+	unsigned long flags;
+	int rc = -ENOSPC;
+
+	if (!binding || !token || !token->device_generation ||
+	    !token->resource_epoch)
+		return -EINVAL;
+	bind_state_lock(&flags);
+	if (binding->state != VMBUS_BIND_ADDING ||
+	    binding->generation != token->device_generation ||
+	    !bind_attempt_active || bind_attempt_binding != binding ||
+	    bind_attempt_owner != uk_thread_current()) {
+		rc = -ESTALE;
+	} else if (token->resource_epoch > channel_resource_epoch) {
+		rc = -EINVAL;
+	} else {
+		binding->failure_epoch = token->resource_epoch;
+		binding->capacity_failure = 1;
+	}
+	bind_state_unlock(flags);
+	return rc;
 }
 
 void vmbus_device_bind_ready(void)
@@ -1817,6 +1926,8 @@ enum host_bind_mode {
 	HOST_BIND_CASCADE,
 	HOST_BIND_REMOVE_PUMP,
 	HOST_BIND_EXPLICIT_RETRY,
+	HOST_BIND_EPOCH_RACE,
+	HOST_BIND_STALE_TOKEN,
 };
 
 static enum host_bind_mode host_bind_mode;
@@ -1832,6 +1943,8 @@ static __u32 host_cascade_channel;
 static __u32 host_remove_offer_channel;
 static int host_remove_active;
 static int host_add_during_remove;
+static int host_stale_retry_result;
+static struct vmbus_device_bind_token host_saved_bind_token;
 static struct vmbus_decoded_offer host_nested_offer;
 struct vmbus_channel *
 vmbus_channel_host_allocate_open(struct vmbus_device *device);
@@ -2000,9 +2113,34 @@ static int host_add_device(struct vmbus_device *dev)
 	}
 	host_add_b++;
 	if (host_bind_mode == HOST_BIND_EXPLICIT_RETRY) {
+		struct vmbus_device_bind_token token;
+
 		host_add_depth--;
-		return host_add_b == 1 ?
-			vmbus_device_bind_retry(dev) : 0;
+		if (host_add_b != 1)
+			return 0;
+		rc = vmbus_device_bind_epoch(dev, &token);
+		return rc ? rc : vmbus_device_bind_retry(dev, &token);
+	}
+	if (host_bind_mode == HOST_BIND_EPOCH_RACE) {
+		if (host_add_b == 1) {
+			rc = vmbus_device_bind_epoch(
+				dev, &host_saved_bind_token);
+			if (!rc)
+				vmbus_device_bind_ready();
+			if (!rc)
+				rc = vmbus_device_bind_retry(
+					dev, &host_saved_bind_token);
+			host_add_depth--;
+			return rc;
+		}
+		host_add_depth--;
+		return 0;
+	}
+	if (host_bind_mode == HOST_BIND_STALE_TOKEN) {
+		host_stale_retry_result = vmbus_device_bind_retry(
+			dev, &host_saved_bind_token);
+		host_add_depth--;
+		return 0;
 	}
 	if (host_bind_mode == HOST_BIND_PERMANENT) {
 		host_add_depth--;
@@ -2036,6 +2174,8 @@ static int host_add_device(struct vmbus_device *dev)
 static void host_remove_device(struct vmbus_device *dev __unused)
 {
 	host_remove_count++;
+	if (host_remove_hook)
+		host_remove_hook(host_remove_hook_arg);
 	if (host_add_active)
 		host_remove_during_add = 1;
 	if (host_bind_mode == HOST_BIND_REMOVE_PUMP &&
@@ -2095,8 +2235,14 @@ static void host_reset_state(void)
 	host_pump_hook = NULL;
 	host_last_tx_len = 0;
 	host_transmit_error = 0;
-	host_teardown_result = INT_MIN;
-	host_teardown_calls = 0;
+	host_unload_response_mode = HOST_UNLOAD_NONE;
+	host_unload_posts = 0;
+	host_unload_injections = 0;
+	host_unload_injected_inactive = 0;
+	host_remove_hook = NULL;
+	host_remove_hook_arg = NULL;
+	host_unload_post_hook = NULL;
+	host_unload_post_hook_arg = NULL;
 	__atomic_store_n(&host_connection_fail_calls, 0, __ATOMIC_RELAXED);
 	host_add_a = 0;
 	host_add_b = 0;
@@ -2110,6 +2256,9 @@ static void host_reset_state(void)
 	host_remove_offer_channel = 0;
 	host_remove_active = 0;
 	host_add_during_remove = 0;
+	host_stale_retry_result = 0;
+	host_zero(&host_saved_bind_token,
+		  sizeof(host_saved_bind_token));
 	bind_work_running = 0;
 	bind_attempt_active = 0;
 	bind_attempt_owner = NULL;
@@ -2311,6 +2460,44 @@ static int host_test_late_driver(void)
 	return 0;
 }
 
+static int host_test_bind_epoch_ordering(void)
+{
+	struct vmbus_decoded_offer offer;
+	__u64 old_generation;
+
+	host_reset_state();
+	host_bind_mode = HOST_BIND_EPOCH_RACE;
+	host_make_offer(&offer, 51);
+	if (add_offer(&offer) || host_add_b != 2 ||
+	    device_bindings[0].state != VMBUS_BIND_BOUND ||
+	    host_saved_bind_token.resource_epoch != 1 ||
+	    channel_resource_epoch != 2)
+		return 121;
+	process_bind_work();
+	if (host_add_b != 2 || bind_work_pending)
+		return 122;
+
+	old_generation = host_saved_bind_token.device_generation;
+	if (rescind_offer(51))
+		return 123;
+	host_bind_mode = HOST_BIND_STALE_TOKEN;
+	host_make_offer(&offer, 52);
+	if (add_offer(&offer) || host_stale_retry_result != -ESTALE ||
+	    device_bindings[0].state != VMBUS_BIND_BOUND ||
+	    device_bindings[0].generation == old_generation)
+		return 124;
+	process_bind_work();
+	if (host_add_b != 3)
+		return 125;
+
+	channel_resource_epoch = UINT64_MAX;
+	bind_work_pending = 0;
+	vmbus_device_bind_ready();
+	if (channel_resource_epoch != UINT64_MAX || bind_work_pending)
+		return 126;
+	return 0;
+}
+
 static int host_test_partial_add_cleanup(void)
 {
 	struct vmbus_decoded_offer offer;
@@ -2487,6 +2674,9 @@ int vmbus_bus_host_production_test(void)
 	rc = host_test_late_driver();
 	if (rc)
 		return rc;
+	rc = host_test_bind_epoch_ordering();
+	if (rc)
+		return rc;
 	rc = host_test_partial_add_cleanup();
 	if (rc)
 		return rc;
@@ -2502,85 +2692,185 @@ int vmbus_bus_host_production_test(void)
 	return host_test_same_relid_reoffer();
 }
 
+static int host_test_connection_start(void)
+{
+	struct vmbus_start_config config = {
+		.target_vp = 0,
+		.timeout_ticks = 30000,
+		.interrupt_page_gpa = 0x1000,
+		.parent_to_child_monitor_gpa = 0x2000,
+		.child_to_parent_monitor_gpa = 0x3000,
+	};
+	struct vmbus_action action;
+	int rc;
+
+	vmbus_protocol_reset();
+	drain_queues();
+	vmbus_queue_recover(&rx_state);
+	__atomic_store_n(&rx_active, 1, __ATOMIC_RELEASE);
+	vmbus_protocol_start(hyperv_reference_time(), &config, &action);
+	rc = handle_action(&action);
+	if (rc)
+		return rc;
+	return connection_generation_begin();
+}
+
 int vmbus_bus_host_quiesce_epoch_test(void)
 {
 	__u64 epoch;
-	unsigned int calls;
+	unsigned int posts;
 	int rc;
 
 	host_reset_state();
-	vmbus_channel_reset_all();
 	epoch = vmbus_connection_quiesce_epoch();
-	host_teardown_result = 0;
 	if (disconnect_locked() || vmbus_connection_quiesce_epoch() != epoch ||
-	    host_teardown_calls)
+	    host_unload_posts)
 		return 301;
 
-	if (connection_generation_begin())
+	if (host_test_connection_start())
 		return 302;
+	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+	host_unload_response_mode = HOST_UNLOAD_MATCH;
 	rc = disconnect_locked();
 	if (rc || vmbus_connection_quiesce_epoch() != epoch + 1 ||
-	    live_connection_generation || host_teardown_calls != 1)
+	    live_connection_generation || host_unload_posts != 1 ||
+	    host_unload_injections != 1 || !host_unload_injected_inactive)
 		return 303;
-	calls = host_teardown_calls;
+	posts = host_unload_posts;
 	if (disconnect_locked() ||
 	    vmbus_connection_quiesce_epoch() != epoch + 1 ||
-	    host_teardown_calls != calls)
+	    host_unload_posts != posts)
 		return 304;
 
-	if (connection_generation_begin())
+	epoch = vmbus_connection_quiesce_epoch();
+	if (host_test_connection_start())
 		return 305;
-	host_teardown_result = -ETIMEDOUT;
+	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+	host_unload_response_mode = HOST_UNLOAD_DUPLICATE;
+	rc = disconnect_locked();
+	if (rc || vmbus_connection_quiesce_epoch() != epoch + 1 ||
+	    host_unload_injections != 3 || host_unload_posts != posts + 1)
+		return 306;
+
+	epoch = vmbus_connection_quiesce_epoch();
+	if (host_test_connection_start())
+		return 307;
+	host_queue_unload_response(0);
+	if (process_messages() ||
+	    vmbus_protocol_state() == VMBUS_STATE_DISCONNECTED ||
+	    vmbus_connection_quiesce_epoch() != epoch)
+		return 308;
+	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
 	rc = disconnect_locked();
 	if (rc != -ETIMEDOUT ||
-	    vmbus_connection_quiesce_epoch() != epoch + 1 ||
+	    vmbus_connection_quiesce_epoch() != epoch ||
 	    !live_connection_generation || !connection_teardown_failed)
-		return 306;
-	calls = host_teardown_calls;
-	vmbus_protocol_reset();
-	if (disconnect_locked() != -ETIMEDOUT ||
-	    vmbus_connection_quiesce_epoch() != epoch + 1 ||
-	    host_teardown_calls != calls)
-		return 307;
-
-	live_connection_generation = 7;
-	next_connection_generation = 8;
-	connection_teardown_failed = 0;
-	connection_teardown_error = 0;
-	host_teardown_result = INT_MIN;
-	calls = host_teardown_calls;
-	vmbus_protocol_reset();
-	if (disconnect_locked() != -EIO ||
-	    vmbus_connection_quiesce_epoch() != epoch + 1 ||
-	    host_teardown_calls != calls || !connection_teardown_failed)
-		return 308;
-
-	live_connection_generation = 0;
-	connection_teardown_failed = 0;
-	connection_teardown_error = 0;
-	if (disconnect_locked() ||
-	    vmbus_connection_quiesce_epoch() != epoch + 1)
 		return 309;
+	posts = host_unload_posts;
+	if (disconnect_locked() != -ETIMEDOUT ||
+	    vmbus_connection_quiesce_epoch() != epoch ||
+	    host_unload_posts != posts)
+		return 310;
+	if (connection_generation_quiesce())
+		return 311;
 
-	host_teardown_result = 0;
-	for (unsigned int generation = 0; generation < 3; generation++) {
-		if (connection_generation_begin() || disconnect_locked())
-			return 310 + generation;
-	}
-	if (vmbus_connection_quiesce_epoch() != epoch + 4)
+	epoch = vmbus_connection_quiesce_epoch();
+	if (host_test_connection_start())
+		return 312;
+	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+	host_unload_response_mode = HOST_UNLOAD_WRONG_GENERATION;
+	rc = disconnect_locked();
+	if (rc != -ETIMEDOUT ||
+	    vmbus_connection_quiesce_epoch() != epoch ||
+	    !connection_teardown_failed)
 		return 313;
+	if (connection_generation_quiesce())
+		return 314;
+
+	epoch = vmbus_connection_quiesce_epoch();
+	if (host_test_connection_start())
+		return 315;
+	vmbus_protocol_reset();
+	posts = host_unload_posts;
+	if (disconnect_locked() != -EIO ||
+	    vmbus_connection_quiesce_epoch() != epoch ||
+	    host_unload_posts != posts || !connection_teardown_failed)
+		return 316;
+	if (disconnect_locked() != -EIO ||
+	    vmbus_connection_quiesce_epoch() != epoch ||
+	    host_unload_posts != posts)
+		return 317;
+	if (connection_generation_quiesce())
+		return 318;
+
+	for (unsigned int generation = 0; generation < 3; generation++) {
+		epoch = vmbus_connection_quiesce_epoch();
+		if (host_test_connection_start())
+			return 319 + (int)generation * 2;
+		__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+		host_unload_response_mode = HOST_UNLOAD_MATCH;
+		if (disconnect_locked() ||
+		    vmbus_connection_quiesce_epoch() != epoch + 1)
+			return 320 + (int)generation * 2;
+	}
 
 	live_connection_generation = 0;
 	next_connection_generation = UINT64_MAX;
 	connection_teardown_failed = 0;
-	if (connection_generation_begin() || disconnect_locked() ||
-	    next_connection_generation ||
+	if (connection_generation_begin() || next_connection_generation ||
+	    connection_generation_quiesce() ||
 	    connection_generation_begin() != -ENOSPC)
-		return 314;
+		return 325;
+
+	live_connection_generation = 1;
+	connection_teardown_failed = 0;
+	connection_quiesce_epoch = UINT64_MAX;
+	if (connection_generation_quiesce() != -ENOSPC ||
+	    !live_connection_generation ||
+	    connection_quiesce_epoch != UINT64_MAX)
+		return 326;
 
 	host_reset_state();
 	vmbus_channel_reset_all();
 	return 0;
+}
+
+int vmbus_bus_host_prepare_disconnect(void)
+{
+	host_reset_state();
+	return host_test_connection_start();
+}
+
+int vmbus_bus_host_disconnect_remove(
+	void (*remove_hook)(void *), void *remove_arg,
+	void (*unload_post_hook)(void *), void *unload_arg,
+	int acknowledge)
+{
+	struct vmbus_decoded_offer offer;
+	struct vmbus_device_binding *binding = &device_bindings[0];
+	int rc;
+
+	if (!live_connection_generation)
+		return -ENODEV;
+	host_make_offer(&offer, 77);
+	copy_offer(&devices[0], &offer);
+	binding->generation = device_generation++;
+	binding->state = VMBUS_BIND_BOUND;
+	devices[0].driver = &host_driver;
+	device_count = 1;
+	host_remove_hook = remove_hook;
+	host_remove_hook_arg = remove_arg;
+	host_unload_post_hook = unload_post_hook;
+	host_unload_post_hook_arg = unload_arg;
+	host_unload_response_mode = acknowledge ?
+		HOST_UNLOAD_MATCH : HOST_UNLOAD_NONE;
+	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+	rc = disconnect_locked();
+	host_remove_hook = NULL;
+	host_remove_hook_arg = NULL;
+	host_unload_post_hook = NULL;
+	host_unload_post_hook_arg = NULL;
+	return rc;
 }
 
 int vmbus_bus_host_connection_begin(void)

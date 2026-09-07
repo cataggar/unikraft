@@ -4,6 +4,7 @@ vmbus_reconnect
 vmbus_unload
 vmbus_connection_fail
 vmbus_connection_quiesce_epoch
+vmbus_device_bind_epoch
 vmbus_device_bind_retry
 vmbus_device_bind_ready
 _vmbus_register_driver
