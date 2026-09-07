@@ -150,6 +150,7 @@ void storvsc_host_pfn_copy_hook(__u64 transaction_id, const __u64 *pfns,
 				unsigned int written);
 void storvsc_host_recovery_begin_hook(void);
 void storvsc_host_reset_ack_hook(void);
+void storvsc_host_deferred_epoch_sample_hook(__u64 epoch);
 #endif
 
 static struct vmbus_channel *
@@ -1640,6 +1641,7 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 #ifdef STORVSC_HOST_TEST
 	busy_retry_limit = storvsc_busy_retry_limit;
 	busy_retry_timeout_ns = storvsc_busy_retry_timeout_ns;
+	storvsc_host_deferred_epoch_sample_hook(quiesce_epoch);
 #endif
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	if (device->deferred_action == STORVSC_DEFER_NONE) {
@@ -1647,7 +1649,9 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 		return 0;
 	}
 	if (device->deferred_wait_vmbus) {
-		if (quiesce_epoch == device->deferred_vmbus_epoch) {
+		/* Pair the proof read with the locked obligation snapshot. */
+		if (vmbus_connection_quiesce_epoch() ==
+		    device->deferred_vmbus_epoch) {
 			ukplat_spin_unlock_irqrestore(&device->lock, flags);
 			return -EINPROGRESS;
 		}
@@ -1935,6 +1939,35 @@ unsigned int storvsc_host_deferred_close_attempts(void)
 	attempts = device->deferred_close_attempts;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	return attempts;
+}
+
+__u64 storvsc_host_deferred_vmbus_epoch(void)
+{
+	struct storvsc_device *device = &storvsc_devices[0];
+	unsigned long flags;
+	__u64 epoch;
+
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	epoch = device->deferred_vmbus_epoch;
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return epoch;
+}
+
+int storvsc_host_update_deferred_vmbus_epoch(__u64 expected,
+					     __u64 replacement)
+{
+	struct storvsc_device *device = &storvsc_devices[0];
+	unsigned long flags;
+	int rc = 0;
+
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	if (!replacement || !device->deferred_wait_vmbus ||
+	    device->deferred_vmbus_epoch != expected)
+		rc = -EINVAL;
+	else
+		device->deferred_vmbus_epoch = replacement;
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return rc;
 }
 
 int storvsc_host_request_bound(struct uk_blkreq *request)
