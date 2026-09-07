@@ -24,6 +24,11 @@ int storvsc_host_receive(void);
 int storvsc_host_reset_timed_out_io(void);
 int storvsc_host_start_timeout_worker(void);
 void storvsc_host_stop_timeout_worker(void);
+void storvsc_host_set_send_wait_limit(unsigned int limit);
+int storvsc_host_deferred_action(void);
+int storvsc_host_online(void);
+int storvsc_host_has_channel(void);
+void storvsc_host_force_timeout(void);
 
 struct uk_thread {
 	pthread_t pthread;
@@ -101,11 +106,21 @@ static unsigned int race_pfns_written;
 static uint64_t race_first_pfn;
 static struct uk_blkreq *race_sender_request;
 static atomic_int race_post_completion_publication;
+static atomic_int host_irqs_disabled;
+static atomic_int channel_mask_calls;
+static atomic_int channel_unmask_calls;
 
 enum {
 	RACE_PAUSE_NONE,
 	RACE_PAUSE_BEFORE_PFNS,
 	RACE_PAUSE_DURING_VMBUS_COPY,
+};
+
+enum {
+	TEST_DEFER_NONE,
+	TEST_DEFER_RESET,
+	TEST_DEFER_FATAL,
+	TEST_DEFER_REMOVE,
 };
 
 static uint32_t get_le32(const uint8_t *bytes, size_t offset)
@@ -249,6 +264,11 @@ static void *thread_start(void *argument)
 struct uk_alloc *uk_alloc_get_default(void)
 {
 	return &host_allocator;
+}
+
+int storvsc_host_irqs_disabled(void)
+{
+	return atomic_load(&host_irqs_disabled);
 }
 
 struct uk_sched *uk_sched_current(void)
@@ -665,6 +685,7 @@ void vmbus_channel_set_callback(struct vmbus_channel *channel,
 
 int vmbus_channel_mask_interrupts(struct vmbus_channel *channel)
 {
+	atomic_fetch_add(&channel_mask_calls, 1);
 	if (!channel || !channel->open)
 		return -ENODEV;
 	channel->masked = 1;
@@ -673,6 +694,7 @@ int vmbus_channel_mask_interrupts(struct vmbus_channel *channel)
 
 int vmbus_channel_unmask_interrupts(struct vmbus_channel *channel)
 {
+	atomic_fetch_add(&channel_unmask_calls, 1);
 	if (!channel || !channel->open)
 		return -ENODEV;
 	channel->masked = 0;
@@ -760,6 +782,13 @@ static void complete_pending(unsigned int duplicates)
 					   pending[i].length);
 	}
 	pending_count = 0;
+}
+
+static void drop_packets(void)
+{
+	pthread_mutex_lock(&packet_lock);
+	packet_head = packet_tail;
+	pthread_mutex_unlock(&packet_lock);
 }
 
 static int configure_device(struct uk_blkdev *device, uint16_t descriptors,
@@ -868,6 +897,27 @@ static int wait_race_flag(int *flag)
 					    &deadline);
 	pthread_mutex_unlock(&race_lock);
 	return rc ? -ETIMEDOUT : 0;
+}
+
+static int wait_atomic_value(atomic_int *value, int expected,
+			     unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		if (atomic_load(value) == expected)
+			return 0;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
+static int wait_deferred_action(int expected, unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		if (storvsc_host_deferred_action() == expected)
+			return 0;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
 }
 
 static void reset_race_state(int pause_kind, struct uk_blkreq *sender)
@@ -1033,6 +1083,279 @@ out:
 	return error;
 }
 
+static int run_terminal_reset_quiesce(struct uk_blkdev *device,
+				      uint8_t *buffer, int irqs_disabled,
+				      int error_base)
+{
+	struct uk_blkreq victim;
+	struct uk_blkreq sender;
+	struct uk_blkreq retry;
+	struct submit_thread_context submit_context = {
+		.device = device,
+	};
+	struct reset_thread_context reset_context = { 0 };
+	atomic_int victim_callbacks;
+	atomic_int sender_callbacks;
+	pthread_t submit_tid;
+	pthread_t reset_tid;
+	int submit_created = 0;
+	int reset_created = 0;
+	int error = 0;
+	int mask_calls;
+	int unmask_calls;
+
+	atomic_init(&victim_callbacks, 0);
+	atomic_init(&sender_callbacks, 0);
+	atomic_init(&submit_context.done, 0);
+	atomic_init(&reset_context.done, 0);
+	initialize_request(&victim, UK_BLKREQ_READ, 60, 1, buffer,
+			   request_done, &victim_callbacks);
+	initialize_request(&sender, UK_BLKREQ_READ, 61, 8, buffer + 512,
+			   request_done, &sender_callbacks);
+	initialize_request(&retry, UK_BLKREQ_READ, 70, 1, buffer + 8192,
+			   NULL, NULL);
+	submit_context.request = &sender;
+	storvsc_host_stop_timeout_worker();
+	storvsc_host_set_send_wait_limit(2);
+	atomic_store(&host_irqs_disabled, irqs_disabled);
+	hold_io = 1;
+	pending_count = 0;
+	if (!(device->submit_one(device, device->_queue[0], &victim) &
+	      UK_BLKDEV_STATUS_SUCCESS))
+		return error_base;
+	reset_race_state(RACE_PAUSE_BEFORE_PFNS, &sender);
+	if (pthread_create(&submit_tid, NULL, submit_thread,
+			   &submit_context)) {
+		error = error_base + 1;
+		goto out;
+	}
+	submit_created = 1;
+	if (wait_race_flag(&race_hook_entered)) {
+		error = error_base + 2;
+		goto out;
+	}
+	if (pthread_create(&reset_tid, NULL, reset_thread, &reset_context)) {
+		error = error_base + 3;
+		goto out;
+	}
+	reset_created = 1;
+	if (wait_race_flag(&race_recovery_begin) ||
+	    wait_atomic_value(&reset_context.done, 1, 1000)) {
+		error = error_base + 4;
+		goto out;
+	}
+	atomic_store(&host_irqs_disabled, 0);
+	if (reset_context.result != -EINPROGRESS ||
+	    storvsc_host_online() ||
+	    storvsc_host_deferred_action() != TEST_DEFER_RESET ||
+	    storvsc_host_has_channel() ||
+	    atomic_load(&victim_callbacks) ||
+	    atomic_load(&sender_callbacks) ||
+	    atomic_load(&victim.state.counter) == UK_BLKREQ_FINISHED ||
+	    atomic_load(&sender.state.counter) == UK_BLKREQ_FINISHED ||
+	    device->submit_one(device, device->_queue[0], &retry) !=
+		    -ENODEV ||
+	    device->submit_one(device, device->_queue[0], &retry) !=
+		    -ENODEV) {
+		error = error_base + 5;
+		goto out;
+	}
+	mask_calls = atomic_load(&channel_mask_calls);
+	unmask_calls = atomic_load(&channel_unmask_calls);
+	if (device->dev_ops->queue_intr_enable(device, device->_queue[0]) !=
+		    -ENODEV ||
+	    device->dev_ops->queue_intr_disable(device, device->_queue[0]) !=
+		    -ENODEV ||
+	    atomic_load(&channel_mask_calls) != mask_calls ||
+	    atomic_load(&channel_unmask_calls) != unmask_calls) {
+		error = error_base + 6;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	if (!race_pfn_source || race_pfns_written)
+		error = error_base + 7;
+	pthread_mutex_unlock(&race_lock);
+
+out:
+	atomic_store(&host_irqs_disabled, 0);
+	pthread_mutex_lock(&race_lock);
+	race_release_sender = 1;
+	race_release_reset = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	if (submit_created)
+		pthread_join(submit_tid, NULL);
+	if (reset_created)
+		pthread_join(reset_tid, NULL);
+	if (!error && wait_deferred_action(TEST_DEFER_NONE, 1000))
+		error = error_base + 8;
+	if (!error &&
+	    (!(submit_context.result & UK_BLKDEV_STATUS_SUCCESS) ||
+	     victim.result != -ETIMEDOUT ||
+	     sender.result != -ETIMEDOUT ||
+	     atomic_load(&victim_callbacks) != 1 ||
+	     atomic_load(&sender_callbacks) != 1 ||
+	     atomic_load(&race_post_completion_publication)))
+		error = error_base + 9;
+	if (!error) {
+		complete_pending(1);
+		fire_channel();
+		if (atomic_load(&victim_callbacks) != 1 ||
+		    atomic_load(&sender_callbacks) != 1)
+			error = error_base + 10;
+	}
+	drop_packets();
+	pending_count = 0;
+	hold_io = 0;
+	storvsc_host_set_send_wait_limit(2000);
+	pthread_mutex_lock(&race_lock);
+	race_pause_kind = RACE_PAUSE_NONE;
+	race_sender_request = NULL;
+	pthread_mutex_unlock(&race_lock);
+	return error;
+}
+
+static int run_terminal_remove_quiesce(
+	struct vmbus_driver *driver, struct vmbus_device *vmbus_device,
+	struct uk_blkdev *device, uint8_t *buffer, int race_fatal,
+	int error_base)
+{
+	struct uk_blkreq victim;
+	struct uk_blkreq sender;
+	struct uk_blkreq retry;
+	struct submit_thread_context submit_context = {
+		.device = device,
+	};
+	atomic_int victim_callbacks;
+	atomic_int sender_callbacks;
+	pthread_t submit_tid;
+	int submit_created = 0;
+	int error = 0;
+	int mask_calls;
+	int unmask_calls;
+
+	atomic_init(&victim_callbacks, 0);
+	atomic_init(&sender_callbacks, 0);
+	atomic_init(&submit_context.done, 0);
+	initialize_request(&victim, UK_BLKREQ_READ, 80, 1, buffer,
+			   request_done, &victim_callbacks);
+	initialize_request(&sender, UK_BLKREQ_READ, 81, 8, buffer + 512,
+			   request_done, &sender_callbacks);
+	initialize_request(&retry, UK_BLKREQ_READ, 90, 1, buffer + 8192,
+			   NULL, NULL);
+	submit_context.request = &sender;
+	storvsc_host_set_send_wait_limit(2);
+	hold_io = 1;
+	pending_count = 0;
+	if (!(device->submit_one(device, device->_queue[0], &victim) &
+	      UK_BLKDEV_STATUS_SUCCESS))
+		return error_base;
+	reset_race_state(RACE_PAUSE_DURING_VMBUS_COPY, &sender);
+	if (pthread_create(&submit_tid, NULL, submit_thread,
+			   &submit_context)) {
+		error = error_base + 1;
+		goto out;
+	}
+	submit_created = 1;
+	if (wait_race_flag(&race_hook_entered)) {
+		error = error_base + 2;
+		goto out;
+	}
+	if (race_fatal) {
+		storvsc_host_force_timeout();
+		if (wait_deferred_action(TEST_DEFER_FATAL, 1000)) {
+			error = error_base + 3;
+			goto out;
+		}
+		enqueue_completion(last_io_id, 64, 0, 1, 0,
+				   last_io_length);
+		fire_channel();
+	}
+	driver->remove_dev(vmbus_device);
+	if (storvsc_host_online() ||
+	    storvsc_host_deferred_action() != TEST_DEFER_REMOVE ||
+	    storvsc_host_has_channel() ||
+	    atomic_load(&victim_callbacks) ||
+	    atomic_load(&sender_callbacks) ||
+	    atomic_load(&victim.state.counter) == UK_BLKREQ_FINISHED ||
+	    atomic_load(&sender.state.counter) == UK_BLKREQ_FINISHED ||
+	    device->submit_one(device, device->_queue[0], &retry) !=
+		    -ENODEV) {
+		error = error_base + 4;
+		goto out;
+	}
+	mask_calls = atomic_load(&channel_mask_calls);
+	unmask_calls = atomic_load(&channel_unmask_calls);
+	if (device->dev_ops->queue_intr_enable(device, device->_queue[0]) !=
+		    -ENODEV ||
+	    device->dev_ops->queue_intr_disable(device, device->_queue[0]) !=
+		    -ENODEV ||
+	    atomic_load(&channel_mask_calls) != mask_calls ||
+	    atomic_load(&channel_unmask_calls) != unmask_calls) {
+		error = error_base + 5;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	if (!race_pfn_source || !race_pfns_written ||
+	    race_pfn_source[0] != race_first_pfn)
+		error = error_base + 6;
+	pthread_mutex_unlock(&race_lock);
+	if (error)
+		goto out;
+	enqueue_completion(last_io_id, 64, 0, 1, 0, last_io_length);
+	fire_channel();
+
+out:
+	pthread_mutex_lock(&race_lock);
+	race_release_sender = 1;
+	race_release_reset = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	if (submit_created)
+		pthread_join(submit_tid, NULL);
+	if (!error && wait_deferred_action(TEST_DEFER_NONE, 1000))
+		error = error_base + 7;
+	if (!error &&
+	    (!(submit_context.result & UK_BLKDEV_STATUS_SUCCESS) ||
+	     victim.result != -ENODEV ||
+	     sender.result != -ENODEV ||
+	     atomic_load(&victim_callbacks) != 1 ||
+	     atomic_load(&sender_callbacks) != 1 ||
+	     atomic_load(&race_post_completion_publication)))
+		error = error_base + 8;
+	if (!error) {
+		complete_pending(1);
+		fire_channel();
+		if (atomic_load(&victim_callbacks) != 1 ||
+		    atomic_load(&sender_callbacks) != 1)
+			error = error_base + 9;
+	}
+	drop_packets();
+	pending_count = 0;
+	hold_io = 0;
+	storvsc_host_set_send_wait_limit(2000);
+	pthread_mutex_lock(&race_lock);
+	race_pause_kind = RACE_PAUSE_NONE;
+	race_sender_request = NULL;
+	pthread_mutex_unlock(&race_lock);
+	return error;
+}
+
+static int reoffer_device(struct vmbus_driver *driver,
+			  struct vmbus_device *vmbus_device,
+			  struct uk_blkdev *device)
+{
+	driver->remove_dev(vmbus_device);
+	if (vmbus_device->channel)
+		(void)vmbus_channel_close(vmbus_device->channel);
+	vmbus_device->present = 1;
+	if (driver->add_dev(vmbus_device))
+		return -EIO;
+	if (!storvsc_host_online() || !storvsc_host_has_channel())
+		return -ENODEV;
+	return device->dev_ops->queue_intr_enable(device, device->_queue[0]);
+}
+
 int main(void)
 {
 	struct vmbus_driver *driver = storvsc_host_driver();
@@ -1170,6 +1493,29 @@ int main(void)
 		return rc;
 	if (storvsc_host_start_timeout_worker())
 		return 19;
+
+	rc = run_terminal_reset_quiesce(device, buffer, 0, 140);
+	if (rc)
+		return rc;
+	if (reoffer_device(driver, &vmbus_device, device))
+		return 154;
+	rc = run_terminal_reset_quiesce(device, buffer, 1, 160);
+	if (rc)
+		return rc;
+	if (reoffer_device(driver, &vmbus_device, device))
+		return 174;
+	rc = run_terminal_remove_quiesce(driver, &vmbus_device, device,
+					 buffer, 0, 180);
+	if (rc)
+		return rc;
+	if (reoffer_device(driver, &vmbus_device, device))
+		return 190;
+	rc = run_terminal_remove_quiesce(driver, &vmbus_device, device,
+					 buffer, 1, 200);
+	if (rc)
+		return rc;
+	if (reoffer_device(driver, &vmbus_device, device))
+		return 210;
 
 	hold_io = 1;
 	initialize_request(&request, UK_BLKREQ_READ, 8, 1, buffer,
