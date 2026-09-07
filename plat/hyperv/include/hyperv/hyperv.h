@@ -21,6 +21,7 @@ enum hyperv_detect_result {
 	HYPERV_DETECT_TIME_REF_PRIVILEGE = 6,
 	HYPERV_DETECT_SYNIC_PRIVILEGE = 7,
 	HYPERV_DETECT_STIMER_PRIVILEGE = 8,
+	HYPERV_DETECT_VP_INDEX_PRIVILEGE = 9,
 };
 
 enum hyperv_enable_result {
@@ -77,6 +78,11 @@ int hyperv_synic_enable(__u64 simp_gpa, __u64 siefp_gpa,
 			__u64 reference_tsc_gpa, __u8 message_vector,
 			__u8 timer_vector);
 void hyperv_synic_disable(void);
+int hyperv_reference_tsc_enable(__u64 reference_tsc_gpa);
+void hyperv_reference_tsc_disable(void);
+int hyperv_synic_cpu_enable(__u64 simp_gpa, __u64 siefp_gpa,
+			    __u8 message_vector, __u8 timer_vector);
+void hyperv_synic_cpu_disable(void);
 __u64 hyperv_hypercall(__u64 control, __u64 input_gpa, __u64 output_gpa);
 __u16 hyperv_status_code(__u64 result);
 __u16 hyperv_status_kind(__u64 result);
@@ -93,10 +99,19 @@ void hyperv_stimer0_arm(__u64 deadline);
 void hyperv_stimer0_cancel(void);
 int hyperv_synic_message_take(__u32 sint, struct hyperv_message *message);
 int hyperv_synic_event_take_word(__u32 sint, __u32 word, __u64 *value);
+int hyperv_synic_message_take_page(void *page, __u32 sint,
+				   struct hyperv_message *message);
+int hyperv_synic_event_take_word_page(void *page, __u32 sint, __u32 word,
+				      __u64 *value);
+__u32 hyperv_vp_index(void);
+__u32 hyperv_max_vp_count(void);
+__u32 hyperv_vmbus_target_vp(void);
+int hyperv_time_shutdown(int crash);
 void hyperv_clock_set_efi_sample(__u64 epoch_ns, __u64 reference_time);
 
 void hyperv_vmbus_message(const struct hyperv_message *message);
 void hyperv_vmbus_event(__u32 event);
+void hyperv_vmbus_event_word(__u32 base_event, __u64 pending);
 void hyperv_vmbus_fini(void);
 
 _Static_assert(HYPERV_PAGE_SIZE == 4096U, "Hyper-V pages are 4 KiB");
