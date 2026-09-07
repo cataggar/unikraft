@@ -13,9 +13,11 @@ struct vmbus_device;
 #define NETVSC_HOST_TX_STAGE_SECTION_COPY 2U
 #define NETVSC_HOST_TX_STAGE_BUILD_RANGES 3U
 #define NETVSC_HOST_TX_STAGE_AFTER_PUBLISH 4U
+#define NETVSC_HOST_TX_STAGE_WRAPPER_RETURN 5U
 #define NETVSC_HOST_CONTROL_STAGE_AFTER_PUBLISH 1U
 #define NETVSC_HOST_CONTROL_STAGE_WAIT_DONE 2U
 #define NETVSC_HOST_CONTROL_STAGE_CANCELLED 3U
+#define NETVSC_HOST_NVS_STAGE_WAITING 1U
 
 struct netvsc_device *netvsc_host_device(void);
 int netvsc_host_add_device(struct vmbus_device *device);
@@ -40,6 +42,12 @@ __u32 netvsc_host_duplicate_completions(void);
 __u32 netvsc_host_early_completions(void);
 __u32 netvsc_host_malformed_messages(void);
 int netvsc_host_keepalive(void);
+int netvsc_host_nvs_probe(void);
+void netvsc_host_set_identity(__u32 generation, __u64 next_transaction,
+			      __u16 next_request);
+__u32 netvsc_host_generation(void);
+__u64 netvsc_host_next_transaction(void);
+int netvsc_host_nvs_active(void);
 void netvsc_host_reset(void);
 int netvsc_host_process_transfer(const __u8 *descriptor,
 				 size_t descriptor_length,

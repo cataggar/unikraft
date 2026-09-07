@@ -45,6 +45,7 @@
 #define NETVSC_CONTROL_STAGE_AFTER_PUBLISH 1U
 #define NETVSC_CONTROL_STAGE_WAIT_DONE	2U
 #define NETVSC_CONTROL_STAGE_CANCELLED	3U
+#define NETVSC_NVS_STAGE_WAITING		1U
 
 #define NETVSC_RX_BUFFER_SIZE		((size_t)CONFIG_LIBNETVSC_RX_BUFFER_MB * \
 					 1024U * 1024U)
@@ -85,7 +86,7 @@ enum netvsc_tx_state {
 	/* Completion may be recorded, but only the publishing sender finalizes. */
 	NETVSC_TX_BUILDING,
 	NETVSC_TX_SENT,
-	NETVSC_TX_COMPLETING,
+	NETVSC_TX_COMPLETED,
 };
 
 struct netvsc_control {
@@ -125,6 +126,7 @@ struct netvsc_tx_context {
 	__u8 state;
 	__u8 completion_pending;
 	__u8 completion_malformed;
+	__u8 upper_done;
 	__u8 header[NETVSC_RNDIS_HEADER_SIZE];
 	struct vmbus_gpa_range ranges[NETVSC_GPA_MAX_RANGES];
 	__u64 pfns[NETVSC_GPA_MAX_PFNS];
@@ -188,6 +190,8 @@ struct netvsc_device {
 	__u16 pending_ack_tail;
 	__u16 pending_ack_count;
 	__u16 operations;
+	__u16 id_reservations;
+	__u16 tx_wrapper_pending;
 	__u16 quarantined_tx_count;
 	__u8 initialized;
 	__u8 attaching;
@@ -223,20 +227,26 @@ static __u8 netvsc_payload_scratch[NETVSC_PACKET_SCRATCH_SIZE];
 static void netvsc_channel_callback(struct vmbus_channel *channel, void *arg);
 static void netvsc_drain_channel(struct netvsc_device *device);
 static void netvsc_detach_host(struct netvsc_device *device, int revoked);
+static void netvsc_clear_id_tombstones(struct netvsc_device *device);
+static void netvsc_tx_reclaim_completed(struct netvsc_device *device);
 
 #ifdef NETVSC_HOST_TEST
 extern void netvsc_host_tx_stage(unsigned int stage, __u64 transaction_id);
 extern void netvsc_host_control_stage(unsigned int stage,
 				      __u64 transaction_id,
 				      __u32 request_id);
+extern void netvsc_host_nvs_stage(unsigned int stage, __u64 transaction_id);
 #define NETVSC_TX_STAGE(stage, id)	netvsc_host_tx_stage((stage), (id))
 #define NETVSC_CONTROL_STAGE(stage, tx, req) \
 	netvsc_host_control_stage((stage), (tx), (req))
+#define NETVSC_NVS_STAGE(stage, tx)	netvsc_host_nvs_stage((stage), (tx))
 #else
 #define NETVSC_TX_STAGE(stage, id) \
 	do { (void)(stage); (void)(id); } while (0)
 #define NETVSC_CONTROL_STAGE(stage, tx, req) \
 	do { (void)(stage); (void)(tx); (void)(req); } while (0)
+#define NETVSC_NVS_STAGE(stage, tx) \
+	do { (void)(stage); (void)(tx); } while (0)
 #endif
 
 static void netvsc_fail_channel(struct netvsc_device *device)
@@ -361,38 +371,123 @@ static void netvsc_init_once(struct netvsc_device *device)
 	device->initialized = 1;
 }
 
+static int netvsc_generation_busy_locked(struct netvsc_device *device)
+{
+	unsigned long flags;
+	unsigned int i;
+	int busy = device->id_reservations || device->pending_ack_count;
+
+	if (busy)
+		return 1;
+	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
+	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++)
+		if (device->tx[i].state != NETVSC_TX_FREE) {
+			busy = 1;
+			break;
+		}
+	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
+	if (busy)
+		return 1;
+	ukplat_spin_lock_irqsave(&device->control_lock, flags);
+	busy = device->nvs_wait.active;
+	for (i = 0; !busy && i < CONFIG_LIBNETVSC_CONTROL_SLOTS; i++)
+		busy = device->controls[i].state != NETVSC_CONTROL_FREE;
+	ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
+	return busy;
+}
+
+static int netvsc_generation_rotate_locked(struct netvsc_device *device)
+{
+	if (netvsc_generation_busy_locked(device))
+		return -EAGAIN;
+	if (!device->generation || device->generation == UINT16_MAX)
+		return -EOVERFLOW;
+	device->generation++;
+	device->next_transaction = 1;
+	device->next_request = 1;
+	netvsc_clear_id_tombstones(device);
+	return 0;
+}
+
+static int netvsc_id_reserve_locked(struct netvsc_device *device,
+				    int needs_request)
+{
+	int exhausted = !device->next_transaction ||
+		device->next_transaction > UINT32_MAX ||
+		(needs_request && !device->next_request);
+	int rc;
+
+	if (exhausted) {
+		rc = netvsc_generation_rotate_locked(device);
+		if (rc)
+			return rc;
+	}
+	if (!device->generation || device->id_reservations == UINT16_MAX)
+		return -ENOSPC;
+	device->id_reservations++;
+	return 0;
+}
+
+static void netvsc_id_reservation_end(struct netvsc_device *device)
+{
+	unsigned long flags;
+
+	ukplat_spin_lock_irqsave(&device->state_lock, flags);
+	UK_ASSERT(device->id_reservations != 0);
+	device->id_reservations--;
+	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
+}
+
+static void netvsc_id_exhausted(struct netvsc_device *device)
+{
+	uk_pr_err("NetVSC: transaction generation exhausted; taking device offline\n");
+	netvsc_fail_channel(device);
+}
+
 static int netvsc_transaction_id(struct netvsc_device *device, __u64 *id)
 {
 	unsigned long flags;
 	__u64 sequence;
+	int rc;
 
 	ukplat_spin_lock_irqsave(&device->state_lock, flags);
-	sequence = device->next_transaction;
-	if (!sequence || sequence > UINT32_MAX || !device->generation) {
+	rc = netvsc_id_reserve_locked(device, 0);
+	if (rc) {
 		ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
-		return -ENOSPC;
+		if (rc == -EOVERFLOW)
+			netvsc_id_exhausted(device);
+		return rc;
 	}
+	sequence = device->next_transaction;
 	device->next_transaction++;
 	*id = ((__u64)device->generation << 32) | sequence;
 	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
 	return 0;
 }
 
-static int netvsc_request_id(struct netvsc_device *device, __u32 *id)
+static int netvsc_control_ids(struct netvsc_device *device,
+			      __u32 *request_id, __u64 *transaction_id)
 {
 	unsigned long flags;
-	__u16 sequence;
+	__u16 request_sequence;
+	__u64 transaction_sequence;
+	int rc;
 
 	ukplat_spin_lock_irqsave(&device->state_lock, flags);
-	sequence = device->next_request;
-	if (!sequence || device->generation > UINT16_MAX) {
+	rc = netvsc_id_reserve_locked(device, 1);
+	if (rc) {
 		ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
-		return -ENOSPC;
+		if (rc == -EOVERFLOW)
+			netvsc_id_exhausted(device);
+		return rc;
 	}
+	request_sequence = device->next_request;
+	transaction_sequence = device->next_transaction;
 	device->next_request++;
-	if (!device->next_request)
-		device->next_request = 0;
-	*id = (device->generation << 16) | sequence;
+	device->next_transaction++;
+	*request_id = (device->generation << 16) | request_sequence;
+	*transaction_id = ((__u64)device->generation << 32) |
+		transaction_sequence;
 	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
 	return 0;
 }
@@ -437,6 +532,22 @@ static void netvsc_count_early_completion(struct netvsc_device *device)
 {
 	(void)__atomic_add_fetch(&device->early_completions, 1,
 				 __ATOMIC_RELAXED);
+}
+
+static void netvsc_clear_id_tombstones(struct netvsc_device *device)
+{
+	unsigned int i;
+
+	for (i = 0; i < NETVSC_ID_TOMBSTONES; i++) {
+		__atomic_store_n(&device->transaction_tombstones[i], 0,
+				 __ATOMIC_RELEASE);
+		__atomic_store_n(&device->request_tombstones[i], 0,
+				 __ATOMIC_RELEASE);
+	}
+	__atomic_store_n(&device->transaction_tombstone_next, 0,
+			 __ATOMIC_RELAXED);
+	__atomic_store_n(&device->request_tombstone_next, 0,
+			 __ATOMIC_RELAXED);
 }
 
 static int netvsc_known_transaction(const struct netvsc_device *device,
@@ -550,7 +661,7 @@ static int netvsc_single_gpa(const void *data, __u32 length,
 
 static struct netvsc_control *
 netvsc_control_allocate(struct netvsc_device *device, __u32 expected_type,
-			int needs_rndis)
+			int needs_rndis, int *error)
 {
 	unsigned long flags;
 	unsigned int i;
@@ -558,8 +669,9 @@ netvsc_control_allocate(struct netvsc_device *device, __u32 expected_type,
 	__u32 request_id;
 	__u64 transaction_id;
 
-	if (netvsc_request_id(device, &request_id) ||
-	    netvsc_transaction_id(device, &transaction_id))
+	netvsc_tx_reclaim_completed(device);
+	*error = netvsc_control_ids(device, &request_id, &transaction_id);
+	if (*error)
 		return NULL;
 	ukplat_spin_lock_irqsave(&device->control_lock, flags);
 	for (i = 0; i < CONFIG_LIBNETVSC_CONTROL_SLOTS; i++) {
@@ -577,6 +689,9 @@ netvsc_control_allocate(struct netvsc_device *device, __u32 expected_type,
 		break;
 	}
 	ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
+	netvsc_id_reservation_end(device);
+	if (!control)
+		*error = -ENOSPC;
 	return control;
 }
 
@@ -878,13 +993,15 @@ static int netvsc_rndis_execute(struct netvsc_device *device,
 static int netvsc_rndis_initialize_device(struct netvsc_device *device)
 {
 	struct netvsc_rndis_completion completion;
-	struct netvsc_control *control = netvsc_control_allocate(device,
-			NETVSC_RNDIS_INITIALIZE_COMPLETE, 1);
+	struct netvsc_control *control;
 	unsigned int index;
 	int length;
+	int rc;
 
+	control = netvsc_control_allocate(device,
+			NETVSC_RNDIS_INITIALIZE_COMPLETE, 1, &rc);
 	if (!control)
-		return -ENOSPC;
+		return rc;
 	index = netvsc_control_index(device, control);
 	length = netvsc_rndis_build_initialize(netvsc_control_pages[index],
 			NETVSC_CONTROL_PAGE_SIZE, control->request_id, 2048);
@@ -905,13 +1022,15 @@ static int netvsc_rndis_initialize_device(struct netvsc_device *device)
 static int netvsc_rndis_query(struct netvsc_device *device, __u32 oid,
 			      void *output, size_t *output_length)
 {
-	struct netvsc_control *control = netvsc_control_allocate(device,
-			NETVSC_RNDIS_QUERY_COMPLETE, 1);
+	struct netvsc_control *control;
 	unsigned int index;
 	int length;
+	int rc;
 
+	control = netvsc_control_allocate(device,
+			NETVSC_RNDIS_QUERY_COMPLETE, 1, &rc);
 	if (!control)
-		return -ENOSPC;
+		return rc;
 	index = netvsc_control_index(device, control);
 	length = netvsc_rndis_build_query(netvsc_control_pages[index],
 			NETVSC_CONTROL_PAGE_SIZE, control->request_id, oid,
@@ -928,13 +1047,15 @@ static int netvsc_rndis_query(struct netvsc_device *device, __u32 oid,
 static int netvsc_rndis_set(struct netvsc_device *device, __u32 oid,
 			    const void *input, size_t input_length)
 {
-	struct netvsc_control *control = netvsc_control_allocate(device,
-			NETVSC_RNDIS_SET_COMPLETE, 1);
+	struct netvsc_control *control;
 	unsigned int index;
 	int length;
+	int rc;
 
+	control = netvsc_control_allocate(device,
+			NETVSC_RNDIS_SET_COMPLETE, 1, &rc);
 	if (!control)
-		return -ENOSPC;
+		return rc;
 	index = netvsc_control_index(device, control);
 	length = netvsc_rndis_build_set(netvsc_control_pages[index],
 			NETVSC_CONTROL_PAGE_SIZE, control->request_id, oid,
@@ -949,13 +1070,15 @@ static int netvsc_rndis_set(struct netvsc_device *device, __u32 oid,
 
 static int netvsc_rndis_keepalive_device(struct netvsc_device *device)
 {
-	struct netvsc_control *control = netvsc_control_allocate(device,
-			NETVSC_RNDIS_KEEPALIVE_COMPLETE, 1);
+	struct netvsc_control *control;
 	unsigned int index;
 	int length;
+	int rc;
 
+	control = netvsc_control_allocate(device,
+			NETVSC_RNDIS_KEEPALIVE_COMPLETE, 1, &rc);
 	if (!control)
-		return -ENOSPC;
+		return rc;
 	index = netvsc_control_index(device, control);
 	length = netvsc_rndis_build_keepalive(netvsc_control_pages[index],
 			NETVSC_CONTROL_PAGE_SIZE, control->request_id);
@@ -969,13 +1092,14 @@ static int netvsc_rndis_keepalive_device(struct netvsc_device *device)
 
 static int netvsc_rndis_halt_device(struct netvsc_device *device)
 {
-	struct netvsc_control *control = netvsc_control_allocate(device, 0, 0);
+	struct netvsc_control *control;
 	unsigned int index;
 	int length;
 	int rc;
 
+	control = netvsc_control_allocate(device, 0, 0, &rc);
 	if (!control)
-		return -ENOSPC;
+		return rc;
 	index = netvsc_control_index(device, control);
 	length = netvsc_rndis_build_halt(netvsc_control_pages[index],
 			NETVSC_CONTROL_PAGE_SIZE, control->request_id);
@@ -1004,12 +1128,14 @@ static int netvsc_nvs_exchange(struct netvsc_device *device,
 
 	if (!netvsc_can_wait() || !response || !response_length)
 		return -EWOULDBLOCK;
+	netvsc_tx_reclaim_completed(device);
 	rc = netvsc_transaction_id(device, &transaction_id);
 	if (rc)
 		return rc;
 	ukplat_spin_lock_irqsave(&device->control_lock, flags);
 	if (wait->active) {
 		ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
+		netvsc_id_reservation_end(device);
 		return -EBUSY;
 	}
 	zero_bytes(wait, sizeof(*wait));
@@ -1017,6 +1143,7 @@ static int netvsc_nvs_exchange(struct netvsc_device *device,
 	wait->transaction_id = transaction_id;
 	wait->expected_type = expected_type;
 	ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
+	netvsc_id_reservation_end(device);
 
 	rc = vmbus_channel_send_ex(device->channel,
 			VMBUS_PACKET_DATA_INBAND,
@@ -1031,6 +1158,7 @@ static int netvsc_nvs_exchange(struct netvsc_device *device,
 		ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
 		return rc;
 	}
+	NETVSC_NVS_STAGE(NETVSC_NVS_STAGE_WAITING, transaction_id);
 	deadline = netvsc_deadline();
 	for (;;) {
 		unsigned int done;
@@ -1401,65 +1529,84 @@ static int netvsc_complete_control_tx(struct netvsc_device *device,
 	return found;
 }
 
-struct netvsc_tx_release {
-	struct netvsc_tx_context *context;
-	struct uk_netbuf *packet;
-	__u64 transaction_id;
-	__u32 section;
-	__u8 malformed;
-	int elected;
-};
-
-static void netvsc_tx_elect_completion_locked(
+static void netvsc_tx_mark_completed_locked(
 				struct netvsc_device *device,
-				struct netvsc_tx_context *context,
-				struct netvsc_tx_release *release)
+				struct netvsc_tx_context *context)
 {
-	if (context->state != NETVSC_TX_BUILDING &&
-	    context->state != NETVSC_TX_SENT)
+	__u32 section;
+
+	if (context->state != NETVSC_TX_SENT)
 		return;
-	release->context = context;
-	release->packet = context->packet;
-	release->transaction_id = context->transaction_id;
-	release->section = context->section_index;
-	release->malformed = context->completion_malformed;
-	release->elected = 1;
-	context->packet = NULL;
+	section = context->section_index;
 	context->section_index = NETVSC_INVALID_SECTION;
-	context->state = NETVSC_TX_COMPLETING;
-	if (release->section < NETVSC_SECTION_LIMIT)
-		device->section_used[release->section] = 0;
-	netvsc_remember_transaction(device, release->transaction_id);
+	context->completion_pending = 0;
+	context->state = NETVSC_TX_COMPLETED;
+	if (section < NETVSC_SECTION_LIMIT)
+		device->section_used[section] = 0;
+	netvsc_remember_transaction(device, context->transaction_id);
 }
 
-static void netvsc_tx_finish_completion(struct netvsc_device *device,
-					struct netvsc_tx_release *release)
+static void netvsc_tx_reclaim_completed(struct netvsc_device *device)
 {
+	struct uk_netbuf *packets[CONFIG_LIBNETVSC_TX_SLOTS];
 	unsigned long flags;
+	unsigned int count = 0;
+	unsigned int i;
 
-	if (!release->elected)
-		return;
-	if (release->malformed)
-		(void)__atomic_add_fetch(&device->malformed_messages, 1,
-					 __ATOMIC_RELAXED);
-	if (release->packet)
-		uk_netbuf_free(release->packet);
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
-	if (release->context->state == NETVSC_TX_COMPLETING &&
-	    release->context->transaction_id == release->transaction_id) {
-		zero_bytes(release->context, sizeof(*release->context));
-		release->context->section_index = NETVSC_INVALID_SECTION;
+	/* The public wrappers may still be walking any submitted chain. */
+	if (device->tx_wrapper_pending) {
+		ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
+		return;
+	}
+	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++) {
+		struct netvsc_tx_context *context = &device->tx[i];
+
+		if (context->state != NETVSC_TX_COMPLETED ||
+		    !context->upper_done)
+			continue;
+		if (context->packet)
+			packets[count++] = context->packet;
+		zero_bytes(context, sizeof(*context));
+		context->section_index = NETVSC_INVALID_SECTION;
 	}
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
+	while (count)
+		uk_netbuf_free(packets[--count]);
+}
+
+static void netvsc_tx_returned(struct uk_netdev *netdev,
+			       struct uk_netdev_tx_queue *queue,
+			       struct uk_netbuf *packet)
+{
+	struct netvsc_device *device =
+		__containerof(netdev, struct netvsc_device, netdev);
+	unsigned long flags;
+	unsigned int i;
+	int found = 0;
+
+	UK_ASSERT(queue == &device->txq);
+	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
+	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++) {
+		struct netvsc_tx_context *context = &device->tx[i];
+
+		if (context->state == NETVSC_TX_FREE ||
+		    context->packet != packet || context->upper_done)
+			continue;
+		context->upper_done = 1;
+		UK_ASSERT(device->tx_wrapper_pending != 0);
+		device->tx_wrapper_pending--;
+		found = 1;
+		break;
+	}
+	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
+	UK_ASSERT(found);
 }
 
 static int netvsc_complete_tx(struct netvsc_device *device,
 			      const struct vmbus_packet *packet,
 			      const __u8 *payload, size_t payload_length)
 {
-	struct netvsc_tx_release release = {
-		.section = NETVSC_INVALID_SECTION,
-	};
 	unsigned long flags;
 	unsigned int i;
 	int found = 0;
@@ -1483,19 +1630,19 @@ static int netvsc_complete_tx(struct netvsc_device *device,
 			}
 			break;
 		}
-		if (context->state == NETVSC_TX_COMPLETING) {
+		if (context->state == NETVSC_TX_COMPLETED) {
 			netvsc_count_duplicate_completion(device);
 			break;
 		}
 		context->completion_malformed = malformed;
-		netvsc_tx_elect_completion_locked(device, context, &release);
+		if (malformed)
+			(void)__atomic_add_fetch(&device->malformed_messages, 1,
+						 __ATOMIC_RELAXED);
+		netvsc_tx_mark_completed_locked(device, context);
 		break;
 	}
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
-	if (!found)
-		return 0;
-	netvsc_tx_finish_completion(device, &release);
-	return 1;
+	return found;
 }
 
 static void netvsc_handle_completion(struct netvsc_device *device,
@@ -2072,9 +2219,6 @@ static int netvsc_tx_publish(struct netvsc_device *device,
 			     struct netvsc_tx_context *context,
 			     __u64 transaction_id)
 {
-	struct netvsc_tx_release release = {
-		.section = NETVSC_INVALID_SECTION,
-	};
 	unsigned long flags;
 	int rc = 0;
 
@@ -2084,12 +2228,18 @@ static int netvsc_tx_publish(struct netvsc_device *device,
 		rc = -ECANCELED;
 	} else {
 		context->state = NETVSC_TX_SENT;
-		if (context->completion_pending)
-			netvsc_tx_elect_completion_locked(device, context,
-							  &release);
+		UK_ASSERT(device->tx_wrapper_pending <
+			  CONFIG_LIBNETVSC_TX_SLOTS);
+		device->tx_wrapper_pending++;
+		if (context->completion_pending) {
+			if (context->completion_malformed)
+				(void)__atomic_add_fetch(
+					&device->malformed_messages, 1,
+					__ATOMIC_RELAXED);
+			netvsc_tx_mark_completed_locked(device, context);
+		}
 	}
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
-	netvsc_tx_finish_completion(device, &release);
 	return rc;
 }
 
@@ -2138,6 +2288,7 @@ static int netvsc_tx_one(struct uk_netdev *netdev,
 	rc = netvsc_operation_begin(device, 1);
 	if (rc)
 		return rc;
+	netvsc_tx_reclaim_completed(device);
 	if (__atomic_load_n(&device->failed, __ATOMIC_ACQUIRE)) {
 		result = -ENODEV;
 		goto out;
@@ -2159,7 +2310,7 @@ static int netvsc_tx_one(struct uk_netdev *netdev,
 	netvsc_drain_channel(device);
 	rc = netvsc_transaction_id(device, &transaction_id);
 	if (rc) {
-		result = rc;
+		result = rc == -EAGAIN ? 0 : rc;
 		goto out;
 	}
 
@@ -2167,6 +2318,7 @@ static int netvsc_tx_one(struct uk_netdev *netdev,
 	context = netvsc_tx_allocate(device, transaction_id);
 	if (!context) {
 		ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
+		netvsc_id_reservation_end(device);
 		result = 0;
 		goto out;
 	}
@@ -2176,6 +2328,7 @@ static int netvsc_tx_one(struct uk_netdev *netdev,
 	if (rc < 0) {
 		ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 		netvsc_tx_rollback(device, context, transaction_id);
+		netvsc_id_reservation_end(device);
 		result = -EINVAL;
 		goto out;
 	}
@@ -2194,6 +2347,7 @@ static int netvsc_tx_one(struct uk_netdev *netdev,
 	}
 	context->section_index = section;
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
+	netvsc_id_reservation_end(device);
 	NETVSC_TX_STAGE(NETVSC_TX_STAGE_BEFORE_COPY, transaction_id);
 
 	if (section != NETVSC_INVALID_SECTION) {
@@ -2561,6 +2715,7 @@ static const struct uk_netdev_ops netvsc_ops = {
 	.rxq_configure = netvsc_rxq_configure,
 	.txq_configure = netvsc_txq_configure,
 	.start = netvsc_start,
+	.tx_returned = netvsc_tx_returned,
 	.rxq_intr_enable = netvsc_rx_intr_enable,
 	.rxq_intr_disable = netvsc_rx_intr_disable,
 	.info_get = netvsc_info_get,
@@ -2607,7 +2762,9 @@ static void netvsc_cancel_tx(struct netvsc_device *device, int quarantine)
 		if (device->tx[i].state == NETVSC_TX_FREE)
 			continue;
 		if (device->tx[i].packet) {
-			if (quarantine && device->quarantined_tx_count <
+			if (quarantine &&
+			    device->tx[i].state != NETVSC_TX_COMPLETED &&
+			    device->quarantined_tx_count <
 			    CONFIG_LIBNETVSC_TX_SLOTS)
 				device->quarantined_tx[
 					device->quarantined_tx_count++] =
@@ -2622,6 +2779,8 @@ static void netvsc_cancel_tx(struct netvsc_device *device, int quarantine)
 		zero_bytes(&device->tx[i], sizeof(device->tx[i]));
 		device->tx[i].section_index = NETVSC_INVALID_SECTION;
 	}
+	UK_ASSERT(device->tx_wrapper_pending == 0);
+	device->tx_wrapper_pending = 0;
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 	while (count)
 		uk_netbuf_free(packets[--count]);
@@ -2702,6 +2861,16 @@ static void netvsc_detach_host(struct netvsc_device *device, int revoked)
 		operations = device->operations;
 		ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
 		if (!operations)
+			break;
+		netvsc_wait_once();
+	}
+	for (;;) {
+		unsigned int pending;
+
+		ukplat_spin_lock_irqsave(&device->tx_lock, flags);
+		pending = device->tx_wrapper_pending;
+		ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
+		if (!pending)
 			break;
 		netvsc_wait_once();
 	}
@@ -2818,6 +2987,7 @@ static int netvsc_attach_host(struct netvsc_device *device,
 	}
 	device->next_request = 1;
 	device->next_transaction = 1;
+	device->id_reservations = 0;
 	device->attaching = 1;
 	device->stopping = 0;
 	device->recovering = 0;
@@ -3063,6 +3233,47 @@ int netvsc_host_keepalive(void)
 	return netvsc_rndis_keepalive_device(&netvsc);
 }
 
+int netvsc_host_nvs_probe(void)
+{
+	__u8 request[NETVSC_NVS_REQUEST_SIZE];
+	__u8 response[NETVSC_NVS_RESPONSE_SIZE];
+	size_t response_length = sizeof(response);
+	int length = netvsc_nvs_build_init(request, sizeof(request),
+					   netvsc.nvs_version);
+
+	if (length < 0)
+		return length;
+	return netvsc_nvs_exchange(&netvsc, request, (size_t)length, 2,
+				   response, &response_length);
+}
+
+void netvsc_host_set_identity(__u32 generation, __u64 next_transaction,
+			      __u16 next_request)
+{
+	unsigned long flags;
+
+	ukplat_spin_lock_irqsave(&netvsc.state_lock, flags);
+	netvsc.generation = generation;
+	netvsc.next_transaction = next_transaction;
+	netvsc.next_request = next_request;
+	ukplat_spin_unlock_irqrestore(&netvsc.state_lock, flags);
+}
+
+__u32 netvsc_host_generation(void)
+{
+	return __atomic_load_n(&netvsc.generation, __ATOMIC_ACQUIRE);
+}
+
+__u64 netvsc_host_next_transaction(void)
+{
+	return __atomic_load_n(&netvsc.next_transaction, __ATOMIC_ACQUIRE);
+}
+
+int netvsc_host_nvs_active(void)
+{
+	return __atomic_load_n(&netvsc.nvs_wait.active, __ATOMIC_ACQUIRE);
+}
+
 void netvsc_host_reset(void)
 {
 	netvsc_init_once(&netvsc);
@@ -3078,10 +3289,9 @@ void netvsc_host_reset(void)
 	netvsc.generation = 0;
 	netvsc.next_request = 1;
 	netvsc.next_transaction = 1;
-	zero_bytes(netvsc.transaction_tombstones,
-		   sizeof(netvsc.transaction_tombstones));
-	zero_bytes(netvsc.request_tombstones,
-		   sizeof(netvsc.request_tombstones));
+	netvsc.id_reservations = 0;
+	netvsc.tx_wrapper_pending = 0;
+	netvsc_clear_id_tombstones(&netvsc);
 }
 
 int netvsc_host_process_transfer(const __u8 *descriptor,

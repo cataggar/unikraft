@@ -17,6 +17,10 @@
 #include "netvsc-host-test.h"
 #include "netvsc_protocol.h"
 
+#if !CONFIG_LIBUKNETDEV_STATS
+#error "NetVSC production ownership tests require uknetdev statistics"
+#endif
+
 #define MOCK_QUEUE 128
 #define MOCK_DESCRIPTOR 520
 #define MOCK_PAYLOAD 512
@@ -100,7 +104,9 @@ struct mock_state {
 	__u64 pending_tx[CONFIG_LIBNETVSC_TX_SLOTS * 2];
 	unsigned int pending_tx_count;
 	__u64 last_tx_id;
+	__u64 last_control_transaction;
 	__u64 last_transfer_id;
+	__u32 last_control_request;
 	__u64 stale_watch_id;
 	unsigned int stale_ack_count;
 	__u8 last_tx[4096];
@@ -121,6 +127,7 @@ static struct uk_alloc allocator;
 static struct uk_sched *scheduler = (struct uk_sched *)1;
 static struct host_netbuf rx_buffers[MOCK_NETBUF_COUNT];
 static int chained_receive;
+static int stats_lock_initialized;
 
 struct stage_gate {
 	pthread_mutex_t lock;
@@ -144,6 +151,11 @@ static struct stage_gate control_wait_gate = {
 	.lock = PTHREAD_MUTEX_INITIALIZER,
 	.condition = PTHREAD_COND_INITIALIZER,
 };
+static struct stage_gate nvs_gate = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.condition = PTHREAD_COND_INITIALIZER,
+};
+static struct uk_netbuf *wrapper_gate_packet;
 
 static void stage_gate_arm(struct stage_gate *gate, unsigned int target)
 {
@@ -212,12 +224,25 @@ void netvsc_host_tx_stage(unsigned int stage, __u64 transaction_id)
 	stage_gate_enter(&tx_gate, stage, transaction_id, 0);
 }
 
+void netvsc_host_tx_wrapper_stage(struct uk_netbuf *packet,
+				  int status __attribute__((unused)))
+{
+	if (wrapper_gate_packet && wrapper_gate_packet != packet)
+		return;
+	stage_gate_enter(&tx_gate, NETVSC_HOST_TX_STAGE_WRAPPER_RETURN, 0, 0);
+}
+
 void netvsc_host_control_stage(unsigned int stage, __u64 transaction_id,
 			       __u32 request_id)
 {
 	stage_gate_enter(stage == NETVSC_HOST_CONTROL_STAGE_WAIT_DONE ?
 			 &control_wait_gate : &control_gate,
 			 stage, transaction_id, request_id);
+}
+
+void netvsc_host_nvs_stage(unsigned int stage, __u64 transaction_id)
+{
+	stage_gate_enter(&nvs_gate, stage, transaction_id, 0);
 }
 
 static __u32 get32(const __u8 *data)
@@ -474,6 +499,8 @@ static void handle_rndis_request(__u64 transaction_id, const __u8 *request,
 	if (!mock.suppress_control_nvs)
 		enqueue_completion(transaction_id, nvs_complete,
 				   sizeof(nvs_complete));
+	mock.last_control_transaction = transaction_id;
+	mock.last_control_request = request_id;
 	if (mock.suppress_control_rndis)
 		return;
 	switch (type) {
@@ -654,6 +681,7 @@ static void mock_reset(void)
 	mock.receive_response_length = NETVSC_NVS_REQUEST_SIZE;
 	mock.send_response_length = NETVSC_NVS_REQUEST_SIZE;
 	mock.send_section_size = 2048;
+	wrapper_gate_packet = NULL;
 	memset(rx_buffers, 0, sizeof(rx_buffers));
 	chained_receive = 0;
 }
@@ -685,6 +713,13 @@ static void host_netbuf_destructor(struct uk_netbuf *packet)
 
 	buffer->free_count++;
 	buffer->in_use = 0;
+	memset(buffer->storage, 0xa5, sizeof(buffer->storage));
+	packet->next = (struct uk_netbuf *)(uintptr_t)1;
+	packet->prev = (struct uk_netbuf *)(uintptr_t)1;
+	packet->data = (void *)(uintptr_t)1;
+	packet->buf = (void *)(uintptr_t)1;
+	packet->len = UINT16_MAX;
+	packet->buflen = 0;
 }
 
 void uk_netbuf_free(struct uk_netbuf *packet)
@@ -754,6 +789,11 @@ int uk_netdev_drv_register(struct uk_netdev *netdev,
 			   const char *name __attribute__((unused)))
 {
 	netdev->_data = netdev;
+	if (!stats_lock_initialized) {
+		ukarch_spin_init(&netdev->stats_lock);
+		stats_lock_initialized = 1;
+	}
+	memset(&netdev->tx_stats, 0, sizeof(netdev->tx_stats));
 	return 0;
 }
 
@@ -1038,8 +1078,7 @@ static void *tx_thread_main(void *argument)
 {
 	struct tx_thread_args *args = argument;
 
-	args->result = args->netdev->tx_one(args->netdev,
-			args->netdev->_tx_queue[0], args->packet);
+	args->result = uk_netdev_tx_one(args->netdev, 0, args->packet);
 	return NULL;
 }
 
@@ -1052,6 +1091,14 @@ static void *control_thread_main(void *argument)
 	struct control_thread_args *args = argument;
 
 	args->result = netvsc_host_keepalive();
+	return NULL;
+}
+
+static void *nvs_thread_main(void *argument)
+{
+	int *result = argument;
+
+	*result = netvsc_host_nvs_probe();
 	return NULL;
 }
 
@@ -1111,41 +1158,41 @@ static int test_tx_ownership_and_saturation(struct uk_netdev *netdev)
 {
 	struct host_netbuf packets[6] = { 0 };
 	struct host_netbuf chain_tail = { 0 };
+	struct host_netbuf reaper = { 0 };
 	unsigned int i;
 
 	mock.delay_tx = 1;
 	for (i = 0; i < 5; i++)
 		prepare_tx_buffer(&packets[i], (__u8)(0x10 + i), 42);
 	for (i = 0; i < 4; i++)
-		CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-				      &packets[i].netbuf) &
+		CHECK((uk_netdev_tx_one(netdev, 0, &packets[i].netbuf) &
 		       UK_NETDEV_STATUS_SUCCESS) != 0);
 	CHECK(netvsc_host_tx_active() == 4);
-	CHECK(netdev->tx_one(netdev, netdev->_tx_queue[0],
-			     &packets[4].netbuf) == 0);
+	CHECK(uk_netdev_tx_one(netdev, 0, &packets[4].netbuf) == 0);
 	CHECK(packets[4].free_count == 0);
 	mock_flush_tx();
-	CHECK(netvsc_host_tx_active() == 0);
+	CHECK(netvsc_host_tx_active() == 4);
+	for (i = 0; i < 4; i++)
+		CHECK(packets[i].free_count == 0);
+	CHECK((uk_netdev_tx_one(netdev, 0, &packets[4].netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	for (i = 0; i < 4; i++)
 		CHECK(packets[i].free_count == 1);
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packets[4].netbuf) &
-	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	mock_flush_tx();
-	CHECK(packets[4].free_count == 1);
+	CHECK(packets[4].free_count == 0);
 
 	prepare_tx_buffer(&packets[5], 0x70, 30);
 	prepare_tx_buffer(&chain_tail, 0x90, 30);
 	packets[5].netbuf.next = &chain_tail.netbuf;
 	chain_tail.netbuf.prev = &packets[5].netbuf;
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packets[5].netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &packets[5].netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(packets[4].free_count == 1);
 	CHECK(mock.last_tx_length == 60);
 	CHECK(mock.last_tx[0] == 0x70 && mock.last_tx[30] == 0x90);
 	mock_flush_tx();
-	CHECK(packets[5].free_count == 1);
-	CHECK(chain_tail.free_count == 1);
+	CHECK(packets[5].free_count == 0);
+	CHECK(chain_tail.free_count == 0);
 
 	/* A duplicate expected completion cannot free a reused request. */
 	{
@@ -1155,8 +1202,15 @@ static int test_tx_ownership_and_saturation(struct uk_netdev *netdev)
 		put32(complete + 4, 1);
 		enqueue_completion(mock.last_tx_id, complete, sizeof(complete));
 		mock_signal();
-		CHECK(packets[5].free_count == 1);
+		CHECK(packets[5].free_count == 0);
 	}
+	prepare_tx_buffer(&reaper, 0xb0, 1);
+	CHECK(uk_netdev_tx_one(netdev, 0, &reaper.netbuf) == -EMSGSIZE);
+	CHECK(packets[5].free_count == 1);
+	CHECK(chain_tail.free_count == 1);
+	CHECK(reaper.free_count == 0);
+	CHECK(netdev->tx_stats.packets == 6);
+	CHECK(netdev->tx_stats.bytes == 270);
 	mock.delay_tx = 0;
 	return 0;
 }
@@ -1208,8 +1262,7 @@ static int test_tx_publication_stage(unsigned int stage, int gpa)
 	    !netvsc_host_tx_state(0) || packet.free_count)
 		failure = __LINE__;
 	if (!failure &&
-	    netdev->tx_one(netdev, netdev->_tx_queue[0],
-			   &blocked.netbuf) != 0)
+	    uk_netdev_tx_one(netdev, 0, &blocked.netbuf) != 0)
 		failure = __LINE__;
 	if (!failure && blocked.free_count)
 		failure = __LINE__;
@@ -1237,23 +1290,26 @@ release:
 	if (failure)
 		return failure;
 	CHECK((args.result & UK_NETDEV_STATUS_SUCCESS) != 0);
-	CHECK((args.result & UK_NETDEV_STATUS_MORE) != 0);
-	CHECK(packet.free_count == 1);
-	CHECK(netvsc_host_tx_active() == 0);
+	CHECK((args.result & UK_NETDEV_STATUS_MORE) == 0);
+	CHECK(packet.free_count == 0);
+	CHECK(netvsc_host_tx_active() == 1);
+	CHECK(netdev->tx_stats.packets == 1);
+	CHECK(netdev->tx_stats.bytes == 60);
 	CHECK(netvsc_host_duplicate_completions() >= duplicate_before + 1);
 	CHECK(netvsc_host_unknown_completions() >= unknown_before + 1);
 	if (stage == NETVSC_HOST_TX_STAGE_BUILD_RANGES)
 		CHECK(netvsc_host_malformed_messages() ==
 		      malformed_before + 1);
 	mock_flush_tx();
-	CHECK(packet.free_count == 1);
+	CHECK(packet.free_count == 0);
 	CHECK(netvsc_host_duplicate_completions() >= duplicate_before + 2);
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &blocked.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &blocked.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(packet.free_count == 1);
 	mock_flush_tx();
-	CHECK(blocked.free_count == 1);
+	CHECK(blocked.free_count == 0);
 	netvsc_host_remove_device(&offered);
+	CHECK(blocked.free_count == 1);
 	return 0;
 }
 
@@ -1272,6 +1328,144 @@ static int test_tx_publication_races(void)
 		return rc;
 	return test_tx_publication_stage(
 			NETVSC_HOST_TX_STAGE_AFTER_PUBLISH, 0);
+}
+
+static int test_tx_completion_races_wrapper_stats(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 86,
+		.connection_id = 186,
+		.present = 1,
+	};
+	struct uk_netdev_txqueue_conf tx_configuration = { 0 };
+	struct host_netbuf head = { 0 };
+	struct host_netbuf tail = { 0 };
+	struct host_netbuf blocked = { 0 };
+	struct host_netbuf reaper = { 0 };
+	struct tx_thread_args args;
+	struct uk_netdev *netdev;
+	pthread_t thread;
+	__u64 transaction_id;
+	int failure = 0;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	netdev->_tx_queue[0] = netdev->ops->txq_configure(
+			netdev, 0, 1, &tx_configuration);
+	CHECK(!PTRISERR(netdev->_tx_queue[0]));
+	mock.delay_tx = 1;
+	prepare_tx_buffer(&head, 0x51, 30);
+	prepare_tx_buffer(&tail, 0x71, 30);
+	prepare_tx_buffer(&blocked, 0x91, 60);
+	head.netbuf.next = &tail.netbuf;
+	tail.netbuf.prev = &head.netbuf;
+	args.netdev = netdev;
+	args.packet = &head.netbuf;
+	args.result = -1;
+	wrapper_gate_packet = &head.netbuf;
+	stage_gate_arm(&tx_gate, NETVSC_HOST_TX_STAGE_WRAPPER_RETURN);
+	if (pthread_create(&thread, NULL, tx_thread_main, &args))
+		return __LINE__;
+	if (stage_gate_wait(&tx_gate)) {
+		failure = __LINE__;
+		goto release;
+	}
+	transaction_id = netvsc_host_tx_transaction(0);
+	if (!transaction_id || netvsc_host_tx_active() != 1)
+		failure = __LINE__;
+	enqueue_rndis_send_complete(transaction_id);
+	enqueue_rndis_send_complete(transaction_id);
+	mock_signal();
+	if (!failure &&
+	    (head.free_count || tail.free_count ||
+	     netvsc_host_tx_active() != 1 ||
+	     uk_netdev_tx_one(netdev, 0, &blocked.netbuf) != 0))
+		failure = __LINE__;
+release:
+	stage_gate_release(&tx_gate);
+	pthread_join(thread, NULL);
+	wrapper_gate_packet = NULL;
+	if (failure)
+		return failure;
+	CHECK((args.result & UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(head.free_count == 0 && tail.free_count == 0);
+	CHECK(netdev->tx_stats.packets == 1);
+	CHECK(netdev->tx_stats.bytes == 60);
+	prepare_tx_buffer(&reaper, 0xb1, 1);
+	CHECK(uk_netdev_tx_one(netdev, 0, &reaper.netbuf) == -EMSGSIZE);
+	CHECK(head.free_count == 1 && tail.free_count == 1);
+	CHECK(blocked.free_count == 0 && reaper.free_count == 0);
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
+static int test_tx_concurrent_wrapper_grace(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 81,
+		.connection_id = 181,
+		.present = 1,
+	};
+	struct uk_netdev_txqueue_conf tx_configuration = { 0 };
+	struct host_netbuf first = { 0 };
+	struct host_netbuf second = { 0 };
+	struct host_netbuf reaper = { 0 };
+	struct tx_thread_args args;
+	struct uk_netdev *netdev;
+	pthread_t thread;
+	int failure = 0;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	netdev->_tx_queue[0] = netdev->ops->txq_configure(
+			netdev, 0, 2, &tx_configuration);
+	CHECK(!PTRISERR(netdev->_tx_queue[0]));
+	mock.delay_tx = 1;
+	prepare_tx_buffer(&first, 0x22, 60);
+	prepare_tx_buffer(&second, 0x42, 60);
+	args.netdev = netdev;
+	args.packet = &first.netbuf;
+	args.result = -1;
+	wrapper_gate_packet = &first.netbuf;
+	stage_gate_arm(&tx_gate, NETVSC_HOST_TX_STAGE_WRAPPER_RETURN);
+	if (pthread_create(&thread, NULL, tx_thread_main, &args))
+		return __LINE__;
+	if (stage_gate_wait(&tx_gate)) {
+		failure = __LINE__;
+		goto release;
+	}
+	if ((uk_netdev_tx_one(netdev, 0, &second.netbuf) &
+	     UK_NETDEV_STATUS_SUCCESS) == 0 ||
+	    mock.pending_tx_count != 2)
+		failure = __LINE__;
+	mock_flush_tx();
+	if (!failure &&
+	    (first.free_count || second.free_count ||
+	     netvsc_host_tx_active() != 2))
+		failure = __LINE__;
+	prepare_tx_buffer(&reaper, 0x62, 1);
+	if (!failure &&
+	    (uk_netdev_tx_one(netdev, 0, &reaper.netbuf) != -EMSGSIZE ||
+	     first.free_count || second.free_count ||
+	     netvsc_host_tx_active() != 2))
+		failure = __LINE__;
+release:
+	stage_gate_release(&tx_gate);
+	pthread_join(thread, NULL);
+	wrapper_gate_packet = NULL;
+	if (failure)
+		return failure;
+	CHECK((args.result & UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(first.free_count == 0 && second.free_count == 0);
+	CHECK(uk_netdev_tx_one(netdev, 0, &reaper.netbuf) == -EMSGSIZE);
+	CHECK(first.free_count == 1 && second.free_count == 1);
+	CHECK(netvsc_host_tx_active() == 0);
+	netvsc_host_remove_device(&offered);
+	return 0;
 }
 
 static int test_tx_unpublished_early_completion(void)
@@ -1321,11 +1515,205 @@ release:
 	CHECK(packet.free_count == 0);
 	CHECK(netvsc_host_tx_active() == 0);
 	CHECK(netvsc_host_early_completions() == early_before + 1);
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packet.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	mock_flush_tx();
+	CHECK(packet.free_count == 0);
+	netvsc_host_remove_device(&offered);
 	CHECK(packet.free_count == 1);
+	return 0;
+}
+
+static int test_transaction_rollover(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 85,
+		.connection_id = 185,
+		.present = 1,
+	};
+	struct host_netbuf first = { 0 };
+	struct host_netbuf last = { 0 };
+	struct host_netbuf next = { 0 };
+	struct host_netbuf reaper = { 0 };
+	struct uk_netdev *netdev;
+	__u64 old_first;
+	__u64 old_last;
+	__u64 new_id;
+	__u32 unknown_before;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	mock.delay_tx = 1;
+	netvsc_host_set_identity(7, (__u64)UINT32_MAX - 1, 1);
+	prepare_tx_buffer(&first, 0x11, 60);
+	prepare_tx_buffer(&last, 0x31, 60);
+	prepare_tx_buffer(&next, 0x51, 60);
+	CHECK((uk_netdev_tx_one(netdev, 0, &first.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	old_first = mock.last_tx_id;
+	CHECK((__u32)old_first == UINT32_MAX - 1);
+	CHECK((uk_netdev_tx_one(netdev, 0, &last.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	old_last = mock.last_tx_id;
+	CHECK((__u32)old_last == UINT32_MAX);
+	CHECK(netvsc_host_next_transaction() ==
+	      (__u64)UINT32_MAX + 1);
+	CHECK(uk_netdev_tx_one(netdev, 0, &next.netbuf) == 0);
+	CHECK(netvsc_host_keepalive() == -EAGAIN);
+	CHECK(netvsc_host_nvs_probe() == -EAGAIN);
+	CHECK(next.free_count == 0 && netvsc_host_generation() == 7);
+	mock_flush_tx();
+	CHECK(first.free_count == 0 && last.free_count == 0);
+	CHECK(netvsc_host_keepalive() == 0);
+	CHECK(first.free_count == 1 && last.free_count == 1);
+	CHECK(netvsc_host_generation() == 8);
+	CHECK((uk_netdev_tx_one(netdev, 0, &next.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	new_id = mock.last_tx_id;
+	CHECK((__u32)(new_id >> 32) == 8 && (__u32)new_id == 2);
+	unknown_before = netvsc_host_unknown_completions();
+	enqueue_rndis_send_complete(old_first);
+	enqueue_rndis_send_complete(old_last);
+	mock_signal();
+	CHECK(next.free_count == 0 && netvsc_host_tx_active() == 1);
+	CHECK(netvsc_host_unknown_completions() == unknown_before + 2);
+	mock_flush_tx();
+	prepare_tx_buffer(&reaper, 0x71, 1);
+	CHECK(uk_netdev_tx_one(netdev, 0, &reaper.netbuf) == -EMSGSIZE);
+	CHECK(next.free_count == 1);
+	netvsc_host_set_identity(13, 5, 0);
+	CHECK(netvsc_host_keepalive() == 0);
+	CHECK(netvsc_host_generation() == 14);
+	CHECK((__u32)(mock.last_control_transaction >> 32) == 14);
+	CHECK((__u32)mock.last_control_transaction == 1);
+	CHECK((mock.last_control_request >> 16) == 14);
+	CHECK((__u16)mock.last_control_request == 1);
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
+static int test_rollover_blocked_by_control(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 84,
+		.connection_id = 184,
+		.present = 1,
+	};
+	struct control_thread_args control = { .result = -1 };
+	struct host_netbuf packet = { 0 };
+	struct host_netbuf reaper = { 0 };
+	struct uk_netdev *netdev;
+	pthread_t thread;
+	int failure = 0;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	netvsc_host_set_identity(9, UINT32_MAX, 1);
+	prepare_tx_buffer(&packet, 0x81, 60);
+	stage_gate_arm(&control_gate,
+		       NETVSC_HOST_CONTROL_STAGE_AFTER_PUBLISH);
+	if (pthread_create(&thread, NULL, control_thread_main, &control))
+		return __LINE__;
+	if (stage_gate_wait(&control_gate)) {
+		failure = __LINE__;
+		goto release;
+	}
+	if (uk_netdev_tx_one(netdev, 0, &packet.netbuf) != 0 ||
+	    packet.free_count || netvsc_host_generation() != 9)
+		failure = __LINE__;
+release:
+	stage_gate_release(&control_gate);
+	pthread_join(thread, NULL);
+	if (failure)
+		return failure;
+	CHECK(control.result == 0);
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(netvsc_host_generation() == 10);
+	mock_signal();
+	prepare_tx_buffer(&reaper, 0x91, 1);
+	CHECK(uk_netdev_tx_one(netdev, 0, &reaper.netbuf) == -EMSGSIZE);
+	CHECK(packet.free_count == 1);
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
+static int test_rollover_blocked_by_nvs(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 83,
+		.connection_id = 183,
+		.present = 1,
+	};
+	struct host_netbuf packet = { 0 };
+	struct host_netbuf reaper = { 0 };
+	struct uk_netdev *netdev;
+	pthread_t thread;
+	int nvs_result = -1;
+	int failure = 0;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	netvsc_host_set_identity(11, UINT32_MAX, 1);
+	prepare_tx_buffer(&packet, 0xa1, 60);
+	stage_gate_arm(&nvs_gate, NETVSC_HOST_NVS_STAGE_WAITING);
+	if (pthread_create(&thread, NULL, nvs_thread_main, &nvs_result))
+		return __LINE__;
+	if (stage_gate_wait(&nvs_gate)) {
+		failure = __LINE__;
+		goto release;
+	}
+	if (!netvsc_host_nvs_active() ||
+	    uk_netdev_tx_one(netdev, 0, &packet.netbuf) != 0 ||
+	    packet.free_count || netvsc_host_generation() != 11)
+		failure = __LINE__;
+release:
+	stage_gate_release(&nvs_gate);
+	pthread_join(thread, NULL);
+	if (failure)
+		return failure;
+	CHECK(nvs_result == 0);
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(netvsc_host_generation() == 12);
+	mock_signal();
+	prepare_tx_buffer(&reaper, 0xb1, 1);
+	CHECK(uk_netdev_tx_one(netdev, 0, &reaper.netbuf) == -EMSGSIZE);
+	CHECK(packet.free_count == 1);
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
+static int test_generation_exhaustion_fails_closed(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 82,
+		.connection_id = 182,
+		.present = 1,
+	};
+	struct host_netbuf packet = { 0 };
+	struct uk_netdev *netdev;
+	unsigned int failures;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	netvsc_host_set_identity(UINT16_MAX, (__u64)UINT32_MAX + 1, 1);
+	prepare_tx_buffer(&packet, 0xc1, 60);
+	failures = mock.connection_fail_count;
+	CHECK(uk_netdev_tx_one(netdev, 0, &packet.netbuf) == -EOVERFLOW);
+	CHECK(packet.free_count == 0);
+	CHECK(mock.connection_fail_count == failures + 1);
+	CHECK(netdev->ops->probe(netdev) == -ENODEV);
+	CHECK(uk_netdev_tx_one(netdev, 0, &packet.netbuf) == -ENODEV);
+	CHECK(mock.connection_fail_count == failures + 1);
 	netvsc_host_remove_device(&offered);
 	return 0;
 }
@@ -1575,6 +1963,53 @@ static int test_rx_bounds_headroom_and_reentry(struct uk_netdev *netdev)
 	uk_netbuf_free(packet);
 	packet = NULL;
 
+	/* NetVSC accepts aligned descriptor padding, never truncation. */
+	{
+		__u8 message[124] = { 0 };
+		__u8 descriptor[24] = { 0 };
+		__u8 nvs[NETVSC_NVS_REQUEST_SIZE] = { 0 };
+		__u32 offset = 5;
+		int header = netvsc_rndis_build_packet_header(
+				message, sizeof(message), sizeof(frame));
+		int nvs_length = netvsc_nvs_build_rndis(
+				nvs, sizeof(nvs), NETVSC_NVS_RNDIS_DATA,
+				NETVSC_NVS_SEND_SECTION_INVALID, 0);
+
+		CHECK(header == 44 && nvs_length > 0);
+		memcpy(message + header, frame, sizeof(frame));
+		memcpy(netvsc_host_receive_buffer() + offset, message,
+		       sizeof(message));
+		put16(descriptor, NETVSC_NVS_RX_BUFFER_ID);
+		put32(descriptor + 4, 1);
+		put32(descriptor + 8, sizeof(message));
+		put32(descriptor + 12, offset);
+		memset(descriptor + 16, 0xcc, sizeof(descriptor) - 16);
+		for (size_t descriptor_length = 16;
+		     descriptor_length <= sizeof(descriptor);
+		     descriptor_length += 4) {
+			CHECK(netvsc_host_process_transfer(
+					descriptor, descriptor_length,
+					nvs, (size_t)nvs_length,
+					0xa0000000ULL + descriptor_length) == 0);
+			status = netdev->rx_one(netdev,
+					netdev->_rx_queue[0], &packet);
+			CHECK((status & UK_NETDEV_STATUS_SUCCESS) != 0);
+			CHECK(packet->len == sizeof(frame));
+			CHECK(memcmp(packet->data, frame,
+				     sizeof(frame)) == 0);
+			uk_netbuf_free(packet);
+			packet = NULL;
+		}
+		CHECK(netvsc_host_process_transfer(descriptor, 15, nvs,
+				(size_t)nvs_length, 0xa0000100ULL) == -EPROTO);
+		CHECK(netvsc_host_process_transfer(descriptor, 17, nvs,
+				(size_t)nvs_length, 0xa0000101ULL) == -EPROTO);
+		put32(descriptor + 4, UINT32_MAX);
+		CHECK(netvsc_host_process_transfer(descriptor,
+				sizeof(descriptor), nvs, (size_t)nvs_length,
+				0xa0000102ULL) == -EPROTO);
+	}
+
 	/* A saturated TX ring defers, then retries, the receive completion. */
 	mock.ack_eagain = 2;
 	{
@@ -1706,6 +2141,7 @@ static int test_control_timeout_and_late_completion(struct uk_netdev *netdev)
 static int test_link_status(struct uk_netdev *netdev)
 {
 	struct host_netbuf packet = { 0 };
+	struct host_netbuf reaper = { 0 };
 	__u8 status_message[20] = { 0 };
 
 	put32(status_message, NETVSC_RNDIS_INDICATE_STATUS);
@@ -1715,17 +2151,18 @@ static int test_link_status(struct uk_netdev *netdev)
 			 NETVSC_NVS_RNDIS_CONTROL);
 	mock_signal();
 	prepare_tx_buffer(&packet, 0x19, 60);
-	CHECK(netdev->tx_one(netdev, netdev->_tx_queue[0],
-			     &packet.netbuf) == -ENETDOWN);
+	CHECK(uk_netdev_tx_one(netdev, 0, &packet.netbuf) == -ENETDOWN);
 	CHECK(packet.free_count == 0);
 	put32(status_message + 8, NETVSC_RNDIS_STATUS_MEDIA_CONNECT);
 	enqueue_transfer(status_message, sizeof(status_message),
 			 NETVSC_NVS_RNDIS_CONTROL);
 	mock_signal();
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packet.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	mock_signal();
+	CHECK(packet.free_count == 0);
+	prepare_tx_buffer(&reaper, 0x29, 1);
+	CHECK(uk_netdev_tx_one(netdev, 0, &reaper.netbuf) == -EMSGSIZE);
 	CHECK(packet.free_count == 1);
 	return 0;
 }
@@ -1734,14 +2171,14 @@ static int test_remove_and_reconnect(struct uk_netdev *netdev,
 				     struct vmbus_device *offered)
 {
 	struct host_netbuf packet = { 0 };
+	struct host_netbuf reaper = { 0 };
 	__u8 frame[60] = { 0 };
 	vmbus_channel_callback_t stale_callback;
 	void *stale_arg;
 
 	mock.delay_tx = 1;
 	prepare_tx_buffer(&packet, 0x33, 60);
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packet.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	mock.ack_eagain = 1000;
 	inject_frame(frame, sizeof(frame));
@@ -1770,10 +2207,12 @@ static int test_remove_and_reconnect(struct uk_netdev *netdev,
 	CHECK(netvsc_host_add_device(offered) == 0);
 	CHECK(mock.stale_ack_count == 0);
 	prepare_tx_buffer(&packet, 0x55, 60);
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packet.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	mock_signal();
+	CHECK(packet.free_count == 1);
+	prepare_tx_buffer(&reaper, 0x65, 1);
+	CHECK(uk_netdev_tx_one(netdev, 0, &reaper.netbuf) == -EMSGSIZE);
 	CHECK(packet.free_count == 2);
 	return 0;
 }
@@ -1915,13 +2354,13 @@ static int test_gpa_fallback(void)
 	prepare_tx_buffer(&tail, 0x61, 30);
 	head.netbuf.next = &tail.netbuf;
 	tail.netbuf.prev = &head.netbuf;
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &head.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &head.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	mock_signal();
-	CHECK(head.free_count == 1 && tail.free_count == 1);
+	CHECK(head.free_count == 0 && tail.free_count == 0);
 	CHECK(mock.last_tx[0] == 0x31 && mock.last_tx[30] == 0x61);
 	netvsc_host_remove_device(&offered);
+	CHECK(head.free_count == 1 && tail.free_count == 1);
 	return 0;
 }
 
@@ -1941,8 +2380,7 @@ static int test_failed_close_quarantines_tx(void)
 	CHECK(configure_and_start(&netdev) == 0);
 	mock.delay_tx = 1;
 	prepare_tx_buffer(&packet, 0x71, 60);
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packet.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	mock.fail_close = 1;
 	netvsc_host_remove_device(&offered);
@@ -1988,8 +2426,7 @@ static int test_post_publish_failure_quarantines_tx(void)
 	mock.delay_tx = 1;
 	prepare_tx_buffer(&packet, 0x79, 60);
 	mock.post_publish_error_once = 1;
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packet.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	CHECK(mock.connection_fail_count == 1);
 	CHECK(netvsc_host_tx_active() == 1);
@@ -2039,8 +2476,7 @@ static int test_malformed_ring_recovery(void)
 	CHECK(configure_and_start(&netdev) == 0);
 	mock.delay_tx = 1;
 	prepare_tx_buffer(&packet, 0x81, 60);
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packet.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	CHECK(netdev->ops->rxq_intr_enable(netdev,
 					   netdev->_rx_queue[0]) == 0);
@@ -2090,8 +2526,7 @@ static int test_malformed_ring_recovery(void)
 	CHECK(configure_and_start(&netdev) == 0);
 	mock.delay_tx = 1;
 	prepare_tx_buffer(&packet, 0x91, 60);
-	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
-			      &packet.netbuf) &
+	CHECK((uk_netdev_tx_one(netdev, 0, &packet.netbuf) &
 	       UK_NETDEV_STATUS_SUCCESS) != 0);
 	mock.fail_close = 1;
 	mock.receive_error_once = -ENOBUFS;
@@ -2162,7 +2597,25 @@ int main(void)
 	rc = test_tx_publication_races();
 	if (rc)
 		return rc;
+	rc = test_tx_completion_races_wrapper_stats();
+	if (rc)
+		return rc;
+	rc = test_tx_concurrent_wrapper_grace();
+	if (rc)
+		return rc;
 	rc = test_tx_unpublished_early_completion();
+	if (rc)
+		return rc;
+	rc = test_transaction_rollover();
+	if (rc)
+		return rc;
+	rc = test_rollover_blocked_by_control();
+	if (rc)
+		return rc;
+	rc = test_rollover_blocked_by_nvs();
+	if (rc)
+		return rc;
+	rc = test_generation_exhaustion_fails_closed();
 	if (rc)
 		return rc;
 	rc = test_control_publication_reentry();

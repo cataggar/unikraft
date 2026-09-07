@@ -562,7 +562,8 @@ export fn netvsc_nvs_transfer_range_count(
         return @intFromEnum(Result.overflow);
     const required = addUsize(8, range_bytes) orelse
         return @intFromEnum(Result.overflow);
-    if (required != descriptor_length)
+    if (required > descriptor_length or
+        (descriptor_length - required) % 4 != 0)
         return @intFromEnum(Result.invalid);
     range_count.* = count;
     return @intFromEnum(Result.ok);
@@ -1067,6 +1068,38 @@ test "receive section table and transfer ranges are bounded" {
         &range_count,
     ));
     try std.testing.expectEqual(@as(u32, 2), range_count);
+    var padded4 = [_]u8{0} ** 28;
+    @memcpy(padded4[0..descriptor.len], &descriptor);
+    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_transfer_range_count(
+        &padded4,
+        padded4.len,
+        &range_count,
+    ));
+    var padded8 = [_]u8{0} ** 32;
+    @memcpy(padded8[0..descriptor.len], &descriptor);
+    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_transfer_range_count(
+        &padded8,
+        padded8.len,
+        &range_count,
+    ));
+    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_transfer_range_count(
+        &descriptor,
+        descriptor.len - 1,
+        &range_count,
+    ));
+    var misaligned = [_]u8{0} ** 25;
+    @memcpy(misaligned[0..descriptor.len], &descriptor);
+    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_transfer_range_count(
+        &misaligned,
+        misaligned.len,
+        &range_count,
+    ));
+    put32(&padded8, 4, std.math.maxInt(u32));
+    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_transfer_range_count(
+        &padded8,
+        padded8.len,
+        &range_count,
+    ));
     descriptor[2] = 1;
     try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_transfer_range_count(
         &descriptor,
