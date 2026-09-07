@@ -1,0 +1,7 @@
+vmbus_device_count
+vmbus_device_get
+vmbus_reconnect
+vmbus_unload
+_vmbus_register_driver
+vmbus_storage_guid
+vmbus_network_guid

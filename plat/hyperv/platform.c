@@ -85,6 +85,7 @@ void ukplat_efi_pre_exit(struct uk_efi_runtime_services *rs)
 
 static int hyperv_shutdown(enum uk_efi_reset_type type)
 {
+	hyperv_vmbus_fini();
 	hyperv_runtime_disable();
 	if (unlikely(!hyperv_efi_rs))
 		return -ENODEV;

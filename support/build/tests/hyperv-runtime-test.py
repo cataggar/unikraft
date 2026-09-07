@@ -27,6 +27,7 @@ def main() -> None:
         "hyperv_runtime_enable",
         "hyperv_runtime_disable",
         "hyperv_hypercall",
+        "hyperv_has_post_messages",
         "hyperv_time_ref_count",
         "hyperv_reference_time",
         "hyperv_synic_enable",

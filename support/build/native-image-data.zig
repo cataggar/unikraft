@@ -53,6 +53,19 @@ pub const x86_64_efi_hyperv_platform = Library{
     },
 };
 
+pub const x86_64_efi_vmbus = Library{
+    .name = "libvmbus",
+    .origin = .driver,
+    .objects = &.{
+        "libvmbus/vmbus_bus.o",
+        "libvmbus/libinfo.libuklibid.o",
+    },
+    .export_symbols = .{
+        .root = .base,
+        .relative = "drivers/hyperv/vmbus/exportsyms.uk",
+    },
+};
+
 pub const x86_64_efi_native_objects = [_][]const u8{
     "libukplat_native/addr.isr.o",
     "libukplat_native/paging.isr.o",

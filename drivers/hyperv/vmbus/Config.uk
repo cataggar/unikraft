@@ -1,0 +1,38 @@
+config LIBVMBUS
+	bool "Hyper-V VMBus protocol and enumeration"
+	depends on PLAT_HYPERV
+	select LIBUKBUS
+	select LIBUKSCHED
+	default y
+	help
+		Negotiate the VMBus control protocol and enumerate synthetic
+		devices. Channel rings and device data paths are not included.
+
+if LIBVMBUS
+
+config LIBVMBUS_MAX_DEVICES
+	int "Maximum enumerated VMBus devices"
+	range 1 256
+	default 32
+
+config LIBVMBUS_MAX_DRIVERS
+	int "Maximum registered VMBus drivers"
+	range 1 64
+	default 16
+
+config LIBVMBUS_RX_QUEUE
+	int "SINT2 control-message queue depth"
+	range 2 128
+	default 16
+
+config LIBVMBUS_VERSION_TIMEOUT_MS
+	int "Protocol response timeout (milliseconds)"
+	range 10 10000
+	default 500
+
+config LIBVMBUS_POST_RETRIES
+	int "PostMessage insufficient-buffer retries"
+	range 0 32
+	default 6
+
+endif

@@ -80,6 +80,7 @@ void hyperv_synic_disable(void);
 __u64 hyperv_hypercall(__u64 control, __u64 input_gpa, __u64 output_gpa);
 __u16 hyperv_status_code(__u64 result);
 __u16 hyperv_status_kind(__u64 result);
+int hyperv_has_post_messages(void);
 __u64 hyperv_msr_read(__u32 msr);
 void hyperv_msr_write(__u32 msr, __u64 value);
 __u64 hyperv_time_ref_count(void);
@@ -95,6 +96,7 @@ void hyperv_clock_set_efi_sample(__u64 epoch_ns, __u64 reference_time);
 
 void hyperv_vmbus_message(const struct hyperv_message *message);
 void hyperv_vmbus_event(__u32 event);
+void hyperv_vmbus_fini(void);
 
 _Static_assert(HYPERV_PAGE_SIZE == 4096U, "Hyper-V pages are 4 KiB");
 _Static_assert(sizeof(struct hyperv_message) == HYPERV_MESSAGE_SIZE,
