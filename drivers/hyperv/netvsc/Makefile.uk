@@ -1,0 +1,24 @@
+$(eval $(call addlib_s,libnetvsc,$(CONFIG_LIBNETVSC)))
+
+LIBNETVSC_CINCLUDES-y += -I$(LIBNETVSC_BASE)
+LIBNETVSC_CINCLUDES-y += -I$(LIBVMBUS_BASE)/include
+LIBNETVSC_CINCLUDES-y += -I$(LIBUKNETDEV_BASE)/include
+
+LIBNETVSC_SRCS-y += $(LIBNETVSC_BASE)/netvsc.c
+
+NETVSC_PROTOCOL_OBJ := $(LIBNETVSC_BUILD)/netvsc_protocol.o
+NETVSC_ZIG_CACHE := $(LIBNETVSC_BUILD)/zig-cache
+NETVSC_ZIG_GLOBAL_CACHE := $(LIBNETVSC_BUILD)/zig-global-cache
+
+$(NETVSC_PROTOCOL_OBJ): $(LIBNETVSC_BASE)/netvsc_protocol.zig
+	$(call build_cmd,ZIG,libnetvsc,$(notdir $@),\
+		mkdir -p $(NETVSC_ZIG_CACHE) $(NETVSC_ZIG_GLOBAL_CACHE) && \
+		zig build-obj -target x86_64-freestanding-none -OReleaseFast \
+			-fPIC -fsingle-threaded -mno-red-zone \
+			-fno-stack-check -fno-stack-protector -fno-unwind-tables \
+			--cache-dir $(NETVSC_ZIG_CACHE) \
+			--global-cache-dir $(NETVSC_ZIG_GLOBAL_CACHE) \
+			-femit-bin=$@ $<)
+
+UK_PREPARE-$(CONFIG_LIBNETVSC) += $(NETVSC_PROTOCOL_OBJ)
+LIBNETVSC_OBJS-y += $(NETVSC_PROTOCOL_OBJ)

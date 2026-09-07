@@ -523,6 +523,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(storvsc_core_tests).step);
+    const netvsc_protocol_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/netvsc/netvsc_protocol.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(netvsc_protocol_tests).step);
     const hyperv_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,
@@ -704,6 +714,72 @@ pub fn build(b: *std.Build) void {
         "1",
     );
     test_step.dependOn(&verify_storvsc_core.step);
+    const netvsc_protocol_object = b.addObject(.{
+        .name = "netvsc-protocol-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/netvsc/netvsc_protocol.zig",
+            ),
+            .target = hyperv_target,
+            .optimize = .ReleaseFast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const netvsc_protocol_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    netvsc_protocol_link.addFileArg(netvsc_protocol_object.getEmittedBin());
+    netvsc_protocol_link.addArg("-o");
+    const netvsc_protocol_linked =
+        netvsc_protocol_link.addOutputFileArg("netvsc-protocol-linked.o");
+    const verify_netvsc_protocol = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/netvsc-protocol-test.py",
+        "--object",
+    });
+    verify_netvsc_protocol.addFileArg(netvsc_protocol_linked);
+    verify_netvsc_protocol.addArgs(&.{ "--nm", "llvm-nm" });
+    verify_netvsc_protocol.setCwd(.{ .cwd_relative = root });
+    verify_netvsc_protocol.setEnvironmentVariable(
+        "PYTHONDONTWRITEBYTECODE",
+        "1",
+    );
+    test_step.dependOn(&verify_netvsc_protocol.step);
+    const netvsc_protocol_abi_tests = b.addExecutable(.{
+        .name = "netvsc-protocol-abi-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    netvsc_protocol_abi_tests.root_module.addIncludePath(b.path("include"));
+    netvsc_protocol_abi_tests.root_module.addIncludePath(
+        b.path("arch/x86/x86_64/include"),
+    );
+    netvsc_protocol_abi_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/netvsc"),
+    );
+    netvsc_protocol_abi_tests.root_module.addCSourceFile(.{
+        .file = b.path(
+            "support/build/tests/netvsc-protocol-abi-test.c",
+        ),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    test_step.dependOn(&b.addRunArtifact(netvsc_protocol_abi_tests).step);
     const vmbus_abi_tests = b.addExecutable(.{
         .name = "vmbus-abi-test",
         .root_module = b.createModule(.{
@@ -929,6 +1005,47 @@ pub fn build(b: *std.Build) void {
     storvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
     storvsc_production_tests.link_gc_sections = true;
     test_step.dependOn(&b.addRunArtifact(storvsc_production_tests).step);
+    const netvsc_binding_protocol = b.addObject(.{
+        .name = "netvsc-protocol-host-binding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/netvsc/netvsc_protocol.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const netvsc_production_tests = b.addExecutable(.{
+        .name = "netvsc-driver-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    inline for (.{
+        "support/build/tests/netvsc-host-include",
+        "support/build/tests",
+        "drivers/hyperv/netvsc",
+    }) |path| netvsc_production_tests.root_module.addIncludePath(b.path(path));
+    netvsc_production_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "drivers/hyperv/netvsc/netvsc.c",
+            "support/build/tests/netvsc-driver-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DNETVSC_HOST_TEST",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-ignored-attributes",
+            "-pthread",
+        },
+    });
+    netvsc_production_tests.root_module.addObject(netvsc_binding_protocol);
+    netvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
+    test_step.dependOn(&b.addRunArtifact(netvsc_production_tests).step);
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",
         .root_module = b.createModule(.{
@@ -1236,21 +1353,21 @@ fn registerNativeGraph(
     const profile_name = b.option(
         []const u8,
         "native-profile",
-        "Registered native graph: qemu-x86_64, qemu-arm64, or hyperv-x86_64-efi",
+        "Registered native graph: qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, or hyperv-x86_64-efi-netvsc",
     ) orelse b.option(
         []const u8,
         "native-qemu-graph",
         "Legacy alias for -Dnative-profile",
     ) orelse {
         const fail = b.addFail(
-            "native-link-graph requires -Dnative-profile=qemu-x86_64, qemu-arm64, or hyperv-x86_64-efi",
+            "native-link-graph requires -Dnative-profile=qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, or hyperv-x86_64-efi-netvsc",
         );
         step.dependOn(&fail.step);
         return null;
     };
     const profile = native_image_graph.parseProfile(profile_name) catch {
         step.dependOn(&b.addFail(b.fmt(
-            "unsupported native graph '{s}'; registered graphs are qemu-x86_64, qemu-arm64, and hyperv-x86_64-efi",
+            "unsupported native graph '{s}'; registered graphs are qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, and hyperv-x86_64-efi-netvsc",
             .{profile_name},
         )).step);
         return null;
@@ -1332,7 +1449,7 @@ fn registerNativePipeline(
     );
     const registered = registration orelse {
         step.dependOn(&b.addFail(
-            "native-images requires -Dnative-profile=qemu-x86_64, qemu-arm64, or hyperv-x86_64-efi",
+            "native-images requires -Dnative-profile=qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, or hyperv-x86_64-efi-netvsc",
         ).step);
         return step;
     };
@@ -1626,6 +1743,12 @@ fn nativeProfileMatchesConfig(
             std.mem.eql(u8, architecture, "x86_64") and
             nativeConfigEnabled(config, "CONFIG_OPTIMIZE_PIE") and
             nativeConfigEnabled(config, "CONFIG_LIBUKPAGING"),
+        .@"hyperv-x86_64-efi-netvsc" => nativeConfigEnabled(config, "CONFIG_PLAT_HYPERV") and
+            std.mem.eql(u8, architecture, "x86_64") and
+            nativeConfigEnabled(config, "CONFIG_OPTIMIZE_PIE") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKPAGING") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKNETDEV") and
+            nativeConfigEnabled(config, "CONFIG_LIBNETVSC"),
     };
 }
 
@@ -1716,11 +1839,22 @@ test "native profiles require matching architecture and boot protocol" {
         \\CONFIG_LIBUKPAGING=y
         \\
     };
+    const hyperv_netvsc = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_HYPERV=y
+        \\CONFIG_OPTIMIZE_PIE=y
+        \\CONFIG_LIBUKPAGING=y
+        \\CONFIG_LIBUKNETDEV=y
+        \\CONFIG_LIBNETVSC=y
+        \\
+    };
     try std.testing.expect(nativeProfileMatchesConfig(.@"qemu-x86_64", &x86));
     try std.testing.expect(!nativeProfileMatchesConfig(.@"qemu-arm64", &x86));
     try std.testing.expect(nativeProfileMatchesConfig(.@"qemu-arm64", &arm64));
     try std.testing.expect(!nativeProfileMatchesConfig(.@"qemu-x86_64", &arm64));
     try std.testing.expect(nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", &hyperv));
+    try std.testing.expect(!nativeProfileMatchesConfig(.@"hyperv-x86_64-efi-netvsc", &hyperv));
+    try std.testing.expect(nativeProfileMatchesConfig(.@"hyperv-x86_64-efi-netvsc", &hyperv_netvsc));
     try std.testing.expect(!nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", &x86));
 }
 

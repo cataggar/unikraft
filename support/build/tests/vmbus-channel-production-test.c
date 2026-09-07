@@ -18,6 +18,8 @@ vmbus_channel_host_prepare_open(struct vmbus_device *device);
 struct vmbus_channel *
 vmbus_channel_host_allocate_open(struct vmbus_device *device);
 int vmbus_channel_host_pages_used(void);
+int vmbus_channel_host_record_count(void);
+int vmbus_channel_host_live_gpadls(void);
 int vmbus_channel_host_is_free(struct vmbus_channel *channel);
 int vmbus_channel_host_is_revoked(struct vmbus_channel *channel);
 int vmbus_channel_host_attach_gpadl(struct vmbus_channel *channel,
@@ -25,6 +27,7 @@ int vmbus_channel_host_attach_gpadl(struct vmbus_channel *channel,
 void vmbus_bus_host_set_transmit_error(int error);
 int vmbus_bus_host_connection_failed(void);
 void vmbus_bus_host_clear_connection_failed(void);
+void vmbus_bus_host_auto_pump(int enabled);
 
 #ifndef VMBUS_REAL_PROTOCOL_TEST
 int vmbus_post_message(__u32 connection_id __attribute__((unused)),
@@ -711,6 +714,62 @@ static int test_gpadl_quarantine(void)
 	return 0;
 }
 
+static int test_external_gpadl_mapping(void)
+{
+	static __u8 pages[3][4096] __attribute__((aligned(4096)));
+	struct vmbus_device device = {
+		.channel_id = 30,
+		.connection_id = 130,
+		.present = 1,
+	};
+	struct vmbus_gpadl mapping = { 0 };
+	struct vmbus_gpadl stale;
+	struct vmbus_channel *channel;
+	int rc;
+
+	channel = vmbus_channel_host_prepare_open(&device);
+	if (!channel)
+		return 240;
+	vmbus_bus_host_auto_pump(1);
+	rc = vmbus_channel_gpadl_map(channel, pages, sizeof(pages),
+				      &mapping);
+	vmbus_bus_host_auto_pump(0);
+	if (rc || !mapping.id || mapping.page_count != 3 ||
+	    !mapping.generation || vmbus_channel_host_record_count() != 1 ||
+	    vmbus_channel_host_live_gpadls() != 1)
+		return 241;
+	stale = mapping;
+	stale.generation++;
+	if (vmbus_channel_gpadl_unmap(channel, &stale) != -ESTALE ||
+	    vmbus_channel_host_record_count() != 1)
+		return 242;
+	vmbus_bus_host_auto_pump(1);
+	rc = vmbus_channel_gpadl_unmap(channel, &mapping);
+	vmbus_bus_host_auto_pump(0);
+	if (rc || mapping.id || mapping.page_count || mapping.generation ||
+	    vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls())
+		return 243;
+	if (vmbus_channel_gpadl_map(channel, &pages[0][1], 4096,
+				    &mapping) != -EINVAL ||
+	    vmbus_channel_gpadl_map(channel, pages,
+		    (size_t)(VMBUS_GPADL_MAX_PAGES + 1) * 4096,
+		    &mapping) != -E2BIG)
+		return 244;
+
+	vmbus_bus_host_auto_pump(1);
+	rc = vmbus_channel_gpadl_map(channel, pages, sizeof(pages),
+				      &mapping);
+	if (!rc)
+		rc = vmbus_channel_close(channel);
+	vmbus_bus_host_auto_pump(0);
+	if (rc || device.channel || vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls() ||
+	    vmbus_channel_host_pages_used())
+		return 245;
+	return 0;
+}
+
 int main(void)
 {
 #ifdef VMBUS_REAL_PROTOCOL_TEST
@@ -748,6 +807,9 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = test_gpadl_quarantine();
+	if (rc)
+		return rc;
+	rc = test_external_gpadl_mapping();
 	if (rc)
 		return rc;
 	return 0;

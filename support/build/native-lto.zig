@@ -75,7 +75,10 @@ pub const ProfileError = error{UnsupportedLtoProfile};
 pub fn requireLtoProfile(profile: native_image_graph.Profile) ProfileError!void {
     switch (profile) {
         .@"qemu-x86_64" => {},
-        .@"qemu-arm64", .@"hyperv-x86_64-efi" => return error.UnsupportedLtoProfile,
+        .@"qemu-arm64",
+        .@"hyperv-x86_64-efi",
+        .@"hyperv-x86_64-efi-netvsc",
+        => return error.UnsupportedLtoProfile,
     }
 }
 

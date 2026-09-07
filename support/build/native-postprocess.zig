@@ -1001,6 +1001,7 @@ test "production native profiles plan through compile database generation" {
         native_graph.Profile.@"qemu-x86_64",
         native_graph.Profile.@"qemu-arm64",
         native_graph.Profile.@"hyperv-x86_64-efi",
+        native_graph.Profile.@"hyperv-x86_64-efi-netvsc",
     }) |profile| {
         var registered = try native_graph.RegisteredGraph.init(std.testing.allocator, .{
             .roots = .{
@@ -1038,7 +1039,9 @@ test "production native profiles plan through compile database generation" {
 
         const expected_operations: usize = if (profile == .@"qemu-x86_64") 4 else 5;
         try std.testing.expectEqual(expected_operations, plan.operations.len);
-        if (profile == .@"hyperv-x86_64-efi") {
+        if (profile == .@"hyperv-x86_64-efi" or
+            profile == .@"hyperv-x86_64-efi-netvsc")
+        {
             try std.testing.expectEqual(OperationKind.uk_reloc, plan.operations[0].kind);
             try std.testing.expectEqual(OperationKind.strip, plan.operations[1].kind);
             try std.testing.expectEqual(

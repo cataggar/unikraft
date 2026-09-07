@@ -26,19 +26,24 @@ enum vmbus_gpadl_record_state {
 	VMBUS_GPADL_RECORD_OWNED,
 	VMBUS_GPADL_RECORD_ASYNC,
 	VMBUS_GPADL_RECORD_RESET,
+	VMBUS_GPADL_RECORD_TEARING_DOWN,
 	VMBUS_GPADL_RECORD_RECLAIMING,
 };
 
 struct vmbus_gpadl_record {
 	struct vmbus_channel_transaction *transaction;
 	__u64 channel_generation;
+	__vaddr_t address;
 	__u32 gpadl_id;
 	__u32 relid;
+	__u32 byte_count;
 	__u16 page_start;
 	__u16 page_count;
 	__u8 state;
 	__u8 host_done;
 	__u8 local_drained;
+	__u8 owns_ring_pages;
+	__u8 external;
 };
 
 struct vmbus_channel {
@@ -103,6 +108,8 @@ transaction_release(struct vmbus_channel_transaction *transaction);
 static void gpadl_record_release(struct vmbus_gpadl_record *record,
 				 int free_pages);
 static void gpadl_record_try_reclaim(struct vmbus_gpadl_record *record);
+static int teardown_external_gpadls(struct vmbus_channel *channel,
+				    int wait);
 
 static void initialize_channel_locks(void)
 {
@@ -398,8 +405,12 @@ static struct vmbus_gpadl_record *gpadl_record_allocate(void)
 				__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
 			continue;
 		gpadl_records[i].transaction = NULL;
+		gpadl_records[i].address = 0;
+		gpadl_records[i].byte_count = 0;
 		gpadl_records[i].host_done = 0;
 		gpadl_records[i].local_drained = 0;
+		gpadl_records[i].owns_ring_pages = 0;
+		gpadl_records[i].external = 0;
 		__atomic_add_fetch(&live_gpadls, 1, __ATOMIC_RELAXED);
 		__atomic_store_n(&gpadl_records[i].state,
 				 VMBUS_GPADL_RECORD_OWNED, __ATOMIC_RELEASE);
@@ -430,16 +441,20 @@ static void gpadl_record_release(struct vmbus_gpadl_record *record,
 		return;
 	if (record->transaction)
 		transaction_release(record->transaction);
-	if (free_pages && record->page_count)
+	if (free_pages && record->owns_ring_pages && record->page_count)
 		free_ring_pages(record->page_start, record->page_count);
 	record->transaction = NULL;
 	record->channel_generation = 0;
+	record->address = 0;
 	record->gpadl_id = 0;
 	record->relid = 0;
+	record->byte_count = 0;
 	record->page_start = 0;
 	record->page_count = 0;
 	record->host_done = 0;
 	record->local_drained = 0;
+	record->owns_ring_pages = 0;
+	record->external = 0;
 	if (__atomic_load_n(&live_gpadls, __ATOMIC_RELAXED))
 		__atomic_sub_fetch(&live_gpadls, 1, __ATOMIC_RELAXED);
 	__atomic_store_n(&record->state, VMBUS_GPADL_RECORD_FREE,
@@ -494,6 +509,8 @@ static void quarantine_channel_pages(
 	 */
 	record->page_start = channel->page_start;
 	record->page_count = channel->page_count;
+	record->byte_count = (__u32)channel->page_count * VMBUS_PAGE_SIZE;
+	record->owns_ring_pages = 1;
 	record->transaction = transaction;
 	__atomic_store_n(&record->state,
 			 posted ? VMBUS_GPADL_RECORD_ASYNC :
@@ -656,6 +673,8 @@ static int create_gpadl(struct vmbus_channel *channel,
 	record->channel_generation = channel->owner.generation;
 	record->page_start = channel->page_start;
 	record->page_count = channel->page_count;
+	record->byte_count = (__u32)channel->page_count * VMBUS_PAGE_SIZE;
+	record->owns_ring_pages = 1;
 	channel->gpadl_record =
 		(__u16)(record - &gpadl_records[0] + 1);
 	capacity_epoch =
@@ -827,6 +846,171 @@ static int teardown_gpadl_nowait(struct vmbus_channel *channel)
 	quarantine_channel_pages(channel, record, record->transaction,
 				 channel->teardown_posted && transaction);
 	return rc;
+}
+
+static struct vmbus_gpadl_record *
+external_gpadl_find(struct vmbus_channel *channel,
+		    const struct vmbus_gpadl *gpadl)
+{
+	unsigned int i;
+
+	if (!channel || !gpadl || !gpadl->id || !gpadl->generation)
+		return NULL;
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++) {
+		struct vmbus_gpadl_record *record = &gpadl_records[i];
+
+		if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_FREE ||
+		    !record->external || record->gpadl_id != gpadl->id ||
+		    record->channel_generation != gpadl->generation ||
+		    record->channel_generation != channel->owner.generation ||
+		    record->relid != channel->relid ||
+		    record->page_count != gpadl->page_count)
+			continue;
+		return record;
+	}
+	return NULL;
+}
+
+static int external_gpadl_pfns(__vaddr_t address, __u16 page_start,
+			       __u16 page_count, __u64 *pfns)
+{
+	unsigned int i;
+
+	for (i = 0; i < page_count; i++) {
+		__vaddr_t page = address +
+			(__vaddr_t)(page_start + i) * VMBUS_PAGE_SIZE;
+		__paddr_t gpa;
+
+		if (page < address)
+			return -EOVERFLOW;
+		gpa = uk_paging_virt_to_phys(page);
+		if (gpa == UK_PAGING_PADDR_INV ||
+		    (gpa & (VMBUS_PAGE_SIZE - 1)))
+			return -EINVAL;
+		pfns[i] = gpa >> 12;
+	}
+	return 0;
+}
+
+static int post_external_gpadl(struct vmbus_channel *channel,
+			       struct vmbus_gpadl_record *record,
+			       int *posted)
+{
+	__u64 pfns[28];
+	__u8 message[240];
+	size_t consumed;
+	unsigned int page = 0;
+	__u32 message_number = 1;
+	int length;
+	int rc;
+
+	rc = external_gpadl_pfns(record->address, 0,
+				 record->page_count > 26 ? 26 :
+				 record->page_count, pfns);
+	if (rc)
+		return rc;
+	length = vmbus_gpadl_header(message, sizeof(message),
+			channel->relid, record->gpadl_id, record->byte_count,
+			pfns, record->page_count, &consumed);
+	rc = transmit_message(message, length);
+	if (rc)
+		return rc;
+	*posted = 1;
+	page += consumed;
+	while (page < record->page_count) {
+		__u16 count = (__u16)(record->page_count - page);
+
+		if (count > 28)
+			count = 28;
+		rc = external_gpadl_pfns(record->address, (__u16)page,
+					 count, pfns);
+		if (rc)
+			return rc;
+		length = vmbus_gpadl_body(message, sizeof(message),
+				message_number++, record->gpadl_id, pfns,
+				count, &consumed);
+		rc = transmit_message(message, length);
+		if (rc)
+			return rc;
+		page += consumed;
+	}
+	return 0;
+}
+
+static int teardown_external_gpadl(struct vmbus_channel *channel,
+				   struct vmbus_gpadl_record *record,
+				   int wait)
+{
+	struct vmbus_channel_transaction *transaction;
+	__u8 message[16];
+	__u8 expected = VMBUS_GPADL_RECORD_OWNED;
+	int posted = 0;
+	int length;
+	int rc;
+
+	if (!__atomic_compare_exchange_n(&record->state, &expected,
+			VMBUS_GPADL_RECORD_TEARING_DOWN, 0,
+			__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+		return expected == VMBUS_GPADL_RECORD_FREE ? 0 :
+			-EINPROGRESS;
+	transaction = transaction_allocate(VMBUS_TRANSACTION_GPADL_TEARDOWN,
+			channel->relid, record->gpadl_id);
+	if (!transaction) {
+		__atomic_store_n(&record->local_drained, 1, __ATOMIC_RELEASE);
+		__atomic_store_n(&record->state, VMBUS_GPADL_RECORD_RESET,
+				 __ATOMIC_RELEASE);
+		return -ENOSPC;
+	}
+	record->transaction = transaction;
+	length = vmbus_gpadl_teardown_message(message, sizeof(message),
+			channel->relid, record->gpadl_id);
+	rc = transmit_message(message, length);
+	posted = !rc;
+	if (!rc && wait)
+		rc = transaction_wait(transaction, NULL);
+	if (!rc && wait) {
+		record->transaction = NULL;
+		transaction_release(transaction);
+		gpadl_record_release(record, 0);
+		return 0;
+	}
+	if (posted) {
+		record->host_done = __atomic_load_n(&transaction->done,
+						    __ATOMIC_ACQUIRE);
+		__atomic_store_n(&record->state, VMBUS_GPADL_RECORD_ASYNC,
+				 __ATOMIC_RELEASE);
+	} else {
+		record->transaction = NULL;
+		transaction_release(transaction);
+		__atomic_store_n(&record->state, VMBUS_GPADL_RECORD_RESET,
+				 __ATOMIC_RELEASE);
+	}
+	__atomic_store_n(&record->local_drained, 1, __ATOMIC_RELEASE);
+	gpadl_record_try_reclaim(record);
+	return rc;
+}
+
+static int teardown_external_gpadls(struct vmbus_channel *channel, int wait)
+{
+	unsigned int i;
+	int result = 0;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++) {
+		struct vmbus_gpadl_record *record = &gpadl_records[i];
+		int rc;
+
+		if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) !=
+			    VMBUS_GPADL_RECORD_OWNED ||
+		    !record->external ||
+		    record->channel_generation != channel->owner.generation ||
+		    record->relid != channel->relid)
+			continue;
+		rc = teardown_external_gpadl(channel, record, wait);
+		if (!result)
+			result = rc;
+	}
+	return result;
 }
 
 static int open_channel_control(struct vmbus_channel *channel,
@@ -1031,6 +1215,7 @@ int vmbus_channel_close(struct vmbus_channel *channel)
 	int acquired;
 	int rc;
 	int rc2;
+	int unmap_rc;
 
 	if (!channel)
 		return -ENODEV;
@@ -1045,9 +1230,14 @@ int vmbus_channel_close(struct vmbus_channel *channel)
 		channel->device->channel = NULL;
 	channel_synchronize_io(channel);
 	rc = close_channel_control(channel);
+	unmap_rc = teardown_external_gpadls(channel, 1);
+	if (unmap_rc)
+		vmbus_control_fail();
 	rc2 = teardown_gpadl(channel, NULL);
 	if (!rc)
 		rc = rc2;
+	if (!rc)
+		rc = unmap_rc;
 	if (rc)
 		vmbus_control_fail();
 	end_channel_operation(channel, &token);
@@ -1090,8 +1280,15 @@ static int channel_send(struct vmbus_channel *channel, __u16 packet_type,
 	if (!rc && need_signal) {
 		int signal_rc = signal_channel(channel, &token);
 
-		if (signal_rc)
-			rc = signal_rc == -ECANCELED ? signal_rc : -EIO;
+		if (signal_rc) {
+			/*
+			 * The ring write is already committed. Report an
+			 * uncertain transport failure, never a pre-commit
+			 * cancellation that could return buffer ownership.
+			 */
+			vmbus_control_fail();
+			rc = -EIO;
+		}
 	}
 	end_channel_operation(channel, &token);
 	if (rc == -ECANCELED)
@@ -1101,6 +1298,146 @@ static int channel_send(struct vmbus_channel *channel, __u16 packet_type,
 	if (rc)
 		return rc == -1 ? -EAGAIN : -EPROTO;
 	return 0;
+}
+
+int vmbus_channel_gpadl_map(struct vmbus_channel *channel, void *address,
+			    size_t length, struct vmbus_gpadl *gpadl)
+{
+	struct vmbus_channel_transaction *transaction;
+	struct vmbus_gpadl_record *record;
+	struct vmbus_channel_token token = { 0 };
+	__u64 capacity_epoch;
+	unsigned int pages;
+	int acquired;
+	int posted = 0;
+	int rc;
+
+	if (!address || !gpadl || ((uintptr_t)address &
+		    (VMBUS_PAGE_SIZE - 1)) || !length ||
+	    (length & (VMBUS_PAGE_SIZE - 1)) || length > UINT32_MAX)
+		return -EINVAL;
+	pages = length / VMBUS_PAGE_SIZE;
+	if (!pages || pages > VMBUS_GPADL_MAX_PAGES)
+		return -E2BIG;
+	if (gpadl->id || gpadl->page_count || gpadl->generation)
+		return -EBUSY;
+	rc = vmbus_control_enter(&acquired);
+	if (rc)
+		return rc;
+	rc = channel_operation_begin(channel, &token, 1);
+	if (rc)
+		goto out_control;
+	capacity_epoch =
+		vmbus_control_channel_capacity_epoch(channel->device);
+	record = gpadl_record_allocate();
+	if (!record) {
+		vmbus_control_note_channel_capacity(channel->device,
+						    capacity_epoch);
+		rc = -ENOSPC;
+		goto out_operation;
+	}
+	rc = vmbus_monotonic_id_allocate(&next_gpadl_id,
+					 &record->gpadl_id);
+	if (rc)
+		goto out_record;
+	record->channel_generation = channel->owner.generation;
+	record->relid = channel->relid;
+	record->address = (__vaddr_t)address;
+	record->byte_count = (__u32)length;
+	record->page_count = (__u16)pages;
+	record->external = 1;
+	gpadl->id = record->gpadl_id;
+	gpadl->page_count = record->page_count;
+	gpadl->generation = record->channel_generation;
+	capacity_epoch =
+		vmbus_control_channel_capacity_epoch(channel->device);
+	transaction = transaction_allocate(VMBUS_TRANSACTION_GPADL_CREATE,
+			channel->relid, record->gpadl_id);
+	if (!transaction) {
+		vmbus_control_note_channel_capacity(channel->device,
+						    capacity_epoch);
+		rc = -ENOSPC;
+		goto out_record;
+	}
+	rc = post_external_gpadl(channel, record, &posted);
+	if (!rc) {
+		rc = transaction_wait(transaction, &token);
+	}
+	transaction_release(transaction);
+	if (rc)
+		goto out_posted;
+	goto out_operation;
+out_posted:
+	if (posted) {
+		int cleanup_rc =
+			teardown_external_gpadl(channel, record, 1);
+
+		if (cleanup_rc) {
+			vmbus_control_fail();
+			rc = -EINPROGRESS;
+		} else {
+			gpadl->id = 0;
+			gpadl->page_count = 0;
+			gpadl->generation = 0;
+		}
+	} else {
+		gpadl_record_release(record, 0);
+		gpadl->id = 0;
+		gpadl->page_count = 0;
+		gpadl->generation = 0;
+	}
+	goto out_operation;
+out_record:
+	gpadl_record_release(record, 0);
+	gpadl->id = 0;
+	gpadl->page_count = 0;
+	gpadl->generation = 0;
+out_operation:
+	end_channel_operation(channel, &token);
+out_control:
+	vmbus_control_exit(acquired);
+	return rc;
+}
+
+int vmbus_channel_gpadl_unmap(struct vmbus_channel *channel,
+			      struct vmbus_gpadl *gpadl)
+{
+	struct vmbus_channel_token token = { 0 };
+	struct vmbus_gpadl_record *record;
+	int acquired;
+	int rc;
+
+	if (!gpadl)
+		return -EINVAL;
+	if (!gpadl->id && !gpadl->page_count && !gpadl->generation)
+		return 0;
+	rc = vmbus_control_enter(&acquired);
+	if (rc)
+		return rc;
+	rc = channel_operation_begin(channel, &token, 1);
+	if (rc)
+		goto out_control;
+	record = external_gpadl_find(channel, gpadl);
+	if (!record) {
+		rc = -ESTALE;
+		goto out_operation;
+	}
+	if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) !=
+	    VMBUS_GPADL_RECORD_OWNED) {
+		rc = -EINPROGRESS;
+		goto out_operation;
+	}
+	rc = teardown_external_gpadl(channel, record, 1);
+	if (!rc) {
+		gpadl->id = 0;
+		gpadl->page_count = 0;
+		gpadl->generation = 0;
+	}
+out_operation:
+	end_channel_operation(channel, &token);
+out_control:
+	vmbus_control_exit(acquired);
+	return rc;
 }
 
 int vmbus_channel_send(struct vmbus_channel *channel, __u16 packet_type,
@@ -1255,8 +1592,7 @@ int vmbus_channel_receive(struct vmbus_channel *channel,
 			int signal_rc = signal_channel(channel, &token);
 
 			if (signal_rc)
-				rc = signal_rc == -ECANCELED ?
-					signal_rc : -EIO;
+				vmbus_control_fail();
 		}
 	}
 	end_channel_operation(channel, &token);
@@ -1471,6 +1807,8 @@ int vmbus_channel_rescind(__u32 channel_id)
 	if (plan.send_gpadl_teardown &&
 	    teardown_gpadl_nowait(channel))
 		vmbus_control_fail();
+	if (teardown_external_gpadls(channel, 0))
+		vmbus_control_fail();
 	if (channel->device && channel->device->channel == channel)
 		channel->device->channel = NULL;
 	channel->device = NULL;
@@ -1498,6 +1836,7 @@ void vmbus_channel_close_all(void)
 					 (__u32)-ECANCELED);
 		rc = close_channel_control(&channels[i]);
 		(void)rc;
+		(void)teardown_external_gpadls(&channels[i], 1);
 		(void)teardown_gpadl(&channels[i], NULL);
 		if (channels[i].device &&
 		    channels[i].device->channel == &channels[i])
@@ -1519,8 +1858,16 @@ void vmbus_channel_reset_all(void)
 			    VMBUS_GPADL_RECORD_ASYNC ||
 		    __atomic_load_n(&gpadl_records[i].state,
 				    __ATOMIC_ACQUIRE) ==
-			    VMBUS_GPADL_RECORD_RESET) {
+			    VMBUS_GPADL_RECORD_RESET ||
+		    __atomic_load_n(&gpadl_records[i].state,
+				    __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_TEARING_DOWN) {
+			__atomic_store_n(&gpadl_records[i].state,
+					 VMBUS_GPADL_RECORD_RESET,
+					 __ATOMIC_RELEASE);
 			__atomic_store_n(&gpadl_records[i].host_done, 1,
+					 __ATOMIC_RELEASE);
+			__atomic_store_n(&gpadl_records[i].local_drained, 1,
 					 __ATOMIC_RELEASE);
 			gpadl_record_try_reclaim(&gpadl_records[i]);
 		}
@@ -1556,6 +1903,11 @@ void vmbus_channel_reset_all(void)
 				 __ATOMIC_RELEASE);
 		end_channel_operation(&channels[i], &token);
 	}
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++)
+		if (__atomic_load_n(&gpadl_records[i].state,
+				    __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_OWNED)
+			gpadl_record_release(&gpadl_records[i], 1);
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++)
 		if (__atomic_load_n(&gpadl_records[i].state,
 				    __ATOMIC_ACQUIRE) ==
@@ -1690,6 +2042,8 @@ int vmbus_channel_host_attach_gpadl(struct vmbus_channel *channel,
 	record->channel_generation = channel->owner.generation;
 	record->page_start = channel->page_start;
 	record->page_count = channel->page_count;
+	record->byte_count = (__u32)channel->page_count * VMBUS_PAGE_SIZE;
+	record->owns_ring_pages = 1;
 	channel->gpadl_id = gpadl_id;
 	channel->gpadl_record =
 		(__u16)(record - &gpadl_records[0] + 1);

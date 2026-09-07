@@ -15,6 +15,7 @@ pub const Profile = enum {
     @"qemu-x86_64",
     @"qemu-arm64",
     @"hyperv-x86_64-efi",
+    @"hyperv-x86_64-efi-netvsc",
 };
 
 pub const Error = component.RegistrationError || component.ValidationError || error{
@@ -45,7 +46,9 @@ pub const RegisteredGraph = struct {
         const profile_data = switch (options.profile) {
             .@"qemu-x86_64" => data.x86_64,
             .@"qemu-arm64" => data.arm64,
-            .@"hyperv-x86_64-efi" => data.x86_64,
+            .@"hyperv-x86_64-efi",
+            .@"hyperv-x86_64-efi-netvsc",
+            => data.x86_64,
         };
         const target = targetFor(options.profile);
         var context = component.BuildContext.init(allocator, .{
@@ -79,7 +82,10 @@ pub const RegisteredGraph = struct {
 
 fn targetFor(profile: Profile) component.Target {
     return switch (profile) {
-        .@"qemu-x86_64", .@"hyperv-x86_64-efi" => .{
+        .@"qemu-x86_64",
+        .@"hyperv-x86_64-efi",
+        .@"hyperv-x86_64-efi-netvsc",
+        => .{
             .architecture = .x86_64,
             .family = .x86,
             .abi = "none",
@@ -92,6 +98,15 @@ fn targetFor(profile: Profile) component.Target {
             .triple = "aarch64-freestanding-none",
         },
     };
+}
+
+fn isHyperv(profile: Profile) bool {
+    return profile == .@"hyperv-x86_64-efi" or
+        profile == .@"hyperv-x86_64-efi-netvsc";
+}
+
+fn hasNetvsc(profile: Profile) bool {
+    return profile == .@"hyperv-x86_64-efi-netvsc";
 }
 
 fn toolchainFor(target: component.Target) component.Toolchain {
@@ -130,12 +145,12 @@ fn registerLibraries(
     profile: data.Profile,
 ) Error!void {
     for (profile.libraries) |library| {
-        if (options.profile == .@"hyperv-x86_64-efi" and
+        if (isHyperv(options.profile) and
             std.mem.eql(u8, library.name, "libvgacons"))
         {
             continue;
         }
-        if (options.profile == .@"hyperv-x86_64-efi" and
+        if (isHyperv(options.profile) and
             std.mem.eql(u8, library.name, "libkvmplat"))
         {
             const source = try joinPath(
@@ -163,7 +178,7 @@ fn registerLibraries(
             );
             continue;
         }
-        if (options.profile == .@"hyperv-x86_64-efi") {
+        if (isHyperv(options.profile)) {
             if (std.mem.eql(u8, library.name, "libukallocstack")) {
                 try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[0], &.{});
             } else if (options.enable_ukblkdev and
@@ -181,14 +196,14 @@ fn registerLibraries(
             }
         }
         var effective = library;
-        if (options.profile == .@"hyperv-x86_64-efi" and
+        if (isHyperv(options.profile) and
             std.mem.eql(u8, library.name, "libukplat_native"))
         {
             effective.objects = &data.x86_64_efi_native_objects;
         }
         try registerLibrary(context, allocator, options, effective, &.{});
     }
-    if (options.profile == .@"hyperv-x86_64-efi") {
+    if (isHyperv(options.profile)) {
         const source = try joinPath(
             allocator,
             options.roots.base,
@@ -251,6 +266,38 @@ fn registerLibraries(
                     .name = "storvsc-core",
                     .root_source_file = storvsc_source,
                     .output = storvsc_output,
+                    .optimize = .ReleaseFast,
+                    .pic = true,
+                }},
+            );
+        }
+        if (hasNetvsc(options.profile)) {
+            try registerLibrary(
+                context,
+                allocator,
+                options,
+                data.x86_64_efi_uknetdev,
+                &.{},
+            );
+            const netvsc_source = try joinPath(
+                allocator,
+                options.roots.base,
+                "drivers/hyperv/netvsc/netvsc_protocol.zig",
+            );
+            const netvsc_output = try joinPath(
+                allocator,
+                options.roots.output,
+                "libnetvsc/netvsc_protocol.o",
+            );
+            try registerLibrary(
+                context,
+                allocator,
+                options,
+                data.x86_64_efi_netvsc,
+                &.{.{
+                    .name = "netvsc-protocol",
+                    .root_source_file = netvsc_source,
+                    .output = netvsc_output,
                     .optimize = .ReleaseFast,
                     .pic = true,
                 }},
@@ -386,7 +433,7 @@ fn registerPlatform(
     options: Options,
     profile: data.Profile,
 ) Error!void {
-    const extra_script_count: usize = if (options.profile == .@"hyperv-x86_64-efi") 1 else 0;
+    const extra_script_count: usize = if (isHyperv(options.profile)) 1 else 0;
     const merge_sequence = try allocator.alloc(
         component.LinkSequenceItem,
         profile.linker_script_inputs.len + extra_script_count,
@@ -396,7 +443,7 @@ fn registerPlatform(
         profile.linker_script_inputs.len + extra_script_count + 1,
     );
     for (profile.linker_script_inputs, 0..) |script, index| {
-        const path = if (options.profile == .@"hyperv-x86_64-efi" and index < 2)
+        const path = if (isHyperv(options.profile) and index < 2)
             try joinPath(
                 allocator,
                 options.roots.output,
@@ -414,7 +461,7 @@ fn registerPlatform(
         } };
         platform_scripts[index] = .{ .path = path };
     }
-    if (options.profile == .@"hyperv-x86_64-efi") {
+    if (isHyperv(options.profile)) {
         const reloc_script = try joinPath(
             allocator,
             options.roots.output,
@@ -432,7 +479,7 @@ fn registerPlatform(
         .stage = "merge-linker-scripts",
     } };
 
-    const extra_final_flags: usize = if (options.profile == .@"hyperv-x86_64-efi") 4 else 0;
+    const extra_final_flags: usize = if (isHyperv(options.profile)) 4 else 0;
     const final_sequence = try allocator.alloc(
         component.LinkSequenceItem,
         context.libraries.items.len + 8 + extra_final_flags,
@@ -441,7 +488,9 @@ fn registerPlatform(
     final_sequence[sequence_index] = .{ .literal_flag = switch (options.profile) {
         .@"qemu-x86_64" => "-Wl,--entry=_multiboot_entry",
         .@"qemu-arm64" => "-Wl,--entry=_libkvmplat_entry",
-        .@"hyperv-x86_64-efi" => "-Wl,--entry=uk_efi_entry64",
+        .@"hyperv-x86_64-efi",
+        .@"hyperv-x86_64-efi-netvsc",
+        => "-Wl,--entry=uk_efi_entry64",
     } };
     sequence_index += 1;
     for (context.libraries.items, 0..) |library, index| {
@@ -460,7 +509,7 @@ fn registerPlatform(
     sequence_index += 1;
     final_sequence[sequence_index] = .{ .literal_flag = "-Wl,--build-id=none" };
     sequence_index += 1;
-    if (options.profile == .@"hyperv-x86_64-efi") {
+    if (isHyperv(options.profile)) {
         for ([_][]const u8{
             "-pie",
             "-z",
@@ -489,7 +538,7 @@ fn registerPlatform(
     const merged_script = try joinPath(
         allocator,
         options.roots.output,
-        if (options.profile == .@"hyperv-x86_64-efi")
+        if (isHyperv(options.profile))
             "hyperv-combined.lds"
         else
             "kvm-combined.lds",
@@ -497,10 +546,11 @@ fn registerPlatform(
     const final_output = try joinPath(
         allocator,
         options.roots.output,
-        if (options.profile == .@"hyperv-x86_64-efi")
-            "helloworld_hyperv-x86_64-efi.dbg"
-        else
-            profile.final_output,
+        switch (options.profile) {
+            .@"hyperv-x86_64-efi" => "helloworld_hyperv-x86_64-efi.dbg",
+            .@"hyperv-x86_64-efi-netvsc" => "helloworld_hyperv-x86_64-efi-netvsc.dbg",
+            else => profile.final_output,
+        },
     );
     const post_process = try postProcess(
         allocator,
@@ -514,16 +564,16 @@ fn registerPlatform(
         .linker_definition = try joinPath(
             allocator,
             options.roots.base,
-            if (options.profile == .@"hyperv-x86_64-efi")
+            if (isHyperv(options.profile))
                 "plat/hyperv/Linker.uk"
             else
                 "plat/kvm/Linker.uk",
         ),
-        .libraries = if (options.profile == .@"hyperv-x86_64-efi")
+        .libraries = if (isHyperv(options.profile))
             &.{"libhypervplat"}
         else
             &.{"libkvmplat"},
-        .object_inputs = if (options.profile == .@"hyperv-x86_64-efi")
+        .object_inputs = if (isHyperv(options.profile))
             &.{.{ .library_final_object = "libhypervplat" }}
         else
             &.{.{ .library_final_object = "libkvmplat" }},
@@ -556,6 +606,7 @@ fn postProcess(
         .@"qemu-x86_64" => "helloworld_qemu-x86_64",
         .@"qemu-arm64" => "helloworld_qemu-arm64",
         .@"hyperv-x86_64-efi" => "helloworld_hyperv-x86_64-efi",
+        .@"hyperv-x86_64-efi-netvsc" => "helloworld_hyperv-x86_64-efi-netvsc",
     };
     const image = try joinPath(allocator, output_root, image_relative);
     const bootinfo = try std.fmt.allocPrint(allocator, "{s}.bootinfo", .{image});
@@ -565,14 +616,16 @@ fn postProcess(
     const protocol_name = switch (profile) {
         .@"qemu-x86_64" => "multiboot",
         .@"qemu-arm64" => "linux-header",
-        .@"hyperv-x86_64-efi" => "efi",
+        .@"hyperv-x86_64-efi",
+        .@"hyperv-x86_64-efi-netvsc",
+        => "efi",
     };
     const transformations = try allocator.alloc(
         component.PostProcessTransformation,
         if (profile == .@"qemu-x86_64") 4 else 5,
     );
-    const strip_index: usize = if (profile == .@"hyperv-x86_64-efi") 1 else 0;
-    if (profile == .@"hyperv-x86_64-efi") {
+    const strip_index: usize = if (isHyperv(profile)) 1 else 0;
+    if (isHyperv(profile)) {
         transformations[0] = .{
             .name = "uk-reloc",
             .kind = .uk_reloc,
@@ -596,7 +649,7 @@ fn postProcess(
     transformations[strip_index] = .{
         .name = "strip",
         .kind = .strip,
-        .input = if (profile == .@"hyperv-x86_64-efi")
+        .input = if (isHyperv(profile))
             .{ .post_process_output = .{
                 .platform = platformName(profile),
                 .transformation = "uk-reloc",
@@ -607,7 +660,7 @@ fn postProcess(
                 .platform = platformName(profile),
                 .stage = "final-link",
             } },
-        .flags = if (profile == .@"hyperv-x86_64-efi")
+        .flags = if (isHyperv(profile))
             &.{ ".dynamic", ".gnu.hash", ".hash", ".dynsym", ".dynstr", ".rela.dyn" }
         else
             &.{},
@@ -714,7 +767,7 @@ fn postProcess(
 }
 
 fn platformName(profile: Profile) []const u8 {
-    return if (profile == .@"hyperv-x86_64-efi") "hyperv" else "kvm";
+    return if (isHyperv(profile)) "hyperv" else "kvm";
 }
 
 fn isPrimaryPlatformLibrary(name: []const u8) bool {
@@ -1034,7 +1087,38 @@ test "Hyper-V block libraries follow the solved configuration" {
     for (registered.graph.libraries) |library| {
         try std.testing.expect(!std.mem.eql(u8, library.name, "libukblkdev"));
         try std.testing.expect(!std.mem.eql(u8, library.name, "libstorvsc"));
+        try std.testing.expect(!std.mem.eql(u8, library.name, "libuknetdev"));
+        try std.testing.expect(!std.mem.eql(u8, library.name, "libnetvsc"));
     }
+}
+
+test "Hyper-V NetVSC profile registers protocol and uknetdev" {
+    var registered = try RegisteredGraph.init(std.testing.allocator, .{
+        .roots = .{
+            .base = "/src/unikraft",
+            .app = "/src/app-helloworld",
+            .output = "/build",
+            .config = "/build/.config",
+        },
+        .profile = .@"hyperv-x86_64-efi-netvsc",
+    });
+    defer registered.deinit();
+
+    var saw_uknetdev = false;
+    var netvsc_library: ?component.Library = null;
+    for (registered.graph.libraries) |library| {
+        saw_uknetdev = saw_uknetdev or
+            std.mem.eql(u8, library.name, "libuknetdev");
+        if (std.mem.eql(u8, library.name, "libnetvsc"))
+            netvsc_library = library;
+    }
+    try std.testing.expect(saw_uknetdev);
+    const netvsc = netvsc_library orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), netvsc.target_zig_objects.len);
+    try std.testing.expectEqualStrings(
+        "/src/unikraft/drivers/hyperv/netvsc/netvsc_protocol.zig",
+        netvsc.target_zig_objects[0].root_source_file,
+    );
 }
 
 test "registered profiles match normalized Make graph fixtures" {

@@ -377,6 +377,12 @@ zig build native-images \
   -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
 ```
 
+The `hyperv-x86_64-efi-netvsc` profile extends that graph with `libuknetdev`,
+the NetVSC C binding, and the freestanding NVS/RNDIS Zig protocol object. Its
+solved configuration must additionally select `CONFIG_LIBUKNETDEV=y` and
+`CONFIG_LIBNETVSC=y`; use the same command above with
+`-Dnative-profile=hyperv-x86_64-efi-netvsc`.
+
 Target Zig modules receive generated Kconfig headers through tracked build
 dependencies and can opt into narrow Unikraft include roots for `@cImport`.
 The resulting objects feed the normal library partial-link and final-link
@@ -390,11 +396,11 @@ configuration in place invalidates the generated header.
 
 The Zig 0.16 `native-images` pipeline supports a whole-program flat LTO path
 for the `qemu-x86_64` profile. Selecting `CONFIG_OPTIMIZE_LTO=y` with the
-`qemu-arm64` or `hyperv-x86_64-efi` native profiles is detected at build time
-and rejected with an explicit error. Non-LTO QEMU/ARM64 builds remain fully
-supported. The GNU Make backend is not affected: it retains its existing
-compiler-specific per-library LTO behavior (e.g. `-flto` forwarded to GCC or
-Clang) unchanged.
+`qemu-arm64`, `hyperv-x86_64-efi`, or `hyperv-x86_64-efi-netvsc` native
+profiles is detected at build time and rejected with an explicit error.
+Non-LTO QEMU/ARM64 builds remain fully supported. The GNU Make backend is not
+affected: it retains its existing compiler-specific per-library LTO behavior
+(e.g. `-flto` forwarded to GCC or Clang) unchanged.
 
 To enable LTO for the QEMU/x86_64 native pipeline, copy the application
 x86_64 defconfig, append `CONFIG_OPTIMIZE_LTO=y`, run `zig build olddefconfig`
