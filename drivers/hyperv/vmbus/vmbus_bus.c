@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <errno.h>
 #include <hyperv/hyperv.h>
+#include <uk/arch/spinlock.h>
 #include <uk/bus.h>
 #include <uk/config.h>
 #include <uk/isr/thread.h>
@@ -65,8 +66,10 @@ static __u32 rx_dropped;
 static __u32 event_dropped;
 static __u32 malformed_hv_messages;
 static __u64 post_input_gpa;
+static __u64 relid_sequence;
 static struct uk_thread *worker;
 static struct uk_thread *control_owner;
+static __spinlock worker_lock;
 static int worker_stop;
 static int control_busy;
 static int initialized;
@@ -123,10 +126,14 @@ static void copy_bytes(__u8 *dst, const __u8 *src, unsigned int len)
 
 static void signal_worker(void)
 {
-	struct uk_thread *thread = __atomic_load_n(&worker, __ATOMIC_ACQUIRE);
+	struct uk_thread *thread;
+	unsigned long flags;
 
-	if (thread)
+	ukplat_spin_lock_irqsave(&worker_lock, flags);
+	thread = __atomic_load_n(&worker, __ATOMIC_ACQUIRE);
+	if (thread && !__atomic_load_n(&worker_stop, __ATOMIC_ACQUIRE))
 		uk_thread_wake_isr(thread);
+	ukplat_spin_unlock_irqrestore(&worker_lock, flags);
 }
 
 void hyperv_vmbus_message(const struct hyperv_message *message)
@@ -328,7 +335,9 @@ static void reset_release_records(void)
 		relids[i].channel_id = 0;
 		relids[i].state = VMBUS_RELID_FREE;
 		relids[i].retained = 0;
+		relids[i].sequence = 0;
 	}
+	relid_sequence = 0;
 }
 
 static void copy_offer(struct vmbus_device *dev,
@@ -371,7 +380,8 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 	}
 	if (!free_slot) {
 		rc = vmbus_relid_offer(relids, VMBUS_RELID_CAPACITY,
-				       offer->channel_id, 0);
+				       offer->channel_id, 0,
+				       &relid_sequence);
 		if (rc > 0)
 			return 0;
 		if (rc)
@@ -382,7 +392,7 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 	}
 
 	rc = vmbus_relid_offer(relids, VMBUS_RELID_CAPACITY,
-			       offer->channel_id, 1);
+			       offer->channel_id, 1, &relid_sequence);
 	if (rc > 0)
 		return 0;
 	if (rc)
@@ -448,7 +458,8 @@ static int handle_action(const struct vmbus_action *action)
 		return rescind_offer(action->channel_id);
 	case VMBUS_ACTION_REJECT_OFFER:
 		rc = vmbus_relid_offer(relids, VMBUS_RELID_CAPACITY,
-				       action->channel_id, 0);
+				       action->channel_id, 0,
+				       &relid_sequence);
 		if (rc > 0)
 			return 0;
 		if (rc)
@@ -721,7 +732,7 @@ static void vmbus_worker(void *arg __unused)
 			uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
 			continue;
 		}
-		if (!__atomic_load_n(&control_busy, __ATOMIC_ACQUIRE)) {
+		if (!acquire_control()) {
 			rc = process_messages();
 			vmbus_protocol_tick(hyperv_reference_time(), &action);
 			if (!rc)
@@ -730,10 +741,17 @@ static void vmbus_worker(void *arg __unused)
 				__atomic_store_n(&connection_failed, 1,
 						 __ATOMIC_RELEASE);
 			report_deferred_diagnostics();
+			release_control();
 		}
 		uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
 	}
-	__atomic_store_n(&worker, NULL, __ATOMIC_RELEASE);
+	{
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&worker_lock, flags);
+		__atomic_store_n(&worker, NULL, __ATOMIC_RELEASE);
+		ukplat_spin_unlock_irqrestore(&worker_lock, flags);
+	}
 	uk_sched_thread_exit();
 }
 
@@ -741,35 +759,53 @@ static int start_worker(void)
 {
 	struct uk_sched *sched = uk_sched_current();
 	struct uk_thread *thread;
+	unsigned long flags;
 
 	if (!sched)
 		return -ENOSYS;
+	ukplat_spin_lock_irqsave(&worker_lock, flags);
+	if (__atomic_load_n(&worker, __ATOMIC_ACQUIRE)) {
+		ukplat_spin_unlock_irqrestore(&worker_lock, flags);
+		return -EBUSY;
+	}
+	ukplat_spin_unlock_irqrestore(&worker_lock, flags);
 	worker_stop = 0;
 	thread = uk_sched_thread_create(sched, vmbus_worker, NULL, "vmbus");
 	if (!thread)
 		return -ENOMEM;
+	ukplat_spin_lock_irqsave(&worker_lock, flags);
 	__atomic_store_n(&worker, thread, __ATOMIC_RELEASE);
+	ukplat_spin_unlock_irqrestore(&worker_lock, flags);
 	return 0;
 }
 
 static void stop_worker_locked(void)
 {
-	struct uk_thread *thread =
-		__atomic_load_n(&worker, __ATOMIC_ACQUIRE);
+	struct uk_thread *thread;
+	unsigned long flags;
 	unsigned int attempt;
 
+	ukplat_spin_lock_irqsave(&worker_lock, flags);
+	thread = __atomic_load_n(&worker, __ATOMIC_ACQUIRE);
 	if (!thread)
-		return;
+		goto unlock;
 	__atomic_store_n(&worker_stop, 1, __ATOMIC_RELEASE);
 	if (thread == uk_thread_current() || !uk_sched_current() ||
 	    uk_lcpu_irqs_disabled())
-		return;
+		goto unlock;
 	uk_thread_wake(thread);
+	ukplat_spin_unlock_irqrestore(&worker_lock, flags);
 	for (attempt = 0; attempt < VMBUS_TEARDOWN_WAIT_LIMIT; attempt++) {
 		if (!__atomic_load_n(&worker, __ATOMIC_ACQUIRE))
 			return;
 		uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
 	}
+	return;
+
+unlock:
+	ukplat_spin_unlock_irqrestore(&worker_lock, flags);
+	if (!thread)
+		return;
 }
 
 static int acquire_control(void)
@@ -797,12 +833,15 @@ static void teardown_deactivate_rx(void *arg __unused)
 
 static void teardown_signal_stop(void *arg __unused, int can_schedule)
 {
-	struct uk_thread *thread =
-		__atomic_load_n(&worker, __ATOMIC_ACQUIRE);
+	struct uk_thread *thread;
+	unsigned long flags;
 
+	ukplat_spin_lock_irqsave(&worker_lock, flags);
+	thread = __atomic_load_n(&worker, __ATOMIC_ACQUIRE);
 	__atomic_store_n(&worker_stop, 1, __ATOMIC_RELEASE);
 	if (can_schedule && thread && thread != uk_thread_current())
 		uk_thread_wake(thread);
+	ukplat_spin_unlock_irqrestore(&worker_lock, flags);
 }
 
 static int teardown_try_control(void *arg __unused)
@@ -815,11 +854,6 @@ static int teardown_control_owned(void *arg __unused)
 	return __atomic_load_n(&control_busy, __ATOMIC_ACQUIRE) &&
 	       __atomic_load_n(&control_owner, __ATOMIC_ACQUIRE) ==
 		       uk_thread_current();
-}
-
-static void teardown_release_control(void *arg __unused)
-{
-	release_control();
 }
 
 static int teardown_worker_present(void *arg __unused)
@@ -840,21 +874,21 @@ static void teardown_wait(void *arg __unused)
 	uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
 }
 
+static const struct vmbus_teardown_ops teardown_ops = {
+	.deactivate_rx = teardown_deactivate_rx,
+	.signal_stop = teardown_signal_stop,
+	.try_acquire_control = teardown_try_control,
+	.control_owned_by_caller = teardown_control_owned,
+	.worker_present = teardown_worker_present,
+	.caller_is_worker = teardown_caller_is_worker,
+	.wait_once = teardown_wait,
+};
+
 static int teardown_enter(int *control_acquired)
 {
-	static const struct vmbus_teardown_ops ops = {
-		.deactivate_rx = teardown_deactivate_rx,
-		.signal_stop = teardown_signal_stop,
-		.try_acquire_control = teardown_try_control,
-		.control_owned_by_caller = teardown_control_owned,
-		.release_control = teardown_release_control,
-		.worker_present = teardown_worker_present,
-		.caller_is_worker = teardown_caller_is_worker,
-		.wait_once = teardown_wait,
-	};
 	int can_schedule = uk_sched_current() && !uk_lcpu_irqs_disabled();
 
-	return vmbus_teardown_enter(&ops, NULL, can_schedule,
+	return vmbus_teardown_enter(&teardown_ops, NULL, can_schedule,
 				    VMBUS_TEARDOWN_WAIT_LIMIT,
 				    control_acquired);
 }
@@ -900,7 +934,8 @@ void hyperv_vmbus_fini(void)
 		(void)disconnect_locked();
 		if (control_acquired)
 			release_control();
-	}
+	} else
+		vmbus_teardown_final_fallback(&teardown_ops, NULL);
 	initialized = 0;
 }
 
@@ -945,6 +980,7 @@ static int vmbus_bus_init(struct uk_alloc *a __unused)
 {
 	__paddr_t gpa = uk_paging_virt_to_phys((__vaddr_t)vmbus_post_input());
 
+	ukarch_spin_init(&worker_lock);
 	if (gpa == UK_PAGING_PADDR_INV || (gpa & 0xff)) {
 		uk_pr_err("VMBus: invalid PostMessage input GPA 0x%lx\n", gpa);
 		return -EINVAL;
