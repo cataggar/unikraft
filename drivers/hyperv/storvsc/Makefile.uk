@@ -1,0 +1,23 @@
+$(eval $(call addlib_s,libstorvsc,$(CONFIG_LIBSTORVSC)))
+
+LIBSTORVSC_CINCLUDES-y += -I$(LIBSTORVSC_BASE)
+LIBSTORVSC_CINCLUDES-y += -I$(LIBVMBUS_BASE)/include
+
+LIBSTORVSC_SRCS-y += $(LIBSTORVSC_BASE)/storvsc.c
+
+STORVSC_CORE_OBJ := $(LIBSTORVSC_BUILD)/storvsc_core.o
+STORVSC_ZIG_CACHE := $(LIBSTORVSC_BUILD)/zig-cache
+STORVSC_ZIG_GLOBAL_CACHE := $(LIBSTORVSC_BUILD)/zig-global-cache
+
+$(STORVSC_CORE_OBJ): $(LIBSTORVSC_BASE)/storvsc_core.zig
+	$(call build_cmd,ZIG,libstorvsc,$(notdir $@),\
+		mkdir -p $(STORVSC_ZIG_CACHE) $(STORVSC_ZIG_GLOBAL_CACHE) && \
+		zig build-obj -target x86_64-freestanding-none -OReleaseFast \
+			-fPIC -fsingle-threaded -mno-red-zone \
+			-fno-stack-check -fno-stack-protector -fno-unwind-tables \
+			--cache-dir $(STORVSC_ZIG_CACHE) \
+			--global-cache-dir $(STORVSC_ZIG_GLOBAL_CACHE) \
+			-femit-bin=$@ $<)
+
+UK_PREPARE-$(CONFIG_LIBSTORVSC) += $(STORVSC_CORE_OBJ)
+LIBSTORVSC_OBJS-y += $(STORVSC_CORE_OBJ)

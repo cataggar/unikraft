@@ -513,6 +513,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(vmbus_channel_tests).step);
+    const storvsc_core_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/storvsc/storvsc_core.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(storvsc_core_tests).step);
     const hyperv_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,
@@ -650,6 +660,50 @@ pub fn build(b: *std.Build) void {
         "1",
     );
     test_step.dependOn(&verify_vmbus_channel.step);
+    const storvsc_core_object = b.addObject(.{
+        .name = "storvsc-core-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/storvsc/storvsc_core.zig",
+            ),
+            .target = hyperv_target,
+            .optimize = .ReleaseFast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const storvsc_core_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    storvsc_core_link.addFileArg(storvsc_core_object.getEmittedBin());
+    storvsc_core_link.addArg("-o");
+    const storvsc_core_linked =
+        storvsc_core_link.addOutputFileArg("storvsc-core-linked.o");
+    const verify_storvsc_core = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/storvsc-core-test.py",
+        "--object",
+    });
+    verify_storvsc_core.addFileArg(storvsc_core_linked);
+    verify_storvsc_core.addArgs(&.{ "--nm", "llvm-nm" });
+    verify_storvsc_core.setCwd(.{ .cwd_relative = root });
+    verify_storvsc_core.setEnvironmentVariable(
+        "PYTHONDONTWRITEBYTECODE",
+        "1",
+    );
+    test_step.dependOn(&verify_storvsc_core.step);
     const vmbus_abi_tests = b.addExecutable(.{
         .name = "vmbus-abi-test",
         .root_module = b.createModule(.{
@@ -735,6 +789,50 @@ pub fn build(b: *std.Build) void {
     vmbus_production_tests.root_module.linkSystemLibrary("pthread", .{});
     vmbus_production_tests.link_gc_sections = true;
     test_step.dependOn(&b.addRunArtifact(vmbus_production_tests).step);
+    const storvsc_core_host_object = b.addObject(.{
+        .name = "storvsc-core-host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/storvsc/storvsc_core.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const storvsc_production_tests = b.addExecutable(.{
+        .name = "storvsc-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    storvsc_production_tests.root_module.addIncludePath(
+        b.path("support/build/tests/storvsc-host-include"),
+    );
+    storvsc_production_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/storvsc"),
+    );
+    storvsc_production_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "drivers/hyperv/storvsc/storvsc.c",
+            "support/build/tests/storvsc-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DSTORVSC_HOST_TEST",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-function",
+            "-pthread",
+        },
+    });
+    storvsc_production_tests.root_module.addObject(
+        storvsc_core_host_object,
+    );
+    storvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
+    test_step.dependOn(&b.addRunArtifact(storvsc_production_tests).step);
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",
         .root_module = b.createModule(.{
@@ -1062,6 +1160,15 @@ fn registerNativeGraph(
         return null;
     };
 
+    const config = loadNativeConfig(b, context.config) catch null;
+    const enable_storvsc = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBSTORVSC")
+    else
+        false;
+    const enable_ukblkdev = enable_storvsc or if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBUKBLKDEV")
+    else
+        false;
     const registration = b.allocator.create(native_image_graph.RegisteredGraph) catch {
         step.dependOn(&b.addFail("unable to allocate the native QEMU graph").step);
         return null;
@@ -1074,6 +1181,8 @@ fn registerNativeGraph(
             .config = context.config,
         },
         .profile = profile,
+        .enable_ukblkdev = enable_ukblkdev,
+        .enable_storvsc = enable_storvsc,
     }) catch |err| {
         step.dependOn(&b.addFail(b.fmt(
             "unable to register native QEMU graph '{s}': {s}",

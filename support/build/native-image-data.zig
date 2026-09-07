@@ -67,6 +67,28 @@ pub const x86_64_efi_vmbus = Library{
     },
 };
 
+pub const x86_64_efi_ukblkdev = Library{
+    .name = "libukblkdev",
+    .origin = .library,
+    .objects = &.{
+        "libukblkdev/blkdev.o",
+        "libukblkdev/libinfo.libuklibid.o",
+    },
+    .export_symbols = .{
+        .root = .base,
+        .relative = "lib/ukblkdev/exportsyms.uk",
+    },
+};
+
+pub const x86_64_efi_storvsc = Library{
+    .name = "libstorvsc",
+    .origin = .driver,
+    .objects = &.{
+        "libstorvsc/storvsc.o",
+        "libstorvsc/libinfo.libuklibid.o",
+    },
+};
+
 pub const x86_64_efi_native_objects = [_][]const u8{
     "libukplat_native/addr.isr.o",
     "libukplat_native/paging.isr.o",

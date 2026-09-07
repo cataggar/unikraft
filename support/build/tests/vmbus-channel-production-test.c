@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <uk/arch/types.h>
 #include <uk/vmbus.h>
@@ -105,6 +106,7 @@ static pthread_mutex_t signal_gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t signal_condition = PTHREAD_COND_INITIALIZER;
 static int host_signal_blocked;
 static int host_signal_entered;
+static int host_signal_result;
 
 static void ring_wait(void)
 {
@@ -185,7 +187,7 @@ int vmbus_signal_event(
 	while (host_signal_blocked)
 		pthread_cond_wait(&signal_condition, &signal_gate);
 	pthread_mutex_unlock(&signal_gate);
-	return 0;
+	return host_signal_result;
 }
 
 int vmbus_gpadl_header(__u8 *output, size_t capacity,
@@ -498,6 +500,54 @@ static int test_signal_lifetime(void)
 	return 0;
 }
 
+static int test_send_publication(void)
+{
+	struct vmbus_device device = {
+		.channel_id = 27,
+		.connection_id = 127,
+		.present = 1,
+	};
+	struct vmbus_channel *channel;
+	struct vmbus_gpa_range range;
+	__u8 value = 1;
+	__u64 pfn = 1;
+	int published = -1;
+	int rc;
+
+	channel = vmbus_channel_host_prepare_open(&device);
+	if (!channel)
+		return 275;
+	ring_blocked = 0;
+	ring_need_signal = 1;
+	host_signal_blocked = 0;
+	host_signal_result = -1;
+	rc = vmbus_channel_send_ex(channel, 6, 0, 1, NULL, 0,
+				   &value, sizeof(value), &published);
+	host_signal_result = 0;
+	ring_need_signal = 0;
+	if (rc != -EIO || published != 1)
+		return 276;
+	published = -1;
+	if (vmbus_channel_send_ex(channel, 6, 0, 2, NULL, 1,
+				  &value, sizeof(value), &published) !=
+	    -EINVAL ||
+	    published != 0)
+		return 277;
+	range.byte_count = 1;
+	range.byte_offset = 0;
+	range.pfns = &pfn;
+	range.pfn_count = UINT32_MAX;
+	published = -1;
+	if (vmbus_channel_send_gpa_direct_ex(channel, 0, 3, &range, 1,
+					     &value, sizeof(value),
+					     &published) != -EINVAL ||
+	    published != 0)
+		return 279;
+	if (vmbus_channel_rescind(27) != -EINPROGRESS)
+		return 278;
+	return 0;
+}
+
 static pthread_mutex_t callback_gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t callback_condition = PTHREAD_COND_INITIALIZER;
 static int callback_entered;
@@ -667,6 +717,9 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = test_signal_lifetime();
+	if (rc)
+		return rc;
+	rc = test_send_publication();
 	if (rc)
 		return rc;
 	rc = test_callback_lifetime();

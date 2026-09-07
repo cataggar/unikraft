@@ -25,6 +25,8 @@ pub const Error = component.RegistrationError || component.ValidationError || er
 pub const Options = struct {
     roots: component.Roots,
     profile: Profile,
+    enable_ukblkdev: bool = false,
+    enable_storvsc: bool = false,
 };
 
 pub fn parseProfile(name: []const u8) error{UnsupportedConfiguration}!Profile {
@@ -164,6 +166,10 @@ fn registerLibraries(
         if (options.profile == .@"hyperv-x86_64-efi") {
             if (std.mem.eql(u8, library.name, "libukallocstack")) {
                 try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[0], &.{});
+            } else if (options.enable_ukblkdev and
+                std.mem.eql(u8, library.name, "libukboot"))
+            {
+                try registerLibrary(context, allocator, options, data.x86_64_efi_ukblkdev, &.{});
             } else if (std.mem.eql(u8, library.name, "libuklibid")) {
                 try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[3], &.{});
                 try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[4], &.{});
@@ -225,6 +231,31 @@ fn registerLibraries(
                 },
             },
         );
+        if (options.enable_storvsc) {
+            const storvsc_source = try joinPath(
+                allocator,
+                options.roots.base,
+                "drivers/hyperv/storvsc/storvsc_core.zig",
+            );
+            const storvsc_output = try joinPath(
+                allocator,
+                options.roots.output,
+                "libstorvsc/storvsc_core.o",
+            );
+            try registerLibrary(
+                context,
+                allocator,
+                options,
+                data.x86_64_efi_storvsc,
+                &.{.{
+                    .name = "storvsc-core",
+                    .root_source_file = storvsc_source,
+                    .output = storvsc_output,
+                    .optimize = .ReleaseFast,
+                    .pic = true,
+                }},
+            );
+        }
     }
 }
 
@@ -883,6 +914,8 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
             .config = "/build/.config",
         },
         .profile = .@"hyperv-x86_64-efi",
+        .enable_ukblkdev = true,
+        .enable_storvsc = true,
     });
     defer registered.deinit();
 
@@ -930,6 +963,19 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
         "/src/unikraft/drivers/hyperv/vmbus/vmbus_channel.zig",
         vmbus.target_zig_objects[1].root_source_file,
     );
+    var storvsc_library: ?component.Library = null;
+    for (registered.graph.libraries) |library| {
+        if (std.mem.eql(u8, library.name, "libstorvsc")) {
+            storvsc_library = library;
+            break;
+        }
+    }
+    const storvsc = storvsc_library orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), storvsc.target_zig_objects.len);
+    try std.testing.expectEqualStrings(
+        "/src/unikraft/drivers/hyperv/storvsc/storvsc_core.zig",
+        storvsc.target_zig_objects[0].root_source_file,
+    );
 
     const final_stage = registered.graph.selectedPlatform().link_stages[1];
     var saw_entry = false;
@@ -971,6 +1017,24 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
         "uk-reloc",
         post[3].additional_inputs[0].post_process_output.transformation,
     );
+}
+
+test "Hyper-V block libraries follow the solved configuration" {
+    var registered = try RegisteredGraph.init(std.testing.allocator, .{
+        .roots = .{
+            .base = "/src/unikraft",
+            .app = "/src/app-helloworld",
+            .output = "/build",
+            .config = "/build/.config",
+        },
+        .profile = .@"hyperv-x86_64-efi",
+    });
+    defer registered.deinit();
+
+    for (registered.graph.libraries) |library| {
+        try std.testing.expect(!std.mem.eql(u8, library.name, "libukblkdev"));
+        try std.testing.expect(!std.mem.eql(u8, library.name, "libstorvsc"));
+    }
 }
 
 test "registered profiles match normalized Make graph fixtures" {

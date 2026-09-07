@@ -348,7 +348,8 @@ The `hyperv-x86_64-efi` profile extends the same compatibility pipeline with
 first-class target-side Zig objects and EFI post-processing. Its solved
 configuration must select the standalone x86_64 `PLAT_HYPERV`, PIE, and
 `LIBUKPAGING`; GNU Make continues to provide the shared x86 UEFI C/assembly
-objects:
+objects. When the solved configuration enables `LIBSTORVSC`, the graph also
+adds `LIBUKBLKDEV`, the StorVSC C binding, and its freestanding Zig core:
 
 The platform captures wall-clock time from UEFI before `ExitBootServices`,
 uses the Hyper-V reference-TSC page when available (falling back to the

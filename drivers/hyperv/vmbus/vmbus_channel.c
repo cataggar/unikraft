@@ -21,9 +21,6 @@
 #define VMBUS_PAGE_SIZE			4096U
 #define VMBUS_CONTROL_TICKS_PER_MS	10000ULL
 #define VMBUS_CONTROL_WAIT_NS		1000000ULL
-#define VMBUS_MAX_GPA_RANGES		32U
-#define VMBUS_MAX_GPA_PFNS		64U
-
 enum vmbus_gpadl_record_state {
 	VMBUS_GPADL_RECORD_FREE,
 	VMBUS_GPADL_RECORD_OWNED,
@@ -1059,16 +1056,19 @@ out:
 	return rc;
 }
 
-int vmbus_channel_send(struct vmbus_channel *channel, __u16 packet_type,
-		       __u16 flags, __u64 transaction_id,
-		       const void *descriptor, size_t descriptor_size,
-		       const void *payload, size_t payload_size)
+static int channel_send(struct vmbus_channel *channel, __u16 packet_type,
+			__u16 flags, __u64 transaction_id,
+			const void *descriptor, size_t descriptor_size,
+			const void *payload, size_t payload_size,
+			int *published)
 {
 	struct vmbus_channel_token token = { 0 };
 	__u8 need_signal;
 	unsigned long irq_flags;
 	int rc;
 
+	if (published)
+		*published = 0;
 	if ((!descriptor && descriptor_size) || (!payload && payload_size))
 		return -EINVAL;
 	rc = channel_operation_begin(channel, &token, 1);
@@ -1085,6 +1085,8 @@ int vmbus_channel_send(struct vmbus_channel *channel, __u16 packet_type,
 			descriptor_size, payload ? payload : &empty_input,
 			payload_size, &need_signal);
 	ukplat_spin_unlock_irqrestore(&channel->tx_lock, irq_flags);
+	if (!rc && published)
+		*published = 1;
 	if (!rc && need_signal) {
 		int signal_rc = signal_channel(channel, &token);
 
@@ -1101,20 +1103,48 @@ int vmbus_channel_send(struct vmbus_channel *channel, __u16 packet_type,
 	return 0;
 }
 
-int vmbus_channel_send_gpa_direct(struct vmbus_channel *channel,
-				  __u16 flags, __u64 transaction_id,
-				  const struct vmbus_gpa_range *ranges,
-				  __u32 range_count,
-				  const void *payload, size_t payload_size)
+int vmbus_channel_send(struct vmbus_channel *channel, __u16 packet_type,
+		       __u16 flags, __u64 transaction_id,
+		       const void *descriptor, size_t descriptor_size,
+		       const void *payload, size_t payload_size)
 {
-	__u8 descriptor[8 + VMBUS_MAX_GPA_RANGES * 8 +
-			VMBUS_MAX_GPA_PFNS * 8];
+	return channel_send(channel, packet_type, flags, transaction_id,
+			    descriptor, descriptor_size, payload, payload_size,
+			    NULL);
+}
+
+int vmbus_channel_send_ex(struct vmbus_channel *channel, __u16 packet_type,
+			  __u16 flags, __u64 transaction_id,
+			  const void *descriptor, size_t descriptor_size,
+			  const void *payload, size_t payload_size,
+			  int *published)
+{
+	if (!published)
+		return -EINVAL;
+	return channel_send(channel, packet_type, flags, transaction_id,
+			    descriptor, descriptor_size, payload, payload_size,
+			    published);
+}
+
+static int channel_send_gpa_direct(
+			struct vmbus_channel *channel,
+			__u16 flags, __u64 transaction_id,
+			const struct vmbus_gpa_range *ranges,
+			__u32 range_count,
+			const void *payload, size_t payload_size,
+			int *published)
+{
+	__u8 descriptor[8 + VMBUS_GPA_DIRECT_MAX_RANGES * 8 +
+			VMBUS_GPA_DIRECT_MAX_PFNS * 8];
 	size_t offset = 8;
 	unsigned int range_index;
 	unsigned int pfn_index;
 	unsigned int total_pfns = 0;
 
-	if (!ranges || !range_count || range_count > VMBUS_MAX_GPA_RANGES)
+	if (published)
+		*published = 0;
+	if (!ranges || !range_count ||
+	    range_count > VMBUS_GPA_DIRECT_MAX_RANGES)
 		return -EINVAL;
 	for (range_index = 0; range_index < range_count; range_index++) {
 		__u64 covered;
@@ -1123,8 +1153,10 @@ int vmbus_channel_send_gpa_direct(struct vmbus_channel *channel,
 		if (!ranges[range_index].pfns ||
 		    !ranges[range_index].pfn_count ||
 		    ranges[range_index].byte_offset >= VMBUS_PAGE_SIZE ||
-		    total_pfns + ranges[range_index].pfn_count >
-			    VMBUS_MAX_GPA_PFNS)
+		    ranges[range_index].pfn_count >
+			    VMBUS_GPA_DIRECT_MAX_PFNS ||
+		    total_pfns > VMBUS_GPA_DIRECT_MAX_PFNS -
+			    ranges[range_index].pfn_count)
 			return -EINVAL;
 		covered = (__u64)ranges[range_index].byte_offset +
 			ranges[range_index].byte_count;
@@ -1156,9 +1188,33 @@ int vmbus_channel_send_gpa_direct(struct vmbus_channel *channel,
 	descriptor[5] = (__u8)(range_count >> 8);
 	descriptor[6] = (__u8)(range_count >> 16);
 	descriptor[7] = (__u8)(range_count >> 24);
-	return vmbus_channel_send(channel, VMBUS_PACKET_DATA_USING_GPA_DIRECT,
-			flags, transaction_id, descriptor, offset,
-			payload, payload_size);
+	return channel_send(channel, VMBUS_PACKET_DATA_USING_GPA_DIRECT,
+			    flags, transaction_id, descriptor, offset,
+			    payload, payload_size, published);
+}
+
+int vmbus_channel_send_gpa_direct(struct vmbus_channel *channel,
+				  __u16 flags, __u64 transaction_id,
+				  const struct vmbus_gpa_range *ranges,
+				  __u32 range_count,
+				  const void *payload, size_t payload_size)
+{
+	return channel_send_gpa_direct(channel, flags, transaction_id, ranges,
+				       range_count, payload, payload_size, NULL);
+}
+
+int vmbus_channel_send_gpa_direct_ex(struct vmbus_channel *channel,
+				     __u16 flags, __u64 transaction_id,
+				     const struct vmbus_gpa_range *ranges,
+				     __u32 range_count,
+				     const void *payload, size_t payload_size,
+				     int *published)
+{
+	if (!published)
+		return -EINVAL;
+	return channel_send_gpa_direct(channel, flags, transaction_id, ranges,
+				       range_count, payload, payload_size,
+				       published);
 }
 
 int vmbus_channel_receive(struct vmbus_channel *channel,

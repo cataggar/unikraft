@@ -12,6 +12,8 @@ extern "C" {
 
 #define VMBUS_GUID_SIZE			16U
 #define VMBUS_USER_DATA_SIZE		120U
+#define VMBUS_GPA_DIRECT_MAX_RANGES	32U
+#define VMBUS_GPA_DIRECT_MAX_PFNS	64U
 
 struct vmbus_guid {
 	__u8 bytes[VMBUS_GUID_SIZE];
@@ -103,11 +105,27 @@ int vmbus_channel_send(struct vmbus_channel *channel, __u16 packet_type,
 		       __u16 flags, __u64 transaction_id,
 		       const void *descriptor, size_t descriptor_size,
 		       const void *payload, size_t payload_size);
+/*
+ * As vmbus_channel_send(), while reporting whether the packet was committed
+ * to the TX ring. A committed packet remains owned by the channel consumer
+ * even if a subsequent SignalEvent operation fails.
+ */
+int vmbus_channel_send_ex(struct vmbus_channel *channel, __u16 packet_type,
+			  __u16 flags, __u64 transaction_id,
+			  const void *descriptor, size_t descriptor_size,
+			  const void *payload, size_t payload_size,
+			  int *published);
 int vmbus_channel_send_gpa_direct(struct vmbus_channel *channel,
 				  __u16 flags, __u64 transaction_id,
 				  const struct vmbus_gpa_range *ranges,
 				  __u32 range_count,
 				  const void *payload, size_t payload_size);
+int vmbus_channel_send_gpa_direct_ex(struct vmbus_channel *channel,
+				     __u16 flags, __u64 transaction_id,
+				     const struct vmbus_gpa_range *ranges,
+				     __u32 range_count,
+				     const void *payload, size_t payload_size,
+				     int *published);
 int vmbus_channel_receive(struct vmbus_channel *channel,
 			  struct vmbus_packet *packet,
 			  void *descriptor, size_t descriptor_capacity,
