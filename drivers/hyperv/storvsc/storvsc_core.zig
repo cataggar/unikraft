@@ -547,6 +547,12 @@ fn findContext(core: *Core, id: u64) ?usize {
     return null;
 }
 
+fn completionPacketSizeValid(length: usize) bool {
+    // VMStor defines the pre-Win8 and Win8+ packet envelopes.
+    return length == legacy_packet_size or
+        length == modern_packet_size;
+}
+
 fn parseRequestCompletion(
     core: *Core,
     slot: usize,
@@ -558,7 +564,7 @@ fn parseRequestCompletion(
         clearEvent(event);
         return;
     }
-    if (payload.len != core.packet_size or payload.len > max_packet_size) {
+    if (!completionPacketSizeValid(payload.len)) {
         completeRequest(
             context,
             slot,
@@ -590,7 +596,9 @@ fn parseRequestCompletion(
     const sense_len = payload[21];
     const transferred = getLe32(payload, 24);
     if (sense_len > core.sense_size or sense_len > max_sense_size or
-        transferred > context.expected_transfer)
+        transferred > context.expected_transfer or
+        ((srb_status & srb_status_autosense_valid) != 0 and
+            28 + @as(usize, sense_len) > payload.len))
     {
         completeRequest(
             context,
@@ -656,9 +664,8 @@ fn parseRequestCompletion(
     );
 }
 
-fn controlPacketValid(core: *Core, payload: []const u8) bool {
-    return payload.len == core.packet_size and
-        payload.len <= max_packet_size and
+fn controlPacketValid(payload: []const u8) bool {
+    return completionPacketSizeValid(payload.len) and
         getLe32(payload, 0) == @intFromEnum(Operation.complete_io);
 }
 
@@ -738,7 +745,7 @@ export fn storvsc_core_receive(
 
     if (core.control_kind != .none and transaction_id == core.control_id) {
         const control_kind = core.control_kind;
-        if (!controlPacketValid(core, payload)) {
+        if (!controlPacketValid(payload)) {
             if (control_kind == .reset) {
                 core.control_kind = .none;
                 core.control_id = 0;
@@ -1210,10 +1217,10 @@ export fn storvsc_parse_inquiry(
 ) callconv(.c) c_int {
     zeroObject(inquiry);
     const data = data_ptr[0..data_len];
-    if (data.len < 36)
+    if (data.len < 5)
         return -eproto;
     const reported = @as(usize, data[4]) + 5;
-    if (reported < 36 or reported > data.len)
+    if (reported < 36)
         return -eproto;
     const qualifier = data[0] >> 5;
     const peripheral_type = data[0] & 0x1f;
@@ -1380,6 +1387,72 @@ fn initializeReady(
     try std.testing.expectEqual(EventKind.initialization_ready, event.kind);
 }
 
+fn initializeReadyWithCompletionLengths(
+    storage: *align(core_storage_align) anyopaque,
+    rejected_versions: usize,
+    lengths: [4]usize,
+) !void {
+    var event: Event = undefined;
+    var packet = completionPacket(64, 0, 0, 0, 0);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_core_start(storage, 1, 100, &event),
+    );
+    _ = storvsc_core_receive(
+        storage,
+        event.tx.transaction_id,
+        &packet,
+        lengths[0],
+        2,
+        &event,
+    );
+    try expectTransmit(&event, .query_protocol_version);
+    for (0..rejected_versions) |_| {
+        const id = event.tx.transaction_id;
+        packet = completionPacket(64, 1, 0, 0, 0);
+        _ = storvsc_core_receive(
+            storage,
+            id,
+            &packet,
+            lengths[1],
+            3,
+            &event,
+        );
+        try expectTransmit(&event, .query_protocol_version);
+    }
+    packet = completionPacket(64, 0, 0, 0, 0);
+    _ = storvsc_core_receive(
+        storage,
+        event.tx.transaction_id,
+        &packet,
+        lengths[1],
+        4,
+        &event,
+    );
+    try expectTransmit(&event, .query_properties);
+    packet = completionPacket(64, 0, 0, 0, 0);
+    putLe32(packet[0..], 24, 256 * 1024);
+    _ = storvsc_core_receive(
+        storage,
+        event.tx.transaction_id,
+        &packet,
+        lengths[2],
+        5,
+        &event,
+    );
+    try expectTransmit(&event, .end_initialization);
+    packet = completionPacket(64, 0, 0, 0, 0);
+    _ = storvsc_core_receive(
+        storage,
+        event.tx.transaction_id,
+        &packet,
+        lengths[3],
+        6,
+        &event,
+    );
+    try std.testing.expectEqual(EventKind.initialization_ready, event.kind);
+}
+
 test "wire layouts and exact C ABI stay stable" {
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(Tx));
     try std.testing.expectEqual(@as(usize, 136), @sizeOf(Event));
@@ -1412,6 +1485,53 @@ test "all handshake stages and explicit version fallback are wire safe" {
             storvsc_core_packet_size(&storage),
         );
     }
+}
+
+test "48 and 64 byte control completions interoperate across versions" {
+    var storage: [core_storage_size]u8 align(core_storage_align) = undefined;
+    _ = storvsc_core_initialize(&storage, 1, 4);
+    try initializeReadyWithCompletionLengths(
+        &storage,
+        0,
+        .{ 64, 64, 48, 64 },
+    );
+    try std.testing.expectEqual(
+        protocol_versions[0],
+        storvsc_core_version(&storage),
+    );
+
+    _ = storvsc_core_initialize(&storage, 2, 4);
+    try initializeReadyWithCompletionLengths(
+        &storage,
+        3,
+        .{ 64, 48, 64, 48 },
+    );
+    try std.testing.expectEqual(
+        protocol_versions[3],
+        storvsc_core_version(&storage),
+    );
+
+    _ = storvsc_core_initialize(&storage, 3, 4);
+    try initializeReadyWithCompletionLengths(
+        &storage,
+        2,
+        .{ 48, 64, 48, 64 },
+    );
+    try std.testing.expectEqual(
+        protocol_versions[2],
+        storvsc_core_version(&storage),
+    );
+
+    _ = storvsc_core_initialize(&storage, 4, 4);
+    try initializeReadyWithCompletionLengths(
+        &storage,
+        4,
+        .{ 64, 48, 64, 48 },
+    );
+    try std.testing.expectEqual(
+        protocol_versions[4],
+        storvsc_core_version(&storage),
+    );
 }
 
 test "unsupported versions and every malformed handshake stage fail closed" {
@@ -1690,6 +1810,120 @@ test "known malformed oversized and short completions finish deterministically" 
     try std.testing.expectEqual(@as(c_int, 0), event.err);
 }
 
+test "request completions accept sanctioned sizes and reject all others" {
+    var storage: [core_storage_size]u8 align(core_storage_align) = undefined;
+    var tx: Tx = undefined;
+    var event: Event = undefined;
+    var spec = ScsiSpec{
+        .transfer_len = 0,
+        .minimum_transfer = 0,
+        .timeout_ns = 100,
+        .cdb = [_]u8{0} ** 16,
+        .cdb_len = 6,
+        .direction = @intFromEnum(Direction.none),
+        .allow_short = 0,
+        .reserved = 0,
+    };
+    var packet = completionPacket(64, 0, srb_status_success, 0, 0);
+
+    _ = storvsc_core_initialize(&storage, 1, 4);
+    try initializeReady(&storage, 0);
+    for ([_]usize{ 48, 64 }) |length| {
+        _ = storvsc_core_prepare_scsi(&storage, &spec, 10, &tx);
+        _ = storvsc_core_receive(
+            &storage,
+            tx.transaction_id,
+            &packet,
+            length,
+            11,
+            &event,
+        );
+        try std.testing.expectEqual(EventKind.request_complete, event.kind);
+        try std.testing.expectEqual(@as(c_int, 0), event.err);
+        _ = storvsc_core_take_completed(
+            &storage,
+            tx.slot,
+            tx.transaction_id,
+            &event,
+        );
+    }
+    _ = storvsc_core_prepare_scsi(&storage, &spec, 12, &tx);
+    _ = storvsc_core_receive(
+        &storage,
+        tx.transaction_id,
+        &packet,
+        47,
+        13,
+        &event,
+    );
+    try std.testing.expectEqual(-eproto, event.err);
+    _ = storvsc_core_take_completed(
+        &storage,
+        tx.slot,
+        tx.transaction_id,
+        &event,
+    );
+    _ = storvsc_core_prepare_scsi(&storage, &spec, 14, &tx);
+    var oversized = [_]u8{0} ** 65;
+    for (packet, 0..) |byte, index|
+        oversized[index] = byte;
+    _ = storvsc_core_receive(
+        &storage,
+        tx.transaction_id,
+        &oversized,
+        oversized.len,
+        15,
+        &event,
+    );
+    try std.testing.expectEqual(-eproto, event.err);
+
+    _ = storvsc_core_initialize(&storage, 2, 4);
+    try initializeReady(&storage, 3);
+    for ([_]usize{ 64, 48 }) |length| {
+        _ = storvsc_core_prepare_scsi(&storage, &spec, 20, &tx);
+        packet = completionPacket(64, 0, srb_status_success, 0, 0);
+        _ = storvsc_core_receive(
+            &storage,
+            tx.transaction_id,
+            &packet,
+            length,
+            21,
+            &event,
+        );
+        try std.testing.expectEqual(@as(c_int, 0), event.err);
+        _ = storvsc_core_take_completed(
+            &storage,
+            tx.slot,
+            tx.transaction_id,
+            &event,
+        );
+    }
+    for ([_]struct { rejected: usize, length: usize }{
+        .{ .rejected = 2, .length = 48 },
+        .{ .rejected = 4, .length = 64 },
+    }, 3..) |scenario, epoch| {
+        _ = storvsc_core_initialize(&storage, @intCast(epoch), 4);
+        try initializeReady(&storage, scenario.rejected);
+        _ = storvsc_core_prepare_scsi(&storage, &spec, 30, &tx);
+        packet = completionPacket(64, 0, srb_status_success, 0, 0);
+        _ = storvsc_core_receive(
+            &storage,
+            tx.transaction_id,
+            &packet,
+            scenario.length,
+            31,
+            &event,
+        );
+        try std.testing.expectEqual(@as(c_int, 0), event.err);
+        _ = storvsc_core_take_completed(
+            &storage,
+            tx.slot,
+            tx.transaction_id,
+            &event,
+        );
+    }
+}
+
 test "timeout reset and cancellation leave every request completable once" {
     var storage: [core_storage_size]u8 align(core_storage_align) = undefined;
     var tx: Tx = undefined;
@@ -1830,6 +2064,35 @@ test "capacity inquiry and mode parsers reject arithmetic and layout edges" {
         @as(c_int, 0),
         storvsc_parse_inquiry(&data, data.len, &inquiry),
     );
+    var long_inquiry = [_]u8{0} ** 96;
+    long_inquiry[4] = 0xff;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_parse_inquiry(
+            &long_inquiry,
+            long_inquiry.len,
+            &inquiry,
+        ),
+    );
+    try std.testing.expectEqual(
+        -eproto,
+        storvsc_parse_inquiry(&data, 4, &inquiry),
+    );
+    var minimum_inquiry = [_]u8{ 0, 0, 0, 0, 31 };
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_parse_inquiry(
+            &minimum_inquiry,
+            minimum_inquiry.len,
+            &inquiry,
+        ),
+    );
+    data[4] = 30;
+    try std.testing.expectEqual(
+        -eproto,
+        storvsc_parse_inquiry(&data, data.len, &inquiry),
+    );
+    data[4] = 31;
     data[0] = 5;
     try std.testing.expectEqual(
         -enotsup,
