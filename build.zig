@@ -622,6 +622,29 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     test_step.dependOn(&b.addRunArtifact(vmbus_abi_tests).step);
+    const vmbus_control_tests = b.addExecutable(.{
+        .name = "vmbus-control-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    vmbus_control_tests.root_module.addIncludePath(
+        b.path("support/build/tests/vmbus-include"),
+    );
+    vmbus_control_tests.root_module.addIncludePath(b.path("include"));
+    vmbus_control_tests.root_module.addIncludePath(
+        b.path("arch/x86/x86_64/include"),
+    );
+    vmbus_control_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/vmbus"),
+    );
+    vmbus_control_tests.root_module.addCSourceFile(.{
+        .file = b.path("support/build/tests/vmbus-control-test.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    test_step.dependOn(&b.addRunArtifact(vmbus_control_tests).step);
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",
         .root_module = b.createModule(.{
