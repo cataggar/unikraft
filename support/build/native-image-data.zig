@@ -89,6 +89,41 @@ pub const x86_64_efi_storvsc = Library{
     },
 };
 
+pub const x86_64_efi_uknetdev = Library{
+    .name = "libuknetdev",
+    .origin = .library,
+    .objects = &.{
+        "libuknetdev/netbuf.o",
+        "libuknetdev/netdev.o",
+        "libuknetdev/libinfo.libuklibid.o",
+    },
+};
+
+pub const uklibparam = Library{
+    .name = "libuklibparam",
+    .origin = .library,
+    .objects = &.{
+        "libuklibparam/parser.o",
+        "libuklibparam/libinfo.libuklibid.o",
+    },
+    .linker_scripts = &.{
+        .{ .root = .output, .relative = "libuklibparam/libparam.lds" },
+    },
+    .export_symbols = .{
+        .root = .base,
+        .relative = "lib/uklibparam/exportsyms.uk",
+    },
+};
+
+pub const x86_64_efi_netvsc = Library{
+    .name = "libnetvsc",
+    .origin = .driver,
+    .objects = &.{
+        "libnetvsc/netvsc.o",
+        "libnetvsc/libinfo.libuklibid.o",
+    },
+};
+
 pub const x86_64_efi_native_objects = [_][]const u8{
     "libukplat_native/addr.isr.o",
     "libukplat_native/paging.isr.o",

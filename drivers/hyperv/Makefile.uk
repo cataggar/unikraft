@@ -1,2 +1,3 @@
 $(eval $(call import_lib,$(UK_DRIV_BASE)/hyperv/vmbus))
 $(eval $(call import_lib,$(UK_DRIV_BASE)/hyperv/storvsc))
+$(eval $(call import_lib,$(UK_DRIV_BASE)/hyperv/netvsc))

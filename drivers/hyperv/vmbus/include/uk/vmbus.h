@@ -85,6 +85,19 @@ struct vmbus_gpa_range {
 	__u32 pfn_count;
 };
 
+/*
+ * Opaque, generation-bearing handle for a GPADL backed by caller-owned
+ * page-aligned memory. GPADL range lengths are 16-bit on the wire, limiting a
+ * single mapping to 8,190 pages.
+ */
+#define VMBUS_GPADL_MAX_PAGES	8190U
+
+struct vmbus_gpadl {
+	__u32 id;
+	__u32 page_count;
+	__u64 generation;
+};
+
 typedef void (*vmbus_channel_callback_t)(struct vmbus_channel *channel,
 					 void *arg);
 
@@ -152,6 +165,18 @@ int vmbus_channel_send_gpa_direct_ex(struct vmbus_channel *channel,
 				     __u32 range_count,
 				     const void *payload, size_t payload_size,
 				     int *published);
+/*
+ * Map caller-owned memory into a GPADL. The address and length must both be
+ * page aligned; every virtual page is translated independently. Memory must
+ * remain valid until unmap succeeds or the VMBus connection is reset. A
+ * failed map can return -EINPROGRESS with a non-zero handle when host teardown
+ * is still pending; that handle and its backing memory must be retained until
+ * reset.
+ */
+int vmbus_channel_gpadl_map(struct vmbus_channel *channel, void *address,
+			    size_t length, struct vmbus_gpadl *gpadl);
+int vmbus_channel_gpadl_unmap(struct vmbus_channel *channel,
+			      struct vmbus_gpadl *gpadl);
 int vmbus_channel_receive(struct vmbus_channel *channel,
 			  struct vmbus_packet *packet,
 			  void *descriptor, size_t descriptor_capacity,
@@ -188,6 +213,10 @@ _Static_assert(sizeof(struct vmbus_packet) == 32,
 	       "VMBus packet ABI must be 32 bytes");
 _Static_assert(offsetof(struct vmbus_packet, transaction_id) == 8,
 	       "VMBus packet transaction ID offset changed");
+_Static_assert(sizeof(struct vmbus_gpadl) == 16,
+	       "VMBus GPADL handle ABI must be 16 bytes");
+_Static_assert(offsetof(struct vmbus_gpadl, generation) == 8,
+	       "VMBus GPADL generation offset changed");
 
 #ifdef __cplusplus
 }

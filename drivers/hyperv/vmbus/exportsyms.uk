@@ -16,6 +16,8 @@ vmbus_channel_send
 vmbus_channel_send_ex
 vmbus_channel_send_gpa_direct
 vmbus_channel_send_gpa_direct_ex
+vmbus_channel_gpadl_map
+vmbus_channel_gpadl_unmap
 vmbus_channel_receive
 vmbus_channel_poll
 vmbus_channel_set_callback
