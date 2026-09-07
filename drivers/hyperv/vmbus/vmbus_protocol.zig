@@ -525,6 +525,7 @@ fn tick(now: u64, action: *Action) void {
             action.err = .timeout;
         },
         .unloading => {
+            // Local parser cleanup only; timeout is not host teardown proof.
             context.state = .disconnected;
             action.kind = .cleanup;
             action.err = .timeout;

@@ -97,6 +97,12 @@ int vmbus_unload(void);
  */
 __u64 vmbus_connection_fail(void);
 __u64 vmbus_connection_quiesce_epoch(void);
+/*
+ * Mark an add_dev() refusal as transient and return the bus retry code.
+ * Call vmbus_device_bind_ready() after the blocking resource is released.
+ */
+int vmbus_device_bind_retry(struct vmbus_device *device);
+void vmbus_device_bind_ready(void);
 int _vmbus_register_driver(struct vmbus_driver *driver);
 
 /*
