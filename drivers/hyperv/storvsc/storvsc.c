@@ -34,6 +34,8 @@
 #define STORVSC_BUSY_RETRY_SLEEP_NS	100000000ULL
 #define STORVSC_STOP_WAIT_LIMIT		2000U
 #define STORVSC_CLOSE_RETRY_LIMIT	8U
+#define STORVSC_BUSY_RETRY_LIMIT	32U
+#define STORVSC_BUSY_RETRY_TIMEOUT_NS	2000000000ULL
 #define STORVSC_SEND_WAIT_LIMIT		2000U
 #define STORVSC_CONTROL_TIMEOUT_NS	\
 	((__u64)CONFIG_LIBSTORVSC_CONTROL_TIMEOUT_MS * 1000000ULL)
@@ -99,14 +101,20 @@ struct storvsc_device {
 	__u8 deferred_running;
 	__u8 deferred_wait_vmbus;
 	__u8 deferred_close_busy;
+	__u8 deferred_close_required;
+	__u16 deferred_close_attempts;
 	int deferred_error;
 	struct vmbus_channel *deferred_channel;
 	__u64 deferred_vmbus_epoch;
+	__u64 deferred_close_deadline;
 };
 
 static struct storvsc_device storvsc_devices[CONFIG_LIBSTORVSC_MAX_DEVICES];
 #ifdef STORVSC_HOST_TEST
 static unsigned int storvsc_send_wait_limit = STORVSC_SEND_WAIT_LIMIT;
+static unsigned int storvsc_busy_retry_limit = STORVSC_BUSY_RETRY_LIMIT;
+static __u64 storvsc_busy_retry_timeout_ns =
+	STORVSC_BUSY_RETRY_TIMEOUT_NS;
 #endif
 
 _Static_assert(CONFIG_LIBSTORVSC_MAX_DEVICES == 1,
@@ -690,16 +698,21 @@ static void storvsc_notify_completions(struct storvsc_device *device)
 		uk_blkdev_drv_queue_event(&device->blkdev, 0);
 }
 
-static int storvsc_close_channel_pointer(struct vmbus_channel *channel)
+static int storvsc_close_channel_pointer(struct vmbus_channel *channel,
+					 unsigned int *attempts_out)
 {
 	unsigned int attempt;
 	int rc = -ENODEV;
 
+	if (attempts_out)
+		*attempts_out = 0;
 	if (!channel)
 		return 0;
 	vmbus_channel_set_callback(channel, NULL, NULL);
 	for (attempt = 0; attempt < STORVSC_CLOSE_RETRY_LIMIT; attempt++) {
 		rc = vmbus_channel_close(channel);
+		if (attempts_out)
+			(*attempts_out)++;
 		if (rc != -EBUSY)
 			break;
 		if (!uk_sched_current() || uk_lcpu_irqs_disabled())
@@ -713,7 +726,7 @@ static int storvsc_close_channel_pointer(struct vmbus_channel *channel)
 static int storvsc_close_channel(struct storvsc_device *device)
 {
 	struct vmbus_channel *channel = storvsc_channel_get(device);
-	int rc = storvsc_close_channel_pointer(channel);
+	int rc = storvsc_close_channel_pointer(channel, NULL);
 
 	if (!rc || rc == -ENODEV || rc == -ECANCELED)
 		storvsc_channel_set(device, NULL);
@@ -777,6 +790,8 @@ static void storvsc_deferred_schedule(struct storvsc_device *device,
 {
 	struct vmbus_channel *detached;
 	unsigned long flags;
+	__u64 quiesce_epoch = vmbus_connection_quiesce_epoch();
+	int fail_connection = 0;
 
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	device->online = 0;
@@ -784,22 +799,40 @@ static void storvsc_deferred_schedule(struct storvsc_device *device,
 	if (action == STORVSC_DEFER_REMOVE) {
 		device->removing = 1;
 		device->vmbus_device = NULL;
-		device->deferred_close_busy = 0;
 	}
 	detached = storvsc_channel_detach(device);
+	if (detached && !device->deferred_close_required &&
+	    !device->deferred_wait_vmbus) {
+		device->deferred_channel = detached;
+		device->deferred_close_required = 1;
+	}
 	if (storvsc_deferred_priority(action) >=
 	    storvsc_deferred_priority(device->deferred_action)) {
 		device->deferred_action = action;
 		device->deferred_error = error;
 	}
-	if (device->deferred_action == STORVSC_DEFER_REMOVE)
+	/*
+	 * EBUSY means no close was posted. If VMBus removal takes priority
+	 * while that obligation is pending, wait for this connection's
+	 * acknowledged teardown instead of dropping the retained channel.
+	 */
+	if (device->deferred_action == STORVSC_DEFER_REMOVE &&
+	    device->deferred_close_busy && !device->deferred_running &&
+	    !device->deferred_wait_vmbus) {
+		device->deferred_vmbus_epoch = quiesce_epoch;
+		device->deferred_wait_vmbus = 1;
+		device->deferred_close_busy = 0;
 		device->deferred_channel = NULL;
-	else if (!device->deferred_channel)
-		device->deferred_channel = detached;
+		device->deferred_close_attempts = 0;
+		device->deferred_close_deadline = 0;
+		fail_connection = 1;
+	}
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 
 	if (detached)
 		vmbus_channel_set_callback(detached, NULL, NULL);
+	if (fail_connection)
+		(void)vmbus_connection_fail();
 	storvsc_wake_timeout(device);
 }
 
@@ -1441,6 +1474,7 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	struct storvsc_device *device = &storvsc_devices[0];
 	struct storvsc_capacity capacity;
 	struct storvsc_mode mode;
+	struct vmbus_device_bind_token bind_token;
 	__u8 open_data[24] = { 0 };
 	unsigned long flags;
 	__u32 host_limit;
@@ -1457,8 +1491,11 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 		device->initialized = 1;
 		device->queue.device = device;
 	}
+	rc = vmbus_device_bind_epoch(vmbus_device, &bind_token);
+	if (rc)
+		return rc;
 	if (storvsc_deferred_pending(device))
-		return vmbus_device_bind_retry(vmbus_device);
+		return vmbus_device_bind_retry(vmbus_device, &bind_token);
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	if (device->online || device->removing || device->recovering ||
 	    device->deferred_action != STORVSC_DEFER_NONE ||
@@ -1485,9 +1522,12 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	device->deferred_running = 0;
 	device->deferred_wait_vmbus = 0;
 	device->deferred_close_busy = 0;
+	device->deferred_close_required = 0;
+	device->deferred_close_attempts = 0;
 	device->deferred_error = 0;
 	device->deferred_channel = NULL;
 	device->deferred_vmbus_epoch = 0;
+	device->deferred_close_deadline = 0;
 	memset(device->bindings, 0, sizeof(device->bindings));
 	rc = storvsc_core_initialize(device->core, device->epoch,
 				      CONFIG_LIBSTORVSC_QUEUE_DEPTH);
@@ -1589,47 +1629,87 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 	unsigned long flags;
 	unsigned int count = 0;
 	unsigned int action;
-	__u64 quiesce_epoch;
+	unsigned int close_attempts = 0;
+	unsigned int busy_retry_limit = STORVSC_BUSY_RETRY_LIMIT;
+	__u64 busy_retry_timeout_ns = STORVSC_BUSY_RETRY_TIMEOUT_NS;
+	__u64 now;
+	__u64 quiesce_epoch = vmbus_connection_quiesce_epoch();
 	int error;
 	int rc = 0;
 
+#ifdef STORVSC_HOST_TEST
+	busy_retry_limit = storvsc_busy_retry_limit;
+	busy_retry_timeout_ns = storvsc_busy_retry_timeout_ns;
+#endif
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	if (device->deferred_action == STORVSC_DEFER_NONE) {
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return 0;
 	}
 	if (device->deferred_wait_vmbus) {
-		if (vmbus_connection_quiesce_epoch() ==
-		    device->deferred_vmbus_epoch) {
+		if (quiesce_epoch == device->deferred_vmbus_epoch) {
 			ukplat_spin_unlock_irqrestore(&device->lock, flags);
 			return -EINPROGRESS;
 		}
 		device->deferred_wait_vmbus = 0;
 		device->deferred_close_busy = 0;
+		device->deferred_close_required = 0;
+		device->deferred_close_attempts = 0;
+		device->deferred_channel = NULL;
+		device->deferred_close_deadline = 0;
 	}
 	if (device->deferred_running || device->active_sends ||
 	    device->finish_active) {
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return -EAGAIN;
 	}
+	if (device->deferred_close_required &&
+	    !device->deferred_channel) {
+		device->deferred_vmbus_epoch = quiesce_epoch;
+		device->deferred_wait_vmbus = 1;
+		device->deferred_close_busy = 0;
+		device->deferred_close_attempts = 0;
+		device->deferred_close_deadline = 0;
+		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+		(void)vmbus_connection_fail();
+		return -EINPROGRESS;
+	}
 	device->deferred_running = 1;
 	device->deferred_close_busy = 0;
-	action = device->deferred_action;
-	channel = action == STORVSC_DEFER_REMOVE ?
-		NULL : device->deferred_channel;
+	channel = device->deferred_close_required ?
+		device->deferred_channel : NULL;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 
 	if (channel)
-		rc = storvsc_close_channel_pointer(channel);
+		rc = storvsc_close_channel_pointer(channel, &close_attempts);
 	if (rc && rc != -ENODEV && rc != -ECANCELED) {
 		quiesce_epoch = vmbus_connection_quiesce_epoch();
+		now = ukplat_monotonic_clock();
 		ukplat_spin_lock_irqsave(&device->lock, flags);
-		if (rc == -EBUSY &&
-		    device->deferred_action != STORVSC_DEFER_REMOVE) {
-			device->deferred_close_busy = 1;
-			device->deferred_running = 0;
-			ukplat_spin_unlock_irqrestore(&device->lock, flags);
-			return -EINPROGRESS;
+		action = device->deferred_action;
+		if (rc == -EBUSY) {
+			if (close_attempts >
+			    UINT16_MAX - device->deferred_close_attempts)
+				device->deferred_close_attempts = UINT16_MAX;
+			else
+				device->deferred_close_attempts +=
+					(__u16)close_attempts;
+			if (!device->deferred_close_deadline)
+				device->deferred_close_deadline =
+					now > UINT64_MAX -
+						busy_retry_timeout_ns ?
+					UINT64_MAX :
+					now + busy_retry_timeout_ns;
+			if (action != STORVSC_DEFER_REMOVE &&
+			    device->deferred_close_attempts <
+				    busy_retry_limit &&
+			    now < device->deferred_close_deadline) {
+				device->deferred_close_busy = 1;
+				device->deferred_running = 0;
+				ukplat_spin_unlock_irqrestore(
+					&device->lock, flags);
+				return -EINPROGRESS;
+			}
 		}
 		/*
 		 * A failed guest close does not prove that StorVSP released
@@ -1641,12 +1721,19 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 		device->deferred_wait_vmbus = 1;
 		device->deferred_close_busy = 0;
 		device->deferred_running = 0;
+		device->deferred_close_attempts = 0;
+		device->deferred_channel = NULL;
+		device->deferred_close_deadline = 0;
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		(void)vmbus_connection_fail();
 		return -EINPROGRESS;
 	}
 
 	ukplat_spin_lock_irqsave(&device->lock, flags);
+	device->deferred_close_required = 0;
+	device->deferred_close_attempts = 0;
+	device->deferred_channel = NULL;
+	device->deferred_close_deadline = 0;
 	action = device->deferred_action;
 	error = device->deferred_error;
 	(void)storvsc_core_cancel_all(device->core, error);
@@ -1676,9 +1763,12 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 	device->deferred_running = 0;
 	device->deferred_wait_vmbus = 0;
 	device->deferred_close_busy = 0;
+	device->deferred_close_required = 0;
+	device->deferred_close_attempts = 0;
 	device->deferred_error = 0;
 	device->deferred_channel = NULL;
 	device->deferred_vmbus_epoch = 0;
+	device->deferred_close_deadline = 0;
 	device->recovering = 0;
 	device->removing = 0;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
@@ -1752,6 +1842,12 @@ void storvsc_host_set_send_wait_limit(unsigned int limit)
 	storvsc_send_wait_limit = limit ? limit : 1;
 }
 
+void storvsc_host_set_busy_retry(unsigned int limit, __u64 timeout_ns)
+{
+	storvsc_busy_retry_limit = limit ? limit : 1;
+	storvsc_busy_retry_timeout_ns = timeout_ns ? timeout_ns : 1;
+}
+
 int storvsc_host_deferred_action(void)
 {
 	struct storvsc_device *device = &storvsc_devices[0];
@@ -1815,6 +1911,65 @@ int storvsc_host_deferred_close_busy(void)
 	busy = device->deferred_close_busy;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	return busy;
+}
+
+int storvsc_host_deferred_close_required(void)
+{
+	struct storvsc_device *device = &storvsc_devices[0];
+	unsigned long flags;
+	int required;
+
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	required = device->deferred_close_required;
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return required;
+}
+
+unsigned int storvsc_host_deferred_close_attempts(void)
+{
+	struct storvsc_device *device = &storvsc_devices[0];
+	unsigned long flags;
+	unsigned int attempts;
+
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	attempts = device->deferred_close_attempts;
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return attempts;
+}
+
+int storvsc_host_request_bound(struct uk_blkreq *request)
+{
+	struct storvsc_device *device = &storvsc_devices[0];
+	unsigned long flags;
+	int bound = 0;
+
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	for (unsigned int i = 0; i < CONFIG_LIBSTORVSC_QUEUE_DEPTH; i++)
+		if (device->bindings[i].req == request) {
+			bound = 1;
+			break;
+		}
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return bound;
+}
+
+__u64 storvsc_host_request_pfn(struct uk_blkreq *request,
+			       unsigned int index)
+{
+	struct storvsc_device *device = &storvsc_devices[0];
+	unsigned long flags;
+	__u64 pfn = 0;
+
+	if (index >= CONFIG_LIBSTORVSC_MAX_TRANSFER_PAGES)
+		return 0;
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	for (unsigned int i = 0; i < CONFIG_LIBSTORVSC_QUEUE_DEPTH; i++)
+		if (device->bindings[i].req == request) {
+			pfn = device->bindings[i].pfns[index];
+			break;
+		}
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return pfn;
 }
 
 void storvsc_host_force_timeout(void)

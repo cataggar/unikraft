@@ -26,6 +26,7 @@ void vmbus_bus_host_set_transmit_error(int error);
 int vmbus_bus_host_connection_failed(void);
 void vmbus_bus_host_clear_connection_failed(void);
 
+#ifndef VMBUS_REAL_PROTOCOL_TEST
 int vmbus_post_message(__u32 connection_id __attribute__((unused)),
 		       __u32 message_type __attribute__((unused)),
 		       const __u8 *payload __attribute__((unused)),
@@ -40,14 +41,14 @@ int vmbus_post_message(__u32 connection_id __attribute__((unused)),
 	return 0;
 }
 
-__u32 vmbus_protocol_connection_id(void) { return 1; }
-__u32 vmbus_protocol_version(void) { return (2U << 16) | 4U; }
 void *vmbus_post_input(void)
 {
 	static __u8 input[256] __attribute__((aligned(256)));
 
 	return input;
 }
+__u32 vmbus_protocol_connection_id(void) { return 1; }
+__u32 vmbus_protocol_version(void) { return (2U << 16) | 4U; }
 int vmbus_protocol_state(void) { return VMBUS_STATE_IDLE; }
 __u32 vmbus_protocol_generation(void) { return 1; }
 void vmbus_protocol_start(__u64 now __attribute__((unused)),
@@ -83,6 +84,7 @@ void vmbus_protocol_release(__u32 channel_id __attribute__((unused)),
 {
 	action->kind = VMBUS_ACTION_NONE;
 }
+#endif
 
 static void write32(__u8 *output, __u32 value)
 {
@@ -711,6 +713,9 @@ static int test_gpadl_quarantine(void)
 
 int main(void)
 {
+#ifdef VMBUS_REAL_PROTOCOL_TEST
+	return vmbus_bus_host_quiesce_epoch_test();
+#else
 	int rc = vmbus_channel_host_nested_ownership_test();
 
 	if (rc)
@@ -745,5 +750,6 @@ int main(void)
 	rc = test_gpadl_quarantine();
 	if (rc)
 		return rc;
-	return vmbus_bus_host_quiesce_epoch_test();
+	return 0;
+#endif
 }

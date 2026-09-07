@@ -28,6 +28,12 @@ struct vmbus_device {
 struct vmbus_device_id {
 	struct vmbus_guid class_id;
 };
+
+struct vmbus_device_bind_token {
+	__u64 device_generation;
+	__u64 resource_epoch;
+};
+
 struct vmbus_driver {
 	const char *name;
 	const struct vmbus_device_id *device_ids;
@@ -52,7 +58,11 @@ struct vmbus_gpa_range {
 typedef void (*vmbus_channel_callback_t)(struct vmbus_channel *, void *);
 __u64 vmbus_connection_fail(void);
 __u64 vmbus_connection_quiesce_epoch(void);
-int vmbus_device_bind_retry(struct vmbus_device *);
+int vmbus_device_bind_epoch(struct vmbus_device *device,
+			    struct vmbus_device_bind_token *token);
+int vmbus_device_bind_retry(
+	struct vmbus_device *device,
+	const struct vmbus_device_bind_token *token);
 void vmbus_device_bind_ready(void);
 int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
 		       const void *, size_t);

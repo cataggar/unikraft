@@ -43,6 +43,11 @@ struct vmbus_device_id {
 	struct vmbus_guid class_id;
 };
 
+struct vmbus_device_bind_token {
+	__u64 device_generation;
+	__u64 resource_epoch;
+};
+
 struct vmbus_driver {
 	const char *name;
 	const struct vmbus_device_id *device_ids;
@@ -98,10 +103,18 @@ int vmbus_unload(void);
 __u64 vmbus_connection_fail(void);
 __u64 vmbus_connection_quiesce_epoch(void);
 /*
- * Mark an add_dev() refusal as transient and return the bus retry code.
- * Call vmbus_device_bind_ready() after the blocking resource is released.
+ * Capture this offer generation's resource epoch before testing the resource
+ * that can block add_dev(). If it is unavailable, publish the captured token
+ * with vmbus_device_bind_retry(). This ordering prevents a concurrent
+ * vmbus_device_bind_ready() from being lost. Tokens are valid only for the
+ * captured offer generation; stale generations are rejected. Epoch
+ * exhaustion is fail-closed.
  */
-int vmbus_device_bind_retry(struct vmbus_device *device);
+int vmbus_device_bind_epoch(struct vmbus_device *device,
+			    struct vmbus_device_bind_token *token);
+int vmbus_device_bind_retry(
+	struct vmbus_device *device,
+	const struct vmbus_device_bind_token *token);
 void vmbus_device_bind_ready(void);
 int _vmbus_register_driver(struct vmbus_driver *driver);
 
