@@ -36,6 +36,9 @@ int storvsc_host_deferred_wait_vmbus(void);
 int storvsc_host_deferred_close_busy(void);
 int storvsc_host_deferred_close_required(void);
 unsigned int storvsc_host_deferred_close_attempts(void);
+uint64_t storvsc_host_deferred_vmbus_epoch(void);
+int storvsc_host_update_deferred_vmbus_epoch(uint64_t expected,
+					     uint64_t replacement);
 int storvsc_host_request_bound(struct uk_blkreq *request);
 uint64_t storvsc_host_request_pfn(struct uk_blkreq *request,
 				  unsigned int index);
@@ -120,6 +123,10 @@ static int race_release_sender;
 static int race_recovery_begin;
 static int race_reset_ack;
 static int race_release_reset;
+static int epoch_sample_enabled;
+static int epoch_sample_entered;
+static int epoch_sample_release;
+static uint64_t epoch_sample_value;
 static uint64_t race_transaction_id;
 static const uint64_t *race_pfn_source;
 static unsigned int race_pfns_written;
@@ -278,6 +285,21 @@ void storvsc_host_recovery_begin_hook(void)
 	pthread_mutex_lock(&race_lock);
 	race_recovery_begin = 1;
 	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+}
+
+void storvsc_host_deferred_epoch_sample_hook(uint64_t epoch)
+{
+	pthread_mutex_lock(&race_lock);
+	if (!epoch_sample_enabled) {
+		pthread_mutex_unlock(&race_lock);
+		return;
+	}
+	epoch_sample_value = epoch;
+	epoch_sample_entered = 1;
+	pthread_cond_broadcast(&race_condition);
+	while (!epoch_sample_release)
+		pthread_cond_wait(&race_condition, &race_lock);
 	pthread_mutex_unlock(&race_lock);
 }
 
@@ -1046,6 +1068,16 @@ static int wait_deferred_close_busy(unsigned int limit_ms)
 {
 	for (unsigned int i = 0; i < limit_ms; i++) {
 		if (storvsc_host_deferred_close_busy())
+			return 0;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
+static int wait_deferred_vmbus(unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		if (storvsc_host_deferred_wait_vmbus())
 			return 0;
 		uk_sched_thread_sleep(1000000ULL);
 	}
@@ -1844,6 +1876,117 @@ out:
 	return error;
 }
 
+static int run_deferred_epoch_refresh(struct uk_blkdev *device,
+				      uint8_t *buffer, int error_base)
+{
+	struct uk_blkreq request;
+	atomic_int callbacks;
+	unsigned int failures_before =
+		vmbus_bus_host_connection_fail_calls();
+	uint64_t old_epoch;
+	uint64_t new_epoch;
+	uint64_t request_pfn;
+	uint64_t sampled_epoch;
+	int error = 0;
+
+	atomic_init(&callbacks, 0);
+	initialize_request(&request, UK_BLKREQ_READ, 115, 1, buffer,
+			   request_done, &callbacks);
+	hold_io = 1;
+	pending_count = 0;
+	configure_close_failure(-EIO, 1);
+	if (!(device->submit_one(device, device->_queue[0], &request) &
+	      UK_BLKDEV_STATUS_SUCCESS)) {
+		error = error_base;
+		goto out;
+	}
+	request_pfn = storvsc_host_request_pfn(&request, 0);
+	storvsc_host_force_timeout();
+	if (wait_connection_fail_calls(failures_before + 1, 1000) ||
+	    wait_deferred_vmbus(1000)) {
+		error = error_base + 1;
+		goto out;
+	}
+	old_epoch = storvsc_host_deferred_vmbus_epoch();
+	if (!old_epoch || old_epoch != vmbus_connection_quiesce_epoch() ||
+	    !request_pfn || !storvsc_host_request_bound(&request)) {
+		error = error_base + 2;
+		goto out;
+	}
+	uk_sched_thread_sleep(30000000ULL);
+	if (!storvsc_host_deferred_wait_vmbus() ||
+	    atomic_load(&callbacks) ||
+	    storvsc_host_request_pfn(&request, 0) != request_pfn) {
+		error = error_base + 3;
+		goto out;
+	}
+
+	pthread_mutex_lock(&race_lock);
+	epoch_sample_enabled = 1;
+	epoch_sample_entered = 0;
+	epoch_sample_release = 0;
+	epoch_sample_value = 0;
+	pthread_mutex_unlock(&race_lock);
+	if (wait_race_flag(&epoch_sample_entered)) {
+		error = error_base + 4;
+		goto out;
+	}
+	if (vmbus_bus_host_connection_quiesce()) {
+		error = error_base + 5;
+		goto out;
+	}
+	new_epoch = vmbus_connection_quiesce_epoch();
+	if (new_epoch != old_epoch + 1 ||
+	    storvsc_host_update_deferred_vmbus_epoch(old_epoch, new_epoch) ||
+	    vmbus_bus_host_connection_begin()) {
+		error = error_base + 6;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	epoch_sample_enabled = 0;
+	epoch_sample_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	uk_sched_thread_sleep(50000000ULL);
+	pthread_mutex_lock(&race_lock);
+	sampled_epoch = epoch_sample_value;
+	pthread_mutex_unlock(&race_lock);
+	if (sampled_epoch != old_epoch ||
+	    vmbus_connection_quiesce_epoch() != new_epoch ||
+	    storvsc_host_deferred_vmbus_epoch() != new_epoch ||
+	    !storvsc_host_deferred_wait_vmbus() ||
+	    atomic_load(&callbacks) ||
+	    !storvsc_host_request_bound(&request) ||
+	    storvsc_host_request_pfn(&request, 0) != request_pfn) {
+		error = error_base + 7;
+		goto out;
+	}
+	if (vmbus_bus_host_connection_quiesce()) {
+		error = error_base + 8;
+		goto out;
+	}
+	if (wait_deferred_action(TEST_DEFER_NONE, 1000) ||
+	    wait_worker_present(0, 1000) ||
+	    request.result != -ETIMEDOUT ||
+	    atomic_load(&callbacks) != 1 ||
+	    storvsc_host_request_bound(&request)) {
+		error = error_base + 9;
+		goto out;
+	}
+
+out:
+	pthread_mutex_lock(&race_lock);
+	epoch_sample_enabled = 0;
+	epoch_sample_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	configure_close_failure(0, 0);
+	drop_packets();
+	pending_count = 0;
+	hold_io = 0;
+	return error;
+}
+
 struct integrated_disconnect_context {
 	struct vmbus_driver *driver;
 	struct vmbus_device *vmbus_device;
@@ -2346,6 +2489,11 @@ int main(void)
 		return rc;
 	if (reoffer_device(driver, &vmbus_device, device))
 		return 386;
+	rc = run_deferred_epoch_refresh(device, buffer, 410);
+	if (rc)
+		return rc;
+	if (reoffer_device(driver, &vmbus_device, device))
+		return 420;
 	rc = run_integrated_remove_unload(
 		driver, &vmbus_device, device, buffer, 1, 390);
 	if (rc)
