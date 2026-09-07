@@ -638,6 +638,8 @@ static int create_gpadl(struct vmbus_channel *channel,
 
 	if (channel->page_count > CONFIG_LIBVMBUS_RING_PAGES)
 		return -EINVAL;
+	if (channel->gpadl_id || channel->gpadl_record)
+		return -EBUSY;
 	capacity_epoch =
 		vmbus_control_channel_capacity_epoch(channel->device);
 	record = gpadl_record_allocate();
@@ -998,7 +1000,7 @@ int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
 		goto out_operation;
 	if (close_channel_control(channel)) {
 		vmbus_control_fail();
-		goto out_operation;
+		goto out_partial_gpadl;
 	}
 out_partial_gpadl:
 	if (!channel_operation_valid(&token, 0))
@@ -1011,7 +1013,7 @@ out_partial_gpadl:
 				goto out_operation;
 			vmbus_control_fail();
 			rc = cleanup_rc;
-			goto out_operation;
+			goto out_failed;
 		}
 	}
 out_pages:
@@ -1499,7 +1501,36 @@ void vmbus_channel_reset_all(void)
 		end_channel_operation(&channels[i], &token);
 	}
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++)
-		gpadl_record_try_reclaim(&gpadl_records[i]);
+		if (__atomic_load_n(&gpadl_records[i].state,
+				    __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_ASYNC ||
+		    __atomic_load_n(&gpadl_records[i].state,
+				    __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_RESET) {
+			unsigned int channel_index;
+			int locally_owned = 0;
+
+			for (channel_index = 0;
+			     channel_index < CONFIG_LIBVMBUS_MAX_DEVICES;
+			     channel_index++) {
+				if (__atomic_load_n(&channels[channel_index].state,
+						    __ATOMIC_ACQUIRE) ==
+					    CHANNEL_FREE)
+					continue;
+				if (channels[channel_index].owner.generation ==
+					    gpadl_records[i].channel_generation &&
+				    channels[channel_index].gpadl_record ==
+					    i + 1) {
+					locally_owned = 1;
+					break;
+				}
+			}
+			if (!locally_owned)
+				__atomic_store_n(
+					&gpadl_records[i].local_drained, 1,
+					__ATOMIC_RELEASE);
+			gpadl_record_try_reclaim(&gpadl_records[i]);
+		}
 	__atomic_store_n(&ignored_responses, 0, __ATOMIC_RELEASE);
 }
 
@@ -1555,6 +1586,23 @@ int vmbus_channel_host_pages_used(void)
 	for (i = 0; i < CONFIG_LIBVMBUS_RING_PAGES; i++)
 		used += !!ring_page_used[i];
 	return used;
+}
+
+int vmbus_channel_host_record_count(void)
+{
+	unsigned int i;
+	int used = 0;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++)
+		used += __atomic_load_n(&gpadl_records[i].state,
+					__ATOMIC_ACQUIRE) !=
+			VMBUS_GPADL_RECORD_FREE;
+	return used;
+}
+
+int vmbus_channel_host_live_gpadls(void)
+{
+	return (int)__atomic_load_n(&live_gpadls, __ATOMIC_ACQUIRE);
 }
 
 int vmbus_channel_host_is_free(struct vmbus_channel *channel)
