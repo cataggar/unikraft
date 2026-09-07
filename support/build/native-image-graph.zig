@@ -182,6 +182,31 @@ fn registerLibraries(
         }
         try registerLibrary(context, allocator, options, effective, &.{});
     }
+    if (options.profile == .@"hyperv-x86_64-efi") {
+        const source = try joinPath(
+            allocator,
+            options.roots.base,
+            "drivers/hyperv/vmbus/vmbus_protocol.zig",
+        );
+        const output = try joinPath(
+            allocator,
+            options.roots.output,
+            "libvmbus/vmbus_protocol.o",
+        );
+        try registerLibrary(
+            context,
+            allocator,
+            options,
+            data.x86_64_efi_vmbus,
+            &.{.{
+                .name = "vmbus-protocol",
+                .root_source_file = source,
+                .output = output,
+                .optimize = .ReleaseFast,
+                .pic = true,
+            }},
+        );
+    }
 }
 
 fn registerLibrary(
@@ -867,6 +892,20 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
             2 + data.x86_64_efi_hyperv_objects.len
         ].artifact.artifact ==
             .component_output,
+    );
+
+    var vmbus_library: ?component.Library = null;
+    for (registered.graph.libraries) |library| {
+        if (std.mem.eql(u8, library.name, "libvmbus")) {
+            vmbus_library = library;
+            break;
+        }
+    }
+    const vmbus = vmbus_library orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), vmbus.target_zig_objects.len);
+    try std.testing.expectEqualStrings(
+        "/src/unikraft/drivers/hyperv/vmbus/vmbus_protocol.zig",
+        vmbus.target_zig_objects[0].root_source_file,
     );
 
     const final_stage = registered.graph.selectedPlatform().link_stages[1];

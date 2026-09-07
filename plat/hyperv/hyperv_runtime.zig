@@ -14,6 +14,7 @@ const access_stimer_msrs = @as(u32, 1) << 3;
 const access_hypercall_msrs = @as(u32, 1) << 5;
 const access_vp_index = @as(u32, 1) << 6;
 const access_reference_tsc = @as(u32, 1) << 9;
+const post_messages = @as(u32, 1) << 4;
 
 const msr_guest_os_id = 0x40000000;
 const msr_hypercall = 0x40000001;
@@ -60,6 +61,7 @@ pub const Discovery = extern struct {
     vendor_edx: u32,
     interface_eax: u32,
     features_eax: u32,
+    features_ebx: u32,
     features_edx: u32,
 };
 
@@ -143,7 +145,7 @@ const Features = packed struct(u32) {
 comptime {
     if (@sizeOf(CpuidRegs) != 16 or @alignOf(CpuidRegs) != 4)
         @compileError("Hyper-V CPUID ABI layout changed");
-    if (@sizeOf(Discovery) != 32 or @alignOf(Discovery) != 4)
+    if (@sizeOf(Discovery) != 36 or @alignOf(Discovery) != 4)
         @compileError("Hyper-V discovery ABI layout changed");
     if (@sizeOf(Message) != 256 or @alignOf(Message) != 8)
         @compileError("Hyper-V message ABI layout changed");
@@ -164,6 +166,7 @@ var guest_id_active = false;
 var synic_enabled = false;
 var reference_tsc_enabled = false;
 var discovered_features: u32 = 0;
+var discovered_privileges_high: u32 = 0;
 
 pub fn decodeDiscovery(info: Discovery) DetectResult {
     if ((info.leaf1_ecx & cpuid_hypervisor_present) == 0)
@@ -371,6 +374,8 @@ export fn hyperv_guest_id_encode(
 }
 
 export fn hyperv_runtime_detect() callconv(.c) c_int {
+    discovered_features = 0;
+    discovered_privileges_high = 0;
     const basic = cpuid(1);
     const identity = cpuid(cpuid_hv_base);
     const interface = cpuid(cpuid_hv_interface);
@@ -383,10 +388,13 @@ export fn hyperv_runtime_detect() callconv(.c) c_int {
         .vendor_edx = identity.edx,
         .interface_eax = interface.eax,
         .features_eax = features.eax,
+        .features_ebx = features.ebx,
         .features_edx = features.edx,
     });
-    if (result == .ok)
+    if (result == .ok) {
         discovered_features = features.eax;
+        discovered_privileges_high = features.ebx;
+    }
     return @intFromEnum(result);
 }
 
@@ -520,6 +528,10 @@ export fn hyperv_status_kind(result: u64) callconv(.c) u16 {
     });
 }
 
+export fn hyperv_has_post_messages() callconv(.c) c_int {
+    return @intFromBool((discovered_privileges_high & post_messages) != 0);
+}
+
 export fn hyperv_msr_read(msr: u32) callconv(.c) u64 {
     return rdmsr(msr);
 }
@@ -645,6 +657,7 @@ test "CPUID discovery reports required privileges precisely" {
         .vendor_edx = 0x76482074,
         .interface_eax = 0x31237648,
         .features_eax = required | access_reference_tsc | access_vp_index,
+        .features_ebx = post_messages,
         .features_edx = 0,
     };
     try std.testing.expectEqual(DetectResult.ok, decodeDiscovery(valid));
@@ -672,6 +685,13 @@ test "CPUID discovery reports required privileges precisely" {
     changed = valid;
     changed.features_eax &= ~access_stimer_msrs;
     try std.testing.expectEqual(DetectResult.stimer_privilege, decodeDiscovery(changed));
+}
+
+test "PostMessages privilege is read from CPUID feature EBX" {
+    discovered_privileges_high = 0;
+    try std.testing.expectEqual(@as(c_int, 0), hyperv_has_post_messages());
+    discovered_privileges_high = post_messages;
+    try std.testing.expectEqual(@as(c_int, 1), hyperv_has_post_messages());
 }
 
 test "IRQ to IDT vector conversion validates the x86 range" {

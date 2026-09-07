@@ -1,0 +1,1 @@
+$(eval $(call import_lib,$(UK_DRIV_BASE)/hyperv/vmbus))

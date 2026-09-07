@@ -41,6 +41,10 @@ void __weak hyperv_vmbus_event(__u32 event)
 	uk_pr_warn("Hyper-V: unclaimed SINT2 event flag %u\n", event);
 }
 
+void __weak hyperv_vmbus_fini(void)
+{
+}
+
 static void hyperv_dispatch_events(__u32 sint, int vmbus)
 {
 	__u64 pending;
@@ -188,6 +192,7 @@ void ukplat_time_fini(void)
 {
 	if (!hyperv_time_initialized)
 		return;
+	hyperv_vmbus_fini();
 	hyperv_synic_disable();
 	uk_intctlr_irq_unregister(hyperv_irqs[1], hyperv_timer_irq);
 	uk_intctlr_irq_unregister(hyperv_irqs[0], hyperv_message_irq);

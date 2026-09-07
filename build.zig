@@ -493,6 +493,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(hyperv_runtime_tests).step);
+    const vmbus_protocol_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);
     const hyperv_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,
@@ -542,6 +552,76 @@ pub fn build(b: *std.Build) void {
     verify_hyperv_runtime.setCwd(.{ .cwd_relative = root });
     verify_hyperv_runtime.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     test_step.dependOn(&verify_hyperv_runtime.step);
+    const vmbus_protocol_object = b.addObject(.{
+        .name = "vmbus-protocol-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            ),
+            .target = hyperv_target,
+            .optimize = .ReleaseFast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const vmbus_protocol_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    vmbus_protocol_link.addFileArg(vmbus_protocol_object.getEmittedBin());
+    vmbus_protocol_link.addArg("-o");
+    const vmbus_protocol_linked =
+        vmbus_protocol_link.addOutputFileArg("vmbus-protocol-linked.o");
+    const verify_vmbus_protocol = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/vmbus-protocol-test.py",
+        "--object",
+    });
+    verify_vmbus_protocol.addFileArg(vmbus_protocol_linked);
+    verify_vmbus_protocol.addArgs(&.{ "--nm", "llvm-nm" });
+    verify_vmbus_protocol.setCwd(.{ .cwd_relative = root });
+    verify_vmbus_protocol.setEnvironmentVariable(
+        "PYTHONDONTWRITEBYTECODE",
+        "1",
+    );
+    test_step.dependOn(&verify_vmbus_protocol.step);
+    const vmbus_abi_tests = b.addExecutable(.{
+        .name = "vmbus-abi-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    vmbus_abi_tests.root_module.addIncludePath(b.path("include"));
+    vmbus_abi_tests.root_module.addIncludePath(
+        b.path("support/build/tests/vmbus-include"),
+    );
+    vmbus_abi_tests.root_module.addIncludePath(
+        b.path("arch/x86/x86_64/include"),
+    );
+    vmbus_abi_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/vmbus/include"),
+    );
+    vmbus_abi_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/vmbus"),
+    );
+    vmbus_abi_tests.root_module.addCSourceFile(.{
+        .file = b.path("support/build/tests/vmbus-abi-test.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    test_step.dependOn(&b.addRunArtifact(vmbus_abi_tests).step);
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",
         .root_module = b.createModule(.{
