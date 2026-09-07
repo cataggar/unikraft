@@ -48,6 +48,8 @@ vmbus_relid_offer(struct vmbus_relid_lifecycle *entries,
 
 	if (!channel_id)
 		return -EINVAL;
+	if (*sequence == UINT64_MAX)
+		return -ENOSPC;
 	entry = vmbus_relid_find(entries, capacity, channel_id);
 	if (entry) {
 		if (entry->state != VMBUS_RELID_RELEASED)

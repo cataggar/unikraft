@@ -11,6 +11,7 @@ struct vmbus_channel_owner {
 	__u16 operations;
 	__u8 revoked;
 	__u8 cleanup_pending;
+	__u8 cleanup_claimed;
 };
 
 struct vmbus_channel_token {
@@ -43,7 +44,10 @@ static inline int vmbus_channel_owner_revoke(struct vmbus_channel_owner *owner)
 {
 	owner->revoked = 1;
 	owner->cleanup_pending = 1;
-	return owner->operations == 0;
+	if (owner->operations || owner->cleanup_claimed)
+		return 0;
+	owner->cleanup_claimed = 1;
+	return 1;
 }
 
 /* Returns non-zero when the final owning operation must perform cleanup. */
@@ -57,13 +61,18 @@ vmbus_channel_owner_end(struct vmbus_channel_token *token)
 		return 0;
 	owner->operations--;
 	token->owner = NULL;
-	return owner->operations == 0 && owner->cleanup_pending;
+	if (owner->operations || !owner->cleanup_pending ||
+	    owner->cleanup_claimed)
+		return 0;
+	owner->cleanup_claimed = 1;
+	return 1;
 }
 
 static inline int
 vmbus_channel_owner_reusable(const struct vmbus_channel_owner *owner)
 {
-	return owner->operations == 0 && !owner->cleanup_pending;
+	return owner->operations == 0 && !owner->cleanup_pending &&
+	       !owner->cleanup_claimed;
 }
 
 #endif /* __VMBUS_CHANNEL_OWNER_H__ */

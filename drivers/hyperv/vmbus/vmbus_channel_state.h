@@ -165,6 +165,27 @@ vmbus_transaction_cancel_channel(
 	return cancelled;
 }
 
+static inline unsigned int
+vmbus_transaction_cancel_channel_except(
+	struct vmbus_channel_transaction *transactions,
+	unsigned int capacity, __u32 channel_id, unsigned int except_type,
+	__u32 status)
+{
+	unsigned int cancelled = 0;
+	unsigned int i;
+
+	for (i = 0; i < capacity; i++) {
+		if (!transactions[i].used ||
+		    transactions[i].channel_id != channel_id ||
+		    transactions[i].type == except_type)
+			continue;
+		transactions[i].status = status;
+		__atomic_store_n(&transactions[i].done, 1, __ATOMIC_RELEASE);
+		cancelled++;
+	}
+	return cancelled;
+}
+
 /* IDs are never reused, including across reconnect epochs. */
 static inline int vmbus_monotonic_id_allocate(__u32 *next, __u32 *id)
 {

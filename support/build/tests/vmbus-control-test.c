@@ -552,6 +552,7 @@ static void test_channel_operation_ownership(void)
 	assert(!vmbus_channel_owner_end(&nested));
 	assert(vmbus_channel_owner_end(&outer));
 	slots[0].cleanup_pending = 0;
+	slots[0].cleanup_claimed = 0;
 	slots[0].revoked = 0;
 	slots[0].generation = 3;
 	assert(vmbus_channel_owner_reusable(&slots[0]));
