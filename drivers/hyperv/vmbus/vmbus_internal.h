@@ -1,0 +1,21 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+#ifndef __VMBUS_INTERNAL_H__
+#define __VMBUS_INTERNAL_H__
+
+#include <stddef.h>
+#include <uk/arch/types.h>
+
+int vmbus_control_transmit(const __u8 *message, size_t length);
+int vmbus_control_pump(void);
+int vmbus_control_enter(int *acquired);
+void vmbus_control_exit(int acquired);
+int vmbus_control_release_relid(__u32 channel_id);
+void vmbus_control_fail(void);
+int vmbus_control_set_event(__u32 channel_id);
+int vmbus_channel_control_receive(const __u8 *message, size_t length);
+void vmbus_channel_event(__u32 event);
+int vmbus_channel_rescind(__u32 channel_id);
+void vmbus_channel_close_all(void);
+void vmbus_channel_reset_all(void);
+
+#endif /* __VMBUS_INTERNAL_H__ */

@@ -15,6 +15,7 @@ const access_hypercall_msrs = @as(u32, 1) << 5;
 const access_vp_index = @as(u32, 1) << 6;
 const access_reference_tsc = @as(u32, 1) << 9;
 const post_messages = @as(u32, 1) << 4;
+const signal_events = @as(u32, 1) << 5;
 
 const msr_guest_os_id = 0x40000000;
 const msr_hypercall = 0x40000001;
@@ -532,6 +533,10 @@ export fn hyperv_has_post_messages() callconv(.c) c_int {
     return @intFromBool((discovered_privileges_high & post_messages) != 0);
 }
 
+export fn hyperv_has_signal_events() callconv(.c) c_int {
+    return @intFromBool((discovered_privileges_high & signal_events) != 0);
+}
+
 export fn hyperv_msr_read(msr: u32) callconv(.c) u64 {
     return rdmsr(msr);
 }
@@ -692,6 +697,13 @@ test "PostMessages privilege is read from CPUID feature EBX" {
     try std.testing.expectEqual(@as(c_int, 0), hyperv_has_post_messages());
     discovered_privileges_high = post_messages;
     try std.testing.expectEqual(@as(c_int, 1), hyperv_has_post_messages());
+}
+
+test "SignalEvents privilege is read from CPUID feature EBX" {
+    discovered_privileges_high = 0;
+    try std.testing.expectEqual(@as(c_int, 0), hyperv_has_signal_events());
+    discovered_privileges_high = signal_events;
+    try std.testing.expectEqual(@as(c_int, 1), hyperv_has_signal_events());
 }
 
 test "IRQ to IDT vector conversion validates the x86 range" {

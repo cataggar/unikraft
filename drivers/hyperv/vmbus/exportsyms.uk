@@ -5,3 +5,12 @@ vmbus_unload
 _vmbus_register_driver
 vmbus_storage_guid
 vmbus_network_guid
+vmbus_channel_open
+vmbus_channel_close
+vmbus_channel_send
+vmbus_channel_send_gpa_direct
+vmbus_channel_receive
+vmbus_channel_poll
+vmbus_channel_set_callback
+vmbus_channel_mask_interrupts
+vmbus_channel_unmask_interrupts

@@ -90,6 +90,7 @@ void vmbus_protocol_reset(void);
 int vmbus_protocol_state(void);
 __u32 vmbus_protocol_generation(void);
 __u32 vmbus_protocol_version(void);
+__u32 vmbus_protocol_connection_id(void);
 
 _Static_assert(sizeof(struct vmbus_decoded_offer) == 172,
 	       "decoded offer ABI mismatch");

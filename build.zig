@@ -503,6 +503,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);
+    const vmbus_channel_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_channel.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(vmbus_channel_tests).step);
     const hyperv_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,
@@ -596,6 +606,50 @@ pub fn build(b: *std.Build) void {
         "1",
     );
     test_step.dependOn(&verify_vmbus_protocol.step);
+    const vmbus_channel_object = b.addObject(.{
+        .name = "vmbus-channel-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_channel.zig",
+            ),
+            .target = hyperv_target,
+            .optimize = .ReleaseFast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const vmbus_channel_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    vmbus_channel_link.addFileArg(vmbus_channel_object.getEmittedBin());
+    vmbus_channel_link.addArg("-o");
+    const vmbus_channel_linked =
+        vmbus_channel_link.addOutputFileArg("vmbus-channel-linked.o");
+    const verify_vmbus_channel = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/vmbus-channel-test.py",
+        "--object",
+    });
+    verify_vmbus_channel.addFileArg(vmbus_channel_linked);
+    verify_vmbus_channel.addArgs(&.{ "--nm", "llvm-nm" });
+    verify_vmbus_channel.setCwd(.{ .cwd_relative = root });
+    verify_vmbus_channel.setEnvironmentVariable(
+        "PYTHONDONTWRITEBYTECODE",
+        "1",
+    );
+    test_step.dependOn(&verify_vmbus_channel.step);
     const vmbus_abi_tests = b.addExecutable(.{
         .name = "vmbus-abi-test",
         .root_module = b.createModule(.{

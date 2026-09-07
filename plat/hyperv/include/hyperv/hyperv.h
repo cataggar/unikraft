@@ -81,6 +81,7 @@ __u64 hyperv_hypercall(__u64 control, __u64 input_gpa, __u64 output_gpa);
 __u16 hyperv_status_code(__u64 result);
 __u16 hyperv_status_kind(__u64 result);
 int hyperv_has_post_messages(void);
+int hyperv_has_signal_events(void);
 __u64 hyperv_msr_read(__u32 msr);
 void hyperv_msr_write(__u32 msr, __u64 value);
 __u64 hyperv_time_ref_count(void);

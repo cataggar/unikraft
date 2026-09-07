@@ -58,6 +58,7 @@ pub const x86_64_efi_vmbus = Library{
     .origin = .driver,
     .objects = &.{
         "libvmbus/vmbus_bus.o",
+        "libvmbus/vmbus_channel.o",
         "libvmbus/libinfo.libuklibid.o",
     },
     .export_symbols = .{
