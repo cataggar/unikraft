@@ -67,6 +67,7 @@ typedef void (*vmbus_channel_callback_t)(struct vmbus_channel *, void *);
 int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
 		       const void *, size_t);
 int vmbus_channel_close(struct vmbus_channel *);
+int vmbus_channel_abort(struct vmbus_channel *);
 int vmbus_channel_send(struct vmbus_channel *, __u16, __u16, __u64,
 		       const void *, size_t, const void *, size_t);
 int vmbus_channel_send_gpa_direct(struct vmbus_channel *, __u16, __u64,

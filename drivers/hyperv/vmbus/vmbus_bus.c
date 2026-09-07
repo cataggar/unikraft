@@ -146,6 +146,18 @@ static void *host_remove_hook_arg;
 static void (*host_unload_post_hook)(void *);
 static void *host_unload_post_hook_arg;
 static unsigned int host_connection_fail_calls;
+static int host_transmit_fail_after = -1;
+static __u32 host_gpadl_status;
+static __u32 host_gpadl_channel;
+static __u32 host_gpadl_id;
+static unsigned int host_gpadl_body_posts;
+static unsigned int host_gpadl_teardown_posts;
+
+static __u32 host_read32(const __u8 *data)
+{
+	return (__u32)data[0] | ((__u32)data[1] << 8) |
+		((__u32)data[2] << 16) | ((__u32)data[3] << 24);
+}
 #endif
 
 static int vmbus_bus_init(struct uk_alloc *a);
@@ -397,10 +409,27 @@ int vmbus_control_transmit(const __u8 *message, size_t length)
 	if (!length || length > HYPERV_MESSAGE_PAYLOAD_SIZE)
 		return -EINVAL;
 #ifdef VMBUS_BUS_HOST_TEST
+	__u32 type;
+
 	copy_bytes(host_last_tx, message, (unsigned int)length);
 	host_last_tx_len = length;
 	if (host_transmit_error)
 		return host_transmit_error;
+	if (host_transmit_fail_after == 0) {
+		host_transmit_fail_after = -1;
+		return -EIO;
+	}
+	if (host_transmit_fail_after > 0)
+		host_transmit_fail_after--;
+	type = host_read32(message);
+	if (type == 8 && length >= 16) {
+		host_gpadl_channel = host_read32(message + 8);
+		host_gpadl_id = host_read32(message + 12);
+	} else if (type == 9) {
+		host_gpadl_body_posts++;
+	} else if (type == 11) {
+		host_gpadl_teardown_posts++;
+	}
 	host_handle_unload_transmit(message, length);
 	return 0;
 #else
@@ -2019,17 +2048,25 @@ static int host_auto_control_pump(void)
 		((__u32)host_last_tx[1] << 8) |
 		((__u32)host_last_tx[2] << 16) |
 		((__u32)host_last_tx[3] << 24);
-	if (type != 5 && type != 8 && type != 11)
+	if (type != 5 && type != 8 && type != 9 && type != 11)
 		return 0;
-	channel_id = (__u32)host_last_tx[8] |
-		((__u32)host_last_tx[9] << 8) |
-		((__u32)host_last_tx[10] << 16) |
-		((__u32)host_last_tx[11] << 24);
-	id = (__u32)host_last_tx[12] |
-		((__u32)host_last_tx[13] << 8) |
-		((__u32)host_last_tx[14] << 16) |
-		((__u32)host_last_tx[15] << 24);
-	response_type = type == 5 ? 6 : type == 8 ? 10 : 12;
+	if (type == 9) {
+		if (!host_gpadl_id)
+			return 0;
+		channel_id = host_gpadl_channel;
+		id = host_gpadl_id;
+	} else {
+		channel_id = (__u32)host_last_tx[8] |
+			((__u32)host_last_tx[9] << 8) |
+			((__u32)host_last_tx[10] << 16) |
+			((__u32)host_last_tx[11] << 24);
+		id = (__u32)host_last_tx[12] |
+			((__u32)host_last_tx[13] << 8) |
+			((__u32)host_last_tx[14] << 16) |
+			((__u32)host_last_tx[15] << 24);
+	}
+	response_type = type == 5 ? 6 :
+		(type == 8 || type == 9) ? 10 : 12;
 	response[0] = (__u8)response_type;
 	if (response_type == 12) {
 		response[8] = (__u8)id;
@@ -2047,6 +2084,14 @@ static int host_auto_control_pump(void)
 	response[13] = (__u8)(id >> 8);
 	response[14] = (__u8)(id >> 16);
 	response[15] = (__u8)(id >> 24);
+	if (response_type == 10) {
+		response[16] = (__u8)host_gpadl_status;
+		response[17] = (__u8)(host_gpadl_status >> 8);
+		response[18] = (__u8)(host_gpadl_status >> 16);
+		response[19] = (__u8)(host_gpadl_status >> 24);
+		host_gpadl_channel = 0;
+		host_gpadl_id = 0;
+	}
 	host_last_tx_len = 0;
 	return vmbus_channel_control_receive(response, 20);
 }
@@ -2244,6 +2289,12 @@ static void host_reset_state(void)
 	host_unload_post_hook = NULL;
 	host_unload_post_hook_arg = NULL;
 	__atomic_store_n(&host_connection_fail_calls, 0, __ATOMIC_RELAXED);
+	host_transmit_fail_after = -1;
+	host_gpadl_status = 0;
+	host_gpadl_channel = 0;
+	host_gpadl_id = 0;
+	host_gpadl_body_posts = 0;
+	host_gpadl_teardown_posts = 0;
 	host_add_a = 0;
 	host_add_b = 0;
 	host_remove_count = 0;
@@ -2907,5 +2958,39 @@ int vmbus_bus_host_connection_failed(void)
 void vmbus_bus_host_clear_connection_failed(void)
 {
 	connection_failed = 0;
+}
+
+void vmbus_bus_host_auto_pump(int enabled)
+{
+	host_pump_hook = enabled ? host_auto_control_pump : NULL;
+}
+
+void vmbus_bus_host_set_gpadl_status(__u32 status)
+{
+	host_gpadl_status = status;
+}
+
+void vmbus_bus_host_set_transmit_fail_after(int successful_posts)
+{
+	host_transmit_fail_after = successful_posts;
+}
+
+void vmbus_bus_host_reset_gpadl_trace(void)
+{
+	host_gpadl_channel = 0;
+	host_gpadl_id = 0;
+	host_gpadl_body_posts = 0;
+	host_gpadl_teardown_posts = 0;
+	host_transmit_fail_after = -1;
+}
+
+unsigned int vmbus_bus_host_gpadl_body_posts(void)
+{
+	return host_gpadl_body_posts;
+}
+
+unsigned int vmbus_bus_host_gpadl_teardown_posts(void)
+{
+	return host_gpadl_teardown_posts;
 }
 #endif

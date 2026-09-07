@@ -9,6 +9,9 @@ const std = @import("std");
 pub const nvs_request_size: usize = 40;
 pub const nvs_status_ok: u32 = 1;
 pub const nvs_status_failed: u32 = 2;
+pub const nvs_status_protocol_too_new: u32 = 3;
+pub const nvs_status_protocol_too_old: u32 = 4;
+pub const nvs_status_protocol_unsupported: u32 = 7;
 pub const rx_buffer_id: u16 = 0xcafe;
 pub const send_buffer_id: u16 = 0xface;
 pub const send_section_invalid: u32 = 0xffff_ffff;
@@ -88,6 +91,7 @@ pub const Result = enum(c_int) {
     overflow = -3,
     unexpected = -4,
     remote_failure = -5,
+    version_unsupported = -6,
 };
 
 pub const NvsInitComplete = extern struct {
@@ -395,9 +399,15 @@ export fn netvsc_nvs_parse_init_complete(
     result.version = requested_version;
     result.max_mdl_chain = get32(input[0..length], 8);
     result.status = get32(input[0..length], 12);
-    if (result.status != nvs_status_ok)
-        return @intFromEnum(Result.remote_failure);
-    return @intFromEnum(Result.ok);
+    return switch (result.status) {
+        nvs_status_ok => @intFromEnum(Result.ok),
+        nvs_status_failed,
+        nvs_status_protocol_too_new,
+        nvs_status_protocol_too_old,
+        nvs_status_protocol_unsupported,
+        => @intFromEnum(Result.version_unsupported),
+        else => @intFromEnum(Result.remote_failure),
+    };
 }
 
 export fn netvsc_nvs_parse_receive_buffer_complete(
@@ -530,8 +540,6 @@ export fn netvsc_nvs_parse_rndis(
     if (get32(bytes, 0) != nvs_type_send_rndis)
         return @intFromEnum(Result.unexpected);
     const kind = get32(bytes, 4);
-    if (kind != nvs_rndis_data and kind != nvs_rndis_control)
-        return @intFromEnum(Result.invalid);
     channel_type.* = kind;
     return @intFromEnum(Result.ok);
 }
@@ -996,17 +1004,20 @@ test "all fixed NVS requests have exact zeroed layouts" {
     try std.testing.expectEqual(@as(u16, send_buffer_id), get16(&message, 4));
 }
 
-test "NVS completion parsing rejects fallback contradictions" {
-    var response = [_]u8{0} ** 16;
+test "NVS init completion accepts padding and classifies rejection" {
+    var response = [_]u8{0} ** 40;
     put32(&response, 0, nvs_type_init_complete);
     put32(&response, 4, nvs_version_6);
     put32(&response, 8, 4);
     put32(&response, 12, nvs_status_ok);
     var result: NvsInitComplete = undefined;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_61, &result));
+    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_init_complete(&response, 16, nvs_version_61, &result));
     try std.testing.expectEqual(nvs_version_61, result.version);
     try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
+    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_init_complete(&response, 15, nvs_version_6, &result));
     put32(&response, 12, nvs_status_failed);
+    try std.testing.expectEqual(@intFromEnum(Result.version_unsupported), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
+    put32(&response, 12, 6);
     try std.testing.expectEqual(@intFromEnum(Result.remote_failure), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
 }
 
@@ -1106,7 +1117,41 @@ test "receive section table and transfer ranges are bounded" {
     ));
 }
 
-test "received NVS RNDIS envelope validates channel type" {
+test "maximum receive section reply accepts VMBus padding" {
+    var response = [_]u8{0} ** 144;
+    put32(&response, 0, nvs_type_receive_buffer_complete);
+    put32(&response, 4, nvs_status_ok);
+    put32(&response, 8, max_sections);
+    for (0..max_sections) |index| {
+        const offset = 12 + index * 16;
+        const start: u32 = @intCast(index * 4096);
+        put32(&response, offset, start);
+        put32(&response, offset + 4, 4096);
+        put32(&response, offset + 8, 1);
+        put32(&response, offset + 12, start + 4095);
+    }
+    var sections: [max_sections]NvsSection = undefined;
+    var count: u32 = 0;
+    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_receive_buffer_complete(
+        &response,
+        response.len,
+        @intCast(max_sections * 4096),
+        &sections,
+        sections.len,
+        &count,
+    ));
+    try std.testing.expectEqual(@as(u32, @intCast(max_sections)), count);
+    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_receive_buffer_complete(
+        &response,
+        139,
+        @intCast(max_sections * 4096),
+        &sections,
+        sections.len,
+        &count,
+    ));
+}
+
+test "received NVS RNDIS envelope treats channel type as informational" {
     var message = [_]u8{0} ** 40;
     put32(&message, 0, nvs_type_send_rndis);
     put32(&message, 4, nvs_rndis_control);
@@ -1118,7 +1163,14 @@ test "received NVS RNDIS envelope validates channel type" {
     ));
     try std.testing.expectEqual(nvs_rndis_control, channel_type);
     put32(&message, 4, 9);
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_rndis(
+    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_rndis(
+        &message,
+        message.len,
+        &channel_type,
+    ));
+    try std.testing.expectEqual(@as(u32, 9), channel_type);
+    put32(&message, 0, 999);
+    try std.testing.expectEqual(@intFromEnum(Result.unexpected), netvsc_nvs_parse_rndis(
         &message,
         message.len,
         &channel_type,
@@ -1126,11 +1178,17 @@ test "received NVS RNDIS envelope validates channel type" {
 }
 
 test "send buffer and RNDIS NVS envelope validate sections" {
-    var response = [_]u8{0} ** 12;
+    var response = [_]u8{0} ** 40;
     put32(&response, 0, nvs_type_send_buffer_complete);
     put32(&response, 4, nvs_status_ok);
     put32(&response, 8, 6144);
     var complete: NvsSendBufferComplete = undefined;
+    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_send_buffer_complete(
+        &response,
+        12,
+        6144 * 8,
+        &complete,
+    ));
     try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_send_buffer_complete(
         &response,
         response.len,
@@ -1138,6 +1196,12 @@ test "send buffer and RNDIS NVS envelope validate sections" {
         &complete,
     ));
     try std.testing.expectEqual(@as(u32, 8), complete.section_count);
+    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_send_buffer_complete(
+        &response,
+        11,
+        6144 * 8,
+        &complete,
+    ));
     var request: [40]u8 = undefined;
     try std.testing.expectEqual(@as(c_int, 40), netvsc_nvs_build_rndis(
         &request,

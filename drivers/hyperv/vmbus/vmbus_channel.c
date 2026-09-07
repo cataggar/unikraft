@@ -601,8 +601,9 @@ static unsigned int transaction_cancel_channel(__u32 channel_id,
 }
 
 static int
-transaction_wait(struct vmbus_channel_transaction *transaction,
-		 const struct vmbus_channel_token *token)
+transaction_wait_status(struct vmbus_channel_transaction *transaction,
+			const struct vmbus_channel_token *token,
+			__u32 *host_status)
 {
 	__u64 deadline = hyperv_reference_time() +
 		(__u64)CONFIG_LIBVMBUS_CHANNEL_TIMEOUT_MS *
@@ -625,7 +626,20 @@ transaction_wait(struct vmbus_channel_transaction *transaction,
 	}
 	if (transaction->status == (__u32)-ECANCELED)
 		return -ECANCELED;
-	return transaction->status ? -EIO : 0;
+	*host_status = transaction->status;
+	return 0;
+}
+
+static int
+transaction_wait(struct vmbus_channel_transaction *transaction,
+		 const struct vmbus_channel_token *token)
+{
+	__u32 host_status = 0;
+	int rc = transaction_wait_status(transaction, token, &host_status);
+
+	if (rc)
+		return rc;
+	return host_status ? -EIO : 0;
 }
 
 static int transmit_message(const __u8 *message, int length)
@@ -647,6 +661,7 @@ static int create_gpadl(struct vmbus_channel *channel,
 	unsigned int i;
 	__u64 capacity_epoch;
 	__u32 message_number = 1;
+	__u32 creation_status = 0;
 	int length;
 	int rc;
 
@@ -718,7 +733,15 @@ static int create_gpadl(struct vmbus_channel *channel,
 			goto out;
 		offset += consumed;
 	}
-	rc = transaction_wait(transaction, token);
+	rc = transaction_wait_status(transaction, token, &creation_status);
+	if (!rc && creation_status) {
+		transaction_release(transaction);
+		channel->gpadl_id = 0;
+		channel->gpadl_record = 0;
+		channel->gpadl_posted = 0;
+		gpadl_record_release(record, 0);
+		return -EIO;
+	}
 	if (!rc) {
 		rc = vmbus_channel_state_gpadl_created(&channel->state);
 		if (rc)
@@ -1246,6 +1269,15 @@ out:
 	return rc;
 }
 
+int vmbus_channel_abort(struct vmbus_channel *channel)
+{
+	if (!channel)
+		return -ENODEV;
+	vmbus_channel_set_callback(channel, NULL, NULL);
+	vmbus_control_fail();
+	return 0;
+}
+
 static int channel_send(struct vmbus_channel *channel, __u16 packet_type,
 			__u16 flags, __u64 transaction_id,
 			const void *descriptor, size_t descriptor_size,
@@ -1308,6 +1340,7 @@ int vmbus_channel_gpadl_map(struct vmbus_channel *channel, void *address,
 	struct vmbus_channel_token token = { 0 };
 	__u64 capacity_epoch;
 	unsigned int pages;
+	__u32 creation_status = 0;
 	int acquired;
 	int posted = 0;
 	int rc;
@@ -1360,10 +1393,18 @@ int vmbus_channel_gpadl_map(struct vmbus_channel *channel, void *address,
 		goto out_record;
 	}
 	rc = post_external_gpadl(channel, record, &posted);
-	if (!rc) {
-		rc = transaction_wait(transaction, &token);
-	}
+	if (!rc)
+		rc = transaction_wait_status(transaction, &token,
+					     &creation_status);
 	transaction_release(transaction);
+	if (!rc && creation_status) {
+		gpadl_record_release(record, 0);
+		gpadl->id = 0;
+		gpadl->page_count = 0;
+		gpadl->generation = 0;
+		rc = -EIO;
+		goto out_operation;
+	}
 	if (rc)
 		goto out_posted;
 	goto out_operation;

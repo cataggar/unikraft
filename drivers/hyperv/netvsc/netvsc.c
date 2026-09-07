@@ -27,6 +27,8 @@
 #define NETVSC_RNDIS_HEADER_SIZE	44U
 #define NETVSC_CONTROL_PAGE_SIZE	NETVSC_PAGE_SIZE
 #define NETVSC_CONTROL_INFO_SIZE	256U
+#define NETVSC_NVS_RESPONSE_SIZE	\
+	(((12U + NETVSC_NVS_MAX_SECTIONS * 16U) + 7U) & ~7U)
 #define NETVSC_PACKET_SCRATCH_SIZE	65536U
 #define NETVSC_CONTROL_WAIT_NS		1000000ULL
 #define NETVSC_INVALID_SECTION		NETVSC_NVS_SEND_SECTION_INVALID
@@ -91,7 +93,7 @@ struct netvsc_nvs_wait {
 	__s16 error;
 	__u8 active;
 	__u8 done;
-	__u8 response[12 + NETVSC_NVS_MAX_SECTIONS * 16];
+	__u8 response[NETVSC_NVS_RESPONSE_SIZE];
 };
 
 struct netvsc_tx_context {
@@ -177,6 +179,7 @@ struct netvsc_device {
 	__u8 promiscuous;
 	__u8 drain_active;
 	__u8 drain_pending;
+	__u8 recovering;
 	__u8 failed;
 };
 
@@ -194,6 +197,16 @@ static __u8 netvsc_payload_scratch[NETVSC_PACKET_SCRATCH_SIZE];
 static void netvsc_channel_callback(struct vmbus_channel *channel, void *arg);
 static void netvsc_drain_channel(struct netvsc_device *device);
 static void netvsc_detach_host(struct netvsc_device *device, int revoked);
+
+static void netvsc_abort_malformed_channel(struct netvsc_device *device)
+{
+	if (__atomic_exchange_n(&device->recovering, 1,
+				 __ATOMIC_ACQ_REL))
+		return;
+	__atomic_store_n(&device->failed, 1, __ATOMIC_RELEASE);
+	__atomic_store_n(&device->host_running, 0, __ATOMIC_RELEASE);
+	(void)vmbus_channel_abort(device->channel);
+}
 
 static void copy_bytes(void *destination, const void *source, size_t length)
 {
@@ -811,20 +824,18 @@ static int netvsc_nvs_exchange(struct netvsc_device *device,
 		ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
 		if (done)
 			break;
-		if (ukplat_monotonic_clock() >= deadline)
-			{
-				ukplat_spin_lock_irqsave(&device->control_lock,
-							 flags);
-				if (wait->active &&
-				    wait->transaction_id == transaction_id) {
-					netvsc_remember_transaction(device,
+		if (ukplat_monotonic_clock() >= deadline) {
+			ukplat_spin_lock_irqsave(&device->control_lock, flags);
+			if (wait->active &&
+			    wait->transaction_id == transaction_id) {
+				netvsc_remember_transaction(device,
 							 transaction_id);
-					zero_bytes(wait, sizeof(*wait));
-				}
-				ukplat_spin_unlock_irqrestore(
-					&device->control_lock, flags);
-				return -ETIMEDOUT;
+				zero_bytes(wait, sizeof(*wait));
 			}
+			ukplat_spin_unlock_irqrestore(&device->control_lock,
+						     flags);
+			return -ETIMEDOUT;
+		}
 		netvsc_wait_once();
 	}
 
@@ -854,7 +865,7 @@ static int netvsc_nvs_send(struct netvsc_device *device,
 static int netvsc_negotiate_nvs(struct netvsc_device *device)
 {
 	__u8 request[NETVSC_NVS_REQUEST_SIZE];
-	__u8 response[32];
+	__u8 response[NETVSC_NVS_RESPONSE_SIZE];
 	unsigned int i;
 
 	for (i = 0; i < netvsc_nvs_version_count(); i++) {
@@ -870,10 +881,10 @@ static int netvsc_negotiate_nvs(struct netvsc_device *device)
 		rc = netvsc_nvs_exchange(device, request, (size_t)length,
 				2, response, &response_length);
 		if (rc)
-			continue;
+			return rc;
 		rc = netvsc_nvs_parse_init_complete(response,
 				response_length, version, &complete);
-		if (rc == NETVSC_PROTOCOL_REMOTE_FAILURE)
+		if (rc == NETVSC_PROTOCOL_VERSION_UNSUPPORTED)
 			continue;
 		if (rc)
 			return -EPROTO;
@@ -887,7 +898,7 @@ static int netvsc_negotiate_nvs(struct netvsc_device *device)
 static int netvsc_connect_receive_buffer(struct netvsc_device *device)
 {
 	__u8 request[NETVSC_NVS_REQUEST_SIZE];
-	__u8 response[12 + NETVSC_NVS_MAX_SECTIONS * 16];
+	__u8 response[NETVSC_NVS_RESPONSE_SIZE];
 	size_t response_length = sizeof(response);
 	int length;
 	int rc;
@@ -924,7 +935,7 @@ static int netvsc_connect_send_buffer(struct netvsc_device *device)
 {
 	struct netvsc_nvs_send_buffer_complete complete;
 	__u8 request[NETVSC_NVS_REQUEST_SIZE];
-	__u8 response[32];
+	__u8 response[NETVSC_NVS_RESPONSE_SIZE];
 	size_t response_length = sizeof(response);
 	int length;
 	int rc;
@@ -1090,10 +1101,15 @@ static void netvsc_complete_nvs(struct netvsc_device *device,
 		ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
 		return;
 	}
+	if (payload_length > sizeof(wait->response)) {
+		wait->error = -ENOBUFS;
+		wait->done = 1;
+		ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
+		return;
+	}
 	if (netvsc_nvs_message_type(payload, payload_length,
 				    &message_type) ||
-	    message_type != wait->expected_type ||
-	    payload_length > sizeof(wait->response)) {
+	    message_type != wait->expected_type) {
 		wait->error = -EPROTO;
 		wait->done = 1;
 		ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
@@ -1364,7 +1380,7 @@ static int netvsc_copy_frame(struct netvsc_device *device,
 
 static int netvsc_handle_rndis(struct netvsc_device *device,
 			       const __u8 *message, size_t message_length,
-			       __u32 channel_type)
+			       __u32 channel_type __unused)
 {
 	struct netvsc_rndis_packet_info packet;
 	struct netvsc_rndis_status_info status;
@@ -1378,8 +1394,6 @@ static int netvsc_handle_rndis(struct netvsc_device *device,
 		return -EPROTO;
 	switch (type) {
 	case NETVSC_RNDIS_PACKET:
-		if (channel_type != NETVSC_NVS_RNDIS_DATA)
-			return -EPROTO;
 		rc = netvsc_rndis_parse_packet(message, message_length,
 					      &packet);
 		if (rc)
@@ -1572,7 +1586,9 @@ static void netvsc_drain_channel(struct netvsc_device *device)
 			if (rc == -EAGAIN)
 				break;
 			if (rc) {
-				if (rc != -ECANCELED)
+				if (rc == -EPROTO || rc == -ENOBUFS)
+					netvsc_abort_malformed_channel(device);
+				else if (rc != -ECANCELED)
 					__atomic_store_n(&device->failed, 1,
 							 __ATOMIC_RELEASE);
 				break;
@@ -1625,6 +1641,13 @@ static void netvsc_drain_channel(struct netvsc_device *device)
 		if (__atomic_exchange_n(&device->drain_active, 1,
 					 __ATOMIC_ACQ_REL))
 			break;
+	}
+	if (notify) {
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&device->rx_lock, flags);
+		notify = device->rxq.interrupt_requested;
+		ukplat_spin_unlock_irqrestore(&device->rx_lock, flags);
 	}
 	if (notify) {
 		if (__atomic_load_n(&device->running, __ATOMIC_ACQUIRE) &&
@@ -2183,6 +2206,8 @@ static void netvsc_free_queued_packets(struct netvsc_device *device)
 		device->receive_count--;
 	}
 	device->receive_head = device->receive_tail = 0;
+	device->rxq.interrupt_armed =
+		device->rxq.interrupt_requested;
 	ukplat_spin_unlock_irqrestore(&device->rx_lock, flags);
 	while (count)
 		uk_netbuf_free(packets[--count]);
@@ -2278,12 +2303,15 @@ static void netvsc_detach_host(struct netvsc_device *device, int revoked)
 	__u8 request[NETVSC_NVS_REQUEST_SIZE];
 	unsigned long flags;
 	int close_rc = 0;
+	int recovering;
 	int length;
 
 	ukplat_spin_lock_irqsave(&device->state_lock, flags);
 	device->stopping = 1;
 	device->host_running = 0;
 	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
+	recovering = __atomic_load_n(&device->recovering,
+				    __ATOMIC_ACQUIRE);
 	for (;;) {
 		unsigned int operations;
 
@@ -2294,19 +2322,22 @@ static void netvsc_detach_host(struct netvsc_device *device, int revoked)
 			break;
 		netvsc_wait_once();
 	}
-	if (!revoked && device->channel && device->rndis_initialized) {
+	if (!revoked && !recovering && device->channel &&
+	    device->rndis_initialized) {
 		if (device->running)
 			(void)netvsc_set_packet_filter(device,
 					NETVSC_PACKET_FILTER_NONE);
 		(void)netvsc_rndis_halt_device(device);
 	}
-	if (!revoked && device->channel && device->send_connected) {
+	if (!revoked && !recovering && device->channel &&
+	    device->send_connected) {
 		length = netvsc_nvs_build_revoke_send_buffer(request,
 						      sizeof(request));
 		if (length > 0)
 			(void)netvsc_nvs_send(device, request, (size_t)length);
 	}
-	if (!revoked && device->channel && device->receive_connected) {
+	if (!revoked && !recovering && device->channel &&
+	    device->receive_connected) {
 		length = netvsc_nvs_build_revoke_receive_buffer(request,
 							 sizeof(request));
 		if (length > 0)
@@ -2346,6 +2377,7 @@ static void netvsc_detach_host(struct netvsc_device *device, int revoked)
 	device->receive_section_count = 0;
 	device->send_section_count = 0;
 	device->send_section_size = 0;
+	device->recovering = 0;
 	device->failed = 0;
 	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
 }
@@ -2377,6 +2409,7 @@ static int netvsc_attach_host(struct netvsc_device *device,
 	device->next_transaction = 1;
 	device->attaching = 1;
 	device->stopping = 0;
+	device->recovering = 0;
 	device->vmbus_device = vmbus_device;
 	device->failed = 0;
 	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);

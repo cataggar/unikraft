@@ -21,6 +21,8 @@
 #define MOCK_PAYLOAD 512
 #define MOCK_RX_SLOT_SIZE 2048U
 #define MOCK_NETBUF_COUNT 16
+#define MOCK_NVS_RESPONSE_CAPACITY \
+	(((12U + NETVSC_NVS_MAX_SECTIONS * 16U) + 7U) & ~7U)
 
 #define CHECK(condition)						\
 	do {								\
@@ -56,8 +58,14 @@ struct mock_state {
 	unsigned int map_count;
 	unsigned int live_gpadls;
 	unsigned int close_count;
+	unsigned int nvs_init_requests;
 	unsigned int nvs_init_attempts;
 	unsigned int nvs_accept_index;
+	__u32 nvs_init_status;
+	size_t init_response_length;
+	size_t receive_response_length;
+	size_t send_response_length;
+	unsigned int suppress_nvs_init;
 	unsigned int send_section_size;
 	unsigned int next_rx_slot;
 	unsigned int ack_count;
@@ -70,6 +78,9 @@ struct mock_state {
 	unsigned int delay_tx;
 	unsigned int fail_open;
 	unsigned int fail_close;
+	int receive_error_once;
+	int receive_error_after;
+	unsigned int abort_count;
 	unsigned int fail_map_call;
 	unsigned int fail_receive_complete;
 	unsigned int fail_send_complete;
@@ -152,7 +163,6 @@ static void enqueue_transfer(const __u8 *message, size_t message_length,
 	struct mock_packet *queued = queue_reserve();
 	__u8 *receive_buffer = netvsc_host_receive_buffer();
 	__u32 offset;
-	int length;
 
 	if (!queued || message_length > MOCK_RX_SLOT_SIZE)
 		abort();
@@ -167,31 +177,30 @@ static void enqueue_transfer(const __u8 *message, size_t message_length,
 	put32(queued->descriptor + 4, 1);
 	put32(queued->descriptor + 8, (__u32)message_length);
 	put32(queued->descriptor + 12, offset);
-	length = netvsc_nvs_build_rndis(queued->payload,
-			sizeof(queued->payload), channel_type,
-			NETVSC_NVS_SEND_SECTION_INVALID, 0);
-	if (length < 0)
-		abort();
-	queued->payload_length = (size_t)length;
-	queued->packet.payload_size = length;
+	put32(queued->payload, NETVSC_NVS_TYPE_SEND_RNDIS);
+	put32(queued->payload + 4, channel_type);
+	queued->payload_length = NETVSC_NVS_REQUEST_SIZE;
+	queued->packet.payload_size = NETVSC_NVS_REQUEST_SIZE;
 }
 
 static void enqueue_init_complete(__u64 transaction_id, __u32 requested)
 {
-	__u8 response[16] = { 0 };
+	__u8 response[MOCK_PAYLOAD] = { 0 };
 	unsigned int attempt = mock.nvs_init_attempts++;
+	__u32 status = mock.nvs_init_status ? mock.nvs_init_status :
+		(attempt < mock.nvs_accept_index ? 2 : 1);
 
 	put32(response, 2);
 	put32(response + 4, requested);
 	put32(response + 8, 32);
-	put32(response + 12,
-	      attempt < mock.nvs_accept_index ? 2 : 1);
-	enqueue_completion(transaction_id, response, sizeof(response));
+	put32(response + 12, status);
+	enqueue_completion(transaction_id, response,
+			   mock.init_response_length);
 }
 
 static void enqueue_receive_complete(__u64 transaction_id)
 {
-	__u8 response[28] = { 0 };
+	__u8 response[MOCK_PAYLOAD] = { 0 };
 	size_t receive_size = mock.mapped_size[0];
 	__u32 slots = (__u32)(receive_size / MOCK_RX_SLOT_SIZE);
 
@@ -202,17 +211,19 @@ static void enqueue_receive_complete(__u64 transaction_id)
 	put32(response + 16, MOCK_RX_SLOT_SIZE);
 	put32(response + 20, slots);
 	put32(response + 24, (__u32)receive_size);
-	enqueue_completion(transaction_id, response, sizeof(response));
+	enqueue_completion(transaction_id, response,
+			   mock.receive_response_length);
 }
 
 static void enqueue_send_complete(__u64 transaction_id)
 {
-	__u8 response[12] = { 0 };
+	__u8 response[MOCK_PAYLOAD] = { 0 };
 
 	put32(response, 105);
 	put32(response + 4, mock.fail_send_complete ? 2 : 1);
 	put32(response + 8, mock.send_section_size);
-	enqueue_completion(transaction_id, response, sizeof(response));
+	enqueue_completion(transaction_id, response,
+			   mock.send_response_length);
 }
 
 static void build_query_complete(__u8 *response, size_t *response_length,
@@ -407,7 +418,10 @@ static int handle_nvs_send(__u16 packet_type, __u16 flags,
 	type = get32(payload);
 	switch (type) {
 	case 1:
-		enqueue_init_complete(transaction_id, get32(payload + 4));
+		mock.nvs_init_requests++;
+		if (!mock.suppress_nvs_init)
+			enqueue_init_complete(transaction_id,
+					      get32(payload + 4));
 		break;
 	case 101:
 		enqueue_receive_complete(transaction_id);
@@ -474,6 +488,9 @@ static void mock_reset(void)
 	memset(&mock, 0, sizeof(mock));
 	mock.channel.open = 1;
 	mock.nvs_accept_index = 2;
+	mock.init_response_length = NETVSC_NVS_REQUEST_SIZE;
+	mock.receive_response_length = NETVSC_NVS_REQUEST_SIZE;
+	mock.send_response_length = NETVSC_NVS_REQUEST_SIZE;
 	mock.send_section_size = 2048;
 	memset(rx_buffers, 0, sizeof(rx_buffers));
 	chained_receive = 0;
@@ -615,6 +632,15 @@ int vmbus_channel_close(struct vmbus_channel *channel)
 	return mock.fail_close ? -EIO : 0;
 }
 
+int vmbus_channel_abort(struct vmbus_channel *channel)
+{
+	mock.abort_count++;
+	(void)channel;
+	mock.callback = NULL;
+	mock.callback_arg = NULL;
+	return 0;
+}
+
 int vmbus_channel_send(struct vmbus_channel *channel, __u16 type,
 		       __u16 flags, __u64 transaction_id,
 		       const void *descriptor __attribute__((unused)),
@@ -678,6 +704,12 @@ int vmbus_channel_receive(struct vmbus_channel *channel,
 
 	if (!channel || !channel->open)
 		return -ECANCELED;
+	if (mock.receive_error_once && mock.receive_error_after <= 0) {
+		int rc = mock.receive_error_once;
+
+		mock.receive_error_once = 0;
+		return rc;
+	}
 	if (mock.tail == mock.head)
 		return -EAGAIN;
 	queued = &mock.queue[mock.tail % MOCK_QUEUE];
@@ -688,6 +720,8 @@ int vmbus_channel_receive(struct vmbus_channel *channel,
 	memcpy(descriptor, queued->descriptor, queued->descriptor_length);
 	memcpy(payload, queued->payload, queued->payload_length);
 	mock.tail++;
+	if (mock.receive_error_after > 0)
+		mock.receive_error_after--;
 	return 0;
 }
 
@@ -735,7 +769,8 @@ static void prepare_tx_buffer(struct host_netbuf *buffer, __u8 seed,
 		((__u8 *)buffer->netbuf.data)[i] = seed + i;
 }
 
-static void inject_frame(const __u8 *frame, size_t frame_length)
+static void queue_frame_type(const __u8 *frame, size_t frame_length,
+			     __u32 channel_type)
 {
 	__u8 message[MOCK_RX_SLOT_SIZE] = { 0 };
 	int header = netvsc_rndis_build_packet_header(message,
@@ -744,9 +779,19 @@ static void inject_frame(const __u8 *frame, size_t frame_length)
 	if (header != 44)
 		abort();
 	memcpy(message + header, frame, frame_length);
-	enqueue_transfer(message, header + frame_length,
-			 NETVSC_NVS_RNDIS_DATA);
+	enqueue_transfer(message, header + frame_length, channel_type);
+}
+
+static void inject_frame_type(const __u8 *frame, size_t frame_length,
+			      __u32 channel_type)
+{
+	queue_frame_type(frame, frame_length, channel_type);
 	mock_signal();
+}
+
+static void inject_frame(const __u8 *frame, size_t frame_length)
+{
+	inject_frame_type(frame, frame_length, NETVSC_NVS_RNDIS_DATA);
 }
 
 static int test_attach_and_lifecycle(struct vmbus_device *offered)
@@ -867,6 +912,31 @@ static int test_rx_bounds_headroom_and_reentry(struct uk_netdev *netdev)
 	uk_netbuf_free(packet);
 	chained_receive = 0;
 
+	{
+		const __u32 channel_types[] = {
+			0,
+			NETVSC_NVS_RNDIS_DATA,
+			NETVSC_NVS_RNDIS_CONTROL,
+			0xdeadbeefU,
+		};
+		unsigned int type_index;
+
+		for (type_index = 0;
+		     type_index < sizeof(channel_types) /
+				      sizeof(channel_types[0]);
+		     type_index++) {
+			inject_frame_type(frame, sizeof(frame),
+					  channel_types[type_index]);
+			status = netdev->rx_one(netdev,
+					netdev->_rx_queue[0], &packet);
+			CHECK((status & UK_NETDEV_STATUS_SUCCESS) != 0);
+			CHECK(packet->len == sizeof(frame));
+			CHECK(memcmp(packet->data, frame,
+				     sizeof(frame)) == 0);
+			uk_netbuf_free(packet);
+		}
+	}
+
 	/* A saturated TX ring defers, then retries, the receive completion. */
 	mock.ack_eagain = 2;
 	{
@@ -919,6 +989,23 @@ static int test_rx_bounds_headroom_and_reentry(struct uk_netdev *netdev)
 		queued->packet.payload_size = queued->payload_length;
 		mock_signal();
 		CHECK(mock.ack_count == acknowledgements + 2);
+
+		enqueue_transfer(message, sizeof(message),
+				 NETVSC_NVS_RNDIS_DATA);
+		queued = &mock.queue[(mock.head - 1) % MOCK_QUEUE];
+		put32(queued->payload, 999);
+		mock_signal();
+		CHECK(mock.ack_count == acknowledgements + 3);
+		CHECK(mock.last_ack_status == NETVSC_NVS_STATUS_FAILED);
+
+		enqueue_transfer(message, sizeof(message),
+				 NETVSC_NVS_RNDIS_DATA);
+		queued = &mock.queue[(mock.head - 1) % MOCK_QUEUE];
+		queued->payload_length = 3;
+		queued->packet.payload_size = 3;
+		mock_signal();
+		CHECK(mock.ack_count == acknowledgements + 4);
+		CHECK(mock.last_ack_status == NETVSC_NVS_STATUS_FAILED);
 	}
 	return 0;
 }
@@ -929,6 +1016,10 @@ static int test_control_timeout_and_late_completion(struct uk_netdev *netdev)
 	__u32 requests[CONFIG_LIBNETVSC_CONTROL_SLOTS] = { 0 };
 	unsigned int i;
 
+	scheduler = NULL;
+	CHECK(netdev->ops->promiscuous_set(netdev, 1) == -EWOULDBLOCK);
+	CHECK(netvsc_host_control_in_use() == 0);
+	scheduler = (struct uk_sched *)1;
 	mock.suppress_control_nvs = 1;
 	mock.suppress_control_rndis = 1;
 	for (i = 0; i < CONFIG_LIBNETVSC_CONTROL_SLOTS; i++) {
@@ -1095,6 +1186,70 @@ static int test_handshake_cleanup_failures(void)
 	return 0;
 }
 
+static int test_nvs_response_sizes_and_fallback(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 80,
+		.connection_id = 81,
+		.present = 1,
+	};
+	int rc;
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.nvs_accept_index = 0;
+	mock.init_response_length = 16;
+	mock.receive_response_length = 28;
+	mock.send_response_length = 12;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	netvsc_host_remove_device(&offered);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.nvs_accept_index = 0;
+	mock.init_response_length = MOCK_NVS_RESPONSE_CAPACITY + 1;
+	rc = netvsc_host_add_device(&offered);
+	CHECK(rc == -ENOBUFS);
+	CHECK(mock.nvs_init_requests == 1);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.nvs_accept_index = 0;
+	mock.init_response_length = 15;
+	rc = netvsc_host_add_device(&offered);
+	CHECK(rc == -EPROTO);
+	CHECK(mock.nvs_init_requests == 1);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.nvs_accept_index = 0;
+	mock.suppress_nvs_init = 1;
+	rc = netvsc_host_add_device(&offered);
+	CHECK(rc == -ETIMEDOUT);
+	CHECK(mock.nvs_init_requests == 1);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.nvs_accept_index = 0;
+	mock.nvs_init_status = 6;
+	rc = netvsc_host_add_device(&offered);
+	CHECK(rc == -EPROTO);
+	CHECK(mock.nvs_init_requests == 1);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.nvs_accept_index = 0;
+	mock.send_response_length = MOCK_NVS_RESPONSE_CAPACITY + 1;
+	CHECK(netvsc_host_add_device(&offered) == -ENOBUFS);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.nvs_accept_index = 0;
+	mock.send_response_length = 11;
+	CHECK(netvsc_host_add_device(&offered) == -EPROTO);
+	return 0;
+}
+
 static int test_gpa_fallback(void)
 {
 	struct vmbus_device offered = {
@@ -1164,6 +1319,100 @@ static int test_failed_close_quarantines_tx(void)
 	return 0;
 }
 
+static int test_malformed_ring_recovery(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 94,
+		.connection_id = 95,
+		.present = 1,
+	};
+	struct host_netbuf packet = { 0 };
+	struct uk_netdev *netdev;
+	struct uk_netbuf *received = NULL;
+	__u8 frame[60] = { 0 };
+	vmbus_channel_callback_t stale_callback;
+	void *stale_arg;
+	unsigned int events;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	mock.delay_tx = 1;
+	prepare_tx_buffer(&packet, 0x81, 60);
+	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
+			      &packet.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(netdev->ops->rxq_intr_enable(netdev,
+					   netdev->_rx_queue[0]) == 0);
+	stale_callback = mock.callback;
+	stale_arg = mock.callback_arg;
+	events = mock.netdev_events;
+	queue_frame_type(frame, sizeof(frame), NETVSC_NVS_RNDIS_DATA);
+	mock.receive_error_once = -EPROTO;
+	mock.receive_error_after = 1;
+	mock_signal();
+	CHECK(mock.abort_count == 1);
+	CHECK(mock.close_count == 0);
+	CHECK(packet.free_count == 0);
+	CHECK(mock.netdev_events == events);
+	CHECK(netvsc_host_receive_count() == 1);
+	stale_callback(&mock.channel, stale_arg);
+	CHECK(mock.abort_count == 1);
+	netvsc_host_remove_device(&offered);
+	CHECK(mock.close_count == 1);
+	CHECK(packet.free_count == 1);
+
+	mock.head = mock.tail = 0;
+	mock.map_count = 0;
+	mock.live_gpadls = 0;
+	mock.nvs_init_attempts = 0;
+	mock.nvs_init_requests = 0;
+	mock.delay_tx = 0;
+	mock.channel.open = 1;
+	offered.channel = NULL;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	events = mock.netdev_events;
+	inject_frame(frame, sizeof(frame));
+	CHECK(mock.netdev_events == events + 1);
+	CHECK((netdev->rx_one(netdev, netdev->_rx_queue[0], &received) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	uk_netbuf_free(received);
+	netvsc_host_remove_device(&offered);
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	mock.delay_tx = 1;
+	prepare_tx_buffer(&packet, 0x91, 60);
+	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
+			      &packet.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	mock.fail_close = 1;
+	mock.receive_error_once = -ENOBUFS;
+	mock_signal();
+	CHECK(mock.abort_count == 1);
+	netvsc_host_remove_device(&offered);
+	CHECK(packet.free_count == 1);
+	CHECK(netvsc_host_quarantined_tx() == 1);
+
+	mock.head = mock.tail = 0;
+	mock.map_count = 0;
+	mock.live_gpadls = 0;
+	mock.nvs_init_attempts = 0;
+	mock.nvs_init_requests = 0;
+	mock.delay_tx = 0;
+	mock.fail_close = 0;
+	mock.channel.open = 1;
+	offered.channel = NULL;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(packet.free_count == 2);
+	CHECK(netvsc_host_quarantined_tx() == 0);
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
 int main(void)
 {
 	struct vmbus_device offered = {
@@ -1197,8 +1446,14 @@ int main(void)
 	rc = test_handshake_cleanup_failures();
 	if (rc)
 		return rc;
+	rc = test_nvs_response_sizes_and_fallback();
+	if (rc)
+		return rc;
 	rc = test_gpa_fallback();
 	if (rc)
 		return rc;
-	return test_failed_close_quarantines_tx();
+	rc = test_failed_close_quarantines_tx();
+	if (rc)
+		return rc;
+	return test_malformed_ring_recovery();
 }

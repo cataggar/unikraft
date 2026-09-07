@@ -383,6 +383,14 @@ solved configuration must additionally select `CONFIG_LIBUKNETDEV=y` and
 `CONFIG_LIBNETVSC=y`; use the same command above with
 `-Dnative-profile=hyperv-x86_64-efi-netvsc`.
 
+NetVSC never guesses past a structurally malformed VMBus ring record. It
+disables channel callbacks and requests bounded VMBus reconnect, then closes
+and tears down the channel after the active callback/data-path operation has
+unwound. Queued TX ownership is released only after confirmed close/reset,
+while an ambiguous close quarantines GPA-direct buffers until the next
+connection generation. This preserves memory safety at the cost of a temporary
+interface outage when the host corrupts the shared ring.
+
 Target Zig modules receive generated Kconfig headers through tracked build
 dependencies and can opt into narrow Unikraft include roots for `@cImport`.
 The resulting objects feed the normal library partial-link and final-link

@@ -17,6 +17,13 @@ _Static_assert(offsetof(struct vmbus_device_bind_token,
 _Static_assert(offsetof(struct vmbus_device_bind_token,
 			resource_epoch) == 8,
 	       "VMBus bind epoch offset changed");
+_Static_assert(_Generic(&vmbus_channel_abort,
+		int (*)(struct vmbus_channel *): 1, default: 0),
+	       "VMBus channel abort ABI changed");
+_Static_assert(_Generic(&vmbus_channel_gpadl_map,
+		int (*)(struct vmbus_channel *, void *, size_t,
+			struct vmbus_gpadl *): 1, default: 0),
+	       "VMBus GPADL map ABI changed");
 
 int main(void)
 {

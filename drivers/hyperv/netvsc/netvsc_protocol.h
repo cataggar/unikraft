@@ -57,6 +57,7 @@ enum netvsc_protocol_result {
 	NETVSC_PROTOCOL_OVERFLOW = -3,
 	NETVSC_PROTOCOL_UNEXPECTED = -4,
 	NETVSC_PROTOCOL_REMOTE_FAILURE = -5,
+	NETVSC_PROTOCOL_VERSION_UNSUPPORTED = -6,
 };
 
 struct netvsc_nvs_init_complete {

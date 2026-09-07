@@ -140,6 +140,12 @@ int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
 		       __u16 rx_pages, const void *user_data,
 		       size_t user_data_size);
 int vmbus_channel_close(struct vmbus_channel *channel);
+/*
+ * Disable callbacks for a structurally corrupt channel and schedule bounded
+ * bus recovery. Closing and teardown are deferred until the active callback
+ * or data-path operation has unwound.
+ */
+int vmbus_channel_abort(struct vmbus_channel *channel);
 int vmbus_channel_send(struct vmbus_channel *channel, __u16 packet_type,
 		       __u16 flags, __u64 transaction_id,
 		       const void *descriptor, size_t descriptor_size,
