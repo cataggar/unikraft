@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <errno.h>
+#include <limits.h>
 #include <hyperv/hyperv.h>
 #include <uk/arch/spinlock.h>
 #include <uk/bus.h>
@@ -118,6 +119,10 @@ static int initialized;
 static int rx_active;
 static int connection_failed;
 static __u64 connection_quiesce_epoch = 1;
+static __u64 next_connection_generation = 1;
+static __u64 live_connection_generation;
+static int connection_teardown_failed;
+static int connection_teardown_error;
 static int clearing_devices;
 static __spinlock bind_lock;
 
@@ -126,6 +131,9 @@ static int (*host_pump_hook)(void);
 static __u8 host_last_tx[HYPERV_MESSAGE_PAYLOAD_SIZE];
 static size_t host_last_tx_len;
 static int host_transmit_error;
+static int host_teardown_result = INT_MIN;
+static unsigned int host_teardown_calls;
+static unsigned int host_connection_fail_calls;
 #endif
 
 static int vmbus_bus_init(struct uk_alloc *a);
@@ -1046,6 +1054,46 @@ static __paddr_t page_gpa(void *page)
 	return gpa;
 }
 
+static int connection_generation_begin(void)
+{
+	__u64 generation;
+
+	if (live_connection_generation)
+		return -EBUSY;
+	generation = next_connection_generation;
+	if (!generation)
+		return -ENOSPC;
+	live_connection_generation = generation;
+	next_connection_generation =
+		generation == UINT64_MAX ? 0 : generation + 1;
+	connection_teardown_failed = 0;
+	connection_teardown_error = 0;
+	return 0;
+}
+
+static void connection_generation_fail(int error)
+{
+	if (!live_connection_generation)
+		return;
+	connection_teardown_failed = 1;
+	connection_teardown_error = error ? error : -EIO;
+}
+
+static int connection_generation_quiesce(void)
+{
+	if (!live_connection_generation)
+		return 0;
+	if (__atomic_load_n(&connection_quiesce_epoch,
+			    __ATOMIC_ACQUIRE) == UINT64_MAX)
+		return -ENOSPC;
+	live_connection_generation = 0;
+	connection_teardown_failed = 0;
+	connection_teardown_error = 0;
+	(void)__atomic_add_fetch(&connection_quiesce_epoch, 1,
+				 __ATOMIC_ACQ_REL);
+	return 0;
+}
+
 static int connect_protocol(void)
 {
 	struct vmbus_start_config config = { 0 };
@@ -1053,6 +1101,10 @@ static int connect_protocol(void)
 	__paddr_t gpa;
 	int rc;
 
+	if (live_connection_generation)
+		return -EBUSY;
+	if (!next_connection_generation)
+		return -ENOSPC;
 	if (!hyperv_has_post_messages()) {
 		uk_pr_err("VMBus: Hyper-V PostMessages privilege is absent\n");
 		return -EACCES;
@@ -1087,7 +1139,11 @@ static int connect_protocol(void)
 	rc = handle_action(&action);
 	if (rc)
 		return rc;
-	return drive_until(VMBUS_STATE_READY, VMBUS_STATE_FAILED);
+	rc = connection_generation_begin();
+	if (rc)
+		return rc;
+	rc = drive_until(VMBUS_STATE_READY, VMBUS_STATE_FAILED);
+	return rc;
 }
 
 static void drain_queues(void)
@@ -1102,32 +1158,52 @@ static int disconnect_locked(void)
 {
 	struct vmbus_action action;
 	int state = vmbus_protocol_state();
-	int quiesced = state == VMBUS_STATE_IDLE ||
-		state == VMBUS_STATE_DISCONNECTED;
 	int rc = 0;
 
 	drain_queues();
 	__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
 	vmbus_channel_close_all();
 	clear_devices();
-	if (state != VMBUS_STATE_IDLE && state != VMBUS_STATE_DISCONNECTED) {
+	if (!live_connection_generation)
+		goto out_reset;
+	if (connection_teardown_failed) {
+		rc = connection_teardown_error;
+		goto out_reset;
+	}
+#ifdef VMBUS_BUS_HOST_TEST
+	if (host_teardown_result != INT_MIN) {
+		host_teardown_calls++;
+		rc = host_teardown_result;
+		goto out_proof;
+	}
+#endif
+	/*
+	 * A local parser reset to IDLE/DISCONNECTED is not host teardown.
+	 * Every negotiated generation requires CHANNELMSG_UNLOAD_RESPONSE;
+	 * posting UNLOAD or timing out is never used as DMA-quiesce proof.
+	 */
+	if (state == VMBUS_STATE_IDLE || state == VMBUS_STATE_DISCONNECTED) {
+		rc = -EIO;
+		goto out_proof;
+	}
+	{
 		vmbus_protocol_unload(hyperv_reference_time(), &action);
 		rc = handle_action(&action);
 		if (!rc)
 			rc = drive_until(VMBUS_STATE_DISCONNECTED,
 					 VMBUS_STATE_FAILED);
-		if (!rc)
-			quiesced = 1;
 	}
+out_proof:
+	if (!rc)
+		rc = connection_generation_quiesce();
+	if (rc)
+		connection_generation_fail(rc);
+out_reset:
 	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
 	reset_release_records();
 	drain_queues();
 	vmbus_protocol_reset();
 	vmbus_channel_reset_all();
-	if (quiesced && __atomic_load_n(&connection_quiesce_epoch,
-					 __ATOMIC_ACQUIRE) != UINT64_MAX)
-		(void)__atomic_add_fetch(&connection_quiesce_epoch, 1,
-					 __ATOMIC_ACQ_REL);
 	return rc;
 }
 
@@ -1145,17 +1221,28 @@ static int unwind_unload(void *arg __unused)
 {
 	struct vmbus_action action;
 	int state = vmbus_protocol_state();
+	int tracked = live_connection_generation != 0;
 	int rc = 0;
 
 	drain_queues();
 	__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
 	vmbus_channel_close_all();
-	if (state != VMBUS_STATE_IDLE && state != VMBUS_STATE_DISCONNECTED) {
+	if (tracked &&
+	    (state == VMBUS_STATE_IDLE || state == VMBUS_STATE_DISCONNECTED)) {
+		rc = -EIO;
+	} else if (state != VMBUS_STATE_IDLE &&
+		   state != VMBUS_STATE_DISCONNECTED) {
 		vmbus_protocol_unload(hyperv_reference_time(), &action);
 		rc = handle_action(&action);
 		if (!rc)
 			rc = drive_until(VMBUS_STATE_DISCONNECTED,
 					 VMBUS_STATE_FAILED);
+	}
+	if (tracked) {
+		if (!rc)
+			rc = connection_generation_quiesce();
+		if (rc)
+			connection_generation_fail(rc);
 	}
 	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
 	return rc;
@@ -1488,6 +1575,21 @@ void vmbus_control_channel_resource_released(void)
 	signal_worker();
 }
 
+int vmbus_device_bind_retry(struct vmbus_device *device)
+{
+	__u64 epoch = vmbus_control_channel_capacity_epoch(device);
+
+	if (!epoch)
+		return -EINVAL;
+	vmbus_control_note_channel_capacity(device, epoch);
+	return -ENOSPC;
+}
+
+void vmbus_device_bind_ready(void)
+{
+	vmbus_control_channel_resource_released();
+}
+
 static void release_control(void)
 {
 	__atomic_store_n(&control_owner, NULL, __ATOMIC_RELEASE);
@@ -1599,6 +1701,10 @@ __u64 vmbus_connection_fail(void)
 	__u64 epoch = __atomic_load_n(&connection_quiesce_epoch,
 				      __ATOMIC_ACQUIRE);
 
+#ifdef VMBUS_BUS_HOST_TEST
+	(void)__atomic_add_fetch(&host_connection_fail_calls, 1,
+				 __ATOMIC_RELAXED);
+#endif
 	vmbus_control_fail();
 	return epoch;
 }
@@ -1710,6 +1816,7 @@ enum host_bind_mode {
 	HOST_BIND_NESTED_RESCIND,
 	HOST_BIND_CASCADE,
 	HOST_BIND_REMOVE_PUMP,
+	HOST_BIND_EXPLICIT_RETRY,
 };
 
 static enum host_bind_mode host_bind_mode;
@@ -1892,6 +1999,11 @@ static int host_add_device(struct vmbus_device *dev)
 		return rc;
 	}
 	host_add_b++;
+	if (host_bind_mode == HOST_BIND_EXPLICIT_RETRY) {
+		host_add_depth--;
+		return host_add_b == 1 ?
+			vmbus_device_bind_retry(dev) : 0;
+	}
 	if (host_bind_mode == HOST_BIND_PERMANENT) {
 		host_add_depth--;
 		return -ENOSPC;
@@ -1975,9 +2087,17 @@ static void host_reset_state(void)
 	channel_resource_epoch = 1;
 	bind_work_pending = 0;
 	connection_failed = 0;
+	connection_quiesce_epoch = 1;
+	next_connection_generation = 1;
+	live_connection_generation = 0;
+	connection_teardown_failed = 0;
+	connection_teardown_error = 0;
 	host_pump_hook = NULL;
 	host_last_tx_len = 0;
 	host_transmit_error = 0;
+	host_teardown_result = INT_MIN;
+	host_teardown_calls = 0;
+	__atomic_store_n(&host_connection_fail_calls, 0, __ATOMIC_RELAXED);
 	host_add_a = 0;
 	host_add_b = 0;
 	host_remove_count = 0;
@@ -2172,6 +2292,22 @@ static int host_test_late_driver(void)
 	if (_vmbus_register_driver(&host_driver) || host_add_b != 1 ||
 	    device_bindings[0].state != VMBUS_BIND_BOUND)
 		return 117;
+
+	host_reset_state();
+	host_bind_mode = HOST_BIND_EXPLICIT_RETRY;
+	host_make_offer(&offer, 5);
+	if (add_offer(&offer) || host_add_b != 1 ||
+	    device_bindings[0].state != VMBUS_BIND_TRANSIENT_WAIT ||
+	    bind_work_pending)
+		return 118;
+	process_bind_work();
+	if (host_add_b != 1)
+		return 119;
+	vmbus_device_bind_ready();
+	process_bind_work();
+	if (host_add_b != 2 ||
+	    device_bindings[0].state != VMBUS_BIND_BOUND)
+		return 120;
 	return 0;
 }
 
@@ -2364,6 +2500,108 @@ int vmbus_bus_host_production_test(void)
 	if (rc)
 		return rc;
 	return host_test_same_relid_reoffer();
+}
+
+int vmbus_bus_host_quiesce_epoch_test(void)
+{
+	__u64 epoch;
+	unsigned int calls;
+	int rc;
+
+	host_reset_state();
+	vmbus_channel_reset_all();
+	epoch = vmbus_connection_quiesce_epoch();
+	host_teardown_result = 0;
+	if (disconnect_locked() || vmbus_connection_quiesce_epoch() != epoch ||
+	    host_teardown_calls)
+		return 301;
+
+	if (connection_generation_begin())
+		return 302;
+	rc = disconnect_locked();
+	if (rc || vmbus_connection_quiesce_epoch() != epoch + 1 ||
+	    live_connection_generation || host_teardown_calls != 1)
+		return 303;
+	calls = host_teardown_calls;
+	if (disconnect_locked() ||
+	    vmbus_connection_quiesce_epoch() != epoch + 1 ||
+	    host_teardown_calls != calls)
+		return 304;
+
+	if (connection_generation_begin())
+		return 305;
+	host_teardown_result = -ETIMEDOUT;
+	rc = disconnect_locked();
+	if (rc != -ETIMEDOUT ||
+	    vmbus_connection_quiesce_epoch() != epoch + 1 ||
+	    !live_connection_generation || !connection_teardown_failed)
+		return 306;
+	calls = host_teardown_calls;
+	vmbus_protocol_reset();
+	if (disconnect_locked() != -ETIMEDOUT ||
+	    vmbus_connection_quiesce_epoch() != epoch + 1 ||
+	    host_teardown_calls != calls)
+		return 307;
+
+	live_connection_generation = 7;
+	next_connection_generation = 8;
+	connection_teardown_failed = 0;
+	connection_teardown_error = 0;
+	host_teardown_result = INT_MIN;
+	calls = host_teardown_calls;
+	vmbus_protocol_reset();
+	if (disconnect_locked() != -EIO ||
+	    vmbus_connection_quiesce_epoch() != epoch + 1 ||
+	    host_teardown_calls != calls || !connection_teardown_failed)
+		return 308;
+
+	live_connection_generation = 0;
+	connection_teardown_failed = 0;
+	connection_teardown_error = 0;
+	if (disconnect_locked() ||
+	    vmbus_connection_quiesce_epoch() != epoch + 1)
+		return 309;
+
+	host_teardown_result = 0;
+	for (unsigned int generation = 0; generation < 3; generation++) {
+		if (connection_generation_begin() || disconnect_locked())
+			return 310 + generation;
+	}
+	if (vmbus_connection_quiesce_epoch() != epoch + 4)
+		return 313;
+
+	live_connection_generation = 0;
+	next_connection_generation = UINT64_MAX;
+	connection_teardown_failed = 0;
+	if (connection_generation_begin() || disconnect_locked() ||
+	    next_connection_generation ||
+	    connection_generation_begin() != -ENOSPC)
+		return 314;
+
+	host_reset_state();
+	vmbus_channel_reset_all();
+	return 0;
+}
+
+int vmbus_bus_host_connection_begin(void)
+{
+	return connection_generation_begin();
+}
+
+int vmbus_bus_host_connection_quiesce(void)
+{
+	return connection_generation_quiesce();
+}
+
+int vmbus_bus_host_connection_live(void)
+{
+	return live_connection_generation != 0;
+}
+
+unsigned int vmbus_bus_host_connection_fail_calls(void)
+{
+	return __atomic_load_n(&host_connection_fail_calls,
+			       __ATOMIC_RELAXED);
 }
 
 void vmbus_bus_host_set_transmit_error(int error)

@@ -12,6 +12,7 @@
 
 int vmbus_channel_host_nested_ownership_test(void);
 int vmbus_bus_host_production_test(void);
+int vmbus_bus_host_quiesce_epoch_test(void);
 struct vmbus_channel *
 vmbus_channel_host_prepare_open(struct vmbus_device *device);
 struct vmbus_channel *
@@ -741,5 +742,8 @@ int main(void)
 	rc = test_callback_lifetime();
 	if (rc)
 		return rc;
-	return test_gpadl_quarantine();
+	rc = test_gpadl_quarantine();
+	if (rc)
+		return rc;
+	return vmbus_bus_host_quiesce_epoch_test();
 }

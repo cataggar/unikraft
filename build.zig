@@ -799,6 +799,40 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
+    const storvsc_vmbus_epoch_object = b.addObject(.{
+        .name = "storvsc-vmbus-epoch-host",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    inline for (.{
+        "support/build/tests/vmbus-host-include",
+        "support/build/tests/vmbus-include",
+        "drivers/hyperv/vmbus",
+    }) |path| storvsc_vmbus_epoch_object.root_module.addIncludePath(
+        b.path(path),
+    );
+    storvsc_vmbus_epoch_object.root_module.addCSourceFile(.{
+        .file = b.path("drivers/hyperv/vmbus/vmbus_bus.c"),
+        .flags = &.{
+            "-std=gnu11",
+            "-DVMBUS_BUS_HOST_TEST",
+            "-DVMBUS_EPOCH_ONLY_HOST_TEST",
+            "-Dvmbus_device_bind_retry=vmbus_epoch_object_bind_retry",
+            "-Dvmbus_device_bind_ready=vmbus_epoch_object_bind_ready",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-variable",
+            "-Wno-ignored-attributes",
+            "-Wno-documentation",
+            "-pthread",
+        },
+    });
     const storvsc_production_tests = b.addExecutable(.{
         .name = "storvsc-production-test",
         .root_module = b.createModule(.{
@@ -831,7 +865,11 @@ pub fn build(b: *std.Build) void {
     storvsc_production_tests.root_module.addObject(
         storvsc_core_host_object,
     );
+    storvsc_production_tests.root_module.addObject(
+        storvsc_vmbus_epoch_object,
+    );
     storvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
+    storvsc_production_tests.link_gc_sections = true;
     test_step.dependOn(&b.addRunArtifact(storvsc_production_tests).step);
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",
