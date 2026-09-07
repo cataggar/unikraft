@@ -68,6 +68,7 @@ struct vmbus_packet {
 	__u32 descriptor_size;
 	__u32 payload_size;
 	__u32 total_size;
+	__u8 trailer_mismatch;
 };
 
 struct vmbus_gpa_range {
