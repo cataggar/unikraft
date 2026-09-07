@@ -17,6 +17,7 @@ struct vmbus_relid_lifecycle {
 	__u32 channel_id;
 	__u8 state;
 	__u8 retained;
+	__u64 sequence;
 };
 
 static inline struct vmbus_relid_lifecycle *
@@ -38,9 +39,11 @@ vmbus_relid_find(struct vmbus_relid_lifecycle *entries,
  */
 static inline int
 vmbus_relid_offer(struct vmbus_relid_lifecycle *entries,
-		  unsigned int capacity, __u32 channel_id, int retained)
+		  unsigned int capacity, __u32 channel_id, int retained,
+		  __u64 *sequence)
 {
 	struct vmbus_relid_lifecycle *entry;
+	struct vmbus_relid_lifecycle *oldest_released = NULL;
 	unsigned int i;
 
 	if (!channel_id)
@@ -49,19 +52,32 @@ vmbus_relid_offer(struct vmbus_relid_lifecycle *entries,
 	if (entry) {
 		if (entry->state != VMBUS_RELID_RELEASED)
 			return 1;
+		if (!retained)
+			return 1;
 		entry->state = VMBUS_RELID_ACTIVE;
 		entry->retained = !!retained;
+		entry->sequence = ++*sequence;
 		return 0;
 	}
 	for (i = 0; i < capacity; i++) {
-		if (entries[i].state != VMBUS_RELID_FREE)
-			continue;
-		entries[i].channel_id = channel_id;
-		entries[i].state = VMBUS_RELID_ACTIVE;
-		entries[i].retained = !!retained;
-		return 0;
+		if (entries[i].state == VMBUS_RELID_FREE) {
+			entry = &entries[i];
+			break;
+		}
+		if (entries[i].state == VMBUS_RELID_RELEASED &&
+		    (!oldest_released ||
+		     entries[i].sequence < oldest_released->sequence))
+			oldest_released = &entries[i];
 	}
-	return -ENOSPC;
+	if (!entry)
+		entry = oldest_released;
+	if (!entry)
+		return -ENOSPC;
+	entry->channel_id = channel_id;
+	entry->state = VMBUS_RELID_ACTIVE;
+	entry->retained = !!retained;
+	entry->sequence = ++*sequence;
+	return 0;
 }
 
 /*
