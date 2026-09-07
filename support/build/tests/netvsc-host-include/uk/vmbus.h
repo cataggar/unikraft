@@ -10,6 +10,8 @@
 #define VMBUS_PACKET_DATA_USING_GPA_DIRECT 9
 #define VMBUS_PACKET_COMPLETION 11
 #define VMBUS_PACKET_FLAG_REQUEST_COMPLETION 1U
+#define VMBUS_GPA_DIRECT_MAX_RANGES 32U
+#define VMBUS_GPA_DIRECT_MAX_PFNS 64U
 
 struct vmbus_guid {
 	__u8 bytes[VMBUS_GUID_SIZE];
@@ -67,12 +69,21 @@ typedef void (*vmbus_channel_callback_t)(struct vmbus_channel *, void *);
 int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
 		       const void *, size_t);
 int vmbus_channel_close(struct vmbus_channel *);
-int vmbus_channel_abort(struct vmbus_channel *);
+__u64 vmbus_connection_fail(void);
+__u64 vmbus_connection_quiesce_epoch(void);
+int vmbus_device_bind_retry(struct vmbus_device *);
+void vmbus_device_bind_ready(void);
 int vmbus_channel_send(struct vmbus_channel *, __u16, __u16, __u64,
 		       const void *, size_t, const void *, size_t);
+int vmbus_channel_send_ex(struct vmbus_channel *, __u16, __u16, __u64,
+			  const void *, size_t, const void *, size_t, int *);
 int vmbus_channel_send_gpa_direct(struct vmbus_channel *, __u16, __u64,
 				  const struct vmbus_gpa_range *, __u32,
 				  const void *, size_t);
+int vmbus_channel_send_gpa_direct_ex(
+				  struct vmbus_channel *, __u16, __u64,
+				  const struct vmbus_gpa_range *, __u32,
+				  const void *, size_t, int *);
 int vmbus_channel_gpadl_map(struct vmbus_channel *, void *, size_t,
 			    struct vmbus_gpadl *);
 int vmbus_channel_gpadl_unmap(struct vmbus_channel *,

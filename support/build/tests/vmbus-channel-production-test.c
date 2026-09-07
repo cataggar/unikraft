@@ -923,30 +923,6 @@ static int test_gpadl_ambiguous_failures(void)
 	return 0;
 }
 
-static int test_channel_abort_recovery(void)
-{
-	struct vmbus_device device = {
-		.channel_id = 34,
-		.connection_id = 134,
-		.present = 1,
-	};
-	struct vmbus_channel *channel =
-		vmbus_channel_host_prepare_open(&device);
-
-	if (!channel)
-		return 287;
-	vmbus_bus_host_clear_connection_failed();
-	if (vmbus_channel_abort(channel) || !device.channel ||
-	    !vmbus_channel_host_pages_used() ||
-	    !vmbus_bus_host_connection_failed())
-		return 288;
-	if (vmbus_channel_close(channel) || device.channel ||
-	    vmbus_channel_host_pages_used())
-		return 289;
-	vmbus_bus_host_clear_connection_failed();
-	return 0;
-}
-
 static int test_receive_signal_failure_preserves_packet(void)
 {
 	struct vmbus_device device = {
@@ -1027,9 +1003,6 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = test_gpadl_ambiguous_failures();
-	if (rc)
-		return rc;
-	rc = test_channel_abort_recovery();
 	if (rc)
 		return rc;
 	rc = test_receive_signal_failure_preserves_packet();

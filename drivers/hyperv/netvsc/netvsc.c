@@ -32,8 +32,8 @@
 #define NETVSC_PACKET_SCRATCH_SIZE	65536U
 #define NETVSC_CONTROL_WAIT_NS		1000000ULL
 #define NETVSC_INVALID_SECTION		NETVSC_NVS_SEND_SECTION_INVALID
-#define NETVSC_GPA_MAX_RANGES		32U
-#define NETVSC_GPA_MAX_PFNS		64U
+#define NETVSC_GPA_MAX_RANGES		VMBUS_GPA_DIRECT_MAX_RANGES
+#define NETVSC_GPA_MAX_PFNS		VMBUS_GPA_DIRECT_MAX_PFNS
 #define NETVSC_ACK_SLOTS		(CONFIG_LIBNETVSC_CHANNEL_RX_PAGES * \
 					 (NETVSC_PAGE_SIZE / 32U))
 #define NETVSC_ID_TOMBSTONES		(CONFIG_LIBNETVSC_TX_SLOTS + \
@@ -141,6 +141,7 @@ struct netvsc_device {
 	__spinlock tx_lock;
 	__spinlock rx_lock;
 	__u64 next_transaction;
+	__u64 quarantined_vmbus_epoch;
 	__u32 generation;
 	__u32 nvs_version;
 	__u32 ndis_version;
@@ -179,6 +180,7 @@ struct netvsc_device {
 	__u8 promiscuous;
 	__u8 drain_active;
 	__u8 drain_pending;
+	__u8 quarantined_wait_vmbus;
 	__u8 recovering;
 	__u8 failed;
 };
@@ -198,14 +200,25 @@ static void netvsc_channel_callback(struct vmbus_channel *channel, void *arg);
 static void netvsc_drain_channel(struct netvsc_device *device);
 static void netvsc_detach_host(struct netvsc_device *device, int revoked);
 
-static void netvsc_abort_malformed_channel(struct netvsc_device *device)
+static void netvsc_fail_channel(struct netvsc_device *device)
 {
+	struct vmbus_channel *channel;
+	unsigned long flags;
+
 	if (__atomic_exchange_n(&device->recovering, 1,
 				 __ATOMIC_ACQ_REL))
 		return;
-	__atomic_store_n(&device->failed, 1, __ATOMIC_RELEASE);
-	__atomic_store_n(&device->host_running, 0, __ATOMIC_RELEASE);
-	(void)vmbus_channel_abort(device->channel);
+	ukplat_spin_lock_irqsave(&device->state_lock, flags);
+	device->failed = 1;
+	device->host_running = 0;
+	device->quarantined_vmbus_epoch =
+		vmbus_connection_quiesce_epoch();
+	device->quarantined_wait_vmbus = 1;
+	channel = device->channel;
+	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
+	if (channel)
+		vmbus_channel_set_callback(channel, NULL, NULL);
+	(void)vmbus_connection_fail();
 }
 
 static void copy_bytes(void *destination, const void *source, size_t length)
@@ -546,6 +559,7 @@ static int netvsc_send_control(struct netvsc_device *device,
 	__u64 pfns[2];
 	__u32 section = NETVSC_INVALID_SECTION;
 	int nvs_length;
+	int published = 0;
 	int rc;
 
 	nvs_length = netvsc_nvs_build_rndis(nvs, sizeof(nvs),
@@ -566,21 +580,23 @@ static int netvsc_send_control(struct netvsc_device *device,
 		nvs_length = netvsc_nvs_build_rndis(nvs, sizeof(nvs),
 				NETVSC_NVS_RNDIS_CONTROL, section,
 				control->request_length);
-		rc = vmbus_channel_send(device->channel,
+		rc = vmbus_channel_send_ex(device->channel,
 				VMBUS_PACKET_DATA_INBAND,
 				VMBUS_PACKET_FLAG_REQUEST_COMPLETION,
 				control->transaction_id, NULL, 0,
-				nvs, (size_t)nvs_length);
+				nvs, (size_t)nvs_length, &published);
 	} else {
 		rc = netvsc_single_gpa(netvsc_control_pages[index],
 				control->request_length, &range, pfns, 2);
 		if (rc)
 			return rc;
-		rc = vmbus_channel_send_gpa_direct(device->channel,
+		rc = vmbus_channel_send_gpa_direct_ex(device->channel,
 				VMBUS_PACKET_FLAG_REQUEST_COMPLETION,
 				control->transaction_id, &range, 1,
-				nvs, (size_t)nvs_length);
+				nvs, (size_t)nvs_length, &published);
 	}
+	if (rc && published)
+		netvsc_fail_channel(device);
 	return rc;
 }
 
@@ -653,7 +669,7 @@ static int netvsc_rndis_execute(struct netvsc_device *device,
 	}
 	rc = netvsc_send_control(device, control);
 
-	if (rc && rc != -EIO) {
+	if (rc) {
 		netvsc_control_release(device, control);
 		return rc;
 	}
@@ -785,6 +801,7 @@ static int netvsc_nvs_exchange(struct netvsc_device *device,
 	unsigned long flags;
 	__u64 transaction_id;
 	__u64 deadline;
+	int published = 0;
 	int rc;
 
 	if (!netvsc_can_wait() || !response || !response_length)
@@ -803,10 +820,13 @@ static int netvsc_nvs_exchange(struct netvsc_device *device,
 	wait->expected_type = expected_type;
 	ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
 
-	rc = vmbus_channel_send(device->channel, VMBUS_PACKET_DATA_INBAND,
+	rc = vmbus_channel_send_ex(device->channel,
+			VMBUS_PACKET_DATA_INBAND,
 			VMBUS_PACKET_FLAG_REQUEST_COMPLETION, transaction_id,
-			NULL, 0, request, request_length);
-	if (rc && rc != -EIO) {
+			NULL, 0, request, request_length, &published);
+	if (rc) {
+		if (published)
+			netvsc_fail_channel(device);
 		ukplat_spin_lock_irqsave(&device->control_lock, flags);
 		wait->active = 0;
 		netvsc_remember_transaction(device, transaction_id);
@@ -855,11 +875,14 @@ static int netvsc_nvs_exchange(struct netvsc_device *device,
 static int netvsc_nvs_send(struct netvsc_device *device,
 			   const __u8 *request, size_t request_length)
 {
-	int rc = vmbus_channel_send(device->channel,
+	int published = 0;
+	int rc = vmbus_channel_send_ex(device->channel,
 			VMBUS_PACKET_DATA_INBAND, 0, 0, NULL, 0,
-			request, request_length);
+			request, request_length, &published);
 
-	return rc == -EIO ? 0 : rc;
+	if (rc && published)
+		netvsc_fail_channel(device);
+	return rc;
 }
 
 static int netvsc_negotiate_nvs(struct netvsc_device *device)
@@ -1430,14 +1453,18 @@ static int netvsc_ack_send(struct netvsc_device *device, __u64 transaction_id,
 	__u8 acknowledgement[NETVSC_NVS_REQUEST_SIZE];
 	int length = netvsc_nvs_build_rndis_ack(acknowledgement,
 			sizeof(acknowledgement), status);
+	int published = 0;
 	int rc;
 
 	if (length < 0)
 		return -EINVAL;
-	rc = vmbus_channel_send(device->channel, VMBUS_PACKET_COMPLETION,
+	rc = vmbus_channel_send_ex(device->channel,
+			VMBUS_PACKET_COMPLETION,
 			0, transaction_id, NULL, 0, acknowledgement,
-			(size_t)length);
-	return rc == -EIO ? 0 : rc;
+			(size_t)length, &published);
+	if (rc && published)
+		netvsc_fail_channel(device);
+	return published ? 0 : rc;
 }
 
 static void netvsc_ack_queue(struct netvsc_device *device,
@@ -1587,7 +1614,7 @@ static void netvsc_drain_channel(struct netvsc_device *device)
 				break;
 			if (rc) {
 				if (rc == -EPROTO || rc == -ENOBUFS)
-					netvsc_abort_malformed_channel(device);
+					netvsc_fail_channel(device);
 				else if (rc != -ECANCELED)
 					__atomic_store_n(&device->failed, 1,
 							 __ATOMIC_RELEASE);
@@ -1765,6 +1792,7 @@ static int netvsc_tx_one(struct uk_netdev *netdev,
 	__u64 transaction_id;
 	__u32 frame_length;
 	__u32 section = NETVSC_INVALID_SECTION;
+	int published = 0;
 	int nvs_length;
 	int rc;
 	int result;
@@ -1849,11 +1877,11 @@ static int netvsc_tx_one(struct uk_netdev *netdev,
 		}
 		nvs_length = netvsc_nvs_build_rndis(nvs, sizeof(nvs),
 				NETVSC_NVS_RNDIS_DATA, section, cursor);
-		rc = vmbus_channel_send(device->channel,
+		rc = vmbus_channel_send_ex(device->channel,
 				VMBUS_PACKET_DATA_INBAND,
 				VMBUS_PACKET_FLAG_REQUEST_COMPLETION,
 				transaction_id, NULL, 0, nvs,
-				(size_t)nvs_length);
+				(size_t)nvs_length, &published);
 	} else {
 		rc = netvsc_tx_append_range(context, context->header,
 					     sizeof(context->header));
@@ -1865,13 +1893,15 @@ static int netvsc_tx_one(struct uk_netdev *netdev,
 		nvs_length = netvsc_nvs_build_rndis(nvs, sizeof(nvs),
 				NETVSC_NVS_RNDIS_DATA,
 				NETVSC_NVS_SEND_SECTION_INVALID, 0);
-		rc = vmbus_channel_send_gpa_direct(device->channel,
+		rc = vmbus_channel_send_gpa_direct_ex(device->channel,
 				VMBUS_PACKET_FLAG_REQUEST_COMPLETION,
 				transaction_id, context->ranges,
 				context->range_count, nvs,
-				(size_t)nvs_length);
+				(size_t)nvs_length, &published);
 	}
-	if (rc && rc != -EIO)
+	if (rc && published)
+		netvsc_fail_channel(device);
+	if (rc && !published)
 		goto reject;
 	result = UK_NETDEV_STATUS_SUCCESS;
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
@@ -2077,12 +2107,16 @@ static int netvsc_start(struct uk_netdev *netdev)
 	if (device->stopping)
 		rc = -ECANCELED;
 	else {
+		unsigned long rx_flags;
+
+		ukplat_spin_lock_irqsave(&device->rx_lock, rx_flags);
+		device->rxq.interrupt_requested = 0;
+		device->rxq.interrupt_armed = 0;
+		ukplat_spin_unlock_irqrestore(&device->rx_lock, rx_flags);
 		device->running = 1;
 		device->host_running = 1;
 	}
 	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
-		device->rxq.interrupt_requested = 0;
-		device->rxq.interrupt_armed = 0;
 	netvsc_operation_end(device);
 	return rc;
 }
@@ -2303,6 +2337,7 @@ static void netvsc_detach_host(struct netvsc_device *device, int revoked)
 	__u8 request[NETVSC_NVS_REQUEST_SIZE];
 	unsigned long flags;
 	int close_rc = 0;
+	int quarantine;
 	int recovering;
 	int length;
 
@@ -2349,13 +2384,20 @@ static void netvsc_detach_host(struct netvsc_device *device, int revoked)
 		netvsc_wait_once();
 	if (!revoked && device->channel)
 		close_rc = vmbus_channel_close(device->channel);
+	recovering = __atomic_load_n(&device->recovering,
+				    __ATOMIC_ACQUIRE);
+	if (!revoked && close_rc && !recovering) {
+		netvsc_fail_channel(device);
+		recovering = 1;
+	}
 	/*
 	 * GPA-direct TX and control pages remain host-owned until the channel
 	 * is quiesced. Release packet ownership only after close, or after a
 	 * rescind has already revoked host access.
 	 */
 	netvsc_cancel_controls(device);
-	netvsc_cancel_tx(device, !revoked && close_rc);
+	quarantine = recovering || (!revoked && close_rc);
+	netvsc_cancel_tx(device, quarantine);
 	netvsc_free_queued_packets(device);
 	ukplat_spin_lock_irqsave(&device->state_lock, flags);
 	device->pending_ack_head = 0;
@@ -2390,7 +2432,17 @@ static int netvsc_attach_host(struct netvsc_device *device,
 	int rc;
 
 	netvsc_init_once(device);
-	netvsc_release_quarantined_tx(device);
+	if (device->quarantined_wait_vmbus) {
+		if (vmbus_connection_quiesce_epoch() ==
+		    device->quarantined_vmbus_epoch)
+			return vmbus_device_bind_retry(vmbus_device);
+		netvsc_release_quarantined_tx(device);
+		device->quarantined_wait_vmbus = 0;
+		device->quarantined_vmbus_epoch = 0;
+		vmbus_device_bind_ready();
+	} else {
+		netvsc_release_quarantined_tx(device);
+	}
 	ukplat_spin_lock_irqsave(&device->state_lock, flags);
 	if (device->attaching || device->attached) {
 		ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
@@ -2610,6 +2662,8 @@ void netvsc_host_reset(void)
 	netvsc_init_once(&netvsc);
 	netvsc_detach_host(&netvsc, 1);
 	netvsc_release_quarantined_tx(&netvsc);
+	netvsc.quarantined_wait_vmbus = 0;
+	netvsc.quarantined_vmbus_epoch = 0;
 	netvsc.registered = 0;
 	netvsc.configured = 0;
 	netvsc.running = 0;

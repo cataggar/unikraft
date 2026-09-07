@@ -1269,15 +1269,6 @@ out:
 	return rc;
 }
 
-int vmbus_channel_abort(struct vmbus_channel *channel)
-{
-	if (!channel)
-		return -ENODEV;
-	vmbus_channel_set_callback(channel, NULL, NULL);
-	vmbus_control_fail();
-	return 0;
-}
-
 static int channel_send(struct vmbus_channel *channel, __u16 packet_type,
 			__u16 flags, __u64 transaction_id,
 			const void *descriptor, size_t descriptor_size,

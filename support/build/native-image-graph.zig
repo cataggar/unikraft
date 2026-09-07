@@ -28,6 +28,7 @@ pub const Options = struct {
     profile: Profile,
     enable_ukblkdev: bool = false,
     enable_storvsc: bool = false,
+    enable_uklibparam: bool = false,
 };
 
 pub fn parseProfile(name: []const u8) error{UnsupportedConfiguration}!Profile {
@@ -271,6 +272,15 @@ fn registerLibraries(
                 }},
             );
         }
+        if (options.enable_uklibparam) {
+            try registerLibrary(
+                context,
+                allocator,
+                options,
+                data.uklibparam,
+                &.{},
+            );
+        }
         if (hasNetvsc(options.profile)) {
             try registerLibrary(
                 context,
@@ -433,7 +443,9 @@ fn registerPlatform(
     options: Options,
     profile: data.Profile,
 ) Error!void {
-    const extra_script_count: usize = if (isHyperv(options.profile)) 1 else 0;
+    const extra_script_count: usize =
+        @as(usize, @intFromBool(isHyperv(options.profile))) +
+        @as(usize, @intFromBool(options.enable_uklibparam));
     const merge_sequence = try allocator.alloc(
         component.LinkSequenceItem,
         profile.linker_script_inputs.len + extra_script_count,
@@ -461,19 +473,37 @@ fn registerPlatform(
         } };
         platform_scripts[index] = .{ .path = path };
     }
+    var extra_script_index = profile.linker_script_inputs.len;
     if (isHyperv(options.profile)) {
         const reloc_script = try joinPath(
             allocator,
             options.roots.output,
             "libukreloc/reloc.lds",
         );
-        merge_sequence[profile.linker_script_inputs.len] = .{ .artifact = .{
+        merge_sequence[extra_script_index] = .{ .artifact = .{
             .kind = .linker_script,
             .artifact = .{ .path = reloc_script },
             .provenance = .global,
         } };
-        platform_scripts[profile.linker_script_inputs.len] = .{ .path = reloc_script };
+        platform_scripts[extra_script_index] = .{ .path = reloc_script };
+        extra_script_index += 1;
     }
+    if (options.enable_uklibparam) {
+        const libparam_script = try joinPath(
+            allocator,
+            options.roots.output,
+            "libuklibparam/libparam.lds",
+        );
+        merge_sequence[extra_script_index] = .{ .artifact = .{
+            .kind = .linker_script,
+            .artifact = .{ .path = libparam_script },
+            .provenance = .global,
+        } };
+        platform_scripts[extra_script_index] = .{ .path = libparam_script };
+        extra_script_index += 1;
+    }
+    std.debug.assert(extra_script_index ==
+        profile.linker_script_inputs.len + extra_script_count);
     platform_scripts[profile.linker_script_inputs.len + extra_script_count] = .{ .stage_output = .{
         .platform = platformName(options.profile),
         .stage = "merge-linker-scripts",
@@ -1101,24 +1131,40 @@ test "Hyper-V NetVSC profile registers protocol and uknetdev" {
             .config = "/build/.config",
         },
         .profile = .@"hyperv-x86_64-efi-netvsc",
+        .enable_uklibparam = true,
     });
     defer registered.deinit();
 
     var saw_uknetdev = false;
+    var saw_uklibparam = false;
     var netvsc_library: ?component.Library = null;
     for (registered.graph.libraries) |library| {
         saw_uknetdev = saw_uknetdev or
             std.mem.eql(u8, library.name, "libuknetdev");
+        saw_uklibparam = saw_uklibparam or
+            std.mem.eql(u8, library.name, "libuklibparam");
         if (std.mem.eql(u8, library.name, "libnetvsc"))
             netvsc_library = library;
     }
     try std.testing.expect(saw_uknetdev);
+    try std.testing.expect(saw_uklibparam);
     const netvsc = netvsc_library orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), netvsc.target_zig_objects.len);
     try std.testing.expectEqualStrings(
         "/src/unikraft/drivers/hyperv/netvsc/netvsc_protocol.zig",
         netvsc.target_zig_objects[0].root_source_file,
     );
+    var saw_libparam_script = false;
+    for (registered.graph.platforms[0].link_stages[0].sequence) |item| {
+        if (item != .artifact or item.artifact.artifact != .path)
+            continue;
+        saw_libparam_script = saw_libparam_script or std.mem.eql(
+            u8,
+            item.artifact.artifact.path,
+            "/build/libuklibparam/libparam.lds",
+        );
+    }
+    try std.testing.expect(saw_libparam_script);
 }
 
 test "registered profiles match normalized Make graph fixtures" {

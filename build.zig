@@ -1382,6 +1382,10 @@ fn registerNativeGraph(
         nativeConfigEnabled(loaded, "CONFIG_LIBUKBLKDEV")
     else
         false;
+    const enable_uklibparam = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBUKLIBPARAM")
+    else
+        false;
     const registration = b.allocator.create(native_image_graph.RegisteredGraph) catch {
         step.dependOn(&b.addFail("unable to allocate the native QEMU graph").step);
         return null;
@@ -1396,6 +1400,7 @@ fn registerNativeGraph(
         .profile = profile,
         .enable_ukblkdev = enable_ukblkdev,
         .enable_storvsc = enable_storvsc,
+        .enable_uklibparam = enable_uklibparam,
     }) catch |err| {
         step.dependOn(&b.addFail(b.fmt(
             "unable to register native QEMU graph '{s}': {s}",

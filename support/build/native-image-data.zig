@@ -99,6 +99,22 @@ pub const x86_64_efi_uknetdev = Library{
     },
 };
 
+pub const uklibparam = Library{
+    .name = "libuklibparam",
+    .origin = .library,
+    .objects = &.{
+        "libuklibparam/parser.o",
+        "libuklibparam/libinfo.libuklibid.o",
+    },
+    .linker_scripts = &.{
+        .{ .root = .output, .relative = "libuklibparam/libparam.lds" },
+    },
+    .export_symbols = .{
+        .root = .base,
+        .relative = "lib/uklibparam/exportsyms.uk",
+    },
+};
+
 pub const x86_64_efi_netvsc = Library{
     .name = "libnetvsc",
     .origin = .driver,

@@ -12,7 +12,6 @@ vmbus_storage_guid
 vmbus_network_guid
 vmbus_channel_open
 vmbus_channel_close
-vmbus_channel_abort
 vmbus_channel_send
 vmbus_channel_send_ex
 vmbus_channel_send_gpa_direct

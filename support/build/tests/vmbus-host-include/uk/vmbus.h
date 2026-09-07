@@ -74,7 +74,6 @@ void vmbus_device_bind_ready(void);
 int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
 		       const void *, size_t);
 int vmbus_channel_close(struct vmbus_channel *);
-int vmbus_channel_abort(struct vmbus_channel *);
 int vmbus_channel_send(struct vmbus_channel *, __u16, __u16, __u64,
 		       const void *, size_t, const void *, size_t);
 int vmbus_channel_send_ex(struct vmbus_channel *, __u16, __u16, __u64,

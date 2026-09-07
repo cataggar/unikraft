@@ -381,7 +381,9 @@ The `hyperv-x86_64-efi-netvsc` profile extends that graph with `libuknetdev`,
 the NetVSC C binding, and the freestanding NVS/RNDIS Zig protocol object. Its
 solved configuration must additionally select `CONFIG_LIBUKNETDEV=y` and
 `CONFIG_LIBNETVSC=y`; use the same command above with
-`-Dnative-profile=hyperv-x86_64-efi-netvsc`.
+`-Dnative-profile=hyperv-x86_64-efi-netvsc`. If the solved configuration
+accepts uknetdev's `CONFIG_LIBUKLIBPARAM` implication, the native graph includes
+that library and its generated linker script as well.
 
 NetVSC never guesses past a structurally malformed VMBus ring record. It
 disables channel callbacks and requests bounded VMBus reconnect, then closes

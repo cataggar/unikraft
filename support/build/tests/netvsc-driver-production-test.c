@@ -76,11 +76,15 @@ struct mock_state {
 	unsigned int suppress_control_nvs;
 	unsigned int suppress_control_rndis;
 	unsigned int delay_tx;
+	unsigned int post_publish_error_once;
 	unsigned int fail_open;
 	unsigned int fail_close;
 	int receive_error_once;
 	int receive_error_after;
-	unsigned int abort_count;
+	unsigned int connection_fail_count;
+	unsigned int bind_retry_count;
+	unsigned int bind_ready_count;
+	__u64 quiesce_epoch;
 	unsigned int fail_map_call;
 	unsigned int fail_receive_complete;
 	unsigned int fail_send_complete;
@@ -487,6 +491,7 @@ static void mock_reset(void)
 {
 	memset(&mock, 0, sizeof(mock));
 	mock.channel.open = 1;
+	mock.quiesce_epoch = 1;
 	mock.nvs_accept_index = 2;
 	mock.init_response_length = NETVSC_NVS_REQUEST_SIZE;
 	mock.receive_response_length = NETVSC_NVS_REQUEST_SIZE;
@@ -632,13 +637,29 @@ int vmbus_channel_close(struct vmbus_channel *channel)
 	return mock.fail_close ? -EIO : 0;
 }
 
-int vmbus_channel_abort(struct vmbus_channel *channel)
+__u64 vmbus_connection_fail(void)
 {
-	mock.abort_count++;
-	(void)channel;
+	mock.connection_fail_count++;
 	mock.callback = NULL;
 	mock.callback_arg = NULL;
-	return 0;
+	return mock.quiesce_epoch;
+}
+
+__u64 vmbus_connection_quiesce_epoch(void)
+{
+	return mock.quiesce_epoch;
+}
+
+int vmbus_device_bind_retry(struct vmbus_device *device
+			    __attribute__((unused)))
+{
+	mock.bind_retry_count++;
+	return -ENOSPC;
+}
+
+void vmbus_device_bind_ready(void)
+{
+	mock.bind_ready_count++;
 }
 
 int vmbus_channel_send(struct vmbus_channel *channel, __u16 type,
@@ -653,6 +674,23 @@ int vmbus_channel_send(struct vmbus_channel *channel, __u16 type,
 			       payload_length, NULL, 0);
 }
 
+int vmbus_channel_send_ex(struct vmbus_channel *channel, __u16 type,
+			  __u16 flags, __u64 transaction_id,
+			  const void *descriptor, size_t descriptor_length,
+			  const void *payload, size_t payload_length,
+			  int *published)
+{
+	int rc = vmbus_channel_send(channel, type, flags, transaction_id,
+			descriptor, descriptor_length, payload, payload_length);
+
+	*published = rc == 0;
+	if (!rc && mock.post_publish_error_once) {
+		mock.post_publish_error_once = 0;
+		return -EIO;
+	}
+	return rc;
+}
+
 int vmbus_channel_send_gpa_direct(struct vmbus_channel *channel,
 				  __u16 flags, __u64 transaction_id,
 				  const struct vmbus_gpa_range *ranges,
@@ -664,6 +702,25 @@ int vmbus_channel_send_gpa_direct(struct vmbus_channel *channel,
 	return handle_nvs_send(VMBUS_PACKET_DATA_USING_GPA_DIRECT, flags,
 			       transaction_id, payload, payload_length,
 			       ranges, range_count);
+}
+
+int vmbus_channel_send_gpa_direct_ex(
+				  struct vmbus_channel *channel,
+				  __u16 flags, __u64 transaction_id,
+				  const struct vmbus_gpa_range *ranges,
+				  __u32 range_count, const void *payload,
+				  size_t payload_length, int *published)
+{
+	int rc = vmbus_channel_send_gpa_direct(channel, flags,
+			transaction_id, ranges, range_count, payload,
+			payload_length);
+
+	*published = rc == 0;
+	if (!rc && mock.post_publish_error_once) {
+		mock.post_publish_error_once = 0;
+		return -EIO;
+	}
+	return rc;
 }
 
 int vmbus_channel_gpadl_map(struct vmbus_channel *channel
@@ -1303,6 +1360,7 @@ static int test_failed_close_quarantines_tx(void)
 	netvsc_host_remove_device(&offered);
 	CHECK(packet.free_count == 0);
 	CHECK(netvsc_host_quarantined_tx() == 1);
+	CHECK(mock.connection_fail_count == 1);
 
 	mock.head = mock.tail = 0;
 	mock.map_count = 0;
@@ -1312,6 +1370,58 @@ static int test_failed_close_quarantines_tx(void)
 	mock.fail_close = 0;
 	mock.channel.open = 1;
 	offered.channel = NULL;
+	CHECK(netvsc_host_add_device(&offered) == -ENOSPC);
+	CHECK(mock.bind_retry_count == 1);
+	CHECK(packet.free_count == 0);
+	mock.quiesce_epoch++;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(packet.free_count == 1);
+	CHECK(netvsc_host_quarantined_tx() == 0);
+	CHECK(mock.bind_ready_count == 1);
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
+static int test_post_publish_failure_quarantines_tx(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 93,
+		.connection_id = 94,
+		.present = 1,
+	};
+	struct host_netbuf packet = { 0 };
+	struct uk_netdev *netdev;
+
+	netvsc_host_reset();
+	mock_reset();
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	mock.delay_tx = 1;
+	prepare_tx_buffer(&packet, 0x79, 60);
+	mock.post_publish_error_once = 1;
+	CHECK((netdev->tx_one(netdev, netdev->_tx_queue[0],
+			      &packet.netbuf) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(mock.connection_fail_count == 1);
+	CHECK(netvsc_host_tx_active() == 1);
+	CHECK(packet.free_count == 0);
+	mock_flush_tx();
+	CHECK(packet.free_count == 0);
+
+	netvsc_host_remove_device(&offered);
+	CHECK(packet.free_count == 0);
+	CHECK(netvsc_host_quarantined_tx() == 1);
+	mock.head = mock.tail = 0;
+	mock.map_count = 0;
+	mock.live_gpadls = 0;
+	mock.nvs_init_attempts = 0;
+	mock.nvs_init_requests = 0;
+	mock.delay_tx = 0;
+	mock.channel.open = 1;
+	offered.channel = NULL;
+	CHECK(netvsc_host_add_device(&offered) == -ENOSPC);
+	CHECK(packet.free_count == 0);
+	mock.quiesce_epoch++;
 	CHECK(netvsc_host_add_device(&offered) == 0);
 	CHECK(packet.free_count == 1);
 	CHECK(netvsc_host_quarantined_tx() == 0);
@@ -1352,16 +1462,17 @@ static int test_malformed_ring_recovery(void)
 	mock.receive_error_once = -EPROTO;
 	mock.receive_error_after = 1;
 	mock_signal();
-	CHECK(mock.abort_count == 1);
+	CHECK(mock.connection_fail_count == 1);
 	CHECK(mock.close_count == 0);
 	CHECK(packet.free_count == 0);
 	CHECK(mock.netdev_events == events);
 	CHECK(netvsc_host_receive_count() == 1);
 	stale_callback(&mock.channel, stale_arg);
-	CHECK(mock.abort_count == 1);
+	CHECK(mock.connection_fail_count == 1);
 	netvsc_host_remove_device(&offered);
 	CHECK(mock.close_count == 1);
-	CHECK(packet.free_count == 1);
+	CHECK(packet.free_count == 0);
+	CHECK(netvsc_host_quarantined_tx() == 1);
 
 	mock.head = mock.tail = 0;
 	mock.map_count = 0;
@@ -1371,7 +1482,11 @@ static int test_malformed_ring_recovery(void)
 	mock.delay_tx = 0;
 	mock.channel.open = 1;
 	offered.channel = NULL;
+	CHECK(netvsc_host_add_device(&offered) == -ENOSPC);
+	CHECK(packet.free_count == 0);
+	mock.quiesce_epoch++;
 	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(packet.free_count == 1);
 	events = mock.netdev_events;
 	inject_frame(frame, sizeof(frame));
 	CHECK(mock.netdev_events == events + 1);
@@ -1392,7 +1507,7 @@ static int test_malformed_ring_recovery(void)
 	mock.fail_close = 1;
 	mock.receive_error_once = -ENOBUFS;
 	mock_signal();
-	CHECK(mock.abort_count == 1);
+	CHECK(mock.connection_fail_count == 1);
 	netvsc_host_remove_device(&offered);
 	CHECK(packet.free_count == 1);
 	CHECK(netvsc_host_quarantined_tx() == 1);
@@ -1406,6 +1521,9 @@ static int test_malformed_ring_recovery(void)
 	mock.fail_close = 0;
 	mock.channel.open = 1;
 	offered.channel = NULL;
+	CHECK(netvsc_host_add_device(&offered) == -ENOSPC);
+	CHECK(packet.free_count == 1);
+	mock.quiesce_epoch++;
 	CHECK(netvsc_host_add_device(&offered) == 0);
 	CHECK(packet.free_count == 2);
 	CHECK(netvsc_host_quarantined_tx() == 0);
@@ -1450,6 +1568,9 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = test_gpa_fallback();
+	if (rc)
+		return rc;
+	rc = test_post_publish_failure_quarantines_tx();
 	if (rc)
 		return rc;
 	rc = test_failed_close_quarantines_tx();
