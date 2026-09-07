@@ -105,6 +105,7 @@ static __u64 relid_sequence;
 static __u64 device_generation = 1;
 static __u64 channel_resource_epoch = 1;
 static int bind_work_pending;
+static int bind_work_running;
 static int bind_attempt_active;
 static struct uk_thread *bind_attempt_owner;
 static struct vmbus_device_binding *bind_attempt_binding;
@@ -137,6 +138,7 @@ static void stop_worker_locked(void);
 static int release_channel(__u32 channel_id, int retain_claim);
 static int add_offer(const struct vmbus_decoded_offer *offer);
 static void bind_device(struct vmbus_device *dev);
+static void process_bind_work(void);
 static void copy_offer(struct vmbus_device *dev,
 		       const struct vmbus_decoded_offer *offer);
 
@@ -412,7 +414,8 @@ static void try_install_pending_offer(struct vmbus_device *dev)
 	struct vmbus_device_binding *binding = device_binding(dev);
 	struct vmbus_decoded_offer offer;
 
-	if (!binding || !binding->pending_offer_valid || dev->present)
+	if (!binding || binding->state != VMBUS_BIND_UNUSED ||
+	    !binding->pending_offer_valid || dev->present)
 		return;
 	offer = binding->pending_offer;
 	binding->pending_offer_valid = 0;
@@ -429,7 +432,7 @@ static void try_install_pending_offer(struct vmbus_device *dev)
 	binding->capacity_failure = 0;
 	binding->remove_called = 0;
 	device_count++;
-	bind_device(dev);
+	__atomic_store_n(&bind_work_pending, 1, __ATOMIC_RELEASE);
 }
 
 static void finish_device_removal(struct vmbus_device *dev,
@@ -543,15 +546,47 @@ stale:
 
 static void process_bind_work(void)
 {
+	unsigned int budget = CONFIG_LIBVMBUS_MAX_DEVICES;
 	unsigned int i;
 
+	if (__atomic_exchange_n(&bind_work_running, 1, __ATOMIC_ACQ_REL))
+		return;
+	__atomic_store_n(&bind_work_pending, 0, __ATOMIC_RELEASE);
+	while (budget--) {
+		struct vmbus_device *work = NULL;
+
+		for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
+			try_install_pending_offer(&devices[i]);
+			if (!work && devices[i].present &&
+			    find_driver(&devices[i].class_id) &&
+			    (device_bindings[i].state ==
+				     VMBUS_BIND_UNATTEMPTED ||
+			     device_bindings[i].state ==
+				     VMBUS_BIND_TRANSIENT_WAIT) &&
+			    (device_bindings[i].state !=
+				     VMBUS_BIND_TRANSIENT_WAIT ||
+			     device_bindings[i].retry_epoch !=
+				     channel_resource_epoch))
+				work = &devices[i];
+		}
+		if (!work)
+			break;
+		bind_device(work);
+	}
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
-		if (devices[i].present &&
-		    (device_bindings[i].state == VMBUS_BIND_UNATTEMPTED ||
-		     device_bindings[i].state == VMBUS_BIND_TRANSIENT_WAIT))
-			bind_device(&devices[i]);
-	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
-		try_install_pending_offer(&devices[i]);
+		if (device_bindings[i].pending_offer_valid ||
+		    (devices[i].present &&
+		     find_driver(&devices[i].class_id) &&
+		     (device_bindings[i].state == VMBUS_BIND_UNATTEMPTED ||
+		      (device_bindings[i].state ==
+			       VMBUS_BIND_TRANSIENT_WAIT &&
+		       device_bindings[i].retry_epoch !=
+			       channel_resource_epoch)))) {
+			__atomic_store_n(&bind_work_pending, 1,
+					 __ATOMIC_RELEASE);
+			break;
+		}
+	__atomic_store_n(&bind_work_running, 0, __ATOMIC_RELEASE);
 }
 
 static void remove_device(struct vmbus_device *dev)
@@ -755,6 +790,7 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 			return rc;
 		binding->pending_offer = *offer;
 		binding->pending_offer_valid = 1;
+		__atomic_store_n(&bind_work_pending, 1, __ATOMIC_RELEASE);
 		return 0;
 	}
 	if (!free_slot) {
@@ -791,8 +827,10 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 	binding->capacity_failure = 0;
 	binding->remove_called = 0;
 	device_count++;
-	bind_device(free_slot);
-	if (binding->state == VMBUS_BIND_UNATTEMPTED) {
+	__atomic_store_n(&bind_work_pending, 1, __ATOMIC_RELEASE);
+	process_bind_work();
+	if (binding->state == VMBUS_BIND_UNATTEMPTED &&
+	    !find_driver(&free_slot->class_id)) {
 		const char *kind =
 			guid_equal(&free_slot->class_id, &vmbus_storage_guid) ?
 			"storage (no data-path driver)" :
@@ -928,6 +966,8 @@ static int process_messages(void)
 		if (rc)
 			return rc;
 	}
+	if (__atomic_load_n(&bind_work_pending, __ATOMIC_ACQUIRE))
+		process_bind_work();
 	return 0;
 }
 
@@ -980,6 +1020,10 @@ static int drive_until(int terminal_a, int terminal_b)
 		if (rc)
 			return rc;
 		report_deferred_diagnostics();
+		if (__atomic_load_n(&bind_work_pending, __ATOMIC_ACQUIRE)) {
+			wait_once();
+			continue;
+		}
 		state = vmbus_protocol_state();
 		if (state == terminal_a || state == terminal_b)
 			return state == terminal_a ? 0 : -EIO;
@@ -1575,19 +1619,16 @@ const struct vmbus_device *vmbus_device_get(unsigned int index)
 
 int _vmbus_register_driver(struct vmbus_driver *driver)
 {
-	unsigned int i;
-
 	if (!driver || !driver->name || !driver->device_ids)
 		return -EINVAL;
-	for (i = 0; i < driver_count; i++)
+	for (unsigned int i = 0; i < driver_count; i++)
 		if (drivers[i] == driver)
 			return -EEXIST;
 	if (driver_count >= CONFIG_LIBVMBUS_MAX_DRIVERS)
 		return -ENOSPC;
 	drivers[driver_count++] = driver;
-	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
-		if (devices[i].present)
-			bind_device(&devices[i]);
+	__atomic_store_n(&bind_work_pending, 1, __ATOMIC_RELEASE);
+	process_bind_work();
 	return 0;
 }
 
@@ -1644,6 +1685,8 @@ enum host_bind_mode {
 	HOST_BIND_PARTIAL,
 	HOST_BIND_TIMEOUT,
 	HOST_BIND_NESTED_RESCIND,
+	HOST_BIND_CASCADE,
+	HOST_BIND_REMOVE_PUMP,
 };
 
 static enum host_bind_mode host_bind_mode;
@@ -1652,6 +1695,13 @@ static unsigned int host_add_b;
 static unsigned int host_remove_count;
 static int host_add_active;
 static int host_remove_during_add;
+static unsigned int host_add_depth;
+static unsigned int host_max_add_depth;
+static unsigned int host_cascade_remaining;
+static __u32 host_cascade_channel;
+static __u32 host_remove_offer_channel;
+static int host_remove_active;
+static int host_add_during_remove;
 static struct vmbus_decoded_offer host_nested_offer;
 struct vmbus_channel *
 vmbus_channel_host_allocate_open(struct vmbus_device *device);
@@ -1661,6 +1711,8 @@ int vmbus_channel_host_pin(struct vmbus_channel *channel);
 void vmbus_channel_host_unpin(struct vmbus_channel *channel);
 int vmbus_channel_host_is_free(struct vmbus_channel *channel);
 int vmbus_channel_host_pages_used(void);
+int vmbus_channel_host_record_count(void);
+int vmbus_channel_host_live_gpadls(void);
 
 static void host_zero(void *pointer, size_t size)
 {
@@ -1696,6 +1748,18 @@ static int host_nested_rescind_pump(void)
 	if (rescind_offer(1) || add_offer(&host_nested_offer))
 		return -EIO;
 	return rescind_offer(host_nested_offer.channel_id);
+}
+
+static int host_cascade_pump(void)
+{
+	struct vmbus_decoded_offer offer;
+	__u32 old_channel = host_cascade_channel;
+
+	host_pump_hook = NULL;
+	host_make_offer(&offer, ++host_cascade_channel);
+	if (rescind_offer(old_channel))
+		return -EIO;
+	return add_offer(&offer);
 }
 
 static int host_auto_control_pump(void)
@@ -1749,10 +1813,51 @@ static int host_no_response_pump(void)
 	return 0;
 }
 
+static int host_fail_after_create_pump(void)
+{
+	int rc = host_auto_control_pump();
+
+	host_transmit_error = -EIO;
+	return rc;
+}
+
+static void host_complete_torndown(__u32 gpadl_id)
+{
+	__u8 response[12] = { 0 };
+
+	response[0] = 12;
+	response[8] = (__u8)gpadl_id;
+	response[9] = (__u8)(gpadl_id >> 8);
+	response[10] = (__u8)(gpadl_id >> 16);
+	response[11] = (__u8)(gpadl_id >> 24);
+	(void)vmbus_channel_control_receive(response, sizeof(response));
+}
+
 static int host_add_device(struct vmbus_device *dev)
 {
 	int rc;
 
+	host_add_depth++;
+	if (host_remove_active)
+		host_add_during_remove = 1;
+	if (host_add_depth > host_max_add_depth)
+		host_max_add_depth = host_add_depth;
+	if (host_bind_mode == HOST_BIND_CASCADE) {
+		host_add_b++;
+		host_add_active = 1;
+		if (host_cascade_remaining) {
+			host_cascade_remaining--;
+			host_cascade_channel = dev->channel_id;
+			host_pump_hook = host_cascade_pump;
+			rc = vmbus_control_pump();
+			host_add_active = 0;
+			host_add_depth--;
+			return rc ? rc : -ECANCELED;
+		}
+		host_add_active = 0;
+		host_add_depth--;
+		return 0;
+	}
 	if (dev->channel_id == 1 &&
 	    (host_bind_mode == HOST_BIND_NESTED ||
 	     host_bind_mode == HOST_BIND_NESTED_RESCIND)) {
@@ -1760,29 +1865,36 @@ static int host_add_device(struct vmbus_device *dev)
 		host_add_active = 1;
 		rc = vmbus_channel_open(dev, 2, 2, NULL, 0);
 		host_add_active = 0;
+		host_add_depth--;
 		return rc;
 	}
 	host_add_b++;
-	if (host_bind_mode == HOST_BIND_PERMANENT)
+	if (host_bind_mode == HOST_BIND_PERMANENT) {
+		host_add_depth--;
 		return -ENOSPC;
+	}
 	if (host_bind_mode == HOST_BIND_TRANSIENT) {
 		host_pump_hook = host_auto_control_pump;
 		rc = vmbus_channel_open(dev, 2, 2, NULL, 0);
 		host_pump_hook = NULL;
+		host_add_depth--;
 		return rc;
 	}
 	if (host_bind_mode == HOST_BIND_PARTIAL) {
 		host_pump_hook = host_auto_control_pump;
 		rc = vmbus_channel_open(dev, 2, 2, NULL, 0);
 		host_pump_hook = NULL;
+		host_add_depth--;
 		return rc ? rc : -EINVAL;
 	}
 	if (host_bind_mode == HOST_BIND_TIMEOUT) {
 		host_pump_hook = host_no_response_pump;
 		rc = vmbus_channel_open(dev, 2, 2, NULL, 0);
 		host_pump_hook = NULL;
+		host_add_depth--;
 		return rc;
 	}
+	host_add_depth--;
 	return 0;
 }
 
@@ -1791,6 +1903,17 @@ static void host_remove_device(struct vmbus_device *dev __unused)
 	host_remove_count++;
 	if (host_add_active)
 		host_remove_during_add = 1;
+	if (host_bind_mode == HOST_BIND_REMOVE_PUMP &&
+	    host_remove_offer_channel) {
+		struct vmbus_decoded_offer offer;
+
+		host_remove_active = 1;
+		host_make_offer(&offer, host_remove_offer_channel);
+		host_remove_offer_channel = 0;
+		(void)add_offer(&offer);
+		process_bind_work();
+		host_remove_active = 0;
+	}
 }
 
 static const struct vmbus_device_id host_ids[] = {
@@ -1837,6 +1960,14 @@ static void host_reset_state(void)
 	host_remove_count = 0;
 	host_add_active = 0;
 	host_remove_during_add = 0;
+	host_add_depth = 0;
+	host_max_add_depth = 0;
+	host_cascade_remaining = 0;
+	host_cascade_channel = 0;
+	host_remove_offer_channel = 0;
+	host_remove_active = 0;
+	host_add_during_remove = 0;
+	bind_work_running = 0;
 	bind_attempt_active = 0;
 	bind_attempt_owner = NULL;
 	bind_attempt_binding = NULL;
@@ -1866,8 +1997,20 @@ static int host_test_nested_bind(void)
 	    devices[0].driver != &host_driver ||
 	    device_bindings[0].state != VMBUS_BIND_BOUND ||
 	    vmbus_channel_host_pages_used() != 4 ||
+	    vmbus_channel_host_record_count() != 1 ||
+	    vmbus_channel_host_live_gpadls() != 1 ||
 	    connection_failed)
 		return 103;
+	if (host_last_tx_len < 16)
+		return 104;
+	host_complete_torndown((__u32)host_last_tx[12] |
+		((__u32)host_last_tx[13] << 8) |
+		((__u32)host_last_tx[14] << 16) |
+		((__u32)host_last_tx[15] << 24));
+	if (vmbus_channel_host_pages_used() ||
+	    vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls())
+		return 105;
 	return 0;
 }
 
@@ -1884,12 +2027,61 @@ static int host_test_deferred_offer_rescind(void)
 		device_bindings[i].state = VMBUS_BIND_PERMANENT_FAILED;
 	host_pump_hook = host_nested_rescind_pump;
 	if (add_offer(&offer))
-		return 104;
+		return 106;
 	if (devices[0].present ||
 	    device_bindings[0].pending_offer_valid ||
 	    vmbus_relid_find(relids, VMBUS_RELID_CAPACITY, 10) ||
 	    host_add_b)
-		return 105;
+		return 107;
+	return 0;
+}
+
+static int host_test_bounded_cascade(void)
+{
+	struct vmbus_decoded_offer offer;
+	unsigned int guard = 0;
+
+	host_reset_state();
+	host_bind_mode = HOST_BIND_CASCADE;
+	host_cascade_remaining = 1000;
+	host_make_offer(&offer, 20);
+	if (add_offer(&offer))
+		return 106;
+	if (!bind_work_pending || host_max_add_depth != 1)
+		return 107;
+	while (__atomic_load_n(&bind_work_pending, __ATOMIC_ACQUIRE) &&
+	       guard++ < 2000)
+		process_bind_work();
+	if (guard >= 2000 || host_add_b != 1001 ||
+	    host_remove_count != 1000 || host_remove_during_add ||
+	    host_max_add_depth != 1 || !devices[0].present ||
+	    devices[0].channel_id != 1020 ||
+	    device_bindings[0].state != VMBUS_BIND_BOUND ||
+	    device_count != 1)
+		return 108;
+	return 0;
+}
+
+static int host_test_remove_pump_defers_bind(void)
+{
+	struct vmbus_decoded_offer offer;
+	unsigned int i;
+
+	host_reset_state();
+	host_bind_mode = HOST_BIND_REMOVE_PUMP;
+	for (i = 1; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
+		device_bindings[i].state = VMBUS_BIND_PERMANENT_FAILED;
+	host_make_offer(&offer, 30);
+	if (add_offer(&offer) || host_add_b != 1)
+		return 109;
+	host_remove_offer_channel = 31;
+	if (rescind_offer(30) || host_add_during_remove)
+		return 110;
+	process_bind_work();
+	if (host_add_b != 2 || !devices[0].present ||
+	    devices[0].channel_id != 31 ||
+	    device_bindings[0].state != VMBUS_BIND_BOUND)
+		return 111;
 	return 0;
 }
 
@@ -1952,7 +2144,7 @@ static int host_test_late_driver(void)
 	driver_count = 0;
 	host_bind_mode = HOST_BIND_NESTED;
 	host_make_offer(&offer, 8);
-	if (add_offer(&offer) || host_add_b)
+	if (add_offer(&offer) || host_add_b || bind_work_pending)
 		return 116;
 	if (_vmbus_register_driver(&host_driver) || host_add_b != 1 ||
 	    device_bindings[0].state != VMBUS_BIND_BOUND)
@@ -1978,24 +2170,83 @@ static int host_test_partial_add_cleanup(void)
 
 static int host_test_open_timeout_cleanup(void)
 {
-	struct vmbus_decoded_offer offer;
+	struct vmbus_device raw = {
+		.channel_id = 6,
+		.connection_id = 106,
+		.present = 1,
+	};
+	__u32 old_gpadl;
+	int rc;
 
 	host_reset_state();
-	host_bind_mode = HOST_BIND_TIMEOUT;
-	host_make_offer(&offer, 6);
-	if (add_offer(&offer))
+	host_pump_hook = host_no_response_pump;
+	rc = vmbus_channel_open(&raw, 2, 2, NULL, 0);
+	host_pump_hook = NULL;
+	if (rc != -ETIMEDOUT || raw.channel ||
+	    vmbus_channel_host_pages_used() != 4 ||
+	    vmbus_channel_host_record_count() != 1 ||
+	    vmbus_channel_host_live_gpadls() != 1 ||
+	    !connection_failed || host_last_tx_len < 16)
 		return 131;
-	if (host_add_b != 1 || host_remove_count != 1 ||
-	    devices[0].channel || !connection_failed ||
-	    vmbus_channel_host_pages_used() != 4)
+	old_gpadl = (__u32)host_last_tx[12] |
+		((__u32)host_last_tx[13] << 8) |
+		((__u32)host_last_tx[14] << 16) |
+		((__u32)host_last_tx[15] << 24);
+	host_transmit_error = 0;
+	host_pump_hook = host_auto_control_pump;
+	rc = vmbus_channel_open(&raw, 2, 2, NULL, 0);
+	host_pump_hook = NULL;
+	if (rc || !raw.channel ||
+	    vmbus_channel_host_pages_used() != 8 ||
+	    vmbus_channel_host_record_count() != 2 ||
+	    vmbus_channel_host_live_gpadls() != 2)
 		return 132;
 	host_pump_hook = host_auto_control_pump;
-	if (vmbus_control_pump() || vmbus_channel_host_pages_used())
-		return 133;
+	rc = vmbus_channel_close(raw.channel);
 	host_pump_hook = NULL;
-	vmbus_channel_reset_all();
-	if (vmbus_channel_host_pages_used())
+	if (rc || raw.channel ||
+	    vmbus_channel_host_pages_used() != 4 ||
+	    vmbus_channel_host_record_count() != 1 ||
+	    vmbus_channel_host_live_gpadls() != 1)
+		return 133;
+	host_complete_torndown(old_gpadl);
+	if (vmbus_channel_host_pages_used() ||
+	    vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls())
 		return 134;
+	vmbus_channel_reset_all();
+	if (vmbus_channel_host_pages_used() ||
+	    vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls())
+		return 135;
+	return 0;
+}
+
+static int host_test_open_teardown_post_failure(void)
+{
+	struct vmbus_device raw = {
+		.channel_id = 11,
+		.connection_id = 111,
+		.present = 1,
+	};
+	int rc;
+
+	host_reset_state();
+	host_pump_hook = host_fail_after_create_pump;
+	rc = vmbus_channel_open(&raw, 2, 2, NULL, 0);
+	host_pump_hook = NULL;
+	host_transmit_error = 0;
+	if (rc != -EIO || raw.channel ||
+	    vmbus_channel_host_pages_used() != 4 ||
+	    vmbus_channel_host_record_count() != 1 ||
+	    vmbus_channel_host_live_gpadls() != 1 ||
+	    !connection_failed)
+		return 136;
+	vmbus_channel_reset_all();
+	if (vmbus_channel_host_pages_used() ||
+	    vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls())
+		return 137;
 	return 0;
 }
 
@@ -2065,6 +2316,12 @@ int vmbus_bus_host_production_test(void)
 	rc = host_test_deferred_offer_rescind();
 	if (rc)
 		return rc;
+	rc = host_test_bounded_cascade();
+	if (rc)
+		return rc;
+	rc = host_test_remove_pump_defers_bind();
+	if (rc)
+		return rc;
 	rc = host_test_bind_retries();
 	if (rc)
 		return rc;
@@ -2075,6 +2332,9 @@ int vmbus_bus_host_production_test(void)
 	if (rc)
 		return rc;
 	rc = host_test_open_timeout_cleanup();
+	if (rc)
+		return rc;
+	rc = host_test_open_teardown_post_failure();
 	if (rc)
 		return rc;
 	rc = host_test_deferred_rescind();
