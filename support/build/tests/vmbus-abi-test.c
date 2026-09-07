@@ -17,7 +17,9 @@ int main(void)
 	struct vmbus_packet_meta_abi packet = { 0 };
 	__typeof__(&vmbus_channel_send_ex) send_ex = NULL;
 	__typeof__(&vmbus_channel_send_gpa_direct_ex) send_gpa_ex = NULL;
+	__typeof__(&vmbus_connection_fail) connection_fail = NULL;
+	__typeof__(&vmbus_connection_quiesce_epoch) quiesce_epoch = NULL;
 
 	return action.tx_len || device.present || packet.payload_size ||
-		send_ex || send_gpa_ex;
+		send_ex || send_gpa_ex || connection_fail || quiesce_epoch;
 }
