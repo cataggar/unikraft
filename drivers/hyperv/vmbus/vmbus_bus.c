@@ -470,6 +470,8 @@ static int rescind_offer(__u32 channel_id)
 		vmbus_relid_forget(relids, VMBUS_RELID_CAPACITY, channel_id);
 		return channel_rc;
 	}
+	if (channel_rc == -EINPROGRESS)
+		return 0;
 	release_rc = release_channel(channel_id, 0);
 	return channel_rc ? channel_rc : release_rc;
 }

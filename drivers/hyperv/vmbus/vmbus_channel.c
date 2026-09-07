@@ -159,8 +159,14 @@ static void finalize_channel(struct vmbus_channel *channel)
 static void end_channel_operation(struct vmbus_channel *channel,
 				  struct vmbus_channel_token *token)
 {
-	if (vmbus_channel_owner_end(token))
+	__u32 relid = channel->relid;
+	int release_relid = channel->rescinded;
+
+	if (vmbus_channel_owner_end(token)) {
 		finalize_channel(channel);
+		if (release_relid && vmbus_control_release_relid(relid))
+			vmbus_control_fail();
+	}
 }
 
 static int allocate_ring_pages(unsigned int count, unsigned int *start)
@@ -807,9 +813,17 @@ int vmbus_channel_rescind(__u32 channel_id)
 		channel->device->channel = NULL;
 	channel->device = NULL;
 	vmbus_channel_state_rescind(&channel->state);
-	if (cleanup_now)
+	if (cleanup_now) {
 		finalize_channel(channel);
-	return 0;
+		return 0;
+	}
+	/*
+	 * A revoked channel is no longer accessed by the host; FreeBSD relies on
+	 * this guarantee when GPADL teardown cannot complete after revoke. Keep
+	 * local pages until the last operation owner returns, then recycle them
+	 * before sending RELID_RELEASED.
+	 */
+	return -EINPROGRESS;
 }
 
 void vmbus_channel_close_all(void)
@@ -869,6 +883,16 @@ void vmbus_channel_reset_all(void)
 }
 
 #ifdef VMBUS_CHANNEL_HOST_TEST
+static unsigned int host_release_page;
+static __u32 host_release_relid;
+static int host_release_pending;
+
+int vmbus_channel_host_release_ready(__u32 relid)
+{
+	return host_release_pending && relid == host_release_relid &&
+		!ring_page_used[host_release_page] && !find_channel(relid);
+}
+
 int vmbus_channel_host_nested_ownership_test(void)
 {
 	struct vmbus_device first_device = {
@@ -900,7 +924,8 @@ int vmbus_channel_host_nested_ownership_test(void)
 		return 2;
 	first->page_start = page;
 	first->page_count = 2;
-	if (vmbus_channel_rescind(first->relid))
+	if (vmbus_channel_rescind(first->relid) != -EINPROGRESS ||
+	    first->state != CHANNEL_RESCINDED)
 		return 3;
 	if (first_device.channel || first->state == CHANNEL_FREE ||
 	    !ring_page_used[page])
@@ -908,7 +933,11 @@ int vmbus_channel_host_nested_ownership_test(void)
 	second = allocate_channel(&second_device);
 	if (!second || second == first)
 		return 5;
+	host_release_page = page;
+	host_release_relid = first->relid;
+	host_release_pending = 1;
 	end_channel_operation(first, &token);
+	host_release_pending = 0;
 	if (first->state != CHANNEL_FREE || ring_page_used[page])
 		return 6;
 	third = allocate_channel(&third_device);
