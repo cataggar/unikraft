@@ -1,15 +1,36 @@
 #include <uk/arch/types.h>
+#define VMBUS_GUID_SIZE 16U
 #define VMBUS_USER_DATA_SIZE 120U
 #define VMBUS_PACKET_DATA_USING_GPA_DIRECT 9
+struct vmbus_guid {
+	__u8 bytes[VMBUS_GUID_SIZE];
+};
 struct vmbus_channel;
-struct vmbus_driver;
 struct vmbus_device {
+	struct vmbus_guid class_id;
+	struct vmbus_guid instance_id;
 	__u32 channel_id;
 	__u32 connection_id;
+	__u16 flags;
+	__u16 mmio_megabytes;
+	__u16 mmio_megabytes_optional;
 	__u16 subchannel_index;
+	__u8 monitor_id;
+	__u8 monitor_allocated;
+	__u16 dedicated;
+	__u8 user_data[VMBUS_USER_DATA_SIZE];
 	const struct vmbus_driver *driver;
 	struct vmbus_channel *channel;
 	__u8 present;
+};
+struct vmbus_device_id {
+	struct vmbus_guid class_id;
+};
+struct vmbus_driver {
+	const char *name;
+	const struct vmbus_device_id *device_ids;
+	int (*add_dev)(struct vmbus_device *);
+	void (*remove_dev)(struct vmbus_device *);
 };
 struct vmbus_packet {
 	__u16 type;
@@ -27,3 +48,15 @@ struct vmbus_gpa_range {
 	__u32 pfn_count;
 };
 typedef void (*vmbus_channel_callback_t)(struct vmbus_channel *, void *);
+int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
+		       const void *, size_t);
+int vmbus_channel_close(struct vmbus_channel *);
+int vmbus_channel_send(struct vmbus_channel *, __u16, __u16, __u64,
+		       const void *, size_t, const void *, size_t);
+int vmbus_channel_receive(struct vmbus_channel *, struct vmbus_packet *,
+			  void *, size_t, void *, size_t);
+int vmbus_channel_poll(struct vmbus_channel *);
+void vmbus_channel_set_callback(struct vmbus_channel *,
+				vmbus_channel_callback_t, void *);
+int vmbus_channel_mask_interrupts(struct vmbus_channel *);
+int vmbus_channel_unmask_interrupts(struct vmbus_channel *);

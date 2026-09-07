@@ -8,6 +8,8 @@
 #define __u64 uint64_t
 #define __vaddr_t uintptr_t
 #define __paddr_t uintptr_t
+#define __nsec unsigned long long
 #define __align(x) __attribute__((aligned(x)))
 #define __unused __attribute__((unused))
+#define __noreturn __attribute__((noreturn))
 #endif

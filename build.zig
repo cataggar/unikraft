@@ -714,12 +714,14 @@ pub fn build(b: *std.Build) void {
     }) |path| vmbus_production_tests.root_module.addIncludePath(b.path(path));
     vmbus_production_tests.root_module.addCSourceFiles(.{
         .files = &.{
+            "drivers/hyperv/vmbus/vmbus_bus.c",
             "drivers/hyperv/vmbus/vmbus_channel.c",
             "support/build/tests/vmbus-channel-production-test.c",
         },
         .flags = &.{
             "-std=gnu11",
             "-DVMBUS_CHANNEL_HOST_TEST",
+            "-DVMBUS_BUS_HOST_TEST",
             "-ffunction-sections",
             "-fdata-sections",
             "-Wall",
@@ -727,8 +729,10 @@ pub fn build(b: *std.Build) void {
             "-Werror",
             "-Wno-ignored-attributes",
             "-Wno-documentation",
+            "-pthread",
         },
     });
+    vmbus_production_tests.root_module.linkSystemLibrary("pthread", .{});
     vmbus_production_tests.link_gc_sections = true;
     test_step.dependOn(&b.addRunArtifact(vmbus_production_tests).step);
     const platform_correctness_tests = b.addExecutable(.{
