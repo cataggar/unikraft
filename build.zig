@@ -699,6 +699,38 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     test_step.dependOn(&b.addRunArtifact(vmbus_control_tests).step);
+    const vmbus_production_tests = b.addExecutable(.{
+        .name = "vmbus-channel-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    inline for (.{
+        "support/build/tests/vmbus-host-include",
+        "support/build/tests/vmbus-include",
+        "drivers/hyperv/vmbus",
+    }) |path| vmbus_production_tests.root_module.addIncludePath(b.path(path));
+    vmbus_production_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "drivers/hyperv/vmbus/vmbus_channel.c",
+            "support/build/tests/vmbus-channel-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DVMBUS_CHANNEL_HOST_TEST",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-ignored-attributes",
+            "-Wno-documentation",
+        },
+    });
+    vmbus_production_tests.link_gc_sections = true;
+    test_step.dependOn(&b.addRunArtifact(vmbus_production_tests).step);
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",
         .root_module = b.createModule(.{

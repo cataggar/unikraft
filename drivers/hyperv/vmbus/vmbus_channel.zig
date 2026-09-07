@@ -441,6 +441,30 @@ export fn vmbus_ring_set_interrupt_mask(
     return 0;
 }
 
+fn ringUnmaskAndReadable(
+    base: [*]u8,
+    total_size: usize,
+    interleave: InterleaveHook,
+) u32 {
+    const size: u32 = @intCast(validateRing(total_size) orelse return 0);
+    storeHeader(base, 8, 0, .release);
+    fullFence();
+    if (interleave) |hook|
+        hook(base, @intCast(size));
+    return readable(
+        loadHeader(base, 4, .acquire),
+        loadHeader(base, 0, .acquire),
+        size,
+    ) orelse 0;
+}
+
+export fn vmbus_ring_unmask_and_readable(
+    base: [*]u8,
+    total_size: usize,
+) callconv(.c) u32 {
+    return ringUnmaskAndReadable(base, total_size, null);
+}
+
 export fn vmbus_ring_readable(base: [*]u8, total_size: usize) callconv(.c) u32 {
     const size: u32 = @intCast(validateRing(total_size) orelse return 0);
     return readable(loadHeader(base, 4, .acquire), loadHeader(base, 0, .acquire), size) orelse 0;
@@ -787,6 +811,23 @@ test "read notification observes pending store after read publication" {
         Hooks.pending,
     ));
     try std.testing.expectEqual(@as(u8, 1), meta.need_signal);
+}
+
+test "unmask end-read barrier observes concurrent host publication" {
+    const Hook = struct {
+        fn publish(base: [*]u8, _: usize) void {
+            storeHeader(base, 0, 24, .release);
+        }
+    };
+    const ring = testRing(2);
+    _ = vmbus_ring_initialize(ring.ptr, ring.len);
+    storeHeader(ring.ptr, 8, 1, .release);
+    try std.testing.expectEqual(@as(u32, 24), ringUnmaskAndReadable(
+        ring.ptr,
+        ring.len,
+        Hook.publish,
+    ));
+    try std.testing.expectEqual(@as(u32, 0), loadHeader(ring.ptr, 8, .acquire));
 }
 
 test "GPADL chunks derive from wire capacity" {
