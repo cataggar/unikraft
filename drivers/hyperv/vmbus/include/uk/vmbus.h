@@ -90,6 +90,13 @@ unsigned int vmbus_device_count(void);
 const struct vmbus_device *vmbus_device_get(unsigned int index);
 int vmbus_reconnect(void);
 int vmbus_unload(void);
+/*
+ * Mark the VMBus control connection failed and schedule whole-bus recovery.
+ * The returned epoch is a token for vmbus_connection_quiesce_epoch(); a
+ * changed epoch proves that the prior connection completed host teardown.
+ */
+__u64 vmbus_connection_fail(void);
+__u64 vmbus_connection_quiesce_epoch(void);
 int _vmbus_register_driver(struct vmbus_driver *driver);
 
 /*

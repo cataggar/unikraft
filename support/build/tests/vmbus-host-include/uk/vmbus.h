@@ -50,6 +50,8 @@ struct vmbus_gpa_range {
 	__u32 pfn_count;
 };
 typedef void (*vmbus_channel_callback_t)(struct vmbus_channel *, void *);
+__u64 vmbus_connection_fail(void);
+__u64 vmbus_connection_quiesce_epoch(void);
 int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
 		       const void *, size_t);
 int vmbus_channel_close(struct vmbus_channel *);

@@ -117,6 +117,7 @@ static int control_busy;
 static int initialized;
 static int rx_active;
 static int connection_failed;
+static __u64 connection_quiesce_epoch = 1;
 static int clearing_devices;
 static __spinlock bind_lock;
 
@@ -1101,6 +1102,8 @@ static int disconnect_locked(void)
 {
 	struct vmbus_action action;
 	int state = vmbus_protocol_state();
+	int quiesced = state == VMBUS_STATE_IDLE ||
+		state == VMBUS_STATE_DISCONNECTED;
 	int rc = 0;
 
 	drain_queues();
@@ -1113,12 +1116,18 @@ static int disconnect_locked(void)
 		if (!rc)
 			rc = drive_until(VMBUS_STATE_DISCONNECTED,
 					 VMBUS_STATE_FAILED);
+		if (!rc)
+			quiesced = 1;
 	}
 	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
 	reset_release_records();
 	drain_queues();
 	vmbus_protocol_reset();
 	vmbus_channel_reset_all();
+	if (quiesced && __atomic_load_n(&connection_quiesce_epoch,
+					 __ATOMIC_ACQUIRE) != UINT64_MAX)
+		(void)__atomic_add_fetch(&connection_quiesce_epoch, 1,
+					 __ATOMIC_ACQ_REL);
 	return rc;
 }
 
@@ -1583,6 +1592,20 @@ int vmbus_reconnect(void)
 		(void)disconnect_locked();
 	release_control();
 	return rc;
+}
+
+__u64 vmbus_connection_fail(void)
+{
+	__u64 epoch = __atomic_load_n(&connection_quiesce_epoch,
+				      __ATOMIC_ACQUIRE);
+
+	vmbus_control_fail();
+	return epoch;
+}
+
+__u64 vmbus_connection_quiesce_epoch(void)
+{
+	return __atomic_load_n(&connection_quiesce_epoch, __ATOMIC_ACQUIRE);
 }
 
 void hyperv_vmbus_fini(void)

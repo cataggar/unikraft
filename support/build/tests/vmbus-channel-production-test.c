@@ -548,6 +548,19 @@ static int test_send_publication(void)
 	return 0;
 }
 
+static int test_connection_fail_api(void)
+{
+	__u64 epoch = vmbus_connection_quiesce_epoch();
+
+	vmbus_bus_host_clear_connection_failed();
+	if (vmbus_connection_fail() != epoch ||
+	    vmbus_connection_quiesce_epoch() != epoch ||
+	    !vmbus_bus_host_connection_failed())
+		return 280;
+	vmbus_bus_host_clear_connection_failed();
+	return 0;
+}
+
 static pthread_mutex_t callback_gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t callback_condition = PTHREAD_COND_INITIALIZER;
 static int callback_entered;
@@ -720,6 +733,9 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = test_send_publication();
+	if (rc)
+		return rc;
+	rc = test_connection_fail_api();
 	if (rc)
 		return rc;
 	rc = test_callback_lifetime();
