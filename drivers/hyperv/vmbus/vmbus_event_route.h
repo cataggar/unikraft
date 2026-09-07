@@ -18,6 +18,7 @@ vmbus_event_route(__u32 version, __u32 event, __u64 *legacy_words,
 		return (int)vmbus_legacy_event_scan(legacy_words,
 				legacy_word_count, relid_limit, emit, arg);
 	}
+	/* Modern SIEFP bit 0 announces protocol-message work, not a channel. */
 	if (!event)
 		return 0;
 	if (event >= relid_limit)

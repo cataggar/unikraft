@@ -138,6 +138,14 @@ fn fullFence() void {
     _ = @atomicRmw(u8, &fence_byte, .Xchg, 0, .seq_cst);
 }
 
+fn postIndexStoreLoadFence() void {
+    fullFence();
+}
+
+fn endReadStoreLoadFence() void {
+    fullFence();
+}
+
 fn validateRing(total_size: usize) ?usize {
     if (total_size < page_size * 2 or total_size % page_size != 0)
         return null;
@@ -313,7 +321,7 @@ fn ringWrite(
     storeHeader(base, 12, 0, .release);
     fullFence();
     storeHeader(base, 0, @intCast(cursor), .release);
-    fullFence();
+    postIndexStoreLoadFence();
     if (interleave) |hook|
         hook(base, data_size_usize);
     const post_read = loadHeader(base, 4, .acquire);
@@ -396,7 +404,7 @@ fn ringRead(
     const new_read: u32 = @intCast((read + total) % data_size_usize);
     fullFence();
     storeHeader(base, 4, new_read, .release);
-    fullFence();
+    postIndexStoreLoadFence();
     if (interleave) |hook|
         hook(base, data_size_usize);
     const pending = loadHeader(base, 12, .acquire);
@@ -448,7 +456,7 @@ fn ringUnmaskAndReadable(
 ) u32 {
     const size: u32 = @intCast(validateRing(total_size) orelse return 0);
     storeHeader(base, 8, 0, .release);
-    fullFence();
+    endReadStoreLoadFence();
     if (interleave) |hook|
         hook(base, @intCast(size));
     return readable(
