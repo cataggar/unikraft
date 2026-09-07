@@ -86,8 +86,10 @@ struct mock_state {
 	int receive_error_once;
 	int receive_error_after;
 	unsigned int connection_fail_count;
+	unsigned int bind_epoch_count;
 	unsigned int bind_retry_count;
 	unsigned int bind_ready_count;
+	unsigned int advance_quiesce_on_bind_epoch;
 	__u64 quiesce_epoch;
 	unsigned int fail_map_call;
 	unsigned int fail_receive_complete;
@@ -805,9 +807,26 @@ __u64 vmbus_connection_quiesce_epoch(void)
 	return mock.quiesce_epoch;
 }
 
-int vmbus_device_bind_retry(struct vmbus_device *device
-			    __attribute__((unused)))
+int vmbus_device_bind_epoch(struct vmbus_device *device
+			    __attribute__((unused)),
+			    struct vmbus_device_bind_token *token)
 {
+	mock.bind_epoch_count++;
+	token->device_generation = 1;
+	token->resource_epoch = mock.quiesce_epoch;
+	if (mock.advance_quiesce_on_bind_epoch) {
+		mock.advance_quiesce_on_bind_epoch = 0;
+		mock.quiesce_epoch++;
+	}
+	return 0;
+}
+
+int vmbus_device_bind_retry(struct vmbus_device *device
+			    __attribute__((unused)),
+			    const struct vmbus_device_bind_token *token)
+{
+	CHECK(token->device_generation != 0);
+	CHECK(token->resource_epoch != 0);
 	mock.bind_retry_count++;
 	return -ENOSPC;
 }
@@ -1942,8 +1961,9 @@ static int test_failed_close_quarantines_tx(void)
 	CHECK(netvsc_host_add_device(&offered) == -ENOSPC);
 	CHECK(mock.bind_retry_count == 1);
 	CHECK(packet.free_count == 0);
-	mock.quiesce_epoch++;
+	mock.advance_quiesce_on_bind_epoch = 1;
 	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(mock.bind_epoch_count == 3);
 	CHECK(packet.free_count == 1);
 	CHECK(netvsc_host_quarantined_tx() == 0);
 	CHECK(mock.bind_ready_count == 1);

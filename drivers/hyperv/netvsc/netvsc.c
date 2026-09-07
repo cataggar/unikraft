@@ -2775,22 +2775,33 @@ static void netvsc_detach_host(struct netvsc_device *device, int revoked)
 static int netvsc_attach_host(struct netvsc_device *device,
 			      struct vmbus_device *vmbus_device)
 {
+	struct vmbus_device_bind_token bind_token;
 	struct uk_alloc *allocator;
 	unsigned long flags;
+	int release_waiting = 0;
 	int rc;
 
 	netvsc_init_once(device);
+	rc = vmbus_device_bind_epoch(vmbus_device, &bind_token);
+	if (rc)
+		return rc;
+	ukplat_spin_lock_irqsave(&device->state_lock, flags);
 	if (device->quarantined_wait_vmbus) {
 		if (vmbus_connection_quiesce_epoch() ==
-		    device->quarantined_vmbus_epoch)
-			return vmbus_device_bind_retry(vmbus_device);
-		netvsc_release_quarantined_tx(device);
+		    device->quarantined_vmbus_epoch) {
+			ukplat_spin_unlock_irqrestore(&device->state_lock,
+						     flags);
+			return vmbus_device_bind_retry(vmbus_device,
+						       &bind_token);
+		}
 		device->quarantined_wait_vmbus = 0;
 		device->quarantined_vmbus_epoch = 0;
-		vmbus_device_bind_ready();
-	} else {
-		netvsc_release_quarantined_tx(device);
+		release_waiting = 1;
 	}
+	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
+	netvsc_release_quarantined_tx(device);
+	if (release_waiting)
+		vmbus_device_bind_ready();
 	ukplat_spin_lock_irqsave(&device->state_lock, flags);
 	if (device->attaching || device->attached) {
 		ukplat_spin_unlock_irqrestore(&device->state_lock, flags);

@@ -64,6 +64,10 @@ struct vmbus_gpadl {
 	__u32 page_count;
 	__u64 generation;
 };
+struct vmbus_device_bind_token {
+	__u64 device_generation;
+	__u64 resource_epoch;
+};
 typedef void (*vmbus_channel_callback_t)(struct vmbus_channel *, void *);
 
 int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
@@ -71,7 +75,10 @@ int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
 int vmbus_channel_close(struct vmbus_channel *);
 __u64 vmbus_connection_fail(void);
 __u64 vmbus_connection_quiesce_epoch(void);
-int vmbus_device_bind_retry(struct vmbus_device *);
+int vmbus_device_bind_epoch(struct vmbus_device *,
+			    struct vmbus_device_bind_token *);
+int vmbus_device_bind_retry(struct vmbus_device *,
+			    const struct vmbus_device_bind_token *);
 void vmbus_device_bind_ready(void);
 int vmbus_channel_send(struct vmbus_channel *, __u16, __u16, __u64,
 		       const void *, size_t, const void *, size_t);
