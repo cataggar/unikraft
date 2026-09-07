@@ -22,6 +22,10 @@
 #include "vmbus_worker_stop.h"
 #include "vmbus_internal.h"
 
+#ifdef VMBUS_BUS_HOST_TEST
+#include <pthread.h>
+#endif
+
 #define VMBUS_REFERENCE_TICKS_PER_MS	10000ULL
 #define VMBUS_WORKER_SLEEP_NS		1000000ULL
 #define VMBUS_EVENT_LIMIT		2048U
@@ -34,6 +38,11 @@ struct vmbus_rx_entry {
 	__u32 generation;
 	__u8 len;
 	__u8 data[HYPERV_MESSAGE_PAYLOAD_SIZE];
+};
+
+struct vmbus_event_entry {
+	__u32 base;
+	__u64 pending;
 };
 
 enum vmbus_bind_state {
@@ -77,7 +86,7 @@ static struct vmbus_device_binding
 	device_bindings[CONFIG_LIBVMBUS_MAX_DEVICES];
 static struct vmbus_driver *drivers[CONFIG_LIBVMBUS_MAX_DRIVERS];
 static struct vmbus_rx_entry rx_queue[CONFIG_LIBVMBUS_RX_QUEUE];
-static __u32 event_queue[CONFIG_LIBVMBUS_RX_QUEUE];
+static struct vmbus_event_entry event_queue[CONFIG_LIBVMBUS_RX_QUEUE];
 static struct vmbus_relid_lifecycle relids[VMBUS_RELID_CAPACITY];
 struct vmbus_deferred_relid {
 	__u32 channel_id;
@@ -112,6 +121,8 @@ static struct vmbus_device_binding *bind_attempt_binding;
 static struct uk_thread *worker;
 static struct uk_thread *control_owner;
 static __spinlock worker_lock;
+static __spinlock rx_queue_lock;
+static __spinlock event_queue_lock;
 static int worker_stop;
 static int control_busy;
 static int initialized;
@@ -240,6 +251,7 @@ void hyperv_vmbus_message(const struct hyperv_message *message)
 {
 	__u32 ticket;
 	struct vmbus_rx_entry *entry;
+	unsigned long flags;
 
 	if ((!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE) &&
 	     vmbus_protocol_state() != VMBUS_STATE_UNLOADING) ||
@@ -253,8 +265,15 @@ void hyperv_vmbus_message(const struct hyperv_message *message)
 		return;
 	}
 
+	ukplat_spin_lock_irqsave(&rx_queue_lock, flags);
+	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE) &&
+	    vmbus_protocol_state() != VMBUS_STATE_UNLOADING) {
+		ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
+		return;
+	}
 	if (vmbus_queue_reserve(&rx_state, CONFIG_LIBVMBUS_RX_QUEUE,
 				&ticket)) {
+		ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
 		__atomic_add_fetch(&rx_dropped, 1, __ATOMIC_RELAXED);
 		signal_worker();
 		return;
@@ -264,25 +283,46 @@ void hyperv_vmbus_message(const struct hyperv_message *message)
 	entry->len = message->payload_size;
 	copy_bytes(entry->data, message->payload, entry->len);
 	vmbus_queue_commit(&rx_state, ticket);
+	ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
 	signal_worker();
 }
 
-static void enqueue_event(__u32 event, void *arg __unused)
+static void enqueue_event_word(__u32 base, __u64 pending)
 {
 	__u32 head;
+	unsigned long flags;
 
-	if (event >= VMBUS_EVENT_LIMIT) {
+	if (!pending || base >= VMBUS_EVENT_LIMIT ||
+	    base + 63U >= VMBUS_EVENT_LIMIT) {
 		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
+		return;
+	}
+	ukplat_spin_lock_irqsave(&event_queue_lock, flags);
+	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE)) {
+		ukplat_spin_unlock_irqrestore(&event_queue_lock, flags);
 		return;
 	}
 	head = __atomic_load_n(&event_head, __ATOMIC_RELAXED);
 	if (head - __atomic_load_n(&event_tail, __ATOMIC_ACQUIRE) >=
 	    CONFIG_LIBVMBUS_RX_QUEUE) {
+		ukplat_spin_unlock_irqrestore(&event_queue_lock, flags);
+		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
+		__atomic_store_n(&connection_failed, 1, __ATOMIC_RELEASE);
+		return;
+	}
+	event_queue[head % CONFIG_LIBVMBUS_RX_QUEUE].base = base;
+	event_queue[head % CONFIG_LIBVMBUS_RX_QUEUE].pending = pending;
+	__atomic_store_n(&event_head, head + 1, __ATOMIC_RELEASE);
+	ukplat_spin_unlock_irqrestore(&event_queue_lock, flags);
+}
+
+static void enqueue_event(__u32 event, void *arg __unused)
+{
+	if (event >= VMBUS_EVENT_LIMIT) {
 		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
 		return;
 	}
-	event_queue[head % CONFIG_LIBVMBUS_RX_QUEUE] = event;
-	__atomic_store_n(&event_head, head + 1, __ATOMIC_RELEASE);
+	enqueue_event_word(event & ~63U, 1ULL << (event & 63U));
 }
 
 void hyperv_vmbus_event(__u32 event)
@@ -299,25 +339,53 @@ void hyperv_vmbus_event(__u32 event)
 	signal_worker();
 }
 
+void hyperv_vmbus_event_word(__u32 base_event, __u64 pending)
+{
+	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE))
+		return;
+	if (vmbus_protocol_version() < VMBUS_EVENT_VERSION_WIN8) {
+		if (base_event == 0 && (pending & 1U))
+			hyperv_vmbus_event(0);
+		if (pending & ~(base_event == 0 ? 1ULL : 0ULL))
+			__atomic_add_fetch(&event_dropped, 1,
+					   __ATOMIC_RELAXED);
+		return;
+	}
+	enqueue_event_word(base_event, pending);
+	signal_worker();
+}
+
 static int dequeue_message(struct vmbus_rx_entry *entry)
 {
 	__u32 ticket;
+	unsigned long flags;
 
-	if (!vmbus_queue_take(&rx_state, &ticket))
+	ukplat_spin_lock_irqsave(&rx_queue_lock, flags);
+	if (!vmbus_queue_take(&rx_state, &ticket)) {
+		ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
 		return 0;
+	}
 	*entry = rx_queue[ticket % CONFIG_LIBVMBUS_RX_QUEUE];
+	ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
 	return 1;
 }
 
-static int dequeue_event(__u32 *event)
+static int dequeue_event(struct vmbus_event_entry *event)
 {
-	__u32 tail = __atomic_load_n(&event_tail, __ATOMIC_RELAXED);
+	__u32 tail;
+	unsigned long flags;
 
+	ukplat_spin_lock_irqsave(&event_queue_lock, flags);
+	tail = __atomic_load_n(&event_tail, __ATOMIC_RELAXED);
 	if (tail == __atomic_load_n(&event_head, __ATOMIC_ACQUIRE))
-		return 0;
+		goto empty;
 	*event = event_queue[tail % CONFIG_LIBVMBUS_RX_QUEUE];
 	__atomic_store_n(&event_tail, tail + 1, __ATOMIC_RELEASE);
+	ukplat_spin_unlock_irqrestore(&event_queue_lock, flags);
 	return 1;
+empty:
+	ukplat_spin_unlock_irqrestore(&event_queue_lock, flags);
+	return 0;
 }
 
 static __u64 post_hypercall(void *arg __unused, __u64 input_gpa)
@@ -1086,8 +1154,8 @@ static int process_messages(void)
 
 static void report_deferred_diagnostics(void)
 {
+	struct vmbus_event_entry events;
 	__u32 count;
-	__u32 event;
 
 	count = __atomic_exchange_n(&malformed_hv_messages, 0,
 				    __ATOMIC_ACQ_REL);
@@ -1101,11 +1169,19 @@ static void report_deferred_diagnostics(void)
 	if (count)
 		uk_pr_warn("VMBus: event queue dropped %u event(s)\n", count);
 	count = 0;
-	while (dequeue_event(&event))
-		vmbus_channel_event(event), count++;
+	while (dequeue_event(&events)) {
+		while (events.pending) {
+			unsigned int bit = __builtin_ctzll(events.pending);
+			__u32 event = events.base + bit;
+
+			if (event)
+				vmbus_channel_event(event);
+			events.pending &= events.pending - 1;
+			count++;
+		}
+	}
 	if (count)
-		uk_pr_debug("VMBus: deferred %u channel event(s); channel rings "
-			    "are not implemented\n", count);
+		uk_pr_debug("VMBus: deferred %u channel event(s)\n", count);
 	count = vmbus_channel_take_ignored_responses();
 	if (count)
 		uk_pr_debug("VMBus: ignored %u late/duplicate channel "
@@ -1215,10 +1291,18 @@ static int connect_protocol(void)
 	}
 	clear_devices();
 	reset_release_records();
+	{
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&rx_queue_lock, flags);
 	vmbus_queue_recover(&rx_state);
+		ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
+		ukplat_spin_lock_irqsave(&event_queue_lock, flags);
 	__atomic_store_n(&event_tail,
 			 __atomic_load_n(&event_head, __ATOMIC_ACQUIRE),
 			 __ATOMIC_RELEASE);
+		ukplat_spin_unlock_irqrestore(&event_queue_lock, flags);
+	}
 	__atomic_store_n(&connection_failed, 0, __ATOMIC_RELEASE);
 	__atomic_store_n(&rx_active, 1, __ATOMIC_RELEASE);
 
@@ -1234,7 +1318,9 @@ static int connect_protocol(void)
 	if (gpa == UK_PAGING_PADDR_INV)
 		return -EINVAL;
 	config.child_to_parent_monitor_gpa = gpa;
-	config.target_vp = 0;
+	config.target_vp = hyperv_vmbus_target_vp();
+	if (config.target_vp == UINT32_MAX)
+		return -ENODEV;
 	config.timeout_ticks =
 		(__u64)CONFIG_LIBVMBUS_VERSION_TIMEOUT_MS *
 		VMBUS_REFERENCE_TICKS_PER_MS;
@@ -1252,10 +1338,16 @@ static int connect_protocol(void)
 
 static void drain_queues(void)
 {
+	unsigned long flags;
+
+	ukplat_spin_lock_irqsave(&rx_queue_lock, flags);
 	vmbus_queue_drain(&rx_state);
+	ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
+	ukplat_spin_lock_irqsave(&event_queue_lock, flags);
 	__atomic_store_n(&event_tail,
 			 __atomic_load_n(&event_head, __ATOMIC_ACQUIRE),
 			 __ATOMIC_RELEASE);
+	ukplat_spin_unlock_irqrestore(&event_queue_lock, flags);
 }
 
 static int disconnect_locked(void)
@@ -1265,7 +1357,13 @@ static int disconnect_locked(void)
 	int rc = 0;
 
 	drain_queues();
-	__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
+	{
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&rx_queue_lock, flags);
+		__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
+		ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
+	}
 	vmbus_channel_close_all();
 	clear_devices();
 	if (!live_connection_generation)
@@ -1322,7 +1420,13 @@ static int unwind_unload(void *arg __unused)
 	int rc = 0;
 
 	drain_queues();
-	__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
+	{
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&rx_queue_lock, flags);
+		__atomic_store_n(&rx_state.lost, 0, __ATOMIC_RELEASE);
+		ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
+	}
 	vmbus_channel_close_all();
 	if (tracked &&
 	    (state == VMBUS_STATE_IDLE || state == VMBUS_STATE_DISCONNECTED)) {
@@ -1354,7 +1458,13 @@ static void unwind_reset(void *arg __unused)
 {
 	reset_release_records();
 	__atomic_store_n(&connection_failed, 0, __ATOMIC_RELEASE);
-	vmbus_queue_recover(&rx_state);
+	{
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&rx_queue_lock, flags);
+		vmbus_queue_recover(&rx_state);
+		ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
+	}
 	vmbus_protocol_reset();
 	vmbus_channel_reset_all();
 }
@@ -1904,6 +2014,8 @@ static int vmbus_bus_init(struct uk_alloc *a __unused)
 	__paddr_t gpa = uk_paging_virt_to_phys((__vaddr_t)vmbus_post_input());
 
 	ukarch_spin_init(&worker_lock);
+	ukarch_spin_init(&rx_queue_lock);
+	ukarch_spin_init(&event_queue_lock);
 	ukarch_spin_init(&deferred_release_lock);
 	ukarch_spin_init(&bind_lock);
 	if (gpa == UK_PAGING_PADDR_INV || (gpa & 0xff)) {
@@ -2316,7 +2428,90 @@ static void host_reset_state(void)
 	bind_attempt_binding = NULL;
 	ukarch_spin_init(&deferred_release_lock);
 	ukarch_spin_init(&bind_lock);
+	ukarch_spin_init(&rx_queue_lock);
+	ukarch_spin_init(&event_queue_lock);
+	ukarch_spin_init(&worker_lock);
 	vmbus_channel_reset_all();
+}
+
+struct host_irq_producer {
+	unsigned int base;
+	int events;
+};
+
+static void *host_irq_producer(void *arg)
+{
+	struct host_irq_producer *producer = arg;
+	unsigned int i;
+
+	for (i = 0; i < 4; i++) {
+		if (producer->events)
+			hyperv_vmbus_event(producer->base + i);
+		else {
+			struct hyperv_message message = { 0 };
+
+			message.message_type = VMBUS_HV_MESSAGE_TYPE;
+			message.payload_size = 8;
+			message.payload[0] = (__u8)(producer->base + i);
+			hyperv_vmbus_message(&message);
+		}
+	}
+	return NULL;
+}
+
+static int host_test_concurrent_irqs(void)
+{
+	struct host_irq_producer producers[2] = {
+		{ .base = 1, .events = 0 },
+		{ .base = 5, .events = 0 },
+	};
+	struct vmbus_rx_entry entry;
+	struct vmbus_event_entry events;
+	pthread_t threads[2];
+	unsigned int seen = 0;
+	unsigned int i;
+
+	host_reset_state();
+	__atomic_store_n(&rx_active, 1, __ATOMIC_RELEASE);
+	for (i = 0; i < 2; i++)
+		if (pthread_create(&threads[i], NULL, host_irq_producer,
+				   &producers[i]))
+			return 90;
+	for (i = 0; i < 2; i++)
+		pthread_join(threads[i], NULL);
+	while (dequeue_message(&entry))
+		seen |= 1U << entry.data[0];
+	if (seen != 0x1feU || rx_state.lost)
+		return 91;
+
+	producers[0].events = 1;
+	producers[1].events = 1;
+	seen = 0;
+	for (i = 0; i < 2; i++)
+		if (pthread_create(&threads[i], NULL, host_irq_producer,
+				   &producers[i]))
+			return 92;
+	for (i = 0; i < 2; i++)
+		pthread_join(threads[i], NULL);
+	while (dequeue_event(&events)) {
+		while (events.pending) {
+			unsigned int bit = __builtin_ctzll(events.pending);
+
+			seen |= 1U << (events.base + bit);
+			events.pending &= events.pending - 1;
+		}
+	}
+	if (seen != 0x1feU)
+		return 93;
+	for (i = 0; i <= CONFIG_LIBVMBUS_RX_QUEUE; i++)
+		hyperv_vmbus_event_word(64, 1);
+	if (!connection_failed)
+		return 94;
+	while (dequeue_event(&events))
+		;
+	connection_failed = 0;
+	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+	return 0;
 }
 
 static int host_test_nested_bind(void)
@@ -2707,6 +2902,9 @@ int vmbus_bus_host_production_test(void)
 {
 	int rc;
 
+	rc = host_test_concurrent_irqs();
+	if (rc)
+		return rc;
 	rc = host_test_nested_bind();
 	if (rc)
 		return rc;

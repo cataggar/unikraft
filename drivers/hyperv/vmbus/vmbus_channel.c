@@ -1042,9 +1042,12 @@ static int open_channel_control(struct vmbus_channel *channel,
 {
 	struct vmbus_channel_transaction *transaction;
 	__u8 message[148];
+	__u32 target_vp = hyperv_vmbus_target_vp();
 	int length;
 	int rc;
 
+	if (target_vp == UINT32_MAX)
+		return -ENODEV;
 	rc = vmbus_monotonic_id_allocate(&next_open_id, &channel->open_id);
 	if (rc)
 		return rc;
@@ -1054,7 +1057,7 @@ static int open_channel_control(struct vmbus_channel *channel,
 		return -ENOSPC;
 	length = vmbus_open_message(message, sizeof(message),
 			channel->relid, channel->open_id,
-			channel->gpadl_id, 0, channel->tx_pages,
+			channel->gpadl_id, target_vp, channel->tx_pages,
 			user_data, user_data_size);
 	rc = vmbus_channel_state_open_begin(&channel->state);
 	if (rc)

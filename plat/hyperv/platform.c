@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <hyperv/hyperv.h>
 #include <uk/efi.h>
+#include <uk/lcpu.h>
 #include <uk/paging.h>
 #include <uk/plat/common/bootinfo.h>
 #include <uk/pm.h>
@@ -12,8 +13,14 @@
 #define HYPERV_UNIKRAFT_VERSION		0x00150000U
 #define HYPERV_EFI_UNSPECIFIED_TZ	0x07ff
 #define HYPERV_NS_PER_MINUTE		60000000000LL
+#define HYPERV_SHUTDOWN_HANDOFF_TICKS	1000000ULL
 
 static struct uk_efi_runtime_services *hyperv_efi_rs;
+#if CONFIG_HAVE_SMP
+static int hyperv_shutdown_request_state;
+static enum uk_efi_reset_type hyperv_shutdown_request_type;
+static int hyperv_shutdown_request_crash;
+#endif
 
 static const char *hyperv_detect_error(int rc)
 {
@@ -34,6 +41,8 @@ static const char *hyperv_detect_error(int rc)
 		return "AccessSynicRegs privilege is absent";
 	case HYPERV_DETECT_STIMER_PRIVILEGE:
 		return "AccessSyntheticTimerRegs privilege is absent";
+	case HYPERV_DETECT_VP_INDEX_PRIVILEGE:
+		return "AccessVpIndex privilege is absent";
 	default:
 		return "unknown discovery failure";
 	}
@@ -83,9 +92,12 @@ void ukplat_efi_pre_exit(struct uk_efi_runtime_services *rs)
 	hyperv_efi_rs = rs;
 }
 
-static int hyperv_shutdown(enum uk_efi_reset_type type)
+static int hyperv_shutdown_local(enum uk_efi_reset_type type, int crash)
 {
-	hyperv_vmbus_fini();
+	int rc = hyperv_time_shutdown(crash);
+
+	if (unlikely(rc))
+		return rc;
 	hyperv_runtime_disable();
 	if (unlikely(!hyperv_efi_rs))
 		return -ENODEV;
@@ -93,19 +105,79 @@ static int hyperv_shutdown(enum uk_efi_reset_type type)
 	return -EIO;
 }
 
+#if CONFIG_HAVE_SMP
+static void __noreturn
+hyperv_shutdown_on_bsp(struct uk_lcpu_regs *regs __unused,
+		       void *arg __unused)
+{
+	while (__atomic_load_n(&hyperv_shutdown_request_state,
+			       __ATOMIC_ACQUIRE) != 1)
+		__asm__ __volatile__("pause");
+	(void)hyperv_shutdown_local(hyperv_shutdown_request_type,
+				    hyperv_shutdown_request_crash);
+	uk_lcpu_halt();
+}
+#endif
+
+static int hyperv_shutdown(enum uk_efi_reset_type type, int crash)
+{
+#if CONFIG_HAVE_SMP
+	if (!uk_lcpu_current_is_bsp()) {
+		const struct uk_lcpu_func fn = {
+			.fn = hyperv_shutdown_on_bsp,
+			.user = NULL,
+		};
+		__u64 bsp = 0;
+		unsigned int count = 1;
+		__u64 deadline;
+		int expected = 0;
+		int rc;
+
+		if (!__atomic_compare_exchange_n(&hyperv_shutdown_request_state,
+				&expected, -1, 0, __ATOMIC_ACQ_REL,
+				__ATOMIC_ACQUIRE)) {
+			uk_lcpu_halt();
+		}
+		hyperv_shutdown_request_type = type;
+		hyperv_shutdown_request_crash = crash;
+		__atomic_store_n(&hyperv_shutdown_request_state, 1,
+				 __ATOMIC_RELEASE);
+		deadline = hyperv_reference_time() +
+			HYPERV_SHUTDOWN_HANDOFF_TICKS;
+		do {
+			count = 1;
+			rc = uk_lcpu_run(&bsp, &count, &fn,
+					  UK_LCPU_RFLG_DONOTBLOCK);
+			if (!rc && count == 1)
+				break;
+			if (rc != -EAGAIN ||
+			    hyperv_reference_time() >= deadline) {
+				__atomic_store_n(
+					&hyperv_shutdown_request_state, 0,
+					__ATOMIC_RELEASE);
+				return rc ? rc : -ETIMEDOUT;
+			}
+			__asm__ __volatile__("pause");
+		} while (1);
+		uk_lcpu_halt();
+	}
+#endif
+	return hyperv_shutdown_local(type, crash);
+}
+
 static int hyperv_halt(void)
 {
-	return hyperv_shutdown(UK_EFI_RESET_SHUTDOWN);
+	return hyperv_shutdown(UK_EFI_RESET_SHUTDOWN, 0);
 }
 
 static int hyperv_restart(void)
 {
-	return hyperv_shutdown(UK_EFI_RESET_COLD);
+	return hyperv_shutdown(UK_EFI_RESET_COLD, 0);
 }
 
 static int hyperv_crash(void)
 {
-	return hyperv_shutdown(UK_EFI_RESET_SHUTDOWN);
+	return hyperv_shutdown(UK_EFI_RESET_SHUTDOWN, 1);
 }
 
 static const struct uk_pm_ops hyperv_pm_ops = {

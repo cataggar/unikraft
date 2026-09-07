@@ -19,6 +19,7 @@ const signal_events = @as(u32, 1) << 5;
 
 const msr_guest_os_id = 0x40000000;
 const msr_hypercall = 0x40000001;
+const msr_vp_index = 0x40000002;
 const msr_time_ref_count = 0x40000020;
 const msr_reference_tsc = 0x40000021;
 const msr_scontrol = 0x40000080;
@@ -93,6 +94,7 @@ pub const DetectResult = enum(c_int) {
     time_ref_privilege = 6,
     synic_privilege = 7,
     stimer_privilege = 8,
+    vp_index_privilege = 9,
 };
 
 pub const EnableResult = enum(c_int) {
@@ -164,10 +166,10 @@ export var hyperv_reference_tsc_page_storage: ReferenceTscPage align(4096) links
 
 var enabled = false;
 var guest_id_active = false;
-var synic_enabled = false;
 var reference_tsc_enabled = false;
 var discovered_features: u32 = 0;
 var discovered_privileges_high: u32 = 0;
+var discovered_max_vp_count: u32 = 0;
 
 pub fn decodeDiscovery(info: Discovery) DetectResult {
     if ((info.leaf1_ecx & cpuid_hypervisor_present) == 0)
@@ -189,6 +191,8 @@ pub fn decodeDiscovery(info: Discovery) DetectResult {
         return .synic_privilege;
     if (!features.stimer)
         return .stimer_privilege;
+    if (!features.vp_index)
+        return .vp_index_privilege;
     return .ok;
 }
 
@@ -304,7 +308,7 @@ fn maskSint(index: u32) void {
     wrmsr(msr, rdmsr(msr) | sint_masked);
 }
 
-fn disableSynicState() void {
+fn disableLocalSynicState() void {
     // Stop the producer, mask delivery, then detach control and shared pages.
     wrmsr(msr_stimer0_count, 0);
     wrmsr(msr_stimer0_config, 0);
@@ -313,11 +317,6 @@ fn disableSynicState() void {
     wrmsr(msr_scontrol, rdmsr(msr_scontrol) & ~register_enable);
     disablePageMsr(msr_simp);
     disablePageMsr(msr_siefp);
-    if (reference_tsc_enabled) {
-        disablePageMsr(msr_reference_tsc);
-        reference_tsc_enabled = false;
-    }
-    synic_enabled = false;
 }
 
 fn scaledReferenceTime(tsc: u64, scale: u64, offset: i64) ?u64 {
@@ -377,10 +376,12 @@ export fn hyperv_guest_id_encode(
 export fn hyperv_runtime_detect() callconv(.c) c_int {
     discovered_features = 0;
     discovered_privileges_high = 0;
+    discovered_max_vp_count = 0;
     const basic = cpuid(1);
     const identity = cpuid(cpuid_hv_base);
     const interface = cpuid(cpuid_hv_interface);
     const features = cpuid(cpuid_hv_features);
+    const limits = cpuid(cpuid_hv_minimum);
     const result = decodeDiscovery(.{
         .leaf1_ecx = basic.ecx,
         .max_leaf = identity.eax,
@@ -395,6 +396,7 @@ export fn hyperv_runtime_detect() callconv(.c) c_int {
     if (result == .ok) {
         discovered_features = features.eax;
         discovered_privileges_high = features.ebx;
+        discovered_max_vp_count = limits.eax;
     }
     return @intFromEnum(result);
 }
@@ -435,58 +437,97 @@ export fn hyperv_synic_enable(
     if (message_vector < 32 or timer_vector < 32 or message_vector == timer_vector)
         return @intFromEnum(SynicResult.bad_vector);
 
+    zeroSharedPage(&hyperv_simp_page_storage);
+    zeroSharedPage(&hyperv_siefp_page_storage);
+    zeroSharedPage(@ptrCast(&hyperv_reference_tsc_page_storage));
+    const ref_rc = hyperv_reference_tsc_enable(reference_tsc_gpa);
+    if (ref_rc != @intFromEnum(SynicResult.ok))
+        return ref_rc;
+    const rc = hyperv_synic_cpu_enable(
+        simp_gpa,
+        siefp_gpa,
+        message_vector,
+        timer_vector,
+    );
+    if (rc != @intFromEnum(SynicResult.ok))
+        hyperv_reference_tsc_disable();
+    return rc;
+}
+
+export fn hyperv_reference_tsc_enable(reference_tsc_gpa: u64) callconv(.c) c_int {
+    if ((reference_tsc_gpa & ~page_mask) != 0)
+        return @intFromEnum(SynicResult.bad_page);
+    const features: Features = @bitCast(discovered_features);
+    if (!features.reference_tsc)
+        return @intFromEnum(SynicResult.ok);
+    if (!programPageMsr(msr_reference_tsc, reference_tsc_gpa))
+        return @intFromEnum(SynicResult.msr_rejected);
+    @atomicStore(bool, &reference_tsc_enabled, true, .release);
+    return @intFromEnum(SynicResult.ok);
+}
+
+export fn hyperv_reference_tsc_disable() callconv(.c) void {
+    if (@atomicLoad(bool, &reference_tsc_enabled, .acquire)) {
+        disablePageMsr(msr_reference_tsc);
+        @atomicStore(bool, &reference_tsc_enabled, false, .release);
+    }
+}
+
+export fn hyperv_synic_cpu_enable(
+    simp_gpa: u64,
+    siefp_gpa: u64,
+    message_vector: u8,
+    timer_vector: u8,
+) callconv(.c) c_int {
+    if (((simp_gpa | siefp_gpa) & ~page_mask) != 0 or
+        simp_gpa == siefp_gpa)
+        return @intFromEnum(SynicResult.bad_page);
+    if (message_vector < 32 or timer_vector < 32 or message_vector == timer_vector)
+        return @intFromEnum(SynicResult.bad_vector);
     const features: Features = @bitCast(discovered_features);
     if (!features.synic or !features.stimer or !features.time_ref_count)
         return @intFromEnum(SynicResult.missing_privilege);
 
-    zeroSharedPage(&hyperv_simp_page_storage);
-    zeroSharedPage(&hyperv_siefp_page_storage);
-    zeroSharedPage(@ptrCast(&hyperv_reference_tsc_page_storage));
-
     // Publish pages and masked SINTs before enabling SynIC and unmasking them.
     if (!programPageMsr(msr_simp, simp_gpa)) {
-        disableSynicState();
+        disableLocalSynicState();
         return @intFromEnum(SynicResult.msr_rejected);
     }
     if (!programPageMsr(msr_siefp, siefp_gpa)) {
-        disableSynicState();
+        disableLocalSynicState();
         return @intFromEnum(SynicResult.msr_rejected);
-    }
-    if (features.reference_tsc) {
-        reference_tsc_enabled = true;
-        if (!programPageMsr(msr_reference_tsc, reference_tsc_gpa)) {
-            disableSynicState();
-            return @intFromEnum(SynicResult.msr_rejected);
-        }
     }
     if (!programSint(2, message_vector, true) or
         !programSint(4, timer_vector, true))
     {
-        disableSynicState();
+        disableLocalSynicState();
         return @intFromEnum(SynicResult.msr_rejected);
     }
 
     const control = rdmsr(msr_scontrol) | register_enable;
     wrmsr(msr_scontrol, control);
     if ((rdmsr(msr_scontrol) & register_enable) == 0) {
-        disableSynicState();
+        disableLocalSynicState();
         return @intFromEnum(SynicResult.msr_rejected);
     }
     if (!programSint(2, message_vector, false) or
         !programSint(4, timer_vector, false))
     {
-        disableSynicState();
+        disableLocalSynicState();
         return @intFromEnum(SynicResult.msr_rejected);
     }
 
     wrmsr(msr_stimer0_config, @as(u64, 4) << stimer_sint_shift | stimer_auto_enable);
-    synic_enabled = true;
     return @intFromEnum(SynicResult.ok);
 }
 
 export fn hyperv_synic_disable() callconv(.c) void {
-    if (synic_enabled or reference_tsc_enabled)
-        disableSynicState();
+    hyperv_synic_cpu_disable();
+    hyperv_reference_tsc_disable();
+}
+
+export fn hyperv_synic_cpu_disable() callconv(.c) void {
+    disableLocalSynicState();
 }
 
 export fn hyperv_runtime_disable() callconv(.c) void {
@@ -550,7 +591,7 @@ export fn hyperv_time_ref_count() callconv(.c) u64 {
 }
 
 export fn hyperv_reference_time() callconv(.c) u64 {
-    if (reference_tsc_enabled) {
+    if (@atomicLoad(bool, &reference_tsc_enabled, .acquire)) {
         const page: *const volatile ReferenceTscPage = &hyperv_reference_tsc_page_storage;
         if (referenceTimeFromPage(page)) |value|
             return value;
@@ -580,10 +621,10 @@ export fn hyperv_stimer0_cancel() callconv(.c) void {
     wrmsr(msr_stimer0_count, 0);
 }
 
-fn messageSlot(sint: u32) ?*volatile Message {
+fn messageSlot(page: *anyopaque, sint: u32) ?*volatile Message {
     if (sint >= sint_count)
         return null;
-    const base: [*]volatile Message = @ptrCast(&hyperv_simp_page_storage);
+    const base: [*]volatile Message = @ptrCast(@alignCast(page));
     return &base[sint];
 }
 
@@ -612,7 +653,19 @@ export fn hyperv_synic_message_take(
     sint: u32,
     output: *Message,
 ) callconv(.c) c_int {
-    const slot = messageSlot(sint) orelse
+    return hyperv_synic_message_take_page(
+        @ptrCast(&hyperv_simp_page_storage),
+        sint,
+        output,
+    );
+}
+
+export fn hyperv_synic_message_take_page(
+    page: *anyopaque,
+    sint: u32,
+    output: *Message,
+) callconv(.c) c_int {
+    const slot = messageSlot(page, sint) orelse
         return @intFromEnum(MessageResult.invalid_sint);
     const message_type_ptr: *u32 =
         @ptrCast(@volatileCast(&slot.message_type));
@@ -620,8 +673,11 @@ export fn hyperv_synic_message_take(
     if (message_type == 0)
         return @intFromEnum(MessageResult.empty);
     const payload_size = @as(*volatile u8, @ptrCast(&slot.payload_size)).*;
-    if (payload_size > max_message_payload)
+    if (payload_size > max_message_payload) {
+        const flags_ptr: *const u8 = @ptrCast(@volatileCast(&slot.flags));
+        completeMessageSlot(message_type_ptr, flags_ptr, writeSynicEom);
         return @intFromEnum(MessageResult.invalid_payload);
+    }
 
     const src: [*]const volatile u8 = @ptrCast(slot);
     const dst: [*]u8 = @ptrCast(output);
@@ -638,12 +694,34 @@ export fn hyperv_synic_event_take_word(
     word: u32,
     value: *u64,
 ) callconv(.c) c_int {
+    return hyperv_synic_event_take_word_page(
+        @ptrCast(&hyperv_siefp_page_storage),
+        sint,
+        word,
+        value,
+    );
+}
+
+export fn hyperv_synic_event_take_word_page(
+    page: *anyopaque,
+    sint: u32,
+    word: u32,
+    value: *u64,
+) callconv(.c) c_int {
     if (sint >= sint_count or word >= event_words_per_sint)
         return -1;
-    const words: [*]u64 = @ptrCast(@alignCast(&hyperv_siefp_page_storage));
+    const words: [*]u64 = @ptrCast(@alignCast(page));
     const index = @as(usize, sint) * event_words_per_sint + word;
     value.* = @atomicRmw(u64, &words[index], .Xchg, 0, .acq_rel);
     return 0;
+}
+
+export fn hyperv_vp_index() callconv(.c) u32 {
+    return @truncate(rdmsr(msr_vp_index));
+}
+
+export fn hyperv_max_vp_count() callconv(.c) u32 {
+    return discovered_max_vp_count;
 }
 
 test "Guest OS ID layout follows TLFS open-source format" {
@@ -690,6 +768,9 @@ test "CPUID discovery reports required privileges precisely" {
     changed = valid;
     changed.features_eax &= ~access_stimer_msrs;
     try std.testing.expectEqual(DetectResult.stimer_privilege, decodeDiscovery(changed));
+    changed = valid;
+    changed.features_eax &= ~access_vp_index;
+    try std.testing.expectEqual(DetectResult.vp_index_privilege, decodeDiscovery(changed));
 }
 
 test "PostMessages privilege is read from CPUID feature EBX" {
@@ -777,6 +858,54 @@ test "SIMP completion clears with a full barrier before conditional EOM" {
         fn write() void {
             calls += 1;
             observed_type = @atomicLoad(u32, message_type, .seq_cst);
+        }
+
+        test "per-vCPU SIMP and SIEFP pages remain isolated" {
+            var simp0: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            var simp1: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            const slot0: *Message = @ptrCast(@alignCast(&simp0[2 * 256]));
+            const slot1: *Message = @ptrCast(@alignCast(&simp1[2 * 256]));
+            slot0.message_type = 0x11;
+            slot0.payload_size = 1;
+            slot0.payload[0] = 0xaa;
+            slot1.message_type = 0x22;
+            slot1.payload_size = 1;
+            slot1.payload[0] = 0xbb;
+            var output = std.mem.zeroes(Message);
+            try std.testing.expectEqual(
+                @intFromEnum(MessageResult.ready),
+                hyperv_synic_message_take_page(&simp1, 2, &output),
+            );
+            try std.testing.expectEqual(@as(u32, 0x22), output.message_type);
+            try std.testing.expectEqual(@as(u8, 0xbb), output.payload[0]);
+            try std.testing.expectEqual(@as(u32, 0x11), slot0.message_type);
+
+            var events0: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            var events1: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            const words0: [*]u64 = @ptrCast(@alignCast(&events0));
+            const words1: [*]u64 = @ptrCast(@alignCast(&events1));
+            words0[2 * event_words_per_sint + 1] = 0x10;
+            words1[2 * event_words_per_sint + 1] = 0x20;
+            var value: u64 = 0;
+            try std.testing.expectEqual(
+                @as(c_int, 0),
+                hyperv_synic_event_take_word_page(&events1, 2, 1, &value),
+            );
+            try std.testing.expectEqual(@as(u64, 0x20), value);
+            try std.testing.expectEqual(@as(u64, 0x10), words0[2 * event_words_per_sint + 1]);
+        }
+
+        test "malformed SIMP payload is completed instead of wedging the slot" {
+            var simp: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            const slot: *Message = @ptrCast(@alignCast(&simp[2 * 256]));
+            slot.message_type = 0x44;
+            slot.payload_size = max_message_payload + 1;
+            var output = std.mem.zeroes(Message);
+            try std.testing.expectEqual(
+                @intFromEnum(MessageResult.invalid_payload),
+                hyperv_synic_message_take_page(&simp, 2, &output),
+            );
+            try std.testing.expectEqual(@as(u32, 0), slot.message_type);
         }
     };
 

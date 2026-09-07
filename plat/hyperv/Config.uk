@@ -2,7 +2,6 @@ menuconfig PLAT_HYPERV
 	bool "Hyper-V Generation 2 guest"
 	default n
 	depends on ARCH_X86_64
-	depends on UKPLAT_CPU_MAXCOUNT = 1
 	select OPTIMIZE_PIE
 	select LIBUKDEBUG
 	select LIBUKBOOT
@@ -30,8 +29,8 @@ menuconfig PLAT_HYPERV
 	imply LIBUKRANDOM_LCPU if LIBUKRANDOM
 	help
 		Create an x86_64 UEFI image for Hyper-V Generation 2 guests.
-		SynIC MSRs and pages are per-vCPU; SMP remains disabled until
-		per-vCPU Hyper-V startup is implemented.
+		SynIC and STimer state is initialized on each online vCPU.
+		Static per-vCPU pages are sized by UKPLAT_CPU_MAXCOUNT.
 
 if PLAT_HYPERV
 

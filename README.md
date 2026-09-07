@@ -354,8 +354,12 @@ adds `LIBUKBLKDEV`, the StorVSC C binding, and its freestanding Zig core:
 The platform captures wall-clock time from UEFI before `ExitBootServices`,
 uses the Hyper-V reference-TSC page when available (falling back to the
 partition reference counter), and uses SynIC STimer0 for one-shot scheduler
-wakeups. The initial implementation is intentionally uniprocessor because
-SynIC registers and shared pages are per-vCPU.
+wakeups. SMP images allocate Kconfig-bounded, page-aligned SIMP/SIEFP storage
+for every logical CPU and program SynIC/STimer MSRs on the CPU that owns them.
+Hyper-V VP indices are discovered from `HV_X64_MSR_VP_INDEX`; logical CPU
+indices are never used as host VP identifiers. StorVSC and NetVSC currently
+retain one primary queue. Subchannels, RSS, and multiqueue remain deferred
+until live-host measurements justify their topology and queue policy.
 
 ```shell
 zig build native-images \

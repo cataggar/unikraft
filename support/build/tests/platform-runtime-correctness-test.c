@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include <hyperv/clock.h>
+#include <hyperv/cpu_lifecycle.h>
 #include <uk/plat/common/efi_runtime.h>
 
 static void test_efi_runtime_permissions(void)
@@ -45,9 +46,42 @@ static void test_paired_wall_clock_baseline(void)
 	assert(hyperv_wall_time_ns(UINT64_MAX - 50, 10, 11) == UINT64_MAX);
 }
 
+static void test_hyperv_cpu_lifecycle(void)
+{
+	struct hyperv_cpu_state cpus[4] = { 0 };
+	uint32_t generation = 0;
+
+	assert(hyperv_cpu_state_reserve(cpus, 4, 0, 7, 64,
+				       &generation) == 0);
+	assert(cpus[0].state == HYPERV_CPU_INITIALIZING);
+	assert(hyperv_cpu_state_online(cpus, 4, 0) == 0);
+	assert(hyperv_cpu_state_reserve(cpus, 4, 0, 7, 64,
+				       &generation) == 1);
+	assert(hyperv_cpu_state_reserve(cpus, 4, 1, 7, 64,
+				       &generation) == -EEXIST);
+	assert(hyperv_cpu_state_reserve(cpus, 4, 1, 64, 64,
+				       &generation) == -ERANGE);
+	assert(hyperv_cpu_state_reserve(cpus, 4, 4, 8, 64,
+				       &generation) == -ERANGE);
+	assert(hyperv_cpu_state_reserve(cpus, 4, 1, 8, 64,
+				       &generation) == 0);
+	/* A failed local MSR/page setup rolls the reserved slot fully back. */
+	hyperv_cpu_state_release(cpus, 4, 1);
+	assert(cpus[1].state == HYPERV_CPU_OFFLINE);
+	assert(cpus[1].vp_index == UINT32_MAX);
+	generation = UINT32_MAX;
+	assert(hyperv_cpu_state_reserve(cpus, 4, 1, 9, 64,
+				       &generation) == -ENOSPC);
+	hyperv_cpu_state_release(cpus, 4, 1);
+	generation = 2;
+	assert(hyperv_cpu_state_reserve(cpus, 4, 1, 0xffff, 0,
+				       &generation) == 0);
+}
+
 int main(void)
 {
 	test_efi_runtime_permissions();
 	test_paired_wall_clock_baseline();
+	test_hyperv_cpu_lifecycle();
 	return 0;
 }

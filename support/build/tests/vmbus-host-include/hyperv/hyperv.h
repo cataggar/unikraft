@@ -17,3 +17,4 @@ static inline __u64 hyperv_reference_time(void)
 }
 static inline int hyperv_has_signal_events(void) { return 1; }
 static inline int hyperv_has_post_messages(void) { return 1; }
+static inline __u32 hyperv_vmbus_target_vp(void) { return 0; }

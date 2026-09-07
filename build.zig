@@ -1067,6 +1067,36 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     test_step.dependOn(&b.addRunArtifact(platform_correctness_tests).step);
+    const hyperv_smp_tests = b.addExecutable(.{
+        .name = "hyperv-smp-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    hyperv_smp_tests.root_module.addIncludePath(
+        b.path("support/build/tests/hyperv-smp-host-include"),
+    );
+    hyperv_smp_tests.root_module.addIncludePath(
+        b.path("plat/hyperv/include"),
+    );
+    hyperv_smp_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "plat/hyperv/time.c",
+            "support/build/tests/hyperv-smp-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DHYPERV_TIME_HOST_TEST",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+        },
+    });
+    hyperv_smp_tests.root_module.linkSystemLibrary("pthread", .{});
+    test_step.dependOn(&b.addRunArtifact(hyperv_smp_tests).step);
     const xpic_correctness_tests = b.addExecutable(.{
         .name = "xpic-runtime-correctness-test",
         .root_module = b.createModule(.{
