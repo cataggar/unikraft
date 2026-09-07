@@ -6,6 +6,7 @@
 #include "vmbus_legacy_events.h"
 #include "vmbus_channel_state.h"
 #include "vmbus_channel_args.h"
+#include "vmbus_channel_owner.h"
 #include "vmbus_event_route.h"
 #include "vmbus_page_pool.h"
 #include "vmbus_signal_policy.h"
@@ -531,6 +532,33 @@ static void test_channel_lifecycle_races(void)
 	assert(!plan.send_close && !plan.send_gpadl_teardown);
 }
 
+static void test_channel_operation_ownership(void)
+{
+	struct vmbus_channel_owner slots[2] = {
+		{ .generation = 1 },
+		{ .generation = 2 },
+	};
+	struct vmbus_channel_token outer = { 0 };
+	struct vmbus_channel_token nested = { 0 };
+
+	assert(vmbus_channel_owner_begin(&slots[0], &outer) == 0);
+	assert(vmbus_channel_owner_valid(&outer));
+	assert(!vmbus_channel_owner_revoke(&slots[0]));
+	assert(!vmbus_channel_owner_valid(&outer));
+	assert(!vmbus_channel_owner_reusable(&slots[0]));
+	/* A nested offer cannot reuse A, but may own a distinct free slot. */
+	assert(vmbus_channel_owner_begin(&slots[1], &nested) == 0);
+	assert(vmbus_channel_owner_valid(&nested));
+	assert(!vmbus_channel_owner_end(&nested));
+	assert(vmbus_channel_owner_end(&outer));
+	slots[0].cleanup_pending = 0;
+	slots[0].revoked = 0;
+	slots[0].generation = 3;
+	assert(vmbus_channel_owner_reusable(&slots[0]));
+	/* The old stack token cannot validate against the recycled generation. */
+	assert(!vmbus_channel_owner_valid(&outer));
+}
+
 static void test_ring_page_pool(void)
 {
 	unsigned char used[8] = { 0 };
@@ -611,7 +639,8 @@ static void test_legacy_event_fanout(void)
 	assert(vmbus_event_route(VMBUS_EVENT_VERSION_WIN8, 192, words, 4,
 			192, collect_legacy_event, &test) == -ERANGE);
 	assert(vmbus_event_route(VMBUS_EVENT_VERSION_WIN8, 0, words, 4,
-			192, collect_legacy_event, &test) == -ERANGE);
+			192, collect_legacy_event, &test) == 0);
+	assert(test.count == 1);
 	assert(vmbus_event_route(VMBUS_EVENT_VERSION_WIN8 - 1, 3, words, 4,
 			192, collect_legacy_event, &test) == -EINVAL);
 }
@@ -633,6 +662,7 @@ int main(void)
 	test_worker_stop_policy();
 	test_channel_transaction_pool();
 	test_channel_lifecycle_races();
+	test_channel_operation_ownership();
 	test_ring_page_pool();
 	test_open_data_boundaries();
 	test_signal_connection_policy();

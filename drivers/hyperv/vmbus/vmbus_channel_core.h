@@ -36,6 +36,7 @@ int vmbus_ring_read(__u8 *base, size_t total_size,
 		    __u8 *payload, size_t payload_capacity);
 int vmbus_ring_set_interrupt_mask(__u8 *base, size_t total_size,
 				  __u8 masked);
+__u32 vmbus_ring_unmask_and_readable(__u8 *base, size_t total_size);
 __u32 vmbus_ring_readable(__u8 *base, size_t total_size);
 int vmbus_gpadl_header(__u8 *output, size_t capacity, __u32 channel_id,
 		       __u32 gpadl_id, __u32 byte_count,

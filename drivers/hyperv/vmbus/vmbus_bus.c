@@ -308,6 +308,15 @@ static void bind_device(struct vmbus_device *dev)
 	}
 }
 
+static void retry_unbound_devices(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
+		if (devices[i].present && !devices[i].driver)
+			bind_device(&devices[i]);
+}
+
 static void remove_device(struct vmbus_device *dev)
 {
 	const struct vmbus_driver *driver;
@@ -783,6 +792,8 @@ static void vmbus_worker(void *arg __unused)
 		}
 		if (!acquire_control()) {
 			rc = process_messages();
+			if (!rc)
+				retry_unbound_devices();
 			vmbus_protocol_tick(hyperv_reference_time(), &action);
 			if (!rc)
 				rc = handle_action(&action);
