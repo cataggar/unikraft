@@ -5,11 +5,19 @@
 #include "vmbus_protocol.h"
 #include "vmbus_channel_core.h"
 
+_Static_assert(VMBUS_GPA_DIRECT_MAX_RANGES == 32,
+	       "VMBus GPA-direct range limit changed");
+_Static_assert(VMBUS_GPA_DIRECT_MAX_PFNS == 64,
+	       "VMBus GPA-direct PFN limit changed");
+
 int main(void)
 {
 	struct vmbus_action action = { 0 };
 	struct vmbus_device device = { 0 };
 	struct vmbus_packet_meta_abi packet = { 0 };
+	__typeof__(&vmbus_channel_send_ex) send_ex = NULL;
+	__typeof__(&vmbus_channel_send_gpa_direct_ex) send_gpa_ex = NULL;
 
-	return action.tx_len || device.present || packet.payload_size;
+	return action.tx_len || device.present || packet.payload_size ||
+		send_ex || send_gpa_ex;
 }

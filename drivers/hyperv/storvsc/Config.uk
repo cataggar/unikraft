@@ -1,0 +1,66 @@
+config LIBSTORVSC
+	bool "Hyper-V StorVSC synthetic block device"
+	depends on LIBVMBUS
+	depends on LIBUKBLKDEV
+	select LIBUKSCHED
+	default n
+	help
+		Expose one Hyper-V synthetic SCSI disk (LUN 0) through ukblkdev.
+		The driver intentionally supports one primary VMBus channel,
+		one device, and one request queue.
+
+if LIBSTORVSC
+
+config LIBSTORVSC_MAX_DEVICES
+	int "Maximum StorVSC devices"
+	range 1 1
+	default 1
+	help
+		StorVSC currently supports exactly one synthetic storage device.
+
+config LIBSTORVSC_MAX_QUEUES
+	int "Maximum queues per StorVSC device"
+	range 1 1
+	default 1
+	help
+		StorVSC currently supports exactly one primary-channel queue.
+
+config LIBSTORVSC_QUEUE_DEPTH
+	int "StorVSC request-context pool size"
+	range 1 64
+	default 32
+
+config LIBSTORVSC_MAX_TRANSFER_PAGES
+	int "Maximum GPA-direct pages per request"
+	range 2 64
+	default 33
+	help
+		Includes a possible partial first page. The advertised transfer
+		limit is conservatively one page smaller so any aligned ukblkdev
+		buffer offset remains representable.
+
+config LIBSTORVSC_TX_RING_PAGES
+	int "StorVSC transmit ring pages"
+	range 2 32
+	default 16
+	help
+		Includes the one-page VMBus ring header.
+
+config LIBSTORVSC_RX_RING_PAGES
+	int "StorVSC receive ring pages"
+	range 2 32
+	default 16
+	help
+		Includes the one-page VMBus ring header.
+
+config LIBSTORVSC_CONTROL_TIMEOUT_MS
+	int "VMStor initialization/reset timeout (milliseconds)"
+	range 10 30000
+	default 1000
+
+config LIBSTORVSC_REQUEST_TIMEOUT_MS
+	int "SCSI request timeout (milliseconds)"
+	range 100 120000
+	default 30000
+
+endif

@@ -1,13 +1,21 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+#ifndef __STORVSC_HOST_VMBUS_H__
+#define __STORVSC_HOST_VMBUS_H__
+#include <stddef.h>
 #include <uk/arch/types.h>
 #define VMBUS_GUID_SIZE 16U
 #define VMBUS_USER_DATA_SIZE 120U
 #define VMBUS_GPA_DIRECT_MAX_RANGES 32U
 #define VMBUS_GPA_DIRECT_MAX_PFNS 64U
-#define VMBUS_PACKET_DATA_USING_GPA_DIRECT 9
+#define VMBUS_PACKET_DATA_INBAND 6U
+#define VMBUS_PACKET_DATA_USING_GPA_DIRECT 9U
+#define VMBUS_PACKET_COMPLETION 11U
+#define VMBUS_PACKET_FLAG_REQUEST_COMPLETION 1U
 struct vmbus_guid {
 	__u8 bytes[VMBUS_GUID_SIZE];
 };
 struct vmbus_channel;
+struct vmbus_driver;
 struct vmbus_device {
 	struct vmbus_guid class_id;
 	struct vmbus_guid instance_id;
@@ -53,17 +61,11 @@ typedef void (*vmbus_channel_callback_t)(struct vmbus_channel *, void *);
 int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
 		       const void *, size_t);
 int vmbus_channel_close(struct vmbus_channel *);
-int vmbus_channel_send(struct vmbus_channel *, __u16, __u16, __u64,
-		       const void *, size_t, const void *, size_t);
 int vmbus_channel_send_ex(struct vmbus_channel *, __u16, __u16, __u64,
 			  const void *, size_t, const void *, size_t, int *);
-int vmbus_channel_send_gpa_direct(struct vmbus_channel *, __u16, __u64,
-				  const struct vmbus_gpa_range *, __u32,
-				  const void *, size_t);
 int vmbus_channel_send_gpa_direct_ex(
-				  struct vmbus_channel *, __u16, __u64,
-				  const struct vmbus_gpa_range *, __u32,
-				  const void *, size_t, int *);
+	struct vmbus_channel *, __u16, __u64,
+	const struct vmbus_gpa_range *, __u32, const void *, size_t, int *);
 int vmbus_channel_receive(struct vmbus_channel *, struct vmbus_packet *,
 			  void *, size_t, void *, size_t);
 int vmbus_channel_poll(struct vmbus_channel *);
@@ -71,3 +73,6 @@ void vmbus_channel_set_callback(struct vmbus_channel *,
 				vmbus_channel_callback_t, void *);
 int vmbus_channel_mask_interrupts(struct vmbus_channel *);
 int vmbus_channel_unmask_interrupts(struct vmbus_channel *);
+#define VMBUS_GUID_END { .bytes = { 0 } }
+#define VMBUS_DRIVER_REGISTER(driver)
+#endif

@@ -1,3 +1,4 @@
 menu "Hyper-V"
 source "$(KCONFIG_DRIV_BASE)/hyperv/vmbus/Config.uk"
+source "$(KCONFIG_DRIV_BASE)/hyperv/storvsc/Config.uk"
 endmenu
