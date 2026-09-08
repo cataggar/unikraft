@@ -120,6 +120,7 @@ class HypervAzureControllerTest(unittest.TestCase):
             "location": "westus2",
             "vm_size": "Standard_D2s_v5",
             "platform_marker": azure.PLATFORM_READY,
+            "disk_id": "/test/disk",
         }, Path("/unused/state.json"))
         run.record = mock.Mock()
         run.az = mock.Mock()
@@ -141,6 +142,24 @@ class HypervAzureControllerTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Refusing to adopt"):
             run.create_group()
         self.assertEqual(run.az.call_count, 1)
+
+    def test_standard_vm_accepts_null_profile_but_rejects_other_security_types(self):
+        for profile in (None, {"securityType": "Standard"},
+                        {"securityType": "TrustedLaunch"}, {}, "Standard"):
+            with self.subTest(profile=profile):
+                run = self.run_fixture()
+                run.az.side_effect = [None, {
+                    "id": "/test/vm", "tags": run.tags,
+                    "provisioningState": "Succeeded",
+                    "storageProfile": {"osDisk": {"managedDisk": {"id": "/test/disk"}}},
+                    "securityProfile": profile,
+                }]
+                if profile is None or profile == {"securityType": "Standard"}:
+                    run.deploy_vm()
+                    run.record.assert_called_with("vm-created", vm_id="/test/vm")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "Standard security"):
+                        run.deploy_vm()
 
     def test_unowned_group_cannot_be_deleted(self):
         run = self.run_fixture()

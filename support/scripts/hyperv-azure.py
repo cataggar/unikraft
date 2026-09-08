@@ -505,7 +505,11 @@ class AzureRun:
         attached = vm.get("storageProfile", {}).get("osDisk", {}).get("managedDisk", {}).get("id")
         if not attached or attached.lower() != self.state["disk_id"].lower():
             raise RuntimeError("VM is not attached to this run's imported disk")
-        if vm.get("securityProfile", {}).get("securityType") != "Standard":
+        # Azure represents Standard VMs with a null securityProfile.
+        security = vm.get("securityProfile")
+        if security is not None and (
+            not isinstance(security, dict) or security.get("securityType") != "Standard"
+        ):
             raise RuntimeError("VM is not using the requested Standard security type")
         self.record("vm-created", vm_id=vm["id"])
 
