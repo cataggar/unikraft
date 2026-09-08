@@ -4,6 +4,8 @@ uk_lcpu_halt_irq
 uk_lcpu_halt_irq_until
 uk_lcpu_halt
 uk_lcpu_init
+ukplat_lcpu_init_hook
+ukplat_lcpu_fini_hook
 uk_lcpu_irqs_disabled
 uk_lcpu_irqs_handle_pending
 uk_lcpu_restore_irqf

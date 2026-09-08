@@ -50,7 +50,6 @@ static __u32 hyperv_cpu_generation;
 static __u8 hyperv_message_vector;
 static __u8 hyperv_timer_vector;
 static __u32 hyperv_irq_dropped;
-static __u32 hyperv_vp_cursor;
 static __u32 hyperv_vp_refs[CONFIG_UKPLAT_CPU_MAXCOUNT];
 static int hyperv_current_cpu_index(__u32 *index);
 
@@ -107,6 +106,12 @@ void __weak hyperv_vmbus_event_word(__u32 base_event __unused,
 
 void __weak hyperv_vmbus_fini(void)
 {
+}
+
+int __weak hyperv_vmbus_shutdown(void)
+{
+	hyperv_vmbus_fini();
+	return 0;
 }
 
 static int hyperv_current_cpu_index(__u32 *index)
@@ -328,16 +333,31 @@ failed:
 	return rc;
 }
 
-static void hyperv_cpu_fini_current(void)
+static int hyperv_cpu_wait_refs(__u32 index, int bounded)
+{
+	__u64 deadline = hyperv_reference_time() +
+		HYPERV_CPU_INIT_TIMEOUT_TICKS;
+
+	while (__atomic_load_n(&hyperv_vp_refs[index], __ATOMIC_ACQUIRE)) {
+		if (!bounded || hyperv_reference_time() >= deadline)
+			return -EBUSY;
+		__asm__ __volatile__("pause");
+	}
+	return 0;
+}
+
+static int hyperv_cpu_fini_current(int host_quiesced)
 {
 	__u32 index;
+	int rc;
 
 	if (hyperv_current_cpu_index(&index) ||
 	    __atomic_load_n(&hyperv_cpus[index].state, __ATOMIC_ACQUIRE) ==
 		    HYPERV_CPU_OFFLINE)
-		return;
-	while (__atomic_load_n(&hyperv_vp_refs[index], __ATOMIC_ACQUIRE))
-		__asm__ __volatile__("pause");
+		return 0;
+	rc = hyperv_cpu_wait_refs(index, host_quiesced);
+	if (rc)
+		return rc;
 	__atomic_store_n(&hyperv_cpus[index].state, HYPERV_CPU_STOPPING,
 			 __ATOMIC_RELEASE);
 	hyperv_stimer0_cancel();
@@ -345,6 +365,7 @@ static void hyperv_cpu_fini_current(void)
 	memset(hyperv_simp_pages[index], 0, HYPERV_PAGE_SIZE);
 	memset(hyperv_siefp_pages[index], 0, HYPERV_PAGE_SIZE);
 	hyperv_cpu_release(index);
+	return 0;
 }
 
 int ukplat_lcpu_init_hook(void)
@@ -401,7 +422,7 @@ int ukplat_lcpu_startup_hook(void)
 
 void ukplat_lcpu_fini_hook(void)
 {
-	hyperv_cpu_fini_current();
+	(void)hyperv_cpu_fini_current(0);
 }
 
 /* Called after the interrupt controller is initialized, with IRQs disabled. */
@@ -424,7 +445,6 @@ void ukplat_time_init(void)
 		hyperv_cpus[i].state = HYPERV_CPU_OFFLINE;
 		hyperv_vp_refs[i] = 0;
 	}
-	hyperv_vp_cursor = 0;
 	hyperv_shutdown_first_error = 0;
 	rc = uk_intctlr_irq_alloc(hyperv_irqs, 2);
 	if (unlikely(rc))
@@ -495,9 +515,11 @@ __nsec ukplat_wall_clock(void)
 #if CONFIG_HAVE_SMP
 static void __noreturn
 hyperv_cpu_remote_fini(struct uk_lcpu_regs *regs __unused,
-		       void *arg __unused)
+		       void *arg)
 {
-	hyperv_cpu_fini_current();
+	int host_quiesced = (int)(__uptr)arg;
+
+	(void)hyperv_cpu_fini_current(host_quiesced);
 	uk_lcpu_halt();
 }
 #endif
@@ -526,7 +548,7 @@ static int hyperv_cpu_wait_initializing(void)
 	}
 }
 
-static int hyperv_cpu_fini_others(void)
+static int hyperv_cpu_fini_others(int host_quiesced)
 {
 	int rc = hyperv_cpu_wait_initializing();
 
@@ -535,7 +557,7 @@ static int hyperv_cpu_fini_others(void)
 #if CONFIG_HAVE_SMP
 	const struct uk_lcpu_func fn = {
 		.fn = hyperv_cpu_remote_fini,
-		.user = NULL,
+		.user = (void *)(__uptr)!!host_quiesced,
 	};
 	__u64 indices[CONFIG_UKPLAT_CPU_MAXCOUNT];
 	unsigned int count = 0;
@@ -580,7 +602,7 @@ static int hyperv_cpu_fini_others(void)
 	return 0;
 }
 
-int hyperv_time_shutdown(int crash)
+int hyperv_time_shutdown(int crash, int host_quiesced)
 {
 	int state = __atomic_load_n(&hyperv_time_initialized,
 				    __ATOMIC_ACQUIRE);
@@ -600,17 +622,23 @@ int hyperv_time_shutdown(int crash)
 			uk_lcpu_halt();
 		return -EINPROGRESS;
 	}
-	hyperv_vmbus_fini();
-	if (!crash) {
-		rc = hyperv_cpu_fini_others();
-		if (rc && !hyperv_shutdown_first_error)
-			hyperv_shutdown_first_error = rc;
-	}
-	hyperv_cpu_fini_current();
-	hyperv_reference_tsc_disable();
+	rc = hyperv_cpu_fini_others(host_quiesced);
+	if (rc && !hyperv_shutdown_first_error)
+		hyperv_shutdown_first_error = rc;
+	rc = hyperv_cpu_fini_current(host_quiesced);
+	if (rc && !hyperv_shutdown_first_error)
+		hyperv_shutdown_first_error = rc;
+	if (!rc && host_quiesced)
+		hyperv_reference_tsc_disable();
 	if (crash) {
+		__atomic_store_n(&hyperv_time_initialized, rc ?
+				 HYPERV_TIME_QUIESCED : HYPERV_TIME_OFFLINE,
+				 __ATOMIC_RELEASE);
+		return 0;
+	}
+	if (!host_quiesced || hyperv_shutdown_first_error) {
 		__atomic_store_n(&hyperv_time_initialized,
-				 HYPERV_TIME_OFFLINE, __ATOMIC_RELEASE);
+				 HYPERV_TIME_QUIESCED, __ATOMIC_RELEASE);
 		return 0;
 	}
 	{
@@ -637,7 +665,9 @@ int hyperv_time_shutdown_error(void)
 
 void ukplat_time_fini(void)
 {
-	(void)hyperv_time_shutdown(0);
+	int rc = hyperv_vmbus_shutdown();
+
+	(void)hyperv_time_shutdown(0, !rc);
 }
 
 __u32 ukplat_time_get_irq(void)
@@ -649,20 +679,13 @@ __u32 ukplat_time_get_irq(void)
 int hyperv_vmbus_target_acquire(__u32 *vp_index, __u32 *generation)
 {
 	unsigned long flags;
-	unsigned int start;
-	unsigned int offset;
+	unsigned int index = 0;
 
 	if (!vp_index || !generation)
 		return -EINVAL;
 	ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
-	start = hyperv_vp_cursor++ % CONFIG_UKPLAT_CPU_MAXCOUNT;
-	for (offset = 0; offset < CONFIG_UKPLAT_CPU_MAXCOUNT; offset++) {
-		unsigned int index =
-			(start + offset) % CONFIG_UKPLAT_CPU_MAXCOUNT;
-
-		if (__atomic_load_n(&hyperv_cpus[index].state,
-				    __ATOMIC_ACQUIRE) != HYPERV_CPU_ONLINE)
-			continue;
+	if (__atomic_load_n(&hyperv_cpus[index].state, __ATOMIC_ACQUIRE) ==
+	    HYPERV_CPU_ONLINE) {
 		hyperv_vp_refs[index]++;
 		*vp_index = hyperv_cpus[index].vp_index;
 		*generation = hyperv_cpus[index].generation;

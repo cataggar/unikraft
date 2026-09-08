@@ -3,3 +3,4 @@ uk_version
 uk_boot_shutdown_req
 uk_boot_early_init
 uk_boot_entry
+ukplat_lcpu_startup_hook

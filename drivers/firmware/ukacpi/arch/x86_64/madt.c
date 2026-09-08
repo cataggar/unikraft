@@ -14,6 +14,7 @@
 #include <uk/pcpuvar.h>
 #include <uk/print.h>
 #include <uk/prio.h>
+#include <errno.h>
 
 static unsigned int acpi_cpu_count = 1;
 
@@ -81,15 +82,18 @@ int uk_acpi_madt_fill_cpu_idmap(void)
 			continue;
 		}
 
+		/* Ignore cores that exceed max configured value */
+		if (unlikely(idx >= CONFIG_UKPLAT_CPU_MAXCOUNT)) {
+			uk_pr_warn("Maximum number of cores exceeded.\n");
+			continue;
+		}
+		for (__u32 prior = 0; prior < idx; prior++)
+			if (uk_pcpuvar_lval(prior, uk_pcpuvar_cpu_id) ==
+			    cpu_id)
+				return -EINVAL;
 		uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id) = cpu_id;
 		uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_idx) = idx;
 		idx++;
-
-		/* Ignore cores that exceed max configured value */
-		if (unlikely(idx == CONFIG_UKPLAT_CPU_MAXCOUNT)) {
-			uk_pr_warn("Maximum number of cores exceeded.\n");
-			break;
-		}
 	}
 	UK_ASSERT(bsp_found);
 	acpi_cpu_count = idx;

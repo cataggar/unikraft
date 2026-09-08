@@ -94,15 +94,21 @@ void ukplat_efi_pre_exit(struct uk_efi_runtime_services *rs)
 
 static int hyperv_shutdown_local(enum uk_efi_reset_type type, int crash)
 {
-	int rc = hyperv_time_shutdown(crash);
+	int vmbus_rc = hyperv_vmbus_shutdown();
+	int rc = hyperv_time_shutdown(crash, !vmbus_rc);
 
 	if (unlikely(rc))
 		return rc;
+	if (vmbus_rc)
+		uk_pr_warn("Hyper-V: VMBus teardown incomplete (%d); "
+			   "shared state remains quarantined until reset\n",
+			   vmbus_rc);
 	rc = hyperv_time_shutdown_error();
 	if (rc)
 		uk_pr_warn("Hyper-V: CPU teardown completed with error %d; "
 			   "forcing firmware reset\n", rc);
-	hyperv_runtime_disable();
+	if (!vmbus_rc && !rc)
+		hyperv_runtime_disable();
 	if (unlikely(!hyperv_efi_rs))
 		return -ENODEV;
 	hyperv_efi_rs->reset_system(type, UK_EFI_SUCCESS, 0, NULL);
@@ -123,6 +129,9 @@ hyperv_shutdown_on_bsp(struct uk_lcpu_regs *regs __unused,
 				   hyperv_shutdown_request_crash);
 	__atomic_store_n(&hyperv_shutdown_request_state,
 			 rc ? rc : 2, __ATOMIC_RELEASE);
+	/* Firmware reset failure is terminal after shared-state teardown. */
+	if (rc == -ENODEV || rc == -EIO)
+		uk_lcpu_halt();
 }
 #endif
 
