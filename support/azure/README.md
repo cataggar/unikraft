@@ -137,6 +137,12 @@ x86-only hosted IRQ, driver, and SMP executables are deferred to the x86-64 CI
 job. It does not reinterpret an architecture skip, missing local KVM, or
 missing Hyper-V devices as a boot or I/O pass.
 
+The production-backed VMBus control, channel, and disconnect fixtures also run
+on non-x86 hosts. Use `zig build test-vmbus-lifecycle -j2` for that focused
+subset, including teardown quarantine, callback lifetime, resource pressure,
+and repeated reconnect/rescind cases. Hosted lifecycle coverage is not a
+scheduled SMP workload or real-host reconnect result.
+
 `state.json` retains `local_platform_boot_modes` for the raw and fixed-VHD
 x2APIC/legacy-APIC boots, while `image_sha256` remains the deployment identity.
 A later trusted `workflow_dispatch` stage should consume this prepared VHD and

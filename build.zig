@@ -831,7 +831,8 @@ pub fn build(b: *std.Build) void {
         .file = b.path("support/build/tests/vmbus-control-test.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
-    test_step.dependOn(&b.addRunArtifact(vmbus_control_tests).step);
+    const run_vmbus_control_tests = b.addRunArtifact(vmbus_control_tests);
+    test_step.dependOn(&run_vmbus_control_tests.step);
     const vmbus_protocol_host_object = b.addObject(.{
         .name = "vmbus-protocol-host",
         .root_module = b.createModule(.{
@@ -877,7 +878,8 @@ pub fn build(b: *std.Build) void {
     });
     vmbus_production_tests.root_module.linkSystemLibrary("pthread", .{});
     vmbus_production_tests.link_gc_sections = true;
-    test_step.dependOn(&b.addRunArtifact(vmbus_production_tests).step);
+    const run_vmbus_production_tests = b.addRunArtifact(vmbus_production_tests);
+    test_step.dependOn(&run_vmbus_production_tests.step);
     const vmbus_disconnect_tests = b.addExecutable(.{
         .name = "vmbus-disconnect-production-test",
         .root_module = b.createModule(.{
@@ -921,7 +923,8 @@ pub fn build(b: *std.Build) void {
     );
     vmbus_disconnect_tests.root_module.linkSystemLibrary("pthread", .{});
     vmbus_disconnect_tests.link_gc_sections = true;
-    test_step.dependOn(&b.addRunArtifact(vmbus_disconnect_tests).step);
+    const run_vmbus_disconnect_tests = b.addRunArtifact(vmbus_disconnect_tests);
+    test_step.dependOn(&run_vmbus_disconnect_tests.step);
     const storvsc_core_host_object = b.addObject(.{
         .name = "storvsc-core-host",
         .root_module = b.createModule(.{
@@ -1121,12 +1124,17 @@ pub fn build(b: *std.Build) void {
     });
     hyperv_smp_tests.root_module.linkSystemLibrary("pthread", .{});
     test_step.dependOn(&b.addRunArtifact(hyperv_smp_tests).step);
+    const vmbus_lifecycle_tests = b.step(
+        "test-vmbus-lifecycle",
+        "Run hosted VMBus control, channel, and disconnect lifecycle fixtures",
+    );
+    vmbus_lifecycle_tests.dependOn(&run_vmbus_control_tests.step);
+    vmbus_lifecycle_tests.dependOn(&run_vmbus_production_tests.step);
+    vmbus_lifecycle_tests.dependOn(&run_vmbus_disconnect_tests.step);
     const hyperv_irq_tests = b.step("test-hyperv-irq", "Run Hyper-V IRQ-path hosted correctness tests");
     hyperv_irq_tests.dependOn(&b.addRunArtifact(hyperv_runtime_tests).step);
     hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);
-    hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_control_tests).step);
-    hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_production_tests).step);
-    hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_disconnect_tests).step);
+    hyperv_irq_tests.dependOn(vmbus_lifecycle_tests);
     hyperv_irq_tests.dependOn(&b.addRunArtifact(hyperv_smp_tests).step);
     hyperv_irq_tests.dependOn(&verify_hyperv_runtime.step);
     hyperv_irq_tests.dependOn(&verify_vmbus_protocol.step);
@@ -1174,6 +1182,7 @@ pub fn build(b: *std.Build) void {
         "test-hyperv-regression",
         "Run focused Hyper-V protocol, driver, controller, and IRQ regressions",
     );
+    hyperv_regression_tests.dependOn(vmbus_lifecycle_tests);
     if (builtin.cpu.arch == .x86_64) {
         hyperv_regression_tests.dependOn(hyperv_irq_tests);
         hyperv_regression_tests.dependOn(
@@ -1185,9 +1194,6 @@ pub fn build(b: *std.Build) void {
     } else {
         hyperv_regression_tests.dependOn(
             &b.addRunArtifact(vmbus_protocol_tests).step,
-        );
-        hyperv_regression_tests.dependOn(
-            &b.addRunArtifact(vmbus_control_tests).step,
         );
         hyperv_regression_tests.dependOn(&verify_hyperv_runtime.step);
         hyperv_regression_tests.dependOn(&verify_vmbus_protocol.step);
