@@ -1047,6 +1047,27 @@ pub fn build(b: *std.Build) void {
     netvsc_production_tests.root_module.addObject(netvsc_binding_protocol);
     netvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
     test_step.dependOn(&b.addRunArtifact(netvsc_production_tests).step);
+    const hyperv_acceptance_protocol_tests = b.addExecutable(.{
+        .name = "hyperv-acceptance-protocol-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    hyperv_acceptance_protocol_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
+    );
+    hyperv_acceptance_protocol_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/build/tests/hyperv-acceptance-protocol-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    test_step.dependOn(
+        &b.addRunArtifact(hyperv_acceptance_protocol_tests).step,
+    );
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",
         .root_module = b.createModule(.{
