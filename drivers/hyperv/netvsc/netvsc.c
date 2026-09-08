@@ -295,6 +295,35 @@ static __u32 read_le32(const __u8 *data)
 		((__u32)data[2] << 16) | ((__u32)data[3] << 24);
 }
 
+static __u32 __unused netvsc_diagnostic_word(const __u8 *data, size_t length,
+					     size_t offset)
+{
+	return offset <= length && length - offset >= sizeof(__u32) ?
+		read_le32(data + offset) : UINT32_MAX;
+}
+
+static void __unused netvsc_log_nvs_parse(const char *stage __unused,
+					  int rc __unused,
+					  const __u8 *response __unused,
+					  size_t response_length __unused)
+{
+	uk_pr_err("NetVSC: %s parse failed (%d), length %zu words "
+		  "%08x/%08x/%08x/%08x\n", stage, rc, response_length,
+		  netvsc_diagnostic_word(response, response_length, 0),
+		  netvsc_diagnostic_word(response, response_length, 4),
+		  netvsc_diagnostic_word(response, response_length, 8),
+		  netvsc_diagnostic_word(response, response_length, 12));
+}
+
+static void __unused netvsc_log_query_failure(__u32 oid __unused,
+					      int rc __unused,
+					      size_t length __unused,
+					      size_t expected __unused)
+{
+	uk_pr_err("NetVSC: RNDIS query OID %08x failed (%d), "
+		  "length %zu expected %zu\n", oid, rc, length, expected);
+}
+
 static void write_le32(__u8 *data, __u32 value)
 {
 	data[0] = (__u8)value;
@@ -1010,11 +1039,20 @@ static int netvsc_rndis_initialize_device(struct netvsc_device *device)
 		return -EINVAL;
 	}
 	control->request_length = (__u32)length;
-	if (netvsc_rndis_execute(device, control, &completion, NULL, NULL))
+	rc = netvsc_rndis_execute(device, control, &completion, NULL, NULL);
+	if (rc) {
+		uk_pr_err("NetVSC: RNDIS initialize exchange failed (%d)\n",
+			  rc);
 		return -EIO;
+	}
 	if (completion.max_transfer_size < NETVSC_RNDIS_HEADER_SIZE +
-		    NETVSC_MIN_FRAME)
+		    NETVSC_MIN_FRAME) {
+		uk_pr_err("NetVSC: RNDIS initialize returned transfer size %u "
+			  "(packets %u alignment %u)\n",
+			  completion.max_transfer_size, completion.max_packets,
+			  completion.alignment);
 		return -EPROTO;
+	}
 	device->rndis_initialized = 1;
 	return 0;
 }
@@ -1229,16 +1267,43 @@ static int netvsc_negotiate_nvs(struct netvsc_device *device)
 			return -EINVAL;
 		rc = netvsc_nvs_exchange(device, request, (size_t)length,
 				2, response, &response_length);
-		if (rc)
+		if (rc) {
+			uk_pr_err("NetVSC: channel %u NVS init 0x%x exchange "
+				  "failed (%d)\n",
+				  device->vmbus_device->channel_id, version, rc);
 			return rc;
+		}
 		rc = netvsc_nvs_parse_init_complete(response,
 				response_length, version, &complete);
-		if (rc == NETVSC_PROTOCOL_VERSION_UNSUPPORTED)
+		if (rc == NETVSC_PROTOCOL_VERSION_UNSUPPORTED) {
+			uk_pr_info("NetVSC: channel %u NVS init 0x%x rejected "
+				   "length %zu words %08x/%08x/%08x/%08x\n",
+				   device->vmbus_device->channel_id, version,
+				   response_length,
+				   netvsc_diagnostic_word(response,
+							  response_length, 0),
+				   netvsc_diagnostic_word(response,
+							  response_length, 4),
+				   netvsc_diagnostic_word(response,
+							  response_length, 8),
+				   netvsc_diagnostic_word(response,
+							  response_length, 12));
 			continue;
-		if (rc)
+		}
+		if (rc) {
+			uk_pr_err("NetVSC: channel %u NVS init 0x%x invalid "
+				  "response\n",
+				  device->vmbus_device->channel_id, version);
+			netvsc_log_nvs_parse("NVS init", rc, response,
+					     response_length);
 			return -EPROTO;
+		}
 		device->nvs_version = version;
 		device->ndis_version = netvsc_nvs_ndis_version(version);
+		uk_pr_info("NetVSC: channel %u negotiated NVS 0x%x, "
+			   "NDIS %u.%u\n", device->vmbus_device->channel_id,
+			   version, device->ndis_version >> 16,
+			   device->ndis_version & 0xffff);
 		return device->ndis_version ? 0 : -EPROTO;
 	}
 	return -ENODEV;
@@ -1274,8 +1339,11 @@ static int netvsc_connect_receive_buffer(struct netvsc_device *device)
 			device->receive_sections,
 			NETVSC_NVS_MAX_SECTIONS,
 			&device->receive_section_count);
-	if (rc)
+	if (rc) {
+		netvsc_log_nvs_parse("receive-buffer response", rc, response,
+				     response_length);
 		return -EPROTO;
+	}
 	device->receive_connected = 1;
 	return 0;
 }
@@ -1304,8 +1372,11 @@ static int netvsc_connect_send_buffer(struct netvsc_device *device)
 	rc = netvsc_nvs_parse_send_buffer_complete(response,
 			response_length, (__u32)NETVSC_SEND_BUFFER_SIZE,
 			&complete);
-	if (rc)
+	if (rc) {
+		netvsc_log_nvs_parse("send-buffer response", rc, response,
+				     response_length);
 		return -EPROTO;
+	}
 	device->send_section_size = complete.section_size;
 	device->send_section_count = complete.section_count;
 	if (device->send_section_count > NETVSC_SECTION_LIMIT)
@@ -1363,8 +1434,12 @@ static int netvsc_query_device(struct netvsc_device *device)
 	rc = netvsc_rndis_query(device,
 			NETVSC_OID_802_3_PERMANENT_ADDRESS,
 			address, &length);
-	if (rc || length != sizeof(address) || !netvsc_mac_valid(address))
+	if (rc || length != sizeof(address) || !netvsc_mac_valid(address)) {
+		netvsc_log_query_failure(
+			NETVSC_OID_802_3_PERMANENT_ADDRESS, rc, length,
+			sizeof(address));
 		return -EPROTO;
+	}
 	copy_bytes(device->permanent_address.addr_bytes, address,
 		   sizeof(address));
 
@@ -1380,20 +1455,33 @@ static int netvsc_query_device(struct netvsc_device *device)
 	length = sizeof(scalar);
 	rc = netvsc_rndis_query(device, NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE,
 			scalar, &length);
-	if (rc || length != sizeof(scalar))
+	if (rc || length != sizeof(scalar)) {
+		netvsc_log_query_failure(NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE,
+					 rc, length, sizeof(scalar));
 		return -EPROTO;
+	}
 	value = read_le32(scalar);
-	if (value < 68 || value > UINT16_MAX)
+	if (value < 68 || value > UINT16_MAX) {
+		uk_pr_err("NetVSC: RNDIS query OID %08x returned invalid "
+			  "value %u\n", NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE,
+			  value);
 		return -EPROTO;
+	}
 	length = sizeof(scalar);
 	rc = netvsc_rndis_query(device, NETVSC_OID_GEN_MAXIMUM_TOTAL_SIZE,
 			scalar, &length);
-	if (rc || length != sizeof(scalar))
+	if (rc || length != sizeof(scalar)) {
+		netvsc_log_query_failure(NETVSC_OID_GEN_MAXIMUM_TOTAL_SIZE,
+					 rc, length, sizeof(scalar));
 		return -EPROTO;
+	}
 	total_size = read_le32(scalar);
 	if (total_size < value ||
-	    total_size - value < NETVSC_ETH_HEADER)
+	    total_size - value < NETVSC_ETH_HEADER) {
+		uk_pr_err("NetVSC: RNDIS frame/total sizes invalid: %u/%u\n",
+			  value, total_size);
 		return -EPROTO;
+	}
 	device->max_mtu = (__u16)value;
 	if (device->mtu > device->max_mtu)
 		device->mtu = device->max_mtu;
@@ -1402,11 +1490,18 @@ static int netvsc_query_device(struct netvsc_device *device)
 	rc = netvsc_rndis_query(device,
 			NETVSC_OID_GEN_MEDIA_CONNECT_STATUS,
 			scalar, &length);
-	if (rc || length != sizeof(scalar))
+	if (rc || length != sizeof(scalar)) {
+		netvsc_log_query_failure(NETVSC_OID_GEN_MEDIA_CONNECT_STATUS,
+					 rc, length, sizeof(scalar));
 		return -EPROTO;
+	}
 	value = read_le32(scalar);
-	if (value > 1)
+	if (value > 1) {
+		uk_pr_err("NetVSC: RNDIS query OID %08x returned invalid "
+			  "value %u\n", NETVSC_OID_GEN_MEDIA_CONNECT_STATUS,
+			  value);
 		return -EPROTO;
+	}
 	__atomic_store_n(&device->link_up, value == 0, __ATOMIC_RELEASE);
 	return netvsc_rndis_keepalive_device(device);
 }
@@ -1459,9 +1554,15 @@ static void netvsc_complete_nvs(struct netvsc_device *device,
 	if (netvsc_nvs_message_type(payload, payload_length,
 				    &message_type) ||
 	    message_type != wait->expected_type) {
+		__u32 expected_type __unused = wait->expected_type;
+
 		wait->error = -EPROTO;
 		wait->done = 1;
 		ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
+		uk_pr_err("NetVSC: NVS response type mismatch expected %u "
+			  "actual %u length %zu transaction %#llx\n",
+			  expected_type, message_type, payload_length,
+			  (unsigned long long)packet->transaction_id);
 		return;
 	}
 	copy_bytes(wait->response, payload, payload_length);
@@ -1524,6 +1625,12 @@ static int netvsc_complete_control_tx(struct netvsc_device *device,
 		break;
 	}
 	ukplat_spin_unlock_irqrestore(&device->control_lock, flags);
+	if (found && parse_result)
+		uk_pr_err("NetVSC: NVS RNDIS acknowledgement parse failed "
+			  "(%d), length %zu words %08x/%08x\n",
+			  parse_result, payload_length,
+			  netvsc_diagnostic_word(payload, payload_length, 0),
+			  netvsc_diagnostic_word(payload, payload_length, 4));
 	netvsc_send_section_release(device, section);
 	netvsc_control_finish_release(device, &release);
 	return found;
@@ -1714,6 +1821,23 @@ static void netvsc_handle_rndis_completion(struct netvsc_device *device,
 
 	parse_result = netvsc_rndis_parse_completion(message, message_length,
 			expected, request_id, &completion);
+	if (parse_result)
+		uk_pr_err("NetVSC: RNDIS completion parse failed (%d), "
+			  "expected %08x request %u length %zu words "
+			  "%08x/%08x/%08x/%08x/%08x/%08x/%08x/%08x/"
+			  "%08x/%08x/%08x\n",
+			  parse_result, expected, request_id, message_length,
+			  netvsc_diagnostic_word(message, message_length, 0),
+			  netvsc_diagnostic_word(message, message_length, 4),
+			  netvsc_diagnostic_word(message, message_length, 8),
+			  netvsc_diagnostic_word(message, message_length, 12),
+			  netvsc_diagnostic_word(message, message_length, 16),
+			  netvsc_diagnostic_word(message, message_length, 20),
+			  netvsc_diagnostic_word(message, message_length, 24),
+			  netvsc_diagnostic_word(message, message_length, 28),
+			  netvsc_diagnostic_word(message, message_length, 32),
+			  netvsc_diagnostic_word(message, message_length, 36),
+			  netvsc_diagnostic_word(message, message_length, 40));
 	ukplat_spin_lock_irqsave(&device->control_lock, flags);
 	if (device->controls[i].state == NETVSC_CONTROL_FREE ||
 	    device->controls[i].state == NETVSC_CONTROL_FINALIZING ||
@@ -2946,6 +3070,7 @@ static int netvsc_attach_host(struct netvsc_device *device,
 {
 	struct vmbus_device_bind_token bind_token;
 	struct uk_alloc *allocator;
+	const char *stage __unused = "channel-open";
 	unsigned long flags;
 	int release_waiting = 0;
 	int rc;
@@ -3007,26 +3132,33 @@ static int netvsc_attach_host(struct netvsc_device *device,
 	}
 	vmbus_channel_set_callback(device->channel,
 				   netvsc_channel_callback, device);
+	stage = "nvs-negotiate";
 	rc = netvsc_negotiate_nvs(device);
 	if (rc)
 		goto failed;
+	stage = "ndis-setup";
 	rc = netvsc_send_ndis_setup(device);
 	if (rc)
 		goto failed;
+	stage = "receive-buffer";
 	rc = netvsc_connect_receive_buffer(device);
 	if (rc)
 		goto failed;
+	stage = "send-buffer";
 	rc = netvsc_connect_send_buffer(device);
 	if (rc)
 		goto failed;
+	stage = "rndis-initialize";
 	rc = netvsc_rndis_initialize_device(device);
 	if (rc)
 		goto failed;
+	stage = "rndis-query";
 	rc = netvsc_query_device(device);
 	if (rc)
 		goto failed;
 
 	if (!device->registered) {
+		stage = "uknetdev-register";
 		allocator = uk_alloc_get_default();
 		if (!allocator) {
 			rc = -ENOMEM;
@@ -3042,6 +3174,7 @@ static int netvsc_attach_host(struct netvsc_device *device,
 		device->registered = 1;
 	}
 	if (device->running) {
+		stage = "packet-filter";
 		rc = netvsc_set_packet_filter(device,
 					      netvsc_packet_filter(device));
 		if (rc)
@@ -3064,6 +3197,10 @@ static int netvsc_attach_host(struct netvsc_device *device,
 	return 0;
 
 failed:
+	uk_pr_err("NetVSC: channel %u attach stage %s failed (%d), "
+		  "NVS 0x%x NDIS %u.%u\n", vmbus_device->channel_id, stage,
+		  rc, device->nvs_version, device->ndis_version >> 16,
+		  device->ndis_version & 0xffff);
 	netvsc_detach_host(device, 0);
 	return rc;
 }
