@@ -82,7 +82,6 @@ def main():
             "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",
             "-drive", "format=raw,file=fat:rw:esp",
             "-device", "vmbus-bridge,irq=15",
-            "-device", "hv-balloon",
             "-display", "none", "-serial", "stdio",
             "-monitor", "none", "-no-reboot", "-nic", "none",
         ]

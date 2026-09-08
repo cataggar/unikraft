@@ -56,7 +56,7 @@ Azure account identifiers or credential-bearing diagnostics.
   [`2db68ca0c3ab12155012a823c3fb8d7aba1cb544`][miz-revision].
   Generic `miz check`/`info` do not validate the embedded EFI payload, and
   `miz azure fixup` can modify an image; neither substitutes for this gate.
-- QEMU with KVM, `vmbus-bridge`, and `hv-balloon`, plus x86-64 OVMF code and
+- QEMU with KVM and `vmbus-bridge`, plus x86-64 OVMF code and
   variable-store files.
 - For `run` only: an authenticated Azure CLI public-cloud subscription with
   Compute/Network already registered, Compute API `2025-11-01`, and available
@@ -107,6 +107,9 @@ hypercall/SynIC initialization and the exact application marker without a
 crash. QEMU's missing storage/network endpoints may produce the probe's
 `UNAVAILABLE` result; that is platform-only local evidence and never an I/O
 success.
+The local platform fixture does not attach a balloon device: balloon support
+is optional in QEMU builds and is not a storage or network acceptance endpoint.
+VMBus channel and device traffic remain separate hosted and real-host gates.
 
 The private directory retains the EFI payload, raw disk, VHD, their fingerprints,
 the `miz` executable fingerprint and packaging report, and all four serial logs

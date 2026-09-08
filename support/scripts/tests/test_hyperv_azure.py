@@ -162,6 +162,9 @@ class HypervAzureLocalBootTest(unittest.TestCase):
             self.assertIn("x2apic=off", cpus[1])
             self.assertNotIn("x2apic=off", cpus[2])
             self.assertIn("x2apic=off", cpus[3])
+            for command in commands:
+                self.assertIn("vmbus-bridge,irq=15", command)
+                self.assertNotIn("hv-balloon", command)
             for image_format in ("raw", "vpc"):
                 for mode in ("x2apic", "legacy-apic"):
                     self.assertTrue(

@@ -249,7 +249,7 @@ def local_disk_boot(image, image_format, directory, ovmf_code, ovmf_vars,
             "-drive", "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
             "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",
             "-drive", f"if=virtio,format={image_format},readonly=on,file=disk.img",
-            "-device", "vmbus-bridge,irq=15", "-device", "hv-balloon",
+            "-device", "vmbus-bridge,irq=15",
             "-display", "none", "-serial", "stdio", "-monitor", "none",
             "-no-reboot", "-nic", "none",
         ]
