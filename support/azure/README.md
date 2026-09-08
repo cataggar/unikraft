@@ -94,10 +94,23 @@ fresh state directory for another attempt.
 
 ## Real device acceptance
 
-For the Hyper-V acceptance probe, omit `prepare --expect` and `run --stage`;
-their defaults require the probe's full I/O contract. Success requires these
-exact serial lines, with the device results between platform readiness and the
-final marker:
+Build the [Hyper-V acceptance probe](../apps/hyperv-acceptance/README.md), then
+prepare it in a fresh directory. Omit `prepare --expect` and `run --stage`;
+their defaults require the probe's full I/O contract:
+
+```shell
+EFI="$PWD/support/apps/hyperv-acceptance/build/helloworld_hyperv-x86_64-efi-netvsc"
+STATE="$PWD/.d/azure/device-probe"
+
+python3 support/scripts/hyperv-azure.py prepare \
+  --efi "$EFI" --miz "$MIZ" --state-dir "$STATE" \
+  --ovmf-code /usr/share/OVMF/OVMF_CODE.fd \
+  --ovmf-vars /usr/share/OVMF/OVMF_VARS.fd
+python3 support/scripts/hyperv-azure.py run --state-dir "$STATE"
+```
+
+Success requires these exact serial lines, with the device results between
+platform readiness and the final marker:
 
 ```text
 UK_HYPERV_PLATFORM_READY
