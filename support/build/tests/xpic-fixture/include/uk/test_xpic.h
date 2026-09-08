@@ -55,5 +55,6 @@ void uk_intctlr_irq_handle(struct uk_lcpu_except_irq_ctx *ctx);
 unsigned int
 uk_lcpu_except_irq_ctx_get_irq(struct uk_lcpu_except_irq_ctx *ctx);
 int uk_intctlr_register(struct uk_intctlr_desc *intctlr);
+void uk_test_xpic_error(const char *format, ...);
 
 #endif /* __UK_TEST_XPIC_H__ */

@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <assert.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <uk/test_xpic.h>
@@ -17,6 +19,8 @@ static unsigned int eoi_writes;
 static unsigned int other_writes;
 static unsigned int pic_acks;
 static unsigned int handled_irqs;
+static unsigned int msr_reads;
+static char diagnostic[256];
 
 static struct uk_intctlr_driver_ops pic_ops;
 
@@ -31,6 +35,19 @@ static void reset_state(void)
 	other_writes = 0;
 	pic_acks = 0;
 	handled_irqs = 0;
+	msr_reads = 0;
+	diagnostic[0] = '\0';
+}
+
+void uk_test_xpic_error(const char *format, ...)
+{
+	va_list args;
+	int written;
+
+	va_start(args, format);
+	written = vsnprintf(diagnostic, sizeof(diagnostic), format, args);
+	va_end(args);
+	assert(written > 0 && (size_t)written < sizeof(diagnostic));
 }
 
 void uk_arch_x86_64_cpuid(__u32 leaf, __u32 subleaf, __u32 *eax,
@@ -46,6 +63,7 @@ void uk_arch_x86_64_cpuid(__u32 leaf, __u32 subleaf, __u32 *eax,
 
 void uk_arch_x86_64_rdmsr(__u32 msr, __u32 *eax, __u32 *edx)
 {
+	msr_reads++;
 	if (msr == UK_ARCH_X86_64_APIC_MSR_BASE)
 		*eax = apic_base;
 	else if (msr == UK_ARCH_X86_64_APIC_MSR_SVR)
@@ -114,6 +132,9 @@ static void test_missing_x2apic_fails_closed(void)
 	assert(uk_intctlr_probe() == -ENOTSUP);
 	assert(register_calls == 0);
 	assert(other_writes == 0);
+	assert(msr_reads == 0);
+	assert(strcmp(diagnostic, "x2APIC unavailable: CPUID.1 eax=00000000 "
+		      "ebx=00000000 ecx=00000000 edx=00000000\n") == 0);
 	assert_irq_is_not_acknowledged();
 }
 
@@ -125,6 +146,9 @@ static void test_disabled_apic_fails_closed(void)
 	assert(uk_intctlr_probe() == -ENOTSUP);
 	assert(register_calls == 0);
 	assert(other_writes == 0);
+	assert(msr_reads == 1);
+	assert(strcmp(diagnostic, "APIC globally disabled: "
+		      "IA32_APIC_BASE=0000000000000000\n") == 0);
 	assert_irq_is_not_acknowledged();
 }
 
@@ -136,6 +160,7 @@ static void test_registration_failure_does_not_arm_eoi(void)
 	assert(uk_intctlr_probe() == -EIO);
 	assert(register_calls == 1);
 	assert(other_writes == 1);
+	assert(diagnostic[0] == '\0');
 	assert_irq_is_not_acknowledged();
 }
 
@@ -148,6 +173,7 @@ static void test_success_arms_x2apic_eoi(void)
 	assert(uk_intctlr_probe() == 0);
 	assert(register_calls == 1);
 	assert(other_writes == 1);
+	assert(diagnostic[0] == '\0');
 	assert(uk_test_irq_handler(&ctx) == UK_EVENT_HANDLED);
 	assert(handled_irqs == 1);
 	assert(eoi_writes == 1);

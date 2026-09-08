@@ -1146,7 +1146,9 @@ pub fn build(b: *std.Build) void {
         },
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
-    test_step.dependOn(&b.addRunArtifact(xpic_correctness_tests).step);
+    const run_xpic_correctness_tests = b.addRunArtifact(xpic_correctness_tests);
+    test_step.dependOn(&run_xpic_correctness_tests.step);
+    hyperv_irq_tests.dependOn(&run_xpic_correctness_tests.step);
     const lto_policy_tests = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/lto-symbol-policy-test.py",

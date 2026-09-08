@@ -11,6 +11,7 @@
 #include <uk/config.h>
 #include <uk/intctlr.h>
 #include <uk/lcpu.h>
+#include <uk/print.h>
 
 #if CONFIG_LIBUKINTCTLR_APIC
 #include <uk/arch/x86_64.h>
@@ -22,14 +23,20 @@ static inline int x2apic_enable(void)
 
 	/* Check for x2APIC support */
 	uk_arch_x86_64_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-	if (!(ecx & UK_ARCH_X86_64_CPUID1_ECX_X2APIC))
+	if (!(ecx & UK_ARCH_X86_64_CPUID1_ECX_X2APIC)) {
+		uk_pr_err("x2APIC unavailable: CPUID.1 eax=%08x ebx=%08x ecx=%08x edx=%08x\n",
+			  eax, ebx, ecx, edx);
 		return -ENOTSUP;
+	}
 
 	/* Check if APIC is active */
 	uk_arch_x86_64_rdmsr(UK_ARCH_X86_64_APIC_MSR_BASE,
 					    &eax, &edx);
-	if (!(eax & UK_ARCH_X86_64_APIC_BASE_EN))
+	if (!(eax & UK_ARCH_X86_64_APIC_BASE_EN)) {
+		uk_pr_err("APIC globally disabled: IA32_APIC_BASE=%08x%08x\n",
+			  edx, eax);
 		return -ENOTSUP;
+	}
 
 	/* Switch to x2APIC mode */
 	eax |= UK_ARCH_X86_64_APIC_BASE_EXTD;
