@@ -7,6 +7,7 @@ config UKPLAT_MEMRNAME
 
 config UKPLAT_MEMREGION_MAX_COUNT
 	int "Maximum amount of Bootinfo Memory Region Descriptors"
+	default 512 if PLAT_HYPERV || KVM_BOOT_PROTO_EFI_STUB
 	default 128
 	help
 		The number of memory region descriptors depends on the platform. Some
@@ -14,6 +15,9 @@ config UKPLAT_MEMREGION_MAX_COUNT
 		descriptors. In order to cope with this, the user is able to configure
 		the amount of statically allocated space in the image made available
 		for storing memory region descriptors' metadata.
+		EFI boots use a larger default because both the firmware memory map
+		and the Memory Attributes Table contribute descriptors before the
+		list is coalesced.
 
 config UKPLAT_CPU_MAXCOUNT
 	int "Maximum number of supported logical CPUs"

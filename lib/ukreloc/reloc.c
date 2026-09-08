@@ -17,7 +17,10 @@
  * absolute 64-bit value relocation, that will be statically resolved
  * anyway  in the final binary.
  */
-static unsigned long lt_baddr = __BASE_ADDR;
+/* Keep the stored link-time value: folding it to a runtime-relative symbol
+ * reference would cancel the relocation delta for kernel memory regions.
+ */
+static volatile unsigned long lt_baddr = __BASE_ADDR;
 static unsigned long rt_baddr;
 
 /* Use `get_rt_addr()` to obtain the runtime base address */

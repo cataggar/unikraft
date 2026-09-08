@@ -233,7 +233,7 @@ permissions_ready:
 
 	/* All UEFI memory regions are page-aligned */
 	mrd->pg_off = 0;
-	mrd->pg_count = md->number_of_pages;
+	mrd->pg_count = UK_PAGING_PAGE_COUNT(mrd->len);
 
 	return 0;
 }
@@ -423,7 +423,9 @@ static void uk_efi_setup_bootinfo_mrds(struct ukplat_bootinfo *bi)
 
 		rc = ukplat_memregion_list_insert(&bi->mrds,  &mrd);
 		if (unlikely(rc < 0))
-			UK_CRASH("Failed to insert mrd\n");
+			UK_CRASH("Failed to insert EFI mrd: %d (%u/%u slots; "
+				 "CONFIG_UKPLAT_MEMREGION_MAX_COUNT)\n",
+				 rc, bi->mrds.count, bi->mrds.capacity);
 	}
 }
 
