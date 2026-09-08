@@ -294,7 +294,7 @@ fn disablePageMsr(msr: u32) void {
 fn programSint(index: u32, vector: u8, masked: bool) bool {
     const msr = msr_sint0 + index;
     const original = rdmsr(msr);
-    // xPIC's x2APIC path issues the EOI, so AutoEOI must remain clear.
+    // xPIC issues the APIC EOI in either access mode; AutoEOI must stay clear.
     var value = (original & ~sint_owned_mask) | vector;
     if (masked)
         value |= sint_masked;

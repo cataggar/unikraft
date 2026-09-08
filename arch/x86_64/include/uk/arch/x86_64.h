@@ -28,6 +28,10 @@ extern "C" {
 #define UK_ARCH_X86_64_CPUID1_ECX_RDRAND		(1 << 30)
 /** FPU feature */
 #define UK_ARCH_X86_64_CPUID1_EDX_FPU			(1 << 0)
+/** Model-specific registers */
+#define UK_ARCH_X86_64_CPUID1_EDX_MSR			(1 << 5)
+/** Local APIC */
+#define UK_ARCH_X86_64_CPUID1_EDX_APIC			(1 << 9)
 /** Page attribute table */
 #define UK_ARCH_X86_64_CPUID1_EDX_PAT			(1 << 16)
 /** FXSAVE/FXRSTOR instructions */

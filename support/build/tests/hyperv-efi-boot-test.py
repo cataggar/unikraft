@@ -46,6 +46,10 @@ def main():
     parser.add_argument("--require-marker", action="append", default=[])
     parser.add_argument("--forbid-marker", action="append", default=[])
     parser.add_argument("--qemu", default="qemu-system-x86_64")
+    parser.add_argument(
+        "--disable-x2apic", action="store_true",
+        help="Mask x2APIC in CPUID to exercise the legacy APIC fallback",
+    )
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
     if args.timeout <= 0:
@@ -63,11 +67,16 @@ def main():
         shutil.copyfile(args.image, boot / "BOOTX64.EFI")
         shutil.copyfile(args.ovmf_vars, root / "OVMF_VARS.fd")
         shutil.copyfile(args.ovmf_code, root / "OVMF_CODE.fd")
+        cpu = (
+            "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-time,"
+            "hv-synic,hv-stimer,hv-vpindex,hv-runtime,hv-frequencies"
+        )
+        if args.disable_x2apic:
+            cpu += ",x2apic=off"
         command = [
             args.qemu,
             "-machine", "q35,accel=kvm",
-            "-cpu", "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-time,"
-            "hv-synic,hv-stimer,hv-vpindex,hv-runtime,hv-frequencies",
+            "-cpu", cpu,
             "-smp", "1", "-m", "512M",
             "-drive", "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
             "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",

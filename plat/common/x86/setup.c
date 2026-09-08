@@ -146,10 +146,12 @@ void _ukplat_entry(struct ukplat_bootinfo *bi)
 	/* Execute ealry init */
 	uk_boot_early_init(bi);
 
-	/* Initialize IRQ controller */
+#if !CONFIG_LIBUKINTCTLR_XAPIC
+	/* SMP requires the IRQ controller before secondary-CPU setup. */
 	rc = uk_intctlr_probe();
 	if (unlikely(rc))
 		UK_CRASH("Interrupt controller init failed: %d\n", rc);
+#endif
 
 #if CONFIG_HAVE_SMP
 	rc = uk_lcpu_mp_init(CONFIG_LIBUKLCPU_RUN_IRQ,
@@ -171,6 +173,13 @@ void _ukplat_entry(struct ukplat_bootinfo *bi)
 	rc = ukplat_mem_init();
 	if (unlikely(rc))
 		UK_CRASH("Mem init failed: %d\n", rc);
+
+#if CONFIG_LIBUKINTCTLR_XAPIC
+	/* Legacy APIC MMIO needs the active page table and frame allocator. */
+	rc = uk_intctlr_probe();
+	if (unlikely(rc))
+		UK_CRASH("Interrupt controller init failed: %d\n", rc);
+#endif
 
 	rc = ukplat_x86_platform_init();
 	if (unlikely(rc))
