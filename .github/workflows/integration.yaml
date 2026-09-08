@@ -784,46 +784,61 @@ jobs:
         export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/regression-zig-local-cache"
         zig build -j2 test-hyperv-regression --summary all
 
-    - name: Solve and build native Hyper-V acceptance image
+    - name: Solve and build native Hyper-V acceptance and SMP images
       run: |
         set -euo pipefail
-        build="${RUNNER_TEMP}/hyperv-ci/build"
-        config="${RUNNER_TEMP}/hyperv-ci/hyperv-acceptance.config"
-        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/image-zig-local-cache"
-        cp support/apps/hyperv-acceptance/defconfig "${config}"
-        zig_args=(
-          "-Dapp=${GITHUB_WORKSPACE}/support/apps/hyperv-acceptance"
-          "-Doutput=${build}"
-          "-Dconfig=${config}"
-          "-Dcompiler=zig cc -target x86_64-freestanding-none"
-          "-Dcompiler-targeted=true"
-          "-Dhost-cc=zig cc"
-          "-Dhost-cxx=zig c++"
-          "-Dhost-cflags=-fno-sanitize=null"
-          "-Dmake-arg=AR=zig ar"
-          "-Dmake-arg=NM=llvm-nm"
-          "-Dmake-arg=OBJCOPY=llvm-objcopy"
-          "-Dmake-arg=OBJDUMP=llvm-objdump"
-          "-Dmake-arg=READELF=llvm-readelf"
-          "-Dmake-arg=STRIP=llvm-strip"
-          "-Dmake-arg=UK_CFLAGS=-std=gnu17"
-          "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
-        )
-        zig build -j2 olddefconfig "${zig_args[@]}"
-        for symbol in \
-          CONFIG_APPHYPERVACCEPTANCE \
-          CONFIG_LIBNETVSC \
-          CONFIG_LIBSTORVSC \
-          CONFIG_LIBVMBUS \
-          CONFIG_PLAT_HYPERV; do
-          grep --fixed-strings --quiet "${symbol}=y" "${config}"
+        for variant in acceptance smp; do
+          if [[ "${variant}" == acceptance ]]; then
+            app=hyperv-acceptance
+            build="${RUNNER_TEMP}/hyperv-ci/build"
+            profile=hyperv-x86_64-efi-netvsc
+            cpus=1
+            symbols=(
+              CONFIG_APPHYPERVACCEPTANCE CONFIG_LIBNETVSC
+              CONFIG_LIBSTORVSC CONFIG_LIBVMBUS CONFIG_PLAT_HYPERV
+            )
+          else
+            app=hyperv-smp-workload
+            build="${RUNNER_TEMP}/hyperv-ci/smp-build"
+            profile=hyperv-x86_64-efi
+            cpus=2
+            symbols=(
+              CONFIG_APPHYPERVSMPWORKLOAD CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+              CONFIG_LIBUKBOOT_FIXED_SMP CONFIG_LIBUKSCHED_FIXED_SMP
+              CONFIG_LIBUKSCHEDCOOP_FIXED_SMP CONFIG_PLAT_HYPERV
+            )
+          fi
+          config="${RUNNER_TEMP}/hyperv-ci/${app}.config"
+          export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/${variant}-zig-local-cache"
+          cp "support/apps/${app}/defconfig" "${config}"
+          zig_args=(
+            "-Dapp=${GITHUB_WORKSPACE}/support/apps/${app}"
+            "-Doutput=${build}"
+            "-Dconfig=${config}"
+            "-Dcompiler=zig cc -target x86_64-freestanding-none"
+            "-Dcompiler-targeted=true"
+            "-Dhost-cc=zig cc"
+            "-Dhost-cxx=zig c++"
+            "-Dhost-cflags=-fno-sanitize=null"
+            "-Dmake-arg=AR=zig ar"
+            "-Dmake-arg=NM=llvm-nm"
+            "-Dmake-arg=OBJCOPY=llvm-objcopy"
+            "-Dmake-arg=OBJDUMP=llvm-objdump"
+            "-Dmake-arg=READELF=llvm-readelf"
+            "-Dmake-arg=STRIP=llvm-strip"
+            "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+            "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+          )
+          zig build -j2 olddefconfig "${zig_args[@]}"
+          for symbol in "${symbols[@]}"; do
+            grep --fixed-strings --line-regexp --quiet "${symbol}=y" "${config}"
+          done
+          grep --fixed-strings --line-regexp --quiet \
+            "CONFIG_UKPLAT_CPU_MAXCOUNT=${cpus}" "${config}"
+          zig build -j2 native-images "-Dnative-profile=${profile}" "${zig_args[@]}"
+          test -s "${build}/helloworld_${profile}"
+          test -s "${build}/helloworld_${profile}.dbg"
         done
-        grep --fixed-strings --quiet 'CONFIG_UKPLAT_CPU_MAXCOUNT=1' "${config}"
-        zig build -j2 native-images \
-          -Dnative-profile=hyperv-x86_64-efi-netvsc \
-          "${zig_args[@]}"
-        test -s "${build}/helloworld_hyperv-x86_64-efi-netvsc"
-        test -s "${build}/helloworld_hyperv-x86_64-efi-netvsc.dbg"
 
     - name: Record local image digests
       run: |
@@ -833,6 +848,10 @@ jobs:
           "${build}/helloworld_hyperv-x86_64-efi-netvsc" \
           "${build}/helloworld_hyperv-x86_64-efi-netvsc.dbg" \
           > "${RUNNER_TEMP}/hyperv-ci/image-sha256.txt"
+        sha256sum \
+          "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi" \
+          "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi.dbg" \
+          > "${RUNNER_TEMP}/hyperv-ci/smp-image-sha256.txt"
 
     - name: Boot exact raw GPT and fixed VHD in both APIC modes
       run: |
@@ -867,6 +886,21 @@ jobs:
                 f"{state.get('local_platform_boot_modes')!r}"
             )
         PY
+
+    - name: Boot the fixed scheduled-SMP workload on two CPUs
+      run: |
+        set -euo pipefail
+        python3 support/build/tests/hyperv-efi-boot-test.py \
+          --image "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi" \
+          --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.fd \
+          --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd \
+          --work-dir "${RUNNER_TEMP}/hyperv-ci/smp-boot" \
+          --qemu "${RUNNER_TEMP}/hyperv-tools/qemu-system-x86_64" \
+          --cpus 2 --timeout 60 \
+          --require-marker UK_HYPERV_AP_EXEC \
+          --require-marker UK_HYPERV_SCHED_THREAD \
+          --require-marker UK_HYPERV_REMOTE_WAKE \
+          --expect 'UK_HYPERV_SMP_WORKLOAD_READY PASS'
 
     - name: Export exact prepared Hyper-V image
       if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
@@ -922,6 +956,8 @@ jobs:
         name: zig-hyperv-local-evidence
         path: |
           ${{ runner.temp }}/hyperv-ci/image-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/smp-image-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/smp-boot/hyperv-efi-boot.log
           ${{ runner.temp }}/hyperv-ci/packaging/packaging.json
           ${{ runner.temp }}/hyperv-ci/packaging/local-*-serial.log
           ${{ runner.temp }}/hyperv-ci/packaging/miz-*.log
