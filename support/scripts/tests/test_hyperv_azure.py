@@ -111,6 +111,92 @@ class HypervAzurePackagingTest(unittest.TestCase):
             azure.check_packaging_report(self.report(), "a" * 64, azure.VIRTUAL_SIZE)
 
 
+class HypervAzureLocalBootTest(unittest.TestCase):
+    def test_raw_and_vhd_boot_in_normal_and_masked_x2apic_modes(self):
+        milestones = "\n".join((
+            "Hyper-V Hv#1 hypercall page enabled",
+            "Hyper-V SynIC:",
+            "Powered by",
+            "Calling main(",
+            azure.PLATFORM_READY,
+            "UK_HYPERV_ACCEPTANCE_UNAVAILABLE:storage+network",
+            "main returned 2",
+        ))
+
+        def execute(command, **kwargs):
+            text = milestones
+            cpu = command[command.index("-cpu") + 1]
+            if "x2apic=off" in cpu:
+                text += f"\n{azure.LEGACY_APIC_MARKER}"
+            kwargs["stdout"].write(text.encode())
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            ovmf_code = directory / "code.fd"
+            ovmf_vars = directory / "vars.fd"
+            raw = directory / "unikraft.raw"
+            vhd = directory / "unikraft.vhd"
+            for path in (raw, vhd, ovmf_code, ovmf_vars):
+                path.write_bytes(b"fixture")
+            with mock.patch.object(azure.subprocess, "run", side_effect=execute) as run:
+                evidence = {
+                    image_format: azure.local_disk_boot_modes(
+                        image, image_format, directory, ovmf_code, ovmf_vars,
+                        Path("/qemu-system-x86_64"), azure.PLATFORM_READY, 30,
+                    )
+                    for image_format, image in (("raw", raw), ("vpc", vhd))
+                }
+
+            for image_evidence in evidence.values():
+                self.assertEqual(set(image_evidence), {"x2apic", "legacy-apic"})
+                self.assertTrue(
+                    all(item["platform_ready"] for item in image_evidence.values())
+                )
+                self.assertTrue(
+                    all(not item["io_ready"] for item in image_evidence.values())
+                )
+            commands = [call.args[0] for call in run.call_args_list]
+            cpus = [command[command.index("-cpu") + 1] for command in commands]
+            self.assertNotIn("x2apic=off", cpus[0])
+            self.assertIn("x2apic=off", cpus[1])
+            self.assertNotIn("x2apic=off", cpus[2])
+            self.assertIn("x2apic=off", cpus[3])
+            for image_format in ("raw", "vpc"):
+                for mode in ("x2apic", "legacy-apic"):
+                    self.assertTrue(
+                        (directory / f"local-{image_format}-{mode}-serial.log").is_file()
+                    )
+
+    @mock.patch.object(azure.subprocess, "run")
+    def test_masked_x2apic_boot_must_reach_legacy_apic_fallback(self, execute):
+        def complete_without_legacy_marker(command, **kwargs):
+            del command
+            kwargs["stdout"].write("\n".join((
+                "Hyper-V Hv#1 hypercall page enabled",
+                "Hyper-V SynIC:",
+                "Powered by",
+                "Calling main(",
+                azure.PLATFORM_READY,
+            )).encode())
+            return mock.Mock(returncode=0)
+
+        execute.side_effect = complete_without_legacy_marker
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            image = directory / "unikraft.vhd"
+            ovmf_code = directory / "code.fd"
+            ovmf_vars = directory / "vars.fd"
+            for path in (image, ovmf_code, ovmf_vars):
+                path.write_bytes(b"fixture")
+            with self.assertRaisesRegex(RuntimeError, "did not use the xAPIC fallback"):
+                azure.local_disk_boot(
+                    image, "vpc", directory, ovmf_code, ovmf_vars,
+                    Path("/qemu-system-x86_64"), azure.PLATFORM_READY, 30,
+                    "legacy-apic", True,
+                )
+
+
 class HypervAzureControllerTest(unittest.TestCase):
     def run_fixture(self):
         run = azure.AzureRun({

@@ -12,5 +12,6 @@ runs:
           echo 'CLANG_VERSION=21.1.8'
           echo 'COMPILER_RT_SRC_SHA256=dd54ae21aee1780fac59445b51ebff601ad016b31ac3a7de3b21126fd3ccb229'
           echo 'CODECHECKER_VERSION=6.27.3'
+          echo 'MIZ_REVISION=2db68ca0c3ab12155012a823c3fb8d7aba1cb544'
           echo 'ZIG_VERSION=0.16.0'
         } >> "$GITHUB_ENV"
