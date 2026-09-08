@@ -77,9 +77,13 @@ struct storvsc_device {
 		__attribute__((aligned(STORVSC_CORE_STORAGE_ALIGN)));
 	__u8 rx_descriptor[STORVSC_RX_DESCRIPTOR_SIZE];
 	__u8 rx_payload[STORVSC_PACKET_MAX];
+	__u8 report_luns_data[STORVSC_REPORT_LUNS_DATA_SIZE];
 	__u8 inquiry_data[STORVSC_INQUIRY_SIZE];
 	__u8 capacity_data[STORVSC_CAPACITY16_SIZE];
 	__u8 mode_data[STORVSC_MODE_SENSE_SIZE];
+	struct storvsc_address lun_addresses[STORVSC_REPORT_LUNS_MAX];
+	struct storvsc_address address;
+	size_t lun_count;
 	struct uk_thread *timeout_thread;
 	__spinlock lock;
 	__spinlock receive_lock;
@@ -546,7 +550,8 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 static void storvsc_scsi_spec_init(struct storvsc_scsi_spec *spec,
 				   __u8 opcode, __u8 cdb_len,
 				   __u8 direction, __u32 transfer_len,
-				   __u32 minimum_transfer, int allow_short)
+				   __u32 minimum_transfer, int allow_short,
+				   const struct storvsc_address *address)
 {
 	memset(spec, 0, sizeof(*spec));
 	spec->cdb[0] = opcode;
@@ -556,6 +561,11 @@ static void storvsc_scsi_spec_init(struct storvsc_scsi_spec *spec,
 	spec->minimum_transfer = minimum_transfer;
 	spec->allow_short = !!allow_short;
 	spec->timeout_ns = STORVSC_CONTROL_TIMEOUT_NS;
+	if (address) {
+		spec->path_id = address->path_id;
+		spec->target_id = address->target_id;
+		spec->lun = address->lun;
+	}
 }
 
 static int storvsc_discover(struct storvsc_device *device,
@@ -564,13 +574,44 @@ static int storvsc_discover(struct storvsc_device *device,
 {
 	struct storvsc_scsi_spec spec;
 	struct storvsc_inquiry inquiry;
+	size_t lun;
 	__u32 transferred;
 	unsigned int retry;
 	int rc;
 
+	memset(device->report_luns_data, 0,
+	       sizeof(device->report_luns_data));
+	memset(device->lun_addresses, 0, sizeof(device->lun_addresses));
+	memset(&device->address, 0, sizeof(device->address));
+	device->lun_count = 0;
+	rc = storvsc_build_report_luns(&spec, 0, 0,
+				       STORVSC_REPORT_LUNS_MAX,
+				       STORVSC_CONTROL_TIMEOUT_NS);
+	if (rc)
+		return rc;
+	rc = storvsc_execute_scsi(device, &spec,
+				  device->report_luns_data, &transferred);
+	if (rc)
+		return rc;
+	rc = storvsc_parse_report_luns(
+		device->report_luns_data, transferred, 0, 0,
+		device->lun_addresses, STORVSC_REPORT_LUNS_MAX,
+		&device->lun_count);
+	if (rc)
+		return rc;
+	for (lun = 0; lun < device->lun_count; lun++) {
+		if (device->lun_addresses[lun].lun == 0) {
+			device->address = device->lun_addresses[lun];
+			break;
+		}
+	}
+	if (lun == device->lun_count)
+		return -ENODEV;
+
 	memset(device->inquiry_data, 0, sizeof(device->inquiry_data));
 	storvsc_scsi_spec_init(&spec, 0x12, 6, STORVSC_DIRECTION_READ,
-			       sizeof(device->inquiry_data), 5, 1);
+			       sizeof(device->inquiry_data), 5, 1,
+			       &device->address);
 	spec.cdb[4] = sizeof(device->inquiry_data);
 	rc = storvsc_execute_scsi(device, &spec, device->inquiry_data,
 				  &transferred);
@@ -583,7 +624,8 @@ static int storvsc_discover(struct storvsc_device *device,
 
 	for (retry = 0; retry < 3; retry++) {
 		storvsc_scsi_spec_init(&spec, 0x00, 6,
-				       STORVSC_DIRECTION_NONE, 0, 0, 0);
+				       STORVSC_DIRECTION_NONE, 0, 0, 0,
+				       &device->address);
 		rc = storvsc_execute_scsi(device, &spec, NULL, NULL);
 		if (rc != -EAGAIN)
 			break;
@@ -594,7 +636,7 @@ static int storvsc_discover(struct storvsc_device *device,
 
 	memset(device->capacity_data, 0, sizeof(device->capacity_data));
 	storvsc_scsi_spec_init(&spec, 0x25, 10, STORVSC_DIRECTION_READ,
-			       8, 8, 0);
+			       8, 8, 0, &device->address);
 	rc = storvsc_execute_scsi(device, &spec, device->capacity_data,
 				  &transferred);
 	if (rc)
@@ -607,7 +649,8 @@ static int storvsc_discover(struct storvsc_device *device,
 		memset(device->capacity_data, 0, sizeof(device->capacity_data));
 		storvsc_scsi_spec_init(&spec, 0x9e, 16,
 				       STORVSC_DIRECTION_READ,
-				       sizeof(device->capacity_data), 12, 1);
+				       sizeof(device->capacity_data), 12, 1,
+				       &device->address);
 		spec.cdb[1] = 0x10;
 		spec.cdb[13] = sizeof(device->capacity_data);
 		rc = storvsc_execute_scsi(device, &spec,
@@ -622,7 +665,8 @@ static int storvsc_discover(struct storvsc_device *device,
 
 	memset(device->mode_data, 0, sizeof(device->mode_data));
 	storvsc_scsi_spec_init(&spec, 0x1a, 6, STORVSC_DIRECTION_READ,
-			       sizeof(device->mode_data), 4, 1);
+			       sizeof(device->mode_data), 4, 1,
+			       &device->address);
 	spec.cdb[1] = 0x08;
 	spec.cdb[2] = 0x3f;
 	spec.cdb[4] = sizeof(device->mode_data);
@@ -641,7 +685,8 @@ static int storvsc_discover(struct storvsc_device *device,
 	 */
 	memset(device->mode_data, 0, sizeof(device->mode_data));
 	storvsc_scsi_spec_init(&spec, 0x5a, 10, STORVSC_DIRECTION_READ,
-			       sizeof(device->mode_data), 8, 1);
+			       sizeof(device->mode_data), 8, 1,
+			       &device->address);
 	spec.cdb[1] = 0x08;
 	spec.cdb[2] = 0x3f;
 	spec.cdb[7] = (__u8)(sizeof(device->mode_data) >> 8);
@@ -1120,7 +1165,8 @@ static int storvsc_submit(struct uk_blkdev *blkdev,
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return -ENOSPC;
 	}
-	rc = storvsc_core_prepare_block(device->core, request->operation,
+	rc = storvsc_core_prepare_block_at(
+		device->core, &device->address, request->operation,
 		request->start_sector, request->nb_sectors,
 		(uintptr_t)request->aio_buf, ukplat_monotonic_clock(),
 		STORVSC_REQUEST_TIMEOUT_NS, &tx);
@@ -1819,6 +1865,19 @@ struct vmbus_driver *storvsc_host_driver(void)
 struct uk_blkdev *storvsc_host_blkdev(void)
 {
 	return &storvsc_devices[0].blkdev;
+}
+
+size_t storvsc_host_lun_count(void)
+{
+	return storvsc_devices[0].lun_count;
+}
+
+int storvsc_host_lun_address(size_t index, struct storvsc_address *address)
+{
+	if (!address || index >= storvsc_devices[0].lun_count)
+		return -EINVAL;
+	*address = storvsc_devices[0].lun_addresses[index];
+	return 0;
 }
 
 int storvsc_host_receive(void)

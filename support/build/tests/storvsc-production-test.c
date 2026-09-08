@@ -18,10 +18,15 @@
 #include <uk/thread.h>
 #include <uk/vmbus.h>
 
+#include "storvsc_core.h"
+
 #define TEST_CLOSE_RETRY_LIMIT 8
 
 struct vmbus_driver *storvsc_host_driver(void);
 struct uk_blkdev *storvsc_host_blkdev(void);
+size_t storvsc_host_lun_count(void);
+int storvsc_host_lun_address(size_t index,
+			     struct storvsc_address *address);
 int storvsc_host_receive(void);
 int storvsc_host_reset_timed_out_io(void);
 int storvsc_host_start_timeout_worker(void);
@@ -105,6 +110,7 @@ static int use_capacity16;
 static int read_only_media;
 static int reject_mode_sense6;
 static int reject_mode_sense10;
+static int report_luns_mode;
 static int alternate_completion_size;
 static int hold_io;
 static int short_transfer_once;
@@ -145,6 +151,8 @@ static atomic_ullong bind_resource_epoch = 1;
 static int close_pause_enabled;
 static int close_pause_entered;
 static int close_pause_release;
+static unsigned int report_luns_commands;
+static int invalid_scsi_address;
 
 enum {
 	RACE_PAUSE_NONE,
@@ -159,12 +167,28 @@ enum {
 	TEST_DEFER_REMOVE,
 };
 
+enum {
+	REPORT_LUNS_NORMAL,
+	REPORT_LUNS_EMPTY,
+	REPORT_LUNS_TRUNCATED,
+	REPORT_LUNS_CAPACITY,
+	REPORT_LUNS_NO_ZERO,
+};
+
 static uint32_t get_le32(const uint8_t *bytes, size_t offset)
 {
 	return (uint32_t)bytes[offset] |
 		((uint32_t)bytes[offset + 1] << 8) |
 		((uint32_t)bytes[offset + 2] << 16) |
 		((uint32_t)bytes[offset + 3] << 24);
+}
+
+static uint32_t get_be32(const uint8_t *bytes, size_t offset)
+{
+	return ((uint32_t)bytes[offset] << 24) |
+		((uint32_t)bytes[offset + 1] << 16) |
+		((uint32_t)bytes[offset + 2] << 8) |
+		(uint32_t)bytes[offset + 3];
 }
 
 static void put_le32(uint8_t *bytes, size_t offset, uint32_t value)
@@ -471,10 +495,51 @@ static void handle_scsi(uint64_t id, const struct vmbus_gpa_range *range,
 {
 	uint8_t opcode = payload[28];
 	uint32_t transfer = get_le32(payload, 24);
-	uint8_t data[192] = { 0 };
+	uint8_t data[STORVSC_REPORT_LUNS_DATA_SIZE] = { 0 };
 	uint32_t response_transfer = transfer;
 
+	if (payload[17] || payload[18] || payload[19])
+		invalid_scsi_address = 1;
 	switch (opcode) {
+	case 0xa0:
+		report_luns_commands++;
+		if (payload[20] != 12 || transfer !=
+		    STORVSC_REPORT_LUNS_DATA_SIZE ||
+		    get_be32(payload, 34) != STORVSC_REPORT_LUNS_DATA_SIZE)
+			invalid_scsi_address = 1;
+		response_transfer = STORVSC_REPORT_LUNS_HEADER_SIZE;
+		switch (report_luns_mode) {
+		case REPORT_LUNS_NORMAL:
+			put_be32(data, 0, 3 * STORVSC_REPORT_LUN_ENTRY_SIZE);
+			data[9] = 7;
+			data[16] = 0x40;
+			data[25] = 3;
+			response_transfer +=
+				3 * STORVSC_REPORT_LUN_ENTRY_SIZE;
+			break;
+		case REPORT_LUNS_EMPTY:
+			break;
+		case REPORT_LUNS_TRUNCATED:
+			put_be32(data, 0,
+				 2 * STORVSC_REPORT_LUN_ENTRY_SIZE);
+			break;
+		case REPORT_LUNS_CAPACITY:
+			put_be32(data, 0,
+				 (STORVSC_REPORT_LUNS_MAX + 1) *
+				 STORVSC_REPORT_LUN_ENTRY_SIZE);
+			break;
+		case REPORT_LUNS_NO_ZERO:
+			put_be32(data, 0, 2 * STORVSC_REPORT_LUN_ENTRY_SIZE);
+			data[9] = 7;
+			data[17] = 3;
+			response_transfer +=
+				2 * STORVSC_REPORT_LUN_ENTRY_SIZE;
+			break;
+		default:
+			abort();
+		}
+		range_write(range, data, response_transfer);
+		break;
 	case 0x12:
 		data[0] = 0;
 		data[2] = 5;
@@ -2285,6 +2350,7 @@ int main(void)
 	struct uk_blkreq request;
 	struct uk_blkreq request2;
 	struct uk_blkreq request3;
+	struct storvsc_address address;
 	struct reentry_context reentry;
 	atomic_int callbacks;
 	uint8_t *buffer;
@@ -2307,6 +2373,16 @@ int main(void)
 	    device->capabilities.mode != O_RDWR ||
 	    device->capabilities.max_sectors_per_req != 56)
 		return 3;
+	if (report_luns_commands != 1 || invalid_scsi_address ||
+	    storvsc_host_lun_count() != 3)
+		return 3;
+	for (size_t i = 0; i < 3; i++) {
+		if (storvsc_host_lun_address(i, &address) ||
+		    address.path_id || address.target_id ||
+		    address.lun != (uint8_t[]){ 0, 3, 7 }[i] ||
+		    address.reserved)
+			return 3;
+	}
 	if (configure_device(device, 2, &events))
 		return 4;
 	if (posix_memalign((void **)&buffer, 4096, 3 * 4096))
@@ -2585,11 +2661,38 @@ int main(void)
 	if (rc != -EINVAL || vmbus_device.channel)
 		return 27;
 
+	report_luns_mode = REPORT_LUNS_EMPTY;
+	vmbus_device.present = 1;
+	rc = driver->add_dev(&vmbus_device);
+	if (rc != -ENODEV || vmbus_device.channel)
+		return 421;
+
+	report_luns_mode = REPORT_LUNS_TRUNCATED;
+	vmbus_device.present = 1;
+	rc = driver->add_dev(&vmbus_device);
+	if (rc != -EPROTO || vmbus_device.channel)
+		return 422;
+
+	report_luns_mode = REPORT_LUNS_CAPACITY;
+	vmbus_device.present = 1;
+	rc = driver->add_dev(&vmbus_device);
+	if (rc != -ENOSPC || vmbus_device.channel)
+		return 423;
+
+	report_luns_mode = REPORT_LUNS_NO_ZERO;
+	vmbus_device.present = 1;
+	rc = driver->add_dev(&vmbus_device);
+	if (rc != -ENODEV || vmbus_device.channel)
+		return 424;
+
+	report_luns_mode = REPORT_LUNS_NORMAL;
 	malformed_handshake = 1;
 	vmbus_device.present = 1;
 	rc = driver->add_dev(&vmbus_device);
 	if (rc != -EPROTO || vmbus_device.channel || close_count < 2)
 		return 28;
+	if (invalid_scsi_address)
+		return 425;
 
 	free(buffer);
 	return 0;

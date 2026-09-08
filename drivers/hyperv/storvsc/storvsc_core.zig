@@ -14,6 +14,11 @@ pub const legacy_packet_size: u32 = 48;
 pub const modern_packet_size: u32 = 64;
 pub const max_sense_size: usize = 20;
 pub const legacy_max_transfer: u32 = 128 * 1024;
+pub const report_luns_max: usize = 64;
+pub const report_luns_header_size: usize = 8;
+pub const report_lun_entry_size: usize = 8;
+pub const report_luns_data_size: usize =
+    report_luns_header_size + report_luns_max * report_lun_entry_size;
 
 pub const protocol_versions = [_]u16{
     makeVersion(6, 2),
@@ -90,6 +95,17 @@ pub const ScsiSpec = extern struct {
     cdb_len: u8,
     direction: u8,
     allow_short: u8,
+    reserved: u8,
+    path_id: u8,
+    target_id: u8,
+    lun: u8,
+    address_reserved: u8,
+};
+
+pub const Address = extern struct {
+    path_id: u8,
+    target_id: u8,
+    lun: u8,
     reserved: u8,
 };
 
@@ -249,6 +265,7 @@ const enoent: c_int = 2;
 const eio: c_int = 5;
 const eagain: c_int = 11;
 const ebusy: c_int = 16;
+const eexist: c_int = 17;
 const enodev: c_int = 19;
 const einval: c_int = 22;
 const enospc: c_int = 28;
@@ -269,7 +286,12 @@ comptime {
     if (@sizeOf(Event) != 136 or @alignOf(Event) != 8 or
         @offsetOf(Event, "tx") != 48)
         @compileError("StorVSC event C ABI changed");
-    if (@sizeOf(ScsiSpec) != 40 or @offsetOf(ScsiSpec, "cdb") != 16)
+    if (@sizeOf(ScsiSpec) != 40 or @offsetOf(ScsiSpec, "cdb") != 16 or
+        @offsetOf(ScsiSpec, "path_id") != 36 or
+        @offsetOf(ScsiSpec, "target_id") != 37 or
+        @offsetOf(ScsiSpec, "lun") != 38 or
+        @offsetOf(ScsiSpec, "address_reserved") != 39 or
+        @sizeOf(Address) != 4 or report_luns_data_size != 520)
         @compileError("StorVSC SCSI specification C ABI changed");
     if (@sizeOf(Capacity) != 16 or @sizeOf(Inquiry) != 4 or
         @sizeOf(Mode) != 4)
@@ -899,7 +921,8 @@ fn allocateContext(
         return -eagain;
     if (spec.timeout_ns == 0 or spec.cdb_len == 0 or spec.cdb_len > 16 or
         spec.minimum_transfer > spec.transfer_len or
-        spec.transfer_len > core.transfer_limit)
+        spec.transfer_len > core.transfer_limit or spec.reserved != 0 or
+        spec.address_reserved != 0)
         return -einval;
     if (spec.direction > @intFromEnum(Direction.none))
         return -einval;
@@ -943,6 +966,9 @@ fn allocateContext(
     tx.packet[20] = spec.cdb_len;
     tx.packet[21] = core.sense_size;
     tx.packet[22] = spec.direction;
+    tx.packet[17] = spec.path_id;
+    tx.packet[18] = spec.target_id;
+    tx.packet[19] = spec.lun;
     putLe32(tx.packet[0..], 24, spec.transfer_len);
     for (0..spec.cdb_len) |i|
         tx.packet[28 + i] = spec.cdb[i];
@@ -967,8 +993,9 @@ export fn storvsc_core_prepare_scsi(
     return allocateContext(coreFrom(storage), spec, now, tx);
 }
 
-export fn storvsc_core_prepare_block(
-    storage: *align(core_storage_align) anyopaque,
+fn prepareBlock(
+    core: *Core,
+    address: *const Address,
     operation: c_int,
     start_sector: u64,
     sector_count: u64,
@@ -976,10 +1003,11 @@ export fn storvsc_core_prepare_block(
     now: u64,
     timeout_ns: u64,
     tx: *Tx,
-) callconv(.c) c_int {
-    const core = coreFrom(storage);
+) c_int {
     if (core.media_ready == 0)
         return -enodev;
+    if (address.reserved != 0)
+        return -einval;
 
     var spec: ScsiSpec = .{
         .transfer_len = 0,
@@ -990,6 +1018,10 @@ export fn storvsc_core_prepare_block(
         .direction = @intFromEnum(Direction.none),
         .allow_short = 0,
         .reserved = 0,
+        .path_id = address.path_id,
+        .target_id = address.target_id,
+        .lun = address.lun,
+        .address_reserved = 0,
     };
     if (operation == 4) {
         if (start_sector != 0 or sector_count != 0)
@@ -1036,6 +1068,59 @@ export fn storvsc_core_prepare_block(
         spec.cdb_len = 16;
     }
     return allocateContext(core, &spec, now, tx);
+}
+
+export fn storvsc_core_prepare_block(
+    storage: *align(core_storage_align) anyopaque,
+    operation: c_int,
+    start_sector: u64,
+    sector_count: u64,
+    buffer_address: u64,
+    now: u64,
+    timeout_ns: u64,
+    tx: *Tx,
+) callconv(.c) c_int {
+    const address: Address = .{
+        .path_id = 0,
+        .target_id = 0,
+        .lun = 0,
+        .reserved = 0,
+    };
+    return prepareBlock(
+        coreFrom(storage),
+        &address,
+        operation,
+        start_sector,
+        sector_count,
+        buffer_address,
+        now,
+        timeout_ns,
+        tx,
+    );
+}
+
+export fn storvsc_core_prepare_block_at(
+    storage: *align(core_storage_align) anyopaque,
+    address: *const Address,
+    operation: c_int,
+    start_sector: u64,
+    sector_count: u64,
+    buffer_address: u64,
+    now: u64,
+    timeout_ns: u64,
+    tx: *Tx,
+) callconv(.c) c_int {
+    return prepareBlock(
+        coreFrom(storage),
+        address,
+        operation,
+        start_sector,
+        sector_count,
+        buffer_address,
+        now,
+        timeout_ns,
+        tx,
+    );
 }
 
 export fn storvsc_core_begin_reset(
@@ -1204,6 +1289,126 @@ export fn storvsc_core_host_max_transfer(
     storage: *align(core_storage_align) anyopaque,
 ) callconv(.c) u32 {
     return coreFrom(storage).host_max_transfer;
+}
+
+export fn storvsc_build_report_luns(
+    spec: *ScsiSpec,
+    path_id: u8,
+    target_id: u8,
+    lun_capacity: u32,
+    timeout_ns: u64,
+) callconv(.c) c_int {
+    if (lun_capacity == 0 or timeout_ns == 0)
+        return -einval;
+    if (lun_capacity > report_luns_max)
+        return -enospc;
+    const payload_size = multiplyChecked(
+        lun_capacity,
+        report_lun_entry_size,
+    ) orelse return -eoverflow;
+    const allocation_size = addChecked(
+        report_luns_header_size,
+        payload_size,
+    ) orelse return -eoverflow;
+    if (allocation_size > std.math.maxInt(u32))
+        return -eoverflow;
+
+    zeroObject(spec);
+    spec.transfer_len = @intCast(allocation_size);
+    spec.minimum_transfer = report_luns_header_size;
+    spec.timeout_ns = timeout_ns;
+    spec.cdb[0] = 0xa0;
+    putBe32(spec.cdb[0..], 6, @intCast(allocation_size));
+    spec.cdb_len = 12;
+    spec.direction = @intFromEnum(Direction.read);
+    spec.allow_short = 1;
+    spec.path_id = path_id;
+    spec.target_id = target_id;
+    return 0;
+}
+
+export fn storvsc_parse_report_luns(
+    data_ptr: [*]const u8,
+    data_len: usize,
+    path_id: u8,
+    target_id: u8,
+    addresses_ptr: [*]Address,
+    address_capacity: usize,
+    address_count: *usize,
+) callconv(.c) c_int {
+    address_count.* = 0;
+    const data = data_ptr[0..data_len];
+    if (data.len < report_luns_header_size)
+        return -eproto;
+    for (data[4..report_luns_header_size]) |byte| {
+        if (byte != 0)
+            return -eproto;
+    }
+
+    const list_size: usize = @intCast(getBe32(data, 0));
+    if (list_size == 0)
+        return -enodev;
+    if (list_size % report_lun_entry_size != 0)
+        return -eproto;
+    const count = list_size / report_lun_entry_size;
+    if (count > report_luns_max or count > address_capacity)
+        return -enospc;
+    const required_size = addChecked(
+        report_luns_header_size,
+        list_size,
+    ) orelse return -eoverflow;
+    if (required_size > data.len)
+        return -eproto;
+
+    var parsed: [report_luns_max]Address = undefined;
+    for (0..count) |index| {
+        const offset =
+            report_luns_header_size + index * report_lun_entry_size;
+        const entry = data[offset .. offset + report_lun_entry_size];
+        for (entry[2..]) |byte| {
+            if (byte != 0)
+                return -enotsup;
+        }
+        const method = entry[0] >> 6;
+        const upper = entry[0] & 0x3f;
+        switch (method) {
+            0 => if (upper != 0)
+                return -enotsup,
+            1 => if (upper != 0)
+                return -eoverflow,
+            else => return -enotsup,
+        }
+        const lun = entry[1];
+        for (parsed[0..index]) |address| {
+            if (address.lun == lun)
+                return -eexist;
+        }
+        parsed[index] = .{
+            .path_id = path_id,
+            .target_id = target_id,
+            .lun = lun,
+            .reserved = 0,
+        };
+    }
+
+    for (1..count) |index| {
+        const address = parsed[index];
+        var insertion = index;
+        while (insertion > 0 and
+            parsed[insertion - 1].lun > address.lun) : (insertion -= 1)
+        {
+            parsed[insertion] = parsed[insertion - 1];
+        }
+        parsed[insertion] = address;
+    }
+    for (0..count) |index| {
+        addresses_ptr[index].path_id = parsed[index].path_id;
+        addresses_ptr[index].target_id = parsed[index].target_id;
+        addresses_ptr[index].lun = parsed[index].lun;
+        addresses_ptr[index].reserved = 0;
+    }
+    address_count.* = count;
+    return 0;
 }
 
 fn sectorSizeValid(size: u32) bool {
@@ -1457,10 +1662,294 @@ test "wire layouts and exact C ABI stay stable" {
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(Tx));
     try std.testing.expectEqual(@as(usize, 136), @sizeOf(Event));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(ScsiSpec));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(Address));
     try std.testing.expectEqual(@as(usize, 20), @offsetOf(Tx, "packet"));
     try std.testing.expectEqual(@as(usize, 48), @offsetOf(Event, "tx"));
+    try std.testing.expectEqual(@as(usize, 36), @offsetOf(ScsiSpec, "path_id"));
+    try std.testing.expectEqual(@as(usize, 37), @offsetOf(ScsiSpec, "target_id"));
+    try std.testing.expectEqual(@as(usize, 38), @offsetOf(ScsiSpec, "lun"));
+    try std.testing.expectEqual(
+        @as(usize, 39),
+        @offsetOf(ScsiSpec, "address_reserved"),
+    );
     try std.testing.expectEqual(@as(u32, 48), legacy_packet_size);
     try std.testing.expectEqual(@as(u32, 64), modern_packet_size);
+}
+
+test "REPORT LUNS construction and SRB addressing are exact" {
+    var spec: ScsiSpec = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_build_report_luns(
+            &spec,
+            2,
+            3,
+            report_luns_max,
+            100,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(u32, report_luns_data_size),
+        spec.transfer_len,
+    );
+    try std.testing.expectEqual(
+        @as(u32, report_luns_header_size),
+        spec.minimum_transfer,
+    );
+    try std.testing.expectEqual(@as(u8, 0xa0), spec.cdb[0]);
+    try std.testing.expectEqual(@as(u8, 12), spec.cdb_len);
+    try std.testing.expectEqual(
+        @as(u8, @intFromEnum(Direction.read)),
+        spec.direction,
+    );
+    try std.testing.expectEqual(@as(u8, 1), spec.allow_short);
+    try std.testing.expectEqual(@as(u8, 2), spec.path_id);
+    try std.testing.expectEqual(@as(u8, 3), spec.target_id);
+    try std.testing.expectEqual(@as(u8, 0), spec.lun);
+    try std.testing.expectEqual(
+        @as(u32, report_luns_data_size),
+        getBe32(&spec.cdb, 6),
+    );
+    try std.testing.expectEqual(
+        -einval,
+        storvsc_build_report_luns(&spec, 0, 0, 0, 100),
+    );
+    try std.testing.expectEqual(
+        -enospc,
+        storvsc_build_report_luns(
+            &spec,
+            0,
+            0,
+            report_luns_max + 1,
+            100,
+        ),
+    );
+    try std.testing.expectEqual(
+        -einval,
+        storvsc_build_report_luns(&spec, 0, 0, 1, 0),
+    );
+
+    var storage: [core_storage_size]u8 align(core_storage_align) = undefined;
+    var tx: Tx = undefined;
+    _ = storvsc_core_initialize(&storage, 1, 2);
+    try initializeReady(&storage, 0);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_build_report_luns(&spec, 2, 3, 4, 100),
+    );
+    spec.lun = 7;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_core_prepare_scsi(&storage, &spec, 10, &tx),
+    );
+    try std.testing.expectEqual(@as(u8, 2), tx.packet[17]);
+    try std.testing.expectEqual(@as(u8, 3), tx.packet[18]);
+    try std.testing.expectEqual(@as(u8, 7), tx.packet[19]);
+    try std.testing.expectEqual(@as(u8, 0xa0), tx.packet[28]);
+}
+
+test "REPORT LUNS parsing is bounded deterministic and fail closed" {
+    var data = [_]u8{0} ** report_luns_data_size;
+    var addresses: [report_luns_max]Address = undefined;
+    var count: usize = 99;
+    putBe32(&data, 0, 3 * report_lun_entry_size);
+    data[9] = 7;
+    data[16] = 0x40;
+    data[25] = 3;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_parse_report_luns(
+            &data,
+            data.len,
+            4,
+            5,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 3), count);
+    for (addresses[0..count], [_]u8{ 0, 3, 7 }) |address, lun| {
+        try std.testing.expectEqual(@as(u8, 4), address.path_id);
+        try std.testing.expectEqual(@as(u8, 5), address.target_id);
+        try std.testing.expectEqual(lun, address.lun);
+        try std.testing.expectEqual(@as(u8, 0), address.reserved);
+    }
+
+    count = 99;
+    try std.testing.expectEqual(
+        -eproto,
+        storvsc_parse_report_luns(
+            &data,
+            report_luns_header_size - 1,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), count);
+
+    data = [_]u8{0} ** report_luns_data_size;
+    count = 99;
+    try std.testing.expectEqual(
+        -enodev,
+        storvsc_parse_report_luns(
+            &data,
+            report_luns_header_size,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), count);
+
+    data[4] = 1;
+    try std.testing.expectEqual(
+        -eproto,
+        storvsc_parse_report_luns(
+            &data,
+            report_luns_header_size,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+    data[4] = 0;
+    putBe32(&data, 0, report_lun_entry_size + 1);
+    try std.testing.expectEqual(
+        -eproto,
+        storvsc_parse_report_luns(
+            &data,
+            report_luns_header_size + report_lun_entry_size + 1,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+
+    putBe32(&data, 0, 2 * report_lun_entry_size);
+    try std.testing.expectEqual(
+        -eproto,
+        storvsc_parse_report_luns(
+            &data,
+            report_luns_header_size + report_lun_entry_size,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+
+    putBe32(&data, 0, 3 * report_lun_entry_size);
+    try std.testing.expectEqual(
+        -enospc,
+        storvsc_parse_report_luns(
+            &data,
+            data.len,
+            0,
+            0,
+            &addresses,
+            2,
+            &count,
+        ),
+    );
+    putBe32(&data, 0, (report_luns_max + 1) * report_lun_entry_size);
+    try std.testing.expectEqual(
+        -enospc,
+        storvsc_parse_report_luns(
+            &data,
+            report_luns_header_size,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+
+    data = [_]u8{0} ** report_luns_data_size;
+    putBe32(&data, 0, report_lun_entry_size);
+    data[8] = 0x41;
+    try std.testing.expectEqual(
+        -eoverflow,
+        storvsc_parse_report_luns(
+            &data,
+            16,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+    data[8] = 0x80;
+    try std.testing.expectEqual(
+        -enotsup,
+        storvsc_parse_report_luns(
+            &data,
+            16,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+    data[8] = 1;
+    try std.testing.expectEqual(
+        -enotsup,
+        storvsc_parse_report_luns(
+            &data,
+            16,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+    data[8] = 0;
+    data[10] = 1;
+    try std.testing.expectEqual(
+        -enotsup,
+        storvsc_parse_report_luns(
+            &data,
+            16,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+
+    data = [_]u8{0} ** report_luns_data_size;
+    putBe32(&data, 0, 2 * report_lun_entry_size);
+    data[9] = 9;
+    data[16] = 0x40;
+    data[17] = 9;
+    try std.testing.expectEqual(
+        -eexist,
+        storvsc_parse_report_luns(
+            &data,
+            24,
+            0,
+            0,
+            &addresses,
+            addresses.len,
+            &count,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), count);
 }
 
 test "all handshake stages and explicit version fallback are wire safe" {
@@ -1687,6 +2176,10 @@ test "pool exhaustion reuse and generation bearing IDs are exact once" {
         .direction = @intFromEnum(Direction.none),
         .allow_short = 0,
         .reserved = 0,
+        .path_id = 0,
+        .target_id = 0,
+        .lun = 0,
+        .address_reserved = 0,
     };
     spec.cdb[0] = 0;
     try std.testing.expectEqual(
@@ -1758,6 +2251,10 @@ test "known malformed oversized and short completions finish deterministically" 
         .direction = @intFromEnum(Direction.read),
         .allow_short = 0,
         .reserved = 0,
+        .path_id = 0,
+        .target_id = 0,
+        .lun = 0,
+        .address_reserved = 0,
     };
     spec.cdb[0] = 0x25;
     _ = storvsc_core_prepare_scsi(&storage, &spec, 10, &tx);
@@ -1823,6 +2320,10 @@ test "request completions accept sanctioned sizes and reject all others" {
         .direction = @intFromEnum(Direction.none),
         .allow_short = 0,
         .reserved = 0,
+        .path_id = 0,
+        .target_id = 0,
+        .lun = 0,
+        .address_reserved = 0,
     };
     var packet = completionPacket(64, 0, srb_status_success, 0, 0);
 
@@ -1939,6 +2440,10 @@ test "timeout reset and cancellation leave every request completable once" {
         .direction = @intFromEnum(Direction.none),
         .allow_short = 0,
         .reserved = 0,
+        .path_id = 0,
+        .target_id = 0,
+        .lun = 0,
+        .address_reserved = 0,
     };
     _ = storvsc_core_prepare_scsi(&storage, &spec, 20, &tx);
     _ = storvsc_core_tick(&storage, 30, &event);
@@ -1994,6 +2499,10 @@ test "sense SRB SCSI and host status mapping is bounded" {
         .direction = @intFromEnum(Direction.none),
         .allow_short = 0,
         .reserved = 0,
+        .path_id = 0,
+        .target_id = 0,
+        .lun = 0,
+        .address_reserved = 0,
     };
     _ = storvsc_core_prepare_scsi(&storage, &spec, 10, &tx);
     var packet = completionPacket(
@@ -2161,6 +2670,30 @@ test "block boundaries CDB selection read only and flush validation" {
         @as(c_int, 0),
         storvsc_core_set_media(&storage, 0x1_0000_0100, 512, 0),
     );
+    const address: Address = .{
+        .path_id = 4,
+        .target_id = 5,
+        .lun = 6,
+        .reserved = 0,
+    };
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_core_prepare_block_at(
+            &storage,
+            &address,
+            0,
+            0,
+            1,
+            0x1000,
+            10,
+            100,
+            &tx,
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 4), tx.packet[17]);
+    try std.testing.expectEqual(@as(u8, 5), tx.packet[18]);
+    try std.testing.expectEqual(@as(u8, 6), tx.packet[19]);
+    _ = storvsc_core_abort(&storage, tx.slot, tx.transaction_id);
     try std.testing.expectEqual(
         @as(c_int, 0),
         storvsc_core_prepare_block(
@@ -2174,6 +2707,9 @@ test "block boundaries CDB selection read only and flush validation" {
             &tx,
         ),
     );
+    try std.testing.expectEqual(@as(u8, 0), tx.packet[17]);
+    try std.testing.expectEqual(@as(u8, 0), tx.packet[18]);
+    try std.testing.expectEqual(@as(u8, 0), tx.packet[19]);
     try std.testing.expectEqual(@as(u8, 0x28), tx.packet[28]);
     _ = storvsc_core_abort(&storage, tx.slot, tx.transaction_id);
     try std.testing.expectEqual(
