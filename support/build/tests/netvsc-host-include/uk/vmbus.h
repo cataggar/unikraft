@@ -99,6 +99,7 @@ int vmbus_channel_receive(struct vmbus_channel *, struct vmbus_packet *,
 			  void *, size_t, void *, size_t);
 void vmbus_channel_set_callback(struct vmbus_channel *,
 				vmbus_channel_callback_t, void *);
+void vmbus_channel_schedule_event(__u32);
 
 #define VMBUS_GUID_END { .bytes = { 0 } }
 #define VMBUS_DRIVER_REGISTER(driver) \

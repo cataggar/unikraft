@@ -31,6 +31,7 @@
 	(((12U + NETVSC_NVS_MAX_SECTIONS * 16U) + 7U) & ~7U)
 #define NETVSC_PACKET_SCRATCH_SIZE	65536U
 #define NETVSC_CONTROL_WAIT_NS		1000000ULL
+#define NETVSC_DRAIN_PACKET_BUDGET	64U
 #define NETVSC_INVALID_SECTION		NETVSC_NVS_SEND_SECTION_INVALID
 #define NETVSC_GPA_MAX_RANGES		VMBUS_GPA_DIRECT_MAX_RANGES
 #define NETVSC_GPA_MAX_PFNS		VMBUS_GPA_DIRECT_MAX_PFNS
@@ -164,6 +165,7 @@ struct netvsc_device {
 	__spinlock control_lock;
 	__spinlock tx_lock;
 	__spinlock rx_lock;
+	__spinlock drain_lock;
 	__u64 next_transaction;
 	__u64 quarantined_vmbus_epoch;
 	__u32 generation;
@@ -229,6 +231,7 @@ static void netvsc_drain_channel(struct netvsc_device *device);
 static void netvsc_detach_host(struct netvsc_device *device, int revoked);
 static void netvsc_clear_id_tombstones(struct netvsc_device *device);
 static void netvsc_tx_reclaim_completed(struct netvsc_device *device);
+void hyperv_vmbus_event(__u32 event);
 
 #ifdef NETVSC_HOST_TEST
 extern void netvsc_host_tx_stage(unsigned int stage, __u64 transaction_id);
@@ -369,8 +372,16 @@ static void netvsc_wait_once(void)
 {
 	if (uk_sched_current())
 		uk_sched_thread_sleep(NETVSC_CONTROL_WAIT_NS);
+#if defined(__x86_64__) || defined(__i386__)
 	else
 		__asm__ __volatile__("pause");
+#elif defined(__aarch64__)
+	else
+		__asm__ __volatile__("yield");
+#else
+	else
+		__asm__ __volatile__("" ::: "memory");
+#endif
 }
 
 static __u64 netvsc_deadline(void)
@@ -390,6 +401,7 @@ static void netvsc_init_once(struct netvsc_device *device)
 	ukarch_spin_init(&device->control_lock);
 	ukarch_spin_init(&device->tx_lock);
 	ukarch_spin_init(&device->rx_lock);
+	ukarch_spin_init(&device->drain_lock);
 	device->rxq.netdev = &device->netdev;
 	device->txq.netdev = &device->netdev;
 	device->rxq.queue_id = 0;
@@ -2052,11 +2064,13 @@ static void netvsc_ack_queue(struct netvsc_device *device,
 	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
 }
 
-static void netvsc_retry_acks(struct netvsc_device *device)
+static unsigned int netvsc_retry_acks(struct netvsc_device *device,
+				      unsigned int budget)
 {
 	unsigned long flags;
+	unsigned int completed = 0;
 
-	for (;;) {
+	while (completed < budget) {
 		struct netvsc_pending_ack ack;
 		__u32 generation;
 		int rc;
@@ -2064,7 +2078,7 @@ static void netvsc_retry_acks(struct netvsc_device *device)
 		ukplat_spin_lock_irqsave(&device->state_lock, flags);
 		if (!device->pending_ack_count) {
 			ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
-			return;
+			break;
 		}
 		ack = device->pending_acks[device->pending_ack_tail];
 		generation = device->generation;
@@ -2075,7 +2089,7 @@ static void netvsc_retry_acks(struct netvsc_device *device)
 			rc = netvsc_ack_send(device, ack.transaction_id,
 					     ack.status);
 		if (rc == -EAGAIN)
-			return;
+			break;
 		ukplat_spin_lock_irqsave(&device->state_lock, flags);
 		device->pending_ack_tail = (device->pending_ack_tail + 1) %
 			NETVSC_ACK_SLOTS;
@@ -2084,7 +2098,9 @@ static void netvsc_retry_acks(struct netvsc_device *device)
 			__atomic_store_n(&device->failed, 1,
 					 __ATOMIC_RELEASE);
 		ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
+		completed++;
 	}
+	return completed;
 }
 
 static int netvsc_handle_transfer(struct netvsc_device *device,
@@ -2138,100 +2154,106 @@ static int netvsc_handle_transfer(struct netvsc_device *device,
 static void netvsc_drain_channel(struct netvsc_device *device)
 {
 	struct vmbus_packet packet;
+	struct vmbus_channel *channel;
 	__u32 receive_events;
+	unsigned long drain_flags;
+	unsigned int work = 0;
+	int defer = 0;
 	int notify = 0;
 
-	if (!device->channel)
-		return;
-	if (__atomic_exchange_n(&device->drain_active, 1,
-				 __ATOMIC_ACQ_REL)) {
-		__atomic_store_n(&device->drain_pending, 1,
-				 __ATOMIC_RELEASE);
+	ukplat_spin_lock_irqsave(&device->drain_lock, drain_flags);
+	channel = device->channel;
+	if (!channel) {
+		ukplat_spin_unlock_irqrestore(&device->drain_lock,
+					      drain_flags);
 		return;
 	}
-	for (;;) {
-		__atomic_store_n(&device->drain_pending, 0,
-				 __ATOMIC_RELEASE);
-		receive_events = __atomic_load_n(&device->receive_events,
-						 __ATOMIC_ACQUIRE);
-		netvsc_retry_acks(device);
-		for (;;) {
-			unsigned long flags;
-			int acknowledgements_full;
-			int rc;
-
-			ukplat_spin_lock_irqsave(&device->state_lock, flags);
-			acknowledgements_full =
-				device->pending_ack_count >= NETVSC_ACK_SLOTS;
-			ukplat_spin_unlock_irqrestore(
-				&device->state_lock, flags);
-			if (acknowledgements_full)
-				break;
-			rc = vmbus_channel_receive(device->channel, &packet,
-					netvsc_descriptor_scratch,
-					sizeof(netvsc_descriptor_scratch),
-					netvsc_payload_scratch,
-					sizeof(netvsc_payload_scratch));
-
-			if (rc == -EAGAIN)
-				break;
-			if (rc) {
-				if (rc == -EPROTO || rc == -ENOBUFS)
-					netvsc_fail_channel(device);
-				else if (rc != -ECANCELED)
-					__atomic_store_n(&device->failed, 1,
-							 __ATOMIC_RELEASE);
-				break;
-			}
-			if (packet.trailer_mismatch)
-				device->malformed_messages++;
-			switch (packet.type) {
-			case VMBUS_PACKET_COMPLETION:
-				netvsc_handle_completion(device, &packet,
-					netvsc_payload_scratch,
-					packet.payload_size);
-				break;
-			case VMBUS_PACKET_DATA_USING_TRANSFER_PAGES:
-				(void)netvsc_handle_transfer(device, &packet,
-					netvsc_descriptor_scratch,
-					packet.descriptor_size,
-					netvsc_payload_scratch,
-					packet.payload_size);
-				break;
-			case VMBUS_PACKET_DATA_INBAND:
-				break;
-			default:
-				device->malformed_messages++;
-				break;
-			}
-		}
-		netvsc_retry_acks(device);
-		{
-			unsigned long flags;
-
-			ukplat_spin_lock_irqsave(&device->rx_lock, flags);
-			if (__atomic_load_n(&device->receive_events,
-					    __ATOMIC_ACQUIRE) != receive_events &&
-			    device->receive_count &&
-			    device->rxq.interrupt_armed) {
-				device->rxq.interrupt_armed = 0;
-				notify = 1;
-			}
-			ukplat_spin_unlock_irqrestore(&device->rx_lock,
-						     flags);
-		}
-		if (__atomic_exchange_n(&device->drain_pending, 0,
-					__ATOMIC_ACQ_REL))
-			continue;
-		__atomic_store_n(&device->drain_active, 0,
-				 __ATOMIC_RELEASE);
-		if (!__atomic_exchange_n(&device->drain_pending, 0,
-					 __ATOMIC_ACQ_REL))
-			break;
-		if (__atomic_exchange_n(&device->drain_active, 1,
-					 __ATOMIC_ACQ_REL))
-			break;
+	if (device->drain_active) {
+		device->drain_pending = 1;
+		ukplat_spin_unlock_irqrestore(&device->drain_lock,
+					      drain_flags);
+		return;
 	}
+	device->drain_active = 1;
+	device->drain_pending = 0;
+	ukplat_spin_unlock_irqrestore(&device->drain_lock, drain_flags);
+
+	receive_events = __atomic_load_n(&device->receive_events,
+					 __ATOMIC_ACQUIRE);
+	work += netvsc_retry_acks(device,
+				 NETVSC_DRAIN_PACKET_BUDGET - work);
+	while (work < NETVSC_DRAIN_PACKET_BUDGET) {
+		unsigned long flags;
+		int acknowledgements_full;
+		int rc;
+
+		ukplat_spin_lock_irqsave(&device->state_lock, flags);
+		acknowledgements_full =
+			device->pending_ack_count >= NETVSC_ACK_SLOTS;
+		ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
+		if (acknowledgements_full)
+			break;
+		rc = vmbus_channel_receive(channel, &packet,
+				netvsc_descriptor_scratch,
+				sizeof(netvsc_descriptor_scratch),
+				netvsc_payload_scratch,
+				sizeof(netvsc_payload_scratch));
+
+		if (rc == -EAGAIN)
+			break;
+		if (rc) {
+			if (rc == -EPROTO || rc == -ENOBUFS)
+				netvsc_fail_channel(device);
+			else if (rc != -ECANCELED)
+				__atomic_store_n(&device->failed, 1,
+						 __ATOMIC_RELEASE);
+			break;
+		}
+		work++;
+		if (packet.trailer_mismatch)
+			device->malformed_messages++;
+		switch (packet.type) {
+		case VMBUS_PACKET_COMPLETION:
+			netvsc_handle_completion(device, &packet,
+				netvsc_payload_scratch,
+				packet.payload_size);
+			break;
+		case VMBUS_PACKET_DATA_USING_TRANSFER_PAGES:
+			(void)netvsc_handle_transfer(device, &packet,
+				netvsc_descriptor_scratch,
+				packet.descriptor_size,
+				netvsc_payload_scratch,
+				packet.payload_size);
+			break;
+		case VMBUS_PACKET_DATA_INBAND:
+			break;
+		default:
+			device->malformed_messages++;
+			break;
+		}
+	}
+	if (work < NETVSC_DRAIN_PACKET_BUDGET)
+		work += netvsc_retry_acks(device,
+				NETVSC_DRAIN_PACKET_BUDGET - work);
+	defer = work == NETVSC_DRAIN_PACKET_BUDGET;
+	{
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&device->rx_lock, flags);
+		if (__atomic_load_n(&device->receive_events,
+				    __ATOMIC_ACQUIRE) != receive_events &&
+		    device->receive_count &&
+		    device->rxq.interrupt_armed) {
+			device->rxq.interrupt_armed = 0;
+			notify = 1;
+		}
+		ukplat_spin_unlock_irqrestore(&device->rx_lock, flags);
+	}
+	ukplat_spin_lock_irqsave(&device->drain_lock, drain_flags);
+	defer |= device->drain_pending;
+	device->drain_pending = 0;
+	__atomic_store_n(&device->drain_active, 0, __ATOMIC_RELEASE);
+	ukplat_spin_unlock_irqrestore(&device->drain_lock, drain_flags);
 	if (notify) {
 		unsigned long flags;
 
@@ -2245,6 +2267,18 @@ static void netvsc_drain_channel(struct netvsc_device *device)
 				    __ATOMIC_ACQUIRE) &&
 		    device->registered)
 			uk_netdev_drv_rx_event(&device->netdev, 0);
+	}
+	if (defer) {
+		__u32 channel_id = 0;
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&device->state_lock, flags);
+		if (!device->stopping && device->channel == channel &&
+		    device->vmbus_device)
+			channel_id = device->vmbus_device->channel_id;
+		ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
+		if (channel_id)
+			vmbus_channel_schedule_event(channel_id);
 	}
 }
 
@@ -3023,6 +3057,9 @@ static void netvsc_detach_host(struct netvsc_device *device, int revoked)
 		vmbus_channel_set_callback(device->channel, NULL, NULL);
 	while (__atomic_load_n(&device->drain_active, __ATOMIC_ACQUIRE))
 		netvsc_wait_once();
+	ukplat_spin_lock_irqsave(&device->drain_lock, flags);
+	device->drain_pending = 0;
+	ukplat_spin_unlock_irqrestore(&device->drain_lock, flags);
 	if (!revoked && device->channel)
 		close_rc = vmbus_channel_close(device->channel);
 	recovering = __atomic_load_n(&device->recovering,
@@ -3294,6 +3331,27 @@ __u32 netvsc_host_send_section_size(void)
 __u16 netvsc_host_receive_count(void)
 {
 	return netvsc.receive_count;
+}
+
+unsigned int netvsc_host_drain_budget(void)
+{
+	return NETVSC_DRAIN_PACKET_BUDGET;
+}
+
+int netvsc_host_drain_active(void)
+{
+	return __atomic_load_n(&netvsc.drain_active, __ATOMIC_ACQUIRE);
+}
+
+int netvsc_host_drain_pending(void)
+{
+	unsigned long flags;
+	int pending;
+
+	ukplat_spin_lock_irqsave(&netvsc.drain_lock, flags);
+	pending = netvsc.drain_pending;
+	ukplat_spin_unlock_irqrestore(&netvsc.drain_lock, flags);
+	return pending;
 }
 
 __u16 netvsc_host_tx_active(void)

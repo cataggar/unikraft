@@ -1,4 +1,25 @@
 $(eval $(call addlib,apphelloworld))
 
 APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/main.c
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/acceptance_protocol.c
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/application_protocol.c
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/application_network.c
 APPHELLOWORLD_CINCLUDES-y += -I$(CONFIG_UK_BASE)/drivers/hyperv/vmbus/include
+
+ifeq ($(CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION),y)
+include $(APPHELLOWORLD_BASE)/network-stack.mk
+APPHELLOWORLD_CINCLUDES-y += -I$(LIBLWIP_BASE)
+
+.PHONY: hyperv_acceptance_network_stack_verify
+UK_PREPARE-y += hyperv_acceptance_network_stack_verify
+hyperv_acceptance_network_stack_verify:
+	@test "$(LIBLWIP_TAG)" = "$(HYPERV_ACCEPTANCE_LWIP_UPSTREAM_TAG)"
+	@test "$(LIBLWIP_ORIGIN_SHA256)" = \
+		"$(HYPERV_ACCEPTANCE_LWIP_UPSTREAM_SHA256)"
+	@test "$$(git -C "$(LIBLWIP_BASE)" rev-parse HEAD)" = \
+		"$(HYPERV_ACCEPTANCE_LWIP_COMMIT)"
+	@test "$$(git -C "$(LIBLWIP_BASE)" remote get-url origin)" = \
+		"$(HYPERV_ACCEPTANCE_LWIP_REPOSITORY)"
+	@test -z "$$(git -C "$(LIBLWIP_BASE)" status \
+		--porcelain --untracked-files=all)"
+endif

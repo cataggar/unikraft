@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "acceptance_protocol.h"
+#include "application_network.h"
 
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <uk/config.h>
 #include <uk/alloc.h>
 #include <uk/blkdev.h>
 #include <uk/netbuf.h>
@@ -14,19 +16,19 @@
 #include <uk/sched.h>
 #include <uk/vmbus.h>
 
-/* The native image graph currently admits only the application main object. */
-#include "acceptance_protocol.c"
-
 #define BLOCK_QUEUE_DEPTH 4U
 #define BLOCK_SECTORS_TO_READ 2U
 #define BLOCK_SECTOR_SIZE_MAX 4096U
 #define BLOCK_TIMEOUT_NS (7ULL * 1000000000ULL)
 #define BIND_TIMEOUT_NS (3ULL * 1000000000ULL)
+#if !CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
 #define NETWORK_QUEUE_DEPTH 8U
 #define NETWORK_BUFFER_SIZE 1536U
 #define DHCP_TIMEOUT_NS (8ULL * 1000000000ULL)
 #define DHCP_RETRY_NS (2ULL * 1000000000ULL)
+#endif
 #define POLL_INTERVAL_NS 10000000ULL
+#if !CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
 #define MAX_RX_PACKETS 256U
 
 struct rx_allocator_context {
@@ -35,6 +37,7 @@ struct rx_allocator_context {
 };
 
 static struct rx_allocator_context rx_context;
+#endif
 static struct uk_blkreq block_request;
 static _Alignas(4096) uint8_t block_buffer[
 	BLOCK_SECTORS_TO_READ * BLOCK_SECTOR_SIZE_MAX];
@@ -250,6 +253,7 @@ static enum hyperv_acceptance_result probe_storage(
 	return HYPERV_ACCEPTANCE_PASS;
 }
 
+#if !CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
 static uint16_t allocate_rx_packets(void *argp, struct uk_netbuf *packets[],
 				    uint16_t count)
 {
@@ -506,6 +510,7 @@ static enum hyperv_acceptance_result probe_network(
 	       received, malformed);
 	return HYPERV_ACCEPTANCE_FAIL;
 }
+#endif
 
 int main(void)
 {
@@ -521,7 +526,11 @@ int main(void)
 	count_vmbus_classes(&storage_offers, &network_offers);
 	wait_for_target_bindings(storage_offers, network_offers);
 	storage = probe_storage(storage_offers);
+#if CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+	network = hyperv_acceptance_probe_application_network(network_offers);
+#else
 	network = probe_network(network_offers);
+#endif
 	final = hyperv_acceptance_final_result(storage, network);
 	if (final == HYPERV_ACCEPTANCE_PASS) {
 		printf("HYPERV_ACCEPTANCE HARDWARE_IO_READY PASS "

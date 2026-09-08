@@ -16,6 +16,7 @@
 
 #include "netvsc-host-test.h"
 #include "netvsc_protocol.h"
+#include "vmbus_event_route.h"
 
 #if !CONFIG_LIBUKNETDEV_STATS
 #error "NetVSC production ownership tests require uknetdev statistics"
@@ -89,6 +90,12 @@ struct mock_state {
 	unsigned int fail_close;
 	int receive_error_once;
 	int receive_error_after;
+	unsigned int receive_calls;
+	unsigned int replenish_receive;
+	unsigned int reenter_channel_once;
+	unsigned int deferred_signal;
+	unsigned int deferred_count;
+	__u32 protocol_version;
 	unsigned int connection_fail_count;
 	unsigned int bind_epoch_count;
 	unsigned int bind_retry_count;
@@ -657,6 +664,35 @@ static void mock_signal(void)
 		mock.callback(&mock.channel, mock.callback_arg);
 }
 
+static int mock_run_deferred(void)
+{
+	if (!mock.deferred_signal)
+		return 0;
+	mock.deferred_signal = 0;
+	mock_signal();
+	return 1;
+}
+
+static void mock_enqueue_event(__u32 event, void *arg __unused)
+{
+	if (!mock.offered_device ||
+	    event != mock.offered_device->channel_id)
+		abort();
+	mock.deferred_count++;
+	mock.deferred_signal = 1;
+}
+
+void hyperv_vmbus_event(__u32 event)
+{
+	(void)vmbus_event_route(mock.protocol_version, event, NULL, 0,
+			       2048, mock_enqueue_event, NULL);
+}
+
+void vmbus_channel_schedule_event(__u32 channel_id)
+{
+	mock_enqueue_event(channel_id, NULL);
+}
+
 static void mock_flush_tx(void)
 {
 	__u8 complete[8] = { 0 };
@@ -676,6 +712,7 @@ static void mock_reset(void)
 	memset(&mock, 0, sizeof(mock));
 	mock.channel.open = 1;
 	mock.quiesce_epoch = 1;
+	mock.protocol_version = VMBUS_EVENT_VERSION_WIN8;
 	mock.nvs_accept_index = 2;
 	mock.init_response_length = NETVSC_NVS_REQUEST_SIZE;
 	mock.receive_response_length = NETVSC_NVS_REQUEST_SIZE;
@@ -999,6 +1036,7 @@ int vmbus_channel_receive(struct vmbus_channel *channel,
 			  size_t descriptor_capacity, void *payload,
 			  size_t payload_capacity)
 {
+	struct mock_packet copy;
 	struct mock_packet *queued;
 
 	if (!channel || !channel->open)
@@ -1018,9 +1056,23 @@ int vmbus_channel_receive(struct vmbus_channel *channel,
 	*packet = queued->packet;
 	memcpy(descriptor, queued->descriptor, queued->descriptor_length);
 	memcpy(payload, queued->payload, queued->payload_length);
+	copy = *queued;
 	mock.tail++;
+	mock.receive_calls++;
 	if (mock.receive_error_after > 0)
 		mock.receive_error_after--;
+	if (mock.replenish_receive) {
+		struct mock_packet *replacement = queue_reserve();
+
+		if (!replacement)
+			abort();
+		*replacement = copy;
+		replacement->packet.transaction_id += mock.receive_calls;
+	}
+	if (mock.reenter_channel_once) {
+		mock.reenter_channel_once = 0;
+		mock_signal();
+	}
 	return 0;
 }
 
@@ -2563,6 +2615,87 @@ static int test_malformed_ring_recovery(void)
 	return 0;
 }
 
+static int test_bounded_channel_drain_and_cleanup(__u32 version)
+{
+	struct vmbus_device offered = {
+		.channel_id = 97,
+		.connection_id = 197,
+		.present = 1,
+	};
+	struct host_netbuf packets[CONFIG_LIBNETVSC_TX_SLOTS] = { 0 };
+	struct host_netbuf blocked = { 0 };
+	struct uk_netdev *netdev;
+	__u8 frame[60] = { 0 };
+	unsigned int acknowledgements;
+	unsigned int deferred;
+	unsigned int received;
+	unsigned int budget;
+	unsigned int i;
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.protocol_version = version;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	mock.delay_tx = 1;
+	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++) {
+		prepare_tx_buffer(&packets[i], (__u8)(0x80 + i), 60);
+		CHECK((uk_netdev_tx_one(netdev, 0, &packets[i].netbuf) &
+		       UK_NETDEV_STATUS_SUCCESS) != 0);
+	}
+	CHECK(netvsc_host_tx_active() == CONFIG_LIBNETVSC_TX_SLOTS);
+
+	queue_frame_type(frame, sizeof(frame), NETVSC_NVS_RNDIS_DATA);
+	mock.replenish_receive = 1;
+	mock.reenter_channel_once = 1;
+	received = mock.receive_calls;
+	acknowledgements = mock.ack_count;
+	deferred = mock.deferred_count;
+	budget = netvsc_host_drain_budget();
+	mock_signal();
+	CHECK(mock.receive_calls == received + budget);
+	CHECK(mock.ack_count == acknowledgements + budget);
+	CHECK(mock.deferred_count == deferred + 1);
+	CHECK(mock.deferred_signal);
+	CHECK(!netvsc_host_drain_active());
+	CHECK(!netvsc_host_drain_pending());
+
+	received = mock.receive_calls;
+	deferred = mock.deferred_count;
+	CHECK(mock_run_deferred());
+	CHECK(mock.receive_calls == received + budget);
+	CHECK(mock.deferred_count == deferred + 1);
+	CHECK(mock.deferred_signal);
+	CHECK(!netvsc_host_drain_active());
+	CHECK(!netvsc_host_drain_pending());
+
+	prepare_tx_buffer(&blocked, 0xd0, 60);
+	received = mock.receive_calls;
+	CHECK(uk_netdev_tx_one(netdev, 0, &blocked.netbuf) == 0);
+	CHECK(mock.receive_calls == received + budget);
+	CHECK(blocked.free_count == 0);
+	CHECK(mock.deferred_signal);
+	CHECK(!netvsc_host_drain_active());
+	CHECK(!netvsc_host_drain_pending());
+
+	mock.replenish_receive = 0;
+	netvsc_host_remove_device(&offered);
+	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++)
+		CHECK(packets[i].free_count == 1);
+	CHECK(blocked.free_count == 0);
+	CHECK(netvsc_host_tx_active() == 0);
+	CHECK(netvsc_host_receive_count() == 0);
+	for (i = 0; i < MOCK_NETBUF_COUNT; i++)
+		CHECK(!rx_buffers[i].in_use);
+	CHECK(!netvsc_host_drain_active());
+	CHECK(!netvsc_host_drain_pending());
+	CHECK(mock.callback == NULL);
+	received = mock.receive_calls;
+	CHECK(mock_run_deferred());
+	CHECK(mock.receive_calls == received);
+	return 0;
+}
+
 int main(void)
 {
 	struct vmbus_device offered = {
@@ -2638,5 +2771,17 @@ int main(void)
 	rc = test_failed_close_quarantines_tx();
 	if (rc)
 		return rc;
+	{
+		const __u32 versions[] = {
+			VMBUS_EVENT_VERSION_WIN8, (1U << 16) | 1U, 13U
+		};
+		unsigned int i;
+
+		for (i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
+			rc = test_bounded_channel_drain_and_cleanup(versions[i]);
+			if (rc)
+				return rc;
+		}
+	}
 	return test_malformed_ring_recovery();
 }

@@ -333,6 +333,17 @@ static void enqueue_event(__u32 event, void *arg __unused)
 	enqueue_event_word(event & ~63U, 1ULL << (event & 63U));
 }
 
+void vmbus_channel_schedule_event(__u32 channel_id)
+{
+	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE))
+		return;
+	if (!channel_id)
+		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
+	else
+		enqueue_event(channel_id, NULL);
+	signal_worker();
+}
+
 void hyperv_vmbus_event(__u32 event)
 {
 	int rc;
@@ -3132,6 +3143,111 @@ int vmbus_bus_host_production_test(void)
 		return rc;
 	return host_test_same_relid_reoffer();
 }
+
+#ifdef VMBUS_REAL_PROTOCOL_TEST
+struct host_event_continuation {
+	__u32 channel_id;
+	unsigned int calls;
+};
+
+static void host_continue_event(struct vmbus_channel *channel __unused,
+				void *arg)
+{
+	struct host_event_continuation *continuation = arg;
+
+	continuation->calls++;
+	if (continuation->calls < 3)
+		vmbus_channel_schedule_event(continuation->channel_id);
+}
+
+int vmbus_bus_host_software_event_test(void)
+{
+	const __u32 versions[] = {
+		VMBUS_EVENT_VERSION_WIN8, (1U << 16) | 1U, 13U
+	};
+	struct vmbus_start_config config = {
+		.timeout_ticks = 100,
+		.interrupt_page_gpa = 0x1000,
+		.parent_to_child_monitor_gpa = 0x2000,
+		.child_to_parent_monitor_gpa = 0x3000,
+	};
+	unsigned int i;
+
+	for (i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
+		struct vmbus_action action;
+		struct vmbus_device device = {
+			.channel_id = 97, .connection_id = 197, .present = 1
+		};
+		struct host_event_continuation continuation = {
+			.channel_id = device.channel_id
+		};
+		struct vmbus_channel *channel;
+		__u8 response[16] = { 15 };
+		unsigned int attempt;
+		__u32 dropped;
+
+		host_reset_state();
+		vmbus_protocol_reset();
+		drain_queues();
+		vmbus_protocol_start(0, &config, &action);
+		for (attempt = 0; attempt < 16; attempt++) {
+			if (action.kind != VMBUS_ACTION_TRANSMIT ||
+			    action.tx_len < 12)
+				return 401;
+			response[8] = host_read32(action.tx + 8) == versions[i];
+			vmbus_protocol_receive(response, sizeof(response),
+						vmbus_protocol_generation(), 1,
+						&action);
+			if (response[8])
+				break;
+		}
+		if (vmbus_protocol_version() != versions[i] ||
+		    vmbus_protocol_state() != VMBUS_STATE_WAIT_OFFERS)
+			return 402;
+		__atomic_store_n(&rx_active, 1, __ATOMIC_RELEASE);
+		worker = (struct uk_thread *)(uintptr_t)1;
+		worker_stop = 0;
+		host_cpu_index = 0;
+		host_wake_isr_count = 0;
+		channel = vmbus_channel_host_allocate_open(&device);
+		if (!channel)
+			return 403;
+		vmbus_channel_set_callback(channel, host_continue_event,
+					   &continuation);
+		if (versions[i] < VMBUS_EVENT_VERSION_WIN8) {
+			dropped = event_dropped;
+			hyperv_vmbus_event(device.channel_id);
+			if (event_dropped != dropped + 1 || event_pending[1])
+				return 404;
+		}
+		vmbus_channel_schedule_event(device.channel_id);
+		vmbus_channel_schedule_event(device.channel_id);
+		if (continuation.calls || !host_wake_isr_count)
+			return 405;
+		for (attempt = 1; attempt <= 3; attempt++) {
+			report_deferred_diagnostics();
+			if (continuation.calls != attempt)
+				return 406;
+		}
+		report_deferred_diagnostics();
+		if (continuation.calls != 3 || event_pending[1])
+			return 407;
+		dropped = event_dropped;
+		vmbus_channel_schedule_event(0);
+		vmbus_channel_schedule_event(VMBUS_EVENT_LIMIT);
+		if (event_dropped != dropped + 2 || event_pending[0])
+			return 408;
+		__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+		vmbus_channel_schedule_event(device.channel_id);
+		if (event_pending[1])
+			return 409;
+		worker = NULL;
+		vmbus_channel_reset_all();
+	}
+	vmbus_protocol_reset();
+	return 0;
+}
+#endif
 
 static int host_test_connection_start(void)
 {

@@ -186,6 +186,8 @@ int vmbus_channel_poll(struct vmbus_channel *channel);
 /* Callback runs in VMBus deferred-worker context, never in the SINT ISR. */
 void vmbus_channel_set_callback(struct vmbus_channel *channel,
 				vmbus_channel_callback_t callback, void *arg);
+/* Queue another worker callback pass, independent of hardware event routing. */
+void vmbus_channel_schedule_event(__u32 channel_id);
 int vmbus_channel_mask_interrupts(struct vmbus_channel *channel);
 /* Returns non-zero if packets arrived while interrupts were masked. */
 int vmbus_channel_unmask_interrupts(struct vmbus_channel *channel);

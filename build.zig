@@ -535,7 +535,8 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
-    test_step.dependOn(&b.addRunArtifact(netvsc_protocol_tests).step);
+    const run_netvsc_protocol_tests = b.addRunArtifact(netvsc_protocol_tests);
+    test_step.dependOn(&run_netvsc_protocol_tests.step);
     const hyperv_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,
@@ -1079,6 +1080,7 @@ pub fn build(b: *std.Build) void {
         "support/build/tests/netvsc-host-include",
         "support/build/tests",
         "drivers/hyperv/netvsc",
+        "drivers/hyperv/vmbus",
     }) |path| netvsc_production_tests.root_module.addIncludePath(b.path(path));
     netvsc_production_tests.root_module.addCSourceFiles(.{
         .files = &.{
@@ -1097,7 +1099,8 @@ pub fn build(b: *std.Build) void {
     });
     netvsc_production_tests.root_module.addObject(netvsc_binding_protocol);
     netvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
-    test_step.dependOn(&b.addRunArtifact(netvsc_production_tests).step);
+    const run_netvsc_production_tests = b.addRunArtifact(netvsc_production_tests);
+    test_step.dependOn(&run_netvsc_production_tests.step);
     const hyperv_acceptance_protocol_tests = b.addExecutable(.{
         .name = "hyperv-acceptance-protocol-test",
         .root_module = b.createModule(.{
@@ -1116,9 +1119,42 @@ pub fn build(b: *std.Build) void {
         },
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
-    test_step.dependOn(
-        &b.addRunArtifact(hyperv_acceptance_protocol_tests).step,
+    const run_hyperv_acceptance_protocol_tests =
+        b.addRunArtifact(hyperv_acceptance_protocol_tests);
+    test_step.dependOn(&run_hyperv_acceptance_protocol_tests.step);
+    const application_protocol_tests = b.addExecutable(.{
+        .name = "hyperv-application-protocol-test",
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    application_protocol_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
     );
+    application_protocol_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/application_protocol.c",
+            "support/apps/hyperv-acceptance/tests/application-protocol-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    const run_application_protocol_tests =
+        b.addRunArtifact(application_protocol_tests);
+    test_step.dependOn(&run_application_protocol_tests.step);
+    const network_regression_tests = b.step(
+        "test-network-regression",
+        "Run Hyper-V network protocols, production driver, and native profile fixtures",
+    );
+    network_regression_tests.dependOn(&run_netvsc_protocol_tests.step);
+    network_regression_tests.dependOn(&verify_netvsc_protocol.step);
+    network_regression_tests.dependOn(&run_netvsc_production_tests.step);
+    network_regression_tests.dependOn(&run_vmbus_disconnect_tests.step);
+    network_regression_tests.dependOn(&run_hyperv_acceptance_protocol_tests.step);
+    network_regression_tests.dependOn(&run_application_protocol_tests.step);
+    network_regression_tests.dependOn(&run_native_image_graph_tests.step);
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",
         .root_module = b.createModule(.{
@@ -1231,11 +1267,9 @@ pub fn build(b: *std.Build) void {
     );
     hyperv_regression_tests.dependOn(vmbus_lifecycle_tests);
     hyperv_regression_tests.dependOn(storvsc_regression_tests);
+    hyperv_regression_tests.dependOn(network_regression_tests);
     if (builtin.cpu.arch == .x86_64) {
         hyperv_regression_tests.dependOn(hyperv_irq_tests);
-        hyperv_regression_tests.dependOn(
-            &b.addRunArtifact(netvsc_production_tests).step,
-        );
     } else {
         hyperv_regression_tests.dependOn(
             &b.addRunArtifact(vmbus_protocol_tests).step,
@@ -1247,15 +1281,12 @@ pub fn build(b: *std.Build) void {
         const x86_host_notice = b.addSystemCommand(&.{
             "python3",
             "-c",
-            "print('INFO: x86-only hosted Hyper-V IRQ, driver, and SMP fixtures require the x86-64 CI job; running portable and freestanding checks on this host')",
+            "print('INFO: x86-only hosted Hyper-V IRQ and SMP fixtures require the x86-64 CI job; running portable and freestanding checks on this host')",
         });
         hyperv_regression_tests.dependOn(&x86_host_notice.step);
     }
     hyperv_regression_tests.dependOn(
         &b.addRunArtifact(vmbus_channel_tests).step,
-    );
-    hyperv_regression_tests.dependOn(
-        &b.addRunArtifact(netvsc_protocol_tests).step,
     );
     hyperv_regression_tests.dependOn(
         &b.addRunArtifact(netvsc_protocol_abi_tests).step,
@@ -1264,13 +1295,9 @@ pub fn build(b: *std.Build) void {
         &b.addRunArtifact(vmbus_abi_tests).step,
     );
     hyperv_regression_tests.dependOn(
-        &b.addRunArtifact(hyperv_acceptance_protocol_tests).step,
-    );
-    hyperv_regression_tests.dependOn(
         &b.addRunArtifact(platform_correctness_tests).step,
     );
     hyperv_regression_tests.dependOn(&verify_vmbus_channel.step);
-    hyperv_regression_tests.dependOn(&verify_netvsc_protocol.step);
     hyperv_regression_tests.dependOn(&hyperv_controller_fixtures.step);
     const lto_policy_tests = b.addSystemCommand(&.{
         "python3",
@@ -1572,6 +1599,23 @@ fn registerNativeGraph(
         nativeConfigEnabled(loaded, "CONFIG_LIBUKLIBPARAM")
     else
         false;
+    const enable_lwip = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBLWIP")
+    else
+        false;
+    const enable_hyperv_acceptance = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_APPHYPERVACCEPTANCE")
+    else
+        false;
+    const enable_ukrandom_lcpu = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBUKRANDOM_LCPU")
+    else
+        false;
+    const lwip_root = if (enable_lwip and
+        context.external_libraries.len == 1)
+        context.external_libraries[0]
+    else
+        null;
     const registration = b.allocator.create(native_image_graph.RegisteredGraph) catch {
         step.dependOn(&b.addFail("unable to allocate the native QEMU graph").step);
         return null;
@@ -1587,6 +1631,10 @@ fn registerNativeGraph(
         .enable_ukblkdev = enable_ukblkdev,
         .enable_storvsc = enable_storvsc,
         .enable_uklibparam = enable_uklibparam,
+        .enable_lwip = enable_lwip,
+        .enable_hyperv_acceptance = enable_hyperv_acceptance,
+        .enable_ukrandom_lcpu = enable_ukrandom_lcpu,
+        .lwip_root = lwip_root,
     }) catch |err| {
         step.dependOn(&b.addFail(b.fmt(
             "unable to register native QEMU graph '{s}': {s}",
