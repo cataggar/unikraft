@@ -346,6 +346,29 @@ fn nextVersion(now: u64, action: *Action) void {
     initiate(now, action);
 }
 
+fn retryLegacyContact(status: u16, now: u64, action: *Action) bool {
+    clearAction(action);
+    action.generation = context.generation;
+    if (status != 0x0012 or context.state != .wait_version or
+        context.version_index >= versions.len or
+        versions[context.version_index] < makeVersion(5, 0) or
+        context.message_connection_id != initiate_contact_connection_id)
+        return false;
+
+    while (context.version_index + 1 < versions.len and
+        versions[context.version_index + 1] >= makeVersion(5, 0))
+        context.version_index += 1;
+    if (context.version_index + 1 >= versions.len)
+        return false;
+
+    context.version_index += 1;
+    context.generation +%= 1;
+    if (context.generation == 0)
+        context.generation = 1;
+    initiate(now, action);
+    return true;
+}
+
 fn requestOffers(now: u64, action: *Action) void {
     header(action, .request_offers, 8);
     context.state = .wait_offers;
@@ -598,12 +621,15 @@ export fn vmbus_post_message(
     payload: [*]const u8,
     payload_len: usize,
     input_gpa: u64,
+    status_code: ?*u16,
     has_post_messages: u8,
     retry_limit: u32,
     hypercall: Hypercall,
     backoff: Backoff,
     user_context: ?*anyopaque,
 ) callconv(.c) c_int {
+    if (status_code) |status|
+        status.* = 0xffff;
     if (has_post_messages == 0)
         return @intFromEnum(PostResult.missing_privilege);
     if (connection_id == 0 or (connection_id & 0xff000000) != 0)
@@ -624,7 +650,10 @@ export fn vmbus_post_message(
 
     var attempt: u32 = 0;
     while (true) {
-        const result = statusToResult(@truncate(hypercall(user_context, input_gpa)));
+        const raw_status: u16 = @truncate(hypercall(user_context, input_gpa));
+        if (status_code) |status|
+            status.* = raw_status;
+        const result = statusToResult(raw_status);
         if (result != .insufficient_buffers)
             return @intFromEnum(result);
         if (attempt >= retry_limit)
@@ -633,6 +662,14 @@ export fn vmbus_post_message(
         backoff(user_context, @as(u32, 10) << shift);
         attempt += 1;
     }
+}
+
+export fn vmbus_protocol_post_failure(
+    status_code: u16,
+    now: u64,
+    action: *Action,
+) callconv(.c) c_int {
+    return @intFromBool(retryLegacyContact(status_code, now, action));
 }
 
 export fn vmbus_protocol_start(
@@ -746,13 +783,15 @@ test "PostMessage validates input, retries boundedly, and preserves failures" {
         }
     };
     const payload = [_]u8{ 1, 2, 3 };
+    var status_code: u16 = undefined;
     Fake.calls = 0;
     Fake.delays = 0;
     Fake.status = 0x0013;
     try std.testing.expectEqual(
         @intFromEnum(PostResult.ok),
-        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, 1, 4, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, &status_code, 1, 4, Fake.call, Fake.delay, null),
     );
+    try std.testing.expectEqual(@as(u16, 0), status_code);
     try std.testing.expectEqual(@as(u32, 3), Fake.calls);
     try std.testing.expectEqual(@as(u32, 2), Fake.delays);
     try std.testing.expectEqual(@as(u32, 7), post_input.connection_id);
@@ -760,26 +799,63 @@ test "PostMessage validates input, retries boundedly, and preserves failures" {
     Fake.delays = 0;
     try std.testing.expectEqual(
         @intFromEnum(PostResult.insufficient_buffers),
-        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, 1, 1, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, &status_code, 1, 1, Fake.call, Fake.delay, null),
     );
+    try std.testing.expectEqual(@as(u16, 0x0013), status_code);
     try std.testing.expectEqual(@as(u32, 2), Fake.calls);
     Fake.status = 0x0012;
     try std.testing.expectEqual(
         @intFromEnum(PostResult.invalid_connection),
-        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, 1, 2, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, &status_code, 1, 2, Fake.call, Fake.delay, null),
     );
+    try std.testing.expectEqual(@as(u16, 0x0012), status_code);
     try std.testing.expectEqual(
         @intFromEnum(PostResult.missing_privilege),
-        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, 0, 2, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1000, &status_code, 0, 2, Fake.call, Fake.delay, null),
     );
+    try std.testing.expectEqual(@as(u16, 0xffff), status_code);
     try std.testing.expectEqual(
         @intFromEnum(PostResult.bad_alignment),
-        vmbus_post_message(7, 1, &payload, payload.len, 0x1008, 1, 2, Fake.call, Fake.delay, null),
+        vmbus_post_message(7, 1, &payload, payload.len, 0x1008, &status_code, 1, 2, Fake.call, Fake.delay, null),
     );
+    try std.testing.expectEqual(@as(u16, 0xffff), status_code);
     try std.testing.expectEqual(
         @intFromEnum(PostResult.invalid_connection),
-        vmbus_post_message(0, 1, &payload, payload.len, 0x1000, 1, 2, Fake.call, Fake.delay, null),
+        vmbus_post_message(0, 1, &payload, payload.len, 0x1000, &status_code, 1, 2, Fake.call, Fake.delay, null),
     );
+    try std.testing.expectEqual(@as(u16, 0xffff), status_code);
+}
+
+test "invalid modern contact connection retries the legacy version range" {
+    var action: Action = undefined;
+    const config = StartConfig{
+        .target_vp = 7,
+        .timeout_ticks = 10,
+        .interrupt_page_gpa = 0x4000,
+        .parent_to_child_monitor_gpa = 0x5000,
+        .child_to_parent_monitor_gpa = 0x6000,
+    };
+    vmbus_protocol_start(100, &config, &action);
+    const modern_generation = context.generation;
+    try std.testing.expect(vmbus_protocol_post_failure(0x0012, 101, &action) != 0);
+    try std.testing.expectEqual(ActionKind.transmit, action.kind);
+    try std.testing.expectEqual(makeVersion(4, 1), readU32(action.tx[0..], 8));
+    try std.testing.expectEqual(@as(u64, 0x4000), readU64(action.tx[0..], 16));
+    try std.testing.expectEqual(legacy_message_connection_id, action.connection_id);
+    try std.testing.expect(action.generation != modern_generation);
+
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        vmbus_protocol_post_failure(0x0012, 102, &action),
+    );
+    try std.testing.expectEqual(ActionKind.none, action.kind);
+
+    vmbus_protocol_start(200, &config, &action);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        vmbus_protocol_post_failure(0x0005, 201, &action),
+    );
+    try std.testing.expectEqual(ActionKind.none, action.kind);
 }
 
 test "explicit version rejection falls back to a legacy 4.0 packet" {

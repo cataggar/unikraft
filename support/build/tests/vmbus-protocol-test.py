@@ -26,6 +26,7 @@ def main() -> None:
     for symbol in (
         "vmbus_post_input",
         "vmbus_post_message",
+        "vmbus_protocol_post_failure",
         "vmbus_protocol_start",
         "vmbus_protocol_receive",
         "vmbus_protocol_tick",

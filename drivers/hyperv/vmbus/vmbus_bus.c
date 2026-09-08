@@ -374,6 +374,7 @@ static int dequeue_message(struct vmbus_rx_entry *entry)
 	return 1;
 }
 
+#ifndef VMBUS_BUS_HOST_TEST
 static __u64 post_hypercall(void *arg __unused, __u64 input_gpa)
 {
 	return hyperv_hypercall(0x005c, input_gpa, 0);
@@ -391,6 +392,7 @@ static void post_backoff(void *arg __unused, __u32 usec)
 			__asm__ __volatile__("pause");
 	}
 }
+#endif
 
 #ifdef VMBUS_BUS_HOST_TEST
 static void host_queue_unload_response(int wrong_generation)
@@ -454,9 +456,57 @@ static void host_handle_unload_transmit(const __u8 *message, size_t length)
 }
 #endif
 
+#ifndef VMBUS_BUS_HOST_TEST
+static __u32 control_message_type(const __u8 *message, size_t length)
+{
+	if (length < sizeof(__u32))
+		return 0;
+	return (__u32)message[0] | ((__u32)message[1] << 8) |
+		((__u32)message[2] << 16) | ((__u32)message[3] << 24);
+}
+
+static const char *post_status_name(__u16 status)
+{
+	switch (status) {
+	case 0x0000:
+		return "success";
+	case 0x0005:
+		return "invalid parameter";
+	case 0x0006:
+		return "access denied";
+	case 0x000e:
+		return "invalid VP index";
+	case 0x0011:
+		return "invalid port ID";
+	case 0x0012:
+		return "invalid connection ID";
+	case 0x0013:
+		return "insufficient buffers";
+	case 0x0018:
+		return "invalid SynIC state";
+	case 0xffff:
+		return "hypercall not issued";
+	default:
+		return "unknown";
+	}
+}
+
+static void report_post_failure(__u32 connection_id, const __u8 *message,
+				size_t length, __u16 status, int rc)
+{
+	uk_pr_err("VMBus: PostMessage connection %u control %u failed: "
+		  "Hyper-V status 0x%04x (%s), transport rc %d, "
+		  "input GPA 0x%lx\n",
+		  connection_id, control_message_type(message, length),
+		  status, post_status_name(status), rc, post_input_gpa);
+}
+#endif
+
 int vmbus_control_transmit(const __u8 *message, size_t length)
 {
 #ifndef VMBUS_BUS_HOST_TEST
+	__u32 connection_id;
+	__u16 status;
 	int rc;
 #endif
 
@@ -487,14 +537,16 @@ int vmbus_control_transmit(const __u8 *message, size_t length)
 	host_handle_unload_transmit(message, length);
 	return 0;
 #else
-	rc = vmbus_post_message(vmbus_protocol_connection_id(),
+	connection_id = vmbus_protocol_connection_id();
+	rc = vmbus_post_message(connection_id,
 				VMBUS_HV_MESSAGE_TYPE, message,
 				length, post_input_gpa,
+				&status,
 				(__u8)hyperv_has_post_messages(),
 				CONFIG_LIBVMBUS_POST_RETRIES,
 				post_hypercall, post_backoff, NULL);
 	if (rc) {
-		uk_pr_err("VMBus: PostMessage failed (%d)\n", rc);
+		report_post_failure(connection_id, message, length, status, rc);
 		return -EIO;
 	}
 	return 0;
@@ -503,14 +555,41 @@ int vmbus_control_transmit(const __u8 *message, size_t length)
 
 static int transmit(const struct vmbus_action *action)
 {
-	if (action->connection_id != vmbus_protocol_connection_id())
-		return vmbus_post_message(action->connection_id,
+#ifdef VMBUS_BUS_HOST_TEST
+	return vmbus_control_transmit(action->tx, action->tx_len);
+#else
+	struct vmbus_action retry;
+	__u16 status;
+	int rc;
+
+	rc = vmbus_post_message(action->connection_id,
 				VMBUS_HV_MESSAGE_TYPE, action->tx,
-				action->tx_len, post_input_gpa,
+				action->tx_len, post_input_gpa, &status,
 				(__u8)hyperv_has_post_messages(),
 				CONFIG_LIBVMBUS_POST_RETRIES,
-				post_hypercall, post_backoff, NULL) ? -EIO : 0;
-	return vmbus_control_transmit(action->tx, action->tx_len);
+				post_hypercall, post_backoff, NULL);
+	if (!rc)
+		return 0;
+	if (vmbus_protocol_post_failure(status, hyperv_reference_time(),
+					&retry)) {
+		uk_pr_info("VMBus: PostMessage connection %u control %u at "
+			   "input GPA 0x%lx returned Hyper-V status 0x%04x "
+			   "(%s); retrying protocol %u.%u on legacy "
+			   "connection %u\n",
+			   action->connection_id,
+			   control_message_type(action->tx, action->tx_len),
+			   post_input_gpa, status, post_status_name(status),
+			   ((__u32)retry.tx[8] | ((__u32)retry.tx[9] << 8) |
+			    ((__u32)retry.tx[10] << 16) |
+			    ((__u32)retry.tx[11] << 24)) >> 16,
+			   (__u32)retry.tx[8] | ((__u32)retry.tx[9] << 8),
+			   retry.connection_id);
+		return handle_action(&retry);
+	}
+	report_post_failure(action->connection_id, action->tx,
+			    action->tx_len, status, rc);
+	return -EIO;
+#endif
 }
 
 static struct vmbus_driver *find_driver(const struct vmbus_guid *class_id)
