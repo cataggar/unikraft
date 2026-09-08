@@ -16,6 +16,7 @@
 
 #include "netvsc-host-test.h"
 #include "netvsc_protocol.h"
+#include "vmbus_event_route.h"
 
 #if !CONFIG_LIBUKNETDEV_STATS
 #error "NetVSC production ownership tests require uknetdev statistics"
@@ -94,6 +95,7 @@ struct mock_state {
 	unsigned int reenter_channel_once;
 	unsigned int deferred_signal;
 	unsigned int deferred_count;
+	__u32 protocol_version;
 	unsigned int connection_fail_count;
 	unsigned int bind_epoch_count;
 	unsigned int bind_retry_count;
@@ -671,13 +673,24 @@ static int mock_run_deferred(void)
 	return 1;
 }
 
-void hyperv_vmbus_event(__u32 event)
+static void mock_enqueue_event(__u32 event, void *arg __unused)
 {
 	if (!mock.offered_device ||
 	    event != mock.offered_device->channel_id)
 		abort();
 	mock.deferred_count++;
 	mock.deferred_signal = 1;
+}
+
+void hyperv_vmbus_event(__u32 event)
+{
+	(void)vmbus_event_route(mock.protocol_version, event, NULL, 0,
+			       2048, mock_enqueue_event, NULL);
+}
+
+void vmbus_channel_schedule_event(__u32 channel_id)
+{
+	mock_enqueue_event(channel_id, NULL);
 }
 
 static void mock_flush_tx(void)
@@ -699,6 +712,7 @@ static void mock_reset(void)
 	memset(&mock, 0, sizeof(mock));
 	mock.channel.open = 1;
 	mock.quiesce_epoch = 1;
+	mock.protocol_version = VMBUS_EVENT_VERSION_WIN8;
 	mock.nvs_accept_index = 2;
 	mock.init_response_length = NETVSC_NVS_REQUEST_SIZE;
 	mock.receive_response_length = NETVSC_NVS_REQUEST_SIZE;
@@ -2601,7 +2615,7 @@ static int test_malformed_ring_recovery(void)
 	return 0;
 }
 
-static int test_bounded_channel_drain_and_cleanup(void)
+static int test_bounded_channel_drain_and_cleanup(__u32 version)
 {
 	struct vmbus_device offered = {
 		.channel_id = 97,
@@ -2620,6 +2634,7 @@ static int test_bounded_channel_drain_and_cleanup(void)
 
 	netvsc_host_reset();
 	mock_reset();
+	mock.protocol_version = version;
 	CHECK(netvsc_host_add_device(&offered) == 0);
 	CHECK(configure_and_start(&netdev) == 0);
 	mock.delay_tx = 1;
@@ -2756,8 +2771,17 @@ int main(void)
 	rc = test_failed_close_quarantines_tx();
 	if (rc)
 		return rc;
-	rc = test_bounded_channel_drain_and_cleanup();
-	if (rc)
-		return rc;
+	{
+		const __u32 versions[] = {
+			VMBUS_EVENT_VERSION_WIN8, (1U << 16) | 1U, 13U
+		};
+		unsigned int i;
+
+		for (i = 0; i < sizeof(versions) / sizeof(versions[0]); i++) {
+			rc = test_bounded_channel_drain_and_cleanup(versions[i]);
+			if (rc)
+				return rc;
+		}
+	}
 	return test_malformed_ring_recovery();
 }

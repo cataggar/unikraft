@@ -15,6 +15,7 @@
 int vmbus_channel_host_nested_ownership_test(void);
 int vmbus_bus_host_production_test(void);
 int vmbus_bus_host_quiesce_epoch_test(void);
+int vmbus_bus_host_software_event_test(void);
 struct vmbus_channel *
 vmbus_channel_host_prepare_open(struct vmbus_device *device);
 struct vmbus_channel *
@@ -1097,6 +1098,10 @@ static int test_receive_signal_failure_preserves_packet(void)
 int main(void)
 {
 #ifdef VMBUS_REAL_PROTOCOL_TEST
+	int rc = vmbus_bus_host_software_event_test();
+
+	if (rc)
+		return rc;
 	return vmbus_bus_host_quiesce_epoch_test();
 #else
 	int rc = vmbus_channel_host_nested_ownership_test();

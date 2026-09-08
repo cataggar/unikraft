@@ -20,7 +20,8 @@ packets per pump and attempts each TX exactly once. Persistent TX backpressure
 fails acceptance instead of spinning; a continuous RX flood returns to lwIP
 timers and the outer deadlines after every bounded batch. NetVSC also limits
 each deferred channel drain to 64 VMBus packets and requeues remaining work on
-the VMBus worker, so the bound applies below the stack adapter. The pinned
+the VMBus worker, including on legacy VMBus versions, so the bound applies
+below the stack adapter. The pinned
 external wrapper checkout remains unmodified.
 
 `UK_HYPERV_IO_READY` is emitted only when storage and the selected network mode
@@ -148,6 +149,9 @@ ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
 ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
 zig build test-network-regression -j2
 ```
+
+The required `test-hyperv-regression` selector includes this coverage, including
+the real worker continuation path after legacy protocol negotiation.
 
 The application fixture includes deterministic multi-pump callback-state
 regressions for a reset PCB with unsent bytes, delayed extra bytes or reset

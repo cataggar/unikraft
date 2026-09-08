@@ -2278,7 +2278,7 @@ static void netvsc_drain_channel(struct netvsc_device *device)
 			channel_id = device->vmbus_device->channel_id;
 		ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
 		if (channel_id)
-			hyperv_vmbus_event(channel_id);
+			vmbus_channel_schedule_event(channel_id);
 	}
 }
 

@@ -94,5 +94,6 @@ int vmbus_channel_receive(struct vmbus_channel *, struct vmbus_packet *,
 int vmbus_channel_poll(struct vmbus_channel *);
 void vmbus_channel_set_callback(struct vmbus_channel *,
 				vmbus_channel_callback_t, void *);
+void vmbus_channel_schedule_event(__u32);
 int vmbus_channel_mask_interrupts(struct vmbus_channel *);
 int vmbus_channel_unmask_interrupts(struct vmbus_channel *);

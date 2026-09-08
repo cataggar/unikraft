@@ -1080,6 +1080,7 @@ pub fn build(b: *std.Build) void {
         "support/build/tests/netvsc-host-include",
         "support/build/tests",
         "drivers/hyperv/netvsc",
+        "drivers/hyperv/vmbus",
     }) |path| netvsc_production_tests.root_module.addIncludePath(b.path(path));
     netvsc_production_tests.root_module.addCSourceFiles(.{
         .files = &.{
@@ -1150,6 +1151,7 @@ pub fn build(b: *std.Build) void {
     network_regression_tests.dependOn(&run_netvsc_protocol_tests.step);
     network_regression_tests.dependOn(&verify_netvsc_protocol.step);
     network_regression_tests.dependOn(&run_netvsc_production_tests.step);
+    network_regression_tests.dependOn(&run_vmbus_disconnect_tests.step);
     network_regression_tests.dependOn(&run_hyperv_acceptance_protocol_tests.step);
     network_regression_tests.dependOn(&run_application_protocol_tests.step);
     network_regression_tests.dependOn(&run_native_image_graph_tests.step);
@@ -1265,11 +1267,9 @@ pub fn build(b: *std.Build) void {
     );
     hyperv_regression_tests.dependOn(vmbus_lifecycle_tests);
     hyperv_regression_tests.dependOn(storvsc_regression_tests);
+    hyperv_regression_tests.dependOn(network_regression_tests);
     if (builtin.cpu.arch == .x86_64) {
         hyperv_regression_tests.dependOn(hyperv_irq_tests);
-        hyperv_regression_tests.dependOn(
-            &b.addRunArtifact(netvsc_production_tests).step,
-        );
     } else {
         hyperv_regression_tests.dependOn(
             &b.addRunArtifact(vmbus_protocol_tests).step,
@@ -1281,15 +1281,12 @@ pub fn build(b: *std.Build) void {
         const x86_host_notice = b.addSystemCommand(&.{
             "python3",
             "-c",
-            "print('INFO: x86-only hosted Hyper-V IRQ, driver, and SMP fixtures require the x86-64 CI job; running portable and freestanding checks on this host')",
+            "print('INFO: x86-only hosted Hyper-V IRQ and SMP fixtures require the x86-64 CI job; running portable and freestanding checks on this host')",
         });
         hyperv_regression_tests.dependOn(&x86_host_notice.step);
     }
     hyperv_regression_tests.dependOn(
         &b.addRunArtifact(vmbus_channel_tests).step,
-    );
-    hyperv_regression_tests.dependOn(
-        &b.addRunArtifact(netvsc_protocol_tests).step,
     );
     hyperv_regression_tests.dependOn(
         &b.addRunArtifact(netvsc_protocol_abi_tests).step,
@@ -1298,13 +1295,9 @@ pub fn build(b: *std.Build) void {
         &b.addRunArtifact(vmbus_abi_tests).step,
     );
     hyperv_regression_tests.dependOn(
-        &b.addRunArtifact(hyperv_acceptance_protocol_tests).step,
-    );
-    hyperv_regression_tests.dependOn(
         &b.addRunArtifact(platform_correctness_tests).step,
     );
     hyperv_regression_tests.dependOn(&verify_vmbus_channel.step);
-    hyperv_regression_tests.dependOn(&verify_netvsc_protocol.step);
     hyperv_regression_tests.dependOn(&hyperv_controller_fixtures.step);
     const lto_policy_tests = b.addSystemCommand(&.{
         "python3",
