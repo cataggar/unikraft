@@ -137,6 +137,10 @@ call the existing `run`/`cleanup` controller paths one VM at a time; it should
 not rebuild, repackage, add a second deployment pipeline, infer coverage from
 CPU/SKU labels, or allocate repeatedly to search for a protocol version.
 Ordinary pull requests intentionally have no Azure stage or credentials.
+The `zig-hyperv-local-evidence` CI artifact retains selected local serial and
+packaging logs, the packaging report, and EFI/debug-ELF digests for seven days,
+including boot failures. It excludes raw controller state, disk images, tool
+caches, and credentials.
 
 ## Run one Azure VM
 
