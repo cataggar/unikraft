@@ -18,10 +18,10 @@
 #include <uk/plat/time.h>
 #include <uk/print.h>
 #include <uk/sched.h>
+#include <uk/storvsc.h>
 #include <uk/thread.h>
 #include <uk/vmbus.h>
 
-#include "include/uk/storvsc.h"
 #include "storvsc_core.h"
 
 #define DRIVER_NAME			"hyperv-storvsc"

@@ -4,6 +4,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <uk/essentials.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define UK_STORVSC_INSTANCE_ID_SIZE	16U
 #define UK_STORVSC_VPD_ID_MAX		64U
@@ -42,11 +47,12 @@ int uk_storvsc_mapping_get(unsigned int index,
 int uk_storvsc_mapping_find(uint16_t blkdev_id,
 			    struct uk_storvsc_mapping *mapping);
 
-_Static_assert(sizeof(struct uk_storvsc_mapping) == 112,
-	       "StorVSC mapping ABI changed");
-_Static_assert(offsetof(struct uk_storvsc_mapping, sectors) == 32,
-	       "StorVSC mapping media offset changed");
-_Static_assert(offsetof(struct uk_storvsc_mapping, vpd_id) == 48,
-	       "StorVSC mapping VPD offset changed");
+UK_CTASSERT(sizeof(struct uk_storvsc_mapping) == 112);
+UK_CTASSERT(offsetof(struct uk_storvsc_mapping, sectors) == 32);
+UK_CTASSERT(offsetof(struct uk_storvsc_mapping, vpd_id) == 48);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* __UK_STORVSC_H__ */

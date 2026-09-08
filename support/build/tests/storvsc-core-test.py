@@ -13,6 +13,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--object", required=True)
     parser.add_argument("--nm", default="llvm-nm")
+    parser.add_argument("--mapping-api-object", action="append", default=[])
     args = parser.parse_args()
 
     undefined = output(args.nm, "-u", args.object).strip()
@@ -44,6 +45,19 @@ def main() -> None:
     ):
         if symbol not in symbols:
             raise SystemExit(f"missing StorVSC core symbol: {symbol}")
+    for path in args.mapping_api_object:
+        references = {
+            line.split()[0]
+            for line in output(args.nm, "-u", "--format=posix", path).splitlines()
+            if line.split()
+        }
+        for symbol in (
+            "uk_storvsc_mapping_count",
+            "uk_storvsc_mapping_get",
+            "uk_storvsc_mapping_find",
+        ):
+            if symbol not in references:
+                raise SystemExit(f"missing unmangled mapping API in {path}: {symbol}")
 
 
 if __name__ == "__main__":

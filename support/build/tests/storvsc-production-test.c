@@ -15,11 +15,11 @@
 #include <uk/config.h>
 #include <uk/paging.h>
 #include <uk/sched.h>
+#include <uk/storvsc.h>
 #include <uk/thread.h>
 #include <uk/vmbus.h>
 
 #include "storvsc_core.h"
-#include "include/uk/storvsc.h"
 
 #define TEST_CLOSE_RETRY_LIMIT 8
 

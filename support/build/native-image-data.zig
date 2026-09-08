@@ -87,6 +87,10 @@ pub const x86_64_efi_storvsc = Library{
         "libstorvsc/storvsc.o",
         "libstorvsc/libinfo.libuklibid.o",
     },
+    .export_symbols = .{
+        .root = .base,
+        .relative = "drivers/hyperv/storvsc/exportsyms.uk",
+    },
 };
 
 pub const x86_64_efi_uknetdev = Library{
