@@ -1,0 +1,15 @@
+menuconfig APPHYPERVACCEPTANCE
+	bool "Hyper-V hardware acceptance probe"
+	default y
+	depends on PLAT_HYPERV
+	select LIBNOLIBC
+	select LIBUKALLOC
+	select LIBUKSCHED
+	select LIBUKSCHEDCOOP
+	select LIBVMBUS
+	select LIBUKBLKDEV
+	select LIBSTORVSC
+	select LIBUKNETDEV
+	select LIBNETVSC
+	help
+	  Probe real Hyper-V StorVSC and NetVSC I/O without modifying storage.

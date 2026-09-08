@@ -9,7 +9,9 @@ import subprocess
 import tempfile
 
 
-def validate_boot_log(text, expected):
+def validate_boot_log(
+    text, expected, main_return=0, required_markers=(), forbidden_markers=()
+):
     for failure in ("Unikraft Crash", "Assertion failure", "Exception Type"):
         if failure in text:
             raise ValueError(f"guest reported {failure}")
@@ -19,10 +21,16 @@ def validate_boot_log(text, expected):
         "Powered by",
         "Calling main(",
         expected,
-        "main returned 0",
+        f"main returned {main_return}",
     ):
         if marker not in text:
             raise ValueError(f"missing boot milestone: {marker}")
+    for marker in required_markers:
+        if marker not in text:
+            raise ValueError(f"missing required marker: {marker}")
+    for marker in forbidden_markers:
+        if marker in text:
+            raise ValueError(f"forbidden marker present: {marker}")
 
 
 def main():
@@ -34,6 +42,9 @@ def main():
     parser.add_argument("--ovmf-vars", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--expect", required=True)
+    parser.add_argument("--expect-main-return", type=int, default=0)
+    parser.add_argument("--require-marker", action="append", default=[])
+    parser.add_argument("--forbid-marker", action="append", default=[])
     parser.add_argument("--qemu", default="qemu-system-x86_64")
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
@@ -79,10 +90,13 @@ def main():
             validate_boot_log(
                 log_path.read_text(errors="replace").replace("\0", ""),
                 args.expect,
+                args.expect_main_return,
+                args.require_marker,
+                args.forbid_marker,
             )
         except (subprocess.TimeoutExpired, ValueError) as error:
             raise SystemExit(f"{error}; guest log: {log_path}") from error
-    print(f"Hyper-V application boot passed; guest log: {log_path}")
+    print(f"Hyper-V application boot/log assertions passed; guest log: {log_path}")
     print("This does not establish VMBus, StorVSC, NetVSC, or Azure acceptance.")
 
 
