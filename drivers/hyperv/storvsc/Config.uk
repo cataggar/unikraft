@@ -29,6 +29,16 @@ config LIBSTORVSC_LUN_DISCOVERY
 		attach supported reported LUNs independently. Disabled preserves
 		the legacy LUN 0 path without issuing discovery commands.
 
+config LIBSTORVSC_GUARDED_IO
+	bool "Require an authorized StorVSC session for I/O"
+	depends on LIBSTORVSC_LUN_DISCOVERY
+	default n
+	help
+		Require a current read session for reads and an explicitly
+		authorized write session for writes and cache flushes. Sessions
+		are invalidated by reset, removal, or rebind. This destructive
+		acceptance guard is intentionally disabled for ordinary builds.
+
 config LIBSTORVSC_MAX_LUNS
 	int "Maximum LUNs per StorVSC controller"
 	range 1 64

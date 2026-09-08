@@ -31,6 +31,7 @@ def main() -> None:
         "storvsc_core_prepare_block",
         "storvsc_core_prepare_block_at",
         "storvsc_core_prepare_block_media",
+        "storvsc_core_prepare_block_media_cdb",
         "storvsc_core_begin_reset",
         "storvsc_core_cancel_all",
         "storvsc_core_take_completed",

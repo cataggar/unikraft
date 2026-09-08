@@ -1014,6 +1014,7 @@ fn prepareBlock(
     core: *Core,
     address: *const Address,
     media: *const Media,
+    cdb_size: u8,
     operation: c_int,
     start_sector: u64,
     sector_count: u64,
@@ -1031,6 +1032,8 @@ fn prepareBlock(
         return -einval;
     if (media.sectors == 0 or !sectorSizeValid(media.sector_size) or
         multiplyChecked(media.sectors, media.sector_size) == null)
+        return -einval;
+    if (cdb_size != 0 and cdb_size != 10 and cdb_size != 16)
         return -einval;
 
     var spec: ScsiSpec = .{
@@ -1076,9 +1079,13 @@ fn prepareBlock(
     else
         @intFromEnum(Direction.write);
     const last_sector = end - 1;
-    if (last_sector <= std.math.maxInt(u32) and
-        sector_count <= std.math.maxInt(u16))
-    {
+    const use_cdb10 = cdb_size == 10 or
+        (cdb_size == 0 and last_sector <= std.math.maxInt(u32) and
+            sector_count <= std.math.maxInt(u16));
+    if (use_cdb10) {
+        if (last_sector > std.math.maxInt(u32) or
+            sector_count > std.math.maxInt(u16))
+            return -einval;
         spec.cdb[0] = if (operation == 0) 0x28 else 0x2a;
         putBe32(spec.cdb[0..], 2, @intCast(start_sector));
         putBe16(spec.cdb[0..], 7, @intCast(sector_count));
@@ -1123,6 +1130,7 @@ export fn storvsc_core_prepare_block(
         core,
         &address,
         &media,
+        0,
         operation,
         start_sector,
         sector_count,
@@ -1157,6 +1165,7 @@ export fn storvsc_core_prepare_block_at(
         core,
         address,
         &media,
+        0,
         operation,
         start_sector,
         sector_count,
@@ -1183,6 +1192,35 @@ export fn storvsc_core_prepare_block_media(
         coreFrom(storage),
         address,
         media,
+        0,
+        operation,
+        start_sector,
+        sector_count,
+        buffer_address,
+        now,
+        timeout_ns,
+        tx,
+    );
+}
+
+export fn storvsc_core_prepare_block_media_cdb(
+    storage: *align(core_storage_align) anyopaque,
+    address: *const Address,
+    media: *const Media,
+    cdb_size: u8,
+    operation: c_int,
+    start_sector: u64,
+    sector_count: u64,
+    buffer_address: u64,
+    now: u64,
+    timeout_ns: u64,
+    tx: *Tx,
+) callconv(.c) c_int {
+    return prepareBlock(
+        coreFrom(storage),
+        address,
+        media,
+        cdb_size,
         operation,
         start_sector,
         sector_count,
@@ -2986,6 +3024,102 @@ test "per-LUN media controls bounds and access independently" {
             &address,
             &invalid_media,
             0,
+            0,
+            1,
+            0x1000,
+            10,
+            100,
+            &tx,
+        ),
+    );
+}
+
+test "guarded CDB selector supports explicit ten and sixteen byte commands" {
+    var storage: [core_storage_size]u8 align(core_storage_align) = undefined;
+    var tx: Tx = undefined;
+    const address: Address = .{
+        .path_id = 1,
+        .target_id = 2,
+        .lun = 3,
+        .reserved = 0,
+    };
+    const media: Media = .{
+        .sectors = @as(u64, std.math.maxInt(u32)) + 2,
+        .sector_size = 512,
+        .read_only = 0,
+        .reserved = [_]u8{0} ** 3,
+    };
+
+    _ = storvsc_core_initialize(&storage, 1, 4);
+    try initializeReady(&storage, 0);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_core_set_transfer_limit(&storage, 128 * 1024),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_core_prepare_block_media_cdb(
+            &storage,
+            &address,
+            &media,
+            10,
+            1,
+            7,
+            1,
+            0x1000,
+            10,
+            100,
+            &tx,
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 0x2a), tx.packet[28]);
+    try std.testing.expectEqual(@as(u8, 10), tx.packet[20]);
+    _ = storvsc_core_abort(&storage, tx.slot, tx.transaction_id);
+
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_core_prepare_block_media_cdb(
+            &storage,
+            &address,
+            &media,
+            16,
+            0,
+            7,
+            1,
+            0x1000,
+            10,
+            100,
+            &tx,
+        ),
+    );
+    try std.testing.expectEqual(@as(u8, 0x88), tx.packet[28]);
+    try std.testing.expectEqual(@as(u8, 16), tx.packet[20]);
+    _ = storvsc_core_abort(&storage, tx.slot, tx.transaction_id);
+
+    try std.testing.expectEqual(
+        -einval,
+        storvsc_core_prepare_block_media_cdb(
+            &storage,
+            &address,
+            &media,
+            10,
+            1,
+            std.math.maxInt(u32),
+            2,
+            0x1000,
+            10,
+            100,
+            &tx,
+        ),
+    );
+    try std.testing.expectEqual(
+        -einval,
+        storvsc_core_prepare_block_media_cdb(
+            &storage,
+            &address,
+            &media,
+            12,
+            1,
             0,
             1,
             0x1000,

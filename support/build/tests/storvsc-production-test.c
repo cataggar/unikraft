@@ -32,6 +32,7 @@ struct uk_blkdev *storvsc_host_blkdev_address(unsigned int controller,
 int storvsc_host_controller_online(unsigned int controller);
 size_t storvsc_host_lun_count(void);
 void storvsc_host_set_lun_discovery(int enabled);
+void storvsc_host_set_guarded_io(int enabled);
 int storvsc_host_lun_address(size_t index,
 			     struct storvsc_address *address);
 int storvsc_host_receive(void);
@@ -131,6 +132,10 @@ static int io_packet_error_once;
 static int publish_error_once;
 static uint64_t last_io_id;
 static uint32_t last_io_length;
+static uint8_t last_io_opcode;
+static unsigned int io_command_count;
+static int backing_media_enabled;
+static uint8_t backing_media[128 * 512];
 static uint32_t last_pfn_count;
 static uint64_t last_pfns[64];
 static unsigned int close_count;
@@ -207,6 +212,7 @@ enum {
 	VPD_UNSUPPORTED,
 	VPD_MALFORMED,
 	VPD_MALFORMED_LUN2,
+	VPD_DUPLICATE,
 };
 
 static uint32_t get_le32(const uint8_t *bytes, size_t offset)
@@ -223,6 +229,12 @@ static uint32_t get_be32(const uint8_t *bytes, size_t offset)
 		((uint32_t)bytes[offset + 1] << 16) |
 		((uint32_t)bytes[offset + 2] << 8) |
 		(uint32_t)bytes[offset + 3];
+}
+
+static uint64_t get_be64(const uint8_t *bytes, size_t offset)
+{
+	return ((uint64_t)get_be32(bytes, offset) << 32) |
+		get_be32(bytes, offset + 4);
 }
 
 static void put_le32(uint8_t *bytes, size_t offset, uint32_t value)
@@ -590,6 +602,29 @@ static void range_write(const struct vmbus_gpa_range *range,
 		abort();
 }
 
+static void range_read(const struct vmbus_gpa_range *range,
+		       uint8_t *destination, uint32_t length)
+{
+	uint32_t remaining = length;
+	uint32_t destination_offset = 0;
+
+	for (uint32_t i = 0; i < range->pfn_count && remaining; i++) {
+		uint8_t *page = virtual_page_for_pfn(range->pfns[i]);
+		uint32_t offset = i ? 0 : range->byte_offset;
+		uint32_t chunk = 4096 - offset;
+
+		if (!page)
+			abort();
+		if (chunk > remaining)
+			chunk = remaining;
+		memcpy(destination + destination_offset, page + offset, chunk);
+		destination_offset += chunk;
+		remaining -= chunk;
+	}
+	if (remaining)
+		abort();
+}
+
 static void fill_read_data(const struct vmbus_gpa_range *range,
 			   uint32_t length, uint8_t seed)
 {
@@ -601,6 +636,12 @@ static void fill_read_data(const struct vmbus_gpa_range *range,
 		data[i] = (uint8_t)(i ^ seed);
 	range_write(range, data, length);
 	free(data);
+}
+
+static uint64_t scsi_io_lba(const uint8_t *payload, uint8_t opcode)
+{
+	return opcode == 0x28 || opcode == 0x2a ?
+		get_be32(payload, 30) : get_be64(payload, 30);
 }
 
 static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
@@ -704,10 +745,13 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 				data[5] = 3;
 				data[7] = 8;
 				data[8] = 0x50;
-				data[9] = (uint8_t)controller;
-				memcpy(data + 10,
-				       channel->device->instance_id.bytes, 5);
-				data[15] = lun;
+				if (vpd_mode != VPD_DUPLICATE) {
+					data[9] = (uint8_t)controller;
+					memcpy(data + 10,
+					       channel->device->instance_id.bytes,
+					       5);
+					data[15] = lun;
+				}
 				response_transfer = 16;
 			}
 			range_write(range, data, response_transfer);
@@ -766,11 +810,25 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 	case 0x88:
 		last_io_id = id;
 		last_io_length = transfer;
+		last_io_opcode = opcode;
+		io_command_count++;
 		if (hold_io) {
-			fill_read_data(range, transfer,
-				       topology_fixture ?
-				       (uint8_t)(0x20 + controller * 0x10 + lun) :
-				       0x5a);
+			if (backing_media_enabled) {
+				uint64_t lba = scsi_io_lba(payload, opcode);
+
+				if (lba * 512 + transfer >
+				    sizeof(backing_media))
+					abort();
+				range_write(range, backing_media + lba * 512,
+					    transfer);
+			} else {
+				fill_read_data(
+					range, transfer,
+					topology_fixture ?
+					(uint8_t)(0x20 + controller * 0x10 +
+						  lun) :
+					0x5a);
+			}
 			if (pending_count >= 32)
 				abort();
 			pending[pending_count++] = (struct pending_io){
@@ -780,10 +838,18 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 			};
 			return;
 		}
-		fill_read_data(range, transfer,
-			       topology_fixture ?
-			       (uint8_t)(0x20 + controller * 0x10 + lun) :
-			       0x5a);
+		if (backing_media_enabled) {
+			uint64_t lba = scsi_io_lba(payload, opcode);
+
+			if (lba * 512 + transfer > sizeof(backing_media))
+				abort();
+			range_write(range, backing_media + lba * 512, transfer);
+		} else {
+			fill_read_data(range, transfer,
+				       topology_fixture ?
+				       (uint8_t)(0x20 + controller * 0x10 + lun) :
+				       0x5a);
+		}
 		if (short_transfer_once) {
 			response_transfer--;
 			short_transfer_once = 0;
@@ -793,6 +859,15 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 	case 0x8a:
 		last_io_id = id;
 		last_io_length = transfer;
+		last_io_opcode = opcode;
+		io_command_count++;
+		if (backing_media_enabled) {
+			uint64_t lba = scsi_io_lba(payload, opcode);
+
+			if (lba * 512 + transfer > sizeof(backing_media))
+				abort();
+			range_read(range, backing_media + lba * 512, transfer);
+		}
 		if (hold_io) {
 			pending[pending_count++] = (struct pending_io){
 				.channel = channel,
@@ -805,6 +880,18 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 	case 0x35:
 		last_io_id = id;
 		last_io_length = 0;
+		last_io_opcode = opcode;
+		io_command_count++;
+		if (hold_io) {
+			if (pending_count >= 32)
+				abort();
+			pending[pending_count++] = (struct pending_io){
+				.channel = channel,
+				.id = id,
+				.length = 0,
+			};
+			return;
+		}
 		break;
 	default:
 		enqueue_completion_on(channel, id, packet_length, 0, 0x86,
@@ -2711,6 +2798,8 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	};
 	struct uk_storvsc_mapping mappings[8];
 	struct uk_storvsc_mapping found;
+	struct uk_storvsc_target_snapshot guarded_targets[3];
+	struct uk_storvsc_session guarded_sessions[3];
 	struct uk_blkdev *devices[4];
 	struct uk_blkreq requests[4];
 	struct uk_blkreq check;
@@ -2810,6 +2899,38 @@ static int run_topology_regression(struct vmbus_driver *driver,
 			return 38;
 	}
 	primary_events = *events;
+	storvsc_host_set_guarded_io(1);
+	if (uk_storvsc_target_get(0, &guarded_targets[0]) ||
+	    uk_storvsc_target_get(2, &guarded_targets[1]) ||
+	    uk_storvsc_target_get(3, &guarded_targets[2]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[0], &guarded_sessions[0]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[1], &guarded_sessions[1]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[2], &guarded_sessions[2]) ||
+	    uk_storvsc_session_authorize_write(&guarded_sessions[0]) ||
+	    uk_storvsc_session_authorize_write(&guarded_sessions[1]) !=
+		    -EBUSY ||
+	    uk_storvsc_session_authorize_write(&guarded_sessions[2]) !=
+		    -EROFS ||
+	    uk_storvsc_session_end(&guarded_sessions[0]) ||
+	    uk_storvsc_session_end(&guarded_sessions[1]) ||
+	    uk_storvsc_session_end(&guarded_sessions[2]))
+		return 426;
+	if (uk_storvsc_target_get(0, &guarded_targets[0]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[0], &guarded_sessions[0]))
+		return 427;
+	storvsc_host_set_guarded_io(1);
+	if (uk_storvsc_session_validate(
+		    &guarded_sessions[0], &guarded_targets[1]) != -ESTALE ||
+	    uk_storvsc_target_get(0, &guarded_targets[0]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[0], &guarded_sessions[0]) ||
+	    uk_storvsc_session_end(&guarded_sessions[0]))
+		return 428;
+	storvsc_host_set_guarded_io(0);
 
 	atomic_init(&callbacks, 0);
 	hold_io = 1;
@@ -3154,9 +3275,283 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	driver->remove_dev(&secondary);
 	if (secondary.channel)
 		(void)vmbus_channel_close(secondary.channel);
+	vpd_mode = VPD_DUPLICATE;
+	secondary.present = 1;
+	primary->present = 1;
+	if (driver->add_dev(&secondary) || driver->add_dev(primary) ||
+	    uk_storvsc_mapping_count() != 4)
+		return 429;
+	for (unsigned int i = 0; i < 4; i++) {
+		if (uk_storvsc_mapping_get(i, &mappings[i]) ||
+		    mappings[i].vpd_length != 8 ||
+		    memcmp(mappings[i].vpd_id, mappings[0].vpd_id, 8))
+			return 430;
+	}
+	driver->remove_dev(primary);
+	if (primary->channel)
+		(void)vmbus_channel_close(primary->channel);
+	driver->remove_dev(&secondary);
+	if (secondary.channel)
+		(void)vmbus_channel_close(secondary.channel);
 	topology_fixture = 0;
 	vpd_mode = VPD_NORMAL;
 	report_luns_mode = REPORT_LUNS_NORMAL;
+	return 0;
+}
+
+static int target_for_device(struct uk_blkdev *device,
+			     struct uk_storvsc_target_snapshot *snapshot)
+{
+	unsigned int count = uk_storvsc_mapping_count();
+
+	for (unsigned int i = 0; i < count; i++) {
+		if (uk_storvsc_target_get(i, snapshot))
+			continue;
+		if (snapshot->mapping.controller_index == 0 &&
+		    !snapshot->mapping.path_id &&
+		    !snapshot->mapping.target_id &&
+		    !snapshot->mapping.lun) {
+			(void)device;
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+static int run_guarded_io_regression(
+	struct vmbus_driver *driver, struct vmbus_device *vmbus_device,
+	uint8_t *buffer, int *events)
+{
+	struct uk_storvsc_target_snapshot target;
+	struct uk_storvsc_target_snapshot current;
+	struct uk_storvsc_session session;
+	struct uk_blkdev *device;
+	struct uk_blkreq request;
+	atomic_int callbacks;
+	unsigned int sends;
+	uint64_t generation;
+	int rc;
+	report_luns_mode = REPORT_LUNS_NORMAL;
+	vpd_mode = VPD_NORMAL;
+	read_only_media = 0;
+	use_capacity16 = 0;
+	topology_fixture = 0;
+	backing_media_enabled = 1;
+	memset(backing_media, 0, sizeof(backing_media));
+	vmbus_device->present = 1;
+	if (driver->add_dev(vmbus_device))
+		return 500;
+	device = storvsc_host_blkdev_address(0, 0);
+	if (activate_device(device, events))
+		return 501;
+	if (target_for_device(device, &target) ||
+	    uk_storvsc_session_begin_read(&target, &session) != -ENOTSUP)
+		return 502;
+	storvsc_host_set_guarded_io(1);
+	if (target_for_device(device, &target) || !target.mapping.vpd_length)
+		return 502;
+	generation = target.controller_generation;
+
+	atomic_init(&callbacks, 0);
+	sends = io_command_count;
+	initialize_request(&request, UK_BLKREQ_READ, 0, 1, buffer,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EACCES || io_command_count != sends)
+		return 503;
+	initialize_request(&request, UK_BLKREQ_WRITE, 0, 1, buffer,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EACCES || io_command_count != sends)
+		return 504;
+	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EACCES || io_command_count != sends)
+		return 505;
+
+	current = target;
+	current.mapping.sectors++;
+	if (uk_storvsc_session_begin_read(&current, &session) != -ESTALE)
+		return 506;
+	current = target;
+	current.mapping.vpd_id[0] ^= 1;
+	if (uk_storvsc_session_begin_read(&current, &session) != -ESTALE)
+		return 506;
+	if (uk_storvsc_session_begin_read(&target, &session))
+		return 507;
+	for (unsigned int attempt = 0; ; attempt++) {
+		uk_sched_thread_sleep(1000000ULL);
+		rc = uk_storvsc_session_validate(&session, &current);
+		if (!rc)
+			break;
+		if (rc != -ESTALE || attempt == 99 ||
+		    target_for_device(device, &target) ||
+		    uk_storvsc_session_begin_read(&target, &session))
+			return 508;
+	}
+	if (memcmp(&target, &current, sizeof(target)))
+		return 508;
+
+	initialize_request(&request, UK_BLKREQ_READ, 1, 1, buffer,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result)
+		return 509;
+	sends = io_command_count;
+	initialize_request(&request, UK_BLKREQ_WRITE, 1, 1, buffer,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EACCES || io_command_count != sends)
+		return 510;
+	if (uk_storvsc_session_authorize_write(&session) ||
+	    uk_storvsc_session_set_cdb(&session, 9) != -EINVAL ||
+	    uk_storvsc_session_set_cdb(&session, UK_STORVSC_CDB_10))
+		return 511;
+	sends = io_command_count;
+	initialize_request(&request, UK_BLKREQ_WRITE, 1000, 1, buffer,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EINVAL || io_command_count != sends)
+		return 511;
+	initialize_request(&request, UK_BLKREQ_WRITE, 1, 1, buffer + 1,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EINVAL || io_command_count != sends)
+		return 511;
+
+	for (unsigned int i = 0; i < 16 * 512; i++)
+		buffer[i] = (uint8_t)(i * 17U + 3U);
+	initialize_request(&request, UK_BLKREQ_WRITE, 32, 16, buffer,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result ||
+	    last_io_opcode != 0x2a || last_pfn_count < 2)
+		return 512;
+	memset(buffer, 0, 16 * 512);
+	initialize_request(&request, UK_BLKREQ_READ, 32, 16, buffer,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result ||
+	    last_io_opcode != 0x28)
+		return 513;
+	for (unsigned int i = 0; i < 16 * 512; i++) {
+		if (buffer[i] != (uint8_t)(i * 17U + 3U))
+			return 514;
+	}
+
+	if (uk_storvsc_session_set_cdb(&session, UK_STORVSC_CDB_16))
+		return 515;
+	memset(buffer, 0xa7, 512);
+	initialize_request(&request, UK_BLKREQ_WRITE, 127, 1, buffer,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result ||
+	    last_io_opcode != 0x8a)
+		return 516;
+	initialize_request(&request, UK_BLKREQ_READ, 127, 1, buffer + 512,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result ||
+	    last_io_opcode != 0x88 ||
+	    memcmp(buffer, buffer + 512, 512))
+		return 517;
+
+	io_packet_error_once = 1;
+	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result != -EIO)
+		return 518;
+	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result)
+		return 519;
+
+	hold_io = 1;
+	pending_count = 0;
+	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
+			   request_done, &callbacks);
+	if (!(device->submit_one(device, device->_queue[0], &request) &
+	      UK_BLKDEV_STATUS_SUCCESS))
+		return 520;
+	storvsc_host_force_timeout();
+	if (wait_finished(&request, 1000) ||
+	    request.result != -ETIMEDOUT)
+		return 521;
+	enqueue_completion(last_io_id, 64, 0, 1, 0, 0);
+	pending_count = 0;
+	fire_channel();
+	if (atomic_load(&callbacks) != 8)
+		return 522;
+	rc = uk_storvsc_session_validate(&session, &current);
+	if (rc != -ESTALE)
+		return 523;
+	driver->remove_dev(vmbus_device);
+	if (vmbus_device->channel)
+		(void)vmbus_channel_close(vmbus_device->channel);
+	hold_io = 0;
+	vmbus_device->present = 1;
+	if (driver->add_dev(vmbus_device) ||
+	    activate_device(device, events))
+		return 523;
+	rc = target_for_device(device, &current);
+	if (rc)
+		return 523;
+	rc = uk_storvsc_session_begin_read(&current, &session);
+	if (rc)
+		return 523;
+	rc = uk_storvsc_session_authorize_write(&session);
+	if (rc)
+		return 523;
+	if (uk_storvsc_session_set_cdb(
+		    &session, UK_STORVSC_CDB_16))
+		return 523;
+
+	hold_io = 1;
+	pending_count = 0;
+	initialize_request(&request, UK_BLKREQ_WRITE, 2, 1, buffer,
+			   request_done, &callbacks);
+	if (!(device->submit_one(device, device->_queue[0], &request) &
+	      UK_BLKDEV_STATUS_SUCCESS) ||
+	    uk_storvsc_session_end(&session) != -EBUSY)
+		return 524;
+	driver->remove_dev(vmbus_device);
+	if (request.result != -ENODEV ||
+	    atomic_load(&request.state.counter) != UK_BLKREQ_FINISHED ||
+	    uk_storvsc_session_validate(&session, &current) != -ESTALE)
+		return 525;
+	enqueue_completion(last_io_id, 64, 0, 1, 0, last_io_length);
+	pending_count = 0;
+	fire_channel();
+	if (atomic_load(&callbacks) != 9)
+		return 526;
+	if (vmbus_device->channel)
+		(void)vmbus_channel_close(vmbus_device->channel);
+	hold_io = 0;
+
+	vmbus_device->present = 1;
+	if (driver->add_dev(vmbus_device) ||
+	    target_for_device(device, &current) ||
+	    current.controller_generation == generation ||
+	    uk_storvsc_session_validate(&session, &target) != -ESTALE)
+		return 527;
+	if (uk_storvsc_session_begin_read(&current, &session) ||
+	    uk_storvsc_session_authorize_write(&session) ||
+	    uk_storvsc_session_end(&session))
+		return 528;
+
+	driver->remove_dev(vmbus_device);
+	if (vmbus_device->channel)
+		(void)vmbus_channel_close(vmbus_device->channel);
+	vpd_mode = VPD_UNSUPPORTED;
+	vmbus_device->present = 1;
+	if (driver->add_dev(vmbus_device) ||
+	    target_for_device(device, &current) ||
+	    current.mapping.vpd_length ||
+	    uk_storvsc_session_begin_read(&current, &session) != -EINVAL)
+		return 529;
+	driver->remove_dev(vmbus_device);
+	if (vmbus_device->channel)
+		(void)vmbus_channel_close(vmbus_device->channel);
+
+	storvsc_host_set_guarded_io(0);
+	backing_media_enabled = 0;
+	vpd_mode = VPD_NORMAL;
 	return 0;
 }
 
@@ -3240,7 +3635,8 @@ int main(void)
 		return 10;
 	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
 			   request_done, &callbacks);
-	if (submit_and_fire(device, &request) || request.result)
+	rc = submit_and_fire(device, &request);
+	if (rc || request.result)
 		return 11;
 	io_packet_error_once = 1;
 	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
@@ -3533,6 +3929,10 @@ int main(void)
 		return rc;
 	if (unregister_calls)
 		return 67;
+	rc = run_guarded_io_regression(
+		driver, &vmbus_device, buffer, &events);
+	if (rc)
+		return rc;
 
 	free(buffer);
 	return 0;

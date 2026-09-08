@@ -21,6 +21,9 @@
 #define STORVSC_DIRECTION_WRITE		0U
 #define STORVSC_DIRECTION_READ		1U
 #define STORVSC_DIRECTION_NONE		2U
+#define STORVSC_CDB_AUTO		0U
+#define STORVSC_CDB_10			10U
+#define STORVSC_CDB_16			16U
 
 enum storvsc_event_kind {
 	STORVSC_EVENT_IGNORED = 0,
@@ -145,6 +148,11 @@ int storvsc_core_prepare_block_media(void *storage,
 				     uint64_t buffer_address, uint64_t now,
 				     uint64_t timeout_ns,
 				     struct storvsc_tx *tx);
+int storvsc_core_prepare_block_media_cdb(
+	void *storage, const struct storvsc_address *address,
+	const struct storvsc_media *media, uint8_t cdb_size, int operation,
+	uint64_t start_sector, uint64_t sector_count, uint64_t buffer_address,
+	uint64_t now, uint64_t timeout_ns, struct storvsc_tx *tx);
 int storvsc_core_begin_reset(void *storage, uint64_t now,
 			     uint64_t timeout_ns,
 			     struct storvsc_event *event);

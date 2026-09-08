@@ -83,11 +83,18 @@ struct storvsc_lun {
 	struct storvsc_address address;
 	struct storvsc_media media;
 	struct storvsc_vpd_id vpd_id;
+	__u64 generation;
+	__u64 session_cookie;
+	__u64 session_topology_generation;
+	__u64 session_controller_generation;
+	__u64 session_lun_generation;
 	__u16 uid;
 	__u8 registered;
 	__u8 present;
 	__u8 started;
 	__u8 completion_pending;
+	__u8 session_state;
+	__u8 session_cdb_size;
 };
 
 struct storvsc_device {
@@ -112,6 +119,7 @@ struct storvsc_device {
 	__spinlock lock;
 	__spinlock receive_lock;
 	__u32 epoch;
+	__u64 session_generation;
 	__u16 index;
 	__u16 interrupt_users;
 	__u8 initialized;
@@ -142,6 +150,11 @@ struct storvsc_device {
 
 static struct storvsc_device storvsc_devices[CONFIG_LIBSTORVSC_MAX_DEVICES];
 static __spinlock storvsc_topology_lock = UKARCH_SPINLOCK_INITIALIZER();
+static struct storvsc_lun *storvsc_write_lun;
+static __u64 storvsc_session_cookie;
+static int storvsc_session_cookie_exhausted;
+static __u64 storvsc_topology_generation;
+static int storvsc_topology_generation_exhausted;
 #if defined(CONFIG_LIBSTORVSC_LUN_DISCOVERY) && \
 	CONFIG_LIBSTORVSC_LUN_DISCOVERY
 #define STORVSC_LUN_DISCOVERY_DEFAULT 1
@@ -155,9 +168,27 @@ static __u64 storvsc_busy_retry_timeout_ns =
 	STORVSC_BUSY_RETRY_TIMEOUT_NS;
 static int storvsc_lun_discovery_enabled =
 	STORVSC_LUN_DISCOVERY_DEFAULT;
+#if defined(CONFIG_LIBSTORVSC_GUARDED_IO) && \
+	CONFIG_LIBSTORVSC_GUARDED_IO
+static int storvsc_guarded_io_enabled = 1;
+#else
+static int storvsc_guarded_io_enabled;
+#endif
 #else
 #define storvsc_lun_discovery_enabled STORVSC_LUN_DISCOVERY_DEFAULT
+#if defined(CONFIG_LIBSTORVSC_GUARDED_IO) && \
+	CONFIG_LIBSTORVSC_GUARDED_IO
+#define storvsc_guarded_io_enabled 1
+#else
+#define storvsc_guarded_io_enabled 0
 #endif
+#endif
+
+enum storvsc_session_state {
+	STORVSC_SESSION_NONE,
+	STORVSC_SESSION_READ,
+	STORVSC_SESSION_WRITE,
+};
 
 _Static_assert(CONFIG_LIBSTORVSC_MAX_DEVICES >= 1 &&
 	       CONFIG_LIBSTORVSC_MAX_DEVICES <= 8,
@@ -221,6 +252,65 @@ static struct vmbus_channel *
 storvsc_channel_detach(struct storvsc_device *device)
 {
 	return __atomic_exchange_n(&device->channel, NULL, __ATOMIC_ACQ_REL);
+}
+
+static void storvsc_release_write_session(struct storvsc_lun *lun)
+{
+	struct storvsc_lun *expected = lun;
+
+	(void)__atomic_compare_exchange_n(
+		&storvsc_write_lun, &expected, NULL, 0,
+		__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static void storvsc_advance_topology_generation(void)
+{
+	__u64 current;
+
+	if (__atomic_load_n(
+		    &storvsc_topology_generation_exhausted,
+		    __ATOMIC_ACQUIRE))
+		return;
+	current = __atomic_load_n(
+		&storvsc_topology_generation, __ATOMIC_RELAXED);
+	for (;;) {
+		if (current == UINT64_MAX) {
+			__atomic_store_n(
+				&storvsc_topology_generation_exhausted, 1,
+				__ATOMIC_RELEASE);
+			return;
+		}
+		if (__atomic_compare_exchange_n(
+			    &storvsc_topology_generation, &current,
+			    current + 1, 0, __ATOMIC_ACQ_REL,
+			    __ATOMIC_RELAXED)) {
+			__atomic_store_n(
+				&storvsc_write_lun, NULL, __ATOMIC_RELEASE);
+			return;
+		}
+	}
+}
+
+static void
+storvsc_invalidate_sessions_locked(struct storvsc_device *device)
+{
+	unsigned int i;
+
+	storvsc_advance_topology_generation();
+	if (device->session_generation != UINT64_MAX)
+		device->session_generation++;
+	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
+		struct storvsc_lun *lun = &device->luns[i];
+
+		if (lun->session_state == STORVSC_SESSION_WRITE)
+			storvsc_release_write_session(lun);
+		lun->session_state = STORVSC_SESSION_NONE;
+		lun->session_cookie = 0;
+		lun->session_topology_generation = 0;
+		lun->session_controller_generation = 0;
+		lun->session_lun_generation = 0;
+		lun->session_cdb_size = UK_STORVSC_CDB_AUTO;
+	}
 }
 
 static int storvsc_build_gpa_range(
@@ -362,6 +452,7 @@ static int storvsc_schedule_fatal(struct storvsc_device *device, int error)
 	    device->deferred_action != STORVSC_DEFER_REMOVE) {
 		device->fatal_error = error ? error : -EIO;
 		device->online = 0;
+		storvsc_invalidate_sessions_locked(device);
 		scheduled = 1;
 	}
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
@@ -1052,6 +1143,7 @@ static void storvsc_deferred_schedule(struct storvsc_device *device,
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	device->online = 0;
 	device->recovering = 1;
+	storvsc_invalidate_sessions_locked(device);
 	if (action == STORVSC_DEFER_REMOVE) {
 		device->removing = 1;
 		device->vmbus_device = NULL;
@@ -1127,6 +1219,7 @@ static int storvsc_reset_timed_out_io(struct storvsc_device *device)
 	device->recovering = 1;
 	device->reset_done = 0;
 	device->reset_result = -ETIMEDOUT;
+	storvsc_invalidate_sessions_locked(device);
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 #ifdef STORVSC_HOST_TEST
 	storvsc_host_recovery_begin_hook();
@@ -1372,6 +1465,7 @@ static int storvsc_submit(struct uk_blkdev *blkdev,
 	int published;
 	int rc;
 	int status;
+	__u8 cdb_size = UK_STORVSC_CDB_AUTO;
 
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	if (!device->online || device->removing || !lun->present) {
@@ -1386,16 +1480,36 @@ static int storvsc_submit(struct uk_blkdev *blkdev,
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return -EINVAL;
 	}
+	if (storvsc_guarded_io_enabled) {
+		if (lun->session_state == STORVSC_SESSION_NONE ||
+		    lun->session_topology_generation !=
+			    __atomic_load_n(&storvsc_topology_generation,
+					    __ATOMIC_ACQUIRE) ||
+		    lun->session_controller_generation !=
+			    device->session_generation ||
+		    lun->session_lun_generation != lun->generation) {
+			ukplat_spin_unlock_irqrestore(&device->lock, flags);
+			return -EACCES;
+		}
+		if (request->operation != UK_BLKREQ_READ &&
+		    (lun->session_state != STORVSC_SESSION_WRITE ||
+		     __atomic_load_n(&storvsc_write_lun,
+				     __ATOMIC_ACQUIRE) != lun)) {
+			ukplat_spin_unlock_irqrestore(&device->lock, flags);
+			return -EACCES;
+		}
+		cdb_size = lun->session_cdb_size;
+	}
 	active = storvsc_lun_active_count_locked(device, lun);
 	if (active >= queue->nb_desc) {
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return -ENOSPC;
 	}
-	rc = storvsc_core_prepare_block_media(
-		device->core, &lun->address, &lun->media, request->operation,
-		request->start_sector, request->nb_sectors,
-		(uintptr_t)request->aio_buf, ukplat_monotonic_clock(),
-		STORVSC_REQUEST_TIMEOUT_NS, &tx);
+	rc = storvsc_core_prepare_block_media_cdb(
+		device->core, &lun->address, &lun->media, cdb_size,
+		request->operation, request->start_sector,
+		request->nb_sectors, (uintptr_t)request->aio_buf,
+		ukplat_monotonic_clock(), STORVSC_REQUEST_TIMEOUT_NS, &tx);
 	if (rc) {
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return rc;
@@ -1861,26 +1975,17 @@ storvsc_collect_mappings(struct storvsc_lun **entries,
 	return count;
 }
 
-static int storvsc_copy_mapping(struct storvsc_lun *lun,
-				struct uk_storvsc_mapping *mapping)
+static int storvsc_fill_mapping_locked(
+	struct storvsc_lun *lun, struct uk_storvsc_mapping *mapping)
 {
-	struct storvsc_device *device;
-	unsigned long flags;
+	struct storvsc_device *device = lun->controller;
 
-	if (!lun || !mapping)
-		return -EINVAL;
-	device = lun->controller;
 	memset(mapping, 0, sizeof(*mapping));
-	ukplat_spin_lock_irqsave(&device->lock, flags);
 	if (!lun->registered || !lun->present || !device->online ||
-	    device->binding || device->removing || !device->vmbus_device) {
-		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	    device->binding || device->removing || !device->vmbus_device)
 		return -ENOENT;
-	}
-	if (lun->vpd_id.length > UK_STORVSC_VPD_ID_MAX) {
-		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	if (lun->vpd_id.length > UK_STORVSC_VPD_ID_MAX)
 		return -EOVERFLOW;
-	}
 	mapping->blkdev_id = lun->uid;
 	mapping->controller_index = device->index;
 	mapping->channel_id = device->vmbus_device->channel_id;
@@ -1899,8 +2004,23 @@ static int storvsc_copy_mapping(struct storvsc_lun *lun,
 	mapping->vpd_association = lun->vpd_id.association;
 	memcpy(mapping->vpd_id, lun->vpd_id.bytes,
 	       lun->vpd_id.length);
-	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	return 0;
+}
+
+static int storvsc_copy_mapping(struct storvsc_lun *lun,
+				struct uk_storvsc_mapping *mapping)
+{
+	struct storvsc_device *device;
+	unsigned long flags;
+	int rc;
+
+	if (!lun || !mapping)
+		return -EINVAL;
+	device = lun->controller;
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	rc = storvsc_fill_mapping_locked(lun, mapping);
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return rc;
 }
 
 unsigned int uk_storvsc_mapping_count(void)
@@ -1941,6 +2061,351 @@ int uk_storvsc_mapping_find(__u16 blkdev_id,
 			return storvsc_copy_mapping(entries[i], mapping);
 	}
 	return -ENOENT;
+}
+
+static int storvsc_fill_target_locked(
+	struct storvsc_lun *lun, struct uk_storvsc_target_snapshot *snapshot)
+{
+	int rc;
+
+	memset(snapshot, 0, sizeof(*snapshot));
+	rc = storvsc_fill_mapping_locked(lun, &snapshot->mapping);
+	if (rc)
+		return rc;
+	snapshot->version = UK_STORVSC_TARGET_SNAPSHOT_VERSION;
+	snapshot->size = sizeof(*snapshot);
+	snapshot->topology_generation = __atomic_load_n(
+		&storvsc_topology_generation, __ATOMIC_ACQUIRE);
+	snapshot->controller_generation =
+		lun->controller->session_generation;
+	snapshot->lun_generation = lun->generation;
+	return 0;
+}
+
+int uk_storvsc_target_get(unsigned int index,
+			  struct uk_storvsc_target_snapshot *snapshot)
+{
+	struct storvsc_lun *entries[
+		CONFIG_LIBSTORVSC_MAX_DEVICES * CONFIG_LIBSTORVSC_MAX_LUNS];
+	struct storvsc_device *device;
+	unsigned long flags;
+	unsigned int count;
+	int rc;
+
+	if (!snapshot)
+		return -EINVAL;
+	count = storvsc_collect_mappings(
+		entries, CONFIG_LIBSTORVSC_MAX_DEVICES *
+				 CONFIG_LIBSTORVSC_MAX_LUNS);
+	if (index >= count)
+		return -ENOENT;
+	device = entries[index]->controller;
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	rc = storvsc_fill_target_locked(entries[index], snapshot);
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return rc;
+}
+
+static int storvsc_mapping_equal(const struct uk_storvsc_mapping *left,
+				 const struct uk_storvsc_mapping *right)
+{
+	return memcmp(left, right, sizeof(*left)) == 0;
+}
+
+static __u64 storvsc_session_key(const struct storvsc_lun *lun)
+{
+	__u64 controller = lun->controller->index;
+	__u64 slot = (__u64)(lun - lun->controller->luns);
+
+	return controller << 48 | slot << 32 | lun->uid;
+}
+
+static void storvsc_fill_session(const struct storvsc_lun *lun,
+				 struct uk_storvsc_session *session)
+{
+	memset(session, 0, sizeof(*session));
+	session->version = UK_STORVSC_SESSION_VERSION;
+	session->size = sizeof(*session);
+	session->opaque[0] = lun->session_cookie;
+	session->opaque[1] = lun->session_topology_generation;
+	session->opaque[2] = lun->session_controller_generation;
+	session->opaque[3] = lun->session_lun_generation;
+	session->opaque[4] = storvsc_session_key(lun);
+}
+
+static int storvsc_allocate_session_cookie(__u64 *cookie)
+{
+	__u64 current;
+
+	if (__atomic_load_n(
+		    &storvsc_session_cookie_exhausted, __ATOMIC_ACQUIRE))
+		return -EOVERFLOW;
+	current = __atomic_load_n(
+		&storvsc_session_cookie, __ATOMIC_RELAXED);
+	for (;;) {
+		if (current == UINT64_MAX) {
+			__atomic_store_n(
+				&storvsc_session_cookie_exhausted, 1,
+				__ATOMIC_RELEASE);
+			return -EOVERFLOW;
+		}
+		if (__atomic_compare_exchange_n(
+			    &storvsc_session_cookie, &current, current + 1, 0,
+			    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+			*cookie = current + 1;
+			return 0;
+		}
+	}
+}
+
+static int storvsc_session_lock(
+	const struct uk_storvsc_session *session,
+	struct storvsc_device **device_out, struct storvsc_lun **lun_out,
+	unsigned long *flags)
+{
+	struct storvsc_device *device;
+	struct storvsc_lun *lun;
+	unsigned int controller;
+	unsigned int slot;
+	__u64 key;
+
+	if (!session ||
+	    session->version != UK_STORVSC_SESSION_VERSION ||
+	    session->size != sizeof(*session) || session->reserved ||
+	    !session->opaque[0])
+		return -EINVAL;
+	key = session->opaque[4];
+	controller = (unsigned int)(key >> 48);
+	slot = (unsigned int)((key >> 32) & 0xffffU);
+	if ((key & 0xffff0000ULL) ||
+	    controller >= CONFIG_LIBSTORVSC_MAX_DEVICES ||
+	    slot >= CONFIG_LIBSTORVSC_MAX_LUNS)
+		return -EINVAL;
+	device = &storvsc_devices[controller];
+	lun = &device->luns[slot];
+	ukplat_spin_lock_irqsave(&device->lock, *flags);
+	if (!device->online || device->binding || device->removing ||
+	    device->recovering || !lun->present || !lun->registered ||
+	    lun->uid != (__u16)key ||
+	    lun->session_state == STORVSC_SESSION_NONE ||
+	    lun->session_cookie != session->opaque[0] ||
+	    __atomic_load_n(&storvsc_topology_generation,
+			    __ATOMIC_ACQUIRE) != session->opaque[1] ||
+	    device->session_generation != session->opaque[2] ||
+	    lun->generation != session->opaque[3] ||
+	    lun->session_topology_generation != session->opaque[1] ||
+	    lun->session_controller_generation != session->opaque[2] ||
+	    lun->session_lun_generation != session->opaque[3]) {
+		ukplat_spin_unlock_irqrestore(&device->lock, *flags);
+		return -ESTALE;
+	}
+	*device_out = device;
+	*lun_out = lun;
+	return 0;
+}
+
+int uk_storvsc_session_begin_read(
+	const struct uk_storvsc_target_snapshot *snapshot,
+	struct uk_storvsc_session *session)
+{
+	struct uk_storvsc_mapping current;
+	struct storvsc_device *device;
+	struct storvsc_lun *lun = NULL;
+	unsigned long flags;
+	__u64 cookie;
+	unsigned int i;
+	int rc;
+
+	if (session)
+		memset(session, 0, sizeof(*session));
+	if (!storvsc_guarded_io_enabled)
+		return -ENOTSUP;
+	if (!snapshot || !session ||
+	    snapshot->version != UK_STORVSC_TARGET_SNAPSHOT_VERSION ||
+	    snapshot->size != sizeof(*snapshot) || snapshot->reserved ||
+	    !snapshot->topology_generation ||
+	    !snapshot->controller_generation || !snapshot->lun_generation ||
+	    snapshot->topology_generation == UINT64_MAX ||
+	    snapshot->controller_generation == UINT64_MAX ||
+	    snapshot->lun_generation == UINT64_MAX ||
+	    !snapshot->mapping.vpd_length ||
+	    snapshot->mapping.controller_index >=
+		    CONFIG_LIBSTORVSC_MAX_DEVICES)
+		return -EINVAL;
+	device = &storvsc_devices[snapshot->mapping.controller_index];
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
+		if (device->luns[i].registered &&
+		    device->luns[i].uid == snapshot->mapping.blkdev_id) {
+			lun = &device->luns[i];
+			break;
+		}
+	}
+	if (!lun) {
+		rc = -ENOENT;
+		goto out;
+	}
+	if (snapshot->topology_generation !=
+		    __atomic_load_n(&storvsc_topology_generation,
+				    __ATOMIC_ACQUIRE) ||
+	    snapshot->controller_generation != device->session_generation ||
+	    snapshot->lun_generation != lun->generation) {
+		rc = -ESTALE;
+		goto out;
+	}
+	if (lun->session_state != STORVSC_SESSION_NONE &&
+	    lun->session_topology_generation !=
+		    snapshot->topology_generation) {
+		lun->session_state = STORVSC_SESSION_NONE;
+		lun->session_cookie = 0;
+		lun->session_topology_generation = 0;
+		lun->session_controller_generation = 0;
+		lun->session_lun_generation = 0;
+		lun->session_cdb_size = UK_STORVSC_CDB_AUTO;
+	}
+	if (lun->session_state != STORVSC_SESSION_NONE ||
+	    storvsc_lun_active_count_locked(device, lun)) {
+		rc = -EBUSY;
+		goto out;
+	}
+	rc = storvsc_fill_mapping_locked(lun, &current);
+	if (rc)
+		goto out;
+	if (!storvsc_mapping_equal(&current, &snapshot->mapping)) {
+		rc = -ESTALE;
+		goto out;
+	}
+	rc = storvsc_allocate_session_cookie(&cookie);
+	if (rc)
+		goto out;
+	lun->session_cookie = cookie;
+	lun->session_topology_generation = snapshot->topology_generation;
+	lun->session_controller_generation = device->session_generation;
+	lun->session_lun_generation = lun->generation;
+	lun->session_state = STORVSC_SESSION_READ;
+	lun->session_cdb_size = UK_STORVSC_CDB_AUTO;
+	storvsc_fill_session(lun, session);
+	rc = 0;
+out:
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return rc;
+}
+
+int uk_storvsc_session_authorize_write(struct uk_storvsc_session *session)
+{
+	struct storvsc_lun *expected = NULL;
+	struct storvsc_device *device;
+	struct storvsc_lun *lun;
+	unsigned long flags;
+	int rc;
+
+	if (!storvsc_guarded_io_enabled)
+		return -ENOTSUP;
+	rc = storvsc_session_lock(session, &device, &lun, &flags);
+	if (rc)
+		return rc;
+	if (lun->media.read_only) {
+		rc = -EROFS;
+		goto out;
+	}
+	if (lun->session_state != STORVSC_SESSION_READ) {
+		rc = -EACCES;
+		goto out;
+	}
+	if (storvsc_lun_active_count_locked(device, lun)) {
+		rc = -EBUSY;
+		goto out;
+	}
+	if (!__atomic_compare_exchange_n(
+		    &storvsc_write_lun, &expected, lun, 0,
+		    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+		rc = -EBUSY;
+		goto out;
+	}
+	lun->session_state = STORVSC_SESSION_WRITE;
+	rc = 0;
+out:
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return rc;
+}
+
+int uk_storvsc_session_set_cdb(struct uk_storvsc_session *session,
+			       __u8 cdb_size)
+{
+	struct storvsc_device *device;
+	struct storvsc_lun *lun;
+	unsigned long flags;
+	int rc;
+
+	if (cdb_size != UK_STORVSC_CDB_AUTO &&
+	    cdb_size != UK_STORVSC_CDB_10 &&
+	    cdb_size != UK_STORVSC_CDB_16)
+		return -EINVAL;
+	if (!storvsc_guarded_io_enabled)
+		return -ENOTSUP;
+	rc = storvsc_session_lock(session, &device, &lun, &flags);
+	if (rc)
+		return rc;
+	if (lun->session_state != STORVSC_SESSION_WRITE ||
+	    storvsc_lun_active_count_locked(device, lun))
+		rc = -EBUSY;
+	else {
+		lun->session_cdb_size = cdb_size;
+		rc = 0;
+	}
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return rc;
+}
+
+int uk_storvsc_session_validate(
+	const struct uk_storvsc_session *session,
+	struct uk_storvsc_target_snapshot *snapshot)
+{
+	struct storvsc_device *device;
+	struct storvsc_lun *lun;
+	unsigned long flags;
+	int rc;
+
+	if (!snapshot)
+		return -EINVAL;
+	memset(snapshot, 0, sizeof(*snapshot));
+	if (!storvsc_guarded_io_enabled)
+		return -ENOTSUP;
+	rc = storvsc_session_lock(session, &device, &lun, &flags);
+	if (rc)
+		return rc;
+	rc = storvsc_fill_target_locked(lun, snapshot);
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	return rc;
+}
+
+int uk_storvsc_session_end(struct uk_storvsc_session *session)
+{
+	struct storvsc_device *device;
+	struct storvsc_lun *lun;
+	unsigned long flags;
+	int rc;
+
+	if (!storvsc_guarded_io_enabled)
+		return -ENOTSUP;
+	rc = storvsc_session_lock(session, &device, &lun, &flags);
+	if (rc)
+		return rc;
+	if (storvsc_lun_active_count_locked(device, lun)) {
+		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+		return -EBUSY;
+	}
+	if (lun->session_state == STORVSC_SESSION_WRITE)
+		storvsc_release_write_session(lun);
+	lun->session_state = STORVSC_SESSION_NONE;
+	lun->session_cookie = 0;
+	lun->session_topology_generation = 0;
+	lun->session_controller_generation = 0;
+	lun->session_lun_generation = 0;
+	lun->session_cdb_size = UK_STORVSC_CDB_AUTO;
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	memset(session, 0, sizeof(*session));
+	return 0;
 }
 
 static int storvsc_guid_equal(const struct vmbus_guid *left,
@@ -2132,6 +2597,7 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 		return -ENOSPC;
 	}
 	ukplat_spin_lock_irqsave(&device->lock, flags);
+	storvsc_invalidate_sessions_locked(device);
 	device->epoch++;
 	device->vmbus_device = vmbus_device;
 	storvsc_channel_set(device, NULL);
@@ -2234,6 +2700,12 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 		memset(lun->media.reserved, 0,
 		       sizeof(lun->media.reserved));
 		lun->vpd_id = vpd_id;
+		if (lun->generation == UINT64_MAX) {
+			if (!first_error)
+				first_error = -EOVERFLOW;
+			continue;
+		}
+		lun->generation++;
 		was_registered = lun->registered;
 		rc = storvsc_register_blkdev(lun, &capacity, &mode,
 					      lun_transfer_limit);
@@ -2260,6 +2732,7 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	}
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	device->online = 1;
+	storvsc_advance_topology_generation();
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	vmbus_channel_set_callback(storvsc_channel_get(device),
 				   storvsc_channel_callback, device);
@@ -2552,6 +3025,21 @@ size_t storvsc_host_lun_count(void)
 void storvsc_host_set_lun_discovery(int enabled)
 {
 	storvsc_lun_discovery_enabled = !!enabled;
+}
+
+void storvsc_host_set_guarded_io(int enabled)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	storvsc_guarded_io_enabled = !!enabled;
+	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_DEVICES; i++) {
+		if (!storvsc_devices[i].initialized)
+			continue;
+		ukplat_spin_lock_irqsave(&storvsc_devices[i].lock, flags);
+		storvsc_invalidate_sessions_locked(&storvsc_devices[i]);
+		ukplat_spin_unlock_irqrestore(&storvsc_devices[i].lock, flags);
+	}
 }
 
 int storvsc_host_lun_address(size_t index, struct storvsc_address *address)
