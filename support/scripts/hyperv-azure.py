@@ -297,6 +297,14 @@ def prepare_image(args):
     return directory
 
 
+def quota_count(value):
+    if type(value) is int and value >= 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        return int(value)
+    raise ValueError("Azure CLI returned an invalid nonnegative quota count")
+
+
 def check_subscription(location, vm_size):
     account = azure_cli(["account", "show"])
     if account.get("state") != "Enabled" or account.get("environmentName") != "AzureCloud":
@@ -336,7 +344,10 @@ def check_subscription(location, vm_size):
     ], subscription=subscription)
     limits = {entry["name"]["value"]: entry for entry in usage}
     for name in ("cores", family):
-        if name not in limits or limits[name]["limit"] - limits[name]["currentValue"] < 2:
+        if name not in limits:
+            raise RuntimeError(f"Missing quota information for {name} in {location}")
+        available = quota_count(limits[name]["limit"]) - quota_count(limits[name]["currentValue"])
+        if available < 2:
             raise RuntimeError(f"Insufficient two-vCPU quota for {name} in {location}")
     return subscription
 

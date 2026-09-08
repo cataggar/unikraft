@@ -242,6 +242,15 @@ class HypervAzureControllerTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Insufficient two-vCPU quota"):
             azure.check_subscription("westus2", "Standard_D2s_v5")
 
+    def test_quota_counts_accept_cli_decimal_strings_without_silent_defaults(self):
+        for value in (0, "0", 100, "100"):
+            with self.subTest(value=value):
+                self.assertEqual(azure.quota_count(value), int(value))
+        for value in (None, True, -1, "-1", "unlimited", "1.5", 1.5):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    azure.quota_count(value)
+
     def test_unknown_serial_error_is_not_hidden_as_not_ready(self):
         run = self.run_fixture()
         result = mock.Mock(returncode=1, stderr="ERROR: (AuthorizationFailed) denied")
