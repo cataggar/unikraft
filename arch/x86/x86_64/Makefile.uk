@@ -19,7 +19,8 @@ CXXINCLUDES += -I$(CONFIG_UK_BASE)/arch/x86_64/include
 
 # compiler flags to prevent use of extended (FP, SSE, AVX) registers.
 # This is for files that contain trap/exception/interrupt handlers
-ISR_ARCHFLAGS += -mno-80387 -mno-mmx -mno-sse -mno-avx
+# Zig cc needs SSE2 disabled explicitly; -mno-sse alone leaves it enabled.
+ISR_ARCHFLAGS += -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-avx
 ISR_ARCHFLAGS-$(call have_gcc)	+= -mno-fp-ret-in-387
 ISR_ARCHFLAGS-$(call gcc_version_ge,7,1) += -mgeneral-regs-only
 

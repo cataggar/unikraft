@@ -3,17 +3,19 @@ $(eval $(call addlib_s,libvmbus,$(CONFIG_LIBVMBUS)))
 LIBVMBUS_CINCLUDES-y += -I$(LIBVMBUS_BASE)/include
 LIBVMBUS_CINCLUDES-y += -I$(UK_PLAT_HYPERV_BASE)/include
 
-LIBVMBUS_SRCS-y += $(LIBVMBUS_BASE)/vmbus_bus.c
+LIBVMBUS_SRCS-y += $(LIBVMBUS_BASE)/vmbus_bus.c|isr
 LIBVMBUS_SRCS-y += $(LIBVMBUS_BASE)/vmbus_channel.c
 
 VMBUS_PROTOCOL_OBJ := $(LIBVMBUS_BUILD)/vmbus_protocol.o
 VMBUS_ZIG_CACHE := $(LIBVMBUS_BUILD)/zig-cache
 VMBUS_ZIG_GLOBAL_CACHE := $(LIBVMBUS_BUILD)/zig-global-cache
 
-$(VMBUS_PROTOCOL_OBJ): $(LIBVMBUS_BASE)/vmbus_protocol.zig
+# Protocol getters run on the SynIC IRQ path, which saves only GPRs.
+$(VMBUS_PROTOCOL_OBJ): $(LIBVMBUS_BASE)/vmbus_protocol.zig $(LIBVMBUS_BASE)/Makefile.uk
 	$(call build_cmd,ZIG,libvmbus,$(notdir $@),\
 		mkdir -p $(VMBUS_ZIG_CACHE) $(VMBUS_ZIG_GLOBAL_CACHE) && \
 		zig build-obj -target x86_64-freestanding-none -OReleaseFast \
+			-mcpu=baseline+soft_float-x87-mmx-sse-sse2-avx-avx2 \
 			-fPIC -fsingle-threaded -mno-red-zone \
 			-fno-stack-check -fno-stack-protector -fno-unwind-tables \
 			--cache-dir $(VMBUS_ZIG_CACHE) \

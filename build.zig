@@ -538,11 +538,12 @@ pub fn build(b: *std.Build) void {
         .os_tag = .freestanding,
         .abi = .none,
     });
+    const hyperv_isr_target = b.resolveTargetQuery(native_target_object.targetQuery(true));
     const hyperv_runtime_object = b.addObject(.{
         .name = "hyperv-runtime-freestanding",
         .root_module = b.createModule(.{
             .root_source_file = b.path("plat/hyperv/hyperv_runtime.zig"),
-            .target = hyperv_target,
+            .target = hyperv_isr_target,
             .optimize = .ReleaseFast,
             .link_libc = false,
             .single_threaded = true,
@@ -588,7 +589,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(
                 "drivers/hyperv/vmbus/vmbus_protocol.zig",
             ),
-            .target = hyperv_target,
+            .target = hyperv_isr_target,
             .optimize = .ReleaseFast,
             .link_libc = false,
             .single_threaded = true,
@@ -1097,6 +1098,15 @@ pub fn build(b: *std.Build) void {
     });
     hyperv_smp_tests.root_module.linkSystemLibrary("pthread", .{});
     test_step.dependOn(&b.addRunArtifact(hyperv_smp_tests).step);
+    const hyperv_irq_tests = b.step("test-hyperv-irq", "Run Hyper-V IRQ-path hosted correctness tests");
+    hyperv_irq_tests.dependOn(&b.addRunArtifact(hyperv_runtime_tests).step);
+    hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);
+    hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_control_tests).step);
+    hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_production_tests).step);
+    hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_disconnect_tests).step);
+    hyperv_irq_tests.dependOn(&b.addRunArtifact(hyperv_smp_tests).step);
+    hyperv_irq_tests.dependOn(&verify_hyperv_runtime.step);
+    hyperv_irq_tests.dependOn(&verify_vmbus_protocol.step);
     const xpic_correctness_tests = b.addExecutable(.{
         .name = "xpic-runtime-correctness-test",
         .root_module = b.createModule(.{
@@ -1660,8 +1670,26 @@ fn finishNativeImages(
         });
         check.setCwd(.{ .cwd_relative = b.build_root.path.? });
         check.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+        const irq_check = b.addSystemCommand(&.{
+            "python3",
+            "support/build/tests/hyperv-irq-register-test.py",
+            "--image",
+        });
+        irq_check.addFileArg(link_output);
+        irq_check.addArgs(&.{
+            "--nm",
+            registered.graph.toolchain.binutils.nm.command,
+            "--objdump",
+            if (registered.graph.toolchain.binutils.objdump) |tool|
+                tool.command
+            else
+                "llvm-objdump",
+        });
+        irq_check.setCwd(.{ .cwd_relative = b.build_root.path.? });
+        irq_check.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
         const gate = b.addSystemCommand(&.{"cp"});
         gate.step.dependOn(&check.step);
+        gate.step.dependOn(&irq_check.step);
         gate.addFileArg(link_output);
         validated_link_output =
             gate.addOutputFileArg("hyperv-validated-final.dbg");

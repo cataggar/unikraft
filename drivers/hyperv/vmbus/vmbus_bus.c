@@ -25,6 +25,7 @@
 
 #ifdef VMBUS_BUS_HOST_TEST
 #include <pthread.h>
+#include <string.h>
 static _Thread_local __u64 host_cpu_index;
 static unsigned int host_wake_isr_count;
 #endif
@@ -2505,6 +2506,28 @@ static int host_test_concurrent_irqs(void)
 	if (host_wake_isr_count != 1)
 		return 91;
 	(void)__atomic_exchange_n(&event_pending[1], 0, __ATOMIC_ACQ_REL);
+	{
+		static const unsigned int lengths[] = {
+			8, 196, HYPERV_MESSAGE_PAYLOAD_SIZE
+		};
+		struct hyperv_message message = { 0 };
+		unsigned int j;
+
+		message.message_type = VMBUS_HV_MESSAGE_TYPE;
+		for (i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+			message.payload_size = lengths[i];
+			for (j = 0; j < lengths[i]; j++)
+				message.payload[j] = (__u8)(j ^ lengths[i]);
+			hyperv_vmbus_message(&message);
+			if (!dequeue_message(&entry) ||
+			    entry.len != lengths[i] ||
+			    entry.generation != vmbus_protocol_generation() ||
+			    memcmp(entry.data, message.payload, lengths[i]))
+				return 93;
+		}
+		if (host_wake_isr_count != 4 || rx_state.lost)
+			return 94;
+	}
 	for (i = 0; i < 2; i++)
 		if (pthread_create(&threads[i], NULL, host_irq_producer,
 				   &producers[i]))

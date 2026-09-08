@@ -336,6 +336,8 @@ pub const TargetZigObject = struct {
     c_macros: []const CMacro = &.{},
     dependencies: []const []const u8 = &.{},
     pic: bool = false,
+    /// Restrict code generation to registers saved by the IRQ entry.
+    isr: bool = false,
     omit_frame_pointer: ?bool = null,
 
     pub const CMacro = struct {
@@ -2122,6 +2124,7 @@ fn copyTargetZigObjects(
             .c_macros = macros,
             .dependencies = try copyStringList(allocator, object.dependencies),
             .pic = object.pic,
+            .isr = object.isr,
             .omit_frame_pointer = object.omit_frame_pointer,
         };
     }
