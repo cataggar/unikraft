@@ -7,6 +7,7 @@
 #include <uk/isr/thread.h>
 #include <uk/lcpu.h>
 #include <uk/paging.h>
+#include <uk/pcpuvar.h>
 #include <uk/plat/time.h>
 #include <uk/print.h>
 #include <uk/sched.h>
@@ -24,6 +25,8 @@
 
 #ifdef VMBUS_BUS_HOST_TEST
 #include <pthread.h>
+static _Thread_local __u64 host_cpu_index;
+static unsigned int host_wake_isr_count;
 #endif
 
 #define VMBUS_REFERENCE_TICKS_PER_MS	10000ULL
@@ -235,10 +238,26 @@ static void signal_worker(void)
 	struct uk_thread *thread;
 	unsigned long flags;
 
+	/*
+	 * schedcoop run/sleep queues are owned by the worker CPU. AP SINT2
+	 * producers only publish into the MPSC queue/bitmap; BSP polling drains
+	 * them without mutating scheduler queues cross-CPU.
+	 */
+#ifdef VMBUS_BUS_HOST_TEST
+	if (host_cpu_index != 0)
+		return;
+#else
+	if (uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx) != 0)
+		return;
+#endif
 	ukplat_spin_lock_irqsave(&worker_lock, flags);
 	thread = __atomic_load_n(&worker, __ATOMIC_ACQUIRE);
-	if (thread && !__atomic_load_n(&worker_stop, __ATOMIC_ACQUIRE))
+	if (thread && !__atomic_load_n(&worker_stop, __ATOMIC_ACQUIRE)) {
+#ifdef VMBUS_BUS_HOST_TEST
+		host_wake_isr_count++;
+#endif
 		uk_thread_wake_isr(thread);
+	}
 	ukplat_spin_unlock_irqrestore(&worker_lock, flags);
 }
 
@@ -2462,6 +2481,30 @@ static int host_test_concurrent_irqs(void)
 
 	host_reset_state();
 	__atomic_store_n(&rx_active, 1, __ATOMIC_RELEASE);
+	worker = (struct uk_thread *)(uintptr_t)1;
+	worker_stop = 0;
+	host_wake_isr_count = 0;
+	host_cpu_index = 1;
+	{
+		struct hyperv_message message = { 0 };
+
+		message.message_type = VMBUS_HV_MESSAGE_TYPE;
+		message.payload_size = 8;
+		message.payload[0] = 12;
+		hyperv_vmbus_message(&message);
+	}
+	if (host_wake_isr_count || !dequeue_message(&entry))
+		return 89;
+	hyperv_vmbus_event_word(64, 1);
+	if (host_wake_isr_count ||
+	    __atomic_exchange_n(&event_pending[1], 0,
+				 __ATOMIC_ACQ_REL) != 1)
+		return 90;
+	host_cpu_index = 0;
+	hyperv_vmbus_event_word(64, 1);
+	if (host_wake_isr_count != 1)
+		return 91;
+	(void)__atomic_exchange_n(&event_pending[1], 0, __ATOMIC_ACQ_REL);
 	for (i = 0; i < 2; i++)
 		if (pthread_create(&threads[i], NULL, host_irq_producer,
 				   &producers[i]))
@@ -2512,6 +2555,7 @@ static int host_test_concurrent_irqs(void)
 			return 96;
 	}
 	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+	worker = NULL;
 	return 0;
 }
 

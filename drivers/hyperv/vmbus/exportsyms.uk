@@ -23,3 +23,8 @@ vmbus_channel_poll
 vmbus_channel_set_callback
 vmbus_channel_mask_interrupts
 vmbus_channel_unmask_interrupts
+hyperv_vmbus_shutdown
+hyperv_vmbus_fini
+hyperv_vmbus_message
+hyperv_vmbus_event
+hyperv_vmbus_event_word

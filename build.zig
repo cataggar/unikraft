@@ -1628,6 +1628,44 @@ fn finishNativeImages(
     stage_name: []const u8,
     link_output: std.Build.LazyPath,
 ) *std.Build.Step {
+    var validated_link_output = link_output;
+    if (registered.profile == .@"hyperv-x86_64-efi" or
+        registered.profile == .@"hyperv-x86_64-efi-netvsc")
+    {
+        const max_cpu_prefix = "CONFIG_UKPLAT_CPU_MAXCOUNT=";
+        var max_cpus: []const u8 = "1";
+        var lines = std.mem.splitScalar(u8, config.source, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, max_cpu_prefix)) {
+                max_cpus = line[max_cpu_prefix.len..];
+                break;
+            }
+        }
+        const check = b.addSystemCommand(&.{
+            "python3",
+            "support/build/tests/hyperv-smp-link-test.py",
+            "--image",
+        });
+        check.addFileArg(link_output);
+        check.addArgs(&.{
+            "--max-cpus",
+            max_cpus,
+            "--nm",
+            registered.graph.toolchain.binutils.nm.command,
+            "--objdump",
+            if (registered.graph.toolchain.binutils.objdump) |tool|
+                tool.command
+            else
+                "llvm-objdump",
+        });
+        check.setCwd(.{ .cwd_relative = b.build_root.path.? });
+        check.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+        const gate = b.addSystemCommand(&.{"cp"});
+        gate.step.dependOn(&check.step);
+        gate.addFileArg(link_output);
+        validated_link_output =
+            gate.addOutputFileArg("hyperv-validated-final.dbg");
+    }
     const final_reference = component_api.ArtifactReference{ .stage_output = .{
         .platform = registered.graph.selectedPlatform().name,
         .stage = stage_name,
@@ -1656,7 +1694,7 @@ fn finishNativeImages(
     const post = native_postprocess.execute(
         b,
         post_plan,
-        &.{link_output},
+        &.{validated_link_output},
         .{
             .python_executable = "python3",
             .strip = registered.graph.toolchain.binutils.strip.command,
@@ -1693,7 +1731,7 @@ fn finishNativeImages(
     addPublishedOutput(
         b,
         step,
-        post.publicationPath(linked_logical_path, link_output),
+        post.publicationPath(linked_logical_path, validated_link_output),
         linked_logical_path,
     );
     for (post.outputs, 0..) |output, index| {
