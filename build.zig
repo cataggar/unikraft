@@ -491,6 +491,8 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = .Debug,
         }),
+        // Match the production backend for the Microsoft-ABI hypercall thunk.
+        .use_llvm = true,
     });
     test_step.dependOn(&b.addRunArtifact(hyperv_runtime_tests).step);
     const vmbus_protocol_tests = b.addTest(.{
@@ -789,10 +791,10 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    vmbus_abi_tests.root_module.addIncludePath(b.path("include"));
     vmbus_abi_tests.root_module.addIncludePath(
         b.path("support/build/tests/vmbus-include"),
     );
+    vmbus_abi_tests.root_module.addIncludePath(b.path("include"));
     vmbus_abi_tests.root_module.addIncludePath(
         b.path("arch/x86/x86_64/include"),
     );
@@ -1128,7 +1130,8 @@ pub fn build(b: *std.Build) void {
     hyperv_irq_tests.dependOn(&b.addRunArtifact(hyperv_smp_tests).step);
     hyperv_irq_tests.dependOn(&verify_hyperv_runtime.step);
     hyperv_irq_tests.dependOn(&verify_vmbus_protocol.step);
-    for ([_]bool{ false, true }) |legacy_apic| {
+    var xpic_correctness_steps: [2]*std.Build.Step = undefined;
+    for ([_]bool{ false, true }, 0..) |legacy_apic, index| {
         const xpic_correctness_tests = b.addExecutable(.{
             .name = if (legacy_apic) "xpic-runtime-correctness-test" else "xpic-x2apic-only-test",
             .root_module = b.createModule(.{
@@ -1151,9 +1154,77 @@ pub fn build(b: *std.Build) void {
             },
         });
         const run_xpic_correctness_tests = b.addRunArtifact(xpic_correctness_tests);
+        xpic_correctness_steps[index] = &run_xpic_correctness_tests.step;
         test_step.dependOn(&run_xpic_correctness_tests.step);
         hyperv_irq_tests.dependOn(&run_xpic_correctness_tests.step);
     }
+    const hyperv_controller_fixtures = b.addSystemCommand(&.{
+        "python3",
+        "-m",
+        "unittest",
+        "support.scripts.tests.test_hyperv_azure",
+        "support.scripts.tests.test_hyperv_efi_boot",
+    });
+    hyperv_controller_fixtures.setCwd(.{ .cwd_relative = root });
+    hyperv_controller_fixtures.setEnvironmentVariable(
+        "PYTHONDONTWRITEBYTECODE",
+        "1",
+    );
+    const hyperv_regression_tests = b.step(
+        "test-hyperv-regression",
+        "Run focused Hyper-V protocol, driver, controller, and IRQ regressions",
+    );
+    if (builtin.cpu.arch == .x86_64) {
+        hyperv_regression_tests.dependOn(hyperv_irq_tests);
+        hyperv_regression_tests.dependOn(
+            &b.addRunArtifact(storvsc_production_tests).step,
+        );
+        hyperv_regression_tests.dependOn(
+            &b.addRunArtifact(netvsc_production_tests).step,
+        );
+    } else {
+        hyperv_regression_tests.dependOn(
+            &b.addRunArtifact(vmbus_protocol_tests).step,
+        );
+        hyperv_regression_tests.dependOn(
+            &b.addRunArtifact(vmbus_control_tests).step,
+        );
+        hyperv_regression_tests.dependOn(&verify_hyperv_runtime.step);
+        hyperv_regression_tests.dependOn(&verify_vmbus_protocol.step);
+        for (xpic_correctness_steps) |xpic_step|
+            hyperv_regression_tests.dependOn(xpic_step);
+        const x86_host_notice = b.addSystemCommand(&.{
+            "python3",
+            "-c",
+            "print('INFO: x86-only hosted Hyper-V IRQ, driver, and SMP fixtures require the x86-64 CI job; running portable and freestanding checks on this host')",
+        });
+        hyperv_regression_tests.dependOn(&x86_host_notice.step);
+    }
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(vmbus_channel_tests).step,
+    );
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(storvsc_core_tests).step,
+    );
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(netvsc_protocol_tests).step,
+    );
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(netvsc_protocol_abi_tests).step,
+    );
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(vmbus_abi_tests).step,
+    );
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(hyperv_acceptance_protocol_tests).step,
+    );
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(platform_correctness_tests).step,
+    );
+    hyperv_regression_tests.dependOn(&verify_vmbus_channel.step);
+    hyperv_regression_tests.dependOn(&verify_storvsc_core.step);
+    hyperv_regression_tests.dependOn(&verify_netvsc_protocol.step);
+    hyperv_regression_tests.dependOn(&hyperv_controller_fixtures.step);
     const lto_policy_tests = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/lto-symbol-policy-test.py",

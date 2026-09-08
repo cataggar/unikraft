@@ -422,7 +422,7 @@ both fit before coalescing. Existing solved configurations retain their old
 value; update `CONFIG_UKPLAT_MEMREGION_MAX_COUNT` to at least 512 if it is still
 128, then regenerate the configuration and rebuild.
 
-With KVM access, OVMF, and QEMU's `vmbus-bridge`/`hv-balloon` devices available:
+With KVM access, OVMF, and QEMU's `vmbus-bridge` device available:
 
 ```shell
 python3 support/build/tests/hyperv-efi-boot-test.py \

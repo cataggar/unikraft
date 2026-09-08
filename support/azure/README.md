@@ -56,7 +56,7 @@ Azure account identifiers or credential-bearing diagnostics.
   [`2db68ca0c3ab12155012a823c3fb8d7aba1cb544`][miz-revision].
   Generic `miz check`/`info` do not validate the embedded EFI payload, and
   `miz azure fixup` can modify an image; neither substitutes for this gate.
-- QEMU with KVM, `vmbus-bridge`, and `hv-balloon`, plus x86-64 OVMF code and
+- QEMU with KVM and `vmbus-bridge`, plus x86-64 OVMF code and
   variable-store files.
 - For `run` only: an authenticated Azure CLI public-cloud subscription with
   Compute/Network already registered, Compute API `2025-11-01`, and available
@@ -100,16 +100,54 @@ python3 support/scripts/hyperv-azure.py prepare \
 Preparation makes no Azure calls. `miz` creates a deterministic GPT disk with
 a 64 MiB FAT32 ESP and a 66 MiB virtual disk, then a native fixed VHD. The raw
 disk boots under OVMF before VHD generation; the exact VHD is independently
-preflighted by `miz` and also booted under OVMF, read-only. Each local boot is
-bounded and must reach hypercall/SynIC initialization and the exact application
-marker without a crash. QEMU's missing storage/network endpoints do not count
-as I/O success.
+preflighted by `miz` and also booted under OVMF, read-only. Both artifacts boot
+once with normal x2APIC discovery and once with x2APIC masked to require the
+single-CPU legacy-xAPIC fallback. Each local boot is bounded and must reach
+hypercall/SynIC initialization and the exact application marker without a
+crash. QEMU's missing storage/network endpoints may produce the probe's
+`UNAVAILABLE` result; that is platform-only local evidence and never an I/O
+success.
+The local platform fixture does not attach a balloon device: balloon support
+is optional in QEMU builds and is not a storage or network acceptance endpoint.
+VMBus channel and device traffic remain separate hosted and real-host gates.
+QEMU maps the exact artifact's 66 MiB guest-visible data region read-only.
+For fixed VHD, this excludes the trailing footer already validated by `miz`;
+it neither converts the image nor substitutes the earlier raw-disk file.
+This also avoids requiring QEMU's optional VPC format driver.
 
 The private directory retains the EFI payload, raw disk, VHD, their fingerprints,
-the `miz` executable fingerprint and packaging report, and both serial logs.
+the `miz` executable fingerprint and packaging report, and all four serial logs
+(`local-{raw,vpc}-{x2apic,legacy-apic}-serial.log`).
 Tool caches and temporary files stay below that directory. Fresh firmware
 copies are removed after each local boot. Existing state directories are never
 overwritten.
+
+## Local CI interface
+
+`zig build test-hyperv-regression` aggregates the existing focused Hyper-V
+protocol, ABI, driver, IRQ, SMP, controller, and packaging fixtures without
+selecting the repository's broad test suite. The ordinary pull-request job
+freshly solves `support/apps/hyperv-acceptance/defconfig`, builds
+`hyperv-x86_64-efi-netvsc`, runs the final constructor/IRQ/SMP link gates, and
+passes that exact EFI payload to `prepare`.
+
+On a non-x86 development host, the same selector runs the architecture-neutral
+hosted fixtures and the x86-64 freestanding object checks, and reports that
+x86-only hosted IRQ, driver, and SMP executables are deferred to the x86-64 CI
+job. It does not reinterpret an architecture skip, missing local KVM, or
+missing Hyper-V devices as a boot or I/O pass.
+
+`state.json` retains `local_platform_boot_modes` for the raw and fixed-VHD
+x2APIC/legacy-APIC boots, while `image_sha256` remains the deployment identity.
+A later trusted `workflow_dispatch` stage should consume this prepared VHD and
+call the existing `run`/`cleanup` controller paths one VM at a time; it should
+not rebuild, repackage, add a second deployment pipeline, infer coverage from
+CPU/SKU labels, or allocate repeatedly to search for a protocol version.
+Ordinary pull requests intentionally have no Azure stage or credentials.
+The `zig-hyperv-local-evidence` CI artifact retains selected local serial and
+packaging logs, the packaging report, and EFI/debug-ELF digests for seven days,
+including boot failures. It excludes raw controller state, disk images, tool
+caches, and credentials.
 
 ## Run one Azure VM
 

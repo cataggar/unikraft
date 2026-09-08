@@ -648,6 +648,228 @@ jobs:
           echo '```'
         } >> "${GITHUB_STEP_SUMMARY}"
 
+  zig-hyperv:
+    name: zig-hyperv
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Install checkout, build, and OVMF dependencies
+      run: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          bison \
+          ca-certificates \
+          curl \
+          file \
+          flex \
+          git \
+          libncurses-dev \
+          make \
+          ovmf \
+          python3 \
+          tar \
+          xz-utils
+        sudo rm -rf /var/lib/apt/lists/*
+
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Load configuration
+      uses: ./.github/actions/ci-versions
+
+    - name: Fetch pinned miz source
+      uses: actions/checkout@v4
+      with:
+        repository: cataggar/miz
+        ref: 2db68ca0c3ab12155012a823c3fb8d7aba1cb544
+        fetch-depth: 1
+        path: _miz
+
+    - name: Download LLVM and QEMU tools
+      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.8.0
+        tools: |
+          cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+        dest: ${{ runner.temp }}/hyperv-tools
+        extract: 'true'
+        strip-components: '1'
+
+    - name: Add LLVM and QEMU tools to PATH
+      run: |
+        set -euo pipefail
+        tools="${RUNNER_TEMP}/hyperv-tools"
+        for command in \
+          "${tools}/bin/llvm-nm" \
+          "${tools}/bin/llvm-objcopy" \
+          "${tools}/bin/llvm-objdump" \
+          "${tools}/bin/llvm-readelf" \
+          "${tools}/bin/llvm-strip" \
+          "${tools}/qemu-system-x86_64"; do
+          test -x "${command}"
+        done
+        {
+          echo "${tools}/bin"
+          echo "${tools}"
+        } >> "${GITHUB_PATH}"
+
+    - name: Install Zig with ghr
+      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.8.0
+        tools: |
+          cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+    - name: Configure bounded local tool directories
+      run: |
+        set -euo pipefail
+        root="${RUNNER_TEMP}/hyperv-ci"
+        mkdir -p \
+          "${root}/cache" \
+          "${root}/tmp" \
+          "${root}/zig-global-cache"
+        {
+          echo "TMPDIR=${root}/tmp"
+          echo "XDG_CACHE_HOME=${root}/cache"
+          echo "ZIG_GLOBAL_CACHE_DIR=${root}/zig-global-cache"
+          echo 'MAKEFLAGS=-j2'
+        } >> "${GITHUB_ENV}"
+
+    - name: Build pinned miz EFI application tooling
+      run: |
+        set -euo pipefail
+        test "$(zig version)" = "${ZIG_VERSION}"
+        test "$(git -C _miz rev-parse HEAD)" = "${MIZ_REVISION}"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/miz-zig-local-cache"
+        (
+          cd _miz
+          zig build -j2 install-miz \
+            -Doptimize=ReleaseSafe \
+            --prefix "${RUNNER_TEMP}/hyperv-ci/miz"
+        )
+        miz="${RUNNER_TEMP}/hyperv-ci/miz/bin/miz"
+        test -x "${miz}"
+        "${miz}" build-efi-application --help
+        "${miz}" check-efi-application --help
+
+    - name: Run focused Hyper-V regressions
+      run: |
+        set -euo pipefail
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/regression-zig-local-cache"
+        zig build -j2 test-hyperv-regression --summary all
+
+    - name: Solve and build native Hyper-V acceptance image
+      run: |
+        set -euo pipefail
+        build="${RUNNER_TEMP}/hyperv-ci/build"
+        config="${RUNNER_TEMP}/hyperv-ci/hyperv-acceptance.config"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/image-zig-local-cache"
+        cp support/apps/hyperv-acceptance/defconfig "${config}"
+        zig_args=(
+          "-Dapp=${GITHUB_WORKSPACE}/support/apps/hyperv-acceptance"
+          "-Doutput=${build}"
+          "-Dconfig=${config}"
+          "-Dcompiler=zig cc -target x86_64-freestanding-none"
+          "-Dcompiler-targeted=true"
+          "-Dhost-cc=zig cc"
+          "-Dhost-cxx=zig c++"
+          "-Dhost-cflags=-fno-sanitize=null"
+          "-Dmake-arg=AR=zig ar"
+          "-Dmake-arg=NM=llvm-nm"
+          "-Dmake-arg=OBJCOPY=llvm-objcopy"
+          "-Dmake-arg=OBJDUMP=llvm-objdump"
+          "-Dmake-arg=READELF=llvm-readelf"
+          "-Dmake-arg=STRIP=llvm-strip"
+          "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+          "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+        )
+        zig build -j2 olddefconfig "${zig_args[@]}"
+        for symbol in \
+          CONFIG_APPHYPERVACCEPTANCE \
+          CONFIG_LIBNETVSC \
+          CONFIG_LIBSTORVSC \
+          CONFIG_LIBVMBUS \
+          CONFIG_PLAT_HYPERV; do
+          grep --fixed-strings --quiet "${symbol}=y" "${config}"
+        done
+        grep --fixed-strings --quiet 'CONFIG_UKPLAT_CPU_MAXCOUNT=1' "${config}"
+        zig build -j2 native-images \
+          -Dnative-profile=hyperv-x86_64-efi-netvsc \
+          "${zig_args[@]}"
+        test -s "${build}/helloworld_hyperv-x86_64-efi-netvsc"
+        test -s "${build}/helloworld_hyperv-x86_64-efi-netvsc.dbg"
+
+    - name: Record local image digests
+      run: |
+        set -euo pipefail
+        build="${RUNNER_TEMP}/hyperv-ci/build"
+        sha256sum \
+          "${build}/helloworld_hyperv-x86_64-efi-netvsc" \
+          "${build}/helloworld_hyperv-x86_64-efi-netvsc.dbg" \
+          > "${RUNNER_TEMP}/hyperv-ci/image-sha256.txt"
+
+    - name: Boot exact raw GPT and fixed VHD in both APIC modes
+      run: |
+        set -euo pipefail
+        if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+          sudo chmod 666 /dev/kvm
+        fi
+        test -r /dev/kvm
+        test -w /dev/kvm
+        state="${RUNNER_TEMP}/hyperv-ci/packaging"
+        python3 support/scripts/hyperv-azure.py prepare \
+          --efi "${RUNNER_TEMP}/hyperv-ci/build/helloworld_hyperv-x86_64-efi-netvsc" \
+          --miz "${RUNNER_TEMP}/hyperv-ci/miz/bin/miz" \
+          --state-dir "${state}" \
+          --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.fd \
+          --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd \
+          --qemu "${RUNNER_TEMP}/hyperv-tools/qemu-system-x86_64" \
+          --timeout 60
+        python3 - "${state}/state.json" <<'PY'
+        import json
+        from pathlib import Path
+        import sys
+
+        state = json.loads(Path(sys.argv[1]).read_text())
+        expected = {
+            "raw": {"x2apic": True, "legacy-apic": True},
+            "vhd": {"x2apic": True, "legacy-apic": True},
+        }
+        if state.get("local_platform_boot_modes") != expected:
+            raise SystemExit(
+                f"unexpected local boot matrix: "
+                f"{state.get('local_platform_boot_modes')!r}"
+            )
+        PY
+
+    - name: Retain bounded local image evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-local-evidence
+        path: |
+          ${{ runner.temp }}/hyperv-ci/image-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/packaging/packaging.json
+          ${{ runner.temp }}/hyperv-ci/packaging/local-*-serial.log
+          ${{ runner.temp }}/hyperv-ci/packaging/miz-*.log
+        retention-days: 7
+        if-no-files-found: warn
+
   zig-helloworld-arm64:
     name: zig-helloworld-arm64
     runs-on: ubuntu-latest

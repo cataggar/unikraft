@@ -28,6 +28,11 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MIB = 1024 * 1024
 ESP_SIZE = 64 * MIB
 VIRTUAL_SIZE = 66 * MIB
+LOCAL_BOOT_MODES = (
+    ("x2apic", False),
+    ("legacy-apic", True),
+)
+LEGACY_APIC_MARKER = "Using legacy xAPIC MMIO"
 
 
 class AzureCliError(RuntimeError):
@@ -224,22 +229,39 @@ def miz_command(miz, arguments, log_path, *, json_output=False):
 
 
 def local_disk_boot(image, image_format, directory, ovmf_code, ovmf_vars,
-                    qemu, expected, timeout):
-    log_path = directory / f"local-{image_format}-serial.log"
+                    qemu, expected, timeout, mode, disable_x2apic):
+    if image_format not in ("raw", "vpc"):
+        raise ValueError("Local boot supports only raw GPT and fixed VHD images")
+    log_path = directory / f"local-{image_format}-{mode}-serial.log"
     with tempfile.TemporaryDirectory(prefix="ovmf-", dir=directory) as temporary:
         work = Path(temporary)
         shutil.copyfile(ovmf_code, work / "OVMF_CODE.fd")
         shutil.copyfile(ovmf_vars, work / "OVMF_VARS.fd")
         os.link(image, work / "disk.img")
+        cpu = (
+            "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-time,"
+            "hv-synic,hv-stimer,hv-vpindex,hv-runtime,hv-frequencies"
+        )
+        if disable_x2apic:
+            cpu += ",x2apic=off"
+        # Both formats expose the same raw data region. For fixed VHD, miz
+        # validates the footer separately; it must not become a guest sector.
+        disk = {
+            "driver": "raw", "node-name": "hyperv-disk",
+            "offset": 0, "size": VIRTUAL_SIZE, "read-only": True,
+            "file": {
+                "driver": "file", "filename": "disk.img", "read-only": True,
+            },
+        }
         command = [
             str(qemu), "-machine", "q35,accel=kvm",
-            "-cpu", "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-time,"
-            "hv-synic,hv-stimer,hv-vpindex,hv-runtime,hv-frequencies",
+            "-cpu", cpu,
             "-smp", "1", "-m", "512M",
             "-drive", "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
             "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",
-            "-drive", f"if=virtio,format={image_format},readonly=on,file=disk.img",
-            "-device", "vmbus-bridge,irq=15", "-device", "hv-balloon",
+            "-blockdev", json.dumps(disk, separators=(",", ":")),
+            "-device", "virtio-blk-pci,drive=hyperv-disk",
+            "-device", "vmbus-bridge,irq=15",
             "-display", "none", "-serial", "stdio", "-monitor", "none",
             "-no-reboot", "-nic", "none",
         ]
@@ -252,16 +274,32 @@ def local_disk_boot(image, image_format, directory, ovmf_code, ovmf_vars,
         if result.returncode:
             raise RuntimeError(f"QEMU exited with {result.returncode}; see {log_path}")
     text = log_path.read_text(errors="replace")
-    evidence = inspect_boot_log(text, expected)
+    normalized = text.replace("\0", "")
+    evidence = inspect_boot_log(normalized, expected)
     if not evidence["platform_ready"]:
         raise RuntimeError(f"Local application-ready marker is missing or guest crashed; see {log_path}")
+    if disable_x2apic and LEGACY_APIC_MARKER not in normalized:
+        raise RuntimeError(f"Legacy-APIC local boot did not use the xAPIC fallback; see {log_path}")
+    if not disable_x2apic and LEGACY_APIC_MARKER in normalized:
+        raise RuntimeError(f"Normal local boot unexpectedly used the xAPIC fallback; see {log_path}")
     for marker in (
         "Hyper-V Hv#1 hypercall page enabled",
         "Hyper-V SynIC:", "Powered by", "Calling main(",
     ):
-        if marker not in text.replace("\0", ""):
+        if marker not in normalized:
             raise RuntimeError(f"Local boot is missing {marker}; see {log_path}")
     return evidence
+
+
+def local_disk_boot_modes(image, image_format, directory, ovmf_code, ovmf_vars,
+                          qemu, expected, timeout):
+    return {
+        mode: local_disk_boot(
+            image, image_format, directory, ovmf_code, ovmf_vars,
+            qemu, expected, timeout, mode, disable_x2apic,
+        )
+        for mode, disable_x2apic in LOCAL_BOOT_MODES
+    }
 
 
 def prepare_image(args):
@@ -311,8 +349,10 @@ def prepare_image(args):
     if raw.stat().st_size != VIRTUAL_SIZE:
         raise ValueError("Unexpected raw GPT disk size from miz")
     raw_digest = image_sha256(raw)
-    local_disk_boot(raw, "raw", directory, ovmf_code, ovmf_vars,
-                    qemu, args.expect, args.timeout)
+    raw_boots = local_disk_boot_modes(
+        raw, "raw", directory, ovmf_code, ovmf_vars,
+        qemu, args.expect, args.timeout,
+    )
     if image_sha256(raw) != raw_digest:
         raise ValueError("Raw disk changed during its read-only local boot")
     image = directory / "unikraft.vhd"
@@ -326,13 +366,25 @@ def prepare_image(args):
     ], directory / "miz-check.log", json_output=True)
     check_packaging_report(report, efi_digest, image.stat().st_size)
     save_json(directory / "packaging.json", report)
-    local_disk_boot(image, "vpc", directory, ovmf_code, ovmf_vars,
-                    qemu, args.expect, args.timeout)
+    vhd_boots = local_disk_boot_modes(
+        image, "vpc", directory, ovmf_code, ovmf_vars,
+        qemu, args.expect, args.timeout,
+    )
     if image_sha256(image) != image_digest:
         raise ValueError("VHD changed during read-only preflight or local boot")
     state.update(
         phase="prepared", image_sha256=image_digest,
         local_platform_boot=True, raw_sha256=raw_digest,
+        local_platform_boot_modes={
+            "raw": {
+                mode: evidence["platform_ready"]
+                for mode, evidence in raw_boots.items()
+            },
+            "vhd": {
+                mode: evidence["platform_ready"]
+                for mode, evidence in vhd_boots.items()
+            },
+        },
     )
     save_json(state_path, state)
     return directory
