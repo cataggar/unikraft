@@ -392,6 +392,32 @@ solved configuration must additionally select `CONFIG_LIBUKNETDEV=y` and
 accepts uknetdev's `CONFIG_LIBUKLIBPARAM` implication, the native graph includes
 that library and its generated linker script as well.
 
+For the first local boot, use a single-CPU hello-world configuration with
+`CONFIG_LIBUKPRINT_KLVL_INFO=y`. EFI configurations now default to 512 bootinfo
+memory descriptors: the firmware memory map and Memory Attributes Table must
+both fit before coalescing. Existing solved configurations retain their old
+value; update `CONFIG_UKPLAT_MEMREGION_MAX_COUNT` to at least 512 if it is still
+128, then regenerate the configuration and rebuild.
+
+With KVM access, OVMF, and QEMU's `vmbus-bridge`/`hv-balloon` devices available:
+
+```shell
+python3 support/build/tests/hyperv-efi-boot-test.py \
+  --image /absolute/path/to/helloworld_hyperv-x86_64 \
+  --ovmf-code /usr/share/OVMF/OVMF_CODE.fd \
+  --ovmf-vars /usr/share/OVMF/OVMF_VARS.fd \
+  --work-dir /absolute/path/to/build/hyperv-efi-smoke \
+  --expect 'Hello world!'
+```
+
+This bounded smoke run requires hypercall/SynIC initialization, the application
+marker, a zero return from `main`, and normal QEMU exit. It keeps the serial log
+in the work directory and removes its temporary firmware and FAT staging files.
+The FAT directory is only an EFI launch fixture, not a GPT/ESP or Azure image.
+Passing does not establish VMBus channel or storage/network operation: bus errors
+remain visible in the serial log. Real Hyper-V I/O, fixed-VHD packaging through
+`miz`, and Azure Boot Diagnostics remain separate acceptance gates.
+
 NetVSC never guesses past a structurally malformed VMBus ring record. It
 disables channel callbacks and requests bounded VMBus reconnect, then closes
 and tears down the channel after the active callback/data-path operation has
@@ -424,6 +450,12 @@ pipelines as `LazyPath` inputs. The EFI pipeline runs the repository's
 and only then strips and converts the image to PE/COFF. Configuration and
 metadata inputs for target headers are content-tracked, so changing a solved
 configuration in place invalidates the generated header.
+
+Self-relocation requires a loadable `.uk_reloc` section with space for the
+signature, static and dynamic records, and sentinel before post-processing.
+The linker keeps GOT entries in initialized data, before `.bss`, so their
+relocations are retained. On x86, the early relocator uses explicit RIP-relative
+addresses rather than consulting a GOT that has not yet been relocated.
 
 #### Experimental LTO (QEMU/x86_64 native pipeline only)
 

@@ -34,7 +34,7 @@
 #error Selected architecture specific absolute relocations are not defined
 #endif
 .macro	ur_sec_updt	sym:req
-.pushsection	.uk_reloc
+.pushsection	.uk_reloc, "a"
 	.quad	0x0			/* r_mem_off */
 	.quad	0x0			/* r_addr */
 	.reloc	., RELA_DYN_ENTRY_TYPE, \sym

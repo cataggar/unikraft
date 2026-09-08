@@ -359,6 +359,20 @@ def build_uk_relocs(elf, rela_dyn_secs, max_r_mem_off):
     return [ur for ur in uk_relocs if ur[0] < max_r_mem_off]
 
 
+def validate_reloc_section(section, start, end, entry_count):
+    if "A" not in section["Flags"]:
+        raise ValueError(".uk_reloc must be allocated in the loaded image")
+    if start != section["Address"] or end < start:
+        raise ValueError(".uk_reloc linker symbols do not match its bounds")
+    required = 4 + 24 * (entry_count + 1)  # signature, entries, sentinel
+    available = min(section["Size"], end - start)
+    if required > available:
+        raise ValueError(
+            f".uk_reloc needs {required} bytes including signature and sentinel, "
+            f"but only {available} bytes are reserved"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Builds the .uk_reloc section off the .rela. and .symtab"
@@ -388,6 +402,7 @@ def main():
     # Make sure that all 5 obligatory sections are present for this to work
     shdrs = get_shdrs(opt.elf)
     bss_shdr = None
+    reloc_shdr = None
     sh_found = 0
     for s in shdrs:
         sh_name = s["Name"]
@@ -398,6 +413,7 @@ def main():
         elif sh_name == ".text":
             sh_found += 1
         elif sh_name == ".uk_reloc":
+            reloc_shdr = s
             sh_found += 1
         elif sh_name == ".bss":
             bss_shdr = s  # We will use this later
@@ -441,14 +457,9 @@ def main():
 
     uk_reloc_start = int(get_nm_syms(opt.elf, r"_uk_reloc_start")[0][0], 16)
     uk_reloc_end = int(get_nm_syms(opt.elf, r"_uk_reloc_end")[0][0], 16)
-    uk_reloc_sz = 24
-    if uk_reloc_end - uk_reloc_start < uk_reloc_sz * len(uk_relocs):
-        raise Exception(
-            "There are " + str(len(uk_relocs)) + " struct uk_reloc"
-            "entries but the maximum amount is of "
-            + str(int((uk_reloc_end - uk_reloc_start) / uk_reloc_sz))
-            + " entries."
-        )
+    validate_reloc_section(
+        reloc_shdr, uk_reloc_start, uk_reloc_end, len(uk_relocs)
+    )
 
     # Write the binary blob with `struct uk_reloc` entries
     with open(opt.output or opt.elf + ".uk_reloc.bin", "wb") as ur_bin:

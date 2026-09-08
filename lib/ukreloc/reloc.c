@@ -17,21 +17,26 @@
  * absolute 64-bit value relocation, that will be statically resolved
  * anyway  in the final binary.
  */
-static unsigned long lt_baddr = __BASE_ADDR;
+/* Keep the stored link-time value: folding it to a runtime-relative symbol
+ * reference would cancel the relocation delta for kernel memory regions.
+ */
+static volatile unsigned long lt_baddr = __BASE_ADDR;
 static unsigned long rt_baddr;
 
 /* Use `get_rt_addr()` to obtain the runtime base address */
 #if defined(__X86_64__)
 
-/* For x86, this is resolved to a `%rip` relative access anyway */
-static inline unsigned long get_rt_addr(unsigned long sym)
-{
-	return	sym;
-}
+/* Absolute linker symbols may otherwise use unrelocated GOT entries with LLD. */
+#define get_rt_addr(sym)							\
+	({								\
+		unsigned long addr;					\
+		__asm__("lea " #sym "(%%rip), %0" : "=r"(addr));		\
+		addr;							\
+	})
 
 #elif defined(__ARM_64__)
 
-static inline unsigned long get_rt_addr(unsigned long sym)
+static inline unsigned long get_rt_addr(const char *sym)
 {
 	__asm__ __volatile__(
 		"adrp	x0, _base_addr\n\t"
@@ -42,7 +47,7 @@ static inline unsigned long get_rt_addr(unsigned long sym)
 		: "x0", "memory"
 	);
 
-	return (sym - lt_baddr) + rt_baddr;
+	return ((unsigned long)sym - lt_baddr) + rt_baddr;
 }
 #endif
 
@@ -52,7 +57,7 @@ static inline struct uk_reloc_hdr *get_uk_reloc_hdr()
 {
 	struct uk_reloc_hdr *ur_hdr;
 
-	ur_hdr = (struct uk_reloc_hdr *)get_rt_addr(__UKRELOC_START);
+	ur_hdr = (struct uk_reloc_hdr *)get_rt_addr(_uk_reloc_start);
 	if (unlikely(!ur_hdr) ||
 	    unlikely(ur_hdr->signature != UKRELOC_SIGNATURE))
 		return NULL;
@@ -72,7 +77,7 @@ __isr __used void do_uk_reloc(__paddr_t r_paddr, __vaddr_t r_vaddr)
 	if (unlikely(!ur_hdr))
 		uk_reloc_crash("Invalid UKRELOC signature");
 
-	rt_baddr = get_rt_addr(__BASE_ADDR);
+	rt_baddr = get_rt_addr(_base_addr);
 	if (r_paddr == 0)
 		r_paddr = (__paddr_t)rt_baddr;
 	if (r_vaddr == 0)
@@ -113,7 +118,7 @@ __isr void do_uk_reloc_kmrds(__paddr_t r_paddr, __vaddr_t r_vaddr)
 {
 	struct ukplat_memregion_desc *mrdp;
 
-	rt_baddr = get_rt_addr(__BASE_ADDR);
+	rt_baddr = get_rt_addr(_base_addr);
 	if (r_paddr == 0)
 		r_paddr = (__paddr_t)rt_baddr;
 	if (r_vaddr == 0)

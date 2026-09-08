@@ -170,6 +170,8 @@
 	{								\
 		*(.data)						\
 		*(.data.*)						\
+		/* Self-relocation only visits targets before .bss. */	\
+		*(.got .got.*)						\
 	} UK_SEGMENT_DATA						\
 	_edata = .;							\
 									\
