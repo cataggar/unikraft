@@ -779,6 +779,10 @@ void vmbus_channel_reset_all(void)
 {
 }
 
+void vmbus_channel_quarantine_all(void)
+{
+}
+
 int vmbus_channel_send_ex(struct vmbus_channel *channel, __u16 packet_type,
 			  __u16 flags, __u64 id,
 			  const void *descriptor, size_t descriptor_size,

@@ -114,6 +114,15 @@ static void gpadl_record_try_reclaim(struct vmbus_gpadl_record *record);
 static int teardown_external_gpadls(struct vmbus_channel *channel,
 				    int wait);
 
+static inline void vmbus_channel_cpu_relax(void)
+{
+#ifdef VMBUS_CHANNEL_HOST_TEST
+	__atomic_signal_fence(__ATOMIC_ACQ_REL);
+#else
+	__asm__ __volatile__("pause");
+#endif
+}
+
 static void initialize_channel_locks(void)
 {
 	unsigned int i;
@@ -336,6 +345,16 @@ static void finalize_channel_locked(struct vmbus_channel *channel)
 		     VMBUS_GPADL_RECORD_ASYNC ||
 	     __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
 		     VMBUS_GPADL_RECORD_RESET)) {
+		if (record->owns_ring_pages && channel->page_count &&
+		    channel->page_start == record->page_start &&
+		    channel->page_count == record->page_count) {
+			channel->page_start = 0;
+			channel->page_count = 0;
+			channel->tx_ring = NULL;
+			channel->rx_ring = NULL;
+			channel->tx_pages = 0;
+			channel->rx_pages = 0;
+		}
 		__atomic_store_n(&record->local_drained, 1, __ATOMIC_RELEASE);
 		channel->gpadl_record = 0;
 		gpadl_record_try_reclaim(record);
@@ -631,7 +650,7 @@ transaction_wait_status(struct vmbus_channel_transaction *transaction,
 		if (uk_sched_current())
 			uk_sched_thread_sleep(VMBUS_CONTROL_WAIT_NS);
 		else
-			__asm__ __volatile__("pause");
+			vmbus_channel_cpu_relax();
 	}
 	if (transaction->status == (__u32)-ECANCELED)
 		return -ECANCELED;
@@ -1894,36 +1913,32 @@ void vmbus_channel_close_all(void)
 	}
 }
 
-void vmbus_channel_reset_all(void)
+static void reset_channels(int host_quiesced)
 {
 	unsigned int i;
 
 	initialize_channel_locks();
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++) {
+		__u8 state = __atomic_load_n(&gpadl_records[i].state,
+					     __ATOMIC_ACQUIRE);
+
 		gpadl_records[i].transaction = NULL;
-		if (__atomic_load_n(&gpadl_records[i].state,
-				    __ATOMIC_ACQUIRE) ==
-			    VMBUS_GPADL_RECORD_ASYNC ||
-		    __atomic_load_n(&gpadl_records[i].state,
-				    __ATOMIC_ACQUIRE) ==
-			    VMBUS_GPADL_RECORD_RESET ||
-		    __atomic_load_n(&gpadl_records[i].state,
-				    __ATOMIC_ACQUIRE) ==
-			    VMBUS_GPADL_RECORD_TEARING_DOWN) {
+		if (state == VMBUS_GPADL_RECORD_OWNED ||
+		    state == VMBUS_GPADL_RECORD_ASYNC ||
+		    state == VMBUS_GPADL_RECORD_RESET ||
+		    state == VMBUS_GPADL_RECORD_TEARING_DOWN) {
 			__atomic_store_n(&gpadl_records[i].state,
 					 VMBUS_GPADL_RECORD_RESET,
 					 __ATOMIC_RELEASE);
-			__atomic_store_n(&gpadl_records[i].host_done, 1,
-					 __ATOMIC_RELEASE);
-			__atomic_store_n(&gpadl_records[i].local_drained, 1,
-					 __ATOMIC_RELEASE);
-			gpadl_record_try_reclaim(&gpadl_records[i]);
+			if (host_quiesced)
+				__atomic_store_n(
+					&gpadl_records[i].host_done, 1,
+					__ATOMIC_RELEASE);
 		}
 	}
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_TRANSACTIONS; i++)
 		transaction_release(&transactions[i]);
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
-		struct vmbus_gpadl_record *record = NULL;
 		struct vmbus_channel_token token = { 0 };
 
 		if (__atomic_load_n(&channels[i].state, __ATOMIC_ACQUIRE) ==
@@ -1931,15 +1946,6 @@ void vmbus_channel_reset_all(void)
 			continue;
 		if (channel_operation_pin(&channels[i], &token))
 			continue;
-		if (channels[i].gpadl_record &&
-		    channels[i].gpadl_record <= CONFIG_LIBVMBUS_MAX_GPADLS)
-			record = &gpadl_records[channels[i].gpadl_record - 1];
-		if (record &&
-		    __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
-			    VMBUS_GPADL_RECORD_OWNED) {
-			gpadl_record_release(record, 0);
-			channels[i].gpadl_record = 0;
-		}
 		channels[i].gpadl_id = 0;
 		channels[i].gpadl_live = 0;
 		if (channels[i].device &&
@@ -1951,11 +1957,6 @@ void vmbus_channel_reset_all(void)
 				 __ATOMIC_RELEASE);
 		end_channel_operation(&channels[i], &token);
 	}
-	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++)
-		if (__atomic_load_n(&gpadl_records[i].state,
-				    __ATOMIC_ACQUIRE) ==
-			    VMBUS_GPADL_RECORD_OWNED)
-			gpadl_record_release(&gpadl_records[i], 1);
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++)
 		if (__atomic_load_n(&gpadl_records[i].state,
 				    __ATOMIC_ACQUIRE) ==
@@ -1988,6 +1989,16 @@ void vmbus_channel_reset_all(void)
 			gpadl_record_try_reclaim(&gpadl_records[i]);
 		}
 	__atomic_store_n(&ignored_responses, 0, __ATOMIC_RELEASE);
+}
+
+void vmbus_channel_quarantine_all(void)
+{
+	reset_channels(0);
+}
+
+void vmbus_channel_reset_all(void)
+{
+	reset_channels(1);
 }
 
 #ifdef VMBUS_CHANNEL_HOST_TEST

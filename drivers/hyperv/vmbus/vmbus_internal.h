@@ -24,6 +24,8 @@ __u32 vmbus_channel_take_ignored_responses(void);
 void vmbus_channel_event(__u32 event);
 int vmbus_channel_rescind(__u32 channel_id);
 void vmbus_channel_close_all(void);
+/* Use reset only after host quiescence is proven; otherwise quarantine. */
+void vmbus_channel_quarantine_all(void);
 void vmbus_channel_reset_all(void);
 
 #endif /* __VMBUS_INTERNAL_H__ */
