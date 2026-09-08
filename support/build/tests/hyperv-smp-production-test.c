@@ -188,7 +188,7 @@ int uk_lcpu_start(const uint64_t *indices, unsigned int *count,
 
 void ukplat_time_init(void);
 int ukplat_lcpu_startup_hook(void);
-int hyperv_time_shutdown(int crash);
+int hyperv_time_shutdown(int crash, int host_quiesced);
 int hyperv_time_shutdown_error(void);
 int hyperv_vmbus_target_acquire(uint32_t *, uint32_t *);
 void hyperv_vmbus_target_release(uint32_t, uint32_t);
@@ -246,7 +246,7 @@ static void test_cpu_setup_routing_and_ap_shutdown(void)
 		for (unsigned int i = 0; i < 3; i++)
 			assert(hyperv_vmbus_target_acquire(
 				       &vp[i], &generation[i]) == 0);
-		assert(vp[0] == 7 && vp[1] == 8 && vp[2] == 3);
+		assert(vp[0] == 3 && vp[1] == 3 && vp[2] == 3);
 		for (unsigned int i = 0; i < 3; i++)
 			hyperv_vmbus_target_release(vp[i], generation[i]);
 	}
@@ -267,7 +267,8 @@ static void test_cpu_setup_routing_and_ap_shutdown(void)
 	order = 0;
 	vmbus_fini_order = 0;
 	first_disable_order = 0;
-	assert(hyperv_time_shutdown(0) == 0);
+	assert(hyperv_vmbus_shutdown() == 0);
+	assert(hyperv_time_shutdown(0, 1) == 0);
 	assert(__atomic_load_n(&vmbus_fini_order, __ATOMIC_RELAXED) &&
 	       __atomic_load_n(&vmbus_fini_order, __ATOMIC_RELAXED) <
 		       __atomic_load_n(&first_disable_order,
@@ -286,7 +287,7 @@ static void *ap_init_thread(void *arg __attribute__((unused)))
 static void *shutdown_thread(void *arg __attribute__((unused)))
 {
 	hyperv_host_cpu_index = 0;
-	return (void *)(intptr_t)hyperv_time_shutdown(0);
+	return (void *)(intptr_t)hyperv_time_shutdown(0, 1);
 }
 
 static void test_startup_shutdown_race(void)
@@ -331,7 +332,7 @@ static void test_partial_ap_setup_rollback(void)
 	assert(enable_count[1] == 1 && disable_count[1] == 1);
 	hyperv_host_cpu_index = 0;
 	fail_enable_cpu = -1;
-	assert(hyperv_time_shutdown(0) == 0);
+	assert(hyperv_time_shutdown(0, 1) == 0);
 }
 
 static void test_shutdown_failure_fails_forward(void)
@@ -343,10 +344,25 @@ static void test_shutdown_failure_fails_forward(void)
 	assert(ukplat_lcpu_init_hook() == 0);
 	hyperv_host_cpu_index = 0;
 	host_run_error = -EIO;
-	assert(hyperv_time_shutdown(0) == 0);
+	assert(hyperv_time_shutdown(0, 1) == 0);
 	assert(hyperv_time_shutdown_error() == -EIO);
 	assert(hyperv_time_host_runtime_state() == 3);
-	assert(hyperv_time_shutdown(1) == 0);
+	assert(hyperv_time_shutdown(1, 0) == 0);
+}
+
+static void test_crash_keeps_pinned_pages_programmed(void)
+{
+	uint32_t vp;
+	uint32_t generation;
+
+	reset_observations();
+	hyperv_host_cpu_index = 0;
+	ukplat_time_init();
+	assert(hyperv_vmbus_target_acquire(&vp, &generation) == 0);
+	assert(hyperv_time_shutdown(1, 0) == 0);
+	assert(hyperv_time_host_runtime_state() == 3);
+	assert(disable_count[0] == 0);
+	hyperv_vmbus_target_release(vp, generation);
 }
 
 int main(void)
@@ -355,5 +371,6 @@ int main(void)
 	test_partial_ap_setup_rollback();
 	test_startup_shutdown_race();
 	test_shutdown_failure_fails_forward();
+	test_crash_keeps_pinned_pages_programmed();
 	return 0;
 }

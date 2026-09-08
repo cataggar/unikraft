@@ -107,7 +107,7 @@ __u32 hyperv_vp_index(void);
 __u32 hyperv_max_vp_count(void);
 int hyperv_vmbus_target_acquire(__u32 *vp_index, __u32 *generation);
 void hyperv_vmbus_target_release(__u32 vp_index, __u32 generation);
-int hyperv_time_shutdown(int crash);
+int hyperv_time_shutdown(int crash, int host_quiesced);
 int hyperv_time_shutdown_error(void);
 void hyperv_clock_set_efi_sample(__u64 epoch_ns, __u64 reference_time);
 
@@ -115,6 +115,7 @@ void hyperv_vmbus_message(const struct hyperv_message *message);
 void hyperv_vmbus_event(__u32 event);
 void hyperv_vmbus_event_word(__u32 base_event, __u64 pending);
 void hyperv_vmbus_fini(void);
+int hyperv_vmbus_shutdown(void);
 
 _Static_assert(HYPERV_PAGE_SIZE == 4096U, "Hyper-V pages are 4 KiB");
 _Static_assert(sizeof(struct hyperv_message) == HYPERV_MESSAGE_SIZE,

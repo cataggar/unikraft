@@ -357,9 +357,12 @@ partition reference counter), and uses SynIC STimer0 for one-shot scheduler
 wakeups. SMP images allocate Kconfig-bounded, page-aligned SIMP/SIEFP storage
 for every logical CPU and program SynIC/STimer MSRs on the CPU that owns them.
 Hyper-V VP indices are discovered from `HV_X64_MSR_VP_INDEX`; logical CPU
-indices are never used as host VP identifiers. StorVSC and NetVSC currently
-retain one primary queue. Subchannels, RSS, and multiqueue remain deferred
-until live-host measurements justify their topology and queue policy.
+indices are never used as host VP identifiers. Secondary CPUs currently run
+the framework's idle/IPI entry rather than independent schedcoop workloads.
+VMBus control and primary StorVSC/NetVSC channels remain pinned to the BSP
+because schedcoop has no SMP-safe cross-CPU worker wake primitive. Subchannels,
+RSS, and multiqueue remain deferred until that scheduler support and live-host
+measurements justify their topology and queue policy.
 
 ```shell
 zig build native-images \

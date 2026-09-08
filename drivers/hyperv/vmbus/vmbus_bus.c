@@ -284,7 +284,7 @@ void hyperv_vmbus_message(const struct hyperv_message *message)
 
 static void enqueue_event_word(__u32 base, __u64 pending)
 {
-	if (!pending || base >= VMBUS_EVENT_LIMIT ||
+	if (!pending || (base & 63U) || base >= VMBUS_EVENT_LIMIT ||
 	    base + 63U >= VMBUS_EVENT_LIMIT) {
 		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
 		return;
@@ -322,6 +322,11 @@ void hyperv_vmbus_event_word(__u32 base_event, __u64 pending)
 {
 	if (!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE))
 		return;
+	if ((base_event & 63U) || base_event >= VMBUS_EVENT_LIMIT ||
+	    base_event + 63U >= VMBUS_EVENT_LIMIT) {
+		__atomic_add_fetch(&event_dropped, 1, __ATOMIC_RELAXED);
+		return;
+	}
 	if (vmbus_protocol_version() < VMBUS_EVENT_VERSION_WIN8) {
 		if (base_event == 0 && (pending & 1U))
 			hyperv_vmbus_event(0);
@@ -1371,7 +1376,7 @@ out_reset:
 	drain_queues();
 	vmbus_protocol_reset();
 	vmbus_channel_reset_all();
-	if (connection_target_held) {
+	if (!rc && connection_target_held) {
 		hyperv_vmbus_target_release(connection_target_vp,
 					   connection_target_generation);
 		connection_target_held = 0;
@@ -1939,17 +1944,26 @@ __u64 vmbus_connection_quiesce_epoch(void)
 	return __atomic_load_n(&connection_quiesce_epoch, __ATOMIC_ACQUIRE);
 }
 
-void hyperv_vmbus_fini(void)
+int hyperv_vmbus_shutdown(void)
 {
 	int control_acquired;
+	int rc;
 
 	if (!teardown_enter(&control_acquired)) {
-		(void)disconnect_locked();
+		rc = disconnect_locked();
 		if (control_acquired)
 			release_control();
-	} else
+	} else {
 		vmbus_teardown_final_fallback(&teardown_ops, NULL);
+		rc = -EWOULDBLOCK;
+	}
 	initialized = 0;
+	return rc;
+}
+
+void hyperv_vmbus_fini(void)
+{
+	(void)hyperv_vmbus_shutdown();
 }
 
 unsigned int vmbus_device_count(void)
@@ -2490,6 +2504,13 @@ static int host_test_concurrent_irqs(void)
 	hyperv_vmbus_event_word(VMBUS_EVENT_LIMIT, 1);
 	if (!event_dropped)
 		return 95;
+	{
+		__u32 dropped = event_dropped;
+
+		hyperv_vmbus_event_word(1, 1);
+		if (event_dropped != dropped + 1)
+			return 96;
+	}
 	__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
 	return 0;
 }
