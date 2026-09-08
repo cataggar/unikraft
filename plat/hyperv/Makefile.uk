@@ -38,10 +38,12 @@ HYPERV_RUNTIME_OBJ := $(LIBHYPERVPLAT_BUILD)/hyperv_runtime.o
 HYPERV_ZIG_CACHE := $(LIBHYPERVPLAT_BUILD)/zig-cache
 HYPERV_ZIG_GLOBAL_CACHE := $(LIBHYPERVPLAT_BUILD)/zig-global-cache
 
-$(HYPERV_RUNTIME_OBJ): $(LIBHYPERVPLAT_BASE)/hyperv_runtime.zig
+# SynIC message/event decoding runs with only the IRQ entry GPRs saved.
+$(HYPERV_RUNTIME_OBJ): $(LIBHYPERVPLAT_BASE)/hyperv_runtime.zig $(LIBHYPERVPLAT_BASE)/Makefile.uk
 	$(call build_cmd,ZIG,libhypervplat,$(notdir $@),\
 		mkdir -p $(HYPERV_ZIG_CACHE) $(HYPERV_ZIG_GLOBAL_CACHE) && \
 		zig build-obj -target x86_64-freestanding-none -OReleaseFast \
+			-mcpu=baseline+soft_float-x87-mmx-sse-sse2-avx-avx2 \
 			-fPIC -fsingle-threaded -mno-red-zone \
 			-fno-stack-check -fno-stack-protector -fno-unwind-tables \
 			--cache-dir $(HYPERV_ZIG_CACHE) \

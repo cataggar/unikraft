@@ -364,6 +364,29 @@ because schedcoop has no SMP-safe cross-CPU worker wake primitive. Subchannels,
 RSS, and multiqueue remain deferred until that scheduler support and live-host
 measurements justify their topology and queue policy.
 
+SynIC IRQ entry saves only general-purpose registers. The VMBus bus C object
+uses Unikraft's `|isr` variant; the Hyper-V runtime and VMBus protocol Zig
+objects disable x87/MMX/SSE/AVX code generation in both build backends.
+Freestanding targeting alone is not sufficient. Queue publication, legacy
+event routing, and the ISR scheduler wake callback stay on this restricted
+path; protocol processing and channel/driver callbacks run in the worker.
+
+`zig build test-hyperv-irq` runs the targeted hosted correctness tests, including
+8-, 196-, and 240-byte receive payloads. Native Hyper-V image publication also
+checks the final linked IRQ call graph for unsaved FP/SIMD use and strong VMBus
+hook resolution. For GNU Make images, run the same check explicitly:
+
+```shell
+python3 support/build/tests/hyperv-irq-register-test.py --image /path/to/image.dbg
+```
+
+The checker follows direct calls/tail branches, the native/controller SynIC
+dispatch, and schedcoop's registered ISR wake callback, rejecting unreviewed
+indirect edges. Only terminal assertion
+logging immediately leading to a fatal trap is excluded: it cannot return to
+the interrupted context. This compiler/register check is not live Hyper-V I/O
+or AP workload acceptance.
+
 ```shell
 zig build native-images \
   -Dnative-profile=hyperv-x86_64-efi \

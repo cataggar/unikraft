@@ -175,6 +175,7 @@ fn registerLibraries(
                     .output = output,
                     .optimize = .ReleaseFast,
                     .pic = true,
+                    .isr = true,
                 }},
             );
             continue;
@@ -237,6 +238,7 @@ fn registerLibraries(
                     .output = output,
                     .optimize = .ReleaseFast,
                     .pic = true,
+                    .isr = true,
                 },
                 .{
                     .name = "vmbus-channel",
@@ -1018,6 +1020,7 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
     try std.testing.expect(zig_library.raw_objects.len > 0);
     try std.testing.expectEqual(@as(usize, 1), zig_library.target_zig_objects.len);
     try std.testing.expect(zig_library.target_zig_objects[0].pic);
+    try std.testing.expect(zig_library.target_zig_objects[0].isr);
     try std.testing.expectEqualStrings(
         "/src/unikraft/plat/hyperv/hyperv_runtime.zig",
         zig_library.target_zig_objects[0].root_source_file,
@@ -1038,6 +1041,12 @@ test "Hyper-V EFI profile registers source-built Zig objects and PIE link orderi
     }
     const vmbus = vmbus_library orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 2), vmbus.target_zig_objects.len);
+    try std.testing.expect(vmbus.target_zig_objects[0].isr);
+    try std.testing.expect(!vmbus.target_zig_objects[1].isr);
+    try std.testing.expectEqualStrings(
+        "/build/libvmbus/vmbus_bus.isr.o",
+        vmbus.raw_objects[0].path,
+    );
     try std.testing.expectEqualStrings(
         "/src/unikraft/drivers/hyperv/vmbus/vmbus_protocol.zig",
         vmbus.target_zig_objects[0].root_source_file,

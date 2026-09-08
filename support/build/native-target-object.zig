@@ -88,6 +88,30 @@ pub const Execution = struct {
     }
 };
 
+pub fn targetQuery(isr: bool) std.Target.Query {
+    return .{
+        .cpu_arch = .x86_64,
+        .os_tag = .freestanding,
+        .abi = .none,
+        .cpu_features_add = if (isr)
+            std.Target.x86.featureSet(&.{.soft_float})
+        else
+            .empty,
+        .cpu_features_sub = if (isr)
+            std.Target.x86.featureSet(&.{ .x87, .mmx, .sse, .sse2, .avx, .avx2 })
+        else
+            .empty,
+    };
+}
+
+test "ISR Zig target excludes unsaved x86 registers" {
+    const target = try std.zig.system.resolveTargetQuery(std.testing.io, targetQuery(true));
+    try std.testing.expect(target.cpu.features.isEnabled(@intFromEnum(std.Target.x86.Feature.soft_float)));
+    inline for (.{ .x87, .mmx, .sse, .sse2, .avx, .avx2 }) |feature| {
+        try std.testing.expect(!target.cpu.features.isEnabled(@intFromEnum(@field(std.Target.x86.Feature, @tagName(feature)))));
+    }
+}
+
 pub fn execute(
     b: *std.Build,
     graph: component.FinalizedGraph,
@@ -95,15 +119,11 @@ pub fn execute(
 ) Error!Execution {
     const object_plan = try plan(b.allocator, graph, options.optimize);
     if (object_plan.objects.len == 0) return .{ .outputs = &.{} };
-    const target = b.resolveTargetQuery(.{
-        .cpu_arch = .x86_64,
-        .os_tag = .freestanding,
-        .abi = .none,
-    });
     const outputs = b.allocator.alloc(Output, object_plan.objects.len) catch
         return error.OutOfMemory;
 
     for (object_plan.objects, outputs) |planned, *output| {
+        const target = b.resolveTargetQuery(targetQuery(planned.object.isr));
         const target_module = b.createModule(.{
             .root_source_file = .{ .cwd_relative = planned.object.root_source_file },
             .target = target,
