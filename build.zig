@@ -1711,6 +1711,35 @@ fn finishNativeImages(
         const gate = b.addSystemCommand(&.{"cp"});
         gate.step.dependOn(&check.step);
         gate.step.dependOn(&irq_check.step);
+        if (nativeConfigEnabled(config, "CONFIG_LIBSTORVSC") or
+            nativeConfigEnabled(config, "CONFIG_LIBNETVSC"))
+        {
+            const driver_check = b.addSystemCommand(&.{
+                "python3",
+                "support/build/tests/hyperv-driver-registration-test.py",
+                "--image",
+            });
+            driver_check.addFileArg(link_output);
+            driver_check.addArgs(&.{
+                "--nm",
+                registered.graph.toolchain.binutils.nm.command,
+                "--objdump",
+                if (registered.graph.toolchain.binutils.objdump) |tool|
+                    tool.command
+                else
+                    "llvm-objdump",
+            });
+            if (nativeConfigEnabled(config, "CONFIG_LIBSTORVSC"))
+                driver_check.addArgs(&.{ "--require-driver", "storvsc" });
+            if (nativeConfigEnabled(config, "CONFIG_LIBNETVSC"))
+                driver_check.addArgs(&.{ "--require-driver", "netvsc" });
+            driver_check.setCwd(.{ .cwd_relative = b.build_root.path.? });
+            driver_check.setEnvironmentVariable(
+                "PYTHONDONTWRITEBYTECODE",
+                "1",
+            );
+            gate.step.dependOn(&driver_check.step);
+        }
         gate.addFileArg(link_output);
         validated_link_output =
             gate.addOutputFileArg("hyperv-validated-final.dbg");

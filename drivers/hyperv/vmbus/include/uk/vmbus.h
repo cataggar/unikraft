@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <uk/arch/types.h>
+#include <uk/bus.h>
 #include <uk/ctors.h>
 
 #ifdef __cplusplus
