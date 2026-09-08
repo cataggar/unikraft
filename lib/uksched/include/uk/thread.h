@@ -65,6 +65,9 @@ struct uk_thread {
 	__snsec wakeup_time;
 	struct uk_sched *sched;
 	struct uk_waitq_ticket wait_ticket;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	unsigned int sched_queue;
+#endif
 
 	struct {
 		struct uk_alloc *t_a;
@@ -173,6 +176,7 @@ bool uk_thread_in_waitq(struct uk_thread *thread)
  *  present in the run queue.
  */
 #define UK_THREADF_QUEUEABLE  (0x020)
+#define UK_THREADF_EXITING    (0x040)
 
 #define uk_thread_is_exited(t)   ((t)->flags & UK_THREADF_EXITED)
 #define uk_thread_is_runnable(t) (!uk_thread_is_exited(t) \
@@ -181,6 +185,7 @@ bool uk_thread_in_waitq(struct uk_thread *thread)
 				  (UK_THREADF_EXITED | UK_THREADF_RUNNABLE) == \
 				  0x0)
 #define uk_thread_is_queueable(t) ((t)->flags & UK_THREADF_QUEUEABLE)
+#define uk_thread_is_exiting(t)   ((t)->flags & UK_THREADF_EXITING)
 
 #define uk_thread_set_runnable(t) \
 	do { (t)->flags |= UK_THREADF_RUNNABLE; } while (0)
@@ -670,6 +675,14 @@ void uk_thread_block_until(struct uk_thread *thread, __snsec until);
 void uk_thread_block_timeout(struct uk_thread *thread, __nsec nsec);
 void uk_thread_block(struct uk_thread *thread);
 void uk_thread_wake(struct uk_thread *thread);
+
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+/*
+ * If an error is returned with @published set, the runnable transition is
+ * committed. The only safe retry is uk_sched_kick_retry(thread->sched, ...).
+ */
+int uk_thread_wake_published(struct uk_thread *thread, int *published);
+#endif
 
 /**
  * Set the wakeup timer state for thread `t`.

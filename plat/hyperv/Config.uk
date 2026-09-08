@@ -53,4 +53,15 @@ config HYPERV_EFI_STUB_RST_ATK_MITIGATION
 	help
 		Request firmware memory overwrite on the next reset.
 
+config HYPERV_FIXED_SMP_WORKLOAD
+	bool "Fixed scheduled secondary-CPU workloads"
+	default n
+	depends on HAVE_SMP && LIBUKBOOT_INITSCHEDCOOP
+	select LIBUKBOOT_FIXED_SMP
+	help
+		Start one BSP-prepared cooperative scheduler and persistent worker
+		on each x2APIC secondary CPU. This remains opt-in; the default
+		Hyper-V image is single CPU and all device/control workers stay on
+		the BSP.
+
 endif

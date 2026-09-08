@@ -288,6 +288,12 @@ int uk_lcpu_run(const __u64 lcpuidx[], unsigned int *num,
  * @return 0 on success, an errno-type error value otherwise
  */
 int uk_lcpu_wakeup(const __u64 lcpuidx[], unsigned int *num);
+
+__isr int uk_lcpu_wakeup_one(unsigned int idx);
+
+void uk_lcpu_startup_idle(void);
+
+void __noreturn uk_lcpu_halt_error(int error);
 #endif /* CONFIG_HAVE_SMP */
 
 struct uk_lcpu *uk_lcpu_get_current(void);

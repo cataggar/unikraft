@@ -44,6 +44,10 @@
 #include <uk/assert.h>
 #include <uk/arch/tls.h>
 #include <uk/plat/memory.h>
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+#include <uk/pcpuvar.h>
+#include <uk/plat/spinlock.h>
+#endif
 
 #if CONFIG_LIBUKSCHED_TCB_INIT && !CONFIG_UKARCH_TLS_HAVE_TCB
 #error CONFIG_LIBUKSCHED_TCB_INIT requires that a TLS contains reserved space for a TCB
@@ -1041,15 +1045,33 @@ void uk_thread_block_until(struct uk_thread *thread, __snsec until)
 	unsigned long flags;
 
 	UK_ASSERT(thread);
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	if (thread->sched)
+		UK_ASSERT(thread == uk_thread_current());
+#endif
 
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	if (thread->sched)
+		ukplat_spin_lock_irqsave(&thread->sched->lock, flags);
+	else
+		flags = uk_lcpu_save_irqf();
+#else
 	flags = uk_lcpu_save_irqf();
+#endif
 	thread->wakeup_time = until;
 	if (uk_thread_is_runnable(thread)) {
 		uk_thread_set_blocked(thread);
 		if (thread->sched)
 			uk_sched_thread_blocked(thread);
 	}
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	if (thread->sched)
+		ukplat_spin_unlock_irqrestore(&thread->sched->lock, flags);
+	else
+		uk_lcpu_restore_irqf(flags);
+#else
 	uk_lcpu_restore_irqf(flags);
+#endif
 }
 
 void uk_thread_block_timeout(struct uk_thread *thread, __nsec nsec)
@@ -1068,16 +1090,77 @@ void uk_thread_block(struct uk_thread *thread)
 	uk_thread_block_until(thread, (__nsec) 0);
 }
 
-void uk_thread_wake(struct uk_thread *thread)
+static int _uk_thread_wake(struct uk_thread *thread, int *published)
 {
 	unsigned long flags;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	struct uk_sched *sched;
+	int rc = 0;
+#endif
 
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	UK_ASSERT(published);
+	*published = 0;
+	sched = thread->sched;
+	if (sched)
+		ukplat_spin_lock_irqsave(&sched->lock, flags);
+	else
+		flags = uk_lcpu_save_irqf();
+#else
 	flags = uk_lcpu_save_irqf();
-	if (!uk_thread_is_runnable(thread)) {
+#endif
+	if (!uk_thread_is_runnable(thread)
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	    && !uk_thread_is_exiting(thread)
+	    && !uk_thread_is_exited(thread)
+#endif
+	    ) {
 		uk_thread_set_runnable(thread);
 		if (thread->sched)
 			uk_sched_thread_woken(thread);
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+		*published = 1;
+#endif
 	}
 	thread->wakeup_time = 0LL;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	if (sched)
+		ukplat_spin_unlock_irqrestore(&sched->lock, flags);
+	else
+		uk_lcpu_restore_irqf(flags);
+
+	if (*published && sched &&
+	    sched->lcpu_idx != uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx) &&
+	    uk_sched_state(sched) == UK_SCHED_ONLINE)
+		rc = uk_sched_kick(sched);
+	return rc;
+#else
 	uk_lcpu_restore_irqf(flags);
+	return 0;
+#endif
 }
+
+void uk_thread_wake(struct uk_thread *thread)
+{
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	int published;
+	int rc;
+
+	rc = _uk_thread_wake(thread, &published);
+	if (rc && published)
+		rc = uk_sched_kick_retry(thread->sched,
+					 UK_SCHED_KICK_RETRIES_DEFAULT);
+	if (rc)
+		uk_pr_err("thread %p: wake published but scheduler kick failed: %d\n",
+			  thread, rc);
+#else
+	(void) _uk_thread_wake(thread, NULL);
+#endif
+}
+
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+int uk_thread_wake_published(struct uk_thread *thread, int *published)
+{
+	return _uk_thread_wake(thread, published);
+}
+#endif

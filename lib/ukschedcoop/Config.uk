@@ -4,3 +4,13 @@ config LIBUKSCHEDCOOP
 	select LIBNOLIBC if !HAVE_LIBC
 	select LIBUKSCHED
 	select LIBUKLCPU
+
+config LIBUKSCHEDCOOP_FIXED_SMP
+	bool "Fixed per-LCPU cooperative schedulers"
+	default n
+	depends on HAVE_SMP
+	select LIBUKSCHED_FIXED_SMP
+	help
+	  Prepare one cooperative scheduler and persistent work thread per
+	  secondary LCPU. Threads never migrate and secondary LCPUs do not
+	  allocate or garbage collect scheduler resources.

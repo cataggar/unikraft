@@ -1,0 +1,11 @@
+menuconfig APPHYPERVSMPWORKLOAD
+	bool "Hyper-V fixed scheduled-SMP workload proof"
+	default y
+	depends on PLAT_HYPERV && HAVE_SMP && LIBUKBOOT_INITSCHEDCOOP
+	select LIBNOLIBC
+	select LIBUKSCHED
+	select LIBUKSCHEDCOOP
+	select HYPERV_FIXED_SMP_WORKLOAD
+	help
+	  Run bounded ISR execution, scheduled AP thread, TLS isolation,
+	  block/idle/remote-wake/resume, and AP-to-BSP completion proofs.

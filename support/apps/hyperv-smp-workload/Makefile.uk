@@ -1,0 +1,3 @@
+$(eval $(call addlib,apphypervsmpworkload))
+
+APPHYPERVSMPWORKLOAD_SRCS-y += $(APPHYPERVSMPWORKLOAD_BASE)/main.c

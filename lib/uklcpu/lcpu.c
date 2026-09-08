@@ -580,4 +580,35 @@ lcpu_wakeup_err:
 	*num = i;
 	return rc;
 }
+
+__isr int uk_lcpu_wakeup_one(unsigned int idx)
+{
+	struct uk_lcpu *lcpu;
+
+	if (idx >= CONFIG_UKPLAT_CPU_MAXCOUNT)
+		return -ERANGE;
+	if (idx == uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx))
+		return 0;
+
+	lcpu = &uk_pcpuvar_lval(idx, uk_lcpus);
+	if (!uk_lcpu_state_is_online(uk_load_n(&lcpu->state)))
+		return -EHOSTDOWN;
+
+	return uk_pal_except_send_ipi(
+		uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id),
+		*uk_lcpu_wakeup_irqv);
+}
+
+void uk_lcpu_startup_idle(void)
+{
+	struct uk_lcpu *lcpu = uk_lcpu_get_current();
+
+	UK_ASSERT(lcpu->state == UK_LCPU_STATE_BUSY0);
+	uk_dec(&lcpu->state);
+}
+
+void __noreturn uk_lcpu_halt_error(int error)
+{
+	lcpu_halt(uk_lcpu_get_current(), error);
+}
 #endif /* CONFIG_HAVE_SMP */

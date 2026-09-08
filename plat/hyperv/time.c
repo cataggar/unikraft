@@ -19,6 +19,9 @@
 #include <uk/plat/time.h>
 #include <uk/plat/common/sections.h>
 #include <uk/print.h>
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+#include <uk/boot/smp.h>
+#endif
 
 #define HYPERV_EVENT_WORDS_PER_SINT	32U
 #define HYPERV_DISPATCH_LIMIT		64U
@@ -644,6 +647,9 @@ hyperv_ap_start_rollback(const __u64 indices[], unsigned int count,
 	rc = hyperv_ap_start_error;
 	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
 
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	uk_boot_fixed_smp_rollback(indices, hyperv_ap_requested, clean);
+#endif
 	uk_pr_warn("Hyper-V: AP startup failed after %u/%u start(s), "
 		   "%u initially settled, %u late; rollback %s (%d)\n",
 		   count, hyperv_ap_requested, hyperv_ap_waited, late,
@@ -669,6 +675,9 @@ int ukplat_lcpu_startup_hook(void)
 #if CONFIG_HAVE_SMP
 	__u64 indices[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
 	__uptr stacks[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	__uptr entries[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
+#endif
 	unsigned int count = uk_acpi_cpu_count();
 	unsigned int requested;
 	unsigned int started;
@@ -684,6 +693,9 @@ int ukplat_lcpu_startup_hook(void)
 	for (i = 1; i < count; i++) {
 		indices[i - 1] = i;
 		stacks[i - 1] = (__uptr)&hyperv_ap_stacks[i - 1][__STACK_SIZE];
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+		entries[i - 1] = (__uptr)uk_boot_fixed_smp_lcpu_entry;
+#endif
 	}
 	requested = count - 1;
 	rc = hyperv_ap_start_begin(indices, requested, &generation);
@@ -691,7 +703,13 @@ int ukplat_lcpu_startup_hook(void)
 		return rc > 0 ? 0 : rc;
 
 	started = requested;
-	rc = uk_lcpu_start(indices, &started, stacks, NULL, 0);
+	rc = uk_lcpu_start(indices, &started, stacks,
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+			    entries,
+#else
+			    NULL,
+#endif
+			    0);
 	if (started > requested) {
 		started = requested;
 		rc = -EIO;
@@ -711,6 +729,12 @@ int ukplat_lcpu_startup_hook(void)
 	if (rc || waited != started)
 		return hyperv_ap_start_rollback(indices, started, generation,
 						rc ? rc : -ETIMEDOUT);
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	rc = uk_boot_fixed_smp_wait_online(indices, started);
+	if (rc)
+		return hyperv_ap_start_rollback(indices, started, generation,
+						rc);
+#endif
 	rc = hyperv_ap_start_complete(indices, started, generation);
 	if (rc)
 		return hyperv_ap_start_rollback(indices, started, generation,
@@ -719,6 +743,13 @@ int ukplat_lcpu_startup_hook(void)
 #endif
 	return 0;
 }
+
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+unsigned int ukplat_lcpu_count(void)
+{
+	return uk_acpi_cpu_count();
+}
+#endif
 
 void ukplat_lcpu_fini_hook(void)
 {
