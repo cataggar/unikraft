@@ -16,6 +16,7 @@
 #define STORVSC_REPORT_LUNS_DATA_SIZE	\
 	(STORVSC_REPORT_LUNS_HEADER_SIZE + \
 	 STORVSC_REPORT_LUNS_MAX * STORVSC_REPORT_LUN_ENTRY_SIZE)
+#define STORVSC_VPD_ID_MAX		64U
 
 #define STORVSC_DIRECTION_WRITE		0U
 #define STORVSC_DIRECTION_READ		1U
@@ -98,6 +99,21 @@ struct storvsc_mode {
 	uint8_t reserved[3];
 };
 
+struct storvsc_media {
+	uint64_t sectors;
+	uint32_t sector_size;
+	uint8_t read_only;
+	uint8_t reserved[3];
+};
+
+struct storvsc_vpd_id {
+	uint8_t length;
+	uint8_t code_set;
+	uint8_t designator_type;
+	uint8_t association;
+	uint8_t bytes[STORVSC_VPD_ID_MAX];
+};
+
 int storvsc_core_initialize(void *storage, uint32_t epoch,
 			    uint16_t queue_depth);
 int storvsc_core_start(void *storage, uint64_t now, uint64_t timeout_ns,
@@ -121,6 +137,14 @@ int storvsc_core_prepare_block_at(void *storage,
 				  uint64_t buffer_address, uint64_t now,
 				  uint64_t timeout_ns,
 				  struct storvsc_tx *tx);
+int storvsc_core_prepare_block_media(void *storage,
+				     const struct storvsc_address *address,
+				     const struct storvsc_media *media,
+				     int operation, uint64_t start_sector,
+				     uint64_t sector_count,
+				     uint64_t buffer_address, uint64_t now,
+				     uint64_t timeout_ns,
+				     struct storvsc_tx *tx);
 int storvsc_core_begin_reset(void *storage, uint64_t now,
 			     uint64_t timeout_ns,
 			     struct storvsc_event *event);
@@ -148,6 +172,8 @@ int storvsc_parse_report_luns(const uint8_t *data, size_t data_len,
 			      struct storvsc_address *addresses,
 			      size_t address_capacity,
 			      size_t *address_count);
+int storvsc_parse_vpd83(const uint8_t *data, size_t data_len,
+			struct storvsc_vpd_id *identity);
 int storvsc_parse_inquiry(const uint8_t *data, size_t data_len,
 			  struct storvsc_inquiry *inquiry);
 int storvsc_parse_capacity10(const uint8_t *data, size_t data_len,
@@ -185,5 +211,13 @@ _Static_assert(STORVSC_REPORT_LUNS_DATA_SIZE == 520,
 	       "StorVSC REPORT LUNS layout changed");
 _Static_assert(sizeof(struct storvsc_capacity) == 16,
 	       "StorVSC capacity ABI changed");
+_Static_assert(sizeof(struct storvsc_media) == 16,
+	       "StorVSC media ABI changed");
+_Static_assert(offsetof(struct storvsc_media, read_only) == 12,
+	       "StorVSC media mode offset changed");
+_Static_assert(sizeof(struct storvsc_vpd_id) == 68,
+	       "StorVSC VPD identity ABI changed");
+_Static_assert(offsetof(struct storvsc_vpd_id, bytes) == 4,
+	       "StorVSC VPD identity offset changed");
 
 #endif /* __STORVSC_CORE_H__ */

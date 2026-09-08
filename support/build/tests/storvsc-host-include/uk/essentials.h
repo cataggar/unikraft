@@ -6,4 +6,9 @@
 	((type *)((char *)(ptr) - offsetof(type, member)))
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
+#ifdef __cplusplus
+#define UK_CTASSERT(x) static_assert((x), #x)
+#else
+#define UK_CTASSERT(x) _Static_assert((x), #x)
+#endif
 #endif

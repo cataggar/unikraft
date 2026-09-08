@@ -143,6 +143,11 @@ subset, including teardown quarantine, callback lifetime, resource pressure,
 and repeated reconnect/rescind cases. Hosted lifecycle coverage is not a
 scheduled SMP workload or real-host reconnect result.
 
+`zig build test-storvsc-regression -j2` runs the StorVSC core, C/C++ public
+mapping ABI, native export metadata, and production topology/lifetime fixtures
+on either host architecture. It includes mixed polling/interrupt LUNs and
+retained-client interrupt restoration after same-controller rebind.
+
 `state.json` retains `local_platform_boot_modes` for the raw and fixed-VHD
 x2APIC/legacy-APIC boots, while `image_sha256` remains the deployment identity.
 A later trusted `workflow_dispatch` stage should consume this prepared VHD and
@@ -154,6 +159,34 @@ The `zig-hyperv-local-evidence` CI artifact retains selected local serial and
 packaging logs, the packaging report, and EFI/debug-ELF digests for seven days,
 including boot failures. It excludes raw controller state, disk images, tool
 caches, and credentials.
+
+## Opt-in storage topology
+
+The default remains one StorVSC controller and LUN 0, without REPORT LUNS or
+VPD discovery. To build a topology-aware workload, explicitly select limits
+and discovery in its configuration, then run `olddefconfig`:
+
+```text
+CONFIG_LIBSTORVSC_MAX_DEVICES=2
+CONFIG_LIBSTORVSC_LUN_DISCOVERY=y
+CONFIG_LIBSTORVSC_MAX_LUNS=4
+```
+
+Each LUN has independent capacity, access mode, queue, and completion routing.
+The limits reserve controller/LUN identities for the boot; removed identities
+are not recycled into different devices. Pool exhaustion is reported without
+discarding healthy attached LUNs.
+
+`<uk/storvsc.h>` exposes `uk_storvsc_mapping_count`, `uk_storvsc_mapping_get`,
+and `uk_storvsc_mapping_find` to C and C++ callers. Active snapshots include
+the controller instance GUID, channel, SCSI address, block-device ID, media
+properties, and any supported LU-associated VPD designator. A missing VPD
+designator is explicit, not a fabricated stable identity. Snapshots do not
+pin a disk across removal and are not authorization to write.
+
+This driver support does not extend the existing smoke controller into a
+multi-disk or write-persistence acceptance lane. Those still require a
+run-owned data-disk guard and separate real-host evidence.
 
 ## Private application-network peer
 

@@ -524,7 +524,8 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
-    test_step.dependOn(&b.addRunArtifact(storvsc_core_tests).step);
+    const run_storvsc_core_tests = b.addRunArtifact(storvsc_core_tests);
+    test_step.dependOn(&run_storvsc_core_tests.step);
     const netvsc_protocol_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(
@@ -711,6 +712,39 @@ pub fn build(b: *std.Build) void {
     });
     verify_storvsc_core.addFileArg(storvsc_core_linked);
     verify_storvsc_core.addArgs(&.{ "--nm", "llvm-nm" });
+    for ([_]bool{ false, true }) |cxx| {
+        const mapping_abi = b.addObject(.{
+            .name = if (cxx) "storvsc-mapping-cxx-abi" else "storvsc-mapping-c-abi",
+            .root_module = b.createModule(.{
+                .target = hyperv_target,
+                .optimize = .ReleaseFast,
+                .link_libc = false,
+                .stack_protector = false,
+                .stack_check = false,
+                .red_zone = false,
+                .pic = true,
+            }),
+        });
+        mapping_abi.root_module.addIncludePath(
+            b.path("support/build/tests/storvsc-host-include"),
+        );
+        mapping_abi.root_module.addIncludePath(
+            b.path("drivers/hyperv/storvsc/include"),
+        );
+        mapping_abi.root_module.addCSourceFile(.{
+            .file = b.path(if (cxx)
+                "support/build/tests/storvsc-mapping-abi-test.cpp"
+            else
+                "support/build/tests/storvsc-mapping-abi-test.c"),
+            .flags = &.{
+                if (cxx) "-std=c++11" else "-std=c11", "-Wall",
+                "-Wextra",                             "-Werror",
+                "-pedantic-errors",
+            },
+        });
+        verify_storvsc_core.addArg("--mapping-api-object");
+        verify_storvsc_core.addFileArg(mapping_abi.getEmittedBin());
+    }
     verify_storvsc_core.setCwd(.{ .cwd_relative = root });
     verify_storvsc_core.setEnvironmentVariable(
         "PYTHONDONTWRITEBYTECODE",
@@ -984,6 +1018,9 @@ pub fn build(b: *std.Build) void {
     storvsc_production_tests.root_module.addIncludePath(
         b.path("drivers/hyperv/storvsc"),
     );
+    storvsc_production_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/storvsc/include"),
+    );
     storvsc_production_tests.root_module.addCSourceFiles(.{
         .files = &.{
             "drivers/hyperv/storvsc/storvsc.c",
@@ -1010,7 +1047,16 @@ pub fn build(b: *std.Build) void {
     );
     storvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
     storvsc_production_tests.link_gc_sections = true;
-    test_step.dependOn(&b.addRunArtifact(storvsc_production_tests).step);
+    const run_storvsc_production_tests = b.addRunArtifact(storvsc_production_tests);
+    test_step.dependOn(&run_storvsc_production_tests.step);
+    const storvsc_regression_tests = b.step(
+        "test-storvsc-regression",
+        "Run StorVSC core, public ABI, and production topology/lifetime fixtures",
+    );
+    storvsc_regression_tests.dependOn(&run_storvsc_core_tests.step);
+    storvsc_regression_tests.dependOn(&verify_storvsc_core.step);
+    storvsc_regression_tests.dependOn(&run_storvsc_production_tests.step);
+    storvsc_regression_tests.dependOn(&run_native_image_graph_tests.step);
     const netvsc_binding_protocol = b.addObject(.{
         .name = "netvsc-protocol-host-binding",
         .root_module = b.createModule(.{
@@ -1184,11 +1230,9 @@ pub fn build(b: *std.Build) void {
         "Run focused Hyper-V protocol, driver, controller, and IRQ regressions",
     );
     hyperv_regression_tests.dependOn(vmbus_lifecycle_tests);
+    hyperv_regression_tests.dependOn(storvsc_regression_tests);
     if (builtin.cpu.arch == .x86_64) {
         hyperv_regression_tests.dependOn(hyperv_irq_tests);
-        hyperv_regression_tests.dependOn(
-            &b.addRunArtifact(storvsc_production_tests).step,
-        );
         hyperv_regression_tests.dependOn(
             &b.addRunArtifact(netvsc_production_tests).step,
         );
@@ -1211,9 +1255,6 @@ pub fn build(b: *std.Build) void {
         &b.addRunArtifact(vmbus_channel_tests).step,
     );
     hyperv_regression_tests.dependOn(
-        &b.addRunArtifact(storvsc_core_tests).step,
-    );
-    hyperv_regression_tests.dependOn(
         &b.addRunArtifact(netvsc_protocol_tests).step,
     );
     hyperv_regression_tests.dependOn(
@@ -1229,7 +1270,6 @@ pub fn build(b: *std.Build) void {
         &b.addRunArtifact(platform_correctness_tests).step,
     );
     hyperv_regression_tests.dependOn(&verify_vmbus_channel.step);
-    hyperv_regression_tests.dependOn(&verify_storvsc_core.step);
     hyperv_regression_tests.dependOn(&verify_netvsc_protocol.step);
     hyperv_regression_tests.dependOn(&hyperv_controller_fixtures.step);
     const lto_policy_tests = b.addSystemCommand(&.{
