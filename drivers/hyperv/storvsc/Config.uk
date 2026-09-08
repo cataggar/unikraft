@@ -5,25 +5,36 @@ config LIBSTORVSC
 	select LIBUKSCHED
 	default n
 	help
-		Expose one Hyper-V synthetic SCSI disk (LUN 0) through ukblkdev.
-		The driver intentionally supports one primary VMBus channel,
-		one device, and one request queue.
+		Expose Hyper-V synthetic SCSI disks through ukblkdev. Defaults
+		preserve one primary controller, LUN 0, and one request queue;
+		bounded controller and LUN pools can be enabled explicitly.
 
 if LIBSTORVSC
 
 config LIBSTORVSC_MAX_DEVICES
-	int "Maximum StorVSC devices"
-	range 1 1
+	int "Maximum StorVSC controllers"
+	range 1 8
 	default 1
 	help
-		StorVSC currently supports exactly one synthetic storage device.
+		Maximum simultaneously retained synthetic storage-controller
+		identities. Raising this intentionally enables multi-controller
+		binding.
 
 config LIBSTORVSC_LUN_DISCOVERY
 	bool "Enable REPORT LUNS discovery"
 	default n
 	help
-		Issue a bounded SCSI REPORT LUNS command before attaching LUN 0.
-		This is an opt-in foundation for multi-LUN topology support.
+		Issue bounded SCSI REPORT LUNS and VPD page 0x83 commands, then
+		attach supported reported LUNs independently. Disabled preserves
+		the legacy LUN 0 path without issuing discovery commands.
+
+config LIBSTORVSC_MAX_LUNS
+	int "Maximum LUNs per StorVSC controller"
+	range 1 64
+	default 1
+	help
+		Maximum independently registered block devices per controller.
+		Values above one require LIBSTORVSC_LUN_DISCOVERY.
 
 config LIBSTORVSC_MAX_QUEUES
 	int "Maximum queues per StorVSC device"
