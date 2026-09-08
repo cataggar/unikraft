@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <uk/arch/types.h>
+#include <uk/bits/config.h>
 #include <uk/vmbus.h>
 #include "vmbus_channel_core.h"
 #include "vmbus_internal.h"
@@ -616,46 +617,95 @@ static void *event_thread(void *arg __attribute__((unused)))
 
 static int test_callback_lifetime(void)
 {
+	unsigned int iteration;
+
+	for (iteration = 0; iteration < 32; iteration++) {
+		struct vmbus_device device = {
+			.channel_id = 20,
+			.connection_id = 120,
+			.present = 1,
+		};
+		struct channel_thread control = { 0 };
+		pthread_t callback_thread;
+		pthread_t control_thread;
+
+		control.channel = vmbus_channel_host_prepare_open(&device);
+		control.channel_id = 20;
+		if (!control.channel)
+			return 211;
+		vmbus_channel_set_callback(control.channel, blocking_callback,
+					   NULL);
+		callback_entered = 0;
+		callback_blocked = 1;
+		callback_count = 0;
+		if (pthread_create(&callback_thread, NULL, event_thread, NULL))
+			return 212;
+		pthread_mutex_lock(&callback_gate);
+		while (!callback_entered)
+			pthread_cond_wait(&callback_condition, &callback_gate);
+		pthread_mutex_unlock(&callback_gate);
+		if (pthread_create(&control_thread, NULL, rescind_thread,
+				   &control))
+			return 213;
+		pthread_join(control_thread, NULL);
+		if (vmbus_channel_host_pages_used() != 4 ||
+		    vmbus_channel_host_is_free(control.channel))
+			return 214;
+		pthread_mutex_lock(&callback_gate);
+		callback_blocked = 0;
+		pthread_cond_broadcast(&callback_condition);
+		pthread_mutex_unlock(&callback_gate);
+		pthread_join(callback_thread, NULL);
+		if (!vmbus_channel_host_is_free(control.channel) ||
+		    vmbus_channel_host_pages_used())
+			return 215;
+		vmbus_channel_event(20);
+		if (callback_count != 1)
+			return 216;
+	}
+	return 0;
+}
+
+static int test_reset_waits_for_callback(void)
+{
 	struct vmbus_device device = {
 		.channel_id = 20,
 		.connection_id = 120,
 		.present = 1,
 	};
-	struct channel_thread control = { 0 };
+	struct vmbus_channel *channel;
 	pthread_t callback_thread;
-	pthread_t control_thread;
 
-	control.channel = vmbus_channel_host_prepare_open(&device);
-	control.channel_id = 20;
-	if (!control.channel)
-		return 211;
-	vmbus_channel_set_callback(control.channel, blocking_callback, NULL);
+	channel = vmbus_channel_host_prepare_open(&device);
+	if (!channel || vmbus_channel_host_attach_gpadl(channel, 0x1020))
+		return 217;
+	vmbus_channel_set_callback(channel, blocking_callback, NULL);
 	callback_entered = 0;
 	callback_blocked = 1;
 	callback_count = 0;
 	if (pthread_create(&callback_thread, NULL, event_thread, NULL))
-		return 212;
+		return 218;
 	pthread_mutex_lock(&callback_gate);
 	while (!callback_entered)
 		pthread_cond_wait(&callback_condition, &callback_gate);
 	pthread_mutex_unlock(&callback_gate);
-	if (pthread_create(&control_thread, NULL, rescind_thread, &control))
-		return 213;
-	pthread_join(control_thread, NULL);
-	if (vmbus_channel_host_pages_used() != 4 ||
-	    vmbus_channel_host_is_free(control.channel))
-		return 214;
+	vmbus_channel_reset_all();
+	if (vmbus_channel_host_is_free(channel) ||
+	    vmbus_channel_host_pages_used() != 4 ||
+	    vmbus_channel_host_record_count() != 1 ||
+	    vmbus_channel_host_live_gpadls() != 1)
+		return 219;
 	pthread_mutex_lock(&callback_gate);
 	callback_blocked = 0;
 	pthread_cond_broadcast(&callback_condition);
 	pthread_mutex_unlock(&callback_gate);
 	pthread_join(callback_thread, NULL);
-	if (!vmbus_channel_host_is_free(control.channel) ||
-	    vmbus_channel_host_pages_used())
-		return 215;
-	vmbus_channel_event(20);
-	if (callback_count != 1)
-		return 216;
+	if (!vmbus_channel_host_is_free(channel) ||
+	    vmbus_channel_host_pages_used() ||
+	    vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls() ||
+	    callback_count != 1)
+		return 220;
 	return 0;
 }
 
@@ -739,11 +789,89 @@ static int test_gpadl_quarantine(void)
 	torndown(0x2234);
 	if (vmbus_channel_host_pages_used() != 4)
 		return 232;
-	vmbus_channel_reset_all();
-	vmbus_bus_host_set_transmit_error(0);
-	vmbus_bus_host_clear_connection_failed();
-	if (vmbus_channel_host_pages_used())
+	vmbus_channel_quarantine_all();
+	vmbus_channel_quarantine_all();
+	if (vmbus_channel_host_pages_used() != 4 ||
+	    vmbus_channel_host_record_count() != 1 ||
+	    vmbus_channel_host_live_gpadls() != 1)
 		return 233;
+	second.channel = NULL;
+	second_channel = vmbus_channel_host_allocate_open(&second);
+	if (!second_channel || vmbus_channel_host_pages_used() != 8)
+		return 234;
+	vmbus_bus_host_set_transmit_error(0);
+	if (vmbus_channel_close(second_channel) ||
+	    vmbus_channel_host_pages_used() != 4)
+		return 235;
+	vmbus_channel_reset_all();
+	vmbus_bus_host_clear_connection_failed();
+	if (vmbus_channel_host_pages_used() ||
+	    vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls())
+		return 236;
+	return 0;
+}
+
+static int test_gpadl_pool_pressure(void)
+{
+	static __u8 pages[CONFIG_LIBVMBUS_MAX_GPADLS + 1][4096]
+		__attribute__((aligned(4096)));
+	struct vmbus_device device = {
+		.channel_id = 36,
+		.connection_id = 136,
+		.present = 1,
+	};
+	struct vmbus_gpadl mappings[CONFIG_LIBVMBUS_MAX_GPADLS + 1] = { 0 };
+	struct vmbus_channel *channel;
+	unsigned int i;
+
+	channel = vmbus_channel_host_prepare_open(&device);
+	if (!channel)
+		return 295;
+	vmbus_bus_host_auto_pump(1);
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++)
+		if (vmbus_channel_gpadl_map(channel, pages[i],
+					    sizeof(pages[i]), &mappings[i]))
+			return 296;
+	if (vmbus_channel_host_record_count() !=
+		    CONFIG_LIBVMBUS_MAX_GPADLS ||
+	    vmbus_channel_host_live_gpadls() !=
+		    CONFIG_LIBVMBUS_MAX_GPADLS ||
+	    vmbus_channel_gpadl_map(channel,
+				    pages[CONFIG_LIBVMBUS_MAX_GPADLS],
+				    sizeof(pages[0]),
+				    &mappings[CONFIG_LIBVMBUS_MAX_GPADLS]) !=
+		    -ENOSPC)
+		return 297;
+	if (mappings[CONFIG_LIBVMBUS_MAX_GPADLS].id ||
+	    mappings[CONFIG_LIBVMBUS_MAX_GPADLS].page_count ||
+	    mappings[CONFIG_LIBVMBUS_MAX_GPADLS].generation)
+		return 298;
+	if (vmbus_channel_gpadl_unmap(channel, &mappings[1]) ||
+	    vmbus_channel_host_record_count() !=
+		    CONFIG_LIBVMBUS_MAX_GPADLS - 1)
+		return 299;
+	if (vmbus_channel_gpadl_map(
+		    channel, pages[CONFIG_LIBVMBUS_MAX_GPADLS],
+		    sizeof(pages[0]),
+		    &mappings[CONFIG_LIBVMBUS_MAX_GPADLS]) ||
+	    vmbus_channel_host_record_count() !=
+		    CONFIG_LIBVMBUS_MAX_GPADLS)
+		return 300;
+	gpadl_created(device.channel_id, mappings[0].id, 0);
+	if (vmbus_channel_take_ignored_responses() != 1 ||
+	    vmbus_channel_take_ignored_responses())
+		return 301;
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS + 1; i++)
+		if (mappings[i].id &&
+		    vmbus_channel_gpadl_unmap(channel, &mappings[i]))
+			return 302;
+	vmbus_bus_host_auto_pump(0);
+	if (vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls() ||
+	    vmbus_channel_close(channel) ||
+	    vmbus_channel_host_pages_used())
+		return 303;
 	return 0;
 }
 
@@ -1002,6 +1130,9 @@ int main(void)
 	rc = test_callback_lifetime();
 	if (rc)
 		return rc;
+	rc = test_reset_waits_for_callback();
+	if (rc)
+		return rc;
 	rc = test_gpadl_quarantine();
 	if (rc)
 		return rc;
@@ -1015,6 +1146,9 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = test_receive_signal_failure_preserves_packet();
+	if (rc)
+		return rc;
+	rc = test_gpadl_pool_pressure();
 	if (rc)
 		return rc;
 	return 0;

@@ -206,6 +206,15 @@ static int guid_equal(const struct vmbus_guid *a,
 	return 1;
 }
 
+static inline void vmbus_cpu_relax(void)
+{
+#ifdef VMBUS_BUS_HOST_TEST
+	__atomic_signal_fence(__ATOMIC_ACQ_REL);
+#else
+	__asm__ __volatile__("pause");
+#endif
+}
+
 static int guid_equal_bytes(const struct vmbus_guid *a, const __u8 *b)
 {
 	unsigned int i;
@@ -1261,7 +1270,7 @@ static void wait_once(void)
 	if (uk_sched_current())
 		uk_sched_thread_sleep(VMBUS_WORKER_SLEEP_NS);
 	else
-		__asm__ __volatile__("pause");
+		vmbus_cpu_relax();
 }
 
 static int drive_until(int terminal_a, int terminal_b)
@@ -1474,7 +1483,10 @@ out_reset:
 	reset_release_records();
 	drain_queues();
 	vmbus_protocol_reset();
-	vmbus_channel_reset_all();
+	if (live_connection_generation)
+		vmbus_channel_quarantine_all();
+	else
+		vmbus_channel_reset_all();
 	if (!rc && connection_target_held) {
 		hyperv_vmbus_target_release(connection_target_vp,
 					   connection_target_generation);
@@ -1547,7 +1559,10 @@ static void unwind_reset(void *arg __unused)
 		ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
 	}
 	vmbus_protocol_reset();
-	vmbus_channel_reset_all();
+	if (live_connection_generation)
+		vmbus_channel_quarantine_all();
+	else
+		vmbus_channel_reset_all();
 }
 
 static int probe_unwind_locked(int primary_error)
@@ -2186,6 +2201,8 @@ int vmbus_channel_host_is_free(struct vmbus_channel *channel);
 int vmbus_channel_host_pages_used(void);
 int vmbus_channel_host_record_count(void);
 int vmbus_channel_host_live_gpadls(void);
+int vmbus_channel_host_attach_gpadl(struct vmbus_channel *channel,
+				    __u32 gpadl_id);
 
 static void host_zero(void *pointer, size_t size)
 {
@@ -2617,6 +2634,34 @@ static int host_test_concurrent_irqs(void)
 		seen |= 1U << entry.data[0];
 	if (seen != 0x1feU || rx_state.lost)
 		return 91;
+	{
+		struct hyperv_message message = {
+			.message_type = VMBUS_HV_MESSAGE_TYPE,
+			.payload_size = 8,
+		};
+		unsigned long flags;
+
+		rx_dropped = 0;
+		for (i = 0; i <= CONFIG_LIBVMBUS_RX_QUEUE; i++) {
+			message.payload[0] = (__u8)(i + 1);
+			hyperv_vmbus_message(&message);
+		}
+		if (!rx_state.lost || rx_dropped != 1 ||
+		    process_messages() != -EOVERFLOW)
+			return 97;
+		hyperv_vmbus_message(&message);
+		if (rx_dropped != 1)
+			return 98;
+		drain_queues();
+		ukplat_spin_lock_irqsave(&rx_queue_lock, flags);
+		vmbus_queue_recover(&rx_state);
+		ukplat_spin_unlock_irqrestore(&rx_queue_lock, flags);
+		message.payload[0] = 42;
+		hyperv_vmbus_message(&message);
+		if (rx_state.lost || !dequeue_message(&entry) ||
+		    entry.data[0] != 42 || dequeue_message(&entry))
+			return 99;
+	}
 
 	producers[0].events = 1;
 	producers[1].events = 1;
@@ -3199,15 +3244,80 @@ int vmbus_bus_host_quiesce_epoch_test(void)
 	if (connection_generation_quiesce())
 		return 318;
 
-	for (unsigned int generation = 0; generation < 3; generation++) {
+	{
+		struct vmbus_device device = {
+			.channel_id = 90,
+			.connection_id = 190,
+			.present = 1,
+		};
+		struct vmbus_channel *channel;
+		int teardown_error;
+
 		epoch = vmbus_connection_quiesce_epoch();
 		if (host_test_connection_start())
-			return 319 + (int)generation * 2;
+			return 327;
+		channel = vmbus_channel_host_allocate_open(&device);
+		if (!channel ||
+		    vmbus_channel_host_attach_gpadl(channel, 0x3090))
+			return 328;
+		host_transmit_error = -EIO;
+		__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
+		teardown_error = disconnect_locked();
+		if (!teardown_error ||
+		    vmbus_connection_quiesce_epoch() != epoch ||
+		    !live_connection_generation || !connection_teardown_failed ||
+		    vmbus_channel_host_pages_used() != 4 ||
+		    vmbus_channel_host_record_count() != 1 ||
+		    vmbus_channel_host_live_gpadls() != 1)
+			return 329;
+		posts = host_unload_posts;
+		if (disconnect_locked() != teardown_error ||
+		    host_unload_posts != posts ||
+		    vmbus_channel_host_pages_used() != 4 ||
+		    vmbus_channel_host_record_count() != 1)
+			return 330;
+		host_transmit_error = 0;
+		if (connection_generation_quiesce())
+			return 331;
+		vmbus_channel_reset_all();
+		if (vmbus_channel_host_pages_used() ||
+		    vmbus_channel_host_record_count() ||
+		    vmbus_channel_host_live_gpadls())
+			return 332;
+	}
+
+	for (unsigned int generation = 0; generation < 32; generation++) {
+		struct vmbus_device device = {
+			.channel_id = 100 + generation,
+			.connection_id = 200 + generation,
+			.present = 1,
+		};
+		struct vmbus_channel *channel;
+
+		epoch = vmbus_connection_quiesce_epoch();
+		if (host_test_connection_start())
+			return 333;
+		channel = vmbus_channel_host_allocate_open(&device);
+		if (!channel ||
+		    vmbus_channel_host_attach_gpadl(
+			    channel, 0x4000 + generation))
+			return 334;
+		if ((generation & 1U) &&
+		    (vmbus_channel_rescind(device.channel_id) != -EINPROGRESS ||
+		     vmbus_channel_host_pages_used() != 4 ||
+		     vmbus_channel_host_record_count() != 1))
+			return 335;
+		host_pump_hook = host_auto_control_pump;
 		__atomic_store_n(&rx_active, 0, __ATOMIC_RELEASE);
 		host_unload_response_mode = HOST_UNLOAD_MATCH;
-		if (disconnect_locked() ||
-		    vmbus_connection_quiesce_epoch() != epoch + 1)
-			return 320 + (int)generation * 2;
+		rc = disconnect_locked();
+		host_pump_hook = NULL;
+		if (rc || vmbus_connection_quiesce_epoch() != epoch + 1 ||
+		    live_connection_generation ||
+		    vmbus_channel_host_pages_used() ||
+		    vmbus_channel_host_record_count() ||
+		    vmbus_channel_host_live_gpadls())
+			return 336;
 	}
 
 	live_connection_generation = 0;
