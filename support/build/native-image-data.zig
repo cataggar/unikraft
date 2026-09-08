@@ -150,6 +150,10 @@ pub const x86_64_efi_ukrandom = Library{
         "libukrandom/random.o",
         "libukrandom/libinfo.libuklibid.o",
     },
+    .export_symbols = .{
+        .root = .base,
+        .relative = "lib/ukrandom/exportsyms.uk",
+    },
 };
 
 pub const x86_64_efi_ukrandom_lcpu = Library{

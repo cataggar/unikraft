@@ -535,7 +535,8 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
-    test_step.dependOn(&b.addRunArtifact(netvsc_protocol_tests).step);
+    const run_netvsc_protocol_tests = b.addRunArtifact(netvsc_protocol_tests);
+    test_step.dependOn(&run_netvsc_protocol_tests.step);
     const hyperv_target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,
@@ -1097,7 +1098,8 @@ pub fn build(b: *std.Build) void {
     });
     netvsc_production_tests.root_module.addObject(netvsc_binding_protocol);
     netvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
-    test_step.dependOn(&b.addRunArtifact(netvsc_production_tests).step);
+    const run_netvsc_production_tests = b.addRunArtifact(netvsc_production_tests);
+    test_step.dependOn(&run_netvsc_production_tests.step);
     const hyperv_acceptance_protocol_tests = b.addExecutable(.{
         .name = "hyperv-acceptance-protocol-test",
         .root_module = b.createModule(.{
@@ -1116,9 +1118,41 @@ pub fn build(b: *std.Build) void {
         },
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
-    test_step.dependOn(
-        &b.addRunArtifact(hyperv_acceptance_protocol_tests).step,
+    const run_hyperv_acceptance_protocol_tests =
+        b.addRunArtifact(hyperv_acceptance_protocol_tests);
+    test_step.dependOn(&run_hyperv_acceptance_protocol_tests.step);
+    const application_protocol_tests = b.addExecutable(.{
+        .name = "hyperv-application-protocol-test",
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    application_protocol_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
     );
+    application_protocol_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/application_protocol.c",
+            "support/apps/hyperv-acceptance/tests/application-protocol-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    const run_application_protocol_tests =
+        b.addRunArtifact(application_protocol_tests);
+    test_step.dependOn(&run_application_protocol_tests.step);
+    const network_regression_tests = b.step(
+        "test-network-regression",
+        "Run Hyper-V network protocols, production driver, and native profile fixtures",
+    );
+    network_regression_tests.dependOn(&run_netvsc_protocol_tests.step);
+    network_regression_tests.dependOn(&verify_netvsc_protocol.step);
+    network_regression_tests.dependOn(&run_netvsc_production_tests.step);
+    network_regression_tests.dependOn(&run_hyperv_acceptance_protocol_tests.step);
+    network_regression_tests.dependOn(&run_application_protocol_tests.step);
+    network_regression_tests.dependOn(&run_native_image_graph_tests.step);
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",
         .root_module = b.createModule(.{
@@ -1576,6 +1610,10 @@ fn registerNativeGraph(
         nativeConfigEnabled(loaded, "CONFIG_LIBLWIP")
     else
         false;
+    const enable_hyperv_acceptance = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_APPHYPERVACCEPTANCE")
+    else
+        false;
     const enable_ukrandom_lcpu = if (config) |loaded|
         nativeConfigEnabled(loaded, "CONFIG_LIBUKRANDOM_LCPU")
     else
@@ -1601,6 +1639,7 @@ fn registerNativeGraph(
         .enable_storvsc = enable_storvsc,
         .enable_uklibparam = enable_uklibparam,
         .enable_lwip = enable_lwip,
+        .enable_hyperv_acceptance = enable_hyperv_acceptance,
         .enable_ukrandom_lcpu = enable_ukrandom_lcpu,
         .lwip_root = lwip_root,
     }) catch |err| {

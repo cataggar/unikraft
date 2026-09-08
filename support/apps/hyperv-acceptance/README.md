@@ -128,7 +128,6 @@ Both integrations carry BSD-3-Clause notices in their source files.
 Materialize and verify the wrapper below the checkout:
 
 ```sh
-PATH="$PWD/.d/pixi/bin:$PATH" \
 make -C support/apps/hyperv-acceptance network-stack
 ```
 
@@ -138,11 +137,16 @@ checkout.
 
 ## Protocol fixtures
 
-Run both host-side protocol fixtures without booting a guest:
+Run the host-side protocol, production NetVSC, and native-profile fixtures
+without booting a guest on either x86-64 or AArch64:
 
 ```sh
-make -C support/apps/hyperv-acceptance \
-  HOSTCC='/home/g/.local/bin/zig cc' protocol-test
+mkdir -p .d/acceptance-tmp .d/acceptance-cache
+TMPDIR="$PWD/.d/acceptance-tmp" \
+XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
+ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
+ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
+zig build test-network-regression -j2
 ```
 
 The application fixture includes deterministic multi-pump callback-state
@@ -179,6 +183,7 @@ Then use the native command below without `-Dexternal-lib`.
 ```sh
 umask 077
 make -C support/apps/hyperv-acceptance network-stack
+mkdir -p .d/acceptance-tmp .d/acceptance-cache
 cp support/apps/hyperv-acceptance/app-network.defconfig \
   support/apps/hyperv-acceptance/.config
 

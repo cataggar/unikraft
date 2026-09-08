@@ -19,6 +19,7 @@ if APPHYPERVACCEPTANCE
 config APPHYPERVACCEPTANCE_NETWORK_APPLICATION
 	bool "Run stack-backed private-peer networking acceptance"
 	depends on LIBLWIP && LWIP_NOTHREADS && LWIP_DHCP && LWIP_TCP && LWIP_UDP
+	depends on LWIP_RELEASE212 && LWIP_UKNETDEV && !LWIP_AUTOIFACE
 	help
 	  Replace the default raw DHCP Offer smoke with bounded DHCP lease,
 	  ARP, TCP, and UDP acceptance through the official lib-lwip stack.

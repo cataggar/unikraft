@@ -29,6 +29,7 @@ pub const Options = struct {
     enable_ukblkdev: bool = false,
     enable_storvsc: bool = false,
     enable_uklibparam: bool = false,
+    enable_hyperv_acceptance: bool = false,
     enable_lwip: bool = false,
     enable_ukrandom_lcpu: bool = false,
     lwip_root: ?[]const u8 = null,
@@ -183,7 +184,7 @@ fn registerLibraries(
             );
             continue;
         }
-        if (hasNetvsc(options.profile) and
+        if (hasNetvsc(options.profile) and options.enable_hyperv_acceptance and
             std.mem.eql(u8, library.name, "apphelloworld"))
         {
             try registerLibrary(
@@ -1225,6 +1226,7 @@ test "Hyper-V NetVSC profile registers protocol and uknetdev" {
 
     var saw_uknetdev = false;
     var saw_uklibparam = false;
+    var application: ?component.Library = null;
     var netvsc_library: ?component.Library = null;
     for (registered.graph.libraries) |library| {
         saw_uknetdev = saw_uknetdev or
@@ -1233,9 +1235,17 @@ test "Hyper-V NetVSC profile registers protocol and uknetdev" {
             std.mem.eql(u8, library.name, "libuklibparam");
         if (std.mem.eql(u8, library.name, "libnetvsc"))
             netvsc_library = library;
+        if (std.mem.eql(u8, library.name, "apphelloworld"))
+            application = library;
     }
     try std.testing.expect(saw_uknetdev);
     try std.testing.expect(saw_uklibparam);
+    const app = application orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), app.raw_objects.len);
+    try std.testing.expectEqualStrings(
+        "/build/apphelloworld/main.o",
+        app.raw_objects[0].path,
+    );
     const netvsc = netvsc_library orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), netvsc.target_zig_objects.len);
     try std.testing.expectEqualStrings(
@@ -1264,6 +1274,7 @@ test "Hyper-V application networking registers pinned stack inputs" {
             .config = "/build/.config",
         },
         .profile = .@"hyperv-x86_64-efi-netvsc",
+        .enable_hyperv_acceptance = true,
         .enable_lwip = true,
         .enable_ukrandom_lcpu = true,
         .lwip_root = "/deps/lib-lwip",
@@ -1304,6 +1315,17 @@ test "Hyper-V application networking registers pinned stack inputs" {
     try std.testing.expect(saw_random);
     try std.testing.expect(saw_random_lcpu);
     for (registered.graph.libraries) |library| {
+        if (std.mem.eql(u8, library.name, "libukrandom")) {
+            try std.testing.expectEqual(@as(usize, 1), library.exports.len);
+            try std.testing.expectEqualStrings(
+                "/src/unikraft/lib/ukrandom/exportsyms.uk",
+                library.exports[0],
+            );
+            try std.testing.expect(
+                library.object_pipeline.?.transform.sequence[0].symbol_file.action ==
+                    .keep_global,
+            );
+        }
         if (!std.mem.eql(u8, library.name, "libukrandom_lcpu"))
             continue;
         try std.testing.expectEqual(
@@ -1328,6 +1350,33 @@ test "Hyper-V application networking registers pinned stack inputs" {
             .profile = .@"hyperv-x86_64-efi-netvsc",
             .enable_lwip = true,
         }),
+    );
+}
+
+test "Hyper-V raw acceptance registers its sources without the network stack" {
+    var registered = try RegisteredGraph.init(std.testing.allocator, .{
+        .roots = .{
+            .base = "/src/unikraft",
+            .app = "/src/hyperv-acceptance",
+            .output = "/build",
+            .config = "/build/.config",
+        },
+        .profile = .@"hyperv-x86_64-efi-netvsc",
+        .enable_hyperv_acceptance = true,
+    });
+    defer registered.deinit();
+
+    var application: ?component.Library = null;
+    for (registered.graph.libraries) |library| {
+        if (std.mem.eql(u8, library.name, "apphelloworld"))
+            application = library;
+        try std.testing.expect(!std.mem.eql(u8, library.name, "liblwip"));
+    }
+    const app = application orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 5), app.raw_objects.len);
+    try std.testing.expectEqualStrings(
+        "/build/apphelloworld/acceptance_protocol.o",
+        app.raw_objects[1].path,
     );
 }
 
