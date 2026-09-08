@@ -451,6 +451,12 @@ and only then strips and converts the image to PE/COFF. Configuration and
 metadata inputs for target headers are content-tracked, so changing a solved
 configuration in place invalidates the generated header.
 
+Self-relocation requires a loadable `.uk_reloc` section with space for the
+signature, static and dynamic records, and sentinel before post-processing.
+The linker keeps GOT entries in initialized data, before `.bss`, so their
+relocations are retained. On x86, the early relocator uses explicit RIP-relative
+addresses rather than consulting a GOT that has not yet been relocated.
+
 #### Experimental LTO (QEMU/x86_64 native pipeline only)
 
 The Zig 0.16 `native-images` pipeline supports a whole-program flat LTO path
