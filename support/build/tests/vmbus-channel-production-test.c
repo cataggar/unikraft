@@ -41,12 +41,21 @@ int vmbus_post_message(__u32 connection_id __attribute__((unused)),
 		       const __u8 *payload __attribute__((unused)),
 		       size_t payload_len __attribute__((unused)),
 		       __u64 input_gpa __attribute__((unused)),
+		       __u16 *status_code __attribute__((unused)),
 		       __u8 has_post_messages __attribute__((unused)),
 		       __u32 retry_limit __attribute__((unused)),
 		       vmbus_hypercall_fn hypercall __attribute__((unused)),
 		       vmbus_backoff_fn backoff __attribute__((unused)),
 		       void *arg __attribute__((unused)))
 {
+	return 0;
+}
+
+int vmbus_protocol_post_failure(__u16 status_code __attribute__((unused)),
+				__u64 now __attribute__((unused)),
+				struct vmbus_action *action)
+{
+	action->kind = VMBUS_ACTION_NONE;
 	return 0;
 }
 

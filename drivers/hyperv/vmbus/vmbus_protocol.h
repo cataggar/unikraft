@@ -31,6 +31,22 @@ enum vmbus_action_kind {
 	VMBUS_ACTION_REJECT_OFFER = 9,
 };
 
+enum vmbus_post_result {
+	VMBUS_POST_OK = 0,
+	VMBUS_POST_BAD_PAYLOAD = -1,
+	VMBUS_POST_BAD_MESSAGE_TYPE = -2,
+	VMBUS_POST_BAD_ALIGNMENT = -3,
+	VMBUS_POST_MISSING_PRIVILEGE = -4,
+	VMBUS_POST_INVALID_CONNECTION = -5,
+	VMBUS_POST_INVALID_PORT = -6,
+	VMBUS_POST_INVALID_VP = -7,
+	VMBUS_POST_INVALID_SYNIC = -8,
+	VMBUS_POST_ACCESS_DENIED = -9,
+	VMBUS_POST_INVALID_PARAMETER = -10,
+	VMBUS_POST_INSUFFICIENT_BUFFERS = -11,
+	VMBUS_POST_HYPERVISOR_ERROR = -12,
+};
+
 struct vmbus_decoded_offer {
 	__u8 class_id[16];
 	__u8 instance_id[16];
@@ -73,9 +89,12 @@ void *vmbus_post_input(void);
 int vmbus_post_message(__u32 connection_id, __u32 message_type,
 		       const __u8 *payload,
 		       size_t payload_len, __u64 input_gpa,
+		       __u16 *status_code,
 		       __u8 has_post_messages, __u32 retry_limit,
 		       vmbus_hypercall_fn hypercall,
 		       vmbus_backoff_fn backoff, void *arg);
+int vmbus_protocol_post_failure(__u16 status_code, __u64 now,
+				struct vmbus_action *action);
 void vmbus_protocol_start(__u64 now,
 			  const struct vmbus_start_config *config,
 			  struct vmbus_action *action);
