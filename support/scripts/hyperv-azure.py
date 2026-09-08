@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,18 @@ LOCAL_BOOT_MODES = (
     ("legacy-apic", True),
 )
 LEGACY_APIC_MARKER = "Using legacy xAPIC MMIO"
+STATE_SCHEMA_VERSION = 1
+PREPARED_IMAGE_SCHEMA = "unikraft.hyperv.prepared-image"
+PREPARED_IMAGE_SCHEMA_VERSION = 1
+PREPARED_IMAGE_CONTROLLER_REVISION = 1
+PREPARED_IMAGE_MANIFEST = "prepared-image-manifest.json"
+PREPARED_IMAGE_VHD = "unikraft.vhd"
+PREPARED_IMAGE_FILES = frozenset((PREPARED_IMAGE_MANIFEST, PREPARED_IMAGE_VHD))
+MIZ_REVISION = "2db68ca0c3ab12155012a823c3fb8d7aba1cb544"
+MAX_MANIFEST_SIZE = 64 * 1024
+MAX_LOCAL_LOG_SIZE = 4 * MIB
+AZURE_OWNERSHIP_FIELDS = frozenset(("subscription", "disk_id", "vm_id"))
+VM_SIZES = ("Standard_D2s_v5", "Standard_D2as_v5", "Standard_B2s")
 
 
 class AzureCliError(RuntimeError):
@@ -99,6 +112,130 @@ def image_sha256(path):
     return digest.hexdigest()
 
 
+def canonical_json(value):
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        + "\n"
+    ).encode("ascii")
+
+
+def sha256_bytes(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def read_regular_file(path, maximum, description):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{description} must be a readable non-symlink file") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > maximum:
+            raise ValueError(f"{description} has an invalid type or size")
+        chunks = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b"".join(chunks)
+        if len(value) > maximum:
+            raise ValueError(f"{description} exceeds its size limit")
+        return value
+    finally:
+        os.close(descriptor)
+
+
+def copy_regular_file(source, destination, expected_size, expected_sha256):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_descriptor = os.open(source, flags)
+    except OSError as error:
+        raise ValueError("Prepared image must be a readable non-symlink file") from error
+    destination_descriptor = None
+    complete = False
+    try:
+        metadata = os.fstat(source_descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != expected_size:
+            raise ValueError("Prepared image has an unexpected type or size")
+        destination_descriptor = os.open(
+            destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            copied += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_descriptor, view)
+                if written <= 0:
+                    raise OSError("Prepared image copy made no progress")
+                view = view[written:]
+        os.fsync(destination_descriptor)
+        if copied != expected_size or digest.hexdigest() != expected_sha256:
+            raise ValueError("Prepared image content does not match its manifest")
+        complete = True
+    finally:
+        os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        if not complete:
+            Path(destination).unlink(missing_ok=True)
+
+
+def parse_strict_json(value, description):
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError(f"{description} contains duplicate field {key!r}")
+            result[key] = item
+        return result
+
+    def reject_constant(constant):
+        raise ValueError(f"{description} contains invalid number {constant}")
+
+    try:
+        return json.loads(
+            value.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError(f"{description} is not valid UTF-8 JSON") from error
+
+
+def load_strict_json(path, maximum, description, *, canonical=False):
+    value = read_regular_file(path, maximum, description)
+    result = parse_strict_json(value, description)
+    if canonical and value != canonical_json(result):
+        raise ValueError(f"{description} is not canonical JSON")
+    return result, value
+
+
+def require_exact_fields(value, fields, description):
+    if not isinstance(value, dict) or set(value) != set(fields):
+        raise ValueError(f"{description} has unknown or missing fields")
+    return value
+
+
+def require_sha256(value, description):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError(f"{description} must be a lowercase SHA-256 digest")
+    return value
+
+
+def controller_sha256():
+    return image_sha256(Path(__file__).absolute())
+
+
 def configure_tool_directories(directory):
     tools = directory / "tools"
     tools.mkdir(mode=0o700, exist_ok=True)
@@ -121,7 +258,7 @@ def load_state(directory):
     if path.is_symlink():
         raise ValueError("State file must not be a symlink")
     state = json.loads(path.read_text())
-    if state.get("schema_version") != 1:
+    if state.get("schema_version") != STATE_SCHEMA_VERSION:
         raise ValueError("Unsupported Azure run state schema")
     configure_tool_directories(directory)
     return state, path
@@ -191,8 +328,8 @@ def upload_managed_vhd(image, endpoint, sas):
         raise RuntimeError("Managed-disk page upload did not verify the expected image")
 
 
-def check_packaging_report(report, efi_sha256, file_size):
-    expected = {
+def packaging_contract(efi_sha256, file_size):
+    return {
         "schema-version": 1,
         "contract": "miz.efi-application-image",
         "valid": True,
@@ -207,6 +344,10 @@ def check_packaging_report(report, efi_sha256, file_size):
         "esp-offset": MIB,
         "esp-length": ESP_SIZE,
     }
+
+
+def check_packaging_report(report, efi_sha256, file_size):
+    expected = packaging_contract(efi_sha256, file_size)
     if not isinstance(report, dict) or file_size != VIRTUAL_SIZE + 512:
         raise ValueError("Invalid fixed-VHD packaging report or file size")
     for key, value in expected.items():
@@ -226,6 +367,33 @@ def miz_command(miz, arguments, log_path, *, json_output=False):
     if json_output:
         return json.loads(result.stdout)
     return None
+
+
+def validate_local_boot_log(log_path, expected, disable_x2apic):
+    text = read_regular_file(
+        log_path, MAX_LOCAL_LOG_SIZE, "Local serial evidence"
+    ).decode("utf-8", errors="replace")
+    normalized = text.replace("\0", "")
+    evidence = inspect_boot_log(normalized, expected)
+    if not evidence["platform_ready"]:
+        raise RuntimeError(
+            f"Local application-ready marker is missing or guest crashed; see {log_path}"
+        )
+    if disable_x2apic and LEGACY_APIC_MARKER not in normalized:
+        raise RuntimeError(
+            f"Legacy-APIC local boot did not use the xAPIC fallback; see {log_path}"
+        )
+    if not disable_x2apic and LEGACY_APIC_MARKER in normalized:
+        raise RuntimeError(
+            f"Normal local boot unexpectedly used the xAPIC fallback; see {log_path}"
+        )
+    for marker in (
+        "Hyper-V Hv#1 hypercall page enabled",
+        "Hyper-V SynIC:", "Powered by", "Calling main(",
+    ):
+        if marker not in normalized:
+            raise RuntimeError(f"Local boot is missing {marker}; see {log_path}")
+    return evidence
 
 
 def local_disk_boot(image, image_format, directory, ovmf_code, ovmf_vars,
@@ -273,22 +441,7 @@ def local_disk_boot(image, image_format, directory, ovmf_code, ovmf_vars,
             )
         if result.returncode:
             raise RuntimeError(f"QEMU exited with {result.returncode}; see {log_path}")
-    text = log_path.read_text(errors="replace")
-    normalized = text.replace("\0", "")
-    evidence = inspect_boot_log(normalized, expected)
-    if not evidence["platform_ready"]:
-        raise RuntimeError(f"Local application-ready marker is missing or guest crashed; see {log_path}")
-    if disable_x2apic and LEGACY_APIC_MARKER not in normalized:
-        raise RuntimeError(f"Legacy-APIC local boot did not use the xAPIC fallback; see {log_path}")
-    if not disable_x2apic and LEGACY_APIC_MARKER in normalized:
-        raise RuntimeError(f"Normal local boot unexpectedly used the xAPIC fallback; see {log_path}")
-    for marker in (
-        "Hyper-V Hv#1 hypercall page enabled",
-        "Hyper-V SynIC:", "Powered by", "Calling main(",
-    ):
-        if marker not in normalized:
-            raise RuntimeError(f"Local boot is missing {marker}; see {log_path}")
-    return evidence
+    return validate_local_boot_log(log_path, expected, disable_x2apic)
 
 
 def local_disk_boot_modes(image, image_format, directory, ovmf_code, ovmf_vars,
@@ -303,13 +456,10 @@ def local_disk_boot_modes(image, image_format, directory, ovmf_code, ovmf_vars,
 
 
 def prepare_image(args):
-    if (
-        not args.expect or args.expect != args.expect.strip()
-        or any(character in args.expect for character in "\r\n\0")
-        or not 1 <= args.timeout <= 300
-        or not re.fullmatch(r"[a-z0-9]{3,30}", args.location)
-    ):
-        raise ValueError("Expected a single-line marker, valid region, and 1-300 second local timeout")
+    validate_platform_marker(args.expect)
+    validate_deployment_config(args.location, args.vm_size)
+    if not 1 <= args.timeout <= 300:
+        raise ValueError("Expected a 1-300 second local timeout")
     efi = args.efi.resolve(strict=True)
     miz = args.miz.resolve(strict=True)
     ovmf_code = args.ovmf_code.resolve(strict=True)
@@ -326,7 +476,7 @@ def prepare_image(args):
     configure_tool_directories(directory)
     state_path = directory / "state.json"
     state = {
-        "schema_version": 1, "phase": "preparing",
+        "schema_version": STATE_SCHEMA_VERSION, "phase": "preparing",
         "name_prefix": "uk-hv-" + secrets.token_hex(10),
         "location": args.location, "vm_size": args.vm_size,
         "platform_marker": args.expect,
@@ -388,6 +538,450 @@ def prepare_image(args):
     )
     save_json(state_path, state)
     return directory
+
+
+def validate_platform_marker(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(character in value for character in "\r\n\0")
+    ):
+        raise ValueError("Expected a nonempty single-line platform marker")
+    return value
+
+
+def validate_deployment_config(location, vm_size):
+    if (
+        not isinstance(location, str)
+        or not re.fullmatch(r"[a-z0-9]{3,30}", location)
+        or vm_size not in VM_SIZES
+    ):
+        raise ValueError("Expected a valid Azure region and bounded VM size")
+
+
+def prepared_image_source(repository, repository_id, workflow_ref, job,
+                          run_id, run_attempt, head_sha):
+    workflow_path = None
+    workflow_revision = None
+    if isinstance(workflow_ref, str) and "@" in workflow_ref:
+        workflow_path, workflow_revision = workflow_ref.rsplit("@", 1)
+    if (
+        not isinstance(repository, str)
+        or not re.fullmatch(
+            r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repository
+        )
+        or type(repository_id) is not int or repository_id <= 0
+        or not isinstance(workflow_ref, str)
+        or len(workflow_ref) > 500
+        or not isinstance(workflow_path, str)
+        or not re.fullmatch(
+            rf"{re.escape(repository)}/\.github/workflows/"
+            r"[A-Za-z0-9_.-]+\.(?:yml|yaml)",
+            workflow_path,
+        )
+        or not isinstance(workflow_revision, str)
+        or not re.fullmatch(r"refs/[A-Za-z0-9_./-]{1,300}", workflow_revision)
+        or ".." in workflow_revision
+        or not isinstance(job, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", job)
+        or type(run_id) is not int or run_id <= 0
+        or type(run_attempt) is not int or run_attempt <= 0
+        or not isinstance(head_sha, str)
+        or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head_sha)
+    ):
+        raise ValueError("Invalid trusted GitHub workflow provenance")
+    return {
+        "provider": "github-actions",
+        "repository": repository,
+        "repository_id": repository_id,
+        "workflow_ref": workflow_ref,
+        "job": job,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "head_sha": head_sha,
+    }
+
+
+def validate_prepared_image_source(value):
+    value = require_exact_fields(value, (
+        "provider", "repository", "repository_id", "workflow_ref", "job",
+        "run_id", "run_attempt", "head_sha",
+    ), "Prepared-image source")
+    if value["provider"] != "github-actions":
+        raise ValueError("Prepared-image source provider is unsupported")
+    return prepared_image_source(
+        value["repository"], value["repository_id"], value["workflow_ref"],
+        value["job"], value["run_id"], value["run_attempt"],
+        value["head_sha"],
+    )
+
+
+def prepared_boot_outcomes():
+    return {
+        "raw": {
+            "x2apic": {
+                "platform_ready": True,
+                "io_ready": False,
+                "apic_path": "x2apic",
+            },
+            "legacy-apic": {
+                "platform_ready": True,
+                "io_ready": False,
+                "apic_path": "legacy-xapic",
+            },
+        },
+        "vhd": {
+            "x2apic": {
+                "platform_ready": True,
+                "io_ready": False,
+                "apic_path": "x2apic",
+            },
+            "legacy-apic": {
+                "platform_ready": True,
+                "io_ready": False,
+                "apic_path": "legacy-xapic",
+            },
+        },
+    }
+
+
+def validate_prepared_image_manifest(manifest, expected_source=None):
+    manifest = require_exact_fields(manifest, (
+        "schema", "schema_version", "controller_revision",
+        "controller_sha256", "source", "artifacts", "packaging",
+        "preflight",
+    ), "Prepared-image manifest")
+    if (
+        manifest["schema"] != PREPARED_IMAGE_SCHEMA
+        or type(manifest["schema_version"]) is not int
+        or manifest["schema_version"] != PREPARED_IMAGE_SCHEMA_VERSION
+        or type(manifest["controller_revision"]) is not int
+        or manifest["controller_revision"] != PREPARED_IMAGE_CONTROLLER_REVISION
+        or require_sha256(
+            manifest["controller_sha256"], "Controller fingerprint"
+        ) != controller_sha256()
+    ):
+        raise ValueError("Prepared-image schema or controller revision is incompatible")
+
+    source = validate_prepared_image_source(manifest["source"])
+    if expected_source is not None and source != expected_source:
+        raise ValueError("Prepared-image GitHub provenance does not match expectations")
+
+    artifacts = require_exact_fields(
+        manifest["artifacts"], ("efi", "raw", "vhd", "miz"),
+        "Prepared-image fingerprints",
+    )
+    efi = require_exact_fields(
+        artifacts["efi"], ("sha256",), "EFI fingerprint"
+    )
+    raw = require_exact_fields(
+        artifacts["raw"], ("sha256", "size"), "Raw-image fingerprint"
+    )
+    vhd = require_exact_fields(
+        artifacts["vhd"], ("sha256", "size"), "VHD fingerprint"
+    )
+    miz = require_exact_fields(
+        artifacts["miz"], ("sha256", "revision"), "miz fingerprint"
+    )
+    efi_sha256 = require_sha256(efi["sha256"], "EFI fingerprint")
+    require_sha256(raw["sha256"], "Raw-image fingerprint")
+    vhd_sha256 = require_sha256(vhd["sha256"], "VHD fingerprint")
+    require_sha256(miz["sha256"], "miz fingerprint")
+    if (
+        type(raw["size"]) is not int or raw["size"] != VIRTUAL_SIZE
+        or type(vhd["size"]) is not int or vhd["size"] != VIRTUAL_SIZE + 512
+        or miz["revision"] != MIZ_REVISION
+    ):
+        raise ValueError("Prepared-image size or miz revision is incompatible")
+
+    packaging = require_exact_fields(
+        manifest["packaging"],
+        packaging_contract(efi_sha256, vhd["size"]).keys(),
+        "Prepared-image packaging contract",
+    )
+    check_packaging_report(packaging, efi_sha256, vhd["size"])
+
+    preflight = require_exact_fields(
+        manifest["preflight"], ("scope", "platform_marker", "boots"),
+        "Prepared-image preflight",
+    )
+    platform_marker = validate_platform_marker(preflight["platform_marker"])
+    if (
+        preflight["scope"] != "platform-only"
+        or canonical_json(preflight["boots"])
+        != canonical_json(prepared_boot_outcomes())
+    ):
+        raise ValueError("Prepared-image preflight does not contain all four exact boots")
+    return {
+        "source": source,
+        "efi_sha256": efi_sha256,
+        "raw_sha256": raw["sha256"],
+        "vhd_sha256": vhd_sha256,
+        "vhd_size": vhd["size"],
+        "miz_sha256": miz["sha256"],
+        "platform_marker": platform_marker,
+        "boots": preflight["boots"],
+    }
+
+
+def export_prepared_image(directory, artifact_directory, source):
+    state, state_path = load_state(directory)
+    expected_modes = {
+        "raw": {"x2apic": True, "legacy-apic": True},
+        "vhd": {"x2apic": True, "legacy-apic": True},
+    }
+    if (
+        state.get("phase") != "prepared"
+        or state.get("local_platform_boot") is not True
+        or state.get("local_platform_boot_modes") != expected_modes
+    ):
+        raise ValueError("Export requires a freshly prepared four-boot local image")
+    if AZURE_OWNERSHIP_FIELDS.intersection(state):
+        raise ValueError("Cloud-owned state cannot be exported")
+
+    platform_marker = validate_platform_marker(state.get("platform_marker"))
+    image = state_path.parent / PREPARED_IMAGE_VHD
+    raw = state_path.parent / "unikraft.raw"
+    efi = state_path.parent / "BOOTX64.EFI"
+    miz_value = state.get("miz_executable")
+    if not isinstance(miz_value, str):
+        raise ValueError("Prepared state has no miz executable")
+    miz = Path(miz_value).resolve(strict=True)
+    if not os.access(miz, os.X_OK):
+        raise ValueError("Prepared miz executable is not executable")
+
+    fingerprints = {
+        "efi": image_sha256(efi),
+        "raw": image_sha256(raw),
+        "vhd": image_sha256(image),
+        "miz": image_sha256(miz),
+    }
+    for state_field, fingerprint in (
+        ("efi_sha256", fingerprints["efi"]),
+        ("raw_sha256", fingerprints["raw"]),
+        ("image_sha256", fingerprints["vhd"]),
+        ("miz_executable_sha256", fingerprints["miz"]),
+    ):
+        if state.get(state_field) != fingerprint:
+            raise ValueError(f"Prepared {state_field} no longer matches its local gate")
+    if raw.stat().st_size != VIRTUAL_SIZE or image.stat().st_size != VIRTUAL_SIZE + 512:
+        raise ValueError("Prepared raw or fixed-VHD image has an unexpected size")
+
+    packaging, _ = load_strict_json(
+        state_path.parent / "packaging.json",
+        MAX_MANIFEST_SIZE,
+        "miz packaging report",
+    )
+    check_packaging_report(packaging, fingerprints["efi"], image.stat().st_size)
+    check_log = (
+        state_path.parent / "tools" / "tmp"
+        / f"miz-export-{secrets.token_hex(8)}.log"
+    )
+    checked = miz_command(miz, [
+        "check-efi-application", "--output=json", "--architecture", "x86_64",
+        "--expected-efi-sha256", fingerprints["efi"],
+        "--expected-virtual-size", "66M", str(image),
+    ], check_log, json_output=True)
+    check_packaging_report(checked, fingerprints["efi"], image.stat().st_size)
+    check_log.unlink(missing_ok=True)
+
+    boot_outcomes = {"raw": {}, "vhd": {}}
+    for image_name, log_name in (("raw", "raw"), ("vhd", "vpc")):
+        for mode, disable_x2apic in LOCAL_BOOT_MODES:
+            evidence = validate_local_boot_log(
+                state_path.parent / f"local-{log_name}-{mode}-serial.log",
+                platform_marker,
+                disable_x2apic,
+            )
+            if evidence["io_ready"]:
+                raise ValueError(
+                    f"Local {image_name}/{mode} evidence exceeded platform-only scope"
+                )
+            boot_outcomes[image_name][mode] = {
+                "platform_ready": evidence["platform_ready"],
+                "io_ready": evidence["io_ready"],
+                "apic_path": "legacy-xapic" if disable_x2apic else "x2apic",
+            }
+    if canonical_json(boot_outcomes) != canonical_json(prepared_boot_outcomes()):
+        raise ValueError("Prepared local evidence does not contain all four exact boots")
+
+    manifest = {
+        "schema": PREPARED_IMAGE_SCHEMA,
+        "schema_version": PREPARED_IMAGE_SCHEMA_VERSION,
+        "controller_revision": PREPARED_IMAGE_CONTROLLER_REVISION,
+        "controller_sha256": controller_sha256(),
+        "source": validate_prepared_image_source(source),
+        "artifacts": {
+            "efi": {"sha256": fingerprints["efi"]},
+            "raw": {"sha256": fingerprints["raw"], "size": VIRTUAL_SIZE},
+            "vhd": {
+                "sha256": fingerprints["vhd"],
+                "size": VIRTUAL_SIZE + 512,
+            },
+            "miz": {
+                "sha256": fingerprints["miz"],
+                "revision": MIZ_REVISION,
+            },
+        },
+        "packaging": packaging_contract(
+            fingerprints["efi"], VIRTUAL_SIZE + 512
+        ),
+        "preflight": {
+            "scope": "platform-only",
+            "platform_marker": platform_marker,
+            "boots": boot_outcomes,
+        },
+    }
+    validate_prepared_image_manifest(manifest, source)
+    manifest_bytes = canonical_json(manifest)
+    manifest_sha256 = sha256_bytes(manifest_bytes)
+
+    artifact_directory = artifact_directory.absolute()
+    artifact_directory.mkdir(mode=0o755, parents=True, exist_ok=False)
+    artifact_directory = artifact_directory.resolve(strict=True)
+    copy_regular_file(
+        image,
+        artifact_directory / PREPARED_IMAGE_VHD,
+        VIRTUAL_SIZE + 512,
+        fingerprints["vhd"],
+    )
+    manifest_path = artifact_directory / PREPARED_IMAGE_MANIFEST
+    with manifest_path.open("xb") as output:
+        output.write(manifest_bytes)
+        output.flush()
+        os.fsync(output.fileno())
+    if {path.name for path in artifact_directory.iterdir()} != PREPARED_IMAGE_FILES:
+        raise ValueError("Prepared-image export contains unexpected files")
+    return manifest_sha256
+
+
+def load_prepared_image_artifact(artifact_directory, expected_manifest_sha256,
+                                 expected_source):
+    require_sha256(expected_manifest_sha256, "Expected manifest fingerprint")
+    artifact_argument = artifact_directory.absolute()
+    if artifact_argument.is_symlink():
+        raise ValueError("Prepared-image artifact directory must not be a symlink")
+    artifact_directory = artifact_argument.resolve(strict=True)
+    if not artifact_directory.is_dir():
+        raise ValueError("Prepared-image artifact must be a directory")
+    entries = {path.name: path for path in artifact_directory.iterdir()}
+    if set(entries) != PREPARED_IMAGE_FILES:
+        raise ValueError("Prepared-image artifact contains unexpected files")
+    manifest, manifest_bytes = load_strict_json(
+        entries[PREPARED_IMAGE_MANIFEST],
+        MAX_MANIFEST_SIZE,
+        "Prepared-image manifest",
+        canonical=True,
+    )
+    if sha256_bytes(manifest_bytes) != expected_manifest_sha256:
+        raise ValueError("Prepared-image manifest does not match the trusted digest")
+    details = validate_prepared_image_manifest(manifest, expected_source)
+    return artifact_directory, manifest, manifest_bytes, details
+
+
+def import_prepared_image(artifact_directory, directory, miz,
+                          expected_manifest_sha256, expected_source,
+                          location, vm_size):
+    validate_deployment_config(location, vm_size)
+    artifact_directory, manifest, manifest_bytes, details = (
+        load_prepared_image_artifact(
+            artifact_directory, expected_manifest_sha256, expected_source
+        )
+    )
+    miz = miz.resolve(strict=True)
+    if not os.access(miz, os.X_OK):
+        raise ValueError("Import miz executable is not executable")
+    import_miz_sha256 = image_sha256(miz)
+
+    directory = directory.absolute()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    directory = directory.resolve(strict=True)
+    configure_tool_directories(directory)
+    state_path = directory / "state.json"
+    state = {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "phase": "preparing",
+        "name_prefix": "uk-hv-" + secrets.token_hex(10),
+        "location": location,
+        "vm_size": vm_size,
+        "platform_marker": details["platform_marker"],
+        "efi_sha256": details["efi_sha256"],
+        "raw_sha256": details["raw_sha256"],
+        "image_sha256": details["vhd_sha256"],
+        "source_miz_executable_sha256": details["miz_sha256"],
+        "import_miz_executable_sha256": import_miz_sha256,
+    }
+    save_json(state_path, state)
+    manifest_path = directory / PREPARED_IMAGE_MANIFEST
+    with manifest_path.open("xb") as output:
+        output.write(manifest_bytes)
+        output.flush()
+        os.fsync(output.fileno())
+    image = directory / PREPARED_IMAGE_VHD
+    copy_regular_file(
+        artifact_directory / PREPARED_IMAGE_VHD,
+        image,
+        details["vhd_size"],
+        details["vhd_sha256"],
+    )
+    report = miz_command(miz, [
+        "check-efi-application", "--output=json", "--architecture", "x86_64",
+        "--expected-efi-sha256", details["efi_sha256"],
+        "--expected-virtual-size", "66M", str(image),
+    ], directory / "miz-import-check.log", json_output=True)
+    check_packaging_report(report, details["efi_sha256"], image.stat().st_size)
+    checked_contract = {
+        key: report[key] for key in manifest["packaging"]
+    }
+    if canonical_json(checked_contract) != canonical_json(manifest["packaging"]):
+        raise ValueError("Imported VHD packaging differs from the trusted manifest")
+    save_json(directory / "packaging.json", report)
+    if image_sha256(image) != details["vhd_sha256"]:
+        raise ValueError("Imported VHD changed during packaging validation")
+    state.update(
+        phase="prepared",
+        prepared_image_import={
+            "contract": PREPARED_IMAGE_SCHEMA,
+            "manifest_sha256": expected_manifest_sha256,
+            "source": details["source"],
+        },
+        trusted_platform_boot_modes=details["boots"],
+    )
+    save_json(state_path, state)
+    return directory
+
+
+def validate_prepared_run_provenance(state, directory):
+    if state.get("local_platform_boot") is True:
+        return
+    receipt = require_exact_fields(
+        state.get("prepared_image_import"),
+        ("contract", "manifest_sha256", "source"),
+        "Prepared-image import receipt",
+    )
+    if receipt["contract"] != PREPARED_IMAGE_SCHEMA:
+        raise ValueError("Prepared-image import receipt has an invalid contract")
+    manifest, manifest_bytes = load_strict_json(
+        directory / PREPARED_IMAGE_MANIFEST,
+        MAX_MANIFEST_SIZE,
+        "Imported prepared-image manifest",
+        canonical=True,
+    )
+    if sha256_bytes(manifest_bytes) != require_sha256(
+        receipt["manifest_sha256"], "Imported manifest fingerprint"
+    ):
+        raise ValueError("Imported prepared-image manifest has changed")
+    source = validate_prepared_image_source(receipt["source"])
+    details = validate_prepared_image_manifest(manifest, source)
+    if (
+        state.get("image_sha256") != details["vhd_sha256"]
+        or state.get("efi_sha256") != details["efi_sha256"]
+        or state.get("raw_sha256") != details["raw_sha256"]
+        or state.get("platform_marker") != details["platform_marker"]
+        or state.get("trusted_platform_boot_modes") != details["boots"]
+    ):
+        raise ValueError("Private state does not match its trusted prepared image")
 
 
 def quota_count(value):
@@ -665,8 +1259,9 @@ def run_prepared(directory, stage, timeout, keep_resources):
     if stage not in ("platform", "io") or not 30 <= timeout <= 1800:
         raise ValueError("Expected platform/io stage and a timeout between 30 and 1800 seconds")
     state, state_path = load_state(directory)
-    if state.get("phase") != "prepared" or state.get("local_platform_boot") is not True:
-        raise ValueError("Run requires a newly prepared, locally booted image")
+    if state.get("phase") != "prepared":
+        raise ValueError("Run requires a newly prepared image")
+    validate_prepared_run_provenance(state, state_path.parent)
     image = state_path.parent / "unikraft.vhd"
     if image_sha256(image) != state["image_sha256"]:
         raise ValueError("Prepared VHD has changed since the local boot")
@@ -700,6 +1295,29 @@ def cleanup_state(directory):
     AzureRun(state, path).cleanup()
 
 
+def add_provenance_arguments(parser, prefix):
+    parser.add_argument(f"--{prefix}-repository", required=True)
+    parser.add_argument(f"--{prefix}-repository-id", type=int, required=True)
+    parser.add_argument(f"--{prefix}-workflow-ref", required=True)
+    parser.add_argument(f"--{prefix}-job", required=True)
+    parser.add_argument(f"--{prefix}-run-id", type=int, required=True)
+    parser.add_argument(f"--{prefix}-run-attempt", type=int, required=True)
+    parser.add_argument(f"--{prefix}-head-sha", required=True)
+
+
+def provenance_from_args(args, prefix):
+    attribute = prefix.replace("-", "_")
+    return prepared_image_source(
+        getattr(args, f"{attribute}_repository"),
+        getattr(args, f"{attribute}_repository_id"),
+        getattr(args, f"{attribute}_workflow_ref"),
+        getattr(args, f"{attribute}_job"),
+        getattr(args, f"{attribute}_run_id"),
+        getattr(args, f"{attribute}_run_attempt"),
+        getattr(args, f"{attribute}_head_sha"),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unikraft Hyper-V/Azure acceptance evidence"
@@ -719,9 +1337,21 @@ def main():
     prepare.add_argument("--expect", default=PLATFORM_READY)
     prepare.add_argument("--timeout", type=int, default=30)
     prepare.add_argument("--location", default="westus2")
-    prepare.add_argument("--vm-size", default="Standard_D2s_v5", choices=(
-        "Standard_D2s_v5", "Standard_D2as_v5", "Standard_B2s",
-    ))
+    prepare.add_argument("--vm-size", default="Standard_D2s_v5", choices=VM_SIZES)
+    export = subparsers.add_parser("export-prepared")
+    export.add_argument("--state-dir", type=Path, required=True)
+    export.add_argument("--artifact-dir", type=Path, required=True)
+    add_provenance_arguments(export, "source")
+    import_image = subparsers.add_parser("import-prepared")
+    import_image.add_argument("--artifact-dir", type=Path, required=True)
+    import_image.add_argument("--state-dir", type=Path, required=True)
+    import_image.add_argument("--miz", type=Path, required=True)
+    import_image.add_argument("--expected-manifest-sha256", required=True)
+    add_provenance_arguments(import_image, "expected")
+    import_image.add_argument("--location", default="westus2")
+    import_image.add_argument(
+        "--vm-size", default="Standard_D2s_v5", choices=VM_SIZES
+    )
     run = subparsers.add_parser("run")
     run.add_argument("--state-dir", type=Path, required=True)
     run.add_argument("--stage", choices=("platform", "io"), default="io")
@@ -739,6 +1369,24 @@ def main():
         elif args.action == "prepare":
             directory = prepare_image(args)
             print(f"Image prepared and locally booted; private run state: {directory}")
+        elif args.action == "export-prepared":
+            digest = export_prepared_image(
+                args.state_dir,
+                args.artifact_dir,
+                provenance_from_args(args, "source"),
+            )
+            print(digest)
+        elif args.action == "import-prepared":
+            directory = import_prepared_image(
+                args.artifact_dir,
+                args.state_dir,
+                args.miz,
+                args.expected_manifest_sha256,
+                provenance_from_args(args, "expected"),
+                args.location,
+                args.vm_size,
+            )
+            print(f"Prepared image imported into private run state: {directory}")
         elif args.action == "run":
             if not 30 <= args.timeout <= 1800:
                 parser.error("--timeout must be between 30 and 1800 seconds")

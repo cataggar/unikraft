@@ -14,6 +14,14 @@ on:
     types: [opened, synchronize, reopened]
     branches: [staging, zig16]
 
+  workflow_dispatch:
+    inputs:
+      export_hyperv_prepared_image:
+        description: Export the exact four-boot Hyper-V VHD for reviewed use
+        required: false
+        type: boolean
+        default: false
+
 jobs:
   libc-test:
     name: libc-test
@@ -652,6 +660,9 @@ jobs:
     name: zig-hyperv
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      prepared_image_manifest_sha256: ${{ steps.hyperv_prepared_image.outputs.manifest_sha256 }}
+      prepared_image_artifact: ${{ steps.hyperv_prepared_image.outputs.artifact_name }}
     permissions:
       attestations: read
       contents: read
@@ -856,6 +867,53 @@ jobs:
                 f"{state.get('local_platform_boot_modes')!r}"
             )
         PY
+
+    - name: Export exact prepared Hyper-V image
+      if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
+      id: hyperv_prepared_image
+      run: |
+        set -euo pipefail
+        state="${RUNNER_TEMP}/hyperv-ci/packaging"
+        artifact="${RUNNER_TEMP}/hyperv-ci/prepared-export"
+        digest="$(
+          python3 support/scripts/hyperv-azure.py export-prepared \
+            --state-dir "${state}" \
+            --artifact-dir "${artifact}" \
+            --source-repository "${GITHUB_REPOSITORY}" \
+            --source-repository-id "${{ github.repository_id }}" \
+            --source-workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --source-job zig-hyperv \
+            --source-run-id "${GITHUB_RUN_ID}" \
+            --source-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --source-head-sha "${GITHUB_SHA}"
+        )"
+        if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "Invalid prepared-image manifest digest" >&2
+          exit 1
+        fi
+        echo "manifest_sha256=${digest}" >> "${GITHUB_OUTPUT}"
+        echo "artifact_name=zig-hyperv-prepared-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          >> "${GITHUB_OUTPUT}"
+        {
+          echo '## Exact prepared Hyper-V image'
+          echo
+          echo "Manifest SHA-256: \`${digest}\`"
+          echo
+          echo "Source job: \`${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}:zig-hyperv\`"
+          echo "Source head: \`${GITHUB_SHA}\`"
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Retain explicitly requested exact prepared image
+      if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/hyperv-ci/prepared-export/prepared-image-manifest.json
+          ${{ runner.temp }}/hyperv-ci/prepared-export/unikraft.vhd
+        compression-level: 9
+        retention-days: 7
+        if-no-files-found: error
 
     - name: Retain bounded local image evidence
       if: always()

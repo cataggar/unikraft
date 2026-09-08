@@ -91,8 +91,8 @@ STATE="$PWD/.d/azure/first-platform"
 
 python3 support/scripts/hyperv-azure.py prepare \
   --efi "$EFI" --miz "$MIZ" --state-dir "$STATE" \
-  --ovmf-code /usr/share/OVMF/OVMF_CODE.fd \
-  --ovmf-vars /usr/share/OVMF/OVMF_VARS.fd \
+  --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.fd \
+  --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd \
   --expect 'Hello world!' \
   --location westus2 --vm-size Standard_D2s_v5
 ```
@@ -150,10 +150,6 @@ retained-client interrupt restoration after same-controller rebind.
 
 `state.json` retains `local_platform_boot_modes` for the raw and fixed-VHD
 x2APIC/legacy-APIC boots, while `image_sha256` remains the deployment identity.
-A later trusted `workflow_dispatch` stage should consume this prepared VHD and
-call the existing `run`/`cleanup` controller paths one VM at a time; it should
-not rebuild, repackage, add a second deployment pipeline, infer coverage from
-CPU/SKU labels, or allocate repeatedly to search for a protocol version.
 Ordinary pull requests intentionally have no Azure stage or credentials.
 The `zig-hyperv-local-evidence` CI artifact retains selected local serial and
 packaging logs, the packaging report, and EFI/debug-ELF digests for seven days,
@@ -224,6 +220,53 @@ matching guest lease, ARP, TCP, UDP, cleanup, and final records.
 The service itself creates no Azure resources and is not yet wired into the
 Azure controller. The existing `run` command remains the original smoke lane;
 do not use its DHCP-Offer result as application-network coverage.
+
+## Transfer an exact prepared image
+
+The `export-prepared` and `import-prepared` commands transfer the exact fixed
+VHD that passed the four local boots. They do not rebuild or repackage it.
+Export is available in CI only when a trusted operator explicitly enables the
+`export_hyperv_prepared_image` `workflow_dispatch` input. Normal pushes and
+pull requests never upload the VHD.
+
+The opt-in artifact contains exactly `prepared-image-manifest.json` and
+`unikraft.vhd`. The canonical manifest contains only strict schema/controller
+revision data, GitHub repository/workflow/job/run/head provenance, fixed image,
+EFI, raw-image, and pinned-`miz` fingerprints, the allowlisted packaging
+contract, and the four platform-only APIC outcomes. It contains no private
+state, local paths, serial logs, Azure identifiers, SAS values, credentials, or
+resource ownership.
+
+Record the manifest SHA-256 printed in the reviewed job summary separately from
+the downloaded artifact. Import requires that externally supplied digest and
+the expected source identity:
+
+```shell
+ARTIFACT="$PWD/.d/artifacts/zig-hyperv-prepared"
+STATE="$PWD/.d/azure/imported-platform"
+MIZ=/absolute/path/to/the/pinned/miz
+
+python3 support/scripts/hyperv-azure.py import-prepared \
+  --artifact-dir "$ARTIFACT" --state-dir "$STATE" --miz "$MIZ" \
+  --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256" \
+  --expected-repository unikraft/unikraft \
+  --expected-repository-id "$REVIEWED_REPOSITORY_ID" \
+  --expected-workflow-ref "$REVIEWED_WORKFLOW_REF" \
+  --expected-job zig-hyperv \
+  --expected-run-id "$REVIEWED_RUN_ID" \
+  --expected-run-attempt "$REVIEWED_RUN_ATTEMPT" \
+  --expected-head-sha "$REVIEWED_HEAD_SHA" \
+  --location westus2 --vm-size Standard_D2s_v5
+```
+
+Import accepts no archive and follows no manifest-provided path. It rejects
+extra files, symlinks, duplicate or unknown fields, incompatible controller
+revisions, source mismatches, and changed image or packaging content. The
+pinned `miz` check is rerun against the copied VHD. A new private state
+directory and random ownership prefix are created; no cloud subscription,
+resource ID, credential, or previous ownership is imported. The existing
+`run` and `cleanup` commands then operate on this private ledger unchanged.
+Import itself makes no GitHub or Azure calls.
 
 ## Run one Azure VM
 
