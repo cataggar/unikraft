@@ -26,6 +26,12 @@
 #define HYPERV_TIME_RUNNING		1
 #define HYPERV_TIME_STOPPING		2
 #define HYPERV_TIME_QUIESCED		3
+#define HYPERV_AP_START_IDLE		0
+#define HYPERV_AP_STARTING		1
+#define HYPERV_AP_STARTED		2
+#define HYPERV_AP_ROLLING_BACK		3
+#define HYPERV_AP_FAILED		4
+#define HYPERV_AP_QUARANTINED		5
 #define HYPERV_CPU_STOP_TIMEOUT_NS	100000000ULL
 #define HYPERV_CPU_INIT_TIMEOUT_TICKS	1000000ULL
 
@@ -51,6 +57,14 @@ static __u8 hyperv_message_vector;
 static __u8 hyperv_timer_vector;
 static __u32 hyperv_irq_dropped;
 static __u32 hyperv_vp_refs[CONFIG_UKPLAT_CPU_MAXCOUNT];
+static int hyperv_ap_start_state;
+static int hyperv_ap_start_error;
+static __u32 hyperv_ap_start_generation;
+static __u32 hyperv_ap_expected[CONFIG_UKPLAT_CPU_MAXCOUNT];
+static unsigned int hyperv_ap_requested;
+static unsigned int hyperv_ap_started;
+static unsigned int hyperv_ap_waited;
+static unsigned int hyperv_ap_late;
 static int hyperv_current_cpu_index(__u32 *index);
 
 _Static_assert(CONFIG_UKPLAT_CPU_MAXCOUNT >= 1,
@@ -72,6 +86,15 @@ unsigned long sched_have_pending_events;
 static __u8 hyperv_ap_stacks[CONFIG_UKPLAT_CPU_MAXCOUNT - 1][__STACK_SIZE]
 	__align(16);
 #endif
+
+static inline void hyperv_cpu_relax(void)
+{
+#ifdef HYPERV_TIME_HOST_TEST
+	__atomic_signal_fence(__ATOMIC_ACQ_REL);
+#else
+	__asm__ __volatile__("pause");
+#endif
+}
 
 static void hyperv_time_mark_pending(void)
 {
@@ -263,6 +286,27 @@ static int hyperv_cpu_reserve(__u32 index, __u32 vp_index, int bootstrap)
 		ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
 		return -EAGAIN;
 	}
+	if (!bootstrap) {
+		int start_state = __atomic_load_n(&hyperv_ap_start_state,
+						  __ATOMIC_ACQUIRE);
+
+		if (__atomic_load_n(&hyperv_cpus[index].state,
+				    __ATOMIC_ACQUIRE) == HYPERV_CPU_ONLINE) {
+			if (start_state != HYPERV_AP_STARTING &&
+			    start_state != HYPERV_AP_STARTED) {
+				hyperv_ap_late++;
+				ukplat_spin_unlock_irqrestore(
+					&hyperv_cpu_lock, flags);
+				return -ECANCELED;
+			}
+		} else if (start_state != HYPERV_AP_STARTING ||
+			   hyperv_ap_expected[index] !=
+				   hyperv_ap_start_generation) {
+			hyperv_ap_late++;
+			ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+			return -ECANCELED;
+		}
+	}
 	rc = hyperv_cpu_state_reserve(hyperv_cpus,
 			CONFIG_UKPLAT_CPU_MAXCOUNT, index, vp_index, max_vp,
 			&hyperv_cpu_generation);
@@ -316,8 +360,14 @@ static int hyperv_cpu_init_current(int bootstrap)
 
 		ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
 		if (!bootstrap &&
-		    __atomic_load_n(&hyperv_time_initialized,
-				    __ATOMIC_ACQUIRE) != HYPERV_TIME_RUNNING) {
+		    (__atomic_load_n(&hyperv_time_initialized,
+				     __ATOMIC_ACQUIRE) != HYPERV_TIME_RUNNING ||
+		     __atomic_load_n(&hyperv_ap_start_state,
+				     __ATOMIC_ACQUIRE) !=
+			     HYPERV_AP_STARTING ||
+		     hyperv_ap_expected[index] !=
+			     hyperv_ap_start_generation)) {
+			hyperv_ap_late++;
 			ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
 			rc = -ECANCELED;
 			goto failed;
@@ -341,7 +391,7 @@ static int hyperv_cpu_wait_refs(__u32 index, int bounded)
 	while (__atomic_load_n(&hyperv_vp_refs[index], __ATOMIC_ACQUIRE)) {
 		if (!bounded || hyperv_reference_time() >= deadline)
 			return -EBUSY;
-		__asm__ __volatile__("pause");
+		hyperv_cpu_relax();
 	}
 	return 0;
 }
@@ -368,6 +418,240 @@ static int hyperv_cpu_fini_current(int host_quiesced)
 	return 0;
 }
 
+#if CONFIG_HAVE_SMP
+static void __noreturn
+hyperv_cpu_remote_fini(struct uk_lcpu_regs *regs __unused,
+		       void *arg)
+{
+	int host_quiesced = (int)(__uptr)arg;
+
+	(void)hyperv_cpu_fini_current(host_quiesced);
+	uk_lcpu_halt();
+}
+
+static int
+hyperv_cpu_fini_indices(const __u64 candidates[], unsigned int candidate_count,
+			int host_quiesced)
+{
+	const struct uk_lcpu_func fn = {
+		.fn = hyperv_cpu_remote_fini,
+		.user = (void *)(__uptr)!!host_quiesced,
+	};
+	__u64 indices[CONFIG_UKPLAT_CPU_MAXCOUNT];
+	__nsec deadline = ukplat_monotonic_clock() +
+		HYPERV_CPU_STOP_TIMEOUT_NS;
+	unsigned int count;
+	unsigned int queued;
+	unsigned int waited;
+	unsigned int i;
+	int rc;
+	int wait_rc;
+
+	for (;;) {
+		count = 0;
+		for (i = 0; i < candidate_count; i++) {
+			if (candidates[i] >= CONFIG_UKPLAT_CPU_MAXCOUNT)
+				return -ERANGE;
+			if (__atomic_load_n(
+				    &hyperv_cpus[candidates[i]].state,
+				    __ATOMIC_ACQUIRE) == HYPERV_CPU_ONLINE)
+				indices[count++] = candidates[i];
+		}
+		if (!count)
+			return 0;
+
+		queued = count;
+		rc = uk_lcpu_run(indices, &queued, &fn,
+				  UK_LCPU_RFLG_DONOTBLOCK);
+		if (queued > count)
+			return -EIO;
+		if (queued) {
+			waited = queued;
+			wait_rc = uk_lcpu_wait(indices, &waited,
+						HYPERV_CPU_STOP_TIMEOUT_NS);
+			if (wait_rc || waited != queued)
+				return wait_rc ? wait_rc : -ETIMEDOUT;
+		}
+		if (rc && rc != -EAGAIN)
+			return rc;
+		if (ukplat_monotonic_clock() >= deadline)
+			return -ETIMEDOUT;
+		hyperv_cpu_relax();
+	}
+}
+
+static int
+hyperv_ap_start_begin(const __u64 indices[], unsigned int count,
+		      __u32 *generation)
+{
+	unsigned long flags;
+	unsigned int i;
+	int state;
+	int rc = 0;
+
+	ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
+	state = __atomic_load_n(&hyperv_ap_start_state, __ATOMIC_ACQUIRE);
+	if (state == HYPERV_AP_STARTED) {
+		rc = 1;
+		goto out;
+	}
+	if (state == HYPERV_AP_FAILED || state == HYPERV_AP_QUARANTINED) {
+		rc = hyperv_ap_start_error ? hyperv_ap_start_error : -EIO;
+		goto out;
+	}
+	if (state != HYPERV_AP_START_IDLE) {
+		rc = -EBUSY;
+		goto out;
+	}
+	if (__atomic_load_n(&hyperv_time_initialized, __ATOMIC_ACQUIRE) !=
+		    HYPERV_TIME_RUNNING) {
+		rc = -EAGAIN;
+		goto out;
+	}
+	if (hyperv_ap_start_generation == UINT32_MAX) {
+		rc = -ENOSPC;
+		goto out;
+	}
+	for (i = 0; i < count; i++) {
+		if (!indices[i] ||
+		    indices[i] >= CONFIG_UKPLAT_CPU_MAXCOUNT) {
+			rc = -ERANGE;
+			goto out;
+		}
+	}
+	*generation = ++hyperv_ap_start_generation;
+	memset(hyperv_ap_expected, 0, sizeof(hyperv_ap_expected));
+	for (i = 0; i < count; i++)
+		hyperv_ap_expected[indices[i]] = *generation;
+	hyperv_ap_requested = count;
+	hyperv_ap_started = 0;
+	hyperv_ap_waited = 0;
+	hyperv_ap_late = 0;
+	hyperv_ap_start_error = 0;
+	__atomic_store_n(&hyperv_ap_start_state, HYPERV_AP_STARTING,
+			 __ATOMIC_RELEASE);
+out:
+	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+	return rc;
+}
+
+static int
+hyperv_ap_start_complete(const __u64 indices[], unsigned int count,
+			 __u32 generation)
+{
+	unsigned long flags;
+	unsigned int i;
+	int rc = 0;
+
+	ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
+	if (__atomic_load_n(&hyperv_ap_start_state, __ATOMIC_ACQUIRE) !=
+		    HYPERV_AP_STARTING ||
+	    generation != hyperv_ap_start_generation) {
+		rc = -ECANCELED;
+		goto out;
+	}
+	if (__atomic_load_n(&hyperv_time_initialized, __ATOMIC_ACQUIRE) !=
+		    HYPERV_TIME_RUNNING) {
+		rc = -ECANCELED;
+		goto out;
+	}
+	for (i = 0; i < count; i++)
+		if (__atomic_load_n(&hyperv_cpus[indices[i]].state,
+				    __ATOMIC_ACQUIRE) != HYPERV_CPU_ONLINE) {
+			rc = -EIO;
+			goto out;
+		}
+	for (i = 0; i < CONFIG_UKPLAT_CPU_MAXCOUNT; i++)
+		hyperv_ap_expected[i] = 0;
+	__atomic_store_n(&hyperv_ap_start_state, HYPERV_AP_STARTED,
+			 __ATOMIC_RELEASE);
+out:
+	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+	return rc;
+}
+
+static int
+hyperv_ap_start_rollback(const __u64 indices[], unsigned int count,
+			 __u32 generation, int startup_error)
+{
+	unsigned long flags;
+	unsigned int settled = count;
+	unsigned int finished = count;
+	unsigned int i;
+	unsigned int late;
+	int clean = 1;
+	int rc;
+	int rollback_error = 0;
+
+	if (!startup_error)
+		startup_error = -EIO;
+	ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
+	if (__atomic_load_n(&hyperv_ap_start_state, __ATOMIC_ACQUIRE) ==
+		    HYPERV_AP_STARTING &&
+	    generation == hyperv_ap_start_generation)
+		__atomic_store_n(&hyperv_ap_start_state,
+				 HYPERV_AP_ROLLING_BACK, __ATOMIC_RELEASE);
+	else {
+		rollback_error = -ECANCELED;
+		clean = 0;
+	}
+	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+
+	if (count) {
+		rc = uk_lcpu_wait(indices, &settled,
+				   HYPERV_CPU_STOP_TIMEOUT_NS);
+		if (settled > count) {
+			settled = count;
+			if (!rollback_error)
+				rollback_error = -EIO;
+		}
+		/*
+		 * A failed settle wait does not make rollback unsafe by itself:
+		 * closing admission above forces initializing late arrivals to
+		 * tear down locally before they can become online.
+		 */
+		(void)rc;
+
+		rc = hyperv_cpu_fini_indices(indices, count, 0);
+		if (rc && !rollback_error)
+			rollback_error = rc;
+
+		rc = uk_lcpu_wait(indices, &finished,
+				   HYPERV_CPU_STOP_TIMEOUT_NS);
+		if (rc || finished != count) {
+			clean = 0;
+			if (!rollback_error)
+				rollback_error = rc ? rc : -ETIMEDOUT;
+		}
+	}
+	for (i = 0; i < count; i++)
+		if (__atomic_load_n(&hyperv_cpus[indices[i]].state,
+				    __ATOMIC_ACQUIRE) != HYPERV_CPU_OFFLINE) {
+			clean = 0;
+			if (!rollback_error)
+				rollback_error = -EBUSY;
+		}
+
+	ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
+	late = hyperv_ap_late;
+	hyperv_ap_start_error = clean ?
+		startup_error : (rollback_error ? rollback_error : -EBUSY);
+	if (clean)
+		memset(hyperv_ap_expected, 0, sizeof(hyperv_ap_expected));
+	__atomic_store_n(&hyperv_ap_start_state,
+			 clean ? HYPERV_AP_FAILED : HYPERV_AP_QUARANTINED,
+			 __ATOMIC_RELEASE);
+	rc = hyperv_ap_start_error;
+	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+
+	uk_pr_warn("Hyper-V: AP startup failed after %u/%u start(s), "
+		   "%u initially settled, %u late; rollback %s (%d)\n",
+		   count, hyperv_ap_requested, hyperv_ap_waited, late,
+		   clean ? "complete" : "quarantined", rc);
+	return rc;
+}
+#endif
+
 int ukplat_lcpu_init_hook(void)
 {
 	int rc;
@@ -377,10 +661,6 @@ int ukplat_lcpu_init_hook(void)
 		rc = uk_lcpu_current_is_bsp() ? 0 : -EAGAIN;
 	else
 		rc = hyperv_cpu_init_current(0);
-#ifndef HYPERV_TIME_HOST_TEST
-	if (unlikely(rc))
-		UK_CRASH("Hyper-V: secondary CPU SynIC init failed: %d\n", rc);
-#endif
 	return rc;
 }
 
@@ -390,9 +670,11 @@ int ukplat_lcpu_startup_hook(void)
 	__u64 indices[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
 	__uptr stacks[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
 	unsigned int count = uk_acpi_cpu_count();
+	unsigned int requested;
 	unsigned int started;
-	unsigned int online;
+	unsigned int waited;
 	unsigned int i;
+	__u32 generation;
 	int rc;
 
 	if (count <= 1)
@@ -403,18 +685,36 @@ int ukplat_lcpu_startup_hook(void)
 		indices[i - 1] = i;
 		stacks[i - 1] = (__uptr)&hyperv_ap_stacks[i - 1][__STACK_SIZE];
 	}
-	started = count - 1;
+	requested = count - 1;
+	rc = hyperv_ap_start_begin(indices, requested, &generation);
+	if (rc)
+		return rc > 0 ? 0 : rc;
+
+	started = requested;
 	rc = uk_lcpu_start(indices, &started, stacks, NULL, 0);
-	if (rc || started != count - 1)
-		return rc ? rc : -EIO;
-	online = started;
-	rc = uk_lcpu_wait(indices, &online, HYPERV_CPU_STOP_TIMEOUT_NS);
-	if (rc || online != started)
-		return rc ? rc : -ETIMEDOUT;
-	for (i = 0; i < started; i++)
-		if (__atomic_load_n(&hyperv_cpus[indices[i]].state,
-				    __ATOMIC_ACQUIRE) != HYPERV_CPU_ONLINE)
-			return -EIO;
+	if (started > requested) {
+		started = requested;
+		rc = -EIO;
+	}
+	__atomic_store_n(&hyperv_ap_started, started, __ATOMIC_RELEASE);
+	if (rc || started != requested)
+		return hyperv_ap_start_rollback(indices, started, generation,
+						rc ? rc : -EIO);
+
+	waited = started;
+	rc = uk_lcpu_wait(indices, &waited, HYPERV_CPU_STOP_TIMEOUT_NS);
+	if (waited > started) {
+		waited = started;
+		rc = -EIO;
+	}
+	__atomic_store_n(&hyperv_ap_waited, waited, __ATOMIC_RELEASE);
+	if (rc || waited != started)
+		return hyperv_ap_start_rollback(indices, started, generation,
+						rc ? rc : -ETIMEDOUT);
+	rc = hyperv_ap_start_complete(indices, started, generation);
+	if (rc)
+		return hyperv_ap_start_rollback(indices, started, generation,
+						rc);
 	uk_pr_info("Hyper-V: started %u secondary CPU(s)\n", started);
 #endif
 	return 0;
@@ -444,7 +744,16 @@ void ukplat_time_init(void)
 		hyperv_cpus[i].generation = 0;
 		hyperv_cpus[i].state = HYPERV_CPU_OFFLINE;
 		hyperv_vp_refs[i] = 0;
+		hyperv_ap_expected[i] = 0;
 	}
+	hyperv_cpu_generation = 0;
+	hyperv_ap_start_state = HYPERV_AP_START_IDLE;
+	hyperv_ap_start_error = 0;
+	hyperv_ap_start_generation = 0;
+	hyperv_ap_requested = 0;
+	hyperv_ap_started = 0;
+	hyperv_ap_waited = 0;
+	hyperv_ap_late = 0;
 	hyperv_shutdown_first_error = 0;
 	rc = uk_intctlr_irq_alloc(hyperv_irqs, 2);
 	if (unlikely(rc))
@@ -512,18 +821,6 @@ __nsec ukplat_wall_clock(void)
 				   hyperv_reference_time());
 }
 
-#if CONFIG_HAVE_SMP
-static void __noreturn
-hyperv_cpu_remote_fini(struct uk_lcpu_regs *regs __unused,
-		       void *arg)
-{
-	int host_quiesced = (int)(__uptr)arg;
-
-	(void)hyperv_cpu_fini_current(host_quiesced);
-	uk_lcpu_halt();
-}
-#endif
-
 static int hyperv_cpu_wait_initializing(void)
 {
 	__u64 deadline = hyperv_reference_time() +
@@ -544,7 +841,7 @@ static int hyperv_cpu_wait_initializing(void)
 			return 0;
 		if (hyperv_reference_time() >= deadline)
 			return -ETIMEDOUT;
-		__asm__ __volatile__("pause");
+		hyperv_cpu_relax();
 	}
 }
 
@@ -555,49 +852,18 @@ static int hyperv_cpu_fini_others(int host_quiesced)
 	if (rc)
 		return rc;
 #if CONFIG_HAVE_SMP
-	const struct uk_lcpu_func fn = {
-		.fn = hyperv_cpu_remote_fini,
-		.user = (void *)(__uptr)!!host_quiesced,
-	};
 	__u64 indices[CONFIG_UKPLAT_CPU_MAXCOUNT];
 	unsigned int count = 0;
-	unsigned int completed;
 	unsigned int i;
 	__u32 current;
-	__nsec deadline;
+
 	rc = hyperv_current_cpu_index(&current);
 	if (rc)
 		return rc;
-	deadline = ukplat_monotonic_clock() + HYPERV_CPU_STOP_TIMEOUT_NS;
-	for (;;) {
-		count = 0;
-		for (i = 0; i < CONFIG_UKPLAT_CPU_MAXCOUNT; i++) {
-			if (i == current)
-				continue;
-			if (__atomic_load_n(&hyperv_cpus[i].state,
-					    __ATOMIC_ACQUIRE) ==
-			    HYPERV_CPU_ONLINE)
-				indices[count++] = i;
-		}
-		if (!count)
-			return 0;
-		completed = count;
-		rc = uk_lcpu_run(indices, &completed, &fn,
-				  UK_LCPU_RFLG_DONOTBLOCK);
-		if (rc && rc != -EAGAIN)
-			return rc;
-		if (completed) {
-			unsigned int waited = completed;
-
-			rc = uk_lcpu_wait(indices, &waited,
-					HYPERV_CPU_STOP_TIMEOUT_NS);
-			if (rc)
-				return rc;
-		}
-		if (ukplat_monotonic_clock() >= deadline)
-			return -ETIMEDOUT;
-		__asm__ __volatile__("pause");
-	}
+	for (i = 0; i < CONFIG_UKPLAT_CPU_MAXCOUNT; i++)
+		if (i != current)
+			indices[count++] = i;
+	return hyperv_cpu_fini_indices(indices, count, host_quiesced);
 #endif
 	return 0;
 }
@@ -762,6 +1028,56 @@ int hyperv_time_host_cpu_state(unsigned int index)
 int hyperv_time_host_runtime_state(void)
 {
 	return __atomic_load_n(&hyperv_time_initialized, __ATOMIC_ACQUIRE);
+}
+
+int hyperv_time_host_ap_start_state(void)
+{
+	return __atomic_load_n(&hyperv_ap_start_state, __ATOMIC_ACQUIRE);
+}
+
+int hyperv_time_host_ap_start_error(void)
+{
+	return __atomic_load_n(&hyperv_ap_start_error, __ATOMIC_ACQUIRE);
+}
+
+unsigned int hyperv_time_host_ap_requested(void)
+{
+	return __atomic_load_n(&hyperv_ap_requested, __ATOMIC_ACQUIRE);
+}
+
+unsigned int hyperv_time_host_ap_started(void)
+{
+	return __atomic_load_n(&hyperv_ap_started, __ATOMIC_ACQUIRE);
+}
+
+unsigned int hyperv_time_host_ap_waited(void)
+{
+	return __atomic_load_n(&hyperv_ap_waited, __ATOMIC_ACQUIRE);
+}
+
+unsigned int hyperv_time_host_ap_late(void)
+{
+	return __atomic_load_n(&hyperv_ap_late, __ATOMIC_ACQUIRE);
+}
+
+unsigned int hyperv_time_host_cpu_generation(unsigned int index)
+{
+	if (index >= CONFIG_UKPLAT_CPU_MAXCOUNT)
+		return 0;
+	return __atomic_load_n(&hyperv_cpus[index].generation,
+			       __ATOMIC_ACQUIRE);
+}
+
+unsigned int hyperv_time_host_lifecycle_generation(void)
+{
+	return __atomic_load_n(&hyperv_cpu_generation, __ATOMIC_ACQUIRE);
+}
+
+unsigned int hyperv_time_host_vp_refs(unsigned int index)
+{
+	if (index >= CONFIG_UKPLAT_CPU_MAXCOUNT)
+		return 0;
+	return __atomic_load_n(&hyperv_vp_refs[index], __ATOMIC_ACQUIRE);
 }
 
 void *hyperv_time_host_simp_page(unsigned int index)
