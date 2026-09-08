@@ -1194,7 +1194,7 @@ pub fn build(b: *std.Build) void {
         const x86_host_notice = b.addSystemCommand(&.{
             "python3",
             "-c",
-            "print('INFO: x86-only hosted Hyper-V IRQ, driver, and SMP fixtures are deferred to the x86-64 CI job; portable and freestanding checks passed on this host')",
+            "print('INFO: x86-only hosted Hyper-V IRQ, driver, and SMP fixtures require the x86-64 CI job; running portable and freestanding checks on this host')",
         });
         hyperv_regression_tests.dependOn(&x86_host_notice.step);
     }

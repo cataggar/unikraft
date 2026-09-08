@@ -827,8 +827,8 @@ jobs:
           --efi "${RUNNER_TEMP}/hyperv-ci/build/helloworld_hyperv-x86_64-efi-netvsc" \
           --miz "${RUNNER_TEMP}/hyperv-ci/miz/bin/miz" \
           --state-dir "${state}" \
-          --ovmf-code /usr/share/OVMF/OVMF_CODE.fd \
-          --ovmf-vars /usr/share/OVMF/OVMF_VARS.fd \
+          --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.fd \
+          --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd \
           --qemu "${RUNNER_TEMP}/hyperv-tools/qemu-system-x86_64" \
           --timeout 60
         python3 - "${state}/state.json" <<'PY'
