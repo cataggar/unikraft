@@ -12,6 +12,46 @@ sys.path.insert(0, str(SUPPORT / "scripts"))
 azure = importlib.import_module("hyperv-azure")
 
 
+class HypervAzurePackagingTest(unittest.TestCase):
+    def report(self):
+        return {
+            "schema-version": 1, "contract": "miz.efi-application-image",
+            "valid": True, "format": "vhd", "subformat": "fixed",
+            "generation": 2, "virtual-size": azure.VIRTUAL_SIZE,
+            "file-size": azure.VIRTUAL_SIZE + 512, "architecture": "x86_64",
+            "boot-path": "EFI/BOOT/BOOTX64.EFI", "boot-file-sha256": "a" * 64,
+            "esp-offset": azure.MIB, "esp-length": azure.ESP_SIZE,
+        }
+
+    def test_expected_miz_contract_is_accepted(self):
+        azure.check_packaging_report(
+            self.report(), "a" * 64, azure.VIRTUAL_SIZE + 512
+        )
+
+    def test_invalid_or_mismatched_packaging_is_rejected(self):
+        for field, value in (
+            ("valid", False), ("subformat", "dynamic"), ("generation", 1),
+            ("architecture", "aarch64"), ("virtual-size", azure.VIRTUAL_SIZE + 1),
+            ("boot-path", "EFI/BOOT/BOOTAA64.EFI"),
+            ("boot-file-sha256", "b" * 64), ("schema-version", True),
+        ):
+            with self.subTest(field=field):
+                report = self.report()
+                report[field] = value
+                with self.assertRaises(ValueError):
+                    azure.check_packaging_report(
+                        report, "a" * 64, azure.VIRTUAL_SIZE + 512
+                    )
+
+    def test_missing_field_or_incorrect_file_length_is_rejected(self):
+        report = self.report()
+        del report["esp-length"]
+        with self.assertRaises(ValueError):
+            azure.check_packaging_report(report, "a" * 64, azure.VIRTUAL_SIZE + 512)
+        with self.assertRaises(ValueError):
+            azure.check_packaging_report(self.report(), "a" * 64, azure.VIRTUAL_SIZE)
+
+
 class HypervAzureControllerTest(unittest.TestCase):
     def run_fixture(self):
         run = azure.AzureRun({
@@ -20,6 +60,7 @@ class HypervAzureControllerTest(unittest.TestCase):
             "subscription": "test-subscription",
             "location": "westus2",
             "vm_size": "Standard_D2s_v5",
+            "platform_marker": azure.PLATFORM_READY,
         }, Path("/unused/state.json"))
         run.record = mock.Mock()
         run.az = mock.Mock()
@@ -102,10 +143,37 @@ class HypervAzureControllerTest(unittest.TestCase):
             "https://blob.core.windows.net.attacker.invalid/path?sig=secret",
             "https://user@disk.blob.core.windows.net/path?sig=secret",
             "https://disk.blob.core.windows.net/path",
+            "https://md-partition.blob.storage.azure.net.attacker.invalid/path?sig=secret",
         ):
             with self.subTest(endpoint=endpoint):
                 with self.assertRaises(ValueError):
                     azure.upload_endpoint(endpoint)
+
+    def test_both_documented_managed_disk_hostname_families_are_supported(self):
+        for host in (
+            "md-impexp-disk.blob.core.windows.net",
+            "md-diskpartition.blob.storage.azure.net",
+            "md-impexp-disk.z43.blob.storage.azure.net",
+        ):
+            with self.subTest(host=host):
+                endpoint, sas = azure.upload_endpoint(f"https://{host}/path?sig=secret")
+                self.assertEqual(endpoint, f"https://{host}/path")
+                self.assertEqual(sas, "sig=secret")
+
+    @mock.patch.object(azure.subprocess, "run")
+    def test_managed_serial_json_preserves_lines(self, execute):
+        serial = "\n".join((
+            azure.PLATFORM_READY, azure.BLOCK_READY,
+            azure.NETWORK_READY, azure.IO_READY,
+        )) + "\n"
+        execute.return_value = mock.Mock(returncode=0, stdout=json.dumps(serial))
+        text = azure.azure_cli(
+            ["vm", "boot-diagnostics", "get-boot-log"], private=True
+        )
+        self.assertTrue(azure.inspect_boot_log(text)["io_ready"])
+        command = execute.call_args.args[0]
+        self.assertEqual(command[command.index("--output") + 1], "json")
+        self.assertFalse(azure.inspect_boot_log(repr(serial.encode()))["io_ready"])
 
     @mock.patch.object(azure.subprocess, "run")
     def test_private_cli_error_does_not_print_credentials(self, execute):
@@ -226,6 +294,27 @@ class HypervAzureControllerTest(unittest.TestCase):
         run.cleanup.assert_called_once_with()
         run.deploy_vm.assert_not_called()
 
+    @mock.patch.object(azure, "save_json")
+    @mock.patch.object(azure, "AzureRun")
+    @mock.patch.object(azure, "load_state")
+    def test_local_only_preparation_cleanup_needs_no_subscription(self, load, constructor, save):
+        state = {"phase": "preparing"}
+        load.return_value = (state, Path("/unused/state.json"))
+        azure.cleanup_state(Path("/unused"))
+        self.assertEqual(state["phase"], "cleaned")
+        azure.cleanup_state(Path("/unused"))
+        constructor.assert_not_called()
+
+    @mock.patch.object(azure, "AzureRun")
+    @mock.patch.object(azure, "load_state")
+    def test_cloud_cleanup_requires_complete_subscription_ownership(self, load, constructor):
+        load.return_value = (
+            {"phase": "creating-group"}, Path("/unused/state.json")
+        )
+        with self.assertRaisesRegex(ValueError, "subscription is missing"):
+            azure.cleanup_state(Path("/unused"))
+        constructor.assert_not_called()
+
 
 class HypervAzureEvidenceTest(unittest.TestCase):
     def complete_log(self):
@@ -247,6 +336,11 @@ class HypervAzureEvidenceTest(unittest.TestCase):
     def test_embedded_marker_does_not_establish_acceptance(self):
         result = azure.inspect_boot_log(f"Looking for {azure.PLATFORM_READY}")
         self.assertFalse(result["platform_ready"])
+
+    def test_custom_application_marker_only_establishes_platform_boot(self):
+        result = azure.inspect_boot_log("Hello world!\n", "Hello world!")
+        self.assertTrue(result["platform_ready"])
+        self.assertFalse(result["io_ready"])
 
     def test_firmware_escape_sequences_and_nuls_are_supported(self):
         text = "\x1b[2J" + self.complete_log().replace("\n", "\0\r\n")

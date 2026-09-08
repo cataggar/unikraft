@@ -441,6 +441,11 @@ Passing does not establish VMBus channel or storage/network operation: bus error
 remain visible in the serial log. Real Hyper-V I/O, fixed-VHD packaging through
 `miz`, and Azure Boot Diagnostics remain separate acceptance gates.
 
+The [Azure acceptance controller](support/azure/README.md) uses native `miz`
+packaging, locally boots both GPT/raw and fixed-VHD images, and manages a
+private, ownership-tagged Gen2 deployment with separate platform and real-I/O
+acceptance markers.
+
 NetVSC never guesses past a structurally malformed VMBus ring record. It
 disables channel callbacks and requests bounded VMBus reconnect, then closes
 and tears down the channel after the active callback/data-path operation has

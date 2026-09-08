@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,9 @@ BLOCK_READY = "UK_HYPERV_BLOCK_READ_OK"
 NETWORK_READY = "UK_HYPERV_NET_DHCP_OFFER"
 IO_READY = "UK_HYPERV_IO_READY"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+MIB = 1024 * 1024
+ESP_SIZE = 64 * MIB
+VIRTUAL_SIZE = 66 * MIB
 
 
 class AzureCliError(RuntimeError):
@@ -32,16 +37,19 @@ class AzureCliError(RuntimeError):
             result.stderr, re.MULTILINE,
         )
         self.code = match.group(1) if match else None
-        detail = "credential-bearing output withheld" if private else result.stderr.strip()
+        detail = (
+            f"{self.code or 'unclassified error'}; credential-bearing output withheld"
+            if private else result.stderr.strip()
+        )
         super().__init__(
             f"az {' '.join(arguments[:2])} failed ({result.returncode}): {detail}"
         )
 
 
 def azure_cli(arguments, *, subscription=None, private=False, env=None,
-              timeout=300, raw=False):
+              timeout=300):
     command = [
-        "az", *arguments, "--only-show-errors", "--output", "tsv" if raw else "json"
+        "az", *arguments, "--only-show-errors", "--output", "json"
     ]
     if subscription is not None:
         command.extend(("--subscription", subscription))
@@ -62,8 +70,6 @@ def azure_cli(arguments, *, subscription=None, private=False, env=None,
     )
     if result.returncode:
         raise AzureCliError(arguments, result, private)
-    if raw:
-        return result.stdout
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
@@ -125,7 +131,9 @@ def upload_endpoint(sas):
     if (
         parsed.scheme != "https"
         or not parsed.hostname
-        or not parsed.hostname.endswith(".blob.core.windows.net")
+        or not parsed.hostname.endswith((
+            ".blob.core.windows.net", ".blob.storage.azure.net",
+        ))
         or parsed.port not in (None, 443)
         or parsed.username is not None
         or parsed.password is not None
@@ -135,6 +143,158 @@ def upload_endpoint(sas):
     ):
         raise ValueError("Expected an Azure public-cloud HTTPS Blob SAS endpoint")
     return urlunsplit(parsed._replace(query="")), parsed.query
+
+
+def check_packaging_report(report, efi_sha256, file_size):
+    expected = {
+        "schema-version": 1,
+        "contract": "miz.efi-application-image",
+        "valid": True,
+        "format": "vhd",
+        "subformat": "fixed",
+        "generation": 2,
+        "virtual-size": VIRTUAL_SIZE,
+        "file-size": file_size,
+        "architecture": "x86_64",
+        "boot-path": "EFI/BOOT/BOOTX64.EFI",
+        "boot-file-sha256": efi_sha256,
+        "esp-offset": MIB,
+        "esp-length": ESP_SIZE,
+    }
+    if not isinstance(report, dict) or file_size != VIRTUAL_SIZE + 512:
+        raise ValueError("Invalid fixed-VHD packaging report or file size")
+    for key, value in expected.items():
+        if type(report.get(key)) is not type(value) or report[key] != value:
+            raise ValueError(f"Unexpected miz packaging field: {key}")
+
+
+def miz_command(miz, arguments, log_path, *, json_output=False):
+    with log_path.open("xb") as log:
+        result = subprocess.run(
+            [str(miz), *arguments], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if json_output else log, stderr=log,
+            timeout=300, check=False,
+        )
+    if result.returncode:
+        raise RuntimeError(f"miz {arguments[0]} failed; see {log_path}")
+    if json_output:
+        return json.loads(result.stdout)
+    return None
+
+
+def local_disk_boot(image, image_format, directory, ovmf_code, ovmf_vars,
+                    qemu, expected, timeout):
+    log_path = directory / f"local-{image_format}-serial.log"
+    with tempfile.TemporaryDirectory(prefix="ovmf-", dir=directory) as temporary:
+        work = Path(temporary)
+        shutil.copyfile(ovmf_code, work / "OVMF_CODE.fd")
+        shutil.copyfile(ovmf_vars, work / "OVMF_VARS.fd")
+        os.link(image, work / "disk.img")
+        command = [
+            str(qemu), "-machine", "q35,accel=kvm",
+            "-cpu", "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-time,"
+            "hv-synic,hv-stimer,hv-vpindex,hv-runtime,hv-frequencies",
+            "-smp", "1", "-m", "512M",
+            "-drive", "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
+            "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",
+            "-drive", f"if=virtio,format={image_format},readonly=on,file=disk.img",
+            "-device", "vmbus-bridge,irq=15", "-device", "hv-balloon",
+            "-display", "none", "-serial", "stdio", "-monitor", "none",
+            "-no-reboot", "-nic", "none",
+        ]
+        with log_path.open("xb") as log:
+            result = subprocess.run(
+                command, cwd=work, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT,
+                timeout=timeout, check=False,
+            )
+        if result.returncode:
+            raise RuntimeError(f"QEMU exited with {result.returncode}; see {log_path}")
+    text = log_path.read_text(errors="replace")
+    evidence = inspect_boot_log(text, expected)
+    if not evidence["platform_ready"]:
+        raise RuntimeError(f"Local application-ready marker is missing or guest crashed; see {log_path}")
+    for marker in (
+        "Hyper-V Hv#1 hypercall page enabled",
+        "Hyper-V SynIC:", "Powered by", "Calling main(",
+    ):
+        if marker not in text.replace("\0", ""):
+            raise RuntimeError(f"Local boot is missing {marker}; see {log_path}")
+    return evidence
+
+
+def prepare_image(args):
+    if (
+        not args.expect or args.expect != args.expect.strip()
+        or any(character in args.expect for character in "\r\n\0")
+        or not 1 <= args.timeout <= 300
+        or not re.fullmatch(r"[a-z0-9]{3,30}", args.location)
+    ):
+        raise ValueError("Expected a single-line marker, valid region, and 1-300 second local timeout")
+    efi = args.efi.resolve(strict=True)
+    miz = args.miz.resolve(strict=True)
+    ovmf_code = args.ovmf_code.resolve(strict=True)
+    ovmf_vars = args.ovmf_vars.resolve(strict=True)
+    qemu_name = shutil.which(args.qemu)
+    if qemu_name is None:
+        raise FileNotFoundError(f"QEMU executable not found: {args.qemu}")
+    qemu = Path(qemu_name).resolve(strict=True)
+    efi_digest = image_sha256(efi)
+    miz_digest = image_sha256(miz)
+    directory = args.state_dir.absolute()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    directory = directory.resolve(strict=True)
+    configure_tool_directories(directory)
+    state_path = directory / "state.json"
+    state = {
+        "schema_version": 1, "phase": "preparing",
+        "name_prefix": "uk-hv-" + secrets.token_hex(10),
+        "location": args.location, "vm_size": args.vm_size,
+        "platform_marker": args.expect,
+        "efi_sha256": efi_digest,
+        "miz_executable": str(miz), "miz_executable_sha256": miz_digest,
+        "local_platform_boot": False,
+    }
+    save_json(state_path, state)
+    payload = directory / "BOOTX64.EFI"
+    shutil.copyfile(efi, payload)
+    if image_sha256(payload) != efi_digest:
+        raise ValueError("EFI input changed while copying it into the private run directory")
+    builder = [
+        "build-efi-application", "--efi", str(payload),
+        "--architecture", "x86_64", "--esp-size", "64M",
+    ]
+    raw = directory / "unikraft.raw"
+    miz_command(miz, [*builder, "-O", "raw", "-o", str(raw)],
+                directory / "miz-build-raw.log")
+    if raw.stat().st_size != VIRTUAL_SIZE:
+        raise ValueError("Unexpected raw GPT disk size from miz")
+    raw_digest = image_sha256(raw)
+    local_disk_boot(raw, "raw", directory, ovmf_code, ovmf_vars,
+                    qemu, args.expect, args.timeout)
+    if image_sha256(raw) != raw_digest:
+        raise ValueError("Raw disk changed during its read-only local boot")
+    image = directory / "unikraft.vhd"
+    miz_command(miz, [*builder, "-O", "vhd", "-o", str(image)],
+                directory / "miz-build-vhd.log")
+    image_digest = image_sha256(image)
+    report = miz_command(miz, [
+        "check-efi-application", "--output=json", "--architecture", "x86_64",
+        "--expected-efi-sha256", efi_digest, "--expected-virtual-size", "66M",
+        str(image),
+    ], directory / "miz-check.log", json_output=True)
+    check_packaging_report(report, efi_digest, image.stat().st_size)
+    save_json(directory / "packaging.json", report)
+    local_disk_boot(image, "vpc", directory, ovmf_code, ovmf_vars,
+                    qemu, args.expect, args.timeout)
+    if image_sha256(image) != image_digest:
+        raise ValueError("VHD changed during read-only preflight or local boot")
+    state.update(
+        phase="prepared", image_sha256=image_digest,
+        local_platform_boot=True, raw_sha256=raw_digest,
+    )
+    save_json(state_path, state)
+    return directory
 
 
 def check_subscription(location, vm_size):
@@ -321,7 +481,7 @@ class AzureRun:
                 text = self.az([
                     "vm", "boot-diagnostics", "get-boot-log",
                     "--resource-group", self.group, "--name", self.vm,
-                ], private=True, raw=True,
+                ], private=True,
                     timeout=max(1, min(120, deadline - time.monotonic())))
             except AzureCliError as error:
                 if error.code not in ("BlobNotFound", "BootDiagnosticsInformationNotAvailable"):
@@ -329,10 +489,12 @@ class AzureRun:
                 print(f"Serial console is not ready: {error.code}", file=sys.stderr)
                 self.record("waiting-for-boot", serial_wait_code=error.code)
             else:
+                if not isinstance(text, str):
+                    raise RuntimeError("Azure CLI did not return a JSON serial-log string")
                 if len(text.encode("utf-8")) > 4 * 1024 * 1024:
                     raise RuntimeError("Serial log exceeded the 4 MiB evidence limit")
                 (self.state_path.parent / "serial.log").write_text(text)
-                result = inspect_boot_log(text)
+                result = inspect_boot_log(text, self.state["platform_marker"])
                 save_json(self.state_path.parent / "acceptance.json", result)
                 if result["crashes"] or (stage == "io" and result["failures"]):
                     raise RuntimeError("Guest reported an acceptance failure; see serial.log")
@@ -345,14 +507,14 @@ class AzureRun:
         )
 
 
-def inspect_boot_log(text):
+def inspect_boot_log(text, platform_marker=PLATFORM_READY):
     lines = [
         ANSI_ESCAPE.sub("", line).replace("\0", "").strip()
         for line in text.splitlines()
     ]
     positions = {
         marker: lines.index(marker)
-        for marker in (PLATFORM_READY, BLOCK_READY, NETWORK_READY, IO_READY)
+        for marker in (platform_marker, BLOCK_READY, NETWORK_READY, IO_READY)
         if marker in lines
     }
     crashes = [
@@ -374,16 +536,16 @@ def inspect_boot_log(text):
     )
     complete = all(
         marker in positions
-        for marker in (PLATFORM_READY, BLOCK_READY, NETWORK_READY, IO_READY)
+        for marker in (platform_marker, BLOCK_READY, NETWORK_READY, IO_READY)
     )
     ordered = complete and (
-        positions[PLATFORM_READY] < positions[BLOCK_READY] < positions[IO_READY]
-        and positions[PLATFORM_READY] < positions[NETWORK_READY] < positions[IO_READY]
+        positions[platform_marker] < positions[BLOCK_READY] < positions[IO_READY]
+        and positions[platform_marker] < positions[NETWORK_READY] < positions[IO_READY]
     )
     if IO_READY in positions and not ordered:
         failures.append("I/O-ready marker is missing its preceding stage markers")
     return {
-        "platform_ready": PLATFORM_READY in positions and not crashes,
+        "platform_ready": platform_marker in positions and not crashes,
         "block_read": BLOCK_READY in positions and not crashes,
         "network_exchange": NETWORK_READY in positions and not crashes,
         "io_ready": bool(ordered and not crashes and not failures),
@@ -416,6 +578,20 @@ def run_prepared(directory, stage, timeout, keep_resources):
             run.cleanup()
 
 
+def cleanup_state(directory):
+    state, path = load_state(directory)
+    if "subscription" not in state:
+        if (
+            state.get("phase") not in ("preparing", "prepared", "cleaned")
+            or "disk_id" in state or "vm_id" in state
+        ):
+            raise ValueError("Incomplete Azure ownership state; subscription is missing")
+        state["phase"] = "cleaned"
+        save_json(path, state)
+        return
+    AzureRun(state, path).cleanup()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unikraft Hyper-V/Azure acceptance evidence"
@@ -424,6 +600,20 @@ def main():
     inspect = subparsers.add_parser("inspect-log")
     inspect.add_argument("log", type=Path)
     inspect.add_argument("--stage", choices=("platform", "io"), default="io")
+    inspect.add_argument("--expect", default=PLATFORM_READY)
+    prepare = subparsers.add_parser("prepare")
+    prepare.add_argument("--efi", type=Path, required=True)
+    prepare.add_argument("--miz", type=Path, required=True)
+    prepare.add_argument("--state-dir", type=Path, required=True)
+    prepare.add_argument("--ovmf-code", type=Path, required=True)
+    prepare.add_argument("--ovmf-vars", type=Path, required=True)
+    prepare.add_argument("--qemu", default="qemu-system-x86_64")
+    prepare.add_argument("--expect", default=PLATFORM_READY)
+    prepare.add_argument("--timeout", type=int, default=30)
+    prepare.add_argument("--location", default="westus2")
+    prepare.add_argument("--vm-size", default="Standard_D2s_v5", choices=(
+        "Standard_D2s_v5", "Standard_D2as_v5", "Standard_B2s",
+    ))
     run = subparsers.add_parser("run")
     run.add_argument("--state-dir", type=Path, required=True)
     run.add_argument("--stage", choices=("platform", "io"), default="io")
@@ -434,10 +624,13 @@ def main():
     args = parser.parse_args()
     try:
         if args.action == "inspect-log":
-            result = inspect_boot_log(args.log.read_text(errors="replace"))
+            result = inspect_boot_log(args.log.read_text(errors="replace"), args.expect)
             print(json.dumps(result, indent=2))
             if not result[f"{args.stage}_ready"]:
                 raise SystemExit(1)
+        elif args.action == "prepare":
+            directory = prepare_image(args)
+            print(f"Image prepared and locally booted; private run state: {directory}")
         elif args.action == "run":
             if not 30 <= args.timeout <= 1800:
                 parser.error("--timeout must be between 30 and 1800 seconds")
@@ -446,9 +639,8 @@ def main():
             )
             print(json.dumps(result, indent=2))
         elif args.action == "cleanup":
-            state, path = load_state(args.state_dir)
-            AzureRun(state, path).cleanup()
-            print("Owned Azure resources have been deleted")
+            cleanup_state(args.state_dir)
+            print("No Azure resources remain for this run")
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
         raise SystemExit(str(error)) from None
 
