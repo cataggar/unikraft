@@ -114,15 +114,20 @@ struct storvsc_device {
 };
 
 static struct storvsc_device storvsc_devices[CONFIG_LIBSTORVSC_MAX_DEVICES];
+#if CONFIG_LIBSTORVSC_LUN_DISCOVERY
+#define STORVSC_LUN_DISCOVERY_DEFAULT 1
+#else
+#define STORVSC_LUN_DISCOVERY_DEFAULT 0
+#endif
 #ifdef STORVSC_HOST_TEST
 static unsigned int storvsc_send_wait_limit = STORVSC_SEND_WAIT_LIMIT;
 static unsigned int storvsc_busy_retry_limit = STORVSC_BUSY_RETRY_LIMIT;
 static __u64 storvsc_busy_retry_timeout_ns =
 	STORVSC_BUSY_RETRY_TIMEOUT_NS;
 static int storvsc_lun_discovery_enabled =
-	CONFIG_LIBSTORVSC_LUN_DISCOVERY;
+	STORVSC_LUN_DISCOVERY_DEFAULT;
 #else
-#define storvsc_lun_discovery_enabled CONFIG_LIBSTORVSC_LUN_DISCOVERY
+#define storvsc_lun_discovery_enabled STORVSC_LUN_DISCOVERY_DEFAULT
 #endif
 
 _Static_assert(CONFIG_LIBSTORVSC_MAX_DEVICES == 1,
