@@ -19,6 +19,11 @@ struct hyperv_acceptance_dhcp_offer {
 	uint8_t has_server_identifier;
 };
 
+static inline size_t hyperv_acceptance_buffer_alignment(size_t ioalign)
+{
+	return ioalign < sizeof(void *) ? sizeof(void *) : ioalign;
+}
+
 size_t hyperv_acceptance_build_discover(uint8_t *frame, size_t capacity,
 					const uint8_t mac[6], uint32_t xid);
 

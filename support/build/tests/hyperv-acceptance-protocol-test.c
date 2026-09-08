@@ -200,9 +200,28 @@ static int test_storage_and_gating(void)
 	return 0;
 }
 
+static int test_buffer_alignment(void)
+{
+	static const size_t alignments[] = { 0, 1, 2, 4, 8, 64, 4096 };
+	size_t index;
+
+	for (index = 0; index < sizeof(alignments) / sizeof(alignments[0]);
+	     index++) {
+		size_t alignment =
+			hyperv_acceptance_buffer_alignment(alignments[index]);
+
+		CHECK(alignment >= alignments[index]);
+		CHECK(alignment >= sizeof(void *));
+		CHECK(alignment % sizeof(void *) == 0);
+	}
+	CHECK(hyperv_acceptance_buffer_alignment(1) == sizeof(void *));
+	CHECK(hyperv_acceptance_buffer_alignment(4096) == 4096);
+	return 0;
+}
+
 int main(void)
 {
-	if (test_dhcp() || test_storage_and_gating())
+	if (test_dhcp() || test_storage_and_gating() || test_buffer_alignment())
 		return 1;
 	puts("hyperv acceptance protocol tests passed");
 	return 0;

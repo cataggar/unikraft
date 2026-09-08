@@ -388,7 +388,7 @@ static enum hyperv_acceptance_result probe_network(
 		return HYPERV_ACCEPTANCE_FAIL;
 	}
 	rx_context.allocator = uk_alloc_get_default();
-	rx_context.alignment = info.ioalign ? info.ioalign : sizeof(void *);
+	rx_context.alignment = hyperv_acceptance_buffer_alignment(info.ioalign);
 	if (!rx_context.allocator) {
 		printf("HYPERV_ACCEPTANCE NETWORK_DHCP_TX FAIL "
 		       "reason=no-allocator\n");
