@@ -1572,6 +1572,19 @@ fn registerNativeGraph(
         nativeConfigEnabled(loaded, "CONFIG_LIBUKLIBPARAM")
     else
         false;
+    const enable_lwip = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBLWIP")
+    else
+        false;
+    const enable_ukrandom_lcpu = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBUKRANDOM_LCPU")
+    else
+        false;
+    const lwip_root = if (enable_lwip and
+        context.external_libraries.len == 1)
+        context.external_libraries[0]
+    else
+        null;
     const registration = b.allocator.create(native_image_graph.RegisteredGraph) catch {
         step.dependOn(&b.addFail("unable to allocate the native QEMU graph").step);
         return null;
@@ -1587,6 +1600,9 @@ fn registerNativeGraph(
         .enable_ukblkdev = enable_ukblkdev,
         .enable_storvsc = enable_storvsc,
         .enable_uklibparam = enable_uklibparam,
+        .enable_lwip = enable_lwip,
+        .enable_ukrandom_lcpu = enable_ukrandom_lcpu,
+        .lwip_root = lwip_root,
     }) catch |err| {
         step.dependOn(&b.addFail(b.fmt(
             "unable to register native QEMU graph '{s}': {s}",

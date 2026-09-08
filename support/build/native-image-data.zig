@@ -19,6 +19,7 @@ pub const Library = struct {
     archives: []const Path = &.{},
     linker_scripts: []const Path = &.{},
     export_symbols: ?Path = null,
+    localize_symbols: ?Path = null,
 };
 
 pub const Profile = struct {
@@ -125,6 +126,87 @@ pub const x86_64_efi_netvsc = Library{
     .objects = &.{
         "libnetvsc/netvsc.o",
         "libnetvsc/libinfo.libuklibid.o",
+    },
+};
+
+pub const x86_64_efi_hyperv_acceptance_app = Library{
+    .name = "apphelloworld",
+    .origin = .application,
+    .objects = &.{
+        "apphelloworld/main.o",
+        "apphelloworld/acceptance_protocol.o",
+        "apphelloworld/application_protocol.o",
+        "apphelloworld/application_network.o",
+        "apphelloworld/libinfo.libuklibid.o",
+    },
+};
+
+pub const x86_64_efi_ukrandom = Library{
+    .name = "libukrandom",
+    .origin = .library,
+    .objects = &.{
+        "libukrandom/chacha.o",
+        "libukrandom/swrand.o",
+        "libukrandom/random.o",
+        "libukrandom/libinfo.libuklibid.o",
+    },
+};
+
+pub const x86_64_efi_ukrandom_lcpu = Library{
+    .name = "libukrandom_lcpu",
+    .origin = .driver,
+    .objects = &.{
+        "libukrandom_lcpu/init.o",
+        "libukrandom_lcpu/random.o",
+        "libukrandom_lcpu/libinfo.libuklibid.o",
+    },
+    .localize_symbols = .{
+        .root = .base,
+        .relative = "support/build/symbols/libukrandom-lcpu.localize",
+    },
+};
+
+pub const x86_64_efi_lwip = Library{
+    .name = "liblwip",
+    .origin = .library,
+    .objects = &.{
+        "liblwip/alloc.unikraft.o",
+        "liblwip/init.unikraft.o",
+        "liblwip/time.unikraft.o",
+        "liblwip/init.o",
+        "liblwip/def.o",
+        "liblwip/inet_chksum.o",
+        "liblwip/ip.o",
+        "liblwip/mem.o",
+        "liblwip/memp.o",
+        "liblwip/netif.o",
+        "liblwip/pbuf.o",
+        "liblwip/raw.o",
+        "liblwip/stats.o",
+        "liblwip/sys.o",
+        "liblwip/timeouts.o",
+        "liblwip/tcp.o",
+        "liblwip/tcp_in.o",
+        "liblwip/tcp_out.o",
+        "liblwip/udp.o",
+        "liblwip/api_lib.o",
+        "liblwip/api_msg.o",
+        "liblwip/err.o",
+        "liblwip/netbuf.o",
+        "liblwip/netdb.o",
+        "liblwip/netifapi.o",
+        "liblwip/tcpip.o",
+        "liblwip/if_api.o",
+        "liblwip/ethernet.o",
+        "liblwip/netbuf.unikraft.o",
+        "liblwip/uknetdev.unikraft.o",
+        "liblwip/etharp.o",
+        "liblwip/ip4_frag.o",
+        "liblwip/ip4.o",
+        "liblwip/ip4_addr.o",
+        "liblwip/icmp.o",
+        "liblwip/dhcp.o",
+        "liblwip/libinfo.libuklibid.o",
     },
 };
 

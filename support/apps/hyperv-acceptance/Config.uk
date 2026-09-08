@@ -13,3 +13,39 @@ menuconfig APPHYPERVACCEPTANCE
 	select LIBNETVSC
 	help
 	  Probe real Hyper-V StorVSC and NetVSC I/O without modifying storage.
+
+if APPHYPERVACCEPTANCE
+
+config APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+	bool "Run stack-backed private-peer networking acceptance"
+	depends on LIBLWIP && LWIP_NOTHREADS && LWIP_DHCP && LWIP_TCP && LWIP_UDP
+	help
+	  Replace the default raw DHCP Offer smoke with bounded DHCP lease,
+	  ARP, TCP, and UDP acceptance through the official lib-lwip stack.
+
+config APPHYPERVACCEPTANCE_PEER_IPV4
+	string "Private peer IPv4 address"
+	default "10.87.0.4"
+	depends on APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+
+config APPHYPERVACCEPTANCE_PEER_TCP_PORT
+	int "Private peer TCP port"
+	range 1 65535
+	default 18887
+	depends on APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+
+config APPHYPERVACCEPTANCE_PEER_UDP_PORT
+	int "Private peer UDP port"
+	range 1 65535
+	default 18888
+	depends on APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+
+config APPHYPERVACCEPTANCE_NONCE
+	string "Acceptance nonce (16 hexadecimal digits)"
+	default "87c0ffee5aa8dfd6"
+	depends on APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+	help
+	  Run-manifest nonce encoded as exactly 16 hexadecimal digits without
+	  a 0x prefix. Invalid values fail before any network traffic.
+
+endif

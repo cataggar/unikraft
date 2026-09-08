@@ -29,6 +29,9 @@ pub const Options = struct {
     enable_ukblkdev: bool = false,
     enable_storvsc: bool = false,
     enable_uklibparam: bool = false,
+    enable_lwip: bool = false,
+    enable_ukrandom_lcpu: bool = false,
+    lwip_root: ?[]const u8 = null,
 };
 
 pub fn parseProfile(name: []const u8) error{UnsupportedConfiguration}!Profile {
@@ -180,6 +183,18 @@ fn registerLibraries(
             );
             continue;
         }
+        if (hasNetvsc(options.profile) and
+            std.mem.eql(u8, library.name, "apphelloworld"))
+        {
+            try registerLibrary(
+                context,
+                allocator,
+                options,
+                data.x86_64_efi_hyperv_acceptance_app,
+                &.{},
+            );
+            continue;
+        }
         if (isHyperv(options.profile)) {
             if (std.mem.eql(u8, library.name, "libukallocstack")) {
                 try registerLibrary(context, allocator, options, data.x86_64_efi_libraries[0], &.{});
@@ -314,6 +329,33 @@ fn registerLibraries(
                     .pic = true,
                 }},
             );
+            if (options.enable_lwip) {
+                if (options.lwip_root == null)
+                    return error.UnsupportedConfiguration;
+                try registerLibrary(
+                    context,
+                    allocator,
+                    options,
+                    data.x86_64_efi_ukrandom,
+                    &.{},
+                );
+                if (options.enable_ukrandom_lcpu) {
+                    try registerLibrary(
+                        context,
+                        allocator,
+                        options,
+                        data.x86_64_efi_ukrandom_lcpu,
+                        &.{},
+                    );
+                }
+                try registerLibrary(
+                    context,
+                    allocator,
+                    options,
+                    data.x86_64_efi_lwip,
+                    &.{},
+                );
+            }
         }
     }
 }
@@ -377,21 +419,45 @@ fn registerLibrary(
         try allocator.dupe([]const u8, &.{try resolvePath(allocator, roots, symbol)})
     else
         &.{};
-    const transform_sequence = if (library.export_symbols) |symbol|
-        try allocator.dupe(component.ObjectTransformItem, &.{.{ .symbol_file = .{
+    const transform_count: usize =
+        @as(usize, @intFromBool(library.export_symbols != null)) +
+        @as(usize, @intFromBool(library.localize_symbols != null));
+    const transform_sequence = try allocator.alloc(
+        component.ObjectTransformItem,
+        transform_count,
+    );
+    var transform_index: usize = 0;
+    if (library.export_symbols) |symbol| {
+        transform_sequence[transform_index] = .{ .symbol_file = .{
             .action = .keep_global,
             .symbols_file = try resolvePath(allocator, roots, symbol),
             .provenance = .library_local,
-        } }})
-    else
-        &.{};
+        } };
+        transform_index += 1;
+    }
+    if (library.localize_symbols) |symbol| {
+        transform_sequence[transform_index] = .{ .symbol_file = .{
+            .action = .localize,
+            .symbols_file = try resolvePath(allocator, roots, symbol),
+            .provenance = .library_local,
+        } };
+        transform_index += 1;
+    }
+    std.debug.assert(transform_index == transform_count);
     const linker_scripts = try resolveRegisteredPaths(
         allocator,
         roots,
         library.linker_scripts,
     );
     const archives = try resolveRegisteredPaths(allocator, roots, library.archives);
-    const origin: component.Origin = switch (library.origin) {
+    const origin: component.Origin = if (std.mem.eql(
+        u8,
+        library.name,
+        "liblwip",
+    )) .{ .external = .{
+        .package_name = "lwip",
+        .root = options.lwip_root.?,
+    } } else switch (library.origin) {
         .application => .{ .external = .{
             .package_name = "helloworld",
             .root = roots.app,
@@ -1187,6 +1253,82 @@ test "Hyper-V NetVSC profile registers protocol and uknetdev" {
         );
     }
     try std.testing.expect(saw_libparam_script);
+}
+
+test "Hyper-V application networking registers pinned stack inputs" {
+    var registered = try RegisteredGraph.init(std.testing.allocator, .{
+        .roots = .{
+            .base = "/src/unikraft",
+            .app = "/src/hyperv-acceptance",
+            .output = "/build",
+            .config = "/build/.config",
+        },
+        .profile = .@"hyperv-x86_64-efi-netvsc",
+        .enable_lwip = true,
+        .enable_ukrandom_lcpu = true,
+        .lwip_root = "/deps/lib-lwip",
+    });
+    defer registered.deinit();
+
+    var application: ?component.Library = null;
+    var lwip: ?component.Library = null;
+    var saw_random = false;
+    var saw_random_lcpu = false;
+    for (registered.graph.libraries) |library| {
+        if (std.mem.eql(u8, library.name, "apphelloworld"))
+            application = library;
+        if (std.mem.eql(u8, library.name, "liblwip"))
+            lwip = library;
+        saw_random = saw_random or
+            std.mem.eql(u8, library.name, "libukrandom");
+        saw_random_lcpu = saw_random_lcpu or
+            std.mem.eql(u8, library.name, "libukrandom_lcpu");
+    }
+    const app = application orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 5), app.raw_objects.len);
+    try std.testing.expectEqualStrings(
+        "/build/apphelloworld/application_network.o",
+        app.raw_objects[3].path,
+    );
+    const stack = lwip orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        data.x86_64_efi_lwip.objects.len,
+        stack.raw_objects.len,
+    );
+    try std.testing.expect(stack.origin == .external);
+    try std.testing.expectEqualStrings("lwip", stack.origin.external.package_name);
+    try std.testing.expectEqualStrings(
+        "/deps/lib-lwip",
+        stack.origin.external.root,
+    );
+    try std.testing.expect(saw_random);
+    try std.testing.expect(saw_random_lcpu);
+    for (registered.graph.libraries) |library| {
+        if (!std.mem.eql(u8, library.name, "libukrandom_lcpu"))
+            continue;
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            library.object_pipeline.?.transform.sequence.len,
+        );
+        try std.testing.expect(
+            library.object_pipeline.?.transform.sequence[0].symbol_file.action ==
+                .localize,
+        );
+    }
+
+    try std.testing.expectError(
+        error.UnsupportedConfiguration,
+        RegisteredGraph.init(std.testing.allocator, .{
+            .roots = .{
+                .base = "/src/unikraft",
+                .app = "/src/hyperv-acceptance",
+                .output = "/build",
+                .config = "/build/.config",
+            },
+            .profile = .@"hyperv-x86_64-efi-netvsc",
+            .enable_lwip = true,
+        }),
+    );
 }
 
 test "registered profiles match normalized Make graph fixtures" {
