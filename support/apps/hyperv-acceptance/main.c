@@ -246,6 +246,7 @@ static enum hyperv_acceptance_result probe_storage(
 	printf("HYPERV_ACCEPTANCE STORAGE_READ PASS bytes=%zu "
 	       "sector_size=%zu mbr=%d gpt=%d\n", bytes,
 	       capabilities->ssize, mbr, gpt);
+	puts("UK_HYPERV_BLOCK_READ_OK");
 	return HYPERV_ACCEPTANCE_PASS;
 }
 
@@ -484,6 +485,7 @@ static enum hyperv_acceptance_result probe_network(
 				       offer.server_identifier[1],
 				       offer.server_identifier[2],
 				       offer.server_identifier[3], received);
+				puts("UK_HYPERV_NET_DHCP_OFFER");
 				return HYPERV_ACCEPTANCE_PASS;
 			}
 			if (rc < 0)
@@ -515,14 +517,32 @@ int main(void)
 
 	printf("HYPERV_ACCEPTANCE PLATFORM_READY PASS cpu_count=1 "
 	       "vmbus_offers=%u\n", vmbus_device_count());
+	puts("UK_HYPERV_PLATFORM_READY");
 	count_vmbus_classes(&storage_offers, &network_offers);
 	wait_for_target_bindings(storage_offers, network_offers);
 	storage = probe_storage(storage_offers);
 	network = probe_network(network_offers);
 	final = hyperv_acceptance_final_result(storage, network);
-	if (final == HYPERV_ACCEPTANCE_PASS)
+	if (final == HYPERV_ACCEPTANCE_PASS) {
 		printf("HYPERV_ACCEPTANCE HARDWARE_IO_READY PASS "
 		       "storage=PASS network=PASS\n");
+		puts("UK_HYPERV_IO_READY");
+	} else if (final == HYPERV_ACCEPTANCE_FAIL) {
+		if (storage == HYPERV_ACCEPTANCE_FAIL &&
+		    network == HYPERV_ACCEPTANCE_FAIL)
+			puts("UK_HYPERV_ACCEPTANCE_FAIL:storage+network");
+		else if (storage == HYPERV_ACCEPTANCE_FAIL)
+			puts("UK_HYPERV_ACCEPTANCE_FAIL:storage");
+		else
+			puts("UK_HYPERV_ACCEPTANCE_FAIL:network");
+	} else if (storage == HYPERV_ACCEPTANCE_UNAVAILABLE &&
+		   network == HYPERV_ACCEPTANCE_UNAVAILABLE) {
+		puts("UK_HYPERV_ACCEPTANCE_UNAVAILABLE:storage+network");
+	} else if (storage == HYPERV_ACCEPTANCE_UNAVAILABLE) {
+		puts("UK_HYPERV_ACCEPTANCE_UNAVAILABLE:storage");
+	} else {
+		puts("UK_HYPERV_ACCEPTANCE_UNAVAILABLE:network");
+	}
 	printf("HYPERV_ACCEPTANCE FINAL_RESULT %s storage=%s network=%s\n",
 	       result_name(final), result_name(storage), result_name(network));
 	fflush(stdout);

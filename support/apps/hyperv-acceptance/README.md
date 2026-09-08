@@ -11,6 +11,17 @@ Hyper-V guest:
 - emits `HYPERV_ACCEPTANCE HARDWARE_IO_READY PASS` only after both real I/O
   stages pass.
 
+Azure Boot Diagnostics consumers can use these stable, exact lines:
+
+- `UK_HYPERV_PLATFORM_READY`
+- `UK_HYPERV_BLOCK_READ_OK`
+- `UK_HYPERV_NET_DHCP_OFFER`
+- `UK_HYPERV_IO_READY`
+- `UK_HYPERV_ACCEPTANCE_FAIL:<reason>`
+- `UK_HYPERV_ACCEPTANCE_UNAVAILABLE:<reason>`
+
+`UK_HYPERV_IO_READY` is never emitted for failed or unavailable hardware.
+
 An environment without StorVSC or NetVSC returns 2 (`UNAVAILABLE`); a present
 device that cannot bind, configure, complete I/O, or meet the timeout returns 1.
 The probe never writes to a block device.
