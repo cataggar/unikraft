@@ -57,10 +57,6 @@ def azure_cli(arguments, *, subscription=None, private=False, env=None,
     environment["AZURE_CORE_COLLECT_TELEMETRY"] = "false"
     environment["AZURE_LOGGING_ENABLE_LOG_FILE"] = "false"
     environment["AZURE_EXTENSION_USE_DYNAMIC_INSTALL"] = "no"
-    if arguments[:3] == ["storage", "blob", "upload"]:
-        for name in tuple(environment):
-            if name.startswith("AZURE_STORAGE_"):
-                del environment[name]
     if env:
         environment.update(env)
     result = subprocess.run(
@@ -143,6 +139,51 @@ def upload_endpoint(sas):
     ):
         raise ValueError("Expected an Azure public-cloud HTTPS Blob SAS endpoint")
     return urlunsplit(parsed._replace(query="")), parsed.query
+
+
+def disk_access_sas(grant):
+    if not isinstance(grant, dict):
+        raise ValueError("Azure CLI returned an invalid disk-access response")
+    values = [grant[key] for key in ("accessSAS", "accessSas") if key in grant]
+    if not values or any(not isinstance(value, str) or not value for value in values):
+        raise ValueError("Azure CLI disk-access response has no valid SAS field")
+    if any(value != values[0] for value in values[1:]):
+        raise ValueError("Azure CLI disk-access response has conflicting SAS fields")
+    return values[0]
+
+
+def upload_helper(arguments, *, sas=None, timeout=1200):
+    environment = {
+        name: value for name, value in os.environ.items()
+        if not name.startswith("AZURE_STORAGE_")
+    }
+    if sas is not None:
+        environment["AZURE_STORAGE_SAS_TOKEN"] = sas
+    result = subprocess.run(
+        [sys.executable, str(SUPPORT / "scripts/hyperv-azure-upload.py"), *arguments],
+        stdin=subprocess.DEVNULL, capture_output=True,
+        text=True, encoding="utf-8", errors="replace", env=environment,
+        timeout=timeout, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(f"Managed-disk upload helper failed: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+def check_upload_dependencies():
+    result = upload_helper(["--check-dependencies"], timeout=30)
+    if not isinstance(result, dict) or result.get("available") is not True:
+        raise RuntimeError("Managed-disk upload dependencies are unavailable")
+
+
+def upload_managed_vhd(image, endpoint, sas):
+    report = upload_helper(["--image", str(image), "--endpoint", endpoint], sas=sas)
+    if (
+        not isinstance(report, dict)
+        or report.get("uploaded_bytes") != image.stat().st_size
+        or report.get("footer_matches") is not True
+    ):
+        raise RuntimeError("Managed-disk page upload did not verify the expected image")
 
 
 def check_packaging_report(report, efi_sha256, file_size):
@@ -420,13 +461,9 @@ class AzureRun:
                 "--name", self.disk, "--access-level", "Write",
                 "--duration-in-seconds", "1800",
             ], private=True)
-            endpoint, sas = upload_endpoint(grant["accessSas"])
-            self.az([
-                "storage", "blob", "upload", "--blob-url", endpoint,
-                "--file", str(image), "--type", "page", "--overwrite", "true",
-                "--validate-content", "--max-connections", "2", "--no-progress",
-            ], private=True, env={"AZURE_STORAGE_SAS_TOKEN": sas}, timeout=1200)
-        except (AzureCliError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+            endpoint, sas = upload_endpoint(disk_access_sas(grant))
+            upload_managed_vhd(image, endpoint, sas)
+        except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print(f"Disk upload did not complete: {error}", file=sys.stderr)
             raise
         finally:
@@ -577,6 +614,7 @@ def run_prepared(directory, stage, timeout, keep_resources):
     image = state_path.parent / "unikraft.vhd"
     if image_sha256(image) != state["image_sha256"]:
         raise ValueError("Prepared VHD has changed since the local boot")
+    check_upload_dependencies()
     state["subscription"] = check_subscription(state["location"], state["vm_size"])
     save_json(state_path, state)
     run = AzureRun(state, state_path)

@@ -12,6 +12,8 @@ storage/network pass.
   boot logging enabled.
 - A `miz` build providing `build-efi-application` and the
   `check-efi-application` version-1 `miz.efi-application-image` JSON contract.
+  These APIs and their reviewed hardening are available at
+  [`2db68ca0c3ab12155012a823c3fb8d7aba1cb544`][miz-revision].
   Generic `miz check`/`info` do not validate the embedded EFI payload, and
   `miz azure fixup` can modify an image; neither substitutes for this gate.
 - QEMU with KVM, `vmbus-bridge`, and `hv-balloon`, plus x86-64 OVMF code and
@@ -19,6 +21,19 @@ storage/network pass.
 - For `run` only: an authenticated Azure CLI public-cloud subscription with
   Compute/Network already registered, Compute API `2025-11-01`, and available
   regional/family quota for the selected two-vCPU size.
+- For `run` only: the Azure Blob SDK in the controller's Python environment;
+  the working version is pinned in `support/azure/requirements.txt`.
+  Dependencies are checked before creating resources. An Azure CLI Python
+  installation may already provide it; otherwise use a private environment:
+
+```shell
+python3 -m venv "$PWD/.d/azure-python"
+. "$PWD/.d/azure-python/bin/activate"
+mkdir -p "$PWD/.d/azure-python/tmp"
+TMPDIR="$PWD/.d/azure-python/tmp" \
+PIP_CACHE_DIR="$PWD/.d/azure-python/pip-cache" \
+python3 -m pip install -r support/azure/requirements.txt
+```
 
 The controller does not register providers or subscription-wide preview
 features, install tools/extensions, provision a guest agent, generate SSH keys,
@@ -67,7 +82,14 @@ python3 support/scripts/hyperv-azure.py run \
 
 The VHD digest is checked before and after upload. The controller creates one
 uniquely named resource group and a Gen2 Linux managed disk, grants short-lived
-write access, uploads the page blob, and always revokes access. SAS credentials
+write access, writes the already-created page blob, and always revokes access.
+The SDK helper uses bounded 4 MiB page updates with service-verified checksums
+and reads back the final 512 bytes before import. It never calls Create Page
+Blob and does not rely on the ordinary `az storage blob upload` path, which
+returned `ApiNotSupportedForAccount` against the managed-disk service. The helper
+runs in a subprocess with a 1,200-second total timeout.
+
+SAS credentials
 are confined to process memory/environment, not arguments, state files or
 command logs. The VM attaches this specialized disk without an `osProfile`,
 uses private networking without a public IP or default Internet egress, and
@@ -137,3 +159,4 @@ stress testing, and production readiness remain separate milestones.
 
 [trusted-launch]: https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-faq#can-i-disable-trusted-launch-for-a-new-vm-deployment
 [upload]: https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-upload-vhd-to-managed-disk-cli
+[miz-revision]: https://github.com/cataggar/miz/commit/2db68ca0c3ab12155012a823c3fb8d7aba1cb544

@@ -1,15 +1,74 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import importlib
+import io
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 SUPPORT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SUPPORT / "scripts"))
 azure = importlib.import_module("hyperv-azure")
+uploader = importlib.import_module("hyperv-azure-upload")
+
+
+class UploadFailure(Exception):
+    error_code = "UploadFailed"
+
+
+class HypervAzurePageUploadTest(unittest.TestCase):
+    def test_precreated_disk_uses_page_updates_and_exact_footer_readback(self):
+        footer = b"conectix" + b"\0" * 504
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / "image.vhd"
+            image.write_bytes(b"\0" * uploader.PAGE_CHUNK + footer)
+            factory = mock.Mock()
+            client = mock.MagicMock()
+            factory.from_blob_url.return_value = client
+            client.__enter__.return_value = client
+            client.download_blob.return_value.readall.return_value = footer
+            with mock.patch.object(uploader, "storage_sdk", return_value=(factory, UploadFailure)):
+                report = uploader.upload_pages(
+                    image, "https://md.blob.storage.azure.net:8443/disk/image", "sig=secret"
+                )
+            self.assertEqual(report["uploaded_bytes"], uploader.PAGE_CHUNK + 512)
+            self.assertTrue(report["footer_matches"])
+            self.assertEqual(client.upload_page.call_count, 2)
+            self.assertEqual(client.upload_page.call_args_list[0].args[1:], (0, uploader.PAGE_CHUNK))
+            self.assertEqual(client.upload_page.call_args_list[1].args[1:], (uploader.PAGE_CHUNK, 512))
+            for call in client.upload_page.call_args_list:
+                self.assertTrue(call.kwargs["validate_content"])
+            client.create_page_blob.assert_not_called()
+            client.upload_blob.assert_not_called()
+            client.download_blob.assert_called_once_with(
+                offset=uploader.PAGE_CHUNK, length=512,
+                validate_content=True, max_concurrency=1,
+            )
+
+    def test_readback_mismatch_and_sdk_error_cannot_report_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / "image.vhd"
+            image.write_bytes(b"conectix" + b"\0" * 504)
+            factory = mock.Mock()
+            client = mock.MagicMock()
+            factory.from_blob_url.return_value = client
+            client.__enter__.return_value = client
+            client.download_blob.return_value.readall.return_value = b"\0" * 512
+            with mock.patch.object(uploader, "storage_sdk", return_value=(factory, UploadFailure)):
+                with self.assertRaisesRegex(ValueError, "footer does not match"):
+                    uploader.upload_pages(
+                        image, "https://md.blob.storage.azure.net/disk/image", "sig=secret"
+                    )
+                client.upload_page.side_effect = UploadFailure("failed at ?sig=secret")
+                with self.assertRaises(RuntimeError) as error:
+                    uploader.upload_pages(
+                        image, "https://md.blob.storage.azure.net/disk/image", "sig=secret"
+                    )
+                self.assertIn("UploadFailed", str(error.exception))
+                self.assertNotIn("secret", str(error.exception))
 
 
 class HypervAzurePackagingTest(unittest.TestCase):
@@ -105,31 +164,33 @@ class HypervAzureControllerTest(unittest.TestCase):
         run.cleanup()
         run.record.assert_called_once_with("cleaned")
 
-    def test_upload_failure_always_revokes_disk_access(self):
+    @mock.patch.object(azure, "upload_managed_vhd", side_effect=RuntimeError("upload failed"))
+    def test_upload_failure_always_revokes_disk_access(self, upload):
         run = self.run_fixture()
         run.az.side_effect = [
             self.disk_fixture(run),
             {"accessSas": "https://disk.blob.core.windows.net/path?sig=secret"},
-            RuntimeError("upload failed"), None,
+            None,
         ]
         image = mock.Mock()
         image.stat.return_value.st_size = 67109376
-        with self.assertRaisesRegex(RuntimeError, "upload failed"):
-            run.upload_disk(image)
+        with mock.patch.object(azure.sys, "stderr", io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "upload failed"):
+                run.upload_disk(image)
         self.assertEqual(run.az.call_args.args[0][:2], ["disk", "revoke-access"])
-        upload = run.az.call_args_list[2]
-        self.assertNotIn("secret", " ".join(upload.args[0]))
-        self.assertEqual(upload.kwargs["env"]["AZURE_STORAGE_SAS_TOKEN"], "sig=secret")
-        self.assertTrue(upload.kwargs["private"])
+        upload.assert_called_once_with(
+            image, "https://disk.blob.core.windows.net/path", "sig=secret"
+        )
 
-    def test_unimported_disk_cannot_advance_to_deployment(self):
+    @mock.patch.object(azure, "upload_managed_vhd")
+    def test_unimported_disk_cannot_advance_to_deployment(self, upload):
         run = self.run_fixture()
         incomplete = self.disk_fixture(run)
         incomplete["diskState"] = "ReadyToUpload"
         run.az.side_effect = [
             self.disk_fixture(run),
             {"accessSas": "https://disk.blob.core.windows.net/path?sig=secret"},
-            None, None, incomplete,
+            None, incomplete,
         ]
         image = mock.Mock()
         image.stat.return_value.st_size = 67109376
@@ -179,6 +240,21 @@ class HypervAzureControllerTest(unittest.TestCase):
                 self.assertEqual(endpoint, f"https://{host}/path")
                 self.assertEqual(sas, "sig=secret")
 
+    def test_disk_access_response_supports_cli_and_rest_sas_spellings(self):
+        for key in ("accessSAS", "accessSas"):
+            with self.subTest(key=key):
+                self.assertEqual(azure.disk_access_sas({key: "expected"}), "expected")
+        self.assertEqual(azure.disk_access_sas({
+            "accessSAS": "expected", "accessSas": "expected",
+        }), "expected")
+        for grant in (
+            None, {}, {"accessSAS": None}, {"accessSAS": 1},
+            {"accessSAS": ""}, {"accessSAS": "first", "accessSas": "second"},
+        ):
+            with self.subTest(grant=grant):
+                with self.assertRaises(ValueError):
+                    azure.disk_access_sas(grant)
+
     @mock.patch.object(azure.subprocess, "run")
     def test_managed_serial_json_preserves_lines(self, execute):
         serial = "\n".join((
@@ -204,20 +280,19 @@ class HypervAzureControllerTest(unittest.TestCase):
         self.assertNotIn("secret", str(error.exception))
 
     @mock.patch.object(azure.subprocess, "run")
-    def test_storage_upload_ignores_ambient_account_credentials(self, execute):
-        execute.return_value = mock.Mock(returncode=0, stdout="null")
+    def test_upload_helper_ignores_ambient_credentials_and_bounds_runtime(self, execute):
+        execute.return_value = mock.Mock(returncode=0, stdout='{"available": true}')
         with mock.patch.dict(azure.os.environ, {
             "AZURE_STORAGE_CONNECTION_STRING": "unrelated-account",
             "AZURE_STORAGE_KEY": "unrelated-key",
         }):
-            azure.azure_cli(
-                ["storage", "blob", "upload"],
-                env={"AZURE_STORAGE_SAS_TOKEN": "expected-sas"},
-            )
+            azure.upload_helper(["--check-dependencies"], sas="expected-sas")
         environment = execute.call_args.kwargs["env"]
         self.assertNotIn("AZURE_STORAGE_CONNECTION_STRING", environment)
         self.assertNotIn("AZURE_STORAGE_KEY", environment)
         self.assertEqual(environment["AZURE_STORAGE_SAS_TOKEN"], "expected-sas")
+        self.assertNotIn("expected-sas", " ".join(execute.call_args.args[0]))
+        self.assertEqual(execute.call_args.kwargs["timeout"], 1200)
 
     @mock.patch.object(azure, "azure_cli")
     def test_subscription_preflight_never_registers_providers(self, command):
@@ -300,13 +375,27 @@ class HypervAzureControllerTest(unittest.TestCase):
             azure.run_prepared(Path("/unused"), "io", 300, False)
         check.assert_not_called()
 
+    @mock.patch.object(azure, "check_subscription")
+    @mock.patch.object(azure, "check_upload_dependencies", side_effect=RuntimeError("missing SDK"))
+    @mock.patch.object(azure, "image_sha256", return_value="a" * 64)
+    @mock.patch.object(azure, "load_state")
+    def test_missing_upload_sdk_fails_before_cloud_calls(self, load, digest, dependencies, check):
+        load.return_value = ({
+            "phase": "prepared", "local_platform_boot": True,
+            "image_sha256": "a" * 64,
+        }, Path("/unused/state.json"))
+        with self.assertRaisesRegex(RuntimeError, "missing SDK"):
+            azure.run_prepared(Path("/unused"), "io", 300, False)
+        check.assert_not_called()
+
     @mock.patch.object(azure, "save_json")
     @mock.patch.object(azure, "AzureRun")
     @mock.patch.object(azure, "check_subscription", return_value="subscription")
+    @mock.patch.object(azure, "check_upload_dependencies")
     @mock.patch.object(azure, "image_sha256", return_value="a" * 64)
     @mock.patch.object(azure, "load_state")
     def test_failed_run_cleans_owned_resources_by_default(
-        self, load, digest, check, constructor, save
+        self, load, digest, dependencies, check, constructor, save
     ):
         state = {
             "phase": "prepared", "local_platform_boot": True,
