@@ -16,8 +16,9 @@ config LIBSTORVSC_MAX_DEVICES
 	range 1 8
 	default 1
 	help
-		Maximum simultaneously retained synthetic storage-controller
-		identities. Raising this intentionally enables multi-controller
+		Maximum synthetic storage-controller identities retained for the
+		boot. Successfully bound identities are not recycled after
+		removal. Raising this intentionally enables multi-controller
 		binding.
 
 config LIBSTORVSC_LUN_DISCOVERY
@@ -33,8 +34,10 @@ config LIBSTORVSC_MAX_LUNS
 	range 1 64
 	default 1
 	help
-		Maximum independently registered block devices per controller.
-		Values above one require LIBSTORVSC_LUN_DISCOVERY.
+		Maximum LUN identities retained per controller for the boot.
+		Registered block-device identities are not recycled after LUN
+		or controller removal. Values above one require
+		LIBSTORVSC_LUN_DISCOVERY.
 
 config LIBSTORVSC_MAX_QUEUES
 	int "Maximum queues per StorVSC device"

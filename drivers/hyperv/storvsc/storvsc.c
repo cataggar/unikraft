@@ -125,7 +125,9 @@ struct storvsc_device {
 	int reset_result;
 	int fatal_error;
 	__u8 finish_active;
+	__u8 notify_active;
 	__u16 active_sends;
+	struct storvsc_lun *notifying_lun;
 	__u8 deferred_action;
 	__u8 deferred_running;
 	__u8 deferred_wait_vmbus;
@@ -199,6 +201,7 @@ void storvsc_host_pfn_copy_hook(__u64 transaction_id, const __u64 *pfns,
 void storvsc_host_recovery_begin_hook(void);
 void storvsc_host_reset_ack_hook(void);
 void storvsc_host_deferred_epoch_sample_hook(__u64 epoch);
+void storvsc_host_sync_completion_hook(void);
 #endif
 
 static struct vmbus_channel *
@@ -417,48 +420,117 @@ static void storvsc_process_async_event(struct storvsc_device *device,
 
 static void storvsc_notify_pending(struct storvsc_device *device)
 {
+	struct storvsc_lun *lun;
 	struct vmbus_channel *channel;
 	unsigned long flags;
 	unsigned int i;
-	int any = 0;
-	int notify;
 
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	if (device->notify_active || device->finish_active ||
+	    device->binding) {
+		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+		return;
+	}
+	device->notify_active = 1;
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+
+	for (;;) {
+		lun = NULL;
+		ukplat_spin_lock_irqsave(&device->lock, flags);
+		if (!device->online || device->removing || device->binding ||
+		    device->finish_active ||
+		    device->deferred_action != STORVSC_DEFER_NONE) {
+			device->notify_active = 0;
+			device->notifying_lun = NULL;
+			ukplat_spin_unlock_irqrestore(&device->lock, flags);
+			return;
+		}
+		channel = storvsc_channel_get(device);
+		if (channel) {
+			for (i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
+				struct storvsc_lun *candidate =
+					&device->luns[i];
+
+				if (candidate->completion_pending &&
+				    candidate->present &&
+				    candidate->registered &&
+				    candidate->queue.configured &&
+				    candidate->queue.intr_user &&
+				    candidate->blkdev._data &&
+				    candidate->blkdev._data->state ==
+					    UK_BLKDEV_RUNNING) {
+					lun = candidate;
+					lun->completion_pending = 0;
+					lun->queue.intr_active = 0;
+					device->notifying_lun = lun;
+					break;
+				}
+			}
+		}
+		if (!lun) {
+			device->notify_active = 0;
+			device->notifying_lun = NULL;
+		}
+		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+		if (!lun)
+			return;
+		(void)vmbus_channel_mask_interrupts(channel);
+		uk_blkdev_drv_queue_event(&lun->blkdev, 0);
+		ukplat_spin_lock_irqsave(&device->lock, flags);
+		device->notifying_lun = NULL;
+		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	}
+}
+
+static int storvsc_rearm_interrupts(struct storvsc_device *device)
+{
+	struct vmbus_channel *channel;
+	unsigned long flags;
+	unsigned int i;
+	unsigned int users = 0;
+	int readable;
+
+	ukplat_spin_lock_irqsave(&device->lock, flags);
+	channel = storvsc_channel_get(device);
+	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
+		struct storvsc_lun *lun = &device->luns[i];
+
+		lun->queue.intr_active = 0;
+		if (lun->queue.intr_user && lun->present &&
+		    lun->registered && lun->queue.configured &&
+		    lun->blkdev._data &&
+		    lun->blkdev._data->state == UK_BLKDEV_RUNNING)
+			users++;
+	}
+	device->interrupt_users = (__u16)users;
+	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	if (!users)
+		return 0;
+	if (!channel)
+		return -ENODEV;
+	readable = vmbus_channel_unmask_interrupts(channel);
+	if (readable < 0) {
+		ukplat_spin_lock_irqsave(&device->lock, flags);
+		device->interrupt_users = 0;
+		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+		return readable;
+	}
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
 		struct storvsc_lun *lun = &device->luns[i];
 
-		if (lun->completion_pending && lun->present &&
+		if (lun->queue.intr_user && lun->present &&
 		    lun->registered && lun->queue.configured &&
-		    lun->queue.intr_user && lun->blkdev._data &&
-		    lun->blkdev._data->state == UK_BLKDEV_RUNNING) {
-			any = 1;
-			break;
-		}
+		    lun->blkdev._data &&
+		    lun->blkdev._data->state == UK_BLKDEV_RUNNING)
+			lun->queue.intr_active = !readable;
 	}
-	channel = any ? storvsc_channel_get(device) : NULL;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
-	if (channel)
+	if (readable) {
 		(void)vmbus_channel_mask_interrupts(channel);
-
-	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
-		struct storvsc_lun *lun = &device->luns[i];
-
-		notify = 0;
-		ukplat_spin_lock_irqsave(&device->lock, flags);
-		if (device->online && !device->removing &&
-		    device->deferred_action == STORVSC_DEFER_NONE &&
-		    lun->completion_pending && lun->present &&
-		    lun->registered && lun->queue.configured &&
-		    lun->queue.intr_user && lun->blkdev._data &&
-		    lun->blkdev._data->state == UK_BLKDEV_RUNNING) {
-			lun->completion_pending = 0;
-			lun->queue.intr_active = 0;
-			notify = 1;
-		}
-		ukplat_spin_unlock_irqrestore(&device->lock, flags);
-		if (notify)
-			uk_blkdev_drv_queue_event(&lun->blkdev, 0);
+		(void)storvsc_receive_async(device, 0);
 	}
+	return 0;
 }
 
 static int storvsc_receive_async(struct storvsc_device *device,
@@ -616,6 +688,9 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 		if (event.kind != STORVSC_EVENT_REQUEST_COMPLETE ||
 		    event.transaction_id != tx.transaction_id)
 			continue;
+#ifdef STORVSC_HOST_TEST
+		storvsc_host_sync_completion_hook();
+#endif
 		rc = storvsc_core_take_completed(device->core, tx.slot,
 				tx.transaction_id, &event);
 		memset(binding, 0, sizeof(*binding));
@@ -828,6 +903,33 @@ static int storvsc_take_completion_locked(struct storvsc_device *device,
 	return 0;
 }
 
+static int storvsc_take_lun_completion_locked(
+	struct storvsc_device *device, struct storvsc_lun *lun,
+	struct uk_blkreq **request, struct storvsc_event *event)
+{
+	unsigned int slot;
+	int rc;
+
+	*request = NULL;
+	for (slot = 0; slot < CONFIG_LIBSTORVSC_QUEUE_DEPTH; slot++) {
+		struct storvsc_request_binding *binding =
+			&device->bindings[slot];
+
+		if (!binding->id || binding->lun != lun)
+			continue;
+		rc = storvsc_core_take_completed(device->core, (__u16)slot,
+						 binding->id, event);
+		if (rc == -ENOENT)
+			continue;
+		if (rc)
+			return rc;
+		*request = binding->req;
+		memset(binding, 0, sizeof(*binding));
+		return 0;
+	}
+	return -ENOENT;
+}
+
 static void storvsc_notify_completions(struct storvsc_device *device)
 {
 	unsigned long flags;
@@ -912,7 +1014,7 @@ static void storvsc_wait_finish(struct storvsc_device *device)
 		return;
 	for (attempt = 0; attempt < STORVSC_SEND_WAIT_LIMIT; attempt++) {
 		ukplat_spin_lock_irqsave(&device->lock, flags);
-		active = device->finish_active;
+		active = device->finish_active || device->notify_active;
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		if (!active)
 			return;
@@ -1350,7 +1452,9 @@ static int storvsc_finish(struct uk_blkdev *blkdev,
 	int readable;
 
 	ukplat_spin_lock_irqsave(&device->lock, flags);
-	if (device->finish_active || device->removing ||
+	if (device->finish_active || !device->online || device->binding ||
+	    (device->notify_active && device->notifying_lun != lun) ||
+	    device->removing ||
 	    device->deferred_action != STORVSC_DEFER_NONE) {
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return 0;
@@ -1362,7 +1466,10 @@ again:
 	(void)storvsc_receive_async(device, 0);
 	for (;;) {
 		ukplat_spin_lock_irqsave(&device->lock, flags);
-		rc = storvsc_take_completion_locked(device, &request, &event);
+		rc = storvsc_take_lun_completion_locked(device, lun, &request,
+							 &event);
+		if (rc == -ENOENT)
+			lun->completion_pending = 0;
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		if (rc == -ENOENT) {
 			rc = 0;
@@ -1406,6 +1513,8 @@ out:
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	if (deferred_ready)
 		storvsc_wake_timeout(device);
+	if (!rc)
+		storvsc_notify_pending(device);
 	(void)blkdev;
 	return rc;
 }
@@ -1876,7 +1985,8 @@ storvsc_reserve_controller(struct vmbus_device *vmbus_device,
 	}
 	*device_out = device;
 	ukplat_spin_lock_irqsave(&device->lock, device_flags);
-	if (device->deferred_action != STORVSC_DEFER_NONE)
+	if (device->deferred_action != STORVSC_DEFER_NONE ||
+	    device->finish_active || device->notify_active)
 		rc = -EAGAIN;
 	else if (device->binding || device->online || device->removing ||
 		 device->recovering || device->deferred_running ||
@@ -1972,7 +2082,6 @@ static void storvsc_mark_luns_absent(struct storvsc_device *device)
 	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
 		device->luns[i].present = 0;
 		device->luns[i].completion_pending = 0;
-		device->luns[i].queue.intr_user = 0;
 		device->luns[i].queue.intr_active = 0;
 	}
 }
@@ -2025,6 +2134,9 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	device->fatal_error = 0;
 	device->active_sends = 0;
 	device->interrupt_users = 0;
+	device->finish_active = 0;
+	device->notify_active = 0;
+	device->notifying_lun = NULL;
 	device->deferred_action = STORVSC_DEFER_NONE;
 	device->deferred_running = 0;
 	device->deferred_wait_vmbus = 0;
@@ -2146,9 +2258,13 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	rc = storvsc_start_timeout_worker(device);
 	if (rc)
 		goto failed_registered;
+	rc = storvsc_rearm_interrupts(device);
+	if (rc)
+		goto failed_registered;
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	device->binding = 0;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+	storvsc_notify_pending(device);
 	if (vmbus_channel_poll(storvsc_channel_get(device)) > 0)
 		(void)storvsc_receive_async(device, 1);
 	uk_pr_info(DRIVER_NAME ": controller%u VMStor %u.%u, %d LUNs\n",
@@ -2220,7 +2336,7 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 		device->deferred_close_deadline = 0;
 	}
 	if (device->deferred_running || device->active_sends ||
-	    device->finish_active) {
+	    device->finish_active || device->notify_active) {
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return -EAGAIN;
 	}
@@ -2334,6 +2450,8 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 	device->deferred_close_deadline = 0;
 	device->recovering = 0;
 	device->removing = 0;
+	device->notify_active = 0;
+	device->notifying_lun = NULL;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	vmbus_device_bind_ready();
 	storvsc_wake_timeout(device);

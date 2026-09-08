@@ -1494,19 +1494,54 @@ fn vpdPriority(designator_type: u8) u8 {
 fn vpdLess(
     candidate: []const u8,
     candidate_type: u8,
+    candidate_code_set: u8,
     selected: []const u8,
     selected_type: u8,
+    selected_code_set: u8,
 ) bool {
     const candidate_priority = vpdPriority(candidate_type);
     const selected_priority = vpdPriority(selected_type);
     if (candidate_priority != selected_priority)
         return candidate_priority < selected_priority;
+    if (candidate_code_set != selected_code_set)
+        return candidate_code_set < selected_code_set;
     const compared = @min(candidate.len, selected.len);
     for (0..compared) |index| {
         if (candidate[index] != selected[index])
             return candidate[index] < selected[index];
     }
     return candidate.len < selected.len;
+}
+
+fn vpdCodeSetSupported(designator_type: u8, code_set: u8) bool {
+    return switch (designator_type) {
+        1 => code_set == 2,
+        2, 3 => code_set == 1,
+        8 => code_set == 3,
+        else => false,
+    };
+}
+
+fn vpdDesignatorSupported(
+    designator: []const u8,
+    designator_type: u8,
+    code_set: u8,
+) bool {
+    if (!vpdCodeSetSupported(designator_type, code_set))
+        return false;
+    return switch (designator_type) {
+        1 => designator.len >= 8,
+        2 => designator.len == 8 or
+            designator.len == 12 or
+            designator.len == 16,
+        3 => switch (designator[0] >> 4) {
+            2, 3, 5 => designator.len == 8,
+            6 => designator.len == 16,
+            else => false,
+        },
+        8 => true,
+        else => false,
+    };
 }
 
 export fn storvsc_parse_vpd83(
@@ -1541,17 +1576,23 @@ export fn storvsc_parse_vpd83(
         if (length == 0 or length > total_size - offset - 4)
             return -eproto;
         const designator = data[offset + 4 .. offset + 4 + length];
-        if (association == 0 and code_set >= 1 and code_set <= 3 and
-            vpdPriority(designator_type) < 4)
+        if (association == 0 and
+            vpdCodeSetSupported(designator_type, code_set))
         {
             if (length > vpd_id_max)
                 return -eoverflow;
-            if (selected_length == 0 or vpdLess(
+            if (vpdDesignatorSupported(
                 designator,
                 designator_type,
+                code_set,
+            ) and (selected_length == 0 or vpdLess(
+                designator,
+                designator_type,
+                code_set,
                 data[selected_offset .. selected_offset + selected_length],
                 selected_type,
-            )) {
+                selected_code_set,
+            ))) {
                 selected_offset = offset + 4;
                 selected_length = length;
                 selected_type = designator_type;
@@ -2955,74 +2996,107 @@ test "per-LUN media controls bounds and access independently" {
     );
 }
 
+fn appendVpdDescriptor(
+    data: []u8,
+    offset: *usize,
+    code_set: u8,
+    association: u8,
+    designator_type: u8,
+    designator: []const u8,
+) void {
+    data[offset.*] = code_set;
+    data[offset.* + 1] = association << 4 | designator_type;
+    data[offset.* + 3] = @intCast(designator.len);
+    @memcpy(
+        data[offset.* + 4 .. offset.* + 4 + designator.len],
+        designator,
+    );
+    offset.* += 4 + designator.len;
+}
+
 test "VPD page 83 parsing is deterministic bounded and fail closed" {
     var data = [_]u8{0} ** 128;
     var identity: VpdId = undefined;
     var offset: usize = 4;
+    const t10 = [_]u8{ 'M', 'S', 'F', 'T', 'D', 'I', 'S', 'K' };
+    const target_naa = [_]u8{ 0x50, 0, 0, 0, 0, 0, 0, 0 };
+    const eui = [_]u8{ 0x10, 0, 0, 0, 0, 0, 0, 1 };
+    const naa_high = [_]u8{ 0x50, 9, 0, 0, 0, 0, 0, 0 };
+    const naa_low = [_]u8{ 0x50, 1, 0, 0, 0, 0, 0, 0 };
 
     data[1] = 0x83;
-    data[offset] = 2;
-    data[offset + 1] = 1;
-    data[offset + 3] = 3;
-    data[offset + 4] = 'T';
-    data[offset + 5] = '1';
-    data[offset + 6] = '0';
-    offset += 7;
-    data[offset] = 1;
-    data[offset + 1] = 0x13;
-    data[offset + 3] = 2;
-    data[offset + 4] = 0;
-    data[offset + 5] = 0;
-    offset += 6;
-    data[offset] = 1;
-    data[offset + 1] = 2;
-    data[offset + 3] = 2;
-    data[offset + 4] = 0;
-    data[offset + 5] = 1;
-    offset += 6;
-    data[offset] = 1;
-    data[offset + 1] = 3;
-    data[offset + 3] = 2;
-    data[offset + 4] = 9;
-    data[offset + 5] = 9;
-    offset += 6;
-    data[offset] = 1;
-    data[offset + 1] = 3;
-    data[offset + 3] = 2;
-    data[offset + 4] = 1;
-    data[offset + 5] = 2;
-    offset += 6;
+    appendVpdDescriptor(&data, &offset, 2, 0, 1, &t10);
+    appendVpdDescriptor(&data, &offset, 1, 1, 3, &target_naa);
+    appendVpdDescriptor(&data, &offset, 1, 0, 2, &eui);
+    appendVpdDescriptor(&data, &offset, 1, 0, 3, &naa_high);
+    appendVpdDescriptor(&data, &offset, 1, 0, 3, &naa_low);
     putBe16(&data, 2, @intCast(offset - 4));
 
     try std.testing.expectEqual(
         @as(c_int, 0),
         storvsc_parse_vpd83(&data, offset, &identity),
     );
-    try std.testing.expectEqual(@as(u8, 2), identity.length);
+    try std.testing.expectEqual(@as(u8, 8), identity.length);
     try std.testing.expectEqual(@as(u8, 1), identity.code_set);
     try std.testing.expectEqual(@as(u8, 3), identity.designator_type);
     try std.testing.expectEqual(@as(u8, 0), identity.association);
     try std.testing.expectEqualSlices(
         u8,
-        &[_]u8{ 1, 2 },
+        &naa_low,
         identity.bytes[0..identity.length],
     );
 
     data = [_]u8{0} ** 128;
     data[1] = 0x83;
-    putBe16(&data, 2, 5);
-    data[4] = 1;
-    data[5] = 4;
-    data[7] = 1;
-    data[8] = 7;
+    offset = 4;
+    appendVpdDescriptor(&data, &offset, 1, 0, 4, &naa_low);
+    putBe16(&data, 2, @intCast(offset - 4));
     try std.testing.expectEqual(
         -enoent,
-        storvsc_parse_vpd83(&data, 9, &identity),
+        storvsc_parse_vpd83(&data, offset, &identity),
     );
     data[5] = 0x13;
     try std.testing.expectEqual(
         -enoent,
-        storvsc_parse_vpd83(&data, 9, &identity),
+        storvsc_parse_vpd83(&data, offset, &identity),
+    );
+
+    data = [_]u8{0} ** 128;
+    data[1] = 0x83;
+    offset = 4;
+    appendVpdDescriptor(&data, &offset, 1, 0, 3, &[_]u8{ 0x50, 1 });
+    putBe16(&data, 2, @intCast(offset - 4));
+    try std.testing.expectEqual(
+        -enoent,
+        storvsc_parse_vpd83(&data, offset, &identity),
+    );
+
+    data = [_]u8{0} ** 128;
+    data[1] = 0x83;
+    offset = 4;
+    appendVpdDescriptor(&data, &offset, 2, 0, 3, &naa_low);
+    appendVpdDescriptor(&data, &offset, 1, 0, 3, &naa_low);
+    putBe16(&data, 2, @intCast(offset - 4));
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_parse_vpd83(&data, offset, &identity),
+    );
+    try std.testing.expectEqual(@as(u8, 1), identity.code_set);
+    data = [_]u8{0} ** 128;
+    data[1] = 0x83;
+    offset = 4;
+    appendVpdDescriptor(&data, &offset, 1, 0, 3, &naa_low);
+    appendVpdDescriptor(&data, &offset, 2, 0, 3, &naa_low);
+    putBe16(&data, 2, @intCast(offset - 4));
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        storvsc_parse_vpd83(&data, offset, &identity),
+    );
+    try std.testing.expectEqual(@as(u8, 1), identity.code_set);
+    try std.testing.expectEqualSlices(
+        u8,
+        &naa_low,
+        identity.bytes[0..identity.length],
     );
 
     data = [_]u8{0} ** 128;
@@ -3044,8 +3118,8 @@ test "VPD page 83 parsing is deterministic bounded and fail closed" {
     data = [_]u8{0} ** 128;
     data[1] = 0x83;
     putBe16(&data, 2, 69);
-    data[4] = 1;
-    data[5] = 3;
+    data[4] = 3;
+    data[5] = 8;
     data[7] = vpd_id_max + 1;
     try std.testing.expectEqual(
         -eoverflow,

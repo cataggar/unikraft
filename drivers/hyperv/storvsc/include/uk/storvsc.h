@@ -30,6 +30,11 @@ struct uk_storvsc_mapping {
 /*
  * Active mappings are enumerated by instance GUID and SCSI address.
  * Get/find return a read-only snapshot and may return -ENOENT on removal.
+ * A snapshot does not pin an immutable disk across controller removal;
+ * callers must obtain and validate a fresh snapshot before acting on it.
+ * Controller/LUN and blkdev identities remain reserved for the boot.
+ * A zero vpd_length means no supported LU-associated designator was
+ * available and must not be treated as a stable disk identity.
  */
 unsigned int uk_storvsc_mapping_count(void);
 int uk_storvsc_mapping_get(unsigned int index,
