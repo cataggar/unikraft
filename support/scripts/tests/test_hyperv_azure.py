@@ -3,7 +3,9 @@
 import importlib
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import unittest
@@ -224,6 +226,473 @@ class HypervAzureLocalBootTest(unittest.TestCase):
                     Path("/qemu-system-x86_64"), azure.PLATFORM_READY, 30,
                     "legacy-apic", True,
                 )
+
+
+class HypervAzureFileHandlingTest(unittest.TestCase):
+    def test_fifo_inputs_are_opened_nonblocking_before_type_rejection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fifo = root / "input"
+            os.mkfifo(fifo)
+            real_open = os.open
+
+            def guarded_open(path, flags, *args):
+                self.assertTrue(
+                    flags & os.O_NONBLOCK,
+                    "FIFO-safe input opens must use O_NONBLOCK",
+                )
+                return real_open(path, flags, *args)
+
+            operations = (
+                lambda: azure.read_regular_file(fifo, 64, "Manifest"),
+                lambda: azure.copy_regular_file(
+                    fifo, root / "copy", 0, azure.sha256_bytes(b"")
+                ),
+            )
+            for operation in operations:
+                with self.subTest(operation=operation):
+                    with mock.patch.object(azure.os, "open", side_effect=guarded_open):
+                        with self.assertRaisesRegex(
+                            ValueError, "invalid type|non-symlink|unexpected type"
+                        ):
+                            operation()
+
+    def test_copy_detects_growth_without_unbounded_reads_or_writes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"1234")
+            reads = []
+
+            def growing_read(descriptor, size):
+                del descriptor
+                reads.append(size)
+                if len(reads) > 2:
+                    raise AssertionError("copy read past its bounded detection byte")
+                return b"x" * min(size, 4)
+
+            with mock.patch.object(azure.os, "read", side_effect=growing_read):
+                with self.assertRaisesRegex(ValueError, "grew|expected size"):
+                    azure.copy_regular_file(
+                        source, destination, 4,
+                        azure.sha256_bytes(b"x" * 4),
+                    )
+            self.assertEqual(reads, [4, 1])
+            self.assertFalse(destination.exists())
+
+    def test_exact_copy_fsyncs_and_rejects_digest_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"exact-content")
+            with mock.patch.object(
+                azure.os, "fsync", wraps=os.fsync
+            ) as fsync:
+                azure.copy_regular_file(
+                    source, destination, source.stat().st_size,
+                    azure.sha256_bytes(b"exact-content"),
+                )
+            self.assertEqual(destination.read_bytes(), b"exact-content")
+            fsync.assert_called_once()
+
+            mismatch = root / "mismatch"
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                azure.copy_regular_file(
+                    source, mismatch, source.stat().st_size, "f" * 64
+                )
+            self.assertFalse(mismatch.exists())
+
+    def test_failed_exclusive_create_preserves_existing_file_and_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.write_bytes(b"new")
+            digest = azure.sha256_bytes(b"new")
+
+            existing = root / "existing"
+            existing.write_bytes(b"keep")
+            with self.assertRaises(FileExistsError):
+                azure.copy_regular_file(source, existing, 3, digest)
+            self.assertEqual(existing.read_bytes(), b"keep")
+
+            target = root / "target"
+            target.write_bytes(b"target")
+            linked = root / "linked"
+            linked.symlink_to(target)
+            with self.assertRaises(FileExistsError):
+                azure.copy_regular_file(source, linked, 3, digest)
+            self.assertTrue(linked.is_symlink())
+            self.assertEqual(linked.readlink(), target)
+            self.assertEqual(target.read_bytes(), b"target")
+
+
+class HypervAzurePreparedImageTransferTest(unittest.TestCase):
+    def setUp(self):
+        self.constants = (
+            mock.patch.object(azure, "MIB", 512),
+            mock.patch.object(azure, "ESP_SIZE", 2048),
+            mock.patch.object(azure, "VIRTUAL_SIZE", 4096),
+        )
+        for patcher in self.constants:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self.constants):
+            patcher.stop()
+
+    @staticmethod
+    def source(**changes):
+        value = {
+            "provider": "github-actions",
+            "repository": "unikraft/unikraft",
+            "repository_id": 12345,
+            "workflow_ref": (
+                "unikraft/unikraft/.github/workflows/integration.yaml@"
+                "refs/heads/zig16"
+            ),
+            "job": "zig-hyperv",
+            "run_id": 67890,
+            "run_attempt": 1,
+            "head_sha": "a" * 40,
+        }
+        value.update(changes)
+        return value
+
+    @staticmethod
+    def boot_text(legacy=False):
+        lines = [
+            "Hyper-V Hv#1 hypercall page enabled",
+            "Hyper-V SynIC:",
+            "Powered by",
+            "Calling main(",
+            azure.PLATFORM_READY,
+            "UK_HYPERV_ACCEPTANCE_UNAVAILABLE:storage+network",
+            "main returned 2",
+        ]
+        if legacy:
+            lines.append(azure.LEGACY_APIC_MARKER)
+        return "\n".join(lines)
+
+    def make_prepared(self, root):
+        state_dir = root / "prepared"
+        state_dir.mkdir(mode=0o700)
+        efi = state_dir / "BOOTX64.EFI"
+        raw = state_dir / "unikraft.raw"
+        vhd = state_dir / azure.PREPARED_IMAGE_VHD
+        miz = state_dir / "miz"
+        efi.write_bytes(b"efi-application")
+        raw.write_bytes(b"r" * azure.VIRTUAL_SIZE)
+        vhd.write_bytes(b"v" * (azure.VIRTUAL_SIZE + 512))
+        miz.write_bytes(b"pinned-miz")
+        miz.chmod(0o700)
+        report = azure.packaging_contract(
+            azure.image_sha256(efi), vhd.stat().st_size
+        )
+        azure.save_json(state_dir / "packaging.json", report)
+        for _, log_name in (("raw", "raw"), ("vhd", "vpc")):
+            for mode, legacy in azure.LOCAL_BOOT_MODES:
+                (state_dir / f"local-{log_name}-{mode}-serial.log").write_text(
+                    self.boot_text(legacy)
+                )
+        state = {
+            "schema_version": azure.STATE_SCHEMA_VERSION,
+            "phase": "prepared",
+            "name_prefix": "uk-hv-private-source",
+            "location": "westus2",
+            "vm_size": "Standard_D2s_v5",
+            "platform_marker": azure.PLATFORM_READY,
+            "efi_sha256": azure.image_sha256(efi),
+            "raw_sha256": azure.image_sha256(raw),
+            "image_sha256": azure.image_sha256(vhd),
+            "miz_executable": str(miz),
+            "miz_executable_sha256": azure.image_sha256(miz),
+            "local_platform_boot": True,
+            "local_platform_boot_modes": {
+                "raw": {"x2apic": True, "legacy-apic": True},
+                "vhd": {"x2apic": True, "legacy-apic": True},
+            },
+        }
+        azure.save_json(state_dir / "state.json", state)
+        return state_dir, report
+
+    def export(self, root):
+        state_dir, report = self.make_prepared(root)
+        artifact = root / "artifact"
+        with mock.patch.object(azure, "miz_command", return_value=report):
+            digest = azure.export_prepared_image(
+                state_dir, artifact, self.source()
+            )
+        return state_dir, artifact, digest, report
+
+    @staticmethod
+    def rewrite_manifest(artifact, update):
+        path = artifact / azure.PREPARED_IMAGE_MANIFEST
+        manifest = json.loads(path.read_text())
+        update(manifest)
+        value = azure.canonical_json(manifest)
+        path.write_bytes(value)
+        return azure.sha256_bytes(value)
+
+    def test_exact_export_import_creates_new_private_run_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_dir, artifact, digest, report = self.export(root)
+            self.assertEqual(
+                {path.name for path in artifact.iterdir()},
+                azure.PREPARED_IMAGE_FILES,
+            )
+            manifest_path = artifact / azure.PREPARED_IMAGE_MANIFEST
+            manifest_text = manifest_path.read_text()
+            self.assertNotIn(str(state_dir), manifest_text)
+            self.assertNotIn("uk-hv-private-source", manifest_text)
+            self.assertNotIn("subscription", manifest_text)
+            self.assertNotIn("serial.log", manifest_text)
+            self.assertEqual(
+                azure.sha256_bytes(manifest_path.read_bytes()), digest
+            )
+
+            local_miz = root / "local-miz"
+            local_miz.write_bytes(b"same-revision-local-tool")
+            local_miz.chmod(0o700)
+            imported = root / "imported"
+            with mock.patch.object(azure, "miz_command", return_value=report):
+                azure.import_prepared_image(
+                    artifact, imported, local_miz, digest, self.source(),
+                    "westus2", "Standard_D2s_v5",
+                )
+            state, state_path = azure.load_state(imported)
+            self.assertEqual(state["phase"], "prepared")
+            self.assertNotEqual(state["name_prefix"], "uk-hv-private-source")
+            self.assertNotIn("local_platform_boot", state)
+            self.assertFalse(azure.AZURE_OWNERSHIP_FIELDS.intersection(state))
+            self.assertEqual(
+                state["prepared_image_import"]["manifest_sha256"], digest
+            )
+            self.assertEqual(
+                azure.image_sha256(imported / azure.PREPARED_IMAGE_VHD),
+                state["image_sha256"],
+            )
+            self.assertFalse(state_path.parent.stat().st_mode & 0o077)
+            azure.validate_prepared_run_provenance(state, state_path.parent)
+            with mock.patch.object(
+                azure, "check_upload_dependencies",
+                side_effect=RuntimeError("dependency gate reached"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "dependency gate reached"):
+                    azure.run_prepared(imported, "platform", 30, False)
+
+    def test_export_rechecks_serial_evidence_and_rejects_cloud_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_dir, report = self.make_prepared(root)
+            legacy = state_dir / "local-vpc-legacy-apic-serial.log"
+            legacy.write_text(self.boot_text(False))
+            with mock.patch.object(azure, "miz_command", return_value=report):
+                with self.assertRaisesRegex(RuntimeError, "xAPIC fallback"):
+                    azure.export_prepared_image(
+                        state_dir, root / "bad-evidence", self.source()
+                    )
+            legacy.write_text(self.boot_text(True))
+            state = json.loads((state_dir / "state.json").read_text())
+            state["subscription"] = "must-not-export"
+            azure.save_json(state_dir / "state.json", state)
+            with self.assertRaisesRegex(ValueError, "Cloud-owned"):
+                azure.export_prepared_image(
+                    state_dir, root / "cloud-state", self.source()
+                )
+
+    def test_import_requires_external_digest_and_exact_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, artifact, digest, report = self.export(root)
+            miz = root / "miz"
+            miz.write_bytes(b"local-miz")
+            miz.chmod(0o700)
+            with mock.patch.object(
+                azure, "miz_command", return_value=report
+            ) as check:
+                with self.assertRaisesRegex(ValueError, "trusted digest"):
+                    azure.import_prepared_image(
+                        artifact, root / "wrong-digest", miz, "f" * 64,
+                        self.source(), "westus2", "Standard_D2s_v5",
+                    )
+                with self.assertRaisesRegex(ValueError, "provenance"):
+                    azure.import_prepared_image(
+                        artifact, root / "wrong-source", miz, digest,
+                        self.source(run_id=67891),
+                        "westus2", "Standard_D2s_v5",
+                    )
+            check.assert_not_called()
+            self.assertFalse((root / "wrong-digest").exists())
+            self.assertFalse((root / "wrong-source").exists())
+
+    def test_import_rejects_unknown_duplicate_and_malformed_contracts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, artifact, _, report = self.export(root)
+            miz = root / "miz"
+            miz.write_bytes(b"local-miz")
+            miz.chmod(0o700)
+
+            unknown = root / "unknown"
+            shutil.copytree(artifact, unknown)
+            unknown_digest = self.rewrite_manifest(
+                unknown, lambda value: value.update(secret_path="/private")
+            )
+            with self.assertRaisesRegex(ValueError, "unknown or missing"):
+                azure.import_prepared_image(
+                    unknown, root / "unknown-state", miz, unknown_digest,
+                    self.source(), "westus2", "Standard_D2s_v5",
+                )
+
+            duplicate = root / "duplicate"
+            shutil.copytree(artifact, duplicate)
+            duplicate_value = (
+                b'{"schema":"first","schema":"second"}\n'
+            )
+            (duplicate / azure.PREPARED_IMAGE_MANIFEST).write_bytes(
+                duplicate_value
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate field"):
+                azure.import_prepared_image(
+                    duplicate, root / "duplicate-state", miz,
+                    azure.sha256_bytes(duplicate_value), self.source(),
+                    "westus2", "Standard_D2s_v5",
+                )
+
+            packaging = root / "packaging"
+            shutil.copytree(artifact, packaging)
+            packaging_digest = self.rewrite_manifest(
+                packaging,
+                lambda value: value["packaging"].update(generation=1),
+            )
+            with self.assertRaisesRegex(ValueError, "packaging field"):
+                azure.import_prepared_image(
+                    packaging, root / "packaging-state", miz,
+                    packaging_digest, self.source(),
+                    "westus2", "Standard_D2s_v5",
+                )
+
+            preflight = root / "preflight"
+            shutil.copytree(artifact, preflight)
+            preflight_digest = self.rewrite_manifest(
+                preflight,
+                lambda value: value["preflight"]["boots"]["raw"]["x2apic"].update(
+                    apic_path="legacy-xapic"
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "all four exact boots"):
+                azure.import_prepared_image(
+                    preflight, root / "preflight-state", miz,
+                    preflight_digest, self.source(),
+                    "westus2", "Standard_D2s_v5",
+                )
+
+            controller = root / "controller"
+            shutil.copytree(artifact, controller)
+            controller_digest = self.rewrite_manifest(
+                controller,
+                lambda value: value.update(controller_sha256="f" * 64),
+            )
+            with self.assertRaisesRegex(ValueError, "controller revision"):
+                azure.import_prepared_image(
+                    controller, root / "controller-state", miz,
+                    controller_digest, self.source(),
+                    "westus2", "Standard_D2s_v5",
+                )
+
+    def test_import_rejects_extra_files_symlinks_and_changed_vhd(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, artifact, digest, report = self.export(root)
+            miz = root / "miz"
+            miz.write_bytes(b"local-miz")
+            miz.chmod(0o700)
+
+            extra = root / "extra"
+            shutil.copytree(artifact, extra)
+            (extra / "state.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "unexpected files"):
+                azure.import_prepared_image(
+                    extra, root / "extra-state", miz, digest, self.source(),
+                    "westus2", "Standard_D2s_v5",
+                )
+
+            linked = root / "linked"
+            shutil.copytree(artifact, linked)
+            target = root / "outside.vhd"
+            shutil.move(linked / azure.PREPARED_IMAGE_VHD, target)
+            (linked / azure.PREPARED_IMAGE_VHD).symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "non-symlink"):
+                azure.import_prepared_image(
+                    linked, root / "linked-state", miz, digest, self.source(),
+                    "westus2", "Standard_D2s_v5",
+                )
+
+            changed = root / "changed"
+            shutil.copytree(artifact, changed)
+            image = changed / azure.PREPARED_IMAGE_VHD
+            image.write_bytes(b"x" + image.read_bytes()[1:])
+            with mock.patch.object(
+                azure, "miz_command", return_value=report
+            ) as check:
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    azure.import_prepared_image(
+                        changed, root / "changed-state", miz, digest,
+                        self.source(), "westus2", "Standard_D2s_v5",
+                    )
+            check.assert_not_called()
+
+    def test_import_rechecks_miz_contract_and_private_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, artifact, digest, report = self.export(root)
+            miz = root / "miz"
+            miz.write_bytes(b"local-miz")
+            miz.chmod(0o700)
+            wrong = dict(report)
+            wrong["boot-file-sha256"] = "f" * 64
+            with mock.patch.object(azure, "miz_command", return_value=wrong):
+                with self.assertRaisesRegex(ValueError, "packaging field"):
+                    azure.import_prepared_image(
+                        artifact, root / "wrong-miz", miz, digest,
+                        self.source(), "westus2", "Standard_D2s_v5",
+                    )
+
+            imported = root / "imported"
+            with mock.patch.object(azure, "miz_command", return_value=report):
+                azure.import_prepared_image(
+                    artifact, imported, miz, digest, self.source(),
+                    "westus2", "Standard_D2s_v5",
+                )
+            manifest = imported / azure.PREPARED_IMAGE_MANIFEST
+            manifest.write_bytes(manifest.read_bytes() + b" ")
+            state, state_path = azure.load_state(imported)
+            with self.assertRaisesRegex(ValueError, "canonical JSON"):
+                azure.validate_prepared_run_provenance(
+                    state, state_path.parent
+                )
+
+    def test_cleanup_of_imported_prepared_state_needs_no_cloud_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, artifact, digest, report = self.export(root)
+            miz = root / "miz"
+            miz.write_bytes(b"local-miz")
+            miz.chmod(0o700)
+            imported = root / "imported"
+            with mock.patch.object(azure, "miz_command", return_value=report):
+                azure.import_prepared_image(
+                    artifact, imported, miz, digest, self.source(),
+                    "westus2", "Standard_D2s_v5",
+                )
+            with mock.patch.object(azure, "AzureRun") as cloud:
+                azure.cleanup_state(imported)
+            cloud.assert_not_called()
+            state, _ = azure.load_state(imported)
+            self.assertEqual(state["phase"], "cleaned")
 
 
 class HypervAzureControllerTest(unittest.TestCase):
