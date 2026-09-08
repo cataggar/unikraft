@@ -5,6 +5,38 @@ application, boots the resulting disks locally, and then optionally runs a
 bounded Azure Generation 2 acceptance deployment. A platform boot is not a
 storage/network pass.
 
+## Observed hardware coverage
+
+On 2026-09-08, the single-CPU acceptance probe completed on an Azure Generation
+2 `Standard_D2s_v5` VM in `westus2`, using the implementation through
+[`8c87f56ab3eaa71974812cd748c3a6bfa61c563b`][unikraft-revision].
+
+| Surface | Observed result |
+| --- | --- |
+| Platform | Hypercall/SynIC initialization and the application-ready marker |
+| VMBus | Protocol 5.3, twelve offers |
+| Storage | VMStor 6.2, 66 MiB OS disk; 1,024 bytes read from MBR/primary GPT |
+| Network | NVS 6.1; matching DHCP Offer after one Discover and one received packet |
+| Completion | All four readiness markers, `main returned 0`, no crash |
+| Cleanup | Run-owned Azure resource group deleted |
+
+The storage operation was read-only. This is bounded boot/device smoke
+coverage, not a filesystem, throughput, hotplug, suspend/resume, or SMP
+workload result. The kernel used one CPU even though the Azure size exposes
+two. The configured storage-controller pool accepted the OS controller and
+rejected one additional offer; multiple-controller coverage is not implied.
+
+A fresh configuration at the same revision exposed two further compatibility
+limits: a `Standard_D2as_v5` run failed interrupt-controller initialization
+([#81][amd-irq]), while another `Standard_D2s_v5` host using VMBus 6.0 and
+VMStor 6.0 passed platform/storage but rejected NetVSC binding with `EPROTO`
+([#82][netvsc-variant]). The successful smoke run is not blanket coverage of
+every Azure host variant.
+
+Retain each run's private `state.json`, `packaging.json`, `acceptance.json`,
+and serial logs for its exact image fingerprints and outcome. Do not publish
+Azure account identifiers or credential-bearing diagnostics.
+
 ## Prerequisites
 
 - A successful local native or GNU build of the EFI application. Keep the
@@ -160,3 +192,6 @@ stress testing, and production readiness remain separate milestones.
 [trusted-launch]: https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-faq#can-i-disable-trusted-launch-for-a-new-vm-deployment
 [upload]: https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-upload-vhd-to-managed-disk-cli
 [miz-revision]: https://github.com/cataggar/miz/commit/2db68ca0c3ab12155012a823c3fb8d7aba1cb544
+[unikraft-revision]: https://github.com/cataggar/unikraft/commit/8c87f56ab3eaa71974812cd748c3a6bfa61c563b
+[amd-irq]: https://github.com/cataggar/unikraft/issues/81
+[netvsc-variant]: https://github.com/cataggar/unikraft/issues/82
