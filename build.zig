@@ -491,6 +491,8 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = .Debug,
         }),
+        // Match the production backend for the Microsoft-ABI hypercall thunk.
+        .use_llvm = true,
     });
     test_step.dependOn(&b.addRunArtifact(hyperv_runtime_tests).step);
     const vmbus_protocol_tests = b.addTest(.{
