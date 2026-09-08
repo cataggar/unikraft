@@ -1172,6 +1172,7 @@ pub fn build(b: *std.Build) void {
         "unittest",
         "support.scripts.tests.test_hyperv_azure",
         "support.scripts.tests.test_hyperv_efi_boot",
+        "support.scripts.tests.test_hyperv_network_peer",
     });
     hyperv_controller_fixtures.setCwd(.{ .cwd_relative = root });
     hyperv_controller_fixtures.setEnvironmentVariable(

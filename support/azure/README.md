@@ -155,6 +155,43 @@ packaging logs, the packaging report, and EFI/debug-ELF digests for seven days,
 including boot failures. It excludes raw controller state, disk images, tool
 caches, and credentials.
 
+## Private application-network peer
+
+`support/scripts/hyperv-network-peer.py` implements the guest's UKNA v1
+application protocol using only the Python standard library. On an explicitly
+owned, private peer host, bind it to the intended interface and guest address:
+
+```shell
+python3 support/scripts/hyperv-network-peer.py \
+  --peer-ip 10.87.0.4 --guest-ip 10.87.0.5 \
+  --tcp-port 18887 --udp-port 18888 --nonce 87c0ffee5aa8dfd6 \
+  --timeout 300
+```
+
+The peer rejects wildcard, loopback, link-local, public, and IPv6 endpoints.
+Its peer address, ports, and 16-hex-digit nonce must match the exact guest
+image's application-network configuration. The nonce correlates evidence; it
+is not authentication. Private-network isolation remains required.
+
+It validates three fresh TCP request streams and six UDP datagrams with the
+documented guest sequences, lengths, and direction-specific payloads, and
+returns independently generated responses. Stream reads/writes share absolute
+deadlines even with partial I/O. Each active exchange has at most five seconds;
+the total service lifetime is bounded by `--timeout` (1 through 600 seconds).
+Unexpected-source traffic is bounded, the UDP source port must remain stable,
+and trailing TCP bytes or extra expected-guest traffic during the final
+200-millisecond drain fail the run. All sockets close on success or failure.
+
+`HYPERV_NETWORK_PEER` records are schema-1 JSON with readiness, per-exchange
+outcomes, and a final result with endpoint/nonce correlation and exact byte
+counts. `READY` appears only after both sockets are bound. A peer-side PASS
+alone is not networking acceptance: the controller must also require the
+matching guest lease, ARP, TCP, UDP, cleanup, and final records.
+
+The service itself creates no Azure resources and is not yet wired into the
+Azure controller. The existing `run` command remains the original smoke lane;
+do not use its DHCP-Offer result as application-network coverage.
+
 ## Run one Azure VM
 
 For the hello-world example, explicitly select platform-only acceptance:
