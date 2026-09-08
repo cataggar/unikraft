@@ -1052,7 +1052,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_storvsc_production_tests.step);
     const storvsc_regression_tests = b.step(
         "test-storvsc-regression",
-        "Run StorVSC core, public ABI, and production topology/lifetime fixtures",
+        "Run StorVSC protocol, topology, guarded-I/O, and ABI fixtures",
     );
     storvsc_regression_tests.dependOn(&run_storvsc_core_tests.step);
     storvsc_regression_tests.dependOn(&verify_storvsc_core.step);
@@ -1122,6 +1122,9 @@ pub fn build(b: *std.Build) void {
     const run_hyperv_acceptance_protocol_tests =
         b.addRunArtifact(hyperv_acceptance_protocol_tests);
     test_step.dependOn(&run_hyperv_acceptance_protocol_tests.step);
+    storvsc_regression_tests.dependOn(
+        &run_hyperv_acceptance_protocol_tests.step,
+    );
     const application_protocol_tests = b.addExecutable(.{
         .name = "hyperv-application-protocol-test",
         .use_llvm = true,

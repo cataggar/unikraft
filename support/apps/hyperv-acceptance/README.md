@@ -30,6 +30,10 @@ DHCP, ARP, peer, content, sequence, count, or timeout error is `FAIL`.
 
 ## Application-network peer contract
 
+The default probe never writes to a block device. An environment without
+StorVSC or NetVSC returns 2 (`UNAVAILABLE`); a present device that cannot bind,
+configure, complete I/O, or meet the timeout returns 1.
+
 The default private peer inputs are:
 
 | Input | Value |
@@ -234,3 +238,43 @@ The native image is
 `support/apps/hyperv-acceptance/build/helloworld_hyperv-x86_64-efi-netvsc`.
 The application library retains the native graph's `apphelloworld`
 compatibility name.
+
+## Opt-in persistence workload
+
+`CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y` replaces the ordinary probe with a
+destructive workload that is valid only for a disposable, run-owned data disk.
+Generate the private seed and matching Kconfig fragment before the one final
+guest image build:
+
+```sh
+python3 support/scripts/hyperv-storage-manifest.py \
+  --output-prefix "$PWD/.d/persistence/run" \
+  --sectors 262144 --path 0 --target 0 --lun 1
+cat .d/persistence/run.config >> support/apps/hyperv-acceptance/.config
+```
+
+The helper creates a sparse raw disk with identical immutable manifests at
+LBAs 8 and 9, plus a private JSON receipt for orchestration. The controller
+must provision the requested exact geometry, convert/upload the seed without
+changing its logical sector count, attach it at the configured address, and
+retain the exact guest image and data disk for both boots.
+
+The guest opens read sessions only for exact address/geometry candidates,
+rejects MBR/GPT-shaped media, and requires exactly one matching private
+manifest with a supported nonzero VPD identity. Boot 1 then authorizes that
+session, flushes an intent at LBA 16, writes and verifies deterministic
+patterns at LBA 0, the final LBA, and LBAs 32..47, flushes and verifies again,
+and flushes a completion receipt at LBA 17. Boot 2 requires the enrolled
+controller/VPD identity and valid receipt, rereads every pattern, and performs
+no writes.
+
+Stable success markers are:
+
+- `UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:<run-id>`
+- `UK_HYPERV_PERSISTENCE_BOOT2_COMPLETE:<run-id>`
+
+The immutable guest cannot distinguish a controller rollback to the pristine
+seed from a genuine first boot. During the expected second boot, orchestration
+must therefore reject any boot-1/write marker; a receipt alone is not accepted
+without the guest's boot-2 pattern-read marker. Incomplete or corrupt
+intent/receipt state fails closed and is never restarted.

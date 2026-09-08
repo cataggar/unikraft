@@ -49,4 +49,49 @@ config APPHYPERVACCEPTANCE_NONCE
 	  Run-manifest nonce encoded as exactly 16 hexadecimal digits without
 	  a 0x prefix. Invalid values fail before any network traffic.
 
+config APPHYPERVACCEPTANCE_PERSISTENCE
+	bool "Run destructive disposable-disk persistence acceptance"
+	default n
+	select LIBSTORVSC_LUN_DISCOVERY
+	select LIBSTORVSC_GUARDED_IO
+	help
+	  Replace the ordinary read-only storage/network probe with the
+	  manifest-gated two-boot persistence workload. This may write only
+	  the uniquely matched disposable disk described below.
+
+if APPHYPERVACCEPTANCE_PERSISTENCE
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID
+	string "Private 128-bit run ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID
+	string "Private 128-bit disk ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS
+	int "Exact disposable disk sector count"
+	default 0
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE
+	int "Exact disposable disk sector size"
+	default 512
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_PATH
+	int "Expected StorVSC path"
+	range 0 255
+	default 0
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_TARGET
+	int "Expected StorVSC target"
+	range 0 255
+	default 0
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_LUN
+	int "Expected StorVSC LUN"
+	range 0 255
+	default 0
+endif
+endif
+
 endif

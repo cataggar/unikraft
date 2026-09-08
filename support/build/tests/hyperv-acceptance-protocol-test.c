@@ -219,9 +219,145 @@ static int test_buffer_alignment(void)
 	return 0;
 }
 
+static int test_persistence_protocol(void)
+{
+	struct hyperv_acceptance_persistence_expected expected = {
+		.sectors = 4096,
+		.sector_size = HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE,
+		.path_id = 0,
+		.target_id = 0,
+		.lun = 2,
+	};
+	struct hyperv_acceptance_persistence_identity identity = {
+		.path_id = 0,
+		.target_id = 0,
+		.lun = 2,
+		.vpd_length = 8,
+		.vpd_code_set = 1,
+		.vpd_designator_type = 3,
+	};
+	struct hyperv_acceptance_persistence_checksums checksums;
+	struct hyperv_acceptance_persistence_checksums found;
+	uint8_t seed0[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
+	uint8_t seed1[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
+	uint8_t intent[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE] = { 0 };
+	uint8_t receipt[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE] = { 0 };
+	uint8_t zero[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE] = { 0 };
+	uint8_t pattern[HYPERV_ACCEPTANCE_PERSISTENCE_EXTENT_SECTORS *
+			HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
+	uint8_t repeat[sizeof(pattern)];
+
+	for (unsigned int i = 0;
+	     i < HYPERV_ACCEPTANCE_PERSISTENCE_ID_SIZE; i++) {
+		expected.run_id[i] = (uint8_t)(0x10 + i);
+		expected.disk_id[i] = (uint8_t)(0x80 + i);
+		identity.controller_instance[i] = (uint8_t)(0x40 + i);
+	}
+	memcpy(identity.vpd_id, "\x50\x01\x02\x03\x04\x05\x06\x02", 8);
+	CHECK(!hyperv_acceptance_persistence_build_manifest(
+		&expected, seed0));
+	memcpy(seed1, seed0, sizeof(seed1));
+	CHECK(!hyperv_acceptance_persistence_validate_manifest(
+		seed0, &expected));
+	CHECK(!memcmp(seed0, "UKPSEED1", 8));
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		&found) == HYPERV_ACCEPTANCE_PERSISTENCE_PRISTINE);
+
+	seed1[120] = 1;
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		NULL) == HYPERV_ACCEPTANCE_PERSISTENCE_INVALID);
+	memcpy(seed1, seed0, sizeof(seed1));
+	seed1[32] ^= 1;
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		NULL) == HYPERV_ACCEPTANCE_PERSISTENCE_INVALID);
+	memcpy(seed1, seed0, sizeof(seed1));
+
+	hyperv_acceptance_persistence_pattern(
+		&expected, HYPERV_ACCEPTANCE_PERSISTENCE_PATTERN_FIRST,
+		0, pattern, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE);
+	checksums.first = hyperv_acceptance_persistence_crc32(
+		pattern, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE);
+	hyperv_acceptance_persistence_pattern(
+		&expected, HYPERV_ACCEPTANCE_PERSISTENCE_PATTERN_LAST,
+		0, pattern, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE);
+	checksums.last = hyperv_acceptance_persistence_crc32(
+		pattern, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE);
+	hyperv_acceptance_persistence_pattern(
+		&expected, HYPERV_ACCEPTANCE_PERSISTENCE_PATTERN_EXTENT,
+		0, pattern, sizeof(pattern));
+	memcpy(repeat, pattern, sizeof(repeat));
+	checksums.extent = hyperv_acceptance_persistence_crc32(
+		pattern, sizeof(pattern));
+	CHECK(checksums.first != checksums.last &&
+	      checksums.last != checksums.extent);
+	hyperv_acceptance_persistence_pattern(
+		&expected, HYPERV_ACCEPTANCE_PERSISTENCE_PATTERN_EXTENT,
+		0, pattern, sizeof(pattern));
+	CHECK(!memcmp(pattern, repeat, sizeof(pattern)));
+	hyperv_acceptance_persistence_pattern(
+		&expected, HYPERV_ACCEPTANCE_PERSISTENCE_PATTERN_EXTENT,
+		512, pattern, 512);
+	CHECK(memcmp(pattern, repeat, 512));
+
+	CHECK(!hyperv_acceptance_persistence_build_intent(
+		&expected, &identity, &checksums, intent));
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		&found) == HYPERV_ACCEPTANCE_PERSISTENCE_INCOMPLETE);
+	CHECK(!memcmp(&checksums, &found, sizeof(checksums)));
+	intent[90] ^= 1;
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		NULL) == HYPERV_ACCEPTANCE_PERSISTENCE_INVALID);
+	CHECK(!hyperv_acceptance_persistence_build_intent(
+		&expected, &identity, &checksums, intent));
+
+	CHECK(!hyperv_acceptance_persistence_build_receipt(
+		&expected, &identity, &checksums, intent, receipt));
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		&found) == HYPERV_ACCEPTANCE_PERSISTENCE_COMPLETE);
+	CHECK(!memcmp(&checksums, &found, sizeof(checksums)));
+	receipt[172] ^= 1;
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		NULL) == HYPERV_ACCEPTANCE_PERSISTENCE_INVALID);
+	CHECK(!hyperv_acceptance_persistence_build_receipt(
+		&expected, &identity, &checksums, intent, receipt));
+
+	identity.vpd_id[1] ^= 1;
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		NULL) == HYPERV_ACCEPTANCE_PERSISTENCE_INVALID);
+	identity.vpd_id[1] ^= 1;
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, zero, receipt,
+		NULL) == HYPERV_ACCEPTANCE_PERSISTENCE_INVALID);
+
+	expected.sectors++;
+	CHECK(hyperv_acceptance_persistence_validate_manifest(
+		seed0, &expected));
+	expected.sectors--;
+	identity.vpd_length = 0;
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		NULL) == HYPERV_ACCEPTANCE_PERSISTENCE_INVALID);
+	identity.vpd_length = 8;
+	memset(identity.controller_instance, 0,
+	       sizeof(identity.controller_instance));
+	CHECK(hyperv_acceptance_persistence_classify(
+		&expected, &identity, seed0, seed1, intent, receipt,
+		NULL) == HYPERV_ACCEPTANCE_PERSISTENCE_INVALID);
+	return 0;
+}
+
 int main(void)
 {
-	if (test_dhcp() || test_storage_and_gating() || test_buffer_alignment())
+	if (test_dhcp() || test_storage_and_gating() ||
+	    test_buffer_alignment() || test_persistence_protocol())
 		return 1;
 	puts("hyperv acceptance protocol tests passed");
 	return 0;
