@@ -119,6 +119,10 @@ static unsigned int storvsc_send_wait_limit = STORVSC_SEND_WAIT_LIMIT;
 static unsigned int storvsc_busy_retry_limit = STORVSC_BUSY_RETRY_LIMIT;
 static __u64 storvsc_busy_retry_timeout_ns =
 	STORVSC_BUSY_RETRY_TIMEOUT_NS;
+static int storvsc_lun_discovery_enabled =
+	CONFIG_LIBSTORVSC_LUN_DISCOVERY;
+#else
+#define storvsc_lun_discovery_enabled CONFIG_LIBSTORVSC_LUN_DISCOVERY
 #endif
 
 _Static_assert(CONFIG_LIBSTORVSC_MAX_DEVICES == 1,
@@ -584,29 +588,32 @@ static int storvsc_discover(struct storvsc_device *device,
 	memset(device->lun_addresses, 0, sizeof(device->lun_addresses));
 	memset(&device->address, 0, sizeof(device->address));
 	device->lun_count = 0;
-	rc = storvsc_build_report_luns(&spec, 0, 0,
-				       STORVSC_REPORT_LUNS_MAX,
-				       STORVSC_CONTROL_TIMEOUT_NS);
-	if (rc)
-		return rc;
-	rc = storvsc_execute_scsi(device, &spec,
-				  device->report_luns_data, &transferred);
-	if (rc)
-		return rc;
-	rc = storvsc_parse_report_luns(
-		device->report_luns_data, transferred, 0, 0,
-		device->lun_addresses, STORVSC_REPORT_LUNS_MAX,
-		&device->lun_count);
-	if (rc)
-		return rc;
-	for (lun = 0; lun < device->lun_count; lun++) {
-		if (device->lun_addresses[lun].lun == 0) {
-			device->address = device->lun_addresses[lun];
-			break;
+	if (storvsc_lun_discovery_enabled) {
+		rc = storvsc_build_report_luns(&spec, 0, 0,
+					       STORVSC_REPORT_LUNS_MAX,
+					       STORVSC_CONTROL_TIMEOUT_NS);
+		if (rc)
+			return rc;
+		rc = storvsc_execute_scsi(device, &spec,
+					  device->report_luns_data,
+					  &transferred);
+		if (rc)
+			return rc;
+		rc = storvsc_parse_report_luns(
+			device->report_luns_data, transferred, 0, 0,
+			device->lun_addresses, STORVSC_REPORT_LUNS_MAX,
+			&device->lun_count);
+		if (rc)
+			return rc;
+		for (lun = 0; lun < device->lun_count; lun++) {
+			if (device->lun_addresses[lun].lun == 0) {
+				device->address = device->lun_addresses[lun];
+				break;
+			}
 		}
+		if (lun == device->lun_count)
+			return -ENODEV;
 	}
-	if (lun == device->lun_count)
-		return -ENODEV;
 
 	memset(device->inquiry_data, 0, sizeof(device->inquiry_data));
 	storvsc_scsi_spec_init(&spec, 0x12, 6, STORVSC_DIRECTION_READ,
@@ -1870,6 +1877,11 @@ struct uk_blkdev *storvsc_host_blkdev(void)
 size_t storvsc_host_lun_count(void)
 {
 	return storvsc_devices[0].lun_count;
+}
+
+void storvsc_host_set_lun_discovery(int enabled)
+{
+	storvsc_lun_discovery_enabled = !!enabled;
 }
 
 int storvsc_host_lun_address(size_t index, struct storvsc_address *address)

@@ -18,6 +18,13 @@ config LIBSTORVSC_MAX_DEVICES
 	help
 		StorVSC currently supports exactly one synthetic storage device.
 
+config LIBSTORVSC_LUN_DISCOVERY
+	bool "Enable REPORT LUNS discovery"
+	default n
+	help
+		Issue a bounded SCSI REPORT LUNS command before attaching LUN 0.
+		This is an opt-in foundation for multi-LUN topology support.
+
 config LIBSTORVSC_MAX_QUEUES
 	int "Maximum queues per StorVSC device"
 	range 1 1

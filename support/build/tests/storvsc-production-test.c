@@ -25,6 +25,7 @@
 struct vmbus_driver *storvsc_host_driver(void);
 struct uk_blkdev *storvsc_host_blkdev(void);
 size_t storvsc_host_lun_count(void);
+void storvsc_host_set_lun_discovery(int enabled);
 int storvsc_host_lun_address(size_t index,
 			     struct storvsc_address *address);
 int storvsc_host_receive(void);
@@ -2364,7 +2365,9 @@ int main(void)
 		return 1;
 	if (vmbus_bus_host_connection_begin())
 		return 2;
+	report_luns_mode = REPORT_LUNS_TRUNCATED;
 	rc = driver->add_dev(&vmbus_device);
+	report_luns_mode = REPORT_LUNS_NORMAL;
 	if (rc)
 		return 3;
 	device = storvsc_host_blkdev();
@@ -2373,16 +2376,9 @@ int main(void)
 	    device->capabilities.mode != O_RDWR ||
 	    device->capabilities.max_sectors_per_req != 56)
 		return 3;
-	if (report_luns_commands != 1 || invalid_scsi_address ||
-	    storvsc_host_lun_count() != 3)
+	if (report_luns_commands || invalid_scsi_address ||
+	    storvsc_host_lun_count())
 		return 3;
-	for (size_t i = 0; i < 3; i++) {
-		if (storvsc_host_lun_address(i, &address) ||
-		    address.path_id || address.target_id ||
-		    address.lun != (uint8_t[]){ 0, 3, 7 }[i] ||
-		    address.reserved)
-			return 3;
-	}
 	if (configure_device(device, 2, &events))
 		return 4;
 	if (posix_memalign((void **)&buffer, 4096, 3 * 4096))
@@ -2632,6 +2628,9 @@ int main(void)
 	pending_count = 0;
 	hold_io = 0;
 
+	if (report_luns_commands)
+		return 25;
+	storvsc_host_set_lun_discovery(1);
 	vmbus_device.present = 1;
 	read_only_media = 1;
 	use_capacity16 = 1;
@@ -2643,6 +2642,15 @@ int main(void)
 	if (rc || device->capabilities.mode != O_RDONLY ||
 	    device->capabilities.sectors != 0x100000101ULL)
 		return 25;
+	if (report_luns_commands != 1 || storvsc_host_lun_count() != 3)
+		return 25;
+	for (size_t i = 0; i < 3; i++) {
+		if (storvsc_host_lun_address(i, &address) ||
+		    address.path_id || address.target_id ||
+		    address.lun != (uint8_t[]){ 0, 3, 7 }[i] ||
+		    address.reserved)
+			return 25;
+	}
 	initialize_request(&request, UK_BLKREQ_WRITE, 0, 1, buffer,
 			   request_done, &callbacks);
 	if (device->submit_one(device, device->_queue[0], &request) !=
