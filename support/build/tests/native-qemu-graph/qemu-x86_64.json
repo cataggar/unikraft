@@ -157,6 +157,7 @@
       "name": "libukboot",
       "objects": [
         "$BUILD_DIR/libukboot/boot.o",
+        "$BUILD_DIR/libukboot/smp.o",
         "$BUILD_DIR/libukboot/early_init.o",
         "$BUILD_DIR/libukboot/version.o",
         "$BUILD_DIR/libukboot/banner.o",

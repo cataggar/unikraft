@@ -1,4 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
+#include <uk/config.h>
+
+#if CONFIG_LIBUKBOOT_FIXED_SMP
+
 #include <errno.h>
 #include <uk/alloc.h>
 #include <uk/assert.h>
@@ -169,3 +173,5 @@ void uk_boot_fixed_smp_rollback(const __u64 *indices,
 		*cpu = (struct fixed_smp_boot_cpu){ 0 };
 	}
 }
+
+#endif /* CONFIG_LIBUKBOOT_FIXED_SMP */

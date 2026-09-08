@@ -395,6 +395,7 @@ pub const x86_64 = Profile{
             .origin = .library,
             .objects = &.{
                 "libukboot/boot.o",
+                "libukboot/smp.o",
                 "libukboot/early_init.o",
                 "libukboot/version.o",
                 "libukboot/banner.o",
@@ -781,6 +782,7 @@ pub const arm64 = Profile{
             .origin = .library,
             .objects = &.{
                 "libukboot/boot.o",
+                "libukboot/smp.o",
                 "libukboot/early_init.o",
                 "libukboot/version.o",
                 "libukboot/banner.o",

@@ -4,3 +4,7 @@ uk_boot_shutdown_req
 uk_boot_early_init
 uk_boot_entry
 ukplat_lcpu_startup_hook
+uk_boot_fixed_smp_prepare
+uk_boot_fixed_smp_lcpu_entry
+uk_boot_fixed_smp_wait_online
+uk_boot_fixed_smp_rollback

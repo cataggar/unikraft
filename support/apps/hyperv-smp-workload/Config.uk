@@ -5,6 +5,7 @@ menuconfig APPHYPERVSMPWORKLOAD
 	select LIBNOLIBC
 	select LIBUKSCHED
 	select LIBUKSCHEDCOOP
+	select LIBUKSGLIST
 	select HYPERV_FIXED_SMP_WORKLOAD
 	help
 	  Run bounded ISR execution, scheduled AP thread, TLS isolation,

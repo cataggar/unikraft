@@ -50,6 +50,30 @@ def terminal_assertion(instructions, index):
     return False
 
 
+def schedcoop_callback_bound(functions, symbols, constructor, callback):
+    """Follow scheduler constructor wrappers to the callback assignment."""
+    pending = [symbols[constructor]]
+    visited = set()
+    while pending:
+        address = pending.pop()
+        if address in visited or address not in functions:
+            continue
+        visited.add(address)
+        _, instructions = functions[address]
+        for _, op, operands in instructions:
+            if f"<{callback}>" in operands:
+                return True
+            if not op.startswith(("call", "j")) or operands.startswith("*"):
+                continue
+            target = re.match(r"(?:0x)?([0-9a-f]+)\s+<", operands)
+            if not target:
+                continue
+            destination = int(target[1], 16)
+            if destination in functions and "schedcoop_create" in functions[destination][0]:
+                pending.append(destination)
+    return False
+
+
 def verify(image, nm, objdump):
     symbols = {}
     kinds = {}
@@ -107,9 +131,15 @@ def verify(image, nm, objdump):
                 if caller is None or not op.startswith("call"):
                     raise ValueError(f"{name}: unreviewed indirect IRQ edge: {op} {operands}")
                 if caller == "uk_thread_wake_isr":
-                    constructor = functions[symbols["uk_schedcoop_create"]][1]
-                    if not any("schedcoop_thread_woken_isr>" in args for _, _, args in constructor):
-                        raise ValueError("schedcoop wake callback binding not found")
+                    constructors = ("uk_schedcoop_create", "uk_schedcoop_create_on")
+                    for constructor in constructors:
+                        if constructor in symbols and not schedcoop_callback_bound(
+                            functions, symbols, constructor,
+                            "schedcoop_thread_woken_isr"
+                        ):
+                            raise ValueError(
+                                f"{constructor}: schedcoop wake callback binding not found"
+                            )
                 elif caller == "uk_intctlr_irq_handle":
                     # For SynIC vectors, time.c registers these three callbacks.
                     constructor = functions[symbols["ukplat_time_init"]][1]

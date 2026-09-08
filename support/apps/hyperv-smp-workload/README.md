@@ -12,3 +12,6 @@ separate bounded proofs on CPU 1:
 `UK_HYPERV_SMP_WORKLOAD_READY PASS` is emitted only after all three pass. A
 hosted fixture or an exact-image build is not a substitute for this marker
 from a real Hyper-V guest.
+
+The application retains the native image graph's `apphelloworld` compatibility
+library name; its serial markers and behavior are scheduled-SMP-specific.
