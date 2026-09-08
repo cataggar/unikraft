@@ -2,6 +2,7 @@
 #include <hyperv/hyperv.h>
 #include <hyperv/clock.h>
 #include <hyperv/cpu_lifecycle.h>
+#include <uk/acpi/madt.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include <uk/pcpuvar.h>
 #include <uk/plat/spinlock.h>
 #include <uk/plat/time.h>
+#include <uk/plat/common/sections.h>
 #include <uk/print.h>
 
 #define HYPERV_EVENT_WORDS_PER_SINT	32U
@@ -23,6 +25,7 @@
 #define HYPERV_TIME_OFFLINE		0
 #define HYPERV_TIME_RUNNING		1
 #define HYPERV_TIME_STOPPING		2
+#define HYPERV_TIME_QUIESCED		3
 #define HYPERV_CPU_STOP_TIMEOUT_NS	100000000ULL
 #define HYPERV_CPU_INIT_TIMEOUT_TICKS	1000000ULL
 
@@ -33,6 +36,7 @@ static __u64 hyperv_efi_ref;
 static __u64 hyperv_boot_ref;
 static unsigned int hyperv_irqs[2];
 static int hyperv_time_initialized;
+static int hyperv_shutdown_first_error;
 static __u8
 hyperv_simp_pages[CONFIG_UKPLAT_CPU_MAXCOUNT][HYPERV_PAGE_SIZE]
 	__align(HYPERV_PAGE_SIZE);
@@ -46,6 +50,8 @@ static __u32 hyperv_cpu_generation;
 static __u8 hyperv_message_vector;
 static __u8 hyperv_timer_vector;
 static __u32 hyperv_irq_dropped;
+static __u32 hyperv_vp_cursor;
+static __u32 hyperv_vp_refs[CONFIG_UKPLAT_CPU_MAXCOUNT];
 static int hyperv_current_cpu_index(__u32 *index);
 
 _Static_assert(CONFIG_UKPLAT_CPU_MAXCOUNT >= 1,
@@ -63,6 +69,10 @@ _Static_assert(__alignof__(hyperv_siefp_pages) >= HYPERV_PAGE_SIZE,
 
 static __u8 hyperv_pending_events[CONFIG_UKPLAT_CPU_MAXCOUNT];
 unsigned long sched_have_pending_events;
+#if CONFIG_HAVE_SMP
+static __u8 hyperv_ap_stacks[CONFIG_UKPLAT_CPU_MAXCOUNT - 1][__STACK_SIZE]
+	__align(16);
+#endif
 
 static void hyperv_time_mark_pending(void)
 {
@@ -326,6 +336,8 @@ static void hyperv_cpu_fini_current(void)
 	    __atomic_load_n(&hyperv_cpus[index].state, __ATOMIC_ACQUIRE) ==
 		    HYPERV_CPU_OFFLINE)
 		return;
+	while (__atomic_load_n(&hyperv_vp_refs[index], __ATOMIC_ACQUIRE))
+		__asm__ __volatile__("pause");
 	__atomic_store_n(&hyperv_cpus[index].state, HYPERV_CPU_STOPPING,
 			 __ATOMIC_RELEASE);
 	hyperv_stimer0_cancel();
@@ -351,6 +363,42 @@ int ukplat_lcpu_init_hook(void)
 	return rc;
 }
 
+int ukplat_lcpu_startup_hook(void)
+{
+#if CONFIG_HAVE_SMP
+	__u64 indices[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
+	__uptr stacks[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
+	unsigned int count = uk_acpi_cpu_count();
+	unsigned int started;
+	unsigned int online;
+	unsigned int i;
+	int rc;
+
+	if (count <= 1)
+		return 0;
+	if (count > CONFIG_UKPLAT_CPU_MAXCOUNT)
+		return -ERANGE;
+	for (i = 1; i < count; i++) {
+		indices[i - 1] = i;
+		stacks[i - 1] = (__uptr)&hyperv_ap_stacks[i - 1][__STACK_SIZE];
+	}
+	started = count - 1;
+	rc = uk_lcpu_start(indices, &started, stacks, NULL, 0);
+	if (rc || started != count - 1)
+		return rc ? rc : -EIO;
+	online = started;
+	rc = uk_lcpu_wait(indices, &online, HYPERV_CPU_STOP_TIMEOUT_NS);
+	if (rc || online != started)
+		return rc ? rc : -ETIMEDOUT;
+	for (i = 0; i < started; i++)
+		if (__atomic_load_n(&hyperv_cpus[indices[i]].state,
+				    __ATOMIC_ACQUIRE) != HYPERV_CPU_ONLINE)
+			return -EIO;
+	uk_pr_info("Hyper-V: started %u secondary CPU(s)\n", started);
+#endif
+	return 0;
+}
+
 void ukplat_lcpu_fini_hook(void)
 {
 	hyperv_cpu_fini_current();
@@ -374,7 +422,10 @@ void ukplat_time_init(void)
 		hyperv_cpus[i].vp_index = UINT32_MAX;
 		hyperv_cpus[i].generation = 0;
 		hyperv_cpus[i].state = HYPERV_CPU_OFFLINE;
+		hyperv_vp_refs[i] = 0;
 	}
+	hyperv_vp_cursor = 0;
+	hyperv_shutdown_first_error = 0;
 	rc = uk_intctlr_irq_alloc(hyperv_irqs, 2);
 	if (unlikely(rc))
 		UK_CRASH("Hyper-V: failed to allocate SynIC IRQs: %d\n", rc);
@@ -536,12 +587,13 @@ int hyperv_time_shutdown(int crash)
 	int expected = HYPERV_TIME_RUNNING;
 	int rc;
 
-	if (state == HYPERV_TIME_OFFLINE)
+	if (state == HYPERV_TIME_OFFLINE || state == HYPERV_TIME_QUIESCED)
 		return 0;
 	if (!__atomic_compare_exchange_n(&hyperv_time_initialized, &expected,
 			HYPERV_TIME_STOPPING, 0, __ATOMIC_ACQ_REL,
 			__ATOMIC_ACQUIRE)) {
-		if (expected == HYPERV_TIME_OFFLINE)
+		if (expected == HYPERV_TIME_OFFLINE ||
+		    expected == HYPERV_TIME_QUIESCED)
 			return 0;
 		/* Another CPU owns teardown. A secondary caller must park. */
 		if (!uk_lcpu_current_is_bsp())
@@ -551,8 +603,8 @@ int hyperv_time_shutdown(int crash)
 	hyperv_vmbus_fini();
 	if (!crash) {
 		rc = hyperv_cpu_fini_others();
-		if (rc)
-			return rc;
+		if (rc && !hyperv_shutdown_first_error)
+			hyperv_shutdown_first_error = rc;
 	}
 	hyperv_cpu_fini_current();
 	hyperv_reference_tsc_disable();
@@ -572,9 +624,15 @@ int hyperv_time_shutdown(int crash)
 	uk_intctlr_irq_unregister(hyperv_irqs[1], hyperv_timer_irq);
 	uk_intctlr_irq_unregister(hyperv_irqs[0], hyperv_message_irq);
 	uk_intctlr_irq_free(hyperv_irqs, 2);
-	__atomic_store_n(&hyperv_time_initialized, HYPERV_TIME_OFFLINE,
+	__atomic_store_n(&hyperv_time_initialized, HYPERV_TIME_QUIESCED,
 			 __ATOMIC_RELEASE);
 	return 0;
+}
+
+int hyperv_time_shutdown_error(void)
+{
+	return __atomic_load_n(&hyperv_shutdown_first_error,
+			       __ATOMIC_ACQUIRE);
 }
 
 void ukplat_time_fini(void)
@@ -588,10 +646,48 @@ __u32 ukplat_time_get_irq(void)
 		HYPERV_TIME_RUNNING ? hyperv_irqs[1] : UINT32_MAX;
 }
 
-__u32 hyperv_vmbus_target_vp(void)
+int hyperv_vmbus_target_acquire(__u32 *vp_index, __u32 *generation)
 {
-	return __atomic_load_n(&hyperv_cpus[0].state, __ATOMIC_ACQUIRE) ==
-		HYPERV_CPU_ONLINE ? hyperv_cpus[0].vp_index : UINT32_MAX;
+	unsigned long flags;
+	unsigned int start;
+	unsigned int offset;
+
+	if (!vp_index || !generation)
+		return -EINVAL;
+	ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
+	start = hyperv_vp_cursor++ % CONFIG_UKPLAT_CPU_MAXCOUNT;
+	for (offset = 0; offset < CONFIG_UKPLAT_CPU_MAXCOUNT; offset++) {
+		unsigned int index =
+			(start + offset) % CONFIG_UKPLAT_CPU_MAXCOUNT;
+
+		if (__atomic_load_n(&hyperv_cpus[index].state,
+				    __ATOMIC_ACQUIRE) != HYPERV_CPU_ONLINE)
+			continue;
+		hyperv_vp_refs[index]++;
+		*vp_index = hyperv_cpus[index].vp_index;
+		*generation = hyperv_cpus[index].generation;
+		ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+		return 0;
+	}
+	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+	return -ENODEV;
+}
+
+void hyperv_vmbus_target_release(__u32 vp_index, __u32 generation)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
+	for (i = 0; i < CONFIG_UKPLAT_CPU_MAXCOUNT; i++) {
+		if (hyperv_cpus[i].vp_index != vp_index ||
+		    hyperv_cpus[i].generation != generation)
+			continue;
+		if (hyperv_vp_refs[i])
+			hyperv_vp_refs[i]--;
+		break;
+	}
+	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
 }
 
 void time_block_until(__snsec until)

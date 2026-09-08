@@ -58,6 +58,8 @@ struct vmbus_channel {
 	__u32 open_id;
 	__u32 relid;
 	__u32 connection_id;
+	__u32 target_vp;
+	__u32 target_generation;
 	__u64 relid_sequence;
 	__u8 state;
 	__u8 rescinded;
@@ -66,6 +68,7 @@ struct vmbus_channel {
 	__u8 close_posted;
 	__u8 teardown_posted;
 	__u8 gpadl_posted;
+	__u8 target_held;
 	__u16 gpadl_record;
 	struct vmbus_channel_owner owner;
 	__spinlock lifetime_lock;
@@ -296,6 +299,12 @@ static void release_channel_object_locked(struct vmbus_channel *channel)
 	channel->open_id = 0;
 	channel->relid = 0;
 	channel->connection_id = 0;
+	if (channel->target_held)
+		hyperv_vmbus_target_release(channel->target_vp,
+					   channel->target_generation);
+	channel->target_vp = 0;
+	channel->target_generation = 0;
+	channel->target_held = 0;
 	channel->relid_sequence = 0;
 	channel->rescinded = 0;
 	channel->event_pending = 0;
@@ -1042,12 +1051,16 @@ static int open_channel_control(struct vmbus_channel *channel,
 {
 	struct vmbus_channel_transaction *transaction;
 	__u8 message[148];
-	__u32 target_vp = hyperv_vmbus_target_vp();
 	int length;
 	int rc;
 
-	if (target_vp == UINT32_MAX)
-		return -ENODEV;
+	if (!channel->target_held) {
+		rc = hyperv_vmbus_target_acquire(&channel->target_vp,
+						 &channel->target_generation);
+		if (rc)
+			return rc;
+		channel->target_held = 1;
+	}
 	rc = vmbus_monotonic_id_allocate(&next_open_id, &channel->open_id);
 	if (rc)
 		return rc;
@@ -1057,7 +1070,7 @@ static int open_channel_control(struct vmbus_channel *channel,
 		return -ENOSPC;
 	length = vmbus_open_message(message, sizeof(message),
 			channel->relid, channel->open_id,
-			channel->gpadl_id, target_vp, channel->tx_pages,
+			channel->gpadl_id, channel->target_vp, channel->tx_pages,
 			user_data, user_data_size);
 	rc = vmbus_channel_state_open_begin(&channel->state);
 	if (rc)

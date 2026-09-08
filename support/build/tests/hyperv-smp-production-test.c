@@ -27,6 +27,10 @@ static int block_enable_cpu = -1;
 static int enable_entered;
 static int release_enable;
 static unsigned char reference_page[4096] __attribute__((aligned(4096)));
+static unsigned int host_cpu_count = 1;
+static unsigned int start_calls;
+static int host_run_error;
+static int host_wait_error;
 
 void *hyperv_reference_tsc_page(void) { return reference_page; }
 uint32_t hyperv_vp_index(void) { return vp_indices[hyperv_host_cpu_index]; }
@@ -135,6 +139,10 @@ int uk_lcpu_run(const uint64_t *indices, unsigned int *count,
 	pthread_t threads[4];
 	unsigned int created = 0;
 
+	if (host_run_error) {
+		*count = 0;
+		return host_run_error;
+	}
 	for (unsigned int i = 0; i < *count; i++) {
 		runs[i].index = indices[i];
 		runs[i].fn = fn;
@@ -154,13 +162,36 @@ int uk_lcpu_wait(const uint64_t *indices __attribute__((unused)),
 		 unsigned int *count __attribute__((unused)),
 		 uint64_t timeout __attribute__((unused)))
 {
+	return host_wait_error;
+}
+unsigned int uk_acpi_cpu_count(void) { return host_cpu_count; }
+int ukplat_lcpu_init_hook(void);
+int uk_lcpu_start(const uint64_t *indices, unsigned int *count,
+		  uintptr_t *stacks, uintptr_t *entries __attribute__((unused)),
+		  unsigned long flags __attribute__((unused)))
+{
+	uint64_t caller = hyperv_host_cpu_index;
+
+	for (unsigned int i = 0; i < *count; i++) {
+		assert(stacks[i]);
+		hyperv_host_cpu_index = indices[i];
+		start_calls++;
+		if (ukplat_lcpu_init_hook()) {
+			*count = i;
+			hyperv_host_cpu_index = caller;
+			return -EIO;
+		}
+	}
+	hyperv_host_cpu_index = caller;
 	return 0;
 }
 
 void ukplat_time_init(void);
-int ukplat_lcpu_init_hook(void);
+int ukplat_lcpu_startup_hook(void);
 int hyperv_time_shutdown(int crash);
-uint32_t hyperv_vmbus_target_vp(void);
+int hyperv_time_shutdown_error(void);
+int hyperv_vmbus_target_acquire(uint32_t *, uint32_t *);
+void hyperv_vmbus_target_release(uint32_t, uint32_t);
 int hyperv_time_host_message_irq(void);
 int hyperv_time_host_timer_irq(void);
 int hyperv_time_host_cpu_state(unsigned int index);
@@ -180,6 +211,10 @@ static void reset_observations(void)
 	enable_entered = 0;
 	release_enable = 0;
 	reference_time = 0;
+	host_cpu_count = 1;
+	start_calls = 0;
+	host_run_error = 0;
+	host_wait_error = 0;
 	order = 0;
 	vmbus_fini_order = 0;
 	first_disable_order = 0;
@@ -190,21 +225,33 @@ static void test_cpu_setup_routing_and_ap_shutdown(void)
 	reset_observations();
 	hyperv_host_cpu_index = 0;
 	ukplat_time_init();
-	assert(hyperv_vmbus_target_vp() == 3);
+	{
+		uint32_t vp;
+		uint32_t generation;
+
+		assert(hyperv_vmbus_target_acquire(&vp, &generation) == 0);
+		assert(vp == 3 && generation);
+		hyperv_vmbus_target_release(vp, generation);
+	}
 	assert(enable_count[0] == 1);
 
-	hyperv_host_cpu_index = 1;
-	assert(ukplat_lcpu_init_hook() == 0);
+	host_cpu_count = 3;
+	assert(ukplat_lcpu_startup_hook() == 0);
+	assert(start_calls == 2);
 	assert(enable_count[1] == 1);
+	{
+		uint32_t vp[3];
+		uint32_t generation[3];
+
+		for (unsigned int i = 0; i < 3; i++)
+			assert(hyperv_vmbus_target_acquire(
+				       &vp[i], &generation[i]) == 0);
+		assert(vp[0] == 7 && vp[1] == 8 && vp[2] == 3);
+		for (unsigned int i = 0; i < 3; i++)
+			hyperv_vmbus_target_release(vp[i], generation[i]);
+	}
 	hyperv_host_cpu_index = 2;
-	vp_indices[2] = 7;
-	assert(ukplat_lcpu_init_hook() == -EEXIST);
-	assert(enable_count[2] == 0);
-	vp_indices[2] = 8;
-	fail_enable_cpu = 2;
-	assert(ukplat_lcpu_init_hook() == -EIO);
-	assert(hyperv_time_host_cpu_state(2) == HYPERV_CPU_OFFLINE);
-	fail_enable_cpu = -1;
+	/* Reinitializing an online CPU is idempotent for the same VP. */
 	assert(ukplat_lcpu_init_hook() == 0);
 
 	hyperv_host_cpu_index = 0;
@@ -272,9 +319,41 @@ static void test_startup_shutdown_race(void)
 	assert(hyperv_time_host_cpu_state(1) == HYPERV_CPU_OFFLINE);
 }
 
+static void test_partial_ap_setup_rollback(void)
+{
+	reset_observations();
+	hyperv_host_cpu_index = 0;
+	ukplat_time_init();
+	hyperv_host_cpu_index = 1;
+	fail_enable_cpu = 1;
+	assert(ukplat_lcpu_init_hook() == -EIO);
+	assert(hyperv_time_host_cpu_state(1) == HYPERV_CPU_OFFLINE);
+	assert(enable_count[1] == 1 && disable_count[1] == 1);
+	hyperv_host_cpu_index = 0;
+	fail_enable_cpu = -1;
+	assert(hyperv_time_shutdown(0) == 0);
+}
+
+static void test_shutdown_failure_fails_forward(void)
+{
+	reset_observations();
+	hyperv_host_cpu_index = 0;
+	ukplat_time_init();
+	hyperv_host_cpu_index = 1;
+	assert(ukplat_lcpu_init_hook() == 0);
+	hyperv_host_cpu_index = 0;
+	host_run_error = -EIO;
+	assert(hyperv_time_shutdown(0) == 0);
+	assert(hyperv_time_shutdown_error() == -EIO);
+	assert(hyperv_time_host_runtime_state() == 3);
+	assert(hyperv_time_shutdown(1) == 0);
+}
+
 int main(void)
 {
 	test_cpu_setup_routing_and_ap_shutdown();
+	test_partial_ap_setup_rollback();
 	test_startup_shutdown_race();
+	test_shutdown_failure_fails_forward();
 	return 0;
 }

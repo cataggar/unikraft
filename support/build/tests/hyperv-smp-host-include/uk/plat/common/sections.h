@@ -1,0 +1,1 @@
+#define __STACK_SIZE 16384U

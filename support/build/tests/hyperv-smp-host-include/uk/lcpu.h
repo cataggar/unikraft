@@ -20,3 +20,5 @@ void __attribute__((noreturn)) uk_lcpu_halt(void);
 int uk_lcpu_run(const __u64 *, unsigned int *, const struct uk_lcpu_func *,
 		 unsigned long);
 int uk_lcpu_wait(const __u64 *, unsigned int *, __nsec);
+int uk_lcpu_start(const __u64 *, unsigned int *, uintptr_t *, uintptr_t *,
+		   unsigned long);
