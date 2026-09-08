@@ -1128,27 +1128,32 @@ pub fn build(b: *std.Build) void {
     hyperv_irq_tests.dependOn(&b.addRunArtifact(hyperv_smp_tests).step);
     hyperv_irq_tests.dependOn(&verify_hyperv_runtime.step);
     hyperv_irq_tests.dependOn(&verify_vmbus_protocol.step);
-    const xpic_correctness_tests = b.addExecutable(.{
-        .name = "xpic-runtime-correctness-test",
-        .root_module = b.createModule(.{
-            .target = b.graph.host,
-            .optimize = .Debug,
-            .link_libc = true,
-        }),
-    });
-    xpic_correctness_tests.root_module.addIncludePath(
-        b.path("support/build/tests/xpic-fixture/include"),
-    );
-    xpic_correctness_tests.root_module.addCSourceFiles(.{
-        .files = &.{
-            "drivers/ukintctlr/xpic/ukintctlr.c",
-            "support/build/tests/xpic-runtime-correctness-test.c",
-        },
-        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
-    });
-    const run_xpic_correctness_tests = b.addRunArtifact(xpic_correctness_tests);
-    test_step.dependOn(&run_xpic_correctness_tests.step);
-    hyperv_irq_tests.dependOn(&run_xpic_correctness_tests.step);
+    for ([_]bool{ false, true }) |legacy_apic| {
+        const xpic_correctness_tests = b.addExecutable(.{
+            .name = if (legacy_apic) "xpic-runtime-correctness-test" else "xpic-x2apic-only-test",
+            .root_module = b.createModule(.{
+                .target = b.graph.host,
+                .optimize = .Debug,
+                .link_libc = true,
+            }),
+        });
+        xpic_correctness_tests.root_module.addIncludePath(
+            b.path("support/build/tests/xpic-fixture/include"),
+        );
+        xpic_correctness_tests.root_module.addCSourceFiles(.{
+            .files = &.{
+                "drivers/ukintctlr/xpic/ukintctlr.c",
+                "support/build/tests/xpic-runtime-correctness-test.c",
+            },
+            .flags = &.{
+                "-std=c11",                                                                            "-Wall", "-Wextra", "-Werror",
+                if (legacy_apic) "-DCONFIG_LIBUKINTCTLR_XAPIC=1" else "-DCONFIG_LIBUKINTCTLR_XAPIC=0",
+            },
+        });
+        const run_xpic_correctness_tests = b.addRunArtifact(xpic_correctness_tests);
+        test_step.dependOn(&run_xpic_correctness_tests.step);
+        hyperv_irq_tests.dependOn(&run_xpic_correctness_tests.step);
+    }
     const lto_policy_tests = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/lto-symbol-policy-test.py",

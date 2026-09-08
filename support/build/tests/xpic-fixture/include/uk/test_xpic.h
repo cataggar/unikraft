@@ -3,15 +3,33 @@
 #define __UK_TEST_XPIC_H__
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define CONFIG_LIBUKINTCTLR_APIC 1
+#ifndef CONFIG_LIBUKINTCTLR_XAPIC
+#define CONFIG_LIBUKINTCTLR_XAPIC 1
+#endif
 #define UK_ARCH_X86_64_CPUID1_ECX_X2APIC (1U << 21)
+#define UK_ARCH_X86_64_CPUID1_EDX_MSR (1U << 5)
+#define UK_ARCH_X86_64_CPUID1_EDX_APIC (1U << 9)
 #define UK_ARCH_X86_64_APIC_MSR_BASE 0x01bU
+#define UK_ARCH_X86_64_APIC_BASE_BSP (1U << 8)
 #define UK_ARCH_X86_64_APIC_BASE_EN (1U << 11)
 #define UK_ARCH_X86_64_APIC_BASE_EXTD (1U << 10)
+#define UK_ARCH_X86_64_APIC_BASE_ADDR_MASK 0x0000000ffffff000UL
 #define UK_ARCH_X86_64_APIC_MSR_EOI 0x80bU
 #define UK_ARCH_X86_64_APIC_MSR_SVR 0x80fU
 #define UK_ARCH_X86_64_APIC_SVR_EN (1U << 8)
+#define UK_ARCH_X86_64_APIC_SVR_VECTOR_MASK 0xffUL
+#define UK_ARCH_X86_64_PTE_PWT 0x08UL
+#define UK_ARCH_X86_64_PTE_PCD 0x10UL
+#define __U32_MAX UINT32_MAX
+
+#define UK_PAGING_PAGE_LEVEL 0
+#define UK_PAGING_PAGE_SIZE 4096
+#define UK_PAGING_PAGE_ATTR_PROT_RW 3
+#define UK_PAGING_PAGE_FLAG_FORCE_SIZE 4
+#define UK_PAGING_PT_Lx_PTE_PADDR(pte, level) ((pte) & 0x000ffffffffff000UL)
 
 #define UK_EVENT_NOT_HANDLED 0
 #define UK_EVENT_HANDLED 1
@@ -24,6 +42,30 @@
 #define unlikely(value) __builtin_expect(!!(value), 0)
 
 typedef uint32_t __u32;
+typedef uint64_t __u64;
+typedef uint64_t __vaddr_t;
+typedef uint64_t __paddr_t;
+typedef uint64_t __pte_t;
+
+struct uk_pagetable {
+	int unused;
+};
+
+struct uk_paging_page_mapx {
+	int (*map)(struct uk_pagetable *, __vaddr_t, __vaddr_t,
+		   unsigned int, __pte_t *, void *);
+	void *ctx;
+};
+
+struct uk_pagetable *uk_paging_pt_get_active(void);
+int uk_paging_paddr_range_isvalid(__paddr_t start, size_t length);
+int uk_paging_page_mapx(struct uk_pagetable *pt, __vaddr_t vaddr,
+		       __paddr_t paddr, unsigned long pages,
+		       unsigned long attr, unsigned long flags,
+		       struct uk_paging_page_mapx *mapx);
+__u32 uk_arch_x86_64_readl(const volatile void *addr);
+void uk_arch_x86_64_writel(volatile void *addr, __u32 value);
+void uk_arch_x86_64_wmb(void);
 
 struct uk_intctlr_irq {
 	unsigned int id;
