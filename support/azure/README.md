@@ -10,9 +10,16 @@ storage/network pass.
 On 2026-09-08, the single-CPU acceptance probe completed on an Azure Generation
 2 `Standard_D2s_v5` VM in `westus2`, using the implementation through
 [`8c87f56ab3eaa71974812cd748c3a6bfa61c563b`][unikraft-revision].
+After the single-CPU legacy-APIC correction in
+[`4cdabd975ab4bc39dcdabeca496d8ee8630e3759`][amd-revision], the same image
+completed the full probe on both `Standard_D2as_v5` and `Standard_D2s_v5` in
+`westus2`. A further `Standard_D2s_v5` run in `westus3` completed the same
+platform, storage, and DHCP stages. These successful runs all negotiated
+VMBus 5.3, VMStor 6.2, and NVS 6.1.
 
 | Surface | Observed result |
 | --- | --- |
+| Interrupt controller | Intel x2APIC path and AMD legacy xAPIC MMIO path |
 | Platform | Hypercall/SynIC initialization and the application-ready marker |
 | VMBus | Protocol 5.3, twelve offers |
 | Storage | VMStor 6.2, 66 MiB OS disk; 1,024 bytes read from MBR/primary GPT |
@@ -26,12 +33,13 @@ workload result. The kernel used one CPU even though the Azure size exposes
 two. The configured storage-controller pool accepted the OS controller and
 rejected one additional offer; multiple-controller coverage is not implied.
 
-A fresh configuration at the same revision exposed two further compatibility
-limits: a `Standard_D2as_v5` run failed interrupt-controller initialization
-([#81][amd-irq]), while another `Standard_D2s_v5` host using VMBus 6.0 and
+A fresh configuration at the initial revision exposed missing legacy-APIC
+support on `Standard_D2as_v5`; [#81][amd-irq] is now resolved by the correction
+and both-family runs above. Another `Standard_D2s_v5` host using VMBus 6.0 and
 VMStor 6.0 passed platform/storage but rejected NetVSC binding with `EPROTO`
-([#82][netvsc-variant]). The successful smoke run is not blanket coverage of
-every Azure host variant.
+([#82][netvsc-variant]). The successful smoke runs are not blanket coverage of
+every Azure host variant, and the legacy-APIC path is restricted to single-CPU
+Hyper-V configurations.
 
 Retain each run's private `state.json`, `packaging.json`, `acceptance.json`,
 and serial logs for its exact image fingerprints and outcome. Do not publish
@@ -193,5 +201,6 @@ stress testing, and production readiness remain separate milestones.
 [upload]: https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-upload-vhd-to-managed-disk-cli
 [miz-revision]: https://github.com/cataggar/miz/commit/2db68ca0c3ab12155012a823c3fb8d7aba1cb544
 [unikraft-revision]: https://github.com/cataggar/unikraft/commit/8c87f56ab3eaa71974812cd748c3a6bfa61c563b
+[amd-revision]: https://github.com/cataggar/unikraft/commit/4cdabd975ab4bc39dcdabeca496d8ee8630e3759
 [amd-irq]: https://github.com/cataggar/unikraft/issues/81
 [netvsc-variant]: https://github.com/cataggar/unikraft/issues/82
