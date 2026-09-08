@@ -18,8 +18,10 @@ The application replaces only that netif instance's unbounded lib-lwip
 poll/transmit callbacks with a scoped boundary that processes at most 64 RX
 packets per pump and attempts each TX exactly once. Persistent TX backpressure
 fails acceptance instead of spinning; a continuous RX flood returns to lwIP
-timers and the outer deadlines after every bounded batch. The pinned external
-wrapper checkout remains unmodified.
+timers and the outer deadlines after every bounded batch. NetVSC also limits
+each deferred channel drain to 64 VMBus packets and requeues remaining work on
+the VMBus worker, so the bound applies below the stack adapter. The pinned
+external wrapper checkout remains unmodified.
 
 `UK_HYPERV_IO_READY` is emitted only when storage and the selected network mode
 both pass. A missing offer is `UNAVAILABLE`; a present but unbound device or any
@@ -86,8 +88,12 @@ The bounded operation set is:
 - ARP: 5-second deadline with one-second retries;
 - each TCP connection and each UDP exchange: 5-second deadline.
 
-The peer may close each TCP connection after its complete response. It must
-keep the UDP source address and port equal to the configured destination.
+After sending each complete TCP response, the peer must shut down its write
+side to deliver orderly EOF. The guest keeps the PCB callbacks installed and
+does not count success until the request is fully acknowledged, the exact
+response is validated, and that EOF arrives. Delayed extra bytes, a reset, or
+missing EOF fails under the same five-second deadline. The peer must keep the
+UDP source address and port equal to the configured destination.
 
 Stable application markers are:
 
@@ -139,11 +145,15 @@ make -C support/apps/hyperv-acceptance \
   HOSTCC='/home/g/.local/bin/zig cc' protocol-test
 ```
 
-The application fixture includes deterministic callback-state regressions for
-a reset PCB with unsent bytes and a valid response followed by extra bytes. It
-also drives endless mock RX and persistent TX-busy statuses through the same
-bounded policy used by the guest, proving that timer/deadline checks and
-cleanup regain control.
+The application fixture includes deterministic multi-pump callback-state
+regressions for a reset PCB with unsent bytes, delayed extra bytes or reset
+after a valid response, orderly EOF, and missing-EOF timeout. It also drives
+endless mock RX and persistent TX-busy statuses through the same bounded
+policy used by the guest, proving that timer/deadline checks and cleanup regain
+control. The NetVSC production fixture separately replenishes mock VMBus
+traffic during a real driver drain, reenters `drain_pending`, verifies exact
+64-packet returns and deferred progress, then covers TX saturation and detach
+cleanup.
 
 ## Build the default raw smoke
 

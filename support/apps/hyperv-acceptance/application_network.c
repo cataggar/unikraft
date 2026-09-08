@@ -676,7 +676,7 @@ static int run_tcp_connection(
 	}
 
 	deadline = ukplat_monotonic_clock() + APPLICATION_IO_TIMEOUT_NS;
-	while (!exchange.failed && ukplat_monotonic_clock() < deadline) {
+	while (!exchange.failed) {
 		enum hyperv_acceptance_app_tcp_action action;
 
 		if (application_pump()) {
@@ -689,7 +689,9 @@ static int run_tcp_connection(
 			exchange.connected,
 			exchange.transmit_offset < exchange.transmit_length,
 			exchange.response_valid,
-			exchange.acknowledged == exchange.transmit_length);
+			exchange.acknowledged == exchange.transmit_length,
+			exchange.peer_closed,
+			ukplat_monotonic_clock() >= deadline);
 		if (action == HYPERV_ACCEPTANCE_APP_TCP_FAIL)
 			break;
 		if (action == HYPERV_ACCEPTANCE_APP_TCP_SEND) {
@@ -708,7 +710,9 @@ static int run_tcp_connection(
 					exchange.transmit_length,
 				exchange.response_valid,
 				exchange.acknowledged ==
-					exchange.transmit_length);
+					exchange.transmit_length,
+				exchange.peer_closed,
+				ukplat_monotonic_clock() >= deadline);
 			if (action == HYPERV_ACCEPTANCE_APP_TCP_FAIL)
 				break;
 		}

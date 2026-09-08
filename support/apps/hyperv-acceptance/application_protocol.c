@@ -99,13 +99,14 @@ int hyperv_acceptance_app_single_tx_attempt(
 
 enum hyperv_acceptance_app_tcp_action hyperv_acceptance_app_tcp_next_action(
 	int failed, int pcb_owned, int connected, int transmit_pending,
-	int response_valid, int fully_acknowledged)
+	int response_valid, int fully_acknowledged, int peer_closed,
+	int deadline_expired)
 {
-	if (failed || !pcb_owned)
+	if (failed || !pcb_owned || deadline_expired)
 		return HYPERV_ACCEPTANCE_APP_TCP_FAIL;
 	if (connected && transmit_pending)
 		return HYPERV_ACCEPTANCE_APP_TCP_SEND;
-	if (response_valid && fully_acknowledged)
+	if (response_valid && fully_acknowledged && peer_closed)
 		return HYPERV_ACCEPTANCE_APP_TCP_CLOSE;
 	return HYPERV_ACCEPTANCE_APP_TCP_WAIT;
 }

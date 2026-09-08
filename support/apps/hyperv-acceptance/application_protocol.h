@@ -65,7 +65,8 @@ int hyperv_acceptance_app_single_tx_attempt(
 
 enum hyperv_acceptance_app_tcp_action hyperv_acceptance_app_tcp_next_action(
 	int failed, int pcb_owned, int connected, int transmit_pending,
-	int response_valid, int fully_acknowledged);
+	int response_valid, int fully_acknowledged, int peer_closed,
+	int deadline_expired);
 
 size_t hyperv_acceptance_app_build(
 	uint8_t *message, size_t capacity,

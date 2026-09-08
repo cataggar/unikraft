@@ -67,23 +67,45 @@ static void test_bounded_adapter_policy(void)
 	assert(mock.cleanup_steps == 1);
 }
 
-static void test_tcp_callback_failure_guards(void)
+static void test_tcp_multipump_eof_guards(void)
 {
 	/* An established PCB reset with unsent bytes must not be dereferenced. */
 	assert(hyperv_acceptance_app_tcp_next_action(
-		       1, 0, 1, 1, 0, 0) ==
+		       1, 0, 1, 1, 0, 0, 0, 0) ==
 	       HYPERV_ACCEPTANCE_APP_TCP_FAIL);
 
-	/* A valid response followed by extra bytes must not be closed as PASS. */
+	/* A complete response remains observable until a later peer action. */
 	assert(hyperv_acceptance_app_tcp_next_action(
-		       1, 1, 1, 0, 1, 1) ==
+		       0, 1, 1, 0, 1, 1, 0, 0) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_WAIT);
+
+	/* Delayed extra bytes or a reset on the next pump must fail. */
+	assert(hyperv_acceptance_app_tcp_next_action(
+		       1, 1, 1, 0, 1, 1, 0, 0) ==
 	       HYPERV_ACCEPTANCE_APP_TCP_FAIL);
 	assert(hyperv_acceptance_app_tcp_next_action(
-		       0, 1, 1, 1, 0, 0) ==
-	       HYPERV_ACCEPTANCE_APP_TCP_SEND);
+		       1, 0, 1, 0, 1, 1, 0, 0) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_FAIL);
+
+	/* Orderly peer EOF permits close only after the request is acknowledged. */
 	assert(hyperv_acceptance_app_tcp_next_action(
-		       0, 1, 1, 0, 1, 1) ==
+		       0, 1, 1, 0, 1, 0, 1, 0) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_WAIT);
+	assert(hyperv_acceptance_app_tcp_next_action(
+		       0, 1, 1, 0, 1, 1, 1, 0) ==
 	       HYPERV_ACCEPTANCE_APP_TCP_CLOSE);
+
+	/* A peer that never sends EOF remains waiting, then hits the deadline. */
+	assert(hyperv_acceptance_app_tcp_next_action(
+		       0, 1, 1, 0, 1, 1, 0, 0) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_WAIT);
+	assert(hyperv_acceptance_app_tcp_next_action(
+		       0, 1, 1, 0, 1, 1, 0, 1) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_FAIL);
+
+	assert(hyperv_acceptance_app_tcp_next_action(
+		       0, 1, 1, 1, 0, 0, 0, 0) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_SEND);
 }
 
 int main(void)
@@ -114,7 +136,7 @@ int main(void)
 		"87c0ffee5aa8dfd6", NULL));
 
 	test_bounded_adapter_policy();
-	test_tcp_callback_failure_guards();
+	test_tcp_multipump_eof_guards();
 
 	length = hyperv_acceptance_app_build(
 		message, sizeof(message), HYPERV_ACCEPTANCE_APP_TCP,
