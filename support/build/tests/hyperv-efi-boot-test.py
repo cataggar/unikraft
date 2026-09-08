@@ -46,6 +46,7 @@ def main():
     parser.add_argument("--require-marker", action="append", default=[])
     parser.add_argument("--forbid-marker", action="append", default=[])
     parser.add_argument("--qemu", default="qemu-system-x86_64")
+    parser.add_argument("--cpus", type=int, default=1)
     parser.add_argument(
         "--disable-x2apic", action="store_true",
         help="Mask x2APIC in CPUID to exercise the legacy APIC fallback",
@@ -54,6 +55,10 @@ def main():
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if not 1 <= args.cpus <= 8:
+        parser.error("--cpus must be between 1 and 8")
+    if args.disable_x2apic and args.cpus != 1:
+        parser.error("legacy xAPIC requires exactly one CPU")
     if not args.expect:
         parser.error("--expect must be nonempty")
 
@@ -77,7 +82,7 @@ def main():
             args.qemu,
             "-machine", "q35,accel=kvm",
             "-cpu", cpu,
-            "-smp", "1", "-m", "512M",
+            "-smp", str(args.cpus), "-m", "512M",
             "-drive", "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
             "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",
             "-drive", "format=raw,file=fat:rw:esp",
