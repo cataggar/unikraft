@@ -2283,6 +2283,14 @@ static int test_nvs_response_sizes_and_fallback(void)
 
 	netvsc_host_reset();
 	mock_reset();
+	mock.nvs_accept_index = 1;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(mock.nvs_init_attempts == 2);
+	CHECK(netvsc_host_nvs_version() == NETVSC_NVS_VERSION_6);
+	netvsc_host_remove_device(&offered);
+
+	netvsc_host_reset();
+	mock_reset();
 	mock.nvs_accept_index = 0;
 	mock.receive_end_offset = 1;
 	CHECK(netvsc_host_add_device(&offered) == 0);
