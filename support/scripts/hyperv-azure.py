@@ -124,7 +124,7 @@ def sha256_bytes(value):
 
 
 def read_regular_file(path, maximum, description):
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
@@ -150,12 +150,13 @@ def read_regular_file(path, maximum, description):
 
 
 def copy_regular_file(source, destination, expected_size, expected_sha256):
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     try:
         source_descriptor = os.open(source, flags)
     except OSError as error:
         raise ValueError("Prepared image must be a readable non-symlink file") from error
     destination_descriptor = None
+    destination_created = False
     complete = False
     try:
         metadata = os.fstat(source_descriptor)
@@ -164,12 +165,16 @@ def copy_regular_file(source, destination, expected_size, expected_sha256):
         destination_descriptor = os.open(
             destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
         )
+        destination_created = True
         digest = hashlib.sha256()
         copied = 0
-        while True:
-            chunk = os.read(source_descriptor, 1024 * 1024)
+        while copied < expected_size:
+            remaining = expected_size - copied
+            chunk = os.read(source_descriptor, min(1024 * 1024, remaining))
             if not chunk:
                 break
+            if len(chunk) > remaining:
+                raise ValueError("Prepared image grew beyond its expected size")
             digest.update(chunk)
             copied += len(chunk)
             view = memoryview(chunk)
@@ -178,6 +183,8 @@ def copy_regular_file(source, destination, expected_size, expected_sha256):
                 if written <= 0:
                     raise OSError("Prepared image copy made no progress")
                 view = view[written:]
+        if copied == expected_size and os.read(source_descriptor, 1):
+            raise ValueError("Prepared image grew beyond its expected size")
         os.fsync(destination_descriptor)
         if copied != expected_size or digest.hexdigest() != expected_sha256:
             raise ValueError("Prepared image content does not match its manifest")
@@ -186,7 +193,7 @@ def copy_regular_file(source, destination, expected_size, expected_sha256):
         os.close(source_descriptor)
         if destination_descriptor is not None:
             os.close(destination_descriptor)
-        if not complete:
+        if destination_created and not complete:
             Path(destination).unlink(missing_ok=True)
 
 

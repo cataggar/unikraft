@@ -3,6 +3,7 @@
 import importlib
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -225,6 +226,106 @@ class HypervAzureLocalBootTest(unittest.TestCase):
                     Path("/qemu-system-x86_64"), azure.PLATFORM_READY, 30,
                     "legacy-apic", True,
                 )
+
+
+class HypervAzureFileHandlingTest(unittest.TestCase):
+    def test_fifo_inputs_are_opened_nonblocking_before_type_rejection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fifo = root / "input"
+            os.mkfifo(fifo)
+            real_open = os.open
+
+            def guarded_open(path, flags, *args):
+                self.assertTrue(
+                    flags & os.O_NONBLOCK,
+                    "FIFO-safe input opens must use O_NONBLOCK",
+                )
+                return real_open(path, flags, *args)
+
+            operations = (
+                lambda: azure.read_regular_file(fifo, 64, "Manifest"),
+                lambda: azure.copy_regular_file(
+                    fifo, root / "copy", 0, azure.sha256_bytes(b"")
+                ),
+            )
+            for operation in operations:
+                with self.subTest(operation=operation):
+                    with mock.patch.object(azure.os, "open", side_effect=guarded_open):
+                        with self.assertRaisesRegex(
+                            ValueError, "invalid type|non-symlink|unexpected type"
+                        ):
+                            operation()
+
+    def test_copy_detects_growth_without_unbounded_reads_or_writes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"1234")
+            reads = []
+
+            def growing_read(descriptor, size):
+                del descriptor
+                reads.append(size)
+                if len(reads) > 2:
+                    raise AssertionError("copy read past its bounded detection byte")
+                return b"x" * min(size, 4)
+
+            with mock.patch.object(azure.os, "read", side_effect=growing_read):
+                with self.assertRaisesRegex(ValueError, "grew|expected size"):
+                    azure.copy_regular_file(
+                        source, destination, 4,
+                        azure.sha256_bytes(b"x" * 4),
+                    )
+            self.assertEqual(reads, [4, 1])
+            self.assertFalse(destination.exists())
+
+    def test_exact_copy_fsyncs_and_rejects_digest_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            source.write_bytes(b"exact-content")
+            with mock.patch.object(
+                azure.os, "fsync", wraps=os.fsync
+            ) as fsync:
+                azure.copy_regular_file(
+                    source, destination, source.stat().st_size,
+                    azure.sha256_bytes(b"exact-content"),
+                )
+            self.assertEqual(destination.read_bytes(), b"exact-content")
+            fsync.assert_called_once()
+
+            mismatch = root / "mismatch"
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                azure.copy_regular_file(
+                    source, mismatch, source.stat().st_size, "f" * 64
+                )
+            self.assertFalse(mismatch.exists())
+
+    def test_failed_exclusive_create_preserves_existing_file_and_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.write_bytes(b"new")
+            digest = azure.sha256_bytes(b"new")
+
+            existing = root / "existing"
+            existing.write_bytes(b"keep")
+            with self.assertRaises(FileExistsError):
+                azure.copy_regular_file(source, existing, 3, digest)
+            self.assertEqual(existing.read_bytes(), b"keep")
+
+            target = root / "target"
+            target.write_bytes(b"target")
+            linked = root / "linked"
+            linked.symlink_to(target)
+            with self.assertRaises(FileExistsError):
+                azure.copy_regular_file(source, linked, 3, digest)
+            self.assertTrue(linked.is_symlink())
+            self.assertEqual(linked.readlink(), target)
+            self.assertEqual(target.read_bytes(), b"target")
 
 
 class HypervAzurePreparedImageTransferTest(unittest.TestCase):

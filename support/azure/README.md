@@ -249,7 +249,7 @@ MIZ=/absolute/path/to/the/pinned/miz
 python3 support/scripts/hyperv-azure.py import-prepared \
   --artifact-dir "$ARTIFACT" --state-dir "$STATE" --miz "$MIZ" \
   --expected-manifest-sha256 "$REVIEWED_MANIFEST_SHA256" \
-  --expected-repository unikraft/unikraft \
+  --expected-repository "$REVIEWED_REPOSITORY" \
   --expected-repository-id "$REVIEWED_REPOSITORY_ID" \
   --expected-workflow-ref "$REVIEWED_WORKFLOW_REF" \
   --expected-job zig-hyperv \
