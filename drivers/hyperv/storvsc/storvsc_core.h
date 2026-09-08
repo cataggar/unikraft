@@ -10,6 +10,12 @@
 #define STORVSC_CORE_MAX_CONTEXTS	64U
 #define STORVSC_PACKET_MAX		64U
 #define STORVSC_SENSE_MAX		20U
+#define STORVSC_REPORT_LUNS_MAX		64U
+#define STORVSC_REPORT_LUNS_HEADER_SIZE	8U
+#define STORVSC_REPORT_LUN_ENTRY_SIZE	8U
+#define STORVSC_REPORT_LUNS_DATA_SIZE	\
+	(STORVSC_REPORT_LUNS_HEADER_SIZE + \
+	 STORVSC_REPORT_LUNS_MAX * STORVSC_REPORT_LUN_ENTRY_SIZE)
 
 #define STORVSC_DIRECTION_WRITE		0U
 #define STORVSC_DIRECTION_READ		1U
@@ -61,6 +67,17 @@ struct storvsc_scsi_spec {
 	uint8_t direction;
 	uint8_t allow_short;
 	uint8_t reserved;
+	uint8_t path_id;
+	uint8_t target_id;
+	uint8_t lun;
+	uint8_t address_reserved;
+};
+
+struct storvsc_address {
+	uint8_t path_id;
+	uint8_t target_id;
+	uint8_t lun;
+	uint8_t reserved;
 };
 
 struct storvsc_capacity {
@@ -97,6 +114,13 @@ int storvsc_core_prepare_block(void *storage, int operation,
 			       uint64_t start_sector, uint64_t sector_count,
 			       uint64_t buffer_address, uint64_t now,
 			       uint64_t timeout_ns, struct storvsc_tx *tx);
+int storvsc_core_prepare_block_at(void *storage,
+				  const struct storvsc_address *address,
+				  int operation, uint64_t start_sector,
+				  uint64_t sector_count,
+				  uint64_t buffer_address, uint64_t now,
+				  uint64_t timeout_ns,
+				  struct storvsc_tx *tx);
 int storvsc_core_begin_reset(void *storage, uint64_t now,
 			     uint64_t timeout_ns,
 			     struct storvsc_event *event);
@@ -116,6 +140,14 @@ uint16_t storvsc_core_version(void *storage);
 uint32_t storvsc_core_packet_size(void *storage);
 uint32_t storvsc_core_host_max_transfer(void *storage);
 
+int storvsc_build_report_luns(struct storvsc_scsi_spec *spec,
+			      uint8_t path_id, uint8_t target_id,
+			      uint32_t lun_capacity, uint64_t timeout_ns);
+int storvsc_parse_report_luns(const uint8_t *data, size_t data_len,
+			      uint8_t path_id, uint8_t target_id,
+			      struct storvsc_address *addresses,
+			      size_t address_capacity,
+			      size_t *address_count);
 int storvsc_parse_inquiry(const uint8_t *data, size_t data_len,
 			  struct storvsc_inquiry *inquiry);
 int storvsc_parse_capacity10(const uint8_t *data, size_t data_len,
@@ -139,6 +171,18 @@ _Static_assert(sizeof(struct storvsc_scsi_spec) == 40,
 	       "StorVSC SCSI specification ABI changed");
 _Static_assert(offsetof(struct storvsc_scsi_spec, cdb) == 16,
 	       "StorVSC CDB offset changed");
+_Static_assert(offsetof(struct storvsc_scsi_spec, path_id) == 36,
+	       "StorVSC SCSI address offset changed");
+_Static_assert(offsetof(struct storvsc_scsi_spec, target_id) == 37,
+	       "StorVSC SCSI target offset changed");
+_Static_assert(offsetof(struct storvsc_scsi_spec, lun) == 38,
+	       "StorVSC SCSI LUN offset changed");
+_Static_assert(offsetof(struct storvsc_scsi_spec, address_reserved) == 39,
+	       "StorVSC SCSI address reserved offset changed");
+_Static_assert(sizeof(struct storvsc_address) == 4,
+	       "StorVSC address ABI changed");
+_Static_assert(STORVSC_REPORT_LUNS_DATA_SIZE == 520,
+	       "StorVSC REPORT LUNS layout changed");
 _Static_assert(sizeof(struct storvsc_capacity) == 16,
 	       "StorVSC capacity ABI changed");
 
