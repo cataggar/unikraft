@@ -1,4 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
+/*
+ * Bounded adapter portions derive from unikraft/lib-lwip uknetdev.c.
+ * Copyright (c) 2019, NEC Laboratories Europe GmbH, NEC Corporation.
+ */
 #include "application_network.h"
 
 #include <uk/config.h>
@@ -19,9 +23,12 @@
 #include <lwip/timeouts.h>
 #include <lwip/udp.h>
 #include <netif/uknetdev.h>
+#include <uk/alloc.h>
 #include <uk/netdev.h>
 #include <uk/plat/time.h>
 #include <uk/sched.h>
+
+#include "netbuf.h"
 
 #define APPLICATION_DHCP_TIMEOUT_NS (12ULL * 1000000000ULL)
 #define APPLICATION_ARP_TIMEOUT_NS (5ULL * 1000000000ULL)
@@ -30,6 +37,7 @@
 #define APPLICATION_ARP_RETRY_NS 1000000000ULL
 #define APPLICATION_TCP_CONNECTIONS 3U
 #define APPLICATION_UDP_DATAGRAMS 6U
+#define APPLICATION_NETDEV_BUFFER_SIZE 2048U
 
 static const size_t tcp_body_lengths[APPLICATION_TCP_CONNECTIONS] = {
 	31, 1400, 257
@@ -100,6 +108,33 @@ struct udp_totals {
 	size_t receive_bytes;
 };
 
+enum bounded_adapter_failure {
+	BOUNDED_ADAPTER_OK,
+	BOUNDED_ADAPTER_TX_BUSY,
+	BOUNDED_ADAPTER_TX_ERROR,
+	BOUNDED_ADAPTER_RX_ERROR,
+	BOUNDED_ADAPTER_INPUT_ERROR,
+};
+
+struct bounded_adapter {
+	struct netif *netif;
+	struct uk_netdev *device;
+	struct uk_alloc *allocator;
+	struct uk_netdev_info info;
+	enum bounded_adapter_failure failure;
+	unsigned int receive_packets;
+	unsigned int receive_budget_exhaustions;
+	unsigned int transmit_attempts;
+	unsigned int transmit_busy;
+};
+
+struct bounded_tx_attempt {
+	struct uk_netdev *device;
+	struct uk_netbuf *buffer;
+};
+
+static struct bounded_adapter application_adapter;
+
 static const char *application_result_name(
 	enum hyperv_acceptance_result result)
 {
@@ -114,16 +149,171 @@ static const char *application_result_name(
 	return "FAIL";
 }
 
-static void application_pump(void)
+static const char *bounded_adapter_failure_name(void)
 {
-	uknetdev_poll_all();
-	sys_check_timeouts();
+	switch (application_adapter.failure) {
+	case BOUNDED_ADAPTER_OK:
+		return "none";
+	case BOUNDED_ADAPTER_TX_BUSY:
+		return "tx-busy";
+	case BOUNDED_ADAPTER_TX_ERROR:
+		return "tx-error";
+	case BOUNDED_ADAPTER_RX_ERROR:
+		return "rx-error";
+	case BOUNDED_ADAPTER_INPUT_ERROR:
+		return "stack-input";
+	}
+	return "unknown";
 }
 
-static void application_wait(void)
+static void bounded_adapter_fail(enum bounded_adapter_failure failure)
 {
-	application_pump();
+	if (application_adapter.failure == BOUNDED_ADAPTER_OK)
+		application_adapter.failure = failure;
+}
+
+static int bounded_tx_one(void *argument)
+{
+	struct bounded_tx_attempt *attempt = argument;
+
+	return uk_netdev_tx_one(attempt->device, 0, attempt->buffer);
+}
+
+static err_t bounded_adapter_output(struct netif *netif, struct pbuf *pbuf)
+{
+	struct bounded_tx_attempt attempt;
+	struct uk_netbuf *buffer;
+	struct pbuf *part;
+	char *write_position;
+	unsigned int attempts;
+	int status;
+
+	if (netif != application_adapter.netif ||
+	    netif->state != application_adapter.device) {
+		bounded_adapter_fail(BOUNDED_ADAPTER_TX_ERROR);
+		return ERR_IF;
+	}
+	buffer = uk_netbuf_alloc_buf(
+		application_adapter.allocator, APPLICATION_NETDEV_BUFFER_SIZE,
+		application_adapter.info.ioalign,
+		application_adapter.info.nb_encap_tx, 0, NULL);
+	if (!buffer)
+		return ERR_MEM;
+	if (pbuf->tot_len > uk_netbuf_tailroom(buffer)) {
+		uk_netbuf_free_single(buffer);
+		return ERR_MEM;
+	}
+	write_position = buffer->data;
+	for (part = pbuf; part; part = part->next) {
+		memcpy(write_position, part->payload, part->len);
+		write_position += part->len;
+	}
+	buffer->len = pbuf->tot_len;
+
+	attempt.device = application_adapter.device;
+	attempt.buffer = buffer;
+	status = hyperv_acceptance_app_single_tx_attempt(
+		bounded_tx_one, &attempt, &attempts);
+	application_adapter.transmit_attempts += attempts;
+	if (uk_netdev_status_notready(status)) {
+		application_adapter.transmit_busy++;
+		bounded_adapter_fail(BOUNDED_ADAPTER_TX_BUSY);
+		uk_netbuf_free_single(buffer);
+		return ERR_IF;
+	}
+	if (status < 0) {
+		bounded_adapter_fail(BOUNDED_ADAPTER_TX_ERROR);
+		uk_netbuf_free_single(buffer);
+		return ERR_IF;
+	}
+	return ERR_OK;
+}
+
+static int bounded_adapter_rx_step(void *argument)
+{
+	struct bounded_adapter *adapter = argument;
+	struct uk_netbuf *buffer;
+	struct uk_netbuf *next;
+	struct pbuf *pbuf;
+	struct pbuf *part;
+	err_t error;
+	int status;
+
+	status = uk_netdev_rx_one(adapter->device, 0, &buffer);
+	if (status < 0) {
+		bounded_adapter_fail(BOUNDED_ADAPTER_RX_ERROR);
+		netif_set_down(adapter->netif);
+		return HYPERV_ACCEPTANCE_APP_RX_ERROR;
+	}
+	if (uk_netdev_status_notready(status))
+		return HYPERV_ACCEPTANCE_APP_RX_IDLE;
+	if (!buffer) {
+		bounded_adapter_fail(BOUNDED_ADAPTER_RX_ERROR);
+		netif_set_down(adapter->netif);
+		return HYPERV_ACCEPTANCE_APP_RX_ERROR;
+	}
+
+	adapter->receive_packets++;
+	pbuf = lwip_netbuf_to_pbuf(buffer);
+	pbuf->payload = buffer->data;
+	pbuf->tot_len = pbuf->len = buffer->len;
+	for (next = buffer->next; next; next = next->next) {
+		part = lwip_netbuf_to_pbuf(next);
+		part->payload = next->data;
+		part->tot_len = part->len = next->len;
+		pbuf_cat(pbuf, part);
+	}
+	error = adapter->netif->input(pbuf, adapter->netif);
+	if (error != ERR_OK) {
+		pbuf_free(pbuf);
+		bounded_adapter_fail(BOUNDED_ADAPTER_INPUT_ERROR);
+		return HYPERV_ACCEPTANCE_APP_RX_ERROR;
+	}
+	return uk_netdev_status_more(status) ?
+	       HYPERV_ACCEPTANCE_APP_RX_MORE :
+	       HYPERV_ACCEPTANCE_APP_RX_LAST;
+}
+
+static int bounded_adapter_attach(
+	struct netif *netif, struct uk_netdev *device)
+{
+	memset(&application_adapter, 0, sizeof(application_adapter));
+	application_adapter.netif = netif;
+	application_adapter.device = device;
+	application_adapter.allocator = uk_alloc_get_default();
+	if (!application_adapter.allocator || netif->state != device)
+		return -1;
+	uk_netdev_info_get(device, &application_adapter.info);
+	netif->linkoutput = bounded_adapter_output;
+	return 0;
+}
+
+static int bounded_adapter_poll(void)
+{
+	struct hyperv_acceptance_app_rx_result result;
+
+	result = hyperv_acceptance_app_bounded_rx_drain(
+		bounded_adapter_rx_step, &application_adapter);
+	if (result.budget_exhausted)
+		application_adapter.receive_budget_exhaustions++;
+	if (result.error && application_adapter.failure == BOUNDED_ADAPTER_OK)
+		bounded_adapter_fail(BOUNDED_ADAPTER_RX_ERROR);
+	return application_adapter.failure != BOUNDED_ADAPTER_OK;
+}
+
+static int application_pump(void)
+{
+	(void)bounded_adapter_poll();
+	sys_check_timeouts();
+	return application_adapter.failure != BOUNDED_ADAPTER_OK;
+}
+
+static int application_wait(void)
+{
+	if (application_pump())
+		return -1;
 	uk_sched_thread_sleep(APPLICATION_POLL_INTERVAL_NS);
+	return 0;
 }
 
 static int private_ipv4(const ip4_addr_t *address)
@@ -185,6 +375,11 @@ static enum hyperv_acceptance_result acquire_lease(struct uk_netdev *device,
 		     "reason=stack-attach");
 		return HYPERV_ACCEPTANCE_FAIL;
 	}
+	if (bounded_adapter_attach(netif, device)) {
+		puts("HYPERV_ACCEPTANCE NETWORK_APP_LEASE FAIL "
+		     "reason=bounded-adapter-attach");
+		return HYPERV_ACCEPTANCE_FAIL;
+	}
 	netif_set_default(netif);
 	netif_set_up(netif);
 	error = dhcp_start(netif);
@@ -198,7 +393,12 @@ static enum hyperv_acceptance_result acquire_lease(struct uk_netdev *device,
 	while (ukplat_monotonic_clock() < deadline) {
 		if (dhcp_supplied_address(netif))
 			break;
-		application_wait();
+		if (application_wait()) {
+			printf("HYPERV_ACCEPTANCE NETWORK_APP_LEASE FAIL "
+			       "reason=adapter-%s\n",
+			       bounded_adapter_failure_name());
+			return HYPERV_ACCEPTANCE_FAIL;
+		}
 	}
 	if (!dhcp_supplied_address(netif)) {
 		dhcp_stop(netif);
@@ -282,7 +482,12 @@ static enum hyperv_acceptance_result resolve_peer(
 			}
 			next_request = now + APPLICATION_ARP_RETRY_NS;
 		}
-		application_wait();
+		if (application_wait()) {
+			printf("HYPERV_ACCEPTANCE NETWORK_APP_ARP FAIL "
+			       "reason=adapter-%s requests=%u\n",
+			       bounded_adapter_failure_name(), requests);
+			return HYPERV_ACCEPTANCE_FAIL;
+		}
 	}
 	printf("HYPERV_ACCEPTANCE NETWORK_APP_ARP FAIL "
 	       "reason=timeout peer=%s requests=%u\n",
@@ -397,6 +602,11 @@ static int tcp_send_chunk(struct tcp_exchange *exchange)
 			       (sizeof(chunks) / sizeof(chunks[0]))];
 	err_t error;
 
+	if (!exchange->pcb) {
+		exchange->failed = 1;
+		exchange->failure = "pcb-lost";
+		return -1;
+	}
 	if (length > remaining)
 		length = remaining;
 	if (length > tcp_sndbuf(exchange->pcb))
@@ -467,12 +677,42 @@ static int run_tcp_connection(
 
 	deadline = ukplat_monotonic_clock() + APPLICATION_IO_TIMEOUT_NS;
 	while (!exchange.failed && ukplat_monotonic_clock() < deadline) {
-		application_pump();
-		if (exchange.connected &&
-		    exchange.transmit_offset < exchange.transmit_length)
+		enum hyperv_acceptance_app_tcp_action action;
+
+		if (application_pump()) {
+			exchange.failed = 1;
+			exchange.error = ERR_IF;
+			exchange.failure = bounded_adapter_failure_name();
+		}
+		action = hyperv_acceptance_app_tcp_next_action(
+			exchange.failed, exchange.pcb != NULL,
+			exchange.connected,
+			exchange.transmit_offset < exchange.transmit_length,
+			exchange.response_valid,
+			exchange.acknowledged == exchange.transmit_length);
+		if (action == HYPERV_ACCEPTANCE_APP_TCP_FAIL)
+			break;
+		if (action == HYPERV_ACCEPTANCE_APP_TCP_SEND) {
 			(void)tcp_send_chunk(&exchange);
-		if (exchange.response_valid &&
-		    exchange.acknowledged == exchange.transmit_length) {
+			if (application_adapter.failure != BOUNDED_ADAPTER_OK &&
+			    !exchange.failed) {
+				exchange.failed = 1;
+				exchange.error = ERR_IF;
+				exchange.failure =
+					bounded_adapter_failure_name();
+			}
+			action = hyperv_acceptance_app_tcp_next_action(
+				exchange.failed, exchange.pcb != NULL,
+				exchange.connected,
+				exchange.transmit_offset <
+					exchange.transmit_length,
+				exchange.response_valid,
+				exchange.acknowledged ==
+					exchange.transmit_length);
+			if (action == HYPERV_ACCEPTANCE_APP_TCP_FAIL)
+				break;
+		}
+		if (action == HYPERV_ACCEPTANCE_APP_TCP_CLOSE) {
 			tcp_arg(exchange.pcb, NULL);
 			tcp_recv(exchange.pcb, NULL);
 			tcp_sent(exchange.pcb, NULL);
@@ -503,7 +743,13 @@ static int run_tcp_connection(
 		tcp_abort(exchange.pcb);
 		exchange.pcb = NULL;
 	}
-	if (!close_accepted) {
+	if (application_adapter.failure != BOUNDED_ADAPTER_OK &&
+	    !exchange.failed) {
+		exchange.failed = 1;
+		exchange.error = ERR_IF;
+		exchange.failure = bounded_adapter_failure_name();
+	}
+	if (!close_accepted || exchange.failed) {
 		printf("HYPERV_ACCEPTANCE NETWORK_APP_TCP_CONNECTION FAIL "
 		       "reason=%s sequence=%" PRIu32 " rc=%d "
 		       "tx=%zu/%zu ack=%" PRIu32 " rx=%zu/%zu "
@@ -686,8 +932,13 @@ static enum hyperv_acceptance_result run_udp(
 		deadline = ukplat_monotonic_clock() +
 			   APPLICATION_IO_TIMEOUT_NS;
 		while (!exchange.received && !exchange.failed &&
-		       ukplat_monotonic_clock() < deadline)
-			application_wait();
+		       ukplat_monotonic_clock() < deadline) {
+			if (application_wait()) {
+				exchange.failure =
+					bounded_adapter_failure_name();
+				exchange.failed = 1;
+			}
+		}
 		if (!exchange.received) {
 			if (!exchange.failed)
 				exchange.failure = "timeout";
@@ -849,7 +1100,9 @@ hyperv_acceptance_probe_application_network(unsigned int network_offers)
 	printf("HYPERV_ACCEPTANCE NETWORK_APP_FINAL %s "
 	       "lease=PASS arp=PASS tcp=%s udp=%s "
 	       "tcp_connections=%u udp_datagrams=%u peer_ipv4=%s "
-	       "tcp_port=%u udp_port=%u nonce=%016" PRIx64 "\n",
+	       "tcp_port=%u udp_port=%u nonce=%016" PRIx64
+	       " adapter_rx_packets=%u adapter_rx_budget_exhaustions=%u "
+	       "adapter_tx_attempts=%u adapter_tx_busy=%u\n",
 	       application_result_name(result),
 	       application_result_name(tcp), application_result_name(udp),
 	       tcp == HYPERV_ACCEPTANCE_PASS ?
@@ -857,7 +1110,11 @@ hyperv_acceptance_probe_application_network(unsigned int network_offers)
 	       udp == HYPERV_ACCEPTANCE_PASS ? APPLICATION_UDP_DATAGRAMS : 0,
 	       CONFIG_APPHYPERVACCEPTANCE_PEER_IPV4,
 	       (unsigned int)CONFIG_APPHYPERVACCEPTANCE_PEER_TCP_PORT,
-	       (unsigned int)CONFIG_APPHYPERVACCEPTANCE_PEER_UDP_PORT, nonce);
+	       (unsigned int)CONFIG_APPHYPERVACCEPTANCE_PEER_UDP_PORT, nonce,
+	       application_adapter.receive_packets,
+	       application_adapter.receive_budget_exhaustions,
+	       application_adapter.transmit_attempts,
+	       application_adapter.transmit_busy);
 	if (result == HYPERV_ACCEPTANCE_PASS)
 		puts("UK_HYPERV_NETWORK_APP_READY");
 	return result;

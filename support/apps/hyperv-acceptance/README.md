@@ -14,6 +14,12 @@ network stage with an official lib-lwip path. It manually attaches the first
 NetVSC device with one RX and one TX queue, completes DHCP through the BOUND
 state, verifies the applied lease, resolves an explicit same-subnet private peer
 with ARP, and performs exact TCP and UDP exchanges. Storage remains read-only.
+The application replaces only that netif instance's unbounded lib-lwip
+poll/transmit callbacks with a scoped boundary that processes at most 64 RX
+packets per pump and attempts each TX exactly once. Persistent TX backpressure
+fails acceptance instead of spinning; a continuous RX flood returns to lwIP
+timers and the outer deadlines after every bounded batch. The pinned external
+wrapper checkout remains unmodified.
 
 `UK_HYPERV_IO_READY` is emitted only when storage and the selected network mode
 both pass. A missing offer is `UNAVAILABLE`; a present but unbound device or any
@@ -99,9 +105,9 @@ Stable application markers are:
 
 The config and final markers report the exact peer IPv4, TCP/UDP ports, and
 nonce for manifest correlation. PASS markers also report connection/datagram,
-byte, chunk/callback, pbuf, and cleanup counts. No application-network marker
-proves Azure acceptance until a real same-VNet peer run produces the exact
-PASS contract.
+byte, chunk/callback, pbuf, adapter-budget, and cleanup counts. No
+application-network marker proves Azure acceptance until a real same-VNet peer
+run produces the exact PASS contract.
 
 ## Pinned stack dependency
 
@@ -132,6 +138,12 @@ Run both host-side protocol fixtures without booting a guest:
 make -C support/apps/hyperv-acceptance \
   HOSTCC='/home/g/.local/bin/zig cc' protocol-test
 ```
+
+The application fixture includes deterministic callback-state regressions for
+a reset PCB with unsent bytes and a valid response followed by extra bytes. It
+also drives endless mock RX and persistent TX-busy statuses through the same
+bounded policy used by the guest, proving that timer/deadline checks and
+cleanup regain control.
 
 ## Build the default raw smoke
 

@@ -1,3 +1,5 @@
+.DEFAULT_GOAL := all
+
 UK_ROOT ?= $(CURDIR)/../../..
 UK_LIBS ?= $(UK_ROOT)/lib
 HOSTCC ?= cc

@@ -54,6 +54,62 @@ int hyperv_acceptance_app_parse_nonce(const char *text, uint64_t *nonce_out)
 	return 0;
 }
 
+struct hyperv_acceptance_app_rx_result
+hyperv_acceptance_app_bounded_rx_drain(
+	hyperv_acceptance_app_rx_step_fn step, void *argument)
+{
+	struct hyperv_acceptance_app_rx_result result = { 0 };
+	unsigned int index;
+
+	if (!step) {
+		result.error = HYPERV_ACCEPTANCE_APP_RX_ERROR;
+		return result;
+	}
+	for (index = 0; index < HYPERV_ACCEPTANCE_APP_RX_POLL_BUDGET;
+	     index++) {
+		int status = step(argument);
+
+		if (status < 0) {
+			result.error = status;
+			return result;
+		}
+		if (status == HYPERV_ACCEPTANCE_APP_RX_IDLE)
+			return result;
+		result.packets++;
+		if (status == HYPERV_ACCEPTANCE_APP_RX_LAST)
+			return result;
+		if (status != HYPERV_ACCEPTANCE_APP_RX_MORE) {
+			result.error = HYPERV_ACCEPTANCE_APP_RX_ERROR;
+			return result;
+		}
+	}
+	result.budget_exhausted = 1;
+	return result;
+}
+
+int hyperv_acceptance_app_single_tx_attempt(
+	hyperv_acceptance_app_tx_attempt_fn attempt, void *argument,
+	unsigned int *attempts_out)
+{
+	if (!attempt || !attempts_out)
+		return -1;
+	*attempts_out = 1;
+	return attempt(argument);
+}
+
+enum hyperv_acceptance_app_tcp_action hyperv_acceptance_app_tcp_next_action(
+	int failed, int pcb_owned, int connected, int transmit_pending,
+	int response_valid, int fully_acknowledged)
+{
+	if (failed || !pcb_owned)
+		return HYPERV_ACCEPTANCE_APP_TCP_FAIL;
+	if (connected && transmit_pending)
+		return HYPERV_ACCEPTANCE_APP_TCP_SEND;
+	if (response_valid && fully_acknowledged)
+		return HYPERV_ACCEPTANCE_APP_TCP_CLOSE;
+	return HYPERV_ACCEPTANCE_APP_TCP_WAIT;
+}
+
 static uint8_t payload_byte(
 	enum hyperv_acceptance_app_transport transport,
 	enum hyperv_acceptance_app_direction direction, uint32_t sequence,

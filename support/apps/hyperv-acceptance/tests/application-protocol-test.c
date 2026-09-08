@@ -2,8 +2,89 @@
 #include "application_protocol.h"
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+
+struct mock_io {
+	unsigned int rx_steps;
+	unsigned int tx_steps;
+	unsigned int timer_steps;
+	unsigned int cleanup_steps;
+};
+
+static int mock_rx_flood(void *argument)
+{
+	struct mock_io *mock = argument;
+
+	mock->rx_steps++;
+	return HYPERV_ACCEPTANCE_APP_RX_MORE;
+}
+
+static int mock_tx_busy(void *argument)
+{
+	struct mock_io *mock = argument;
+
+	mock->tx_steps++;
+	return 1;
+}
+
+static void test_bounded_adapter_policy(void)
+{
+	struct hyperv_acceptance_app_rx_result result;
+	struct mock_io mock = { 0 };
+	unsigned int tx_attempts;
+	unsigned int tick;
+	int tx_status;
+
+	for (tick = 0; tick < 3; tick++) {
+		result = hyperv_acceptance_app_bounded_rx_drain(
+			mock_rx_flood, &mock);
+		assert(result.packets ==
+		       HYPERV_ACCEPTANCE_APP_RX_POLL_BUDGET);
+		assert(result.budget_exhausted);
+		assert(!result.error);
+		mock.timer_steps++;
+	}
+	assert(mock.rx_steps == 3 * HYPERV_ACCEPTANCE_APP_RX_POLL_BUDGET);
+	assert(mock.timer_steps == 3);
+	assert(tick == 3);
+
+	/* Timer-driven and cleanup sends each return after one busy attempt. */
+	mock.timer_steps++;
+	tx_status = hyperv_acceptance_app_single_tx_attempt(
+		mock_tx_busy, &mock, &tx_attempts);
+	assert(tx_status == 1);
+	assert(tx_attempts == 1);
+	assert(mock.tx_steps == 1);
+	tx_status = hyperv_acceptance_app_single_tx_attempt(
+		mock_tx_busy, &mock, &tx_attempts);
+	assert(tx_status == 1);
+	assert(tx_attempts == 1);
+	assert(mock.tx_steps == 2);
+	mock.cleanup_steps++;
+	assert(mock.timer_steps == 4);
+	assert(mock.cleanup_steps == 1);
+}
+
+static void test_tcp_callback_failure_guards(void)
+{
+	/* An established PCB reset with unsent bytes must not be dereferenced. */
+	assert(hyperv_acceptance_app_tcp_next_action(
+		       1, 0, 1, 1, 0, 0) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_FAIL);
+
+	/* A valid response followed by extra bytes must not be closed as PASS. */
+	assert(hyperv_acceptance_app_tcp_next_action(
+		       1, 1, 1, 0, 1, 1) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_FAIL);
+	assert(hyperv_acceptance_app_tcp_next_action(
+		       0, 1, 1, 1, 0, 0) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_SEND);
+	assert(hyperv_acceptance_app_tcp_next_action(
+		       0, 1, 1, 0, 1, 1) ==
+	       HYPERV_ACCEPTANCE_APP_TCP_CLOSE);
+}
 
 int main(void)
 {
@@ -31,6 +112,9 @@ int main(void)
 	assert(hyperv_acceptance_app_parse_nonce(NULL, &nonce));
 	assert(hyperv_acceptance_app_parse_nonce(
 		"87c0ffee5aa8dfd6", NULL));
+
+	test_bounded_adapter_policy();
+	test_tcp_callback_failure_guards();
 
 	length = hyperv_acceptance_app_build(
 		message, sizeof(message), HYPERV_ACCEPTANCE_APP_TCP,
@@ -65,5 +149,6 @@ int main(void)
 		message, sizeof(message), HYPERV_ACCEPTANCE_APP_UDP,
 		HYPERV_ACCEPTANCE_APP_RESPONSE, 1,
 		HYPERV_ACCEPTANCE_APP_MAX_BODY_SIZE + 1, 2));
+	puts("hyperv application protocol/control tests passed");
 	return 0;
 }
