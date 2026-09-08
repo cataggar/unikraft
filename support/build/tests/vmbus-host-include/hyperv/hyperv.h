@@ -17,4 +17,12 @@ static inline __u64 hyperv_reference_time(void)
 }
 static inline int hyperv_has_signal_events(void) { return 1; }
 static inline int hyperv_has_post_messages(void) { return 1; }
-static inline __u32 hyperv_vmbus_target_vp(void) { return 0; }
+static inline int hyperv_vmbus_target_acquire(__u32 *vp, __u32 *generation)
+{
+	*vp = 0;
+	*generation = 1;
+	return 0;
+}
+static inline void hyperv_vmbus_target_release(
+	__u32 vp __attribute__((unused)),
+	__u32 generation __attribute__((unused))) {}

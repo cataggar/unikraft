@@ -105,8 +105,10 @@ int hyperv_synic_event_take_word_page(void *page, __u32 sint, __u32 word,
 				      __u64 *value);
 __u32 hyperv_vp_index(void);
 __u32 hyperv_max_vp_count(void);
-__u32 hyperv_vmbus_target_vp(void);
+int hyperv_vmbus_target_acquire(__u32 *vp_index, __u32 *generation);
+void hyperv_vmbus_target_release(__u32 vp_index, __u32 generation);
 int hyperv_time_shutdown(int crash);
+int hyperv_time_shutdown_error(void);
 void hyperv_clock_set_efi_sample(__u64 epoch_ns, __u64 reference_time);
 
 void hyperv_vmbus_message(const struct hyperv_message *message);

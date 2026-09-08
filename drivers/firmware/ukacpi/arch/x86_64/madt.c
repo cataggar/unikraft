@@ -15,6 +15,13 @@
 #include <uk/print.h>
 #include <uk/prio.h>
 
+static unsigned int acpi_cpu_count = 1;
+
+unsigned int uk_acpi_cpu_count(void)
+{
+	return acpi_cpu_count;
+}
+
 #if CONFIG_LIBUKBOOT
 #include <uk/boot/earlytab.h>
 #include <uk/plat/common/bootinfo.h>
@@ -85,6 +92,7 @@ int uk_acpi_madt_fill_cpu_idmap(void)
 		}
 	}
 	UK_ASSERT(bsp_found);
+	acpi_cpu_count = idx;
 
 	return 0;
 }

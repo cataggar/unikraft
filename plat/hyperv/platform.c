@@ -98,6 +98,10 @@ static int hyperv_shutdown_local(enum uk_efi_reset_type type, int crash)
 
 	if (unlikely(rc))
 		return rc;
+	rc = hyperv_time_shutdown_error();
+	if (rc)
+		uk_pr_warn("Hyper-V: CPU teardown completed with error %d; "
+			   "forcing firmware reset\n", rc);
 	hyperv_runtime_disable();
 	if (unlikely(!hyperv_efi_rs))
 		return -ENODEV;
@@ -106,16 +110,19 @@ static int hyperv_shutdown_local(enum uk_efi_reset_type type, int crash)
 }
 
 #if CONFIG_HAVE_SMP
-static void __noreturn
+static void
 hyperv_shutdown_on_bsp(struct uk_lcpu_regs *regs __unused,
 		       void *arg __unused)
 {
+	int rc;
+
 	while (__atomic_load_n(&hyperv_shutdown_request_state,
 			       __ATOMIC_ACQUIRE) != 1)
 		__asm__ __volatile__("pause");
-	(void)hyperv_shutdown_local(hyperv_shutdown_request_type,
-				    hyperv_shutdown_request_crash);
-	uk_lcpu_halt();
+	rc = hyperv_shutdown_local(hyperv_shutdown_request_type,
+				   hyperv_shutdown_request_crash);
+	__atomic_store_n(&hyperv_shutdown_request_state,
+			 rc ? rc : 2, __ATOMIC_RELEASE);
 }
 #endif
 
@@ -132,11 +139,14 @@ static int hyperv_shutdown(enum uk_efi_reset_type type, int crash)
 		__u64 deadline;
 		int expected = 0;
 		int rc;
+		int state;
 
 		if (!__atomic_compare_exchange_n(&hyperv_shutdown_request_state,
 				&expected, -1, 0, __ATOMIC_ACQ_REL,
 				__ATOMIC_ACQUIRE)) {
-			uk_lcpu_halt();
+			if (expected == 1 || expected == 2)
+				uk_lcpu_halt();
+			return -EINPROGRESS;
 		}
 		hyperv_shutdown_request_type = type;
 		hyperv_shutdown_request_crash = crash;
@@ -159,6 +169,15 @@ static int hyperv_shutdown(enum uk_efi_reset_type type, int crash)
 			}
 			__asm__ __volatile__("pause");
 		} while (1);
+		do {
+			state = __atomic_load_n(&hyperv_shutdown_request_state,
+						__ATOMIC_ACQUIRE);
+			if (state == 2 || state < 0)
+				break;
+			__asm__ __volatile__("pause");
+		} while (hyperv_reference_time() < deadline);
+		if (state != 2)
+			return state < 0 ? state : -ETIMEDOUT;
 		uk_lcpu_halt();
 	}
 #endif

@@ -41,6 +41,7 @@
 #include <errno.h>
 
 #include <uk/boot.h>
+#include <uk/essentials.h>
 #ifdef CONFIG_LIBUKPAGING
 #include <uk/falloc.h>
 #include <uk/paging.h>
@@ -65,6 +66,11 @@
 #include <uk/tinyalloc.h>
 #define uk_alloc_init uk_tinyalloc_init
 #endif
+
+int __weak ukplat_lcpu_startup_hook(void)
+{
+	return 0;
+}
 #if CONFIG_LIBUKBOOT_ALLOCSTACK
 #include <uk/allocstack.h>
 #if CONFIG_LIBUKBOOT_ALLOCSTACK_PREMAP_ORDER
@@ -353,6 +359,9 @@ void uk_boot_entry(void)
 	/* On most platforms the timer depend on an initialized IRQ subsystem */
 	uk_pr_info("Initialize platform time...\n");
 	ukplat_time_init();
+	rc = ukplat_lcpu_startup_hook();
+	if (unlikely(rc))
+		UK_CRASH("Could not start platform secondary CPUs: %d\n", rc);
 
 #if CONFIG_LIBUKBOOT_INITSCHED
 	uk_pr_info("Initialize scheduling...\n");

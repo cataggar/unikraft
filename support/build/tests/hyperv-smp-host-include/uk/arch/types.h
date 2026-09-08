@@ -9,6 +9,7 @@
 #define __s64 int64_t
 #define __paddr_t uintptr_t
 #define __vaddr_t uintptr_t
+#define __uptr uintptr_t
 #define __nsec uint64_t
 #define __snsec int64_t
 #define __align(x) __attribute__((aligned(x)))

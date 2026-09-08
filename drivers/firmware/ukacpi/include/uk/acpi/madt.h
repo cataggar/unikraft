@@ -230,6 +230,7 @@ struct uk_acpi_madt_mp_wkp_src {
  * @return Pointer to MADT.
  */
 struct uk_acpi_madt *uk_acpi_get_madt(void);
+unsigned int uk_acpi_cpu_count(void);
 
 #if CONFIG_LIBUKACPI_MADT_FILL_CPU_IDMAP
 /**
