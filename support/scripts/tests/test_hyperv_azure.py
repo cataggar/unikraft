@@ -137,12 +137,30 @@ class HypervAzureControllerTest(unittest.TestCase):
             run.upload_disk(image)
         self.assertNotIn(mock.call("disk-ready"), run.record.call_args_list)
 
+    def test_initial_upload_error_remains_visible_if_revocation_also_fails(self):
+        run = self.run_fixture()
+        run.az.side_effect = [
+            self.disk_fixture(run),
+            {"accessSas": "https://disk.blob.storage.azure.net:8080/path?sig=secret"},
+            RuntimeError("revoke failed"),
+        ]
+        image = mock.Mock()
+        image.stat.return_value.st_size = 67109376
+        with mock.patch.object(azure.sys, "stderr") as errors:
+            with self.assertRaisesRegex(RuntimeError, "revoke failed"):
+                run.upload_disk(image)
+        output = "".join(call.args[0] for call in errors.write.call_args_list)
+        self.assertIn("Disk upload did not complete:", output)
+        self.assertIn("Expected an Azure public-cloud HTTPS Blob SAS endpoint", output)
+        self.assertNotIn("secret", output)
+
     def test_upload_rejects_non_azure_or_plaintext_endpoints(self):
         for endpoint in (
             "http://disk.blob.core.windows.net/path?sig=secret",
             "https://blob.core.windows.net.attacker.invalid/path?sig=secret",
             "https://user@disk.blob.core.windows.net/path?sig=secret",
             "https://disk.blob.core.windows.net/path",
+            "https://disk.blob.storage.azure.net:8080/path?sig=secret",
             "https://md-partition.blob.storage.azure.net.attacker.invalid/path?sig=secret",
         ):
             with self.subTest(endpoint=endpoint):
@@ -154,6 +172,7 @@ class HypervAzureControllerTest(unittest.TestCase):
             "md-impexp-disk.blob.core.windows.net",
             "md-diskpartition.blob.storage.azure.net",
             "md-impexp-disk.z43.blob.storage.azure.net",
+            "md-impexp-disk.z20.blob.storage.azure.net:8443",
         ):
             with self.subTest(host=host):
                 endpoint, sas = azure.upload_endpoint(f"https://{host}/path?sig=secret")

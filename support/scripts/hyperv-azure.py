@@ -134,7 +134,7 @@ def upload_endpoint(sas):
         or not parsed.hostname.endswith((
             ".blob.core.windows.net", ".blob.storage.azure.net",
         ))
-        or parsed.port not in (None, 443)
+        or parsed.port not in (None, 443, 8443)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
@@ -426,6 +426,9 @@ class AzureRun:
                 "--file", str(image), "--type", "page", "--overwrite", "true",
                 "--validate-content", "--max-connections", "2", "--no-progress",
             ], private=True, env={"AZURE_STORAGE_SAS_TOKEN": sas}, timeout=1200)
+        except (AzureCliError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+            print(f"Disk upload did not complete: {error}", file=sys.stderr)
+            raise
         finally:
             self.az([
                 "disk", "revoke-access", "--resource-group", self.group,
