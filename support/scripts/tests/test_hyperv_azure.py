@@ -122,8 +122,10 @@ class HypervAzureLocalBootTest(unittest.TestCase):
             "UK_HYPERV_ACCEPTANCE_UNAVAILABLE:storage+network",
             "main returned 2",
         ))
+        booted_inodes = []
 
         def execute(command, **kwargs):
+            booted_inodes.append((Path(kwargs["cwd"]) / "disk.img").stat().st_ino)
             text = milestones
             cpu = command[command.index("-cpu") + 1]
             if "x2apic=off" in cpu:
@@ -157,6 +159,10 @@ class HypervAzureLocalBootTest(unittest.TestCase):
                     all(not item["io_ready"] for item in image_evidence.values())
                 )
             commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(
+                booted_inodes,
+                [raw.stat().st_ino] * 2 + [vhd.stat().st_ino] * 2,
+            )
             cpus = [command[command.index("-cpu") + 1] for command in commands]
             self.assertNotIn("x2apic=off", cpus[0])
             self.assertIn("x2apic=off", cpus[1])
@@ -165,11 +171,31 @@ class HypervAzureLocalBootTest(unittest.TestCase):
             for command in commands:
                 self.assertIn("vmbus-bridge,irq=15", command)
                 self.assertNotIn("hv-balloon", command)
+                disk = json.loads(command[command.index("-blockdev") + 1])
+                self.assertEqual(disk, {
+                    "driver": "raw", "node-name": "hyperv-disk",
+                    "offset": 0, "size": azure.VIRTUAL_SIZE, "read-only": True,
+                    "file": {
+                        "driver": "file", "filename": "disk.img",
+                        "read-only": True,
+                    },
+                })
+                self.assertIn("virtio-blk-pci,drive=hyperv-disk", command)
             for image_format in ("raw", "vpc"):
                 for mode in ("x2apic", "legacy-apic"):
                     self.assertTrue(
                         (directory / f"local-{image_format}-{mode}-serial.log").is_file()
                     )
+
+    def test_other_disk_formats_are_rejected_before_boot(self):
+        with mock.patch.object(azure.subprocess, "run") as execute:
+            with self.assertRaisesRegex(ValueError, "raw GPT and fixed VHD"):
+                azure.local_disk_boot(
+                    Path("/image"), "qcow2", Path("/state"),
+                    Path("/code"), Path("/vars"), Path("/qemu"),
+                    azure.PLATFORM_READY, 30, "x2apic", False,
+                )
+            execute.assert_not_called()
 
     @mock.patch.object(azure.subprocess, "run")
     def test_masked_x2apic_boot_must_reach_legacy_apic_fallback(self, execute):

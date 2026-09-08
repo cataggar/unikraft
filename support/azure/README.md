@@ -110,6 +110,10 @@ success.
 The local platform fixture does not attach a balloon device: balloon support
 is optional in QEMU builds and is not a storage or network acceptance endpoint.
 VMBus channel and device traffic remain separate hosted and real-host gates.
+QEMU maps the exact artifact's 66 MiB guest-visible data region read-only.
+For fixed VHD, this excludes the trailing footer already validated by `miz`;
+it neither converts the image nor substitutes the earlier raw-disk file.
+This also avoids requiring QEMU's optional VPC format driver.
 
 The private directory retains the EFI payload, raw disk, VHD, their fingerprints,
 the `miz` executable fingerprint and packaging report, and all four serial logs

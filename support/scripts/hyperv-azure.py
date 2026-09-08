@@ -230,6 +230,8 @@ def miz_command(miz, arguments, log_path, *, json_output=False):
 
 def local_disk_boot(image, image_format, directory, ovmf_code, ovmf_vars,
                     qemu, expected, timeout, mode, disable_x2apic):
+    if image_format not in ("raw", "vpc"):
+        raise ValueError("Local boot supports only raw GPT and fixed VHD images")
     log_path = directory / f"local-{image_format}-{mode}-serial.log"
     with tempfile.TemporaryDirectory(prefix="ovmf-", dir=directory) as temporary:
         work = Path(temporary)
@@ -242,13 +244,23 @@ def local_disk_boot(image, image_format, directory, ovmf_code, ovmf_vars,
         )
         if disable_x2apic:
             cpu += ",x2apic=off"
+        # Both formats expose the same raw data region. For fixed VHD, miz
+        # validates the footer separately; it must not become a guest sector.
+        disk = {
+            "driver": "raw", "node-name": "hyperv-disk",
+            "offset": 0, "size": VIRTUAL_SIZE, "read-only": True,
+            "file": {
+                "driver": "file", "filename": "disk.img", "read-only": True,
+            },
+        }
         command = [
             str(qemu), "-machine", "q35,accel=kvm",
             "-cpu", cpu,
             "-smp", "1", "-m", "512M",
             "-drive", "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
             "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",
-            "-drive", f"if=virtio,format={image_format},readonly=on,file=disk.img",
+            "-blockdev", json.dumps(disk, separators=(",", ":")),
+            "-device", "virtio-blk-pci,drive=hyperv-disk",
             "-device", "vmbus-bridge,irq=15",
             "-display", "none", "-serial", "stdio", "-monitor", "none",
             "-no-reboot", "-nic", "none",
