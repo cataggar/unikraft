@@ -1611,6 +1611,10 @@ def build_private_image(
                 candidate = Path(value)
                 if not candidate.is_absolute():
                     candidate = repository / candidate
+                if candidate.is_symlink():
+                    raise RuntimeError(
+                        "Private local native build recovery path is invalid"
+                    )
                 candidate = candidate.resolve(strict=True)
                 try:
                     candidate.relative_to(cache_root)
@@ -1618,7 +1622,7 @@ def build_private_image(
                     raise RuntimeError(
                         "Private local native build recovery path is invalid"
                     ) from None
-                if candidate.is_symlink() or not candidate.is_file():
+                if not candidate.is_file():
                     raise RuntimeError(
                         "Private local native build recovery path is invalid"
                     )
