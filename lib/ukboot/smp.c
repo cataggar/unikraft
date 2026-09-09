@@ -97,6 +97,7 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 	unsigned int idx;
 	struct fixed_smp_boot_cpu *cpu;
 	unsigned int expected;
+	bool heap_accessible = false;
 #if CONFIG_LIBUKPAGING
 	struct uk_pagetable *pt;
 #endif
@@ -134,6 +135,7 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 	if (unlikely(rc))
 		goto err_halt;
 #endif
+	heap_accessible = true;
 	uk_lcpu_tlsp_set(cpu->bootstrap->tlsp);
 	uk_lcpu_set_auxsp(cpu->bootstrap->auxsp);
 	uk_pr_info("Fixed SMP: AP LCPU %u scheduler context active\n", idx);
@@ -163,12 +165,13 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 
 err_halt:
 	cpu->error = rc;
-	uk_sched_set_state(cpu->sched, UK_SCHED_ROLLED_BACK);
+	if (heap_accessible)
+		uk_sched_set_state(cpu->sched, UK_SCHED_ROLLED_BACK);
 	expected = FIXED_SMP_STARTING;
 	if (!__atomic_compare_exchange_n(&cpu->state, &expected,
 					 FIXED_SMP_ROLLED_BACK, 0,
 					 __ATOMIC_RELEASE,
-					 __ATOMIC_ACQUIRE))
+					 __ATOMIC_ACQUIRE) && heap_accessible)
 		uk_sched_set_state(cpu->sched, UK_SCHED_QUARANTINED);
 	uk_lcpu_halt_error(rc);
 }

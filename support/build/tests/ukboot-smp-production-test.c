@@ -37,7 +37,8 @@ static int scheduler_backing_live[4];
 static int lcpu_reported_halted[4];
 static int start_error[4];
 static int lcpu_init_error[4];
-static int paging_active = 1;
+static unsigned int paging_active = 1;
+static int paging_error;
 static jmp_buf ap_exit;
 static int ap_halt_error;
 
@@ -102,11 +103,13 @@ int uk_sched_start_thread(struct uk_sched *sched, struct uk_thread *thread)
 
 unsigned int uk_sched_state(const struct uk_sched *sched)
 {
+	assert(ukboot_host_cpu_idx == 0 || ap_init_stage >= 2);
 	return sched->state;
 }
 
 void uk_sched_set_state(struct uk_sched *sched, unsigned int state)
 {
+	assert(ukboot_host_cpu_idx == 0 || ap_init_stage >= 2);
 	sched->state = state;
 }
 
@@ -143,9 +146,10 @@ int uk_paging_pt_activate_lcpu(struct uk_pagetable *pt)
 	assert(ukboot_host_cpu_idx > 0);
 	assert(ap_init_stage == 1);
 	assert(pt == &runtime_pt && pt->token == 0x51U);
-	ap_init_stage = 2;
 	paging_sets++;
-	return 0;
+	if (!paging_error)
+		ap_init_stage = 2;
+	return paging_error;
 }
 
 void uk_lcpu_tlsp_set(uintptr_t tlsp)
@@ -231,15 +235,20 @@ int main(int argc, char **argv)
 		assert(bootstrap_releases == 2 && scheduler_destroys == 2);
 		return 0;
 	}
-	if (argc == 2 && !strcmp(argv[1], "--paging-failure")) {
-		paging_active = 0;
+	if (argc == 2 && (!strcmp(argv[1], "--paging-failure") ||
+			 !strcmp(argv[1], "--paging-activation-failure"))) {
+		int expected_error;
+
+		paging_active = !strcmp(argv[1], "--paging-activation-failure");
+		paging_error = paging_active ? -EIO : 0;
+		expected_error = paging_active ? -EIO : -ENODEV;
 		run_ap(1, 2);
-		assert(ap_halt_error == -ENODEV);
+		assert(ap_halt_error == expected_error);
 		assert(lcpu_inits == 1 && ap_init_stage == 1);
-		assert(paging_gets == 1 && paging_sets == 0);
+		assert(paging_gets == 1 && paging_sets == paging_active);
 		assert(tls_sets == 0 && auxsp_sets == 0);
 		assert(idle_publishes == 0 && irq_enables == 0 && blocks == 0);
-		assert(uk_boot_fixed_smp_wait_online(cpus, 1) == -ENODEV);
+		assert(uk_boot_fixed_smp_wait_online(cpus, 1) == expected_error);
 		uk_boot_fixed_smp_rollback(cpus, 3, 1);
 		assert(schedulers[1].state == UK_SCHED_QUARANTINED);
 		assert(bootstrap_releases == 2 && scheduler_destroys == 2);
