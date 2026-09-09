@@ -816,6 +816,69 @@ class HypervAzureControllerTest(unittest.TestCase):
         return run, state
 
     @staticmethod
+    def peer_declared_ids(run):
+        return [
+            run.expected_resource_id(
+                "Microsoft.Network", "networkSecurityGroups",
+                run.prefix + "-nsg",
+            ),
+            run.expected_resource_id(
+                "Microsoft.Network", "virtualNetworks",
+                run.prefix + "-vnet",
+            ),
+            run.expected_resource_id(
+                "Microsoft.Network", "networkInterfaces",
+                run.prefix + "-peer-nic",
+            ),
+            run.expected_resource_id(
+                "Microsoft.Network", "networkInterfaces",
+                run.prefix + "-guest-nic",
+            ),
+            run.expected_resource_id(
+                "Microsoft.Compute", "virtualMachines", run.peer_vm,
+            ),
+        ]
+
+    @classmethod
+    def peer_deployment(cls, run):
+        return {
+            "id": run.expected_resource_id(
+                "Microsoft.Resources", "deployments", run.prefix + "-peer"
+            ),
+            "name": run.prefix + "-peer",
+            "properties": {
+                "provisioningState": "Succeeded",
+                "correlationId": "11111111-1111-4111-8111-111111111111",
+                "outputResources": [
+                    {"id": identifier}
+                    for identifier in cls.peer_declared_ids(run)
+                ],
+            },
+        }
+
+    @classmethod
+    def peer_receipt(cls, run, *, complete=True):
+        receipt = {
+            "deployment_id": run.expected_resource_id(
+                "Microsoft.Resources", "deployments", run.prefix + "-peer"
+            ),
+            "correlation_id": "11111111-1111-4111-8111-111111111111",
+            "declared_resource_ids": cls.peer_declared_ids(run),
+        }
+        if complete:
+            receipt.update({
+                "peer_vm_id": run.expected_resource_id(
+                    "Microsoft.Compute", "virtualMachines", run.peer_vm
+                ),
+                "peer_vm_uuid": "22222222-2222-4222-8222-222222222222",
+                "peer_disk_id": run.expected_resource_id(
+                    "Microsoft.Compute", "disks", run.prefix + "-peer-os"
+                ),
+                "peer_disk_uuid": "33333333-3333-4333-8333-333333333333",
+            })
+        return receipt
+
+    @staticmethod
     def network_acceptance():
         config = (
             b"CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION=y\n"
@@ -1536,21 +1599,15 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             with self.subTest(phase=phase):
                 run, state = fixture.network_run_fixture()
                 state["phase"] = phase
-                state["peer_deployment"] = {
-                    "deployment_id": run.expected_resource_id(
-                        "Microsoft.Resources", "deployments",
-                        run.prefix + "-peer",
-                    ),
-                    "correlation_id": (
-                        "11111111-1111-4111-8111-111111111111"
-                    ),
-                    "peer_vm_id": peer_vm_id,
-                    "peer_vm_uuid": peer_vm_uuid,
-                    "peer_disk_id": disk_id,
-                    "peer_disk_uuid": peer_disk_uuid,
+                state["peer_deployment"] = fixture.peer_receipt(run)
+                vm_resource = {
+                    "id": peer_vm_id, "name": run.peer_vm,
+                    "type": "Microsoft.Compute/virtualMachines",
+                    "tags": run.tags,
                 }
                 run.az.side_effect = [
-                    True, group, [resource], peer_vm, disk, None, False,
+                    True, group, [vm_resource, resource],
+                    peer_vm, disk, None, None, False,
                 ]
                 run.cleanup()
                 self.assertEqual(
@@ -1608,16 +1665,7 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
         )
         peer_vm_uuid = "22222222-2222-4222-8222-222222222222"
         peer_disk_uuid = "33333333-3333-4333-8333-333333333333"
-        state["peer_deployment"] = {
-            "deployment_id": run.expected_resource_id(
-                "Microsoft.Resources", "deployments", run.prefix + "-peer"
-            ),
-            "correlation_id": "11111111-1111-4111-8111-111111111111",
-            "peer_vm_id": peer_vm_id,
-            "peer_vm_uuid": peer_vm_uuid,
-            "peer_disk_id": disk_id,
-            "peer_disk_uuid": peer_disk_uuid,
-        }
+        state["peer_deployment"] = fixture.peer_receipt(run)
         group = {"id": state["resource_group_id"], "tags": run.group_tags}
         resource = {
             "id": disk_id, "name": run.prefix + "-peer-os",
@@ -1633,6 +1681,10 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             **resource, "managedBy": peer_vm_id,
             "uniqueId": peer_disk_uuid,
         }
+        vm_resource = {
+            "id": peer_vm_id, "name": run.peer_vm,
+            "type": "Microsoft.Compute/virtualMachines", "tags": run.tags,
+        }
         variants = (
             ({**peer_vm, "vmId": "44444444-4444-4444-8444-444444444444"},
              disk),
@@ -1646,7 +1698,8 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             with self.subTest(changed_vm=changed_vm, changed_disk=changed_disk):
                 run.az.reset_mock()
                 run.az.side_effect = [
-                    True, group, [resource], changed_vm, changed_disk,
+                    True, group, [vm_resource, resource],
+                    changed_vm, changed_disk,
                 ]
                 with self.assertRaisesRegex(RuntimeError, "detached or replaced"):
                     run.cleanup()
@@ -1751,16 +1804,7 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
         peer_disk_id = run.expected_resource_id(
             "Microsoft.Compute", "disks", run.prefix + "-peer-os"
         )
-        deployment = {
-            "id": run.expected_resource_id(
-                "Microsoft.Resources", "deployments", run.prefix + "-peer"
-            ),
-            "name": run.prefix + "-peer",
-            "properties": {
-                "provisioningState": "Succeeded",
-                "correlationId": "11111111-1111-4111-8111-111111111111",
-            },
-        }
+        deployment = HypervAzureControllerTest.peer_deployment(run)
         peer_vm = {
             "id": peer_vm_id,
             "vmId": "22222222-2222-4222-8222-222222222222",
@@ -1790,7 +1834,7 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             }
 
         run.az.side_effect = [
-            deployment, peer_vm, peer_disk, peer_disk,
+            deployment, peer_vm, peer_disk, peer_vm, peer_disk,
             nic("/peer-nic", "10.87.0.4"),
             nic("/guest-nic", "10.87.0.5"),
         ]
@@ -1824,6 +1868,314 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             for call in run.az.call_args_list
         ))
 
+    def test_peer_deployment_persists_identity_before_updating_becomes_ready(self):
+        fixture = HypervAzureControllerTest()
+        run, state = fixture.network_run_fixture()
+        state["network_run"] = azure.network.private_network(
+            state["acceptance"], "10.87.0.5", "10.87.0.0/29"
+        )
+        peer_image = {
+            "publisher": "ExamplePublisher", "offer": "test-offer",
+            "sku": "test-sku", "version": "1.2.3",
+        }
+        receipt = fixture.peer_receipt(run)
+        extra_tags = {**run.tags, "fixture-extra": "retained"}
+        peer_vm = {
+            "id": receipt["peer_vm_id"], "vmId": receipt["peer_vm_uuid"],
+            "tags": extra_tags,
+            "hardwareProfile": {"vmSize": azure.network.PEER_VM_SIZE},
+            "storageProfile": {
+                "imageReference": peer_image,
+                "osDisk": {"managedDisk": {"id": receipt["peer_disk_id"]}},
+            },
+        }
+        peer_disk = {
+            "id": receipt["peer_disk_id"],
+            "uniqueId": receipt["peer_disk_uuid"],
+            "managedBy": receipt["peer_vm_id"],
+            "tags": extra_tags,
+        }
+
+        def nic(identifier, address):
+            return {
+                "id": identifier, "tags": extra_tags,
+                "ipConfigurations": [{
+                    "privateIPAddress": address,
+                    "privateIPAllocationMethod": "Static",
+                    "publicIPAddress": None,
+                }],
+            }
+
+        run.record.side_effect = lambda phase, **fields: state.update(
+            phase=phase, **fields
+        )
+
+        @azure.contextmanager
+        def parameters(_):
+            yield Path("/private/parameters.json")
+
+        run.private_parameters = parameters
+        run.az.side_effect = [
+            fixture.peer_deployment(run),
+            {**peer_vm, "provisioningState": "Updating"},
+            peer_disk,
+            {**peer_vm, "provisioningState": "Succeeded"},
+            peer_disk,
+            nic("/peer-nic", "10.87.0.4"),
+            nic("/guest-nic", "10.87.0.5"),
+        ]
+        with mock.patch.object(azure.time, "monotonic", return_value=100), \
+                mock.patch.object(azure.time, "sleep"):
+            run.deploy_network_peer(state["network_run"], peer_image, 700)
+        self.assertEqual(state["phase"], "peer-created")
+        self.assertEqual(state["peer_deployment"], receipt)
+        phases = [call.args[0] for call in run.record.call_args_list]
+        self.assertLess(
+            phases.index("peer-resources-verified"),
+            phases.index("peer-created"),
+        )
+
+    def test_peer_readiness_deadline_retains_recoverable_identity(self):
+        fixture = HypervAzureControllerTest()
+        run, state = fixture.network_run_fixture()
+        state["network_run"] = azure.network.private_network(
+            state["acceptance"], "10.87.0.5", "10.87.0.0/29"
+        )
+        peer_image = {
+            "publisher": "ExamplePublisher", "offer": "test-offer",
+            "sku": "test-sku", "version": "1.2.3",
+        }
+        receipt = fixture.peer_receipt(run)
+        peer_vm = {
+            "id": receipt["peer_vm_id"], "vmId": receipt["peer_vm_uuid"],
+            "tags": run.tags, "provisioningState": "Updating",
+            "hardwareProfile": {"vmSize": azure.network.PEER_VM_SIZE},
+            "storageProfile": {
+                "imageReference": peer_image,
+                "osDisk": {"managedDisk": {"id": receipt["peer_disk_id"]}},
+            },
+        }
+        peer_disk = {
+            "id": receipt["peer_disk_id"],
+            "uniqueId": receipt["peer_disk_uuid"],
+            "managedBy": receipt["peer_vm_id"], "tags": run.tags,
+        }
+        run.record.side_effect = lambda phase, **fields: state.update(
+            phase=phase, **fields
+        )
+
+        @azure.contextmanager
+        def parameters(_):
+            yield Path("/private/parameters.json")
+
+        run.private_parameters = parameters
+        run.az.side_effect = [
+            fixture.peer_deployment(run), peer_vm, peer_disk,
+            peer_vm, peer_disk,
+        ]
+        clock = iter((100, 100, 100, 100, 102, 102))
+        with mock.patch.object(
+            azure.time, "monotonic", side_effect=lambda: next(clock)
+        ), mock.patch.object(azure.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "provisioning readiness"):
+                run.deploy_network_peer(state["network_run"], peer_image, 101)
+        self.assertEqual(state["phase"], "peer-resources-verified")
+        self.assertEqual(state["peer_deployment"], receipt)
+
+    def test_peer_terminal_state_and_foreign_deployment_output_are_rejected(self):
+        fixture = HypervAzureControllerTest()
+        run, state = fixture.network_run_fixture()
+        state["network_run"] = azure.network.private_network(
+            state["acceptance"], "10.87.0.5", "10.87.0.0/29"
+        )
+        peer_image = {
+            "publisher": "ExamplePublisher", "offer": "test-offer",
+            "sku": "test-sku", "version": "1.2.3",
+        }
+        receipt = fixture.peer_receipt(run)
+        peer_vm = {
+            "id": receipt["peer_vm_id"], "vmId": receipt["peer_vm_uuid"],
+            "tags": run.tags, "provisioningState": "Failed",
+            "hardwareProfile": {"vmSize": azure.network.PEER_VM_SIZE},
+            "storageProfile": {
+                "imageReference": peer_image,
+                "osDisk": {"managedDisk": {"id": receipt["peer_disk_id"]}},
+            },
+        }
+        peer_disk = {
+            "id": receipt["peer_disk_id"],
+            "uniqueId": receipt["peer_disk_uuid"],
+            "managedBy": receipt["peer_vm_id"], "tags": run.tags,
+        }
+        run.record.side_effect = lambda phase, **fields: state.update(
+            phase=phase, **fields
+        )
+
+        @azure.contextmanager
+        def parameters(_):
+            yield Path("/private/parameters.json")
+
+        run.private_parameters = parameters
+        run.az.side_effect = [
+            fixture.peer_deployment(run), peer_vm, peer_disk,
+            peer_vm, peer_disk,
+        ]
+        with mock.patch.object(azure.time, "monotonic", return_value=100):
+            with self.assertRaisesRegex(RuntimeError, "terminal"):
+                run.deploy_network_peer(
+                    state["network_run"], peer_image, 700
+                )
+        self.assertEqual(state["phase"], "peer-resources-verified")
+        self.assertEqual(state["peer_deployment"], receipt)
+
+        deployment = fixture.peer_deployment(run)
+        deployment["properties"]["outputResources"].append({
+            "id": state["resource_group_id"]
+            + "/providers/Example.Provider/widgets/foreign",
+        })
+        with self.assertRaisesRegex(RuntimeError, "resource provenance"):
+            run.peer_deployment_receipt(deployment)
+
+    def test_cleanup_accepts_only_exact_untagged_peer_vm_extensions(self):
+        fixture = HypervAzureControllerTest()
+        run, state = fixture.network_run_fixture()
+        receipt = fixture.peer_receipt(run)
+        state.update(
+            phase="peer-resources-verified",
+            peer_deployment=receipt,
+            network_preflight={"peer_image": {
+                "publisher": "ExamplePublisher", "offer": "test-offer",
+                "sku": "test-sku", "version": "1.2.3",
+            }},
+        )
+        extra_tags = {**run.tags, "fixture-extra": "retained"}
+        group = {"id": state["resource_group_id"], "tags": run.group_tags}
+        vm_resource = {
+            "id": receipt["peer_vm_id"], "name": run.peer_vm,
+            "type": "Microsoft.Compute/virtualMachines", "tags": extra_tags,
+        }
+        disk_resource = {
+            "id": receipt["peer_disk_id"],
+            "name": run.prefix + "-peer-os",
+            "type": "Microsoft.Compute/disks", "tags": extra_tags,
+        }
+        extension = {
+            "id": receipt["peer_vm_id"] + "/extensions/fixture-agent",
+            "name": run.peer_vm + "/fixture-agent",
+            "type": "Microsoft.Compute/virtualMachines/extensions",
+            "tags": None,
+        }
+        peer_vm = {
+            **vm_resource, "vmId": receipt["peer_vm_uuid"],
+            "provisioningState": "Updating",
+            "hardwareProfile": {"vmSize": azure.network.PEER_VM_SIZE},
+            "storageProfile": {
+                "imageReference": state["network_preflight"]["peer_image"],
+                "osDisk": {"managedDisk": {"id": receipt["peer_disk_id"]}},
+            },
+        }
+        peer_disk = {
+            **disk_resource, "uniqueId": receipt["peer_disk_uuid"],
+            "managedBy": receipt["peer_vm_id"],
+        }
+        run.az.side_effect = [
+            True, group, [vm_resource, disk_resource, extension],
+            peer_vm, peer_disk, None, None, False,
+        ]
+        run.cleanup()
+        self.assertIn(
+            ["vm", "deallocate", "--resource-group", run.group,
+             "--name", run.peer_vm, "--no-wait"],
+            [call.args[0] for call in run.az.call_args_list],
+        )
+
+        invalid = (
+            {
+                **extension,
+                "id": receipt["peer_vm_id"] + "/diagnostics/unknown",
+                "type": "Microsoft.Compute/virtualMachines/diagnostics",
+            },
+            {
+                **extension,
+                "id": state["resource_group_id"]
+                + "/providers/Microsoft.Compute/virtualMachines/"
+                "other-vm/extensions/fixture-agent",
+            },
+            {
+                "id": state["resource_group_id"]
+                + "/providers/Example.Provider/widgets/unknown",
+                "name": "unknown", "type": "Example.Provider/widgets",
+                "tags": run.tags,
+            },
+        )
+        for resource in invalid:
+            with self.subTest(resource=resource):
+                run.az.reset_mock()
+                run.az.side_effect = [
+                    True, group, [vm_resource, disk_resource, resource],
+                    peer_vm, peer_disk, None,
+                ]
+                with self.assertRaisesRegex(RuntimeError, "unproven resource"):
+                    run.cleanup()
+
+    def test_cleanup_reconciles_only_proven_partial_peer_identity(self):
+        fixture = HypervAzureControllerTest()
+        run, state = fixture.network_run_fixture()
+        receipt = fixture.peer_receipt(run)
+        state.update(
+            phase="peer-deployment-succeeded",
+            peer_deployment=fixture.peer_receipt(run, complete=False),
+            network_preflight={"peer_image": {
+                "publisher": "ExamplePublisher", "offer": "test-offer",
+                "sku": "test-sku", "version": "1.2.3",
+            }},
+        )
+        group = {"id": state["resource_group_id"], "tags": run.group_tags}
+        vm_resource = {
+            "id": receipt["peer_vm_id"], "name": run.peer_vm,
+            "type": "Microsoft.Compute/virtualMachines", "tags": run.tags,
+        }
+        disk_resource = {
+            "id": receipt["peer_disk_id"],
+            "name": run.prefix + "-peer-os",
+            "type": "Microsoft.Compute/disks", "tags": run.tags,
+        }
+        peer_vm = {
+            **vm_resource, "vmId": receipt["peer_vm_uuid"],
+            "provisioningState": "Updating",
+            "hardwareProfile": {"vmSize": azure.network.PEER_VM_SIZE},
+            "storageProfile": {
+                "imageReference": state["network_preflight"]["peer_image"],
+                "osDisk": {"managedDisk": {"id": receipt["peer_disk_id"]}},
+            },
+        }
+        peer_disk = {
+            **disk_resource, "uniqueId": receipt["peer_disk_uuid"],
+            "managedBy": receipt["peer_vm_id"],
+        }
+        run.record.side_effect = lambda phase, **fields: state.update(
+            phase=phase, **fields
+        )
+        run.az.side_effect = [
+            True, group, [vm_resource, disk_resource],
+            peer_vm, peer_disk, None, None, False,
+        ]
+        run.cleanup()
+        self.assertEqual(state["peer_deployment"], receipt)
+        self.assertNotEqual(state["phase"], "peer-created")
+
+        run, state = fixture.network_run_fixture()
+        state.update(
+            phase="peer-deployment-succeeded",
+            peer_deployment={
+                "deployment_id": receipt["deployment_id"],
+                "declared_resource_ids": receipt["declared_resource_ids"],
+            },
+        )
+        run.az.side_effect = [True, group, [vm_resource, disk_resource]]
+        with self.assertRaisesRegex(RuntimeError, "unproven"):
+            run.cleanup()
+
     def test_replaced_peer_disk_with_run_tags_still_blocks_cleanup(self):
         fixture = HypervAzureControllerTest()
         run, state = fixture.network_run_fixture()
@@ -1842,16 +2194,7 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
         )
         original_uuid = "33333333-3333-4333-8333-333333333333"
         replacement_uuid = "44444444-4444-4444-8444-444444444444"
-        deployment = {
-            "id": run.expected_resource_id(
-                "Microsoft.Resources", "deployments", run.prefix + "-peer"
-            ),
-            "name": run.prefix + "-peer",
-            "properties": {
-                "provisioningState": "Succeeded",
-                "correlationId": "11111111-1111-4111-8111-111111111111",
-            },
-        }
+        deployment = HypervAzureControllerTest.peer_deployment(run)
         peer_vm = {
             "id": peer_vm_id,
             "vmId": "22222222-2222-4222-8222-222222222222",
@@ -1882,10 +2225,10 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
 
         run.private_parameters = parameters
         run.az.side_effect = [
-            deployment, peer_vm, original_disk, replacement_disk,
+            deployment, peer_vm, original_disk, peer_vm, replacement_disk,
         ]
         with mock.patch.object(azure.time, "monotonic", return_value=100):
-            with self.assertRaisesRegex(RuntimeError, "not owned by the peer VM"):
+            with self.assertRaisesRegex(RuntimeError, "detached or replaced"):
                 run.deploy_network_peer(
                     state["network_run"], peer_image, 400
                 )
@@ -1987,6 +2330,42 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
                     guest_ipv4="10.87.0.5", subnet="10.87.0.0/29",
                 )
         run.cleanup.assert_called()
+
+        state["phase"] = "prepared"
+        private_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        private_endpoint = "https://fixture.invalid/private?credential=secret"
+        private_group = "fixture-private-group"
+        run.private_failure_values.return_value = {private_group}
+        run.wait_for_peer_ready.side_effect = RuntimeError(
+            f"primary failure {private_uuid} {private_endpoint} {private_group}"
+        )
+        run.cleanup.side_effect = RuntimeError(
+            f"cleanup failure /subscriptions/{private_uuid}/resourceGroups/private"
+        )
+        with mock.patch.object(azure, "validate_prepared_run_provenance"), \
+                mock.patch.object(azure, "save_json"), \
+                mock.patch.object(azure.time, "monotonic", return_value=100):
+            with self.assertRaises(azure.RunCleanupError) as raised:
+                azure.run_prepared(
+                    Path("/unused"), "io", 600, False,
+                    subscription="11111111-2222-3333-4444-555555555555",
+                    guest_ipv4="10.87.0.5", subnet="10.87.0.0/29",
+                )
+        message = str(raised.exception)
+        self.assertIn("primary failure", message)
+        self.assertIn("cleanup also failed", message)
+        self.assertNotIn(private_uuid, message)
+        self.assertNotIn(private_endpoint, message)
+        self.assertNotIn(private_group, message)
+        rendered = "".join(traceback.format_exception(raised.exception))
+        self.assertNotIn(private_uuid, rendered)
+        self.assertNotIn(private_endpoint, rendered)
+        failure_record = run.record.call_args
+        self.assertEqual(failure_record.args[0], "cleanup-failed")
+        self.assertNotIn(
+            private_uuid,
+            json.dumps(failure_record.kwargs, sort_keys=True),
+        )
 
     @mock.patch.object(azure, "AzureRun")
     @mock.patch.object(azure, "check_upload_dependencies")
