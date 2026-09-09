@@ -127,6 +127,10 @@ pub const x86_64_efi_netvsc = Library{
         "libnetvsc/netvsc.o",
         "libnetvsc/libinfo.libuklibid.o",
     },
+    .export_symbols = .{
+        .root = .base,
+        .relative = "drivers/hyperv/netvsc/exportsyms.uk",
+    },
 };
 
 pub const x86_64_efi_hyperv_acceptance_app = Library{

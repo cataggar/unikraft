@@ -12,6 +12,7 @@ APPHELLOWORLD_CINCLUDES-y += -I$(CONFIG_UK_BASE)/drivers/hyperv/vmbus/include
 ifeq ($(CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION),y)
 include $(APPHELLOWORLD_BASE)/network-stack.mk
 APPHELLOWORLD_CINCLUDES-y += -I$(LIBLWIP_BASE)
+APPHELLOWORLD_CINCLUDES-y += -I$(CONFIG_UK_BASE)/drivers/hyperv/netvsc/include
 
 .PHONY: hyperv_acceptance_network_stack_verify
 UK_PREPARE-y += hyperv_acceptance_network_stack_verify

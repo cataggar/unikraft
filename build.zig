@@ -1103,6 +1103,7 @@ pub fn build(b: *std.Build) void {
         "support/build/tests/netvsc-host-include",
         "support/build/tests",
         "drivers/hyperv/netvsc",
+        "drivers/hyperv/netvsc/include",
         "drivers/hyperv/vmbus",
     }) |path| netvsc_production_tests.root_module.addIncludePath(b.path(path));
     netvsc_production_tests.root_module.addCSourceFiles(.{

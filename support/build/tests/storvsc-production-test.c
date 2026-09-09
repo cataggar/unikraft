@@ -153,6 +153,8 @@ static int read_only_media;
 static int reject_mode_sense6;
 static int reject_mode_sense10;
 static int report_luns_mode;
+static uint8_t single_report_lun = 2;
+static int enumerate_during_report_luns;
 static int topology_fixture;
 static int vpd_mode;
 static uint8_t vpd_variant;
@@ -163,6 +165,7 @@ static int discovery_failure_kind;
 static unsigned int discovery_failure_controller;
 static uint8_t discovery_failure_lun;
 static unsigned int discovery_failures_remaining;
+static int inquiry_no_device;
 static unsigned int registration_failure_controller;
 static uint8_t registration_failure_lun;
 static unsigned int registration_failures_remaining;
@@ -222,6 +225,10 @@ static int use_vmbus_offer_lifetimes;
 static int retained_callback_entered;
 static int retained_callback_release;
 static int retained_callback_count;
+
+static int persistence_remove_device(struct vmbus_driver *driver,
+				     struct vmbus_device *device);
+static void enqueue_enumerate_bus(struct vmbus_channel *channel);
 
 enum persistence_hook_mode {
 	PERSISTENCE_HOOK_NONE = 0,
@@ -288,6 +295,7 @@ enum {
 
 enum {
 	REPORT_LUNS_NORMAL,
+	REPORT_LUNS_SINGLE,
 	REPORT_LUNS_EMPTY,
 	REPORT_LUNS_TRUNCATED,
 	REPORT_LUNS_CAPACITY,
@@ -850,6 +858,11 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 			response_transfer +=
 				3 * STORVSC_REPORT_LUN_ENTRY_SIZE;
 			break;
+		case REPORT_LUNS_SINGLE:
+			put_be32(data, 0, STORVSC_REPORT_LUN_ENTRY_SIZE);
+			data[9] = single_report_lun;
+			response_transfer += STORVSC_REPORT_LUN_ENTRY_SIZE;
+			break;
 		case REPORT_LUNS_EMPTY:
 			break;
 		case REPORT_LUNS_TRUNCATED:
@@ -884,6 +897,10 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 			abort();
 		}
 		range_write(range, data, response_transfer);
+		if (enumerate_during_report_luns) {
+			enumerate_during_report_luns = 0;
+			enqueue_enumerate_bus(channel);
+		}
 		break;
 	case 0x12:
 		if (payload[29] & 1) {
@@ -925,6 +942,12 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 			}
 			range_write(range, data, response_transfer);
 			break;
+		}
+		if (inquiry_no_device) {
+			enqueue_completion_on(
+				channel, id, response_packet_length(packet_length),
+				0, 0x08, 0, 0);
+			return;
 		}
 		data[0] = 0;
 		data[2] = 5;
@@ -3430,6 +3453,7 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	int lun_events[4] = { 0 };
 	int primary_events;
 	unsigned int count;
+	unsigned int empty_reports;
 	int rc;
 
 	topology_fixture = 1;
@@ -4068,14 +4092,64 @@ static int run_topology_regression(struct vmbus_driver *driver,
 		    memcmp(mappings[i].vpd_id, mappings[0].vpd_id, 8))
 			return 430;
 	}
-	remove_test_offer(driver, primary);
-	if (primary->channel)
-		(void)vmbus_channel_close(primary->channel);
-	remove_test_offer(driver, &secondary);
-	if (secondary.channel)
-		(void)vmbus_channel_close(secondary.channel);
+	rc = persistence_remove_device(driver, &secondary);
+	if (persistence_remove_device(driver, primary) || rc)
+		return 431;
 	topology_fixture = 0;
 	vpd_mode = VPD_NORMAL;
+	empty_reports = report_luns_commands;
+	report_luns_mode = REPORT_LUNS_SINGLE;
+	primary->present = 1;
+	if (driver->add_dev(primary) || !primary->channel ||
+	    !storvsc_host_controller_online(0) ||
+	    uk_storvsc_mapping_count() != 1)
+		return 432;
+	report_luns_mode = REPORT_LUNS_EMPTY;
+	secondary.present = 1;
+	if (driver->add_dev(&secondary) || !secondary.channel ||
+	    !storvsc_host_controller_online(1) ||
+	    uk_storvsc_mapping_count() != 1 ||
+	    report_luns_commands != empty_reports + 3 ||
+	    uk_storvsc_inventory_get(&inventory) || inventory.count != 1)
+		return 433;
+	enqueue_enumerate_bus(secondary.channel);
+	fire_channel_on(secondary.channel);
+	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
+		return 434;
+	rc = persistence_remove_device(driver, &secondary);
+	if (persistence_remove_device(driver, primary) || rc)
+		return 435;
+
+	report_luns_mode = REPORT_LUNS_EMPTY;
+	enumerate_during_report_luns = 1;
+	secondary.present = 1;
+	rc = driver->add_dev(&secondary);
+	if (rc != -ESTALE || secondary.channel ||
+	    uk_storvsc_mapping_count()) {
+		fprintf(stderr,
+			"disrupted empty discovery rc=%d channel=%p mappings=%u\n",
+			rc, (void *)secondary.channel,
+			uk_storvsc_mapping_count());
+		return 436;
+	}
+	remove_test_offer(driver, &secondary);
+
+	report_luns_mode = REPORT_LUNS_SINGLE;
+	single_report_lun = 0;
+	inquiry_no_device = 1;
+	secondary.present = 1;
+	rc = driver->add_dev(&secondary);
+	inquiry_no_device = 0;
+	single_report_lun = 2;
+	if (rc != -ENODEV || secondary.channel ||
+	    uk_storvsc_mapping_count()) {
+		fprintf(stderr,
+			"no-device discovery rc=%d channel=%p mappings=%u\n",
+			rc, (void *)secondary.channel,
+			uk_storvsc_mapping_count());
+		return 437;
+	}
+	remove_test_offer(driver, &secondary);
 	report_luns_mode = REPORT_LUNS_NORMAL;
 	return 0;
 }
@@ -6136,12 +6210,6 @@ static int storvsc_production_test(void)
 	rc = driver->add_dev(&vmbus_device);
 	if (rc != -EINVAL || vmbus_device.channel)
 		return 27;
-
-	report_luns_mode = REPORT_LUNS_EMPTY;
-	vmbus_device.present = 1;
-	rc = driver->add_dev(&vmbus_device);
-	if (rc != -ENODEV || vmbus_device.channel)
-		return 421;
 
 	report_luns_mode = REPORT_LUNS_TRUNCATED;
 	vmbus_device.present = 1;

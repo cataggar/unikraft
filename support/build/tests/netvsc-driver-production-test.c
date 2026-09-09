@@ -11,6 +11,7 @@
 #include <uk/essentials.h>
 #include <uk/netbuf.h>
 #include <uk/netdev_driver.h>
+#include <uk/netvsc.h>
 #include <uk/sched.h>
 #include <uk/vmbus.h>
 
@@ -29,6 +30,9 @@
 #define MOCK_NETBUF_COUNT 16
 #define MOCK_NVS_RESPONSE_CAPACITY \
 	(((12U + NETVSC_NVS_MAX_SECTIONS * 16U) + 7U) & ~7U)
+
+_Static_assert(sizeof(struct uk_netvsc_diagnostics) == 96,
+	       "NetVSC diagnostics ABI changed");
 
 #define CHECK(condition)						\
 	do {								\
@@ -1211,8 +1215,19 @@ static int test_tx_ownership_and_saturation(struct uk_netdev *netdev)
 	struct host_netbuf packets[6] = { 0 };
 	struct host_netbuf chain_tail = { 0 };
 	struct host_netbuf reaper = { 0 };
+	struct uk_netvsc_diagnostics before;
+	struct uk_netvsc_diagnostics after;
 	unsigned int i;
 
+	CHECK(uk_netvsc_diagnostics_get(netdev, &before) == 0);
+	CHECK(before.version == UK_NETVSC_DIAGNOSTICS_VERSION);
+	CHECK(before.size == sizeof(before));
+	CHECK(before.attached && before.configured && before.running &&
+	      before.host_running && before.link_up && !before.failed);
+	CHECK(before.nvs_version == NETVSC_NVS_VERSION_5);
+	CHECK(before.ndis_version ==
+	      netvsc_nvs_ndis_version(NETVSC_NVS_VERSION_5));
+	CHECK(before.mtu == 1500);
 	mock.delay_tx = 1;
 	for (i = 0; i < 5; i++)
 		prepare_tx_buffer(&packets[i], (__u8)(0x10 + i), 42);
@@ -1263,6 +1278,10 @@ static int test_tx_ownership_and_saturation(struct uk_netdev *netdev)
 	CHECK(reaper.free_count == 0);
 	CHECK(netdev->tx_stats.packets == 6);
 	CHECK(netdev->tx_stats.bytes == 270);
+	CHECK(uk_netvsc_diagnostics_get(netdev, &after) == 0);
+	CHECK(after.tx_submitted == before.tx_submitted + 6);
+	CHECK(after.tx_completed == before.tx_completed + 6);
+	CHECK(after.tx_pending == 0);
 	mock.delay_tx = 0;
 	return 0;
 }
@@ -1947,9 +1966,12 @@ static int test_rx_bounds_headroom_and_reentry(struct uk_netdev *netdev)
 {
 	__u8 frame[80];
 	struct uk_netbuf *packet = NULL;
+	struct uk_netvsc_diagnostics before;
+	struct uk_netvsc_diagnostics after;
 	unsigned int i;
 	int status;
 
+	CHECK(uk_netvsc_diagnostics_get(netdev, &before) == 0);
 	for (i = 0; i < sizeof(frame); i++)
 		frame[i] = (__u8)(0xa0 + i);
 	CHECK(netdev->ops->rxq_intr_enable(netdev,
@@ -2132,6 +2154,12 @@ static int test_rx_bounds_headroom_and_reentry(struct uk_netdev *netdev)
 		CHECK(mock.ack_count == acknowledgements + 4);
 		CHECK(mock.last_ack_status == NETVSC_NVS_STATUS_FAILED);
 	}
+	CHECK(uk_netvsc_diagnostics_get(netdev, &after) == 0);
+	CHECK(after.rx_packets >= before.rx_packets + 10);
+	CHECK(after.rx_dropped >= before.rx_dropped + 1);
+	CHECK(after.transfer_packets > before.transfer_packets);
+	CHECK(after.channel_packets > before.channel_packets);
+	CHECK(after.rx_queued == 0);
 	return 0;
 }
 

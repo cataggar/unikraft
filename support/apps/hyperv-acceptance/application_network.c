@@ -25,6 +25,7 @@
 #include <netif/uknetdev.h>
 #include <uk/alloc.h>
 #include <uk/netdev.h>
+#include <uk/netvsc.h>
 #include <uk/plat/time.h>
 #include <uk/sched.h>
 
@@ -126,6 +127,7 @@ struct bounded_adapter {
 	unsigned int receive_budget_exhaustions;
 	unsigned int transmit_attempts;
 	unsigned int transmit_busy;
+	uint64_t pumps;
 };
 
 struct bounded_tx_attempt {
@@ -303,6 +305,7 @@ static int bounded_adapter_poll(void)
 
 static int application_pump(void)
 {
+	application_adapter.pumps++;
 	(void)bounded_adapter_poll();
 	sys_check_timeouts();
 	return application_adapter.failure != BOUNDED_ADAPTER_OK;
@@ -338,6 +341,60 @@ static void print_unavailable_stages(enum hyperv_acceptance_result result,
 	       application_result_name(result), reason);
 	printf("HYPERV_ACCEPTANCE NETWORK_APP_FINAL %s reason=%s\n",
 	       application_result_name(result), reason);
+}
+
+static void print_dhcp_diagnostic(struct netif *netif, const char *reason)
+{
+	struct uk_netvsc_diagnostics diagnostics;
+	struct dhcp *client = netif ? netif_dhcp_data(netif) : NULL;
+	int driver_rc;
+
+	memset(&diagnostics, 0, sizeof(diagnostics));
+	driver_rc = uk_netvsc_diagnostics_get(application_adapter.device,
+					     &diagnostics);
+	printf("HYPERV_ACCEPTANCE NETWORK_DHCP_DIAGNOSTIC INFO "
+	       "reason=%s dhcp_state=%" PRIu8 " dhcp_tries=%" PRIu8
+	       " request_timeout=%" PRIu16 " supplied=%d pumps=%" PRIu64
+	       " netif_up=%d link_up=%d adapter_failure=%s "
+	       "adapter_tx=%u adapter_busy=%u adapter_rx=%u "
+	       "adapter_rx_budget=%u driver_rc=%d generation=%" PRIu32
+	       " nvs=%08" PRIx32 " ndis=%08" PRIx32 " mtu=%" PRIu16
+	       " attached=%" PRIu8 " configured=%" PRIu8
+	       " running=%" PRIu8 " host_running=%" PRIu8
+	       " host_link=%" PRIu8 " failed=%" PRIu8
+	       " tx_submitted=%" PRIu64 " tx_completed=%" PRIu64
+	       " tx_pending=%" PRIu16 " rx_packets=%" PRIu64
+	       " rx_dropped=%" PRIu64 " rx_queued=%" PRIu16
+	       " channel_packets=%" PRIu64 " transfer_packets=%" PRIu64
+	       " pending_acks=%" PRIu16 " malformed=%" PRIu32
+	       " unknown=%" PRIu32 " duplicate=%" PRIu32
+	       " early=%" PRIu32 "\n",
+	       reason, client ? client->state : UINT8_MAX,
+	       client ? client->tries : UINT8_MAX,
+	       client ? client->request_timeout : UINT16_MAX,
+	       netif ? dhcp_supplied_address(netif) : 0,
+	       application_adapter.pumps,
+	       netif ? netif_is_up(netif) : 0,
+	       netif ? netif_is_link_up(netif) : 0,
+	       bounded_adapter_failure_name(),
+	       application_adapter.transmit_attempts,
+	       application_adapter.transmit_busy,
+	       application_adapter.receive_packets,
+	       application_adapter.receive_budget_exhaustions,
+	       driver_rc, diagnostics.generation, diagnostics.nvs_version,
+	       diagnostics.ndis_version, diagnostics.mtu,
+	       diagnostics.attached,
+	       diagnostics.configured, diagnostics.running,
+	       diagnostics.host_running, diagnostics.link_up,
+	       diagnostics.failed, diagnostics.tx_submitted,
+	       diagnostics.tx_completed, diagnostics.tx_pending,
+	       diagnostics.rx_packets, diagnostics.rx_dropped,
+	       diagnostics.rx_queued, diagnostics.channel_packets,
+	       diagnostics.transfer_packets, diagnostics.pending_acks,
+	       diagnostics.malformed_messages,
+	       diagnostics.unknown_completions,
+	       diagnostics.duplicate_completions,
+	       diagnostics.early_completions);
 }
 
 static enum hyperv_acceptance_result acquire_lease(struct uk_netdev *device,
@@ -384,6 +441,7 @@ static enum hyperv_acceptance_result acquire_lease(struct uk_netdev *device,
 	netif_set_up(netif);
 	error = dhcp_start(netif);
 	if (error != ERR_OK) {
+		print_dhcp_diagnostic(netif, "dhcp-start");
 		printf("HYPERV_ACCEPTANCE NETWORK_APP_LEASE FAIL "
 		       "reason=dhcp-start rc=%d\n", (int)error);
 		return HYPERV_ACCEPTANCE_FAIL;
@@ -394,6 +452,7 @@ static enum hyperv_acceptance_result acquire_lease(struct uk_netdev *device,
 		if (dhcp_supplied_address(netif))
 			break;
 		if (application_wait()) {
+			print_dhcp_diagnostic(netif, "adapter-failure");
 			printf("HYPERV_ACCEPTANCE NETWORK_APP_LEASE FAIL "
 			       "reason=adapter-%s\n",
 			       bounded_adapter_failure_name());
@@ -401,6 +460,7 @@ static enum hyperv_acceptance_result acquire_lease(struct uk_netdev *device,
 		}
 	}
 	if (!dhcp_supplied_address(netif)) {
+		print_dhcp_diagnostic(netif, "dhcp-timeout");
 		dhcp_stop(netif);
 		puts("HYPERV_ACCEPTANCE NETWORK_APP_LEASE FAIL "
 		     "reason=dhcp-timeout");
