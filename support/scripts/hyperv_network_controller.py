@@ -528,8 +528,8 @@ def inspect_guest_log(text, acceptance, network):
         or tcp_values["tx_bytes"] != TCP_BYTES
         or tcp_values["rx_bytes"] != TCP_BYTES
         or tcp_values["close_accepted"] != len(TCP_CASES)
-        or tcp_values["write_chunks"] < TCP_MIN_WRITE_TOTAL
-        or tcp_values["rx_callbacks"] < len(TCP_CASES)
+        or not TCP_MIN_WRITE_TOTAL <= tcp_values["write_chunks"] <= TCP_BYTES
+        or not len(TCP_CASES) <= tcp_values["rx_callbacks"] <= TCP_BYTES
         or tcp_values["rx_pbuf_freed"] != tcp_values["rx_callbacks"]
     ):
         raise ValueError("Guest TCP counts or cleanup are invalid")
@@ -793,8 +793,10 @@ def inspect_peer_log(text, acceptance, network):
             "schema": 1, "event": "TCP", "result": "PASS",
             "sequence": sequence, "rx_bytes": body_length + 24,
             "tx_bytes": body_length + 24, "writes": value["writes"],
-        } or value["writes"] < minimum_writes:
-            raise ValueError("Peer TCP record has invalid sequence, bytes, or result")
+        } or not minimum_writes <= value["writes"] <= body_length + 24:
+            raise ValueError(
+                "Peer TCP record has invalid sequence, bytes, result, or writes"
+            )
         tcp_writes.append(value["writes"])
     for (index, value), (sequence, body_length) in zip(udp, UDP_CASES):
         _exact_fields(

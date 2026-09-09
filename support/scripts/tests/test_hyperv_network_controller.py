@@ -45,7 +45,7 @@ class HypervNetworkControllerTest(unittest.TestCase):
         return prefix + json.dumps(fields, sort_keys=True)
 
     @staticmethod
-    def producer_tcp_writes():
+    def producer_tcp_writes(write_limit=None):
         peer = controller._load_peer()
 
         class CompleteWrite:
@@ -54,7 +54,7 @@ class HypervNetworkControllerTest(unittest.TestCase):
 
             @staticmethod
             def send(data):
-                return len(data)
+                return len(data) if write_limit is None else min(len(data), write_limit)
 
         connection = CompleteWrite()
         nonce = int("87c0ffee5aa8dfd6", 16)
@@ -302,6 +302,67 @@ class HypervNetworkControllerTest(unittest.TestCase):
             )["tcp"]["writes"],
             17,
         )
+
+    def test_tcp_partial_io_counts_cannot_exceed_transferred_bytes(self):
+        peer = self.peer_log()
+        maxima = self.producer_tcp_writes(write_limit=1)
+        self.assertEqual(
+            maxima, tuple(length + 24 for _, length in controller.TCP_CASES)
+        )
+        maximum_peer = peer
+        for occurrence, writes in enumerate(maxima):
+            maximum_peer = self.mutate_record(
+                maximum_peer, controller.PEER_PREFIX, "TCP", "writes",
+                writes, occurrence,
+            )
+        maximum_peer = self.mutate_record(
+            maximum_peer, controller.PEER_PREFIX, "FINAL", "tcp_writes",
+            sum(maxima),
+        )
+        result = controller.correlate_evidence(
+            self.guest_log(), maximum_peer, self.acceptance(), self.network()
+        )
+        self.assertEqual(result["peer"]["tcp"]["writes"], controller.TCP_BYTES)
+
+        minima = self.producer_tcp_writes()
+        for occurrence, maximum in enumerate(maxima):
+            impossible = self.mutate_record(
+                peer, controller.PEER_PREFIX, "TCP", "writes",
+                maximum + 1, occurrence,
+            )
+            impossible = self.mutate_record(
+                impossible, controller.PEER_PREFIX, "FINAL", "tcp_writes",
+                sum(minima) - minima[occurrence] + maximum + 1,
+            )
+            with self.subTest(peer_connection=occurrence):
+                with self.assertRaisesRegex(ValueError, "Peer TCP"):
+                    controller.correlate_evidence(
+                        self.guest_log(), impossible,
+                        self.acceptance(), self.network(),
+                    )
+
+        for field, minimum in (
+            ("write_chunks", controller.TCP_MIN_WRITE_TOTAL),
+            ("rx_callbacks", len(controller.TCP_CASES)),
+        ):
+            for count in (controller.TCP_BYTES, controller.TCP_BYTES + 1):
+                guest = self.guest_log().replace(
+                    f"{field}={minimum}", f"{field}={count}"
+                )
+                if field == "rx_callbacks":
+                    guest = guest.replace(
+                        f"rx_pbuf_freed={minimum}", f"rx_pbuf_freed={count}"
+                    )
+                with self.subTest(guest_field=field, count=count):
+                    if count == controller.TCP_BYTES:
+                        controller.correlate_evidence(
+                            guest, peer, self.acceptance(), self.network()
+                        )
+                    else:
+                        with self.assertRaisesRegex(ValueError, "Guest TCP"):
+                            controller.correlate_evidence(
+                                guest, peer, self.acceptance(), self.network()
+                            )
 
     def test_every_peer_wire_integer_rejects_float_and_boolean_json(self):
         peer = self.peer_log()

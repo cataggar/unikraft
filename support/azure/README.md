@@ -393,7 +393,8 @@ digests, guest/peer cleanup, peer `EOF`, application final, overall I/O-ready,
 and the exact producer `main returned 0` record. Integer wire fields must be
 JSON integers (never booleans or floats), and the fixed TCP producer schedules
 must prove at least 2/9/3 writes with the final total matching the three
-records. Raw DHCP, peer-only success, stale/duplicate records, restart, bad
+records. TCP write and receive-callback counts cannot exceed the corresponding
+transferred byte counts. Raw DHCP, peer-only success, stale/duplicate records, restart, bad
 endpoint/nonce, missing EOF, or any failure is rejected.
 
 Private `peer-serial.log`, `guest-serial.log`, and
