@@ -74,6 +74,13 @@ STATE_FILE = "state.json"
 LOCATION = "northeurope"
 VM_SIZE = "Standard_D2s_v5"
 VM_MEMORY_GB = 8
+FIXED_SKU_CAPABILITY_NAMES = (
+    "CpuArchitectureType",
+    "vCPUs",
+    "MemoryGB",
+    "HyperVGenerations",
+    "NestedVirtualization",
+)
 CONTAINER = "preflight"
 WORKLOAD = "platform-only-v1"
 NESTED_VIRTUALIZATION_REFERENCE = {
@@ -3406,9 +3413,11 @@ def validate_nested_capability_admission(value):
         )
     if (
         value["schema"] != NESTED_CAPABILITY_ADMISSION_SCHEMA
+        or type(value["schema_version"]) is not int
         or value["schema_version"] != NESTED_CAPABILITY_ADMISSION_VERSION
         or value["location"] != LOCATION
         or value["vm_size"] != VM_SIZE
+        or type(value["memory_gb"]) is not int
         or value["memory_gb"] != VM_MEMORY_GB
         or metadata["capability_name"] != "NestedVirtualization"
         or type(metadata["capability_count"]) is not int
@@ -3454,6 +3463,11 @@ def nested_capability_admission(location, vm_size, sku_metadata):
         ):
             raise ValueError
         capabilities = []
+        consumed_names = {
+            "".join(name.split()).casefold(): name
+            for name in FIXED_SKU_CAPABILITY_NAMES
+        }
+        seen_consumed = set()
         for entry in record["capabilities"]:
             entry = exact_fields(
                 entry, ("name", "value"), "Fixed preflight SKU capability"
@@ -3465,6 +3479,12 @@ def nested_capability_admission(location, vm_size, sku_metadata):
                 or not entry["value"]
             ):
                 raise ValueError
+            normalized_name = "".join(entry["name"].split()).casefold()
+            consumed = consumed_names.get(normalized_name)
+            if consumed is not None:
+                if entry["name"] != consumed or consumed in seen_consumed:
+                    raise ValueError
+                seen_consumed.add(consumed)
             capabilities.append((entry["name"], entry["value"]))
     except (TypeError, ValueError):
         raise RuntimeError(
@@ -3478,12 +3498,14 @@ def nested_capability_admission(location, vm_size, sku_metadata):
     vcpus = values("vCPUs")
     memory = values("MemoryGB")
     generations = values("HyperVGenerations")
+    generation_tokens = (
+        tuple(generations[0].split(",")) if len(generations) == 1 else ()
+    )
     if (
         architecture != ["x64"]
         or vcpus != ["2"]
         or memory != [str(VM_MEMORY_GB)]
-        or len(generations) != 1
-        or "V2" not in generations[0].split(",")
+        or generation_tokens not in (("V2",), ("V1", "V2"))
     ):
         raise RuntimeError(
             "The fixed preflight SKU metadata conflicts with its "

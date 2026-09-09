@@ -5256,6 +5256,19 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                         self.RUN_ID, self.DISK_ID,
                         self.contract["geometry"],
                     )
+        for field, value in (
+            ("schema_version", True),
+            ("memory_gb", 8.0),
+        ):
+            preflight = copy.deepcopy(self.contract["preflight"])
+            preflight["host_capability_admission"][field] = value
+            with self.subTest(admission_field=field):
+                with self.assertRaises(ValueError):
+                    persistence.validate_preflight_receipt(
+                        preflight, self.contract["files"]["guest_vhd"],
+                        self.RUN_ID, self.DISK_ID,
+                        self.contract["geometry"],
+                    )
         preflight = copy.deepcopy(self.contract["preflight"])
         preflight["guarded"]["lun"] = 6
         with self.assertRaises(ValueError):

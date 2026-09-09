@@ -408,9 +408,13 @@ supported (documentation source revision
 controller records the absent advertisement and this authority in private
 state and the completed receipt; it does not synthesize an advertised
 `True`. An explicit `False`, duplicate, conflicting, or malformed
-advertisement remains a pre-deployment failure. The same narrow admission
-does not apply to another SKU or region. It never changes region, image, SKU,
-or host in response to failure.
+advertisement remains a pre-deployment failure. Case or whitespace aliases
+of any consumed SKU capability name are rejected rather than treated as
+missing metadata. `HyperVGenerations` must contain canonical `V2`, either
+alone or after canonical `V1`; unknown, duplicate, empty, reordered, or
+whitespace-padded tokens fail. V1 support is not required. The same narrow
+admission does not apply to another SKU or region. It never changes region,
+image, SKU, or host in response to failure.
 Operators can inspect the same immutable retail-image/SKU inputs without
 changing account defaults:
 
