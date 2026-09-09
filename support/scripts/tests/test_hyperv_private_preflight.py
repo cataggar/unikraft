@@ -24,6 +24,10 @@ blob_worker = importlib.import_module("hyperv_private_preflight_blob")
 TEST_TEMP = SUPPORT.parent / ".d" / "private-preflight-test-tmp"
 TEST_TEMP.mkdir(mode=0o700, parents=True, exist_ok=True)
 tempfile.tempdir = str(TEST_TEMP)
+GUARDED_PRODUCER_RECORDS = (
+    Path(__file__).with_name("fixtures")
+    / "hyperv-guarded-v2-pristine-unavailable.records"
+)
 
 
 def modeled_host_disk_output_order(template):
@@ -164,10 +168,10 @@ def capability_reference(capability, approved=True):
     }
 
 
-def private_build_receipt(provenance, efi):
+def private_build_receipt(provenance, efi, guarded=None):
     receipt = {
         "schema": preflight.PRIVATE_BUILD_SCHEMA,
-        "schema_version": 1,
+        "schema_version": 2,
         "result": "PASS",
         "source_before": provenance,
         "source_after": provenance,
@@ -196,6 +200,9 @@ def private_build_receipt(provenance, efi):
         "builder_sha256": preflight.azure.image_sha256(
             Path(preflight.__file__)
         ),
+        "guarded": (
+            json.loads(json.dumps(guarded)) if guarded is not None else None
+        ),
     }
     return {
         "name": preflight.PRIVATE_BUILD_RECEIPT,
@@ -206,6 +213,47 @@ def private_build_receipt(provenance, efi):
 
 
 class PrivatePreflightFixture(unittest.TestCase):
+    @staticmethod
+    def guarded_config():
+        return (
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y\n"
+            "CONFIG_LIBSTORVSC=y\n"
+            "CONFIG_LIBSTORVSC_LUN_DISCOVERY=y\n"
+            "CONFIG_LIBSTORVSC_GUARDED_IO=y\n"
+            "CONFIG_LIBSTORVSC_MAX_DEVICES=2\n"
+            "CONFIG_LIBSTORVSC_MAX_LUNS=8\n"
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID="
+            '"00112233445566778899aabbccddeeff"\n'
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID="
+            '"102132435465768798a9bacbdcedfe0f"\n'
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=1000\n"
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512\n"
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2\n"
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0\n"
+        ).encode()
+
+    @staticmethod
+    def guarded_contract(config_sha256):
+        return {
+            "schema": preflight.GUARDED_CONTRACT_SCHEMA,
+            "schema_version": 1,
+            "scope": "platform-only",
+            "result": "UNAVAILABLE",
+            "protocol": 1,
+            "identity_policy": 2,
+            "reason": "no-devices",
+            "main_return": 2,
+            "run_id": "00112233445566778899aabbccddeeff",
+            "disk_id": "102132435465768798a9bacbdcedfe0f",
+            "path": 0,
+            "target": 0,
+            "lun": 0,
+            "sectors": 1000,
+            "sector_size": 512,
+            "solved_config_sha256": config_sha256,
+            "producer": preflight.guarded_producer_contract(),
+        }
+
     def implementation(self):
         return {
             "sdk": {
@@ -236,6 +284,7 @@ class PrivatePreflightFixture(unittest.TestCase):
         }
 
     def manifest(self, **changes):
+        boot_policy = changes.pop("boot_policy", "platform-unavailable-v1")
         raw_size = preflight.azure.VIRTUAL_SIZE
         sizes = {
             "qemu": 26_911_032,
@@ -275,11 +324,16 @@ class PrivatePreflightFixture(unittest.TestCase):
                 "size": 4096,
             },
         }
+        guarded = (
+            self.guarded_contract(provenance["config"]["sha256"])
+            if boot_policy == preflight.GUARDED_BOOT_POLICY else None
+        )
         value = {
             "schema": preflight.INPUT_SCHEMA,
             "schema_version": preflight.INPUT_SCHEMA_VERSION,
             "workload": preflight.WORKLOAD,
-            "boot_policy": "platform-unavailable-v1",
+            "boot_policy": boot_policy,
+            "guarded": guarded,
             "raw_size": raw_size,
             "provenance": provenance,
             "files": files,
@@ -298,7 +352,7 @@ class PrivatePreflightFixture(unittest.TestCase):
                 files["capability_raw"]
             ),
             "private_build": private_build_receipt(
-                provenance, files["efi"]
+                provenance, files["efi"], guarded
             ),
             "implementation": self.implementation(),
             "budget": preflight.expected_budget(files, qemu_support),
@@ -306,8 +360,10 @@ class PrivatePreflightFixture(unittest.TestCase):
         value.update(changes)
         return value
 
-    def state(self):
-        manifest = preflight.validate_input_manifest(self.manifest())
+    def state(self, **manifest_changes):
+        manifest = preflight.validate_input_manifest(
+            self.manifest(**manifest_changes)
+        )
         manifest_sha = hashlib.sha256(
             preflight.azure.canonical_json(manifest)
         ).hexdigest()
@@ -483,6 +539,71 @@ class PrivatePreflightFixture(unittest.TestCase):
 
 
 class PrivatePreflightManifestTest(PrivatePreflightFixture):
+    def test_guarded_contract_is_derived_from_exact_solved_v2_config(self):
+        preflight.verify_guarded_producer_sources(SUPPORT.parent)
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "solved.config"
+            config.write_bytes(self.guarded_config())
+            contract = preflight.guarded_contract_from_solved_config(config)
+        self.assertEqual(
+            contract,
+            self.guarded_contract(
+                hashlib.sha256(self.guarded_config()).hexdigest()
+            ),
+        )
+        manifest = preflight.validate_input_manifest(
+            self.manifest(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        )
+        self.assertEqual(manifest["guarded"]["result"], "UNAVAILABLE")
+        self.assertEqual(manifest["guarded"]["scope"], "platform-only")
+        self.assertEqual(
+            manifest["private_build"]["receipt"]["guarded"],
+            manifest["guarded"],
+        )
+
+    def test_guarded_contract_rejects_v1_or_mismatched_configuration(self):
+        variants = []
+        for old, new in (
+            (
+                b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2",
+                b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=1",
+            ),
+            (
+                b"CONFIG_LIBSTORVSC_GUARDED_IO=y",
+                b"CONFIG_LIBSTORVSC_GUARDED_IO=n",
+            ),
+            (
+                b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0",
+                b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=256",
+            ),
+        ):
+            variants.append(self.guarded_config().replace(old, new))
+        variants.append(
+            self.guarded_config()
+            + b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH=0\n"
+        )
+        for index, raw in enumerate(variants):
+            with self.subTest(index=index), \
+                    tempfile.TemporaryDirectory() as temporary:
+                config = Path(temporary) / "solved.config"
+                config.write_bytes(raw)
+                with self.assertRaises(ValueError):
+                    preflight.guarded_contract_from_solved_config(config)
+        value = self.manifest(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        value["guarded"]["lun"] = 1
+        with self.assertRaises(ValueError):
+            preflight.validate_input_manifest(value)
+        value = self.manifest(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        value["private_build"]["receipt"]["guarded"]["sectors"] = 2000
+        with self.assertRaises(ValueError):
+            preflight.validate_input_manifest(value)
+        value = self.manifest()
+        value["guarded"] = self.guarded_contract(
+            value["provenance"]["config"]["sha256"]
+        )
+        with self.assertRaises(ValueError):
+            preflight.validate_input_manifest(value)
+
     def test_manifest_binds_real_budget_and_keeps_efi_local(self):
         manifest = preflight.validate_input_manifest(self.manifest())
         budget = manifest["budget"]
@@ -606,7 +727,9 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             preflight.azure.canonical_json(capability)
         ).hexdigest()
         private = preflight.host_phase_manifest(state, "private", digest)
-        self.assertEqual(capability["schema_version"], 2)
+        self.assertEqual(capability["schema_version"], 3)
+        self.assertIsNone(capability["guarded"])
+        self.assertIsNone(private["guarded"])
         self.assertEqual(private["capability_manifest_sha256"], digest)
         self.assertNotIn("efi", private["files"])
         self.assertEqual(
@@ -620,6 +743,26 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             item[0].endswith("/qemu/share/qemu/firmware.json")
             for item in staged
         ))
+
+    def test_private_host_manifest_binds_guarded_contract_after_capability(self):
+        state = self.state(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        capability = preflight.host_phase_manifest(state, "capability")
+        digest = hashlib.sha256(
+            preflight.azure.canonical_json(capability)
+        ).hexdigest()
+        private = preflight.host_phase_manifest(state, "private", digest)
+        self.assertEqual(
+            capability["boot_policy"], "platform-unavailable-v1"
+        )
+        self.assertIsNone(capability["guarded"])
+        self.assertEqual(
+            private["boot_policy"], preflight.GUARDED_BOOT_POLICY
+        )
+        self.assertEqual(private["guarded"], state["input_manifest"]["guarded"])
+        parsed, _ = runner.parse_manifest(
+            base64_encode(private), "private"
+        )
+        self.assertEqual(parsed["guarded"], private["guarded"])
 
     def test_transfer_source_and_deadline_are_explicit(self):
         self.assertEqual(preflight.transfer_source("8.8.8.8"), "8.8.8.8/32")
@@ -832,6 +975,51 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 },
             )
 
+    def test_generate_input_rejects_config_policy_mismatch_before_packaging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ordinary = root / "ordinary.config"
+            ordinary.write_text("CONFIG_PLAT_HYPERV=y\n")
+            guarded = root / "guarded.config"
+            guarded.write_bytes(self.guarded_config())
+            provenance = self.manifest()["provenance"]
+            arguments = [
+                root / "output", root, ordinary, root / "qemu",
+                root / "code", root / "vars", root / "capability",
+                root / "capability-receipt", root / "efi",
+                root / "build-receipt", root / "raw", root / "vhd",
+                root / "miz",
+            ]
+            with mock.patch.object(
+                preflight, "check_blob_dependency"
+            ), mock.patch.object(
+                preflight, "build_provenance",
+                return_value=provenance,
+            ), mock.patch.object(
+                preflight, "qemu_closure_records"
+            ) as packaging:
+                with self.assertRaises(ValueError):
+                    preflight.generate_input(
+                        *arguments, preflight.GUARDED_BOOT_POLICY
+                    )
+                packaging.assert_not_called()
+            arguments[2] = guarded
+            with mock.patch.object(
+                preflight, "check_blob_dependency"
+            ), mock.patch.object(
+                preflight, "build_provenance",
+                return_value=provenance,
+            ), mock.patch.object(
+                preflight, "verify_guarded_producer_sources"
+            ), mock.patch.object(
+                preflight, "qemu_closure_records"
+            ) as packaging:
+                with self.assertRaises(ValueError):
+                    preflight.generate_input(
+                        *arguments, "platform-unavailable-v1"
+                    )
+                packaging.assert_not_called()
+
     def test_local_build_action_emits_causal_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -938,6 +1126,28 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
         )
         return "\n".join(lines)
 
+    @staticmethod
+    def guarded_boot_log(records=None, main_return=2, legacy=False, extra=()):
+        records = (
+            GUARDED_PRODUCER_RECORDS.read_text().splitlines()
+            if records is None else list(records)
+        )
+        lines = [
+            "Hyper-V Hv#1 hypercall page enabled",
+            "Hyper-V SynIC:",
+            "Powered by",
+            "Calling main(",
+            *records,
+        ]
+        if legacy:
+            lines.append(runner.LEGACY_APIC_MARKER)
+        lines.extend(extra)
+        lines.append(
+            "[    0.100000] Info: [libukboot] "
+            f"<boot.c @  523> main returned {main_return}"
+        )
+        return "\n".join(lines)
+
     def fake_qemu(self, root, action="pass"):
         qemu = root / "qemu" / "bin" / "qemu-system-x86_64"
         qemu.parent.mkdir(parents=True)
@@ -1015,6 +1225,54 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
                 "platform-unavailable-v1", "raw-x2apic", False, root,
             )
 
+    def run_fake_guarded_boot(self, extra=None):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            qemu = root / "qemu" / "bin" / "qemu-system-x86_64"
+            qemu.parent.mkdir(parents=True)
+            lines = [
+                "Hyper-V Hv#1 hypercall page enabled",
+                "Hyper-V SynIC:",
+                "Powered by",
+                "Calling main(",
+                *GUARDED_PRODUCER_RECORDS.read_text().splitlines(),
+            ]
+            if extra is not None:
+                lines.append(extra)
+            lines.append(
+                "[ 0.1] Info: [libukboot] <boot.c @ 523> main returned 2"
+            )
+            qemu.write_text(
+                "#!/bin/sh\n"
+                + "\n".join("printf '%s\\n' " + repr(line) for line in lines)
+                + "\n"
+            )
+            qemu.chmod(0o700)
+            code = root / "code"
+            variables = root / "vars"
+            image = root / "image"
+            code.write_bytes(b"code")
+            variables.write_bytes(b"vars")
+            image.write_bytes(b"image")
+
+            def record(path, name):
+                return {
+                    "blob": "unused",
+                    "name": name,
+                    "size": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+
+            return runner.run_boot(
+                qemu, code, record(code, "OVMF_CODE.fd"),
+                variables, record(variables, "OVMF_VARS.fd"),
+                image, record(image, "image"), image.stat().st_size,
+                preflight.GUARDED_BOOT_POLICY, "raw-x2apic", False, root,
+                self.guarded_contract(
+                    hashlib.sha256(self.guarded_config()).hexdigest()
+                ),
+            )
+
     def test_boot_reuses_readonly_code_and_copies_only_variables(self):
         original = runner.shutil.copyfile
         copies = []
@@ -1051,9 +1309,144 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
                         text, "platform-unavailable-v1", False
                     )
 
+    def test_guarded_v2_accepts_only_authentic_pristine_unavailable_records(self):
+        contract = self.guarded_contract(
+            hashlib.sha256(self.guarded_config()).hexdigest()
+        )
+        runner.validate_boot_log(
+            self.guarded_boot_log(), preflight.GUARDED_BOOT_POLICY,
+            False, contract,
+        )
+        runner.validate_boot_log(
+            self.guarded_boot_log(legacy=True),
+            preflight.GUARDED_BOOT_POLICY, True, contract,
+        )
+        self.assertEqual(
+            GUARDED_PRODUCER_RECORDS.read_text().splitlines(),
+            [
+                (
+                    "HYPERV_PERSISTENCE START PASS "
+                    "run=00112233445566778899aabbccddeeff "
+                    "address=0:0:0 sectors=1000 sector_size=512"
+                ),
+                (
+                    "HYPERV_PERSISTENCE SELECT UNAVAILABLE "
+                    "reason=no-devices writes=0 flushes=0"
+                ),
+                runner.PLATFORM_MARKER,
+                "UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices",
+            ],
+        )
+
+    def test_guarded_v2_rejects_wrong_or_additional_persistence_activity(self):
+        contract = self.guarded_contract(
+            hashlib.sha256(self.guarded_config()).hexdigest()
+        )
+        authentic = GUARDED_PRODUCER_RECORDS.read_text().splitlines()
+        variants = {
+            "missing": authentic[:-1],
+            "duplicate": authentic + [authentic[-1]],
+            "reordered": [authentic[0], authentic[2], authentic[1], authentic[3]],
+            "wrong-run": [
+                authentic[0].replace(contract["run_id"], "f" * 32),
+                *authentic[1:],
+            ],
+            "wrong-lun": [
+                authentic[0].replace("address=0:0:0", "address=0:0:1"),
+                *authentic[1:],
+            ],
+            "wrong-geometry": [
+                authentic[0].replace("sectors=1000", "sectors=999"),
+                *authentic[1:],
+            ],
+            "wrong-protocol": [
+                *authentic[:-1],
+                "UK_HYPERV_PERSISTENCE_UNAVAILABLE:2:2:no-devices",
+            ],
+            "wrong-policy": [
+                *authentic[:-1],
+                "UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:1:no-devices",
+            ],
+            "wrong-reason": [
+                authentic[0],
+                authentic[1].replace("no-devices", "discovery-failed"),
+                authentic[2],
+                authentic[3].replace("no-devices", "discovery-failed"),
+            ],
+            "old-fail": [
+                authentic[0],
+                "HYPERV_PERSISTENCE SELECT FAIL rc=-2 writes=0",
+            ],
+            "final-pass": authentic + [
+                "HYPERV_PERSISTENCE FINAL PASS rc=0"
+            ],
+            "final-fail": authentic + [
+                "HYPERV_PERSISTENCE FINAL FAIL rc=-2"
+            ],
+            "identity": authentic + [
+                "UK_HYPERV_PERSISTENCE_IDENTITY:1:2:synthetic"
+            ],
+            "boot1": authentic + [
+                "UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:synthetic"
+            ],
+            "boot2": authentic + [
+                "UK_HYPERV_PERSISTENCE_BOOT2_COMPLETE:synthetic"
+            ],
+            "write": authentic + [
+                "HYPERV_PERSISTENCE BOOT1_WRITE PASS run="
+                + contract["run_id"]
+            ],
+            "read": authentic + [
+                "HYPERV_PERSISTENCE BOOT2_READ PASS run="
+                + contract["run_id"]
+            ],
+            "flush": authentic + [
+                "HYPERV_PERSISTENCE FLUSH PASS writes=0 flushes=1"
+            ],
+            "wrong-seed": authentic + [
+                "HYPERV_PERSISTENCE CANDIDATE_REJECT PASS "
+                "reason=boot-signature id=0"
+            ],
+            "receipt": authentic + [
+                "UK_HYPERV_PERSISTENCE_RECEIPT:synthetic"
+            ],
+            "ordinary-acceptance": authentic + [
+                runner.UNAVAILABLE_RECORDS[0]
+            ],
+            "live-io": authentic + ["UK_HYPERV_IO_READY"],
+            "prefixed-diagnostic": authentic + [
+                "diagnostic HYPERV_PERSISTENCE FINAL PASS rc=0"
+            ],
+        }
+        for description, records in variants.items():
+            with self.subTest(description=description):
+                with self.assertRaises(runner.RunnerError):
+                    runner.validate_boot_log(
+                        self.guarded_boot_log(records),
+                        preflight.GUARDED_BOOT_POLICY, False, contract,
+                    )
+        with self.assertRaises(runner.RunnerError):
+            runner.validate_boot_log(
+                self.guarded_boot_log(main_return=1),
+                preflight.GUARDED_BOOT_POLICY, False, contract,
+            )
+        with self.assertRaises(runner.RunnerError):
+            runner.validate_boot_log(
+                self.guarded_boot_log(),
+                preflight.GUARDED_BOOT_POLICY, False, None,
+            )
+
     def test_actual_qemu_process_uses_readonly_footer_mask_and_passes(self):
         result, _ = self.run_fake_boot("pass")
         self.assertEqual(result["result"], "PASS")
+
+    def test_actual_runner_path_enforces_guarded_platform_only_outcome(self):
+        result, _ = self.run_fake_guarded_boot()
+        self.assertEqual(result["result"], "PASS")
+        with self.assertRaises(runner.RunnerError):
+            self.run_fake_guarded_boot(
+                "HYPERV_PERSISTENCE FINAL PASS rc=0"
+            )
 
     def test_actual_qemu_mutation_cannot_forge_pass(self):
         with self.assertRaisesRegex(runner.RunnerError, "mutated"):
@@ -1121,6 +1514,28 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
         changed["qemu_support"][0]["blob"] += "/foreign"
         with self.assertRaisesRegex(runner.RunnerError, "qemu-support"):
             runner.parse_manifest(base64_encode(changed), "capability")
+        state = self.state(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        capability = preflight.host_phase_manifest(state, "capability")
+        private = preflight.host_phase_manifest(
+            state, "private",
+            hashlib.sha256(
+                preflight.azure.canonical_json(capability)
+            ).hexdigest(),
+        )
+        for mutate in (
+            lambda value: value["guarded"].__setitem__("protocol", 2),
+            lambda value: value["guarded"].__setitem__("scope", "storage"),
+            lambda value: value["guarded"]["producer"]["files"].__setitem__(
+                "support/apps/hyperv-acceptance/persistence.c", "f" * 64
+            ),
+            lambda value: value.__setitem__(
+                "boot_policy", "platform-unavailable-v1"
+            ),
+        ):
+            changed = json.loads(json.dumps(private))
+            mutate(changed)
+            with self.assertRaises(runner.RunnerError):
+                runner.parse_manifest(base64_encode(changed), "private")
 
 
 class PrivatePreflightBlobTest(PrivatePreflightFixture):
@@ -2280,6 +2695,7 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
                     "host_boot_id": (
                         "66666666-6666-4666-8666-666666666666"
                     ),
+                    "storage_result": "NOT_EVALUATED",
                     "boots": {
                         "capability" if phase == "capability" else "raw": {},
                     },

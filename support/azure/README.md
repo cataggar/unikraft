@@ -145,9 +145,40 @@ TMPDIR="$RUNTIME/tmp" PIP_CACHE_DIR="$RUNTIME/pip-cache" \
   'import sys; sys.path.insert(0, "support/scripts"); import hyperv_private_preflight as p; assert len(p.sdk_dependency_contract()["distributions"]) == 12'
 ```
 
-First solve the default Hyper-V configuration using the documented
-`olddefconfig` command. Then let the controller invoke the fixed native builder
-itself, snapshot source/configuration before and after the build, fingerprint
+First solve the selected Hyper-V configuration using the documented
+`olddefconfig` command. For the guarded V2 policy, create one policy-2 manifest
+and retain its raw seed and JSON receipt for the later, separately authorized
+real-data-disk workload. The seed is not uploaded to this platform preflight:
+
+```shell
+PERSISTENCE="$PWD/.d/private-preflight-persistence"
+mkdir -p "$PERSISTENCE" "$PWD/.d/acceptance-tmp" \
+  "$PWD/.d/acceptance-cache"
+"$RUNTIME/venv/bin/python" support/scripts/hyperv-storage-manifest.py \
+  --output-prefix "$PERSISTENCE/run" \
+  --identity-policy seed-enrollment-v2 --sectors 262144 --lun 1
+cp support/apps/hyperv-acceptance/defconfig \
+  support/apps/hyperv-acceptance/.config
+cat "$PERSISTENCE/run.config" >> \
+  support/apps/hyperv-acceptance/.config
+TMPDIR="$PWD/.d/acceptance-tmp" \
+XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
+ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
+ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
+  "$ZIG" build olddefconfig -j2 \
+  -Dapp="$PWD/support/apps/hyperv-acceptance" \
+  -Dconfig="$PWD/support/apps/hyperv-acceptance/.config"
+SOLVED_CONFIG="$PWD/support/apps/hyperv-acceptance/.config"
+```
+
+The solved configuration must enable persistence, StorVSC, LUN discovery, and
+guarded I/O; use identity policy 2; preserve the exact run ID, disk ID, LUN,
+sector count, and 512-byte sector size; and leave path and target unenrolled.
+V1, network-application, altered geometry, or incomplete guarded configurations
+are rejected before packaging or any cloud action.
+
+Then let the controller invoke the fixed native builder itself, snapshot
+source/configuration before and after the build, fingerprint
 the compiler, LLVM, Make, Python, parser tools and Bison data, and write the
 causal local build receipt:
 
@@ -164,12 +195,28 @@ SOLVED_CONFIG="$LOCAL_BUILD/solved.config"
 ```
 
 Package that exact EFI into raw/fixed-VHD files locally with the pinned `miz`
-workflow above. `generate-input` rejects an EFI whose hash, size, source
+API. Do not use a converted or previously built image:
+
+```shell
+LOCAL_PACKAGE="$PWD/.d/private-preflight-package"
+mkdir -m 700 "$LOCAL_PACKAGE"
+"$MIZ" build-efi-application --efi "$PRIVATE_EFI" \
+  --architecture x86_64 --esp-size 64M -O raw \
+  -o "$LOCAL_PACKAGE/private.raw"
+"$MIZ" build-efi-application --efi "$PRIVATE_EFI" \
+  --architecture x86_64 --esp-size 64M -O vhd \
+  -o "$LOCAL_PACKAGE/private.vhd"
+"$MIZ" check-efi-application --output=json --architecture x86_64 \
+  --expected-efi-sha256 "$(sha256sum "$PRIVATE_EFI" | cut -d' ' -f1)" \
+  --expected-virtual-size 66M "$LOCAL_PACKAGE/private.vhd"
+```
+
+`generate-input` repeats the pinned check and rejects an EFI whose hash, size, source
 snapshot, solved configuration, invocation, or build tools differ from the
 receipt. The QEMU closure is an owner-selected directory whose
 executable is exactly `bin/qemu-system-x86_64`; required regular files below
 `lib/` and `share/` are copied and hashed recursively. Symlinks are rejected.
-Generate the canonical schema-5 manifest and owner-only input directory:
+Generate the canonical schema-6 manifest and owner-only input directory:
 
 ```shell
 INPUTS="$PWD/.d/private-preflight-input"
@@ -187,7 +234,7 @@ PRIVATE_VHD="$LOCAL_PACKAGE/private.vhd"
   --private-efi "$PRIVATE_EFI" \
   --private-build-receipt "$PRIVATE_BUILD_RECEIPT" \
   --private-raw "$PRIVATE_RAW" --private-vhd "$PRIVATE_VHD" \
-  --miz "$MIZ" --boot-policy platform-unavailable-v1
+  --miz "$MIZ" --boot-policy guarded-v2-pristine-unavailable
 PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
 "$RUNTIME/venv/bin/python" support/scripts/hyperv_private_preflight.py \
   prepare --input-dir "$INPUTS" \
@@ -213,6 +260,14 @@ operator-provided replacement receipt is rejected. Updating that historical
 capability requires an explicit reviewed source change. Any tracked source,
 configuration, helper, requirement, SDK file, or prepared-input change fails
 before the first cloud command.
+
+The guarded input and causal build receipts additionally bind the exact
+reviewed producer files, protocol 1, identity policy 2, `no-devices`, guest
+return 2, and the private solved run/LUN/geometry. Updating a pinned producer
+file requires an explicit reviewed source change. The exact same causal
+`private.efi`, raw disk, and fixed VHD are used for all four private platform
+boots and must be retained unchanged for the later real-data workload; there
+is no preflight-only guest flag, rebuild, or reseed.
 
 `private.efi`, copied `miz`, source/config metadata, and controller files stay
 local. Only the capability raw, private raw/fixed VHD, QEMU closure, and OVMF
@@ -276,22 +331,43 @@ QEMU/OVMF inputs. It must prove Linux KVM plus the required QEMU Hyper-V
 features in both x2APIC and masked legacy-APIC modes. Only that exact PASS
 allows any private seed or image upload. A durable capability sentinel binds
 the Linux boot identity, and a host restart between phases is rejected. The
-second phase boots the exact
-private raw and fixed-VHD bytes in both modes, masking the fixed-VHD footer as
+second phase boots the exact private raw and fixed-VHD bytes in both modes,
+masking the fixed-VHD footer as
 the local controller does. Logs have strict stage, normal-return, uniqueness,
-size, and deadline checks. A reviewed `UNAVAILABLE storage+network` result is
-valid only for the explicit platform-only policy; arbitrary failures and
-I/O-ready markers are rejected. This is not real device or persistence
-evidence. This controller deliberately defines no private LUN, write-disk, or
-seed-enrollment metadata; a later storage acceptance integration must consume
-the separately reviewed manifest-v2 interface rather than adding those fields
-to this platform-only contract.
+size, and deadline checks. Ordinary `platform-unavailable-v1` and
+`platform-main-zero-v1` behavior is unchanged.
 
-The current guarded persistence producer is deliberately unsupported: its
-missing-seed/endpoint/geometry outcomes are strict failures, not an acceptable
-platform result. This preflight never treats `SELECT FAIL`, `rc=-2`, `rc=-11`,
-writes-zero, or main-return 1 as PASS. A separately reviewed no-device producer
-and policy are required before a persistence image can enter this workflow.
+`guarded-v2-pristine-unavailable` is a separate, versioned platform-only
+consumer. After the standard Hyper-V capability records it requires exactly
+one ordered producer sequence matching the private solved configuration:
+
+```text
+HYPERV_PERSISTENCE START PASS run=<bound-run> address=0:0:<bound-lun> sectors=<bound-sectors> sector_size=512
+HYPERV_PERSISTENCE SELECT UNAVAILABLE reason=no-devices writes=0 flushes=0
+UK_HYPERV_PLATFORM_READY
+UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices
+... main returned 2
+```
+
+Only a genuinely pristine, coherent, empty inventory with no recognized
+storage-lifetime activity can produce that sequence. Missing, duplicate,
+reordered, malformed, policy-1, wrong-configuration, `SELECT FAIL`,
+`FINAL PASS`, identity, Boot1/Boot2, write/read/flush, completion, ordinary
+acceptance, or live-I/O evidence is rejected even when valid unavailable
+markers are also present. The START record and full serial logs contain private
+configuration and remain only in protected host state and owner-only receipts.
+The committed positive records fixture was captured from the actual hosted V2
+empty-inventory producer linked with the real driver, using public synthetic
+IDs; it is producer evidence, not an x86 nested-KVM capture.
+
+Host and final receipts state `acceptance_scope=platform-only` and
+`storage_result=UNAVAILABLE`. A successful runner result proves only that the
+same image reached the reviewed pristine-no-device outcome in the two APIC
+modes and two packaging formats. It does not prove StorVSC discovery, a live
+LUN, writes, flushes, reboot persistence, or any storage PASS. V1 guarded
+images remain unsupported. This controller adds no data disk or seed payload
+to the host; real two-boot storage acceptance remains a separately authorized
+workload using the retained V2 seed and exact unchanged image.
 
 Private manifests, SAS values, host identity, serial logs, and receipts remain
 in owner-only local state and authenticated Blob/control-plane parameters.

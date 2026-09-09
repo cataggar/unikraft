@@ -61,6 +61,37 @@ UNAVAILABLE_RECORDS = (
         "storage=UNAVAILABLE network=UNAVAILABLE"
     ),
 )
+GUARDED_BOOT_POLICY = "guarded-v2-pristine-unavailable"
+GUARDED_CONTRACT_SCHEMA = (
+    "unikraft.hyperv.guarded-v2-pristine-unavailable"
+)
+GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
+GUARDED_PRODUCER_FILES = {
+    "drivers/hyperv/storvsc/include/uk/storvsc.h": (
+        "e0e666ff4faefc2ba1186403a4320170fb3163375cc31a04312bbce011aa9f10"
+    ),
+    "drivers/hyperv/storvsc/storvsc.c": (
+        "cb9e5afefb8f18612c36b5975b94ed64c0702c4a4e6988ea4edfa9c6bc6da213"
+    ),
+    "drivers/hyperv/vmbus/include/uk/vmbus.h": (
+        "e11c351dcb6bf4596285193bf728f1f30a2152da25e075539e4143edafc6d763"
+    ),
+    "drivers/hyperv/vmbus/vmbus_bus.c": (
+        "70f4157ce22475e88b037b9f599e4910719a3cfdde0e70cbf32f0f9004b0b185"
+    ),
+    "support/apps/hyperv-acceptance/Config.uk": (
+        "548e97aadb9b55101e2ec1dbb7a4b22f82b210a22d5f14eb441b17fdd2009aa7"
+    ),
+    "support/apps/hyperv-acceptance/acceptance_protocol.h": (
+        "0298f62c5db8cfec137d39d6a33f9726ca291c7f55150780588a17795cd2b0da"
+    ),
+    "support/apps/hyperv-acceptance/main.c": (
+        "35cdcb441b8acc2520d56aefab0f4538eda74164e26c005d12d7ffd4f5e2691c"
+    ),
+    "support/apps/hyperv-acceptance/persistence.c": (
+        "fff49e4a09ecb6a5e788b817a5f2677d39cadd1f5a7693a2cb2be6721399d9ee"
+    ),
+}
 LIVE_IO_MARKERS = (
     "UK_HYPERV_BLOCK_READ_OK",
     "UK_HYPERV_NET_DHCP_OFFER",
@@ -130,6 +161,72 @@ def require_identity(value):
     return value
 
 
+def validate_guarded_contract(value, boot_policy):
+    if boot_policy != GUARDED_BOOT_POLICY:
+        if value is not None:
+            raise RunnerError("unexpected-guarded-contract")
+        return None
+    value = exact_fields(
+        value,
+        (
+            "schema", "schema_version", "scope", "result", "protocol",
+            "identity_policy", "reason", "main_return", "run_id",
+            "disk_id", "path", "target", "lun", "sectors",
+            "sector_size", "solved_config_sha256", "producer",
+        ),
+        "invalid-guarded-contract",
+    )
+    producer = exact_fields(
+        value["producer"], ("schema", "schema_version", "files"),
+        "invalid-guarded-producer",
+    )
+    files = exact_fields(
+        producer["files"], GUARDED_PRODUCER_FILES,
+        "invalid-guarded-producer-files",
+    )
+    if (
+        value["schema"] != GUARDED_CONTRACT_SCHEMA
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["scope"] != "platform-only"
+        or value["result"] != "UNAVAILABLE"
+        or type(value["protocol"]) is not int
+        or value["protocol"] != 1
+        or type(value["identity_policy"]) is not int
+        or value["identity_policy"] != 2
+        or value["reason"] != "no-devices"
+        or type(value["main_return"]) is not int
+        or value["main_return"] != 2
+        or require_identity(value["run_id"]) != value["run_id"]
+        or require_identity(value["disk_id"]) != value["disk_id"]
+        or type(value["path"]) is not int
+        or value["path"] != 0
+        or type(value["target"]) is not int
+        or value["target"] != 0
+        or type(value["lun"]) is not int
+        or not 0 <= value["lun"] <= 255
+        or type(value["sectors"]) is not int
+        or value["sectors"] <= 48
+        or value["sectors"] > ((1 << 63) - 1) // 512
+        or type(value["sector_size"]) is not int
+        or value["sector_size"] != 512
+        or require_sha256(value["solved_config_sha256"])
+        != value["solved_config_sha256"]
+        or producer["schema"] != GUARDED_PRODUCER_SCHEMA
+        or type(producer["schema_version"]) is not int
+        or producer["schema_version"] != 1
+        or dict(files) != GUARDED_PRODUCER_FILES
+    ):
+        raise RunnerError("invalid-guarded-contract")
+    return {
+        **value,
+        "producer": {
+            **producer,
+            "files": dict(files),
+        },
+    }
+
+
 def host_boot_id():
     try:
         value = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -170,7 +267,7 @@ def parse_manifest(encoded, expected_phase):
             "schema", "schema_version", "phase", "identity",
             "boot_policy", "raw_size", "files", "evidence_prefix",
             "runner_sha256", "qemu_support", "input_manifest_sha256",
-            "workload",
+            "workload", "guarded",
         ) + (
             ("capability_manifest_sha256",)
             if expected_phase == "private" else ()
@@ -183,11 +280,12 @@ def parse_manifest(encoded, expected_phase):
     if (
         manifest["schema"] != SCHEMA
         or type(manifest["schema_version"]) is not int
-        or manifest["schema_version"] != 2
+        or manifest["schema_version"] != 3
         or manifest["phase"] != expected_phase
         or manifest["workload"] != "platform-only-v1"
         or manifest["boot_policy"] not in (
             "platform-unavailable-v1", "platform-main-zero-v1",
+            GUARDED_BOOT_POLICY,
         )
         or type(manifest["raw_size"]) is not int
         or not 1024 * 1024 <= manifest["raw_size"] <= MAX_FILE_BYTES
@@ -197,6 +295,9 @@ def parse_manifest(encoded, expected_phase):
         != manifest["input_manifest_sha256"]
     ):
         raise RunnerError("invalid-manifest-contract")
+    manifest["guarded"] = validate_guarded_contract(
+        manifest["guarded"], manifest["boot_policy"]
+    )
     identity = require_identity(manifest["identity"])
     prefix = manifest["evidence_prefix"]
     if (
@@ -252,6 +353,8 @@ def parse_manifest(encoded, expected_phase):
         if manifest["files"]["capability_raw"]["size"] != manifest["raw_size"]:
             raise RunnerError("invalid-capability-size")
         if manifest["boot_policy"] != "platform-unavailable-v1":
+            raise RunnerError("invalid-capability-policy")
+        if manifest["guarded"] is not None:
             raise RunnerError("invalid-capability-policy")
     else:
         if (
@@ -421,8 +524,9 @@ def normalized_lines(text):
     ]
 
 
-def validate_boot_log(text, policy, legacy_apic):
+def validate_boot_log(text, policy, legacy_apic, guarded=None):
     lines = normalized_lines(text)
+    guarded = validate_guarded_contract(guarded, policy)
     for marker in (
         "Hyper-V Hv#1 hypercall page enabled",
         "Hyper-V SynIC:", "Powered by", "Calling main(",
@@ -443,10 +547,70 @@ def validate_boot_log(text, policy, legacy_apic):
     ]
     if len(main) != 1 or main[0] is None:
         raise RunnerError("invalid-main-return")
-    expected_return = 2 if policy == "platform-unavailable-v1" else 0
+    expected_return = (
+        2 if policy in ("platform-unavailable-v1", GUARDED_BOOT_POLICY)
+        else 0
+    )
     if int(main[0].group(1)) != expected_return:
         raise RunnerError("unexpected-main-return")
-    if policy == "platform-unavailable-v1":
+    if policy == GUARDED_BOOT_POLICY:
+        start = (
+            "HYPERV_PERSISTENCE START PASS "
+            f"run={guarded['run_id']} "
+            f"address={guarded['path']}:{guarded['target']}:{guarded['lun']} "
+            f"sectors={guarded['sectors']} "
+            f"sector_size={guarded['sector_size']}"
+        )
+        select = (
+            "HYPERV_PERSISTENCE SELECT UNAVAILABLE "
+            f"reason={guarded['reason']} writes=0 flushes=0"
+        )
+        unavailable = (
+            "UK_HYPERV_PERSISTENCE_UNAVAILABLE:"
+            f"{guarded['protocol']}:{guarded['identity_policy']}:"
+            f"{guarded['reason']}"
+        )
+        persistence = [
+            line for line in lines
+            if (
+                "HYPERV_PERSISTENCE" in line
+                or "UK_HYPERV_PERSISTENCE" in line
+            )
+        ]
+        if persistence != [start, select, unavailable]:
+            raise RunnerError("invalid-guarded-unavailable-policy")
+        positions = []
+        for marker in (
+            "Hyper-V Hv#1 hypercall page enabled",
+            "Hyper-V SynIC:", "Powered by", "Calling main(",
+        ):
+            positions.append(next(
+                index for index, line in enumerate(lines) if marker in line
+            ))
+        positions.extend((
+            lines.index(start),
+            lines.index(select),
+            lines.index(PLATFORM_MARKER),
+            lines.index(unavailable),
+            next(
+                index for index, line in enumerate(lines)
+                if "main returned" in line
+            ),
+        ))
+        if positions != sorted(positions) or len(set(positions)) != len(positions):
+            raise RunnerError("reordered-guarded-unavailable-policy")
+        if (
+            any("FAIL" in line for line in lines)
+            or any(
+                line.startswith((
+                    "HYPERV_ACCEPTANCE ", "UK_HYPERV_ACCEPTANCE_",
+                    "HYPERV_STORAGE ", "HYPERV_NETWORK_APP ",
+                ))
+                for line in lines
+            )
+        ):
+            raise RunnerError("unexpected-guarded-activity")
+    elif policy == "platform-unavailable-v1":
         acceptance = [
             line for line in lines
             if line.startswith("HYPERV_ACCEPTANCE ")
@@ -482,14 +646,17 @@ def validate_boot_log(text, policy, legacy_apic):
             )
             for line in lines
         )
-        or any(
-            " PASS" in line
-            and line.startswith((
-                "HYPERV_ACCEPTANCE", "HYPERV_NETWORK_APP",
-                "HYPERV_STORAGE",
-            ))
-            and line != UNAVAILABLE_RECORDS[0]
-            for line in lines
+        or (
+            policy != GUARDED_BOOT_POLICY
+            and any(
+                " PASS" in line
+                and line.startswith((
+                    "HYPERV_ACCEPTANCE", "HYPERV_NETWORK_APP",
+                    "HYPERV_STORAGE",
+                ))
+                and line != UNAVAILABLE_RECORDS[0]
+                for line in lines
+            )
         )
     ):
         raise RunnerError("unexpected-live-io")
@@ -497,7 +664,7 @@ def validate_boot_log(text, policy, legacy_apic):
 
 def run_boot(qemu, ovmf_code, ovmf_code_record, ovmf_vars, ovmf_vars_record,
              image, image_record, raw_size, policy, mode, legacy_apic,
-             output_directory):
+             output_directory, guarded=None):
     work = Path(tempfile.mkdtemp(prefix="boot-", dir=output_directory))
     image_identity = immutable_identity(
         image, image_record, "boot-image-invalid"
@@ -573,7 +740,7 @@ def run_boot(qemu, ovmf_code, ovmf_code_record, ovmf_vars, ovmf_vars_record,
         if result.returncode:
             raise RunnerError("qemu-failed")
         text = log_path.read_text(errors="replace")
-        validate_boot_log(text, policy, legacy_apic)
+        validate_boot_log(text, policy, legacy_apic, guarded)
         return {
             "result": "PASS",
             "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
@@ -702,12 +869,13 @@ def execute_phase(phase, manifest, manifest_bytes, base_url, container, sas,
                         else "capability_raw"],
                 raw_size, manifest["boot_policy"],
                 f"{image_name}-{mode}", legacy_apic, evidence_root,
+                manifest["guarded"],
             )
             boots[image_name][mode] = outcome
             logs.append(log_path)
     receipt = {
         "schema": EVIDENCE_SCHEMA,
-        "schema_version": 1,
+        "schema_version": 2,
         "phase": phase,
         "identity": identity,
         "result": "PASS",
@@ -715,6 +883,12 @@ def execute_phase(phase, manifest, manifest_bytes, base_url, container, sas,
         "runner_sha256": manifest["runner_sha256"],
         "host_boot_id": boot_id,
         "boot_policy": manifest["boot_policy"],
+        "acceptance_scope": "platform-only",
+        "storage_result": (
+            "UNAVAILABLE"
+            if manifest["boot_policy"] == GUARDED_BOOT_POLICY
+            else "NOT_EVALUATED"
+        ),
         "boots": boots,
     }
     receipt_path = evidence_root / "receipt.json"

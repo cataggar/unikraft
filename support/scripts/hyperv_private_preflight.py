@@ -45,9 +45,9 @@ NETWORK_CONTROLLER_PATH = Path(__file__).with_name(
 INPUT_SCHEMA = "unikraft.hyperv.private-preflight-input"
 STATE_SCHEMA = "unikraft.hyperv.private-preflight-state"
 RECEIPT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
-INPUT_SCHEMA_VERSION = 5
+INPUT_SCHEMA_VERSION = 6
 STATE_SCHEMA_VERSION = 2
-RECEIPT_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 3
 HOST_PHASE_SCHEMA = host_runner.SCHEMA
 HOST_EVIDENCE_SCHEMA = host_runner.EVIDENCE_SCHEMA
 INPUT_MANIFEST = "private-preflight-input.json"
@@ -106,7 +106,42 @@ PRIVATE_ROLES = ("raw", "vhd")
 REMOTE_ROLES = PUBLIC_ROLES + PRIVATE_ROLES
 LOCAL_ROLES = ("efi",)
 ALL_ROLES = REMOTE_ROLES + LOCAL_ROLES
-BOOT_POLICIES = ("platform-unavailable-v1", "platform-main-zero-v1")
+BOOT_POLICIES = (
+    "platform-unavailable-v1",
+    "platform-main-zero-v1",
+    "guarded-v2-pristine-unavailable",
+)
+GUARDED_BOOT_POLICY = "guarded-v2-pristine-unavailable"
+GUARDED_CONTRACT_SCHEMA = (
+    "unikraft.hyperv.guarded-v2-pristine-unavailable"
+)
+GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
+GUARDED_PRODUCER_FILES = {
+    "drivers/hyperv/storvsc/include/uk/storvsc.h": (
+        "e0e666ff4faefc2ba1186403a4320170fb3163375cc31a04312bbce011aa9f10"
+    ),
+    "drivers/hyperv/storvsc/storvsc.c": (
+        "cb9e5afefb8f18612c36b5975b94ed64c0702c4a4e6988ea4edfa9c6bc6da213"
+    ),
+    "drivers/hyperv/vmbus/include/uk/vmbus.h": (
+        "e11c351dcb6bf4596285193bf728f1f30a2152da25e075539e4143edafc6d763"
+    ),
+    "drivers/hyperv/vmbus/vmbus_bus.c": (
+        "70f4157ce22475e88b037b9f599e4910719a3cfdde0e70cbf32f0f9004b0b185"
+    ),
+    "support/apps/hyperv-acceptance/Config.uk": (
+        "548e97aadb9b55101e2ec1dbb7a4b22f82b210a22d5f14eb441b17fdd2009aa7"
+    ),
+    "support/apps/hyperv-acceptance/acceptance_protocol.h": (
+        "0298f62c5db8cfec137d39d6a33f9726ca291c7f55150780588a17795cd2b0da"
+    ),
+    "support/apps/hyperv-acceptance/main.c": (
+        "35cdcb441b8acc2520d56aefab0f4538eda74164e26c005d12d7ffd4f5e2691c"
+    ),
+    "support/apps/hyperv-acceptance/persistence.c": (
+        "fff49e4a09ecb6a5e788b817a5f2677d39cadd1f5a7693a2cb2be6721399d9ee"
+    ),
+}
 APPROVED_CAPABILITY_REFERENCE = {
     "name": CAPABILITY_REFERENCE,
     "sha256": (
@@ -197,6 +232,24 @@ IMPLEMENTATION_PATHS = {
     "network_controller": NETWORK_CONTROLLER_PATH,
     "template": TEMPLATE_PATH,
     "requirements": REQUIREMENTS_PATH,
+    "guarded_config": SUPPORT / "apps" / "hyperv-acceptance" / "Config.uk",
+    "guarded_main": SUPPORT / "apps" / "hyperv-acceptance" / "main.c",
+    "guarded_persistence": (
+        SUPPORT / "apps" / "hyperv-acceptance" / "persistence.c"
+    ),
+    "guarded_protocol": (
+        SUPPORT / "apps" / "hyperv-acceptance" / "acceptance_protocol.h"
+    ),
+    "storvsc": SUPPORT.parent / "drivers" / "hyperv" / "storvsc" / "storvsc.c",
+    "storvsc_api": (
+        SUPPORT.parent / "drivers" / "hyperv" / "storvsc"
+        / "include" / "uk" / "storvsc.h"
+    ),
+    "vmbus": SUPPORT.parent / "drivers" / "hyperv" / "vmbus" / "vmbus_bus.c",
+    "vmbus_api": (
+        SUPPORT.parent / "drivers" / "hyperv" / "vmbus"
+        / "include" / "uk" / "vmbus.h"
+    ),
 }
 
 
@@ -231,6 +284,232 @@ def require_relative(value, description):
     ):
         raise ValueError(f"{description} is invalid")
     return value
+
+
+def guarded_producer_contract():
+    return {
+        "schema": GUARDED_PRODUCER_SCHEMA,
+        "schema_version": 1,
+        "files": dict(GUARDED_PRODUCER_FILES),
+    }
+
+
+def verify_guarded_producer_sources(repository):
+    repository = Path(repository).resolve(strict=True)
+    if repository != SUPPORT.parent.resolve(strict=True):
+        raise ValueError("Guarded producer must use this repository worktree")
+    for relative, expected in GUARDED_PRODUCER_FILES.items():
+        path = repository / relative
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or azure.image_sha256(path) != expected
+        ):
+            raise ValueError(
+                "Guarded producer differs from the reviewed V2 contract"
+            )
+
+
+def guarded_contract_from_solved_config(config_path):
+    raw = azure.read_regular_file(
+        config_path, 1024 * 1024, "Solved guarded V2 configuration"
+    )
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        raise ValueError("Solved guarded V2 configuration is not UTF-8") from None
+    names = (
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE",
+        "CONFIG_LIBSTORVSC",
+        "CONFIG_LIBSTORVSC_LUN_DISCOVERY",
+        "CONFIG_LIBSTORVSC_GUARDED_IO",
+        "CONFIG_LIBSTORVSC_MAX_DEVICES",
+        "CONFIG_LIBSTORVSC_MAX_LUNS",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN",
+        "CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION",
+    )
+    values = {}
+    for line in lines:
+        for name in names:
+            prefix = name + "="
+            if line.startswith(prefix):
+                if name in values:
+                    raise ValueError(
+                        "Solved guarded V2 configuration repeats a field"
+                    )
+                values[name] = line[len(prefix):]
+                break
+    if values.get("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE") != "y":
+        return None
+    required_enabled = (
+        "CONFIG_LIBSTORVSC",
+        "CONFIG_LIBSTORVSC_LUN_DISCOVERY",
+        "CONFIG_LIBSTORVSC_GUARDED_IO",
+    )
+    if any(values.get(name) != "y" for name in required_enabled):
+        raise ValueError(
+            "Guarded V2 configuration must enable solved StorVSC discovery"
+        )
+    if values.get("CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION") == "y":
+        raise ValueError(
+            "Guarded persistence cannot enable the network application"
+        )
+    if any(
+        name in values
+        for name in (
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH",
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET",
+        )
+    ):
+        raise ValueError(
+            "Guarded V2 seed enrollment cannot bind path or target"
+        )
+
+    def quoted(name):
+        value = values.get(name)
+        if (
+            not isinstance(value, str)
+            or len(value) != 34
+            or value[0] != '"'
+            or value[-1] != '"'
+            or not IDENTITY.fullmatch(value[1:-1])
+        ):
+            raise ValueError(
+                "Guarded V2 run and disk IDs must be 32 lowercase hex digits"
+            )
+        return value[1:-1]
+
+    def integer(name):
+        value = values.get(name)
+        if (
+            not isinstance(value, str)
+            or not re.fullmatch(r"0|[1-9][0-9]*", value)
+        ):
+            raise ValueError("Guarded V2 configuration has an invalid integer")
+        return int(value)
+
+    run_id = quoted("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID")
+    disk_id = quoted("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID")
+    sectors = integer("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS")
+    sector_size = integer(
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE"
+    )
+    identity_policy = integer(
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY"
+    )
+    lun = integer("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN")
+    max_devices = integer("CONFIG_LIBSTORVSC_MAX_DEVICES")
+    max_luns = integer("CONFIG_LIBSTORVSC_MAX_LUNS")
+    if (
+        identity_policy != 2
+        or sector_size != 512
+        or sectors <= 48
+        or sectors > ((1 << 63) - 1) // sector_size
+        or not 0 <= lun <= 255
+        or max_devices != 2
+        or max_luns != 8
+    ):
+        raise ValueError(
+            "Guarded V2 solved geometry or identity policy is incompatible"
+        )
+    return {
+        "schema": GUARDED_CONTRACT_SCHEMA,
+        "schema_version": 1,
+        "scope": "platform-only",
+        "result": "UNAVAILABLE",
+        "protocol": 1,
+        "identity_policy": 2,
+        "reason": "no-devices",
+        "main_return": 2,
+        "run_id": run_id,
+        "disk_id": disk_id,
+        "path": 0,
+        "target": 0,
+        "lun": lun,
+        "sectors": sectors,
+        "sector_size": sector_size,
+        "solved_config_sha256": hashlib.sha256(raw).hexdigest(),
+        "producer": guarded_producer_contract(),
+    }
+
+
+def validate_guarded_contract(value, boot_policy, solved_config_sha256):
+    if boot_policy != GUARDED_BOOT_POLICY:
+        if value is not None:
+            raise ValueError(
+                "Ordinary platform boot policies cannot carry guarded state"
+            )
+        return None
+    value = exact_fields(
+        value,
+        (
+            "schema", "schema_version", "scope", "result", "protocol",
+            "identity_policy", "reason", "main_return", "run_id",
+            "disk_id", "path", "target", "lun", "sectors",
+            "sector_size", "solved_config_sha256", "producer",
+        ),
+        "Guarded V2 pristine-unavailable contract",
+    )
+    producer = exact_fields(
+        value["producer"], ("schema", "schema_version", "files"),
+        "Guarded V2 producer pin",
+    )
+    files = exact_fields(
+        producer["files"], GUARDED_PRODUCER_FILES,
+        "Guarded V2 producer files",
+    )
+    if (
+        value["schema"] != GUARDED_CONTRACT_SCHEMA
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["scope"] != "platform-only"
+        or value["result"] != "UNAVAILABLE"
+        or type(value["protocol"]) is not int
+        or value["protocol"] != 1
+        or type(value["identity_policy"]) is not int
+        or value["identity_policy"] != 2
+        or value["reason"] != "no-devices"
+        or type(value["main_return"]) is not int
+        or value["main_return"] != 2
+        or not isinstance(value["run_id"], str)
+        or not IDENTITY.fullmatch(value["run_id"])
+        or not isinstance(value["disk_id"], str)
+        or not IDENTITY.fullmatch(value["disk_id"])
+        or type(value["path"]) is not int
+        or value["path"] != 0
+        or type(value["target"]) is not int
+        or value["target"] != 0
+        or type(value["lun"]) is not int
+        or not 0 <= value["lun"] <= 255
+        or type(value["sectors"]) is not int
+        or value["sectors"] <= 48
+        or value["sectors"] > ((1 << 63) - 1) // 512
+        or type(value["sector_size"]) is not int
+        or value["sector_size"] != 512
+        or require_sha256(
+            value["solved_config_sha256"],
+            "Guarded V2 solved configuration",
+        ) != solved_config_sha256
+        or producer["schema"] != GUARDED_PRODUCER_SCHEMA
+        or type(producer["schema_version"]) is not int
+        or producer["schema_version"] != 1
+        or dict(files) != GUARDED_PRODUCER_FILES
+    ):
+        raise ValueError("Guarded V2 pristine-unavailable contract is invalid")
+    return {
+        **value,
+        "producer": {
+            **producer,
+            "files": dict(files),
+        },
+    }
 
 
 def file_record(value, role):
@@ -502,7 +781,7 @@ def validate_input_manifest(value):
             "schema", "schema_version", "workload", "boot_policy",
             "raw_size", "provenance", "files", "qemu_support", "miz",
             "packaging", "implementation", "budget",
-            "capability_reference", "private_build",
+            "capability_reference", "private_build", "guarded",
         ),
         "Private-preflight input manifest",
     )
@@ -548,11 +827,15 @@ def validate_input_manifest(value):
         raise ValueError("Private-preflight miz contract is invalid")
     require_sha256(miz["sha256"], "Private-preflight miz fingerprint")
     provenance = validate_provenance(value["provenance"])
+    guarded = validate_guarded_contract(
+        value["guarded"], value["boot_policy"],
+        provenance["config"]["sha256"],
+    )
     capability_reference = validate_capability_reference(
         value["capability_reference"], files["capability_raw"]
     )
     private_build = validate_private_build(
-        value["private_build"], provenance, files["efi"]
+        value["private_build"], provenance, files["efi"], guarded
     )
     implementation = validate_implementation(value["implementation"])
     budget = exact_fields(
@@ -579,6 +862,7 @@ def validate_input_manifest(value):
     return {
         **value,
         "provenance": provenance,
+        "guarded": guarded,
         "capability_reference": capability_reference,
         "private_build": private_build,
         "files": files,
@@ -837,7 +1121,7 @@ def validate_capability_reference(value, capability_raw):
     return validated
 
 
-def validate_private_build(value, provenance, efi):
+def validate_private_build(value, provenance, efi, expected_guarded=None):
     value = exact_fields(
         value, ("name", "sha256", "size", "receipt"),
         "Private local build receipt",
@@ -854,7 +1138,7 @@ def validate_private_build(value, provenance, efi):
         (
             "schema", "schema_version", "result", "source_before",
             "source_after", "invocation", "tools", "output",
-            "builder_sha256",
+            "builder_sha256", "guarded",
         ),
         "Private local build receipt",
     )
@@ -863,7 +1147,7 @@ def validate_private_build(value, provenance, efi):
     if (
         receipt["schema"] != PRIVATE_BUILD_SCHEMA
         or type(receipt["schema_version"]) is not int
-        or receipt["schema_version"] != 1
+        or receipt["schema_version"] != 2
         or receipt["result"] != "PASS"
         or before != provenance
         or after != provenance
@@ -872,6 +1156,16 @@ def validate_private_build(value, provenance, efi):
         ) != azure.image_sha256(Path(__file__))
     ):
         raise ValueError("Private local build provenance is incompatible")
+    guarded = validate_guarded_contract(
+        receipt["guarded"],
+        GUARDED_BOOT_POLICY if receipt["guarded"] is not None
+        else "platform-unavailable-v1",
+        provenance["config"]["sha256"],
+    )
+    if guarded != expected_guarded:
+        raise ValueError(
+            "Private local build guarded contract is unrelated to the policy"
+        )
     invocation = exact_fields(
         receipt["invocation"],
         (
@@ -915,6 +1209,7 @@ def validate_private_build(value, provenance, efi):
             "invocation": dict(invocation),
             "tools": tools,
             "output": dict(output),
+            "guarded": guarded,
         },
     }
 
@@ -999,6 +1294,13 @@ def build_private_image(
         raise ValueError("Private local build timeout must be 1-3600 seconds")
     repository = Path(repository).resolve(strict=True)
     source_before = build_provenance(repository, config_path)
+    guarded = guarded_contract_from_solved_config(config_path)
+    if guarded is not None:
+        verify_guarded_producer_sources(repository)
+        guarded = validate_guarded_contract(
+            guarded, GUARDED_BOOT_POLICY,
+            source_before["config"]["sha256"],
+        )
     output_directory = private_directory(
         output_directory, "Private local build directory", must_exist=False
     )
@@ -1162,7 +1464,7 @@ def build_private_image(
     )
     receipt = {
         "schema": PRIVATE_BUILD_SCHEMA,
-        "schema_version": 1,
+        "schema_version": 2,
         "result": "PASS",
         "source_before": source_before,
         "source_after": source_after,
@@ -1177,6 +1479,7 @@ def build_private_image(
         "tools": tools,
         "output": output,
         "builder_sha256": azure.image_sha256(Path(__file__)),
+        "guarded": guarded,
     }
     receipt_path = output_directory / PRIVATE_BUILD_RECEIPT
     save_private_bytes(receipt_path, azure.canonical_json(receipt))
@@ -1191,6 +1494,7 @@ def build_private_image(
             "sha256": output["sha256"],
             "size": output["size"],
         },
+        guarded,
     )
     azure.fsync_directory(output_directory)
     return receipt_path, efi_path
@@ -1255,6 +1559,12 @@ def generate_input(
     if boot_policy not in BOOT_POLICIES:
         raise ValueError("Unsupported platform-only boot policy")
     provenance = build_provenance(repository, config_path)
+    guarded = guarded_contract_from_solved_config(config_path)
+    if guarded is not None:
+        verify_guarded_producer_sources(repository)
+    guarded = validate_guarded_contract(
+        guarded, boot_policy, provenance["config"]["sha256"]
+    )
     qemu, qemu_support = qemu_closure_records(qemu_root)
     files = {
         "qemu": qemu,
@@ -1292,7 +1602,7 @@ def generate_input(
             build_receipt, PRIVATE_BUILD_RECEIPT,
             "Private local build receipt",
         ),
-        provenance, files["efi"],
+        provenance, files["efi"], guarded,
     )
     miz = regular_record(miz_path, "miz", "Pinned miz executable")
     miz["revision"] = azure.MIZ_REVISION
@@ -1377,6 +1687,7 @@ def generate_input(
             "schema_version": INPUT_SCHEMA_VERSION,
             "workload": WORKLOAD,
             "boot_policy": boot_policy,
+            "guarded": guarded,
             "raw_size": azure.VIRTUAL_SIZE,
             "provenance": provenance,
             "capability_reference": capability_reference,
@@ -1453,6 +1764,14 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
         raise ValueError(
             "Private-preflight source, configuration, or dependencies changed"
         )
+    guarded = guarded_contract_from_solved_config(source / SOLVED_CONFIG)
+    if guarded is not None:
+        verify_guarded_producer_sources(SUPPORT.parent)
+    if validate_guarded_contract(
+        guarded, manifest["boot_policy"],
+        manifest["provenance"]["config"]["sha256"],
+    ) != manifest["guarded"]:
+        raise ValueError("Private-preflight guarded V2 contract changed")
     miz_source = Path(miz_path)
     if stat.S_ISLNK(miz_source.lstat().st_mode):
         raise ValueError("Pinned miz executable must not be a symlink")
@@ -1793,6 +2112,13 @@ def verify_immutable_inputs(state, state_directory):
         != manifest["provenance"]
     ):
         raise ValueError("Prepared source or solved configuration changed")
+    guarded = guarded_contract_from_solved_config(config_path)
+    if guarded is not None:
+        verify_guarded_producer_sources(SUPPORT.parent)
+    if validate_guarded_contract(
+        guarded, manifest["boot_policy"], config["sha256"]
+    ) != manifest["guarded"]:
+        raise ValueError("Prepared guarded V2 contract changed")
     for name, key, description in (
         (
             CAPABILITY_REFERENCE, "capability_reference",
@@ -3557,7 +3883,7 @@ def host_phase_manifest(state, phase, capability_sha256=None):
         }
     result = {
         "schema": HOST_PHASE_SCHEMA,
-        "schema_version": 2,
+        "schema_version": 3,
         "phase": phase,
         "identity": state["identity"],
         "runner_sha256": state["implementation"]["files"]["runner"][
@@ -3569,6 +3895,9 @@ def host_phase_manifest(state, phase, capability_sha256=None):
             "platform-unavailable-v1"
             if phase == "capability"
             else input_manifest["boot_policy"]
+        ),
+        "guarded": (
+            None if phase == "capability" else input_manifest["guarded"]
         ),
         "raw_size": input_manifest["raw_size"],
         "files": files,
@@ -3624,7 +3953,7 @@ def validate_host_receipt(value, state, phase, manifest, logs):
         (
             "schema", "schema_version", "phase", "identity", "result",
             "manifest_sha256", "runner_sha256", "host_boot_id",
-            "boot_policy", "boots",
+            "boot_policy", "acceptance_scope", "storage_result", "boots",
         ),
         "Private host evidence receipt",
     )
@@ -3655,7 +3984,7 @@ def validate_host_receipt(value, state, phase, manifest, logs):
     if (
         value["schema"] != HOST_EVIDENCE_SCHEMA
         or type(value["schema_version"]) is not int
-        or value["schema_version"] != 1
+        or value["schema_version"] != 2
         or value["phase"] != phase
         or value["identity"] != state["identity"]
         or value["result"] != "PASS"
@@ -3667,6 +3996,12 @@ def validate_host_receipt(value, state, phase, manifest, logs):
             value["host_boot_id"], "Private host boot identity"
         ) != value["host_boot_id"]
         or value["boot_policy"] != manifest["boot_policy"]
+        or value["acceptance_scope"] != "platform-only"
+        or value["storage_result"] != (
+            "UNAVAILABLE"
+            if manifest["boot_policy"] == GUARDED_BOOT_POLICY
+            else "NOT_EVALUATED"
+        )
     ):
         raise ValueError("Private host receipt is stale or mismatched")
     return value
@@ -3903,6 +4238,9 @@ def run_preflight(
                 ],
                 "private_receipt_sha256": state["private_receipt_sha256"],
                 "boot_policy": state["input_manifest"]["boot_policy"],
+                "acceptance_scope": "platform-only",
+                "storage_result": private_receipt["storage_result"],
+                "guarded": state["input_manifest"]["guarded"],
                 "capability_boots": capability_receipt["boots"],
                 "private_boots": private_receipt["boots"],
                 "cleanup": "pending",
