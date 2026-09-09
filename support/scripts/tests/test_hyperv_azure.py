@@ -2,6 +2,7 @@
 
 import copy
 import contextlib
+import errno
 import hashlib
 import importlib
 import io
@@ -17,6 +18,7 @@ import threading
 import time
 import traceback
 import unittest
+import uuid
 import zlib
 from unittest import mock
 
@@ -4177,6 +4179,11 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "os_disk_id": state["os_disk"]["id"],
             "data_disk_id": state["data_disk"]["id"],
         }
+        state["vm_operation"] = {
+            "phase": "created",
+            "operation_id": "99999999-9999-4999-8999-999999999999",
+            "deployment_id": state["vm"]["deployment_id"],
+        }
         return state
 
     def live_vm(self, state, *, data_disk_id=None, vm_uuid=None):
@@ -4189,6 +4196,9 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                 "unikraft-run": self.contract["azure"]["name_prefix"],
                 "image-sha256": self.contract["files"]["guest_vhd"]["sha256"],
                 "seed-sha256": self.contract["files"]["data_raw"]["sha256"],
+                "persistence-operation": (
+                    state["vm_operation"]["operation_id"]
+                ),
             },
             "hardwareProfile": {"vmSize": self.contract["azure"]["vm_size"]},
             "storageProfile": {
@@ -4225,6 +4235,35 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "hyperVGeneration": "V2" if role == "os" else None,
         }
 
+    def unattached_disk(self, state, role, *, disk_uuid=None,
+                        disk_state="Unattached"):
+        proof = state[f"{role}_disk"]
+        return {
+            "id": proof["id"],
+            "uniqueId": disk_uuid or proof["uuid"],
+            "tags": {
+                "managed-by": persistence.MANAGED_BY,
+                "purpose": persistence.PURPOSE,
+                "unikraft-run": self.contract["azure"]["name_prefix"],
+                "image-sha256": self.contract["files"][
+                    "guest_vhd"
+                ]["sha256"],
+                "seed-sha256": self.contract["files"][
+                    "data_raw"
+                ]["sha256"],
+            },
+            "managedBy": None,
+            "diskSizeBytes": (
+                self.contract["files"]["guest_vhd"]["size"] - 512
+                if role == "os"
+                else self.contract["geometry"]["sectors"] * 512
+            ),
+            "provisioningState": "Succeeded",
+            "diskState": disk_state,
+            "osType": "Linux" if role == "os" else None,
+            "hyperVGeneration": "V2" if role == "os" else None,
+        }
+
     def live_deployment(self, state):
         group_id = state["resource_group_id"]
 
@@ -4249,6 +4288,26 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "properties": {
                 "provisioningState": "Succeeded",
                 "correlationId": state["vm"]["correlation_id"],
+                "parameters": {
+                    name: {"value": value}
+                    for name, value in {
+                        "namePrefix": self.contract["azure"]["name_prefix"],
+                        "location": self.contract["azure"]["location"],
+                        "vmSize": self.contract["azure"]["vm_size"],
+                        "osDiskId": state["os_disk"]["id"],
+                        "dataDiskId": state["data_disk"]["id"],
+                        "dataLun": self.contract["geometry"]["lun"],
+                        "imageSha256": self.contract["files"][
+                            "guest_vhd"
+                        ]["sha256"],
+                        "seedSha256": self.contract["files"][
+                            "data_raw"
+                        ]["sha256"],
+                        "operationId": state["vm_operation"][
+                            "operation_id"
+                        ],
+                    }.items()
+                },
                 "outputResources": [{"id": value} for value in resources],
                 "outputs": {
                     "vmId": output(state["vm"]["id"]),
@@ -4259,6 +4318,15 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                 },
             },
         }
+
+    def owned_resource(self, run, identifier, operation_id=None):
+        tags = dict(run.tags)
+        if "/microsoft.compute/disks/" not in identifier.lower():
+            tags["persistence-operation"] = (
+                operation_id
+                or run.state["vm_operation"]["operation_id"]
+            )
+        return {"id": identifier, "tags": tags}
 
     def test_exact_two_boot_parser_and_causal_serial_boundary(self):
         boot1_text = self.boot_log(1)
@@ -4578,6 +4646,46 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                 )
             cloud.assert_not_called()
 
+    def test_state_lock_serializes_run_and_cleanup_across_processes(self):
+        self.prepare()
+        script = (
+            "import pathlib,sys;"
+            f"sys.path.insert(0,{str(SUPPORT / 'scripts')!r});"
+            "import hyperv_persistence_controller as p;"
+            "state=pathlib.Path(sys.argv[2]);"
+            "\ntry:\n"
+            "  if sys.argv[1]=='cleanup':\n"
+            f"    p.cleanup_state(state,{self.SUBSCRIPTION!r})\n"
+            "  else:\n"
+            f"    p.run_acceptance(state,{self.SUBSCRIPTION!r},False,"
+            f"{persistence.resource_envelope_sha256(self.contract)!r})\n"
+            "except RuntimeError as error:\n"
+            "  if 'already controlled' not in str(error): raise\n"
+            "  print('LOCKED')\n"
+        )
+        environment = {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(SUPPORT / "scripts"),
+            "TMPDIR": str(self.root),
+        }
+        with persistence.PersistenceStateLock(self.state_dir):
+            for action in ("run", "cleanup"):
+                result = subprocess.run(
+                    [
+                        sys.executable, "-B", "-c", script,
+                        action, str(self.state_dir),
+                    ],
+                    cwd=SUPPORT.parent,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "LOCKED")
+
     def test_all_irreversible_phases_refuse_reenrollment_or_another_boot(self):
         _state, path = self.prepare()
         for phase, boot_count in (
@@ -4688,6 +4796,9 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             def private_failure_values(self):
                 return ()
 
+            def ensure_deadline(self):
+                return None
+
         with (
             mock.patch.object(
                 persistence, "PersistenceRun", FakeRun
@@ -4766,6 +4877,61 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         self.assertTrue(state["cleanup_required"])
         self.assertIn("cleanup", state["failure"])
 
+    def test_failure_recording_cannot_mask_primary_and_cleanup(self):
+        _state, _path = self.prepare()
+
+        class RecordingFailureRun:
+            def __init__(self, state, state_path):
+                self.state = state
+                self.state_path = state_path
+                self.deadline = None
+
+            def record(self, phase, **fields):
+                if phase == "failed":
+                    raise OSError(errno.ENOSPC, "synthetic disk full")
+                self.state.update(fields, phase=phase)
+                azure.save_durable_json(self.state_path, self.state)
+
+            def check_cloud(self):
+                raise RuntimeError(
+                    "/subscriptions/primary-private-id failed"
+                )
+
+            def cleanup(self):
+                raise RuntimeError(
+                    "/subscriptions/cleanup-private-id failed"
+                )
+
+            def private_failure_values(self):
+                return ("primary-private-id", "cleanup-private-id")
+
+        with (
+            mock.patch.object(
+                persistence, "PersistenceRun", RecordingFailureRun
+            ),
+            mock.patch.object(
+                persistence.azure, "check_upload_dependencies"
+            ),
+            mock.patch.object(
+                persistence.azure, "interrupt_as_exception",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            with self.assertRaises(azure.RunCleanupError) as raised:
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, True,
+                    persistence.resource_envelope_sha256(self.contract),
+                )
+        message = str(raised.exception)
+        self.assertIn("Primary run failure", message)
+        self.assertIn("cleanup also failed", message)
+        self.assertIn(
+            "durable cleanup-failure recording also failed", message
+        )
+        self.assertIn("synthetic disk full", message)
+        self.assertNotIn("primary-private-id", message)
+        self.assertNotIn("cleanup-private-id", message)
+
     def test_replaced_uuid_and_foreign_attachment_are_rejected(self):
         state, path = self.prepare()
         state = self.attach_proofs(state)
@@ -4809,6 +4975,132 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "UUID"):
             run.disk_proof("data", disk)
 
+    def test_reserved_disks_allow_only_the_proven_second_boot(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        state.update(
+            phase="boot1-deallocated",
+            boot_count=1,
+            cleanup_required=True,
+        )
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        commands = []
+
+        def execute(arguments, **_kwargs):
+            commands.append(tuple(arguments[:2]))
+            if arguments[:3] == ["deployment", "group", "show"]:
+                return self.live_deployment(state)
+            if arguments[:2] == ["vm", "show"]:
+                return self.live_vm(state)
+            if arguments[:2] == ["disk", "show"]:
+                role = (
+                    "os" if arguments[arguments.index("--name") + 1]
+                    == self.contract["azure"]["os_disk_name"] else "data"
+                )
+                disk = self.live_disk(state, role)
+                disk["diskState"] = "Reserved"
+                return disk
+            if arguments[:2] == ["vm", "start"]:
+                return None
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        run.az = execute
+        run.start_boot2()
+        self.assertEqual(run.state["boot_count"], 2)
+        self.assertEqual(commands.count(("vm", "start")), 1)
+
+    def test_deploy_revalidates_both_disk_uuids_before_vm_creation(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        state.pop("vm")
+        state.pop("vm_operation")
+        state.update(
+            phase="data-disk-ready",
+            boot_count=0,
+            cleanup_required=True,
+        )
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        commands = []
+
+        def execute(arguments, **_kwargs):
+            commands.append(tuple(arguments[:3]))
+            if arguments[:2] == ["disk", "show"]:
+                role = (
+                    "os" if arguments[arguments.index("--name") + 1]
+                    == self.contract["azure"]["os_disk_name"] else "data"
+                )
+                return self.unattached_disk(
+                    state, role,
+                    disk_uuid=(
+                        "55555555-5555-4555-8555-555555555555"
+                        if role == "data" else None
+                    ),
+                )
+            self.fail("VM deployment ran before disk revalidation completed")
+
+        run.az = execute
+        with self.assertRaisesRegex(RuntimeError, "replaced"):
+            run.deploy_vm()
+        reloaded, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(reloaded["vm_operation"]["phase"], "pending")
+        self.assertNotIn("vm", reloaded)
+        self.assertEqual(
+            [command[:2] for command in commands],
+            [("disk", "show"), ("disk", "show")],
+        )
+
+    def test_late_deployment_persists_returned_identities_before_failure(self):
+        state, path = self.prepare()
+        complete = self.attach_proofs(copy.deepcopy(state))
+        operation_id = complete["vm_operation"]["operation_id"]
+        deployment = self.live_deployment(complete)
+        state.update({
+            "phase": "data-disk-ready",
+            "cleanup_required": True,
+            "resource_group_id": complete["resource_group_id"],
+            "os_disk": complete["os_disk"],
+            "data_disk": complete["data_disk"],
+        })
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        clock = [100.0]
+        run.deadline = 100.25
+
+        def execute(arguments, **_kwargs):
+            if arguments[:2] == ["disk", "show"]:
+                role = (
+                    "os" if arguments[arguments.index("--name") + 1]
+                    == self.contract["azure"]["os_disk_name"] else "data"
+                )
+                return self.unattached_disk(state, role)
+            if arguments[:3] == ["deployment", "group", "create"]:
+                clock[0] = 100.5
+                return deployment
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        run.az = execute
+        with (
+            mock.patch.object(
+                persistence.uuid, "uuid4",
+                return_value=uuid.UUID(operation_id),
+            ),
+            mock.patch.object(
+                persistence.time, "monotonic",
+                side_effect=lambda: clock[0],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "deadline expired"):
+                run.deploy_vm()
+        reloaded, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(reloaded["phase"], "deploying-vm")
+        self.assertEqual(reloaded["vm"]["uuid"], self.VM_UUID)
+        self.assertEqual(
+            reloaded["vm_operation"],
+            complete["vm_operation"],
+        )
+
     def test_cleanup_deallocates_proven_vm_when_one_disk_is_unproven(self):
         state, path = self.prepare()
         state = self.attach_proofs(state)
@@ -4822,7 +5114,7 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "tags": run.tags,
         }
         resources = [
-            {"id": identifier, "tags": run.tags}
+            self.owned_resource(run, identifier)
             for identifier in run.expected_resource_ids()
         ]
 
@@ -4837,7 +5129,9 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             if arguments[:3] == ["deployment", "group", "show"]:
                 return self.live_deployment(state)
             if arguments[:2] == ["vm", "show"]:
-                return self.live_vm(state)
+                return self.live_vm(
+                    state, data_disk_id="/foreign/attachment"
+                )
             if arguments[:2] == ["disk", "show"]:
                 role = (
                     "os" if arguments[arguments.index("--name") + 1]
@@ -4859,6 +5153,38 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             run.cleanup()
         self.assertIn(("vm", "deallocate"), commands)
         self.assertNotIn(("group", "delete"), commands)
+
+    def test_fractional_deadline_cannot_publish_late_deallocation(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        clock = [100.0]
+        run.deadline = 100.25
+        run.verify_topology = mock.Mock()
+        original_record = run.record
+        phases = []
+
+        def record(phase, **fields):
+            phases.append(phase)
+            original_record(phase, **fields)
+
+        def execute(_arguments, **kwargs):
+            self.assertAlmostEqual(kwargs["timeout"], 0.25)
+            clock[0] = 100.5
+
+        run.record = record
+        run.az = execute
+        with mock.patch.object(
+            persistence.time, "monotonic",
+            side_effect=lambda: clock[0],
+        ):
+            self.assertAlmostEqual(run.remaining(10), 0.25)
+            with self.assertRaisesRegex(RuntimeError, "deadline expired"):
+                run.deallocate(2)
+        self.assertEqual(phases, ["deallocating-boot2"])
+        reloaded, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(reloaded["phase"], "deallocating-boot2")
 
     def test_cleanup_accepts_proven_partial_resource_envelope(self):
         state, path = self.prepare()
@@ -4894,7 +5220,7 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                 self.contract["files"]["guest_vhd"]["size"] - 512
             ),
             "provisioningState": "Succeeded",
-            "diskState": "Unattached",
+            "diskState": "ReadyToUpload",
             "osType": "Linux",
             "hyperVGeneration": "V2",
         }
@@ -4989,17 +5315,19 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         run.cleanup()
         self.assertEqual(run.state["phase"], "cleaned")
 
-    def test_cleanup_recovers_vm_uuid_from_original_deployment_output(self):
+    def test_cleanup_never_adopts_later_replacement_deployment(self):
         state, path = self.prepare()
         state = self.attach_proofs(state)
-        deployment = self.live_deployment(state)
         state.pop("vm")
+        original_operation = state["vm_operation"]["operation_id"]
+        state["vm_operation"]["phase"] = "pending"
         state.update({
             "phase": "deploying-vm",
             "cleanup_required": True,
             "boot_count": 1,
         })
         azure.save_durable_json(path, state)
+        state, path = persistence.load_state(self.state_dir)
         run = persistence.PersistenceRun(state, path)
         group = {
             "id": state["resource_group_id"],
@@ -5007,45 +5335,80 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "tags": run.tags,
         }
         expected_resources = [
-            {"id": identifier, "tags": run.tags}
+            self.owned_resource(
+                run, identifier,
+                operation_id=(
+                    "88888888-8888-4888-8888-888888888888"
+                ),
+            )
             for identifier in run.expected_resource_ids()
         ]
-        exists_calls = 0
         commands = []
 
         def execute(arguments, **_kwargs):
-            nonlocal exists_calls
             commands.append(tuple(arguments[:3]))
             if arguments[:2] == ["group", "exists"]:
-                exists_calls += 1
-                return exists_calls == 1
+                return True
             if arguments[:2] == ["group", "show"]:
                 return group
             if arguments[:2] == ["resource", "list"]:
                 return expected_resources
-            if arguments[:3] == ["deployment", "group", "show"]:
-                return deployment
-            if arguments[:2] == ["vm", "show"]:
-                return self.live_vm(run.state)
             if arguments[:2] == ["disk", "show"]:
                 role = (
                     "os" if arguments[arguments.index("--name") + 1]
                     == self.contract["azure"]["os_disk_name"] else "data"
                 )
-                return self.live_disk(run.state, role)
-            if arguments[:2] in (
-                ["vm", "deallocate"], ["group", "delete"]
-            ):
-                return None
+                proof = run.state[f"{role}_disk"]
+                return {
+                    "id": proof["id"],
+                    "uniqueId": proof["uuid"],
+                    "tags": run.tags,
+                    "managedBy": None,
+                    "diskSizeBytes": (
+                        self.contract["files"]["guest_vhd"]["size"] - 512
+                        if role == "os"
+                        else self.contract["geometry"]["sectors"] * 512
+                    ),
+                    "provisioningState": "Succeeded",
+                    "diskState": "Reserved",
+                    "osType": "Linux" if role == "os" else None,
+                    "hyperVGeneration": "V2" if role == "os" else None,
+                }
             self.fail(f"unexpected cloud operation: {arguments}")
 
         run.az = execute
-        run.cleanup()
-        self.assertEqual(run.state["vm"]["uuid"], self.VM_UUID)
-        self.assertIn(("vm", "deallocate"), [
-            command[:2] for command in commands
-        ])
-        self.assertEqual(run.state["phase"], "cleaned")
+        with self.assertRaises(persistence.PersistenceCleanupError):
+            run.cleanup()
+        self.assertNotIn("vm", run.state)
+        self.assertEqual(
+            run.state["vm_operation"]["operation_id"],
+            original_operation,
+        )
+        self.assertNotIn(
+            ("deployment", "group", "show"), commands
+        )
+        self.assertFalse(any(
+            command[:2] == ("group", "delete")
+            for command in commands
+        ))
+
+    def test_same_named_replacement_deployment_output_is_rejected(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        replacement = self.live_deployment(state)
+        replacement["properties"]["parameters"]["operationId"]["value"] = (
+            "88888888-8888-4888-8888-888888888888"
+        )
+        replacement["properties"]["correlationId"] = (
+            "77777777-7777-4777-8777-777777777777"
+        )
+        replacement["properties"]["outputs"]["vmUuid"]["value"] = (
+            "66666666-6666-4666-8666-666666666666"
+        )
+        with self.assertRaisesRegex(RuntimeError, "provenance"):
+            run.vm_proof(replacement)
 
     def test_cleanup_finalizes_durable_acceptance_after_reload(self):
         state, path = self.prepare()
@@ -5132,6 +5495,34 @@ class HypervPersistenceTemplateTest(unittest.TestCase):
         tags = self.template["variables"]["tags"]
         self.assertEqual(tags["purpose"], persistence.PURPOSE)
         self.assertEqual(tags["seed-sha256"], "[parameters('seedSha256')]")
+        self.assertEqual(
+            tags["persistence-operation"],
+            "[parameters('operationId')]",
+        )
+
+    def test_vm_uses_prevalidated_external_disks_and_operation_output(self):
+        vm = self.resources["Microsoft.Compute/virtualMachines"]
+        self.assertEqual(
+            vm["dependsOn"],
+            [
+                "[resourceId('Microsoft.Network/networkInterfaces', "
+                "variables('nicName'))]"
+            ],
+        )
+        storage = vm["properties"]["storageProfile"]
+        self.assertEqual(
+            storage["osDisk"]["managedDisk"]["id"],
+            "[parameters('osDiskId')]",
+        )
+        self.assertEqual(
+            storage["dataDisks"][0]["managedDisk"]["id"],
+            "[parameters('dataDiskId')]",
+        )
+        self.assertIn("operationId", self.template["parameters"])
+        self.assertIn(
+            "'2025-11-01', 'Full'",
+            self.template["outputs"]["vmUuid"]["value"],
+        )
 
 
 if __name__ == "__main__":

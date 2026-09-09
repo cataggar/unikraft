@@ -33,6 +33,11 @@
       "type": "string",
       "minLength": 64,
       "maxLength": 64
+    },
+    "operationId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36
     }
   },
   "variables": {
@@ -45,7 +50,8 @@
       "purpose": "guarded-v2-two-boot-persistence",
       "unikraft-run": "[parameters('namePrefix')]",
       "image-sha256": "[parameters('imageSha256')]",
-      "seed-sha256": "[parameters('seedSha256')]"
+      "seed-sha256": "[parameters('seedSha256')]",
+      "persistence-operation": "[parameters('operationId')]"
     }
   },
   "resources": [

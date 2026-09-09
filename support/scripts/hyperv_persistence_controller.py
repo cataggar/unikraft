@@ -5,6 +5,8 @@
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import errno
+import fcntl
 import hashlib
 import importlib
 import json
@@ -127,7 +129,8 @@ class EvidenceIncomplete(RuntimeError):
 
 
 class PersistenceCleanupError(RuntimeError):
-    def __init__(self, failures):
+    def __init__(self, failures, recording_error=None):
+        self.recording_error = recording_error
         super().__init__(
             "Persistence cleanup failed: " + "; ".join(
                 f"{name}: {azure.safe_failure_message(error)}"
@@ -579,6 +582,64 @@ def private_directory(path, description, *, must_exist=True):
     return path
 
 
+class PersistenceStateLock:
+    def __init__(self, state_directory):
+        self.directory = Path(state_directory).absolute()
+        self.path = self.directory / ".persistence-controller.lock"
+        self.descriptor = None
+
+    def __enter__(self):
+        private_directory(
+            self.directory, "Persistence state directory"
+        )
+        flags = (
+            os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            self.descriptor = os.open(self.path, flags, 0o600)
+        except OSError as error:
+            raise ValueError(
+                "Persistence state lock must be a private regular file"
+            ) from error
+        try:
+            metadata = os.fstat(self.descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077
+                or metadata.st_nlink != 1
+            ):
+                raise ValueError(
+                    "Persistence state lock must be owner-only"
+                )
+            try:
+                fcntl.flock(
+                    self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+            except OSError as error:
+                if error.errno in (errno.EACCES, errno.EAGAIN):
+                    raise RuntimeError(
+                        "Persistence state is already controlled by "
+                        "another process"
+                    ) from None
+                raise
+            return self
+        except BaseException:
+            os.close(self.descriptor)
+            self.descriptor = None
+            raise
+
+    def __exit__(self, _error_type, _error, _traceback):
+        if self.descriptor is not None:
+            try:
+                fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(self.descriptor)
+                self.descriptor = None
+
+
 def read_json(path, description, *, canonical=True):
     raw = azure.read_regular_file(path, MAX_JSON_BYTES, description)
     value = azure.parse_strict_json(raw, description)
@@ -965,6 +1026,32 @@ def validate_state(state):
         if any(not isinstance(proof[field], str) or not proof[field]
                for field in proof if field not in ("uuid", "correlation_id")):
             raise ValueError("VM deployment proof is invalid")
+    if "vm_operation" in state:
+        operation = exact_fields(
+            state["vm_operation"],
+            ("phase", "operation_id", "deployment_id"),
+            "VM deployment operation",
+        )
+        require_uuid(
+            operation["operation_id"], "VM deployment operation UUID"
+        )
+        if (
+            operation["phase"] not in ("pending", "created")
+            or not isinstance(operation["deployment_id"], str)
+            or not operation["deployment_id"]
+            or (
+                operation["phase"] == "created"
+                and not isinstance(state.get("vm"), dict)
+            )
+        ):
+            raise ValueError("VM deployment operation is invalid")
+    if isinstance(state.get("vm"), dict) and (
+        not isinstance(state.get("vm_operation"), dict)
+        or state["vm_operation"]["phase"] != "created"
+        or state["vm_operation"]["deployment_id"]
+        != state["vm"]["deployment_id"]
+    ):
+        raise ValueError("VM proof lacks its original deployment operation")
     resource_uuids = [
         state[field]["uuid"]
         for field in ("os_disk", "data_disk", "vm")
@@ -1435,7 +1522,21 @@ class PersistenceRun:
                 "Persistence cleanup deadline expired"
                 if cleanup else "Persistence acceptance deadline expired"
             )
-        return max(1, min(maximum, remaining))
+        return min(maximum, remaining)
+
+    def ensure_deadline(self, *, cleanup=False):
+        deadline = self.cleanup_deadline if cleanup else self.deadline
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Persistence cleanup deadline expired"
+                if cleanup else "Persistence acceptance deadline expired"
+            )
+
+    def whole_seconds_remaining(self, maximum):
+        remaining = self.remaining(maximum)
+        if remaining < 1:
+            raise RuntimeError("Persistence acceptance deadline expired")
+        return int(remaining)
 
     def expected_id(self, provider, resource_type, name):
         group_id = self.state.get("resource_group_id")
@@ -1454,6 +1555,17 @@ class PersistenceRun:
         ):
             raise RuntimeError(
                 f"{description} lacks this run's exact ownership tags"
+            )
+
+    def require_operation_tags(self, resource, description):
+        operation = self.state.get("vm_operation")
+        if not isinstance(operation, dict):
+            raise RuntimeError("VM deployment operation is unavailable")
+        self.require_tags(resource, description)
+        tags = resource.get("tags")
+        if tags.get("persistence-operation") != operation["operation_id"]:
+            raise RuntimeError(
+                f"{description} lacks the original deployment operation"
             )
 
     def resource_tags(self):
@@ -1502,6 +1614,7 @@ class PersistenceRun:
             ) from None
         if max_data_disks < 1:
             raise RuntimeError("Requested VM size cannot attach one data disk")
+        self.ensure_deadline()
         return {"subscription": subscription, "sku": sku}
 
     def create_group(self):
@@ -1516,6 +1629,7 @@ class PersistenceRun:
             "--location", self.cloud["location"],
             "--tags", *self.resource_tags(),
         ], timeout=self.remaining(300))
+        self.ensure_deadline()
         self.require_tags(group, "Created resource group")
         if str(group.get("location", "")).lower() != self.cloud["location"]:
             raise RuntimeError(
@@ -1560,13 +1674,12 @@ class PersistenceRun:
         return proof
 
     def verify_disk(self, role, disk, attached_vm_id=None,
-                    require_ready=True):
+                    ready_states=("Unattached",)):
         proof = self.state.get(f"{role}_disk")
         if not isinstance(proof, dict):
             raise RuntimeError(f"{role} disk creation proof is unavailable")
         self.require_tags(disk, f"{role} disk")
         managed_by = disk.get("managedBy")
-        expected_state = "Unattached" if attached_vm_id is None else "Attached"
         common_invalid = (
             str(disk.get("id", "")).lower() != proof["id"].lower()
             or require_uuid(
@@ -1583,10 +1696,10 @@ class PersistenceRun:
             )
             or disk.get("diskSizeBytes") != self.disk_logical_bytes(role)
             or (
-                require_ready
+                ready_states is not None
                 and (
                     disk.get("provisioningState") != "Succeeded"
-                    or disk.get("diskState") != expected_state
+                    or disk.get("diskState") not in ready_states
                 )
             )
         )
@@ -1601,6 +1714,19 @@ class PersistenceRun:
                 f"{role} disk is detached, replaced, or has wrong geometry"
             )
         return proof
+
+    def verify_uploaded_disks(self):
+        for role in ("os", "data"):
+            disk = self.az([
+                "disk", "show",
+                "--resource-group", self.cloud["resource_group"],
+                "--name", self.disk_name(role),
+            ], timeout=self.remaining(120))
+            self.verify_disk(
+                role, disk, attached_vm_id=None,
+                ready_states=("Unattached",),
+            )
+        self.ensure_deadline()
 
     def upload_disk(self, role):
         if role not in ("os", "data"):
@@ -1634,7 +1760,7 @@ class PersistenceRun:
                 "--resource-group", self.cloud["resource_group"],
                 "--name", name, "--access-level", "Write",
                 "--duration-in-seconds",
-                str(int(max(1, min(1800, self.remaining(1800))))),
+                str(self.whole_seconds_remaining(1800)),
             ], timeout=self.remaining(120))
             endpoint, sas = azure.upload_endpoint(
                 azure.disk_access_sas(grant)
@@ -1654,7 +1780,7 @@ class PersistenceRun:
                     "disk", "revoke-access",
                     "--resource-group", self.cloud["resource_group"],
                     "--name", name,
-                ], timeout=self.remaining(120))
+                ], timeout=120)
             except BaseException as error:
                 revoke = error
         if primary is not None and revoke is not None:
@@ -1667,12 +1793,14 @@ class PersistenceRun:
             raise primary
         if revoke is not None:
             raise revoke
+        self.ensure_deadline()
         disk = self.az([
             "disk", "show",
             "--resource-group", self.cloud["resource_group"],
             "--name", name,
         ], timeout=self.remaining(120))
         self.verify_disk(role, disk)
+        self.ensure_deadline()
         self.record(f"{role}-disk-ready")
 
     @contextmanager
@@ -1687,6 +1815,7 @@ class PersistenceRun:
             "dataLun": self.contract["geometry"]["lun"],
             "imageSha256": self.contract["files"]["guest_vhd"]["sha256"],
             "seedSha256": self.contract["files"]["data_raw"]["sha256"],
+            "operationId": self.state["vm_operation"]["operation_id"],
         }
         azure.save_json(path, {
             "$schema": (
@@ -1750,11 +1879,29 @@ class PersistenceRun:
             str(resource.get("id", "")).lower()
             for resource in resources if isinstance(resource, dict)
         }
+        parameters = properties.get("parameters")
+        expected_parameters = {
+            "namePrefix": self.cloud["name_prefix"],
+            "location": self.cloud["location"],
+            "vmSize": self.cloud["vm_size"],
+            "osDiskId": self.state["os_disk"]["id"],
+            "dataDiskId": self.state["data_disk"]["id"],
+            "dataLun": self.contract["geometry"]["lun"],
+            "imageSha256": self.contract["files"]["guest_vhd"]["sha256"],
+            "seedSha256": self.contract["files"]["data_raw"]["sha256"],
+            "operationId": self.state["vm_operation"]["operation_id"],
+        }
         if (
             deployment.get("name") != self.cloud["name_prefix"]
             or str(deployment.get("id", "")).lower()
             != expected_deployment.lower()
             or properties.get("provisioningState") != "Succeeded"
+            or not isinstance(parameters, dict)
+            or any(
+                not isinstance(parameters.get(name), dict)
+                or parameters[name].get("value") != value
+                for name, value in expected_parameters.items()
+            )
             or len(resources) != len(expected_resources)
             or actual_resources != expected_resources
             or self.deployment_output(properties, "vmId").lower()
@@ -1791,7 +1938,19 @@ class PersistenceRun:
     def deploy_vm(self):
         if self.state["boot_count"] != 0:
             raise RuntimeError("VM deployment would exceed the boot contract")
-        self.record("deploying-vm", boot_count=1)
+        deployment_id = self.expected_id(
+            "Microsoft.Resources", "deployments",
+            self.cloud["name_prefix"],
+        )
+        operation = {
+            "phase": "pending",
+            "operation_id": str(uuid.uuid4()),
+            "deployment_id": deployment_id,
+        }
+        self.record(
+            "deploying-vm", boot_count=1, vm_operation=operation
+        )
+        self.verify_uploaded_disks()
         with self.deployment_parameters() as parameters:
             deployment = self.az([
                 "deployment", "group", "create",
@@ -1802,7 +1961,12 @@ class PersistenceRun:
                 "--parameters", "@" + str(parameters),
             ], timeout=self.remaining(600))
         proof = self.vm_proof(deployment)
-        self.record("vm-created", vm=proof)
+        self.record(
+            "deploying-vm", vm=proof,
+            vm_operation={**operation, "phase": "created"},
+        )
+        self.ensure_deadline()
+        self.record("vm-created")
         self.verify_topology()
 
     def verify_deployment(self, *, cleanup=False):
@@ -1818,7 +1982,7 @@ class PersistenceRun:
             raise RuntimeError("Original VM deployment proof changed")
         return proof
 
-    def verify_vm(self, *, cleanup=False):
+    def verify_vm_identity(self, *, cleanup=False):
         proof = self.state.get("vm")
         if not isinstance(proof, dict):
             raise RuntimeError("VM creation proof is unavailable")
@@ -1827,7 +1991,23 @@ class PersistenceRun:
             "vm", "show", "--resource-group", self.cloud["resource_group"],
             "--name", self.cloud["vm_name"],
         ], timeout=timeout)
-        self.require_tags(vm, "Persistence VM")
+        self.require_operation_tags(vm, "Persistence VM")
+        if (
+            str(vm.get("id", "")).lower() != proof["id"].lower()
+            or require_uuid(vm.get("vmId"), "VM UUID") != proof["uuid"]
+            or vm.get("hardwareProfile", {}).get("vmSize")
+            != self.cloud["vm_size"]
+        ):
+            raise RuntimeError("Persistence VM identity was replaced")
+        return vm
+
+    def verify_vm(self, *, cleanup=False):
+        vm = self.verify_vm_identity(cleanup=cleanup)
+        self.verify_vm_attachments(vm)
+        return self.state["vm"]
+
+    def verify_vm_attachments(self, vm):
+        proof = self.state["vm"]
         os_id = (
             vm.get("storageProfile", {}).get("osDisk", {})
             .get("managedDisk", {}).get("id")
@@ -1835,11 +2015,7 @@ class PersistenceRun:
         data = vm.get("storageProfile", {}).get("dataDisks")
         interfaces = vm.get("networkProfile", {}).get("networkInterfaces")
         if (
-            str(vm.get("id", "")).lower() != proof["id"].lower()
-            or require_uuid(vm.get("vmId"), "VM UUID") != proof["uuid"]
-            or vm.get("hardwareProfile", {}).get("vmSize")
-            != self.cloud["vm_size"]
-            or str(os_id or "").lower() != proof["os_disk_id"].lower()
+            str(os_id or "").lower() != proof["os_disk_id"].lower()
             or not isinstance(data, list)
             or len(data) != 1
             or data[0].get("lun") != self.contract["geometry"]["lun"]
@@ -1854,7 +2030,8 @@ class PersistenceRun:
             raise RuntimeError("VM or reciprocal disk attachment was replaced")
         return proof
 
-    def verify_topology(self, *, cleanup=False):
+    def verify_topology(self, *, cleanup=False,
+                        disk_states=("Attached",)):
         self.verify_deployment(cleanup=cleanup)
         proof = self.verify_vm(cleanup=cleanup)
         for role in ("os", "data"):
@@ -1863,7 +2040,10 @@ class PersistenceRun:
                 "--resource-group", self.cloud["resource_group"],
                 "--name", self.disk_name(role),
             ], timeout=self.remaining(120, cleanup=cleanup))
-            self.verify_disk(role, disk, attached_vm_id=proof["id"])
+            self.verify_disk(
+                role, disk, attached_vm_id=proof["id"],
+                ready_states=disk_states,
+            )
         return proof
 
     def serial_log(self):
@@ -1909,6 +2089,7 @@ class PersistenceRun:
                 except EvidenceIncomplete:
                     pass
                 else:
+                    self.ensure_deadline()
                     if not text.endswith("\n"):
                         raise EvidenceIncomplete(
                             "Accepted serial boundary lacks a final newline"
@@ -1929,19 +2110,21 @@ class PersistenceRun:
             "--resource-group", self.cloud["resource_group"],
             "--name", self.cloud["vm_name"],
         ], timeout=self.remaining(300, cleanup=cleanup))
+        self.ensure_deadline(cleanup=cleanup)
         if not cleanup:
             self.record(f"boot{boot}-deallocated")
 
     def start_boot2(self):
         if self.state["boot_count"] != 1:
             raise RuntimeError("Boot 2 start would violate the exact boot count")
-        self.verify_topology()
+        self.verify_topology(disk_states=("Reserved", "Attached"))
         self.record("boot2-start-requested", boot_count=2)
         self.az([
             "vm", "start",
             "--resource-group", self.cloud["resource_group"],
             "--name", self.cloud["vm_name"],
         ], timeout=self.remaining(300))
+        self.ensure_deadline()
 
     def expected_resource_ids(self):
         return {
@@ -1986,6 +2169,7 @@ class PersistenceRun:
                 ("resource-group lookup", error)
             ]) from None
         if exists is False:
+            self.ensure_deadline(cleanup=True)
             self.record("cleaned", cleanup_required=False)
             return
         group_verified = False
@@ -2034,35 +2218,22 @@ class PersistenceRun:
         except BaseException as error:
             failures.append(("resource inventory", error))
 
-        if (
-            group_verified
-            and group_has_creation_proof
-            and not isinstance(self.state.get("vm"), dict)
-            and self.state["phase"] == "deploying-vm"
-            and all(
-                isinstance(self.state.get(f"{role}_disk"), dict)
-                for role in ("os", "data")
-            )
-        ):
-            try:
-                deployment = self.az([
-                    "deployment", "group", "show",
-                    "--resource-group", self.cloud["resource_group"],
-                    "--name", self.cloud["name_prefix"],
-                ], timeout=self.remaining(120, cleanup=True))
-                proof = self.vm_proof(deployment)
-                self.record("deploying-vm", vm=proof)
-            except BaseException:
-                pass
-
-        vm_verified = False
+        vm_identity_verified = False
         if isinstance(self.state.get("vm"), dict):
             try:
                 self.verify_deployment(cleanup=True)
-                self.verify_vm(cleanup=True)
-                vm_verified = True
             except BaseException as error:
-                failures.append(("VM identity and attachments", error))
+                failures.append(("VM deployment provenance", error))
+            try:
+                vm = self.verify_vm_identity(cleanup=True)
+                vm_identity_verified = True
+            except BaseException as error:
+                failures.append(("VM identity", error))
+            if vm_identity_verified:
+                try:
+                    self.verify_vm_attachments(vm)
+                except BaseException as error:
+                    failures.append(("VM attachments", error))
             for role in ("os", "data"):
                 try:
                     disk = self.az([
@@ -2073,10 +2244,11 @@ class PersistenceRun:
                     self.verify_disk(
                         role, disk,
                         attached_vm_id=self.state["vm"]["id"],
+                        ready_states=None,
                     )
                 except BaseException as error:
                     failures.append((f"{role} disk identity", error))
-            if vm_verified:
+            if vm_identity_verified:
                 try:
                     self.deallocate(
                         min(max(self.state["boot_count"], 1), 2),
@@ -2094,12 +2266,26 @@ class PersistenceRun:
                         "--resource-group", self.cloud["resource_group"],
                         "--name", self.disk_name(role),
                     ], timeout=self.remaining(120, cleanup=True))
-                    self.verify_disk(role, disk)
+                    self.verify_disk(
+                        role, disk, ready_states=None
+                    )
                 except BaseException as error:
                     failures.append((f"{role} disk identity", error))
 
         if resources is not None:
             actual_ids = set()
+            operation_resource_ids = set()
+            if group_has_creation_proof:
+                operation_resource_ids = self.expected_resource_ids() - {
+                    self.expected_id(
+                        "Microsoft.Compute", "disks",
+                        self.cloud["os_disk_name"],
+                    ).lower(),
+                    self.expected_id(
+                        "Microsoft.Compute", "disks",
+                        self.cloud["data_disk_name"],
+                    ).lower(),
+                }
             for resource in resources:
                 try:
                     if not isinstance(resource, dict):
@@ -2108,6 +2294,10 @@ class PersistenceRun:
                     identifier = str(resource.get("id", "")).lower()
                     if not identifier:
                         raise RuntimeError("Resource identity is unavailable")
+                    if identifier in operation_resource_ids:
+                        self.require_operation_tags(
+                            resource, "Persistence deployment resource"
+                        )
                     actual_ids.add(identifier)
                 except BaseException as error:
                     failures.append(("resource ownership", error))
@@ -2155,11 +2345,17 @@ class PersistenceRun:
                 failures.append(("resource envelope", error))
 
         if failures:
-            self.record(
-                "cleanup-failed", cleanup_required=True,
-                cleanup_failures=[name for name, _ in failures],
-            )
-            raise PersistenceCleanupError(failures)
+            cleanup_error = PersistenceCleanupError(failures)
+            try:
+                self.record(
+                    "cleanup-failed", cleanup_required=True,
+                    cleanup_failures=[name for name, _ in failures],
+                )
+            except BaseException as recording:
+                raise PersistenceCleanupError(
+                    failures, recording
+                ) from None
+            raise cleanup_error
         try:
             self.record("deleting-group")
             self.az([
@@ -2173,14 +2369,19 @@ class PersistenceRun:
                 "--name", self.cloud["resource_group"],
             ], timeout=self.remaining(120, cleanup=True)) is not False:
                 raise RuntimeError("Resource-group deletion did not complete")
+            self.ensure_deadline(cleanup=True)
         except BaseException as error:
-            self.record(
-                "cleanup-failed", cleanup_required=True,
-                cleanup_failures=["resource-group deletion"],
-            )
-            raise PersistenceCleanupError([
-                ("resource-group deletion", error)
-            ]) from None
+            failures = [("resource-group deletion", error)]
+            try:
+                self.record(
+                    "cleanup-failed", cleanup_required=True,
+                    cleanup_failures=["resource-group deletion"],
+                )
+            except BaseException as recording:
+                raise PersistenceCleanupError(
+                    failures, recording
+                ) from None
+            raise PersistenceCleanupError(failures) from None
         self.record("cleaned", cleanup_required=False)
 
 
@@ -2277,8 +2478,40 @@ def finalize_cleaned_acceptance(run):
     return receipt
 
 
+def combined_recording_error(errors, private_values):
+    present = [error for error in errors if error is not None]
+    if not present:
+        return None
+    return RuntimeError(
+        "; ".join(
+            azure.safe_failure_message(error, private_values)
+            for error in present
+        )
+    )
+
+
+def cleanup_recording_failure(error, private_values):
+    recording = getattr(error, "recording_error", None)
+    if recording is None:
+        return error
+    return RuntimeError(
+        azure.safe_failure_message(error, private_values)
+        + "; durable cleanup-failure recording also failed: "
+        + azure.safe_failure_message(recording, private_values)
+    )
+
+
 def run_acceptance(state_directory, subscription, approve_cloud_run,
                    approved_envelope_sha256):
+    with PersistenceStateLock(state_directory):
+        return _run_acceptance_locked(
+            state_directory, subscription, approve_cloud_run,
+            approved_envelope_sha256,
+        )
+
+
+def _run_acceptance_locked(state_directory, subscription, approve_cloud_run,
+                           approved_envelope_sha256):
     state, state_path = load_state(state_directory)
     if state["phase"] != "prepared" or state["cleanup_required"]:
         raise ValueError(
@@ -2345,13 +2578,16 @@ def run_acceptance(state_directory, subscription, approve_cloud_run,
             _accumulated_boot2, boot2 = run.wait_for_boot(2)
             run.record("boot2-accepted", boot2=boot2)
             run.deallocate(2)
+            run.ensure_deadline()
             receipt, receipt_path = save_acceptance_receipt(
                 run, boot1, boot2, "pending"
             )
+            run.ensure_deadline()
             run.record(
                 "acceptance-recorded",
                 acceptance_receipt_sha256=azure.image_sha256(receipt_path),
             )
+            run.ensure_deadline()
     except BaseException as error:
         primary = error
     if run.state.get("cleanup_required"):
@@ -2372,23 +2608,53 @@ def run_acceptance(state_directory, subscription, approve_cloud_run,
                 )
             ),
         }
-        run.record(
-            "failed", cleanup_required=cleanup_error is not None,
-            failure=failure,
-        )
+        recording_error = None
+        try:
+            run.record(
+                "failed", cleanup_required=cleanup_error is not None,
+                failure=failure,
+            )
+        except BaseException as error:
+            recording_error = error
         if cleanup_error is not None:
+            recording_error = combined_recording_error(
+                (
+                    getattr(
+                        cleanup_error, "recording_error", None
+                    ),
+                    recording_error,
+                ),
+                run.private_failure_values(),
+            )
             raise azure.RunCleanupError(
-                primary, cleanup_error,
+                primary, cleanup_error, recording_error,
                 private_values=run.private_failure_values(),
+            ) from None
+        if recording_error is not None:
+            private_values = run.private_failure_values()
+            raise RuntimeError(
+                "Primary run failure: "
+                + azure.safe_failure_message(primary, private_values)
+                + "; durable failure recording also failed: "
+                + azure.safe_failure_message(
+                    recording_error, private_values
+                )
             ) from None
         raise primary
     if cleanup_error is not None:
-        raise cleanup_error
+        raise cleanup_recording_failure(
+            cleanup_error, run.private_failure_values()
+        )
     finalize_cleaned_acceptance(run)
     return receipt_path
 
 
 def cleanup_state(state_directory, subscription):
+    with PersistenceStateLock(state_directory):
+        return _cleanup_state_locked(state_directory, subscription)
+
+
+def _cleanup_state_locked(state_directory, subscription):
     state, state_path = load_state(state_directory)
     if (
         azure.validate_subscription_id(subscription)
@@ -2408,7 +2674,12 @@ def cleanup_state(state_directory, subscription):
             )
         return
     run = PersistenceRun(state, state_path)
-    run.cleanup()
+    try:
+        run.cleanup()
+    except PersistenceCleanupError as error:
+        raise cleanup_recording_failure(
+            error, run.private_failure_values()
+        ) from None
     finalize_cleaned_acceptance(run)
 
 

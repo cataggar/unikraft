@@ -572,18 +572,26 @@ python3 support/scripts/hyperv_persistence_controller.py run \
 
 The controller creates one owned group, uploads one OS VHD and one seeded data
 VHD with the existing SDK page uploader, and records each disk `uniqueId`
-directly from its create response. One incremental deployment returns the
-guest VM `vmId`; cleanup may re-read that original deployment output when its
-create response was interrupted, but never enrolls an identity from names,
-tags, ARM IDs, or live-resource UUIDs. Before each boundary it verifies
-reciprocal VM/disk attachment, geometry, LUN, ownership tags and all three
-UUIDs.
+directly from its create response. Immediately before deployment it rereads
+both disks and requires their original UUIDs, exact geometry, ownership and
+unattached readiness. The disks are pre-existing external ARM inputs; the
+template does not rely on a `resourceId()` reference to order their creation.
+The controller durably creates a random operation UUID before the VM call and
+requires that UUID in the returned deployment parameters and every
+template-created resource. Only that create response may establish the
+deployment correlation and guest VM `vmId`. A timeout or lost response leaves
+an unresolved cleanup obligation: a later deployment GET, matching name, tag,
+ARM ID or live-resource UUID can never enroll replacement identities. Before
+each later boundary the controller verifies reciprocal VM/disk attachment,
+geometry, LUN, operation tags and all three UUIDs.
 
 The deployment itself is Boot 1. The controller accepts exactly one ordered V2
 identity, five-write/three-flush/receipt record, Boot 1 completion and normal
 return. It stores the exact serial prefix, deallocates the proven VM, durably
 records `boot_count=2` before the sole `vm start`, and treats that start as Boot
-2. The second serial segment must append to the unchanged Boot 1 prefix and
+2. Deallocated Azure disks may report `Reserved`; only the UUID-anchored,
+reciprocally attached disks in that phase can proceed to the second start.
+The second serial segment must append to the unchanged Boot 1 prefix and
 must contain the same controller GUID, path, target, LUN, VPD, run/disk IDs and
 geometry, a zero-write/zero-flush receipt readback, Boot 2 completion and
 normal return. Any Boot 1/write/reseed marker in the Boot 2 segment fails even
@@ -593,13 +601,17 @@ success.
 Interrupted mutation phases cannot be resumed or re-enrolled; they may only
 enter explicit cleanup, preventing a replacement or third boot. Cleanup gets
 its own deadline, independently verifies and deallocates a proven VM even when
-one disk is unproven, refuses replacement UUIDs or foreign resources, preserves
-both primary and cleanup failures, and deletes the group only when every
-extant resource is an owner-verified member of the fixed envelope. Interrupted
-creation may leave a strict subset, but an extant VM or disk still requires its
-original UUID proof. A successful private receipt binds both serial segments,
-the complete enrolled identity, immutable provenance, the same
-VM/OS-disk/data-disk UUIDs, exact two-boot count and completed cleanup.
+one disk or the VM's attachment graph is unproven, while retaining those
+validation failures and refusing group deletion. Cleanup checks UUID, geometry,
+ownership and attachment independently of transient readiness, so a proven
+pre-upload `ReadyToUpload` disk or a deallocated `Reserved` disk is not
+misclassified. It refuses replacement UUIDs or foreign resources, preserves
+primary, cleanup and durable-recording failures, and deletes the group only
+when every extant resource is an owner-verified member of the fixed envelope.
+Interrupted creation may leave a strict subset, but an extant VM or disk still
+requires its original UUID proof. A successful private receipt binds both
+serial segments, the complete enrolled identity, immutable provenance, the
+same VM/OS-disk/data-disk UUIDs, exact two-boot count and completed cleanup.
 
 Credential-free Python and hosted driver fixtures exercise this state machine
 with synthetic IDs. They do not establish local x86/KVM capability, completion
@@ -617,6 +629,17 @@ python3 support/scripts/hyperv_persistence_controller.py cleanup \
 Its independent deadline never renews the acceptance deadline. If deletion
 completed after the accepted receipt was durably staged, a later cleanup
 invocation finalizes that same receipt rather than starting another boot.
+Cloud operations retain fractional timeout budgets, and their return is
+checked against the relevant deadline before any success phase is persisted.
+
+`run` and `cleanup` hold one owner-only advisory lock file in the state
+directory from the first load through final recording. A concurrent process
+using the same canonical state directory fails before cloud access. This is a
+single-host, single-filesystem guard: copying the prepared directory creates a
+different lock inode, and advisory locks do not coordinate unrelated hosts.
+Operators must therefore never copy, mount independently, or run the same
+prepared identity from multiple hosts; the fixed resource names and cloud
+ownership checks are fail-closed backstops, not a distributed lock.
 
 ## Private nested-KVM platform preflight cleanup
 
