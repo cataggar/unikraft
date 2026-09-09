@@ -1188,6 +1188,7 @@ static int test_attach_and_lifecycle(struct vmbus_device *offered)
 	struct uk_netdev *netdev;
 	struct uk_netdev_info info;
 	const struct uk_hwaddr *address;
+	void *packet_buffer = NULL;
 
 	netvsc_host_reset();
 	mock_reset();
@@ -1203,6 +1204,10 @@ static int test_attach_and_lifecycle(struct vmbus_device *offered)
 	CHECK(netdev->ops->mtu_get(netdev) == 1500);
 	netdev->ops->info_get(netdev, &info);
 	CHECK(info.max_rx_queues == 1 && info.max_tx_queues == 1);
+	CHECK(info.ioalign == sizeof(void *));
+	CHECK(posix_memalign(&packet_buffer, info.ioalign,
+			     MOCK_RX_SLOT_SIZE) == 0);
+	free(packet_buffer);
 	CHECK(info.features == UK_NETDEV_F_RXQ_INTR);
 	CHECK(configure_and_start(&netdev) == 0);
 	CHECK(netdev->ops->promiscuous_set(netdev, 1) == 0);

@@ -2669,7 +2669,7 @@ static void netvsc_info_get(struct uk_netdev *netdev,
 	info->max_mtu = device->max_mtu;
 	info->nb_encap_tx = 0;
 	info->nb_encap_rx = 0;
-	info->ioalign = 1;
+	info->ioalign = sizeof(void *);
 	info->features = UK_NETDEV_F_RXQ_INTR;
 }
 
