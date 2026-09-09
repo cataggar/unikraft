@@ -107,6 +107,82 @@ REMOTE_ROLES = PUBLIC_ROLES + PRIVATE_ROLES
 LOCAL_ROLES = ("efi",)
 ALL_ROLES = REMOTE_ROLES + LOCAL_ROLES
 BOOT_POLICIES = ("platform-unavailable-v1", "platform-main-zero-v1")
+APPROVED_CAPABILITY_REFERENCE = {
+    "name": CAPABILITY_REFERENCE,
+    "sha256": (
+        "eeff27fe4cd755cd46905860b0cd1663e6234cc67b9b8a55ce7c357cc5c03ec9"
+    ),
+    "size": 1325,
+    "receipt": {
+        "schema": CAPABILITY_REFERENCE_SCHEMA,
+        "schema_version": 1,
+        "scope": (
+            "historical nonsecret capability only; "
+            "not current private deployment provenance"
+        ),
+        "source": {
+            "provider": "github-actions",
+            "repository": "cataggar/unikraft",
+            "repository_id": 1356638974,
+            "workflow_ref": (
+                "cataggar/unikraft/.github/workflows/integration.yaml@"
+                "refs/heads/zig16"
+            ),
+            "head_sha": "67ca3cdbc30774b600b18f515c158620caf902c4",
+            "run_id": 34296179269,
+            "run_attempt": 1,
+            "job": "zig-hyperv",
+        },
+        "manifest_sha256": (
+            "6d9224e4f2693815cf7056c389ee57615c38b6dccede73cce85b7b7ab8020735"
+        ),
+        "efi_sha256": (
+            "22195c323579350040adf822f30d7f0d8cb72f80773b52121f5bedbe2391897d"
+        ),
+        "raw": {
+            "sha256": (
+                "e69a9b70b0ed8959b47ec00ac037c065567d44a0aaf02f5077af107e00f67ad1"
+            ),
+            "size": 69206016,
+        },
+        "source_vhd": {
+            "sha256": (
+                "54960c639e80471d3b111a608f913cfea4f5b91bf0e4fc09df84061a2064d460"
+            ),
+            "size": 69206528,
+        },
+        "source_boot_evidence": {
+            "boots": {
+                "raw": {
+                    "legacy-apic": {
+                        "apic_path": "legacy-xapic",
+                        "io_ready": False,
+                        "platform_ready": True,
+                    },
+                    "x2apic": {
+                        "apic_path": "x2apic",
+                        "io_ready": False,
+                        "platform_ready": True,
+                    },
+                },
+                "vhd": {
+                    "legacy-apic": {
+                        "apic_path": "legacy-xapic",
+                        "io_ready": False,
+                        "platform_ready": True,
+                    },
+                    "x2apic": {
+                        "apic_path": "x2apic",
+                        "io_ready": False,
+                        "platform_ready": True,
+                    },
+                },
+            },
+            "platform_marker": host_runner.PLATFORM_MARKER,
+            "scope": "platform-only",
+        },
+    },
+}
 BUILD_TOOL_NAMES = (
     "zig", "make", "python", "bison", "flex", "m4",
     "llvm-nm", "llvm-objcopy", "llvm-objdump", "llvm-readelf",
@@ -735,7 +811,7 @@ def validate_capability_reference(value, capability_raw):
                 raise ValueError(
                     "Public capability boot outcome is invalid"
                 )
-    return {
+    validated = {
         **value,
         "receipt": {
             **receipt,
@@ -754,6 +830,11 @@ def validate_capability_reference(value, capability_raw):
             },
         },
     }
+    if validated != APPROVED_CAPABILITY_REFERENCE:
+        raise ValueError(
+            "Public capability reference is not the reviewed known-good source"
+        )
+    return validated
 
 
 def validate_private_build(value, provenance, efi):
@@ -2003,6 +2084,36 @@ class PrivatePreflightRun(azure.AzureRun):
             "disposable": "true",
             "private-manifest-sha256": state["manifest_sha256"],
         })
+
+    def private_failure_values(self):
+        values = {
+            str(self.state_path),
+            str(self.state_path.parent),
+            self.prefix,
+            self.group,
+            self.host_vm,
+            self.host_disk,
+            self.host_nic,
+            self.storage,
+            self.state.get("identity"),
+            self.state.get("subscription"),
+            self.state.get("resource_group_id"),
+        }
+        firewall = self.state.get("firewall_obligation")
+        if isinstance(firewall, dict):
+            values.add(firewall.get("cidr"))
+        deployment = self.state.get("host_deployment")
+        if isinstance(deployment, dict):
+            values.update(
+                value for value in deployment.values()
+                if isinstance(value, str)
+            )
+        for name in self.state.get("pending_secret_files", ()):
+            values.add(name)
+            values.add(str(self.state_path.parent / name))
+        return tuple(
+            value for value in values if isinstance(value, str) and value
+        )
 
     def account_bytes(self, category, amount):
         if type(amount) is not int or amount < 0:
@@ -3619,6 +3730,19 @@ def record_private_failure(run, error, phase):
     })
 
 
+def record_private_failure_or_raise(run, error, phase):
+    try:
+        record_private_failure(run, error, phase)
+    except BaseException as recording:
+        private_values = run.private_failure_values()
+        raise RuntimeError(
+            "Primary run failure: "
+            + azure.safe_failure_message(error, private_values)
+            + "; durable failure recording also failed: "
+            + azure.safe_failure_message(recording, private_values)
+        ) from None
+
+
 def run_preflight(
     state_directory, subscription, transfer_ip, approve_transfer_source_ip
 ):
@@ -3788,16 +3912,20 @@ def run_preflight(
             run.record(
                 "accepted", final_receipt_sha256=azure.image_sha256(final_path)
             )
-    except BaseException as error:
-        record_private_failure(run, error, state.get("phase", "unknown"))
-        raise
-    finally:
+    except BaseException as primary:
+        primary_phase = state.get("phase", "unknown")
         if state.get("cleanup_required"):
-            try:
-                run.cleanup()
-            except BaseException as error:
-                record_private_failure(run, error, "cleanup")
-                raise
+            azure.cleanup_after_primary_failure(run, primary)
+        record_private_failure_or_raise(run, primary, primary_phase)
+        raise
+    if state.get("cleanup_required"):
+        try:
+            run.cleanup()
+        except BaseException as cleanup_error:
+            record_private_failure_or_raise(
+                run, cleanup_error, "cleanup"
+            )
+            raise
     final["cleanup"] = "complete"
     azure.save_durable_json(state_path.parent / "private-receipt.json", final)
     run.record(

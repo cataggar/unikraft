@@ -43,7 +43,17 @@ def packaging_contract(efi_sha256, efi_size, file_size):
     return value
 
 
-def capability_reference(capability):
+def capability_reference(capability, approved=True):
+    if approved:
+        value = json.loads(json.dumps(
+            preflight.APPROVED_CAPABILITY_REFERENCE
+        ))
+        if value["receipt"]["raw"] != {
+            "sha256": capability["sha256"],
+            "size": capability["size"],
+        }:
+            raise ValueError("Fixture capability differs from approved source")
+        return value
     receipt = {
         "schema": preflight.CAPABILITY_REFERENCE_SCHEMA,
         "schema_version": 1,
@@ -192,6 +202,11 @@ class PrivatePreflightFixture(unittest.TestCase):
             }
             for index, role in enumerate(preflight.ALL_ROLES)
         }
+        files["capability_raw"]["sha256"] = (
+            preflight.APPROVED_CAPABILITY_REFERENCE["receipt"]["raw"][
+                "sha256"
+            ]
+        )
         qemu_support = [{
             "path": "qemu/share/qemu/firmware.json",
             "sha256": "9" * 64,
@@ -441,6 +456,60 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             manifest["files"]["efi"]["sha256"],
         )
 
+    def test_capability_reference_is_exact_reviewed_historical_source(self):
+        approved = preflight.validate_input_manifest(self.manifest())
+        self.assertEqual(
+            approved["capability_reference"],
+            preflight.APPROVED_CAPABILITY_REFERENCE,
+        )
+        mutations = {
+            "fork": lambda value: (
+                value["capability_reference"]["receipt"]["source"].__setitem__(
+                    "repository", "attacker/unikraft"
+                ),
+                value["capability_reference"]["receipt"]["source"].__setitem__(
+                    "workflow_ref",
+                    "attacker/unikraft/.github/workflows/"
+                    "integration.yaml@refs/heads/zig16",
+                ),
+            ),
+            "commit": lambda value: value["capability_reference"]["receipt"][
+                "source"
+            ].__setitem__("head_sha", "9" * 40),
+            "run": lambda value: value["capability_reference"]["receipt"][
+                "source"
+            ].__setitem__("run_id", 999999),
+            "manifest": lambda value: value["capability_reference"][
+                "receipt"
+            ].__setitem__("manifest_sha256", "9" * 64),
+            "efi": lambda value: value["capability_reference"][
+                "receipt"
+            ].__setitem__("efi_sha256", "9" * 64),
+            "vhd": lambda value: value["capability_reference"]["receipt"][
+                "source_vhd"
+            ].__setitem__("sha256", "9" * 64),
+            "receipt-file": lambda value: value[
+                "capability_reference"
+            ].__setitem__("sha256", "9" * 64),
+        }
+        for description, mutate in mutations.items():
+            value = self.manifest()
+            mutate(value)
+            with self.subTest(description=description):
+                with self.assertRaisesRegex(
+                    ValueError, "reviewed known-good source"
+                ):
+                    preflight.validate_input_manifest(value)
+        changed_raw = self.manifest()
+        changed_raw["files"]["capability_raw"]["sha256"] = "9" * 64
+        changed_raw["capability_reference"]["receipt"]["raw"][
+            "sha256"
+        ] = "9" * 64
+        with self.assertRaisesRegex(
+            ValueError, "reviewed known-good source"
+        ):
+            preflight.validate_input_manifest(changed_raw)
+
     def test_manifest_rejects_bool_unknown_oversize_and_nonplatform_workload(self):
         variants = []
         unknown = self.manifest()
@@ -648,11 +717,15 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             capability = capability_reference({
                 "sha256": hashlib.sha256(b"c" * 1024).hexdigest(),
                 "size": 1024,
-            })
+            }, approved=False)
             capability_path = root / preflight.CAPABILITY_REFERENCE
             capability_path.write_bytes(
                 preflight.azure.canonical_json(capability["receipt"])
             )
+            capability["sha256"] = preflight.azure.image_sha256(
+                capability_path
+            )
+            capability["size"] = capability_path.stat().st_size
             build = private_build_receipt(
                 provenance,
                 {
@@ -676,6 +749,8 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 preflight.azure, "VIRTUAL_SIZE", 1024
             ), mock.patch.object(
                 preflight.azure, "miz_command", side_effect=packaging
+            ), mock.patch.object(
+                preflight, "APPROVED_CAPABILITY_REFERENCE", capability
             ):
                 digest = preflight.generate_input(
                     output, repository, config, qemu,
@@ -1995,11 +2070,39 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             self.assertNotIn("/subscriptions/", str(error.exception))
             self.assertTrue(command.call_args.kwargs["private"])
 
+    def test_private_run_failure_values_redact_state_and_resource_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            state["firewall_obligation"] = {
+                "cidr": "8.8.8.8/32", "phase": "active",
+            }
+            state["pending_secret_files"] = [
+                ".run-command-0123456789abcdef.json"
+            ]
+            message = preflight.azure.safe_failure_message(
+                RuntimeError(
+                    f"{run.storage} {run.state_path} "
+                    f"{state['subscription']} "
+                    f"{state['host_deployment']['vm_uuid']} 8.8.8.8/32"
+                ),
+                run.private_failure_values(),
+            )
+            for private in (
+                run.storage, str(run.state_path), state["subscription"],
+                state["host_deployment"]["vm_uuid"], "8.8.8.8/32",
+            ):
+                self.assertNotIn(private, message)
+
 
 class PrivatePreflightOrderingTest(PrivatePreflightFixture):
-    def execute(self, capability_error=None):
+    def execute(
+        self, capability_error=None, cleanup_error=None,
+        recording_error=None,
+    ):
         state = self.state()
         events = []
+        raised_error = None
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_path = root / "state.json"
@@ -2011,6 +2114,11 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             fake.deadline = time.monotonic() + 3600
 
             def record(phase, **fields):
+                if (
+                    phase in ("cleanup-failed", "failed")
+                    and recording_error is not None
+                ):
+                    raise recording_error
                 state.update(phase=phase, **fields)
 
             def account(category, amount):
@@ -2073,7 +2181,19 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             fake.deallocate_host.side_effect = lambda: events.append(
                 "deallocate"
             )
-            fake.cleanup.side_effect = lambda: events.append("cleanup")
+
+            def cleanup():
+                events.append("cleanup")
+                if cleanup_error is not None:
+                    raise cleanup_error
+                state["cleanup_required"] = False
+
+            fake.cleanup.side_effect = cleanup
+            fake.private_failure_values.return_value = (
+                fake.storage, str(root),
+                "/owner/private/state",
+                "11111111-2222-3333-4444-555555555555",
+            )
 
             def upload(_run, _url, sas, _container, files, **_kwargs):
                 events.append(
@@ -2128,18 +2248,24 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
                 preflight.azure, "image_sha256", return_value="e" * 64
             ):
                 if capability_error is not None:
-                    with self.assertRaises(type(capability_error)):
+                    expected = (
+                        preflight.azure.RunCleanupError
+                        if cleanup_error is not None
+                        else type(capability_error)
+                    )
+                    with self.assertRaises(expected) as raised:
                         preflight.run_preflight(
                             root, cloud["subscription"], "8.8.8.8", True
                         )
+                    raised_error = raised.exception
                 else:
                     preflight.run_preflight(
                         root, cloud["subscription"], "8.8.8.8", True
                     )
-        return events, state
+        return events, state, raised_error
 
     def test_capability_pass_precedes_any_private_upload(self):
-        events, state = self.execute()
+        events, state, _ = self.execute()
         self.assertLess(
             events.index("retrieve-capability"),
             events.index("upload-private"),
@@ -2154,9 +2280,70 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             InterruptedError("cancelled"),
         ):
             with self.subTest(error=type(error).__name__):
-                events, _ = self.execute(error)
+                events, _, raised = self.execute(error)
                 self.assertNotIn("upload-private", events)
                 self.assertEqual(events[-1], "cleanup")
+                self.assertIs(raised, error)
+
+    def test_primary_and_cleanup_failures_are_both_sanitized_and_durable(self):
+        private = "11111111-2222-3333-4444-555555555555"
+        primary = RuntimeError(
+            "deployment failed at "
+            "https://ukhvp1234567890abcd.blob.core.windows.net/private "
+            f"/subscriptions/{private}/resourceGroups/private"
+        )
+        cleanup = RuntimeError(
+            "cleanup failed for ukhvp1234567890abcd in /owner/private/state"
+        )
+        events, state, raised = self.execute(primary, cleanup)
+        self.assertEqual(events[-1], "cleanup")
+        self.assertIsInstance(raised, preflight.azure.RunCleanupError)
+        self.assertIn("Primary run failure", str(raised))
+        self.assertIn("cleanup also failed", str(raised))
+        self.assertNotIn("ukhvp1234567890abcd", str(raised))
+        self.assertNotIn("/subscriptions/", str(raised))
+        self.assertNotIn("/owner/private/state", str(raised))
+        self.assertEqual(state["phase"], "cleanup-failed")
+        self.assertIn("primary_failure", state)
+        self.assertIn("cleanup_failure", state)
+        self.assertNotIn(
+            "ukhvp1234567890abcd", state["cleanup_failure"]
+        )
+
+    def test_cleanup_recording_failure_reports_all_three_failures(self):
+        primary = RuntimeError("deployment failed /owner/private/state")
+        cleanup = RuntimeError("cleanup failed ukhvp1234567890abcd")
+        recording = RuntimeError(
+            "record failed /owner/private/state ukhvp1234567890abcd"
+        )
+        events, _, raised = self.execute(
+            primary, cleanup, recording
+        )
+        self.assertEqual(events[-1], "cleanup")
+        self.assertIsInstance(raised, preflight.azure.RunCleanupError)
+        message = str(raised)
+        self.assertIn("Primary run failure", message)
+        self.assertIn("cleanup also failed", message)
+        self.assertIn(
+            "durable cleanup-failure recording also failed", message
+        )
+        self.assertNotIn("ukhvp1234567890abcd", message)
+        self.assertNotIn("/owner/private/state", message)
+
+    def test_primary_recording_failure_survives_successful_cleanup(self):
+        primary = RuntimeError("deployment failed /owner/private/state")
+        recording = RuntimeError(
+            "record failed /owner/private/state ukhvp1234567890abcd"
+        )
+        events, _, raised = self.execute(
+            primary, recording_error=recording
+        )
+        self.assertEqual(events[-1], "cleanup")
+        message = str(raised)
+        self.assertIn("Primary run failure", message)
+        self.assertIn("durable failure recording also failed", message)
+        self.assertNotIn("ukhvp1234567890abcd", message)
+        self.assertNotIn("/owner/private/state", message)
 
     def test_cli_error_redacts_ids_secrets_and_paths(self):
         secret = (

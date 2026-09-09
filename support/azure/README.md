@@ -205,9 +205,14 @@ and `private.vhd`. The manifest binds the clean Git `HEAD`, SHA-256 of the raw
 helper, ARM template, requirements file, every installed SDK distribution,
 all inputs, packaging geometry, sizes, and reviewed policy. The separately
 scoped capability receipt binds its historical public source identity and raw
-hash; it is never represented as current private-build provenance. Any tracked
-source, configuration, helper, requirement, SDK file, or prepared-input change
-fails before the first cloud command.
+hash; it is never represented as current private-build provenance. The
+controller pins the exact reviewed repository/workflow/job/run/attempt/commit,
+receipt-file digest, source manifest, EFI, raw image, fixed VHD, and four
+platform-only boot outcomes. A structurally valid fork, different run, or
+operator-provided replacement receipt is rejected. Updating that historical
+capability requires an explicit reviewed source change. Any tracked source,
+configuration, helper, requirement, SDK file, or prepared-input change fails
+before the first cloud command.
 
 `private.efi`, copied `miz`, source/config metadata, and controller files stay
 local. Only the capability raw, private raw/fixed VHD, QEMU closure, and OVMF
@@ -330,7 +335,11 @@ structurally below that already proven VM; the exact pre-private resource
 inventory still rejects unexpected extension software. There is no
 keep-resources mode. Control-plane or
 ownership failures are reported as cleanup failures rather than claimed as
-successful deletion. The final private receipt binds the exact inputs, tools,
+successful deletion. If both the primary operation and cleanup fail, the
+durable state and raised error retain both sanitized failures; failure to write
+that combined record is also reported without exposing subscription, storage,
+endpoint, identifier, or local private-state values. The final private receipt
+binds the exact inputs, tools,
 host identity, four boot outcomes, and cleanup obligations; live nested-KVM
 success still requires the operator-run attempt.
 
