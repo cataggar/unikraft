@@ -1587,6 +1587,13 @@ static void retained_counted_request_done(
 	retained_request_done(request, NULL);
 }
 
+static void retained_then_counted_request_done(
+	struct uk_blkreq *request, void *cookie)
+{
+	retained_request_done(request, NULL);
+	request_done(request, cookie);
+}
+
 struct fire_channel_context {
 	struct vmbus_channel *channel;
 };
@@ -1599,12 +1606,17 @@ static void *fire_channel_thread(void *argument)
 	return NULL;
 }
 
-static void release_retained_callback_thread(pthread_t thread)
+static void release_retained_callback(void)
 {
 	pthread_mutex_lock(&race_lock);
 	retained_callback_release = 1;
 	pthread_cond_broadcast(&race_condition);
 	pthread_mutex_unlock(&race_lock);
+}
+
+static void release_retained_callback_thread(pthread_t thread)
+{
+	release_retained_callback();
 	pthread_join(thread, NULL);
 }
 
@@ -1622,11 +1634,15 @@ static void queue_event(struct uk_blkdev *device, uint16_t queue_id,
 		abort();
 }
 
-static int wait_finished(struct uk_blkreq *request, unsigned int limit_ms)
+static int wait_request_completion(struct uk_blkreq *request,
+				   atomic_int *callbacks,
+				   int expected_callbacks,
+				   unsigned int limit_ms)
 {
 	for (unsigned int i = 0; i < limit_ms; i++) {
 		if (atomic_load(&request->state.counter) ==
-		    UK_BLKREQ_FINISHED)
+			    UK_BLKREQ_FINISHED &&
+		    atomic_load(callbacks) == expected_callbacks)
 			return 0;
 		uk_sched_thread_sleep(1000000ULL);
 	}
@@ -4056,7 +4072,7 @@ static int run_guarded_io_regression(
 	      UK_BLKDEV_STATUS_SUCCESS))
 		return 520;
 	storvsc_host_force_timeout();
-	if (wait_finished(&request, 1000) ||
+	if (wait_request_completion(&request, &callbacks, 8, 1000) ||
 	    request.result != -ETIMEDOUT)
 		return 521;
 	enqueue_completion(last_io_id, 64, 0, 1, 0, 0);
@@ -4132,14 +4148,43 @@ static int run_guarded_io_regression(
 			return 530;
 		hold_io = 1;
 		pending_count = 0;
+		pthread_mutex_lock(&race_lock);
+		retained_callback_entered = 0;
+		retained_callback_release = 0;
+		retained_callback_count = 0;
+		pthread_mutex_unlock(&race_lock);
 		initialize_request(&request, UK_BLKREQ_WRITE, 4, 1, buffer,
-				   request_done, &callbacks);
+				   retained_then_counted_request_done,
+				   &callbacks);
 		if (!(device->submit_one(device, device->_queue[0], &request) &
 		      UK_BLKDEV_STATUS_SUCCESS) ||
 		    pending_count != 1)
 			return 531;
 		enqueue_enumerate_bus(enumerate_channel);
 		fire_channel_on(enumerate_channel);
+		rc = wait_race_flag(&retained_callback_entered);
+		if (rc ||
+		    request.result != -ESTALE ||
+		    atomic_load(&request.state.counter) !=
+			    UK_BLKREQ_FINISHED ||
+		    atomic_load(&callbacks) != (int)callbacks_before ||
+		    storvsc_host_request_bound(&request)) {
+			fprintf(stderr,
+				"guarded I/O completion failed: "
+				"fullrc=533 branch=held wait_rc=%d "
+				"state=%u result=%d callbacks=%d "
+				"expected=%u retained=%d bound=%d\n",
+				rc,
+				atomic_load(&request.state.counter),
+				request.result, atomic_load(&callbacks),
+				callbacks_before, retained_callback_count,
+				storvsc_host_request_bound(&request));
+			release_retained_callback();
+			(void)wait_request_completion(
+				&request, &callbacks,
+				(int)callbacks_before + 1, 1000);
+			return 533;
+		}
 		sends = io_command_count;
 		initialize_request(&request2, UK_BLKREQ_READ, 5, 1,
 				   buffer + 512, request_done, &callbacks);
@@ -4147,16 +4192,41 @@ static int run_guarded_io_regression(
 			    -ESTALE ||
 		    device->submit_one(device, device->_queue[0],
 				       &request2) != -ENODEV ||
-		    io_command_count != sends)
+		    io_command_count != sends) {
+			release_retained_callback();
+			(void)wait_request_completion(
+				&request, &callbacks,
+				(int)callbacks_before + 1, 1000);
 			return 532;
+		}
 		enqueue_completion_on(
 			enumerate_channel, pending[0].id, 64, 0, 1, 0,
 			pending[0].length);
-		if (wait_finished(&request, 1000) ||
+		release_retained_callback();
+		rc = wait_request_completion(
+			&request, &callbacks, (int)callbacks_before + 1,
+			1000);
+		if (rc ||
 		    request.result != -ESTALE ||
 		    atomic_load(&callbacks) !=
-			    (int)callbacks_before + 1)
+			    (int)callbacks_before + 1 ||
+		    atomic_load(&request.state.counter) !=
+			    UK_BLKREQ_FINISHED ||
+		    retained_callback_count != 1 ||
+		    storvsc_host_request_bound(&request)) {
+			fprintf(stderr,
+				"guarded I/O completion failed: "
+				"fullrc=533 branch=delivered wait_rc=%d "
+				"state=%u result=%d callbacks=%d "
+				"expected=%u retained=%d bound=%d\n",
+				rc,
+				atomic_load(&request.state.counter),
+				request.result, atomic_load(&callbacks),
+				callbacks_before + 1,
+				retained_callback_count,
+				storvsc_host_request_bound(&request));
 			return 533;
+		}
 		fire_channel_on(enumerate_channel);
 		if (atomic_load(&callbacks) !=
 		    (int)callbacks_before + 1)
@@ -5604,7 +5674,8 @@ static int storvsc_production_test(void)
 	if (!(device->submit_one(device, device->_queue[0], &request) &
 	      UK_BLKDEV_STATUS_SUCCESS))
 		return 20;
-	if (wait_finished(&request, 1000) || request.result != -ETIMEDOUT)
+	if (wait_request_completion(&request, &callbacks, 10, 1000) ||
+	    request.result != -ETIMEDOUT)
 		return 21;
 	enqueue_completion(last_io_id, 64, 0, 1, 0, last_io_length);
 	pending_count = 0;
