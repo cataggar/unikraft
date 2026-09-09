@@ -496,12 +496,13 @@ workload's low-LBA command selection and does not require a disk larger than
 2 TiB. Azure billing/allocation tiers do not replace the exact guest-visible
 SCSI capacity and Azure-reported `diskSizeBytes` checks.
 
-The approved first persistence envelope is exactly North Europe,
+For example, a bounded persistence envelope uses North Europe,
 `Standard_D2s_v5` with two vCPUs, one `StandardSSD_LRS` boot disk, and one
 4 GiB (`8388608` 512-byte sectors) `StandardSSD_LRS` data disk. It retains the
 fixed one-VM/two-disk topology, no public IP or SSH, one deployment boot and
-one restart only. This expressible contract does not authorize allocation
-before the completed consumer, exact-image, and publication gates have passed.
+one restart only. This example does not authorize allocation: the operator
+must separately authorize the resource budget, and the completed-consumer,
+exact-image, and publication gates must pass.
 
 A build or packaging receipt, local ARM-hosted fixture, receipt file by itself,
 or prepared private-preflight state is not this handoff. The controller imports

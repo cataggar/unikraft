@@ -699,6 +699,7 @@ jobs:
           ovmf \
           patch \
           python3 \
+          python3-venv \
           tar \
           unzip \
           wget \
@@ -774,6 +775,17 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=${root}/zig-global-cache"
           echo 'MAKEFLAGS=-j2'
         } >> "${GITHUB_ENV}"
+
+    - name: Install pinned Hyper-V controller dependencies
+      run: |
+        set -euo pipefail
+        venv="${RUNNER_TEMP}/hyperv-ci/python"
+        python3 -m venv "${venv}"
+        "${venv}/bin/python" -m pip install \
+          --disable-pip-version-check -r support/azure/requirements.txt
+        PYTHONPATH=support/scripts "${venv}/bin/python" -c \
+          'import hyperv_private_preflight as p; p.sdk_dependency_contract()'
+        echo "${venv}/bin" >> "${GITHUB_PATH}"
 
     - name: Build pinned miz EFI application tooling
       run: |

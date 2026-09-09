@@ -5,6 +5,7 @@ import contextlib
 import errno
 import hashlib
 import importlib
+from importlib.metadata import PackageNotFoundError, version
 import io
 import json
 import os
@@ -2196,6 +2197,40 @@ class HypervWorkflowTest(unittest.TestCase):
             ["bash", "-n"], input=script, text=True, check=True, timeout=10
         )
 
+    def test_hyperv_regressions_require_the_pinned_sdk(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        job = workflow.split("  zig-hyperv:\n", 1)[1]
+        step = "    - name: Install pinned Hyper-V controller dependencies\n"
+        self.assertLess(
+            job.index("    - name: Configure bounded local tool directories\n"),
+            job.index(step),
+        )
+        self.assertLess(
+            job.index(step),
+            job.index("    - name: Run focused Hyper-V regressions\n"),
+        )
+        self.assertIn("          python3-venv \\\n", job)
+        body = job.split(step + "      run: |\n", 1)[1]
+        lines = body.split("\n    - ", 1)[0].splitlines()
+        self.assertTrue(all(not line or line.startswith(" " * 8)
+                            for line in lines))
+        script = "\n".join(line[8:] for line in lines)
+        for required in (
+            'venv="${RUNNER_TEMP}/hyperv-ci/python"',
+            'python3 -m venv "${venv}"',
+            '"${venv}/bin/python" -m pip install',
+            "-r support/azure/requirements.txt",
+            'PYTHONPATH=support/scripts "${venv}/bin/python" -c',
+            "p.sdk_dependency_contract()",
+            'echo "${venv}/bin" >> "${GITHUB_PATH}"',
+        ):
+            self.assertIn(required, script)
+        subprocess.run(
+            ["bash", "-n"], input=script, text=True, check=True, timeout=10
+        )
+
 
 class HypervAzureNetworkReservationTest(unittest.TestCase):
     def reservation(self):
@@ -4106,6 +4141,11 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             preflight_tests.PrivatePreflightCompletedReceiptTest()
         )
         private = persistence.private_preflight
+        try:
+            version("azure-storage-blob")
+        except PackageNotFoundError:
+            self.skipTest("azure-storage-blob is not installed in this runner")
+        private.implementation_contract()
         assets = self.root / "real-private-preflight"
         assets.mkdir(mode=0o700)
         config = assets / private.SOLVED_CONFIG
@@ -4136,10 +4176,6 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         git_runtime = preflight_tests.create_git_runtime(
             assets / "git-tools"
         )
-        try:
-            private.implementation_contract()
-        except RuntimeError as error:
-            self.skipTest(str(error))
         provenance = private.build_provenance(
             SUPPORT.parent, config, git_runtime
         )
@@ -4947,6 +4983,22 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                 inputs=self.paths,
                 preflight_state_directory=self.preflight_state,
             )
+
+    def test_real_handoff_rejects_incompatible_sdk_without_skipping(self):
+        with (
+            mock.patch(
+                __name__ + ".version",
+                return_value=persistence.private_preflight.SDK_VERSION,
+            ),
+            mock.patch.object(
+                persistence.private_preflight,
+                "implementation_contract",
+                side_effect=RuntimeError("Pinned SDK closure is incompatible"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "closure is incompatible"),
+        ):
+            with self.real_completed_preflight():
+                self.fail("An incompatible SDK reached the completed handoff")
 
     def test_real_completed_handoff_and_approved_envelope(self):
         geometry = {
