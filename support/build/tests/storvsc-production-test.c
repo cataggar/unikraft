@@ -1844,6 +1844,19 @@ static int wait_worker_present(int expected, unsigned int limit_ms)
 	return -ETIMEDOUT;
 }
 
+static int wait_primary_removal_quiesced(unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		if (storvsc_host_deferred_action() == TEST_DEFER_NONE &&
+		    !storvsc_host_worker_present() &&
+		    !storvsc_host_controller_online(0) &&
+		    !storvsc_host_has_channel())
+			return 0;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
 static int wait_deferred_close_busy(unsigned int limit_ms)
 {
 	for (unsigned int i = 0; i < limit_ms; i++) {
@@ -3527,15 +3540,64 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	remove_test_offer(driver, primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
+	rc = wait_primary_removal_quiesced(
+		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	if (rc) {
+		fprintf(stderr,
+			"topology partial rediscovery failed: "
+			"branch=quiesce rc=%d deferred=%d worker=%d "
+			"online=%d channel=%d\n",
+			rc, storvsc_host_deferred_action(),
+			storvsc_host_worker_present(),
+			storvsc_host_controller_online(0),
+			storvsc_host_has_channel());
+		return 68;
+	}
 
 	vpd_mode = VPD_MALFORMED_LUN2;
 	primary->present = 1;
-	if (driver->add_dev(primary) || uk_storvsc_mapping_count() != 3 ||
-	    !storvsc_host_blkdev_address(0, 0) ||
-	    storvsc_host_blkdev_address(0, 2))
+	{
+		int before_deferred = storvsc_host_deferred_action();
+		int before_worker = storvsc_host_worker_present();
+		int before_online = storvsc_host_controller_online(0);
+		int before_channel = storvsc_host_has_channel();
+		unsigned int mapping_count;
+		int lun0;
+		int lun2;
+
+		rc = driver->add_dev(primary);
+		mapping_count = uk_storvsc_mapping_count();
+		lun0 = storvsc_host_blkdev_address(0, 0) != NULL;
+		lun2 = storvsc_host_blkdev_address(0, 2) != NULL;
+		if (rc || mapping_count != 3 || !lun0 || lun2) {
+			fprintf(stderr,
+				"topology partial rediscovery failed: "
+				"branch=add rc=%d count=%u lun0=%d lun2=%d "
+				"before={deferred=%d worker=%d online=%d channel=%d} "
+				"after={deferred=%d worker=%d online=%d channel=%d}\n",
+				rc, mapping_count, lun0, lun2,
+				before_deferred, before_worker, before_online,
+				before_channel,
+				storvsc_host_deferred_action(),
+				storvsc_host_worker_present(),
+				storvsc_host_controller_online(0),
+				storvsc_host_has_channel());
+			return 68;
+		}
+	}
+	rc = uk_storvsc_inventory_get(&inventory);
+	if (rc != -EAGAIN) {
+		fprintf(stderr,
+			"topology partial rediscovery failed: "
+			"branch=inventory rc=%d count=%u generation=%" PRIu64
+			" deferred=%d worker=%d online=%d channel=%d\n",
+			rc, inventory.count, inventory.topology_generation,
+			storvsc_host_deferred_action(),
+			storvsc_host_worker_present(),
+			storvsc_host_controller_online(0),
+			storvsc_host_has_channel());
 		return 68;
-	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
-		return 68;
+	}
 	remove_test_offer(driver, primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
