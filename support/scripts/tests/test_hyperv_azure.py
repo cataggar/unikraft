@@ -3914,7 +3914,7 @@ class HypervPersistenceControllerTest(unittest.TestCase):
     def make_inputs(self):
         sectors = 4096
         lun = 7
-        guest_data = b"G" * 4096
+        guest_data = b"G" * (1024 * 1024)
         guest_vhd = self.inputs / persistence.FILE_NAMES["guest_vhd"]
         self.write_fixed_vhd(
             guest_vhd, guest_data,
