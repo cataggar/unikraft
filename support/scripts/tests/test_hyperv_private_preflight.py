@@ -171,13 +171,15 @@ def capability_reference(capability, approved=True):
 def private_build_receipt(provenance, efi, guarded=None):
     receipt = {
         "schema": preflight.PRIVATE_BUILD_SCHEMA,
-        "schema_version": 2,
+        "schema_version": preflight.PRIVATE_BUILD_SCHEMA_VERSION,
         "result": "PASS",
         "source_before": provenance,
         "source_after": provenance,
         "invocation": {
-            "engine": "zig-native-images-v1",
+            "engine": "zig-native-images-two-pass-v1",
+            "passes": 2,
             "jobs": 2,
+            "materialization_returncode": 0,
             "app": "support/apps/hyperv-acceptance",
             "profile": "hyperv-x86_64-efi-netvsc",
             "compiler_target": "x86_64-freestanding-none",
@@ -1230,7 +1232,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 validated["receipt"]["source_after"],
             )
             self.assertEqual(invoked.read_text(), str(zig.absolute()))
-            self.assertIn("-j1", invoked_args.read_text().splitlines())
+            self.assertIn("-j2", invoked_args.read_text().splitlines())
             self.assertIn(
                 f"exec {zig.absolute()} \"$@\"",
                 (output / ".tool-bin" / "zig").read_text(),

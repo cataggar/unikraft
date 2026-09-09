@@ -57,6 +57,7 @@ PRIVATE_BUILD_RECEIPT = "private-build-receipt.json"
 NATIVE_EFI_NAME = "helloworld_hyperv-x86_64-efi-netvsc"
 CAPABILITY_REFERENCE_SCHEMA = "unikraft.hyperv.capability-reference"
 PRIVATE_BUILD_SCHEMA = "unikraft.hyperv.private-local-build"
+PRIVATE_BUILD_SCHEMA_VERSION = 3
 STATE_FILE = "state.json"
 LOCATION = "northeurope"
 VM_SIZE = "Standard_D2s_v5"
@@ -1197,7 +1198,7 @@ def validate_private_build(value, provenance, efi, expected_guarded=None):
     if (
         receipt["schema"] != PRIVATE_BUILD_SCHEMA
         or type(receipt["schema_version"]) is not int
-        or receipt["schema_version"] != 2
+        or receipt["schema_version"] != PRIVATE_BUILD_SCHEMA_VERSION
         or receipt["result"] != "PASS"
         or before != provenance
         or after != provenance
@@ -1219,19 +1220,29 @@ def validate_private_build(value, provenance, efi, expected_guarded=None):
     invocation = exact_fields(
         receipt["invocation"],
         (
-            "engine", "jobs", "app", "profile", "compiler_target",
-            "output",
+            "engine", "passes", "jobs", "materialization_returncode",
+            "app", "profile", "compiler_target", "output",
         ),
         "Private local build invocation",
     )
-    if invocation != {
-        "engine": "zig-native-images-v1",
+    expected_invocation = {
+        "engine": "zig-native-images-two-pass-v1",
+        "passes": 2,
         "jobs": 2,
         "app": "support/apps/hyperv-acceptance",
         "profile": "hyperv-x86_64-efi-netvsc",
         "compiler_target": "x86_64-freestanding-none",
         "output": NATIVE_EFI_NAME,
-    }:
+    }
+    materialization_returncode = invocation["materialization_returncode"]
+    if (
+        type(materialization_returncode) is not int
+        or not -255 <= materialization_returncode <= 255
+        or {
+            key: value for key, value in invocation.items()
+            if key != "materialization_returncode"
+        } != expected_invocation
+    ):
         raise ValueError("Private local build invocation is incompatible")
     tools = exact_fields(
         receipt["tools"], BUILD_TOOL_NAMES, "Private local build tools"
@@ -1428,7 +1439,7 @@ def build_private_image(
         )
     zig = str(zig_invocation)
     command = [
-        zig, "build", "native-images", "-j1",
+        zig, "build", "native-images", "-j2",
         "-Dapp=" + str(SUPPORT / "apps" / "hyperv-acceptance"),
         "-Dconfig=" + str(config),
         "-Doutput=" + str(build_output),
@@ -1463,46 +1474,67 @@ def build_private_image(
     log_path = output_directory / "build.log"
     with log_path.open("xb") as log:
         os.chmod(log_path, 0o600)
-        process = subprocess.Popen(
-            command, cwd=repository, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env=environment, start_new_session=True,
-        )
         overflow = threading.Event()
+        written = 0
+        deadline = time.monotonic() + timeout
 
-        def drain_output():
-            written = 0
-            for chunk in iter(lambda: process.stdout.read(64 * 1024), b""):
-                remaining = 8 * 1024 * 1024 - written
-                if remaining > 0:
-                    log.write(chunk[:remaining])
-                    written += min(len(chunk), remaining)
-                if len(chunk) > remaining:
-                    overflow.set()
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+        def run_build_pass(label):
+            nonlocal written
+            log.write(f"=== {label} ===\n".encode())
+            process = subprocess.Popen(
+                command, cwd=repository, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=environment, start_new_session=True,
+            )
 
-        reader = threading.Thread(target=drain_output, daemon=True)
-        reader.start()
-        try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            def drain_output():
+                nonlocal written
+                for chunk in iter(
+                    lambda: process.stdout.read(64 * 1024), b""
+                ):
+                    remaining = 8 * 1024 * 1024 - written
+                    if remaining > 0:
+                        log.write(chunk[:remaining])
+                        written += min(len(chunk), remaining)
+                    if len(chunk) > remaining:
+                        overflow.set()
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+            reader = threading.Thread(target=drain_output, daemon=True)
+            reader.start()
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                returncode = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                reader.join()
+                process.stdout.close()
+                raise RuntimeError(
+                    "Private local native build timed out"
+                ) from None
             reader.join()
             process.stdout.close()
-            raise RuntimeError("Private local native build timed out") from None
-        reader.join()
-        process.stdout.close()
+            if overflow.is_set():
+                raise RuntimeError(
+                    "Private local native build log exceeded 8 MiB"
+                )
+            return returncode
+
+        materialization_returncode = run_build_pass(
+            "native build materialization pass"
+        )
+        returncode = run_build_pass("native build verification pass")
         log.flush()
         os.fsync(log.fileno())
-    if overflow.is_set():
-        raise RuntimeError("Private local native build log exceeded 8 MiB")
     if returncode:
         raise RuntimeError(
             "Private local native build failed; inspect its owner-only log"
@@ -1518,13 +1550,15 @@ def build_private_image(
     )
     receipt = {
         "schema": PRIVATE_BUILD_SCHEMA,
-        "schema_version": 2,
+        "schema_version": PRIVATE_BUILD_SCHEMA_VERSION,
         "result": "PASS",
         "source_before": source_before,
         "source_after": source_after,
         "invocation": {
-            "engine": "zig-native-images-v1",
+            "engine": "zig-native-images-two-pass-v1",
+            "passes": 2,
             "jobs": 2,
+            "materialization_returncode": materialization_returncode,
             "app": "support/apps/hyperv-acceptance",
             "profile": "hyperv-x86_64-efi-netvsc",
             "compiler_target": "x86_64-freestanding-none",
