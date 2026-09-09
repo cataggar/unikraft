@@ -42,7 +42,7 @@ NETWORK_CONTROLLER_PATH = Path(__file__).with_name(
 INPUT_SCHEMA = "unikraft.hyperv.private-preflight-input"
 STATE_SCHEMA = "unikraft.hyperv.private-preflight-state"
 RECEIPT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
-INPUT_SCHEMA_VERSION = 2
+INPUT_SCHEMA_VERSION = 3
 STATE_SCHEMA_VERSION = 2
 RECEIPT_SCHEMA_VERSION = 2
 HOST_PHASE_SCHEMA = host_runner.SCHEMA
@@ -249,9 +249,16 @@ def validate_provenance(value):
 def expected_budget(files, qemu_support):
     remote = sum(files[role]["size"] for role in REMOTE_ROLES)
     remote += sum(record["size"] for record in qemu_support)
-    total = remote + MAX_CONTROL_BYTES + MAX_EVIDENCE_BYTES
+    firmware_working = (
+        files["ovmf_code"]["size"] + files["ovmf_vars"]["size"]
+    )
+    total = (
+        remote + firmware_working
+        + MAX_CONTROL_BYTES + MAX_EVIDENCE_BYTES
+    )
     return {
         "remote_input_bytes": remote,
+        "firmware_working_copy_max_bytes": firmware_working,
         "control_payload_max_bytes": MAX_CONTROL_BYTES,
         "evidence_max_bytes": MAX_EVIDENCE_BYTES,
         "total_max_bytes": total,
@@ -315,7 +322,8 @@ def validate_input_manifest(value):
     budget = exact_fields(
         value["budget"],
         (
-            "remote_input_bytes", "control_payload_max_bytes",
+            "remote_input_bytes", "firmware_working_copy_max_bytes",
+            "control_payload_max_bytes",
             "evidence_max_bytes", "total_max_bytes", "remaining_bytes",
         ),
         "Private-preflight byte budget",
@@ -837,6 +845,9 @@ def load_state(directory):
         > state["input_manifest"]["budget"]["remote_input_bytes"]
         or (
             state["staged_input_bytes"]
+            + state["input_manifest"]["budget"][
+                "firmware_working_copy_max_bytes"
+            ]
             + state["control_payload_bytes"]
             + state["evidence_bytes"]
             > MAX_TOTAL_BYTES
@@ -1273,6 +1284,9 @@ class PrivatePreflightRun(azure.AzureRun):
                 updated if category == "input"
                 else self.state["staged_input_bytes"]
             )
+            + self.state["input_manifest"]["budget"][
+                "firmware_working_copy_max_bytes"
+            ]
             + (
                 updated if category == "control"
                 else self.state["control_payload_bytes"]

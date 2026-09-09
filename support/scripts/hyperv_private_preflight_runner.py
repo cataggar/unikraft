@@ -42,6 +42,24 @@ CPU_FEATURES = (
 LEGACY_APIC_MARKER = "Using legacy xAPIC MMIO"
 PLATFORM_MARKER = "UK_HYPERV_PLATFORM_READY"
 UNAVAILABLE_MARKER = "UK_HYPERV_ACCEPTANCE_UNAVAILABLE:storage+network"
+UNAVAILABLE_RECORDS = (
+    "HYPERV_ACCEPTANCE PLATFORM_READY PASS cpu_count=1 vmbus_offers=0",
+    (
+        "HYPERV_ACCEPTANCE STORAGE_INVENTORY UNAVAILABLE "
+        "devices=0 offers=0 reason=no-storvsc-offer"
+    ),
+    "HYPERV_ACCEPTANCE STORAGE_READ UNAVAILABLE reason=no-device",
+    (
+        "HYPERV_ACCEPTANCE NETWORK_INVENTORY UNAVAILABLE "
+        "devices=0 offers=0 reason=no-netvsc-offer"
+    ),
+    "HYPERV_ACCEPTANCE NETWORK_DHCP_TX UNAVAILABLE reason=no-device",
+    "HYPERV_ACCEPTANCE NETWORK_DHCP_RX UNAVAILABLE reason=no-device",
+    (
+        "HYPERV_ACCEPTANCE FINAL_RESULT UNAVAILABLE "
+        "storage=UNAVAILABLE network=UNAVAILABLE"
+    ),
+)
 LIVE_IO_MARKERS = (
     "UK_HYPERV_BLOCK_READ_OK",
     "UK_HYPERV_NET_DHCP_OFFER",
@@ -428,8 +446,18 @@ def validate_boot_log(text, policy, legacy_apic):
     if int(main[0].group(1)) != expected_return:
         raise RunnerError("unexpected-main-return")
     if policy == "platform-unavailable-v1":
-        unavailable = [line for line in lines if "UNAVAILABLE" in line]
-        if unavailable != [UNAVAILABLE_MARKER]:
+        acceptance = [
+            line for line in lines
+            if line.startswith("HYPERV_ACCEPTANCE ")
+        ]
+        unavailable = [
+            line for line in lines
+            if line.startswith("UK_HYPERV_ACCEPTANCE_")
+        ]
+        if (
+            acceptance != list(UNAVAILABLE_RECORDS)
+            or unavailable != [UNAVAILABLE_MARKER]
+        ):
             raise RunnerError("invalid-unavailable-policy")
         if any("FAIL" in line for line in lines):
             raise RunnerError("unexpected-guest-failure")
@@ -459,6 +487,7 @@ def validate_boot_log(text, policy, legacy_apic):
                 "HYPERV_ACCEPTANCE", "HYPERV_NETWORK_APP",
                 "HYPERV_STORAGE",
             ))
+            and line != UNAVAILABLE_RECORDS[0]
             for line in lines
         )
     ):

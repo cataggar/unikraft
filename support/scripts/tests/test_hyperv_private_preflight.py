@@ -276,6 +276,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         budget = manifest["budget"]
         measured_without_support = (
             207_618_560 + 26_911_032 + 8_388_608
+            + 8_388_608
             + preflight.MAX_CONTROL_BYTES + preflight.MAX_EVIDENCE_BYTES
         )
         self.assertEqual(
@@ -530,8 +531,11 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
             "Hyper-V SynIC:",
             "Powered by",
             "Calling main(",
+            runner.UNAVAILABLE_RECORDS[0],
             runner.PLATFORM_MARKER,
+            *runner.UNAVAILABLE_RECORDS[1:-1],
             runner.UNAVAILABLE_MARKER,
+            runner.UNAVAILABLE_RECORDS[-1],
         ]
         if legacy:
             lines.append(runner.LEGACY_APIC_MARKER)
@@ -565,8 +569,20 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
             "print('Hyper-V SynIC:')",
             "print('Powered by')",
             "print('Calling main(')",
+            *[
+                "print(" + repr(record) + ")"
+                for record in runner.UNAVAILABLE_RECORDS[:1]
+            ],
             f"print('{runner.PLATFORM_MARKER}')",
+            *[
+                "print(" + repr(record) + ")"
+                for record in runner.UNAVAILABLE_RECORDS[1:-1]
+            ],
             f"print('{runner.UNAVAILABLE_MARKER}')",
+            *[
+                "print(" + repr(record) + ")"
+                for record in runner.UNAVAILABLE_RECORDS[-1:]
+            ],
             (
                 f"print('{runner.LEGACY_APIC_MARKER}') "
                 "if 'x2apic=off' in ' '.join(sys.argv) else None"

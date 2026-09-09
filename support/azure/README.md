@@ -146,7 +146,7 @@ Build Unikraft and package the EFI/raw/fixed-VHD files locally with the pinned
 `miz` workflow above. The QEMU closure is an owner-selected directory whose
 executable is exactly `bin/qemu-system-x86_64`; required regular files below
 `lib/` and `share/` are copied and hashed recursively. Symlinks are rejected.
-Generate the canonical schema-2 manifest and owner-only input directory:
+Generate the canonical schema-3 manifest and owner-only input directory:
 
 ```shell
 INPUTS="$PWD/.d/private-preflight-input"
@@ -184,9 +184,13 @@ the first cloud command.
 `private.efi`, copied `miz`, source/config metadata, and controller files stay
 local. Only the capability raw, private raw/fixed VHD, QEMU closure, and OVMF
 files are Blob-staged. The three fixed-size images use 207,618,560 bytes; the
-measured QEMU executable uses 26,911,032 bytes; an 8 MiB OVMF allowance,
-8 MiB cumulative evidence allowance, and 512 KiB cumulative runner/manifest
-control allowance leave 16,604,360 bytes for the remaining QEMU closure.
+measured QEMU executable uses 26,911,032 bytes; the required closure adds
+`share/kvmvapic.bin`, `share/vgabios-stdvga.bin`, and
+`share/efi-virtio.rom`, totaling 209,408 bytes. The exact 4,194,304-byte OVMF
+pair produces one additional 4,194,304-byte peak working copy. Including the
+8,388,608-byte cumulative evidence limit and 524,288-byte cumulative
+runner/manifest control limit, the measured maximum is 252,040,504 bytes,
+leaving 16,394,952 bytes below the 268,435,456-byte limit.
 `generate-input` measures the real closure and refuses a total above
 268,435,456 bytes. Feasibility therefore requires the operator's authenticated
 QEMU/OVMF assets; fixture sizes are not acceptance evidence.
