@@ -4271,6 +4271,280 @@ def retrieve_phase_evidence(run, transfer_cidr, sas, phase, manifest):
     return receipt
 
 
+def _load_completed_host_evidence(
+    state, state_directory, phase, manifest
+):
+    formats = ("capability",) if phase == "capability" else ("raw", "vhd")
+    evidence_directory = state_directory / "evidence" / phase
+    receipt_path = evidence_directory / "receipt.json"
+    receipt_bytes = azure.read_regular_file(
+        receipt_path, MAX_MANIFEST_BYTES,
+        "Completed private host evidence receipt",
+    )
+    logs = {}
+    for image_format in formats:
+        for mode in ("x2apic", "legacy-apic"):
+            name = f"{image_format}-{mode}.log"
+            raw = azure.read_regular_file(
+                evidence_directory / name, host_runner.MAX_LOG_BYTES,
+                "Completed private host boot log",
+            )
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError(
+                    "Completed private host boot log is not UTF-8"
+                ) from None
+            host_runner.validate_boot_log(
+                text,
+                (
+                    "platform-unavailable-v1"
+                    if phase == "capability"
+                    else state["input_manifest"]["boot_policy"]
+                ),
+                mode == "legacy-apic",
+                (
+                    None
+                    if phase == "capability"
+                    else state["input_manifest"]["guarded"]
+                ),
+            )
+            logs[name] = raw
+    receipt = validate_host_receipt(
+        azure.parse_strict_json(
+            receipt_bytes, "Completed private host evidence receipt"
+        ),
+        state, phase, manifest, logs,
+    )
+    digest = hashlib.sha256(receipt_bytes).hexdigest()
+    if digest != require_sha256(
+        state.get(phase + "_receipt_sha256"),
+        "Completed private host evidence receipt",
+    ):
+        raise ValueError("Completed private host evidence receipt is stale")
+    return receipt, digest
+
+
+def load_completed_receipt(state_directory):
+    state, state_path = load_state(state_directory)
+    state_directory = state_path.parent
+    if (
+        state.get("phase") != "complete"
+        or state["cleanup_required"] is not False
+        or state["pending_secret_files"] != []
+        or state.get("firewall_obligation") is not None
+    ):
+        raise ValueError("Private preflight is not completely cleaned")
+    verify_immutable_inputs(state, state_directory)
+    manifest = state["input_manifest"]
+    capability_manifest = host_phase_manifest(state, "capability")
+    capability_manifest_sha256 = hashlib.sha256(
+        azure.canonical_json(capability_manifest)
+    ).hexdigest()
+    if capability_manifest_sha256 != require_sha256(
+        state.get("capability_manifest_sha256"),
+        "Completed capability manifest",
+    ):
+        raise ValueError("Completed capability manifest is stale")
+    private_manifest = host_phase_manifest(
+        state, "private", capability_manifest_sha256
+    )
+    if hashlib.sha256(
+        azure.canonical_json(private_manifest)
+    ).hexdigest() != require_sha256(
+        state.get("private_manifest_sha256"),
+        "Completed private manifest",
+    ):
+        raise ValueError("Completed private manifest is stale")
+    capability_receipt, capability_receipt_sha256 = (
+        _load_completed_host_evidence(
+            state, state_directory, "capability", capability_manifest
+        )
+    )
+    private_receipt, private_receipt_sha256 = _load_completed_host_evidence(
+        state, state_directory, "private", private_manifest
+    )
+    if (
+        capability_receipt["host_boot_id"]
+        != private_receipt["host_boot_id"]
+    ):
+        raise ValueError("Completed private host boot identity changed")
+
+    receipt_path = state_directory / "private-receipt.json"
+    receipt_bytes = azure.read_regular_file(
+        receipt_path, MAX_MANIFEST_BYTES,
+        "Completed private-preflight receipt",
+    )
+    receipt_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
+    if receipt_sha256 != require_sha256(
+        state.get("final_receipt_sha256"),
+        "Completed private-preflight receipt",
+    ):
+        raise ValueError("Completed private-preflight receipt is stale")
+    receipt = exact_fields(
+        azure.parse_strict_json(
+            receipt_bytes, "Completed private-preflight receipt"
+        ),
+        (
+            "schema", "schema_version", "result", "identity",
+            "input_manifest_sha256", "implementation", "provenance",
+            "capability_reference", "private_build", "inputs",
+            "qemu_support", "miz", "packaging", "budget", "host_image",
+            "host", "capability_receipt_sha256",
+            "private_receipt_sha256", "boot_policy",
+            "acceptance_scope", "storage_result", "guarded",
+            "capability_boots", "private_boots", "cleanup",
+        ),
+        "Completed private-preflight receipt",
+    )
+    inputs = exact_fields(
+        receipt["inputs"], ALL_ROLES,
+        "Completed private-preflight inputs",
+    )
+    normalized_inputs = {}
+    for role in ALL_ROLES:
+        record = exact_fields(
+            inputs[role], ("sha256", "size"),
+            "Completed private-preflight input",
+        )
+        expected = manifest["files"][role]
+        normalized = {
+            "sha256": require_sha256(
+                record["sha256"], "Completed private-preflight input"
+            ),
+            "size": record["size"],
+        }
+        if (
+            type(record["size"]) is not int
+            or normalized != {
+                "sha256": expected["sha256"],
+                "size": expected["size"],
+            }
+        ):
+            raise ValueError("Completed private-preflight input is stale")
+        normalized_inputs[role] = normalized
+
+    expected_budget = {
+        **manifest["budget"],
+        "staged_input_bytes": state["staged_input_bytes"],
+        "control_payload_bytes": state["control_payload_bytes"],
+        "evidence_bytes": state["evidence_bytes"],
+    }
+    budget = exact_fields(
+        receipt["budget"], tuple(expected_budget),
+        "Completed private-preflight budget",
+    )
+    if (
+        dict(budget) != expected_budget
+        or state["staged_input_bytes"]
+        != manifest["budget"]["remote_input_bytes"]
+    ):
+        raise ValueError("Completed private-preflight accounting is stale")
+
+    cloud = exact_fields(
+        state.get("cloud_preflight"),
+        ("subscription", "sku", "image"),
+        "Completed private cloud preflight",
+    )
+    image = exact_fields(
+        receipt["host_image"],
+        (
+            "publisher", "offer", "sku", "version", "urn",
+            "architecture", "hyperv_generation",
+        ),
+        "Completed private host image",
+    )
+    if (
+        cloud["subscription"] != state.get("subscription")
+        or not isinstance(cloud["sku"], dict)
+        or dict(image) != cloud["image"]
+        or any(
+            not isinstance(image[field], str) or not image[field]
+            for field in ("publisher", "offer", "sku", "version")
+        )
+        or image["urn"] != (
+            f"{image['publisher']}:{image['offer']}:"
+            f"{image['sku']}:{image['version']}"
+        )
+        or image["architecture"] != "x64"
+        or image["hyperv_generation"] != "V2"
+    ):
+        raise ValueError("Completed private host image is stale")
+
+    deployment = state.get("host_deployment")
+    host = exact_fields(
+        receipt["host"],
+        (
+            "operation_id", "deployment_correlation_id", "vm_uuid",
+            "disk_uuid", "boot_id",
+        ),
+        "Completed private host identity",
+    )
+    if (
+        not isinstance(deployment, dict)
+        or host["operation_id"] != deployment.get("operation_id")
+        or host["deployment_correlation_id"]
+        != deployment.get("correlation_id")
+        or host["vm_uuid"] != deployment.get("vm_uuid")
+        or host["disk_uuid"] != deployment.get("disk_uuid")
+        or host["boot_id"] != private_receipt["host_boot_id"]
+    ):
+        raise ValueError("Completed private host identity is stale")
+    for field in (
+        "operation_id", "deployment_correlation_id", "vm_uuid",
+        "disk_uuid", "boot_id",
+    ):
+        require_uuid(host[field], "Completed private host identity")
+
+    if (
+        receipt["schema"] != RECEIPT_SCHEMA
+        or type(receipt["schema_version"]) is not int
+        or receipt["schema_version"] != RECEIPT_SCHEMA_VERSION
+        or receipt["result"] != "PASS"
+        or receipt["identity"] != state["identity"]
+        or receipt["input_manifest_sha256"] != state["manifest_sha256"]
+        or receipt["implementation"] != manifest["implementation"]
+        or receipt["implementation"] != state["implementation"]
+        or receipt["provenance"] != manifest["provenance"]
+        or receipt["capability_reference"]
+        != manifest["capability_reference"]
+        or receipt["private_build"] != manifest["private_build"]
+        or receipt["qemu_support"] != manifest["qemu_support"]
+        or receipt["miz"] != manifest["miz"]
+        or receipt["packaging"] != manifest["packaging"]
+        or receipt["capability_receipt_sha256"]
+        != capability_receipt_sha256
+        or receipt["private_receipt_sha256"] != private_receipt_sha256
+        or receipt["boot_policy"] != GUARDED_BOOT_POLICY
+        or receipt["boot_policy"] != manifest["boot_policy"]
+        or receipt["acceptance_scope"] != "platform-only"
+        or receipt["storage_result"] != "UNAVAILABLE"
+        or receipt["storage_result"] != private_receipt["storage_result"]
+        or receipt["guarded"] != manifest["guarded"]
+        or receipt["capability_boots"] != capability_receipt["boots"]
+        or receipt["private_boots"] != private_receipt["boots"]
+        or receipt["cleanup"] != "complete"
+    ):
+        raise ValueError("Completed private-preflight receipt is incompatible")
+    return {
+        **receipt,
+        "implementation": manifest["implementation"],
+        "provenance": manifest["provenance"],
+        "capability_reference": manifest["capability_reference"],
+        "private_build": manifest["private_build"],
+        "inputs": normalized_inputs,
+        "qemu_support": manifest["qemu_support"],
+        "miz": manifest["miz"],
+        "packaging": manifest["packaging"],
+        "budget": dict(budget),
+        "host_image": dict(image),
+        "host": dict(host),
+        "guarded": manifest["guarded"],
+        "capability_boots": capability_receipt["boots"],
+        "private_boots": private_receipt["boots"],
+    }, receipt_path
+
+
 def record_private_failure(run, error, phase):
     code = getattr(error, "code", None)
     if not isinstance(code, str) or not re.fullmatch(

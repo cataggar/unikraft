@@ -411,6 +411,16 @@ images remain unsupported. This controller adds no data disk or seed payload
 to the host; real two-boot storage acceptance remains a separately authorized
 workload using the retained V2 seed and exact unchanged image.
 
+Downstream local controllers must import
+`load_completed_receipt(state_directory)` from
+`support/scripts/hyperv_private_preflight.py` rather than accepting a prepared
+input manifest or build receipt. It returns the normalized completed receipt
+and its `private-receipt.json` path only after revalidating immutable inputs,
+all six host boot logs and both host-evidence receipts, exact image/build/source
+and tool bindings, completed cleanup, and the final receipt digest recorded in
+`state.json`. Prepared, partially cleaned, stale, or mismatched state is
+rejected.
+
 Private manifests, SAS values, host identity, serial logs, and receipts remain
 in owner-only local state and authenticated Blob/control-plane parameters.
 Ordinary CLI errors redact identifiers and credentials. The operator needs

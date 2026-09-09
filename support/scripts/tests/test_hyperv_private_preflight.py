@@ -1727,6 +1727,330 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
                 runner.parse_manifest(base64_encode(changed), "private")
 
 
+class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
+    @staticmethod
+    def host_receipt(state, phase, manifest, logs):
+        formats = ("capability",) if phase == "capability" else ("raw", "vhd")
+        return {
+            "schema": runner.EVIDENCE_SCHEMA,
+            "schema_version": 2,
+            "phase": phase,
+            "identity": state["identity"],
+            "result": "PASS",
+            "manifest_sha256": hashlib.sha256(
+                preflight.azure.canonical_json(manifest)
+            ).hexdigest(),
+            "runner_sha256": state["implementation"]["files"]["runner"][
+                "sha256"
+            ],
+            "host_boot_id": "66666666-6666-4666-8666-666666666666",
+            "boot_policy": (
+                "platform-unavailable-v1"
+                if phase == "capability"
+                else preflight.GUARDED_BOOT_POLICY
+            ),
+            "acceptance_scope": "platform-only",
+            "storage_result": (
+                "NOT_EVALUATED" if phase == "capability" else "UNAVAILABLE"
+            ),
+            "boots": {
+                image_format: {
+                    mode: {
+                        "result": "PASS",
+                        "log_sha256": hashlib.sha256(
+                            logs[f"{image_format}-{mode}.log"]
+                        ).hexdigest(),
+                        "return_code": 0,
+                    }
+                    for mode in ("x2apic", "legacy-apic")
+                }
+                for image_format in formats
+            },
+        }
+
+    def completed_handoff(self, root):
+        root.mkdir(mode=0o700)
+        state = self.state(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        state.update({
+            "phase": "complete",
+            "subscription": "11111111-2222-3333-4444-555555555555",
+            "cloud_preflight": {
+                "subscription": "11111111-2222-3333-4444-555555555555",
+                "sku": {},
+                "image": {
+                    "publisher": "Canonical",
+                    "offer": "ubuntu-24_04-lts",
+                    "sku": "server",
+                    "version": "24.04.202609010",
+                    "urn": (
+                        "Canonical:ubuntu-24_04-lts:"
+                        "server:24.04.202609010"
+                    ),
+                    "architecture": "x64",
+                    "hyperv_generation": "V2",
+                },
+            },
+            "deadline_monotonic": time.monotonic() + 3600,
+            "deadline_utc": "2026-09-09T16:00:00Z",
+            "storage_account": "ukhvp1234567890abcd",
+            "firewall_obligation": None,
+            "resource_group_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg"
+            ),
+            "host_deployment": {
+                "phase": "resources-verified",
+                "operation_id": "22222222-2222-4222-8222-222222222222",
+                "deployment_id": (
+                    "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                    "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                    "Microsoft.Resources/deployments/uk-hvp-123456789abc-host"
+                ),
+                "correlation_id": (
+                    "33333333-3333-4333-8333-333333333333"
+                ),
+                "vm_id": (
+                    "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                    "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                    "Microsoft.Compute/virtualMachines/"
+                    "uk-hvp-123456789abc-host"
+                ),
+                "vm_uuid": "44444444-4444-4444-8444-444444444444",
+                "disk_id": (
+                    "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                    "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                    "Microsoft.Compute/disks/"
+                    "uk-hvp-123456789abc-host-os"
+                ),
+                "disk_uuid": "55555555-5555-4555-8555-555555555555",
+                "shutdown_time": "1600",
+            },
+            "staged_input_bytes": state["input_manifest"]["budget"][
+                "remote_input_bytes"
+            ],
+            "pending_secret_files": [],
+            "cleanup_required": False,
+        })
+        capability_manifest = preflight.host_phase_manifest(
+            state, "capability"
+        )
+        capability_manifest_sha256 = hashlib.sha256(
+            preflight.azure.canonical_json(capability_manifest)
+        ).hexdigest()
+        private_manifest = preflight.host_phase_manifest(
+            state, "private", capability_manifest_sha256
+        )
+        state["capability_manifest_sha256"] = capability_manifest_sha256
+        state["private_manifest_sha256"] = hashlib.sha256(
+            preflight.azure.canonical_json(private_manifest)
+        ).hexdigest()
+
+        capability_logs = {
+            f"capability-{mode}.log": (
+                PrivatePreflightRunnerTest.boot_log(
+                    legacy=mode == "legacy-apic"
+                ).encode()
+            )
+            for mode in ("x2apic", "legacy-apic")
+        }
+        private_logs = {
+            f"{image_format}-{mode}.log": (
+                PrivatePreflightRunnerTest.guarded_boot_log(
+                    legacy=mode == "legacy-apic"
+                ).encode()
+            )
+            for image_format in ("raw", "vhd")
+            for mode in ("x2apic", "legacy-apic")
+        }
+        receipts = {}
+        evidence_bytes = 0
+        for phase, manifest, logs in (
+            ("capability", capability_manifest, capability_logs),
+            ("private", private_manifest, private_logs),
+        ):
+            directory = root / "evidence" / phase
+            directory.mkdir(mode=0o700, parents=True)
+            for name, raw in logs.items():
+                preflight.save_private_bytes(directory / name, raw)
+                evidence_bytes += len(raw)
+            receipt = self.host_receipt(state, phase, manifest, logs)
+            receipt_bytes = preflight.azure.canonical_json(receipt)
+            preflight.save_private_bytes(
+                directory / "receipt.json", receipt_bytes
+            )
+            evidence_bytes += len(receipt_bytes)
+            digest = hashlib.sha256(receipt_bytes).hexdigest()
+            state[phase + "_receipt_sha256"] = digest
+            receipts[phase] = receipt
+        state["evidence_bytes"] = evidence_bytes
+
+        manifest = state["input_manifest"]
+        final = {
+            "schema": preflight.RECEIPT_SCHEMA,
+            "schema_version": preflight.RECEIPT_SCHEMA_VERSION,
+            "result": "PASS",
+            "identity": state["identity"],
+            "input_manifest_sha256": state["manifest_sha256"],
+            "implementation": json.loads(json.dumps(state["implementation"])),
+            "provenance": json.loads(json.dumps(manifest["provenance"])),
+            "capability_reference": json.loads(json.dumps(
+                manifest["capability_reference"]
+            )),
+            "private_build": json.loads(json.dumps(
+                manifest["private_build"]
+            )),
+            "inputs": {
+                role: {
+                    "sha256": record["sha256"],
+                    "size": record["size"],
+                }
+                for role, record in manifest["files"].items()
+            },
+            "qemu_support": json.loads(json.dumps(manifest["qemu_support"])),
+            "miz": json.loads(json.dumps(manifest["miz"])),
+            "packaging": json.loads(json.dumps(manifest["packaging"])),
+            "budget": {
+                **manifest["budget"],
+                "staged_input_bytes": state["staged_input_bytes"],
+                "control_payload_bytes": state["control_payload_bytes"],
+                "evidence_bytes": state["evidence_bytes"],
+            },
+            "host_image": json.loads(json.dumps(
+                state["cloud_preflight"]["image"]
+            )),
+            "host": {
+                "operation_id": state["host_deployment"]["operation_id"],
+                "deployment_correlation_id": state["host_deployment"][
+                    "correlation_id"
+                ],
+                "vm_uuid": state["host_deployment"]["vm_uuid"],
+                "disk_uuid": state["host_deployment"]["disk_uuid"],
+                "boot_id": receipts["private"]["host_boot_id"],
+            },
+            "capability_receipt_sha256": state[
+                "capability_receipt_sha256"
+            ],
+            "private_receipt_sha256": state["private_receipt_sha256"],
+            "boot_policy": manifest["boot_policy"],
+            "acceptance_scope": "platform-only",
+            "storage_result": receipts["private"]["storage_result"],
+            "guarded": json.loads(json.dumps(manifest["guarded"])),
+            "capability_boots": json.loads(json.dumps(
+                receipts["capability"]["boots"]
+            )),
+            "private_boots": json.loads(json.dumps(
+                receipts["private"]["boots"]
+            )),
+            "cleanup": "complete",
+        }
+        receipt_path = root / "private-receipt.json"
+        preflight.save_private_bytes(
+            receipt_path, preflight.azure.canonical_json(final)
+        )
+        state["final_receipt_sha256"] = preflight.azure.image_sha256(
+            receipt_path
+        )
+        preflight.azure.save_durable_json(root / preflight.STATE_FILE, state)
+        return state, final, receipt_path
+
+    def test_completed_handoff_loads_only_full_exact_image_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "state"
+            state, final, receipt_path = self.completed_handoff(root)
+            with mock.patch.object(
+                preflight, "verify_immutable_inputs"
+            ) as verify:
+                validated, loaded_path = preflight.load_completed_receipt(
+                    root
+                )
+            verify.assert_called_once()
+            self.assertEqual(loaded_path, receipt_path)
+            self.assertEqual(validated, final)
+            self.assertEqual(
+                validated["inputs"]["vhd"]["sha256"],
+                state["input_manifest"]["files"]["vhd"]["sha256"],
+            )
+            self.assertEqual(
+                validated["private_build"],
+                state["input_manifest"]["private_build"],
+            )
+
+    def test_completed_handoff_rejects_prepared_or_stale_bindings(self):
+        for mutation in ("prepared", "vhd", "build", "cleanup"):
+            with self.subTest(mutation=mutation), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "state"
+                state, final, receipt_path = self.completed_handoff(root)
+                if mutation == "prepared":
+                    state["phase"] = "prepared"
+                elif mutation == "vhd":
+                    final["inputs"]["vhd"]["sha256"] = "f" * 64
+                elif mutation == "build":
+                    final["private_build"]["receipt"]["output"][
+                        "sha256"
+                    ] = "e" * 64
+                else:
+                    final["cleanup"] = "pending"
+                if mutation != "prepared":
+                    receipt_path.unlink()
+                    preflight.save_private_bytes(
+                        receipt_path,
+                        preflight.azure.canonical_json(final),
+                    )
+                    state["final_receipt_sha256"] = (
+                        preflight.azure.image_sha256(receipt_path)
+                    )
+                preflight.azure.save_durable_json(
+                    root / preflight.STATE_FILE, state
+                )
+                with mock.patch.object(
+                    preflight, "verify_immutable_inputs"
+                ):
+                    with self.assertRaises(ValueError):
+                        preflight.load_completed_receipt(root)
+
+    def test_completed_handoff_reparses_private_boot_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "state"
+            state, final, receipt_path = self.completed_handoff(root)
+            log_path = root / "evidence" / "private" / "raw-x2apic.log"
+            log_path.write_bytes(
+                log_path.read_bytes()
+                + b"\nHYPERV_PERSISTENCE WRITE PASS writes=1"
+            )
+            evidence_path = root / "evidence" / "private" / "receipt.json"
+            evidence = json.loads(evidence_path.read_text())
+            evidence["boots"]["raw"]["x2apic"]["log_sha256"] = (
+                preflight.azure.image_sha256(log_path)
+            )
+            evidence_path.unlink()
+            preflight.save_private_bytes(
+                evidence_path, preflight.azure.canonical_json(evidence)
+            )
+            state["private_receipt_sha256"] = (
+                preflight.azure.image_sha256(evidence_path)
+            )
+            final["private_receipt_sha256"] = state[
+                "private_receipt_sha256"
+            ]
+            final["private_boots"] = evidence["boots"]
+            receipt_path.unlink()
+            preflight.save_private_bytes(
+                receipt_path, preflight.azure.canonical_json(final)
+            )
+            state["final_receipt_sha256"] = (
+                preflight.azure.image_sha256(receipt_path)
+            )
+            preflight.azure.save_durable_json(
+                root / preflight.STATE_FILE, state
+            )
+            with mock.patch.object(
+                preflight, "verify_immutable_inputs"
+            ):
+                with self.assertRaises(runner.RunnerError):
+                    preflight.load_completed_receipt(root)
+
+
 class PrivatePreflightBlobTest(PrivatePreflightFixture):
     def test_declared_blob_sdk_is_exact_when_available(self):
         try:
