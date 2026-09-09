@@ -3820,13 +3820,27 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         self.inputs = self.root / "source"
         self.inputs.mkdir(mode=0o700)
         self.state_dir = self.root / "state"
+        self.preflight_state = self.root / "private-preflight"
+        self.preflight_state.mkdir(mode=0o700)
         self.contract, self.paths = self.make_inputs()
+        self.completed_preflight = mock.patch.object(
+            persistence.private_preflight,
+            "load_completed_receipt",
+            return_value=(
+                self.contract["preflight"],
+                self.preflight_state
+                / persistence.FILE_NAMES["preflight_receipt"],
+            ),
+            create=True,
+        )
+        self.completed_preflight.start()
         self.contract_path = self.root / "contract.json"
         self.contract_path.write_bytes(azure.canonical_json(self.contract))
         os.chmod(self.contract_path, 0o600)
         self.contract_sha256 = azure.image_sha256(self.contract_path)
 
     def tearDown(self):
+        self.completed_preflight.stop()
         self.temporary.cleanup()
 
     @staticmethod
@@ -3915,36 +3929,114 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "sha256": azure.image_sha256(guest_vhd),
             "size": guest_vhd.stat().st_size,
         }
+        preflight_inputs = {
+            role: {"sha256": str(index) * 64, "size": 4096}
+            for index, role in enumerate(
+                persistence.PREFLIGHT_INPUT_ROLES, 1
+            )
+        }
+        preflight_inputs["vhd"] = {
+            "sha256": guest_record["sha256"],
+            "size": guest_record["size"],
+        }
+        provenance = {
+            "scheme": "unikraft.git-ls-tree-v1",
+            "head_commit": "a" * 40,
+            "tree_sha256": "b" * 64,
+            "tracked_entries": 100,
+            "config": {
+                "name": "solved.config",
+                "sha256": "c" * 64,
+                "size": 1024,
+            },
+        }
+        guarded = {
+            "schema": "unikraft.hyperv.guarded-v2-pristine-unavailable",
+            "schema_version": 1,
+            "scope": "platform-only",
+            "result": "UNAVAILABLE",
+            "protocol": 1,
+            "identity_policy": 2,
+            "reason": "no-devices",
+            "main_return": 2,
+            "run_id": self.RUN_ID,
+            "disk_id": self.DISK_ID,
+            "path": 0,
+            "target": 0,
+            "lun": lun,
+            "sectors": sectors,
+            "sector_size": 512,
+            "solved_config_sha256": provenance["config"]["sha256"],
+            "producer": {
+                "schema": "unikraft.hyperv.guarded-producer-pin",
+                "schema_version": 2,
+                "files": {"build.zig": "d" * 64},
+            },
+        }
+        boot_outcome = {
+            "result": "PASS", "log_sha256": "e" * 64,
+            "return_code": 0,
+        }
         preflight = {
             "schema": persistence.PREFLIGHT_SCHEMA,
             "schema_version": persistence.PREFLIGHT_VERSION,
             "result": "PASS",
-            "scope": "exact-image-private-x86",
-            "workload": persistence.WORKLOAD,
+            "identity": "f" * 32,
+            "input_manifest_sha256": "1" * 64,
+            "implementation": {"controller": {"sha256": "2" * 64}},
+            "provenance": provenance,
+            "capability_reference": {"revision": "3" * 40},
+            "private_build": {
+                "name": "private-build-receipt.json",
+                "sha256": "4" * 64,
+                "size": 4096,
+                "receipt": {
+                    "schema": "unikraft.hyperv.private-local-build",
+                    "schema_version": 3,
+                    "result": "PASS",
+                    "source_before": provenance,
+                    "source_after": provenance,
+                    "invocation": {},
+                    "tools": {},
+                    "output": preflight_inputs["efi"],
+                    "builder_sha256": "5" * 64,
+                    "guarded": guarded,
+                },
+            },
+            "inputs": preflight_inputs,
+            "qemu_support": {"files": {}},
+            "miz": {"sha256": "6" * 64},
+            "packaging": {"vhd": preflight_inputs["vhd"]},
+            "budget": {"maximum_bytes": 1},
+            "host_image": {"urn": "fixture"},
+            "host": {
+                "operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "deployment_correlation_id": (
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ),
+                "vm_uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "disk_uuid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "boot_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            },
+            "capability_receipt_sha256": "7" * 64,
+            "private_receipt_sha256": "8" * 64,
             "boot_policy": persistence.BOOT_POLICY,
-            "identity_policy_version": 2,
-            "image": {
-                "sha256": guest_record["sha256"],
-                "size": guest_record["size"],
+            "acceptance_scope": "platform-only",
+            "storage_result": "UNAVAILABLE",
+            "guarded": guarded,
+            "capability_boots": {"x2apic": boot_outcome},
+            "private_boots": {
+                image_format: {
+                    "x2apic": dict(boot_outcome),
+                    "legacy-apic": dict(boot_outcome),
+                }
+                for image_format in ("raw", "vhd")
             },
-            "provenance": {
-                "source_tree_sha256": "1" * 64,
-                "solved_config_sha256": "2" * 64,
-                "private_build_receipt_sha256": "3" * 64,
-                "toolchain_sha256": "4" * 64,
-                "input_manifest_sha256": "5" * 64,
-                "preflight_receipt_sha256": "6" * 64,
-            },
-            "private_host": {
-                "vm_uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-                "disk_uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-                "boot_count": 4,
-                "boot_evidence_sha256": "7" * 64,
-                "cleanup": "complete",
-            },
+            "cleanup": "complete",
         }
         preflight_path = (
-            self.inputs / persistence.FILE_NAMES["preflight_receipt"]
+            self.preflight_state
+            / persistence.FILE_NAMES["preflight_receipt"]
         )
         preflight_path.write_text(json.dumps(preflight, indent=2) + "\n")
         os.chmod(preflight_path, 0o600)
@@ -3953,15 +4045,15 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "data_raw": data_raw,
             "data_vhd": data_vhd,
             "seed_manifest": seed_path,
-            "preflight_receipt": preflight_path,
         }
+        all_paths = {**paths, "preflight_receipt": preflight_path}
         records = {
             role: {
                 "name": path.name,
                 "sha256": azure.image_sha256(path),
                 "size": path.stat().st_size,
             }
-            for role, path in paths.items()
+            for role, path in all_paths.items()
         }
         prefix = "uk-hvpersist01"
         contract = {
@@ -4002,7 +4094,7 @@ class HypervPersistenceControllerTest(unittest.TestCase):
     def prepare(self):
         persistence.prepare_state(
             self.contract_path, self.contract_sha256,
-            self.state_dir, self.paths,
+            self.state_dir, self.paths, self.preflight_state,
         )
         return persistence.load_state(self.state_dir)
 
@@ -4337,9 +4429,13 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             runtime_seconds=600,
             cleanup_seconds=600,
             inputs=self.paths,
+            preflight_state_directory=self.preflight_state,
         )
         self.assertEqual(digest, azure.image_sha256(output))
         self.assertEqual(json.loads(output.read_text()), self.contract)
+        persistence.private_preflight.load_completed_receipt.assert_called_with(
+            self.preflight_state
+        )
         with self.assertRaises(FileExistsError):
             persistence.create_contract(
                 output,
@@ -4357,7 +4453,42 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                 runtime_seconds=600,
                 cleanup_seconds=600,
                 inputs=self.paths,
+                preflight_state_directory=self.preflight_state,
             )
+
+    def test_prepared_only_private_state_cannot_create_or_prepare(self):
+        with mock.patch.object(
+            persistence.private_preflight,
+            "load_completed_receipt",
+            side_effect=ValueError(
+                "Private preflight is not completely cleaned"
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "not completely cleaned"):
+                persistence.create_contract(
+                    self.root / "untrusted-contract.json",
+                    run_id=self.RUN_ID,
+                    disk_id=self.DISK_ID,
+                    sectors=4096,
+                    lun=7,
+                    subscription=self.SUBSCRIPTION,
+                    location="northeurope",
+                    vm_size="Standard_B1s",
+                    vm_vcpus=1,
+                    name_prefix="uk-hvpersist01",
+                    os_disk_sku="Standard_LRS",
+                    data_disk_sku="Standard_LRS",
+                    runtime_seconds=600,
+                    cleanup_seconds=600,
+                    inputs=self.paths,
+                    preflight_state_directory=self.preflight_state,
+                )
+            with self.assertRaisesRegex(ValueError, "not completely cleaned"):
+                persistence.prepare_state(
+                    self.contract_path, self.contract_sha256,
+                    self.state_dir, self.paths, self.preflight_state,
+                )
+        self.assertFalse(self.state_dir.exists())
 
     def test_contract_limits_and_build_only_preflight_fail_closed(self):
         variants = []
@@ -4389,31 +4520,35 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                     persistence.validate_contract(contract)
         for field, value in (
             ("result", "PREPARED"),
-            ("scope", "build-package-only"),
+            ("acceptance_scope", "storage"),
             ("boot_policy", "platform-unavailable-v1"),
+            ("storage_result", "PASS"),
+            ("cleanup", "pending"),
         ):
             preflight = copy.deepcopy(self.contract["preflight"])
             preflight[field] = value
             with self.subTest(preflight_field=field):
-                with self.assertRaisesRegex(
-                    ValueError, "incomplete or mismatched"
-                ):
+                with self.assertRaises(ValueError):
                     persistence.validate_preflight_receipt(
-                        preflight, self.contract["files"]["guest_vhd"]
+                        preflight, self.contract["files"]["guest_vhd"],
+                        self.RUN_ID, self.DISK_ID,
+                        self.contract["geometry"],
                     )
         preflight = copy.deepcopy(self.contract["preflight"])
-        preflight["private_host"]["cleanup"] = "pending"
-        with self.assertRaisesRegex(ValueError, "incomplete or mismatched"):
+        preflight["guarded"]["lun"] = 6
+        with self.assertRaises(ValueError):
             persistence.validate_preflight_receipt(
-                preflight, self.contract["files"]["guest_vhd"]
+                preflight, self.contract["files"]["guest_vhd"],
+                self.RUN_ID, self.DISK_ID, self.contract["geometry"],
             )
         preflight = copy.deepcopy(self.contract["preflight"])
-        preflight["private_host"]["disk_uuid"] = (
-            preflight["private_host"]["vm_uuid"]
+        preflight["host"]["disk_uuid"] = (
+            preflight["host"]["vm_uuid"]
         )
-        with self.assertRaisesRegex(ValueError, "incomplete or mismatched"):
+        with self.assertRaises(ValueError):
             persistence.validate_preflight_receipt(
-                preflight, self.contract["files"]["guest_vhd"]
+                preflight, self.contract["files"]["guest_vhd"],
+                self.RUN_ID, self.DISK_ID, self.contract["geometry"],
             )
 
     def test_cloud_is_default_off_and_interrupted_state_cannot_restart(self):

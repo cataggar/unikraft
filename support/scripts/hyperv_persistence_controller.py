@@ -20,6 +20,7 @@ import zlib
 
 
 azure = importlib.import_module("hyperv-azure")
+private_preflight = importlib.import_module("hyperv_private_preflight")
 
 SUPPORT = Path(__file__).resolve().parents[1]
 TEMPLATE = SUPPORT / "azure" / "hyperv-persistence.json"
@@ -29,14 +30,14 @@ REQUIREMENTS = SUPPORT / "azure" / "requirements.txt"
 
 CONTRACT_SCHEMA = "unikraft.hyperv.persistence-two-boot-contract"
 CONTRACT_VERSION = 1
-PREFLIGHT_SCHEMA = "unikraft.hyperv.persistence-exact-image-preflight"
-PREFLIGHT_VERSION = 1
+PREFLIGHT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
+PREFLIGHT_VERSION = 3
 STATE_SCHEMA = "unikraft.hyperv.persistence-two-boot-state"
 STATE_VERSION = 1
 RECEIPT_SCHEMA = "unikraft.hyperv.persistence-two-boot-receipt"
 RECEIPT_VERSION = 1
 WORKLOAD = "guarded-v2-two-boot-persistence"
-BOOT_POLICY = "guarded-v2-pristine-no-devices-v1"
+BOOT_POLICY = "guarded-v2-pristine-unavailable"
 PURPOSE = "guarded-v2-two-boot-persistence"
 MANAGED_BY = "unikraft-hyperv"
 
@@ -64,8 +65,15 @@ FILE_NAMES = {
     "data_raw": "data.raw",
     "data_vhd": "data.vhd",
     "seed_manifest": "seed.json",
-    "preflight_receipt": "exact-image-preflight.json",
+    "preflight_receipt": "private-receipt.json",
 }
+PERSISTENCE_INPUT_ROLES = (
+    "guest_vhd", "data_raw", "data_vhd", "seed_manifest",
+)
+PREFLIGHT_INPUT_ROLES = (
+    "qemu", "ovmf_code", "ovmf_vars", "capability_raw",
+    "raw", "vhd", "efi",
+)
 RESOURCE_COUNTS = {
     "resource_groups": 1,
     "virtual_machines": 1,
@@ -175,6 +183,10 @@ def implementation_contract():
         ("template", TEMPLATE),
         ("shared_controller", SHARED_CONTROLLER),
         ("upload_helper", UPLOAD_HELPER),
+        (
+            "private_preflight",
+            Path(private_preflight.__file__).resolve(),
+        ),
         ("requirements", REQUIREMENTS),
     ):
         value = azure.read_regular_file(
@@ -191,73 +203,209 @@ def implementation_contract():
     }
 
 
-def validate_preflight_receipt(value, guest_vhd):
+def validate_preflight_receipt(
+    value, guest_vhd, run_id, disk_id, geometry,
+):
     value = exact_fields(
         value,
         (
-            "schema", "schema_version", "result", "scope", "workload",
-            "boot_policy", "identity_policy_version", "image",
-            "provenance", "private_host",
+            "schema", "schema_version", "result", "identity",
+            "input_manifest_sha256", "implementation", "provenance",
+            "capability_reference", "private_build", "inputs",
+            "qemu_support", "miz", "packaging", "budget", "host_image",
+            "host", "capability_receipt_sha256",
+            "private_receipt_sha256", "boot_policy",
+            "acceptance_scope", "storage_result", "guarded",
+            "capability_boots", "private_boots", "cleanup",
         ),
-        "Exact-image private preflight receipt",
+        "Completed private-preflight receipt",
     )
-    image = exact_fields(
-        value["image"], ("sha256", "size"), "Preflight image"
+    inputs = exact_fields(
+        value["inputs"], PREFLIGHT_INPUT_ROLES,
+        "Completed private-preflight inputs",
     )
-    provenance = exact_fields(
-        value["provenance"],
+    normalized_inputs = {}
+    for role in PREFLIGHT_INPUT_ROLES:
+        record = exact_fields(
+            inputs[role], ("sha256", "size"),
+            f"Completed private-preflight {role} input",
+        )
+        normalized_inputs[role] = {
+            "sha256": require_hex(
+                record["sha256"], HEX64,
+                f"Completed private-preflight {role} SHA-256",
+            ),
+            "size": require_integer(
+                record["size"], 1, MAX_SECTORS * SECTOR_SIZE + 512,
+                f"Completed private-preflight {role} size",
+            ),
+        }
+    guarded = exact_fields(
+        value["guarded"],
         (
-            "source_tree_sha256", "solved_config_sha256",
-            "private_build_receipt_sha256", "toolchain_sha256",
-            "input_manifest_sha256", "preflight_receipt_sha256",
+            "schema", "schema_version", "scope", "result", "protocol",
+            "identity_policy", "reason", "main_return", "run_id",
+            "disk_id", "path", "target", "lun", "sectors",
+            "sector_size", "solved_config_sha256", "producer",
         ),
-        "Preflight provenance",
+        "Completed guarded V2 contract",
     )
+    producer = exact_fields(
+        guarded["producer"], ("schema", "schema_version", "files"),
+        "Completed guarded producer pin",
+    )
+    if not isinstance(producer["files"], dict) or not producer["files"]:
+        raise ValueError("Completed guarded producer pin is empty")
+    for name, digest in producer["files"].items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or require_hex(
+                digest, HEX64, "Completed guarded producer file"
+            ) != digest
+        ):
+            raise ValueError("Completed guarded producer pin is invalid")
     host = exact_fields(
-        value["private_host"],
+        value["host"],
         (
-            "vm_uuid", "disk_uuid", "boot_count",
-            "boot_evidence_sha256", "cleanup",
+            "operation_id", "deployment_correlation_id", "vm_uuid",
+            "disk_uuid", "boot_id",
         ),
-        "Private preflight host evidence",
+        "Completed private-preflight host",
     )
-    for field in provenance:
-        require_hex(provenance[field], HEX64, f"Preflight {field}")
-    require_hex(image["sha256"], HEX64, "Preflight image SHA-256")
-    require_integer(image["size"], 1, MAX_SECTORS * SECTOR_SIZE + 512,
-                    "Preflight image size")
-    require_uuid(host["vm_uuid"], "Private preflight VM UUID")
-    require_uuid(host["disk_uuid"], "Private preflight disk UUID")
-    require_integer(host["boot_count"], 1, 16, "Private preflight boot count")
+    for field in host:
+        require_uuid(
+            host[field], f"Completed private-preflight host {field}"
+        )
+    private_build = exact_fields(
+        value["private_build"], ("name", "sha256", "size", "receipt"),
+        "Completed private build",
+    )
     require_hex(
-        host["boot_evidence_sha256"], HEX64,
-        "Private preflight boot evidence",
+        private_build["sha256"], HEX64,
+        "Completed private build receipt SHA-256",
     )
+    require_integer(
+        private_build["size"], 1, MAX_JSON_BYTES,
+        "Completed private build receipt size",
+    )
+    build_receipt = exact_fields(
+        private_build["receipt"],
+        (
+            "schema", "schema_version", "result", "source_before",
+            "source_after", "invocation", "tools", "output",
+            "builder_sha256", "guarded",
+        ),
+        "Completed private build receipt",
+    )
+    for field in (
+        "input_manifest_sha256", "capability_receipt_sha256",
+        "private_receipt_sha256",
+    ):
+        require_hex(value[field], HEX64, f"Completed {field}")
+    require_hex(
+        guarded["solved_config_sha256"], HEX64,
+        "Completed guarded solved configuration",
+    )
+    private_boots = exact_fields(
+        value["private_boots"], ("raw", "vhd"),
+        "Completed private boots",
+    )
+    for image_format in ("raw", "vhd"):
+        modes = exact_fields(
+            private_boots[image_format],
+            ("x2apic", "legacy-apic"),
+            "Completed private boot formats",
+        )
+        for mode in modes.values():
+            outcome = exact_fields(
+                mode, ("result", "log_sha256", "return_code"),
+                "Completed private boot outcome",
+            )
+            require_hex(
+                outcome["log_sha256"], HEX64,
+                "Completed private boot log SHA-256",
+            )
+            if outcome["result"] != "PASS" or outcome["return_code"] != 0:
+                raise ValueError("Completed private boot did not pass")
     if (
         value["schema"] != PREFLIGHT_SCHEMA
         or value["schema_version"] != PREFLIGHT_VERSION
         or value["result"] != "PASS"
-        or value["scope"] != "exact-image-private-x86"
-        or value["workload"] != WORKLOAD
         or value["boot_policy"] != BOOT_POLICY
-        or value["identity_policy_version"] != 2
-        or image != {
+        or value["acceptance_scope"] != "platform-only"
+        or value["storage_result"] != "UNAVAILABLE"
+    ):
+        raise ValueError("Completed private x86 preflight is incompatible")
+    if (
+        value["cleanup"] != "complete"
+        or normalized_inputs["vhd"] != {
             "sha256": guest_vhd["sha256"],
             "size": guest_vhd["size"],
         }
-        or host["boot_count"] != 4
-        or host["cleanup"] != "complete"
         or host["vm_uuid"] == host["disk_uuid"]
+        or guarded["schema"]
+        != "unikraft.hyperv.guarded-v2-pristine-unavailable"
+        or guarded["schema_version"] != 1
+        or guarded["scope"] != "platform-only"
+        or guarded["result"] != "UNAVAILABLE"
+        or guarded["protocol"] != 1
+        or guarded["identity_policy"] != 2
+        or guarded["reason"] != "no-devices"
+        or guarded["main_return"] != 2
+        or guarded["run_id"] != run_id
+        or guarded["disk_id"] != disk_id
+        or guarded["path"] != 0
+        or guarded["target"] != 0
+        or guarded["lun"] != geometry["lun"]
+        or guarded["sectors"] != geometry["sectors"]
+        or guarded["sector_size"] != SECTOR_SIZE
+        or producer["schema"] != "unikraft.hyperv.guarded-producer-pin"
+        or producer["schema_version"] != 2
+        or build_receipt["result"] != "PASS"
+        or build_receipt["guarded"] != value["guarded"]
+        or build_receipt["source_before"] != value["provenance"]
+        or build_receipt["source_after"] != value["provenance"]
     ):
-        raise ValueError(
-            "Exact-image private x86 preflight is incomplete or mismatched"
-        )
+        raise ValueError("Completed private x86 preflight is mismatched")
     return {
         **value,
-        "image": dict(image),
-        "provenance": dict(provenance),
-        "private_host": dict(host),
+        "inputs": normalized_inputs,
+        "host": dict(host),
+        "guarded": {
+            **guarded,
+            "producer": {
+                **producer,
+                "files": dict(producer["files"]),
+            },
+        },
+        "private_build": {
+            **private_build,
+            "receipt": dict(build_receipt),
+        },
     }
+
+
+def load_completed_preflight(state_directory, guest_vhd, run_id, disk_id,
+                             geometry):
+    loader = getattr(private_preflight, "load_completed_receipt", None)
+    if not callable(loader):
+        raise RuntimeError(
+            "Private-preflight completed-handoff validator is unavailable"
+        )
+    receipt, receipt_path = loader(state_directory)
+    validated = validate_preflight_receipt(
+        receipt, guest_vhd, run_id, disk_id, geometry
+    )
+    expected_path = (
+        Path(state_directory).resolve(strict=True)
+        / FILE_NAMES["preflight_receipt"]
+    )
+    if Path(receipt_path).resolve(strict=True) != expected_path:
+        raise ValueError(
+            "Completed private-preflight receipt path is unexpected"
+        )
+    return validated, expected_path
 
 
 def validate_seed_manifest(value, contract):
@@ -400,7 +548,8 @@ def validate_contract(value):
     ):
         raise ValueError("Persistence input geometry is incompatible")
     preflight = validate_preflight_receipt(
-        value["preflight"], files["guest_vhd"]
+        value["preflight"], files["guest_vhd"],
+        value["run_id"], value["disk_id"], geometry,
     )
     return {
         **value,
@@ -563,13 +712,30 @@ def validate_seed_bytes(raw_path, manifest):
 def create_contract(output_path, *, run_id, disk_id, sectors, lun,
                     subscription, location, vm_size, vm_vcpus, name_prefix,
                     os_disk_sku, data_disk_sku, runtime_seconds,
-                    cleanup_seconds, inputs):
+                    cleanup_seconds, inputs, preflight_state_directory):
     require_hex(run_id, HEX32, "Persistence run ID")
     require_hex(disk_id, HEX32, "Persistence disk ID")
     require_integer(sectors, MIN_SECTORS, MAX_SECTORS, "Sector count")
     require_integer(lun, 0, 63, "Data-disk LUN")
-    if set(inputs) != set(FILE_NAMES):
+    if set(inputs) != set(PERSISTENCE_INPUT_ROLES):
         raise ValueError("Persistence contract inputs are incomplete")
+    geometry = {
+        "sectors": sectors,
+        "sector_size": SECTOR_SIZE,
+        "lun": lun,
+    }
+    guest_record = file_record(
+        inputs["guest_vhd"], FILE_NAMES["guest_vhd"],
+        "guest_vhd input", MAX_SECTORS * SECTOR_SIZE + 512,
+    )
+    preflight, preflight_path = load_completed_preflight(
+        preflight_state_directory, guest_record,
+        run_id, disk_id, geometry,
+    )
+    all_inputs = {
+        **inputs,
+        "preflight_receipt": preflight_path,
+    }
     files = {
         role: file_record(
             path, FILE_NAMES[role], f"{role} input",
@@ -579,12 +745,18 @@ def create_contract(output_path, *, run_id, disk_id, sectors, lun,
                 ) else MAX_SECTORS * SECTOR_SIZE + 512
             ),
         )
-        for role, path in inputs.items()
+        for role, path in all_inputs.items()
     }
-    preflight, _ = read_json(
-        inputs["preflight_receipt"], "Exact-image private preflight receipt",
+    current_preflight, _ = read_json(
+        preflight_path, "Completed private-preflight receipt",
         canonical=False,
     )
+    if current_preflight != preflight:
+        raise ValueError(
+            "Completed private-preflight receipt changed during validation"
+        )
+    if files["guest_vhd"] != guest_record:
+        raise ValueError("Guarded guest input changed during preflight validation")
     prefix = name_prefix
     contract = {
         "schema": CONTRACT_SCHEMA,
@@ -593,11 +765,7 @@ def create_contract(output_path, *, run_id, disk_id, sectors, lun,
         "implementation": implementation_contract(),
         "run_id": run_id,
         "disk_id": disk_id,
-        "geometry": {
-            "sectors": sectors,
-            "sector_size": SECTOR_SIZE,
-            "lun": lun,
-        },
+        "geometry": geometry,
         "azure": {
             "subscription": subscription,
             "location": location,
@@ -657,7 +825,7 @@ def create_contract(output_path, *, run_id, disk_id, sectors, lun,
 
 
 def prepare_state(contract_path, expected_contract_sha256, state_directory,
-                  inputs):
+                  inputs, preflight_state_directory):
     contract_value, contract_bytes = read_json(
         contract_path, "Two-boot persistence contract"
     )
@@ -670,9 +838,17 @@ def prepare_state(contract_path, expected_contract_sha256, state_directory,
     ):
         raise ValueError("Two-boot persistence contract digest does not match")
     contract = validate_contract(contract_value)
-    if set(inputs) != set(FILE_NAMES):
+    if set(inputs) != set(PERSISTENCE_INPUT_ROLES):
         raise ValueError("Persistence prepare inputs are incomplete")
-    for role, path in inputs.items():
+    preflight, preflight_path = load_completed_preflight(
+        preflight_state_directory, contract["files"]["guest_vhd"],
+        contract["run_id"], contract["disk_id"], contract["geometry"],
+    )
+    all_inputs = {
+        **inputs,
+        "preflight_receipt": preflight_path,
+    }
+    for role, path in all_inputs.items():
         record = contract["files"][role]
         if (
             Path(path).is_symlink()
@@ -689,16 +865,10 @@ def prepare_state(contract_path, expected_contract_sha256, state_directory,
     ):
         raise ValueError("Storage seed manifest fingerprint changed")
     seed = validate_seed_manifest(seed, contract)
-    preflight, preflight_bytes = read_json(
-        inputs["preflight_receipt"], "Exact-image private preflight receipt",
-        canonical=False,
-    )
     if (
-        hashlib.sha256(preflight_bytes).hexdigest()
+        azure.image_sha256(preflight_path)
         != contract["files"]["preflight_receipt"]["sha256"]
-        or validate_preflight_receipt(
-            preflight, contract["files"]["guest_vhd"]
-        ) != contract["preflight"]
+        or preflight != contract["preflight"]
     ):
         raise ValueError("Private preflight receipt differs from the contract")
     validate_fixed_vhd(
@@ -725,7 +895,7 @@ def prepare_state(contract_path, expected_contract_sha256, state_directory,
             output.write(contract_bytes)
             output.flush()
             os.fsync(output.fileno())
-        for role, source in inputs.items():
+        for role, source in all_inputs.items():
             record = contract["files"][role]
             azure.copy_regular_file(
                 Path(source), copied / record["name"],
@@ -879,7 +1049,8 @@ def verify_immutable_inputs(state, directory):
         "Prepared exact-image private preflight receipt", canonical=False,
     )
     if validate_preflight_receipt(
-        preflight, contract["files"]["guest_vhd"]
+        preflight, contract["files"]["guest_vhd"],
+        contract["run_id"], contract["disk_id"], contract["geometry"],
     ) != contract["preflight"]:
         raise ValueError("Prepared private x86 preflight evidence changed")
     validate_fixed_vhd(
@@ -2280,11 +2451,16 @@ def main():
         ("data_raw", "--data-raw"),
         ("data_vhd", "--data-vhd"),
         ("seed_manifest", "--seed-manifest"),
-        ("preflight_receipt", "--preflight-receipt"),
     )
     for role, option in input_options:
         create.add_argument(option, dest=role, type=Path, required=True)
         prepare.add_argument(option, dest=role, type=Path, required=True)
+    create.add_argument(
+        "--preflight-state-dir", type=Path, required=True
+    )
+    prepare.add_argument(
+        "--preflight-state-dir", type=Path, required=True
+    )
     run = subparsers.add_parser("run")
     run.add_argument("--state-dir", type=Path, required=True)
     run.add_argument("--subscription", required=True)
@@ -2316,6 +2492,7 @@ def main():
                 inputs={
                     role: getattr(args, role) for role, _ in input_options
                 },
+                preflight_state_directory=args.preflight_state_dir,
             )
             print("Two-boot persistence contract SHA-256: " + digest)
             contract, _ = read_json(
@@ -2331,8 +2508,9 @@ def main():
                 args.state_dir,
                 {
                     role: getattr(args, role)
-                    for role in FILE_NAMES
+                    for role in PERSISTENCE_INPUT_ROLES
                 },
+                args.preflight_state_dir,
             )
             print(f"Prepared exact two-boot state: {prepared}")
         elif args.action == "run":

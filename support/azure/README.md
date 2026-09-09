@@ -484,11 +484,11 @@ does not build, reseed, convert, or discover a resource budget. It requires:
   SKUs, runtime, cleanup duration, and fixed one-VM/two-disk resource count;
 - the exact guarded V2 guest fixed VHD, raw seed, matching fixed data VHD and
   generator receipt;
-- a completed schema-1
-  `unikraft.hyperv.persistence-exact-image-preflight` handoff from the private
-  x86 preflight, binding the same guest VHD, source tree, solved configuration,
-  private build receipt, toolchain, input manifest, host boot evidence and
-  completed cleanup.
+- a completed schema-3 `unikraft.hyperv.private-preflight-receipt` loaded from
+  the private preflight's complete state directory, binding the same guest
+  VHD, source tree, solved configuration, private build receipt, twelve-tool
+  closure, schema-2 guarded producer pin, all six retained boot logs, immutable
+  host/deployment identities, accounting and completed cleanup.
 
 The controller accepts only whole-MiB 512-byte geometry, capped at 2 TiB; the
 operator chooses the exact approved value. WRITE(16) coverage uses the
@@ -496,11 +496,13 @@ workload's low-LBA command selection and does not require a disk larger than
 2 TiB. Azure billing/allocation tiers do not replace the exact guest-visible
 SCSI capacity and Azure-reported `diskSizeBytes` checks.
 
-A build or packaging receipt, local ARM-hosted fixture, or prepared private
-preflight state is not this handoff. The preflight consumer must finish its
-actual private x86 boots and owner-checked cleanup first. The handoff is a
-private interface: do not publish its host UUIDs, image identifiers, source
-policy, serial evidence, seed, contract, or resulting receipts.
+A build or packaging receipt, local ARM-hosted fixture, receipt file by itself,
+or prepared private-preflight state is not this handoff. The controller imports
+`load_completed_receipt()`, which revalidates the complete state, immutable
+inputs, final receipt hash, four private exact-image boots, two separate
+capability boots, guarded no-device result and owner-checked cleanup. The
+handoff is private: do not publish host UUIDs, image identifiers, source policy,
+serial evidence, seed, contract, state directory or resulting receipts.
 
 Generate the seed and fixed data VHD before the one final guarded-image build:
 
@@ -533,7 +535,7 @@ PYTHONPATH=support/scripts python3 \
   --data-raw "$PWD/.d/persistence/run.raw" \
   --data-vhd "$PWD/.d/persistence/run.vhd" \
   --seed-manifest "$PWD/.d/persistence/run.json" \
-  --preflight-receipt "$PRIVATE_EXACT_IMAGE_PREFLIGHT"
+  --preflight-state-dir "$COMPLETED_PRIVATE_PREFLIGHT_STATE"
 ```
 
 The generator prints both the whole contract SHA-256 and the separately
@@ -552,7 +554,7 @@ python3 support/scripts/hyperv_persistence_controller.py prepare \
   --data-raw "$PWD/.d/persistence/run.raw" \
   --data-vhd "$PWD/.d/persistence/run.vhd" \
   --seed-manifest "$PWD/.d/persistence/run.json" \
-  --preflight-receipt "$PRIVATE_EXACT_IMAGE_PREFLIGHT"
+  --preflight-state-dir "$COMPLETED_PRIVATE_PREFLIGHT_STATE"
 ```
 
 `run` remains inert unless both the exact subscription and the SHA-256 of the
