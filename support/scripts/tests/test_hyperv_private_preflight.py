@@ -4835,25 +4835,35 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             "/subscriptions/private/resourceGroups/private "
             "?sig=private-secret /owner/private/state"
         )
-        output = io.StringIO()
-        with mock.patch.object(
-            preflight.sys, "argv",
-            [
-                "hyperv_private_preflight.py", "cleanup",
-                "--state-dir", "/owner/private/state",
-                "--subscription", "11111111-2222-3333-4444-555555555555",
-            ],
-        ), mock.patch.object(
-            preflight, "cleanup", side_effect=RuntimeError(secret)
-        ), mock.patch.object(preflight.sys, "stderr", output):
-            with self.assertRaises(SystemExit) as stopped:
-                preflight.main()
-            print(stopped.exception, file=preflight.sys.stderr)
-        message = output.getvalue()
-        self.assertNotIn("private-secret", message)
-        self.assertNotIn("/subscriptions/", message)
-        self.assertNotIn("/owner/private", message)
-        self.assertNotIn("Traceback", message)
+        for failure in (
+            RuntimeError(secret),
+            preflight.subprocess.TimeoutExpired(
+                ["private-worker", secret], 1, output=secret, stderr=secret,
+            ),
+        ):
+            with self.subTest(category=type(failure).__name__):
+                output = io.StringIO()
+                with mock.patch.object(
+                    preflight.sys, "argv",
+                    [
+                        "hyperv_private_preflight.py", "cleanup",
+                        "--state-dir", "/owner/private/state",
+                        "--subscription",
+                        "11111111-2222-3333-4444-555555555555",
+                    ],
+                ), mock.patch.object(
+                    preflight, "cleanup", side_effect=failure
+                ), mock.patch.object(preflight.sys, "stderr", output):
+                    with self.assertRaises(SystemExit) as stopped:
+                        preflight.main()
+                    print(stopped.exception, file=preflight.sys.stderr)
+                self.assertIsNone(stopped.exception.__cause__)
+                self.assertIsNone(stopped.exception.__context__)
+                message = output.getvalue()
+                self.assertNotIn("private-secret", message)
+                self.assertNotIn("/subscriptions/", message)
+                self.assertNotIn("/owner/private", message)
+                self.assertNotIn("Traceback", message)
 
 
 if __name__ == "__main__":

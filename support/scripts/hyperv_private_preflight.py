@@ -6315,6 +6315,7 @@ def main():
     cleanup_parser.add_argument("--state-dir", type=Path, required=True)
     cleanup_parser.add_argument("--subscription", required=True)
     args = parser.parse_args()
+    failure_message = None
     try:
         if args.action == "build-private":
             build_private_image(
@@ -6361,13 +6362,15 @@ def main():
             cleanup(args.state_dir, args.subscription)
             print("Private preflight cleanup completed")
     except subprocess.TimeoutExpired:
-        raise SystemExit(
+        failure_message = (
             "A bounded private-preflight subprocess timed out; details withheld"
-        ) from None
+        )
     except (OSError, RuntimeError, ValueError, KeyboardInterrupt):
-        raise SystemExit(
+        failure_message = (
             "Private preflight failed; inspect the owner-only state directory"
-        ) from None
+        )
+    if failure_message is not None:
+        raise SystemExit(failure_message)
 
 
 if __name__ == "__main__":
