@@ -151,12 +151,14 @@ and retain its raw seed and JSON receipt for the later, separately authorized
 real-data-disk workload. The seed is not uploaded to this platform preflight:
 Set `ZIG`, `MAKE`, `BISON`, `FLEX`, `M4`, `BISON_DATA`, `LLVM_BIN`, and
 `GIT_RUNTIME` to absolute reviewed tool paths. `GIT_RUNTIME` must be a
-relocatable owner-selected directory containing a native ELF `bin/git` and,
-when required, only regular runtime libraries directly below `lib/`. Symlinks,
-scripts, launchers that require adjacent configuration, and unknown paths are
-rejected. The system ELF loader and C runtime are an explicit trusted OS
-boundary; the Git binary and its private runtime libraries are fingerprinted
-and copied together.
+relocatable owner-selected directory containing native ELF files only:
+`bin/git`, the matching dynamic loader at `lib/loader`, and every transitive
+DSO needed by Git directly below `lib/` under its requested SONAME. Symlinks,
+scripts, launchers that require adjacent configuration, missing or unused
+libraries, ambient dependency fallback, and unknown paths are rejected. The
+loader, C runtime, thread/dlopen compatibility DSOs, and Git's private
+libraries are fingerprinted and copied together; only the kernel and virtual
+DSO remain outside that runtime closure.
 
 ```shell
 PERSISTENCE="$PWD/.d/private-preflight-persistence"
@@ -184,8 +186,14 @@ export GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_EXEC_PATH="$GIT_RUNTIME/disabled-exec-path"
 export GIT_OPTIONAL_LOCKS=0
+export GIT_NO_REPLACE_OBJECTS=1
+export OPENSSL_CONF=/dev/null
+export OPENSSL_MODULES="$GIT_RUNTIME/disabled-openssl-modules"
 export LC_ALL=C
-exec "$GIT_RUNTIME/bin/git" -c core.fsmonitor=false \
+export PATH="$GIT_RUNTIME/disabled-path"
+exec "$GIT_RUNTIME/lib/loader" --inhibit-cache \
+  --library-path "$GIT_RUNTIME/lib" "$GIT_RUNTIME/bin/git" \
+  --no-replace-objects -c core.fsmonitor=false \
   -c core.hooksPath=/dev/null "\$@"
 EOF
 chmod 700 "$CONFIG_TOOLS/yacc" "$CONFIG_TOOLS/lex" "$CONFIG_TOOLS/git"
@@ -242,7 +250,12 @@ fingerprints the complete Git runtime, compiler, LLVM, Make, Python, parser
 tools and Bison data. Git configuration, hook, helper, fsmonitor, and
 repository-selection environment overrides are removed; system/global config
 and the helper search path are disabled, and dynamic-loader injection
-variables are removed. Both complete bounded
+variables are removed. Dependency resolution must remain entirely inside the
+copied runtime before and after every source query. Provenance rejects object
+replacement refs, assume-unchanged and skip-worktree flags, and any index
+difference, then hashes every tracked physical regular file or symlink and
+checks its Git mode and object ID against the unreplaced `HEAD` tree using
+NUL-delimited path records. Both complete bounded
 native passes must return successfully and contain no failure record. The only
 recoverable materialization record is the exact pinned `uk-reloc` command
 whose cache-local inputs are validated before a clean second pass:
@@ -282,7 +295,7 @@ snapshot, solved configuration, invocation, or build tools differ from the
 receipt. The QEMU closure is an owner-selected directory whose
 executable is exactly `bin/qemu-system-x86_64`; required regular files below
 `lib/` and `share/` are copied and hashed recursively. Symlinks are rejected.
-Generate the canonical schema-8 manifest and owner-only input directory:
+Generate the canonical schema-9 manifest and owner-only input directory:
 
 ```shell
 INPUTS="$PWD/.d/private-preflight-input"
@@ -311,11 +324,12 @@ PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
 
 The exact generated names are `private-preflight-input.json`, `solved.config`,
 `capability.source.json`, `private-build-receipt.json`, `git-runtime/bin/git`,
-the optional enumerated `git-runtime/lib` closure,
+`git-runtime/lib/loader`, the complete enumerated `git-runtime/lib` closure,
 `qemu/bin/qemu-system-x86_64`, the enumerated `qemu/lib`/`qemu/share` closure,
 `OVMF_CODE.fd`, `OVMF_VARS.fd`, `capability.raw`, `private.efi`, `private.raw`,
 and `private.vhd`. The manifest binds the clean Git `HEAD`, SHA-256 of the raw
-`git ls-tree -r --full-tree -z HEAD` output, solved configuration, pinned
+`git ls-tree -r --full-tree -z HEAD` output, the independently verified
+physical tracked-tree digest and byte count, solved configuration, pinned
 `miz`, controller, runner, Blob worker, imported shared controller and network
 helper, ARM template, requirements file, every installed SDK distribution,
 all inputs, packaging geometry, sizes, and reviewed policy. The separately
@@ -333,7 +347,7 @@ The guarded producer-pin-v4 contract additionally binds the complete
 `support/build` directory, including production validation gates even when
 they live below `tests/`, plus every external native-image helper invoked by
 the root Make/facade/postprocessing path. Unknown additions, removals, or byte
-changes fail closed. The input-manifest-v8 and private-build-receipt-v5
+changes fail closed. The input-manifest-v9 and private-build-receipt-v6
 contracts bind the copied Git runtime used for every source query and
 native-build invocation, the exact reviewed producer files, protocol 1,
 identity policy 2, `no-devices`, guest return 2, and the private solved

@@ -49,7 +49,7 @@ UK_RELOC_SCRIPT_PATH = SUPPORT / "scripts" / "mkukreloc.py"
 INPUT_SCHEMA = "unikraft.hyperv.private-preflight-input"
 STATE_SCHEMA = "unikraft.hyperv.private-preflight-state"
 RECEIPT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
-INPUT_SCHEMA_VERSION = 8
+INPUT_SCHEMA_VERSION = 9
 STATE_SCHEMA_VERSION = 2
 RECEIPT_SCHEMA_VERSION = 3
 HOST_PHASE_SCHEMA = host_runner.SCHEMA
@@ -59,12 +59,13 @@ SOLVED_CONFIG = "solved.config"
 CAPABILITY_REFERENCE = "capability.source.json"
 PRIVATE_BUILD_RECEIPT = "private-build-receipt.json"
 GIT_RUNTIME = "git-runtime"
-GIT_RUNTIME_SCHEMA = "unikraft.git-runtime-v1"
+GIT_RUNTIME_SCHEMA = "unikraft.git-runtime-v2"
 GIT_EXECUTABLE = Path("bin/git")
+GIT_LOADER = Path("lib/loader")
 NATIVE_EFI_NAME = "helloworld_hyperv-x86_64-efi-netvsc"
 CAPABILITY_REFERENCE_SCHEMA = "unikraft.hyperv.capability-reference"
 PRIVATE_BUILD_SCHEMA = "unikraft.hyperv.private-local-build"
-PRIVATE_BUILD_SCHEMA_VERSION = 5
+PRIVATE_BUILD_SCHEMA_VERSION = 6
 STATE_FILE = "state.json"
 LOCATION = "northeurope"
 VM_SIZE = "Standard_D2s_v5"
@@ -92,6 +93,9 @@ MAX_CONTROL_BYTES = 512 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_STATE_BYTES = 192 * 1024
 MAX_BLOB_SAS_BYTES = 4096
+MAX_TRACKED_ENTRIES = 100_000
+MAX_TRACKED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TRACKED_FILE_BYTES = 256 * 1024 * 1024
 TRANSFER_TIMEOUT_SECONDS = 300
 RECONCILE_TIMEOUT_SECONDS = 120
 CLEANUP_TIMEOUT_SECONDS = 20 * 60
@@ -980,38 +984,101 @@ def validate_implementation(value):
 def validate_git_runtime_record(value):
     value = exact_fields(
         value,
-        ("schema", "name", "sha256", "size", "files", "executable"),
+        (
+            "schema", "name", "sha256", "size", "files",
+            "executable", "loader", "libraries",
+        ),
         "Private Git runtime fingerprint",
     )
     executable = exact_fields(
         value["executable"], ("name", "sha256", "size"),
         "Private Git executable fingerprint",
     )
+    loader = exact_fields(
+        value["loader"], ("name", "sha256", "size"),
+        "Private Git loader fingerprint",
+    )
+    libraries = value["libraries"]
+    if not isinstance(libraries, list) or not libraries:
+        raise ValueError("Private Git runtime libraries are invalid")
+    libraries = [
+        exact_fields(
+            library, ("name", "sha256", "size"),
+            "Private Git runtime library fingerprint",
+        )
+        for library in libraries
+    ]
+    if any(
+        not isinstance(library["name"], str)
+        for library in libraries
+    ):
+        raise ValueError("Private Git runtime libraries are invalid")
+    member_names = [
+        executable["name"], loader["name"],
+        *(library["name"] for library in libraries),
+    ]
     if (
         value["schema"] != GIT_RUNTIME_SCHEMA
         or value["name"] != GIT_RUNTIME
         or type(value["size"]) is not int
         or value["size"] <= 0
         or type(value["files"]) is not int
-        or value["files"] <= 0
+        or value["files"] != len(member_names)
         or executable["name"] != GIT_EXECUTABLE.as_posix()
+        or loader["name"] != GIT_LOADER.as_posix()
         or type(executable["size"]) is not int
         or executable["size"] <= 0
+        or type(loader["size"]) is not int
+        or loader["size"] <= 0
+        or len(member_names) != len(set(member_names))
+        or [library["name"] for library in libraries]
+        != sorted(library["name"] for library in libraries)
+        or any(
+            not re.fullmatch(
+                r"lib/[A-Za-z0-9][A-Za-z0-9._+-]{0,127}",
+                library["name"],
+            )
+            or library["name"] == GIT_LOADER.as_posix()
+            or type(library["size"]) is not int
+            or library["size"] <= 0
+            for library in libraries
+        )
+        or value["size"] != sum(
+            member["size"]
+            for member in (executable, loader, *libraries)
+        )
     ):
         raise ValueError("Private Git runtime fingerprint is invalid")
     require_sha256(value["sha256"], "Private Git runtime fingerprint")
-    require_sha256(
-        executable["sha256"], "Private Git executable fingerprint"
-    )
-    return {**value, "executable": dict(executable)}
+    for member in (executable, loader, *libraries):
+        require_sha256(
+            member["sha256"], "Private Git runtime member fingerprint"
+        )
+    digest = hashlib.sha256()
+    for member in sorted(
+        (executable, loader, *libraries), key=lambda item: item["name"]
+    ):
+        encoded = member["name"].encode()
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(member["size"].to_bytes(8, "big"))
+        digest.update(bytes.fromhex(member["sha256"]))
+    if digest.hexdigest() != value["sha256"]:
+        raise ValueError("Private Git runtime aggregate is inconsistent")
+    return {
+        **value,
+        "executable": dict(executable),
+        "loader": dict(loader),
+        "libraries": [dict(library) for library in libraries],
+    }
 
 
 def validate_provenance(value):
     value = exact_fields(
         value,
         (
-            "scheme", "head_commit", "tree_sha256", "tracked_entries",
-            "config", "git",
+            "scheme", "head_commit", "tree_sha256", "physical_sha256",
+            "tracked_entries", "tracked_bytes", "config", "git",
         ),
         "Private-preflight build provenance",
     )
@@ -1020,17 +1087,22 @@ def validate_provenance(value):
         "Solved configuration provenance",
     )
     if (
-        value["scheme"] != "unikraft.git-ls-tree-v1"
+        value["scheme"] != "unikraft.git-physical-tree-v2"
         or not isinstance(value["head_commit"], str)
         or not GIT_COMMIT.fullmatch(value["head_commit"])
         or type(value["tracked_entries"]) is not int
-        or value["tracked_entries"] <= 0
+        or not 0 < value["tracked_entries"] <= MAX_TRACKED_ENTRIES
+        or type(value["tracked_bytes"]) is not int
+        or not 0 < value["tracked_bytes"] <= MAX_TRACKED_BYTES
         or config["name"] != SOLVED_CONFIG
         or type(config["size"]) is not int
         or not 0 < config["size"] <= 1024 * 1024
     ):
         raise ValueError("Private-preflight build provenance is invalid")
     require_sha256(value["tree_sha256"], "Tracked source-tree fingerprint")
+    require_sha256(
+        value["physical_sha256"], "Physical source-tree fingerprint"
+    )
     require_sha256(config["sha256"], "Solved configuration fingerprint")
     git = validate_git_runtime_record(value["git"])
     return {**value, "config": dict(config), "git": git}
@@ -1283,6 +1355,8 @@ def git_runtime_record(path):
         raise ValueError("Private Git runtime must be a non-symlink directory")
     root = original.resolve(strict=True)
     executable = None
+    loader = None
+    libraries = []
     for entry in sorted(root.rglob("*")):
         relative = entry.relative_to(root)
         metadata = entry.lstat()
@@ -1294,30 +1368,37 @@ def git_runtime_record(path):
                     "Private Git runtime has an unsupported directory"
                 )
             continue
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or (
-                relative != GIT_EXECUTABLE
-                and (
-                    len(relative.parts) != 2
-                    or relative.parts[0] != "lib"
-                )
+        if not stat.S_ISREG(metadata.st_mode) or (
+            relative != GIT_EXECUTABLE
+            and (
+                len(relative.parts) != 2
+                or relative.parts[0] != "lib"
             )
         ):
             raise ValueError("Private Git runtime has an unsupported file")
-        if relative == GIT_EXECUTABLE:
+        if relative in (GIT_EXECUTABLE, GIT_LOADER):
             if not os.access(entry, os.X_OK):
-                raise ValueError("Private Git executable is not executable")
-            with entry.open("rb") as stream:
-                if stream.read(4) != b"\x7fELF":
-                    raise ValueError(
-                        "Private Git executable must be a native ELF binary"
-                    )
-            executable = regular_record(
-                entry, relative.as_posix(), "Private Git executable"
-            )
-    if executable is None:
-        raise ValueError("Private Git runtime requires bin/git")
+                raise ValueError(
+                    "Private Git executable or loader is not executable"
+                )
+        with entry.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                raise ValueError(
+                    "Private Git runtime members must be native ELF files"
+                )
+        record = regular_record(
+            entry, relative.as_posix(), "Private Git runtime member"
+        )
+        if relative == GIT_EXECUTABLE:
+            executable = record
+        elif relative == GIT_LOADER:
+            loader = record
+        else:
+            libraries.append(record)
+    if executable is None or loader is None or not libraries:
+        raise ValueError(
+            "Private Git runtime requires bin/git, lib/loader, and libraries"
+        )
     runtime = directory_record(
         root, GIT_RUNTIME, "Private Git runtime"
     )
@@ -1325,6 +1406,8 @@ def git_runtime_record(path):
         "schema": GIT_RUNTIME_SCHEMA,
         **runtime,
         "executable": executable,
+        "loader": loader,
+        "libraries": libraries,
     }
 
 
@@ -1627,19 +1710,29 @@ def load_receipt(path, name, description):
     }
 
 
-def git_environment(git_runtime):
+def git_environment(git_runtime, isolate_path=True):
     environment = {
         name: value for name, value in os.environ.items()
         if not name.startswith("GIT_")
-        and name not in ("LD_AUDIT", "LD_LIBRARY_PATH", "LD_PRELOAD")
+        and not name.startswith("LD_")
+        and name not in ("GCONV_PATH", "GLIBC_TUNABLES", "LOCPATH")
     }
     environment.update({
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_EXEC_PATH": str(Path(git_runtime) / "disabled-exec-path"),
         "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "HOME": str(Path(git_runtime) / "disabled-home"),
+        "XDG_CONFIG_HOME": str(Path(git_runtime) / "disabled-xdg-config"),
+        "OPENSSL_CONF": os.devnull,
+        "OPENSSL_MODULES": str(
+            Path(git_runtime) / "disabled-openssl-modules"
+        ),
         "LC_ALL": "C",
     })
+    if isolate_path:
+        environment["PATH"] = str(Path(git_runtime) / "disabled-path")
     return environment
 
 
@@ -1698,44 +1791,312 @@ def bounded_command_output(argv, cwd, environment, timeout, maximum):
     )
 
 
+def git_runtime_command(git_runtime, arguments):
+    git_runtime = Path(git_runtime)
+    return [
+        str(git_runtime / GIT_LOADER),
+        "--inhibit-cache",
+        "--library-path", str(git_runtime / "lib"),
+        str(git_runtime / GIT_EXECUTABLE),
+        "--no-replace-objects",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.hooksPath=/dev/null",
+        *arguments,
+    ]
+
+
+def validate_git_runtime_resolution(git_runtime, record):
+    git_runtime = Path(git_runtime).resolve(strict=True)
+    returncode, stdout, stderr, overflow = bounded_command_output(
+        [
+            str(git_runtime / GIT_LOADER),
+            "--inhibit-cache",
+            "--library-path", str(git_runtime / "lib"),
+            "--list", str(git_runtime / GIT_EXECUTABLE),
+        ],
+        git_runtime, git_environment(git_runtime), 30, 16 * 1024,
+    )
+    if returncode or stderr or overflow:
+        raise ValueError(
+            "Private Git runtime dependency resolution is invalid"
+        )
+    expected = {
+        record["loader"]["name"],
+        *(library["name"] for library in record["libraries"]),
+    }
+    resolved = []
+    for line in stdout.splitlines():
+        if re.fullmatch(rb"\s*linux-vdso\.so\.1 \(0x[0-9a-fA-F]+\)", line):
+            continue
+        match = re.fullmatch(
+            rb"\s*(\S+) => (.+) \(0x[0-9a-fA-F]+\)", line
+        )
+        direct = None
+        if match is None:
+            direct = re.fullmatch(
+                rb"\s*(/.+) \(0x[0-9a-fA-F]+\)", line
+            )
+            if direct is None:
+                raise ValueError(
+                    "Private Git runtime dependency resolution is invalid"
+                )
+            dependency = None
+            path_bytes = direct.group(1)
+        else:
+            dependency = match.group(1)
+            path_bytes = match.group(2)
+        path = Path(os.fsdecode(path_bytes)).resolve(strict=True)
+        try:
+            relative = path.relative_to(git_runtime).as_posix()
+        except ValueError:
+            raise ValueError(
+                "Private Git runtime resolved an ambient dependency"
+            ) from None
+        if relative not in expected:
+            raise ValueError(
+                "Private Git runtime resolved an unknown dependency"
+            )
+        if (
+            relative != GIT_LOADER.as_posix()
+            and dependency != os.fsencode(path.name)
+        ):
+            raise ValueError(
+                "Private Git runtime dependency identity is invalid"
+            )
+        resolved.append(relative)
+    if len(resolved) != len(set(resolved)) or set(resolved) != expected:
+        raise ValueError(
+            "Private Git runtime dependency closure is incomplete"
+        )
+
+
 def preflight_git_runtime(git_runtime):
     git_runtime = Path(git_runtime).resolve(strict=True)
-    before = git_runtime_record(git_runtime)
+    before = validate_git_runtime_record(
+        git_runtime_record(git_runtime)
+    )
+    validate_git_runtime_resolution(git_runtime, before)
     returncode, stdout, stderr, overflow = bounded_command_output(
-        [str(git_runtime / GIT_EXECUTABLE), "--version"],
+        git_runtime_command(git_runtime, ["--version"]),
         git_runtime, git_environment(git_runtime), 30, 256,
     )
+    after = validate_git_runtime_record(git_runtime_record(git_runtime))
     if (
         returncode
         or stderr
         or overflow
         or not re.fullmatch(rb"git version [0-9][ -~]{0,200}\n", stdout)
-        or git_runtime_record(git_runtime) != before
+        or after != before
     ):
         raise ValueError(
             "Private Git runtime is not a relocatable Git executable"
         )
+    validate_git_runtime_resolution(git_runtime, after)
     return before
 
 
 def git_output(git_runtime, repository, arguments):
     git_runtime = Path(git_runtime).resolve(strict=True)
-    before = git_runtime_record(git_runtime)
+    before = validate_git_runtime_record(
+        git_runtime_record(git_runtime)
+    )
     returncode, stdout, stderr, overflow = bounded_command_output(
-        [
-            str(git_runtime / GIT_EXECUTABLE),
-            "-c", "core.fsmonitor=false",
-            "-c", "core.hooksPath=/dev/null",
-            "-C", str(repository),
-            *arguments,
-        ],
+        git_runtime_command(
+            git_runtime, ["-C", str(repository), *arguments]
+        ),
         repository, git_environment(git_runtime), 60, 8 * 1024 * 1024,
     )
-    if git_runtime_record(git_runtime) != before:
+    after = validate_git_runtime_record(git_runtime_record(git_runtime))
+    if after != before:
         raise RuntimeError("Private Git runtime changed while in use")
+    validate_git_runtime_resolution(git_runtime, after)
     if returncode or stderr or overflow:
         raise RuntimeError("Unable to derive local Git source provenance")
     return stdout
+
+
+def parse_git_tree(raw):
+    records = []
+    seen = set()
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        prefix, separator, path = item.partition(b"\t")
+        fields = prefix.split(b" ")
+        if (
+            separator != b"\t"
+            or len(fields) != 3
+            or fields[0] not in (b"100644", b"100755", b"120000")
+            or fields[1] != b"blob"
+            or not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[2])
+            or not path
+            or path.startswith(b"/")
+            or any(part in (b"", b".", b"..") for part in path.split(b"/"))
+            or path in seen
+        ):
+            raise ValueError("Tracked Git tree is unsupported or ambiguous")
+        seen.add(path)
+        records.append((path, fields[0], fields[2]))
+        if len(records) > MAX_TRACKED_ENTRIES:
+            raise ValueError("Tracked Git tree exceeds the entry limit")
+    if not records:
+        raise ValueError("Tracked Git tree is empty")
+    return records
+
+
+def verify_git_index(git_runtime, repository, tree_records):
+    expected = {
+        path: (mode, object_id)
+        for path, mode, object_id in tree_records
+    }
+    staged = {}
+    raw = git_output(
+        git_runtime, repository, ["ls-files", "-s", "-z"]
+    )
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        prefix, separator, path = item.partition(b"\t")
+        fields = prefix.split(b" ")
+        if (
+            separator != b"\t"
+            or len(fields) != 3
+            or fields[2] != b"0"
+            or path in staged
+        ):
+            raise ValueError("Git index state is unsupported or ambiguous")
+        staged[path] = (fields[0], fields[1])
+    if staged != expected:
+        raise ValueError("Git index differs from the claimed HEAD tree")
+    flags = {}
+    raw = git_output(
+        git_runtime, repository, ["ls-files", "-v", "-z"]
+    )
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        if len(item) < 3 or item[1:2] != b" " or item[2:] in flags:
+            raise ValueError("Git index flags are unsupported or ambiguous")
+        flags[item[2:]] = item[:1]
+    if set(flags) != set(expected) or any(
+        flag != b"H" for flag in flags.values()
+    ):
+        raise ValueError(
+            "Git index concealment flags or nonstandard entries are forbidden"
+        )
+
+
+def stable_metadata(value):
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns,
+    )
+
+
+def hash_physical_git_blob(root_fd, path, mode, expected_object):
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("Physical Git tree verification requires O_NOFOLLOW")
+    components = path.split(b"/")
+    parent_fd = os.dup(root_fd)
+    try:
+        for component in components[:-1]:
+            child_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = child_fd
+        name = components[-1]
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        digest = (
+            hashlib.sha1() if len(expected_object) == 40
+            else hashlib.sha256()
+        )
+        if mode == b"120000":
+            if not stat.S_ISLNK(before.st_mode):
+                raise ValueError("Tracked Git symlink type changed")
+            content = os.readlink(name, dir_fd=parent_fd)
+            if isinstance(content, str):
+                content = os.fsencode(content)
+            after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stable_metadata(before) != stable_metadata(after):
+                raise ValueError("Tracked Git symlink changed while hashing")
+            size = len(content)
+            digest.update(f"blob {size}\0".encode())
+            digest.update(content)
+        else:
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or bool(before.st_mode & 0o111) != (mode == b"100755")
+            ):
+                raise ValueError("Tracked Git file type or mode changed")
+            descriptor = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if stable_metadata(opened) != stable_metadata(before):
+                    raise ValueError("Tracked Git file changed before hashing")
+                size = opened.st_size
+                if not 0 <= size <= MAX_TRACKED_FILE_BYTES:
+                    raise ValueError("Tracked Git file exceeds the size limit")
+                digest.update(f"blob {size}\0".encode())
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                after = os.fstat(descriptor)
+                if stable_metadata(opened) != stable_metadata(after):
+                    raise ValueError("Tracked Git file changed while hashing")
+            finally:
+                os.close(descriptor)
+        if not 0 <= size <= MAX_TRACKED_FILE_BYTES:
+            raise ValueError("Tracked Git blob exceeds the size limit")
+        actual = digest.hexdigest().encode()
+        if actual != expected_object:
+            raise ValueError(
+                "Physical tracked source differs from the claimed HEAD tree"
+            )
+        return size
+    except OSError as error:
+        raise ValueError(
+            "Physical tracked source cannot be verified safely"
+        ) from error
+    finally:
+        os.close(parent_fd)
+
+
+def verify_physical_git_tree(repository, tree_records):
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("Physical Git tree verification requires O_NOFOLLOW")
+    root_fd = os.open(
+        os.fsencode(repository),
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    aggregate = hashlib.sha256()
+    total = 0
+    try:
+        for path, mode, object_id in tree_records:
+            size = hash_physical_git_blob(
+                root_fd, path, mode, object_id
+            )
+            total += size
+            if total > MAX_TRACKED_BYTES:
+                raise ValueError("Tracked Git tree exceeds the byte limit")
+            aggregate.update(len(path).to_bytes(4, "big"))
+            aggregate.update(path)
+            aggregate.update(mode)
+            aggregate.update(size.to_bytes(8, "big"))
+            aggregate.update(bytes.fromhex(object_id.decode()))
+    finally:
+        os.close(root_fd)
+    return {
+        "physical_sha256": aggregate.hexdigest(),
+        "tracked_entries": len(tree_records),
+        "tracked_bytes": total,
+    }
 
 
 def build_provenance(repository, config_path, git_runtime):
@@ -1745,30 +2106,50 @@ def build_provenance(repository, config_path, git_runtime):
     git_runtime = Path(git_runtime).resolve(strict=True)
     git = preflight_git_runtime(git_runtime)
     if git_output(
-        git_runtime,
-        repository,
-        ["status", "--porcelain=v1", "--untracked-files=no", "-z"],
+        git_runtime, repository,
+        ["for-each-ref", "--format=%(refname)%00", "refs/replace/"],
+    ):
+        raise ValueError("Git object replacement refs are forbidden")
+    if git_output(
+        git_runtime, repository,
+        ["status", "--porcelain=v1", "--untracked-files=all", "-z"],
     ):
         raise ValueError("Source provenance requires a clean tracked worktree")
     head = git_output(
-        git_runtime, repository, ["rev-parse", "HEAD"]
+        git_runtime, repository, ["rev-parse", "--verify", "HEAD^{commit}"]
     ).decode().strip()
+    if not GIT_COMMIT.fullmatch(head):
+        raise ValueError("Git HEAD identity is invalid")
     tree = git_output(
         git_runtime, repository,
-        ["ls-tree", "-r", "--full-tree", "-z", "HEAD"],
+        ["ls-tree", "-r", "--full-tree", "-z", head],
+    )
+    tree_records = parse_git_tree(tree)
+    if any(len(object_id) != len(head) for _, _, object_id in tree_records):
+        raise ValueError("Git object format changed within the claimed tree")
+    verify_git_index(git_runtime, repository, tree_records)
+    physical = verify_physical_git_tree(repository, tree_records)
+    verify_git_index(git_runtime, repository, tree_records)
+    final_head = git_output(
+        git_runtime, repository, ["rev-parse", "--verify", "HEAD^{commit}"]
+    ).decode().strip()
+    final_status = git_output(
+        git_runtime, repository,
+        ["status", "--porcelain=v1", "--untracked-files=all", "-z"],
     )
     if (
-        not GIT_COMMIT.fullmatch(head)
+        final_head != head
+        or final_status
         or not tree
-        or git_runtime_record(git_runtime) != git
+        or preflight_git_runtime(git_runtime) != git
     ):
         raise ValueError("Git source provenance is invalid")
     config = regular_record(config_path, SOLVED_CONFIG, "Solved configuration")
     return {
-        "scheme": "unikraft.git-ls-tree-v1",
+        "scheme": "unikraft.git-physical-tree-v2",
         "head_commit": head,
         "tree_sha256": hashlib.sha256(tree).hexdigest(),
-        "tracked_entries": tree.count(b"\0"),
+        **physical,
         "config": config,
         "git": git,
     }
@@ -1801,16 +2182,20 @@ def write_git_wrapper(path, git_runtime):
     lines = ["#!/bin/sh", "set -eu"]
     for name in (
         "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_EXEC_PATH",
-        "GIT_OPTIONAL_LOCKS", "LC_ALL",
+        "GIT_OPTIONAL_LOCKS", "GIT_NO_REPLACE_OBJECTS", "HOME",
+        "XDG_CONFIG_HOME", "OPENSSL_CONF", "OPENSSL_MODULES", "LC_ALL",
+        "PATH",
     ):
         lines.append(
             f"export {name}={shlex.quote(str(environment[name]))}"
         )
-    executable = Path(git_runtime) / GIT_EXECUTABLE
     lines.append(
         "exec "
-        f"{shlex.quote(str(executable))} "
-        "-c core.fsmonitor=false -c core.hooksPath=/dev/null \"$@\""
+        + " ".join(
+            shlex.quote(value)
+            for value in git_runtime_command(git_runtime, [])
+        )
+        + ' "$@"'
     )
     save_private_bytes(path, ("\n".join(lines) + "\n").encode())
     path.chmod(0o700)
@@ -1940,7 +2325,9 @@ def build_private_image(
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
     ]
-    environment = git_environment(relocated_git)
+    environment = git_environment(relocated_git, isolate_path=False)
+    environment.pop("OPENSSL_CONF")
+    environment.pop("OPENSSL_MODULES")
     environment.update({
         "PATH": str(wrappers) + os.pathsep + environment.get("PATH", ""),
         "TMPDIR": str(temporary),
@@ -1949,6 +2336,7 @@ def build_private_image(
         "ZIG_LOCAL_CACHE_DIR": str(cache / "zig-local"),
         "PYTHONPYCACHEPREFIX": str(cache / "pycache"),
         "HOME": str(home),
+        "XDG_CONFIG_HOME": str(cache / "xdg-config"),
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_EXEC_PATH": str(relocated_git / "disabled-exec-path"),
@@ -2263,7 +2651,7 @@ def copy_record(source, destination, record):
 
 def copy_git_runtime(source, destination, expected=None):
     source = Path(source).resolve(strict=True)
-    record = git_runtime_record(source)
+    record = preflight_git_runtime(source)
     if expected is not None and record != expected:
         raise ValueError("Private Git runtime differs from its fingerprint")
     destination.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -2276,7 +2664,7 @@ def copy_git_runtime(source, destination, expected=None):
         )
         copy_record(entry, destination / relative, member)
         (destination / relative).chmod(
-            0o700 if relative == GIT_EXECUTABLE else 0o600
+            0o700 if relative in (GIT_EXECUTABLE, GIT_LOADER) else 0o600
         )
     copied = preflight_git_runtime(destination)
     if copied != record:
@@ -2494,7 +2882,7 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
     )
     check_blob_dependency()
     git_source = source / GIT_RUNTIME
-    if git_runtime_record(git_source) != manifest["provenance"]["git"]:
+    if preflight_git_runtime(git_source) != manifest["provenance"]["git"]:
         raise ValueError("Pinned Git runtime does not match the manifest")
     if (
         manifest["implementation"] != implementation_contract()
@@ -2854,7 +3242,7 @@ def verify_immutable_inputs(state, state_directory):
         or not config_path.is_file()
         or config_path.stat().st_size != config["size"]
         or azure.image_sha256(config_path) != config["sha256"]
-        or git_runtime_record(git) != manifest["provenance"]["git"]
+        or preflight_git_runtime(git) != manifest["provenance"]["git"]
         or build_provenance(SUPPORT.parent, config_path, git)
         != manifest["provenance"]
     ):

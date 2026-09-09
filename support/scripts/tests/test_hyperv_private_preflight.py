@@ -6,7 +6,9 @@ import hashlib
 import importlib
 import io
 import json
+import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -50,19 +52,75 @@ def create_git_runtime(root):
     (runtime / "bin").mkdir(parents=True)
     git = selected_git_executable()
     shutil.copy2(git, runtime / preflight.GIT_EXECUTABLE)
-    if "/.pixi/envs/" in str(git):
-        library_directory = git.parent.parent / "lib"
-        (runtime / "lib").mkdir()
-        for name in (
-            "libpcre2-8.so.0", "libz.so.1", "libiconv.so.2",
-            "libcrypto.so.3",
-        ):
-            shutil.copy2(
-                (library_directory / name).resolve(),
-                runtime / "lib" / name,
-            )
+    (runtime / "lib").mkdir()
+    result = subprocess.run(
+        ["ldd", str(git)], capture_output=True, check=True, text=True,
+        env={"LC_ALL": "C", "PATH": os.environ.get("PATH", "")},
+    )
+    loader = None
+    libraries = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("linux-vdso.so.1 "):
+            continue
+        match = re.fullmatch(r"(\S+) => (/.+) \(0x[0-9a-fA-F]+\)", line)
+        if match is not None:
+            libraries[match.group(1)] = Path(match.group(2)).resolve()
+            continue
+        match = re.fullmatch(r"(/.+) \(0x[0-9a-fA-F]+\)", line)
+        if match is not None:
+            loader = Path(match.group(1)).resolve()
+            continue
+        raise RuntimeError("Unable to stage the test Git runtime")
+    if loader is None or not libraries:
+        raise RuntimeError("The test Git runtime closure is incomplete")
+    shutil.copy2(loader, runtime / preflight.GIT_LOADER)
+    for name, source in libraries.items():
+        shutil.copy2(source, runtime / "lib" / name)
+    (runtime / preflight.GIT_EXECUTABLE).chmod(0o700)
+    (runtime / preflight.GIT_LOADER).chmod(0o700)
+    for library in libraries:
+        (runtime / "lib" / library).chmod(0o600)
     preflight.preflight_git_runtime(runtime)
     return runtime
+
+
+def fake_git_runtime_record():
+    executable = {
+        "name": preflight.GIT_EXECUTABLE.as_posix(),
+        "sha256": "d" * 64,
+        "size": 1,
+    }
+    loader = {
+        "name": preflight.GIT_LOADER.as_posix(),
+        "sha256": "e" * 64,
+        "size": 1,
+    }
+    libraries = [{
+        "name": "lib/libc.so.6",
+        "sha256": "f" * 64,
+        "size": 1,
+    }]
+    members = sorted(
+        (executable, loader, *libraries), key=lambda item: item["name"]
+    )
+    digest = hashlib.sha256()
+    for member in members:
+        encoded = member["name"].encode()
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(member["size"].to_bytes(8, "big"))
+        digest.update(bytes.fromhex(member["sha256"]))
+    return {
+        "schema": preflight.GIT_RUNTIME_SCHEMA,
+        "name": preflight.GIT_RUNTIME,
+        "sha256": digest.hexdigest(),
+        "size": sum(member["size"] for member in members),
+        "files": len(members),
+        "executable": executable,
+        "loader": loader,
+        "libraries": libraries,
+    }
 
 
 def modeled_host_disk_output_order(template):
@@ -355,27 +413,18 @@ class PrivatePreflightFixture(unittest.TestCase):
             "size": 1024 * 1024,
         }]
         provenance = {
-            "scheme": "unikraft.git-ls-tree-v1",
+            "scheme": "unikraft.git-physical-tree-v2",
             "head_commit": "a" * 40,
             "tree_sha256": "b" * 64,
+            "physical_sha256": "9" * 64,
             "tracked_entries": 200,
+            "tracked_bytes": 1024 * 1024,
             "config": {
                 "name": preflight.SOLVED_CONFIG,
                 "sha256": "c" * 64,
                 "size": 4096,
             },
-            "git": {
-                "schema": preflight.GIT_RUNTIME_SCHEMA,
-                "name": preflight.GIT_RUNTIME,
-                "sha256": "d" * 64,
-                "size": 1,
-                "files": 1,
-                "executable": {
-                    "name": preflight.GIT_EXECUTABLE.as_posix(),
-                    "sha256": "e" * 64,
-                    "size": 1,
-                },
-            },
+            "git": fake_git_runtime_record(),
         }
         guarded = (
             self.guarded_contract(provenance["config"]["sha256"])
@@ -778,9 +827,10 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         )
         self.assertIn('-Dmake-command="$MAKE"', recipe)
         self.assertNotIn("$LLVM_BIN:$PATH", recipe)
-        self.assertIn('exec "$GIT_RUNTIME/bin/git"', recipe)
+        self.assertIn('exec "$GIT_RUNTIME/lib/loader"', recipe)
+        self.assertIn("--no-replace-objects", recipe)
         self.assertIn('--git-runtime "$GIT_RUNTIME"', readme)
-        self.assertIn("canonical schema-8 manifest", readme)
+        self.assertIn("canonical schema-9 manifest", readme)
 
     def test_guarded_contract_is_derived_from_exact_solved_v2_config(self):
         preflight.verify_guarded_producer_sources(SUPPORT.parent)
@@ -1060,19 +1110,37 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 )
             cloud.assert_not_called()
 
-    def test_provenance_generator_hashes_clean_git_tree_and_config(self):
+    def test_provenance_binds_physical_tree_and_rejects_concealment(self):
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary)
-            (repository / "support").mkdir()
-            config = repository / "solved.config"
+            root = Path(temporary)
+            repository = root / "repository"
+            (repository / "support").mkdir(parents=True)
+            config = root / "solved.config"
             config.write_text("CONFIG_HYPERV=y\n")
             git_command = str(selected_git_executable())
             subprocess.run(
                 [git_command, "init", "-q"], cwd=repository, check=True
             )
             (repository / "tracked").write_text("source\n")
+            production = repository / "lib" / "ukboot" / "boot.c"
+            production.parent.mkdir(parents=True)
+            production.write_bytes(
+                (SUPPORT.parent / "lib" / "ukboot" / "boot.c").read_bytes()
+            )
+            unusual = repository / "tracked\nname\twith-bytes"
+            unusual.write_bytes(b"binary-safe\n")
+            executable = repository / "tracked-executable"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+            link = repository / "tracked-link"
+            link.symlink_to("tracked")
             subprocess.run(
-                [git_command, "add", "tracked"], cwd=repository, check=True
+                [
+                    git_command, "add", "--", "tracked",
+                    "lib/ukboot/boot.c", unusual.name,
+                    executable.name, link.name,
+                ],
+                cwd=repository, check=True,
             )
             subprocess.run(
                 [
@@ -1082,8 +1150,8 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 ],
                 cwd=repository, check=True,
             )
-            git_runtime = create_git_runtime(repository / "tools")
-            fake_bin = repository / "fake-bin"
+            git_runtime = create_git_runtime(root / "tools")
+            fake_bin = root / "fake-bin"
             fake_bin.mkdir()
             fake_git = fake_bin / "git"
             fake_git.write_text(
@@ -1102,6 +1170,8 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     "GIT_CONFIG_VALUE_0": "forged",
                     "LD_LIBRARY_PATH": str(repository / "forged-libs"),
                     "LD_PRELOAD": str(repository / "forged-preload.so"),
+                    "LD_DEBUG": "all",
+                    "GLIBC_TUNABLES": "glibc.rtld.dynamic_sort=1",
                 },
             ):
                 first = preflight.build_provenance(
@@ -1111,8 +1181,16 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     repository, config, git_runtime
                 )
             self.assertEqual(first, second)
-            self.assertEqual(first["scheme"], "unikraft.git-ls-tree-v1")
-            self.assertEqual(first["tracked_entries"], 1)
+            self.assertEqual(
+                first["scheme"], "unikraft.git-physical-tree-v2"
+            )
+            self.assertEqual(first["tracked_entries"], 5)
+            self.assertEqual(
+                first["tracked_bytes"],
+                len(b"source\n") + production.stat().st_size
+                + len(b"binary-safe\n") + len(b"#!/bin/sh\nexit 0\n")
+                + len(b"tracked"),
+            )
             self.assertEqual(
                 first["git"], preflight.git_runtime_record(git_runtime)
             )
@@ -1127,11 +1205,122 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 first["config"]["sha256"], changed["config"]["sha256"]
             )
 
+            with mock.patch.object(
+                preflight, "SUPPORT", repository / "support"
+            ):
+                tree = preflight.parse_git_tree(preflight.git_output(
+                    git_runtime, repository,
+                    ["ls-tree", "-r", "--full-tree", "-z", "HEAD"],
+                ))
+                executable.chmod(0o644)
+                with self.assertRaisesRegex(ValueError, "mode changed"):
+                    preflight.verify_physical_git_tree(repository, tree)
+                executable.chmod(0o755)
+                link.unlink()
+                link.write_bytes(b"tracked")
+                with self.assertRaisesRegex(ValueError, "symlink type"):
+                    preflight.verify_physical_git_tree(repository, tree)
+                link.unlink()
+                link.symlink_to("tracked")
+
+            original_production = production.read_bytes()
+            subprocess.run(
+                [
+                    git_command, "update-index", "--assume-unchanged",
+                    "--", "lib/ukboot/boot.c",
+                ],
+                cwd=repository, check=True,
+            )
+            production.write_bytes(original_production + b"\nconcealed\n")
+            with mock.patch.object(
+                preflight, "SUPPORT", repository / "support"
+            ):
+                tree = preflight.parse_git_tree(preflight.git_output(
+                    git_runtime, repository,
+                    ["ls-tree", "-r", "--full-tree", "-z", "HEAD"],
+                ))
+                with self.assertRaisesRegex(
+                    ValueError, "Physical tracked source"
+                ):
+                    preflight.verify_physical_git_tree(repository, tree)
+                with self.assertRaisesRegex(
+                    ValueError, "concealment flags"
+                ):
+                    preflight.build_provenance(
+                        repository, config, git_runtime
+                    )
+            production.write_bytes(original_production)
+            subprocess.run(
+                [
+                    git_command, "update-index", "--no-assume-unchanged",
+                    "--", "lib/ukboot/boot.c",
+                ],
+                cwd=repository, check=True,
+            )
+
+            subprocess.run(
+                [
+                    git_command, "update-index", "--skip-worktree",
+                    "--", "lib/ukboot/boot.c",
+                ],
+                cwd=repository, check=True,
+            )
+            production.write_bytes(original_production + b"\nskipped\n")
+            with mock.patch.object(
+                preflight, "SUPPORT", repository / "support"
+            ), self.assertRaisesRegex(ValueError, "concealment flags"):
+                preflight.build_provenance(
+                    repository, config, git_runtime
+                )
+            production.write_bytes(original_production)
+            subprocess.run(
+                [
+                    git_command, "update-index", "--no-skip-worktree",
+                    "--", "lib/ukboot/boot.c",
+                ],
+                cwd=repository, check=True,
+            )
+
+            original_head = subprocess.run(
+                [git_command, "rev-parse", "HEAD"],
+                cwd=repository, check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            production.write_bytes(original_production + b"\nreplacement\n")
+            subprocess.run(
+                [git_command, "add", "--", "lib/ukboot/boot.c"],
+                cwd=repository, check=True,
+            )
+            subprocess.run(
+                [
+                    git_command, "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid",
+                    "commit", "-qm", "replacement",
+                ],
+                cwd=repository, check=True,
+            )
+            replacement = subprocess.run(
+                [git_command, "rev-parse", "HEAD"],
+                cwd=repository, check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [git_command, "reset", "--hard", "-q", original_head],
+                cwd=repository, check=True,
+            )
+            subprocess.run(
+                [git_command, "replace", original_head, replacement],
+                cwd=repository, check=True,
+            )
+            with mock.patch.object(
+                preflight, "SUPPORT", repository / "support"
+            ), self.assertRaisesRegex(ValueError, "replacement refs"):
+                preflight.build_provenance(
+                    repository, config, git_runtime
+                )
+
     def test_private_build_rejects_unbound_git_launcher_before_native_build(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            runtime = root / "runtime"
-            (runtime / "bin").mkdir(parents=True)
+            runtime = create_git_runtime(root / "launcher-tools")
             shutil.copy2(
                 Path(shutil.which("true")).resolve(),
                 runtime / preflight.GIT_EXECUTABLE,
@@ -1140,7 +1329,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 preflight, "build_provenance"
             ) as provenance:
                 with self.assertRaisesRegex(
-                    ValueError, "not a relocatable Git executable"
+                    ValueError, "dependency closure"
                 ):
                     preflight.build_private_image(
                         root / "output", root, root / "config",
@@ -1164,11 +1353,67 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     ambient, pixi_runtime / preflight.GIT_EXECUTABLE
                 )
                 with self.assertRaisesRegex(
-                    ValueError, "not a relocatable Git executable"
+                    ValueError, "requires bin/git"
                 ):
                     preflight.copy_git_runtime(
                         pixi_runtime, root / "copied-pixi-runtime"
                     )
+
+    def test_git_runtime_requires_complete_exact_relocated_dependency_closure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = create_git_runtime(root / "valid")
+            expected = preflight.preflight_git_runtime(runtime)
+            preferred = (
+                runtime / "lib" / "libz.so.1"
+                if (runtime / "lib" / "libz.so.1").is_file()
+                else runtime / expected["libraries"][0]["name"]
+            )
+            missing_targets = [
+                runtime / "lib" / name
+                for name in ("libz.so.1", "libcrypto.so.3")
+                if (runtime / "lib" / name).is_file()
+            ] or [preferred]
+            for index, missing_target in enumerate(missing_targets):
+                with self.subTest(missing=missing_target.name):
+                    missing = root / f"missing-{index}"
+                    shutil.copytree(runtime, missing)
+                    (
+                        missing / missing_target.relative_to(runtime)
+                    ).unlink()
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "ambient dependency|closure is incomplete",
+                    ):
+                        preflight.preflight_git_runtime(missing)
+
+            changed = root / "changed"
+            shutil.copytree(runtime, changed)
+            target = changed / preferred.relative_to(runtime)
+            target.write_bytes(target.read_bytes() + b"\0")
+            with self.assertRaisesRegex(ValueError, "differs"):
+                preflight.copy_git_runtime(
+                    changed, root / "changed-copy", expected
+                )
+
+            extra = root / "extra"
+            shutil.copytree(runtime, extra)
+            shutil.copy2(
+                extra / expected["libraries"][0]["name"],
+                extra / "lib" / "unresolved-extra.so",
+            )
+            with self.assertRaisesRegex(ValueError, "closure is incomplete"):
+                preflight.preflight_git_runtime(extra)
+
+            linked = root / "linked"
+            shutil.copytree(runtime, linked)
+            target = linked / preferred.relative_to(runtime)
+            target.unlink()
+            target.symlink_to(
+                runtime / preferred.relative_to(runtime)
+            )
+            with self.assertRaisesRegex(ValueError, "must not contain symlinks"):
+                preflight.preflight_git_runtime(linked)
 
     def test_generate_input_creates_complete_canonical_operator_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1279,13 +1524,24 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 )
                 state, _ = preflight.load_state(state_directory)
                 preflight.verify_immutable_inputs(state, state_directory)
-            self.assertEqual(
-                preflight.git_runtime_record(
+                prepared_runtime = (
                     state_directory / "local-tools"
                     / preflight.GIT_RUNTIME
-                ),
-                provenance["git"],
-            )
+                )
+                self.assertEqual(
+                    preflight.git_runtime_record(prepared_runtime),
+                    provenance["git"],
+                )
+                (
+                    prepared_runtime
+                    / provenance["git"]["libraries"][0]["name"]
+                ).unlink()
+                with self.assertRaisesRegex(
+                    ValueError, "ambient dependency|Prepared source"
+                ):
+                    preflight.verify_immutable_inputs(
+                        state, state_directory
+                    )
             manifest_bytes = (
                 output / preflight.INPUT_MANIFEST
             ).read_bytes()
@@ -1362,13 +1618,20 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             repository = root / "repository"
             support = repository / "support"
             (support / "apps" / "hyperv-acceptance").mkdir(parents=True)
+            native_runner = support / "build" / "native-postprocess-runner.py"
+            native_runner.parent.mkdir(parents=True)
+            native_runner.write_text("raise SystemExit(0)\n")
+            uk_reloc = support / "scripts" / "mkukreloc.py"
+            uk_reloc.parent.mkdir(parents=True)
+            uk_reloc.write_text("raise SystemExit(0)\n")
             (repository / "tracked").write_text("source\n")
             git_command = str(selected_git_executable())
             subprocess.run(
                 [git_command, "init", "-q"], cwd=repository, check=True
             )
             subprocess.run(
-                [git_command, "add", "tracked"], cwd=repository, check=True
+                [git_command, "add", "tracked", "support"],
+                cwd=repository, check=True,
             )
             subprocess.run(
                 [
@@ -1385,12 +1648,6 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             zig_target = tools / "zig-real"
             invoked = tools / "zig-invoked"
             invoked_args = tools / "zig-invoked-args"
-            native_runner = support / "build" / "native-postprocess-runner.py"
-            native_runner.parent.mkdir(parents=True)
-            native_runner.write_text("raise SystemExit(0)\n")
-            uk_reloc = support / "scripts" / "mkukreloc.py"
-            uk_reloc.parent.mkdir(parents=True)
-            uk_reloc.write_text("raise SystemExit(0)\n")
             zig_target.write_text(
                 "#!/bin/sh\nset -eu\nout=''\n"
                 f"printf '%s' \"$0\" > {invoked}\n"
@@ -1522,6 +1779,14 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             )
             self.assertIn(
                 str(output / preflight.GIT_RUNTIME / preflight.GIT_EXECUTABLE),
+                (output / ".tool-bin" / "git").read_text(),
+            )
+            self.assertIn(
+                str(output / preflight.GIT_RUNTIME / preflight.GIT_LOADER),
+                (output / ".tool-bin" / "git").read_text(),
+            )
+            self.assertIn(
+                "--no-replace-objects",
                 (output / ".tool-bin" / "git").read_text(),
             )
 
