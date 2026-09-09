@@ -445,6 +445,9 @@ The [Azure acceptance controller](support/azure/README.md) uses native `miz`
 packaging, locally boots both GPT/raw and fixed-VHD images, and manages a
 private, ownership-tagged Gen2 deployment with separate platform and real-I/O
 acceptance markers.
+Its separate exact two-boot StorVSC controller is destructive and default-off:
+credential-free fixtures do not replace an approved exact-image private x86
+preflight or an explicitly authorized one-VM/two-disk Azure run.
 
 NetVSC never guesses past a structurally malformed VMBus ring record. It
 disables channel callbacks and requests bounded VMBus reconnect, then closes

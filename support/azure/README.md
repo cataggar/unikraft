@@ -471,6 +471,153 @@ signing-key fingerprint, a deallocated host, and the original
 IDs and exact byte total of both host receipts plus all six serial logs must
 also match the durable state.
 
+## Exact two-boot persistence controller
+
+`support/scripts/hyperv_persistence_controller.py` is the destructive,
+default-off consumer for one separately authorized disposable Azure run. It
+does not build, reseed, convert, or discover a resource budget. It requires:
+
+- an operator-supplied canonical schema-1
+  `unikraft.hyperv.persistence-two-boot-contract`;
+- explicit 128-bit run and disk IDs, 512-byte logical geometry and Azure LUN;
+- one exact subscription, region, VM size/vCPU count, resource prefix, disk
+  SKUs, runtime, cleanup duration, and fixed one-VM/two-disk resource count;
+- the exact guarded V2 guest fixed VHD, raw seed, matching fixed data VHD and
+  generator receipt;
+- a completed schema-1
+  `unikraft.hyperv.persistence-exact-image-preflight` handoff from the private
+  x86 preflight, binding the same guest VHD, source tree, solved configuration,
+  private build receipt, toolchain, input manifest, host boot evidence and
+  completed cleanup.
+
+The controller accepts only whole-MiB 512-byte geometry, capped at 2 TiB; the
+operator chooses the exact approved value. WRITE(16) coverage uses the
+workload's low-LBA command selection and does not require a disk larger than
+2 TiB. Azure billing/allocation tiers do not replace the exact guest-visible
+SCSI capacity and Azure-reported `diskSizeBytes` checks.
+
+A build or packaging receipt, local ARM-hosted fixture, or prepared private
+preflight state is not this handoff. The preflight consumer must finish its
+actual private x86 boots and owner-checked cleanup first. The handoff is a
+private interface: do not publish its host UUIDs, image identifiers, source
+policy, serial evidence, seed, contract, or resulting receipts.
+
+Generate the seed and fixed data VHD before the one final guarded-image build:
+
+```shell
+python3 support/scripts/hyperv-storage-manifest.py \
+  --output-prefix "$PWD/.d/persistence/run" \
+  --identity-policy seed-enrollment-v2 \
+  --run-id "$PRIVATE_RUN_ID" --disk-id "$PRIVATE_DISK_ID" \
+  --sectors "$APPROVED_SECTORS" --lun "$APPROVED_LUN" --fixed-vhd
+```
+
+After the exact image completes private x86 preflight, create the fully
+explicit contract. The command makes no cloud calls and creates a new
+owner-only file:
+
+```shell
+PYTHONPATH=support/scripts python3 \
+  support/scripts/hyperv_persistence_controller.py create-contract \
+  --output "$PRIVATE/contract.json" \
+  --run-id "$PRIVATE_RUN_ID" --disk-id "$PRIVATE_DISK_ID" \
+  --sectors "$APPROVED_SECTORS" --lun "$APPROVED_LUN" \
+  --subscription "$EXPLICIT_SUBSCRIPTION" --location "$APPROVED_LOCATION" \
+  --vm-size "$APPROVED_VM_SIZE" --vm-vcpus "$APPROVED_VCPUS" \
+  --name-prefix "$APPROVED_PREFIX" \
+  --os-disk-sku "$APPROVED_OS_SKU" \
+  --data-disk-sku "$APPROVED_DATA_SKU" \
+  --runtime-seconds "$APPROVED_RUNTIME" \
+  --cleanup-seconds "$APPROVED_CLEANUP_RUNTIME" \
+  --guest-vhd "$PRIVATE_GUEST_VHD" \
+  --data-raw "$PWD/.d/persistence/run.raw" \
+  --data-vhd "$PWD/.d/persistence/run.vhd" \
+  --seed-manifest "$PWD/.d/persistence/run.json" \
+  --preflight-receipt "$PRIVATE_EXACT_IMAGE_PREFLIGHT"
+```
+
+The generator prints both the whole contract SHA-256 and the separately
+approved Azure resource-envelope SHA-256. `prepare` revalidates the current
+controller/template/uploader/requirements fingerprints, preflight binding,
+seed records and CRC, pristine intent/receipt/write regions, fixed-VHD
+footer/checksum, exact data-region equality, and all file hashes before copying
+them into new durable private state:
+
+```shell
+python3 support/scripts/hyperv_persistence_controller.py prepare \
+  --contract "$PRIVATE/contract.json" \
+  --expected-contract-sha256 "$CONTRACT_SHA256" \
+  --state-dir "$PRIVATE/state" \
+  --guest-vhd "$PRIVATE_GUEST_VHD" \
+  --data-raw "$PWD/.d/persistence/run.raw" \
+  --data-vhd "$PWD/.d/persistence/run.vhd" \
+  --seed-manifest "$PWD/.d/persistence/run.json" \
+  --preflight-receipt "$PRIVATE_EXACT_IMAGE_PREFLIGHT"
+```
+
+`run` remains inert unless both the exact subscription and the SHA-256 of the
+contract's Azure resource envelope are supplied with the explicit approval
+flag. Actual data-disk allocation and this cloud action require separate user
+authorization:
+
+```shell
+python3 support/scripts/hyperv_persistence_controller.py run \
+  --state-dir "$PRIVATE/state" \
+  --subscription "$EXPLICIT_SUBSCRIPTION" \
+  --approved-resource-envelope-sha256 "$RESOURCE_ENVELOPE_SHA256" \
+  --approve-cloud-run
+```
+
+The controller creates one owned group, uploads one OS VHD and one seeded data
+VHD with the existing SDK page uploader, and records each disk `uniqueId`
+directly from its create response. One incremental deployment returns the
+guest VM `vmId`; cleanup may re-read that original deployment output when its
+create response was interrupted, but never enrolls an identity from names,
+tags, ARM IDs, or live-resource UUIDs. Before each boundary it verifies
+reciprocal VM/disk attachment, geometry, LUN, ownership tags and all three
+UUIDs.
+
+The deployment itself is Boot 1. The controller accepts exactly one ordered V2
+identity, five-write/three-flush/receipt record, Boot 1 completion and normal
+return. It stores the exact serial prefix, deallocates the proven VM, durably
+records `boot_count=2` before the sole `vm start`, and treats that start as Boot
+2. The second serial segment must append to the unchanged Boot 1 prefix and
+must contain the same controller GUID, path, target, LUN, VPD, run/disk IDs and
+geometry, a zero-write/zero-flush receipt readback, Boot 2 completion and
+normal return. Any Boot 1/write/reseed marker in the Boot 2 segment fails even
+if a later line says PASS. Unavailable/no-device evidence is never persistence
+success.
+
+Interrupted mutation phases cannot be resumed or re-enrolled; they may only
+enter explicit cleanup, preventing a replacement or third boot. Cleanup gets
+its own deadline, independently verifies and deallocates a proven VM even when
+one disk is unproven, refuses replacement UUIDs or foreign resources, preserves
+both primary and cleanup failures, and deletes the group only when every
+extant resource is an owner-verified member of the fixed envelope. Interrupted
+creation may leave a strict subset, but an extant VM or disk still requires its
+original UUID proof. A successful private receipt binds both serial segments,
+the complete enrolled identity, immutable provenance, the same
+VM/OS-disk/data-disk UUIDs, exact two-boot count and completed cleanup.
+
+Credential-free Python and hosted driver fixtures exercise this state machine
+with synthetic IDs. They do not establish local x86/KVM capability, completion
+of the private exact-image preflight, Azure allocation authorization, or actual
+two-boot durability.
+
+Cleanup remains available without granting permission for another run:
+
+```shell
+python3 support/scripts/hyperv_persistence_controller.py cleanup \
+  --state-dir "$PRIVATE/state" \
+  --subscription "$EXPLICIT_SUBSCRIPTION"
+```
+
+Its independent deadline never renews the acceptance deadline. If deletion
+completed after the accepted receipt was durably staged, a later cleanup
+invocation finalizes that same receipt rather than starting another boot.
+
+## Private nested-KVM platform preflight cleanup
+
 Private manifests, SAS values, host identity, serial logs, and receipts remain
 in owner-only local state and authenticated Blob/control-plane parameters.
 Ordinary CLI errors redact identifiers and credentials. The operator needs
