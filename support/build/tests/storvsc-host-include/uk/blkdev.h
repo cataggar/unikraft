@@ -97,4 +97,16 @@ struct uk_blkdev {
 };
 #define UK_BLKDEV_STATUS_SUCCESS 0x1
 #define UK_BLKDEV_STATUS_MORE 0x2
+struct uk_blkdev *uk_blkdev_get(uint16_t id);
+enum uk_blkdev_state uk_blkdev_state_get(struct uk_blkdev *device);
+int uk_blkdev_configure(struct uk_blkdev *device,
+			const struct uk_blkdev_conf *config);
+int uk_blkdev_queue_configure(struct uk_blkdev *device, uint16_t queue_id,
+			      uint16_t descriptors,
+			      const struct uk_blkdev_queue_conf *config);
+int uk_blkdev_start(struct uk_blkdev *device);
+int uk_blkdev_queue_intr_enable(struct uk_blkdev *device, uint16_t queue_id);
+int uk_blkdev_queue_submit_one(struct uk_blkdev *device, uint16_t queue_id,
+			       struct uk_blkreq *request);
+int uk_blkdev_queue_finish_reqs(struct uk_blkdev *device, uint16_t queue_id);
 #endif

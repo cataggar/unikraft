@@ -56,6 +56,7 @@ def main() -> None:
             "uk_storvsc_mapping_count",
             "uk_storvsc_mapping_get",
             "uk_storvsc_mapping_find",
+            "uk_storvsc_inventory_get",
         ):
             if symbol not in references:
                 raise SystemExit(f"missing unmangled mapping API in {path}: {symbol}")

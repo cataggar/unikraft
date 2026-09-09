@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "acceptance_protocol.h"
 #include "application_network.h"
+#include "persistence.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -16,6 +17,21 @@
 #include <uk/sched.h>
 #include <uk/vmbus.h>
 
+#if defined(CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE) && \
+	CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE && \
+	defined(CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION) && \
+	CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+#error "persistence and application-network workloads are mutually exclusive"
+#endif
+
+#if defined(CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE) && \
+	CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE
+#define HYPERV_ACCEPTANCE_PERSISTENCE_ENABLED 1
+#else
+#define HYPERV_ACCEPTANCE_PERSISTENCE_ENABLED 0
+#endif
+
+#if !HYPERV_ACCEPTANCE_PERSISTENCE_ENABLED
 #define BLOCK_QUEUE_DEPTH 4U
 #define BLOCK_SECTORS_TO_READ 2U
 #define BLOCK_SECTOR_SIZE_MAX 4096U
@@ -511,9 +527,13 @@ static enum hyperv_acceptance_result probe_network(
 	return HYPERV_ACCEPTANCE_FAIL;
 }
 #endif
+#endif
 
 int main(void)
 {
+#if HYPERV_ACCEPTANCE_PERSISTENCE_ENABLED
+	return hyperv_acceptance_persistence_main();
+#else
 	enum hyperv_acceptance_result storage;
 	enum hyperv_acceptance_result network;
 	enum hyperv_acceptance_result final;
@@ -556,4 +576,5 @@ int main(void)
 	       result_name(final), result_name(storage), result_name(network));
 	fflush(stdout);
 	return (int)final;
+#endif
 }

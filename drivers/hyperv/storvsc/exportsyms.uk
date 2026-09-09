@@ -1,6 +1,7 @@
 uk_storvsc_mapping_count
 uk_storvsc_mapping_get
 uk_storvsc_mapping_find
+uk_storvsc_inventory_get
 uk_storvsc_target_get
 uk_storvsc_session_begin_read
 uk_storvsc_session_authorize_write

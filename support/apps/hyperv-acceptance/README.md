@@ -268,6 +268,19 @@ and flushes a completion receipt at LBA 17. Boot 2 requires the enrolled
 controller/VPD identity and valid receipt, rereads every pattern, and performs
 no writes.
 
+The controller and LUN limits reserve identities for the life of the boot;
+they are not reusable active-slot limits after removal. Mapping and inventory
+snapshots are observations, not immutable disk pins. Candidate enumeration,
+rejected sessions, the retained candidate, and write authorization are bound
+to one topology generation, and any enumerate, removal, reset, or rebind makes
+the session permanently stale. If an accepted request exceeds the workload
+deadline, its descriptor and DMA storage remain reserved and immutable and
+the workload cannot issue more I/O or end the session during that boot.
+
+Persistence and application-network workloads are mutually exclusive Kconfig
+choices. The default selection remains the non-destructive storage/network
+smoke probe.
+
 Stable success markers are:
 
 - `UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:<run-id>`

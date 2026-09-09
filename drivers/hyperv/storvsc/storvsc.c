@@ -493,6 +493,10 @@ static void storvsc_process_async_event(struct storvsc_device *device,
 	case STORVSC_EVENT_REMOVE_DEVICE:
 		(void)storvsc_schedule_fatal(device, -ENODEV);
 		break;
+	case STORVSC_EVENT_ENUMERATE_BUS:
+		if (storvsc_guarded_io_enabled)
+			(void)storvsc_schedule_fatal(device, -ESTALE);
+		break;
 	case STORVSC_EVENT_PROTOCOL_ERROR:
 	case STORVSC_EVENT_INITIALIZATION_FAILED:
 		(void)storvsc_schedule_fatal(device,
@@ -502,7 +506,6 @@ static void storvsc_process_async_event(struct storvsc_device *device,
 	case STORVSC_EVENT_INITIALIZATION_READY:
 		(void)storvsc_schedule_fatal(device, -EPROTO);
 		break;
-	case STORVSC_EVENT_ENUMERATE_BUS:
 	case STORVSC_EVENT_REQUEST_TIMEOUT:
 	case STORVSC_EVENT_IGNORED:
 	default:
@@ -2061,6 +2064,41 @@ int uk_storvsc_mapping_find(__u16 blkdev_id,
 			return storvsc_copy_mapping(entries[i], mapping);
 	}
 	return -ENOENT;
+}
+
+int uk_storvsc_inventory_get(
+	struct uk_storvsc_inventory_snapshot *snapshot)
+{
+	struct storvsc_lun *entries[
+		CONFIG_LIBSTORVSC_MAX_DEVICES * CONFIG_LIBSTORVSC_MAX_LUNS];
+	__u64 before;
+	__u64 after;
+	unsigned int count;
+	unsigned int attempt;
+
+	if (!snapshot)
+		return -EINVAL;
+	memset(snapshot, 0, sizeof(*snapshot));
+	for (attempt = 0; attempt < 4; attempt++) {
+		before = __atomic_load_n(
+			&storvsc_topology_generation, __ATOMIC_ACQUIRE);
+		if (before == UINT64_MAX)
+			return -EOVERFLOW;
+		count = storvsc_collect_mappings(
+			entries, CONFIG_LIBSTORVSC_MAX_DEVICES *
+					 CONFIG_LIBSTORVSC_MAX_LUNS);
+		after = __atomic_load_n(
+			&storvsc_topology_generation, __ATOMIC_ACQUIRE);
+		if (before == after) {
+			snapshot->version =
+				UK_STORVSC_INVENTORY_SNAPSHOT_VERSION;
+			snapshot->size = sizeof(*snapshot);
+			snapshot->topology_generation = before;
+			snapshot->count = count;
+			return 0;
+		}
+	}
+	return -EAGAIN;
 }
 
 static int storvsc_fill_target_locked(

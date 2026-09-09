@@ -13,6 +13,7 @@ extern "C" {
 #define UK_STORVSC_INSTANCE_ID_SIZE	16U
 #define UK_STORVSC_VPD_ID_MAX		64U
 #define UK_STORVSC_TARGET_SNAPSHOT_VERSION	1U
+#define UK_STORVSC_INVENTORY_SNAPSHOT_VERSION	1U
 #define UK_STORVSC_SESSION_VERSION		1U
 
 #define UK_STORVSC_CDB_AUTO	0U
@@ -48,6 +49,15 @@ struct uk_storvsc_target_snapshot {
 	struct uk_storvsc_mapping mapping;
 };
 
+struct uk_storvsc_inventory_snapshot {
+	uint16_t version;
+	uint16_t size;
+	uint32_t reserved;
+	uint64_t topology_generation;
+	uint32_t count;
+	uint32_t reserved2;
+};
+
 struct uk_storvsc_session {
 	uint16_t version;
 	uint16_t size;
@@ -69,6 +79,14 @@ int uk_storvsc_mapping_get(unsigned int index,
 			   struct uk_storvsc_mapping *mapping);
 int uk_storvsc_mapping_find(uint16_t blkdev_id,
 			    struct uk_storvsc_mapping *mapping);
+/*
+ * Returns a coherent active mapping count and topology generation. Callers
+ * that enumerate targets must require every target and a final inventory
+ * snapshot to carry the same generation. A snapshot does not pin a target;
+ * use a session for that purpose.
+ */
+int uk_storvsc_inventory_get(
+	struct uk_storvsc_inventory_snapshot *snapshot);
 int uk_storvsc_target_get(unsigned int index,
 			  struct uk_storvsc_target_snapshot *snapshot);
 
@@ -99,6 +117,7 @@ UK_CTASSERT(offsetof(struct uk_storvsc_mapping, sectors) == 32);
 UK_CTASSERT(offsetof(struct uk_storvsc_mapping, vpd_id) == 48);
 UK_CTASSERT(sizeof(struct uk_storvsc_target_snapshot) == 144);
 UK_CTASSERT(offsetof(struct uk_storvsc_target_snapshot, mapping) == 32);
+UK_CTASSERT(sizeof(struct uk_storvsc_inventory_snapshot) == 24);
 UK_CTASSERT(sizeof(struct uk_storvsc_session) == 48);
 
 #ifdef __cplusplus

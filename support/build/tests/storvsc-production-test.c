@@ -19,6 +19,9 @@
 #include <uk/thread.h>
 #include <uk/vmbus.h>
 
+#include "acceptance_protocol.h"
+#include "persistence.h"
+#include "persistence_host.h"
 #include "storvsc_core.h"
 
 #define TEST_CLOSE_RETRY_LIMIT 8
@@ -134,12 +137,16 @@ static uint64_t last_io_id;
 static uint32_t last_io_length;
 static uint8_t last_io_opcode;
 static unsigned int io_command_count;
+static unsigned int write10_command_count;
+static unsigned int write16_command_count;
+static unsigned int flush_command_count;
 static int backing_media_enabled;
-static uint8_t backing_media[128 * 512];
+static uint8_t backing_media[1000 * 512];
 static uint32_t last_pfn_count;
 static uint64_t last_pfns[64];
 static unsigned int close_count;
 static uint16_t next_blkdev_id;
+static struct uk_blkdev *registered_blkdevs[256];
 static unsigned int unregister_calls;
 static struct uk_blkdev *deferred_finish_device;
 static unsigned int deferred_finish_events;
@@ -163,6 +170,18 @@ static unsigned int race_pfns_written;
 static uint64_t race_first_pfn;
 static struct uk_blkreq *race_sender_request;
 static atomic_int race_post_completion_publication;
+static struct vmbus_driver *persistence_hook_driver;
+static struct vmbus_device *persistence_hook_device;
+static int persistence_hook_mode;
+static int persistence_hook_fired;
+static int persistence_hook_end_error;
+static int persistence_hook_timeouts;
+
+enum persistence_hook_mode {
+	PERSISTENCE_HOOK_NONE = 0,
+	PERSISTENCE_HOOK_ADD_BEFORE_REVALIDATE,
+	PERSISTENCE_HOOK_ADD_BEFORE_REJECT_END,
+};
 static atomic_int host_irqs_disabled;
 static atomic_int channel_mask_calls;
 static atomic_int channel_unmask_calls;
@@ -464,6 +483,32 @@ static void *thread_start(void *argument)
 struct uk_alloc *uk_alloc_get_default(void)
 {
 	return &host_allocator;
+}
+
+void hyperv_persistence_host_event(enum hyperv_persistence_host_event event,
+				  unsigned int index, int value)
+{
+	int should_add =
+		(persistence_hook_mode ==
+			 PERSISTENCE_HOOK_ADD_BEFORE_REVALIDATE &&
+		 event == HYPERV_PERSISTENCE_HOST_BEFORE_REVALIDATE) ||
+		(persistence_hook_mode ==
+			 PERSISTENCE_HOOK_ADD_BEFORE_REJECT_END &&
+		 event == HYPERV_PERSISTENCE_HOST_BEFORE_REJECT_END);
+
+	(void)index;
+	if (event == HYPERV_PERSISTENCE_HOST_SESSION_END_ERROR)
+		persistence_hook_end_error = value;
+	if (event == HYPERV_PERSISTENCE_HOST_IO_TIMEOUT)
+		persistence_hook_timeouts++;
+	if (!should_add || persistence_hook_fired)
+		return;
+	persistence_hook_fired = 1;
+	if (!persistence_hook_driver || !persistence_hook_device)
+		abort();
+	persistence_hook_device->present = 1;
+	if (persistence_hook_driver->add_dev(persistence_hook_device))
+		abort();
 }
 
 int storvsc_host_irqs_disabled(void)
@@ -861,6 +906,10 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 		last_io_length = transfer;
 		last_io_opcode = opcode;
 		io_command_count++;
+		if (opcode == 0x2a)
+			write10_command_count++;
+		else
+			write16_command_count++;
 		if (backing_media_enabled) {
 			uint64_t lba = scsi_io_lba(payload, opcode);
 
@@ -882,6 +931,7 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 		last_io_length = 0;
 		last_io_opcode = opcode;
 		io_command_count++;
+		flush_command_count++;
 		if (hold_io) {
 			if (pending_count >= 32)
 				abort();
@@ -1209,13 +1259,91 @@ int uk_blkdev_drv_register(struct uk_blkdev *device,
 	data->drv_name = name;
 	data->a = allocator;
 	device->_data = data;
+	if (data->id >= sizeof(registered_blkdevs) /
+			 sizeof(registered_blkdevs[0])) {
+		free(data);
+		device->_data = NULL;
+		return -ENOSPC;
+	}
+	registered_blkdevs[data->id] = device;
 	return data->id;
 }
 
 void uk_blkdev_drv_unregister(struct uk_blkdev *device)
 {
 	unregister_calls++;
+	if (device->_data &&
+	    device->_data->id < sizeof(registered_blkdevs) /
+				       sizeof(registered_blkdevs[0]))
+		registered_blkdevs[device->_data->id] = NULL;
 	free(device->_data);
+	device->_data = NULL;
+}
+
+struct uk_blkdev *uk_blkdev_get(uint16_t id)
+{
+	if (id >= sizeof(registered_blkdevs) /
+			  sizeof(registered_blkdevs[0]))
+		return NULL;
+	return registered_blkdevs[id];
+}
+
+enum uk_blkdev_state uk_blkdev_state_get(struct uk_blkdev *device)
+{
+	return device && device->_data ?
+		device->_data->state : UK_BLKDEV_INVALID;
+}
+
+int uk_blkdev_configure(struct uk_blkdev *device,
+			const struct uk_blkdev_conf *config)
+{
+	int rc = device->dev_ops->dev_configure(device, config);
+
+	if (!rc)
+		device->_data->state = UK_BLKDEV_CONFIGURED;
+	return rc;
+}
+
+int uk_blkdev_queue_configure(struct uk_blkdev *device, uint16_t queue_id,
+			      uint16_t descriptors,
+			      const struct uk_blkdev_queue_conf *config)
+{
+	struct uk_blkdev_queue *queue = device->dev_ops->queue_configure(
+		device, queue_id, descriptors, config);
+
+	if ((uintptr_t)queue >= (uintptr_t)-4095)
+		return (int)(intptr_t)queue;
+	device->_queue[queue_id] = queue;
+	device->_data->queue_handler[queue_id].callback = config->callback;
+	device->_data->queue_handler[queue_id].cookie =
+		config->callback_cookie;
+	return 0;
+}
+
+int uk_blkdev_start(struct uk_blkdev *device)
+{
+	int rc = device->dev_ops->dev_start(device);
+
+	if (!rc)
+		device->_data->state = UK_BLKDEV_RUNNING;
+	return rc;
+}
+
+int uk_blkdev_queue_intr_enable(struct uk_blkdev *device, uint16_t queue_id)
+{
+	return device->dev_ops->queue_intr_enable(
+		device, device->_queue[queue_id]);
+}
+
+int uk_blkdev_queue_submit_one(struct uk_blkdev *device, uint16_t queue_id,
+			       struct uk_blkreq *request)
+{
+	return device->submit_one(device, device->_queue[queue_id], request);
+}
+
+int uk_blkdev_queue_finish_reqs(struct uk_blkdev *device, uint16_t queue_id)
+{
+	return device->finish_reqs(device, device->_queue[queue_id]);
 }
 
 static void fire_channel_on(struct vmbus_channel *channel)
@@ -1227,6 +1355,14 @@ static void fire_channel_on(struct vmbus_channel *channel)
 static void fire_channel(void)
 {
 	fire_channel_on(&host_channel);
+}
+
+static void enqueue_enumerate_bus(struct vmbus_channel *channel)
+{
+	uint8_t payload[4] = { 0 };
+
+	put_le32(payload, 0, 11);
+	enqueue_packet_on(channel, 0, payload, sizeof(payload));
 }
 
 static void initialize_request(struct uk_blkreq *request,
@@ -3322,11 +3458,13 @@ static int run_guarded_io_regression(
 	struct vmbus_driver *driver, struct vmbus_device *vmbus_device,
 	uint8_t *buffer, int *events)
 {
+	struct uk_storvsc_inventory_snapshot inventory;
 	struct uk_storvsc_target_snapshot target;
 	struct uk_storvsc_target_snapshot current;
 	struct uk_storvsc_session session;
 	struct uk_blkdev *device;
 	struct uk_blkreq request;
+	struct uk_blkreq request2;
 	atomic_int callbacks;
 	unsigned int sends;
 	uint64_t generation;
@@ -3349,6 +3487,12 @@ static int run_guarded_io_regression(
 		return 502;
 	storvsc_host_set_guarded_io(1);
 	if (target_for_device(device, &target) || !target.mapping.vpd_length)
+		return 502;
+	if (uk_storvsc_inventory_get(&inventory) ||
+	    inventory.version != UK_STORVSC_INVENTORY_SNAPSHOT_VERSION ||
+	    inventory.size != sizeof(inventory) ||
+	    inventory.topology_generation != target.topology_generation ||
+	    inventory.count != uk_storvsc_mapping_count())
 		return 502;
 	generation = target.controller_generation;
 
@@ -3535,6 +3679,57 @@ static int run_guarded_io_regression(
 	    uk_storvsc_session_end(&session))
 		return 528;
 
+	{
+		struct vmbus_channel *enumerate_channel =
+			vmbus_device->channel;
+		unsigned int callbacks_before =
+			(unsigned int)atomic_load(&callbacks);
+
+		if (uk_storvsc_session_begin_read(&current, &session) ||
+		    uk_storvsc_session_authorize_write(&session))
+			return 530;
+		hold_io = 1;
+		pending_count = 0;
+		initialize_request(&request, UK_BLKREQ_WRITE, 4, 1, buffer,
+				   request_done, &callbacks);
+		if (!(device->submit_one(device, device->_queue[0], &request) &
+		      UK_BLKDEV_STATUS_SUCCESS) ||
+		    pending_count != 1)
+			return 531;
+		enqueue_enumerate_bus(enumerate_channel);
+		fire_channel_on(enumerate_channel);
+		sends = io_command_count;
+		initialize_request(&request2, UK_BLKREQ_READ, 5, 1,
+				   buffer + 512, request_done, &callbacks);
+		if (uk_storvsc_session_validate(&session, &target) !=
+			    -ESTALE ||
+		    device->submit_one(device, device->_queue[0],
+				       &request2) != -ENODEV ||
+		    io_command_count != sends)
+			return 532;
+		enqueue_completion_on(
+			enumerate_channel, pending[0].id, 64, 0, 1, 0,
+			pending[0].length);
+		if (wait_finished(&request, 1000) ||
+		    request.result != -ESTALE ||
+		    atomic_load(&callbacks) !=
+			    (int)callbacks_before + 1)
+			return 533;
+		fire_channel_on(enumerate_channel);
+		if (atomic_load(&callbacks) !=
+		    (int)callbacks_before + 1)
+			return 534;
+		pending_count = 0;
+		hold_io = 0;
+		if (reoffer_device(driver, vmbus_device, device) ||
+		    target_for_device(device, &current) ||
+		    uk_storvsc_session_validate(&session, &target) !=
+			    -ESTALE ||
+		    uk_storvsc_session_begin_read(&current, &session) ||
+		    uk_storvsc_session_end(&session))
+			return 535;
+	}
+
 	driver->remove_dev(vmbus_device);
 	if (vmbus_device->channel)
 		(void)vmbus_channel_close(vmbus_device->channel);
@@ -3555,12 +3750,232 @@ static int run_guarded_io_regression(
 	return 0;
 }
 
+static int persistence_prepare_seed(int boot_signature)
+{
+	const struct hyperv_acceptance_persistence_expected expected = {
+		.run_id = {
+			0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+			0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+		},
+		.disk_id = {
+			0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+			0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
+		},
+		.sectors = 1000,
+		.sector_size = 512,
+		.path_id = 0,
+		.target_id = 0,
+		.lun = 0,
+	};
+	uint8_t manifest[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
+
+	memset(backing_media, 0, sizeof(backing_media));
+	if (hyperv_acceptance_persistence_build_manifest(
+		    &expected, manifest))
+		return -EINVAL;
+	memcpy(backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_SEED0_LBA * 512,
+	       manifest, sizeof(manifest));
+	memcpy(backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_SEED1_LBA * 512,
+	       manifest, sizeof(manifest));
+	if (boot_signature) {
+		backing_media[510] = 0x55;
+		backing_media[511] = 0xaa;
+	}
+	return 0;
+}
+
+static void persistence_remove_device(struct vmbus_driver *driver,
+				      struct vmbus_device *device)
+{
+	if (!device->present && !device->channel)
+		return;
+	driver->remove_dev(device);
+	if (device->channel)
+		(void)vmbus_channel_close(device->channel);
+}
+
+static int run_persistence_workflow_regression(
+	struct vmbus_driver *driver, struct vmbus_device *primary)
+{
+	struct vmbus_device secondary = {
+		.channel_id = 47,
+		.connection_id = 147,
+		.instance_id = {
+			.bytes = { 2, 1, 2, 3, 4, 5, 6, 7,
+				   8, 9, 10, 11, 12, 13, 14, 15 },
+		},
+		.present = 1,
+	};
+	unsigned int writes10;
+	unsigned int writes16;
+	unsigned int flushes;
+	unsigned int commands;
+	uint8_t saved_receipt;
+	int rc;
+
+	storvsc_host_set_guarded_io(1);
+	storvsc_host_set_lun_discovery(1);
+	report_luns_mode = REPORT_LUNS_NORMAL;
+	topology_fixture = 0;
+	vpd_mode = VPD_NORMAL;
+	read_only_media = 0;
+	use_capacity16 = 0;
+	backing_media_enabled = 1;
+	hold_io = 0;
+	pending_count = 0;
+	persistence_hook_mode = PERSISTENCE_HOOK_NONE;
+	persistence_hook_fired = 0;
+	persistence_hook_end_error = 0;
+	persistence_hook_timeouts = 0;
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(0))
+		return 600;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 601;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_PASS ||
+	    write10_command_count <= writes10 ||
+	    write16_command_count <= writes16 ||
+	    flush_command_count <= flushes)
+		return 602;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_PASS ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 603;
+	saved_receipt =
+		backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA *
+			      512 + 40];
+	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512 +
+		      40] ^= 0x80;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 604;
+	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512 +
+		      40] = saved_receipt;
+	persistence_remove_device(driver, primary);
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(0))
+		return 605;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 606;
+	persistence_hook_driver = driver;
+	persistence_hook_device = &secondary;
+	persistence_hook_mode = PERSISTENCE_HOOK_ADD_BEFORE_REVALIDATE;
+	persistence_hook_fired = 0;
+	persistence_hook_end_error = 0;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL || !persistence_hook_fired ||
+	    persistence_hook_end_error != -ESTALE ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 607;
+	persistence_remove_device(driver, &secondary);
+	persistence_remove_device(driver, primary);
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(1))
+		return 608;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 609;
+	secondary.present = 1;
+	persistence_hook_mode = PERSISTENCE_HOOK_ADD_BEFORE_REJECT_END;
+	persistence_hook_fired = 0;
+	persistence_hook_end_error = 0;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL || !persistence_hook_fired ||
+	    persistence_hook_end_error != -ESTALE ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 610;
+	persistence_remove_device(driver, &secondary);
+	persistence_remove_device(driver, primary);
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(0))
+		return 611;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 612;
+	persistence_hook_mode = PERSISTENCE_HOOK_NONE;
+	persistence_hook_fired = 0;
+	persistence_hook_end_error = 0;
+	persistence_hook_timeouts = 0;
+	hold_io = 1;
+	pending_count = 0;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL || pending_count != 1 ||
+	    persistence_hook_timeouts != 1 ||
+	    persistence_hook_end_error != -EBUSY ||
+	    !hyperv_acceptance_persistence_host_request_owned() ||
+	    hyperv_acceptance_persistence_host_request_done() ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 613;
+	commands = io_command_count;
+	if (hyperv_acceptance_persistence_main() != HYPERV_ACCEPTANCE_FAIL ||
+	    io_command_count != commands)
+		return 614;
+	complete_pending(2);
+	pending_count = 0;
+	fire_channel_on(primary->channel);
+	if (!hyperv_acceptance_persistence_host_request_owned() ||
+	    !hyperv_acceptance_persistence_host_request_done())
+		return 615;
+	commands = io_command_count;
+	if (hyperv_acceptance_persistence_main() != HYPERV_ACCEPTANCE_FAIL ||
+	    io_command_count != commands)
+		return 616;
+	hold_io = 0;
+	hyperv_acceptance_persistence_host_reset();
+	persistence_remove_device(driver, primary);
+
+	persistence_hook_driver = NULL;
+	persistence_hook_device = NULL;
+	persistence_hook_mode = PERSISTENCE_HOOK_NONE;
+	backing_media_enabled = 0;
+	storvsc_host_set_guarded_io(0);
+	return 0;
+}
+
 int main(void)
 {
 	struct vmbus_driver *driver = storvsc_host_driver();
 	struct vmbus_device vmbus_device = {
 		.channel_id = 37,
 		.connection_id = 137,
+		.instance_id = {
+			.bytes = { 1, 1, 2, 3, 4, 5, 6, 7,
+				   8, 9, 10, 11, 12, 13, 14, 15 },
+		},
 		.present = 1,
 	};
 	struct uk_blkdev *device;
@@ -3598,6 +4013,10 @@ int main(void)
 	    address.path_id || address.target_id || address.lun)
 		return 3;
 	if (configure_device(device, 2, &events))
+		return 4;
+	enqueue_enumerate_bus(vmbus_device.channel);
+	fire_channel();
+	if (!storvsc_host_online())
 		return 4;
 	if (posix_memalign((void **)&buffer, 4096, 3 * 4096))
 		return 5;
@@ -3931,6 +4350,9 @@ int main(void)
 		return 67;
 	rc = run_guarded_io_regression(
 		driver, &vmbus_device, buffer, &events);
+	if (rc)
+		return rc;
+	rc = run_persistence_workflow_regression(driver, &vmbus_device);
 	if (rc)
 		return rc;
 
