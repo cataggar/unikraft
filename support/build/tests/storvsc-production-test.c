@@ -127,8 +127,13 @@ static struct uk_alloc host_allocator;
 static struct uk_sched host_scheduler;
 static struct uk_thread main_thread;
 static _Thread_local struct uk_thread *current_thread = &main_thread;
+static _Thread_local struct vmbus_device *closed_channel_device;
 static struct vmbus_channel
 	host_channels[CONFIG_LIBSTORVSC_MAX_DEVICES];
+static pthread_mutex_t host_channel_target_lock =
+	PTHREAD_MUTEX_INITIALIZER;
+static struct vmbus_device *
+	host_channel_targets[CONFIG_LIBSTORVSC_MAX_DEVICES];
 #define host_channel host_channels[0]
 static pthread_mutex_t packet_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct host_packet
@@ -230,6 +235,13 @@ static atomic_int close_failures_remaining;
 static atomic_int close_attempts;
 static atomic_int bind_retry_calls;
 static atomic_int bind_ready_calls;
+struct bind_ready_target {
+	struct vmbus_device *device;
+	atomic_int calls;
+};
+static pthread_mutex_t bind_ready_target_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct bind_ready_target
+	bind_ready_targets[CONFIG_LIBSTORVSC_MAX_DEVICES * 4];
 static atomic_ullong bind_resource_epoch = 1;
 static int close_pause_enabled;
 static int close_pause_entered;
@@ -248,6 +260,8 @@ static int removal_coherence_release_caller;
 static int removal_coherence_close_entered;
 static int removal_coherence_release_close;
 static int removal_coherence_wait_entered;
+static int removal_coherence_allow_completion_check;
+static int removal_coherence_target_waiting;
 static unsigned int report_luns_commands;
 static unsigned int vpd_commands;
 static int invalid_scsi_address;
@@ -1118,11 +1132,21 @@ static int handle_send(struct vmbus_channel *channel, uint64_t id,
 	return 0;
 }
 
+static int host_channel_index(const struct vmbus_channel *channel)
+{
+	for (unsigned int i = 0; i < CONFIG_LIBSTORVSC_MAX_DEVICES; i++) {
+		if (channel == &host_channels[i])
+			return (int)i;
+	}
+	return -1;
+}
+
 int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
 		       __u16 rx_pages, const void *user_data,
 		       size_t user_data_size)
 {
 	struct vmbus_channel *channel = NULL;
+	int channel_index;
 	unsigned int i;
 
 	if (!device || tx_pages < 2 || rx_pages < 2 ||
@@ -1142,11 +1166,70 @@ int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
 	channel->device = device;
 	channel->open = 1;
 	device->channel = channel;
+	channel_index = host_channel_index(channel);
+	pthread_mutex_lock(&host_channel_target_lock);
+	host_channel_targets[channel_index] = device;
+	pthread_mutex_unlock(&host_channel_target_lock);
 	return 0;
+}
+
+static atomic_int *bind_ready_target_counter(
+	struct vmbus_device *device, int create)
+{
+	atomic_int *counter = NULL;
+	struct bind_ready_target *free_target = NULL;
+
+	if (!device)
+		return NULL;
+	pthread_mutex_lock(&bind_ready_target_lock);
+	for (unsigned int i = 0;
+	     i < sizeof(bind_ready_targets) / sizeof(bind_ready_targets[0]);
+	     i++) {
+		struct bind_ready_target *target = &bind_ready_targets[i];
+
+		if (target->device == device) {
+			counter = &target->calls;
+			break;
+		}
+		if (!free_target && !target->device)
+			free_target = target;
+	}
+	if (!counter && create && free_target) {
+		free_target->device = device;
+		atomic_store(&free_target->calls, 0);
+		counter = &free_target->calls;
+	}
+	pthread_mutex_unlock(&bind_ready_target_lock);
+	return counter;
+}
+
+static void bind_ready_target_release(struct vmbus_device *device)
+{
+	pthread_mutex_lock(&bind_ready_target_lock);
+	for (unsigned int i = 0;
+	     i < sizeof(bind_ready_targets) / sizeof(bind_ready_targets[0]);
+	     i++) {
+		struct bind_ready_target *target = &bind_ready_targets[i];
+
+		if (target->device != device)
+			continue;
+		target->device = NULL;
+		atomic_store(&target->calls, 0);
+		break;
+	}
+	pthread_mutex_unlock(&bind_ready_target_lock);
 }
 
 int vmbus_channel_close(struct vmbus_channel *channel)
 {
+	int channel_index = host_channel_index(channel);
+
+	closed_channel_device = NULL;
+	if (channel_index >= 0) {
+		pthread_mutex_lock(&host_channel_target_lock);
+		closed_channel_device = host_channel_targets[channel_index];
+		pthread_mutex_unlock(&host_channel_target_lock);
+	}
 	pthread_mutex_lock(&race_lock);
 	if (removal_coherence_enabled && current_thread != &main_thread) {
 		removal_coherence_close_entered = 1;
@@ -1209,10 +1292,17 @@ int vmbus_device_bind_retry(
 
 void vmbus_device_bind_ready(void)
 {
+	struct vmbus_device *ready_device = closed_channel_device;
+	atomic_int *target_counter;
+
+	closed_channel_device = NULL;
 	if (use_vmbus_offer_lifetimes) {
 		vmbus_epoch_object_bind_ready();
 		return;
 	}
+	target_counter = bind_ready_target_counter(ready_device, 0);
+	if (target_counter)
+		atomic_fetch_add(target_counter, 1);
 	atomic_fetch_add(&bind_ready_calls, 1);
 	atomic_fetch_add(&bind_resource_epoch, 1);
 }
@@ -1957,8 +2047,26 @@ static int wait_atomic_at_least(atomic_int *value, int expected,
 				unsigned int limit_ms)
 {
 	for (unsigned int i = 0; i < limit_ms; i++) {
+		pthread_mutex_lock(&race_lock);
+		if (removal_coherence_enabled) {
+			removal_coherence_wait_entered = 1;
+			pthread_cond_broadcast(&race_condition);
+			while (removal_coherence_enabled &&
+			       !removal_coherence_allow_completion_check)
+				pthread_cond_wait(&race_condition, &race_lock);
+		}
+		pthread_mutex_unlock(&race_lock);
 		if (atomic_load(value) >= expected)
 			return 0;
+		pthread_mutex_lock(&race_lock);
+		if (removal_coherence_enabled) {
+			removal_coherence_target_waiting = 1;
+			pthread_cond_broadcast(&race_condition);
+			while (removal_coherence_enabled &&
+			       !removal_coherence_release_close)
+				pthread_cond_wait(&race_condition, &race_lock);
+		}
+		pthread_mutex_unlock(&race_lock);
 		uk_sched_thread_sleep(1000000ULL);
 	}
 	return -ETIMEDOUT;
@@ -4345,6 +4453,7 @@ static int persistence_remove_device(struct vmbus_driver *driver,
 				     struct vmbus_device *device)
 {
 	unsigned int channel_id;
+	atomic_int *target_counter;
 	int ready_before;
 	int wait_for_ready;
 	int rc;
@@ -4353,29 +4462,30 @@ static int persistence_remove_device(struct vmbus_driver *driver,
 		return 0;
 	channel_id = device->channel_id;
 	wait_for_ready = device->channel != NULL;
-	ready_before = atomic_load(&bind_ready_calls);
+	target_counter = wait_for_ready ?
+		bind_ready_target_counter(device, 1) : NULL;
+	if (wait_for_ready && !target_counter)
+		return -ENOSPC;
+	ready_before = wait_for_ready ?
+		atomic_load(target_counter) : 0;
 	remove_test_offer(driver, device);
 	if (device->channel)
 		(void)vmbus_channel_close(device->channel);
 	if (!wait_for_ready)
 		return 0;
 	/* Deferred removal publishes bind readiness after clearing device state. */
-	pthread_mutex_lock(&race_lock);
-	if (removal_coherence_enabled) {
-		removal_coherence_wait_entered = 1;
-		pthread_cond_broadcast(&race_condition);
-	}
-	pthread_mutex_unlock(&race_lock);
 	rc = wait_atomic_at_least(
-		&bind_ready_calls, ready_before + 1,
+		target_counter, ready_before + 1,
 		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
 	if (rc)
 		fprintf(stderr,
 			"persistence removal wait failed: "
-			"stage=bind-ready rc=%d channel=%u ready=%d/%d "
-			"mappings=%u\n",
-			rc, channel_id, atomic_load(&bind_ready_calls),
-			ready_before + 1, uk_storvsc_mapping_count());
+			"stage=target-bind-ready rc=%d channel=%u "
+			"ready=%d/%d global=%d mappings=%u\n",
+			rc, channel_id, atomic_load(target_counter),
+			ready_before + 1, atomic_load(&bind_ready_calls),
+			uk_storvsc_mapping_count());
+	bind_ready_target_release(device);
 	return rc;
 }
 
@@ -4408,10 +4518,22 @@ static int persistence_remove_with_worker_ownership(
 		.driver = driver,
 		.device = device,
 	};
+	static struct vmbus_device unrelated = {
+		.channel_id = 1470,
+		.connection_id = 2470,
+		.present = 1,
+	};
+	__u8 open_data[24] = { 0 };
+	atomic_int *target_counter =
+		bind_ready_target_counter(device, 1);
+	atomic_int *unrelated_counter =
+		bind_ready_target_counter(&unrelated, 1);
 	pthread_t thread;
 	int created = 0;
 	int error = 0;
 
+	if (!target_counter || !unrelated_counter)
+		return -ENOSPC;
 	atomic_init(&context.done, 0);
 	pthread_mutex_lock(&race_lock);
 	removal_coherence_enabled = 1;
@@ -4421,6 +4543,8 @@ static int persistence_remove_with_worker_ownership(
 	removal_coherence_close_entered = 0;
 	removal_coherence_release_close = 0;
 	removal_coherence_wait_entered = 0;
+	removal_coherence_allow_completion_check = 0;
+	removal_coherence_target_waiting = 0;
 	pthread_mutex_unlock(&race_lock);
 	if (pthread_create(&thread, NULL, persistence_remove_thread, &context)) {
 		error = -EIO;
@@ -4436,18 +4560,45 @@ static int persistence_remove_with_worker_ownership(
 	removal_coherence_release_caller = 1;
 	pthread_cond_broadcast(&race_condition);
 	pthread_mutex_unlock(&race_lock);
+	if (wait_race_flag(&removal_coherence_wait_entered)) {
+		error = -ETIMEDOUT;
+		goto out;
+	}
+	{
+		int global_ready = atomic_load(&bind_ready_calls);
+		int target_ready = atomic_load(target_counter);
+		int unrelated_ready = atomic_load(unrelated_counter);
+
+		if (vmbus_channel_open(
+			    &unrelated, 2, 2, open_data, sizeof(open_data)) ||
+		    vmbus_channel_close(unrelated.channel)) {
+			error = -EIO;
+			goto out;
+		}
+		vmbus_device_bind_ready();
+		if (atomic_load(&bind_ready_calls) != global_ready + 1 ||
+		    atomic_load(target_counter) != target_ready ||
+		    atomic_load(unrelated_counter) != unrelated_ready + 1) {
+			error = -EINVAL;
+			goto out;
+		}
+	}
+	pthread_mutex_lock(&race_lock);
+	removal_coherence_allow_completion_check = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
 	for (unsigned int i = 0; i < 1000; i++) {
-		int waiting;
+		int target_waiting;
 
 		pthread_mutex_lock(&race_lock);
-		waiting = removal_coherence_wait_entered;
+		target_waiting = removal_coherence_target_waiting;
 		pthread_mutex_unlock(&race_lock);
-		if (waiting || atomic_load(&context.done))
+		if (target_waiting || atomic_load(&context.done))
 			break;
 		uk_sched_thread_sleep(1000000ULL);
 	}
 	pthread_mutex_lock(&race_lock);
-	if (!removal_coherence_wait_entered)
+	if (!removal_coherence_target_waiting)
 		error = atomic_load(&context.done) ?
 			-EALREADY : -ETIMEDOUT;
 	else if (atomic_load(&context.done))
@@ -4467,9 +4618,12 @@ out:
 	removal_coherence_caller_entered = 0;
 	removal_coherence_close_entered = 0;
 	removal_coherence_wait_entered = 0;
+	removal_coherence_allow_completion_check = 0;
+	removal_coherence_target_waiting = 0;
 	pthread_mutex_unlock(&race_lock);
 	if (!error && context.result)
 		error = context.result;
+	bind_ready_target_release(&unrelated);
 	if (error)
 		fprintf(stderr,
 			"persistence removal coherence failed: rc=%d "
@@ -4495,7 +4649,7 @@ static int run_unresolved_discovery_case(
 	enum unresolved_discovery_case failure, int run_guest)
 {
 	char output[8192];
-	struct uk_storvsc_inventory_snapshot inventory;
+	struct uk_storvsc_inventory_snapshot inventory = { 0 };
 	unsigned int writes10 = write10_command_count;
 	unsigned int writes16 = write16_command_count;
 	unsigned int flushes = flush_command_count;
