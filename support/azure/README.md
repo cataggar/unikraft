@@ -338,6 +338,8 @@ tags are recorded before upload access is granted. The controller revalidates
 that identity while unattached before VM deployment and requires the same live
 UUID plus reciprocal VM/disk attachment before accepting the guest or deleting
 the group. A same-name disk with copied tags is never re-enrolled.
+Cleanup can remove that proven disk before upload completes, including the
+`ReadyToUpload` state; deployment still requires a fully imported disk.
 
 ## Run private application-network acceptance
 

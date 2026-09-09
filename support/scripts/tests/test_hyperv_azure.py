@@ -1667,6 +1667,85 @@ class HypervAzureControllerTest(unittest.TestCase):
         self.assertNotIn("uploaded_disk", state)
         self.assertEqual(run.az.call_count, 1)
 
+    def test_interrupted_upload_cleanup_uses_durable_identity_not_readiness(self):
+        variants = (
+            ({}, True),
+            ({"uniqueId": "99999999-9999-4999-8999-999999999999"}, False),
+            ({"managedBy": "/fixture/other-vm"}, False),
+        )
+        for changes, cleanup_allowed in variants:
+            with self.subTest(changes=changes), \
+                    mock.patch.dict(os.environ), \
+                    tempfile.TemporaryDirectory() as temporary:
+                run, state = self.network_run_fixture()
+                state["schema_version"] = azure.STATE_SCHEMA_VERSION
+                directory = Path(temporary)
+                run.state_path = directory / "state.json"
+                disk_id = run.expected_uploaded_disk_id()
+                disk_uuid = "88888888-8888-4888-8888-888888888888"
+                created = {
+                    "id": disk_id, "name": run.disk,
+                    "type": "Microsoft.Compute/disks",
+                    "uniqueId": disk_uuid, "managedBy": None,
+                    "tags": {**run.tags, "fixture-extra": "retained"},
+                    "diskState": "ReadyToUpload",
+                    "provisioningState": "Succeeded",
+                    "hyperVGeneration": "V2", "osType": "Linux",
+                }
+
+                def interrupt_after_record(phase, **fields):
+                    azure.AzureRun.record(run, phase, **fields)
+                    if phase == "uploading-disk":
+                        raise InterruptedError("fixture interruption")
+
+                run.record = interrupt_after_record
+                run.az.return_value = created
+                image = mock.Mock()
+                image.stat.return_value.st_size = 69206528
+                with self.assertRaisesRegex(
+                    InterruptedError, "fixture interruption"
+                ):
+                    run.upload_disk(image)
+                self.assertEqual(run.az.call_count, 1)
+                self.assertEqual(
+                    run.az.call_args.args[0][:2], ["disk", "create"]
+                )
+
+                saved, path = azure.load_state(directory)
+                self.assertEqual(saved["uploaded_disk"], {
+                    "disk_id": disk_id, "disk_uuid": disk_uuid,
+                })
+                recovered = azure.AzureRun(saved, path)
+                with self.assertRaisesRegex(RuntimeError, "unproven"):
+                    recovered.verify_uploaded_disk_identity(created)
+                current = {**created, **changes}
+                group = {
+                    "id": saved["resource_group_id"],
+                    "tags": recovered.group_tags,
+                }
+                responses = [True, group, [current], current]
+                if cleanup_allowed:
+                    responses.extend((None, False))
+                recovered.az = mock.Mock(side_effect=responses)
+                if cleanup_allowed:
+                    recovered.cleanup()
+                    self.assertEqual(
+                        azure.load_state(directory)[0]["phase"], "cleaned"
+                    )
+                else:
+                    with self.assertRaises(azure.CleanupValidationError):
+                        recovered.cleanup()
+                self.assertEqual(
+                    any(
+                        call.args[0][:2] == ["group", "delete"]
+                        for call in recovered.az.call_args_list
+                    ),
+                    cleanup_allowed,
+                )
+                self.assertEqual(
+                    saved["uploaded_disk"]["disk_uuid"], disk_uuid
+                )
+
     def test_uploaded_disk_replacement_blocks_vm_deployment(self):
         run, state = self.network_run_fixture()
         original = self.complete_disk_upload(run, state)

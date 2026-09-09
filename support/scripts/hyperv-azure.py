@@ -2831,7 +2831,7 @@ class AzureRun:
             "--name", self.disk,
         ], private=True, timeout=120)
         self.verify_uploaded_disk_identity(
-            disk, attached_vm_id=attached_vm_id
+            disk, attached_vm_id=attached_vm_id, require_ready=False
         )
         return resource
 
