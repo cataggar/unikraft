@@ -2315,6 +2315,37 @@ static int test_handshake_cleanup_failures(void)
 	return 0;
 }
 
+static int test_late_bind_consumer_readiness(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 79,
+		.connection_id = 179,
+		.present = 1,
+	};
+	struct uk_netdev *netdev;
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.fail_map_call = 2;
+	CHECK(netvsc_host_add_device(&offered) == -ENOSPC);
+	CHECK(netvsc_host_netdev()->ops->probe(
+		      netvsc_host_netdev()) == -ENODEV);
+	CHECK(mock.close_count == 1);
+	CHECK(mock.live_gpadls == 0);
+
+	mock.fail_map_call = 0;
+	mock.map_count = 0;
+	mock.nvs_init_attempts = 0;
+	mock.head = mock.tail = 0;
+	mock.channel.open = 1;
+	offered.channel = NULL;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(configure_and_start(&netdev) == 0);
+	CHECK(netdev == netvsc_host_netdev());
+	netvsc_host_remove_device(&offered);
+	return 0;
+}
+
 static int test_nvs_response_sizes_and_fallback(void)
 {
 	struct vmbus_device offered = {
@@ -2727,6 +2758,9 @@ int main(void)
 		return rc;
 	netvsc_host_remove_device(&offered);
 	rc = test_handshake_cleanup_failures();
+	if (rc)
+		return rc;
+	rc = test_late_bind_consumer_readiness();
 	if (rc)
 		return rc;
 	rc = test_nvs_response_sizes_and_fallback();

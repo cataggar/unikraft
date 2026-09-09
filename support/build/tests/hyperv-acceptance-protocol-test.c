@@ -225,6 +225,10 @@ static int test_storage_and_gating(void)
 	CHECK(hyperv_acceptance_final_result(HYPERV_ACCEPTANCE_PASS,
 					    HYPERV_ACCEPTANCE_FAIL) ==
 	      HYPERV_ACCEPTANCE_FAIL);
+	CHECK(hyperv_acceptance_binding_ready(0, 0, 0));
+	CHECK(!hyperv_acceptance_binding_ready(1, 0, 1));
+	CHECK(!hyperv_acceptance_binding_ready(1, 1, 0));
+	CHECK(hyperv_acceptance_binding_ready(2, 1, 1));
 	return 0;
 }
 

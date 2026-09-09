@@ -718,3 +718,10 @@ enum hyperv_acceptance_result hyperv_acceptance_final_result(
 		return HYPERV_ACCEPTANCE_FAIL;
 	return HYPERV_ACCEPTANCE_UNAVAILABLE;
 }
+
+int hyperv_acceptance_binding_ready(unsigned int offers,
+				    unsigned int bound_offers,
+				    unsigned int ready_devices)
+{
+	return !offers || (bound_offers && ready_devices);
+}

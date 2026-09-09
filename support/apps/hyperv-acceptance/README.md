@@ -14,7 +14,10 @@ network stage with an official lib-lwip path. It manually attaches the first
 NetVSC device with one RX and one TX queue, completes DHCP through the BOUND
 state, verifies the applied lease, resolves an explicit same-subnet private peer
 with ARP, and performs exact TCP and UDP exchanges. Storage remains read-only.
-The application replaces only that netif instance's unbounded lib-lwip
+This profile admits two StorVSC controllers for Azure's normal OS/resource-disk
+offer topology. The probe waits for current bound offers and a coherent StorVSC
+generation instead of treating previously registered device counts as ready.
+The application replaces only that netif instance's unbounded lib-lwIP
 poll/transmit callbacks with a scoped boundary that processes at most 64 RX
 packets per pump and attempts each TX exactly once. Persistent TX backpressure
 fails acceptance instead of spinning; a continuous RX flood returns to lwIP
