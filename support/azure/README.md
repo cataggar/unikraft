@@ -154,6 +154,22 @@ real-data-disk workload. The seed is not uploaded to this platform preflight:
 PERSISTENCE="$PWD/.d/private-preflight-persistence"
 mkdir -p "$PERSISTENCE" "$PWD/.d/acceptance-tmp" \
   "$PWD/.d/acceptance-cache"
+CONFIG_TOOLS="$PWD/.d/private-preflight-config-tools"
+mkdir -m 700 "$CONFIG_TOOLS"
+cat >"$CONFIG_TOOLS/yacc" <<EOF
+#!/bin/sh
+set -eu
+export BISON_PKGDATADIR="$BISON_DATA"
+export M4="$M4"
+exec "$BISON" "\$@"
+EOF
+cat >"$CONFIG_TOOLS/lex" <<EOF
+#!/bin/sh
+set -eu
+export M4="$M4"
+exec "$FLEX" "\$@"
+EOF
+chmod 700 "$CONFIG_TOOLS/yacc" "$CONFIG_TOOLS/lex"
 "$RUNTIME/venv/bin/python" support/scripts/hyperv-storage-manifest.py \
   --output-prefix "$PERSISTENCE/run" \
   --identity-policy seed-enrollment-v2 --sectors 262144 --lun 1
@@ -165,9 +181,17 @@ TMPDIR="$PWD/.d/acceptance-tmp" \
 XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
 ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
 ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
+PATH="$CONFIG_TOOLS:$LLVM_BIN:$PATH" \
   "$ZIG" build olddefconfig -j2 \
   -Dapp="$PWD/support/apps/hyperv-acceptance" \
-  -Dconfig="$PWD/support/apps/hyperv-acceptance/.config"
+  -Dconfig="$PWD/support/apps/hyperv-acceptance/.config" \
+  "-Dcompiler=$ZIG cc -target x86_64-freestanding-none" \
+  -Dcompiler-targeted=true "-Dhost-cc=$ZIG cc" \
+  "-Dhost-cxx=$ZIG c++" -Dhost-cflags=-fno-sanitize=null \
+  "-Dmake-arg=AR=$ZIG ar" -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf -Dmake-arg=STRIP=llvm-strip
 SOLVED_CONFIG="$PWD/support/apps/hyperv-acceptance/.config"
 ```
 
