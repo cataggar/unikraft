@@ -1496,6 +1496,34 @@ static void retained_request_done(struct uk_blkreq *request, void *cookie)
 	pthread_mutex_unlock(&race_lock);
 }
 
+static void retained_counted_request_done(
+	struct uk_blkreq *request, void *cookie)
+{
+	request_done(request, cookie);
+	retained_request_done(request, NULL);
+}
+
+struct fire_channel_context {
+	struct vmbus_channel *channel;
+};
+
+static void *fire_channel_thread(void *argument)
+{
+	struct fire_channel_context *context = argument;
+
+	fire_channel_on(context->channel);
+	return NULL;
+}
+
+static void release_retained_callback_thread(pthread_t thread)
+{
+	pthread_mutex_lock(&race_lock);
+	retained_callback_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	pthread_join(thread, NULL);
+}
+
 static void queue_event(struct uk_blkdev *device, uint16_t queue_id,
 			void *cookie)
 {
@@ -1838,6 +1866,19 @@ static int wait_worker_present(int expected, unsigned int limit_ms)
 {
 	for (unsigned int i = 0; i < limit_ms; i++) {
 		if (storvsc_host_worker_present() == expected)
+			return 0;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
+static int wait_primary_removal_quiesced(unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		if (storvsc_host_deferred_action() == TEST_DEFER_NONE &&
+		    !storvsc_host_worker_present() &&
+		    !storvsc_host_controller_online(0) &&
+		    !storvsc_host_has_channel())
 			return 0;
 		uk_sched_thread_sleep(1000000ULL);
 	}
@@ -3095,6 +3136,8 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	atomic_int callbacks;
 	atomic_int teardown_callbacks;
 	atomic_int rebind_callbacks;
+	struct fire_channel_context retained_fire;
+	pthread_t retained_fire_thread;
 	struct vmbus_channel *primary_channel;
 	uint16_t stable_ids[4];
 	const uint8_t expected_luns[] = { 0, 2, 0, 3 };
@@ -3474,11 +3517,18 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	if (driver->add_dev(primary))
 		return 83;
 	atomic_store(&rebind_callbacks, 0);
+	pthread_mutex_lock(&race_lock);
+	retained_callback_entered = 0;
+	retained_callback_release = 0;
+	retained_callback_count = 0;
+	pthread_mutex_unlock(&race_lock);
 	hold_io = 1;
 	pending_count = 0;
 	for (unsigned int i = 0; i < 2; i++) {
 		initialize_request(&requests[i], UK_BLKREQ_READ, 40 + i, 1,
-				   buffer + i * 512, request_done,
+				   buffer + i * 512,
+				   i ? request_done :
+				       retained_counted_request_done,
 				   &rebind_callbacks);
 		if (!(devices[i]->submit_one(devices[i],
 					     devices[i]->_queue[0],
@@ -3487,19 +3537,101 @@ static int run_topology_regression(struct vmbus_driver *driver,
 			return 84;
 	}
 	complete_pending(0);
-	fire_channel_on(primary->channel);
+	retained_fire.channel = primary->channel;
+	if (pthread_create(&retained_fire_thread, NULL, fire_channel_thread,
+			   &retained_fire))
+		return 84;
+	if (wait_race_flag(&retained_callback_entered)) {
+		fprintf(stderr,
+			"topology interrupt completion failed: "
+			"branch=retain-enter rc=%d callbacks=%d "
+			"states=%u,%u results=%d,%d bound=%d,%d\n",
+			-ETIMEDOUT, atomic_load(&rebind_callbacks),
+			atomic_load(&requests[0].state.counter),
+			atomic_load(&requests[1].state.counter),
+			requests[0].result, requests[1].result,
+			storvsc_host_request_bound(&requests[0]),
+			storvsc_host_request_bound(&requests[1]));
+		release_retained_callback_thread(retained_fire_thread);
+		return 85;
+	}
 	if (requests[0].result ||
 	    atomic_load(&rebind_callbacks) != 1 ||
 	    atomic_load(&requests[1].state.counter) == UK_BLKREQ_FINISHED ||
-	    !storvsc_host_request_bound(&requests[1]))
+	    !storvsc_host_request_bound(&requests[1])) {
+		fprintf(stderr,
+			"topology interrupt completion failed: "
+			"branch=first rc=%d callbacks=%d states=%u,%u "
+			"results=%d,%d bound=%d,%d\n",
+			-EIO, atomic_load(&rebind_callbacks),
+			atomic_load(&requests[0].state.counter),
+			atomic_load(&requests[1].state.counter),
+			requests[0].result, requests[1].result,
+			storvsc_host_request_bound(&requests[0]),
+			storvsc_host_request_bound(&requests[1]));
+		release_retained_callback_thread(retained_fire_thread);
 		return 85;
-	if (devices[1]->dev_ops->queue_intr_enable(
-		    devices[1], devices[1]->_queue[0]))
+	}
+	rc = devices[1]->dev_ops->queue_intr_enable(
+		devices[1], devices[1]->_queue[0]);
+	if (rc) {
+		fprintf(stderr,
+			"topology interrupt completion failed: "
+			"branch=enable rc=%d callbacks=%d states=%u,%u "
+			"results=%d,%d bound=%d,%d\n",
+			rc, atomic_load(&rebind_callbacks),
+			atomic_load(&requests[0].state.counter),
+			atomic_load(&requests[1].state.counter),
+			requests[0].result, requests[1].result,
+			storvsc_host_request_bound(&requests[0]),
+			storvsc_host_request_bound(&requests[1]));
+		release_retained_callback_thread(retained_fire_thread);
 		return 86;
-	if (requests[1].result ||
-	    atomic_load(&rebind_callbacks) != 2 ||
-	    storvsc_host_request_bound(&requests[1]))
+	}
+	if (requests[1].result != -EINPROGRESS ||
+	    atomic_load(&rebind_callbacks) != 1 ||
+	    atomic_load(&requests[1].state.counter) == UK_BLKREQ_FINISHED ||
+	    !storvsc_host_request_bound(&requests[1])) {
+		fprintf(stderr,
+			"topology interrupt completion failed: "
+			"branch=deferred rc=%d callbacks=%d states=%u,%u "
+			"results=%d,%d bound=%d,%d\n",
+			-EIO, atomic_load(&rebind_callbacks),
+			atomic_load(&requests[0].state.counter),
+			atomic_load(&requests[1].state.counter),
+			requests[0].result, requests[1].result,
+			storvsc_host_request_bound(&requests[0]),
+			storvsc_host_request_bound(&requests[1]));
+		release_retained_callback_thread(retained_fire_thread);
 		return 87;
+	}
+	pthread_mutex_lock(&race_lock);
+	retained_callback_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	rc = wait_atomic_value(&rebind_callbacks, 2,
+			       CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	pthread_join(retained_fire_thread, NULL);
+	if (rc || retained_callback_count != 1 ||
+	    requests[0].result || requests[1].result ||
+	    atomic_load(&rebind_callbacks) != 2 ||
+	    atomic_load(&requests[0].state.counter) != UK_BLKREQ_FINISHED ||
+	    atomic_load(&requests[1].state.counter) != UK_BLKREQ_FINISHED ||
+	    storvsc_host_request_bound(&requests[0]) ||
+	    storvsc_host_request_bound(&requests[1])) {
+		fprintf(stderr,
+			"topology interrupt completion failed: "
+			"branch=finished rc=%d callbacks=%d retained=%d "
+			"states=%u,%u results=%d,%d bound=%d,%d\n",
+			rc, atomic_load(&rebind_callbacks),
+			retained_callback_count,
+			atomic_load(&requests[0].state.counter),
+			atomic_load(&requests[1].state.counter),
+			requests[0].result, requests[1].result,
+			storvsc_host_request_bound(&requests[0]),
+			storvsc_host_request_bound(&requests[1]));
+		return 87;
+	}
 	hold_io = 0;
 	if (driver->add_dev(&excess) != -ENOSPC || excess.channel ||
 	    uk_storvsc_mapping_count() != 4 ||
@@ -3527,15 +3659,64 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	remove_test_offer(driver, primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
+	rc = wait_primary_removal_quiesced(
+		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	if (rc) {
+		fprintf(stderr,
+			"topology partial rediscovery failed: "
+			"branch=quiesce rc=%d deferred=%d worker=%d "
+			"online=%d channel=%d\n",
+			rc, storvsc_host_deferred_action(),
+			storvsc_host_worker_present(),
+			storvsc_host_controller_online(0),
+			storvsc_host_has_channel());
+		return 68;
+	}
 
 	vpd_mode = VPD_MALFORMED_LUN2;
 	primary->present = 1;
-	if (driver->add_dev(primary) || uk_storvsc_mapping_count() != 3 ||
-	    !storvsc_host_blkdev_address(0, 0) ||
-	    storvsc_host_blkdev_address(0, 2))
+	{
+		int before_deferred = storvsc_host_deferred_action();
+		int before_worker = storvsc_host_worker_present();
+		int before_online = storvsc_host_controller_online(0);
+		int before_channel = storvsc_host_has_channel();
+		unsigned int mapping_count;
+		int lun0;
+		int lun2;
+
+		rc = driver->add_dev(primary);
+		mapping_count = uk_storvsc_mapping_count();
+		lun0 = storvsc_host_blkdev_address(0, 0) != NULL;
+		lun2 = storvsc_host_blkdev_address(0, 2) != NULL;
+		if (rc || mapping_count != 3 || !lun0 || lun2) {
+			fprintf(stderr,
+				"topology partial rediscovery failed: "
+				"branch=add rc=%d count=%u lun0=%d lun2=%d "
+				"before={deferred=%d worker=%d online=%d channel=%d} "
+				"after={deferred=%d worker=%d online=%d channel=%d}\n",
+				rc, mapping_count, lun0, lun2,
+				before_deferred, before_worker, before_online,
+				before_channel,
+				storvsc_host_deferred_action(),
+				storvsc_host_worker_present(),
+				storvsc_host_controller_online(0),
+				storvsc_host_has_channel());
+			return 68;
+		}
+	}
+	rc = uk_storvsc_inventory_get(&inventory);
+	if (rc != -EAGAIN) {
+		fprintf(stderr,
+			"topology partial rediscovery failed: "
+			"branch=inventory rc=%d count=%u generation=%" PRIu64
+			" deferred=%d worker=%d online=%d channel=%d\n",
+			rc, inventory.count, inventory.topology_generation,
+			storvsc_host_deferred_action(),
+			storvsc_host_worker_present(),
+			storvsc_host_controller_online(0),
+			storvsc_host_has_channel());
 		return 68;
-	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
-		return 68;
+	}
 	remove_test_offer(driver, primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
@@ -4857,7 +5038,7 @@ static int run_persistence_workflow_regression(
 	return 0;
 }
 
-int main(void)
+static int storvsc_production_test(void)
 {
 	struct vmbus_driver *driver = storvsc_host_driver();
 	struct vmbus_device vmbus_device = {
@@ -5261,4 +5442,13 @@ int main(void)
 
 	free(buffer);
 	return 0;
+}
+
+int main(void)
+{
+	int rc = storvsc_production_test();
+
+	if (rc)
+		fprintf(stderr, "storvsc-production-test failed: rc=%d\n", rc);
+	return rc;
 }
