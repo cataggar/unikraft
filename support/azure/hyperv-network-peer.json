@@ -306,6 +306,18 @@
       "type": "string",
       "value": "[resourceId('Microsoft.Compute/virtualMachines', variables('peerVmName'))]"
     },
+    "peerVmUuid": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', variables('peerVmName')), '2025-11-01', 'Full').properties.vmId]"
+    },
+    "peerDiskId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/disks', concat(parameters('namePrefix'), '-peer-os'))]"
+    },
+    "peerDiskUuid": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Compute/disks', concat(parameters('namePrefix'), '-peer-os')), '2025-01-02', 'Full').properties.uniqueId]"
+    },
     "peerNicId": {
       "type": "string",
       "value": "[resourceId('Microsoft.Network/networkInterfaces', variables('peerNicName'))]"

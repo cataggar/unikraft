@@ -320,15 +320,17 @@ Cleanup is idempotent and refuses to delete a group if its ownership tags, or
 those of any contained resource, do not match the run. An interrupted or
 partially uploaded run is not silently resumed: clean it up, then prepare a
 fresh state directory for another attempt. The implicit private-peer OS disk is
-not adopted by adding ownership tags. Cleanup requires the successful ARM
-deployment correlation plus the exact VM and disk immutable identities in
-private state, and the live VM must still own that exact disk, even if its tags
-match the run. Required ownership tags are matched as a subset, so unrelated
-additional tags do not invalidate otherwise proven resources; tags alone still
-never authorize the implicit disk. A disk present before deployment, one that
-is detached or replaced, or a peer VM without a proven OS disk stops cleanup,
-including after an unverified partial deployment. Matching names or tags alone
-never authorize deletion through the VM or resource group.
+not adopted by adding ownership tags. The successful ARM deployment itself
+outputs the peer VM and disk UUIDs. The controller records those immutable
+anchors with the deployment correlation and exact declared resources before
+any follow-up read, then re-reads that original deployment during cleanup.
+The live VM must still have the anchored UUID and own the anchored disk, even
+if its tags match the run. Required ownership tags are matched as a subset, so
+unrelated additional tags do not invalidate otherwise proven resources; tags
+alone still never authorize the implicit disk. Missing deployment outputs, a
+disk present before deployment, a detached or replaced disk, or a replaced VM
+stops cleanup. Matching names or tags alone never authorize deletion through
+the VM or resource group.
 
 ## Run private application-network acceptance
 
@@ -389,12 +391,15 @@ as a `secureString`, and deleted after peer deployment.
 
 The controller starts its conservative deadline before peer VM deployment,
 durably records the successful deployment correlation, declared top-level
-resources, and immutable peer VM/disk identities before waiting through
-bounded `Creating` or `Updating` control-plane states. Terminal provisioning
-states fail immediately. It then requires one exact `START` and matching
-`READY` before creating the guest and never resets the deadline after delayed
-boot-diagnostic observation. The peer retains the 600-second process lifetime
-and five-second exchange bounds.
+resources, and ARM-output immutable peer VM/disk identities before waiting
+through bounded `Creating` or `Updating` control-plane states. The guest ARM
+deployment similarly records its VM UUID, imported-disk attachment, and
+reserved NIC before bounded readiness checks. Every peer, disk, NIC, guest, and
+boot-diagnostic query must finish within the original deadline; no query or
+transient state resets it. Terminal provisioning states fail immediately. The
+controller then requires one exact `START` and matching `READY` before creating
+the guest. The peer retains the 600-second process lifetime and five-second
+exchange bounds.
 Both serial streams must then contain unique ordered correlated evidence:
 lease, ARP, three TCP exchanges, six UDP exchanges, exact bytes and transcript
 digests, guest/peer cleanup, peer `EOF`, application final, overall I/O-ready,
@@ -410,15 +415,19 @@ Private `peer-serial.log`, `guest-serial.log`, and
 attempted on success, failure, SIGINT, or SIGTERM, and deletes the disposable
 group only after verifying ownership of every resource. Top-level peer
 resources are bounded by the successful deployment record and durable
-identities. Untagged VM extensions are accepted only as exact children of the
-proven peer VM; unknown children and siblings remain fail-closed. Cleanup
-independently requests deallocation of that proven VM before group deletion.
-If the run and cleanup both fail, both sanitized failures are retained and
-reported without converting the run into success. Unknown ownership stops
-deletion and surfaces a cleanup failure; it is not a successful run or an
-implicit keep-resources mode. This controller path creates no GitHub resources;
-live Azure acceptance remains an explicit operator action after reviewing the
-exported manifest digest and source provenance.
+identities. Cleanup also revalidates the original guest deployment and exact VM
+UUID before recovering an interrupted post-deployment guest inspection; the
+imported disk remains authorized only by its existing run-owned ID and tags,
+not a fabricated UUID claim. VM extensions are accepted only as immediate
+children of the proven peer VM and must either be untagged or carry the normal
+required ownership tags; unknown children and siblings remain fail-closed.
+Cleanup independently requests deallocation of that proven peer VM before
+group deletion. If the run and cleanup both fail, both sanitized failures are
+retained and reported without converting the run into success. Unknown
+ownership stops deletion and surfaces a cleanup failure; it is not a successful
+run or an implicit keep-resources mode. This controller path creates no GitHub
+resources; live Azure acceptance remains an explicit operator action after
+reviewing the exported manifest digest and source provenance.
 
 ## Real device acceptance
 
