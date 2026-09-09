@@ -1428,7 +1428,7 @@ def build_private_image(
         )
     zig = str(zig_invocation)
     command = [
-        zig, "build", "native-images", "-j2",
+        zig, "build", "native-images", "-j1",
         "-Dapp=" + str(SUPPORT / "apps" / "hyperv-acceptance"),
         "-Dconfig=" + str(config),
         "-Doutput=" + str(build_output),

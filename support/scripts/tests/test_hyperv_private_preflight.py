@@ -1170,9 +1170,11 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             tools.mkdir()
             zig_target = tools / "zig-real"
             invoked = tools / "zig-invoked"
+            invoked_args = tools / "zig-invoked-args"
             zig_target.write_text(
                 "#!/bin/sh\nset -eu\nout=''\n"
                 f"printf '%s' \"$0\" > {invoked}\n"
+                f"printf '%s\\n' \"$@\" > {invoked_args}\n"
                 "for arg in \"$@\"; do\n"
                 " case \"$arg\" in -Doutput=*) out=${arg#-Doutput=};; esac\n"
                 "done\n"
@@ -1228,6 +1230,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 validated["receipt"]["source_after"],
             )
             self.assertEqual(invoked.read_text(), str(zig.absolute()))
+            self.assertIn("-j1", invoked_args.read_text().splitlines())
             self.assertIn(
                 f"exec {zig.absolute()} \"$@\"",
                 (output / ".tool-bin" / "zig").read_text(),
