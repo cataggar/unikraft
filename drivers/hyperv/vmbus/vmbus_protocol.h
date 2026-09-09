@@ -101,6 +101,8 @@ void vmbus_protocol_start(__u64 now,
 void vmbus_protocol_receive(const __u8 *payload, size_t payload_len,
 			    __u32 generation, __u64 now,
 			    struct vmbus_action *action);
+int vmbus_protocol_offer_matches_class(
+	const __u8 *payload, size_t payload_len, const __u8 *class_id);
 void vmbus_protocol_tick(__u64 now, struct vmbus_action *action);
 void vmbus_protocol_unload(__u64 now, struct vmbus_action *action);
 void vmbus_protocol_release(__u32 channel_id,

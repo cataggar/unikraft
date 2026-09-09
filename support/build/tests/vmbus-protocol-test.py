@@ -29,6 +29,7 @@ def main() -> None:
         "vmbus_protocol_post_failure",
         "vmbus_protocol_start",
         "vmbus_protocol_receive",
+        "vmbus_protocol_offer_matches_class",
         "vmbus_protocol_tick",
         "vmbus_protocol_unload",
         "vmbus_protocol_release",

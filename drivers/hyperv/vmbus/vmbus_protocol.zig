@@ -703,6 +703,26 @@ export fn vmbus_protocol_receive(
     receive(payload[0..payload_len], generation, now, action);
 }
 
+export fn vmbus_protocol_offer_matches_class(
+    payload: [*]const u8,
+    payload_len: usize,
+    class_id: [*]const u8,
+) callconv(.c) c_int {
+    const class_offset = @offsetOf(WireOfferChannel, "interface_id");
+    const class_end = @offsetOf(WireOfferChannel, "instance_id");
+
+    if (payload_len < class_end)
+        return 0;
+    const bytes = payload[0..payload_len];
+    if (readU32(bytes, 0) != @intFromEnum(MessageType.offer_channel))
+        return 0;
+    const decoded = decodeGuid(bytes[class_offset..class_end]) orelse
+        return 0;
+    return @intFromBool(std.mem.eql(
+        u8, decoded.bytes[0..], class_id[0..16],
+    ));
+}
+
 export fn vmbus_protocol_tick(now: u64, action: *Action) callconv(.c) void {
     tick(now, action);
 }
@@ -1050,6 +1070,43 @@ test "malformed lengths fields and message types are rejected" {
     putU32(unknown[0..], 0, 0xffff);
     vmbus_protocol_receive(&unknown, unknown.len, context.generation, 2, &action);
     try std.testing.expectEqual(ActionKind.malformed, action.kind);
+}
+
+test "offer class recognition precedes offer field validation" {
+    const class = [_]u8{
+        0xba, 0x61, 0x63, 0xd9, 0x04, 0xa1, 0x4d, 0x29,
+        0xb6, 0x05, 0x72, 0xe2, 0xff, 0xb1, 0xdc, 0x7f,
+    };
+    const wire = [_]u8{
+        0xd9, 0x63, 0x61, 0xba, 0xa1, 0x04, 0x29, 0x4d,
+        0xb6, 0x05, 0x72, 0xe2, 0xff, 0xb1, 0xdc, 0x7f,
+    };
+    var offer = makeOffer(wire, 1);
+
+    offer[189] = 2;
+    try std.testing.expectEqual(
+        @as(c_int, 1),
+        vmbus_protocol_offer_matches_class(&offer, offer_size, &class),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, 1),
+        vmbus_protocol_offer_matches_class(&offer, 24, &class),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        vmbus_protocol_offer_matches_class(&offer, 23, &class),
+    );
+    offer[8] ^= 1;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        vmbus_protocol_offer_matches_class(&offer, offer_size, &class),
+    );
+    offer[8] ^= 1;
+    offer[0] = @intFromEnum(MessageType.rescind_channel_offer);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        vmbus_protocol_offer_matches_class(&offer, offer_size, &class),
+    );
 }
 
 test "offer enumeration timeout is surfaced" {

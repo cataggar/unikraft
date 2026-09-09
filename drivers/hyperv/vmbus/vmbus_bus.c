@@ -171,6 +171,30 @@ static __u32 host_read32(const __u8 *data)
 	return (__u32)data[0] | ((__u32)data[1] << 8) |
 		((__u32)data[2] << 16) | ((__u32)data[3] << 24);
 }
+
+static void host_write32(__u8 *data, __u32 value)
+{
+	data[0] = (__u8)value;
+	data[1] = (__u8)(value >> 8);
+	data[2] = (__u8)(value >> 16);
+	data[3] = (__u8)(value >> 24);
+}
+
+static void host_encode_guid(__u8 *wire, const struct vmbus_guid *guid)
+{
+	unsigned int i;
+
+	wire[0] = guid->bytes[3];
+	wire[1] = guid->bytes[2];
+	wire[2] = guid->bytes[1];
+	wire[3] = guid->bytes[0];
+	wire[4] = guid->bytes[5];
+	wire[5] = guid->bytes[4];
+	wire[6] = guid->bytes[7];
+	wire[7] = guid->bytes[6];
+	for (i = 8; i < VMBUS_GUID_SIZE; i++)
+		wire[i] = guid->bytes[i];
+}
 #endif
 
 static int vmbus_bus_init(struct uk_alloc *a);
@@ -279,7 +303,17 @@ void hyperv_vmbus_message(const struct hyperv_message *message)
 	__u32 ticket;
 	struct vmbus_rx_entry *entry;
 	unsigned long flags;
+	size_t inspected_size;
 
+	inspected_size = message->payload_size;
+	if (inspected_size > sizeof(message->payload))
+		inspected_size = sizeof(message->payload);
+	if (message->message_type == VMBUS_HV_MESSAGE_TYPE &&
+	    vmbus_protocol_offer_matches_class(
+		    message->payload, inspected_size,
+		    vmbus_storage_guid.bytes))
+		__atomic_store_n(&storage_offer_lifetime_observed, 1,
+				 __ATOMIC_RELEASE);
 	if ((!__atomic_load_n(&rx_active, __ATOMIC_ACQUIRE) &&
 	     vmbus_protocol_state() != VMBUS_STATE_UNLOADING) ||
 	    __atomic_load_n(&rx_state.lost, __ATOMIC_ACQUIRE))
@@ -3618,6 +3652,60 @@ int vmbus_bus_host_offer_lifetime_setup(struct vmbus_driver *driver)
 	host_reset_state();
 	driver_count = 0;
 	return _vmbus_register_driver(driver);
+}
+
+int vmbus_bus_host_reject_storage_wire(
+	struct vmbus_driver *driver, const struct vmbus_guid *instance_id,
+	__u32 channel_id, __u32 connection_id)
+{
+	struct hyperv_message message = {
+		.message_type = VMBUS_HV_MESSAGE_TYPE,
+		.payload_size = 196,
+	};
+	struct vmbus_action action;
+	__u8 response[16] = { 15 };
+	int rc;
+
+	if (!driver || !instance_id || !channel_id || !connection_id)
+		return -EINVAL;
+	if (vmbus_bus_host_offer_lifetime_setup(driver))
+		return -EIO;
+	rc = host_test_connection_start();
+	if (rc)
+		return rc;
+	response[8] = 1;
+	host_write32(response + 12, 0x1234);
+	vmbus_protocol_receive(
+		response, sizeof(response), vmbus_protocol_generation(),
+		hyperv_reference_time(), &action);
+	if (action.kind != VMBUS_ACTION_TRANSMIT ||
+	    handle_action(&action) ||
+	    vmbus_protocol_state() != VMBUS_STATE_WAIT_OFFERS)
+		return -EIO;
+
+	host_write32(message.payload, 1);
+	host_encode_guid(message.payload + 8, &vmbus_storage_guid);
+	host_encode_guid(message.payload + 24, instance_id);
+	host_write32(message.payload + 184, channel_id);
+	message.payload[189] = 2;
+	host_write32(message.payload + 192, connection_id);
+	hyperv_vmbus_message(&message);
+	rc = process_messages();
+	if (rc || host_last_tx_len != 12 ||
+	    host_read32(host_last_tx) != 13 ||
+	    host_read32(host_last_tx + 8) != channel_id ||
+	    device_count)
+		return -EIO;
+
+	host_zero(&message, sizeof(message));
+	message.message_type = VMBUS_HV_MESSAGE_TYPE;
+	message.payload_size = 8;
+	host_write32(message.payload, 4);
+	hyperv_vmbus_message(&message);
+	rc = process_messages();
+	if (rc || vmbus_protocol_state() != VMBUS_STATE_READY)
+		return -EIO;
+	return 0;
 }
 
 int vmbus_bus_host_offer_storage(

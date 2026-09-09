@@ -99,6 +99,23 @@ void vmbus_protocol_receive(const __u8 *payload __attribute__((unused)),
 {
 	action->kind = VMBUS_ACTION_NONE;
 }
+int vmbus_protocol_offer_matches_class(
+	const __u8 *payload, size_t length, const __u8 *class_id)
+{
+	static const __u8 order[16] = {
+		3, 2, 1, 0, 5, 4, 7, 6,
+		8, 9, 10, 11, 12, 13, 14, 15,
+	};
+	unsigned int i;
+
+	if (length < 24 || payload[0] != 1 || payload[1] ||
+	    payload[2] || payload[3])
+		return 0;
+	for (i = 0; i < 16; i++)
+		if (payload[8 + order[i]] != class_id[i])
+			return 0;
+	return 1;
+}
 void vmbus_protocol_release(__u32 channel_id __attribute__((unused)),
 			    struct vmbus_action *action)
 {

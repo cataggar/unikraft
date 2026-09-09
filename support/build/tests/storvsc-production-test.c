@@ -72,6 +72,9 @@ int vmbus_bus_host_disconnect_remove(
 	void (*unload_post_hook)(void *), void *unload_arg,
 	int acknowledge);
 int vmbus_bus_host_offer_lifetime_setup(struct vmbus_driver *driver);
+int vmbus_bus_host_reject_storage_wire(
+	struct vmbus_driver *driver, const struct vmbus_guid *instance_id,
+	__u32 channel_id, __u32 connection_id);
 int vmbus_bus_host_offer_storage(
 	const struct vmbus_guid *instance_id, __u32 channel_id,
 	__u32 connection_id);
@@ -5184,6 +5187,7 @@ static int run_persistence_unavailable_regression(
 	struct vmbus_driver *driver, struct vmbus_device *device)
 {
 	char output[8192];
+	struct uk_storvsc_inventory_snapshot inventory;
 	unsigned int writes10 = write10_command_count;
 	unsigned int writes16 = write16_command_count;
 	unsigned int flushes = flush_command_count;
@@ -5226,10 +5230,13 @@ static int run_persistence_unavailable_regression(
 		    "reason=invalid-expectation", 0) != 1)
 		return 692;
 
-	if (vmbus_bus_host_offer_lifetime_setup(driver) ||
-	    vmbus_bus_host_fill_nonstorage_offers(700) ||
-	    vmbus_bus_host_offer_storage(&device->instance_id, 900, 1000) !=
-		    -ENOSPC)
+	if (vmbus_storage_offer_lifetime_observed() ||
+	    vmbus_bus_host_reject_storage_wire(
+		    driver, &device->instance_id, 690, 1690) ||
+	    !vmbus_storage_offer_lifetime_observed() ||
+	    uk_storvsc_inventory_get(&inventory) || inventory.count ||
+	    inventory.topology_generation !=
+		    UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION)
 		return 697;
 	hyperv_acceptance_persistence_host_reset();
 	hyperv_acceptance_persistence_host_set_identity_policy(
@@ -5241,6 +5248,22 @@ static int run_persistence_unavailable_regression(
 	    write16_command_count != writes16 ||
 	    flush_command_count != flushes)
 		return 698;
+
+	if (vmbus_bus_host_offer_lifetime_setup(driver) ||
+	    vmbus_bus_host_fill_nonstorage_offers(700) ||
+	    vmbus_bus_host_offer_storage(&device->instance_id, 900, 1000) !=
+		    -ENOSPC)
+		return 699;
+	hyperv_acceptance_persistence_host_reset();
+	hyperv_acceptance_persistence_host_set_identity_policy(
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2);
+	rc = capture_persistence_output(output, sizeof(output), &result);
+	if (rc || result != HYPERV_ACCEPTANCE_FAIL ||
+	    persistence_log_has_unavailable(output) ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 700;
 
 	hyperv_acceptance_persistence_host_reset();
 	hyperv_acceptance_persistence_host_set_identity_policy(
