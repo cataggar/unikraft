@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <uk/alloc.h>
 #include <uk/blkdev.h>
@@ -74,6 +75,7 @@ int vmbus_bus_host_offer_lifetime_setup(struct vmbus_driver *driver);
 int vmbus_bus_host_offer_storage(
 	const struct vmbus_guid *instance_id, __u32 channel_id,
 	__u32 connection_id);
+int vmbus_bus_host_fill_nonstorage_offers(__u32 first_channel);
 int vmbus_bus_host_confirm_rescind(__u32 channel_id);
 int vmbus_bus_host_offer_present(__u32 channel_id);
 __u64 vmbus_bus_host_offer_generation(__u32 channel_id);
@@ -1481,6 +1483,85 @@ static void request_done(struct uk_blkreq *request, void *cookie)
 
 	(void)request;
 	atomic_fetch_add(count, 1);
+}
+
+static int capture_persistence_output(
+	char *output, size_t capacity, int *result)
+{
+	int descriptors[2];
+	int saved_stdout;
+	int flush_rc;
+	int restore_rc;
+	size_t used = 0;
+	ssize_t count;
+
+	if (!output || capacity < 2 || !result || fflush(stdout) ||
+	    pipe(descriptors))
+		return -EIO;
+	saved_stdout = dup(STDOUT_FILENO);
+	if (saved_stdout < 0) {
+		close(descriptors[0]);
+		close(descriptors[1]);
+		return -EIO;
+	}
+	if (dup2(descriptors[1], STDOUT_FILENO) < 0) {
+		close(saved_stdout);
+		close(descriptors[0]);
+		close(descriptors[1]);
+		return -EIO;
+	}
+	close(descriptors[1]);
+	*result = hyperv_acceptance_persistence_main();
+	flush_rc = fflush(stdout);
+	restore_rc = dup2(saved_stdout, STDOUT_FILENO);
+	if (flush_rc || restore_rc < 0) {
+		close(saved_stdout);
+		close(descriptors[0]);
+		return -EIO;
+	}
+	close(saved_stdout);
+	while ((count = read(
+			descriptors[0], output + used,
+			capacity - used - 1)) > 0) {
+		used += (size_t)count;
+		if (used == capacity - 1)
+			break;
+	}
+	close(descriptors[0]);
+	output[used] = '\0';
+	return count < 0 ? -EIO : 0;
+}
+
+static unsigned int persistence_log_line_count(
+	const char *output, const char *marker, int prefix)
+{
+	const char *line = output;
+	size_t marker_length = strlen(marker);
+	unsigned int count = 0;
+
+	while (*line) {
+		const char *end = strchr(line, '\n');
+		size_t line_length = end ? (size_t)(end - line) : strlen(line);
+
+		if ((!prefix && line_length == marker_length) ||
+		    (prefix && line_length >= marker_length))
+			if (!memcmp(line, marker, marker_length))
+				count++;
+		if (!end)
+			break;
+		line = end + 1;
+	}
+	return count;
+}
+
+static int persistence_log_has_unavailable(const char *output)
+{
+	return persistence_log_line_count(
+		       output, "HYPERV_PERSISTENCE SELECT UNAVAILABLE ", 1) ||
+	       persistence_log_line_count(
+		       output, "UK_HYPERV_PERSISTENCE_UNAVAILABLE:", 1) ||
+	       persistence_log_line_count(
+		       output, "UK_HYPERV_PLATFORM_READY", 0);
 }
 
 static void retained_request_done(struct uk_blkreq *request, void *cookie)
@@ -4173,11 +4254,13 @@ static int run_unresolved_discovery_case(
 	struct vmbus_device *secondary,
 	enum unresolved_discovery_case failure, int run_guest)
 {
+	char output[8192];
 	struct uk_storvsc_inventory_snapshot inventory;
 	unsigned int writes10 = write10_command_count;
 	unsigned int writes16 = write16_command_count;
 	unsigned int flushes = flush_command_count;
 	int inventory_rc;
+	int guest_result;
 	int rc;
 
 	hyperv_acceptance_persistence_host_reset();
@@ -4234,14 +4317,18 @@ static int run_unresolved_discovery_case(
 	}
 	if (inventory_rc == -EAGAIN)
 		inventory_rc = uk_storvsc_inventory_get(&inventory);
-	if (run_guest &&
-	    (hyperv_acceptance_persistence_main() != HYPERV_ACCEPTANCE_FAIL ||
-	     write10_command_count != writes10 ||
-	     write16_command_count != writes16 ||
-	     flush_command_count != flushes)) {
-		persistence_remove_device(driver, secondary);
-		persistence_remove_device(driver, primary);
-		return 655;
+	if (run_guest) {
+		rc = capture_persistence_output(
+			output, sizeof(output), &guest_result);
+		if (rc || guest_result != HYPERV_ACCEPTANCE_FAIL ||
+		    persistence_log_has_unavailable(output) ||
+		    write10_command_count != writes10 ||
+		    write16_command_count != writes16 ||
+		    flush_command_count != flushes) {
+			persistence_remove_device(driver, secondary);
+			persistence_remove_device(driver, primary);
+			return 655;
+		}
 	}
 	if (inventory_rc != -EAGAIN) {
 		persistence_remove_device(driver, secondary);
@@ -4712,9 +4799,11 @@ out:
 static int persistence_expect_no_write_failure(
 	struct vmbus_driver *driver, struct vmbus_device *device)
 {
+	char output[8192];
 	unsigned int writes10 = write10_command_count;
 	unsigned int writes16 = write16_command_count;
 	unsigned int flushes = flush_command_count;
+	int result;
 	int rc;
 
 	hyperv_acceptance_persistence_host_reset();
@@ -4722,9 +4811,11 @@ static int persistence_expect_no_write_failure(
 	rc = driver->add_dev(device);
 	if (rc)
 		return rc;
-	rc = hyperv_acceptance_persistence_main();
+	rc = capture_persistence_output(
+		output, sizeof(output), &result);
 	persistence_remove_device(driver, device);
-	if (rc != HYPERV_ACCEPTANCE_FAIL ||
+	if (rc || result != HYPERV_ACCEPTANCE_FAIL ||
+	    persistence_log_has_unavailable(output) ||
 	    write10_command_count != writes10 ||
 	    write16_command_count != writes16 ||
 	    flush_command_count != flushes)
@@ -4736,6 +4827,7 @@ static int run_persistence_workflow_regression(
 	struct vmbus_driver *driver, struct vmbus_device *primary,
 	unsigned int identity_policy)
 {
+	char output[8192];
 	struct vmbus_device secondary = {
 		.channel_id = 47,
 		.connection_id = 147,
@@ -4753,6 +4845,7 @@ static int run_persistence_workflow_regression(
 	uint8_t saved_receipt;
 	uint8_t saved_receipt_sector[
 		HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
+	int result;
 	int rc;
 
 	storvsc_host_set_guarded_io(1);
@@ -4791,8 +4884,16 @@ static int run_persistence_workflow_regression(
 	writes10 = write10_command_count;
 	writes16 = write16_command_count;
 	flushes = flush_command_count;
-	rc = hyperv_acceptance_persistence_main();
-	if (rc != HYPERV_ACCEPTANCE_PASS ||
+	rc = capture_persistence_output(
+		output, sizeof(output), &result);
+	if (rc || result != HYPERV_ACCEPTANCE_PASS ||
+	    persistence_log_has_unavailable(output) ||
+	    persistence_log_line_count(
+		    output, "HYPERV_PERSISTENCE BOOT1_WRITE PASS ", 1) != 1 ||
+	    persistence_log_line_count(
+		    output, "UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:", 1) != 1 ||
+	    persistence_log_line_count(
+		    output, "UK_HYPERV_PERSISTENCE_IDENTITY:1:", 1) != 1 ||
 	    write10_command_count <= writes10 ||
 	    write16_command_count <= writes16 ||
 	    flush_command_count <= flushes)
@@ -4800,8 +4901,16 @@ static int run_persistence_workflow_regression(
 	writes10 = write10_command_count;
 	writes16 = write16_command_count;
 	flushes = flush_command_count;
-	rc = hyperv_acceptance_persistence_main();
-	if (rc != HYPERV_ACCEPTANCE_PASS ||
+	rc = capture_persistence_output(
+		output, sizeof(output), &result);
+	if (rc || result != HYPERV_ACCEPTANCE_PASS ||
+	    persistence_log_has_unavailable(output) ||
+	    persistence_log_line_count(
+		    output, "HYPERV_PERSISTENCE BOOT2_READ PASS ", 1) != 1 ||
+	    persistence_log_line_count(
+		    output, "UK_HYPERV_PERSISTENCE_BOOT2_COMPLETE:", 1) != 1 ||
+	    persistence_log_line_count(
+		    output, "HYPERV_PERSISTENCE BOOT1_", 1) ||
 	    write10_command_count != writes10 ||
 	    write16_command_count != writes16 ||
 	    flush_command_count != flushes)
@@ -5038,6 +5147,160 @@ static int run_persistence_workflow_regression(
 	return 0;
 }
 
+static int persistence_unavailable_log_valid(const char *output)
+{
+	return persistence_log_line_count(
+		       output,
+		       "HYPERV_PERSISTENCE SELECT UNAVAILABLE "
+		       "reason=no-devices writes=0 flushes=0", 0) == 1 &&
+	       persistence_log_line_count(
+		       output, "HYPERV_PERSISTENCE SELECT UNAVAILABLE ", 1) ==
+		       1 &&
+	       persistence_log_line_count(
+		       output, "UK_HYPERV_PLATFORM_READY", 0) == 1 &&
+	       persistence_log_line_count(
+		       output,
+		       "UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices",
+		       0) == 1 &&
+	       persistence_log_line_count(
+		       output, "UK_HYPERV_PERSISTENCE_UNAVAILABLE:", 1) == 1 &&
+	       !persistence_log_line_count(
+		       output, "HYPERV_PERSISTENCE SELECT FAIL", 1) &&
+	       !persistence_log_line_count(
+		       output, "HYPERV_PERSISTENCE FINAL PASS", 1) &&
+	       !persistence_log_line_count(
+		       output, "UK_HYPERV_PERSISTENCE_IDENTITY:", 1) &&
+	       !persistence_log_line_count(
+		       output, "HYPERV_PERSISTENCE BOOT1_", 1) &&
+	       !persistence_log_line_count(
+		       output, "HYPERV_PERSISTENCE BOOT2_", 1) &&
+	       !persistence_log_line_count(
+		       output, "UK_HYPERV_PERSISTENCE_BOOT1_", 1) &&
+	       !persistence_log_line_count(
+		       output, "UK_HYPERV_PERSISTENCE_BOOT2_", 1);
+}
+
+static int run_persistence_unavailable_regression(
+	struct vmbus_driver *driver, struct vmbus_device *device)
+{
+	char output[8192];
+	unsigned int writes10 = write10_command_count;
+	unsigned int writes16 = write16_command_count;
+	unsigned int flushes = flush_command_count;
+	int result;
+	int rc;
+
+	storvsc_host_set_guarded_io(1);
+	hyperv_acceptance_persistence_host_reset();
+	hyperv_acceptance_persistence_host_set_identity_policy(
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2);
+	rc = capture_persistence_output(output, sizeof(output), &result);
+	if (rc || result != HYPERV_ACCEPTANCE_UNAVAILABLE ||
+	    !persistence_unavailable_log_valid(output) ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 690;
+
+	hyperv_acceptance_persistence_host_reset();
+	hyperv_acceptance_persistence_host_set_identity_policy(
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1);
+	rc = capture_persistence_output(output, sizeof(output), &result);
+	if (rc || result != HYPERV_ACCEPTANCE_FAIL ||
+	    persistence_log_has_unavailable(output) ||
+	    persistence_log_line_count(
+		    output, "HYPERV_PERSISTENCE SELECT FAIL", 1) != 1 ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 691;
+
+	hyperv_acceptance_persistence_host_reset();
+	hyperv_acceptance_persistence_host_set_identity_policy(3);
+	rc = capture_persistence_output(output, sizeof(output), &result);
+	if (rc || result != HYPERV_ACCEPTANCE_FAIL ||
+	    persistence_log_has_unavailable(output) ||
+	    persistence_log_line_count(
+		    output,
+		    "HYPERV_PERSISTENCE FINAL FAIL "
+		    "reason=invalid-expectation", 0) != 1)
+		return 692;
+
+	if (vmbus_bus_host_offer_lifetime_setup(driver) ||
+	    vmbus_bus_host_fill_nonstorage_offers(700) ||
+	    vmbus_bus_host_offer_storage(&device->instance_id, 900, 1000) !=
+		    -ENOSPC)
+		return 697;
+	hyperv_acceptance_persistence_host_reset();
+	hyperv_acceptance_persistence_host_set_identity_policy(
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2);
+	rc = capture_persistence_output(output, sizeof(output), &result);
+	if (rc || result != HYPERV_ACCEPTANCE_FAIL ||
+	    persistence_log_has_unavailable(output) ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 698;
+
+	hyperv_acceptance_persistence_host_reset();
+	hyperv_acceptance_persistence_host_set_identity_policy(
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2);
+	report_luns_mode = REPORT_LUNS_NORMAL;
+	vpd_mode = VPD_NORMAL;
+	storvsc_host_set_lun_discovery(1);
+	persistence_hook_driver = driver;
+	persistence_hook_device = device;
+	persistence_hook_mode = PERSISTENCE_HOOK_ADD_BEFORE_REVALIDATE;
+	persistence_hook_fired = 0;
+	rc = capture_persistence_output(output, sizeof(output), &result);
+	persistence_hook_mode = PERSISTENCE_HOOK_NONE;
+	if (rc || result != HYPERV_ACCEPTANCE_FAIL ||
+	    !persistence_hook_fired ||
+	    persistence_log_has_unavailable(output) ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 693;
+	persistence_remove_device(driver, device);
+
+	hyperv_acceptance_persistence_host_reset();
+	rc = capture_persistence_output(output, sizeof(output), &result);
+	if (rc || result != HYPERV_ACCEPTANCE_FAIL ||
+	    persistence_log_has_unavailable(output) ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 694;
+
+	hyperv_acceptance_persistence_host_reset();
+	vpd_mode = VPD_MALFORMED;
+	device->present = 1;
+	rc = driver->add_dev(device);
+	vpd_mode = VPD_NORMAL;
+	if (rc != -EPROTO)
+		return 695;
+	rc = capture_persistence_output(output, sizeof(output), &result);
+	if (rc || result != HYPERV_ACCEPTANCE_FAIL ||
+	    persistence_log_has_unavailable(output) ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 696;
+	persistence_remove_device(driver, device);
+
+	persistence_hook_driver = NULL;
+	persistence_hook_device = NULL;
+	persistence_hook_mode = PERSISTENCE_HOOK_NONE;
+	hyperv_acceptance_persistence_host_set_identity_policy(0);
+	hyperv_acceptance_persistence_host_reset();
+	storvsc_host_set_lun_discovery(0);
+	storvsc_host_set_guarded_io(0);
+	report_luns_commands = 0;
+	vpd_commands = 0;
+	invalid_scsi_address = 0;
+	return 0;
+}
+
 static int storvsc_production_test(void)
 {
 	struct vmbus_driver *driver = storvsc_host_driver();
@@ -5066,6 +5329,10 @@ static int storvsc_production_test(void)
 			 0xb6, 0x05, 0x72, 0xe2, 0xff, 0xb1, 0xdc, 0x7f },
 	    16))
 		return 1;
+	rc = run_persistence_unavailable_regression(
+		driver, &vmbus_device);
+	if (rc)
+		return rc;
 	if (vmbus_bus_host_connection_begin())
 		return 2;
 	report_luns_mode = REPORT_LUNS_TRUNCATED;

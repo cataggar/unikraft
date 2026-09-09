@@ -164,8 +164,10 @@ static struct storvsc_lun *storvsc_write_lun;
 static __u64 storvsc_session_cookie;
 static int storvsc_session_cookie_exhausted;
 static int storvsc_unresolved_offer_overflow;
-static __u64 storvsc_topology_generation;
+static __u64 storvsc_topology_generation =
+	UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION;
 static int storvsc_topology_generation_exhausted;
+static int storvsc_storage_lifetime_observed;
 #if defined(CONFIG_LIBSTORVSC_LUN_DISCOVERY) && \
 	CONFIG_LIBSTORVSC_LUN_DISCOVERY
 #define STORVSC_LUN_DISCOVERY_DEFAULT 1
@@ -302,6 +304,15 @@ static void storvsc_advance_topology_generation(void)
 			return;
 		}
 	}
+}
+
+static void storvsc_note_storage_lifetime(void)
+{
+	unsigned long flags;
+
+	ukplat_spin_lock_irqsave(&storvsc_topology_lock, flags);
+	storvsc_storage_lifetime_observed = 1;
+	ukplat_spin_unlock_irqrestore(&storvsc_topology_lock, flags);
 }
 
 static int storvsc_unresolved_offer_matches(
@@ -2224,6 +2235,45 @@ int uk_storvsc_inventory_get(
 	return -EAGAIN;
 }
 
+int uk_storvsc_inventory_pristine_empty(
+	const struct uk_storvsc_inventory_snapshot *first,
+	const struct uk_storvsc_inventory_snapshot *second)
+{
+	unsigned long flags;
+	unsigned int i;
+	int pristine = 0;
+
+	if (!first || !second ||
+	    first->version != UK_STORVSC_INVENTORY_SNAPSHOT_VERSION ||
+	    second->version != UK_STORVSC_INVENTORY_SNAPSHOT_VERSION ||
+	    first->size != sizeof(*first) ||
+	    second->size != sizeof(*second) ||
+	    first->reserved || first->reserved2 ||
+	    second->reserved || second->reserved2 ||
+	    first->count || second->count ||
+	    first->topology_generation !=
+		    UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION ||
+	    second->topology_generation !=
+		    UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION)
+		return 0;
+
+	ukplat_spin_lock_irqsave(&storvsc_topology_lock, flags);
+	if (storvsc_storage_lifetime_observed ||
+	    vmbus_storage_offer_lifetime_observed() ||
+	    storvsc_topology_generation_exhausted ||
+	    storvsc_topology_generation !=
+		    UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION ||
+	    storvsc_unresolved_offer_overflow)
+		goto out;
+	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_DEVICES; i++)
+		if (storvsc_unresolved_offers[i].active)
+			goto out;
+	pristine = 1;
+out:
+	ukplat_spin_unlock_irqrestore(&storvsc_topology_lock, flags);
+	return pristine;
+}
+
 static int storvsc_fill_target_locked(
 	struct storvsc_lun *lun, struct uk_storvsc_target_snapshot *snapshot)
 {
@@ -2740,7 +2790,10 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	int identity_committed = 0;
 	int rc;
 
-	if (!vmbus_device || vmbus_device->subchannel_index)
+	if (!vmbus_device)
+		return -EINVAL;
+	storvsc_note_storage_lifetime();
+	if (vmbus_device->subchannel_index)
 		return -EINVAL;
 	rc = vmbus_device_bind_epoch(vmbus_device, &bind_token);
 	if (rc)
@@ -3135,6 +3188,7 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 static void
 storvsc_offer_removed(const struct vmbus_offer_identity *offer)
 {
+	storvsc_note_storage_lifetime();
 	if (!offer || !offer->generation)
 		return;
 	storvsc_clear_unresolved_offer(

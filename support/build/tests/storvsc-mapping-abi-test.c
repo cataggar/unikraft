@@ -26,6 +26,7 @@ int storvsc_mapping_abi_fixture(
 		uk_storvsc_mapping_get(0, mapping) +
 		uk_storvsc_mapping_find(0, mapping) +
 		uk_storvsc_inventory_get(inventory) +
+		uk_storvsc_inventory_pristine_empty(inventory, inventory) +
 		uk_storvsc_target_get(0, target) +
 		uk_storvsc_session_begin_read(target, session) +
 		uk_storvsc_session_authorize_write(session) +

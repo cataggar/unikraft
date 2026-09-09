@@ -15,6 +15,7 @@ extern "C" {
 #define UK_STORVSC_TARGET_SNAPSHOT_VERSION	1U
 #define UK_STORVSC_INVENTORY_SNAPSHOT_VERSION	1U
 #define UK_STORVSC_SESSION_VERSION		1U
+#define UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION 0ULL
 
 #define UK_STORVSC_CDB_AUTO	0U
 #define UK_STORVSC_CDB_10	10U
@@ -90,6 +91,17 @@ int uk_storvsc_inventory_get(
 	struct uk_storvsc_inventory_snapshot *snapshot);
 int uk_storvsc_target_get(unsigned int index,
 			  struct uk_storvsc_target_snapshot *snapshot);
+/*
+ * Returns one only when two coherent empty snapshots describe the driver's
+ * documented initial generation and no storage offer lifetime has ever
+ * reached VMBus during this boot, including offers rejected before StorVSC
+ * admission. Since sessions and I/O require an admitted offer, this also
+ * proves that neither could have occurred. This is platform availability
+ * evidence, not storage acceptance.
+ */
+int uk_storvsc_inventory_pristine_empty(
+	const struct uk_storvsc_inventory_snapshot *first,
+	const struct uk_storvsc_inventory_snapshot *second);
 
 /*
  * Candidate reads are pinned to the exact mapping and controller, LUN, and

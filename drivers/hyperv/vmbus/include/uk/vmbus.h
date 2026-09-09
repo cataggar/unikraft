@@ -143,6 +143,12 @@ int vmbus_device_bind_retry(
 	const struct vmbus_device_bind_token *token);
 void vmbus_device_bind_ready(void);
 int _vmbus_register_driver(struct vmbus_driver *driver);
+/*
+ * Return nonzero after any decoded primary or subchannel storage offer has
+ * reached VMBus during this boot, including one rejected before driver
+ * admission because the bounded device pool was exhausted.
+ */
+int vmbus_storage_offer_lifetime_observed(void);
 
 /*
  * Open a primary channel using a statically allocated TX/RX ring pair.

@@ -35,9 +35,11 @@ int main(void)
 	__typeof__(&vmbus_device_bind_epoch) bind_epoch = NULL;
 	__typeof__(&vmbus_device_bind_retry) bind_retry = NULL;
 	__typeof__(&vmbus_device_bind_ready) bind_ready = NULL;
+	__typeof__(&vmbus_storage_offer_lifetime_observed)
+		storage_offer_observed = NULL;
 
 	return action.tx_len || device.present || gpadl.id ||
 		packet.payload_size ||
 		send_ex || send_gpa_ex || connection_fail || quiesce_epoch ||
-		bind_epoch || bind_retry || bind_ready;
+		bind_epoch || bind_retry || bind_ready || storage_offer_observed;
 }

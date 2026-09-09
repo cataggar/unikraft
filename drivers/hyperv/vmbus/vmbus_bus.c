@@ -112,6 +112,7 @@ static __u64 post_input_gpa;
 static __u64 relid_sequence;
 static __u64 device_generation = 1;
 static __u64 channel_resource_epoch = 1;
+static int storage_offer_lifetime_observed;
 static int bind_work_pending;
 static int bind_work_running;
 static int bind_attempt_active;
@@ -1062,6 +1063,9 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 	unsigned int i;
 	int rc;
 
+	if (guid_equal_bytes(&vmbus_storage_guid, offer->class_id))
+		__atomic_store_n(&storage_offer_lifetime_observed, 1,
+				 __ATOMIC_RELEASE);
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
 		dev = &devices[i];
 		if (dev->present && dev->channel_id == offer->channel_id) {
@@ -1071,6 +1075,7 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 				return -EINVAL;
 			return 0;
 		}
+
 		binding = &device_bindings[i];
 		if (!dev->present && binding->state == VMBUS_BIND_UNUSED &&
 		    !binding->pending_offer_valid && !free_slot)
@@ -1144,6 +1149,12 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 			   free_slot->channel_id, kind);
 	}
 	return 0;
+}
+
+int vmbus_storage_offer_lifetime_observed(void)
+{
+	return __atomic_load_n(&storage_offer_lifetime_observed,
+			       __ATOMIC_ACQUIRE);
 }
 
 static int rescind_offer(__u32 channel_id)
@@ -3625,6 +3636,27 @@ int vmbus_bus_host_offer_storage(
 	offer.channel_id = channel_id;
 	offer.connection_id = connection_id;
 	return add_offer(&offer);
+}
+
+int vmbus_bus_host_fill_nonstorage_offers(__u32 first_channel)
+{
+	struct vmbus_decoded_offer offer;
+	unsigned int i;
+	int rc;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
+		host_zero(&offer, sizeof(offer));
+		copy_bytes(offer.class_id, vmbus_network_guid.bytes,
+			   VMBUS_GUID_SIZE);
+		offer.instance_id[0] = (__u8)i;
+		offer.instance_id[1] = (__u8)(i >> 8);
+		offer.channel_id = first_channel + i;
+		offer.connection_id = first_channel + i + 100;
+		rc = add_offer(&offer);
+		if (rc)
+			return rc;
+	}
+	return 0;
 }
 
 int vmbus_bus_host_offer_present(__u32 channel_id)
