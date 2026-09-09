@@ -25,6 +25,12 @@
 #ifndef PERSISTENCE_POLL_NS
 #define PERSISTENCE_POLL_NS 10000000ULL
 #endif
+#ifndef CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH
+#define CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH 0
+#endif
+#ifndef CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET
+#define CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET 0
+#endif
 
 struct persistence_candidate {
 	struct uk_storvsc_target_snapshot target;
@@ -47,6 +53,9 @@ static struct uk_blkreq persistence_request;
 static struct persistence_candidate persistence_selected;
 static int persistence_request_owned;
 static int persistence_request_abandoned;
+#ifdef HYPERV_PERSISTENCE_HOST_TEST
+static unsigned int persistence_host_identity_policy;
+#endif
 
 static void persistence_queue_event(struct uk_blkdev *device,
 				    uint16_t queue_id, void *cookie)
@@ -95,6 +104,12 @@ static void persistence_print_run(const uint8_t run_id[16])
 		printf("%02x", run_id[i]);
 }
 
+static void persistence_print_hex(const uint8_t *bytes, size_t length)
+{
+	for (size_t i = 0; i < length; i++)
+		printf("%02x", bytes[i]);
+}
+
 static int persistence_expected(
 	struct hyperv_acceptance_persistence_expected *expected)
 {
@@ -113,11 +128,21 @@ static int persistence_expected(
 	expected->path_id = CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH;
 	expected->target_id = CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET;
 	expected->lun = CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN;
+	expected->identity_policy =
+		CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY;
+#ifdef HYPERV_PERSISTENCE_HOST_TEST
+	if (persistence_host_identity_policy)
+		expected->identity_policy = persistence_host_identity_policy;
+#endif
 	return expected->sector_size ==
 			       HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE &&
 		       expected->sectors >
 			       HYPERV_ACCEPTANCE_PERSISTENCE_EXTENT_LBA +
-			       HYPERV_ACCEPTANCE_PERSISTENCE_EXTENT_SECTORS ?
+			       HYPERV_ACCEPTANCE_PERSISTENCE_EXTENT_SECTORS &&
+		       (expected->identity_policy ==
+				HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1 ||
+			expected->identity_policy ==
+				HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2) ?
 		       0 : -EINVAL;
 }
 
@@ -226,20 +251,57 @@ static void persistence_identity(
 	memcpy(identity->vpd_id, mapping->vpd_id, mapping->vpd_length);
 }
 
-static int persistence_snapshot_matches(
+static int persistence_snapshot_in_scope(
 	const struct uk_storvsc_target_snapshot *target,
 	const struct hyperv_acceptance_persistence_expected *expected)
 {
 	const struct uk_storvsc_mapping *mapping = &target->mapping;
 
-	return mapping->path_id == expected->path_id &&
-	       mapping->target_id == expected->target_id &&
-	       mapping->lun == expected->lun &&
+	return mapping->lun == expected->lun &&
 	       mapping->sectors == expected->sectors &&
 	       mapping->sector_size == expected->sector_size &&
-	       !mapping->read_only && mapping->vpd_length &&
+	       (expected->identity_policy ==
+			HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2 ||
+		(mapping->path_id == expected->path_id &&
+		 mapping->target_id == expected->target_id));
+}
+
+static int persistence_snapshot_has_safe_identity(
+	const struct uk_storvsc_target_snapshot *target)
+{
+	const struct uk_storvsc_mapping *mapping = &target->mapping;
+
+	return !mapping->read_only && mapping->vpd_length &&
 	       mapping->vpd_length <= HYPERV_ACCEPTANCE_PERSISTENCE_VPD_MAX;
 }
+
+#ifdef HYPERV_PERSISTENCE_HOST_TEST
+int hyperv_acceptance_persistence_host_mapping_in_scope(
+	unsigned int identity_policy, uint8_t path, uint8_t target,
+	uint8_t lun, uint64_t sectors, uint32_t sector_size)
+{
+	const struct hyperv_acceptance_persistence_expected expected = {
+		.sectors = CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS,
+		.sector_size =
+			CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE,
+		.path_id = CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH,
+		.target_id = CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET,
+		.lun = CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN,
+		.identity_policy = identity_policy,
+	};
+	const struct uk_storvsc_target_snapshot snapshot = {
+		.mapping = {
+			.path_id = path,
+			.target_id = target,
+			.lun = lun,
+			.sectors = sectors,
+			.sector_size = sector_size,
+		},
+	};
+
+	return persistence_snapshot_in_scope(&snapshot, &expected);
+}
+#endif
 
 static int persistence_read_records(
 	struct uk_blkdev *device,
@@ -342,11 +404,17 @@ static int persistence_select(
 			rc = rc ? rc : -ESTALE;
 			goto fail;
 		}
-		if (!persistence_snapshot_matches(&target, expected))
+		if (!persistence_snapshot_in_scope(&target, expected))
 			continue;
+		if (!persistence_snapshot_has_safe_identity(&target)) {
+			unsafe_candidates++;
+			continue;
+		}
 		device = uk_blkdev_get(target.mapping.blkdev_id);
-		if (!device)
+		if (!device) {
+			unsafe_candidates++;
 			continue;
+		}
 		memset(&session, 0, sizeof(session));
 		rc = uk_storvsc_session_begin_read(&target, &session);
 		if (rc)
@@ -430,8 +498,12 @@ static int persistence_select(
 		rc = rc ? rc : -ESTALE;
 		goto fail;
 	}
+	if (unsafe_candidates) {
+		rc = -EPERM;
+		goto fail;
+	}
 	if (matches != 1) {
-		rc = unsafe_candidates ? -EPERM : -ENOENT;
+		rc = -ENOENT;
 		goto fail;
 	}
 	{
@@ -460,6 +532,31 @@ fail:
 			return end_rc;
 	}
 	return rc;
+}
+
+static void persistence_print_identity_evidence(
+	const struct hyperv_acceptance_persistence_expected *expected,
+	const struct persistence_candidate *candidate)
+{
+	const struct hyperv_acceptance_persistence_identity *identity =
+		&candidate->identity;
+
+	printf("UK_HYPERV_PERSISTENCE_IDENTITY:1:%u:",
+	       expected->identity_policy);
+	persistence_print_hex(expected->run_id, sizeof(expected->run_id));
+	putchar(':');
+	persistence_print_hex(expected->disk_id, sizeof(expected->disk_id));
+	putchar(':');
+	persistence_print_hex(identity->controller_instance,
+			      sizeof(identity->controller_instance));
+	printf(":%u:%u:%u:%" PRIu64 ":%u:%u:%u:%u:%u:",
+	       identity->path_id, identity->target_id, identity->lun,
+	       expected->sectors, expected->sector_size,
+	       identity->vpd_length, identity->vpd_code_set,
+	       identity->vpd_designator_type, identity->vpd_association);
+	persistence_print_hex(identity->vpd_id, identity->vpd_length);
+	putchar('\n');
+	fflush(stdout);
 }
 
 static void persistence_pattern_checksums(
@@ -702,6 +799,8 @@ int hyperv_acceptance_persistence_main(void)
 	       persistence_selected.target.mapping.blkdev_id,
 	       persistence_selected.target.mapping.controller_index,
 	       persistence_selected.state);
+	persistence_print_identity_evidence(
+		&expected, &persistence_selected);
 	if (persistence_selected.state ==
 	    HYPERV_ACCEPTANCE_PERSISTENCE_PRISTINE) {
 		rc = persistence_boot1(&persistence_selected, &expected);
@@ -763,5 +862,11 @@ void hyperv_acceptance_persistence_host_reset(void)
 	memset(persistence_verify, 0, sizeof(persistence_verify));
 	persistence_request_owned = 0;
 	persistence_request_abandoned = 0;
+}
+
+void hyperv_acceptance_persistence_host_set_identity_policy(
+	unsigned int identity_policy)
+{
+	persistence_host_identity_policy = identity_policy;
 }
 #endif

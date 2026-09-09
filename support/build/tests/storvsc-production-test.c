@@ -129,6 +129,7 @@ static int reject_mode_sense10;
 static int report_luns_mode;
 static int topology_fixture;
 static int vpd_mode;
+static uint8_t vpd_variant;
 static int alternate_completion_size;
 static int hold_io;
 static int short_transfer_once;
@@ -816,6 +817,7 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 					       channel->device->instance_id.bytes,
 					       5);
 					data[15] = lun;
+					data[14] ^= vpd_variant;
 				}
 				response_transfer = 16;
 			}
@@ -3786,9 +3788,12 @@ static int run_guarded_io_regression(
 	return 0;
 }
 
-static int persistence_prepare_seed(int boot_signature)
+static int persistence_prepare_seed(unsigned int identity_policy,
+				    int boot_signature,
+				    uint64_t sectors, uint8_t lun,
+				    int wrong_id)
 {
-	const struct hyperv_acceptance_persistence_expected expected = {
+	struct hyperv_acceptance_persistence_expected expected = {
 		.run_id = {
 			0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
 			0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
@@ -3797,15 +3802,18 @@ static int persistence_prepare_seed(int boot_signature)
 			0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
 			0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
 		},
-		.sectors = 1000,
+		.sectors = sectors,
 		.sector_size = 512,
 		.path_id = 0,
 		.target_id = 0,
-		.lun = 0,
+		.lun = lun,
+		.identity_policy = identity_policy,
 	};
 	uint8_t manifest[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
 
 	memset(backing_media, 0, sizeof(backing_media));
+	if (wrong_id)
+		expected.run_id[0] ^= 0x80;
 	if (hyperv_acceptance_persistence_build_manifest(
 		    &expected, manifest))
 		return -EINVAL;
@@ -3950,8 +3958,32 @@ out:
 	return 0;
 }
 
+static int persistence_expect_no_write_failure(
+	struct vmbus_driver *driver, struct vmbus_device *device)
+{
+	unsigned int writes10 = write10_command_count;
+	unsigned int writes16 = write16_command_count;
+	unsigned int flushes = flush_command_count;
+	int rc;
+
+	hyperv_acceptance_persistence_host_reset();
+	device->present = 1;
+	rc = driver->add_dev(device);
+	if (rc)
+		return rc;
+	rc = hyperv_acceptance_persistence_main();
+	persistence_remove_device(driver, device);
+	if (rc != HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return -EIO;
+	return 0;
+}
+
 static int run_persistence_workflow_regression(
-	struct vmbus_driver *driver, struct vmbus_device *primary)
+	struct vmbus_driver *driver, struct vmbus_device *primary,
+	unsigned int identity_policy)
 {
 	struct vmbus_device secondary = {
 		.channel_id = 47,
@@ -3966,7 +3998,10 @@ static int run_persistence_workflow_regression(
 	unsigned int writes16;
 	unsigned int flushes;
 	unsigned int commands;
+	uint8_t saved_intent;
 	uint8_t saved_receipt;
+	uint8_t saved_receipt_sector[
+		HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
 	int rc;
 
 	storvsc_host_set_guarded_io(1);
@@ -3984,7 +4019,20 @@ static int run_persistence_workflow_regression(
 	persistence_hook_end_error = 0;
 	persistence_hook_timeouts = 0;
 	hyperv_acceptance_persistence_host_reset();
-	if (persistence_prepare_seed(0))
+	hyperv_acceptance_persistence_host_set_identity_policy(identity_policy);
+	if (hyperv_acceptance_persistence_host_mapping_in_scope(
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1,
+		    4, 5, 0, 1000, 512) ||
+	    !hyperv_acceptance_persistence_host_mapping_in_scope(
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2,
+		    4, 5, 0, 1000, 512) ||
+	    hyperv_acceptance_persistence_host_mapping_in_scope(
+		    identity_policy, 0, 0, 1, 1000, 512) ||
+	    hyperv_acceptance_persistence_host_mapping_in_scope(
+		    identity_policy, 0, 0, 0, 999, 512))
+		return 643;
+	if (persistence_prepare_seed(
+		    identity_policy, 0, 1000, 0, 0))
 		return 600;
 	primary->present = 1;
 	if (driver->add_dev(primary))
@@ -4020,10 +4068,87 @@ static int run_persistence_workflow_regression(
 		return 604;
 	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512 +
 		      40] = saved_receipt;
+	saved_intent =
+		backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_INTENT_LBA *
+			      512 + 80];
+	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_INTENT_LBA * 512 +
+		      80] ^= 0x40;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 630;
+	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_INTENT_LBA * 512 +
+		      80] = saved_intent;
+	memcpy(saved_receipt_sector,
+	       backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512,
+	       sizeof(saved_receipt_sector));
+	memset(backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512,
+	       0, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE);
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 631;
+	memcpy(backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512,
+	       saved_receipt_sector, sizeof(saved_receipt_sector));
 	persistence_remove_device(driver, primary);
 
+	if (identity_policy ==
+	    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2) {
+		vpd_variant = 1;
+		rc = persistence_expect_no_write_failure(driver, primary);
+		vpd_variant = 0;
+		if (rc)
+			return 633;
+
+		if (persistence_prepare_seed(
+			    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1,
+			    0, 1000, 0, 0) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 634;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 1000, 0, 1) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 635;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 999, 0, 0) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 636;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 1000, 1, 0) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 637;
+		if (persistence_prepare_seed(
+			    identity_policy, 1, 1000, 0, 0) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 638;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 1000, 0, 0))
+			return 639;
+		vpd_mode = VPD_UNSUPPORTED;
+		rc = persistence_expect_no_write_failure(driver, primary);
+		vpd_mode = VPD_NORMAL;
+		if (rc)
+			return 640;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 1000, 0, 0))
+			return 641;
+		read_only_media = 1;
+		rc = persistence_expect_no_write_failure(driver, primary);
+		read_only_media = 0;
+		if (rc)
+			return 642;
+	}
+
 	hyperv_acceptance_persistence_host_reset();
-	if (persistence_prepare_seed(0))
+	if (persistence_prepare_seed(
+		    identity_policy, 0, 1000, 0, 0))
 		return 617;
 	primary->present = 1;
 	if (driver->add_dev(primary))
@@ -4036,7 +4161,8 @@ static int run_persistence_workflow_regression(
 	persistence_remove_device(driver, primary);
 
 	hyperv_acceptance_persistence_host_reset();
-	if (persistence_prepare_seed(0))
+	if (persistence_prepare_seed(
+		    identity_policy, 0, 1000, 0, 0))
 		return 605;
 	primary->present = 1;
 	if (driver->add_dev(primary))
@@ -4060,7 +4186,8 @@ static int run_persistence_workflow_regression(
 	persistence_remove_device(driver, primary);
 
 	hyperv_acceptance_persistence_host_reset();
-	if (persistence_prepare_seed(1))
+	if (persistence_prepare_seed(
+		    identity_policy, 1, 1000, 0, 0))
 		return 608;
 	primary->present = 1;
 	if (driver->add_dev(primary))
@@ -4083,7 +4210,8 @@ static int run_persistence_workflow_regression(
 	persistence_remove_device(driver, primary);
 
 	hyperv_acceptance_persistence_host_reset();
-	if (persistence_prepare_seed(0))
+	if (persistence_prepare_seed(
+		    identity_policy, 0, 1000, 0, 0))
 		return 611;
 	primary->present = 1;
 	if (driver->add_dev(primary))
@@ -4128,6 +4256,7 @@ static int run_persistence_workflow_regression(
 	persistence_hook_driver = NULL;
 	persistence_hook_device = NULL;
 	persistence_hook_mode = PERSISTENCE_HOOK_NONE;
+	hyperv_acceptance_persistence_host_set_identity_policy(0);
 	backing_media_enabled = 0;
 	storvsc_host_set_guarded_io(0);
 	return 0;
@@ -4519,7 +4648,14 @@ int main(void)
 		driver, &vmbus_device, buffer, &events);
 	if (rc)
 		return rc;
-	rc = run_persistence_workflow_regression(driver, &vmbus_device);
+	rc = run_persistence_workflow_regression(
+		driver, &vmbus_device,
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1);
+	if (rc)
+		return rc;
+	rc = run_persistence_workflow_regression(
+		driver, &vmbus_device,
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2);
 	if (rc)
 		return rc;
 

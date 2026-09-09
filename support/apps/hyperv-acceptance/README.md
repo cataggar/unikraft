@@ -249,7 +249,8 @@ guest image build:
 ```sh
 python3 support/scripts/hyperv-storage-manifest.py \
   --output-prefix "$PWD/.d/persistence/run" \
-  --sectors 262144 --path 0 --target 0 --lun 1
+  --identity-policy seed-enrollment-v2 \
+  --sectors 262144 --lun 1
 cat .d/persistence/run.config >> support/apps/hyperv-acceptance/.config
 ```
 
@@ -259,14 +260,29 @@ must provision the requested exact geometry, convert/upload the seed without
 changing its logical sector count, attach it at the configured address, and
 retain the exact guest image and data disk for both boots.
 
-The guest opens read sessions only for exact address/geometry candidates,
-rejects MBR/GPT-shaped media, and requires exactly one matching private
-manifest with a supported nonzero VPD identity. Boot 1 then authorizes that
-session, flushes an intent at LBA 16, writes and verifies deterministic
-patterns at LBA 0, the final LBA, and LBAs 32..47, flushes and verifies again,
-and flushes a completion receipt at LBA 17. Boot 2 requires the enrolled
-controller/VPD identity and valid receipt, rereads every pattern, and performs
-no writes.
+Identity policy 1 (`address-v1`, the generator default for compatibility)
+requires `--path`, `--target`, and `--lun` and emits the original `UKPSEED1`,
+`UKPINT01`, and `UKPDONE1` records unchanged. Identity policy 2
+(`seed-enrollment-v2`) fixes LUN, geometry, run ID, and disk ID before the
+build, but deliberately does not guess path or target. The guest considers
+all exact LUN/geometry candidates in one coherent inventory generation,
+rejects unsafe boot-shaped or identity-less candidates, and enrolls path,
+target, controller instance, and VPD only after exactly one private seed
+matches. V2 uses `UKPSEED2`, `UKPINT02`, and `UKPDONE2`; record versions,
+manifest CRC, and explicit policy bytes prevent fallback or cross-policy
+reuse.
+The private JSON `version` and `identity_policy_version` are likewise 1 or 2;
+v2 reports `path` and `target` as `null` because they are enrollment outputs,
+not controller guesses.
+
+The guest opens read sessions only for policy-matching candidates, rejects
+MBR/GPT-shaped media, and requires exactly one matching private manifest with
+a supported nonzero VPD identity. Boot 1 then authorizes that session, flushes
+an intent at LBA 16, writes and verifies deterministic patterns at LBA 0, the
+final LBA, and LBAs 32..47, flushes and verifies again, and flushes a
+completion receipt at LBA 17. Boot 2 requires the complete enrolled address,
+controller, and VPD identity plus a valid receipt, rereads every pattern, and
+performs no writes.
 
 The controller and LUN limits reserve identities for the life of the boot;
 they are not reusable active-slot limits after removal. Mapping and inventory
@@ -285,6 +301,18 @@ Stable success markers are:
 
 - `UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:<run-id>`
 - `UK_HYPERV_PERSISTENCE_BOOT2_COMPLETE:<run-id>`
+
+Each successful selection also emits one bounded private identity record:
+
+```
+UK_HYPERV_PERSISTENCE_IDENTITY:1:<policy>:<run-id>:<disk-id>:<controller-guid>:<path>:<target>:<lun>:<sectors>:<sector-size>:<vpd-length>:<code-set>:<type>:<association>:<vpd-id>
+```
+
+IDs and VPD bytes are lowercase hexadecimal without separators; all other
+fields are unsigned decimal. The controller must keep this line private,
+require the same enrolled identity on Boot 2, and never place real run
+records or the seeded image in public CI artifacts. Public fixtures use only
+synthetic identifiers.
 
 The immutable guest cannot distinguish a controller rollback to the pristine
 seed from a genuine first boot. During the expected second boot, orchestration

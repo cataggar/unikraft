@@ -82,15 +82,27 @@ config APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE
 	int "Exact disposable disk sector size"
 	default 512
 
+config APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY
+	int "Persistence identity policy version"
+	range 1 2
+	default 1
+	help
+	  Policy 1 binds path, target, and LUN in the seed before boot.
+	  Policy 2 binds LUN and geometry in the seed, then enrolls path,
+	  target, controller instance, and VPD only after a unique seed match.
+	  Intent and receipt records remain bound to the selected policy.
+
 config APPHYPERVACCEPTANCE_PERSISTENCE_PATH
 	int "Expected StorVSC path"
 	range 0 255
 	default 0
+	depends on APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY = 1
 
 config APPHYPERVACCEPTANCE_PERSISTENCE_TARGET
 	int "Expected StorVSC target"
 	range 0 255
 	default 0
+	depends on APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY = 1
 
 config APPHYPERVACCEPTANCE_PERSISTENCE_LUN
 	int "Expected StorVSC LUN"

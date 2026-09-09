@@ -334,7 +334,17 @@ static int bytes_zero(const uint8_t *bytes, size_t length)
 static int expected_valid(
 	const struct hyperv_acceptance_persistence_expected *expected)
 {
-	return expected && !expected->reserved &&
+	if (!expected ||
+	    (expected->identity_policy !=
+		     HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1 &&
+	     expected->identity_policy !=
+		     HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2))
+		return 0;
+	if (expected->identity_policy ==
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2 &&
+	    (expected->path_id || expected->target_id))
+		return 0;
+	return
 	       !bytes_zero(expected->run_id, sizeof(expected->run_id)) &&
 	       !bytes_zero(expected->disk_id, sizeof(expected->disk_id)) &&
 	       expected->sector_size ==
@@ -356,6 +366,18 @@ static int identity_valid(
 	       !bytes_zero(identity->vpd_id, identity->vpd_length);
 }
 
+static int identity_matches_expected(
+	const struct hyperv_acceptance_persistence_expected *expected,
+	const struct hyperv_acceptance_persistence_identity *identity)
+{
+	return expected_valid(expected) && identity_valid(identity) &&
+	       identity->lun == expected->lun &&
+	       (expected->identity_policy ==
+			HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2 ||
+		(identity->path_id == expected->path_id &&
+		 identity->target_id == expected->target_id));
+}
+
 static uint32_t record_crc(const uint8_t *sector)
 {
 	uint8_t copy[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
@@ -368,10 +390,10 @@ static uint32_t record_crc(const uint8_t *sector)
 }
 
 static int record_valid(const uint8_t *sector, const char magic[8],
-			uint16_t header_size)
+			uint16_t version, uint16_t header_size)
 {
 	return sector && !memcmp(sector, magic, 8) &&
-	       read_le16(sector + 8) == 1 &&
+	       read_le16(sector + 8) == version &&
 	       read_le16(sector + 10) == header_size &&
 	       read_le32(sector + 12) ==
 		       HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE &&
@@ -380,11 +402,11 @@ static int record_valid(const uint8_t *sector, const char magic[8],
 }
 
 static void record_begin(uint8_t *sector, const char magic[8],
-			 uint16_t header_size)
+			 uint16_t version, uint16_t header_size)
 {
 	memset(sector, 0, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE);
 	memcpy(sector, magic, 8);
-	write_le16(sector + 8, 1);
+	write_le16(sector + 8, version);
 	write_le16(sector + 10, header_size);
 	write_le32(sector + 12, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE);
 }
@@ -394,20 +416,43 @@ static void record_finish(uint8_t *sector)
 	write_le32(sector + 508, record_crc(sector));
 }
 
+static const char *manifest_magic(
+	const struct hyperv_acceptance_persistence_expected *expected)
+{
+	return expected->identity_policy ==
+		       HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1 ?
+	       "UKPSEED1" : "UKPSEED2";
+}
+
+static const char *intent_magic(
+	const struct hyperv_acceptance_persistence_expected *expected)
+{
+	return expected->identity_policy ==
+		       HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1 ?
+	       "UKPINT01" : "UKPINT02";
+}
+
+static const char *receipt_magic(
+	const struct hyperv_acceptance_persistence_expected *expected)
+{
+	return expected->identity_policy ==
+		       HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1 ?
+	       "UKPDONE1" : "UKPDONE2";
+}
+
 int hyperv_acceptance_persistence_build_manifest(
 	const struct hyperv_acceptance_persistence_expected *expected,
 	uint8_t sector[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE])
 {
-	static const char magic[] = "UKPSEED1";
-
 	if (!sector || !expected_valid(expected))
 		return -1;
-	record_begin(sector, magic, 128);
+	record_begin(sector, manifest_magic(expected),
+		     expected->identity_policy, 128);
 	memcpy(sector + 16, expected->run_id, sizeof(expected->run_id));
 	memcpy(sector + 32, expected->disk_id, sizeof(expected->disk_id));
 	write_le64(sector + 48, expected->sectors);
 	write_le32(sector + 56, expected->sector_size);
-	write_le32(sector + 60, 1);
+	write_le32(sector + 60, expected->identity_policy);
 	write_le64(sector + 64, HYPERV_ACCEPTANCE_PERSISTENCE_SEED0_LBA);
 	write_le64(sector + 72, HYPERV_ACCEPTANCE_PERSISTENCE_SEED1_LBA);
 	write_le64(sector + 80, HYPERV_ACCEPTANCE_PERSISTENCE_INTENT_LBA);
@@ -415,8 +460,13 @@ int hyperv_acceptance_persistence_build_manifest(
 	write_le64(sector + 96, HYPERV_ACCEPTANCE_PERSISTENCE_EXTENT_LBA);
 	write_le32(sector + 104,
 		   HYPERV_ACCEPTANCE_PERSISTENCE_EXTENT_SECTORS);
-	sector[108] = expected->path_id;
-	sector[109] = expected->target_id;
+	if (expected->identity_policy ==
+	    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1) {
+		sector[108] = expected->path_id;
+		sector[109] = expected->target_id;
+	} else {
+		sector[108] = expected->identity_policy;
+	}
 	sector[110] = expected->lun;
 	record_finish(sector);
 	return 0;
@@ -426,16 +476,16 @@ int hyperv_acceptance_persistence_validate_manifest(
 	const uint8_t sector[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE],
 	const struct hyperv_acceptance_persistence_expected *expected)
 {
-	static const char magic[] = "UKPSEED1";
-
-	if (!expected_valid(expected) || !record_valid(sector, magic, 128))
+	if (!expected_valid(expected) ||
+	    !record_valid(sector, manifest_magic(expected),
+			  expected->identity_policy, 128))
 		return -1;
 	if (memcmp(sector + 16, expected->run_id, sizeof(expected->run_id)) ||
 	    memcmp(sector + 32, expected->disk_id,
 		   sizeof(expected->disk_id)) ||
 	    read_le64(sector + 48) != expected->sectors ||
 	    read_le32(sector + 56) != expected->sector_size ||
-	    read_le32(sector + 60) != 1 ||
+	    read_le32(sector + 60) != expected->identity_policy ||
 	    read_le64(sector + 64) !=
 		    HYPERV_ACCEPTANCE_PERSISTENCE_SEED0_LBA ||
 	    read_le64(sector + 72) !=
@@ -448,11 +498,18 @@ int hyperv_acceptance_persistence_validate_manifest(
 		    HYPERV_ACCEPTANCE_PERSISTENCE_EXTENT_LBA ||
 	    read_le32(sector + 104) !=
 		    HYPERV_ACCEPTANCE_PERSISTENCE_EXTENT_SECTORS ||
-	    sector[108] != expected->path_id ||
-	    sector[109] != expected->target_id ||
 	    sector[110] != expected->lun || sector[111] ||
 	    !bytes_zero(sector + 112, 16))
 		return -1;
+	if (expected->identity_policy ==
+	    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1) {
+		if (sector[108] != expected->path_id ||
+		    sector[109] != expected->target_id)
+			return -1;
+	} else if (sector[108] != expected->identity_policy ||
+		   sector[109]) {
+		return -1;
+	}
 	return 0;
 }
 
@@ -476,6 +533,9 @@ static void fill_identity_record(
 	sector[80] = identity->path_id;
 	sector[81] = identity->target_id;
 	sector[82] = identity->lun;
+	if (expected->identity_policy ==
+	    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2)
+		sector[83] = expected->identity_policy;
 	sector[84] = identity->vpd_length;
 	sector[85] = identity->vpd_code_set;
 	sector[86] = identity->vpd_designator_type;
@@ -496,7 +556,7 @@ static int identity_record_valid(
 	uint8_t manifest[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
 	size_t vpd_length;
 
-	if (!expected_valid(expected) || !identity_valid(identity))
+	if (!identity_matches_expected(expected, identity))
 		return -1;
 	if (hyperv_acceptance_persistence_build_manifest(
 		    expected, manifest))
@@ -512,7 +572,11 @@ static int identity_record_valid(
 		   sizeof(identity->controller_instance)) ||
 	    sector[80] != identity->path_id ||
 	    sector[81] != identity->target_id ||
-	    sector[82] != identity->lun || sector[83] ||
+	    sector[82] != identity->lun ||
+	    sector[83] !=
+		    (expected->identity_policy ==
+			     HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2 ?
+		     expected->identity_policy : 0) ||
 	    sector[84] != identity->vpd_length ||
 	    sector[85] != identity->vpd_code_set ||
 	    sector[86] != identity->vpd_designator_type ||
@@ -536,12 +600,11 @@ int hyperv_acceptance_persistence_build_intent(
 	const struct hyperv_acceptance_persistence_checksums *checksums,
 	uint8_t sector[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE])
 {
-	static const char magic[] = "UKPINT01";
-
-	if (!sector || !checksums || !expected_valid(expected) ||
-	    !identity_valid(identity))
+	if (!sector || !checksums ||
+	    !identity_matches_expected(expected, identity))
 		return -1;
-	record_begin(sector, magic, 168);
+	record_begin(sector, intent_magic(expected),
+		     expected->identity_policy, 168);
 	fill_identity_record(sector, expected, identity, checksums);
 	record_finish(sector);
 	return 0;
@@ -554,17 +617,18 @@ int hyperv_acceptance_persistence_build_receipt(
 	const uint8_t intent[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE],
 	uint8_t sector[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE])
 {
-	static const char intent_magic[] = "UKPINT01";
-	static const char magic[] = "UKPDONE1";
 	struct hyperv_acceptance_persistence_checksums intent_checksums;
 
 	if (!sector || !checksums ||
-	    !record_valid(intent, intent_magic, 168) ||
+	    !expected_valid(expected) ||
+	    !record_valid(intent, intent_magic(expected),
+			  expected->identity_policy, 168) ||
 	    identity_record_valid(
 		    intent, expected, identity, &intent_checksums) ||
 	    memcmp(checksums, &intent_checksums, sizeof(*checksums)))
 		return -1;
-	record_begin(sector, magic, 176);
+	record_begin(sector, receipt_magic(expected),
+		     expected->identity_policy, 176);
 	fill_identity_record(sector, expected, identity, checksums);
 	write_le32(sector + 168, read_le32(intent + 508));
 	write_le32(sector + 172, 2);
@@ -582,8 +646,6 @@ hyperv_acceptance_persistence_classify(
 	const uint8_t receipt[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE],
 	struct hyperv_acceptance_persistence_checksums *checksums)
 {
-	static const char intent_magic[] = "UKPINT01";
-	static const char receipt_magic[] = "UKPDONE1";
 	struct hyperv_acceptance_persistence_checksums found;
 
 	if (checksums)
@@ -596,14 +658,16 @@ hyperv_acceptance_persistence_classify(
 	if (bytes_zero(intent, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE) &&
 	    bytes_zero(receipt, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE))
 		return HYPERV_ACCEPTANCE_PERSISTENCE_PRISTINE;
-	if (!record_valid(intent, intent_magic, 168) ||
+	if (!record_valid(intent, intent_magic(expected),
+			  expected->identity_policy, 168) ||
 	    identity_record_valid(intent, expected, identity, &found))
 		return HYPERV_ACCEPTANCE_PERSISTENCE_INVALID;
 	if (checksums)
 		*checksums = found;
 	if (bytes_zero(receipt, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE))
 		return HYPERV_ACCEPTANCE_PERSISTENCE_INCOMPLETE;
-	if (!record_valid(receipt, receipt_magic, 176) ||
+	if (!record_valid(receipt, receipt_magic(expected),
+			  expected->identity_policy, 176) ||
 	    identity_record_valid(receipt, expected, identity, NULL) ||
 	    memcmp(receipt + 16, intent + 16, 152) ||
 	    read_le32(receipt + 168) != read_le32(intent + 508) ||

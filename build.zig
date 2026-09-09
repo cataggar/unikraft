@@ -1043,6 +1043,7 @@ pub fn build(b: *std.Build) void {
             "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID=\"102132435465768798a9bacbdcedfe0f\"",
             "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=1000",
             "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2",
             "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH=0",
             "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET=0",
             "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0",
@@ -1414,6 +1415,7 @@ pub fn build(b: *std.Build) void {
         "support.scripts.tests.test_hyperv_network_controller",
         "support.scripts.tests.test_hyperv_network_peer",
         "support.scripts.tests.test_hyperv_irq_register",
+        "support.scripts.tests.test_hyperv_storage_manifest",
     });
     hyperv_controller_fixtures.setCwd(.{ .cwd_relative = root });
     hyperv_controller_fixtures.setEnvironmentVariable(

@@ -21,6 +21,9 @@
 #define HYPERV_ACCEPTANCE_PERSISTENCE_PATTERN_LAST 2U
 #define HYPERV_ACCEPTANCE_PERSISTENCE_PATTERN_EXTENT 3U
 
+#define HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1 1U
+#define HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2 2U
+
 enum hyperv_acceptance_result {
 	HYPERV_ACCEPTANCE_PASS = 0,
 	HYPERV_ACCEPTANCE_FAIL = 1,
@@ -38,22 +41,34 @@ struct hyperv_acceptance_dhcp_offer {
  * little-endian and all unspecified bytes must be zero. Every record stores
  * an IEEE CRC-32 in bytes 508..511, calculated with that field zero.
  *
- * Manifest (magic "UKPSEED1", header size 128):
+ * Address-v1 manifest (magic "UKPSEED1", record/layout version 1,
+ * header size 128):
  *   16 run ID[16], 32 disk ID[16], 48 sectors:u64,
  *   56 sector size:u32, 60 layout version:u32,
  *   64 seed0:u64, 72 seed1:u64, 80 intent:u64, 88 receipt:u64,
  *   96 extent LBA:u64, 104 extent sectors:u32,
  *   108 path:u8, 109 target:u8, 110 LUN:u8, 111 reserved:u8.
  *
- * Intent (magic "UKPINT01", header size 168) repeats the IDs and geometry:
+ * Seed-enrollment-v2 manifest (magic "UKPSEED2", record/layout version 2,
+ * header size 128) has the same bytes through 107, then:
+ *   108 identity policy:u8 (=2), 109 reserved:u8,
+ *   110 LUN:u8, 111 reserved:u8.
+ * Path and target are deliberately absent: the guest enrolls them together
+ * with the controller and VPD only after a unique seed and geometry match.
+ *
+ * Intent (v1 magic "UKPINT01", v2 magic "UKPINT02", header size 168)
+ * repeats the IDs and geometry:
  *   48 manifest CRC:u32, 52 sector size:u32, 56 sectors:u64,
- *   64 controller instance ID[16], 80 path/target/LUN/reserved,
+ *   64 controller instance ID[16], 80 path/target/LUN,
+ *   83 v1 reserved (=0) or v2 identity policy (=2),
  *   84 VPD length/code set/type/association, 88 VPD ID[64],
  *   152 first-sector CRC:u32, 156 last-sector CRC:u32,
  *   160 extent CRC:u32, 164 phase:u32 (=1).
  *
- * Receipt (magic "UKPDONE1", header size 176) has the same bytes 16..167 as
- * the intent, then 168 intent CRC:u32 and 172 phase:u32 (=2).
+ * Receipt (v1 magic "UKPDONE1", v2 magic "UKPDONE2", header size 176)
+ * has the same bytes 16..167 as the intent, then 168 intent CRC:u32 and
+ * 172 phase:u32 (=2). Record version, magic, manifest CRC, and policy byte
+ * prevent policy downgrade or cross-policy record reuse.
  */
 struct hyperv_acceptance_persistence_expected {
 	uint8_t run_id[HYPERV_ACCEPTANCE_PERSISTENCE_ID_SIZE];
@@ -63,7 +78,7 @@ struct hyperv_acceptance_persistence_expected {
 	uint8_t path_id;
 	uint8_t target_id;
 	uint8_t lun;
-	uint8_t reserved;
+	uint8_t identity_policy;
 };
 
 struct hyperv_acceptance_persistence_identity {
