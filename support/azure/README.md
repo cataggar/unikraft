@@ -397,10 +397,12 @@ records. Raw DHCP, peer-only success, stale/duplicate records, restart, bad
 endpoint/nonce, missing EOF, or any failure is rejected.
 
 Private `peer-serial.log`, `guest-serial.log`, and
-`network-acceptance.json` are retained in the state directory. The entire
-owner-checked disposable group is deleted on success, failure, SIGINT, or
-SIGTERM. This controller path creates no GitHub resources; live Azure
-acceptance remains an explicit operator action after reviewing the exported
+`network-acceptance.json` are retained in the state directory. Cleanup is
+attempted on success, failure, SIGINT, or SIGTERM, and deletes the disposable
+group only after verifying ownership of every resource. Unknown ownership
+stops deletion and surfaces a cleanup failure; it is not a successful run or
+an implicit keep-resources mode. This controller path creates no GitHub
+resources; live Azure acceptance remains an explicit operator action after reviewing the exported
 manifest digest and source provenance.
 
 ## Real device acceptance
