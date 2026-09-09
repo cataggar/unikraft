@@ -28,6 +28,11 @@
       "minLength": 3,
       "maxLength": 64
     },
+    "operationId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36
+    },
     "adminPassword": {
       "type": "secureString",
       "minLength": 16
@@ -49,7 +54,8 @@
     "tags": {
       "managed-by": "unikraft-hyperv",
       "unikraft-run": "[parameters('namePrefix')]",
-      "image-sha256": "[parameters('imageSha256')]"
+      "image-sha256": "[parameters('imageSha256')]",
+      "preflight-operation": "[parameters('operationId')]"
     }
   },
   "resources": [
@@ -227,6 +233,7 @@
       ],
       "properties": {
         "enableAcceleratedNetworking": false,
+        "enableIPForwarding": false,
         "ipConfigurations": [
           {
             "name": "private",

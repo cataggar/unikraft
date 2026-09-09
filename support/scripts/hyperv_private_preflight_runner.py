@@ -11,8 +11,10 @@ from pathlib import Path
 import re
 import resource
 import shutil
+import stat
 import subprocess
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 
@@ -56,11 +58,10 @@ MAX_LOG_BYTES = 1024 * 1024
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 BOOT_TIMEOUT_SECONDS = 120
 INPUT_NAMES = {
-    "qemu": "qemu-system-x86_64",
+    "qemu": "qemu/bin/qemu-system-x86_64",
     "ovmf_code": "OVMF_CODE.fd",
     "ovmf_vars": "OVMF_VARS.fd",
     "capability_raw": "capability.raw",
-    "efi": "private.efi",
     "raw": "private.raw",
     "vhd": "private.vhd",
 }
@@ -149,7 +150,8 @@ def parse_manifest(encoded, expected_phase):
     fields = (
             "schema", "schema_version", "phase", "identity",
             "boot_policy", "raw_size", "files", "evidence_prefix",
-            "runner_sha256",
+            "runner_sha256", "qemu_support", "input_manifest_sha256",
+            "workload",
         ) + (
             ("capability_manifest_sha256",)
             if expected_phase == "private" else ()
@@ -162,8 +164,9 @@ def parse_manifest(encoded, expected_phase):
     if (
         manifest["schema"] != SCHEMA
         or type(manifest["schema_version"]) is not int
-        or manifest["schema_version"] != 1
+        or manifest["schema_version"] != 2
         or manifest["phase"] != expected_phase
+        or manifest["workload"] != "platform-only-v1"
         or manifest["boot_policy"] not in (
             "platform-unavailable-v1", "platform-main-zero-v1",
         )
@@ -171,6 +174,8 @@ def parse_manifest(encoded, expected_phase):
         or not 1024 * 1024 <= manifest["raw_size"] <= MAX_FILE_BYTES
         or require_sha256(manifest["runner_sha256"])
         != manifest["runner_sha256"]
+        or require_sha256(manifest["input_manifest_sha256"])
+        != manifest["input_manifest_sha256"]
     ):
         raise RunnerError("invalid-manifest-contract")
     identity = require_identity(manifest["identity"])
@@ -183,7 +188,7 @@ def parse_manifest(encoded, expected_phase):
     expected_files = (
         ("qemu", "ovmf_code", "ovmf_vars", "capability_raw")
         if expected_phase == "capability"
-        else ("qemu", "ovmf_code", "ovmf_vars", "efi", "raw", "vhd")
+        else ("qemu", "ovmf_code", "ovmf_vars", "raw", "vhd")
     )
     files = exact_fields(
         manifest["files"], expected_files, "invalid-manifest-files"
@@ -204,6 +209,26 @@ def parse_manifest(encoded, expected_phase):
             )
         ):
             raise RunnerError("invalid-file-binding")
+    support = manifest["qemu_support"]
+    if not isinstance(support, list) or len(support) > 124:
+        raise RunnerError("invalid-qemu-support")
+    parsed_support = []
+    names = set()
+    for record in support:
+        record = require_file_record(record)
+        if (
+            not record["name"].startswith("qemu/")
+            or len(Path(record["name"]).parts) < 3
+            or Path(record["name"]).parts[1] not in ("lib", "share")
+            or record["blob"] != (
+                f"inputs/{identity}/public/{record['name']}"
+            )
+            or record["name"] in names
+        ):
+            raise RunnerError("invalid-qemu-support")
+        names.add(record["name"])
+        parsed_support.append(record)
+    manifest["qemu_support"] = parsed_support
     if expected_phase == "capability":
         if manifest["files"]["capability_raw"]["size"] != manifest["raw_size"]:
             raise RunnerError("invalid-capability-size")
@@ -318,6 +343,40 @@ def hash_prefix(path, length):
     return digest.hexdigest()
 
 
+def hash_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def immutable_identity(path, record, code):
+    try:
+        metadata = path.lstat()
+    except OSError:
+        raise RunnerError(code) from None
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size != record["size"]
+        or hash_file(path) != record["sha256"]
+    ):
+        raise RunnerError(code)
+    return metadata.st_dev, metadata.st_ino
+
+
+def revalidate_boot_image(image, backing, record, identity):
+    source_identity = immutable_identity(
+        image, record, "boot-image-mutated"
+    )
+    backing_identity = immutable_identity(
+        backing, record, "boot-backing-mutated"
+    )
+    if source_identity != identity or backing_identity != identity:
+        raise RunnerError("boot-image-replaced")
+
+
 def write_durable(path, value):
     with path.open("xb") as output:
         os.chmod(path, 0o600)
@@ -406,13 +465,26 @@ def validate_boot_log(text, policy, legacy_apic):
         raise RunnerError("unexpected-live-io")
 
 
-def run_boot(qemu, ovmf_code, ovmf_vars, image, raw_size, policy,
+def run_boot(qemu, ovmf_code, ovmf_vars, image, image_record, raw_size, policy,
              mode, legacy_apic, output_directory):
     work = Path(tempfile.mkdtemp(prefix="boot-", dir=output_directory))
+    image_identity = immutable_identity(
+        image, image_record, "boot-image-invalid"
+    )
+    backing = work / "disk.img"
+    linked = False
+    failure = None
     try:
         shutil.copyfile(ovmf_code, work / "OVMF_CODE.fd")
         shutil.copyfile(ovmf_vars, work / "OVMF_VARS.fd")
-        os.link(image, work / "disk.img")
+        (work / "OVMF_CODE.fd").chmod(0o400)
+        (work / "OVMF_VARS.fd").chmod(0o600)
+        os.link(image, backing)
+        linked = True
+        if immutable_identity(
+            backing, image_record, "boot-backing-invalid"
+        ) != image_identity:
+            raise RunnerError("boot-backing-identity-mismatch")
         cpu = CPU_FEATURES + (",x2apic=off" if legacy_apic else "")
         disk = {
             "driver": "raw", "node-name": "hyperv-disk",
@@ -424,6 +496,7 @@ def run_boot(qemu, ovmf_code, ovmf_vars, image, raw_size, policy,
         }
         command = [
             str(qemu), "-machine", "q35,accel=kvm", "-cpu", cpu,
+            "-L", str(qemu.parent.parent / "share"),
             "-smp", "1", "-m", "512M",
             "-drive", "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
             "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",
@@ -443,11 +516,17 @@ def run_boot(qemu, ovmf_code, ovmf_vars, image, raw_size, policy,
         with log_path.open("xb") as log:
             os.chmod(log_path, 0o600)
             try:
+                environment = os.environ.copy()
+                qemu_root = qemu.parent.parent
+                library = qemu_root / "lib"
+                if library.is_dir():
+                    environment["LD_LIBRARY_PATH"] = str(library)
                 result = subprocess.run(
                     command, cwd=work, stdin=subprocess.DEVNULL,
                     stdout=log, stderr=subprocess.STDOUT,
                     timeout=BOOT_TIMEOUT_SECONDS, check=False,
                     preexec_fn=bound_output,
+                    env=environment,
                 )
             except subprocess.TimeoutExpired:
                 raise RunnerError("qemu-timeout") from None
@@ -460,8 +539,30 @@ def run_boot(qemu, ovmf_code, ovmf_vars, image, raw_size, policy,
             "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
             "return_code": result.returncode,
         }, log_path
+    except BaseException as error:
+        failure = error
+        raise
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        try:
+            if linked and (backing.exists() or backing.is_symlink()):
+                revalidate_boot_image(
+                    image, backing, image_record, image_identity
+                )
+            elif linked:
+                immutable_identity(
+                    image, image_record, "boot-image-mutated"
+                )
+                raise RunnerError("boot-backing-replaced")
+            else:
+                immutable_identity(
+                    image, image_record, "boot-image-mutated"
+                )
+        except RunnerError:
+            if failure is None:
+                raise
+            raise
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def execute_phase(phase, manifest, manifest_bytes, base_url, container, sas,
@@ -499,10 +600,14 @@ def execute_phase(phase, manifest, manifest_bytes, base_url, container, sas,
             raise RunnerError("capability-state-mismatch")
     records = manifest["files"]
     paths = {}
-    for name, record in records.items():
+    download_records = list(records.items()) + [
+        ("support:" + record["name"], record)
+        for record in manifest["qemu_support"]
+    ]
+    for name, record in download_records:
         public_file = name in (
             "qemu", "ovmf_code", "ovmf_vars", "capability_raw"
-        )
+        ) or name.startswith("support:")
         destination_root = public_root if public_file else phase_root
         destination = destination_root / record["name"]
         if destination.exists():
@@ -540,6 +645,8 @@ def execute_phase(phase, manifest, manifest_bytes, base_url, container, sas,
         for mode, legacy_apic in LOCAL_BOOT_MODES:
             outcome, log_path = run_boot(
                 qemu, paths["ovmf_code"], paths["ovmf_vars"], image,
+                records[image_name if image_name != "capability"
+                        else "capability_raw"],
                 raw_size, manifest["boot_policy"],
                 f"{image_name}-{mode}", legacy_apic, evidence_root,
             )

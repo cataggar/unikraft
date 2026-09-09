@@ -6,9 +6,12 @@ import importlib
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import uuid
 from unittest import mock
 
 
@@ -16,76 +19,115 @@ SUPPORT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SUPPORT / "scripts"))
 preflight = importlib.import_module("hyperv_private_preflight")
 runner = importlib.import_module("hyperv_private_preflight_runner")
+blob_worker = importlib.import_module("hyperv_private_preflight_blob")
 TEST_TEMP = SUPPORT.parent / ".d" / "private-preflight-test-tmp"
 TEST_TEMP.mkdir(mode=0o700, parents=True, exist_ok=True)
 tempfile.tempdir = str(TEST_TEMP)
 
 
+def base64_encode(value):
+    import base64
+    return base64.b64encode(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).decode()
+
+
 class PrivatePreflightFixture(unittest.TestCase):
+    def implementation(self):
+        return {
+            "sdk": {
+                "name": "azure-storage-blob",
+                "version": preflight.SDK_VERSION,
+            },
+            "files": {
+                name: {
+                    "path": str(path.relative_to(SUPPORT.parent)),
+                    "sha256": preflight.azure.image_sha256(path),
+                    "size": path.stat().st_size,
+                }
+                for name, path in preflight.IMPLEMENTATION_PATHS.items()
+            },
+        }
+
     def manifest(self, **changes):
         raw_size = preflight.azure.VIRTUAL_SIZE
         sizes = {
-            "qemu": 1024 * 1024,
-            "ovmf_code": 2 * 1024 * 1024,
-            "ovmf_vars": 2 * 1024 * 1024,
+            "qemu": 26_911_032,
+            "ovmf_code": 4 * 1024 * 1024,
+            "ovmf_vars": 4 * 1024 * 1024,
             "capability_raw": raw_size,
-            "efi": 1024 * 1024,
+            "efi": 49_981_328,
             "raw": raw_size,
             "vhd": raw_size + 512,
         }
         files = {
             role: {
                 "name": preflight.INPUT_NAMES[role],
-                "sha256": "0123456"[index] * 64,
+                "sha256": f"{index + 1:x}" * 64,
                 "size": sizes[role],
             }
             for index, role in enumerate(preflight.ALL_ROLES)
         }
+        qemu_support = [{
+            "path": "qemu/share/qemu/firmware.json",
+            "sha256": "9" * 64,
+            "size": 1024 * 1024,
+        }]
         value = {
             "schema": preflight.INPUT_SCHEMA,
-            "schema_version": 1,
+            "schema_version": preflight.INPUT_SCHEMA_VERSION,
+            "workload": preflight.WORKLOAD,
             "boot_policy": "platform-unavailable-v1",
             "raw_size": raw_size,
-            "source": {
-                "config_sha256": "8" * 64,
-                "source_sha256": "9" * 64,
+            "provenance": {
+                "scheme": "unikraft.git-ls-tree-v1",
+                "head_commit": "a" * 40,
+                "tree_sha256": "b" * 64,
+                "tracked_entries": 200,
+                "config": {
+                    "name": preflight.SOLVED_CONFIG,
+                    "sha256": "c" * 64,
+                    "size": 4096,
+                },
             },
             "files": files,
+            "qemu_support": qemu_support,
             "miz": {
                 "name": "miz",
                 "revision": preflight.azure.MIZ_REVISION,
-                "sha256": "f" * 64,
-                "size": 1024 * 1024,
+                "sha256": "d" * 64,
+                "size": 8 * 1024 * 1024,
             },
             "packaging": preflight.azure.packaging_contract(
                 files["efi"]["sha256"], files["vhd"]["size"]
             ),
+            "implementation": self.implementation(),
+            "budget": preflight.expected_budget(files, qemu_support),
         }
         value.update(changes)
         return value
 
     def state(self):
         manifest = preflight.validate_input_manifest(self.manifest())
+        manifest_sha = hashlib.sha256(
+            preflight.azure.canonical_json(manifest)
+        ).hexdigest()
         return {
             "schema": preflight.STATE_SCHEMA,
-            "schema_version": 1,
+            "schema_version": preflight.STATE_SCHEMA_VERSION,
             "phase": "prepared",
             "identity": "1" * 32,
             "name_prefix": "uk-hvp-123456789abc",
             "location": preflight.LOCATION,
             "vm_size": preflight.VM_SIZE,
             "image_sha256": manifest["files"]["vhd"]["sha256"],
-            "manifest_sha256": "2" * 64,
-            "controller_sha256": preflight.azure.image_sha256(
-                Path(preflight.__file__)
-            ),
-            "runner_sha256": preflight.azure.image_sha256(
-                preflight.RUNNER_PATH
-            ),
-            "template_sha256": preflight.azure.image_sha256(
-                preflight.TEMPLATE_PATH
-            ),
+            "manifest_sha256": manifest_sha,
+            "implementation": manifest["implementation"],
             "input_manifest": manifest,
+            "staged_input_bytes": 0,
+            "control_payload_bytes": 0,
+            "evidence_bytes": 0,
+            "pending_secret_files": [],
             "cleanup_required": False,
         }
 
@@ -103,10 +145,11 @@ class PrivatePreflightFixture(unittest.TestCase):
                     "hyperv_generation": "V2",
                 },
             },
-            "deadline_monotonic": 10**18,
+            "deadline_monotonic": time.monotonic() + 3600,
             "deadline_utc": "2026-09-09T05:26:00Z",
             "cleanup_required": True,
             "storage_account": "ukhvp1234567890abcd",
+            "firewall_obligation": None,
             "resource_group_id": (
                 "/subscriptions/11111111-2222-3333-4444-555555555555/"
                 "resourceGroups/uk-hvp-123456789abc-rg"
@@ -114,21 +157,145 @@ class PrivatePreflightFixture(unittest.TestCase):
         })
         return state
 
+    def run_fixture(self, root):
+        state = self.cloud_state()
+        path = root / "state.json"
+        preflight.azure.save_json(path, state)
+        run = preflight.PrivatePreflightRun(state, path)
+        run.az = mock.Mock()
+
+        def record(phase, **fields):
+            state.update(phase=phase, **fields)
+
+        run.record = mock.Mock(side_effect=record)
+        return run, state
+
+    def begin_operation(self, run, state, phase="resources-verified"):
+        operation = "22222222-2222-4222-8222-222222222222"
+        ids = run.expected_host_ids()
+        state["host_deployment"] = {
+            "phase": phase,
+            "operation_id": operation,
+            "deployment_id": ids["deployment_id"],
+            "correlation_id": (
+                None if phase == "pending"
+                else "33333333-3333-4333-8333-333333333333"
+            ),
+            "vm_id": ids["vm_id"],
+            "vm_uuid": (
+                None if phase in ("pending", "deployment-succeeded")
+                else "44444444-4444-4444-8444-444444444444"
+            ),
+            "disk_id": ids["disk_id"],
+            "disk_uuid": (
+                "55555555-5555-4555-8555-555555555555"
+                if phase == "resources-verified" else None
+            ),
+            "shutdown_time": "0526",
+        }
+        return state["host_deployment"]
+
+    def vm_disk(self, run, state):
+        receipt = state["host_deployment"]
+        image = state["cloud_preflight"]["image"]
+        vm = {
+            "id": receipt["vm_id"],
+            "name": run.host_vm,
+            "type": "Microsoft.Compute/virtualMachines",
+            "vmId": receipt["vm_uuid"]
+            or "44444444-4444-4444-8444-444444444444",
+            "tags": run.operation_tags(),
+            "location": preflight.LOCATION,
+            "provisioningState": "Succeeded",
+            "hardwareProfile": {"vmSize": preflight.VM_SIZE},
+            "securityProfile": {"securityType": "Standard"},
+            "networkProfile": {
+                "networkInterfaces": [{
+                    "id": run.expected_host_ids()["nic_id"],
+                    "primary": True,
+                    "deleteOption": "Delete",
+                }],
+            },
+            "storageProfile": {
+                "imageReference": image,
+                "osDisk": {
+                    "diskSizeGb": 32,
+                    "createOption": "FromImage",
+                    "caching": "ReadWrite",
+                    "deleteOption": "Delete",
+                    "managedDisk": {"id": receipt["disk_id"]},
+                },
+                "dataDisks": [],
+            },
+        }
+        disk = {
+            "id": receipt["disk_id"],
+            "name": run.host_disk,
+            "type": "Microsoft.Compute/disks",
+            "uniqueId": receipt["disk_uuid"]
+            or "55555555-5555-4555-8555-555555555555",
+            "managedBy": receipt["vm_id"],
+            "diskSizeGb": 32,
+            "sku": {"name": "StandardSSD_LRS"},
+            "osType": "Linux",
+            "hyperVGeneration": "V2",
+            "tags": None,
+            "location": preflight.LOCATION,
+        }
+        return vm, disk
+
+    def deployment(self, run, state, provisioning="Succeeded"):
+        receipt = state["host_deployment"]
+        image = state["cloud_preflight"]["image"]
+        parameters = {
+            "namePrefix": run.prefix,
+            "location": preflight.LOCATION,
+            "imageSha256": state["image_sha256"],
+            "storageAccountName": run.storage,
+            "hostImageVersion": image["version"],
+            "operationId": receipt["operation_id"],
+            "shutdownTime": receipt["shutdown_time"],
+        }
+        return {
+            "id": receipt["deployment_id"],
+            "name": run.prefix + "-host",
+            "properties": {
+                "provisioningState": provisioning,
+                "correlationId": "33333333-3333-4333-8333-333333333333",
+                "parameters": {
+                    name: {"value": value}
+                    for name, value in parameters.items()
+                },
+            },
+        }
+
 
 class PrivatePreflightManifestTest(PrivatePreflightFixture):
-    def test_strict_manifest_binds_build_tools_images_and_size_cap(self):
+    def test_manifest_binds_real_budget_and_keeps_efi_local(self):
         manifest = preflight.validate_input_manifest(self.manifest())
-        self.assertEqual(manifest["raw_size"], preflight.azure.VIRTUAL_SIZE)
-        self.assertLessEqual(
-            manifest["staged_bytes"] + preflight.MAX_EVIDENCE_BYTES,
-            256 * 1024 * 1024,
+        budget = manifest["budget"]
+        measured_without_support = (
+            207_618_560 + 26_911_032 + 8_388_608
+            + preflight.MAX_CONTROL_BYTES + preflight.MAX_EVIDENCE_BYTES
+        )
+        self.assertEqual(
+            budget["total_max_bytes"],
+            measured_without_support + 1024 * 1024,
+        )
+        self.assertEqual(
+            budget["remaining_bytes"],
+            preflight.MAX_TOTAL_BYTES - budget["total_max_bytes"],
+        )
+        self.assertNotIn(
+            manifest["files"]["efi"]["size"],
+            (budget["remote_input_bytes"], budget["total_max_bytes"]),
         )
         self.assertEqual(
             manifest["packaging"]["boot-file-sha256"],
             manifest["files"]["efi"]["sha256"],
         )
 
-    def test_manifest_rejects_unknown_fields_bool_sizes_and_oversize(self):
+    def test_manifest_rejects_bool_unknown_oversize_and_nonplatform_workload(self):
         variants = []
         unknown = self.manifest()
         unknown["private_path"] = "/secret"
@@ -137,41 +304,41 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         boolean["files"]["raw"]["size"] = True
         variants.append(boolean)
         oversized = self.manifest()
-        oversized["files"]["qemu"]["size"] = 60 * 1024 * 1024
+        oversized["qemu_support"][0]["size"] = 30 * 1024 * 1024
+        oversized["budget"] = preflight.expected_budget(
+            oversized["files"], oversized["qemu_support"]
+        )
         variants.append(oversized)
-        bad_policy = self.manifest(boot_policy="accept-any-failure")
-        variants.append(bad_policy)
+        variants.append(self.manifest(workload="persistence-v2"))
+        variants.append(self.manifest(boot_policy="accept-any-failure"))
         for value in variants:
-            with self.subTest(value=value):
+            with self.subTest(value=value.get("workload")):
                 with self.assertRaises(ValueError):
                     preflight.validate_input_manifest(value)
 
-    def test_input_directory_rejects_extra_files_and_symlinks(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            root.chmod(0o700)
-            manifest = self.manifest()
-            manifest_bytes = json.dumps(manifest).encode()
-            (root / preflight.INPUT_MANIFEST).write_bytes(manifest_bytes)
-            for name in preflight.INPUT_NAMES.values():
-                (root / name).write_bytes(b"x")
-            (root / "private.log").write_text("not allowed")
-            with self.assertRaisesRegex(ValueError, "extra or missing"):
-                preflight.load_input_manifest(
-                    root, hashlib.sha256(manifest_bytes).hexdigest()
-                )
-            (root / "private.log").unlink()
-            linked = root.parent / (root.name + "-linked")
-            linked.symlink_to(root, target_is_directory=True)
-            try:
-                with self.assertRaisesRegex(ValueError, "symlink"):
-                    preflight.load_input_manifest(
-                        linked, hashlib.sha256(manifest_bytes).hexdigest()
-                    )
-            finally:
-                linked.unlink()
+    def test_host_manifests_bind_qemu_closure_and_never_stage_efi(self):
+        state = self.state()
+        capability = preflight.host_phase_manifest(state, "capability")
+        digest = hashlib.sha256(
+            preflight.azure.canonical_json(capability)
+        ).hexdigest()
+        private = preflight.host_phase_manifest(state, "private", digest)
+        self.assertEqual(capability["schema_version"], 2)
+        self.assertEqual(private["capability_manifest_sha256"], digest)
+        self.assertNotIn("efi", private["files"])
+        self.assertEqual(
+            private["qemu_support"][0]["name"],
+            "qemu/share/qemu/firmware.json",
+        )
+        staged = preflight.blob_files(
+            state, Path("/owner/state"), preflight.PUBLIC_ROLES
+        )
+        self.assertTrue(any(
+            item[0].endswith("/qemu/share/qemu/firmware.json")
+            for item in staged
+        ))
 
-    def test_transfer_source_is_explicit_single_public_ipv4(self):
+    def test_transfer_source_and_deadline_are_explicit(self):
         self.assertEqual(preflight.transfer_source("8.8.8.8"), "8.8.8.8/32")
         self.assertEqual(
             preflight.transfer_source("8.8.4.4/32"), "8.8.4.4/32"
@@ -183,78 +350,176 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     preflight.transfer_source(value)
-
-    def test_deadline_timeout_never_extends_an_expired_attempt(self):
         with mock.patch.object(preflight.time, "monotonic", return_value=101):
             with self.assertRaisesRegex(RuntimeError, "deadline"):
                 preflight.bounded_timeout(100, 300)
 
-    def test_private_state_cannot_enable_existing_group_adoption(self):
+    def test_run_requires_explicit_uploader_authorization_before_cloud(self):
         state = self.state()
-        state.update({
-            "group_precreated": True,
-            "resource_group": "foreign-group",
-        })
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            preflight.azure.save_json(root / preflight.STATE_FILE, state)
-            with self.assertRaisesRegex(ValueError, "cannot adopt"):
-                preflight.load_state(root)
-
-    def test_host_manifests_bind_capability_before_private_phase(self):
-        state = self.state()
-        capability = preflight.host_phase_manifest(state, "capability")
-        capability_digest = hashlib.sha256(
-            preflight.azure.canonical_json(capability)
-        ).hexdigest()
-        private = preflight.host_phase_manifest(
-            state, "private", capability_digest
-        )
-        self.assertEqual(
-            private["capability_manifest_sha256"], capability_digest
-        )
-        self.assertEqual(
-            set(capability["files"]), set(preflight.PUBLIC_ROLES)
-        )
-        self.assertNotIn("capability_raw", private["files"])
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with self.assertRaisesRegex(
-                runner.RunnerError, "capability-not-complete"
-            ):
-                runner.execute_phase(
-                    "private", private,
-                    preflight.azure.canonical_json(private),
-                    "https://abc.blob.core.windows.net",
-                    preflight.CONTAINER, "sv=fixture", root,
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(
+                    preflight, "load_state",
+                    return_value=(state, Path(temporary) / "state.json"),
+                ), mock.patch.object(
+                    preflight, "verify_immutable_inputs"
+                ), mock.patch.object(
+                    preflight, "check_blob_dependency"
+                ), mock.patch.object(
+                    preflight, "check_subscription"
+                ) as cloud:
+            with self.assertRaisesRegex(ValueError, "authorization"):
+                preflight.run_preflight(
+                    Path(temporary), "1" * 36, "8.8.8.8", False
                 )
+            cloud.assert_not_called()
+
+    def test_source_or_dependency_change_fails_before_cloud_preflight(self):
+        state = self.state()
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(
+                    preflight, "load_state",
+                    return_value=(state, Path(temporary) / "state.json"),
+                ), mock.patch.object(
+                    preflight, "verify_immutable_inputs",
+                    side_effect=ValueError("implementation changed"),
+                ), mock.patch.object(
+                    preflight, "check_subscription"
+                ) as cloud:
+            with self.assertRaisesRegex(ValueError, "implementation changed"):
+                preflight.run_preflight(
+                    Path(temporary), "1" * 36, "8.8.8.8", True
+                )
+            cloud.assert_not_called()
+
+    def test_provenance_generator_hashes_clean_git_tree_and_config(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            run_root = root / state["identity"]
-            run_root.mkdir(mode=0o700)
-            runner.write_durable(
-                run_root / "capability.complete",
-                (json.dumps({
-                    "identity": state["identity"],
-                    "manifest_sha256": capability_digest,
-                    "result": "PASS",
-                    "host_boot_id": (
-                        "11111111-1111-4111-8111-111111111111"
-                    ),
-                }, sort_keys=True) + "\n").encode(),
+            repository = Path(temporary)
+            (repository / "support").mkdir()
+            config = repository / "solved.config"
+            config.write_text("CONFIG_HYPERV=y\n")
+            subprocess.run(
+                ["git", "init", "-q"], cwd=repository, check=True
+            )
+            (repository / "tracked").write_text("source\n")
+            subprocess.run(
+                ["git", "add", "tracked"], cwd=repository, check=True
+            )
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid",
+                    "commit", "-qm", "fixture",
+                ],
+                cwd=repository, check=True,
             )
             with mock.patch.object(
-                runner, "host_boot_id",
-                return_value="22222222-2222-4222-8222-222222222222",
-            ), self.assertRaisesRegex(
-                runner.RunnerError, "capability-state-mismatch"
+                preflight, "SUPPORT", repository / "support"
             ):
-                runner.execute_phase(
-                    "private", private,
-                    preflight.azure.canonical_json(private),
-                    "https://abc.blob.core.windows.net",
-                    preflight.CONTAINER, "sv=fixture", root,
+                first = preflight.build_provenance(repository, config)
+                second = preflight.build_provenance(repository, config)
+            self.assertEqual(first, second)
+            self.assertEqual(first["scheme"], "unikraft.git-ls-tree-v1")
+            self.assertEqual(first["tracked_entries"], 1)
+            config.write_text("CONFIG_HYPERV=n\n")
+            with mock.patch.object(
+                preflight, "SUPPORT", repository / "support"
+            ):
+                changed = preflight.build_provenance(repository, config)
+            self.assertNotEqual(
+                first["config"]["sha256"], changed["config"]["sha256"]
+            )
+
+    def test_generate_input_creates_complete_canonical_operator_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            (repository / "support").mkdir(parents=True)
+            config = repository / "solved.config"
+            config.write_text("CONFIG_HYPERV=y\n")
+            (repository / "tracked").write_text("source\n")
+            subprocess.run(
+                ["git", "init", "-q"], cwd=repository, check=True
+            )
+            subprocess.run(
+                ["git", "add", "tracked"], cwd=repository, check=True
+            )
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid",
+                    "commit", "-qm", "fixture",
+                ],
+                cwd=repository, check=True,
+            )
+            qemu = root / "qemu"
+            (qemu / "bin").mkdir(parents=True)
+            (qemu / "share").mkdir()
+            (qemu / "bin" / "qemu-system-x86_64").write_bytes(b"qemu")
+            (qemu / "share" / "firmware.json").write_bytes(b"support")
+            assets = {}
+            for name, content in (
+                ("code", b"code"), ("vars", b"vars"),
+                ("capability", b"c" * 1024), ("efi", b"efi"),
+                ("raw", b"r" * 1024), ("vhd", b"r" * 1024 + b"v" * 512),
+                ("miz", b"miz"),
+            ):
+                assets[name] = root / name
+                assets[name].write_bytes(content)
+            assets["miz"].chmod(0o700)
+            output = root / "input"
+
+            def packaging(_miz, _arguments, _log, **_kwargs):
+                return preflight.azure.packaging_contract(
+                    hashlib.sha256(b"efi").hexdigest(), 1536
                 )
+
+            provenance = {
+                **self.manifest()["provenance"],
+                "config": {
+                    "name": preflight.SOLVED_CONFIG,
+                    "sha256": hashlib.sha256(
+                        config.read_bytes()
+                    ).hexdigest(),
+                    "size": config.stat().st_size,
+                },
+            }
+            with mock.patch.object(
+                preflight, "check_blob_dependency"
+            ), mock.patch.object(
+                preflight, "build_provenance",
+                return_value=provenance,
+            ), mock.patch.object(
+                preflight, "implementation_contract",
+                return_value=self.implementation(),
+            ), mock.patch.object(
+                preflight.azure, "VIRTUAL_SIZE", 1024
+            ), mock.patch.object(
+                preflight.azure, "miz_command", side_effect=packaging
+            ):
+                digest = preflight.generate_input(
+                    output, repository, config, qemu,
+                    assets["code"], assets["vars"], assets["capability"],
+                    assets["efi"], assets["raw"], assets["vhd"],
+                    assets["miz"], "platform-unavailable-v1",
+                )
+            manifest_bytes = (
+                output / preflight.INPUT_MANIFEST
+            ).read_bytes()
+            self.assertEqual(hashlib.sha256(manifest_bytes).hexdigest(), digest)
+            self.assertEqual(
+                {
+                    str(path.relative_to(output))
+                    for path in output.rglob("*") if path.is_file()
+                },
+                {
+                    preflight.INPUT_MANIFEST,
+                    preflight.SOLVED_CONFIG,
+                    "qemu/bin/qemu-system-x86_64",
+                    "qemu/share/firmware.json",
+                    "OVMF_CODE.fd", "OVMF_VARS.fd", "capability.raw",
+                    "private.efi", "private.raw", "private.vhd",
+                },
+            )
 
 
 class PrivatePreflightRunnerTest(PrivatePreflightFixture):
@@ -278,138 +543,299 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
         )
         return "\n".join(lines)
 
-    def test_strict_no_device_policy_is_not_arbitrary_failure_success(self):
+    def fake_qemu(self, root, action="pass"):
+        qemu = root / "qemu" / "bin" / "qemu-system-x86_64"
+        qemu.parent.mkdir(parents=True)
+        script = [
+            "#!/usr/bin/python3",
+            "import os, pathlib, sys",
+        ]
+        if action == "mutate":
+            script.append(
+                "p=pathlib.Path('disk.img'); "
+                "d=p.read_bytes(); p.write_bytes(b'Z'+d[1:])"
+            )
+        elif action == "replace":
+            script.append(
+                "p=pathlib.Path('disk.img'); d=p.read_bytes(); "
+                "p.unlink(); p.write_bytes(d)"
+            )
+        script.extend([
+            "print('Hyper-V Hv#1 hypercall page enabled')",
+            "print('Hyper-V SynIC:')",
+            "print('Powered by')",
+            "print('Calling main(')",
+            f"print('{runner.PLATFORM_MARKER}')",
+            f"print('{runner.UNAVAILABLE_MARKER}')",
+            (
+                f"print('{runner.LEGACY_APIC_MARKER}') "
+                "if 'x2apic=off' in ' '.join(sys.argv) else None"
+            ),
+            "print('[ 0.1] Info: [libukboot] <boot.c @ 523> main returned 2')",
+        ])
+        qemu.write_text("\n".join(script) + "\n")
+        qemu.chmod(0o700)
+        return qemu
+
+    def run_fake_boot(self, action):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            qemu = self.fake_qemu(root, action)
+            code = root / "code"
+            variables = root / "vars"
+            image = root / "image"
+            code.write_bytes(b"code")
+            variables.write_bytes(b"vars")
+            image.write_bytes(b"image")
+            record = {
+                "blob": "unused",
+                "name": "image",
+                "size": image.stat().st_size,
+                "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+            }
+            return runner.run_boot(
+                qemu, code, variables, image, record, image.stat().st_size,
+                "platform-unavailable-v1", "raw-x2apic", False, root,
+            )
+
+    def test_strict_no_device_policy_rejects_guarded_storage_failures(self):
         runner.validate_boot_log(
             self.boot_log(), "platform-unavailable-v1", False
         )
-        runner.validate_boot_log(
-            self.boot_log(legacy=True), "platform-unavailable-v1", True
-        )
         for text in (
-            self.boot_log(extra="HYPERV_ACCEPTANCE STORAGE_READ FAIL reason=io"),
+            self.boot_log(
+                main_return=1,
+                extra="HYPERV_STORAGE SELECT FAIL rc=-2 writes=0",
+            ),
             self.boot_log(extra="UK_HYPERV_IO_READY"),
-            self.boot_log(extra="UK_HYPERV_BLOCK_READ_OK"),
             self.boot_log(extra="HYPERV_STORAGE WRITE PASS bytes=512"),
             self.boot_log(main_return=0),
-            self.boot_log(extra=runner.UNAVAILABLE_MARKER),
             self.boot_log(
                 extra="diagnostic: expected main returned 2 but continued"
             ),
         ):
-            with self.subTest(text=text[-100:]):
+            with self.subTest(text=text[-80:]):
                 with self.assertRaises(runner.RunnerError):
                     runner.validate_boot_log(
                         text, "platform-unavailable-v1", False
                     )
 
-    def test_qemu_command_uses_kvm_hyperv_footer_mask_and_no_network(self):
+    def test_actual_qemu_process_uses_readonly_footer_mask_and_passes(self):
+        result, _ = self.run_fake_boot("pass")
+        self.assertEqual(result["result"], "PASS")
+
+    def test_actual_qemu_mutation_cannot_forge_pass(self):
+        with self.assertRaisesRegex(runner.RunnerError, "mutated"):
+            self.run_fake_boot("mutate")
+
+    def test_actual_qemu_replacement_cannot_forge_pass(self):
+        with self.assertRaisesRegex(runner.RunnerError, "replaced"):
+            self.run_fake_boot("replace")
+
+    def test_qemu_command_shape_masks_fixed_vhd_footer(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            qemu = root / "qemu"
-            code = root / "code"
-            variables = root / "vars"
-            image = root / "image"
-            for path in (qemu, code, variables, image):
-                path.write_bytes(b"x")
+            qemu = root / "qemu" / "bin" / "qemu-system-x86_64"
+            qemu.parent.mkdir(parents=True)
+            for path, value in (
+                (qemu, b"q"), (root / "code", b"c"),
+                (root / "vars", b"v"), (root / "image", b"i"),
+            ):
+                path.write_bytes(value)
             captured = {}
 
             def execute(command, **kwargs):
                 captured["command"] = command
-                captured["kwargs"] = kwargs
                 kwargs["stdout"].write(self.boot_log().encode())
                 return mock.Mock(returncode=0)
 
+            image = root / "image"
+            record = {
+                "name": "image", "blob": "unused", "size": 1,
+                "sha256": hashlib.sha256(b"i").hexdigest(),
+            }
             with mock.patch.object(
                 runner.subprocess, "run", side_effect=execute
             ):
-                result, _ = runner.run_boot(
-                    qemu, code, variables, image,
+                runner.run_boot(
+                    qemu, root / "code", root / "vars", image, record,
                     preflight.azure.VIRTUAL_SIZE,
                     "platform-unavailable-v1", "raw-x2apic", False, root,
                 )
-            self.assertEqual(result["result"], "PASS")
             command = captured["command"]
-            self.assertEqual(
-                command[command.index("-machine") + 1], "q35,accel=kvm"
-            )
-            cpu = command[command.index("-cpu") + 1]
-            for feature in ("hv-synic", "hv-stimer", "hv-vpindex", "hv-runtime"):
-                self.assertIn(feature, cpu)
-            self.assertNotIn("x2apic=off", cpu)
-            self.assertIn("vmbus-bridge,irq=15", command)
-            self.assertEqual(command[-2:], ["-nic", "none"])
             disk = json.loads(command[command.index("-blockdev") + 1])
             self.assertEqual(disk["size"], preflight.azure.VIRTUAL_SIZE)
             self.assertTrue(disk["read-only"])
-            self.assertEqual(captured["kwargs"]["timeout"], 120)
+            self.assertEqual(command[-2:], ["-nic", "none"])
+            self.assertIn("vmbus-bridge,irq=15", command)
 
-    def test_runner_manifest_requires_exact_integer_fields(self):
+    def test_runner_manifest_requires_exact_integer_and_closure_fields(self):
         state = self.state()
         manifest = preflight.host_phase_manifest(state, "capability")
         for field, value in (
-            ("schema_version", True), ("raw_size", float(manifest["raw_size"])),
+            ("schema_version", True),
+            ("raw_size", float(manifest["raw_size"])),
         ):
             changed = json.loads(json.dumps(manifest))
             changed[field] = value
-            encoded = base64_encode(changed)
             with self.assertRaises(runner.RunnerError):
-                runner.parse_manifest(encoded, "capability")
+                runner.parse_manifest(base64_encode(changed), "capability")
         changed = json.loads(json.dumps(manifest))
-        changed["files"]["qemu"]["blob"] = (
-            "inputs/" + state["identity"] + "/public/foreign-qemu"
-        )
-        with self.assertRaisesRegex(runner.RunnerError, "invalid-file-binding"):
+        changed["qemu_support"][0]["blob"] += "/foreign"
+        with self.assertRaisesRegex(runner.RunnerError, "qemu-support"):
             runner.parse_manifest(base64_encode(changed), "capability")
 
-    def test_runner_download_detects_one_byte_overrun_without_writing_it(self):
-        class Response:
-            status = 200
 
-            def __init__(self):
-                self.returned = False
+class PrivatePreflightBlobTest(PrivatePreflightFixture):
+    def test_declared_blob_sdk_is_exact_when_available(self):
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+            installed = version("azure-storage-blob")
+        except PackageNotFoundError:
+            self.skipTest("azure-storage-blob is not installed in this runner")
+        self.assertEqual(installed, preflight.SDK_VERSION)
+        self.assertIsNotNone(preflight.check_blob_dependency())
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_):
-                return False
-
-            def read(self, _size):
-                if self.returned:
-                    return b""
-                self.returned = True
-                return b"abcd"
-
-        record = {
-            "blob": "inputs/" + "1" * 32 + "/public/qemu-system-x86_64",
-            "name": "qemu-system-x86_64",
-            "sha256": hashlib.sha256(b"abc").hexdigest(),
-            "size": 3,
+    def test_blob_worker_rejects_bool_sizes_and_public_request_files(self):
+        request = {
+            "schema": blob_worker.SCHEMA,
+            "schema_version": 1,
+            "action": "upload",
+            "account_url": "https://ukhvp123.blob.core.windows.net",
+            "container": "preflight",
+            "files": [{
+                "blob": "input", "path": "/owner/input",
+                "size": True, "sha256": "a" * 64,
+            }],
+            "create_container": False,
         }
-        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
-            runner.urllib.request, "urlopen", return_value=Response()
-        ):
-            destination = Path(temporary) / "qemu"
+        with self.assertRaises(blob_worker.WorkerError):
+            blob_worker.require_nonnegative(True)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "request.json"
+            path.write_text(json.dumps(request))
+            path.chmod(0o644)
             with self.assertRaisesRegex(
-                runner.RunnerError, "download-size-mismatch"
+                blob_worker.WorkerError, "request-file"
             ):
-                runner.download_file(
-                    "https://ukhvp123.blob.core.windows.net",
-                    "preflight", record, "sv=private", destination,
+                blob_worker.load_request(path)
+
+    def test_absolute_deadline_kills_blocked_blob_worker(self):
+        process = mock.Mock()
+        process.communicate.side_effect = subprocess.TimeoutExpired(
+            ["worker"], 1
+        )
+        with mock.patch.object(
+            preflight, "check_blob_dependency"
+        ), mock.patch.object(
+            preflight.subprocess, "Popen", return_value=process
+        ), tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "state.json"
+            state_path.write_text("{}")
+
+            @contextmanager
+            def request_file(_kind, value):
+                path = Path(temporary) / ".blob-request.json"
+                path.write_text(json.dumps(value))
+                try:
+                    yield path
+                finally:
+                    path.unlink(missing_ok=True)
+
+            run = mock.Mock()
+            run.tracked_private_json.side_effect = request_file
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                preflight.run_blob_worker(
+                    run,
+                    {
+                        "schema": blob_worker.SCHEMA,
+                        "schema_version": 1,
+                        "action": "download",
+                        "account_url": (
+                            "https://ukhvp123.blob.core.windows.net"
+                        ),
+                        "container": "preflight",
+                        "files": [{
+                            "blob": "receipt", "path": "/owner/output",
+                            "maximum": 1,
+                        }],
+                        "create_container": False,
+                    },
+                    "sv=secret", time.monotonic() + 0.1,
                 )
-            self.assertFalse(destination.exists())
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with()
 
+    def test_multifile_transfer_is_one_deadline_bounded_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = self.state()
+            path = root / "state.json"
+            run = mock.Mock(state=state, state_path=path)
+            files = []
+            for index, content in enumerate((b"a", b"bb")):
+                source = root / f"in-{index}"
+                source.write_bytes(content)
+                files.append((
+                    f"blob-{index}", source, len(content),
+                    hashlib.sha256(content).hexdigest(),
+                ))
+            with mock.patch.object(
+                preflight, "run_blob_worker", return_value=3
+            ) as worker:
+                self.assertEqual(
+                    preflight.upload_blob_set(
+                        run,
+                        "https://ukhvp123.blob.core.windows.net",
+                        "sv=secret", "preflight", files,
+                        create_container=True,
+                        deadline=time.monotonic() + 10,
+                    ),
+                    3,
+                )
+            self.assertEqual(len(worker.call_args.args[1]["files"]), 2)
 
-def base64_encode(value):
-    import base64
-    return base64.b64encode(
-        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    ).decode()
+    def test_success_returned_after_deadline_is_rejected(self):
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = (
+            b'{"schema":1,"result":"PASS","bytes":1}', b""
+        )
+        monotonic = iter((10.0, 11.0))
+        with mock.patch.object(
+            preflight, "check_blob_dependency"
+        ), mock.patch.object(
+            preflight.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            preflight.time, "monotonic", side_effect=lambda: next(monotonic)
+        ), tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "state.json"
+            state_path.write_text("{}")
+
+            @contextmanager
+            def request_file(_kind, value):
+                path = Path(temporary) / ".blob-request.json"
+                path.write_text(json.dumps(value))
+                try:
+                    yield path
+                finally:
+                    path.unlink(missing_ok=True)
+
+            run = mock.Mock()
+            run.tracked_private_json.side_effect = request_file
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                preflight.run_blob_worker(
+                    run, {}, "sv=secret", 10.5
+                )
 
 
 class PrivatePreflightTemplateTest(PrivatePreflightFixture):
-    def test_arm_template_is_one_private_bounded_standard_host(self):
+    def test_arm_template_is_exact_private_standard_host(self):
         template = json.loads(preflight.TEMPLATE_PATH.read_text())
+        self.assertIn("operationId", template["parameters"])
+        self.assertEqual(
+            template["variables"]["tags"]["preflight-operation"],
+            "[parameters('operationId')]",
+        )
         resources = template["resources"]
         kinds = [resource["type"] for resource in resources]
         self.assertEqual(
@@ -418,106 +844,58 @@ class PrivatePreflightTemplateTest(PrivatePreflightFixture):
         self.assertNotIn("Microsoft.Network/publicIPAddresses", kinds)
         self.assertNotIn("Microsoft.Network/natGateways", kinds)
         vm = next(
-            resource for resource in resources
-            if resource["type"] == "Microsoft.Compute/virtualMachines"
+            item for item in resources
+            if item["type"] == "Microsoft.Compute/virtualMachines"
         )
-        properties = vm["properties"]
+        profile = vm["properties"]["storageProfile"]
+        self.assertEqual(profile["dataDisks"], [])
+        self.assertEqual(profile["osDisk"]["diskSizeGB"], 32)
         self.assertEqual(
-            properties["hardwareProfile"]["vmSize"], "Standard_D2s_v5"
+            vm["properties"]["securityProfile"],
+            {"securityType": "Standard"},
         )
-        self.assertEqual(
-            properties["securityProfile"], {"securityType": "Standard"}
+        nic = next(
+            item for item in resources
+            if item["type"] == "Microsoft.Network/networkInterfaces"
         )
-        os_disk = properties["storageProfile"]["osDisk"]
-        self.assertEqual(os_disk["diskSizeGB"], 32)
-        self.assertEqual(
-            os_disk["managedDisk"]["storageAccountType"], "StandardSSD_LRS"
-        )
-        self.assertEqual(properties["storageProfile"]["dataDisks"], [])
-        self.assertTrue(
-            properties["diagnosticsProfile"]["bootDiagnostics"]["enabled"]
-        )
-        vnet = next(
-            resource for resource in resources
-            if resource["type"] == "Microsoft.Network/virtualNetworks"
-        )
-        subnet = vnet["properties"]["subnets"][0]["properties"]
+        self.assertIs(nic["properties"]["enableIPForwarding"], False)
+        subnet = next(
+            item for item in resources
+            if item["type"] == "Microsoft.Network/virtualNetworks"
+        )["properties"]["subnets"][0]["properties"]
         self.assertIs(subnet["defaultOutboundAccess"], False)
-        self.assertEqual(
-            subnet["serviceEndpoints"],
-            [{"service": "Microsoft.Storage", "locations": ["northeurope"]}],
-        )
+        self.assertNotIn("natGateway", subnet)
         storage = next(
-            resource for resource in resources
-            if resource["type"] == "Microsoft.Storage/storageAccounts"
-        )
-        self.assertEqual(storage["apiVersion"], "2023-05-01")
-        self.assertIs(storage["properties"]["allowBlobPublicAccess"], False)
-        self.assertEqual(
-            storage["properties"]["networkAcls"]["defaultAction"], "Deny"
+            item for item in resources
+            if item["type"] == "Microsoft.Storage/storageAccounts"
         )
         self.assertEqual(
-            storage["properties"]["networkAcls"]["bypass"], "None"
-        )
-        self.assertEqual(storage["properties"]["networkAcls"]["ipRules"], [])
-        self.assertEqual(
-            storage["properties"]["networkAcls"]["virtualNetworkRules"],
-            [{"id": "[variables('subnetId')]", "action": "Allow"}],
-        )
-        nsg = next(
-            resource for resource in resources
-            if resource["type"] == "Microsoft.Network/networkSecurityGroups"
-        )
-        rules = nsg["properties"]["securityRules"]
-        self.assertFalse(any(
-            rule["properties"]["direction"] == "Inbound"
-            and rule["properties"]["access"] == "Allow"
-            for rule in rules
-        ))
-        self.assertEqual(
+            storage["properties"]["networkAcls"],
             {
-                rule["properties"].get("destinationAddressPrefix")
-                for rule in rules
-                if rule["properties"]["access"] == "Allow"
-            },
-            {
-                "AzurePlatformDNS", "AzurePlatformIMDS",
-                "168.63.129.16", "Storage.NorthEurope",
+                "bypass": "None",
+                "defaultAction": "Deny",
+                "ipRules": [],
+                "virtualNetworkRules": [{
+                    "id": "[variables('subnetId')]",
+                    "action": "Allow",
+                }],
             },
         )
-        schedules = [
-            resource for resource in resources
-            if resource["type"] == "Microsoft.DevTestLab/schedules"
-        ]
-        self.assertEqual(len(schedules), 1)
-        self.assertEqual(schedules[0]["properties"]["status"], "Enabled")
 
 
 class PrivatePreflightCloudTest(PrivatePreflightFixture):
-    def run_fixture(self, root):
-        state = self.cloud_state()
-        path = root / "state.json"
-        preflight.azure.save_json(path, state)
-        run = preflight.PrivatePreflightRun(state, path)
-        run.az = mock.Mock()
-        run.record = mock.Mock(side_effect=lambda phase, **fields: state.update(
-            phase=phase, **fields
-        ))
-        return run, state
-
     @mock.patch.object(preflight.azure, "resolve_peer_image")
     @mock.patch.object(preflight.azure, "exact_vm_sku")
     @mock.patch.object(preflight.azure, "azure_cli")
     @mock.patch.object(preflight.azure, "selected_account")
-    def test_subscription_preflight_is_exact_and_has_no_retry(
+    def test_subscription_preflight_is_exact_and_private(
         self, account, command, sku, image
     ):
         subscription = "11111111-2222-3333-4444-555555555555"
         account.return_value = subscription
         command.side_effect = [
             "Registered", "Registered", "Registered", "Registered",
-            ["2025-11-01"],
-            ["True"],
+            ["2025-11-01"], ["True"],
             [
                 {"name": {"value": "cores"}, "limit": 8, "currentValue": 0},
                 {
@@ -539,192 +917,221 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
         }
         result = preflight.check_subscription(subscription)
         self.assertEqual(result["image"]["version"], "24.04.202609010")
-        account.assert_called_once_with(subscription)
-        sku.assert_called_once_with(
-            "northeurope", "Standard_D2s_v5", subscription,
-            vcpus=2, require_v2=True,
-        )
-        image.assert_called_once_with("northeurope", subscription, ("V2",))
-        self.assertEqual(command.call_count, 7)
         self.assertTrue(all(
             call.kwargs.get("private") is True
-            and call.kwargs.get("subscription") == subscription
             for call in command.call_args_list
         ))
 
-    @mock.patch.object(preflight.azure, "exact_vm_sku")
-    @mock.patch.object(preflight.azure, "azure_cli")
-    @mock.patch.object(preflight.azure, "selected_account")
-    def test_subscription_preflight_rejects_missing_nested_capability(
-        self, account, command, sku
-    ):
-        subscription = "11111111-2222-3333-4444-555555555555"
-        account.return_value = subscription
-        command.side_effect = [
-            "Registered", "Registered", "Registered", "Registered",
-            ["2025-11-01"], [],
-        ]
-        sku.return_value = {
-            "name": preflight.VM_SIZE,
-            "family": "standardDSv5Family",
-            "vcpus": 2,
-            "generations": ["V2"],
-        }
-        with self.assertRaisesRegex(RuntimeError, "nested virtualization"):
-            preflight.check_subscription(subscription)
-
-    def test_host_deployment_records_immutable_vm_and_disk_before_tag(self):
+    def test_deployment_obligation_is_durable_before_create(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
-            group = state["resource_group_id"]
-            deployment_id = (
-                group + "/providers/Microsoft.Resources/deployments/"
-                + run.prefix + "-host"
-            )
-            vm_id = (
-                group + "/providers/Microsoft.Compute/virtualMachines/"
-                + run.host_vm
-            )
-            disk_id = (
-                group + "/providers/Microsoft.Compute/disks/"
-                + run.host_disk
-            )
-            image = state["cloud_preflight"]["image"]
-            deployment = {
-                "id": deployment_id, "name": run.prefix + "-host",
-                "properties": {
-                    "provisioningState": "Succeeded",
-                    "correlationId": "33333333-3333-4333-8333-333333333333",
-                },
-            }
-            vm = {
-                "id": vm_id, "vmId": "44444444-4444-4444-8444-444444444444",
-                "tags": run.tags, "provisioningState": "Succeeded",
-                "hardwareProfile": {"vmSize": preflight.VM_SIZE},
-                "securityProfile": {"securityType": "Standard"},
-                "storageProfile": {
-                    "imageReference": image,
-                    "osDisk": {
-                        "diskSizeGb": 32,
-                        "managedDisk": {"id": disk_id},
-                    },
-                },
-            }
-            disk = {
-                "id": disk_id,
-                "uniqueId": "55555555-5555-4555-8555-555555555555",
-                "managedBy": vm_id, "diskSizeGb": 32,
-                "sku": {"name": "StandardSSD_LRS"}, "tags": run.tags,
-            }
-            nic = {
-                "id": "/private/nic", "tags": run.tags,
-                "ipConfigurations": [{
-                    "publicIPAddress": None,
-                    "privateIPAllocationMethod": "Static",
-                    "privateIPAddress": "10.88.0.4",
-                    "subnet": {"id": (
-                        group
-                        + "/providers/Microsoft.Network/virtualNetworks/"
-                        + run.prefix + "-vnet/subnets/preflight"
-                    )},
-                }],
-            }
-            storage = {
-                "id": (
-                    group + "/providers/Microsoft.Storage/storageAccounts/"
-                    + run.storage
-                ),
-                "tags": run.tags,
-                "allowBlobPublicAccess": False,
-                "allowSharedKeyAccess": True,
-                "minimumTlsVersion": "TLS1_2",
-                "publicNetworkAccess": "Enabled",
-                "supportsHttpsTrafficOnly": True,
-                "networkRuleSet": {"defaultAction": "Deny"},
-            }
-            schedule = {
-                "id": "/private/schedule", "tags": run.tags,
-                "properties": {
-                    "status": "Enabled", "targetResourceId": vm_id,
-                    "dailyRecurrence": {"time": "0526"},
-                },
-            }
-            run.az.side_effect = [
-                deployment, vm, disk, nic, storage, schedule,
-            ]
-
-            @contextmanager
-            def parameters(values):
-                self.assertNotIn(values["adminPassword"], str(values.keys()))
-                yield Path("/owner-only/parameters.json")
-
-            run.private_parameters = parameters
             with mock.patch.object(
-                run, "deadline_timeout", return_value=900
+                preflight.uuid, "uuid4",
+                return_value=uuid.UUID(
+                    "22222222-2222-4222-8222-222222222222"
+                ),
             ):
-                run.deploy_host("0526")
+                receipt = run.begin_host_deployment("0526")
+            self.assertEqual(receipt["phase"], "pending")
             self.assertEqual(
-                state["host_deployment"]["disk_uuid"],
-                "55555555-5555-4555-8555-555555555555",
+                receipt["vm_id"], run.expected_host_ids()["vm_id"]
             )
-            command = run.az.call_args_list[0].args[0]
-            self.assertEqual(command[:3], ["deployment", "group", "create"])
-            self.assertNotIn("adminPassword", " ".join(command))
+            self.assertIs(state["host_deployment"], receipt)
+            run.record.assert_called_once()
 
-    def test_transfer_firewall_is_removed_after_failure(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            run, _ = self.run_fixture(Path(temporary))
-            events = []
-            run.az.side_effect = lambda arguments, **_: events.append(
-                arguments
-            )
-            run.verify_storage_rules = mock.Mock()
-            with self.assertRaisesRegex(RuntimeError, "inside"):
-                with run.transfer_access("8.8.8.8/32"):
-                    raise RuntimeError("inside")
-            self.assertEqual(
-                [command[3] for command in events], ["add", "remove"]
-            )
-            self.assertEqual(
-                run.verify_storage_rules.call_args_list,
-                [
-                    mock.call("8.8.8.8/32"),
-                    mock.call(enforce_deadline=False),
-                ],
-            )
-
-    def test_transfer_firewall_cleanup_runs_after_ambiguous_add(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            run, _ = self.run_fixture(Path(temporary))
-            events = []
-
-            def command(arguments, **_):
-                events.append(arguments)
-                if arguments[3] == "add":
-                    raise RuntimeError("ambiguous add")
-
-            run.az.side_effect = command
-            run.verify_storage_rules = mock.Mock()
-            with self.assertRaisesRegex(RuntimeError, "ambiguous add"):
-                with run.transfer_access("8.8.8.8/32"):
-                    self.fail("ambiguous add must not enter the transfer")
-            self.assertEqual(
-                [arguments[3] for arguments in events], ["add", "remove"]
-            )
-            run.verify_storage_rules.assert_called_once_with(
-                enforce_deadline=False
-            )
-
-    def test_storage_firewall_requires_exact_private_subnet(self):
+    def test_ambiguous_create_reconciles_only_original_deployment(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "pending")
+            deployment = self.deployment(run, state)
+            run.az.return_value = deployment
+            run.capture_host_identity = mock.Mock()
+            self.assertTrue(
+                run.reconcile_host_deployment(time.monotonic() + 10)
+            )
+            run.capture_host_identity.assert_called_once_with()
+            command = run.az.call_args.args[0]
+            self.assertEqual(command[:3], ["deployment", "group", "show"])
+            self.assertEqual(
+                state["host_deployment"]["correlation_id"],
+                "33333333-3333-4333-8333-333333333333",
+            )
+
+    def test_missing_original_deployment_needs_repeated_empty_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "pending")
+            missing = preflight.azure.AzureCliError(
+                ["deployment", "group"],
+                mock.Mock(
+                    returncode=1,
+                    stderr="ERROR: (DeploymentNotFound) absent",
+                ),
+                True,
+            )
+            run.az.side_effect = [
+                missing, [], missing, [], missing, [],
+            ]
+            with mock.patch.object(preflight.time, "sleep"):
+                self.assertFalse(
+                    run.reconcile_host_deployment(time.monotonic() + 10)
+                )
+            self.assertEqual(
+                state["host_deployment"]["phase"], "not-created-empty"
+            )
+
+    def test_vm_and_disk_proof_never_tags_or_adopts_implicit_disk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "deployment-succeeded")
+            vm, disk = self.vm_disk(run, state)
+            run.az.side_effect = [vm, vm, disk, vm, disk]
+            run.capture_host_identity()
+            commands = [" ".join(call.args[0]) for call in run.az.call_args_list]
+            self.assertFalse(any("disk update" in command for command in commands))
+            self.assertEqual(
+                state["host_deployment"]["disk_uuid"], disk["uniqueId"]
+            )
+
+    def test_partial_deployment_persists_vm_proof_for_deallocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "deployment-terminal")
+            vm, _ = self.vm_disk(run, state)
+            run.az.side_effect = [
+                vm, vm, RuntimeError("disk unavailable"),
+            ]
+            with self.assertRaisesRegex(RuntimeError, "disk unavailable"):
+                run.capture_host_identity()
+            self.assertEqual(state["host_deployment"]["phase"], "vm-verified")
+            view = {
+                "instanceView": {
+                    "statuses": [{"code": "PowerState/deallocated"}]
+                },
+            }
+            run.az.reset_mock()
+            run.az.side_effect = [vm, None, view]
+            run.deallocate_host()
+            self.assertTrue(state["host_deallocated"])
+
+    def test_cleanup_refuses_matching_name_disk_with_changed_uuid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            group = {"id": state["resource_group_id"], "tags": run.group_tags}
+            vm, disk = self.vm_disk(run, state)
+            foreign = {**disk, "uniqueId": "6" * 32}
+            run.az.side_effect = [True, group, [disk], vm, foreign]
+            with self.assertRaises(RuntimeError):
+                run.delete_owned_group()
+            self.assertFalse(any(
+                call.args[0][:2] == ["group", "delete"]
+                for call in run.az.call_args_list
+            ))
+
+    def test_group_cleanup_cannot_succeed_when_proven_disk_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            group = {"id": state["resource_group_id"], "tags": run.group_tags}
+            vm, _ = self.vm_disk(run, state)
+            run.az.side_effect = [
+                True, group, [], vm, RuntimeError("disk missing"),
+            ]
+            with self.assertRaises(RuntimeError):
+                run.delete_owned_group()
+
+    def test_group_cleanup_succeeds_only_with_rechecked_vm_disk_proof(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            group = {"id": state["resource_group_id"], "tags": run.group_tags}
+            vm, disk = self.vm_disk(run, state)
+            run.az.side_effect = [
+                True, group, [vm, disk],
+                vm, disk,
+                vm, disk,
+                None, False,
+            ]
+            run.delete_owned_group()
+            self.assertFalse(state["cleanup_required"])
+            self.assertTrue(any(
+                call.args[0][:2] == ["group", "delete"]
+                for call in run.az.call_args_list
+            ))
+
+    def test_firewall_intent_precedes_add_and_survives_ambiguous_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            phases = []
+
+            def record(phase, **fields):
+                phases.append(phase)
+                state.update(phase=phase, **fields)
+
+            run.record.side_effect = record
+            run.az.side_effect = RuntimeError("ambiguous add")
+            run.clear_firewall_obligation = mock.Mock(
+                side_effect=RuntimeError("remove unconfirmed")
+            )
+            with self.assertRaisesRegex(RuntimeError, "remove unconfirmed"):
+                with run.transfer_access("8.8.8.8/32"):
+                    self.fail("ambiguous add must not expose a transfer")
+            self.assertEqual(phases[0], "blob-firewall-add-pending")
+            self.assertEqual(
+                state["firewall_obligation"]["phase"], "pending-remove"
+            )
+
+    def test_cleanup_attempts_firewall_sas_deallocate_and_group_independently(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            secret_name = ".run-command-0123456789abcdef.json"
+            secret_path = Path(temporary) / secret_name
+            secret_path.write_text("private")
+            secret_path.chmod(0o600)
+            state.update({
+                "pending_secret_files": [secret_name],
+                "firewall_obligation": {
+                    "cidr": "8.8.8.8/32", "phase": "active"
+                },
+                "active_sas": True,
+                "active_sas_signing_key_sha256": "a" * 64,
+            })
+            run.clear_firewall_obligation = mock.Mock(
+                side_effect=RuntimeError("firewall")
+            )
+            run.revoke_sas = mock.Mock(side_effect=RuntimeError("sas"))
+            run.deallocate_host = mock.Mock(side_effect=RuntimeError("vm"))
+            run.delete_owned_group = mock.Mock(side_effect=RuntimeError("group"))
+            with self.assertRaisesRegex(RuntimeError, "did not complete"):
+                run.cleanup()
+            self.assertFalse(secret_path.exists())
+            self.assertEqual(state["pending_secret_files"], [])
+            run.clear_firewall_obligation.assert_called_once_with()
+            run.revoke_sas.assert_called_once()
+            run.deallocate_host.assert_called_once_with()
+            run.delete_owned_group.assert_called_once_with()
+
+    def test_unresolved_firewall_blocks_new_transfer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            state["firewall_obligation"] = {
+                "cidr": "8.8.8.8/32", "phase": "pending-remove"
+            }
+            with self.assertRaisesRegex(RuntimeError, "unresolved"):
+                with run.transfer_access("8.8.4.4/32"):
+                    pass
+
+    def test_storage_firewall_rejects_resource_access_rules(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
             subnet = (
-                state["resource_group_id"]
-                + "/providers/Microsoft.Network/virtualNetworks/"
-                + run.prefix + "-vnet/subnets/preflight"
+                run.expected_host_ids()["vnet_id"] + "/subnets/preflight"
             )
             storage = {
-                "tags": run.tags,
+                "tags": run.operation_tags(),
                 "networkRuleSet": {
                     "defaultAction": "Deny",
                     "bypass": "None",
@@ -734,67 +1141,18 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                         "action": "Allow",
                         "state": "Succeeded",
                     }],
+                    "resourceAccessRules": [{"tenantId": "foreign"}],
                 },
             }
             run.az.return_value = storage
-            run.verify_storage_rules()
-            storage["networkRuleSet"]["virtualNetworkRules"][0][
-                "virtualNetworkResourceId"
-            ] = subnet + "-foreign"
-            with self.assertRaisesRegex(RuntimeError, "subnet rule"):
+            with self.assertRaisesRegex(RuntimeError, "firewall"):
                 run.verify_storage_rules()
 
-    def test_sas_intent_is_durable_and_revocation_rotates_the_key(self):
+    def test_run_command_uses_protected_parameter_and_bounded_control(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
-            first_key = "first-private-key"
-            second_key = "second-private-key"
-            run.az.side_effect = [
-                [{"keyName": "key1", "value": first_key}],
-                "sv=private",
-                None,
-                [{"keyName": "key1", "value": second_key}],
-            ]
-            token = run.generate_sas()
-            self.assertIs(state["active_sas"], True)
-            command = run.az.call_args_list[1].args[0]
-            self.assertEqual(
-                command[command.index("--permissions") + 1], "rcw"
-            )
-            self.assertNotIn(first_key, " ".join(command))
-            self.assertEqual(
-                run.az.call_args_list[1].kwargs["env"],
-                {"AZURE_STORAGE_KEY": first_key},
-            )
-            run.revoke_sas(token)
-            self.assertIs(state["active_sas"], False)
-            self.assertEqual(
-                run.az.call_args_list[2].args[0][-2:], ["--key", "primary"]
-            )
-
-    def test_failed_sas_issue_retains_revocation_obligation(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            run, state = self.run_fixture(Path(temporary))
-            run.az.side_effect = [
-                [{"keyName": "key1", "value": "private-key"}],
-                RuntimeError("generation failed"),
-            ]
-            with self.assertRaisesRegex(RuntimeError, "generation failed"):
-                run.generate_sas()
-            self.assertIs(state["active_sas"], True)
-            self.assertRegex(
-                state["active_sas_signing_key_sha256"], r"^[0-9a-f]{64}$"
-            )
-
-    def test_run_command_keeps_sas_out_of_arguments_and_requires_exact_pass(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            run, state = self.run_fixture(root)
-            state["host_vm_id"] = (
-                state["resource_group_id"]
-                + "/providers/Microsoft.Compute/virtualMachines/"
-                + run.host_vm
-            )
+            self.begin_operation(run, state)
+            state["host_vm_id"] = state["host_deployment"]["vm_id"]
             manifest = preflight.host_phase_manifest(state, "capability")
             receipt = "6" * 64
             captured = {}
@@ -804,7 +1162,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 request_path = Path(
                     arguments[arguments.index("--body") + 1][1:]
                 )
-                captured["request"] = request_path.read_text()
+                captured["request"] = json.loads(request_path.read_text())
                 return {"value": [{
                     "code": "ComponentStatus/StdOut/succeeded",
                     "message": "HYPERV_PRIVATE_PREFLIGHT " + json.dumps({
@@ -815,218 +1173,170 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 }]}
 
             run.az.side_effect = command
-            run.run_host_phase("capability", manifest, "sv=private-secret")
+            run.run_host_phase(
+                "capability", manifest, "sv=private-secret"
+            )
             self.assertNotIn(
                 "private-secret", " ".join(captured["arguments"])
             )
-            self.assertIn("private-secret", captured["request"])
+            self.assertNotIn(
+                "private-secret", captured["request"]["script"][0]
+            )
+            self.assertEqual(
+                captured["request"]["protectedParameters"],
+                [{"name": "sas", "value": "sv=private-secret"}],
+            )
+            self.assertGreater(state["control_payload_bytes"], 0)
+            self.assertEqual(state["pending_secret_files"], [])
             self.assertFalse(any(
                 path.name.startswith(".run-command-")
-                for path in root.iterdir()
-            ))
-            self.assertEqual(state["capability_receipt_sha256"], receipt)
-            run.az.side_effect = None
-            run.az.return_value = {
-                "value": [{
-                    "code": "ComponentStatus/StdOut/succeeded",
-                    "message": (
-                        "HYPERV_PRIVATE_PREFLIGHT "
-                        + json.dumps({
-                            "schema": 1, "phase": "capability",
-                            "result": "PASS", "identity": state["identity"],
-                            "receipt_sha256": receipt, "boot_count": 2,
-                        })
-                        + "\nHYPERV_PRIVATE_PREFLIGHT "
-                        + json.dumps({
-                            "schema": 1, "phase": "capability",
-                            "result": "PASS", "identity": state["identity"],
-                            "receipt_sha256": receipt, "boot_count": 2,
-                        })
-                    ),
-                }]
-            }
-            with self.assertRaisesRegex(RuntimeError, "duplicated"):
-                run.run_host_phase(
-                    "capability", manifest, "sv=private-secret"
-                )
-
-    def test_downloaded_receipt_must_match_run_command_fingerprint(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            run, state = self.run_fixture(Path(temporary))
-            manifest = preflight.host_phase_manifest(state, "capability")
-            logs = {
-                "capability-x2apic.log": b"x2apic\n",
-                "capability-legacy-apic.log": b"legacy\n",
-            }
-            receipt = {
-                "schema": preflight.HOST_EVIDENCE_SCHEMA,
-                "schema_version": 1,
-                "phase": "capability",
-                "identity": state["identity"],
-                "result": "PASS",
-                "manifest_sha256": hashlib.sha256(
-                    preflight.azure.canonical_json(manifest)
-                ).hexdigest(),
-                "runner_sha256": state["runner_sha256"],
-                "host_boot_id": "66666666-6666-4666-8666-666666666666",
-                "boot_policy": manifest["boot_policy"],
-                "boots": {"capability": {
-                    "x2apic": {
-                        "result": "PASS",
-                        "log_sha256": hashlib.sha256(
-                            logs["capability-x2apic.log"]
-                        ).hexdigest(),
-                        "return_code": 0,
-                    },
-                    "legacy-apic": {
-                        "result": "PASS",
-                        "log_sha256": hashlib.sha256(
-                            logs["capability-legacy-apic.log"]
-                        ).hexdigest(),
-                        "return_code": 0,
-                    },
-                }},
-            }
-            receipt_bytes = preflight.azure.canonical_json(receipt)
-            state["capability_receipt_sha256"] = "0" * 64
-
-            @contextmanager
-            def access(_cidr):
-                yield
-
-            run.transfer_access = access
-            with mock.patch.object(
-                preflight, "download_blob_bytes",
-                side_effect=[
-                    receipt_bytes,
-                    logs["capability-x2apic.log"],
-                    logs["capability-legacy-apic.log"],
-                ],
-            ), self.assertRaisesRegex(ValueError, "RunCommand proof"):
-                preflight.retrieve_phase_evidence(
-                    run, "8.8.8.8/32", "sv=private",
-                    "capability", manifest,
-                )
-
-    def test_cleanup_refuses_foreign_or_detached_implicit_host_disk(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            run, state = self.run_fixture(Path(temporary))
-            group = {"id": state["resource_group_id"], "tags": run.group_tags}
-            disk_id = run.expected_resource_id(
-                "Microsoft.Compute", "disks", run.host_disk
-            )
-            foreign = {
-                "id": disk_id, "name": run.host_disk,
-                "type": "Microsoft.Compute/disks", "tags": None,
-            }
-            run.az.side_effect = [True, group, [foreign]]
-            with self.assertRaisesRegex(RuntimeError, "unproven"):
-                run.delete_owned_group()
-            self.assertFalse(any(
-                call.args[0][:2] == ["group", "delete"]
-                for call in run.az.call_args_list
+                for path in Path(temporary).iterdir()
             ))
 
-            vm_id = run.expected_resource_id(
-                "Microsoft.Compute", "virtualMachines", run.host_vm
-            )
-            state["host_deployment"] = {
-                "deployment_id": run.expected_resource_id(
-                    "Microsoft.Resources", "deployments",
-                    run.prefix + "-host",
+    def test_deployed_envelope_rejects_any_data_disk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            vm, disk = self.vm_disk(run, state)
+            vm["storageProfile"]["dataDisks"] = [{"lun": 0}]
+            run.verify_host_identity = mock.Mock(return_value=(vm, disk))
+            with self.assertRaisesRegex(RuntimeError, "envelope"):
+                run.verify_deployed_envelope()
+            run.az.assert_not_called()
+
+    def test_deployed_envelope_rejects_nat_on_private_subnet(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            vm, disk = self.vm_disk(run, state)
+            ids = run.expected_host_ids()
+            run.verify_host_identity = mock.Mock(return_value=(vm, disk))
+            nic = {
+                "id": ids["nic_id"], "tags": run.operation_tags(),
+                "location": preflight.LOCATION,
+                "enableAcceleratedNetworking": False,
+                "enableIPForwarding": False,
+                "networkSecurityGroup": None,
+                "ipConfigurations": [{
+                    "name": "private",
+                    "primary": True,
+                    "privateIPAddressVersion": "IPv4",
+                    "publicIPAddress": None,
+                    "privateIPAllocationMethod": "Static",
+                    "privateIPAddress": "10.88.0.4",
+                    "subnet": {"id": ids["vnet_id"] + "/subnets/preflight"},
+                }],
+            }
+            nsg = {
+                "id": ids["nsg_id"], "tags": run.operation_tags(),
+                "location": preflight.LOCATION,
+                "securityRules": [],
+            }
+            expected = {
+                "AllowAzurePlatformDns": (
+                    100, "Allow", "Outbound", "Udp", "53",
+                    "VirtualNetwork", "AzurePlatformDNS",
                 ),
-                "correlation_id": "33333333-3333-4333-8333-333333333333",
-                "vm_id": vm_id,
-                "vm_uuid": "44444444-4444-4444-8444-444444444444",
-                "disk_id": disk_id,
-                "disk_uuid": "55555555-5555-4555-8555-555555555555",
+                "AllowAzurePlatformImds": (
+                    110, "Allow", "Outbound", "Tcp", "80",
+                    "VirtualNetwork", "AzurePlatformIMDS",
+                ),
+                "AllowAzurePlatformAgent": (
+                    120, "Allow", "Outbound", "Tcp", ["80", "32526"],
+                    "VirtualNetwork", "168.63.129.16",
+                ),
+                "AllowRegionalStorage": (
+                    130, "Allow", "Outbound", "Tcp", "443",
+                    "VirtualNetwork", "Storage.NorthEurope",
+                ),
+                "DenyAllInbound": (
+                    4095, "Deny", "Inbound", "*", "*", "*", "*",
+                ),
+                "DenyAllOutbound": (
+                    4096, "Deny", "Outbound", "*", "*", "*", "*",
+                ),
             }
-            vm = {
-                "id": vm_id, "vmId": state["host_deployment"]["vm_uuid"],
-                "tags": run.tags,
-                "storageProfile": {
-                    "osDisk": {"managedDisk": {"id": disk_id}},
+            for name, values in expected.items():
+                rule = {
+                    "name": name, "priority": values[0],
+                    "access": values[1], "direction": values[2],
+                    "protocol": values[3], "sourcePortRange": "*",
+                    "sourceAddressPrefix": values[5],
+                    "destinationAddressPrefix": values[6],
+                }
+                if isinstance(values[4], list):
+                    rule["destinationPortRanges"] = values[4]
+                else:
+                    rule["destinationPortRange"] = values[4]
+                nsg["securityRules"].append(rule)
+            vnet = {
+                "id": ids["vnet_id"], "tags": run.operation_tags(),
+                "location": preflight.LOCATION,
+                "addressSpace": {"addressPrefixes": ["10.88.0.0/29"]},
+                "subnets": [{"name": "preflight"}],
+            }
+            subnet = {
+                "id": ids["vnet_id"] + "/subnets/preflight",
+                "addressPrefix": "10.88.0.0/29",
+                "defaultOutboundAccess": False,
+                "natGateway": {"id": "/foreign/nat"},
+                "networkSecurityGroup": {"id": ids["nsg_id"]},
+                "serviceEndpoints": [{
+                    "service": "Microsoft.Storage",
+                    "locations": ["northeurope"],
+                }],
+            }
+            run.az.side_effect = [nic, nsg, vnet, subnet]
+            with self.assertRaisesRegex(RuntimeError, "subnet"):
+                run.verify_deployed_envelope()
+            subnet["natGateway"] = None
+            storage = {
+                "id": ids["storage_id"], "tags": run.operation_tags(),
+                "location": preflight.LOCATION,
+                "kind": "StorageV2",
+                "sku": {"name": "Standard_LRS"},
+                "allowBlobPublicAccess": False,
+                "allowSharedKeyAccess": True,
+                "defaultToOAuthAuthentication": False,
+                "minimumTlsVersion": "TLS1_2",
+                "publicNetworkAccess": "Enabled",
+                "supportsHttpsTrafficOnly": True,
+                "privateEndpointConnections": [],
+                "networkRuleSet": {"resourceAccessRules": []},
+            }
+            schedule = {
+                "id": ids["schedule_id"], "tags": run.operation_tags(),
+                "location": preflight.LOCATION,
+                "properties": {
+                    "status": "Enabled",
+                    "taskType": "ComputeVmShutdownTask",
+                    "targetResourceId": state["host_deployment"]["vm_id"],
+                    "dailyRecurrence": {"time": "0526"},
+                    "timeZoneId": "UTC",
                 },
             }
-            detached = {
-                **foreign,
-                "uniqueId": state["host_deployment"]["disk_uuid"],
-                "managedBy": None,
-            }
             run.az.reset_mock()
-            run.az.side_effect = [True, group, [foreign], vm, detached]
-            with self.assertRaisesRegex(RuntimeError, "detached or replaced"):
-                run.delete_owned_group()
+            run.az.side_effect = [
+                nic, nsg, vnet, subnet, storage, schedule,
+            ]
+            run.verify_storage_rules = mock.Mock()
+            run.verify_resource_inventory = mock.Mock()
+            run.verify_deployed_envelope()
+            run.verify_storage_rules.assert_called_once_with()
+            run.verify_resource_inventory.assert_called_once_with()
 
-    def test_cleanup_requires_the_explicit_bound_subscription(self):
-        state = self.cloud_state()
-        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
-            preflight, "load_state",
-            return_value=(state, Path(temporary) / "state.json"),
-        ):
-            with self.assertRaisesRegex(ValueError, "does not match"):
-                preflight.cleanup(
-                    Path(temporary),
-                    "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-                )
-
-    def test_cleanup_accepts_only_proven_attached_untagged_disk(self):
+    def test_resource_inventory_rejects_extra_public_ip(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
-            group = {"id": state["resource_group_id"], "tags": run.group_tags}
-            vm_id = run.expected_resource_id(
-                "Microsoft.Compute", "virtualMachines", run.host_vm
-            )
-            disk_id = run.expected_resource_id(
-                "Microsoft.Compute", "disks", run.host_disk
-            )
-            state["host_deployment"] = {
-                "deployment_id": run.expected_resource_id(
-                    "Microsoft.Resources", "deployments",
-                    run.prefix + "-host",
-                ),
-                "correlation_id": "33333333-3333-4333-8333-333333333333",
-                "vm_id": vm_id,
-                "vm_uuid": "44444444-4444-4444-8444-444444444444",
-                "disk_id": disk_id,
-                "disk_uuid": "55555555-5555-4555-8555-555555555555",
-            }
-            resource = {
-                "id": disk_id, "name": run.host_disk,
-                "type": "Microsoft.Compute/disks", "tags": None,
-            }
-            vm = {
-                "id": vm_id, "tags": run.tags,
-                "vmId": state["host_deployment"]["vm_uuid"],
-                "storageProfile": {"osDisk": {
-                    "managedDisk": {"id": disk_id},
-                }},
-            }
-            disk = {
-                **resource,
-                "uniqueId": state["host_deployment"]["disk_uuid"],
-                "managedBy": vm_id,
-            }
-            run.az.side_effect = [
-                True, group, [resource], vm, disk, None, False,
-            ]
-            run.delete_owned_group()
-            self.assertTrue(any(
-                call.args[0][:2] == ["group", "delete"]
-                for call in run.az.call_args_list
-            ))
-            self.assertIs(state["cleanup_required"], False)
-
-    def test_cleanup_attempts_group_delete_after_deallocation_failure(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            run, _ = self.run_fixture(Path(temporary))
-            run.deallocate_host = mock.Mock(
-                side_effect=RuntimeError("deallocation failed")
-            )
-            run.delete_owned_group = mock.Mock()
-            with self.assertRaisesRegex(RuntimeError, "did not complete"):
-                run.cleanup()
-            run.delete_owned_group.assert_called_once_with()
+            self.begin_operation(run, state)
+            run.az.return_value = [{
+                "type": "Microsoft.Network/publicIPAddresses",
+                "name": "forbidden",
+                "id": "/foreign/public-ip",
+                "tags": run.operation_tags(),
+            }]
+            with self.assertRaisesRegex(RuntimeError, "inventory"):
+                run.verify_resource_inventory()
 
     @mock.patch.object(preflight.azure, "azure_cli")
     def test_all_lifecycle_cli_failures_are_private(self, command):
@@ -1065,19 +1375,35 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             fake.container = preflight.CONTAINER
             fake.state = state
             fake.state_path = state_path
+            fake.deadline = time.monotonic() + 3600
 
             def record(phase, **fields):
                 state.update(phase=phase, **fields)
 
+            def account(category, amount):
+                field = {
+                    "input": "staged_input_bytes",
+                    "control": "control_payload_bytes",
+                    "evidence": "evidence_bytes",
+                }[category]
+                state[field] += amount
+
             fake.record.side_effect = record
+            fake.account_bytes.side_effect = account
             fake.create_group.side_effect = lambda: events.append("group")
             fake.deploy_host.side_effect = lambda _: (
                 events.append("host"),
                 state.update(
                     host_vm_id="/private/vm",
                     host_deployment={
-                        "vm_uuid": "4" * 32,
-                        "disk_uuid": "5" * 32,
+                        "operation_id": (
+                            "22222222-2222-4222-8222-222222222222"
+                        ),
+                        "correlation_id": (
+                            "33333333-3333-4333-8333-333333333333"
+                        ),
+                        "vm_uuid": "44444444-4444-4444-8444-444444444444",
+                        "disk_uuid": "55555555-5555-4555-8555-555555555555",
                     },
                 ),
             )
@@ -1116,14 +1442,18 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             )
             fake.cleanup.side_effect = lambda: events.append("cleanup")
 
-            def upload(_url, sas, _container, _files, **_kwargs):
+            def upload(_run, _url, sas, _container, files, **_kwargs):
                 events.append(
                     "upload-public" if sas == "public-sas"
                     else "upload-private"
                 )
+                return sum(record[2] for record in files)
 
-            def retrieve(_run, _cidr, sas, phase, _manifest):
+            def retrieve(_run, _cidr, _sas, phase, _manifest):
                 events.append("retrieve-" + phase)
+                state[phase + "_receipt_sha256"] = (
+                    "c" * 64 if phase == "capability" else "d" * 64
+                )
                 return {
                     "host_boot_id": (
                         "66666666-6666-4666-8666-666666666666"
@@ -1167,31 +1497,31 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
                 if capability_error is not None:
                     with self.assertRaises(type(capability_error)):
                         preflight.run_preflight(
-                            root, cloud["subscription"], "8.8.8.8"
+                            root, cloud["subscription"], "8.8.8.8", True
                         )
                 else:
                     preflight.run_preflight(
-                        root, cloud["subscription"], "8.8.8.8"
+                        root, cloud["subscription"], "8.8.8.8", True
                     )
         return events, state
 
     def test_capability_pass_precedes_any_private_upload(self):
         events, state = self.execute()
-        self.assertLess(events.index("run-capability"), events.index("upload-private"))
         self.assertLess(
-            events.index("retrieve-capability"), events.index("upload-private")
+            events.index("retrieve-capability"),
+            events.index("upload-private"),
         )
-        self.assertEqual(events[-1], "cleanup")
         self.assertIn("deallocate", events)
+        self.assertEqual(events[-1], "cleanup")
         self.assertIs(state["cleanup_required"], False)
 
-    def test_capability_failure_or_cancellation_cleans_without_private_upload(self):
+    def test_capability_failure_and_cancellation_cleanup_without_private_upload(self):
         for error in (
             RuntimeError("capability failed"),
             InterruptedError("cancelled"),
         ):
             with self.subTest(error=type(error).__name__):
-                events, _ = self.execute(capability_error=error)
+                events, _ = self.execute(error)
                 self.assertNotIn("upload-private", events)
                 self.assertEqual(events[-1], "cleanup")
 

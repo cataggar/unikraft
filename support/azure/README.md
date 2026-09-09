@@ -127,38 +127,85 @@ overwritten.
 `support/scripts/hyperv_private_preflight.py` is a separate, operator-run
 platform preflight. It does not replace `hyperv-azure.py`, consume a public
 prepared-image artifact, build Unikraft in Azure, or claim StorVSC persistence.
-Prepare it only after locally building the private EFI/raw/fixed-VHD inputs
-and the nonsecret capability image:
+It uses `azure-storage-blob==12.28.0`, already pinned in
+`support/azure/requirements.txt`. Create an isolated worktree-local runtime
+and verify the installed distribution before generating an input contract:
 
 ```shell
+RUNTIME="$PWD/.d/private-preflight-runtime"
+mkdir -p "$RUNTIME/tmp" "$RUNTIME/pip-cache"
+python3 -m venv "$RUNTIME/venv"
+TMPDIR="$RUNTIME/tmp" PIP_CACHE_DIR="$RUNTIME/pip-cache" \
+  "$RUNTIME/venv/bin/python" -m pip install \
+  --disable-pip-version-check -r support/azure/requirements.txt
+"$RUNTIME/venv/bin/python" -c \
+  'from importlib.metadata import version; assert version("azure-storage-blob") == "12.28.0"'
+```
+
+Build Unikraft and package the EFI/raw/fixed-VHD files locally with the pinned
+`miz` workflow above. The QEMU closure is an owner-selected directory whose
+executable is exactly `bin/qemu-system-x86_64`; required regular files below
+`lib/` and `share/` are copied and hashed recursively. Symlinks are rejected.
+Generate the canonical schema-2 manifest and owner-only input directory:
+
+```shell
+INPUTS="$PWD/.d/private-preflight-input"
 STATE="$PWD/.d/private-preflight-state"
-python3 support/scripts/hyperv_private_preflight.py prepare \
-  --input-dir "$PRIVATE_INPUTS" \
+# Each directory is an independently completed local `hyperv-azure.py prepare`.
+CAPABILITY_RAW="$CAPABILITY_LOCAL_STATE/unikraft.raw"
+PRIVATE_EFI="$PRIVATE_LOCAL_STATE/BOOTX64.EFI"
+PRIVATE_RAW="$PRIVATE_LOCAL_STATE/unikraft.raw"
+PRIVATE_VHD="$PRIVATE_LOCAL_STATE/unikraft.vhd"
+"$RUNTIME/venv/bin/python" support/scripts/hyperv_private_preflight.py \
+  generate-input --output-dir "$INPUTS" --repository "$PWD" \
+  --solved-config "$SOLVED_CONFIG" --qemu-root "$PINNED_QEMU_ROOT" \
+  --ovmf-code "$PINNED_OVMF_CODE" --ovmf-vars "$PINNED_OVMF_VARS" \
+  --capability-raw "$CAPABILITY_RAW" --private-efi "$PRIVATE_EFI" \
+  --private-raw "$PRIVATE_RAW" --private-vhd "$PRIVATE_VHD" \
+  --miz "$MIZ" --boot-policy platform-unavailable-v1
+PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
+"$RUNTIME/venv/bin/python" support/scripts/hyperv_private_preflight.py \
+  prepare --input-dir "$INPUTS" \
   --expected-manifest-sha256 "$PRIVATE_INPUT_MANIFEST_SHA256" \
   --state-dir "$STATE" --miz "$MIZ"
 ```
 
-The owner-only input manifest binds the local source/config, pinned `miz`,
-runner, QEMU, OVMF, capability image, private EFI/raw/fixed VHD, packaging
-geometry, hashes, sizes, and reviewed boot policy. The controller rejects
-symlinks, extra input files, mutable or incorrectly packaged content, and a
-staged-input/evidence allowance above 256 MiB. It copies the exact inputs into
-private state before any possible resource action; there is no post-preflight
-rebuild.
+The exact generated names are `private-preflight-input.json`, `solved.config`,
+`qemu/bin/qemu-system-x86_64`, the enumerated `qemu/lib`/`qemu/share` closure,
+`OVMF_CODE.fd`, `OVMF_VARS.fd`, `capability.raw`, `private.efi`, `private.raw`,
+and `private.vhd`. The manifest binds the clean Git `HEAD`, SHA-256 of the raw
+`git ls-tree -r --full-tree -z HEAD` output, solved configuration, pinned
+`miz`, controller, runner, Blob worker, imported shared controller and network
+helper, ARM template, requirements file, actual SDK version, all inputs,
+packaging geometry, sizes, and reviewed policy. Any tracked source,
+configuration, helper, requirement, SDK, or prepared-input change fails before
+the first cloud command.
+
+`private.efi`, copied `miz`, source/config metadata, and controller files stay
+local. Only the capability raw, private raw/fixed VHD, QEMU closure, and OVMF
+files are Blob-staged. The three fixed-size images use 207,618,560 bytes; the
+measured QEMU executable uses 26,911,032 bytes; an 8 MiB OVMF allowance,
+8 MiB cumulative evidence allowance, and 512 KiB cumulative runner/manifest
+control allowance leave 16,604,360 bytes for the remaining QEMU closure.
+`generate-input` measures the real closure and refuses a total above
+268,435,456 bytes. Feasibility therefore requires the operator's authenticated
+QEMU/OVMF assets; fixture sizes are not acceptance evidence.
 
 Live execution is a separate explicitly authorized action:
 
 ```shell
-python3 support/scripts/hyperv_private_preflight.py run \
+"$RUNTIME/venv/bin/python" support/scripts/hyperv_private_preflight.py run \
   --state-dir "$STATE" --subscription "$AZURE_SUBSCRIPTION" \
-  --transfer-source-ip "$EXPLICIT_OPERATOR_IPV4"
+  --transfer-source-ip "$EXPLICIT_OPERATOR_IPV4" \
+  --approve-transfer-source-ip
 ```
 
 Every Azure command carries the explicit private subscription; the controller
 never changes the global account default. The uploader address must be one
 explicit public IPv4. It is temporarily narrowed to `/32` for authenticated
 Blob upload and receipt download, then removed. There is no automatic address
-discovery. If this temporary exception is not approved, the run requires a
+discovery. The explicit approval flag is checked before subscription or other
+cloud preflight calls. If this temporary exception is not approved, the run requires a
 separately authorized private controller path and must stop before deployment.
 
 The fixed ARM topology contains one North Europe `Standard_D2s_v5` Ubuntu Gen2
@@ -170,6 +217,20 @@ gateway, data disk, or reuse of network-acceptance resources. Before creating
 the group, the controller validates the exact immutable Ubuntu image, SKU,
 generation, nested-virtualization capability, providers, and regional/family
 quota. It never changes region, image, SKU, or host in response to failure.
+Operators can inspect the same immutable retail-image/SKU inputs without
+changing account defaults:
+
+```shell
+az vm image list --all --location northeurope --publisher Canonical \
+  --offer ubuntu-24_04-lts --sku server --subscription "$AZURE_SUBSCRIPTION"
+az vm image show \
+  --urn "Canonical:ubuntu-24_04-lts:server:$IMMUTABLE_VERSION" \
+  --subscription "$AZURE_SUBSCRIPTION"
+az vm list-skus --all --location northeurope --size Standard_D2s_v5 \
+  --subscription "$AZURE_SUBSCRIPTION"
+az vm list-usage --location northeurope \
+  --subscription "$AZURE_SUBSCRIPTION"
+```
 
 The first RunCommand receives only the public capability image and pinned
 QEMU/OVMF inputs. It must prove Linux KVM plus the required QEMU Hyper-V
@@ -187,11 +248,19 @@ seed-enrollment metadata; a later storage acceptance integration must consume
 the separately reviewed manifest-v2 interface rather than adding those fields
 to this platform-only contract.
 
+The current guarded persistence producer is deliberately unsupported: its
+missing-seed/endpoint/geometry outcomes are strict failures, not an acceptable
+platform result. This preflight never treats `SELECT FAIL`, `rc=-2`, `rc=-11`,
+writes-zero, or main-return 1 as PASS. A separately reviewed no-device producer
+and policy are required before a persistence image can enter this workflow.
+
 Private manifests, SAS values, host identity, serial logs, and receipts remain
 in owner-only local state and authenticated Blob/control-plane parameters.
 Ordinary CLI errors redact identifiers and credentials. The operator needs
 only the resource permissions for this topology plus storage-account key
-listing and regeneration; the controller assumes no broader role assignment.
+listing/regeneration and network-rule mutation, VM RunCommand/deallocation,
+deployment inspection, and owner-checked deletion; it creates no role
+assignments and assumes no broader grant.
 The 60-minute deadline starts before deployment and is never extended; bounded
 transfer, RunCommand, and boot limits are subordinate to it. Managed auto-shutdown is
 configured before private work only as a backstop. Guest shutdown or the
@@ -204,10 +273,16 @@ python3 support/scripts/hyperv_private_preflight.py cleanup \
   --state-dir "$STATE" --subscription "$AZURE_SUBSCRIPTION"
 ```
 
-The controller attempts SAS-key rotation, explicit VM deallocation, and
-owner-checked resource-group deletion. It persists deployment, VM, and OS-disk
-provenance before private work and refuses deletion for an unknown, detached,
-replaced, or foreign disk. There is no keep-resources mode. Control-plane or
+The controller first resolves any durable pending/active uploader `/32`, then
+removes interrupted protected-parameter files and attempts SAS-key rotation,
+explicit VM deallocation, and owner-checked resource-group deletion
+independently. Firewall intent is persisted before
+the add call and remains pending until exact absence is re-read, including
+after interrupted processes. It persists the original deployment operation
+before create, records VM proof independently, and records immutable OS-disk
+identity/attachment proof without tag adoption. It refuses VM/group cascade
+for an unknown, detached, replaced, or foreign disk. There is no keep-resources
+mode. Control-plane or
 ownership failures are reported as cleanup failures rather than claimed as
 successful deletion. The final private receipt binds the exact inputs, tools,
 host identity, four boot outcomes, and cleanup obligations; live nested-KVM
