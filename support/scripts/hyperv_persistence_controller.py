@@ -2610,6 +2610,7 @@ def _run_acceptance_locked(state_directory, subscription, approve_cloud_run,
             )
     except BaseException as error:
         primary = error
+        run.state["acceptance_eligible"] = False
     if run.state.get("cleanup_required"):
         try:
             run.cleanup()

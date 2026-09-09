@@ -4328,10 +4328,12 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             )
         return {"id": identifier, "tags": tags}
 
-    def production_acceptance_cloud(self, state_path):
+    def production_acceptance_cloud(self, state_path, *,
+                                    cleanup_failure="delete"):
         calls = []
         group_exists = [False]
-        delete_failures = [1]
+        delete_failures = [1 if cleanup_failure == "delete" else 0]
+        inventory_failures = [1 if cleanup_failure == "inventory" else 0]
         serial_reads = [0]
         group_id = (
             f"/subscriptions/{self.SUBSCRIPTION}/resourceGroups/"
@@ -4448,6 +4450,9 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             if arguments[:2] in (["vm", "deallocate"], ["vm", "start"]):
                 return None
             if arguments[:2] == ["resource", "list"]:
+                if inventory_failures[0]:
+                    inventory_failures[0] -= 1
+                    raise RuntimeError("synthetic cleanup inventory failure")
                 state = current_state()
                 run = persistence.PersistenceRun(state, state_path)
                 return [
@@ -4517,7 +4522,7 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         receipt = json.loads(receipt_path.read_text())
         return caught, interrupted, final, receipt, calls
 
-    def assert_exact_production_lifecycle(self, calls):
+    def assert_exact_production_lifecycle(self, calls, *, group_deletes=2):
         self.assertEqual(sum(
             call[:3] == ("deployment", "group", "create")
             for call in calls
@@ -4535,7 +4540,7 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         ), 2)
         self.assertEqual(sum(
             call[:2] == ("group", "delete") for call in calls
-        ), 2)
+        ), group_deletes)
 
     def test_exact_two_boot_parser_and_causal_serial_boundary(self):
         boot1_text = self.boot_log(1)
@@ -4581,6 +4586,74 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         self.assertEqual(receipt["result"], "PASS")
         self.assertEqual(receipt["cleanup"], "complete")
         self.assert_exact_production_lifecycle(calls)
+
+    def test_failed_eligibility_write_is_invalid_before_cleanup_records(self):
+        _state, state_path = self.prepare()
+        execute, calls = self.production_acceptance_cloud(
+            state_path, cleanup_failure="inventory"
+        )
+        original_save = azure.save_durable_json
+
+        def save(path, value):
+            if (
+                Path(path) == state_path
+                and value.get("phase") == "acceptance-recorded"
+                and value.get("acceptance_eligible") is True
+            ):
+                raise OSError(errno.EIO, "synthetic eligibility write failure")
+            if (
+                Path(path) == state_path
+                and value.get("phase") == "failed"
+            ):
+                raise OSError(errno.ENOSPC, "synthetic rejection write failure")
+            original_save(path, value)
+
+        with (
+            mock.patch.object(
+                persistence.azure, "azure_cli", side_effect=execute
+            ),
+            mock.patch.object(
+                persistence.azure, "check_upload_dependencies"
+            ),
+            mock.patch.object(
+                persistence.azure, "upload_managed_vhd"
+            ),
+            mock.patch.object(
+                persistence.azure, "interrupt_as_exception",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                persistence.azure, "save_durable_json", side_effect=save
+            ),
+            mock.patch.object(
+                persistence.time, "monotonic", return_value=100.0
+            ),
+        ):
+            with self.assertRaises(azure.RunCleanupError) as raised:
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, True,
+                    persistence.resource_envelope_sha256(self.contract),
+                )
+            interrupted, _ = persistence.load_state(self.state_dir)
+            self.assertEqual(interrupted["phase"], "cleanup-failed")
+            self.assertFalse(interrupted["acceptance_eligible"])
+            self.assertNotIn("failure", interrupted)
+            persistence.cleanup_state(self.state_dir, self.SUBSCRIPTION)
+        message = str(raised.exception)
+        self.assertIn("synthetic eligibility write failure", message)
+        self.assertIn("synthetic cleanup inventory failure", message)
+        self.assertIn("synthetic rejection write failure", message)
+        final, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(final["phase"], "cleaned")
+        self.assertFalse(final["acceptance_eligible"])
+        receipt = json.loads(
+            (self.state_dir / "persistence-receipt.json").read_text()
+        )
+        self.assertEqual(receipt["cleanup"], "pending")
+        self.assert_exact_production_lifecycle(calls, group_deletes=1)
+        self.assertEqual(sum(
+            call[:2] == ("resource", "list") for call in calls
+        ), 2)
 
     def test_stale_or_replayed_boot1_never_authorizes_boot2(self):
         boot1 = self.boot_log(1)
