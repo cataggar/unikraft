@@ -1,5 +1,6 @@
 vmbus_device_count
 vmbus_device_get
+vmbus_device_is_bound
 vmbus_reconnect
 vmbus_unload
 vmbus_connection_fail
