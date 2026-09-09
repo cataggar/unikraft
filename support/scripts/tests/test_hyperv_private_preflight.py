@@ -2367,11 +2367,24 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
         return self.complete_prepared_handoff(root, state)
 
     def complete_prepared_handoff(self, root, state):
+        subscription = "11111111-2222-3333-4444-555555555555"
+        prefix = state["name_prefix"]
+        group_id = (
+            f"/subscriptions/{subscription}/resourceGroups/{prefix}-rg"
+        )
+        host_vm_id = (
+            group_id + "/providers/Microsoft.Compute/virtualMachines/"
+            + prefix + "-host"
+        )
+        host_disk_id = (
+            group_id + "/providers/Microsoft.Compute/disks/"
+            + prefix + "-host-os"
+        )
         state.update({
             "phase": "complete",
-            "subscription": "11111111-2222-3333-4444-555555555555",
+            "subscription": subscription,
             "cloud_preflight": {
-                "subscription": "11111111-2222-3333-4444-555555555555",
+                "subscription": subscription,
                 "sku": {},
                 "image": {
                     "publisher": "Canonical",
@@ -2390,63 +2403,34 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
             "deadline_utc": "2026-09-09T16:00:00Z",
             "storage_account": "ukhvp1234567890abcd",
             "firewall_obligation": None,
-            "resource_group_id": (
-                "/subscriptions/11111111-2222-3333-4444-555555555555/"
-                "resourceGroups/uk-hvp-123456789abc-rg"
-            ),
-            "host_vm_id": (
-                "/subscriptions/11111111-2222-3333-4444-555555555555/"
-                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
-                "Microsoft.Compute/virtualMachines/"
-                "uk-hvp-123456789abc-host"
-            ),
-            "host_disk_id": (
-                "/subscriptions/11111111-2222-3333-4444-555555555555/"
-                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
-                "Microsoft.Compute/disks/"
-                "uk-hvp-123456789abc-host-os"
-            ),
+            "resource_group_id": group_id,
+            "host_vm_id": host_vm_id,
+            "host_disk_id": host_disk_id,
             "host_nic_id": (
-                "/subscriptions/11111111-2222-3333-4444-555555555555/"
-                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
-                "Microsoft.Network/networkInterfaces/"
-                "uk-hvp-123456789abc-host-nic"
+                group_id + "/providers/Microsoft.Network/networkInterfaces/"
+                + prefix + "-host-nic"
             ),
             "storage_account_id": (
-                "/subscriptions/11111111-2222-3333-4444-555555555555/"
-                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
-                "Microsoft.Storage/storageAccounts/ukhvp1234567890abcd"
+                group_id + "/providers/Microsoft.Storage/storageAccounts/"
+                "ukhvp1234567890abcd"
             ),
             "shutdown_schedule_id": (
-                "/subscriptions/11111111-2222-3333-4444-555555555555/"
-                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
-                "Microsoft.DevTestLab/schedules/"
-                "shutdown-computevm-uk-hvp-123456789abc-host"
+                group_id + "/providers/Microsoft.DevTestLab/schedules/"
+                "shutdown-computevm-" + prefix + "-host"
             ),
             "host_deployment": {
                 "phase": "resources-verified",
                 "operation_id": "22222222-2222-4222-8222-222222222222",
                 "deployment_id": (
-                    "/subscriptions/11111111-2222-3333-4444-555555555555/"
-                    "resourceGroups/uk-hvp-123456789abc-rg/providers/"
-                    "Microsoft.Resources/deployments/uk-hvp-123456789abc-host"
+                    group_id + "/providers/Microsoft.Resources/deployments/"
+                    + prefix + "-host"
                 ),
                 "correlation_id": (
                     "33333333-3333-4333-8333-333333333333"
                 ),
-                "vm_id": (
-                    "/subscriptions/11111111-2222-3333-4444-555555555555/"
-                    "resourceGroups/uk-hvp-123456789abc-rg/providers/"
-                    "Microsoft.Compute/virtualMachines/"
-                    "uk-hvp-123456789abc-host"
-                ),
+                "vm_id": host_vm_id,
                 "vm_uuid": "44444444-4444-4444-8444-444444444444",
-                "disk_id": (
-                    "/subscriptions/11111111-2222-3333-4444-555555555555/"
-                    "resourceGroups/uk-hvp-123456789abc-rg/providers/"
-                    "Microsoft.Compute/disks/"
-                    "uk-hvp-123456789abc-host-os"
-                ),
+                "disk_id": host_disk_id,
                 "disk_uuid": "55555555-5555-4555-8555-555555555555",
                 "shutdown_time": "1600",
             },
