@@ -133,9 +133,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "6719fca71190d1b7f8f68b50aabc1187c87a6c5811d8efc27836a00741e3a89d"
+            "bf805fcd99724811fd0f4c1269ef1efddc8bc2b5412542747c5070e8e0f6b8a6"
         ),
-        "size": 1174519,
+        "size": 1179571,
         "files": 177,
     },
 }
@@ -201,7 +201,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "205df26de46ffaaf27cfd396907a623831410869bf41518b6e6771f95861e40f"
+        "fd59a9880077c16a9e38af777950d46471e1e50332a5644ddaec6ec1ece38bf8"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -258,7 +258,7 @@ GUARDED_PRODUCER_FILES = {
         "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
     ),
     "support/build/native-image-data.zig": (
-        "9ac7e0c53a5017ba1cd82152cde1fd3fcd80ae419e5478f9e50752b2a1dd97dc"
+        "159b836c9ae05acf0889bdf37bc385dd3171fa9df6d6be01746376811c5b514c"
     ),
     "support/build/native-library-link.zig": (
         "562a0b713e67e6e3de6897077f6bd18cc0ee135b8522bfaecd6d8c11a61423fe"
@@ -339,13 +339,16 @@ GUARDED_PRODUCER_FILES = {
         "7622b3998629db41f2e1c8f8538872cf3efc64fff16e5832d0fb053ba2437a57"
     ),
     "drivers/hyperv/vmbus/exportsyms.uk": (
-        "0e2c628030c199ab0e61f691a86a8f0f6282f16871bea816374a2e6941997b3a"
+        "340c49783a88696b2027f815ac0db70bc2b0ae34a331aac8bac0f6a0314a1918"
     ),
     "drivers/hyperv/vmbus/include/uk/vmbus.h": (
-        "e11c351dcb6bf4596285193bf728f1f30a2152da25e075539e4143edafc6d763"
+        "13bc5450a7a8eb9c360e240c35907e1b5d82f683e36c2ee4e9a19f90f4d76bcb"
     ),
     "drivers/hyperv/vmbus/vmbus_bus.c": (
-        "70f4157ce22475e88b037b9f599e4910719a3cfdde0e70cbf32f0f9004b0b185"
+        "6428a549e5b41155103e6d66ea31b4baf4a90d2657114edc9e7b60dd4746f28e"
+    ),
+    "drivers/hyperv/vmbus/vmbus_channel.c": (
+        "088cc06d1db460cb52525aeee56d980a2074be5c0c0d8cdfa15eef72b656cc1c"
     ),
     "drivers/hyperv/vmbus/vmbus_protocol.h": (
         "c00e58790f9d8ece3518fdda9b82b02b843eccb3c2cc90002344192b554e44a9"
@@ -372,7 +375,7 @@ GUARDED_PRODUCER_FILES = {
         "3b97fcf27fa0a76b93e565b770bb2b1d8b0d7496267387039b6c88d0e1a1cce1"
     ),
     "support/build/native-image-graph.zig": (
-        "38e5b979da8b914aefb4225dae687866af0642d8e49912205c9c5b8f706139ee"
+        "2ab2de7473bca0a886e35559edbe81d7fe71e24ac92f86721068a7b86a2f9e72"
     ),
     "support/build/native-postprocess-runner.py": (
         "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"
@@ -396,16 +399,22 @@ GUARDED_PRODUCER_FILES = {
         "548e97aadb9b55101e2ec1dbb7a4b22f82b210a22d5f14eb441b17fdd2009aa7"
     ),
     "support/apps/hyperv-acceptance/Makefile.uk": (
-        "7896635d1d9be1149ecac6c7dff1f92bdcf44b2ed80e022b6b517e4df0107ef0"
+        "19f70c5cc056157f329a6b226ead55b74fd3b628eb068b065d2d1e23b6f01bb8"
     ),
     "support/apps/hyperv-acceptance/acceptance_protocol.c": (
-        "fe6b1a641ef70481e6b6f4d7360a7d3a06496c4a261611b3ce996db6fa0dc86a"
+        "5ba77f19e204c9bc3b9b579cf6ccd9e0184952fd9e0d14c123f5a19af05dd64e"
     ),
     "support/apps/hyperv-acceptance/acceptance_protocol.h": (
-        "0298f62c5db8cfec137d39d6a33f9726ca291c7f55150780588a17795cd2b0da"
+        "1b7d718ca10b760b61df07570b640586cce34d1d3c498c68fbd336a61669db4e"
+    ),
+    "support/apps/hyperv-acceptance/application_network.c": (
+        "b55080d196e6015c7a5a84f2ab2dc76856c978cf6a7ec1793186511616c56ffb"
+    ),
+    "support/apps/hyperv-acceptance/application_network.h": (
+        "dba07b1331d6a6f02c3f017c2fabe5a0c1c03f61ffd1df7e07e49c84427d2231"
     ),
     "support/apps/hyperv-acceptance/main.c": (
-        "35cdcb441b8acc2520d56aefab0f4538eda74164e26c005d12d7ffd4f5e2691c"
+        "deaf231ec5edf0746e99e7a657a73fcb813da8bc18116b8ef5b6543213064ddb"
     ),
     "support/apps/hyperv-acceptance/persistence.c": (
         "fff49e4a09ecb6a5e788b817a5f2677d39cadd1f5a7693a2cb2be6721399d9ee"
@@ -415,6 +424,12 @@ GUARDED_PRODUCER_FILES = {
     ),
     "support/apps/hyperv-acceptance/persistence_host.h": (
         "29f1f4f0f272225ae1d2578612a4f8320f1bc8d245e9447ce6696300b80ad23c"
+    ),
+    "support/apps/hyperv-acceptance/storage_target.c": (
+        "f1ea10aca41b49e0a82c9cb8bc855cb7ddf86354abb8331c198127345b018a03"
+    ),
+    "support/apps/hyperv-acceptance/storage_target.h": (
+        "8e357584c2544f25f511b61e486719dea66b526a2e01539e282a67d95530d915"
     ),
 }
 APPROVED_CAPABILITY_REFERENCE = {
