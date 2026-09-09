@@ -213,8 +213,15 @@ gdt64_ptr:
 #define CR4_BOOT32_SETTINGS						\
 	  UK_ARCH_X86_64_CR4_PAE	/* Physical Address Extension */
 
+#ifdef CONFIG_HAVE_PAGING
+/* Runtime page tables encode non-executable mappings with NX PTEs. */
+#define EFER_BOOT32_PAGING	UK_ARCH_X86_64_EFER_NXE
+#else
+#define EFER_BOOT32_PAGING	0
+#endif
+
 #define EFER_BOOT32_SETTINGS						\
-	  UK_ARCH_X86_64_EFER_LME	/* IA-32e Mode */
+	(UK_ARCH_X86_64_EFER_LME | EFER_BOOT32_PAGING)
 
 #define CR0_BOOT32_SETTINGS						\
 	  UK_ARCH_X86_64_CR0_PE	/* Protected mode */			\

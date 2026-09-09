@@ -23,6 +23,9 @@ uk_lcpu_mp_init
 uk_lcpu_sysctx_load
 uk_lcpu_sysctx_store
 uk_lcpu_wakeup
+uk_lcpu_wakeup_one
+uk_lcpu_startup_idle
+uk_lcpu_halt_error
 uk_lcpu_ectx_load
 uk_lcpu_ectx_sanitize
 uk_lcpu_ectx_store

@@ -14,6 +14,15 @@ if LIBUKSCHED
 config LIBUKSCHED_TCB_INIT
 	bool
 
+config LIBUKSCHED_FIXED_SMP
+	bool "Fixed per-LCPU scheduler ownership"
+	default n
+	depends on HAVE_SMP
+	help
+	  Enable immutable per-LCPU scheduler ownership, serialized queue
+	  transitions, and checked remote wake delivery. This does not enable
+	  migration or create secondary-CPU schedulers by itself.
+
 config LIBUKSCHED_DEBUG
 	bool "Enable debug messages"
 

@@ -50,6 +50,189 @@ def terminal_assertion(instructions, index):
     return False
 
 
+def schedcoop_callback_bound(functions, symbols, constructor, callback):
+    """Follow scheduler constructor wrappers to the callback assignment."""
+    pending = [symbols[constructor]]
+    visited = set()
+    while pending:
+        address = pending.pop()
+        if address in visited or address not in functions:
+            continue
+        visited.add(address)
+        _, instructions = functions[address]
+        for _, op, operands in instructions:
+            if f"<{callback}>" in operands:
+                return True
+            if not op.startswith(("call", "j")) or operands.startswith("*"):
+                continue
+            target = re.match(r"(?:0x)?([0-9a-f]+)\s+<", operands)
+            if not target:
+                continue
+            destination = int(target[1], 16)
+            if destination in functions and "schedcoop_create" in functions[destination][0]:
+                pending.append(destination)
+    return False
+
+
+def verify_schedcoop_callbacks(functions, symbols):
+    constructors = tuple(
+        name for name in ("uk_schedcoop_create", "uk_schedcoop_create_on")
+        if name in symbols
+    )
+    if not constructors:
+        raise ValueError("schedcoop constructor binding not found")
+    for constructor in constructors:
+        if not schedcoop_callback_bound(
+            functions, symbols, constructor, "schedcoop_thread_woken_isr"
+        ):
+            raise ValueError(
+                f"{constructor}: schedcoop wake callback binding not found"
+            )
+
+
+def direct_target_address(functions, symbols, caller, callee):
+    if caller not in symbols or callee not in symbols:
+        return None
+    for address, op, operands in functions.get(
+        symbols[caller], ("", ())
+    )[1]:
+        if not op.startswith(("call", "j")) or operands.startswith("*"):
+            continue
+        target = re.match(r"(?:0x)?([0-9a-f]+)\s+<", operands)
+        if target and int(target[1], 16) == symbols[callee]:
+            return address
+    return None
+
+
+def direct_target(functions, symbols, caller, callee):
+    return direct_target_address(
+        functions, symbols, caller, callee
+    ) is not None
+
+
+def verify_ap_paging_controls(functions, symbols):
+    start = symbols.get("lcpu_start32")
+    end = symbols.get("lcpu_start64")
+    instructions = sorted(
+        instruction
+        for _, body in functions.values()
+        for instruction in body
+        if start is not None and end is not None
+        and start <= instruction[0] < end
+    )
+    def immediate(instruction, register):
+        if instruction is None or not instruction[1].startswith("mov"):
+            return None
+        match = re.match(
+            rf"\$(0x[0-9a-f]+),\s*%{register}(?:\s|$)", instruction[2]
+        )
+        return int(match[1], 16) if match else None
+
+    control_writes = {"cr0": [], "cr4": []}
+    msr_writes = []
+    for index, (_, op, operands) in enumerate(instructions):
+        control = re.match(r"%[re]ax,\s*%(cr[04])(?:\s|$)", operands)
+        if op.startswith("mov") and control:
+            previous = instructions[index - 1] if index else None
+            control_writes[control[1]].append(
+                (index, immediate(previous, "eax"))
+            )
+        if op == "wrmsr":
+            msr_writes.append(index)
+
+    efer_ready = False
+    if len(msr_writes) == 1:
+        efer_index = msr_writes[0]
+        setup = instructions[max(0, efer_index - 3):efer_index]
+        if len(setup) == 3:
+            efer = immediate(setup[1], "eax")
+            required_efer = (1 << 8) | (1 << 11)
+            efer_ready = (
+                setup[0][1].startswith("xor")
+                and re.match(r"%edx,\s*%edx(?:\s|$)", setup[0][2]) is not None
+                and immediate(setup[2], "ecx") == 0xC0000080
+                and efer is not None
+                and efer & required_efer == required_efer
+            )
+    if not efer_ready:
+        raise ValueError(
+            "fixed SMP AP startup does not enable EFER.NXE/LME "
+            "before runtime paging"
+        )
+    for register, required, label in (
+        ("cr4", 1 << 5, "CR4.PAE"),
+        ("cr0", (1 << 0) | (1 << 16) | (1 << 31), "CR0.PE/WP/PG"),
+    ):
+        writes = control_writes[register]
+        if (len(writes) != 1 or writes[0][1] is None
+                or writes[0][1] & required != required):
+            raise ValueError(f"fixed SMP AP startup does not enable {label}")
+    paging_index = control_writes["cr0"][0][0]
+    if (msr_writes[0] >= paging_index
+            or control_writes["cr4"][0][0] >= paging_index
+            or any(
+                op.startswith(("j", "ljmp", "call", "loop", "ret"))
+                for _, op, _ in instructions[:paging_index]
+            )):
+        raise ValueError(
+            "fixed SMP AP startup has unreviewed paging-control flow"
+        )
+
+
+def verify_fixed_smp_bindings(functions, symbols, kinds):
+    if "uk_boot_fixed_smp_prepare" not in symbols:
+        return
+    if kinds.get("ukplat_lcpu_count") != ["T"]:
+        raise ValueError(
+            "fixed SMP CPU count must resolve to one strong platform symbol; "
+            f"got {kinds.get('ukplat_lcpu_count')}"
+        )
+    if not direct_target(
+        functions, symbols, "uk_boot_entry", "ukplat_lcpu_count"
+    ):
+        raise ValueError(
+            "fixed SMP boot does not call the strong platform CPU count"
+        )
+    if not direct_target(
+        functions, symbols, "ukplat_lcpu_count", "uk_acpi_cpu_count"
+    ):
+        raise ValueError(
+            "Hyper-V fixed SMP CPU count does not use ACPI enumeration"
+        )
+    if not direct_target(
+        functions, symbols, "uk_boot_fixed_smp_lcpu_entry", "uk_lcpu_init"
+    ):
+        raise ValueError(
+            "fixed SMP AP entry does not initialize the logical CPU"
+        )
+    paging_symbols = (
+        "uk_paging_pt_get_active", "uk_paging_pt_activate_lcpu",
+    )
+    paging_present = tuple(name in symbols for name in paging_symbols)
+    if any(paging_present) and not all(paging_present):
+        raise ValueError("fixed SMP runtime page table binding is incomplete")
+    if all(paging_present):
+        verify_ap_paging_controls(functions, symbols)
+        entry = "uk_boot_fixed_smp_lcpu_entry"
+        init = direct_target_address(
+            functions, symbols, entry, "uk_lcpu_init"
+        )
+        get_active = direct_target_address(
+            functions, symbols, entry, "uk_paging_pt_get_active"
+        )
+        set_active = direct_target_address(
+            functions, symbols, entry, "uk_paging_pt_activate_lcpu"
+        )
+        if get_active is None or set_active is None:
+            raise ValueError(
+                "fixed SMP AP entry does not activate the runtime page table"
+            )
+        if not init < get_active < set_active:
+            raise ValueError(
+                "fixed SMP AP address-space initialization order is invalid"
+            )
+
+
 def verify(image, nm, objdump):
     symbols = {}
     kinds = {}
@@ -84,6 +267,8 @@ def verify(image, nm, objdump):
                 (int(instruction[1], 16), instruction[2], instruction[3])
             )
 
+    verify_fixed_smp_bindings(functions, symbols, kinds)
+
     pending = [symbols["uk_plat_native_except_irq_handler"]]
     visited = set()
     fatal_logs = 0
@@ -107,9 +292,7 @@ def verify(image, nm, objdump):
                 if caller is None or not op.startswith("call"):
                     raise ValueError(f"{name}: unreviewed indirect IRQ edge: {op} {operands}")
                 if caller == "uk_thread_wake_isr":
-                    constructor = functions[symbols["uk_schedcoop_create"]][1]
-                    if not any("schedcoop_thread_woken_isr>" in args for _, _, args in constructor):
-                        raise ValueError("schedcoop wake callback binding not found")
+                    verify_schedcoop_callbacks(functions, symbols)
                 elif caller == "uk_intctlr_irq_handle":
                     # For SynIC vectors, time.c registers these three callbacks.
                     constructor = functions[symbols["ukplat_time_init"]][1]

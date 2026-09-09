@@ -84,6 +84,9 @@ int __weak ukplat_lcpu_startup_hook(void)
 #if CONFIG_LIBUKBOOT_INITSCHEDCOOP
 #include <uk/schedcoop.h>
 #endif /* CONFIG_LIBUKBOOT_INITSCHEDCOOP */
+#if CONFIG_LIBUKBOOT_FIXED_SMP
+#include <uk/boot/smp.h>
+#endif
 #include <uk/lcpu.h>
 #include <uk/pm.h>
 #include <uk/plat/memory.h>
@@ -359,6 +362,23 @@ void uk_boot_entry(void)
 	/* On most platforms the timer depend on an initialized IRQ subsystem */
 	uk_pr_info("Initialize platform time...\n");
 	ukplat_time_init();
+#if CONFIG_LIBUKBOOT_FIXED_SMP
+	rc = uk_boot_fixed_smp_prepare(a, sa, auxsa, ukplat_lcpu_count());
+	if (unlikely(rc))
+		UK_CRASH("Could not prepare fixed SMP schedulers: %d\n", rc);
+
+	uk_pr_info("Initialize fixed BSP scheduling...\n");
+	s = uk_sched_get_lcpu(0);
+	if (unlikely(!s))
+		UK_CRASH("Failed to initialize BSP scheduling\n");
+	rc = uk_sched_start(s);
+	if (unlikely(rc))
+		UK_CRASH("Failed to start BSP scheduling: %d\n", rc);
+
+	rc = ukplat_lcpu_startup_hook();
+	if (unlikely(rc))
+		UK_CRASH("Could not start scheduled secondary CPUs: %d\n", rc);
+#else
 	rc = ukplat_lcpu_startup_hook();
 	if (unlikely(rc))
 		UK_CRASH("Could not start platform secondary CPUs: %d\n", rc);
@@ -372,6 +392,7 @@ void uk_boot_entry(void)
 		UK_CRASH("Failed to initialize scheduling\n");
 	uk_sched_start(s);
 #endif /* CONFIG_LIBUKBOOT_INITSCHED */
+#endif /* CONFIG_LIBUKBOOT_FIXED_SMP */
 
 	ictx.cmdline.argc = boot_argc;
 	ictx.cmdline.argv = boot_argv;

@@ -41,6 +41,9 @@
 #include <uk/thread.h>
 #include <uk/assert.h>
 #include <uk/arch/types.h>
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+#include <uk/arch/spinlock.h>
+#endif
 #include <uk/essentials.h>
 #include <errno.h>
 
@@ -99,6 +102,12 @@ struct uk_sched {
 
 	/* internal */
 	bool is_started;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	__spinlock lock;
+	unsigned int lcpu_idx;
+	unsigned int state;
+	int kick_error;
+#endif
 	struct uk_thread_list thread_list;
 	struct uk_thread_list exited_threads;
 	struct uk_alloc *a;       /**< default allocator for struct uk_thread */
@@ -111,6 +120,28 @@ struct uk_sched {
 	struct uk_sched_stats stats;
 #endif /* CONFIG_LIBUKSCHED_STATS */
 };
+
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+enum uk_sched_state {
+	UK_SCHED_PREPARED = 0,
+	UK_SCHED_STARTING,
+	UK_SCHED_ONLINE,
+	UK_SCHED_ROLLED_BACK,
+	UK_SCHED_QUARANTINED
+};
+
+#define UK_SCHED_KICK_RETRIES_DEFAULT 4U
+
+int uk_sched_bind_lcpu(struct uk_sched *sched, unsigned int lcpu_idx);
+void uk_sched_unbind_lcpu(struct uk_sched *sched);
+struct uk_sched *uk_sched_get_lcpu(unsigned int lcpu_idx);
+unsigned int uk_sched_lcpu(const struct uk_sched *sched);
+__isr unsigned int uk_sched_state(const struct uk_sched *sched);
+void uk_sched_set_state(struct uk_sched *sched, unsigned int state);
+__isr int uk_sched_kick(struct uk_sched *sched);
+int uk_sched_kick_retry(struct uk_sched *sched, unsigned int attempts);
+int uk_sched_last_kick_error(const struct uk_sched *sched);
+#endif
 
 /* wrapper functions over scheduler callbacks */
 static inline void uk_sched_yield(void)
@@ -177,6 +208,11 @@ static inline const struct uk_thread *uk_sched_idle_thread(struct uk_sched *s,
  * Create a main thread from current context and call thread starter function
  */
 int uk_sched_start(struct uk_sched *sched);
+
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+int uk_sched_start_thread(struct uk_sched *sched,
+			  struct uk_thread *main_thread);
+#endif
 
 /**
  * Allocates a uk_thread and assigns it to a scheduler.

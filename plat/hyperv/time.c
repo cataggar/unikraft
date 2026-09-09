@@ -19,6 +19,9 @@
 #include <uk/plat/time.h>
 #include <uk/plat/common/sections.h>
 #include <uk/print.h>
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+#include <uk/boot/smp.h>
+#endif
 
 #define HYPERV_EVENT_WORDS_PER_SINT	32U
 #define HYPERV_DISPATCH_LIMIT		64U
@@ -63,6 +66,7 @@ static __u32 hyperv_ap_start_generation;
 static __u32 hyperv_ap_expected[CONFIG_UKPLAT_CPU_MAXCOUNT];
 static unsigned int hyperv_ap_requested;
 static unsigned int hyperv_ap_started;
+static unsigned int hyperv_ap_attempted;
 static unsigned int hyperv_ap_waited;
 static unsigned int hyperv_ap_late;
 static int hyperv_current_cpu_index(__u32 *index);
@@ -525,6 +529,7 @@ hyperv_ap_start_begin(const __u64 indices[], unsigned int count,
 		hyperv_ap_expected[indices[i]] = *generation;
 	hyperv_ap_requested = count;
 	hyperv_ap_started = 0;
+	hyperv_ap_attempted = 0;
 	hyperv_ap_waited = 0;
 	hyperv_ap_late = 0;
 	hyperv_ap_start_error = 0;
@@ -571,20 +576,33 @@ out:
 }
 
 static int
-hyperv_ap_start_rollback(const __u64 indices[], unsigned int count,
-			 __u32 generation, int startup_error)
+hyperv_ap_start_rollback(const __u64 indices[], unsigned int started,
+			 unsigned int attempted, __u32 generation,
+			 int startup_error)
 {
 	unsigned long flags;
-	unsigned int settled = count;
-	unsigned int finished = count;
+	unsigned int settled;
+	unsigned int finished;
 	unsigned int i;
 	unsigned int late;
+	int retain;
 	int clean = 1;
 	int rc;
 	int rollback_error = 0;
 
 	if (!startup_error)
 		startup_error = -EIO;
+	if (attempted > hyperv_ap_requested)
+		attempted = hyperv_ap_requested;
+	if (started > attempted)
+		started = attempted;
+	settled = attempted;
+	finished = attempted;
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	retain = attempted != 0;
+#else
+	retain = 0;
+#endif
 	ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
 	if (__atomic_load_n(&hyperv_ap_start_state, __ATOMIC_ACQUIRE) ==
 		    HYPERV_AP_STARTING &&
@@ -597,11 +615,11 @@ hyperv_ap_start_rollback(const __u64 indices[], unsigned int count,
 	}
 	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
 
-	if (count) {
+	if (attempted) {
 		rc = uk_lcpu_wait(indices, &settled,
 				   HYPERV_CPU_STOP_TIMEOUT_NS);
-		if (settled > count) {
-			settled = count;
+		if (settled > attempted) {
+			settled = attempted;
 			if (!rollback_error)
 				rollback_error = -EIO;
 		}
@@ -612,19 +630,19 @@ hyperv_ap_start_rollback(const __u64 indices[], unsigned int count,
 		 */
 		(void)rc;
 
-		rc = hyperv_cpu_fini_indices(indices, count, 0);
+		rc = hyperv_cpu_fini_indices(indices, attempted, 0);
 		if (rc && !rollback_error)
 			rollback_error = rc;
 
 		rc = uk_lcpu_wait(indices, &finished,
 				   HYPERV_CPU_STOP_TIMEOUT_NS);
-		if (rc || finished != count) {
+		if (rc || finished != attempted) {
 			clean = 0;
 			if (!rollback_error)
 				rollback_error = rc ? rc : -ETIMEDOUT;
 		}
 	}
-	for (i = 0; i < count; i++)
+	for (i = 0; i < attempted; i++)
 		if (__atomic_load_n(&hyperv_cpus[indices[i]].state,
 				    __ATOMIC_ACQUIRE) != HYPERV_CPU_OFFLINE) {
 			clean = 0;
@@ -636,31 +654,49 @@ hyperv_ap_start_rollback(const __u64 indices[], unsigned int count,
 	late = hyperv_ap_late;
 	hyperv_ap_start_error = clean ?
 		startup_error : (rollback_error ? rollback_error : -EBUSY);
-	if (clean)
+	if (clean && !retain)
 		memset(hyperv_ap_expected, 0, sizeof(hyperv_ap_expected));
 	__atomic_store_n(&hyperv_ap_start_state,
-			 clean ? HYPERV_AP_FAILED : HYPERV_AP_QUARANTINED,
+			 clean && !retain ?
+				HYPERV_AP_FAILED : HYPERV_AP_QUARANTINED,
 			 __ATOMIC_RELEASE);
 	rc = hyperv_ap_start_error;
 	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
 
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	uk_boot_fixed_smp_rollback(indices, hyperv_ap_requested, attempted);
+#endif
 	uk_pr_warn("Hyper-V: AP startup failed after %u/%u start(s), "
-		   "%u initially settled, %u late; rollback %s (%d)\n",
-		   count, hyperv_ap_requested, hyperv_ap_waited, late,
-		   clean ? "complete" : "quarantined", rc);
+		   "%u attempt(s), %u initially settled, %u late; "
+		   "platform rollback %s, execution resources %s (%d)\n",
+		   started, hyperv_ap_requested, attempted,
+		   hyperv_ap_waited, late,
+		   clean ? "complete" : "ambiguous",
+		   retain ? "quarantined" : "released", rc);
 	return rc;
 }
 #endif
 
 int ukplat_lcpu_init_hook(void)
 {
+	int is_bsp = uk_lcpu_current_is_bsp();
 	int rc;
 
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	if (!is_bsp)
+		uk_pr_info("Hyper-V: AP LCPU %lu platform init entered\n",
+			   uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx));
+#endif
 	if (__atomic_load_n(&hyperv_time_initialized, __ATOMIC_ACQUIRE) !=
 	    HYPERV_TIME_RUNNING)
-		rc = uk_lcpu_current_is_bsp() ? 0 : -EAGAIN;
+		rc = is_bsp ? 0 : -EAGAIN;
 	else
 		rc = hyperv_cpu_init_current(0);
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	if (!is_bsp)
+		uk_pr_info("Hyper-V: AP LCPU %lu platform init returned %d\n",
+			   uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx), rc);
+#endif
 	return rc;
 }
 
@@ -669,9 +705,13 @@ int ukplat_lcpu_startup_hook(void)
 #if CONFIG_HAVE_SMP
 	__u64 indices[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
 	__uptr stacks[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	__uptr entries[CONFIG_UKPLAT_CPU_MAXCOUNT - 1];
+#endif
 	unsigned int count = uk_acpi_cpu_count();
 	unsigned int requested;
 	unsigned int started;
+	unsigned int attempted;
 	unsigned int waited;
 	unsigned int i;
 	__u32 generation;
@@ -684,22 +724,47 @@ int ukplat_lcpu_startup_hook(void)
 	for (i = 1; i < count; i++) {
 		indices[i - 1] = i;
 		stacks[i - 1] = (__uptr)&hyperv_ap_stacks[i - 1][__STACK_SIZE];
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+		entries[i - 1] = (__uptr)uk_boot_fixed_smp_lcpu_entry;
+#endif
 	}
 	requested = count - 1;
 	rc = hyperv_ap_start_begin(indices, requested, &generation);
-	if (rc)
+	if (rc) {
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+		if (rc < 0)
+			uk_boot_fixed_smp_rollback(indices, requested, 0);
+#endif
 		return rc > 0 ? 0 : rc;
+	}
 
 	started = requested;
-	rc = uk_lcpu_start(indices, &started, stacks, NULL, 0);
+	rc = uk_lcpu_start(indices, &started, stacks,
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+			    entries,
+#else
+			    NULL,
+#endif
+			    0);
 	if (started > requested) {
 		started = requested;
 		rc = -EIO;
 	}
+	attempted = started;
+	if (rc && attempted < requested) {
+#if CONFIG_HAVE_CPU_MULTI_PHASE_STARTUP
+		/* post_start errors do not identify which issued starts ran. */
+		attempted = requested;
+#else
+		/* The failed single-phase start itself may still arrive late. */
+		attempted++;
+#endif
+	}
 	__atomic_store_n(&hyperv_ap_started, started, __ATOMIC_RELEASE);
+	__atomic_store_n(&hyperv_ap_attempted, attempted, __ATOMIC_RELEASE);
 	if (rc || started != requested)
-		return hyperv_ap_start_rollback(indices, started, generation,
-						rc ? rc : -EIO);
+		return hyperv_ap_start_rollback(indices, started, attempted,
+						generation, rc ? rc : -EIO);
 
 	waited = started;
 	rc = uk_lcpu_wait(indices, &waited, HYPERV_CPU_STOP_TIMEOUT_NS);
@@ -709,16 +774,30 @@ int ukplat_lcpu_startup_hook(void)
 	}
 	__atomic_store_n(&hyperv_ap_waited, waited, __ATOMIC_RELEASE);
 	if (rc || waited != started)
-		return hyperv_ap_start_rollback(indices, started, generation,
+		return hyperv_ap_start_rollback(indices, started, attempted,
+						generation,
 						rc ? rc : -ETIMEDOUT);
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	rc = uk_boot_fixed_smp_wait_online(indices, started);
+	if (rc)
+		return hyperv_ap_start_rollback(indices, started, attempted,
+						generation, rc);
+#endif
 	rc = hyperv_ap_start_complete(indices, started, generation);
 	if (rc)
-		return hyperv_ap_start_rollback(indices, started, generation,
-						rc);
+		return hyperv_ap_start_rollback(indices, started, attempted,
+						generation, rc);
 	uk_pr_info("Hyper-V: started %u secondary CPU(s)\n", started);
 #endif
 	return 0;
 }
+
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+unsigned int ukplat_lcpu_count(void)
+{
+	return uk_acpi_cpu_count();
+}
+#endif
 
 void ukplat_lcpu_fini_hook(void)
 {
@@ -752,6 +831,7 @@ void ukplat_time_init(void)
 	hyperv_ap_start_generation = 0;
 	hyperv_ap_requested = 0;
 	hyperv_ap_started = 0;
+	hyperv_ap_attempted = 0;
 	hyperv_ap_waited = 0;
 	hyperv_ap_late = 0;
 	hyperv_shutdown_first_error = 0;
@@ -1048,6 +1128,11 @@ unsigned int hyperv_time_host_ap_requested(void)
 unsigned int hyperv_time_host_ap_started(void)
 {
 	return __atomic_load_n(&hyperv_ap_started, __ATOMIC_ACQUIRE);
+}
+
+unsigned int hyperv_time_host_ap_attempted(void)
+{
+	return __atomic_load_n(&hyperv_ap_attempted, __ATOMIC_ACQUIRE);
 }
 
 unsigned int hyperv_time_host_ap_waited(void)

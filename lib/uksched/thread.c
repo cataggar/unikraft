@@ -44,6 +44,10 @@
 #include <uk/assert.h>
 #include <uk/arch/tls.h>
 #include <uk/plat/memory.h>
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+#include <uk/pcpuvar.h>
+#include <uk/plat/spinlock.h>
+#endif
 
 #if CONFIG_LIBUKSCHED_TCB_INIT && !CONFIG_UKARCH_TLS_HAVE_TCB
 #error CONFIG_LIBUKSCHED_TCB_INIT requires that a TLS contains reserved space for a TCB
@@ -1041,15 +1045,33 @@ void uk_thread_block_until(struct uk_thread *thread, __snsec until)
 	unsigned long flags;
 
 	UK_ASSERT(thread);
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	if (thread->sched)
+		UK_ASSERT(thread == uk_thread_current());
+#endif
 
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	if (thread->sched)
+		ukplat_spin_lock_irqsave(&thread->sched->lock, flags);
+	else
+		flags = uk_lcpu_save_irqf();
+#else
 	flags = uk_lcpu_save_irqf();
+#endif
 	thread->wakeup_time = until;
 	if (uk_thread_is_runnable(thread)) {
 		uk_thread_set_blocked(thread);
 		if (thread->sched)
 			uk_sched_thread_blocked(thread);
 	}
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	if (thread->sched)
+		ukplat_spin_unlock_irqrestore(&thread->sched->lock, flags);
+	else
+		uk_lcpu_restore_irqf(flags);
+#else
 	uk_lcpu_restore_irqf(flags);
+#endif
 }
 
 void uk_thread_block_timeout(struct uk_thread *thread, __nsec nsec)
@@ -1066,18 +1088,4 @@ void uk_thread_block(struct uk_thread *thread)
 	UK_ASSERT(thread);
 
 	uk_thread_block_until(thread, (__nsec) 0);
-}
-
-void uk_thread_wake(struct uk_thread *thread)
-{
-	unsigned long flags;
-
-	flags = uk_lcpu_save_irqf();
-	if (!uk_thread_is_runnable(thread)) {
-		uk_thread_set_runnable(thread);
-		if (thread->sched)
-			uk_sched_thread_woken(thread);
-	}
-	thread->wakeup_time = 0LL;
-	uk_lcpu_restore_irqf(flags);
 }
