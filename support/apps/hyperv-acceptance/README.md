@@ -297,6 +297,28 @@ Persistence and application-network workloads are mutually exclusive Kconfig
 choices. The default selection remains the non-destructive storage/network
 smoke probe.
 
+For policy 2 only, a boot that remains storage-pristine through the existing
+bounded bind wait is classified as platform-only unavailable. The driver must
+produce two coherent empty inventory snapshots at
+`UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION`, and must still report that no
+storage offer, session, or I/O activity has ever occurred during the boot.
+The offer observation is sticky at VMBus ingress, so device-pool exhaustion
+before StorVSC admission cannot be misclassified as an empty platform.
+The exact output is:
+
+```text
+HYPERV_PERSISTENCE SELECT UNAVAILABLE reason=no-devices writes=0 flushes=0
+UK_HYPERV_PLATFORM_READY
+UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices
+```
+
+It returns 2 and emits no selection failure, final success, identity,
+Boot 1/Boot 2, write, or completion marker. This is not storage acceptance.
+Policy 1, any nonempty or uncertain inventory, and an empty inventory after
+any earlier offer, topology transition, session, or I/O activity remain
+failures. Controllers must match the complete versioned marker; a generic
+failure or unavailable result is not equivalent.
+
 Stable success markers are:
 
 - `UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:<run-id>`

@@ -43,6 +43,12 @@ struct persistence_candidate {
 	uint8_t receipt[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
 };
 
+enum persistence_selection_class {
+	PERSISTENCE_SELECTION_ERROR,
+	PERSISTENCE_SELECTION_FOUND,
+	PERSISTENCE_SELECTION_PRISTINE_EMPTY,
+};
+
 static _Alignas(4096) uint8_t persistence_buffer[
 	HYPERV_ACCEPTANCE_PERSISTENCE_EXTENT_SECTORS *
 	HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
@@ -371,7 +377,8 @@ static int persistence_end_session(struct uk_storvsc_session *session,
 
 static int persistence_select(
 	const struct hyperv_acceptance_persistence_expected *expected,
-	struct persistence_candidate *selected)
+	struct persistence_candidate *selected,
+	enum persistence_selection_class *selection)
 {
 	struct uk_storvsc_inventory_snapshot inventory;
 	struct uk_storvsc_inventory_snapshot final_inventory;
@@ -384,6 +391,7 @@ static int persistence_select(
 	int rc;
 
 	memset(selected, 0, sizeof(*selected));
+	*selection = PERSISTENCE_SELECTION_ERROR;
 	rc = uk_storvsc_inventory_get(&inventory);
 	if (rc)
 		return rc;
@@ -502,6 +510,14 @@ static int persistence_select(
 		rc = -EPERM;
 		goto fail;
 	}
+	if (!matches &&
+	    expected->identity_policy ==
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2 &&
+	    uk_storvsc_inventory_pristine_empty(
+		    &inventory, &final_inventory)) {
+		*selection = PERSISTENCE_SELECTION_PRISTINE_EMPTY;
+		return 0;
+	}
 	if (matches != 1) {
 		rc = -ENOENT;
 		goto fail;
@@ -521,8 +537,10 @@ static int persistence_select(
 			rc = uk_storvsc_session_authorize_write(
 				&selected->session);
 	}
-	if (!rc)
+	if (!rc) {
+		*selection = PERSISTENCE_SELECTION_FOUND;
 		return 0;
+	}
 fail:
 	{
 		int end_rc = persistence_end_session(
@@ -762,7 +780,10 @@ static int persistence_boot2(
 int hyperv_acceptance_persistence_main(void)
 {
 	struct hyperv_acceptance_persistence_expected expected;
+	enum persistence_selection_class selection =
+		PERSISTENCE_SELECTION_ERROR;
 	uint64_t deadline;
+	int unavailable_disqualified = 0;
 	int rc;
 
 	if (persistence_request_abandoned) {
@@ -784,13 +805,35 @@ int hyperv_acceptance_persistence_main(void)
 		while (!uk_storvsc_mapping_count() &&
 		       ukplat_monotonic_clock() < deadline)
 			uk_sched_thread_sleep(PERSISTENCE_POLL_NS);
-		rc = persistence_select(&expected, &persistence_selected);
+		rc = persistence_select(
+			&expected, &persistence_selected, &selection);
+		if (selection == PERSISTENCE_SELECTION_PRISTINE_EMPTY) {
+			if (unavailable_disqualified) {
+				selection = PERSISTENCE_SELECTION_ERROR;
+				rc = -EPERM;
+			}
+			break;
+		}
+		if (selection == PERSISTENCE_SELECTION_FOUND)
+			break;
+		unavailable_disqualified = 1;
 		if (rc != -ESTALE && rc != -EAGAIN && rc != -ENOENT)
 			break;
 		if (ukplat_monotonic_clock() < deadline)
 			uk_sched_thread_sleep(PERSISTENCE_POLL_NS);
 	} while (ukplat_monotonic_clock() < deadline);
-	if (rc) {
+	if (selection == PERSISTENCE_SELECTION_PRISTINE_EMPTY) {
+		puts("HYPERV_PERSISTENCE SELECT UNAVAILABLE "
+		     "reason=no-devices writes=0 flushes=0");
+		puts("UK_HYPERV_PLATFORM_READY");
+		printf("UK_HYPERV_PERSISTENCE_UNAVAILABLE:%u:%u:%s\n",
+		       HYPERV_ACCEPTANCE_PERSISTENCE_UNAVAILABLE_PROTOCOL,
+		       expected.identity_policy,
+		       HYPERV_ACCEPTANCE_PERSISTENCE_UNAVAILABLE_NO_DEVICES);
+		fflush(stdout);
+		return HYPERV_ACCEPTANCE_UNAVAILABLE;
+	}
+	if (rc || selection != PERSISTENCE_SELECTION_FOUND) {
 		printf("HYPERV_PERSISTENCE SELECT FAIL rc=%d writes=0\n", rc);
 		return HYPERV_ACCEPTANCE_FAIL;
 	}

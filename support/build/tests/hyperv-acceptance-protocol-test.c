@@ -555,11 +555,21 @@ static int test_persistence_seed_enrollment_v2(void)
 	return 0;
 }
 
+static int test_persistence_unavailable_contract(void)
+{
+	CHECK(HYPERV_ACCEPTANCE_PERSISTENCE_UNAVAILABLE_PROTOCOL == 1);
+	CHECK(!strcmp(
+		HYPERV_ACCEPTANCE_PERSISTENCE_UNAVAILABLE_NO_DEVICES,
+		"no-devices"));
+	return 0;
+}
+
 int main(void)
 {
 	if (test_dhcp() || test_storage_and_gating() ||
 	    test_buffer_alignment() || test_persistence_protocol() ||
-	    test_persistence_seed_enrollment_v2())
+	    test_persistence_seed_enrollment_v2() ||
+	    test_persistence_unavailable_contract())
 		return 1;
 	puts("hyperv acceptance protocol tests passed");
 	return 0;

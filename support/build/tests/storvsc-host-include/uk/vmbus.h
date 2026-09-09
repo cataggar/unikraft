@@ -79,6 +79,7 @@ int vmbus_device_bind_retry(
 	struct vmbus_device *device,
 	const struct vmbus_device_bind_token *token);
 void vmbus_device_bind_ready(void);
+int vmbus_storage_offer_lifetime_observed(void);
 int vmbus_channel_open(struct vmbus_device *, __u16, __u16,
 		       const void *, size_t);
 int vmbus_channel_close(struct vmbus_channel *);
