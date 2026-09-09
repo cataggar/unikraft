@@ -487,7 +487,7 @@ does not build, reseed, convert, or discover a resource budget. It requires:
 - a completed schema-3 `unikraft.hyperv.private-preflight-receipt` loaded from
   the private preflight's complete state directory, binding the same guest
   VHD, source tree, solved configuration, private build receipt, twelve-tool
-  closure, schema-2 guarded producer pin, all six retained boot logs, immutable
+  closure, schema-4 guarded producer pin, all six retained boot logs, immutable
   host/deployment identities, accounting and completed cleanup.
 
 The controller accepts only whole-MiB 512-byte geometry, capped at 2 TiB; the
@@ -495,6 +495,13 @@ operator chooses the exact approved value. WRITE(16) coverage uses the
 workload's low-LBA command selection and does not require a disk larger than
 2 TiB. Azure billing/allocation tiers do not replace the exact guest-visible
 SCSI capacity and Azure-reported `diskSizeBytes` checks.
+
+The approved first persistence envelope is exactly North Europe,
+`Standard_D2s_v5` with two vCPUs, one `StandardSSD_LRS` boot disk, and one
+4 GiB (`8388608` 512-byte sectors) `StandardSSD_LRS` data disk. It retains the
+fixed one-VM/two-disk topology, no public IP or SSH, one deployment boot and
+one restart only. This expressible contract does not authorize allocation
+before the completed consumer, exact-image, and publication gates have passed.
 
 A build or packaging receipt, local ARM-hosted fixture, receipt file by itself,
 or prepared private-preflight state is not this handoff. The controller imports

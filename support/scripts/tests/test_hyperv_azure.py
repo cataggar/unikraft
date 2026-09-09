@@ -27,6 +27,9 @@ sys.path.insert(0, str(SUPPORT / "scripts"))
 azure = importlib.import_module("hyperv-azure")
 uploader = importlib.import_module("hyperv-azure-upload")
 persistence = importlib.import_module("hyperv_persistence_controller")
+preflight_tests = importlib.import_module(
+    "support.scripts.tests.test_hyperv_private_preflight"
+)
 
 
 def modeled_implicit_disk_output_order(
@@ -3815,6 +3818,8 @@ class HypervPersistenceControllerTest(unittest.TestCase):
     OS_UUID = "22222222-2222-4222-8222-222222222222"
     DATA_UUID = "33333333-3333-4333-8333-333333333333"
     CORRELATION_UUID = "44444444-4444-4444-8444-444444444444"
+    APPROVED_SECTORS = (4 * 1024 ** 3) // persistence.SECTOR_SIZE
+    APPROVED_LUN = 7
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -3842,7 +3847,8 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         self.contract_sha256 = azure.image_sha256(self.contract_path)
 
     def tearDown(self):
-        self.completed_preflight.stop()
+        if self.completed_preflight is not None:
+            self.completed_preflight.stop()
         self.temporary.cleanup()
 
     @staticmethod
@@ -3969,11 +3975,9 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "sectors": sectors,
             "sector_size": 512,
             "solved_config_sha256": provenance["config"]["sha256"],
-            "producer": {
-                "schema": "unikraft.hyperv.guarded-producer-pin",
-                "schema_version": 2,
-                "files": {"build.zig": "d" * 64},
-            },
+            "producer": (
+                persistence.private_preflight.guarded_producer_contract()
+            ),
         }
         boot_outcome = {
             "result": "PASS", "log_sha256": "e" * 64,
@@ -4092,6 +4096,117 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "preflight": preflight,
         }
         return contract, paths
+
+    @contextlib.contextmanager
+    def real_completed_preflight(self):
+        self.completed_preflight.stop()
+        self.completed_preflight = None
+        shutil.rmtree(self.preflight_state)
+        fixture = (
+            preflight_tests.PrivatePreflightCompletedReceiptTest()
+        )
+        private = persistence.private_preflight
+        assets = self.root / "real-private-preflight"
+        assets.mkdir(mode=0o700)
+        config = assets / private.SOLVED_CONFIG
+        config.write_bytes(fixture.guarded_config(
+            run_id=self.RUN_ID,
+            disk_id=self.DISK_ID,
+            sectors=self.APPROVED_SECTORS,
+            lun=self.APPROVED_LUN,
+        ))
+        qemu = assets / "qemu"
+        (qemu / "bin").mkdir(parents=True)
+        (qemu / "share").mkdir()
+        (qemu / "bin" / "qemu-system-x86_64").write_bytes(b"qemu")
+        (qemu / "share" / "firmware.json").write_bytes(b"firmware")
+        guest_vhd = self.paths["guest_vhd"]
+        guest_raw = assets / "private.raw"
+        guest_raw.write_bytes(guest_vhd.read_bytes()[:-512])
+        capability = assets / "capability.raw"
+        capability.write_bytes(b"C" * guest_raw.stat().st_size)
+        files = {}
+        for name, content in (
+            ("code", b"code"), ("vars", b"vars"), ("efi", b"efi"),
+            ("miz", b"miz"),
+        ):
+            files[name] = assets / name
+            files[name].write_bytes(content)
+        files["miz"].chmod(0o700)
+        git_runtime = preflight_tests.create_git_runtime(
+            assets / "git-tools"
+        )
+        implementation = fixture.implementation()
+        provenance = private.build_provenance(
+            SUPPORT.parent, config, git_runtime
+        )
+        guarded = private.guarded_contract_from_solved_config(config)
+        capability_record = {
+            "sha256": azure.image_sha256(capability),
+            "size": capability.stat().st_size,
+        }
+        capability_reference = preflight_tests.capability_reference(
+            capability_record, approved=False
+        )
+        capability_path = assets / private.CAPABILITY_REFERENCE
+        capability_path.write_bytes(azure.canonical_json(
+            capability_reference["receipt"]
+        ))
+        capability_reference.update({
+            "sha256": azure.image_sha256(capability_path),
+            "size": capability_path.stat().st_size,
+        })
+        build = preflight_tests.private_build_receipt(
+            provenance,
+            {
+                "sha256": azure.image_sha256(files["efi"]),
+                "size": files["efi"].stat().st_size,
+            },
+            guarded,
+        )
+        build_path = assets / private.PRIVATE_BUILD_RECEIPT
+        build_path.write_bytes(azure.canonical_json(build["receipt"]))
+        generated = assets / "generated"
+
+        def packaging(_miz, _arguments, _log, **_kwargs):
+            return preflight_tests.packaging_contract(
+                azure.image_sha256(files["efi"]),
+                files["efi"].stat().st_size,
+                guest_vhd.stat().st_size,
+            )
+
+        with (
+            mock.patch.object(
+                private.azure, "VIRTUAL_SIZE", guest_raw.stat().st_size
+            ),
+            mock.patch.object(private, "check_blob_dependency"),
+            mock.patch.object(
+                private, "implementation_contract",
+                return_value=implementation,
+            ),
+            mock.patch.object(
+                private.azure, "miz_command", side_effect=packaging
+            ),
+            mock.patch.object(
+                private, "APPROVED_CAPABILITY_REFERENCE",
+                capability_reference,
+            ),
+        ):
+            digest = private.generate_input(
+                generated, SUPPORT.parent, config, qemu,
+                files["code"], files["vars"], capability,
+                capability_path, files["efi"], build_path,
+                guest_raw, guest_vhd, files["miz"], git_runtime,
+                private.GUARDED_BOOT_POLICY,
+            )
+            private.prepare(
+                generated, self.preflight_state, files["miz"], digest
+            )
+            state, _ = private.load_state(self.preflight_state)
+            fixture.complete_prepared_handoff(
+                self.preflight_state, state
+            )
+            yield private
 
     def prepare(self):
         persistence.prepare_state(
@@ -4833,6 +4948,136 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                 inputs=self.paths,
                 preflight_state_directory=self.preflight_state,
             )
+
+    def test_real_completed_handoff_and_approved_envelope(self):
+        geometry = {
+            "sectors": self.APPROVED_SECTORS,
+            "sector_size": persistence.SECTOR_SIZE,
+            "lun": self.APPROVED_LUN,
+        }
+        guest = {
+            "name": self.paths["guest_vhd"].name,
+            "sha256": azure.image_sha256(self.paths["guest_vhd"]),
+            "size": self.paths["guest_vhd"].stat().st_size,
+        }
+        with self.real_completed_preflight() as private, \
+                mock.patch.object(persistence.azure, "azure_cli") as cloud:
+            receipt, receipt_path = persistence.load_completed_preflight(
+                self.preflight_state, guest,
+                self.RUN_ID, self.DISK_ID, geometry,
+            )
+            self.assertEqual(
+                receipt_path,
+                self.preflight_state
+                / persistence.FILE_NAMES["preflight_receipt"],
+            )
+            self.assertEqual(
+                receipt["guarded"]["producer"],
+                private.guarded_producer_contract(),
+            )
+            approved = copy.deepcopy(self.contract)
+            approved["implementation"] = persistence.implementation_contract()
+            approved["geometry"] = geometry
+            approved["azure"].update({
+                "location": "northeurope",
+                "vm_size": "Standard_D2s_v5",
+                "vm_vcpus": 2,
+                "os_disk_sku": "StandardSSD_LRS",
+                "data_disk_sku": "StandardSSD_LRS",
+            })
+            approved["preflight"] = receipt
+            approved["files"]["guest_vhd"] = guest
+            approved["files"]["data_raw"]["size"] = 4 * 1024 ** 3
+            approved["files"]["data_vhd"]["size"] = 4 * 1024 ** 3 + 512
+            approved["files"]["preflight_receipt"] = {
+                "name": receipt_path.name,
+                "sha256": azure.image_sha256(receipt_path),
+                "size": receipt_path.stat().st_size,
+            }
+            validated = persistence.validate_contract(approved)
+            self.assertEqual(
+                validated["geometry"]["sectors"],
+                self.APPROVED_SECTORS,
+            )
+            self.assertEqual(
+                validated["azure"]["vm_size"], "Standard_D2s_v5"
+            )
+            self.assertEqual(validated["azure"]["vm_vcpus"], 2)
+            self.assertEqual(
+                validated["azure"]["data_disk_sku"],
+                "StandardSSD_LRS",
+            )
+
+            def copied(name):
+                destination = self.root / f"invalid-{name}"
+                shutil.copytree(self.preflight_state, destination)
+                return destination
+
+            def state_mutation(name, update):
+                directory = copied(name)
+                state_path = directory / private.STATE_FILE
+                state = json.loads(state_path.read_text())
+                update(state)
+                private.azure.save_durable_json(state_path, state)
+                return directory
+
+            invalid = {
+                "prepared": state_mutation(
+                    "prepared",
+                    lambda state: state.update(phase="prepared"),
+                ),
+                "active-sas": state_mutation(
+                    "active-sas",
+                    lambda state: state.update(active_sas=True),
+                ),
+                "incomplete-cleanup": state_mutation(
+                    "incomplete-cleanup",
+                    lambda state: state.update(cleanup_required=True),
+                ),
+                "immutable-input": copied("immutable-input"),
+                "serial-log": copied("serial-log"),
+                "stale-receipt": copied("stale-receipt"),
+            }
+            qemu = (
+                invalid["immutable-input"] / "inputs"
+                / private.INPUT_NAMES["qemu"]
+            )
+            qemu.write_bytes(qemu.read_bytes() + b"x")
+            log = (
+                invalid["serial-log"] / "evidence" / "private"
+                / "raw-x2apic.log"
+            )
+            log.write_bytes(log.read_bytes() + b"\nreplayed")
+            stale_path = invalid["stale-receipt"] / "private-receipt.json"
+            stale = json.loads(stale_path.read_text())
+            stale["cleanup"] = "pending"
+            private.save_private_bytes(
+                stale_path, private.azure.canonical_json(stale)
+            )
+            stale_state_path = (
+                invalid["stale-receipt"] / private.STATE_FILE
+            )
+            stale_state = json.loads(stale_state_path.read_text())
+            stale_state["final_receipt_sha256"] = (
+                private.azure.image_sha256(stale_path)
+            )
+            private.azure.save_durable_json(
+                stale_state_path, stale_state
+            )
+            for name, directory in invalid.items():
+                with self.subTest(invalid_handoff=name):
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        persistence.load_completed_preflight(
+                            directory, guest,
+                            self.RUN_ID, self.DISK_ID, geometry,
+                        )
+            mismatched = dict(geometry, lun=geometry["lun"] - 1)
+            with self.assertRaises(ValueError):
+                persistence.load_completed_preflight(
+                    self.preflight_state, guest,
+                    self.RUN_ID, self.DISK_ID, mismatched,
+                )
+            cloud.assert_not_called()
 
     def test_prepared_only_private_state_cannot_create_or_prepare(self):
         with mock.patch.object(

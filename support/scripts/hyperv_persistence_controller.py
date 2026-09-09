@@ -254,20 +254,11 @@ def validate_preflight_receipt(
         "Completed guarded V2 contract",
     )
     producer = exact_fields(
-        guarded["producer"], ("schema", "schema_version", "files"),
+        guarded["producer"],
+        ("schema", "schema_version", "files", "closures"),
         "Completed guarded producer pin",
     )
-    if not isinstance(producer["files"], dict) or not producer["files"]:
-        raise ValueError("Completed guarded producer pin is empty")
-    for name, digest in producer["files"].items():
-        if (
-            not isinstance(name, str)
-            or not name
-            or require_hex(
-                digest, HEX64, "Completed guarded producer file"
-            ) != digest
-        ):
-            raise ValueError("Completed guarded producer pin is invalid")
+    expected_producer = private_preflight.guarded_producer_contract()
     host = exact_fields(
         value["host"],
         (
@@ -363,8 +354,7 @@ def validate_preflight_receipt(
         or guarded["lun"] != geometry["lun"]
         or guarded["sectors"] != geometry["sectors"]
         or guarded["sector_size"] != SECTOR_SIZE
-        or producer["schema"] != "unikraft.hyperv.guarded-producer-pin"
-        or producer["schema_version"] != 2
+        or producer != expected_producer
         or build_receipt["result"] != "PASS"
         or build_receipt["guarded"] != value["guarded"]
         or build_receipt["source_before"] != value["provenance"]
@@ -380,6 +370,10 @@ def validate_preflight_receipt(
             "producer": {
                 **producer,
                 "files": dict(producer["files"]),
+                "closures": {
+                    name: dict(record)
+                    for name, record in producer["closures"].items()
+                },
             },
         },
         "private_build": {

@@ -313,7 +313,12 @@ def private_build_receipt(provenance, efi, guarded=None):
 
 class PrivatePreflightFixture(unittest.TestCase):
     @staticmethod
-    def guarded_config():
+    def guarded_config(
+        run_id="00112233445566778899aabbccddeeff",
+        disk_id="102132435465768798a9bacbdcedfe0f",
+        sectors=1000,
+        lun=0,
+    ):
         return (
             "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y\n"
             "CONFIG_LIBSTORVSC=y\n"
@@ -322,13 +327,13 @@ class PrivatePreflightFixture(unittest.TestCase):
             "CONFIG_LIBSTORVSC_MAX_DEVICES=2\n"
             "CONFIG_LIBSTORVSC_MAX_LUNS=8\n"
             "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID="
-            '"00112233445566778899aabbccddeeff"\n'
+            f'"{run_id}"\n'
             "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID="
-            '"102132435465768798a9bacbdcedfe0f"\n'
-            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=1000\n"
+            f'"{disk_id}"\n'
+            f"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS={sectors}\n"
             "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512\n"
             "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2\n"
-            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0\n"
+            f"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN={lun}\n"
         ).encode()
 
     @staticmethod
@@ -2301,6 +2306,22 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
 
 class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
     @staticmethod
+    def guarded_records(guarded):
+        return [
+            (
+                "HYPERV_PERSISTENCE START PASS "
+                f"run={guarded['run_id']} "
+                f"address={guarded['path']}:{guarded['target']}:"
+                f"{guarded['lun']} sectors={guarded['sectors']} "
+                f"sector_size={guarded['sector_size']}"
+            ),
+            "HYPERV_PERSISTENCE SELECT UNAVAILABLE reason=no-devices "
+            "writes=0 flushes=0",
+            runner.PLATFORM_MARKER,
+            "UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices",
+        ]
+
+    @staticmethod
     def host_receipt(state, phase, manifest, logs):
         formats = ("capability",) if phase == "capability" else ("raw", "vhd")
         return {
@@ -2343,6 +2364,9 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
     def completed_handoff(self, root):
         root.mkdir(mode=0o700)
         state = self.state(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        return self.complete_prepared_handoff(root, state)
+
+    def complete_prepared_handoff(self, root, state):
         state.update({
             "phase": "complete",
             "subscription": "11111111-2222-3333-4444-555555555555",
@@ -2461,6 +2485,9 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
         private_logs = {
             f"{image_format}-{mode}.log": (
                 PrivatePreflightRunnerTest.guarded_boot_log(
+                    records=self.guarded_records(
+                        state["input_manifest"]["guarded"]
+                    ),
                     legacy=mode == "legacy-apic"
                 ).encode()
             )
