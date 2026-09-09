@@ -240,6 +240,14 @@ static int receive_gate_before_entered;
 static int receive_gate_release_drain;
 static int receive_gate_notify_entered;
 static int receive_gate_release_notify;
+static int removal_coherence_enabled;
+static int removal_coherence_caller_registered;
+static pthread_t removal_coherence_caller;
+static int removal_coherence_caller_entered;
+static int removal_coherence_release_caller;
+static int removal_coherence_close_entered;
+static int removal_coherence_release_close;
+static int removal_coherence_wait_entered;
 static unsigned int report_luns_commands;
 static unsigned int vpd_commands;
 static int invalid_scsi_address;
@@ -495,6 +503,15 @@ void storvsc_host_receive_hook(unsigned int controller, int before_notify)
 void storvsc_host_deferred_epoch_sample_hook(uint64_t epoch)
 {
 	pthread_mutex_lock(&race_lock);
+	if (removal_coherence_enabled &&
+	    removal_coherence_caller_registered &&
+	    pthread_equal(pthread_self(), removal_coherence_caller)) {
+		removal_coherence_caller_entered = 1;
+		pthread_cond_broadcast(&race_condition);
+		while (removal_coherence_enabled &&
+		       !removal_coherence_release_caller)
+			pthread_cond_wait(&race_condition, &race_lock);
+	}
 	if (!epoch_sample_enabled) {
 		pthread_mutex_unlock(&race_lock);
 		return;
@@ -1130,6 +1147,15 @@ int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
 
 int vmbus_channel_close(struct vmbus_channel *channel)
 {
+	pthread_mutex_lock(&race_lock);
+	if (removal_coherence_enabled && current_thread != &main_thread) {
+		removal_coherence_close_entered = 1;
+		pthread_cond_broadcast(&race_condition);
+		while (removal_coherence_enabled &&
+		       !removal_coherence_release_close)
+			pthread_cond_wait(&race_condition, &race_lock);
+	}
+	pthread_mutex_unlock(&race_lock);
 	atomic_fetch_add(&close_attempts, 1);
 	if (atomic_load(&close_failures_remaining) > 0) {
 		pthread_mutex_lock(&race_lock);
@@ -1921,6 +1947,17 @@ static int wait_atomic_value(atomic_int *value, int expected,
 {
 	for (unsigned int i = 0; i < limit_ms; i++) {
 		if (atomic_load(value) == expected)
+			return 0;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
+static int wait_atomic_at_least(atomic_int *value, int expected,
+				unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		if (atomic_load(value) >= expected)
 			return 0;
 		uk_sched_thread_sleep(1000000ULL);
 	}
@@ -4304,14 +4341,144 @@ static int persistence_prepare_seed(unsigned int identity_policy,
 	return 0;
 }
 
-static void persistence_remove_device(struct vmbus_driver *driver,
-				      struct vmbus_device *device)
+static int persistence_remove_device(struct vmbus_driver *driver,
+				     struct vmbus_device *device)
 {
+	unsigned int channel_id;
+	int ready_before;
+	int wait_for_ready;
+	int rc;
+
 	if (!device->present && !device->channel)
-		return;
+		return 0;
+	channel_id = device->channel_id;
+	wait_for_ready = device->channel != NULL;
+	ready_before = atomic_load(&bind_ready_calls);
 	remove_test_offer(driver, device);
 	if (device->channel)
 		(void)vmbus_channel_close(device->channel);
+	if (!wait_for_ready)
+		return 0;
+	/* Deferred removal publishes bind readiness after clearing device state. */
+	pthread_mutex_lock(&race_lock);
+	if (removal_coherence_enabled) {
+		removal_coherence_wait_entered = 1;
+		pthread_cond_broadcast(&race_condition);
+	}
+	pthread_mutex_unlock(&race_lock);
+	rc = wait_atomic_at_least(
+		&bind_ready_calls, ready_before + 1,
+		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	if (rc)
+		fprintf(stderr,
+			"persistence removal wait failed: "
+			"stage=bind-ready rc=%d channel=%u ready=%d/%d "
+			"mappings=%u\n",
+			rc, channel_id, atomic_load(&bind_ready_calls),
+			ready_before + 1, uk_storvsc_mapping_count());
+	return rc;
+}
+
+struct persistence_remove_context {
+	struct vmbus_driver *driver;
+	struct vmbus_device *device;
+	atomic_int done;
+	int result;
+};
+
+static void *persistence_remove_thread(void *argument)
+{
+	struct persistence_remove_context *context = argument;
+
+	pthread_mutex_lock(&race_lock);
+	removal_coherence_caller = pthread_self();
+	removal_coherence_caller_registered = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	context->result =
+		persistence_remove_device(context->driver, context->device);
+	atomic_store(&context->done, 1);
+	return NULL;
+}
+
+static int persistence_remove_with_worker_ownership(
+	struct vmbus_driver *driver, struct vmbus_device *device)
+{
+	struct persistence_remove_context context = {
+		.driver = driver,
+		.device = device,
+	};
+	pthread_t thread;
+	int created = 0;
+	int error = 0;
+
+	atomic_init(&context.done, 0);
+	pthread_mutex_lock(&race_lock);
+	removal_coherence_enabled = 1;
+	removal_coherence_caller_registered = 0;
+	removal_coherence_caller_entered = 0;
+	removal_coherence_release_caller = 0;
+	removal_coherence_close_entered = 0;
+	removal_coherence_release_close = 0;
+	removal_coherence_wait_entered = 0;
+	pthread_mutex_unlock(&race_lock);
+	if (pthread_create(&thread, NULL, persistence_remove_thread, &context)) {
+		error = -EIO;
+		goto out;
+	}
+	created = 1;
+	if (wait_race_flag(&removal_coherence_caller_entered) ||
+	    wait_race_flag(&removal_coherence_close_entered)) {
+		error = -ETIMEDOUT;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	removal_coherence_release_caller = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	for (unsigned int i = 0; i < 1000; i++) {
+		int waiting;
+
+		pthread_mutex_lock(&race_lock);
+		waiting = removal_coherence_wait_entered;
+		pthread_mutex_unlock(&race_lock);
+		if (waiting || atomic_load(&context.done))
+			break;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	pthread_mutex_lock(&race_lock);
+	if (!removal_coherence_wait_entered)
+		error = atomic_load(&context.done) ?
+			-EALREADY : -ETIMEDOUT;
+	else if (atomic_load(&context.done))
+		error = -EALREADY;
+	pthread_mutex_unlock(&race_lock);
+out:
+	pthread_mutex_lock(&race_lock);
+	removal_coherence_enabled = 0;
+	removal_coherence_release_caller = 1;
+	removal_coherence_release_close = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	if (created)
+		pthread_join(thread, NULL);
+	pthread_mutex_lock(&race_lock);
+	removal_coherence_caller_registered = 0;
+	removal_coherence_caller_entered = 0;
+	removal_coherence_close_entered = 0;
+	removal_coherence_wait_entered = 0;
+	pthread_mutex_unlock(&race_lock);
+	if (!error && context.result)
+		error = context.result;
+	if (error)
+		fprintf(stderr,
+			"persistence removal coherence failed: rc=%d "
+			"done=%d ready=%d online1=%d mappings=%u\n",
+			error, atomic_load(&context.done),
+			atomic_load(&bind_ready_calls),
+			storvsc_host_controller_online(1),
+			uk_storvsc_mapping_count());
+	return error;
 }
 
 enum unresolved_discovery_case {
@@ -4377,15 +4544,15 @@ static int run_unresolved_discovery_case(
 		     rc != -EPROTO : rc) ||
 	    uk_storvsc_mapping_count() !=
 		    (failure == UNRESOLVED_DISCOVERY_ALL_VPD ? 3U : 5U)) {
-		persistence_remove_device(driver, secondary);
-		persistence_remove_device(driver, primary);
+		(void)persistence_remove_device(driver, secondary);
+		(void)persistence_remove_device(driver, primary);
 		return 652;
 	}
 	if (inventory_rc == -EAGAIN &&
 	    failure != UNRESOLVED_DISCOVERY_ALL_VPD &&
 	    storvsc_host_reset_controller(1)) {
-		persistence_remove_device(driver, secondary);
-		persistence_remove_device(driver, primary);
+		(void)persistence_remove_device(driver, secondary);
+		(void)persistence_remove_device(driver, primary);
 		return 653;
 	}
 	if (inventory_rc == -EAGAIN)
@@ -4398,20 +4565,35 @@ static int run_unresolved_discovery_case(
 		    write10_command_count != writes10 ||
 		    write16_command_count != writes16 ||
 		    flush_command_count != flushes) {
-			persistence_remove_device(driver, secondary);
-			persistence_remove_device(driver, primary);
+			(void)persistence_remove_device(driver, secondary);
+			(void)persistence_remove_device(driver, primary);
 			return 655;
 		}
 	}
 	if (inventory_rc != -EAGAIN) {
-		persistence_remove_device(driver, secondary);
-		persistence_remove_device(driver, primary);
+		(void)persistence_remove_device(driver, secondary);
+		(void)persistence_remove_device(driver, primary);
 		return 654;
 	}
-	persistence_remove_device(driver, secondary);
-	if (uk_storvsc_inventory_get(&inventory) ||
-	    inventory.count != 3) {
-		persistence_remove_device(driver, primary);
+	if (failure == UNRESOLVED_DISCOVERY_VPD)
+		rc = persistence_remove_with_worker_ownership(
+			driver, secondary);
+	else
+		rc = persistence_remove_device(driver, secondary);
+	if (rc) {
+		(void)persistence_remove_device(driver, primary);
+		return 656;
+	}
+	inventory_rc = uk_storvsc_inventory_get(&inventory);
+	if (inventory_rc || inventory.count != 3) {
+		fprintf(stderr,
+			"unresolved discovery removal failed: "
+			"case=%d rc=%d count=%u generation=%" PRIu64
+			" mappings=%u\n",
+			failure, inventory_rc, inventory.count,
+			inventory.topology_generation,
+			uk_storvsc_mapping_count());
+		(void)persistence_remove_device(driver, primary);
 		return 656;
 	}
 	if (failure == UNRESOLVED_DISCOVERY_VPD) {
@@ -4424,13 +4606,17 @@ static int run_unresolved_discovery_case(
 		    write10_command_count != writes10 ||
 		    write16_command_count != writes16 ||
 		    flush_command_count != flushes) {
-			persistence_remove_device(driver, secondary);
-			persistence_remove_device(driver, primary);
+			(void)persistence_remove_device(driver, secondary);
+			(void)persistence_remove_device(driver, primary);
 			return 657;
 		}
-		persistence_remove_device(driver, secondary);
+		if (persistence_remove_device(driver, secondary)) {
+			(void)persistence_remove_device(driver, primary);
+			return 658;
+		}
 	}
-	persistence_remove_device(driver, primary);
+	if (persistence_remove_device(driver, primary))
+		return 659;
 	return 0;
 }
 
@@ -4886,7 +5072,8 @@ static int persistence_expect_no_write_failure(
 		return rc;
 	rc = capture_persistence_output(
 		output, sizeof(output), &result);
-	persistence_remove_device(driver, device);
+	if (persistence_remove_device(driver, device))
+		return -ETIMEDOUT;
 	if (rc || result != HYPERV_ACCEPTANCE_FAIL ||
 	    persistence_log_has_unavailable(output) ||
 	    write10_command_count != writes10 ||
@@ -5030,7 +5217,8 @@ static int run_persistence_workflow_regression(
 	memcpy(backing_media +
 		       HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512,
 	       saved_receipt_sector, sizeof(saved_receipt_sector));
-	persistence_remove_device(driver, primary);
+	if (persistence_remove_device(driver, primary))
+		return 644;
 
 	if (identity_policy ==
 	    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2) {
@@ -5115,8 +5303,9 @@ static int run_persistence_workflow_regression(
 	rc = run_binding_publication_regression(driver, &secondary);
 	if (rc)
 		return rc;
-	persistence_remove_device(driver, &secondary);
-	persistence_remove_device(driver, primary);
+	rc = persistence_remove_device(driver, &secondary);
+	if (persistence_remove_device(driver, primary) || rc)
+		return 645;
 
 	hyperv_acceptance_persistence_host_reset();
 	if (persistence_prepare_seed(
@@ -5140,8 +5329,9 @@ static int run_persistence_workflow_regression(
 	    write16_command_count != writes16 ||
 	    flush_command_count != flushes)
 		return 607;
-	persistence_remove_device(driver, &secondary);
-	persistence_remove_device(driver, primary);
+	rc = persistence_remove_device(driver, &secondary);
+	if (persistence_remove_device(driver, primary) || rc)
+		return 646;
 
 	hyperv_acceptance_persistence_host_reset();
 	if (persistence_prepare_seed(
@@ -5164,8 +5354,9 @@ static int run_persistence_workflow_regression(
 	    write16_command_count != writes16 ||
 	    flush_command_count != flushes)
 		return 610;
-	persistence_remove_device(driver, &secondary);
-	persistence_remove_device(driver, primary);
+	rc = persistence_remove_device(driver, &secondary);
+	if (persistence_remove_device(driver, primary) || rc)
+		return 647;
 
 	hyperv_acceptance_persistence_host_reset();
 	if (persistence_prepare_seed(
@@ -5209,7 +5400,8 @@ static int run_persistence_workflow_regression(
 		return 616;
 	hold_io = 0;
 	hyperv_acceptance_persistence_host_reset();
-	persistence_remove_device(driver, primary);
+	if (persistence_remove_device(driver, primary))
+		return 648;
 
 	persistence_hook_driver = NULL;
 	persistence_hook_device = NULL;
@@ -5354,7 +5546,8 @@ static int run_persistence_unavailable_regression(
 	    write16_command_count != writes16 ||
 	    flush_command_count != flushes)
 		return 693;
-	persistence_remove_device(driver, device);
+	if (persistence_remove_device(driver, device))
+		return 701;
 
 	hyperv_acceptance_persistence_host_reset();
 	rc = capture_persistence_output(output, sizeof(output), &result);
@@ -5379,7 +5572,8 @@ static int run_persistence_unavailable_regression(
 	    write16_command_count != writes16 ||
 	    flush_command_count != flushes)
 		return 696;
-	persistence_remove_device(driver, device);
+	if (persistence_remove_device(driver, device))
+		return 702;
 
 	persistence_hook_driver = NULL;
 	persistence_hook_device = NULL;
