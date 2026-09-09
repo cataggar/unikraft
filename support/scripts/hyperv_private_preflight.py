@@ -51,7 +51,11 @@ STATE_SCHEMA = "unikraft.hyperv.private-preflight-state"
 RECEIPT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
 INPUT_SCHEMA_VERSION = 9
 STATE_SCHEMA_VERSION = 2
-RECEIPT_SCHEMA_VERSION = 3
+RECEIPT_SCHEMA_VERSION = 4
+NESTED_CAPABILITY_ADMISSION_SCHEMA = (
+    "unikraft.hyperv.nested-capability-admission"
+)
+NESTED_CAPABILITY_ADMISSION_VERSION = 1
 HOST_PHASE_SCHEMA = host_runner.SCHEMA
 HOST_EVIDENCE_SCHEMA = host_runner.EVIDENCE_SCHEMA
 INPUT_MANIFEST = "private-preflight-input.json"
@@ -69,8 +73,17 @@ PRIVATE_BUILD_SCHEMA_VERSION = 6
 STATE_FILE = "state.json"
 LOCATION = "northeurope"
 VM_SIZE = "Standard_D2s_v5"
+VM_MEMORY_GB = 8
 CONTAINER = "preflight"
 WORKLOAD = "platform-only-v1"
+NESTED_VIRTUALIZATION_REFERENCE = {
+    "url": (
+        "https://learn.microsoft.com/en-us/azure/virtual-machines/"
+        "sizes/general-purpose/dsv5-series"
+    ),
+    "source_commit": "2072bfd7009384b9fde1357342d91953104e293d",
+    "updated": "2026-07-27",
+}
 SDK_VERSION = "12.28.0"
 SDK_DISTRIBUTIONS = (
     ("azure-core", "1.41.0"),
@@ -3199,6 +3212,20 @@ def load_state(directory):
     subscription = state.get("subscription")
     if subscription is not None:
         azure.validate_subscription_id(subscription)
+        cloud = exact_fields(
+            state.get("cloud_preflight"),
+            ("subscription", "sku", "image", "nested_virtualization"),
+            "Private cloud preflight",
+        )
+        if (
+            cloud["subscription"] != subscription
+            or not isinstance(cloud["sku"], dict)
+            or not isinstance(cloud["image"], dict)
+        ):
+            raise ValueError("Private cloud preflight is incompatible")
+        validate_nested_capability_admission(
+            cloud["nested_virtualization"]
+        )
         if (
             type(state.get("deadline_monotonic")) not in (int, float)
             or state["deadline_monotonic"] <= 0
@@ -3339,6 +3366,164 @@ def transfer_source(value):
     return f"{address}/32"
 
 
+def validate_nested_capability_admission(value):
+    value = exact_fields(
+        value,
+        (
+            "schema", "schema_version", "location", "vm_size",
+            "memory_gb", "metadata", "admission", "authority",
+        ),
+        "Nested-virtualization capability admission",
+    )
+    metadata = exact_fields(
+        value["metadata"],
+        (
+            "capability_name", "capability_count",
+            "advertised_values", "status",
+        ),
+        "Nested-virtualization SKU metadata",
+    )
+    admission = exact_fields(
+        value["admission"],
+        ("scope", "reason", "runtime_gate"),
+        "Nested-virtualization admission boundary",
+    )
+    authority = exact_fields(
+        value["authority"],
+        ("url", "source_commit", "updated"),
+        "Nested-virtualization public authority",
+    )
+    advertised = metadata["advertised_values"]
+    if advertised == []:
+        expected_status = "not-advertised"
+        expected_reason = "documented-fixed-sku-runtime-proof-required"
+    elif advertised == ["True"]:
+        expected_status = "advertised-true"
+        expected_reason = "advertised-fixed-sku-runtime-proof-required"
+    else:
+        raise ValueError(
+            "Nested-virtualization metadata is not an admissible assertion"
+        )
+    if (
+        value["schema"] != NESTED_CAPABILITY_ADMISSION_SCHEMA
+        or value["schema_version"] != NESTED_CAPABILITY_ADMISSION_VERSION
+        or value["location"] != LOCATION
+        or value["vm_size"] != VM_SIZE
+        or value["memory_gb"] != VM_MEMORY_GB
+        or metadata["capability_name"] != "NestedVirtualization"
+        or type(metadata["capability_count"]) is not int
+        or not 1 <= metadata["capability_count"] <= 1024
+        or metadata["status"] != expected_status
+        or admission["scope"] != "public-capability-smoke-only"
+        or admission["reason"] != expected_reason
+        or admission["runtime_gate"]
+        != "kvm-qemu-two-apic-pass-before-private-transfer"
+        or dict(authority) != NESTED_VIRTUALIZATION_REFERENCE
+    ):
+        raise ValueError(
+            "Nested-virtualization capability admission is incompatible"
+        )
+    return {
+        **value,
+        "metadata": {
+            **metadata,
+            "advertised_values": list(advertised),
+        },
+        "admission": dict(admission),
+        "authority": dict(authority),
+    }
+
+
+def nested_capability_admission(location, vm_size, sku_metadata):
+    if location != LOCATION or vm_size != VM_SIZE:
+        raise RuntimeError(
+            "Nested-virtualization admission is limited to the fixed "
+            "Standard_D2s_v5 North Europe preflight"
+        )
+    try:
+        if not isinstance(sku_metadata, list) or len(sku_metadata) != 1:
+            raise ValueError
+        record = exact_fields(
+            sku_metadata[0], ("name", "capabilities"),
+            "Fixed preflight SKU metadata",
+        )
+        if (
+            record["name"] != VM_SIZE
+            or not isinstance(record["capabilities"], list)
+            or not 1 <= len(record["capabilities"]) <= 1024
+        ):
+            raise ValueError
+        capabilities = []
+        for entry in record["capabilities"]:
+            entry = exact_fields(
+                entry, ("name", "value"), "Fixed preflight SKU capability"
+            )
+            if (
+                not isinstance(entry["name"], str)
+                or not entry["name"]
+                or not isinstance(entry["value"], str)
+                or not entry["value"]
+            ):
+                raise ValueError
+            capabilities.append((entry["name"], entry["value"]))
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "Azure returned malformed fixed preflight SKU capabilities"
+        ) from None
+
+    def values(name):
+        return [value for key, value in capabilities if key == name]
+
+    architecture = values("CpuArchitectureType")
+    vcpus = values("vCPUs")
+    memory = values("MemoryGB")
+    generations = values("HyperVGenerations")
+    if (
+        architecture != ["x64"]
+        or vcpus != ["2"]
+        or memory != [str(VM_MEMORY_GB)]
+        or len(generations) != 1
+        or "V2" not in generations[0].split(",")
+    ):
+        raise RuntimeError(
+            "The fixed preflight SKU metadata conflicts with its "
+            "x64, two-vCPU, 8-GiB, Gen2 envelope"
+        )
+    nested = values("NestedVirtualization")
+    if nested == []:
+        status = "not-advertised"
+        reason = "documented-fixed-sku-runtime-proof-required"
+    elif nested == ["True"]:
+        status = "advertised-true"
+        reason = "advertised-fixed-sku-runtime-proof-required"
+    else:
+        raise RuntimeError(
+            "The fixed preflight SKU has an explicit, duplicate, "
+            "conflicting, or malformed nested-virtualization advertisement"
+        )
+    return validate_nested_capability_admission({
+        "schema": NESTED_CAPABILITY_ADMISSION_SCHEMA,
+        "schema_version": NESTED_CAPABILITY_ADMISSION_VERSION,
+        "location": LOCATION,
+        "vm_size": VM_SIZE,
+        "memory_gb": VM_MEMORY_GB,
+        "metadata": {
+            "capability_name": "NestedVirtualization",
+            "capability_count": len(capabilities),
+            "advertised_values": nested,
+            "status": status,
+        },
+        "admission": {
+            "scope": "public-capability-smoke-only",
+            "reason": reason,
+            "runtime_gate": (
+                "kvm-qemu-two-apic-pass-before-private-transfer"
+            ),
+        },
+        "authority": dict(NESTED_VIRTUALIZATION_REFERENCE),
+    })
+
+
 def check_subscription(subscription):
     subscription = azure.selected_account(subscription)
     for namespace in (
@@ -3360,19 +3545,20 @@ def check_subscription(subscription):
     sku = azure.exact_vm_sku(
         LOCATION, VM_SIZE, subscription, vcpus=2, require_v2=True
     )
-    nested = azure.azure_cli([
+    sku_metadata = azure.azure_cli([
         "vm", "list-skus", "--all", "--location", LOCATION,
         "--resource-type", "virtualMachines", "--size", VM_SIZE,
         "--query",
         (
-            f"[?name=='{VM_SIZE}'].capabilities[] | "
-            "[?name=='NestedVirtualization'].value"
+            f"[?name=='{VM_SIZE}']."
+            "{name:name,capabilities:capabilities[]."
+            "{name:name,value:value}}"
         ),
     ], subscription=subscription, private=True)
-    if nested != ["True"]:
-        raise RuntimeError(
-            "The exact preflight SKU does not advertise nested virtualization"
-        )
+    nested = nested_capability_admission(
+        LOCATION, VM_SIZE, sku_metadata
+    )
+    sku = {**sku, "memory_gb": VM_MEMORY_GB}
     image = azure.resolve_peer_image(LOCATION, subscription, ("V2",))
     if image["hyperv_generation"] != "V2":
         raise RuntimeError("The selected immutable Ubuntu image is not Gen2")
@@ -3393,7 +3579,12 @@ def check_subscription(subscription):
             - azure.quota_count(limits[name].get("currentValue"))
         ) < 2:
             raise RuntimeError("Two-vCPU preflight quota is unavailable")
-    return {"subscription": subscription, "sku": sku, "image": image}
+    return {
+        "subscription": subscription,
+        "sku": sku,
+        "image": image,
+        "nested_virtualization": nested,
+    }
 
 
 def utc_text(value):
@@ -5356,7 +5547,8 @@ def load_completed_receipt(state_directory):
             "input_manifest_sha256", "implementation", "provenance",
             "capability_reference", "private_build", "inputs",
             "qemu_support", "miz", "packaging", "budget", "host_image",
-            "host", "capability_receipt_sha256",
+            "host_capability_admission", "host",
+            "capability_receipt_sha256",
             "private_receipt_sha256", "boot_policy",
             "acceptance_scope", "storage_result", "guarded",
             "capability_boots", "private_boots", "cleanup",
@@ -5409,8 +5601,11 @@ def load_completed_receipt(state_directory):
 
     cloud = exact_fields(
         state.get("cloud_preflight"),
-        ("subscription", "sku", "image"),
+        ("subscription", "sku", "image", "nested_virtualization"),
         "Completed private cloud preflight",
+    )
+    capability_admission = validate_nested_capability_admission(
+        receipt["host_capability_admission"]
     )
     image = exact_fields(
         receipt["host_image"],
@@ -5424,6 +5619,7 @@ def load_completed_receipt(state_directory):
         cloud["subscription"] != state.get("subscription")
         or not isinstance(cloud["sku"], dict)
         or dict(image) != cloud["image"]
+        or capability_admission != cloud["nested_virtualization"]
         or any(
             not isinstance(image[field], str) or not image[field]
             for field in ("publisher", "offer", "sku", "version")
@@ -5528,6 +5724,7 @@ def load_completed_receipt(state_directory):
         "packaging": manifest["packaging"],
         "budget": dict(budget),
         "host_image": dict(image),
+        "host_capability_admission": capability_admission,
         "host": dict(host),
         "guarded": manifest["guarded"],
         "capability_boots": capability_receipt["boots"],
@@ -5705,6 +5902,9 @@ def run_preflight(
                     "evidence_bytes": state["evidence_bytes"],
                 },
                 "host_image": state["cloud_preflight"]["image"],
+                "host_capability_admission": state["cloud_preflight"][
+                    "nested_virtualization"
+                ],
                 "host": {
                     "operation_id": state["host_deployment"][
                         "operation_id"

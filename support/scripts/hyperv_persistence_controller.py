@@ -33,7 +33,7 @@ REQUIREMENTS = SUPPORT / "azure" / "requirements.txt"
 CONTRACT_SCHEMA = "unikraft.hyperv.persistence-two-boot-contract"
 CONTRACT_VERSION = 1
 PREFLIGHT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
-PREFLIGHT_VERSION = 3
+PREFLIGHT_VERSION = 4
 STATE_SCHEMA = "unikraft.hyperv.persistence-two-boot-state"
 STATE_VERSION = 1
 RECEIPT_SCHEMA = "unikraft.hyperv.persistence-two-boot-receipt"
@@ -216,7 +216,8 @@ def validate_preflight_receipt(
             "input_manifest_sha256", "implementation", "provenance",
             "capability_reference", "private_build", "inputs",
             "qemu_support", "miz", "packaging", "budget", "host_image",
-            "host", "capability_receipt_sha256",
+            "host_capability_admission", "host",
+            "capability_receipt_sha256",
             "private_receipt_sha256", "boot_policy",
             "acceptance_scope", "storage_result", "guarded",
             "capability_boots", "private_boots", "cleanup",
@@ -259,6 +260,11 @@ def validate_preflight_receipt(
         "Completed guarded producer pin",
     )
     expected_producer = private_preflight.guarded_producer_contract()
+    capability_admission = (
+        private_preflight.validate_nested_capability_admission(
+            value["host_capability_admission"]
+        )
+    )
     host = exact_fields(
         value["host"],
         (
@@ -364,6 +370,7 @@ def validate_preflight_receipt(
     return {
         **value,
         "inputs": normalized_inputs,
+        "host_capability_admission": capability_admission,
         "host": dict(host),
         "guarded": {
             **guarded,

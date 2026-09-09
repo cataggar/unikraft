@@ -192,6 +192,48 @@ def packaging_contract(efi_sha256, efi_size, file_size):
     return value
 
 
+def d2s_v5_sku_metadata(nested_values=()):
+    capabilities = [
+        ("vCPUs", "2"),
+        ("MemoryGB", "8"),
+        ("CpuArchitectureType", "x64"),
+        ("HyperVGenerations", "V1,V2"),
+        ("MaxDataDiskCount", "4"),
+        ("MaxResourceVolumeMB", "0"),
+        ("OSVhdSizeMB", "1047552"),
+        ("TempResourceDiskSizeMB", "0"),
+        ("PremiumIO", "True"),
+        ("PremiumV2IO", "False"),
+        ("UltraSSDAvailable", "False"),
+        ("EphemeralOSDiskSupported", "True"),
+        ("EncryptionAtHostSupported", "True"),
+        ("AcceleratedNetworkingEnabled", "True"),
+        ("RdmaEnabled", "False"),
+        ("MaxNetworkInterfaces", "2"),
+        ("CombinedTempDiskAndCachedIOPS", "4000"),
+        ("CombinedTempDiskAndCachedReadBytesPerSecond", "50331648"),
+        ("UncachedDiskIOPS", "3200"),
+        ("UncachedDiskBytesPerSecond", "50331648"),
+        ("CachedDiskBytes", "0"),
+        ("LowPriorityCapable", "True"),
+        ("CapacityReservationSupported", "True"),
+        ("HibernationSupported", "True"),
+        ("TrustedLaunchSupported", "True"),
+        ("ConfidentialComputingType", "None"),
+        ("DiskControllerTypes", "SCSI,NVMe"),
+    ]
+    capabilities.extend(
+        ("NestedVirtualization", value) for value in nested_values
+    )
+    return [{
+        "name": preflight.VM_SIZE,
+        "capabilities": [
+            {"name": name, "value": value}
+            for name, value in capabilities
+        ],
+    }]
+
+
 def capability_reference(capability, approved=True):
     if approved:
         value = json.loads(json.dumps(
@@ -499,6 +541,14 @@ class PrivatePreflightFixture(unittest.TestCase):
             "phase": "cloud-preflight-complete",
             "subscription": "11111111-2222-3333-4444-555555555555",
             "cloud_preflight": {
+                "subscription": "11111111-2222-3333-4444-555555555555",
+                "sku": {
+                    "name": preflight.VM_SIZE,
+                    "family": "standardDSv5Family",
+                    "vcpus": 2,
+                    "generations": ["V1", "V2"],
+                    "memory_gb": preflight.VM_MEMORY_GB,
+                },
                 "image": {
                     "publisher": "Canonical",
                     "offer": "ubuntu-24_04-lts",
@@ -506,6 +556,12 @@ class PrivatePreflightFixture(unittest.TestCase):
                     "version": "24.04.202609010",
                     "hyperv_generation": "V2",
                 },
+                "nested_virtualization": (
+                    preflight.nested_capability_admission(
+                        preflight.LOCATION, preflight.VM_SIZE,
+                        d2s_v5_sku_metadata(),
+                    )
+                ),
             },
             "deadline_monotonic": time.monotonic() + 3600,
             "deadline_utc": "2026-09-09T05:26:00Z",
@@ -2407,6 +2463,12 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
                     "architecture": "x64",
                     "hyperv_generation": "V2",
                 },
+                "nested_virtualization": (
+                    preflight.nested_capability_admission(
+                        preflight.LOCATION, preflight.VM_SIZE,
+                        d2s_v5_sku_metadata(),
+                    )
+                ),
             },
             "deadline_monotonic": time.monotonic() + 3600,
             "deadline_utc": "2026-09-09T16:00:00Z",
@@ -2543,6 +2605,9 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
             "host_image": json.loads(json.dumps(
                 state["cloud_preflight"]["image"]
             )),
+            "host_capability_admission": json.loads(json.dumps(
+                state["cloud_preflight"]["nested_virtualization"]
+            )),
             "host": {
                 "operation_id": state["host_deployment"]["operation_id"],
                 "deployment_correlation_id": state["host_deployment"][
@@ -2604,7 +2669,7 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
         for mutation in (
             "prepared", "vhd", "build", "cleanup", "sas",
             "deallocated", "deployment", "control", "resource",
-            "evidence",
+            "evidence", "admission",
         ):
             with self.subTest(mutation=mutation), \
                     tempfile.TemporaryDirectory() as temporary:
@@ -2633,6 +2698,10 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
                     final["budget"]["control_payload_bytes"] = 0
                 elif mutation == "resource":
                     state["host_nic_id"] += "-replacement"
+                elif mutation == "admission":
+                    final["host_capability_admission"]["metadata"][
+                        "advertised_values"
+                    ] = ["False"]
                 else:
                     state["evidence_bytes"] += 1
                     final["budget"]["evidence_bytes"] = state[
@@ -2941,7 +3010,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
         account.return_value = subscription
         command.side_effect = [
             "Registered", "Registered", "Registered", "Registered",
-            ["2025-11-01"], ["True"],
+            ["2025-11-01"], d2s_v5_sku_metadata(),
             [
                 {"name": {"value": "cores"}, "limit": 8, "currentValue": 0},
                 {
@@ -2963,10 +3032,133 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
         }
         result = preflight.check_subscription(subscription)
         self.assertEqual(result["image"]["version"], "24.04.202609010")
+        self.assertEqual(result["sku"]["memory_gb"], 8)
+        self.assertEqual(
+            result["nested_virtualization"]["metadata"],
+            {
+                "capability_name": "NestedVirtualization",
+                "capability_count": 27,
+                "advertised_values": [],
+                "status": "not-advertised",
+            },
+        )
+        self.assertEqual(
+            result["nested_virtualization"]["admission"]["scope"],
+            "public-capability-smoke-only",
+        )
         self.assertTrue(all(
             call.kwargs.get("private") is True
             for call in command.call_args_list
         ))
+
+    def test_nested_capability_admission_is_fixed_and_truthful(self):
+        missing = preflight.nested_capability_admission(
+            preflight.LOCATION, preflight.VM_SIZE,
+            d2s_v5_sku_metadata(),
+        )
+        self.assertEqual(
+            missing["metadata"]["status"], "not-advertised"
+        )
+        self.assertEqual(
+            missing["metadata"]["advertised_values"], []
+        )
+        self.assertEqual(
+            missing["admission"]["runtime_gate"],
+            "kvm-qemu-two-apic-pass-before-private-transfer",
+        )
+        advertised = preflight.nested_capability_admission(
+            preflight.LOCATION, preflight.VM_SIZE,
+            d2s_v5_sku_metadata(("True",)),
+        )
+        self.assertEqual(
+            advertised["metadata"]["status"], "advertised-true"
+        )
+        self.assertEqual(
+            advertised["metadata"]["advertised_values"], ["True"]
+        )
+        self.assertEqual(
+            advertised["admission"]["scope"],
+            "public-capability-smoke-only",
+        )
+
+    def test_nested_capability_admission_rejects_unsafe_metadata(self):
+        malformed = d2s_v5_sku_metadata()
+        malformed[0]["capabilities"].append({
+            "name": "NestedVirtualization", "value": None,
+        })
+        cases = (
+            (
+                "explicit-false", preflight.LOCATION, preflight.VM_SIZE,
+                d2s_v5_sku_metadata(("False",)),
+            ),
+            (
+                "duplicate", preflight.LOCATION, preflight.VM_SIZE,
+                d2s_v5_sku_metadata(("True", "True")),
+            ),
+            (
+                "conflict", preflight.LOCATION, preflight.VM_SIZE,
+                d2s_v5_sku_metadata(("True", "False")),
+            ),
+            (
+                "unknown-sku", preflight.LOCATION, "Standard_D2as_v5",
+                d2s_v5_sku_metadata(),
+            ),
+            (
+                "unknown-region", "westus2", preflight.VM_SIZE,
+                d2s_v5_sku_metadata(),
+            ),
+            (
+                "malformed", preflight.LOCATION, preflight.VM_SIZE,
+                malformed,
+            ),
+        )
+        for name, location, vm_size, metadata in cases:
+            with self.subTest(name=name), self.assertRaises(RuntimeError):
+                preflight.nested_capability_admission(
+                    location, vm_size, metadata
+                )
+
+    def test_invalid_nested_metadata_fails_before_resource_creation(self):
+        state = self.state()
+        subscription = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(
+                    preflight, "load_state",
+                    return_value=(state, Path(temporary) / "state.json"),
+                ), mock.patch.object(
+                    preflight, "verify_immutable_inputs"
+                ), mock.patch.object(
+                    preflight, "check_blob_dependency"
+                ), mock.patch.object(
+                    preflight, "transfer_source", return_value="8.8.8.8/32"
+                ), mock.patch.object(
+                    preflight.azure, "selected_account",
+                    return_value=subscription,
+                ), mock.patch.object(
+                    preflight.azure, "exact_vm_sku",
+                    return_value={
+                        "name": preflight.VM_SIZE,
+                        "family": "standardDSv5Family",
+                        "vcpus": 2,
+                        "generations": ["V1", "V2"],
+                    },
+                ), mock.patch.object(
+                    preflight.azure, "azure_cli",
+                    side_effect=[
+                        "Registered", "Registered", "Registered", "Registered",
+                        ["2025-11-01"],
+                        d2s_v5_sku_metadata(("False",)),
+                    ],
+                ), mock.patch.object(
+                    preflight, "PrivatePreflightRun"
+                ) as run_type:
+            with self.assertRaisesRegex(
+                RuntimeError, "nested-virtualization advertisement"
+            ):
+                preflight.run_preflight(
+                    Path(temporary), subscription, "8.8.8.8", True
+                )
+            run_type.assert_not_called()
 
     def test_deployment_obligation_is_durable_before_create(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3870,6 +4062,12 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
                     "sku": "server", "version": "24.04.202609010",
                     "hyperv_generation": "V2",
                 },
+                "nested_virtualization": (
+                    preflight.nested_capability_admission(
+                        preflight.LOCATION, preflight.VM_SIZE,
+                        d2s_v5_sku_metadata(),
+                    )
+                ),
             }
             with mock.patch.object(
                 preflight, "load_state", return_value=(state, state_path)
@@ -3929,6 +4127,22 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
                 self.assertNotIn("upload-private", events)
                 self.assertEqual(events[-1], "cleanup")
                 self.assertIs(raised, error)
+
+    def test_missing_metadata_admission_still_requires_runtime_capability(self):
+        events, state, raised = self.execute(
+            RuntimeError("public capability failed")
+        )
+        self.assertEqual(
+            state["cloud_preflight"]["nested_virtualization"][
+                "metadata"
+            ]["status"],
+            "not-advertised",
+        )
+        self.assertIn("upload-public", events)
+        self.assertIn("run-capability", events)
+        self.assertNotIn("upload-private", events)
+        self.assertEqual(events[-1], "cleanup")
+        self.assertIsInstance(raised, RuntimeError)
 
     def test_primary_and_cleanup_failures_are_both_sanitized_and_durable(self):
         private = "11111111-2222-3333-4444-555555555555"
