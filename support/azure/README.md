@@ -733,9 +733,15 @@ inventory still rejects unexpected extension software. There is no
 keep-resources mode. Control-plane or
 ownership failures are reported as cleanup failures rather than claimed as
 successful deletion. If both the primary operation and cleanup fail, the
-durable state and raised error retain both sanitized failures; failure to write
-that combined record is also reported without exposing subscription, storage,
-endpoint, identifier, or local private-state values. The final private receipt
+durable state retains only bounded phase/stage, exception category, and Azure
+error-code metadata for the primary, reconciliation, cleanup, and recording
+paths. It never persists free-form diagnostic messages. A failure to write
+that bounded record is itself reported by bounded category/code without
+masking the primary failure. Reload removes the obsolete free-form
+`primary_failure` and `cleanup_failure` fields before recovery, without
+blocking cleanup. Raised combined errors likewise omit raw stderr, request
+parameters, subscription, storage, endpoint, identifier, and local
+private-state values. The final private receipt
 binds the exact inputs, tools,
 host identity, four boot outcomes, and cleanup obligations; live nested-KVM
 success still requires the operator-run attempt.

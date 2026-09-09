@@ -584,12 +584,12 @@ def exact_fields(value, fields, description):
 
 
 def validate_private_failure_record(value):
+    required = {"category", "code", "phase"}
+    optional = {"reconciliation", "cleanup", "recording"}
     if (
         not isinstance(value, dict)
-        or set(value) not in (
-            {"category", "code", "phase"},
-            {"category", "code", "phase", "reconciliation"},
-        )
+        or not required.issubset(value)
+        or not set(value).issubset(required | optional)
         or not isinstance(value["category"], str)
         or not re.fullmatch(
             r"[A-Za-z][A-Za-z0-9_]{0,79}", value["category"]
@@ -624,12 +624,59 @@ def validate_private_failure_record(value):
         )
     ):
         raise ValueError("Private-preflight reconciliation failure is invalid")
+    bounded_lists = {}
+    for field, stages in (
+        (
+            "cleanup",
+            {
+                "private-files", "firewall", "sas",
+                "deallocate", "resource-group", "cleanup",
+            },
+        ),
+        ("recording", {"initial", "final"}),
+    ):
+        entries = value.get(field)
+        if entries is None:
+            continue
+        if (
+            not isinstance(entries, list)
+            or not 1 <= len(entries) <= 8
+        ):
+            raise ValueError(
+                f"Private-preflight {field} failures are invalid"
+            )
+        bounded = []
+        for entry in entries:
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"stage", "category", "code"}
+                or entry["stage"] not in stages
+                or not isinstance(entry["category"], str)
+                or not re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_]{0,79}",
+                    entry["category"],
+                )
+                or entry["code"] is not None
+                and (
+                    not isinstance(entry["code"], str)
+                    or not re.fullmatch(
+                        r"[A-Za-z][A-Za-z0-9_-]{0,79}",
+                        entry["code"],
+                    )
+                )
+            ):
+                raise ValueError(
+                    f"Private-preflight {field} failure is invalid"
+                )
+            bounded.append(dict(entry))
+        bounded_lists[field] = bounded
     return {
         **value,
         **(
             {"reconciliation": dict(reconciliation)}
             if reconciliation is not None else {}
         ),
+        **bounded_lists,
     }
 
 
@@ -3116,6 +3163,12 @@ def load_state(directory):
         path, MAX_STATE_BYTES, "Private-preflight private state"
     )
     state = azure.parse_strict_json(raw, "Private-preflight private state")
+    legacy_diagnostics = False
+    if isinstance(state, dict):
+        for field in ("primary_failure", "cleanup_failure"):
+            if field in state:
+                legacy_diagnostics = True
+                state.pop(field)
     if any(
         field in state
         for field in (
@@ -3305,6 +3358,8 @@ def load_state(directory):
                 or group_id.lower() != expected_group_id.lower()
             ):
                 raise ValueError("Private-preflight group binding is invalid")
+    if legacy_diagnostics:
+        azure.save_durable_json(path, state)
     return state, path
 
 
@@ -3822,48 +3877,100 @@ def save_private_bytes(path, value):
         os.fsync(output.fileno())
 
 
+def bounded_exception_record(error):
+    category = getattr(error, "failure_category", type(error).__name__)
+    if not isinstance(category, str) or not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_]{0,79}", category
+    ):
+        category = "RuntimeError"
+    code = getattr(error, "code", None)
+    if not isinstance(code, str) or not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_-]{0,79}", code
+    ):
+        code = None
+    return {"category": category, "code": code}
+
+
+def bounded_cleanup_failures(error, default_stage="cleanup"):
+    failures = getattr(error, "cleanup_failures", None)
+    if isinstance(failures, list):
+        return [dict(failure) for failure in failures]
+    return [{"stage": default_stage, **bounded_exception_record(error)}]
+
+
 class PrivateHostDeploymentReconciliationError(RuntimeError):
     def __init__(self, primary, reconciliation, private_values):
-        category = type(primary).__name__
-        self.failure_category = (
-            category
-            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", category)
-            else "RuntimeError"
+        primary_record = bounded_exception_record(primary)
+        self.failure_category = primary_record["category"]
+        self.code = primary_record["code"]
+        self.reconciliation_failure = bounded_exception_record(
+            reconciliation
         )
-        code = getattr(primary, "code", None)
-        self.code = (
-            code
-            if isinstance(code, str)
-            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", code)
-            else None
-        )
-        reconciliation_category = type(reconciliation).__name__
-        reconciliation_code = getattr(reconciliation, "code", None)
-        self.reconciliation_failure = {
-            "category": (
-                reconciliation_category
-                if re.fullmatch(
-                    r"[A-Za-z][A-Za-z0-9_]{0,79}",
-                    reconciliation_category,
-                )
-                else "RuntimeError"
-            ),
-            "code": (
-                reconciliation_code
-                if isinstance(reconciliation_code, str)
-                and re.fullmatch(
-                    r"[A-Za-z][A-Za-z0-9_-]{0,79}",
-                    reconciliation_code,
-                )
-                else None
-            ),
-        }
         super().__init__(
             "Primary private host deployment failure: "
             + azure.safe_failure_message(primary, private_values)
             + "; deployment reconciliation also failed: "
             + azure.safe_failure_message(reconciliation, private_values)
         )
+
+
+class PrivateCleanupError(RuntimeError):
+    def __init__(self, failures):
+        self.cleanup_failures = [
+            {"stage": stage, **bounded_exception_record(error)}
+            for stage, error in failures
+        ]
+        super().__init__(
+            "Private preflight cleanup failed: "
+            + ", ".join(
+                f"{failure['stage']}="
+                f"{failure['category']}"
+                f"({failure['code'] or 'unclassified'})"
+                for failure in self.cleanup_failures
+            )
+        )
+
+
+class PrivateFailurePipelineError(RuntimeError):
+    def __init__(self, primary, cleanup, recording):
+        primary_record = bounded_exception_record(primary)
+        self.failure_category = primary_record["category"]
+        self.code = primary_record["code"]
+        reconciliation = getattr(
+            primary, "reconciliation_failure", None
+        )
+        self.reconciliation_failure = (
+            dict(reconciliation)
+            if isinstance(reconciliation, dict) else None
+        )
+        self.cleanup_failures = (
+            bounded_cleanup_failures(cleanup)
+            if cleanup is not None else []
+        )
+        self.recording_failures = [dict(item) for item in recording]
+        parts = [
+            "primary="
+            f"{self.failure_category}({self.code or 'unclassified'})"
+        ]
+        if self.reconciliation_failure is not None:
+            parts.append(
+                "reconciliation="
+                f"{self.reconciliation_failure['category']}"
+                f"({self.reconciliation_failure['code'] or 'unclassified'})"
+            )
+        parts.extend(
+            "cleanup="
+            f"{failure['stage']}:{failure['category']}"
+            f"({failure['code'] or 'unclassified'})"
+            for failure in self.cleanup_failures
+        )
+        parts.extend(
+            "recording="
+            f"{failure['stage']}:{failure['category']}"
+            f"({failure['code'] or 'unclassified'})"
+            for failure in self.recording_failures
+        )
+        super().__init__("Private failure pipeline: " + "; ".join(parts))
 
 
 class PrivatePreflightRun(azure.AzureRun):
@@ -5307,12 +5414,12 @@ class PrivatePreflightRun(azure.AzureRun):
         try:
             self.clear_private_files()
         except (RuntimeError, ValueError, OSError) as error:
-            errors.append(error)
+            errors.append(("private-files", error))
         if self.state.get("firewall_obligation") is not None:
             try:
                 self.clear_firewall_obligation()
             except (RuntimeError, ValueError, OSError) as error:
-                errors.append(error)
+                errors.append(("firewall", error))
         if self.state.get("active_sas") is True:
             fingerprint = self.state.get("active_sas_signing_key_sha256")
             try:
@@ -5320,19 +5427,17 @@ class PrivatePreflightRun(azure.AzureRun):
                     fingerprint, "Active private Blob signing key"
                 )})
             except (RuntimeError, ValueError, OSError) as error:
-                errors.append(error)
+                errors.append(("sas", error))
         try:
             self.deallocate_host()
         except (RuntimeError, ValueError, OSError) as error:
-            errors.append(error)
+            errors.append(("deallocate", error))
         try:
             self.delete_owned_group()
         except (RuntimeError, ValueError, OSError) as error:
-            errors.append(error)
+            errors.append(("resource-group", error))
         if errors:
-            raise RuntimeError(
-                "Private preflight cleanup or deallocation did not complete"
-            ) from None
+            raise PrivateCleanupError(errors) from None
 
 
 def host_phase_manifest(state, phase, capability_sha256=None):
@@ -5848,41 +5953,68 @@ def load_completed_receipt(state_directory):
     }, receipt_path
 
 
-def record_private_failure(run, error, phase):
-    code = getattr(error, "code", None)
-    if not isinstance(code, str) or not re.fullmatch(
-        r"[A-Za-z][A-Za-z0-9_-]{0,79}", code
-    ):
-        code = None
-    category = getattr(error, "failure_category", type(error).__name__)
-    if not isinstance(category, str) or not re.fullmatch(
-        r"[A-Za-z][A-Za-z0-9_]{0,79}", category
-    ):
-        category = type(error).__name__
+def private_failure_record(
+    error, phase, *, cleanup=None, recording=()
+):
+    primary = bounded_exception_record(error)
     failure = {
-        "category": category,
-        "code": code,
+        **primary,
         "phase": phase,
     }
     reconciliation = getattr(error, "reconciliation_failure", None)
     if isinstance(reconciliation, dict):
         failure["reconciliation"] = dict(reconciliation)
+    primary_cleanup = getattr(error, "cleanup_failures", None)
+    if cleanup is not None:
+        failure["cleanup"] = bounded_cleanup_failures(cleanup)
+    elif isinstance(primary_cleanup, list) and primary_cleanup:
+        failure["cleanup"] = [
+            dict(item) for item in primary_cleanup
+        ]
+    if recording:
+        failure["recording"] = [dict(item) for item in recording]
+    return validate_private_failure_record(failure)
+
+
+def record_private_failure(run, error, phase):
     run.record(
-        "failed", failure=validate_private_failure_record(failure)
+        "failed", failure=private_failure_record(error, phase)
     )
 
 
-def record_private_failure_or_raise(run, error, phase):
+def persist_private_failure(run, error, phase, *, attempt_cleanup):
+    recording_failures = []
+    initial = private_failure_record(error, phase)
     try:
-        record_private_failure(run, error, phase)
+        run.record("failure-recorded", failure=initial)
     except BaseException as recording:
-        private_values = run.private_failure_values()
-        raise RuntimeError(
-            "Primary run failure: "
-            + azure.safe_failure_message(error, private_values)
-            + "; durable failure recording also failed: "
-            + azure.safe_failure_message(recording, private_values)
-        ) from None
+        recording_failures.append({
+            "stage": "initial", **bounded_exception_record(recording),
+        })
+    cleanup_error = None
+    if attempt_cleanup and run.state.get("cleanup_required"):
+        try:
+            run.cleanup()
+        except BaseException as cleanup:
+            cleanup_error = cleanup
+    final = private_failure_record(
+        error, phase, cleanup=cleanup_error,
+        recording=recording_failures,
+    )
+    final_phase = (
+        "cleanup-failed" if "cleanup" in final else "failed"
+    )
+    try:
+        run.record(final_phase, failure=final)
+    except BaseException as recording:
+        recording_failures.append({
+            "stage": "final", **bounded_exception_record(recording),
+        })
+    if cleanup_error is not None or recording_failures:
+        return PrivateFailurePipelineError(
+            error, cleanup_error, recording_failures
+        )
+    return None
 
 
 def run_preflight(
@@ -6062,17 +6194,21 @@ def run_preflight(
             )
     except BaseException as primary:
         primary_phase = state.get("phase", "unknown")
-        if state.get("cleanup_required"):
-            azure.cleanup_after_primary_failure(run, primary)
-        record_private_failure_or_raise(run, primary, primary_phase)
+        pipeline = persist_private_failure(
+            run, primary, primary_phase, attempt_cleanup=True
+        )
+        if pipeline is not None:
+            raise pipeline from None
         raise
     if state.get("cleanup_required"):
         try:
             run.cleanup()
         except BaseException as cleanup_error:
-            record_private_failure_or_raise(
-                run, cleanup_error, "cleanup"
+            pipeline = persist_private_failure(
+                run, cleanup_error, "cleanup", attempt_cleanup=False
             )
+            if pipeline is not None:
+                raise pipeline from None
             raise
     final["cleanup"] = "complete"
     azure.save_durable_json(state_path.parent / "private-receipt.json", final)
