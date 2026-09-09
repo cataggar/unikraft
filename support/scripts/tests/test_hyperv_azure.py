@@ -21,6 +21,59 @@ azure = importlib.import_module("hyperv-azure")
 uploader = importlib.import_module("hyperv-azure-upload")
 
 
+def modeled_implicit_disk_output_order(
+    template, vm_variable, identity_variable, output_name, inner_output_name,
+):
+    output = template["outputs"][output_name]["value"]
+    if "reference(resourceId('Microsoft.Compute/disks'" in output:
+        raise RuntimeError(
+            "ResourceNotFound: implicit disk read can precede VM creation"
+        )
+    identity = next(
+        resource for resource in template["resources"]
+        if resource["type"] == "Microsoft.Resources/deployments"
+        and resource["name"] == f"[variables('{identity_variable}')]"
+    )
+    vm_dependency = (
+        "[resourceId('Microsoft.Compute/virtualMachines', "
+        f"variables('{vm_variable}'))]"
+    )
+    if identity.get("dependsOn") != [vm_dependency]:
+        raise RuntimeError(
+            "ResourceNotFound: implicit disk read lacks a VM dependency"
+        )
+    properties = identity["properties"]
+    if (
+        properties.get("expressionEvaluationOptions") != {"scope": "inner"}
+        or properties.get("mode") != "Incremental"
+        or properties["template"].get("resources") != []
+    ):
+        raise RuntimeError("Identity deployment is not an output-only inner scope")
+    if properties["parameters"] != {
+        "peerDiskId": {
+            "value": (
+                f"[reference(variables('{vm_variable}'), '2025-11-01')"
+                ".storageProfile.osDisk.managedDisk.id]"
+            )
+        }
+    }:
+        raise RuntimeError(
+            "Identity deployment does not use the VM's returned disk ID"
+        )
+    expected_output = (
+        f"[reference(variables('{identity_variable}'), '2022-09-01')"
+        f".outputs.{inner_output_name}.value]"
+    )
+    if output != expected_output:
+        raise RuntimeError("Outer output does not await identity deployment")
+    inner = properties["template"]["outputs"][
+        inner_output_name
+    ]["value"]
+    if "reference(parameters(" not in inner or ".uniqueId]" not in inner:
+        raise RuntimeError("Identity deployment does not read the disk UUID")
+    return ("vm-created", "implicit-disk-read", "outer-output")
+
+
 class UploadFailure(Exception):
     error_code = "UploadFailed"
 
@@ -2513,13 +2566,49 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             peer["parameters"]["adminPassword"]["type"], "secureString"
         )
         self.assertIn("peerImageVersion", peer["parameters"])
-        self.assertIn("properties.vmId", peer["outputs"]["peerVmUuid"]["value"])
-        self.assertIn(
-            "properties.uniqueId",
-            peer["outputs"]["peerDiskUuid"]["value"],
+        self.assertEqual(
+            peer["outputs"]["peerVmUuid"]["value"],
+            "[reference(variables('peerVmName'), '2025-11-01').vmId]",
         )
+        self.assertEqual(
+            modeled_implicit_disk_output_order(
+                peer, "peerVmName", "peerIdentityDeploymentName",
+                "peerDiskUuid", "peerDiskUuid",
+            ),
+            ("vm-created", "implicit-disk-read", "outer-output"),
+        )
+        self.assertEqual(
+            peer["outputs"]["peerDiskId"]["value"],
+            "[reference(variables('peerIdentityDeploymentName'), "
+            "'2022-09-01').outputs.peerDiskId.value]",
+        )
+        direct = copy.deepcopy(peer)
+        direct["outputs"]["peerDiskUuid"]["value"] = (
+            "[reference(resourceId('Microsoft.Compute/disks', "
+            "concat(parameters('namePrefix'), '-peer-os')), "
+            "'2025-01-02').uniqueId]"
+        )
+        with self.assertRaisesRegex(RuntimeError, "ResourceNotFound"):
+            modeled_implicit_disk_output_order(
+                direct, "peerVmName", "peerIdentityDeploymentName",
+                "peerDiskUuid", "peerDiskUuid",
+            )
+        unordered = copy.deepcopy(peer)
+        identity = next(
+            resource for resource in unordered["resources"]
+            if resource["type"] == "Microsoft.Resources/deployments"
+        )
+        identity["dependsOn"] = []
+        with self.assertRaisesRegex(RuntimeError, "ResourceNotFound"):
+            modeled_implicit_disk_output_order(
+                unordered, "peerVmName", "peerIdentityDeploymentName",
+                "peerDiskUuid", "peerDiskUuid",
+            )
         self.assertIn("existingNicId", guest["parameters"])
-        self.assertIn("properties.vmId", guest["outputs"]["vmUuid"]["value"])
+        self.assertEqual(
+            guest["outputs"]["vmUuid"]["value"],
+            "[reference(variables('vmName'), '2025-11-01').vmId]",
+        )
         self.assertEqual(
             guest["outputs"]["osDiskId"]["value"],
             "[parameters('osDiskId')]",
@@ -2924,6 +3013,33 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
         self.assertEqual(state["phase"], "peer-deployment-succeeded")
         self.assertEqual(state["peer_deployment"], receipt)
 
+    def test_peer_receipt_accepts_five_leaf_resources_and_nested_outputs(self):
+        fixture = HypervAzureControllerTest()
+        run, _ = fixture.network_run_fixture()
+        receipt = fixture.peer_receipt(run)
+        deployment = fixture.peer_deployment(run)
+        output_resources = deployment["properties"]["outputResources"]
+        self.assertEqual(
+            output_resources,
+            [
+                {"id": identifier}
+                for identifier in fixture.peer_declared_ids(run)
+            ],
+        )
+        self.assertEqual(len(output_resources), 5)
+        self.assertNotIn(
+            run.prefix + "-peer-identity", json.dumps(output_resources)
+        )
+        self.assertEqual(
+            deployment["properties"]["outputs"]["peerVmUuid"]["value"],
+            receipt["peer_vm_uuid"],
+        )
+        self.assertEqual(
+            deployment["properties"]["outputs"]["peerDiskUuid"]["value"],
+            receipt["peer_disk_uuid"],
+        )
+        self.assertEqual(run.peer_deployment_receipt(deployment), receipt)
+
     def test_peer_terminal_state_and_foreign_deployment_output_are_rejected(self):
         fixture = HypervAzureControllerTest()
         run, state = fixture.network_run_fixture()
@@ -2981,6 +3097,12 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
         deployment = fixture.peer_deployment(run)
         del deployment["properties"]["outputs"]["peerDiskUuid"]
         with self.assertRaisesRegex(RuntimeError, "disk UUID.*unavailable"):
+            run.peer_deployment_receipt(deployment)
+
+        deployment = fixture.peer_deployment(run)
+        deployment["properties"]["provisioningState"] = "Failed"
+        del deployment["properties"]["outputs"]
+        with self.assertRaisesRegex(RuntimeError, "provenance is invalid"):
             run.peer_deployment_receipt(deployment)
 
     def test_cleanup_revalidates_original_peer_deployment_outputs(self):

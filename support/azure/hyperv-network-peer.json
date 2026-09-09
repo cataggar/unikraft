@@ -51,6 +51,7 @@
     "peerNicName": "[concat(parameters('namePrefix'), '-peer-nic')]",
     "guestNicName": "[concat(parameters('namePrefix'), '-guest-nic')]",
     "peerVmName": "[concat(parameters('namePrefix'), '-peer-vm')]",
+    "peerIdentityDeploymentName": "[concat(parameters('namePrefix'), '-peer-identity')]",
     "subnetId": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), 'acceptance')]",
     "tags": {
       "managed-by": "unikraft-hyperv",
@@ -299,6 +300,45 @@
           }
         }
       }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2022-09-01",
+      "name": "[variables('peerIdentityDeploymentName')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/virtualMachines', variables('peerVmName'))]"
+      ],
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "peerDiskId": {
+            "value": "[reference(variables('peerVmName'), '2025-11-01').storageProfile.osDisk.managedDisk.id]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "peerDiskId": {
+              "type": "string"
+            }
+          },
+          "resources": [],
+          "outputs": {
+            "peerDiskId": {
+              "type": "string",
+              "value": "[parameters('peerDiskId')]"
+            },
+            "peerDiskUuid": {
+              "type": "string",
+              "value": "[reference(parameters('peerDiskId'), '2025-01-02').uniqueId]"
+            }
+          }
+        }
+      }
     }
   ],
   "outputs": {
@@ -308,15 +348,15 @@
     },
     "peerVmUuid": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', variables('peerVmName')), '2025-11-01', 'Full').properties.vmId]"
+      "value": "[reference(variables('peerVmName'), '2025-11-01').vmId]"
     },
     "peerDiskId": {
       "type": "string",
-      "value": "[resourceId('Microsoft.Compute/disks', concat(parameters('namePrefix'), '-peer-os'))]"
+      "value": "[reference(variables('peerIdentityDeploymentName'), '2022-09-01').outputs.peerDiskId.value]"
     },
     "peerDiskUuid": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Compute/disks', concat(parameters('namePrefix'), '-peer-os')), '2025-01-02', 'Full').properties.uniqueId]"
+      "value": "[reference(variables('peerIdentityDeploymentName'), '2022-09-01').outputs.peerDiskUuid.value]"
     },
     "peerNicId": {
       "type": "string",

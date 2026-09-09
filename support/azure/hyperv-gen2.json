@@ -166,7 +166,7 @@
     },
     "vmUuid": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', variables('vmName')), '2025-11-01', 'Full').properties.vmId]"
+      "value": "[reference(variables('vmName'), '2025-11-01').vmId]"
     },
     "osDiskId": {
       "type": "string",
