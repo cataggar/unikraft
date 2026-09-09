@@ -90,16 +90,24 @@ def verify_schedcoop_callbacks(functions, symbols):
             )
 
 
-def direct_target(functions, symbols, caller, callee):
+def direct_target_address(functions, symbols, caller, callee):
     if caller not in symbols or callee not in symbols:
-        return False
-    for _, op, operands in functions.get(symbols[caller], ("", ()))[1]:
+        return None
+    for address, op, operands in functions.get(
+        symbols[caller], ("", ())
+    )[1]:
         if not op.startswith(("call", "j")) or operands.startswith("*"):
             continue
         target = re.match(r"(?:0x)?([0-9a-f]+)\s+<", operands)
         if target and int(target[1], 16) == symbols[callee]:
-            return True
-    return False
+            return address
+    return None
+
+
+def direct_target(functions, symbols, caller, callee):
+    return direct_target_address(
+        functions, symbols, caller, callee
+    ) is not None
 
 
 def verify_fixed_smp_bindings(functions, symbols, kinds):
@@ -128,6 +136,31 @@ def verify_fixed_smp_bindings(functions, symbols, kinds):
         raise ValueError(
             "fixed SMP AP entry does not initialize the logical CPU"
         )
+    paging_symbols = (
+        "uk_paging_pt_get_active", "uk_paging_pt_activate_lcpu",
+    )
+    paging_present = tuple(name in symbols for name in paging_symbols)
+    if any(paging_present) and not all(paging_present):
+        raise ValueError("fixed SMP runtime page table binding is incomplete")
+    if all(paging_present):
+        entry = "uk_boot_fixed_smp_lcpu_entry"
+        init = direct_target_address(
+            functions, symbols, entry, "uk_lcpu_init"
+        )
+        get_active = direct_target_address(
+            functions, symbols, entry, "uk_paging_pt_get_active"
+        )
+        set_active = direct_target_address(
+            functions, symbols, entry, "uk_paging_pt_activate_lcpu"
+        )
+        if get_active is None or set_active is None:
+            raise ValueError(
+                "fixed SMP AP entry does not activate the runtime page table"
+            )
+        if not init < get_active < set_active:
+            raise ValueError(
+                "fixed SMP AP address-space initialization order is invalid"
+            )
 
 
 def verify(image, nm, objdump):

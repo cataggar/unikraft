@@ -9,6 +9,7 @@
 #include <uk/alloc.h>
 #include <uk/boot/smp.h>
 #include <uk/lcpu.h>
+#include <uk/paging.h>
 #include <uk/sched.h>
 #include <uk/thread.h>
 
@@ -18,6 +19,7 @@ static struct uk_alloc allocator;
 static struct uk_sched schedulers[4];
 static struct uk_thread bootstraps[4];
 static struct uk_lcpu lcpus[4];
+static struct uk_pagetable runtime_pt = { .token = 0x51U };
 static unsigned int scheduler_creates;
 static unsigned int bootstrap_creates;
 static unsigned int bootstrap_releases;
@@ -28,11 +30,14 @@ static unsigned int idle_publishes;
 static unsigned int irq_enables;
 static unsigned int blocks;
 static unsigned int lcpu_inits;
+static unsigned int paging_gets;
+static unsigned int paging_sets;
 static unsigned int ap_init_stage;
 static int scheduler_backing_live[4];
 static int lcpu_reported_halted[4];
 static int start_error[4];
 static int lcpu_init_error[4];
+static int paging_active = 1;
 static jmp_buf ap_exit;
 static int ap_halt_error;
 
@@ -86,10 +91,10 @@ void uk_thread_release(struct uk_thread *thread)
 int uk_sched_start_thread(struct uk_sched *sched, struct uk_thread *thread)
 {
 	assert(ukboot_host_cpu_idx == sched->lcpu_idx);
-	assert(ap_init_stage == 3);
+	assert(ap_init_stage == 4);
 	if (start_error[sched->lcpu_idx])
 		return start_error[sched->lcpu_idx];
-	ap_init_stage = 4;
+	ap_init_stage = 5;
 	thread->sched = sched;
 	sched->state = UK_SCHED_ONLINE;
 	return 0;
@@ -125,19 +130,37 @@ int uk_lcpu_init(struct uk_lcpu *lcpu)
 	return lcpu_init_error[ukboot_host_cpu_idx];
 }
 
+struct uk_pagetable *uk_paging_pt_get_active(void)
+{
+	assert(ukboot_host_cpu_idx > 0);
+	assert(ap_init_stage == 1);
+	paging_gets++;
+	return paging_active ? &runtime_pt : NULL;
+}
+
+int uk_paging_pt_activate_lcpu(struct uk_pagetable *pt)
+{
+	assert(ukboot_host_cpu_idx > 0);
+	assert(ap_init_stage == 1);
+	assert(pt == &runtime_pt && pt->token == 0x51U);
+	ap_init_stage = 2;
+	paging_sets++;
+	return 0;
+}
+
 void uk_lcpu_tlsp_set(uintptr_t tlsp)
 {
-	assert(ap_init_stage == 1);
+	assert(ap_init_stage == 2);
 	assert(tlsp == bootstraps[ukboot_host_cpu_idx].tlsp);
-	ap_init_stage = 2;
+	ap_init_stage = 3;
 	tls_sets++;
 }
 
 void uk_lcpu_set_auxsp(uintptr_t auxsp)
 {
-	assert(ap_init_stage == 2);
+	assert(ap_init_stage == 3);
 	assert(auxsp == bootstraps[ukboot_host_cpu_idx].auxsp);
-	ap_init_stage = 3;
+	ap_init_stage = 4;
 	auxsp_sets++;
 }
 
@@ -195,8 +218,7 @@ int main(int argc, char **argv)
 	assert(scheduler_creates == 4);
 	assert(bootstrap_creates == 3);
 
-	if (argc > 1) {
-		assert(argc == 2 && !strcmp(argv[1], "--init-failure"));
+	if (argc == 2 && !strcmp(argv[1], "--init-failure")) {
 		lcpu_init_error[1] = -ENODEV;
 		run_ap(1, 2);
 		assert(ap_halt_error == -ENODEV);
@@ -209,9 +231,25 @@ int main(int argc, char **argv)
 		assert(bootstrap_releases == 2 && scheduler_destroys == 2);
 		return 0;
 	}
+	if (argc == 2 && !strcmp(argv[1], "--paging-failure")) {
+		paging_active = 0;
+		run_ap(1, 2);
+		assert(ap_halt_error == -ENODEV);
+		assert(lcpu_inits == 1 && ap_init_stage == 1);
+		assert(paging_gets == 1 && paging_sets == 0);
+		assert(tls_sets == 0 && auxsp_sets == 0);
+		assert(idle_publishes == 0 && irq_enables == 0 && blocks == 0);
+		assert(uk_boot_fixed_smp_wait_online(cpus, 1) == -ENODEV);
+		uk_boot_fixed_smp_rollback(cpus, 3, 1);
+		assert(schedulers[1].state == UK_SCHED_QUARANTINED);
+		assert(bootstrap_releases == 2 && scheduler_destroys == 2);
+		return 0;
+	}
+	assert(argc == 1);
 
 	run_ap(1, 1);
-	assert(lcpu_inits == 1 && ap_init_stage == 4);
+	assert(lcpu_inits == 1 && ap_init_stage == 5);
+	assert(paging_gets == 1 && paging_sets == 1);
 	assert(tls_sets == 1 && auxsp_sets == 1);
 	assert(idle_publishes == 1 && irq_enables == 1 && blocks == 1);
 	assert(lcpu_reported_halted[1] && scheduler_backing_live[1]);
@@ -232,6 +270,7 @@ int main(int argc, char **argv)
 	run_ap(2, 2);
 	assert(ap_halt_error == -ECANCELED);
 	assert(lcpu_inits == 2 && ap_init_stage == 1);
+	assert(paging_gets == 1 && paging_sets == 1);
 	assert(tls_sets == 1 && auxsp_sets == 1);
 	assert(!scheduler_backing_live[2]);
 

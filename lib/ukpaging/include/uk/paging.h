@@ -462,6 +462,22 @@ void uk_paging_tlb_flush(void)
 struct uk_pagetable *uk_paging_pt_get_active(void);
 
 /**
+ * Activates a page table on the executing logical CPU without changing the
+ * paging subsystem's globally selected table.
+ *
+ * This allows an additional logical CPU to join an established address space
+ * without racing other CPUs on the active-table owner.
+ *
+ * @param pt
+ *   The page table instance to activate. The code of the function must be
+ *   mapped into the new address space at the same virtual address.
+ *
+ * @return
+ *   0 on success, a non-zero value otherwise
+ */
+int uk_paging_pt_activate_lcpu(struct uk_pagetable *pt);
+
+/**
  * Switches the active page table to the specified one.
  *
  * @param pt

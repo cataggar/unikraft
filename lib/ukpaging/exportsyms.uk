@@ -9,6 +9,7 @@ uk_paging_pt_add_mem
 uk_paging_pt_clone
 uk_paging_pt_free
 uk_paging_pt_get_active
+uk_paging_pt_activate_lcpu
 uk_paging_pt_init
 uk_paging_pt_set_active
 uk_paging_pt_walk

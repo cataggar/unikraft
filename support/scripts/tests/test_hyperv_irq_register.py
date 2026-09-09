@@ -68,7 +68,11 @@ class HypervFixedSmpBindingTest(unittest.TestCase):
             3: ("uk_acpi_cpu_count", [(3, "ret", "")]),
             5: (
                 "uk_boot_fixed_smp_lcpu_entry",
-                [(5, "call", "6 <uk_lcpu_init>")],
+                [
+                    (5, "call", "6 <uk_lcpu_init>"),
+                    (6, "call", "8 <uk_paging_pt_get_active>"),
+                    (7, "call", "9 <uk_paging_pt_activate_lcpu>"),
+                ],
             ),
         }
         self.symbols = {
@@ -78,6 +82,8 @@ class HypervFixedSmpBindingTest(unittest.TestCase):
             "uk_acpi_cpu_count": 3,
             "uk_boot_fixed_smp_lcpu_entry": 5,
             "uk_lcpu_init": 6,
+            "uk_paging_pt_get_active": 8,
+            "uk_paging_pt_activate_lcpu": 9,
         }
         self.kinds = {"ukplat_lcpu_count": ["T"]}
 
@@ -142,6 +148,39 @@ class HypervFixedSmpBindingTest(unittest.TestCase):
             with self.subTest(instructions=instructions):
                 self.functions[5] = ("uk_boot_fixed_smp_lcpu_entry", instructions)
                 with self.assertRaisesRegex(ValueError, "does not initialize"):
+                    irq.verify_fixed_smp_bindings(
+                        self.functions, self.symbols, self.kinds,
+                    )
+
+    def test_missing_or_misordered_ap_address_space_activation_is_rejected(self):
+        variants = (
+            (
+                [(5, "call", "6 <uk_lcpu_init>")],
+                "does not activate",
+            ),
+            (
+                [
+                    (5, "call", "8 <uk_paging_pt_get_active>"),
+                    (6, "call", "6 <uk_lcpu_init>"),
+                    (7, "call", "9 <uk_paging_pt_activate_lcpu>"),
+                ],
+                "initialization order",
+            ),
+            (
+                [
+                    (5, "call", "6 <uk_lcpu_init>"),
+                    (6, "call", "9 <uk_paging_pt_activate_lcpu>"),
+                    (7, "call", "8 <uk_paging_pt_get_active>"),
+                ],
+                "initialization order",
+            ),
+        )
+        for instructions, message in variants:
+            with self.subTest(message=message):
+                self.functions[5] = (
+                    "uk_boot_fixed_smp_lcpu_entry", instructions
+                )
+                with self.assertRaisesRegex(ValueError, message):
                     irq.verify_fixed_smp_bindings(
                         self.functions, self.symbols, self.kinds,
                     )

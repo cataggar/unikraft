@@ -13,6 +13,9 @@
 #include <uk/sched.h>
 #include <uk/schedcoop.h>
 #include <uk/thread.h>
+#if CONFIG_LIBUKPAGING
+#include <uk/paging.h>
+#endif
 
 enum fixed_smp_boot_state {
 	FIXED_SMP_UNUSED = 0,
@@ -94,6 +97,9 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 	unsigned int idx;
 	struct fixed_smp_boot_cpu *cpu;
 	unsigned int expected;
+#if CONFIG_LIBUKPAGING
+	struct uk_pagetable *pt;
+#endif
 	int rc;
 
 	UK_ASSERT(lcpu == uk_lcpu_get_current());
@@ -114,6 +120,20 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 		uk_lcpu_halt_error(-ECANCELED);
 	UK_ASSERT(cpu->sched && cpu->bootstrap);
 
+#if CONFIG_LIBUKPAGING
+	/*
+	 * Native AP startup enters on the static boot page table. Activate the
+	 * BSP-published runtime table before dereferencing heap-backed state.
+	 */
+	pt = uk_paging_pt_get_active();
+	if (unlikely(!pt)) {
+		rc = -ENODEV;
+		goto err_halt;
+	}
+	rc = uk_paging_pt_activate_lcpu(pt);
+	if (unlikely(rc))
+		goto err_halt;
+#endif
 	uk_lcpu_tlsp_set(cpu->bootstrap->tlsp);
 	uk_lcpu_set_auxsp(cpu->bootstrap->auxsp);
 	uk_pr_info("Fixed SMP: AP LCPU %u scheduler context active\n", idx);
