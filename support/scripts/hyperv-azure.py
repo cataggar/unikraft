@@ -4,6 +4,8 @@
 import argparse
 import base64
 from contextlib import contextmanager
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -43,7 +45,7 @@ LEGACY_APIC_MARKER = "Using legacy xAPIC MMIO"
 STATE_SCHEMA_VERSION = 1
 PREPARED_IMAGE_SCHEMA = "unikraft.hyperv.prepared-image"
 PREPARED_IMAGE_SCHEMA_VERSION = 2
-PREPARED_IMAGE_CONTROLLER_REVISION = 2
+PREPARED_IMAGE_CONTROLLER_REVISION = 3
 PREPARED_IMAGE_MANIFEST = "prepared-image-manifest.json"
 PREPARED_IMAGE_VHD = "unikraft.vhd"
 PREPARED_IMAGE_FILES = frozenset((PREPARED_IMAGE_MANIFEST, PREPARED_IMAGE_VHD))
@@ -62,6 +64,15 @@ RESERVATION_TAGS = {
     "purpose": "disposable-unikraft-acceptance",
     "disposable": "true",
 }
+RESERVATION_FIELDS = (
+    "schema", "schema_version", "phase", "subscription", "location",
+    "name_prefix", "resource_group", "tags", "resource_group_id",
+    "resource_count",
+)
+RESERVATION_CLAIM_FIELDS = (
+    "claim_id", "run_name_prefix", "image_sha256",
+    "prepared_manifest_sha256",
+)
 
 
 class AzureCliError(RuntimeError):
@@ -80,6 +91,13 @@ class AzureCliError(RuntimeError):
         )
 
 
+class AzureCliTimeout(RuntimeError):
+    def __init__(self, arguments):
+        super().__init__(
+            f"az {' '.join(arguments[:2])} timed out; private command details withheld"
+        )
+
+
 def azure_cli(arguments, *, subscription=None, private=False, env=None,
               timeout=300):
     command = [
@@ -93,11 +111,13 @@ def azure_cli(arguments, *, subscription=None, private=False, env=None,
     environment["AZURE_EXTENSION_USE_DYNAMIC_INSTALL"] = "no"
     if env:
         environment.update(env)
-    result = subprocess.run(
-        command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        env=environment,
-        timeout=timeout, check=False,
-    )
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", env=environment, timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise AzureCliTimeout(arguments) from None
     if result.returncode:
         raise AzureCliError(arguments, result, private)
     return json.loads(result.stdout) if result.stdout.strip() else None
@@ -116,6 +136,22 @@ def save_json(path, value):
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def fsync_directory(path):
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def save_durable_json(path, value):
+    save_json(path, value)
+    fsync_directory(path.parent)
 
 
 def save_private_text(path, value):
@@ -1103,7 +1139,7 @@ def validate_subscription_id(value):
     return str(parsed)
 
 
-def load_resource_group_reservation(path):
+def read_resource_group_reservation(path):
     path = path.absolute()
     try:
         if path.resolve(strict=True) != path:
@@ -1143,12 +1179,18 @@ def load_resource_group_reservation(path):
             raise ValueError("Resource-group reservation exceeds its size limit")
     finally:
         os.close(descriptor)
+    return path, parse_strict_json(value, "Resource-group reservation")
+
+
+def validate_resource_group_reservation(reservation, phases):
+    if not isinstance(reservation, dict):
+        raise ValueError("Resource-group reservation is not a JSON object")
+    phase = reservation.get("phase")
+    fields = RESERVATION_FIELDS + (
+        ("claim",) if phase in ("claiming", "consumed") else ()
+    )
     reservation = require_exact_fields(
-        parse_strict_json(value, "Resource-group reservation"), (
-            "schema", "schema_version", "phase", "subscription", "location",
-            "name_prefix", "resource_group", "tags", "resource_group_id",
-            "resource_count",
-        ), "Resource-group reservation",
+        reservation, fields, "Resource-group reservation"
     )
     subscription = validate_subscription_id(reservation["subscription"])
     prefix = reservation["name_prefix"]
@@ -1157,7 +1199,8 @@ def load_resource_group_reservation(path):
     if (
         reservation["schema"] != RESERVATION_SCHEMA
         or reservation["schema_version"] != 1
-        or reservation["phase"] != "group-created"
+        or type(reservation["schema_version"]) is not int
+        or phase not in phases
         or not isinstance(prefix, str)
         or not re.fullmatch(r"[a-z][a-z0-9-]{5,31}", prefix)
         or not isinstance(group, str)
@@ -1181,12 +1224,159 @@ def load_resource_group_reservation(path):
         or resource_group_id.lower() != expected_id.lower()
     ):
         raise ValueError("Resource-group reservation identity is invalid")
-    return {
+    result = {
         **reservation,
         "subscription": subscription,
         "resource_group_id": resource_group_id,
         "tags": expected_tags,
     }
+    if phase in ("claiming", "consumed"):
+        claim = require_exact_fields(
+            reservation["claim"], RESERVATION_CLAIM_FIELDS,
+            "Resource-group reservation claim",
+        )
+        if (
+            not isinstance(claim["claim_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", claim["claim_id"])
+            or not isinstance(claim["run_name_prefix"], str)
+            or not re.fullmatch(
+                r"[a-z][a-z0-9-]{5,31}", claim["run_name_prefix"]
+            )
+            or require_sha256(
+                claim["image_sha256"], "Reservation image fingerprint"
+            ) != claim["image_sha256"]
+            or require_sha256(
+                claim["prepared_manifest_sha256"],
+                "Reservation manifest fingerprint",
+            ) != claim["prepared_manifest_sha256"]
+        ):
+            raise ValueError("Resource-group reservation claim is invalid")
+        result["claim"] = dict(claim)
+    return result
+
+
+def load_resource_group_reservation(path):
+    _, reservation = read_resource_group_reservation(path)
+    return validate_resource_group_reservation(reservation, ("group-created",))
+
+
+class ResourceGroupReservationClaim:
+    def __init__(self, path):
+        self.path = path.absolute()
+        self.lock_path = self.path.with_name(self.path.name + ".lock")
+        self.descriptor = None
+        self.reservation = None
+        self.claim = None
+        self.claiming_document = None
+
+    def __enter__(self):
+        try:
+            if self.path.parent.resolve(strict=True) != self.path.parent:
+                raise ValueError(
+                    "Resource-group reservation directory must not contain symlinks"
+                )
+        except OSError as error:
+            raise ValueError(
+                "Resource-group reservation directory does not exist"
+            ) from error
+        flags = (
+            os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            self.descriptor = os.open(self.lock_path, flags, 0o600)
+        except OSError as error:
+            raise ValueError(
+                "Resource-group reservation lock must be a private regular file"
+            ) from error
+        try:
+            metadata = os.fstat(self.descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077
+            ):
+                raise ValueError(
+                    "Resource-group reservation lock must be owner-only"
+                )
+            try:
+                fcntl.flock(
+                    self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                )
+            except OSError as error:
+                if error.errno in (errno.EACCES, errno.EAGAIN):
+                    raise RuntimeError(
+                        "Resource-group reservation is already being claimed"
+                    ) from None
+                raise
+            path, reservation = read_resource_group_reservation(self.path)
+            if path != self.path:
+                raise ValueError("Resource-group reservation path changed")
+            self.reservation = validate_resource_group_reservation(
+                reservation, ("group-created",)
+            )
+            return self
+        except BaseException:
+            os.close(self.descriptor)
+            self.descriptor = None
+            raise
+
+    def bind(self, run_name_prefix, image_sha256, prepared_manifest_sha256):
+        if self.descriptor is None or self.reservation is None or self.claim:
+            raise RuntimeError("Resource-group reservation claim is not active")
+        claim = {
+            "claim_id": secrets.token_hex(16),
+            "run_name_prefix": run_name_prefix,
+            "image_sha256": require_sha256(
+                image_sha256, "Reservation image fingerprint"
+            ),
+            "prepared_manifest_sha256": require_sha256(
+                prepared_manifest_sha256,
+                "Reservation manifest fingerprint",
+            ),
+        }
+        validate_resource_group_reservation(
+            {
+                **self.reservation,
+                "phase": "claiming",
+                "claim": claim,
+            },
+            ("claiming",),
+        )
+        self.claim = claim
+        self.claiming_document = {
+            **self.reservation,
+            "phase": "claiming",
+            "claim": claim,
+        }
+        save_durable_json(self.path, self.claiming_document)
+        return {
+            "resource_group_id": self.reservation["resource_group_id"],
+            "original_tags": self.reservation["tags"],
+            "claim": dict(claim),
+        }
+
+    def mark_consumed(self):
+        if self.claiming_document is None:
+            raise RuntimeError("Resource-group reservation has not been bound")
+        _, current = read_resource_group_reservation(self.path)
+        current = validate_resource_group_reservation(current, ("claiming",))
+        if current != self.claiming_document:
+            raise RuntimeError(
+                "Resource-group reservation changed during its claim"
+            )
+        save_durable_json(
+            self.path, {**self.claiming_document, "phase": "consumed"}
+        )
+
+    def __exit__(self, _error_type, _error, _traceback):
+        if self.descriptor is not None:
+            try:
+                fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(self.descriptor)
+                self.descriptor = None
 
 
 def quota_count(value):
@@ -1449,7 +1639,10 @@ class AzureRun:
         acceptance = network.validate_acceptance(
             state.get("acceptance", {"mode": network.RAW_ACCEPTANCE_MODE})
         )
-        if acceptance["mode"] == network.NETWORK_ACCEPTANCE_MODE:
+        self.network_mode = (
+            acceptance["mode"] == network.NETWORK_ACCEPTANCE_MODE
+        )
+        if self.network_mode:
             receipt = state.get("prepared_image_import")
             if not isinstance(receipt, dict):
                 raise ValueError(
@@ -1464,6 +1657,7 @@ class AzureRun:
             })
 
     def az(self, arguments, **kwargs):
+        kwargs.setdefault("private", self.network_mode)
         return azure_cli(
             arguments, subscription=self.state["subscription"], **kwargs
         )
@@ -1471,14 +1665,13 @@ class AzureRun:
     def record(self, phase, **fields):
         self.state.update(fields)
         self.state["phase"] = phase
-        save_json(self.state_path, self.state)
+        save_durable_json(self.state_path, self.state)
 
     def require_owned(self, resource):
         tags = resource.get("tags") or {}
         if any(tags.get(key) != value for key, value in self.tags.items()):
             raise RuntimeError(
-                f"Refusing to use a resource without this run's ownership tags: "
-                f"{resource.get('id', resource.get('name', '<unknown>'))}"
+                "Refusing to use a resource without this run's ownership tags"
             )
 
     def require_owned_group(self, resource):
@@ -1518,6 +1711,22 @@ class AzureRun:
             or reservation["subscription"] != self.state["subscription"]
         ):
             raise ValueError("Reservation no longer matches the private run state")
+        reservation_claim = self.state.get("reservation_claim")
+        if (
+            not isinstance(reservation_claim, dict)
+            or reservation_claim.get("resource_group_id")
+            != reservation["resource_group_id"]
+            or reservation_claim.get("original_tags") != reservation["tags"]
+            or not isinstance(reservation_claim.get("claim"), dict)
+            or reservation_claim["claim"].get("run_name_prefix") != self.prefix
+            or reservation_claim["claim"].get("image_sha256")
+            != self.state["image_sha256"]
+            or reservation_claim["claim"].get("prepared_manifest_sha256")
+            != self.state["prepared_image_import"]["manifest_sha256"]
+        ):
+            raise ValueError(
+                "Reservation claim is not durably bound to this private run"
+            )
         group = self.az(["group", "show", "--name", self.group], private=True)
         if (
             not isinstance(group, dict)
@@ -1534,19 +1743,16 @@ class AzureRun:
         )
         if resources != []:
             raise RuntimeError("Reserved resource group is no longer empty")
-        self.record(
-            "claiming-reservation",
-            reservation_claim={
-                "resource_group_id": reservation["resource_group_id"],
-                "original_tags": reservation["tags"],
-            },
-        )
         group = self.az([
             "group", "update", "--name", self.group,
             "--tags", *self.resource_tags(group=True),
         ], private=True)
         if group.get("tags") != self.group_tags:
             raise RuntimeError("Resource-group reservation tag binding did not complete")
+        self.require_owned_group(group)
+        group = self.az(
+            ["group", "show", "--name", self.group], private=True
+        )
         self.require_owned_group(group)
         if self.az([
             "resource", "list", "--resource-group", self.group,
@@ -1621,6 +1827,124 @@ class AzureRun:
             raise RuntimeError("The private peer lifetime has expired")
         return max(1, min(maximum, int(remaining)))
 
+    def expected_resource_id(self, provider, resource_type, name):
+        group_id = self.state.get("resource_group_id")
+        if not isinstance(group_id, str):
+            raise RuntimeError("Private resource-group identity is unavailable")
+        return (
+            group_id.rstrip("/") + f"/providers/{provider}/"
+            f"{resource_type}/{name}"
+        )
+
+    @staticmethod
+    def require_resource_uuid(value, description):
+        if not isinstance(value, str):
+            raise RuntimeError(f"{description} is unavailable")
+        try:
+            parsed = uuid.UUID(value)
+        except ValueError:
+            raise RuntimeError(f"{description} is invalid") from None
+        if parsed.int == 0:
+            raise RuntimeError(f"{description} is invalid")
+        return str(parsed)
+
+    def peer_deployment_receipt(self, deployment):
+        if not isinstance(deployment, dict):
+            raise RuntimeError("Private peer deployment provenance is unavailable")
+        properties = deployment.get("properties")
+        expected_name = self.prefix + "-peer"
+        expected_id = self.expected_resource_id(
+            "Microsoft.Resources", "deployments", expected_name
+        )
+        if (
+            deployment.get("name") != expected_name
+            or str(deployment.get("id", "")).lower() != expected_id.lower()
+            or not isinstance(properties, dict)
+            or properties.get("provisioningState") != "Succeeded"
+        ):
+            raise RuntimeError("Private peer deployment provenance is invalid")
+        return {
+            "deployment_id": expected_id,
+            "correlation_id": self.require_resource_uuid(
+                properties.get("correlationId"),
+                "Private peer deployment correlation",
+            ),
+        }
+
+    def verified_peer_disk_for_cleanup(self, resource):
+        receipt = self.state.get("peer_deployment")
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "deployment_id", "correlation_id", "peer_vm_id", "peer_vm_uuid",
+            "peer_disk_id", "peer_disk_uuid",
+        }:
+            raise RuntimeError(
+                "Refusing to clean an unproven private peer OS disk"
+            )
+        expected_deployment_id = self.expected_resource_id(
+            "Microsoft.Resources", "deployments", self.prefix + "-peer"
+        )
+        expected_vm_id = self.expected_resource_id(
+            "Microsoft.Compute", "virtualMachines", self.peer_vm
+        )
+        expected_disk_id = self.expected_resource_id(
+            "Microsoft.Compute", "disks", self.prefix + "-peer-os"
+        )
+        if (
+            str(receipt["deployment_id"]).lower()
+            != expected_deployment_id.lower()
+            or str(receipt["peer_vm_id"]).lower() != expected_vm_id.lower()
+            or str(receipt["peer_disk_id"]).lower() != expected_disk_id.lower()
+            or self.require_resource_uuid(
+                receipt["correlation_id"],
+                "Private peer deployment correlation",
+            ) != receipt["correlation_id"]
+            or self.require_resource_uuid(
+                receipt["peer_vm_uuid"], "Private peer VM identity"
+            ) != receipt["peer_vm_uuid"]
+            or self.require_resource_uuid(
+                receipt["peer_disk_uuid"], "Private peer disk identity"
+            ) != receipt["peer_disk_uuid"]
+            or str(resource.get("id", "")).lower() != expected_disk_id.lower()
+            or resource.get("name") != self.prefix + "-peer-os"
+            or str(resource.get("type", "")).lower()
+            != "microsoft.compute/disks"
+            or resource.get("tags") not in (None, {})
+        ):
+            raise RuntimeError(
+                "Refusing to clean an unproven private peer OS disk"
+            )
+        peer_vm = self.az([
+            "vm", "show", "--resource-group", self.group,
+            "--name", self.peer_vm,
+        ], private=True)
+        self.require_owned(peer_vm)
+        attached_disk_id = (
+            peer_vm.get("storageProfile", {}).get("osDisk", {})
+            .get("managedDisk", {}).get("id")
+        )
+        if (
+            str(peer_vm.get("id", "")).lower() != expected_vm_id.lower()
+            or peer_vm.get("vmId") != receipt["peer_vm_uuid"]
+            or str(attached_disk_id or "").lower() != expected_disk_id.lower()
+        ):
+            raise RuntimeError(
+                "Refusing to clean a detached or replaced private peer OS disk"
+            )
+        disk = self.az([
+            "disk", "show", "--resource-group", self.group,
+            "--name", self.prefix + "-peer-os",
+        ], private=True)
+        if (
+            str(disk.get("id", "")).lower() != expected_disk_id.lower()
+            or disk.get("uniqueId") != receipt["peer_disk_uuid"]
+            or str(disk.get("managedBy") or "").lower()
+            != expected_vm_id.lower()
+            or disk.get("tags") not in (None, {})
+        ):
+            raise RuntimeError(
+                "Refusing to clean a detached or replaced private peer OS disk"
+            )
+
     def deploy_network_peer(self, network_config, peer_image, deadline):
         peer_script = read_regular_file(
             network.PEER_SCRIPT, 4 * 1024 * 1024,
@@ -1647,13 +1971,18 @@ class AzureRun:
         }
         self.record("deploying-peer")
         with self.private_parameters(parameters) as parameter_file:
-            self.az([
+            deployment = self.az([
                 "deployment", "group", "create", "--resource-group", self.group,
                 "--name", self.prefix + "-peer", "--mode", "Incremental",
                 "--template-file",
                 str(SUPPORT / "azure" / "hyperv-network-peer.json"),
                 "--parameters", "@" + str(parameter_file),
             ], private=True, timeout=self.deadline_timeout(deadline, 300))
+        deployment_receipt = self.peer_deployment_receipt(deployment)
+        self.record(
+            "peer-deployment-succeeded",
+            peer_deployment=deployment_receipt,
+        )
         password = None
 
         peer_vm = self.az([
@@ -1661,9 +1990,23 @@ class AzureRun:
             "--name", self.peer_vm,
         ], private=True)
         self.require_owned(peer_vm)
+        expected_peer_vm_id = self.expected_resource_id(
+            "Microsoft.Compute", "virtualMachines", self.peer_vm
+        )
+        expected_peer_disk_id = self.expected_resource_id(
+            "Microsoft.Compute", "disks", self.prefix + "-peer-os"
+        )
         image_reference = peer_vm.get("storageProfile", {}).get("imageReference", {})
+        attached_peer_disk_id = (
+            peer_vm.get("storageProfile", {}).get("osDisk", {})
+            .get("managedDisk", {}).get("id")
+        )
         if (
-            peer_vm.get("provisioningState") != "Succeeded"
+            str(peer_vm.get("id", "")).lower()
+            != expected_peer_vm_id.lower()
+            or str(attached_peer_disk_id or "").lower()
+            != expected_peer_disk_id.lower()
+            or peer_vm.get("provisioningState") != "Succeeded"
             or peer_vm.get("hardwareProfile", {}).get("vmSize")
             != network.PEER_VM_SIZE
             or any(
@@ -1677,6 +2020,32 @@ class AzureRun:
             "disk", "show", "--resource-group", self.group,
             "--name", peer_disk_name,
         ], private=True)
+        peer_vm_uuid = self.require_resource_uuid(
+            peer_vm.get("vmId"), "Private peer VM identity"
+        )
+        peer_disk_uuid = self.require_resource_uuid(
+            peer_disk.get("uniqueId"), "Private peer disk identity"
+        )
+        if (
+            str(peer_disk.get("id", "")).lower()
+            != expected_peer_disk_id.lower()
+            or str(peer_disk.get("managedBy", "")).lower()
+            != expected_peer_vm_id.lower()
+            or peer_disk.get("tags") not in (None, {}, self.tags)
+        ):
+            raise RuntimeError(
+                "Private peer OS disk lacks verified creation provenance"
+            )
+        deployment_receipt.update({
+            "peer_vm_id": expected_peer_vm_id,
+            "peer_vm_uuid": peer_vm_uuid,
+            "peer_disk_id": expected_peer_disk_id,
+            "peer_disk_uuid": peer_disk_uuid,
+        })
+        self.record(
+            "peer-resources-verified",
+            peer_deployment=deployment_receipt,
+        )
         if peer_disk.get("tags") != self.tags:
             peer_disk = self.az([
                 "disk", "update", "--resource-group", self.group,
@@ -1684,9 +2053,11 @@ class AzureRun:
             ], private=True)
         self.require_owned(peer_disk)
         if (
-            not isinstance(peer_disk.get("id"), str)
+            str(peer_disk.get("id", "")).lower()
+            != expected_peer_disk_id.lower()
+            or peer_disk.get("uniqueId") != peer_disk_uuid
             or str(peer_disk.get("managedBy", "")).lower()
-            != str(peer_vm["id"]).lower()
+            != expected_peer_vm_id.lower()
         ):
             raise RuntimeError("Private peer OS disk is not owned by the peer VM")
 
@@ -1714,8 +2085,9 @@ class AzureRun:
             nics[name] = nic
         self.record(
             "peer-created",
-            peer_vm_id=peer_vm["id"],
-            peer_disk_id=peer_disk["id"],
+            peer_deployment=deployment_receipt,
+            peer_vm_id=expected_peer_vm_id,
+            peer_disk_id=expected_peer_disk_id,
             peer_nic_id=nics[peer_nic_name]["id"],
             guest_nic_id=nics[guest_nic_name]["id"],
         )
@@ -1787,18 +2159,6 @@ class AzureRun:
             try:
                 self.require_owned(resource)
             except RuntimeError:
-                resource_type = str(resource.get("type", "")).lower()
-                expected_id = (
-                    str(self.state.get("resource_group_id", "")).rstrip("/")
-                    + "/providers/Microsoft.Compute/disks/"
-                    + self.prefix + "-peer-os"
-                )
-                expected_vm_id = (
-                    str(self.state.get("resource_group_id", "")).rstrip("/")
-                    + "/providers/Microsoft.Compute/virtualMachines/"
-                    + self.peer_vm
-                )
-                tags = resource.get("tags")
                 if (
                     network.validate_acceptance(
                         self.state.get(
@@ -1806,26 +2166,9 @@ class AzureRun:
                             {"mode": network.RAW_ACCEPTANCE_MODE},
                         )
                     )["mode"] != network.NETWORK_ACCEPTANCE_MODE
-                    or resource_type != "microsoft.compute/disks"
-                    or resource.get("name") != self.prefix + "-peer-os"
-                    or str(resource.get("id", "")).lower()
-                    != expected_id.lower()
-                    or tags not in (None, {})
                 ):
                     raise
-                disk = self.az([
-                    "disk", "show", "--resource-group", self.group,
-                    "--name", self.prefix + "-peer-os",
-                ], private=True)
-                if (
-                    str(disk.get("id", "")).lower() != expected_id.lower()
-                    or str(disk.get("managedBy") or "").lower()
-                    not in ("", expected_vm_id.lower())
-                    or disk.get("tags") not in (None, {})
-                ):
-                    raise RuntimeError(
-                        "Refusing to clean an unbound private peer OS disk"
-                    )
+                self.verified_peer_disk_for_cleanup(resource)
         self.record("deleting-group")
         self.az(["group", "delete", "--name", self.group, "--yes"], timeout=900)
         if self.az(["group", "exists", "--name", self.group]) is not False:
@@ -2096,65 +2439,85 @@ def run_prepared(directory, stage, timeout, keep_resources, *,
     network_run = network.private_network(
         acceptance, guest_ipv4, subnet
     )
-    reservation = None
-    if resource_group_reservation is not None:
-        reservation = load_resource_group_reservation(
-            resource_group_reservation
-        )
-        if subscription is not None and (
-            validate_subscription_id(subscription) != reservation["subscription"]
-        ):
-            raise ValueError(
-                "Explicit subscription does not match the private reservation"
-            )
-        selected_subscription = reservation["subscription"]
-        if reservation["location"] != state["location"]:
-            raise ValueError(
-                "Private reservation location does not match imported image state"
-            )
-    elif subscription is not None:
-        selected_subscription = validate_subscription_id(subscription)
-    else:
-        raise ValueError(
-            "Application-network runs require --subscription or "
-            "--resource-group-reservation"
-        )
 
-    preflight = check_network_subscription(
-        state["location"], state["vm_size"], selected_subscription
-    )
-    state.update(
-        subscription=selected_subscription,
-        network_run=network_run,
-        network_preflight=preflight,
-    )
-    if reservation is not None:
-        state.update(
-            resource_group=reservation["resource_group"],
-            resource_group_id=reservation["resource_group_id"],
-            group_precreated=True,
-        )
-    save_json(state_path, state)
-    run = AzureRun(state, state_path)
-    with interrupt_as_exception():
-        try:
-            if reservation is None:
-                run.create_group()
-            else:
-                run.claim_group_reservation(reservation)
-            run.upload_disk(image)
-            if image_sha256(image) != state["image_sha256"]:
-                raise ValueError("VHD changed during upload")
-            peer_deadline = time.monotonic() + timeout
-            run.deploy_network_peer(
-                network_run, preflight["peer_image"], peer_deadline
+    def execute_network_run(reservation=None, reservation_claim=None):
+        if reservation is not None:
+            if subscription is not None and (
+                validate_subscription_id(subscription)
+                != reservation["subscription"]
+            ):
+                raise ValueError(
+                    "Explicit subscription does not match the private reservation"
+                )
+            if reservation["location"] != state["location"]:
+                raise ValueError(
+                    "Private reservation location does not match imported image state"
+                )
+            selected_subscription = reservation["subscription"]
+            receipt = reservation_claim.bind(
+                state["name_prefix"], state["image_sha256"],
+                state["prepared_image_import"]["manifest_sha256"],
             )
-            run.wait_for_peer_ready(peer_deadline)
-            run.deploy_vm(state["guest_nic_id"], peer_deadline)
-            return run.wait_for_network_acceptance(peer_deadline)
-        finally:
-            if state["phase"] != "prepared":
-                run.cleanup()
+            state.update(
+                phase="claiming-reservation",
+                subscription=selected_subscription,
+                network_run=network_run,
+                resource_group=reservation["resource_group"],
+                resource_group_id=reservation["resource_group_id"],
+                group_precreated=True,
+                reservation_claim=receipt,
+            )
+            save_durable_json(state_path, state)
+            run = AzureRun(state, state_path)
+        else:
+            if subscription is None:
+                raise ValueError(
+                    "Application-network runs require --subscription or "
+                    "--resource-group-reservation"
+                )
+            selected_subscription = validate_subscription_id(subscription)
+            run = None
+
+        with interrupt_as_exception():
+            try:
+                preflight = check_network_subscription(
+                    state["location"], state["vm_size"],
+                    selected_subscription,
+                )
+                state.update(
+                    subscription=selected_subscription,
+                    network_run=network_run,
+                    network_preflight=preflight,
+                )
+                save_json(state_path, state)
+                if run is None:
+                    run = AzureRun(state, state_path)
+                    run.create_group()
+                else:
+                    run.claim_group_reservation(reservation)
+                    reservation_claim.mark_consumed()
+                run.upload_disk(image)
+                if image_sha256(image) != state["image_sha256"]:
+                    raise ValueError("VHD changed during upload")
+                peer_deadline = time.monotonic() + timeout
+                run.deploy_network_peer(
+                    network_run, preflight["peer_image"], peer_deadline
+                )
+                run.wait_for_peer_ready(peer_deadline)
+                run.deploy_vm(state["guest_nic_id"], peer_deadline)
+                return run.wait_for_network_acceptance(peer_deadline)
+            finally:
+                if run is not None and state["phase"] != "prepared":
+                    run.cleanup()
+
+    if resource_group_reservation is None:
+        return execute_network_run()
+    with ResourceGroupReservationClaim(
+        resource_group_reservation
+    ) as reservation_claim:
+        return execute_network_run(
+            reservation_claim.reservation, reservation_claim
+        )
 
 
 def cleanup_state(directory):
@@ -2283,7 +2646,11 @@ def main():
         elif args.action == "cleanup":
             cleanup_state(args.state_dir)
             print("No Azure resources remain for this run")
-    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            "A bounded subprocess timed out; private command details withheld"
+        ) from None
+    except (OSError, RuntimeError, ValueError) as error:
         raise SystemExit(str(error)) from None
 
 

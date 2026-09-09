@@ -174,7 +174,7 @@ class HypervNetworkControllerTest(unittest.TestCase):
             "UK_HYPERV_NETWORK_APP_READY",
             "UK_HYPERV_IO_READY",
             "HYPERV_ACCEPTANCE FINAL_RESULT PASS storage=PASS network=PASS",
-            "[    1.234] Info: [libukboot] <boot.c @ 523>: main returned 0",
+            "[    1.234] Info: [libukboot] <boot.c @  523> main returned 0",
         ]
         return "\n".join(lines)
 
@@ -346,10 +346,13 @@ class HypervNetworkControllerTest(unittest.TestCase):
 
     def test_only_exact_zero_main_return_record_can_complete_guest(self):
         guest = self.guest_log()
-        producer = "[    1.234] Info: [libukboot] <boot.c @ 523>: main returned 0"
+        producer = (
+            "[    1.234] Info: [libukboot] "
+            "<boot.c @  523> main returned 0"
+        )
         normalized = (
             "\x1b[32m[    1.234] Info: [libukboot] "
-            "<boot.c @ 523>: main returned 0\x1b[0m\0\r"
+            "<boot.c @  523> main returned 0\x1b[0m\0\r"
         )
         controller.inspect_guest_log(
             guest.replace(producer, normalized),
@@ -405,7 +408,7 @@ class HypervNetworkControllerTest(unittest.TestCase):
             guest.replace("adapter_tx_busy=0", "adapter_tx_busy=1"),
             guest.replace(
                 "[    1.234] Info: [libukboot] "
-                "<boot.c @ 523>: main returned 0",
+                "<boot.c @  523> main returned 0",
                 "",
             ),
             guest.replace(

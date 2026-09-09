@@ -40,7 +40,7 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 MAIN_RETURN = re.compile(
     r"^(?:\[\s*[0-9]+(?:\.[0-9]+)?\]\s+)?"
     r"(?:Info:\s+)?(?:\[[A-Za-z0-9_.-]{1,64}\]\s+)?"
-    r"(?:<[^<>\r\n]{1,160}>:\s+)?main returned (-?[0-9]+)$"
+    r"(?:<[^<>\r\n]{1,160}>:?\s+)?main returned (-?[0-9]+)$"
 )
 
 

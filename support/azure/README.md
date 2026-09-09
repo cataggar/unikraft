@@ -319,7 +319,12 @@ python3 support/scripts/hyperv-azure.py cleanup --state-dir "$STATE"
 Cleanup is idempotent and refuses to delete a group if its ownership tags, or
 those of any contained resource, do not match the run. An interrupted or
 partially uploaded run is not silently resumed: clean it up, then prepare a
-fresh state directory for another attempt.
+fresh state directory for another attempt. The implicit private-peer OS disk is
+accepted without tags only when private state already contains the successful
+ARM deployment correlation plus the exact VM and disk immutable identities,
+and the live VM still owns that exact disk. A disk present before deployment,
+or one that is detached, replaced, or left by an unverified partial deployment,
+stops cleanup rather than turning a matching name into deletion authority.
 
 ## Run private application-network acceptance
 
@@ -346,13 +351,22 @@ returned acceptance evidence.
 A reservation is a private owner-only, non-symlink JSON file with schema
 `unikraft.hyperv.resource-group-reservation`, version 1, phase
 `group-created`, an explicit subscription/location/name prefix/group/group ID,
-the exact disposable ownership tags, and `resource_count: 0`. Before claiming
-it, the controller verifies the selected account, exact live group identity
-and tags, and a second live empty-resource listing. It records claim intent in
-private state before replacing the reservation tags with the new imported
-image/run/manifest ownership identity. A stale reservation file cannot claim
-the retagged group again. Normal runs still refuse to adopt any existing
-group.
+the exact disposable ownership tags, and `resource_count: 0`. The controller
+first takes a nonblocking exclusive lock on a stable owner-only sibling lock
+file. While retaining that lock across atomic reservation-file replacement, it
+binds the reservation durably to the private run, exact image, and reviewed
+manifest before any Azure check or mutation. It then verifies the selected
+account, exact live group identity and tags, and two empty-resource listings
+around the tag update. A successful claim leaves the reservation in the
+`consumed` phase; a crash leaves it fail-closed in `claiming`, so neither can be
+silently retried.
+
+This exclusivity guarantee applies to cooperating processes using the same
+canonical reservation path on one local filesystem. Copying the private
+reservation creates a distinct lock domain and is unsupported; Azure tag
+updates are not treated as compare-and-swap. Keep the consumed file and its
+`.lock` sibling private for audit rather than copying or recreating them.
+Normal runs still refuse to adopt any existing group.
 
 Before any resource creation, the controller validates the Gen2 guest size,
 one private `Standard_B1s` peer, x64/generation capabilities, combined regional
@@ -376,8 +390,11 @@ peer retains the 600-second process lifetime and five-second exchange bounds.
 Both serial streams must then contain unique ordered correlated evidence:
 lease, ARP, three TCP exchanges, six UDP exchanges, exact bytes and transcript
 digests, guest/peer cleanup, peer `EOF`, application final, overall I/O-ready,
-and `main returned 0`. Raw DHCP, peer-only success, stale/duplicate records,
-restart, bad endpoint/nonce, missing EOF, or any failure is rejected.
+and the exact producer `main returned 0` record. Integer wire fields must be
+JSON integers (never booleans or floats), and the fixed TCP producer schedules
+must prove at least 2/9/3 writes with the final total matching the three
+records. Raw DHCP, peer-only success, stale/duplicate records, restart, bad
+endpoint/nonce, missing EOF, or any failure is rejected.
 
 Private `peer-serial.log`, `guest-serial.log`, and
 `network-acceptance.json` are retained in the state directory. The entire
