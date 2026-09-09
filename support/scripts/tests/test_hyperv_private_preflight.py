@@ -446,14 +446,6 @@ class PrivatePreflightFixture(unittest.TestCase):
         }
         return vm, disk
 
-    def identity_deployment(self, run):
-        return {
-            "id": run.expected_host_ids()["identity_deployment_id"],
-            "name": run.prefix + "-host-identity",
-            "type": "Microsoft.Resources/deployments",
-            "tags": None,
-        }
-
     def deployment(self, run, state, provisioning="Succeeded"):
         receipt = state["host_deployment"]
         image = state["cloud_preflight"]["image"]
@@ -1832,9 +1824,8 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             self.begin_operation(run, state)
             group = {"id": state["resource_group_id"], "tags": run.group_tags}
             vm, disk = self.vm_disk(run, state)
-            identity_deployment = self.identity_deployment(run)
             run.az.side_effect = [
-                True, group, [vm, disk, identity_deployment],
+                True, group, [vm, disk],
                 vm, disk,
                 vm, disk,
                 None, False,
@@ -2122,48 +2113,6 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 "tags": run.operation_tags(),
             }]
             with self.assertRaisesRegex(RuntimeError, "inventory"):
-                run.verify_resource_inventory()
-
-    def test_resource_inventory_accepts_only_exact_identity_deployment(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            run, state = self.run_fixture(Path(temporary))
-            self.begin_operation(run, state)
-            ids = run.expected_host_ids()
-            resources = [
-                {
-                    "id": ids[key],
-                    "name": name,
-                    "type": resource_type,
-                    "tags": run.operation_tags(),
-                }
-                for key, name, resource_type in (
-                    ("nsg_id", run.prefix + "-nsg",
-                     "Microsoft.Network/networkSecurityGroups"),
-                    ("vnet_id", run.prefix + "-vnet",
-                     "Microsoft.Network/virtualNetworks"),
-                    ("storage_id", run.storage,
-                     "Microsoft.Storage/storageAccounts"),
-                    ("nic_id", run.host_nic,
-                     "Microsoft.Network/networkInterfaces"),
-                    ("vm_id", run.host_vm,
-                     "Microsoft.Compute/virtualMachines"),
-                    ("disk_id", run.host_disk,
-                     "Microsoft.Compute/disks"),
-                    ("schedule_id", "shutdown-computevm-" + run.host_vm,
-                     "Microsoft.DevTestLab/schedules"),
-                )
-            ]
-            resources.append(self.identity_deployment(run))
-            run.az.return_value = resources
-            run.verify_host_identity = mock.Mock()
-            run.verify_resource_inventory()
-            run.verify_host_identity.assert_called_once_with()
-
-            resources[-1] = {
-                **resources[-1],
-                "id": ids["identity_deployment_id"] + "-replacement",
-            }
-            with self.assertRaisesRegex(RuntimeError, "not exact"):
                 run.verify_resource_inventory()
 
     @mock.patch.object(preflight.azure, "azure_cli")

@@ -2301,10 +2301,6 @@ class PrivatePreflightRun(azure.AzureRun):
             "deployment_id": self.expected_resource_id(
                 "Microsoft.Resources", "deployments", self.prefix + "-host"
             ),
-            "identity_deployment_id": self.expected_resource_id(
-                "Microsoft.Resources", "deployments",
-                self.prefix + "-host-identity",
-            ),
             "vm_id": self.expected_resource_id(
                 "Microsoft.Compute", "virtualMachines", self.host_vm
             ),
@@ -2330,17 +2326,6 @@ class PrivatePreflightRun(azure.AzureRun):
                 "shutdown-computevm-" + self.host_vm,
             ),
         }
-
-    def verified_host_identity_deployment(self, resource):
-        ids = self.expected_host_ids()
-        return (
-            str(resource.get("id", "")).lower()
-            == ids["identity_deployment_id"].lower()
-            and resource.get("name") == self.prefix + "-host-identity"
-            and str(resource.get("type", "")).lower()
-            == "microsoft.resources/deployments"
-            and resource.get("tags") in (None, {})
-        )
 
     def begin_host_deployment(self, shutdown_time):
         ids = self.expected_host_ids()
@@ -2983,26 +2968,17 @@ class PrivatePreflightRun(azure.AzureRun):
                 "shutdown-computevm-" + self.host_vm,
             ),
         }
-        identity_deployment = (
-            "microsoft.resources/deployments",
-            self.prefix + "-host-identity",
-        )
         actual = {
             (str(resource.get("type", "")).lower(), resource.get("name"))
             for resource in resources
         }
-        if actual - {identity_deployment} != expected:
+        if actual != expected:
             raise RuntimeError(
                 "Private preflight resource inventory is not exact"
             )
         for resource in resources:
             key = (str(resource.get("type", "")).lower(), resource.get("name"))
-            if key == identity_deployment:
-                if not self.verified_host_identity_deployment(resource):
-                    raise RuntimeError(
-                        "Private preflight identity deployment is not exact"
-                    )
-            elif key == (
+            if key == (
                 "microsoft.compute/disks", self.host_disk
             ):
                 self.verify_host_identity()
@@ -3512,8 +3488,6 @@ class PrivatePreflightRun(azure.AzureRun):
             resource_type = str(resource.get("type", "")).lower()
             if resource_type == "microsoft.compute/disks":
                 self.verified_host_disk_for_cleanup(resource)
-            elif self.verified_host_identity_deployment(resource):
-                continue
             elif (
                 resource_type
                 == "microsoft.compute/virtualmachines/extensions"

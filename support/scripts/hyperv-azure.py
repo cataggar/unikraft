@@ -2069,8 +2069,6 @@ class AzureRun:
             ("Microsoft.Network", "networkInterfaces",
              self.prefix + "-guest-nic"),
             ("Microsoft.Compute", "virtualMachines", self.peer_vm),
-            ("Microsoft.Resources", "deployments",
-             self.prefix + "-peer-identity"),
         )
         return [
             self.expected_resource_id(provider, resource_type, name)
@@ -2943,19 +2941,6 @@ class AzureRun:
             return False
         return True
 
-    def verified_peer_identity_deployment(self, resource):
-        expected_id = self.expected_resource_id(
-            "Microsoft.Resources", "deployments",
-            self.prefix + "-peer-identity",
-        )
-        return (
-            str(resource.get("id", "")).lower() == expected_id.lower()
-            and resource.get("name") == self.prefix + "-peer-identity"
-            and str(resource.get("type", "")).lower()
-            == "microsoft.resources/deployments"
-            and resource.get("tags") in (None, {})
-        )
-
     def cleanup(self):
         if self.az(["group", "exists", "--name", self.group]) is False:
             self.record("cleaned")
@@ -3050,11 +3035,6 @@ class AzureRun:
                     and self.verified_peer_vm_extension(
                         resource, verified_peer_vm_id
                     )
-                ):
-                    continue
-                if (
-                    network_mode and verified_peer_vm_id is not None
-                    and self.verified_peer_identity_deployment(resource)
                 ):
                     continue
                 if (

@@ -903,10 +903,6 @@ class HypervAzureControllerTest(unittest.TestCase):
             run.expected_resource_id(
                 "Microsoft.Compute", "virtualMachines", run.peer_vm,
             ),
-            run.expected_resource_id(
-                "Microsoft.Resources", "deployments",
-                run.prefix + "-peer-identity",
-            ),
         ]
 
     @classmethod
@@ -3017,6 +3013,33 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
         self.assertEqual(state["phase"], "peer-deployment-succeeded")
         self.assertEqual(state["peer_deployment"], receipt)
 
+    def test_peer_receipt_accepts_five_leaf_resources_and_nested_outputs(self):
+        fixture = HypervAzureControllerTest()
+        run, _ = fixture.network_run_fixture()
+        receipt = fixture.peer_receipt(run)
+        deployment = fixture.peer_deployment(run)
+        output_resources = deployment["properties"]["outputResources"]
+        self.assertEqual(
+            output_resources,
+            [
+                {"id": identifier}
+                for identifier in fixture.peer_declared_ids(run)
+            ],
+        )
+        self.assertEqual(len(output_resources), 5)
+        self.assertNotIn(
+            run.prefix + "-peer-identity", json.dumps(output_resources)
+        )
+        self.assertEqual(
+            deployment["properties"]["outputs"]["peerVmUuid"]["value"],
+            receipt["peer_vm_uuid"],
+        )
+        self.assertEqual(
+            deployment["properties"]["outputs"]["peerDiskUuid"]["value"],
+            receipt["peer_disk_uuid"],
+        )
+        self.assertEqual(run.peer_deployment_receipt(deployment), receipt)
+
     def test_peer_terminal_state_and_foreign_deployment_output_are_rejected(self):
         fixture = HypervAzureControllerTest()
         run, state = fixture.network_run_fixture()
@@ -3148,15 +3171,6 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             "name": run.peer_vm + "/fixture-monitor",
             "tags": extra_tags,
         }
-        identity_deployment = {
-            "id": run.expected_resource_id(
-                "Microsoft.Resources", "deployments",
-                run.prefix + "-peer-identity",
-            ),
-            "name": run.prefix + "-peer-identity",
-            "type": "Microsoft.Resources/deployments",
-            "tags": None,
-        }
         peer_vm = {
             **vm_resource, "vmId": receipt["peer_vm_uuid"],
             "provisioningState": "Updating",
@@ -3173,7 +3187,6 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
         run.az.side_effect = [
             True, group, [
                 vm_resource, disk_resource, extension, tagged_extension,
-                identity_deployment,
             ],
             fixture.peer_deployment(run),
             peer_vm, peer_disk, None, None, False,
@@ -3206,14 +3219,6 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             {
                 **tagged_extension,
                 "tags": {"fixture-extra": "not-owned"},
-            },
-            {
-                **identity_deployment,
-                "id": run.expected_resource_id(
-                    "Microsoft.Resources", "deployments",
-                    run.prefix + "-foreign-identity",
-                ),
-                "name": run.prefix + "-foreign-identity",
             },
         )
         for resource in invalid:
