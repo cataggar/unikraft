@@ -15,13 +15,14 @@ import json
 import os
 from pathlib import Path
 import re
-import resource
 import secrets
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -1024,23 +1025,50 @@ def build_private_image(
         "LC_ALL": "C",
     })
 
-    def bound_log():
-        resource.setrlimit(
-            resource.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024)
-        )
-
     log_path = output_directory / "build.log"
     with log_path.open("xb") as log:
         os.chmod(log_path, 0o600)
+        process = subprocess.Popen(
+            command, cwd=repository, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=environment, start_new_session=True,
+        )
+        overflow = threading.Event()
+
+        def drain_output():
+            written = 0
+            for chunk in iter(lambda: process.stdout.read(64 * 1024), b""):
+                remaining = 8 * 1024 * 1024 - written
+                if remaining > 0:
+                    log.write(chunk[:remaining])
+                    written += min(len(chunk), remaining)
+                if len(chunk) > remaining:
+                    overflow.set()
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+        reader = threading.Thread(target=drain_output, daemon=True)
+        reader.start()
         try:
-            result = subprocess.run(
-                command, cwd=repository, stdin=subprocess.DEVNULL,
-                stdout=log, stderr=subprocess.STDOUT, timeout=timeout,
-                check=False, env=environment, preexec_fn=bound_log,
-            )
+            returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            reader.join()
+            process.stdout.close()
             raise RuntimeError("Private local native build timed out") from None
-    if result.returncode:
+        reader.join()
+        process.stdout.close()
+        log.flush()
+        os.fsync(log.fileno())
+    if overflow.is_set():
+        raise RuntimeError("Private local native build log exceeded 8 MiB")
+    if returncode:
         raise RuntimeError(
             "Private local native build failed; inspect its owner-only log"
         )
