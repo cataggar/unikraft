@@ -320,11 +320,13 @@ Cleanup is idempotent and refuses to delete a group if its ownership tags, or
 those of any contained resource, do not match the run. An interrupted or
 partially uploaded run is not silently resumed: clean it up, then prepare a
 fresh state directory for another attempt. The implicit private-peer OS disk is
-accepted without tags only when private state already contains the successful
-ARM deployment correlation plus the exact VM and disk immutable identities,
-and the live VM still owns that exact disk. A disk present before deployment,
-or one that is detached, replaced, or left by an unverified partial deployment,
-stops cleanup rather than turning a matching name into deletion authority.
+not adopted by adding ownership tags. Cleanup requires the successful ARM
+deployment correlation plus the exact VM and disk immutable identities in
+private state, and the live VM must still own that exact disk, even if its tags
+match the run. A disk present before deployment, one that is detached or
+replaced, or a peer VM without a proven OS disk stops cleanup, including after
+an unverified partial deployment. Matching names or tags alone never authorize
+deletion through the VM or resource group.
 
 ## Run private application-network acceptance
 

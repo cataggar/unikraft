@@ -1558,6 +1558,44 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
                     ["group", "delete"],
                 )
 
+    def test_cleanup_refuses_peer_vm_without_proven_os_disk(self):
+        for partial_receipt in (False, True):
+            with self.subTest(partial_receipt=partial_receipt):
+                fixture = HypervAzureControllerTest()
+                run, state = fixture.network_run_fixture()
+                state["phase"] = (
+                    "peer-deployment-succeeded" if partial_receipt
+                    else "deploying-peer"
+                )
+                if partial_receipt:
+                    state["peer_deployment"] = {
+                        "deployment_id": run.expected_resource_id(
+                            "Microsoft.Resources", "deployments",
+                            run.prefix + "-peer",
+                        ),
+                        "correlation_id": "11111111-1111-4111-8111-111111111111",
+                    }
+                group = {
+                    "id": state["resource_group_id"], "tags": run.group_tags,
+                }
+                peer_vm = {
+                    "id": run.expected_resource_id(
+                        "Microsoft.Compute", "virtualMachines", run.peer_vm,
+                    ),
+                    "name": run.peer_vm,
+                    "type": "Microsoft.Compute/virtualMachines",
+                    "tags": run.tags,
+                }
+                run.az.side_effect = [
+                    True, group, [peer_vm], None, False,
+                ]
+                with self.assertRaisesRegex(RuntimeError, "detached or replaced"):
+                    run.cleanup()
+                self.assertFalse(any(
+                    call.args[0][:2] == ["group", "delete"]
+                    for call in run.az.call_args_list
+                ))
+
     def test_cleanup_refuses_detached_or_replaced_peer_disk(self):
         fixture = HypervAzureControllerTest()
         run, state = fixture.network_run_fixture()

@@ -2179,8 +2179,16 @@ class AzureRun:
         )
         verified_peer_disk = None
         if network_mode:
+            expected_peer_vm_id = self.expected_resource_id(
+                "Microsoft.Compute", "virtualMachines", self.peer_vm
+            )
             expected_peer_disk_id = self.expected_resource_id(
                 "Microsoft.Compute", "disks", self.prefix + "-peer-os"
+            )
+            peer_vm_present = any(
+                str(resource.get("id", "")).lower() == expected_peer_vm_id.lower()
+                or resource.get("name") == self.peer_vm
+                for resource in resources
             )
             peer_disk_name = self.prefix + "-peer-os"
             candidates = [
@@ -2207,9 +2215,9 @@ class AzureRun:
             if candidates:
                 verified_peer_disk = candidates[0]
                 self.verified_peer_disk_for_cleanup(verified_peer_disk)
-            elif receipt_complete:
+            elif receipt_complete or peer_vm_present:
                 raise RuntimeError(
-                    "Refusing to clean a detached or replaced "
+                    "Refusing to clean an unproven, detached or replaced "
                     "private peer OS disk"
                 )
         for resource in resources:
