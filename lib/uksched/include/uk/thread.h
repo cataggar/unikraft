@@ -679,7 +679,9 @@ void uk_thread_wake(struct uk_thread *thread);
 #if CONFIG_LIBUKSCHED_FIXED_SMP
 /*
  * If an error is returned with @published set, the runnable transition is
- * committed. The only safe retry is uk_sched_kick_retry(thread->sched, ...).
+ * committed. Callers may retry only with a scheduler reference whose
+ * lifetime they already own; the thread may run, terminate, and be reclaimed
+ * before this function returns.
  */
 int uk_thread_wake_published(struct uk_thread *thread, int *published);
 #endif

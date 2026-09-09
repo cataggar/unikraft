@@ -17,6 +17,11 @@
 #define HOST_AP_STARTED		2
 #define HOST_AP_FAILED		4
 #define HOST_AP_QUARANTINED	5
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+#define HOST_AP_ROLLBACK_STATE	HOST_AP_QUARANTINED
+#else
+#define HOST_AP_ROLLBACK_STATE	HOST_AP_FAILED
+#endif
 
 _Thread_local uint64_t hyperv_host_cpu_index;
 
@@ -38,6 +43,7 @@ static int release_enable;
 static unsigned char reference_page[4096] __attribute__((aligned(4096)));
 static unsigned int host_cpu_count = 1;
 static unsigned int start_calls;
+static unsigned int start_attempts;
 static unsigned int host_start_limit;
 static int host_start_error;
 static int defer_start_cpu = -1;
@@ -48,7 +54,7 @@ static uintptr_t host_ap_entry;
 static int host_boot_wait_error;
 static unsigned int host_boot_wait_count;
 static unsigned int host_boot_rollback_count;
-static int host_boot_rollback_clean;
+static unsigned int host_boot_rollback_attempted;
 
 #define HOST_WAIT_STEPS 8
 struct host_wait_step {
@@ -230,12 +236,12 @@ int uk_boot_fixed_smp_wait_online(const uint64_t *indices,
 	return host_boot_wait_error;
 }
 void uk_boot_fixed_smp_rollback(const uint64_t *indices,
-				unsigned int count, int clean)
+				unsigned int count, unsigned int attempted)
 {
 	for (unsigned int i = 0; i < count; i++)
 		assert(indices[i] == i + 1);
 	host_boot_rollback_count = count;
-	host_boot_rollback_clean = clean;
+	host_boot_rollback_attempted = attempted;
 }
 int uk_lcpu_start(const uint64_t *indices, unsigned int *count,
 		  uintptr_t *stacks, uintptr_t *entries,
@@ -245,6 +251,7 @@ int uk_lcpu_start(const uint64_t *indices, unsigned int *count,
 	unsigned int requested = *count;
 
 	for (unsigned int i = 0; i < requested; i++) {
+		start_attempts++;
 		if (i == host_start_limit) {
 			*count = i;
 			hyperv_host_cpu_index = caller;
@@ -287,6 +294,7 @@ int hyperv_time_host_ap_start_state(void);
 int hyperv_time_host_ap_start_error(void);
 unsigned int hyperv_time_host_ap_requested(void);
 unsigned int hyperv_time_host_ap_started(void);
+unsigned int hyperv_time_host_ap_attempted(void);
 unsigned int hyperv_time_host_ap_waited(void);
 unsigned int hyperv_time_host_ap_late(void);
 unsigned int hyperv_time_host_cpu_generation(unsigned int index);
@@ -311,6 +319,7 @@ static void reset_observations(void)
 	reference_time = 0;
 	host_cpu_count = 1;
 	start_calls = 0;
+	start_attempts = 0;
 	host_start_limit = UINT_MAX;
 	host_start_error = -EIO;
 	defer_start_cpu = -1;
@@ -319,7 +328,7 @@ static void reset_observations(void)
 	host_boot_wait_error = 0;
 	host_boot_wait_count = 0;
 	host_boot_rollback_count = 0;
-	host_boot_rollback_clean = -1;
+	host_boot_rollback_attempted = 0;
 	host_wait_step_count = 0;
 	host_wait_calls = 0;
 	for (unsigned int i = 0; i < HOST_WAIT_STEPS; i++) {
@@ -356,6 +365,7 @@ static void test_single_cpu_startup_noop(void)
 	assert(hyperv_time_host_ap_start_state() == HOST_AP_IDLE);
 	assert(hyperv_time_host_ap_requested() == 0);
 	assert(hyperv_time_host_ap_started() == 0);
+	assert(hyperv_time_host_ap_attempted() == 0);
 	assert(hyperv_time_host_ap_waited() == 0);
 	assert(start_calls == 0);
 	assert_bsp_online();
@@ -391,6 +401,7 @@ static void test_cpu_setup_routing_and_ap_shutdown(void)
 	assert(hyperv_time_host_ap_start_state() == HOST_AP_STARTED);
 	assert(hyperv_time_host_ap_requested() == 2);
 	assert(hyperv_time_host_ap_started() == 2);
+	assert(hyperv_time_host_ap_attempted() == 2);
 	assert(hyperv_time_host_ap_waited() == 2);
 	assert(hyperv_time_host_ap_late() == 0);
 	assert(hyperv_time_host_lifecycle_generation() == 3);
@@ -446,25 +457,29 @@ static void test_partial_ap_start_rollback(void)
 	reset_observations();
 	hyperv_host_cpu_index = 0;
 	ukplat_time_init();
-	host_cpu_count = 3;
+	host_cpu_count = 4;
 	host_start_limit = 1;
 	host_start_error = -EIO;
 	assert(ukplat_lcpu_startup_hook() == -EIO);
-	assert(hyperv_time_host_ap_start_state() == HOST_AP_FAILED);
+	assert(hyperv_time_host_ap_start_state() == HOST_AP_ROLLBACK_STATE);
 	assert(hyperv_time_host_ap_start_error() == -EIO);
-	assert(hyperv_time_host_ap_requested() == 2);
+	assert(hyperv_time_host_ap_requested() == 3);
 	assert(hyperv_time_host_ap_started() == 1);
+	assert(hyperv_time_host_ap_attempted() == 2);
 	assert(hyperv_time_host_ap_waited() == 0);
 	assert(hyperv_time_host_ap_late() == 0);
 #if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
-	assert(host_boot_rollback_count == 2);
-	assert(host_boot_rollback_clean == 1);
+	assert(host_boot_rollback_count == 3);
+	assert(host_boot_rollback_attempted == 2);
 #endif
 	assert(start_calls == 1);
+	assert(start_attempts == 2);
 	assert(enable_count[1] == 1 && disable_count[1] == 1);
 	assert(enable_count[2] == 0 && disable_count[2] == 0);
+	assert(enable_count[3] == 0 && disable_count[3] == 0);
 	assert_ap_offline(1);
 	assert_ap_offline(2);
+	assert_ap_offline(3);
 	assert_bsp_online();
 	assert(hyperv_time_host_lifecycle_generation() == 2);
 
@@ -486,15 +501,16 @@ static void test_wait_timeout_rollback(void)
 	host_wait_steps[0].rc = -ETIMEDOUT;
 	host_wait_steps[0].count = 1;
 	assert(ukplat_lcpu_startup_hook() == -ETIMEDOUT);
-	assert(hyperv_time_host_ap_start_state() == HOST_AP_FAILED);
+	assert(hyperv_time_host_ap_start_state() == HOST_AP_ROLLBACK_STATE);
 	assert(hyperv_time_host_ap_start_error() == -ETIMEDOUT);
 	assert(hyperv_time_host_ap_requested() == 2);
 	assert(hyperv_time_host_ap_started() == 2);
+	assert(hyperv_time_host_ap_attempted() == 2);
 	assert(hyperv_time_host_ap_waited() == 1);
 	assert(hyperv_time_host_ap_late() == 0);
 #if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
 	assert(host_boot_rollback_count == 2);
-	assert(host_boot_rollback_clean == 1);
+	assert(host_boot_rollback_attempted == 2);
 #endif
 	assert(disable_count[1] == 1 && disable_count[2] == 1);
 	assert_ap_offline(1);
@@ -518,14 +534,15 @@ static void test_ap_init_failure_rollback(void)
 	assert(ukplat_lcpu_startup_hook() == -EIO);
 	assert(ap_init_result[1] == 0);
 	assert(ap_init_result[2] == -EIO);
-	assert(hyperv_time_host_ap_start_state() == HOST_AP_FAILED);
+	assert(hyperv_time_host_ap_start_state() == HOST_AP_ROLLBACK_STATE);
 	assert(hyperv_time_host_ap_requested() == 2);
 	assert(hyperv_time_host_ap_started() == 2);
+	assert(hyperv_time_host_ap_attempted() == 2);
 	assert(hyperv_time_host_ap_waited() == 2);
 	assert(hyperv_time_host_ap_late() == 0);
 #if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
 	assert(host_boot_rollback_count == 2);
-	assert(host_boot_rollback_clean == 1);
+	assert(host_boot_rollback_attempted == 2);
 #endif
 	assert(enable_count[1] == 1 && disable_count[1] == 1);
 	assert(enable_count[2] == 1 && disable_count[2] == 1);
@@ -550,14 +567,15 @@ static void test_late_ap_arrival_rollback(void)
 	assert(ukplat_lcpu_startup_hook() == -ETIMEDOUT);
 	assert(ap_init_result[1] == 0);
 	assert(ap_init_result[2] == -ECANCELED);
-	assert(hyperv_time_host_ap_start_state() == HOST_AP_FAILED);
+	assert(hyperv_time_host_ap_start_state() == HOST_AP_ROLLBACK_STATE);
 	assert(hyperv_time_host_ap_requested() == 2);
 	assert(hyperv_time_host_ap_started() == 2);
+	assert(hyperv_time_host_ap_attempted() == 2);
 	assert(hyperv_time_host_ap_waited() == 1);
 	assert(hyperv_time_host_ap_late() == 1);
 #if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
 	assert(host_boot_rollback_count == 2);
-	assert(host_boot_rollback_clean == 1);
+	assert(host_boot_rollback_attempted == 2);
 #endif
 	assert(enable_count[1] == 1 && disable_count[1] == 1);
 	assert(enable_count[2] == 0 && disable_count[2] == 0);
@@ -585,10 +603,11 @@ static void test_rollback_stop_failure_quarantines(void)
 	assert(hyperv_time_host_ap_start_error() == -EIO);
 	assert(hyperv_time_host_ap_requested() == 1);
 	assert(hyperv_time_host_ap_started() == 1);
+	assert(hyperv_time_host_ap_attempted() == 1);
 	assert(hyperv_time_host_ap_waited() == 0);
 #if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
 	assert(host_boot_rollback_count == 1);
-	assert(host_boot_rollback_clean == 0);
+	assert(host_boot_rollback_attempted == 1);
 #endif
 	assert(hyperv_time_host_cpu_state(1) == HYPERV_CPU_ONLINE);
 	assert(hyperv_time_host_cpu_generation(1) == 2);
@@ -623,9 +642,10 @@ static void test_scheduler_readiness_failure_rolls_back(void)
 	assert(ukplat_lcpu_startup_hook() == -EIO);
 	assert(host_boot_wait_count == 2);
 	assert(host_boot_rollback_count == 2);
-	assert(host_boot_rollback_clean == 1);
-	assert(hyperv_time_host_ap_start_state() == HOST_AP_FAILED);
+	assert(host_boot_rollback_attempted == 2);
+	assert(hyperv_time_host_ap_start_state() == HOST_AP_QUARANTINED);
 	assert(hyperv_time_host_ap_started() == 2);
+	assert(hyperv_time_host_ap_attempted() == 2);
 	assert(hyperv_time_host_ap_waited() == 2);
 	assert_ap_offline(1);
 	assert_ap_offline(2);

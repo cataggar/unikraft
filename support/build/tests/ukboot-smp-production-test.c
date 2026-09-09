@@ -26,6 +26,8 @@ static unsigned int auxsp_sets;
 static unsigned int idle_publishes;
 static unsigned int irq_enables;
 static unsigned int blocks;
+static int scheduler_backing_live[4];
+static int lcpu_reported_halted[4];
 static int start_error[4];
 static jmp_buf ap_exit;
 static int ap_halt_error;
@@ -49,6 +51,7 @@ void uk_schedcoop_fixed_destroy(struct uk_sched *sched)
 {
 	assert(ukboot_host_cpu_idx == 0);
 	assert(sched->state == UK_SCHED_ROLLED_BACK);
+	assert(!scheduler_backing_live[sched->lcpu_idx]);
 	scheduler_destroys++;
 }
 
@@ -136,6 +139,7 @@ void uk_thread_block(struct uk_thread *thread)
 
 void uk_sched_yield(void)
 {
+	scheduler_backing_live[ukboot_host_cpu_idx] = 1;
 	longjmp(ap_exit, 1);
 }
 
@@ -154,37 +158,54 @@ static void run_ap(unsigned int idx, int expected_exit)
 	if (!exit_reason)
 		uk_boot_fixed_smp_lcpu_entry(&lcpus[idx]);
 	assert(exit_reason == expected_exit);
+	lcpu_reported_halted[idx] = 1;
 	ukboot_host_cpu_idx = 0;
 }
 
 int main(void)
 {
-	const __u64 cpu1 = 1;
-	const __u64 cpu2 = 2;
+	const __u64 cpus[] = { 1, 2, 3 };
+	unsigned int creates;
 
 	for (unsigned int i = 0; i < 4; i++)
 		lcpus[i].idx = i;
 	assert(uk_boot_fixed_smp_prepare(&allocator, &allocator,
-					 &allocator, 3) == 0);
-	assert(scheduler_creates == 3);
-	assert(bootstrap_creates == 2);
+					 &allocator, 4) == 0);
+	assert(scheduler_creates == 4);
+	assert(bootstrap_creates == 3);
 
 	run_ap(1, 1);
 	assert(tls_sets == 1 && auxsp_sets == 1);
 	assert(idle_publishes == 1 && irq_enables == 1 && blocks == 1);
-	assert(uk_boot_fixed_smp_wait_online(&cpu1, 1) == 0);
+	assert(lcpu_reported_halted[1] && scheduler_backing_live[1]);
+	assert(uk_boot_fixed_smp_wait_online(cpus, 1) == 0);
 
-	uk_boot_fixed_smp_rollback(&cpu1, 1, 1);
-	assert(bootstrap_releases == 1);
-	assert(scheduler_destroys == 1);
-
-	start_error[2] = -EIO;
-	run_ap(2, 2);
-	assert(ap_halt_error == -EIO);
-	assert(uk_boot_fixed_smp_wait_online(&cpu2, 1) == -EIO);
-	uk_boot_fixed_smp_rollback(&cpu2, 1, 0);
+	/*
+	 * CPUs 1 and 2 were attempted. CPU 1 has reported HALTED while still
+	 * retaining scheduler backing; CPU 2 may arrive late. CPU 3 was never
+	 * attempted and is the only safe release.
+	 */
+	uk_boot_fixed_smp_rollback(cpus, 3, 2);
+	assert(schedulers[1].state == UK_SCHED_QUARANTINED);
 	assert(schedulers[2].state == UK_SCHED_QUARANTINED);
 	assert(bootstrap_releases == 1);
 	assert(scheduler_destroys == 1);
+
+	/* A late attempted AP is rejected without switching to freed backing. */
+	run_ap(2, 2);
+	assert(ap_halt_error == -ECANCELED);
+	assert(tls_sets == 1 && auxsp_sets == 1);
+	assert(!scheduler_backing_live[2]);
+
+	/* Quarantine and never-started cleanup are idempotent. */
+	uk_boot_fixed_smp_rollback(cpus, 3, 2);
+	assert(bootstrap_releases == 1);
+	assert(scheduler_destroys == 1);
+
+	/* Retained ownership prevents an unbounded second allocation set. */
+	creates = scheduler_creates;
+	assert(uk_boot_fixed_smp_prepare(&allocator, &allocator,
+					 &allocator, 4) == -EBUSY);
+	assert(scheduler_creates == creates);
 	return 0;
 }

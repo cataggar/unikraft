@@ -599,7 +599,8 @@ void uk_schedcoop_fixed_destroy(struct uk_sched *sched)
 	struct schedcoop *c = uksched2schedcoop(sched);
 	struct uk_alloc *a = sched->a;
 
-	UK_ASSERT(sched->state != UK_SCHED_ONLINE);
+	UK_ASSERT(sched->state == UK_SCHED_PREPARED ||
+		  sched->state == UK_SCHED_ROLLED_BACK);
 	uk_sched_unbind_lcpu(sched);
 	if (c->worker) {
 		c->worker->sched = NULL;

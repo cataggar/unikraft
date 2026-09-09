@@ -23,8 +23,13 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu);
 int uk_boot_fixed_smp_wait_online(const __u64 *indices,
 				   unsigned int count);
 
+/*
+ * Retain every resource in the attempted prefix: a halted LCPU may still be
+ * executing on its scheduler-owned stack or TLS. Only the never-attempted
+ * suffix can be released.
+ */
 void uk_boot_fixed_smp_rollback(const __u64 *indices,
-				unsigned int count, int clean);
+				unsigned int count, unsigned int attempted);
 #endif
 
 #endif /* __UK_BOOT_SMP_H__ */

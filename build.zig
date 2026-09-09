@@ -1270,6 +1270,31 @@ pub fn build(b: *std.Build) void {
     });
     schedcoop_smp_tests.root_module.linkSystemLibrary("pthread", .{});
     const run_schedcoop_smp_tests = b.addRunArtifact(schedcoop_smp_tests);
+    const uksched_wake_tests = b.addExecutable(.{
+        .name = "uksched-wake-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    uksched_wake_tests.root_module.addIncludePath(
+        b.path("support/build/tests/uksched-wake-host-include"),
+    );
+    uksched_wake_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "lib/uksched/wake.c",
+            "support/build/tests/uksched-wake-production-test.c",
+        },
+        .flags = &.{
+            "-std=c11",
+            "-D_GNU_SOURCE",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+        },
+    });
+    const run_uksched_wake_tests = b.addRunArtifact(uksched_wake_tests);
     const ukboot_smp_tests = b.addExecutable(.{
         .name = "ukboot-smp-production-test",
         .root_module = b.createModule(.{
@@ -1299,9 +1324,11 @@ pub fn build(b: *std.Build) void {
         "Run fixed cooperative-SMP queue and wake lifecycle fixtures",
     );
     schedcoop_smp_test_step.dependOn(&run_schedcoop_smp_tests.step);
+    schedcoop_smp_test_step.dependOn(&run_uksched_wake_tests.step);
     schedcoop_smp_test_step.dependOn(&run_ukboot_smp_tests.step);
     schedcoop_smp_test_step.dependOn(&run_hyperv_fixed_smp_tests.step);
     test_step.dependOn(&run_schedcoop_smp_tests.step);
+    test_step.dependOn(&run_uksched_wake_tests.step);
     const vmbus_lifecycle_tests = b.step(
         "test-vmbus-lifecycle",
         "Run hosted VMBus control, channel, and disconnect lifecycle fixtures",
@@ -1366,6 +1393,7 @@ pub fn build(b: *std.Build) void {
     hyperv_regression_tests.dependOn(storvsc_regression_tests);
     hyperv_regression_tests.dependOn(network_regression_tests);
     hyperv_regression_tests.dependOn(&run_schedcoop_smp_tests.step);
+    hyperv_regression_tests.dependOn(&run_uksched_wake_tests.step);
     hyperv_regression_tests.dependOn(&run_ukboot_smp_tests.step);
     hyperv_regression_tests.dependOn(&run_hyperv_fixed_smp_tests.step);
     if (builtin.cpu.arch == .x86_64) {

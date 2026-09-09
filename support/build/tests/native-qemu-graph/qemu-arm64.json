@@ -343,6 +343,7 @@
       "objects": [
         "$BUILD_DIR/libuksched/sched.o",
         "$BUILD_DIR/libuksched/thread.o",
+        "$BUILD_DIR/libuksched/wake.o",
         "$BUILD_DIR/libuksched/isrwake.isr.o",
         "$BUILD_DIR/libuksched/libinfo.libuklibid.o"
       ],
