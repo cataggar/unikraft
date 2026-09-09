@@ -373,6 +373,9 @@ int uk_sched_start(struct uk_sched *s)
 	 * NOTE: We assume that if we have a TLS pointer, it points to
 	 *       an TLS that is derived from the Unikraft TLS template.
 	 */
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	uk_pr_info("Fixed SMP: capture BSP scheduler context\n");
+#endif
 	tlsp = uk_lcpu_tlsp_get();
 	auxsp = uk_pcpuvar_current_get(UK_LCPU_AUXSP_SYM);
 	main_thread = uk_thread_create_bare(s->a,
@@ -381,10 +384,17 @@ int uk_sched_start(struct uk_sched *s)
 					    "init", NULL, NULL);
 	if (!main_thread)
 		return -ENOMEM;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	uk_pr_info("Fixed SMP: BSP scheduler context ready\n");
+#endif
 
 	ret = _uk_sched_start(s, main_thread);
 	if (ret < 0)
 		uk_thread_release(main_thread);
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	else
+		uk_pr_info("Fixed SMP: BSP scheduler online\n");
+#endif
 	return ret;
 }
 

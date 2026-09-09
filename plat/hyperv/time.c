@@ -679,13 +679,24 @@ hyperv_ap_start_rollback(const __u64 indices[], unsigned int started,
 
 int ukplat_lcpu_init_hook(void)
 {
+	int is_bsp = uk_lcpu_current_is_bsp();
 	int rc;
 
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	if (!is_bsp)
+		uk_pr_info("Hyper-V: AP LCPU %lu platform init entered\n",
+			   uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx));
+#endif
 	if (__atomic_load_n(&hyperv_time_initialized, __ATOMIC_ACQUIRE) !=
 	    HYPERV_TIME_RUNNING)
-		rc = uk_lcpu_current_is_bsp() ? 0 : -EAGAIN;
+		rc = is_bsp ? 0 : -EAGAIN;
 	else
 		rc = hyperv_cpu_init_current(0);
+#if CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+	if (!is_bsp)
+		uk_pr_info("Hyper-V: AP LCPU %lu platform init returned %d\n",
+			   uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx), rc);
+#endif
 	return rc;
 }
 

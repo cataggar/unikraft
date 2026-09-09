@@ -342,6 +342,9 @@ static int schedcoop_start(struct uk_sched *s,
 	/* Since we are now starting to schedule, we save the current timestamp
 	 * as the start time for the first time slice.
 	 */
+#if CONFIG_LIBUKSCHEDCOOP_FIXED_SMP
+	uk_pr_info("Fixed SMP: BSP scheduler callback entered\n");
+#endif
 	c->ts_prev_switch = ukplat_monotonic_clock();
 
 	/* NOTE: We do not put `main_thread` into the thread list.
@@ -352,6 +355,7 @@ static int schedcoop_start(struct uk_sched *s,
 #if CONFIG_LIBUKSCHEDCOOP_FIXED_SMP
 	/* Boot publishes all fixed schedulers before enabling BSP/AP IRQs. */
 	(void)s;
+	uk_pr_info("Fixed SMP: BSP scheduler callback complete\n");
 #else
 	uk_lcpu_enable_irq();
 #endif

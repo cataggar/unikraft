@@ -98,6 +98,7 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 
 	UK_ASSERT(idx > 0 && idx < CONFIG_UKPLAT_CPU_MAXCOUNT);
 	UK_ASSERT(lcpu == uk_lcpu_get_current());
+	uk_pr_info("Fixed SMP: AP LCPU %u scheduler entry\n", idx);
 	cpu = &fixed_smp_cpus[idx];
 	expected = FIXED_SMP_PREPARED;
 	if (!__atomic_compare_exchange_n(&cpu->state, &expected,
@@ -109,10 +110,12 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 
 	uk_lcpu_tlsp_set(cpu->bootstrap->tlsp);
 	uk_lcpu_set_auxsp(cpu->bootstrap->auxsp);
+	uk_pr_info("Fixed SMP: AP LCPU %u scheduler context active\n", idx);
 
 	rc = uk_sched_start_thread(cpu->sched, cpu->bootstrap);
 	if (unlikely(rc))
 		goto err_halt;
+	uk_pr_info("Fixed SMP: AP LCPU %u scheduler started\n", idx);
 
 	expected = FIXED_SMP_STARTING;
 	if (!__atomic_compare_exchange_n(&cpu->state, &expected,
@@ -123,6 +126,7 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 		uk_sched_set_state(cpu->sched, UK_SCHED_QUARANTINED);
 		goto err_halt;
 	}
+	uk_pr_info("Fixed SMP: AP LCPU %u scheduler online\n", idx);
 	uk_lcpu_startup_idle();
 	uk_lcpu_enable_irq();
 
