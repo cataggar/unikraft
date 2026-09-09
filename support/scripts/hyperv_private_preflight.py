@@ -963,6 +963,13 @@ def build_private_image(
     wrapper_tools = {
         "make": ("make", None),
         "python3": ("python", None),
+        "bison": (
+            "bison",
+            {
+                "BISON_PKGDATADIR": Path(bison_data).resolve(strict=True),
+                "M4": resolved["m4"],
+            },
+        ),
         "yacc": (
             "bison",
             {
@@ -970,6 +977,7 @@ def build_private_image(
                 "M4": resolved["m4"],
             },
         ),
+        "flex": ("flex", {"M4": resolved["m4"]}),
         "lex": ("flex", {"M4": resolved["m4"]}),
         "llvm-nm": ("llvm-nm", None),
         "llvm-objcopy": ("llvm-objcopy", None),
