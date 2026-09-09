@@ -266,6 +266,37 @@ def expected_budget(files, qemu_support):
     }
 
 
+def validate_packaging_report(report, efi_sha256, efi_size, file_size):
+    expected = azure.packaging_contract(efi_sha256, file_size)
+    report = exact_fields(
+        report,
+        tuple(expected) + (
+            "boot-file-size", "disk-guid", "esp-partition-guid",
+            "esp-volume-id",
+        ),
+        "Fixed-VHD packaging contract",
+    )
+    azure.check_packaging_report(report, efi_sha256, file_size)
+    if type(report["boot-file-size"]) is not int or (
+        report["boot-file-size"] != efi_size
+    ):
+        raise ValueError("Fixed-VHD boot file size is invalid")
+    if (
+        type(report["esp-volume-id"]) is not int
+        or not 0 < report["esp-volume-id"] <= 0xffffffff
+    ):
+        raise ValueError("Fixed-VHD ESP volume ID is invalid")
+    for field in ("disk-guid", "esp-partition-guid"):
+        value = report[field]
+        try:
+            parsed = uuid.UUID(value) if isinstance(value, str) else None
+        except ValueError:
+            parsed = None
+        if parsed is None or parsed.int == 0 or str(parsed) != value:
+            raise ValueError(f"Fixed-VHD {field} is invalid")
+    return dict(report)
+
+
 def validate_input_manifest(value):
     value = exact_fields(
         value,
@@ -335,15 +366,9 @@ def validate_input_manifest(value):
         or expected["remaining_bytes"] < 0
     ):
         raise ValueError("Private-preflight staged files exceed 256 MiB")
-    packaging = exact_fields(
-        value["packaging"],
-        tuple(azure.packaging_contract(
-            files["efi"]["sha256"], files["vhd"]["size"]
-        )),
-        "Fixed-VHD packaging contract",
-    )
-    azure.check_packaging_report(
-        packaging, files["efi"]["sha256"], files["vhd"]["size"]
+    packaging = validate_packaging_report(
+        value["packaging"], files["efi"]["sha256"], files["efi"]["size"],
+        files["vhd"]["size"],
     )
     return {
         **value,
@@ -587,15 +612,9 @@ def generate_input(
             json_output=True,
         )
         (output_directory / "miz-generate-check.log").unlink(missing_ok=True)
-        azure.check_packaging_report(
-            packaging, files["efi"]["sha256"], files["vhd"]["size"]
-        )
-        packaging = exact_fields(
-            packaging,
-            tuple(azure.packaging_contract(
-                files["efi"]["sha256"], files["vhd"]["size"]
-            )),
-            "Generated packaging contract",
+        packaging = validate_packaging_report(
+            packaging, files["efi"]["sha256"], files["efi"]["size"],
+            files["vhd"]["size"],
         )
         if sha256_prefix(
             output_directory / INPUT_NAMES["vhd"], azure.VIRTUAL_SIZE
@@ -734,8 +753,9 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
             "--expected-virtual-size", "66M",
             str(inputs / INPUT_NAMES["vhd"]),
         ], state_directory / "miz-check.log", json_output=True)
-        azure.check_packaging_report(
+        checked = validate_packaging_report(
             checked, manifest["files"]["efi"]["sha256"],
+            manifest["files"]["efi"]["size"],
             manifest["files"]["vhd"]["size"],
         )
         if (

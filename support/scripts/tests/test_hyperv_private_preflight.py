@@ -32,6 +32,17 @@ def base64_encode(value):
     ).decode()
 
 
+def packaging_contract(efi_sha256, efi_size, file_size):
+    value = preflight.azure.packaging_contract(efi_sha256, file_size)
+    value.update({
+        "boot-file-size": efi_size,
+        "disk-guid": "7e7ff0d3-0472-5a76-a74c-8679a83fafbe",
+        "esp-partition-guid": "70a887c3-dd2d-5f06-a5da-bdcfc00a0b5c",
+        "esp-volume-id": 159129288,
+    })
+    return value
+
+
 class PrivatePreflightFixture(unittest.TestCase):
     def implementation(self):
         return {
@@ -98,8 +109,9 @@ class PrivatePreflightFixture(unittest.TestCase):
                 "sha256": "d" * 64,
                 "size": 8 * 1024 * 1024,
             },
-            "packaging": preflight.azure.packaging_contract(
-                files["efi"]["sha256"], files["vhd"]["size"]
+            "packaging": packaging_contract(
+                files["efi"]["sha256"], files["efi"]["size"],
+                files["vhd"]["size"],
             ),
             "implementation": self.implementation(),
             "budget": preflight.expected_budget(files, qemu_support),
@@ -312,6 +324,12 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         variants.append(oversized)
         variants.append(self.manifest(workload="persistence-v2"))
         variants.append(self.manifest(boot_policy="accept-any-failure"))
+        invalid_packaging = self.manifest()
+        invalid_packaging["packaging"]["boot-file-size"] = True
+        variants.append(invalid_packaging)
+        invalid_packaging = self.manifest()
+        invalid_packaging["packaging"]["disk-guid"] = str(uuid.UUID(int=0))
+        variants.append(invalid_packaging)
         for value in variants:
             with self.subTest(value=value.get("workload")):
                 with self.assertRaises(ValueError):
@@ -470,8 +488,8 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             output = root / "input"
 
             def packaging(_miz, _arguments, _log, **_kwargs):
-                return preflight.azure.packaging_contract(
-                    hashlib.sha256(b"efi").hexdigest(), 1536
+                return packaging_contract(
+                    hashlib.sha256(b"efi").hexdigest(), 3, 1536
                 )
 
             provenance = {
