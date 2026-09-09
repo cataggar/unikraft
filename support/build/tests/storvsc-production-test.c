@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -164,6 +165,10 @@ static int epoch_sample_enabled;
 static int epoch_sample_entered;
 static int epoch_sample_release;
 static uint64_t epoch_sample_value;
+static int binding_publish_pause;
+static unsigned int binding_publish_controller;
+static int binding_publish_entered;
+static int binding_publish_release;
 static uint64_t race_transaction_id;
 static const uint64_t *race_pfn_source;
 static unsigned int race_pfns_written;
@@ -469,6 +474,21 @@ void storvsc_host_sync_completion_hook(void)
 	if (sync_finish_device->finish_reqs(
 		    sync_finish_device, sync_finish_device->_queue[0]))
 		abort();
+}
+
+void storvsc_host_binding_publish_hook(unsigned int controller)
+{
+	pthread_mutex_lock(&race_lock);
+	if (!binding_publish_pause ||
+	    controller != binding_publish_controller) {
+		pthread_mutex_unlock(&race_lock);
+		return;
+	}
+	binding_publish_entered = 1;
+	pthread_cond_broadcast(&race_condition);
+	while (!binding_publish_release)
+		pthread_cond_wait(&race_condition, &race_lock);
+	pthread_mutex_unlock(&race_lock);
 }
 
 static void *thread_start(void *argument)
@@ -1615,6 +1635,13 @@ struct reset_thread_context {
 	int result;
 };
 
+struct add_thread_context {
+	struct vmbus_driver *driver;
+	struct vmbus_device *device;
+	atomic_int done;
+	int result;
+};
+
 static void *submit_thread(void *argument)
 {
 	struct submit_thread_context *context = argument;
@@ -1631,6 +1658,15 @@ static void *reset_thread(void *argument)
 	struct reset_thread_context *context = argument;
 
 	context->result = storvsc_host_reset_timed_out_io();
+	atomic_store(&context->done, 1);
+	return NULL;
+}
+
+static void *add_thread(void *argument)
+{
+	struct add_thread_context *context = argument;
+
+	context->result = context->driver->add_dev(context->device);
 	atomic_store(&context->done, 1);
 	return NULL;
 }
@@ -3796,6 +3832,124 @@ static void persistence_remove_device(struct vmbus_driver *driver,
 		(void)vmbus_channel_close(device->channel);
 }
 
+static int run_binding_publication_regression(
+	struct vmbus_driver *driver, struct vmbus_device *secondary)
+{
+	struct uk_storvsc_inventory_snapshot before;
+	struct uk_storvsc_inventory_snapshot after;
+	struct uk_storvsc_target_snapshot target;
+	struct uk_storvsc_target_snapshot during_target;
+	struct uk_storvsc_session session;
+	struct uk_storvsc_session during_session;
+	struct add_thread_context add_context = {
+		.driver = driver,
+		.device = secondary,
+	};
+	struct uk_blkdev *device;
+	struct uk_blkreq request;
+	pthread_t add_tid;
+	unsigned int sends;
+	unsigned int writes10;
+	unsigned int writes16;
+	unsigned int flushes;
+	int add_created = 0;
+	int error = 0;
+
+	device = storvsc_host_blkdev_address(0, 0);
+	if (!device || uk_storvsc_inventory_get(&before) ||
+	    target_for_device(device, &target) ||
+	    target.topology_generation != before.topology_generation ||
+	    uk_storvsc_session_begin_read(&target, &session))
+		return 620;
+	pthread_mutex_lock(&race_lock);
+	binding_publish_pause = 1;
+	binding_publish_controller = 1;
+	binding_publish_entered = 0;
+	binding_publish_release = 0;
+	pthread_mutex_unlock(&race_lock);
+	atomic_init(&add_context.done, 0);
+	secondary->present = 1;
+	if (pthread_create(&add_tid, NULL, add_thread, &add_context)) {
+		error = 621;
+		goto out;
+	}
+	add_created = 1;
+	if (wait_race_flag(&binding_publish_entered)) {
+		error = 622;
+		goto out;
+	}
+	if (uk_storvsc_session_authorize_write(&session) != -ESTALE) {
+		error = 623;
+		goto out;
+	}
+	if (uk_storvsc_inventory_get(&after) != -EAGAIN ||
+	    uk_storvsc_mapping_count() != before.count) {
+		error = 624;
+		goto out;
+	}
+	if (target_for_device(device, &during_target) ||
+	    during_target.topology_generation ==
+		    before.topology_generation ||
+	    uk_storvsc_session_begin_read(
+		    &during_target, &during_session)) {
+		error = 625;
+		goto out;
+	}
+out:
+	pthread_mutex_lock(&race_lock);
+	binding_publish_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	if (add_created)
+		pthread_join(add_tid, NULL);
+	pthread_mutex_lock(&race_lock);
+	binding_publish_pause = 0;
+	binding_publish_entered = 0;
+	binding_publish_release = 0;
+	pthread_mutex_unlock(&race_lock);
+	if (error)
+		return error;
+	if (!atomic_load(&add_context.done) || add_context.result)
+		return 626;
+	{
+		int inventory_rc = uk_storvsc_inventory_get(&after);
+		int authorize_rc = uk_storvsc_session_authorize_write(
+			&during_session);
+
+		if (inventory_rc ||
+		    after.topology_generation ==
+			    during_target.topology_generation ||
+		    after.count <= before.count ||
+		    authorize_rc != -ESTALE) {
+			fprintf(stderr,
+				"binding publication: inventory=%d "
+				"generation=%" PRIu64 "/%" PRIu64
+				" count=%u/%u authorize=%d\n",
+				inventory_rc, after.topology_generation,
+				during_target.topology_generation,
+				after.count, before.count, authorize_rc);
+			return 627;
+		}
+	}
+	sends = io_command_count;
+	initialize_request(&request, UK_BLKREQ_WRITE, 0, 1,
+			   backing_media, NULL, NULL);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+		    -EACCES ||
+	    io_command_count != sends)
+		return 628;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	if (hyperv_acceptance_persistence_main() !=
+		    HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 629;
+	return 0;
+}
+
 static int run_persistence_workflow_regression(
 	struct vmbus_driver *driver, struct vmbus_device *primary)
 {
@@ -3866,6 +4020,19 @@ static int run_persistence_workflow_regression(
 		return 604;
 	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512 +
 		      40] = saved_receipt;
+	persistence_remove_device(driver, primary);
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(0))
+		return 617;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 618;
+	secondary.present = 1;
+	rc = run_binding_publication_regression(driver, &secondary);
+	if (rc)
+		return rc;
+	persistence_remove_device(driver, &secondary);
 	persistence_remove_device(driver, primary);
 
 	hyperv_acceptance_persistence_host_reset();

@@ -83,7 +83,8 @@ int uk_storvsc_mapping_find(uint16_t blkdev_id,
  * Returns a coherent active mapping count and topology generation. Callers
  * that enumerate targets must require every target and a final inventory
  * snapshot to carry the same generation. A snapshot does not pin a target;
- * use a session for that purpose.
+ * use a session for that purpose. Returns -EAGAIN while a controller has an
+ * unresolved bind, recovery, removal, or deferred topology transition.
  */
 int uk_storvsc_inventory_get(
 	struct uk_storvsc_inventory_snapshot *snapshot);

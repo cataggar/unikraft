@@ -234,6 +234,7 @@ void storvsc_host_reset_ack_hook(void);
 void storvsc_host_deferred_epoch_sample_hook(__u64 epoch);
 void storvsc_host_sync_completion_hook(void);
 void storvsc_host_receive_hook(unsigned int controller, int before_notify);
+void storvsc_host_binding_publish_hook(unsigned int controller);
 #endif
 
 static struct vmbus_channel *
@@ -1933,7 +1934,7 @@ static int storvsc_lun_identity_compare(const struct storvsc_lun *left,
 
 static unsigned int
 storvsc_collect_mappings(struct storvsc_lun **entries,
-			 unsigned int capacity)
+			 unsigned int capacity, int *unresolved)
 {
 	unsigned long flags;
 	unsigned int controller_index;
@@ -1949,6 +1950,12 @@ storvsc_collect_mappings(struct storvsc_lun **entries,
 		if (!device->initialized)
 			continue;
 		ukplat_spin_lock_irqsave(&device->lock, flags);
+		if (unresolved &&
+		    (device->binding || device->recovering ||
+		     device->removing || device->fatal_error ||
+		     (!device->online && device->vmbus_device) ||
+		     device->deferred_action != STORVSC_DEFER_NONE))
+			*unresolved = 1;
 		if (!device->online || device->binding || device->removing) {
 			ukplat_spin_unlock_irqrestore(&device->lock, flags);
 			continue;
@@ -2033,7 +2040,7 @@ unsigned int uk_storvsc_mapping_count(void)
 
 	return storvsc_collect_mappings(
 		entries, CONFIG_LIBSTORVSC_MAX_DEVICES *
-				 CONFIG_LIBSTORVSC_MAX_LUNS);
+				 CONFIG_LIBSTORVSC_MAX_LUNS, NULL);
 }
 
 int uk_storvsc_mapping_get(unsigned int index,
@@ -2043,7 +2050,7 @@ int uk_storvsc_mapping_get(unsigned int index,
 		CONFIG_LIBSTORVSC_MAX_DEVICES * CONFIG_LIBSTORVSC_MAX_LUNS];
 	unsigned int count = storvsc_collect_mappings(
 		entries, CONFIG_LIBSTORVSC_MAX_DEVICES *
-				 CONFIG_LIBSTORVSC_MAX_LUNS);
+				 CONFIG_LIBSTORVSC_MAX_LUNS, NULL);
 
 	if (index >= count)
 		return -ENOENT;
@@ -2057,7 +2064,7 @@ int uk_storvsc_mapping_find(__u16 blkdev_id,
 		CONFIG_LIBSTORVSC_MAX_DEVICES * CONFIG_LIBSTORVSC_MAX_LUNS];
 	unsigned int count = storvsc_collect_mappings(
 		entries, CONFIG_LIBSTORVSC_MAX_DEVICES *
-				 CONFIG_LIBSTORVSC_MAX_LUNS);
+				 CONFIG_LIBSTORVSC_MAX_LUNS, NULL);
 
 	for (unsigned int i = 0; i < count; i++) {
 		if (entries[i]->uid == blkdev_id)
@@ -2075,21 +2082,26 @@ int uk_storvsc_inventory_get(
 	__u64 after;
 	unsigned int count;
 	unsigned int attempt;
+	int unresolved;
 
 	if (!snapshot)
 		return -EINVAL;
 	memset(snapshot, 0, sizeof(*snapshot));
 	for (attempt = 0; attempt < 4; attempt++) {
+		unresolved = 0;
 		before = __atomic_load_n(
 			&storvsc_topology_generation, __ATOMIC_ACQUIRE);
 		if (before == UINT64_MAX)
 			return -EOVERFLOW;
 		count = storvsc_collect_mappings(
 			entries, CONFIG_LIBSTORVSC_MAX_DEVICES *
-					 CONFIG_LIBSTORVSC_MAX_LUNS);
+					 CONFIG_LIBSTORVSC_MAX_LUNS,
+			&unresolved);
 		after = __atomic_load_n(
 			&storvsc_topology_generation, __ATOMIC_ACQUIRE);
 		if (before == after) {
+			if (unresolved)
+				return -EAGAIN;
 			snapshot->version =
 				UK_STORVSC_INVENTORY_SNAPSHOT_VERSION;
 			snapshot->size = sizeof(*snapshot);
@@ -2134,7 +2146,7 @@ int uk_storvsc_target_get(unsigned int index,
 		return -EINVAL;
 	count = storvsc_collect_mappings(
 		entries, CONFIG_LIBSTORVSC_MAX_DEVICES *
-				 CONFIG_LIBSTORVSC_MAX_LUNS);
+				 CONFIG_LIBSTORVSC_MAX_LUNS, NULL);
 	if (index >= count)
 		return -ENOENT;
 	device = entries[index]->controller;
@@ -2772,6 +2784,9 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	device->online = 1;
 	storvsc_advance_topology_generation();
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+#ifdef STORVSC_HOST_TEST
+	storvsc_host_binding_publish_hook(device->index);
+#endif
 	vmbus_channel_set_callback(storvsc_channel_get(device),
 				   storvsc_channel_callback, device);
 	rc = storvsc_start_timeout_worker(device);
@@ -2781,6 +2796,7 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	if (rc)
 		goto failed_registered;
 	ukplat_spin_lock_irqsave(&device->lock, flags);
+	storvsc_advance_topology_generation();
 	device->binding = 0;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	storvsc_notify_pending(device);
