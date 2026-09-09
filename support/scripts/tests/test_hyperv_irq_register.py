@@ -61,6 +61,29 @@ class HypervIrqConstructorTest(unittest.TestCase):
 
 
 class HypervFixedSmpBindingTest(unittest.TestCase):
+    @staticmethod
+    def startup_controls(
+        efer=0x900, cr4=0x20, cr0=0x80010001,
+        clear_edx=True, efer_msr=0xC0000080,
+    ):
+        operations = [
+            ("movl", f"${cr4:#x}, %eax"),
+            ("movq", "%rax, %cr4"),
+        ]
+        if clear_edx:
+            operations.append(("xorl", "%edx, %edx"))
+        operations.extend((
+            ("movl", f"${efer:#x}, %eax"),
+            ("movl", f"${efer_msr:#x}, %ecx"),
+            ("wrmsr", ""),
+            ("movl", f"${cr0:#x}, %eax"),
+            ("movq", "%rax, %cr0"),
+        ))
+        return [
+            (10 + index, op, operands)
+            for index, (op, operands) in enumerate(operations)
+        ]
+
     def setUp(self):
         self.functions = {
             1: ("uk_boot_entry", [(1, "call", "2 <ukplat_lcpu_count>")]),
@@ -74,6 +97,10 @@ class HypervFixedSmpBindingTest(unittest.TestCase):
                     (7, "call", "9 <uk_paging_pt_activate_lcpu>"),
                 ],
             ),
+            10: (
+                "x86_start16_end",
+                self.startup_controls(),
+            ),
         }
         self.symbols = {
             "uk_boot_fixed_smp_prepare": 4,
@@ -84,6 +111,8 @@ class HypervFixedSmpBindingTest(unittest.TestCase):
             "uk_lcpu_init": 6,
             "uk_paging_pt_get_active": 8,
             "uk_paging_pt_activate_lcpu": 9,
+            "lcpu_start32": 10,
+            "lcpu_start64": 18,
         }
         self.kinds = {"ukplat_lcpu_count": ["T"]}
 
@@ -180,6 +209,34 @@ class HypervFixedSmpBindingTest(unittest.TestCase):
                 self.functions[5] = (
                     "uk_boot_fixed_smp_lcpu_entry", instructions
                 )
+                with self.assertRaisesRegex(ValueError, message):
+                    irq.verify_fixed_smp_bindings(
+                        self.functions, self.symbols, self.kinds,
+                    )
+
+    def test_ap_runtime_paging_requires_nxe(self):
+        invalid = (
+            self.startup_controls(efer=0x100),
+            self.startup_controls(efer=0x800),
+            self.startup_controls(clear_edx=False),
+            self.startup_controls(efer_msr=0xC0000081),
+        )
+        for instructions in invalid:
+            with self.subTest(instructions=instructions):
+                self.functions[10] = ("x86_start16_end", instructions)
+                with self.assertRaisesRegex(ValueError, "EFER.NXE"):
+                    irq.verify_fixed_smp_bindings(
+                        self.functions, self.symbols, self.kinds,
+                    )
+
+    def test_ap_runtime_paging_requires_cr0_and_cr4_controls(self):
+        variants = (
+            (self.startup_controls(cr4=0), "CR4.PAE"),
+            (self.startup_controls(cr0=0x80000001), "CR0.PE/WP/PG"),
+        )
+        for instructions, message in variants:
+            with self.subTest(message=message):
+                self.functions[10] = ("x86_start16_end", instructions)
                 with self.assertRaisesRegex(ValueError, message):
                     irq.verify_fixed_smp_bindings(
                         self.functions, self.symbols, self.kinds,

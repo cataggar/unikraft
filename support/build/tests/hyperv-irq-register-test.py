@@ -110,6 +110,66 @@ def direct_target(functions, symbols, caller, callee):
     ) is not None
 
 
+def verify_ap_paging_controls(functions, symbols):
+    start = symbols.get("lcpu_start32")
+    end = symbols.get("lcpu_start64")
+    instructions = sorted(
+        instruction
+        for _, body in functions.values()
+        for instruction in body
+        if start is not None and end is not None
+        and start <= instruction[0] < end
+    )
+    control_values = {}
+    eax = None
+    efer_ready = False
+    for index, (_, op, operands) in enumerate(instructions):
+        immediate = re.match(
+            r"\$(0x[0-9a-f]+),\s*%eax(?:\s|$)", operands
+        )
+        if op.startswith("mov") and immediate:
+            eax = int(immediate[1], 16)
+        control = re.match(r"%rax,\s*%(cr[04])(?:\s|$)", operands)
+        if op.startswith("mov") and control:
+            control_values[control[1]] = eax
+        if op != "wrmsr":
+            continue
+        efer = None
+        efer_high_clear = False
+        efer_msr = None
+        for _, setup_op, operands in instructions[max(0, index - 5):index]:
+            immediate = re.match(
+                r"\$(0x[0-9a-f]+),\s*%(e[ac]x)(?:\s|$)", operands
+            )
+            if setup_op.startswith("mov") and immediate:
+                value = int(immediate[1], 16)
+                if immediate[2] == "eax":
+                    efer = value
+                else:
+                    efer_msr = value
+            if setup_op.startswith("xor") and re.match(
+                r"%edx,\s*%edx(?:\s|$)", operands
+            ):
+                efer_high_clear = True
+        required_efer = (1 << 8) | (1 << 11)
+        if (efer_msr == 0xC0000080 and efer_high_clear and
+                efer is not None and
+                efer & required_efer == required_efer):
+            efer_ready = True
+    if not efer_ready:
+        raise ValueError(
+            "fixed SMP AP startup does not enable EFER.NXE/LME "
+            "before runtime paging"
+        )
+    if control_values.get("cr4", 0) & (1 << 5) == 0:
+        raise ValueError("fixed SMP AP startup does not enable CR4.PAE")
+    required_cr0 = (1 << 0) | (1 << 16) | (1 << 31)
+    if control_values.get("cr0", 0) & required_cr0 != required_cr0:
+        raise ValueError(
+            "fixed SMP AP startup does not enable CR0.PE/WP/PG"
+        )
+
+
 def verify_fixed_smp_bindings(functions, symbols, kinds):
     if "uk_boot_fixed_smp_prepare" not in symbols:
         return
@@ -143,6 +203,7 @@ def verify_fixed_smp_bindings(functions, symbols, kinds):
     if any(paging_present) and not all(paging_present):
         raise ValueError("fixed SMP runtime page table binding is incomplete")
     if all(paging_present):
+        verify_ap_paging_controls(functions, symbols)
         entry = "uk_boot_fixed_smp_lcpu_entry"
         init = direct_target_address(
             functions, symbols, entry, "uk_lcpu_init"
