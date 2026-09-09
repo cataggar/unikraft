@@ -737,9 +737,12 @@ durable state retains only bounded phase/stage, exception category, and Azure
 error-code metadata for the primary, reconciliation, cleanup, and recording
 paths. It never persists free-form diagnostic messages. A failure to write
 that bounded record is itself reported by bounded category/code without
-masking the primary failure. Reload removes the obsolete free-form
-`primary_failure` and `cleanup_failure` fields before recovery, without
-blocking cleanup. Raised combined errors likewise omit raw stderr, request
+masking the primary failure. Reload atomically removes the obsolete free-form
+`primary_failure` and `cleanup_failure` fields only in `cleanup-failed` state
+with an active cleanup obligation. Other phases reject those fields without
+rewriting state; they cannot be sanitized into a completed handoff. Raised
+combined errors carry only bounded categories/codes and do not retain the
+originating exception contexts. They omit raw stderr, request
 parameters, subscription, storage, endpoint, identifier, and local
 private-state values. The final private receipt
 binds the exact inputs, tools,

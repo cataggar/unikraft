@@ -3163,12 +3163,19 @@ def load_state(directory):
         path, MAX_STATE_BYTES, "Private-preflight private state"
     )
     state = azure.parse_strict_json(raw, "Private-preflight private state")
-    legacy_diagnostics = False
-    if isinstance(state, dict):
+    legacy_diagnostics = isinstance(state, dict) and any(
+        field in state for field in ("primary_failure", "cleanup_failure")
+    )
+    if legacy_diagnostics:
+        if (
+            state.get("phase") != "cleanup-failed"
+            or state.get("cleanup_required") is not True
+        ):
+            raise ValueError(
+                "Legacy private diagnostics require active cleanup recovery"
+            )
         for field in ("primary_failure", "cleanup_failure"):
-            if field in state:
-                legacy_diagnostics = True
-                state.pop(field)
+            state.pop(field, None)
     if any(
         field in state
         for field in (
@@ -3899,7 +3906,7 @@ def bounded_cleanup_failures(error, default_stage="cleanup"):
 
 
 class PrivateHostDeploymentReconciliationError(RuntimeError):
-    def __init__(self, primary, reconciliation, private_values):
+    def __init__(self, primary, reconciliation):
         primary_record = bounded_exception_record(primary)
         self.failure_category = primary_record["category"]
         self.code = primary_record["code"]
@@ -3907,10 +3914,10 @@ class PrivateHostDeploymentReconciliationError(RuntimeError):
             reconciliation
         )
         super().__init__(
-            "Primary private host deployment failure: "
-            + azure.safe_failure_message(primary, private_values)
-            + "; deployment reconciliation also failed: "
-            + azure.safe_failure_message(reconciliation, private_values)
+            "Private host deployment failed: "
+            f"primary={self.failure_category}({self.code or 'unclassified'}); "
+            f"reconciliation={self.reconciliation_failure['category']}"
+            f"({self.reconciliation_failure['code'] or 'unclassified'})"
         )
 
 
@@ -4895,6 +4902,7 @@ class PrivatePreflightRun(azure.AzureRun):
             "adminPassword": password,
             "shutdownTime": shutdown_time,
         }
+        reconciliation_error = None
         try:
             with self.private_parameters(parameters) as parameter_file:
                 deployment = self.az([
@@ -4916,13 +4924,16 @@ class PrivatePreflightRun(azure.AzureRun):
                     reconcile_deadline
                 )
             except (RuntimeError, ValueError, OSError) as reconciliation:
-                raise PrivateHostDeploymentReconciliationError(
-                    primary, reconciliation, self.private_failure_values()
-                ) from None
-            if not reconciled:
-                raise
+                reconciliation_error = PrivateHostDeploymentReconciliationError(
+                    primary, reconciliation
+                )
+            else:
+                if not reconciled:
+                    raise
         finally:
             password = None
+        if reconciliation_error is not None:
+            raise reconciliation_error
         self.verify_deployed_envelope()
 
     def verify_storage_rules(self, transfer_cidr=None, *, enforce_deadline=True):
@@ -6047,6 +6058,7 @@ def run_preflight(
     azure.save_durable_json(state_path, state)
     run = PrivatePreflightRun(state, state_path)
     shutdown_time = deadline_utc.strftime("%H%M")
+    pipeline = None
     try:
         with azure.interrupt_as_exception():
             run.create_group()
@@ -6197,9 +6209,10 @@ def run_preflight(
         pipeline = persist_private_failure(
             run, primary, primary_phase, attempt_cleanup=True
         )
-        if pipeline is not None:
-            raise pipeline from None
-        raise
+        if pipeline is None:
+            raise
+    if pipeline is not None:
+        raise pipeline
     if state.get("cleanup_required"):
         try:
             run.cleanup()
@@ -6207,9 +6220,10 @@ def run_preflight(
             pipeline = persist_private_failure(
                 run, cleanup_error, "cleanup", attempt_cleanup=False
             )
-            if pipeline is not None:
-                raise pipeline from None
-            raise
+            if pipeline is None:
+                raise
+        if pipeline is not None:
+            raise pipeline
     final["cleanup"] = "complete"
     azure.save_durable_json(state_path.parent / "private-receipt.json", final)
     run.record(
