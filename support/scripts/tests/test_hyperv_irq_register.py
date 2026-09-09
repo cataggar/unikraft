@@ -58,5 +58,71 @@ class HypervIrqConstructorTest(unittest.TestCase):
                     )
 
 
+class HypervFixedSmpCpuCountTest(unittest.TestCase):
+    def test_boot_uses_strong_acpi_platform_count(self):
+        functions = {
+            1: ("uk_boot_entry", [(1, "call", "2 <ukplat_lcpu_count>")]),
+            2: ("ukplat_lcpu_count", [(2, "jmp", "3 <uk_acpi_cpu_count>")]),
+            3: ("uk_acpi_cpu_count", [(3, "ret", "")]),
+        }
+        irq.verify_fixed_smp_cpu_count_binding(
+            functions,
+            {
+                "uk_boot_fixed_smp_prepare": 4,
+                "uk_boot_entry": 1,
+                "ukplat_lcpu_count": 2,
+                "uk_acpi_cpu_count": 3,
+            },
+            {"ukplat_lcpu_count": ["T"]},
+        )
+
+    def test_localized_weak_count_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "one strong platform symbol"):
+            irq.verify_fixed_smp_cpu_count_binding(
+                {},
+                {
+                    "uk_boot_fixed_smp_prepare": 4,
+                    "ukplat_lcpu_count": 2,
+                },
+                {"ukplat_lcpu_count": ["T", "t"]},
+            )
+
+    def test_boot_or_platform_misbinding_is_rejected(self):
+        symbols = {
+            "uk_boot_fixed_smp_prepare": 4,
+            "uk_boot_entry": 1,
+            "ukplat_lcpu_count": 2,
+            "uk_acpi_cpu_count": 3,
+        }
+        kinds = {"ukplat_lcpu_count": ["T"]}
+        for functions, message in (
+            (
+                {
+                    1: ("uk_boot_entry", [(1, "call", "5 <weak_count>")]),
+                    2: (
+                        "ukplat_lcpu_count",
+                        [(2, "jmp", "3 <uk_acpi_cpu_count>")],
+                    ),
+                },
+                "boot does not call",
+            ),
+            (
+                {
+                    1: (
+                        "uk_boot_entry",
+                        [(1, "call", "2 <ukplat_lcpu_count>")],
+                    ),
+                    2: ("ukplat_lcpu_count", [(2, "ret", "")]),
+                },
+                "does not use ACPI",
+            ),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    irq.verify_fixed_smp_cpu_count_binding(
+                        functions, symbols, kinds
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

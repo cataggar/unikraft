@@ -8,3 +8,4 @@ uk_boot_fixed_smp_prepare
 uk_boot_fixed_smp_lcpu_entry
 uk_boot_fixed_smp_wait_online
 uk_boot_fixed_smp_rollback
+ukplat_lcpu_count

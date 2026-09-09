@@ -90,6 +90,40 @@ def verify_schedcoop_callbacks(functions, symbols):
             )
 
 
+def direct_target(functions, symbols, caller, callee):
+    if caller not in symbols or callee not in symbols:
+        return False
+    for _, op, operands in functions.get(symbols[caller], ("", ()))[1]:
+        if not op.startswith(("call", "j")) or operands.startswith("*"):
+            continue
+        target = re.match(r"(?:0x)?([0-9a-f]+)\s+<", operands)
+        if target and int(target[1], 16) == symbols[callee]:
+            return True
+    return False
+
+
+def verify_fixed_smp_cpu_count_binding(functions, symbols, kinds):
+    if "uk_boot_fixed_smp_prepare" not in symbols:
+        return
+    if kinds.get("ukplat_lcpu_count") != ["T"]:
+        raise ValueError(
+            "fixed SMP CPU count must resolve to one strong platform symbol; "
+            f"got {kinds.get('ukplat_lcpu_count')}"
+        )
+    if not direct_target(
+        functions, symbols, "uk_boot_entry", "ukplat_lcpu_count"
+    ):
+        raise ValueError(
+            "fixed SMP boot does not call the strong platform CPU count"
+        )
+    if not direct_target(
+        functions, symbols, "ukplat_lcpu_count", "uk_acpi_cpu_count"
+    ):
+        raise ValueError(
+            "Hyper-V fixed SMP CPU count does not use ACPI enumeration"
+        )
+
+
 def verify(image, nm, objdump):
     symbols = {}
     kinds = {}
@@ -123,6 +157,8 @@ def verify(image, nm, objdump):
             functions[current][1].append(
                 (int(instruction[1], 16), instruction[2], instruction[3])
             )
+
+    verify_fixed_smp_cpu_count_binding(functions, symbols, kinds)
 
     pending = [symbols["uk_plat_native_except_irq_handler"]]
     visited = set()
