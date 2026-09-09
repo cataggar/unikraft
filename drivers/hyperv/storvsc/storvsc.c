@@ -2745,17 +2745,23 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	rc = vmbus_device_bind_epoch(vmbus_device, &bind_token);
 	if (rc)
 		return rc;
+	/* This offer remains inventory uncertainty until discovery clears it. */
+	storvsc_note_unresolved_offer(
+		&vmbus_device->instance_id,
+		vmbus_device->channel_id,
+		bind_token.device_generation, -EAGAIN);
 	rc = storvsc_reserve_controller(vmbus_device, &device,
 					 &allocated_identity);
-	if (rc == -EAGAIN)
-		return vmbus_device_bind_retry(vmbus_device, &bind_token);
 	if (rc) {
-		if (device)
-			return rc;
 		storvsc_note_unresolved_offer(
 			&vmbus_device->instance_id,
 			vmbus_device->channel_id,
-			bind_token.device_generation, -ENOSPC);
+			bind_token.device_generation, rc);
+		if (rc == -EAGAIN)
+			return vmbus_device_bind_retry(
+				vmbus_device, &bind_token);
+		if (device)
+			return rc;
 		uk_pr_err(DRIVER_NAME
 			  ": controller pool exhausted for relid=%"PRIu32"\n",
 			  vmbus_device->channel_id);
