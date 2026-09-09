@@ -1265,7 +1265,7 @@ def validate_private_build(value, provenance, efi, expected_guarded=None):
         type(materialization_returncode) is not int
         or not -255 <= materialization_returncode <= 255
         or recovery not in ("none", "uk-reloc-v1")
-        or (materialization_returncode == 0) != (recovery == "none")
+        or (recovery == "none" and materialization_returncode != 0)
         or {
             key: value for key, value in invocation.items()
             if key not in ("materialization_returncode", "recovery")
@@ -1566,18 +1566,20 @@ def build_private_image(
             "native build materialization pass"
         )
         recovery = "none"
-        if materialization_returncode:
-            try:
-                text = tail.decode("utf-8")
-            except UnicodeDecodeError:
+        try:
+            text = tail.decode("utf-8")
+        except UnicodeDecodeError:
+            if materialization_returncode:
                 raise RuntimeError(
                     "Private local native build failed before verification"
                 ) from None
-            failed = [
-                line[len("failed command: "):]
-                for line in text.splitlines()
-                if line.startswith("failed command: ")
-            ]
+            text = ""
+        failed = [
+            line[len("failed command: "):]
+            for line in text.splitlines()
+            if line.startswith("failed command: ")
+        ]
+        if materialization_returncode or failed:
             if len(failed) != 1:
                 raise RuntimeError(
                     "Private local native build failed before verification"

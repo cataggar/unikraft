@@ -1211,7 +1211,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 "--nm llvm-nm --readelf llvm-readelf "
                 "--objcopy llvm-objcopy '"
                 "\"$input\"' '\"$reloc\"' '\"$output\"\n"
-                " exit 1\n"
+                " exit 0\n"
                 "fi\n"
                 "test -n \"$out\"\nmkdir -p \"$out\"\n"
                 f"printf efi > \"$out/{preflight.NATIVE_EFI_NAME}\"\n"
@@ -1276,7 +1276,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 validated["receipt"]["invocation"][
                     "materialization_returncode"
                 ],
-                1,
+                0,
             )
             self.assertEqual(
                 validated["receipt"]["invocation"]["recovery"],
