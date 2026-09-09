@@ -91,13 +91,19 @@ err_clean:
 
 void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 {
-	unsigned int idx = uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx);
+	unsigned int idx;
 	struct fixed_smp_boot_cpu *cpu;
 	unsigned int expected;
 	int rc;
 
-	UK_ASSERT(idx > 0 && idx < CONFIG_UKPLAT_CPU_MAXCOUNT);
 	UK_ASSERT(lcpu == uk_lcpu_get_current());
+	/* Custom startup entries bypass uk_lcpu_entry_default(). */
+	rc = uk_lcpu_init(lcpu);
+	if (unlikely(rc))
+		uk_lcpu_halt_error(rc);
+
+	idx = uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx);
+	UK_ASSERT(idx > 0 && idx < CONFIG_UKPLAT_CPU_MAXCOUNT);
 	uk_pr_info("Fixed SMP: AP LCPU %u scheduler entry\n", idx);
 	cpu = &fixed_smp_cpus[idx];
 	expected = FIXED_SMP_PREPARED;

@@ -26,9 +26,12 @@ static unsigned int auxsp_sets;
 static unsigned int idle_publishes;
 static unsigned int irq_enables;
 static unsigned int blocks;
+static unsigned int lcpu_inits;
+static unsigned int ap_init_stage;
 static int scheduler_backing_live[4];
 static int lcpu_reported_halted[4];
 static int start_error[4];
+static int lcpu_init_error[4];
 static jmp_buf ap_exit;
 static int ap_halt_error;
 
@@ -82,8 +85,10 @@ void uk_thread_release(struct uk_thread *thread)
 int uk_sched_start_thread(struct uk_sched *sched, struct uk_thread *thread)
 {
 	assert(ukboot_host_cpu_idx == sched->lcpu_idx);
+	assert(ap_init_stage == 3);
 	if (start_error[sched->lcpu_idx])
 		return start_error[sched->lcpu_idx];
+	ap_init_stage = 4;
 	thread->sched = sched;
 	sched->state = UK_SCHED_ONLINE;
 	return 0;
@@ -109,15 +114,29 @@ int uk_lcpu_current_is_bsp(void)
 	return ukboot_host_cpu_idx == 0;
 }
 
+int uk_lcpu_init(struct uk_lcpu *lcpu)
+{
+	assert(ukboot_host_cpu_idx > 0);
+	assert(lcpu == &lcpus[ukboot_host_cpu_idx]);
+	assert(ap_init_stage == 0);
+	ap_init_stage = 1;
+	lcpu_inits++;
+	return lcpu_init_error[ukboot_host_cpu_idx];
+}
+
 void uk_lcpu_tlsp_set(uintptr_t tlsp)
 {
+	assert(ap_init_stage == 1);
 	assert(tlsp == bootstraps[ukboot_host_cpu_idx].tlsp);
+	ap_init_stage = 2;
 	tls_sets++;
 }
 
 void uk_lcpu_set_auxsp(uintptr_t auxsp)
 {
+	assert(ap_init_stage == 2);
 	assert(auxsp == bootstraps[ukboot_host_cpu_idx].auxsp);
+	ap_init_stage = 3;
 	auxsp_sets++;
 }
 
@@ -154,6 +173,7 @@ static void run_ap(unsigned int idx, int expected_exit)
 	int exit_reason;
 
 	ukboot_host_cpu_idx = idx;
+	ap_init_stage = 0;
 	exit_reason = setjmp(ap_exit);
 	if (!exit_reason)
 		uk_boot_fixed_smp_lcpu_entry(&lcpus[idx]);
@@ -175,6 +195,7 @@ int main(void)
 	assert(bootstrap_creates == 3);
 
 	run_ap(1, 1);
+	assert(lcpu_inits == 1 && ap_init_stage == 4);
 	assert(tls_sets == 1 && auxsp_sets == 1);
 	assert(idle_publishes == 1 && irq_enables == 1 && blocks == 1);
 	assert(lcpu_reported_halted[1] && scheduler_backing_live[1]);
@@ -194,6 +215,7 @@ int main(void)
 	/* A late attempted AP is rejected without switching to freed backing. */
 	run_ap(2, 2);
 	assert(ap_halt_error == -ECANCELED);
+	assert(lcpu_inits == 2 && ap_init_stage == 1);
 	assert(tls_sets == 1 && auxsp_sets == 1);
 	assert(!scheduler_backing_live[2]);
 
