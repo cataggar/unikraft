@@ -21,6 +21,11 @@ on:
         required: false
         type: boolean
         default: false
+      hyperv_network_application:
+        description: Build and bind the stack-backed private-peer image
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   libc-test:
@@ -686,8 +691,11 @@ jobs:
           libncurses-dev \
           make \
           ovmf \
+          patch \
           python3 \
           tar \
+          unzip \
+          wget \
           xz-utils
         sudo rm -rf /var/lib/apt/lists/*
 
@@ -784,11 +792,21 @@ jobs:
         export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/regression-zig-local-cache"
         zig build -j2 test-hyperv-regression --summary all
 
+    - name: Fetch pinned application-network stack
+      if: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
+      run: |
+        set -euo pipefail
+        make -C support/apps/hyperv-acceptance network-stack
+
     - name: Solve and build native Hyper-V acceptance and SMP images
+      env:
+        HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
       run: |
         set -euo pipefail
         for variant in acceptance smp; do
+          network_application=false
           if [[ "${variant}" == acceptance ]]; then
+            network_application="${HYPERV_NETWORK_APPLICATION}"
             app=hyperv-acceptance
             build="${RUNNER_TEMP}/hyperv-ci/build"
             profile=hyperv-x86_64-efi-netvsc
@@ -810,7 +828,12 @@ jobs:
           fi
           config="${RUNNER_TEMP}/hyperv-ci/${app}.config"
           export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/${variant}-zig-local-cache"
-          cp "support/apps/${app}/defconfig" "${config}"
+          if [ "${network_application}" = "true" ]; then
+            cp "support/apps/${app}/app-network.defconfig" "${config}"
+            symbols+=(CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION)
+          else
+            cp "support/apps/${app}/defconfig" "${config}"
+          fi
           zig_args=(
             "-Dapp=${GITHUB_WORKSPACE}/support/apps/${app}"
             "-Doutput=${build}"
@@ -829,12 +852,19 @@ jobs:
             "-Dmake-arg=UK_CFLAGS=-std=gnu17"
             "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
           )
+          if [ "${network_application}" = "true" ]; then
+            zig_args+=("-Dexternal-lib=${GITHUB_WORKSPACE}/.d/deps/lib-lwip")
+          fi
           zig build -j2 olddefconfig "${zig_args[@]}"
           for symbol in "${symbols[@]}"; do
             grep --fixed-strings --line-regexp --quiet "${symbol}=y" "${config}"
           done
           grep --fixed-strings --line-regexp --quiet \
             "CONFIG_UKPLAT_CPU_MAXCOUNT=${cpus}" "${config}"
+          if [ "${network_application}" = "true" ]; then
+            grep --extended-regexp --quiet \
+              '^CONFIG_APPHYPERVACCEPTANCE_NONCE="[0-9a-fA-F]{16}"$' "${config}"
+          fi
           zig build -j2 native-images "-Dnative-profile=${profile}" "${zig_args[@]}"
           test -s "${build}/helloworld_${profile}"
           test -s "${build}/helloworld_${profile}.dbg"
@@ -854,6 +884,8 @@ jobs:
           > "${RUNNER_TEMP}/hyperv-ci/smp-image-sha256.txt"
 
     - name: Boot exact raw GPT and fixed VHD in both APIC modes
+      env:
+        HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
       run: |
         set -euo pipefail
         if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
@@ -862,6 +894,13 @@ jobs:
         test -r /dev/kvm
         test -w /dev/kvm
         state="${RUNNER_TEMP}/hyperv-ci/packaging"
+        solved_config=()
+        if [ "${HYPERV_NETWORK_APPLICATION}" = "true" ]; then
+          solved_config=(
+            --solved-config
+            "${RUNNER_TEMP}/hyperv-ci/hyperv-acceptance.config"
+          )
+        fi
         python3 support/scripts/hyperv-azure.py prepare \
           --efi "${RUNNER_TEMP}/hyperv-ci/build/helloworld_hyperv-x86_64-efi-netvsc" \
           --miz "${RUNNER_TEMP}/hyperv-ci/miz/bin/miz" \
@@ -869,6 +908,7 @@ jobs:
           --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.fd \
           --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd \
           --qemu "${RUNNER_TEMP}/hyperv-tools/qemu-system-x86_64" \
+          "${solved_config[@]}" \
           --timeout 60
         python3 - "${state}/state.json" <<'PY'
         import json

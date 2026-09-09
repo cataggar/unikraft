@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import argparse
+import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -9,12 +11,16 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 from urllib.parse import urlsplit, urlunsplit
+import uuid
+
+import hyperv_network_controller as network
 
 
 SUPPORT = Path(__file__).resolve().parents[1]
@@ -36,16 +42,26 @@ LOCAL_BOOT_MODES = (
 LEGACY_APIC_MARKER = "Using legacy xAPIC MMIO"
 STATE_SCHEMA_VERSION = 1
 PREPARED_IMAGE_SCHEMA = "unikraft.hyperv.prepared-image"
-PREPARED_IMAGE_SCHEMA_VERSION = 1
-PREPARED_IMAGE_CONTROLLER_REVISION = 1
+PREPARED_IMAGE_SCHEMA_VERSION = 2
+PREPARED_IMAGE_CONTROLLER_REVISION = 2
 PREPARED_IMAGE_MANIFEST = "prepared-image-manifest.json"
 PREPARED_IMAGE_VHD = "unikraft.vhd"
 PREPARED_IMAGE_FILES = frozenset((PREPARED_IMAGE_MANIFEST, PREPARED_IMAGE_VHD))
 MIZ_REVISION = "2db68ca0c3ab12155012a823c3fb8d7aba1cb544"
 MAX_MANIFEST_SIZE = 64 * 1024
 MAX_LOCAL_LOG_SIZE = 4 * MIB
-AZURE_OWNERSHIP_FIELDS = frozenset(("subscription", "disk_id", "vm_id"))
+MAX_RESERVATION_SIZE = 16 * 1024
+AZURE_OWNERSHIP_FIELDS = frozenset((
+    "subscription", "resource_group", "resource_group_id", "disk_id", "vm_id",
+    "peer_vm_id", "peer_disk_id", "peer_nic_id", "guest_nic_id",
+))
 VM_SIZES = ("Standard_D2s_v5", "Standard_D2as_v5", "Standard_B2s")
+RESERVATION_SCHEMA = "unikraft.hyperv.resource-group-reservation"
+RESERVATION_TAGS = {
+    "managed-by": MANAGED_BY,
+    "purpose": "disposable-unikraft-acceptance",
+    "disposable": "true",
+}
 
 
 class AzureCliError(RuntimeError):
@@ -95,6 +111,20 @@ def save_json(path, value):
         try:
             json.dump(value, output, indent=2)
             output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def save_private_text(path, value):
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, prefix=".azure-evidence-", delete=False
+    ) as output:
+        temporary = Path(output.name)
+        try:
+            output.write(value)
             output.flush()
             os.fsync(output.fileno())
             os.replace(temporary, path)
@@ -240,7 +270,20 @@ def require_sha256(value, description):
 
 
 def controller_sha256():
-    return image_sha256(Path(__file__).absolute())
+    digest = hashlib.sha256()
+    for path in (
+        Path(__file__).absolute(),
+        Path(network.__file__).absolute(),
+        SUPPORT / "azure" / "hyperv-gen2.json",
+        SUPPORT / "azure" / "hyperv-network-peer.json",
+    ):
+        digest.update(path.name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(read_regular_file(
+            path, 4 * 1024 * 1024, "Controller source"
+        ))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def configure_tool_directories(directory):
@@ -477,6 +520,17 @@ def prepare_image(args):
     qemu = Path(qemu_name).resolve(strict=True)
     efi_digest = image_sha256(efi)
     miz_digest = image_sha256(miz)
+    if args.solved_config is None:
+        acceptance = {"mode": network.RAW_ACCEPTANCE_MODE}
+    else:
+        config = read_regular_file(
+            args.solved_config, MIB, "Solved application-network configuration"
+        )
+        peer_script = read_regular_file(
+            network.PEER_SCRIPT, 4 * 1024 * 1024,
+            "Pinned Hyper-V network peer"
+        )
+        acceptance = network.acceptance_from_solved_config(config, peer_script)
     directory = args.state_dir.absolute()
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     directory = directory.resolve(strict=True)
@@ -489,7 +543,7 @@ def prepare_image(args):
         "platform_marker": args.expect,
         "efi_sha256": efi_digest,
         "miz_executable": str(miz), "miz_executable_sha256": miz_digest,
-        "local_platform_boot": False,
+        "local_platform_boot": False, "acceptance": acceptance,
     }
     save_json(state_path, state)
     payload = directory / "BOOTX64.EFI"
@@ -529,6 +583,15 @@ def prepare_image(args):
     )
     if image_sha256(image) != image_digest:
         raise ValueError("VHD changed during read-only preflight or local boot")
+    if acceptance["mode"] == network.NETWORK_ACCEPTANCE_MODE:
+        for log_name in ("raw", "vpc"):
+            for mode, _ in LOCAL_BOOT_MODES:
+                text = read_regular_file(
+                    directory / f"local-{log_name}-{mode}-serial.log",
+                    MAX_LOCAL_LOG_SIZE,
+                    f"Local {log_name}/{mode} serial evidence",
+                ).decode("utf-8", errors="replace")
+                network.validate_preflight_log(text, acceptance)
     state.update(
         phase="prepared", image_sha256=image_digest,
         local_platform_boot=True, raw_sha256=raw_digest,
@@ -624,8 +687,8 @@ def validate_prepared_image_source(value):
     )
 
 
-def prepared_boot_outcomes():
-    return {
+def prepared_boot_outcomes(acceptance=None):
+    outcomes = {
         "raw": {
             "x2apic": {
                 "platform_ready": True,
@@ -651,12 +714,21 @@ def prepared_boot_outcomes():
             },
         },
     }
+    if (
+        acceptance is not None
+        and network.validate_acceptance(acceptance)["mode"]
+        == network.NETWORK_ACCEPTANCE_MODE
+    ):
+        for image in outcomes.values():
+            for result in image.values():
+                result["network_config"] = "matched"
+    return outcomes
 
 
 def validate_prepared_image_manifest(manifest, expected_source=None):
     manifest = require_exact_fields(manifest, (
         "schema", "schema_version", "controller_revision",
-        "controller_sha256", "source", "artifacts", "packaging",
+        "controller_sha256", "source", "acceptance", "artifacts", "packaging",
         "preflight",
     ), "Prepared-image manifest")
     if (
@@ -674,6 +746,15 @@ def validate_prepared_image_manifest(manifest, expected_source=None):
     source = validate_prepared_image_source(manifest["source"])
     if expected_source is not None and source != expected_source:
         raise ValueError("Prepared-image GitHub provenance does not match expectations")
+    acceptance = network.validate_acceptance(manifest["acceptance"])
+    if (
+        acceptance["mode"] == network.NETWORK_ACCEPTANCE_MODE
+        and sha256_bytes(read_regular_file(
+            network.PEER_SCRIPT, 4 * 1024 * 1024,
+            "Pinned Hyper-V network peer"
+        )) != acceptance["peer_script_sha256"]
+    ):
+        raise ValueError("Prepared image requires a different pinned network peer")
 
     artifacts = require_exact_fields(
         manifest["artifacts"], ("efi", "raw", "vhd", "miz"),
@@ -717,7 +798,7 @@ def validate_prepared_image_manifest(manifest, expected_source=None):
     if (
         preflight["scope"] != "platform-only"
         or canonical_json(preflight["boots"])
-        != canonical_json(prepared_boot_outcomes())
+        != canonical_json(prepared_boot_outcomes(acceptance))
     ):
         raise ValueError("Prepared-image preflight does not contain all four exact boots")
     return {
@@ -729,6 +810,7 @@ def validate_prepared_image_manifest(manifest, expected_source=None):
         "miz_sha256": miz["sha256"],
         "platform_marker": platform_marker,
         "boots": preflight["boots"],
+        "acceptance": acceptance,
     }
 
 
@@ -748,6 +830,9 @@ def export_prepared_image(directory, artifact_directory, source):
         raise ValueError("Cloud-owned state cannot be exported")
 
     platform_marker = validate_platform_marker(state.get("platform_marker"))
+    acceptance = network.validate_acceptance(
+        state.get("acceptance", {"mode": network.RAW_ACCEPTANCE_MODE})
+    )
     image = state_path.parent / PREPARED_IMAGE_VHD
     raw = state_path.parent / "unikraft.raw"
     efi = state_path.parent / "BOOTX64.EFI"
@@ -805,12 +890,24 @@ def export_prepared_image(directory, artifact_directory, source):
                 raise ValueError(
                     f"Local {image_name}/{mode} evidence exceeded platform-only scope"
                 )
-            boot_outcomes[image_name][mode] = {
+            if acceptance["mode"] == network.NETWORK_ACCEPTANCE_MODE:
+                text = read_regular_file(
+                    state_path.parent / f"local-{log_name}-{mode}-serial.log",
+                    MAX_LOCAL_LOG_SIZE,
+                    f"Local {image_name}/{mode} serial evidence",
+                ).decode("utf-8", errors="replace")
+                network.validate_preflight_log(text, acceptance)
+            boot_outcome = {
                 "platform_ready": evidence["platform_ready"],
                 "io_ready": evidence["io_ready"],
                 "apic_path": "legacy-xapic" if disable_x2apic else "x2apic",
             }
-    if canonical_json(boot_outcomes) != canonical_json(prepared_boot_outcomes()):
+            if acceptance["mode"] == network.NETWORK_ACCEPTANCE_MODE:
+                boot_outcome["network_config"] = "matched"
+            boot_outcomes[image_name][mode] = boot_outcome
+    if canonical_json(boot_outcomes) != canonical_json(
+        prepared_boot_outcomes(acceptance)
+    ):
         raise ValueError("Prepared local evidence does not contain all four exact boots")
 
     manifest = {
@@ -819,6 +916,7 @@ def export_prepared_image(directory, artifact_directory, source):
         "controller_revision": PREPARED_IMAGE_CONTROLLER_REVISION,
         "controller_sha256": controller_sha256(),
         "source": validate_prepared_image_source(source),
+        "acceptance": acceptance,
         "artifacts": {
             "efi": {"sha256": fingerprints["efi"]},
             "raw": {"sha256": fingerprints["raw"], "size": VIRTUAL_SIZE},
@@ -913,6 +1011,7 @@ def import_prepared_image(artifact_directory, directory, miz,
         "location": location,
         "vm_size": vm_size,
         "platform_marker": details["platform_marker"],
+        "acceptance": details["acceptance"],
         "efi_sha256": details["efi_sha256"],
         "raw_sha256": details["raw_sha256"],
         "image_sha256": details["vhd_sha256"],
@@ -986,9 +1085,108 @@ def validate_prepared_run_provenance(state, directory):
         or state.get("efi_sha256") != details["efi_sha256"]
         or state.get("raw_sha256") != details["raw_sha256"]
         or state.get("platform_marker") != details["platform_marker"]
+        or state.get("acceptance") != details["acceptance"]
         or state.get("trusted_platform_boot_modes") != details["boots"]
     ):
         raise ValueError("Private state does not match its trusted prepared image")
+
+
+def validate_subscription_id(value):
+    if not isinstance(value, str):
+        raise ValueError("An explicit Azure subscription UUID is required")
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as error:
+        raise ValueError("An explicit Azure subscription UUID is required") from error
+    if parsed.int == 0:
+        raise ValueError("An explicit nonzero Azure subscription UUID is required")
+    return str(parsed)
+
+
+def load_resource_group_reservation(path):
+    path = path.absolute()
+    try:
+        if path.resolve(strict=True) != path:
+            raise ValueError(
+                "Resource-group reservation path must not contain symlinks"
+            )
+    except OSError as error:
+        raise ValueError("Resource-group reservation does not exist") from error
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(
+            "Resource-group reservation must be a private non-symlink file"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_size > MAX_RESERVATION_SIZE
+        ):
+            raise ValueError(
+                "Resource-group reservation must be a private owner-only regular file"
+            )
+        chunks = []
+        remaining = MAX_RESERVATION_SIZE + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b"".join(chunks)
+        if len(value) > MAX_RESERVATION_SIZE:
+            raise ValueError("Resource-group reservation exceeds its size limit")
+    finally:
+        os.close(descriptor)
+    reservation = require_exact_fields(
+        parse_strict_json(value, "Resource-group reservation"), (
+            "schema", "schema_version", "phase", "subscription", "location",
+            "name_prefix", "resource_group", "tags", "resource_group_id",
+            "resource_count",
+        ), "Resource-group reservation",
+    )
+    subscription = validate_subscription_id(reservation["subscription"])
+    prefix = reservation["name_prefix"]
+    group = reservation["resource_group"]
+    location = reservation["location"]
+    if (
+        reservation["schema"] != RESERVATION_SCHEMA
+        or reservation["schema_version"] != 1
+        or reservation["phase"] != "group-created"
+        or not isinstance(prefix, str)
+        or not re.fullmatch(r"[a-z][a-z0-9-]{5,31}", prefix)
+        or not isinstance(group, str)
+        or group != prefix + "-rg"
+        or not isinstance(location, str)
+        or not re.fullmatch(r"[a-z0-9]{3,30}", location)
+        or type(reservation["resource_count"]) is not int
+        or reservation["resource_count"] != 0
+    ):
+        raise ValueError("Resource-group reservation is incompatible or not empty")
+    expected_tags = {
+        **RESERVATION_TAGS,
+        "unikraft-run": prefix,
+    }
+    if reservation["tags"] != expected_tags:
+        raise ValueError("Resource-group reservation has invalid ownership tags")
+    expected_id = f"/subscriptions/{subscription}/resourceGroups/{group}"
+    resource_group_id = reservation["resource_group_id"]
+    if (
+        not isinstance(resource_group_id, str)
+        or resource_group_id.lower() != expected_id.lower()
+    ):
+        raise ValueError("Resource-group reservation identity is invalid")
+    return {
+        **reservation,
+        "subscription": subscription,
+        "resource_group_id": resource_group_id,
+        "tags": expected_tags,
+    }
 
 
 def quota_count(value):
@@ -997,6 +1195,181 @@ def quota_count(value):
     if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
         return int(value)
     raise ValueError("Azure CLI returned an invalid nonnegative quota count")
+
+
+def selected_account(subscription):
+    subscription = validate_subscription_id(subscription)
+    account = azure_cli(
+        ["account", "show"], subscription=subscription, private=True
+    )
+    try:
+        account_subscription = validate_subscription_id(account["id"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Azure CLI did not return the explicitly selected subscription"
+        ) from error
+    if (
+        account_subscription != subscription
+        or account.get("state") != "Enabled"
+        or account.get("environmentName") != "AzureCloud"
+    ):
+        raise RuntimeError(
+            "The explicitly selected Azure public-cloud subscription is unavailable"
+        )
+    return subscription
+
+
+def exact_vm_sku(location, vm_size, subscription, vcpus, require_v2):
+    skus = azure_cli([
+        "vm", "list-skus", "--all", "--location", location,
+        "--resource-type", "virtualMachines", "--size", vm_size,
+        "--query", f"[?name=='{vm_size}']",
+    ], subscription=subscription, private=True)
+    if (
+        not isinstance(skus, list)
+        or len(skus) != 1
+        or skus[0].get("restrictions") != []
+        or not isinstance(skus[0].get("capabilities"), list)
+        or not isinstance(skus[0].get("family"), str)
+        or not re.fullmatch(r"[A-Za-z0-9_]{1,100}", skus[0]["family"])
+    ):
+        raise RuntimeError(
+            f"Requested VM size {vm_size} is not unrestricted in {location}"
+        )
+    capabilities = {
+        entry.get("name"): entry.get("value")
+        for entry in skus[0]["capabilities"]
+        if isinstance(entry, dict)
+    }
+    generations = capabilities.get("HyperVGenerations", "").split(",")
+    if (
+        capabilities.get("CpuArchitectureType") != "x64"
+        or capabilities.get("vCPUs") != str(vcpus)
+        or require_v2 and "V2" not in generations
+    ):
+        raise RuntimeError(
+            f"Requested VM size {vm_size} lacks its required x64/generation capabilities"
+        )
+    return {
+        "name": vm_size,
+        "family": skus[0]["family"],
+        "vcpus": vcpus,
+        "generations": generations,
+    }
+
+
+def image_version_key(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9]+(?:\.[0-9]+){1,4}", value
+    ):
+        raise ValueError("Azure returned a malformed immutable image version")
+    return tuple(int(part) for part in value.split("."))
+
+
+def resolve_peer_image(location, subscription, supported_generations):
+    publisher = network.PEER_IMAGE["publisher"]
+    offer = network.PEER_IMAGE["offer"]
+    sku = network.PEER_IMAGE["sku"]
+    images = azure_cli([
+        "vm", "image", "list", "--location", location,
+        "--publisher", publisher, "--offer", offer, "--sku", sku, "--all",
+    ], subscription=subscription, private=True)
+    candidates = []
+    if not isinstance(images, list):
+        raise RuntimeError("Azure returned an invalid Ubuntu image list")
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        urn = image.get("urn")
+        version = image.get("version")
+        if (
+            isinstance(urn, str)
+            and urn.split(":") == [publisher, offer, sku, version]
+            and version != "latest"
+        ):
+            candidates.append((image_version_key(version), urn, version))
+    if not candidates:
+        raise RuntimeError("No immutable pinned Ubuntu peer image is available")
+    _, urn, version = max(candidates)
+    details = azure_cli([
+        "vm", "image", "show", "--location", location, "--urn", urn,
+    ], subscription=subscription, private=True)
+    if (
+        not isinstance(details, dict)
+        or details.get("architecture") != "x64"
+        or details.get("hyperVGeneration") not in supported_generations
+    ):
+        raise RuntimeError(
+            "Pinned Ubuntu peer image is incompatible with Standard_B1s"
+        )
+    return {
+        "publisher": publisher,
+        "offer": offer,
+        "sku": sku,
+        "version": version,
+        "urn": urn,
+        "architecture": "x64",
+        "hyperv_generation": details["hyperVGeneration"],
+    }
+
+
+def check_network_subscription(location, guest_vm_size, subscription):
+    subscription = selected_account(subscription)
+    for namespace in ("Microsoft.Compute", "Microsoft.Network"):
+        registration = azure_cli([
+            "provider", "show", "--namespace", namespace,
+            "--query", "registrationState",
+        ], subscription=subscription, private=True)
+        if registration != "Registered":
+            raise RuntimeError(f"{namespace} must already be registered")
+    versions = azure_cli([
+        "provider", "show", "--namespace", "Microsoft.Compute",
+        "--query", "resourceTypes[?resourceType=='virtualMachines'].apiVersions | [0]",
+    ], subscription=subscription, private=True)
+    if not isinstance(versions, list) or "2025-11-01" not in versions:
+        raise RuntimeError(
+            "Compute API 2025-11-01 is required for explicit Standard security"
+        )
+    guest = exact_vm_sku(
+        location, guest_vm_size, subscription, vcpus=2, require_v2=True
+    )
+    peer = exact_vm_sku(
+        location, network.PEER_VM_SIZE, subscription, vcpus=1, require_v2=False
+    )
+    peer_image = resolve_peer_image(
+        location, subscription, peer["generations"]
+    )
+    required = {"cores": guest["vcpus"] + peer["vcpus"]}
+    for sku in (guest, peer):
+        required[sku["family"]] = required.get(sku["family"], 0) + sku["vcpus"]
+    names = " || ".join(f"name.value=='{name}'" for name in required)
+    usage = azure_cli([
+        "vm", "list-usage", "--location", location,
+        "--query", f"[?{names}]",
+    ], subscription=subscription, private=True)
+    if not isinstance(usage, list):
+        raise RuntimeError("Azure returned invalid quota information")
+    limits = {
+        entry.get("name", {}).get("value"): entry
+        for entry in usage if isinstance(entry, dict)
+    }
+    for name, count in required.items():
+        if name not in limits:
+            raise RuntimeError(f"Missing quota information for {name} in {location}")
+        available = (
+            quota_count(limits[name].get("limit"))
+            - quota_count(limits[name].get("currentValue"))
+        )
+        if available < count:
+            raise RuntimeError(
+                f"Insufficient quota for one guest and one private peer in {location}"
+            )
+    return {
+        "subscription": subscription,
+        "guest_sku": guest,
+        "peer_sku": peer,
+        "peer_image": peer_image,
+    }
 
 
 def check_subscription(location, vm_size):
@@ -1055,14 +1428,40 @@ class AzureRun:
             raise ValueError("Invalid run name prefix")
         if not re.fullmatch(r"[0-9a-f]{64}", state["image_sha256"]):
             raise ValueError("Invalid image SHA256")
-        self.group = self.prefix + "-rg"
+        self.group = state.get("resource_group", self.prefix + "-rg")
+        if (
+            not isinstance(self.group, str)
+            or not re.fullmatch(r"[a-zA-Z0-9_.()/-]{1,90}", self.group)
+            or "/" in self.group
+        ):
+            raise ValueError("Invalid resource group name")
+        if not state.get("group_precreated") and self.group != self.prefix + "-rg":
+            raise ValueError("Only an explicit reservation may select an existing group")
         self.vm = self.prefix + "-vm"
+        self.peer_vm = self.prefix + "-peer-vm"
         self.disk = self.prefix + "-os"
         self.tags = {
             "managed-by": MANAGED_BY,
             "unikraft-run": self.prefix,
             "image-sha256": state["image_sha256"],
         }
+        self.group_tags = dict(self.tags)
+        acceptance = network.validate_acceptance(
+            state.get("acceptance", {"mode": network.RAW_ACCEPTANCE_MODE})
+        )
+        if acceptance["mode"] == network.NETWORK_ACCEPTANCE_MODE:
+            receipt = state.get("prepared_image_import")
+            if not isinstance(receipt, dict):
+                raise ValueError(
+                    "Application-network runs require a trusted imported image"
+                )
+            self.group_tags.update({
+                "purpose": RESERVATION_TAGS["purpose"],
+                "disposable": RESERVATION_TAGS["disposable"],
+                "prepared-manifest-sha256": require_sha256(
+                    receipt.get("manifest_sha256"), "Prepared manifest fingerprint"
+                ),
+            })
 
     def az(self, arguments, **kwargs):
         return azure_cli(
@@ -1082,8 +1481,17 @@ class AzureRun:
                 f"{resource.get('id', resource.get('name', '<unknown>'))}"
             )
 
-    def resource_tags(self):
-        return [f"{key}={value}" for key, value in self.tags.items()]
+    def require_owned_group(self, resource):
+        tags = resource.get("tags") or {}
+        if any(tags.get(key) != value for key, value in self.group_tags.items()):
+            raise RuntimeError(
+                "Refusing to use a resource group without this run's "
+                "ownership tags and exact binding"
+            )
+
+    def resource_tags(self, *, group=False):
+        tags = self.group_tags if group else self.tags
+        return [f"{key}={value}" for key, value in tags.items()]
 
     def create_group(self):
         if self.az(["group", "exists", "--name", self.group]) is not False:
@@ -1092,10 +1500,59 @@ class AzureRun:
         group = self.az([
             "group", "create", "--name", self.group,
             "--location", self.state["location"],
-            "--tags", *self.resource_tags(),
+            "--tags", *self.resource_tags(group=True),
         ])
-        self.require_owned(group)
-        self.record("group-created")
+        self.require_owned_group(group)
+        if not isinstance(group.get("id"), str):
+            raise RuntimeError("Azure did not return the created resource group ID")
+        self.record("group-created", resource_group_id=group["id"])
+
+    def claim_group_reservation(self, reservation):
+        if not self.state.get("group_precreated"):
+            raise ValueError("Reservation claim requires explicit private state")
+        if (
+            reservation["resource_group"] != self.group
+            or reservation["resource_group_id"].lower()
+            != self.state["resource_group_id"].lower()
+            or reservation["location"] != self.state["location"]
+            or reservation["subscription"] != self.state["subscription"]
+        ):
+            raise ValueError("Reservation no longer matches the private run state")
+        group = self.az(["group", "show", "--name", self.group], private=True)
+        if (
+            not isinstance(group, dict)
+            or str(group.get("id", "")).lower()
+            != reservation["resource_group_id"].lower()
+            or group.get("location") != reservation["location"]
+            or group.get("tags") != reservation["tags"]
+        ):
+            raise RuntimeError(
+                "Live resource group does not match the private reservation"
+            )
+        resources = self.az(
+            ["resource", "list", "--resource-group", self.group], private=True
+        )
+        if resources != []:
+            raise RuntimeError("Reserved resource group is no longer empty")
+        self.record(
+            "claiming-reservation",
+            reservation_claim={
+                "resource_group_id": reservation["resource_group_id"],
+                "original_tags": reservation["tags"],
+            },
+        )
+        group = self.az([
+            "group", "update", "--name", self.group,
+            "--tags", *self.resource_tags(group=True),
+        ], private=True)
+        if group.get("tags") != self.group_tags:
+            raise RuntimeError("Resource-group reservation tag binding did not complete")
+        self.require_owned_group(group)
+        if self.az([
+            "resource", "list", "--resource-group", self.group,
+        ], private=True) != []:
+            raise RuntimeError("Reserved resource group changed during its claim")
+        self.record("group-claimed")
 
     def upload_disk(self, image):
         self.record("creating-disk")
@@ -1137,18 +1594,150 @@ class AzureRun:
             raise RuntimeError("Uploaded disk is not a successfully imported Gen2 Linux disk")
         self.record("disk-ready")
 
-    def deploy_vm(self):
+    @contextmanager
+    def private_parameters(self, values):
+        path = self.state_path.parent / (
+            ".deployment-parameters-" + secrets.token_hex(8) + ".json"
+        )
+        save_json(path, {
+            "$schema": (
+                "https://schema.management.azure.com/schemas/"
+                "2019-04-01/deploymentParameters.json#"
+            ),
+            "contentVersion": "1.0.0.0",
+            "parameters": {
+                key: {"value": value} for key, value in values.items()
+            },
+        })
+        try:
+            yield path
+        finally:
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def deadline_timeout(deadline, maximum):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("The private peer lifetime has expired")
+        return max(1, min(maximum, int(remaining)))
+
+    def deploy_network_peer(self, network_config, peer_image, deadline):
+        peer_script = read_regular_file(
+            network.PEER_SCRIPT, 4 * 1024 * 1024,
+            "Pinned Hyper-V network peer"
+        )
+        bootstrap = network.peer_bootstrap(
+            peer_script, self.state["acceptance"], network_config
+        )
+        password = (
+            "Uk!" + secrets.token_urlsafe(32) + "a7"
+        )
+        parameters = {
+            "namePrefix": self.prefix,
+            "location": self.state["location"],
+            "imageSha256": self.state["image_sha256"],
+            "peerIPAddress": network_config["peer_ipv4"],
+            "guestIPAddress": network_config["guest_ipv4"],
+            "subnetPrefix": network_config["subnet"],
+            "tcpPort": network_config["tcp_port"],
+            "udpPort": network_config["udp_port"],
+            "peerImageVersion": peer_image["version"],
+            "peerCustomData": base64.b64encode(bootstrap.encode()).decode("ascii"),
+            "adminPassword": password,
+        }
+        self.record("deploying-peer")
+        with self.private_parameters(parameters) as parameter_file:
+            self.az([
+                "deployment", "group", "create", "--resource-group", self.group,
+                "--name", self.prefix + "-peer", "--mode", "Incremental",
+                "--template-file",
+                str(SUPPORT / "azure" / "hyperv-network-peer.json"),
+                "--parameters", "@" + str(parameter_file),
+            ], private=True, timeout=self.deadline_timeout(deadline, 300))
+        password = None
+
+        peer_vm = self.az([
+            "vm", "show", "--resource-group", self.group,
+            "--name", self.peer_vm,
+        ], private=True)
+        self.require_owned(peer_vm)
+        image_reference = peer_vm.get("storageProfile", {}).get("imageReference", {})
+        if (
+            peer_vm.get("provisioningState") != "Succeeded"
+            or peer_vm.get("hardwareProfile", {}).get("vmSize")
+            != network.PEER_VM_SIZE
+            or any(
+                image_reference.get(key) != peer_image[key]
+                for key in ("publisher", "offer", "sku", "version")
+            )
+        ):
+            raise RuntimeError("Private peer VM did not use the pinned image and size")
+        peer_disk_name = self.prefix + "-peer-os"
+        peer_disk = self.az([
+            "disk", "show", "--resource-group", self.group,
+            "--name", peer_disk_name,
+        ], private=True)
+        if peer_disk.get("tags") != self.tags:
+            peer_disk = self.az([
+                "disk", "update", "--resource-group", self.group,
+                "--name", peer_disk_name, "--tags", *self.resource_tags(),
+            ], private=True)
+        self.require_owned(peer_disk)
+        if (
+            not isinstance(peer_disk.get("id"), str)
+            or str(peer_disk.get("managedBy", "")).lower()
+            != str(peer_vm["id"]).lower()
+        ):
+            raise RuntimeError("Private peer OS disk is not owned by the peer VM")
+
+        peer_nic_name = self.prefix + "-peer-nic"
+        guest_nic_name = self.prefix + "-guest-nic"
+        nics = {}
+        for name, address in (
+            (peer_nic_name, network_config["peer_ipv4"]),
+            (guest_nic_name, network_config["guest_ipv4"]),
+        ):
+            nic = self.az([
+                "network", "nic", "show", "--resource-group", self.group,
+                "--name", name,
+            ], private=True)
+            self.require_owned(nic)
+            configurations = nic.get("ipConfigurations")
+            if (
+                not isinstance(configurations, list)
+                or len(configurations) != 1
+                or configurations[0].get("privateIPAddress") != address
+                or configurations[0].get("privateIPAllocationMethod") != "Static"
+                or configurations[0].get("publicIPAddress") is not None
+            ):
+                raise RuntimeError("Private network NIC does not match its static address")
+            nics[name] = nic
+        self.record(
+            "peer-created",
+            peer_vm_id=peer_vm["id"],
+            peer_disk_id=peer_disk["id"],
+            peer_nic_id=nics[peer_nic_name]["id"],
+            guest_nic_id=nics[guest_nic_name]["id"],
+        )
+
+    def deploy_vm(self, guest_nic_id=None, deadline=None):
         self.record("deploying-vm")
-        self.az([
-            "deployment", "group", "create", "--resource-group", self.group,
-            "--name", self.prefix, "--mode", "Incremental",
-            "--template-file", str(SUPPORT / "azure" / "hyperv-gen2.json"),
-            "--parameters",
+        parameters = [
             f"namePrefix={self.prefix}", f"location={self.state['location']}",
             f"osDiskId={self.state['disk_id']}",
             f"imageSha256={self.state['image_sha256']}",
             f"vmSize={self.state['vm_size']}",
-        ], timeout=900)
+        ]
+        if guest_nic_id is not None:
+            parameters.append(f"existingNicId={guest_nic_id}")
+        self.az([
+            "deployment", "group", "create", "--resource-group", self.group,
+            "--name", self.prefix, "--mode", "Incremental",
+            "--template-file", str(SUPPORT / "azure" / "hyperv-gen2.json"),
+            "--parameters", *parameters,
+        ], timeout=(
+            900 if deadline is None else self.deadline_timeout(deadline, 300)
+        ))
         vm = self.az([
             "vm", "show", "--resource-group", self.group, "--name", self.vm,
         ])
@@ -1164,6 +1753,15 @@ class AzureRun:
             not isinstance(security, dict) or security.get("securityType") != "Standard"
         ):
             raise RuntimeError("VM is not using the requested Standard security type")
+        if guest_nic_id is not None:
+            interfaces = vm.get("networkProfile", {}).get("networkInterfaces")
+            if (
+                not isinstance(interfaces, list)
+                or len(interfaces) != 1
+                or str(interfaces[0].get("id", "")).lower()
+                != guest_nic_id.lower()
+            ):
+                raise RuntimeError("Guest VM is not attached to the reserved private NIC")
         self.record("vm-created", vm_id=vm["id"])
 
     def cleanup(self):
@@ -1171,10 +1769,63 @@ class AzureRun:
             self.record("cleaned")
             return
         group = self.az(["group", "show", "--name", self.group])
-        self.require_owned(group)
+        reservation_claim = self.state.get("reservation_claim")
+        original_reservation = (
+            isinstance(reservation_claim, dict)
+            and str(group.get("id", "")).lower()
+            == str(reservation_claim.get("resource_group_id", "")).lower()
+            and group.get("tags") == reservation_claim.get("original_tags")
+        )
+        if not original_reservation:
+            self.require_owned_group(group)
         resources = self.az(["resource", "list", "--resource-group", self.group])
+        if original_reservation and resources:
+            raise RuntimeError(
+                "Refusing to clean a reservation that changed before its claim"
+            )
         for resource in resources:
-            self.require_owned(resource)
+            try:
+                self.require_owned(resource)
+            except RuntimeError:
+                resource_type = str(resource.get("type", "")).lower()
+                expected_id = (
+                    str(self.state.get("resource_group_id", "")).rstrip("/")
+                    + "/providers/Microsoft.Compute/disks/"
+                    + self.prefix + "-peer-os"
+                )
+                expected_vm_id = (
+                    str(self.state.get("resource_group_id", "")).rstrip("/")
+                    + "/providers/Microsoft.Compute/virtualMachines/"
+                    + self.peer_vm
+                )
+                tags = resource.get("tags")
+                if (
+                    network.validate_acceptance(
+                        self.state.get(
+                            "acceptance",
+                            {"mode": network.RAW_ACCEPTANCE_MODE},
+                        )
+                    )["mode"] != network.NETWORK_ACCEPTANCE_MODE
+                    or resource_type != "microsoft.compute/disks"
+                    or resource.get("name") != self.prefix + "-peer-os"
+                    or str(resource.get("id", "")).lower()
+                    != expected_id.lower()
+                    or tags not in (None, {})
+                ):
+                    raise
+                disk = self.az([
+                    "disk", "show", "--resource-group", self.group,
+                    "--name", self.prefix + "-peer-os",
+                ], private=True)
+                if (
+                    str(disk.get("id", "")).lower() != expected_id.lower()
+                    or str(disk.get("managedBy") or "").lower()
+                    not in ("", expected_vm_id.lower())
+                    or disk.get("tags") not in (None, {})
+                ):
+                    raise RuntimeError(
+                        "Refusing to clean an unbound private peer OS disk"
+                    )
         self.record("deleting-group")
         self.az(["group", "delete", "--name", self.group, "--yes"], timeout=900)
         if self.az(["group", "exists", "--name", self.group]) is not False:
@@ -1212,6 +1863,103 @@ class AzureRun:
             time.sleep(min(30, max(0, deadline - time.monotonic())))
         raise RuntimeError(
             f"Timed out waiting for {stage} acceptance; see saved serial.log and acceptance.json"
+        )
+
+    def network_boot_log(self, vm, deadline):
+        try:
+            text = self.az([
+                "vm", "boot-diagnostics", "get-boot-log",
+                "--resource-group", self.group, "--name", vm,
+            ], private=True, timeout=self.deadline_timeout(deadline, 120))
+        except AzureCliError as error:
+            if error.code not in (
+                "BlobNotFound", "BootDiagnosticsInformationNotAvailable",
+            ):
+                raise
+            return None
+        if not isinstance(text, str):
+            raise RuntimeError("Azure CLI did not return a JSON serial-log string")
+        if len(text.encode("utf-8")) > MAX_LOCAL_LOG_SIZE:
+            raise RuntimeError("Serial log exceeded the 4 MiB evidence limit")
+        return text
+
+    def wait_for_peer_ready(self, deadline):
+        ready_deadline = min(deadline, time.monotonic() + 240)
+        self.record("waiting-for-peer-ready")
+        while time.monotonic() < ready_deadline:
+            text = self.network_boot_log(self.peer_vm, ready_deadline)
+            if text is not None:
+                save_private_text(self.state_path.parent / "peer-serial.log", text)
+                try:
+                    result = network.inspect_peer_ready(
+                        text, self.state["acceptance"],
+                        self.state["network_run"],
+                    )
+                except network.EvidenceIncomplete:
+                    pass
+                else:
+                    self.record("peer-ready")
+                    return result
+            time.sleep(min(10, max(0, ready_deadline - time.monotonic())))
+        raise RuntimeError(
+            "Timed out waiting for the exact private peer READY record"
+        )
+
+    def wait_for_network_acceptance(self, deadline):
+        self.record("waiting-for-network-acceptance")
+        guest_text = None
+        peer_text = None
+        while time.monotonic() < deadline:
+            current_peer = self.network_boot_log(self.peer_vm, deadline)
+            if current_peer is not None:
+                peer_text = current_peer
+                save_private_text(
+                    self.state_path.parent / "peer-serial.log", peer_text
+                )
+            current_guest = self.network_boot_log(self.vm, deadline)
+            if current_guest is not None:
+                guest_text = current_guest
+                save_private_text(
+                    self.state_path.parent / "guest-serial.log", guest_text
+                )
+            if peer_text is not None and guest_text is not None:
+                try:
+                    evidence = network.correlate_evidence(
+                        guest_text, peer_text, self.state["acceptance"],
+                        self.state["network_run"],
+                    )
+                except network.EvidenceIncomplete:
+                    pass
+                else:
+                    safe = {
+                        **evidence,
+                        "image": {
+                            "vhd_sha256": self.state["image_sha256"],
+                            "prepared_manifest_sha256": (
+                                self.state["prepared_image_import"]["manifest_sha256"]
+                            ),
+                        },
+                        "peer_image": self.state["network_preflight"]["peer_image"],
+                        "source": self.state["prepared_image_import"]["source"],
+                    }
+                    private = {
+                        **safe,
+                        "run": {
+                            "name_prefix": self.prefix,
+                            "resource_group": self.group,
+                            "guest_vm_id": self.state["vm_id"],
+                            "peer_vm_id": self.state["peer_vm_id"],
+                        },
+                    }
+                    save_json(
+                        self.state_path.parent / "network-acceptance.json",
+                        private,
+                    )
+                    self.record("accepted", acceptance_stage="io")
+                    return safe
+            time.sleep(min(10, max(0, deadline - time.monotonic())))
+        raise RuntimeError(
+            "Timed out waiting for correlated peer and guest network acceptance"
         )
 
 
@@ -1262,30 +2010,151 @@ def inspect_boot_log(text, platform_marker=PLATFORM_READY):
     }
 
 
-def run_prepared(directory, stage, timeout, keep_resources):
-    if stage not in ("platform", "io") or not 30 <= timeout <= 1800:
-        raise ValueError("Expected platform/io stage and a timeout between 30 and 1800 seconds")
+@contextmanager
+def interrupt_as_exception():
+    previous = {}
+    received = False
+
+    def interrupted(signum, _frame):
+        nonlocal received
+        if received:
+            return
+        received = True
+        for number in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(number, signal.SIG_IGN)
+        raise InterruptedError(f"Interrupted by signal {signum}")
+
+    for number in (signal.SIGINT, signal.SIGTERM):
+        previous[number] = signal.getsignal(number)
+        signal.signal(number, interrupted)
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def run_prepared(directory, stage, timeout, keep_resources, *,
+                 subscription=None, resource_group_reservation=None,
+                 guest_ipv4=None, subnet=None):
+    if stage not in ("platform", "io"):
+        raise ValueError("Expected platform or io acceptance stage")
     state, state_path = load_state(directory)
     if state.get("phase") != "prepared":
         raise ValueError("Run requires a newly prepared image")
     validate_prepared_run_provenance(state, state_path.parent)
+    acceptance = network.validate_acceptance(
+        state.get("acceptance", {"mode": network.RAW_ACCEPTANCE_MODE})
+    )
+    network_mode = acceptance["mode"] == network.NETWORK_ACCEPTANCE_MODE
+    if timeout is None:
+        timeout = network.PEER_TIMEOUT_SECONDS if network_mode else 300
+    maximum_timeout = network.PEER_TIMEOUT_SECONDS if network_mode else 1800
+    if not 30 <= timeout <= maximum_timeout:
+        raise ValueError(
+            f"Expected a timeout between 30 and {maximum_timeout} seconds"
+        )
+    if network_mode and (
+        stage != "io" or keep_resources
+        or not isinstance(state.get("prepared_image_import"), dict)
+    ):
+        raise ValueError(
+            "Application-network acceptance requires an imported image, "
+            "the io stage, and mandatory cleanup"
+        )
     image = state_path.parent / "unikraft.vhd"
     if image_sha256(image) != state["image_sha256"]:
         raise ValueError("Prepared VHD has changed since the local boot")
     check_upload_dependencies()
-    state["subscription"] = check_subscription(state["location"], state["vm_size"])
+    if not network_mode:
+        if any(value is not None for value in (
+            subscription, resource_group_reservation, guest_ipv4, subnet,
+        )):
+            raise ValueError(
+                "Private network options require an application-network image"
+            )
+        state["subscription"] = check_subscription(
+            state["location"], state["vm_size"]
+        )
+        save_json(state_path, state)
+        run = AzureRun(state, state_path)
+        try:
+            run.create_group()
+            run.upload_disk(image)
+            if image_sha256(image) != state["image_sha256"]:
+                raise ValueError("VHD changed during upload")
+            run.deploy_vm()
+            return run.wait_for_boot(stage, timeout)
+        finally:
+            if state["phase"] != "prepared" and not keep_resources:
+                run.cleanup()
+
+    if guest_ipv4 is None or subnet is None:
+        raise ValueError(
+            "Application-network runs require explicit guest IPv4 and subnet"
+        )
+    network_run = network.private_network(
+        acceptance, guest_ipv4, subnet
+    )
+    reservation = None
+    if resource_group_reservation is not None:
+        reservation = load_resource_group_reservation(
+            resource_group_reservation
+        )
+        if subscription is not None and (
+            validate_subscription_id(subscription) != reservation["subscription"]
+        ):
+            raise ValueError(
+                "Explicit subscription does not match the private reservation"
+            )
+        selected_subscription = reservation["subscription"]
+        if reservation["location"] != state["location"]:
+            raise ValueError(
+                "Private reservation location does not match imported image state"
+            )
+    elif subscription is not None:
+        selected_subscription = validate_subscription_id(subscription)
+    else:
+        raise ValueError(
+            "Application-network runs require --subscription or "
+            "--resource-group-reservation"
+        )
+
+    preflight = check_network_subscription(
+        state["location"], state["vm_size"], selected_subscription
+    )
+    state.update(
+        subscription=selected_subscription,
+        network_run=network_run,
+        network_preflight=preflight,
+    )
+    if reservation is not None:
+        state.update(
+            resource_group=reservation["resource_group"],
+            resource_group_id=reservation["resource_group_id"],
+            group_precreated=True,
+        )
     save_json(state_path, state)
     run = AzureRun(state, state_path)
-    try:
-        run.create_group()
-        run.upload_disk(image)
-        if image_sha256(image) != state["image_sha256"]:
-            raise ValueError("VHD changed during upload")
-        run.deploy_vm()
-        return run.wait_for_boot(stage, timeout)
-    finally:
-        if state["phase"] != "prepared" and not keep_resources:
-            run.cleanup()
+    with interrupt_as_exception():
+        try:
+            if reservation is None:
+                run.create_group()
+            else:
+                run.claim_group_reservation(reservation)
+            run.upload_disk(image)
+            if image_sha256(image) != state["image_sha256"]:
+                raise ValueError("VHD changed during upload")
+            peer_deadline = time.monotonic() + timeout
+            run.deploy_network_peer(
+                network_run, preflight["peer_image"], peer_deadline
+            )
+            run.wait_for_peer_ready(peer_deadline)
+            run.deploy_vm(state["guest_nic_id"], peer_deadline)
+            return run.wait_for_network_acceptance(peer_deadline)
+        finally:
+            if state["phase"] != "prepared":
+                run.cleanup()
 
 
 def cleanup_state(directory):
@@ -1343,6 +2212,10 @@ def main():
     prepare.add_argument("--qemu", default="qemu-system-x86_64")
     prepare.add_argument("--expect", default=PLATFORM_READY)
     prepare.add_argument("--timeout", type=int, default=30)
+    prepare.add_argument(
+        "--solved-config", type=Path,
+        help="Bind a solved application-network configuration to the image",
+    )
     prepare.add_argument("--location", default="westus2")
     prepare.add_argument("--vm-size", default="Standard_D2s_v5", choices=VM_SIZES)
     export = subparsers.add_parser("export-prepared")
@@ -1362,8 +2235,12 @@ def main():
     run = subparsers.add_parser("run")
     run.add_argument("--state-dir", type=Path, required=True)
     run.add_argument("--stage", choices=("platform", "io"), default="io")
-    run.add_argument("--timeout", type=int, default=300)
+    run.add_argument("--timeout", type=int)
     run.add_argument("--keep-resources", action="store_true")
+    run.add_argument("--subscription")
+    run.add_argument("--resource-group-reservation", type=Path)
+    run.add_argument("--guest-ipv4")
+    run.add_argument("--subnet")
     cleanup = subparsers.add_parser("cleanup")
     cleanup.add_argument("--state-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -1395,10 +2272,12 @@ def main():
             )
             print(f"Prepared image imported into private run state: {directory}")
         elif args.action == "run":
-            if not 30 <= args.timeout <= 1800:
-                parser.error("--timeout must be between 30 and 1800 seconds")
             result = run_prepared(
-                args.state_dir, args.stage, args.timeout, args.keep_resources
+                args.state_dir, args.stage, args.timeout, args.keep_resources,
+                subscription=args.subscription,
+                resource_group_reservation=args.resource_group_reservation,
+                guest_ipv4=args.guest_ipv4,
+                subnet=args.subnet,
             )
             print(json.dumps(result, indent=2))
         elif args.action == "cleanup":
