@@ -170,6 +170,12 @@ static atomic_ullong bind_resource_epoch = 1;
 static int close_pause_enabled;
 static int close_pause_entered;
 static int close_pause_release;
+static int receive_gate_enabled;
+static unsigned int receive_gate_controller;
+static int receive_gate_before_entered;
+static int receive_gate_release_drain;
+static int receive_gate_notify_entered;
+static int receive_gate_release_notify;
 static unsigned int report_luns_commands;
 static unsigned int vpd_commands;
 static int invalid_scsi_address;
@@ -382,6 +388,30 @@ void storvsc_host_recovery_begin_hook(void)
 	pthread_mutex_lock(&race_lock);
 	race_recovery_begin = 1;
 	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+}
+
+void storvsc_host_receive_hook(unsigned int controller, int before_notify)
+{
+	if (current_thread == &main_thread)
+		return;
+
+	pthread_mutex_lock(&race_lock);
+	if (!receive_gate_enabled || controller != receive_gate_controller) {
+		pthread_mutex_unlock(&race_lock);
+		return;
+	}
+	if (!before_notify) {
+		receive_gate_before_entered = 1;
+		pthread_cond_broadcast(&race_condition);
+		while (receive_gate_enabled && !receive_gate_release_drain)
+			pthread_cond_wait(&race_condition, &race_lock);
+	} else {
+		receive_gate_notify_entered = 1;
+		pthread_cond_broadcast(&race_condition);
+		while (receive_gate_enabled && !receive_gate_release_notify)
+			pthread_cond_wait(&race_condition, &race_lock);
+	}
 	pthread_mutex_unlock(&race_lock);
 }
 
@@ -2898,28 +2928,117 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	if (atomic_load(&teardown_callbacks) != 2)
 		return 57;
 	for (unsigned int i = 0; i < 2; i++) {
-		if (uk_storvsc_mapping_get(i, &found) ||
-		    found.blkdev_id != stable_ids[i])
+		rc = uk_storvsc_mapping_get(i, &found);
+		if (rc || found.blkdev_id != stable_ids[i]) {
+			fprintf(stderr,
+				"rebind mapping[%u] failed: rc=%d actual=%u expected=%u\n",
+				i, rc,
+				(unsigned int)(rc ? UINT16_MAX :
+						     found.blkdev_id),
+				(unsigned int)stable_ids[i]);
 			return 58;
+		}
+	}
+	pthread_mutex_lock(&race_lock);
+	receive_gate_enabled = 1;
+	receive_gate_controller = 0;
+	receive_gate_before_entered = 0;
+	receive_gate_release_drain = 0;
+	receive_gate_notify_entered = 0;
+	receive_gate_release_notify = 0;
+	pthread_mutex_unlock(&race_lock);
+	if (wait_race_flag(&receive_gate_before_entered)) {
+		fprintf(stderr,
+			"rebind worker did not reach the receive gate\n");
+		pthread_mutex_lock(&race_lock);
+		receive_gate_enabled = 0;
+		receive_gate_release_drain = 1;
+		receive_gate_release_notify = 1;
+		pthread_cond_broadcast(&race_condition);
+		pthread_mutex_unlock(&race_lock);
+		return 58;
 	}
 	atomic_init(&rebind_callbacks, 0);
 	hold_io = 1;
 	pending_count = 0;
 	for (unsigned int i = 0; i < 2; i++) {
+		int status;
+
 		initialize_request(&requests[i], UK_BLKREQ_READ, 30 + i, 1,
 				   buffer + i * 512, request_done,
 				   &rebind_callbacks);
-		if (!(devices[i]->submit_one(devices[i],
-					     devices[i]->_queue[0],
-					     &requests[i]) &
-		      UK_BLKDEV_STATUS_SUCCESS))
+		status = devices[i]->submit_one(devices[i],
+					       devices[i]->_queue[0],
+					       &requests[i]);
+		if (!(status & UK_BLKDEV_STATUS_SUCCESS)) {
+			fprintf(stderr,
+				"rebind submit[%u] failed: status=%d pending=%u request_result=%d\n",
+				i, status, pending_count, requests[i].result);
+			pthread_mutex_lock(&race_lock);
+			receive_gate_enabled = 0;
+			receive_gate_release_drain = 1;
+			receive_gate_release_notify = 1;
+			pthread_cond_broadcast(&race_condition);
+			pthread_mutex_unlock(&race_lock);
 			return 58;
+		}
 	}
 	complete_pending(0);
-	fire_channel_on(primary->channel);
-	if (atomic_load(&rebind_callbacks) != 2 ||
-	    requests[0].result || requests[1].result)
+	pthread_mutex_lock(&race_lock);
+	receive_gate_release_drain = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	if (wait_race_flag(&receive_gate_notify_entered)) {
+		fprintf(stderr,
+			"rebind worker did not retain notification ownership\n");
+		pthread_mutex_lock(&race_lock);
+		receive_gate_enabled = 0;
+		receive_gate_release_notify = 1;
+		pthread_cond_broadcast(&race_condition);
+		pthread_mutex_unlock(&race_lock);
 		return 58;
+	}
+	fire_channel_on(primary->channel);
+	if (atomic_load(&rebind_callbacks) ||
+	    !storvsc_host_request_bound(&requests[0]) ||
+	    !storvsc_host_request_bound(&requests[1])) {
+		fprintf(stderr,
+			"rebind callback raced retained notification: callbacks=%d bound=%d,%d\n",
+			atomic_load(&rebind_callbacks),
+			storvsc_host_request_bound(&requests[0]),
+			storvsc_host_request_bound(&requests[1]));
+		pthread_mutex_lock(&race_lock);
+		receive_gate_enabled = 0;
+		receive_gate_release_notify = 1;
+		pthread_cond_broadcast(&race_condition);
+		pthread_mutex_unlock(&race_lock);
+		return 58;
+	}
+	pthread_mutex_lock(&race_lock);
+	receive_gate_release_notify = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	rc = wait_atomic_value(&rebind_callbacks, 2,
+			       CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	pthread_mutex_lock(&race_lock);
+	receive_gate_enabled = 0;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	if (rc || requests[0].result || requests[1].result ||
+	    atomic_load(&requests[0].state.counter) != UK_BLKREQ_FINISHED ||
+	    atomic_load(&requests[1].state.counter) != UK_BLKREQ_FINISHED ||
+	    storvsc_host_request_bound(&requests[0]) ||
+	    storvsc_host_request_bound(&requests[1])) {
+		fprintf(stderr,
+			"rebind completion failed: wait=%d callbacks=%d results=%d,%d states=%u,%u bound=%d,%d\n",
+			rc, atomic_load(&rebind_callbacks),
+			requests[0].result, requests[1].result,
+			atomic_load(&requests[0].state.counter),
+			atomic_load(&requests[1].state.counter),
+			storvsc_host_request_bound(&requests[0]),
+			storvsc_host_request_bound(&requests[1]));
+		return 58;
+	}
 	hold_io = 0;
 	rc = run_mixed_lun_completion(devices[0], devices[1],
 				      primary->channel, buffer, 0, 70);
