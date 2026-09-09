@@ -97,7 +97,7 @@ void __noreturn uk_boot_fixed_smp_lcpu_entry(struct uk_lcpu *lcpu)
 	int rc;
 
 	UK_ASSERT(lcpu == uk_lcpu_get_current());
-	/* Custom startup entries bypass uk_lcpu_entry_default(). */
+	/* x86 startup jumps directly to custom entries. */
 	rc = uk_lcpu_init(lcpu);
 	if (unlikely(rc))
 		uk_lcpu_halt_error(rc);

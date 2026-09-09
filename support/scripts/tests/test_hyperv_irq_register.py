@@ -4,10 +4,12 @@ import importlib
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 TESTS = Path(__file__).resolve().parents[2] / "build/tests"
 sys.path.insert(0, str(TESTS))
 irq = importlib.import_module("hyperv-irq-register-test")
+smp = importlib.import_module("hyperv-smp-link-test")
 
 CALLBACK = "schedcoop_thread_woken_isr"
 
@@ -58,27 +60,35 @@ class HypervIrqConstructorTest(unittest.TestCase):
                     )
 
 
-class HypervFixedSmpCpuCountTest(unittest.TestCase):
-    def test_boot_uses_strong_acpi_platform_count(self):
-        functions = {
+class HypervFixedSmpBindingTest(unittest.TestCase):
+    def setUp(self):
+        self.functions = {
             1: ("uk_boot_entry", [(1, "call", "2 <ukplat_lcpu_count>")]),
             2: ("ukplat_lcpu_count", [(2, "jmp", "3 <uk_acpi_cpu_count>")]),
             3: ("uk_acpi_cpu_count", [(3, "ret", "")]),
+            5: (
+                "uk_boot_fixed_smp_lcpu_entry",
+                [(5, "call", "6 <uk_lcpu_init>")],
+            ),
         }
-        irq.verify_fixed_smp_cpu_count_binding(
-            functions,
-            {
-                "uk_boot_fixed_smp_prepare": 4,
-                "uk_boot_entry": 1,
-                "ukplat_lcpu_count": 2,
-                "uk_acpi_cpu_count": 3,
-            },
-            {"ukplat_lcpu_count": ["T"]},
+        self.symbols = {
+            "uk_boot_fixed_smp_prepare": 4,
+            "uk_boot_entry": 1,
+            "ukplat_lcpu_count": 2,
+            "uk_acpi_cpu_count": 3,
+            "uk_boot_fixed_smp_lcpu_entry": 5,
+            "uk_lcpu_init": 6,
+        }
+        self.kinds = {"ukplat_lcpu_count": ["T"]}
+
+    def test_boot_uses_strong_acpi_count_and_initializes_ap(self):
+        irq.verify_fixed_smp_bindings(
+            self.functions, self.symbols, self.kinds,
         )
 
     def test_localized_weak_count_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "one strong platform symbol"):
-            irq.verify_fixed_smp_cpu_count_binding(
+            irq.verify_fixed_smp_bindings(
                 {},
                 {
                     "uk_boot_fixed_smp_prepare": 4,
@@ -119,9 +129,54 @@ class HypervFixedSmpCpuCountTest(unittest.TestCase):
         ):
             with self.subTest(message=message):
                 with self.assertRaisesRegex(ValueError, message):
-                    irq.verify_fixed_smp_cpu_count_binding(
+                    irq.verify_fixed_smp_bindings(
                         functions, symbols, kinds
                     )
+
+    def test_missing_or_misbound_ap_initialization_is_rejected(self):
+        for instructions in (
+            [],
+            [(5, "call", "7 <wrong_init>")],
+            [(5, "call", "*%rax")],
+        ):
+            with self.subTest(instructions=instructions):
+                self.functions[5] = ("uk_boot_fixed_smp_lcpu_entry", instructions)
+                with self.assertRaisesRegex(ValueError, "does not initialize"):
+                    irq.verify_fixed_smp_bindings(
+                        self.functions, self.symbols, self.kinds,
+                    )
+
+    def test_non_fixed_image_does_not_require_fixed_bindings(self):
+        irq.verify_fixed_smp_bindings({}, {}, {})
+
+    def test_multicpu_link_without_fixed_scheduler_is_supported(self):
+        hooks = (
+            "ukplat_lcpu_startup_hook", "ukplat_lcpu_init_hook",
+            "ukplat_lcpu_fini_hook", "hyperv_vmbus_shutdown",
+            "hyperv_vmbus_fini", "hyperv_vmbus_message",
+            "hyperv_vmbus_event", "hyperv_vmbus_event_word",
+        )
+        symbols = "\n".join(f"{i:x} T {hook}" for i, hook in enumerate(hooks))
+        calls = {
+            "uk_boot_entry": ("ukplat_lcpu_startup_hook",),
+            "uk_lcpu_init": ("ukplat_lcpu_init_hook",),
+            "lcpu_halt": ("ukplat_lcpu_fini_hook",),
+            "ukplat_lcpu_startup_hook": (
+                "uk_lcpu_start", "hyperv_vmbus_message",
+                "hyperv_vmbus_event_word", "hyperv_vmbus_shutdown",
+            ),
+        }
+        disassembly = "".join(
+            f"{i:x} <{caller}>:\n" + "".join(
+                f"  {i:x}: call 0 <{callee}>\n" for callee in callees
+            )
+            for i, (caller, callees) in enumerate(calls.items())
+        )
+        with mock.patch.object(smp, "output", side_effect=[symbols, disassembly]):
+            with mock.patch.object(sys, "argv", [
+                "hyperv-smp-link-test.py", "--image", "unused", "--max-cpus", "2",
+            ]):
+                smp.main()
 
 
 if __name__ == "__main__":

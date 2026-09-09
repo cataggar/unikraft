@@ -102,7 +102,7 @@ def direct_target(functions, symbols, caller, callee):
     return False
 
 
-def verify_fixed_smp_cpu_count_binding(functions, symbols, kinds):
+def verify_fixed_smp_bindings(functions, symbols, kinds):
     if "uk_boot_fixed_smp_prepare" not in symbols:
         return
     if kinds.get("ukplat_lcpu_count") != ["T"]:
@@ -121,6 +121,12 @@ def verify_fixed_smp_cpu_count_binding(functions, symbols, kinds):
     ):
         raise ValueError(
             "Hyper-V fixed SMP CPU count does not use ACPI enumeration"
+        )
+    if not direct_target(
+        functions, symbols, "uk_boot_fixed_smp_lcpu_entry", "uk_lcpu_init"
+    ):
+        raise ValueError(
+            "fixed SMP AP entry does not initialize the logical CPU"
         )
 
 
@@ -158,7 +164,7 @@ def verify(image, nm, objdump):
                 (int(instruction[1], 16), instruction[2], instruction[3])
             )
 
-    verify_fixed_smp_cpu_count_binding(functions, symbols, kinds)
+    verify_fixed_smp_bindings(functions, symbols, kinds)
 
     pending = [symbols["uk_plat_native_except_irq_handler"]]
     visited = set()

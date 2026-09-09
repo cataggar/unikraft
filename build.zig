@@ -1319,6 +1319,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_ukboot_smp_tests = b.addRunArtifact(ukboot_smp_tests);
+    const run_ukboot_smp_init_failure = b.addRunArtifact(ukboot_smp_tests);
+    run_ukboot_smp_init_failure.addArg("--init-failure");
     const schedcoop_smp_test_step = b.step(
         "test-schedcoop-smp",
         "Run fixed cooperative-SMP queue and wake lifecycle fixtures",
@@ -1326,6 +1328,7 @@ pub fn build(b: *std.Build) void {
     schedcoop_smp_test_step.dependOn(&run_schedcoop_smp_tests.step);
     schedcoop_smp_test_step.dependOn(&run_uksched_wake_tests.step);
     schedcoop_smp_test_step.dependOn(&run_ukboot_smp_tests.step);
+    schedcoop_smp_test_step.dependOn(&run_ukboot_smp_init_failure.step);
     schedcoop_smp_test_step.dependOn(&run_hyperv_fixed_smp_tests.step);
     test_step.dependOn(&run_schedcoop_smp_tests.step);
     test_step.dependOn(&run_uksched_wake_tests.step);
@@ -1395,6 +1398,7 @@ pub fn build(b: *std.Build) void {
     hyperv_regression_tests.dependOn(&run_schedcoop_smp_tests.step);
     hyperv_regression_tests.dependOn(&run_uksched_wake_tests.step);
     hyperv_regression_tests.dependOn(&run_ukboot_smp_tests.step);
+    hyperv_regression_tests.dependOn(&run_ukboot_smp_init_failure.step);
     hyperv_regression_tests.dependOn(&run_hyperv_fixed_smp_tests.step);
     if (builtin.cpu.arch == .x86_64) {
         hyperv_regression_tests.dependOn(hyperv_irq_tests);

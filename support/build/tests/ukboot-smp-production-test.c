@@ -4,6 +4,7 @@
 #include <setjmp.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include <uk/alloc.h>
 #include <uk/boot/smp.h>
@@ -182,7 +183,7 @@ static void run_ap(unsigned int idx, int expected_exit)
 	ukboot_host_cpu_idx = 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
 	const __u64 cpus[] = { 1, 2, 3 };
 	unsigned int creates;
@@ -193,6 +194,21 @@ int main(void)
 					 &allocator, 4) == 0);
 	assert(scheduler_creates == 4);
 	assert(bootstrap_creates == 3);
+
+	if (argc > 1) {
+		assert(argc == 2 && !strcmp(argv[1], "--init-failure"));
+		lcpu_init_error[1] = -ENODEV;
+		run_ap(1, 2);
+		assert(ap_halt_error == -ENODEV);
+		assert(lcpu_inits == 1 && ap_init_stage == 1);
+		assert(tls_sets == 0 && auxsp_sets == 0);
+		assert(idle_publishes == 0 && irq_enables == 0 && blocks == 0);
+		assert(uk_boot_fixed_smp_wait_online(cpus, 1) == -EIO);
+		uk_boot_fixed_smp_rollback(cpus, 3, 1);
+		assert(schedulers[1].state == UK_SCHED_QUARANTINED);
+		assert(bootstrap_releases == 2 && scheduler_destroys == 2);
+		return 0;
+	}
 
 	run_ap(1, 1);
 	assert(lcpu_inits == 1 && ap_init_stage == 4);

@@ -73,8 +73,6 @@ def main() -> None:
     if args.max_cpus > 1:
         require_call(function(disassembly, "ukplat_lcpu_startup_hook"),
                      "uk_lcpu_start")
-        require_call(function(disassembly, "uk_boot_fixed_smp_lcpu_entry"),
-                     "uk_lcpu_init")
 
 
 if __name__ == "__main__":
