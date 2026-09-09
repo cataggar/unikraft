@@ -61,6 +61,264 @@ UNAVAILABLE_RECORDS = (
         "storage=UNAVAILABLE network=UNAVAILABLE"
     ),
 )
+GUARDED_BOOT_POLICY = "guarded-v2-pristine-unavailable"
+GUARDED_CONTRACT_SCHEMA = (
+    "unikraft.hyperv.guarded-v2-pristine-unavailable"
+)
+GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
+GUARDED_PRODUCER_SCHEMA_VERSION = 4
+GUARDED_PRODUCER_CLOSURES = {
+    "support/build": {
+        "name": "support/build",
+        "sha256": (
+            "bf805fcd99724811fd0f4c1269ef1efddc8bc2b5412542747c5070e8e0f6b8a6"
+        ),
+        "size": 1179571,
+        "files": 177,
+    },
+}
+GUARDED_PRODUCER_FILES = {
+    "Config.uk": (
+        "17b791a1bc6709f31846321cb705cd30b141e09eb05f6cd0bcffebb3eba0d50e"
+    ),
+    "Makefile": (
+        "c790738ac50a85be2e7def288a32890a1c2703b9a148ffb2dd633d200305d562"
+    ),
+    "Makefile.uk": (
+        "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
+    ),
+    "build.zig": (
+        "fd59a9880077c16a9e38af777950d46471e1e50332a5644ddaec6ec1ece38bf8"
+    ),
+    "build.zig.zon": (
+        "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
+    ),
+    "version.mk": (
+        "cafea59f9f8b9ca7b2d8c15e907cc984f2b8992e52766ed2e826337de0c9503c"
+    ),
+    "support/build/Makefile.build": (
+        "61ae89caa8ca9c5b41d8daf4fd2a855b3c80fec347ae473dd51c0bfa1656b8c8"
+    ),
+    "support/build/Makefile.clean": (
+        "067162c663472b42c09401aba78ed0d1bbb39dd9cb809718a9b12eb8d7aec55f"
+    ),
+    "support/build/Makefile.graph": (
+        "32a17fdb76ae0c52be5b501d6c5270503b4f235f491a2ac508ff22df95edd538"
+    ),
+    "support/build/Makefile.rules": (
+        "a8ad0532d523b7acb632f73ea5c4dc81050740452c747e1fdd3af36884233ee5"
+    ),
+    "support/build/build-context.zig": (
+        "87e9e9c1b396275ed472d746a1d05b610e1fde97a1a9617087ea850e1b0af495"
+    ),
+    "support/build/cc-version.sh": (
+        "fcf53f6cd69d082189c1e1a57c10fb0c34a5c0ac6b5e23f6035562287cfd9ae9"
+    ),
+    "support/build/component-api.zig": (
+        "f34516c624f42b1151d45fe4674e41a3bd8cb76dd03ad279b74afe9feb6860c2"
+    ),
+    "support/build/config-submenu.sh": (
+        "8036c9d1665fcf577b3ac96d28e0fc6196fada7683077884ba85b8ba4ca5f9cd"
+    ),
+    "support/build/elf-common-validator.zig": (
+        "9aa2cd402443fa41ce65040332698859853a89c4916be65a8b032907a4bf108f"
+    ),
+    "support/build/final-link.zig": (
+        "2b2934844c13e511351ae5a6f63fd7f4168a98ee007a1cc37e2411016fb71067"
+    ),
+    "support/build/kconfig.zig": (
+        "e3f8ea0dbb9b136038f4c462e67a88394407e299b0ff87cae803a698d630c624"
+    ),
+    "support/build/linker-script.zig": (
+        "0116adde8d137b22230accc9c07731939558b7e5a5eac0637b44d7386375880f"
+    ),
+    "support/build/lto-symbol-policy.py": (
+        "139c967944d7460b92dcad82c8a2149a56d5698a27f7bc1029b1b789da4b19ce"
+    ),
+    "support/build/merge-linker-scripts.py": (
+        "dd39b9cec861bdf4771fba05c0b477aea37e2b2f1d40d843f31d3c1df011ee3a"
+    ),
+    "support/build/native-config-metadata.py": (
+        "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
+    ),
+    "support/build/native-config-tool.zig": (
+        "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
+    ),
+    "support/build/native-image-data.zig": (
+        "159b836c9ae05acf0889bdf37bc385dd3171fa9df6d6be01746376811c5b514c"
+    ),
+    "support/build/native-library-link.zig": (
+        "562a0b713e67e6e3de6897077f6bd18cc0ee135b8522bfaecd6d8c11a61423fe"
+    ),
+    "support/build/native-lto.zig": (
+        "68076583775b233c21447ad580a3a30b653a589c9dd6c8cf994b9eb70cf97974"
+    ),
+    "support/build/native-target-object.zig": (
+        "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
+    ),
+    "support/build/symbols/libukrandom-lcpu.localize": (
+        "b00d5cfee43ae40b56bda292365bf7339d2c8f4239131d632edbebe623e940c6"
+    ),
+    "support/build/target/native-profile.zig": (
+        "ab321fb4434415ddd6ed4e34e173956a9555af91b91f26557b47673b6fe310de"
+    ),
+    "support/build/zig-facade-paths.zig": (
+        "38325cf826d855004e9808924e2687dc70bc42264b952da98f2dce0ad801b8f0"
+    ),
+    "support/build/zig-facade-runner.zig": (
+        "5ba4f753fd4a0537564009a47298f242d10a1b831fe6fda00b5172023de8db77"
+    ),
+    "support/build/tests/hyperv-smp-link-test.py": (
+        "dc40554f6da6ddca3e9f65b5b6c12243c734d24992a342d3564750ecc5e71488"
+    ),
+    "support/build/tests/hyperv-irq-register-test.py": (
+        "a8041f4954d1b0d3ab7082350cdb912bde5ea9a83102e329845ac09cfbfeed8b"
+    ),
+    "support/build/tests/hyperv-driver-registration-test.py": (
+        "b5696ca8cc32ae189a1a388675df85bc7021a6c3d7311ab7d01f53e990f3b8ef"
+    ),
+    "support/scripts/build-graph.py": (
+        "d4618b21455fda35240f29779b289191ddebeabdecbfcafcf27d32bcd8ebd1ab"
+    ),
+    "support/scripts/configupdate": (
+        "2530183ffd12a43fae6003024e41524dade65b2b073de9dc3d59d23b72c41d62"
+    ),
+    "support/scripts/gitsha1": (
+        "10f93856e88dc7afea74e2aff8cbe0048ee907c5f819834325542efa40794564"
+    ),
+    "support/scripts/mkcompiledb.py": (
+        "8c9a11a03940e6c2cbc82f334303908cd52ca9d31c3de42003d21b1306b59339"
+    ),
+    "support/scripts/mklinux.py": (
+        "25aecf13f71468d27537c8b84f7fa1deb271ba3867a0d0655d1b04cd321c1c67"
+    ),
+    "support/scripts/multiboot.py": (
+        "91d3d660ebbc11f03d6b86bc04a70ca7b7e28539c4a293abbbdba7e1ee3ba6a9"
+    ),
+    "support/scripts/uk-gdb.py": (
+        "cc0d9b9c1c2e8721aa267c2fc1885bb72a6662e2d2573cdc04227e6998a79434"
+    ),
+    "drivers/hyperv/storvsc/Config.uk": (
+        "bc4474ee1655396b74359fc0b40fd5036b2e6219a50f6b6fb6787a0e8daeec6a"
+    ),
+    "drivers/hyperv/storvsc/Makefile.uk": (
+        "9ea0883afdb3e08df3110347df9a3917dbd602a151a302b6d3bceea02ec6b905"
+    ),
+    "drivers/hyperv/storvsc/exportsyms.uk": (
+        "0d15682c08580e5dd5f9546b66990e2b053ed1b2b8b0746a05670aaeadc61a6d"
+    ),
+    "drivers/hyperv/storvsc/include/uk/storvsc.h": (
+        "e0e666ff4faefc2ba1186403a4320170fb3163375cc31a04312bbce011aa9f10"
+    ),
+    "drivers/hyperv/storvsc/storvsc.c": (
+        "cb9e5afefb8f18612c36b5975b94ed64c0702c4a4e6988ea4edfa9c6bc6da213"
+    ),
+    "drivers/hyperv/storvsc/storvsc_core.h": (
+        "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
+    ),
+    "drivers/hyperv/storvsc/storvsc_core.zig": (
+        "f4b7f4fa58cca087b9ff7b2e15f372d09cab9ea542210c0a306b9a5880ba9ae6"
+    ),
+    "drivers/hyperv/vmbus/Config.uk": (
+        "05a880a38a10e130510fafbfa786f080d3da1413feb84ca7fc2a068c04a4d069"
+    ),
+    "drivers/hyperv/vmbus/Makefile.uk": (
+        "7622b3998629db41f2e1c8f8538872cf3efc64fff16e5832d0fb053ba2437a57"
+    ),
+    "drivers/hyperv/vmbus/exportsyms.uk": (
+        "340c49783a88696b2027f815ac0db70bc2b0ae34a331aac8bac0f6a0314a1918"
+    ),
+    "drivers/hyperv/vmbus/include/uk/vmbus.h": (
+        "13bc5450a7a8eb9c360e240c35907e1b5d82f683e36c2ee4e9a19f90f4d76bcb"
+    ),
+    "drivers/hyperv/vmbus/vmbus_bus.c": (
+        "6428a549e5b41155103e6d66ea31b4baf4a90d2657114edc9e7b60dd4746f28e"
+    ),
+    "drivers/hyperv/vmbus/vmbus_channel.c": (
+        "088cc06d1db460cb52525aeee56d980a2074be5c0c0d8cdfa15eef72b656cc1c"
+    ),
+    "drivers/hyperv/vmbus/vmbus_protocol.h": (
+        "c00e58790f9d8ece3518fdda9b82b02b843eccb3c2cc90002344192b554e44a9"
+    ),
+    "drivers/hyperv/vmbus/vmbus_protocol.zig": (
+        "4815d095de1aefcbc8f9bd40c87f7b17b1ff5e51bc816b8ba0b73980b5eab2a3"
+    ),
+    "plat/hyperv/Config.uk": (
+        "c5fe6226a426333e2119845366cac6c712b4258d8c7ead82980d7ac57c7c0505"
+    ),
+    "plat/hyperv/Makefile.uk": (
+        "672e146edc8058fce245a05e475564a89e634b2e41394625236a17167d7a08a4"
+    ),
+    "plat/hyperv/hyperv_runtime.zig": (
+        "901a9caf76b33fa9990acdc061139553862caf394d1c78039cb71008262ec076"
+    ),
+    "plat/hyperv/include/hyperv/hyperv.h": (
+        "af844d90dea4b706ad00ef50beaa0df54697a6b324888d4d41dc918ae2b57b3c"
+    ),
+    "plat/hyperv/platform.c": (
+        "0129808beafd31996448bc8a636a1329feda5d538f19704875a908125e37da5a"
+    ),
+    "plat/hyperv/time.c": (
+        "3b97fcf27fa0a76b93e565b770bb2b1d8b0d7496267387039b6c88d0e1a1cce1"
+    ),
+    "support/build/native-image-graph.zig": (
+        "2ab2de7473bca0a886e35559edbe81d7fe71e24ac92f86721068a7b86a2f9e72"
+    ),
+    "support/build/native-postprocess-runner.py": (
+        "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"
+    ),
+    "support/build/native-postprocess.zig": (
+        "fe6adc24f97bf72dcb111853f2b8d5c30a4a86596402e33d9d30945892a8f49f"
+    ),
+    "support/scripts/elf_tools.py": (
+        "0aad63e7830a814a5c29a7330925f64e8c844cf28700aa959002a629d5019820"
+    ),
+    "support/scripts/mkbootinfo.py": (
+        "61436b01857de643ea4cc8ccc1563b8d8321e1ddc1c425d459b08aa1b0aaa409"
+    ),
+    "support/scripts/mkefi.py": (
+        "f2587a5108d5ad57e7418cc6c6a6c2351ccd1e763c68e63a9fc0c8da52426225"
+    ),
+    "support/scripts/mkukreloc.py": (
+        "325817c2c76a389c21358df535ac2ae0f1beb36b7e4cb73b62648d1f5faac8cc"
+    ),
+    "support/apps/hyperv-acceptance/Config.uk": (
+        "548e97aadb9b55101e2ec1dbb7a4b22f82b210a22d5f14eb441b17fdd2009aa7"
+    ),
+    "support/apps/hyperv-acceptance/Makefile.uk": (
+        "19f70c5cc056157f329a6b226ead55b74fd3b628eb068b065d2d1e23b6f01bb8"
+    ),
+    "support/apps/hyperv-acceptance/acceptance_protocol.c": (
+        "5ba77f19e204c9bc3b9b579cf6ccd9e0184952fd9e0d14c123f5a19af05dd64e"
+    ),
+    "support/apps/hyperv-acceptance/acceptance_protocol.h": (
+        "1b7d718ca10b760b61df07570b640586cce34d1d3c498c68fbd336a61669db4e"
+    ),
+    "support/apps/hyperv-acceptance/application_network.c": (
+        "b55080d196e6015c7a5a84f2ab2dc76856c978cf6a7ec1793186511616c56ffb"
+    ),
+    "support/apps/hyperv-acceptance/application_network.h": (
+        "dba07b1331d6a6f02c3f017c2fabe5a0c1c03f61ffd1df7e07e49c84427d2231"
+    ),
+    "support/apps/hyperv-acceptance/main.c": (
+        "deaf231ec5edf0746e99e7a657a73fcb813da8bc18116b8ef5b6543213064ddb"
+    ),
+    "support/apps/hyperv-acceptance/persistence.c": (
+        "fff49e4a09ecb6a5e788b817a5f2677d39cadd1f5a7693a2cb2be6721399d9ee"
+    ),
+    "support/apps/hyperv-acceptance/persistence.h": (
+        "8ef53f9ed76286b945212ea487bed1e6d51ec161078d4a2283f9054b962bd70f"
+    ),
+    "support/apps/hyperv-acceptance/persistence_host.h": (
+        "29f1f4f0f272225ae1d2578612a4f8320f1bc8d245e9447ce6696300b80ad23c"
+    ),
+    "support/apps/hyperv-acceptance/storage_target.c": (
+        "f1ea10aca41b49e0a82c9cb8bc855cb7ddf86354abb8331c198127345b018a03"
+    ),
+    "support/apps/hyperv-acceptance/storage_target.h": (
+        "8e357584c2544f25f511b61e486719dea66b526a2e01539e282a67d95530d915"
+    ),
+}
 LIVE_IO_MARKERS = (
     "UK_HYPERV_BLOCK_READ_OK",
     "UK_HYPERV_NET_DHCP_OFFER",
@@ -130,6 +388,82 @@ def require_identity(value):
     return value
 
 
+def validate_guarded_contract(value, boot_policy):
+    if boot_policy != GUARDED_BOOT_POLICY:
+        if value is not None:
+            raise RunnerError("unexpected-guarded-contract")
+        return None
+    value = exact_fields(
+        value,
+        (
+            "schema", "schema_version", "scope", "result", "protocol",
+            "identity_policy", "reason", "main_return", "run_id",
+            "disk_id", "path", "target", "lun", "sectors",
+            "sector_size", "solved_config_sha256", "producer",
+        ),
+        "invalid-guarded-contract",
+    )
+    producer = exact_fields(
+        value["producer"],
+        ("schema", "schema_version", "files", "closures"),
+        "invalid-guarded-producer",
+    )
+    files = exact_fields(
+        producer["files"], GUARDED_PRODUCER_FILES,
+        "invalid-guarded-producer-files",
+    )
+    closures = exact_fields(
+        producer["closures"], GUARDED_PRODUCER_CLOSURES,
+        "invalid-guarded-producer-closures",
+    )
+    if (
+        value["schema"] != GUARDED_CONTRACT_SCHEMA
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["scope"] != "platform-only"
+        or value["result"] != "UNAVAILABLE"
+        or type(value["protocol"]) is not int
+        or value["protocol"] != 1
+        or type(value["identity_policy"]) is not int
+        or value["identity_policy"] != 2
+        or value["reason"] != "no-devices"
+        or type(value["main_return"]) is not int
+        or value["main_return"] != 2
+        or require_identity(value["run_id"]) != value["run_id"]
+        or require_identity(value["disk_id"]) != value["disk_id"]
+        or type(value["path"]) is not int
+        or value["path"] != 0
+        or type(value["target"]) is not int
+        or value["target"] != 0
+        or type(value["lun"]) is not int
+        or not 0 <= value["lun"] <= 255
+        or type(value["sectors"]) is not int
+        or value["sectors"] <= 48
+        or value["sectors"] > ((1 << 63) - 1) // 512
+        or type(value["sector_size"]) is not int
+        or value["sector_size"] != 512
+        or require_sha256(value["solved_config_sha256"])
+        != value["solved_config_sha256"]
+        or producer["schema"] != GUARDED_PRODUCER_SCHEMA
+        or type(producer["schema_version"]) is not int
+        or producer["schema_version"] != GUARDED_PRODUCER_SCHEMA_VERSION
+        or dict(files) != GUARDED_PRODUCER_FILES
+        or dict(closures) != GUARDED_PRODUCER_CLOSURES
+    ):
+        raise RunnerError("invalid-guarded-contract")
+    return {
+        **value,
+        "producer": {
+            **producer,
+            "files": dict(files),
+            "closures": {
+                name: dict(record)
+                for name, record in closures.items()
+            },
+        },
+    }
+
+
 def host_boot_id():
     try:
         value = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
@@ -170,7 +504,7 @@ def parse_manifest(encoded, expected_phase):
             "schema", "schema_version", "phase", "identity",
             "boot_policy", "raw_size", "files", "evidence_prefix",
             "runner_sha256", "qemu_support", "input_manifest_sha256",
-            "workload",
+            "workload", "guarded",
         ) + (
             ("capability_manifest_sha256",)
             if expected_phase == "private" else ()
@@ -183,11 +517,12 @@ def parse_manifest(encoded, expected_phase):
     if (
         manifest["schema"] != SCHEMA
         or type(manifest["schema_version"]) is not int
-        or manifest["schema_version"] != 2
+        or manifest["schema_version"] != 3
         or manifest["phase"] != expected_phase
         or manifest["workload"] != "platform-only-v1"
         or manifest["boot_policy"] not in (
             "platform-unavailable-v1", "platform-main-zero-v1",
+            GUARDED_BOOT_POLICY,
         )
         or type(manifest["raw_size"]) is not int
         or not 1024 * 1024 <= manifest["raw_size"] <= MAX_FILE_BYTES
@@ -197,6 +532,9 @@ def parse_manifest(encoded, expected_phase):
         != manifest["input_manifest_sha256"]
     ):
         raise RunnerError("invalid-manifest-contract")
+    manifest["guarded"] = validate_guarded_contract(
+        manifest["guarded"], manifest["boot_policy"]
+    )
     identity = require_identity(manifest["identity"])
     prefix = manifest["evidence_prefix"]
     if (
@@ -252,6 +590,8 @@ def parse_manifest(encoded, expected_phase):
         if manifest["files"]["capability_raw"]["size"] != manifest["raw_size"]:
             raise RunnerError("invalid-capability-size")
         if manifest["boot_policy"] != "platform-unavailable-v1":
+            raise RunnerError("invalid-capability-policy")
+        if manifest["guarded"] is not None:
             raise RunnerError("invalid-capability-policy")
     else:
         if (
@@ -421,8 +761,9 @@ def normalized_lines(text):
     ]
 
 
-def validate_boot_log(text, policy, legacy_apic):
+def validate_boot_log(text, policy, legacy_apic, guarded=None):
     lines = normalized_lines(text)
+    guarded = validate_guarded_contract(guarded, policy)
     for marker in (
         "Hyper-V Hv#1 hypercall page enabled",
         "Hyper-V SynIC:", "Powered by", "Calling main(",
@@ -443,10 +784,70 @@ def validate_boot_log(text, policy, legacy_apic):
     ]
     if len(main) != 1 or main[0] is None:
         raise RunnerError("invalid-main-return")
-    expected_return = 2 if policy == "platform-unavailable-v1" else 0
+    expected_return = (
+        2 if policy in ("platform-unavailable-v1", GUARDED_BOOT_POLICY)
+        else 0
+    )
     if int(main[0].group(1)) != expected_return:
         raise RunnerError("unexpected-main-return")
-    if policy == "platform-unavailable-v1":
+    if policy == GUARDED_BOOT_POLICY:
+        start = (
+            "HYPERV_PERSISTENCE START PASS "
+            f"run={guarded['run_id']} "
+            f"address={guarded['path']}:{guarded['target']}:{guarded['lun']} "
+            f"sectors={guarded['sectors']} "
+            f"sector_size={guarded['sector_size']}"
+        )
+        select = (
+            "HYPERV_PERSISTENCE SELECT UNAVAILABLE "
+            f"reason={guarded['reason']} writes=0 flushes=0"
+        )
+        unavailable = (
+            "UK_HYPERV_PERSISTENCE_UNAVAILABLE:"
+            f"{guarded['protocol']}:{guarded['identity_policy']}:"
+            f"{guarded['reason']}"
+        )
+        persistence = [
+            line for line in lines
+            if (
+                "HYPERV_PERSISTENCE" in line
+                or "UK_HYPERV_PERSISTENCE" in line
+            )
+        ]
+        if persistence != [start, select, unavailable]:
+            raise RunnerError("invalid-guarded-unavailable-policy")
+        positions = []
+        for marker in (
+            "Hyper-V Hv#1 hypercall page enabled",
+            "Hyper-V SynIC:", "Powered by", "Calling main(",
+        ):
+            positions.append(next(
+                index for index, line in enumerate(lines) if marker in line
+            ))
+        positions.extend((
+            lines.index(start),
+            lines.index(select),
+            lines.index(PLATFORM_MARKER),
+            lines.index(unavailable),
+            next(
+                index for index, line in enumerate(lines)
+                if "main returned" in line
+            ),
+        ))
+        if positions != sorted(positions) or len(set(positions)) != len(positions):
+            raise RunnerError("reordered-guarded-unavailable-policy")
+        if (
+            any("FAIL" in line for line in lines)
+            or any(
+                line.startswith((
+                    "HYPERV_ACCEPTANCE ", "UK_HYPERV_ACCEPTANCE_",
+                    "HYPERV_STORAGE ", "HYPERV_NETWORK_APP ",
+                ))
+                for line in lines
+            )
+        ):
+            raise RunnerError("unexpected-guarded-activity")
+    elif policy == "platform-unavailable-v1":
         acceptance = [
             line for line in lines
             if line.startswith("HYPERV_ACCEPTANCE ")
@@ -482,14 +883,17 @@ def validate_boot_log(text, policy, legacy_apic):
             )
             for line in lines
         )
-        or any(
-            " PASS" in line
-            and line.startswith((
-                "HYPERV_ACCEPTANCE", "HYPERV_NETWORK_APP",
-                "HYPERV_STORAGE",
-            ))
-            and line != UNAVAILABLE_RECORDS[0]
-            for line in lines
+        or (
+            policy != GUARDED_BOOT_POLICY
+            and any(
+                " PASS" in line
+                and line.startswith((
+                    "HYPERV_ACCEPTANCE", "HYPERV_NETWORK_APP",
+                    "HYPERV_STORAGE",
+                ))
+                and line != UNAVAILABLE_RECORDS[0]
+                for line in lines
+            )
         )
     ):
         raise RunnerError("unexpected-live-io")
@@ -497,7 +901,7 @@ def validate_boot_log(text, policy, legacy_apic):
 
 def run_boot(qemu, ovmf_code, ovmf_code_record, ovmf_vars, ovmf_vars_record,
              image, image_record, raw_size, policy, mode, legacy_apic,
-             output_directory):
+             output_directory, guarded=None):
     work = Path(tempfile.mkdtemp(prefix="boot-", dir=output_directory))
     image_identity = immutable_identity(
         image, image_record, "boot-image-invalid"
@@ -573,7 +977,7 @@ def run_boot(qemu, ovmf_code, ovmf_code_record, ovmf_vars, ovmf_vars_record,
         if result.returncode:
             raise RunnerError("qemu-failed")
         text = log_path.read_text(errors="replace")
-        validate_boot_log(text, policy, legacy_apic)
+        validate_boot_log(text, policy, legacy_apic, guarded)
         return {
             "result": "PASS",
             "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
@@ -702,12 +1106,13 @@ def execute_phase(phase, manifest, manifest_bytes, base_url, container, sas,
                         else "capability_raw"],
                 raw_size, manifest["boot_policy"],
                 f"{image_name}-{mode}", legacy_apic, evidence_root,
+                manifest["guarded"],
             )
             boots[image_name][mode] = outcome
             logs.append(log_path)
     receipt = {
         "schema": EVIDENCE_SCHEMA,
-        "schema_version": 1,
+        "schema_version": 2,
         "phase": phase,
         "identity": identity,
         "result": "PASS",
@@ -715,6 +1120,12 @@ def execute_phase(phase, manifest, manifest_bytes, base_url, container, sas,
         "runner_sha256": manifest["runner_sha256"],
         "host_boot_id": boot_id,
         "boot_policy": manifest["boot_policy"],
+        "acceptance_scope": "platform-only",
+        "storage_result": (
+            "UNAVAILABLE"
+            if manifest["boot_policy"] == GUARDED_BOOT_POLICY
+            else "NOT_EVALUATED"
+        ),
         "boots": boots,
     }
     receipt_path = evidence_root / "receipt.json"

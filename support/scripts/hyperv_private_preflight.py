@@ -42,21 +42,30 @@ SHARED_CONTROLLER_PATH = Path(__file__).with_name("hyperv-azure.py")
 NETWORK_CONTROLLER_PATH = Path(__file__).with_name(
     "hyperv_network_controller.py"
 )
+NATIVE_POSTPROCESS_RUNNER_PATH = (
+    SUPPORT / "build" / "native-postprocess-runner.py"
+)
+UK_RELOC_SCRIPT_PATH = SUPPORT / "scripts" / "mkukreloc.py"
 INPUT_SCHEMA = "unikraft.hyperv.private-preflight-input"
 STATE_SCHEMA = "unikraft.hyperv.private-preflight-state"
 RECEIPT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
-INPUT_SCHEMA_VERSION = 5
+INPUT_SCHEMA_VERSION = 9
 STATE_SCHEMA_VERSION = 2
-RECEIPT_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 3
 HOST_PHASE_SCHEMA = host_runner.SCHEMA
 HOST_EVIDENCE_SCHEMA = host_runner.EVIDENCE_SCHEMA
 INPUT_MANIFEST = "private-preflight-input.json"
 SOLVED_CONFIG = "solved.config"
 CAPABILITY_REFERENCE = "capability.source.json"
 PRIVATE_BUILD_RECEIPT = "private-build-receipt.json"
+GIT_RUNTIME = "git-runtime"
+GIT_RUNTIME_SCHEMA = "unikraft.git-runtime-v2"
+GIT_EXECUTABLE = Path("bin/git")
+GIT_LOADER = Path("lib/loader")
 NATIVE_EFI_NAME = "helloworld_hyperv-x86_64-efi-netvsc"
 CAPABILITY_REFERENCE_SCHEMA = "unikraft.hyperv.capability-reference"
 PRIVATE_BUILD_SCHEMA = "unikraft.hyperv.private-local-build"
+PRIVATE_BUILD_SCHEMA_VERSION = 6
 STATE_FILE = "state.json"
 LOCATION = "northeurope"
 VM_SIZE = "Standard_D2s_v5"
@@ -84,6 +93,9 @@ MAX_CONTROL_BYTES = 512 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_STATE_BYTES = 192 * 1024
 MAX_BLOB_SAS_BYTES = 4096
+MAX_TRACKED_ENTRIES = 100_000
+MAX_TRACKED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TRACKED_FILE_BYTES = 256 * 1024 * 1024
 TRANSFER_TIMEOUT_SECONDS = 300
 RECONCILE_TIMEOUT_SECONDS = 120
 CLEANUP_TIMEOUT_SECONDS = 20 * 60
@@ -106,7 +118,320 @@ PRIVATE_ROLES = ("raw", "vhd")
 REMOTE_ROLES = PUBLIC_ROLES + PRIVATE_ROLES
 LOCAL_ROLES = ("efi",)
 ALL_ROLES = REMOTE_ROLES + LOCAL_ROLES
-BOOT_POLICIES = ("platform-unavailable-v1", "platform-main-zero-v1")
+BOOT_POLICIES = (
+    "platform-unavailable-v1",
+    "platform-main-zero-v1",
+    "guarded-v2-pristine-unavailable",
+)
+GUARDED_BOOT_POLICY = "guarded-v2-pristine-unavailable"
+GUARDED_CONTRACT_SCHEMA = (
+    "unikraft.hyperv.guarded-v2-pristine-unavailable"
+)
+GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
+GUARDED_PRODUCER_SCHEMA_VERSION = 4
+GUARDED_PRODUCER_CLOSURES = {
+    "support/build": {
+        "name": "support/build",
+        "sha256": (
+            "bf805fcd99724811fd0f4c1269ef1efddc8bc2b5412542747c5070e8e0f6b8a6"
+        ),
+        "size": 1179571,
+        "files": 177,
+    },
+}
+GUARDED_BUILD_CONTROL_FILES = (
+    "Config.uk",
+    "Makefile",
+    "Makefile.uk",
+    "build.zig",
+    "build.zig.zon",
+    "version.mk",
+    "support/build/Makefile.build",
+    "support/build/Makefile.clean",
+    "support/build/Makefile.graph",
+    "support/build/Makefile.rules",
+    "support/build/build-context.zig",
+    "support/build/cc-version.sh",
+    "support/build/component-api.zig",
+    "support/build/config-submenu.sh",
+    "support/build/elf-common-validator.zig",
+    "support/build/final-link.zig",
+    "support/build/kconfig.zig",
+    "support/build/linker-script.zig",
+    "support/build/lto-symbol-policy.py",
+    "support/build/merge-linker-scripts.py",
+    "support/build/native-config-metadata.py",
+    "support/build/native-config-tool.zig",
+    "support/build/native-image-data.zig",
+    "support/build/native-image-graph.zig",
+    "support/build/native-library-link.zig",
+    "support/build/native-lto.zig",
+    "support/build/native-postprocess-runner.py",
+    "support/build/native-postprocess.zig",
+    "support/build/native-target-object.zig",
+    "support/build/symbols/libukrandom-lcpu.localize",
+    "support/build/target/native-profile.zig",
+    "support/build/zig-facade-paths.zig",
+    "support/build/zig-facade-runner.zig",
+)
+GUARDED_EXECUTED_HELPER_FILES = (
+    "support/build/tests/hyperv-smp-link-test.py",
+    "support/build/tests/hyperv-irq-register-test.py",
+    "support/build/tests/hyperv-driver-registration-test.py",
+    "support/scripts/build-graph.py",
+    "support/scripts/configupdate",
+    "support/scripts/elf_tools.py",
+    "support/scripts/gitsha1",
+    "support/scripts/mkbootinfo.py",
+    "support/scripts/mkcompiledb.py",
+    "support/scripts/mkefi.py",
+    "support/scripts/mklinux.py",
+    "support/scripts/mkukreloc.py",
+    "support/scripts/multiboot.py",
+    "support/scripts/uk-gdb.py",
+)
+GUARDED_PRODUCER_FILES = {
+    "Config.uk": (
+        "17b791a1bc6709f31846321cb705cd30b141e09eb05f6cd0bcffebb3eba0d50e"
+    ),
+    "Makefile": (
+        "c790738ac50a85be2e7def288a32890a1c2703b9a148ffb2dd633d200305d562"
+    ),
+    "Makefile.uk": (
+        "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
+    ),
+    "build.zig": (
+        "fd59a9880077c16a9e38af777950d46471e1e50332a5644ddaec6ec1ece38bf8"
+    ),
+    "build.zig.zon": (
+        "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
+    ),
+    "version.mk": (
+        "cafea59f9f8b9ca7b2d8c15e907cc984f2b8992e52766ed2e826337de0c9503c"
+    ),
+    "support/build/Makefile.build": (
+        "61ae89caa8ca9c5b41d8daf4fd2a855b3c80fec347ae473dd51c0bfa1656b8c8"
+    ),
+    "support/build/Makefile.clean": (
+        "067162c663472b42c09401aba78ed0d1bbb39dd9cb809718a9b12eb8d7aec55f"
+    ),
+    "support/build/Makefile.graph": (
+        "32a17fdb76ae0c52be5b501d6c5270503b4f235f491a2ac508ff22df95edd538"
+    ),
+    "support/build/Makefile.rules": (
+        "a8ad0532d523b7acb632f73ea5c4dc81050740452c747e1fdd3af36884233ee5"
+    ),
+    "support/build/build-context.zig": (
+        "87e9e9c1b396275ed472d746a1d05b610e1fde97a1a9617087ea850e1b0af495"
+    ),
+    "support/build/cc-version.sh": (
+        "fcf53f6cd69d082189c1e1a57c10fb0c34a5c0ac6b5e23f6035562287cfd9ae9"
+    ),
+    "support/build/component-api.zig": (
+        "f34516c624f42b1151d45fe4674e41a3bd8cb76dd03ad279b74afe9feb6860c2"
+    ),
+    "support/build/config-submenu.sh": (
+        "8036c9d1665fcf577b3ac96d28e0fc6196fada7683077884ba85b8ba4ca5f9cd"
+    ),
+    "support/build/elf-common-validator.zig": (
+        "9aa2cd402443fa41ce65040332698859853a89c4916be65a8b032907a4bf108f"
+    ),
+    "support/build/final-link.zig": (
+        "2b2934844c13e511351ae5a6f63fd7f4168a98ee007a1cc37e2411016fb71067"
+    ),
+    "support/build/kconfig.zig": (
+        "e3f8ea0dbb9b136038f4c462e67a88394407e299b0ff87cae803a698d630c624"
+    ),
+    "support/build/linker-script.zig": (
+        "0116adde8d137b22230accc9c07731939558b7e5a5eac0637b44d7386375880f"
+    ),
+    "support/build/lto-symbol-policy.py": (
+        "139c967944d7460b92dcad82c8a2149a56d5698a27f7bc1029b1b789da4b19ce"
+    ),
+    "support/build/merge-linker-scripts.py": (
+        "dd39b9cec861bdf4771fba05c0b477aea37e2b2f1d40d843f31d3c1df011ee3a"
+    ),
+    "support/build/native-config-metadata.py": (
+        "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
+    ),
+    "support/build/native-config-tool.zig": (
+        "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
+    ),
+    "support/build/native-image-data.zig": (
+        "159b836c9ae05acf0889bdf37bc385dd3171fa9df6d6be01746376811c5b514c"
+    ),
+    "support/build/native-library-link.zig": (
+        "562a0b713e67e6e3de6897077f6bd18cc0ee135b8522bfaecd6d8c11a61423fe"
+    ),
+    "support/build/native-lto.zig": (
+        "68076583775b233c21447ad580a3a30b653a589c9dd6c8cf994b9eb70cf97974"
+    ),
+    "support/build/native-target-object.zig": (
+        "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
+    ),
+    "support/build/symbols/libukrandom-lcpu.localize": (
+        "b00d5cfee43ae40b56bda292365bf7339d2c8f4239131d632edbebe623e940c6"
+    ),
+    "support/build/target/native-profile.zig": (
+        "ab321fb4434415ddd6ed4e34e173956a9555af91b91f26557b47673b6fe310de"
+    ),
+    "support/build/zig-facade-paths.zig": (
+        "38325cf826d855004e9808924e2687dc70bc42264b952da98f2dce0ad801b8f0"
+    ),
+    "support/build/zig-facade-runner.zig": (
+        "5ba4f753fd4a0537564009a47298f242d10a1b831fe6fda00b5172023de8db77"
+    ),
+    "support/build/tests/hyperv-smp-link-test.py": (
+        "dc40554f6da6ddca3e9f65b5b6c12243c734d24992a342d3564750ecc5e71488"
+    ),
+    "support/build/tests/hyperv-irq-register-test.py": (
+        "a8041f4954d1b0d3ab7082350cdb912bde5ea9a83102e329845ac09cfbfeed8b"
+    ),
+    "support/build/tests/hyperv-driver-registration-test.py": (
+        "b5696ca8cc32ae189a1a388675df85bc7021a6c3d7311ab7d01f53e990f3b8ef"
+    ),
+    "support/scripts/build-graph.py": (
+        "d4618b21455fda35240f29779b289191ddebeabdecbfcafcf27d32bcd8ebd1ab"
+    ),
+    "support/scripts/configupdate": (
+        "2530183ffd12a43fae6003024e41524dade65b2b073de9dc3d59d23b72c41d62"
+    ),
+    "support/scripts/gitsha1": (
+        "10f93856e88dc7afea74e2aff8cbe0048ee907c5f819834325542efa40794564"
+    ),
+    "support/scripts/mkcompiledb.py": (
+        "8c9a11a03940e6c2cbc82f334303908cd52ca9d31c3de42003d21b1306b59339"
+    ),
+    "support/scripts/mklinux.py": (
+        "25aecf13f71468d27537c8b84f7fa1deb271ba3867a0d0655d1b04cd321c1c67"
+    ),
+    "support/scripts/multiboot.py": (
+        "91d3d660ebbc11f03d6b86bc04a70ca7b7e28539c4a293abbbdba7e1ee3ba6a9"
+    ),
+    "support/scripts/uk-gdb.py": (
+        "cc0d9b9c1c2e8721aa267c2fc1885bb72a6662e2d2573cdc04227e6998a79434"
+    ),
+    "drivers/hyperv/storvsc/Config.uk": (
+        "bc4474ee1655396b74359fc0b40fd5036b2e6219a50f6b6fb6787a0e8daeec6a"
+    ),
+    "drivers/hyperv/storvsc/Makefile.uk": (
+        "9ea0883afdb3e08df3110347df9a3917dbd602a151a302b6d3bceea02ec6b905"
+    ),
+    "drivers/hyperv/storvsc/exportsyms.uk": (
+        "0d15682c08580e5dd5f9546b66990e2b053ed1b2b8b0746a05670aaeadc61a6d"
+    ),
+    "drivers/hyperv/storvsc/include/uk/storvsc.h": (
+        "e0e666ff4faefc2ba1186403a4320170fb3163375cc31a04312bbce011aa9f10"
+    ),
+    "drivers/hyperv/storvsc/storvsc.c": (
+        "cb9e5afefb8f18612c36b5975b94ed64c0702c4a4e6988ea4edfa9c6bc6da213"
+    ),
+    "drivers/hyperv/storvsc/storvsc_core.h": (
+        "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
+    ),
+    "drivers/hyperv/storvsc/storvsc_core.zig": (
+        "f4b7f4fa58cca087b9ff7b2e15f372d09cab9ea542210c0a306b9a5880ba9ae6"
+    ),
+    "drivers/hyperv/vmbus/Config.uk": (
+        "05a880a38a10e130510fafbfa786f080d3da1413feb84ca7fc2a068c04a4d069"
+    ),
+    "drivers/hyperv/vmbus/Makefile.uk": (
+        "7622b3998629db41f2e1c8f8538872cf3efc64fff16e5832d0fb053ba2437a57"
+    ),
+    "drivers/hyperv/vmbus/exportsyms.uk": (
+        "340c49783a88696b2027f815ac0db70bc2b0ae34a331aac8bac0f6a0314a1918"
+    ),
+    "drivers/hyperv/vmbus/include/uk/vmbus.h": (
+        "13bc5450a7a8eb9c360e240c35907e1b5d82f683e36c2ee4e9a19f90f4d76bcb"
+    ),
+    "drivers/hyperv/vmbus/vmbus_bus.c": (
+        "6428a549e5b41155103e6d66ea31b4baf4a90d2657114edc9e7b60dd4746f28e"
+    ),
+    "drivers/hyperv/vmbus/vmbus_channel.c": (
+        "088cc06d1db460cb52525aeee56d980a2074be5c0c0d8cdfa15eef72b656cc1c"
+    ),
+    "drivers/hyperv/vmbus/vmbus_protocol.h": (
+        "c00e58790f9d8ece3518fdda9b82b02b843eccb3c2cc90002344192b554e44a9"
+    ),
+    "drivers/hyperv/vmbus/vmbus_protocol.zig": (
+        "4815d095de1aefcbc8f9bd40c87f7b17b1ff5e51bc816b8ba0b73980b5eab2a3"
+    ),
+    "plat/hyperv/Config.uk": (
+        "c5fe6226a426333e2119845366cac6c712b4258d8c7ead82980d7ac57c7c0505"
+    ),
+    "plat/hyperv/Makefile.uk": (
+        "672e146edc8058fce245a05e475564a89e634b2e41394625236a17167d7a08a4"
+    ),
+    "plat/hyperv/hyperv_runtime.zig": (
+        "901a9caf76b33fa9990acdc061139553862caf394d1c78039cb71008262ec076"
+    ),
+    "plat/hyperv/include/hyperv/hyperv.h": (
+        "af844d90dea4b706ad00ef50beaa0df54697a6b324888d4d41dc918ae2b57b3c"
+    ),
+    "plat/hyperv/platform.c": (
+        "0129808beafd31996448bc8a636a1329feda5d538f19704875a908125e37da5a"
+    ),
+    "plat/hyperv/time.c": (
+        "3b97fcf27fa0a76b93e565b770bb2b1d8b0d7496267387039b6c88d0e1a1cce1"
+    ),
+    "support/build/native-image-graph.zig": (
+        "2ab2de7473bca0a886e35559edbe81d7fe71e24ac92f86721068a7b86a2f9e72"
+    ),
+    "support/build/native-postprocess-runner.py": (
+        "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"
+    ),
+    "support/build/native-postprocess.zig": (
+        "fe6adc24f97bf72dcb111853f2b8d5c30a4a86596402e33d9d30945892a8f49f"
+    ),
+    "support/scripts/elf_tools.py": (
+        "0aad63e7830a814a5c29a7330925f64e8c844cf28700aa959002a629d5019820"
+    ),
+    "support/scripts/mkbootinfo.py": (
+        "61436b01857de643ea4cc8ccc1563b8d8321e1ddc1c425d459b08aa1b0aaa409"
+    ),
+    "support/scripts/mkefi.py": (
+        "f2587a5108d5ad57e7418cc6c6a6c2351ccd1e763c68e63a9fc0c8da52426225"
+    ),
+    "support/scripts/mkukreloc.py": (
+        "325817c2c76a389c21358df535ac2ae0f1beb36b7e4cb73b62648d1f5faac8cc"
+    ),
+    "support/apps/hyperv-acceptance/Config.uk": (
+        "548e97aadb9b55101e2ec1dbb7a4b22f82b210a22d5f14eb441b17fdd2009aa7"
+    ),
+    "support/apps/hyperv-acceptance/Makefile.uk": (
+        "19f70c5cc056157f329a6b226ead55b74fd3b628eb068b065d2d1e23b6f01bb8"
+    ),
+    "support/apps/hyperv-acceptance/acceptance_protocol.c": (
+        "5ba77f19e204c9bc3b9b579cf6ccd9e0184952fd9e0d14c123f5a19af05dd64e"
+    ),
+    "support/apps/hyperv-acceptance/acceptance_protocol.h": (
+        "1b7d718ca10b760b61df07570b640586cce34d1d3c498c68fbd336a61669db4e"
+    ),
+    "support/apps/hyperv-acceptance/application_network.c": (
+        "b55080d196e6015c7a5a84f2ab2dc76856c978cf6a7ec1793186511616c56ffb"
+    ),
+    "support/apps/hyperv-acceptance/application_network.h": (
+        "dba07b1331d6a6f02c3f017c2fabe5a0c1c03f61ffd1df7e07e49c84427d2231"
+    ),
+    "support/apps/hyperv-acceptance/main.c": (
+        "deaf231ec5edf0746e99e7a657a73fcb813da8bc18116b8ef5b6543213064ddb"
+    ),
+    "support/apps/hyperv-acceptance/persistence.c": (
+        "fff49e4a09ecb6a5e788b817a5f2677d39cadd1f5a7693a2cb2be6721399d9ee"
+    ),
+    "support/apps/hyperv-acceptance/persistence.h": (
+        "8ef53f9ed76286b945212ea487bed1e6d51ec161078d4a2283f9054b962bd70f"
+    ),
+    "support/apps/hyperv-acceptance/persistence_host.h": (
+        "29f1f4f0f272225ae1d2578612a4f8320f1bc8d245e9447ce6696300b80ad23c"
+    ),
+    "support/apps/hyperv-acceptance/storage_target.c": (
+        "f1ea10aca41b49e0a82c9cb8bc855cb7ddf86354abb8331c198127345b018a03"
+    ),
+    "support/apps/hyperv-acceptance/storage_target.h": (
+        "8e357584c2544f25f511b61e486719dea66b526a2e01539e282a67d95530d915"
+    ),
+}
 APPROVED_CAPABILITY_REFERENCE = {
     "name": CAPABILITY_REFERENCE,
     "sha256": (
@@ -184,7 +509,7 @@ APPROVED_CAPABILITY_REFERENCE = {
     },
 }
 BUILD_TOOL_NAMES = (
-    "zig", "make", "python", "bison", "flex", "m4",
+    "git", "zig", "make", "python", "bison", "flex", "m4",
     "llvm-nm", "llvm-objcopy", "llvm-objdump", "llvm-readelf",
     "llvm-strip", "bison-data",
 )
@@ -197,6 +522,10 @@ IMPLEMENTATION_PATHS = {
     "network_controller": NETWORK_CONTROLLER_PATH,
     "template": TEMPLATE_PATH,
     "requirements": REQUIREMENTS_PATH,
+    **{
+        f"guarded_producer:{relative}": SUPPORT.parent / relative
+        for relative in GUARDED_PRODUCER_FILES
+    },
 }
 
 
@@ -231,6 +560,259 @@ def require_relative(value, description):
     ):
         raise ValueError(f"{description} is invalid")
     return value
+
+
+def guarded_producer_contract():
+    return {
+        "schema": GUARDED_PRODUCER_SCHEMA,
+        "schema_version": GUARDED_PRODUCER_SCHEMA_VERSION,
+        "files": dict(GUARDED_PRODUCER_FILES),
+        "closures": {
+            name: dict(record)
+            for name, record in GUARDED_PRODUCER_CLOSURES.items()
+        },
+    }
+
+
+def verify_guarded_producer_sources(repository):
+    repository = Path(repository).resolve(strict=True)
+    if repository != SUPPORT.parent.resolve(strict=True):
+        raise ValueError("Guarded producer must use this repository worktree")
+    if not (
+        set(GUARDED_BUILD_CONTROL_FILES)
+        | set(GUARDED_EXECUTED_HELPER_FILES)
+    ).issubset(GUARDED_PRODUCER_FILES):
+        raise RuntimeError("Guarded build proof closure is incomplete")
+    for relative, expected in GUARDED_PRODUCER_FILES.items():
+        path = repository / relative
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or azure.image_sha256(path) != expected
+        ):
+            raise ValueError(
+                "Guarded producer differs from the reviewed V2 contract"
+            )
+    for relative, expected in GUARDED_PRODUCER_CLOSURES.items():
+        if directory_record(
+            repository / relative, relative,
+            "Guarded producer execution closure",
+        ) != expected:
+            raise ValueError(
+                "Guarded producer differs from the reviewed V2 contract"
+            )
+
+
+def guarded_contract_from_solved_config(config_path):
+    raw = azure.read_regular_file(
+        config_path, 1024 * 1024, "Solved guarded V2 configuration"
+    )
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        raise ValueError("Solved guarded V2 configuration is not UTF-8") from None
+    names = (
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE",
+        "CONFIG_LIBSTORVSC",
+        "CONFIG_LIBSTORVSC_LUN_DISCOVERY",
+        "CONFIG_LIBSTORVSC_GUARDED_IO",
+        "CONFIG_LIBSTORVSC_MAX_DEVICES",
+        "CONFIG_LIBSTORVSC_MAX_LUNS",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET",
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN",
+        "CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION",
+    )
+    values = {}
+    for line in lines:
+        for name in names:
+            prefix = name + "="
+            if line.startswith(prefix):
+                if name in values:
+                    raise ValueError(
+                        "Solved guarded V2 configuration repeats a field"
+                    )
+                values[name] = line[len(prefix):]
+                break
+    if values.get("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE") != "y":
+        return None
+    required_enabled = (
+        "CONFIG_LIBSTORVSC",
+        "CONFIG_LIBSTORVSC_LUN_DISCOVERY",
+        "CONFIG_LIBSTORVSC_GUARDED_IO",
+    )
+    if any(values.get(name) != "y" for name in required_enabled):
+        raise ValueError(
+            "Guarded V2 configuration must enable solved StorVSC discovery"
+        )
+    if values.get("CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION") == "y":
+        raise ValueError(
+            "Guarded persistence cannot enable the network application"
+        )
+    if any(
+        name in values
+        for name in (
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH",
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET",
+        )
+    ):
+        raise ValueError(
+            "Guarded V2 seed enrollment cannot bind path or target"
+        )
+
+    def quoted(name):
+        value = values.get(name)
+        if (
+            not isinstance(value, str)
+            or len(value) != 34
+            or value[0] != '"'
+            or value[-1] != '"'
+            or not IDENTITY.fullmatch(value[1:-1])
+        ):
+            raise ValueError(
+                "Guarded V2 run and disk IDs must be 32 lowercase hex digits"
+            )
+        return value[1:-1]
+
+    def integer(name):
+        value = values.get(name)
+        if (
+            not isinstance(value, str)
+            or not re.fullmatch(r"0|[1-9][0-9]*", value)
+        ):
+            raise ValueError("Guarded V2 configuration has an invalid integer")
+        return int(value)
+
+    run_id = quoted("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID")
+    disk_id = quoted("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID")
+    sectors = integer("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS")
+    sector_size = integer(
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE"
+    )
+    identity_policy = integer(
+        "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY"
+    )
+    lun = integer("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN")
+    max_devices = integer("CONFIG_LIBSTORVSC_MAX_DEVICES")
+    max_luns = integer("CONFIG_LIBSTORVSC_MAX_LUNS")
+    if (
+        identity_policy != 2
+        or sector_size != 512
+        or sectors <= 48
+        or sectors > ((1 << 63) - 1) // sector_size
+        or not 0 <= lun <= 255
+        or max_devices != 2
+        or max_luns != 8
+    ):
+        raise ValueError(
+            "Guarded V2 solved geometry or identity policy is incompatible"
+        )
+    return {
+        "schema": GUARDED_CONTRACT_SCHEMA,
+        "schema_version": 1,
+        "scope": "platform-only",
+        "result": "UNAVAILABLE",
+        "protocol": 1,
+        "identity_policy": 2,
+        "reason": "no-devices",
+        "main_return": 2,
+        "run_id": run_id,
+        "disk_id": disk_id,
+        "path": 0,
+        "target": 0,
+        "lun": lun,
+        "sectors": sectors,
+        "sector_size": sector_size,
+        "solved_config_sha256": hashlib.sha256(raw).hexdigest(),
+        "producer": guarded_producer_contract(),
+    }
+
+
+def validate_guarded_contract(value, boot_policy, solved_config_sha256):
+    if boot_policy != GUARDED_BOOT_POLICY:
+        if value is not None:
+            raise ValueError(
+                "Ordinary platform boot policies cannot carry guarded state"
+            )
+        return None
+    value = exact_fields(
+        value,
+        (
+            "schema", "schema_version", "scope", "result", "protocol",
+            "identity_policy", "reason", "main_return", "run_id",
+            "disk_id", "path", "target", "lun", "sectors",
+            "sector_size", "solved_config_sha256", "producer",
+        ),
+        "Guarded V2 pristine-unavailable contract",
+    )
+    producer = exact_fields(
+        value["producer"],
+        ("schema", "schema_version", "files", "closures"),
+        "Guarded V2 producer pin",
+    )
+    files = exact_fields(
+        producer["files"], GUARDED_PRODUCER_FILES,
+        "Guarded V2 producer files",
+    )
+    closures = exact_fields(
+        producer["closures"], GUARDED_PRODUCER_CLOSURES,
+        "Guarded V2 producer closures",
+    )
+    if (
+        value["schema"] != GUARDED_CONTRACT_SCHEMA
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["scope"] != "platform-only"
+        or value["result"] != "UNAVAILABLE"
+        or type(value["protocol"]) is not int
+        or value["protocol"] != 1
+        or type(value["identity_policy"]) is not int
+        or value["identity_policy"] != 2
+        or value["reason"] != "no-devices"
+        or type(value["main_return"]) is not int
+        or value["main_return"] != 2
+        or not isinstance(value["run_id"], str)
+        or not IDENTITY.fullmatch(value["run_id"])
+        or not isinstance(value["disk_id"], str)
+        or not IDENTITY.fullmatch(value["disk_id"])
+        or type(value["path"]) is not int
+        or value["path"] != 0
+        or type(value["target"]) is not int
+        or value["target"] != 0
+        or type(value["lun"]) is not int
+        or not 0 <= value["lun"] <= 255
+        or type(value["sectors"]) is not int
+        or value["sectors"] <= 48
+        or value["sectors"] > ((1 << 63) - 1) // 512
+        or type(value["sector_size"]) is not int
+        or value["sector_size"] != 512
+        or require_sha256(
+            value["solved_config_sha256"],
+            "Guarded V2 solved configuration",
+        ) != solved_config_sha256
+        or producer["schema"] != GUARDED_PRODUCER_SCHEMA
+        or type(producer["schema_version"]) is not int
+        or producer["schema_version"] != GUARDED_PRODUCER_SCHEMA_VERSION
+        or dict(files) != GUARDED_PRODUCER_FILES
+        or dict(closures) != GUARDED_PRODUCER_CLOSURES
+    ):
+        raise ValueError("Guarded V2 pristine-unavailable contract is invalid")
+    return {
+        **value,
+        "producer": {
+            **producer,
+            "files": dict(files),
+            "closures": {
+                name: dict(record)
+                for name, record in closures.items()
+            },
+        },
+    }
 
 
 def file_record(value, role):
@@ -414,12 +996,104 @@ def validate_implementation(value):
     }
 
 
+def validate_git_runtime_record(value):
+    value = exact_fields(
+        value,
+        (
+            "schema", "name", "sha256", "size", "files",
+            "executable", "loader", "libraries",
+        ),
+        "Private Git runtime fingerprint",
+    )
+    executable = exact_fields(
+        value["executable"], ("name", "sha256", "size"),
+        "Private Git executable fingerprint",
+    )
+    loader = exact_fields(
+        value["loader"], ("name", "sha256", "size"),
+        "Private Git loader fingerprint",
+    )
+    libraries = value["libraries"]
+    if not isinstance(libraries, list) or not libraries:
+        raise ValueError("Private Git runtime libraries are invalid")
+    libraries = [
+        exact_fields(
+            library, ("name", "sha256", "size"),
+            "Private Git runtime library fingerprint",
+        )
+        for library in libraries
+    ]
+    if any(
+        not isinstance(library["name"], str)
+        for library in libraries
+    ):
+        raise ValueError("Private Git runtime libraries are invalid")
+    member_names = [
+        executable["name"], loader["name"],
+        *(library["name"] for library in libraries),
+    ]
+    if (
+        value["schema"] != GIT_RUNTIME_SCHEMA
+        or value["name"] != GIT_RUNTIME
+        or type(value["size"]) is not int
+        or value["size"] <= 0
+        or type(value["files"]) is not int
+        or value["files"] != len(member_names)
+        or executable["name"] != GIT_EXECUTABLE.as_posix()
+        or loader["name"] != GIT_LOADER.as_posix()
+        or type(executable["size"]) is not int
+        or executable["size"] <= 0
+        or type(loader["size"]) is not int
+        or loader["size"] <= 0
+        or len(member_names) != len(set(member_names))
+        or [library["name"] for library in libraries]
+        != sorted(library["name"] for library in libraries)
+        or any(
+            not re.fullmatch(
+                r"lib/[A-Za-z0-9][A-Za-z0-9._+-]{0,127}",
+                library["name"],
+            )
+            or library["name"] == GIT_LOADER.as_posix()
+            or type(library["size"]) is not int
+            or library["size"] <= 0
+            for library in libraries
+        )
+        or value["size"] != sum(
+            member["size"]
+            for member in (executable, loader, *libraries)
+        )
+    ):
+        raise ValueError("Private Git runtime fingerprint is invalid")
+    require_sha256(value["sha256"], "Private Git runtime fingerprint")
+    for member in (executable, loader, *libraries):
+        require_sha256(
+            member["sha256"], "Private Git runtime member fingerprint"
+        )
+    digest = hashlib.sha256()
+    for member in sorted(
+        (executable, loader, *libraries), key=lambda item: item["name"]
+    ):
+        encoded = member["name"].encode()
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(member["size"].to_bytes(8, "big"))
+        digest.update(bytes.fromhex(member["sha256"]))
+    if digest.hexdigest() != value["sha256"]:
+        raise ValueError("Private Git runtime aggregate is inconsistent")
+    return {
+        **value,
+        "executable": dict(executable),
+        "loader": dict(loader),
+        "libraries": [dict(library) for library in libraries],
+    }
+
+
 def validate_provenance(value):
     value = exact_fields(
         value,
         (
-            "scheme", "head_commit", "tree_sha256", "tracked_entries",
-            "config",
+            "scheme", "head_commit", "tree_sha256", "physical_sha256",
+            "tracked_entries", "tracked_bytes", "config", "git",
         ),
         "Private-preflight build provenance",
     )
@@ -428,19 +1102,25 @@ def validate_provenance(value):
         "Solved configuration provenance",
     )
     if (
-        value["scheme"] != "unikraft.git-ls-tree-v1"
+        value["scheme"] != "unikraft.git-physical-tree-v2"
         or not isinstance(value["head_commit"], str)
         or not GIT_COMMIT.fullmatch(value["head_commit"])
         or type(value["tracked_entries"]) is not int
-        or value["tracked_entries"] <= 0
+        or not 0 < value["tracked_entries"] <= MAX_TRACKED_ENTRIES
+        or type(value["tracked_bytes"]) is not int
+        or not 0 < value["tracked_bytes"] <= MAX_TRACKED_BYTES
         or config["name"] != SOLVED_CONFIG
         or type(config["size"]) is not int
         or not 0 < config["size"] <= 1024 * 1024
     ):
         raise ValueError("Private-preflight build provenance is invalid")
     require_sha256(value["tree_sha256"], "Tracked source-tree fingerprint")
+    require_sha256(
+        value["physical_sha256"], "Physical source-tree fingerprint"
+    )
     require_sha256(config["sha256"], "Solved configuration fingerprint")
-    return {**value, "config": dict(config)}
+    git = validate_git_runtime_record(value["git"])
+    return {**value, "config": dict(config), "git": git}
 
 
 def expected_budget(files, qemu_support):
@@ -502,7 +1182,7 @@ def validate_input_manifest(value):
             "schema", "schema_version", "workload", "boot_policy",
             "raw_size", "provenance", "files", "qemu_support", "miz",
             "packaging", "implementation", "budget",
-            "capability_reference", "private_build",
+            "capability_reference", "private_build", "guarded",
         ),
         "Private-preflight input manifest",
     )
@@ -548,11 +1228,15 @@ def validate_input_manifest(value):
         raise ValueError("Private-preflight miz contract is invalid")
     require_sha256(miz["sha256"], "Private-preflight miz fingerprint")
     provenance = validate_provenance(value["provenance"])
+    guarded = validate_guarded_contract(
+        value["guarded"], value["boot_policy"],
+        provenance["config"]["sha256"],
+    )
     capability_reference = validate_capability_reference(
         value["capability_reference"], files["capability_raw"]
     )
     private_build = validate_private_build(
-        value["private_build"], provenance, files["efi"]
+        value["private_build"], provenance, files["efi"], guarded
     )
     implementation = validate_implementation(value["implementation"])
     budget = exact_fields(
@@ -579,6 +1263,7 @@ def validate_input_manifest(value):
     return {
         **value,
         "provenance": provenance,
+        "guarded": guarded,
         "capability_reference": capability_reference,
         "private_build": private_build,
         "files": files,
@@ -675,6 +1360,69 @@ def directory_record(path, name, description):
         "sha256": digest.hexdigest(),
         "size": total,
         "files": count,
+    }
+
+
+def git_runtime_record(path):
+    original = Path(path)
+    metadata = original.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("Private Git runtime must be a non-symlink directory")
+    root = original.resolve(strict=True)
+    executable = None
+    loader = None
+    libraries = []
+    for entry in sorted(root.rglob("*")):
+        relative = entry.relative_to(root)
+        metadata = entry.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("Private Git runtime must not contain symlinks")
+        if stat.S_ISDIR(metadata.st_mode):
+            if relative.parts not in (("bin",), ("lib",)):
+                raise ValueError(
+                    "Private Git runtime has an unsupported directory"
+                )
+            continue
+        if not stat.S_ISREG(metadata.st_mode) or (
+            relative != GIT_EXECUTABLE
+            and (
+                len(relative.parts) != 2
+                or relative.parts[0] != "lib"
+            )
+        ):
+            raise ValueError("Private Git runtime has an unsupported file")
+        if relative in (GIT_EXECUTABLE, GIT_LOADER):
+            if not os.access(entry, os.X_OK):
+                raise ValueError(
+                    "Private Git executable or loader is not executable"
+                )
+        with entry.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                raise ValueError(
+                    "Private Git runtime members must be native ELF files"
+                )
+        record = regular_record(
+            entry, relative.as_posix(), "Private Git runtime member"
+        )
+        if relative == GIT_EXECUTABLE:
+            executable = record
+        elif relative == GIT_LOADER:
+            loader = record
+        else:
+            libraries.append(record)
+    if executable is None or loader is None or not libraries:
+        raise ValueError(
+            "Private Git runtime requires bin/git, lib/loader, and libraries"
+        )
+    runtime = directory_record(
+        root, GIT_RUNTIME, "Private Git runtime"
+    )
+    return {
+        "schema": GIT_RUNTIME_SCHEMA,
+        **runtime,
+        "executable": executable,
+        "loader": loader,
+        "libraries": libraries,
     }
 
 
@@ -837,7 +1585,7 @@ def validate_capability_reference(value, capability_raw):
     return validated
 
 
-def validate_private_build(value, provenance, efi):
+def validate_private_build(value, provenance, efi, expected_guarded=None):
     value = exact_fields(
         value, ("name", "sha256", "size", "receipt"),
         "Private local build receipt",
@@ -854,7 +1602,7 @@ def validate_private_build(value, provenance, efi):
         (
             "schema", "schema_version", "result", "source_before",
             "source_after", "invocation", "tools", "output",
-            "builder_sha256",
+            "builder_sha256", "guarded",
         ),
         "Private local build receipt",
     )
@@ -863,7 +1611,7 @@ def validate_private_build(value, provenance, efi):
     if (
         receipt["schema"] != PRIVATE_BUILD_SCHEMA
         or type(receipt["schema_version"]) is not int
-        or receipt["schema_version"] != 1
+        or receipt["schema_version"] != PRIVATE_BUILD_SCHEMA_VERSION
         or receipt["result"] != "PASS"
         or before != provenance
         or after != provenance
@@ -872,30 +1620,76 @@ def validate_private_build(value, provenance, efi):
         ) != azure.image_sha256(Path(__file__))
     ):
         raise ValueError("Private local build provenance is incompatible")
+    guarded = validate_guarded_contract(
+        receipt["guarded"],
+        GUARDED_BOOT_POLICY if receipt["guarded"] is not None
+        else "platform-unavailable-v1",
+        provenance["config"]["sha256"],
+    )
+    if guarded != expected_guarded:
+        raise ValueError(
+            "Private local build guarded contract is unrelated to the policy"
+        )
     invocation = exact_fields(
         receipt["invocation"],
         (
-            "engine", "jobs", "app", "profile", "compiler_target",
-            "output",
+            "engine", "passes", "jobs", "materialization_returncode",
+            "recovery", "recovery_returncode", "verification_returncode",
+            "app", "profile", "compiler_target", "output",
         ),
         "Private local build invocation",
     )
-    if invocation != {
-        "engine": "zig-native-images-v1",
+    expected_invocation = {
+        "engine": "zig-native-images-two-pass-v1",
+        "passes": 2,
         "jobs": 2,
         "app": "support/apps/hyperv-acceptance",
         "profile": "hyperv-x86_64-efi-netvsc",
         "compiler_target": "x86_64-freestanding-none",
         "output": NATIVE_EFI_NAME,
-    }:
+    }
+    materialization_returncode = invocation["materialization_returncode"]
+    recovery = invocation["recovery"]
+    recovery_returncode = invocation["recovery_returncode"]
+    verification_returncode = invocation["verification_returncode"]
+    if (
+        type(materialization_returncode) is not int
+        or materialization_returncode != 0
+        or recovery not in ("none", "uk-reloc-v1")
+        or (recovery == "none" and recovery_returncode is not None)
+        or (
+            recovery == "uk-reloc-v1"
+            and (
+                type(recovery_returncode) is not int
+                or recovery_returncode != 0
+            )
+        )
+        or type(verification_returncode) is not int
+        or verification_returncode != 0
+        or {
+            key: value for key, value in invocation.items()
+            if key not in (
+                "materialization_returncode", "recovery",
+                "recovery_returncode", "verification_returncode",
+            )
+        } != expected_invocation
+    ):
         raise ValueError("Private local build invocation is incompatible")
     tools = exact_fields(
         receipt["tools"], BUILD_TOOL_NAMES, "Private local build tools"
     )
     tools = {
-        name: validate_tool_record(tools[name], name)
+        name: (
+            validate_git_runtime_record(tools[name])
+            if name == "git"
+            else validate_tool_record(tools[name], name)
+        )
         for name in BUILD_TOOL_NAMES
     }
+    if tools["git"] != provenance["git"]:
+        raise ValueError(
+            "Private build Git runtime is unrelated to provenance"
+        )
     output = exact_fields(
         receipt["output"], ("name", "sha256", "size"),
         "Private local build output",
@@ -915,6 +1709,7 @@ def validate_private_build(value, provenance, efi):
             "invocation": dict(invocation),
             "tools": tools,
             "output": dict(output),
+            "guarded": guarded,
         },
     }
 
@@ -930,41 +1725,448 @@ def load_receipt(path, name, description):
     }
 
 
-def git_output(repository, arguments):
-    result = subprocess.run(
-        ["git", "-C", str(repository), *arguments],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        timeout=60,
-        check=False,
+def git_environment(git_runtime, isolate_path=True):
+    environment = {
+        name: value for name, value in os.environ.items()
+        if not name.startswith("GIT_")
+        and not name.startswith("LD_")
+        and name not in ("GCONV_PATH", "GLIBC_TUNABLES", "LOCPATH")
+    }
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_EXEC_PATH": str(Path(git_runtime) / "disabled-exec-path"),
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "HOME": str(Path(git_runtime) / "disabled-home"),
+        "XDG_CONFIG_HOME": str(Path(git_runtime) / "disabled-xdg-config"),
+        "OPENSSL_CONF": os.devnull,
+        "OPENSSL_MODULES": str(
+            Path(git_runtime) / "disabled-openssl-modules"
+        ),
+        "LC_ALL": "C",
+    })
+    if isolate_path:
+        environment["PATH"] = str(Path(git_runtime) / "disabled-path")
+    return environment
+
+
+def bounded_command_output(argv, cwd, environment, timeout, maximum):
+    process = subprocess.Popen(
+        argv, cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=environment, start_new_session=True,
     )
-    if result.returncode:
+    outputs = {"stdout": bytearray(), "stderr": bytearray()}
+    overflow = threading.Event()
+    lock = threading.Lock()
+    total = 0
+
+    def drain(name, stream):
+        nonlocal total
+        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+            with lock:
+                remaining = maximum - total
+                outputs[name].extend(chunk[:max(0, remaining)])
+                total += min(len(chunk), max(0, remaining))
+                if len(chunk) > remaining:
+                    overflow.set()
+            if overflow.is_set():
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    readers = [
+        threading.Thread(target=drain, args=("stdout", process.stdout)),
+        threading.Thread(target=drain, args=("stderr", process.stderr)),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        for reader in readers:
+            reader.join()
+        process.stdout.close()
+        process.stderr.close()
+        raise ValueError("Private Git runtime command timed out") from None
+    for reader in readers:
+        reader.join()
+    process.stdout.close()
+    process.stderr.close()
+    return (
+        returncode, bytes(outputs["stdout"]), bytes(outputs["stderr"]),
+        overflow.is_set(),
+    )
+
+
+def git_runtime_command(git_runtime, arguments):
+    git_runtime = Path(git_runtime)
+    return [
+        str(git_runtime / GIT_LOADER),
+        "--inhibit-cache",
+        "--library-path", str(git_runtime / "lib"),
+        str(git_runtime / GIT_EXECUTABLE),
+        "--no-replace-objects",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.hooksPath=/dev/null",
+        *arguments,
+    ]
+
+
+def validate_git_runtime_resolution(git_runtime, record):
+    git_runtime = Path(git_runtime).resolve(strict=True)
+    returncode, stdout, stderr, overflow = bounded_command_output(
+        [
+            str(git_runtime / GIT_LOADER),
+            "--inhibit-cache",
+            "--library-path", str(git_runtime / "lib"),
+            "--list", str(git_runtime / GIT_EXECUTABLE),
+        ],
+        git_runtime, git_environment(git_runtime), 30, 16 * 1024,
+    )
+    if returncode or stderr or overflow:
+        raise ValueError(
+            "Private Git runtime dependency resolution is invalid"
+        )
+    expected = {
+        record["loader"]["name"],
+        *(library["name"] for library in record["libraries"]),
+    }
+    resolved = []
+    for line in stdout.splitlines():
+        if re.fullmatch(rb"\s*linux-vdso\.so\.1 \(0x[0-9a-fA-F]+\)", line):
+            continue
+        match = re.fullmatch(
+            rb"\s*(\S+) => (.+) \(0x[0-9a-fA-F]+\)", line
+        )
+        direct = None
+        if match is None:
+            direct = re.fullmatch(
+                rb"\s*(/.+) \(0x[0-9a-fA-F]+\)", line
+            )
+            if direct is None:
+                raise ValueError(
+                    "Private Git runtime dependency resolution is invalid"
+                )
+            dependency = None
+            path_bytes = direct.group(1)
+        else:
+            dependency = match.group(1)
+            path_bytes = match.group(2)
+        path = Path(os.fsdecode(path_bytes)).resolve(strict=True)
+        try:
+            relative = path.relative_to(git_runtime).as_posix()
+        except ValueError:
+            raise ValueError(
+                "Private Git runtime resolved an ambient dependency"
+            ) from None
+        if relative not in expected:
+            raise ValueError(
+                "Private Git runtime resolved an unknown dependency"
+            )
+        if (
+            relative != GIT_LOADER.as_posix()
+            and dependency != os.fsencode(path.name)
+        ):
+            raise ValueError(
+                "Private Git runtime dependency identity is invalid"
+            )
+        resolved.append(relative)
+    if len(resolved) != len(set(resolved)) or set(resolved) != expected:
+        raise ValueError(
+            "Private Git runtime dependency closure is incomplete"
+        )
+
+
+def preflight_git_runtime(git_runtime):
+    git_runtime = Path(git_runtime).resolve(strict=True)
+    before = validate_git_runtime_record(
+        git_runtime_record(git_runtime)
+    )
+    validate_git_runtime_resolution(git_runtime, before)
+    returncode, stdout, stderr, overflow = bounded_command_output(
+        git_runtime_command(git_runtime, ["--version"]),
+        git_runtime, git_environment(git_runtime), 30, 256,
+    )
+    after = validate_git_runtime_record(git_runtime_record(git_runtime))
+    if (
+        returncode
+        or stderr
+        or overflow
+        or not re.fullmatch(rb"git version [0-9][ -~]{0,200}\n", stdout)
+        or after != before
+    ):
+        raise ValueError(
+            "Private Git runtime is not a relocatable Git executable"
+        )
+    validate_git_runtime_resolution(git_runtime, after)
+    return before
+
+
+def git_output(git_runtime, repository, arguments):
+    git_runtime = Path(git_runtime).resolve(strict=True)
+    before = validate_git_runtime_record(
+        git_runtime_record(git_runtime)
+    )
+    returncode, stdout, stderr, overflow = bounded_command_output(
+        git_runtime_command(
+            git_runtime, ["-C", str(repository), *arguments]
+        ),
+        repository, git_environment(git_runtime), 60, 8 * 1024 * 1024,
+    )
+    after = validate_git_runtime_record(git_runtime_record(git_runtime))
+    if after != before:
+        raise RuntimeError("Private Git runtime changed while in use")
+    validate_git_runtime_resolution(git_runtime, after)
+    if returncode or stderr or overflow:
         raise RuntimeError("Unable to derive local Git source provenance")
-    return result.stdout
+    return stdout
 
 
-def build_provenance(repository, config_path):
+def parse_git_tree(raw):
+    records = []
+    seen = set()
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        prefix, separator, path = item.partition(b"\t")
+        fields = prefix.split(b" ")
+        if (
+            separator != b"\t"
+            or len(fields) != 3
+            or fields[0] not in (b"100644", b"100755", b"120000")
+            or fields[1] != b"blob"
+            or not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", fields[2])
+            or not path
+            or path.startswith(b"/")
+            or any(part in (b"", b".", b"..") for part in path.split(b"/"))
+            or path in seen
+        ):
+            raise ValueError("Tracked Git tree is unsupported or ambiguous")
+        seen.add(path)
+        records.append((path, fields[0], fields[2]))
+        if len(records) > MAX_TRACKED_ENTRIES:
+            raise ValueError("Tracked Git tree exceeds the entry limit")
+    if not records:
+        raise ValueError("Tracked Git tree is empty")
+    return records
+
+
+def verify_git_index(git_runtime, repository, tree_records):
+    expected = {
+        path: (mode, object_id)
+        for path, mode, object_id in tree_records
+    }
+    staged = {}
+    raw = git_output(
+        git_runtime, repository, ["ls-files", "-s", "-z"]
+    )
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        prefix, separator, path = item.partition(b"\t")
+        fields = prefix.split(b" ")
+        if (
+            separator != b"\t"
+            or len(fields) != 3
+            or fields[2] != b"0"
+            or path in staged
+        ):
+            raise ValueError("Git index state is unsupported or ambiguous")
+        staged[path] = (fields[0], fields[1])
+    if staged != expected:
+        raise ValueError("Git index differs from the claimed HEAD tree")
+    flags = {}
+    raw = git_output(
+        git_runtime, repository, ["ls-files", "-v", "-z"]
+    )
+    for item in raw.split(b"\0"):
+        if not item:
+            continue
+        if len(item) < 3 or item[1:2] != b" " or item[2:] in flags:
+            raise ValueError("Git index flags are unsupported or ambiguous")
+        flags[item[2:]] = item[:1]
+    if set(flags) != set(expected) or any(
+        flag != b"H" for flag in flags.values()
+    ):
+        raise ValueError(
+            "Git index concealment flags or nonstandard entries are forbidden"
+        )
+
+
+def stable_metadata(value):
+    return (
+        value.st_dev, value.st_ino, value.st_mode, value.st_size,
+        value.st_mtime_ns, value.st_ctime_ns,
+    )
+
+
+def hash_physical_git_blob(root_fd, path, mode, expected_object):
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("Physical Git tree verification requires O_NOFOLLOW")
+    components = path.split(b"/")
+    parent_fd = os.dup(root_fd)
+    try:
+        for component in components[:-1]:
+            child_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = child_fd
+        name = components[-1]
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        digest = (
+            hashlib.sha1() if len(expected_object) == 40
+            else hashlib.sha256()
+        )
+        if mode == b"120000":
+            if not stat.S_ISLNK(before.st_mode):
+                raise ValueError("Tracked Git symlink type changed")
+            content = os.readlink(name, dir_fd=parent_fd)
+            if isinstance(content, str):
+                content = os.fsencode(content)
+            after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stable_metadata(before) != stable_metadata(after):
+                raise ValueError("Tracked Git symlink changed while hashing")
+            size = len(content)
+            digest.update(f"blob {size}\0".encode())
+            digest.update(content)
+        else:
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or bool(before.st_mode & 0o111) != (mode == b"100755")
+            ):
+                raise ValueError("Tracked Git file type or mode changed")
+            descriptor = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if stable_metadata(opened) != stable_metadata(before):
+                    raise ValueError("Tracked Git file changed before hashing")
+                size = opened.st_size
+                if not 0 <= size <= MAX_TRACKED_FILE_BYTES:
+                    raise ValueError("Tracked Git file exceeds the size limit")
+                digest.update(f"blob {size}\0".encode())
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                after = os.fstat(descriptor)
+                if stable_metadata(opened) != stable_metadata(after):
+                    raise ValueError("Tracked Git file changed while hashing")
+            finally:
+                os.close(descriptor)
+        if not 0 <= size <= MAX_TRACKED_FILE_BYTES:
+            raise ValueError("Tracked Git blob exceeds the size limit")
+        actual = digest.hexdigest().encode()
+        if actual != expected_object:
+            raise ValueError(
+                "Physical tracked source differs from the claimed HEAD tree"
+            )
+        return size
+    except OSError as error:
+        raise ValueError(
+            "Physical tracked source cannot be verified safely"
+        ) from error
+    finally:
+        os.close(parent_fd)
+
+
+def verify_physical_git_tree(repository, tree_records):
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("Physical Git tree verification requires O_NOFOLLOW")
+    root_fd = os.open(
+        os.fsencode(repository),
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    aggregate = hashlib.sha256()
+    total = 0
+    try:
+        for path, mode, object_id in tree_records:
+            size = hash_physical_git_blob(
+                root_fd, path, mode, object_id
+            )
+            total += size
+            if total > MAX_TRACKED_BYTES:
+                raise ValueError("Tracked Git tree exceeds the byte limit")
+            aggregate.update(len(path).to_bytes(4, "big"))
+            aggregate.update(path)
+            aggregate.update(mode)
+            aggregate.update(size.to_bytes(8, "big"))
+            aggregate.update(bytes.fromhex(object_id.decode()))
+    finally:
+        os.close(root_fd)
+    return {
+        "physical_sha256": aggregate.hexdigest(),
+        "tracked_entries": len(tree_records),
+        "tracked_bytes": total,
+    }
+
+
+def build_provenance(repository, config_path, git_runtime):
     repository = repository.resolve(strict=True)
     if repository != SUPPORT.parent.resolve(strict=True):
         raise ValueError("Source provenance must use this repository worktree")
+    git_runtime = Path(git_runtime).resolve(strict=True)
+    git = preflight_git_runtime(git_runtime)
     if git_output(
-        repository,
-        ["status", "--porcelain=v1", "--untracked-files=no", "-z"],
+        git_runtime, repository,
+        ["for-each-ref", "--format=%(refname)%00", "refs/replace/"],
+    ):
+        raise ValueError("Git object replacement refs are forbidden")
+    if git_output(
+        git_runtime, repository,
+        ["status", "--porcelain=v1", "--untracked-files=all", "-z"],
     ):
         raise ValueError("Source provenance requires a clean tracked worktree")
-    head = git_output(repository, ["rev-parse", "HEAD"]).decode().strip()
+    head = git_output(
+        git_runtime, repository, ["rev-parse", "--verify", "HEAD^{commit}"]
+    ).decode().strip()
+    if not GIT_COMMIT.fullmatch(head):
+        raise ValueError("Git HEAD identity is invalid")
     tree = git_output(
-        repository, ["ls-tree", "-r", "--full-tree", "-z", "HEAD"]
+        git_runtime, repository,
+        ["ls-tree", "-r", "--full-tree", "-z", head],
     )
-    if not GIT_COMMIT.fullmatch(head) or not tree:
+    tree_records = parse_git_tree(tree)
+    if any(len(object_id) != len(head) for _, _, object_id in tree_records):
+        raise ValueError("Git object format changed within the claimed tree")
+    verify_git_index(git_runtime, repository, tree_records)
+    physical = verify_physical_git_tree(repository, tree_records)
+    verify_git_index(git_runtime, repository, tree_records)
+    final_head = git_output(
+        git_runtime, repository, ["rev-parse", "--verify", "HEAD^{commit}"]
+    ).decode().strip()
+    final_status = git_output(
+        git_runtime, repository,
+        ["status", "--porcelain=v1", "--untracked-files=all", "-z"],
+    )
+    if (
+        final_head != head
+        or final_status
+        or not tree
+        or preflight_git_runtime(git_runtime) != git
+    ):
         raise ValueError("Git source provenance is invalid")
     config = regular_record(config_path, SOLVED_CONFIG, "Solved configuration")
     return {
-        "scheme": "unikraft.git-ls-tree-v1",
+        "scheme": "unikraft.git-physical-tree-v2",
         "head_commit": head,
         "tree_sha256": hashlib.sha256(tree).hexdigest(),
-        "tracked_entries": tree.count(b"\0"),
+        **physical,
         "config": config,
+        "git": git,
     }
 
 
@@ -990,19 +2192,56 @@ def write_tool_wrapper(path, executable, environment=None):
     path.chmod(0o700)
 
 
+def write_git_wrapper(path, git_runtime):
+    environment = git_environment(git_runtime)
+    lines = ["#!/bin/sh", "set -eu"]
+    for name in (
+        "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_EXEC_PATH",
+        "GIT_OPTIONAL_LOCKS", "GIT_NO_REPLACE_OBJECTS", "HOME",
+        "XDG_CONFIG_HOME", "OPENSSL_CONF", "OPENSSL_MODULES", "LC_ALL",
+        "PATH",
+    ):
+        lines.append(
+            f"export {name}={shlex.quote(str(environment[name]))}"
+        )
+    lines.append(
+        "exec "
+        + " ".join(
+            shlex.quote(value)
+            for value in git_runtime_command(git_runtime, [])
+        )
+        + ' "$@"'
+    )
+    save_private_bytes(path, ("\n".join(lines) + "\n").encode())
+    path.chmod(0o700)
+
+
 def build_private_image(
     output_directory, repository, config_path, zig_path, make_path,
     python_path, bison_path, flex_path, m4_path, bison_data,
-    llvm_directory, timeout,
+    llvm_directory, git_runtime, timeout,
 ):
     if type(timeout) is not int or not 1 <= timeout <= 3600:
         raise ValueError("Private local build timeout must be 1-3600 seconds")
     repository = Path(repository).resolve(strict=True)
-    source_before = build_provenance(repository, config_path)
     output_directory = private_directory(
         output_directory, "Private local build directory", must_exist=False
     )
+    output_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    relocated_git = output_directory / GIT_RUNTIME
+    git_record = copy_git_runtime(git_runtime, relocated_git)
+    source_before = build_provenance(
+        repository, config_path, relocated_git
+    )
+    guarded = guarded_contract_from_solved_config(config_path)
+    if guarded is not None:
+        verify_guarded_producer_sources(repository)
+        guarded = validate_guarded_contract(
+            guarded, GUARDED_BOOT_POLICY,
+            source_before["config"]["sha256"],
+        )
     tools = {
+        "git": git_record,
         "zig": local_tool_record(zig_path, "zig"),
         "make": local_tool_record(make_path, "make"),
         "python": local_tool_record(python_path, "python"),
@@ -1010,8 +2249,13 @@ def build_private_image(
         "flex": local_tool_record(flex_path, "flex"),
         "m4": local_tool_record(m4_path, "m4"),
     }
+    if tools["git"] != source_before["git"]:
+        raise ValueError("Private Git runtime changed before native build")
+    zig_invocation = Path(zig_path).absolute()
     resolved = {
-        "zig": Path(zig_path).resolve(strict=True),
+        "git_runtime": relocated_git,
+        "git": relocated_git / GIT_EXECUTABLE,
+        "zig": zig_invocation,
         "make": Path(make_path).resolve(strict=True),
         "python": Path(python_path).resolve(strict=True),
         "bison": Path(bison_path).resolve(strict=True),
@@ -1030,20 +2274,22 @@ def build_private_image(
     tools["bison-data"] = directory_record(
         bison_data, "bison-data", "Private build Bison data"
     )
-    output_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     config = output_directory / SOLVED_CONFIG
     build_output = output_directory / "build"
     wrappers = output_directory / ".tool-bin"
     temporary = output_directory / "tmp"
     cache = output_directory / "cache"
+    home = output_directory / "home"
     wrappers.mkdir(mode=0o700)
     temporary.mkdir(mode=0o700)
     cache.mkdir(mode=0o700)
+    home.mkdir(mode=0o700)
     copy_record(
         Path(config_path).resolve(strict=True), config,
         source_before["config"],
     )
     wrapper_tools = {
+        "zig": ("zig", None),
         "make": ("make", None),
         "python3": ("python", None),
         "bison": (
@@ -1068,11 +2314,12 @@ def build_private_image(
         "llvm-readelf": ("llvm-readelf", None),
         "llvm-strip": ("llvm-strip", None),
     }
+    write_git_wrapper(wrappers / "git", resolved["git_runtime"])
     for wrapper, (tool, environment) in wrapper_tools.items():
         write_tool_wrapper(
             wrappers / wrapper, resolved[tool], environment
         )
-    zig = str(resolved["zig"])
+    zig = str(zig_invocation)
     command = [
         zig, "build", "native-images", "-j2",
         "-Dapp=" + str(SUPPORT / "apps" / "hyperv-acceptance"),
@@ -1093,7 +2340,9 @@ def build_private_image(
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
     ]
-    environment = os.environ.copy()
+    environment = git_environment(relocated_git, isolate_path=False)
+    environment.pop("OPENSSL_CONF")
+    environment.pop("OPENSSL_MODULES")
     environment.update({
         "PATH": str(wrappers) + os.pathsep + environment.get("PATH", ""),
         "TMPDIR": str(temporary),
@@ -1101,6 +2350,12 @@ def build_private_image(
         "ZIG_GLOBAL_CACHE_DIR": str(cache / "zig-global"),
         "ZIG_LOCAL_CACHE_DIR": str(cache / "zig-local"),
         "PYTHONPYCACHEPREFIX": str(cache / "pycache"),
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(cache / "xdg-config"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_EXEC_PATH": str(relocated_git / "disabled-exec-path"),
+        "GIT_OPTIONAL_LOCKS": "0",
         "BISON_PKGDATADIR": str(Path(bison_data).resolve(strict=True)),
         "M4": str(resolved["m4"]),
         "LC_ALL": "C",
@@ -1109,66 +2364,227 @@ def build_private_image(
     log_path = output_directory / "build.log"
     with log_path.open("xb") as log:
         os.chmod(log_path, 0o600)
-        process = subprocess.Popen(
-            command, cwd=repository, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env=environment, start_new_session=True,
-        )
         overflow = threading.Event()
+        written = 0
+        deadline = time.monotonic() + timeout
 
-        def drain_output():
-            written = 0
-            for chunk in iter(lambda: process.stdout.read(64 * 1024), b""):
-                remaining = 8 * 1024 * 1024 - written
-                if remaining > 0:
-                    log.write(chunk[:remaining])
-                    written += min(len(chunk), remaining)
-                if len(chunk) > remaining:
-                    overflow.set()
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+        def run_process(argv, label):
+            nonlocal written
+            header = f"=== {label} ===\n".encode()
+            if written + len(header) > 8 * 1024 * 1024:
+                raise RuntimeError(
+                    "Private local native build log exceeded 8 MiB"
+                )
+            log.write(header)
+            written += len(header)
+            process = subprocess.Popen(
+                argv, cwd=repository, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=environment, start_new_session=True,
+            )
+            output = bytearray()
 
-        reader = threading.Thread(target=drain_output, daemon=True)
-        reader.start()
-        try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            def drain_output():
+                nonlocal written
+                for chunk in iter(
+                    lambda: process.stdout.read(64 * 1024), b""
+                ):
+                    remaining = 8 * 1024 * 1024 - written
+                    if remaining > 0:
+                        log.write(chunk[:remaining])
+                        written += min(len(chunk), remaining)
+                    if len(chunk) <= remaining:
+                        output.extend(chunk)
+                    if len(chunk) > remaining:
+                        overflow.set()
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+
+            reader = threading.Thread(target=drain_output, daemon=True)
+            reader.start()
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                returncode = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                reader.join()
+                process.stdout.close()
+                raise RuntimeError(
+                    "Private local native build timed out"
+                ) from None
             reader.join()
             process.stdout.close()
-            raise RuntimeError("Private local native build timed out") from None
-        reader.join()
-        process.stdout.close()
+            if overflow.is_set():
+                raise RuntimeError(
+                    "Private local native build log exceeded 8 MiB"
+                )
+            return returncode, bytes(output)
+
+        def failure_commands(output, label):
+            try:
+                text = output.decode("utf-8")
+            except UnicodeDecodeError:
+                raise RuntimeError(
+                    f"Private local native {label} output is not UTF-8"
+                ) from None
+            failed = []
+            for line in text.splitlines():
+                if "failed command:" not in line:
+                    continue
+                if (
+                    not line.startswith("failed command: ")
+                    or line.count("failed command:") != 1
+                    or not line[len("failed command: "):]
+                ):
+                    raise RuntimeError(
+                        f"Private local native {label} failure evidence "
+                        "is ambiguous"
+                    )
+                failed.append(line[len("failed command: "):])
+            return failed
+
+        materialization_returncode, materialization_output = run_process(
+            command,
+            "native build materialization pass"
+        )
+        recovery = "none"
+        recovery_returncode = None
+        failed = failure_commands(
+            materialization_output, "materialization pass"
+        )
+        if materialization_returncode:
+            raise RuntimeError(
+                "Private local native build failed before verification"
+            )
+        if failed:
+            if len(failed) != 1:
+                raise RuntimeError(
+                    "Private local native build failed before verification"
+                )
+            failed_argv = shlex.split(failed[0])
+            expected_prefix = [
+                "PYTHON=python3",
+                "python3",
+                str(NATIVE_POSTPROCESS_RUNNER_PATH),
+                "uk-reloc",
+                "--script",
+                str(UK_RELOC_SCRIPT_PATH),
+                "--nm",
+                "llvm-nm",
+                "--readelf",
+                "llvm-readelf",
+                "--objcopy",
+                "llvm-objcopy",
+            ]
+            if failed_argv[:len(expected_prefix)] != expected_prefix or (
+                len(failed_argv) != len(expected_prefix) + 3
+            ):
+                raise RuntimeError(
+                    "Private local native build failed before verification"
+                )
+            generated = []
+            cache_root = cache.resolve(strict=True)
+            for value in failed_argv[-3:]:
+                candidate = Path(value)
+                if not candidate.is_absolute():
+                    candidate = repository / candidate
+                if candidate.is_symlink():
+                    raise RuntimeError(
+                        "Private local native build recovery path is invalid"
+                    )
+                candidate = candidate.resolve(strict=True)
+                try:
+                    candidate.relative_to(cache_root)
+                except ValueError:
+                    raise RuntimeError(
+                        "Private local native build recovery path is invalid"
+                    ) from None
+                if not candidate.is_file():
+                    raise RuntimeError(
+                        "Private local native build recovery path is invalid"
+                    )
+                generated.append(candidate)
+            input_path, relocations_path, output_path = generated
+            if (
+                input_path.name != "hyperv-validated-final.dbg"
+                or output_path.name != NATIVE_EFI_NAME + ".dbg"
+                or relocations_path != Path(str(output_path) + ".uk_reloc.bin")
+            ):
+                raise RuntimeError(
+                    "Private local native build recovery path is invalid"
+                )
+            recovery_command = [
+                str(resolved["python"]),
+                str(NATIVE_POSTPROCESS_RUNNER_PATH),
+                "uk-reloc",
+                "--script",
+                str(UK_RELOC_SCRIPT_PATH),
+                "--nm",
+                "llvm-nm",
+                "--readelf",
+                "llvm-readelf",
+                "--objcopy",
+                "llvm-objcopy",
+                str(input_path),
+                str(relocations_path),
+                str(output_path),
+            ]
+            recovery_returncode, recovery_output = run_process(
+                recovery_command, "bounded native uk-reloc recovery"
+            )
+            if (
+                recovery_returncode
+                or failure_commands(recovery_output, "recovery pass")
+            ):
+                raise RuntimeError(
+                    "Private local native build recovery failed"
+                )
+            recovery = "uk-reloc-v1"
+        verification_returncode, verification_output = run_process(
+            command, "native build verification pass"
+        )
         log.flush()
         os.fsync(log.fileno())
-    if overflow.is_set():
-        raise RuntimeError("Private local native build log exceeded 8 MiB")
-    if returncode:
+    if (
+        verification_returncode
+        or failure_commands(verification_output, "verification pass")
+    ):
         raise RuntimeError(
             "Private local native build failed; inspect its owner-only log"
         )
-    source_after = build_provenance(repository, config)
+    source_after = build_provenance(
+        repository, config, resolved["git_runtime"]
+    )
     if source_after != source_before:
         raise RuntimeError("Private source or configuration changed during build")
+    if local_tool_record(zig_invocation, "zig") != tools["zig"]:
+        raise RuntimeError("Private Zig compiler changed during build")
     efi_path = build_output / NATIVE_EFI_NAME
     output = regular_record(
         efi_path, NATIVE_EFI_NAME, "Private local EFI build output"
     )
     receipt = {
         "schema": PRIVATE_BUILD_SCHEMA,
-        "schema_version": 1,
+        "schema_version": PRIVATE_BUILD_SCHEMA_VERSION,
         "result": "PASS",
         "source_before": source_before,
         "source_after": source_after,
         "invocation": {
-            "engine": "zig-native-images-v1",
+            "engine": "zig-native-images-two-pass-v1",
+            "passes": 2,
             "jobs": 2,
+            "materialization_returncode": materialization_returncode,
+            "recovery": recovery,
+            "recovery_returncode": recovery_returncode,
+            "verification_returncode": verification_returncode,
             "app": "support/apps/hyperv-acceptance",
             "profile": "hyperv-x86_64-efi-netvsc",
             "compiler_target": "x86_64-freestanding-none",
@@ -1177,6 +2593,7 @@ def build_private_image(
         "tools": tools,
         "output": output,
         "builder_sha256": azure.image_sha256(Path(__file__)),
+        "guarded": guarded,
     }
     receipt_path = output_directory / PRIVATE_BUILD_RECEIPT
     save_private_bytes(receipt_path, azure.canonical_json(receipt))
@@ -1191,6 +2608,7 @@ def build_private_image(
             "sha256": output["sha256"],
             "size": output["size"],
         },
+        guarded,
     )
     azure.fsync_directory(output_directory)
     return receipt_path, efi_path
@@ -1246,15 +2664,44 @@ def copy_record(source, destination, record):
     )
 
 
+def copy_git_runtime(source, destination, expected=None):
+    source = Path(source).resolve(strict=True)
+    record = preflight_git_runtime(source)
+    if expected is not None and record != expected:
+        raise ValueError("Private Git runtime differs from its fingerprint")
+    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
+    for entry in sorted(source.rglob("*")):
+        if not entry.is_file():
+            continue
+        relative = entry.relative_to(source)
+        member = regular_record(
+            entry, relative.as_posix(), "Private Git runtime member"
+        )
+        copy_record(entry, destination / relative, member)
+        (destination / relative).chmod(
+            0o700 if relative in (GIT_EXECUTABLE, GIT_LOADER) else 0o600
+        )
+    copied = preflight_git_runtime(destination)
+    if copied != record:
+        raise ValueError("Copied private Git runtime is inconsistent")
+    return copied
+
+
 def generate_input(
     output_directory, repository, config_path, qemu_root, ovmf_code,
     ovmf_vars, capability_raw, capability_receipt, efi, build_receipt,
-    raw, vhd, miz_path, boot_policy,
+    raw, vhd, miz_path, git_runtime, boot_policy,
 ):
     check_blob_dependency()
     if boot_policy not in BOOT_POLICIES:
         raise ValueError("Unsupported platform-only boot policy")
-    provenance = build_provenance(repository, config_path)
+    provenance = build_provenance(repository, config_path, git_runtime)
+    guarded = guarded_contract_from_solved_config(config_path)
+    if guarded is not None:
+        verify_guarded_producer_sources(repository)
+    guarded = validate_guarded_contract(
+        guarded, boot_policy, provenance["config"]["sha256"]
+    )
     qemu, qemu_support = qemu_closure_records(qemu_root)
     files = {
         "qemu": qemu,
@@ -1292,7 +2739,7 @@ def generate_input(
             build_receipt, PRIVATE_BUILD_RECEIPT,
             "Private local build receipt",
         ),
-        provenance, files["efi"],
+        provenance, files["efi"], guarded,
     )
     miz = regular_record(miz_path, "miz", "Pinned miz executable")
     miz["revision"] = azure.MIZ_REVISION
@@ -1348,6 +2795,10 @@ def generate_input(
             output_directory / PRIVATE_BUILD_RECEIPT,
             private_build,
         )
+        copy_git_runtime(
+            git_runtime, output_directory / GIT_RUNTIME,
+            provenance["git"],
+        )
         packaging = azure.miz_command(
             miz_path.resolve(strict=True),
             [
@@ -1377,6 +2828,7 @@ def generate_input(
             "schema_version": INPUT_SCHEMA_VERSION,
             "workload": WORKLOAD,
             "boot_policy": boot_policy,
+            "guarded": guarded,
             "raw_size": azure.VIRTUAL_SIZE,
             "provenance": provenance,
             "capability_reference": capability_reference,
@@ -1415,7 +2867,7 @@ def load_input_manifest(input_directory, expected_sha256):
         raise ValueError("Private-preflight manifest digest does not match")
     expected_names = {
         INPUT_MANIFEST, SOLVED_CONFIG, CAPABILITY_REFERENCE,
-        PRIVATE_BUILD_RECEIPT, "qemu",
+        PRIVATE_BUILD_RECEIPT, GIT_RUNTIME, "qemu",
         *(Path(name).parts[0] for role, name in INPUT_NAMES.items()
           if role != "qemu"),
     }
@@ -1444,15 +2896,26 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
         input_directory, expected_sha256
     )
     check_blob_dependency()
+    git_source = source / GIT_RUNTIME
+    if preflight_git_runtime(git_source) != manifest["provenance"]["git"]:
+        raise ValueError("Pinned Git runtime does not match the manifest")
     if (
         manifest["implementation"] != implementation_contract()
         or build_provenance(
-            SUPPORT.parent, source / SOLVED_CONFIG
+            SUPPORT.parent, source / SOLVED_CONFIG, git_source
         ) != manifest["provenance"]
     ):
         raise ValueError(
             "Private-preflight source, configuration, or dependencies changed"
         )
+    guarded = guarded_contract_from_solved_config(source / SOLVED_CONFIG)
+    if guarded is not None:
+        verify_guarded_producer_sources(SUPPORT.parent)
+    if validate_guarded_contract(
+        guarded, manifest["boot_policy"],
+        manifest["provenance"]["config"]["sha256"],
+    ) != manifest["guarded"]:
+        raise ValueError("Private-preflight guarded V2 contract changed")
     miz_source = Path(miz_path)
     if stat.S_ISLNK(miz_source.lstat().st_mode):
         raise ValueError("Pinned miz executable must not be a symlink")
@@ -1508,6 +2971,10 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
         )
         copied_miz = local_tools / "miz"
         copied_miz.chmod(0o700)
+        copy_git_runtime(
+            git_source, local_tools / GIT_RUNTIME,
+            manifest["provenance"]["git"],
+        )
         checked = azure.miz_command(copied_miz, [
             "check-efi-application", "--output=json",
             "--architecture", "x86_64",
@@ -1784,15 +3251,24 @@ def verify_immutable_inputs(state, state_directory):
             raise ValueError("Prepared QEMU support closure changed")
     config = manifest["provenance"]["config"]
     config_path = state_directory / "inputs" / config["name"]
+    git = state_directory / "local-tools" / GIT_RUNTIME
     if (
         config_path.is_symlink()
         or not config_path.is_file()
         or config_path.stat().st_size != config["size"]
         or azure.image_sha256(config_path) != config["sha256"]
-        or build_provenance(SUPPORT.parent, config_path)
+        or preflight_git_runtime(git) != manifest["provenance"]["git"]
+        or build_provenance(SUPPORT.parent, config_path, git)
         != manifest["provenance"]
     ):
         raise ValueError("Prepared source or solved configuration changed")
+    guarded = guarded_contract_from_solved_config(config_path)
+    if guarded is not None:
+        verify_guarded_producer_sources(SUPPORT.parent)
+    if validate_guarded_contract(
+        guarded, manifest["boot_policy"], config["sha256"]
+    ) != manifest["guarded"]:
+        raise ValueError("Prepared guarded V2 contract changed")
     for name, key, description in (
         (
             CAPABILITY_REFERENCE, "capability_reference",
@@ -3557,7 +5033,7 @@ def host_phase_manifest(state, phase, capability_sha256=None):
         }
     result = {
         "schema": HOST_PHASE_SCHEMA,
-        "schema_version": 2,
+        "schema_version": 3,
         "phase": phase,
         "identity": state["identity"],
         "runner_sha256": state["implementation"]["files"]["runner"][
@@ -3569,6 +5045,9 @@ def host_phase_manifest(state, phase, capability_sha256=None):
             "platform-unavailable-v1"
             if phase == "capability"
             else input_manifest["boot_policy"]
+        ),
+        "guarded": (
+            None if phase == "capability" else input_manifest["guarded"]
         ),
         "raw_size": input_manifest["raw_size"],
         "files": files,
@@ -3624,7 +5103,7 @@ def validate_host_receipt(value, state, phase, manifest, logs):
         (
             "schema", "schema_version", "phase", "identity", "result",
             "manifest_sha256", "runner_sha256", "host_boot_id",
-            "boot_policy", "boots",
+            "boot_policy", "acceptance_scope", "storage_result", "boots",
         ),
         "Private host evidence receipt",
     )
@@ -3655,7 +5134,7 @@ def validate_host_receipt(value, state, phase, manifest, logs):
     if (
         value["schema"] != HOST_EVIDENCE_SCHEMA
         or type(value["schema_version"]) is not int
-        or value["schema_version"] != 1
+        or value["schema_version"] != 2
         or value["phase"] != phase
         or value["identity"] != state["identity"]
         or value["result"] != "PASS"
@@ -3667,6 +5146,12 @@ def validate_host_receipt(value, state, phase, manifest, logs):
             value["host_boot_id"], "Private host boot identity"
         ) != value["host_boot_id"]
         or value["boot_policy"] != manifest["boot_policy"]
+        or value["acceptance_scope"] != "platform-only"
+        or value["storage_result"] != (
+            "UNAVAILABLE"
+            if manifest["boot_policy"] == GUARDED_BOOT_POLICY
+            else "NOT_EVALUATED"
+        )
     ):
         raise ValueError("Private host receipt is stale or mismatched")
     return value
@@ -3715,6 +5200,327 @@ def retrieve_phase_evidence(run, transfer_cidr, sas, phase, manifest):
     save_private_bytes(receipt_path, receipt_bytes)
     azure.fsync_directory(evidence_directory)
     return receipt
+
+
+def _load_completed_host_evidence(
+    state, state_directory, phase, manifest
+):
+    formats = ("capability",) if phase == "capability" else ("raw", "vhd")
+    evidence_directory = state_directory / "evidence" / phase
+    receipt_path = evidence_directory / "receipt.json"
+    receipt_bytes = azure.read_regular_file(
+        receipt_path, MAX_MANIFEST_BYTES,
+        "Completed private host evidence receipt",
+    )
+    logs = {}
+    for image_format in formats:
+        for mode in ("x2apic", "legacy-apic"):
+            name = f"{image_format}-{mode}.log"
+            raw = azure.read_regular_file(
+                evidence_directory / name, host_runner.MAX_LOG_BYTES,
+                "Completed private host boot log",
+            )
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError(
+                    "Completed private host boot log is not UTF-8"
+                ) from None
+            host_runner.validate_boot_log(
+                text,
+                (
+                    "platform-unavailable-v1"
+                    if phase == "capability"
+                    else state["input_manifest"]["boot_policy"]
+                ),
+                mode == "legacy-apic",
+                (
+                    None
+                    if phase == "capability"
+                    else state["input_manifest"]["guarded"]
+                ),
+            )
+            logs[name] = raw
+    receipt = validate_host_receipt(
+        azure.parse_strict_json(
+            receipt_bytes, "Completed private host evidence receipt"
+        ),
+        state, phase, manifest, logs,
+    )
+    digest = hashlib.sha256(receipt_bytes).hexdigest()
+    if digest != require_sha256(
+        state.get(phase + "_receipt_sha256"),
+        "Completed private host evidence receipt",
+    ):
+        raise ValueError("Completed private host evidence receipt is stale")
+    return receipt, digest, (
+        len(receipt_bytes) + sum(len(raw) for raw in logs.values())
+    )
+
+
+def load_completed_receipt(state_directory):
+    state, state_path = load_state(state_directory)
+    state_directory = state_path.parent
+    deployment = state.get("host_deployment")
+    if (
+        state.get("phase") != "complete"
+        or state["cleanup_required"] is not False
+        or state["pending_secret_files"] != []
+        or state.get("firewall_obligation") is not None
+        or state.get("active_sas") is not False
+        or "active_sas_signing_key_sha256" not in state
+        or state["active_sas_signing_key_sha256"] is not None
+        or state.get("host_deallocated") is not True
+        or not isinstance(deployment, dict)
+        or deployment.get("phase") != "resources-verified"
+        or not isinstance(state.get("resource_group_id"), str)
+        or state.get("failure") is not None
+        or state.get("cleanup_failure") is not None
+    ):
+        raise ValueError("Private preflight is not completely cleaned")
+    verify_immutable_inputs(state, state_directory)
+    manifest = state["input_manifest"]
+    capability_manifest = host_phase_manifest(state, "capability")
+    capability_manifest_sha256 = hashlib.sha256(
+        azure.canonical_json(capability_manifest)
+    ).hexdigest()
+    if capability_manifest_sha256 != require_sha256(
+        state.get("capability_manifest_sha256"),
+        "Completed capability manifest",
+    ):
+        raise ValueError("Completed capability manifest is stale")
+    private_manifest = host_phase_manifest(
+        state, "private", capability_manifest_sha256
+    )
+    if hashlib.sha256(
+        azure.canonical_json(private_manifest)
+    ).hexdigest() != require_sha256(
+        state.get("private_manifest_sha256"),
+        "Completed private manifest",
+    ):
+        raise ValueError("Completed private manifest is stale")
+    (
+        capability_receipt,
+        capability_receipt_sha256,
+        capability_evidence_bytes,
+    ) = (
+        _load_completed_host_evidence(
+            state, state_directory, "capability", capability_manifest
+        )
+    )
+    (
+        private_receipt,
+        private_receipt_sha256,
+        private_evidence_bytes,
+    ) = _load_completed_host_evidence(
+        state, state_directory, "private", private_manifest
+    )
+    if (
+        capability_receipt["host_boot_id"]
+        != private_receipt["host_boot_id"]
+        or state["evidence_bytes"]
+        != capability_evidence_bytes + private_evidence_bytes
+        or state["control_payload_bytes"] <= 0
+    ):
+        raise ValueError("Completed private host evidence is inconsistent")
+
+    receipt_path = state_directory / "private-receipt.json"
+    receipt_bytes = azure.read_regular_file(
+        receipt_path, MAX_MANIFEST_BYTES,
+        "Completed private-preflight receipt",
+    )
+    receipt_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
+    if receipt_sha256 != require_sha256(
+        state.get("final_receipt_sha256"),
+        "Completed private-preflight receipt",
+    ):
+        raise ValueError("Completed private-preflight receipt is stale")
+    receipt = exact_fields(
+        azure.parse_strict_json(
+            receipt_bytes, "Completed private-preflight receipt"
+        ),
+        (
+            "schema", "schema_version", "result", "identity",
+            "input_manifest_sha256", "implementation", "provenance",
+            "capability_reference", "private_build", "inputs",
+            "qemu_support", "miz", "packaging", "budget", "host_image",
+            "host", "capability_receipt_sha256",
+            "private_receipt_sha256", "boot_policy",
+            "acceptance_scope", "storage_result", "guarded",
+            "capability_boots", "private_boots", "cleanup",
+        ),
+        "Completed private-preflight receipt",
+    )
+    inputs = exact_fields(
+        receipt["inputs"], ALL_ROLES,
+        "Completed private-preflight inputs",
+    )
+    normalized_inputs = {}
+    for role in ALL_ROLES:
+        record = exact_fields(
+            inputs[role], ("sha256", "size"),
+            "Completed private-preflight input",
+        )
+        expected = manifest["files"][role]
+        normalized = {
+            "sha256": require_sha256(
+                record["sha256"], "Completed private-preflight input"
+            ),
+            "size": record["size"],
+        }
+        if (
+            type(record["size"]) is not int
+            or normalized != {
+                "sha256": expected["sha256"],
+                "size": expected["size"],
+            }
+        ):
+            raise ValueError("Completed private-preflight input is stale")
+        normalized_inputs[role] = normalized
+
+    expected_budget = {
+        **manifest["budget"],
+        "staged_input_bytes": state["staged_input_bytes"],
+        "control_payload_bytes": state["control_payload_bytes"],
+        "evidence_bytes": state["evidence_bytes"],
+    }
+    budget = exact_fields(
+        receipt["budget"], tuple(expected_budget),
+        "Completed private-preflight budget",
+    )
+    if (
+        dict(budget) != expected_budget
+        or state["staged_input_bytes"]
+        != manifest["budget"]["remote_input_bytes"]
+    ):
+        raise ValueError("Completed private-preflight accounting is stale")
+
+    cloud = exact_fields(
+        state.get("cloud_preflight"),
+        ("subscription", "sku", "image"),
+        "Completed private cloud preflight",
+    )
+    image = exact_fields(
+        receipt["host_image"],
+        (
+            "publisher", "offer", "sku", "version", "urn",
+            "architecture", "hyperv_generation",
+        ),
+        "Completed private host image",
+    )
+    if (
+        cloud["subscription"] != state.get("subscription")
+        or not isinstance(cloud["sku"], dict)
+        or dict(image) != cloud["image"]
+        or any(
+            not isinstance(image[field], str) or not image[field]
+            for field in ("publisher", "offer", "sku", "version")
+        )
+        or image["urn"] != (
+            f"{image['publisher']}:{image['offer']}:"
+            f"{image['sku']}:{image['version']}"
+        )
+        or image["architecture"] != "x64"
+        or image["hyperv_generation"] != "V2"
+    ):
+        raise ValueError("Completed private host image is stale")
+
+    group_id = state["resource_group_id"].rstrip("/")
+    prefix = state["name_prefix"]
+    expected_resource_ids = {
+        "host_vm_id": deployment["vm_id"],
+        "host_disk_id": deployment["disk_id"],
+        "host_nic_id": (
+            f"{group_id}/providers/Microsoft.Network/"
+            f"networkInterfaces/{prefix}-host-nic"
+        ),
+        "storage_account_id": (
+            f"{group_id}/providers/Microsoft.Storage/"
+            f"storageAccounts/{state['storage_account']}"
+        ),
+        "shutdown_schedule_id": (
+            f"{group_id}/providers/Microsoft.DevTestLab/schedules/"
+            f"shutdown-computevm-{prefix}-host"
+        ),
+    }
+    if any(
+        not isinstance(state.get(field), str)
+        or state[field].lower() != expected.lower()
+        for field, expected in expected_resource_ids.items()
+    ):
+        raise ValueError("Completed private host resource binding is stale")
+
+    host = exact_fields(
+        receipt["host"],
+        (
+            "operation_id", "deployment_correlation_id", "vm_uuid",
+            "disk_uuid", "boot_id",
+        ),
+        "Completed private host identity",
+    )
+    if (
+        not isinstance(deployment, dict)
+        or host["operation_id"] != deployment.get("operation_id")
+        or host["deployment_correlation_id"]
+        != deployment.get("correlation_id")
+        or host["vm_uuid"] != deployment.get("vm_uuid")
+        or host["disk_uuid"] != deployment.get("disk_uuid")
+        or host["boot_id"] != private_receipt["host_boot_id"]
+    ):
+        raise ValueError("Completed private host identity is stale")
+    for field in (
+        "operation_id", "deployment_correlation_id", "vm_uuid",
+        "disk_uuid", "boot_id",
+    ):
+        require_uuid(host[field], "Completed private host identity")
+
+    if (
+        receipt["schema"] != RECEIPT_SCHEMA
+        or type(receipt["schema_version"]) is not int
+        or receipt["schema_version"] != RECEIPT_SCHEMA_VERSION
+        or receipt["result"] != "PASS"
+        or receipt["identity"] != state["identity"]
+        or receipt["input_manifest_sha256"] != state["manifest_sha256"]
+        or receipt["implementation"] != manifest["implementation"]
+        or receipt["implementation"] != state["implementation"]
+        or receipt["provenance"] != manifest["provenance"]
+        or receipt["capability_reference"]
+        != manifest["capability_reference"]
+        or receipt["private_build"] != manifest["private_build"]
+        or receipt["qemu_support"] != manifest["qemu_support"]
+        or receipt["miz"] != manifest["miz"]
+        or receipt["packaging"] != manifest["packaging"]
+        or receipt["capability_receipt_sha256"]
+        != capability_receipt_sha256
+        or receipt["private_receipt_sha256"] != private_receipt_sha256
+        or receipt["boot_policy"] != GUARDED_BOOT_POLICY
+        or receipt["boot_policy"] != manifest["boot_policy"]
+        or receipt["acceptance_scope"] != "platform-only"
+        or receipt["storage_result"] != "UNAVAILABLE"
+        or receipt["storage_result"] != private_receipt["storage_result"]
+        or receipt["guarded"] != manifest["guarded"]
+        or receipt["capability_boots"] != capability_receipt["boots"]
+        or receipt["private_boots"] != private_receipt["boots"]
+        or receipt["cleanup"] != "complete"
+    ):
+        raise ValueError("Completed private-preflight receipt is incompatible")
+    return {
+        **receipt,
+        "implementation": manifest["implementation"],
+        "provenance": manifest["provenance"],
+        "capability_reference": manifest["capability_reference"],
+        "private_build": manifest["private_build"],
+        "inputs": normalized_inputs,
+        "qemu_support": manifest["qemu_support"],
+        "miz": manifest["miz"],
+        "packaging": manifest["packaging"],
+        "budget": dict(budget),
+        "host_image": dict(image),
+        "host": dict(host),
+        "guarded": manifest["guarded"],
+        "capability_boots": capability_receipt["boots"],
+        "private_boots": private_receipt["boots"],
+    }, receipt_path
 
 
 def record_private_failure(run, error, phase):
@@ -3903,6 +5709,9 @@ def run_preflight(
                 ],
                 "private_receipt_sha256": state["private_receipt_sha256"],
                 "boot_policy": state["input_manifest"]["boot_policy"],
+                "acceptance_scope": "platform-only",
+                "storage_result": private_receipt["storage_result"],
+                "guarded": state["input_manifest"]["guarded"],
                 "capability_boots": capability_receipt["boots"],
                 "private_boots": private_receipt["boots"],
                 "cleanup": "pending",
@@ -3970,6 +5779,7 @@ def main():
     build_parser.add_argument("--m4", type=Path, required=True)
     build_parser.add_argument("--bison-data", type=Path, required=True)
     build_parser.add_argument("--llvm-bin", type=Path, required=True)
+    build_parser.add_argument("--git-runtime", type=Path, required=True)
     build_parser.add_argument("--timeout", type=int, default=1800)
     generate_parser = subparsers.add_parser("generate-input")
     generate_parser.add_argument("--output-dir", type=Path, required=True)
@@ -3993,6 +5803,7 @@ def main():
     generate_parser.add_argument("--private-raw", type=Path, required=True)
     generate_parser.add_argument("--private-vhd", type=Path, required=True)
     generate_parser.add_argument("--miz", type=Path, required=True)
+    generate_parser.add_argument("--git-runtime", type=Path, required=True)
     generate_parser.add_argument(
         "--boot-policy", choices=BOOT_POLICIES, required=True
     )
@@ -4020,7 +5831,8 @@ def main():
             build_private_image(
                 args.output_dir, args.repository, args.solved_config,
                 args.zig, args.make, args.python, args.bison, args.flex,
-                args.m4, args.bison_data, args.llvm_bin, args.timeout,
+                args.m4, args.bison_data, args.llvm_bin, args.git_runtime,
+                args.timeout,
             )
             print("Private local build completed in owner-only directory")
         elif args.action == "generate-input":
@@ -4038,6 +5850,7 @@ def main():
                 args.private_raw,
                 args.private_vhd,
                 args.miz,
+                args.git_runtime,
                 args.boot_policy,
             )
             print(

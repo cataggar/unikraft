@@ -6,7 +6,10 @@ import hashlib
 import importlib
 import io
 import json
+import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +27,100 @@ blob_worker = importlib.import_module("hyperv_private_preflight_blob")
 TEST_TEMP = SUPPORT.parent / ".d" / "private-preflight-test-tmp"
 TEST_TEMP.mkdir(mode=0o700, parents=True, exist_ok=True)
 tempfile.tempdir = str(TEST_TEMP)
+GUARDED_PRODUCER_RECORDS = (
+    Path(__file__).with_name("fixtures")
+    / "hyperv-guarded-v2-pristine-unavailable.records"
+)
+
+
+def selected_git_executable():
+    selected = shutil.which("git")
+    if selected is None:
+        raise RuntimeError("A Git executable is required by this test")
+    ambient = Path(selected).resolve()
+    configuration = (
+        ambient.parent / "trampoline_configuration" / "git.json"
+    )
+    if configuration.is_file():
+        return Path(json.loads(configuration.read_text())["exe"]).resolve()
+    return ambient
+
+
+def create_git_runtime(root):
+    root = Path(root)
+    runtime = root / "git-runtime"
+    (runtime / "bin").mkdir(parents=True)
+    git = selected_git_executable()
+    shutil.copy2(git, runtime / preflight.GIT_EXECUTABLE)
+    (runtime / "lib").mkdir()
+    result = subprocess.run(
+        ["ldd", str(git)], capture_output=True, check=True, text=True,
+        env={"LC_ALL": "C", "PATH": os.environ.get("PATH", "")},
+    )
+    loader = None
+    libraries = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("linux-vdso.so.1 "):
+            continue
+        match = re.fullmatch(r"(\S+) => (/.+) \(0x[0-9a-fA-F]+\)", line)
+        if match is not None:
+            libraries[match.group(1)] = Path(match.group(2)).resolve()
+            continue
+        match = re.fullmatch(r"(/.+) \(0x[0-9a-fA-F]+\)", line)
+        if match is not None:
+            loader = Path(match.group(1)).resolve()
+            continue
+        raise RuntimeError("Unable to stage the test Git runtime")
+    if loader is None or not libraries:
+        raise RuntimeError("The test Git runtime closure is incomplete")
+    shutil.copy2(loader, runtime / preflight.GIT_LOADER)
+    for name, source in libraries.items():
+        shutil.copy2(source, runtime / "lib" / name)
+    (runtime / preflight.GIT_EXECUTABLE).chmod(0o700)
+    (runtime / preflight.GIT_LOADER).chmod(0o700)
+    for library in libraries:
+        (runtime / "lib" / library).chmod(0o600)
+    preflight.preflight_git_runtime(runtime)
+    return runtime
+
+
+def fake_git_runtime_record():
+    executable = {
+        "name": preflight.GIT_EXECUTABLE.as_posix(),
+        "sha256": "d" * 64,
+        "size": 1,
+    }
+    loader = {
+        "name": preflight.GIT_LOADER.as_posix(),
+        "sha256": "e" * 64,
+        "size": 1,
+    }
+    libraries = [{
+        "name": "lib/libc.so.6",
+        "sha256": "f" * 64,
+        "size": 1,
+    }]
+    members = sorted(
+        (executable, loader, *libraries), key=lambda item: item["name"]
+    )
+    digest = hashlib.sha256()
+    for member in members:
+        encoded = member["name"].encode()
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(member["size"].to_bytes(8, "big"))
+        digest.update(bytes.fromhex(member["sha256"]))
+    return {
+        "schema": preflight.GIT_RUNTIME_SCHEMA,
+        "name": preflight.GIT_RUNTIME,
+        "sha256": digest.hexdigest(),
+        "size": sum(member["size"] for member in members),
+        "files": len(members),
+        "executable": executable,
+        "loader": loader,
+        "libraries": libraries,
+    }
 
 
 def modeled_host_disk_output_order(template):
@@ -164,16 +261,21 @@ def capability_reference(capability, approved=True):
     }
 
 
-def private_build_receipt(provenance, efi):
+def private_build_receipt(provenance, efi, guarded=None):
     receipt = {
         "schema": preflight.PRIVATE_BUILD_SCHEMA,
-        "schema_version": 1,
+        "schema_version": preflight.PRIVATE_BUILD_SCHEMA_VERSION,
         "result": "PASS",
         "source_before": provenance,
         "source_after": provenance,
         "invocation": {
-            "engine": "zig-native-images-v1",
+            "engine": "zig-native-images-two-pass-v1",
+            "passes": 2,
             "jobs": 2,
+            "materialization_returncode": 0,
+            "recovery": "none",
+            "recovery_returncode": None,
+            "verification_returncode": 0,
             "app": "support/apps/hyperv-acceptance",
             "profile": "hyperv-x86_64-efi-netvsc",
             "compiler_target": "x86_64-freestanding-none",
@@ -196,7 +298,11 @@ def private_build_receipt(provenance, efi):
         "builder_sha256": preflight.azure.image_sha256(
             Path(preflight.__file__)
         ),
+        "guarded": (
+            json.loads(json.dumps(guarded)) if guarded is not None else None
+        ),
     }
+    receipt["tools"]["git"] = json.loads(json.dumps(provenance["git"]))
     return {
         "name": preflight.PRIVATE_BUILD_RECEIPT,
         "sha256": "3" * 64,
@@ -206,6 +312,47 @@ def private_build_receipt(provenance, efi):
 
 
 class PrivatePreflightFixture(unittest.TestCase):
+    @staticmethod
+    def guarded_config():
+        return (
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y\n"
+            "CONFIG_LIBSTORVSC=y\n"
+            "CONFIG_LIBSTORVSC_LUN_DISCOVERY=y\n"
+            "CONFIG_LIBSTORVSC_GUARDED_IO=y\n"
+            "CONFIG_LIBSTORVSC_MAX_DEVICES=2\n"
+            "CONFIG_LIBSTORVSC_MAX_LUNS=8\n"
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID="
+            '"00112233445566778899aabbccddeeff"\n'
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID="
+            '"102132435465768798a9bacbdcedfe0f"\n'
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=1000\n"
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512\n"
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2\n"
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0\n"
+        ).encode()
+
+    @staticmethod
+    def guarded_contract(config_sha256):
+        return {
+            "schema": preflight.GUARDED_CONTRACT_SCHEMA,
+            "schema_version": 1,
+            "scope": "platform-only",
+            "result": "UNAVAILABLE",
+            "protocol": 1,
+            "identity_policy": 2,
+            "reason": "no-devices",
+            "main_return": 2,
+            "run_id": "00112233445566778899aabbccddeeff",
+            "disk_id": "102132435465768798a9bacbdcedfe0f",
+            "path": 0,
+            "target": 0,
+            "lun": 0,
+            "sectors": 1000,
+            "sector_size": 512,
+            "solved_config_sha256": config_sha256,
+            "producer": preflight.guarded_producer_contract(),
+        }
+
     def implementation(self):
         return {
             "sdk": {
@@ -236,6 +383,7 @@ class PrivatePreflightFixture(unittest.TestCase):
         }
 
     def manifest(self, **changes):
+        boot_policy = changes.pop("boot_policy", "platform-unavailable-v1")
         raw_size = preflight.azure.VIRTUAL_SIZE
         sizes = {
             "qemu": 26_911_032,
@@ -265,21 +413,29 @@ class PrivatePreflightFixture(unittest.TestCase):
             "size": 1024 * 1024,
         }]
         provenance = {
-            "scheme": "unikraft.git-ls-tree-v1",
+            "scheme": "unikraft.git-physical-tree-v2",
             "head_commit": "a" * 40,
             "tree_sha256": "b" * 64,
+            "physical_sha256": "9" * 64,
             "tracked_entries": 200,
+            "tracked_bytes": 1024 * 1024,
             "config": {
                 "name": preflight.SOLVED_CONFIG,
                 "sha256": "c" * 64,
                 "size": 4096,
             },
+            "git": fake_git_runtime_record(),
         }
+        guarded = (
+            self.guarded_contract(provenance["config"]["sha256"])
+            if boot_policy == preflight.GUARDED_BOOT_POLICY else None
+        )
         value = {
             "schema": preflight.INPUT_SCHEMA,
             "schema_version": preflight.INPUT_SCHEMA_VERSION,
             "workload": preflight.WORKLOAD,
-            "boot_policy": "platform-unavailable-v1",
+            "boot_policy": boot_policy,
+            "guarded": guarded,
             "raw_size": raw_size,
             "provenance": provenance,
             "files": files,
@@ -298,7 +454,7 @@ class PrivatePreflightFixture(unittest.TestCase):
                 files["capability_raw"]
             ),
             "private_build": private_build_receipt(
-                provenance, files["efi"]
+                provenance, files["efi"], guarded
             ),
             "implementation": self.implementation(),
             "budget": preflight.expected_budget(files, qemu_support),
@@ -306,8 +462,10 @@ class PrivatePreflightFixture(unittest.TestCase):
         value.update(changes)
         return value
 
-    def state(self):
-        manifest = preflight.validate_input_manifest(self.manifest())
+    def state(self, **manifest_changes):
+        manifest = preflight.validate_input_manifest(
+            self.manifest(**manifest_changes)
+        )
         manifest_sha = hashlib.sha256(
             preflight.azure.canonical_json(manifest)
         ).hexdigest()
@@ -352,6 +510,35 @@ class PrivatePreflightFixture(unittest.TestCase):
             "resource_group_id": (
                 "/subscriptions/11111111-2222-3333-4444-555555555555/"
                 "resourceGroups/uk-hvp-123456789abc-rg"
+            ),
+            "host_vm_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Compute/virtualMachines/"
+                "uk-hvp-123456789abc-host"
+            ),
+            "host_disk_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Compute/disks/"
+                "uk-hvp-123456789abc-host-os"
+            ),
+            "host_nic_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Network/networkInterfaces/"
+                "uk-hvp-123456789abc-host-nic"
+            ),
+            "storage_account_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Storage/storageAccounts/ukhvp1234567890abcd"
+            ),
+            "shutdown_schedule_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.DevTestLab/schedules/"
+                "shutdown-computevm-uk-hvp-123456789abc-host"
             ),
         })
         return state
@@ -483,6 +670,243 @@ class PrivatePreflightFixture(unittest.TestCase):
 
 
 class PrivatePreflightManifestTest(PrivatePreflightFixture):
+    def test_guarded_source_pin_covers_pristine_proof_dependency_closure(self):
+        self.assertEqual(
+            preflight.GUARDED_PRODUCER_FILES,
+            runner.GUARDED_PRODUCER_FILES,
+        )
+        self.assertEqual(
+            preflight.GUARDED_PRODUCER_SCHEMA_VERSION,
+            runner.GUARDED_PRODUCER_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            preflight.GUARDED_PRODUCER_CLOSURES,
+            runner.GUARDED_PRODUCER_CLOSURES,
+        )
+        self.assertEqual(
+            preflight.directory_record(
+                SUPPORT / "build", "support/build",
+                "Guarded producer execution closure",
+            ),
+            preflight.GUARDED_PRODUCER_CLOSURES["support/build"],
+        )
+        proof_roles = {
+            "plat/hyperv/Makefile.uk",
+            "plat/hyperv/hyperv_runtime.zig",
+            "plat/hyperv/include/hyperv/hyperv.h",
+            "plat/hyperv/time.c",
+            "drivers/hyperv/vmbus/Makefile.uk",
+            "drivers/hyperv/vmbus/include/uk/vmbus.h",
+            "drivers/hyperv/vmbus/vmbus_bus.c",
+            "drivers/hyperv/vmbus/vmbus_channel.c",
+            "drivers/hyperv/vmbus/vmbus_protocol.h",
+            "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            "drivers/hyperv/storvsc/Makefile.uk",
+            "drivers/hyperv/storvsc/include/uk/storvsc.h",
+            "drivers/hyperv/storvsc/storvsc.c",
+            "drivers/hyperv/storvsc/storvsc_core.h",
+            "drivers/hyperv/storvsc/storvsc_core.zig",
+            "support/build/native-image-graph.zig",
+            "support/build/native-postprocess.zig",
+            "support/build/native-postprocess-runner.py",
+            "support/apps/hyperv-acceptance/Makefile.uk",
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/apps/hyperv-acceptance/acceptance_protocol.h",
+            "support/apps/hyperv-acceptance/application_network.c",
+            "support/apps/hyperv-acceptance/application_network.h",
+            "support/apps/hyperv-acceptance/main.c",
+            "support/apps/hyperv-acceptance/persistence.c",
+            "support/apps/hyperv-acceptance/storage_target.c",
+            "support/apps/hyperv-acceptance/storage_target.h",
+            *preflight.GUARDED_BUILD_CONTROL_FILES,
+            *preflight.GUARDED_EXECUTED_HELPER_FILES,
+        }
+        self.assertLessEqual(
+            proof_roles, set(preflight.GUARDED_PRODUCER_FILES)
+        )
+        for relative, expected in preflight.GUARDED_PRODUCER_FILES.items():
+            with self.subTest(relative=relative):
+                self.assertEqual(
+                    preflight.azure.image_sha256(SUPPORT.parent / relative),
+                    expected,
+                )
+                self.assertEqual(
+                    preflight.IMPLEMENTATION_PATHS[
+                        f"guarded_producer:{relative}"
+                    ],
+                    SUPPORT.parent / relative,
+                )
+
+    def test_guarded_matcher_mutations_fail_before_packaging(self):
+        mutation_targets = (
+            "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            "drivers/hyperv/vmbus/vmbus_protocol.h",
+            "drivers/hyperv/vmbus/vmbus_channel.c",
+            "support/apps/hyperv-acceptance/application_network.c",
+            "support/apps/hyperv-acceptance/application_network.h",
+            "support/apps/hyperv-acceptance/storage_target.c",
+            "support/apps/hyperv-acceptance/storage_target.h",
+            "support/build/native-target-object.zig",
+            "support/build/tests/hyperv-smp-link-test.py",
+            "support/build/tests/hyperv-irq-register-test.py",
+            "support/build/tests/hyperv-driver-registration-test.py",
+            "support/build/tests/storvsc-production-test.c",
+            "support/scripts/mkcompiledb.py",
+            "support/scripts/gitsha1",
+            "support/build/unreviewed-native-helper.py",
+        )
+        for relative in mutation_targets:
+            with self.subTest(relative=relative), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for source_relative in preflight.GUARDED_PRODUCER_FILES:
+                    source = SUPPORT.parent / source_relative
+                    destination = root / source_relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(source.read_bytes())
+                shutil.copytree(
+                    SUPPORT.parent / "support" / "build",
+                    root / "support" / "build",
+                    dirs_exist_ok=True,
+                )
+                fake_support = root / "support"
+                with mock.patch.object(preflight, "SUPPORT", fake_support):
+                    preflight.verify_guarded_producer_sources(root)
+                    target = root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(
+                        (target.read_bytes() if target.exists() else b"")
+                        + b"\n"
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "reviewed V2 contract"
+                    ):
+                        preflight.verify_guarded_producer_sources(root)
+
+                    config = root / "solved.config"
+                    config.write_bytes(self.guarded_config())
+                    arguments = [
+                        root / "output", root, config, root / "qemu",
+                        root / "code", root / "vars", root / "capability",
+                        root / "capability-receipt", root / "efi",
+                        root / "build-receipt", root / "raw", root / "vhd",
+                        root / "miz", root / "git",
+                    ]
+                    provenance = self.manifest(
+                        boot_policy=preflight.GUARDED_BOOT_POLICY
+                    )["provenance"]
+                    provenance["config"] = {
+                        "name": preflight.SOLVED_CONFIG,
+                        "sha256": hashlib.sha256(
+                            self.guarded_config()
+                        ).hexdigest(),
+                        "size": len(self.guarded_config()),
+                    }
+                    with mock.patch.object(
+                        preflight, "check_blob_dependency"
+                    ), mock.patch.object(
+                        preflight, "build_provenance",
+                        return_value=provenance,
+                    ), mock.patch.object(
+                        preflight, "qemu_closure_records"
+                    ) as packaging:
+                        with self.assertRaisesRegex(
+                            ValueError, "reviewed V2 contract"
+                        ):
+                            preflight.generate_input(
+                                *arguments, preflight.GUARDED_BOOT_POLICY
+                            )
+                        packaging.assert_not_called()
+
+    def test_guarded_olddefconfig_recipe_uses_pinned_make_and_python(self):
+        readme = (SUPPORT / "azure" / "README.md").read_text()
+        start = readme.index(
+            'PERSISTENCE="$PWD/.d/private-preflight-persistence"'
+        )
+        end = readme.index(
+            'SOLVED_CONFIG="$PWD/support/apps/hyperv-acceptance/.config"',
+            start,
+        )
+        recipe = readme[start:end]
+        self.assertIn(
+            (
+                'PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:'
+                '/usr/bin:/bin"'
+            ),
+            recipe,
+        )
+        self.assertIn('-Dmake-command="$MAKE"', recipe)
+        self.assertNotIn("$LLVM_BIN:$PATH", recipe)
+        self.assertIn('exec "$GIT_RUNTIME/lib/loader"', recipe)
+        self.assertIn("--no-replace-objects", recipe)
+        self.assertIn('--git-runtime "$GIT_RUNTIME"', readme)
+        self.assertIn("canonical schema-9 manifest", readme)
+
+    def test_guarded_contract_is_derived_from_exact_solved_v2_config(self):
+        preflight.verify_guarded_producer_sources(SUPPORT.parent)
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "solved.config"
+            config.write_bytes(self.guarded_config())
+            contract = preflight.guarded_contract_from_solved_config(config)
+        self.assertEqual(
+            contract,
+            self.guarded_contract(
+                hashlib.sha256(self.guarded_config()).hexdigest()
+            ),
+        )
+        manifest = preflight.validate_input_manifest(
+            self.manifest(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        )
+        self.assertEqual(manifest["guarded"]["result"], "UNAVAILABLE")
+        self.assertEqual(manifest["guarded"]["scope"], "platform-only")
+        self.assertEqual(
+            manifest["private_build"]["receipt"]["guarded"],
+            manifest["guarded"],
+        )
+
+    def test_guarded_contract_rejects_v1_or_mismatched_configuration(self):
+        variants = []
+        for old, new in (
+            (
+                b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2",
+                b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=1",
+            ),
+            (
+                b"CONFIG_LIBSTORVSC_GUARDED_IO=y",
+                b"CONFIG_LIBSTORVSC_GUARDED_IO=n",
+            ),
+            (
+                b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0",
+                b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=256",
+            ),
+        ):
+            variants.append(self.guarded_config().replace(old, new))
+        variants.append(
+            self.guarded_config()
+            + b"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH=0\n"
+        )
+        for index, raw in enumerate(variants):
+            with self.subTest(index=index), \
+                    tempfile.TemporaryDirectory() as temporary:
+                config = Path(temporary) / "solved.config"
+                config.write_bytes(raw)
+                with self.assertRaises(ValueError):
+                    preflight.guarded_contract_from_solved_config(config)
+        value = self.manifest(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        value["guarded"]["lun"] = 1
+        with self.assertRaises(ValueError):
+            preflight.validate_input_manifest(value)
+        value = self.manifest(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        value["private_build"]["receipt"]["guarded"]["sectors"] = 2000
+        with self.assertRaises(ValueError):
+            preflight.validate_input_manifest(value)
+        value = self.manifest()
+        value["guarded"] = self.guarded_contract(
+            value["provenance"]["config"]["sha256"]
+        )
+        with self.assertRaises(ValueError):
+            preflight.validate_input_manifest(value)
+
     def test_manifest_binds_real_budget_and_keeps_efi_local(self):
         manifest = preflight.validate_input_manifest(self.manifest())
         budget = manifest["budget"]
@@ -606,7 +1030,9 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             preflight.azure.canonical_json(capability)
         ).hexdigest()
         private = preflight.host_phase_manifest(state, "private", digest)
-        self.assertEqual(capability["schema_version"], 2)
+        self.assertEqual(capability["schema_version"], 3)
+        self.assertIsNone(capability["guarded"])
+        self.assertIsNone(private["guarded"])
         self.assertEqual(private["capability_manifest_sha256"], digest)
         self.assertNotIn("efi", private["files"])
         self.assertEqual(
@@ -620,6 +1046,26 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             item[0].endswith("/qemu/share/qemu/firmware.json")
             for item in staged
         ))
+
+    def test_private_host_manifest_binds_guarded_contract_after_capability(self):
+        state = self.state(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        capability = preflight.host_phase_manifest(state, "capability")
+        digest = hashlib.sha256(
+            preflight.azure.canonical_json(capability)
+        ).hexdigest()
+        private = preflight.host_phase_manifest(state, "private", digest)
+        self.assertEqual(
+            capability["boot_policy"], "platform-unavailable-v1"
+        )
+        self.assertIsNone(capability["guarded"])
+        self.assertEqual(
+            private["boot_policy"], preflight.GUARDED_BOOT_POLICY
+        )
+        self.assertEqual(private["guarded"], state["input_manifest"]["guarded"])
+        parsed, _ = runner.parse_manifest(
+            base64_encode(private), "private"
+        )
+        self.assertEqual(parsed["guarded"], private["guarded"])
 
     def test_transfer_source_and_deadline_are_explicit(self):
         self.assertEqual(preflight.transfer_source("8.8.8.8"), "8.8.8.8/32")
@@ -674,43 +1120,310 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 )
             cloud.assert_not_called()
 
-    def test_provenance_generator_hashes_clean_git_tree_and_config(self):
+    def test_provenance_binds_physical_tree_and_rejects_concealment(self):
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary)
-            (repository / "support").mkdir()
-            config = repository / "solved.config"
+            root = Path(temporary)
+            repository = root / "repository"
+            (repository / "support").mkdir(parents=True)
+            config = root / "solved.config"
             config.write_text("CONFIG_HYPERV=y\n")
+            git_command = str(selected_git_executable())
             subprocess.run(
-                ["git", "init", "-q"], cwd=repository, check=True
+                [git_command, "init", "-q"], cwd=repository, check=True
             )
             (repository / "tracked").write_text("source\n")
+            production = repository / "lib" / "ukboot" / "boot.c"
+            production.parent.mkdir(parents=True)
+            production.write_bytes(
+                (SUPPORT.parent / "lib" / "ukboot" / "boot.c").read_bytes()
+            )
+            unusual = repository / "tracked\nname\twith-bytes"
+            unusual.write_bytes(b"binary-safe\n")
+            executable = repository / "tracked-executable"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+            link = repository / "tracked-link"
+            link.symlink_to("tracked")
             subprocess.run(
-                ["git", "add", "tracked"], cwd=repository, check=True
+                [
+                    git_command, "add", "--", "tracked",
+                    "lib/ukboot/boot.c", unusual.name,
+                    executable.name, link.name,
+                ],
+                cwd=repository, check=True,
             )
             subprocess.run(
                 [
-                    "git", "-c", "user.name=Fixture",
+                    git_command, "-c", "user.name=Fixture",
                     "-c", "user.email=fixture@example.invalid",
                     "commit", "-qm", "fixture",
                 ],
                 cwd=repository, check=True,
             )
+            git_runtime = create_git_runtime(root / "tools")
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/bin/sh\nprintf '%s' 'forged ambient git'\n"
+            )
+            fake_git.chmod(0o700)
             with mock.patch.object(
                 preflight, "SUPPORT", repository / "support"
+            ), mock.patch.dict(
+                preflight.os.environ,
+                {
+                    "PATH": str(fake_bin),
+                    "GIT_DIR": str(repository / "forged-git-dir"),
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                    "GIT_CONFIG_VALUE_0": "forged",
+                    "LD_LIBRARY_PATH": str(repository / "forged-libs"),
+                    "LD_PRELOAD": str(repository / "forged-preload.so"),
+                    "LD_DEBUG": "all",
+                    "GLIBC_TUNABLES": "glibc.rtld.dynamic_sort=1",
+                },
             ):
-                first = preflight.build_provenance(repository, config)
-                second = preflight.build_provenance(repository, config)
+                first = preflight.build_provenance(
+                    repository, config, git_runtime
+                )
+                second = preflight.build_provenance(
+                    repository, config, git_runtime
+                )
             self.assertEqual(first, second)
-            self.assertEqual(first["scheme"], "unikraft.git-ls-tree-v1")
-            self.assertEqual(first["tracked_entries"], 1)
+            self.assertEqual(
+                first["scheme"], "unikraft.git-physical-tree-v2"
+            )
+            self.assertEqual(first["tracked_entries"], 5)
+            self.assertEqual(
+                first["tracked_bytes"],
+                len(b"source\n") + production.stat().st_size
+                + len(b"binary-safe\n") + len(b"#!/bin/sh\nexit 0\n")
+                + len(b"tracked"),
+            )
+            self.assertEqual(
+                first["git"], preflight.git_runtime_record(git_runtime)
+            )
             config.write_text("CONFIG_HYPERV=n\n")
             with mock.patch.object(
                 preflight, "SUPPORT", repository / "support"
             ):
-                changed = preflight.build_provenance(repository, config)
+                changed = preflight.build_provenance(
+                    repository, config, git_runtime
+                )
             self.assertNotEqual(
                 first["config"]["sha256"], changed["config"]["sha256"]
             )
+
+            with mock.patch.object(
+                preflight, "SUPPORT", repository / "support"
+            ):
+                tree = preflight.parse_git_tree(preflight.git_output(
+                    git_runtime, repository,
+                    ["ls-tree", "-r", "--full-tree", "-z", "HEAD"],
+                ))
+                executable.chmod(0o644)
+                with self.assertRaisesRegex(ValueError, "mode changed"):
+                    preflight.verify_physical_git_tree(repository, tree)
+                executable.chmod(0o755)
+                link.unlink()
+                link.write_bytes(b"tracked")
+                with self.assertRaisesRegex(ValueError, "symlink type"):
+                    preflight.verify_physical_git_tree(repository, tree)
+                link.unlink()
+                link.symlink_to("tracked")
+
+            original_production = production.read_bytes()
+            subprocess.run(
+                [
+                    git_command, "update-index", "--assume-unchanged",
+                    "--", "lib/ukboot/boot.c",
+                ],
+                cwd=repository, check=True,
+            )
+            production.write_bytes(original_production + b"\nconcealed\n")
+            with mock.patch.object(
+                preflight, "SUPPORT", repository / "support"
+            ):
+                tree = preflight.parse_git_tree(preflight.git_output(
+                    git_runtime, repository,
+                    ["ls-tree", "-r", "--full-tree", "-z", "HEAD"],
+                ))
+                with self.assertRaisesRegex(
+                    ValueError, "Physical tracked source"
+                ):
+                    preflight.verify_physical_git_tree(repository, tree)
+                with self.assertRaisesRegex(
+                    ValueError, "concealment flags"
+                ):
+                    preflight.build_provenance(
+                        repository, config, git_runtime
+                    )
+            production.write_bytes(original_production)
+            subprocess.run(
+                [
+                    git_command, "update-index", "--no-assume-unchanged",
+                    "--", "lib/ukboot/boot.c",
+                ],
+                cwd=repository, check=True,
+            )
+
+            subprocess.run(
+                [
+                    git_command, "update-index", "--skip-worktree",
+                    "--", "lib/ukboot/boot.c",
+                ],
+                cwd=repository, check=True,
+            )
+            production.write_bytes(original_production + b"\nskipped\n")
+            with mock.patch.object(
+                preflight, "SUPPORT", repository / "support"
+            ), self.assertRaisesRegex(ValueError, "concealment flags"):
+                preflight.build_provenance(
+                    repository, config, git_runtime
+                )
+            production.write_bytes(original_production)
+            subprocess.run(
+                [
+                    git_command, "update-index", "--no-skip-worktree",
+                    "--", "lib/ukboot/boot.c",
+                ],
+                cwd=repository, check=True,
+            )
+
+            original_head = subprocess.run(
+                [git_command, "rev-parse", "HEAD"],
+                cwd=repository, check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            production.write_bytes(original_production + b"\nreplacement\n")
+            subprocess.run(
+                [git_command, "add", "--", "lib/ukboot/boot.c"],
+                cwd=repository, check=True,
+            )
+            subprocess.run(
+                [
+                    git_command, "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid",
+                    "commit", "-qm", "replacement",
+                ],
+                cwd=repository, check=True,
+            )
+            replacement = subprocess.run(
+                [git_command, "rev-parse", "HEAD"],
+                cwd=repository, check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [git_command, "reset", "--hard", "-q", original_head],
+                cwd=repository, check=True,
+            )
+            subprocess.run(
+                [git_command, "replace", original_head, replacement],
+                cwd=repository, check=True,
+            )
+            with mock.patch.object(
+                preflight, "SUPPORT", repository / "support"
+            ), self.assertRaisesRegex(ValueError, "replacement refs"):
+                preflight.build_provenance(
+                    repository, config, git_runtime
+                )
+
+    def test_private_build_rejects_unbound_git_launcher_before_native_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = create_git_runtime(root / "launcher-tools")
+            shutil.copy2(
+                Path(shutil.which("true")).resolve(),
+                runtime / preflight.GIT_EXECUTABLE,
+            )
+            with mock.patch.object(
+                preflight, "build_provenance"
+            ) as provenance:
+                with self.assertRaisesRegex(
+                    ValueError, "dependency closure"
+                ):
+                    preflight.build_private_image(
+                        root / "output", root, root / "config",
+                        root / "zig", root / "make", root / "python",
+                        root / "bison", root / "flex", root / "m4",
+                        root / "bison-data", root / "llvm", runtime, 30,
+                    )
+                provenance.assert_not_called()
+            ambient_name = shutil.which("git")
+            if ambient_name is not None:
+                ambient = Path(ambient_name).resolve()
+                configuration = (
+                    ambient.parent / "trampoline_configuration" / "git.json"
+                )
+            else:
+                configuration = None
+            if configuration is not None and configuration.is_file():
+                pixi_runtime = root / "pixi-runtime"
+                (pixi_runtime / "bin").mkdir(parents=True)
+                shutil.copy2(
+                    ambient, pixi_runtime / preflight.GIT_EXECUTABLE
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "requires bin/git"
+                ):
+                    preflight.copy_git_runtime(
+                        pixi_runtime, root / "copied-pixi-runtime"
+                    )
+
+    def test_git_runtime_requires_complete_exact_relocated_dependency_closure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = create_git_runtime(root / "valid")
+            expected = preflight.preflight_git_runtime(runtime)
+            preferred = (
+                runtime / "lib" / "libz.so.1"
+                if (runtime / "lib" / "libz.so.1").is_file()
+                else runtime / expected["libraries"][0]["name"]
+            )
+            missing_targets = [
+                runtime / "lib" / name
+                for name in ("libz.so.1", "libcrypto.so.3")
+                if (runtime / "lib" / name).is_file()
+            ] or [preferred]
+            for index, missing_target in enumerate(missing_targets):
+                with self.subTest(missing=missing_target.name):
+                    missing = root / f"missing-{index}"
+                    shutil.copytree(runtime, missing)
+                    (
+                        missing / missing_target.relative_to(runtime)
+                    ).unlink()
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "ambient dependency|closure is incomplete",
+                    ):
+                        preflight.preflight_git_runtime(missing)
+
+            changed = root / "changed"
+            shutil.copytree(runtime, changed)
+            target = changed / preferred.relative_to(runtime)
+            target.write_bytes(target.read_bytes() + b"\0")
+            with self.assertRaisesRegex(ValueError, "differs"):
+                preflight.copy_git_runtime(
+                    changed, root / "changed-copy", expected
+                )
+
+            extra = root / "extra"
+            shutil.copytree(runtime, extra)
+            shutil.copy2(
+                extra / expected["libraries"][0]["name"],
+                extra / "lib" / "unresolved-extra.so",
+            )
+            with self.assertRaisesRegex(ValueError, "closure is incomplete"):
+                preflight.preflight_git_runtime(extra)
+
+            linked = root / "linked"
+            shutil.copytree(runtime, linked)
+            target = linked / preferred.relative_to(runtime)
+            target.unlink()
+            target.symlink_to(
+                runtime / preferred.relative_to(runtime)
+            )
+            with self.assertRaisesRegex(ValueError, "must not contain symlinks"):
+                preflight.preflight_git_runtime(linked)
 
     def test_generate_input_creates_complete_canonical_operator_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -720,15 +1433,16 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             config = repository / "solved.config"
             config.write_text("CONFIG_HYPERV=y\n")
             (repository / "tracked").write_text("source\n")
+            git_command = str(selected_git_executable())
             subprocess.run(
-                ["git", "init", "-q"], cwd=repository, check=True
+                [git_command, "init", "-q"], cwd=repository, check=True
             )
             subprocess.run(
-                ["git", "add", "tracked"], cwd=repository, check=True
+                [git_command, "add", "tracked"], cwd=repository, check=True
             )
             subprocess.run(
                 [
-                    "git", "-c", "user.name=Fixture",
+                    git_command, "-c", "user.name=Fixture",
                     "-c", "user.email=fixture@example.invalid",
                     "commit", "-qm", "fixture",
                 ],
@@ -749,6 +1463,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 assets[name] = root / name
                 assets[name].write_bytes(content)
             assets["miz"].chmod(0o700)
+            git_runtime = create_git_runtime(root / "git-tools")
             output = root / "input"
 
             def packaging(_miz, _arguments, _log, **_kwargs):
@@ -765,6 +1480,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     ).hexdigest(),
                     "size": config.stat().st_size,
                 },
+                "git": preflight.git_runtime_record(git_runtime),
             }
             capability = capability_reference({
                 "sha256": hashlib.sha256(b"c" * 1024).hexdigest(),
@@ -809,8 +1525,33 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     assets["code"], assets["vars"], assets["capability"],
                     capability_path, assets["efi"], build_path,
                     assets["raw"], assets["vhd"],
-                    assets["miz"], "platform-unavailable-v1",
+                    assets["miz"], git_runtime,
+                    "platform-unavailable-v1",
                 )
+                state_directory = root / "state"
+                preflight.prepare(
+                    output, state_directory, assets["miz"], digest
+                )
+                state, _ = preflight.load_state(state_directory)
+                preflight.verify_immutable_inputs(state, state_directory)
+                prepared_runtime = (
+                    state_directory / "local-tools"
+                    / preflight.GIT_RUNTIME
+                )
+                self.assertEqual(
+                    preflight.git_runtime_record(prepared_runtime),
+                    provenance["git"],
+                )
+                (
+                    prepared_runtime
+                    / provenance["git"]["libraries"][0]["name"]
+                ).unlink()
+                with self.assertRaisesRegex(
+                    ValueError, "ambient dependency|Prepared source"
+                ):
+                    preflight.verify_immutable_inputs(
+                        state, state_directory
+                    )
             manifest_bytes = (
                 output / preflight.INPUT_MANIFEST
             ).read_bytes()
@@ -825,6 +1566,10 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     preflight.SOLVED_CONFIG,
                     preflight.CAPABILITY_REFERENCE,
                     preflight.PRIVATE_BUILD_RECEIPT,
+                    *{
+                        str(path.relative_to(git_runtime.parent))
+                        for path in git_runtime.rglob("*") if path.is_file()
+                    },
                     "qemu/bin/qemu-system-x86_64",
                     "qemu/share/firmware.json",
                     "OVMF_CODE.fd", "OVMF_VARS.fd", "capability.raw",
@@ -832,22 +1577,75 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 },
             )
 
+    def test_generate_input_rejects_config_policy_mismatch_before_packaging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ordinary = root / "ordinary.config"
+            ordinary.write_text("CONFIG_PLAT_HYPERV=y\n")
+            guarded = root / "guarded.config"
+            guarded.write_bytes(self.guarded_config())
+            provenance = self.manifest()["provenance"]
+            arguments = [
+                root / "output", root, ordinary, root / "qemu",
+                root / "code", root / "vars", root / "capability",
+                root / "capability-receipt", root / "efi",
+                root / "build-receipt", root / "raw", root / "vhd",
+                root / "miz", root / "git",
+            ]
+            with mock.patch.object(
+                preflight, "check_blob_dependency"
+            ), mock.patch.object(
+                preflight, "build_provenance",
+                return_value=provenance,
+            ), mock.patch.object(
+                preflight, "qemu_closure_records"
+            ) as packaging:
+                with self.assertRaises(ValueError):
+                    preflight.generate_input(
+                        *arguments, preflight.GUARDED_BOOT_POLICY
+                    )
+                packaging.assert_not_called()
+            arguments[2] = guarded
+            with mock.patch.object(
+                preflight, "check_blob_dependency"
+            ), mock.patch.object(
+                preflight, "build_provenance",
+                return_value=provenance,
+            ), mock.patch.object(
+                preflight, "verify_guarded_producer_sources"
+            ), mock.patch.object(
+                preflight, "qemu_closure_records"
+            ) as packaging:
+                with self.assertRaises(ValueError):
+                    preflight.generate_input(
+                        *arguments, "platform-unavailable-v1"
+                    )
+                packaging.assert_not_called()
+
     def test_local_build_action_emits_causal_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             repository = root / "repository"
             support = repository / "support"
             (support / "apps" / "hyperv-acceptance").mkdir(parents=True)
+            native_runner = support / "build" / "native-postprocess-runner.py"
+            native_runner.parent.mkdir(parents=True)
+            native_runner.write_text("raise SystemExit(0)\n")
+            uk_reloc = support / "scripts" / "mkukreloc.py"
+            uk_reloc.parent.mkdir(parents=True)
+            uk_reloc.write_text("raise SystemExit(0)\n")
             (repository / "tracked").write_text("source\n")
+            git_command = str(selected_git_executable())
             subprocess.run(
-                ["git", "init", "-q"], cwd=repository, check=True
+                [git_command, "init", "-q"], cwd=repository, check=True
             )
             subprocess.run(
-                ["git", "add", "tracked"], cwd=repository, check=True
+                [git_command, "add", "tracked", "support"],
+                cwd=repository, check=True,
             )
             subprocess.run(
                 [
-                    "git", "-c", "user.name=Fixture",
+                    git_command, "-c", "user.name=Fixture",
                     "-c", "user.email=fixture@example.invalid",
                     "commit", "-qm", "fixture",
                 ],
@@ -857,16 +1655,41 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             config.write_text("CONFIG_PLAT_HYPERV=y\n")
             tools = root / "tools"
             tools.mkdir()
-            zig = tools / "zig"
-            zig.write_text(
+            zig_target = tools / "zig-real"
+            invoked = tools / "zig-invoked"
+            invoked_args = tools / "zig-invoked-args"
+            zig_target.write_text(
                 "#!/bin/sh\nset -eu\nout=''\n"
+                f"printf '%s' \"$0\" > {invoked}\n"
+                f"printf '%s\\n' \"$@\" > {invoked_args}\n"
                 "for arg in \"$@\"; do\n"
                 " case \"$arg\" in -Doutput=*) out=${arg#-Doutput=};; esac\n"
                 "done\n"
+                "marker=\"$ZIG_LOCAL_CACHE_DIR/materialized\"\n"
+                "if test ! -e \"$marker\"; then\n"
+                " input=\"$ZIG_LOCAL_CACHE_DIR/o/111/"
+                "hyperv-validated-final.dbg\"\n"
+                " output=\"$ZIG_LOCAL_CACHE_DIR/o/222/"
+                f"{preflight.NATIVE_EFI_NAME}.dbg\"\n"
+                " reloc=\"$output.uk_reloc.bin\"\n"
+                " mkdir -p \"${input%/*}\" \"${output%/*}\"\n"
+                " printf input > \"$input\"\n"
+                " printf output > \"$output\"\n"
+                " printf reloc > \"$reloc\"\n"
+                " : > \"$marker\"\n"
+                " printf '%s\\n' 'failed command: PYTHON=python3 python3 "
+                f"{native_runner} uk-reloc --script {uk_reloc} "
+                "--nm llvm-nm --readelf llvm-readelf "
+                "--objcopy llvm-objcopy '"
+                "\"$input\"' '\"$reloc\"' '\"$output\"\n"
+                " exit 0\n"
+                "fi\n"
                 "test -n \"$out\"\nmkdir -p \"$out\"\n"
                 f"printf efi > \"$out/{preflight.NATIVE_EFI_NAME}\"\n"
             )
-            zig.chmod(0o700)
+            zig_target.chmod(0o700)
+            zig = tools / "zig"
+            zig.symlink_to(zig_target)
             paths = {"zig": zig}
             for name in ("make", "python", "bison", "flex", "m4"):
                 path = tools / name
@@ -886,14 +1709,24 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             bison_data.mkdir()
             (bison_data / "skeleton").write_text("data\n")
             output = root / "build-result"
-            with mock.patch.object(preflight, "SUPPORT", support):
+            git_runtime = create_git_runtime(root / "git-tools")
+            with mock.patch.object(
+                preflight, "SUPPORT", support
+            ), mock.patch.object(
+                preflight, "NATIVE_POSTPROCESS_RUNNER_PATH", native_runner
+            ), mock.patch.object(
+                preflight, "UK_RELOC_SCRIPT_PATH", uk_reloc
+            ):
                 receipt_path, efi_path = preflight.build_private_image(
                     output, repository, config, paths["zig"],
                     paths["make"], paths["python"], paths["bison"],
-                    paths["flex"], paths["m4"], bison_data, llvm, 30,
+                    paths["flex"], paths["m4"], bison_data, llvm,
+                    git_runtime,
+                    30,
                 )
                 provenance = preflight.build_provenance(
-                    repository, output / preflight.SOLVED_CONFIG
+                    repository, output / preflight.SOLVED_CONFIG,
+                    output / preflight.GIT_RUNTIME,
                 )
             receipt = preflight.load_receipt(
                 receipt_path, preflight.PRIVATE_BUILD_RECEIPT,
@@ -912,6 +1745,122 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 validated["receipt"]["source_before"],
                 validated["receipt"]["source_after"],
             )
+            self.assertEqual(invoked.read_text(), str(zig.absolute()))
+            self.assertIn("-j2", invoked_args.read_text().splitlines())
+            self.assertEqual(
+                validated["receipt"]["invocation"][
+                    "materialization_returncode"
+                ],
+                0,
+            )
+            self.assertEqual(
+                validated["receipt"]["invocation"]["recovery"],
+                "uk-reloc-v1",
+            )
+            self.assertEqual(
+                validated["receipt"]["invocation"][
+                    "recovery_returncode"
+                ],
+                0,
+            )
+            self.assertEqual(
+                validated["receipt"]["invocation"][
+                    "verification_returncode"
+                ],
+                0,
+            )
+            self.assertEqual(
+                validated["receipt"]["tools"]["git"],
+                preflight.git_runtime_record(git_runtime),
+            )
+            unrelated_git = copy.deepcopy(receipt)
+            unrelated_git["receipt"]["tools"]["git"]["sha256"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "Git runtime"):
+                preflight.validate_private_build(
+                    unrelated_git, provenance, {
+                        "name": preflight.INPUT_NAMES["efi"],
+                        "sha256": hashlib.sha256(b"efi").hexdigest(),
+                        "size": 3,
+                    },
+                )
+            self.assertIn(
+                f"exec {zig.absolute()} \"$@\"",
+                (output / ".tool-bin" / "zig").read_text(),
+            )
+            self.assertIn(
+                str(output / preflight.GIT_RUNTIME / preflight.GIT_EXECUTABLE),
+                (output / ".tool-bin" / "git").read_text(),
+            )
+            self.assertIn(
+                str(output / preflight.GIT_RUNTIME / preflight.GIT_LOADER),
+                (output / ".tool-bin" / "git").read_text(),
+            )
+            self.assertIn(
+                "--no-replace-objects",
+                (output / ".tool-bin" / "git").read_text(),
+            )
+
+            script = zig_target.read_text()
+            variants = {
+                "verification-failure": script.replace(
+                    'test -n "$out"\n',
+                    "printf '%s\\n' 'failed command: unrelated "
+                    "verification failure'\n"
+                    'test -n "$out"\n',
+                ),
+                "hidden-materialization-failure": script.replace(
+                    ' : > "$marker"\n',
+                    ' : > "$marker"\n'
+                    " printf '%s\\n' 'failed command: unrelated "
+                    "materialization failure'\n"
+                    " i=0\n"
+                    " while test \"$i\" -lt 5000; do\n"
+                    "  printf '%064d\\n' \"$i\"\n"
+                    "  i=$((i + 1))\n"
+                    " done\n",
+                ),
+                "nonzero-materialization": script.replace(
+                    " exit 0\nfi\n", " exit 1\nfi\n", 1
+                ),
+                "ambiguous-materialization": script.replace(
+                    ' : > "$marker"\n',
+                    ' : > "$marker"\n'
+                    " printf '%s\\n' 'prefix failed command: unrelated'\n",
+                ),
+                "oversized-materialization": script.replace(
+                    ' : > "$marker"\n',
+                    ' : > "$marker"\n'
+                    " i=0\n"
+                    " while test \"$i\" -lt 140000; do\n"
+                    "  printf '%064d\\n' \"$i\"\n"
+                    "  i=$((i + 1))\n"
+                    " done\n",
+                ),
+            }
+            for name, changed_script in variants.items():
+                with self.subTest(name=name):
+                    zig_target.write_text(changed_script)
+                    rejected_output = root / ("rejected-" + name)
+                    with mock.patch.object(
+                        preflight, "SUPPORT", support
+                    ), mock.patch.object(
+                        preflight,
+                        "NATIVE_POSTPROCESS_RUNNER_PATH",
+                        native_runner,
+                    ), mock.patch.object(
+                        preflight, "UK_RELOC_SCRIPT_PATH", uk_reloc
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "failed|failure|exceeded"
+                        ):
+                            preflight.build_private_image(
+                                rejected_output, repository, config,
+                                paths["zig"], paths["make"],
+                                paths["python"], paths["bison"],
+                                paths["flex"], paths["m4"], bison_data,
+                                llvm, git_runtime, 30,
+                            )
+            zig_target.write_text(script)
 
 
 class PrivatePreflightRunnerTest(PrivatePreflightFixture):
@@ -932,6 +1881,28 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
             lines.append(runner.LEGACY_APIC_MARKER)
         if extra:
             lines.append(extra)
+        lines.append(
+            "[    0.100000] Info: [libukboot] "
+            f"<boot.c @  523> main returned {main_return}"
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def guarded_boot_log(records=None, main_return=2, legacy=False, extra=()):
+        records = (
+            GUARDED_PRODUCER_RECORDS.read_text().splitlines()
+            if records is None else list(records)
+        )
+        lines = [
+            "Hyper-V Hv#1 hypercall page enabled",
+            "Hyper-V SynIC:",
+            "Powered by",
+            "Calling main(",
+            *records,
+        ]
+        if legacy:
+            lines.append(runner.LEGACY_APIC_MARKER)
+        lines.extend(extra)
         lines.append(
             "[    0.100000] Info: [libukboot] "
             f"<boot.c @  523> main returned {main_return}"
@@ -1015,6 +1986,54 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
                 "platform-unavailable-v1", "raw-x2apic", False, root,
             )
 
+    def run_fake_guarded_boot(self, extra=None):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            qemu = root / "qemu" / "bin" / "qemu-system-x86_64"
+            qemu.parent.mkdir(parents=True)
+            lines = [
+                "Hyper-V Hv#1 hypercall page enabled",
+                "Hyper-V SynIC:",
+                "Powered by",
+                "Calling main(",
+                *GUARDED_PRODUCER_RECORDS.read_text().splitlines(),
+            ]
+            if extra is not None:
+                lines.append(extra)
+            lines.append(
+                "[ 0.1] Info: [libukboot] <boot.c @ 523> main returned 2"
+            )
+            qemu.write_text(
+                "#!/bin/sh\n"
+                + "\n".join("printf '%s\\n' " + repr(line) for line in lines)
+                + "\n"
+            )
+            qemu.chmod(0o700)
+            code = root / "code"
+            variables = root / "vars"
+            image = root / "image"
+            code.write_bytes(b"code")
+            variables.write_bytes(b"vars")
+            image.write_bytes(b"image")
+
+            def record(path, name):
+                return {
+                    "blob": "unused",
+                    "name": name,
+                    "size": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+
+            return runner.run_boot(
+                qemu, code, record(code, "OVMF_CODE.fd"),
+                variables, record(variables, "OVMF_VARS.fd"),
+                image, record(image, "image"), image.stat().st_size,
+                preflight.GUARDED_BOOT_POLICY, "raw-x2apic", False, root,
+                self.guarded_contract(
+                    hashlib.sha256(self.guarded_config()).hexdigest()
+                ),
+            )
+
     def test_boot_reuses_readonly_code_and_copies_only_variables(self):
         original = runner.shutil.copyfile
         copies = []
@@ -1051,9 +2070,144 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
                         text, "platform-unavailable-v1", False
                     )
 
+    def test_guarded_v2_accepts_only_authentic_pristine_unavailable_records(self):
+        contract = self.guarded_contract(
+            hashlib.sha256(self.guarded_config()).hexdigest()
+        )
+        runner.validate_boot_log(
+            self.guarded_boot_log(), preflight.GUARDED_BOOT_POLICY,
+            False, contract,
+        )
+        runner.validate_boot_log(
+            self.guarded_boot_log(legacy=True),
+            preflight.GUARDED_BOOT_POLICY, True, contract,
+        )
+        self.assertEqual(
+            GUARDED_PRODUCER_RECORDS.read_text().splitlines(),
+            [
+                (
+                    "HYPERV_PERSISTENCE START PASS "
+                    "run=00112233445566778899aabbccddeeff "
+                    "address=0:0:0 sectors=1000 sector_size=512"
+                ),
+                (
+                    "HYPERV_PERSISTENCE SELECT UNAVAILABLE "
+                    "reason=no-devices writes=0 flushes=0"
+                ),
+                runner.PLATFORM_MARKER,
+                "UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices",
+            ],
+        )
+
+    def test_guarded_v2_rejects_wrong_or_additional_persistence_activity(self):
+        contract = self.guarded_contract(
+            hashlib.sha256(self.guarded_config()).hexdigest()
+        )
+        authentic = GUARDED_PRODUCER_RECORDS.read_text().splitlines()
+        variants = {
+            "missing": authentic[:-1],
+            "duplicate": authentic + [authentic[-1]],
+            "reordered": [authentic[0], authentic[2], authentic[1], authentic[3]],
+            "wrong-run": [
+                authentic[0].replace(contract["run_id"], "f" * 32),
+                *authentic[1:],
+            ],
+            "wrong-lun": [
+                authentic[0].replace("address=0:0:0", "address=0:0:1"),
+                *authentic[1:],
+            ],
+            "wrong-geometry": [
+                authentic[0].replace("sectors=1000", "sectors=999"),
+                *authentic[1:],
+            ],
+            "wrong-protocol": [
+                *authentic[:-1],
+                "UK_HYPERV_PERSISTENCE_UNAVAILABLE:2:2:no-devices",
+            ],
+            "wrong-policy": [
+                *authentic[:-1],
+                "UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:1:no-devices",
+            ],
+            "wrong-reason": [
+                authentic[0],
+                authentic[1].replace("no-devices", "discovery-failed"),
+                authentic[2],
+                authentic[3].replace("no-devices", "discovery-failed"),
+            ],
+            "old-fail": [
+                authentic[0],
+                "HYPERV_PERSISTENCE SELECT FAIL rc=-2 writes=0",
+            ],
+            "final-pass": authentic + [
+                "HYPERV_PERSISTENCE FINAL PASS rc=0"
+            ],
+            "final-fail": authentic + [
+                "HYPERV_PERSISTENCE FINAL FAIL rc=-2"
+            ],
+            "identity": authentic + [
+                "UK_HYPERV_PERSISTENCE_IDENTITY:1:2:synthetic"
+            ],
+            "boot1": authentic + [
+                "UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:synthetic"
+            ],
+            "boot2": authentic + [
+                "UK_HYPERV_PERSISTENCE_BOOT2_COMPLETE:synthetic"
+            ],
+            "write": authentic + [
+                "HYPERV_PERSISTENCE BOOT1_WRITE PASS run="
+                + contract["run_id"]
+            ],
+            "read": authentic + [
+                "HYPERV_PERSISTENCE BOOT2_READ PASS run="
+                + contract["run_id"]
+            ],
+            "flush": authentic + [
+                "HYPERV_PERSISTENCE FLUSH PASS writes=0 flushes=1"
+            ],
+            "wrong-seed": authentic + [
+                "HYPERV_PERSISTENCE CANDIDATE_REJECT PASS "
+                "reason=boot-signature id=0"
+            ],
+            "receipt": authentic + [
+                "UK_HYPERV_PERSISTENCE_RECEIPT:synthetic"
+            ],
+            "ordinary-acceptance": authentic + [
+                runner.UNAVAILABLE_RECORDS[0]
+            ],
+            "live-io": authentic + ["UK_HYPERV_IO_READY"],
+            "prefixed-diagnostic": authentic + [
+                "diagnostic HYPERV_PERSISTENCE FINAL PASS rc=0"
+            ],
+        }
+        for description, records in variants.items():
+            with self.subTest(description=description):
+                with self.assertRaises(runner.RunnerError):
+                    runner.validate_boot_log(
+                        self.guarded_boot_log(records),
+                        preflight.GUARDED_BOOT_POLICY, False, contract,
+                    )
+        with self.assertRaises(runner.RunnerError):
+            runner.validate_boot_log(
+                self.guarded_boot_log(main_return=1),
+                preflight.GUARDED_BOOT_POLICY, False, contract,
+            )
+        with self.assertRaises(runner.RunnerError):
+            runner.validate_boot_log(
+                self.guarded_boot_log(),
+                preflight.GUARDED_BOOT_POLICY, False, None,
+            )
+
     def test_actual_qemu_process_uses_readonly_footer_mask_and_passes(self):
         result, _ = self.run_fake_boot("pass")
         self.assertEqual(result["result"], "PASS")
+
+    def test_actual_runner_path_enforces_guarded_platform_only_outcome(self):
+        result, _ = self.run_fake_guarded_boot()
+        self.assertEqual(result["result"], "PASS")
+        with self.assertRaises(runner.RunnerError):
+            self.run_fake_guarded_boot(
+                "HYPERV_PERSISTENCE FINAL PASS rc=0"
+            )
 
     def test_actual_qemu_mutation_cannot_forge_pass(self):
         with self.assertRaisesRegex(runner.RunnerError, "mutated"):
@@ -1121,6 +2275,407 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
         changed["qemu_support"][0]["blob"] += "/foreign"
         with self.assertRaisesRegex(runner.RunnerError, "qemu-support"):
             runner.parse_manifest(base64_encode(changed), "capability")
+        state = self.state(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        capability = preflight.host_phase_manifest(state, "capability")
+        private = preflight.host_phase_manifest(
+            state, "private",
+            hashlib.sha256(
+                preflight.azure.canonical_json(capability)
+            ).hexdigest(),
+        )
+        for mutate in (
+            lambda value: value["guarded"].__setitem__("protocol", 2),
+            lambda value: value["guarded"].__setitem__("scope", "storage"),
+            lambda value: value["guarded"]["producer"]["files"].__setitem__(
+                "support/apps/hyperv-acceptance/persistence.c", "f" * 64
+            ),
+            lambda value: value.__setitem__(
+                "boot_policy", "platform-unavailable-v1"
+            ),
+        ):
+            changed = json.loads(json.dumps(private))
+            mutate(changed)
+            with self.assertRaises(runner.RunnerError):
+                runner.parse_manifest(base64_encode(changed), "private")
+
+
+class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
+    @staticmethod
+    def host_receipt(state, phase, manifest, logs):
+        formats = ("capability",) if phase == "capability" else ("raw", "vhd")
+        return {
+            "schema": runner.EVIDENCE_SCHEMA,
+            "schema_version": 2,
+            "phase": phase,
+            "identity": state["identity"],
+            "result": "PASS",
+            "manifest_sha256": hashlib.sha256(
+                preflight.azure.canonical_json(manifest)
+            ).hexdigest(),
+            "runner_sha256": state["implementation"]["files"]["runner"][
+                "sha256"
+            ],
+            "host_boot_id": "66666666-6666-4666-8666-666666666666",
+            "boot_policy": (
+                "platform-unavailable-v1"
+                if phase == "capability"
+                else preflight.GUARDED_BOOT_POLICY
+            ),
+            "acceptance_scope": "platform-only",
+            "storage_result": (
+                "NOT_EVALUATED" if phase == "capability" else "UNAVAILABLE"
+            ),
+            "boots": {
+                image_format: {
+                    mode: {
+                        "result": "PASS",
+                        "log_sha256": hashlib.sha256(
+                            logs[f"{image_format}-{mode}.log"]
+                        ).hexdigest(),
+                        "return_code": 0,
+                    }
+                    for mode in ("x2apic", "legacy-apic")
+                }
+                for image_format in formats
+            },
+        }
+
+    def completed_handoff(self, root):
+        root.mkdir(mode=0o700)
+        state = self.state(boot_policy=preflight.GUARDED_BOOT_POLICY)
+        state.update({
+            "phase": "complete",
+            "subscription": "11111111-2222-3333-4444-555555555555",
+            "cloud_preflight": {
+                "subscription": "11111111-2222-3333-4444-555555555555",
+                "sku": {},
+                "image": {
+                    "publisher": "Canonical",
+                    "offer": "ubuntu-24_04-lts",
+                    "sku": "server",
+                    "version": "24.04.202609010",
+                    "urn": (
+                        "Canonical:ubuntu-24_04-lts:"
+                        "server:24.04.202609010"
+                    ),
+                    "architecture": "x64",
+                    "hyperv_generation": "V2",
+                },
+            },
+            "deadline_monotonic": time.monotonic() + 3600,
+            "deadline_utc": "2026-09-09T16:00:00Z",
+            "storage_account": "ukhvp1234567890abcd",
+            "firewall_obligation": None,
+            "resource_group_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg"
+            ),
+            "host_vm_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Compute/virtualMachines/"
+                "uk-hvp-123456789abc-host"
+            ),
+            "host_disk_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Compute/disks/"
+                "uk-hvp-123456789abc-host-os"
+            ),
+            "host_nic_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Network/networkInterfaces/"
+                "uk-hvp-123456789abc-host-nic"
+            ),
+            "storage_account_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Storage/storageAccounts/ukhvp1234567890abcd"
+            ),
+            "shutdown_schedule_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.DevTestLab/schedules/"
+                "shutdown-computevm-uk-hvp-123456789abc-host"
+            ),
+            "host_deployment": {
+                "phase": "resources-verified",
+                "operation_id": "22222222-2222-4222-8222-222222222222",
+                "deployment_id": (
+                    "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                    "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                    "Microsoft.Resources/deployments/uk-hvp-123456789abc-host"
+                ),
+                "correlation_id": (
+                    "33333333-3333-4333-8333-333333333333"
+                ),
+                "vm_id": (
+                    "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                    "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                    "Microsoft.Compute/virtualMachines/"
+                    "uk-hvp-123456789abc-host"
+                ),
+                "vm_uuid": "44444444-4444-4444-8444-444444444444",
+                "disk_id": (
+                    "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                    "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                    "Microsoft.Compute/disks/"
+                    "uk-hvp-123456789abc-host-os"
+                ),
+                "disk_uuid": "55555555-5555-4555-8555-555555555555",
+                "shutdown_time": "1600",
+            },
+            "staged_input_bytes": state["input_manifest"]["budget"][
+                "remote_input_bytes"
+            ],
+            "control_payload_bytes": 4096,
+            "pending_secret_files": [],
+            "cleanup_required": False,
+            "active_sas": False,
+            "active_sas_signing_key_sha256": None,
+            "host_deallocated": True,
+        })
+        capability_manifest = preflight.host_phase_manifest(
+            state, "capability"
+        )
+        capability_manifest_sha256 = hashlib.sha256(
+            preflight.azure.canonical_json(capability_manifest)
+        ).hexdigest()
+        private_manifest = preflight.host_phase_manifest(
+            state, "private", capability_manifest_sha256
+        )
+        state["capability_manifest_sha256"] = capability_manifest_sha256
+        state["private_manifest_sha256"] = hashlib.sha256(
+            preflight.azure.canonical_json(private_manifest)
+        ).hexdigest()
+
+        capability_logs = {
+            f"capability-{mode}.log": (
+                PrivatePreflightRunnerTest.boot_log(
+                    legacy=mode == "legacy-apic"
+                ).encode()
+            )
+            for mode in ("x2apic", "legacy-apic")
+        }
+        private_logs = {
+            f"{image_format}-{mode}.log": (
+                PrivatePreflightRunnerTest.guarded_boot_log(
+                    legacy=mode == "legacy-apic"
+                ).encode()
+            )
+            for image_format in ("raw", "vhd")
+            for mode in ("x2apic", "legacy-apic")
+        }
+        receipts = {}
+        evidence_bytes = 0
+        for phase, manifest, logs in (
+            ("capability", capability_manifest, capability_logs),
+            ("private", private_manifest, private_logs),
+        ):
+            directory = root / "evidence" / phase
+            directory.mkdir(mode=0o700, parents=True)
+            for name, raw in logs.items():
+                preflight.save_private_bytes(directory / name, raw)
+                evidence_bytes += len(raw)
+            receipt = self.host_receipt(state, phase, manifest, logs)
+            receipt_bytes = preflight.azure.canonical_json(receipt)
+            preflight.save_private_bytes(
+                directory / "receipt.json", receipt_bytes
+            )
+            evidence_bytes += len(receipt_bytes)
+            digest = hashlib.sha256(receipt_bytes).hexdigest()
+            state[phase + "_receipt_sha256"] = digest
+            receipts[phase] = receipt
+        state["evidence_bytes"] = evidence_bytes
+
+        manifest = state["input_manifest"]
+        final = {
+            "schema": preflight.RECEIPT_SCHEMA,
+            "schema_version": preflight.RECEIPT_SCHEMA_VERSION,
+            "result": "PASS",
+            "identity": state["identity"],
+            "input_manifest_sha256": state["manifest_sha256"],
+            "implementation": json.loads(json.dumps(state["implementation"])),
+            "provenance": json.loads(json.dumps(manifest["provenance"])),
+            "capability_reference": json.loads(json.dumps(
+                manifest["capability_reference"]
+            )),
+            "private_build": json.loads(json.dumps(
+                manifest["private_build"]
+            )),
+            "inputs": {
+                role: {
+                    "sha256": record["sha256"],
+                    "size": record["size"],
+                }
+                for role, record in manifest["files"].items()
+            },
+            "qemu_support": json.loads(json.dumps(manifest["qemu_support"])),
+            "miz": json.loads(json.dumps(manifest["miz"])),
+            "packaging": json.loads(json.dumps(manifest["packaging"])),
+            "budget": {
+                **manifest["budget"],
+                "staged_input_bytes": state["staged_input_bytes"],
+                "control_payload_bytes": state["control_payload_bytes"],
+                "evidence_bytes": state["evidence_bytes"],
+            },
+            "host_image": json.loads(json.dumps(
+                state["cloud_preflight"]["image"]
+            )),
+            "host": {
+                "operation_id": state["host_deployment"]["operation_id"],
+                "deployment_correlation_id": state["host_deployment"][
+                    "correlation_id"
+                ],
+                "vm_uuid": state["host_deployment"]["vm_uuid"],
+                "disk_uuid": state["host_deployment"]["disk_uuid"],
+                "boot_id": receipts["private"]["host_boot_id"],
+            },
+            "capability_receipt_sha256": state[
+                "capability_receipt_sha256"
+            ],
+            "private_receipt_sha256": state["private_receipt_sha256"],
+            "boot_policy": manifest["boot_policy"],
+            "acceptance_scope": "platform-only",
+            "storage_result": receipts["private"]["storage_result"],
+            "guarded": json.loads(json.dumps(manifest["guarded"])),
+            "capability_boots": json.loads(json.dumps(
+                receipts["capability"]["boots"]
+            )),
+            "private_boots": json.loads(json.dumps(
+                receipts["private"]["boots"]
+            )),
+            "cleanup": "complete",
+        }
+        receipt_path = root / "private-receipt.json"
+        preflight.save_private_bytes(
+            receipt_path, preflight.azure.canonical_json(final)
+        )
+        state["final_receipt_sha256"] = preflight.azure.image_sha256(
+            receipt_path
+        )
+        preflight.azure.save_durable_json(root / preflight.STATE_FILE, state)
+        return state, final, receipt_path
+
+    def test_completed_handoff_loads_only_full_exact_image_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "state"
+            state, final, receipt_path = self.completed_handoff(root)
+            with mock.patch.object(
+                preflight, "verify_immutable_inputs"
+            ) as verify:
+                validated, loaded_path = preflight.load_completed_receipt(
+                    root
+                )
+            verify.assert_called_once()
+            self.assertEqual(loaded_path, receipt_path)
+            self.assertEqual(validated, final)
+            self.assertEqual(
+                validated["inputs"]["vhd"]["sha256"],
+                state["input_manifest"]["files"]["vhd"]["sha256"],
+            )
+            self.assertEqual(
+                validated["private_build"],
+                state["input_manifest"]["private_build"],
+            )
+
+    def test_completed_handoff_rejects_prepared_or_stale_bindings(self):
+        for mutation in (
+            "prepared", "vhd", "build", "cleanup", "sas",
+            "deallocated", "deployment", "control", "resource",
+            "evidence",
+        ):
+            with self.subTest(mutation=mutation), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "state"
+                state, final, receipt_path = self.completed_handoff(root)
+                if mutation == "prepared":
+                    state["phase"] = "prepared"
+                elif mutation == "vhd":
+                    final["inputs"]["vhd"]["sha256"] = "f" * 64
+                elif mutation == "build":
+                    final["private_build"]["receipt"]["output"][
+                        "sha256"
+                    ] = "e" * 64
+                elif mutation == "cleanup":
+                    final["cleanup"] = "pending"
+                elif mutation == "sas":
+                    state["active_sas"] = True
+                elif mutation == "deallocated":
+                    state["host_deallocated"] = False
+                elif mutation == "deployment":
+                    state["host_deployment"][
+                        "phase"
+                    ] = "deployment-succeeded"
+                elif mutation == "control":
+                    state["control_payload_bytes"] = 0
+                    final["budget"]["control_payload_bytes"] = 0
+                elif mutation == "resource":
+                    state["host_nic_id"] += "-replacement"
+                else:
+                    state["evidence_bytes"] += 1
+                    final["budget"]["evidence_bytes"] = state[
+                        "evidence_bytes"
+                    ]
+                if mutation != "prepared":
+                    receipt_path.unlink()
+                    preflight.save_private_bytes(
+                        receipt_path,
+                        preflight.azure.canonical_json(final),
+                    )
+                    state["final_receipt_sha256"] = (
+                        preflight.azure.image_sha256(receipt_path)
+                    )
+                preflight.azure.save_durable_json(
+                    root / preflight.STATE_FILE, state
+                )
+                with mock.patch.object(
+                    preflight, "verify_immutable_inputs"
+                ):
+                    with self.assertRaises(ValueError):
+                        preflight.load_completed_receipt(root)
+
+    def test_completed_handoff_reparses_private_boot_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "state"
+            state, final, receipt_path = self.completed_handoff(root)
+            log_path = root / "evidence" / "private" / "raw-x2apic.log"
+            log_path.write_bytes(
+                log_path.read_bytes()
+                + b"\nHYPERV_PERSISTENCE WRITE PASS writes=1"
+            )
+            evidence_path = root / "evidence" / "private" / "receipt.json"
+            evidence = json.loads(evidence_path.read_text())
+            evidence["boots"]["raw"]["x2apic"]["log_sha256"] = (
+                preflight.azure.image_sha256(log_path)
+            )
+            evidence_path.unlink()
+            preflight.save_private_bytes(
+                evidence_path, preflight.azure.canonical_json(evidence)
+            )
+            state["private_receipt_sha256"] = (
+                preflight.azure.image_sha256(evidence_path)
+            )
+            final["private_receipt_sha256"] = state[
+                "private_receipt_sha256"
+            ]
+            final["private_boots"] = evidence["boots"]
+            receipt_path.unlink()
+            preflight.save_private_bytes(
+                receipt_path, preflight.azure.canonical_json(final)
+            )
+            state["final_receipt_sha256"] = (
+                preflight.azure.image_sha256(receipt_path)
+            )
+            preflight.azure.save_durable_json(
+                root / preflight.STATE_FILE, state
+            )
+            with mock.patch.object(
+                preflight, "verify_immutable_inputs"
+            ):
+                with self.assertRaises(runner.RunnerError):
+                    preflight.load_completed_receipt(root)
 
 
 class PrivatePreflightBlobTest(PrivatePreflightFixture):
@@ -2280,6 +3835,7 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
                     "host_boot_id": (
                         "66666666-6666-4666-8666-666666666666"
                     ),
+                    "storage_result": "NOT_EVALUATED",
                     "boots": {
                         "capability" if phase == "capability" else "raw": {},
                     },

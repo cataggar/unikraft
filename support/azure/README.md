@@ -145,11 +145,120 @@ TMPDIR="$RUNTIME/tmp" PIP_CACHE_DIR="$RUNTIME/pip-cache" \
   'import sys; sys.path.insert(0, "support/scripts"); import hyperv_private_preflight as p; assert len(p.sdk_dependency_contract()["distributions"]) == 12'
 ```
 
-First solve the default Hyper-V configuration using the documented
-`olddefconfig` command. Then let the controller invoke the fixed native builder
-itself, snapshot source/configuration before and after the build, fingerprint
-the compiler, LLVM, Make, Python, parser tools and Bison data, and write the
-causal local build receipt:
+First solve the selected Hyper-V configuration using the documented
+`olddefconfig` command. For the guarded V2 policy, create one policy-2 manifest
+and retain its raw seed and JSON receipt for the later, separately authorized
+real-data-disk workload. The seed is not uploaded to this platform preflight:
+Set `ZIG`, `MAKE`, `BISON`, `FLEX`, `M4`, `BISON_DATA`, `LLVM_BIN`, and
+`GIT_RUNTIME` to absolute reviewed tool paths. `GIT_RUNTIME` must be a
+relocatable owner-selected directory containing native ELF files only:
+`bin/git`, the matching dynamic loader at `lib/loader`, and every transitive
+DSO needed by Git directly below `lib/` under its requested SONAME. Symlinks,
+scripts, launchers that require adjacent configuration, missing or unused
+libraries, ambient dependency fallback, and unknown paths are rejected. The
+loader, C runtime, thread/dlopen compatibility DSOs, and Git's private
+libraries are fingerprinted and copied together; only the kernel and virtual
+DSO remain outside that runtime closure.
+
+```shell
+PERSISTENCE="$PWD/.d/private-preflight-persistence"
+mkdir -p "$PERSISTENCE" "$PWD/.d/acceptance-tmp" \
+  "$PWD/.d/acceptance-cache"
+CONFIG_TOOLS="$PWD/.d/private-preflight-config-tools"
+mkdir -m 700 "$CONFIG_TOOLS"
+cat >"$CONFIG_TOOLS/yacc" <<EOF
+#!/bin/sh
+set -eu
+export BISON_PKGDATADIR="$BISON_DATA"
+export M4="$M4"
+exec "$BISON" "\$@"
+EOF
+cat >"$CONFIG_TOOLS/lex" <<EOF
+#!/bin/sh
+set -eu
+export M4="$M4"
+exec "$FLEX" "\$@"
+EOF
+cat >"$CONFIG_TOOLS/git" <<EOF
+#!/bin/sh
+set -eu
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_EXEC_PATH="$GIT_RUNTIME/disabled-exec-path"
+export GIT_OPTIONAL_LOCKS=0
+export GIT_NO_REPLACE_OBJECTS=1
+export OPENSSL_CONF=/dev/null
+export OPENSSL_MODULES="$GIT_RUNTIME/disabled-openssl-modules"
+export LC_ALL=C
+export PATH="$GIT_RUNTIME/disabled-path"
+exec "$GIT_RUNTIME/lib/loader" --inhibit-cache \
+  --library-path "$GIT_RUNTIME/lib" "$GIT_RUNTIME/bin/git" \
+  --no-replace-objects -c core.fsmonitor=false \
+  -c core.hooksPath=/dev/null "\$@"
+EOF
+chmod 700 "$CONFIG_TOOLS/yacc" "$CONFIG_TOOLS/lex" "$CONFIG_TOOLS/git"
+"$RUNTIME/venv/bin/python" support/scripts/hyperv-storage-manifest.py \
+  --output-prefix "$PERSISTENCE/run" \
+  --identity-policy seed-enrollment-v2 --sectors 262144 --lun 1
+cp support/apps/hyperv-acceptance/defconfig \
+  support/apps/hyperv-acceptance/.config
+cat "$PERSISTENCE/run.config" >> \
+  support/apps/hyperv-acceptance/.config
+TMPDIR="$PWD/.d/acceptance-tmp" \
+XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
+ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
+ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
+PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:/usr/bin:/bin" \
+  "$ZIG" build olddefconfig -j2 \
+  -Dapp="$PWD/support/apps/hyperv-acceptance" \
+  -Dconfig="$PWD/support/apps/hyperv-acceptance/.config" \
+  -Dmake-command="$MAKE" \
+  "-Dcompiler=$ZIG cc -target x86_64-freestanding-none" \
+  -Dcompiler-targeted=true "-Dhost-cc=$ZIG cc" \
+  "-Dhost-cxx=$ZIG c++" -Dhost-cflags=-fno-sanitize=null \
+  "-Dmake-arg=AR=$ZIG ar" -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf -Dmake-arg=STRIP=llvm-strip
+SOLVED_CONFIG="$PWD/support/apps/hyperv-acceptance/.config"
+```
+
+The solved configuration must enable persistence, StorVSC, LUN discovery, and
+guarded I/O; use identity policy 2; preserve the exact run ID, disk ID, LUN,
+sector count, and 512-byte sector size; and leave path and target unenrolled.
+V1, network-application, altered geometry, or incomplete guarded configurations
+are rejected before packaging or any cloud action.
+
+The guarded producer pin is a separately versioned reviewed contract. It
+fingerprints the native build selection, Hyper-V message ingress and ABI,
+VMBus storage-offer matcher and sticky lifetime state, StorVSC coherent
+inventory/core, and the acceptance application's unavailable decision and
+record framing, including their Kconfig, Make, and exported-symbol wiring.
+Any update to that critical proof closure requires an explicit reviewed pin
+change before another guarded image can be generated.
+
+Run the solve command with the controlled tool path shown above rather than an
+ambient developer shell. `python3` then resolves from the pinned runtime, the
+parser wrappers resolve first, source versioning uses the selected Git runtime,
+LLVM tools retain their symbolic command names, and the Make-backed facade
+uses the absolute `$MAKE` supplied by `-Dmake-command`.
+
+Then let the controller invoke the fixed native builder itself. It first
+copies and preflights the complete Git runtime, then uses only that relocated
+copy for source snapshots and Make's symbolic `git` invocation. The receipt
+fingerprints the complete Git runtime, compiler, LLVM, Make, Python, parser
+tools and Bison data. Git configuration, hook, helper, fsmonitor, and
+repository-selection environment overrides are removed; system/global config
+and the helper search path are disabled, and dynamic-loader injection
+variables are removed. Dependency resolution must remain entirely inside the
+copied runtime before and after every source query. Provenance rejects object
+replacement refs, assume-unchanged and skip-worktree flags, and any index
+difference, then hashes every tracked physical regular file or symlink and
+checks its Git mode and object ID against the unreplaced `HEAD` tree using
+NUL-delimited path records. Both complete bounded
+native passes must return successfully and contain no failure record. The only
+recoverable materialization record is the exact pinned `uk-reloc` command
+whose cache-local inputs are validated before a clean second pass:
 
 ```shell
 LOCAL_BUILD="$PWD/.d/private-preflight-local-build"
@@ -157,19 +266,36 @@ LOCAL_BUILD="$PWD/.d/private-preflight-local-build"
   build-private --output-dir "$LOCAL_BUILD" --repository "$PWD" \
   --solved-config "$SOLVED_CONFIG" --zig "$ZIG" --make "$MAKE" \
   --python "$RUNTIME/venv/bin/python" --bison "$BISON" --flex "$FLEX" \
-  --m4 "$M4" --bison-data "$BISON_DATA" --llvm-bin "$LLVM_BIN"
+  --m4 "$M4" --bison-data "$BISON_DATA" --llvm-bin "$LLVM_BIN" \
+  --git-runtime "$GIT_RUNTIME"
 PRIVATE_EFI="$LOCAL_BUILD/build/helloworld_hyperv-x86_64-efi-netvsc"
 PRIVATE_BUILD_RECEIPT="$LOCAL_BUILD/private-build-receipt.json"
 SOLVED_CONFIG="$LOCAL_BUILD/solved.config"
 ```
 
 Package that exact EFI into raw/fixed-VHD files locally with the pinned `miz`
-workflow above. `generate-input` rejects an EFI whose hash, size, source
+API. Do not use a converted or previously built image:
+
+```shell
+LOCAL_PACKAGE="$PWD/.d/private-preflight-package"
+mkdir -m 700 "$LOCAL_PACKAGE"
+"$MIZ" build-efi-application --efi "$PRIVATE_EFI" \
+  --architecture x86_64 --esp-size 64M -O raw \
+  -o "$LOCAL_PACKAGE/private.raw"
+"$MIZ" build-efi-application --efi "$PRIVATE_EFI" \
+  --architecture x86_64 --esp-size 64M -O vhd \
+  -o "$LOCAL_PACKAGE/private.vhd"
+"$MIZ" check-efi-application --output=json --architecture x86_64 \
+  --expected-efi-sha256 "$(sha256sum "$PRIVATE_EFI" | cut -d' ' -f1)" \
+  --expected-virtual-size 66M "$LOCAL_PACKAGE/private.vhd"
+```
+
+`generate-input` repeats the pinned check and rejects an EFI whose hash, size, source
 snapshot, solved configuration, invocation, or build tools differ from the
 receipt. The QEMU closure is an owner-selected directory whose
 executable is exactly `bin/qemu-system-x86_64`; required regular files below
 `lib/` and `share/` are copied and hashed recursively. Symlinks are rejected.
-Generate the canonical schema-5 manifest and owner-only input directory:
+Generate the canonical schema-9 manifest and owner-only input directory:
 
 ```shell
 INPUTS="$PWD/.d/private-preflight-input"
@@ -187,7 +313,8 @@ PRIVATE_VHD="$LOCAL_PACKAGE/private.vhd"
   --private-efi "$PRIVATE_EFI" \
   --private-build-receipt "$PRIVATE_BUILD_RECEIPT" \
   --private-raw "$PRIVATE_RAW" --private-vhd "$PRIVATE_VHD" \
-  --miz "$MIZ" --boot-policy platform-unavailable-v1
+  --miz "$MIZ" --git-runtime "$GIT_RUNTIME" \
+  --boot-policy guarded-v2-pristine-unavailable
 PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
 "$RUNTIME/venv/bin/python" support/scripts/hyperv_private_preflight.py \
   prepare --input-dir "$INPUTS" \
@@ -196,11 +323,13 @@ PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
 ```
 
 The exact generated names are `private-preflight-input.json`, `solved.config`,
-`capability.source.json`, `private-build-receipt.json`,
+`capability.source.json`, `private-build-receipt.json`, `git-runtime/bin/git`,
+`git-runtime/lib/loader`, the complete enumerated `git-runtime/lib` closure,
 `qemu/bin/qemu-system-x86_64`, the enumerated `qemu/lib`/`qemu/share` closure,
 `OVMF_CODE.fd`, `OVMF_VARS.fd`, `capability.raw`, `private.efi`, `private.raw`,
 and `private.vhd`. The manifest binds the clean Git `HEAD`, SHA-256 of the raw
-`git ls-tree -r --full-tree -z HEAD` output, solved configuration, pinned
+`git ls-tree -r --full-tree -z HEAD` output, the independently verified
+physical tracked-tree digest and byte count, solved configuration, pinned
 `miz`, controller, runner, Blob worker, imported shared controller and network
 helper, ARM template, requirements file, every installed SDK distribution,
 all inputs, packaging geometry, sizes, and reviewed policy. The separately
@@ -213,6 +342,20 @@ operator-provided replacement receipt is rejected. Updating that historical
 capability requires an explicit reviewed source change. Any tracked source,
 configuration, helper, requirement, SDK file, or prepared-input change fails
 before the first cloud command.
+
+The guarded producer-pin-v4 contract additionally binds the complete
+`support/build` directory, including production validation gates even when
+they live below `tests/`, plus every external native-image helper invoked by
+the root Make/facade/postprocessing path. Unknown additions, removals, or byte
+changes fail closed. The input-manifest-v9 and private-build-receipt-v6
+contracts bind the copied Git runtime used for every source query and
+native-build invocation, the exact reviewed producer files, protocol 1,
+identity policy 2, `no-devices`, guest return 2, and the private solved
+run/LUN/geometry. Updating a pinned producer or build-closure file requires an
+explicit reviewed source change. The exact same causal
+`private.efi`, raw disk, and fixed VHD are used for all four private platform
+boots and must be retained unchanged for the later real-data workload; there
+is no preflight-only guest flag, rebuild, or reseed.
 
 `private.efi`, copied `miz`, source/config metadata, and controller files stay
 local. Only the capability raw, private raw/fixed VHD, QEMU closure, and OVMF
@@ -276,22 +419,57 @@ QEMU/OVMF inputs. It must prove Linux KVM plus the required QEMU Hyper-V
 features in both x2APIC and masked legacy-APIC modes. Only that exact PASS
 allows any private seed or image upload. A durable capability sentinel binds
 the Linux boot identity, and a host restart between phases is rejected. The
-second phase boots the exact
-private raw and fixed-VHD bytes in both modes, masking the fixed-VHD footer as
+second phase boots the exact private raw and fixed-VHD bytes in both modes,
+masking the fixed-VHD footer as
 the local controller does. Logs have strict stage, normal-return, uniqueness,
-size, and deadline checks. A reviewed `UNAVAILABLE storage+network` result is
-valid only for the explicit platform-only policy; arbitrary failures and
-I/O-ready markers are rejected. This is not real device or persistence
-evidence. This controller deliberately defines no private LUN, write-disk, or
-seed-enrollment metadata; a later storage acceptance integration must consume
-the separately reviewed manifest-v2 interface rather than adding those fields
-to this platform-only contract.
+size, and deadline checks. Ordinary `platform-unavailable-v1` and
+`platform-main-zero-v1` behavior is unchanged.
 
-The current guarded persistence producer is deliberately unsupported: its
-missing-seed/endpoint/geometry outcomes are strict failures, not an acceptable
-platform result. This preflight never treats `SELECT FAIL`, `rc=-2`, `rc=-11`,
-writes-zero, or main-return 1 as PASS. A separately reviewed no-device producer
-and policy are required before a persistence image can enter this workflow.
+`guarded-v2-pristine-unavailable` is a separate, versioned platform-only
+consumer. After the standard Hyper-V capability records it requires exactly
+one ordered producer sequence matching the private solved configuration:
+
+```text
+HYPERV_PERSISTENCE START PASS run=<bound-run> address=0:0:<bound-lun> sectors=<bound-sectors> sector_size=512
+HYPERV_PERSISTENCE SELECT UNAVAILABLE reason=no-devices writes=0 flushes=0
+UK_HYPERV_PLATFORM_READY
+UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices
+... main returned 2
+```
+
+Only a genuinely pristine, coherent, empty inventory with no recognized
+storage-lifetime activity can produce that sequence. Missing, duplicate,
+reordered, malformed, policy-1, wrong-configuration, `SELECT FAIL`,
+`FINAL PASS`, identity, Boot1/Boot2, write/read/flush, completion, ordinary
+acceptance, or live-I/O evidence is rejected even when valid unavailable
+markers are also present. The START record and full serial logs contain private
+configuration and remain only in protected host state and owner-only receipts.
+The committed positive records fixture was captured from the actual hosted V2
+empty-inventory producer linked with the real driver, using public synthetic
+IDs; it is producer evidence, not an x86 nested-KVM capture.
+
+Host and final receipts state `acceptance_scope=platform-only` and
+`storage_result=UNAVAILABLE`. A successful runner result proves only that the
+same image reached the reviewed pristine-no-device outcome in the two APIC
+modes and two packaging formats. It does not prove StorVSC discovery, a live
+LUN, writes, flushes, reboot persistence, or any storage PASS. V1 guarded
+images remain unsupported. This controller adds no data disk or seed payload
+to the host; real two-boot storage acceptance remains a separately authorized
+workload using the retained V2 seed and exact unchanged image.
+
+Downstream local controllers must import
+`load_completed_receipt(state_directory)` from
+`support/scripts/hyperv_private_preflight.py` rather than accepting a prepared
+input manifest or build receipt. It returns the normalized completed receipt
+and its `private-receipt.json` path only after revalidating immutable inputs,
+all six host boot logs and both host-evidence receipts, exact image/build/source
+and tool bindings, completed cleanup, and the final receipt digest recorded in
+`state.json`. Prepared, partially cleaned, stale, or mismatched state is
+rejected. Completion additionally requires revoked SAS state, no retained
+signing-key fingerprint, a deallocated host, and the original
+`resources-verified` VM/OS-disk identity anchors. The retained host-resource
+IDs and exact byte total of both host receipts plus all six serial logs must
+also match the durable state.
 
 Private manifests, SAS values, host identity, serial logs, and receipts remain
 in owner-only local state and authenticated Blob/control-plane parameters.
