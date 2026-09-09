@@ -202,6 +202,7 @@ void storvsc_host_recovery_begin_hook(void);
 void storvsc_host_reset_ack_hook(void);
 void storvsc_host_deferred_epoch_sample_hook(__u64 epoch);
 void storvsc_host_sync_completion_hook(void);
+void storvsc_host_receive_hook(unsigned int controller, int before_notify);
 #endif
 
 static struct vmbus_channel *
@@ -549,6 +550,9 @@ static int storvsc_receive_async(struct storvsc_device *device,
 		return 0;
 	}
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
+#ifdef STORVSC_HOST_TEST
+	storvsc_host_receive_hook(device->index, 0);
+#endif
 	ukplat_spin_lock_irqsave(&device->receive_lock, receive_flags);
 	for (;;) {
 		rc = storvsc_read_event(device, &event);
@@ -564,6 +568,10 @@ static int storvsc_receive_async(struct storvsc_device *device,
 	}
 	ukplat_spin_unlock_irqrestore(&device->receive_lock, receive_flags);
 
+#ifdef STORVSC_HOST_TEST
+	if (completed && notify_user)
+		storvsc_host_receive_hook(device->index, 1);
+#endif
 	if (completed && notify_user)
 		storvsc_notify_pending(device);
 	return rc == -EAGAIN ? 0 : rc;
