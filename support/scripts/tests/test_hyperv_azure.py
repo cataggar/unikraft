@@ -4328,6 +4328,215 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             )
         return {"id": identifier, "tags": tags}
 
+    def production_acceptance_cloud(self, state_path):
+        calls = []
+        group_exists = [False]
+        delete_failures = [1]
+        serial_reads = [0]
+        group_id = (
+            f"/subscriptions/{self.SUBSCRIPTION}/resourceGroups/"
+            f"{self.contract['azure']['resource_group']}"
+        )
+        base_tags = {
+            "managed-by": persistence.MANAGED_BY,
+            "purpose": persistence.PURPOSE,
+            "unikraft-run": self.contract["azure"]["name_prefix"],
+            "image-sha256": self.contract["files"]["guest_vhd"]["sha256"],
+            "seed-sha256": self.contract["files"]["data_raw"]["sha256"],
+        }
+        sku = [{
+            "name": self.contract["azure"]["vm_size"],
+            "family": "standardBSFamily",
+            "restrictions": [],
+            "capabilities": [
+                {"name": "CpuArchitectureType", "value": "x64"},
+                {"name": "vCPUs", "value": "1"},
+                {"name": "HyperVGenerations", "value": "V1,V2"},
+                {"name": "MaxDataDiskCount", "value": "2"},
+            ],
+        }]
+
+        def current_state():
+            return persistence.load_state(self.state_dir)[0]
+
+        def role_from(arguments):
+            name = arguments[arguments.index("--name") + 1]
+            return (
+                "os" if name == self.contract["azure"]["os_disk_name"]
+                else "data"
+            )
+
+        def deployment_state():
+            state = current_state()
+            operation = state["vm_operation"]
+            complete = self.attach_proofs(copy.deepcopy(state))
+            complete["boot_count"] = state["boot_count"]
+            complete["vm_operation"] = {
+                **operation, "phase": "created",
+                "deployment_id": complete["vm"]["deployment_id"],
+            }
+            return complete
+
+        def execute(arguments, **_kwargs):
+            command = tuple(arguments[:3])
+            calls.append(tuple(arguments))
+            if arguments[:2] == ["account", "show"]:
+                return {
+                    "id": self.SUBSCRIPTION,
+                    "state": "Enabled",
+                    "environmentName": "AzureCloud",
+                }
+            if arguments[:2] == ["provider", "show"]:
+                return "Registered"
+            if arguments[:2] == ["vm", "list-skus"]:
+                return sku
+            if arguments[:2] == ["group", "exists"]:
+                return group_exists[0]
+            if arguments[:2] == ["group", "create"]:
+                group_exists[0] = True
+                return {
+                    "id": group_id,
+                    "location": self.contract["azure"]["location"],
+                    "tags": base_tags,
+                }
+            if arguments[:2] == ["group", "show"]:
+                return {
+                    "id": group_id,
+                    "location": self.contract["azure"]["location"],
+                    "tags": base_tags,
+                }
+            if arguments[:2] == ["disk", "create"]:
+                role = role_from(arguments)
+                return {
+                    "id": group_id + (
+                        "/providers/Microsoft.Compute/disks/"
+                        + self.contract["azure"][f"{role}_disk_name"]
+                    ),
+                    "uniqueId": (
+                        self.OS_UUID if role == "os" else self.DATA_UUID
+                    ),
+                    "tags": base_tags,
+                }
+            if arguments[:2] == ["disk", "grant-access"]:
+                return {
+                    "accessSAS": (
+                        "https://fixture.blob.core.windows.net/"
+                        "disk/image.vhd?sig=private"
+                    ),
+                }
+            if arguments[:2] == ["disk", "revoke-access"]:
+                return None
+            if arguments[:2] == ["disk", "show"]:
+                state = current_state()
+                role = role_from(arguments)
+                if "vm" not in state:
+                    return self.unattached_disk(state, role)
+                return self.live_disk(state, role)
+            if command == ("deployment", "group", "create"):
+                return self.live_deployment(deployment_state())
+            if command == ("deployment", "group", "show"):
+                return self.live_deployment(current_state())
+            if arguments[:2] == ["vm", "show"]:
+                return self.live_vm(current_state())
+            if arguments[:3] == [
+                "vm", "boot-diagnostics", "get-boot-log"
+            ]:
+                serial_reads[0] += 1
+                if serial_reads[0] == 1:
+                    return self.boot_log(1)
+                return self.boot_log(1) + self.boot_log(2)
+            if arguments[:2] in (["vm", "deallocate"], ["vm", "start"]):
+                return None
+            if arguments[:2] == ["resource", "list"]:
+                state = current_state()
+                run = persistence.PersistenceRun(state, state_path)
+                return [
+                    self.owned_resource(run, identifier)
+                    for identifier in run.expected_resource_ids()
+                ]
+            if arguments[:2] == ["group", "delete"]:
+                if delete_failures[0]:
+                    delete_failures[0] -= 1
+                    raise RuntimeError("synthetic first cleanup failure")
+                group_exists[0] = False
+                return None
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        return execute, calls
+
+    def production_cleanup_retry(self, *, expire_staging):
+        _state, state_path = self.prepare()
+        execute, calls = self.production_acceptance_cloud(state_path)
+        clock = [100.0]
+        original_save = azure.save_durable_json
+
+        def save(path, value):
+            original_save(path, value)
+            if (
+                expire_staging
+                and Path(path) == state_path
+                and value.get("phase") == "acceptance-recorded"
+                and value.get("acceptance_eligible") is False
+            ):
+                clock[0] = 701.0
+
+        caught = None
+        with (
+            mock.patch.object(
+                persistence.azure, "azure_cli", side_effect=execute
+            ),
+            mock.patch.object(
+                persistence.azure, "check_upload_dependencies"
+            ),
+            mock.patch.object(
+                persistence.azure, "upload_managed_vhd"
+            ),
+            mock.patch.object(
+                persistence.azure, "interrupt_as_exception",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                persistence.azure, "save_durable_json", side_effect=save
+            ),
+            mock.patch.object(
+                persistence.time, "monotonic",
+                side_effect=lambda: clock[0],
+            ),
+        ):
+            try:
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, True,
+                    persistence.resource_envelope_sha256(self.contract),
+                )
+            except BaseException as error:
+                caught = error
+            interrupted, _ = persistence.load_state(self.state_dir)
+            persistence.cleanup_state(self.state_dir, self.SUBSCRIPTION)
+        final, _ = persistence.load_state(self.state_dir)
+        receipt_path = self.state_dir / "persistence-receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        return caught, interrupted, final, receipt, calls
+
+    def assert_exact_production_lifecycle(self, calls):
+        self.assertEqual(sum(
+            call[:3] == ("deployment", "group", "create")
+            for call in calls
+        ), 1)
+        self.assertEqual(sum(
+            call[:2] == ("disk", "create") for call in calls
+        ), 2)
+        self.assertEqual(sum(
+            call[:2] == ("vm", "start") for call in calls
+        ), 1)
+        self.assertEqual(sum(
+            call[:3] == (
+                "vm", "boot-diagnostics", "get-boot-log"
+            ) for call in calls
+        ), 2)
+        self.assertEqual(sum(
+            call[:2] == ("group", "delete") for call in calls
+        ), 2)
+
     def test_exact_two_boot_parser_and_causal_serial_boundary(self):
         boot1_text = self.boot_log(1)
         boot1 = persistence.parse_boot_segment(
@@ -4344,6 +4553,34 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         self.assertEqual((boot1["writes"], boot1["flushes"]), (5, 3))
         self.assertEqual((boot2["writes"], boot2["flushes"]), (0, 0))
         self.assertEqual(boot2["identity"], boot1["identity"])
+
+    def test_deadline_rejection_cannot_be_promoted_by_cleanup_retry(self):
+        error, interrupted, final, receipt, calls = (
+            self.production_cleanup_retry(expire_staging=True)
+        )
+        self.assertIsInstance(error, azure.RunCleanupError)
+        self.assertEqual(interrupted["phase"], "failed")
+        self.assertFalse(interrupted["acceptance_eligible"])
+        self.assertEqual(final["phase"], "cleaned")
+        self.assertFalse(final["acceptance_eligible"])
+        self.assertIn("failure", final)
+        self.assertEqual(receipt["result"], "PASS")
+        self.assertEqual(receipt["cleanup"], "pending")
+        self.assert_exact_production_lifecycle(calls)
+
+    def test_eligible_acceptance_is_promoted_after_cleanup_retry(self):
+        error, interrupted, final, receipt, calls = (
+            self.production_cleanup_retry(expire_staging=False)
+        )
+        self.assertIsInstance(error, persistence.PersistenceCleanupError)
+        self.assertEqual(interrupted["phase"], "cleanup-failed")
+        self.assertTrue(interrupted["acceptance_eligible"])
+        self.assertEqual(final["phase"], "cleaned")
+        self.assertTrue(final["acceptance_eligible"])
+        self.assertNotIn("failure", final)
+        self.assertEqual(receipt["result"], "PASS")
+        self.assertEqual(receipt["cleanup"], "complete")
+        self.assert_exact_production_lifecycle(calls)
 
     def test_stale_or_replayed_boot1_never_authorizes_boot2(self):
         boot1 = self.boot_log(1)
@@ -4875,6 +5112,7 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         state, _ = persistence.load_state(self.state_dir)
         self.assertEqual(state["phase"], "failed")
         self.assertTrue(state["cleanup_required"])
+        self.assertFalse(state["acceptance_eligible"])
         self.assertIn("cleanup", state["failure"])
 
     def test_failure_recording_cannot_mask_primary_and_cleanup(self):
@@ -5438,6 +5676,7 @@ class HypervPersistenceControllerTest(unittest.TestCase):
         )
         run.record(
             "acceptance-recorded",
+            acceptance_eligible=True,
             acceptance_receipt_sha256=azure.image_sha256(receipt_path),
         )
 

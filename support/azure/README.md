@@ -627,8 +627,12 @@ python3 support/scripts/hyperv_persistence_controller.py cleanup \
 ```
 
 Its independent deadline never renews the acceptance deadline. If deletion
-completed after the accepted receipt was durably staged, a later cleanup
-invocation finalizes that same receipt rather than starting another boot.
+completed after an acceptance-eligible receipt was durably staged, a later
+cleanup invocation finalizes that same receipt rather than starting another
+boot. Staging the pending receipt and its hash is not eligibility: the
+controller records eligibility only after the final acceptance deadline check.
+Any primary acceptance rejection records the state as ineligible, so a later
+cleanup-only recovery cannot promote that pending receipt to a completed PASS.
 Cloud operations retain fractional timeout budgets, and their return is
 checked against the relevant deadline before any success phase is persisted.
 

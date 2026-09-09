@@ -1091,6 +1091,18 @@ def validate_state(state):
             state["acceptance_receipt_sha256"], HEX64,
             "Acceptance receipt SHA-256",
         )
+    if "acceptance_eligible" in state:
+        if type(state["acceptance_eligible"]) is not bool:
+            raise ValueError("Acceptance eligibility is invalid")
+        if (
+            state["acceptance_eligible"]
+            and (
+                "acceptance_receipt_sha256" not in state
+                or "boot2" not in state
+                or "failure" in state
+            )
+        ):
+            raise ValueError("Acceptance eligibility lacks valid evidence")
     return state
 
 
@@ -2430,6 +2442,8 @@ def save_acceptance_receipt(run, boot1, boot2, cleanup):
 
 def finalize_cleaned_acceptance(run):
     state = run.state
+    if state.get("acceptance_eligible") is not True:
+        return None
     receipt_sha256 = state.get("acceptance_receipt_sha256")
     if receipt_sha256 is None:
         return None
@@ -2473,6 +2487,7 @@ def finalize_cleaned_acceptance(run):
     )
     run.record(
         "cleaned", cleanup_required=False,
+        acceptance_eligible=True,
         acceptance_receipt_sha256=azure.image_sha256(path),
     )
     return receipt
@@ -2585,9 +2600,14 @@ def _run_acceptance_locked(state_directory, subscription, approve_cloud_run,
             run.ensure_deadline()
             run.record(
                 "acceptance-recorded",
+                acceptance_eligible=False,
                 acceptance_receipt_sha256=azure.image_sha256(receipt_path),
             )
             run.ensure_deadline()
+            run.record(
+                "acceptance-recorded",
+                acceptance_eligible=True,
+            )
     except BaseException as error:
         primary = error
     if run.state.get("cleanup_required"):
@@ -2612,7 +2632,7 @@ def _run_acceptance_locked(state_directory, subscription, approve_cloud_run,
         try:
             run.record(
                 "failed", cleanup_required=cleanup_error is not None,
-                failure=failure,
+                acceptance_eligible=False, failure=failure,
             )
         except BaseException as error:
             recording_error = error
