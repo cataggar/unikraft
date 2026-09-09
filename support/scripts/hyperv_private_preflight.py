@@ -941,7 +941,8 @@ def build_private_image(
         "llvm-nm", "llvm-objcopy", "llvm-objdump", "llvm-readelf",
         "llvm-strip",
     ):
-        path = (llvm_directory / name).resolve(strict=True)
+        path = llvm_directory / name
+        path.resolve(strict=True)
         tools[name] = local_tool_record(path, name)
         resolved[name] = path
     tools["bison-data"] = directory_record(
