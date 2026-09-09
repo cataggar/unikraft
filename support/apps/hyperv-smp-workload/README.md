@@ -20,3 +20,8 @@ The supplied configuration requires two CPUs. Use `--cpus 2` with
 `support/build/tests/hyperv-efi-boot-test.py` and require all three stage
 markers plus `UK_HYPERV_SMP_WORKLOAD_READY PASS`. That helper defaults to one
 CPU for existing smoke callers and rejects multi-CPU legacy-xAPIC requests.
+
+CI packages the exact EFI payload into a raw GPT disk with the pinned `miz`
+tool and passes `--raw-disk` to boot that same disk read-only. This avoids
+QEMU's `fat:` protocol, which is absent from the pinned minimal QEMU bundle.
+The existing `--image` convenience path still requires that protocol.

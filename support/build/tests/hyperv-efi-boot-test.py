@@ -35,9 +35,14 @@ def validate_boot_log(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Single-CPU Hyper-V EFI application boot, not I/O acceptance"
+        description="Hyper-V EFI application boot with explicit CPU count, not I/O acceptance"
     )
-    parser.add_argument("--image", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--image", type=Path)
+    source.add_argument(
+        "--raw-disk", type=Path,
+        help="Boot this exact raw disk read-only instead of a directory-backed ESP",
+    )
     parser.add_argument("--ovmf-code", type=Path, required=True)
     parser.add_argument("--ovmf-vars", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
@@ -67,9 +72,17 @@ def main():
     log_path = work / "hyperv-efi-boot.log"
     with tempfile.TemporaryDirectory(prefix="efi-boot-", dir=work) as temp:
         root = Path(temp)
-        boot = root / "esp/EFI/BOOT"
-        boot.mkdir(parents=True)
-        shutil.copyfile(args.image, boot / "BOOTX64.EFI")
+        if args.raw_disk is not None:
+            disk = args.raw_disk.resolve(strict=True)
+            if not disk.is_file():
+                parser.error("--raw-disk must be a regular file")
+            (root / "disk.raw").symlink_to(disk)
+            boot_drive = "if=virtio,format=raw,readonly=on,file=disk.raw"
+        else:
+            boot = root / "esp/EFI/BOOT"
+            boot.mkdir(parents=True)
+            shutil.copyfile(args.image, boot / "BOOTX64.EFI")
+            boot_drive = "format=raw,file=fat:rw:esp"
         shutil.copyfile(args.ovmf_vars, root / "OVMF_VARS.fd")
         shutil.copyfile(args.ovmf_code, root / "OVMF_CODE.fd")
         cpu = (
@@ -85,7 +98,7 @@ def main():
             "-smp", str(args.cpus), "-m", "512M",
             "-drive", "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
             "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",
-            "-drive", "format=raw,file=fat:rw:esp",
+            "-drive", boot_drive,
             "-device", "vmbus-bridge,irq=15",
             "-display", "none", "-serial", "stdio",
             "-monitor", "none", "-no-reboot", "-nic", "none",

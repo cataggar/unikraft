@@ -87,6 +87,46 @@ class HypervEfiBootTest(unittest.TestCase):
                 self.assertEqual(error.exception.code, 2)
                 qemu.assert_not_called()
 
+    def test_raw_disk_smp_uses_exact_read_only_backing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            disk = root / "exact,disk.raw"
+            disk.write_bytes(b"exact disk fixture")
+            for name in ("code", "vars"):
+                (root / name).write_bytes(b"fixture")
+            arguments = self.arguments(root)
+            arguments[1:3] = ["--raw-disk", str(disk)]
+            arguments += ["--cpus", "2"]
+
+            def run(command, **kwargs):
+                backing = kwargs["cwd"] / "disk.raw"
+                self.assertTrue(backing.samefile(disk))
+                self.assertFalse((kwargs["cwd"] / "esp").exists())
+                self.assertIn(
+                    "if=virtio,format=raw,readonly=on,file=disk.raw", command
+                )
+                self.assertFalse(any("fat:" in argument for argument in command))
+                self.assertEqual(command[command.index("-smp") + 1], "2")
+                kwargs["stdout"].write("\n".join(MILESTONES).encode())
+                return mock.Mock(returncode=0)
+
+            with mock.patch.object(sys, "argv", arguments):
+                with mock.patch.object(boot.subprocess, "run", side_effect=run) as qemu:
+                    with redirect_stdout(io.StringIO()):
+                        boot.main()
+            qemu.assert_called_once()
+            self.assertEqual(disk.read_bytes(), b"exact disk fixture")
+
+    def test_raw_disk_and_efi_input_are_mutually_exclusive(self):
+        arguments = self.arguments(Path("unused")) + ["--raw-disk", "disk.raw"]
+        with mock.patch.object(sys, "argv", arguments):
+            with mock.patch.object(boot.subprocess, "run") as qemu:
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        boot.main()
+        self.assertEqual(error.exception.code, 2)
+        qemu.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

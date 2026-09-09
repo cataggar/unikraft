@@ -890,8 +890,14 @@ jobs:
     - name: Boot the fixed scheduled-SMP workload on two CPUs
       run: |
         set -euo pipefail
+        disk="${RUNNER_TEMP}/hyperv-ci/smp.raw"
+        "${RUNNER_TEMP}/hyperv-ci/miz/bin/miz" build-efi-application \
+          --efi "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi" \
+          --architecture x86_64 --esp-size 64M -O raw -o "${disk}"
+        test "$(stat -c %s "${disk}")" -eq "$((66 * 1024 * 1024))"
+        sha256sum "${disk}" > "${RUNNER_TEMP}/hyperv-ci/smp-disk-sha256.txt"
         python3 support/build/tests/hyperv-efi-boot-test.py \
-          --image "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi" \
+          --raw-disk "${disk}" \
           --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.fd \
           --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd \
           --work-dir "${RUNNER_TEMP}/hyperv-ci/smp-boot" \
@@ -901,6 +907,7 @@ jobs:
           --require-marker UK_HYPERV_SCHED_THREAD \
           --require-marker UK_HYPERV_REMOTE_WAKE \
           --expect 'UK_HYPERV_SMP_WORKLOAD_READY PASS'
+        sha256sum --check "${RUNNER_TEMP}/hyperv-ci/smp-disk-sha256.txt"
 
     - name: Export exact prepared Hyper-V image
       if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
@@ -957,6 +964,7 @@ jobs:
         path: |
           ${{ runner.temp }}/hyperv-ci/image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-image-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/smp-disk-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-boot/hyperv-efi-boot.log
           ${{ runner.temp }}/hyperv-ci/packaging/packaging.json
           ${{ runner.temp }}/hyperv-ci/packaging/local-*-serial.log
