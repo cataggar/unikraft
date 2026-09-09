@@ -221,8 +221,11 @@ facade uses the absolute `$MAKE` supplied by `-Dmake-command`.
 
 Then let the controller invoke the fixed native builder itself, snapshot
 source/configuration before and after the build, fingerprint
-the compiler, LLVM, Make, Python, parser tools and Bison data, and write the
-causal local build receipt:
+the selected Git executable, compiler, LLVM, Make, Python, parser tools and
+Bison data, and write the causal local build receipt. Both complete bounded
+native passes must return successfully and contain no failure record. The only
+recoverable materialization record is the exact pinned `uk-reloc` command
+whose cache-local inputs are validated before a clean second pass:
 
 ```shell
 LOCAL_BUILD="$PWD/.d/private-preflight-local-build"
@@ -230,7 +233,8 @@ LOCAL_BUILD="$PWD/.d/private-preflight-local-build"
   build-private --output-dir "$LOCAL_BUILD" --repository "$PWD" \
   --solved-config "$SOLVED_CONFIG" --zig "$ZIG" --make "$MAKE" \
   --python "$RUNTIME/venv/bin/python" --bison "$BISON" --flex "$FLEX" \
-  --m4 "$M4" --bison-data "$BISON_DATA" --llvm-bin "$LLVM_BIN"
+  --m4 "$M4" --bison-data "$BISON_DATA" --llvm-bin "$LLVM_BIN" \
+  --git "$GIT_BIN/git"
 PRIVATE_EFI="$LOCAL_BUILD/build/helloworld_hyperv-x86_64-efi-netvsc"
 PRIVATE_BUILD_RECEIPT="$LOCAL_BUILD/private-build-receipt.json"
 SOLVED_CONFIG="$LOCAL_BUILD/solved.config"
@@ -258,7 +262,7 @@ snapshot, solved configuration, invocation, or build tools differ from the
 receipt. The QEMU closure is an owner-selected directory whose
 executable is exactly `bin/qemu-system-x86_64`; required regular files below
 `lib/` and `share/` are copied and hashed recursively. Symlinks are rejected.
-Generate the canonical schema-6 manifest and owner-only input directory:
+Generate the canonical schema-7 manifest and owner-only input directory:
 
 ```shell
 INPUTS="$PWD/.d/private-preflight-input"
@@ -276,7 +280,8 @@ PRIVATE_VHD="$LOCAL_PACKAGE/private.vhd"
   --private-efi "$PRIVATE_EFI" \
   --private-build-receipt "$PRIVATE_BUILD_RECEIPT" \
   --private-raw "$PRIVATE_RAW" --private-vhd "$PRIVATE_VHD" \
-  --miz "$MIZ" --boot-policy guarded-v2-pristine-unavailable
+  --miz "$MIZ" --git "$GIT_BIN/git" \
+  --boot-policy guarded-v2-pristine-unavailable
 PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
 "$RUNTIME/venv/bin/python" support/scripts/hyperv_private_preflight.py \
   prepare --input-dir "$INPUTS" \
@@ -285,7 +290,7 @@ PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
 ```
 
 The exact generated names are `private-preflight-input.json`, `solved.config`,
-`capability.source.json`, `private-build-receipt.json`,
+`capability.source.json`, `private-build-receipt.json`, `git`,
 `qemu/bin/qemu-system-x86_64`, the enumerated `qemu/lib`/`qemu/share` closure,
 `OVMF_CODE.fd`, `OVMF_VARS.fd`, `capability.raw`, `private.efi`, `private.raw`,
 and `private.vhd`. The manifest binds the clean Git `HEAD`, SHA-256 of the raw
@@ -303,10 +308,12 @@ capability requires an explicit reviewed source change. Any tracked source,
 configuration, helper, requirement, SDK file, or prepared-input change fails
 before the first cloud command.
 
-The guarded input and causal build receipts additionally bind the exact
+The guarded input and causal build receipts additionally bind the full
+non-test `support/build` source closure used by the facade, the selected Git
+binary used for every source query and native-build invocation, the exact
 reviewed producer files, protocol 1, identity policy 2, `no-devices`, guest
 return 2, and the private solved run/LUN/geometry. Updating a pinned producer
-file requires an explicit reviewed source change. The exact same causal
+or build-closure file requires an explicit reviewed source change. The exact same causal
 `private.efi`, raw disk, and fixed VHD are used for all four private platform
 boots and must be retained unchanged for the later real-data workload; there
 is no preflight-only guest flag, rebuild, or reseed.
@@ -419,7 +426,11 @@ and its `private-receipt.json` path only after revalidating immutable inputs,
 all six host boot logs and both host-evidence receipts, exact image/build/source
 and tool bindings, completed cleanup, and the final receipt digest recorded in
 `state.json`. Prepared, partially cleaned, stale, or mismatched state is
-rejected.
+rejected. Completion additionally requires revoked SAS state, no retained
+signing-key fingerprint, a deallocated host, and the original
+`resources-verified` VM/OS-disk identity anchors. The retained host-resource
+IDs and exact byte total of both host receipts plus all six serial logs must
+also match the durable state.
 
 Private manifests, SAS values, host identity, serial logs, and receipts remain
 in owner-only local state and authenticated Blob/control-plane parameters.

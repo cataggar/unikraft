@@ -7,6 +7,7 @@ import importlib
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -181,6 +182,8 @@ def private_build_receipt(provenance, efi, guarded=None):
             "jobs": 2,
             "materialization_returncode": 0,
             "recovery": "none",
+            "recovery_returncode": None,
+            "verification_returncode": 0,
             "app": "support/apps/hyperv-acceptance",
             "profile": "hyperv-x86_64-efi-netvsc",
             "compiler_target": "x86_64-freestanding-none",
@@ -207,6 +210,7 @@ def private_build_receipt(provenance, efi, guarded=None):
             json.loads(json.dumps(guarded)) if guarded is not None else None
         ),
     }
+    receipt["tools"]["git"] = json.loads(json.dumps(provenance["git"]))
     return {
         "name": preflight.PRIVATE_BUILD_RECEIPT,
         "sha256": "3" * 64,
@@ -326,6 +330,12 @@ class PrivatePreflightFixture(unittest.TestCase):
                 "sha256": "c" * 64,
                 "size": 4096,
             },
+            "git": {
+                "name": "git",
+                "sha256": "d" * 64,
+                "size": 1,
+                "files": 1,
+            },
         }
         guarded = (
             self.guarded_contract(provenance["config"]["sha256"])
@@ -411,6 +421,35 @@ class PrivatePreflightFixture(unittest.TestCase):
             "resource_group_id": (
                 "/subscriptions/11111111-2222-3333-4444-555555555555/"
                 "resourceGroups/uk-hvp-123456789abc-rg"
+            ),
+            "host_vm_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Compute/virtualMachines/"
+                "uk-hvp-123456789abc-host"
+            ),
+            "host_disk_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Compute/disks/"
+                "uk-hvp-123456789abc-host-os"
+            ),
+            "host_nic_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Network/networkInterfaces/"
+                "uk-hvp-123456789abc-host-nic"
+            ),
+            "storage_account_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Storage/storageAccounts/ukhvp1234567890abcd"
+            ),
+            "shutdown_schedule_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.DevTestLab/schedules/"
+                "shutdown-computevm-uk-hvp-123456789abc-host"
             ),
         })
         return state
@@ -551,8 +590,28 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             preflight.GUARDED_PRODUCER_SCHEMA_VERSION,
             runner.GUARDED_PRODUCER_SCHEMA_VERSION,
         )
+        build_root = SUPPORT / "build"
+        discovered_build_sources = {
+            str(path.relative_to(SUPPORT.parent))
+            for path in build_root.rglob("*")
+            if path.is_file()
+            and "tests" not in path.relative_to(build_root).parts
+            and path.name != "native-config-tests.zig"
+            and (
+                path.suffix in (".zig", ".py", ".sh")
+                or path.name.startswith("Makefile.")
+                or "symbols" in path.relative_to(build_root).parts
+            )
+        }
+        discovered_build_sources.update({
+            "Config.uk", "Makefile", "Makefile.uk", "build.zig",
+            "build.zig.zon", "version.mk",
+        })
+        self.assertEqual(
+            discovered_build_sources,
+            set(preflight.GUARDED_BUILD_SOURCE_FILES),
+        )
         proof_roles = {
-            "build.zig",
             "plat/hyperv/Makefile.uk",
             "plat/hyperv/hyperv_runtime.zig",
             "plat/hyperv/include/hyperv/hyperv.h",
@@ -579,6 +638,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             "support/apps/hyperv-acceptance/acceptance_protocol.h",
             "support/apps/hyperv-acceptance/main.c",
             "support/apps/hyperv-acceptance/persistence.c",
+            *preflight.GUARDED_BUILD_SOURCE_FILES,
         }
         self.assertLessEqual(
             proof_roles, set(preflight.GUARDED_PRODUCER_FILES)
@@ -600,6 +660,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         mutation_targets = (
             "drivers/hyperv/vmbus/vmbus_protocol.zig",
             "drivers/hyperv/vmbus/vmbus_protocol.h",
+            "support/build/native-target-object.zig",
         )
         for relative in mutation_targets:
             with self.subTest(relative=relative), \
@@ -627,7 +688,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                         root / "code", root / "vars", root / "capability",
                         root / "capability-receipt", root / "efi",
                         root / "build-receipt", root / "raw", root / "vhd",
-                        root / "miz",
+                        root / "miz", root / "git",
                     ]
                     provenance = self.manifest(
                         boot_policy=preflight.GUARDED_BOOT_POLICY
@@ -674,6 +735,8 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         )
         self.assertIn('-Dmake-command="$MAKE"', recipe)
         self.assertNotIn("$LLVM_BIN:$PATH", recipe)
+        self.assertIn('--git "$GIT_BIN/git"', readme)
+        self.assertIn("canonical schema-7 manifest", readme)
 
     def test_guarded_contract_is_derived_from_exact_solved_v2_config(self):
         preflight.verify_guarded_producer_sources(SUPPORT.parent)
@@ -974,19 +1037,38 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 ],
                 cwd=repository, check=True,
             )
+            git = Path(shutil.which("git")).resolve()
+            fake_bin = repository / "fake-bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/bin/sh\nprintf '%s' 'forged ambient git'\n"
+            )
+            fake_git.chmod(0o700)
             with mock.patch.object(
                 preflight, "SUPPORT", repository / "support"
+            ), mock.patch.dict(
+                preflight.os.environ, {"PATH": str(fake_bin)}
             ):
-                first = preflight.build_provenance(repository, config)
-                second = preflight.build_provenance(repository, config)
+                first = preflight.build_provenance(
+                    repository, config, git
+                )
+                second = preflight.build_provenance(
+                    repository, config, git
+                )
             self.assertEqual(first, second)
             self.assertEqual(first["scheme"], "unikraft.git-ls-tree-v1")
             self.assertEqual(first["tracked_entries"], 1)
+            self.assertEqual(
+                first["git"], preflight.local_tool_record(git, "git")
+            )
             config.write_text("CONFIG_HYPERV=n\n")
             with mock.patch.object(
                 preflight, "SUPPORT", repository / "support"
             ):
-                changed = preflight.build_provenance(repository, config)
+                changed = preflight.build_provenance(
+                    repository, config, git
+                )
             self.assertNotEqual(
                 first["config"]["sha256"], changed["config"]["sha256"]
             )
@@ -1023,11 +1105,12 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 ("code", b"code"), ("vars", b"vars"),
                 ("capability", b"c" * 1024), ("efi", b"efi"),
                 ("raw", b"r" * 1024), ("vhd", b"r" * 1024 + b"v" * 512),
-                ("miz", b"miz"),
+                ("miz", b"miz"), ("git", b"#!/bin/sh\nexit 0\n"),
             ):
                 assets[name] = root / name
                 assets[name].write_bytes(content)
             assets["miz"].chmod(0o700)
+            assets["git"].chmod(0o700)
             output = root / "input"
 
             def packaging(_miz, _arguments, _log, **_kwargs):
@@ -1044,6 +1127,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     ).hexdigest(),
                     "size": config.stat().st_size,
                 },
+                "git": preflight.local_tool_record(assets["git"], "git"),
             }
             capability = capability_reference({
                 "sha256": hashlib.sha256(b"c" * 1024).hexdigest(),
@@ -1088,7 +1172,8 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     assets["code"], assets["vars"], assets["capability"],
                     capability_path, assets["efi"], build_path,
                     assets["raw"], assets["vhd"],
-                    assets["miz"], "platform-unavailable-v1",
+                    assets["miz"], assets["git"],
+                    "platform-unavailable-v1",
                 )
             manifest_bytes = (
                 output / preflight.INPUT_MANIFEST
@@ -1104,6 +1189,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     preflight.SOLVED_CONFIG,
                     preflight.CAPABILITY_REFERENCE,
                     preflight.PRIVATE_BUILD_RECEIPT,
+                    preflight.GIT_TOOL,
                     "qemu/bin/qemu-system-x86_64",
                     "qemu/share/firmware.json",
                     "OVMF_CODE.fd", "OVMF_VARS.fd", "capability.raw",
@@ -1124,7 +1210,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 root / "code", root / "vars", root / "capability",
                 root / "capability-receipt", root / "efi",
                 root / "build-receipt", root / "raw", root / "vhd",
-                root / "miz",
+                root / "miz", root / "git",
             ]
             with mock.patch.object(
                 preflight, "check_blob_dependency"
@@ -1241,6 +1327,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             bison_data.mkdir()
             (bison_data / "skeleton").write_text("data\n")
             output = root / "build-result"
+            git = Path(shutil.which("git")).resolve()
             with mock.patch.object(
                 preflight, "SUPPORT", support
             ), mock.patch.object(
@@ -1251,10 +1338,11 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 receipt_path, efi_path = preflight.build_private_image(
                     output, repository, config, paths["zig"],
                     paths["make"], paths["python"], paths["bison"],
-                    paths["flex"], paths["m4"], bison_data, llvm, 30,
+                    paths["flex"], paths["m4"], bison_data, llvm, git,
+                    30,
                 )
                 provenance = preflight.build_provenance(
-                    repository, output / preflight.SOLVED_CONFIG
+                    repository, output / preflight.SOLVED_CONFIG, git
                 )
             receipt = preflight.load_receipt(
                 receipt_path, preflight.PRIVATE_BUILD_RECEIPT,
@@ -1285,10 +1373,102 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 validated["receipt"]["invocation"]["recovery"],
                 "uk-reloc-v1",
             )
+            self.assertEqual(
+                validated["receipt"]["invocation"][
+                    "recovery_returncode"
+                ],
+                0,
+            )
+            self.assertEqual(
+                validated["receipt"]["invocation"][
+                    "verification_returncode"
+                ],
+                0,
+            )
+            self.assertEqual(
+                validated["receipt"]["tools"]["git"],
+                preflight.local_tool_record(git, "git"),
+            )
+            unrelated_git = copy.deepcopy(receipt)
+            unrelated_git["receipt"]["tools"]["git"]["sha256"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "Git tool"):
+                preflight.validate_private_build(
+                    unrelated_git, provenance, {
+                        "name": preflight.INPUT_NAMES["efi"],
+                        "sha256": hashlib.sha256(b"efi").hexdigest(),
+                        "size": 3,
+                    },
+                )
             self.assertIn(
                 f"exec {zig.absolute()} \"$@\"",
                 (output / ".tool-bin" / "zig").read_text(),
             )
+            self.assertIn(
+                f"exec {git} \"$@\"",
+                (output / ".tool-bin" / "git").read_text(),
+            )
+
+            script = zig_target.read_text()
+            variants = {
+                "verification-failure": script.replace(
+                    'test -n "$out"\n',
+                    "printf '%s\\n' 'failed command: unrelated "
+                    "verification failure'\n"
+                    'test -n "$out"\n',
+                ),
+                "hidden-materialization-failure": script.replace(
+                    ' : > "$marker"\n',
+                    ' : > "$marker"\n'
+                    " printf '%s\\n' 'failed command: unrelated "
+                    "materialization failure'\n"
+                    " i=0\n"
+                    " while test \"$i\" -lt 5000; do\n"
+                    "  printf '%064d\\n' \"$i\"\n"
+                    "  i=$((i + 1))\n"
+                    " done\n",
+                ),
+                "nonzero-materialization": script.replace(
+                    " exit 0\nfi\n", " exit 1\nfi\n", 1
+                ),
+                "ambiguous-materialization": script.replace(
+                    ' : > "$marker"\n',
+                    ' : > "$marker"\n'
+                    " printf '%s\\n' 'prefix failed command: unrelated'\n",
+                ),
+                "oversized-materialization": script.replace(
+                    ' : > "$marker"\n',
+                    ' : > "$marker"\n'
+                    " i=0\n"
+                    " while test \"$i\" -lt 140000; do\n"
+                    "  printf '%064d\\n' \"$i\"\n"
+                    "  i=$((i + 1))\n"
+                    " done\n",
+                ),
+            }
+            for name, changed_script in variants.items():
+                with self.subTest(name=name):
+                    zig_target.write_text(changed_script)
+                    rejected_output = root / ("rejected-" + name)
+                    with mock.patch.object(
+                        preflight, "SUPPORT", support
+                    ), mock.patch.object(
+                        preflight,
+                        "NATIVE_POSTPROCESS_RUNNER_PATH",
+                        native_runner,
+                    ), mock.patch.object(
+                        preflight, "UK_RELOC_SCRIPT_PATH", uk_reloc
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "failed|failure|exceeded"
+                        ):
+                            preflight.build_private_image(
+                                rejected_output, repository, config,
+                                paths["zig"], paths["make"],
+                                paths["python"], paths["bison"],
+                                paths["flex"], paths["m4"], bison_data,
+                                llvm, git, 30,
+                            )
+            zig_target.write_text(script)
 
 
 class PrivatePreflightRunnerTest(PrivatePreflightFixture):
@@ -1798,6 +1978,35 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
                 "/subscriptions/11111111-2222-3333-4444-555555555555/"
                 "resourceGroups/uk-hvp-123456789abc-rg"
             ),
+            "host_vm_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Compute/virtualMachines/"
+                "uk-hvp-123456789abc-host"
+            ),
+            "host_disk_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Compute/disks/"
+                "uk-hvp-123456789abc-host-os"
+            ),
+            "host_nic_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Network/networkInterfaces/"
+                "uk-hvp-123456789abc-host-nic"
+            ),
+            "storage_account_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.Storage/storageAccounts/ukhvp1234567890abcd"
+            ),
+            "shutdown_schedule_id": (
+                "/subscriptions/11111111-2222-3333-4444-555555555555/"
+                "resourceGroups/uk-hvp-123456789abc-rg/providers/"
+                "Microsoft.DevTestLab/schedules/"
+                "shutdown-computevm-uk-hvp-123456789abc-host"
+            ),
             "host_deployment": {
                 "phase": "resources-verified",
                 "operation_id": "22222222-2222-4222-8222-222222222222",
@@ -1828,8 +2037,12 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
             "staged_input_bytes": state["input_manifest"]["budget"][
                 "remote_input_bytes"
             ],
+            "control_payload_bytes": 4096,
             "pending_secret_files": [],
             "cleanup_required": False,
+            "active_sas": False,
+            "active_sas_signing_key_sha256": None,
+            "host_deallocated": True,
         })
         capability_manifest = preflight.host_phase_manifest(
             state, "capability"
@@ -1976,7 +2189,11 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
             )
 
     def test_completed_handoff_rejects_prepared_or_stale_bindings(self):
-        for mutation in ("prepared", "vhd", "build", "cleanup"):
+        for mutation in (
+            "prepared", "vhd", "build", "cleanup", "sas",
+            "deallocated", "deployment", "control", "resource",
+            "evidence",
+        ):
             with self.subTest(mutation=mutation), \
                     tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / "state"
@@ -1989,8 +2206,26 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
                     final["private_build"]["receipt"]["output"][
                         "sha256"
                     ] = "e" * 64
-                else:
+                elif mutation == "cleanup":
                     final["cleanup"] = "pending"
+                elif mutation == "sas":
+                    state["active_sas"] = True
+                elif mutation == "deallocated":
+                    state["host_deallocated"] = False
+                elif mutation == "deployment":
+                    state["host_deployment"][
+                        "phase"
+                    ] = "deployment-succeeded"
+                elif mutation == "control":
+                    state["control_payload_bytes"] = 0
+                    final["budget"]["control_payload_bytes"] = 0
+                elif mutation == "resource":
+                    state["host_nic_id"] += "-replacement"
+                else:
+                    state["evidence_bytes"] += 1
+                    final["budget"]["evidence_bytes"] = state[
+                        "evidence_bytes"
+                    ]
                 if mutation != "prepared":
                     receipt_path.unlink()
                     preflight.save_private_bytes(

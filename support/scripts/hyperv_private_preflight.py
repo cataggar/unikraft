@@ -49,7 +49,7 @@ UK_RELOC_SCRIPT_PATH = SUPPORT / "scripts" / "mkukreloc.py"
 INPUT_SCHEMA = "unikraft.hyperv.private-preflight-input"
 STATE_SCHEMA = "unikraft.hyperv.private-preflight-state"
 RECEIPT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
-INPUT_SCHEMA_VERSION = 6
+INPUT_SCHEMA_VERSION = 7
 STATE_SCHEMA_VERSION = 2
 RECEIPT_SCHEMA_VERSION = 3
 HOST_PHASE_SCHEMA = host_runner.SCHEMA
@@ -58,10 +58,11 @@ INPUT_MANIFEST = "private-preflight-input.json"
 SOLVED_CONFIG = "solved.config"
 CAPABILITY_REFERENCE = "capability.source.json"
 PRIVATE_BUILD_RECEIPT = "private-build-receipt.json"
+GIT_TOOL = "git"
 NATIVE_EFI_NAME = "helloworld_hyperv-x86_64-efi-netvsc"
 CAPABILITY_REFERENCE_SCHEMA = "unikraft.hyperv.capability-reference"
 PRIVATE_BUILD_SCHEMA = "unikraft.hyperv.private-local-build"
-PRIVATE_BUILD_SCHEMA_VERSION = 3
+PRIVATE_BUILD_SCHEMA_VERSION = 4
 STATE_FILE = "state.json"
 LOCATION = "northeurope"
 VM_SIZE = "Standard_D2s_v5"
@@ -121,10 +122,132 @@ GUARDED_CONTRACT_SCHEMA = (
     "unikraft.hyperv.guarded-v2-pristine-unavailable"
 )
 GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
-GUARDED_PRODUCER_SCHEMA_VERSION = 2
+GUARDED_PRODUCER_SCHEMA_VERSION = 3
+GUARDED_BUILD_SOURCE_FILES = (
+    "Config.uk",
+    "Makefile",
+    "Makefile.uk",
+    "build.zig",
+    "build.zig.zon",
+    "version.mk",
+    "support/build/Makefile.build",
+    "support/build/Makefile.clean",
+    "support/build/Makefile.graph",
+    "support/build/Makefile.rules",
+    "support/build/build-context.zig",
+    "support/build/cc-version.sh",
+    "support/build/component-api.zig",
+    "support/build/config-submenu.sh",
+    "support/build/elf-common-validator.zig",
+    "support/build/final-link.zig",
+    "support/build/kconfig.zig",
+    "support/build/linker-script.zig",
+    "support/build/lto-symbol-policy.py",
+    "support/build/merge-linker-scripts.py",
+    "support/build/native-config-metadata.py",
+    "support/build/native-config-tool.zig",
+    "support/build/native-image-data.zig",
+    "support/build/native-image-graph.zig",
+    "support/build/native-library-link.zig",
+    "support/build/native-lto.zig",
+    "support/build/native-postprocess-runner.py",
+    "support/build/native-postprocess.zig",
+    "support/build/native-target-object.zig",
+    "support/build/symbols/libukrandom-lcpu.localize",
+    "support/build/target/native-profile.zig",
+    "support/build/zig-facade-paths.zig",
+    "support/build/zig-facade-runner.zig",
+)
 GUARDED_PRODUCER_FILES = {
+    "Config.uk": (
+        "17b791a1bc6709f31846321cb705cd30b141e09eb05f6cd0bcffebb3eba0d50e"
+    ),
+    "Makefile": (
+        "c790738ac50a85be2e7def288a32890a1c2703b9a148ffb2dd633d200305d562"
+    ),
+    "Makefile.uk": (
+        "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
+    ),
     "build.zig": (
         "205df26de46ffaaf27cfd396907a623831410869bf41518b6e6771f95861e40f"
+    ),
+    "build.zig.zon": (
+        "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
+    ),
+    "version.mk": (
+        "cafea59f9f8b9ca7b2d8c15e907cc984f2b8992e52766ed2e826337de0c9503c"
+    ),
+    "support/build/Makefile.build": (
+        "61ae89caa8ca9c5b41d8daf4fd2a855b3c80fec347ae473dd51c0bfa1656b8c8"
+    ),
+    "support/build/Makefile.clean": (
+        "067162c663472b42c09401aba78ed0d1bbb39dd9cb809718a9b12eb8d7aec55f"
+    ),
+    "support/build/Makefile.graph": (
+        "32a17fdb76ae0c52be5b501d6c5270503b4f235f491a2ac508ff22df95edd538"
+    ),
+    "support/build/Makefile.rules": (
+        "a8ad0532d523b7acb632f73ea5c4dc81050740452c747e1fdd3af36884233ee5"
+    ),
+    "support/build/build-context.zig": (
+        "87e9e9c1b396275ed472d746a1d05b610e1fde97a1a9617087ea850e1b0af495"
+    ),
+    "support/build/cc-version.sh": (
+        "fcf53f6cd69d082189c1e1a57c10fb0c34a5c0ac6b5e23f6035562287cfd9ae9"
+    ),
+    "support/build/component-api.zig": (
+        "f34516c624f42b1151d45fe4674e41a3bd8cb76dd03ad279b74afe9feb6860c2"
+    ),
+    "support/build/config-submenu.sh": (
+        "8036c9d1665fcf577b3ac96d28e0fc6196fada7683077884ba85b8ba4ca5f9cd"
+    ),
+    "support/build/elf-common-validator.zig": (
+        "9aa2cd402443fa41ce65040332698859853a89c4916be65a8b032907a4bf108f"
+    ),
+    "support/build/final-link.zig": (
+        "2b2934844c13e511351ae5a6f63fd7f4168a98ee007a1cc37e2411016fb71067"
+    ),
+    "support/build/kconfig.zig": (
+        "e3f8ea0dbb9b136038f4c462e67a88394407e299b0ff87cae803a698d630c624"
+    ),
+    "support/build/linker-script.zig": (
+        "0116adde8d137b22230accc9c07731939558b7e5a5eac0637b44d7386375880f"
+    ),
+    "support/build/lto-symbol-policy.py": (
+        "139c967944d7460b92dcad82c8a2149a56d5698a27f7bc1029b1b789da4b19ce"
+    ),
+    "support/build/merge-linker-scripts.py": (
+        "dd39b9cec861bdf4771fba05c0b477aea37e2b2f1d40d843f31d3c1df011ee3a"
+    ),
+    "support/build/native-config-metadata.py": (
+        "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
+    ),
+    "support/build/native-config-tool.zig": (
+        "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
+    ),
+    "support/build/native-image-data.zig": (
+        "9ac7e0c53a5017ba1cd82152cde1fd3fcd80ae419e5478f9e50752b2a1dd97dc"
+    ),
+    "support/build/native-library-link.zig": (
+        "562a0b713e67e6e3de6897077f6bd18cc0ee135b8522bfaecd6d8c11a61423fe"
+    ),
+    "support/build/native-lto.zig": (
+        "68076583775b233c21447ad580a3a30b653a589c9dd6c8cf994b9eb70cf97974"
+    ),
+    "support/build/native-target-object.zig": (
+        "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
+    ),
+    "support/build/symbols/libukrandom-lcpu.localize": (
+        "b00d5cfee43ae40b56bda292365bf7339d2c8f4239131d632edbebe623e940c6"
+    ),
+    "support/build/target/native-profile.zig": (
+        "ab321fb4434415ddd6ed4e34e173956a9555af91b91f26557b47673b6fe310de"
+    ),
+    "support/build/zig-facade-paths.zig": (
+        "38325cf826d855004e9808924e2687dc70bc42264b952da98f2dce0ad801b8f0"
+    ),
+    "support/build/zig-facade-runner.zig": (
+        "5ba4f753fd4a0537564009a47298f242d10a1b831fe6fda00b5172023de8db77"
     ),
     "drivers/hyperv/storvsc/Config.uk": (
         "bc4474ee1655396b74359fc0b40fd5036b2e6219a50f6b6fb6787a0e8daeec6a"
@@ -309,7 +432,7 @@ APPROVED_CAPABILITY_REFERENCE = {
     },
 }
 BUILD_TOOL_NAMES = (
-    "zig", "make", "python", "bison", "flex", "m4",
+    "git", "zig", "make", "python", "bison", "flex", "m4",
     "llvm-nm", "llvm-objcopy", "llvm-objdump", "llvm-readelf",
     "llvm-strip", "bison-data",
 )
@@ -374,6 +497,10 @@ def verify_guarded_producer_sources(repository):
     repository = Path(repository).resolve(strict=True)
     if repository != SUPPORT.parent.resolve(strict=True):
         raise ValueError("Guarded producer must use this repository worktree")
+    if not set(GUARDED_BUILD_SOURCE_FILES).issubset(
+        GUARDED_PRODUCER_FILES
+    ):
+        raise RuntimeError("Guarded build proof closure is incomplete")
     for relative, expected in GUARDED_PRODUCER_FILES.items():
         path = repository / relative
         if (
@@ -774,7 +901,7 @@ def validate_provenance(value):
         value,
         (
             "scheme", "head_commit", "tree_sha256", "tracked_entries",
-            "config",
+            "config", "git",
         ),
         "Private-preflight build provenance",
     )
@@ -795,7 +922,8 @@ def validate_provenance(value):
         raise ValueError("Private-preflight build provenance is invalid")
     require_sha256(value["tree_sha256"], "Tracked source-tree fingerprint")
     require_sha256(config["sha256"], "Solved configuration fingerprint")
-    return {**value, "config": dict(config)}
+    git = validate_tool_record(value["git"], "git")
+    return {**value, "config": dict(config), "git": git}
 
 
 def expected_budget(files, qemu_support):
@@ -1246,7 +1374,8 @@ def validate_private_build(value, provenance, efi, expected_guarded=None):
         receipt["invocation"],
         (
             "engine", "passes", "jobs", "materialization_returncode",
-            "recovery", "app", "profile", "compiler_target", "output",
+            "recovery", "recovery_returncode", "verification_returncode",
+            "app", "profile", "compiler_target", "output",
         ),
         "Private local build invocation",
     )
@@ -1261,14 +1390,28 @@ def validate_private_build(value, provenance, efi, expected_guarded=None):
     }
     materialization_returncode = invocation["materialization_returncode"]
     recovery = invocation["recovery"]
+    recovery_returncode = invocation["recovery_returncode"]
+    verification_returncode = invocation["verification_returncode"]
     if (
         type(materialization_returncode) is not int
-        or not -255 <= materialization_returncode <= 255
+        or materialization_returncode != 0
         or recovery not in ("none", "uk-reloc-v1")
-        or (recovery == "none" and materialization_returncode != 0)
+        or (recovery == "none" and recovery_returncode is not None)
+        or (
+            recovery == "uk-reloc-v1"
+            and (
+                type(recovery_returncode) is not int
+                or recovery_returncode != 0
+            )
+        )
+        or type(verification_returncode) is not int
+        or verification_returncode != 0
         or {
             key: value for key, value in invocation.items()
-            if key not in ("materialization_returncode", "recovery")
+            if key not in (
+                "materialization_returncode", "recovery",
+                "recovery_returncode", "verification_returncode",
+            )
         } != expected_invocation
     ):
         raise ValueError("Private local build invocation is incompatible")
@@ -1279,6 +1422,8 @@ def validate_private_build(value, provenance, efi, expected_guarded=None):
         name: validate_tool_record(tools[name], name)
         for name in BUILD_TOOL_NAMES
     }
+    if tools["git"] != provenance["git"]:
+        raise ValueError("Private build Git tool is unrelated to provenance")
     output = exact_fields(
         receipt["output"], ("name", "sha256", "size"),
         "Private local build output",
@@ -1314,9 +1459,9 @@ def load_receipt(path, name, description):
     }
 
 
-def git_output(repository, arguments):
+def git_output(git_path, repository, arguments):
     result = subprocess.run(
-        ["git", "-C", str(repository), *arguments],
+        [str(git_path), "-C", str(repository), *arguments],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=60,
@@ -1327,20 +1472,29 @@ def git_output(repository, arguments):
     return result.stdout
 
 
-def build_provenance(repository, config_path):
+def build_provenance(repository, config_path, git_path):
     repository = repository.resolve(strict=True)
     if repository != SUPPORT.parent.resolve(strict=True):
         raise ValueError("Source provenance must use this repository worktree")
+    git_path = Path(git_path).resolve(strict=True)
+    git = local_tool_record(git_path, "git")
     if git_output(
+        git_path,
         repository,
         ["status", "--porcelain=v1", "--untracked-files=no", "-z"],
     ):
         raise ValueError("Source provenance requires a clean tracked worktree")
-    head = git_output(repository, ["rev-parse", "HEAD"]).decode().strip()
+    head = git_output(
+        git_path, repository, ["rev-parse", "HEAD"]
+    ).decode().strip()
     tree = git_output(
-        repository, ["ls-tree", "-r", "--full-tree", "-z", "HEAD"]
+        git_path, repository, ["ls-tree", "-r", "--full-tree", "-z", "HEAD"]
     )
-    if not GIT_COMMIT.fullmatch(head) or not tree:
+    if (
+        not GIT_COMMIT.fullmatch(head)
+        or not tree
+        or local_tool_record(git_path, "git") != git
+    ):
         raise ValueError("Git source provenance is invalid")
     config = regular_record(config_path, SOLVED_CONFIG, "Solved configuration")
     return {
@@ -1349,6 +1503,7 @@ def build_provenance(repository, config_path):
         "tree_sha256": hashlib.sha256(tree).hexdigest(),
         "tracked_entries": tree.count(b"\0"),
         "config": config,
+        "git": git,
     }
 
 
@@ -1377,12 +1532,12 @@ def write_tool_wrapper(path, executable, environment=None):
 def build_private_image(
     output_directory, repository, config_path, zig_path, make_path,
     python_path, bison_path, flex_path, m4_path, bison_data,
-    llvm_directory, timeout,
+    llvm_directory, git_path, timeout,
 ):
     if type(timeout) is not int or not 1 <= timeout <= 3600:
         raise ValueError("Private local build timeout must be 1-3600 seconds")
     repository = Path(repository).resolve(strict=True)
-    source_before = build_provenance(repository, config_path)
+    source_before = build_provenance(repository, config_path, git_path)
     guarded = guarded_contract_from_solved_config(config_path)
     if guarded is not None:
         verify_guarded_producer_sources(repository)
@@ -1394,6 +1549,7 @@ def build_private_image(
         output_directory, "Private local build directory", must_exist=False
     )
     tools = {
+        "git": local_tool_record(git_path, "git"),
         "zig": local_tool_record(zig_path, "zig"),
         "make": local_tool_record(make_path, "make"),
         "python": local_tool_record(python_path, "python"),
@@ -1401,8 +1557,11 @@ def build_private_image(
         "flex": local_tool_record(flex_path, "flex"),
         "m4": local_tool_record(m4_path, "m4"),
     }
+    if tools["git"] != source_before["git"]:
+        raise ValueError("Private Git executable changed before native build")
     zig_invocation = Path(zig_path).absolute()
     resolved = {
+        "git": Path(git_path).resolve(strict=True),
         "zig": zig_invocation,
         "make": Path(make_path).resolve(strict=True),
         "python": Path(python_path).resolve(strict=True),
@@ -1436,6 +1595,7 @@ def build_private_image(
         source_before["config"],
     )
     wrapper_tools = {
+        "git": ("git", None),
         "zig": ("zig", None),
         "make": ("make", None),
         "python3": ("python", None),
@@ -1508,13 +1668,19 @@ def build_private_image(
 
         def run_process(argv, label):
             nonlocal written
-            log.write(f"=== {label} ===\n".encode())
+            header = f"=== {label} ===\n".encode()
+            if written + len(header) > 8 * 1024 * 1024:
+                raise RuntimeError(
+                    "Private local native build log exceeded 8 MiB"
+                )
+            log.write(header)
+            written += len(header)
             process = subprocess.Popen(
                 argv, cwd=repository, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 env=environment, start_new_session=True,
             )
-            tail = bytearray()
+            output = bytearray()
 
             def drain_output():
                 nonlocal written
@@ -1525,9 +1691,8 @@ def build_private_image(
                     if remaining > 0:
                         log.write(chunk[:remaining])
                         written += min(len(chunk), remaining)
-                    tail.extend(chunk)
-                    if len(tail) > 256 * 1024:
-                        del tail[:-256 * 1024]
+                    if len(chunk) <= remaining:
+                        output.extend(chunk)
                     if len(chunk) > remaining:
                         overflow.set()
                         try:
@@ -1559,27 +1724,45 @@ def build_private_image(
                 raise RuntimeError(
                     "Private local native build log exceeded 8 MiB"
                 )
-            return returncode, bytes(tail)
+            return returncode, bytes(output)
 
-        materialization_returncode, tail = run_process(
+        def failure_commands(output, label):
+            try:
+                text = output.decode("utf-8")
+            except UnicodeDecodeError:
+                raise RuntimeError(
+                    f"Private local native {label} output is not UTF-8"
+                ) from None
+            failed = []
+            for line in text.splitlines():
+                if "failed command:" not in line:
+                    continue
+                if (
+                    not line.startswith("failed command: ")
+                    or line.count("failed command:") != 1
+                    or not line[len("failed command: "):]
+                ):
+                    raise RuntimeError(
+                        f"Private local native {label} failure evidence "
+                        "is ambiguous"
+                    )
+                failed.append(line[len("failed command: "):])
+            return failed
+
+        materialization_returncode, materialization_output = run_process(
             command,
             "native build materialization pass"
         )
         recovery = "none"
-        try:
-            text = tail.decode("utf-8")
-        except UnicodeDecodeError:
-            if materialization_returncode:
-                raise RuntimeError(
-                    "Private local native build failed before verification"
-                ) from None
-            text = ""
-        failed = [
-            line[len("failed command: "):]
-            for line in text.splitlines()
-            if line.startswith("failed command: ")
-        ]
-        if materialization_returncode or failed:
+        recovery_returncode = None
+        failed = failure_commands(
+            materialization_output, "materialization pass"
+        )
+        if materialization_returncode:
+            raise RuntimeError(
+                "Private local native build failed before verification"
+            )
+        if failed:
             if len(failed) != 1:
                 raise RuntimeError(
                     "Private local native build failed before verification"
@@ -1652,24 +1835,30 @@ def build_private_image(
                 str(relocations_path),
                 str(output_path),
             ]
-            recovery_returncode, _ = run_process(
+            recovery_returncode, recovery_output = run_process(
                 recovery_command, "bounded native uk-reloc recovery"
             )
-            if recovery_returncode:
+            if (
+                recovery_returncode
+                or failure_commands(recovery_output, "recovery pass")
+            ):
                 raise RuntimeError(
                     "Private local native build recovery failed"
                 )
             recovery = "uk-reloc-v1"
-        returncode, _ = run_process(
+        verification_returncode, verification_output = run_process(
             command, "native build verification pass"
         )
         log.flush()
         os.fsync(log.fileno())
-    if returncode:
+    if (
+        verification_returncode
+        or failure_commands(verification_output, "verification pass")
+    ):
         raise RuntimeError(
             "Private local native build failed; inspect its owner-only log"
         )
-    source_after = build_provenance(repository, config)
+    source_after = build_provenance(repository, config, resolved["git"])
     if source_after != source_before:
         raise RuntimeError("Private source or configuration changed during build")
     if local_tool_record(zig_invocation, "zig") != tools["zig"]:
@@ -1690,6 +1879,8 @@ def build_private_image(
             "jobs": 2,
             "materialization_returncode": materialization_returncode,
             "recovery": recovery,
+            "recovery_returncode": recovery_returncode,
+            "verification_returncode": verification_returncode,
             "app": "support/apps/hyperv-acceptance",
             "profile": "hyperv-x86_64-efi-netvsc",
             "compiler_target": "x86_64-freestanding-none",
@@ -1772,12 +1963,12 @@ def copy_record(source, destination, record):
 def generate_input(
     output_directory, repository, config_path, qemu_root, ovmf_code,
     ovmf_vars, capability_raw, capability_receipt, efi, build_receipt,
-    raw, vhd, miz_path, boot_policy,
+    raw, vhd, miz_path, git_path, boot_policy,
 ):
     check_blob_dependency()
     if boot_policy not in BOOT_POLICIES:
         raise ValueError("Unsupported platform-only boot policy")
-    provenance = build_provenance(repository, config_path)
+    provenance = build_provenance(repository, config_path, git_path)
     guarded = guarded_contract_from_solved_config(config_path)
     if guarded is not None:
         verify_guarded_producer_sources(repository)
@@ -1877,6 +2068,12 @@ def generate_input(
             output_directory / PRIVATE_BUILD_RECEIPT,
             private_build,
         )
+        copy_record(
+            Path(git_path).resolve(strict=True),
+            output_directory / GIT_TOOL,
+            provenance["git"],
+        )
+        (output_directory / GIT_TOOL).chmod(0o700)
         packaging = azure.miz_command(
             miz_path.resolve(strict=True),
             [
@@ -1945,7 +2142,7 @@ def load_input_manifest(input_directory, expected_sha256):
         raise ValueError("Private-preflight manifest digest does not match")
     expected_names = {
         INPUT_MANIFEST, SOLVED_CONFIG, CAPABILITY_REFERENCE,
-        PRIVATE_BUILD_RECEIPT, "qemu",
+        PRIVATE_BUILD_RECEIPT, GIT_TOOL, "qemu",
         *(Path(name).parts[0] for role, name in INPUT_NAMES.items()
           if role != "qemu"),
     }
@@ -1974,10 +2171,19 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
         input_directory, expected_sha256
     )
     check_blob_dependency()
+    git_source = source / GIT_TOOL
+    if (
+        git_source.is_symlink()
+        or not git_source.is_file()
+        or not os.access(git_source, os.X_OK)
+        or local_tool_record(git_source, "git")
+        != manifest["provenance"]["git"]
+    ):
+        raise ValueError("Pinned Git executable does not match the manifest")
     if (
         manifest["implementation"] != implementation_contract()
         or build_provenance(
-            SUPPORT.parent, source / SOLVED_CONFIG
+            SUPPORT.parent, source / SOLVED_CONFIG, git_source
         ) != manifest["provenance"]
     ):
         raise ValueError(
@@ -2046,6 +2252,12 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
         )
         copied_miz = local_tools / "miz"
         copied_miz.chmod(0o700)
+        copy_record(
+            git_source, local_tools / GIT_TOOL,
+            manifest["provenance"]["git"],
+        )
+        copied_git = local_tools / GIT_TOOL
+        copied_git.chmod(0o700)
         checked = azure.miz_command(copied_miz, [
             "check-efi-application", "--output=json",
             "--architecture", "x86_64",
@@ -2322,12 +2534,17 @@ def verify_immutable_inputs(state, state_directory):
             raise ValueError("Prepared QEMU support closure changed")
     config = manifest["provenance"]["config"]
     config_path = state_directory / "inputs" / config["name"]
+    git = state_directory / "local-tools" / GIT_TOOL
     if (
         config_path.is_symlink()
         or not config_path.is_file()
         or config_path.stat().st_size != config["size"]
         or azure.image_sha256(config_path) != config["sha256"]
-        or build_provenance(SUPPORT.parent, config_path)
+        or git.is_symlink()
+        or not git.is_file()
+        or not os.access(git, os.X_OK)
+        or local_tool_record(git, "git") != manifest["provenance"]["git"]
+        or build_provenance(SUPPORT.parent, config_path, git)
         != manifest["provenance"]
     ):
         raise ValueError("Prepared source or solved configuration changed")
@@ -4322,17 +4539,29 @@ def _load_completed_host_evidence(
         "Completed private host evidence receipt",
     ):
         raise ValueError("Completed private host evidence receipt is stale")
-    return receipt, digest
+    return receipt, digest, (
+        len(receipt_bytes) + sum(len(raw) for raw in logs.values())
+    )
 
 
 def load_completed_receipt(state_directory):
     state, state_path = load_state(state_directory)
     state_directory = state_path.parent
+    deployment = state.get("host_deployment")
     if (
         state.get("phase") != "complete"
         or state["cleanup_required"] is not False
         or state["pending_secret_files"] != []
         or state.get("firewall_obligation") is not None
+        or state.get("active_sas") is not False
+        or "active_sas_signing_key_sha256" not in state
+        or state["active_sas_signing_key_sha256"] is not None
+        or state.get("host_deallocated") is not True
+        or not isinstance(deployment, dict)
+        or deployment.get("phase") != "resources-verified"
+        or not isinstance(state.get("resource_group_id"), str)
+        or state.get("failure") is not None
+        or state.get("cleanup_failure") is not None
     ):
         raise ValueError("Private preflight is not completely cleaned")
     verify_immutable_inputs(state, state_directory)
@@ -4356,19 +4585,30 @@ def load_completed_receipt(state_directory):
         "Completed private manifest",
     ):
         raise ValueError("Completed private manifest is stale")
-    capability_receipt, capability_receipt_sha256 = (
+    (
+        capability_receipt,
+        capability_receipt_sha256,
+        capability_evidence_bytes,
+    ) = (
         _load_completed_host_evidence(
             state, state_directory, "capability", capability_manifest
         )
     )
-    private_receipt, private_receipt_sha256 = _load_completed_host_evidence(
+    (
+        private_receipt,
+        private_receipt_sha256,
+        private_evidence_bytes,
+    ) = _load_completed_host_evidence(
         state, state_directory, "private", private_manifest
     )
     if (
         capability_receipt["host_boot_id"]
         != private_receipt["host_boot_id"]
+        or state["evidence_bytes"]
+        != capability_evidence_bytes + private_evidence_bytes
+        or state["control_payload_bytes"] <= 0
     ):
-        raise ValueError("Completed private host boot identity changed")
+        raise ValueError("Completed private host evidence is inconsistent")
 
     receipt_path = state_directory / "private-receipt.json"
     receipt_bytes = azure.read_regular_file(
@@ -4471,7 +4711,31 @@ def load_completed_receipt(state_directory):
     ):
         raise ValueError("Completed private host image is stale")
 
-    deployment = state.get("host_deployment")
+    group_id = state["resource_group_id"].rstrip("/")
+    prefix = state["name_prefix"]
+    expected_resource_ids = {
+        "host_vm_id": deployment["vm_id"],
+        "host_disk_id": deployment["disk_id"],
+        "host_nic_id": (
+            f"{group_id}/providers/Microsoft.Network/"
+            f"networkInterfaces/{prefix}-host-nic"
+        ),
+        "storage_account_id": (
+            f"{group_id}/providers/Microsoft.Storage/"
+            f"storageAccounts/{state['storage_account']}"
+        ),
+        "shutdown_schedule_id": (
+            f"{group_id}/providers/Microsoft.DevTestLab/schedules/"
+            f"shutdown-computevm-{prefix}-host"
+        ),
+    }
+    if any(
+        not isinstance(state.get(field), str)
+        or state[field].lower() != expected.lower()
+        for field, expected in expected_resource_ids.items()
+    ):
+        raise ValueError("Completed private host resource binding is stale")
+
     host = exact_fields(
         receipt["host"],
         (
@@ -4801,6 +5065,7 @@ def main():
     build_parser.add_argument("--m4", type=Path, required=True)
     build_parser.add_argument("--bison-data", type=Path, required=True)
     build_parser.add_argument("--llvm-bin", type=Path, required=True)
+    build_parser.add_argument("--git", type=Path, required=True)
     build_parser.add_argument("--timeout", type=int, default=1800)
     generate_parser = subparsers.add_parser("generate-input")
     generate_parser.add_argument("--output-dir", type=Path, required=True)
@@ -4824,6 +5089,7 @@ def main():
     generate_parser.add_argument("--private-raw", type=Path, required=True)
     generate_parser.add_argument("--private-vhd", type=Path, required=True)
     generate_parser.add_argument("--miz", type=Path, required=True)
+    generate_parser.add_argument("--git", type=Path, required=True)
     generate_parser.add_argument(
         "--boot-policy", choices=BOOT_POLICIES, required=True
     )
@@ -4851,7 +5117,8 @@ def main():
             build_private_image(
                 args.output_dir, args.repository, args.solved_config,
                 args.zig, args.make, args.python, args.bison, args.flex,
-                args.m4, args.bison_data, args.llvm_bin, args.timeout,
+                args.m4, args.bison_data, args.llvm_bin, args.git,
+                args.timeout,
             )
             print("Private local build completed in owner-only directory")
         elif args.action == "generate-input":
@@ -4869,6 +5136,7 @@ def main():
                 args.private_raw,
                 args.private_vhd,
                 args.miz,
+                args.git,
                 args.boot_policy,
             )
             print(

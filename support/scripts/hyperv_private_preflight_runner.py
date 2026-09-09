@@ -66,10 +66,97 @@ GUARDED_CONTRACT_SCHEMA = (
     "unikraft.hyperv.guarded-v2-pristine-unavailable"
 )
 GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
-GUARDED_PRODUCER_SCHEMA_VERSION = 2
+GUARDED_PRODUCER_SCHEMA_VERSION = 3
 GUARDED_PRODUCER_FILES = {
+    "Config.uk": (
+        "17b791a1bc6709f31846321cb705cd30b141e09eb05f6cd0bcffebb3eba0d50e"
+    ),
+    "Makefile": (
+        "c790738ac50a85be2e7def288a32890a1c2703b9a148ffb2dd633d200305d562"
+    ),
+    "Makefile.uk": (
+        "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
+    ),
     "build.zig": (
         "205df26de46ffaaf27cfd396907a623831410869bf41518b6e6771f95861e40f"
+    ),
+    "build.zig.zon": (
+        "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
+    ),
+    "version.mk": (
+        "cafea59f9f8b9ca7b2d8c15e907cc984f2b8992e52766ed2e826337de0c9503c"
+    ),
+    "support/build/Makefile.build": (
+        "61ae89caa8ca9c5b41d8daf4fd2a855b3c80fec347ae473dd51c0bfa1656b8c8"
+    ),
+    "support/build/Makefile.clean": (
+        "067162c663472b42c09401aba78ed0d1bbb39dd9cb809718a9b12eb8d7aec55f"
+    ),
+    "support/build/Makefile.graph": (
+        "32a17fdb76ae0c52be5b501d6c5270503b4f235f491a2ac508ff22df95edd538"
+    ),
+    "support/build/Makefile.rules": (
+        "a8ad0532d523b7acb632f73ea5c4dc81050740452c747e1fdd3af36884233ee5"
+    ),
+    "support/build/build-context.zig": (
+        "87e9e9c1b396275ed472d746a1d05b610e1fde97a1a9617087ea850e1b0af495"
+    ),
+    "support/build/cc-version.sh": (
+        "fcf53f6cd69d082189c1e1a57c10fb0c34a5c0ac6b5e23f6035562287cfd9ae9"
+    ),
+    "support/build/component-api.zig": (
+        "f34516c624f42b1151d45fe4674e41a3bd8cb76dd03ad279b74afe9feb6860c2"
+    ),
+    "support/build/config-submenu.sh": (
+        "8036c9d1665fcf577b3ac96d28e0fc6196fada7683077884ba85b8ba4ca5f9cd"
+    ),
+    "support/build/elf-common-validator.zig": (
+        "9aa2cd402443fa41ce65040332698859853a89c4916be65a8b032907a4bf108f"
+    ),
+    "support/build/final-link.zig": (
+        "2b2934844c13e511351ae5a6f63fd7f4168a98ee007a1cc37e2411016fb71067"
+    ),
+    "support/build/kconfig.zig": (
+        "e3f8ea0dbb9b136038f4c462e67a88394407e299b0ff87cae803a698d630c624"
+    ),
+    "support/build/linker-script.zig": (
+        "0116adde8d137b22230accc9c07731939558b7e5a5eac0637b44d7386375880f"
+    ),
+    "support/build/lto-symbol-policy.py": (
+        "139c967944d7460b92dcad82c8a2149a56d5698a27f7bc1029b1b789da4b19ce"
+    ),
+    "support/build/merge-linker-scripts.py": (
+        "dd39b9cec861bdf4771fba05c0b477aea37e2b2f1d40d843f31d3c1df011ee3a"
+    ),
+    "support/build/native-config-metadata.py": (
+        "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
+    ),
+    "support/build/native-config-tool.zig": (
+        "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
+    ),
+    "support/build/native-image-data.zig": (
+        "9ac7e0c53a5017ba1cd82152cde1fd3fcd80ae419e5478f9e50752b2a1dd97dc"
+    ),
+    "support/build/native-library-link.zig": (
+        "562a0b713e67e6e3de6897077f6bd18cc0ee135b8522bfaecd6d8c11a61423fe"
+    ),
+    "support/build/native-lto.zig": (
+        "68076583775b233c21447ad580a3a30b653a589c9dd6c8cf994b9eb70cf97974"
+    ),
+    "support/build/native-target-object.zig": (
+        "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
+    ),
+    "support/build/symbols/libukrandom-lcpu.localize": (
+        "b00d5cfee43ae40b56bda292365bf7339d2c8f4239131d632edbebe623e940c6"
+    ),
+    "support/build/target/native-profile.zig": (
+        "ab321fb4434415ddd6ed4e34e173956a9555af91b91f26557b47673b6fe310de"
+    ),
+    "support/build/zig-facade-paths.zig": (
+        "38325cf826d855004e9808924e2687dc70bc42264b952da98f2dce0ad801b8f0"
+    ),
+    "support/build/zig-facade-runner.zig": (
+        "5ba4f753fd4a0537564009a47298f242d10a1b831fe6fda00b5172023de8db77"
     ),
     "drivers/hyperv/storvsc/Config.uk": (
         "bc4474ee1655396b74359fc0b40fd5036b2e6219a50f6b6fb6787a0e8daeec6a"
