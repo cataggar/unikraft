@@ -315,8 +315,11 @@ explicit VM deallocation, and owner-checked resource-group deletion
 independently. Firewall intent is persisted before
 the add call and remains pending until exact absence is re-read, including
 after interrupted processes. It persists the original deployment operation
-before create, records VM proof independently, and records immutable OS-disk
-identity/attachment proof without tag adoption. It refuses VM/group cascade
+before create. A successful deployment must return server-side ARM outputs
+for the original VM `vmId` and OS-disk `uniqueId`; both immutable anchors are
+recorded together before any live VM or disk query. Live reads may only
+confirm those anchors, never fill or replace them from matching names, tags,
+resource IDs, images, or attachments. It refuses VM/group cascade
 for an unknown, detached, replaced, or foreign disk. Required ownership tags
 may contain additive Azure metadata, but tags never substitute for persisted
 VM UUID, disk UUID, attachment, and original deployment proof. Untagged

@@ -336,5 +336,15 @@
         }
       }
     }
-  ]
+  ],
+  "outputs": {
+    "hostVmUuid": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', variables('hostName')), '2025-11-01').vmId]"
+    },
+    "hostDiskUuid": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Compute/disks', variables('hostDiskName')), '2025-01-02').uniqueId]"
+    }
+  }
 }

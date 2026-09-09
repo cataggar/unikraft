@@ -1606,6 +1606,36 @@ def load_state(directory):
                     host_deployment[field],
                     "Private host deployment identity",
                 )
+        phase = host_deployment["phase"]
+        correlation = host_deployment["correlation_id"]
+        vm_uuid = host_deployment["vm_uuid"]
+        disk_uuid = host_deployment["disk_uuid"]
+        if (
+            ((vm_uuid is None) != (disk_uuid is None))
+            or (phase == "pending" and any(
+                value is not None
+                for value in (correlation, vm_uuid, disk_uuid)
+            ))
+            or (
+                phase in (
+                    "deployment-succeeded", "vm-verified",
+                    "resources-verified",
+                )
+                and any(
+                    value is None
+                    for value in (correlation, vm_uuid, disk_uuid)
+                )
+            )
+            or (
+                phase in (
+                    "failed-no-compute", "not-created-empty",
+                )
+                and (vm_uuid is not None or disk_uuid is not None)
+            )
+        ):
+            raise ValueError(
+                "Private host deployment identity anchors are invalid"
+            )
     subscription = state.get("subscription")
     if subscription is not None:
         azure.validate_subscription_id(subscription)
@@ -2251,8 +2281,44 @@ class PrivatePreflightRun(azure.AzureRun):
             properties.get("correlationId"),
             "Private host deployment correlation",
         )
-        receipt = {**receipt, "phase": "deployment-succeeded",
-                   "correlation_id": correlation}
+        if receipt.get("correlation_id") not in (None, correlation):
+            raise RuntimeError(
+                "Private host deployment correlation changed"
+            )
+        outputs = properties.get("outputs")
+        if not isinstance(outputs, dict) or set(outputs) != {
+            "hostVmUuid", "hostDiskUuid",
+        }:
+            raise RuntimeError(
+                "Private host deployment identity outputs are invalid"
+            )
+        identities = {}
+        for output, field, label in (
+            ("hostVmUuid", "vm_uuid", "Private host VM identity"),
+            ("hostDiskUuid", "disk_uuid", "Private host disk identity"),
+        ):
+            value = outputs.get(output)
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"type", "value"}
+                or value.get("type") != "String"
+            ):
+                raise RuntimeError(
+                    "Private host deployment identity outputs are invalid"
+                )
+            identities[field] = self.require_resource_uuid(
+                value.get("value"), label
+            )
+            if receipt.get(field) not in (None, identities[field]):
+                raise RuntimeError(
+                    "Private host deployment identity anchor changed"
+                )
+        receipt = {
+            **receipt,
+            "phase": "deployment-succeeded",
+            "correlation_id": correlation,
+            **identities,
+        }
         self.record(
             "host-deployment-succeeded", host_deployment=receipt
         )
@@ -2267,8 +2333,12 @@ class PrivatePreflightRun(azure.AzureRun):
                 "resources-verified",
             )
             or receipt.get("correlation_id") is None
+            or receipt.get("vm_uuid") is None
+            or receipt.get("disk_uuid") is None
         ):
-            raise RuntimeError("Private host deployment is not proven")
+            raise RuntimeError(
+                "Private host deployment identities are not anchored"
+            )
         vm = self.az([
             "vm", "show", "--resource-group", self.group,
             "--name", self.host_vm,
@@ -2290,12 +2360,11 @@ class PrivatePreflightRun(azure.AzureRun):
         vm_uuid = self.require_resource_uuid(
             vm.get("vmId"), "Private host VM identity"
         )
-        if receipt.get("vm_uuid") not in (None, vm_uuid):
+        if receipt["vm_uuid"] != vm_uuid:
             raise RuntimeError("Private host VM identity changed")
         receipt = {
             **receipt,
             "phase": "vm-verified",
-            "vm_uuid": vm_uuid,
         }
         self.record("host-vm-verified", host_deployment=receipt)
         self.verify_vm_identity()
@@ -2311,13 +2380,12 @@ class PrivatePreflightRun(azure.AzureRun):
             != expected_vm.lower()
         ):
             raise RuntimeError("Private host disk provenance is invalid")
-        receipt = {
-            **receipt,
-            "phase": "resources-verified",
-            "disk_uuid": self.require_resource_uuid(
-                disk.get("uniqueId"), "Private host disk identity"
-            ),
-        }
+        disk_uuid = self.require_resource_uuid(
+            disk.get("uniqueId"), "Private host disk identity"
+        )
+        if receipt["disk_uuid"] != disk_uuid:
+            raise RuntimeError("Private host disk identity changed")
+        receipt = {**receipt, "phase": "resources-verified"}
         self.record("host-resources-verified", host_deployment=receipt)
         settling_deadline = min(
             (
@@ -2493,8 +2561,10 @@ class PrivatePreflightRun(azure.AzureRun):
                             "host-deployment-terminal",
                             host_deployment=terminal,
                         )
-                        self.capture_host_identity(deadline)
-                        return True
+                        raise RuntimeError(
+                            "Terminal private host deployment left "
+                            "unanchored compute resources"
+                        )
                     failed = {**receipt, "phase": "failed-no-compute"}
                     self.record(
                         "host-deployment-failed-no-compute",

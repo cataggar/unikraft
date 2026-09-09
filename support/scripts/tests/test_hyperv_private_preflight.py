@@ -397,6 +397,16 @@ class PrivatePreflightFixture(unittest.TestCase):
             "properties": {
                 "provisioningState": provisioning,
                 "correlationId": "33333333-3333-4333-8333-333333333333",
+                "outputs": {
+                    "hostVmUuid": {
+                        "type": "String",
+                        "value": "44444444-4444-4444-8444-444444444444",
+                    },
+                    "hostDiskUuid": {
+                        "type": "String",
+                        "value": "55555555-5555-4555-8555-555555555555",
+                    },
+                },
                 "parameters": {
                     name: {"value": value}
                     for name, value in parameters.items()
@@ -1144,6 +1154,15 @@ class PrivatePreflightTemplateTest(PrivatePreflightFixture):
             template["variables"]["tags"]["preflight-operation"],
             "[parameters('operationId')]",
         )
+        self.assertEqual(
+            set(template["outputs"]), {"hostVmUuid", "hostDiskUuid"}
+        )
+        self.assertIn(
+            ".vmId", template["outputs"]["hostVmUuid"]["value"]
+        )
+        self.assertIn(
+            ".uniqueId", template["outputs"]["hostDiskUuid"]["value"]
+        )
         resources = template["resources"]
         kinds = [resource["type"] for resource in resources]
         self.assertEqual(
@@ -1247,6 +1266,15 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             self.assertIs(state["host_deployment"], receipt)
             run.record.assert_called_once()
 
+    def test_partial_persisted_identity_anchors_are_invalid(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run, state = self.run_fixture(root)
+            self.begin_operation(run, state, "vm-verified")
+            preflight.azure.save_json(run.state_path, state)
+            with self.assertRaisesRegex(ValueError, "anchors are invalid"):
+                preflight.load_state(root)
+
     def test_ambiguous_create_reconciles_only_original_deployment(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
@@ -1265,6 +1293,14 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             self.assertEqual(
                 state["host_deployment"]["correlation_id"],
                 "33333333-3333-4333-8333-333333333333",
+            )
+            self.assertEqual(
+                state["host_deployment"]["vm_uuid"],
+                "44444444-4444-4444-8444-444444444444",
+            )
+            self.assertEqual(
+                state["host_deployment"]["disk_uuid"],
+                "55555555-5555-4555-8555-555555555555",
             )
 
     def test_missing_original_deployment_needs_repeated_empty_inventory(self):
@@ -1294,6 +1330,10 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
             self.begin_operation(run, state, "deployment-succeeded")
+            state["host_deployment"].update({
+                "vm_uuid": "44444444-4444-4444-8444-444444444444",
+                "disk_uuid": "55555555-5555-4555-8555-555555555555",
+            })
             vm, disk = self.vm_disk(run, state)
             run.az.side_effect = [vm, vm, disk, vm, disk]
             run.capture_host_identity()
@@ -1307,6 +1347,10 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
             self.begin_operation(run, state, "deployment-succeeded")
+            state["host_deployment"].update({
+                "vm_uuid": "44444444-4444-4444-8444-444444444444",
+                "disk_uuid": "55555555-5555-4555-8555-555555555555",
+            })
             vm, disk = self.vm_disk(run, state)
             disk["tags"] = {}
             run.az.side_effect = [vm, vm, disk]
@@ -1336,10 +1380,14 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             self.assertEqual(settled, (vm, disk))
             self.assertEqual(run.verify_host_identity.call_count, 2)
 
-    def test_partial_deployment_persists_vm_proof_for_deallocation(self):
+    def test_partial_live_read_preserves_deployment_identity_anchors(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
-            self.begin_operation(run, state, "deployment-terminal")
+            self.begin_operation(run, state, "deployment-succeeded")
+            state["host_deployment"].update({
+                "vm_uuid": "44444444-4444-4444-8444-444444444444",
+                "disk_uuid": "55555555-5555-4555-8555-555555555555",
+            })
             vm, _ = self.vm_disk(run, state)
             run.az.side_effect = [
                 vm, vm, RuntimeError("disk unavailable"),
@@ -1347,6 +1395,10 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             with self.assertRaisesRegex(RuntimeError, "disk unavailable"):
                 run.capture_host_identity()
             self.assertEqual(state["host_deployment"]["phase"], "vm-verified")
+            self.assertEqual(
+                state["host_deployment"]["disk_uuid"],
+                "55555555-5555-4555-8555-555555555555",
+            )
             view = {
                 "instanceView": {
                     "statuses": [{"code": "PowerState/deallocated"}]
@@ -1361,6 +1413,119 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             ]
             run.deallocate_host()
             self.assertTrue(state["host_deallocated"])
+
+    def test_reconcile_refuses_replacement_before_first_live_vm_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "pending")
+            deployment = self.deployment(run, state)
+            replacement, _ = self.vm_disk(run, state)
+            replacement["vmId"] = (
+                "66666666-6666-4666-8666-666666666666"
+            )
+            run.az.side_effect = [deployment, replacement]
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                run.reconcile_host_deployment(time.monotonic() + 10)
+            self.assertEqual(
+                state["host_deployment"]["vm_uuid"],
+                "44444444-4444-4444-8444-444444444444",
+            )
+            self.assertFalse(any(
+                call.args[0][:2] == ["vm", "deallocate"]
+                for call in run.az.call_args_list
+            ))
+
+    def test_observed_vm_anchor_cannot_be_reenrolled_after_disk_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "deployment-succeeded")
+            state["host_deployment"].update({
+                "vm_uuid": "44444444-4444-4444-8444-444444444444",
+                "disk_uuid": "55555555-5555-4555-8555-555555555555",
+            })
+            original, _ = self.vm_disk(run, state)
+            run.az.side_effect = [
+                original, original, RuntimeError("disk unavailable"),
+            ]
+            with self.assertRaisesRegex(RuntimeError, "disk unavailable"):
+                run.capture_host_identity()
+            replacement = {
+                **original,
+                "vmId": "66666666-6666-4666-8666-666666666666",
+            }
+            run.az.reset_mock()
+            run.az.side_effect = None
+            run.az.return_value = replacement
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                run.reconcile_host_deployment(time.monotonic() + 10)
+            self.assertEqual(
+                state["host_deployment"]["vm_uuid"],
+                "44444444-4444-4444-8444-444444444444",
+            )
+            self.assertEqual(
+                state["host_deployment"]["disk_uuid"],
+                "55555555-5555-4555-8555-555555555555",
+            )
+            self.assertFalse(any(
+                call.args[0][:2] == ["vm", "deallocate"]
+                for call in run.az.call_args_list
+            ))
+
+    def test_success_without_server_identity_outputs_cannot_adopt_live_vm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "pending")
+            deployment = self.deployment(run, state)
+            del deployment["properties"]["outputs"]
+            run.az.return_value = deployment
+            with self.assertRaisesRegex(RuntimeError, "outputs are invalid"):
+                run.reconcile_host_deployment(time.monotonic() + 10)
+            self.assertIsNone(state["host_deployment"]["vm_uuid"])
+            self.assertIsNone(state["host_deployment"]["disk_uuid"])
+            self.assertFalse(any(
+                call.args[0][:2] == ["vm", "show"]
+                for call in run.az.call_args_list
+            ))
+
+    def test_deployment_correlation_anchor_is_monotonic(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "deployment-succeeded")
+            state["host_deployment"].update({
+                "vm_uuid": "44444444-4444-4444-8444-444444444444",
+                "disk_uuid": "55555555-5555-4555-8555-555555555555",
+            })
+            deployment = self.deployment(run, state)
+            deployment["properties"]["correlationId"] = (
+                "77777777-7777-4777-8777-777777777777"
+            )
+            with self.assertRaisesRegex(RuntimeError, "correlation changed"):
+                run.validate_deployment_result(deployment)
+            self.assertEqual(
+                state["host_deployment"]["correlation_id"],
+                "33333333-3333-4333-8333-333333333333",
+            )
+
+    def test_failed_deployment_compute_without_outputs_is_not_adopted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "pending")
+            deployment = self.deployment(run, state, "Failed")
+            vm, _ = self.vm_disk(run, state)
+            run.az.side_effect = [deployment, [vm]]
+            with self.assertRaisesRegex(RuntimeError, "unanchored compute"):
+                run.reconcile_host_deployment(time.monotonic() + 10)
+            self.assertEqual(
+                state["host_deployment"]["phase"], "deployment-terminal"
+            )
+            self.assertIsNone(state["host_deployment"]["vm_uuid"])
+            self.assertIsNone(state["host_deployment"]["disk_uuid"])
+            self.assertFalse(any(
+                call.args[0][:2] in (
+                    ["vm", "show"], ["vm", "deallocate"],
+                )
+                for call in run.az.call_args_list
+            ))
 
     def test_cleanup_refuses_matching_name_disk_with_changed_uuid(self):
         with tempfile.TemporaryDirectory() as temporary:
