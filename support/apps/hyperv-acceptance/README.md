@@ -15,8 +15,11 @@ NetVSC device with one RX and one TX queue, completes DHCP through the BOUND
 state, verifies the applied lease, resolves an explicit same-subnet private peer
 with ARP, and performs exact TCP and UDP exchanges. Storage remains read-only.
 This profile admits two StorVSC controllers for Azure's normal OS/resource-disk
-offer topology. The probe waits for current bound offers and a coherent StorVSC
-generation instead of treating previously registered device counts as ready.
+offer topology. It uses REPORT LUNS discovery, and an additional controller is
+accepted as empty only after two successful zero-entry reports on the same
+binding. Failed or disrupted addressed discovery remains unresolved. The probe
+waits for current bound offers and a coherent StorVSC generation instead of
+treating previously registered device counts as ready.
 The application replaces only that netif instance's unbounded lib-lwIP
 poll/transmit callbacks with a scoped boundary that processes at most 64 RX
 packets per pump and attempts each TX exactly once. Persistent TX backpressure
@@ -26,6 +29,10 @@ each deferred channel drain to 64 VMBus packets and requeues remaining work on
 the VMBus worker, including on legacy VMBus versions, so the bound applies
 below the stack adapter. The pinned
 external wrapper checkout remains unmodified.
+On a DHCP start, adapter, or lease deadline failure, the application emits an
+additive `NETWORK_DHCP_DIAGNOSTIC INFO` record containing bounded lwIP state and
+NetVSC TX, completion, RX, queue, and transport counters before the existing
+stable failure marker.
 
 `UK_HYPERV_IO_READY` is emitted only when storage and the selected network mode
 both pass. A missing offer is `UNAVAILABLE`; a present but unbound device or any

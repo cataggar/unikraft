@@ -1455,7 +1455,7 @@ export fn storvsc_parse_report_luns(
 
     const list_size: usize = @intCast(getBe32(data, 0));
     if (list_size == 0)
-        return -enodev;
+        return 0;
     if (list_size % report_lun_entry_size != 0)
         return -eproto;
     const count = list_size / report_lun_entry_size;
@@ -2037,7 +2037,7 @@ test "REPORT LUNS parsing is bounded deterministic and fail closed" {
     data = [_]u8{0} ** report_luns_data_size;
     count = 99;
     try std.testing.expectEqual(
-        -enodev,
+        @as(c_int, 0),
         storvsc_parse_report_luns(
             &data,
             report_luns_header_size,

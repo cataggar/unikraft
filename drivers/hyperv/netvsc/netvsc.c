@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <errno.h>
 #include <stdint.h>
+#include <string.h>
 #include <uk/alloc.h>
 #include <uk/arch/spinlock.h>
 #include <uk/assert.h>
@@ -10,6 +11,7 @@
 #include <uk/lcpu.h>
 #include <uk/netbuf.h>
 #include <uk/netdev_driver.h>
+#include <uk/netvsc.h>
 #include <uk/paging.h>
 #include <uk/plat/time.h>
 #include <uk/print.h>
@@ -182,6 +184,12 @@ struct netvsc_device {
 	__u32 duplicate_completions;
 	__u32 early_completions;
 	__u32 receive_events;
+	__u64 diagnostic_tx_submitted;
+	__u64 diagnostic_tx_completed;
+	__u64 diagnostic_rx_packets;
+	__u64 diagnostic_rx_dropped;
+	__u64 diagnostic_channel_packets;
+	__u64 diagnostic_transfer_packets;
 	__u16 next_request;
 	__u16 mtu;
 	__u16 max_mtu;
@@ -1662,6 +1670,8 @@ static void netvsc_tx_mark_completed_locked(
 	context->state = NETVSC_TX_COMPLETED;
 	if (section < NETVSC_SECTION_LIMIT)
 		device->section_used[section] = 0;
+	(void)__atomic_add_fetch(&device->diagnostic_tx_completed, 1,
+				 __ATOMIC_RELAXED);
 	netvsc_remember_transaction(device, context->transaction_id);
 }
 
@@ -1972,6 +1982,8 @@ static int netvsc_copy_frame(struct netvsc_device *device,
 		CONFIG_LIBNETVSC_RX_SLOTS;
 	device->receive_count++;
 	__atomic_add_fetch(&device->receive_events, 1, __ATOMIC_RELEASE);
+	(void)__atomic_add_fetch(&device->diagnostic_rx_packets, 1,
+				 __ATOMIC_RELAXED);
 	ukplat_spin_unlock_irqrestore(&device->rx_lock, flags);
 	return 0;
 }
@@ -1994,10 +2006,19 @@ static int netvsc_handle_rndis(struct netvsc_device *device,
 	case NETVSC_RNDIS_PACKET:
 		rc = netvsc_rndis_parse_packet(message, message_length,
 					      &packet);
-		if (rc)
+		if (rc) {
+			(void)__atomic_add_fetch(
+				&device->diagnostic_rx_dropped, 1,
+				__ATOMIC_RELAXED);
 			return -EPROTO;
-		return netvsc_copy_frame(device, message + packet.data_offset,
-					 packet.data_length);
+		}
+		rc = netvsc_copy_frame(device, message + packet.data_offset,
+				      packet.data_length);
+		if (rc)
+			(void)__atomic_add_fetch(
+				&device->diagnostic_rx_dropped, 1,
+				__ATOMIC_RELAXED);
+		return rc;
 	case NETVSC_RNDIS_INITIALIZE_COMPLETE:
 	case NETVSC_RNDIS_QUERY_COMPLETE:
 	case NETVSC_RNDIS_SET_COMPLETE:
@@ -2210,6 +2231,8 @@ static void netvsc_drain_channel(struct netvsc_device *device)
 			break;
 		}
 		work++;
+		(void)__atomic_add_fetch(&device->diagnostic_channel_packets, 1,
+					 __ATOMIC_RELAXED);
 		if (packet.trailer_mismatch)
 			device->malformed_messages++;
 		switch (packet.type) {
@@ -2219,6 +2242,9 @@ static void netvsc_drain_channel(struct netvsc_device *device)
 				packet.payload_size);
 			break;
 		case VMBUS_PACKET_DATA_USING_TRANSFER_PAGES:
+			(void)__atomic_add_fetch(
+				&device->diagnostic_transfer_packets, 1,
+				__ATOMIC_RELAXED);
 			(void)netvsc_handle_transfer(device, &packet,
 				netvsc_descriptor_scratch,
 				packet.descriptor_size,
@@ -2386,6 +2412,8 @@ static int netvsc_tx_publish(struct netvsc_device *device,
 		rc = -ECANCELED;
 	} else {
 		context->state = NETVSC_TX_SENT;
+		(void)__atomic_add_fetch(&device->diagnostic_tx_submitted, 1,
+					 __ATOMIC_RELAXED);
 		UK_ASSERT(device->tx_wrapper_pending <
 			  CONFIG_LIBNETVSC_TX_SLOTS);
 		device->tx_wrapper_pending++;
@@ -2884,6 +2912,69 @@ static const struct uk_netdev_ops netvsc_ops = {
 	.txq_info_get = netvsc_txq_info_get,
 	.rxq_info_get = netvsc_rxq_info_get,
 };
+
+int uk_netvsc_diagnostics_get(struct uk_netdev *netdev,
+			      struct uk_netvsc_diagnostics *diagnostics)
+{
+	struct netvsc_device *device;
+	unsigned long flags;
+	unsigned int i;
+
+	if (!netdev || !diagnostics)
+		return -EINVAL;
+	device = __containerof(netdev, struct netvsc_device, netdev);
+	if (device != &netvsc)
+		return -ENODEV;
+
+	memset(diagnostics, 0, sizeof(*diagnostics));
+	diagnostics->version = UK_NETVSC_DIAGNOSTICS_VERSION;
+	diagnostics->size = sizeof(*diagnostics);
+	diagnostics->tx_submitted = __atomic_load_n(
+		&device->diagnostic_tx_submitted, __ATOMIC_ACQUIRE);
+	diagnostics->tx_completed = __atomic_load_n(
+		&device->diagnostic_tx_completed, __ATOMIC_ACQUIRE);
+	diagnostics->rx_packets = __atomic_load_n(
+		&device->diagnostic_rx_packets, __ATOMIC_ACQUIRE);
+	diagnostics->rx_dropped = __atomic_load_n(
+		&device->diagnostic_rx_dropped, __ATOMIC_ACQUIRE);
+	diagnostics->channel_packets = __atomic_load_n(
+		&device->diagnostic_channel_packets, __ATOMIC_ACQUIRE);
+	diagnostics->transfer_packets = __atomic_load_n(
+		&device->diagnostic_transfer_packets, __ATOMIC_ACQUIRE);
+	diagnostics->malformed_messages = __atomic_load_n(
+		&device->malformed_messages, __ATOMIC_ACQUIRE);
+	diagnostics->unknown_completions = __atomic_load_n(
+		&device->unknown_completions, __ATOMIC_ACQUIRE);
+	diagnostics->duplicate_completions = __atomic_load_n(
+		&device->duplicate_completions, __ATOMIC_ACQUIRE);
+	diagnostics->early_completions = __atomic_load_n(
+		&device->early_completions, __ATOMIC_ACQUIRE);
+
+	ukplat_spin_lock_irqsave(&device->state_lock, flags);
+	diagnostics->generation = device->generation;
+	diagnostics->nvs_version = device->nvs_version;
+	diagnostics->ndis_version = device->ndis_version;
+	diagnostics->mtu = device->mtu;
+	diagnostics->pending_acks = device->pending_ack_count;
+	diagnostics->attached = device->attached;
+	diagnostics->configured = device->configured;
+	diagnostics->running = device->running;
+	diagnostics->host_running = device->host_running;
+	diagnostics->link_up = device->link_up;
+	diagnostics->failed = device->failed;
+	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
+
+	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
+	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++)
+		diagnostics->tx_pending +=
+			device->tx[i].state != NETVSC_TX_FREE;
+	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
+
+	ukplat_spin_lock_irqsave(&device->rx_lock, flags);
+	diagnostics->rx_queued = device->receive_count;
+	ukplat_spin_unlock_irqrestore(&device->rx_lock, flags);
+	return 0;
+}
 
 static void netvsc_free_queued_packets(struct netvsc_device *device)
 {

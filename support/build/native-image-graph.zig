@@ -1252,6 +1252,21 @@ test "Hyper-V NetVSC profile registers protocol and uknetdev" {
     );
     const netvsc = netvsc_library orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), netvsc.target_zig_objects.len);
+    try std.testing.expectEqual(@as(usize, 1), netvsc.exports.len);
+    try std.testing.expectEqualStrings(
+        "/src/unikraft/drivers/hyperv/netvsc/exportsyms.uk",
+        netvsc.exports[0],
+    );
+    const netvsc_transform = netvsc.object_pipeline.?.transform.sequence;
+    try std.testing.expectEqual(@as(usize, 1), netvsc_transform.len);
+    try std.testing.expect(netvsc_transform[0] == .symbol_file);
+    try std.testing.expectEqualStrings(
+        "/src/unikraft/drivers/hyperv/netvsc/exportsyms.uk",
+        netvsc_transform[0].symbol_file.symbols_file,
+    );
+    try std.testing.expect(
+        netvsc_transform[0].symbol_file.action == .keep_global,
+    );
     try std.testing.expectEqualStrings(
         "/src/unikraft/drivers/hyperv/netvsc/netvsc_protocol.zig",
         netvsc.target_zig_objects[0].root_source_file,

@@ -143,6 +143,11 @@ class HypervNetworkControllerTest(unittest.TestCase):
                 "xid=1a2b3c4d state=10 retries=1 lease_seconds=3600 "
                 "proof=discover-offer-request-ack-bound"
             ),
+            (
+                "HYPERV_ACCEPTANCE NETWORK_DHCP_DIAGNOSTIC INFO "
+                "reason=lease-bound dhcp_state=10 dhcp_tries=1 "
+                "tx_submitted=2 tx_completed=2 rx_packets=2"
+            ),
             "UK_HYPERV_NET_APP_LEASE",
             (
                 "HYPERV_ACCEPTANCE NETWORK_APP_ARP PASS "

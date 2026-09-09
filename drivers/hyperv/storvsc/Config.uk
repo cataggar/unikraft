@@ -27,7 +27,9 @@ config LIBSTORVSC_LUN_DISCOVERY
 	help
 		Issue bounded SCSI REPORT LUNS and VPD page 0x83 commands, then
 		attach supported reported LUNs independently. Disabled preserves
-		the legacy LUN 0 path without issuing discovery commands.
+		the legacy LUN 0 path without issuing discovery commands. A
+		successful stable zero-entry report may bind an empty controller;
+		failed addressed discovery never proves emptiness.
 
 config LIBSTORVSC_GUARDED_IO
 	bool "Require an authorized StorVSC session for I/O"

@@ -611,7 +611,7 @@ static void storvsc_process_async_event(struct storvsc_device *device,
 		(void)storvsc_schedule_fatal(device, -ENODEV);
 		break;
 	case STORVSC_EVENT_ENUMERATE_BUS:
-		if (storvsc_guarded_io_enabled)
+		if (storvsc_guarded_io_enabled || !device->lun_count)
 			(void)storvsc_schedule_fatal(device, -ESTALE);
 		break;
 	case STORVSC_EVENT_PROTOCOL_ERROR:
@@ -863,6 +863,7 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 	struct storvsc_request_binding *binding;
 	struct storvsc_event event;
 	struct storvsc_tx tx;
+	int topology_changed = 0;
 	int published;
 	int rc;
 
@@ -904,6 +905,10 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 			return rc;
 		if (event.kind == STORVSC_EVENT_REMOVE_DEVICE)
 			return -ENODEV;
+		if (event.kind == STORVSC_EVENT_ENUMERATE_BUS) {
+			topology_changed = 1;
+			continue;
+		}
 		if (event.kind != STORVSC_EVENT_REQUEST_COMPLETE ||
 		    event.transaction_id != tx.transaction_id)
 			continue;
@@ -917,7 +922,9 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 			return rc;
 		if (transferred)
 			*transferred = event.transferred;
-		return event.error;
+		if (event.error)
+			return event.error;
+		return topology_changed ? -ESTALE : 0;
 	}
 }
 
@@ -946,6 +953,7 @@ static int storvsc_enumerate_luns(struct storvsc_device *device)
 {
 	struct storvsc_scsi_spec spec;
 	__u32 transferred;
+	size_t count;
 	int rc;
 
 	memset(device->report_luns_data, 0,
@@ -965,10 +973,33 @@ static int storvsc_enumerate_luns(struct storvsc_device *device)
 				  device->report_luns_data, &transferred);
 	if (rc)
 		return rc;
-	return storvsc_parse_report_luns(
+	rc = storvsc_parse_report_luns(
 		device->report_luns_data, transferred, 0, 0,
 		device->lun_addresses, STORVSC_REPORT_LUNS_MAX,
-		&device->lun_count);
+		&count);
+	if (rc)
+		return rc;
+	device->lun_count = count;
+	if (count)
+		return 0;
+
+	/*
+	 * A single empty report can race a topology update. Require a second
+	 * successful empty report before treating this controller as empty.
+	 */
+	memset(device->report_luns_data, 0,
+	       sizeof(device->report_luns_data));
+	rc = storvsc_execute_scsi(device, &spec,
+				  device->report_luns_data, &transferred);
+	if (rc)
+		return rc;
+	rc = storvsc_parse_report_luns(
+		device->report_luns_data, transferred, 0, 0,
+		device->lun_addresses, STORVSC_REPORT_LUNS_MAX,
+		&count);
+	if (!rc)
+		device->lun_count = count;
+	return rc;
 }
 
 static int storvsc_discover_lun(struct storvsc_device *device,
@@ -2950,10 +2981,16 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 			   capacity.sectors, capacity.sector_size,
 			   mode.read_only ? ", read-only" : "");
 	}
-	if (!registered) {
+	if (!registered && (!storvsc_lun_discovery_enabled ||
+			    device->lun_count)) {
 		rc = first_error ? first_error : -ENODEV;
 		goto failed_registered;
 	}
+	if (!registered)
+		uk_pr_info(DRIVER_NAME
+			   ": controller%u relid=%"PRIu32
+			   " bound with verified empty LUN inventory\n",
+			   device->index, vmbus_device->channel_id);
 	if (first_error) {
 		storvsc_note_unresolved_offer(
 			&vmbus_device->instance_id,
