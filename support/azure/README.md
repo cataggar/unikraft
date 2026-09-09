@@ -149,6 +149,9 @@ First solve the selected Hyper-V configuration using the documented
 `olddefconfig` command. For the guarded V2 policy, create one policy-2 manifest
 and retain its raw seed and JSON receipt for the later, separately authorized
 real-data-disk workload. The seed is not uploaded to this platform preflight:
+Set `ZIG`, `MAKE`, `BISON`, `FLEX`, `M4`, `BISON_DATA`, `LLVM_BIN`, and
+`GIT_BIN` to absolute reviewed tool paths; `GIT_BIN` is the directory
+containing the selected `git` executable.
 
 ```shell
 PERSISTENCE="$PWD/.d/private-preflight-persistence"
@@ -181,7 +184,7 @@ TMPDIR="$PWD/.d/acceptance-tmp" \
 XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
 ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
 ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
-PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:/usr/bin:/bin" \
+PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:$GIT_BIN:/usr/bin:/bin" \
   "$ZIG" build olddefconfig -j2 \
   -Dapp="$PWD/support/apps/hyperv-acceptance" \
   -Dconfig="$PWD/support/apps/hyperv-acceptance/.config" \
@@ -212,9 +215,9 @@ change before another guarded image can be generated.
 
 Run the solve command with the controlled tool path shown above rather than an
 ambient developer shell. `python3` then resolves from the pinned runtime, the
-parser wrappers resolve first, LLVM tools retain their symbolic command names,
-and the Make-backed facade uses the absolute `$MAKE` supplied by
-`-Dmake-command`.
+parser wrappers resolve first, source versioning uses the selected Git
+directory, LLVM tools retain their symbolic command names, and the Make-backed
+facade uses the absolute `$MAKE` supplied by `-Dmake-command`.
 
 Then let the controller invoke the fixed native builder itself, snapshot
 source/configuration before and after the build, fingerprint

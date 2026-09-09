@@ -666,7 +666,10 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         )
         recipe = readme[start:end]
         self.assertIn(
-            'PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:/usr/bin:/bin"',
+            (
+                'PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:'
+                '$GIT_BIN:/usr/bin:/bin"'
+            ),
             recipe,
         )
         self.assertIn('-Dmake-command="$MAKE"', recipe)
