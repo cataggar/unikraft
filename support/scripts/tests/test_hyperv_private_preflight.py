@@ -1045,16 +1045,20 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             config.write_text("CONFIG_PLAT_HYPERV=y\n")
             tools = root / "tools"
             tools.mkdir()
-            zig = tools / "zig"
-            zig.write_text(
+            zig_target = tools / "zig-real"
+            invoked = tools / "zig-invoked"
+            zig_target.write_text(
                 "#!/bin/sh\nset -eu\nout=''\n"
+                f"printf '%s' \"$0\" > {invoked}\n"
                 "for arg in \"$@\"; do\n"
                 " case \"$arg\" in -Doutput=*) out=${arg#-Doutput=};; esac\n"
                 "done\n"
                 "test -n \"$out\"\nmkdir -p \"$out\"\n"
                 f"printf efi > \"$out/{preflight.NATIVE_EFI_NAME}\"\n"
             )
-            zig.chmod(0o700)
+            zig_target.chmod(0o700)
+            zig = tools / "zig"
+            zig.symlink_to(zig_target)
             paths = {"zig": zig}
             for name in ("make", "python", "bison", "flex", "m4"):
                 path = tools / name
@@ -1100,6 +1104,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 validated["receipt"]["source_before"],
                 validated["receipt"]["source_after"],
             )
+            self.assertEqual(invoked.read_text(), str(zig.absolute()))
 
 
 class PrivatePreflightRunnerTest(PrivatePreflightFixture):

@@ -1312,8 +1312,8 @@ def build_private_image(
         "flex": local_tool_record(flex_path, "flex"),
         "m4": local_tool_record(m4_path, "m4"),
     }
+    zig_invocation = Path(zig_path).absolute()
     resolved = {
-        "zig": Path(zig_path).resolve(strict=True),
         "make": Path(make_path).resolve(strict=True),
         "python": Path(python_path).resolve(strict=True),
         "bison": Path(bison_path).resolve(strict=True),
@@ -1374,7 +1374,7 @@ def build_private_image(
         write_tool_wrapper(
             wrappers / wrapper, resolved[tool], environment
         )
-    zig = str(resolved["zig"])
+    zig = str(zig_invocation)
     command = [
         zig, "build", "native-images", "-j2",
         "-Dapp=" + str(SUPPORT / "apps" / "hyperv-acceptance"),
@@ -1458,6 +1458,8 @@ def build_private_image(
     source_after = build_provenance(repository, config)
     if source_after != source_before:
         raise RuntimeError("Private source or configuration changed during build")
+    if local_tool_record(zig_invocation, "zig") != tools["zig"]:
+        raise RuntimeError("Private Zig compiler changed during build")
     efi_path = build_output / NATIVE_EFI_NAME
     output = regular_record(
         efi_path, NATIVE_EFI_NAME, "Private local EFI build output"
