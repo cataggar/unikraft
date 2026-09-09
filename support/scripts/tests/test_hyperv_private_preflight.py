@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from contextlib import contextmanager
+import copy
 import hashlib
 import importlib
 import io
@@ -23,6 +24,57 @@ blob_worker = importlib.import_module("hyperv_private_preflight_blob")
 TEST_TEMP = SUPPORT.parent / ".d" / "private-preflight-test-tmp"
 TEST_TEMP.mkdir(mode=0o700, parents=True, exist_ok=True)
 tempfile.tempdir = str(TEST_TEMP)
+
+
+def modeled_host_disk_output_order(template):
+    output = template["outputs"]["hostDiskUuid"]["value"]
+    if "reference(resourceId('Microsoft.Compute/disks'" in output:
+        raise RuntimeError(
+            "ResourceNotFound: implicit disk read can precede VM creation"
+        )
+    identity = next(
+        resource for resource in template["resources"]
+        if resource["type"] == "Microsoft.Resources/deployments"
+        and resource["name"]
+        == "[variables('hostIdentityDeploymentName')]"
+    )
+    dependency = (
+        "[resourceId('Microsoft.Compute/virtualMachines', "
+        "variables('hostName'))]"
+    )
+    if identity.get("dependsOn") != [dependency]:
+        raise RuntimeError(
+            "ResourceNotFound: implicit disk read lacks a VM dependency"
+        )
+    properties = identity["properties"]
+    if (
+        properties.get("expressionEvaluationOptions") != {"scope": "inner"}
+        or properties.get("mode") != "Incremental"
+        or properties["template"].get("resources") != []
+    ):
+        raise RuntimeError("Identity deployment is not an output-only inner scope")
+    if properties["parameters"] != {
+        "hostDiskId": {
+            "value": (
+                "[reference(variables('hostName'), '2025-11-01')"
+                ".storageProfile.osDisk.managedDisk.id]"
+            )
+        }
+    }:
+        raise RuntimeError(
+            "Identity deployment does not use the VM's returned disk ID"
+        )
+    if output != (
+        "[reference(variables('hostIdentityDeploymentName'), "
+        "'2022-09-01').outputs.hostDiskUuid.value]"
+    ):
+        raise RuntimeError("Outer output does not await identity deployment")
+    inner = properties["template"]["outputs"][
+        "hostDiskUuid"
+    ]["value"]
+    if "reference(parameters(" not in inner or ".uniqueId]" not in inner:
+        raise RuntimeError("Identity deployment does not read the disk UUID")
+    return ("vm-created", "implicit-disk-read", "outer-output")
 
 
 def base64_encode(value):
@@ -393,6 +445,14 @@ class PrivatePreflightFixture(unittest.TestCase):
             "location": preflight.LOCATION,
         }
         return vm, disk
+
+    def identity_deployment(self, run):
+        return {
+            "id": run.expected_host_ids()["identity_deployment_id"],
+            "name": run.prefix + "-host-identity",
+            "type": "Microsoft.Resources/deployments",
+            "tags": None,
+        }
 
     def deployment(self, run, state, provisioning="Succeeded"):
         receipt = state["host_deployment"]
@@ -1232,12 +1292,29 @@ class PrivatePreflightTemplateTest(PrivatePreflightFixture):
         self.assertEqual(
             set(template["outputs"]), {"hostVmUuid", "hostDiskUuid"}
         )
-        self.assertIn(
-            ".vmId", template["outputs"]["hostVmUuid"]["value"]
+        self.assertEqual(
+            template["outputs"]["hostVmUuid"]["value"],
+            "[reference(variables('hostName'), '2025-11-01').vmId]",
         )
-        self.assertIn(
-            ".uniqueId", template["outputs"]["hostDiskUuid"]["value"]
+        self.assertEqual(
+            modeled_host_disk_output_order(template),
+            ("vm-created", "implicit-disk-read", "outer-output"),
         )
+        direct = copy.deepcopy(template)
+        direct["outputs"]["hostDiskUuid"]["value"] = (
+            "[reference(resourceId('Microsoft.Compute/disks', "
+            "variables('hostDiskName')), '2025-01-02').uniqueId]"
+        )
+        with self.assertRaisesRegex(RuntimeError, "ResourceNotFound"):
+            modeled_host_disk_output_order(direct)
+        unordered = copy.deepcopy(template)
+        identity = next(
+            resource for resource in unordered["resources"]
+            if resource["type"] == "Microsoft.Resources/deployments"
+        )
+        identity["dependsOn"] = []
+        with self.assertRaisesRegex(RuntimeError, "ResourceNotFound"):
+            modeled_host_disk_output_order(unordered)
         resources = template["resources"]
         kinds = [resource["type"] for resource in resources]
         self.assertEqual(
@@ -1755,8 +1832,9 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             self.begin_operation(run, state)
             group = {"id": state["resource_group_id"], "tags": run.group_tags}
             vm, disk = self.vm_disk(run, state)
+            identity_deployment = self.identity_deployment(run)
             run.az.side_effect = [
-                True, group, [vm, disk],
+                True, group, [vm, disk, identity_deployment],
                 vm, disk,
                 vm, disk,
                 None, False,
@@ -2044,6 +2122,48 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 "tags": run.operation_tags(),
             }]
             with self.assertRaisesRegex(RuntimeError, "inventory"):
+                run.verify_resource_inventory()
+
+    def test_resource_inventory_accepts_only_exact_identity_deployment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            ids = run.expected_host_ids()
+            resources = [
+                {
+                    "id": ids[key],
+                    "name": name,
+                    "type": resource_type,
+                    "tags": run.operation_tags(),
+                }
+                for key, name, resource_type in (
+                    ("nsg_id", run.prefix + "-nsg",
+                     "Microsoft.Network/networkSecurityGroups"),
+                    ("vnet_id", run.prefix + "-vnet",
+                     "Microsoft.Network/virtualNetworks"),
+                    ("storage_id", run.storage,
+                     "Microsoft.Storage/storageAccounts"),
+                    ("nic_id", run.host_nic,
+                     "Microsoft.Network/networkInterfaces"),
+                    ("vm_id", run.host_vm,
+                     "Microsoft.Compute/virtualMachines"),
+                    ("disk_id", run.host_disk,
+                     "Microsoft.Compute/disks"),
+                    ("schedule_id", "shutdown-computevm-" + run.host_vm,
+                     "Microsoft.DevTestLab/schedules"),
+                )
+            ]
+            resources.append(self.identity_deployment(run))
+            run.az.return_value = resources
+            run.verify_host_identity = mock.Mock()
+            run.verify_resource_inventory()
+            run.verify_host_identity.assert_called_once_with()
+
+            resources[-1] = {
+                **resources[-1],
+                "id": ids["identity_deployment_id"] + "-replacement",
+            }
+            with self.assertRaisesRegex(RuntimeError, "not exact"):
                 run.verify_resource_inventory()
 
     @mock.patch.object(preflight.azure, "azure_cli")

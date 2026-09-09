@@ -46,6 +46,7 @@
   "variables": {
     "hostName": "[concat(parameters('namePrefix'), '-host')]",
     "hostDiskName": "[concat(parameters('namePrefix'), '-host-os')]",
+    "hostIdentityDeploymentName": "[concat(parameters('namePrefix'), '-host-identity')]",
     "hostNicName": "[concat(parameters('namePrefix'), '-host-nic')]",
     "nsgName": "[concat(parameters('namePrefix'), '-nsg')]",
     "vnetName": "[concat(parameters('namePrefix'), '-vnet')]",
@@ -335,16 +336,51 @@
           "status": "Disabled"
         }
       }
+    },
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2022-09-01",
+      "name": "[variables('hostIdentityDeploymentName')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Compute/virtualMachines', variables('hostName'))]"
+      ],
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "parameters": {
+          "hostDiskId": {
+            "value": "[reference(variables('hostName'), '2025-11-01').storageProfile.osDisk.managedDisk.id]"
+          }
+        },
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "hostDiskId": {
+              "type": "string"
+            }
+          },
+          "resources": [],
+          "outputs": {
+            "hostDiskUuid": {
+              "type": "string",
+              "value": "[reference(parameters('hostDiskId'), '2025-01-02').uniqueId]"
+            }
+          }
+        }
+      }
     }
   ],
   "outputs": {
     "hostVmUuid": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', variables('hostName')), '2025-11-01').vmId]"
+      "value": "[reference(variables('hostName'), '2025-11-01').vmId]"
     },
     "hostDiskUuid": {
       "type": "string",
-      "value": "[reference(resourceId('Microsoft.Compute/disks', variables('hostDiskName')), '2025-01-02').uniqueId]"
+      "value": "[reference(variables('hostIdentityDeploymentName'), '2022-09-01').outputs.hostDiskUuid.value]"
     }
   }
 }

@@ -322,7 +322,10 @@ the add call and remains pending until exact absence is re-read, including
 after interrupted processes. It persists the original deployment operation
 before create. A successful deployment must return server-side ARM outputs
 for the original VM `vmId` and OS-disk `uniqueId`; both immutable anchors are
-recorded together before any live VM or disk query. Live reads may only
+recorded together before any live VM or disk query. The disk identity output
+comes from a nested deployment that explicitly waits for VM creation and reads
+the managed-disk ID returned by that VM, rather than racing an undeclared
+implicit disk. Live reads may only
 confirm those anchors, never fill or replace them from matching names, tags,
 resource IDs, images, or attachments. Cleanup may deallocate the exact
 UUID-anchored VM independently when disk inspection fails, but group deletion
@@ -549,7 +552,10 @@ fresh state directory for another attempt. The implicit private-peer OS disk is
 not adopted by adding ownership tags. The successful ARM deployment itself
 outputs the peer VM and disk UUIDs. The controller records those immutable
 anchors with the deployment correlation and exact declared resources before
-any follow-up read, then re-reads that original deployment during cleanup.
+any follow-up read, then re-reads that original deployment during cleanup. A
+VM-dependent nested identity deployment obtains the implicit OS-disk ID from
+the completed VM before reading its UUID; direct resource-ID output references
+are not treated as ordering dependencies.
 The live VM must still have the anchored UUID and own the anchored disk, even
 if its tags match the run. Required ownership tags are matched as a subset, so
 unrelated additional tags do not invalidate otherwise proven resources; tags
