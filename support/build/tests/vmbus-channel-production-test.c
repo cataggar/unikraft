@@ -33,6 +33,9 @@ void vmbus_bus_host_clear_connection_failed(void);
 void vmbus_bus_host_auto_pump(int enabled);
 void vmbus_bus_host_set_gpadl_status(__u32 status);
 void vmbus_bus_host_set_transmit_fail_after(int successful_posts);
+void vmbus_bus_host_set_transmit_backpressure(__u32 control_type,
+					      unsigned int attempts);
+unsigned int vmbus_bus_host_transmit_attempts(void);
 void vmbus_bus_host_reset_gpadl_trace(void);
 unsigned int vmbus_bus_host_gpadl_body_posts(void);
 unsigned int vmbus_bus_host_gpadl_teardown_posts(void);
@@ -1078,6 +1081,69 @@ static int test_gpadl_ambiguous_failures(void)
 	return 0;
 }
 
+static int test_gpadl_post_backpressure(void)
+{
+	static __u8 pages[30][4096] __attribute__((aligned(4096)));
+	struct vmbus_device device = {
+		.channel_id = 34,
+		.connection_id = 134,
+		.present = 1,
+	};
+	struct vmbus_gpadl mapping = { 0 };
+	struct vmbus_channel *channel;
+	unsigned int attempts;
+	int rc;
+
+	channel = vmbus_channel_host_prepare_open(&device);
+	if (!channel)
+		return 287;
+	vmbus_bus_host_clear_connection_failed();
+	vmbus_bus_host_reset_gpadl_trace();
+	vmbus_bus_host_set_transmit_backpressure(9, 3);
+	vmbus_bus_host_auto_pump(1);
+	rc = vmbus_channel_gpadl_map(channel, pages, sizeof(pages), &mapping);
+	vmbus_bus_host_auto_pump(0);
+	attempts = vmbus_bus_host_transmit_attempts();
+	if (rc || !mapping.id || mapping.page_count != 30 ||
+	    vmbus_bus_host_gpadl_body_posts() != 1 ||
+	    vmbus_bus_host_gpadl_teardown_posts() ||
+	    attempts != 5 || vmbus_bus_host_connection_failed())
+		return 288;
+	vmbus_bus_host_auto_pump(1);
+	rc = vmbus_channel_gpadl_unmap(channel, &mapping);
+	vmbus_bus_host_auto_pump(0);
+	if (rc || mapping.id || vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls())
+		return 289;
+
+	vmbus_bus_host_reset_gpadl_trace();
+	vmbus_bus_host_set_transmit_backpressure(8, 100);
+	rc = vmbus_channel_gpadl_map(channel, pages, sizeof(pages), &mapping);
+	if (rc != -ETIMEDOUT || mapping.id ||
+	    vmbus_bus_host_gpadl_body_posts() ||
+	    vmbus_bus_host_gpadl_teardown_posts() ||
+	    vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls() ||
+	    vmbus_bus_host_connection_failed())
+		return 290;
+
+	vmbus_bus_host_reset_gpadl_trace();
+	vmbus_bus_host_set_transmit_backpressure(9, 100);
+	vmbus_bus_host_auto_pump(1);
+	rc = vmbus_channel_gpadl_map(channel, pages, sizeof(pages), &mapping);
+	vmbus_bus_host_auto_pump(0);
+	if (rc != -ETIMEDOUT || mapping.id ||
+	    vmbus_bus_host_gpadl_body_posts() ||
+	    vmbus_bus_host_gpadl_teardown_posts() != 1 ||
+	    vmbus_channel_host_record_count() ||
+	    vmbus_channel_host_live_gpadls() ||
+	    vmbus_bus_host_connection_failed())
+		return 291;
+	if (vmbus_channel_close(channel))
+		return 292;
+	return 0;
+}
+
 static int test_receive_signal_failure_preserves_packet(void)
 {
 	struct vmbus_device device = {
@@ -1165,6 +1231,9 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = test_gpadl_ambiguous_failures();
+	if (rc)
+		return rc;
+	rc = test_gpadl_post_backpressure();
 	if (rc)
 		return rc;
 	rc = test_receive_signal_failure_preserves_packet();

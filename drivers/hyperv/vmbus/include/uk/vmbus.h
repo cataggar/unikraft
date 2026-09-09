@@ -119,6 +119,7 @@ extern const struct vmbus_guid vmbus_network_guid;
 
 unsigned int vmbus_device_count(void);
 const struct vmbus_device *vmbus_device_get(unsigned int index);
+int vmbus_device_is_bound(const struct vmbus_device *device);
 int vmbus_reconnect(void);
 int vmbus_unload(void);
 /*

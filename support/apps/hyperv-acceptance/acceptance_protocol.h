@@ -162,5 +162,8 @@ void hyperv_acceptance_persistence_pattern(
 enum hyperv_acceptance_result hyperv_acceptance_final_result(
 	enum hyperv_acceptance_result storage,
 	enum hyperv_acceptance_result network);
+int hyperv_acceptance_binding_ready(unsigned int offers,
+				    unsigned int bound_offers,
+				    unsigned int ready_devices);
 
 #endif

@@ -23,6 +23,7 @@
 
 #include "acceptance_protocol.h"
 #include "persistence.h"
+#include "storage_target.h"
 #include "persistence_host.h"
 #include "storvsc_core.h"
 
@@ -3325,7 +3326,17 @@ static int reoffer_device(struct vmbus_driver *driver,
 			  struct vmbus_device *vmbus_device,
 			  struct uk_blkdev *device)
 {
+	struct hyperv_acceptance_storage_target target = { 0 };
+	int rc;
+
 	remove_test_offer(driver, vmbus_device);
+	if (!hyperv_acceptance_storage_target_acquire(&target)) {
+		(void)hyperv_acceptance_storage_target_release(&target);
+		fprintf(stderr,
+			"recovered target readiness failed: stale target "
+			"remained acquirable\n");
+		return -EALREADY;
+	}
 	if (vmbus_device->channel)
 		(void)vmbus_channel_close(vmbus_device->channel);
 	if (!vmbus_bus_host_connection_live() &&
@@ -3336,6 +3347,33 @@ static int reoffer_device(struct vmbus_driver *driver,
 		return -EIO;
 	if (!storvsc_host_online() || !storvsc_host_has_channel())
 		return -ENODEV;
+	rc = hyperv_acceptance_storage_target_acquire(&target);
+	if (rc) {
+		fprintf(stderr,
+			"recovered target readiness failed: acquire rc=%d "
+			"online=%d channel=%d mappings=%u\n",
+			rc, storvsc_host_online(), storvsc_host_has_channel(),
+			uk_storvsc_mapping_count());
+		return -ENODEV;
+	}
+	if (target.device != device) {
+		(void)hyperv_acceptance_storage_target_release(&target);
+		fprintf(stderr,
+			"recovered target readiness failed: selected=%p "
+			"expected=%p\n",
+			(void *)target.device, (void *)device);
+		return -ESTALE;
+	}
+	if (hyperv_acceptance_storage_target_validate(&target)) {
+		(void)hyperv_acceptance_storage_target_release(&target);
+		return -ESTALE;
+	}
+	rc = hyperv_acceptance_storage_target_release(&target);
+	if (rc) {
+		fprintf(stderr,
+			"recovered target readiness failed: release=%d\n", rc);
+		return -ESTALE;
+	}
 	return device->dev_ops->queue_intr_enable(device, device->_queue[0]);
 }
 

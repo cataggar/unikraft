@@ -996,7 +996,8 @@ static enum hyperv_acceptance_result run_udp(
 }
 
 enum hyperv_acceptance_result
-hyperv_acceptance_probe_application_network(unsigned int network_offers)
+hyperv_acceptance_probe_application_network(unsigned int network_offers,
+					     int binding_ready)
 {
 	enum hyperv_acceptance_result lease;
 	enum hyperv_acceptance_result arp;
@@ -1042,6 +1043,13 @@ hyperv_acceptance_probe_application_network(unsigned int network_offers)
 	       (unsigned int)CONFIG_APPHYPERVACCEPTANCE_PEER_UDP_PORT, nonce,
 	       APPLICATION_TCP_CONNECTIONS, APPLICATION_UDP_DATAGRAMS);
 
+	if (network_offers && !binding_ready) {
+		puts("HYPERV_ACCEPTANCE NETWORK_INVENTORY FAIL "
+		     "reason=binding-timeout");
+		print_unavailable_stages(HYPERV_ACCEPTANCE_FAIL,
+					 "binding-timeout");
+		return HYPERV_ACCEPTANCE_FAIL;
+	}
 	if (!uk_netdev_count()) {
 		result = network_offers ? HYPERV_ACCEPTANCE_FAIL :
 			 HYPERV_ACCEPTANCE_UNAVAILABLE;
@@ -1127,9 +1135,11 @@ hyperv_acceptance_probe_application_network(unsigned int network_offers)
 #else
 
 enum hyperv_acceptance_result
-hyperv_acceptance_probe_application_network(unsigned int network_offers)
+hyperv_acceptance_probe_application_network(unsigned int network_offers,
+					     int binding_ready)
 {
 	(void)network_offers;
+	(void)binding_ready;
 	return HYPERV_ACCEPTANCE_FAIL;
 }
 

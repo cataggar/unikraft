@@ -2,6 +2,7 @@
 #include "acceptance_protocol.h"
 #include "application_network.h"
 #include "persistence.h"
+#include "storage_target.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -15,6 +16,7 @@
 #include <uk/netdev.h>
 #include <uk/plat/time.h>
 #include <uk/sched.h>
+#include <uk/storvsc.h>
 #include <uk/vmbus.h>
 
 #if defined(CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE) && \
@@ -111,49 +113,116 @@ static void count_vmbus_classes(unsigned int *storage, unsigned int *network)
 	}
 }
 
-static void wait_for_target_bindings(unsigned int storage_offers,
-				     unsigned int network_offers)
-{
-	uint64_t deadline = ukplat_monotonic_clock() + BIND_TIMEOUT_NS;
+struct target_binding_status {
+	int storage;
+	int network;
+};
 
-	while (ukplat_monotonic_clock() < deadline) {
-		if ((!storage_offers || uk_blkdev_count()) &&
-		    (!network_offers || uk_netdev_count()))
-			return;
-		uk_sched_thread_sleep(POLL_INTERVAL_NS);
+static void current_bound_offers(unsigned int *storage,
+				 unsigned int *network)
+{
+	unsigned int count = vmbus_device_count();
+	unsigned int index;
+
+	*storage = 0;
+	*network = 0;
+	for (index = 0; index < count; index++) {
+		const struct vmbus_device *device = vmbus_device_get(index);
+
+		if (!device || !vmbus_device_is_bound(device))
+			continue;
+		if (guid_equal(&device->class_id, &vmbus_storage_guid))
+			(*storage)++;
+		else if (guid_equal(&device->class_id, &vmbus_network_guid))
+			(*network)++;
 	}
 }
 
-static enum hyperv_acceptance_result probe_storage(
-	unsigned int storage_offers)
+static struct target_binding_status
+wait_for_target_bindings(unsigned int storage_offers,
+			 unsigned int network_offers)
 {
+	uint64_t deadline = ukplat_monotonic_clock() + BIND_TIMEOUT_NS;
+	struct target_binding_status status = { 0 };
+
+	while (ukplat_monotonic_clock() < deadline) {
+		struct uk_storvsc_inventory_snapshot inventory = { 0 };
+		unsigned int storage_bound;
+		unsigned int network_bound;
+		unsigned int storage_targets = 0;
+
+		current_bound_offers(&storage_bound, &network_bound);
+		if (!uk_storvsc_inventory_get(&inventory))
+			storage_targets = inventory.count;
+		status.storage = hyperv_acceptance_binding_ready(
+			storage_offers, storage_bound, storage_targets);
+		status.network = hyperv_acceptance_binding_ready(
+			network_offers, network_bound, uk_netdev_count());
+		if (status.storage && status.network)
+			return status;
+		uk_sched_thread_sleep(POLL_INTERVAL_NS);
+	}
+	return status;
+}
+
+static enum hyperv_acceptance_result probe_storage(
+	unsigned int storage_offers, int binding_ready)
+{
+	struct hyperv_acceptance_storage_target selected = { 0 };
 	struct uk_blkdev *device;
 	struct uk_blkdev_conf config = { .nb_queues = 1 };
 	struct uk_blkdev_queue_conf queue_config = { 0 };
 	const struct uk_blkdev_cap *capabilities;
 	struct uk_alloc *allocator;
+	enum hyperv_acceptance_result result = HYPERV_ACCEPTANCE_FAIL;
 	uint64_t deadline;
 	size_t bytes;
 	int rc;
 	int status;
 	int mbr;
 	int gpt;
+	int release_rc;
 	unsigned int index;
 
+	if (storage_offers && !binding_ready) {
+		puts("HYPERV_ACCEPTANCE STORAGE_INVENTORY FAIL "
+		     "reason=binding-timeout");
+		puts("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
+		     "reason=binding-timeout");
+		return HYPERV_ACCEPTANCE_FAIL;
+	}
 	if (!uk_blkdev_count()) {
-		enum hyperv_acceptance_result result = storage_offers ?
+		enum hyperv_acceptance_result unavailable = storage_offers ?
 			HYPERV_ACCEPTANCE_FAIL : HYPERV_ACCEPTANCE_UNAVAILABLE;
 
 		printf("HYPERV_ACCEPTANCE STORAGE_INVENTORY %s "
-		       "devices=0 offers=%u reason=%s\n", result_name(result),
+		       "devices=0 offers=%u reason=%s\n",
+		       result_name(unavailable),
 		       storage_offers, storage_offers ? "offered-unbound" :
 		       "no-storvsc-offer");
 		printf("HYPERV_ACCEPTANCE STORAGE_READ %s reason=no-device\n",
-		       result_name(result));
-		return result;
+		       result_name(unavailable));
+		return unavailable;
 	}
 
-	device = uk_blkdev_get(0);
+	deadline = ukplat_monotonic_clock() + BIND_TIMEOUT_NS;
+	do {
+		rc = hyperv_acceptance_storage_target_acquire(&selected);
+		if (!rc)
+			break;
+		if (rc != -EAGAIN && rc != -ESTALE && rc != -ENODEV)
+			break;
+		uk_sched_thread_sleep(POLL_INTERVAL_NS);
+	} while (ukplat_monotonic_clock() < deadline);
+	if (rc) {
+		printf("HYPERV_ACCEPTANCE STORAGE_INVENTORY FAIL "
+		       "devices=%u offers=%u reason=target-readiness rc=%d\n",
+		       uk_blkdev_count(), storage_offers, rc);
+		puts("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
+		     "reason=target-readiness");
+		return HYPERV_ACCEPTANCE_FAIL;
+	}
+	device = selected.device;
 	for (index = 0; index < uk_blkdev_count(); index++) {
 		struct uk_blkdev *inventory_device = uk_blkdev_get(index);
 		const char *driver = uk_blkdev_drv_name_get(inventory_device);
@@ -174,20 +243,20 @@ static enum hyperv_acceptance_result probe_storage(
 		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
 		       "reason=unexpected-state state=%d\n",
 		       uk_blkdev_state_get(device));
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
 	}
 
 	rc = uk_blkdev_configure(device, &config);
 	if (rc) {
 		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
 		       "reason=configure rc=%d\n", rc);
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
 	}
 	allocator = uk_alloc_get_default();
 	if (!allocator) {
 		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
 		       "reason=no-allocator\n");
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
 	}
 	queue_config.a = allocator;
 	rc = uk_blkdev_queue_configure(device, 0, BLOCK_QUEUE_DEPTH,
@@ -195,13 +264,13 @@ static enum hyperv_acceptance_result probe_storage(
 	if (rc) {
 		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
 		       "reason=queue-configure rc=%d\n", rc);
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
 	}
 	rc = uk_blkdev_start(device);
 	if (rc) {
 		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL reason=start rc=%d\n",
 		       rc);
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
 	}
 
 	capabilities = uk_blkdev_capabilities(device);
@@ -217,7 +286,7 @@ static enum hyperv_acceptance_result probe_storage(
 		       (uint64_t)capabilities->sectors, capabilities->ssize,
 		       capabilities->ioalign,
 		       (uint64_t)capabilities->max_sectors_per_req);
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
 	}
 	bytes = capabilities->ssize * BLOCK_SECTORS_TO_READ;
 	memset(block_buffer, 0, bytes);
@@ -227,7 +296,7 @@ static enum hyperv_acceptance_result probe_storage(
 	if (status < 0 || !(status & UK_BLKDEV_STATUS_SUCCESS)) {
 		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
 		       "reason=submit status=%d\n", status);
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
 	}
 
 	deadline = ukplat_monotonic_clock() + BLOCK_TIMEOUT_NS;
@@ -237,19 +306,25 @@ static enum hyperv_acceptance_result probe_storage(
 		if (rc) {
 			printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
 			       "reason=completion rc=%d\n", rc);
-			return HYPERV_ACCEPTANCE_FAIL;
+			goto out;
 		}
 		if (!uk_blkreq_is_done(&block_request))
 			uk_sched_thread_sleep(POLL_INTERVAL_NS);
 	}
 	if (!uk_blkreq_is_done(&block_request)) {
 		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL reason=timeout\n");
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
 	}
 	if (block_request.result) {
 		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
 		       "reason=request rc=%d\n", block_request.result);
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
+	}
+	rc = hyperv_acceptance_storage_target_validate(&selected);
+	if (rc) {
+		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
+		       "reason=topology-changed rc=%d\n", rc);
+		goto out;
 	}
 
 	mbr = hyperv_acceptance_has_mbr_signature(block_buffer,
@@ -260,13 +335,22 @@ static enum hyperv_acceptance_result probe_storage(
 		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
 		       "reason=os-disk-signature bytes=%zu mbr=%d gpt=%d\n",
 		       bytes, mbr, gpt);
-		return HYPERV_ACCEPTANCE_FAIL;
+		goto out;
 	}
 	printf("HYPERV_ACCEPTANCE STORAGE_READ PASS bytes=%zu "
 	       "sector_size=%zu mbr=%d gpt=%d\n", bytes,
 	       capabilities->ssize, mbr, gpt);
 	puts("UK_HYPERV_BLOCK_READ_OK");
-	return HYPERV_ACCEPTANCE_PASS;
+	result = HYPERV_ACCEPTANCE_PASS;
+out:
+	release_rc = hyperv_acceptance_storage_target_release(&selected);
+	if (release_rc) {
+		printf("HYPERV_ACCEPTANCE STORAGE_SESSION FAIL rc=%d\n",
+		       release_rc);
+		if (result == HYPERV_ACCEPTANCE_PASS)
+			result = HYPERV_ACCEPTANCE_FAIL;
+	}
+	return result;
 }
 
 #if !CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
@@ -314,7 +398,7 @@ static int transmit_discover(struct uk_netdev *device, const uint8_t mac[6],
 }
 
 static enum hyperv_acceptance_result probe_network(
-	unsigned int network_offers)
+	unsigned int network_offers, int binding_ready)
 {
 	struct uk_netdev *device;
 	struct uk_netdev_conf config = {
@@ -336,6 +420,15 @@ static enum hyperv_acceptance_result probe_network(
 	int rc;
 	unsigned int index;
 
+	if (network_offers && !binding_ready) {
+		puts("HYPERV_ACCEPTANCE NETWORK_INVENTORY FAIL "
+		     "reason=binding-timeout");
+		puts("HYPERV_ACCEPTANCE NETWORK_DHCP_TX FAIL "
+		     "reason=binding-timeout");
+		puts("HYPERV_ACCEPTANCE NETWORK_DHCP_RX FAIL "
+		     "reason=binding-timeout");
+		return HYPERV_ACCEPTANCE_FAIL;
+	}
 	if (!uk_netdev_count()) {
 		enum hyperv_acceptance_result result = network_offers ?
 			HYPERV_ACCEPTANCE_FAIL : HYPERV_ACCEPTANCE_UNAVAILABLE;
@@ -537,6 +630,7 @@ int main(void)
 	enum hyperv_acceptance_result storage;
 	enum hyperv_acceptance_result network;
 	enum hyperv_acceptance_result final;
+	struct target_binding_status bindings;
 	unsigned int storage_offers;
 	unsigned int network_offers;
 
@@ -544,12 +638,13 @@ int main(void)
 	       "vmbus_offers=%u\n", vmbus_device_count());
 	puts("UK_HYPERV_PLATFORM_READY");
 	count_vmbus_classes(&storage_offers, &network_offers);
-	wait_for_target_bindings(storage_offers, network_offers);
-	storage = probe_storage(storage_offers);
+	bindings = wait_for_target_bindings(storage_offers, network_offers);
+	storage = probe_storage(storage_offers, bindings.storage);
 #if CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
-	network = hyperv_acceptance_probe_application_network(network_offers);
+	network = hyperv_acceptance_probe_application_network(
+		network_offers, bindings.network);
 #else
-	network = probe_network(network_offers);
+	network = probe_network(network_offers, bindings.network);
 #endif
 	final = hyperv_acceptance_final_result(storage, network);
 	if (final == HYPERV_ACCEPTANCE_PASS) {

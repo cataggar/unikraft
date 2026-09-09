@@ -112,6 +112,7 @@ static void gpadl_record_release(struct vmbus_gpadl_record *record,
 				 int free_pages);
 static void gpadl_record_try_reclaim(struct vmbus_gpadl_record *record);
 static int teardown_external_gpadls(struct vmbus_channel *channel,
+				    const struct vmbus_channel_token *token,
 				    int wait);
 
 static inline void vmbus_channel_cpu_relax(void)
@@ -628,14 +629,18 @@ static unsigned int transaction_cancel_channel(__u32 channel_id,
 	return cancelled;
 }
 
+static __u64 channel_control_deadline(void)
+{
+	return hyperv_reference_time() +
+		(__u64)CONFIG_LIBVMBUS_CHANNEL_TIMEOUT_MS *
+		VMBUS_CONTROL_TICKS_PER_MS;
+}
+
 static int
 transaction_wait_status(struct vmbus_channel_transaction *transaction,
 			const struct vmbus_channel_token *token,
-			__u32 *host_status)
+			__u64 deadline, __u32 *host_status)
 {
-	__u64 deadline = hyperv_reference_time() +
-		(__u64)CONFIG_LIBVMBUS_CHANNEL_TIMEOUT_MS *
-		VMBUS_CONTROL_TICKS_PER_MS;
 	int rc;
 
 	while (!__atomic_load_n(&transaction->done, __ATOMIC_ACQUIRE)) {
@@ -660,21 +665,39 @@ transaction_wait_status(struct vmbus_channel_transaction *transaction,
 
 static int
 transaction_wait(struct vmbus_channel_transaction *transaction,
-		 const struct vmbus_channel_token *token)
+		 const struct vmbus_channel_token *token, __u64 deadline)
 {
 	__u32 host_status = 0;
-	int rc = transaction_wait_status(transaction, token, &host_status);
+	int rc = transaction_wait_status(transaction, token, deadline,
+					 &host_status);
 
 	if (rc)
 		return rc;
 	return host_status ? -EIO : 0;
 }
 
-static int transmit_message(const __u8 *message, int length)
+static int transmit_message(const __u8 *message, int length,
+			    const struct vmbus_channel_token *token,
+			    __u64 deadline)
 {
+	int rc;
+
 	if (length <= 0)
 		return length ? length : -EINVAL;
-	return vmbus_control_transmit(message, (size_t)length);
+	for (;;) {
+		rc = vmbus_control_transmit(message, (size_t)length);
+		if (rc != -EAGAIN)
+			return rc;
+		if (token && !channel_operation_valid(token, 0))
+			return -ECANCELED;
+		if (vmbus_transaction_timed_out(hyperv_reference_time(),
+					       deadline))
+			return -ETIMEDOUT;
+		if (uk_sched_current())
+			uk_sched_thread_sleep(VMBUS_CONTROL_WAIT_NS);
+		else
+			vmbus_channel_cpu_relax();
+	}
 }
 
 static int create_gpadl(struct vmbus_channel *channel,
@@ -692,6 +715,7 @@ static int create_gpadl(struct vmbus_channel *channel,
 	__u32 creation_status = 0;
 	int length;
 	int rc;
+	__u64 deadline = channel_control_deadline();
 
 	if (channel->page_count > CONFIG_LIBVMBUS_RING_PAGES)
 		return -EINVAL;
@@ -746,7 +770,7 @@ static int create_gpadl(struct vmbus_channel *channel,
 			channel->relid, channel->gpadl_id,
 			channel->page_count * VMBUS_PAGE_SIZE, pfns,
 			channel->page_count, &consumed);
-	rc = transmit_message(message, length);
+	rc = transmit_message(message, length, token, deadline);
 	if (rc)
 		goto out;
 	channel->gpadl_posted = 1;
@@ -756,12 +780,13 @@ static int create_gpadl(struct vmbus_channel *channel,
 				message_number++, channel->gpadl_id,
 				&pfns[offset], channel->page_count - offset,
 				&consumed);
-		rc = transmit_message(message, length);
+		rc = transmit_message(message, length, token, deadline);
 		if (rc)
 			goto out;
 		offset += consumed;
 	}
-	rc = transaction_wait_status(transaction, token, &creation_status);
+	rc = transaction_wait_status(transaction, token, deadline,
+				     &creation_status);
 	if (!rc && creation_status) {
 		transaction_release(transaction);
 		channel->gpadl_id = 0;
@@ -793,6 +818,7 @@ static int teardown_gpadl(struct vmbus_channel *channel,
 	struct vmbus_channel_transaction *transaction;
 	__u8 message[16];
 	__u64 capacity_epoch;
+	__u64 deadline = channel_control_deadline();
 	int length;
 	int rc;
 
@@ -813,10 +839,10 @@ static int teardown_gpadl(struct vmbus_channel *channel,
 	}
 	length = vmbus_gpadl_teardown_message(message, sizeof(message),
 			channel->relid, channel->gpadl_id);
-	rc = transmit_message(message, length);
+	rc = transmit_message(message, length, token, deadline);
 	if (!rc) {
 		channel->teardown_posted = 1;
-		rc = transaction_wait(transaction, token);
+		rc = transaction_wait(transaction, token, deadline);
 	}
 	if (!rc) {
 		transaction_release(transaction);
@@ -855,6 +881,7 @@ static int teardown_gpadl_nowait(struct vmbus_channel *channel)
 	struct vmbus_gpadl_record *record;
 	struct vmbus_channel_transaction *transaction;
 	__u8 message[16];
+	__u64 deadline = channel_control_deadline();
 	int length;
 	int rc;
 
@@ -882,7 +909,7 @@ static int teardown_gpadl_nowait(struct vmbus_channel *channel)
 		}
 		length = vmbus_gpadl_teardown_message(message, sizeof(message),
 				channel->relid, channel->gpadl_id);
-		rc = transmit_message(message, length);
+		rc = transmit_message(message, length, NULL, deadline);
 		channel->teardown_posted = !rc;
 	}
 	if (channel->teardown_posted && transaction) {
@@ -946,6 +973,8 @@ static int external_gpadl_pfns(__vaddr_t address, __u16 page_start,
 
 static int post_external_gpadl(struct vmbus_channel *channel,
 			       struct vmbus_gpadl_record *record,
+			       const struct vmbus_channel_token *token,
+			       __u64 deadline,
 			       int *posted)
 {
 	__u64 pfns[28];
@@ -964,7 +993,7 @@ static int post_external_gpadl(struct vmbus_channel *channel,
 	length = vmbus_gpadl_header(message, sizeof(message),
 			channel->relid, record->gpadl_id, record->byte_count,
 			pfns, record->page_count, &consumed);
-	rc = transmit_message(message, length);
+	rc = transmit_message(message, length, token, deadline);
 	if (rc)
 		return rc;
 	*posted = 1;
@@ -981,7 +1010,7 @@ static int post_external_gpadl(struct vmbus_channel *channel,
 		length = vmbus_gpadl_body(message, sizeof(message),
 				message_number++, record->gpadl_id, pfns,
 				count, &consumed);
-		rc = transmit_message(message, length);
+		rc = transmit_message(message, length, token, deadline);
 		if (rc)
 			return rc;
 		page += consumed;
@@ -991,11 +1020,13 @@ static int post_external_gpadl(struct vmbus_channel *channel,
 
 static int teardown_external_gpadl(struct vmbus_channel *channel,
 				   struct vmbus_gpadl_record *record,
+				   const struct vmbus_channel_token *token,
 				   int wait)
 {
 	struct vmbus_channel_transaction *transaction;
 	__u8 message[16];
 	__u8 expected = VMBUS_GPADL_RECORD_OWNED;
+	__u64 deadline = channel_control_deadline();
 	int posted = 0;
 	int length;
 	int rc;
@@ -1016,10 +1047,10 @@ static int teardown_external_gpadl(struct vmbus_channel *channel,
 	record->transaction = transaction;
 	length = vmbus_gpadl_teardown_message(message, sizeof(message),
 			channel->relid, record->gpadl_id);
-	rc = transmit_message(message, length);
+	rc = transmit_message(message, length, token, deadline);
 	posted = !rc;
 	if (!rc && wait)
-		rc = transaction_wait(transaction, NULL);
+		rc = transaction_wait(transaction, token, deadline);
 	if (!rc && wait) {
 		record->transaction = NULL;
 		transaction_release(transaction);
@@ -1042,7 +1073,9 @@ static int teardown_external_gpadl(struct vmbus_channel *channel,
 	return rc;
 }
 
-static int teardown_external_gpadls(struct vmbus_channel *channel, int wait)
+static int teardown_external_gpadls(
+	struct vmbus_channel *channel,
+	const struct vmbus_channel_token *token, int wait)
 {
 	unsigned int i;
 	int result = 0;
@@ -1057,7 +1090,7 @@ static int teardown_external_gpadls(struct vmbus_channel *channel, int wait)
 		    record->channel_generation != channel->owner.generation ||
 		    record->relid != channel->relid)
 			continue;
-		rc = teardown_external_gpadl(channel, record, wait);
+		rc = teardown_external_gpadl(channel, record, token, wait);
 		if (!result)
 			result = rc;
 	}
@@ -1070,6 +1103,7 @@ static int open_channel_control(struct vmbus_channel *channel,
 {
 	struct vmbus_channel_transaction *transaction;
 	__u8 message[148];
+	__u64 deadline = channel_control_deadline();
 	int length;
 	int rc;
 
@@ -1094,9 +1128,9 @@ static int open_channel_control(struct vmbus_channel *channel,
 	rc = vmbus_channel_state_open_begin(&channel->state);
 	if (rc)
 		goto done;
-	rc = transmit_message(message, length);
+	rc = transmit_message(message, length, token, deadline);
 	if (!rc)
-		rc = transaction_wait(transaction, token);
+		rc = transaction_wait(transaction, token, deadline);
 	if (__atomic_load_n(&transaction->done, __ATOMIC_ACQUIRE)) {
 		int transition_rc =
 			vmbus_channel_state_open_complete(&channel->state, rc);
@@ -1113,6 +1147,7 @@ static int close_channel_control(struct vmbus_channel *channel)
 {
 	__u8 message[12];
 	__u8 previous_state = channel->state;
+	__u64 deadline = channel_control_deadline();
 	int length;
 	int rc;
 
@@ -1122,7 +1157,7 @@ static int close_channel_control(struct vmbus_channel *channel)
 		return -EPROTO;
 	length = vmbus_close_message(message, sizeof(message),
 				     channel->relid);
-	rc = transmit_message(message, length);
+	rc = transmit_message(message, length, NULL, deadline);
 	if (rc) {
 		channel->state = previous_state;
 	} else {
@@ -1288,7 +1323,7 @@ int vmbus_channel_close(struct vmbus_channel *channel)
 		channel->device->channel = NULL;
 	channel_synchronize_io(channel);
 	rc = close_channel_control(channel);
-	unmap_rc = teardown_external_gpadls(channel, 1);
+	unmap_rc = teardown_external_gpadls(channel, NULL, 1);
 	if (unmap_rc)
 		vmbus_control_fail();
 	rc2 = teardown_gpadl(channel, NULL);
@@ -1365,6 +1400,7 @@ int vmbus_channel_gpadl_map(struct vmbus_channel *channel, void *address,
 	struct vmbus_gpadl_record *record;
 	struct vmbus_channel_token token = { 0 };
 	__u64 capacity_epoch;
+	__u64 deadline;
 	unsigned int pages;
 	__u32 creation_status = 0;
 	int acquired;
@@ -1418,9 +1454,10 @@ int vmbus_channel_gpadl_map(struct vmbus_channel *channel, void *address,
 		rc = -ENOSPC;
 		goto out_record;
 	}
-	rc = post_external_gpadl(channel, record, &posted);
+	deadline = channel_control_deadline();
+	rc = post_external_gpadl(channel, record, &token, deadline, &posted);
 	if (!rc)
-		rc = transaction_wait_status(transaction, &token,
+		rc = transaction_wait_status(transaction, &token, deadline,
 					     &creation_status);
 	transaction_release(transaction);
 	if (!rc && creation_status) {
@@ -1437,7 +1474,7 @@ int vmbus_channel_gpadl_map(struct vmbus_channel *channel, void *address,
 out_posted:
 	if (posted) {
 		int cleanup_rc =
-			teardown_external_gpadl(channel, record, 1);
+			teardown_external_gpadl(channel, record, &token, 1);
 
 		if (cleanup_rc) {
 			vmbus_control_fail();
@@ -1494,7 +1531,7 @@ int vmbus_channel_gpadl_unmap(struct vmbus_channel *channel,
 		rc = -EINPROGRESS;
 		goto out_operation;
 	}
-	rc = teardown_external_gpadl(channel, record, 1);
+	rc = teardown_external_gpadl(channel, record, &token, 1);
 	if (!rc) {
 		gpadl->id = 0;
 		gpadl->page_count = 0;
@@ -1864,7 +1901,8 @@ int vmbus_channel_rescind(__u32 channel_id)
 		__u8 message[12];
 		int length = vmbus_close_message(message, sizeof(message),
 						 channel_id);
-		int close_rc = transmit_message(message, length);
+		int close_rc = transmit_message(
+			message, length, NULL, channel_control_deadline());
 
 		if (!close_rc)
 			channel->close_posted = 1;
@@ -1874,7 +1912,7 @@ int vmbus_channel_rescind(__u32 channel_id)
 	if (plan.send_gpadl_teardown &&
 	    teardown_gpadl_nowait(channel))
 		vmbus_control_fail();
-	if (teardown_external_gpadls(channel, 0))
+	if (teardown_external_gpadls(channel, NULL, 0))
 		vmbus_control_fail();
 	if (channel->device && channel->device->channel == channel)
 		channel->device->channel = NULL;
@@ -1903,7 +1941,7 @@ void vmbus_channel_close_all(void)
 					 (__u32)-ECANCELED);
 		rc = close_channel_control(&channels[i]);
 		(void)rc;
-		(void)teardown_external_gpadls(&channels[i], 1);
+		(void)teardown_external_gpadls(&channels[i], NULL, 1);
 		(void)teardown_gpadl(&channels[i], NULL);
 		if (channels[i].device &&
 		    channels[i].device->channel == &channels[i])

@@ -160,6 +160,9 @@ static void (*host_unload_post_hook)(void *);
 static void *host_unload_post_hook_arg;
 static unsigned int host_connection_fail_calls;
 static int host_transmit_fail_after = -1;
+static __u32 host_transmit_backpressure_type;
+static unsigned int host_transmit_backpressure;
+static unsigned int host_transmit_attempts;
 static __u32 host_gpadl_status;
 static __u32 host_gpadl_channel;
 static __u32 host_gpadl_id;
@@ -572,6 +575,14 @@ int vmbus_control_transmit(const __u8 *message, size_t length)
 #ifdef VMBUS_BUS_HOST_TEST
 	__u32 type;
 
+	type = host_read32(message);
+	host_transmit_attempts++;
+	if (host_transmit_backpressure &&
+	    (!host_transmit_backpressure_type ||
+	     host_transmit_backpressure_type == type)) {
+		host_transmit_backpressure--;
+		return -EAGAIN;
+	}
 	copy_bytes(host_last_tx, message, (unsigned int)length);
 	host_last_tx_len = length;
 	if (host_transmit_error)
@@ -582,7 +593,6 @@ int vmbus_control_transmit(const __u8 *message, size_t length)
 	}
 	if (host_transmit_fail_after > 0)
 		host_transmit_fail_after--;
-	type = host_read32(message);
 	if (type == 8 && length >= 16) {
 		host_gpadl_channel = host_read32(message + 8);
 		host_gpadl_id = host_read32(message + 12);
@@ -603,6 +613,9 @@ int vmbus_control_transmit(const __u8 *message, size_t length)
 				CONFIG_LIBVMBUS_POST_RETRIES,
 				post_hypercall, post_backoff, NULL);
 	if (rc) {
+		if (status == 0x0013 &&
+		    rc == VMBUS_POST_INSUFFICIENT_BUFFERS)
+			return -EAGAIN;
 		report_post_failure(connection_id, message, length, status, rc);
 		return -EIO;
 	}
@@ -613,20 +626,50 @@ int vmbus_control_transmit(const __u8 *message, size_t length)
 static int transmit(const struct vmbus_action *action)
 {
 #ifdef VMBUS_BUS_HOST_TEST
-	return vmbus_control_transmit(action->tx, action->tx_len);
+	__u64 deadline = hyperv_reference_time() +
+		(__u64)CONFIG_LIBVMBUS_VERSION_TIMEOUT_MS *
+		VMBUS_REFERENCE_TICKS_PER_MS;
+	int rc;
+
+	for (;;) {
+		rc = vmbus_control_transmit(action->tx, action->tx_len);
+		if (rc != -EAGAIN)
+			return rc;
+		if (action->generation != vmbus_protocol_generation())
+			return -ECANCELED;
+		if (hyperv_reference_time() >= deadline)
+			return -ETIMEDOUT;
+		vmbus_cpu_relax();
+	}
 #else
 	struct vmbus_action retry;
+	__u64 deadline = hyperv_reference_time() +
+		(__u64)CONFIG_LIBVMBUS_VERSION_TIMEOUT_MS *
+		VMBUS_REFERENCE_TICKS_PER_MS;
 	__u16 status;
 	int rc;
 
-	rc = vmbus_post_message(action->connection_id,
-				VMBUS_HV_MESSAGE_TYPE, action->tx,
-				action->tx_len, post_input_gpa, &status,
-				(__u8)hyperv_has_post_messages(),
-				CONFIG_LIBVMBUS_POST_RETRIES,
-				post_hypercall, post_backoff, NULL);
-	if (!rc)
-		return 0;
+	for (;;) {
+		rc = vmbus_post_message(action->connection_id,
+					VMBUS_HV_MESSAGE_TYPE, action->tx,
+					action->tx_len, post_input_gpa, &status,
+					(__u8)hyperv_has_post_messages(),
+					CONFIG_LIBVMBUS_POST_RETRIES,
+					post_hypercall, post_backoff, NULL);
+		if (!rc)
+			return 0;
+		if (status != 0x0013 ||
+		    rc != VMBUS_POST_INSUFFICIENT_BUFFERS)
+			break;
+		if (action->generation != vmbus_protocol_generation())
+			return -ECANCELED;
+		if (hyperv_reference_time() >= deadline) {
+			report_post_failure(action->connection_id, action->tx,
+					    action->tx_len, status, rc);
+			return -ETIMEDOUT;
+		}
+		post_backoff(NULL, 1000);
+	}
 	if (vmbus_protocol_post_failure(status, hyperv_reference_time(),
 					&retry)) {
 		uk_pr_info("VMBus: PostMessage connection %u control %u at "
@@ -665,7 +708,7 @@ static struct vmbus_driver *find_driver(const struct vmbus_guid *class_id)
 }
 
 static struct vmbus_device_binding *
-device_binding(struct vmbus_device *dev)
+device_binding(const struct vmbus_device *dev)
 {
 	uintptr_t address = (uintptr_t)dev;
 	uintptr_t first = (uintptr_t)&devices[0];
@@ -2192,6 +2235,23 @@ const struct vmbus_device *vmbus_device_get(unsigned int index)
 	return NULL;
 }
 
+int vmbus_device_is_bound(const struct vmbus_device *device)
+{
+	struct vmbus_device_binding *binding =
+		device_binding(device);
+	unsigned long flags;
+	int bound = 0;
+
+	if (!binding)
+		return 0;
+	bind_state_lock(&flags);
+	if (device->present && device->driver &&
+	    binding->state == VMBUS_BIND_BOUND && binding->generation)
+		bound = 1;
+	bind_state_unlock(flags);
+	return bound;
+}
+
 int _vmbus_register_driver(struct vmbus_driver *driver)
 {
 	if (!driver || !driver->name || !driver->device_ids)
@@ -2602,6 +2662,9 @@ static void host_reset_state(void)
 	host_pump_hook = NULL;
 	host_last_tx_len = 0;
 	host_transmit_error = 0;
+	host_transmit_backpressure_type = 0;
+	host_transmit_backpressure = 0;
+	host_transmit_attempts = 0;
 	host_unload_response_mode = HOST_UNLOAD_NONE;
 	host_unload_posts = 0;
 	host_unload_injections = 0;
@@ -2933,6 +2996,8 @@ static int host_test_bind_retries(void)
 	host_make_offer(&offer, 3);
 	if (add_offer(&offer) || host_add_b != 1)
 		return 111;
+	if (vmbus_device_is_bound(&devices[0]))
+		return 112;
 	vmbus_control_channel_resource_released();
 	process_bind_work();
 	if (host_add_b != 1 ||
@@ -2958,6 +3023,8 @@ static int host_test_bind_retries(void)
 	host_make_offer(&offer, 4);
 	if (add_offer(&offer) || host_add_b != 1)
 		return 114;
+	if (vmbus_device_is_bound(&devices[0]))
+		return 115;
 	process_bind_work();
 	if (host_add_b != 1)
 		return 115;
@@ -2965,7 +3032,8 @@ static int host_test_bind_retries(void)
 		return 116;
 	process_bind_work();
 	if (host_add_b != 2 ||
-	    device_bindings[0].state != VMBUS_BIND_BOUND)
+	    device_bindings[0].state != VMBUS_BIND_BOUND ||
+	    !vmbus_device_is_bound(&devices[0]))
 		return 117;
 	host_pump_hook = host_auto_control_pump;
 	if (vmbus_channel_close(devices[0].channel))
@@ -3232,10 +3300,45 @@ static int host_test_same_relid_reoffer(void)
 	return 0;
 }
 
+static int host_test_protocol_backpressure(void)
+{
+	struct vmbus_action action;
+	unsigned int attempts;
+	int rc;
+
+	host_reset_state();
+	host_zero(&action, sizeof(action));
+	action.kind = VMBUS_ACTION_TRANSMIT;
+	action.generation = vmbus_protocol_generation();
+	action.connection_id = 4;
+	action.tx_len = 12;
+	host_write32(action.tx, 14);
+	host_transmit_backpressure_type = 14;
+	host_transmit_backpressure = 3;
+	rc = handle_action(&action);
+	attempts = host_transmit_attempts;
+	if (rc || attempts != 4)
+		return 157;
+
+	host_transmit_attempts = 0;
+	host_transmit_backpressure = 10000;
+	rc = handle_action(&action);
+	attempts = host_transmit_attempts;
+	host_transmit_backpressure_type = 0;
+	host_transmit_backpressure = 0;
+	host_transmit_attempts = 0;
+	if (rc != -ETIMEDOUT || attempts < 4 || attempts >= 10000)
+		return 158;
+	return 0;
+}
+
 int vmbus_bus_host_production_test(void)
 {
 	int rc;
 
+	rc = host_test_protocol_backpressure();
+	if (rc)
+		return rc;
 	rc = host_test_concurrent_irqs();
 	if (rc)
 		return rc;
@@ -3814,6 +3917,18 @@ void vmbus_bus_host_set_transmit_fail_after(int successful_posts)
 	host_transmit_fail_after = successful_posts;
 }
 
+void vmbus_bus_host_set_transmit_backpressure(__u32 control_type,
+					      unsigned int attempts)
+{
+	host_transmit_backpressure_type = control_type;
+	host_transmit_backpressure = attempts;
+}
+
+unsigned int vmbus_bus_host_transmit_attempts(void)
+{
+	return host_transmit_attempts;
+}
+
 void vmbus_bus_host_reset_gpadl_trace(void)
 {
 	host_gpadl_channel = 0;
@@ -3821,6 +3936,9 @@ void vmbus_bus_host_reset_gpadl_trace(void)
 	host_gpadl_body_posts = 0;
 	host_gpadl_teardown_posts = 0;
 	host_transmit_fail_after = -1;
+	host_transmit_backpressure_type = 0;
+	host_transmit_backpressure = 0;
+	host_transmit_attempts = 0;
 }
 
 unsigned int vmbus_bus_host_gpadl_body_posts(void)

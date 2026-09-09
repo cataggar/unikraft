@@ -1030,6 +1030,7 @@ pub fn build(b: *std.Build) void {
             "drivers/hyperv/storvsc/storvsc.c",
             "support/apps/hyperv-acceptance/acceptance_protocol.c",
             "support/apps/hyperv-acceptance/persistence.c",
+            "support/apps/hyperv-acceptance/storage_target.c",
             "support/build/tests/storvsc-production-test.c",
         },
         .flags = &.{

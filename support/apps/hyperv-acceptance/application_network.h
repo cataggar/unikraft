@@ -5,6 +5,7 @@
 #include "acceptance_protocol.h"
 
 enum hyperv_acceptance_result
-hyperv_acceptance_probe_application_network(unsigned int network_offers);
+hyperv_acceptance_probe_application_network(unsigned int network_offers,
+					     int binding_ready);
 
 #endif
