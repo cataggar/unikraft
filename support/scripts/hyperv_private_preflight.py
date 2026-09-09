@@ -8,12 +8,14 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib
-from importlib.metadata import version as package_version
+from importlib.metadata import distribution as package_distribution
+from importlib.metadata import PackageNotFoundError
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import resource
 import secrets
 import shlex
 import shutil
@@ -42,19 +44,38 @@ NETWORK_CONTROLLER_PATH = Path(__file__).with_name(
 INPUT_SCHEMA = "unikraft.hyperv.private-preflight-input"
 STATE_SCHEMA = "unikraft.hyperv.private-preflight-state"
 RECEIPT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
-INPUT_SCHEMA_VERSION = 3
+INPUT_SCHEMA_VERSION = 5
 STATE_SCHEMA_VERSION = 2
 RECEIPT_SCHEMA_VERSION = 2
 HOST_PHASE_SCHEMA = host_runner.SCHEMA
 HOST_EVIDENCE_SCHEMA = host_runner.EVIDENCE_SCHEMA
 INPUT_MANIFEST = "private-preflight-input.json"
 SOLVED_CONFIG = "solved.config"
+CAPABILITY_REFERENCE = "capability.source.json"
+PRIVATE_BUILD_RECEIPT = "private-build-receipt.json"
+NATIVE_EFI_NAME = "helloworld_hyperv-x86_64-efi-netvsc"
+CAPABILITY_REFERENCE_SCHEMA = "unikraft.hyperv.capability-reference"
+PRIVATE_BUILD_SCHEMA = "unikraft.hyperv.private-local-build"
 STATE_FILE = "state.json"
 LOCATION = "northeurope"
 VM_SIZE = "Standard_D2s_v5"
 CONTAINER = "preflight"
 WORKLOAD = "platform-only-v1"
 SDK_VERSION = "12.28.0"
+SDK_DISTRIBUTIONS = (
+    ("azure-core", "1.41.0"),
+    ("azure-storage-blob", SDK_VERSION),
+    ("certifi", "2026.7.22"),
+    ("cffi", "2.1.1"),
+    ("charset-normalizer", "3.5.1"),
+    ("cryptography", "50.0.1"),
+    ("idna", "3.19"),
+    ("isodate", "0.7.2"),
+    ("pycparser", "3.0"),
+    ("requests", "2.34.2"),
+    ("typing-extensions", "4.16.0"),
+    ("urllib3", "2.7.0"),
+)
 MAX_ATTEMPT_SECONDS = 60 * 60
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
@@ -64,6 +85,7 @@ MAX_STATE_BYTES = 192 * 1024
 MAX_BLOB_SAS_BYTES = 4096
 TRANSFER_TIMEOUT_SECONDS = 300
 RECONCILE_TIMEOUT_SECONDS = 120
+CLEANUP_TIMEOUT_SECONDS = 20 * 60
 SHA256 = re.compile(r"[0-9a-f]{64}")
 IDENTITY = re.compile(r"[0-9a-f]{32}")
 STORAGE_NAME = re.compile(r"[a-z0-9]{3,24}")
@@ -84,6 +106,11 @@ REMOTE_ROLES = PUBLIC_ROLES + PRIVATE_ROLES
 LOCAL_ROLES = ("efi",)
 ALL_ROLES = REMOTE_ROLES + LOCAL_ROLES
 BOOT_POLICIES = ("platform-unavailable-v1", "platform-main-zero-v1")
+BUILD_TOOL_NAMES = (
+    "zig", "make", "python", "bison", "flex", "m4",
+    "llvm-nm", "llvm-objcopy", "llvm-objdump", "llvm-readelf",
+    "llvm-strip", "bison-data",
+)
 PURPOSE = "private-hyperv-platform-preflight"
 IMPLEMENTATION_PATHS = {
     "controller": Path(__file__),
@@ -163,17 +190,8 @@ def support_record(value):
 
 
 def implementation_contract():
-    try:
-        installed_sdk = package_version("azure-storage-blob")
-    except Exception:
-        raise RuntimeError(
-            "Pinned azure-storage-blob dependency is unavailable"
-        ) from None
     return {
-        "sdk": {
-            "name": "azure-storage-blob",
-            "version": installed_sdk,
-        },
+        "sdk": sdk_dependency_contract(),
         "files": {
             name: {
                 "path": str(path.relative_to(SUPPORT.parent)),
@@ -185,15 +203,111 @@ def implementation_contract():
     }
 
 
+def sdk_dependency_contract():
+    expected_requirements = "".join(
+        f"{name}=={version}\n" for name, version in SDK_DISTRIBUTIONS
+    ).encode()
+    requirements = azure.read_regular_file(
+        REQUIREMENTS_PATH, 16 * 1024,
+        "Private-preflight dependency lock",
+    )
+    if requirements != expected_requirements:
+        raise RuntimeError(
+            "Private-preflight dependency lock is incompatible"
+        )
+    records = []
+    for name, expected_version in SDK_DISTRIBUTIONS:
+        try:
+            package = package_distribution(name)
+        except PackageNotFoundError:
+            raise RuntimeError(
+                "Pinned private-preflight dependency is unavailable"
+            ) from None
+        if package.version != expected_version or package.files is None:
+            raise RuntimeError(
+                "Pinned private-preflight dependency is incompatible"
+            )
+        digest = hashlib.sha256()
+        count = 0
+        total = 0
+        for relative in sorted(package.files, key=str):
+            path = Path(package.locate_file(relative))
+            try:
+                metadata = path.lstat()
+            except OSError:
+                raise RuntimeError(
+                    "Pinned private-preflight dependency is incomplete"
+                ) from None
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+            ):
+                raise RuntimeError(
+                    "Pinned private-preflight dependency is unsafe"
+                )
+            fingerprint = azure.image_sha256(path)
+            encoded = str(relative).encode()
+            digest.update(len(encoded).to_bytes(4, "big"))
+            digest.update(encoded)
+            digest.update(metadata.st_size.to_bytes(8, "big"))
+            digest.update(bytes.fromhex(fingerprint))
+            count += 1
+            total += metadata.st_size
+        if count == 0:
+            raise RuntimeError(
+                "Pinned private-preflight dependency is empty"
+            )
+        records.append({
+            "name": name,
+            "version": expected_version,
+            "files": count,
+            "bytes": total,
+            "sha256": digest.hexdigest(),
+        })
+    return {
+        "requirements_sha256": hashlib.sha256(requirements).hexdigest(),
+        "distributions": records,
+    }
+
+
 def validate_implementation(value):
     value = exact_fields(
         value, ("sdk", "files"), "Private-preflight implementation"
     )
     sdk = exact_fields(
-        value["sdk"], ("name", "version"), "Blob SDK contract"
+        value["sdk"], ("requirements_sha256", "distributions"),
+        "Blob SDK contract",
     )
-    if sdk != {"name": "azure-storage-blob", "version": SDK_VERSION}:
+    require_sha256(
+        sdk["requirements_sha256"], "Dependency lock fingerprint"
+    )
+    if (
+        sdk["requirements_sha256"] != azure.image_sha256(REQUIREMENTS_PATH)
+        or not isinstance(sdk["distributions"], list)
+        or len(sdk["distributions"]) != len(SDK_DISTRIBUTIONS)
+    ):
         raise ValueError("Blob SDK contract is incompatible")
+    distributions = []
+    for record, (name, version) in zip(
+        sdk["distributions"], SDK_DISTRIBUTIONS
+    ):
+        record = exact_fields(
+            record, ("name", "version", "files", "bytes", "sha256"),
+            "Blob SDK distribution",
+        )
+        if (
+            record["name"] != name
+            or record["version"] != version
+            or type(record["files"]) is not int
+            or record["files"] <= 0
+            or type(record["bytes"]) is not int
+            or record["bytes"] <= 0
+        ):
+            raise ValueError("Blob SDK distribution is incompatible")
+        require_sha256(
+            record["sha256"], "Blob SDK distribution fingerprint"
+        )
+        distributions.append(dict(record))
     files = exact_fields(
         value["files"], tuple(IMPLEMENTATION_PATHS),
         "Private-preflight implementation files",
@@ -214,7 +328,13 @@ def validate_implementation(value):
             record["sha256"], f"{name} implementation fingerprint"
         )
         normalized[name] = dict(record)
-    return {"sdk": dict(sdk), "files": normalized}
+    return {
+        "sdk": {
+            "requirements_sha256": sdk["requirements_sha256"],
+            "distributions": distributions,
+        },
+        "files": normalized,
+    }
 
 
 def validate_provenance(value):
@@ -250,7 +370,7 @@ def expected_budget(files, qemu_support):
     remote = sum(files[role]["size"] for role in REMOTE_ROLES)
     remote += sum(record["size"] for record in qemu_support)
     firmware_working = (
-        files["ovmf_code"]["size"] + files["ovmf_vars"]["size"]
+        files["ovmf_vars"]["size"] * host_runner.TOTAL_BOOT_COUNT
     )
     total = (
         remote + firmware_working
@@ -258,7 +378,8 @@ def expected_budget(files, qemu_support):
     )
     return {
         "remote_input_bytes": remote,
-        "firmware_working_copy_max_bytes": firmware_working,
+        "firmware_variable_copy_count": host_runner.TOTAL_BOOT_COUNT,
+        "firmware_working_copy_bytes": firmware_working,
         "control_payload_max_bytes": MAX_CONTROL_BYTES,
         "evidence_max_bytes": MAX_EVIDENCE_BYTES,
         "total_max_bytes": total,
@@ -304,6 +425,7 @@ def validate_input_manifest(value):
             "schema", "schema_version", "workload", "boot_policy",
             "raw_size", "provenance", "files", "qemu_support", "miz",
             "packaging", "implementation", "budget",
+            "capability_reference", "private_build",
         ),
         "Private-preflight input manifest",
     )
@@ -349,11 +471,18 @@ def validate_input_manifest(value):
         raise ValueError("Private-preflight miz contract is invalid")
     require_sha256(miz["sha256"], "Private-preflight miz fingerprint")
     provenance = validate_provenance(value["provenance"])
+    capability_reference = validate_capability_reference(
+        value["capability_reference"], files["capability_raw"]
+    )
+    private_build = validate_private_build(
+        value["private_build"], provenance, files["efi"]
+    )
     implementation = validate_implementation(value["implementation"])
     budget = exact_fields(
         value["budget"],
         (
-            "remote_input_bytes", "firmware_working_copy_max_bytes",
+            "remote_input_bytes", "firmware_variable_copy_count",
+            "firmware_working_copy_bytes",
             "control_payload_max_bytes",
             "evidence_max_bytes", "total_max_bytes", "remaining_bytes",
         ),
@@ -373,6 +502,8 @@ def validate_input_manifest(value):
     return {
         **value,
         "provenance": provenance,
+        "capability_reference": capability_reference,
+        "private_build": private_build,
         "files": files,
         "qemu_support": qemu_support,
         "miz": dict(miz),
@@ -434,6 +565,289 @@ def regular_record(path, name, description):
     }
 
 
+def directory_record(path, name, description):
+    original = Path(path)
+    metadata = original.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"{description} must be a non-symlink directory")
+    root = original.resolve(strict=True)
+    digest = hashlib.sha256()
+    count = 0
+    total = 0
+    for entry in sorted(root.rglob("*")):
+        relative = entry.relative_to(root).as_posix()
+        metadata = entry.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"{description} contains a symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{description} contains a nonregular file")
+        encoded = relative.encode()
+        fingerprint = azure.image_sha256(entry)
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(metadata.st_size.to_bytes(8, "big"))
+        digest.update(bytes.fromhex(fingerprint))
+        count += 1
+        total += metadata.st_size
+    if count == 0:
+        raise ValueError(f"{description} is empty")
+    return {
+        "name": name,
+        "sha256": digest.hexdigest(),
+        "size": total,
+        "files": count,
+    }
+
+
+def validate_tool_record(value, expected_name):
+    value = exact_fields(
+        value, ("name", "sha256", "size", "files"),
+        "Private build tool fingerprint",
+    )
+    if (
+        value["name"] != expected_name
+        or type(value["size"]) is not int
+        or value["size"] <= 0
+        or type(value["files"]) is not int
+        or value["files"] <= 0
+    ):
+        raise ValueError("Private build tool fingerprint is invalid")
+    require_sha256(value["sha256"], "Private build tool fingerprint")
+    return dict(value)
+
+
+def validate_capability_reference(value, capability_raw):
+    value = exact_fields(
+        value, ("name", "sha256", "size", "receipt"),
+        "Public capability reference",
+    )
+    if (
+        value["name"] != CAPABILITY_REFERENCE
+        or type(value["size"]) is not int
+        or not 0 < value["size"] <= MAX_MANIFEST_BYTES
+    ):
+        raise ValueError("Public capability reference is invalid")
+    require_sha256(value["sha256"], "Public capability reference")
+    receipt = exact_fields(
+        value["receipt"],
+        (
+            "schema", "schema_version", "scope", "source",
+            "manifest_sha256", "efi_sha256", "raw", "source_vhd",
+            "source_boot_evidence",
+        ),
+        "Public capability receipt",
+    )
+    if (
+        receipt["schema"] != CAPABILITY_REFERENCE_SCHEMA
+        or type(receipt["schema_version"]) is not int
+        or receipt["schema_version"] != 1
+        or receipt["scope"] != (
+            "historical nonsecret capability only; "
+            "not current private deployment provenance"
+        )
+    ):
+        raise ValueError("Public capability receipt is incompatible")
+    source = exact_fields(
+        receipt["source"],
+        (
+            "provider", "repository", "repository_id", "workflow_ref",
+            "head_sha", "run_id", "run_attempt", "job",
+        ),
+        "Public capability source",
+    )
+    if (
+        source["provider"] != "github-actions"
+        or not isinstance(source["repository"], str)
+        or not re.fullmatch(
+            r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}",
+            source["repository"],
+        )
+        or type(source["repository_id"]) is not int
+        or source["repository_id"] <= 0
+        or not isinstance(source["workflow_ref"], str)
+        or not source["workflow_ref"].startswith(
+            source["repository"] + "/.github/workflows/"
+        )
+        or not GIT_COMMIT.fullmatch(source["head_sha"])
+        or type(source["run_id"]) is not int
+        or source["run_id"] <= 0
+        or type(source["run_attempt"]) is not int
+        or source["run_attempt"] <= 0
+        or not isinstance(source["job"], str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", source["job"])
+    ):
+        raise ValueError("Public capability source is invalid")
+    require_sha256(
+        receipt["manifest_sha256"], "Public capability manifest"
+    )
+    require_sha256(receipt["efi_sha256"], "Public capability EFI")
+    raw = exact_fields(
+        receipt["raw"], ("sha256", "size"), "Public capability raw image"
+    )
+    source_vhd = exact_fields(
+        receipt["source_vhd"], ("sha256", "size"),
+        "Public capability fixed VHD",
+    )
+    if (
+        raw != {
+            "sha256": capability_raw["sha256"],
+            "size": capability_raw["size"],
+        }
+        or type(source_vhd["size"]) is not int
+        or source_vhd["size"] != capability_raw["size"] + 512
+    ):
+        raise ValueError("Public capability image binding is invalid")
+    require_sha256(source_vhd["sha256"], "Public capability fixed VHD")
+    evidence = exact_fields(
+        receipt["source_boot_evidence"],
+        ("boots", "platform_marker", "scope"),
+        "Public capability boot evidence",
+    )
+    if (
+        evidence["platform_marker"] != host_runner.PLATFORM_MARKER
+        or evidence["scope"] != "platform-only"
+    ):
+        raise ValueError("Public capability boot evidence is invalid")
+    boots = exact_fields(
+        evidence["boots"], ("raw", "vhd"), "Public capability boot formats"
+    )
+    for image, modes in boots.items():
+        modes = exact_fields(
+            modes, ("legacy-apic", "x2apic"),
+            "Public capability boot modes",
+        )
+        for mode, outcome in modes.items():
+            outcome = exact_fields(
+                outcome, ("apic_path", "io_ready", "platform_ready"),
+                "Public capability boot outcome",
+            )
+            expected_apic = (
+                "legacy-xapic" if mode == "legacy-apic" else "x2apic"
+            )
+            if outcome != {
+                "apic_path": expected_apic,
+                "io_ready": False,
+                "platform_ready": True,
+            }:
+                raise ValueError(
+                    "Public capability boot outcome is invalid"
+                )
+    return {
+        **value,
+        "receipt": {
+            **receipt,
+            "source": dict(source),
+            "raw": dict(raw),
+            "source_vhd": dict(source_vhd),
+            "source_boot_evidence": {
+                **evidence,
+                "boots": {
+                    image: {
+                        mode: dict(outcome)
+                        for mode, outcome in image_modes.items()
+                    }
+                    for image, image_modes in boots.items()
+                },
+            },
+        },
+    }
+
+
+def validate_private_build(value, provenance, efi):
+    value = exact_fields(
+        value, ("name", "sha256", "size", "receipt"),
+        "Private local build receipt",
+    )
+    if (
+        value["name"] != PRIVATE_BUILD_RECEIPT
+        or type(value["size"]) is not int
+        or not 0 < value["size"] <= MAX_MANIFEST_BYTES
+    ):
+        raise ValueError("Private local build receipt is invalid")
+    require_sha256(value["sha256"], "Private local build receipt")
+    receipt = exact_fields(
+        value["receipt"],
+        (
+            "schema", "schema_version", "result", "source_before",
+            "source_after", "invocation", "tools", "output",
+            "builder_sha256",
+        ),
+        "Private local build receipt",
+    )
+    before = validate_provenance(receipt["source_before"])
+    after = validate_provenance(receipt["source_after"])
+    if (
+        receipt["schema"] != PRIVATE_BUILD_SCHEMA
+        or type(receipt["schema_version"]) is not int
+        or receipt["schema_version"] != 1
+        or receipt["result"] != "PASS"
+        or before != provenance
+        or after != provenance
+        or require_sha256(
+            receipt["builder_sha256"], "Private build implementation"
+        ) != azure.image_sha256(Path(__file__))
+    ):
+        raise ValueError("Private local build provenance is incompatible")
+    invocation = exact_fields(
+        receipt["invocation"],
+        (
+            "engine", "jobs", "app", "profile", "compiler_target",
+            "output",
+        ),
+        "Private local build invocation",
+    )
+    if invocation != {
+        "engine": "zig-native-images-v1",
+        "jobs": 2,
+        "app": "support/apps/hyperv-acceptance",
+        "profile": "hyperv-x86_64-efi-netvsc",
+        "compiler_target": "x86_64-freestanding-none",
+        "output": NATIVE_EFI_NAME,
+    }:
+        raise ValueError("Private local build invocation is incompatible")
+    tools = exact_fields(
+        receipt["tools"], BUILD_TOOL_NAMES, "Private local build tools"
+    )
+    tools = {
+        name: validate_tool_record(tools[name], name)
+        for name in BUILD_TOOL_NAMES
+    }
+    output = exact_fields(
+        receipt["output"], ("name", "sha256", "size"),
+        "Private local build output",
+    )
+    if output != {
+        "name": NATIVE_EFI_NAME,
+        "sha256": efi["sha256"],
+        "size": efi["size"],
+    }:
+        raise ValueError("Private local build output is unrelated to the EFI")
+    return {
+        **value,
+        "receipt": {
+            **receipt,
+            "source_before": before,
+            "source_after": after,
+            "invocation": dict(invocation),
+            "tools": tools,
+            "output": dict(output),
+        },
+    }
+
+
+def load_receipt(path, name, description):
+    record = regular_record(path, name, description)
+    if record["size"] > MAX_MANIFEST_BYTES:
+        raise ValueError(f"{description} is too large")
+    raw = azure.read_regular_file(path, MAX_MANIFEST_BYTES, description)
+    return {
+        **record,
+        "receipt": azure.parse_strict_json(raw, description),
+    }
+
+
 def git_output(repository, arguments):
     result = subprocess.run(
         ["git", "-C", str(repository), *arguments],
@@ -470,6 +884,198 @@ def build_provenance(repository, config_path):
         "tracked_entries": tree.count(b"\0"),
         "config": config,
     }
+
+
+def local_tool_record(path, name):
+    path = Path(path).resolve(strict=True)
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"Private build tool {name} is not a regular file")
+    return {
+        "name": name,
+        "sha256": azure.image_sha256(path),
+        "size": metadata.st_size,
+        "files": 1,
+    }
+
+
+def write_tool_wrapper(path, executable, environment=None):
+    lines = ["#!/bin/sh", "set -eu"]
+    for name, value in (environment or {}).items():
+        lines.append(f"export {name}={shlex.quote(str(value))}")
+    lines.append(f"exec {shlex.quote(str(executable))} \"$@\"")
+    save_private_bytes(path, ("\n".join(lines) + "\n").encode())
+    path.chmod(0o700)
+
+
+def build_private_image(
+    output_directory, repository, config_path, zig_path, make_path,
+    python_path, bison_path, flex_path, m4_path, bison_data,
+    llvm_directory, timeout,
+):
+    if type(timeout) is not int or not 1 <= timeout <= 3600:
+        raise ValueError("Private local build timeout must be 1-3600 seconds")
+    repository = Path(repository).resolve(strict=True)
+    source_before = build_provenance(repository, config_path)
+    output_directory = private_directory(
+        output_directory, "Private local build directory", must_exist=False
+    )
+    tools = {
+        "zig": local_tool_record(zig_path, "zig"),
+        "make": local_tool_record(make_path, "make"),
+        "python": local_tool_record(python_path, "python"),
+        "bison": local_tool_record(bison_path, "bison"),
+        "flex": local_tool_record(flex_path, "flex"),
+        "m4": local_tool_record(m4_path, "m4"),
+    }
+    resolved = {
+        "zig": Path(zig_path).resolve(strict=True),
+        "make": Path(make_path).resolve(strict=True),
+        "python": Path(python_path).resolve(strict=True),
+        "bison": Path(bison_path).resolve(strict=True),
+        "flex": Path(flex_path).resolve(strict=True),
+        "m4": Path(m4_path).resolve(strict=True),
+    }
+    llvm_directory = Path(llvm_directory).resolve(strict=True)
+    for name in (
+        "llvm-nm", "llvm-objcopy", "llvm-objdump", "llvm-readelf",
+        "llvm-strip",
+    ):
+        path = (llvm_directory / name).resolve(strict=True)
+        tools[name] = local_tool_record(path, name)
+        resolved[name] = path
+    tools["bison-data"] = directory_record(
+        bison_data, "bison-data", "Private build Bison data"
+    )
+    output_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    config = output_directory / SOLVED_CONFIG
+    build_output = output_directory / "build"
+    wrappers = output_directory / ".tool-bin"
+    temporary = output_directory / "tmp"
+    cache = output_directory / "cache"
+    wrappers.mkdir(mode=0o700)
+    temporary.mkdir(mode=0o700)
+    cache.mkdir(mode=0o700)
+    copy_record(
+        Path(config_path).resolve(strict=True), config,
+        source_before["config"],
+    )
+    wrapper_tools = {
+        "make": ("make", None),
+        "python3": ("python", None),
+        "yacc": (
+            "bison",
+            {
+                "BISON_PKGDATADIR": Path(bison_data).resolve(strict=True),
+                "M4": resolved["m4"],
+            },
+        ),
+        "lex": ("flex", {"M4": resolved["m4"]}),
+        "llvm-nm": ("llvm-nm", None),
+        "llvm-objcopy": ("llvm-objcopy", None),
+        "llvm-objdump": ("llvm-objdump", None),
+        "llvm-readelf": ("llvm-readelf", None),
+        "llvm-strip": ("llvm-strip", None),
+    }
+    for wrapper, (tool, environment) in wrapper_tools.items():
+        write_tool_wrapper(
+            wrappers / wrapper, resolved[tool], environment
+        )
+    zig = str(resolved["zig"])
+    command = [
+        zig, "build", "native-images", "-j2",
+        "-Dapp=" + str(SUPPORT / "apps" / "hyperv-acceptance"),
+        "-Dconfig=" + str(config),
+        "-Doutput=" + str(build_output),
+        "-Dnative-profile=hyperv-x86_64-efi-netvsc",
+        f"-Dcompiler={zig} cc -target x86_64-freestanding-none",
+        "-Dcompiler-targeted=true",
+        f"-Dhost-cc={zig} cc",
+        f"-Dhost-cxx={zig} c++",
+        "-Dhost-cflags=-fno-sanitize=null",
+        f"-Dmake-arg=AR={zig} ar",
+        "-Dmake-arg=NM=llvm-nm",
+        "-Dmake-arg=OBJCOPY=llvm-objcopy",
+        "-Dmake-arg=OBJDUMP=llvm-objdump",
+        "-Dmake-arg=READELF=llvm-readelf",
+        "-Dmake-arg=STRIP=llvm-strip",
+        "-Dmake-arg=UK_CFLAGS=-std=gnu17",
+        "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
+    ]
+    environment = os.environ.copy()
+    environment.update({
+        "PATH": str(wrappers) + os.pathsep + environment.get("PATH", ""),
+        "TMPDIR": str(temporary),
+        "XDG_CACHE_HOME": str(cache / "xdg"),
+        "ZIG_GLOBAL_CACHE_DIR": str(cache / "zig-global"),
+        "ZIG_LOCAL_CACHE_DIR": str(cache / "zig-local"),
+        "PYTHONPYCACHEPREFIX": str(cache / "pycache"),
+        "BISON_PKGDATADIR": str(Path(bison_data).resolve(strict=True)),
+        "M4": str(resolved["m4"]),
+        "LC_ALL": "C",
+    })
+
+    def bound_log():
+        resource.setrlimit(
+            resource.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024)
+        )
+
+    log_path = output_directory / "build.log"
+    with log_path.open("xb") as log:
+        os.chmod(log_path, 0o600)
+        try:
+            result = subprocess.run(
+                command, cwd=repository, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT, timeout=timeout,
+                check=False, env=environment, preexec_fn=bound_log,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Private local native build timed out") from None
+    if result.returncode:
+        raise RuntimeError(
+            "Private local native build failed; inspect its owner-only log"
+        )
+    source_after = build_provenance(repository, config)
+    if source_after != source_before:
+        raise RuntimeError("Private source or configuration changed during build")
+    efi_path = build_output / NATIVE_EFI_NAME
+    output = regular_record(
+        efi_path, NATIVE_EFI_NAME, "Private local EFI build output"
+    )
+    receipt = {
+        "schema": PRIVATE_BUILD_SCHEMA,
+        "schema_version": 1,
+        "result": "PASS",
+        "source_before": source_before,
+        "source_after": source_after,
+        "invocation": {
+            "engine": "zig-native-images-v1",
+            "jobs": 2,
+            "app": "support/apps/hyperv-acceptance",
+            "profile": "hyperv-x86_64-efi-netvsc",
+            "compiler_target": "x86_64-freestanding-none",
+            "output": NATIVE_EFI_NAME,
+        },
+        "tools": tools,
+        "output": output,
+        "builder_sha256": azure.image_sha256(Path(__file__)),
+    }
+    receipt_path = output_directory / PRIVATE_BUILD_RECEIPT
+    save_private_bytes(receipt_path, azure.canonical_json(receipt))
+    validate_private_build(
+        load_receipt(
+            receipt_path, PRIVATE_BUILD_RECEIPT,
+            "Private local build receipt",
+        ),
+        source_before,
+        {
+            "name": INPUT_NAMES["efi"],
+            "sha256": output["sha256"],
+            "size": output["size"],
+        },
+    )
+    azure.fsync_directory(output_directory)
+    return receipt_path, efi_path
 
 
 def qemu_closure_records(qemu_root):
@@ -524,7 +1130,8 @@ def copy_record(source, destination, record):
 
 def generate_input(
     output_directory, repository, config_path, qemu_root, ovmf_code,
-    ovmf_vars, capability_raw, efi, raw, vhd, miz_path, boot_policy,
+    ovmf_vars, capability_raw, capability_receipt, efi, build_receipt,
+    raw, vhd, miz_path, boot_policy,
 ):
     check_blob_dependency()
     if boot_policy not in BOOT_POLICIES:
@@ -555,6 +1162,20 @@ def generate_input(
         or files["vhd"]["size"] != azure.VIRTUAL_SIZE + 512
     ):
         raise ValueError("Generated raw/fixed-VHD geometry is invalid")
+    capability_reference = validate_capability_reference(
+        load_receipt(
+            capability_receipt, CAPABILITY_REFERENCE,
+            "Public capability reference",
+        ),
+        files["capability_raw"],
+    )
+    private_build = validate_private_build(
+        load_receipt(
+            build_receipt, PRIVATE_BUILD_RECEIPT,
+            "Private local build receipt",
+        ),
+        provenance, files["efi"],
+    )
     miz = regular_record(miz_path, "miz", "Pinned miz executable")
     miz["revision"] = azure.MIZ_REVISION
     miz = {
@@ -599,6 +1220,16 @@ def generate_input(
             output_directory / SOLVED_CONFIG,
             provenance["config"],
         )
+        copy_record(
+            Path(capability_receipt).resolve(strict=True),
+            output_directory / CAPABILITY_REFERENCE,
+            capability_reference,
+        )
+        copy_record(
+            Path(build_receipt).resolve(strict=True),
+            output_directory / PRIVATE_BUILD_RECEIPT,
+            private_build,
+        )
         packaging = azure.miz_command(
             miz_path.resolve(strict=True),
             [
@@ -630,6 +1261,8 @@ def generate_input(
             "boot_policy": boot_policy,
             "raw_size": azure.VIRTUAL_SIZE,
             "provenance": provenance,
+            "capability_reference": capability_reference,
+            "private_build": private_build,
             "files": files,
             "qemu_support": qemu_support,
             "miz": miz,
@@ -663,7 +1296,8 @@ def load_input_manifest(input_directory, expected_sha256):
     ):
         raise ValueError("Private-preflight manifest digest does not match")
     expected_names = {
-        INPUT_MANIFEST, SOLVED_CONFIG, "qemu",
+        INPUT_MANIFEST, SOLVED_CONFIG, CAPABILITY_REFERENCE,
+        PRIVATE_BUILD_RECEIPT, "qemu",
         *(Path(name).parts[0] for role, name in INPUT_NAMES.items()
           if role != "qemu"),
     }
@@ -739,6 +1373,16 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
             source / SOLVED_CONFIG,
             inputs / SOLVED_CONFIG,
             manifest["provenance"]["config"],
+        )
+        copy_record(
+            source / CAPABILITY_REFERENCE,
+            inputs / CAPABILITY_REFERENCE,
+            manifest["capability_reference"],
+        )
+        copy_record(
+            source / PRIVATE_BUILD_RECEIPT,
+            inputs / PRIVATE_BUILD_RECEIPT,
+            manifest["private_build"],
         )
         azure.copy_regular_file(
             miz_path, local_tools / "miz",
@@ -866,7 +1510,7 @@ def load_state(directory):
         or (
             state["staged_input_bytes"]
             + state["input_manifest"]["budget"][
-                "firmware_working_copy_max_bytes"
+                "firmware_working_copy_bytes"
             ]
             + state["control_payload_bytes"]
             + state["evidence_bytes"]
@@ -1001,6 +1645,27 @@ def verify_immutable_inputs(state, state_directory):
         != manifest["provenance"]
     ):
         raise ValueError("Prepared source or solved configuration changed")
+    for name, key, description in (
+        (
+            CAPABILITY_REFERENCE, "capability_reference",
+            "Prepared public capability reference",
+        ),
+        (
+            PRIVATE_BUILD_RECEIPT, "private_build",
+            "Prepared private local build receipt",
+        ),
+    ):
+        record = manifest[key]
+        path = state_directory / "inputs" / name
+        raw = azure.read_regular_file(path, MAX_MANIFEST_BYTES, description)
+        if (
+            path.is_symlink()
+            or path.stat().st_size != record["size"]
+            or hashlib.sha256(raw).hexdigest() != record["sha256"]
+            or azure.parse_strict_json(raw, description)
+            != record["receipt"]
+        ):
+            raise ValueError(f"{description} changed")
     miz = state_directory / "local-tools" / "miz"
     if (
         miz.is_symlink()
@@ -1013,14 +1678,13 @@ def verify_immutable_inputs(state, state_directory):
 
 
 def check_blob_dependency():
+    sdk_dependency_contract()
     try:
         from azure.storage.blob import BlobServiceClient
     except ImportError:
         raise RuntimeError(
             "Pinned azure-storage-blob dependency is unavailable"
         ) from None
-    if package_version("azure-storage-blob") != SDK_VERSION:
-        raise RuntimeError("Pinned azure-storage-blob version is unavailable")
     return BlobServiceClient
 
 
@@ -1266,6 +1930,7 @@ class PrivatePreflightRun(azure.AzureRun):
         self.storage = state["storage_account"]
         self.container = CONTAINER
         self.deadline = state.get("deadline_monotonic")
+        self.cleanup_deadline = None
         self.group_tags.update({
             "purpose": PURPOSE,
             "disposable": "true",
@@ -1305,7 +1970,7 @@ class PrivatePreflightRun(azure.AzureRun):
                 else self.state["staged_input_bytes"]
             )
             + self.state["input_manifest"]["budget"][
-                "firmware_working_copy_max_bytes"
+                "firmware_working_copy_bytes"
             ]
             + (
                 updated if category == "control"
@@ -1405,8 +2070,21 @@ class PrivatePreflightRun(azure.AzureRun):
     def phase_timeout(self, maximum):
         return bounded_timeout(self.state["deadline_monotonic"], maximum)
 
+    def operation_timeout(self, maximum, deadline=None):
+        if deadline is None:
+            deadline = (
+                self.cleanup_deadline
+                if self.cleanup_deadline is not None
+                else self.state["deadline_monotonic"]
+            )
+        return bounded_timeout(deadline, maximum)
+
     def az(self, arguments, **kwargs):
         kwargs.setdefault("private", True)
+        if self.cleanup_deadline is not None:
+            kwargs["timeout"] = self.operation_timeout(
+                kwargs.get("timeout", TRANSFER_TIMEOUT_SECONDS)
+            )
         return azure.azure_cli(
             arguments, subscription=self.state["subscription"], **kwargs
         )
@@ -1543,7 +2221,7 @@ class PrivatePreflightRun(azure.AzureRun):
         )
         return receipt
 
-    def capture_host_identity(self):
+    def capture_host_identity(self, deadline=None):
         receipt = self.state["host_deployment"]
         if (
             receipt.get("phase") not in (
@@ -1557,7 +2235,9 @@ class PrivatePreflightRun(azure.AzureRun):
         vm = self.az([
             "vm", "show", "--resource-group", self.group,
             "--name", self.host_vm,
-        ], timeout=self.phase_timeout(TRANSFER_TIMEOUT_SECONDS))
+        ], timeout=self.operation_timeout(
+            TRANSFER_TIMEOUT_SECONDS, deadline
+        ))
         self.require_operation_owned(vm)
         expected_vm = receipt["vm_id"]
         expected_disk = receipt["disk_id"]
@@ -1585,14 +2265,13 @@ class PrivatePreflightRun(azure.AzureRun):
         disk = self.az([
             "disk", "show", "--resource-group", self.group,
             "--name", self.host_disk,
-        ], timeout=self.phase_timeout(TRANSFER_TIMEOUT_SECONDS))
+        ], timeout=self.operation_timeout(
+            TRANSFER_TIMEOUT_SECONDS, deadline
+        ))
         if (
             str(disk.get("id", "")).lower() != expected_disk.lower()
             or str(disk.get("managedBy") or "").lower()
             != expected_vm.lower()
-            or disk.get("tags") not in (
-                None, {}, self.operation_tags(),
-            )
         ):
             raise RuntimeError("Private host disk provenance is invalid")
         receipt = {
@@ -1603,7 +2282,14 @@ class PrivatePreflightRun(azure.AzureRun):
             ),
         }
         self.record("host-resources-verified", host_deployment=receipt)
-        self.verify_host_identity()
+        settling_deadline = min(
+            (
+                deadline if deadline is not None
+                else self.state["deadline_monotonic"]
+            ),
+            time.monotonic() + RECONCILE_TIMEOUT_SECONDS,
+        )
+        self.settle_host_identity(settling_deadline)
         return receipt
 
     def verify_vm_identity(self, vm=None):
@@ -1657,6 +2343,7 @@ class PrivatePreflightRun(azure.AzureRun):
                 "disk", "show", "--resource-group", self.group,
                 "--name", self.host_disk,
             ])
+        self.require_operation_owned(disk)
         attached = (
             vm.get("storageProfile", {}).get("osDisk", {})
             .get("managedDisk", {}).get("id")
@@ -1670,14 +2357,36 @@ class PrivatePreflightRun(azure.AzureRun):
             or disk.get("uniqueId") != receipt["disk_uuid"]
             or str(disk.get("managedBy") or "").lower()
             != receipt["vm_id"].lower()
-            or disk.get("tags") not in (
-                None, {}, self.operation_tags(),
-            )
         ):
             raise RuntimeError(
                 "Private host VM/disk identity or attachment changed"
             )
         return vm, disk
+
+    def settle_host_identity(self, deadline):
+        while time.monotonic() < deadline:
+            try:
+                vm, disk = self.verify_host_identity()
+                vm_state = vm.get("provisioningState")
+                disk_state = disk.get("provisioningState")
+                if (
+                    vm_state in (None, "Succeeded")
+                    and disk_state in (None, "Succeeded")
+                ):
+                    return vm, disk
+                if vm_state in ("Failed", "Canceled") or disk_state in (
+                    "Failed", "Canceled",
+                ):
+                    raise RuntimeError(
+                        "Private host provisioning reached a terminal state"
+                    )
+            except RuntimeError:
+                pass
+            if deadline - time.monotonic() > 1:
+                time.sleep(min(2, deadline - time.monotonic()))
+        raise RuntimeError(
+            "Private host identity or metadata did not settle"
+        ) from None
 
     def reconcile_host_deployment(self, deadline):
         receipt = self.state.get("host_deployment")
@@ -1688,10 +2397,10 @@ class PrivatePreflightRun(azure.AzureRun):
         ):
             raise RuntimeError("Private host deployment obligation is invalid")
         if receipt["phase"] == "resources-verified":
-            self.verify_host_identity()
+            self.settle_host_identity(deadline)
             return True
         if receipt["phase"] == "vm-verified":
-            self.capture_host_identity()
+            self.capture_host_identity(deadline)
             return True
         if receipt["phase"] == "failed-no-compute":
             return False
@@ -1719,7 +2428,7 @@ class PrivatePreflightRun(azure.AzureRun):
                 )
                 if provisioned == "Succeeded":
                     self.validate_deployment_result(deployment)
-                    self.capture_host_identity()
+                    self.capture_host_identity(deadline)
                     return True
                 if provisioned in ("Failed", "Canceled"):
                     resources = self.az([
@@ -1747,7 +2456,7 @@ class PrivatePreflightRun(azure.AzureRun):
                             "host-deployment-terminal",
                             host_deployment=terminal,
                         )
-                        self.capture_host_identity()
+                        self.capture_host_identity(deadline)
                         return True
                     failed = {**receipt, "phase": "failed-no-compute"}
                     self.record(
@@ -1789,7 +2498,10 @@ class PrivatePreflightRun(azure.AzureRun):
 
     def verify_deployed_envelope(self):
         receipt = self.state["host_deployment"]
-        vm, disk = self.verify_host_identity()
+        vm, disk = self.settle_host_identity(min(
+            self.state["deadline_monotonic"],
+            time.monotonic() + RECONCILE_TIMEOUT_SECONDS,
+        ))
         image = self.state["cloud_preflight"]["image"]
         storage_profile = vm.get("storageProfile", {})
         os_disk = storage_profile.get("osDisk", {})
@@ -2073,7 +2785,7 @@ class PrivatePreflightRun(azure.AzureRun):
                     "--parameters", "@" + str(parameter_file),
                 ], timeout=self.phase_timeout(900))
             self.validate_deployment_result(deployment)
-            self.capture_host_identity()
+            self.capture_host_identity(self.state["deadline_monotonic"])
         except (RuntimeError, ValueError, OSError):
             reconcile_deadline = min(
                 self.deadline,
@@ -2417,12 +3129,36 @@ class PrivatePreflightRun(azure.AzureRun):
             or resource.get("name") != self.host_disk
             or str(resource.get("type", "")).lower()
             != "microsoft.compute/disks"
-            or resource.get("tags") not in (
-                None, {}, self.operation_tags(),
-            )
         ):
             raise RuntimeError("Refusing to clean an unproven host OS disk")
+        self.require_operation_owned(resource)
         self.verify_host_identity()
+
+    def require_owned_vm_child(self, resource):
+        receipt = self.state.get("host_deployment")
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("phase") != "resources-verified"
+        ):
+            raise RuntimeError(
+                "Refusing to clean an unproven host extension child"
+            )
+        resource_id = str(resource.get("id", ""))
+        expected_prefix = receipt["vm_id"].rstrip("/") + "/extensions/"
+        child = resource_id[len(expected_prefix):]
+        name = resource.get("name")
+        if (
+            not resource_id.lower().startswith(expected_prefix.lower())
+            or not child
+            or "/" in child
+            or str(resource.get("type", "")).lower()
+            != "microsoft.compute/virtualmachines/extensions"
+            or name not in (child, self.host_vm + "/" + child)
+            or resource.get("location") not in (None, LOCATION)
+        ):
+            raise RuntimeError(
+                "Refusing to clean an unproven host extension child"
+            )
 
     def deallocate_host(self):
         if self.state.get("host_deallocated") is True:
@@ -2431,10 +3167,14 @@ class PrivatePreflightRun(azure.AzureRun):
         if not isinstance(receipt, dict):
             return
         if receipt.get("phase") in (
-            "pending", "deployment-succeeded", "deployment-terminal"
+            "pending", "deployment-succeeded", "deployment-terminal",
+            "vm-verified",
         ):
             if not self.reconcile_host_deployment(
-                time.monotonic() + RECONCILE_TIMEOUT_SECONDS
+                min(
+                    self.cleanup_deadline or self.state["deadline_monotonic"],
+                    time.monotonic() + RECONCILE_TIMEOUT_SECONDS,
+                )
             ):
                 return
             receipt = self.state["host_deployment"]
@@ -2514,6 +3254,11 @@ class PrivatePreflightRun(azure.AzureRun):
             resource_type = str(resource.get("type", "")).lower()
             if resource_type == "microsoft.compute/disks":
                 self.verified_host_disk_for_cleanup(resource)
+            elif (
+                resource_type
+                == "microsoft.compute/virtualmachines/extensions"
+            ):
+                self.require_owned_vm_child(resource)
             else:
                 self.require_operation_owned(resource)
         self.record("deleting-group")
@@ -2525,6 +3270,10 @@ class PrivatePreflightRun(azure.AzureRun):
         self.record("cleaned", cleanup_required=False)
 
     def cleanup(self):
+        if self.cleanup_deadline is None:
+            self.cleanup_deadline = (
+                time.monotonic() + CLEANUP_TIMEOUT_SECONDS
+            )
         errors = []
         try:
             self.clear_private_files()
@@ -2868,6 +3617,10 @@ def run_preflight(
                 "input_manifest_sha256": state["manifest_sha256"],
                 "implementation": state["implementation"],
                 "provenance": state["input_manifest"]["provenance"],
+                "capability_reference": state["input_manifest"][
+                    "capability_reference"
+                ],
+                "private_build": state["input_manifest"]["private_build"],
                 "inputs": {
                     role: {
                         "sha256": record["sha256"],
@@ -2952,6 +3705,21 @@ def main():
         description="Bounded private nested-KVM Hyper-V platform preflight"
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
+    build_parser = subparsers.add_parser("build-private")
+    build_parser.add_argument("--output-dir", type=Path, required=True)
+    build_parser.add_argument(
+        "--repository", type=Path, default=SUPPORT.parent
+    )
+    build_parser.add_argument("--solved-config", type=Path, required=True)
+    build_parser.add_argument("--zig", type=Path, required=True)
+    build_parser.add_argument("--make", type=Path, required=True)
+    build_parser.add_argument("--python", type=Path, required=True)
+    build_parser.add_argument("--bison", type=Path, required=True)
+    build_parser.add_argument("--flex", type=Path, required=True)
+    build_parser.add_argument("--m4", type=Path, required=True)
+    build_parser.add_argument("--bison-data", type=Path, required=True)
+    build_parser.add_argument("--llvm-bin", type=Path, required=True)
+    build_parser.add_argument("--timeout", type=int, default=1800)
     generate_parser = subparsers.add_parser("generate-input")
     generate_parser.add_argument("--output-dir", type=Path, required=True)
     generate_parser.add_argument(
@@ -2964,7 +3732,13 @@ def main():
     generate_parser.add_argument(
         "--capability-raw", type=Path, required=True
     )
+    generate_parser.add_argument(
+        "--capability-receipt", type=Path, required=True
+    )
     generate_parser.add_argument("--private-efi", type=Path, required=True)
+    generate_parser.add_argument(
+        "--private-build-receipt", type=Path, required=True
+    )
     generate_parser.add_argument("--private-raw", type=Path, required=True)
     generate_parser.add_argument("--private-vhd", type=Path, required=True)
     generate_parser.add_argument("--miz", type=Path, required=True)
@@ -2991,7 +3765,14 @@ def main():
     cleanup_parser.add_argument("--subscription", required=True)
     args = parser.parse_args()
     try:
-        if args.action == "generate-input":
+        if args.action == "build-private":
+            build_private_image(
+                args.output_dir, args.repository, args.solved_config,
+                args.zig, args.make, args.python, args.bison, args.flex,
+                args.m4, args.bison_data, args.llvm_bin, args.timeout,
+            )
+            print("Private local build completed in owner-only directory")
+        elif args.action == "generate-input":
             digest = generate_input(
                 args.output_dir,
                 args.repository,
@@ -3000,7 +3781,9 @@ def main():
                 args.ovmf_code,
                 args.ovmf_vars,
                 args.capability_raw,
+                args.capability_receipt,
                 args.private_efi,
+                args.private_build_receipt,
                 args.private_raw,
                 args.private_vhd,
                 args.miz,

@@ -127,9 +127,12 @@ overwritten.
 `support/scripts/hyperv_private_preflight.py` is a separate, operator-run
 platform preflight. It does not replace `hyperv-azure.py`, consume a public
 prepared-image artifact, build Unikraft in Azure, or claim StorVSC persistence.
-It uses `azure-storage-blob==12.28.0`, already pinned in
-`support/azure/requirements.txt`. Create an isolated worktree-local runtime
-and verify the installed distribution before generating an input contract:
+It uses `azure-storage-blob==12.28.0`. Its complete 12-distribution closure,
+including `azure-core==1.41.0`, `requests==2.34.2`, and
+`cryptography==50.0.1`, is pinned in `support/azure/requirements.txt`.
+The controller fingerprints every installed file in every locked distribution.
+Create an isolated worktree-local runtime and verify the installed closure
+before generating an input contract:
 
 ```shell
 RUNTIME="$PWD/.d/private-preflight-runtime"
@@ -139,28 +142,50 @@ TMPDIR="$RUNTIME/tmp" PIP_CACHE_DIR="$RUNTIME/pip-cache" \
   "$RUNTIME/venv/bin/python" -m pip install \
   --disable-pip-version-check -r support/azure/requirements.txt
 "$RUNTIME/venv/bin/python" -c \
-  'from importlib.metadata import version; assert version("azure-storage-blob") == "12.28.0"'
+  'import sys; sys.path.insert(0, "support/scripts"); import hyperv_private_preflight as p; assert len(p.sdk_dependency_contract()["distributions"]) == 12'
 ```
 
-Build Unikraft and package the EFI/raw/fixed-VHD files locally with the pinned
-`miz` workflow above. The QEMU closure is an owner-selected directory whose
+First solve the default Hyper-V configuration using the documented
+`olddefconfig` command. Then let the controller invoke the fixed native builder
+itself, snapshot source/configuration before and after the build, fingerprint
+the compiler, LLVM, Make, Python, parser tools and Bison data, and write the
+causal local build receipt:
+
+```shell
+LOCAL_BUILD="$PWD/.d/private-preflight-local-build"
+"$RUNTIME/venv/bin/python" support/scripts/hyperv_private_preflight.py \
+  build-private --output-dir "$LOCAL_BUILD" --repository "$PWD" \
+  --solved-config "$SOLVED_CONFIG" --zig "$ZIG" --make "$MAKE" \
+  --python "$RUNTIME/venv/bin/python" --bison "$BISON" --flex "$FLEX" \
+  --m4 "$M4" --bison-data "$BISON_DATA" --llvm-bin "$LLVM_BIN"
+PRIVATE_EFI="$LOCAL_BUILD/build/helloworld_hyperv-x86_64-efi-netvsc"
+PRIVATE_BUILD_RECEIPT="$LOCAL_BUILD/private-build-receipt.json"
+SOLVED_CONFIG="$LOCAL_BUILD/solved.config"
+```
+
+Package that exact EFI into raw/fixed-VHD files locally with the pinned `miz`
+workflow above. `generate-input` rejects an EFI whose hash, size, source
+snapshot, solved configuration, invocation, or build tools differ from the
+receipt. The QEMU closure is an owner-selected directory whose
 executable is exactly `bin/qemu-system-x86_64`; required regular files below
 `lib/` and `share/` are copied and hashed recursively. Symlinks are rejected.
-Generate the canonical schema-3 manifest and owner-only input directory:
+Generate the canonical schema-5 manifest and owner-only input directory:
 
 ```shell
 INPUTS="$PWD/.d/private-preflight-input"
 STATE="$PWD/.d/private-preflight-state"
-# Each directory is an independently completed local `hyperv-azure.py prepare`.
-CAPABILITY_RAW="$CAPABILITY_LOCAL_STATE/unikraft.raw"
-PRIVATE_EFI="$PRIVATE_LOCAL_STATE/BOOTX64.EFI"
-PRIVATE_RAW="$PRIVATE_LOCAL_STATE/unikraft.raw"
-PRIVATE_VHD="$PRIVATE_LOCAL_STATE/unikraft.vhd"
+CAPABILITY_RAW="$AUTHENTICATED_CAPABILITY/capability.raw"
+CAPABILITY_RECEIPT="$AUTHENTICATED_CAPABILITY/capability.source.json"
+PRIVATE_RAW="$LOCAL_PACKAGE/private.raw"
+PRIVATE_VHD="$LOCAL_PACKAGE/private.vhd"
 "$RUNTIME/venv/bin/python" support/scripts/hyperv_private_preflight.py \
   generate-input --output-dir "$INPUTS" --repository "$PWD" \
   --solved-config "$SOLVED_CONFIG" --qemu-root "$PINNED_QEMU_ROOT" \
   --ovmf-code "$PINNED_OVMF_CODE" --ovmf-vars "$PINNED_OVMF_VARS" \
-  --capability-raw "$CAPABILITY_RAW" --private-efi "$PRIVATE_EFI" \
+  --capability-raw "$CAPABILITY_RAW" \
+  --capability-receipt "$CAPABILITY_RECEIPT" \
+  --private-efi "$PRIVATE_EFI" \
+  --private-build-receipt "$PRIVATE_BUILD_RECEIPT" \
   --private-raw "$PRIVATE_RAW" --private-vhd "$PRIVATE_VHD" \
   --miz "$MIZ" --boot-policy platform-unavailable-v1
 PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
@@ -171,26 +196,31 @@ PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
 ```
 
 The exact generated names are `private-preflight-input.json`, `solved.config`,
+`capability.source.json`, `private-build-receipt.json`,
 `qemu/bin/qemu-system-x86_64`, the enumerated `qemu/lib`/`qemu/share` closure,
 `OVMF_CODE.fd`, `OVMF_VARS.fd`, `capability.raw`, `private.efi`, `private.raw`,
 and `private.vhd`. The manifest binds the clean Git `HEAD`, SHA-256 of the raw
 `git ls-tree -r --full-tree -z HEAD` output, solved configuration, pinned
 `miz`, controller, runner, Blob worker, imported shared controller and network
-helper, ARM template, requirements file, actual SDK version, all inputs,
-packaging geometry, sizes, and reviewed policy. Any tracked source,
-configuration, helper, requirement, SDK, or prepared-input change fails before
-the first cloud command.
+helper, ARM template, requirements file, every installed SDK distribution,
+all inputs, packaging geometry, sizes, and reviewed policy. The separately
+scoped capability receipt binds its historical public source identity and raw
+hash; it is never represented as current private-build provenance. Any tracked
+source, configuration, helper, requirement, SDK file, or prepared-input change
+fails before the first cloud command.
 
 `private.efi`, copied `miz`, source/config metadata, and controller files stay
 local. Only the capability raw, private raw/fixed VHD, QEMU closure, and OVMF
 files are Blob-staged. The three fixed-size images use 207,618,560 bytes; the
 measured QEMU executable uses 26,911,032 bytes; the required closure adds
 `share/kvmvapic.bin`, `share/vgabios-stdvga.bin`, and
-`share/efi-virtio.rom`, totaling 209,408 bytes. The exact 4,194,304-byte OVMF
-pair produces one additional 4,194,304-byte peak working copy. Including the
+`share/efi-virtio.rom`, totaling 209,408 bytes. The immutable OVMF code is
+referenced read-only from its staged copy; each of the six boots receives a
+fresh copy of only the 540,672-byte variables file, totaling 3,244,032
+cumulative working-copy bytes. Including the
 8,388,608-byte cumulative evidence limit and 524,288-byte cumulative
-runner/manifest control limit, the measured maximum is 252,040,504 bytes,
-leaving 16,394,952 bytes below the 268,435,456-byte limit.
+runner/manifest control limit, the measured maximum is 251,090,232 bytes,
+leaving 17,345,224 bytes below the 268,435,456-byte limit.
 `generate-input` measures the real closure and refuses a total above
 268,435,456 bytes. Feasibility therefore requires the operator's authenticated
 QEMU/OVMF assets; fixture sizes are not acceptance evidence.
@@ -277,7 +307,9 @@ python3 support/scripts/hyperv_private_preflight.py cleanup \
   --state-dir "$STATE" --subscription "$AZURE_SUBSCRIPTION"
 ```
 
-The controller first resolves any durable pending/active uploader `/32`, then
+Cleanup receives one separate bounded 20-minute budget; it does not renew the
+60-minute attempt or permit uploads, deployment, or new VM work. The controller
+first resolves any durable pending/active uploader `/32`, then
 removes interrupted protected-parameter files and attempts SAS-key rotation,
 explicit VM deallocation, and owner-checked resource-group deletion
 independently. Firewall intent is persisted before
@@ -285,8 +317,13 @@ the add call and remains pending until exact absence is re-read, including
 after interrupted processes. It persists the original deployment operation
 before create, records VM proof independently, and records immutable OS-disk
 identity/attachment proof without tag adoption. It refuses VM/group cascade
-for an unknown, detached, replaced, or foreign disk. There is no keep-resources
-mode. Control-plane or
+for an unknown, detached, replaced, or foreign disk. Required ownership tags
+may contain additive Azure metadata, but tags never substitute for persisted
+VM UUID, disk UUID, attachment, and original deployment proof. Untagged
+extension children are accepted during cleanup only when their resource ID is
+structurally below that already proven VM; the exact pre-private resource
+inventory still rejects unexpected extension software. There is no
+keep-resources mode. Control-plane or
 ownership failures are reported as cleanup failures rather than claimed as
 successful deletion. The final private receipt binds the exact inputs, tools,
 host identity, four boot outcomes, and cleanup obligations; live nested-KVM

@@ -43,12 +43,125 @@ def packaging_contract(efi_sha256, efi_size, file_size):
     return value
 
 
+def capability_reference(capability):
+    receipt = {
+        "schema": preflight.CAPABILITY_REFERENCE_SCHEMA,
+        "schema_version": 1,
+        "scope": (
+            "historical nonsecret capability only; "
+            "not current private deployment provenance"
+        ),
+        "source": {
+            "provider": "github-actions",
+            "repository": "example/unikraft",
+            "repository_id": 123,
+            "workflow_ref": (
+                "example/unikraft/.github/workflows/integration.yaml@"
+                "refs/heads/example"
+            ),
+            "head_sha": "8" * 40,
+            "run_id": 456,
+            "run_attempt": 1,
+            "job": "generic-capability",
+        },
+        "manifest_sha256": "7" * 64,
+        "efi_sha256": "6" * 64,
+        "raw": {
+            "sha256": capability["sha256"],
+            "size": capability["size"],
+        },
+        "source_vhd": {
+            "sha256": "5" * 64,
+            "size": capability["size"] + 512,
+        },
+        "source_boot_evidence": {
+            "boots": {
+                image: {
+                    "legacy-apic": {
+                        "apic_path": "legacy-xapic",
+                        "io_ready": False,
+                        "platform_ready": True,
+                    },
+                    "x2apic": {
+                        "apic_path": "x2apic",
+                        "io_ready": False,
+                        "platform_ready": True,
+                    },
+                }
+                for image in ("raw", "vhd")
+            },
+            "platform_marker": preflight.host_runner.PLATFORM_MARKER,
+            "scope": "platform-only",
+        },
+    }
+    return {
+        "name": preflight.CAPABILITY_REFERENCE,
+        "sha256": "4" * 64,
+        "size": 1024,
+        "receipt": receipt,
+    }
+
+
+def private_build_receipt(provenance, efi):
+    receipt = {
+        "schema": preflight.PRIVATE_BUILD_SCHEMA,
+        "schema_version": 1,
+        "result": "PASS",
+        "source_before": provenance,
+        "source_after": provenance,
+        "invocation": {
+            "engine": "zig-native-images-v1",
+            "jobs": 2,
+            "app": "support/apps/hyperv-acceptance",
+            "profile": "hyperv-x86_64-efi-netvsc",
+            "compiler_target": "x86_64-freestanding-none",
+            "output": preflight.NATIVE_EFI_NAME,
+        },
+        "tools": {
+            name: {
+                "name": name,
+                "sha256": f"{index + 1:x}" * 64,
+                "size": 1,
+                "files": 1,
+            }
+            for index, name in enumerate(preflight.BUILD_TOOL_NAMES)
+        },
+        "output": {
+            "name": preflight.NATIVE_EFI_NAME,
+            "sha256": efi["sha256"],
+            "size": efi["size"],
+        },
+        "builder_sha256": preflight.azure.image_sha256(
+            Path(preflight.__file__)
+        ),
+    }
+    return {
+        "name": preflight.PRIVATE_BUILD_RECEIPT,
+        "sha256": "3" * 64,
+        "size": 2048,
+        "receipt": receipt,
+    }
+
+
 class PrivatePreflightFixture(unittest.TestCase):
     def implementation(self):
         return {
             "sdk": {
-                "name": "azure-storage-blob",
-                "version": preflight.SDK_VERSION,
+                "requirements_sha256": preflight.azure.image_sha256(
+                    preflight.REQUIREMENTS_PATH
+                ),
+                "distributions": [
+                    {
+                        "name": name,
+                        "version": version,
+                        "files": 1,
+                        "bytes": 1,
+                        "sha256": f"{index + 1:x}" * 64,
+                    }
+                    for index, (name, version) in enumerate(
+                        preflight.SDK_DISTRIBUTIONS
+                    )
+                ],
             },
             "files": {
                 name: {
@@ -64,8 +177,8 @@ class PrivatePreflightFixture(unittest.TestCase):
         raw_size = preflight.azure.VIRTUAL_SIZE
         sizes = {
             "qemu": 26_911_032,
-            "ovmf_code": 4 * 1024 * 1024,
-            "ovmf_vars": 4 * 1024 * 1024,
+            "ovmf_code": 3_653_632,
+            "ovmf_vars": 540_672,
             "capability_raw": raw_size,
             "efi": 49_981_328,
             "raw": raw_size,
@@ -84,23 +197,24 @@ class PrivatePreflightFixture(unittest.TestCase):
             "sha256": "9" * 64,
             "size": 1024 * 1024,
         }]
+        provenance = {
+            "scheme": "unikraft.git-ls-tree-v1",
+            "head_commit": "a" * 40,
+            "tree_sha256": "b" * 64,
+            "tracked_entries": 200,
+            "config": {
+                "name": preflight.SOLVED_CONFIG,
+                "sha256": "c" * 64,
+                "size": 4096,
+            },
+        }
         value = {
             "schema": preflight.INPUT_SCHEMA,
             "schema_version": preflight.INPUT_SCHEMA_VERSION,
             "workload": preflight.WORKLOAD,
             "boot_policy": "platform-unavailable-v1",
             "raw_size": raw_size,
-            "provenance": {
-                "scheme": "unikraft.git-ls-tree-v1",
-                "head_commit": "a" * 40,
-                "tree_sha256": "b" * 64,
-                "tracked_entries": 200,
-                "config": {
-                    "name": preflight.SOLVED_CONFIG,
-                    "sha256": "c" * 64,
-                    "size": 4096,
-                },
-            },
+            "provenance": provenance,
             "files": files,
             "qemu_support": qemu_support,
             "miz": {
@@ -112,6 +226,12 @@ class PrivatePreflightFixture(unittest.TestCase):
             "packaging": packaging_contract(
                 files["efi"]["sha256"], files["efi"]["size"],
                 files["vhd"]["size"],
+            ),
+            "capability_reference": capability_reference(
+                files["capability_raw"]
+            ),
+            "private_build": private_build_receipt(
+                provenance, files["efi"]
             ),
             "implementation": self.implementation(),
             "budget": preflight.expected_budget(files, qemu_support),
@@ -251,7 +371,10 @@ class PrivatePreflightFixture(unittest.TestCase):
             "sku": {"name": "StandardSSD_LRS"},
             "osType": "Linux",
             "hyperVGeneration": "V2",
-            "tags": None,
+            "tags": {
+                **run.operation_tags(),
+                "azure-generated": "metadata",
+            },
             "location": preflight.LOCATION,
         }
         return vm, disk
@@ -287,8 +410,8 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         manifest = preflight.validate_input_manifest(self.manifest())
         budget = manifest["budget"]
         measured_without_support = (
-            207_618_560 + 26_911_032 + 8_388_608
-            + 8_388_608
+            207_618_560 + 26_911_032 + 4_194_304
+            + 540_672 * runner.TOTAL_BOOT_COUNT
             + preflight.MAX_CONTROL_BYTES + preflight.MAX_EVIDENCE_BYTES
         )
         self.assertEqual(
@@ -330,6 +453,16 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         invalid_packaging = self.manifest()
         invalid_packaging["packaging"]["disk-guid"] = str(uuid.UUID(int=0))
         variants.append(invalid_packaging)
+        unrelated_build = self.manifest()
+        unrelated_build["private_build"]["receipt"]["output"][
+            "sha256"
+        ] = "e" * 64
+        variants.append(unrelated_build)
+        unrelated_capability = self.manifest()
+        unrelated_capability["capability_reference"]["receipt"]["raw"][
+            "sha256"
+        ] = "e" * 64
+        variants.append(unrelated_capability)
         for value in variants:
             with self.subTest(value=value.get("workload")):
                 with self.assertRaises(ValueError):
@@ -502,6 +635,25 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     "size": config.stat().st_size,
                 },
             }
+            capability = capability_reference({
+                "sha256": hashlib.sha256(b"c" * 1024).hexdigest(),
+                "size": 1024,
+            })
+            capability_path = root / preflight.CAPABILITY_REFERENCE
+            capability_path.write_bytes(
+                preflight.azure.canonical_json(capability["receipt"])
+            )
+            build = private_build_receipt(
+                provenance,
+                {
+                    "sha256": hashlib.sha256(b"efi").hexdigest(),
+                    "size": 3,
+                },
+            )
+            build_path = root / preflight.PRIVATE_BUILD_RECEIPT
+            build_path.write_bytes(
+                preflight.azure.canonical_json(build["receipt"])
+            )
             with mock.patch.object(
                 preflight, "check_blob_dependency"
             ), mock.patch.object(
@@ -518,7 +670,8 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 digest = preflight.generate_input(
                     output, repository, config, qemu,
                     assets["code"], assets["vars"], assets["capability"],
-                    assets["efi"], assets["raw"], assets["vhd"],
+                    capability_path, assets["efi"], build_path,
+                    assets["raw"], assets["vhd"],
                     assets["miz"], "platform-unavailable-v1",
                 )
             manifest_bytes = (
@@ -533,11 +686,94 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 {
                     preflight.INPUT_MANIFEST,
                     preflight.SOLVED_CONFIG,
+                    preflight.CAPABILITY_REFERENCE,
+                    preflight.PRIVATE_BUILD_RECEIPT,
                     "qemu/bin/qemu-system-x86_64",
                     "qemu/share/firmware.json",
                     "OVMF_CODE.fd", "OVMF_VARS.fd", "capability.raw",
                     "private.efi", "private.raw", "private.vhd",
                 },
+            )
+
+    def test_local_build_action_emits_causal_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            support = repository / "support"
+            (support / "apps" / "hyperv-acceptance").mkdir(parents=True)
+            (repository / "tracked").write_text("source\n")
+            subprocess.run(
+                ["git", "init", "-q"], cwd=repository, check=True
+            )
+            subprocess.run(
+                ["git", "add", "tracked"], cwd=repository, check=True
+            )
+            subprocess.run(
+                [
+                    "git", "-c", "user.name=Fixture",
+                    "-c", "user.email=fixture@example.invalid",
+                    "commit", "-qm", "fixture",
+                ],
+                cwd=repository, check=True,
+            )
+            config = root / "solved.config"
+            config.write_text("CONFIG_PLAT_HYPERV=y\n")
+            tools = root / "tools"
+            tools.mkdir()
+            zig = tools / "zig"
+            zig.write_text(
+                "#!/bin/sh\nset -eu\nout=''\n"
+                "for arg in \"$@\"; do\n"
+                " case \"$arg\" in -Doutput=*) out=${arg#-Doutput=};; esac\n"
+                "done\n"
+                "test -n \"$out\"\nmkdir -p \"$out\"\n"
+                f"printf efi > \"$out/{preflight.NATIVE_EFI_NAME}\"\n"
+            )
+            zig.chmod(0o700)
+            paths = {"zig": zig}
+            for name in ("make", "python", "bison", "flex", "m4"):
+                path = tools / name
+                path.write_text("#!/bin/sh\nexit 0\n")
+                path.chmod(0o700)
+                paths[name] = path
+            llvm = tools / "llvm"
+            llvm.mkdir()
+            for name in (
+                "llvm-nm", "llvm-objcopy", "llvm-objdump",
+                "llvm-readelf", "llvm-strip",
+            ):
+                path = llvm / name
+                path.write_text("#!/bin/sh\nexit 0\n")
+                path.chmod(0o700)
+            bison_data = tools / "bison-data"
+            bison_data.mkdir()
+            (bison_data / "skeleton").write_text("data\n")
+            output = root / "build-result"
+            with mock.patch.object(preflight, "SUPPORT", support):
+                receipt_path, efi_path = preflight.build_private_image(
+                    output, repository, config, paths["zig"],
+                    paths["make"], paths["python"], paths["bison"],
+                    paths["flex"], paths["m4"], bison_data, llvm, 30,
+                )
+                provenance = preflight.build_provenance(
+                    repository, output / preflight.SOLVED_CONFIG
+                )
+            receipt = preflight.load_receipt(
+                receipt_path, preflight.PRIVATE_BUILD_RECEIPT,
+                "Private local build receipt",
+            )
+            validated = preflight.validate_private_build(
+                receipt, provenance, {
+                    "name": preflight.INPUT_NAMES["efi"],
+                    "sha256": hashlib.sha256(b"efi").hexdigest(),
+                    "size": 3,
+                },
+            )
+            self.assertEqual(validated["receipt"]["result"], "PASS")
+            self.assertEqual(efi_path.read_bytes(), b"efi")
+            self.assertEqual(
+                validated["receipt"]["source_before"],
+                validated["receipt"]["source_after"],
             )
 
 
@@ -628,9 +864,33 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
                 "sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
             }
             return runner.run_boot(
-                qemu, code, variables, image, record, image.stat().st_size,
+                qemu, code, {
+                    **record, "name": "OVMF_CODE.fd",
+                    "size": code.stat().st_size,
+                    "sha256": hashlib.sha256(code.read_bytes()).hexdigest(),
+                }, variables, {
+                    **record, "name": "OVMF_VARS.fd",
+                    "size": variables.stat().st_size,
+                    "sha256": hashlib.sha256(
+                        variables.read_bytes()
+                    ).hexdigest(),
+                }, image, record, image.stat().st_size,
                 "platform-unavailable-v1", "raw-x2apic", False, root,
             )
+
+    def test_boot_reuses_readonly_code_and_copies_only_variables(self):
+        original = runner.shutil.copyfile
+        copies = []
+
+        def tracked(source, destination, *args, **kwargs):
+            copies.append((Path(source).name, Path(destination).name))
+            return original(source, destination, *args, **kwargs)
+
+        with mock.patch.object(
+            runner.shutil, "copyfile", side_effect=tracked
+        ):
+            self.run_fake_boot("pass")
+        self.assertEqual(copies, [("vars", "OVMF_VARS.fd")])
 
     def test_strict_no_device_policy_rejects_guarded_storage_failures(self):
         runner.validate_boot_log(
@@ -692,7 +952,13 @@ class PrivatePreflightRunnerTest(PrivatePreflightFixture):
                 runner.subprocess, "run", side_effect=execute
             ):
                 runner.run_boot(
-                    qemu, root / "code", root / "vars", image, record,
+                    qemu, root / "code", {
+                        **record, "name": "OVMF_CODE.fd",
+                        "sha256": hashlib.sha256(b"c").hexdigest(),
+                    }, root / "vars", {
+                        **record, "name": "OVMF_VARS.fd",
+                        "sha256": hashlib.sha256(b"v").hexdigest(),
+                    }, image, record,
                     preflight.azure.VIRTUAL_SIZE,
                     "platform-unavailable-v1", "raw-x2apic", False, root,
                 )
@@ -729,6 +995,14 @@ class PrivatePreflightBlobTest(PrivatePreflightFixture):
             self.skipTest("azure-storage-blob is not installed in this runner")
         self.assertEqual(installed, preflight.SDK_VERSION)
         self.assertIsNotNone(preflight.check_blob_dependency())
+        contract = preflight.sdk_dependency_contract()
+        self.assertEqual(
+            [
+                (item["name"], item["version"])
+                for item in contract["distributions"]
+            ],
+            list(preflight.SDK_DISTRIBUTIONS),
+        )
 
     def test_blob_worker_rejects_bool_sizes_and_public_request_files(self):
         request = {
@@ -983,7 +1257,9 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             self.assertTrue(
                 run.reconcile_host_deployment(time.monotonic() + 10)
             )
-            run.capture_host_identity.assert_called_once_with()
+            run.capture_host_identity.assert_called_once_with(
+                mock.ANY
+            )
             command = run.az.call_args.args[0]
             self.assertEqual(command[:3], ["deployment", "group", "show"])
             self.assertEqual(
@@ -1027,6 +1303,39 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 state["host_deployment"]["disk_uuid"], disk["uniqueId"]
             )
 
+    def test_disk_identity_is_durable_before_metadata_settles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "deployment-succeeded")
+            vm, disk = self.vm_disk(run, state)
+            disk["tags"] = {}
+            run.az.side_effect = [vm, vm, disk]
+            run.settle_host_identity = mock.Mock(
+                side_effect=RuntimeError("metadata did not settle")
+            )
+            with self.assertRaisesRegex(RuntimeError, "did not settle"):
+                run.capture_host_identity()
+            self.assertEqual(
+                state["host_deployment"]["phase"], "resources-verified"
+            )
+            self.assertEqual(
+                state["host_deployment"]["disk_uuid"], disk["uniqueId"]
+            )
+
+    def test_updating_vm_is_bounded_until_identity_settles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            vm, disk = self.vm_disk(run, state)
+            updating = {**vm, "provisioningState": "Updating"}
+            run.verify_host_identity = mock.Mock(
+                side_effect=[(updating, disk), (vm, disk)]
+            )
+            with mock.patch.object(preflight.time, "sleep"):
+                settled = run.settle_host_identity(time.monotonic() + 10)
+            self.assertEqual(settled, (vm, disk))
+            self.assertEqual(run.verify_host_identity.call_count, 2)
+
     def test_partial_deployment_persists_vm_proof_for_deallocation(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
@@ -1044,7 +1353,12 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 },
             }
             run.az.reset_mock()
-            run.az.side_effect = [vm, None, view]
+            _, disk = self.vm_disk(run, state)
+            state["deadline_monotonic"] = time.monotonic() - 1
+            run.cleanup_deadline = time.monotonic() + 60
+            run.az.side_effect = [
+                vm, vm, disk, vm, disk, vm, disk, None, view,
+            ]
             run.deallocate_host()
             self.assertTrue(state["host_deallocated"])
 
@@ -1062,6 +1376,53 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 call.args[0][:2] == ["group", "delete"]
                 for call in run.az.call_args_list
             ))
+
+    def test_cleanup_allows_only_structural_children_of_proven_vm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            group = {
+                "id": state["resource_group_id"],
+                "tags": {**run.group_tags, "azure-generated": "metadata"},
+            }
+            vm, disk = self.vm_disk(run, state)
+            vm["tags"]["azure-generated"] = "metadata"
+            extension = {
+                "id": (
+                    state["host_deployment"]["vm_id"]
+                    + "/extensions/generic-agent"
+                ),
+                "name": run.host_vm + "/generic-agent",
+                "type": "Microsoft.Compute/virtualMachines/extensions",
+                "location": preflight.LOCATION,
+                "tags": None,
+                "publisher": "Generic.Publisher",
+            }
+            run.az.side_effect = [
+                vm, disk, None, {
+                    "instanceView": {
+                        "statuses": [{"code": "PowerState/deallocated"}]
+                    },
+                },
+                True, group, [vm, disk, extension],
+                vm, disk, vm, disk, None, False,
+            ]
+            state["deadline_monotonic"] = time.monotonic() - 1
+            run.cleanup()
+            self.assertTrue(state["host_deallocated"])
+            self.assertFalse(state["cleanup_required"])
+
+            foreign = {
+                **extension,
+                "id": (
+                    state["resource_group_id"]
+                    + "/providers/Microsoft.Compute/virtualMachines/"
+                    "unrelated/extensions/generic-agent"
+                ),
+                "name": "unrelated/generic-agent",
+            }
+            with self.assertRaisesRegex(RuntimeError, "unproven"):
+                run.require_owned_vm_child(foreign)
 
     def test_group_cleanup_cannot_succeed_when_proven_disk_is_missing(self):
         with tempfile.TemporaryDirectory() as temporary:

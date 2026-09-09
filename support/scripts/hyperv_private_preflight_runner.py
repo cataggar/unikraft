@@ -35,6 +35,7 @@ MAIN_RETURN = re.compile(
     r"(?:<[^<>\r\n]{1,160}>:?\s+)?main returned (-?[0-9]+)$"
 )
 LOCAL_BOOT_MODES = (("x2apic", False), ("legacy-apic", True))
+TOTAL_BOOT_COUNT = 6
 CPU_FEATURES = (
     "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-time,"
     "hv-synic,hv-stimer,hv-vpindex,hv-runtime,hv-frequencies"
@@ -494,19 +495,28 @@ def validate_boot_log(text, policy, legacy_apic):
         raise RunnerError("unexpected-live-io")
 
 
-def run_boot(qemu, ovmf_code, ovmf_vars, image, image_record, raw_size, policy,
-             mode, legacy_apic, output_directory):
+def run_boot(qemu, ovmf_code, ovmf_code_record, ovmf_vars, ovmf_vars_record,
+             image, image_record, raw_size, policy, mode, legacy_apic,
+             output_directory):
     work = Path(tempfile.mkdtemp(prefix="boot-", dir=output_directory))
     image_identity = immutable_identity(
         image, image_record, "boot-image-invalid"
+    )
+    code_identity = immutable_identity(
+        ovmf_code, ovmf_code_record, "ovmf-code-invalid"
+    )
+    variables_identity = immutable_identity(
+        ovmf_vars, ovmf_vars_record, "ovmf-vars-invalid"
     )
     backing = work / "disk.img"
     linked = False
     failure = None
     try:
-        shutil.copyfile(ovmf_code, work / "OVMF_CODE.fd")
         shutil.copyfile(ovmf_vars, work / "OVMF_VARS.fd")
-        (work / "OVMF_CODE.fd").chmod(0o400)
+        immutable_identity(
+            work / "OVMF_VARS.fd", ovmf_vars_record,
+            "ovmf-vars-copy-invalid",
+        )
         (work / "OVMF_VARS.fd").chmod(0o600)
         os.link(image, backing)
         linked = True
@@ -527,7 +537,8 @@ def run_boot(qemu, ovmf_code, ovmf_vars, image, image_record, raw_size, policy,
             str(qemu), "-machine", "q35,accel=kvm", "-cpu", cpu,
             "-L", str(qemu.parent.parent / "share"),
             "-smp", "1", "-m", "512M",
-            "-drive", "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
+            "-drive",
+            "if=pflash,format=raw,readonly=on,file=" + str(ovmf_code),
             "-drive", "if=pflash,format=raw,file=OVMF_VARS.fd",
             "-blockdev", json.dumps(disk, separators=(",", ":")),
             "-device", "virtio-blk-pci,drive=hyperv-disk",
@@ -573,6 +584,14 @@ def run_boot(qemu, ovmf_code, ovmf_vars, image, image_record, raw_size, policy,
         raise
     finally:
         try:
+            if immutable_identity(
+                ovmf_code, ovmf_code_record, "ovmf-code-mutated"
+            ) != code_identity:
+                raise RunnerError("ovmf-code-replaced")
+            if immutable_identity(
+                ovmf_vars, ovmf_vars_record, "ovmf-vars-mutated"
+            ) != variables_identity:
+                raise RunnerError("ovmf-vars-replaced")
             if linked and (backing.exists() or backing.is_symlink()):
                 revalidate_boot_image(
                     image, backing, image_record, image_identity
@@ -654,6 +673,8 @@ def execute_phase(phase, manifest, manifest_bytes, base_url, container, sas,
         paths[name] = destination
     qemu = paths["qemu"]
     qemu.chmod(0o700)
+    paths["ovmf_code"].chmod(0o400)
+    paths["ovmf_vars"].chmod(0o400)
     raw_size = manifest["raw_size"]
     if phase == "private":
         if hash_prefix(paths["vhd"], raw_size) != records["raw"]["sha256"]:
@@ -673,7 +694,10 @@ def execute_phase(phase, manifest, manifest_bytes, base_url, container, sas,
         boots[image_name] = {}
         for mode, legacy_apic in LOCAL_BOOT_MODES:
             outcome, log_path = run_boot(
-                qemu, paths["ovmf_code"], paths["ovmf_vars"], image,
+                qemu,
+                paths["ovmf_code"], records["ovmf_code"],
+                paths["ovmf_vars"], records["ovmf_vars"],
+                image,
                 records[image_name if image_name != "capability"
                         else "capability_raw"],
                 raw_size, manifest["boot_policy"],
