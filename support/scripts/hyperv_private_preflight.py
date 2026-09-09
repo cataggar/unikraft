@@ -3505,7 +3505,7 @@ def nested_capability_admission(location, vm_size, sku_metadata):
         architecture != ["x64"]
         or vcpus != ["2"]
         or memory != [str(VM_MEMORY_GB)]
-        or generation_tokens not in (("V2",), ("V1", "V2"))
+        or generation_tokens not in (("V2",), ("V1", "V2"), ("V2", "V1"))
     ):
         raise RuntimeError(
             "The fixed preflight SKU metadata conflicts with its "

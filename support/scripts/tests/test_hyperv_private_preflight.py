@@ -3160,16 +3160,18 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 preflight.LOCATION, preflight.VM_SIZE, conflict
             )
 
-    def test_generation_metadata_accepts_v2_only_and_rejects_malformed(self):
-        admitted = preflight.nested_capability_admission(
-            preflight.LOCATION, preflight.VM_SIZE,
-            d2s_v5_sku_metadata(generations="V2"),
-        )
-        self.assertEqual(
-            admitted["metadata"]["status"], "not-advertised"
-        )
+    def test_generation_metadata_requires_v2_without_ordering(self):
+        for generations in ("V2", "V1,V2", "V2,V1"):
+            with self.subTest(generations=generations):
+                admitted = preflight.nested_capability_admission(
+                    preflight.LOCATION, preflight.VM_SIZE,
+                    d2s_v5_sku_metadata(generations=generations),
+                )
+                self.assertEqual(
+                    admitted["metadata"]["status"], "not-advertised"
+                )
         for generations in (
-            "", "V1", "v2", "V2,V1", "V2,V2", "V1,,V2",
+            "", "V1", "v2", "V2,V2", "V1,,V2",
             "V1, V2", "V1,V2 ", "V1,V2,V3",
         ):
             with self.subTest(generations=generations), \
