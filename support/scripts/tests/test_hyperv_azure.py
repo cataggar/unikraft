@@ -5051,6 +5051,7 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             stale_path = invalid["stale-receipt"] / "private-receipt.json"
             stale = json.loads(stale_path.read_text())
             stale["cleanup"] = "pending"
+            stale_path.unlink()
             private.save_private_bytes(
                 stale_path, private.azure.canonical_json(stale)
             )
