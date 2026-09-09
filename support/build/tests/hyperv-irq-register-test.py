@@ -120,53 +120,62 @@ def verify_ap_paging_controls(functions, symbols):
         if start is not None and end is not None
         and start <= instruction[0] < end
     )
-    control_values = {}
-    eax = None
-    efer_ready = False
-    for index, (_, op, operands) in enumerate(instructions):
-        immediate = re.match(
-            r"\$(0x[0-9a-f]+),\s*%eax(?:\s|$)", operands
+    def immediate(instruction, register):
+        if instruction is None or not instruction[1].startswith("mov"):
+            return None
+        match = re.match(
+            rf"\$(0x[0-9a-f]+),\s*%{register}(?:\s|$)", instruction[2]
         )
-        if op.startswith("mov") and immediate:
-            eax = int(immediate[1], 16)
-        control = re.match(r"%rax,\s*%(cr[04])(?:\s|$)", operands)
+        return int(match[1], 16) if match else None
+
+    control_writes = {"cr0": [], "cr4": []}
+    msr_writes = []
+    for index, (_, op, operands) in enumerate(instructions):
+        control = re.match(r"%[re]ax,\s*%(cr[04])(?:\s|$)", operands)
         if op.startswith("mov") and control:
-            control_values[control[1]] = eax
-        if op != "wrmsr":
-            continue
-        efer = None
-        efer_high_clear = False
-        efer_msr = None
-        for _, setup_op, operands in instructions[max(0, index - 5):index]:
-            immediate = re.match(
-                r"\$(0x[0-9a-f]+),\s*%(e[ac]x)(?:\s|$)", operands
+            previous = instructions[index - 1] if index else None
+            control_writes[control[1]].append(
+                (index, immediate(previous, "eax"))
             )
-            if setup_op.startswith("mov") and immediate:
-                value = int(immediate[1], 16)
-                if immediate[2] == "eax":
-                    efer = value
-                else:
-                    efer_msr = value
-            if setup_op.startswith("xor") and re.match(
-                r"%edx,\s*%edx(?:\s|$)", operands
-            ):
-                efer_high_clear = True
-        required_efer = (1 << 8) | (1 << 11)
-        if (efer_msr == 0xC0000080 and efer_high_clear and
-                efer is not None and
-                efer & required_efer == required_efer):
-            efer_ready = True
+        if op == "wrmsr":
+            msr_writes.append(index)
+
+    efer_ready = False
+    if len(msr_writes) == 1:
+        efer_index = msr_writes[0]
+        setup = instructions[max(0, efer_index - 3):efer_index]
+        if len(setup) == 3:
+            efer = immediate(setup[1], "eax")
+            required_efer = (1 << 8) | (1 << 11)
+            efer_ready = (
+                setup[0][1].startswith("xor")
+                and re.match(r"%edx,\s*%edx(?:\s|$)", setup[0][2]) is not None
+                and immediate(setup[2], "ecx") == 0xC0000080
+                and efer is not None
+                and efer & required_efer == required_efer
+            )
     if not efer_ready:
         raise ValueError(
             "fixed SMP AP startup does not enable EFER.NXE/LME "
             "before runtime paging"
         )
-    if control_values.get("cr4", 0) & (1 << 5) == 0:
-        raise ValueError("fixed SMP AP startup does not enable CR4.PAE")
-    required_cr0 = (1 << 0) | (1 << 16) | (1 << 31)
-    if control_values.get("cr0", 0) & required_cr0 != required_cr0:
+    for register, required, label in (
+        ("cr4", 1 << 5, "CR4.PAE"),
+        ("cr0", (1 << 0) | (1 << 16) | (1 << 31), "CR0.PE/WP/PG"),
+    ):
+        writes = control_writes[register]
+        if (len(writes) != 1 or writes[0][1] is None
+                or writes[0][1] & required != required):
+            raise ValueError(f"fixed SMP AP startup does not enable {label}")
+    paging_index = control_writes["cr0"][0][0]
+    if (msr_writes[0] >= paging_index
+            or control_writes["cr4"][0][0] >= paging_index
+            or any(
+                op.startswith(("j", "ljmp", "call", "loop", "ret"))
+                for _, op, _ in instructions[:paging_index]
+            )):
         raise ValueError(
-            "fixed SMP AP startup does not enable CR0.PE/WP/PG"
+            "fixed SMP AP startup has unreviewed paging-control flow"
         )
 
 

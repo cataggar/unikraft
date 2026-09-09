@@ -242,6 +242,37 @@ class HypervFixedSmpBindingTest(unittest.TestCase):
                         self.functions, self.symbols, self.kinds,
                     )
 
+    def test_ap_paging_rejects_clobbered_or_overwritten_controls(self):
+        variants = (
+            (0, [("jmp", "17 <skip_controls>")]),
+            (1, [("xorl", "%eax, %eax")]),
+            (3, [("movl", "$0x1, %edx")]),
+            (4, [("andl", "$0xfffff7ff, %eax")]),
+            (6, [
+                ("xorl", "%edx, %edx"),
+                ("movl", "$0x100, %eax"),
+                ("movl", "$0xc0000080, %ecx"),
+                ("wrmsr", ""),
+            ]),
+            (7, [("xorl", "%eax, %eax")]),
+        )
+        for position, inserted in variants:
+            with self.subTest(position=position):
+                operations = [
+                    (op, operands) for _, op, operands in self.startup_controls()
+                ]
+                operations[position:position] = inserted
+                instructions = [
+                    (10 + index, op, operands)
+                    for index, (op, operands) in enumerate(operations)
+                ]
+                self.functions[10] = ("x86_start16_end", instructions)
+                self.symbols["lcpu_start64"] = 10 + len(instructions)
+                with self.assertRaises(ValueError):
+                    irq.verify_fixed_smp_bindings(
+                        self.functions, self.symbols, self.kinds,
+                    )
+
     def test_non_fixed_image_does_not_require_fixed_bindings(self):
         irq.verify_fixed_smp_bindings({}, {}, {})
 
