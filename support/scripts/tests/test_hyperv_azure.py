@@ -4075,6 +4075,27 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             "packaging": {"vhd": preflight_inputs["vhd"]},
             "budget": {"maximum_bytes": 1},
             "host_image": {"urn": "fixture"},
+            "host_capability_admission": (
+                persistence.private_preflight.nested_capability_admission(
+                    persistence.private_preflight.LOCATION,
+                    persistence.private_preflight.VM_SIZE,
+                    [{
+                        "name": persistence.private_preflight.VM_SIZE,
+                        "capabilities": [
+                            {"name": "vCPUs", "value": "2"},
+                            {"name": "MemoryGB", "value": "8"},
+                            {
+                                "name": "CpuArchitectureType",
+                                "value": "x64",
+                            },
+                            {
+                                "name": "HyperVGenerations",
+                                "value": "V1,V2",
+                            },
+                        ],
+                    }],
+                )
+            ),
             "host": {
                 "operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                 "deployment_correlation_id": (
@@ -5224,10 +5245,24 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             ("boot_policy", "platform-unavailable-v1"),
             ("storage_result", "PASS"),
             ("cleanup", "pending"),
+            ("host_capability_admission", {}),
         ):
             preflight = copy.deepcopy(self.contract["preflight"])
             preflight[field] = value
             with self.subTest(preflight_field=field):
+                with self.assertRaises(ValueError):
+                    persistence.validate_preflight_receipt(
+                        preflight, self.contract["files"]["guest_vhd"],
+                        self.RUN_ID, self.DISK_ID,
+                        self.contract["geometry"],
+                    )
+        for field, value in (
+            ("schema_version", True),
+            ("memory_gb", 8.0),
+        ):
+            preflight = copy.deepcopy(self.contract["preflight"])
+            preflight["host_capability_admission"][field] = value
+            with self.subTest(admission_field=field):
                 with self.assertRaises(ValueError):
                     persistence.validate_preflight_receipt(
                         preflight, self.contract["files"]["guest_vhd"],

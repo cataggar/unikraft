@@ -397,8 +397,24 @@ account. The subnet disables default outbound access and enables the
 Microsoft.Storage service endpoint. There is no public IP, SSH ingress, NAT
 gateway, data disk, or reuse of network-acceptance resources. Before creating
 the group, the controller validates the exact immutable Ubuntu image, SKU,
-generation, nested-virtualization capability, providers, and regional/family
-quota. It never changes region, image, SKU, or host in response to failure.
+generation, x64 architecture, two-vCPU/eight-GiB shape, providers, and
+regional/family quota. Azure's Resource SKUs metadata does not currently
+advertise a `NestedVirtualization` capability for this exact
+`Standard_D2s_v5`/North Europe selection. That absence is admitted only for
+the bounded public capability-smoke phase because Microsoft's
+[Dsv5 documentation][dsv5-nested] explicitly lists nested virtualization as
+supported (documentation source revision
+`2072bfd7009384b9fde1357342d91953104e293d`, updated 2026-07-27). The
+controller records the absent advertisement and this authority in private
+state and the completed receipt; it does not synthesize an advertised
+`True`. An explicit `False`, duplicate, conflicting, or malformed
+advertisement remains a pre-deployment failure. Case or whitespace aliases
+of any consumed SKU capability name are rejected rather than treated as
+missing metadata. `HyperVGenerations` must contain canonical `V2`, optionally
+alongside canonical `V1` in either order; unknown, duplicate, empty, or
+whitespace-padded tokens fail. V1 support is not required. The same narrow
+admission does not apply to another SKU or region. It never changes region,
+image, SKU, or host in response to failure.
 Operators can inspect the same immutable retail-image/SKU inputs without
 changing account defaults:
 
@@ -417,7 +433,9 @@ az vm list-usage --location northeurope \
 The first RunCommand receives only the public capability image and pinned
 QEMU/OVMF inputs. It must prove Linux KVM plus the required QEMU Hyper-V
 features in both x2APIC and masked legacy-APIC modes. Only that exact PASS
-allows any private seed or image upload. A durable capability sentinel binds
+allows any private seed or image upload. This runtime result, not the
+Resource SKUs advertisement or the public documentation, is the capability
+proof. A durable capability sentinel binds
 the Linux boot identity, and a host restart between phases is rejected. The
 second phase boots the exact private raw and fixed-VHD bytes in both modes,
 masking the fixed-VHD footer as
@@ -484,11 +502,12 @@ does not build, reseed, convert, or discover a resource budget. It requires:
   SKUs, runtime, cleanup duration, and fixed one-VM/two-disk resource count;
 - the exact guarded V2 guest fixed VHD, raw seed, matching fixed data VHD and
   generator receipt;
-- a completed schema-3 `unikraft.hyperv.private-preflight-receipt` loaded from
+- a completed schema-4 `unikraft.hyperv.private-preflight-receipt` loaded from
   the private preflight's complete state directory, binding the same guest
   VHD, source tree, solved configuration, private build receipt, twelve-tool
   closure, schema-4 guarded producer pin, all six retained boot logs, immutable
-  host/deployment identities, accounting and completed cleanup.
+  host/deployment identities, the exact nested-capability admission record,
+  accounting and completed cleanup.
 
 The controller accepts only whole-MiB 512-byte geometry, capped at 2 TiB; the
 operator chooses the exact approved value. WRITE(16) coverage uses the
@@ -1076,6 +1095,7 @@ host is available, but only after the local gates pass. Full workload SMP,
 stress testing, and production readiness remain separate milestones.
 
 [trusted-launch]: https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-faq#can-i-disable-trusted-launch-for-a-new-vm-deployment
+[dsv5-nested]: https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/dsv5-series
 [upload]: https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-upload-vhd-to-managed-disk-cli
 [miz-revision]: https://github.com/cataggar/miz/commit/2db68ca0c3ab12155012a823c3fb8d7aba1cb544
 [unikraft-revision]: https://github.com/cataggar/unikraft/commit/8c87f56ab3eaa71974812cd748c3a6bfa61c563b
