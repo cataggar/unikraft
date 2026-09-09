@@ -98,6 +98,14 @@ class AzureCliTimeout(RuntimeError):
         )
 
 
+class ManagedDiskUploadTimeout(RuntimeError):
+    def __init__(self):
+        super().__init__(
+            "Managed-disk upload helper timed out; "
+            "private upload details withheld"
+        )
+
+
 def azure_cli(arguments, *, subscription=None, private=False, env=None,
               timeout=300):
     command = [
@@ -387,12 +395,19 @@ def upload_helper(arguments, *, sas=None, timeout=1200):
     }
     if sas is not None:
         environment["AZURE_STORAGE_SAS_TOKEN"] = sas
-    result = subprocess.run(
-        [sys.executable, str(SUPPORT / "scripts/hyperv-azure-upload.py"), *arguments],
-        stdin=subprocess.DEVNULL, capture_output=True,
-        text=True, encoding="utf-8", errors="replace", env=environment,
-        timeout=timeout, check=False,
-    )
+    timed_out = False
+    try:
+        result = subprocess.run(
+            [sys.executable, str(SUPPORT / "scripts/hyperv-azure-upload.py"),
+             *arguments],
+            stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", env=environment,
+            timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    if timed_out:
+        raise ManagedDiskUploadTimeout() from None
     if result.returncode:
         raise RuntimeError(f"Managed-disk upload helper failed: {result.stderr.strip()}")
     return json.loads(result.stdout)
@@ -1779,7 +1794,7 @@ class AzureRun:
             ], private=True)
             endpoint, sas = upload_endpoint(disk_access_sas(grant))
             upload_managed_vhd(image, endpoint, sas)
-        except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        except (RuntimeError, OSError, ValueError) as error:
             print(f"Disk upload did not complete: {error}", file=sys.stderr)
             raise
         finally:
@@ -1908,7 +1923,7 @@ class AzureRun:
             or resource.get("name") != self.prefix + "-peer-os"
             or str(resource.get("type", "")).lower()
             != "microsoft.compute/disks"
-            or resource.get("tags") not in (None, {})
+            or resource.get("tags") not in (None, {}, self.tags)
         ):
             raise RuntimeError(
                 "Refusing to clean an unproven private peer OS disk"
@@ -1939,7 +1954,7 @@ class AzureRun:
             or disk.get("uniqueId") != receipt["peer_disk_uuid"]
             or str(disk.get("managedBy") or "").lower()
             != expected_vm_id.lower()
-            or disk.get("tags") not in (None, {})
+            or disk.get("tags") not in (None, {}, self.tags)
         ):
             raise RuntimeError(
                 "Refusing to clean a detached or replaced private peer OS disk"
@@ -2046,18 +2061,17 @@ class AzureRun:
             "peer-resources-verified",
             peer_deployment=deployment_receipt,
         )
-        if peer_disk.get("tags") != self.tags:
-            peer_disk = self.az([
-                "disk", "update", "--resource-group", self.group,
-                "--name", peer_disk_name, "--tags", *self.resource_tags(),
-            ], private=True)
-        self.require_owned(peer_disk)
+        peer_disk = self.az([
+            "disk", "show", "--resource-group", self.group,
+            "--name", peer_disk_name,
+        ], private=True)
         if (
             str(peer_disk.get("id", "")).lower()
             != expected_peer_disk_id.lower()
             or peer_disk.get("uniqueId") != peer_disk_uuid
             or str(peer_disk.get("managedBy", "")).lower()
             != expected_peer_vm_id.lower()
+            or peer_disk.get("tags") not in (None, {}, self.tags)
         ):
             raise RuntimeError("Private peer OS disk is not owned by the peer VM")
 
@@ -2155,18 +2169,56 @@ class AzureRun:
             raise RuntimeError(
                 "Refusing to clean a reservation that changed before its claim"
             )
+        network_mode = (
+            network.validate_acceptance(
+                self.state.get(
+                    "acceptance",
+                    {"mode": network.RAW_ACCEPTANCE_MODE},
+                )
+            )["mode"] == network.NETWORK_ACCEPTANCE_MODE
+        )
+        verified_peer_disk = None
+        if network_mode:
+            expected_peer_disk_id = self.expected_resource_id(
+                "Microsoft.Compute", "disks", self.prefix + "-peer-os"
+            )
+            peer_disk_name = self.prefix + "-peer-os"
+            candidates = [
+                resource for resource in resources
+                if (
+                    str(resource.get("id", "")).lower()
+                    == expected_peer_disk_id.lower()
+                    or resource.get("name") == peer_disk_name
+                )
+            ]
+            receipt = self.state.get("peer_deployment")
+            receipt_complete = (
+                isinstance(receipt, dict)
+                and set(receipt) == {
+                    "deployment_id", "correlation_id",
+                    "peer_vm_id", "peer_vm_uuid",
+                    "peer_disk_id", "peer_disk_uuid",
+                }
+            )
+            if len(candidates) > 1:
+                raise RuntimeError(
+                    "Refusing to clean an unproven private peer OS disk"
+                )
+            if candidates:
+                verified_peer_disk = candidates[0]
+                self.verified_peer_disk_for_cleanup(verified_peer_disk)
+            elif receipt_complete:
+                raise RuntimeError(
+                    "Refusing to clean a detached or replaced "
+                    "private peer OS disk"
+                )
         for resource in resources:
+            if resource is verified_peer_disk:
+                continue
             try:
                 self.require_owned(resource)
             except RuntimeError:
-                if (
-                    network.validate_acceptance(
-                        self.state.get(
-                            "acceptance",
-                            {"mode": network.RAW_ACCEPTANCE_MODE},
-                        )
-                    )["mode"] != network.NETWORK_ACCEPTANCE_MODE
-                ):
+                if not network_mode:
                     raise
                 self.verified_peer_disk_for_cleanup(resource)
         self.record("deleting-group")

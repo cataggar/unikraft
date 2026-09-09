@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 import unittest
 from unittest import mock
 
@@ -914,6 +915,48 @@ class HypervAzureControllerTest(unittest.TestCase):
             image, "https://disk.blob.core.windows.net/path", "sig=secret"
         )
 
+    @mock.patch.object(azure.subprocess, "run")
+    def test_upload_timeout_is_sanitized_before_intermediate_logging(self, execute):
+        run = self.run_fixture()
+        endpoint = (
+            "https://privateaccount.blob.core.windows.net/"
+            "private-container/private-disk"
+        )
+        image_path = "/private/build/private-image.vhd"
+        run.az.side_effect = [
+            self.disk_fixture(run),
+            {"accessSas": endpoint + "?sig=private-sas"},
+            None,
+        ]
+        image = mock.Mock()
+        image.stat.return_value.st_size = 67109376
+        image.__str__ = mock.Mock(return_value=image_path)
+
+        def time_out(command, **kwargs):
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        execute.side_effect = time_out
+        errors = io.StringIO()
+        with mock.patch.object(azure.sys, "stderr", errors):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Managed-disk upload helper timed out; "
+                "private upload details withheld",
+            ) as stopped:
+                run.upload_disk(image)
+        rendered = "".join(traceback.format_exception(stopped.exception))
+        visible = errors.getvalue() + str(stopped.exception) + rendered
+        for private in (
+            "privateaccount", "private-container", "private-disk",
+            "private-image.vhd", image_path, endpoint, "private-sas",
+        ):
+            self.assertNotIn(private, visible)
+        self.assertIsNone(stopped.exception.__cause__)
+        self.assertIsNone(stopped.exception.__context__)
+        self.assertEqual(
+            run.az.call_args.args[0][:2], ["disk", "revoke-access"]
+        )
+
     @mock.patch.object(azure, "upload_managed_vhd")
     def test_unimported_disk_cannot_advance_to_deployment(self, upload):
         run = self.run_fixture()
@@ -1694,7 +1737,7 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
         peer_disk = {
             "id": peer_disk_id,
             "uniqueId": "33333333-3333-4333-8333-333333333333",
-            "tags": run.tags,
+            "tags": None,
             "managedBy": peer_vm_id,
         }
 
@@ -1709,7 +1752,7 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             }
 
         run.az.side_effect = [
-            deployment, peer_vm, peer_disk,
+            deployment, peer_vm, peer_disk, peer_disk,
             nic("/peer-nic", "10.87.0.4"),
             nic("/guest-nic", "10.87.0.5"),
         ]
@@ -1738,6 +1781,105 @@ class HypervAzureNetworkReservationTest(unittest.TestCase):
             state["peer_deployment"]["peer_disk_uuid"],
             "33333333-3333-4333-8333-333333333333",
         )
+        self.assertFalse(any(
+            call.args[0][:2] == ["disk", "update"]
+            for call in run.az.call_args_list
+        ))
+
+    def test_replaced_peer_disk_with_run_tags_still_blocks_cleanup(self):
+        fixture = HypervAzureControllerTest()
+        run, state = fixture.network_run_fixture()
+        state["network_run"] = azure.network.private_network(
+            state["acceptance"], "10.87.0.5", "10.87.0.0/29"
+        )
+        peer_image = {
+            "publisher": "Canonical", "offer": "ubuntu-24_04-lts",
+            "sku": "server", "version": "24.04.202601010",
+        }
+        peer_vm_id = run.expected_resource_id(
+            "Microsoft.Compute", "virtualMachines", run.peer_vm
+        )
+        peer_disk_id = run.expected_resource_id(
+            "Microsoft.Compute", "disks", run.prefix + "-peer-os"
+        )
+        original_uuid = "33333333-3333-4333-8333-333333333333"
+        replacement_uuid = "44444444-4444-4444-8444-444444444444"
+        deployment = {
+            "id": run.expected_resource_id(
+                "Microsoft.Resources", "deployments", run.prefix + "-peer"
+            ),
+            "name": run.prefix + "-peer",
+            "properties": {
+                "provisioningState": "Succeeded",
+                "correlationId": "11111111-1111-4111-8111-111111111111",
+            },
+        }
+        peer_vm = {
+            "id": peer_vm_id,
+            "vmId": "22222222-2222-4222-8222-222222222222",
+            "tags": run.tags,
+            "provisioningState": "Succeeded",
+            "hardwareProfile": {"vmSize": azure.network.PEER_VM_SIZE},
+            "storageProfile": {
+                "imageReference": peer_image,
+                "osDisk": {"managedDisk": {"id": peer_disk_id}},
+            },
+        }
+        original_disk = {
+            "id": peer_disk_id, "name": run.prefix + "-peer-os",
+            "type": "Microsoft.Compute/disks", "tags": None,
+            "managedBy": peer_vm_id, "uniqueId": original_uuid,
+        }
+        replacement_disk = {
+            **original_disk, "tags": run.tags,
+            "uniqueId": replacement_uuid,
+        }
+        run.record.side_effect = lambda phase, **fields: state.update(
+            phase=phase, **fields
+        )
+
+        @azure.contextmanager
+        def parameters(_):
+            yield Path("/private/parameters.json")
+
+        run.private_parameters = parameters
+        run.az.side_effect = [
+            deployment, peer_vm, original_disk, replacement_disk,
+        ]
+        with mock.patch.object(azure.time, "monotonic", return_value=100):
+            with self.assertRaisesRegex(RuntimeError, "not owned by the peer VM"):
+                run.deploy_network_peer(
+                    state["network_run"], peer_image, 400
+                )
+        self.assertEqual(
+            state["peer_deployment"]["peer_disk_uuid"], original_uuid
+        )
+        self.assertFalse(any(
+            call.args[0][:2] == ["disk", "update"]
+            for call in run.az.call_args_list
+        ))
+
+        group = {
+            "id": state["resource_group_id"], "tags": run.group_tags,
+        }
+        resources = [
+            {
+                "id": peer_vm_id, "name": run.peer_vm,
+                "type": "Microsoft.Compute/virtualMachines",
+                "tags": run.tags,
+            },
+            replacement_disk,
+        ]
+        run.az.reset_mock()
+        run.az.side_effect = [
+            True, group, resources, peer_vm, replacement_disk,
+        ]
+        with self.assertRaisesRegex(RuntimeError, "detached or replaced"):
+            run.cleanup()
+        self.assertFalse(any(
+            call.args[0][:2] == ["group", "delete"]
+            for call in run.az.call_args_list
+        ))
 
     @mock.patch.object(azure, "AzureRun")
     @mock.patch.object(azure, "check_network_subscription")
