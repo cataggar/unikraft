@@ -42,11 +42,18 @@ struct vmbus_device_bind_token {
 	__u64 resource_epoch;
 };
 
+struct vmbus_offer_identity {
+	struct vmbus_guid instance_id;
+	__u32 channel_id;
+	__u64 generation;
+};
+
 struct vmbus_driver {
 	const char *name;
 	const struct vmbus_device_id *device_ids;
 	int (*add_dev)(struct vmbus_device *);
 	void (*remove_dev)(struct vmbus_device *);
+	void (*offer_removed)(const struct vmbus_offer_identity *);
 };
 struct vmbus_packet {
 	__u16 type;

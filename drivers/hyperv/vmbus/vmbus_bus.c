@@ -59,11 +59,13 @@ struct vmbus_device_binding {
 	__u64 retry_epoch;
 	__u64 failure_epoch;
 	const struct vmbus_driver *adding_driver;
+	const struct vmbus_driver *offer_driver;
 	struct vmbus_decoded_offer pending_offer;
 	__u8 state;
 	__u8 capacity_failure;
 	__u8 pending_offer_valid;
 	__u8 remove_called;
+	__u8 offer_remove_notified;
 };
 
 const struct vmbus_guid vmbus_storage_guid = {
@@ -675,6 +677,25 @@ static void cleanup_added_device(struct vmbus_device *dev,
 		(void)vmbus_channel_close(dev->channel);
 }
 
+static const struct vmbus_driver *claim_offer_removed(
+	struct vmbus_device *dev, struct vmbus_device_binding *binding,
+	struct vmbus_offer_identity *offer)
+{
+	const struct vmbus_driver *driver = NULL;
+	unsigned long flags;
+
+	bind_state_lock(&flags);
+	if (binding->generation && !binding->offer_remove_notified) {
+		binding->offer_remove_notified = 1;
+		driver = binding->offer_driver;
+		offer->instance_id = dev->instance_id;
+		offer->channel_id = dev->channel_id;
+		offer->generation = binding->generation;
+	}
+	bind_state_unlock(flags);
+	return driver;
+}
+
 static void try_install_pending_offer(struct vmbus_device *dev)
 {
 	struct vmbus_device_binding *binding = device_binding(dev);
@@ -695,8 +716,10 @@ static void try_install_pending_offer(struct vmbus_device *dev)
 	binding->retry_epoch = 0;
 	binding->failure_epoch = 0;
 	binding->adding_driver = NULL;
+	binding->offer_driver = NULL;
 	binding->capacity_failure = 0;
 	binding->remove_called = 0;
+	binding->offer_remove_notified = 0;
 	device_count++;
 	__atomic_store_n(&bind_work_pending, 1, __ATOMIC_RELEASE);
 }
@@ -705,12 +728,21 @@ static void finish_device_removal(struct vmbus_device *dev,
 				  struct vmbus_device_binding *binding,
 				  const struct vmbus_driver *driver)
 {
+	struct vmbus_offer_identity offer;
+	const struct vmbus_driver *offer_driver =
+		claim_offer_removed(dev, binding, &offer);
+
 	cleanup_added_device(dev, binding, driver);
+	if (offer_driver && offer_driver->offer_removed)
+		offer_driver->offer_removed(&offer);
 	clear_device_fields(dev);
+	binding->generation = 0;
 	binding->adding_driver = NULL;
+	binding->offer_driver = NULL;
 	binding->capacity_failure = 0;
 	binding->failure_epoch = 0;
 	binding->remove_called = 0;
+	binding->offer_remove_notified = 0;
 	binding->state = VMBUS_BIND_UNUSED;
 	if (!clearing_devices)
 		try_install_pending_offer(dev);
@@ -749,6 +781,7 @@ static void bind_device(struct vmbus_device *dev)
 	generation = binding->generation;
 	binding->state = VMBUS_BIND_ADDING;
 	binding->adding_driver = driver;
+	binding->offer_driver = driver;
 	binding->capacity_failure = 0;
 	binding->failure_epoch = 0;
 	binding->remove_called = 0;
@@ -899,9 +932,11 @@ static void clear_devices(void)
 		device_bindings[i].state = VMBUS_BIND_UNUSED;
 		device_bindings[i].pending_offer_valid = 0;
 		device_bindings[i].adding_driver = NULL;
+		device_bindings[i].offer_driver = NULL;
 		device_bindings[i].capacity_failure = 0;
 		device_bindings[i].failure_epoch = 0;
 		device_bindings[i].remove_called = 0;
+		device_bindings[i].offer_remove_notified = 0;
 		clear_device_fields(&devices[i]);
 	}
 	clearing_devices = 0;
@@ -1090,8 +1125,10 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 	binding->retry_epoch = 0;
 	binding->failure_epoch = 0;
 	binding->adding_driver = NULL;
+	binding->offer_driver = NULL;
 	binding->capacity_failure = 0;
 	binding->remove_called = 0;
+	binding->offer_remove_notified = 0;
 	device_count++;
 	__atomic_store_n(&bind_work_pending, 1, __ATOMIC_RELEASE);
 	process_bind_work();
@@ -2190,6 +2227,8 @@ static enum host_bind_mode host_bind_mode;
 static unsigned int host_add_a;
 static unsigned int host_add_b;
 static unsigned int host_remove_count;
+static unsigned int host_offer_removed_count;
+static struct vmbus_offer_identity host_last_removed_offer;
 static int host_add_active;
 static int host_remove_during_add;
 static unsigned int host_add_depth;
@@ -2465,6 +2504,13 @@ static void host_remove_device(struct vmbus_device *dev __unused)
 	}
 }
 
+static void
+host_offer_removed(const struct vmbus_offer_identity *offer)
+{
+	host_offer_removed_count++;
+	host_last_removed_offer = *offer;
+}
+
 static const struct vmbus_device_id host_ids[] = {
 	{ .class_id = {
 		.bytes = {
@@ -2480,6 +2526,7 @@ static struct vmbus_driver host_driver = {
 	.device_ids = host_ids,
 	.add_dev = host_add_device,
 	.remove_dev = host_remove_device,
+	.offer_removed = host_offer_removed,
 };
 
 static void host_reset_state(void)
@@ -2528,6 +2575,9 @@ static void host_reset_state(void)
 	host_add_a = 0;
 	host_add_b = 0;
 	host_remove_count = 0;
+	host_offer_removed_count = 0;
+	host_zero(&host_last_removed_offer,
+		  sizeof(host_last_removed_offer));
 	host_add_active = 0;
 	host_remove_during_add = 0;
 	host_add_depth = 0;
@@ -2841,7 +2891,11 @@ static int host_test_bind_retries(void)
 	vmbus_control_channel_resource_released();
 	process_bind_work();
 	if (host_add_b != 1 ||
-	    device_bindings[0].state != VMBUS_BIND_PERMANENT_FAILED)
+	    device_bindings[0].state != VMBUS_BIND_PERMANENT_FAILED ||
+	    host_remove_count || host_offer_removed_count)
+		return 112;
+	if (rescind_offer(3) || host_offer_removed_count != 1 ||
+	    host_last_removed_offer.channel_id != 3)
 		return 112;
 
 	host_reset_state();
@@ -2950,6 +3004,7 @@ static int host_test_bind_epoch_ordering(void)
 static int host_test_partial_add_cleanup(void)
 {
 	struct vmbus_decoded_offer offer;
+	__u64 first_generation;
 
 	host_reset_state();
 	host_bind_mode = HOST_BIND_PARTIAL;
@@ -2957,9 +3012,40 @@ static int host_test_partial_add_cleanup(void)
 	if (add_offer(&offer))
 		return 121;
 	if (host_add_b != 1 || host_remove_count != 1 ||
+	    host_offer_removed_count ||
 	    devices[0].channel ||
 	    device_bindings[0].state != VMBUS_BIND_PERMANENT_FAILED)
 		return 122;
+	first_generation = device_bindings[0].generation;
+	if (rescind_offer(5) || host_offer_removed_count != 1 ||
+	    host_last_removed_offer.channel_id != 5 ||
+	    host_last_removed_offer.generation != first_generation ||
+	    memcmp(host_last_removed_offer.instance_id.bytes,
+		   offer.instance_id, VMBUS_GUID_SIZE))
+		return 123;
+	if (rescind_offer(5) || host_offer_removed_count != 1)
+		return 124;
+	if (add_offer(&offer) ||
+	    device_bindings[0].generation == first_generation ||
+	    host_offer_removed_count != 1)
+		return 125;
+	if (rescind_offer(5) || host_offer_removed_count != 2 ||
+	    host_last_removed_offer.generation == first_generation)
+		return 126;
+
+	host_reset_state();
+	host_bind_mode = HOST_BIND_NESTED;
+	host_make_offer(&offer, 6);
+	if (add_offer(&offer) ||
+	    device_bindings[0].state != VMBUS_BIND_BOUND)
+		return 127;
+	clear_devices();
+	if (host_remove_count != 1 || host_offer_removed_count != 1 ||
+	    host_last_removed_offer.channel_id != 6 || device_count)
+		return 128;
+	clear_devices();
+	if (host_remove_count != 1 || host_offer_removed_count != 1)
+		return 129;
 	return 0;
 }
 
@@ -3514,6 +3600,68 @@ unsigned int vmbus_bus_host_connection_fail_calls(void)
 {
 	return __atomic_load_n(&host_connection_fail_calls,
 			       __ATOMIC_RELAXED);
+}
+
+int vmbus_bus_host_offer_lifetime_setup(struct vmbus_driver *driver)
+{
+	host_reset_state();
+	driver_count = 0;
+	return _vmbus_register_driver(driver);
+}
+
+int vmbus_bus_host_offer_storage(
+	const struct vmbus_guid *instance_id, __u32 channel_id,
+	__u32 connection_id)
+{
+	struct vmbus_decoded_offer offer;
+
+	if (!instance_id)
+		return -EINVAL;
+	host_zero(&offer, sizeof(offer));
+	memcpy(offer.class_id, vmbus_storage_guid.bytes,
+	       sizeof(offer.class_id));
+	memcpy(offer.instance_id, instance_id->bytes,
+	       sizeof(offer.instance_id));
+	offer.channel_id = channel_id;
+	offer.connection_id = connection_id;
+	return add_offer(&offer);
+}
+
+int vmbus_bus_host_offer_present(__u32 channel_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
+		if (devices[i].present &&
+		    devices[i].channel_id == channel_id)
+			return 1;
+	return 0;
+}
+
+int vmbus_bus_host_confirm_rescind(__u32 channel_id)
+{
+	struct vmbus_relid_lifecycle *lifecycle =
+		vmbus_relid_find(relids, VMBUS_RELID_CAPACITY, channel_id);
+	int rc;
+
+	if (!lifecycle)
+		return -ENOENT;
+	lifecycle->state = VMBUS_RELID_RELEASED;
+	rc = rescind_offer(channel_id);
+	if (rc == -ENODEV && !vmbus_bus_host_offer_present(channel_id))
+		return 0;
+	return rc;
+}
+
+__u64 vmbus_bus_host_offer_generation(__u32 channel_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
+		if (devices[i].present &&
+		    devices[i].channel_id == channel_id)
+			return device_bindings[i].generation;
+	return 0;
 }
 
 void vmbus_bus_host_set_transmit_error(int error)

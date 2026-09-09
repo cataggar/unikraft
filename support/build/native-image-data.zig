@@ -141,6 +141,19 @@ pub const x86_64_efi_hyperv_acceptance_app = Library{
     },
 };
 
+pub const x86_64_efi_hyperv_persistence_app = Library{
+    .name = "apphelloworld",
+    .origin = .application,
+    .objects = &.{
+        "apphelloworld/main.o",
+        "apphelloworld/acceptance_protocol.o",
+        "apphelloworld/application_protocol.o",
+        "apphelloworld/application_network.o",
+        "apphelloworld/persistence.o",
+        "apphelloworld/libinfo.libuklibid.o",
+    },
+};
+
 pub const x86_64_efi_ukrandom = Library{
     .name = "libukrandom",
     .origin = .library,

@@ -1022,14 +1022,31 @@ pub fn build(b: *std.Build) void {
     storvsc_production_tests.root_module.addIncludePath(
         b.path("drivers/hyperv/storvsc/include"),
     );
+    storvsc_production_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
+    );
     storvsc_production_tests.root_module.addCSourceFiles(.{
         .files = &.{
             "drivers/hyperv/storvsc/storvsc.c",
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/apps/hyperv-acceptance/persistence.c",
             "support/build/tests/storvsc-production-test.c",
         },
         .flags = &.{
             "-std=gnu11",
             "-DSTORVSC_HOST_TEST",
+            "-DHYPERV_PERSISTENCE_HOST_TEST",
+            "-DPERSISTENCE_TIMEOUT_NS=5000000ULL",
+            "-DPERSISTENCE_BIND_TIMEOUT_NS=50000000ULL",
+            "-DPERSISTENCE_POLL_NS=1000000ULL",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID=\"00112233445566778899aabbccddeeff\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID=\"102132435465768798a9bacbdcedfe0f\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=1000",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH=0",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET=0",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0",
             "-Wall",
             "-Wextra",
             "-Werror",
@@ -1050,9 +1067,14 @@ pub fn build(b: *std.Build) void {
     storvsc_production_tests.link_gc_sections = true;
     const run_storvsc_production_tests = b.addRunArtifact(storvsc_production_tests);
     test_step.dependOn(&run_storvsc_production_tests.step);
+    const persistence_workflow_tests = b.step(
+        "test-hyperv-persistence-workflow",
+        "Run production-backed guarded persistence workflow fixtures",
+    );
+    persistence_workflow_tests.dependOn(&run_storvsc_production_tests.step);
     const storvsc_regression_tests = b.step(
         "test-storvsc-regression",
-        "Run StorVSC core, public ABI, and production topology/lifetime fixtures",
+        "Run StorVSC protocol, topology, guarded-I/O, and ABI fixtures",
     );
     storvsc_regression_tests.dependOn(&run_storvsc_core_tests.step);
     storvsc_regression_tests.dependOn(&verify_storvsc_core.step);
@@ -1122,6 +1144,9 @@ pub fn build(b: *std.Build) void {
     const run_hyperv_acceptance_protocol_tests =
         b.addRunArtifact(hyperv_acceptance_protocol_tests);
     test_step.dependOn(&run_hyperv_acceptance_protocol_tests.step);
+    storvsc_regression_tests.dependOn(
+        &run_hyperv_acceptance_protocol_tests.step,
+    );
     const application_protocol_tests = b.addExecutable(.{
         .name = "hyperv-application-protocol-test",
         .use_llvm = true,
@@ -1390,6 +1415,7 @@ pub fn build(b: *std.Build) void {
         "support.scripts.tests.test_hyperv_network_controller",
         "support.scripts.tests.test_hyperv_network_peer",
         "support.scripts.tests.test_hyperv_irq_register",
+        "support.scripts.tests.test_hyperv_storage_manifest",
     });
     hyperv_controller_fixtures.setCwd(.{ .cwd_relative = root });
     hyperv_controller_fixtures.setEnvironmentVariable(
@@ -1749,6 +1775,13 @@ fn registerNativeGraph(
         nativeConfigEnabled(loaded, "CONFIG_APPHYPERVACCEPTANCE")
     else
         false;
+    const enable_hyperv_persistence = if (config) |loaded|
+        nativeConfigEnabled(
+            loaded,
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE",
+        )
+    else
+        false;
     const enable_ukrandom_lcpu = if (config) |loaded|
         nativeConfigEnabled(loaded, "CONFIG_LIBUKRANDOM_LCPU")
     else
@@ -1775,6 +1808,7 @@ fn registerNativeGraph(
         .enable_uklibparam = enable_uklibparam,
         .enable_lwip = enable_lwip,
         .enable_hyperv_acceptance = enable_hyperv_acceptance,
+        .enable_hyperv_persistence = enable_hyperv_persistence,
         .enable_ukrandom_lcpu = enable_ukrandom_lcpu,
         .lwip_root = lwip_root,
     }) catch |err| {

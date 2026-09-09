@@ -49,11 +49,23 @@ struct vmbus_device_bind_token {
 	__u64 resource_epoch;
 };
 
+struct vmbus_offer_identity {
+	struct vmbus_guid instance_id;
+	__u32 channel_id;
+	__u64 generation;
+};
+
+/*
+ * offer_removed ends exactly one generation-bearing offer lifetime. It is
+ * distinct from remove_dev(), which may also be used to roll back a failed
+ * add, and does not itself prove channel or DMA quiescence.
+ */
 struct vmbus_driver {
 	const char *name;
 	const struct vmbus_device_id *device_ids;
 	int (*add_dev)(struct vmbus_device *dev);
 	void (*remove_dev)(struct vmbus_device *dev);
+	void (*offer_removed)(const struct vmbus_offer_identity *offer);
 };
 
 enum vmbus_packet_type {

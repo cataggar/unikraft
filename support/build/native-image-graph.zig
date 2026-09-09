@@ -30,6 +30,7 @@ pub const Options = struct {
     enable_storvsc: bool = false,
     enable_uklibparam: bool = false,
     enable_hyperv_acceptance: bool = false,
+    enable_hyperv_persistence: bool = false,
     enable_lwip: bool = false,
     enable_ukrandom_lcpu: bool = false,
     lwip_root: ?[]const u8 = null,
@@ -191,7 +192,10 @@ fn registerLibraries(
                 context,
                 allocator,
                 options,
-                data.x86_64_efi_hyperv_acceptance_app,
+                if (options.enable_hyperv_persistence)
+                    data.x86_64_efi_hyperv_persistence_app
+                else
+                    data.x86_64_efi_hyperv_acceptance_app,
                 &.{},
             );
             continue;
@@ -1372,12 +1376,40 @@ test "Hyper-V raw acceptance registers its sources without the network stack" {
             application = library;
         try std.testing.expect(!std.mem.eql(u8, library.name, "liblwip"));
     }
+
     const app = application orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 5), app.raw_objects.len);
     try std.testing.expectEqualStrings(
         "/build/apphelloworld/acceptance_protocol.o",
         app.raw_objects[1].path,
     );
+}
+
+test "Hyper-V persistence registers its separately compiled workload" {
+    var registered = try RegisteredGraph.init(std.testing.allocator, .{
+        .roots = .{
+            .base = "/src/unikraft",
+            .app = "/src/hyperv-acceptance",
+            .output = "/build",
+            .config = "/build/.config",
+        },
+        .profile = .@"hyperv-x86_64-efi-netvsc",
+        .enable_hyperv_acceptance = true,
+        .enable_hyperv_persistence = true,
+    });
+    defer registered.deinit();
+
+    for (registered.graph.libraries) |library| {
+        if (!std.mem.eql(u8, library.name, "apphelloworld"))
+            continue;
+        try std.testing.expectEqual(@as(usize, 6), library.raw_objects.len);
+        try std.testing.expectEqualStrings(
+            "/build/apphelloworld/persistence.o",
+            library.raw_objects[4].path,
+        );
+        return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "registered profiles match normalized Make graph fixtures" {

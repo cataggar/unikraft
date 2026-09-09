@@ -16,6 +16,10 @@ menuconfig APPHYPERVACCEPTANCE
 
 if APPHYPERVACCEPTANCE
 
+choice APPHYPERVACCEPTANCE_WORKLOAD
+	prompt "Optional acceptance workload"
+	optional
+
 config APPHYPERVACCEPTANCE_NETWORK_APPLICATION
 	bool "Run stack-backed private-peer networking acceptance"
 	depends on LIBLWIP && LWIP_NOTHREADS && LWIP_DHCP && LWIP_TCP && LWIP_UDP
@@ -23,6 +27,17 @@ config APPHYPERVACCEPTANCE_NETWORK_APPLICATION
 	help
 	  Replace the default raw DHCP Offer smoke with bounded DHCP lease,
 	  ARP, TCP, and UDP acceptance through the official lib-lwip stack.
+
+config APPHYPERVACCEPTANCE_PERSISTENCE
+	bool "Run destructive disposable-disk persistence acceptance"
+	select LIBSTORVSC_LUN_DISCOVERY
+	select LIBSTORVSC_GUARDED_IO
+	help
+	  Replace the ordinary read-only storage/network probe with the
+	  manifest-gated two-boot persistence workload. This may write only
+	  the uniquely matched disposable disk described below.
+
+endchoice
 
 config APPHYPERVACCEPTANCE_PEER_IPV4
 	string "Private peer IPv4 address"
@@ -48,5 +63,51 @@ config APPHYPERVACCEPTANCE_NONCE
 	help
 	  Run-manifest nonce encoded as exactly 16 hexadecimal digits without
 	  a 0x prefix. Invalid values fail before any network traffic.
+
+if APPHYPERVACCEPTANCE_PERSISTENCE
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID
+	string "Private 128-bit run ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID
+	string "Private 128-bit disk ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS
+	int "Exact disposable disk sector count"
+	default 0
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE
+	int "Exact disposable disk sector size"
+	default 512
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY
+	int "Persistence identity policy version"
+	range 1 2
+	default 1
+	help
+	  Policy 1 binds path, target, and LUN in the seed before boot.
+	  Policy 2 binds LUN and geometry in the seed, then enrolls path,
+	  target, controller instance, and VPD only after a unique seed match.
+	  Intent and receipt records remain bound to the selected policy.
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_PATH
+	int "Expected StorVSC path"
+	range 0 255
+	default 0
+	depends on APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY = 1
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_TARGET
+	int "Expected StorVSC target"
+	range 0 255
+	default 0
+	depends on APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY = 1
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_LUN
+	int "Expected StorVSC LUN"
+	range 0 255
+	default 0
+endif
 
 endif

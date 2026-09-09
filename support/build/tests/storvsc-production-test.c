@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -19,6 +20,9 @@
 #include <uk/thread.h>
 #include <uk/vmbus.h>
 
+#include "acceptance_protocol.h"
+#include "persistence.h"
+#include "persistence_host.h"
 #include "storvsc_core.h"
 
 #define TEST_CLOSE_RETRY_LIMIT 8
@@ -32,10 +36,12 @@ struct uk_blkdev *storvsc_host_blkdev_address(unsigned int controller,
 int storvsc_host_controller_online(unsigned int controller);
 size_t storvsc_host_lun_count(void);
 void storvsc_host_set_lun_discovery(int enabled);
+void storvsc_host_set_guarded_io(int enabled);
 int storvsc_host_lun_address(size_t index,
 			     struct storvsc_address *address);
 int storvsc_host_receive(void);
 int storvsc_host_reset_timed_out_io(void);
+int storvsc_host_reset_controller(unsigned int controller);
 int storvsc_host_start_timeout_worker(void);
 void storvsc_host_stop_timeout_worker(void);
 void storvsc_host_set_send_wait_limit(unsigned int limit);
@@ -64,6 +70,20 @@ int vmbus_bus_host_disconnect_remove(
 	void (*remove_hook)(void *), void *remove_arg,
 	void (*unload_post_hook)(void *), void *unload_arg,
 	int acknowledge);
+int vmbus_bus_host_offer_lifetime_setup(struct vmbus_driver *driver);
+int vmbus_bus_host_offer_storage(
+	const struct vmbus_guid *instance_id, __u32 channel_id,
+	__u32 connection_id);
+int vmbus_bus_host_confirm_rescind(__u32 channel_id);
+int vmbus_bus_host_offer_present(__u32 channel_id);
+__u64 vmbus_bus_host_offer_generation(__u32 channel_id);
+int vmbus_epoch_object_bind_epoch(
+	struct vmbus_device *device,
+	struct vmbus_device_bind_token *token);
+int vmbus_epoch_object_bind_retry(
+	struct vmbus_device *device,
+	const struct vmbus_device_bind_token *token);
+void vmbus_epoch_object_bind_ready(void);
 
 struct uk_thread {
 	pthread_t pthread;
@@ -124,6 +144,17 @@ static int reject_mode_sense10;
 static int report_luns_mode;
 static int topology_fixture;
 static int vpd_mode;
+static uint8_t vpd_variant;
+static int targeted_vpd_malformed;
+static unsigned int targeted_vpd_controller;
+static uint8_t targeted_vpd_lun;
+static int discovery_failure_kind;
+static unsigned int discovery_failure_controller;
+static uint8_t discovery_failure_lun;
+static unsigned int discovery_failures_remaining;
+static unsigned int registration_failure_controller;
+static uint8_t registration_failure_lun;
+static unsigned int registration_failures_remaining;
 static int alternate_completion_size;
 static int hold_io;
 static int short_transfer_once;
@@ -131,10 +162,18 @@ static int io_packet_error_once;
 static int publish_error_once;
 static uint64_t last_io_id;
 static uint32_t last_io_length;
+static uint8_t last_io_opcode;
+static unsigned int io_command_count;
+static unsigned int write10_command_count;
+static unsigned int write16_command_count;
+static unsigned int flush_command_count;
+static int backing_media_enabled;
+static uint8_t backing_media[1000 * 512];
 static uint32_t last_pfn_count;
 static uint64_t last_pfns[64];
 static unsigned int close_count;
 static uint16_t next_blkdev_id;
+static struct uk_blkdev *registered_blkdevs[256];
 static unsigned int unregister_calls;
 static struct uk_blkdev *deferred_finish_device;
 static unsigned int deferred_finish_events;
@@ -152,12 +191,32 @@ static int epoch_sample_enabled;
 static int epoch_sample_entered;
 static int epoch_sample_release;
 static uint64_t epoch_sample_value;
+static int binding_publish_pause;
+static unsigned int binding_publish_controller;
+static int binding_publish_entered;
+static int binding_publish_release;
 static uint64_t race_transaction_id;
 static const uint64_t *race_pfn_source;
 static unsigned int race_pfns_written;
 static uint64_t race_first_pfn;
 static struct uk_blkreq *race_sender_request;
 static atomic_int race_post_completion_publication;
+static struct vmbus_driver *persistence_hook_driver;
+static struct vmbus_device *persistence_hook_device;
+static int persistence_hook_mode;
+static int persistence_hook_fired;
+static int persistence_hook_end_error;
+static int persistence_hook_timeouts;
+static int use_vmbus_offer_lifetimes;
+static int retained_callback_entered;
+static int retained_callback_release;
+static int retained_callback_count;
+
+enum persistence_hook_mode {
+	PERSISTENCE_HOOK_NONE = 0,
+	PERSISTENCE_HOOK_ADD_BEFORE_REVALIDATE,
+	PERSISTENCE_HOOK_ADD_BEFORE_REJECT_END,
+};
 static atomic_int host_irqs_disabled;
 static atomic_int channel_mask_calls;
 static atomic_int channel_unmask_calls;
@@ -187,6 +246,12 @@ enum {
 };
 
 enum {
+	DISCOVERY_FAILURE_NONE,
+	DISCOVERY_FAILURE_INQUIRY,
+	DISCOVERY_FAILURE_CAPACITY,
+};
+
+enum {
 	TEST_DEFER_NONE,
 	TEST_DEFER_RESET,
 	TEST_DEFER_FATAL,
@@ -207,6 +272,7 @@ enum {
 	VPD_UNSUPPORTED,
 	VPD_MALFORMED,
 	VPD_MALFORMED_LUN2,
+	VPD_DUPLICATE,
 };
 
 static uint32_t get_le32(const uint8_t *bytes, size_t offset)
@@ -223,6 +289,12 @@ static uint32_t get_be32(const uint8_t *bytes, size_t offset)
 		((uint32_t)bytes[offset + 1] << 16) |
 		((uint32_t)bytes[offset + 2] << 8) |
 		(uint32_t)bytes[offset + 3];
+}
+
+static uint64_t get_be64(const uint8_t *bytes, size_t offset)
+{
+	return ((uint64_t)get_be32(bytes, offset) << 32) |
+		get_be32(bytes, offset + 4);
 }
 
 static void put_le32(uint8_t *bytes, size_t offset, uint32_t value)
@@ -440,6 +512,31 @@ void storvsc_host_sync_completion_hook(void)
 		abort();
 }
 
+void storvsc_host_binding_publish_hook(unsigned int controller)
+{
+	pthread_mutex_lock(&race_lock);
+	if (!binding_publish_pause ||
+	    controller != binding_publish_controller) {
+		pthread_mutex_unlock(&race_lock);
+		return;
+	}
+	binding_publish_entered = 1;
+	pthread_cond_broadcast(&race_condition);
+	while (!binding_publish_release)
+		pthread_cond_wait(&race_condition, &race_lock);
+	pthread_mutex_unlock(&race_lock);
+}
+
+int storvsc_host_registration_hook(unsigned int controller, uint8_t lun)
+{
+	if (!registration_failures_remaining ||
+	    controller != registration_failure_controller ||
+	    lun != registration_failure_lun)
+		return 0;
+	registration_failures_remaining--;
+	return -EIO;
+}
+
 static void *thread_start(void *argument)
 {
 	struct uk_thread *thread = argument;
@@ -452,6 +549,32 @@ static void *thread_start(void *argument)
 struct uk_alloc *uk_alloc_get_default(void)
 {
 	return &host_allocator;
+}
+
+void hyperv_persistence_host_event(enum hyperv_persistence_host_event event,
+				  unsigned int index, int value)
+{
+	int should_add =
+		(persistence_hook_mode ==
+			 PERSISTENCE_HOOK_ADD_BEFORE_REVALIDATE &&
+		 event == HYPERV_PERSISTENCE_HOST_BEFORE_REVALIDATE) ||
+		(persistence_hook_mode ==
+			 PERSISTENCE_HOOK_ADD_BEFORE_REJECT_END &&
+		 event == HYPERV_PERSISTENCE_HOST_BEFORE_REJECT_END);
+
+	(void)index;
+	if (event == HYPERV_PERSISTENCE_HOST_SESSION_END_ERROR)
+		persistence_hook_end_error = value;
+	if (event == HYPERV_PERSISTENCE_HOST_IO_TIMEOUT)
+		persistence_hook_timeouts++;
+	if (!should_add || persistence_hook_fired)
+		return;
+	persistence_hook_fired = 1;
+	if (!persistence_hook_driver || !persistence_hook_device)
+		abort();
+	persistence_hook_device->present = 1;
+	if (persistence_hook_driver->add_dev(persistence_hook_device))
+		abort();
 }
 
 int storvsc_host_irqs_disabled(void)
@@ -590,6 +713,29 @@ static void range_write(const struct vmbus_gpa_range *range,
 		abort();
 }
 
+static void range_read(const struct vmbus_gpa_range *range,
+		       uint8_t *destination, uint32_t length)
+{
+	uint32_t remaining = length;
+	uint32_t destination_offset = 0;
+
+	for (uint32_t i = 0; i < range->pfn_count && remaining; i++) {
+		uint8_t *page = virtual_page_for_pfn(range->pfns[i]);
+		uint32_t offset = i ? 0 : range->byte_offset;
+		uint32_t chunk = 4096 - offset;
+
+		if (!page)
+			abort();
+		if (chunk > remaining)
+			chunk = remaining;
+		memcpy(destination + destination_offset, page + offset, chunk);
+		destination_offset += chunk;
+		remaining -= chunk;
+	}
+	if (remaining)
+		abort();
+}
+
 static void fill_read_data(const struct vmbus_gpa_range *range,
 			   uint32_t length, uint8_t seed)
 {
@@ -601,6 +747,12 @@ static void fill_read_data(const struct vmbus_gpa_range *range,
 		data[i] = (uint8_t)(i ^ seed);
 	range_write(range, data, length);
 	free(data);
+}
+
+static uint64_t scsi_io_lba(const uint8_t *payload, uint8_t opcode)
+{
+	return opcode == 0x28 || opcode == 0x2a ?
+		get_be32(payload, 30) : get_be64(payload, 30);
 }
 
 static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
@@ -616,6 +768,19 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 
 	if (payload[17] || payload[18])
 		invalid_scsi_address = 1;
+	if (discovery_failures_remaining &&
+	    controller == discovery_failure_controller &&
+	    lun == discovery_failure_lun &&
+	    ((discovery_failure_kind == DISCOVERY_FAILURE_INQUIRY &&
+	      opcode == 0x12 && !(payload[29] & 1)) ||
+	     (discovery_failure_kind == DISCOVERY_FAILURE_CAPACITY &&
+	      opcode == 0x25))) {
+		discovery_failures_remaining--;
+		enqueue_completion_on(
+			channel, id, response_packet_length(packet_length),
+			1, 1, 0, 0);
+		return;
+	}
 	switch (opcode) {
 	case 0xa0:
 		report_luns_commands++;
@@ -667,13 +832,17 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 				2 * STORVSC_REPORT_LUN_ENTRY_SIZE;
 			break;
 		case REPORT_LUNS_POOL_EXCESS:
+		{
+			static const uint8_t pool_luns[] = { 0, 1, 3, 7, 2 };
+
 			put_be32(data, 0, 5 * STORVSC_REPORT_LUN_ENTRY_SIZE);
 			for (unsigned int i = 0; i < 5; i++)
 				data[9 + i * STORVSC_REPORT_LUN_ENTRY_SIZE] =
-					(uint8_t)i;
+					pool_luns[i];
 			response_transfer +=
 				5 * STORVSC_REPORT_LUN_ENTRY_SIZE;
 			break;
+		}
 		default:
 			abort();
 		}
@@ -695,7 +864,10 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 			data[1] = 0x83;
 			if (vpd_mode == VPD_MALFORMED ||
 			    (vpd_mode == VPD_MALFORMED_LUN2 &&
-			     controller == 0 && lun == 2)) {
+			     controller == 0 && lun == 2) ||
+			    (targeted_vpd_malformed &&
+			     controller == targeted_vpd_controller &&
+			     lun == targeted_vpd_lun)) {
 				put_be16(data, 2, 32);
 				response_transfer = 4;
 			} else {
@@ -704,10 +876,14 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 				data[5] = 3;
 				data[7] = 8;
 				data[8] = 0x50;
-				data[9] = (uint8_t)controller;
-				memcpy(data + 10,
-				       channel->device->instance_id.bytes, 5);
-				data[15] = lun;
+				if (vpd_mode != VPD_DUPLICATE) {
+					data[9] = (uint8_t)controller;
+					memcpy(data + 10,
+					       channel->device->instance_id.bytes,
+					       5);
+					data[15] = lun;
+					data[14] ^= vpd_variant;
+				}
 				response_transfer = 16;
 			}
 			range_write(range, data, response_transfer);
@@ -766,11 +942,25 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 	case 0x88:
 		last_io_id = id;
 		last_io_length = transfer;
+		last_io_opcode = opcode;
+		io_command_count++;
 		if (hold_io) {
-			fill_read_data(range, transfer,
-				       topology_fixture ?
-				       (uint8_t)(0x20 + controller * 0x10 + lun) :
-				       0x5a);
+			if (backing_media_enabled) {
+				uint64_t lba = scsi_io_lba(payload, opcode);
+
+				if (lba * 512 + transfer >
+				    sizeof(backing_media))
+					abort();
+				range_write(range, backing_media + lba * 512,
+					    transfer);
+			} else {
+				fill_read_data(
+					range, transfer,
+					topology_fixture ?
+					(uint8_t)(0x20 + controller * 0x10 +
+						  lun) :
+					0x5a);
+			}
 			if (pending_count >= 32)
 				abort();
 			pending[pending_count++] = (struct pending_io){
@@ -780,10 +970,18 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 			};
 			return;
 		}
-		fill_read_data(range, transfer,
-			       topology_fixture ?
-			       (uint8_t)(0x20 + controller * 0x10 + lun) :
-			       0x5a);
+		if (backing_media_enabled) {
+			uint64_t lba = scsi_io_lba(payload, opcode);
+
+			if (lba * 512 + transfer > sizeof(backing_media))
+				abort();
+			range_write(range, backing_media + lba * 512, transfer);
+		} else {
+			fill_read_data(range, transfer,
+				       topology_fixture ?
+				       (uint8_t)(0x20 + controller * 0x10 + lun) :
+				       0x5a);
+		}
 		if (short_transfer_once) {
 			response_transfer--;
 			short_transfer_once = 0;
@@ -793,6 +991,19 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 	case 0x8a:
 		last_io_id = id;
 		last_io_length = transfer;
+		last_io_opcode = opcode;
+		io_command_count++;
+		if (opcode == 0x2a)
+			write10_command_count++;
+		else
+			write16_command_count++;
+		if (backing_media_enabled) {
+			uint64_t lba = scsi_io_lba(payload, opcode);
+
+			if (lba * 512 + transfer > sizeof(backing_media))
+				abort();
+			range_read(range, backing_media + lba * 512, transfer);
+		}
 		if (hold_io) {
 			pending[pending_count++] = (struct pending_io){
 				.channel = channel,
@@ -805,6 +1016,19 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 	case 0x35:
 		last_io_id = id;
 		last_io_length = 0;
+		last_io_opcode = opcode;
+		io_command_count++;
+		flush_command_count++;
+		if (hold_io) {
+			if (pending_count >= 32)
+				abort();
+			pending[pending_count++] = (struct pending_io){
+				.channel = channel,
+				.id = id,
+				.length = 0,
+			};
+			return;
+		}
 		break;
 	default:
 		enqueue_completion_on(channel, id, packet_length, 0, 0x86,
@@ -930,6 +1154,8 @@ int vmbus_channel_close(struct vmbus_channel *channel)
 int vmbus_device_bind_epoch(struct vmbus_device *device,
 			    struct vmbus_device_bind_token *token)
 {
+	if (use_vmbus_offer_lifetimes)
+		return vmbus_epoch_object_bind_epoch(device, token);
 	if (!device || !token)
 		return -EINVAL;
 	token->device_generation = 1;
@@ -941,6 +1167,8 @@ int vmbus_device_bind_retry(
 	struct vmbus_device *device,
 	const struct vmbus_device_bind_token *token)
 {
+	if (use_vmbus_offer_lifetimes)
+		return vmbus_epoch_object_bind_retry(device, token);
 	if (!device || !token || !token->device_generation ||
 	    !token->resource_epoch)
 		return -EINVAL;
@@ -950,6 +1178,10 @@ int vmbus_device_bind_retry(
 
 void vmbus_device_bind_ready(void)
 {
+	if (use_vmbus_offer_lifetimes) {
+		vmbus_epoch_object_bind_ready();
+		return;
+	}
 	atomic_fetch_add(&bind_ready_calls, 1);
 	atomic_fetch_add(&bind_resource_epoch, 1);
 }
@@ -1122,13 +1354,91 @@ int uk_blkdev_drv_register(struct uk_blkdev *device,
 	data->drv_name = name;
 	data->a = allocator;
 	device->_data = data;
+	if (data->id >= sizeof(registered_blkdevs) /
+			 sizeof(registered_blkdevs[0])) {
+		free(data);
+		device->_data = NULL;
+		return -ENOSPC;
+	}
+	registered_blkdevs[data->id] = device;
 	return data->id;
 }
 
 void uk_blkdev_drv_unregister(struct uk_blkdev *device)
 {
 	unregister_calls++;
+	if (device->_data &&
+	    device->_data->id < sizeof(registered_blkdevs) /
+				       sizeof(registered_blkdevs[0]))
+		registered_blkdevs[device->_data->id] = NULL;
 	free(device->_data);
+	device->_data = NULL;
+}
+
+struct uk_blkdev *uk_blkdev_get(uint16_t id)
+{
+	if (id >= sizeof(registered_blkdevs) /
+			  sizeof(registered_blkdevs[0]))
+		return NULL;
+	return registered_blkdevs[id];
+}
+
+enum uk_blkdev_state uk_blkdev_state_get(struct uk_blkdev *device)
+{
+	return device && device->_data ?
+		device->_data->state : UK_BLKDEV_INVALID;
+}
+
+int uk_blkdev_configure(struct uk_blkdev *device,
+			const struct uk_blkdev_conf *config)
+{
+	int rc = device->dev_ops->dev_configure(device, config);
+
+	if (!rc)
+		device->_data->state = UK_BLKDEV_CONFIGURED;
+	return rc;
+}
+
+int uk_blkdev_queue_configure(struct uk_blkdev *device, uint16_t queue_id,
+			      uint16_t descriptors,
+			      const struct uk_blkdev_queue_conf *config)
+{
+	struct uk_blkdev_queue *queue = device->dev_ops->queue_configure(
+		device, queue_id, descriptors, config);
+
+	if ((uintptr_t)queue >= (uintptr_t)-4095)
+		return (int)(intptr_t)queue;
+	device->_queue[queue_id] = queue;
+	device->_data->queue_handler[queue_id].callback = config->callback;
+	device->_data->queue_handler[queue_id].cookie =
+		config->callback_cookie;
+	return 0;
+}
+
+int uk_blkdev_start(struct uk_blkdev *device)
+{
+	int rc = device->dev_ops->dev_start(device);
+
+	if (!rc)
+		device->_data->state = UK_BLKDEV_RUNNING;
+	return rc;
+}
+
+int uk_blkdev_queue_intr_enable(struct uk_blkdev *device, uint16_t queue_id)
+{
+	return device->dev_ops->queue_intr_enable(
+		device, device->_queue[queue_id]);
+}
+
+int uk_blkdev_queue_submit_one(struct uk_blkdev *device, uint16_t queue_id,
+			       struct uk_blkreq *request)
+{
+	return device->submit_one(device, device->_queue[queue_id], request);
+}
+
+int uk_blkdev_queue_finish_reqs(struct uk_blkdev *device, uint16_t queue_id)
+{
+	return device->finish_reqs(device, device->_queue[queue_id]);
 }
 
 static void fire_channel_on(struct vmbus_channel *channel)
@@ -1140,6 +1450,14 @@ static void fire_channel_on(struct vmbus_channel *channel)
 static void fire_channel(void)
 {
 	fire_channel_on(&host_channel);
+}
+
+static void enqueue_enumerate_bus(struct vmbus_channel *channel)
+{
+	uint8_t payload[4] = { 0 };
+
+	put_le32(payload, 0, 11);
+	enqueue_packet_on(channel, 0, payload, sizeof(payload));
 }
 
 static void initialize_request(struct uk_blkreq *request,
@@ -1163,6 +1481,19 @@ static void request_done(struct uk_blkreq *request, void *cookie)
 
 	(void)request;
 	atomic_fetch_add(count, 1);
+}
+
+static void retained_request_done(struct uk_blkreq *request, void *cookie)
+{
+	(void)request;
+	(void)cookie;
+	pthread_mutex_lock(&race_lock);
+	retained_callback_entered = 1;
+	pthread_cond_broadcast(&race_condition);
+	while (!retained_callback_release)
+		pthread_cond_wait(&race_condition, &race_lock);
+	retained_callback_count++;
+	pthread_mutex_unlock(&race_lock);
 }
 
 static void queue_event(struct uk_blkdev *device, uint16_t queue_id,
@@ -1392,6 +1723,18 @@ struct reset_thread_context {
 	int result;
 };
 
+struct add_thread_context {
+	struct vmbus_driver *driver;
+	struct vmbus_device *device;
+	atomic_int done;
+	int result;
+};
+
+struct rescind_thread_context {
+	__u32 channel_id;
+	int result;
+};
+
 static void *submit_thread(void *argument)
 {
 	struct submit_thread_context *context = argument;
@@ -1409,6 +1752,24 @@ static void *reset_thread(void *argument)
 
 	context->result = storvsc_host_reset_timed_out_io();
 	atomic_store(&context->done, 1);
+	return NULL;
+}
+
+static void *add_thread(void *argument)
+{
+	struct add_thread_context *context = argument;
+
+	context->result = context->driver->add_dev(context->device);
+	atomic_store(&context->done, 1);
+	return NULL;
+}
+
+static void *rescind_thread(void *argument)
+{
+	struct rescind_thread_context *context = argument;
+
+	context->result =
+		vmbus_bus_host_confirm_rescind(context->channel_id);
 	return NULL;
 }
 
@@ -1447,6 +1808,20 @@ static int wait_connection_fail_calls(unsigned int expected,
 		uk_sched_thread_sleep(1000000ULL);
 	}
 	return -ETIMEDOUT;
+}
+
+static void remove_test_offer(struct vmbus_driver *driver,
+			      struct vmbus_device *device)
+{
+	struct vmbus_offer_identity offer = {
+		.instance_id = device->instance_id,
+		.channel_id = device->channel_id,
+		.generation = 1,
+	};
+
+	driver->remove_dev(device);
+	if (driver->offer_removed)
+		driver->offer_removed(&offer);
 }
 
 static int wait_deferred_action(int expected, unsigned int limit_ms)
@@ -1842,7 +2217,7 @@ static int run_terminal_remove_quiesce(
 				   last_io_length);
 		fire_channel();
 	}
-	driver->remove_dev(vmbus_device);
+	remove_test_offer(driver, vmbus_device);
 	if (storvsc_host_online() ||
 	    storvsc_host_deferred_action() != TEST_DEFER_REMOVE ||
 	    !storvsc_host_worker_present() ||
@@ -2014,7 +2389,7 @@ static int run_close_failure_case(
 		if (atomic_load(&close_attempts) - attempts_before != attempts)
 			return error_base + 6;
 		configure_close_failure(0, 0);
-		driver->remove_dev(vmbus_device);
+		remove_test_offer(driver, vmbus_device);
 		if (storvsc_host_deferred_action() != TEST_DEFER_REMOVE ||
 		    !storvsc_host_worker_present() ||
 		    atomic_load(&callbacks))
@@ -2061,7 +2436,7 @@ static int run_close_remove_window(
 	storvsc_host_force_timeout();
 	if (wait_race_flag(&close_pause_entered))
 		return error_base + 1;
-	driver->remove_dev(vmbus_device);
+	remove_test_offer(driver, vmbus_device);
 	if (storvsc_host_deferred_action() != TEST_DEFER_REMOVE ||
 	    storvsc_host_has_channel() || atomic_load(&callbacks))
 		return error_base + 2;
@@ -2134,7 +2509,7 @@ static int run_busy_remove_upgrade(
 			error = error_base + 2;
 			goto out;
 		}
-		driver->remove_dev(vmbus_device);
+		remove_test_offer(driver, vmbus_device);
 		if (storvsc_host_deferred_action() != TEST_DEFER_REMOVE ||
 		    !storvsc_host_deferred_close_required() ||
 		    storvsc_host_deferred_wait_vmbus() ||
@@ -2155,7 +2530,7 @@ static int run_busy_remove_upgrade(
 			error = error_base + 2;
 			goto out;
 		}
-		driver->remove_dev(vmbus_device);
+		remove_test_offer(driver, vmbus_device);
 	}
 	if (wait_connection_fail_calls(failures_before + 1, 1000) ||
 	    !storvsc_host_deferred_wait_vmbus() ||
@@ -2410,7 +2785,7 @@ static void integrated_remove_hook(void *arg)
 {
 	struct integrated_disconnect_context *context = arg;
 
-	context->driver->remove_dev(context->vmbus_device);
+	remove_test_offer(context->driver, context->vmbus_device);
 	context->remove_observed_safe =
 		storvsc_host_deferred_action() == TEST_DEFER_REMOVE &&
 		storvsc_host_deferred_wait_vmbus() &&
@@ -2638,7 +3013,7 @@ static int run_completion_preservation(
 			return error_base + 4;
 		break;
 	case PRESERVE_REMOVE:
-		driver->remove_dev(vmbus_device);
+		remove_test_offer(driver, vmbus_device);
 		terminal_error = -ENODEV;
 		if (wait_worker_present(0, 1000))
 			return error_base + 5;
@@ -2664,7 +3039,7 @@ static int reoffer_device(struct vmbus_driver *driver,
 			  struct vmbus_device *vmbus_device,
 			  struct uk_blkdev *device)
 {
-	driver->remove_dev(vmbus_device);
+	remove_test_offer(driver, vmbus_device);
 	if (vmbus_device->channel)
 		(void)vmbus_channel_close(vmbus_device->channel);
 	if (!vmbus_bus_host_connection_live() &&
@@ -2711,6 +3086,9 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	};
 	struct uk_storvsc_mapping mappings[8];
 	struct uk_storvsc_mapping found;
+	struct uk_storvsc_inventory_snapshot inventory;
+	struct uk_storvsc_target_snapshot guarded_targets[3];
+	struct uk_storvsc_session guarded_sessions[3];
 	struct uk_blkdev *devices[4];
 	struct uk_blkreq requests[4];
 	struct uk_blkreq check;
@@ -2750,6 +3128,12 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	rc = driver->add_dev(&secondary);
 	if (rc || !storvsc_host_controller_online(1) ||
 	    uk_storvsc_mapping_count() != 2)
+		return 30;
+	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
+		return 30;
+	remove_test_offer(driver, &failed_offer);
+	if (uk_storvsc_inventory_get(&inventory) ||
+	    inventory.count != 2)
 		return 30;
 	primary->present = 1;
 	rc = driver->add_dev(primary);
@@ -2810,6 +3194,38 @@ static int run_topology_regression(struct vmbus_driver *driver,
 			return 38;
 	}
 	primary_events = *events;
+	storvsc_host_set_guarded_io(1);
+	if (uk_storvsc_target_get(0, &guarded_targets[0]) ||
+	    uk_storvsc_target_get(2, &guarded_targets[1]) ||
+	    uk_storvsc_target_get(3, &guarded_targets[2]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[0], &guarded_sessions[0]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[1], &guarded_sessions[1]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[2], &guarded_sessions[2]) ||
+	    uk_storvsc_session_authorize_write(&guarded_sessions[0]) ||
+	    uk_storvsc_session_authorize_write(&guarded_sessions[1]) !=
+		    -EBUSY ||
+	    uk_storvsc_session_authorize_write(&guarded_sessions[2]) !=
+		    -EROFS ||
+	    uk_storvsc_session_end(&guarded_sessions[0]) ||
+	    uk_storvsc_session_end(&guarded_sessions[1]) ||
+	    uk_storvsc_session_end(&guarded_sessions[2]))
+		return 426;
+	if (uk_storvsc_target_get(0, &guarded_targets[0]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[0], &guarded_sessions[0]))
+		return 427;
+	storvsc_host_set_guarded_io(1);
+	if (uk_storvsc_session_validate(
+		    &guarded_sessions[0], &guarded_targets[1]) != -ESTALE ||
+	    uk_storvsc_target_get(0, &guarded_targets[0]) ||
+	    uk_storvsc_session_begin_read(
+		    &guarded_targets[0], &guarded_sessions[0]) ||
+	    uk_storvsc_session_end(&guarded_sessions[0]))
+		return 428;
+	storvsc_host_set_guarded_io(0);
 
 	atomic_init(&callbacks, 0);
 	hold_io = 1;
@@ -2886,7 +3302,7 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	    pending_count != 2)
 		return 50;
 	primary_channel = primary->channel;
-	driver->remove_dev(primary);
+	remove_test_offer(driver, primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
 	if (requests[0].result != -ENODEV ||
@@ -3051,7 +3467,7 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	if (devices[1]->dev_ops->queue_intr_disable(
 		    devices[1], devices[1]->_queue[0]))
 		return 82;
-	driver->remove_dev(primary);
+	remove_test_offer(driver, primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
 	primary->present = 1;
@@ -3090,8 +3506,14 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	    !storvsc_host_controller_online(0) ||
 	    !storvsc_host_controller_online(1))
 		return 59;
+	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
+		return 59;
+	remove_test_offer(driver, &excess);
+	if (uk_storvsc_inventory_get(&inventory) ||
+	    inventory.count != 4)
+		return 59;
 
-	driver->remove_dev(primary);
+	remove_test_offer(driver, primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
 	vpd_mode = VPD_UNSUPPORTED;
@@ -3102,7 +3524,7 @@ static int run_topology_regression(struct vmbus_driver *driver,
 		if (uk_storvsc_mapping_get(i, &found) || found.vpd_length)
 			return 61;
 	}
-	driver->remove_dev(primary);
+	remove_test_offer(driver, primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
 
@@ -3112,23 +3534,39 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	    !storvsc_host_blkdev_address(0, 0) ||
 	    storvsc_host_blkdev_address(0, 2))
 		return 68;
-	driver->remove_dev(primary);
+	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
+		return 68;
+	remove_test_offer(driver, primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
 
-	driver->remove_dev(&secondary);
+	remove_test_offer(driver, &secondary);
 	if (secondary.channel)
 		(void)vmbus_channel_close(secondary.channel);
+	topology_fixture = 0;
+	report_luns_mode = REPORT_LUNS_NORMAL;
+	vpd_mode = VPD_NORMAL;
+	secondary.present = 1;
+	rc = driver->add_dev(&secondary);
+	if (rc)
+		return 62;
+	remove_test_offer(driver, &secondary);
+	if (secondary.channel)
+		(void)vmbus_channel_close(secondary.channel);
+	topology_fixture = 1;
 	report_luns_mode = REPORT_LUNS_POOL_EXCESS;
 	vpd_mode = VPD_NORMAL;
 	secondary.present = 1;
-	if (driver->add_dev(&secondary) ||
+	rc = driver->add_dev(&secondary);
+	if (rc ||
 	    uk_storvsc_mapping_count() != CONFIG_LIBSTORVSC_MAX_LUNS ||
 	    storvsc_host_blkdev_address(1, 4))
 		return 62;
-	for (unsigned int lun = 0; lun < CONFIG_LIBSTORVSC_MAX_LUNS; lun++) {
+	for (unsigned int i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
+		static const uint8_t pool_luns[] = { 0, 1, 3, 7 };
+
 		if (activate_device(storvsc_host_blkdev_address(1,
-							       (uint8_t)lun),
+							       pool_luns[i]),
 				    events))
 			return 63;
 	}
@@ -3151,12 +3589,1271 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	if (check.result || atomic_load(&callbacks) != 7)
 		return 66;
 
-	driver->remove_dev(&secondary);
+	remove_test_offer(driver, &secondary);
+	if (secondary.channel)
+		(void)vmbus_channel_close(secondary.channel);
+	vpd_mode = VPD_DUPLICATE;
+	secondary.present = 1;
+	primary->present = 1;
+	if (driver->add_dev(&secondary) || driver->add_dev(primary) ||
+	    uk_storvsc_mapping_count() != 4)
+		return 429;
+	for (unsigned int i = 0; i < 4; i++) {
+		if (uk_storvsc_mapping_get(i, &mappings[i]) ||
+		    mappings[i].vpd_length != 8 ||
+		    memcmp(mappings[i].vpd_id, mappings[0].vpd_id, 8))
+			return 430;
+	}
+	remove_test_offer(driver, primary);
+	if (primary->channel)
+		(void)vmbus_channel_close(primary->channel);
+	remove_test_offer(driver, &secondary);
 	if (secondary.channel)
 		(void)vmbus_channel_close(secondary.channel);
 	topology_fixture = 0;
 	vpd_mode = VPD_NORMAL;
 	report_luns_mode = REPORT_LUNS_NORMAL;
+	return 0;
+}
+
+static int target_for_device(struct uk_blkdev *device,
+			     struct uk_storvsc_target_snapshot *snapshot)
+{
+	unsigned int count = uk_storvsc_mapping_count();
+
+	for (unsigned int i = 0; i < count; i++) {
+		if (uk_storvsc_target_get(i, snapshot))
+			continue;
+		if (device && device->_data &&
+		    snapshot->mapping.blkdev_id == device->_data->id)
+			return 0;
+	}
+	return -ENOENT;
+}
+
+static int run_guarded_io_regression(
+	struct vmbus_driver *driver, struct vmbus_device *vmbus_device,
+	uint8_t *buffer, int *events)
+{
+	struct uk_storvsc_inventory_snapshot inventory;
+	struct uk_storvsc_target_snapshot target;
+	struct uk_storvsc_target_snapshot current;
+	struct uk_storvsc_session session;
+	struct uk_blkdev *device;
+	struct uk_blkreq request;
+	struct uk_blkreq request2;
+	atomic_int callbacks;
+	unsigned int sends;
+	uint64_t generation;
+	int rc;
+	report_luns_mode = REPORT_LUNS_NORMAL;
+	vpd_mode = VPD_NORMAL;
+	read_only_media = 0;
+	use_capacity16 = 0;
+	topology_fixture = 0;
+	backing_media_enabled = 1;
+	memset(backing_media, 0, sizeof(backing_media));
+	vmbus_device->present = 1;
+	if (driver->add_dev(vmbus_device))
+		return 500;
+	device = storvsc_host_blkdev_address(0, 0);
+	if (activate_device(device, events))
+		return 501;
+	if (target_for_device(device, &target) ||
+	    uk_storvsc_session_begin_read(&target, &session) != -ENOTSUP)
+		return 502;
+	storvsc_host_set_guarded_io(1);
+	if (target_for_device(device, &target) || !target.mapping.vpd_length)
+		return 502;
+	if (uk_storvsc_inventory_get(&inventory) ||
+	    inventory.version != UK_STORVSC_INVENTORY_SNAPSHOT_VERSION ||
+	    inventory.size != sizeof(inventory) ||
+	    inventory.topology_generation != target.topology_generation ||
+	    inventory.count != uk_storvsc_mapping_count())
+		return 502;
+	generation = target.controller_generation;
+
+	atomic_init(&callbacks, 0);
+	sends = io_command_count;
+	initialize_request(&request, UK_BLKREQ_READ, 0, 1, buffer,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EACCES || io_command_count != sends)
+		return 503;
+	initialize_request(&request, UK_BLKREQ_WRITE, 0, 1, buffer,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EACCES || io_command_count != sends)
+		return 504;
+	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EACCES || io_command_count != sends)
+		return 505;
+
+	current = target;
+	current.mapping.sectors++;
+	if (uk_storvsc_session_begin_read(&current, &session) != -ESTALE)
+		return 506;
+	current = target;
+	current.mapping.vpd_id[0] ^= 1;
+	if (uk_storvsc_session_begin_read(&current, &session) != -ESTALE)
+		return 506;
+	if (uk_storvsc_session_begin_read(&target, &session))
+		return 507;
+	for (unsigned int attempt = 0; ; attempt++) {
+		uk_sched_thread_sleep(1000000ULL);
+		rc = uk_storvsc_session_validate(&session, &current);
+		if (!rc)
+			break;
+		if (rc != -ESTALE || attempt == 99 ||
+		    target_for_device(device, &target) ||
+		    uk_storvsc_session_begin_read(&target, &session))
+			return 508;
+	}
+	if (memcmp(&target, &current, sizeof(target)))
+		return 508;
+
+	initialize_request(&request, UK_BLKREQ_READ, 1, 1, buffer,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result)
+		return 509;
+	sends = io_command_count;
+	initialize_request(&request, UK_BLKREQ_WRITE, 1, 1, buffer,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EACCES || io_command_count != sends)
+		return 510;
+	if (uk_storvsc_session_authorize_write(&session) ||
+	    uk_storvsc_session_set_cdb(&session, 9) != -EINVAL ||
+	    uk_storvsc_session_set_cdb(&session, UK_STORVSC_CDB_10))
+		return 511;
+	sends = io_command_count;
+	initialize_request(&request, UK_BLKREQ_WRITE, 1000, 1, buffer,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EINVAL || io_command_count != sends)
+		return 511;
+	initialize_request(&request, UK_BLKREQ_WRITE, 1, 1, buffer + 1,
+			   request_done, &callbacks);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+	    -EINVAL || io_command_count != sends)
+		return 511;
+
+	for (unsigned int i = 0; i < 16 * 512; i++)
+		buffer[i] = (uint8_t)(i * 17U + 3U);
+	initialize_request(&request, UK_BLKREQ_WRITE, 32, 16, buffer,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result ||
+	    last_io_opcode != 0x2a || last_pfn_count < 2)
+		return 512;
+	memset(buffer, 0, 16 * 512);
+	initialize_request(&request, UK_BLKREQ_READ, 32, 16, buffer,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result ||
+	    last_io_opcode != 0x28)
+		return 513;
+	for (unsigned int i = 0; i < 16 * 512; i++) {
+		if (buffer[i] != (uint8_t)(i * 17U + 3U))
+			return 514;
+	}
+
+	if (uk_storvsc_session_set_cdb(&session, UK_STORVSC_CDB_16))
+		return 515;
+	memset(buffer, 0xa7, 512);
+	initialize_request(&request, UK_BLKREQ_WRITE, 127, 1, buffer,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result ||
+	    last_io_opcode != 0x8a)
+		return 516;
+	initialize_request(&request, UK_BLKREQ_READ, 127, 1, buffer + 512,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result ||
+	    last_io_opcode != 0x88 ||
+	    memcmp(buffer, buffer + 512, 512))
+		return 517;
+
+	io_packet_error_once = 1;
+	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result != -EIO)
+		return 518;
+	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
+			   request_done, &callbacks);
+	if (submit_and_fire(device, &request) || request.result)
+		return 519;
+
+	hold_io = 1;
+	pending_count = 0;
+	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
+			   request_done, &callbacks);
+	if (!(device->submit_one(device, device->_queue[0], &request) &
+	      UK_BLKDEV_STATUS_SUCCESS))
+		return 520;
+	storvsc_host_force_timeout();
+	if (wait_finished(&request, 1000) ||
+	    request.result != -ETIMEDOUT)
+		return 521;
+	enqueue_completion(last_io_id, 64, 0, 1, 0, 0);
+	pending_count = 0;
+	fire_channel();
+	if (atomic_load(&callbacks) != 8)
+		return 522;
+	rc = uk_storvsc_session_validate(&session, &current);
+	if (rc != -ESTALE)
+		return 523;
+	remove_test_offer(driver, vmbus_device);
+	if (vmbus_device->channel)
+		(void)vmbus_channel_close(vmbus_device->channel);
+	hold_io = 0;
+	vmbus_device->present = 1;
+	if (driver->add_dev(vmbus_device) ||
+	    activate_device(device, events))
+		return 523;
+	rc = target_for_device(device, &current);
+	if (rc)
+		return 523;
+	rc = uk_storvsc_session_begin_read(&current, &session);
+	if (rc)
+		return 523;
+	rc = uk_storvsc_session_authorize_write(&session);
+	if (rc)
+		return 523;
+	if (uk_storvsc_session_set_cdb(
+		    &session, UK_STORVSC_CDB_16))
+		return 523;
+
+	hold_io = 1;
+	pending_count = 0;
+	initialize_request(&request, UK_BLKREQ_WRITE, 2, 1, buffer,
+			   request_done, &callbacks);
+	if (!(device->submit_one(device, device->_queue[0], &request) &
+	      UK_BLKDEV_STATUS_SUCCESS) ||
+	    uk_storvsc_session_end(&session) != -EBUSY)
+		return 524;
+	remove_test_offer(driver, vmbus_device);
+	if (request.result != -ENODEV ||
+	    atomic_load(&request.state.counter) != UK_BLKREQ_FINISHED ||
+	    uk_storvsc_session_validate(&session, &current) != -ESTALE)
+		return 525;
+	enqueue_completion(last_io_id, 64, 0, 1, 0, last_io_length);
+	pending_count = 0;
+	fire_channel();
+	if (atomic_load(&callbacks) != 9)
+		return 526;
+	if (vmbus_device->channel)
+		(void)vmbus_channel_close(vmbus_device->channel);
+	hold_io = 0;
+
+	vmbus_device->present = 1;
+	if (driver->add_dev(vmbus_device) ||
+	    target_for_device(device, &current) ||
+	    current.controller_generation == generation ||
+	    uk_storvsc_session_validate(&session, &target) != -ESTALE)
+		return 527;
+	if (uk_storvsc_session_begin_read(&current, &session) ||
+	    uk_storvsc_session_authorize_write(&session) ||
+	    uk_storvsc_session_end(&session))
+		return 528;
+
+	{
+		struct vmbus_channel *enumerate_channel =
+			vmbus_device->channel;
+		unsigned int callbacks_before =
+			(unsigned int)atomic_load(&callbacks);
+
+		if (uk_storvsc_session_begin_read(&current, &session) ||
+		    uk_storvsc_session_authorize_write(&session))
+			return 530;
+		hold_io = 1;
+		pending_count = 0;
+		initialize_request(&request, UK_BLKREQ_WRITE, 4, 1, buffer,
+				   request_done, &callbacks);
+		if (!(device->submit_one(device, device->_queue[0], &request) &
+		      UK_BLKDEV_STATUS_SUCCESS) ||
+		    pending_count != 1)
+			return 531;
+		enqueue_enumerate_bus(enumerate_channel);
+		fire_channel_on(enumerate_channel);
+		sends = io_command_count;
+		initialize_request(&request2, UK_BLKREQ_READ, 5, 1,
+				   buffer + 512, request_done, &callbacks);
+		if (uk_storvsc_session_validate(&session, &target) !=
+			    -ESTALE ||
+		    device->submit_one(device, device->_queue[0],
+				       &request2) != -ENODEV ||
+		    io_command_count != sends)
+			return 532;
+		enqueue_completion_on(
+			enumerate_channel, pending[0].id, 64, 0, 1, 0,
+			pending[0].length);
+		if (wait_finished(&request, 1000) ||
+		    request.result != -ESTALE ||
+		    atomic_load(&callbacks) !=
+			    (int)callbacks_before + 1)
+			return 533;
+		fire_channel_on(enumerate_channel);
+		if (atomic_load(&callbacks) !=
+		    (int)callbacks_before + 1)
+			return 534;
+		pending_count = 0;
+		hold_io = 0;
+		if (reoffer_device(driver, vmbus_device, device) ||
+		    target_for_device(device, &current) ||
+		    uk_storvsc_session_validate(&session, &target) !=
+			    -ESTALE ||
+		    uk_storvsc_session_begin_read(&current, &session) ||
+		    uk_storvsc_session_end(&session))
+			return 535;
+	}
+
+	remove_test_offer(driver, vmbus_device);
+	if (vmbus_device->channel)
+		(void)vmbus_channel_close(vmbus_device->channel);
+	vpd_mode = VPD_UNSUPPORTED;
+	vmbus_device->present = 1;
+	if (driver->add_dev(vmbus_device) ||
+	    target_for_device(device, &current) ||
+	    current.mapping.vpd_length ||
+	    uk_storvsc_session_begin_read(&current, &session) != -EINVAL)
+		return 529;
+	remove_test_offer(driver, vmbus_device);
+	if (vmbus_device->channel)
+		(void)vmbus_channel_close(vmbus_device->channel);
+
+	storvsc_host_set_guarded_io(0);
+	backing_media_enabled = 0;
+	vpd_mode = VPD_NORMAL;
+	return 0;
+}
+
+static int persistence_prepare_seed(unsigned int identity_policy,
+				    int boot_signature,
+				    uint64_t sectors, uint8_t lun,
+				    int wrong_id)
+{
+	struct hyperv_acceptance_persistence_expected expected = {
+		.run_id = {
+			0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+			0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+		},
+		.disk_id = {
+			0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+			0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
+		},
+		.sectors = sectors,
+		.sector_size = 512,
+		.path_id = 0,
+		.target_id = 0,
+		.lun = lun,
+		.identity_policy = identity_policy,
+	};
+	uint8_t manifest[HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
+
+	memset(backing_media, 0, sizeof(backing_media));
+	if (wrong_id)
+		expected.run_id[0] ^= 0x80;
+	if (hyperv_acceptance_persistence_build_manifest(
+		    &expected, manifest))
+		return -EINVAL;
+	memcpy(backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_SEED0_LBA * 512,
+	       manifest, sizeof(manifest));
+	memcpy(backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_SEED1_LBA * 512,
+	       manifest, sizeof(manifest));
+	if (boot_signature) {
+		backing_media[510] = 0x55;
+		backing_media[511] = 0xaa;
+	}
+	return 0;
+}
+
+static void persistence_remove_device(struct vmbus_driver *driver,
+				      struct vmbus_device *device)
+{
+	if (!device->present && !device->channel)
+		return;
+	remove_test_offer(driver, device);
+	if (device->channel)
+		(void)vmbus_channel_close(device->channel);
+}
+
+enum unresolved_discovery_case {
+	UNRESOLVED_DISCOVERY_VPD,
+	UNRESOLVED_DISCOVERY_INQUIRY,
+	UNRESOLVED_DISCOVERY_CAPACITY,
+	UNRESOLVED_DISCOVERY_REGISTRATION,
+	UNRESOLVED_DISCOVERY_ALL_VPD,
+};
+
+static int run_unresolved_discovery_case(
+	struct vmbus_driver *driver, struct vmbus_device *primary,
+	struct vmbus_device *secondary,
+	enum unresolved_discovery_case failure, int run_guest)
+{
+	struct uk_storvsc_inventory_snapshot inventory;
+	unsigned int writes10 = write10_command_count;
+	unsigned int writes16 = write16_command_count;
+	unsigned int flushes = flush_command_count;
+	int inventory_rc;
+	int rc;
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2,
+		    0, 1000, 0, 0))
+		return 650;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 651;
+
+	targeted_vpd_malformed =
+		failure == UNRESOLVED_DISCOVERY_VPD;
+	targeted_vpd_controller = 1;
+	targeted_vpd_lun = 0;
+	discovery_failure_kind =
+		failure == UNRESOLVED_DISCOVERY_INQUIRY ?
+			DISCOVERY_FAILURE_INQUIRY :
+		failure == UNRESOLVED_DISCOVERY_CAPACITY ?
+			DISCOVERY_FAILURE_CAPACITY :
+			DISCOVERY_FAILURE_NONE;
+	discovery_failure_controller = 1;
+	discovery_failure_lun = 0;
+	discovery_failures_remaining =
+		discovery_failure_kind != DISCOVERY_FAILURE_NONE;
+	registration_failure_controller = 1;
+	registration_failure_lun = 0;
+	registration_failures_remaining =
+		failure == UNRESOLVED_DISCOVERY_REGISTRATION;
+	if (failure == UNRESOLVED_DISCOVERY_ALL_VPD)
+		vpd_mode = VPD_MALFORMED;
+	secondary->present = 1;
+	rc = driver->add_dev(secondary);
+	targeted_vpd_malformed = 0;
+	discovery_failure_kind = DISCOVERY_FAILURE_NONE;
+	discovery_failures_remaining = 0;
+	registration_failures_remaining = 0;
+	vpd_mode = VPD_NORMAL;
+	inventory_rc = uk_storvsc_inventory_get(&inventory);
+	if ((failure == UNRESOLVED_DISCOVERY_ALL_VPD ?
+		     rc != -EPROTO : rc) ||
+	    uk_storvsc_mapping_count() !=
+		    (failure == UNRESOLVED_DISCOVERY_ALL_VPD ? 3U : 5U)) {
+		persistence_remove_device(driver, secondary);
+		persistence_remove_device(driver, primary);
+		return 652;
+	}
+	if (inventory_rc == -EAGAIN &&
+	    failure != UNRESOLVED_DISCOVERY_ALL_VPD &&
+	    storvsc_host_reset_controller(1)) {
+		persistence_remove_device(driver, secondary);
+		persistence_remove_device(driver, primary);
+		return 653;
+	}
+	if (inventory_rc == -EAGAIN)
+		inventory_rc = uk_storvsc_inventory_get(&inventory);
+	if (run_guest &&
+	    (hyperv_acceptance_persistence_main() != HYPERV_ACCEPTANCE_FAIL ||
+	     write10_command_count != writes10 ||
+	     write16_command_count != writes16 ||
+	     flush_command_count != flushes)) {
+		persistence_remove_device(driver, secondary);
+		persistence_remove_device(driver, primary);
+		return 655;
+	}
+	if (inventory_rc != -EAGAIN) {
+		persistence_remove_device(driver, secondary);
+		persistence_remove_device(driver, primary);
+		return 654;
+	}
+	persistence_remove_device(driver, secondary);
+	if (uk_storvsc_inventory_get(&inventory) ||
+	    inventory.count != 3) {
+		persistence_remove_device(driver, primary);
+		return 656;
+	}
+	if (failure == UNRESOLVED_DISCOVERY_VPD) {
+		secondary->present = 1;
+		if (driver->add_dev(secondary) ||
+		    uk_storvsc_inventory_get(&inventory) ||
+		    inventory.count != 6 ||
+		    hyperv_acceptance_persistence_main() !=
+			    HYPERV_ACCEPTANCE_FAIL ||
+		    write10_command_count != writes10 ||
+		    write16_command_count != writes16 ||
+		    flush_command_count != flushes) {
+			persistence_remove_device(driver, secondary);
+			persistence_remove_device(driver, primary);
+			return 657;
+		}
+		persistence_remove_device(driver, secondary);
+	}
+	persistence_remove_device(driver, primary);
+	return 0;
+}
+
+enum vmbus_offer_lifetime_case {
+	VMBUS_OFFER_FAILED_CLOSE,
+	VMBUS_OFFER_NORMAL_CLOSE,
+	VMBUS_OFFER_POOL_FAILURE,
+};
+
+static int run_vmbus_offer_lifetime_case(
+	struct vmbus_driver *driver,
+	const struct vmbus_guid *primary_id,
+	const struct vmbus_guid *secondary_id,
+	enum vmbus_offer_lifetime_case failure)
+{
+	struct vmbus_guid pool_id = {
+		.bytes = {
+			3, 1, 2, 3, 4, 5, 6, 7,
+			8, 9, 10, 11, 12, 13, 14, 15,
+		},
+	};
+	struct uk_storvsc_inventory_snapshot inventory;
+	const __u32 primary_channel = 201;
+	const __u32 failed_channel = 202;
+	const struct vmbus_guid *failed_id =
+		failure == VMBUS_OFFER_POOL_FAILURE ?
+			&pool_id : secondary_id;
+	unsigned int close_attempts_before =
+		atomic_load(&close_attempts);
+	unsigned int writes10 = write10_command_count;
+	unsigned int writes16 = write16_command_count;
+	unsigned int flushes = flush_command_count;
+	__u64 failed_generation;
+	int inventory_rc;
+	int error = 0;
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2,
+		    0, 1000, 0, 0))
+		return 660;
+	report_luns_mode = REPORT_LUNS_NORMAL;
+	topology_fixture = 0;
+	vpd_mode = VPD_NORMAL;
+	storvsc_host_set_guarded_io(1);
+	storvsc_host_set_lun_discovery(1);
+	read_only_media = 0;
+	use_capacity16 = 0;
+	hold_io = 0;
+	pending_count = 0;
+	if (vmbus_bus_host_offer_lifetime_setup(driver))
+		return 661;
+	use_vmbus_offer_lifetimes = 1;
+	if (vmbus_bus_host_offer_storage(
+		    primary_id, primary_channel, primary_channel + 100) ||
+	    !vmbus_bus_host_offer_present(primary_channel)) {
+		error = 662;
+		goto out;
+	}
+	if (failure != VMBUS_OFFER_POOL_FAILURE)
+		vpd_mode = VPD_MALFORMED;
+	if (failure == VMBUS_OFFER_FAILED_CLOSE)
+		configure_close_failure(
+			-EBUSY, TEST_CLOSE_RETRY_LIMIT);
+	if (vmbus_bus_host_offer_storage(
+		    failed_id, failed_channel, failed_channel + 100) ||
+	    !vmbus_bus_host_offer_present(failed_channel) ||
+	    !(failed_generation =
+		      vmbus_bus_host_offer_generation(failed_channel))) {
+		error = 663;
+		goto out;
+	}
+	vpd_mode = VPD_NORMAL;
+	configure_close_failure(0, 0);
+	if (failure == VMBUS_OFFER_FAILED_CLOSE &&
+	    atomic_load(&close_attempts) - close_attempts_before !=
+		    TEST_CLOSE_RETRY_LIMIT + 1) {
+		error = 664;
+		goto out;
+	}
+	inventory_rc = uk_storvsc_inventory_get(&inventory);
+	if (uk_storvsc_mapping_count() != 3) {
+		error = 665;
+		goto out;
+	}
+	if (hyperv_acceptance_persistence_main() !=
+		    HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes) {
+		error = 666;
+		goto out;
+	}
+	if (inventory_rc != -EAGAIN) {
+		error = 665;
+		goto out;
+	}
+	if (driver->offer_removed) {
+		struct vmbus_offer_identity stale = {
+			.instance_id = *failed_id,
+			.channel_id = failed_channel,
+			.generation = failed_generation == 1 ?
+				2 : failed_generation - 1,
+		};
+
+		driver->offer_removed(&stale);
+		if (uk_storvsc_inventory_get(&inventory) != -EAGAIN) {
+			error = 668;
+			goto out;
+		}
+	}
+	if (vmbus_bus_host_confirm_rescind(failed_channel) ||
+	    vmbus_bus_host_offer_present(failed_channel) ||
+	    uk_storvsc_inventory_get(&inventory) ||
+	    inventory.count != 3) {
+		error = 667;
+		goto out;
+	}
+out:
+	vpd_mode = VPD_NORMAL;
+	configure_close_failure(0, 0);
+	if (vmbus_bus_host_offer_present(failed_channel))
+		(void)vmbus_bus_host_confirm_rescind(failed_channel);
+	if (vmbus_bus_host_offer_present(primary_channel))
+		(void)vmbus_bus_host_confirm_rescind(primary_channel);
+	use_vmbus_offer_lifetimes = 0;
+	storvsc_host_set_guarded_io(0);
+	return error;
+}
+
+static int run_vmbus_reoffer_cleanup_case(
+	struct vmbus_driver *driver,
+	const struct vmbus_guid *primary_id,
+	const struct vmbus_guid *secondary_id,
+	uint8_t *buffer)
+{
+	struct uk_storvsc_inventory_snapshot inventory;
+	struct uk_storvsc_target_snapshot target;
+	struct uk_storvsc_session session;
+	struct rescind_thread_context rescind = {
+		.channel_id = 212,
+	};
+	struct uk_blkdev *secondary;
+	struct uk_blkreq request;
+	pthread_t rescind_tid;
+	unsigned int writes10;
+	unsigned int writes16;
+	unsigned int flushes;
+	int events = 0;
+	int guest_rc;
+	int inventory_rc;
+	int submit_rc;
+	int rescind_created = 0;
+	int error = 0;
+
+	hyperv_acceptance_persistence_host_reset();
+	hyperv_acceptance_persistence_host_set_identity_policy(
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2);
+	if (persistence_prepare_seed(
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2,
+		    0, 1000, 0, 0))
+		return 670;
+	report_luns_mode = REPORT_LUNS_NORMAL;
+	topology_fixture = 0;
+	vpd_mode = VPD_NORMAL;
+	storvsc_host_set_guarded_io(1);
+	storvsc_host_set_lun_discovery(1);
+	read_only_media = 0;
+	use_capacity16 = 0;
+	backing_media_enabled = 1;
+	hold_io = 0;
+	pending_count = 0;
+	if (vmbus_bus_host_offer_lifetime_setup(driver))
+		return 671;
+	use_vmbus_offer_lifetimes = 1;
+	if (vmbus_bus_host_offer_storage(primary_id, 211, 311) ||
+	    vmbus_bus_host_offer_storage(secondary_id, 212, 312)) {
+		error = 672;
+		goto out;
+	}
+	secondary = storvsc_host_blkdev_address(1, 0);
+	if (!secondary) {
+		error = 673;
+		goto out;
+	}
+	error = activate_device(secondary, &events);
+	if (error) {
+		error = 674;
+		goto out;
+	}
+	if (target_for_device(secondary, &target) ||
+	    uk_storvsc_session_begin_read(&target, &session)) {
+		error = 675;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	retained_callback_entered = 0;
+	retained_callback_release = 0;
+	retained_callback_count = 0;
+	pthread_mutex_unlock(&race_lock);
+	hold_io = 1;
+	initialize_request(&request, UK_BLKREQ_READ, 8, 1, buffer,
+			   retained_request_done, NULL);
+	submit_rc = secondary->submit_one(
+		secondary, secondary->_queue[0], &request);
+	if (submit_rc < 0 ||
+	    !(submit_rc & UK_BLKDEV_STATUS_SUCCESS)) {
+		error = 676;
+		goto out;
+	}
+	if (pending_count != 1) {
+		error = 676;
+		goto out;
+	}
+	if (pthread_create(&rescind_tid, NULL, rescind_thread, &rescind)) {
+		error = 677;
+		goto out;
+	}
+	rescind_created = 1;
+	if (wait_race_flag(&retained_callback_entered)) {
+		error = 678;
+		goto out;
+	}
+	if (vmbus_bus_host_offer_storage(secondary_id, 213, 313) ||
+	    !vmbus_bus_host_offer_present(213) ||
+	    uk_storvsc_inventory_get(&inventory) != -EAGAIN) {
+		error = 679;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	retained_callback_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	pthread_join(rescind_tid, NULL);
+	rescind_created = 0;
+	if (rescind.result || retained_callback_count != 1 ||
+	    request.result != -ENODEV ||
+	    storvsc_host_controller_online(1)) {
+		error = 680;
+		goto out;
+	}
+	hold_io = 0;
+	pending_count = 0;
+	drop_packets();
+
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	inventory_rc = uk_storvsc_inventory_get(&inventory);
+	guest_rc = hyperv_acceptance_persistence_main();
+	if (inventory_rc != -EAGAIN ||
+	    guest_rc != HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes) {
+		error = 681;
+		goto out;
+	}
+	if (vmbus_bus_host_confirm_rescind(213) ||
+	    uk_storvsc_inventory_get(&inventory) ||
+	    inventory.count != 3) {
+		error = 682;
+		goto out;
+	}
+
+out:
+	pthread_mutex_lock(&race_lock);
+	retained_callback_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	if (rescind_created)
+		pthread_join(rescind_tid, NULL);
+	hold_io = 0;
+	pending_count = 0;
+	drop_packets();
+	if (vmbus_bus_host_offer_present(213))
+		(void)vmbus_bus_host_confirm_rescind(213);
+	if (vmbus_bus_host_offer_present(212))
+		(void)vmbus_bus_host_confirm_rescind(212);
+	if (vmbus_bus_host_offer_present(211))
+		(void)vmbus_bus_host_confirm_rescind(211);
+	use_vmbus_offer_lifetimes = 0;
+	backing_media_enabled = 0;
+	hyperv_acceptance_persistence_host_set_identity_policy(0);
+	hyperv_acceptance_persistence_host_reset();
+	storvsc_host_set_guarded_io(0);
+	return error;
+}
+
+static int run_vmbus_offer_lifetime_regression(
+	struct vmbus_driver *driver, const struct vmbus_device *primary,
+	uint8_t *buffer)
+{
+	struct vmbus_guid secondary_id = {
+		.bytes = {
+			2, 1, 2, 3, 4, 5, 6, 7,
+			8, 9, 10, 11, 12, 13, 14, 15,
+		},
+	};
+	int rc;
+
+	rc = run_vmbus_offer_lifetime_case(
+		driver, &primary->instance_id, &secondary_id,
+		VMBUS_OFFER_FAILED_CLOSE);
+	if (rc)
+		return rc;
+	rc = run_vmbus_offer_lifetime_case(
+		driver, &primary->instance_id, &secondary_id,
+		VMBUS_OFFER_NORMAL_CLOSE);
+	if (rc)
+		return rc;
+	rc = run_vmbus_offer_lifetime_case(
+		driver, &primary->instance_id, &secondary_id,
+		VMBUS_OFFER_POOL_FAILURE);
+	if (rc)
+		return rc;
+	return run_vmbus_reoffer_cleanup_case(
+		driver, &primary->instance_id, &secondary_id, buffer);
+}
+
+static int run_binding_publication_regression(
+	struct vmbus_driver *driver, struct vmbus_device *secondary)
+{
+	struct uk_storvsc_inventory_snapshot before;
+	struct uk_storvsc_inventory_snapshot after;
+	struct uk_storvsc_target_snapshot target;
+	struct uk_storvsc_target_snapshot during_target;
+	struct uk_storvsc_session session;
+	struct uk_storvsc_session during_session;
+	struct add_thread_context add_context = {
+		.driver = driver,
+		.device = secondary,
+	};
+	struct uk_blkdev *device;
+	struct uk_blkreq request;
+	pthread_t add_tid;
+	unsigned int sends;
+	unsigned int writes10;
+	unsigned int writes16;
+	unsigned int flushes;
+	int add_created = 0;
+	int error = 0;
+
+	device = storvsc_host_blkdev_address(0, 0);
+	if (!device || uk_storvsc_inventory_get(&before) ||
+	    target_for_device(device, &target) ||
+	    target.topology_generation != before.topology_generation ||
+	    uk_storvsc_session_begin_read(&target, &session))
+		return 620;
+	pthread_mutex_lock(&race_lock);
+	binding_publish_pause = 1;
+	binding_publish_controller = 1;
+	binding_publish_entered = 0;
+	binding_publish_release = 0;
+	pthread_mutex_unlock(&race_lock);
+	atomic_init(&add_context.done, 0);
+	secondary->present = 1;
+	if (pthread_create(&add_tid, NULL, add_thread, &add_context)) {
+		error = 621;
+		goto out;
+	}
+	add_created = 1;
+	if (wait_race_flag(&binding_publish_entered)) {
+		error = 622;
+		goto out;
+	}
+	if (uk_storvsc_session_authorize_write(&session) != -ESTALE) {
+		error = 623;
+		goto out;
+	}
+	if (uk_storvsc_inventory_get(&after) != -EAGAIN ||
+	    uk_storvsc_mapping_count() != before.count) {
+		error = 624;
+		goto out;
+	}
+	if (target_for_device(device, &during_target) ||
+	    during_target.topology_generation ==
+		    before.topology_generation ||
+	    uk_storvsc_session_begin_read(
+		    &during_target, &during_session)) {
+		error = 625;
+		goto out;
+	}
+out:
+	pthread_mutex_lock(&race_lock);
+	binding_publish_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	if (add_created)
+		pthread_join(add_tid, NULL);
+	pthread_mutex_lock(&race_lock);
+	binding_publish_pause = 0;
+	binding_publish_entered = 0;
+	binding_publish_release = 0;
+	pthread_mutex_unlock(&race_lock);
+	if (error)
+		return error;
+	if (!atomic_load(&add_context.done) || add_context.result)
+		return 626;
+	{
+		int inventory_rc = uk_storvsc_inventory_get(&after);
+		int authorize_rc = uk_storvsc_session_authorize_write(
+			&during_session);
+
+		if (inventory_rc ||
+		    after.topology_generation ==
+			    during_target.topology_generation ||
+		    after.count <= before.count ||
+		    authorize_rc != -ESTALE) {
+			fprintf(stderr,
+				"binding publication: inventory=%d "
+				"generation=%" PRIu64 "/%" PRIu64
+				" count=%u/%u authorize=%d\n",
+				inventory_rc, after.topology_generation,
+				during_target.topology_generation,
+				after.count, before.count, authorize_rc);
+			return 627;
+		}
+	}
+	sends = io_command_count;
+	initialize_request(&request, UK_BLKREQ_WRITE, 0, 1,
+			   backing_media, NULL, NULL);
+	if (device->submit_one(device, device->_queue[0], &request) !=
+		    -EACCES ||
+	    io_command_count != sends)
+		return 628;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	if (hyperv_acceptance_persistence_main() !=
+		    HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 629;
+	return 0;
+}
+
+static int persistence_expect_no_write_failure(
+	struct vmbus_driver *driver, struct vmbus_device *device)
+{
+	unsigned int writes10 = write10_command_count;
+	unsigned int writes16 = write16_command_count;
+	unsigned int flushes = flush_command_count;
+	int rc;
+
+	hyperv_acceptance_persistence_host_reset();
+	device->present = 1;
+	rc = driver->add_dev(device);
+	if (rc)
+		return rc;
+	rc = hyperv_acceptance_persistence_main();
+	persistence_remove_device(driver, device);
+	if (rc != HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return -EIO;
+	return 0;
+}
+
+static int run_persistence_workflow_regression(
+	struct vmbus_driver *driver, struct vmbus_device *primary,
+	unsigned int identity_policy)
+{
+	struct vmbus_device secondary = {
+		.channel_id = 47,
+		.connection_id = 147,
+		.instance_id = {
+			.bytes = { 2, 1, 2, 3, 4, 5, 6, 7,
+				   8, 9, 10, 11, 12, 13, 14, 15 },
+		},
+		.present = 1,
+	};
+	unsigned int writes10;
+	unsigned int writes16;
+	unsigned int flushes;
+	unsigned int commands;
+	uint8_t saved_intent;
+	uint8_t saved_receipt;
+	uint8_t saved_receipt_sector[
+		HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE];
+	int rc;
+
+	storvsc_host_set_guarded_io(1);
+	storvsc_host_set_lun_discovery(1);
+	report_luns_mode = REPORT_LUNS_NORMAL;
+	topology_fixture = 0;
+	vpd_mode = VPD_NORMAL;
+	read_only_media = 0;
+	use_capacity16 = 0;
+	backing_media_enabled = 1;
+	hold_io = 0;
+	pending_count = 0;
+	persistence_hook_mode = PERSISTENCE_HOOK_NONE;
+	persistence_hook_fired = 0;
+	persistence_hook_end_error = 0;
+	persistence_hook_timeouts = 0;
+	hyperv_acceptance_persistence_host_reset();
+	hyperv_acceptance_persistence_host_set_identity_policy(identity_policy);
+	if (hyperv_acceptance_persistence_host_mapping_in_scope(
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1,
+		    4, 5, 0, 1000, 512) ||
+	    !hyperv_acceptance_persistence_host_mapping_in_scope(
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2,
+		    4, 5, 0, 1000, 512) ||
+	    hyperv_acceptance_persistence_host_mapping_in_scope(
+		    identity_policy, 0, 0, 1, 1000, 512) ||
+	    hyperv_acceptance_persistence_host_mapping_in_scope(
+		    identity_policy, 0, 0, 0, 999, 512))
+		return 643;
+	if (persistence_prepare_seed(
+		    identity_policy, 0, 1000, 0, 0))
+		return 600;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 601;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_PASS ||
+	    write10_command_count <= writes10 ||
+	    write16_command_count <= writes16 ||
+	    flush_command_count <= flushes)
+		return 602;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_PASS ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 603;
+	saved_receipt =
+		backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA *
+			      512 + 40];
+	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512 +
+		      40] ^= 0x80;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 604;
+	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512 +
+		      40] = saved_receipt;
+	saved_intent =
+		backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_INTENT_LBA *
+			      512 + 80];
+	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_INTENT_LBA * 512 +
+		      80] ^= 0x40;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 630;
+	backing_media[HYPERV_ACCEPTANCE_PERSISTENCE_INTENT_LBA * 512 +
+		      80] = saved_intent;
+	memcpy(saved_receipt_sector,
+	       backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512,
+	       sizeof(saved_receipt_sector));
+	memset(backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512,
+	       0, HYPERV_ACCEPTANCE_PERSISTENCE_SECTOR_SIZE);
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 631;
+	memcpy(backing_media +
+		       HYPERV_ACCEPTANCE_PERSISTENCE_RECEIPT_LBA * 512,
+	       saved_receipt_sector, sizeof(saved_receipt_sector));
+	persistence_remove_device(driver, primary);
+
+	if (identity_policy ==
+	    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2) {
+		vpd_variant = 1;
+		rc = persistence_expect_no_write_failure(driver, primary);
+		vpd_variant = 0;
+		if (rc)
+			return 633;
+
+		if (persistence_prepare_seed(
+			    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1,
+			    0, 1000, 0, 0) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 634;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 1000, 0, 1) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 635;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 999, 0, 0) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 636;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 1000, 1, 0) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 637;
+		if (persistence_prepare_seed(
+			    identity_policy, 1, 1000, 0, 0) ||
+		    persistence_expect_no_write_failure(driver, primary))
+			return 638;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 1000, 0, 0))
+			return 639;
+		vpd_mode = VPD_UNSUPPORTED;
+		rc = persistence_expect_no_write_failure(driver, primary);
+		vpd_mode = VPD_NORMAL;
+		if (rc)
+			return 640;
+		if (persistence_prepare_seed(
+			    identity_policy, 0, 1000, 0, 0))
+			return 641;
+		read_only_media = 1;
+		rc = persistence_expect_no_write_failure(driver, primary);
+		read_only_media = 0;
+		if (rc)
+			return 642;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_VPD, 1);
+		if (rc)
+			return rc;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_INQUIRY, 0);
+		if (rc)
+			return rc;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_CAPACITY, 0);
+		if (rc)
+			return rc;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_REGISTRATION, 0);
+		if (rc)
+			return rc;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_ALL_VPD, 1);
+		if (rc)
+			return rc;
+	}
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(
+		    identity_policy, 0, 1000, 0, 0))
+		return 617;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 618;
+	secondary.present = 1;
+	rc = run_binding_publication_regression(driver, &secondary);
+	if (rc)
+		return rc;
+	persistence_remove_device(driver, &secondary);
+	persistence_remove_device(driver, primary);
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(
+		    identity_policy, 0, 1000, 0, 0))
+		return 605;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 606;
+	persistence_hook_driver = driver;
+	persistence_hook_device = &secondary;
+	persistence_hook_mode = PERSISTENCE_HOOK_ADD_BEFORE_REVALIDATE;
+	persistence_hook_fired = 0;
+	persistence_hook_end_error = 0;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL || !persistence_hook_fired ||
+	    persistence_hook_end_error != -ESTALE ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 607;
+	persistence_remove_device(driver, &secondary);
+	persistence_remove_device(driver, primary);
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(
+		    identity_policy, 1, 1000, 0, 0))
+		return 608;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 609;
+	secondary.present = 1;
+	persistence_hook_mode = PERSISTENCE_HOOK_ADD_BEFORE_REJECT_END;
+	persistence_hook_fired = 0;
+	persistence_hook_end_error = 0;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL || !persistence_hook_fired ||
+	    persistence_hook_end_error != -ESTALE ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 610;
+	persistence_remove_device(driver, &secondary);
+	persistence_remove_device(driver, primary);
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(
+		    identity_policy, 0, 1000, 0, 0))
+		return 611;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 612;
+	persistence_hook_mode = PERSISTENCE_HOOK_NONE;
+	persistence_hook_fired = 0;
+	persistence_hook_end_error = 0;
+	persistence_hook_timeouts = 0;
+	hold_io = 1;
+	pending_count = 0;
+	writes10 = write10_command_count;
+	writes16 = write16_command_count;
+	flushes = flush_command_count;
+	rc = hyperv_acceptance_persistence_main();
+	if (rc != HYPERV_ACCEPTANCE_FAIL || pending_count != 1 ||
+	    persistence_hook_timeouts != 1 ||
+	    persistence_hook_end_error != -EBUSY ||
+	    !hyperv_acceptance_persistence_host_request_owned() ||
+	    hyperv_acceptance_persistence_host_request_done() ||
+	    write10_command_count != writes10 ||
+	    write16_command_count != writes16 ||
+	    flush_command_count != flushes)
+		return 613;
+	commands = io_command_count;
+	if (hyperv_acceptance_persistence_main() != HYPERV_ACCEPTANCE_FAIL ||
+	    io_command_count != commands)
+		return 614;
+	complete_pending(2);
+	pending_count = 0;
+	fire_channel_on(primary->channel);
+	if (!hyperv_acceptance_persistence_host_request_owned() ||
+	    !hyperv_acceptance_persistence_host_request_done())
+		return 615;
+	commands = io_command_count;
+	if (hyperv_acceptance_persistence_main() != HYPERV_ACCEPTANCE_FAIL ||
+	    io_command_count != commands)
+		return 616;
+	hold_io = 0;
+	hyperv_acceptance_persistence_host_reset();
+	persistence_remove_device(driver, primary);
+
+	persistence_hook_driver = NULL;
+	persistence_hook_device = NULL;
+	persistence_hook_mode = PERSISTENCE_HOOK_NONE;
+	hyperv_acceptance_persistence_host_set_identity_policy(0);
+	backing_media_enabled = 0;
+	storvsc_host_set_guarded_io(0);
 	return 0;
 }
 
@@ -3166,6 +4863,10 @@ int main(void)
 	struct vmbus_device vmbus_device = {
 		.channel_id = 37,
 		.connection_id = 137,
+		.instance_id = {
+			.bytes = { 1, 1, 2, 3, 4, 5, 6, 7,
+				   8, 9, 10, 11, 12, 13, 14, 15 },
+		},
 		.present = 1,
 	};
 	struct uk_blkdev *device;
@@ -3204,6 +4905,10 @@ int main(void)
 		return 3;
 	if (configure_device(device, 2, &events))
 		return 4;
+	enqueue_enumerate_bus(vmbus_device.channel);
+	fire_channel();
+	if (!storvsc_host_online())
+		return 4;
 	if (posix_memalign((void **)&buffer, 4096, 3 * 4096))
 		return 5;
 
@@ -3240,7 +4945,8 @@ int main(void)
 		return 10;
 	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
 			   request_done, &callbacks);
-	if (submit_and_fire(device, &request) || request.result)
+	rc = submit_and_fire(device, &request);
+	if (rc || request.result)
 		return 11;
 	io_packet_error_once = 1;
 	initialize_request(&request, UK_BLKREQ_FFLUSH, 0, 0, NULL,
@@ -3442,7 +5148,7 @@ int main(void)
 	if (!(device->submit_one(device, device->_queue[0], &request) &
 	      UK_BLKDEV_STATUS_SUCCESS))
 		return 23;
-	driver->remove_dev(&vmbus_device);
+	remove_test_offer(driver, &vmbus_device);
 	if (request.result != -ENODEV ||
 	    atomic_load(&request.state.counter) != UK_BLKREQ_FINISHED)
 		return 24;
@@ -3480,7 +5186,7 @@ int main(void)
 	if (device->submit_one(device, device->_queue[0], &request) !=
 	    -EROFS)
 		return 26;
-	driver->remove_dev(&vmbus_device);
+	remove_test_offer(driver, &vmbus_device);
 	if (vmbus_device.channel)
 		(void)vmbus_channel_close(vmbus_device.channel);
 
@@ -3516,7 +5222,7 @@ int main(void)
 	rc = driver->add_dev(&vmbus_device);
 	if (rc || !vmbus_device.channel || storvsc_host_lun_count() != 2)
 		return 424;
-	driver->remove_dev(&vmbus_device);
+	remove_test_offer(driver, &vmbus_device);
 	if (vmbus_device.channel)
 		(void)vmbus_channel_close(vmbus_device.channel);
 
@@ -3526,6 +5232,7 @@ int main(void)
 	rc = driver->add_dev(&vmbus_device);
 	if (rc != -EPROTO || vmbus_device.channel || close_count < 2)
 		return 28;
+	remove_test_offer(driver, &vmbus_device);
 	if (invalid_scsi_address)
 		return 425;
 	rc = run_topology_regression(driver, &vmbus_device, buffer, &events);
@@ -3533,6 +5240,24 @@ int main(void)
 		return rc;
 	if (unregister_calls)
 		return 67;
+	rc = run_guarded_io_regression(
+		driver, &vmbus_device, buffer, &events);
+	if (rc)
+		return rc;
+	rc = run_persistence_workflow_regression(
+		driver, &vmbus_device,
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_ADDRESS_V1);
+	if (rc)
+		return rc;
+	rc = run_persistence_workflow_regression(
+		driver, &vmbus_device,
+		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2);
+	if (rc)
+		return rc;
+	rc = run_vmbus_offer_lifetime_regression(
+		driver, &vmbus_device, buffer);
+	if (rc)
+		return rc;
 
 	free(buffer);
 	return 0;
