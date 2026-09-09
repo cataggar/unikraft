@@ -719,7 +719,7 @@ jobs:
         repository: cataggar/miz
         ref: 2db68ca0c3ab12155012a823c3fb8d7aba1cb544
         fetch-depth: 1
-        path: _miz
+        path: .d/ci-miz
 
     - name: Download LLVM and QEMU tools
       uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
@@ -791,10 +791,10 @@ jobs:
       run: |
         set -euo pipefail
         test "$(zig version)" = "${ZIG_VERSION}"
-        test "$(git -C _miz rev-parse HEAD)" = "${MIZ_REVISION}"
+        test "$(git -C .d/ci-miz rev-parse HEAD)" = "${MIZ_REVISION}"
         export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/miz-zig-local-cache"
         (
-          cd _miz
+          cd .d/ci-miz
           zig build -j2 install-miz \
             -Doptimize=ReleaseSafe \
             --prefix "${RUNNER_TEMP}/hyperv-ci/miz"

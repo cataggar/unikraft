@@ -2231,6 +2231,31 @@ class HypervWorkflowTest(unittest.TestCase):
             ["bash", "-n"], input=script, text=True, check=True, timeout=10
         )
 
+    def test_miz_checkout_is_outside_the_tracked_source_boundary(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        job = workflow.split("  zig-hyperv:\n", 1)[1]
+        checkout = job.split("    - name: Fetch pinned miz source\n", 1)[1]
+        checkout = checkout.split("\n    - ", 1)[0]
+        self.assertIn("        path: .d/ci-miz\n", checkout + "\n")
+        self.assertIn("        repository: cataggar/miz\n", checkout)
+        self.assertIn(
+            "test \"$(git -C .d/ci-miz rev-parse HEAD)\" = \"${MIZ_REVISION}\"",
+            job,
+        )
+        self.assertIn("          cd .d/ci-miz\n", job)
+        ignored = subprocess.run(
+            [
+                "git", "-c", "core.excludesFile=/dev/null",
+                "check-ignore", "--no-index", "-v", ".d/ci-miz/README.md",
+            ],
+            cwd=SUPPORT.parent, text=True, capture_output=True,
+            check=True, timeout=10,
+        )
+        self.assertIn(".gitignore:", ignored.stdout)
+        self.assertTrue(ignored.stdout.rstrip().endswith(".d/ci-miz/README.md"))
+
 
 class HypervAzureNetworkReservationTest(unittest.TestCase):
     def reservation(self):
