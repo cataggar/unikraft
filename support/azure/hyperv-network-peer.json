@@ -1,0 +1,318 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": {
+      "type": "string",
+      "minLength": 6,
+      "maxLength": 32
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "imageSha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "peerIPAddress": {
+      "type": "string"
+    },
+    "guestIPAddress": {
+      "type": "string"
+    },
+    "subnetPrefix": {
+      "type": "string"
+    },
+    "tcpPort": {
+      "type": "int",
+      "minValue": 1,
+      "maxValue": 65535
+    },
+    "udpPort": {
+      "type": "int",
+      "minValue": 1,
+      "maxValue": 65535
+    },
+    "peerImageVersion": {
+      "type": "string"
+    },
+    "peerCustomData": {
+      "type": "string"
+    },
+    "adminPassword": {
+      "type": "secureString"
+    }
+  },
+  "variables": {
+    "vnetName": "[concat(parameters('namePrefix'), '-vnet')]",
+    "nsgName": "[concat(parameters('namePrefix'), '-nsg')]",
+    "peerNicName": "[concat(parameters('namePrefix'), '-peer-nic')]",
+    "guestNicName": "[concat(parameters('namePrefix'), '-guest-nic')]",
+    "peerVmName": "[concat(parameters('namePrefix'), '-peer-vm')]",
+    "subnetId": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), 'acceptance')]",
+    "tags": {
+      "managed-by": "unikraft-hyperv",
+      "unikraft-run": "[parameters('namePrefix')]",
+      "image-sha256": "[parameters('imageSha256')]",
+      "purpose": "disposable-unikraft-acceptance",
+      "disposable": "true"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('nsgName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "guest-to-peer-tcp",
+            "properties": {
+              "priority": 100,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourceAddressPrefix": "[parameters('guestIPAddress')]",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "[parameters('peerIPAddress')]",
+              "destinationPortRange": "[string(parameters('tcpPort'))]"
+            }
+          },
+          {
+            "name": "guest-to-peer-udp",
+            "properties": {
+              "priority": 110,
+              "direction": "Inbound",
+              "access": "Allow",
+              "protocol": "Udp",
+              "sourceAddressPrefix": "[parameters('guestIPAddress')]",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "[parameters('peerIPAddress')]",
+              "destinationPortRange": "[string(parameters('udpPort'))]"
+            }
+          },
+          {
+            "name": "guest-to-peer-tcp-outbound",
+            "properties": {
+              "priority": 100,
+              "direction": "Outbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourceAddressPrefix": "[parameters('guestIPAddress')]",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "[parameters('peerIPAddress')]",
+              "destinationPortRange": "[string(parameters('tcpPort'))]"
+            }
+          },
+          {
+            "name": "guest-to-peer-udp-outbound",
+            "properties": {
+              "priority": 110,
+              "direction": "Outbound",
+              "access": "Allow",
+              "protocol": "Udp",
+              "sourceAddressPrefix": "[parameters('guestIPAddress')]",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "[parameters('peerIPAddress')]",
+              "destinationPortRange": "[string(parameters('udpPort'))]"
+            }
+          },
+          {
+            "name": "azure-wire-server",
+            "properties": {
+              "priority": 120,
+              "direction": "Outbound",
+              "access": "Allow",
+              "protocol": "*",
+              "sourceAddressPrefix": "*",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "168.63.129.16/32",
+              "destinationPortRange": "*"
+            }
+          },
+          {
+            "name": "azure-instance-metadata",
+            "properties": {
+              "priority": 130,
+              "direction": "Outbound",
+              "access": "Allow",
+              "protocol": "Tcp",
+              "sourceAddressPrefix": "*",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "169.254.169.254/32",
+              "destinationPortRange": "80"
+            }
+          },
+          {
+            "name": "deny-other-inbound",
+            "properties": {
+              "priority": 4095,
+              "direction": "Inbound",
+              "access": "Deny",
+              "protocol": "*",
+              "sourceAddressPrefix": "*",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "*",
+              "destinationPortRange": "*"
+            }
+          },
+          {
+            "name": "deny-other-outbound",
+            "properties": {
+              "priority": 4095,
+              "direction": "Outbound",
+              "access": "Deny",
+              "protocol": "*",
+              "sourceAddressPrefix": "*",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "*",
+              "destinationPortRange": "*"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "[parameters('subnetPrefix')]"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "acceptance",
+            "properties": {
+              "addressPrefix": "[parameters('subnetPrefix')]",
+              "defaultOutboundAccess": false,
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "copy": {
+        "name": "acceptanceNics",
+        "count": 2
+      },
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2024-05-01",
+      "name": "[if(equals(copyIndex(), 0), variables('peerNicName'), variables('guestNicName'))]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+      ],
+      "properties": {
+        "enableAcceleratedNetworking": false,
+        "enableIPForwarding": false,
+        "ipConfigurations": [
+          {
+            "name": "primary",
+            "properties": {
+              "privateIPAddress": "[if(equals(copyIndex(), 0), parameters('peerIPAddress'), parameters('guestIPAddress'))]",
+              "privateIPAllocationMethod": "Static",
+              "subnet": {
+                "id": "[variables('subnetId')]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2025-11-01",
+      "name": "[variables('peerVmName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('peerNicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "Standard_B1s"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "ubuntu-24_04-lts",
+            "sku": "server",
+            "version": "[parameters('peerImageVersion')]"
+          },
+          "osDisk": {
+            "name": "[concat(parameters('namePrefix'), '-peer-os')]",
+            "createOption": "FromImage",
+            "caching": "ReadWrite",
+            "deleteOption": "Delete",
+            "managedDisk": {
+              "storageAccountType": "Standard_LRS"
+            }
+          }
+        },
+        "osProfile": {
+          "computerName": "[variables('peerVmName')]",
+          "adminUsername": "ukpeer",
+          "adminPassword": "[parameters('adminPassword')]",
+          "customData": "[parameters('peerCustomData')]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": false,
+            "provisionVMAgent": true,
+            "patchSettings": {
+              "patchMode": "ImageDefault",
+              "assessmentMode": "ImageDefault"
+            }
+          }
+        },
+        "securityProfile": {
+          "securityType": "Standard"
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('peerNicName'))]",
+              "properties": {
+                "primary": true,
+                "deleteOption": "Delete"
+              }
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "peerVmId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/virtualMachines', variables('peerVmName'))]"
+    },
+    "peerNicId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/networkInterfaces', variables('peerNicName'))]"
+    },
+    "guestNicId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/networkInterfaces', variables('guestNicName'))]"
+    }
+  }
+}

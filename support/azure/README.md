@@ -217,9 +217,15 @@ counts. `READY` appears only after both sockets are bound. A peer-side PASS
 alone is not networking acceptance: the controller must also require the
 matching guest lease, ARP, TCP, UDP, cleanup, and final records.
 
-The service itself creates no Azure resources and is not yet wired into the
-Azure controller. The existing `run` command remains the original smoke lane;
-do not use its DHCP-Offer result as application-network coverage.
+The service itself creates no Azure resources. For a reviewed
+application-network export, explicitly select both
+`hyperv_network_application` and `export_hyperv_prepared_image` in an
+`integration` workflow dispatch. The existing `zig-hyperv` job then fetches
+the pinned lwIP wrapper, freshly solves `app-network.defconfig`, builds the
+native image, and requires the exact `NETWORK_APP_CONFIG` record in all four
+raw/fixed-VHD APIC preflight logs. The preflight remains platform-only and
+does not claim StorVSC or NetVSC I/O. The raw-DHCP `run` path remains the
+original smoke lane and is not application-network coverage.
 
 ## Transfer an exact prepared image
 
@@ -233,9 +239,13 @@ The opt-in artifact contains exactly `prepared-image-manifest.json` and
 `unikraft.vhd`. The canonical manifest contains only strict schema/controller
 revision data, GitHub repository/workflow/job/run/head provenance, fixed image,
 EFI, raw-image, and pinned-`miz` fingerprints, the allowlisted packaging
-contract, and the four platform-only APIC outcomes. It contains no private
-state, local paths, serial logs, Azure identifiers, SAS values, credentials, or
-resource ownership.
+contract, and the four platform-only APIC outcomes. Its discriminated
+acceptance contract is either `raw-dhcp` or `network-application`. The latter
+also binds the solved peer IPv4, TCP/UDP ports, 16-hex nonce, solved
+configuration, unchanged peer script, UKNA request/response transcript
+digests, and exact message/byte totals. It contains no private state, guest
+address, local paths, serial logs, Azure identifiers, SAS values, credentials,
+or resource ownership.
 
 Record the manifest SHA-256 printed in the reviewed job summary separately from
 the downloaded artifact. Import requires that externally supplied digest and
@@ -309,7 +319,94 @@ python3 support/scripts/hyperv-azure.py cleanup --state-dir "$STATE"
 Cleanup is idempotent and refuses to delete a group if its ownership tags, or
 those of any contained resource, do not match the run. An interrupted or
 partially uploaded run is not silently resumed: clean it up, then prepare a
-fresh state directory for another attempt.
+fresh state directory for another attempt. The implicit private-peer OS disk is
+not adopted by adding ownership tags. Cleanup requires the successful ARM
+deployment correlation plus the exact VM and disk immutable identities in
+private state, and the live VM must still own that exact disk, even if its tags
+match the run. A disk present before deployment, one that is detached or
+replaced, or a peer VM without a proven OS disk stops cleanup, including after
+an unverified partial deployment. Matching names or tags alone never authorize
+deletion through the VM or resource group.
+
+## Run private application-network acceptance
+
+Application-network acceptance consumes an imported, trusted, exact VHD. It
+cannot run from mutable local preparation, cannot rebuild after preflight, and
+does not permit `--keep-resources`. Supply a private `/29`, a static guest
+address that avoids Azure's first four and last subnet addresses, and either an
+explicit subscription UUID or an explicitly authorized private reservation:
+
+```shell
+chmod 600 "$PRIVATE_RESERVATION"
+python3 support/scripts/hyperv-azure.py run \
+  --state-dir "$STATE" --stage io --timeout 600 \
+  --resource-group-reservation "$PRIVATE_RESERVATION" \
+  --guest-ipv4 10.87.0.5 --subnet 10.87.0.0/29
+```
+
+Without a reservation, replace the reservation option with
+`--subscription "$AZURE_SUBSCRIPTION"`. The controller passes that selection
+to every Azure CLI command and never changes the global `az account` default.
+Subscription identifiers remain only in private state and are omitted from
+returned acceptance evidence.
+
+A reservation is a private owner-only, non-symlink JSON file with schema
+`unikraft.hyperv.resource-group-reservation`, version 1, phase
+`group-created`, an explicit subscription/location/name prefix/group/group ID,
+the exact disposable ownership tags, and `resource_count: 0`. The controller
+first takes a nonblocking exclusive lock on a stable owner-only sibling lock
+file. While retaining that lock across atomic reservation-file replacement, it
+binds the reservation durably to the private run, exact image, and reviewed
+manifest before any Azure check or mutation. It then verifies the selected
+account, exact live group identity and tags, and two empty-resource listings
+around the tag update. A successful claim leaves the reservation in the
+`consumed` phase; a crash leaves it fail-closed in `claiming`, so neither can be
+silently retried.
+
+This exclusivity guarantee applies to cooperating processes using the same
+canonical reservation path on one local filesystem. Copying the private
+reservation creates a distinct lock domain and is unsupported; Azure tag
+updates are not treated as compare-and-swap. Keep the consumed file and its
+`.lock` sibling private for audit rather than copying or recreating them.
+Normal runs still refuse to adopt any existing group.
+
+Before any resource creation, the controller validates the Gen2 guest size,
+one private `Standard_B1s` peer, x64/generation capabilities, combined regional
+and family quotas, and the fixed Canonical `ubuntu-24_04-lts:server` image
+line. It resolves and records one exact immutable image version; it never
+deploys `latest` and never retries another region, size, SKU, or host.
+
+The exact guest VHD upload completes before the 600-second peer lifetime
+begins. One run-owned VNet has static peer `.4` and guest `.5` addresses, no
+public IP, no default outbound access, and NSG rules limited to the configured
+TCP/UDP exchanges plus Azure platform DHCP/metadata services. Cloud-init
+embeds the unchanged standard-library peer and a lifecycle wrapper; it
+downloads nothing and opens no SSH ingress. The required OS-profile password
+is generated in memory, passed only through an owner-only ARM parameter file
+as a `secureString`, and deleted after peer deployment.
+
+The controller starts its conservative deadline before peer VM deployment,
+requires one exact `START` and matching `READY` before creating the guest, and
+never resets that deadline after delayed boot-diagnostic observation. The
+peer retains the 600-second process lifetime and five-second exchange bounds.
+Both serial streams must then contain unique ordered correlated evidence:
+lease, ARP, three TCP exchanges, six UDP exchanges, exact bytes and transcript
+digests, guest/peer cleanup, peer `EOF`, application final, overall I/O-ready,
+and the exact producer `main returned 0` record. Integer wire fields must be
+JSON integers (never booleans or floats), and the fixed TCP producer schedules
+must prove at least 2/9/3 writes with the final total matching the three
+records. TCP write and receive-callback counts cannot exceed the corresponding
+transferred byte counts. Raw DHCP, peer-only success, stale/duplicate records, restart, bad
+endpoint/nonce, missing EOF, or any failure is rejected.
+
+Private `peer-serial.log`, `guest-serial.log`, and
+`network-acceptance.json` are retained in the state directory. Cleanup is
+attempted on success, failure, SIGINT, or SIGTERM, and deletes the disposable
+group only after verifying ownership of every resource. Unknown ownership
+stops deletion and surfaces a cleanup failure; it is not a successful run or
+an implicit keep-resources mode. This controller path creates no GitHub
+resources; live Azure acceptance remains an explicit operator action after reviewing the exported
+manifest digest and source provenance.
 
 ## Real device acceptance
 
