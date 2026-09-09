@@ -680,8 +680,14 @@ jobs:
       run: |
         set -euxo pipefail
         export DEBIAN_FRONTEND=noninteractive
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        # This job needs only Ubuntu packages, not optional runner repositories.
+        test -s /etc/apt/sources.list.d/ubuntu.sources
+        ubuntu_apt=(
+          -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+          -o Dir::Etc::sourceparts=-
+        )
+        sudo apt-get "${ubuntu_apt[@]}" update
+        sudo apt-get "${ubuntu_apt[@]}" install -y --no-install-recommends \
           bison \
           ca-certificates \
           curl \

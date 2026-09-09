@@ -2128,6 +2128,44 @@ class HypervAzureControllerTest(unittest.TestCase):
         constructor.assert_not_called()
 
 
+class HypervWorkflowTest(unittest.TestCase):
+    def test_bootstrap_uses_only_ubuntu_package_sources(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        job = workflow.split("  zig-hyperv:\n", 1)[1]
+        header, body = job.split(
+            "    - name: Install checkout, build, and OVMF dependencies\n"
+            "      run: |\n",
+            1,
+        )
+        self.assertIn("    runs-on: ubuntu-24.04\n", header)
+        body = body.split("\n    - ", 1)[0]
+        lines = body.splitlines()
+        self.assertTrue(all(not line or line.startswith(" " * 8)
+                            for line in lines))
+        script = "\n".join(line[8:] for line in lines)
+        self.assertIn(
+            "test -s /etc/apt/sources.list.d/ubuntu.sources", script
+        )
+        self.assertIn(
+            "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources",
+            script,
+        )
+        self.assertIn("-o Dir::Etc::sourceparts=-", script)
+        self.assertIn('sudo apt-get "${ubuntu_apt[@]}" update', script)
+        self.assertIn(
+            'sudo apt-get "${ubuntu_apt[@]}" install -y '
+            "--no-install-recommends", script,
+        )
+        for bypass in ("--allow-unauthenticated", "AllowInsecureRepositories",
+                       "Check-Valid-Until=false", "trusted=yes"):
+            self.assertNotIn(bypass, script)
+        subprocess.run(
+            ["bash", "-n"], input=script, text=True, check=True, timeout=10
+        )
+
+
 class HypervAzureNetworkReservationTest(unittest.TestCase):
     def reservation(self):
         return HypervAzureControllerTest.reservation()
