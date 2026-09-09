@@ -164,6 +164,18 @@
       "type": "string",
       "value": "[resourceId('Microsoft.Compute/virtualMachines', variables('vmName'))]"
     },
+    "vmUuid": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', variables('vmName')), '2025-11-01', 'Full').properties.vmId]"
+    },
+    "osDiskId": {
+      "type": "string",
+      "value": "[parameters('osDiskId')]"
+    },
+    "nicId": {
+      "type": "string",
+      "value": "[if(empty(parameters('existingNicId')), resourceId('Microsoft.Network/networkInterfaces', variables('nicName')), parameters('existingNicId'))]"
+    },
     "vmName": {
       "type": "string",
       "value": "[variables('vmName')]"
