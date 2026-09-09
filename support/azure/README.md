@@ -332,6 +332,13 @@ disk present before deployment, a detached or replaced disk, or a replaced VM
 stops cleanup. Matching names or tags alone never authorize deletion through
 the VM or resource group.
 
+The uploaded guest disk is anchored separately from the original `disk create`
+response: its expected resource ID, immutable `uniqueId`, and run ownership
+tags are recorded before upload access is granted. The controller revalidates
+that identity while unattached before VM deployment and requires the same live
+UUID plus reciprocal VM/disk attachment before accepting the guest or deleting
+the group. A same-name disk with copied tags is never re-enrolled.
+
 ## Run private application-network acceptance
 
 Application-network acceptance consumes an imported, trusted, exact VHD. It
@@ -415,19 +422,19 @@ Private `peer-serial.log`, `guest-serial.log`, and
 attempted on success, failure, SIGINT, or SIGTERM, and deletes the disposable
 group only after verifying ownership of every resource. Top-level peer
 resources are bounded by the successful deployment record and durable
-identities. Cleanup also revalidates the original guest deployment and exact VM
-UUID before recovering an interrupted post-deployment guest inspection; the
-imported disk remains authorized only by its existing run-owned ID and tags,
-not a fabricated UUID claim. VM extensions are accepted only as immediate
-children of the proven peer VM and must either be untagged or carry the normal
-required ownership tags; unknown children and siblings remain fail-closed.
-Cleanup independently requests deallocation of that proven peer VM before
-group deletion. If the run and cleanup both fail, both sanitized failures are
-retained and reported without converting the run into success. Unknown
-ownership stops deletion and surfaces a cleanup failure; it is not a successful
-run or an implicit keep-resources mode. This controller path creates no GitHub
-resources; live Azure acceptance remains an explicit operator action after
-reviewing the exported manifest digest and source provenance.
+identities. Cleanup also revalidates the original guest deployment, exact VM
+UUID, anchored uploaded-disk UUID, and reciprocal attachment before recovering
+an interrupted post-deployment guest inspection. VM extensions are accepted
+only as immediate children of the proven peer VM and must either be untagged or
+carry the normal required ownership tags; unknown children and siblings remain
+fail-closed. Cleanup independently verifies and requests deallocation of a
+proven peer VM even when guest or uploaded-disk ownership cannot be established;
+group deletion still remains blocked. If the run and cleanup both fail, all
+sanitized failures are retained and reported without converting the run into
+success. Unknown ownership stops deletion and surfaces a cleanup failure; it is
+not a successful run or an implicit keep-resources mode. This controller path
+creates no GitHub resources; live Azure acceptance remains an explicit operator
+action after reviewing the exported manifest digest and source provenance.
 
 ## Real device acceptance
 

@@ -81,8 +81,9 @@ PEER_DEPLOYMENT_IDENTITY_FIELDS = frozenset((
 ))
 GUEST_DEPLOYMENT_FIELDS = frozenset((
     "deployment_id", "correlation_id", "declared_resource_ids",
-    "vm_id", "vm_uuid", "disk_id", "nic_id",
+    "vm_id", "vm_uuid", "disk_id", "disk_uuid", "nic_id",
 ))
+UPLOADED_DISK_FIELDS = frozenset(("disk_id", "disk_uuid"))
 PEER_TRANSIENT_PROVISIONING_STATES = frozenset(("Creating", "Updating"))
 
 
@@ -168,6 +169,17 @@ class CleanupOperationError(RuntimeError):
             f"{safe_failure_message(deallocation, private_values)}; "
             "resource-group cleanup also failed: "
             f"{safe_failure_message(group_cleanup, private_values)}"
+        )
+
+
+class CleanupValidationError(RuntimeError):
+    def __init__(self, failures, private_values=()):
+        super().__init__(
+            "Cleanup ownership checks failed: " + "; ".join(
+                f"{description}: "
+                f"{safe_failure_message(error, private_values)}"
+                for description, error in failures
+            )
         )
 
 
@@ -1887,6 +1899,82 @@ class AzureRun:
             raise RuntimeError("Reserved resource group changed during its claim")
         self.record("group-claimed")
 
+    def expected_uploaded_disk_id(self):
+        return self.expected_resource_id(
+            "Microsoft.Compute", "disks", self.disk
+        )
+
+    def uploaded_disk_receipt(self, disk):
+        self.require_owned(disk)
+        expected_id = self.expected_uploaded_disk_id()
+        if str(disk.get("id", "")).lower() != expected_id.lower():
+            raise RuntimeError(
+                "Created disk does not have this run's expected identity"
+            )
+        return {
+            "disk_id": expected_id,
+            "disk_uuid": self.require_resource_uuid(
+                disk.get("uniqueId"), "Uploaded disk identity"
+            ),
+        }
+
+    def require_uploaded_disk_proof(self, receipt=None):
+        if receipt is None:
+            receipt = self.state.get("uploaded_disk")
+        expected_id = self.expected_uploaded_disk_id()
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != UPLOADED_DISK_FIELDS
+            or str(receipt["disk_id"]).lower() != expected_id.lower()
+            or self.state.get("disk_id") != receipt["disk_id"]
+            or self.require_resource_uuid(
+                receipt["disk_uuid"], "Uploaded disk identity"
+            ) != receipt["disk_uuid"]
+        ):
+            raise RuntimeError("Uploaded disk provenance is incomplete")
+        return receipt
+
+    def verify_uploaded_disk_identity(
+        self, disk, *, attached_vm_id=None, require_ready=True,
+    ):
+        receipt = self.require_uploaded_disk_proof()
+        self.require_owned(disk)
+        managed_by = disk.get("managedBy")
+        if (
+            str(disk.get("id", "")).lower()
+            != receipt["disk_id"].lower()
+            or self.require_resource_uuid(
+                disk.get("uniqueId"), "Uploaded disk identity"
+            ) != receipt["disk_uuid"]
+            or (
+                attached_vm_id is None
+                and managed_by not in (None, "")
+            )
+            or (
+                attached_vm_id is not None
+                and str(managed_by or "").lower()
+                != attached_vm_id.lower()
+            )
+            or (
+                require_ready
+                and (
+                    disk.get("provisioningState") != "Succeeded"
+                    or disk.get("hyperVGeneration") != "V2"
+                    or disk.get("osType") != "Linux"
+                    or disk.get("diskState")
+                    != (
+                        "Unattached"
+                        if attached_vm_id is None
+                        else "Attached"
+                    )
+                )
+            )
+        ):
+            raise RuntimeError(
+                "Uploaded disk is missing, detached, replaced or unproven"
+            )
+        return receipt
+
     def upload_disk(self, image):
         self.record("creating-disk")
         disk = self.az([
@@ -1896,8 +1984,12 @@ class AzureRun:
             "--hyper-v-generation", "V2", "--os-type", "Linux",
             "--sku", "Standard_LRS", "--tags", *self.resource_tags(),
         ], timeout=600)
-        self.require_owned(disk)
-        self.record("uploading-disk", disk_id=disk["id"])
+        disk_receipt = self.uploaded_disk_receipt(disk)
+        self.record(
+            "uploading-disk",
+            disk_id=disk_receipt["disk_id"],
+            uploaded_disk=disk_receipt,
+        )
         try:
             grant = self.az([
                 "disk", "grant-access", "--resource-group", self.group,
@@ -1917,13 +2009,9 @@ class AzureRun:
         disk = self.az([
             "disk", "show", "--resource-group", self.group, "--name", self.disk,
         ])
-        self.require_owned(disk)
-        if (
-            disk.get("diskState") != "Unattached"
-            or disk.get("provisioningState") != "Succeeded"
-            or disk.get("hyperVGeneration") != "V2"
-            or disk.get("osType") != "Linux"
-        ):
+        try:
+            self.verify_uploaded_disk_identity(disk)
+        except RuntimeError:
             raise RuntimeError("Uploaded disk is not a successfully imported Gen2 Linux disk")
         self.record("disk-ready")
 
@@ -2149,7 +2237,7 @@ class AzureRun:
             "deployment", "group", "show",
             "--resource-group", self.group,
             "--name", self.prefix + "-peer",
-        ], private=True)
+        ], private=True, timeout=120)
         if self.peer_deployment_receipt(deployment) != receipt:
             raise RuntimeError(
                 "Refusing to clean a peer whose original deployment changed"
@@ -2221,6 +2309,7 @@ class AzureRun:
                 "Private guest deployment VM UUID",
             ),
             "disk_id": self.state["disk_id"],
+            "disk_uuid": self.require_uploaded_disk_proof()["disk_uuid"],
             "nic_id": guest_nic_id,
         }
 
@@ -2248,6 +2337,8 @@ class AzureRun:
                 receipt["vm_uuid"], "Private guest VM identity"
             ) != receipt["vm_uuid"]
             or receipt["disk_id"] != self.state.get("disk_id")
+            or receipt["disk_uuid"]
+            != self.require_uploaded_disk_proof()["disk_uuid"]
             or receipt["nic_id"] != self.state.get("guest_nic_id")
         ):
             raise RuntimeError("Private guest deployment provenance is invalid")
@@ -2258,7 +2349,7 @@ class AzureRun:
         deployment = self.az([
             "deployment", "group", "show",
             "--resource-group", self.group, "--name", self.prefix,
-        ], private=True)
+        ], private=True, timeout=120)
         if self.guest_deployment_receipt(
             deployment, receipt["nic_id"]
         ) != receipt:
@@ -2313,6 +2404,18 @@ class AzureRun:
             if time.monotonic() >= deadline:
                 break
             self.verify_guest_vm_identity(vm, receipt)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            disk = self.az([
+                "disk", "show", "--resource-group", self.group,
+                "--name", self.disk,
+            ], private=True, timeout=min(120, remaining))
+            if time.monotonic() >= deadline:
+                break
+            self.verify_uploaded_disk_identity(
+                disk, attached_vm_id=receipt["vm_id"]
+            )
             if self.provisioning_ready(vm, "Private guest VM"):
                 return
             time.sleep(min(10, max(0, deadline - time.monotonic())))
@@ -2445,7 +2548,7 @@ class AzureRun:
         peer_vm = self.az([
             "vm", "show", "--resource-group", self.group,
             "--name", self.peer_vm,
-        ], private=True)
+        ], private=True, timeout=120)
         peer_image = self.state.get("network_preflight", {}).get("peer_image")
         if isinstance(peer_image, dict):
             self.verify_peer_vm_identity(peer_vm, peer_image, receipt)
@@ -2468,7 +2571,7 @@ class AzureRun:
         disk = self.az([
             "disk", "show", "--resource-group", self.group,
             "--name", self.prefix + "-peer-os",
-        ], private=True)
+        ], private=True, timeout=120)
         self.verify_peer_disk_identity(disk, receipt)
         return peer_vm
 
@@ -2571,6 +2674,21 @@ class AzureRun:
 
     def deploy_vm(self, guest_nic_id=None, deadline=None):
         self.record("deploying-vm")
+        disk_arguments = [
+            "disk", "show", "--resource-group", self.group,
+            "--name", self.disk,
+        ]
+        if deadline is None:
+            disk = self.az(disk_arguments)
+        else:
+            disk = self.az(
+                disk_arguments,
+                timeout=self.deadline_timeout(deadline, 120),
+            )
+            self.require_before_deadline(
+                deadline, "uploaded guest disk inspection"
+            )
+        self.verify_uploaded_disk_identity(disk)
         parameters = [
             f"namePrefix={self.prefix}", f"location={self.state['location']}",
             f"osDiskId={self.state['disk_id']}",
@@ -2623,6 +2741,184 @@ class AzureRun:
             ):
                 raise RuntimeError("Guest VM is not attached to the reserved private NIC")
         self.record("vm-created", vm_id=vm["id"])
+
+    def verified_guest_for_cleanup(self, resources):
+        expected_vm_id = self.expected_resource_id(
+            "Microsoft.Compute", "virtualMachines", self.vm
+        )
+        candidates = [
+            resource for resource in resources
+            if (
+                str(resource.get("id", "")).lower()
+                == expected_vm_id.lower()
+                or resource.get("name") == self.vm
+            )
+        ]
+        if len(candidates) > 1:
+            raise RuntimeError("Refusing to clean an unproven guest VM")
+        receipt = self.state.get("guest_deployment")
+        vm_id = self.state.get("vm_id")
+        if not candidates and receipt is None and vm_id is None:
+            return None
+        if len(candidates) != 1:
+            raise RuntimeError("Refusing to clean an unproven guest VM")
+        self.require_guest_deployment_proof(receipt)
+        if (
+            vm_id is not None
+            and (
+                not isinstance(vm_id, str)
+                or vm_id.lower() != receipt["vm_id"].lower()
+            )
+        ):
+            raise RuntimeError("Refusing to clean an unproven guest VM")
+        resource = candidates[0]
+        if (
+            str(resource.get("id", "")).lower()
+            != receipt["vm_id"].lower()
+            or resource.get("name") != self.vm
+            or str(resource.get("type", "")).lower()
+            != "microsoft.compute/virtualmachines"
+        ):
+            raise RuntimeError("Refusing to clean an unproven guest VM")
+        self.require_owned(resource)
+        self.verify_guest_deployment_for_cleanup(receipt)
+        vm = self.az([
+            "vm", "show", "--resource-group", self.group,
+            "--name", self.vm,
+        ], private=True, timeout=120)
+        self.verify_guest_vm_identity(vm, receipt)
+        if vm_id is None:
+            self.record(
+                "guest-cleanup-identity-verified",
+                vm_id=receipt["vm_id"],
+            )
+        return receipt["vm_id"]
+
+    def verified_uploaded_disk_for_cleanup(
+        self, resources, attached_vm_id,
+    ):
+        expected_id = self.expected_uploaded_disk_id()
+        candidates = [
+            resource for resource in resources
+            if (
+                str(resource.get("id", "")).lower() == expected_id.lower()
+                or resource.get("name") == self.disk
+            )
+        ]
+        receipt = self.state.get("uploaded_disk")
+        disk_id = self.state.get("disk_id")
+        if not candidates and receipt is None and disk_id is None:
+            return None
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "Refusing to clean a missing or unproven uploaded disk"
+            )
+        receipt = self.require_uploaded_disk_proof(receipt)
+        resource = candidates[0]
+        if (
+            str(resource.get("id", "")).lower()
+            != receipt["disk_id"].lower()
+            or resource.get("name") != self.disk
+            or str(resource.get("type", "")).lower()
+            != "microsoft.compute/disks"
+        ):
+            raise RuntimeError(
+                "Refusing to clean a missing or unproven uploaded disk"
+            )
+        self.require_owned(resource)
+        disk = self.az([
+            "disk", "show", "--resource-group", self.group,
+            "--name", self.disk,
+        ], private=True, timeout=120)
+        self.verify_uploaded_disk_identity(
+            disk, attached_vm_id=attached_vm_id
+        )
+        return resource
+
+    def verified_peer_for_cleanup(self, resources):
+        expected_vm_id = self.expected_resource_id(
+            "Microsoft.Compute", "virtualMachines", self.peer_vm
+        )
+        expected_disk_id = self.expected_resource_id(
+            "Microsoft.Compute", "disks", self.prefix + "-peer-os"
+        )
+        vm_candidates = [
+            resource for resource in resources
+            if (
+                str(resource.get("id", "")).lower()
+                == expected_vm_id.lower()
+                or resource.get("name") == self.peer_vm
+            )
+        ]
+        disk_name = self.prefix + "-peer-os"
+        disk_candidates = [
+            resource for resource in resources
+            if (
+                str(resource.get("id", "")).lower()
+                == expected_disk_id.lower()
+                or resource.get("name") == disk_name
+            )
+        ]
+        if len(vm_candidates) > 1 or len(disk_candidates) > 1:
+            raise RuntimeError(
+                "Refusing to clean unproven private peer resources"
+            )
+        receipt = self.state.get("peer_deployment")
+        receipt_fields = set(receipt) if isinstance(receipt, dict) else set()
+        complete_fields = (
+            PEER_DEPLOYMENT_PROOF_FIELDS
+            | PEER_DEPLOYMENT_IDENTITY_FIELDS
+        )
+        if receipt is not None and receipt_fields != complete_fields:
+            raise RuntimeError(
+                "Refusing to clean unproven, detached or replaced "
+                "private peer resources"
+            )
+        if not vm_candidates and not disk_candidates and not receipt_fields:
+            return None, None, set(), None
+        if (
+            len(vm_candidates) != 1
+            or len(disk_candidates) != 1
+            or receipt_fields != complete_fields
+        ):
+            raise RuntimeError(
+                "Refusing to clean unproven, detached or replaced "
+                "private peer resources"
+            )
+        vm_resource = vm_candidates[0]
+        disk_resource = disk_candidates[0]
+        if (
+            str(vm_resource.get("id", "")).lower()
+            != expected_vm_id.lower()
+            or vm_resource.get("name") != self.peer_vm
+            or str(vm_resource.get("type", "")).lower()
+            != "microsoft.compute/virtualmachines"
+            or str(disk_resource.get("id", "")).lower()
+            != expected_disk_id.lower()
+            or disk_resource.get("name") != disk_name
+            or str(disk_resource.get("type", "")).lower()
+            != "microsoft.compute/disks"
+        ):
+            raise RuntimeError(
+                "Refusing to clean unproven private peer resources"
+            )
+        self.require_owned(vm_resource)
+        self.require_owned_if_tagged(disk_resource)
+        self.verify_peer_deployment_for_cleanup(receipt)
+        self.verified_peer_disk_for_cleanup(disk_resource)
+        deallocation_error = None
+        try:
+            self.az([
+                "vm", "deallocate", "--resource-group", self.group,
+                "--name", self.peer_vm, "--no-wait",
+            ], private=True, timeout=120)
+        except BaseException as error:
+            deallocation_error = error
+        allowed = {
+            value.lower() for value in receipt["declared_resource_ids"]
+        }
+        allowed.add(receipt["peer_disk_id"].lower())
+        return disk_resource, receipt["peer_vm_id"], allowed, deallocation_error
 
     def verified_peer_vm_extension(self, resource, peer_vm_id):
         if (
@@ -2677,174 +2973,59 @@ class AzureRun:
         deallocation_error = None
         allowed_network_resource_ids = set()
         if network_mode:
-            uploaded_disk_id = self.state.get("disk_id")
-            if uploaded_disk_id is not None:
-                expected_uploaded_disk_id = self.expected_resource_id(
-                    "Microsoft.Compute", "disks", self.disk
+            validation_failures = []
+            try:
+                (
+                    verified_peer_disk,
+                    verified_peer_vm_id,
+                    peer_ids,
+                    deallocation_error,
+                ) = self.verified_peer_for_cleanup(resources)
+                allowed_network_resource_ids.update(peer_ids)
+            except BaseException as error:
+                validation_failures.append(("private peer", error))
+
+            verified_guest_vm_id = None
+            try:
+                verified_guest_vm_id = self.verified_guest_for_cleanup(
+                    resources
                 )
-                if (
-                    not isinstance(uploaded_disk_id, str)
-                    or uploaded_disk_id.lower()
-                    != expected_uploaded_disk_id.lower()
-                ):
-                    raise RuntimeError(
-                        "Refusing to clean an unproven uploaded disk"
+                if verified_guest_vm_id is not None:
+                    allowed_network_resource_ids.add(
+                        verified_guest_vm_id.lower()
                     )
-                allowed_network_resource_ids.add(
-                    expected_uploaded_disk_id.lower()
-                )
-            expected_guest_vm_id = self.expected_resource_id(
-                "Microsoft.Compute", "virtualMachines", self.vm
-            )
-            guest_vm_candidates = [
-                resource for resource in resources
-                if (
-                    str(resource.get("id", "")).lower()
-                    == expected_guest_vm_id.lower()
-                    or resource.get("name") == self.vm
-                )
-            ]
-            if len(guest_vm_candidates) > 1:
-                raise RuntimeError(
-                    "Refusing to clean an unproven guest VM"
-                )
-            guest_receipt = self.state.get("guest_deployment")
-            guest_vm_id = self.state.get("vm_id")
-            if (
-                guest_vm_candidates
-                or guest_receipt is not None
-                or guest_vm_id is not None
-            ):
-                if len(guest_vm_candidates) != 1:
-                    raise RuntimeError(
-                        "Refusing to clean an unproven guest VM"
-                    )
-                self.require_guest_deployment_proof(guest_receipt)
-                if (
-                    guest_vm_id is not None
-                    and (
-                        not isinstance(guest_vm_id, str)
-                        or guest_vm_id.lower()
-                        != guest_receipt["vm_id"].lower()
-                    )
-                ):
-                    raise RuntimeError(
-                        "Refusing to clean an unproven guest VM"
-                    )
-                guest_vm_resource = guest_vm_candidates[0]
-                if (
-                    str(guest_vm_resource.get("id", "")).lower()
-                    != guest_receipt["vm_id"].lower()
-                    or guest_vm_resource.get("name") != self.vm
-                    or str(guest_vm_resource.get("type", "")).lower()
-                    != "microsoft.compute/virtualmachines"
-                ):
-                    raise RuntimeError(
-                        "Refusing to clean an unproven guest VM"
-                    )
-                self.require_owned(guest_vm_resource)
-                self.verify_guest_deployment_for_cleanup(guest_receipt)
-                guest_vm = self.az([
-                    "vm", "show", "--resource-group", self.group,
-                    "--name", self.vm,
-                ], private=True)
-                self.verify_guest_vm_identity(guest_vm, guest_receipt)
-                allowed_network_resource_ids.add(
-                    guest_receipt["vm_id"].lower()
-                )
-                if guest_vm_id is None:
-                    self.record(
-                        "guest-cleanup-identity-verified",
-                        vm_id=guest_receipt["vm_id"],
-                    )
-            expected_peer_vm_id = self.expected_resource_id(
-                "Microsoft.Compute", "virtualMachines", self.peer_vm
-            )
-            expected_peer_disk_id = self.expected_resource_id(
-                "Microsoft.Compute", "disks", self.prefix + "-peer-os"
-            )
-            peer_vm_candidates = [
-                resource for resource in resources
-                if (
-                    str(resource.get("id", "")).lower()
-                    == expected_peer_vm_id.lower()
-                    or resource.get("name") == self.peer_vm
-                )
-            ]
-            peer_disk_name = self.prefix + "-peer-os"
-            peer_disk_candidates = [
-                resource for resource in resources
-                if (
-                    str(resource.get("id", "")).lower()
-                    == expected_peer_disk_id.lower()
-                    or resource.get("name") == peer_disk_name
-                )
-            ]
-            if len(peer_vm_candidates) > 1 or len(peer_disk_candidates) > 1:
-                raise RuntimeError(
-                    "Refusing to clean unproven private peer resources"
-                )
-            receipt = self.state.get("peer_deployment")
-            receipt_fields = set(receipt) if isinstance(receipt, dict) else set()
-            complete_fields = (
-                PEER_DEPLOYMENT_PROOF_FIELDS
-                | PEER_DEPLOYMENT_IDENTITY_FIELDS
-            )
-            if receipt is not None and receipt_fields != complete_fields:
-                raise RuntimeError(
-                    "Refusing to clean unproven, detached or replaced "
-                    "private peer resources"
-                )
-            if (
-                peer_vm_candidates or peer_disk_candidates
-                or receipt_fields == complete_fields
-            ):
-                if (
-                    len(peer_vm_candidates) != 1
-                    or len(peer_disk_candidates) != 1
-                    or receipt_fields != complete_fields
-                ):
-                    raise RuntimeError(
-                        "Refusing to clean unproven, detached or replaced "
-                        "private peer resources"
-                    )
-                peer_vm_resource = peer_vm_candidates[0]
-                peer_disk_resource = peer_disk_candidates[0]
-                if (
-                    str(peer_vm_resource.get("id", "")).lower()
-                    != expected_peer_vm_id.lower()
-                    or peer_vm_resource.get("name") != self.peer_vm
-                    or str(peer_vm_resource.get("type", "")).lower()
-                    != "microsoft.compute/virtualmachines"
-                    or str(peer_disk_resource.get("id", "")).lower()
-                    != expected_peer_disk_id.lower()
-                    or peer_disk_resource.get("name") != peer_disk_name
-                    or str(peer_disk_resource.get("type", "")).lower()
-                    != "microsoft.compute/disks"
-                ):
-                    raise RuntimeError(
-                        "Refusing to clean unproven private peer resources"
-                    )
-                self.require_owned(peer_vm_resource)
-                self.require_owned_if_tagged(peer_disk_resource)
-                verified_peer_disk = peer_disk_resource
-                self.verify_peer_deployment_for_cleanup(receipt)
-                self.verified_peer_disk_for_cleanup(peer_disk_resource)
-                verified_peer_vm_id = receipt["peer_vm_id"]
-                allowed_network_resource_ids.update(
-                    value.lower()
-                    for value in receipt["declared_resource_ids"]
-                )
-                allowed_network_resource_ids.add(
-                    receipt["peer_disk_id"].lower()
-                )
+            except BaseException as error:
+                validation_failures.append(("private guest", error))
+
+            attached_vm_id = verified_guest_vm_id
+            if attached_vm_id is None:
                 try:
-                    self.az([
-                        "vm", "deallocate", "--resource-group", self.group,
-                        "--name", self.peer_vm, "--no-wait",
-                    ], private=True, timeout=120)
-                except BaseException as error:
-                    deallocation_error = error
+                    attached_vm_id = self.require_guest_deployment_proof(
+                        self.state.get("guest_deployment")
+                    )["vm_id"]
+                except BaseException:
+                    attached_vm_id = None
+            try:
+                uploaded_disk = self.verified_uploaded_disk_for_cleanup(
+                    resources, attached_vm_id
+                )
+                if uploaded_disk is not None:
+                    allowed_network_resource_ids.add(
+                        str(uploaded_disk["id"]).lower()
+                    )
+            except BaseException as error:
+                validation_failures.append(("uploaded guest disk", error))
+
+            if validation_failures:
+                validation_error = CleanupValidationError(
+                    validation_failures, self.private_failure_values()
+                )
+                if deallocation_error is not None:
+                    raise CleanupOperationError(
+                        deallocation_error, validation_error,
+                        self.private_failure_values(),
+                    ) from None
+                raise validation_error from None
         try:
             for resource in resources:
                 if resource is verified_peer_disk:
