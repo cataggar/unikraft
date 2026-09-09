@@ -5346,6 +5346,10 @@ static int run_persistence_workflow_regression(
 		    output, "UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:", 1) != 1 ||
 	    persistence_log_line_count(
 		    output, "UK_HYPERV_PERSISTENCE_IDENTITY:1:", 1) != 1 ||
+	    persistence_log_line_count(
+		    output, "UK_HYPERV_PERSISTENCE_IO:1:1:", 1) !=
+		    (identity_policy ==
+			     HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2) ||
 	    write10_command_count <= writes10 ||
 	    write16_command_count <= writes16 ||
 	    flush_command_count <= flushes)
@@ -5361,6 +5365,10 @@ static int run_persistence_workflow_regression(
 		    output, "HYPERV_PERSISTENCE BOOT2_READ PASS ", 1) != 1 ||
 	    persistence_log_line_count(
 		    output, "UK_HYPERV_PERSISTENCE_BOOT2_COMPLETE:", 1) != 1 ||
+	    persistence_log_line_count(
+		    output, "UK_HYPERV_PERSISTENCE_IO:1:2:", 1) !=
+		    (identity_policy ==
+			     HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2) ||
 	    persistence_log_line_count(
 		    output, "HYPERV_PERSISTENCE BOOT1_", 1) ||
 	    write10_command_count != writes10 ||
@@ -5634,7 +5642,9 @@ static int persistence_unavailable_log_valid(const char *output)
 	       !persistence_log_line_count(
 		       output, "UK_HYPERV_PERSISTENCE_BOOT1_", 1) &&
 	       !persistence_log_line_count(
-		       output, "UK_HYPERV_PERSISTENCE_BOOT2_", 1);
+		       output, "UK_HYPERV_PERSISTENCE_BOOT2_", 1) &&
+	       !persistence_log_line_count(
+		       output, "UK_HYPERV_PERSISTENCE_IO:", 1);
 }
 
 static int run_persistence_unavailable_regression(

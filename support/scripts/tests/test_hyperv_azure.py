@@ -1,24 +1,36 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import copy
+import contextlib
+import errno
+import hashlib
 import importlib
+from importlib.metadata import PackageNotFoundError, version
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import unittest
+import uuid
+import zlib
 from unittest import mock
 
 SUPPORT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SUPPORT / "scripts"))
 azure = importlib.import_module("hyperv-azure")
 uploader = importlib.import_module("hyperv-azure-upload")
+persistence = importlib.import_module("hyperv_persistence_controller")
+preflight_tests = importlib.import_module(
+    "support.scripts.tests.test_hyperv_private_preflight"
+)
 
 
 def modeled_implicit_disk_output_order(
@@ -94,6 +106,11 @@ class HypervAzurePageUploadTest(unittest.TestCase):
                     image, "https://md.blob.storage.azure.net:8443/disk/image", "sig=secret"
                 )
             self.assertEqual(report["uploaded_bytes"], uploader.PAGE_CHUNK + 512)
+            self.assertEqual(
+                report["image_sha256"], hashlib.sha256(
+                    b"\0" * uploader.PAGE_CHUNK + footer
+                ).hexdigest(),
+            )
             self.assertTrue(report["footer_matches"])
             self.assertEqual(client.upload_page.call_count, 2)
             self.assertEqual(client.upload_page.call_args_list[0].args[1:], (0, uploader.PAGE_CHUNK))
@@ -128,6 +145,21 @@ class HypervAzurePageUploadTest(unittest.TestCase):
                     )
                 self.assertIn("UploadFailed", str(error.exception))
                 self.assertNotIn("secret", str(error.exception))
+
+    @mock.patch.object(azure, "upload_helper")
+    def test_expected_image_digest_is_enforced(self, helper):
+        image = mock.Mock()
+        image.stat.return_value.st_size = 1024
+        helper.return_value = {
+            "uploaded_bytes": 1024,
+            "image_sha256": "b" * 64,
+            "footer_matches": True,
+        }
+        with self.assertRaisesRegex(RuntimeError, "expected image"):
+            azure.upload_managed_vhd(
+                image, "https://example.invalid/disk", "secret",
+                expected_sha256="a" * 64,
+            )
 
 
 class HypervAzurePackagingTest(unittest.TestCase):
@@ -2165,6 +2197,65 @@ class HypervWorkflowTest(unittest.TestCase):
             ["bash", "-n"], input=script, text=True, check=True, timeout=10
         )
 
+    def test_hyperv_regressions_require_the_pinned_sdk(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        job = workflow.split("  zig-hyperv:\n", 1)[1]
+        step = "    - name: Install pinned Hyper-V controller dependencies\n"
+        self.assertLess(
+            job.index("    - name: Configure bounded local tool directories\n"),
+            job.index(step),
+        )
+        self.assertLess(
+            job.index(step),
+            job.index("    - name: Run focused Hyper-V regressions\n"),
+        )
+        self.assertIn("          python3-venv \\\n", job)
+        body = job.split(step + "      run: |\n", 1)[1]
+        lines = body.split("\n    - ", 1)[0].splitlines()
+        self.assertTrue(all(not line or line.startswith(" " * 8)
+                            for line in lines))
+        script = "\n".join(line[8:] for line in lines)
+        for required in (
+            'venv="${RUNNER_TEMP}/hyperv-ci/python"',
+            'python3 -m venv "${venv}"',
+            '"${venv}/bin/python" -m pip install',
+            "-r support/azure/requirements.txt",
+            'PYTHONPATH=support/scripts "${venv}/bin/python" -c',
+            "p.sdk_dependency_contract()",
+            'echo "${venv}/bin" >> "${GITHUB_PATH}"',
+        ):
+            self.assertIn(required, script)
+        subprocess.run(
+            ["bash", "-n"], input=script, text=True, check=True, timeout=10
+        )
+
+    def test_miz_checkout_is_outside_the_tracked_source_boundary(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        job = workflow.split("  zig-hyperv:\n", 1)[1]
+        checkout = job.split("    - name: Fetch pinned miz source\n", 1)[1]
+        checkout = checkout.split("\n    - ", 1)[0]
+        self.assertIn("        path: .d/ci-miz\n", checkout + "\n")
+        self.assertIn("        repository: cataggar/miz\n", checkout)
+        self.assertIn(
+            "test \"$(git -C .d/ci-miz rev-parse HEAD)\" = \"${MIZ_REVISION}\"",
+            job,
+        )
+        self.assertIn("          cd .d/ci-miz\n", job)
+        ignored = subprocess.run(
+            [
+                "git", "-c", "core.excludesFile=/dev/null",
+                "check-ignore", "--no-index", "-v", ".d/ci-miz/README.md",
+            ],
+            cwd=SUPPORT.parent, text=True, capture_output=True,
+            check=True, timeout=10,
+        )
+        self.assertIn(".gitignore:", ignored.stdout)
+        self.assertTrue(ignored.stdout.rstrip().endswith(".d/ci-miz/README.md"))
+
 
 class HypervAzureNetworkReservationTest(unittest.TestCase):
     def reservation(self):
@@ -3776,6 +3867,2295 @@ class HypervAzureTemplateTest(unittest.TestCase):
         self.assertEqual(
             size["allowedValues"],
             ["Standard_D2s_v5", "Standard_D2as_v5", "Standard_B2s"],
+        )
+
+
+class HypervPersistenceControllerTest(unittest.TestCase):
+    RUN_ID = "00112233445566778899aabbccddeeff"
+    DISK_ID = "102132435465768798a9bacbdcedfe0f"
+    SUBSCRIPTION = "12345678-1234-4234-9234-123456789abc"
+    VM_UUID = "11111111-1111-4111-8111-111111111111"
+    OS_UUID = "22222222-2222-4222-8222-222222222222"
+    DATA_UUID = "33333333-3333-4333-8333-333333333333"
+    CORRELATION_UUID = "44444444-4444-4444-8444-444444444444"
+    APPROVED_SECTORS = (4 * 1024 ** 3) // persistence.SECTOR_SIZE
+    APPROVED_LUN = 7
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.inputs = self.root / "source"
+        self.inputs.mkdir(mode=0o700)
+        self.state_dir = self.root / "state"
+        self.preflight_state = self.root / "private-preflight"
+        self.preflight_state.mkdir(mode=0o700)
+        self.contract, self.paths = self.make_inputs()
+        self.completed_preflight = mock.patch.object(
+            persistence.private_preflight,
+            "load_completed_receipt",
+            return_value=(
+                self.contract["preflight"],
+                self.preflight_state
+                / persistence.FILE_NAMES["preflight_receipt"],
+            ),
+            create=True,
+        )
+        self.completed_preflight.start()
+        self.contract_path = self.root / "contract.json"
+        self.contract_path.write_bytes(azure.canonical_json(self.contract))
+        os.chmod(self.contract_path, 0o600)
+        self.contract_sha256 = azure.image_sha256(self.contract_path)
+
+    def tearDown(self):
+        if self.completed_preflight is not None:
+            self.completed_preflight.stop()
+        self.temporary.cleanup()
+
+    @staticmethod
+    def fixed_footer(logical_size, identifier):
+        footer = bytearray(512)
+        footer[0:8] = b"conectix"
+        struct.pack_into(">I", footer, 8, 2)
+        struct.pack_into(">I", footer, 12, 0x00010000)
+        struct.pack_into(">Q", footer, 16, 0xFFFFFFFFFFFFFFFF)
+        footer[28:32] = b"ukrt"
+        struct.pack_into(">I", footer, 32, 0x00010000)
+        footer[36:40] = b"Wi2k"
+        struct.pack_into(">Q", footer, 40, logical_size)
+        struct.pack_into(">Q", footer, 48, logical_size)
+        struct.pack_into(">I", footer, 60, 2)
+        footer[68:84] = bytes.fromhex(identifier)
+        struct.pack_into(">I", footer, 64, (~sum(footer)) & 0xFFFFFFFF)
+        return bytes(footer)
+
+    def write_fixed_vhd(self, path, data, identifier):
+        path.write_bytes(data + self.fixed_footer(len(data), identifier))
+        os.chmod(path, 0o600)
+
+    def make_seed(self, sectors, lun):
+        raw = bytearray(sectors * persistence.SECTOR_SIZE)
+        seed = bytearray(persistence.SECTOR_SIZE)
+        seed[0:8] = b"UKPSEED2"
+        struct.pack_into("<HHI", seed, 8, 2, 128, 512)
+        seed[16:32] = bytes.fromhex(self.RUN_ID)
+        seed[32:48] = bytes.fromhex(self.DISK_ID)
+        struct.pack_into(
+            "<QIIQQQQQI", seed, 48, sectors, 512, 2,
+            persistence.SEED0_LBA, persistence.SEED1_LBA,
+            persistence.INTENT_LBA, persistence.RECEIPT_LBA,
+            persistence.EXTENT_LBA, persistence.EXTENT_SECTORS,
+        )
+        seed[108:112] = bytes((2, 0, lun, 0))
+        crc = zlib.crc32(seed)
+        struct.pack_into("<I", seed, 508, crc)
+        for lba in (persistence.SEED0_LBA, persistence.SEED1_LBA):
+            offset = lba * persistence.SECTOR_SIZE
+            raw[offset:offset + persistence.SECTOR_SIZE] = seed
+        manifest = {
+            "version": 2,
+            "run_id": self.RUN_ID,
+            "disk_id": self.DISK_ID,
+            "sectors": sectors,
+            "sector_size": 512,
+            "identity_policy": "seed-enrollment-v2",
+            "identity_policy_version": 2,
+            "path": None,
+            "target": None,
+            "lun": lun,
+            "seed_lbas": [8, 9],
+            "intent_lba": 16,
+            "receipt_lba": 17,
+            "extent_lba": 32,
+            "extent_sectors": 16,
+            "manifest_crc32": crc,
+        }
+        return bytes(raw), manifest
+
+    def make_inputs(self):
+        sectors = 4096
+        lun = 7
+        guest_data = b"G" * (1024 * 1024)
+        guest_vhd = self.inputs / persistence.FILE_NAMES["guest_vhd"]
+        self.write_fixed_vhd(
+            guest_vhd, guest_data,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        data, seed = self.make_seed(sectors, lun)
+        data_raw = self.inputs / persistence.FILE_NAMES["data_raw"]
+        data_raw.write_bytes(data)
+        os.chmod(data_raw, 0o600)
+        data_vhd = self.inputs / persistence.FILE_NAMES["data_vhd"]
+        self.write_fixed_vhd(
+            data_vhd, data,
+            self.DISK_ID,
+        )
+        seed_path = self.inputs / persistence.FILE_NAMES["seed_manifest"]
+        seed_path.write_text(json.dumps(seed, sort_keys=True) + "\n")
+        os.chmod(seed_path, 0o600)
+        guest_record = {
+            "name": guest_vhd.name,
+            "sha256": azure.image_sha256(guest_vhd),
+            "size": guest_vhd.stat().st_size,
+        }
+        preflight_inputs = {
+            role: {"sha256": str(index) * 64, "size": 4096}
+            for index, role in enumerate(
+                persistence.PREFLIGHT_INPUT_ROLES, 1
+            )
+        }
+        preflight_inputs["vhd"] = {
+            "sha256": guest_record["sha256"],
+            "size": guest_record["size"],
+        }
+        provenance = {
+            "scheme": "unikraft.git-ls-tree-v1",
+            "head_commit": "a" * 40,
+            "tree_sha256": "b" * 64,
+            "tracked_entries": 100,
+            "config": {
+                "name": "solved.config",
+                "sha256": "c" * 64,
+                "size": 1024,
+            },
+        }
+        guarded = {
+            "schema": "unikraft.hyperv.guarded-v2-pristine-unavailable",
+            "schema_version": 1,
+            "scope": "platform-only",
+            "result": "UNAVAILABLE",
+            "protocol": 1,
+            "identity_policy": 2,
+            "reason": "no-devices",
+            "main_return": 2,
+            "run_id": self.RUN_ID,
+            "disk_id": self.DISK_ID,
+            "path": 0,
+            "target": 0,
+            "lun": lun,
+            "sectors": sectors,
+            "sector_size": 512,
+            "solved_config_sha256": provenance["config"]["sha256"],
+            "producer": (
+                persistence.private_preflight.guarded_producer_contract()
+            ),
+        }
+        boot_outcome = {
+            "result": "PASS", "log_sha256": "e" * 64,
+            "return_code": 0,
+        }
+        preflight = {
+            "schema": persistence.PREFLIGHT_SCHEMA,
+            "schema_version": persistence.PREFLIGHT_VERSION,
+            "result": "PASS",
+            "identity": "f" * 32,
+            "input_manifest_sha256": "1" * 64,
+            "implementation": {"controller": {"sha256": "2" * 64}},
+            "provenance": provenance,
+            "capability_reference": {"revision": "3" * 40},
+            "private_build": {
+                "name": "private-build-receipt.json",
+                "sha256": "4" * 64,
+                "size": 4096,
+                "receipt": {
+                    "schema": "unikraft.hyperv.private-local-build",
+                    "schema_version": 3,
+                    "result": "PASS",
+                    "source_before": provenance,
+                    "source_after": provenance,
+                    "invocation": {},
+                    "tools": {},
+                    "output": preflight_inputs["efi"],
+                    "builder_sha256": "5" * 64,
+                    "guarded": guarded,
+                },
+            },
+            "inputs": preflight_inputs,
+            "qemu_support": {"files": {}},
+            "miz": {"sha256": "6" * 64},
+            "packaging": {"vhd": preflight_inputs["vhd"]},
+            "budget": {"maximum_bytes": 1},
+            "host_image": {"urn": "fixture"},
+            "host": {
+                "operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "deployment_correlation_id": (
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                ),
+                "vm_uuid": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "disk_uuid": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "boot_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            },
+            "capability_receipt_sha256": "7" * 64,
+            "private_receipt_sha256": "8" * 64,
+            "boot_policy": persistence.BOOT_POLICY,
+            "acceptance_scope": "platform-only",
+            "storage_result": "UNAVAILABLE",
+            "guarded": guarded,
+            "capability_boots": {"x2apic": boot_outcome},
+            "private_boots": {
+                image_format: {
+                    "x2apic": dict(boot_outcome),
+                    "legacy-apic": dict(boot_outcome),
+                }
+                for image_format in ("raw", "vhd")
+            },
+            "cleanup": "complete",
+        }
+        preflight_path = (
+            self.preflight_state
+            / persistence.FILE_NAMES["preflight_receipt"]
+        )
+        preflight_path.write_text(json.dumps(preflight, indent=2) + "\n")
+        os.chmod(preflight_path, 0o600)
+        paths = {
+            "guest_vhd": guest_vhd,
+            "data_raw": data_raw,
+            "data_vhd": data_vhd,
+            "seed_manifest": seed_path,
+        }
+        all_paths = {**paths, "preflight_receipt": preflight_path}
+        records = {
+            role: {
+                "name": path.name,
+                "sha256": azure.image_sha256(path),
+                "size": path.stat().st_size,
+            }
+            for role, path in all_paths.items()
+        }
+        prefix = "uk-hvpersist01"
+        contract = {
+            "schema": persistence.CONTRACT_SCHEMA,
+            "schema_version": persistence.CONTRACT_VERSION,
+            "workload": persistence.WORKLOAD,
+            "implementation": persistence.implementation_contract(),
+            "run_id": self.RUN_ID,
+            "disk_id": self.DISK_ID,
+            "geometry": {
+                "sectors": sectors, "sector_size": 512, "lun": lun,
+            },
+            "azure": {
+                "subscription": self.SUBSCRIPTION,
+                "location": "northeurope",
+                "vm_size": "Standard_B1s",
+                "vm_vcpus": 1,
+                "name_prefix": prefix,
+                "resource_group": prefix + "-rg",
+                "vm_name": prefix + "-vm",
+                "os_disk_name": prefix + "-os",
+                "data_disk_name": prefix + "-data",
+                "nic_name": prefix + "-nic",
+                "vnet_name": prefix + "-vnet",
+                "nsg_name": prefix + "-nsg",
+                "os_disk_sku": "Standard_LRS",
+                "data_disk_sku": "Standard_LRS",
+                "resource_counts": dict(persistence.RESOURCE_COUNTS),
+                "max_boots": 2,
+                "runtime_seconds": 600,
+                "cleanup_seconds": 600,
+            },
+            "files": records,
+            "preflight": preflight,
+        }
+        return contract, paths
+
+    @contextlib.contextmanager
+    def real_completed_preflight(self):
+        self.completed_preflight.stop()
+        self.completed_preflight = None
+        shutil.rmtree(self.preflight_state)
+        fixture = (
+            preflight_tests.PrivatePreflightCompletedReceiptTest()
+        )
+        private = persistence.private_preflight
+        try:
+            version("azure-storage-blob")
+        except PackageNotFoundError:
+            self.skipTest("azure-storage-blob is not installed in this runner")
+        private.implementation_contract()
+        assets = self.root / "real-private-preflight"
+        assets.mkdir(mode=0o700)
+        config = assets / private.SOLVED_CONFIG
+        config.write_bytes(fixture.guarded_config(
+            run_id=self.RUN_ID,
+            disk_id=self.DISK_ID,
+            sectors=self.APPROVED_SECTORS,
+            lun=self.APPROVED_LUN,
+        ))
+        qemu = assets / "qemu"
+        (qemu / "bin").mkdir(parents=True)
+        (qemu / "share").mkdir()
+        (qemu / "bin" / "qemu-system-x86_64").write_bytes(b"qemu")
+        (qemu / "share" / "firmware.json").write_bytes(b"firmware")
+        guest_vhd = self.paths["guest_vhd"]
+        guest_raw = assets / "private.raw"
+        guest_raw.write_bytes(guest_vhd.read_bytes()[:-512])
+        capability = assets / "capability.raw"
+        capability.write_bytes(b"C" * guest_raw.stat().st_size)
+        files = {}
+        for name, content in (
+            ("code", b"code"), ("vars", b"vars"), ("efi", b"efi"),
+            ("miz", b"miz"),
+        ):
+            files[name] = assets / name
+            files[name].write_bytes(content)
+        files["miz"].chmod(0o700)
+        git_runtime = preflight_tests.create_git_runtime(
+            assets / "git-tools"
+        )
+        provenance = private.build_provenance(
+            SUPPORT.parent, config, git_runtime
+        )
+        guarded = private.guarded_contract_from_solved_config(config)
+        capability_record = {
+            "sha256": azure.image_sha256(capability),
+            "size": capability.stat().st_size,
+        }
+        capability_reference = preflight_tests.capability_reference(
+            capability_record, approved=False
+        )
+        capability_path = assets / private.CAPABILITY_REFERENCE
+        capability_path.write_bytes(azure.canonical_json(
+            capability_reference["receipt"]
+        ))
+        capability_reference.update({
+            "sha256": azure.image_sha256(capability_path),
+            "size": capability_path.stat().st_size,
+        })
+        build = preflight_tests.private_build_receipt(
+            provenance,
+            {
+                "sha256": azure.image_sha256(files["efi"]),
+                "size": files["efi"].stat().st_size,
+            },
+            guarded,
+        )
+        build_path = assets / private.PRIVATE_BUILD_RECEIPT
+        build_path.write_bytes(azure.canonical_json(build["receipt"]))
+        generated = assets / "generated"
+
+        def packaging(_miz, _arguments, _log, **_kwargs):
+            return preflight_tests.packaging_contract(
+                azure.image_sha256(files["efi"]),
+                files["efi"].stat().st_size,
+                guest_vhd.stat().st_size,
+            )
+
+        with (
+            mock.patch.object(
+                private.azure, "VIRTUAL_SIZE", guest_raw.stat().st_size
+            ),
+            mock.patch.object(private, "check_blob_dependency"),
+            mock.patch.object(
+                private.azure, "miz_command", side_effect=packaging
+            ),
+            mock.patch.object(
+                private, "APPROVED_CAPABILITY_REFERENCE",
+                capability_reference,
+            ),
+        ):
+            digest = private.generate_input(
+                generated, SUPPORT.parent, config, qemu,
+                files["code"], files["vars"], capability,
+                capability_path, files["efi"], build_path,
+                guest_raw, guest_vhd, files["miz"], git_runtime,
+                private.GUARDED_BOOT_POLICY,
+            )
+            private.prepare(
+                generated, self.preflight_state, files["miz"], digest
+            )
+            state, _ = private.load_state(self.preflight_state)
+            fixture.complete_prepared_handoff(
+                self.preflight_state, state
+            )
+            yield private
+
+    def prepare(self):
+        persistence.prepare_state(
+            self.contract_path, self.contract_sha256,
+            self.state_dir, self.paths, self.preflight_state,
+        )
+        return persistence.load_state(self.state_dir)
+
+    def identity_line(self, *, controller=None, lun=7, sectors=4096,
+                      vpd="5000010102030400"):
+        controller = controller or "aabbccddeeff00112233445566778899"
+        return (
+            "UK_HYPERV_PERSISTENCE_IDENTITY:1:2:"
+            f"{self.RUN_ID}:{self.DISK_ID}:{controller}:1:2:{lun}:"
+            f"{sectors}:512:{len(vpd) // 2}:1:3:0:{vpd}"
+        )
+
+    def boot_log(self, boot, *, identity=None, writes=None, flushes=None):
+        writes = (5 if boot == 1 else 0) if writes is None else writes
+        flushes = (3 if boot == 1 else 0) if flushes is None else flushes
+        action = "WRITE" if boot == 1 else "READ"
+        state = 0 if boot == 1 else 2
+        return "\n".join((
+            "Powered by",
+            "Calling main(",
+            (
+                f"HYPERV_PERSISTENCE START PASS run={self.RUN_ID} "
+                "address=0:0:7 sectors=4096 sector_size=512"
+            ),
+            f"HYPERV_PERSISTENCE SELECT PASS id=3 controller=1 state={state}",
+            identity or self.identity_line(),
+            (
+                f"HYPERV_PERSISTENCE BOOT{boot}_{action} PASS "
+                f"run={self.RUN_ID}"
+            ),
+            (
+                f"UK_HYPERV_PERSISTENCE_IO:1:{boot}:{self.RUN_ID}:"
+                f"{writes}:{flushes}:receipt-verified"
+            ),
+            f"UK_HYPERV_PERSISTENCE_BOOT{boot}_COMPLETE:{self.RUN_ID}",
+            "HYPERV_PERSISTENCE FINAL PASS rc=0",
+            "main returned 0",
+            "",
+        ))
+
+    def attach_proofs(self, state):
+        group_id = (
+            f"/subscriptions/{self.SUBSCRIPTION}/resourceGroups/"
+            f"{self.contract['azure']['resource_group']}"
+        )
+        state.update({
+            "resource_group_id": group_id,
+            "cleanup_required": True,
+            "boot_count": 2,
+            "os_disk": {
+                "id": group_id + (
+                    "/providers/Microsoft.Compute/disks/"
+                    + self.contract["azure"]["os_disk_name"]
+                ),
+                "uuid": self.OS_UUID,
+            },
+            "data_disk": {
+                "id": group_id + (
+                    "/providers/Microsoft.Compute/disks/"
+                    + self.contract["azure"]["data_disk_name"]
+                ),
+                "uuid": self.DATA_UUID,
+            },
+        })
+        state["vm"] = {
+            "id": group_id + (
+                "/providers/Microsoft.Compute/virtualMachines/"
+                + self.contract["azure"]["vm_name"]
+            ),
+            "uuid": self.VM_UUID,
+            "deployment_id": group_id + (
+                "/providers/Microsoft.Resources/deployments/"
+                + self.contract["azure"]["name_prefix"]
+            ),
+            "correlation_id": self.CORRELATION_UUID,
+            "nic_id": group_id + (
+                "/providers/Microsoft.Network/networkInterfaces/"
+                + self.contract["azure"]["nic_name"]
+            ),
+            "os_disk_id": state["os_disk"]["id"],
+            "data_disk_id": state["data_disk"]["id"],
+        }
+        state["vm_operation"] = {
+            "phase": "created",
+            "operation_id": "99999999-9999-4999-8999-999999999999",
+            "deployment_id": state["vm"]["deployment_id"],
+        }
+        return state
+
+    def live_vm(self, state, *, data_disk_id=None, vm_uuid=None):
+        return {
+            "id": state["vm"]["id"],
+            "vmId": vm_uuid or state["vm"]["uuid"],
+            "tags": {
+                "managed-by": persistence.MANAGED_BY,
+                "purpose": persistence.PURPOSE,
+                "unikraft-run": self.contract["azure"]["name_prefix"],
+                "image-sha256": self.contract["files"]["guest_vhd"]["sha256"],
+                "seed-sha256": self.contract["files"]["data_raw"]["sha256"],
+                "persistence-operation": (
+                    state["vm_operation"]["operation_id"]
+                ),
+            },
+            "hardwareProfile": {"vmSize": self.contract["azure"]["vm_size"]},
+            "storageProfile": {
+                "osDisk": {
+                    "managedDisk": {"id": state["os_disk"]["id"]},
+                },
+                "dataDisks": [{
+                    "lun": 7,
+                    "managedDisk": {
+                        "id": data_disk_id or state["data_disk"]["id"],
+                    },
+                }],
+            },
+            "networkProfile": {
+                "networkInterfaces": [{"id": state["vm"]["nic_id"]}],
+            },
+        }
+
+    def live_disk(self, state, role, *, disk_uuid=None):
+        proof = state[f"{role}_disk"]
+        return {
+            "id": proof["id"],
+            "uniqueId": disk_uuid or proof["uuid"],
+            "tags": self.live_vm(state)["tags"],
+            "managedBy": state["vm"]["id"],
+            "diskSizeBytes": (
+                self.contract["files"]["guest_vhd"]["size"] - 512
+                if role == "os"
+                else self.contract["geometry"]["sectors"] * 512
+            ),
+            "provisioningState": "Succeeded",
+            "diskState": "Attached",
+            "osType": "Linux" if role == "os" else None,
+            "hyperVGeneration": "V2" if role == "os" else None,
+        }
+
+    def unattached_disk(self, state, role, *, disk_uuid=None,
+                        disk_state="Unattached"):
+        proof = state[f"{role}_disk"]
+        return {
+            "id": proof["id"],
+            "uniqueId": disk_uuid or proof["uuid"],
+            "tags": {
+                "managed-by": persistence.MANAGED_BY,
+                "purpose": persistence.PURPOSE,
+                "unikraft-run": self.contract["azure"]["name_prefix"],
+                "image-sha256": self.contract["files"][
+                    "guest_vhd"
+                ]["sha256"],
+                "seed-sha256": self.contract["files"][
+                    "data_raw"
+                ]["sha256"],
+            },
+            "managedBy": None,
+            "diskSizeBytes": (
+                self.contract["files"]["guest_vhd"]["size"] - 512
+                if role == "os"
+                else self.contract["geometry"]["sectors"] * 512
+            ),
+            "provisioningState": "Succeeded",
+            "diskState": disk_state,
+            "osType": "Linux" if role == "os" else None,
+            "hyperVGeneration": "V2" if role == "os" else None,
+        }
+
+    def live_deployment(self, state):
+        group_id = state["resource_group_id"]
+
+        def output(value):
+            return {"type": "String", "value": value}
+
+        resources = [
+            state["vm"]["id"],
+            state["vm"]["nic_id"],
+            group_id + (
+                "/providers/Microsoft.Network/virtualNetworks/"
+                + self.contract["azure"]["vnet_name"]
+            ),
+            group_id + (
+                "/providers/Microsoft.Network/networkSecurityGroups/"
+                + self.contract["azure"]["nsg_name"]
+            ),
+        ]
+        return {
+            "name": self.contract["azure"]["name_prefix"],
+            "id": state["vm"]["deployment_id"],
+            "properties": {
+                "provisioningState": "Succeeded",
+                "correlationId": state["vm"]["correlation_id"],
+                "parameters": {
+                    name: {"value": value}
+                    for name, value in {
+                        "namePrefix": self.contract["azure"]["name_prefix"],
+                        "location": self.contract["azure"]["location"],
+                        "vmSize": self.contract["azure"]["vm_size"],
+                        "osDiskId": state["os_disk"]["id"],
+                        "dataDiskId": state["data_disk"]["id"],
+                        "dataLun": self.contract["geometry"]["lun"],
+                        "imageSha256": self.contract["files"][
+                            "guest_vhd"
+                        ]["sha256"],
+                        "seedSha256": self.contract["files"][
+                            "data_raw"
+                        ]["sha256"],
+                        "operationId": state["vm_operation"][
+                            "operation_id"
+                        ],
+                    }.items()
+                },
+                "outputResources": [{"id": value} for value in resources],
+                "outputs": {
+                    "vmId": output(state["vm"]["id"]),
+                    "vmUuid": output(state["vm"]["uuid"]),
+                    "osDiskId": output(state["os_disk"]["id"]),
+                    "dataDiskId": output(state["data_disk"]["id"]),
+                    "nicId": output(state["vm"]["nic_id"]),
+                },
+            },
+        }
+
+    def owned_resource(self, run, identifier, operation_id=None):
+        tags = dict(run.tags)
+        if "/microsoft.compute/disks/" not in identifier.lower():
+            tags["persistence-operation"] = (
+                operation_id
+                or run.state["vm_operation"]["operation_id"]
+            )
+        return {"id": identifier, "tags": tags}
+
+    def production_acceptance_cloud(self, state_path, *,
+                                    cleanup_failure="delete"):
+        calls = []
+        group_exists = [False]
+        delete_failures = [1 if cleanup_failure == "delete" else 0]
+        inventory_failures = [1 if cleanup_failure == "inventory" else 0]
+        serial_reads = [0]
+        group_id = (
+            f"/subscriptions/{self.SUBSCRIPTION}/resourceGroups/"
+            f"{self.contract['azure']['resource_group']}"
+        )
+        base_tags = {
+            "managed-by": persistence.MANAGED_BY,
+            "purpose": persistence.PURPOSE,
+            "unikraft-run": self.contract["azure"]["name_prefix"],
+            "image-sha256": self.contract["files"]["guest_vhd"]["sha256"],
+            "seed-sha256": self.contract["files"]["data_raw"]["sha256"],
+        }
+        sku = [{
+            "name": self.contract["azure"]["vm_size"],
+            "family": "standardBSFamily",
+            "restrictions": [],
+            "capabilities": [
+                {"name": "CpuArchitectureType", "value": "x64"},
+                {"name": "vCPUs", "value": "1"},
+                {"name": "HyperVGenerations", "value": "V1,V2"},
+                {"name": "MaxDataDiskCount", "value": "2"},
+            ],
+        }]
+
+        def current_state():
+            return persistence.load_state(self.state_dir)[0]
+
+        def role_from(arguments):
+            name = arguments[arguments.index("--name") + 1]
+            return (
+                "os" if name == self.contract["azure"]["os_disk_name"]
+                else "data"
+            )
+
+        def deployment_state():
+            state = current_state()
+            operation = state["vm_operation"]
+            complete = self.attach_proofs(copy.deepcopy(state))
+            complete["boot_count"] = state["boot_count"]
+            complete["vm_operation"] = {
+                **operation, "phase": "created",
+                "deployment_id": complete["vm"]["deployment_id"],
+            }
+            return complete
+
+        def execute(arguments, **_kwargs):
+            command = tuple(arguments[:3])
+            calls.append(tuple(arguments))
+            if arguments[:2] == ["account", "show"]:
+                return {
+                    "id": self.SUBSCRIPTION,
+                    "state": "Enabled",
+                    "environmentName": "AzureCloud",
+                }
+            if arguments[:2] == ["provider", "show"]:
+                return "Registered"
+            if arguments[:2] == ["vm", "list-skus"]:
+                return sku
+            if arguments[:2] == ["group", "exists"]:
+                return group_exists[0]
+            if arguments[:2] == ["group", "create"]:
+                group_exists[0] = True
+                return {
+                    "id": group_id,
+                    "location": self.contract["azure"]["location"],
+                    "tags": base_tags,
+                }
+            if arguments[:2] == ["group", "show"]:
+                return {
+                    "id": group_id,
+                    "location": self.contract["azure"]["location"],
+                    "tags": base_tags,
+                }
+            if arguments[:2] == ["disk", "create"]:
+                role = role_from(arguments)
+                return {
+                    "id": group_id + (
+                        "/providers/Microsoft.Compute/disks/"
+                        + self.contract["azure"][f"{role}_disk_name"]
+                    ),
+                    "uniqueId": (
+                        self.OS_UUID if role == "os" else self.DATA_UUID
+                    ),
+                    "tags": base_tags,
+                }
+            if arguments[:2] == ["disk", "grant-access"]:
+                return {
+                    "accessSAS": (
+                        "https://fixture.blob.core.windows.net/"
+                        "disk/image.vhd?sig=private"
+                    ),
+                }
+            if arguments[:2] == ["disk", "revoke-access"]:
+                return None
+            if arguments[:2] == ["disk", "show"]:
+                state = current_state()
+                role = role_from(arguments)
+                if "vm" not in state:
+                    return self.unattached_disk(state, role)
+                return self.live_disk(state, role)
+            if command == ("deployment", "group", "create"):
+                return self.live_deployment(deployment_state())
+            if command == ("deployment", "group", "show"):
+                return self.live_deployment(current_state())
+            if arguments[:2] == ["vm", "show"]:
+                return self.live_vm(current_state())
+            if arguments[:3] == [
+                "vm", "boot-diagnostics", "get-boot-log"
+            ]:
+                serial_reads[0] += 1
+                if serial_reads[0] == 1:
+                    return self.boot_log(1)
+                return self.boot_log(1) + self.boot_log(2)
+            if arguments[:2] in (["vm", "deallocate"], ["vm", "start"]):
+                return None
+            if arguments[:2] == ["resource", "list"]:
+                if inventory_failures[0]:
+                    inventory_failures[0] -= 1
+                    raise RuntimeError("synthetic cleanup inventory failure")
+                state = current_state()
+                run = persistence.PersistenceRun(state, state_path)
+                return [
+                    self.owned_resource(run, identifier)
+                    for identifier in run.expected_resource_ids()
+                ]
+            if arguments[:2] == ["group", "delete"]:
+                if delete_failures[0]:
+                    delete_failures[0] -= 1
+                    raise RuntimeError("synthetic first cleanup failure")
+                group_exists[0] = False
+                return None
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        return execute, calls
+
+    def production_cleanup_retry(self, *, expire_staging):
+        _state, state_path = self.prepare()
+        execute, calls = self.production_acceptance_cloud(state_path)
+        clock = [100.0]
+        original_save = azure.save_durable_json
+
+        def save(path, value):
+            original_save(path, value)
+            if (
+                expire_staging
+                and Path(path) == state_path
+                and value.get("phase") == "acceptance-recorded"
+                and value.get("acceptance_eligible") is False
+            ):
+                clock[0] = 701.0
+
+        caught = None
+        with (
+            mock.patch.object(
+                persistence.azure, "azure_cli", side_effect=execute
+            ),
+            mock.patch.object(
+                persistence.azure, "check_upload_dependencies"
+            ),
+            mock.patch.object(
+                persistence.azure, "upload_managed_vhd"
+            ),
+            mock.patch.object(
+                persistence.azure, "interrupt_as_exception",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                persistence.azure, "save_durable_json", side_effect=save
+            ),
+            mock.patch.object(
+                persistence.time, "monotonic",
+                side_effect=lambda: clock[0],
+            ),
+        ):
+            try:
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, True,
+                    persistence.resource_envelope_sha256(self.contract),
+                )
+            except BaseException as error:
+                caught = error
+            interrupted, _ = persistence.load_state(self.state_dir)
+            persistence.cleanup_state(self.state_dir, self.SUBSCRIPTION)
+        final, _ = persistence.load_state(self.state_dir)
+        receipt_path = self.state_dir / "persistence-receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        return caught, interrupted, final, receipt, calls
+
+    def assert_exact_production_lifecycle(self, calls, *, group_deletes=2):
+        self.assertEqual(sum(
+            call[:3] == ("deployment", "group", "create")
+            for call in calls
+        ), 1)
+        self.assertEqual(sum(
+            call[:2] == ("disk", "create") for call in calls
+        ), 2)
+        self.assertEqual(sum(
+            call[:2] == ("vm", "start") for call in calls
+        ), 1)
+        self.assertEqual(sum(
+            call[:3] == (
+                "vm", "boot-diagnostics", "get-boot-log"
+            ) for call in calls
+        ), 2)
+        self.assertEqual(sum(
+            call[:2] == ("group", "delete") for call in calls
+        ), group_deletes)
+
+    def test_exact_two_boot_parser_and_causal_serial_boundary(self):
+        boot1_text = self.boot_log(1)
+        boot1 = persistence.parse_boot_segment(
+            boot1_text, 1, self.contract
+        )
+        full = boot1_text + self.boot_log(2)
+        boot2_text = persistence.boot2_suffix(
+            full, len(boot1_text.encode()),
+            hashlib.sha256(boot1_text.encode()).hexdigest(),
+        )
+        boot2 = persistence.parse_boot_segment(
+            boot2_text, 2, self.contract, boot1["identity"]
+        )
+        self.assertEqual((boot1["writes"], boot1["flushes"]), (5, 3))
+        self.assertEqual((boot2["writes"], boot2["flushes"]), (0, 0))
+        self.assertEqual(boot2["identity"], boot1["identity"])
+
+    def test_deadline_rejection_cannot_be_promoted_by_cleanup_retry(self):
+        error, interrupted, final, receipt, calls = (
+            self.production_cleanup_retry(expire_staging=True)
+        )
+        self.assertIsInstance(error, azure.RunCleanupError)
+        self.assertEqual(interrupted["phase"], "failed")
+        self.assertFalse(interrupted["acceptance_eligible"])
+        self.assertEqual(final["phase"], "cleaned")
+        self.assertFalse(final["acceptance_eligible"])
+        self.assertIn("failure", final)
+        self.assertEqual(receipt["result"], "PASS")
+        self.assertEqual(receipt["cleanup"], "pending")
+        self.assert_exact_production_lifecycle(calls)
+
+    def test_eligible_acceptance_is_promoted_after_cleanup_retry(self):
+        error, interrupted, final, receipt, calls = (
+            self.production_cleanup_retry(expire_staging=False)
+        )
+        self.assertIsInstance(error, persistence.PersistenceCleanupError)
+        self.assertEqual(interrupted["phase"], "cleanup-failed")
+        self.assertTrue(interrupted["acceptance_eligible"])
+        self.assertEqual(final["phase"], "cleaned")
+        self.assertTrue(final["acceptance_eligible"])
+        self.assertNotIn("failure", final)
+        self.assertEqual(receipt["result"], "PASS")
+        self.assertEqual(receipt["cleanup"], "complete")
+        self.assert_exact_production_lifecycle(calls)
+
+    def test_failed_eligibility_write_is_invalid_before_cleanup_records(self):
+        _state, state_path = self.prepare()
+        execute, calls = self.production_acceptance_cloud(
+            state_path, cleanup_failure="inventory"
+        )
+        original_save = azure.save_durable_json
+
+        def save(path, value):
+            if (
+                Path(path) == state_path
+                and value.get("phase") == "acceptance-recorded"
+                and value.get("acceptance_eligible") is True
+            ):
+                raise OSError(errno.EIO, "synthetic eligibility write failure")
+            if (
+                Path(path) == state_path
+                and value.get("phase") == "failed"
+            ):
+                raise OSError(errno.ENOSPC, "synthetic rejection write failure")
+            original_save(path, value)
+
+        with (
+            mock.patch.object(
+                persistence.azure, "azure_cli", side_effect=execute
+            ),
+            mock.patch.object(
+                persistence.azure, "check_upload_dependencies"
+            ),
+            mock.patch.object(
+                persistence.azure, "upload_managed_vhd"
+            ),
+            mock.patch.object(
+                persistence.azure, "interrupt_as_exception",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                persistence.azure, "save_durable_json", side_effect=save
+            ),
+            mock.patch.object(
+                persistence.time, "monotonic", return_value=100.0
+            ),
+        ):
+            with self.assertRaises(azure.RunCleanupError) as raised:
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, True,
+                    persistence.resource_envelope_sha256(self.contract),
+                )
+            interrupted, _ = persistence.load_state(self.state_dir)
+            self.assertEqual(interrupted["phase"], "cleanup-failed")
+            self.assertFalse(interrupted["acceptance_eligible"])
+            self.assertNotIn("failure", interrupted)
+            persistence.cleanup_state(self.state_dir, self.SUBSCRIPTION)
+        message = str(raised.exception)
+        self.assertIn("synthetic eligibility write failure", message)
+        self.assertIn("synthetic cleanup inventory failure", message)
+        self.assertIn("synthetic rejection write failure", message)
+        final, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(final["phase"], "cleaned")
+        self.assertFalse(final["acceptance_eligible"])
+        receipt = json.loads(
+            (self.state_dir / "persistence-receipt.json").read_text()
+        )
+        self.assertEqual(receipt["cleanup"], "pending")
+        self.assert_exact_production_lifecycle(calls, group_deletes=1)
+        self.assertEqual(sum(
+            call[:2] == ("resource", "list") for call in calls
+        ), 2)
+
+    def test_stale_or_replayed_boot1_never_authorizes_boot2(self):
+        boot1 = self.boot_log(1)
+        with self.assertRaisesRegex(ValueError, "Boot 1 or write"):
+            persistence.parse_boot_segment(
+                boot1 + self.boot_log(2), 2, self.contract
+            )
+        replay = (
+            "UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:" + self.RUN_ID + "\n"
+            + self.boot_log(2)
+        )
+        with self.assertRaisesRegex(ValueError, "Boot 1 or write"):
+            persistence.parse_boot_segment(
+                replay, 2, self.contract
+            )
+        with self.assertRaisesRegex(ValueError, "Boot 1 or write"):
+            persistence.parse_boot_segment(
+                "storage reseed detected\n" + self.boot_log(2),
+                2, self.contract,
+            )
+        with self.assertRaisesRegex(ValueError, "prefix changed"):
+            persistence.boot2_suffix(
+                "changed" + self.boot_log(2), len(boot1.encode()),
+                hashlib.sha256(boot1.encode()).hexdigest(),
+            )
+
+    def test_candidate_rejections_are_bounded_before_selection(self):
+        valid = self.boot_log(1).replace(
+            "HYPERV_PERSISTENCE SELECT PASS",
+            (
+                "HYPERV_PERSISTENCE CANDIDATE_REJECT PASS "
+                "reason=boot-signature id=2\n"
+                "HYPERV_PERSISTENCE SELECT PASS"
+            ),
+        )
+        persistence.parse_boot_segment(valid, 1, self.contract)
+        late = self.boot_log(1).replace(
+            "main returned 0",
+            (
+                "HYPERV_PERSISTENCE CANDIDATE_REJECT PASS "
+                "reason=boot-signature id=2\nmain returned 0"
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "unbounded or unordered"):
+            persistence.parse_boot_segment(late, 1, self.contract)
+        excessive = self.boot_log(1).replace(
+            "HYPERV_PERSISTENCE SELECT PASS",
+            "\n".join(
+                (
+                    "HYPERV_PERSISTENCE CANDIDATE_REJECT PASS "
+                    f"reason=boot-signature id={index}"
+                )
+                for index in range(17)
+            ) + "\nHYPERV_PERSISTENCE SELECT PASS",
+        )
+        with self.assertRaisesRegex(ValueError, "unbounded or unordered"):
+            persistence.parse_boot_segment(
+                excessive, 1, self.contract
+            )
+
+    def test_identity_geometry_lun_and_vpd_drift_fail_closed(self):
+        boot1 = persistence.parse_boot_segment(
+            self.boot_log(1), 1, self.contract
+        )
+        variants = (
+            self.identity_line(
+                controller="ffeeddccbbaa99887766554433221100"
+            ),
+            self.identity_line(lun=6),
+            self.identity_line(sectors=6144),
+            self.identity_line(vpd="5000010102030401"),
+        )
+        for identity in variants:
+            with self.subTest(identity=identity):
+                with self.assertRaises(ValueError):
+                    persistence.parse_boot_segment(
+                        self.boot_log(2, identity=identity), 2,
+                        self.contract, boot1["identity"],
+                    )
+
+    def test_failure_unavailable_exit_and_io_receipt_variants_are_rejected(self):
+        variants = (
+            self.boot_log(1).replace(
+                "HYPERV_PERSISTENCE SELECT PASS id=3 controller=1 state=0",
+                "HYPERV_PERSISTENCE SELECT UNAVAILABLE reason=no-devices "
+                "writes=0 flushes=0",
+            ),
+            self.boot_log(1).replace(
+                "HYPERV_PERSISTENCE FINAL PASS rc=0",
+                "HYPERV_PERSISTENCE FINAL FAIL rc=-5",
+            ),
+            self.boot_log(1).replace("main returned 0", "main returned 1"),
+            self.boot_log(1, writes=4),
+            self.boot_log(1, flushes=2),
+            self.boot_log(1).replace(
+                (
+                    f"UK_HYPERV_PERSISTENCE_IO:1:1:{self.RUN_ID}:"
+                    "5:3:receipt-verified\n"
+                ),
+                "",
+            ),
+            self.boot_log(1).replace(
+                "5:3:receipt-verified", "5:3:receipt-missing"
+            ),
+            self.boot_log(1).replace(
+                f"UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:{self.RUN_ID}\n",
+                "",
+            ),
+            self.boot_log(1).replace(
+                "UK_HYPERV_PERSISTENCE_IO:1:1:",
+                "UK_HYPERV_PERSISTENCE_IO:1:1:"
+            ) + (
+                f"UK_HYPERV_PERSISTENCE_IO:1:1:{self.RUN_ID}:5:3:"
+                "receipt-verified\n"
+            ),
+        )
+        for text in variants:
+            with self.subTest(text=text[-100:]):
+                with self.assertRaises(ValueError):
+                    persistence.parse_boot_segment(
+                        text, 1, self.contract
+                    )
+
+    def test_prepare_pins_seed_vhd_preflight_and_mutation(self):
+        state, path = self.prepare()
+        self.assertEqual(state["phase"], "prepared")
+        self.assertEqual(state["boot_count"], 0)
+        persistence.verify_immutable_inputs(state, path.parent)
+        data = path.parent / "inputs" / persistence.FILE_NAMES["data_raw"]
+        with data.open("r+b") as output:
+            output.seek(0)
+            output.write(b"x")
+        with self.assertRaisesRegex(ValueError, "input changed"):
+            persistence.verify_immutable_inputs(state, path.parent)
+
+    def test_contract_generator_requires_all_explicit_identity_and_envelope(self):
+        output = self.root / "generated-contract.json"
+        digest = persistence.create_contract(
+            output,
+            run_id=self.RUN_ID,
+            disk_id=self.DISK_ID,
+            sectors=4096,
+            lun=7,
+            subscription=self.SUBSCRIPTION,
+            location="northeurope",
+            vm_size="Standard_B1s",
+            vm_vcpus=1,
+            name_prefix="uk-hvpersist01",
+            os_disk_sku="Standard_LRS",
+            data_disk_sku="Standard_LRS",
+            runtime_seconds=600,
+            cleanup_seconds=600,
+            inputs=self.paths,
+            preflight_state_directory=self.preflight_state,
+        )
+        self.assertEqual(digest, azure.image_sha256(output))
+        self.assertEqual(json.loads(output.read_text()), self.contract)
+        persistence.private_preflight.load_completed_receipt.assert_called_with(
+            self.preflight_state
+        )
+        with self.assertRaises(FileExistsError):
+            persistence.create_contract(
+                output,
+                run_id=self.RUN_ID,
+                disk_id=self.DISK_ID,
+                sectors=4096,
+                lun=7,
+                subscription=self.SUBSCRIPTION,
+                location="northeurope",
+                vm_size="Standard_B1s",
+                vm_vcpus=1,
+                name_prefix="uk-hvpersist01",
+                os_disk_sku="Standard_LRS",
+                data_disk_sku="Standard_LRS",
+                runtime_seconds=600,
+                cleanup_seconds=600,
+                inputs=self.paths,
+                preflight_state_directory=self.preflight_state,
+            )
+
+    def test_real_handoff_rejects_incompatible_sdk_without_skipping(self):
+        with (
+            mock.patch(
+                __name__ + ".version",
+                return_value=persistence.private_preflight.SDK_VERSION,
+            ),
+            mock.patch.object(
+                persistence.private_preflight,
+                "implementation_contract",
+                side_effect=RuntimeError("Pinned SDK closure is incompatible"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "closure is incompatible"),
+        ):
+            with self.real_completed_preflight():
+                self.fail("An incompatible SDK reached the completed handoff")
+
+    def test_real_completed_handoff_and_approved_envelope(self):
+        geometry = {
+            "sectors": self.APPROVED_SECTORS,
+            "sector_size": persistence.SECTOR_SIZE,
+            "lun": self.APPROVED_LUN,
+        }
+        guest = {
+            "name": self.paths["guest_vhd"].name,
+            "sha256": azure.image_sha256(self.paths["guest_vhd"]),
+            "size": self.paths["guest_vhd"].stat().st_size,
+        }
+        with self.real_completed_preflight() as private, \
+                mock.patch.object(persistence.azure, "azure_cli") as cloud:
+            receipt, receipt_path = persistence.load_completed_preflight(
+                self.preflight_state, guest,
+                self.RUN_ID, self.DISK_ID, geometry,
+            )
+            self.assertEqual(
+                receipt_path,
+                self.preflight_state
+                / persistence.FILE_NAMES["preflight_receipt"],
+            )
+            self.assertEqual(
+                receipt["guarded"]["producer"],
+                private.guarded_producer_contract(),
+            )
+            approved = copy.deepcopy(self.contract)
+            approved["implementation"] = persistence.implementation_contract()
+            approved["geometry"] = geometry
+            approved["azure"].update({
+                "location": "northeurope",
+                "vm_size": "Standard_D2s_v5",
+                "vm_vcpus": 2,
+                "os_disk_sku": "StandardSSD_LRS",
+                "data_disk_sku": "StandardSSD_LRS",
+            })
+            approved["preflight"] = receipt
+            approved["files"]["guest_vhd"] = guest
+            approved["files"]["data_raw"]["size"] = 4 * 1024 ** 3
+            approved["files"]["data_vhd"]["size"] = 4 * 1024 ** 3 + 512
+            approved["files"]["preflight_receipt"] = {
+                "name": receipt_path.name,
+                "sha256": azure.image_sha256(receipt_path),
+                "size": receipt_path.stat().st_size,
+            }
+            validated = persistence.validate_contract(approved)
+            self.assertEqual(
+                validated["geometry"]["sectors"],
+                self.APPROVED_SECTORS,
+            )
+            self.assertEqual(
+                validated["azure"]["vm_size"], "Standard_D2s_v5"
+            )
+            self.assertEqual(validated["azure"]["vm_vcpus"], 2)
+            self.assertEqual(
+                validated["azure"]["data_disk_sku"],
+                "StandardSSD_LRS",
+            )
+
+            def copied(name):
+                destination = self.root / f"invalid-{name}"
+                shutil.copytree(self.preflight_state, destination)
+                return destination
+
+            def state_mutation(name, update):
+                directory = copied(name)
+                state_path = directory / private.STATE_FILE
+                state = json.loads(state_path.read_text())
+                update(state)
+                private.azure.save_durable_json(state_path, state)
+                return directory
+
+            invalid = {
+                "prepared": state_mutation(
+                    "prepared",
+                    lambda state: state.update(phase="prepared"),
+                ),
+                "active-sas": state_mutation(
+                    "active-sas",
+                    lambda state: state.update(active_sas=True),
+                ),
+                "incomplete-cleanup": state_mutation(
+                    "incomplete-cleanup",
+                    lambda state: state.update(cleanup_required=True),
+                ),
+                "immutable-input": copied("immutable-input"),
+                "serial-log": copied("serial-log"),
+                "stale-receipt": copied("stale-receipt"),
+            }
+            qemu = (
+                invalid["immutable-input"] / "inputs"
+                / private.INPUT_NAMES["qemu"]
+            )
+            qemu.write_bytes(qemu.read_bytes() + b"x")
+            log = (
+                invalid["serial-log"] / "evidence" / "private"
+                / "raw-x2apic.log"
+            )
+            log.write_bytes(log.read_bytes() + b"\nreplayed")
+            stale_path = invalid["stale-receipt"] / "private-receipt.json"
+            stale = json.loads(stale_path.read_text())
+            stale["cleanup"] = "pending"
+            stale_path.unlink()
+            private.save_private_bytes(
+                stale_path, private.azure.canonical_json(stale)
+            )
+            stale_state_path = (
+                invalid["stale-receipt"] / private.STATE_FILE
+            )
+            stale_state = json.loads(stale_state_path.read_text())
+            stale_state["final_receipt_sha256"] = (
+                private.azure.image_sha256(stale_path)
+            )
+            private.azure.save_durable_json(
+                stale_state_path, stale_state
+            )
+            for name, directory in invalid.items():
+                with self.subTest(invalid_handoff=name):
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        persistence.load_completed_preflight(
+                            directory, guest,
+                            self.RUN_ID, self.DISK_ID, geometry,
+                        )
+            mismatched = dict(geometry, lun=geometry["lun"] - 1)
+            with self.assertRaises(ValueError):
+                persistence.load_completed_preflight(
+                    self.preflight_state, guest,
+                    self.RUN_ID, self.DISK_ID, mismatched,
+                )
+            cloud.assert_not_called()
+
+    def test_prepared_only_private_state_cannot_create_or_prepare(self):
+        with mock.patch.object(
+            persistence.private_preflight,
+            "load_completed_receipt",
+            side_effect=ValueError(
+                "Private preflight is not completely cleaned"
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "not completely cleaned"):
+                persistence.create_contract(
+                    self.root / "untrusted-contract.json",
+                    run_id=self.RUN_ID,
+                    disk_id=self.DISK_ID,
+                    sectors=4096,
+                    lun=7,
+                    subscription=self.SUBSCRIPTION,
+                    location="northeurope",
+                    vm_size="Standard_B1s",
+                    vm_vcpus=1,
+                    name_prefix="uk-hvpersist01",
+                    os_disk_sku="Standard_LRS",
+                    data_disk_sku="Standard_LRS",
+                    runtime_seconds=600,
+                    cleanup_seconds=600,
+                    inputs=self.paths,
+                    preflight_state_directory=self.preflight_state,
+                )
+            with self.assertRaisesRegex(ValueError, "not completely cleaned"):
+                persistence.prepare_state(
+                    self.contract_path, self.contract_sha256,
+                    self.state_dir, self.paths, self.preflight_state,
+                )
+        self.assertFalse(self.state_dir.exists())
+
+    def test_contract_limits_and_build_only_preflight_fail_closed(self):
+        variants = []
+        for field, value in (
+            ("sectors", True),
+            ("sectors", persistence.MAX_SECTORS + 1),
+            ("sector_size", 4096),
+            ("lun", 64),
+        ):
+            contract = copy.deepcopy(self.contract)
+            contract["geometry"][field] = value
+            variants.append(contract)
+        contract = copy.deepcopy(self.contract)
+        contract["azure"]["max_boots"] = 3
+        variants.append(contract)
+        contract = copy.deepcopy(self.contract)
+        contract["azure"]["resource_counts"]["virtual_machines"] = 2
+        variants.append(contract)
+        contract = copy.deepcopy(self.contract)
+        contract["run_id"] = "0" * 32
+        variants.append(contract)
+        contract = copy.deepcopy(self.contract)
+        contract["disk_id"] = contract["run_id"]
+        variants.append(contract)
+        for contract in variants:
+            contract["implementation"] = persistence.implementation_contract()
+            with self.subTest(contract=contract["geometry"]):
+                with self.assertRaises(ValueError):
+                    persistence.validate_contract(contract)
+        for field, value in (
+            ("result", "PREPARED"),
+            ("acceptance_scope", "storage"),
+            ("boot_policy", "platform-unavailable-v1"),
+            ("storage_result", "PASS"),
+            ("cleanup", "pending"),
+        ):
+            preflight = copy.deepcopy(self.contract["preflight"])
+            preflight[field] = value
+            with self.subTest(preflight_field=field):
+                with self.assertRaises(ValueError):
+                    persistence.validate_preflight_receipt(
+                        preflight, self.contract["files"]["guest_vhd"],
+                        self.RUN_ID, self.DISK_ID,
+                        self.contract["geometry"],
+                    )
+        preflight = copy.deepcopy(self.contract["preflight"])
+        preflight["guarded"]["lun"] = 6
+        with self.assertRaises(ValueError):
+            persistence.validate_preflight_receipt(
+                preflight, self.contract["files"]["guest_vhd"],
+                self.RUN_ID, self.DISK_ID, self.contract["geometry"],
+            )
+        preflight = copy.deepcopy(self.contract["preflight"])
+        preflight["host"]["disk_uuid"] = (
+            preflight["host"]["vm_uuid"]
+        )
+        with self.assertRaises(ValueError):
+            persistence.validate_preflight_receipt(
+                preflight, self.contract["files"]["guest_vhd"],
+                self.RUN_ID, self.DISK_ID, self.contract["geometry"],
+            )
+
+    def test_cloud_is_default_off_and_interrupted_state_cannot_restart(self):
+        state, path = self.prepare()
+        with mock.patch.object(persistence.azure, "azure_cli") as cloud:
+            with self.assertRaisesRegex(ValueError, "approval"):
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, False,
+                    persistence.resource_envelope_sha256(self.contract),
+                )
+            cloud.assert_not_called()
+        with mock.patch.object(persistence.azure, "azure_cli") as cloud:
+            with self.assertRaisesRegex(ValueError, "approval does not match"):
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, True, "f" * 64,
+                )
+            cloud.assert_not_called()
+        state["phase"] = "boot2-start-requested"
+        state["cleanup_required"] = True
+        state["boot_count"] = 2
+        azure.save_durable_json(path, state)
+        with mock.patch.object(persistence.azure, "azure_cli") as cloud:
+            with self.assertRaisesRegex(ValueError, "may only be cleaned"):
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, True,
+                    persistence.resource_envelope_sha256(self.contract),
+                )
+            cloud.assert_not_called()
+
+    def test_state_lock_serializes_run_and_cleanup_across_processes(self):
+        self.prepare()
+        script = (
+            "import pathlib,sys;"
+            f"sys.path.insert(0,{str(SUPPORT / 'scripts')!r});"
+            "import hyperv_persistence_controller as p;"
+            "state=pathlib.Path(sys.argv[2]);"
+            "\ntry:\n"
+            "  if sys.argv[1]=='cleanup':\n"
+            f"    p.cleanup_state(state,{self.SUBSCRIPTION!r})\n"
+            "  else:\n"
+            f"    p.run_acceptance(state,{self.SUBSCRIPTION!r},False,"
+            f"{persistence.resource_envelope_sha256(self.contract)!r})\n"
+            "except RuntimeError as error:\n"
+            "  if 'already controlled' not in str(error): raise\n"
+            "  print('LOCKED')\n"
+        )
+        environment = {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(SUPPORT / "scripts"),
+            "TMPDIR": str(self.root),
+        }
+        with persistence.PersistenceStateLock(self.state_dir):
+            for action in ("run", "cleanup"):
+                result = subprocess.run(
+                    [
+                        sys.executable, "-B", "-c", script,
+                        action, str(self.state_dir),
+                    ],
+                    cwd=SUPPORT.parent,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "LOCKED")
+
+    def test_all_irreversible_phases_refuse_reenrollment_or_another_boot(self):
+        _state, path = self.prepare()
+        for phase, boot_count in (
+            ("creating-os-disk", 0),
+            ("uploading-data-disk", 0),
+            ("deploying-vm", 1),
+            ("waiting-boot1", 1),
+            ("boot1-deallocated", 1),
+            ("boot2-start-requested", 2),
+            ("waiting-boot2", 2),
+        ):
+            with self.subTest(phase=phase):
+                state, _ = persistence.load_state(self.state_dir)
+                state.update(
+                    phase=phase, boot_count=boot_count,
+                    cleanup_required=True,
+                )
+                azure.save_durable_json(path, state)
+                with mock.patch.object(
+                    persistence.azure, "azure_cli"
+                ) as cloud:
+                    with self.assertRaisesRegex(
+                        ValueError, "may only be cleaned"
+                    ):
+                        persistence.run_acceptance(
+                            self.state_dir, self.SUBSCRIPTION, True,
+                            persistence.resource_envelope_sha256(
+                                self.contract
+                            ),
+                        )
+                    cloud.assert_not_called()
+                state.update(
+                    phase="prepared", boot_count=0,
+                    cleanup_required=False,
+                )
+                azure.save_durable_json(path, state)
+
+    def test_exact_state_machine_uses_one_deployment_and_one_restart(self):
+        _state, _path = self.prepare()
+        calls = []
+        outer = self
+
+        class FakeRun:
+            def __init__(self, state, state_path):
+                self.state = state
+                self.state_path = state_path
+                self.directory = state_path.parent
+                self.deadline = None
+
+            def record(self, phase, **fields):
+                self.state.update(fields, phase=phase)
+                azure.save_durable_json(self.state_path, self.state)
+
+            def check_cloud(self):
+                calls.append("preflight")
+                return {"subscription": outer.SUBSCRIPTION, "sku": {}}
+
+            def create_group(self):
+                calls.append("group")
+                self.record("group-created", resource_group_id="/group")
+
+            def upload_disk(self, role):
+                calls.append("upload-" + role)
+                self.state[role + "_disk"] = {
+                    "id": "/" + role, "uuid": (
+                        outer.OS_UUID if role == "os" else outer.DATA_UUID
+                    ),
+                }
+                self.record(role + "-disk-ready")
+
+            def deploy_vm(self):
+                calls.append("deploy")
+                self.state["boot_count"] = 1
+                self.state["vm"] = {
+                    "id": "/vm", "uuid": outer.VM_UUID,
+                    "deployment_id": "/deployment",
+                    "correlation_id": outer.CORRELATION_UUID,
+                    "nic_id": "/nic", "os_disk_id": "/os",
+                    "data_disk_id": "/data",
+                }
+                self.record("vm-created")
+
+            def wait_for_boot(self, boot):
+                calls.append("boot" + str(boot))
+                text = outer.boot_log(boot)
+                enrolled = self.state.get("enrolled_identity")
+                evidence = persistence.parse_boot_segment(
+                    text, boot, outer.contract, enrolled
+                )
+                return (
+                    text if boot == 1
+                    else outer.boot_log(1) + text,
+                    evidence,
+                )
+
+            def deallocate(self, boot):
+                calls.append("deallocate" + str(boot))
+                self.record(f"boot{boot}-deallocated")
+
+            def start_boot2(self):
+                calls.append("start")
+                self.record("boot2-start-requested", boot_count=2)
+
+            def cleanup(self):
+                calls.append("cleanup")
+                self.record("cleaned", cleanup_required=False)
+
+            def private_failure_values(self):
+                return ()
+
+            def ensure_deadline(self):
+                return None
+
+        with (
+            mock.patch.object(
+                persistence, "PersistenceRun", FakeRun
+            ),
+            mock.patch.object(
+                persistence.azure, "check_upload_dependencies"
+            ),
+            mock.patch.object(
+                persistence.azure, "interrupt_as_exception",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            receipt_path = persistence.run_acceptance(
+                self.state_dir, self.SUBSCRIPTION, True,
+                persistence.resource_envelope_sha256(self.contract),
+            )
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["boots"]["count"], 2)
+        self.assertEqual(receipt["cleanup"], "complete")
+        self.assertEqual(calls.count("deploy"), 1)
+        self.assertEqual(calls.count("start"), 1)
+        self.assertEqual(
+            calls,
+            [
+                "preflight", "group", "upload-os", "upload-data",
+                "deploy", "boot1", "deallocate1", "start", "boot2",
+                "deallocate2", "cleanup",
+            ],
+        )
+
+    def test_primary_and_cleanup_failures_are_both_durable(self):
+        _state, _path = self.prepare()
+
+        class FailingRun:
+            def __init__(self, state, state_path):
+                self.state = state
+                self.state_path = state_path
+                self.deadline = None
+
+            def record(self, phase, **fields):
+                self.state.update(fields, phase=phase)
+                azure.save_durable_json(self.state_path, self.state)
+
+            def check_cloud(self):
+                raise RuntimeError(
+                    "/subscriptions/primary-private-id failed"
+                )
+
+            def cleanup(self):
+                raise RuntimeError(
+                    "/subscriptions/cleanup-private-id failed"
+                )
+
+            def private_failure_values(self):
+                return ("primary-private-id", "cleanup-private-id")
+
+        with (
+            mock.patch.object(persistence, "PersistenceRun", FailingRun),
+            mock.patch.object(
+                persistence.azure, "check_upload_dependencies"
+            ),
+            mock.patch.object(
+                persistence.azure, "interrupt_as_exception",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            with self.assertRaises(azure.RunCleanupError) as raised:
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, True,
+                    persistence.resource_envelope_sha256(self.contract),
+                )
+        self.assertNotIn("primary-private-id", str(raised.exception))
+        self.assertNotIn("cleanup-private-id", str(raised.exception))
+        state, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(state["phase"], "failed")
+        self.assertTrue(state["cleanup_required"])
+        self.assertFalse(state["acceptance_eligible"])
+        self.assertIn("cleanup", state["failure"])
+
+    def test_failure_recording_cannot_mask_primary_and_cleanup(self):
+        _state, _path = self.prepare()
+
+        class RecordingFailureRun:
+            def __init__(self, state, state_path):
+                self.state = state
+                self.state_path = state_path
+                self.deadline = None
+
+            def record(self, phase, **fields):
+                if phase == "failed":
+                    raise OSError(errno.ENOSPC, "synthetic disk full")
+                self.state.update(fields, phase=phase)
+                azure.save_durable_json(self.state_path, self.state)
+
+            def check_cloud(self):
+                raise RuntimeError(
+                    "/subscriptions/primary-private-id failed"
+                )
+
+            def cleanup(self):
+                raise RuntimeError(
+                    "/subscriptions/cleanup-private-id failed"
+                )
+
+            def private_failure_values(self):
+                return ("primary-private-id", "cleanup-private-id")
+
+        with (
+            mock.patch.object(
+                persistence, "PersistenceRun", RecordingFailureRun
+            ),
+            mock.patch.object(
+                persistence.azure, "check_upload_dependencies"
+            ),
+            mock.patch.object(
+                persistence.azure, "interrupt_as_exception",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            with self.assertRaises(azure.RunCleanupError) as raised:
+                persistence.run_acceptance(
+                    self.state_dir, self.SUBSCRIPTION, True,
+                    persistence.resource_envelope_sha256(self.contract),
+                )
+        message = str(raised.exception)
+        self.assertIn("Primary run failure", message)
+        self.assertIn("cleanup also failed", message)
+        self.assertIn(
+            "durable cleanup-failure recording also failed", message
+        )
+        self.assertIn("synthetic disk full", message)
+        self.assertNotIn("primary-private-id", message)
+        self.assertNotIn("cleanup-private-id", message)
+
+    def test_replaced_uuid_and_foreign_attachment_are_rejected(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        with self.assertRaisesRegex(RuntimeError, "replaced"):
+            run.verify_disk(
+                "data",
+                self.live_disk(
+                    state, "data",
+                    disk_uuid="55555555-5555-4555-8555-555555555555",
+                ),
+                attached_vm_id=state["vm"]["id"],
+            )
+        run.az = mock.Mock(return_value=self.live_vm(
+            state, data_disk_id="/foreign/data"
+        ))
+        with self.assertRaisesRegex(RuntimeError, "replaced"):
+            run.verify_vm()
+        run.az = mock.Mock(return_value=self.live_vm(
+            state,
+            vm_uuid="66666666-6666-4666-8666-666666666666",
+        ))
+        with self.assertRaisesRegex(RuntimeError, "replaced"):
+            run.verify_vm()
+
+    def test_vm_and_disk_uuid_proofs_must_come_from_create_outputs(self):
+        state, path = self.prepare()
+        state["resource_group_id"] = (
+            f"/subscriptions/{self.SUBSCRIPTION}/resourceGroups/"
+            f"{self.contract['azure']['resource_group']}"
+        )
+        run = persistence.PersistenceRun(state, path)
+        disk = {
+            "id": run.expected_id(
+                "Microsoft.Compute", "disks",
+                self.contract["azure"]["data_disk_name"],
+            ),
+            "tags": run.tags,
+        }
+        with self.assertRaisesRegex(ValueError, "UUID"):
+            run.disk_proof("data", disk)
+
+    def test_reserved_disks_allow_only_the_proven_second_boot(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        state.update(
+            phase="boot1-deallocated",
+            boot_count=1,
+            cleanup_required=True,
+        )
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        commands = []
+
+        def execute(arguments, **_kwargs):
+            commands.append(tuple(arguments[:2]))
+            if arguments[:3] == ["deployment", "group", "show"]:
+                return self.live_deployment(state)
+            if arguments[:2] == ["vm", "show"]:
+                return self.live_vm(state)
+            if arguments[:2] == ["disk", "show"]:
+                role = (
+                    "os" if arguments[arguments.index("--name") + 1]
+                    == self.contract["azure"]["os_disk_name"] else "data"
+                )
+                disk = self.live_disk(state, role)
+                disk["diskState"] = "Reserved"
+                return disk
+            if arguments[:2] == ["vm", "start"]:
+                return None
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        run.az = execute
+        run.start_boot2()
+        self.assertEqual(run.state["boot_count"], 2)
+        self.assertEqual(commands.count(("vm", "start")), 1)
+
+    def test_deploy_revalidates_both_disk_uuids_before_vm_creation(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        state.pop("vm")
+        state.pop("vm_operation")
+        state.update(
+            phase="data-disk-ready",
+            boot_count=0,
+            cleanup_required=True,
+        )
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        commands = []
+
+        def execute(arguments, **_kwargs):
+            commands.append(tuple(arguments[:3]))
+            if arguments[:2] == ["disk", "show"]:
+                role = (
+                    "os" if arguments[arguments.index("--name") + 1]
+                    == self.contract["azure"]["os_disk_name"] else "data"
+                )
+                return self.unattached_disk(
+                    state, role,
+                    disk_uuid=(
+                        "55555555-5555-4555-8555-555555555555"
+                        if role == "data" else None
+                    ),
+                )
+            self.fail("VM deployment ran before disk revalidation completed")
+
+        run.az = execute
+        with self.assertRaisesRegex(RuntimeError, "replaced"):
+            run.deploy_vm()
+        reloaded, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(reloaded["vm_operation"]["phase"], "pending")
+        self.assertNotIn("vm", reloaded)
+        self.assertEqual(
+            [command[:2] for command in commands],
+            [("disk", "show"), ("disk", "show")],
+        )
+
+    def test_late_deployment_persists_returned_identities_before_failure(self):
+        state, path = self.prepare()
+        complete = self.attach_proofs(copy.deepcopy(state))
+        operation_id = complete["vm_operation"]["operation_id"]
+        deployment = self.live_deployment(complete)
+        state.update({
+            "phase": "data-disk-ready",
+            "cleanup_required": True,
+            "resource_group_id": complete["resource_group_id"],
+            "os_disk": complete["os_disk"],
+            "data_disk": complete["data_disk"],
+        })
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        clock = [100.0]
+        run.deadline = 100.25
+
+        def execute(arguments, **_kwargs):
+            if arguments[:2] == ["disk", "show"]:
+                role = (
+                    "os" if arguments[arguments.index("--name") + 1]
+                    == self.contract["azure"]["os_disk_name"] else "data"
+                )
+                return self.unattached_disk(state, role)
+            if arguments[:3] == ["deployment", "group", "create"]:
+                clock[0] = 100.5
+                return deployment
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        run.az = execute
+        with (
+            mock.patch.object(
+                persistence.uuid, "uuid4",
+                return_value=uuid.UUID(operation_id),
+            ),
+            mock.patch.object(
+                persistence.time, "monotonic",
+                side_effect=lambda: clock[0],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "deadline expired"):
+                run.deploy_vm()
+        reloaded, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(reloaded["phase"], "deploying-vm")
+        self.assertEqual(reloaded["vm"]["uuid"], self.VM_UUID)
+        self.assertEqual(
+            reloaded["vm_operation"],
+            complete["vm_operation"],
+        )
+
+    def test_cleanup_deallocates_proven_vm_when_one_disk_is_unproven(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        run.deadline = time.monotonic() - 1
+        commands = []
+        group = {
+            "id": state["resource_group_id"],
+            "location": self.contract["azure"]["location"],
+            "tags": run.tags,
+        }
+        resources = [
+            self.owned_resource(run, identifier)
+            for identifier in run.expected_resource_ids()
+        ]
+
+        def execute(arguments, **_kwargs):
+            commands.append(tuple(arguments[:2]))
+            if arguments[:2] == ["group", "exists"]:
+                return True
+            if arguments[:2] == ["group", "show"]:
+                return group
+            if arguments[:2] == ["resource", "list"]:
+                return resources
+            if arguments[:3] == ["deployment", "group", "show"]:
+                return self.live_deployment(state)
+            if arguments[:2] == ["vm", "show"]:
+                return self.live_vm(
+                    state, data_disk_id="/foreign/attachment"
+                )
+            if arguments[:2] == ["disk", "show"]:
+                role = (
+                    "os" if arguments[arguments.index("--name") + 1]
+                    == self.contract["azure"]["os_disk_name"] else "data"
+                )
+                return self.live_disk(
+                    state, role,
+                    disk_uuid=(
+                        "55555555-5555-4555-8555-555555555555"
+                        if role == "data" else None
+                    ),
+                )
+            if arguments[:2] == ["vm", "deallocate"]:
+                return None
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        run.az = execute
+        with self.assertRaises(persistence.PersistenceCleanupError):
+            run.cleanup()
+        self.assertIn(("vm", "deallocate"), commands)
+        self.assertNotIn(("group", "delete"), commands)
+
+    def test_fractional_deadline_cannot_publish_late_deallocation(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        clock = [100.0]
+        run.deadline = 100.25
+        run.verify_topology = mock.Mock()
+        original_record = run.record
+        phases = []
+
+        def record(phase, **fields):
+            phases.append(phase)
+            original_record(phase, **fields)
+
+        def execute(_arguments, **kwargs):
+            self.assertAlmostEqual(kwargs["timeout"], 0.25)
+            clock[0] = 100.5
+
+        run.record = record
+        run.az = execute
+        with mock.patch.object(
+            persistence.time, "monotonic",
+            side_effect=lambda: clock[0],
+        ):
+            self.assertAlmostEqual(run.remaining(10), 0.25)
+            with self.assertRaisesRegex(RuntimeError, "deadline expired"):
+                run.deallocate(2)
+        self.assertEqual(phases, ["deallocating-boot2"])
+        reloaded, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(reloaded["phase"], "deallocating-boot2")
+
+    def test_cleanup_accepts_proven_partial_resource_envelope(self):
+        state, path = self.prepare()
+        group_id = (
+            f"/subscriptions/{self.SUBSCRIPTION}/resourceGroups/"
+            f"{self.contract['azure']['resource_group']}"
+        )
+        state.update({
+            "phase": "os-disk-created",
+            "cleanup_required": True,
+            "resource_group_id": group_id,
+            "os_disk": {
+                "id": group_id + (
+                    "/providers/Microsoft.Compute/disks/"
+                    + self.contract["azure"]["os_disk_name"]
+                ),
+                "uuid": self.OS_UUID,
+            },
+        })
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        group = {
+            "id": group_id,
+            "location": self.contract["azure"]["location"],
+            "tags": run.tags,
+        }
+        disk = {
+            "id": state["os_disk"]["id"],
+            "uniqueId": self.OS_UUID,
+            "tags": run.tags,
+            "managedBy": None,
+            "diskSizeBytes": (
+                self.contract["files"]["guest_vhd"]["size"] - 512
+            ),
+            "provisioningState": "Succeeded",
+            "diskState": "ReadyToUpload",
+            "osType": "Linux",
+            "hyperVGeneration": "V2",
+        }
+        commands = []
+
+        def execute(arguments, **_kwargs):
+            commands.append(tuple(arguments[:2]))
+            if arguments[:2] == ["group", "exists"]:
+                return len([
+                    command for command in commands
+                    if command == ("group", "exists")
+                ]) == 1
+            if arguments[:2] == ["group", "show"]:
+                return group
+            if arguments[:2] == ["resource", "list"]:
+                return [{"id": state["os_disk"]["id"], "tags": run.tags}]
+            if arguments[:2] == ["disk", "show"]:
+                return disk
+            if arguments[:2] == ["group", "delete"]:
+                return None
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        run.az = execute
+        run.cleanup()
+        self.assertEqual(run.state["phase"], "cleaned")
+        self.assertIn(("group", "delete"), commands)
+
+    def test_unproven_partial_disk_blocks_group_deletion(self):
+        state, path = self.prepare()
+        group_id = (
+            f"/subscriptions/{self.SUBSCRIPTION}/resourceGroups/"
+            f"{self.contract['azure']['resource_group']}"
+        )
+        state.update({
+            "phase": "creating-os-disk",
+            "cleanup_required": True,
+            "resource_group_id": group_id,
+        })
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        disk_id = run.expected_id(
+            "Microsoft.Compute", "disks",
+            self.contract["azure"]["os_disk_name"],
+        )
+
+        def execute(arguments, **_kwargs):
+            if arguments[:2] == ["group", "exists"]:
+                return True
+            if arguments[:2] == ["group", "show"]:
+                return {
+                    "id": group_id,
+                    "location": self.contract["azure"]["location"],
+                    "tags": run.tags,
+                }
+            if arguments[:2] == ["resource", "list"]:
+                return [{"id": disk_id, "tags": run.tags}]
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        run.az = execute
+        with self.assertRaises(persistence.PersistenceCleanupError):
+            run.cleanup()
+        self.assertEqual(run.state["phase"], "cleanup-failed")
+
+    def test_interrupted_group_creation_cleans_only_an_empty_group(self):
+        state, path = self.prepare()
+        state.update({
+            "phase": "creating-group",
+            "cleanup_required": True,
+        })
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        calls = 0
+
+        def execute(arguments, **_kwargs):
+            nonlocal calls
+            if arguments[:2] == ["group", "exists"]:
+                calls += 1
+                return calls == 1
+            if arguments[:2] == ["group", "show"]:
+                return {
+                    "id": "/created-response-was-lost",
+                    "location": self.contract["azure"]["location"],
+                    "tags": run.tags,
+                }
+            if arguments[:2] == ["resource", "list"]:
+                return []
+            if arguments[:2] == ["group", "delete"]:
+                return None
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        run.az = execute
+        run.cleanup()
+        self.assertEqual(run.state["phase"], "cleaned")
+
+    def test_cleanup_never_adopts_later_replacement_deployment(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        state.pop("vm")
+        original_operation = state["vm_operation"]["operation_id"]
+        state["vm_operation"]["phase"] = "pending"
+        state.update({
+            "phase": "deploying-vm",
+            "cleanup_required": True,
+            "boot_count": 1,
+        })
+        azure.save_durable_json(path, state)
+        state, path = persistence.load_state(self.state_dir)
+        run = persistence.PersistenceRun(state, path)
+        group = {
+            "id": state["resource_group_id"],
+            "location": self.contract["azure"]["location"],
+            "tags": run.tags,
+        }
+        expected_resources = [
+            self.owned_resource(
+                run, identifier,
+                operation_id=(
+                    "88888888-8888-4888-8888-888888888888"
+                ),
+            )
+            for identifier in run.expected_resource_ids()
+        ]
+        commands = []
+
+        def execute(arguments, **_kwargs):
+            commands.append(tuple(arguments[:3]))
+            if arguments[:2] == ["group", "exists"]:
+                return True
+            if arguments[:2] == ["group", "show"]:
+                return group
+            if arguments[:2] == ["resource", "list"]:
+                return expected_resources
+            if arguments[:2] == ["disk", "show"]:
+                role = (
+                    "os" if arguments[arguments.index("--name") + 1]
+                    == self.contract["azure"]["os_disk_name"] else "data"
+                )
+                proof = run.state[f"{role}_disk"]
+                return {
+                    "id": proof["id"],
+                    "uniqueId": proof["uuid"],
+                    "tags": run.tags,
+                    "managedBy": None,
+                    "diskSizeBytes": (
+                        self.contract["files"]["guest_vhd"]["size"] - 512
+                        if role == "os"
+                        else self.contract["geometry"]["sectors"] * 512
+                    ),
+                    "provisioningState": "Succeeded",
+                    "diskState": "Reserved",
+                    "osType": "Linux" if role == "os" else None,
+                    "hyperVGeneration": "V2" if role == "os" else None,
+                }
+            self.fail(f"unexpected cloud operation: {arguments}")
+
+        run.az = execute
+        with self.assertRaises(persistence.PersistenceCleanupError):
+            run.cleanup()
+        self.assertNotIn("vm", run.state)
+        self.assertEqual(
+            run.state["vm_operation"]["operation_id"],
+            original_operation,
+        )
+        self.assertNotIn(
+            ("deployment", "group", "show"), commands
+        )
+        self.assertFalse(any(
+            command[:2] == ("group", "delete")
+            for command in commands
+        ))
+
+    def test_same_named_replacement_deployment_output_is_rejected(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        replacement = self.live_deployment(state)
+        replacement["properties"]["parameters"]["operationId"]["value"] = (
+            "88888888-8888-4888-8888-888888888888"
+        )
+        replacement["properties"]["correlationId"] = (
+            "77777777-7777-4777-8777-777777777777"
+        )
+        replacement["properties"]["outputs"]["vmUuid"]["value"] = (
+            "66666666-6666-4666-8666-666666666666"
+        )
+        with self.assertRaisesRegex(RuntimeError, "provenance"):
+            run.vm_proof(replacement)
+
+    def test_cleanup_finalizes_durable_acceptance_after_reload(self):
+        state, path = self.prepare()
+        state = self.attach_proofs(state)
+        boot1_text = self.boot_log(1)
+        identity = persistence.parse_boot_segment(
+            boot1_text, 1, self.contract
+        )["identity"]
+        state.update({
+            "phase": "boot2-deallocated",
+            "enrolled_identity": identity,
+            "boot1": persistence.parse_boot_segment(
+                boot1_text, 1, self.contract
+            ),
+            "boot1_serial_bytes": len(boot1_text.encode()),
+            "boot1_serial_sha256": hashlib.sha256(
+                boot1_text.encode()
+            ).hexdigest(),
+            "boot2": persistence.parse_boot_segment(
+                self.boot_log(2), 2, self.contract, identity
+            ),
+        })
+        azure.save_durable_json(path, state)
+        run = persistence.PersistenceRun(state, path)
+        _receipt, receipt_path = persistence.save_acceptance_receipt(
+            run, state["boot1"], state["boot2"], "pending"
+        )
+        run.record(
+            "acceptance-recorded",
+            acceptance_eligible=True,
+            acceptance_receipt_sha256=azure.image_sha256(receipt_path),
+        )
+
+        def complete_cleanup(reloaded):
+            reloaded.record("cleaned", cleanup_required=False)
+
+        with mock.patch.object(
+            persistence.PersistenceRun, "cleanup", complete_cleanup
+        ):
+            persistence.cleanup_state(self.state_dir, self.SUBSCRIPTION)
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["cleanup"], "complete")
+        final, _ = persistence.load_state(self.state_dir)
+        self.assertEqual(
+            final["acceptance_receipt_sha256"],
+            azure.image_sha256(receipt_path),
+        )
+
+
+class HypervPersistenceTemplateTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.template = json.loads(
+            (SUPPORT / "azure/hyperv-persistence.json").read_text()
+        )
+        cls.resources = {
+            resource["type"]: resource
+            for resource in cls.template["resources"]
+        }
+
+    def test_exact_data_disk_and_no_public_ingress(self):
+        vm = self.resources["Microsoft.Compute/virtualMachines"][
+            "properties"
+        ]
+        self.assertEqual(len(vm["storageProfile"]["dataDisks"]), 1)
+        data = vm["storageProfile"]["dataDisks"][0]
+        self.assertEqual(data["lun"], "[parameters('dataLun')]")
+        self.assertEqual(data["createOption"], "Attach")
+        self.assertEqual(data["caching"], "None")
+        self.assertEqual(data["deleteOption"], "Detach")
+        self.assertFalse(data["writeAcceleratorEnabled"])
+        self.assertNotIn(
+            "Microsoft.Network/publicIPAddresses", self.resources
+        )
+        vnet = self.resources["Microsoft.Network/virtualNetworks"][
+            "properties"
+        ]
+        self.assertFalse(
+            vnet["subnets"][0]["properties"]["defaultOutboundAccess"]
+        )
+
+    def test_all_resources_have_exact_persistence_ownership(self):
+        for resource in self.resources.values():
+            self.assertEqual(resource["tags"], "[variables('tags')]")
+        tags = self.template["variables"]["tags"]
+        self.assertEqual(tags["purpose"], persistence.PURPOSE)
+        self.assertEqual(tags["seed-sha256"], "[parameters('seedSha256')]")
+        self.assertEqual(
+            tags["persistence-operation"],
+            "[parameters('operationId')]",
+        )
+
+    def test_vm_uses_prevalidated_external_disks_and_operation_output(self):
+        vm = self.resources["Microsoft.Compute/virtualMachines"]
+        self.assertEqual(
+            vm["dependsOn"],
+            [
+                "[resourceId('Microsoft.Network/networkInterfaces', "
+                "variables('nicName'))]"
+            ],
+        )
+        storage = vm["properties"]["storageProfile"]
+        self.assertEqual(
+            storage["osDisk"]["managedDisk"]["id"],
+            "[parameters('osDiskId')]",
+        )
+        self.assertEqual(
+            storage["dataDisks"][0]["managedDisk"]["id"],
+            "[parameters('dataDiskId')]",
+        )
+        self.assertIn("operationId", self.template["parameters"])
+        self.assertIn(
+            "'2025-11-01', 'Full'",
+            self.template["outputs"]["vmUuid"]["value"],
         )
 
 

@@ -37,8 +37,11 @@ def upload_pages(image, endpoint, sas):
         raise ValueError("Upload input must be a regular, non-symlink file")
     with image.open("rb") as source:
         size = os.fstat(source.fileno()).st_size
+        image_digest = hashlib.sha256()
         if size < 512 or size % 512:
-            raise ValueError("Managed-disk upload must contain complete 512-byte pages")
+            raise ValueError(
+                "Managed-disk upload must contain complete 512-byte pages"
+            )
         source.seek(size - 512)
         expected_footer = source.read(512)
         source.seek(0)
@@ -52,7 +55,10 @@ def upload_pages(image, endpoint, sas):
                     length = min(PAGE_CHUNK, size - offset)
                     page = source.read(length)
                     if len(page) != length:
-                        raise ValueError("Upload input became shorter during transfer")
+                        raise ValueError(
+                            "Upload input became shorter during transfer"
+                        )
+                    image_digest.update(page)
                     client.upload_page(
                         page, offset, length, validate_content=True
                     )
@@ -64,13 +70,17 @@ def upload_pages(image, endpoint, sas):
                 ).readall()
         except azure_error as error:
             code = getattr(error, "error_code", None)
-            if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9_]+", code):
+            if (
+                not isinstance(code, str)
+                or not re.fullmatch(r"[A-Za-z0-9_]+", code)
+            ):
                 code = type(error).__name__
             raise RuntimeError(f"Managed-disk page transfer failed: {code}") from None
     if footer != expected_footer:
         raise ValueError("Uploaded VHD footer does not match the local image")
     return {
         "uploaded_bytes": size,
+        "image_sha256": image_digest.hexdigest(),
         "footer_matches": True,
         "footer_sha256": hashlib.sha256(footer).hexdigest(),
     }

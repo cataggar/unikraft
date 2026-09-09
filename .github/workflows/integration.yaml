@@ -699,6 +699,7 @@ jobs:
           ovmf \
           patch \
           python3 \
+          python3-venv \
           tar \
           unzip \
           wget \
@@ -718,7 +719,7 @@ jobs:
         repository: cataggar/miz
         ref: 2db68ca0c3ab12155012a823c3fb8d7aba1cb544
         fetch-depth: 1
-        path: _miz
+        path: .d/ci-miz
 
     - name: Download LLVM and QEMU tools
       uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
@@ -775,14 +776,25 @@ jobs:
           echo 'MAKEFLAGS=-j2'
         } >> "${GITHUB_ENV}"
 
+    - name: Install pinned Hyper-V controller dependencies
+      run: |
+        set -euo pipefail
+        venv="${RUNNER_TEMP}/hyperv-ci/python"
+        python3 -m venv "${venv}"
+        "${venv}/bin/python" -m pip install \
+          --disable-pip-version-check -r support/azure/requirements.txt
+        PYTHONPATH=support/scripts "${venv}/bin/python" -c \
+          'import hyperv_private_preflight as p; p.sdk_dependency_contract()'
+        echo "${venv}/bin" >> "${GITHUB_PATH}"
+
     - name: Build pinned miz EFI application tooling
       run: |
         set -euo pipefail
         test "$(zig version)" = "${ZIG_VERSION}"
-        test "$(git -C _miz rev-parse HEAD)" = "${MIZ_REVISION}"
+        test "$(git -C .d/ci-miz rev-parse HEAD)" = "${MIZ_REVISION}"
         export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/miz-zig-local-cache"
         (
-          cd _miz
+          cd .d/ci-miz
           zig build -j2 install-miz \
             -Doptimize=ReleaseSafe \
             --prefix "${RUNNER_TEMP}/hyperv-ci/miz"

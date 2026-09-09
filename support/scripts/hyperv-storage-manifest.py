@@ -23,6 +23,45 @@ IDENTITY_POLICIES = {
 }
 
 
+def fixed_vhd_geometry(sectors: int) -> bytes:
+    sectors = min(sectors, 65535 * 16 * 255)
+    if sectors >= 65535 * 16 * 63:
+        sectors_per_track = 255
+        heads = 16
+    else:
+        sectors_per_track = 17
+        cylinders_times_heads = sectors // sectors_per_track
+        heads = max(4, (cylinders_times_heads + 1023) // 1024)
+        if cylinders_times_heads >= heads * 1024 or heads > 16:
+            sectors_per_track = 31
+            heads = 16
+            cylinders_times_heads = sectors // sectors_per_track
+        if cylinders_times_heads >= heads * 1024:
+            sectors_per_track = 63
+            heads = 16
+    cylinders = sectors // (heads * sectors_per_track)
+    return struct.pack(">HBB", cylinders, heads, sectors_per_track)
+
+
+def fixed_vhd_footer(sectors: int, disk_id: bytes) -> bytes:
+    footer = bytearray(SECTOR_SIZE)
+    footer[0:8] = b"conectix"
+    struct.pack_into(">I", footer, 8, 2)
+    struct.pack_into(">I", footer, 12, 0x00010000)
+    struct.pack_into(">Q", footer, 16, 0xFFFFFFFFFFFFFFFF)
+    footer[28:32] = b"ukrt"
+    struct.pack_into(">I", footer, 32, 0x00010000)
+    footer[36:40] = b"Wi2k"
+    size = sectors * SECTOR_SIZE
+    struct.pack_into(">Q", footer, 40, size)
+    struct.pack_into(">Q", footer, 48, size)
+    footer[56:60] = fixed_vhd_geometry(sectors)
+    struct.pack_into(">I", footer, 60, 2)
+    footer[68:84] = disk_id
+    struct.pack_into(">I", footer, 64, (~sum(footer)) & 0xFFFFFFFF)
+    return bytes(footer)
+
+
 def parse_id(value: str) -> bytes:
     if len(value) != 32 or any(c not in "0123456789abcdef" for c in value):
         raise argparse.ArgumentTypeError(
@@ -85,6 +124,10 @@ def main() -> int:
     parser.add_argument("--lun", required=True, type=int)
     parser.add_argument("--run-id", type=parse_id)
     parser.add_argument("--disk-id", type=parse_id)
+    parser.add_argument(
+        "--fixed-vhd", action="store_true",
+        help="also create an exact sparse fixed VHD for managed-disk upload",
+    )
     args = parser.parse_args()
 
     if args.sectors <= EXTENT_LBA + EXTENT_SECTORS:
@@ -112,15 +155,27 @@ def main() -> int:
     )
 
     raw_path = args.output_prefix.with_suffix(".raw")
+    vhd_path = args.output_prefix.with_suffix(".vhd")
     config_path = args.output_prefix.with_suffix(".config")
     json_path = args.output_prefix.with_suffix(".json")
-    if any(path.exists() for path in (raw_path, config_path, json_path)):
+    outputs = [raw_path, config_path, json_path]
+    if args.fixed_vhd:
+        outputs.append(vhd_path)
+    if any(path.exists() for path in outputs):
         parser.error("output files already exist")
     with create_private(raw_path, "wb") as output:
         output.truncate(args.sectors * SECTOR_SIZE)
         output.seek(SEED0_LBA * SECTOR_SIZE)
         output.write(sector)
         output.write(sector)
+    if args.fixed_vhd:
+        with create_private(vhd_path, "wb") as output:
+            output.truncate(args.sectors * SECTOR_SIZE + SECTOR_SIZE)
+            output.seek(SEED0_LBA * SECTOR_SIZE)
+            output.write(sector)
+            output.write(sector)
+            output.seek(args.sectors * SECTOR_SIZE)
+            output.write(fixed_vhd_footer(args.sectors, disk_id))
     with create_private(config_path, "w") as output:
         output.write("CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y\n")
         output.write("CONFIG_LIBSTORVSC_LUN_DISCOVERY=y\n")

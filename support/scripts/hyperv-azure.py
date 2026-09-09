@@ -521,14 +521,25 @@ def check_upload_dependencies():
         raise RuntimeError("Managed-disk upload dependencies are unavailable")
 
 
-def upload_managed_vhd(image, endpoint, sas):
-    report = upload_helper(["--image", str(image), "--endpoint", endpoint], sas=sas)
+def upload_managed_vhd(
+    image, endpoint, sas, *, timeout=1200, expected_sha256=None,
+):
+    report = upload_helper(
+        ["--image", str(image), "--endpoint", endpoint],
+        sas=sas, timeout=timeout,
+    )
     if (
         not isinstance(report, dict)
         or report.get("uploaded_bytes") != image.stat().st_size
         or report.get("footer_matches") is not True
+        or (
+            expected_sha256 is not None
+            and report.get("image_sha256") != expected_sha256
+        )
     ):
-        raise RuntimeError("Managed-disk page upload did not verify the expected image")
+        raise RuntimeError(
+            "Managed-disk page upload did not verify the expected image"
+        )
 
 
 def packaging_contract(efi_sha256, file_size):
