@@ -180,6 +180,7 @@ def private_build_receipt(provenance, efi, guarded=None):
             "passes": 2,
             "jobs": 2,
             "materialization_returncode": 0,
+            "recovery": "none",
             "app": "support/apps/hyperv-acceptance",
             "profile": "hyperv-x86_64-efi-netvsc",
             "compiler_target": "x86_64-freestanding-none",
@@ -566,6 +567,13 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             "drivers/hyperv/storvsc/storvsc.c",
             "drivers/hyperv/storvsc/storvsc_core.h",
             "drivers/hyperv/storvsc/storvsc_core.zig",
+            "support/build/native-image-graph.zig",
+            "support/build/native-postprocess.zig",
+            "support/build/native-postprocess-runner.py",
+            "support/scripts/elf_tools.py",
+            "support/scripts/mkbootinfo.py",
+            "support/scripts/mkefi.py",
+            "support/scripts/mkukreloc.py",
             "support/apps/hyperv-acceptance/Makefile.uk",
             "support/apps/hyperv-acceptance/acceptance_protocol.c",
             "support/apps/hyperv-acceptance/acceptance_protocol.h",
@@ -1173,6 +1181,12 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             zig_target = tools / "zig-real"
             invoked = tools / "zig-invoked"
             invoked_args = tools / "zig-invoked-args"
+            native_runner = support / "build" / "native-postprocess-runner.py"
+            native_runner.parent.mkdir(parents=True)
+            native_runner.write_text("raise SystemExit(0)\n")
+            uk_reloc = support / "scripts" / "mkukreloc.py"
+            uk_reloc.parent.mkdir(parents=True)
+            uk_reloc.write_text("raise SystemExit(0)\n")
             zig_target.write_text(
                 "#!/bin/sh\nset -eu\nout=''\n"
                 f"printf '%s' \"$0\" > {invoked}\n"
@@ -1180,6 +1194,25 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 "for arg in \"$@\"; do\n"
                 " case \"$arg\" in -Doutput=*) out=${arg#-Doutput=};; esac\n"
                 "done\n"
+                "marker=\"$ZIG_LOCAL_CACHE_DIR/materialized\"\n"
+                "if test ! -e \"$marker\"; then\n"
+                " input=\"$ZIG_LOCAL_CACHE_DIR/o/111/"
+                "hyperv-validated-final.dbg\"\n"
+                " output=\"$ZIG_LOCAL_CACHE_DIR/o/222/"
+                f"{preflight.NATIVE_EFI_NAME}.dbg\"\n"
+                " reloc=\"$output.uk_reloc.bin\"\n"
+                " mkdir -p \"${input%/*}\" \"${output%/*}\"\n"
+                " printf input > \"$input\"\n"
+                " printf output > \"$output\"\n"
+                " printf reloc > \"$reloc\"\n"
+                " : > \"$marker\"\n"
+                " printf '%s\\n' 'failed command: PYTHON=python3 python3 "
+                f"{native_runner} uk-reloc --script {uk_reloc} "
+                "--nm llvm-nm --readelf llvm-readelf "
+                "--objcopy llvm-objcopy '"
+                "\"$input\"' '\"$reloc\"' '\"$output\"\n"
+                " exit 1\n"
+                "fi\n"
                 "test -n \"$out\"\nmkdir -p \"$out\"\n"
                 f"printf efi > \"$out/{preflight.NATIVE_EFI_NAME}\"\n"
             )
@@ -1205,7 +1238,13 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             bison_data.mkdir()
             (bison_data / "skeleton").write_text("data\n")
             output = root / "build-result"
-            with mock.patch.object(preflight, "SUPPORT", support):
+            with mock.patch.object(
+                preflight, "SUPPORT", support
+            ), mock.patch.object(
+                preflight, "NATIVE_POSTPROCESS_RUNNER_PATH", native_runner
+            ), mock.patch.object(
+                preflight, "UK_RELOC_SCRIPT_PATH", uk_reloc
+            ):
                 receipt_path, efi_path = preflight.build_private_image(
                     output, repository, config, paths["zig"],
                     paths["make"], paths["python"], paths["bison"],
@@ -1233,6 +1272,16 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             )
             self.assertEqual(invoked.read_text(), str(zig.absolute()))
             self.assertIn("-j2", invoked_args.read_text().splitlines())
+            self.assertEqual(
+                validated["receipt"]["invocation"][
+                    "materialization_returncode"
+                ],
+                1,
+            )
+            self.assertEqual(
+                validated["receipt"]["invocation"]["recovery"],
+                "uk-reloc-v1",
+            )
             self.assertIn(
                 f"exec {zig.absolute()} \"$@\"",
                 (output / ".tool-bin" / "zig").read_text(),

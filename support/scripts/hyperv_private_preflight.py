@@ -42,6 +42,10 @@ SHARED_CONTROLLER_PATH = Path(__file__).with_name("hyperv-azure.py")
 NETWORK_CONTROLLER_PATH = Path(__file__).with_name(
     "hyperv_network_controller.py"
 )
+NATIVE_POSTPROCESS_RUNNER_PATH = (
+    SUPPORT / "build" / "native-postprocess-runner.py"
+)
+UK_RELOC_SCRIPT_PATH = SUPPORT / "scripts" / "mkukreloc.py"
 INPUT_SCHEMA = "unikraft.hyperv.private-preflight-input"
 STATE_SCHEMA = "unikraft.hyperv.private-preflight-state"
 RECEIPT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
@@ -181,6 +185,27 @@ GUARDED_PRODUCER_FILES = {
     ),
     "plat/hyperv/time.c": (
         "3b97fcf27fa0a76b93e565b770bb2b1d8b0d7496267387039b6c88d0e1a1cce1"
+    ),
+    "support/build/native-image-graph.zig": (
+        "38e5b979da8b914aefb4225dae687866af0642d8e49912205c9c5b8f706139ee"
+    ),
+    "support/build/native-postprocess-runner.py": (
+        "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"
+    ),
+    "support/build/native-postprocess.zig": (
+        "fe6adc24f97bf72dcb111853f2b8d5c30a4a86596402e33d9d30945892a8f49f"
+    ),
+    "support/scripts/elf_tools.py": (
+        "0aad63e7830a814a5c29a7330925f64e8c844cf28700aa959002a629d5019820"
+    ),
+    "support/scripts/mkbootinfo.py": (
+        "61436b01857de643ea4cc8ccc1563b8d8321e1ddc1c425d459b08aa1b0aaa409"
+    ),
+    "support/scripts/mkefi.py": (
+        "f2587a5108d5ad57e7418cc6c6a6c2351ccd1e763c68e63a9fc0c8da52426225"
+    ),
+    "support/scripts/mkukreloc.py": (
+        "325817c2c76a389c21358df535ac2ae0f1beb36b7e4cb73b62648d1f5faac8cc"
     ),
     "support/apps/hyperv-acceptance/Config.uk": (
         "548e97aadb9b55101e2ec1dbb7a4b22f82b210a22d5f14eb441b17fdd2009aa7"
@@ -1221,7 +1246,7 @@ def validate_private_build(value, provenance, efi, expected_guarded=None):
         receipt["invocation"],
         (
             "engine", "passes", "jobs", "materialization_returncode",
-            "app", "profile", "compiler_target", "output",
+            "recovery", "app", "profile", "compiler_target", "output",
         ),
         "Private local build invocation",
     )
@@ -1235,12 +1260,15 @@ def validate_private_build(value, provenance, efi, expected_guarded=None):
         "output": NATIVE_EFI_NAME,
     }
     materialization_returncode = invocation["materialization_returncode"]
+    recovery = invocation["recovery"]
     if (
         type(materialization_returncode) is not int
         or not -255 <= materialization_returncode <= 255
+        or recovery not in ("none", "uk-reloc-v1")
+        or (materialization_returncode == 0) != (recovery == "none")
         or {
             key: value for key, value in invocation.items()
-            if key != "materialization_returncode"
+            if key not in ("materialization_returncode", "recovery")
         } != expected_invocation
     ):
         raise ValueError("Private local build invocation is incompatible")
@@ -1478,14 +1506,15 @@ def build_private_image(
         written = 0
         deadline = time.monotonic() + timeout
 
-        def run_build_pass(label):
+        def run_process(argv, label):
             nonlocal written
             log.write(f"=== {label} ===\n".encode())
             process = subprocess.Popen(
-                command, cwd=repository, stdin=subprocess.DEVNULL,
+                argv, cwd=repository, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 env=environment, start_new_session=True,
             )
+            tail = bytearray()
 
             def drain_output():
                 nonlocal written
@@ -1496,6 +1525,9 @@ def build_private_image(
                     if remaining > 0:
                         log.write(chunk[:remaining])
                         written += min(len(chunk), remaining)
+                    tail.extend(chunk)
+                    if len(tail) > 256 * 1024:
+                        del tail[:-256 * 1024]
                     if len(chunk) > remaining:
                         overflow.set()
                         try:
@@ -1508,7 +1540,7 @@ def build_private_image(
             try:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, timeout)
+                    raise subprocess.TimeoutExpired(argv, timeout)
                 returncode = process.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
                 try:
@@ -1527,12 +1559,104 @@ def build_private_image(
                 raise RuntimeError(
                     "Private local native build log exceeded 8 MiB"
                 )
-            return returncode
+            return returncode, bytes(tail)
 
-        materialization_returncode = run_build_pass(
+        materialization_returncode, tail = run_process(
+            command,
             "native build materialization pass"
         )
-        returncode = run_build_pass("native build verification pass")
+        recovery = "none"
+        if materialization_returncode:
+            try:
+                text = tail.decode("utf-8")
+            except UnicodeDecodeError:
+                raise RuntimeError(
+                    "Private local native build failed before verification"
+                ) from None
+            failed = [
+                line[len("failed command: "):]
+                for line in text.splitlines()
+                if line.startswith("failed command: ")
+            ]
+            if len(failed) != 1:
+                raise RuntimeError(
+                    "Private local native build failed before verification"
+                )
+            failed_argv = shlex.split(failed[0])
+            expected_prefix = [
+                "PYTHON=python3",
+                "python3",
+                str(NATIVE_POSTPROCESS_RUNNER_PATH),
+                "uk-reloc",
+                "--script",
+                str(UK_RELOC_SCRIPT_PATH),
+                "--nm",
+                "llvm-nm",
+                "--readelf",
+                "llvm-readelf",
+                "--objcopy",
+                "llvm-objcopy",
+            ]
+            if failed_argv[:len(expected_prefix)] != expected_prefix or (
+                len(failed_argv) != len(expected_prefix) + 3
+            ):
+                raise RuntimeError(
+                    "Private local native build failed before verification"
+                )
+            generated = []
+            cache_root = cache.resolve(strict=True)
+            for value in failed_argv[-3:]:
+                candidate = Path(value)
+                if not candidate.is_absolute():
+                    candidate = repository / candidate
+                candidate = candidate.resolve(strict=True)
+                try:
+                    candidate.relative_to(cache_root)
+                except ValueError:
+                    raise RuntimeError(
+                        "Private local native build recovery path is invalid"
+                    ) from None
+                if candidate.is_symlink() or not candidate.is_file():
+                    raise RuntimeError(
+                        "Private local native build recovery path is invalid"
+                    )
+                generated.append(candidate)
+            input_path, relocations_path, output_path = generated
+            if (
+                input_path.name != "hyperv-validated-final.dbg"
+                or output_path.name != NATIVE_EFI_NAME + ".dbg"
+                or relocations_path != Path(str(output_path) + ".uk_reloc.bin")
+            ):
+                raise RuntimeError(
+                    "Private local native build recovery path is invalid"
+                )
+            recovery_command = [
+                str(resolved["python"]),
+                str(NATIVE_POSTPROCESS_RUNNER_PATH),
+                "uk-reloc",
+                "--script",
+                str(UK_RELOC_SCRIPT_PATH),
+                "--nm",
+                "llvm-nm",
+                "--readelf",
+                "llvm-readelf",
+                "--objcopy",
+                "llvm-objcopy",
+                str(input_path),
+                str(relocations_path),
+                str(output_path),
+            ]
+            recovery_returncode, _ = run_process(
+                recovery_command, "bounded native uk-reloc recovery"
+            )
+            if recovery_returncode:
+                raise RuntimeError(
+                    "Private local native build recovery failed"
+                )
+            recovery = "uk-reloc-v1"
+        returncode, _ = run_process(
+            command, "native build verification pass"
+        )
         log.flush()
         os.fsync(log.fileno())
     if returncode:
@@ -1559,6 +1683,7 @@ def build_private_image(
             "passes": 2,
             "jobs": 2,
             "materialization_returncode": materialization_returncode,
+            "recovery": recovery,
             "app": "support/apps/hyperv-acceptance",
             "profile": "hyperv-x86_64-efi-netvsc",
             "compiler_target": "x86_64-freestanding-none",

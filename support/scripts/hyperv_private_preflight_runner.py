@@ -131,6 +131,27 @@ GUARDED_PRODUCER_FILES = {
     "plat/hyperv/time.c": (
         "3b97fcf27fa0a76b93e565b770bb2b1d8b0d7496267387039b6c88d0e1a1cce1"
     ),
+    "support/build/native-image-graph.zig": (
+        "38e5b979da8b914aefb4225dae687866af0642d8e49912205c9c5b8f706139ee"
+    ),
+    "support/build/native-postprocess-runner.py": (
+        "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"
+    ),
+    "support/build/native-postprocess.zig": (
+        "fe6adc24f97bf72dcb111853f2b8d5c30a4a86596402e33d9d30945892a8f49f"
+    ),
+    "support/scripts/elf_tools.py": (
+        "0aad63e7830a814a5c29a7330925f64e8c844cf28700aa959002a629d5019820"
+    ),
+    "support/scripts/mkbootinfo.py": (
+        "61436b01857de643ea4cc8ccc1563b8d8321e1ddc1c425d459b08aa1b0aaa409"
+    ),
+    "support/scripts/mkefi.py": (
+        "f2587a5108d5ad57e7418cc6c6a6c2351ccd1e763c68e63a9fc0c8da52426225"
+    ),
+    "support/scripts/mkukreloc.py": (
+        "325817c2c76a389c21358df535ac2ae0f1beb36b7e4cb73b62648d1f5faac8cc"
+    ),
     "support/apps/hyperv-acceptance/Config.uk": (
         "548e97aadb9b55101e2ec1dbb7a4b22f82b210a22d5f14eb441b17fdd2009aa7"
     ),
