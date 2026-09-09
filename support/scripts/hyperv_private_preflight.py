@@ -49,7 +49,7 @@ UK_RELOC_SCRIPT_PATH = SUPPORT / "scripts" / "mkukreloc.py"
 INPUT_SCHEMA = "unikraft.hyperv.private-preflight-input"
 STATE_SCHEMA = "unikraft.hyperv.private-preflight-state"
 RECEIPT_SCHEMA = "unikraft.hyperv.private-preflight-receipt"
-INPUT_SCHEMA_VERSION = 7
+INPUT_SCHEMA_VERSION = 8
 STATE_SCHEMA_VERSION = 2
 RECEIPT_SCHEMA_VERSION = 3
 HOST_PHASE_SCHEMA = host_runner.SCHEMA
@@ -58,11 +58,13 @@ INPUT_MANIFEST = "private-preflight-input.json"
 SOLVED_CONFIG = "solved.config"
 CAPABILITY_REFERENCE = "capability.source.json"
 PRIVATE_BUILD_RECEIPT = "private-build-receipt.json"
-GIT_TOOL = "git"
+GIT_RUNTIME = "git-runtime"
+GIT_RUNTIME_SCHEMA = "unikraft.git-runtime-v1"
+GIT_EXECUTABLE = Path("bin/git")
 NATIVE_EFI_NAME = "helloworld_hyperv-x86_64-efi-netvsc"
 CAPABILITY_REFERENCE_SCHEMA = "unikraft.hyperv.capability-reference"
 PRIVATE_BUILD_SCHEMA = "unikraft.hyperv.private-local-build"
-PRIVATE_BUILD_SCHEMA_VERSION = 4
+PRIVATE_BUILD_SCHEMA_VERSION = 5
 STATE_FILE = "state.json"
 LOCATION = "northeurope"
 VM_SIZE = "Standard_D2s_v5"
@@ -122,8 +124,18 @@ GUARDED_CONTRACT_SCHEMA = (
     "unikraft.hyperv.guarded-v2-pristine-unavailable"
 )
 GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
-GUARDED_PRODUCER_SCHEMA_VERSION = 3
-GUARDED_BUILD_SOURCE_FILES = (
+GUARDED_PRODUCER_SCHEMA_VERSION = 4
+GUARDED_PRODUCER_CLOSURES = {
+    "support/build": {
+        "name": "support/build",
+        "sha256": (
+            "6719fca71190d1b7f8f68b50aabc1187c87a6c5811d8efc27836a00741e3a89d"
+        ),
+        "size": 1174519,
+        "files": 177,
+    },
+}
+GUARDED_BUILD_CONTROL_FILES = (
     "Config.uk",
     "Makefile",
     "Makefile.uk",
@@ -157,6 +169,22 @@ GUARDED_BUILD_SOURCE_FILES = (
     "support/build/target/native-profile.zig",
     "support/build/zig-facade-paths.zig",
     "support/build/zig-facade-runner.zig",
+)
+GUARDED_EXECUTED_HELPER_FILES = (
+    "support/build/tests/hyperv-smp-link-test.py",
+    "support/build/tests/hyperv-irq-register-test.py",
+    "support/build/tests/hyperv-driver-registration-test.py",
+    "support/scripts/build-graph.py",
+    "support/scripts/configupdate",
+    "support/scripts/elf_tools.py",
+    "support/scripts/gitsha1",
+    "support/scripts/mkbootinfo.py",
+    "support/scripts/mkcompiledb.py",
+    "support/scripts/mkefi.py",
+    "support/scripts/mklinux.py",
+    "support/scripts/mkukreloc.py",
+    "support/scripts/multiboot.py",
+    "support/scripts/uk-gdb.py",
 )
 GUARDED_PRODUCER_FILES = {
     "Config.uk": (
@@ -248,6 +276,36 @@ GUARDED_PRODUCER_FILES = {
     ),
     "support/build/zig-facade-runner.zig": (
         "5ba4f753fd4a0537564009a47298f242d10a1b831fe6fda00b5172023de8db77"
+    ),
+    "support/build/tests/hyperv-smp-link-test.py": (
+        "dc40554f6da6ddca3e9f65b5b6c12243c734d24992a342d3564750ecc5e71488"
+    ),
+    "support/build/tests/hyperv-irq-register-test.py": (
+        "a8041f4954d1b0d3ab7082350cdb912bde5ea9a83102e329845ac09cfbfeed8b"
+    ),
+    "support/build/tests/hyperv-driver-registration-test.py": (
+        "b5696ca8cc32ae189a1a388675df85bc7021a6c3d7311ab7d01f53e990f3b8ef"
+    ),
+    "support/scripts/build-graph.py": (
+        "d4618b21455fda35240f29779b289191ddebeabdecbfcafcf27d32bcd8ebd1ab"
+    ),
+    "support/scripts/configupdate": (
+        "2530183ffd12a43fae6003024e41524dade65b2b073de9dc3d59d23b72c41d62"
+    ),
+    "support/scripts/gitsha1": (
+        "10f93856e88dc7afea74e2aff8cbe0048ee907c5f819834325542efa40794564"
+    ),
+    "support/scripts/mkcompiledb.py": (
+        "8c9a11a03940e6c2cbc82f334303908cd52ca9d31c3de42003d21b1306b59339"
+    ),
+    "support/scripts/mklinux.py": (
+        "25aecf13f71468d27537c8b84f7fa1deb271ba3867a0d0655d1b04cd321c1c67"
+    ),
+    "support/scripts/multiboot.py": (
+        "91d3d660ebbc11f03d6b86bc04a70ca7b7e28539c4a293abbbdba7e1ee3ba6a9"
+    ),
+    "support/scripts/uk-gdb.py": (
+        "cc0d9b9c1c2e8721aa267c2fc1885bb72a6662e2d2573cdc04227e6998a79434"
     ),
     "drivers/hyperv/storvsc/Config.uk": (
         "bc4474ee1655396b74359fc0b40fd5036b2e6219a50f6b6fb6787a0e8daeec6a"
@@ -490,6 +548,10 @@ def guarded_producer_contract():
         "schema": GUARDED_PRODUCER_SCHEMA,
         "schema_version": GUARDED_PRODUCER_SCHEMA_VERSION,
         "files": dict(GUARDED_PRODUCER_FILES),
+        "closures": {
+            name: dict(record)
+            for name, record in GUARDED_PRODUCER_CLOSURES.items()
+        },
     }
 
 
@@ -497,9 +559,10 @@ def verify_guarded_producer_sources(repository):
     repository = Path(repository).resolve(strict=True)
     if repository != SUPPORT.parent.resolve(strict=True):
         raise ValueError("Guarded producer must use this repository worktree")
-    if not set(GUARDED_BUILD_SOURCE_FILES).issubset(
-        GUARDED_PRODUCER_FILES
-    ):
+    if not (
+        set(GUARDED_BUILD_CONTROL_FILES)
+        | set(GUARDED_EXECUTED_HELPER_FILES)
+    ).issubset(GUARDED_PRODUCER_FILES):
         raise RuntimeError("Guarded build proof closure is incomplete")
     for relative, expected in GUARDED_PRODUCER_FILES.items():
         path = repository / relative
@@ -508,6 +571,14 @@ def verify_guarded_producer_sources(repository):
             or not path.is_file()
             or azure.image_sha256(path) != expected
         ):
+            raise ValueError(
+                "Guarded producer differs from the reviewed V2 contract"
+            )
+    for relative, expected in GUARDED_PRODUCER_CLOSURES.items():
+        if directory_record(
+            repository / relative, relative,
+            "Guarded producer execution closure",
+        ) != expected:
             raise ValueError(
                 "Guarded producer differs from the reviewed V2 contract"
             )
@@ -661,12 +732,17 @@ def validate_guarded_contract(value, boot_policy, solved_config_sha256):
         "Guarded V2 pristine-unavailable contract",
     )
     producer = exact_fields(
-        value["producer"], ("schema", "schema_version", "files"),
+        value["producer"],
+        ("schema", "schema_version", "files", "closures"),
         "Guarded V2 producer pin",
     )
     files = exact_fields(
         producer["files"], GUARDED_PRODUCER_FILES,
         "Guarded V2 producer files",
+    )
+    closures = exact_fields(
+        producer["closures"], GUARDED_PRODUCER_CLOSURES,
+        "Guarded V2 producer closures",
     )
     if (
         value["schema"] != GUARDED_CONTRACT_SCHEMA
@@ -704,6 +780,7 @@ def validate_guarded_contract(value, boot_policy, solved_config_sha256):
         or type(producer["schema_version"]) is not int
         or producer["schema_version"] != GUARDED_PRODUCER_SCHEMA_VERSION
         or dict(files) != GUARDED_PRODUCER_FILES
+        or dict(closures) != GUARDED_PRODUCER_CLOSURES
     ):
         raise ValueError("Guarded V2 pristine-unavailable contract is invalid")
     return {
@@ -711,6 +788,10 @@ def validate_guarded_contract(value, boot_policy, solved_config_sha256):
         "producer": {
             **producer,
             "files": dict(files),
+            "closures": {
+                name: dict(record)
+                for name, record in closures.items()
+            },
         },
     }
 
@@ -896,6 +977,35 @@ def validate_implementation(value):
     }
 
 
+def validate_git_runtime_record(value):
+    value = exact_fields(
+        value,
+        ("schema", "name", "sha256", "size", "files", "executable"),
+        "Private Git runtime fingerprint",
+    )
+    executable = exact_fields(
+        value["executable"], ("name", "sha256", "size"),
+        "Private Git executable fingerprint",
+    )
+    if (
+        value["schema"] != GIT_RUNTIME_SCHEMA
+        or value["name"] != GIT_RUNTIME
+        or type(value["size"]) is not int
+        or value["size"] <= 0
+        or type(value["files"]) is not int
+        or value["files"] <= 0
+        or executable["name"] != GIT_EXECUTABLE.as_posix()
+        or type(executable["size"]) is not int
+        or executable["size"] <= 0
+    ):
+        raise ValueError("Private Git runtime fingerprint is invalid")
+    require_sha256(value["sha256"], "Private Git runtime fingerprint")
+    require_sha256(
+        executable["sha256"], "Private Git executable fingerprint"
+    )
+    return {**value, "executable": dict(executable)}
+
+
 def validate_provenance(value):
     value = exact_fields(
         value,
@@ -922,7 +1032,7 @@ def validate_provenance(value):
         raise ValueError("Private-preflight build provenance is invalid")
     require_sha256(value["tree_sha256"], "Tracked source-tree fingerprint")
     require_sha256(config["sha256"], "Solved configuration fingerprint")
-    git = validate_tool_record(value["git"], "git")
+    git = validate_git_runtime_record(value["git"])
     return {**value, "config": dict(config), "git": git}
 
 
@@ -1163,6 +1273,58 @@ def directory_record(path, name, description):
         "sha256": digest.hexdigest(),
         "size": total,
         "files": count,
+    }
+
+
+def git_runtime_record(path):
+    original = Path(path)
+    metadata = original.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("Private Git runtime must be a non-symlink directory")
+    root = original.resolve(strict=True)
+    executable = None
+    for entry in sorted(root.rglob("*")):
+        relative = entry.relative_to(root)
+        metadata = entry.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("Private Git runtime must not contain symlinks")
+        if stat.S_ISDIR(metadata.st_mode):
+            if relative.parts not in (("bin",), ("lib",)):
+                raise ValueError(
+                    "Private Git runtime has an unsupported directory"
+                )
+            continue
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (
+                relative != GIT_EXECUTABLE
+                and (
+                    len(relative.parts) != 2
+                    or relative.parts[0] != "lib"
+                )
+            )
+        ):
+            raise ValueError("Private Git runtime has an unsupported file")
+        if relative == GIT_EXECUTABLE:
+            if not os.access(entry, os.X_OK):
+                raise ValueError("Private Git executable is not executable")
+            with entry.open("rb") as stream:
+                if stream.read(4) != b"\x7fELF":
+                    raise ValueError(
+                        "Private Git executable must be a native ELF binary"
+                    )
+            executable = regular_record(
+                entry, relative.as_posix(), "Private Git executable"
+            )
+    if executable is None:
+        raise ValueError("Private Git runtime requires bin/git")
+    runtime = directory_record(
+        root, GIT_RUNTIME, "Private Git runtime"
+    )
+    return {
+        "schema": GIT_RUNTIME_SCHEMA,
+        **runtime,
+        "executable": executable,
     }
 
 
@@ -1419,11 +1581,17 @@ def validate_private_build(value, provenance, efi, expected_guarded=None):
         receipt["tools"], BUILD_TOOL_NAMES, "Private local build tools"
     )
     tools = {
-        name: validate_tool_record(tools[name], name)
+        name: (
+            validate_git_runtime_record(tools[name])
+            if name == "git"
+            else validate_tool_record(tools[name], name)
+        )
         for name in BUILD_TOOL_NAMES
     }
     if tools["git"] != provenance["git"]:
-        raise ValueError("Private build Git tool is unrelated to provenance")
+        raise ValueError(
+            "Private build Git runtime is unrelated to provenance"
+        )
     output = exact_fields(
         receipt["output"], ("name", "sha256", "size"),
         "Private local build output",
@@ -1459,41 +1627,140 @@ def load_receipt(path, name, description):
     }
 
 
-def git_output(git_path, repository, arguments):
-    result = subprocess.run(
-        [str(git_path), "-C", str(repository), *arguments],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        timeout=60,
-        check=False,
+def git_environment(git_runtime):
+    environment = {
+        name: value for name, value in os.environ.items()
+        if not name.startswith("GIT_")
+        and name not in ("LD_AUDIT", "LD_LIBRARY_PATH", "LD_PRELOAD")
+    }
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_EXEC_PATH": str(Path(git_runtime) / "disabled-exec-path"),
+        "GIT_OPTIONAL_LOCKS": "0",
+        "LC_ALL": "C",
+    })
+    return environment
+
+
+def bounded_command_output(argv, cwd, environment, timeout, maximum):
+    process = subprocess.Popen(
+        argv, cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=environment, start_new_session=True,
     )
-    if result.returncode:
+    outputs = {"stdout": bytearray(), "stderr": bytearray()}
+    overflow = threading.Event()
+    lock = threading.Lock()
+    total = 0
+
+    def drain(name, stream):
+        nonlocal total
+        for chunk in iter(lambda: stream.read(64 * 1024), b""):
+            with lock:
+                remaining = maximum - total
+                outputs[name].extend(chunk[:max(0, remaining)])
+                total += min(len(chunk), max(0, remaining))
+                if len(chunk) > remaining:
+                    overflow.set()
+            if overflow.is_set():
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    readers = [
+        threading.Thread(target=drain, args=("stdout", process.stdout)),
+        threading.Thread(target=drain, args=("stderr", process.stderr)),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        for reader in readers:
+            reader.join()
+        process.stdout.close()
+        process.stderr.close()
+        raise ValueError("Private Git runtime command timed out") from None
+    for reader in readers:
+        reader.join()
+    process.stdout.close()
+    process.stderr.close()
+    return (
+        returncode, bytes(outputs["stdout"]), bytes(outputs["stderr"]),
+        overflow.is_set(),
+    )
+
+
+def preflight_git_runtime(git_runtime):
+    git_runtime = Path(git_runtime).resolve(strict=True)
+    before = git_runtime_record(git_runtime)
+    returncode, stdout, stderr, overflow = bounded_command_output(
+        [str(git_runtime / GIT_EXECUTABLE), "--version"],
+        git_runtime, git_environment(git_runtime), 30, 256,
+    )
+    if (
+        returncode
+        or stderr
+        or overflow
+        or not re.fullmatch(rb"git version [0-9][ -~]{0,200}\n", stdout)
+        or git_runtime_record(git_runtime) != before
+    ):
+        raise ValueError(
+            "Private Git runtime is not a relocatable Git executable"
+        )
+    return before
+
+
+def git_output(git_runtime, repository, arguments):
+    git_runtime = Path(git_runtime).resolve(strict=True)
+    before = git_runtime_record(git_runtime)
+    returncode, stdout, stderr, overflow = bounded_command_output(
+        [
+            str(git_runtime / GIT_EXECUTABLE),
+            "-c", "core.fsmonitor=false",
+            "-c", "core.hooksPath=/dev/null",
+            "-C", str(repository),
+            *arguments,
+        ],
+        repository, git_environment(git_runtime), 60, 8 * 1024 * 1024,
+    )
+    if git_runtime_record(git_runtime) != before:
+        raise RuntimeError("Private Git runtime changed while in use")
+    if returncode or stderr or overflow:
         raise RuntimeError("Unable to derive local Git source provenance")
-    return result.stdout
+    return stdout
 
 
-def build_provenance(repository, config_path, git_path):
+def build_provenance(repository, config_path, git_runtime):
     repository = repository.resolve(strict=True)
     if repository != SUPPORT.parent.resolve(strict=True):
         raise ValueError("Source provenance must use this repository worktree")
-    git_path = Path(git_path).resolve(strict=True)
-    git = local_tool_record(git_path, "git")
+    git_runtime = Path(git_runtime).resolve(strict=True)
+    git = preflight_git_runtime(git_runtime)
     if git_output(
-        git_path,
+        git_runtime,
         repository,
         ["status", "--porcelain=v1", "--untracked-files=no", "-z"],
     ):
         raise ValueError("Source provenance requires a clean tracked worktree")
     head = git_output(
-        git_path, repository, ["rev-parse", "HEAD"]
+        git_runtime, repository, ["rev-parse", "HEAD"]
     ).decode().strip()
     tree = git_output(
-        git_path, repository, ["ls-tree", "-r", "--full-tree", "-z", "HEAD"]
+        git_runtime, repository,
+        ["ls-tree", "-r", "--full-tree", "-z", "HEAD"],
     )
     if (
         not GIT_COMMIT.fullmatch(head)
         or not tree
-        or local_tool_record(git_path, "git") != git
+        or git_runtime_record(git_runtime) != git
     ):
         raise ValueError("Git source provenance is invalid")
     config = regular_record(config_path, SOLVED_CONFIG, "Solved configuration")
@@ -1529,15 +1796,43 @@ def write_tool_wrapper(path, executable, environment=None):
     path.chmod(0o700)
 
 
+def write_git_wrapper(path, git_runtime):
+    environment = git_environment(git_runtime)
+    lines = ["#!/bin/sh", "set -eu"]
+    for name in (
+        "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_EXEC_PATH",
+        "GIT_OPTIONAL_LOCKS", "LC_ALL",
+    ):
+        lines.append(
+            f"export {name}={shlex.quote(str(environment[name]))}"
+        )
+    executable = Path(git_runtime) / GIT_EXECUTABLE
+    lines.append(
+        "exec "
+        f"{shlex.quote(str(executable))} "
+        "-c core.fsmonitor=false -c core.hooksPath=/dev/null \"$@\""
+    )
+    save_private_bytes(path, ("\n".join(lines) + "\n").encode())
+    path.chmod(0o700)
+
+
 def build_private_image(
     output_directory, repository, config_path, zig_path, make_path,
     python_path, bison_path, flex_path, m4_path, bison_data,
-    llvm_directory, git_path, timeout,
+    llvm_directory, git_runtime, timeout,
 ):
     if type(timeout) is not int or not 1 <= timeout <= 3600:
         raise ValueError("Private local build timeout must be 1-3600 seconds")
     repository = Path(repository).resolve(strict=True)
-    source_before = build_provenance(repository, config_path, git_path)
+    output_directory = private_directory(
+        output_directory, "Private local build directory", must_exist=False
+    )
+    output_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    relocated_git = output_directory / GIT_RUNTIME
+    git_record = copy_git_runtime(git_runtime, relocated_git)
+    source_before = build_provenance(
+        repository, config_path, relocated_git
+    )
     guarded = guarded_contract_from_solved_config(config_path)
     if guarded is not None:
         verify_guarded_producer_sources(repository)
@@ -1545,11 +1840,8 @@ def build_private_image(
             guarded, GUARDED_BOOT_POLICY,
             source_before["config"]["sha256"],
         )
-    output_directory = private_directory(
-        output_directory, "Private local build directory", must_exist=False
-    )
     tools = {
-        "git": local_tool_record(git_path, "git"),
+        "git": git_record,
         "zig": local_tool_record(zig_path, "zig"),
         "make": local_tool_record(make_path, "make"),
         "python": local_tool_record(python_path, "python"),
@@ -1558,10 +1850,11 @@ def build_private_image(
         "m4": local_tool_record(m4_path, "m4"),
     }
     if tools["git"] != source_before["git"]:
-        raise ValueError("Private Git executable changed before native build")
+        raise ValueError("Private Git runtime changed before native build")
     zig_invocation = Path(zig_path).absolute()
     resolved = {
-        "git": Path(git_path).resolve(strict=True),
+        "git_runtime": relocated_git,
+        "git": relocated_git / GIT_EXECUTABLE,
         "zig": zig_invocation,
         "make": Path(make_path).resolve(strict=True),
         "python": Path(python_path).resolve(strict=True),
@@ -1581,21 +1874,21 @@ def build_private_image(
     tools["bison-data"] = directory_record(
         bison_data, "bison-data", "Private build Bison data"
     )
-    output_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     config = output_directory / SOLVED_CONFIG
     build_output = output_directory / "build"
     wrappers = output_directory / ".tool-bin"
     temporary = output_directory / "tmp"
     cache = output_directory / "cache"
+    home = output_directory / "home"
     wrappers.mkdir(mode=0o700)
     temporary.mkdir(mode=0o700)
     cache.mkdir(mode=0o700)
+    home.mkdir(mode=0o700)
     copy_record(
         Path(config_path).resolve(strict=True), config,
         source_before["config"],
     )
     wrapper_tools = {
-        "git": ("git", None),
         "zig": ("zig", None),
         "make": ("make", None),
         "python3": ("python", None),
@@ -1621,6 +1914,7 @@ def build_private_image(
         "llvm-readelf": ("llvm-readelf", None),
         "llvm-strip": ("llvm-strip", None),
     }
+    write_git_wrapper(wrappers / "git", resolved["git_runtime"])
     for wrapper, (tool, environment) in wrapper_tools.items():
         write_tool_wrapper(
             wrappers / wrapper, resolved[tool], environment
@@ -1646,7 +1940,7 @@ def build_private_image(
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
     ]
-    environment = os.environ.copy()
+    environment = git_environment(relocated_git)
     environment.update({
         "PATH": str(wrappers) + os.pathsep + environment.get("PATH", ""),
         "TMPDIR": str(temporary),
@@ -1654,6 +1948,11 @@ def build_private_image(
         "ZIG_GLOBAL_CACHE_DIR": str(cache / "zig-global"),
         "ZIG_LOCAL_CACHE_DIR": str(cache / "zig-local"),
         "PYTHONPYCACHEPREFIX": str(cache / "pycache"),
+        "HOME": str(home),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_EXEC_PATH": str(relocated_git / "disabled-exec-path"),
+        "GIT_OPTIONAL_LOCKS": "0",
         "BISON_PKGDATADIR": str(Path(bison_data).resolve(strict=True)),
         "M4": str(resolved["m4"]),
         "LC_ALL": "C",
@@ -1858,7 +2157,9 @@ def build_private_image(
         raise RuntimeError(
             "Private local native build failed; inspect its owner-only log"
         )
-    source_after = build_provenance(repository, config, resolved["git"])
+    source_after = build_provenance(
+        repository, config, resolved["git_runtime"]
+    )
     if source_after != source_before:
         raise RuntimeError("Private source or configuration changed during build")
     if local_tool_record(zig_invocation, "zig") != tools["zig"]:
@@ -1960,15 +2261,38 @@ def copy_record(source, destination, record):
     )
 
 
+def copy_git_runtime(source, destination, expected=None):
+    source = Path(source).resolve(strict=True)
+    record = git_runtime_record(source)
+    if expected is not None and record != expected:
+        raise ValueError("Private Git runtime differs from its fingerprint")
+    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
+    for entry in sorted(source.rglob("*")):
+        if not entry.is_file():
+            continue
+        relative = entry.relative_to(source)
+        member = regular_record(
+            entry, relative.as_posix(), "Private Git runtime member"
+        )
+        copy_record(entry, destination / relative, member)
+        (destination / relative).chmod(
+            0o700 if relative == GIT_EXECUTABLE else 0o600
+        )
+    copied = preflight_git_runtime(destination)
+    if copied != record:
+        raise ValueError("Copied private Git runtime is inconsistent")
+    return copied
+
+
 def generate_input(
     output_directory, repository, config_path, qemu_root, ovmf_code,
     ovmf_vars, capability_raw, capability_receipt, efi, build_receipt,
-    raw, vhd, miz_path, git_path, boot_policy,
+    raw, vhd, miz_path, git_runtime, boot_policy,
 ):
     check_blob_dependency()
     if boot_policy not in BOOT_POLICIES:
         raise ValueError("Unsupported platform-only boot policy")
-    provenance = build_provenance(repository, config_path, git_path)
+    provenance = build_provenance(repository, config_path, git_runtime)
     guarded = guarded_contract_from_solved_config(config_path)
     if guarded is not None:
         verify_guarded_producer_sources(repository)
@@ -2068,12 +2392,10 @@ def generate_input(
             output_directory / PRIVATE_BUILD_RECEIPT,
             private_build,
         )
-        copy_record(
-            Path(git_path).resolve(strict=True),
-            output_directory / GIT_TOOL,
+        copy_git_runtime(
+            git_runtime, output_directory / GIT_RUNTIME,
             provenance["git"],
         )
-        (output_directory / GIT_TOOL).chmod(0o700)
         packaging = azure.miz_command(
             miz_path.resolve(strict=True),
             [
@@ -2142,7 +2464,7 @@ def load_input_manifest(input_directory, expected_sha256):
         raise ValueError("Private-preflight manifest digest does not match")
     expected_names = {
         INPUT_MANIFEST, SOLVED_CONFIG, CAPABILITY_REFERENCE,
-        PRIVATE_BUILD_RECEIPT, GIT_TOOL, "qemu",
+        PRIVATE_BUILD_RECEIPT, GIT_RUNTIME, "qemu",
         *(Path(name).parts[0] for role, name in INPUT_NAMES.items()
           if role != "qemu"),
     }
@@ -2171,15 +2493,9 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
         input_directory, expected_sha256
     )
     check_blob_dependency()
-    git_source = source / GIT_TOOL
-    if (
-        git_source.is_symlink()
-        or not git_source.is_file()
-        or not os.access(git_source, os.X_OK)
-        or local_tool_record(git_source, "git")
-        != manifest["provenance"]["git"]
-    ):
-        raise ValueError("Pinned Git executable does not match the manifest")
+    git_source = source / GIT_RUNTIME
+    if git_runtime_record(git_source) != manifest["provenance"]["git"]:
+        raise ValueError("Pinned Git runtime does not match the manifest")
     if (
         manifest["implementation"] != implementation_contract()
         or build_provenance(
@@ -2252,12 +2568,10 @@ def prepare(input_directory, state_directory, miz_path, expected_sha256):
         )
         copied_miz = local_tools / "miz"
         copied_miz.chmod(0o700)
-        copy_record(
-            git_source, local_tools / GIT_TOOL,
+        copy_git_runtime(
+            git_source, local_tools / GIT_RUNTIME,
             manifest["provenance"]["git"],
         )
-        copied_git = local_tools / GIT_TOOL
-        copied_git.chmod(0o700)
         checked = azure.miz_command(copied_miz, [
             "check-efi-application", "--output=json",
             "--architecture", "x86_64",
@@ -2534,16 +2848,13 @@ def verify_immutable_inputs(state, state_directory):
             raise ValueError("Prepared QEMU support closure changed")
     config = manifest["provenance"]["config"]
     config_path = state_directory / "inputs" / config["name"]
-    git = state_directory / "local-tools" / GIT_TOOL
+    git = state_directory / "local-tools" / GIT_RUNTIME
     if (
         config_path.is_symlink()
         or not config_path.is_file()
         or config_path.stat().st_size != config["size"]
         or azure.image_sha256(config_path) != config["sha256"]
-        or git.is_symlink()
-        or not git.is_file()
-        or not os.access(git, os.X_OK)
-        or local_tool_record(git, "git") != manifest["provenance"]["git"]
+        or git_runtime_record(git) != manifest["provenance"]["git"]
         or build_provenance(SUPPORT.parent, config_path, git)
         != manifest["provenance"]
     ):
@@ -5065,7 +5376,7 @@ def main():
     build_parser.add_argument("--m4", type=Path, required=True)
     build_parser.add_argument("--bison-data", type=Path, required=True)
     build_parser.add_argument("--llvm-bin", type=Path, required=True)
-    build_parser.add_argument("--git", type=Path, required=True)
+    build_parser.add_argument("--git-runtime", type=Path, required=True)
     build_parser.add_argument("--timeout", type=int, default=1800)
     generate_parser = subparsers.add_parser("generate-input")
     generate_parser.add_argument("--output-dir", type=Path, required=True)
@@ -5089,7 +5400,7 @@ def main():
     generate_parser.add_argument("--private-raw", type=Path, required=True)
     generate_parser.add_argument("--private-vhd", type=Path, required=True)
     generate_parser.add_argument("--miz", type=Path, required=True)
-    generate_parser.add_argument("--git", type=Path, required=True)
+    generate_parser.add_argument("--git-runtime", type=Path, required=True)
     generate_parser.add_argument(
         "--boot-policy", choices=BOOT_POLICIES, required=True
     )
@@ -5117,7 +5428,7 @@ def main():
             build_private_image(
                 args.output_dir, args.repository, args.solved_config,
                 args.zig, args.make, args.python, args.bison, args.flex,
-                args.m4, args.bison_data, args.llvm_bin, args.git,
+                args.m4, args.bison_data, args.llvm_bin, args.git_runtime,
                 args.timeout,
             )
             print("Private local build completed in owner-only directory")
@@ -5136,7 +5447,7 @@ def main():
                 args.private_raw,
                 args.private_vhd,
                 args.miz,
-                args.git,
+                args.git_runtime,
                 args.boot_policy,
             )
             print(

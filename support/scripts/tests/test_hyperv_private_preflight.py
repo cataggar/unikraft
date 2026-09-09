@@ -31,6 +31,40 @@ GUARDED_PRODUCER_RECORDS = (
 )
 
 
+def selected_git_executable():
+    selected = shutil.which("git")
+    if selected is None:
+        raise RuntimeError("A Git executable is required by this test")
+    ambient = Path(selected).resolve()
+    configuration = (
+        ambient.parent / "trampoline_configuration" / "git.json"
+    )
+    if configuration.is_file():
+        return Path(json.loads(configuration.read_text())["exe"]).resolve()
+    return ambient
+
+
+def create_git_runtime(root):
+    root = Path(root)
+    runtime = root / "git-runtime"
+    (runtime / "bin").mkdir(parents=True)
+    git = selected_git_executable()
+    shutil.copy2(git, runtime / preflight.GIT_EXECUTABLE)
+    if "/.pixi/envs/" in str(git):
+        library_directory = git.parent.parent / "lib"
+        (runtime / "lib").mkdir()
+        for name in (
+            "libpcre2-8.so.0", "libz.so.1", "libiconv.so.2",
+            "libcrypto.so.3",
+        ):
+            shutil.copy2(
+                (library_directory / name).resolve(),
+                runtime / "lib" / name,
+            )
+    preflight.preflight_git_runtime(runtime)
+    return runtime
+
+
 def modeled_host_disk_output_order(template):
     output = template["outputs"]["hostDiskUuid"]["value"]
     if "reference(resourceId('Microsoft.Compute/disks'" in output:
@@ -331,10 +365,16 @@ class PrivatePreflightFixture(unittest.TestCase):
                 "size": 4096,
             },
             "git": {
-                "name": "git",
+                "schema": preflight.GIT_RUNTIME_SCHEMA,
+                "name": preflight.GIT_RUNTIME,
                 "sha256": "d" * 64,
                 "size": 1,
                 "files": 1,
+                "executable": {
+                    "name": preflight.GIT_EXECUTABLE.as_posix(),
+                    "sha256": "e" * 64,
+                    "size": 1,
+                },
             },
         }
         guarded = (
@@ -590,26 +630,16 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             preflight.GUARDED_PRODUCER_SCHEMA_VERSION,
             runner.GUARDED_PRODUCER_SCHEMA_VERSION,
         )
-        build_root = SUPPORT / "build"
-        discovered_build_sources = {
-            str(path.relative_to(SUPPORT.parent))
-            for path in build_root.rglob("*")
-            if path.is_file()
-            and "tests" not in path.relative_to(build_root).parts
-            and path.name != "native-config-tests.zig"
-            and (
-                path.suffix in (".zig", ".py", ".sh")
-                or path.name.startswith("Makefile.")
-                or "symbols" in path.relative_to(build_root).parts
-            )
-        }
-        discovered_build_sources.update({
-            "Config.uk", "Makefile", "Makefile.uk", "build.zig",
-            "build.zig.zon", "version.mk",
-        })
         self.assertEqual(
-            discovered_build_sources,
-            set(preflight.GUARDED_BUILD_SOURCE_FILES),
+            preflight.GUARDED_PRODUCER_CLOSURES,
+            runner.GUARDED_PRODUCER_CLOSURES,
+        )
+        self.assertEqual(
+            preflight.directory_record(
+                SUPPORT / "build", "support/build",
+                "Guarded producer execution closure",
+            ),
+            preflight.GUARDED_PRODUCER_CLOSURES["support/build"],
         )
         proof_roles = {
             "plat/hyperv/Makefile.uk",
@@ -629,16 +659,13 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             "support/build/native-image-graph.zig",
             "support/build/native-postprocess.zig",
             "support/build/native-postprocess-runner.py",
-            "support/scripts/elf_tools.py",
-            "support/scripts/mkbootinfo.py",
-            "support/scripts/mkefi.py",
-            "support/scripts/mkukreloc.py",
             "support/apps/hyperv-acceptance/Makefile.uk",
             "support/apps/hyperv-acceptance/acceptance_protocol.c",
             "support/apps/hyperv-acceptance/acceptance_protocol.h",
             "support/apps/hyperv-acceptance/main.c",
             "support/apps/hyperv-acceptance/persistence.c",
-            *preflight.GUARDED_BUILD_SOURCE_FILES,
+            *preflight.GUARDED_BUILD_CONTROL_FILES,
+            *preflight.GUARDED_EXECUTED_HELPER_FILES,
         }
         self.assertLessEqual(
             proof_roles, set(preflight.GUARDED_PRODUCER_FILES)
@@ -661,6 +688,13 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             "drivers/hyperv/vmbus/vmbus_protocol.zig",
             "drivers/hyperv/vmbus/vmbus_protocol.h",
             "support/build/native-target-object.zig",
+            "support/build/tests/hyperv-smp-link-test.py",
+            "support/build/tests/hyperv-irq-register-test.py",
+            "support/build/tests/hyperv-driver-registration-test.py",
+            "support/build/tests/storvsc-production-test.c",
+            "support/scripts/mkcompiledb.py",
+            "support/scripts/gitsha1",
+            "support/build/unreviewed-native-helper.py",
         )
         for relative in mutation_targets:
             with self.subTest(relative=relative), \
@@ -671,11 +705,20 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     destination = root / source_relative
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(source.read_bytes())
+                shutil.copytree(
+                    SUPPORT.parent / "support" / "build",
+                    root / "support" / "build",
+                    dirs_exist_ok=True,
+                )
                 fake_support = root / "support"
                 with mock.patch.object(preflight, "SUPPORT", fake_support):
                     preflight.verify_guarded_producer_sources(root)
                     target = root / relative
-                    target.write_bytes(target.read_bytes() + b"\n")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(
+                        (target.read_bytes() if target.exists() else b"")
+                        + b"\n"
+                    )
                     with self.assertRaisesRegex(
                         ValueError, "reviewed V2 contract"
                     ):
@@ -729,14 +772,15 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         self.assertIn(
             (
                 'PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:'
-                '$GIT_BIN:/usr/bin:/bin"'
+                '/usr/bin:/bin"'
             ),
             recipe,
         )
         self.assertIn('-Dmake-command="$MAKE"', recipe)
         self.assertNotIn("$LLVM_BIN:$PATH", recipe)
-        self.assertIn('--git "$GIT_BIN/git"', readme)
-        self.assertIn("canonical schema-7 manifest", readme)
+        self.assertIn('exec "$GIT_RUNTIME/bin/git"', recipe)
+        self.assertIn('--git-runtime "$GIT_RUNTIME"', readme)
+        self.assertIn("canonical schema-8 manifest", readme)
 
     def test_guarded_contract_is_derived_from_exact_solved_v2_config(self):
         preflight.verify_guarded_producer_sources(SUPPORT.parent)
@@ -1022,22 +1066,23 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             (repository / "support").mkdir()
             config = repository / "solved.config"
             config.write_text("CONFIG_HYPERV=y\n")
+            git_command = str(selected_git_executable())
             subprocess.run(
-                ["git", "init", "-q"], cwd=repository, check=True
+                [git_command, "init", "-q"], cwd=repository, check=True
             )
             (repository / "tracked").write_text("source\n")
             subprocess.run(
-                ["git", "add", "tracked"], cwd=repository, check=True
+                [git_command, "add", "tracked"], cwd=repository, check=True
             )
             subprocess.run(
                 [
-                    "git", "-c", "user.name=Fixture",
+                    git_command, "-c", "user.name=Fixture",
                     "-c", "user.email=fixture@example.invalid",
                     "commit", "-qm", "fixture",
                 ],
                 cwd=repository, check=True,
             )
-            git = Path(shutil.which("git")).resolve()
+            git_runtime = create_git_runtime(repository / "tools")
             fake_bin = repository / "fake-bin"
             fake_bin.mkdir()
             fake_git = fake_bin / "git"
@@ -1048,30 +1093,82 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             with mock.patch.object(
                 preflight, "SUPPORT", repository / "support"
             ), mock.patch.dict(
-                preflight.os.environ, {"PATH": str(fake_bin)}
+                preflight.os.environ,
+                {
+                    "PATH": str(fake_bin),
+                    "GIT_DIR": str(repository / "forged-git-dir"),
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                    "GIT_CONFIG_VALUE_0": "forged",
+                    "LD_LIBRARY_PATH": str(repository / "forged-libs"),
+                    "LD_PRELOAD": str(repository / "forged-preload.so"),
+                },
             ):
                 first = preflight.build_provenance(
-                    repository, config, git
+                    repository, config, git_runtime
                 )
                 second = preflight.build_provenance(
-                    repository, config, git
+                    repository, config, git_runtime
                 )
             self.assertEqual(first, second)
             self.assertEqual(first["scheme"], "unikraft.git-ls-tree-v1")
             self.assertEqual(first["tracked_entries"], 1)
             self.assertEqual(
-                first["git"], preflight.local_tool_record(git, "git")
+                first["git"], preflight.git_runtime_record(git_runtime)
             )
             config.write_text("CONFIG_HYPERV=n\n")
             with mock.patch.object(
                 preflight, "SUPPORT", repository / "support"
             ):
                 changed = preflight.build_provenance(
-                    repository, config, git
+                    repository, config, git_runtime
                 )
             self.assertNotEqual(
                 first["config"]["sha256"], changed["config"]["sha256"]
             )
+
+    def test_private_build_rejects_unbound_git_launcher_before_native_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            (runtime / "bin").mkdir(parents=True)
+            shutil.copy2(
+                Path(shutil.which("true")).resolve(),
+                runtime / preflight.GIT_EXECUTABLE,
+            )
+            with mock.patch.object(
+                preflight, "build_provenance"
+            ) as provenance:
+                with self.assertRaisesRegex(
+                    ValueError, "not a relocatable Git executable"
+                ):
+                    preflight.build_private_image(
+                        root / "output", root, root / "config",
+                        root / "zig", root / "make", root / "python",
+                        root / "bison", root / "flex", root / "m4",
+                        root / "bison-data", root / "llvm", runtime, 30,
+                    )
+                provenance.assert_not_called()
+            ambient_name = shutil.which("git")
+            if ambient_name is not None:
+                ambient = Path(ambient_name).resolve()
+                configuration = (
+                    ambient.parent / "trampoline_configuration" / "git.json"
+                )
+            else:
+                configuration = None
+            if configuration is not None and configuration.is_file():
+                pixi_runtime = root / "pixi-runtime"
+                (pixi_runtime / "bin").mkdir(parents=True)
+                shutil.copy2(
+                    ambient, pixi_runtime / preflight.GIT_EXECUTABLE
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "not a relocatable Git executable"
+                ):
+                    preflight.copy_git_runtime(
+                        pixi_runtime, root / "copied-pixi-runtime"
+                    )
 
     def test_generate_input_creates_complete_canonical_operator_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1081,15 +1178,16 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             config = repository / "solved.config"
             config.write_text("CONFIG_HYPERV=y\n")
             (repository / "tracked").write_text("source\n")
+            git_command = str(selected_git_executable())
             subprocess.run(
-                ["git", "init", "-q"], cwd=repository, check=True
+                [git_command, "init", "-q"], cwd=repository, check=True
             )
             subprocess.run(
-                ["git", "add", "tracked"], cwd=repository, check=True
+                [git_command, "add", "tracked"], cwd=repository, check=True
             )
             subprocess.run(
                 [
-                    "git", "-c", "user.name=Fixture",
+                    git_command, "-c", "user.name=Fixture",
                     "-c", "user.email=fixture@example.invalid",
                     "commit", "-qm", "fixture",
                 ],
@@ -1105,12 +1203,12 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 ("code", b"code"), ("vars", b"vars"),
                 ("capability", b"c" * 1024), ("efi", b"efi"),
                 ("raw", b"r" * 1024), ("vhd", b"r" * 1024 + b"v" * 512),
-                ("miz", b"miz"), ("git", b"#!/bin/sh\nexit 0\n"),
+                ("miz", b"miz"),
             ):
                 assets[name] = root / name
                 assets[name].write_bytes(content)
             assets["miz"].chmod(0o700)
-            assets["git"].chmod(0o700)
+            git_runtime = create_git_runtime(root / "git-tools")
             output = root / "input"
 
             def packaging(_miz, _arguments, _log, **_kwargs):
@@ -1127,7 +1225,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     ).hexdigest(),
                     "size": config.stat().st_size,
                 },
-                "git": preflight.local_tool_record(assets["git"], "git"),
+                "git": preflight.git_runtime_record(git_runtime),
             }
             capability = capability_reference({
                 "sha256": hashlib.sha256(b"c" * 1024).hexdigest(),
@@ -1172,9 +1270,22 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     assets["code"], assets["vars"], assets["capability"],
                     capability_path, assets["efi"], build_path,
                     assets["raw"], assets["vhd"],
-                    assets["miz"], assets["git"],
+                    assets["miz"], git_runtime,
                     "platform-unavailable-v1",
                 )
+                state_directory = root / "state"
+                preflight.prepare(
+                    output, state_directory, assets["miz"], digest
+                )
+                state, _ = preflight.load_state(state_directory)
+                preflight.verify_immutable_inputs(state, state_directory)
+            self.assertEqual(
+                preflight.git_runtime_record(
+                    state_directory / "local-tools"
+                    / preflight.GIT_RUNTIME
+                ),
+                provenance["git"],
+            )
             manifest_bytes = (
                 output / preflight.INPUT_MANIFEST
             ).read_bytes()
@@ -1189,7 +1300,10 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     preflight.SOLVED_CONFIG,
                     preflight.CAPABILITY_REFERENCE,
                     preflight.PRIVATE_BUILD_RECEIPT,
-                    preflight.GIT_TOOL,
+                    *{
+                        str(path.relative_to(git_runtime.parent))
+                        for path in git_runtime.rglob("*") if path.is_file()
+                    },
                     "qemu/bin/qemu-system-x86_64",
                     "qemu/share/firmware.json",
                     "OVMF_CODE.fd", "OVMF_VARS.fd", "capability.raw",
@@ -1249,15 +1363,16 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             support = repository / "support"
             (support / "apps" / "hyperv-acceptance").mkdir(parents=True)
             (repository / "tracked").write_text("source\n")
+            git_command = str(selected_git_executable())
             subprocess.run(
-                ["git", "init", "-q"], cwd=repository, check=True
+                [git_command, "init", "-q"], cwd=repository, check=True
             )
             subprocess.run(
-                ["git", "add", "tracked"], cwd=repository, check=True
+                [git_command, "add", "tracked"], cwd=repository, check=True
             )
             subprocess.run(
                 [
-                    "git", "-c", "user.name=Fixture",
+                    git_command, "-c", "user.name=Fixture",
                     "-c", "user.email=fixture@example.invalid",
                     "commit", "-qm", "fixture",
                 ],
@@ -1327,7 +1442,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             bison_data.mkdir()
             (bison_data / "skeleton").write_text("data\n")
             output = root / "build-result"
-            git = Path(shutil.which("git")).resolve()
+            git_runtime = create_git_runtime(root / "git-tools")
             with mock.patch.object(
                 preflight, "SUPPORT", support
             ), mock.patch.object(
@@ -1338,11 +1453,13 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 receipt_path, efi_path = preflight.build_private_image(
                     output, repository, config, paths["zig"],
                     paths["make"], paths["python"], paths["bison"],
-                    paths["flex"], paths["m4"], bison_data, llvm, git,
+                    paths["flex"], paths["m4"], bison_data, llvm,
+                    git_runtime,
                     30,
                 )
                 provenance = preflight.build_provenance(
-                    repository, output / preflight.SOLVED_CONFIG, git
+                    repository, output / preflight.SOLVED_CONFIG,
+                    output / preflight.GIT_RUNTIME,
                 )
             receipt = preflight.load_receipt(
                 receipt_path, preflight.PRIVATE_BUILD_RECEIPT,
@@ -1387,11 +1504,11 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             )
             self.assertEqual(
                 validated["receipt"]["tools"]["git"],
-                preflight.local_tool_record(git, "git"),
+                preflight.git_runtime_record(git_runtime),
             )
             unrelated_git = copy.deepcopy(receipt)
             unrelated_git["receipt"]["tools"]["git"]["sha256"] = "f" * 64
-            with self.assertRaisesRegex(ValueError, "Git tool"):
+            with self.assertRaisesRegex(ValueError, "Git runtime"):
                 preflight.validate_private_build(
                     unrelated_git, provenance, {
                         "name": preflight.INPUT_NAMES["efi"],
@@ -1404,7 +1521,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 (output / ".tool-bin" / "zig").read_text(),
             )
             self.assertIn(
-                f"exec {git} \"$@\"",
+                str(output / preflight.GIT_RUNTIME / preflight.GIT_EXECUTABLE),
                 (output / ".tool-bin" / "git").read_text(),
             )
 
@@ -1466,7 +1583,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                                 paths["zig"], paths["make"],
                                 paths["python"], paths["bison"],
                                 paths["flex"], paths["m4"], bison_data,
-                                llvm, git, 30,
+                                llvm, git_runtime, 30,
                             )
             zig_target.write_text(script)
 

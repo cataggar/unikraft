@@ -66,7 +66,17 @@ GUARDED_CONTRACT_SCHEMA = (
     "unikraft.hyperv.guarded-v2-pristine-unavailable"
 )
 GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
-GUARDED_PRODUCER_SCHEMA_VERSION = 3
+GUARDED_PRODUCER_SCHEMA_VERSION = 4
+GUARDED_PRODUCER_CLOSURES = {
+    "support/build": {
+        "name": "support/build",
+        "sha256": (
+            "6719fca71190d1b7f8f68b50aabc1187c87a6c5811d8efc27836a00741e3a89d"
+        ),
+        "size": 1174519,
+        "files": 177,
+    },
+}
 GUARDED_PRODUCER_FILES = {
     "Config.uk": (
         "17b791a1bc6709f31846321cb705cd30b141e09eb05f6cd0bcffebb3eba0d50e"
@@ -157,6 +167,36 @@ GUARDED_PRODUCER_FILES = {
     ),
     "support/build/zig-facade-runner.zig": (
         "5ba4f753fd4a0537564009a47298f242d10a1b831fe6fda00b5172023de8db77"
+    ),
+    "support/build/tests/hyperv-smp-link-test.py": (
+        "dc40554f6da6ddca3e9f65b5b6c12243c734d24992a342d3564750ecc5e71488"
+    ),
+    "support/build/tests/hyperv-irq-register-test.py": (
+        "a8041f4954d1b0d3ab7082350cdb912bde5ea9a83102e329845ac09cfbfeed8b"
+    ),
+    "support/build/tests/hyperv-driver-registration-test.py": (
+        "b5696ca8cc32ae189a1a388675df85bc7021a6c3d7311ab7d01f53e990f3b8ef"
+    ),
+    "support/scripts/build-graph.py": (
+        "d4618b21455fda35240f29779b289191ddebeabdecbfcafcf27d32bcd8ebd1ab"
+    ),
+    "support/scripts/configupdate": (
+        "2530183ffd12a43fae6003024e41524dade65b2b073de9dc3d59d23b72c41d62"
+    ),
+    "support/scripts/gitsha1": (
+        "10f93856e88dc7afea74e2aff8cbe0048ee907c5f819834325542efa40794564"
+    ),
+    "support/scripts/mkcompiledb.py": (
+        "8c9a11a03940e6c2cbc82f334303908cd52ca9d31c3de42003d21b1306b59339"
+    ),
+    "support/scripts/mklinux.py": (
+        "25aecf13f71468d27537c8b84f7fa1deb271ba3867a0d0655d1b04cd321c1c67"
+    ),
+    "support/scripts/multiboot.py": (
+        "91d3d660ebbc11f03d6b86bc04a70ca7b7e28539c4a293abbbdba7e1ee3ba6a9"
+    ),
+    "support/scripts/uk-gdb.py": (
+        "cc0d9b9c1c2e8721aa267c2fc1885bb72a6662e2d2573cdc04227e6998a79434"
     ),
     "drivers/hyperv/storvsc/Config.uk": (
         "bc4474ee1655396b74359fc0b40fd5036b2e6219a50f6b6fb6787a0e8daeec6a"
@@ -349,12 +389,17 @@ def validate_guarded_contract(value, boot_policy):
         "invalid-guarded-contract",
     )
     producer = exact_fields(
-        value["producer"], ("schema", "schema_version", "files"),
+        value["producer"],
+        ("schema", "schema_version", "files", "closures"),
         "invalid-guarded-producer",
     )
     files = exact_fields(
         producer["files"], GUARDED_PRODUCER_FILES,
         "invalid-guarded-producer-files",
+    )
+    closures = exact_fields(
+        producer["closures"], GUARDED_PRODUCER_CLOSURES,
+        "invalid-guarded-producer-closures",
     )
     if (
         value["schema"] != GUARDED_CONTRACT_SCHEMA
@@ -388,6 +433,7 @@ def validate_guarded_contract(value, boot_policy):
         or type(producer["schema_version"]) is not int
         or producer["schema_version"] != GUARDED_PRODUCER_SCHEMA_VERSION
         or dict(files) != GUARDED_PRODUCER_FILES
+        or dict(closures) != GUARDED_PRODUCER_CLOSURES
     ):
         raise RunnerError("invalid-guarded-contract")
     return {
@@ -395,6 +441,10 @@ def validate_guarded_contract(value, boot_policy):
         "producer": {
             **producer,
             "files": dict(files),
+            "closures": {
+                name: dict(record)
+                for name, record in closures.items()
+            },
         },
     }
 

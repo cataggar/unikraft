@@ -150,8 +150,13 @@ First solve the selected Hyper-V configuration using the documented
 and retain its raw seed and JSON receipt for the later, separately authorized
 real-data-disk workload. The seed is not uploaded to this platform preflight:
 Set `ZIG`, `MAKE`, `BISON`, `FLEX`, `M4`, `BISON_DATA`, `LLVM_BIN`, and
-`GIT_BIN` to absolute reviewed tool paths; `GIT_BIN` is the directory
-containing the selected `git` executable.
+`GIT_RUNTIME` to absolute reviewed tool paths. `GIT_RUNTIME` must be a
+relocatable owner-selected directory containing a native ELF `bin/git` and,
+when required, only regular runtime libraries directly below `lib/`. Symlinks,
+scripts, launchers that require adjacent configuration, and unknown paths are
+rejected. The system ELF loader and C runtime are an explicit trusted OS
+boundary; the Git binary and its private runtime libraries are fingerprinted
+and copied together.
 
 ```shell
 PERSISTENCE="$PWD/.d/private-preflight-persistence"
@@ -172,7 +177,18 @@ set -eu
 export M4="$M4"
 exec "$FLEX" "\$@"
 EOF
-chmod 700 "$CONFIG_TOOLS/yacc" "$CONFIG_TOOLS/lex"
+cat >"$CONFIG_TOOLS/git" <<EOF
+#!/bin/sh
+set -eu
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_EXEC_PATH="$GIT_RUNTIME/disabled-exec-path"
+export GIT_OPTIONAL_LOCKS=0
+export LC_ALL=C
+exec "$GIT_RUNTIME/bin/git" -c core.fsmonitor=false \
+  -c core.hooksPath=/dev/null "\$@"
+EOF
+chmod 700 "$CONFIG_TOOLS/yacc" "$CONFIG_TOOLS/lex" "$CONFIG_TOOLS/git"
 "$RUNTIME/venv/bin/python" support/scripts/hyperv-storage-manifest.py \
   --output-prefix "$PERSISTENCE/run" \
   --identity-policy seed-enrollment-v2 --sectors 262144 --lun 1
@@ -184,7 +200,7 @@ TMPDIR="$PWD/.d/acceptance-tmp" \
 XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
 ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
 ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
-PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:$GIT_BIN:/usr/bin:/bin" \
+PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:/usr/bin:/bin" \
   "$ZIG" build olddefconfig -j2 \
   -Dapp="$PWD/support/apps/hyperv-acceptance" \
   -Dconfig="$PWD/support/apps/hyperv-acceptance/.config" \
@@ -215,14 +231,18 @@ change before another guarded image can be generated.
 
 Run the solve command with the controlled tool path shown above rather than an
 ambient developer shell. `python3` then resolves from the pinned runtime, the
-parser wrappers resolve first, source versioning uses the selected Git
-directory, LLVM tools retain their symbolic command names, and the Make-backed
-facade uses the absolute `$MAKE` supplied by `-Dmake-command`.
+parser wrappers resolve first, source versioning uses the selected Git runtime,
+LLVM tools retain their symbolic command names, and the Make-backed facade
+uses the absolute `$MAKE` supplied by `-Dmake-command`.
 
-Then let the controller invoke the fixed native builder itself, snapshot
-source/configuration before and after the build, fingerprint
-the selected Git executable, compiler, LLVM, Make, Python, parser tools and
-Bison data, and write the causal local build receipt. Both complete bounded
+Then let the controller invoke the fixed native builder itself. It first
+copies and preflights the complete Git runtime, then uses only that relocated
+copy for source snapshots and Make's symbolic `git` invocation. The receipt
+fingerprints the complete Git runtime, compiler, LLVM, Make, Python, parser
+tools and Bison data. Git configuration, hook, helper, fsmonitor, and
+repository-selection environment overrides are removed; system/global config
+and the helper search path are disabled, and dynamic-loader injection
+variables are removed. Both complete bounded
 native passes must return successfully and contain no failure record. The only
 recoverable materialization record is the exact pinned `uk-reloc` command
 whose cache-local inputs are validated before a clean second pass:
@@ -234,7 +254,7 @@ LOCAL_BUILD="$PWD/.d/private-preflight-local-build"
   --solved-config "$SOLVED_CONFIG" --zig "$ZIG" --make "$MAKE" \
   --python "$RUNTIME/venv/bin/python" --bison "$BISON" --flex "$FLEX" \
   --m4 "$M4" --bison-data "$BISON_DATA" --llvm-bin "$LLVM_BIN" \
-  --git "$GIT_BIN/git"
+  --git-runtime "$GIT_RUNTIME"
 PRIVATE_EFI="$LOCAL_BUILD/build/helloworld_hyperv-x86_64-efi-netvsc"
 PRIVATE_BUILD_RECEIPT="$LOCAL_BUILD/private-build-receipt.json"
 SOLVED_CONFIG="$LOCAL_BUILD/solved.config"
@@ -262,7 +282,7 @@ snapshot, solved configuration, invocation, or build tools differ from the
 receipt. The QEMU closure is an owner-selected directory whose
 executable is exactly `bin/qemu-system-x86_64`; required regular files below
 `lib/` and `share/` are copied and hashed recursively. Symlinks are rejected.
-Generate the canonical schema-7 manifest and owner-only input directory:
+Generate the canonical schema-8 manifest and owner-only input directory:
 
 ```shell
 INPUTS="$PWD/.d/private-preflight-input"
@@ -280,7 +300,7 @@ PRIVATE_VHD="$LOCAL_PACKAGE/private.vhd"
   --private-efi "$PRIVATE_EFI" \
   --private-build-receipt "$PRIVATE_BUILD_RECEIPT" \
   --private-raw "$PRIVATE_RAW" --private-vhd "$PRIVATE_VHD" \
-  --miz "$MIZ" --git "$GIT_BIN/git" \
+  --miz "$MIZ" --git-runtime "$GIT_RUNTIME" \
   --boot-policy guarded-v2-pristine-unavailable
 PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
 "$RUNTIME/venv/bin/python" support/scripts/hyperv_private_preflight.py \
@@ -290,7 +310,8 @@ PRIVATE_INPUT_MANIFEST_SHA256="<digest printed by generate-input>"
 ```
 
 The exact generated names are `private-preflight-input.json`, `solved.config`,
-`capability.source.json`, `private-build-receipt.json`, `git`,
+`capability.source.json`, `private-build-receipt.json`, `git-runtime/bin/git`,
+the optional enumerated `git-runtime/lib` closure,
 `qemu/bin/qemu-system-x86_64`, the enumerated `qemu/lib`/`qemu/share` closure,
 `OVMF_CODE.fd`, `OVMF_VARS.fd`, `capability.raw`, `private.efi`, `private.raw`,
 and `private.vhd`. The manifest binds the clean Git `HEAD`, SHA-256 of the raw
@@ -308,12 +329,16 @@ capability requires an explicit reviewed source change. Any tracked source,
 configuration, helper, requirement, SDK file, or prepared-input change fails
 before the first cloud command.
 
-The guarded input and causal build receipts additionally bind the full
-non-test `support/build` source closure used by the facade, the selected Git
-binary used for every source query and native-build invocation, the exact
-reviewed producer files, protocol 1, identity policy 2, `no-devices`, guest
-return 2, and the private solved run/LUN/geometry. Updating a pinned producer
-or build-closure file requires an explicit reviewed source change. The exact same causal
+The guarded producer-pin-v4 contract additionally binds the complete
+`support/build` directory, including production validation gates even when
+they live below `tests/`, plus every external native-image helper invoked by
+the root Make/facade/postprocessing path. Unknown additions, removals, or byte
+changes fail closed. The input-manifest-v8 and private-build-receipt-v5
+contracts bind the copied Git runtime used for every source query and
+native-build invocation, the exact reviewed producer files, protocol 1,
+identity policy 2, `no-devices`, guest return 2, and the private solved
+run/LUN/geometry. Updating a pinned producer or build-closure file requires an
+explicit reviewed source change. The exact same causal
 `private.efi`, raw disk, and fixed VHD are used for all four private platform
 boots and must be retained unchanged for the later real-data workload; there
 is no preflight-only guest flag, rebuild, or reseed.
