@@ -1228,6 +1228,10 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 validated["receipt"]["source_after"],
             )
             self.assertEqual(invoked.read_text(), str(zig.absolute()))
+            self.assertIn(
+                f"exec {zig.absolute()} \"$@\"",
+                (output / ".tool-bin" / "zig").read_text(),
+            )
 
 
 class PrivatePreflightRunnerTest(PrivatePreflightFixture):

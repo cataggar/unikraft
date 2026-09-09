@@ -1364,6 +1364,7 @@ def build_private_image(
     }
     zig_invocation = Path(zig_path).absolute()
     resolved = {
+        "zig": zig_invocation,
         "make": Path(make_path).resolve(strict=True),
         "python": Path(python_path).resolve(strict=True),
         "bison": Path(bison_path).resolve(strict=True),
@@ -1396,6 +1397,7 @@ def build_private_image(
         source_before["config"],
     )
     wrapper_tools = {
+        "zig": ("zig", None),
         "make": ("make", None),
         "python3": ("python", None),
         "bison": (
