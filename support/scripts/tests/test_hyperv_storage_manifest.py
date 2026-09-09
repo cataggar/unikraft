@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -117,6 +118,35 @@ class StorageManifestTests(unittest.TestCase):
         self.assertIsNone(receipt["target"])
         self.assertEqual(receipt["lun"], 7)
         self.assertEqual(receipt["sectors"], 4096)
+
+    def test_optional_fixed_vhd_matches_seed_and_geometry(self):
+        self.run_generator(
+            "--identity-policy", "seed-enrollment-v2", "--fixed-vhd"
+        )
+        raw = self.directory / "seed.raw"
+        vhd = self.directory / "seed.vhd"
+        self.assertEqual(vhd.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(vhd.stat().st_size, raw.stat().st_size + 512)
+        with raw.open("rb") as source:
+            raw_digest = hashlib.sha256(source.read()).digest()
+        with vhd.open("rb") as source:
+            self.assertEqual(
+                hashlib.sha256(source.read(raw.stat().st_size)).digest(),
+                raw_digest,
+            )
+            footer = bytearray(source.read(512))
+        self.assertEqual(footer[:8], b"conectix")
+        self.assertEqual(
+            struct.unpack_from(">Q", footer, 40)[0], raw.stat().st_size
+        )
+        self.assertEqual(
+            struct.unpack_from(">Q", footer, 48)[0], raw.stat().st_size
+        )
+        self.assertEqual(struct.unpack_from(">I", footer, 60)[0], 2)
+        self.assertEqual(footer[68:84].hex(), DISK_ID)
+        checksum = struct.unpack_from(">I", footer, 64)[0]
+        footer[64:68] = b"\0" * 4
+        self.assertEqual(checksum, (~sum(footer)) & 0xFFFFFFFF)
 
     def test_policy_specific_arguments_fail_closed(self):
         result = self.run_generator(success=False)

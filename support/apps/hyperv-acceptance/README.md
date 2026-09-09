@@ -253,15 +253,19 @@ guest image build:
 python3 support/scripts/hyperv-storage-manifest.py \
   --output-prefix "$PWD/.d/persistence/run" \
   --identity-policy seed-enrollment-v2 \
-  --sectors 262144 --lun 1
+  --sectors 262144 --lun 1 --fixed-vhd
 cat .d/persistence/run.config >> support/apps/hyperv-acceptance/.config
 ```
 
 The helper creates a sparse raw disk with identical immutable manifests at
-LBAs 8 and 9, plus a private JSON receipt for orchestration. The controller
-must provision the requested exact geometry, convert/upload the seed without
-changing its logical sector count, attach it at the configured address, and
-retain the exact guest image and data disk for both boots.
+LBAs 8 and 9, plus a private JSON receipt for orchestration. With
+`--fixed-vhd`, it also creates a sparse fixed VHD whose data region is
+byte-for-byte equal to the raw seed and whose deterministic footer UUID is the
+private disk ID. This conversion must happen before the final guest build and
+controller contract; neither file may subsequently be reseeded or mutated.
+The controller provisions the requested exact logical geometry, attaches the
+same managed data disk at the configured LUN, and retains the exact guest image
+and data-disk UUIDs for both boots.
 
 Identity policy 1 (`address-v1`, the generator default for compatibility)
 requires `--path`, `--target`, and `--lun` and emits the original `UKPSEED1`,
@@ -326,6 +330,14 @@ Stable success markers are:
 
 - `UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:<run-id>`
 - `UK_HYPERV_PERSISTENCE_BOOT2_COMPLETE:<run-id>`
+- `UK_HYPERV_PERSISTENCE_IO:1:1:<run-id>:5:3:receipt-verified`
+- `UK_HYPERV_PERSISTENCE_IO:1:2:<run-id>:0:0:receipt-verified`
+
+The versioned I/O records are emitted only by policy 2. The Boot 1 counts bind
+the five write requests and three flush requests in the guarded workload,
+including the durable intent and completion receipt. The Boot 2 record binds
+zero writes and zero flushes after readback of the accepted receipt and all
+patterns. Policy 1 output is unchanged.
 
 Each successful selection also emits one bounded private identity record:
 

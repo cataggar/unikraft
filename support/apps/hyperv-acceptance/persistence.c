@@ -851,6 +851,12 @@ int hyperv_acceptance_persistence_main(void)
 			printf("HYPERV_PERSISTENCE BOOT1_WRITE PASS run=");
 			persistence_print_run(expected.run_id);
 			putchar('\n');
+			if (expected.identity_policy ==
+			    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2) {
+				printf("UK_HYPERV_PERSISTENCE_IO:1:1:");
+				persistence_print_run(expected.run_id);
+				puts(":5:3:receipt-verified");
+			}
 			printf("UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:");
 			persistence_print_run(expected.run_id);
 			putchar('\n');
@@ -862,6 +868,12 @@ int hyperv_acceptance_persistence_main(void)
 			printf("HYPERV_PERSISTENCE BOOT2_READ PASS run=");
 			persistence_print_run(expected.run_id);
 			putchar('\n');
+			if (expected.identity_policy ==
+			    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2) {
+				printf("UK_HYPERV_PERSISTENCE_IO:1:2:");
+				persistence_print_run(expected.run_id);
+				puts(":0:0:receipt-verified");
+			}
 			printf("UK_HYPERV_PERSISTENCE_BOOT2_COMPLETE:");
 			persistence_print_run(expected.run_id);
 			putchar('\n');
