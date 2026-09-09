@@ -122,6 +122,97 @@ Tool caches and temporary files stay below that directory. Fresh firmware
 copies are removed after each local boot. Existing state directories are never
 overwritten.
 
+## Private nested-KVM platform preflight
+
+`support/scripts/hyperv_private_preflight.py` is a separate, operator-run
+platform preflight. It does not replace `hyperv-azure.py`, consume a public
+prepared-image artifact, build Unikraft in Azure, or claim StorVSC persistence.
+Prepare it only after locally building the private EFI/raw/fixed-VHD inputs
+and the nonsecret capability image:
+
+```shell
+STATE="$PWD/.d/private-preflight-state"
+python3 support/scripts/hyperv_private_preflight.py prepare \
+  --input-dir "$PRIVATE_INPUTS" \
+  --expected-manifest-sha256 "$PRIVATE_INPUT_MANIFEST_SHA256" \
+  --state-dir "$STATE" --miz "$MIZ"
+```
+
+The owner-only input manifest binds the local source/config, pinned `miz`,
+runner, QEMU, OVMF, capability image, private EFI/raw/fixed VHD, packaging
+geometry, hashes, sizes, and reviewed boot policy. The controller rejects
+symlinks, extra input files, mutable or incorrectly packaged content, and a
+staged-input/evidence allowance above 256 MiB. It copies the exact inputs into
+private state before any possible resource action; there is no post-preflight
+rebuild.
+
+Live execution is a separate explicitly authorized action:
+
+```shell
+python3 support/scripts/hyperv_private_preflight.py run \
+  --state-dir "$STATE" --subscription "$AZURE_SUBSCRIPTION" \
+  --transfer-source-ip "$EXPLICIT_OPERATOR_IPV4"
+```
+
+Every Azure command carries the explicit private subscription; the controller
+never changes the global account default. The uploader address must be one
+explicit public IPv4. It is temporarily narrowed to `/32` for authenticated
+Blob upload and receipt download, then removed. There is no automatic address
+discovery. If this temporary exception is not approved, the run requires a
+separately authorized private controller path and must stop before deployment.
+
+The fixed ARM topology contains one North Europe `Standard_D2s_v5` Ubuntu Gen2
+host with Standard security, a 32 GiB `StandardSSD_LRS` OS disk, one dedicated
+owned resource group, `/29` VNet/subnet, NIC, NSG, and network-deny Blob
+account. The subnet disables default outbound access and enables the
+Microsoft.Storage service endpoint. There is no public IP, SSH ingress, NAT
+gateway, data disk, or reuse of network-acceptance resources. Before creating
+the group, the controller validates the exact immutable Ubuntu image, SKU,
+generation, nested-virtualization capability, providers, and regional/family
+quota. It never changes region, image, SKU, or host in response to failure.
+
+The first RunCommand receives only the public capability image and pinned
+QEMU/OVMF inputs. It must prove Linux KVM plus the required QEMU Hyper-V
+features in both x2APIC and masked legacy-APIC modes. Only that exact PASS
+allows any private seed or image upload. A durable capability sentinel binds
+the Linux boot identity, and a host restart between phases is rejected. The
+second phase boots the exact
+private raw and fixed-VHD bytes in both modes, masking the fixed-VHD footer as
+the local controller does. Logs have strict stage, normal-return, uniqueness,
+size, and deadline checks. A reviewed `UNAVAILABLE storage+network` result is
+valid only for the explicit platform-only policy; arbitrary failures and
+I/O-ready markers are rejected. This is not real device or persistence
+evidence. This controller deliberately defines no private LUN, write-disk, or
+seed-enrollment metadata; a later storage acceptance integration must consume
+the separately reviewed manifest-v2 interface rather than adding those fields
+to this platform-only contract.
+
+Private manifests, SAS values, host identity, serial logs, and receipts remain
+in owner-only local state and authenticated Blob/control-plane parameters.
+Ordinary CLI errors redact identifiers and credentials. The operator needs
+only the resource permissions for this topology plus storage-account key
+listing and regeneration; the controller assumes no broader role assignment.
+The 60-minute deadline starts before deployment and is never extended; bounded
+transfer, RunCommand, and boot limits are subordinate to it. Managed auto-shutdown is
+configured before private work only as a backstop. Guest shutdown or the
+schedule is not proof of compute deallocation or a hard billing cap.
+
+Cleanup is attempted after success, failure, interruption, or deadline expiry:
+
+```shell
+python3 support/scripts/hyperv_private_preflight.py cleanup \
+  --state-dir "$STATE" --subscription "$AZURE_SUBSCRIPTION"
+```
+
+The controller attempts SAS-key rotation, explicit VM deallocation, and
+owner-checked resource-group deletion. It persists deployment, VM, and OS-disk
+provenance before private work and refuses deletion for an unknown, detached,
+replaced, or foreign disk. There is no keep-resources mode. Control-plane or
+ownership failures are reported as cleanup failures rather than claimed as
+successful deletion. The final private receipt binds the exact inputs, tools,
+host identity, four boot outcomes, and cleanup obligations; live nested-KVM
+success still requires the operator-run attempt.
+
 ## Local CI interface
 
 `zig build test-hyperv-regression` aggregates the existing focused Hyper-V
@@ -136,6 +227,11 @@ hosted fixtures and the x86-64 freestanding object checks, and reports that
 x86-only hosted IRQ, driver, and SMP executables are deferred to the x86-64 CI
 job. It does not reinterpret an architecture skip, missing local KVM, or
 missing Hyper-V devices as a boot or I/O pass.
+
+`zig build test-hyperv-private-preflight -j2` runs only the synthetic
+manifest, host-runner, ARM-shape, private-error, ordering, deadline, and
+owner-checked cleanup fixtures. It makes no Azure calls and uses no private
+identifiers.
 
 The production-backed VMBus control, channel, and disconnect fixtures also run
 on non-x86 hosts. Use `zig build test-vmbus-lifecycle -j2` for that focused

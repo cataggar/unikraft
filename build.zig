@@ -1422,6 +1422,24 @@ pub fn build(b: *std.Build) void {
         "PYTHONDONTWRITEBYTECODE",
         "1",
     );
+    const hyperv_private_preflight_fixtures = b.addSystemCommand(&.{
+        "python3",
+        "-m",
+        "unittest",
+        "support.scripts.tests.test_hyperv_private_preflight",
+    });
+    hyperv_private_preflight_fixtures.setCwd(.{ .cwd_relative = root });
+    hyperv_private_preflight_fixtures.setEnvironmentVariable(
+        "PYTHONDONTWRITEBYTECODE",
+        "1",
+    );
+    const hyperv_private_preflight_tests = b.step(
+        "test-hyperv-private-preflight",
+        "Run private nested-KVM Hyper-V preflight controller fixtures",
+    );
+    hyperv_private_preflight_tests.dependOn(
+        &hyperv_private_preflight_fixtures.step,
+    );
     const hyperv_regression_tests = b.step(
         "test-hyperv-regression",
         "Run focused Hyper-V protocol, driver, controller, and IRQ regressions",
@@ -1467,6 +1485,9 @@ pub fn build(b: *std.Build) void {
     );
     hyperv_regression_tests.dependOn(&verify_vmbus_channel.step);
     hyperv_regression_tests.dependOn(&hyperv_controller_fixtures.step);
+    hyperv_regression_tests.dependOn(
+        &hyperv_private_preflight_fixtures.step,
+    );
     const lto_policy_tests = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/lto-symbol-policy-test.py",
