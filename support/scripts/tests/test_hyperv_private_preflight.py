@@ -1409,10 +1409,83 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             state["deadline_monotonic"] = time.monotonic() - 1
             run.cleanup_deadline = time.monotonic() + 60
             run.az.side_effect = [
-                vm, vm, disk, vm, disk, vm, disk, None, view,
+                vm, None, vm, view,
             ]
             run.deallocate_host()
             self.assertTrue(state["host_deallocated"])
+            self.assertFalse(any(
+                call.args[0][:2] == ["disk", "show"]
+                for call in run.az.call_args_list
+            ))
+
+    def test_reconcile_disk_failure_still_deallocates_anchored_vm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "pending")
+            deployment = self.deployment(run, state)
+            vm, _ = self.vm_disk(run, state)
+            view = {
+                "instanceView": {
+                    "statuses": [{"code": "PowerState/deallocated"}]
+                },
+            }
+            run.cleanup_deadline = time.monotonic() + 60
+            run.az.side_effect = [
+                deployment,
+                vm, vm, RuntimeError("disk unavailable"),
+                vm, None, vm, view,
+            ]
+            run.deallocate_host()
+            self.assertTrue(state["host_deallocated"])
+            self.assertEqual(
+                state["host_deployment"]["vm_uuid"],
+                "44444444-4444-4444-8444-444444444444",
+            )
+            self.assertEqual(
+                state["host_deployment"]["disk_uuid"],
+                "55555555-5555-4555-8555-555555555555",
+            )
+            commands = [
+                call.args[0] for call in run.az.call_args_list
+            ]
+            self.assertEqual(
+                sum(command[:2] == ["vm", "deallocate"]
+                    for command in commands),
+                1,
+            )
+
+    def test_deallocation_uses_vm_anchor_not_live_disk_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "resources-verified")
+            vm, _ = self.vm_disk(run, state)
+            view = {
+                "instanceView": {
+                    "statuses": [{"code": "PowerState/deallocated"}]
+                },
+            }
+            run.az.side_effect = [vm, None, vm, view]
+            run.deallocate_host()
+            self.assertTrue(state["host_deallocated"])
+            self.assertFalse(any(
+                call.args[0][:2] == ["disk", "show"]
+                for call in run.az.call_args_list
+            ))
+
+    def test_deallocation_refuses_replacement_vm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state, "resources-verified")
+            vm, _ = self.vm_disk(run, state)
+            vm["vmId"] = "66666666-6666-4666-8666-666666666666"
+            run.az.return_value = vm
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                run.deallocate_host()
+            self.assertFalse(state.get("host_deallocated", False))
+            self.assertFalse(any(
+                call.args[0][:2] == ["vm", "deallocate"]
+                for call in run.az.call_args_list
+            ))
 
     def test_reconcile_refuses_replacement_before_first_live_vm_read(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1564,7 +1637,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 "publisher": "Generic.Publisher",
             }
             run.az.side_effect = [
-                vm, disk, None, {
+                vm, None, vm, {
                     "instanceView": {
                         "statuses": [{"code": "PowerState/deallocated"}]
                     },

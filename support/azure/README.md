@@ -319,8 +319,10 @@ before create. A successful deployment must return server-side ARM outputs
 for the original VM `vmId` and OS-disk `uniqueId`; both immutable anchors are
 recorded together before any live VM or disk query. Live reads may only
 confirm those anchors, never fill or replace them from matching names, tags,
-resource IDs, images, or attachments. It refuses VM/group cascade
-for an unknown, detached, replaced, or foreign disk. Required ownership tags
+resource IDs, images, or attachments. Cleanup may deallocate the exact
+UUID-anchored VM independently when disk inspection fails, but group deletion
+still refuses an unknown, detached, replaced, or foreign disk. Required
+ownership tags
 may contain additive Azure metadata, but tags never substitute for persisted
 VM UUID, disk UUID, attachment, and original deployment proof. Untagged
 extension children are accepted during cleanup only when their resource ID is

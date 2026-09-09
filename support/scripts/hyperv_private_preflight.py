@@ -2397,14 +2397,16 @@ class PrivatePreflightRun(azure.AzureRun):
         self.settle_host_identity(settling_deadline)
         return receipt
 
-    def verify_vm_identity(self, vm=None):
+    def verify_vm_identity(self, vm=None, require_attachment=True):
         receipt = self.state.get("host_deployment")
         if (
             not isinstance(receipt, dict)
             or receipt.get("phase") not in (
-                "vm-verified", "resources-verified"
+                "deployment-succeeded", "deployment-terminal",
+                "vm-verified", "resources-verified",
             )
             or receipt.get("vm_uuid") is None
+            or receipt.get("disk_uuid") is None
         ):
             raise RuntimeError("Private host VM identity is unproven")
         if vm is None:
@@ -2420,7 +2422,11 @@ class PrivatePreflightRun(azure.AzureRun):
         if (
             str(vm.get("id", "")).lower() != receipt["vm_id"].lower()
             or vm.get("vmId") != receipt["vm_uuid"]
-            or str(attached or "").lower() != receipt["disk_id"].lower()
+            or (
+                require_attachment
+                and str(attached or "").lower()
+                != receipt["disk_id"].lower()
+            )
         ):
             raise RuntimeError("Private host VM identity changed")
         return vm
@@ -3273,30 +3279,40 @@ class PrivatePreflightRun(azure.AzureRun):
         receipt = self.state.get("host_deployment")
         if not isinstance(receipt, dict):
             return
-        if receipt.get("phase") in (
-            "pending", "deployment-succeeded", "deployment-terminal",
-            "vm-verified",
-        ):
-            if not self.reconcile_host_deployment(
-                min(
-                    self.cleanup_deadline or self.state["deadline_monotonic"],
-                    time.monotonic() + RECONCILE_TIMEOUT_SECONDS,
-                )
-            ):
-                return
+        if receipt.get("phase") in ("pending", "deployment-terminal"):
+            try:
+                if not self.reconcile_host_deployment(
+                    min(
+                        self.cleanup_deadline
+                        or self.state["deadline_monotonic"],
+                        time.monotonic() + RECONCILE_TIMEOUT_SECONDS,
+                    )
+                ):
+                    return
+            except (RuntimeError, ValueError, OSError):
+                receipt = self.state.get("host_deployment")
+                if (
+                    not isinstance(receipt, dict)
+                    or receipt.get("phase") not in (
+                        "deployment-succeeded", "deployment-terminal",
+                        "vm-verified", "resources-verified",
+                    )
+                    or receipt.get("correlation_id") is None
+                    or receipt.get("vm_uuid") is None
+                    or receipt.get("disk_uuid") is None
+                ):
+                    raise
             receipt = self.state["host_deployment"]
         if receipt.get("phase") in (
             "failed-no-compute", "not-created-empty"
         ):
             return
-        if receipt.get("phase") == "vm-verified":
-            self.verify_vm_identity()
-        else:
-            self.verify_host_identity()
+        self.verify_vm_identity(require_attachment=False)
         self.az([
             "vm", "deallocate", "--resource-group", self.group,
             "--name", self.host_vm,
         ], timeout=300)
+        self.verify_vm_identity(require_attachment=False)
         view = self.az([
             "vm", "get-instance-view", "--resource-group", self.group,
             "--name", self.host_vm,
