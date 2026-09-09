@@ -148,11 +148,20 @@ struct storvsc_device {
 	__u64 deferred_close_deadline;
 };
 
+struct storvsc_unresolved_offer {
+	struct vmbus_guid instance_id;
+	int error;
+	__u8 active;
+};
+
 static struct storvsc_device storvsc_devices[CONFIG_LIBSTORVSC_MAX_DEVICES];
+static struct storvsc_unresolved_offer
+	storvsc_unresolved_offers[CONFIG_LIBSTORVSC_MAX_DEVICES];
 static __spinlock storvsc_topology_lock = UKARCH_SPINLOCK_INITIALIZER();
 static struct storvsc_lun *storvsc_write_lun;
 static __u64 storvsc_session_cookie;
 static int storvsc_session_cookie_exhausted;
+static int storvsc_unresolved_offer_overflow;
 static __u64 storvsc_topology_generation;
 static int storvsc_topology_generation_exhausted;
 #if defined(CONFIG_LIBSTORVSC_LUN_DISCOVERY) && \
@@ -235,6 +244,7 @@ void storvsc_host_deferred_epoch_sample_hook(__u64 epoch);
 void storvsc_host_sync_completion_hook(void);
 void storvsc_host_receive_hook(unsigned int controller, int before_notify);
 void storvsc_host_binding_publish_hook(unsigned int controller);
+int storvsc_host_registration_hook(unsigned int controller, uint8_t lun);
 #endif
 
 static struct vmbus_channel *
@@ -290,6 +300,90 @@ static void storvsc_advance_topology_generation(void)
 			return;
 		}
 	}
+}
+
+static int storvsc_unresolved_offer_matches(
+	const struct storvsc_unresolved_offer *offer,
+	const struct vmbus_guid *instance_id)
+{
+	return offer->active &&
+	       !memcmp(offer->instance_id.bytes, instance_id->bytes,
+		       VMBUS_GUID_SIZE);
+}
+
+static void storvsc_note_unresolved_offer(
+	const struct vmbus_guid *instance_id, int error)
+{
+	struct storvsc_unresolved_offer *free_offer = NULL;
+	unsigned long flags;
+	unsigned int i;
+
+	ukplat_spin_lock_irqsave(&storvsc_topology_lock, flags);
+	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_DEVICES; i++) {
+		struct storvsc_unresolved_offer *offer =
+			&storvsc_unresolved_offers[i];
+
+		if (storvsc_unresolved_offer_matches(offer, instance_id)) {
+			offer->error = error ? error : -EIO;
+			goto out;
+		}
+		if (!free_offer && !offer->active)
+			free_offer = offer;
+	}
+	if (free_offer) {
+		free_offer->instance_id = *instance_id;
+		free_offer->error = error ? error : -EIO;
+		free_offer->active = 1;
+	} else {
+		/* An unrecorded offer cannot later be proven absent by identity. */
+		storvsc_unresolved_offer_overflow =
+			error ? error : -ENOSPC;
+	}
+	storvsc_advance_topology_generation();
+out:
+	ukplat_spin_unlock_irqrestore(&storvsc_topology_lock, flags);
+}
+
+static void storvsc_clear_unresolved_offer(
+	const struct vmbus_guid *instance_id)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	ukplat_spin_lock_irqsave(&storvsc_topology_lock, flags);
+	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_DEVICES; i++) {
+		struct storvsc_unresolved_offer *offer =
+			&storvsc_unresolved_offers[i];
+
+		if (!storvsc_unresolved_offer_matches(offer, instance_id))
+			continue;
+		memset(offer, 0, sizeof(*offer));
+		storvsc_advance_topology_generation();
+		break;
+	}
+	ukplat_spin_unlock_irqrestore(&storvsc_topology_lock, flags);
+}
+
+static int storvsc_has_unresolved_offer(void)
+{
+	unsigned long flags;
+	unsigned int i;
+	int unresolved = 0;
+
+	ukplat_spin_lock_irqsave(&storvsc_topology_lock, flags);
+	if (storvsc_unresolved_offer_overflow) {
+		unresolved = 1;
+		goto out;
+	}
+	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_DEVICES; i++) {
+		if (storvsc_unresolved_offers[i].active) {
+			unresolved = 1;
+			break;
+		}
+	}
+out:
+	ukplat_spin_unlock_irqrestore(&storvsc_topology_lock, flags);
+	return unresolved;
 }
 
 static void
@@ -1904,6 +1998,12 @@ static int storvsc_register_blkdev(struct storvsc_lun *lun,
 		mode->read_only ? O_RDONLY : O_RDWR;
 	lun->blkdev.capabilities.max_sectors_per_req =
 		transfer_limit / capacity->sector_size;
+#ifdef STORVSC_HOST_TEST
+	rc = storvsc_host_registration_hook(
+		lun->controller->index, lun->address.lun);
+	if (rc)
+		return rc;
+#endif
 	if (lun->registered)
 		return 0;
 	rc = uk_blkdev_drv_register(&lun->blkdev, allocator, DRIVER_NAME);
@@ -2088,11 +2188,11 @@ int uk_storvsc_inventory_get(
 		return -EINVAL;
 	memset(snapshot, 0, sizeof(*snapshot));
 	for (attempt = 0; attempt < 4; attempt++) {
-		unresolved = 0;
 		before = __atomic_load_n(
 			&storvsc_topology_generation, __ATOMIC_ACQUIRE);
 		if (before == UINT64_MAX)
 			return -EOVERFLOW;
+		unresolved = storvsc_has_unresolved_offer();
 		count = storvsc_collect_mappings(
 			entries, CONFIG_LIBSTORVSC_MAX_DEVICES *
 					 CONFIG_LIBSTORVSC_MAX_LUNS,
@@ -2641,6 +2741,8 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	if (rc) {
 		if (device)
 			return rc;
+		storvsc_note_unresolved_offer(
+			&vmbus_device->instance_id, -ENOSPC);
 		uk_pr_err(DRIVER_NAME
 			  ": controller pool exhausted for relid=%"PRIu32"\n",
 			  vmbus_device->channel_id);
@@ -2780,6 +2882,16 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 		rc = first_error ? first_error : -ENODEV;
 		goto failed_registered;
 	}
+	if (first_error) {
+		storvsc_note_unresolved_offer(
+			&vmbus_device->instance_id, first_error);
+		uk_pr_err(DRIVER_NAME
+			  ": controller%u inventory unresolved: %d\n",
+			  device->index, first_error);
+	} else {
+		storvsc_clear_unresolved_offer(
+			&vmbus_device->instance_id);
+	}
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	device->online = 1;
 	storvsc_advance_topology_generation();
@@ -2815,6 +2927,8 @@ failed_registered:
 		vmbus_channel_set_callback(storvsc_channel_get(device),
 					   NULL, NULL);
 failed:
+	storvsc_note_unresolved_offer(
+		&vmbus_device->instance_id, rc);
 	if (storvsc_channel_get(device))
 		(void)storvsc_close_channel(device);
 	ukplat_spin_lock_irqsave(&device->lock, flags);
@@ -3002,15 +3116,24 @@ static void storvsc_remove_device(struct vmbus_device *vmbus_device)
 	ukplat_spin_lock_irqsave(&storvsc_topology_lock, topology_flags);
 	device = storvsc_find_controller(vmbus_device);
 	ukplat_spin_unlock_irqrestore(&storvsc_topology_lock, topology_flags);
-	if (!device)
+	if (!device) {
+		storvsc_clear_unresolved_offer(
+			&vmbus_device->instance_id);
 		return;
+	}
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	if (device->vmbus_device != vmbus_device) {
+		int unbound = !device->vmbus_device;
+
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
+		if (unbound)
+			storvsc_clear_unresolved_offer(
+				&vmbus_device->instance_id);
 		return;
 	}
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	storvsc_deferred_schedule(device, STORVSC_DEFER_REMOVE, -ENODEV);
+	storvsc_clear_unresolved_offer(&vmbus_device->instance_id);
 	if (storvsc_wait_active_sends(device))
 		return;
 	storvsc_wait_finish(device);
@@ -3112,6 +3235,13 @@ int storvsc_host_receive(void)
 int storvsc_host_reset_timed_out_io(void)
 {
 	return storvsc_reset_timed_out_io(&storvsc_devices[0]);
+}
+
+int storvsc_host_reset_controller(unsigned int controller)
+{
+	if (controller >= CONFIG_LIBSTORVSC_MAX_DEVICES)
+		return -EINVAL;
+	return storvsc_reset_timed_out_io(&storvsc_devices[controller]);
 }
 
 int storvsc_host_start_timeout_worker(void)

@@ -41,6 +41,7 @@ int storvsc_host_lun_address(size_t index,
 			     struct storvsc_address *address);
 int storvsc_host_receive(void);
 int storvsc_host_reset_timed_out_io(void);
+int storvsc_host_reset_controller(unsigned int controller);
 int storvsc_host_start_timeout_worker(void);
 void storvsc_host_stop_timeout_worker(void);
 void storvsc_host_set_send_wait_limit(unsigned int limit);
@@ -130,6 +131,16 @@ static int report_luns_mode;
 static int topology_fixture;
 static int vpd_mode;
 static uint8_t vpd_variant;
+static int targeted_vpd_malformed;
+static unsigned int targeted_vpd_controller;
+static uint8_t targeted_vpd_lun;
+static int discovery_failure_kind;
+static unsigned int discovery_failure_controller;
+static uint8_t discovery_failure_lun;
+static unsigned int discovery_failures_remaining;
+static unsigned int registration_failure_controller;
+static uint8_t registration_failure_lun;
+static unsigned int registration_failures_remaining;
 static int alternate_completion_size;
 static int hold_io;
 static int short_transfer_once;
@@ -214,6 +225,12 @@ enum {
 	RACE_PAUSE_NONE,
 	RACE_PAUSE_BEFORE_PFNS,
 	RACE_PAUSE_DURING_VMBUS_COPY,
+};
+
+enum {
+	DISCOVERY_FAILURE_NONE,
+	DISCOVERY_FAILURE_INQUIRY,
+	DISCOVERY_FAILURE_CAPACITY,
 };
 
 enum {
@@ -492,6 +509,16 @@ void storvsc_host_binding_publish_hook(unsigned int controller)
 	pthread_mutex_unlock(&race_lock);
 }
 
+int storvsc_host_registration_hook(unsigned int controller, uint8_t lun)
+{
+	if (!registration_failures_remaining ||
+	    controller != registration_failure_controller ||
+	    lun != registration_failure_lun)
+		return 0;
+	registration_failures_remaining--;
+	return -EIO;
+}
+
 static void *thread_start(void *argument)
 {
 	struct uk_thread *thread = argument;
@@ -723,6 +750,19 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 
 	if (payload[17] || payload[18])
 		invalid_scsi_address = 1;
+	if (discovery_failures_remaining &&
+	    controller == discovery_failure_controller &&
+	    lun == discovery_failure_lun &&
+	    ((discovery_failure_kind == DISCOVERY_FAILURE_INQUIRY &&
+	      opcode == 0x12 && !(payload[29] & 1)) ||
+	     (discovery_failure_kind == DISCOVERY_FAILURE_CAPACITY &&
+	      opcode == 0x25))) {
+		discovery_failures_remaining--;
+		enqueue_completion_on(
+			channel, id, response_packet_length(packet_length),
+			1, 1, 0, 0);
+		return;
+	}
 	switch (opcode) {
 	case 0xa0:
 		report_luns_commands++;
@@ -774,13 +814,17 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 				2 * STORVSC_REPORT_LUN_ENTRY_SIZE;
 			break;
 		case REPORT_LUNS_POOL_EXCESS:
+		{
+			static const uint8_t pool_luns[] = { 0, 1, 3, 7, 2 };
+
 			put_be32(data, 0, 5 * STORVSC_REPORT_LUN_ENTRY_SIZE);
 			for (unsigned int i = 0; i < 5; i++)
 				data[9 + i * STORVSC_REPORT_LUN_ENTRY_SIZE] =
-					(uint8_t)i;
+					pool_luns[i];
 			response_transfer +=
 				5 * STORVSC_REPORT_LUN_ENTRY_SIZE;
 			break;
+		}
 		default:
 			abort();
 		}
@@ -802,7 +846,10 @@ static void handle_scsi(struct vmbus_channel *channel, uint64_t id,
 			data[1] = 0x83;
 			if (vpd_mode == VPD_MALFORMED ||
 			    (vpd_mode == VPD_MALFORMED_LUN2 &&
-			     controller == 0 && lun == 2)) {
+			     controller == 0 && lun == 2) ||
+			    (targeted_vpd_malformed &&
+			     controller == targeted_vpd_controller &&
+			     lun == targeted_vpd_lun)) {
 				put_be16(data, 2, 32);
 				response_transfer = 4;
 			} else {
@@ -2972,6 +3019,7 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	};
 	struct uk_storvsc_mapping mappings[8];
 	struct uk_storvsc_mapping found;
+	struct uk_storvsc_inventory_snapshot inventory;
 	struct uk_storvsc_target_snapshot guarded_targets[3];
 	struct uk_storvsc_session guarded_sessions[3];
 	struct uk_blkdev *devices[4];
@@ -3013,6 +3061,12 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	rc = driver->add_dev(&secondary);
 	if (rc || !storvsc_host_controller_online(1) ||
 	    uk_storvsc_mapping_count() != 2)
+		return 30;
+	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
+		return 30;
+	driver->remove_dev(&failed_offer);
+	if (uk_storvsc_inventory_get(&inventory) ||
+	    inventory.count != 2)
 		return 30;
 	primary->present = 1;
 	rc = driver->add_dev(primary);
@@ -3385,6 +3439,12 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	    !storvsc_host_controller_online(0) ||
 	    !storvsc_host_controller_online(1))
 		return 59;
+	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
+		return 59;
+	driver->remove_dev(&excess);
+	if (uk_storvsc_inventory_get(&inventory) ||
+	    inventory.count != 4)
+		return 59;
 
 	driver->remove_dev(primary);
 	if (primary->channel)
@@ -3407,6 +3467,8 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	    !storvsc_host_blkdev_address(0, 0) ||
 	    storvsc_host_blkdev_address(0, 2))
 		return 68;
+	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
+		return 68;
 	driver->remove_dev(primary);
 	if (primary->channel)
 		(void)vmbus_channel_close(primary->channel);
@@ -3414,16 +3476,30 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	driver->remove_dev(&secondary);
 	if (secondary.channel)
 		(void)vmbus_channel_close(secondary.channel);
+	topology_fixture = 0;
+	report_luns_mode = REPORT_LUNS_NORMAL;
+	vpd_mode = VPD_NORMAL;
+	secondary.present = 1;
+	rc = driver->add_dev(&secondary);
+	if (rc)
+		return 62;
+	driver->remove_dev(&secondary);
+	if (secondary.channel)
+		(void)vmbus_channel_close(secondary.channel);
+	topology_fixture = 1;
 	report_luns_mode = REPORT_LUNS_POOL_EXCESS;
 	vpd_mode = VPD_NORMAL;
 	secondary.present = 1;
-	if (driver->add_dev(&secondary) ||
+	rc = driver->add_dev(&secondary);
+	if (rc ||
 	    uk_storvsc_mapping_count() != CONFIG_LIBSTORVSC_MAX_LUNS ||
 	    storvsc_host_blkdev_address(1, 4))
 		return 62;
-	for (unsigned int lun = 0; lun < CONFIG_LIBSTORVSC_MAX_LUNS; lun++) {
+	for (unsigned int i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
+		static const uint8_t pool_luns[] = { 0, 1, 3, 7 };
+
 		if (activate_device(storvsc_host_blkdev_address(1,
-							       (uint8_t)lun),
+							       pool_luns[i]),
 				    events))
 			return 63;
 	}
@@ -3840,6 +3916,120 @@ static void persistence_remove_device(struct vmbus_driver *driver,
 		(void)vmbus_channel_close(device->channel);
 }
 
+enum unresolved_discovery_case {
+	UNRESOLVED_DISCOVERY_VPD,
+	UNRESOLVED_DISCOVERY_INQUIRY,
+	UNRESOLVED_DISCOVERY_CAPACITY,
+	UNRESOLVED_DISCOVERY_REGISTRATION,
+	UNRESOLVED_DISCOVERY_ALL_VPD,
+};
+
+static int run_unresolved_discovery_case(
+	struct vmbus_driver *driver, struct vmbus_device *primary,
+	struct vmbus_device *secondary,
+	enum unresolved_discovery_case failure, int run_guest)
+{
+	struct uk_storvsc_inventory_snapshot inventory;
+	unsigned int writes10 = write10_command_count;
+	unsigned int writes16 = write16_command_count;
+	unsigned int flushes = flush_command_count;
+	int inventory_rc;
+	int rc;
+
+	hyperv_acceptance_persistence_host_reset();
+	if (persistence_prepare_seed(
+		    HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2,
+		    0, 1000, 0, 0))
+		return 650;
+	primary->present = 1;
+	if (driver->add_dev(primary))
+		return 651;
+
+	targeted_vpd_malformed =
+		failure == UNRESOLVED_DISCOVERY_VPD;
+	targeted_vpd_controller = 1;
+	targeted_vpd_lun = 0;
+	discovery_failure_kind =
+		failure == UNRESOLVED_DISCOVERY_INQUIRY ?
+			DISCOVERY_FAILURE_INQUIRY :
+		failure == UNRESOLVED_DISCOVERY_CAPACITY ?
+			DISCOVERY_FAILURE_CAPACITY :
+			DISCOVERY_FAILURE_NONE;
+	discovery_failure_controller = 1;
+	discovery_failure_lun = 0;
+	discovery_failures_remaining =
+		discovery_failure_kind != DISCOVERY_FAILURE_NONE;
+	registration_failure_controller = 1;
+	registration_failure_lun = 0;
+	registration_failures_remaining =
+		failure == UNRESOLVED_DISCOVERY_REGISTRATION;
+	if (failure == UNRESOLVED_DISCOVERY_ALL_VPD)
+		vpd_mode = VPD_MALFORMED;
+	secondary->present = 1;
+	rc = driver->add_dev(secondary);
+	targeted_vpd_malformed = 0;
+	discovery_failure_kind = DISCOVERY_FAILURE_NONE;
+	discovery_failures_remaining = 0;
+	registration_failures_remaining = 0;
+	vpd_mode = VPD_NORMAL;
+	inventory_rc = uk_storvsc_inventory_get(&inventory);
+	if ((failure == UNRESOLVED_DISCOVERY_ALL_VPD ?
+		     rc != -EPROTO : rc) ||
+	    uk_storvsc_mapping_count() !=
+		    (failure == UNRESOLVED_DISCOVERY_ALL_VPD ? 3U : 5U)) {
+		persistence_remove_device(driver, secondary);
+		persistence_remove_device(driver, primary);
+		return 652;
+	}
+	if (inventory_rc == -EAGAIN &&
+	    failure != UNRESOLVED_DISCOVERY_ALL_VPD &&
+	    storvsc_host_reset_controller(1)) {
+		persistence_remove_device(driver, secondary);
+		persistence_remove_device(driver, primary);
+		return 653;
+	}
+	if (inventory_rc == -EAGAIN)
+		inventory_rc = uk_storvsc_inventory_get(&inventory);
+	if (run_guest &&
+	    (hyperv_acceptance_persistence_main() != HYPERV_ACCEPTANCE_FAIL ||
+	     write10_command_count != writes10 ||
+	     write16_command_count != writes16 ||
+	     flush_command_count != flushes)) {
+		persistence_remove_device(driver, secondary);
+		persistence_remove_device(driver, primary);
+		return 655;
+	}
+	if (inventory_rc != -EAGAIN) {
+		persistence_remove_device(driver, secondary);
+		persistence_remove_device(driver, primary);
+		return 654;
+	}
+	persistence_remove_device(driver, secondary);
+	if (uk_storvsc_inventory_get(&inventory) ||
+	    inventory.count != 3) {
+		persistence_remove_device(driver, primary);
+		return 656;
+	}
+	if (failure == UNRESOLVED_DISCOVERY_VPD) {
+		secondary->present = 1;
+		if (driver->add_dev(secondary) ||
+		    uk_storvsc_inventory_get(&inventory) ||
+		    inventory.count != 6 ||
+		    hyperv_acceptance_persistence_main() !=
+			    HYPERV_ACCEPTANCE_FAIL ||
+		    write10_command_count != writes10 ||
+		    write16_command_count != writes16 ||
+		    flush_command_count != flushes) {
+			persistence_remove_device(driver, secondary);
+			persistence_remove_device(driver, primary);
+			return 657;
+		}
+		persistence_remove_device(driver, secondary);
+	}
+	persistence_remove_device(driver, primary);
+	return 0;
+}
+
 static int run_binding_publication_regression(
 	struct vmbus_driver *driver, struct vmbus_device *secondary)
 {
@@ -4144,6 +4334,31 @@ static int run_persistence_workflow_regression(
 		read_only_media = 0;
 		if (rc)
 			return 642;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_VPD, 1);
+		if (rc)
+			return rc;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_INQUIRY, 0);
+		if (rc)
+			return rc;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_CAPACITY, 0);
+		if (rc)
+			return rc;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_REGISTRATION, 0);
+		if (rc)
+			return rc;
+		rc = run_unresolved_discovery_case(
+			driver, primary, &secondary,
+			UNRESOLVED_DISCOVERY_ALL_VPD, 1);
+		if (rc)
+			return rc;
 	}
 
 	hyperv_acceptance_persistence_host_reset();
@@ -4637,6 +4852,7 @@ int main(void)
 	rc = driver->add_dev(&vmbus_device);
 	if (rc != -EPROTO || vmbus_device.channel || close_count < 2)
 		return 28;
+	driver->remove_dev(&vmbus_device);
 	if (invalid_scsi_address)
 		return 425;
 	rc = run_topology_regression(driver, &vmbus_device, buffer, &events);
