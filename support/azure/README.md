@@ -181,10 +181,11 @@ TMPDIR="$PWD/.d/acceptance-tmp" \
 XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
 ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
 ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
-PATH="$CONFIG_TOOLS:$LLVM_BIN:$PATH" \
+PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:/usr/bin:/bin" \
   "$ZIG" build olddefconfig -j2 \
   -Dapp="$PWD/support/apps/hyperv-acceptance" \
   -Dconfig="$PWD/support/apps/hyperv-acceptance/.config" \
+  -Dmake-command="$MAKE" \
   "-Dcompiler=$ZIG cc -target x86_64-freestanding-none" \
   -Dcompiler-targeted=true "-Dhost-cc=$ZIG cc" \
   "-Dhost-cxx=$ZIG c++" -Dhost-cflags=-fno-sanitize=null \
@@ -200,6 +201,20 @@ guarded I/O; use identity policy 2; preserve the exact run ID, disk ID, LUN,
 sector count, and 512-byte sector size; and leave path and target unenrolled.
 V1, network-application, altered geometry, or incomplete guarded configurations
 are rejected before packaging or any cloud action.
+
+The guarded producer pin is a separately versioned reviewed contract. It
+fingerprints the native build selection, Hyper-V message ingress and ABI,
+VMBus storage-offer matcher and sticky lifetime state, StorVSC coherent
+inventory/core, and the acceptance application's unavailable decision and
+record framing, including their Kconfig, Make, and exported-symbol wiring.
+Any update to that critical proof closure requires an explicit reviewed pin
+change before another guarded image can be generated.
+
+Run the solve command with the controlled tool path shown above rather than an
+ambient developer shell. `python3` then resolves from the pinned runtime, the
+parser wrappers resolve first, LLVM tools retain their symbolic command names,
+and the Make-backed facade uses the absolute `$MAKE` supplied by
+`-Dmake-command`.
 
 Then let the controller invoke the fixed native builder itself, snapshot
 source/configuration before and after the build, fingerprint

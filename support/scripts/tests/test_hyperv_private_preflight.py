@@ -539,6 +539,129 @@ class PrivatePreflightFixture(unittest.TestCase):
 
 
 class PrivatePreflightManifestTest(PrivatePreflightFixture):
+    def test_guarded_source_pin_covers_pristine_proof_dependency_closure(self):
+        self.assertEqual(
+            preflight.GUARDED_PRODUCER_FILES,
+            runner.GUARDED_PRODUCER_FILES,
+        )
+        self.assertEqual(
+            preflight.GUARDED_PRODUCER_SCHEMA_VERSION,
+            runner.GUARDED_PRODUCER_SCHEMA_VERSION,
+        )
+        proof_roles = {
+            "build.zig",
+            "plat/hyperv/Makefile.uk",
+            "plat/hyperv/hyperv_runtime.zig",
+            "plat/hyperv/include/hyperv/hyperv.h",
+            "plat/hyperv/time.c",
+            "drivers/hyperv/vmbus/Makefile.uk",
+            "drivers/hyperv/vmbus/include/uk/vmbus.h",
+            "drivers/hyperv/vmbus/vmbus_bus.c",
+            "drivers/hyperv/vmbus/vmbus_protocol.h",
+            "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            "drivers/hyperv/storvsc/Makefile.uk",
+            "drivers/hyperv/storvsc/include/uk/storvsc.h",
+            "drivers/hyperv/storvsc/storvsc.c",
+            "drivers/hyperv/storvsc/storvsc_core.h",
+            "drivers/hyperv/storvsc/storvsc_core.zig",
+            "support/apps/hyperv-acceptance/Makefile.uk",
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/apps/hyperv-acceptance/acceptance_protocol.h",
+            "support/apps/hyperv-acceptance/main.c",
+            "support/apps/hyperv-acceptance/persistence.c",
+        }
+        self.assertLessEqual(
+            proof_roles, set(preflight.GUARDED_PRODUCER_FILES)
+        )
+        for relative, expected in preflight.GUARDED_PRODUCER_FILES.items():
+            with self.subTest(relative=relative):
+                self.assertEqual(
+                    preflight.azure.image_sha256(SUPPORT.parent / relative),
+                    expected,
+                )
+                self.assertEqual(
+                    preflight.IMPLEMENTATION_PATHS[
+                        f"guarded_producer:{relative}"
+                    ],
+                    SUPPORT.parent / relative,
+                )
+
+    def test_guarded_matcher_mutations_fail_before_packaging(self):
+        mutation_targets = (
+            "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            "drivers/hyperv/vmbus/vmbus_protocol.h",
+        )
+        for relative in mutation_targets:
+            with self.subTest(relative=relative), \
+                    tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for source_relative in preflight.GUARDED_PRODUCER_FILES:
+                    source = SUPPORT.parent / source_relative
+                    destination = root / source_relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(source.read_bytes())
+                fake_support = root / "support"
+                with mock.patch.object(preflight, "SUPPORT", fake_support):
+                    preflight.verify_guarded_producer_sources(root)
+                    target = root / relative
+                    target.write_bytes(target.read_bytes() + b"\n")
+                    with self.assertRaisesRegex(
+                        ValueError, "reviewed V2 contract"
+                    ):
+                        preflight.verify_guarded_producer_sources(root)
+
+                    config = root / "solved.config"
+                    config.write_bytes(self.guarded_config())
+                    arguments = [
+                        root / "output", root, config, root / "qemu",
+                        root / "code", root / "vars", root / "capability",
+                        root / "capability-receipt", root / "efi",
+                        root / "build-receipt", root / "raw", root / "vhd",
+                        root / "miz",
+                    ]
+                    provenance = self.manifest(
+                        boot_policy=preflight.GUARDED_BOOT_POLICY
+                    )["provenance"]
+                    provenance["config"] = {
+                        "name": preflight.SOLVED_CONFIG,
+                        "sha256": hashlib.sha256(
+                            self.guarded_config()
+                        ).hexdigest(),
+                        "size": len(self.guarded_config()),
+                    }
+                    with mock.patch.object(
+                        preflight, "check_blob_dependency"
+                    ), mock.patch.object(
+                        preflight, "build_provenance",
+                        return_value=provenance,
+                    ), mock.patch.object(
+                        preflight, "qemu_closure_records"
+                    ) as packaging:
+                        with self.assertRaisesRegex(
+                            ValueError, "reviewed V2 contract"
+                        ):
+                            preflight.generate_input(
+                                *arguments, preflight.GUARDED_BOOT_POLICY
+                            )
+                        packaging.assert_not_called()
+
+    def test_guarded_olddefconfig_recipe_uses_pinned_make_and_python(self):
+        readme = (SUPPORT / "azure" / "README.md").read_text()
+        start = readme.index(
+            'PERSISTENCE="$PWD/.d/private-preflight-persistence"'
+        )
+        end = readme.index(
+            'SOLVED_CONFIG="$PWD/support/apps/hyperv-acceptance/.config"',
+            start,
+        )
+        recipe = readme[start:end]
+        self.assertIn(
+            'PATH="$CONFIG_TOOLS:$RUNTIME/venv/bin:$LLVM_BIN:/usr/bin:/bin"',
+            recipe,
+        )
+        self.assertIn('-Dmake-command="$MAKE"', recipe)
+        self.assertNotIn("$LLVM_BIN:$PATH", recipe)
+
     def test_guarded_contract_is_derived_from_exact_solved_v2_config(self):
         preflight.verify_guarded_producer_sources(SUPPORT.parent)
         with tempfile.TemporaryDirectory() as temporary:

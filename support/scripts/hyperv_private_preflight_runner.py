@@ -66,12 +66,40 @@ GUARDED_CONTRACT_SCHEMA = (
     "unikraft.hyperv.guarded-v2-pristine-unavailable"
 )
 GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
+GUARDED_PRODUCER_SCHEMA_VERSION = 2
 GUARDED_PRODUCER_FILES = {
+    "build.zig": (
+        "205df26de46ffaaf27cfd396907a623831410869bf41518b6e6771f95861e40f"
+    ),
+    "drivers/hyperv/storvsc/Config.uk": (
+        "bc4474ee1655396b74359fc0b40fd5036b2e6219a50f6b6fb6787a0e8daeec6a"
+    ),
+    "drivers/hyperv/storvsc/Makefile.uk": (
+        "9ea0883afdb3e08df3110347df9a3917dbd602a151a302b6d3bceea02ec6b905"
+    ),
+    "drivers/hyperv/storvsc/exportsyms.uk": (
+        "0d15682c08580e5dd5f9546b66990e2b053ed1b2b8b0746a05670aaeadc61a6d"
+    ),
     "drivers/hyperv/storvsc/include/uk/storvsc.h": (
         "e0e666ff4faefc2ba1186403a4320170fb3163375cc31a04312bbce011aa9f10"
     ),
     "drivers/hyperv/storvsc/storvsc.c": (
         "cb9e5afefb8f18612c36b5975b94ed64c0702c4a4e6988ea4edfa9c6bc6da213"
+    ),
+    "drivers/hyperv/storvsc/storvsc_core.h": (
+        "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
+    ),
+    "drivers/hyperv/storvsc/storvsc_core.zig": (
+        "f4b7f4fa58cca087b9ff7b2e15f372d09cab9ea542210c0a306b9a5880ba9ae6"
+    ),
+    "drivers/hyperv/vmbus/Config.uk": (
+        "05a880a38a10e130510fafbfa786f080d3da1413feb84ca7fc2a068c04a4d069"
+    ),
+    "drivers/hyperv/vmbus/Makefile.uk": (
+        "7622b3998629db41f2e1c8f8538872cf3efc64fff16e5832d0fb053ba2437a57"
+    ),
+    "drivers/hyperv/vmbus/exportsyms.uk": (
+        "0e2c628030c199ab0e61f691a86a8f0f6282f16871bea816374a2e6941997b3a"
     ),
     "drivers/hyperv/vmbus/include/uk/vmbus.h": (
         "e11c351dcb6bf4596285193bf728f1f30a2152da25e075539e4143edafc6d763"
@@ -79,8 +107,38 @@ GUARDED_PRODUCER_FILES = {
     "drivers/hyperv/vmbus/vmbus_bus.c": (
         "70f4157ce22475e88b037b9f599e4910719a3cfdde0e70cbf32f0f9004b0b185"
     ),
+    "drivers/hyperv/vmbus/vmbus_protocol.h": (
+        "c00e58790f9d8ece3518fdda9b82b02b843eccb3c2cc90002344192b554e44a9"
+    ),
+    "drivers/hyperv/vmbus/vmbus_protocol.zig": (
+        "4815d095de1aefcbc8f9bd40c87f7b17b1ff5e51bc816b8ba0b73980b5eab2a3"
+    ),
+    "plat/hyperv/Config.uk": (
+        "c5fe6226a426333e2119845366cac6c712b4258d8c7ead82980d7ac57c7c0505"
+    ),
+    "plat/hyperv/Makefile.uk": (
+        "672e146edc8058fce245a05e475564a89e634b2e41394625236a17167d7a08a4"
+    ),
+    "plat/hyperv/hyperv_runtime.zig": (
+        "901a9caf76b33fa9990acdc061139553862caf394d1c78039cb71008262ec076"
+    ),
+    "plat/hyperv/include/hyperv/hyperv.h": (
+        "af844d90dea4b706ad00ef50beaa0df54697a6b324888d4d41dc918ae2b57b3c"
+    ),
+    "plat/hyperv/platform.c": (
+        "0129808beafd31996448bc8a636a1329feda5d538f19704875a908125e37da5a"
+    ),
+    "plat/hyperv/time.c": (
+        "3b97fcf27fa0a76b93e565b770bb2b1d8b0d7496267387039b6c88d0e1a1cce1"
+    ),
     "support/apps/hyperv-acceptance/Config.uk": (
         "548e97aadb9b55101e2ec1dbb7a4b22f82b210a22d5f14eb441b17fdd2009aa7"
+    ),
+    "support/apps/hyperv-acceptance/Makefile.uk": (
+        "7896635d1d9be1149ecac6c7dff1f92bdcf44b2ed80e022b6b517e4df0107ef0"
+    ),
+    "support/apps/hyperv-acceptance/acceptance_protocol.c": (
+        "fe6b1a641ef70481e6b6f4d7360a7d3a06496c4a261611b3ce996db6fa0dc86a"
     ),
     "support/apps/hyperv-acceptance/acceptance_protocol.h": (
         "0298f62c5db8cfec137d39d6a33f9726ca291c7f55150780588a17795cd2b0da"
@@ -90,6 +148,12 @@ GUARDED_PRODUCER_FILES = {
     ),
     "support/apps/hyperv-acceptance/persistence.c": (
         "fff49e4a09ecb6a5e788b817a5f2677d39cadd1f5a7693a2cb2be6721399d9ee"
+    ),
+    "support/apps/hyperv-acceptance/persistence.h": (
+        "8ef53f9ed76286b945212ea487bed1e6d51ec161078d4a2283f9054b962bd70f"
+    ),
+    "support/apps/hyperv-acceptance/persistence_host.h": (
+        "29f1f4f0f272225ae1d2578612a4f8320f1bc8d245e9447ce6696300b80ad23c"
     ),
 }
 LIVE_IO_MARKERS = (
@@ -214,7 +278,7 @@ def validate_guarded_contract(value, boot_policy):
         != value["solved_config_sha256"]
         or producer["schema"] != GUARDED_PRODUCER_SCHEMA
         or type(producer["schema_version"]) is not int
-        or producer["schema_version"] != 1
+        or producer["schema_version"] != GUARDED_PRODUCER_SCHEMA_VERSION
         or dict(files) != GUARDED_PRODUCER_FILES
     ):
         raise RunnerError("invalid-guarded-contract")
