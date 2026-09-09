@@ -395,7 +395,20 @@ host with Standard security, a 32 GiB `StandardSSD_LRS` OS disk, one dedicated
 owned resource group, `/29` VNet/subnet, NIC, NSG, and network-deny Blob
 account. The subnet disables default outbound access and enables the
 Microsoft.Storage service endpoint. There is no public IP, SSH ingress, NAT
-gateway, data disk, or reuse of network-acceptance resources. Before creating
+gateway, data disk, or reuse of network-acceptance resources. Its NSG allows
+only TCP 80/32526 to the exact Azure platform virtual IP
+`168.63.129.16/32` and TCP 443 to `Storage.NorthEurope`, then denies all
+other inbound and outbound traffic. It deliberately has no `Allow` rule
+targeting `AzurePlatformDNS` or `AzurePlatformIMDS`. Microsoft documents DNS,
+IMDS, DHCP, health and agent communication as
+[platform traffic exempt from ordinary NSG rules][azure-platform-nsg];
+those special service tags target that otherwise exempt path for an explicit
+deny (documentation source revision
+`aceedff0b0c50c5a106a6dbfa5b6048e181770c2`). Omitting the invalid
+tag-based allows therefore retains platform DNS and IMDS without widening
+Internet access. The exact WireServer ports follow Microsoft's
+[platform virtual-IP contract][azure-platform-ip] (documentation source
+revision `4fd2222b00bd277111ce9f635255aefa0b7b396c`). Before creating
 the group, the controller validates the exact immutable Ubuntu image, SKU,
 generation, x64 architecture, two-vCPU/eight-GiB shape, providers, and
 regional/family quota. Azure's Resource SKUs metadata does not currently
@@ -1095,6 +1108,8 @@ host is available, but only after the local gates pass. Full workload SMP,
 stress testing, and production readiness remain separate milestones.
 
 [trusted-launch]: https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-faq#can-i-disable-trusted-launch-for-a-new-vm-deployment
+[azure-platform-nsg]: https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview#azure-platform-considerations
+[azure-platform-ip]: https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16
 [dsv5-nested]: https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/dsv5-series
 [upload]: https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-upload-vhd-to-managed-disk-cli
 [miz-revision]: https://github.com/cataggar/miz/commit/2db68ca0c3ab12155012a823c3fb8d7aba1cb544

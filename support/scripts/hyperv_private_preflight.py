@@ -583,6 +583,56 @@ def exact_fields(value, fields, description):
     return azure.require_exact_fields(value, fields, description)
 
 
+def validate_private_failure_record(value):
+    if (
+        not isinstance(value, dict)
+        or set(value) not in (
+            {"category", "code", "phase"},
+            {"category", "code", "phase", "reconciliation"},
+        )
+        or not isinstance(value["category"], str)
+        or not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{0,79}", value["category"]
+        )
+        or value["code"] is not None
+        and (
+            not isinstance(value["code"], str)
+            or not re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_-]{0,79}", value["code"]
+            )
+        )
+        or not isinstance(value["phase"], str)
+        or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", value["phase"])
+    ):
+        raise ValueError("Private-preflight failure record is invalid")
+    reconciliation = value.get("reconciliation")
+    if reconciliation is not None and (
+        not isinstance(reconciliation, dict)
+        or set(reconciliation) != {"category", "code"}
+        or not isinstance(reconciliation["category"], str)
+        or not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{0,79}",
+            reconciliation["category"],
+        )
+        or reconciliation["code"] is not None
+        and (
+            not isinstance(reconciliation["code"], str)
+            or not re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_-]{0,79}",
+                reconciliation["code"],
+            )
+        )
+    ):
+        raise ValueError("Private-preflight reconciliation failure is invalid")
+    return {
+        **value,
+        **(
+            {"reconciliation": dict(reconciliation)}
+            if reconciliation is not None else {}
+        ),
+    }
+
+
 def require_relative(value, description):
     if (
         not isinstance(value, str)
@@ -3111,6 +3161,8 @@ def load_state(directory):
         state["pending_secret_files"]
     ):
         raise ValueError("Private-preflight secret-file obligation is invalid")
+    if state.get("failure") is not None:
+        state["failure"] = validate_private_failure_record(state["failure"])
     state["input_manifest"] = validate_input_manifest(state["input_manifest"])
     state["implementation"] = validate_implementation(
         state["implementation"]
@@ -3768,6 +3820,50 @@ def save_private_bytes(path, value):
         output.write(value)
         output.flush()
         os.fsync(output.fileno())
+
+
+class PrivateHostDeploymentReconciliationError(RuntimeError):
+    def __init__(self, primary, reconciliation, private_values):
+        category = type(primary).__name__
+        self.failure_category = (
+            category
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", category)
+            else "RuntimeError"
+        )
+        code = getattr(primary, "code", None)
+        self.code = (
+            code
+            if isinstance(code, str)
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", code)
+            else None
+        )
+        reconciliation_category = type(reconciliation).__name__
+        reconciliation_code = getattr(reconciliation, "code", None)
+        self.reconciliation_failure = {
+            "category": (
+                reconciliation_category
+                if re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_]{0,79}",
+                    reconciliation_category,
+                )
+                else "RuntimeError"
+            ),
+            "code": (
+                reconciliation_code
+                if isinstance(reconciliation_code, str)
+                and re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_-]{0,79}",
+                    reconciliation_code,
+                )
+                else None
+            ),
+        }
+        super().__init__(
+            "Primary private host deployment failure: "
+            + azure.safe_failure_message(primary, private_values)
+            + "; deployment reconciliation also failed: "
+            + azure.safe_failure_message(reconciliation, private_values)
+        )
 
 
 class PrivatePreflightRun(azure.AzureRun):
@@ -4495,17 +4591,9 @@ class PrivatePreflightRun(azure.AzureRun):
         ])
         self.require_operation_owned(nsg)
         expected_rules = {
-            "AllowAzurePlatformDns": (
-                100, "Allow", "Outbound", "Udp", "53",
-                "VirtualNetwork", "AzurePlatformDNS",
-            ),
-            "AllowAzurePlatformImds": (
-                110, "Allow", "Outbound", "Tcp", "80",
-                "VirtualNetwork", "AzurePlatformIMDS",
-            ),
             "AllowAzurePlatformAgent": (
                 120, "Allow", "Outbound", "Tcp", ("80", "32526"),
-                "VirtualNetwork", "168.63.129.16",
+                "VirtualNetwork", "168.63.129.16/32",
             ),
             "AllowRegionalStorage": (
                 130, "Allow", "Outbound", "Tcp", "443",
@@ -4711,15 +4799,21 @@ class PrivatePreflightRun(azure.AzureRun):
                 ], timeout=self.phase_timeout(900))
             self.validate_deployment_result(deployment)
             self.capture_host_identity(self.state["deadline_monotonic"])
-        except (RuntimeError, ValueError, OSError):
+        except (RuntimeError, ValueError, OSError) as primary:
             reconcile_deadline = min(
                 self.deadline,
                 time.monotonic() + RECONCILE_TIMEOUT_SECONDS,
             )
-            if not self.reconcile_host_deployment(reconcile_deadline):
-                raise RuntimeError(
-                    "Private host deployment did not create compute resources"
+            try:
+                reconciled = self.reconcile_host_deployment(
+                    reconcile_deadline
+                )
+            except (RuntimeError, ValueError, OSError) as reconciliation:
+                raise PrivateHostDeploymentReconciliationError(
+                    primary, reconciliation, self.private_failure_values()
                 ) from None
+            if not reconciled:
+                raise
         finally:
             password = None
         self.verify_deployed_envelope()
@@ -5760,11 +5854,22 @@ def record_private_failure(run, error, phase):
         r"[A-Za-z][A-Za-z0-9_-]{0,79}", code
     ):
         code = None
-    run.record("failed", failure={
-        "category": type(error).__name__,
+    category = getattr(error, "failure_category", type(error).__name__)
+    if not isinstance(category, str) or not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_]{0,79}", category
+    ):
+        category = type(error).__name__
+    failure = {
+        "category": category,
         "code": code,
         "phase": phase,
-    })
+    }
+    reconciliation = getattr(error, "reconciliation_failure", None)
+    if isinstance(reconciliation, dict):
+        failure["reconciliation"] = dict(reconciliation)
+    run.record(
+        "failed", failure=validate_private_failure_record(failure)
+    )
 
 
 def record_private_failure_or_raise(run, error, phase):

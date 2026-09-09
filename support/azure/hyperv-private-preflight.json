@@ -69,32 +69,6 @@
       "properties": {
         "securityRules": [
           {
-            "name": "AllowAzurePlatformDns",
-            "properties": {
-              "priority": 100,
-              "access": "Allow",
-              "direction": "Outbound",
-              "protocol": "Udp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "53",
-              "sourceAddressPrefix": "VirtualNetwork",
-              "destinationAddressPrefix": "AzurePlatformDNS"
-            }
-          },
-          {
-            "name": "AllowAzurePlatformImds",
-            "properties": {
-              "priority": 110,
-              "access": "Allow",
-              "direction": "Outbound",
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "80",
-              "sourceAddressPrefix": "VirtualNetwork",
-              "destinationAddressPrefix": "AzurePlatformIMDS"
-            }
-          },
-          {
             "name": "AllowAzurePlatformAgent",
             "properties": {
               "priority": 120,
@@ -107,7 +81,7 @@
                 "32526"
               ],
               "sourceAddressPrefix": "VirtualNetwork",
-              "destinationAddressPrefix": "168.63.129.16"
+              "destinationAddressPrefix": "168.63.129.16/32"
             }
           },
           {

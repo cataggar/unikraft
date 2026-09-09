@@ -3004,6 +3004,63 @@ class PrivatePreflightTemplateTest(PrivatePreflightFixture):
             },
         )
 
+    def test_private_nsg_uses_only_valid_platform_rule_semantics(self):
+        template = json.loads(preflight.TEMPLATE_PATH.read_text())
+        nsg = next(
+            item for item in template["resources"]
+            if item["type"] == "Microsoft.Network/networkSecurityGroups"
+        )
+        rules = {
+            rule["name"]: rule["properties"]
+            for rule in nsg["properties"]["securityRules"]
+        }
+        self.assertEqual(
+            set(rules),
+            {
+                "AllowAzurePlatformAgent",
+                "AllowRegionalStorage",
+                "DenyAllInbound",
+                "DenyAllOutbound",
+            },
+        )
+        self.assertEqual(
+            rules["AllowAzurePlatformAgent"],
+            {
+                "priority": 120,
+                "access": "Allow",
+                "direction": "Outbound",
+                "protocol": "Tcp",
+                "sourcePortRange": "*",
+                "destinationPortRanges": ["80", "32526"],
+                "sourceAddressPrefix": "VirtualNetwork",
+                "destinationAddressPrefix": "168.63.129.16/32",
+            },
+        )
+        self.assertEqual(
+            rules["AllowRegionalStorage"],
+            {
+                "priority": 130,
+                "access": "Allow",
+                "direction": "Outbound",
+                "protocol": "Tcp",
+                "sourcePortRange": "*",
+                "destinationPortRange": "443",
+                "sourceAddressPrefix": "VirtualNetwork",
+                "destinationAddressPrefix": "Storage.NorthEurope",
+            },
+        )
+        self.assertEqual(
+            rules["DenyAllInbound"]["access"], "Deny"
+        )
+        self.assertEqual(
+            rules["DenyAllOutbound"]["access"], "Deny"
+        )
+        self.assertFalse(any(
+            rule["destinationAddressPrefix"]
+            in ("AzurePlatformDNS", "AzurePlatformIMDS")
+            for rule in rules.values()
+        ))
+
 
 class PrivatePreflightCloudTest(PrivatePreflightFixture):
     @mock.patch.object(preflight.azure, "resolve_peer_image")
@@ -3313,6 +3370,20 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 with self.assertRaises(ValueError):
                     preflight.load_state(root)
 
+    def test_state_failure_record_cannot_retain_raw_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = self.cloud_state()
+            state["failure"] = {
+                "category": "AzureCliError",
+                "code": "SecurityRuleInvalidAccessType",
+                "phase": "host-deployment-failed-no-compute",
+                "message": "adminPassword=private-secret",
+            }
+            preflight.azure.save_json(root / "state.json", state)
+            with self.assertRaisesRegex(ValueError, "failure record"):
+                preflight.load_state(root)
+
     def test_deployment_obligation_is_durable_before_create(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
@@ -3329,6 +3400,98 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             )
             self.assertIs(state["host_deployment"], receipt)
             run.record.assert_called_once()
+
+    def test_failed_no_compute_preserves_private_azure_creation_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            failure = preflight.azure.AzureCliError(
+                ["deployment", "group", "create"],
+                mock.Mock(
+                    returncode=1,
+                    stderr=(
+                        "ERROR: (SecurityRuleInvalidAccessType) "
+                        "invalid access; adminPassword=private-secret "
+                        "https://private.example/?sig=private-sas"
+                    ),
+                ),
+                True,
+            )
+
+            def command(arguments, **_kwargs):
+                if arguments[:3] == ["deployment", "group", "create"]:
+                    raise failure
+                if arguments[:3] == ["deployment", "group", "show"]:
+                    return self.deployment(run, state, "Failed")
+                if arguments[:2] == ["resource", "list"]:
+                    return []
+                self.fail(f"Unexpected Azure operation: {arguments[:3]}")
+
+            run.az.side_effect = command
+            with self.assertRaises(preflight.azure.AzureCliError) as raised:
+                run.deploy_host("0526")
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(
+                failure.code, "SecurityRuleInvalidAccessType"
+            )
+            self.assertEqual(
+                state["host_deployment"]["phase"], "failed-no-compute"
+            )
+            self.assertEqual(
+                state["phase"], "host-deployment-failed-no-compute"
+            )
+            self.assertEqual(state["pending_secret_files"], [])
+            self.assertNotIn("private-secret", str(raised.exception))
+            self.assertNotIn("private-sas", str(raised.exception))
+
+    def test_deployment_reconciliation_retains_both_safe_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            failure = preflight.azure.AzureCliError(
+                ["deployment", "group", "create"],
+                mock.Mock(
+                    returncode=1,
+                    stderr=(
+                        "ERROR: (SecurityRuleInvalidAccessType) "
+                        "adminPassword=private-secret"
+                    ),
+                ),
+                True,
+            )
+            run.az.side_effect = failure
+            run.reconcile_host_deployment = mock.Mock(
+                side_effect=RuntimeError(
+                    f"{state['subscription']} {run.group}"
+                )
+            )
+            with self.assertRaises(
+                preflight.PrivateHostDeploymentReconciliationError
+            ) as raised:
+                run.deploy_host("0526")
+            error = raised.exception
+            self.assertEqual(error.failure_category, "AzureCliError")
+            self.assertEqual(
+                error.code, "SecurityRuleInvalidAccessType"
+            )
+            self.assertEqual(
+                error.reconciliation_failure,
+                {"category": "RuntimeError", "code": None},
+            )
+            self.assertNotIn(state["subscription"], str(error))
+            self.assertNotIn("private-secret", str(error))
+            self.assertNotIn(run.group, str(error))
+            preflight.record_private_failure(run, error, "deployment")
+            self.assertEqual(
+                state["failure"],
+                {
+                    "category": "AzureCliError",
+                    "code": "SecurityRuleInvalidAccessType",
+                    "phase": "deployment",
+                    "reconciliation": {
+                        "category": "RuntimeError",
+                        "code": None,
+                    },
+                },
+            )
 
     def test_partial_persisted_identity_anchors_are_invalid(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3930,17 +4093,9 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 "securityRules": [],
             }
             expected = {
-                "AllowAzurePlatformDns": (
-                    100, "Allow", "Outbound", "Udp", "53",
-                    "VirtualNetwork", "AzurePlatformDNS",
-                ),
-                "AllowAzurePlatformImds": (
-                    110, "Allow", "Outbound", "Tcp", "80",
-                    "VirtualNetwork", "AzurePlatformIMDS",
-                ),
                 "AllowAzurePlatformAgent": (
                     120, "Allow", "Outbound", "Tcp", ["80", "32526"],
-                    "VirtualNetwork", "168.63.129.16",
+                    "VirtualNetwork", "168.63.129.16/32",
                 ),
                 "AllowRegionalStorage": (
                     130, "Allow", "Outbound", "Tcp", "443",
@@ -4021,6 +4176,32 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             run.verify_deployed_envelope()
             run.verify_storage_rules.assert_called_once_with()
             run.verify_resource_inventory.assert_called_once_with()
+            invalid_access = copy.deepcopy(nsg)
+            next(
+                rule for rule in invalid_access["securityRules"]
+                if rule["name"] == "AllowRegionalStorage"
+            )["access"] = "Permit"
+            platform_tag_allow = copy.deepcopy(nsg)
+            platform_tag_allow["securityRules"].append({
+                "name": "AllowAzurePlatformDns",
+                "priority": 100,
+                "access": "Allow",
+                "direction": "Outbound",
+                "protocol": "Udp",
+                "sourcePortRange": "*",
+                "destinationPortRange": "53",
+                "sourceAddressPrefix": "VirtualNetwork",
+                "destinationAddressPrefix": "AzurePlatformDNS",
+            })
+            for name, changed in (
+                ("invalid-access", invalid_access),
+                ("platform-tag-allow", platform_tag_allow),
+            ):
+                with self.subTest(nsg=name):
+                    run.az.reset_mock()
+                    run.az.side_effect = [nic, changed]
+                    with self.assertRaisesRegex(RuntimeError, "NSG"):
+                        run.verify_deployed_envelope()
 
     def test_resource_inventory_rejects_extra_public_ip(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4087,7 +4268,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
 class PrivatePreflightOrderingTest(PrivatePreflightFixture):
     def execute(
         self, capability_error=None, cleanup_error=None,
-        recording_error=None,
+        recording_error=None, deployment_error=None,
     ):
         state = self.state()
         events = []
@@ -4121,8 +4302,15 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             fake.record.side_effect = record
             fake.account_bytes.side_effect = account
             fake.create_group.side_effect = lambda: events.append("group")
-            fake.deploy_host.side_effect = lambda _: (
-                events.append("host"),
+
+            def deploy_host(_shutdown):
+                events.append("host")
+                if deployment_error is not None:
+                    fake.record(
+                        "host-deployment-failed-no-compute",
+                        host_deployment={"phase": "failed-no-compute"}
+                    )
+                    raise deployment_error
                 state.update(
                     host_vm_id="/private/vm",
                     host_deployment={
@@ -4135,8 +4323,9 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
                         "vm_uuid": "44444444-4444-4444-8444-444444444444",
                         "disk_uuid": "55555555-5555-4555-8555-555555555555",
                     },
-                ),
-            )
+                )
+
+            fake.deploy_host.side_effect = deploy_host
             fake.verify_storage_rules.side_effect = lambda: events.append(
                 "firewall-closed"
             )
@@ -4243,11 +4432,12 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             ), mock.patch.object(
                 preflight.azure, "image_sha256", return_value="e" * 64
             ):
-                if capability_error is not None:
+                primary_error = deployment_error or capability_error
+                if primary_error is not None:
                     expected = (
                         preflight.azure.RunCleanupError
                         if cleanup_error is not None
-                        else type(capability_error)
+                        else type(primary_error)
                     )
                     with self.assertRaises(expected) as raised:
                         preflight.run_preflight(
@@ -4296,6 +4486,38 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
         self.assertNotIn("upload-private", events)
         self.assertEqual(events[-1], "cleanup")
         self.assertIsInstance(raised, RuntimeError)
+
+    def test_failed_no_compute_records_safe_azure_code_and_cleans(self):
+        failure = preflight.azure.AzureCliError(
+            ["deployment", "group", "create"],
+            mock.Mock(
+                returncode=1,
+                stderr=(
+                    "ERROR: (SecurityRuleInvalidAccessType) "
+                    "adminPassword=private-secret "
+                    "https://private.example/?sig=private-sas"
+                ),
+            ),
+            True,
+        )
+        events, state, raised = self.execute(deployment_error=failure)
+        self.assertIs(raised, failure)
+        self.assertEqual(events, ["group", "host", "cleanup"])
+        self.assertIs(state["cleanup_required"], False)
+        self.assertEqual(
+            state["host_deployment"], {"phase": "failed-no-compute"}
+        )
+        self.assertEqual(
+            state["failure"],
+            {
+                "category": "AzureCliError",
+                "code": "SecurityRuleInvalidAccessType",
+                "phase": "host-deployment-failed-no-compute",
+            },
+        )
+        serialized = json.dumps(state["failure"])
+        self.assertNotIn("private-secret", serialized)
+        self.assertNotIn("private-sas", serialized)
 
     def test_primary_and_cleanup_failures_are_both_sanitized_and_durable(self):
         private = "11111111-2222-3333-4444-555555555555"
