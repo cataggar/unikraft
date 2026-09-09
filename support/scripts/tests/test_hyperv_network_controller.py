@@ -44,6 +44,46 @@ class HypervNetworkControllerTest(unittest.TestCase):
     def encoded(prefix, **fields):
         return prefix + json.dumps(fields, sort_keys=True)
 
+    @staticmethod
+    def producer_tcp_writes():
+        peer = controller._load_peer()
+
+        class CompleteWrite:
+            def settimeout(self, _timeout):
+                pass
+
+            @staticmethod
+            def send(data):
+                return len(data)
+
+        connection = CompleteWrite()
+        nonce = int("87c0ffee5aa8dfd6", 16)
+        return tuple(
+            peer.send_chunks(
+                connection,
+                peer.message(1, 2, sequence, length, nonce),
+                float("inf"),
+            )
+            for sequence, length in controller.TCP_CASES
+        )
+
+    @staticmethod
+    def mutate_record(text, prefix, event, field, value, occurrence=0):
+        lines = text.splitlines()
+        matched = 0
+        for index, line in enumerate(lines):
+            if not line.startswith(prefix):
+                continue
+            record = json.loads(line[len(prefix):])
+            if record.get("event") != event:
+                continue
+            if matched == occurrence:
+                record[field] = value
+                lines[index] = prefix + json.dumps(record, sort_keys=True)
+                return "\n".join(lines)
+            matched += 1
+        raise AssertionError(f"Missing {event} occurrence {occurrence}")
+
     def peer_log(self):
         acceptance = self.acceptance()
         network = self.network()
@@ -60,11 +100,12 @@ class HypervNetworkControllerTest(unittest.TestCase):
                 nonce=network["nonce"],
             ),
         ]
-        for sequence, length in controller.TCP_CASES:
+        tcp_writes = self.producer_tcp_writes()
+        for (sequence, length), writes in zip(controller.TCP_CASES, tcp_writes):
             lines.append(self.encoded(
                 controller.PEER_PREFIX, schema=1, event="TCP", result="PASS",
                 sequence=sequence, rx_bytes=length + 24,
-                tx_bytes=length + 24, writes=1,
+                tx_bytes=length + 24, writes=writes,
             ))
         for sequence, length in controller.UDP_CASES:
             lines.append(self.encoded(
@@ -79,7 +120,8 @@ class HypervNetworkControllerTest(unittest.TestCase):
                 tcp_port=network["tcp_port"], udp_port=network["udp_port"],
                 nonce=network["nonce"],
                 tcp_connections=3, udp_datagrams=6,
-                tcp_rx_bytes=1760, tcp_tx_bytes=1760, tcp_writes=3,
+                tcp_rx_bytes=1760, tcp_tx_bytes=1760,
+                tcp_writes=sum(tcp_writes),
                 udp_rx_bytes=3408, udp_tx_bytes=3408,
             ),
             self.encoded(
@@ -110,7 +152,7 @@ class HypervNetworkControllerTest(unittest.TestCase):
             (
                 "HYPERV_ACCEPTANCE NETWORK_APP_TCP PASS "
                 "connections=3 tx_messages=3 rx_messages=3 "
-                "tx_bytes=1760 rx_bytes=1760 write_chunks=3 "
+                "tx_bytes=1760 rx_bytes=1760 write_chunks=14 "
                 "rx_callbacks=3 rx_pbuf_freed=3 close_accepted=3"
             ),
             "UK_HYPERV_NET_APP_TCP",
@@ -132,7 +174,7 @@ class HypervNetworkControllerTest(unittest.TestCase):
             "UK_HYPERV_NETWORK_APP_READY",
             "UK_HYPERV_IO_READY",
             "HYPERV_ACCEPTANCE FINAL_RESULT PASS storage=PASS network=PASS",
-            "Info: main returned 0, halting",
+            "[    1.234] Info: [libukboot] <boot.c @ 523>: main returned 0",
         ]
         return "\n".join(lines)
 
@@ -204,6 +246,7 @@ class HypervNetworkControllerTest(unittest.TestCase):
         self.assertIn("systemctl, enable, --now", bootstrap)
 
     def test_correlated_peer_and_guest_streams_pass(self):
+        self.assertEqual(self.producer_tcp_writes(), (2, 9, 3))
         result = controller.correlate_evidence(
             self.guest_log(), self.peer_log(),
             self.acceptance(), self.network(),
@@ -218,6 +261,115 @@ class HypervNetworkControllerTest(unittest.TestCase):
             )["guest_ip"],
             "10.87.0.5",
         )
+
+    def test_fixed_producer_write_minima_and_final_sum_are_required(self):
+        peer = self.peer_log()
+        impossible = self.mutate_record(
+            peer, controller.PEER_PREFIX, "TCP", "writes", 1
+        )
+        impossible = self.mutate_record(
+            impossible, controller.PEER_PREFIX, "FINAL", "tcp_writes", 13
+        )
+        inconsistent = self.mutate_record(
+            peer, controller.PEER_PREFIX, "FINAL", "tcp_writes", 15
+        )
+        with self.assertRaisesRegex(ValueError, "TCP record"):
+            controller.inspect_peer_log(
+                impossible, self.acceptance(), self.network()
+            )
+        with self.assertRaisesRegex(ValueError, "FINAL"):
+            controller.inspect_peer_log(
+                inconsistent, self.acceptance(), self.network()
+            )
+        with self.assertRaisesRegex(ValueError, "Guest TCP"):
+            controller.inspect_guest_log(
+                self.guest_log().replace("write_chunks=14", "write_chunks=13"),
+                self.acceptance(), self.network(),
+            )
+
+        extra = peer
+        for occurrence, writes in enumerate((3, 10, 4)):
+            extra = self.mutate_record(
+                extra, controller.PEER_PREFIX, "TCP", "writes",
+                writes, occurrence,
+            )
+        extra = self.mutate_record(
+            extra, controller.PEER_PREFIX, "FINAL", "tcp_writes", 17
+        )
+        self.assertEqual(
+            controller.inspect_peer_log(
+                extra, self.acceptance(), self.network()
+            )["tcp"]["writes"],
+            17,
+        )
+
+    def test_every_peer_wire_integer_rejects_float_and_boolean_json(self):
+        peer = self.peer_log()
+        records = (
+            (controller.BOOTSTRAP_PREFIX, "START",
+             ("schema", "timeout_seconds")),
+            (controller.PEER_PREFIX, "READY",
+             ("schema", "tcp_port", "udp_port")),
+            (controller.PEER_PREFIX, "TCP",
+             ("schema", "sequence", "rx_bytes", "tx_bytes", "writes")),
+            (controller.PEER_PREFIX, "UDP",
+             ("schema", "sequence", "rx_bytes", "tx_bytes")),
+            (controller.PEER_PREFIX, "FINAL",
+             ("schema", "tcp_port", "udp_port", "tcp_connections",
+              "udp_datagrams", "tcp_rx_bytes", "tcp_tx_bytes", "tcp_writes",
+              "udp_rx_bytes", "udp_tx_bytes")),
+            (controller.BOOTSTRAP_PREFIX, "EOF", ("schema", "exit_code")),
+        )
+        for prefix, event, fields in records:
+            line = next(
+                line for line in peer.splitlines()
+                if line.startswith(prefix)
+                and json.loads(line[len(prefix):]).get("event") == event
+            )
+            record = json.loads(line[len(prefix):])
+            for field in fields:
+                for invalid in (float(record[field]), record[field] == 1):
+                    with self.subTest(event=event, field=field, invalid=invalid):
+                        changed = self.mutate_record(
+                            peer, prefix, event, field, invalid
+                        )
+                        with self.assertRaises(ValueError):
+                            controller.inspect_peer_log(
+                                changed, self.acceptance(), self.network()
+                            )
+                        if event in ("START", "READY"):
+                            with self.assertRaises(ValueError):
+                                controller.inspect_peer_ready(
+                                    "\n".join(changed.splitlines()[:2]),
+                                    self.acceptance(), self.network(),
+                                )
+
+    def test_only_exact_zero_main_return_record_can_complete_guest(self):
+        guest = self.guest_log()
+        producer = "[    1.234] Info: [libukboot] <boot.c @ 523>: main returned 0"
+        normalized = (
+            "\x1b[32m[    1.234] Info: [libukboot] "
+            "<boot.c @ 523>: main returned 0\x1b[0m\0\r"
+        )
+        controller.inspect_guest_log(
+            guest.replace(producer, normalized),
+            self.acceptance(), self.network(),
+        )
+        variants = (
+            guest.replace(
+                producer,
+                "diagnostic: expected main returned 0 but execution continued",
+            ),
+            guest.replace(producer, "Info: main returned -1"),
+            guest + "\nmain returned 0",
+            guest.replace(producer, "Info: main returned 0, halting"),
+        )
+        for value in variants:
+            with self.subTest(value=value[-100:]):
+                with self.assertRaises(ValueError):
+                    controller.inspect_guest_log(
+                        value, self.acceptance(), self.network()
+                    )
 
     def test_peer_only_restart_failure_missing_eof_and_bad_endpoint_fail(self):
         peer = self.peer_log()
@@ -251,7 +403,11 @@ class HypervNetworkControllerTest(unittest.TestCase):
             guest + "\n" + config,
             guest.replace("tx_bytes=1760", "tx_bytes=1759", 1),
             guest.replace("adapter_tx_busy=0", "adapter_tx_busy=1"),
-            guest.replace("Info: main returned 0, halting", ""),
+            guest.replace(
+                "[    1.234] Info: [libukboot] "
+                "<boot.c @ 523>: main returned 0",
+                "",
+            ),
             guest.replace(
                 "UK_HYPERV_NET_APP_TCP\n"
                 "HYPERV_ACCEPTANCE NETWORK_APP_UDP",

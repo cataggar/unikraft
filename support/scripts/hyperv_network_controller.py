@@ -22,6 +22,8 @@ PEER_IMAGE = {
     "sku": "server",
 }
 TCP_CASES = ((1, 31), (2, 1400), (3, 257))
+TCP_MIN_WRITES = (2, 9, 3)
+TCP_MIN_WRITE_TOTAL = sum(TCP_MIN_WRITES)
 UDP_CASES = (
     (0x100, 19), (0x101, 1448), (0x102, 73),
     (0x103, 1448), (0x104, 257), (0x105, 19),
@@ -35,6 +37,11 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 NONCE = re.compile(r"[0-9a-f]{16}")
 MAC = re.compile(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}")
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+MAIN_RETURN = re.compile(
+    r"^(?:\[\s*[0-9]+(?:\.[0-9]+)?\]\s+)?"
+    r"(?:Info:\s+)?(?:\[[A-Za-z0-9_.-]{1,64}\]\s+)?"
+    r"(?:<[^<>\r\n]{1,160}>:\s+)?main returned (-?[0-9]+)$"
+)
 
 
 class EvidenceIncomplete(RuntimeError):
@@ -74,6 +81,17 @@ def _port(value, description):
     if type(value) is not int or not 1 <= value <= 65535:
         raise ValueError(f"{description} must be an integer TCP/UDP port")
     return value
+
+
+def _wire_integer(value, description, minimum=0):
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{description} is not an integer at least {minimum}")
+    return value
+
+
+def _require_wire_integers(value, fields, description):
+    for field in fields:
+        _wire_integer(value[field], f"{description} {field}")
 
 
 def _load_peer():
@@ -510,7 +528,7 @@ def inspect_guest_log(text, acceptance, network):
         or tcp_values["tx_bytes"] != TCP_BYTES
         or tcp_values["rx_bytes"] != TCP_BYTES
         or tcp_values["close_accepted"] != len(TCP_CASES)
-        or tcp_values["write_chunks"] < len(TCP_CASES)
+        or tcp_values["write_chunks"] < TCP_MIN_WRITE_TOTAL
         or tcp_values["rx_callbacks"] < len(TCP_CASES)
         or tcp_values["rx_pbuf_freed"] != tcp_values["rx_callbacks"]
     ):
@@ -581,14 +599,20 @@ def inspect_guest_log(text, acceptance, network):
         if lines.count(marker) != 1:
             raise ValueError(f"Guest marker {marker} is duplicated")
         marker_positions.append(lines.index(marker))
-    main_positions = [
-        index for index, line in enumerate(lines)
-        if re.search(r"\bmain returned 0\b", line)
+    main_records = [
+        (index, line, MAIN_RETURN.fullmatch(line))
+        for index, line in enumerate(lines)
+        if "main returned" in line
     ]
-    if not main_positions:
+    if not main_records:
         raise EvidenceIncomplete("Guest main return has not appeared")
-    if len(main_positions) != 1:
-        raise ValueError("Guest main return is duplicated")
+    if (
+        len(main_records) != 1
+        or main_records[0][2] is None
+        or int(main_records[0][2].group(1)) != 0
+    ):
+        raise ValueError("Guest main return is malformed, nonzero, or duplicated")
+    main_position = main_records[0][0]
     expected_order = (
         marker_positions[0], marker_positions[1],
         records[0], records[1], marker_positions[2],
@@ -596,7 +620,7 @@ def inspect_guest_log(text, acceptance, network):
         records[3], marker_positions[4],
         records[4], marker_positions[5],
         records[5], marker_positions[6],
-        marker_positions[7], marker_positions[8], main_positions[0],
+        marker_positions[7], marker_positions[8], main_position,
     )
     if list(expected_order) != sorted(expected_order) or len(set(expected_order)) != len(expected_order):
         raise ValueError("Guest application-network evidence is stale, duplicated, or out of order")
@@ -659,6 +683,9 @@ def inspect_peer_ready(text, acceptance, network):
         ("schema", "event", "peer_script_sha256", "timeout_seconds"),
         "Peer START record",
     )
+    _require_wire_integers(
+        start, ("schema", "timeout_seconds"), "Peer START record"
+    )
     if start != {
         "schema": 1, "event": "START",
         "peer_script_sha256": acceptance["peer_script_sha256"],
@@ -669,6 +696,9 @@ def inspect_peer_ready(text, acceptance, network):
         ready_value,
         ("schema", "event", "peer_ip", "guest_ip", "tcp_port", "udp_port", "nonce"),
         "Peer READY record",
+    )
+    _require_wire_integers(
+        ready_value, ("schema", "tcp_port", "udp_port"), "Peer READY record"
     )
     expected = {
         "schema": 1, "event": "READY", "peer_ip": network["peer_ipv4"],
@@ -703,6 +733,9 @@ def inspect_peer_log(text, acceptance, network):
         start, ("schema", "event", "peer_script_sha256", "timeout_seconds"),
         "Peer START record",
     )
+    _require_wire_integers(
+        start, ("schema", "timeout_seconds"), "Peer START record"
+    )
     if (
         start["schema"] != 1
         or start["peer_script_sha256"] != acceptance["peer_script_sha256"]
@@ -735,27 +768,42 @@ def inspect_peer_log(text, acceptance, network):
         ("schema", "event", "peer_ip", "guest_ip", "tcp_port", "udp_port", "nonce"),
         "Peer READY record",
     )
+    _require_wire_integers(
+        ready_value, ("schema", "tcp_port", "udp_port"), "Peer READY record"
+    )
     if ready_value != {"event": "READY", **endpoint_fields}:
         raise ValueError("Peer READY does not match the exact guest configuration")
 
     if len(tcp) > len(TCP_CASES) or len(udp) > len(UDP_CASES):
         raise ValueError("Peer emitted duplicate exchange records")
-    for (index, value), (sequence, body_length) in zip(tcp, TCP_CASES):
+    tcp_writes = []
+    for (index, value), (sequence, body_length), minimum_writes in zip(
+        tcp, TCP_CASES, TCP_MIN_WRITES
+    ):
         _exact_fields(
             value,
             ("schema", "event", "result", "sequence", "rx_bytes", "tx_bytes", "writes"),
+            "Peer TCP record",
+        )
+        _require_wire_integers(
+            value, ("schema", "sequence", "rx_bytes", "tx_bytes", "writes"),
             "Peer TCP record",
         )
         if value != {
             "schema": 1, "event": "TCP", "result": "PASS",
             "sequence": sequence, "rx_bytes": body_length + 24,
             "tx_bytes": body_length + 24, "writes": value["writes"],
-        } or type(value["writes"]) is not int or value["writes"] < 1:
+        } or value["writes"] < minimum_writes:
             raise ValueError("Peer TCP record has invalid sequence, bytes, or result")
+        tcp_writes.append(value["writes"])
     for (index, value), (sequence, body_length) in zip(udp, UDP_CASES):
         _exact_fields(
             value,
             ("schema", "event", "result", "sequence", "rx_bytes", "tx_bytes"),
+            "Peer UDP record",
+        )
+        _require_wire_integers(
+            value, ("schema", "sequence", "rx_bytes", "tx_bytes"),
             "Peer UDP record",
         )
         if value != {
@@ -776,6 +824,15 @@ def inspect_peer_log(text, acceptance, network):
          "udp_tx_bytes"),
         "Peer FINAL record",
     )
+    _require_wire_integers(
+        final_value,
+        (
+            "schema", "tcp_port", "udp_port", "tcp_connections",
+            "udp_datagrams", "tcp_rx_bytes", "tcp_tx_bytes", "tcp_writes",
+            "udp_rx_bytes", "udp_tx_bytes",
+        ),
+        "Peer FINAL record",
+    )
     if final_value.get("result") != "PASS":
         raise ValueError("Peer FINAL record reported failure")
     expected_counts = {
@@ -786,14 +843,16 @@ def inspect_peer_log(text, acceptance, network):
     if (
         any(final_value[key] != value for key, value in endpoint_fields.items())
         or any(final_value[key] != value for key, value in expected_counts.items())
-        or type(final_value["tcp_writes"]) is not int
-        or final_value["tcp_writes"] < len(TCP_CASES)
+        or final_value["tcp_writes"] != sum(tcp_writes)
     ):
         raise ValueError("Peer FINAL record does not match the exact exchange")
     if not eof:
         raise EvidenceIncomplete("Peer EOF has not appeared")
     eof_index, eof_value = eof[0]
     _exact_fields(eof_value, ("schema", "event", "exit_code"), "Peer EOF record")
+    _require_wire_integers(
+        eof_value, ("schema", "exit_code"), "Peer EOF record"
+    )
     if eof_value != {"schema": 1, "event": "EOF", "exit_code": 0}:
         raise ValueError("Peer process did not exit successfully")
     positions = [
