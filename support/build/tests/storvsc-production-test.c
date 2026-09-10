@@ -3624,6 +3624,7 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	struct fire_channel_context retained_fire;
 	pthread_t retained_fire_thread;
 	struct vmbus_channel *primary_channel;
+	struct vmbus_channel *secondary_channel;
 	uint16_t stable_ids[4];
 	const uint8_t expected_luns[] = { 0, 2, 0, 3 };
 	const uint16_t expected_controllers[] = { 0, 0, 1, 1 };
@@ -3635,6 +3636,8 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	int primary_events;
 	unsigned int count;
 	unsigned int empty_reports;
+	int retry_before;
+	unsigned long long resource_epoch;
 	int rc;
 
 	topology_fixture = 1;
@@ -4331,12 +4334,37 @@ static int run_topology_regression(struct vmbus_driver *driver,
 		release_receive_gate();
 		return 434;
 	}
-	rc = persistence_remove_device(driver, &secondary);
-	if (!rc)
-		rc = release_receive_gate_and_wait_worker(
-			CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
-	else
+	retry_before = atomic_load(&bind_retry_calls);
+	resource_epoch = atomic_load(&bind_resource_epoch);
+	empty_reports = report_luns_commands;
+	secondary_channel = secondary.channel;
+	remove_test_offer(driver, &secondary);
+	secondary.present = 1;
+	rc = driver->add_dev(&secondary);
+	if (rc != -ENOSPC || secondary.channel != secondary_channel ||
+	    report_luns_commands != empty_reports ||
+	    atomic_load(&bind_retry_calls) != retry_before + 1) {
+		fprintf(stderr,
+			"active old receiver admitted replacement: "
+			"rc=%d channel=%p reports=%u/%u retries=%d/%d\n",
+			rc, (void *)secondary.channel,
+			report_luns_commands, empty_reports,
+			atomic_load(&bind_retry_calls), retry_before + 1);
 		release_receive_gate();
+		return 439;
+	}
+	rc = release_receive_gate_and_wait_worker(
+		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	if (!rc &&
+	    atomic_load(&bind_resource_epoch) != resource_epoch + 1) {
+		fprintf(stderr,
+			"old receiver exit did not publish retry: "
+			"epoch=%llu/%llu\n",
+			(unsigned long long)atomic_load(
+				&bind_resource_epoch),
+			resource_epoch + 1);
+		rc = -EAGAIN;
+	}
 	if (persistence_remove_device(driver, primary) || rc)
 		return 435;
 
@@ -5181,6 +5209,12 @@ static int run_vmbus_offer_lifetime_case(
 	}
 	inventory_rc = uk_storvsc_inventory_get(&inventory);
 	if (uk_storvsc_mapping_count() != 3) {
+		fprintf(stderr,
+			"offer lifetime mapping mismatch: case=%d count=%u "
+			"inventory=%d retries=%d ready=%d\n",
+			failure, uk_storvsc_mapping_count(), inventory_rc,
+			atomic_load(&bind_retry_calls),
+			atomic_load(&bind_ready_calls));
 		error = 665;
 		goto out;
 	}
@@ -6200,7 +6234,9 @@ static int storvsc_production_test(void)
 	enqueue_completion(last_io_id + 999, 64, 0, 1, 0, last_io_length);
 	complete_pending(1);
 	fire_channel();
-	if (request.result || request2.result ||
+	if (wait_atomic_value(&callbacks, 7,
+			      CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS) ||
+	    request.result || request2.result ||
 	    atomic_load(&callbacks) != 7)
 		return 14;
 	hold_io = 0;
@@ -6212,7 +6248,10 @@ static int storvsc_production_test(void)
 	if (!(rc & UK_BLKDEV_STATUS_SUCCESS))
 		return 15;
 	fire_channel();
-	if (request.result)
+	if (wait_request_completion(
+		    &request, &callbacks, 8,
+		    CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS) ||
+	    request.result)
 		return 16;
 
 	initialize_request(&request2, UK_BLKREQ_READ, 7, 1, buffer + 512,
