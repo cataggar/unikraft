@@ -804,6 +804,19 @@ jobs:
         "${miz}" build-efi-application --help
         "${miz}" check-efi-application --help
 
+    - name: Run native Hyper-V controller foundation fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        for mode in Debug ReleaseSafe; do
+          root="${RUNNER_TEMP}/hyperv-ci/native-${mode}"
+          mkdir -p "${root}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/build.zig \
+              --prefix "${root}/out" -Dtest-root="${root}/fixtures" \
+              -Doptimize="${mode}" -j2 test install --summary all
+        done
+
     - name: Run focused Hyper-V regressions
       run: |
         set -euo pipefail
