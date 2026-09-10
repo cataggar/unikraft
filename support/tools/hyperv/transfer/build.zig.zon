@@ -1,0 +1,17 @@
+.{
+    .name = .hyperv_transfers,
+    .version = "0.1.0",
+    .fingerprint = 0xdfae39fe19528273,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .azure_sdk_core = .{
+            .url = "git+https://github.com/cataggar/azure-sdk-for-zig.git#bc77bcacbb64af935ca53d60bf8a351c9592bc41",
+            .hash = "azure_sdk_core-0.3.0-eFY0Ev0-CACjsFaYPL6jS7CpeVNvsqYqTrXRfgQKiRFV",
+        },
+        .azure_sdk_storage_common = .{
+            .url = "git+https://github.com/cataggar/azure-sdk-for-zig.git#5291e5d7224b4d69989d403f605345d949c41db7",
+            .hash = "azure_sdk_storage_common-0.3.0-JzoreF0KAQDsbNtEXsub-0AZ1oiyzWJ-CGf1S5XSmQK4",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "root.zig", "diagnostic.zig", "files.zig", "request.zig", "client.zig", "fixtures.zig", "README.md" },
+}
