@@ -165,16 +165,61 @@ pub fn relativeUrl(raw: []const u8) ![]const u8 {
 }
 
 pub fn queryVersion(path: []const u8, expected: []const u8, pagination: bool) !void {
-    return queryPolicy(path, expected, pagination, null);
+    return queryPolicy(path, expected, pagination, null, false);
 }
 
 const Filter = struct { allocator: std.mem.Allocator, expected: []const u8 };
-fn queryPolicy(path: []const u8, expected: []const u8, pagination: bool, filter: ?Filter) !void {
+pub fn initialQuery(allocator: std.mem.Allocator, path: []const u8, version: []const u8, filter: ?[]const u8, boot_diagnostics: bool) !void {
+    try queryPolicy(path, version, false, if (filter) |expected| .{ .allocator = allocator, .expected = expected } else null, boot_diagnostics);
+}
+
+pub const DiskOperationEndpoint = enum { status, location };
+
+/// Signed values remain opaque and byte-for-byte unchanged in the returned URL.
+pub fn diskOperationQuery(path: []const u8, version: []const u8, endpoint: DiskOperationEndpoint) !void {
+    if (path.len > 4096 or !std.mem.eql(u8, version, "2025-01-02")) return error.UnsafeUrl;
+    const start = std.mem.indexOfScalar(u8, path, '?') orelse return error.MissingApiVersion;
+    var parts = std.mem.splitScalar(u8, path[start + 1 ..], '&');
+    var seen: [7]bool = @splat(false);
+    const names = [_][]const u8{ "p", "api-version", "t", "c", "s", "h", "monitor" };
+    while (parts.next()) |part| {
+        const eq = std.mem.indexOfScalar(u8, part, '=') orelse return error.UnsafeUrl;
+        const key = part[0..eq];
+        const value = part[eq + 1 ..];
+        const index = for (names, 0..) |field_name, i| {
+            if (std.mem.eql(u8, key, field_name)) break i;
+        } else return error.UnsafeUrl;
+        if (seen[index]) return error.UnsafeUrl;
+        seen[index] = true;
+        if (index == 1) {
+            if (!std.mem.eql(u8, value, version)) return error.UnsafeUrl;
+        } else if (index == 6) {
+            if (endpoint != .location or !std.mem.eql(u8, value, "true")) return error.UnsafeUrl;
+        } else try opaqueQueryValue(value);
+    }
+    for (seen[0..6]) |present| if (!present) return error.UnsafeUrl;
+    if (seen[6] != (endpoint == .location)) return error.UnsafeUrl;
+}
+
+fn opaqueQueryValue(value: []const u8) !void {
+    if (value.len == 0 or value.len > 2048) return error.UnsafeUrl;
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        if (value[i] == '%') {
+            if (value.len - i < 3 or !std.ascii.isHex(value[i + 1]) or !std.ascii.isHex(value[i + 2])) return error.UnsafeUrl;
+            i += 2;
+        } else if (!std.ascii.isAlphanumeric(value[i]) and std.mem.indexOfScalar(u8, "-._~!$'()*+,;=:@/?", value[i]) == null)
+            return error.UnsafeUrl;
+    }
+}
+
+fn queryPolicy(path: []const u8, expected: []const u8, pagination: bool, filter: ?Filter, boot_diagnostics: bool) !void {
     const start = std.mem.indexOfScalar(u8, path, '?') orelse return error.MissingApiVersion;
     var parts = std.mem.splitScalar(u8, path[start + 1 ..], '&');
     var version_seen = false;
     var continuation_seen = false;
     var filter_seen = false;
+    var lifetime_seen = false;
     var count: usize = 0;
     while (parts.next()) |part| {
         count += 1;
@@ -200,10 +245,14 @@ fn queryPolicy(path: []const u8, expected: []const u8, pagination: bool, filter:
             const decoded = try (std.Uri.Component{ .percent_encoded = copy }).toRawMaybeAlloc(filter.?.allocator);
             defer if (decoded.ptr != copy.ptr) filter.?.allocator.free(decoded);
             if (!std.mem.eql(u8, decoded, filter.?.expected)) return error.UnsafeUrl;
+        } else if (boot_diagnostics and std.mem.eql(u8, key, "sasUriExpirationTimeInMinutes")) {
+            if (lifetime_seen or !std.mem.eql(u8, value, "10")) return error.UnsafeUrl;
+            lifetime_seen = true;
         } else return error.UnsafeUrl;
     }
     if (!version_seen) return error.MissingApiVersion;
     if (filter != null and !filter_seen) return error.UnsafeUrl;
+    if (boot_diagnostics and !lifetime_seen) return error.UnsafeUrl;
 }
 
 pub fn continuation(allocator: std.mem.Allocator, original_path: []const u8, raw: []const u8, version: []const u8) ![]u8 {
@@ -212,7 +261,7 @@ pub fn continuation(allocator: std.mem.Allocator, original_path: []const u8, raw
 
 pub fn continuationFiltered(allocator: std.mem.Allocator, original_path: []const u8, raw: []const u8, version: []const u8, filter: ?[]const u8) ![]u8 {
     const path = try relativeUrl(raw);
-    try queryPolicy(path, version, true, if (filter) |expected| .{ .allocator = allocator, .expected = expected } else null);
+    try queryPolicy(path, version, true, if (filter) |expected| .{ .allocator = allocator, .expected = expected } else null, false);
     const end = std.mem.indexOfScalar(u8, path, '?').?;
     if (!std.ascii.eqlIgnoreCase(path[0..end], original_path)) return error.ScopeMismatch;
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ arm_host, path });

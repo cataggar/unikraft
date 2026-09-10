@@ -203,7 +203,7 @@ pub const Plan = struct {
                 };
                 try plan.resource(a, authority, action.vm, suffix);
                 plan.method = .POST;
-                plan.body = if (operation == .boot_diagnostics) "{\"sasUriExpirationTimeInMinutes\":10}" else "{}";
+                plan.body = if (operation == .boot_diagnostics) null else "{}";
             },
             .firewall => |firewall| {
                 try requireKind(firewall.account, .storage);
@@ -266,8 +266,17 @@ pub const Plan = struct {
         }
         plan.url = try std.fmt.allocPrint(a, "{s}{s}?api-version={s}", .{ s.arm_host, plan.path, plan.version });
         if (operation == .skus) plan.url = try std.fmt.allocPrint(a, "{s}&$filter=location%20eq%20%27{s}%27", .{ plan.url, authority.location });
+        if (operation == .boot_diagnostics) plan.url = try std.fmt.allocPrint(a, "{s}&sasUriExpirationTimeInMinutes=10", .{plan.url});
         if (plan.body) |body| if (body.len > 256 * 1024) return error.InvalidBody;
+        try plan.validateInitialUrl(a);
         return plan;
+    }
+
+    pub fn validateInitialUrl(self: Plan, a: std.mem.Allocator) !void {
+        const relative = try s.relativeUrl(self.url);
+        const end = std.mem.indexOfScalar(u8, relative, '?').?;
+        if (!std.mem.eql(u8, relative[0..end], self.path)) return error.ScopeMismatch;
+        try s.initialQuery(a, relative, self.version, self.filter, self.operation == .boot_diagnostics);
     }
 
     fn resource(self: *Plan, a: std.mem.Allocator, authority: s.Authority, target: s.Ref, suffix: []const u8) !void {

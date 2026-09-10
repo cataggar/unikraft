@@ -269,11 +269,11 @@ pub const Client = struct {
         const async_raw = reply.async_operation orelse reply.operation_location;
         if (reply.async_operation != null and reply.operation_location != null and !std.mem.eql(u8, reply.async_operation.?, reply.operation_location.?))
             return fail(error.ConflictingOperationUrl, .accepted, reply.status);
-        const result_url = if (reply.location) |location| self.pollUrl(a, plan, location) catch |err| return fail(err, .accepted, reply.status) else null;
+        const result_url = if (reply.location) |location| self.pollUrl(a, plan, location, .location) catch |err| return fail(err, .accepted, reply.status) else null;
         const resource_poll = async_raw == null and result_url == null and reply.status == 202;
-        var poll_url: ?[]const u8 = if (async_raw) |raw| self.pollUrl(a, plan, raw) catch |err| return fail(err, .accepted, reply.status) else null;
+        var poll_url: ?[]const u8 = if (async_raw) |raw| self.pollUrl(a, plan, raw, .status) catch |err| return fail(err, .accepted, reply.status) else null;
         if (poll_url == null and reply.status == 202) {
-            if (reply.location) |location| poll_url = self.pollUrl(a, plan, location) catch |err| return fail(err, .accepted, reply.status) else if (plan.target) |target| poll_url = std.fmt.allocPrint(a, "{s}{s}?api-version={s}", .{ s.arm_host, target.path(a, self.authority) catch |err| return fail(err, .accepted, reply.status), plan.version }) catch |err| return fail(err, .accepted, reply.status) else return fail(error.MissingOperationUrl, .accepted, reply.status);
+            if (result_url) |location| poll_url = location else if (plan.target) |target| poll_url = std.fmt.allocPrint(a, "{s}{s}?api-version={s}", .{ s.arm_host, target.path(a, self.authority) catch |err| return fail(err, .accepted, reply.status), plan.version }) catch |err| return fail(err, .accepted, reply.status) else return fail(error.MissingOperationUrl, .accepted, reply.status);
         }
         var polls: u16 = 0;
         while (poll_url) |url| {
@@ -437,22 +437,26 @@ pub const Client = struct {
         return fail(error.LimitExceeded, .accepted, reply.status);
     }
 
-    fn pollUrl(self: *Client, a: std.mem.Allocator, plan: ops.Plan, raw: []const u8) ![]const u8 {
+    fn pollUrl(self: *Client, a: std.mem.Allocator, plan: ops.Plan, raw: []const u8, endpoint: s.DiskOperationEndpoint) ![]const u8 {
         const relative = try s.relativeUrl(raw);
-        try s.queryVersion(relative, plan.version, false);
         const path = relative[0..std.mem.indexOfScalar(u8, relative, '?').?];
         if (plan.operation == .group_delete) {
             const result_prefix = try std.fmt.allocPrint(a, "/subscriptions/{s}/operationresults/", .{self.authority.subscription});
             if (std.ascii.startsWithIgnoreCase(path, result_prefix)) {
+                try s.queryVersion(relative, plan.version, false);
                 _ = try s.uuid(path[result_prefix.len..]);
                 return std.fmt.allocPrint(a, "{s}{s}", .{ s.arm_host, relative });
             }
         }
         if (plan.target) |target| {
             const expected = try target.path(a, self.authority);
-            if (std.ascii.eqlIgnoreCase(path, expected)) return std.fmt.allocPrint(a, "{s}{s}", .{ s.arm_host, relative });
+            if (std.ascii.eqlIgnoreCase(path, expected)) {
+                try s.queryVersion(relative, plan.version, false);
+                return std.fmt.allocPrint(a, "{s}{s}", .{ s.arm_host, relative });
+            }
             const prefix = try std.fmt.allocPrint(a, "{s}/operationStatuses/", .{expected});
             if (std.ascii.startsWithIgnoreCase(path, prefix)) {
+                try s.queryVersion(relative, plan.version, false);
                 _ = try s.uuid(path[prefix.len..]);
                 return std.fmt.allocPrint(a, "{s}{s}", .{ s.arm_host, relative });
             }
@@ -462,9 +466,14 @@ pub const Client = struct {
         const rest = path[prefix.len..];
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.UnsafeOperationScope;
         const kind = rest[0..slash];
-        if (!std.ascii.eqlIgnoreCase(kind, "operations") and !std.ascii.eqlIgnoreCase(kind, "operationStatuses") and !std.ascii.eqlIgnoreCase(kind, "operationResults") and
-            !(plan.target != null and plan.target.?.kind == .disk and std.ascii.eqlIgnoreCase(kind, "DiskOperations")))
-            return error.UnsafeOperationScope;
+        if (std.ascii.eqlIgnoreCase(kind, "DiskOperations")) {
+            if (plan.target == null or plan.target.?.kind != .disk) return error.UnsafeOperationScope;
+            try s.diskOperationQuery(relative, plan.version, endpoint);
+        } else {
+            if (!std.ascii.eqlIgnoreCase(kind, "operations") and !std.ascii.eqlIgnoreCase(kind, "operationStatuses") and !std.ascii.eqlIgnoreCase(kind, "operationResults"))
+                return error.UnsafeOperationScope;
+            try s.queryVersion(relative, plan.version, false);
+        }
         _ = try s.uuid(rest[slash + 1 ..]);
         return std.fmt.allocPrint(a, "{s}{s}", .{ s.arm_host, relative });
     }

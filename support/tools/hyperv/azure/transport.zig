@@ -142,6 +142,9 @@ pub const Channel = struct {
     budget: *Budget,
 
     pub fn send(self: Channel, request: *sdk.http.Request, mutation: bool, stage: d.Stage) Outcome(Reply) {
+        // Core maps this well-known header to std.http's override, not an extra header.
+        request.setHeader("Accept-Encoding", "identity") catch |err|
+            return .{ .failed = Failure.local(stage, err, .not_started, null) };
         request.retryable = false;
         request.redirect_policy = .not_allowed;
         request.operation_timeout_ms = self.budget.beforeRequest() catch |err|

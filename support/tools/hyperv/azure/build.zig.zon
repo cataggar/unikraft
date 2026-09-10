@@ -24,5 +24,6 @@
         "secret.zig",
         "tests.zig",
         "transport.zig",
+        "wire_tests.zig",
     },
 }

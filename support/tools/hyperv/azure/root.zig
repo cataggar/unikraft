@@ -9,4 +9,5 @@ pub const admission = @import("admission.zig");
 
 test {
     _ = @import("tests.zig");
+    _ = @import("wire_tests.zig");
 }

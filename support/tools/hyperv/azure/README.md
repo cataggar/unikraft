@@ -118,6 +118,9 @@ them again after attachment. Existing network provisioning is not rewritten.
 VM actions bind the original VM UUID; power completion requires the same UUID
 and the requested instance-view state. VM parsing requires explicit Standard
 security, one owned NIC, and at most one data disk at LUN 7 with no caching.
+Boot diagnostics requests put the exact ten-minute lifetime in the
+`sasUriExpirationTimeInMinutes=10` query parameter, not in a JSON body. The
+initial-request query policy permits that parameter only for boot diagnostics.
 Managed disks require original UUID, raw `diskSizeGB`, explicit 512-byte logical
 sectors, StandardSSD_LRS, and 1--32 GiB geometry. Write grants require an Upload
 disk in ReadyToUpload with exact VHD upload size. Revocation reads back original
@@ -163,6 +166,19 @@ ARM authority and recognized scoped resource/operation paths. Both
 status-monitor plus result-Location and direct Location result protocols are
 supported. A missing secret result fails instead of replaying a grant or key
 rotation. HTTP success/LRO success does not bypass resource reconciliation.
+
+Compute `2025-01-02` regional `DiskOperations` URLs have a separate signed-query
+contract: exactly `p`, `api-version`, `t`, `c`, `s`, `h`, plus `monitor=true` on
+Location URLs. The 4096-byte URL bound and a 2048-byte bound per opaque value
+apply. Signed values and percent-escape spelling are preserved byte-for-byte,
+never decoded/re-encoded or rendered in diagnostics. This does not relax
+authority, subscription, provider, location, operation-ID or other query
+policies.
+
+All native channel requests, including credentials, explicitly select
+`Accept-Encoding: identity`. The pinned SDK maps this well-known header to
+the standard HTTP client's override rather than adding a second header beside
+its compressed default. Unexpected compressed responses remain failures.
 
 Each response loop uses a single `readVec` progress call with budget checks
 before and after it, including zero progress, errors and explicit EndOfStream.
@@ -225,5 +241,8 @@ pagination/filter/cycles, LRO result variants and failures, ambiguity/no replay,
 disk geometry/upload/revocation, created-resource reconciliation, schedule
 completion/deletion, network rejection, firewall preservation, key rotation and
 metadata admission. They use synthetic authority, tokens and SAS material.
+Native loopback HTTP fixtures additionally inspect the actual SDK wire request
+for one identity encoding header and unchanged opaque query bytes, and reject
+an unsolicited compressed response.
 They do not exercise a live TLS handshake, real identity authority, ARM service,
 cloud cleanup, host boot or the complete migration.

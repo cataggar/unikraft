@@ -35,6 +35,10 @@ const vm_path = group_path ++ "/providers/Microsoft.Compute/virtualMachines/synt
 const vm_url = s.arm_host ++ vm_path ++ "?api-version=2025-11-01";
 const disk_path = group_path ++ "/providers/Microsoft.Compute/disks/synthetic-disk";
 const disk_url = s.arm_host ++ disk_path ++ "?api-version=2025-01-02";
+const disk_operation_path = "/subscriptions/" ++ sub ++ "/providers/Microsoft.Compute/locations/northeurope/DiskOperations/" ++ operation_uuid;
+const disk_operation_query = "?p=SYNTHETIC_PRIVATE%2bstate%2Fvalue%3d&api-version=2025-01-02&t=638000000000000000&c=1&s=SYNTHETIC_PRIVATE+state/==&h=SYNTHETIC_PRIVATE%2Bsignature%2f%3D";
+const disk_status_url = s.arm_host ++ disk_operation_path ++ disk_operation_query;
+const disk_location_url = disk_status_url ++ "&monitor=true";
 const account_path = group_path ++ "/providers/Microsoft.Storage/storageAccounts/syntheticaccount";
 const account_url = s.arm_host ++ account_path ++ "?api-version=2023-05-01";
 const group_json = "{\"id\":\"" ++ group_path ++ "\",\"name\":\"synthetic-group\",\"location\":\"northeurope\",\"tags\":{\"uk-hyperv-run\":\"" ++ run ++ "\"},\"properties\":{\"provisioningState\":\"Succeeded\"}}";
@@ -64,6 +68,7 @@ const Step = struct {
     headers: []const sdk.http.MockTransport.HeaderPair = &.{},
     authorization: bool = true,
     body_contains: ?[]const u8 = null,
+    body_absent: bool = false,
     fail: bool = false,
     cancel: bool = false,
     progress: ?Progress = null,
@@ -157,6 +162,7 @@ const Harness = struct {
         self.calls += 1;
         if (!std.mem.eql(u8, step.url, request.url) or step.method != request.method or request.retryable or
             request.redirect_policy != .not_allowed or request.operation_timeout_ms == null or options.cancellation == null or
+            !std.mem.eql(u8, request.getHeader("Accept-Encoding") orelse "", "identity") or
             (step.authorization and !std.mem.eql(u8, request.getHeader("Authorization") orelse "", "Bearer synthetic-arm-token")) or
             (!step.authorization and request.getHeader("Authorization") != null))
         {
@@ -167,6 +173,10 @@ const Harness = struct {
             self.broken = true;
             return error.UnexpectedBody;
         };
+        if (step.body_absent and request.body != null) {
+            self.broken = true;
+            return error.UnexpectedBody;
+        }
         if (step.fail) return error.SYNTHETIC_SECRET_must_not_escape;
         if (step.cancel) self.cancellation.cancel();
         self.finishMock();
@@ -258,6 +268,7 @@ fn requireFailure(outcome: anytype, category: foundation.diagnostics.Category, e
             defer rendered.deinit();
             _ = try foundation.contracts.exactFields(rendered.value(), &.{ "diagnostic", "effect", "oauth_code" });
             try t.expect(std.mem.indexOf(u8, writer.written(), "SYNTHETIC_SECRET") == null);
+            try t.expect(std.mem.indexOf(u8, writer.written(), "SYNTHETIC_PRIVATE") == null);
             try t.expect(std.mem.indexOf(u8, writer.written(), "sig=") == null);
         },
     }
@@ -605,8 +616,8 @@ test "managed disk grant returns validated secret URI and revoke is a single ope
 
 test "boot diagnostics require original VM and refuse non-Blob SAS destinations" {
     var h = try Harness.init(&.{
-        .{ .url = group_url, .response = group_json },                                                                                                                                                                                                                                                                                    .{ .url = vm_url, .response = vm_json },
-        .{ .url = s.arm_host ++ vm_path ++ "/retrieveBootDiagnosticsData?api-version=2025-11-01", .method = .POST, .body_contains = "\"sasUriExpirationTimeInMinutes\":10", .response = "{\"serialConsoleLogBlobUri\":\"https://synthetic.blob.core.windows.net/boot/serial?sig=SYNTHETIC_SECRET\",\"consoleScreenshotBlobUri\":null}" },
+        .{ .url = group_url, .response = group_json },                                                                                                                                                                                                                                                                                 .{ .url = vm_url, .response = vm_json },
+        .{ .url = s.arm_host ++ vm_path ++ "/retrieveBootDiagnosticsData?api-version=2025-11-01&sasUriExpirationTimeInMinutes=10", .method = .POST, .body_absent = true, .response = "{\"serialConsoleLogBlobUri\":\"https://synthetic.blob.core.windows.net/boot/serial?sig=SYNTHETIC_SECRET\",\"consoleScreenshotBlobUri\":null}" },
     });
     defer h.deinit();
     var arm = h.arm();
@@ -801,7 +812,7 @@ test "zeroizing allocator erases intermediate and final private copies" {
 }
 
 test "disk Location LRO returns actual grant result without replaying POST" {
-    const location = s.arm_host ++ "/subscriptions/" ++ sub ++ "/providers/Microsoft.Compute/locations/northeurope/DiskOperations/" ++ operation_uuid ++ "?api-version=2025-01-02";
+    const location = disk_location_url;
     var h = try Harness.init(&.{
         .{ .url = group_url, .response = group_json },
         .{ .url = disk_url, .response = upload_disk_json },
@@ -1317,6 +1328,156 @@ test "LRO progress cancellation preserves the accepted initiating mutation" {
         try t.expectEqual(@as(usize, 0), h.response_calls_after_stop);
         try t.expectEqual(@as(usize, 1), h.mock.?.stream_cancel_count);
     }
+}
+
+test "signed DiskOperations grant preserves opaque encoding and Location monitor" {
+    var h = try Harness.init(&.{
+        .{ .url = group_url, .response = group_json },
+        .{ .url = disk_url, .response = upload_disk_json },
+        .{ .url = s.arm_host ++ disk_path ++ "/beginGetAccess?api-version=2025-01-02", .method = .POST, .status = 202, .headers = &.{
+            .{ .name = "Azure-AsyncOperation", .value = disk_status_url },
+            .{ .name = "Location", .value = disk_location_url },
+        } },
+        .{ .url = disk_status_url, .response = "{\"status\":\"InProgress\"}" },
+        .{ .url = disk_status_url, .response = "{\"status\":\"Succeeded\"}" },
+        .{ .url = disk_location_url, .response = "{\"accessSAS\":\"https://synthetic.blob.storage.azure.net/disk/vhd?sig=SYNTHETIC_SECRET\"}" },
+    });
+    defer h.deinit();
+    var arm = h.arm();
+    var result = try requireOk(arm.execute(.{ .grant = .{ .identity = disk_identity, .seconds = 600 } }));
+    defer result.deinit();
+    try t.expect(result.model == .grant);
+    try t.expectEqual(.accepted, result.effect);
+}
+
+test "signed DiskOperations create and revoke complete with scoped resource readback" {
+    var h = try Harness.init(&.{
+        .{ .url = group_url, .response = group_json },
+        .{ .url = disk_url, .status = 404, .response = "{\"error\":{\"code\":\"ResourceNotFound\"}}" },
+        .{ .url = disk_url, .method = .PUT, .status = 202, .headers = &.{
+            .{ .name = "Azure-AsyncOperation", .value = disk_status_url },
+            .{ .name = "Location", .value = disk_location_url },
+        } },
+        .{ .url = disk_status_url, .response = "{\"status\":\"Succeeded\"}" },
+        .{ .url = disk_url, .response = upload_disk_json },
+        .{ .url = group_url, .response = group_json },
+        .{ .url = disk_url, .response = upload_disk_json },
+        .{ .url = s.arm_host ++ disk_path ++ "/endGetAccess?api-version=2025-01-02", .method = .POST, .status = 202, .headers = &.{
+            .{ .name = "Azure-AsyncOperation", .value = disk_status_url },
+            .{ .name = "Location", .value = disk_location_url },
+        } },
+        .{ .url = disk_status_url, .response = "{\"status\":\"Succeeded\"}" },
+        .{ .url = disk_url, .response = upload_disk_json },
+    });
+    defer h.deinit();
+    var arm = h.arm();
+    var created = try requireOk(arm.execute(.{ .disk_create = .{ .name = disk_ref.name, .size_gib = 4, .upload_bytes = 4294967808 } }));
+    defer created.deinit();
+    try t.expectEqual(.accepted, created.effect);
+    var revoked = try requireOk(arm.execute(.{ .revoke = disk_identity }));
+    defer revoked.deinit();
+    try t.expectEqual(.accepted, revoked.effect);
+    try t.expectEqual(.ready_to_upload, revoked.model.disk.access);
+}
+
+test "signed DiskOperations duplicate and unknown keys fail without forwarding" {
+    for ([_][]const u8{ "p", "api-version", "t", "c", "s", "h", "%68", "extra" }) |key| {
+        const bad = try std.fmt.allocPrint(a, "{s}&{s}=SYNTHETIC_PRIVATE", .{ disk_status_url, key });
+        defer a.free(bad);
+        var h = try Harness.init(&.{
+            .{ .url = group_url, .response = group_json },
+            .{ .url = disk_url, .response = upload_disk_json },
+            .{ .url = s.arm_host ++ disk_path ++ "/beginGetAccess?api-version=2025-01-02", .method = .POST, .status = 202, .headers = &.{.{ .name = "Azure-AsyncOperation", .value = bad }} },
+        });
+        defer h.deinit();
+        var arm = h.arm();
+        try requireFailure(arm.execute(.{ .grant = .{ .identity = disk_identity, .seconds = 600 } }), .invalid_response, .accepted, 202);
+    }
+}
+
+test "signed DiskOperations queries cannot escape endpoint scope or API version" {
+    for ([_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = "https://management.azure.com", .to = "https://untrusted.invalid" },
+        .{ .from = "https://management.azure.com", .to = "https://management.azure.com@untrusted.invalid" },
+        .{ .from = sub, .to = tenant },
+        .{ .from = "Microsoft.Compute", .to = "Microsoft.Network" },
+        .{ .from = "northeurope", .to = "westeurope" },
+        .{ .from = "DiskOperations", .to = "operations" },
+        .{ .from = "DiskOperations", .to = "DiskOperations%2fextra" },
+        .{ .from = operation_uuid, .to = operation_uuid ++ "/extra" },
+        .{ .from = "2025-01-02", .to = "2025-11-01" },
+    }) |change| {
+        const bad = try std.mem.replaceOwned(u8, a, disk_status_url, change.from, change.to);
+        defer a.free(bad);
+        var h = try Harness.init(&.{
+            .{ .url = group_url, .response = group_json },
+            .{ .url = disk_url, .response = upload_disk_json },
+            .{ .url = s.arm_host ++ disk_path ++ "/beginGetAccess?api-version=2025-01-02", .method = .POST, .status = 202, .headers = &.{.{ .name = "Azure-AsyncOperation", .value = bad }} },
+        });
+        defer h.deinit();
+        var arm = h.arm();
+        try requireFailure(arm.execute(.{ .grant = .{ .identity = disk_identity, .seconds = 600 } }), .invalid_response, .accepted, 202);
+    }
+}
+
+test "signed DiskOperations requires complete bounded opaque values and exact monitor role" {
+    try s.diskOperationQuery(disk_status_url, "2025-01-02", .status);
+    try s.diskOperationQuery(disk_location_url, "2025-01-02", .location);
+    try t.expectError(error.UnsafeUrl, s.diskOperationQuery(disk_status_url, "2025-01-02", .location));
+    try t.expectError(error.UnsafeUrl, s.diskOperationQuery(disk_location_url, "2025-01-02", .status));
+    for ([_][]const u8{
+        "?api-version=2025-01-02",
+        "?p=x&api-version=2025-01-02&t=x&c=x&s=x",
+        "?p=x&api-version=2025-01-02&t=x&c=x&s=x&h=",
+        "?p=x&api-version=2025-01-02&t=x&c=x&s=x&h=%",
+        "?p=x&api-version=2025-01-02&t=x&c=x&s=x&h=%GG",
+    }) |query| {
+        const bad = try std.fmt.allocPrint(a, "{s}{s}", .{ disk_operation_path, query });
+        defer a.free(bad);
+        try t.expectError(error.UnsafeUrl, s.diskOperationQuery(bad, "2025-01-02", .status));
+    }
+    try t.expectError(error.UnsafeUrl, s.diskOperationQuery(disk_status_url ++ "&monitor=false", "2025-01-02", .location));
+    try t.expectError(error.UnsafeUrl, s.diskOperationQuery(disk_location_url ++ "&monitor=true", "2025-01-02", .location));
+    const large = try std.fmt.allocPrint(a, "{s}?p={s}&api-version=2025-01-02&t=x&c=x&s=x&h=x", .{ disk_operation_path, "a" ** 2049 });
+    defer a.free(large);
+    try t.expectError(error.UnsafeUrl, s.diskOperationQuery(large, "2025-01-02", .status));
+    try t.expectError(error.UnsafeUrl, s.queryVersion(disk_status_url, "2025-01-02", false));
+}
+
+test "signed LRO poll failures retain accepted mutation and never become absence or replay" {
+    for ([_]?u16{ null, 403, 404 }) |status| {
+        var h = try Harness.init(&.{
+            .{ .url = group_url, .response = group_json },
+            .{ .url = disk_url, .response = upload_disk_json },
+            .{ .url = s.arm_host ++ disk_path ++ "/beginGetAccess?api-version=2025-01-02", .method = .POST, .status = 202, .headers = &.{.{ .name = "Azure-AsyncOperation", .value = disk_status_url }} },
+            .{ .url = disk_status_url, .fail = status == null, .status = status orelse 200, .response = "{\"error\":{\"code\":\"ResourceNotFound\",\"message\":\"SYNTHETIC_PRIVATE\"}}" },
+        });
+        defer h.deinit();
+        var arm = h.arm();
+        try requireFailure(arm.execute(.{ .grant = .{ .identity = disk_identity, .seconds = 600 } }), if (status == null) .transport else if (status == 403) .authorization else .not_found, .accepted, status);
+    }
+}
+
+test "boot diagnostics initial query has exact ten-minute lifetime and no JSON body" {
+    const arena = try secret.Arena.create(a);
+    defer arena.destroy();
+    const alloc = arena.allocator();
+    var plan = try ops.Plan.create(alloc, authority, .{ .boot_diagnostics = .{ .vm = vm_ref, .original_uuid = vm_uuid.* } });
+    try t.expectEqualStrings(s.arm_host ++ vm_path ++ "/retrieveBootDiagnosticsData?api-version=2025-11-01&sasUriExpirationTimeInMinutes=10", plan.url);
+    try t.expect(plan.body == null);
+    for ([_][]const u8{
+        "?api-version=2025-11-01",
+        "?api-version=2025-11-01&sasUriExpirationTimeInMinutes=120",
+        "?api-version=2025-11-01&sasUriExpirationTimeInMinutes=10&sasUriExpirationTimeInMinutes=10",
+        "?api-version=2025-11-01&sasUriExpirationTimeInMinutes=10&extra=true",
+    }) |query| {
+        plan.url = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ s.arm_host, plan.path, query });
+        try t.expectError(error.UnsafeUrl, plan.validateInitialUrl(alloc));
+    }
+    var ordinary = try ops.Plan.create(alloc, authority, .{ .get = vm_ref });
+    ordinary.url = s.arm_host ++ vm_path ++ "?api-version=2025-11-01&sasUriExpirationTimeInMinutes=10";
+    try t.expectError(error.UnsafeUrl, ordinary.validateInitialUrl(alloc));
+    try t.expectError(error.UnsafeUrl, s.queryVersion(ordinary.url, "2025-11-01", false));
 }
 
 test "credential JSON and OAuth error progress cannot outread their budget" {
