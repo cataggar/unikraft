@@ -235,6 +235,15 @@ registrations must name defined symbols and form a bijection; duplicate,
 conflicting and missing external registrations fail. Unchanged metadata is
 not rewritten.
 
+Only the metadata executable enables `UK_KCONFIG_METADATA`: unmatched
+`source` paths/globs and filesystem glob errors are fatal. Its shell
+expansions use dynamic capture with a **1,048,576-byte raw stdout ceiling per
+command**, before newline normalization. Overflow, embedded NULs and read
+errors fail explicitly rather than emitting truncated metadata. Missing
+sources and capture failures return public exit status 2 without publishing
+metadata. The ordinary C solver retains its existing optional-source and
+255-byte shell-output behavior.
+
 Run the focused native unit and CLI fixtures (no Make or Python execution):
 
 ```sh
@@ -242,7 +251,9 @@ zig build test-build-tools -j2
 ```
 
 This includes metadata/version/platform negative cases, unchanged solved
-configuration/header checks, NM failure and malformed-output cases, private
+configuration/header checks, long root submenu paths, shell-capture boundary
+cases, a standalone legacy `olddefconfig` compatibility fixture, NM failure
+and malformed-output cases, private
 reference/collision gates, deterministic version scripts and force-keep files,
 and the existing native configuration/linker/LTO planning tests. Other root
 test targets and legacy Make image/build-graph modes retain their separately

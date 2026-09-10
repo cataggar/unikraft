@@ -29,12 +29,20 @@ const Fixture = struct {
     }
 
     fn expectRun(self: Fixture, argv: []const []const u8, expected: u8) !void {
+        try self.expectDiagnostic(argv, expected, "");
+    }
+
+    fn expectDiagnostic(self: Fixture, argv: []const []const u8, expected: u8, diagnostic: []const u8) !void {
         const result = try std.process.run(self.a, self.io, .{ .argv = argv });
         if (result.term != .exited or result.term.exited != expected) {
             std.debug.print("fixture expected exit {d}: {s}\nstdout: {s}\nstderr: {s}\n", .{
                 expected, argv[0], result.stdout, result.stderr,
             });
             return error.UnexpectedExitStatus;
+        }
+        if (std.mem.indexOf(u8, result.stderr, diagnostic) == null) {
+            std.debug.print("fixture expected diagnostic '{s}', got:\n{s}\n", .{ diagnostic, result.stderr });
+            return error.MissingDiagnostic;
         }
     }
 };
@@ -128,16 +136,124 @@ fn metadataFixtures(f: Fixture, tool: []const u8, config_tool: []const u8) !void
     try f.expectRun(&argv, 2);
     try std.Io.Dir.cwd().deleteFile(f.io, try f.path("external/Makefile.uk"));
     try f.expectRun(&argv, 2);
+    // Model and version failures must not be masked by the missing platform.
+    const model_argv = argv[0 .. argv.len - 2];
     _ = try f.write("base/support/scripts/gitsha1", "#!/bin/sh\nprintf 'one\\ntwo\\n'\n", true);
-    try f.expectRun(&argv, 2);
+    try f.expectDiagnostic(model_argv, 2, "MultilineVersionSuffix");
     _ = try f.write("base/support/scripts/gitsha1", "#!/bin/sh\nexit 7\n", true);
-    try f.expectRun(&argv, 2);
+    try f.expectDiagnostic(model_argv, 2, "VersionHelperFailed");
     _ = try f.write("base/support/scripts/gitsha1", "#!/bin/sh\nprintf '%s\\n' '~fixture'\n", true);
     _ = try f.write("base/Config.uk", "invalid kconfig syntax\n", false);
-    try f.expectRun(&argv, 2);
-    _ = try f.write("base/Config.uk", "source \"missing-Kconfig-source\"\n", false);
-    try f.expectRun(&argv, 2);
+    try f.expectDiagnostic(model_argv, 2, "unknown statement");
+    _ = try f.write("base/Config.uk", "# Empty model is a valid control.\n", false);
+    try f.expectRun(model_argv, 0);
+    const empty_model = "unikraft-native-config-metadata-v1\n";
+    try std.testing.expectEqualStrings(empty_model, try f.read(metadata_path));
+    var fresh_argv = argv;
+    fresh_argv[10] = try f.path("missing-source-new.tsv");
+    for ([_][]const u8{ "missing-Kconfig-source", "missing-Kconfig-*.uk" }) |source| {
+        _ = try f.write("base/Config.uk", try std.fmt.allocPrint(f.a, "source \"{s}\"\n", .{source}), false);
+        const diagnostic = try std.fmt.allocPrint(f.a, "metadata source \"{s}\": no matching files", .{source});
+        try f.expectDiagnostic(model_argv, 2, diagnostic);
+        try std.testing.expectEqualStrings(empty_model, try f.read(metadata_path));
+        try f.expectDiagnostic(fresh_argv[0 .. fresh_argv.len - 2], 2, diagnostic);
+        try std.testing.expectError(error.FileNotFound, f.read(fresh_argv[10]));
+    }
+    _ = try f.write("base/parts/a.uk", "config PART_A\n bool\n", false);
+    _ = try f.write("base/parts/b.uk", "config PART_B\n int\n", false);
+    _ = try f.write("base/Config.uk", "source \"parts/*.uk\"\n", false);
+    try f.expectRun(model_argv, 0);
+    try std.testing.expectEqualStrings(
+        "unikraft-native-config-metadata-v1\nsymbol\tPART_A\tbool\nsymbol\tPART_B\tint\n",
+        try f.read(metadata_path),
+    );
     try std.testing.expectEqualStrings(original_config, try f.read(config));
+}
+
+fn longRootPaths(f: Fixture, tool: []const u8, config_tool: []const u8, repository: []const u8) !void {
+    var output = try f.path("long-root-output");
+    for (0..8) |_| {
+        output = try std.fs.path.join(f.a, &.{ output, "nested-metadata-output-0123456789" });
+    }
+    const submenu = try std.fs.path.join(f.a, &.{ output, "native-config", "kconfig", "plats.uk" });
+    try std.testing.expect(submenu.len > 255);
+    const config = try std.fs.path.join(f.a, &.{ repository, "support/build/tests/native-config/x86_64-acme.config" });
+    const platform = try std.fs.path.join(f.a, &.{ repository, "support/build/tests/native-config/external-platform/provider" });
+    const metadata_path = try std.fs.path.join(f.a, &.{ output, "metadata.tsv" });
+    try f.expectRun(&.{
+        tool,         "--base",      repository,            "--app",  repository, "--output", output, "--config", config,
+        "--metadata", metadata_path, "--external-platform", platform,
+    }, 0);
+    const submenu_contents = try f.read(submenu);
+    try std.testing.expect(std.mem.indexOf(u8, submenu_contents, platform) != null);
+    var metadata = try kconfig.Metadata.parse(f.a, try f.read(metadata_path));
+    try std.testing.expectEqual(kconfig.SymbolType.boolean, metadata.typeOf("PLAT_ACME").?);
+    var found = false;
+    for (metadata.platforms.items) |registration| {
+        if (std.mem.eql(u8, registration.name, "acme")) found = true;
+    }
+    try std.testing.expect(found);
+    try f.expectRun(&.{ config_tool, "validate", config, metadata_path }, 0);
+}
+
+fn shellBoundaries(f: Fixture, tool: []const u8) !void {
+    const base = try f.path("shell-base");
+    _ = try f.write("shell-base/version.mk", "UK_VERSION=1\nUK_SUBVERSION=2\n", false);
+    _ = try f.write("shell-base/support/scripts/gitsha1", "#!/bin/sh\nexit 0\n", true);
+    _ = try f.write("shell-base/emit-output", "#!/bin/sh\nhead -c \"$1\" /dev/zero | tr '\\000' x\n", true);
+    const config = try f.write("shell.config", "# No solved values are changed.\n", false);
+    const metadata_path = try f.path("shell-output/metadata.tsv");
+    const argv = [_][]const u8{
+        tool,       "--base", base,         "--app",       base, "--output", try f.path("shell-output"),
+        "--config", config,   "--metadata", metadata_path,
+    };
+    const limit = 1024 * 1024;
+    for ([_]usize{ 256, limit }) |size| {
+        _ = try f.write("shell-base/Config.uk", try std.fmt.allocPrint(f.a, "config SHELL_VALUE\n string\n default \"$(shell,$(UK_BASE)/emit-output {d})\"\n", .{size}), false);
+        try f.expectRun(&argv, 0);
+        try std.testing.expectEqualStrings(
+            "unikraft-native-config-metadata-v1\nsymbol\tSHELL_VALUE\tstring\n",
+            try f.read(metadata_path),
+        );
+    }
+    const original_metadata = try f.read(metadata_path);
+    _ = try f.write("shell-base/Config.uk", try std.fmt.allocPrint(f.a, "config SHELL_VALUE\n string\n default \"$(shell,$(UK_BASE)/emit-output {d})\"\n", .{limit + 1}), false);
+    try f.expectDiagnostic(&argv, 2, "metadata shell output exceeds 1048576-byte limit");
+    try std.testing.expectEqualStrings(original_metadata, try f.read(metadata_path));
+    _ = try f.write("shell-base/Config.uk", "config SHELL_VALUE\n string\n default \"$(shell,printf '\\000')\"\n", false);
+    try f.expectDiagnostic(&argv, 2, "metadata shell output contains a NUL byte");
+    try std.testing.expectEqualStrings(original_metadata, try f.read(metadata_path));
+    _ = try f.write("shell-base/Config.uk", "source \"$(shell,printf 'line\\nbreak\\n\\n')\"\n", false);
+    _ = try f.write("shell-base/line break", "config NEWLINE_SOURCE\n bool\n", false);
+    try f.expectRun(&argv, 0);
+    try std.testing.expectEqualStrings(
+        "unikraft-native-config-metadata-v1\nsymbol\tNEWLINE_SOURCE\tbool\n",
+        try f.read(metadata_path),
+    );
+}
+
+fn legacySolver(f: Fixture, tool: []const u8) !void {
+    const source = try f.write("legacy/Config.uk", "source \"missing-Kconfig-source\"\nconfig LEGACY_VALUE\n string\n default \"$(shell,printf '%0300d' 0)\"\n", false);
+    const output = try f.path("legacy/solved.config");
+    var environment = std.process.Environ.Map.init(f.a);
+    defer environment.deinit();
+    try environment.put("CONFIG_", "CONFIG_");
+    try environment.put("KCONFIG_CONFIG", output);
+    try environment.put("KCONFIG_AUTOCONFIG", try f.path("legacy/auto.conf"));
+    try environment.put("KCONFIG_AUTOHEADER", try f.path("legacy/autoconf.h"));
+    try environment.put("KCONFIG_TRISTATE", try f.path("legacy/tristate.conf"));
+    const result = try std.process.run(f.a, f.io, .{
+        .argv = &.{ tool, "--olddefconfig", source },
+        .cwd = .{ .path = try f.path("legacy") },
+        .environ_map = &environment,
+    });
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("legacy solver fixture failed:\n{s}\n{s}\n", .{ result.stdout, result.stderr });
+        return error.UnexpectedExitStatus;
+    }
+    const solved = try f.read(output);
+    const expected = try std.mem.concat(f.a, u8, &.{ "CONFIG_LEGACY_VALUE=\"", "0" ** 255, "\"\n" });
+    try std.testing.expect(std.mem.indexOf(u8, solved, expected) != null);
 }
 
 fn policyFixtures(f: Fixture, tool: []const u8) !void {
@@ -193,8 +309,12 @@ fn policyFixtures(f: Fixture, tool: []const u8) !void {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 5) return error.InvalidArguments;
+    if (args.len != 7) return error.InvalidArguments;
     const fixture: Fixture = .{ .a = init.arena.allocator(), .io = init.io, .root = args[4] };
     try metadataFixtures(fixture, args[1], args[2]);
+    try longRootPaths(fixture, args[1], args[2], args[5]);
+    try shellBoundaries(fixture, args[1]);
+    const legacy_tool = try std.Io.Dir.cwd().realPathFileAlloc(init.io, args[6], init.arena.allocator());
+    try legacySolver(fixture, legacy_tool);
     try policyFixtures(fixture, args[3]);
 }

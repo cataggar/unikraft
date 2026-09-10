@@ -3,6 +3,10 @@
 #include <stdlib.h>
 #include "lkc.h"
 
+#ifndef UK_KCONFIG_METADATA
+#error "native metadata requires the metadata-specific Kconfig parser mode"
+#endif
+
 /* Inspect the same parsed model as conf, without reading or solving .config. */
 void uk_kconfig_metadata(const char *path,
 			void (*emit)(const char *, const char *))

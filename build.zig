@@ -1527,10 +1527,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_build_tools_integration = b.addRunArtifact(build_tools_integration);
+    // Config.uk discovers source fragments at runtime; do not cache a model
+    // proof using only the top-level configuration file as its input.
+    run_build_tools_integration.has_side_effects = true;
     run_build_tools_integration.addArtifactArg(metadata_tool);
     run_build_tools_integration.addArtifactArg(native_config_tool);
     run_build_tools_integration.addArtifactArg(policy_tool);
     _ = run_build_tools_integration.addOutputDirectoryArg("native-build-tools-fixtures");
+    run_build_tools_integration.addArg(root);
+    run_build_tools_integration.addFileInput(b.path("Config.uk"));
+    run_build_tools_integration.addFileInput(b.path("support/build/config-submenu.sh"));
+    run_build_tools_integration.addArtifactArg(native_build_tools.legacyConfigFixture(b, b.path(".")));
     build_tools_tests.dependOn(&run_build_tools_integration.step);
     test_step.dependOn(build_tools_tests);
     const integration_output = resolvePath(
