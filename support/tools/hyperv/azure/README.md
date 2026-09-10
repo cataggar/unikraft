@@ -169,8 +169,10 @@ rotation. HTTP success/LRO success does not bypass resource reconciliation.
 
 Compute `2025-01-02` regional `DiskOperations` URLs have a separate signed-query
 contract: exactly `p`, `api-version`, `t`, `c`, `s`, `h`, plus `monitor=true` on
-Location URLs. The 4096-byte URL bound and a 2048-byte bound per opaque value
-apply. Signed values and percent-escape spelling are preserved byte-for-byte,
+Location URLs. The complete URL is bounded to 4096 bytes; opaque values remain
+within that bound without a smaller per-value limit. Fixtures cover a
+service-sized 2956-byte `c` value and the exact URL limit. Signed values and
+percent-escape spelling are preserved byte-for-byte,
 never decoded/re-encoded or rendered in diagnostics. This does not relax
 authority, subscription, provider, location, operation-ID or other query
 policies.

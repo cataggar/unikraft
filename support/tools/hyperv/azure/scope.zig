@@ -202,7 +202,7 @@ pub fn diskOperationQuery(path: []const u8, version: []const u8, endpoint: DiskO
 }
 
 fn opaqueQueryValue(value: []const u8) !void {
-    if (value.len == 0 or value.len > 2048) return error.UnsafeUrl;
+    if (value.len == 0) return error.UnsafeUrl;
     var i: usize = 0;
     while (i < value.len) : (i += 1) {
         if (value[i] == '%') {

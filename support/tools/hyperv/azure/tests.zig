@@ -36,7 +36,8 @@ const vm_url = s.arm_host ++ vm_path ++ "?api-version=2025-11-01";
 const disk_path = group_path ++ "/providers/Microsoft.Compute/disks/synthetic-disk";
 const disk_url = s.arm_host ++ disk_path ++ "?api-version=2025-01-02";
 const disk_operation_path = "/subscriptions/" ++ sub ++ "/providers/Microsoft.Compute/locations/northeurope/DiskOperations/" ++ operation_uuid;
-const disk_operation_query = "?p=SYNTHETIC_PRIVATE%2bstate%2Fvalue%3d&api-version=2025-01-02&t=638000000000000000&c=1&s=SYNTHETIC_PRIVATE+state/==&h=SYNTHETIC_PRIVATE%2Bsignature%2f%3D";
+const disk_operation_context = "SYNTHETIC_PRIVATE%2b%2F%3d" ++ "a" ** (2956 - "SYNTHETIC_PRIVATE%2b%2F%3d".len);
+const disk_operation_query = "?p=SYNTHETIC_PRIVATE%2bstate%2Fvalue%3d&api-version=2025-01-02&t=638000000000000000&c=" ++ disk_operation_context ++ "&s=SYNTHETIC_PRIVATE+state/==&h=SYNTHETIC_PRIVATE%2Bsignature%2f%3D";
 const disk_status_url = s.arm_host ++ disk_operation_path ++ disk_operation_query;
 const disk_location_url = disk_status_url ++ "&monitor=true";
 const account_path = group_path ++ "/providers/Microsoft.Storage/storageAccounts/syntheticaccount";
@@ -1330,7 +1331,8 @@ test "LRO progress cancellation preserves the accepted initiating mutation" {
     }
 }
 
-test "signed DiskOperations grant preserves opaque encoding and Location monitor" {
+test "service-sized signed DiskOperations grant preserves opaque encoding and Location monitor" {
+    try t.expectEqual(@as(usize, 2956), disk_operation_context.len);
     var h = try Harness.init(&.{
         .{ .url = group_url, .response = group_json },
         .{ .url = disk_url, .response = upload_disk_json },
@@ -1438,10 +1440,29 @@ test "signed DiskOperations requires complete bounded opaque values and exact mo
     }
     try t.expectError(error.UnsafeUrl, s.diskOperationQuery(disk_status_url ++ "&monitor=false", "2025-01-02", .location));
     try t.expectError(error.UnsafeUrl, s.diskOperationQuery(disk_location_url ++ "&monitor=true", "2025-01-02", .location));
-    const large = try std.fmt.allocPrint(a, "{s}?p={s}&api-version=2025-01-02&t=x&c=x&s=x&h=x", .{ disk_operation_path, "a" ** 2049 });
-    defer a.free(large);
-    try t.expectError(error.UnsafeUrl, s.diskOperationQuery(large, "2025-01-02", .status));
     try t.expectError(error.UnsafeUrl, s.queryVersion(disk_status_url, "2025-01-02", false));
+}
+
+test "signed DiskOperations opaque values remain bounded by the complete URL" {
+    const prefix = s.arm_host ++ disk_operation_path ++ "?p=x&api-version=2025-01-02&t=x&c=";
+    for ([_]struct { endpoint: s.DiskOperationEndpoint, suffix: []const u8 }{
+        .{ .endpoint = .status, .suffix = "&s=x&h=x" },
+        .{ .endpoint = .location, .suffix = "&s=x&h=x&monitor=true" },
+    }) |case| {
+        const value = try a.alloc(u8, 4096 - prefix.len - case.suffix.len + 1);
+        defer a.free(value);
+        @memset(value, 'a');
+        const exact = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ prefix, value[0 .. value.len - 1], case.suffix });
+        defer a.free(exact);
+        const over = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ prefix, value, case.suffix });
+        defer a.free(over);
+        try t.expectEqual(@as(usize, 4096), exact.len);
+        try t.expectEqual(@as(usize, 4097), over.len);
+        try s.diskOperationQuery(exact, "2025-01-02", case.endpoint);
+        try s.diskOperationQuery(try s.relativeUrl(exact), "2025-01-02", case.endpoint);
+        try t.expectError(error.UnsafeUrl, s.relativeUrl(over));
+        try t.expectError(error.UnsafeUrl, s.diskOperationQuery(over, "2025-01-02", case.endpoint));
+    }
 }
 
 test "signed LRO poll failures retain accepted mutation and never become absence or replay" {
