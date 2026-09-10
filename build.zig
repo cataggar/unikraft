@@ -497,6 +497,22 @@ pub fn build(b: *std.Build) void {
         "test",
         "Test facade, native configuration, native linking, QEMU graphs, and post-processing",
     );
+    const compiler_option_tests = b.step(
+        "test-native-compiler-options",
+        "Test Make compiler-option probes with the native Zig driver",
+    );
+    const compiler_option_run = b.addSystemCommand(&.{ options.command, "-j2", "--no-print-directory", "-f" });
+    compiler_option_run.addFileArg(b.path("support/build/tests/cc-option-test.mk"));
+    compiler_option_run.addArgs(&.{
+        b.fmt("UK_ROOT={s}", .{root}),
+        b.fmt("ZIG={s}", .{b.graph.zig_exe}),
+        "test",
+    });
+    compiler_option_run.addFileInput(b.path("support/build/Makefile.rules"));
+    compiler_option_run.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    compiler_option_run.has_side_effects = true;
+    compiler_option_tests.dependOn(&compiler_option_run.step);
+    test_step.dependOn(compiler_option_tests);
     test_step.dependOn(&run_facade_tests.step);
     test_step.dependOn(&run_runner_tests.step);
     test_step.dependOn(&run_native_config_tests.step);
@@ -1461,6 +1477,7 @@ pub fn build(b: *std.Build) void {
     );
     hyperv_regression_tests.dependOn(vmbus_lifecycle_tests);
     hyperv_regression_tests.dependOn(hyperv_image_proofs);
+    hyperv_regression_tests.dependOn(compiler_option_tests);
     hyperv_regression_tests.dependOn(storvsc_regression_tests);
     hyperv_regression_tests.dependOn(network_regression_tests);
     hyperv_regression_tests.dependOn(&run_schedcoop_smp_tests.step);

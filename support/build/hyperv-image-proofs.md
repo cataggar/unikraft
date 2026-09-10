@@ -89,6 +89,11 @@ existing selectors are unchanged. The broader regression aggregate still
 contains unrelated Python/controller tests: use the focused native selector
 when Python or cloud/controller actions are prohibited.
 
+`test-native-compiler-options` exercises the actual Make flag-probe macro with
+Zig, including PIE and invalid-option cases. Empty C input is supplied through
+stdin rather than a device pathname, so an unsupported input type cannot
+silently remove required position-independent-code flags.
+
 Supported final images are little-endian ELF64 x86-64 EXEC/DYN with the full
 symbol table and loaded executable sections. Native AArch64 hosts can run the
 proof tools and cross-decode x86-64 fixtures; ARM64 images are explicitly
