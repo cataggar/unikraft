@@ -52,18 +52,20 @@ No Python generator, oracle, proof executor, or install hook is involved.
 | Runtime paging symbols occur together, with init/get/activate ordering | Each missing symbol/call and both reorderings; a fixed-SMP image without paging remains valid |
 | AP EFER LME/NXE, cleared EDX, correct MSR, CR4 PAE, CR0 PE/WP/PG | Required-bit, MSR, source-register, EDX/EAX/AND clobber, missing/duplicate write and ordering unit cases; real immediate mutations |
 | AP controls precede paging enable without intervening control flow | Branch/clobber insertions, control ordering, address-range inspection independent of disassembly label aliases |
-| Every present scheduler constructor binds the ISR callback | Actual direct store and shared call/tail-wrapper fixtures; missing, individually unbound, cyclic and unresolved wrapper refusals |
-| Actual scheduler callback assignment, not a textual mention | Full-width immediate/register stores; register copies, partial writes, unary clobbers, caller/callee-saved behavior; materialization without a store is rejected |
-| Three SynIC/pending callbacks are registered | Real argument materialization for each registration API; each removed independently; SysV RDI/RSI call-site evidence |
+| Every present scheduler constructor binds the ISR callback | Actual direct store, allocated-object shared initializer, call/tail-wrapper and nullable return fixtures; missing, individually unbound, cyclic and unresolved wrapper refusals |
+| Actual destination and object, not merely callback materialization | Consumer-derived global slot or object field; displacement-only redirection to `registered_driver`, wrong object field and bypassed initializer store all fail |
+| Callback facts survive only valid register/memory operations | Full-width immediate/register stores, copies, stack spills, partial/unary/exchange writes, caller/callee-saved effects; overlapping stores and escaped-stack writes invalidate facts and publication |
+| Three SynIC/pending callbacks are registered on reachable paths | Must-provenance at each SysV RDI/RSI call site; removed materialization and jump-only bypass fail; valid branch joins and loop-invariant arguments pass |
 | Exactly the reviewed native IRQ event handler | Actual retained event pointer, missing/extra handler entries, and changed pointer refusals |
-| Follow linked calls, tail/local branches, and symbol aliases | Real C/Zig graph and aliases; numeric targets are independently checked against relative-branch bytes |
+| Follow linked calls, tail/local branches, aliases and interior-label fallthrough | ELF function extents, not objdump label blocks; adding only an interior ELF symbol cannot hide unchanged executed SIMD bytes; valid interior labels pass |
 | Reviewed indirect callers and exact counts 1/2/1 | Real event/controller/wake indirect sites; count mutation, indirect tail jump, and unreviewed caller refusals |
 | Required IRQ roots, SynIC helpers, protocol getters and ISR wake are reachable | Real returning graph; removal of the ISR wake edge refuses publication |
-| No x87/MMX/SSE/AVX/mask/tile state on returning IRQ paths | Register/mnemonic family unit matrix, prefix normalization, real SIMD insertion |
+| No x87/MMX/SSE/AVX/mask/tile state on returning IRQ paths | Register/mnemonic family unit matrix, prefix normalization, real SIMD insertion, and HLT/INT3 resumption fallthrough |
+| Legitimate integer LOCK operations retain IRQ coverage | Real `lock; orq` memory RMW fixture and split-record parser case; register-only LOCK remains unknown and is refused when reached |
 | Only straight-line terminal assertion logging is exempt | Worker-only SIMD logger behind UD2 passes; returning logger and SIMD in the asserting caller fail; branch/call/return/loop barrier cases |
 | Unique strong driver registration and unique constructors/entries | Real macro-generated symbols; weak/duplicate registration, absent call and wrong constructor pointer refusals |
 | Nonempty ctor bounds, complete slot within bounds, no orphan priority sections | Empty table, entry at end, wrong slot size, and orphan section mutations; linker KEEP retains constructors |
-| Actual driver descriptor argument, names, IDs and callbacks | Both drivers: argument removal, 40-byte descriptor/32-byte ID ABI, GUID/sentinel, name/ID/add/remove/optional callback pointers |
+| Actual driver descriptor argument, names, IDs and callbacks | Both drivers: argument removal and jump-only LEA bypass, 40-byte descriptor/32-byte ID ABI, GUID/sentinel, name/ID/add/remove/optional callback pointers |
 | Configured driver requirements remain conditional | Each driver individually, both together, duplicate arguments; corruption of an unrequired driver's GUID does not fail the selected driver |
 | Static and PIE pointer evidence | EXEC and DYN fixtures; loaded absolute pointers and `R_X86_64_RELATIVE` RELA; unsupported and ambiguous relocation refusals |
 | Native tools cannot supply success-shaped bad evidence | Native mock executable covers nonzero/empty/malformed/truncated NM and objdump; mismatched NM addresses, raw bytes and branch targets |
@@ -72,6 +74,48 @@ No Python generator, oracle, proof executor, or install hook is involved.
 Each fixture loop asserts its expected source-site count rather than silently
 omitting cases when compiler output changes. Per-fixture `summary.txt` files
 are produced in the build's generated output directories.
+
+## Control flow and scheduler provenance
+
+`hyperv-proof-image.zig` derives function extents from sized ELF `STT_FUNC`
+symbols. Exact aliases and nested labels retain the enclosing extent;
+ambiguous partial overlaps are refused. IRQ traversal visits instruction PCs,
+following both conditional edges and physical fallthrough. A new objdump label
+does not end a function or change its reviewed indirect-call identity.
+
+`hyperv-proof-flow.zig` constructs a bounded CFG and computes must-facts at
+joins. Unreachable materialization is never used, and every reachable
+registration call must have an allowed argument. Full-width pointer null tests
+refine both register and spilled aliases; narrow tests and clobbered flags do
+not establish a null object. Unknown or unsupported control flow is refused.
+
+`hyperv-proof-binding.zig` derives the callback location from the actual
+`uk_thread_wake_isr` indirect load/call. The object form requires a scheduler
+loaded from the original thread, that same scheduler in RDI, and the original
+thread in RSI. Constructor/helper analysis requires the callback in that
+object's derived field before publication through strong `uk_sched_register`,
+then requires the same bound object on every non-null return. The global form
+requires the exact consumed global slot on every return. An arbitrary memory
+store of the callback is insufficient.
+
+The publication contract is the reviewed `uk_sched_init` macro in
+`lib/uksched/include/uk/sched_impl.h` and `uk_sched_register` in
+`lib/uksched/sched.c`: initialize `thread_woken_isr`, then link that scheduler
+into the scheduler list without replacing its callback. The real public image
+loads `thread->sched` at offset 80 and calls field 40; the independent native
+object fixture deliberately uses offsets 8 and 24, so passing cannot depend
+on a hard-coded fixture or kernel displacement. Shared initializers, pointer
+copies/spills, tail wrappers, and allocation-failure returns are exercised.
+Overwrites invalidate publication even for spilled aliases or nullable helper
+summaries. Separate untracked memory loads are not assumed to return the same
+object; repeated allocation sites inside constructor call cycles are refused.
+
+The parent acceptance ELF's former `ukplat_time_init` error actually occurred
+in `uk_intctlr_irq_handle`: LLVM printed `f0 lock` at `0x12ca40` separately
+from `orq $1, (%r12)` at `0x12ca41`. The parser now joins only contiguous,
+at-most-15-byte LOCK plus integer **memory** RMW encodings. Invalid prefixes
+remain unknown; executable boot/table data is not blanket-whitelisted as IRQ
+code. Failure diagnostics now retain the current instruction PC and opcode.
 
 ## Integration and evidence limits
 
@@ -101,11 +145,24 @@ refused, not skipped or certified. Decoder output is bounded, newline-complete
 AT&T syntax with raw bytes, including LLVM continuation annotations and GNU
 wrapped instruction bytes. Configured native decoders remain trusted toolchain
 inputs, not an independent instruction decoder. Register proofs deliberately
-fail when the required materialization/store cannot be established; they do
-not infer pointers through arbitrary stack spills or control-flow joins.
+fail when required provenance cannot be established. They support modeled
+full-width copies, object-relative/RIP-relative addressing, unescaped spills,
+and must-facts across joins, not arbitrary alias analysis, heap lifetime
+proofs, or arbitrary calling conventions. Constructor-only vector writes do
+not spuriously clobber GP registers, but overlapping memory writes invalidate
+callback facts; this does not authorize vector state in the IRQ graph.
 PIE callback/argument evidence must retain a full-width position-independent
 address: absolute immediates and narrowed register copies are not accepted.
-The selected non-LTO C ABI is SysV x86-64. Embedded real-mode bootstrap code,
+The selected non-LTO C ABI is SysV x86-64, with the reviewed scheduler
+publication contract above. Analysis is capped at 8,192 instructions per
+function, 131,072 state transfers (also shared across constructor summaries),
+48 tracked memory cells, two load levels, 16 helper levels, 256 call contexts,
+8,192 call-hook operations, 32 candidate-closure rounds, 16,384 normalized
+functions, and 131,072 visited IRQ PCs. Recursive helpers, constructor
+call-containing cycles, conditional exits beyond function extents, indirect
+tail transfers in provenance analysis, and exhausted bounds explicitly fail.
+These conservative restrictions are not silent skips or boot evidence.
+Embedded real-mode bootstrap code,
 GDT bytes, and the post-paging far-transfer suffix are not certified as IRQ
 code. Mixed 16/32/64-bit fixture sections exercise the ELF64 decoder's handling
 of these bytes; unknown instructions still fail inside the returning IRQ graph

@@ -9,6 +9,8 @@ pub fn main(init: std.process.Init) void {
     var diagnostic: proofs.Diagnostic = .{};
     execute(init, &diagnostic) catch |err| {
         std.debug.print("FAIL: Hyper-V linked-image proof: {s}: {s}\n", .{ diagnostic.subject, @errorName(err) });
+        if (diagnostic.address) |address|
+            std.debug.print("instruction 0x{x}: {s}\n", .{ address, diagnostic.opcode });
         std.process.exit(switch (err) {
             error.InvalidArguments, error.InvalidToolCommand, error.InvalidMaxCpus, error.MissingDriverRequirement => 2,
             else => 1,

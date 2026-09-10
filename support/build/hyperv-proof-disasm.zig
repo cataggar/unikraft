@@ -57,6 +57,16 @@ pub const Instruction = struct {
         return std.mem.startsWith(u8, self.op, "call");
     }
 
+    pub fn isJump(self: Instruction) bool {
+        return std.mem.eql(u8, self.op, "jmp") or std.mem.eql(u8, self.op, "jmpq") or
+            std.mem.eql(u8, self.op, "jmpl");
+    }
+
+    pub fn stops(self: Instruction) bool {
+        return std.mem.startsWith(u8, self.op, "ret") or std.mem.startsWith(u8, self.op, "iret") or
+            std.mem.eql(u8, self.op, "ud2");
+    }
+
     pub fn isBranch(self: Instruction) bool {
         return self.isCall() or std.mem.startsWith(u8, self.op, "j") or
             std.mem.startsWith(u8, self.op, "ljmp") or std.mem.startsWith(u8, self.op, "lcall") or
@@ -196,6 +206,20 @@ pub const Program = struct {
             instruction.op = opcode orelse ".prefix";
             instruction.operands = std.mem.trim(u8, tokens.rest(), " \t");
             const function = &result.functions.items[owner];
+            if (function.count != 0) {
+                const previous = &result.instructions.items[result.instructions.items.len - 1];
+                // LLVM can print LOCK separately from its integer RMW opcode.
+                if (previous.size == 1 and previous.bytes[0] == 0xf0 and std.mem.eql(u8, previous.op, ".prefix") and
+                    address == previous.address + 1 and instruction.size < 15 and lockable(instruction))
+                {
+                    @memcpy(previous.bytes[1..][0..instruction.size], instruction.bytes[0..instruction.size]);
+                    previous.size += instruction.size;
+                    previous.op = instruction.op;
+                    previous.operands = instruction.operands;
+                    previous.annotated_reference = instruction.annotated_reference;
+                    continue;
+                }
+            }
             if (function.count == 0 and address != function.address) return error.IncompleteDisassembly;
             if (function.count != 0) {
                 const previous = result.instructions.items[result.instructions.items.len - 1];
@@ -226,6 +250,27 @@ pub const Program = struct {
         return self.instructions.items[function.first..][0..function.count];
     }
 };
+
+fn lockable(instruction: Instruction) bool {
+    const operands = splitOperands(instruction);
+    const destination = if (operands) |parts| parts[1] else instruction.operands;
+    if (std.mem.indexOfScalar(u8, destination, '(') == null) return false;
+    for ([_][]const u8{ "add", "adc", "and", "btc", "btr", "bts", "cmpxchg", "dec", "inc", "neg", "not", "or", "sbb", "sub", "xadd", "xchg", "xor" }) |op|
+        if (std.mem.startsWith(u8, instruction.op, op)) return true;
+    return false;
+}
+
+pub fn splitOperands(instruction: Instruction) ?[2][]const u8 {
+    const text = instruction.operands[0 .. std.mem.indexOfScalar(u8, instruction.operands, '#') orelse instruction.operands.len];
+    var depth: usize = 0;
+    for (text, 0..) |c, i| {
+        if (c == '(') depth += 1;
+        if (c == ')' and depth != 0) depth -= 1;
+        if (c == ',' and depth == 0)
+            return .{ std.mem.trim(u8, text[0..i], " \t"), std.mem.trim(u8, text[i + 1 ..], " \t") };
+    }
+    return null;
+}
 
 fn isPrefix(op: []const u8) bool {
     for ([_][]const u8{ "lock", "rep", "repz", "repe", "repne", "repnz", "bnd", "notrack", "data16", "addr32", "cs", "ds", "es", "ss", "fs", "gs" }) |prefix|

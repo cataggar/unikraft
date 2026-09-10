@@ -3,11 +3,13 @@
 const std = @import("std");
 const elf = @import("postprocess-elf.zig");
 pub const disasm = @import("hyperv-proof-disasm.zig");
+pub const Function = struct { start: u64, end: u64, name: []const u8 };
 
 pub const Model = struct {
     image: elf.Image,
     symbols: disasm.Symbols,
     program: disasm.Program,
+    functions: []Function,
 
     pub fn init(allocator: std.mem.Allocator, bytes: []const u8, nm: []const u8, assembly: []const u8) !Model {
         var image = try elf.Image.parse(allocator, bytes);
@@ -19,12 +21,15 @@ pub const Model = struct {
         errdefer symbols.deinit();
         var program = try disasm.Program.parse(allocator, assembly);
         errdefer program.deinit();
-        const model: Model = .{ .image = image, .symbols = symbols, .program = program };
+        const functions = try functionRanges(allocator, image);
+        errdefer allocator.free(functions);
+        const model: Model = .{ .image = image, .symbols = symbols, .program = program, .functions = functions };
         try model.validateEvidence();
         return model;
     }
 
     pub fn deinit(self: *Model) void {
+        self.image.allocator.free(self.functions);
         self.program.deinit();
         self.symbols.deinit();
         self.image.deinit();
@@ -95,7 +100,33 @@ pub const Model = struct {
     }
 
     pub fn body(self: Model, name: []const u8) ![]const disasm.Instruction {
-        return self.program.body(try self.address(name));
+        return self.bodyAt(try self.address(name));
+    }
+
+    pub fn functionAt(self: Model, pc: u64) !Function {
+        var lo: usize = 0;
+        var hi = self.functions.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.functions[mid].start <= pc) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0 or pc >= self.functions[lo - 1].end) return error.MissingFunctionExtent;
+        return self.functions[lo - 1];
+    }
+
+    pub fn bodyAt(self: Model, pc: u64) ![]const disasm.Instruction {
+        const extent = try self.functionAt(pc);
+        const first = self.program.instruction_index.get(pc) orelse return error.MissingDisassembly;
+        var last = first;
+        var cursor = pc;
+        while (cursor < extent.end) : (last += 1) {
+            if (last >= self.program.instructions.items.len) return error.IncompleteDisassembly;
+            const instruction = self.program.instructions.items[last];
+            if (instruction.address != cursor) return error.IncompleteDisassembly;
+            cursor = try elf.add(cursor, instruction.size);
+        }
+        if (cursor != extent.end) return error.IncompleteDisassembly;
+        return self.program.instructions.items[first..last];
     }
 
     pub fn dataAt(self: Model, address_value: u64, size: u64) ![]const u8 {
@@ -166,6 +197,34 @@ pub const Model = struct {
         return false;
     }
 };
+
+fn rangeLessThan(_: void, a: Function, b: Function) bool {
+    return a.start < b.start or (a.start == b.start and a.end > b.end);
+}
+
+fn functionRanges(allocator: std.mem.Allocator, image: elf.Image) ![]Function {
+    var ranges: std.ArrayList(Function) = .empty;
+    defer ranges.deinit(allocator);
+    for (image.symbols) |item| {
+        if (item.header.st_info & 15 != std.elf.STT_FUNC or item.header.st_size == 0) continue;
+        try ranges.append(allocator, .{
+            .start = item.header.st_value,
+            .end = try elf.add(item.header.st_value, item.header.st_size),
+            .name = item.name,
+        });
+    }
+    std.mem.sort(Function, ranges.items, {}, rangeLessThan);
+    var count: usize = 0;
+    for (ranges.items) |item| {
+        if (count != 0 and item.start < ranges.items[count - 1].end) {
+            if (item.end <= ranges.items[count - 1].end) continue;
+            return error.AmbiguousFunctionExtent;
+        }
+        ranges.items[count] = item;
+        count += 1;
+    }
+    return allocator.dupe(Function, ranges.items[0..count]);
+}
 
 fn verifyBranchEncoding(instruction: disasm.Instruction) !void {
     if (instruction.unknown()) return;

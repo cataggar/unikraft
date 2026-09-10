@@ -6,8 +6,10 @@ const Model = model_module.Model;
 const assembly = model_module.disasm;
 const Instruction = assembly.Instruction;
 const protocol = @import("vmbus_protocol");
+const flow = @import("hyperv-proof-flow.zig");
+const binding = @import("hyperv-proof-binding.zig");
 
-pub const Diagnostic = struct { subject: []const u8 = "" };
+pub const Diagnostic = struct { subject: []const u8 = "", address: ?u64 = null, opcode: []const u8 = "" };
 pub const IrqReport = struct { functions: usize, indirect: usize, fatal_logs: usize };
 pub const Driver = enum { storvsc, netvsc };
 
@@ -190,156 +192,21 @@ fn fixedSmp(model: Model, diagnostic: *Diagnostic) !void {
     if (!(init < get_active and get_active < set_active)) return error.PagingInitializationOrder;
 }
 
-pub fn updateRegisters(values: *[16]?u64, instruction: Instruction) void {
-    if (instruction.isCall()) {
-        for ([_]usize{ 0, 1, 2, 6, 7, 8, 9, 10, 11 }) |index| values[index] = null;
-        return;
-    }
-    if (instruction.isBarrier() or instruction.unknown()) {
-        values.* = @splat(null);
-        return;
-    }
-    for ([_][]const u8{ "cmp", "cmpb", "cmpw", "cmpl", "cmpq", "test", "testb", "testw", "testl", "testq", "nop", "nopl", "nopw", "endbr64", "endbr32", "pause", "cld", "std", "clc", "stc", "cmc", "lfence", "sfence", "mfence", "wrmsr", "cli", "sti" }) |neutral|
-        if (std.mem.eql(u8, instruction.op, neutral)) return;
-    if (std.mem.startsWith(u8, instruction.op, "push") or
-        (std.mem.startsWith(u8, instruction.op, "pop") and !std.mem.startsWith(u8, instruction.op, "popcnt")))
-    {
-        values[4] = null;
-        if (std.mem.startsWith(u8, instruction.op, "pop")) {
-            if (assembly.register(instruction.operands)) |destination| values[destination] = null;
-        }
-        return;
-    }
-    // Only model reviewed GP writers; unknown/implicit writers kill provenance.
-    for ([_][]const u8{ "cmpxchg", "movs", "lods", "stos", "scas", "cmps" }) |implicit| {
-        if (std.mem.startsWith(u8, instruction.op, implicit)) {
-            values.* = @splat(null);
-            return;
-        }
-    }
-    var reviewed = false;
-    for ([_][]const u8{ "mov", "lea", "add", "adc", "sub", "sbb", "and", "or", "xor", "shl", "shr", "sal", "sar", "rol", "ror", "inc", "dec", "neg", "not", "bsf", "bsr", "bswap", "lzcnt", "tzcnt", "popcnt", "set", "cmov", "bts", "btr", "btc", "xchg", "xadd", "mul", "imul", "div", "idiv" }) |prefix| {
-        if (std.mem.startsWith(u8, instruction.op, prefix)) reviewed = true;
-    }
-    if (!reviewed) {
-        values.* = @splat(null);
-        return;
-    }
-    if (std.mem.startsWith(u8, instruction.op, "mul") or std.mem.startsWith(u8, instruction.op, "div") or
-        std.mem.startsWith(u8, instruction.op, "imul") or std.mem.startsWith(u8, instruction.op, "idiv"))
-    {
-        values[0] = null;
-        values[2] = null;
-    }
-    const pair = operands(instruction) orelse {
-        if (!std.mem.startsWith(u8, instruction.op, "push")) {
-            if (assembly.register(instruction.operands)) |destination| values[destination] = null;
-        }
-        return;
-    };
-    if (std.mem.startsWith(u8, instruction.op, "xchg") or std.mem.startsWith(u8, instruction.op, "xadd")) {
-        if (assembly.register(pair[0])) |source| values[source] = null;
-    }
-    const destination = assembly.register(pair[1]) orelse return;
-    const supported = std.mem.eql(u8, instruction.op, "mov") or std.mem.eql(u8, instruction.op, "movq") or
-        std.mem.eql(u8, instruction.op, "movl") or std.mem.eql(u8, instruction.op, "movabsq") or std.mem.eql(u8, instruction.op, "movabs") or
-        std.mem.eql(u8, instruction.op, "lea") or std.mem.eql(u8, instruction.op, "leaq") or std.mem.eql(u8, instruction.op, "leal");
-    const width = assembly.registerWidth(pair[1]).?;
-    if (!supported or width < 32) {
-        values[destination] = null;
-        return;
-    }
-    var value: ?u64 = if (std.mem.startsWith(u8, instruction.op, "lea"))
-        instruction.reference()
-    else if (assembly.register(pair[0])) |source|
-        values[source]
-    else
-        assembly.immediate(pair[0]);
-    if (value != null and width == 32) value = @as(u32, @truncate(value.?));
-    values[destination] = value;
-}
-
-fn updatePointerRegisters(values: *[16]?u64, instruction: Instruction, position_independent: bool) void {
-    updateRegisters(values, instruction);
-    if (!position_independent) return;
-    const pair = operands(instruction) orelse return;
-    const destination = assembly.register(pair[1]) orelse return;
-    if (std.mem.startsWith(u8, instruction.op, "mov") and assembly.immediate(pair[0]) != null) {
-        values[destination] = null;
-        return;
-    }
-    if (assembly.registerWidth(pair[1]).? < 64 and
-        !std.mem.startsWith(u8, instruction.op, "cmp") and !std.mem.startsWith(u8, instruction.op, "test"))
-        values[destination] = null;
-}
-
-pub fn callbackStored(instructions: []const Instruction, callback: u64, position_independent: bool) bool {
-    var values: [16]?u64 = @splat(null);
-    for (instructions) |instruction| {
-        if (operands(instruction)) |pair| {
-            const value = if (assembly.register(pair[0])) |source| values[source] else assembly.immediate(pair[0]);
-            const wide = std.mem.eql(u8, instruction.op, "movq") or
-                (std.mem.eql(u8, instruction.op, "mov") and assembly.registerWidth(pair[0]) == 64);
-            const absolute: ?u64 = assembly.hex(pair[1]) catch null;
-            if (wide and value == callback and (!position_independent or assembly.register(pair[0]) != null) and assembly.register(pair[1]) == null and
-                (std.mem.indexOfScalar(u8, pair[1], '(') != null or absolute != null))
-                return true;
-        }
-        updatePointerRegisters(&values, instruction, position_independent);
-    }
-    return false;
-}
-
 fn boundArgument(model: Model, caller: []const u8, callee: []const u8, argument_register: u4, value: u64) !bool {
-    const destination = try model.address(callee);
-    var values: [16]?u64 = @splat(null);
-    for (try model.body(caller)) |instruction| {
-        if ((instruction.isCall() or std.mem.eql(u8, instruction.op, "jmp") or std.mem.eql(u8, instruction.op, "jmpq")) and
-            !instruction.indirect() and try instruction.target() == destination and values[argument_register] == value)
-            return true;
-        updatePointerRegisters(&values, instruction, model.image.header.type == .DYN);
-    }
-    return false;
+    return binding.arguments(model, caller, callee, argument_register, &.{value});
 }
 
 fn schedcoopCallbacks(model: Model, diagnostic: *Diagnostic) !void {
-    const callback = try model.address("schedcoop_thread_woken_isr");
-    var constructors: usize = 0;
-    for ([_][]const u8{ "uk_schedcoop_create", "uk_schedcoop_create_on" }) |name| {
-        const constructor = (try model.maybeSymbol(name)) orelse continue;
-        constructors += 1;
-        diagnostic.subject = name;
-        var pending: std.ArrayList(u64) = .empty;
-        defer pending.deinit(model.image.allocator);
-        var visited = std.AutoHashMap(u64, void).init(model.image.allocator);
-        defer visited.deinit();
-        try pending.append(model.image.allocator, constructor.header.st_value);
-        var bound = false;
-        while (pending.pop()) |address| {
-            const entry = try visited.getOrPut(address);
-            if (entry.found_existing) continue;
-            const instructions = try model.program.body(address);
-            if (callbackStored(instructions, callback, model.image.header.type == .DYN)) bound = true;
-            for (instructions) |instruction| {
-                if (!instruction.isBranch() or instruction.indirect()) continue;
-                const destination = try instruction.target();
-                if (model.hasNameAt(destination, "schedcoop_create"))
-                    try pending.append(model.image.allocator, destination);
-            }
-        }
-        if (!bound) return error.MissingSchedulerCallbackBinding;
-    }
-    if (constructors == 0) return error.MissingSchedulerConstructor;
+    diagnostic.* = .{ .subject = "scheduler callback slot" };
+    try binding.scheduler(model);
 }
 
 fn irqRegistrations(model: Model, diagnostic: *Diagnostic) !void {
-    diagnostic.subject = "ukplat_time_init";
+    diagnostic.* = .{ .subject = "ukplat_time_init" };
     if (!try boundArgument(model, diagnostic.subject, "uk_intctlr_time_pending_register", 7, try model.address(irq_roots[2])))
         return error.MissingSynicCallbackBinding;
-    for (irq_roots[0..2]) |callback| {
-        if (!try boundArgument(model, diagnostic.subject, "uk_intctlr_irq_register", 6, try model.address(callback)))
-            return error.MissingSynicCallbackBinding;
-    }
+    if (!try binding.arguments(model, diagnostic.subject, "uk_intctlr_irq_register", 6, &.{ try model.address(irq_roots[0]), try model.address(irq_roots[1]) }))
+        return error.MissingSynicCallbackBinding;
 }
 
 pub fn irq(model: Model, diagnostic: *Diagnostic) !IrqReport {
@@ -367,6 +234,8 @@ pub fn irq(model: Model, diagnostic: *Diagnostic) !IrqReport {
     defer pending.deinit(model.image.allocator);
     var visited = std.AutoHashMap(u64, void).init(model.image.allocator);
     defer visited.deinit();
+    var functions = std.AutoHashMap(u64, void).init(model.image.allocator);
+    defer functions.deinit();
     var counts = [_]usize{0} ** 3;
     var fatal_logs: usize = 0;
     try pending.append(model.image.allocator, try model.address(indirect_callers[0]));
@@ -374,37 +243,38 @@ pub fn irq(model: Model, diagnostic: *Diagnostic) !IrqReport {
     while (pending.pop()) |address| {
         const visit = try visited.getOrPut(address);
         if (visit.found_existing) continue;
-        const instructions = try model.program.body(address);
-        const function = model.program.functions.items[model.program.function_index.get(address).?];
-        diagnostic.subject = function.name;
-        for (instructions, 0..) |instruction, index| {
-            if (instruction.unknown()) return error.UnsupportedIrqInstruction;
-            if (forbiddenRegisters(instruction)) return error.UnsavedFpSimd;
-            if (!instruction.isBranch()) continue;
+        if (visited.count() > 131072) return error.ControlFlowLimit;
+        const function = try model.functionAt(address);
+        try functions.put(function.start, {});
+        const instructions = try model.bodyAt(address);
+        const instruction = instructions[0];
+        diagnostic.* = .{ .subject = function.name, .address = address, .opcode = instruction.op };
+        if (instruction.unknown()) return error.UnsupportedIrqInstruction;
+        if (forbiddenRegisters(instruction)) return error.UnsavedFpSimd;
+        if (instruction.isBranch()) {
             if (instruction.indirect()) {
                 var caller: ?usize = null;
                 for (indirect_callers, 0..) |name, caller_index| {
-                    if (try model.address(name) == address) caller = caller_index;
+                    if (try model.address(name) == function.start) caller = caller_index;
                 }
                 if (caller == null or !instruction.isCall()) return error.UnreviewedIndirectEdge;
                 if (caller.? == 2) try schedcoopCallbacks(model, diagnostic);
                 if (caller.? == 1) try irqRegistrations(model, diagnostic);
+                diagnostic.* = .{ .subject = function.name, .address = address, .opcode = instruction.op };
                 counts[caller.?] += 1;
                 for (indirect_targets[caller.?]) |callback|
                     try pending.append(model.image.allocator, try model.address(callback));
-                continue;
+            } else {
+                const destination = try instruction.target();
+                if (printk != null and destination == printk.?.header.st_value and terminalAssertion(instructions, 0)) {
+                    fatal_logs += 1;
+                } else try pending.append(model.image.allocator, destination);
             }
-            const destination = try instruction.target();
-            var local = false;
-            for (instructions) |candidate| if (candidate.address == destination) {
-                local = true;
-            };
-            if (local) continue;
-            if (printk != null and destination == printk.?.header.st_value and terminalAssertion(instructions, index)) {
-                fatal_logs += 1;
-                continue;
-            }
-            try pending.append(model.image.allocator, destination);
+        }
+        if (!instruction.stops() and !instruction.isJump()) {
+            const next = try std.math.add(u64, address, instruction.size);
+            _ = try model.functionAt(next);
+            try pending.append(model.image.allocator, next);
         }
     }
     for (irq_roots ++ [_][]const u8{
@@ -413,11 +283,11 @@ pub fn irq(model: Model, diagnostic: *Diagnostic) !IrqReport {
         "vmbus_protocol_version",         "uk_thread_wake_isr",
         "schedcoop_thread_woken_isr",
     }) |name| {
-        diagnostic.subject = name;
+        diagnostic.* = .{ .subject = name };
         if (!visited.contains(try model.address(name))) return error.MissingIrqReachability;
     }
     if (!std.mem.eql(usize, &counts, &.{ 1, 2, 1 })) return error.UnreviewedIndirectCount;
-    return .{ .functions = visited.count(), .indirect = 4, .fatal_logs = fatal_logs };
+    return .{ .functions = functions.count(), .indirect = 4, .fatal_logs = fatal_logs };
 }
 
 pub fn drivers(model: Model, required: []const Driver, diagnostic: *Diagnostic) !void {

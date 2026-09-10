@@ -28,7 +28,20 @@ static volatile unsigned int proof_fail;
 static volatile unsigned int proof_counter;
 static int (*volatile irq_callback)(void *);
 static void (*volatile time_callback)(void);
+#if PROOF_OBJECT_SCHED
+struct proof_thread;
+struct proof_sched {
+	void (*other[3])(struct proof_sched *, struct proof_thread *);
+	void (*wake)(struct proof_sched *, struct proof_thread *);
+};
+struct proof_thread { long reserved; struct proof_sched *sched; };
+static struct proof_sched proof_scheduler;
+static struct proof_thread proof_thread;
+static struct proof_sched *volatile published_sched;
+#else
 static void (*volatile wake_callback)(void);
+#endif
+static volatile unsigned long proof_pending;
 static const struct vmbus_driver *volatile registered_driver;
 unsigned int proof_ctor_writable __attribute__((section(".proof_rw")));
 
@@ -47,6 +60,19 @@ FN void _uk_printk(void)
 	__asm__ volatile(".byte 0x66, 0x0f, 0xef, 0xc0"); /* worker-only pxor */
 }
 
+#if PROOF_OBJECT_SCHED
+FN void schedcoop_thread_woken_isr(struct proof_sched *sched, struct proof_thread *thread)
+{
+	(void)sched;
+	(void)thread;
+	proof_counter++;
+}
+
+FN void uk_thread_wake_isr(struct proof_thread *thread)
+{
+	thread->sched->wake(thread->sched, thread);
+}
+#else
 FN void schedcoop_thread_woken_isr(void)
 {
 	proof_counter++;
@@ -56,6 +82,7 @@ FN void uk_thread_wake_isr(void)
 {
 	wake_callback();
 }
+#endif
 
 FN int hyperv_message_irq(void *arg)
 {
@@ -74,12 +101,17 @@ FN int hyperv_timer_irq(void *arg)
 	(void)arg;
 	hyperv_synic_event_take_word_page();
 	hyperv_vmbus_event();
+#if PROOF_OBJECT_SCHED
+	uk_thread_wake_isr(&proof_thread);
+#else
 	uk_thread_wake_isr();
+#endif
 	return 0;
 }
 
 FN void hyperv_time_mark_pending(void)
 {
+	__asm__ volatile("lock; orq $1, %0" : "+m"(proof_pending) : : "memory", "cc");
 	hyperv_vmbus_event_word();
 }
 
@@ -99,6 +131,8 @@ FN int uk_intctlr_time_pending_register(void (*callback)(void))
 
 FN void ukplat_time_init(void)
 {
+	if (proof_fail)
+		proof_counter++;
 	uk_intctlr_time_pending_register(hyperv_time_mark_pending);
 	uk_intctlr_irq_register(1, hyperv_message_irq, NULL);
 	uk_intctlr_irq_register(2, hyperv_timer_irq, NULL);
@@ -128,8 +162,42 @@ FN void uk_plat_native_except_irq_handler(void)
 	(*entry)(NULL);
 }
 
+#if PROOF_OBJECT_SCHED
+FN void uk_sched_register(struct proof_sched *sched)
+{
+	published_sched = sched;
+}
+FN struct proof_sched *proof_sched_allocate(void)
+{
+	return proof_fail ? NULL : &proof_scheduler;
+}
+FN void proof_sched_initialize(struct proof_sched *sched,
+			       void (*callback)(struct proof_sched *, struct proof_thread *))
+{
+	sched->wake = callback;
+	uk_sched_register(sched);
+}
+FN struct proof_sched *schedcoop_create(void)
+{
+	struct proof_sched *sched = proof_sched_allocate();
+	if (!sched)
+		return NULL;
+	proof_sched_initialize(sched, schedcoop_thread_woken_isr);
+	return sched;
+}
+FN struct proof_sched *uk_schedcoop_create(void)
+{
+	return schedcoop_create();
+}
+__attribute__((naked)) struct proof_sched *uk_schedcoop_create_on(void)
+{
+	__asm__ volatile("jmp schedcoop_create");
+}
+#else
 FN void schedcoop_create(void)
 {
+	if (proof_fail)
+		proof_counter++;
 	wake_callback = schedcoop_thread_woken_isr;
 }
 
@@ -146,6 +214,7 @@ __attribute__((naked)) void uk_schedcoop_create_on(void)
 {
 	__asm__ volatile("jmp schedcoop_create");
 }
+#endif
 
 FN void ukplat_lcpu_init_hook(void) { proof_counter++; }
 FN void ukplat_lcpu_fini_hook(void) { hyperv_vmbus_shutdown(); }
@@ -252,7 +321,11 @@ FN void _start(void)
 	uk_boot_entry();
 	uk_lcpu_init();
 	ukplat_time_init();
+#if PROOF_OBJECT_SCHED
+	proof_thread.sched = uk_schedcoop_create();
+#else
 	uk_schedcoop_create();
+#endif
 	uk_schedcoop_create_on();
 	uk_plat_native_except_irq_handler();
 	lcpu_halt();

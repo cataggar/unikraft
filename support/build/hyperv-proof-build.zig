@@ -39,8 +39,9 @@ pub fn tests(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step {
     });
     const config = b.addWriteFiles();
     _ = config.add("uk/bits/config.h", "/* Native, freestanding proof fixture configuration. */\n");
-    for ([_]struct { name: []const u8, cpus: u32, fixed: bool, paging: bool, pie: bool = true, direct_scheduler: bool = false }{
+    for ([_]struct { name: []const u8, cpus: u32, fixed: bool, paging: bool, pie: bool = true, direct_scheduler: bool = false, object_scheduler: bool = false }{
         .{ .name = "fixed", .cpus = 4, .fixed = true, .paging = true },
+        .{ .name = "fixed-object", .cpus = 4, .fixed = true, .paging = true, .object_scheduler = true },
         .{ .name = "fixed-static", .cpus = 4, .fixed = true, .paging = true, .pie = false, .direct_scheduler = true },
         .{ .name = "fixed-no-paging", .cpus = 4, .fixed = true, .paging = false },
         .{ .name = "multi-nonfixed", .cpus = 4, .fixed = false, .paging = false },
@@ -63,9 +64,10 @@ pub fn tests(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step {
         executable.root_module.addCSourceFile(.{
             .file = root.path(b, "support/build/tests/hyperv-proof-fixture.c"),
             .flags = &.{
-                "-std=gnu11",                                   "-ffreestanding",                                               "-fno-builtin",                                               "-fno-stack-protector",                                                       if (options.pie) "-fno-optimize-sibling-calls" else "-foptimize-sibling-calls",
-                "-ffunction-sections",                          "-fdata-sections",                                              "-mno-sse",                                                   "-mno-mmx",                                                                   "-mno-red-zone",
-                b.fmt("-DPROOF_MAX_CPUS={d}", .{options.cpus}), b.fmt("-DPROOF_FIXED_SMP={d}", .{@intFromBool(options.fixed)}), b.fmt("-DPROOF_PAGING={d}", .{@intFromBool(options.paging)}), b.fmt("-DPROOF_DIRECT_SCHED={d}", .{@intFromBool(options.direct_scheduler)}),
+                "-std=gnu11",                                                                 "-ffreestanding",                                               "-fno-builtin",                                               "-fno-stack-protector",                                                       if (options.pie) "-fno-optimize-sibling-calls" else "-foptimize-sibling-calls",
+                "-ffunction-sections",                                                        "-fdata-sections",                                              "-mno-sse",                                                   "-mno-mmx",                                                                   "-mno-red-zone",
+                b.fmt("-DPROOF_MAX_CPUS={d}", .{options.cpus}),                               b.fmt("-DPROOF_FIXED_SMP={d}", .{@intFromBool(options.fixed)}), b.fmt("-DPROOF_PAGING={d}", .{@intFromBool(options.paging)}), b.fmt("-DPROOF_DIRECT_SCHED={d}", .{@intFromBool(options.direct_scheduler)}), "-fpatchable-function-entry=2",
+                b.fmt("-DPROOF_OBJECT_SCHED={d}", .{@intFromBool(options.object_scheduler)}),
             },
         });
         executable.setLinkerScript(root.path(b, "support/build/tests/hyperv-proof-fixture.lds"));

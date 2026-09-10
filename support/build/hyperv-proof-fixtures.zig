@@ -5,6 +5,7 @@ const tool = @import("hyperv-proof-tool.zig");
 const commands = @import("native-postprocess-runner.zig");
 const model_module = @import("hyperv-proof-image.zig");
 const assembly = @import("hyperv-proof-disasm.zig");
+const flow = @import("hyperv-proof-flow.zig");
 
 const Fixture = struct {
     allocator: std.mem.Allocator,
@@ -215,13 +216,130 @@ pub fn main(init: std.process.Init) !void {
     try fixture.check(object_path, "irq", 1, "UnsupportedImageType");
     if (std.mem.eql(u8, args[6], "fixed")) {
         try mutations(&fixture);
+        try reviewRegressions(&fixture);
         try processCases(&fixture, args[0], image_path, nm_text, dump);
     }
+    if (std.mem.eql(u8, args[6], "fixed-object")) try objectRegressions(&fixture);
     if (std.mem.eql(u8, args[6], "single"))
         try fixture.cli(&.{ "smp", "--image", image_path, "--max-cpus", "2", "--nm", nm, "--objdump", objdump }, 1, null);
     const report = try std.fmt.allocPrint(allocator, "PASS: {s}: {d} native CLI cases; real C/Zig object + linked ELF, never executed as a guest\n", .{ args[6], fixture.cases });
     try commands.write(init.io, try std.fs.path.join(allocator, &.{ root, "summary.txt" }), report);
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
+}
+
+fn interiorLabel(f: Fixture, bytes: []u8, name: []const u8, address: u64) !void {
+    const item = try f.model.symbol(name);
+    const offset = try f.symbolOffset("proof_ctor_writable");
+    bytes[offset + 4] = @as(u8, std.elf.STB_GLOBAL) << 4;
+    std.mem.writeInt(u16, bytes[offset + 6 ..][0..2], item.header.st_shndx, .little);
+    std.mem.writeInt(u64, bytes[offset + 8 ..][0..8], address, .little);
+    std.mem.writeInt(u64, bytes[offset + 16 ..][0..8], 0, .little);
+}
+
+fn bypass(f: Fixture, bytes: []u8, caller: []const u8, callee: []const u8) !void {
+    const start = try f.model.address(caller);
+    const target = (try f.edge(caller, callee)).address;
+    const offset = try f.at(start, 2);
+    try std.testing.expectEqualSlices(u8, &.{ 0x66, 0x90 }, bytes[offset..][0..2]);
+    bytes[offset] = 0xeb;
+    bytes[offset + 1] = @bitCast(@as(i8, @intCast(@as(i128, target) - start - 2)));
+}
+
+fn reviewRegressions(f: *Fixture) !void {
+    const callback_name = "schedcoop_thread_woken_isr";
+    const callback = try f.model.symbol(callback_name);
+    {
+        const bytes = try f.edit();
+        try interiorLabel(f.*, bytes, callback_name, callback.header.st_value + 2);
+        const path = try f.save("valid-interior-fallthrough-label", bytes);
+        try f.check(path, "irq", 0, null);
+        const symbol_offset = try f.symbolOffset("proof_ctor_writable");
+        bytes[symbol_offset + 4] |= std.elf.STT_FUNC;
+        std.mem.writeInt(u64, bytes[symbol_offset + 16 ..][0..8], callback.header.st_size - 2, .little);
+        try f.check(try f.save("valid-nested-function-alias", bytes), "irq", 0, null);
+        std.mem.writeInt(u64, bytes[symbol_offset + 16 ..][0..8], callback.header.st_size, .little);
+        try f.refuse("partially-overlapping-function-extents", bytes, "irq", "AmbiguousFunctionExtent");
+    }
+    {
+        const bytes = try f.edit();
+        const start = try f.at(callback.header.st_value, @intCast(callback.header.st_size));
+        try std.testing.expect(callback.header.st_size >= 7);
+        @memset(bytes[start..][0..@intCast(callback.header.st_size)], 0x90);
+        @memcpy(bytes[start + 2 ..][0..4], &[_]u8{ 0x66, 0x0f, 0xef, 0xc0 });
+        bytes[start + 6] = 0xc3;
+        try f.refuse("simd-before-label-mutation", bytes, "irq", "UnsavedFpSimd");
+        const executed = try f.allocator.dupe(u8, bytes[start..][0..@intCast(callback.header.st_size)]);
+        try interiorLabel(f.*, bytes, callback_name, callback.header.st_value + 2);
+        try std.testing.expectEqualSlices(u8, executed, bytes[start..][0..executed.len]);
+        try f.refuse("single-symbol-cannot-hide-simd", bytes, "irq", "UnsavedFpSimd");
+        for ([_]u8{ 0xf4, 0xcc }) |opcode| {
+            bytes[start] = opcode;
+            try f.refuse("halt-or-trap-resume-cannot-hide-simd", bytes, "irq", "UnsavedFpSimd");
+        }
+        @memset(bytes[start..][0..@intCast(callback.header.st_size)], 0x90);
+        @memcpy(bytes[start..][0..5], &[_]u8{ 0xf0, 0x83, 0xc8, 0x01, 0xc3 });
+        try interiorLabel(f.*, bytes, callback_name, callback.header.st_value + 4);
+        try f.refuse("invalid-register-lock-remains-unknown", bytes, "irq", "UnsupportedIrqInstruction");
+    }
+    var stores: usize = 0;
+    for (try f.model.body("schedcoop_create")) |instruction| {
+        const operands = flow.pair(instruction) orelse continue;
+        if (!flow.memory(.{}, instruction, operands[1]).addressIs(try f.model.address("wake_callback"), true)) continue;
+        const bytes = try f.edit();
+        try std.testing.expectEqual(7, instruction.size);
+        const target = try f.model.address("registered_driver");
+        const delta: i32 = @intCast(@as(i128, target) - instruction.address - instruction.size);
+        std.mem.writeInt(i32, bytes[try f.at(instruction.address + instruction.size - 4, 4)..][0..4], delta, .little);
+        try f.refuse("single-store-displacement-wrong-object", bytes, "irq", "MissingSchedulerCallbackBinding");
+        stores += 1;
+    }
+    try std.testing.expectEqual(1, stores);
+    for ([_][3][]const u8{
+        .{ "libstorvsc_vmbus_register_driver", "_vmbus_register_driver", "drivers" },
+        .{ "ukplat_time_init", "uk_intctlr_time_pending_register", "irq" },
+    }) |case| {
+        const bytes = try f.edit();
+        try bypass(f.*, bytes, case[0], case[1]);
+        try f.refuse("single-jump-bypasses-argument", bytes, case[2], if (std.mem.eql(u8, case[2], "drivers")) "DriverArgumentMismatch" else "MissingSynicCallbackBinding");
+    }
+}
+
+fn objectRegressions(f: *Fixture) !void {
+    const initializer = try f.model.body("proof_sched_initialize");
+    var stores: usize = 0;
+    for (initializer) |instruction| {
+        const operands = flow.pair(instruction) orelse continue;
+        if (!std.mem.eql(u8, operands[1], "0x18(%rdi)")) continue;
+        const bytes = try f.edit();
+        try std.testing.expectEqual(4, instruction.size);
+        bytes[try f.at(instruction.address + 3, 1)] = 0x10;
+        try f.refuse("object-initializer-wrong-field", bytes, "irq", "MissingSchedulerCallbackBinding");
+        stores += 1;
+    }
+    try std.testing.expectEqual(1, stores);
+    var guards: usize = 0;
+    for (try f.model.body("schedcoop_create")) |instruction| {
+        if (!std.mem.eql(u8, instruction.op, "testq") or !std.mem.eql(u8, instruction.operands, "%rax, %rax")) continue;
+        const bytes = try f.edit();
+        const offset = try f.at(instruction.address, 3);
+        try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x85, 0xc0 }, bytes[offset..][0..3]);
+        bytes[offset] = 0x40;
+        try f.refuse("object-null-test-must-be-pointer-width", bytes, "irq", "MissingSchedulerCallbackBinding");
+        guards += 1;
+    }
+    try std.testing.expectEqual(1, guards);
+    {
+        const bytes = try f.edit();
+        try bypass(f.*, bytes, "proof_sched_initialize", "uk_sched_register");
+        try f.refuse("object-initializer-bypasses-store", bytes, "irq", "MissingSchedulerCallbackBinding");
+    }
+    {
+        const bytes = try f.edit();
+        const start = try f.model.address("proof_sched_initialize");
+        try interiorLabel(f.*, bytes, "proof_sched_initialize", start + 2);
+        const path = try f.save("valid-shared-initializer-label", bytes);
+        try f.check(path, "irq", 0, null);
+    }
 }
 
 fn mutations(f: *Fixture) !void {
