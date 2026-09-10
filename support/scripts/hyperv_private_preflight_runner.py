@@ -71,9 +71,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "621725cd3b92b2a4bc33975b47f9792c7c6343c6ce05709aa16e3f70aaa4d515"
+            "30c7c731ad8acc6438f57b8109b0d26bf947cfc54e6d0e87e4821d6db1db7a38"
         ),
-        "size": 1188308,
+        "size": 1195715,
         "files": 177,
     },
 }
@@ -223,7 +223,7 @@ GUARDED_PRODUCER_FILES = {
         "e0e666ff4faefc2ba1186403a4320170fb3163375cc31a04312bbce011aa9f10"
     ),
     "drivers/hyperv/storvsc/storvsc.c": (
-        "e0d9977fbc6ff6e5047a05dc1b19b8876289ff5e27fc02f8532b3b5d732658da"
+        "42e59853180fa7aa039e0895fe6d217d4fcbf0874d6cdb927dad4237ab92a6f0"
     ),
     "drivers/hyperv/storvsc/storvsc_core.h": (
         "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
