@@ -655,7 +655,7 @@ class PrivatePreflightFixture(unittest.TestCase):
             "location": preflight.LOCATION,
             "provisioningState": "Succeeded",
             "hardwareProfile": {"vmSize": preflight.VM_SIZE},
-            "securityProfile": {"securityType": "Standard"},
+            "securityProfile": None,
             "networkProfile": {
                 "networkInterfaces": [{
                     "id": run.expected_host_ids()["nic_id"],
@@ -693,6 +693,21 @@ class PrivatePreflightFixture(unittest.TestCase):
             "location": preflight.LOCATION,
         }
         return vm, disk
+
+    @staticmethod
+    def arm_vm(vm):
+        properties = copy.deepcopy({
+            name: vm[name]
+            for name in ("vmId", "provisioningState", "storageProfile")
+        })
+        os_disk = properties["storageProfile"]["osDisk"]
+        os_disk["diskSizeGB"] = os_disk.pop("diskSizeGb")
+        properties["securityProfile"] = {"securityType": "Standard"}
+        return {
+            "id": vm["id"], "tags": copy.deepcopy(vm["tags"]),
+            "type": vm["type"],
+            "properties": properties,
+        }
 
     def deployment(self, run, state, provisioning="Succeeded"):
         receipt = state["host_deployment"]
@@ -2984,6 +2999,7 @@ class PrivatePreflightTemplateTest(PrivatePreflightFixture):
             vm["properties"]["securityProfile"],
             {"securityType": "Standard"},
         )
+        self.assertEqual(vm["apiVersion"], preflight.HOST_COMPUTE_API_VERSION)
         nic = next(
             item for item in resources
             if item["type"] == "Microsoft.Network/networkInterfaces"
@@ -4161,11 +4177,106 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 run.verify_deployed_envelope()
             run.az.assert_not_called()
 
+    def test_security_read_is_versioned_and_bound_to_original_vm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            vm, _ = self.vm_disk(run, state)
+            self.assertIsNone(vm["securityProfile"])
+            resource = self.arm_vm(vm)
+            resource["properties"]["securityProfile"].update({
+                "encryptionAtHost": False,
+                "encryptionIdentity": None,
+                "proxyAgentSettings": None,
+                "uefiSettings": None,
+            })
+            original = copy.deepcopy(state)
+            run.az.return_value = resource
+            run.verify_host_security_profile()
+            run.az.assert_called_once_with([
+                "resource", "show", "--ids", state["host_deployment"]["vm_id"],
+                "--api-version", "2025-11-01",
+            ])
+            self.assertEqual(state, original)
+
+    def test_versioned_security_read_rejects_missing_or_nonstandard_profile(self):
+        for profile in (
+            None, {}, {"securityType": None},
+            {"securityType": "TrustedLaunch"},
+            {"securityType": "ConfidentialVM"},
+            {"securityType": "standard"},
+            {"securityType": "Standard", "encryptionAtHost": True},
+            {"securityType": "Standard", "encryptionAtHost": 0},
+            {"securityType": "Standard", "encryptionIdentity": {}},
+            {"securityType": "Standard", "proxyAgentSettings": {}},
+            {"securityType": "Standard", "uefiSettings": {}},
+            {"securityType": "Standard", "unknown": None},
+        ):
+            with self.subTest(profile=profile), \
+                    tempfile.TemporaryDirectory() as temporary:
+                run, state = self.run_fixture(Path(temporary))
+                self.begin_operation(run, state)
+                vm, _ = self.vm_disk(run, state)
+                resource = self.arm_vm(vm)
+                resource["properties"]["securityProfile"] = profile
+                run.az.return_value = resource
+                with self.assertRaisesRegex(RuntimeError, "security profile"):
+                    run.verify_host_security_profile()
+
+    def test_versioned_security_read_rejects_identity_and_shape_drift(self):
+        for mutation in (
+            "resource-id", "vm-uuid", "attachment", "operation", "state",
+            "properties", "response", "resource-type", "tags",
+            "storage-profile", "os-disk", "managed-disk",
+        ):
+            with self.subTest(mutation=mutation), \
+                    tempfile.TemporaryDirectory() as temporary:
+                run, state = self.run_fixture(Path(temporary))
+                self.begin_operation(run, state)
+                vm, _ = self.vm_disk(run, state)
+                resource = self.arm_vm(vm)
+                if mutation == "resource-id":
+                    resource["id"] += "-replacement"
+                elif mutation == "vm-uuid":
+                    resource["properties"]["vmId"] = (
+                        "77777777-7777-4777-8777-777777777777"
+                    )
+                elif mutation == "attachment":
+                    resource["properties"]["storageProfile"]["osDisk"][
+                        "managedDisk"
+                    ]["id"] += "-replacement"
+                elif mutation == "operation":
+                    resource["tags"]["preflight-operation"] = "foreign"
+                elif mutation == "state":
+                    resource["properties"]["provisioningState"] = "Updating"
+                elif mutation == "properties":
+                    resource["properties"] = None
+                elif mutation == "resource-type":
+                    resource["type"] = "Microsoft.Compute/disks"
+                elif mutation == "tags":
+                    resource["tags"] = None
+                elif mutation == "storage-profile":
+                    resource["properties"]["storageProfile"] = None
+                elif mutation == "os-disk":
+                    resource["properties"]["storageProfile"]["osDisk"] = None
+                elif mutation == "managed-disk":
+                    resource["properties"]["storageProfile"]["osDisk"][
+                        "managedDisk"
+                    ] = None
+                else:
+                    resource = []
+                original = copy.deepcopy(state)
+                run.az.return_value = resource
+                with self.assertRaises(RuntimeError):
+                    run.verify_host_security_profile()
+                self.assertEqual(state, original)
+
     def test_deployed_envelope_rejects_nat_on_private_subnet(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
             self.begin_operation(run, state)
             vm, disk = self.vm_disk(run, state)
+            arm_vm = self.arm_vm(vm)
             ids = run.expected_host_ids()
             run.verify_host_identity = mock.Mock(return_value=(vm, disk))
             nic = {
@@ -4235,7 +4346,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                     "locations": ["northeurope"],
                 }],
             }
-            run.az.side_effect = [nic, nsg, vnet, subnet]
+            run.az.side_effect = [arm_vm, nic, nsg, vnet, subnet]
             with self.assertRaisesRegex(RuntimeError, "subnet"):
                 run.verify_deployed_envelope()
             subnet["natGateway"] = None
@@ -4266,7 +4377,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             }
             run.az.reset_mock()
             run.az.side_effect = [
-                nic, nsg, vnet, subnet, storage, schedule,
+                arm_vm, nic, nsg, vnet, subnet, storage, schedule,
             ]
             run.verify_storage_rules = mock.Mock()
             run.verify_resource_inventory = mock.Mock()
@@ -4296,7 +4407,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             ):
                 with self.subTest(nsg=name):
                     run.az.reset_mock()
-                    run.az.side_effect = [nic, changed]
+                    run.az.side_effect = [arm_vm, nic, changed]
                     with self.assertRaisesRegex(RuntimeError, "NSG"):
                         run.verify_deployed_envelope()
 

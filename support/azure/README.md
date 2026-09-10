@@ -428,6 +428,20 @@ alongside canonical `V1` in either order; unknown, duplicate, empty, or
 whitespace-padded tokens fail. V1 support is not required. The same narrow
 admission does not apply to another SKU or region. It never changes region,
 image, SKU, or host in response to failure.
+
+Before staging public inputs, the controller reads the host security profile
+through `az resource show` with the already-required Compute API
+`2025-11-01`. Older VM read APIs can omit Standard security metadata;
+Microsoft documents an [explicit Standard result from this API version
+onward][compute-security-profile] (documentation source revision
+`fa7e6e741dd9fa1d9a45e595adeacff9d85fec38`). The unversioned `az vm show`
+result is not used to infer a security type. The versioned response must
+identify the original VM UUID, OS-disk attachment and operation ownership,
+and explicitly report `Standard`. Optional fields must be absent/null, apart
+from an explicitly disabled host-encryption flag. Missing, malformed or
+nonstandard security metadata still fails
+closed; live KVM capability proof remains mandatory.
+
 Operators can inspect the same immutable retail-image/SKU inputs without
 changing account defaults:
 
@@ -1120,6 +1134,7 @@ stress testing, and production readiness remain separate milestones.
 [azure-platform-nsg]: https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview#azure-platform-considerations
 [azure-platform-ip]: https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16
 [dsv5-nested]: https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/dsv5-series
+[compute-security-profile]: https://learn.microsoft.com/en-us/javascript/api/@azure/arm-compute/securityprofile?view=azure-node-latest
 [upload]: https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-upload-vhd-to-managed-disk-cli
 [miz-revision]: https://github.com/cataggar/miz/commit/2db68ca0c3ab12155012a823c3fb8d7aba1cb544
 [unikraft-revision]: https://github.com/cataggar/unikraft/commit/8c87f56ab3eaa71974812cd748c3a6bfa61c563b

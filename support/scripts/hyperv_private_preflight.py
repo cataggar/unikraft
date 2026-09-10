@@ -74,6 +74,7 @@ STATE_FILE = "state.json"
 LOCATION = "northeurope"
 VM_SIZE = "Standard_D2s_v5"
 VM_MEMORY_GB = 8
+HOST_COMPUTE_API_VERSION = "2025-11-01"
 FIXED_SKU_CAPABILITY_NAMES = (
     "CpuArchitectureType",
     "vCPUs",
@@ -3676,8 +3677,11 @@ def check_subscription(subscription):
         "--query",
         "resourceTypes[?resourceType=='virtualMachines'].apiVersions | [0]",
     ], subscription=subscription, private=True)
-    if not isinstance(versions, list) or "2025-11-01" not in versions:
-        raise RuntimeError("Compute API 2025-11-01 is required")
+    if (
+        not isinstance(versions, list)
+        or HOST_COMPUTE_API_VERSION not in versions
+    ):
+        raise RuntimeError(f"Compute API {HOST_COMPUTE_API_VERSION} is required")
     sku = azure.exact_vm_sku(
         LOCATION, VM_SIZE, subscription, vcpus=2, require_v2=True
     )
@@ -4631,6 +4635,57 @@ class PrivatePreflightRun(azure.AzureRun):
             "Private host deployment provenance could not be reconciled"
         ) from None
 
+    def verify_host_security_profile(self):
+        receipt = self.state["host_deployment"]
+        resource = self.az([
+            "resource", "show", "--ids", receipt["vm_id"],
+            "--api-version", HOST_COMPUTE_API_VERSION,
+        ])
+        if (
+            not isinstance(resource, dict)
+            or str(resource.get("type", "")).lower()
+            != "microsoft.compute/virtualmachines"
+            or not isinstance(resource.get("properties"), dict)
+        ):
+            raise RuntimeError("Private host security response is incompatible")
+        properties = resource["properties"]
+        storage_profile = properties.get("storageProfile")
+        if (
+            not isinstance(resource.get("tags"), dict)
+            or not isinstance(storage_profile, dict)
+            or not isinstance(storage_profile.get("osDisk"), dict)
+            or not isinstance(
+                storage_profile["osDisk"].get("managedDisk"), dict
+            )
+        ):
+            raise RuntimeError("Private host security response is incompatible")
+        self.verify_vm_identity({
+            **properties,
+            "id": resource.get("id"),
+            "tags": resource.get("tags"),
+        })
+        security = properties.get("securityProfile")
+        if (
+            properties.get("provisioningState") != "Succeeded"
+            or not isinstance(security, dict)
+            or not set(security).issubset({
+                "securityType", "encryptionAtHost", "encryptionIdentity",
+                "proxyAgentSettings", "uefiSettings",
+            })
+            or security.get("securityType") != "Standard"
+            or (
+                security.get("encryptionAtHost") is not None
+                and security["encryptionAtHost"] is not False
+            )
+            or any(
+                security.get(field) is not None
+                for field in (
+                    "encryptionIdentity", "proxyAgentSettings", "uefiSettings",
+                )
+            )
+        ):
+            raise RuntimeError("Private host security profile is incompatible")
+
     def verify_deployed_envelope(self):
         receipt = self.state["host_deployment"]
         vm, disk = self.settle_host_identity(min(
@@ -4642,13 +4697,11 @@ class PrivatePreflightRun(azure.AzureRun):
         os_disk = storage_profile.get("osDisk", {})
         image_reference = storage_profile.get("imageReference", {})
         interfaces = vm.get("networkProfile", {}).get("networkInterfaces")
-        security = vm.get("securityProfile")
         ids = self.expected_host_ids()
         if (
             vm.get("provisioningState") != "Succeeded"
             or vm.get("location") != LOCATION
             or vm.get("hardwareProfile", {}).get("vmSize") != VM_SIZE
-            or security != {"securityType": "Standard"}
             or storage_profile.get("dataDisks") != []
             or os_disk.get("diskSizeGb") != 32
             or os_disk.get("createOption") != "FromImage"
@@ -4671,6 +4724,7 @@ class PrivatePreflightRun(azure.AzureRun):
             or disk.get("hyperVGeneration") != "V2"
         ):
             raise RuntimeError("Private preflight host envelope is incompatible")
+        self.verify_host_security_profile()
         nic = self.az([
             "network", "nic", "show", "--resource-group", self.group,
             "--name", self.host_nic,
