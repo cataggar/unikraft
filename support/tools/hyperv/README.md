@@ -24,10 +24,10 @@ export ZIG_LOCAL_CACHE_DIR="$CORE_WORK/zig-local"
 # This Zig distribution restores beside the build file. Keep that operation
 # in scratch, then disable fetching for every source-tree build.
 cp support/tools/hyperv/build.zig support/tools/hyperv/build.zig.zon "$CORE_WORK/restore/"
-/home/g/.local/bin/zig build --build-file "$CORE_WORK/restore/build.zig" \
+zig build --build-file "$CORE_WORK/restore/build.zig" \
   --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" -j2
-/home/g/.local/bin/zig build --build-file support/tools/hyperv/build.zig \
+zig build --build-file support/tools/hyperv/build.zig \
   --system "$CORE_WORK/restore/zig-pkg" \
   --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
   --prefix "$CORE_WORK/out" -Dtest-root="$CORE_WORK/fixtures" \
@@ -99,7 +99,9 @@ unwrapped or formatted.
 `test-core`, `test-transfer` and `test-worker` are focused selectors; `test`
 depends on all three. Dependencies, including versions and package hashes, are
 pinned in both manifests; the SDK commits are documented in the transfer README.
-The parent owns CI selector/restore updates and producer-pin refresh.
+The required Hyper-V integration job restores dependencies in scratch and runs
+all three selectors in Debug and ReleaseSafe. It also exercises the standalone
+transfer build in ReleaseSafe, without implicit source-tree fetching.
 
 ## Module interfaces
 
