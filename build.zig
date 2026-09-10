@@ -9,6 +9,7 @@ const native_lto = @import("support/build/native-lto.zig");
 const native_postprocess = @import("support/build/native-postprocess.zig");
 const native_image_graph = @import("support/build/native-image-graph.zig");
 const native_target_object = @import("support/build/native-target-object.zig");
+const native_build_tools = @import("support/build/native-build-tools.zig");
 
 const supported_zig = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
 
@@ -225,14 +226,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const config_input = std.Build.LazyPath{ .cwd_relative = context.config };
+    const metadata_tool = native_build_tools.metadataTool(b, b.path("."));
     const metadata_path = std.fs.path.join(
         b.allocator,
         &.{ context.output, "native-config", "metadata.tsv" },
     ) catch @panic("out of memory");
     const metadata_input = std.Build.LazyPath{ .cwd_relative = metadata_path };
-    const export_config_metadata = b.addSystemCommand(&.{
-        "python3",
-        "support/build/native-config-metadata.py",
+    const export_config_metadata = b.addRunArtifact(metadata_tool);
+    export_config_metadata.addArgs(&.{
         "--base",
         context.base,
         "--app",
@@ -244,7 +245,6 @@ pub fn build(b: *std.Build) void {
     export_config_metadata.addFileArg(config_input);
     export_config_metadata.addArgs(&.{ "--metadata", metadata_path });
     export_config_metadata.setCwd(.{ .cwd_relative = root });
-    export_config_metadata.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     if (image_name_option) |image_name| {
         export_config_metadata.addArgs(&.{ "--image-name", image_name });
     }
@@ -1490,13 +1490,49 @@ pub fn build(b: *std.Build) void {
     hyperv_regression_tests.dependOn(
         &hyperv_private_preflight_fixtures.step,
     );
-    const lto_policy_tests = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/lto-symbol-policy-test.py",
+    const build_tools_tests = b.step(
+        "test-build-tools",
+        "Test native metadata, linker merge, final link and LTO policy without Make or Python",
+    );
+    for ([_][]const u8{ "native-config-metadata.zig", "lto-symbol-policy.zig" }) |source| {
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("support/build/{s}", .{source})),
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }),
+        });
+        const run = b.addRunArtifact(tests);
+        run.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+        build_tools_tests.dependOn(&run.step);
+    }
+    build_tools_tests.dependOn(&run_native_config_tests.step);
+    build_tools_tests.dependOn(&run_linker_script_tests.step);
+    build_tools_tests.dependOn(&run_final_link_tests.step);
+    build_tools_tests.dependOn(&run_native_lto_tests.step);
+    const policy_tool = b.addExecutable(.{
+        .name = "unikraft-lto-policy-fixture-tool",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/lto-symbol-policy.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
     });
-    lto_policy_tests.setCwd(.{ .cwd_relative = root });
-    lto_policy_tests.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
-    test_step.dependOn(&lto_policy_tests.step);
+    const build_tools_integration = b.addExecutable(.{
+        .name = "unikraft-build-tools-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/build-tools-integration.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_build_tools_integration = b.addRunArtifact(build_tools_integration);
+    run_build_tools_integration.addArtifactArg(metadata_tool);
+    run_build_tools_integration.addArtifactArg(native_config_tool);
+    run_build_tools_integration.addArtifactArg(policy_tool);
+    _ = run_build_tools_integration.addOutputDirectoryArg("native-build-tools-fixtures");
+    build_tools_tests.dependOn(&run_build_tools_integration.step);
+    test_step.dependOn(build_tools_tests);
     const integration_output = resolvePath(
         b.allocator,
         root,
@@ -1548,9 +1584,8 @@ pub fn build(b: *std.Build) void {
         root,
         "support/build/tests/native-config/external-platform/provider",
     );
-    const export_integration_metadata = b.addSystemCommand(&.{
-        "python3",
-        "support/build/native-config-metadata.py",
+    const export_integration_metadata = b.addRunArtifact(metadata_tool);
+    export_integration_metadata.addArgs(&.{
         "--base",
         root,
         "--app",
@@ -1565,7 +1600,6 @@ pub fn build(b: *std.Build) void {
         acme_platform,
     });
     export_integration_metadata.setCwd(.{ .cwd_relative = root });
-    export_integration_metadata.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     const inspect_acme_config = b.addRunArtifact(native_config_tool);
     inspect_acme_config.addArgs(&.{ "inspect", acme_config, integration_metadata });
     inspect_acme_config.setCwd(.{ .cwd_relative = root });
@@ -1608,9 +1642,8 @@ pub fn build(b: *std.Build) void {
         b.allocator,
         &.{ x86_integration_output, "config.h" },
     ) catch @panic("out of memory");
-    const export_x86_metadata = b.addSystemCommand(&.{
-        "python3",
-        "support/build/native-config-metadata.py",
+    const export_x86_metadata = b.addRunArtifact(metadata_tool);
+    export_x86_metadata.addArgs(&.{
         "--base",
         root,
         "--app",
@@ -1625,7 +1658,6 @@ pub fn build(b: *std.Build) void {
         fixture_library,
     });
     export_x86_metadata.setCwd(.{ .cwd_relative = root });
-    export_x86_metadata.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     const generate_x86_header = b.addRunArtifact(native_config_tool);
     generate_x86_header.addArgs(&.{ "header", x86_config, x86_metadata, x86_generated_header });
     generate_x86_header.setCwd(.{ .cwd_relative = root });
@@ -1680,9 +1712,8 @@ pub fn build(b: *std.Build) void {
         b.allocator,
         &.{ version_integration_output, "config.h" },
     ) catch @panic("out of memory");
-    const export_version_metadata = b.addSystemCommand(&.{
-        "python3",
-        "support/build/native-config-metadata.py",
+    const export_version_metadata = b.addRunArtifact(metadata_tool);
+    export_version_metadata.addArgs(&.{
         "--base",
         root,
         "--app",
@@ -1697,7 +1728,6 @@ pub fn build(b: *std.Build) void {
         version_library,
     });
     export_version_metadata.setCwd(.{ .cwd_relative = root });
-    export_version_metadata.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     export_version_metadata.step.dependOn(&prepare_version_fragment.step);
     const generate_version_header = b.addRunArtifact(native_config_tool);
     generate_version_header.addArgs(&.{

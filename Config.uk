@@ -121,7 +121,7 @@ config OPTIMIZE_LTO
 		-Dnative-profile=qemu-x86_64). Selecting this option with the
 		qemu-arm64 or hyperv-x86_64-efi native profiles is detected at
 		build time and rejected explicitly; non-LTO ARM64 builds are
-		unaffected. For the native path, a Python-based symbol-policy
+		unaffected. For the native path, a native Zig symbol-policy
 		step validates per-library private/export symbol references before
 		the final link and generates an LLD version script plus force-keep
 		response arguments that preserve per-library symbol locality and

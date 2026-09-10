@@ -207,7 +207,7 @@ When `CONFIG_OPTIMIZE_LTO=y` is active and the native profile is `qemu-x86_64`,
 the per-library partial-link and objcopy stages are bypassed entirely.
 `native-lto.zig` collects all library object and archive inputs in registration
 order and passes them directly to a single `zig cc -flto` final link.
-`lto-symbol-policy.py` runs before that link: it invokes the configured NM
+The native `lto-symbol-policy.zig` executable runs before that link: it invokes the configured NM
 tool (`llvm-nm`) on each library's objects/archives, reads export-symbol files,
 detects private-symbol collisions and illegal cross-library private references
 (both are explicit failures), and writes a deterministic LLD version script
@@ -218,6 +218,35 @@ generated after the GNU Make input step, allowing export lists produced in a
 clean output tree. Within the native pipeline, LTO is rejected at build time
 for `qemu-arm64` and `hyperv-x86_64-efi`; non-LTO ARM64 builds and the GNU Make
 backend are unaffected.
+
+## Native configuration metadata
+
+`native-config-metadata.zig` exports the sorted
+`unikraft-native-config-metadata-v1` symbol/platform model consumed by
+`native-config-tool.zig` and `kconfig.zig`. It links the existing C Kconfig
+parser through a small read-only bridge; it does not read configuration into
+the solver or change solved values. Linux Make `olddefconfig` and `syncconfig`
+remain responsible for solving Kconfig. Building the metadata executable
+requires the same native Bison/Flex tools used by the C solver, plus libc.
+
+The exporter preserves version.mk/gitsha1 defaults, environment-expanded
+sources, image-name precedence, external roots and exclusions. Platform
+registrations must name defined symbols and form a bijection; duplicate,
+conflicting and missing external registrations fail. Unchanged metadata is
+not rewritten.
+
+Run the focused native unit and CLI fixtures (no Make or Python execution):
+
+```sh
+zig build test-build-tools -j2
+```
+
+This includes metadata/version/platform negative cases, unchanged solved
+configuration/header checks, NM failure and malformed-output cases, private
+reference/collision gates, deterministic version scripts and force-keep files,
+and the existing native configuration/linker/LTO planning tests. Other root
+test targets and legacy Make image/build-graph modes retain their separately
+owned producers; this target does not invoke them.
 
 Run the standalone, leak-checked unit tests with:
 
@@ -240,3 +269,5 @@ primary script; later scripts may only contribute ordered `PHDRS` entries or
 `SECTIONS { ... } INSERT BEFORE/AFTER <section>` blocks. Malformed scripts,
 unknown supplemental commands, duplicate program headers, and missing or
 ambiguous insertion anchors are rejected rather than ignored.
+Insertion groups retain registration order, including anchors introduced by
+earlier groups, and preserve the legacy merger's generated text.
