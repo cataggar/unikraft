@@ -32,12 +32,21 @@ pub const Image = struct {
     }
 
     pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !Image {
+        return parseWithOptions(allocator, bytes, .{});
+    }
+
+    pub fn parseWithOptions(
+        allocator: std.mem.Allocator,
+        bytes: []const u8,
+        options: struct { allow_relocatable: bool = false },
+    ) !Image {
         var reader = std.Io.Reader.fixed(bytes);
         const header = try elf.Header.read(&reader);
         if (!header.is_64) return error.UnsupportedClass;
         if (header.machine != .X86_64 and header.machine != .AARCH64)
             return error.UnsupportedArchitecture;
-        if (header.type != .EXEC and header.type != .DYN)
+        if (header.type != .EXEC and header.type != .DYN and
+            !(options.allow_relocatable and header.type == .REL))
             return error.UnsupportedElfType;
         if (try integer(u32, bytes, 20, header.endian) != 1 or
             try integer(u16, bytes, 52, header.endian) != @sizeOf(elf.Elf64_Ehdr))
