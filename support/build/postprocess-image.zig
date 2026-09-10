@@ -376,6 +376,10 @@ pub fn diagnostic(err: anyerror) []const u8 {
         error.ToolFailed => "native strip/objcopy tool failed",
         error.InvalidArguments => "invalid native post-processing arguments",
         error.UnsupportedTransformation => "unsupported native post-processing action; no interpreter fallback is available",
+        error.InPlaceMutation => "output aliases an input file; refusing in-place mutation",
+        error.AliasedOutputs => "post-processing outputs alias each other",
+        error.OutputSymlink => "post-processing output must not be a symlink",
+        error.InputChanged => "post-processing input identity changed before publication",
         else => "native post-processing failed",
     };
 }

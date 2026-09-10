@@ -98,7 +98,7 @@ pub const Image = struct {
         for (sections) |item| {
             const sh = item.header;
             if (sh.sh_type != elf.SHT_SYMTAB and sh.sh_type != elf.SHT_DYNSYM) continue;
-            if (sh.sh_entsize != @sizeOf(elf.Elf64_Sym) or sh.sh_size % sh.sh_entsize != 0)
+            if (sh.sh_size == 0 or sh.sh_entsize != @sizeOf(elf.Elf64_Sym) or sh.sh_size % sh.sh_entsize != 0)
                 return error.InvalidSymbolTable;
             if (sh.sh_link >= sections.len) return error.InvalidStringTable;
             const strings = sections[sh.sh_link].header;

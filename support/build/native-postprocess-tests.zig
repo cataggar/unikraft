@@ -168,6 +168,23 @@ test "ELF bounds and malformed formats fail instead of trapping" {
     }
 }
 
+test "empty SYMTAB and DYNSYM fail before the COMMON validator for both byte orders" {
+    for ([_]std.builtin.Endian{ .little, .big }) |endian| {
+        for ([_]u32{ std.elf.SHT_SYMTAB, std.elf.SHT_DYNSYM }) |kind| {
+            var bytes = fixture(endian, .X86_64);
+            put(u32, &bytes, section_table + 3 * 64 + 4, kind, endian);
+            put(u64, &bytes, section_table + 3 * 64 + 32, 0, endian);
+            put(u32, &bytes, section_table + 3 * 64 + 44, 0, endian);
+            try testing.expectError(error.InvalidSymbolTable, format.Image.parse(testing.allocator, &bytes));
+            put(u64, &bytes, section_table + 3 * 64 + 32, 24, endian);
+            put(u32, &bytes, section_table + 3 * 64 + 44, 1, endian);
+            var null_only = try format.Image.parse(testing.allocator, &bytes);
+            defer null_only.deinit();
+            try testing.expectEqual(0, null_only.symbols.len);
+        }
+    }
+}
+
 test "relocation blob is byte exact including override ordering PTE flags signed values filter and sentinel" {
     for ([_]std.builtin.Endian{ .little, .big }) |endian| {
         for ([_]std.elf.EM{ .X86_64, .AARCH64 }) |machine| {

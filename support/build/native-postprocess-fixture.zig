@@ -119,6 +119,7 @@ pub fn main(init: std.process.Init) !void {
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, try failed_tool.wait(io));
     try std.testing.expectError(error.FileNotFound, runner.read(allocator, io, paths[11]));
+    try @import("native-postprocess-file-fixture.zig").run(allocator, io, native, objcopy, strip, root, machine);
 }
 
 fn verifyGraph(allocator: std.mem.Allocator, io: std.Io, paths: []const []const u8) !void {

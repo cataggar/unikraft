@@ -3,6 +3,7 @@
 const std = @import("std");
 const format = @import("postprocess-elf.zig");
 const transform = @import("postprocess-image.zig");
+const Files = @import("postprocess-files.zig").Files;
 
 const limit = 1024 * 1024 * 1024;
 
@@ -105,20 +106,18 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
         (options.remove.items.len != 0 and !strip)) return error.InvalidArguments;
     if (boot and !std.mem.eql(u8, options.arch.?, "x86_64") and
         !std.mem.eql(u8, options.arch.?, "arm64")) return error.InvalidArguments;
-    for (paths, 0..) |path, index| {
-        if (path.len == 0) return error.InvalidArguments;
-        for (paths[0..index]) |previous| {
-            if (std.mem.eql(u8, path, previous)) return error.InPlaceMutation;
-        }
-    }
+    const input_count: usize = if (efi) 2 else 1;
+    var files = try Files.init(allocator, io, paths[0..input_count], paths[input_count..]);
+    defer files.deinit();
 
     if (database) {
-        const contents = try compileDatabase(allocator, io, options.search_root.?);
+        const contents = try compileDatabaseChecked(allocator, io, options.search_root.?, &files);
         defer allocator.free(contents);
-        try write(io, paths[1], contents);
+        try files.write(0, contents);
+        try files.commit();
         return;
     }
-    const input = try read(allocator, io, paths[0]);
+    const input = try files.readInput(0);
     defer allocator.free(input);
     var image = try format.Image.parse(allocator, input);
     defer image.deinit();
@@ -134,22 +133,23 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
             for (options.remove.items) |section| {
                 try command.appendSlice(allocator, &.{ "-R", section });
             }
-            try command.appendSlice(allocator, &.{ paths[0], "-o", paths[1] });
+            try command.appendSlice(allocator, &.{ paths[0], "-o", files.path(0) });
         } else {
-            try command.appendSlice(allocator, &.{ "-O", "binary", paths[0], paths[1] });
+            try command.appendSlice(allocator, &.{ "-O", "binary", paths[0], files.path(0) });
         }
-        errdefer std.Io.Dir.cwd().deleteFile(io, paths[1]) catch {};
         try run(io, command.items);
+        try files.commit();
         return;
     }
     if (efi) {
-        const debug_bytes = try read(allocator, io, paths[1]);
+        const debug_bytes = try files.readInput(1);
         defer allocator.free(debug_bytes);
         var debug = try format.Image.parse(allocator, debug_bytes);
         defer debug.deinit();
         const result = try transform.efi(allocator, image, debug);
         defer allocator.free(result);
-        try write(io, paths[2], result);
+        try files.write(0, result);
+        try files.commit();
         return;
     }
     if (boot) {
@@ -164,26 +164,25 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
     else
         try transform.bootinfo(allocator, image, paths[0], options.names);
     defer allocator.free(blob);
-    try write(io, paths[1], blob);
-    errdefer std.Io.Dir.cwd().deleteFile(io, paths[1]) catch {};
+    try files.write(0, blob);
     const tool = try splitCommand(allocator, options.objcopy.?);
     defer freeCommand(allocator, tool);
     var command: std.ArrayList([]const u8) = .empty;
     defer command.deinit(allocator);
     try command.appendSlice(allocator, tool);
     const update = try std.fmt.allocPrint(allocator, "--update-section={s}={s}", .{
-        if (reloc) ".uk_reloc" else ".uk_bootinfo", paths[1],
+        if (reloc) ".uk_reloc" else ".uk_bootinfo", files.path(0),
     });
     defer allocator.free(update);
-    errdefer std.Io.Dir.cwd().deleteFile(io, paths[2]) catch {};
     if (reloc) {
         // Keep the exact legacy copy + in-place objcopy sequence.
-        try write(io, paths[2], input);
-        try command.appendSlice(allocator, &.{ update, paths[2] });
+        try files.write(1, input);
+        try command.appendSlice(allocator, &.{ update, files.path(1) });
     } else {
-        try command.appendSlice(allocator, &.{ paths[0], update, paths[2] });
+        try command.appendSlice(allocator, &.{ paths[0], update, files.path(1) });
     }
     try run(io, command.items);
+    try files.commit();
 }
 
 pub fn read(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -191,10 +190,10 @@ pub fn read(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
 }
 
 pub fn write(io: std.Io, path: []const u8, bytes: []const u8) !void {
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    errdefer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    try file.writePositionalAll(io, bytes, 0);
+    var file = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true });
+    defer file.deinit(io);
+    try file.file.writePositionalAll(io, bytes, 0);
+    try file.replace(io);
 }
 
 pub fn run(io: std.Io, argv: []const []const u8) !void {
@@ -263,17 +262,21 @@ pub fn freeCommand(allocator: std.mem.Allocator, words: [][]const u8) void {
 }
 
 pub fn compileDatabase(allocator: std.mem.Allocator, io: std.Io, root: []const u8) ![]u8 {
+    return compileDatabaseChecked(allocator, io, root, null);
+}
+
+fn compileDatabaseChecked(allocator: std.mem.Allocator, io: std.Io, root: []const u8, files: ?*Files) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
     try result.appendSlice(allocator, "[\n");
-    try collectDatabase(allocator, io, root, &result, 0);
+    try collectDatabase(allocator, io, root, &result, 0, files);
     while (result.items.len > 2 and (result.items[result.items.len - 1] == ',' or
         result.items[result.items.len - 1] == '\n')) _ = result.pop();
     try result.appendSlice(allocator, "\n]\n");
     return result.toOwnedSlice(allocator);
 }
 
-fn collectDatabase(allocator: std.mem.Allocator, io: std.Io, root: []const u8, result: *std.ArrayList(u8), depth: usize) !void {
+fn collectDatabase(allocator: std.mem.Allocator, io: std.Io, root: []const u8, result: *std.ArrayList(u8), depth: usize, files: ?*Files) !void {
     if (depth > 64) return error.DirectoryDepthExceeded;
     var directory = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer directory.close(io);
@@ -294,7 +297,11 @@ fn collectDatabase(allocator: std.mem.Allocator, io: std.Io, root: []const u8, r
             errdefer allocator.free(child);
             try children.append(allocator, child);
         } else if (std.mem.endsWith(u8, entry.name, ".ukcmpdb.json")) {
-            const contents = try directory.readFileAlloc(io, entry.name, allocator, .limited(64 * 1024 * 1024));
+            const file = try directory.openFile(io, entry.name, .{});
+            defer file.close(io);
+            if (files) |guard| try guard.addInput(file);
+            var reader = file.reader(io, &.{});
+            const contents = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
             defer allocator.free(contents);
             if (!std.unicode.utf8ValidateSlice(contents)) return error.InvalidCompileDatabaseEncoding;
             if (contents.len > 64 * 1024 * 1024 -| result.items.len) return error.CompileDatabaseTooLarge;
@@ -307,5 +314,5 @@ fn collectDatabase(allocator: std.mem.Allocator, io: std.Io, root: []const u8, r
             }
         }
     }
-    for (children.items) |child| try collectDatabase(allocator, io, child, result, depth + 1);
+    for (children.items) |child| try collectDatabase(allocator, io, child, result, depth + 1, files);
 }
