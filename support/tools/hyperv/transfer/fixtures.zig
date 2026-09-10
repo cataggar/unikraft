@@ -226,6 +226,10 @@ const Fixture = struct {
     }
     fn file(self: Fixture, name: []const u8, bytes: []const u8, mode: u32) ![]u8 {
         try self.dir.writeFile(io, .{ .sub_path = name, .data = bytes, .flags = .{ .exclusive = true, .permissions = .fromMode(mode) } });
+        const handle = try self.dir.openFile(io, name, .{});
+        defer handle.close(io);
+        // Creation applies umask; permission-refusal fixtures need exact modes.
+        try handle.setPermissions(io, .fromMode(mode));
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.path, name });
     }
     fn input(self: Fixture, bytes: []const u8) !files.Input {
@@ -731,6 +735,11 @@ test "FIFO symlink ancestor wrong size and nonprivate output directory refuse wi
         return error.SymlinkAncestorWasAccepted;
     } else |_| {}
     try fixture.dir.createDir(io, "public", .fromMode(0o755));
+    {
+        const directory = try fixture.dir.openDir(io, "public", .{ .follow_symlinks = false, .iterate = true });
+        defer directory.close(io);
+        try directory.setPermissions(io, .fromMode(0o755));
+    }
     const public = try std.fmt.allocPrint(allocator, "{s}/public/output", .{fixture.path});
     defer allocator.free(public);
     try expectFailure(client.downloadBlob(blob, .{ .path = public, .maximum = 100 }), .unsafe_file, .not_started, null);

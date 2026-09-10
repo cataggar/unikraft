@@ -817,6 +817,26 @@ jobs:
               -Doptimize="${mode}" -j2 test install --summary all
         done
 
+    - name: Run native Hyper-V transfer fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-transfers"
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/transfer/build.zig \
+          support/tools/hyperv/transfer/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in Debug ReleaseSafe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/transfer/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --prefix "${root}/${mode}/out" \
+              -Dfixture-root="${root}/${mode}/fixtures" \
+              -Doptimize="${mode}" -j2 test install --summary all
+        done
+
     - name: Run focused Hyper-V regressions
       run: |
         set -euo pipefail
