@@ -1,0 +1,8 @@
+.{
+    .name = .unikraft_hyperv,
+    .version = "0.1.0",
+    .fingerprint = 0xae54b61c0f967d4d,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{""},
+}
