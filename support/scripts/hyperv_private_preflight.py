@@ -154,10 +154,18 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "30c7c731ad8acc6438f57b8109b0d26bf947cfc54e6d0e87e4821d6db1db7a38"
+            "31d6c4329313af242dd336f172c1be9c92f156a4da4f24f629ebf30266622cc2"
         ),
-        "size": 1195715,
-        "files": 177,
+        "size": 1255979,
+        "files": 182,
+    },
+    "support/kconfig": {
+        "name": "support/kconfig",
+        "sha256": (
+            "1922363c552b45adbe8edf0df83b5a05eed16140d8525c9cd1908b80da5662b3"
+        ),
+        "size": 692952,
+        "files": 111,
     },
 }
 GUARDED_BUILD_CONTROL_FILES = (
@@ -180,11 +188,15 @@ GUARDED_BUILD_CONTROL_FILES = (
     "support/build/kconfig.zig",
     "support/build/linker-script.zig",
     "support/build/lto-symbol-policy.py",
+    "support/build/lto-symbol-policy.zig",
     "support/build/merge-linker-scripts.py",
+    "support/build/native-build-tools.zig",
     "support/build/native-config-metadata.py",
+    "support/build/native-config-metadata.zig",
     "support/build/native-config-tool.zig",
     "support/build/native-image-data.zig",
     "support/build/native-image-graph.zig",
+    "support/build/native-kconfig-bridge.c",
     "support/build/native-library-link.zig",
     "support/build/native-lto.zig",
     "support/build/native-postprocess-runner.py",
@@ -213,7 +225,7 @@ GUARDED_EXECUTED_HELPER_FILES = (
 )
 GUARDED_PRODUCER_FILES = {
     "Config.uk": (
-        "17b791a1bc6709f31846321cb705cd30b141e09eb05f6cd0bcffebb3eba0d50e"
+        "31ad9392835d740c86f36c8801dc1d0973ee33c2a40ef6f758ecb8f65cc58d5f"
     ),
     "Makefile": (
         "c790738ac50a85be2e7def288a32890a1c2703b9a148ffb2dd633d200305d562"
@@ -222,7 +234,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "1b1bd56b15bdac559e89339e312e5fd3db6f778bb6969858dd074e9d0d86dcd5"
+        "28f7a432f0b5c9d04dedd6686ba6e42ca516e5c770634bd9596edd6dd4b9cdfb"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -264,16 +276,25 @@ GUARDED_PRODUCER_FILES = {
         "e3f8ea0dbb9b136038f4c462e67a88394407e299b0ff87cae803a698d630c624"
     ),
     "support/build/linker-script.zig": (
-        "0116adde8d137b22230accc9c07731939558b7e5a5eac0637b44d7386375880f"
+        "e3c29e543d56b538807524a915fecba1241365010f3165fe715d0f2812c702ff"
     ),
     "support/build/lto-symbol-policy.py": (
         "139c967944d7460b92dcad82c8a2149a56d5698a27f7bc1029b1b789da4b19ce"
     ),
+    "support/build/lto-symbol-policy.zig": (
+        "c9866d7d1e93b7fa63f338e0b5dab79dc09469ed0346e4d900df43d8c4e4b2e5"
+    ),
     "support/build/merge-linker-scripts.py": (
         "dd39b9cec861bdf4771fba05c0b477aea37e2b2f1d40d843f31d3c1df011ee3a"
     ),
+    "support/build/native-build-tools.zig": (
+        "7d04586443a85ae6712673b7b47f7ac67622bfc656fe930c9c16082f1362132d"
+    ),
     "support/build/native-config-metadata.py": (
         "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
+    ),
+    "support/build/native-config-metadata.zig": (
+        "aa4d88591d27633eff90c424451782aad753e160d005ecaefc00e99c1f4281e2"
     ),
     "support/build/native-config-tool.zig": (
         "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
@@ -281,11 +302,14 @@ GUARDED_PRODUCER_FILES = {
     "support/build/native-image-data.zig": (
         "8800b7373be0a4e995d259fdf3369476d028b322a589ff03e49762a705ba4d9a"
     ),
+    "support/build/native-kconfig-bridge.c": (
+        "457137bfa280d69f8c3c819ca059c20b76a6c5dcb190575d10a7e5b1ea05f93a"
+    ),
     "support/build/native-library-link.zig": (
         "562a0b713e67e6e3de6897077f6bd18cc0ee135b8522bfaecd6d8c11a61423fe"
     ),
     "support/build/native-lto.zig": (
-        "68076583775b233c21447ad580a3a30b653a589c9dd6c8cf994b9eb70cf97974"
+        "cb5a2c661288b243ce97246c27e5c3a6b8b33aa9c037fdb263a42a1774aaba4a"
     ),
     "support/build/native-target-object.zig": (
         "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"

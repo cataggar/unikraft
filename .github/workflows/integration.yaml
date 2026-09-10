@@ -804,6 +804,14 @@ jobs:
         "${miz}" build-efi-application --help
         "${miz}" check-efi-application --help
 
+    - name: Run native configuration, linker, and LTO fixtures
+      run: |
+        set -euo pipefail
+        root="${RUNNER_TEMP}/hyperv-ci/native-build-tools"
+        ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+          zig build -j2 test-build-tools "-Doutput=${root}/build" \
+            --summary all
+
     - name: Run native Hyper-V controller foundation fixtures
       run: |
         set -euo pipefail
