@@ -642,6 +642,24 @@ class PrivatePreflightFixture(unittest.TestCase):
         }
         return state["host_deployment"]
 
+    def storage_firewall(self, run, ip_rules=()):
+        return {
+            "tags": run.operation_tags(),
+            "networkRuleSet": {
+                "defaultAction": "Deny",
+                "bypass": "None",
+                "ipRules": list(ip_rules),
+                "virtualNetworkRules": [{
+                    "virtualNetworkResourceId": (
+                        run.expected_host_ids()["vnet_id"]
+                        + "/subnets/preflight"
+                    ),
+                    "action": "Allow",
+                    "state": "Succeeded",
+                }],
+            },
+        }
+
     def vm_disk(self, run, state):
         receipt = state["host_deployment"]
         image = state["cloud_preflight"]["image"]
@@ -4004,6 +4022,102 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 for call in run.az.call_args_list
             ))
 
+    def test_firewall_uses_single_ip_with_durable_exact_host_intent(self):
+        for source in ("8.8.8.8", "8.8.8.8/32"):
+            with self.subTest(source=source), \
+                    tempfile.TemporaryDirectory() as temporary:
+                run, state = self.run_fixture(Path(temporary))
+                self.begin_operation(run, state)
+                storage = self.storage_firewall(run)
+                rules = storage["networkRuleSet"]["ipRules"]
+
+                def command(arguments, **_kwargs):
+                    if arguments[:4] == [
+                        "storage", "account", "network-rule", "add"
+                    ]:
+                        self.assertEqual(
+                            arguments[arguments.index("--ip-address") + 1],
+                            "8.8.8.8",
+                        )
+                        self.assertEqual(state["firewall_obligation"], {
+                            "cidr": "8.8.8.8/32", "phase": "pending-add"
+                        })
+                        rules.append({
+                            "ipAddressOrRange": "8.8.8.8", "action": "Allow"
+                        })
+                    elif arguments[:4] == [
+                        "storage", "account", "network-rule", "remove"
+                    ]:
+                        self.assertEqual(
+                            arguments[arguments.index("--ip-address") + 1],
+                            "8.8.8.8",
+                        )
+                        self.assertEqual(state["firewall_obligation"], {
+                            "cidr": "8.8.8.8/32", "phase": "pending-remove"
+                        })
+                        rules.clear()
+                    elif arguments[:3] == ["storage", "account", "show"]:
+                        return storage
+                    elif arguments[:2] == ["group", "exists"]:
+                        return True
+                    elif arguments[:2] == ["group", "show"]:
+                        return {
+                            "id": state["resource_group_id"],
+                            "tags": run.group_tags,
+                        }
+                    else:
+                        self.fail(f"Unexpected Azure command: {arguments}")
+
+                run.az.side_effect = command
+                with run.transfer_access(source):
+                    self.assertEqual(state["firewall_obligation"], {
+                        "cidr": "8.8.8.8/32", "phase": "active"
+                    })
+                    self.assertEqual(len(rules), 1)
+                self.assertIsNone(state["firewall_obligation"])
+                self.assertEqual(rules, [])
+
+    def test_firewall_recovery_removes_single_ip_for_each_durable_phase(self):
+        for phase in ("pending-add", "active", "pending-remove"):
+            with self.subTest(phase=phase), \
+                    tempfile.TemporaryDirectory() as temporary:
+                run, state = self.run_fixture(Path(temporary))
+                self.begin_operation(run, state)
+                state["firewall_obligation"] = {
+                    "cidr": "8.8.8.8/32", "phase": phase
+                }
+                run.az.side_effect = [
+                    True,
+                    {"id": state["resource_group_id"], "tags": run.group_tags},
+                    self.storage_firewall(run, [{
+                        "ipAddressOrRange": "8.8.8.8", "action": "Allow"
+                    }]),
+                    None,
+                    self.storage_firewall(run),
+                ]
+                run.clear_firewall_obligation()
+                self.assertEqual(run.az.call_args_list[3].args[0], [
+                    "storage", "account", "network-rule", "remove",
+                    "--resource-group", run.group,
+                    "--account-name", run.storage,
+                    "--ip-address", "8.8.8.8",
+                ])
+                self.assertIsNone(state["firewall_obligation"])
+
+    def test_firewall_rejects_nonexact_source_before_recording_or_mutation(self):
+        for source in (
+            "8.8.8.8/31", "8.8.8.0/24", "8.8.8.8/0",
+            "8.8.8.8/32 ", " 8.8.8.8", "10.0.0.1", "::1", None,
+        ):
+            with self.subTest(source=source), \
+                    tempfile.TemporaryDirectory() as temporary:
+                run, _state = self.run_fixture(Path(temporary))
+                with self.assertRaises(ValueError):
+                    with run.transfer_access(source):
+                        self.fail("Invalid source must not expose a transfer")
+                run.az.assert_not_called()
+                run.record.assert_not_called()
+
     def test_firewall_intent_precedes_add_and_survives_ambiguous_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
@@ -4098,24 +4212,43 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
             self.begin_operation(run, state)
-            subnet = (
-                run.expected_host_ids()["vnet_id"] + "/subnets/preflight"
-            )
-            storage = {
-                "tags": run.operation_tags(),
-                "networkRuleSet": {
-                    "defaultAction": "Deny",
-                    "bypass": "None",
-                    "ipRules": [],
-                    "virtualNetworkRules": [{
-                        "virtualNetworkResourceId": subnet,
-                        "action": "Allow",
-                        "state": "Succeeded",
-                    }],
-                    "resourceAccessRules": [{"tenantId": "foreign"}],
-                },
-            }
+            storage = self.storage_firewall(run)
+            storage["networkRuleSet"]["resourceAccessRules"] = [
+                {"tenantId": "foreign"}
+            ]
             run.az.return_value = storage
+            with self.assertRaisesRegex(RuntimeError, "firewall"):
+                run.verify_storage_rules()
+
+    def test_storage_firewall_requires_one_exact_single_ip_rule(self):
+        allowed = {"ipAddressOrRange": "8.8.8.8", "action": "Allow"}
+        for ip_rules in (
+            [], [allowed, allowed], [None], [{}],
+            [dict(allowed, ipAddressOrRange=value) for value in (
+                "8.8.8.8", "8.8.4.4"
+            )],
+            *[
+                [dict(allowed, ipAddressOrRange=value)]
+                for value in (
+                    "8.8.8.8/32", "8.8.8.8/31", "8.8.8.0/24",
+                    "8.8.4.4", "8.8.8.8 ", " 8.8.8.8", "::1",
+                    None, [], {},
+                )
+            ],
+            [dict(allowed, action="Deny")],
+            [dict(allowed, resourceId="foreign")],
+        ):
+            with self.subTest(ip_rules=ip_rules), \
+                    tempfile.TemporaryDirectory() as temporary:
+                run, state = self.run_fixture(Path(temporary))
+                self.begin_operation(run, state)
+                run.az.return_value = self.storage_firewall(run, ip_rules)
+                with self.assertRaisesRegex(RuntimeError, "firewall"):
+                    run.verify_storage_rules("8.8.8.8/32")
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            self.begin_operation(run, state)
+            run.az.return_value = self.storage_firewall(run, [allowed])
             with self.assertRaisesRegex(RuntimeError, "firewall"):
                 run.verify_storage_rules()
 

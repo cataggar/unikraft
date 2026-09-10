@@ -385,8 +385,12 @@ Live execution is a separate explicitly authorized action:
 Every Azure command carries the explicit private subscription; the controller
 never changes the global account default. The uploader address must be one
 explicit public IPv4. It is temporarily narrowed to `/32` for authenticated
-Blob upload and receipt download, then removed. There is no automatic address
-discovery. The explicit approval flag is checked before subscription or other
+Blob upload and receipt download, then removed. Authorization and durable cleanup
+intent retain the `/32`; the Storage API receives the single IPv4 address
+without its prefix for add, exact readback, and removal, because Azure Storage
+[does not support `/31` or `/32` CIDR rules](https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security-limitations#restrictions-for-ip-network-rules).
+This representation never authorizes an additional address. There is no automatic
+address discovery. The explicit approval flag is checked before subscription or other
 cloud preflight calls. If this temporary exception is not approved, the run requires a
 separately authorized private controller path and must stop before deployment.
 
