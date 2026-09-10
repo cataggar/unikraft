@@ -154,9 +154,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "bef2024c1c3390fac803621e610668d3a450133aa5971e96dd51dc0034abdb69"
+            "30c7c731ad8acc6438f57b8109b0d26bf947cfc54e6d0e87e4821d6db1db7a38"
         ),
-        "size": 1184519,
+        "size": 1195715,
         "files": 177,
     },
 }
@@ -357,7 +357,7 @@ GUARDED_PRODUCER_FILES = {
         "e0e666ff4faefc2ba1186403a4320170fb3163375cc31a04312bbce011aa9f10"
     ),
     "drivers/hyperv/storvsc/storvsc.c": (
-        "e0d9977fbc6ff6e5047a05dc1b19b8876289ff5e27fc02f8532b3b5d732658da"
+        "42e59853180fa7aa039e0895fe6d217d4fcbf0874d6cdb927dad4237ab92a6f0"
     ),
     "drivers/hyperv/storvsc/storvsc_core.h": (
         "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
@@ -4849,7 +4849,10 @@ class PrivatePreflightRun(azure.AzureRun):
             or not isinstance(endpoints, list)
             or len(endpoints) != 1
             or endpoints[0].get("service") != "Microsoft.Storage"
-            or endpoints[0].get("locations") != ["northeurope"]
+            or endpoints[0].get("locations") not in (
+                ["northeurope", "westeurope"],
+                ["westeurope", "northeurope"],
+            )
             or endpoints[0].get("provisioningState")
             not in (None, "Succeeded")
         ):
@@ -4870,7 +4873,7 @@ class PrivatePreflightRun(azure.AzureRun):
             or storage.get("defaultToOAuthAuthentication") is not False
             or storage.get("minimumTlsVersion") != "TLS1_2"
             or storage.get("publicNetworkAccess") != "Enabled"
-            or storage.get("supportsHttpsTrafficOnly") is not True
+            or storage.get("enableHttpsTrafficOnly") is not True
             or storage.get("privateEndpointConnections") not in (None, [])
             or rules.get("resourceAccessRules") not in (None, [])
         ):

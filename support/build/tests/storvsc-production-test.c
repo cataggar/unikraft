@@ -260,6 +260,12 @@ static int receive_gate_before_entered;
 static int receive_gate_release_drain;
 static int receive_gate_notify_entered;
 static int receive_gate_release_notify;
+static struct uk_thread *receive_gate_thread;
+static struct uk_thread *worker_exit_watch;
+static int worker_exit_observed;
+static int connection_fail_gate_enabled;
+static int connection_fail_gate_entered;
+static int connection_fail_gate_release;
 static int removal_coherence_enabled;
 static int removal_coherence_caller_registered;
 static pthread_t removal_coherence_caller;
@@ -499,6 +505,19 @@ void storvsc_host_recovery_begin_hook(void)
 	pthread_mutex_unlock(&race_lock);
 }
 
+void storvsc_host_connection_fail_hook(void)
+{
+	pthread_mutex_lock(&race_lock);
+	if (connection_fail_gate_enabled) {
+		connection_fail_gate_entered = 1;
+		pthread_cond_broadcast(&race_condition);
+		while (connection_fail_gate_enabled &&
+		       !connection_fail_gate_release)
+			pthread_cond_wait(&race_condition, &race_lock);
+	}
+	pthread_mutex_unlock(&race_lock);
+}
+
 void storvsc_host_receive_hook(unsigned int controller, int before_notify)
 {
 	if (current_thread == &main_thread)
@@ -510,6 +529,7 @@ void storvsc_host_receive_hook(unsigned int controller, int before_notify)
 		return;
 	}
 	if (!before_notify) {
+		receive_gate_thread = current_thread;
 		receive_gate_before_entered = 1;
 		pthread_cond_broadcast(&race_condition);
 		while (receive_gate_enabled && !receive_gate_release_drain)
@@ -682,6 +702,12 @@ void uk_sched_thread_exit(void)
 {
 	struct uk_thread *thread = current_thread;
 
+	pthread_mutex_lock(&race_lock);
+	if (thread == worker_exit_watch) {
+		worker_exit_observed = 1;
+		pthread_cond_broadcast(&race_condition);
+	}
+	pthread_mutex_unlock(&race_lock);
 	current_thread = NULL;
 	if (thread != &main_thread)
 		free(thread);
@@ -1951,12 +1977,31 @@ static int run_mixed_lun_completion(struct uk_blkdev *polled,
 static int submit_and_fire(struct uk_blkdev *device,
 			   struct uk_blkreq *request)
 {
+	atomic_int *callback_count = request->cb == request_done ?
+		request->cb_cookie : NULL;
+	int expected_callbacks = callback_count ?
+		atomic_load(callback_count) + 1 : 0;
 	int rc = device->submit_one(device, device->_queue[0], request);
 
 	if (!(rc & UK_BLKDEV_STATUS_SUCCESS))
 		return rc;
 	fire_channel();
-	return 0;
+	for (unsigned int attempt = 0;
+	     attempt < CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS; attempt++) {
+		if (callback_count) {
+			int callbacks = atomic_load(callback_count);
+
+			if (callbacks == expected_callbacks)
+				return 0;
+			if (callbacks > expected_callbacks)
+				return -EOVERFLOW;
+		} else if (atomic_load(&request->state.counter) ==
+			   UK_BLKREQ_FINISHED) {
+			return 0;
+		}
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
 }
 
 struct reentry_context {
@@ -1972,11 +2017,11 @@ static void reentry_done(struct uk_blkreq *request, void *cookie)
 	struct reentry_context *context = cookie;
 
 	(void)request;
-	atomic_fetch_add(&context->callbacks, 1);
 	context->nested_finish_result = context->device->finish_reqs(
 		context->device, context->device->_queue[0]);
 	context->submit_result = context->device->submit_one(
 		context->device, context->device->_queue[0], context->next);
+	atomic_fetch_add(&context->callbacks, 1);
 }
 
 struct submit_thread_context {
@@ -2067,6 +2112,111 @@ static int wait_atomic_value(atomic_int *value, int expected,
 	return -ETIMEDOUT;
 }
 
+static void release_receive_gate(void)
+{
+	pthread_mutex_lock(&race_lock);
+	receive_gate_enabled = 0;
+	receive_gate_release_drain = 1;
+	receive_gate_release_notify = 1;
+	receive_gate_thread = NULL;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+}
+
+static int hold_receive_gate(unsigned int controller)
+{
+	pthread_mutex_lock(&race_lock);
+	if (receive_gate_enabled) {
+		pthread_mutex_unlock(&race_lock);
+		return -EBUSY;
+	}
+	receive_gate_enabled = 1;
+	receive_gate_controller = controller;
+	receive_gate_before_entered = 0;
+	receive_gate_release_drain = 0;
+	receive_gate_notify_entered = 0;
+	receive_gate_release_notify = 0;
+	receive_gate_thread = NULL;
+	pthread_mutex_unlock(&race_lock);
+	if (wait_race_flag(&receive_gate_before_entered)) {
+		release_receive_gate();
+		return -ETIMEDOUT;
+	}
+	return 0;
+}
+
+static int release_receive_gate_and_wait_worker(unsigned int limit_ms)
+{
+	struct timespec deadline;
+	struct uk_thread *worker;
+	int observed;
+	int wait_rc = 0;
+
+	pthread_mutex_lock(&race_lock);
+	worker = receive_gate_thread;
+	if (!receive_gate_enabled || !receive_gate_before_entered || !worker) {
+		pthread_mutex_unlock(&race_lock);
+		release_receive_gate();
+		return -EINVAL;
+	}
+	worker_exit_watch = worker;
+	worker_exit_observed = 0;
+	receive_gate_enabled = 0;
+	receive_gate_release_drain = 1;
+	receive_gate_release_notify = 1;
+	receive_gate_thread = NULL;
+	pthread_cond_broadcast(&race_condition);
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += limit_ms / 1000;
+	deadline.tv_nsec += (limit_ms % 1000) * 1000000ULL;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+	while (!worker_exit_observed && !wait_rc)
+		wait_rc = pthread_cond_timedwait(
+			&race_condition, &race_lock, &deadline);
+	observed = worker_exit_observed;
+	if (worker_exit_watch == worker)
+		worker_exit_watch = NULL;
+	pthread_mutex_unlock(&race_lock);
+	return observed ? 0 : -ETIMEDOUT;
+}
+
+static int wait_topology_delivery(
+	atomic_int *callbacks, int expected_callbacks,
+	const int *primary_events, int expected_primary_events,
+	const int lun_events[4], const int expected_lun_events[4],
+	unsigned int limit_ms)
+{
+	for (unsigned int attempt = 0; attempt < limit_ms; attempt++) {
+		int callback_count = atomic_load(callbacks);
+		int overflow;
+		int matches;
+
+		if (callback_count > expected_callbacks)
+			return -EOVERFLOW;
+		if (callback_count != expected_callbacks) {
+			uk_sched_thread_sleep(1000000ULL);
+			continue;
+		}
+		overflow = *primary_events > expected_primary_events;
+		matches = *primary_events == expected_primary_events;
+		for (unsigned int i = 0; i < 4; i++) {
+			overflow = overflow ||
+				lun_events[i] > expected_lun_events[i];
+			matches = matches &&
+				lun_events[i] == expected_lun_events[i];
+		}
+		if (overflow)
+			return -EOVERFLOW;
+		if (matches)
+			return 0;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
 static int wait_atomic_at_least(atomic_int *value, int expected,
 				unsigned int limit_ms)
 {
@@ -2100,8 +2250,39 @@ static int wait_connection_fail_calls(unsigned int expected,
 				      unsigned int limit_ms)
 {
 	for (unsigned int i = 0; i < limit_ms; i++) {
-		if (vmbus_bus_host_connection_fail_calls() == expected)
+		unsigned int calls =
+			vmbus_bus_host_connection_fail_calls();
+
+		if (calls == expected)
 			return 0;
+		if (calls > expected)
+			return -EOVERFLOW;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
+static int wait_persistence_request_done(unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		if (hyperv_acceptance_persistence_host_request_done())
+			return 0;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
+static int wait_inventory_count(
+	struct uk_storvsc_inventory_snapshot *inventory,
+	unsigned int expected, unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		int rc = uk_storvsc_inventory_get(inventory);
+
+		if (!rc && inventory->count == expected)
+			return 0;
+		if (rc && rc != -EAGAIN)
+			return rc;
 		uk_sched_thread_sleep(1000000ULL);
 	}
 	return -ETIMEDOUT;
@@ -2356,6 +2537,8 @@ static int run_terminal_reset_quiesce(struct uk_blkdev *device,
 	int reset_created = 0;
 	int error = 0;
 	int mask_calls;
+	int retry_result;
+	int retry_result_again;
 	int unmask_calls;
 
 	atomic_init(&victim_callbacks, 0);
@@ -2369,6 +2552,9 @@ static int run_terminal_reset_quiesce(struct uk_blkdev *device,
 	initialize_request(&retry, UK_BLKREQ_READ, 70, 1, buffer + 8192,
 			   NULL, NULL);
 	submit_context.request = &sender;
+	storvsc_host_stop_timeout_worker();
+	if (wait_worker_present(0, 1000))
+		return error_base + 12;
 	storvsc_host_set_send_wait_limit(2);
 	atomic_store(&host_irqs_disabled, irqs_disabled);
 	hold_io = 1;
@@ -2401,16 +2587,38 @@ static int run_terminal_reset_quiesce(struct uk_blkdev *device,
 	if (reset_context.result != -EINPROGRESS ||
 	    storvsc_host_online() ||
 	    storvsc_host_deferred_action() != TEST_DEFER_RESET ||
-	    !storvsc_host_worker_present() ||
+	    storvsc_host_worker_present() ||
 	    storvsc_host_has_channel() ||
 	    atomic_load(&victim_callbacks) ||
 	    atomic_load(&sender_callbacks) ||
 	    atomic_load(&victim.state.counter) == UK_BLKREQ_FINISHED ||
-	    atomic_load(&sender.state.counter) == UK_BLKREQ_FINISHED ||
-	    device->submit_one(device, device->_queue[0], &retry) !=
-		    -ENODEV ||
-	    device->submit_one(device, device->_queue[0], &retry) !=
-		    -ENODEV) {
+	    atomic_load(&sender.state.counter) == UK_BLKREQ_FINISHED) {
+		fprintf(stderr,
+			"terminal reset gate failed: result=%d online=%d "
+			"deferred=%d worker=%d channel=%d callbacks=%d/%d "
+			"states=%d/%d\n",
+			reset_context.result, storvsc_host_online(),
+			storvsc_host_deferred_action(),
+			storvsc_host_worker_present(),
+			storvsc_host_has_channel(),
+			atomic_load(&victim_callbacks),
+			atomic_load(&sender_callbacks),
+			atomic_load(&victim.state.counter),
+			atomic_load(&sender.state.counter));
+		error = error_base + 5;
+		goto out;
+	}
+	if (storvsc_host_start_timeout_worker() ||
+	    wait_worker_present(1, 1000)) {
+		error = error_base + 13;
+		goto out;
+	}
+	retry_result = device->submit_one(
+		device, device->_queue[0], &retry);
+	retry_result_again = device->submit_one(
+		device, device->_queue[0], &retry);
+	if (retry_result != -ENODEV ||
+	    retry_result_again != -ENODEV) {
 		error = error_base + 5;
 		goto out;
 	}
@@ -3085,6 +3293,9 @@ struct integrated_disconnect_context {
 	pthread_mutex_t lock;
 	pthread_cond_t condition;
 	int remove_observed_safe;
+	int remove_wait_result;
+	int failure_wait_result;
+	unsigned int expected_failure_calls;
 	int unload_posted;
 	int release_unload;
 	int acknowledge;
@@ -3096,13 +3307,22 @@ static void integrated_remove_hook(void *arg)
 	struct integrated_disconnect_context *context = arg;
 
 	remove_test_offer(context->driver, context->vmbus_device);
+	context->remove_wait_result = wait_deferred_vmbus(
+		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	context->failure_wait_result = wait_connection_fail_calls(
+		context->expected_failure_calls,
+		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
 	context->remove_observed_safe =
+		!context->remove_wait_result &&
+		!context->failure_wait_result &&
 		storvsc_host_deferred_action() == TEST_DEFER_REMOVE &&
 		storvsc_host_deferred_wait_vmbus() &&
 		storvsc_host_deferred_close_required() &&
 		!storvsc_host_deferred_close_busy() &&
 		!atomic_load(context->callbacks) &&
-		storvsc_host_request_bound(context->request);
+		storvsc_host_request_bound(context->request) &&
+		vmbus_bus_host_connection_fail_calls() ==
+			context->expected_failure_calls;
 }
 
 static void integrated_unload_post_hook(void *arg)
@@ -3161,6 +3381,8 @@ static int run_integrated_remove_unload(
 	uint64_t epoch;
 	uint64_t request_pfn = 0;
 	unsigned int failures_before;
+	int posted;
+	int submit_rc;
 	int thread_created = 0;
 	int error = 0;
 
@@ -3168,6 +3390,7 @@ static int run_integrated_remove_unload(
 		return error_base;
 	epoch = vmbus_connection_quiesce_epoch();
 	failures_before = vmbus_bus_host_connection_fail_calls();
+	context.expected_failure_calls = failures_before + 1;
 	atomic_init(&callbacks, 0);
 	initialize_request(&request, UK_BLKREQ_READ, 114, 1, buffer,
 			   request_done, &callbacks);
@@ -3178,18 +3401,49 @@ static int run_integrated_remove_unload(
 	hold_io = 1;
 	pending_count = 0;
 	configure_close_failure(-EBUSY, 128);
-	if (!(device->submit_one(device, device->_queue[0], &request) &
-	      UK_BLKDEV_STATUS_SUCCESS)) {
+	submit_rc = device->submit_one(device, device->_queue[0], &request);
+	if (!(submit_rc & UK_BLKDEV_STATUS_SUCCESS)) {
+		fprintf(stderr,
+			"integrated unload submit failed: rc=%d "
+			"online=%d channel=%d worker=%d deferred=%d "
+			"wait_vmbus=%d\n",
+			submit_rc, storvsc_host_online(),
+			storvsc_host_has_channel(),
+			storvsc_host_worker_present(),
+			storvsc_host_deferred_action(),
+			storvsc_host_deferred_wait_vmbus());
 		error = error_base + 1;
 		goto out;
 	}
 	request_pfn = storvsc_host_request_pfn(&request, 0);
+	pthread_mutex_lock(&race_lock);
+	connection_fail_gate_enabled = 1;
+	connection_fail_gate_entered = 0;
+	connection_fail_gate_release = 0;
+	pthread_mutex_unlock(&race_lock);
 	if (pthread_create(&thread, NULL, integrated_disconnect_thread,
 			   &context)) {
 		error = error_base + 2;
 		goto out;
 	}
 	thread_created = 1;
+	if (wait_race_flag(&connection_fail_gate_entered)) {
+		error = error_base + 8;
+		goto out;
+	}
+	pthread_mutex_lock(&context.lock);
+	posted = context.unload_posted;
+	pthread_mutex_unlock(&context.lock);
+	if (posted ||
+	    vmbus_bus_host_connection_fail_calls() != failures_before ||
+	    context.remove_observed_safe) {
+		error = error_base + 8;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	connection_fail_gate_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
 	if (wait_integrated_unload(&context, 1000) ||
 	    !context.remove_observed_safe ||
 	    vmbus_connection_quiesce_epoch() != epoch ||
@@ -3197,6 +3451,23 @@ static int run_integrated_remove_unload(
 	    !request_pfn ||
 	    storvsc_host_request_pfn(&request, 0) != request_pfn ||
 	    vmbus_bus_host_connection_fail_calls() != failures_before + 1) {
+		fprintf(stderr,
+			"integrated unload observation failed: "
+			"wait=%d failure_wait=%d safe=%d "
+			"deferred=%d wait_vmbus=%d "
+			"close_required=%d close_busy=%d callbacks=%d "
+			"bound=%d failures=%u/%u\n",
+			context.remove_wait_result,
+			context.failure_wait_result,
+			context.remove_observed_safe,
+			storvsc_host_deferred_action(),
+			storvsc_host_deferred_wait_vmbus(),
+			storvsc_host_deferred_close_required(),
+			storvsc_host_deferred_close_busy(),
+			atomic_load(&callbacks),
+			storvsc_host_request_bound(&request),
+			vmbus_bus_host_connection_fail_calls(),
+			failures_before + 1);
 		error = error_base + 3;
 		goto out;
 	}
@@ -3253,6 +3524,11 @@ static int run_integrated_remove_unload(
 	}
 
 out:
+	pthread_mutex_lock(&race_lock);
+	connection_fail_gate_enabled = 0;
+	connection_fail_gate_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
 	pthread_mutex_lock(&context.lock);
 	context.release_unload = 1;
 	pthread_cond_broadcast(&context.condition);
@@ -3445,15 +3721,20 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	struct fire_channel_context retained_fire;
 	pthread_t retained_fire_thread;
 	struct vmbus_channel *primary_channel;
+	struct vmbus_channel *secondary_channel;
 	uint16_t stable_ids[4];
 	const uint8_t expected_luns[] = { 0, 2, 0, 3 };
 	const uint16_t expected_controllers[] = { 0, 0, 1, 1 };
 	const uint64_t expected_sectors[] = { 1000, 1200, 2000, 2300 };
 	const uint8_t expected_seeds[] = { 0x20, 0x22, 0x30, 0x33 };
+	const int secondary_delivery[] = { 0, 0, 1, 1 };
+	const int complete_delivery[] = { 0, 1, 1, 1 };
 	int lun_events[4] = { 0 };
 	int primary_events;
 	unsigned int count;
 	unsigned int empty_reports;
+	int retry_before;
+	unsigned long long resource_epoch;
 	int rc;
 
 	topology_fixture = 1;
@@ -3591,21 +3872,49 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	}
 	if (pending_count != 4)
 		return 40;
+	rc = hold_receive_gate(0);
+	if (rc) {
+		fprintf(stderr,
+			"topology primary receive gate failed: rc=%d\n", rc);
+		return 421;
+	}
 	enqueue_completion_on(secondary.channel, pending[0].id + 999,
 			      64, 0, 1, 0, pending[0].length);
 	fire_channel_on(secondary.channel);
 	if (atomic_load(&callbacks) || *events != primary_events ||
-	    lun_events[1] || lun_events[2] || lun_events[3])
+	    lun_events[1] || lun_events[2] || lun_events[3]) {
+		release_receive_gate();
 		return 41;
+	}
 	complete_pending_reverse(1);
 	fire_channel_on(secondary.channel);
-	if (atomic_load(&callbacks) != 2 ||
-	    lun_events[2] != 1 || lun_events[3] != 1)
+	rc = wait_topology_delivery(
+		&callbacks, 2, events, primary_events, lun_events,
+		secondary_delivery, CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	if (rc) {
+		fprintf(stderr,
+			"topology secondary delivery failed: rc=%d "
+			"callbacks=%d primary=%d/%d luns=%d,%d,%d,%d\n",
+			rc, atomic_load(&callbacks), *events, primary_events,
+			lun_events[0], lun_events[1], lun_events[2],
+			lun_events[3]);
+		release_receive_gate();
 		return 42;
+	}
 	fire_channel_on(primary->channel);
-	if (atomic_load(&callbacks) != 4 ||
-	    *events != primary_events + 1 || lun_events[1] != 1)
+	rc = wait_topology_delivery(
+		&callbacks, 4, events, primary_events + 1, lun_events,
+		complete_delivery, CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	release_receive_gate();
+	if (rc) {
+		fprintf(stderr,
+			"topology complete delivery failed: rc=%d "
+			"callbacks=%d primary=%d/%d luns=%d,%d,%d,%d\n",
+			rc, atomic_load(&callbacks), *events,
+			primary_events + 1, lun_events[0], lun_events[1],
+			lun_events[2], lun_events[3]);
 		return 43;
+	}
 	for (unsigned int i = 0; i < 4; i++) {
 		if (requests[i].result ||
 		    buffer[i * 512] != expected_seeds[i])
@@ -3652,13 +3961,21 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	    pending_count != 2)
 		return 50;
 	primary_channel = primary->channel;
-	remove_test_offer(driver, primary);
-	if (primary->channel)
-		(void)vmbus_channel_close(primary->channel);
-	if (requests[0].result != -ENODEV ||
-	    atomic_load(&teardown_callbacks) != 1 ||
-	    atomic_load(&requests[1].state.counter) == UK_BLKREQ_FINISHED)
+	if (persistence_remove_device(driver, primary))
 		return 51;
+	rc = wait_atomic_value(&teardown_callbacks, 1,
+			       CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	if (rc || requests[0].result != -ENODEV ||
+	    atomic_load(&teardown_callbacks) != 1 ||
+	    atomic_load(&requests[1].state.counter) == UK_BLKREQ_FINISHED) {
+		fprintf(stderr,
+			"topology teardown delivery failed: wait=%d "
+			"primary_result=%d callbacks=%d secondary_state=%d\n",
+			rc, requests[0].result,
+			atomic_load(&teardown_callbacks),
+			atomic_load(&requests[1].state.counter));
+		return 51;
+	}
 	for (unsigned int i = 0; i < pending_count; i++) {
 		enqueue_completion_on(pending[i].channel, pending[i].id, 64,
 				      0, 1, 0, pending[i].length);
@@ -3817,9 +4134,8 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	if (devices[1]->dev_ops->queue_intr_disable(
 		    devices[1], devices[1]->_queue[0]))
 		return 82;
-	remove_test_offer(driver, primary);
-	if (primary->channel)
-		(void)vmbus_channel_close(primary->channel);
+	if (persistence_remove_device(driver, primary))
+		return 83;
 	primary->present = 1;
 	if (driver->add_dev(primary))
 		return 83;
@@ -3952,9 +4268,8 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	    inventory.count != 4)
 		return 59;
 
-	remove_test_offer(driver, primary);
-	if (primary->channel)
-		(void)vmbus_channel_close(primary->channel);
+	if (persistence_remove_device(driver, primary))
+		return 60;
 	vpd_mode = VPD_UNSUPPORTED;
 	primary->present = 1;
 	if (driver->add_dev(primary) || uk_storvsc_mapping_count() != 4)
@@ -3963,9 +4278,8 @@ static int run_topology_regression(struct vmbus_driver *driver,
 		if (uk_storvsc_mapping_get(i, &found) || found.vpd_length)
 			return 61;
 	}
-	remove_test_offer(driver, primary);
-	if (primary->channel)
-		(void)vmbus_channel_close(primary->channel);
+	if (persistence_remove_device(driver, primary))
+		return 68;
 	rc = wait_primary_removal_quiesced(
 		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
 	if (rc) {
@@ -4024,13 +4338,11 @@ static int run_topology_regression(struct vmbus_driver *driver,
 			storvsc_host_has_channel());
 		return 68;
 	}
-	remove_test_offer(driver, primary);
-	if (primary->channel)
-		(void)vmbus_channel_close(primary->channel);
+	if (persistence_remove_device(driver, primary))
+		return 68;
 
-	remove_test_offer(driver, &secondary);
-	if (secondary.channel)
-		(void)vmbus_channel_close(secondary.channel);
+	if (persistence_remove_device(driver, &secondary))
+		return 62;
 	topology_fixture = 0;
 	report_luns_mode = REPORT_LUNS_NORMAL;
 	vpd_mode = VPD_NORMAL;
@@ -4038,9 +4350,8 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	rc = driver->add_dev(&secondary);
 	if (rc)
 		return 62;
-	remove_test_offer(driver, &secondary);
-	if (secondary.channel)
-		(void)vmbus_channel_close(secondary.channel);
+	if (persistence_remove_device(driver, &secondary))
+		return 62;
 	topology_fixture = 1;
 	report_luns_mode = REPORT_LUNS_POOL_EXCESS;
 	vpd_mode = VPD_NORMAL;
@@ -4077,9 +4388,8 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	if (check.result || atomic_load(&callbacks) != 7)
 		return 66;
 
-	remove_test_offer(driver, &secondary);
-	if (secondary.channel)
-		(void)vmbus_channel_close(secondary.channel);
+	if (persistence_remove_device(driver, &secondary))
+		return 429;
 	vpd_mode = VPD_DUPLICATE;
 	secondary.present = 1;
 	primary->present = 1;
@@ -4112,11 +4422,46 @@ static int run_topology_regression(struct vmbus_driver *driver,
 	    report_luns_commands != empty_reports + 3 ||
 	    uk_storvsc_inventory_get(&inventory) || inventory.count != 1)
 		return 433;
+	rc = hold_receive_gate(1);
+	if (rc)
+		return 434;
 	enqueue_enumerate_bus(secondary.channel);
 	fire_channel_on(secondary.channel);
-	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN)
+	if (uk_storvsc_inventory_get(&inventory) != -EAGAIN) {
+		release_receive_gate();
 		return 434;
-	rc = persistence_remove_device(driver, &secondary);
+	}
+	retry_before = atomic_load(&bind_retry_calls);
+	resource_epoch = atomic_load(&bind_resource_epoch);
+	empty_reports = report_luns_commands;
+	secondary_channel = secondary.channel;
+	remove_test_offer(driver, &secondary);
+	secondary.present = 1;
+	rc = driver->add_dev(&secondary);
+	if (rc != -ENOSPC || secondary.channel != secondary_channel ||
+	    report_luns_commands != empty_reports ||
+	    atomic_load(&bind_retry_calls) != retry_before + 1) {
+		fprintf(stderr,
+			"active old receiver admitted replacement: "
+			"rc=%d channel=%p reports=%u/%u retries=%d/%d\n",
+			rc, (void *)secondary.channel,
+			report_luns_commands, empty_reports,
+			atomic_load(&bind_retry_calls), retry_before + 1);
+		release_receive_gate();
+		return 439;
+	}
+	rc = release_receive_gate_and_wait_worker(
+		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	if (!rc &&
+	    atomic_load(&bind_resource_epoch) != resource_epoch + 1) {
+		fprintf(stderr,
+			"old receiver exit did not publish retry: "
+			"epoch=%llu/%llu\n",
+			(unsigned long long)atomic_load(
+				&bind_resource_epoch),
+			resource_epoch + 1);
+		rc = -EAGAIN;
+	}
 	if (persistence_remove_device(driver, primary) || rc)
 		return 435;
 
@@ -4340,9 +4685,8 @@ static int run_guarded_io_regression(
 	rc = uk_storvsc_session_validate(&session, &current);
 	if (rc != -ESTALE)
 		return 523;
-	remove_test_offer(driver, vmbus_device);
-	if (vmbus_device->channel)
-		(void)vmbus_channel_close(vmbus_device->channel);
+	if (persistence_remove_device(driver, vmbus_device))
+		return 523;
 	hold_io = 0;
 	vmbus_device->present = 1;
 	if (driver->add_dev(vmbus_device) ||
@@ -4369,7 +4713,8 @@ static int run_guarded_io_regression(
 	      UK_BLKDEV_STATUS_SUCCESS) ||
 	    uk_storvsc_session_end(&session) != -EBUSY)
 		return 524;
-	remove_test_offer(driver, vmbus_device);
+	if (persistence_remove_device(driver, vmbus_device))
+		return 525;
 	if (request.result != -ENODEV ||
 	    atomic_load(&request.state.counter) != UK_BLKREQ_FINISHED ||
 	    uk_storvsc_session_validate(&session, &current) != -ESTALE)
@@ -4379,8 +4724,6 @@ static int run_guarded_io_regression(
 	fire_channel();
 	if (atomic_load(&callbacks) != 9)
 		return 526;
-	if (vmbus_device->channel)
-		(void)vmbus_channel_close(vmbus_device->channel);
 	hold_io = 0;
 
 	vmbus_device->present = 1;
@@ -4499,9 +4842,8 @@ static int run_guarded_io_regression(
 			return 535;
 	}
 
-	remove_test_offer(driver, vmbus_device);
-	if (vmbus_device->channel)
-		(void)vmbus_channel_close(vmbus_device->channel);
+	if (persistence_remove_device(driver, vmbus_device))
+		return 529;
 	vpd_mode = VPD_UNSUPPORTED;
 	vmbus_device->present = 1;
 	if (driver->add_dev(vmbus_device) ||
@@ -4509,9 +4851,8 @@ static int run_guarded_io_regression(
 	    current.mapping.vpd_length ||
 	    uk_storvsc_session_begin_read(&current, &session) != -EINVAL)
 		return 529;
-	remove_test_offer(driver, vmbus_device);
-	if (vmbus_device->channel)
-		(void)vmbus_channel_close(vmbus_device->channel);
+	if (persistence_remove_device(driver, vmbus_device))
+		return 529;
 
 	storvsc_host_set_guarded_io(0);
 	backing_media_enabled = 0;
@@ -4938,7 +5279,9 @@ static int run_vmbus_offer_lifetime_case(
 	use_vmbus_offer_lifetimes = 1;
 	if (vmbus_bus_host_offer_storage(
 		    primary_id, primary_channel, primary_channel + 100) ||
-	    !vmbus_bus_host_offer_present(primary_channel)) {
+	    !vmbus_bus_host_offer_present(primary_channel) ||
+	    wait_inventory_count(
+		    &inventory, 3, CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS)) {
 		error = 662;
 		goto out;
 	}
@@ -4965,6 +5308,12 @@ static int run_vmbus_offer_lifetime_case(
 	}
 	inventory_rc = uk_storvsc_inventory_get(&inventory);
 	if (uk_storvsc_mapping_count() != 3) {
+		fprintf(stderr,
+			"offer lifetime mapping mismatch: case=%d count=%u "
+			"inventory=%d retries=%d ready=%d\n",
+			failure, uk_storvsc_mapping_count(), inventory_rc,
+			atomic_load(&bind_retry_calls),
+			atomic_load(&bind_ready_calls));
 		error = 665;
 		goto out;
 	}
@@ -5112,22 +5461,6 @@ static int run_vmbus_reoffer_cleanup_case(
 		error = 679;
 		goto out;
 	}
-	pthread_mutex_lock(&race_lock);
-	retained_callback_release = 1;
-	pthread_cond_broadcast(&race_condition);
-	pthread_mutex_unlock(&race_lock);
-	pthread_join(rescind_tid, NULL);
-	rescind_created = 0;
-	if (rescind.result || retained_callback_count != 1 ||
-	    request.result != -ENODEV ||
-	    storvsc_host_controller_online(1)) {
-		error = 680;
-		goto out;
-	}
-	hold_io = 0;
-	pending_count = 0;
-	drop_packets();
-
 	writes10 = write10_command_count;
 	writes16 = write16_command_count;
 	flushes = flush_command_count;
@@ -5142,9 +5475,40 @@ static int run_vmbus_reoffer_cleanup_case(
 		goto out;
 	}
 	if (vmbus_bus_host_confirm_rescind(213) ||
-	    uk_storvsc_inventory_get(&inventory) ||
-	    inventory.count != 3) {
+	    vmbus_bus_host_offer_present(213)) {
 		error = 682;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	retained_callback_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	pthread_join(rescind_tid, NULL);
+	rescind_created = 0;
+	if (rescind.result || retained_callback_count != 1 ||
+	    request.result != -ENODEV ||
+	    storvsc_host_controller_online(1)) {
+		fprintf(stderr,
+			"reoffer cleanup quiescence failed: rescind=%d "
+			"callbacks=%d request=%d online=%d mappings=%u "
+			"inventory=%d retries=%d ready=%d\n",
+			rescind.result, retained_callback_count, request.result,
+			storvsc_host_controller_online(1),
+			uk_storvsc_mapping_count(),
+			uk_storvsc_inventory_get(&inventory),
+			atomic_load(&bind_retry_calls),
+			atomic_load(&bind_ready_calls));
+		error = 680;
+		goto out;
+	}
+	hold_io = 0;
+	pending_count = 0;
+	drop_packets();
+
+	if (wait_inventory_count(
+		    &inventory, 3,
+		    CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS)) {
+		error = 683;
 		goto out;
 	}
 
@@ -5665,7 +6029,9 @@ static int run_persistence_workflow_regression(
 	complete_pending(2);
 	pending_count = 0;
 	fire_channel_on(primary->channel);
-	if (!hyperv_acceptance_persistence_host_request_owned() ||
+	if (wait_persistence_request_done(
+		    CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS) ||
+	    !hyperv_acceptance_persistence_host_request_owned() ||
 	    !hyperv_acceptance_persistence_host_request_done())
 		return 615;
 	commands = io_command_count;
@@ -5982,7 +6348,9 @@ static int storvsc_production_test(void)
 	enqueue_completion(last_io_id + 999, 64, 0, 1, 0, last_io_length);
 	complete_pending(1);
 	fire_channel();
-	if (request.result || request2.result ||
+	if (wait_atomic_value(&callbacks, 7,
+			      CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS) ||
+	    request.result || request2.result ||
 	    atomic_load(&callbacks) != 7)
 		return 14;
 	hold_io = 0;
@@ -5994,7 +6362,10 @@ static int storvsc_production_test(void)
 	if (!(rc & UK_BLKDEV_STATUS_SUCCESS))
 		return 15;
 	fire_channel();
-	if (request.result)
+	if (wait_request_completion(
+		    &request, &callbacks, 8,
+		    CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS) ||
+	    request.result)
 		return 16;
 
 	initialize_request(&request2, UK_BLKREQ_READ, 7, 1, buffer + 512,
@@ -6006,6 +6377,8 @@ static int storvsc_production_test(void)
 	initialize_request(&request, UK_BLKREQ_READ, 6, 1, buffer,
 			   reentry_done, &reentry);
 	if (submit_and_fire(device, &request) ||
+	    wait_atomic_value(&reentry.callbacks, 1,
+			      CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS) ||
 	    reentry.nested_finish_result ||
 	    !(reentry.submit_result & UK_BLKDEV_STATUS_SUCCESS))
 		return 17;
@@ -6160,12 +6533,11 @@ static int storvsc_production_test(void)
 	if (!(device->submit_one(device, device->_queue[0], &request) &
 	      UK_BLKDEV_STATUS_SUCCESS))
 		return 23;
-	remove_test_offer(driver, &vmbus_device);
+	if (persistence_remove_device(driver, &vmbus_device))
+		return 24;
 	if (request.result != -ENODEV ||
 	    atomic_load(&request.state.counter) != UK_BLKREQ_FINISHED)
 		return 24;
-	if (vmbus_device.channel)
-		(void)vmbus_channel_close(vmbus_device.channel);
 	pending_count = 0;
 	hold_io = 0;
 
@@ -6198,9 +6570,8 @@ static int storvsc_production_test(void)
 	if (device->submit_one(device, device->_queue[0], &request) !=
 	    -EROFS)
 		return 26;
-	remove_test_offer(driver, &vmbus_device);
-	if (vmbus_device.channel)
-		(void)vmbus_channel_close(vmbus_device.channel);
+	if (persistence_remove_device(driver, &vmbus_device))
+		return 27;
 
 	read_only_media = 0;
 	use_capacity16 = 0;
@@ -6228,9 +6599,8 @@ static int storvsc_production_test(void)
 	rc = driver->add_dev(&vmbus_device);
 	if (rc || !vmbus_device.channel || storvsc_host_lun_count() != 2)
 		return 424;
-	remove_test_offer(driver, &vmbus_device);
-	if (vmbus_device.channel)
-		(void)vmbus_channel_close(vmbus_device.channel);
+	if (persistence_remove_device(driver, &vmbus_device))
+		return 424;
 
 	report_luns_mode = REPORT_LUNS_NORMAL;
 	malformed_handshake = 1;

@@ -429,6 +429,22 @@ whitespace-padded tokens fail. V1 support is not required. The same narrow
 admission does not apply to another SKU or region. It never changes region,
 image, SKU, or host in response to failure.
 
+Azure expands the subnet's deployed `Microsoft.Storage` endpoint locations to
+North Europe and its paired West Europe region. The controller requires
+exactly that pair, in either order, and rejects missing, duplicate, wildcard
+or additional locations and `Microsoft.Storage.Global`. Microsoft's
+[storage endpoint documentation][storage-regional-endpoints] describes
+paired-region access (source revision
+`6d9e089dd29c0235cfb740b010b2d32dc0ba651d`). This routing metadata does not
+grant outbound access: the NSG still allows storage traffic only to
+`Storage.NorthEurope`, and the account and all allocated resources remain in
+North Europe.
+
+The storage account's HTTPS-only check requires the literal boolean `true`
+in the CLI response's `enableHttpsTrafficOnly` field. The ARM template uses
+`supportsHttpsTrafficOnly`; that wire-format name is not a substitute for the
+CLI's flattened SDK field. Missing, false or malformed CLI values fail closed.
+
 Before staging public inputs, the controller reads the host security profile
 through `az resource show` with the already-required Compute API
 `2025-11-01`. Older VM read APIs can omit Standard security metadata;
@@ -1135,6 +1151,7 @@ stress testing, and production readiness remain separate milestones.
 [azure-platform-ip]: https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16
 [dsv5-nested]: https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/dsv5-series
 [compute-security-profile]: https://learn.microsoft.com/en-us/javascript/api/@azure/arm-compute/securityprofile?view=azure-node-latest
+[storage-regional-endpoints]: https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security#access-from-a-paired-region
 [upload]: https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-upload-vhd-to-managed-disk-cli
 [miz-revision]: https://github.com/cataggar/miz/commit/2db68ca0c3ab12155012a823c3fb8d7aba1cb544
 [unikraft-revision]: https://github.com/cataggar/unikraft/commit/8c87f56ab3eaa71974812cd748c3a6bfa61c563b
