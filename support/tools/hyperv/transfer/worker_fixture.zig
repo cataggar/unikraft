@@ -34,8 +34,10 @@ pub fn main(init: std.process.Init) void {
 fn run(init: std.process.Init) !void {
     if (init.environ_map.count() != 0) return error.InheritedEnvironment;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 3 or !std.mem.eql(u8, args[1], "__transfer-worker")) return error.InvalidArguments;
     for (args) |arg| if (std.mem.indexOf(u8, arg, "sig=") != null) return error.SecretInArguments;
+    if (args.len == 6 and std.mem.eql(u8, args[1], "__capture-cli"))
+        return captureCli(init.io, init.arena.allocator(), args[2..]);
+    if (args.len != 3 or !std.mem.eql(u8, args[1], "__transfer-worker")) return error.InvalidArguments;
     var wiping: core.sensitive.Allocator = .{ .backing = std.heap.page_allocator };
     const allocator = wiping.allocator();
     const directory = try core.private_files.Directory.openWorkerCwd(init.io);
@@ -90,6 +92,26 @@ fn run(init: std.process.Init) !void {
         }
         try report.write(&stdout.interface);
     }
+}
+
+// Preserve the actual CLI's failure JSON without changing the supervisor's
+// policy of discarding nonzero-exit pipe output. No additional child is spawned.
+fn captureCli(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (!std.fs.path.isAbsolute(args[0])) return error.InvalidArguments;
+    const internal = std.mem.eql(u8, args[1], "__transfer-worker");
+    if (!internal and !std.mem.eql(u8, args[1], "transfer")) return error.InvalidArguments;
+    const directory = try core.private_files.Directory.openWorkerCwd(io);
+    defer directory.close(io);
+    const file = try directory.dir.createFile(io, "cli-output.json", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o600));
+    if (std.os.linux.errno(std.os.linux.dup3(file.handle, 1, 0)) != .SUCCESS) return error.RedirectFailed;
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    return std.process.replace(io, .{
+        .argv = if (internal) &.{ args[0], args[1], args[3] } else args,
+        .environ_map = &environment,
+    });
 }
 
 fn replaceOne(allocator: std.mem.Allocator, raw: []const u8, before: []const u8, after: []const u8) ![]u8 {

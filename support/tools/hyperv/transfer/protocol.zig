@@ -151,7 +151,8 @@ fn prefixEffect(plan: job.Plan, confirmed: u64) d.Certainty {
 }
 
 pub const Report = struct {
-    /// Trusted admission context, never decoded from or emitted in the report.
+    /// Trusted invocation plan, never decoded from or emitted in the report.
+    /// Refusal may precede durable admission; this does not describe prior use.
     admitted_plan: ?job.Plan = null,
     attempt_id: ?[32]u8 = null,
     delivery_complete: bool = false,
@@ -278,8 +279,9 @@ pub const Report = struct {
         const kind = self.kind orelse return error.InvalidReport;
         try plan.validate(kind);
         const p = self.progress orelse {
-            if (self.side_effect != (if (plan.mutations == 0) d.Certainty.not_applicable else .unknown))
-                return error.InvalidReport;
+            // Admission describes this invocation, not earlier use of the
+            // directory. A new read-only plan cannot prove prior effects absent.
+            if (self.side_effect != .unknown) return error.InvalidReport;
             try self.validateUnavailable();
             return;
         };
@@ -331,7 +333,7 @@ pub const Report = struct {
         self.delivery_complete = false;
         self.phase = .prepared;
         const plan = self.admitted_plan.?;
-        self.side_effect = if (plan.mutations == 0) .not_applicable else .unknown;
+        self.side_effect = .unknown;
         if (self.progress) |p| {
             if (p.validate(self.kind.?, plan)) |_| {
                 self.side_effect = p.certainty(plan);

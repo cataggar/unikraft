@@ -28,11 +28,12 @@ pub fn executeNative(allocator: std.mem.Allocator, io: std.Io, name: []const u8)
 pub fn execute(allocator: std.mem.Allocator, io: std.Io, name: []const u8, runtime: sdk.http.HttpRuntime) Report {
     var report: Report = .{};
     return executeChecked(allocator, io, name, runtime, &report) catch |err| {
+        var outcome = d.Outcome.fail(.request_file, transferCategory(err));
         if (err == error.AttemptConsumed or err == error.WouldBlock) {
             report.side_effect = .unknown;
             report.progress = null;
+            outcome.failures.record(.primary, .{ .stage = .transfer_worker, .category = coreCategory(err) }) catch unreachable;
         }
-        var outcome = d.Outcome.fail(.request_file, transferCategory(err));
         if (err == error.RecordingFailed) {
             outcome.diagnostic.category = .none;
             outcome.failures.record(.recording, .{ .stage = .state_record, .category = .local_io }) catch unreachable;
@@ -190,13 +191,13 @@ fn superviseChecked(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
     report.merge(child.failures);
     if (!child.cleanup_complete) {
         report.progress = null;
-        report.side_effect = if (plan.mutations == 0) .not_applicable else .unknown;
+        report.side_effect = .unknown;
         report.process_cleanup_complete = false;
         report.merge(child.failures);
         return report.*;
     }
     report.progress = null;
-    report.side_effect = if (plan.mutations == 0) .not_applicable else .unknown;
+    report.side_effect = .unknown;
     report.process_cleanup_complete = true;
     var valid_output = false;
     var output_error: ?anyerror = null;
@@ -251,7 +252,7 @@ fn superviseChecked(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
 fn recover(allocator: std.mem.Allocator, io: std.Io, directory: core.private_files.Directory, intent: protocol.Intent) Report {
     var result = Report.initial(intent);
     result.progress = null;
-    result.side_effect = if (intent.plan.mutations == 0) .not_applicable else .unknown;
+    result.side_effect = .unknown;
     var bytes = directory.readSensitive(io, allocator, job.state_name, protocol.maximum_result, null) catch {
         result.failures.record(.recording, .{ .stage = .state_record, .category = .local_io }) catch unreachable;
         return result;
@@ -273,6 +274,7 @@ fn transferCategory(err: anyerror) d.Category {
         error.UnsafeFile, error.UnsafePath => .unsafe_file,
         error.HashMismatch, error.FileChanged => .input_changed,
         error.Deadline => .deadline,
+        error.AttemptConsumed, error.WouldBlock => .condition,
         error.RecordingFailed => .local_io,
         error.OutOfMemory => .allocation,
         else => .invalid_contract,

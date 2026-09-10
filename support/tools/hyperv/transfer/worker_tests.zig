@@ -74,6 +74,12 @@ const Fixture = struct {
         try self.put("request.json", changed);
     }
 
+    fn useDownload(self: Fixture) !void {
+        const request = try std.fmt.allocPrint(allocator, "{{\"schema\":\"unikraft.hyperv.private-preflight-blob-worker\",\"schema_version\":1,\"action\":\"download\",\"account_url\":\"https://fixture.blob.core.windows.net\",\"container\":\"fixture\",\"files\":[{{\"blob\":\"input\",\"path\":\"{s}/download\",\"maximum\":128}}],\"create_container\":false}}", .{self.path});
+        defer allocator.free(request);
+        try self.put("request.json", request);
+    }
+
     fn deinit(self: Fixture) void {
         self.directory.close(io);
         self.root.dir.deleteTree(io, &self.name) catch @panic("worker fixture cleanup failed");
@@ -103,6 +109,172 @@ fn safeReport(report: worker.Report) !void {
     try document.requireCanonical(writer.buffered());
 }
 
+fn reportContext(report: protocol.Report) protocol.Intent {
+    return .{
+        .attempt_id = report.attempt_id.?,
+        .job_sha256 = report.job_sha256.?,
+        .kind = report.kind.?,
+        .plan = report.admitted_plan.?,
+        .request_sha256 = [_]u8{0} ** 32,
+        .sas_sha256 = [_]u8{0} ** 32,
+        .parent_pid = 1,
+        .deadline_ns = 0,
+    };
+}
+
+fn unavailableReport(report: protocol.Report, category: core.diagnostics.Category) !void {
+    try testing.expect(!report.succeeded());
+    try testing.expectEqual(category, report.failures.primary.?.category);
+    try testing.expectEqual(.unknown, report.side_effect);
+    try testing.expect(report.progress == null);
+    try testing.expect(report.failures.cleanup == null and report.failures.recording == null);
+    try safeReport(report);
+    if (report.admitted_plan != null) try roundtrip(report, reportContext(report));
+}
+
+fn captureCli(fixture: Fixture, internal: bool) !core.sensitive.Buffer {
+    const wrapper = try std.Io.Dir.cwd().realPathFileAlloc(io, options.worker_fixture, allocator);
+    defer allocator.free(wrapper);
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(executable);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try core.process.initialize();
+    var child = try core.process.run(allocator, io, .{
+        .argv = &.{ wrapper, "__capture-cli", executable, if (internal) "__transfer-worker" else "transfer", fixture.path, "job.json" },
+        .cwd = fixture.directory.dir,
+        .environment = &environment,
+        .deadline = try core.process.Deadline.afterMilliseconds(5000),
+    });
+    defer child.deinit(allocator);
+    try testing.expect(child.cleanup_complete);
+    try testing.expectEqual(@as(u8, if (internal) 0 else 1), child.termination.?.exited);
+    try testing.expectEqual(@as(usize, 0), child.stdout.len);
+    return fixture.directory.readSensitive(io, allocator, "cli-output.json", protocol.maximum_result, null);
+}
+
+fn capturedContext(value: std.json.Value, plan: core.transfer.job.Plan) !protocol.Intent {
+    const fields = value.object;
+    return .{
+        .attempt_id = try core.contracts.parseSha256(try core.contracts.string(fields.get("attempt_id").?)),
+        .job_sha256 = try core.contracts.parseSha256(try core.contracts.string(fields.get("job_sha256").?)),
+        .kind = try core.contracts.enumeration(core.transfer.job.Kind, fields.get("kind").?),
+        .plan = plan,
+        .request_sha256 = [_]u8{0} ** 32,
+        .sas_sha256 = [_]u8{0} ** 32,
+        .parent_pid = 1,
+        .deadline_ns = 0,
+    };
+}
+
+test "repeated downloads and new read-only plans retain uncertainty about consumed attempts" {
+    for ([_]struct { download: bool, size: usize }{
+        .{ .download = true, .size = 0 },
+        .{ .download = false, .size = 0 },
+        .{ .download = false, .size = 17 },
+    }) |case| {
+        const fixture = try Fixture.init("pass", .blob, case.size, case.download, 5000);
+        defer fixture.deinit();
+        const first = fixture.run(null);
+        try testing.expect(first.succeeded());
+        var original = try fixture.directory.readSensitive(io, allocator, core.transfer.job.supervised_name, protocol.maximum_result, null);
+        defer original.deinit();
+        const intent = try protocol.Intent.load(allocator, io, fixture.directory);
+        if (!case.download) {
+            try fixture.useDownload();
+            var held = try fixture.directory.lock(io);
+            defer held.close(io);
+            const contended = fixture.run(null);
+            try testing.expectEqual(@as(u64, 0), contended.admitted_plan.?.mutations);
+            try unavailableReport(contended, .contention);
+        }
+        const repeated = fixture.run(null);
+        try testing.expectEqual(@as(u64, 0), repeated.admitted_plan.?.mutations);
+        try testing.expect(repeated.attempt_id != null and repeated.job_sha256 != null);
+        try unavailableReport(repeated, .conflict);
+        try testing.expectEqualDeep(intent, try protocol.Intent.load(allocator, io, fixture.directory));
+        var retained = try fixture.directory.readSensitive(io, allocator, core.transfer.job.supervised_name, protocol.maximum_result, null);
+        defer retained.deinit();
+        try testing.expectEqualSlices(u8, original.bytes(), retained.bytes());
+        var invocations = try fixture.directory.readSensitive(io, allocator, "invocations", 32, null);
+        defer invocations.deinit();
+        try testing.expectEqualStrings("1", invocations.bytes());
+        try noChildren();
+    }
+}
+
+test "read-only supervisor lock contention produces a serializable admission failure" {
+    const fixture = try Fixture.init("pass", .blob, 0, true, 5000);
+    defer fixture.deinit();
+    var lock = try fixture.directory.lock(io);
+    defer lock.close(io);
+    const result = fixture.run(null);
+    try testing.expectEqual(@as(u64, 0), result.admitted_plan.?.mutations);
+    try unavailableReport(result, .contention);
+    try testing.expectError(error.FileNotFound, fixture.directory.dir.statFile(io, "invocations", .{}));
+    try testing.expectError(error.FileNotFound, fixture.directory.dir.statFile(io, core.transfer.job.intent_name, .{}));
+    try noChildren();
+}
+
+test "public CLI emits conflict and contention reports instead of generic invalid input" {
+    for ([_]enum { repeated_download, changed_plan, contention }{ .repeated_download, .changed_plan, .contention }) |case| {
+        const fixture = try Fixture.init("pass", .blob, if (case == .changed_plan) 17 else 0, case != .changed_plan, 5000);
+        defer fixture.deinit();
+        if (case != .contention) try testing.expect(fixture.run(null).succeeded());
+        if (case == .changed_plan) {
+            try fixture.useDownload();
+            try fixture.put("download", "synthetic no-network guard");
+        }
+        var lock: ?core.private_files.Locked = if (case == .contention) try fixture.directory.lock(io) else null;
+        defer if (lock) |*held| held.close(io);
+        var raw = try captureCli(fixture, false);
+        defer raw.deinit();
+        const document = try core.contracts.SensitiveDocument.parse(allocator, raw.bytes(), .{});
+        defer document.deinit();
+        const intent = try capturedContext(document.value(), .{ .bytes = 0, .download_bytes = 128, .mutations = 0, .requests = 1 });
+        const report = try protocol.Report.parse(allocator, raw.bytes(), intent);
+        try unavailableReport(report, if (case == .contention) .contention else .conflict);
+        var definition = try fixture.directory.readSensitive(io, allocator, "job.json", 8192, null);
+        defer definition.deinit();
+        try testing.expectEqualDeep(core.transfer.job.hash(definition.bytes()), report.job_sha256.?);
+        if (case != .contention) {
+            const retained = try protocol.Intent.load(allocator, io, fixture.directory);
+            try testing.expectEqual(@as(u64, if (case == .changed_plan) 1 else 0), retained.plan.mutations);
+        }
+        try noChildren();
+    }
+}
+
+test "native child consumed and contended paths serialize original failure categories" {
+    for ([_]bool{ false, true }) |contended| {
+        const fixture = try Fixture.init("pass", .blob, 0, true, 5000);
+        defer fixture.deinit();
+        if (!contended) try testing.expect(fixture.run(null).succeeded());
+        var lock: ?core.private_files.Locked = if (contended) try fixture.directory.lock(io) else null;
+        defer if (lock) |*held| held.close(io);
+        var raw = try captureCli(fixture, true);
+        defer raw.deinit();
+        const document = try core.contracts.SensitiveDocument.parse(allocator, raw.bytes(), .{});
+        defer document.deinit();
+        try document.requireCanonical(raw.bytes());
+        const fields = document.value().object;
+        const failures = try core.diagnostics.Failures.parse(fields.get("failures").?);
+        try testing.expectEqual(if (contended) core.diagnostics.Category.contention else .conflict, failures.primary.?.category);
+        const outcome = try core.transfer.Outcome.parse(fields.get("outcome").?);
+        try testing.expectEqual(.unknown, outcome.side_effect);
+        try testing.expectEqual(.failed, outcome.completion);
+        try testing.expect(fields.get("progress").? == .null);
+        if (!contended) {
+            const intent = try protocol.Intent.load(allocator, io, fixture.directory);
+            const report = try protocol.Report.parse(allocator, raw.bytes(), intent);
+            try unavailableReport(report, .conflict);
+            try testing.expectEqual(@as(u64, 0), report.admitted_plan.?.mutations);
+        } else {
+            try testing.expect(fields.get("attempt_id").? == .null);
+        }
+        try noChildren();
+    }
+}
 test "real native worker uploads downloads and reads page footer through supervised protocol" {
     for ([_]struct { kind: core.transfer.job.Kind, size: usize, download: bool }{
         .{ .kind = .blob, .size = 17001, .download = false },
@@ -123,6 +295,55 @@ test "real native worker uploads downloads and reads page footer through supervi
         try safeReport(result);
         try noChildren();
     }
+}
+
+test "unavailable read-only progress remains unknown through validation and recovery" {
+    const intent: protocol.Intent = .{
+        .attempt_id = [_]u8{1} ** 32,
+        .job_sha256 = [_]u8{2} ** 32,
+        .kind = .blob,
+        .plan = .{ .bytes = 0, .download_bytes = 128, .mutations = 0, .requests = 1 },
+        .request_sha256 = [_]u8{3} ** 32,
+        .sas_sha256 = [_]u8{4} ** 32,
+        .parent_pid = 1,
+        .deadline_ns = 0,
+    };
+    var report = protocol.Report.initial(intent);
+    report.progress = null;
+    report.side_effect = .unknown;
+    try report.failures.record(.primary, .{ .stage = .transfer_worker, .category = .conflict });
+    try report.failures.record(.cleanup, .{ .stage = .private_file, .category = .cleanup_failed });
+    try roundtrip(report, intent);
+    var buffer: [protocol.maximum_result]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try report.write(&writer);
+    const recovered = try protocol.Report.recover(allocator, writer.buffered(), intent);
+    try testing.expectEqualDeep(report, recovered);
+    const corrupt = try mutateOne(writer.buffered(), "\"phase\":\"prepared\"", "\"phase\":\"in_flight\"");
+    defer allocator.free(corrupt);
+    try testing.expectError(error.InvalidReport, protocol.Report.parse(allocator, corrupt, intent));
+    const rejected = try protocol.Report.recover(allocator, corrupt, intent);
+    try testing.expectEqual(.unknown, rejected.side_effect);
+    try testing.expect(rejected.progress == null);
+    try testing.expectEqualDeep(report.failures.primary, rejected.failures.primary);
+    try testing.expectEqualDeep(report.failures.cleanup, rejected.failures.cleanup);
+    try testing.expect(rejected.failures.recording != null);
+    for ([_]core.transfer.diagnostic.Certainty{ .not_started, .not_applicable, .accepted, .rejected, .incomplete }) |effect| {
+        var invalid = report;
+        invalid.side_effect = effect;
+        try testing.expectError(error.InvalidReport, invalid.validate());
+        try testing.expect(!invalid.succeeded());
+    }
+    var invalid = report;
+    invalid.phase = .finished;
+    invalid.delivery_complete = true;
+    invalid.outcome = core.transfer.Outcome.fail(.request_file, .condition);
+    invalid.outcome.?.side_effect = .unknown;
+    invalid.outcome.?.bytes_accepted = 1;
+    try testing.expectError(error.InvalidReport, invalid.validate());
+    const known_read_only = protocol.Report.initial(intent);
+    try testing.expectEqual(.not_applicable, known_read_only.side_effect);
+    try roundtrip(known_read_only, intent);
 }
 
 test "sealed artifacts keep nonprivate mode and hard-link policy distinct from SAS files" {
