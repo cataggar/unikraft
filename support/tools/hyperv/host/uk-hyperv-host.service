@@ -1,0 +1,28 @@
+[Unit]
+Description=Unikraft authenticated agentless Hyper-V boot evidence
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/uk-hyperv-host/admission.json
+ConditionPathExists=/etc/uk-hyperv-host/locator.json
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+StateDirectory=uk-hyperv-host
+StateDirectoryMode=0700
+ExecStart=/usr/libexec/uk-hyperv-host run
+Restart=no
+TimeoutStartSec=3600
+TimeoutStopSec=120
+KillMode=control-group
+SendSIGKILL=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/uk-hyperv-host
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+
+[Install]
+WantedBy=multi-user.target
