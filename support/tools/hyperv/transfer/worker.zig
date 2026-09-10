@@ -28,6 +28,10 @@ pub fn executeNative(allocator: std.mem.Allocator, io: std.Io, name: []const u8)
 pub fn execute(allocator: std.mem.Allocator, io: std.Io, name: []const u8, runtime: sdk.http.HttpRuntime) Report {
     var report: Report = .{};
     return executeChecked(allocator, io, name, runtime, &report) catch |err| {
+        if (err == error.AttemptConsumed or err == error.WouldBlock) {
+            report.side_effect = .unknown;
+            report.progress = null;
+        }
         var outcome = d.Outcome.fail(.request_file, transferCategory(err));
         if (err == error.RecordingFailed) {
             outcome.diagnostic.category = .none;
@@ -50,7 +54,7 @@ fn executeChecked(allocator: std.mem.Allocator, io: std.Io, name: []const u8, ru
     defer lock.close(io);
     const intent = try protocol.Intent.load(allocator, io, directory);
     if (intent.parent_pid != std.os.linux.getppid()) return error.InvalidParent;
-    report.* = initial(intent);
+    report.* = Report.initial(intent);
     const definition = try job.Job.load(allocator, io, directory, name);
     defer definition.deinit();
     var spec = try job.Spec.load(allocator, io, directory, definition);
@@ -148,7 +152,7 @@ fn superviseChecked(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
         .plan = plan,
         .parent_pid = @intCast(std.os.linux.getpid()),
     };
-    report.* = initial(intent);
+    report.* = Report.initial(intent);
     try core.process.initialize();
     {
         var lock = try directory.lock(io);
@@ -198,10 +202,11 @@ fn superviseChecked(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
     var output_error: ?anyerror = null;
     if (child.failures.primary == null) {
         if (Report.parse(allocator, child.stdout, intent)) |decoded| {
+            report.merge(decoded.failures);
             if (decoded.delivery_complete and decoded.phase == .finished and decoded.kind == intent.kind and
                 decoded.process_cleanup_complete == null)
             {
-                report.* = decoded;
+                report.retain(decoded);
                 valid_output = true;
             } else output_error = error.InvalidReport;
         } else |err| output_error = err;
@@ -212,7 +217,7 @@ fn superviseChecked(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
             .category = if (err == error.BindingMismatch) .integrity else .invalid_response,
         } else null;
     report.process_cleanup_complete = true;
-    if (delivery_failure) |failure| report.failures.primary = failure;
+    if (delivery_failure) |failure| report.failures.record(.primary, failure) catch unreachable;
     report.merge(child.failures);
     var lock = directory.lock(io) catch {
         report.failures.record(.recording, .{ .stage = .state_record, .category = .local_io }) catch unreachable;
@@ -220,13 +225,11 @@ fn superviseChecked(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
     };
     defer lock.close(io);
     if (!valid_output) {
-        report.* = recover(allocator, io, directory, intent);
+        report.retain(recover(allocator, io, directory, intent));
         report.delivery_complete = false;
     }
     report.process_cleanup_complete = true;
-    // The supervisor failure is the primary reason delivery failed, independent
-    // of the last recorded transfer outcome and of cleanup/recording failures.
-    if (delivery_failure) |failure| report.failures.primary = failure;
+    if (delivery_failure) |failure| report.failures.record(.primary, failure) catch unreachable;
     report.merge(child.failures);
     var bytes: [protocol.maximum_result]u8 = undefined;
     defer std.crypto.secureZero(u8, &bytes);
@@ -245,18 +248,8 @@ fn superviseChecked(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
     return report.*;
 }
 
-fn initial(intent: protocol.Intent) Report {
-    return .{
-        .attempt_id = intent.attempt_id,
-        .job_sha256 = intent.job_sha256,
-        .kind = intent.kind,
-        .progress = .{},
-        .side_effect = if (intent.plan.mutations == 0) .not_applicable else .not_started,
-    };
-}
-
 fn recover(allocator: std.mem.Allocator, io: std.Io, directory: core.private_files.Directory, intent: protocol.Intent) Report {
-    var result = initial(intent);
+    var result = Report.initial(intent);
     result.progress = null;
     result.side_effect = if (intent.plan.mutations == 0) .not_applicable else .unknown;
     var bytes = directory.readSensitive(io, allocator, job.state_name, protocol.maximum_result, null) catch {
@@ -264,7 +257,7 @@ fn recover(allocator: std.mem.Allocator, io: std.Io, directory: core.private_fil
         return result;
     };
     defer bytes.deinit();
-    const recorded = Report.parse(allocator, bytes.bytes(), intent) catch {
+    const recorded = Report.recover(allocator, bytes.bytes(), intent) catch {
         result.failures.record(.recording, .{ .stage = .state_record, .category = .invalid_response }) catch unreachable;
         return result;
     };

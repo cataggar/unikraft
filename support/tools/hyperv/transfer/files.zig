@@ -101,7 +101,14 @@ pub const InputReader = struct {
         };
 
         var buffer: [buffer_size]u8 = undefined;
-        const count = self.source.file.readPositional(self.source.io, &.{buffer[0..limit.minInt(buffer.len)]}, self.offset) catch |err| {
+        if (self.offset > self.source.expected.size) {
+            self.failure = error.InputChanged;
+            return error.ReadFailed;
+        }
+        // A failed stream may expose one excess-byte probe, never an unbounded
+        // growing suffix. Successful streams still provide exactly the input.
+        const wanted: usize = @intCast(@min(limit.minInt(buffer.len), self.source.expected.size - self.offset + 1));
+        const count = self.source.file.readPositional(self.source.io, &.{buffer[0..wanted]}, self.offset) catch |err| {
             self.failure = err;
             return error.ReadFailed;
         };

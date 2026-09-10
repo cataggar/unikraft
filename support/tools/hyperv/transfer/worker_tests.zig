@@ -66,6 +66,14 @@ const Fixture = struct {
         });
     }
 
+    fn createContainer(self: Fixture) !void {
+        var original = try self.directory.readSensitive(io, allocator, "request.json", 8192, null);
+        defer original.deinit();
+        const changed = try mutateOne(original.bytes(), "\"create_container\":false", "\"create_container\":true");
+        defer allocator.free(changed);
+        try self.put("request.json", changed);
+    }
+
     fn deinit(self: Fixture) void {
         self.directory.close(io);
         self.root.dir.deleteTree(io, &self.name) catch @panic("worker fixture cleanup failed");
@@ -73,6 +81,11 @@ const Fixture = struct {
         allocator.free(self.path);
     }
 };
+
+fn mutateOne(raw: []const u8, before: []const u8, after: []const u8) ![]u8 {
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, raw, before));
+    return std.mem.replaceOwned(u8, allocator, raw, before, after);
+}
 
 fn noChildren() !void {
     var status: u32 = 0;
@@ -268,6 +281,8 @@ test "strict worker result protocol rejects extra fields numeric coercions and i
         .{ "\"schema_version\":1", "\"schema_version\":true" },
         .{ "\"bytes_confirmed\":17", "\"bytes_confirmed\":17.0" },
         .{ "\"bytes_confirmed\":17", "\"bytes_confirmed\":0" },
+        .{ "\"bytes_accepted\":17", "\"bytes_accepted\":0" },
+        .{ "\"bytes_streamed\":17", "\"bytes_streamed\":0" },
         .{ "\"status\":201", "\"status\":403" },
         .{ "\"status\":201},\"phase\"", "\"status\":200},\"phase\"" },
         .{ "\"status\":201},\"schema_version\"", "\"status\":200},\"schema_version\"" },
@@ -278,7 +293,117 @@ test "strict worker result protocol rejects extra fields numeric coercions and i
         defer allocator.free(raw);
         if (protocol.Report.parse(allocator, raw, intent)) |_| return error.InvalidReportAccepted else |_| {}
     }
+    var inconsistent = result;
+    inconsistent.outcome.?.bytes_accepted = 0;
+    try testing.expect(!inconsistent.succeeded());
+    try testing.expectError(error.InvalidReport, inconsistent.write(&writer));
+    inconsistent = result;
+    inconsistent.progress.?.mutations_confirmed = 0;
+    try testing.expect(!inconsistent.succeeded());
+    inconsistent = result;
+    inconsistent.admitted_plan = null;
+    try testing.expect(!inconsistent.succeeded());
     try noChildren();
+}
+
+test "native recovery rejects pending no-mutation claims including zero-byte mutations" {
+    for ([_]struct { size: usize, container: bool }{
+        .{ .size = 17, .container = false },
+        .{ .size = 0, .container = false },
+        .{ .size = 0, .container = true },
+    }) |case| {
+        const fixture = try Fixture.init("pending_forgery", .blob, case.size, false, 1500);
+        defer fixture.deinit();
+        if (case.container) try fixture.createContainer();
+        const result = fixture.run(null);
+        try testing.expectEqual(.timeout, result.failures.primary.?.category);
+        try testing.expectEqual(.invalid_response, result.failures.recording.?.category);
+        try testing.expectEqual(.unknown, result.side_effect);
+        try testing.expect(result.progress.?.pending_mutation);
+        try testing.expectEqual(@as(u64, 1), result.progress.?.mutations_attempted);
+        try testing.expectEqual(@as(u64, 0), result.progress.?.mutations_confirmed);
+        try testing.expectEqual(@as(u64, if (case.container) 0 else case.size), result.progress.?.bytes_attempted);
+        var raw = try fixture.directory.readSensitive(io, allocator, core.transfer.job.state_name, protocol.maximum_result, null);
+        defer raw.deinit();
+        const intent = try protocol.Intent.load(allocator, io, fixture.directory);
+        try testing.expectError(error.InvalidReport, protocol.Report.parse(allocator, raw.bytes(), intent));
+        try testing.expect(!result.succeeded());
+        try safeReport(result);
+        try noChildren();
+    }
+}
+
+test "native counter forgery cannot succeed and recovery preserves confirmed progress" {
+    const fixture = try Fixture.init("counter_forgery", .blob, 17, false, 5000);
+    defer fixture.deinit();
+    const result = fixture.run(null);
+    try testing.expect(!result.succeeded());
+    try testing.expectEqual(.invalid_response, result.failures.primary.?.category);
+    try testing.expectEqual(.invalid_response, result.failures.recording.?.category);
+    try testing.expectEqual(.accepted, result.side_effect);
+    try testing.expectEqual(@as(u64, 17), result.progress.?.bytes_confirmed);
+    try testing.expectEqual(@as(u64, 1), result.progress.?.mutations_confirmed);
+    try testing.expect(result.outcome == null);
+    try testing.expect(!result.delivery_complete);
+    try safeReport(result);
+    try noChildren();
+}
+
+test "native zero-byte rejected partial and short-reader controls preserve distinct counter meanings" {
+    const Case = struct {
+        mode: []const u8,
+        size: usize = 0,
+        container: bool = false,
+        effect: core.transfer.diagnostic.Certainty,
+        confirmed: u64,
+        accepted: u64 = 0,
+        streamed: u64 = 0,
+        complete: bool = false,
+    };
+    for ([_]Case{
+        .{ .mode = "pass", .effect = .accepted, .confirmed = 1, .complete = true },
+        .{ .mode = "pass", .container = true, .effect = .accepted, .confirmed = 2, .complete = true },
+        .{ .mode = "reject", .effect = .rejected, .confirmed = 0 },
+        .{ .mode = "reject_second", .container = true, .effect = .incomplete, .confirmed = 1 },
+        .{ .mode = "partial", .container = true, .effect = .unknown, .confirmed = 1 },
+        .{ .mode = "container_body_failure", .size = 17, .container = true, .effect = .incomplete, .confirmed = 1 },
+        .{ .mode = "early_accept", .size = 17, .effect = .accepted, .confirmed = 1, .accepted = 17 },
+        .{ .mode = "short_source", .size = 17, .effect = .unknown, .confirmed = 0 },
+        .{ .mode = "growing_source", .size = 17, .effect = .unknown, .confirmed = 0, .streamed = 18 },
+    }) |case| {
+        const fixture = try Fixture.init(case.mode, .blob, case.size, false, 5000);
+        defer fixture.deinit();
+        if (case.container) try fixture.createContainer();
+        const result = fixture.run(null);
+        try testing.expectEqual(case.effect, result.side_effect);
+        try testing.expectEqual(case.confirmed, result.progress.?.mutations_confirmed);
+        try testing.expectEqual(case.accepted, result.outcome.?.bytes_accepted);
+        try testing.expectEqual(case.streamed, result.outcome.?.bytes_streamed);
+        try testing.expectEqual(case.complete, result.succeeded());
+        try testing.expect(result.failures.recording == null);
+        try safeReport(result);
+        try noChildren();
+    }
+}
+
+test "read-only failures and pending footer reads do not invent mutation uncertainty" {
+    for ([_]struct { mode: []const u8, pages: bool, pre_open: bool = false }{
+        .{ .mode = "pass", .pages = false, .pre_open = true },
+        .{ .mode = "disconnect", .pages = false },
+        .{ .mode = "blocked", .pages = false },
+        .{ .mode = "block_footer", .pages = true },
+    }) |case| {
+        const fixture = try Fixture.init(case.mode, if (case.pages) .pages else .blob, if (case.pages) 512 else 0, !case.pages, 1500);
+        defer fixture.deinit();
+        if (case.pre_open) try fixture.put("download", "existing");
+        const result = fixture.run(null);
+        try testing.expect(!result.succeeded());
+        try testing.expectEqual(if (case.pages) core.transfer.diagnostic.Certainty.accepted else .not_applicable, result.side_effect);
+        try testing.expectEqual(@as(u64, if (case.pages) 1 else 0), result.progress.?.mutations_confirmed);
+        try testing.expect(result.failures.recording == null);
+        try safeReport(result);
+        try noChildren();
+    }
 }
 
 test "installed CLI exposes supervised transfers and refuses unsupervised worker execution" {
@@ -452,4 +577,212 @@ test "outcome v2 preserves independent source metadata certainty and failure lan
         .header = .known,
         .header_code = .PendingCopyOperation,
     }).validate());
+}
+
+fn emit(journal: *protocol.Journal, event: core.transfer.client.Event) !void {
+    const observer = journal.observer();
+    try observer.notifyFn(observer.context, event);
+}
+
+fn roundtrip(report: protocol.Report, intent: protocol.Intent) !void {
+    var bytes: [protocol.maximum_result]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try report.write(&writer);
+    try testing.expectEqualDeep(report, try protocol.Report.parse(allocator, writer.buffered(), intent));
+}
+
+fn rejectSingleFields(report: protocol.Report, intent: protocol.Intent, changes: []const [2][]const u8) !void {
+    var bytes: [protocol.maximum_result]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try report.write(&writer);
+    for (changes) |change| {
+        const raw = try mutateOne(writer.buffered(), change[0], change[1]);
+        defer allocator.free(raw);
+        try testing.expectError(error.InvalidReport, protocol.Report.parse(allocator, raw, intent));
+        const recovered = try protocol.Report.recover(allocator, raw, intent);
+        try testing.expect(!recovered.succeeded());
+        try testing.expect(recovered.failures.recording != null);
+        try testing.expect(recovered.outcome == null);
+        try recovered.validate();
+    }
+}
+
+test "journal phase matrix validates serial transitions rollback heads and zero-byte prefixes" {
+    const intent: protocol.Intent = .{
+        .attempt_id = [_]u8{1} ** 32,
+        .job_sha256 = [_]u8{2} ** 32,
+        .request_sha256 = [_]u8{3} ** 32,
+        .sas_sha256 = [_]u8{4} ** 32,
+        .deadline_ns = 1000,
+        .parent_pid = 1,
+        .kind = .blob,
+        .plan = .{ .bytes = 17, .download_bytes = 0, .mutations = 2, .requests = 2 },
+    };
+    for ([_]struct { started: bool, status: ?u16, effect: core.transfer.diagnostic.Certainty }{
+        .{ .started = false, .status = null, .effect = .incomplete },
+        .{ .started = true, .status = null, .effect = .unknown },
+        .{ .started = true, .status = 412, .effect = .incomplete },
+        .{ .started = true, .status = 201, .effect = .accepted },
+    }) |case| {
+        const fixture = try Fixture.init("pass", .blob, 17, false, 5000);
+        defer fixture.deinit();
+        var lock = try fixture.directory.lock(io);
+        defer lock.close(io);
+        var journal: protocol.Journal = .{
+            .io = io,
+            .lock = &lock,
+            .plan = intent.plan,
+            .report = .initial(intent),
+        };
+        try journal.persist();
+        try roundtrip(journal.report, intent);
+        try rejectSingleFields(journal.report, intent, &.{
+            .{ "\"phase\":\"prepared\"", "\"phase\":\"observed\"" },
+            .{ "\"side_effect\":\"not_started\"", "\"side_effect\":\"unknown\"" },
+            .{ "\"requests_attempted\":0", "\"requests_attempted\":1" },
+        });
+        try emit(&journal, .{ .begin = .{ .stage = .container_create, .mutation = true, .bytes = 0 } });
+        try roundtrip(journal.report, intent);
+        try rejectSingleFields(journal.report, intent, &.{
+            .{ "\"side_effect\":\"unknown\"", "\"side_effect\":\"not_started\"" },
+            .{ "\"side_effect\":\"unknown\"", "\"side_effect\":\"accepted\"" },
+            .{ "\"side_effect\":\"unknown\"", "\"side_effect\":\"rejected\"" },
+            .{ "\"side_effect\":\"unknown\"", "\"side_effect\":\"incomplete\"" },
+            .{ "\"side_effect\":\"unknown\"", "\"side_effect\":\"not_applicable\"" },
+            .{ "\"phase\":\"in_flight\"", "\"phase\":\"observed\"" },
+            .{ "\"pending\":true", "\"pending\":false" },
+            .{ "\"pending_mutation\":true", "\"pending_mutation\":false" },
+            .{ "\"pending_bytes\":0", "\"pending_bytes\":1" },
+            .{ "\"mutations_attempted\":1", "\"mutations_attempted\":0" },
+            .{ "\"mutations_confirmed\":0", "\"mutations_confirmed\":1" },
+            .{ "\"responses_observed\":0", "\"responses_observed\":1" },
+            .{ "\"previous_effect\":\"not_started\"", "\"previous_effect\":\"accepted\"" },
+            .{ "\"status\":null", "\"status\":201" },
+        });
+        const pending = journal.report;
+        try testing.expectError(error.InvalidProgress, emit(&journal, .{ .end = .{ .transport_started = false, .status = 201 } }));
+        try testing.expectEqualDeep(pending, journal.report);
+        try emit(&journal, .{ .end = .{ .transport_started = true, .status = 201 } });
+        try roundtrip(journal.report, intent);
+        try testing.expectEqual(.incomplete, journal.report.side_effect);
+        try testing.expectEqual(@as(u64, 0), journal.report.progress.?.bytes_confirmed);
+        try rejectSingleFields(journal.report, intent, &.{
+            .{ "\"side_effect\":\"incomplete\"", "\"side_effect\":\"not_started\"" },
+            .{ "\"side_effect\":\"incomplete\"", "\"side_effect\":\"accepted\"" },
+            .{ "\"mutations_confirmed\":1", "\"mutations_confirmed\":0" },
+            .{ "\"status\":201", "\"status\":412" },
+        });
+        try emit(&journal, .{ .begin = .{ .stage = .block_put, .mutation = true, .bytes = 17 } });
+        try roundtrip(journal.report, intent);
+        try rejectSingleFields(journal.report, intent, &.{
+            .{ "\"previous_effect\":\"incomplete\"", "\"previous_effect\":\"not_started\"" },
+            .{ "\"bytes_attempted\":17", "\"bytes_attempted\":0" },
+            .{ "\"pending_bytes\":17", "\"pending_bytes\":0" },
+            .{ "\"mutations_confirmed\":1", "\"mutations_confirmed\":0" },
+        });
+        try emit(&journal, .{ .end = .{ .transport_started = case.started, .status = case.status } });
+        try testing.expectEqual(case.effect, journal.report.side_effect);
+        try roundtrip(journal.report, intent);
+        if (case.started and case.status != 201) {
+            const stopped = journal.report;
+            try testing.expectError(error.InvalidProgress, emit(&journal, .{ .begin = .{ .stage = .block_put, .mutation = true, .bytes = 0 } }));
+            try testing.expectEqualDeep(stopped, journal.report);
+        }
+        var outcome = core.transfer.Outcome.fail(.block_put, .transport);
+        outcome.side_effect = case.effect;
+        outcome.diagnostic.status = case.status;
+        outcome.bytes_accepted = if (case.status == 201) 17 else 0;
+        outcome.bytes_streamed = if (case.status != null) 17 else 0;
+        if (case.status == 201) {
+            outcome.completion = .complete;
+            outcome.diagnostic.category = .none;
+        }
+        const finished = journal.finish(outcome);
+        try roundtrip(finished, intent);
+        try testing.expect(finished.failures.recording == null);
+        if (case.status == 201) {
+            var parent = finished;
+            parent.process_cleanup_complete = true;
+            try testing.expect(parent.succeeded());
+        }
+    }
+}
+
+test "recovery preserves each existing failure lane and discards invalid progress conservatively" {
+    const fixture = try Fixture.init("metadata", .blob, 17, false, 5000);
+    defer fixture.deinit();
+    _ = fixture.run(null);
+    const intent = try protocol.Intent.load(allocator, io, fixture.directory);
+    var raw = try fixture.directory.readSensitive(io, allocator, core.transfer.job.state_name, protocol.maximum_result, null);
+    defer raw.deinit();
+    var original = try protocol.Report.parse(allocator, raw.bytes(), intent);
+    try original.failures.record(.cleanup, .{ .stage = .private_file, .category = .cleanup_failed });
+    try original.failures.record(.recording, .{ .stage = .state_record, .category = .local_io });
+    var bytes: [protocol.maximum_result]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try original.write(&writer);
+    const bad_outcome = try mutateOne(writer.buffered(), "\"bytes_accepted\":0", "\"bytes_accepted\":1");
+    defer allocator.free(bad_outcome);
+    const recovered = try protocol.Report.recover(allocator, bad_outcome, intent);
+    try testing.expectEqualDeep(original.failures, recovered.failures);
+    try testing.expectEqualDeep(original.progress, recovered.progress);
+    try testing.expectEqual(.rejected, recovered.side_effect);
+    try testing.expect(recovered.outcome == null);
+    const bad_progress = try mutateOne(writer.buffered(), "\"mutations_attempted\":1", "\"mutations_attempted\":0");
+    defer allocator.free(bad_progress);
+    const uncertain = try protocol.Report.recover(allocator, bad_progress, intent);
+    try testing.expectEqualDeep(original.failures, uncertain.failures);
+    try testing.expectEqual(.unknown, uncertain.side_effect);
+    try testing.expect(uncertain.progress == null);
+    try uncertain.validate();
+    var parent = protocol.Report.initial(intent);
+    try parent.failures.record(.primary, .{ .stage = .transfer_worker, .category = .timeout });
+    const prior = parent.failures.primary.?;
+    parent.retain(recovered);
+    try testing.expectEqualDeep(prior, parent.failures.primary.?);
+    try testing.expectEqualDeep(original.failures.cleanup, parent.failures.cleanup);
+    try testing.expectEqualDeep(original.failures.recording, parent.failures.recording);
+    try noChildren();
+}
+
+test "write-ahead recording refusal rolls back unentered zero-byte and payload mutations" {
+    for ([_]u64{ 0, 17 }) |size| {
+        const fixture = try Fixture.init("pass", .blob, @intCast(size), false, 5000);
+        defer fixture.deinit();
+        var lock = try fixture.directory.lock(io);
+        defer lock.close(io);
+        const intent: protocol.Intent = .{
+            .attempt_id = [_]u8{1} ** 32,
+            .job_sha256 = [_]u8{2} ** 32,
+            .request_sha256 = [_]u8{3} ** 32,
+            .sas_sha256 = [_]u8{4} ** 32,
+            .deadline_ns = 1000,
+            .parent_pid = 1,
+            .kind = .blob,
+            .plan = .{ .bytes = size, .download_bytes = 0, .mutations = 1, .requests = 1 },
+        };
+        var journal: protocol.Journal = .{
+            .io = io,
+            .lock = &lock,
+            .plan = intent.plan,
+            .report = .initial(intent),
+        };
+        try journal.persist();
+        try fixture.directory.dir.deleteFile(io, core.transfer.job.state_name);
+        try fixture.directory.dir.createDir(io, core.transfer.job.state_name, .fromMode(0o700));
+        try testing.expectError(error.RecordingFailed, emit(&journal, .{ .begin = .{
+            .stage = if (size == 0) .container_create else .block_put,
+            .mutation = true,
+            .bytes = size,
+        } }));
+        try testing.expect(journal.report.progress.?.pending_mutation);
+        var outcome = core.transfer.Outcome.fail(.block_put, .none);
+        try outcome.failures.record(.recording, .{ .stage = .state_record, .category = .local_io });
+        const result = journal.finish(outcome);
+        try testing.expectEqual(.not_started, result.side_effect);
+        try testing.expectEqual(@as(u64, 0), result.progress.?.mutations_attempted);
+        try testing.expectEqual(@as(u64, 0), result.progress.?.bytes_attempted);
+        try testing.expect(result.failures.primary == null and result.failures.recording != null);
+        try roundtrip(result, intent);
+    }
 }

@@ -1,7 +1,31 @@
 const std = @import("std");
 const core = @import("hyperv");
 const sdk = @import("azure_sdk_core");
-const Mode = enum { pass, partial, blocked, blocked_lock_failure, final_lock_failure, malformed, stale, flood, stderr_secret, metadata, cleanup_failure, recording_failure, changed_request };
+const Mode = enum {
+    pass,
+    partial,
+    blocked,
+    blocked_lock_failure,
+    final_lock_failure,
+    malformed,
+    stale,
+    flood,
+    stderr_secret,
+    metadata,
+    cleanup_failure,
+    recording_failure,
+    changed_request,
+    pending_forgery,
+    counter_forgery,
+    reject,
+    reject_second,
+    container_body_failure,
+    early_accept,
+    short_source,
+    growing_source,
+    disconnect,
+    block_footer,
+};
 
 pub fn main(init: std.process.Init) void {
     run(init) catch std.process.exit(2);
@@ -44,7 +68,17 @@ fn run(init: std.process.Init) !void {
     ));
     var stdout = std.Io.File.stdout().writer(init.io, &.{});
     if (mode == .final_lock_failure) try invalidateLock(init.io, directory);
-    if (mode == .malformed) {
+    if (mode == .counter_forgery) {
+        var raw = try directory.readSensitive(init.io, allocator, core.transfer.job.state_name, core.transfer.worker.protocol.maximum_result, null);
+        defer raw.deinit();
+        const corrupt = try replaceOne(allocator, raw.bytes(), "\"bytes_accepted\":17", "\"bytes_accepted\":0");
+        defer allocator.free(corrupt);
+        var lock = try directory.lock(init.io);
+        defer lock.close(init.io);
+        const saved = try lock.commit(init.io, core.transfer.job.state_name, corrupt);
+        if (saved.status != .durable) return error.RecordingFailed;
+        try stdout.interface.writeAll(corrupt);
+    } else if (mode == .malformed) {
         try stdout.interface.writeAll("{\"unexpected\":\"SYNTHETIC_SECRET?sig=PRIVATE\"}\n");
     } else if (mode == .flood) {
         while (true) try stdout.interface.writeAll("SYNTHETIC_SECRET?sig=PRIVATE\n");
@@ -56,6 +90,11 @@ fn run(init: std.process.Init) !void {
         }
         try report.write(&stdout.interface);
     }
+}
+
+fn replaceOne(allocator: std.mem.Allocator, raw: []const u8, before: []const u8, after: []const u8) ![]u8 {
+    if (std.mem.count(u8, raw, before) != 1) return error.InvalidMutationFixture;
+    return std.mem.replaceOwned(u8, allocator, raw, before, after);
 }
 
 fn invalidateLock(io: std.Io, directory: core.private_files.Directory) !void {
@@ -80,20 +119,41 @@ const Mock = struct {
         self.calls += 1;
         if (request.retryable or request.redirect_policy != .not_allowed or request.getHeader("Authorization") != null)
             return error.UnsafeRequest;
-        if (self.mode == .blocked or self.mode == .blocked_lock_failure) {
+        if (self.mode == .blocked or self.mode == .blocked_lock_failure or self.mode == .pending_forgery or
+            (self.mode == .block_footer and request.method == .GET))
+        {
             try self.directory.dir.writeFile(self.io, .{
                 .sub_path = "entered",
                 .data = "native",
                 .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) },
             });
             if (self.mode == .blocked_lock_failure) try invalidateLock(self.io, self.directory);
+            if (self.mode == .pending_forgery) {
+                var raw = try self.directory.readSensitive(self.io, self.allocator, core.transfer.job.state_name, core.transfer.worker.protocol.maximum_result, null);
+                defer raw.deinit();
+                const corrupt = try replaceOne(self.allocator, raw.bytes(), "\"side_effect\":\"unknown\"", "\"side_effect\":\"not_started\"");
+                defer self.allocator.free(corrupt);
+                const file = try self.directory.dir.openFile(self.io, core.transfer.job.state_name, .{ .mode = .write_only });
+                defer file.close(self.io);
+                try file.setLength(self.io, corrupt.len);
+                try file.writePositionalAll(self.io, corrupt, 0);
+                try file.sync(self.io);
+            }
             while (true) {
                 const duration: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
                 _ = std.os.linux.nanosleep(&duration, null);
             }
         }
-        if (self.mode == .partial and self.calls == 2) return error.SyntheticDisconnected;
-        if (options.body) |body| {
+        if (self.mode == .disconnect or (self.mode == .partial and self.calls == 2)) return error.SyntheticDisconnected;
+        if (self.mode == .short_source or self.mode == .growing_source) {
+            const file = try self.directory.dir.openFile(self.io, "source", .{ .mode = .read_write });
+            defer file.close(self.io);
+            if (self.mode == .short_source) {
+                try file.setLength(self.io, 0);
+            } else try file.writePositionalAll(self.io, "SYNTHETIC_GROWTH", (try file.stat(self.io)).size);
+        }
+        if (options.body != null and self.mode != .early_accept) {
+            const body = options.body.?;
             var buffer: [4093]u8 = undefined;
             defer std.crypto.secureZero(u8, &buffer);
             var count: u64 = 0;
@@ -128,7 +188,7 @@ const Mock = struct {
         const footer = request.getHeader("x-ms-range-get-content-md5") != null;
         const response: []const u8 = if (request.method == .GET)
             (if (footer) &operation.footer else "synthetic evidence")
-        else if (self.mode == .metadata)
+        else if (self.mode == .metadata or (self.mode == .container_body_failure and self.calls == 1))
             "SYNTHETIC_SECRET?sig=PRIVATE"
         else
             "";
@@ -146,7 +206,7 @@ const Mock = struct {
         if (self.mode == .metadata) try headers.append("x-ms-error-code", "AuthorizationServiceMismatch");
         if (self.mode == .cleanup_failure) try headers.append("Content-MD5", "AAAAAAAAAAAAAAAAAAAAAA==");
         operation.interface = .{
-            .status_code = if (self.mode == .metadata) 403 else if (request.method == .GET) (if (footer) @as(u16, 206) else 200) else 201,
+            .status_code = if (self.mode == .reject or (self.mode == .reject_second and self.calls == 2)) 412 else if (self.mode == .metadata) 403 else if (request.method == .GET) (if (footer) @as(u16, 206) else 200) else 201,
             .headers = std.StringHashMap([]const u8).init(self.allocator),
             .response_headers = headers,
             .body_reader = &operation.reader,

@@ -69,6 +69,24 @@ pub const Plan = struct {
     mutations: u64,
     requests: u64,
 
+    pub fn validate(self: Plan, kind: Kind) !void {
+        if (self.requests == 0 or self.requests > 1026 or self.mutations > self.requests or
+            self.bytes > 128 * @as(u64, request.maximum_file) or
+            self.download_bytes > 128 * @as(u64, request.maximum_file)) return error.InvalidJob;
+        switch (kind) {
+            .blob => {
+                if (self.mutations == 0) {
+                    if (self.bytes != 0) return error.InvalidJob;
+                } else if (self.mutations != self.requests or self.download_bytes != 0) return error.InvalidJob;
+            },
+            .pages => {
+                if (self.bytes < 512 or self.bytes > request.maximum_disk_bytes or self.bytes % 512 != 0 or
+                    self.mutations != (self.bytes - 1) / (4 * 1024 * 1024) + 1 or
+                    self.requests != self.mutations + 1 or self.download_bytes != 512) return error.InvalidJob;
+            },
+        }
+    }
+
     pub fn parse(value: std.json.Value) !Plan {
         const o = try core.contracts.exactFields(value, &.{ "bytes", "download_bytes", "mutations", "requests" });
         const result: Plan = .{
