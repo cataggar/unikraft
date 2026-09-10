@@ -8,7 +8,7 @@ fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hyperv_core", .module = b.createModule(.{
-                .root_source_file = b.path("../root.zig"),
+                .root_source_file = b.path("../core.zig"),
                 .target = target,
                 .optimize = optimize,
             }) },
