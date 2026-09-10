@@ -4686,6 +4686,25 @@ class PrivatePreflightRun(azure.AzureRun):
         ):
             raise RuntimeError("Private host security profile is incompatible")
 
+    @staticmethod
+    def verify_host_disk_size(disk, description):
+        if not isinstance(disk, dict):
+            raise RuntimeError(
+                f"Private preflight {description} size metadata is incompatible"
+            )
+        # AAZ commands preserve GB; older SDK-based commands emitted Gb.
+        sizes = [
+            disk[field] for field in ("diskSizeGB", "diskSizeGb")
+            if field in disk
+        ]
+        if (
+            not sizes
+            or any(type(size) is not int or size != 32 for size in sizes)
+        ):
+            raise RuntimeError(
+                f"Private preflight {description} size metadata is incompatible"
+            )
+
     def verify_deployed_envelope(self):
         receipt = self.state["host_deployment"]
         vm, disk = self.settle_host_identity(min(
@@ -4698,12 +4717,13 @@ class PrivatePreflightRun(azure.AzureRun):
         image_reference = storage_profile.get("imageReference", {})
         interfaces = vm.get("networkProfile", {}).get("networkInterfaces")
         ids = self.expected_host_ids()
+        self.verify_host_disk_size(os_disk, "VM OS disk")
+        self.verify_host_disk_size(disk, "managed OS disk")
         if (
             vm.get("provisioningState") != "Succeeded"
             or vm.get("location") != LOCATION
             or vm.get("hardwareProfile", {}).get("vmSize") != VM_SIZE
             or storage_profile.get("dataDisks") != []
-            or os_disk.get("diskSizeGb") != 32
             or os_disk.get("createOption") != "FromImage"
             or os_disk.get("caching") != "ReadWrite"
             or os_disk.get("deleteOption") != "Delete"
@@ -4717,7 +4737,6 @@ class PrivatePreflightRun(azure.AzureRun):
             != ids["nic_id"].lower()
             or interfaces[0].get("primary") is not True
             or interfaces[0].get("deleteOption") != "Delete"
-            or disk.get("diskSizeGb") != 32
             or disk.get("location") != LOCATION
             or disk.get("sku", {}).get("name") != "StandardSSD_LRS"
             or disk.get("osType") != "Linux"

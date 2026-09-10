@@ -666,7 +666,7 @@ class PrivatePreflightFixture(unittest.TestCase):
             "storageProfile": {
                 "imageReference": image,
                 "osDisk": {
-                    "diskSizeGb": 32,
+                    "diskSizeGB": 32,
                     "createOption": "FromImage",
                     "caching": "ReadWrite",
                     "deleteOption": "Delete",
@@ -682,7 +682,7 @@ class PrivatePreflightFixture(unittest.TestCase):
             "uniqueId": receipt["disk_uuid"]
             or "55555555-5555-4555-8555-555555555555",
             "managedBy": receipt["vm_id"],
-            "diskSizeGb": 32,
+            "diskSizeGB": 32,
             "sku": {"name": "StandardSSD_LRS"},
             "osType": "Linux",
             "hyperVGeneration": "V2",
@@ -700,8 +700,6 @@ class PrivatePreflightFixture(unittest.TestCase):
             name: vm[name]
             for name in ("vmId", "provisioningState", "storageProfile")
         })
-        os_disk = properties["storageProfile"]["osDisk"]
-        os_disk["diskSizeGB"] = os_disk.pop("diskSizeGb")
         properties["securityProfile"] = {"securityType": "Standard"}
         return {
             "id": vm["id"], "tags": copy.deepcopy(vm["tags"]),
@@ -4177,6 +4175,59 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 run.verify_deployed_envelope()
             run.az.assert_not_called()
 
+    def test_host_disk_size_accepts_current_and_legacy_cli_fields(self):
+        for fields in (
+            {"diskSizeGB": 32},
+            {"diskSizeGb": 32},
+            {"diskSizeGB": 32, "diskSizeGb": 32},
+        ):
+            with self.subTest(fields=fields):
+                preflight.PrivatePreflightRun.verify_host_disk_size(
+                    fields, "VM OS disk"
+                )
+
+    def test_deployed_envelope_rejects_missing_or_ambiguous_disk_sizes(self):
+        for role in ("VM OS disk", "managed OS disk"):
+            for fields in (
+                {},
+                {"diskSizegb": 32},
+                {"diskSizeGB": None},
+                {"diskSizeGB": False},
+                {"diskSizeGB": 32.0},
+                {"diskSizeGB": "32"},
+                {"diskSizeGB": 31},
+                {"diskSizeGB": 64},
+                {"diskSizeGB": []},
+                {"diskSizeGB": {}},
+                {"diskSizeGb": None},
+                {"diskSizeGb": 32.0},
+                {"diskSizeGB": 32, "diskSizeGb": 64},
+                {"diskSizeGB": 32, "diskSizeGb": 32.0},
+                {"diskSizeGB": None, "diskSizeGb": 32},
+            ):
+                with self.subTest(role=role, fields=fields):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        run, state = self.run_fixture(Path(temporary))
+                        self.begin_operation(run, state)
+                        vm, disk = self.vm_disk(run, state)
+                        target = (
+                            vm["storageProfile"]["osDisk"]
+                            if role == "VM OS disk" else disk
+                        )
+                        del target["diskSizeGB"]
+                        target.update(fields)
+                        original = copy.deepcopy(state)
+                        run.verify_host_identity = mock.Mock(
+                            return_value=(vm, disk)
+                        )
+                        with self.assertRaisesRegex(
+                            RuntimeError, role + " size metadata"
+                        ):
+                            run.verify_deployed_envelope()
+                        run.az.assert_not_called()
+                        run.record.assert_not_called()
+                        self.assertEqual(state, original)
+
     def test_security_read_is_versioned_and_bound_to_original_vm(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
@@ -4384,6 +4435,17 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             run.verify_deployed_envelope()
             run.verify_storage_rules.assert_called_once_with()
             run.verify_resource_inventory.assert_called_once_with()
+            legacy_vm = copy.deepcopy(vm)
+            legacy_disk = copy.deepcopy(disk)
+            legacy_os_disk = legacy_vm["storageProfile"]["osDisk"]
+            legacy_os_disk["diskSizeGb"] = legacy_os_disk.pop("diskSizeGB")
+            legacy_disk["diskSizeGb"] = legacy_disk.pop("diskSizeGB")
+            run.verify_host_identity.return_value = (legacy_vm, legacy_disk)
+            run.az.side_effect = [
+                arm_vm, nic, nsg, vnet, subnet, storage, schedule,
+            ]
+            run.verify_deployed_envelope()
+            run.verify_host_identity.return_value = (vm, disk)
             reversed_pair = copy.deepcopy(subnet)
             reversed_pair["serviceEndpoints"][0]["locations"].reverse()
             run.az.side_effect = [

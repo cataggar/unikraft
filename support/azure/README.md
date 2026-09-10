@@ -445,6 +445,13 @@ in the CLI response's `enableHttpsTrafficOnly` field. The ARM template uses
 `supportsHttpsTrafficOnly`; that wire-format name is not a substitute for the
 CLI's flattened SDK field. Missing, false or malformed CLI values fail closed.
 
+VM and managed-disk size reads accept the current AAZ command field
+`diskSizeGB` and the older SDK-based command field `diskSizeGb`. Each resource
+must explicitly report integer `32`; if both spellings are present, both must
+agree. Missing, null, non-integer, conflicting or different sizes fail before
+public staging. Standalone SDK model serialization is not a substitute for
+the output contract of the actual CLI command.
+
 Before staging public inputs, the controller reads the host security profile
 through `az resource show` with the already-required Compute API
 `2025-11-01`. Older VM read APIs can omit Standard security metadata;
