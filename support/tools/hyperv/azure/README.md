@@ -164,8 +164,15 @@ status-monitor plus result-Location and direct Location result protocols are
 supported. A missing secret result fails instead of replaying a grant or key
 rotation. HTTP success/LRO success does not bypass resource reconciliation.
 
-These are synchronous SDK transports. Between-read cancellation and deadlines
-cannot interrupt every blocked socket, DNS operation or native callback.
+Each response loop uses a single `readVec` progress call with budget checks
+before and after it, including zero progress, errors and explicit EndOfStream.
+Zero progress is not EOF. This covers successful JSON, LRO and error responses,
+including credential responses. Budget stops cancel the HTTP operation without
+another read. After guarded EOF, the transport closes locally instead of calling
+the SDK's unbudgeted draining `finish`; this does not undo an accepted ARM action.
+
+These are synchronous SDK transports. Per-progress cancellation and deadlines
+cannot interrupt a blocked socket, DNS operation or native callback.
 **An independently supervised worker with the foundation's hard process-tree
 deadline is mandatory before live use.** Durable mutation intent, exclusive
 locks, process supervision, resource-admission policy, artifact/image proofs,
@@ -225,6 +232,7 @@ the `zig fetch` inputs without any network access.
 
 The native fixtures cover exact HTTP binding, expiry and OAuth errors,
 redaction/zeroization, raw aliases/types/duplicates, authority escapes,
+one-byte progress cancellation/deadline stops, zero progress and explicit EOF,
 pagination/filter/cycles, LRO result variants and failures, ambiguity/no replay,
 disk geometry/upload/revocation, created-resource reconciliation, schedule
 completion/deletion, network rejection, firewall preservation, key rotation and

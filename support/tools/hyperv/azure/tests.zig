@@ -48,6 +48,14 @@ const account_ref: s.Ref = .{ .kind = .storage, .name = "syntheticaccount" };
 const group_ref: s.Ref = .{ .kind = .group, .name = "synthetic-group" };
 const disk_identity: ops.DiskIdentity = .{ .disk = disk_ref, .original_uuid = disk_uuid.*, .geometry = .{ .sectors = 8388608, .sector_size = 512 } };
 
+const Progress = struct {
+    fragment: usize = 1,
+    zero_first: bool = false,
+    fail_read: bool = false,
+    stop: enum { none, deadline, cancellation } = .none,
+    on: enum { data, zero, eof, failure } = .data,
+};
+
 const Step = struct {
     url: []const u8,
     method: sdk.http.Method = .GET,
@@ -58,6 +66,7 @@ const Step = struct {
     body_contains: ?[]const u8 = null,
     fail: bool = false,
     cancel: bool = false,
+    progress: ?Progress = null,
 };
 const Harness = struct {
     steps: []const Step,
@@ -71,6 +80,10 @@ const Harness = struct {
     crypto: sdk.crypto.StdCryptoProvider = .init(t.io),
     token: auth.Token,
     mock: ?sdk.http.MockTransport = null,
+    response_reader: ?ProgressReader = null,
+    response_calls: usize = 0,
+    response_calls_after_stop: usize = 0,
+    response_bytes: usize = 0,
 
     fn init(steps: []const Step) !Harness {
         return .{ .steps = steps, .token = .{
@@ -109,9 +122,11 @@ const Harness = struct {
     }
     fn finishMock(self: *Harness) void {
         if (self.mock) |*mock| {
-            if (mock.call_count != mock.stream_deinit_count) self.broken = true;
+            if (mock.call_count != mock.stream_deinit_count or mock.stream_finish_count != 0 or
+                mock.stream_abort_count + mock.stream_cancel_count != mock.call_count) self.broken = true;
             mock.deinit();
             self.mock = null;
+            self.response_reader = null;
         }
     }
     fn monotonic(context: *anyopaque) u64 {
@@ -157,9 +172,65 @@ const Harness = struct {
         self.finishMock();
         self.mock = sdk.http.MockTransport.init(a, step.status, step.response);
         self.mock.?.response_headers_list = step.headers;
-        return self.mock.?.asTransport().open(request, options);
+        const operation = try self.mock.?.asTransport().open(request, options);
+        if (step.progress) |progress| {
+            self.response_reader = .{
+                .owner = self,
+                .body = step.response,
+                .progress = progress,
+                .reader = .{ .vtable = &.{ .stream = ProgressReader.stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+            };
+            operation.body_reader = &self.response_reader.?.reader;
+        }
+        return operation;
     }
 };
+
+const ProgressReader = struct {
+    owner: *Harness,
+    body: []const u8,
+    progress: Progress,
+    reader: std.Io.Reader,
+    offset: usize = 0,
+    sent_zero: bool = false,
+
+    fn stop(self: *ProgressReader, event: @FieldType(Progress, "on")) void {
+        if (event != self.progress.on) return;
+        switch (self.progress.stop) {
+            .none => {},
+            .deadline => self.owner.now_ms = self.owner.budget.deadline_ms,
+            .cancellation => self.owner.cancellation.cancel(),
+        }
+    }
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *ProgressReader = @fieldParentPtr("reader", reader);
+        self.owner.response_calls += 1;
+        if (self.owner.cancellation.isCancelled() or self.owner.now_ms >= self.owner.budget.deadline_ms) {
+            self.owner.response_calls_after_stop += 1;
+            return error.ReadFailed;
+        }
+        if (self.progress.zero_first and !self.sent_zero) {
+            self.sent_zero = true;
+            self.stop(.zero);
+            return 0;
+        }
+        if (self.progress.fail_read) {
+            self.stop(.failure);
+            return error.ReadFailed;
+        }
+        if (self.offset == self.body.len) {
+            self.stop(.eof);
+            return error.EndOfStream;
+        }
+        const count = try writer.write(self.body[self.offset..][0..@min(limit.minInt(self.progress.fragment), self.body.len - self.offset)]);
+        self.offset += count;
+        self.owner.response_bytes += count;
+        self.stop(.data);
+        return count;
+    }
+};
+
 fn requireOk(outcome: wire.Outcome(client.Result)) !client.Result {
     return switch (outcome) {
         .ok => |result| result,
@@ -1154,4 +1225,125 @@ test "typed request constructors encode exact raw strings arrays and numeric fie
     try t.expectEqualStrings(disk_path, try models.string(try models.field(try models.field(profile, "osDisk"), "managedDisk"), "id"));
     const nics = try models.array(try models.field(try models.field(vm_properties, "networkProfile"), "networkInterfaces"));
     try t.expectEqual(@as(usize, 1), nics.len);
+}
+
+test "response progress stops at cancellation or deadline without another read" {
+    for ([_]u16{ 200, 403, 500 }) |status| {
+        for ([_]@FieldType(Progress, "stop"){ .deadline, .cancellation }) |stop| {
+            var h = try Harness.init(&.{.{
+                .url = group_url,
+                .method = .PUT,
+                .authorization = false,
+                .status = status,
+                .response = if (status == 200) group_json else "{\"error\":{\"code\":\"AuthorizationFailed\",\"message\":\"SYNTHETIC_SECRET\"}}",
+                .progress = .{ .stop = stop },
+            }});
+            defer h.deinit();
+            const channel = h.channel();
+            var request = sdk.http.Request.init(a, .PUT, group_url);
+            defer request.deinit();
+            try requireFailure(channel.send(&request, true, .arm), if (stop == .deadline) .timeout else .cancelled, if (status == 200) .accepted else if (status == 403) .rejected else .unknown, status);
+            try t.expectEqual(@as(usize, 1), h.response_calls);
+            try t.expectEqual(@as(usize, 1), h.response_bytes);
+            try t.expectEqual(@as(usize, 0), h.response_calls_after_stop);
+            try t.expectEqual(@as(usize, 1), h.mock.?.stream_cancel_count);
+        }
+    }
+}
+
+test "zero progress EOF and read failure still perform the post-read budget check" {
+    for ([_]@FieldType(Progress, "on"){ .zero, .eof, .failure }) |event| {
+        for ([_]@FieldType(Progress, "stop"){ .deadline, .cancellation }) |stop| {
+            var h = try Harness.init(&.{.{
+                .url = group_url,
+                .method = .PUT,
+                .authorization = false,
+                .response = if (event == .eof) "" else group_json,
+                .progress = .{ .stop = stop, .on = event, .zero_first = event == .zero, .fail_read = event == .failure },
+            }});
+            defer h.deinit();
+            const channel = h.channel();
+            var request = sdk.http.Request.init(a, .PUT, group_url);
+            defer request.deinit();
+            try requireFailure(channel.send(&request, true, .arm), if (stop == .deadline) .timeout else .cancelled, .accepted, 200);
+            try t.expectEqual(@as(usize, 1), h.response_calls);
+            try t.expectEqual(@as(usize, 0), h.response_bytes);
+            try t.expectEqual(@as(usize, 0), h.response_calls_after_stop);
+            try t.expectEqual(@as(usize, 1), h.mock.?.stream_cancel_count);
+        }
+    }
+}
+
+test "zero response progress is not EOF and success never invokes unbounded finish" {
+    var h = try Harness.init(&.{.{
+        .url = group_url,
+        .response = group_json,
+        .progress = .{ .zero_first = true, .fragment = 7 },
+    }});
+    defer h.deinit();
+    var arm = h.arm();
+    var result = try requireOk(arm.execute(.{ .get = group_ref }));
+    defer result.deinit();
+    try t.expectEqual(.succeeded, result.model.group);
+    try t.expectEqual(group_json.len, h.response_bytes);
+    try t.expectEqual(@as(usize, (group_json.len + 6) / 7 + 2), h.response_calls);
+    try t.expectEqual(@as(usize, 0), h.mock.?.stream_finish_count);
+    try t.expectEqual(@as(usize, 1), h.mock.?.stream_abort_count);
+}
+
+test "response read failures are not EOF and release the operation without draining" {
+    var h = try Harness.init(&.{.{ .url = group_url, .response = group_json, .progress = .{ .fail_read = true } }});
+    defer h.deinit();
+    var arm = h.arm();
+    try requireFailure(arm.execute(.{ .get = group_ref }), .invalid_response, .not_applicable, 200);
+    try t.expectEqual(@as(usize, 1), h.response_calls);
+    try t.expectEqual(@as(usize, 0), h.mock.?.stream_finish_count);
+    try t.expectEqual(@as(usize, 1), h.mock.?.stream_abort_count);
+}
+
+test "LRO progress cancellation preserves the accepted initiating mutation" {
+    const monitor = s.arm_host ++ "/subscriptions/" ++ sub ++ "/providers/Microsoft.Compute/locations/northeurope/operations/" ++ operation_uuid ++ "?api-version=2025-11-01";
+    for ([_]@FieldType(Progress, "stop"){ .deadline, .cancellation }) |stop| {
+        var h = try Harness.init(&.{
+            .{ .url = group_url, .response = group_json },
+            .{ .url = vm_url, .response = vm_json },
+            .{ .url = s.arm_host ++ vm_path ++ "/deallocate?api-version=2025-11-01", .method = .POST, .status = 202, .headers = &.{.{ .name = "Azure-AsyncOperation", .value = monitor }} },
+            .{ .url = monitor, .response = "{\"status\":\"InProgress\"}", .progress = .{ .stop = stop } },
+        });
+        defer h.deinit();
+        var arm = h.arm();
+        try requireFailure(arm.execute(.{ .deallocate = .{ .vm = vm_ref, .original_uuid = vm_uuid.* } }), if (stop == .deadline) .timeout else .cancelled, .accepted, 200);
+        try t.expectEqual(@as(usize, 1), h.response_calls);
+        try t.expectEqual(@as(usize, 0), h.response_calls_after_stop);
+        try t.expectEqual(@as(usize, 1), h.mock.?.stream_cancel_count);
+    }
+}
+
+test "credential JSON and OAuth error progress cannot outread their budget" {
+    const callback = struct {
+        fn assertion(allocator: std.mem.Allocator) ![]u8 {
+            return allocator.dupe(u8, "synthetic.header.signature");
+        }
+    }.assertion;
+    for ([_]u16{ 200, 400 }) |status| {
+        for ([_]@FieldType(Progress, "stop"){ .deadline, .cancellation }) |stop| {
+            var h = try Harness.init(&.{.{
+                .url = s.login_host ++ "/" ++ tenant ++ "/oauth2/v2.0/token",
+                .method = .POST,
+                .authorization = false,
+                .status = status,
+                .response = if (status == 200) "{\"access_token\":\"synthetic-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}" else "{\"error\":\"invalid_client\",\"error_description\":\"SYNTHETIC_SECRET\"}",
+                .progress = .{ .stop = stop },
+            }});
+            defer h.deinit();
+            try requireFailure(auth.acquire(a, h.channel(), .{
+                .authority = authority,
+                .provider = .{ .client_assertion = callback },
+                .minimum_validity_seconds = 300,
+            }), if (stop == .deadline) .timeout else .cancelled, .not_applicable, status);
+            try t.expectEqual(@as(usize, 1), h.response_calls);
+            try t.expectEqual(@as(usize, 0), h.response_calls_after_stop);
+            try t.expectEqual(@as(usize, 1), h.mock.?.stream_cancel_count);
+        }
+    }
 }

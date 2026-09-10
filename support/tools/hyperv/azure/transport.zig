@@ -219,6 +219,20 @@ pub const Channel = struct {
         return .{ .ok = reply };
     }
 
+    fn readProgress(self: Channel, operation: *sdk.http.HttpOperation, buffer: []u8) !usize {
+        self.budget.check() catch |err| {
+            operation.cancel();
+            return err;
+        };
+        var slices = [_][]u8{buffer};
+        const result = operation.body_reader.readVec(&slices);
+        self.budget.check() catch |err| {
+            operation.cancel();
+            return err;
+        };
+        return result;
+    }
+
     fn read(self: Channel, allocator: std.mem.Allocator, operation: *sdk.http.HttpOperation, arena: *secret.Arena) !Reply {
         try self.budget.check();
         var header_bytes: usize = 0;
@@ -234,19 +248,22 @@ pub const Channel = struct {
         if (declared) |length| if (length > self.budget.max_response_bytes) return error.BodyTooLarge;
         const bytes = try allocator.alloc(u8, self.budget.max_response_bytes + 1);
         var used: usize = 0;
-        const reader = try operation.reader();
+        _ = try operation.reader();
         while (true) {
-            try self.budget.check();
-            const n = try reader.readSliceShort(bytes[used..@min(bytes.len, used + 4096)]);
-            if (n == 0) break;
+            // readSliceShort hides repeated progress; zero readVec progress is not EOF.
+            const n = self.readProgress(operation, bytes[used..@min(bytes.len, used + 4096)]) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
             used += n;
             if (used > self.budget.max_response_bytes or n > self.budget.max_total_bytes -| self.budget.bytes) return error.BodyTooLarge;
             self.budget.bytes += n;
         }
         if (declared) |length| if (length != used) return error.TruncatedResponse;
         if (operation.bodyError() != null) return error.TruncatedResponse;
-        try operation.finish();
         try self.budget.check();
+        // SDK finish drains without our budget. Close locally after guarded EOF.
+        operation.abort();
         const retry_ms: ?u32 = if (try uniqueHeader(operation, "Retry-After")) |raw| retry: {
             const seconds = try unsigned(raw);
             if (seconds > 60) return error.InvalidRetryAfter;
