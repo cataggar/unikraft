@@ -845,6 +845,17 @@ jobs:
               -Doptimize="${mode}" -j2 test install --summary all
         done
 
+    - name: Run native Hyper-V image transformation fixtures
+      run: |
+        set -euo pipefail
+        for arch in x86_64 arm64; do
+          root="${RUNNER_TEMP}/hyperv-ci/native-postprocess-${arch}"
+          ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+            zig build --build-file support/build/native-postprocess-tests.build.zig \
+              --prefix "${root}/out" "-Dfixture-arch=${arch}" \
+              -j2 integration install --summary all
+        done
+
     - name: Run focused Hyper-V regressions
       run: |
         set -euo pipefail

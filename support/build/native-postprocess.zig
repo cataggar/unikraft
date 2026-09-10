@@ -527,6 +527,8 @@ pub const ToolCommands = struct {
 };
 
 pub const ExecutorPaths = struct {
+    /// Explicit selection: unsupported native operations fail, never fall back.
+    native_runner: ?*std.Build.Step.Compile = null,
     runner: std.Build.LazyPath,
     uk_reloc: std.Build.LazyPath,
     bootinfo: std.Build.LazyPath,
@@ -584,20 +586,30 @@ pub fn execute(
     for (binding_paths, 0..) |path, index| resolved[index] = path;
 
     for (plan.operations) |operation| {
-        const run = b.addSystemCommand(&.{tools.python_executable});
-        run.setEnvironmentVariable(
-            "PYTHON",
-            tools.python_command orelse tools.python_executable,
-        );
-        run.addFileArg(paths.runner);
-        if (operation.kind == .uk_reloc or operation.kind == .bootinfo or
+        const native = paths.native_runner != null;
+        const run = if (paths.native_runner) |runner|
+            b.addRunArtifact(runner)
+        else blk: {
+            const legacy = b.addSystemCommand(&.{tools.python_executable});
+            legacy.setEnvironmentVariable(
+                "PYTHON",
+                tools.python_command orelse tools.python_executable,
+            );
+            legacy.addFileArg(paths.runner);
+            break :blk legacy;
+        };
+        if (!native and (operation.kind == .uk_reloc or operation.kind == .bootinfo or
             operation.kind == .efi or
-            operation.kind == .linux_header)
+            operation.kind == .linux_header))
         {
             run.addFileInput(paths.elf_tools);
         }
 
-        for (operation.arguments) |argument| {
+        const arguments = if (native)
+            try nativeArguments(b.allocator, operation)
+        else
+            operation.arguments;
+        for (arguments) |argument| {
             switch (argument) {
                 .literal => |item| run.addArg(item),
                 .directory => |path| run.addDirectoryArg(.{ .cwd_relative = path }),
@@ -639,6 +651,36 @@ pub fn execute(
         }) catch return error.OutOfMemory;
     }
     return .{ .outputs = outputs.toOwnedSlice() catch return error.OutOfMemory };
+}
+
+fn nativeArguments(allocator: std.mem.Allocator, operation: Operation) Error![]const Argument {
+    switch (operation.kind) {
+        .uk_reloc, .strip, .bootinfo, .efi, .objcopy_binary, .compile_database => {},
+        else => return error.UnsupportedTransformation,
+    }
+    var result = std.array_list.Managed(Argument).init(allocator);
+    errdefer result.deinit();
+    var index: usize = 0;
+    while (index < operation.arguments.len) : (index += 1) {
+        const argument = operation.arguments[index];
+        if (argument == .literal and index + 1 < operation.arguments.len) {
+            const next = operation.arguments[index + 1];
+            const legacy_helper = std.mem.eql(u8, argument.literal, "--script") and next == .helper;
+            const legacy_inspector = next == .tool and switch (next.tool) {
+                .nm => std.mem.eql(u8, argument.literal, "--nm"),
+                .readelf => std.mem.eql(u8, argument.literal, "--readelf"),
+                .objdump => std.mem.eql(u8, argument.literal, "--objdump"),
+                else => false,
+            };
+            if (legacy_helper or legacy_inspector) {
+                index += 1;
+                continue;
+            }
+        }
+        if (argument == .helper) return error.MalformedTransformation;
+        result.append(argument) catch return error.OutOfMemory;
+    }
+    return result.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 fn toolCommand(tools: ToolCommands, tool: ToolKind) Error![]const u8 {
@@ -913,6 +955,34 @@ test "EFI plan populates relocation data before strip and EFI conversion" {
     try std.testing.expectEqual(Helper.uk_reloc, plan.operations[0].arguments[2].helper);
     try std.testing.expect(plan.operations[2].arguments[2] == .helper);
     try std.testing.expectEqual(Helper.efi, plan.operations[2].arguments[2].helper);
+    const reloc_args = try nativeArguments(std.testing.allocator, plan.operations[0]);
+    defer std.testing.allocator.free(reloc_args);
+    try std.testing.expectEqual(6, reloc_args.len);
+    try std.testing.expectEqualStrings("uk-reloc", reloc_args[0].literal);
+    try std.testing.expectEqualStrings("--objcopy", reloc_args[1].literal);
+    try std.testing.expectEqual(ToolKind.objcopy, reloc_args[2].tool);
+    try std.testing.expectEqual(plan.operations[0].inputs[0], reloc_args[3].input);
+    try std.testing.expectEqual(plan.operations[0].outputs[0], reloc_args[4].output);
+    try std.testing.expectEqual(plan.operations[0].outputs[1], reloc_args[5].output);
+    const strip_args = try nativeArguments(std.testing.allocator, plan.operations[1]);
+    defer std.testing.allocator.free(strip_args);
+    try std.testing.expectEqual(plan.operations[1].arguments.len, strip_args.len);
+    const efi_args = try nativeArguments(std.testing.allocator, plan.operations[2]);
+    defer std.testing.allocator.free(efi_args);
+    try std.testing.expectEqual(4, efi_args.len);
+    try std.testing.expectEqualStrings("efi", efi_args[0].literal);
+    try std.testing.expectEqual(plan.operations[2].inputs[1], efi_args[2].input);
+    try std.testing.expectEqual(plan.operations[2].outputs[0], efi_args[3].output);
+}
+
+test "native postprocess cannot implicitly fall back to an unrelated Python mode" {
+    try std.testing.expectError(error.UnsupportedTransformation, nativeArguments(std.testing.allocator, .{
+        .transformation = "multiboot",
+        .kind = .multiboot,
+        .inputs = &.{0},
+        .outputs = &.{1},
+        .arguments = &.{.{ .literal = "multiboot" }},
+    }));
 }
 
 test "planner rejects missing references, collisions, and unsupported active kinds" {

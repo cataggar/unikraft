@@ -154,10 +154,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "31d6c4329313af242dd336f172c1be9c92f156a4da4f24f629ebf30266622cc2"
+            "9bdc54e5c9a9a59367966c2b55b5c628b76d9f2989a31bc0b3b49fb36f42fd51"
         ),
-        "size": 1255979,
-        "files": 182,
+        "size": 1365900,
+        "files": 190,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -200,8 +200,12 @@ GUARDED_BUILD_CONTROL_FILES = (
     "support/build/native-library-link.zig",
     "support/build/native-lto.zig",
     "support/build/native-postprocess-runner.py",
+    "support/build/native-postprocess-runner.zig",
     "support/build/native-postprocess.zig",
     "support/build/native-target-object.zig",
+    "support/build/postprocess-elf.zig",
+    "support/build/postprocess-files.zig",
+    "support/build/postprocess-image.zig",
     "support/build/symbols/libukrandom-lcpu.localize",
     "support/build/target/native-profile.zig",
     "support/build/zig-facade-paths.zig",
@@ -234,7 +238,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "28f7a432f0b5c9d04dedd6686ba6e42ca516e5c770634bd9596edd6dd4b9cdfb"
+        "53bf356cdd9836b7009ccf2063b1669ccef829e2b3cdf5555a2ba297ebec508e"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -313,6 +317,15 @@ GUARDED_PRODUCER_FILES = {
     ),
     "support/build/native-target-object.zig": (
         "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
+    ),
+    "support/build/postprocess-elf.zig": (
+        "344fec5ba83ce2a07b1b35595b40d4339786ab861adba462715cc34835df2035"
+    ),
+    "support/build/postprocess-files.zig": (
+        "246755ac1072ef405b0899eb68383eede069eb5d4d0151e8f54844eb8ad5f33f"
+    ),
+    "support/build/postprocess-image.zig": (
+        "5421eb54f11e132ec71551c724b6713e9bda781bd9ecd584aa5f846457209114"
     ),
     "support/build/symbols/libukrandom-lcpu.localize": (
         "b00d5cfee43ae40b56bda292365bf7339d2c8f4239131d632edbebe623e940c6"
@@ -437,8 +450,11 @@ GUARDED_PRODUCER_FILES = {
     "support/build/native-postprocess-runner.py": (
         "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"
     ),
+    "support/build/native-postprocess-runner.zig": (
+        "fedf2fc2a2d8297c3852453f79cf5b02ddb67caad61ba2de92d4de98a7d69dcc"
+    ),
     "support/build/native-postprocess.zig": (
-        "fe6adc24f97bf72dcb111853f2b8d5c30a4a86596402e33d9d30945892a8f49f"
+        "943fd3dbd2c3328e34696ae4240c8f7f36a3f573ffc31e4c2a02c493ceea89ec"
     ),
     "support/scripts/elf_tools.py": (
         "0aad63e7830a814a5c29a7330925f64e8c844cf28700aa959002a629d5019820"
