@@ -4849,7 +4849,10 @@ class PrivatePreflightRun(azure.AzureRun):
             or not isinstance(endpoints, list)
             or len(endpoints) != 1
             or endpoints[0].get("service") != "Microsoft.Storage"
-            or endpoints[0].get("locations") != ["northeurope"]
+            or endpoints[0].get("locations") not in (
+                ["northeurope", "westeurope"],
+                ["westeurope", "northeurope"],
+            )
             or endpoints[0].get("provisioningState")
             not in (None, "Succeeded")
         ):
@@ -4870,7 +4873,7 @@ class PrivatePreflightRun(azure.AzureRun):
             or storage.get("defaultToOAuthAuthentication") is not False
             or storage.get("minimumTlsVersion") != "TLS1_2"
             or storage.get("publicNetworkAccess") != "Enabled"
-            or storage.get("supportsHttpsTrafficOnly") is not True
+            or storage.get("enableHttpsTrafficOnly") is not True
             or storage.get("privateEndpointConnections") not in (None, [])
             or rules.get("resourceAccessRules") not in (None, [])
         ):

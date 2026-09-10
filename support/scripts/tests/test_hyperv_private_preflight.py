@@ -4271,7 +4271,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                     run.verify_host_security_profile()
                 self.assertEqual(state, original)
 
-    def test_deployed_envelope_rejects_nat_on_private_subnet(self):
+    def test_deployed_envelope_enforces_private_network_and_storage(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
             self.begin_operation(run, state)
@@ -4343,7 +4343,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 "networkSecurityGroup": {"id": ids["nsg_id"]},
                 "serviceEndpoints": [{
                     "service": "Microsoft.Storage",
-                    "locations": ["northeurope"],
+                    "locations": ["northeurope", "westeurope"],
                 }],
             }
             run.az.side_effect = [arm_vm, nic, nsg, vnet, subnet]
@@ -4360,7 +4360,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 "defaultToOAuthAuthentication": False,
                 "minimumTlsVersion": "TLS1_2",
                 "publicNetworkAccess": "Enabled",
-                "supportsHttpsTrafficOnly": True,
+                "enableHttpsTrafficOnly": True,
                 "privateEndpointConnections": [],
                 "networkRuleSet": {"resourceAccessRules": []},
             }
@@ -4384,6 +4384,75 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             run.verify_deployed_envelope()
             run.verify_storage_rules.assert_called_once_with()
             run.verify_resource_inventory.assert_called_once_with()
+            reversed_pair = copy.deepcopy(subnet)
+            reversed_pair["serviceEndpoints"][0]["locations"].reverse()
+            run.az.side_effect = [
+                arm_vm, nic, nsg, vnet, reversed_pair, storage, schedule,
+            ]
+            run.verify_deployed_envelope()
+            original = copy.deepcopy(state)
+            for locations in (
+                None, [], "northeurope,westeurope",
+                ["northeurope"], ["westeurope"],
+                ["northeurope", "northeurope"],
+                ["northeurope", "westeurope", "westeurope"],
+                ["northeurope", "westeurope", "eastus"],
+                ["northeurope", "*"],
+                ["NorthEurope", "westeurope"],
+                ["northeurope", "westeurope "],
+                ["northeurope", 1], ["northeurope", {}],
+            ):
+                with self.subTest(endpoint_locations=locations):
+                    changed = copy.deepcopy(subnet)
+                    changed["serviceEndpoints"][0]["locations"] = locations
+                    run.az.reset_mock()
+                    run.az.side_effect = [arm_vm, nic, nsg, vnet, changed]
+                    run.record.reset_mock()
+                    run.verify_storage_rules.reset_mock()
+                    run.verify_resource_inventory.reset_mock()
+                    with self.assertRaisesRegex(RuntimeError, "subnet"):
+                        run.verify_deployed_envelope()
+                    self.assertEqual(run.az.call_count, 5)
+                    run.record.assert_not_called()
+                    run.verify_storage_rules.assert_not_called()
+                    run.verify_resource_inventory.assert_not_called()
+                    self.assertEqual(state, original)
+            global_endpoint = copy.deepcopy(subnet)
+            global_endpoint["serviceEndpoints"][0]["service"] = (
+                "Microsoft.Storage.Global"
+            )
+            run.az.side_effect = [arm_vm, nic, nsg, vnet, global_endpoint]
+            with self.assertRaisesRegex(RuntimeError, "subnet"):
+                run.verify_deployed_envelope()
+            for https_fields in (
+                {},
+                {"enableHttpsTrafficOnly": None},
+                {"enableHttpsTrafficOnly": False},
+                {"enableHttpsTrafficOnly": 0},
+                {"enableHttpsTrafficOnly": 1},
+                {"enableHttpsTrafficOnly": "true"},
+                {"enableHttpsTrafficOnly": []},
+                {"enableHttpsTrafficOnly": {}},
+            ):
+                with self.subTest(https_fields=https_fields):
+                    changed = copy.deepcopy(storage)
+                    del changed["enableHttpsTrafficOnly"]
+                    changed.update(https_fields)
+                    changed["supportsHttpsTrafficOnly"] = True
+                    run.az.reset_mock()
+                    run.az.side_effect = [
+                        arm_vm, nic, nsg, vnet, subnet, changed,
+                    ]
+                    run.record.reset_mock()
+                    run.verify_storage_rules.reset_mock()
+                    run.verify_resource_inventory.reset_mock()
+                    with self.assertRaisesRegex(RuntimeError, "storage"):
+                        run.verify_deployed_envelope()
+                    self.assertEqual(run.az.call_count, 6)
+                    run.record.assert_not_called()
+                    run.verify_storage_rules.assert_not_called()
+                    run.verify_resource_inventory.assert_not_called()
+                    self.assertEqual(state, original)
             invalid_access = copy.deepcopy(nsg)
             next(
                 rule for rule in invalid_access["securityRules"]
@@ -4401,9 +4470,21 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 "sourceAddressPrefix": "VirtualNetwork",
                 "destinationAddressPrefix": "AzurePlatformDNS",
             })
+            global_storage_allow = copy.deepcopy(nsg)
+            next(
+                rule for rule in global_storage_allow["securityRules"]
+                if rule["name"] == "AllowRegionalStorage"
+            )["destinationAddressPrefix"] = "Storage"
+            paired_storage_allow = copy.deepcopy(nsg)
+            next(
+                rule for rule in paired_storage_allow["securityRules"]
+                if rule["name"] == "AllowRegionalStorage"
+            )["destinationAddressPrefix"] = "Storage.WestEurope"
             for name, changed in (
                 ("invalid-access", invalid_access),
                 ("platform-tag-allow", platform_tag_allow),
+                ("global-storage-allow", global_storage_allow),
+                ("paired-storage-allow", paired_storage_allow),
             ):
                 with self.subTest(nsg=name):
                     run.az.reset_mock()
