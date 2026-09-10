@@ -2194,6 +2194,17 @@ fn finishNativeImages(
             .readelf = "llvm-readelf",
         },
         .{
+            .native_runner = if (std.mem.eql(u8, registered.graph.selectedPlatform().name, "hyperv"))
+                b.addExecutable(.{
+                    .name = "native-postprocess-runner",
+                    .root_module = b.createModule(.{
+                        .root_source_file = b.path("support/build/native-postprocess-runner.zig"),
+                        .target = b.graph.host,
+                        .optimize = .ReleaseSafe,
+                    }),
+                })
+            else
+                null,
             .runner = b.path("support/build/native-postprocess-runner.py"),
             .uk_reloc = b.path("support/scripts/mkukreloc.py"),
             .bootinfo = b.path("support/scripts/mkbootinfo.py"),
