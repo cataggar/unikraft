@@ -5033,19 +5033,18 @@ class PrivatePreflightRun(azure.AzureRun):
         ip_rules = rules.get("ipRules")
         if not isinstance(ip_rules, list):
             raise RuntimeError("Private Blob firewall IP rules are invalid")
-        values = {
-            item.get("ipAddressOrRange")
-            for item in ip_rules if isinstance(item, dict)
-        }
-        expected = set() if transfer_cidr is None else {transfer_cidr}
+        expected_ip = (
+            None if transfer_cidr is None
+            else transfer_source(transfer_cidr).removesuffix("/32")
+        )
         if (
-            values != expected
-            or len(ip_rules) != len(expected)
+            len(ip_rules) != (0 if expected_ip is None else 1)
             or any(
-                set(item) - {"ipAddressOrRange", "action"}
+                not isinstance(item, dict)
+                or set(item) - {"ipAddressOrRange", "action"}
+                or item.get("ipAddressOrRange") != expected_ip
                 or item.get("action") not in (None, "Allow")
                 for item in ip_rules
-                if isinstance(item, dict)
             )
         ):
             raise RuntimeError("Private Blob transfer firewall is not exact")
@@ -5073,17 +5072,19 @@ class PrivatePreflightRun(azure.AzureRun):
             raise RuntimeError(
                 "An unresolved private Blob firewall obligation exists"
             )
+        transfer_cidr = transfer_source(transfer_cidr)
         obligation = {"cidr": transfer_cidr, "phase": "pending-add"}
         self.record(
             "blob-firewall-add-pending",
             firewall_obligation=obligation,
         )
         try:
+            # Storage rejects /32 notation; the durable intent stays CIDR.
             self.az([
                 "storage", "account", "network-rule", "add",
                 "--resource-group", self.group,
                 "--account-name", self.storage,
-                "--ip-address", transfer_cidr,
+                "--ip-address", transfer_cidr.removesuffix("/32"),
             ], timeout=self.phase_timeout(TRANSFER_TIMEOUT_SECONDS))
             self.verify_storage_rules(transfer_cidr)
             obligation = {"cidr": transfer_cidr, "phase": "active"}
@@ -5140,7 +5141,7 @@ class PrivatePreflightRun(azure.AzureRun):
             "storage", "account", "network-rule", "remove",
             "--resource-group", self.group,
             "--account-name", self.storage,
-            "--ip-address", cidr,
+            "--ip-address", str(network.network_address),
         ])
         self.verify_storage_rules(enforce_deadline=False)
         self.record("blob-firewall-cleared", firewall_obligation=None)
