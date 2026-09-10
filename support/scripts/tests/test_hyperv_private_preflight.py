@@ -775,13 +775,15 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             preflight.GUARDED_PRODUCER_CLOSURES,
             runner.GUARDED_PRODUCER_CLOSURES,
         )
-        self.assertEqual(
-            preflight.directory_record(
-                SUPPORT / "build", "support/build",
-                "Guarded producer execution closure",
-            ),
-            preflight.GUARDED_PRODUCER_CLOSURES["support/build"],
-        )
+        for relative, expected in preflight.GUARDED_PRODUCER_CLOSURES.items():
+            with self.subTest(closure=relative):
+                self.assertEqual(
+                    preflight.directory_record(
+                        SUPPORT.parent / relative, relative,
+                        "Guarded producer execution closure",
+                    ),
+                    expected,
+                )
         proof_roles = {
             "plat/hyperv/Makefile.uk",
             "plat/hyperv/hyperv_runtime.zig",
@@ -855,6 +857,9 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             "support/scripts/mkcompiledb.py",
             "support/scripts/gitsha1",
             "support/build/unreviewed-native-helper.py",
+            "support/kconfig/lexer.l",
+            "support/kconfig/preprocess.c",
+            "support/kconfig/unreviewed-native-helper.c",
         )
         for relative in mutation_targets:
             with self.subTest(relative=relative), \
@@ -865,11 +870,12 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     destination = root / source_relative
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(source.read_bytes())
-                shutil.copytree(
-                    SUPPORT.parent / "support" / "build",
-                    root / "support" / "build",
-                    dirs_exist_ok=True,
-                )
+                for source_relative in preflight.GUARDED_PRODUCER_CLOSURES:
+                    shutil.copytree(
+                        SUPPORT.parent / source_relative,
+                        root / source_relative,
+                        dirs_exist_ok=True,
+                    )
                 fake_support = root / "support"
                 with mock.patch.object(preflight, "SUPPORT", fake_support):
                     preflight.verify_guarded_producer_sources(root)

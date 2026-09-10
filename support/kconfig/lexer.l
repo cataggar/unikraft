@@ -449,6 +449,20 @@ void zconf_nextfiles(const char *wildcard)
 	char **w;
 	int i;
 
+#ifdef UK_KCONFIG_METADATA
+	int result = glob(wildcard, GLOB_ERR, NULL, &g);
+
+	if (result != 0 || g.gl_pathv == NULL || g.gl_pathc == 0) {
+		const char *reason = result == GLOB_NOSPACE ? "out of memory" :
+			result == GLOB_ABORTED ? "filesystem error" :
+			"no matching files";
+
+		fprintf(stderr, "%s:%d: metadata source \"%s\": %s\n",
+			zconf_curname(), zconf_lineno(), wildcard, reason);
+		globfree(&g);
+		exit(1);
+	}
+#else
 	if (glob(wildcard, 0, NULL, &g) != 0) {
 		return;
 	}
@@ -456,6 +470,7 @@ void zconf_nextfiles(const char *wildcard)
 		globfree(&g);
 		return;
 	}
+#endif
 
 	/* working through files backwards, since
 	 * we're first pushing them on a stack

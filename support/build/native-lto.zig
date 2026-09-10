@@ -13,8 +13,8 @@
 //! are collected in registration order and passed directly to a single
 //! `zig cc -flto` final link, allowing LLVM LTO cross-TU optimization.
 //!
-//! Symbol-export semantics are preserved by a Python-based policy step
-//! (`lto-symbol-policy.py`) that runs before the final link. It invokes the
+//! Symbol-export semantics are preserved by a native Zig policy step
+//! (`lto-symbol-policy.zig`) that runs before the final link. It invokes the
 //! configured NM tool on each library's objects/archives, reads export symbol
 //! lists, detects private-symbol collisions and cross-library private
 //! references, and generates a deterministic LLD version script with the
@@ -99,7 +99,7 @@ pub const LtoLinked = struct {
 /// This replaces both `native_library_link.execute()` and
 /// `final_link.Executor.addSelected()` when LTO is active. It:
 ///  1. Merges linker scripts using the existing `final_link.Executor`.
-///  2. Runs the `lto-symbol-policy.py` script to validate symbol policy
+///  2. Runs the native `lto-symbol-policy` tool to validate symbol policy
 ///     and generate a version script.
 ///  3. Emits a single `zig cc -flto` command with all library inputs
 ///     flattened and the version script applied.
@@ -138,16 +138,18 @@ pub fn executeLtoFinalLink(
     const merged_script = executor.resolveMergedScript(graph, plan, merged_stages);
 
     // -- Symbol-policy step ---------------------------------------------
-    // Invoke lto-symbol-policy.py to validate and generate version script.
-    const policy = b.addSystemCommand(&.{
-        "python3",
-        "support/build/lto-symbol-policy.py",
-        "--nm",
-        graph.toolchain.binutils.nm.command,
+    const policy_tool = b.addExecutable(.{
+        .name = "unikraft-lto-symbol-policy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/lto-symbol-policy.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
     });
+    const policy = b.addRunArtifact(policy_tool);
+    policy.addArgs(&.{ "--nm", graph.toolchain.binutils.nm.command });
     policy.setName("LTO symbol-policy generator");
     policy.setCwd(b.path("."));
-    policy.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     if (prerequisite) |p| policy.step.dependOn(p);
 
     // Output: the generated version script (tracked LazyPath).

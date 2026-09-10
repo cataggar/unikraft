@@ -37,12 +37,6 @@ const Insertion = struct {
     }
 };
 
-const Edit = struct {
-    offset: usize,
-    order: usize,
-    text: []const u8,
-};
-
 pub fn mergeAlloc(
     allocator: std.mem.Allocator,
     primary: []const u8,
@@ -66,7 +60,7 @@ pub fn mergeAlloc(
         primary_phdrs = block;
         position = block.closing + 1;
     }
-    const sections = primary_sections orelse return error.MissingPrimarySections;
+    _ = primary_sections orelse return error.MissingPrimarySections;
 
     var phdr_bodies = std.array_list.Managed([]const u8).init(allocator);
     defer phdr_bodies.deinit();
@@ -100,73 +94,37 @@ pub fn mergeAlloc(
         }
     }
 
-    var edits = std.array_list.Managed(Edit).init(allocator);
-    defer edits.deinit();
-    var edit_texts = std.array_list.Managed([]u8).init(allocator);
-    defer {
-        for (edit_texts.items) |text| allocator.free(text);
-        edit_texts.deinit();
-    }
-
+    var result = try allocator.dupe(u8, primary);
+    errdefer allocator.free(result);
     if (phdr_bodies.items.len != 0) {
         const text = try joinBodies(allocator, phdr_bodies.items);
-        try edit_texts.append(text);
-        if (primary_phdrs) |block| {
-            try edits.append(.{
-                .offset = block.closing,
-                .order = 0,
-                .text = text,
-            });
-        } else {
-            const wrapper = try std.fmt.allocPrint(
-                allocator,
-                "PHDRS\n{{{s}\n}}\n",
-                .{text},
-            );
-            try edit_texts.append(wrapper);
-            try edits.append(.{
-                .offset = 0,
-                .order = 0,
-                .text = wrapper,
-            });
-        }
+        defer allocator.free(text);
+        const next = if (primary_phdrs) |block|
+            try std.mem.concat(allocator, u8, &.{ result[0..block.closing], text, result[block.closing..] })
+        else
+            try std.mem.concat(allocator, u8, &.{ "PHDRS\n{", text, "}\n", result });
+        allocator.free(result);
+        result = next;
     }
-
-    for (insertions.items, 0..) |insertion, index| {
-        const bounds = try findSectionBounds(
-            primary_mask,
-            sections,
-            insertion.anchor,
-        );
+    // Apply groups in registration order: a later INSERT may anchor to a
+    // section introduced by an earlier supplement.
+    for (insertions.items) |insertion| {
+        const clean = try maskAlloc(allocator, result);
+        defer allocator.free(clean);
+        const sections = findTopLevelNamedBlock(clean, "SECTIONS", 0) orelse
+            return error.MissingPrimarySections;
+        const bounds = try findSectionBounds(clean, sections, insertion.anchor);
         const text = try joinBodies(allocator, insertion.bodies.items);
-        try edit_texts.append(text);
-        try edits.append(.{
-            .offset = switch (insertion.mode) {
-                .before => bounds.start,
-                .after => bounds.end,
-            },
-            .order = index + 1,
-            .text = text,
-        });
+        defer allocator.free(text);
+        const offset = switch (insertion.mode) {
+            .before => bounds.start,
+            .after => bounds.end,
+        };
+        const next = try std.mem.concat(allocator, u8, &.{ result[0..offset], text, result[offset..] });
+        allocator.free(result);
+        result = next;
     }
-
-    std.mem.sort(Edit, edits.items, {}, struct {
-        fn lessThan(_: void, a: Edit, b: Edit) bool {
-            return a.offset < b.offset or
-                (a.offset == b.offset and a.order < b.order);
-        }
-    }.lessThan);
-
-    var result = std.array_list.Managed(u8).init(allocator);
-    errdefer result.deinit();
-    var cursor: usize = 0;
-    for (edits.items) |edit| {
-        try result.appendSlice(primary[cursor..edit.offset]);
-        try result.appendSlice(edit.text);
-        cursor = edit.offset;
-    }
-    try result.appendSlice(primary[cursor..]);
-    return result.toOwnedSlice();
+    return result;
 }
 
 fn parseSupplement(
@@ -687,6 +645,20 @@ test "supplemental PHDRS is added when the primary has none" {
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.startsWith(u8, result, "PHDRS\n{"));
     try expectOrdered(result, &.{ "text PT_LOAD;", ".text", ".meta" });
+}
+
+test "legacy merger output bytes PHDRS grouping and sequential anchors" {
+    const result = try mergeAlloc(std.testing.allocator, "SECTIONS { .text : { *(.text) } .data : { *(.data) } }\n", &.{
+        "PHDRS { text PT_LOAD; }\nSECTIONS { .one : { BYTE(1) } } INSERT AFTER .text;",
+        "SECTIONS { .two : { BYTE(2) } } INSERT AFTER .one;",
+        "SECTIONS { .three : { BYTE(3) } } INSERT AFTER .text;",
+    });
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "PHDRS\n{\ntext PT_LOAD;\n}\nSECTIONS { .text : { *(.text) }\n" ++
+            ".one : { BYTE(1) }\n.two : { BYTE(2) }\n\n.three : { BYTE(3) }\n .data : { *(.data) } }\n",
+        result,
+    );
 }
 
 test "INSERT AFTER preserves a spaced section fill expression" {
