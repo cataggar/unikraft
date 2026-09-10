@@ -59,7 +59,19 @@ pub fn sign(value: anytype, domain: []const u8) ![]u8 {
     return signBody(doc.value(), domain);
 }
 
+pub const image_controls = 256 + p.service_unit_bytes + 128;
+pub const AdmissionBudget = struct {
+    image_staging_bytes: u64 = image_controls + 512,
+    image_control_bytes: u64 = image_controls,
+    control_bytes: u64 = p.max_control,
+    staging_bytes: u64 = p.max_staging,
+};
+
 pub fn admissionBytes() ![]u8 {
+    return admissionBytesWithBudget(.{});
+}
+
+pub fn admissionBytesWithBudget(budget: AdmissionBudget) ![]u8 {
     return sign(.{
         .schema = "uk-hyperv-image-admission-v1",
         .account = "fixture",
@@ -67,8 +79,8 @@ pub fn admissionBytes() ![]u8 {
         .runner_sha256 = @as([]const u8, &p.hex(runner_hash)),
         .host_image_sha256 = @as([]const u8, &p.hex(p.hash("synthetic-host-image"))),
         .guarded_producer_sha256 = @as([]const u8, &p.hex(producer_hash)),
-        .image_staging_bytes = 256,
-        .image_control_bytes = 256,
+        .image_staging_bytes = budget.image_staging_bytes,
+        .image_control_bytes = budget.image_control_bytes,
         .issued_at = 900,
         .expires_at = 2000,
         .region = "northeurope",
@@ -81,8 +93,8 @@ pub fn admissionBytes() ![]u8 {
         .public_ip = false,
         .data_disks = 0,
         .nat = false,
-        .control_bytes = p.max_control,
-        .staging_bytes = p.max_staging,
+        .control_bytes = budget.control_bytes,
+        .staging_bytes = budget.staging_bytes,
     }, "uk-hyperv-image-admission-v1");
 }
 

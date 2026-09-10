@@ -1,9 +1,15 @@
 const std = @import("std");
 const c = @import("hyperv_core").contracts;
 
-pub const max_control = 524288;
+pub const max_control = 2 * 1024 * 1024;
 pub const max_staging = 256 * 1024 * 1024;
 pub const max_command = 64 * 1024;
+pub const max_locator = 4096;
+pub const max_record = 4096;
+pub const emergency_control = 4096;
+pub const startup_control = 8192;
+pub const attempt_marker_bytes = 36;
+pub const service_unit_bytes = @embedFile("uk-hyperv-host.service").len;
 pub const max_artifact = 128 * 1024 * 1024;
 pub const max_serial = 1024 * 1024;
 pub const max_evidence = 8 * 1024 * 1024;
@@ -16,6 +22,21 @@ pub const Ed25519 = std.crypto.sign.Ed25519;
 pub const Phase = enum { public, private };
 pub const Role = enum { qemu, ovmf_code, ovmf_vars, capability_raw, raw, vhd, support };
 pub const Policy = enum { platform_unavailable, platform_main_zero, guarded_v2 };
+
+pub fn controlTotal(parts: []const u64) !u64 {
+    var total: u64 = 0;
+    for (parts) |size| {
+        if (size > max_control - total) return error.ControlAllowanceExceeded;
+        total += size;
+    }
+    return total;
+}
+
+pub fn startupControlBytes(admission_bytes: u64, locator_bytes: u64) !u64 {
+    if (admission_bytes > max_command or locator_bytes > max_locator) return error.InvalidBudget;
+    // Both startup ledger writes may occupy their full bounded record size.
+    return controlTotal(&.{ admission_bytes, locator_bytes, startup_control, emergency_control, 2 * max_record });
+}
 
 pub const Scope = struct {
     account: []const u8,
@@ -152,7 +173,8 @@ pub const Admission = struct {
         if (try c.integer(u64, try field(body, "staging_bytes")) != max_staging) return error.InvalidBudget;
         const staged = try c.integer(u64, try field(body, "image_staging_bytes"));
         const image_control = try c.integer(u64, try field(body, "image_control_bytes"));
-        if (image_control < runner_size or image_control > max_control or staged < image_control or staged > max_staging) return error.InvalidBudget;
+        const known_controls = try controlTotal(&.{ runner_size, service_unit_bytes });
+        if (image_control < known_controls or image_control > max_control or staged < image_control or staged > max_staging) return error.InvalidBudget;
         inline for (.{ .{ "region", "northeurope" }, .{ "vm_size", "Standard_D2s_v5" }, .{ "security_type", "Standard" }, .{ "os_disk_sku", "StandardSSD_LRS" } }) |pair| {
             if (!std.mem.eql(u8, try c.string(try field(body, pair[0])), pair[1])) return error.HostEnvelopeMismatch;
         }
@@ -176,6 +198,12 @@ pub const Admission = struct {
 
     pub fn deinit(self: *Admission) void {
         self.verified.deinit();
+    }
+
+    pub fn validateStartup(self: *const Admission, admission_bytes: u64, locator_bytes: u64) !void {
+        const additional = try startupControlBytes(admission_bytes, locator_bytes);
+        _ = try controlTotal(&.{ self.image_control_bytes, additional });
+        if (self.image_staging_bytes > max_staging or additional > max_staging - self.image_staging_bytes) return error.StagingBudgetExceeded;
     }
 };
 

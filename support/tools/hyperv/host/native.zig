@@ -49,6 +49,10 @@ pub const Image = struct {
     pub fn deinit(self: *Image) void {
         self.admission.deinit();
     }
+
+    pub fn validateStartup(self: *const Image, locator_bytes: usize) !void {
+        try self.admission.validateStartup(self.policy_bytes, locator_bytes);
+    }
 };
 
 fn requireSupervisor(allocator: std.mem.Allocator, io: std.Io, image: *const Image) !void {
@@ -113,7 +117,7 @@ pub const Locator = struct {
 };
 
 pub fn parseLocator(allocator: std.mem.Allocator, bytes: []const u8, admission: *const p.Admission) !Locator {
-    var doc = try core.contracts.Document.parse(allocator, bytes, .{ .bytes = 4096, .string_bytes = 128, .items = 8, .tokens = 32, .depth = 2 });
+    var doc = try core.contracts.Document.parse(allocator, bytes, .{ .bytes = p.max_locator, .string_bytes = 128, .items = 8, .tokens = 32, .depth = 2 });
     errdefer doc.deinit();
     const object = try core.contracts.exactFields(doc.value(), &.{ "account", "container", "run_id" });
     const scope: p.Scope = .{
@@ -190,13 +194,17 @@ pub const Supervised = struct {
         const call_index = if (self.store) |store| store.record.wire_calls else self.next_call;
         if (call_index >= 256) return error.OperationLimit;
         if (self.store) |store| {
-            const reserve: u64 = encoded.len + 4096 + @as(u64, if (request.action == .command) p.max_command else 0);
+            const reserve: u64 = encoded.len + p.max_record + @as(u64, if (request.action == .command) p.max_command else 0);
             try store.reserve(reserve, true, false);
             if (payload) |bytes| try store.reserve(bytes.len, request.evidence_name != null and std.mem.eql(u8, request.evidence_name.?, "receipt.json"), false);
             store.record.wire_calls += 1;
             store.record.wire_inflight = true;
             try store.save();
-        } else self.next_call += 1;
+        } else {
+            if (self.next_call != 0 or request.action != .identify or payload != null) return error.InvalidBootstrap;
+            if (encoded.len > p.startup_control - p.max_record - p.attempt_marker_bytes) return error.ControlAllowanceExceeded;
+            self.next_call += 1;
+        }
         var name_buffer: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buffer, "wire-{d}", .{call_index});
         try self.locked.directory.dir.createDir(self.io, name, .fromMode(0o700));
@@ -229,7 +237,7 @@ pub const Supervised = struct {
             if (self.store) |store| store.fail(result.failures);
             return error.WireWorkerFailed;
         }
-        const bytes = try directory.read(self.io, self.allocator, "result.json", 4096, null);
+        const bytes = try directory.read(self.io, self.allocator, "result.json", p.max_record, null);
         defer self.allocator.free(bytes);
         var doc = try core.contracts.Document.parse(self.allocator, bytes, .{});
         defer doc.deinit();
@@ -239,7 +247,7 @@ pub const Supervised = struct {
         const response = parsed.value;
         self.last_failures = response.failures;
         if (self.store) |store| {
-            var unused: u64 = 4096 - bytes.len;
+            var unused: u64 = p.max_record - bytes.len;
             if (request.action == .command) {
                 if (response.ok) {
                     const command_file = try directory.openFile(self.io, "command.json");
@@ -422,10 +430,11 @@ pub fn run(init: std.process.Init, comptime key: [32]u8) !void {
     defer image.deinit();
     const policy = try core.private_files.Directory.open(init.io, policy_root);
     defer policy.close(init.io);
-    const locator_bytes = try policy.read(init.io, init.gpa, "locator.json", 4096, null);
+    const locator_bytes = try policy.read(init.io, init.gpa, "locator.json", p.max_locator, null);
     defer init.gpa.free(locator_bytes);
     var location = try parseLocator(init.gpa, locator_bytes, &image.admission);
     defer location.document.deinit();
+    try image.validateStartup(locator_bytes.len);
     const directory = try files.durableDirectory(init.io, state_root);
     defer directory.close(init.io);
     var locked = try directory.lock(init.io);
@@ -454,7 +463,7 @@ pub fn run(init: std.process.Init, comptime key: [32]u8) !void {
     initial.deadline_ns = start.expires_ns;
     initial.wire_calls = supervised.next_call;
     var store = try state.Store.open(init.gpa, init.io, &locked, initial);
-    try store.reserve(image.policy_bytes + locator_bytes.len + 8192, true, false);
+    try store.reserve(image.policy_bytes + locator_bytes.len + p.startup_control, true, false);
     supervised.store = &store;
     supervised.vm_id = identity.vm_id;
     supervised.deadline = .{ .expires_ns = store.record.deadline_ns };

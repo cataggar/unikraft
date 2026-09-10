@@ -138,9 +138,13 @@ image/serial hashes, byte counts and evidence kind. No exit-code-only PASS exist
 
 ## Limits and admission blockers
 
-| Item | Unchanged bound |
+The user explicitly approved a **2-MiB native-only control cap on 2026-09-10**.
+The cumulative staging limit remains unchanged. This approval changes no cloud,
+image-publication, identity, RBAC or network admission.
+
+| Item | Native bound |
 | --- | --- |
-| Control allowance | 524,288 bytes, including image-baked controls |
+| Control allowance | 2,097,152 bytes, including image-baked controls |
 | Cumulative staging | 268,435,456 bytes |
 | Command/admission | 65,536 bytes each |
 | Individual artifact | 134,217,728 bytes |
@@ -149,8 +153,10 @@ image/serial hashes, byte counts and evidence kind. No exit-code-only PASS exist
 | Total wire operations | 256, with no mutation retries |
 
 Signed `image_control_bytes` includes the executable, unit and every other
-image-baked control. `image_staging_bytes` is the parent's signed starting
-debit/reservation for the complete workflow ledger, including **all** image-baked
+image-baked control. It must cover at least the measured runner plus the supplied
+unit's compiled-in byte length; this minimum is not proof that all other controls
+are present in the signed subtotal. `image_staging_bytes` is the parent's signed
+starting debit/reservation for the complete workflow ledger, including **all** image-baked
 bytes, image publication and other producer staging. It cannot be less than image
 controls. Other lanes' future staging must already be reserved there; this
 host-local ledger is not a substitute for that admission. The ledger additionally charges
@@ -158,17 +164,31 @@ commands, operation files, every atomic state version, evidence copies/uploads,
 artifact transfers and fresh firmware copies. Failed/uncertain transfers retain
 their reservation. Only known unused GET/result reservations are released.
 4 KiB is reserved for emergency recording; serial reserves its full bound.
+Before the first identity worker or network operation, the startup gate also
+requires room for the actual admission/locator bytes, the 8-KiB bootstrap
+reservation and both initial ledger writes at their full 4-KiB bounds. The
+bootstrap reservation covers one identity job/result and the attempt marker,
+not an unmetered sequence of workers. The running ledger charges actual state
+versions; the conservative pre-network check does not exempt later recording.
 Hard links add no second image byte copy. No image publication, baked payload,
 runner or control wrapper may be excluded from the admission accounting.
 Receipt counters explicitly describe the reservation **before that receipt**;
 the durable local ledger also charges the receipt and subsequent recording.
 
-The measured complete x86_64 Linux-musl ReleaseSmall binary is **886,528 bytes**:
-**362,240 bytes over** the unchanged control allowance. The unit is another
-647 bytes (887,175 bytes together), before admission, locator and other controls.
-`Image.load` rejects an oversized executable **before IMDS or any network call**.
-Do not increase the allowance,
-exclude this binary, or replace this gate with an exemption.
+An executable or declared image subtotal above the native cap remains invalid.
+An otherwise fitting image without complete startup/recording headroom is also
+rejected before IMDS. A runner-plus-unit measurement alone does not admit a
+complete image, all remaining controls, or its cumulative staging ledger.
+There are no binary, unit, image-baked, startup, ledger or emergency exemptions.
+Legacy Python policy, historical receipts and existing signed admissions are
+not rewritten or reinterpreted by this native policy change.
+
+The synthetic-key x86_64 Linux-musl ReleaseSmall measurement is **887,336 bytes**
+for the runner and **647 bytes** for the unit: **887,983 bytes together**.
+That known subtotal fits the approved 2,097,152-byte cap, leaving 1,209,169 bytes
+before accounting for every other control, admission/locator, startup,
+emergency reservation and ledger version. It is not whole-image or deployment
+admission, nor permission to exclude any remaining bytes.
 
 Production remains blocked on a reviewed immutable-image closure and signing
 authority, secure delivery/binding of signed admission and non-secret locator,
@@ -205,6 +225,14 @@ Use `-Doptimize=ReleaseSafe` for checked optimized fixtures. A cross-build uses
 `-Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall` and an explicitly synthetic
 image public key; it is not cloud admission. `-Dtest-filter=TEXT` narrows native
 fixture names. Fixture directories retain private local evidence under scratch.
+`test install` also compiles the CLI and therefore requires an explicit synthetic
+`-Dimage-trust-key`. Both cache layouts are supported: an absolute cache outside
+cwd, and an absolute cache inside cwd such as
+`$PWD/.d/zig-migration-host-controls/Debug/zig-local-cache`. Keep `--cache-dir`
+explicit. Zig may emit the latter fixture path relative to cwd; the fixture
+normalizes it once into its assets arena and uses that same absolute path for
+byte loading and both supervisors. No production path requirement or lazy build
+dependency is weakened, and moving caches is not the fix.
 Fixtures execute native child processes and synthetic streaming responses,
 including six-boot phasing, interruption, publication ambiguity, failures,
 timeouts, descendant cleanup, serial limits and negative authority cases.

@@ -9,6 +9,7 @@ const t = std.testing;
 
 const Assets = struct {
     arena: std.heap.ArenaAllocator,
+    executable_path: []const u8,
     qemu: []const u8,
     raw: []u8,
     vhd: []u8,
@@ -19,7 +20,8 @@ const Assets = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const scratch = arena.allocator();
-        const executable = try std.Io.Dir.openFileAbsolute(io, @import("test_options").child_fixture, .{ .mode = .read_only });
+        const executable_path = try std.Io.Dir.cwd().realPathFileAlloc(io, @import("test_options").child_fixture, scratch);
+        const executable = try std.Io.Dir.openFileAbsolute(io, executable_path, .{ .mode = .read_only });
         defer executable.close(io);
         const size = (try executable.stat(io)).size;
         if (size > p.max_artifact) return error.FixtureTooLarge;
@@ -32,7 +34,7 @@ const Assets = struct {
         @memcpy(vhd[0..raw.len], raw);
         @memset(vhd[raw.len..], 0);
         @memcpy(vhd[raw.len..][0..8], "conectix");
-        return .{ .arena = arena, .qemu = bytes, .raw = raw, .vhd = vhd };
+        return .{ .arena = arena, .executable_path = executable_path, .qemu = bytes, .raw = raw, .vhd = vhd };
     }
 
     fn body(self: *Assets, role: p.Role) []const u8 {
@@ -66,6 +68,24 @@ const Assets = struct {
         return output;
     }
 };
+
+test "generated child fixture resolves absolute and cwd-relative cache paths" {
+    var assets = try Assets.init(0);
+    defer assets.arena.deinit();
+    try t.expect(std.fs.path.isAbsolute(assets.executable_path));
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_size = try host.files.cwdPath(io, &cwd_buffer);
+    const cwd = cwd_buffer[0..cwd_size];
+    const relative = try std.fs.path.relative(a, cwd, null, cwd, assets.executable_path);
+    defer a.free(relative);
+    try t.expect(!std.fs.path.isAbsolute(relative));
+    const from_relative = try std.Io.Dir.cwd().realPathFileAlloc(io, relative, a);
+    defer a.free(from_relative);
+    const from_absolute = try std.Io.Dir.cwd().realPathFileAlloc(io, assets.executable_path, a);
+    defer a.free(from_absolute);
+    try t.expectEqualStrings(assets.executable_path, from_relative);
+    try t.expectEqualStrings(assets.executable_path, from_absolute);
+}
 
 const Fixture = struct {
     directory: f.Directory,
@@ -103,7 +123,7 @@ const Fixture = struct {
         errdefer a.free(self.work_root);
         try self.directory.directory.dir.createDir(io, "artifacts", .fromMode(0o700));
         try self.directory.directory.dir.createDir(io, "boots", .fromMode(0o700));
-        const initial = try host.state.Record.initial(f.uuid(f.run_text), f.uuid(f.vm_text), try hostBootId(), 256, 256);
+        const initial = try host.state.Record.initial(f.uuid(f.run_text), f.uuid(f.vm_text), try hostBootId(), self.admitted.image_staging_bytes, self.admitted.image_control_bytes);
         self.store = try host.state.Store.open(a, io, &self.locked, initial);
         self.downloads = 0;
         self.private_downloads = 0;
@@ -140,7 +160,7 @@ const Fixture = struct {
             .nowFn = f.clock,
             .store = &self.store,
             .remote = .{ .context = self, .fetchFn = fetch, .downloadFn = download, .publishFn = publish, .failuresFn = failures },
-            .runner = .{ .allocator = a, .io = io, .self_executable = @import("test_options").child_fixture, .artifact_root = self.artifact_root, .work_root = self.work_root, .attempt_deadline = .{ .expires_ns = self.store.record.deadline_ns }, .boot_timeout_ms = self.boot_timeout_ms, .cleanup_timeout_ms = 200, .evidence_kind = .synthetic_child },
+            .runner = .{ .allocator = a, .io = io, .self_executable = self.assets.executable_path, .artifact_root = self.artifact_root, .work_root = self.work_root, .attempt_deadline = .{ .expires_ns = self.store.record.deadline_ns }, .boot_timeout_ms = self.boot_timeout_ms, .cleanup_timeout_ms = 200, .evidence_kind = .synthetic_child },
         };
     }
 
@@ -384,7 +404,7 @@ test "native wire child hard deadline persists interrupted operation separately"
         .allocator = a,
         .io = io,
         .directory_path = fixture.directory.path,
-        .self_executable = @import("test_options").child_fixture,
+        .self_executable = fixture.assets.executable_path,
         .locked = &fixture.locked,
         .store = &fixture.store,
         .scope = f.scope(),

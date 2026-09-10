@@ -28,11 +28,11 @@ pub const Record = struct {
     failures: core.diagnostics.Failures,
 
     pub fn initial(run: p.Uuid, vm: p.Uuid, boot: p.Uuid, image_bytes: u64, control: u64) !Record {
-        if (image_bytes < control or image_bytes > p.max_staging - 4096 or control > p.max_control - 4096) return error.InvalidBudget;
+        if (image_bytes < control or image_bytes > p.max_staging - p.emergency_control or control > p.max_control - p.emergency_control) return error.InvalidBudget;
         try p.validUuid(run);
         try p.validUuid(vm);
         try p.validUuid(boot);
-        return .{ .version = 1, .run_id = run, .vm_id = vm, .host_boot_id = boot, .stage = .empty, .public_nonce = null, .private_nonce = null, .public_command_sha256 = null, .public_evidence_sha256 = null, .infrastructure_sha256 = null, .boots_attempted = 0, .boots_passed = 0, .staging_bytes = image_bytes + 4096, .control_bytes = control + 4096, .evidence_bytes = 0, .deadline_ns = (try core.process.Deadline.afterMilliseconds(p.attempt_ms)).expires_ns, .wire_calls = 0, .wire_inflight = false, .publication = .not_started, .failures = .{} };
+        return .{ .version = 1, .run_id = run, .vm_id = vm, .host_boot_id = boot, .stage = .empty, .public_nonce = null, .private_nonce = null, .public_command_sha256 = null, .public_evidence_sha256 = null, .infrastructure_sha256 = null, .boots_attempted = 0, .boots_passed = 0, .staging_bytes = image_bytes + p.emergency_control, .control_bytes = control + p.emergency_control, .evidence_bytes = 0, .deadline_ns = (try core.process.Deadline.afterMilliseconds(p.attempt_ms)).expires_ns, .wire_calls = 0, .wire_inflight = false, .publication = .not_started, .failures = .{} };
     }
 
     pub fn validate(self: Record) !void {
@@ -99,7 +99,7 @@ pub const Store = struct {
         for (0..4) |_| {
             const bytes = try self.encode(self.record);
             defer self.allocator.free(bytes);
-            if (bytes.len > 4096 or bytes.len > p.max_staging - staging or bytes.len > p.max_control - control) return error.RecordingBudgetExceeded;
+            if (bytes.len > p.max_record or bytes.len > p.max_staging - staging or bytes.len > p.max_control - control) return error.RecordingBudgetExceeded;
             if (bytes.len == accounted) {
                 const result = try self.locked.commit(self.io, "state.json", bytes);
                 if (!files.isDurable(result)) return error.StateNotDurable;
