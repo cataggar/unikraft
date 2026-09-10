@@ -248,6 +248,7 @@ static void storvsc_timeout_worker(void *arg) __attribute__((noreturn));
 void storvsc_host_pfn_copy_hook(__u64 transaction_id, const __u64 *pfns,
 				unsigned int written);
 void storvsc_host_recovery_begin_hook(void);
+void storvsc_host_connection_fail_hook(void);
 void storvsc_host_reset_ack_hook(void);
 void storvsc_host_deferred_epoch_sample_hook(__u64 epoch);
 void storvsc_host_sync_completion_hook(void);
@@ -1338,6 +1339,14 @@ static int storvsc_deferred_priority(unsigned int action)
 	return action;
 }
 
+static void storvsc_fail_connection(void)
+{
+#ifdef STORVSC_HOST_TEST
+	storvsc_host_connection_fail_hook();
+#endif
+	(void)vmbus_connection_fail();
+}
+
 /*
  * device->lock publishes the terminal state and elects one cleanup owner.
  * It is never held while waiting, entering VMBus, or invoking blkreq
@@ -1392,7 +1401,7 @@ static void storvsc_deferred_schedule(struct storvsc_device *device,
 	if (detached)
 		vmbus_channel_set_callback(detached, NULL, NULL);
 	if (fail_connection)
-		(void)vmbus_connection_fail();
+		storvsc_fail_connection();
 	storvsc_wake_timeout(device);
 }
 
@@ -3200,7 +3209,7 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 		device->deferred_close_attempts = 0;
 		device->deferred_close_deadline = 0;
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
-		(void)vmbus_connection_fail();
+		storvsc_fail_connection();
 		return -EINPROGRESS;
 	}
 	device->deferred_running = 1;
@@ -3254,7 +3263,7 @@ static int storvsc_deferred_try_run(struct storvsc_device *device)
 		device->deferred_channel = NULL;
 		device->deferred_close_deadline = 0;
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
-		(void)vmbus_connection_fail();
+		storvsc_fail_connection();
 		return -EINPROGRESS;
 	}
 

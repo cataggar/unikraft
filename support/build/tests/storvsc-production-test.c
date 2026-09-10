@@ -263,6 +263,9 @@ static int receive_gate_release_notify;
 static struct uk_thread *receive_gate_thread;
 static struct uk_thread *worker_exit_watch;
 static int worker_exit_observed;
+static int connection_fail_gate_enabled;
+static int connection_fail_gate_entered;
+static int connection_fail_gate_release;
 static int removal_coherence_enabled;
 static int removal_coherence_caller_registered;
 static pthread_t removal_coherence_caller;
@@ -499,6 +502,19 @@ void storvsc_host_recovery_begin_hook(void)
 	pthread_mutex_lock(&race_lock);
 	race_recovery_begin = 1;
 	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+}
+
+void storvsc_host_connection_fail_hook(void)
+{
+	pthread_mutex_lock(&race_lock);
+	if (connection_fail_gate_enabled) {
+		connection_fail_gate_entered = 1;
+		pthread_cond_broadcast(&race_condition);
+		while (connection_fail_gate_enabled &&
+		       !connection_fail_gate_release)
+			pthread_cond_wait(&race_condition, &race_lock);
+	}
 	pthread_mutex_unlock(&race_lock);
 }
 
@@ -2256,6 +2272,22 @@ static int wait_persistence_request_done(unsigned int limit_ms)
 	return -ETIMEDOUT;
 }
 
+static int wait_inventory_count(
+	struct uk_storvsc_inventory_snapshot *inventory,
+	unsigned int expected, unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		int rc = uk_storvsc_inventory_get(inventory);
+
+		if (!rc && inventory->count == expected)
+			return 0;
+		if (rc && rc != -EAGAIN)
+			return rc;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
 static void remove_test_offer(struct vmbus_driver *driver,
 			      struct vmbus_device *device)
 {
@@ -2505,6 +2537,8 @@ static int run_terminal_reset_quiesce(struct uk_blkdev *device,
 	int reset_created = 0;
 	int error = 0;
 	int mask_calls;
+	int retry_result;
+	int retry_result_again;
 	int unmask_calls;
 
 	atomic_init(&victim_callbacks, 0);
@@ -2518,6 +2552,9 @@ static int run_terminal_reset_quiesce(struct uk_blkdev *device,
 	initialize_request(&retry, UK_BLKREQ_READ, 70, 1, buffer + 8192,
 			   NULL, NULL);
 	submit_context.request = &sender;
+	storvsc_host_stop_timeout_worker();
+	if (wait_worker_present(0, 1000))
+		return error_base + 12;
 	storvsc_host_set_send_wait_limit(2);
 	atomic_store(&host_irqs_disabled, irqs_disabled);
 	hold_io = 1;
@@ -2550,16 +2587,38 @@ static int run_terminal_reset_quiesce(struct uk_blkdev *device,
 	if (reset_context.result != -EINPROGRESS ||
 	    storvsc_host_online() ||
 	    storvsc_host_deferred_action() != TEST_DEFER_RESET ||
-	    !storvsc_host_worker_present() ||
+	    storvsc_host_worker_present() ||
 	    storvsc_host_has_channel() ||
 	    atomic_load(&victim_callbacks) ||
 	    atomic_load(&sender_callbacks) ||
 	    atomic_load(&victim.state.counter) == UK_BLKREQ_FINISHED ||
-	    atomic_load(&sender.state.counter) == UK_BLKREQ_FINISHED ||
-	    device->submit_one(device, device->_queue[0], &retry) !=
-		    -ENODEV ||
-	    device->submit_one(device, device->_queue[0], &retry) !=
-		    -ENODEV) {
+	    atomic_load(&sender.state.counter) == UK_BLKREQ_FINISHED) {
+		fprintf(stderr,
+			"terminal reset gate failed: result=%d online=%d "
+			"deferred=%d worker=%d channel=%d callbacks=%d/%d "
+			"states=%d/%d\n",
+			reset_context.result, storvsc_host_online(),
+			storvsc_host_deferred_action(),
+			storvsc_host_worker_present(),
+			storvsc_host_has_channel(),
+			atomic_load(&victim_callbacks),
+			atomic_load(&sender_callbacks),
+			atomic_load(&victim.state.counter),
+			atomic_load(&sender.state.counter));
+		error = error_base + 5;
+		goto out;
+	}
+	if (storvsc_host_start_timeout_worker() ||
+	    wait_worker_present(1, 1000)) {
+		error = error_base + 13;
+		goto out;
+	}
+	retry_result = device->submit_one(
+		device, device->_queue[0], &retry);
+	retry_result_again = device->submit_one(
+		device, device->_queue[0], &retry);
+	if (retry_result != -ENODEV ||
+	    retry_result_again != -ENODEV) {
 		error = error_base + 5;
 		goto out;
 	}
@@ -3322,6 +3381,8 @@ static int run_integrated_remove_unload(
 	uint64_t epoch;
 	uint64_t request_pfn = 0;
 	unsigned int failures_before;
+	int posted;
+	int submit_rc;
 	int thread_created = 0;
 	int error = 0;
 
@@ -3340,18 +3401,49 @@ static int run_integrated_remove_unload(
 	hold_io = 1;
 	pending_count = 0;
 	configure_close_failure(-EBUSY, 128);
-	if (!(device->submit_one(device, device->_queue[0], &request) &
-	      UK_BLKDEV_STATUS_SUCCESS)) {
+	submit_rc = device->submit_one(device, device->_queue[0], &request);
+	if (!(submit_rc & UK_BLKDEV_STATUS_SUCCESS)) {
+		fprintf(stderr,
+			"integrated unload submit failed: rc=%d "
+			"online=%d channel=%d worker=%d deferred=%d "
+			"wait_vmbus=%d\n",
+			submit_rc, storvsc_host_online(),
+			storvsc_host_has_channel(),
+			storvsc_host_worker_present(),
+			storvsc_host_deferred_action(),
+			storvsc_host_deferred_wait_vmbus());
 		error = error_base + 1;
 		goto out;
 	}
 	request_pfn = storvsc_host_request_pfn(&request, 0);
+	pthread_mutex_lock(&race_lock);
+	connection_fail_gate_enabled = 1;
+	connection_fail_gate_entered = 0;
+	connection_fail_gate_release = 0;
+	pthread_mutex_unlock(&race_lock);
 	if (pthread_create(&thread, NULL, integrated_disconnect_thread,
 			   &context)) {
 		error = error_base + 2;
 		goto out;
 	}
 	thread_created = 1;
+	if (wait_race_flag(&connection_fail_gate_entered)) {
+		error = error_base + 8;
+		goto out;
+	}
+	pthread_mutex_lock(&context.lock);
+	posted = context.unload_posted;
+	pthread_mutex_unlock(&context.lock);
+	if (posted ||
+	    vmbus_bus_host_connection_fail_calls() != failures_before ||
+	    context.remove_observed_safe) {
+		error = error_base + 8;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	connection_fail_gate_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
 	if (wait_integrated_unload(&context, 1000) ||
 	    !context.remove_observed_safe ||
 	    vmbus_connection_quiesce_epoch() != epoch ||
@@ -3432,6 +3524,11 @@ static int run_integrated_remove_unload(
 	}
 
 out:
+	pthread_mutex_lock(&race_lock);
+	connection_fail_gate_enabled = 0;
+	connection_fail_gate_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
 	pthread_mutex_lock(&context.lock);
 	context.release_unload = 1;
 	pthread_cond_broadcast(&context.condition);
@@ -5182,7 +5279,9 @@ static int run_vmbus_offer_lifetime_case(
 	use_vmbus_offer_lifetimes = 1;
 	if (vmbus_bus_host_offer_storage(
 		    primary_id, primary_channel, primary_channel + 100) ||
-	    !vmbus_bus_host_offer_present(primary_channel)) {
+	    !vmbus_bus_host_offer_present(primary_channel) ||
+	    wait_inventory_count(
+		    &inventory, 3, CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS)) {
 		error = 662;
 		goto out;
 	}
@@ -5362,22 +5461,6 @@ static int run_vmbus_reoffer_cleanup_case(
 		error = 679;
 		goto out;
 	}
-	pthread_mutex_lock(&race_lock);
-	retained_callback_release = 1;
-	pthread_cond_broadcast(&race_condition);
-	pthread_mutex_unlock(&race_lock);
-	pthread_join(rescind_tid, NULL);
-	rescind_created = 0;
-	if (rescind.result || retained_callback_count != 1 ||
-	    request.result != -ENODEV ||
-	    storvsc_host_controller_online(1)) {
-		error = 680;
-		goto out;
-	}
-	hold_io = 0;
-	pending_count = 0;
-	drop_packets();
-
 	writes10 = write10_command_count;
 	writes16 = write16_command_count;
 	flushes = flush_command_count;
@@ -5392,9 +5475,40 @@ static int run_vmbus_reoffer_cleanup_case(
 		goto out;
 	}
 	if (vmbus_bus_host_confirm_rescind(213) ||
-	    uk_storvsc_inventory_get(&inventory) ||
-	    inventory.count != 3) {
+	    vmbus_bus_host_offer_present(213)) {
 		error = 682;
+		goto out;
+	}
+	pthread_mutex_lock(&race_lock);
+	retained_callback_release = 1;
+	pthread_cond_broadcast(&race_condition);
+	pthread_mutex_unlock(&race_lock);
+	pthread_join(rescind_tid, NULL);
+	rescind_created = 0;
+	if (rescind.result || retained_callback_count != 1 ||
+	    request.result != -ENODEV ||
+	    storvsc_host_controller_online(1)) {
+		fprintf(stderr,
+			"reoffer cleanup quiescence failed: rescind=%d "
+			"callbacks=%d request=%d online=%d mappings=%u "
+			"inventory=%d retries=%d ready=%d\n",
+			rescind.result, retained_callback_count, request.result,
+			storvsc_host_controller_online(1),
+			uk_storvsc_mapping_count(),
+			uk_storvsc_inventory_get(&inventory),
+			atomic_load(&bind_retry_calls),
+			atomic_load(&bind_ready_calls));
+		error = 680;
+		goto out;
+	}
+	hold_io = 0;
+	pending_count = 0;
+	drop_packets();
+
+	if (wait_inventory_count(
+		    &inventory, 3,
+		    CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS)) {
+		error = 683;
 		goto out;
 	}
 
