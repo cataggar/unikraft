@@ -311,6 +311,10 @@ fn now() !u64 {
     return @as(u64, @intCast(timestamp.sec)) * std.time.ns_per_s + @as(u64, @intCast(timestamp.nsec));
 }
 
+pub fn monotonicNanoseconds() !u64 {
+    return now();
+}
+
 const Spawned = struct {
     pid: linux.pid_t,
     stdout: linux.fd_t,

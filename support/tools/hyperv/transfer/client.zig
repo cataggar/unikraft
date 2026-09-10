@@ -14,13 +14,13 @@ pub const maximum_disk_bytes = contract.maximum_disk_bytes;
 
 pub const Budget = struct {
     context: *anyopaque,
-    nowMsFn: *const fn (*anyopaque) u64,
+    nowMsFn: *const fn (*anyopaque) anyerror!u64,
     deadline_ms: u64,
     cancellation: *const core.http.CancellationToken,
 
     pub fn check(self: *const Budget) !void {
         if (self.cancellation.isCancelled()) return error.Cancelled;
-        if (self.nowMsFn(self.context) >= self.deadline_ms) return error.Deadline;
+        if (try self.nowMsFn(self.context) >= self.deadline_ms) return error.Deadline;
     }
 
     pub fn guard(self: *Budget) files.Guard {
@@ -58,12 +58,21 @@ pub const NativeRuntime = struct {
 pub const Blob = struct { account_url: []const u8, container: []const u8, name: []const u8, sas: []const u8 };
 pub const Disk = struct { endpoint: []const u8, sas: []const u8 };
 pub const Download = struct { path: []const u8, maximum: u64 };
+pub const Event = union(enum) {
+    begin: struct { stage: d.Stage, mutation: bool, bytes: u64 },
+    end: struct { transport_started: bool, status: ?u16 },
+};
+pub const Observer = struct {
+    context: *anyopaque,
+    notifyFn: *const fn (*anyopaque, Event) anyerror!void,
+};
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     runtime: core.http.HttpRuntime,
     budget: Budget,
+    observer: ?Observer = null,
 
     pub fn createContainer(self: *Client, account: []const u8, container: []const u8, sas: []const u8) d.Outcome {
         var uri = contract.blobUri(self.allocator, account, container, null, sas) catch return d.Outcome.fail(.contract, .invalid_contract);
@@ -119,7 +128,7 @@ pub const Client = struct {
         var uri = contract.blobUri(self.allocator, target.account_url, target.container, target.name, target.sas) catch return d.Outcome.fail(.contract, .invalid_contract);
         defer eraseUri(&uri);
         self.budget.check() catch |err| return d.Outcome.fail(.output_create, localCategory(err));
-        const parent = files.Parent.open(self.io, output.path, true) catch return d.Outcome.fail(.output_create, .unsafe_file);
+        const parent = files.Parent.open(self.io, output.path, .private) catch return d.Outcome.fail(.output_create, .unsafe_file);
         defer parent.close(self.io);
         const file = parent.dir().createFile(self.io, parent.name, .{
             .exclusive = true,
@@ -129,7 +138,7 @@ pub const Client = struct {
         defer file.close(self.io);
         var outcome = self.downloadToFile(uri.bytes, output.maximum, file);
         if (outcome.completion == .complete) {
-            parent.file.sync(self.io) catch {
+            parent.sync(self.io) catch {
                 outcome.completion = .failed;
                 outcome.diagnostic.stage = .output_sync;
                 outcome.diagnostic.category = .local_io;
@@ -144,7 +153,7 @@ pub const Client = struct {
             parent.dir().deleteFile(self.io, parent.name) catch {
                 outcome.cleanup_failed = true;
             };
-            parent.file.sync(self.io) catch {
+            parent.sync(self.io) catch {
                 outcome.cleanup_failed = true;
             };
         }
@@ -420,10 +429,10 @@ pub const Client = struct {
         var request = contract.Request.load(self.allocator, self.io, request_path) catch |err|
             return d.Outcome.fail(.request_file, if (err == error.InvalidContract) .invalid_contract else localCategory(err));
         defer request.deinit();
-        const sas = contract.loadSas(self.allocator, self.io, sas_path) catch |err|
+        var sas = contract.loadSas(self.allocator, self.io, sas_path) catch |err|
             return d.Outcome.fail(.request_file, if (err == error.InvalidContract) .invalid_contract else localCategory(err));
-        defer self.erase(sas);
-        return self.execute(&request, sas);
+        defer sas.deinit();
+        return self.execute(&request, sas.bytes());
     }
 
     pub fn uploadPagesPrivate(self: *Client, request_path: []const u8, sas_path: []const u8) d.Outcome {
@@ -431,10 +440,10 @@ pub const Client = struct {
         var request = contract.DiskRequest.load(self.allocator, self.io, request_path) catch |err|
             return d.Outcome.fail(.request_file, if (err == error.InvalidContract) .invalid_contract else localCategory(err));
         defer request.deinit();
-        const sas = contract.loadSas(self.allocator, self.io, sas_path) catch |err|
+        var sas = contract.loadSas(self.allocator, self.io, sas_path) catch |err|
             return d.Outcome.fail(.request_file, if (err == error.InvalidContract) .invalid_contract else localCategory(err));
-        defer self.erase(sas);
-        return self.uploadPages(.{ .endpoint = request.endpoint, .sas = sas }, request.input);
+        defer sas.deinit();
+        return self.uploadPages(.{ .endpoint = request.endpoint, .sas = sas.bytes() }, request.input);
     }
 
     fn headers(self: *Client, request: *core.http.Request, version: []const u8, length: ?u64) !void {
@@ -464,12 +473,25 @@ pub const Client = struct {
         }
         request.retryable = false;
         request.redirect_policy = .not_allowed;
-        const now = self.budget.nowMsFn(self.budget.context);
+        const now = self.budget.nowMsFn(self.budget.context) catch |err| {
+            outcome.diagnostic.category = localCategory(err);
+            return null;
+        };
         if (now >= self.budget.deadline_ms) {
             outcome.diagnostic.category = .deadline;
             return null;
         }
         request.operation_timeout_ms = self.budget.deadline_ms - now;
+        const length = if (body) |stream| stream.content_length orelse 0 else if (request.body) |bytes| bytes.len else 0;
+        if (!self.notify(.{ .begin = .{ .stage = stage, .mutation = mutation_request, .bytes = length } }, outcome)) {
+            outcome.diagnostic.category = .none;
+            return null;
+        }
+        self.budget.check() catch |err| {
+            outcome.diagnostic.category = localCategory(err);
+            _ = self.notify(.{ .end = .{ .transport_started = false, .status = null } }, outcome);
+            return null;
+        };
         var pipeline = core.http.HttpPipeline.init(self.runtime, &.{});
         const operation = pipeline.open(request, .{ .body = body, .cancellation = self.budget.cancellation }) catch |err| {
             outcome.diagnostic.category = switch (err) {
@@ -478,11 +500,27 @@ pub const Client = struct {
                 else => .transport,
             };
             if (mutation_request and request.transport_started) outcome.side_effect = .unknown;
+            _ = self.notify(.{ .end = .{ .transport_started = request.transport_started, .status = null } }, outcome);
             return null;
         };
         outcome.diagnostic.status = operation.status_code;
         if (mutation_request) outcome.side_effect = if (operation.isSuccess()) .accepted else .rejected;
+        if (mutation_request and operation.isSuccess()) outcome.bytes_accepted = length;
+        outcome.diagnostic.category = if (operation.isSuccess()) .none else d.statusCategory(operation.status_code);
+        if (!self.notify(.{ .end = .{ .transport_started = true, .status = operation.status_code } }, outcome)) {
+            operation.deinit();
+            return null;
+        }
         return operation;
+    }
+
+    fn notify(self: *Client, event: Event, outcome: *d.Outcome) bool {
+        const observer = self.observer orelse return true;
+        observer.notifyFn(observer.context, event) catch {
+            outcome.failures.record(.recording, .{ .stage = .state_record, .category = .local_io }) catch unreachable;
+            return false;
+        };
+        return true;
     }
 
     fn mutation(self: *Client, request: *core.http.Request, body: ?core.http.StreamingRequestBody, stage: d.Stage, accepted_bytes: u64) d.Outcome {
@@ -578,7 +616,7 @@ fn localCategory(err: anyerror) d.Category {
         error.Deadline => .deadline,
         error.InputChanged => .input_changed,
         error.OutOfMemory => .allocation,
-        error.UnsafeFile, error.SymLinkLoop, error.FileNotFound, error.NotDir, error.AccessDenied => .unsafe_file,
+        error.UnsafeFile, error.UnsafePath, error.SymLinkLoop, error.FileNotFound, error.NotDir, error.AccessDenied => .unsafe_file,
         else => .local_io,
     };
 }

@@ -502,3 +502,108 @@ test "exec permission and format failures are bounded reaped and have no shell f
         try noChildren();
     }
 }
+
+const WipeObserver = struct {
+    allocated: usize = 0,
+    freed: usize = 0,
+    dirty_frees: usize = 0,
+    remaining: ?usize = null,
+
+    fn asAllocator(self: *WipeObserver) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = allocate,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = release,
+        } };
+    }
+    fn allocate(context: *anyopaque, length: usize, alignment: std.mem.Alignment, address: usize) ?[*]u8 {
+        const self: *WipeObserver = @ptrCast(@alignCast(context));
+        if (self.remaining) |remaining| {
+            if (remaining == 0) return null;
+            self.remaining = remaining - 1;
+        }
+        const memory = allocator.rawAlloc(length, alignment, address) orelse return null;
+        self.allocated += 1;
+        @memset(memory[0..length], 0xa5);
+        return memory;
+    }
+    fn release(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, address: usize) void {
+        const self: *WipeObserver = @ptrCast(@alignCast(context));
+        self.freed += 1;
+        if (!std.mem.allEqual(u8, memory, 0)) self.dirty_frees += 1;
+        allocator.rawFree(memory, alignment, address);
+    }
+    fn verify(self: WipeObserver) !void {
+        try testing.expectEqual(self.allocated, self.freed);
+        try testing.expectEqual(@as(usize, 0), self.dirty_frees);
+    }
+};
+
+test "sensitive reader wipes successful and hash-rejected buffers before release" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var lock = try fixture.directory.lock(io);
+    defer lock.close(io);
+    _ = try lock.commit(io, "sas", "sig=SYNTHETIC_SECRET");
+    var observer: WipeObserver = .{};
+    var secret = try fixture.directory.readSensitive(io, observer.asAllocator(), "sas", 64, null);
+    try testing.expectEqualStrings("sig=SYNTHETIC_SECRET", secret.bytes());
+    secret.deinit();
+    try testing.expectError(error.HashMismatch, fixture.directory.readSensitive(io, observer.asAllocator(), "sas", 64, [_]u8{0} ** 32));
+    try observer.verify();
+}
+
+test "sensitive JSON clears scanner decoded strings arenas canonical copies and partial parses" {
+    for ([_][]const u8{
+        " {\"token\":\"SYNTHETIC_SECRET\",\"nested\":[\"\\u0053ECRET\"]} ",
+        "{\"token\":\"SYNTHETIC_SECRET\",\"token\":\"different\"}",
+        "{\"token\":\"SYNTHETIC_SECRET\",\"broken\":[}",
+    }) |source| {
+        var observer: WipeObserver = .{};
+        if (contracts.SensitiveDocument.parse(observer.asAllocator(), source, .{})) |document| {
+            defer document.deinit();
+            try testing.expectError(error.NonCanonical, document.requireCanonical(source));
+        } else |_| {}
+        try observer.verify();
+    }
+    var baseline: WipeObserver = .{};
+    try sensitiveCanonicalLifecycle(baseline.asAllocator());
+    try baseline.verify();
+    for (0..baseline.allocated + 1) |limit| {
+        var observer: WipeObserver = .{ .remaining = limit };
+        sensitiveCanonicalLifecycle(observer.asAllocator()) catch |err|
+            try testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
+        try observer.verify();
+    }
+}
+
+fn sensitiveCanonicalLifecycle(backing: std.mem.Allocator) !void {
+    const source = "{\"token\":\"SYNTHETIC_SECRET\"}\n";
+    const document = try contracts.SensitiveDocument.parse(backing, source, .{});
+    defer document.deinit();
+    try document.requireCanonical(source);
+}
+
+test "sensitive allocator never relocates secret storage without a wiping free" {
+    var observer: WipeObserver = .{};
+    var wiping: core.sensitive.Allocator = .{ .backing = observer.asAllocator() };
+    const secure = wiping.allocator();
+    var bytes = try secure.dupe(u8, "SYNTHETIC_SECRET");
+    bytes = try secure.realloc(bytes, 4096);
+    bytes = try secure.realloc(bytes, 3);
+    secure.free(bytes);
+    try observer.verify();
+}
+
+test "shared service allowlist uses documented storage codes and rejects the old lease alias" {
+    inline for (.{
+        diagnostics.ServiceCode.LeaseIdMismatchWithBlobOperation,
+        diagnostics.ServiceCode.AuthorizationServiceMismatch,
+        diagnostics.ServiceCode.KeyBasedAuthenticationNotPermitted,
+        diagnostics.ServiceCode.InvalidBlobType,
+        diagnostics.ServiceCode.PendingCopyOperation,
+    }) |code| try testing.expectEqual(code, diagnostics.classifyServiceCode(@tagName(code)));
+    try testing.expectEqual(.unknown, diagnostics.classifyServiceCode("LeaseIdMismatchWithBlob"));
+    try testing.expectEqual(.unknown, diagnostics.classifyServiceCode("New_Service_Code"));
+}

@@ -1,6 +1,7 @@
 const std = @import("std");
 const file_io = @import("files.zig");
-const diagnostic = @import("diagnostic.zig");
+const shared = @import("hyperv_core");
+const contracts = shared.contracts;
 const common = @import("azure_sdk_storage_common");
 
 pub const schema = "unikraft.hyperv.private-preflight-blob-worker";
@@ -16,7 +17,7 @@ pub const Record = union(Action) {
 };
 pub const Request = struct {
     allocator: std.mem.Allocator,
-    parsed: std.json.Parsed(std.json.Value),
+    document: contracts.SensitiveDocument,
     action: Action,
     account_url: []const u8,
     container: []const u8,
@@ -25,33 +26,27 @@ pub const Request = struct {
 
     pub fn deinit(self: *Request) void {
         self.allocator.free(self.records);
-        self.parsed.deinit();
+        self.document.deinit();
         self.* = undefined;
     }
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Request {
-        const raw = try file_io.readPrivate(allocator, io, path, maximum_request);
-        defer {
-            std.crypto.secureZero(u8, raw);
-            allocator.free(raw);
-        }
-        return parse(allocator, raw);
+        var raw = try file_io.readSensitive(io, allocator, path, maximum_request, null);
+        defer raw.deinit();
+        return parse(allocator, raw.bytes());
     }
 
     pub fn parse(allocator: std.mem.Allocator, raw: []const u8) !Request {
-        if (raw.len > maximum_request or !diagnostic.boundedJson(raw)) return error.InvalidContract;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{
-            .allocate = .alloc_always,
-            .duplicate_field_behavior = .@"error",
-            .max_value_len = 4096,
-            .parse_numbers = false,
-        }) catch return error.InvalidContract;
-        errdefer parsed.deinit();
-        const value = parsed.value;
+        const document = contracts.SensitiveDocument.parse(allocator, raw, .{ .bytes = maximum_request }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidContract;
+        };
+        errdefer document.deinit();
+        const value = document.value();
         try exact(value, &.{ "schema", "schema_version", "action", "account_url", "container", "files", "create_container" });
         if (!std.mem.eql(u8, try string(value, "schema"), schema) or try integer(value.object.get("schema_version").?, 1) != 1)
             return error.InvalidContract;
-        const action = std.meta.stringToEnum(Action, try string(value, "action")) orelse return error.InvalidContract;
+        const action = contracts.enumeration(Action, value.object.get("action").?) catch return error.InvalidContract;
         const account = try string(value, "account_url");
         const container = try string(value, "container");
         if (!validAccount(account) or !validContainer(container)) return error.InvalidContract;
@@ -92,7 +87,7 @@ pub const Request = struct {
         }
         return .{
             .allocator = allocator,
-            .parsed = parsed,
+            .document = document,
             .action = action,
             .account_url = account,
             .container = container,
@@ -103,34 +98,28 @@ pub const Request = struct {
 };
 
 pub const DiskRequest = struct {
-    parsed: std.json.Parsed(std.json.Value),
+    document: contracts.SensitiveDocument,
     endpoint: []const u8,
     input: file_io.Input,
 
     pub fn deinit(self: *DiskRequest) void {
-        self.parsed.deinit();
+        self.document.deinit();
         self.* = undefined;
     }
 
     pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !DiskRequest {
-        const raw = try file_io.readPrivate(allocator, io, path, maximum_request);
-        defer {
-            std.crypto.secureZero(u8, raw);
-            allocator.free(raw);
-        }
-        return parse(allocator, raw);
+        var raw = try file_io.readSensitive(io, allocator, path, maximum_request, null);
+        defer raw.deinit();
+        return parse(allocator, raw.bytes());
     }
 
     pub fn parse(allocator: std.mem.Allocator, raw: []const u8) !DiskRequest {
-        if (raw.len > maximum_request or !diagnostic.boundedJson(raw)) return error.InvalidContract;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{
-            .allocate = .alloc_always,
-            .duplicate_field_behavior = .@"error",
-            .max_value_len = 4096,
-            .parse_numbers = false,
-        }) catch return error.InvalidContract;
-        errdefer parsed.deinit();
-        const value = parsed.value;
+        const document = contracts.SensitiveDocument.parse(allocator, raw, .{ .bytes = maximum_request }) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return error.InvalidContract;
+        };
+        errdefer document.deinit();
+        const value = document.value();
         try exact(value, &.{ "schema", "schema_version", "endpoint", "path", "size", "sha256" });
         if (!std.mem.eql(u8, try string(value, "schema"), disk_schema) or try integer(value.object.get("schema_version").?, 1) != 1)
             return error.InvalidContract;
@@ -140,7 +129,7 @@ pub const DiskRequest = struct {
         if (!validDiskEndpoint(endpoint) or !file_io.validPath(path) or size < 512 or size % 512 != 0)
             return error.InvalidContract;
         return .{
-            .parsed = parsed,
+            .document = document,
             .endpoint = endpoint,
             .input = .{ .path = path, .size = size, .sha256 = try digest(try string(value, "sha256")) },
         };
@@ -148,28 +137,21 @@ pub const DiskRequest = struct {
 };
 
 fn exact(value: std.json.Value, fields: []const []const u8) !void {
-    if (value != .object or value.object.count() != fields.len) return error.InvalidContract;
-    for (fields) |field| if (!value.object.contains(field)) return error.InvalidContract;
+    _ = contracts.exactFields(value, fields) catch return error.InvalidContract;
 }
 
 fn string(value: std.json.Value, field: []const u8) ![]const u8 {
     const item = value.object.get(field) orelse return error.InvalidContract;
-    return if (item == .string) item.string else error.InvalidContract;
+    return contracts.string(item) catch error.InvalidContract;
 }
 
 fn integer(value: std.json.Value, maximum: u64) !u64 {
-    if (value != .number_string or value.number_string.len == 0) return error.InvalidContract;
-    for (value.number_string) |c| if (!std.ascii.isDigit(c)) return error.InvalidContract;
-    const result = std.fmt.parseInt(u64, value.number_string, 10) catch return error.InvalidContract;
+    const result = contracts.integer(u64, value) catch return error.InvalidContract;
     return if (result <= maximum) result else error.InvalidContract;
 }
 
 pub fn digest(value: []const u8) ![32]u8 {
-    if (value.len != 64) return error.InvalidContract;
-    for (value) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidContract;
-    var result: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&result, value) catch return error.InvalidContract;
-    return result;
+    return contracts.parseSha256(value) catch error.InvalidContract;
 }
 
 pub fn validAccount(value: []const u8) bool {
@@ -238,14 +220,11 @@ pub fn validSas(value: []const u8) bool {
 
 /// SAS bytes arrive only in private memory or through this owner-only loader.
 /// There is intentionally no argv/environment fallback or credential discovery.
-pub fn loadSas(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    const bytes = try file_io.readPrivate(allocator, io, path, maximum_sas);
-    errdefer {
-        std.crypto.secureZero(u8, bytes);
-        allocator.free(bytes);
-    }
-    if (!validSas(bytes)) return error.InvalidContract;
-    return bytes;
+pub fn loadSas(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !shared.sensitive.Buffer {
+    var buffer = try file_io.readSensitive(io, allocator, path, maximum_sas, null);
+    errdefer buffer.deinit();
+    if (!validSas(buffer.bytes())) return error.InvalidContract;
+    return buffer;
 }
 
 pub fn blobUri(allocator: std.mem.Allocator, account: []const u8, container: []const u8, blob: ?[]const u8, sas: []const u8) !common.sas.CompleteSasUri {

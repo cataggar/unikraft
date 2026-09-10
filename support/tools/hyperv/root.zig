@@ -1,4 +1,7 @@
-pub const contracts = @import("contracts.zig");
-pub const diagnostics = @import("diagnostics.zig");
-pub const private_files = @import("private_files.zig");
-pub const process = @import("process.zig");
+const core = @import("hyperv_core");
+pub const contracts = core.contracts;
+pub const diagnostics = core.diagnostics;
+pub const private_files = core.private_files;
+pub const sensitive = core.sensitive;
+pub const process = core.process;
+pub const transfer = @import("hyperv_transfer");

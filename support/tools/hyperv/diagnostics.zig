@@ -19,6 +19,7 @@ pub const Stage = enum {
     host_phase,
     cleanup,
     inspection,
+    transfer_worker,
 };
 pub const Category = enum {
     unavailable,
@@ -54,6 +55,8 @@ pub const ServiceCode = enum {
     AuthorizationPermissionMismatch,
     AuthorizationSourceIPMismatch,
     AuthorizationProtocolMismatch,
+    AuthorizationServiceMismatch,
+    KeyBasedAuthenticationNotPermitted,
     InvalidAuthenticationInfo,
     InvalidHeaderValue,
     InvalidQueryParameterValue,
@@ -79,6 +82,8 @@ pub const ServiceCode = enum {
     InvalidMd5,
     InvalidRange,
     InvalidPageRange,
+    InvalidBlobType,
+    PendingCopyOperation,
     TooManyRequests,
     QuotaExceeded,
     SubscriptionNotFound,
@@ -86,6 +91,7 @@ pub const ServiceCode = enum {
     SkuNotAvailable,
     AllocationFailed,
 };
+pub const MetadataState = enum { absent, known, unknown, malformed, conflicting };
 
 /// These fields cannot hold response bodies, exception strings, paths, IDs, or secrets.
 pub const Diagnostic = struct {
@@ -154,13 +160,18 @@ pub const Failures = struct {
     }
 
     pub fn write(self: Failures, writer: *std.Io.Writer) !void {
+        try self.writeValue(writer);
+        try writer.writeByte('\n');
+    }
+
+    pub fn writeValue(self: Failures, writer: *std.Io.Writer) !void {
         try writer.writeAll("{\"cleanup\":");
         try optional(self.cleanup, writer);
         try writer.writeAll(",\"primary\":");
         try optional(self.primary, writer);
         try writer.writeAll(",\"recording\":");
         try optional(self.recording, writer);
-        try writer.writeAll(",\"schema_version\":1}\n");
+        try writer.writeAll(",\"schema_version\":1}");
     }
 };
 
@@ -175,9 +186,9 @@ fn optional(value: ?Diagnostic, writer: *std.Io.Writer) !void {
 /// Raw codes are inspected transiently and never copied into the diagnostic.
 pub fn classifyServiceCode(raw: ?[]const u8) ServiceCode {
     const source = raw orelse return .unavailable;
-    if (source.len == 0 or source.len > 96) return .malformed;
+    if (source.len == 0 or source.len > 128) return .malformed;
     for (source) |byte| {
-        if (!std.ascii.isAlphanumeric(byte)) return .malformed;
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return .malformed;
     }
     const parsed = std.meta.stringToEnum(ServiceCode, source) orelse return .unknown;
     return switch (parsed) {

@@ -1,0 +1,455 @@
+const std = @import("std");
+const core = @import("hyperv");
+const worker = core.transfer.worker;
+const protocol = worker.protocol;
+const options = @import("test_options");
+const testing = std.testing;
+const allocator = testing.allocator;
+const io = testing.io;
+const linux = std.os.linux;
+
+const Fixture = struct {
+    root: core.private_files.Directory,
+    directory: core.private_files.Directory,
+    name: [32]u8,
+    path: []u8,
+
+    fn init(mode: []const u8, kind: core.transfer.job.Kind, size: usize, download: bool, timeout_ms: u32) !Fixture {
+        const root_path = options.test_root orelse return error.MissingTestRoot;
+        const root = try core.private_files.Directory.open(io, root_path);
+        errdefer root.close(io);
+        var random: [16]u8 = undefined;
+        io.random(&random);
+        const name = std.fmt.bytesToHex(random, .lower);
+        try root.dir.createDir(io, &name, .fromMode(0o700));
+        errdefer root.dir.deleteTree(io, &name) catch {};
+        const dir = try root.dir.openDir(io, &name, .{ .follow_symlinks = false, .iterate = true });
+        errdefer dir.close(io);
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_path, name });
+        errdefer allocator.free(path);
+        const fixture: Fixture = .{ .root = root, .directory = .{ .dir = dir }, .name = name, .path = path };
+        try fixture.put("fixture-mode", mode);
+        try fixture.put("sas", "sv=2024-11-04&sp=rcw&sig=SYNTHETIC%2BONLY%3D");
+        const bytes = try allocator.alloc(u8, size);
+        defer allocator.free(bytes);
+        @memset(bytes, 0x5a);
+        try fixture.put("source", bytes);
+        const digest = std.fmt.bytesToHex(core.transfer.job.hash(bytes), .lower);
+        const request = if (kind == .pages)
+            try std.fmt.allocPrint(allocator, "{{\"schema\":\"unikraft.hyperv.managed-disk-page-worker\",\"schema_version\":1,\"endpoint\":\"https://fixture.blob.storage.azure.net/upload/vhd\",\"path\":\"{s}/source\",\"size\":{d},\"sha256\":\"{s}\"}}", .{ path, size, digest })
+        else if (download)
+            try std.fmt.allocPrint(allocator, "{{\"schema\":\"unikraft.hyperv.private-preflight-blob-worker\",\"schema_version\":1,\"action\":\"download\",\"account_url\":\"https://fixture.blob.core.windows.net\",\"container\":\"fixture\",\"files\":[{{\"blob\":\"input\",\"path\":\"{s}/download\",\"maximum\":128}}],\"create_container\":false}}", .{path})
+        else
+            try std.fmt.allocPrint(allocator, "{{\"schema\":\"unikraft.hyperv.private-preflight-blob-worker\",\"schema_version\":1,\"action\":\"upload\",\"account_url\":\"https://fixture.blob.core.windows.net\",\"container\":\"fixture\",\"files\":[{{\"blob\":\"input\",\"path\":\"{s}/source\",\"size\":{d},\"sha256\":\"{s}\"}}],\"create_container\":false}}", .{ path, size, digest });
+        defer allocator.free(request);
+        try fixture.put("request.json", request);
+        const job = try std.fmt.allocPrint(allocator, "{{\"contract\":\"uk.hyperv.transfer-job\",\"schema_version\":1,\"kind\":\"{s}\",\"request\":\"request.json\",\"sas\":\"sas\",\"timeout_ms\":{d},\"cleanup_ms\":1000}}", .{ @tagName(kind), timeout_ms });
+        defer allocator.free(job);
+        try fixture.put("job.json", job);
+        return fixture;
+    }
+
+    fn put(self: Fixture, name: []const u8, bytes: []const u8) !void {
+        const file = try self.directory.dir.createFile(io, name, .{ .permissions = .fromMode(0o600) });
+        defer file.close(io);
+        try file.setPermissions(io, .fromMode(0o600));
+        try file.writeStreamingAll(io, bytes);
+    }
+
+    fn run(self: Fixture, cancel: ?*const std.atomic.Value(bool)) worker.Report {
+        const executable = std.Io.Dir.cwd().realPathFileAlloc(io, options.worker_fixture, allocator) catch
+            @panic("native worker fixture executable is unavailable");
+        defer allocator.free(executable);
+        return worker.supervise(allocator, io, self.path, "job.json", .{
+            .executable = executable,
+            .cancel = cancel,
+        });
+    }
+
+    fn deinit(self: Fixture) void {
+        self.directory.close(io);
+        self.root.dir.deleteTree(io, &self.name) catch @panic("worker fixture cleanup failed");
+        self.root.close(io);
+        allocator.free(self.path);
+    }
+};
+
+fn noChildren() !void {
+    var status: u32 = 0;
+    try testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(-1, &status, linux.W.NOHANG)));
+}
+
+fn safeReport(report: worker.Report) !void {
+    var bytes: [protocol.maximum_result]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try report.write(&writer);
+    for ([_][]const u8{ "SYNTHETIC", "sig=", "https://", ".blob.", "source", "request.json" }) |secret|
+        try testing.expect(std.mem.indexOf(u8, writer.buffered(), secret) == null);
+    const document = try core.contracts.SensitiveDocument.parse(allocator, writer.buffered(), .{ .bytes = protocol.maximum_result });
+    defer document.deinit();
+    try document.requireCanonical(writer.buffered());
+}
+
+test "real native worker uploads downloads and reads page footer through supervised protocol" {
+    for ([_]struct { kind: core.transfer.job.Kind, size: usize, download: bool }{
+        .{ .kind = .blob, .size = 17001, .download = false },
+        .{ .kind = .blob, .size = 0, .download = true },
+        .{ .kind = .pages, .size = 512, .download = false },
+    }) |case| {
+        const fixture = try Fixture.init("pass", case.kind, case.size, case.download, 5000);
+        defer fixture.deinit();
+        const result = fixture.run(null);
+        try testing.expect(result.succeeded());
+        try testing.expectEqual(@as(?bool, true), result.process_cleanup_complete);
+        try testing.expectEqual(@as(u64, if (case.kind == .pages) 2 else 1), result.progress.?.requests_attempted);
+        try testing.expectEqual(@as(u64, if (case.download) 0 else case.size), result.progress.?.bytes_confirmed);
+        if (case.kind == .pages) try testing.expect(result.outcome.?.footer_sha256 != null);
+        var durable = try fixture.directory.readSensitive(io, allocator, core.transfer.job.supervised_name, protocol.maximum_result, null);
+        defer durable.deinit();
+        try testing.expect(std.mem.indexOf(u8, durable.bytes(), "\"delivery_complete\":true") != null);
+        try safeReport(result);
+        try noChildren();
+    }
+}
+
+test "sealed artifacts keep nonprivate mode and hard-link policy distinct from SAS files" {
+    const fixture = try Fixture.init("pass", .blob, 4096, false, 5000);
+    defer fixture.deinit();
+    const file = try fixture.directory.openFile(io, "source");
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o644));
+    try file.hardLink(io, fixture.directory.dir, "source-link", .{});
+    try testing.expect(fixture.run(null).succeeded());
+    try testing.expectError(error.UnsafeFile, fixture.directory.openFile(io, "source"));
+    try noChildren();
+}
+
+test "partial page side effects retain attempted confirmed and consumed-attempt state" {
+    const fixture = try Fixture.init("partial", .pages, 4 * 1024 * 1024 + 512, false, 5000);
+    defer fixture.deinit();
+    const result = fixture.run(null);
+    try testing.expect(!result.succeeded());
+    try testing.expectEqual(.unknown, result.side_effect);
+    try testing.expectEqual(@as(u64, 2), result.progress.?.mutations_attempted);
+    try testing.expectEqual(@as(u64, 1), result.progress.?.mutations_confirmed);
+    try testing.expectEqual(@as(u64, 4 * 1024 * 1024 + 512), result.progress.?.bytes_attempted);
+    try testing.expectEqual(@as(u64, 4 * 1024 * 1024), result.progress.?.bytes_confirmed);
+    try testing.expectEqual(result.progress.?.bytes_confirmed, result.outcome.?.bytes_accepted);
+    try testing.expectEqual(.transport, result.failures.primary.?.category);
+    const repeated = fixture.run(null);
+    try testing.expectEqual(.conflict, repeated.failures.primary.?.category);
+    try testing.expectEqual(.unknown, repeated.side_effect);
+    var invocations = try fixture.directory.readSensitive(io, allocator, "invocations", 32, null);
+    defer invocations.deinit();
+    try testing.expectEqualStrings("1", invocations.bytes());
+    try safeReport(result);
+    try noChildren();
+}
+
+test "hard parent deadline stops a native blocked transport and keeps pending effects unknown" {
+    const fixture = try Fixture.init("blocked", .blob, 4096, false, 1500);
+    defer fixture.deinit();
+    const result = fixture.run(null);
+    try testing.expect(!result.succeeded());
+    try testing.expectEqual(.timeout, result.failures.primary.?.category);
+    try testing.expectEqual(@as(?bool, true), result.process_cleanup_complete);
+    try testing.expectEqual(.unknown, result.side_effect);
+    try testing.expect(result.outcome == null);
+    try testing.expect(result.progress.?.pending);
+    try testing.expectEqual(@as(u64, 1), result.progress.?.mutations_attempted);
+    try testing.expectEqual(@as(u64, 0), result.progress.?.mutations_confirmed);
+    _ = try fixture.directory.dir.statFile(io, "entered", .{});
+    try safeReport(result);
+    try noChildren();
+}
+
+test "cancellation terminates a native blocked worker under an independent cleanup budget" {
+    const fixture = try Fixture.init("blocked", .blob, 4096, false, 5000);
+    defer fixture.deinit();
+    var cancelled = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn cancel(directory: std.Io.Dir, flag: *std.atomic.Value(bool)) void {
+            var tries: usize = 0;
+            while (tries < 400) : (tries += 1) {
+                if (directory.statFile(io, "entered", .{})) |_| break else |_| {}
+                const duration: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+                _ = linux.nanosleep(&duration, null);
+            }
+            flag.store(true, .release);
+        }
+    }.cancel, .{ fixture.directory.dir, &cancelled });
+    defer thread.join();
+    const result = fixture.run(&cancelled);
+    try testing.expectEqual(.cancelled, result.failures.primary.?.category);
+    try testing.expectEqual(@as(?bool, true), result.process_cleanup_complete);
+    try testing.expectEqual(.unknown, result.side_effect);
+    try testing.expect(result.progress.?.pending);
+    _ = try fixture.directory.dir.statFile(io, "entered", .{});
+    try safeReport(result);
+    try noChildren();
+}
+
+test "malformed stale or excessive native output never substitutes successful delivery" {
+    for ([_][]const u8{ "malformed", "stale", "flood" }) |mode| {
+        const fixture = try Fixture.init(mode, .blob, 17, false, 5000);
+        defer fixture.deinit();
+        const result = fixture.run(null);
+        try testing.expect(!result.succeeded());
+        try testing.expect(!result.delivery_complete);
+        try testing.expectEqual(.accepted, result.side_effect);
+        const expected: core.diagnostics.Category = if (std.mem.eql(u8, mode, "flood")) .output_limit else if (std.mem.eql(u8, mode, "stale")) .integrity else .invalid_response;
+        try testing.expectEqual(expected, result.failures.primary.?.category);
+        try testing.expectEqual(.complete, result.outcome.?.completion);
+        try testing.expectEqual(@as(u64, 17), result.progress.?.bytes_confirmed);
+        try safeReport(result);
+        try noChildren();
+    }
+}
+
+test "native stderr and error bodies stay private while source metadata survives" {
+    const clean = try Fixture.init("stderr_secret", .blob, 17, false, 5000);
+    defer clean.deinit();
+    const clean_result = clean.run(null);
+    try testing.expect(clean_result.succeeded());
+    try safeReport(clean_result);
+    const fixture = try Fixture.init("metadata", .blob, 17, false, 5000);
+    defer fixture.deinit();
+    const result = fixture.run(null);
+    try testing.expectEqual(.rejected, result.side_effect);
+    try testing.expectEqual(@as(?u16, 403), result.outcome.?.diagnostic.status);
+    try testing.expectEqual(.known, result.outcome.?.diagnostic.service.header);
+    try testing.expectEqual(.malformed, result.outcome.?.diagnostic.service.body);
+    try testing.expectEqual(.AuthorizationServiceMismatch, result.outcome.?.diagnostic.service.header_code.?);
+    try testing.expectEqual(.malformed, result.failures.primary.?.service_code);
+    try safeReport(result);
+    try noChildren();
+}
+
+test "native transfer primary cleanup and recording failures occupy independent lanes" {
+    const cleanup = try Fixture.init("cleanup_failure", .blob, 0, true, 5000);
+    defer cleanup.deinit();
+    const failed = cleanup.run(null);
+    try testing.expectEqual(.integrity, failed.failures.primary.?.category);
+    try testing.expectEqual(.cleanup_failed, failed.failures.cleanup.?.category);
+    try testing.expect(failed.failures.recording == null);
+    try testing.expect(failed.outcome.?.cleanup_failed);
+    const recording = try Fixture.init("recording_failure", .blob, 17, false, 5000);
+    defer recording.deinit();
+    const result = recording.run(null);
+    try testing.expect(!result.succeeded());
+    try testing.expectEqual(.accepted, result.side_effect);
+    try testing.expectEqual(@as(u64, 17), result.progress.?.bytes_confirmed);
+    try testing.expect(result.failures.primary == null);
+    try testing.expectEqual(.local_io, result.failures.recording.?.category);
+    try safeReport(result);
+    try noChildren();
+}
+
+test "worker refuses request substitution after private parent admission" {
+    const fixture = try Fixture.init("changed_request", .blob, 17, false, 5000);
+    defer fixture.deinit();
+    const result = fixture.run(null);
+    try testing.expectEqual(.not_started, result.side_effect);
+    try testing.expectEqual(.integrity, result.failures.primary.?.category);
+    try testing.expectEqual(@as(u64, 0), result.progress.?.requests_attempted);
+    try noChildren();
+}
+
+test "strict worker result protocol rejects extra fields numeric coercions and inconsistent success" {
+    const fixture = try Fixture.init("pass", .blob, 17, false, 5000);
+    defer fixture.deinit();
+    const result = fixture.run(null);
+    try testing.expect(result.succeeded());
+    var bytes: [protocol.maximum_result]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&bytes);
+    try result.write(&writer);
+    const intent = try protocol.Intent.load(allocator, io, fixture.directory);
+    for ([_][2][]const u8{
+        .{ "\"schema_version\":1", "\"schema_version\":true" },
+        .{ "\"bytes_confirmed\":17", "\"bytes_confirmed\":17.0" },
+        .{ "\"bytes_confirmed\":17", "\"bytes_confirmed\":0" },
+        .{ "\"status\":201", "\"status\":403" },
+        .{ "\"status\":201},\"phase\"", "\"status\":200},\"phase\"" },
+        .{ "\"status\":201},\"schema_version\"", "\"status\":200},\"schema_version\"" },
+        .{ "\"contract\":\"uk.hyperv.transfer-report\"", "\"contract\":\"uk.hyperv.transfer-report\",\"message\":\"SYNTHETIC_SECRET\"" },
+    }) |change| {
+        try testing.expect(std.mem.indexOf(u8, writer.buffered(), change[0]) != null);
+        const raw = try std.mem.replaceOwned(u8, allocator, writer.buffered(), change[0], change[1]);
+        defer allocator.free(raw);
+        if (protocol.Report.parse(allocator, raw, intent)) |_| return error.InvalidReportAccepted else |_| {}
+    }
+    try noChildren();
+}
+
+test "installed CLI exposes supervised transfers and refuses unsupervised worker execution" {
+    const fixture = try Fixture.init("pass", .blob, 17, false, 5000);
+    defer fixture.deinit();
+    try core.process.initialize();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(executable);
+    var help = try core.process.run(allocator, io, .{
+        .argv = &.{ executable, "--help" },
+        .cwd = fixture.directory.dir,
+        .environment = &environment,
+        .deadline = try core.process.Deadline.afterMilliseconds(3000),
+    });
+    defer help.deinit(allocator);
+    try testing.expect(help.failures.primary == null);
+    try testing.expect(std.mem.indexOf(u8, help.stdout, "transfer PRIVATE_DIRECTORY JOB_BASENAME") != null);
+    var inspection = try core.process.run(allocator, io, .{
+        .argv = &.{ executable, "inspect-json", fixture.path, "request.json" },
+        .cwd = fixture.directory.dir,
+        .environment = &environment,
+        .deadline = try core.process.Deadline.afterMilliseconds(3000),
+    });
+    defer inspection.deinit(allocator);
+    try testing.expect(inspection.failures.primary == null);
+    try testing.expectEqualStrings("{\"canonical\":false,\"valid\":true}\n", inspection.stdout);
+    var refused = try core.process.run(allocator, io, .{
+        .argv = &.{ executable, "__transfer-worker", "job.json" },
+        .cwd = fixture.directory.dir,
+        .environment = &environment,
+        .deadline = try core.process.Deadline.afterMilliseconds(3000),
+    });
+    defer refused.deinit(allocator);
+    try testing.expect(refused.failures.primary == null);
+    const document = try core.contracts.SensitiveDocument.parse(allocator, refused.stdout, .{});
+    defer document.deinit();
+    const outcome = try core.transfer.Outcome.parse(document.value().object.get("outcome").?);
+    try testing.expectEqual(.failed, outcome.completion);
+    try testing.expectEqual(.not_started, outcome.side_effect);
+    try testing.expectError(error.FileNotFound, fixture.directory.dir.statFile(io, "entered", .{}));
+    // Exercise the public CLI and its real native worker without reaching HTTP.
+    try fixture.directory.dir.deleteFile(io, "source");
+    var public = try core.process.run(allocator, io, .{
+        .argv = &.{ executable, "transfer", fixture.path, "job.json" },
+        .cwd = fixture.directory.dir,
+        .environment = &environment,
+        .deadline = try core.process.Deadline.afterMilliseconds(10000),
+    });
+    defer public.deinit(allocator);
+    try testing.expect(public.failures.primary != null);
+    try testing.expect(public.cleanup_complete);
+    const intent = try protocol.Intent.load(allocator, io, fixture.directory);
+    var final_bytes = try fixture.directory.readSensitive(io, allocator, core.transfer.job.supervised_name, protocol.maximum_result, null);
+    defer final_bytes.deinit();
+    const final = try protocol.Report.parse(allocator, final_bytes.bytes(), intent);
+    try testing.expect(!final.succeeded());
+    try testing.expectEqual(.not_started, final.side_effect);
+    try testing.expectEqual(@as(u64, 0), final.progress.?.requests_attempted);
+    try testing.expectEqual(.input_hash, final.outcome.?.diagnostic.stage);
+    try safeReport(final);
+    try noChildren();
+}
+
+test "invalid private jobs and unsafe SAS modes fail before child execution" {
+    for ([_][2][]const u8{
+        .{ "\"schema_version\":1", "\"schema_version\":2" },
+        .{ "\"kind\":\"blob\"", "\"kind\":\"blob\",\"token\":\"SYNTHETIC_SECRET\"" },
+        .{ "\"sas\":\"sas\"", "\"sas\":\"request.json\"" },
+        .{ "\"request\":\"request.json\"", "\"request\":\"../request.json\"" },
+        .{ "\"request\":\"request.json\"", "\"request\":\"transfer-state.json\"" },
+        .{ "\"timeout_ms\":5000", "\"timeout_ms\":true" },
+        .{ "\"timeout_ms\":5000", "\"timeout_ms\":5e3" },
+        .{ "\"timeout_ms\":5000", "\"timeout_ms\":3600001" },
+        .{ "\"cleanup_ms\":1000", "\"cleanup_ms\":0" },
+    }) |change| {
+        const fixture = try Fixture.init("pass", .blob, 17, false, 5000);
+        defer fixture.deinit();
+        var original = try fixture.directory.readSensitive(io, allocator, "job.json", 8192, null);
+        defer original.deinit();
+        const changed = try std.mem.replaceOwned(u8, allocator, original.bytes(), change[0], change[1]);
+        defer allocator.free(changed);
+        try fixture.put("job.json", changed);
+        const result = fixture.run(null);
+        try testing.expect(!result.succeeded());
+        try testing.expectEqual(.not_started, result.side_effect);
+        try testing.expect(result.failures.primary != null);
+        try testing.expectError(error.FileNotFound, fixture.directory.dir.statFile(io, "invocations", .{}));
+    }
+    const fixture = try Fixture.init("pass", .blob, 17, false, 5000);
+    defer fixture.deinit();
+    const sas = try fixture.directory.openFile(io, "sas");
+    try sas.setPermissions(io, .fromMode(0o644));
+    sas.close(io);
+    const result = fixture.run(null);
+    try testing.expectEqual(.unsafe_file, result.failures.primary.?.category);
+    try testing.expectEqual(.not_started, result.side_effect);
+    try testing.expectError(error.FileNotFound, fixture.directory.dir.statFile(io, "invocations", .{}));
+    try noChildren();
+}
+
+test "durable admission recording failure prevents native transport and has its own lane" {
+    const fixture = try Fixture.init("pass", .blob, 17, false, 5000);
+    defer fixture.deinit();
+    try fixture.directory.dir.createDir(io, core.transfer.job.state_name, .fromMode(0o700));
+    const result = fixture.run(null);
+    try testing.expect(!result.succeeded());
+    try testing.expectEqual(.not_started, result.side_effect);
+    try testing.expect(result.failures.primary == null);
+    try testing.expect(result.failures.recording != null);
+    try testing.expectError(error.FileNotFound, fixture.directory.dir.statFile(io, "invocations", .{}));
+    try noChildren();
+}
+
+test "post-child lock failure preserves timeout or confirmed success and adds recording failure" {
+    for ([_][]const u8{ "blocked_lock_failure", "final_lock_failure" }) |mode| {
+        const fixture = try Fixture.init(mode, .blob, 17, false, 1500);
+        defer fixture.deinit();
+        const result = fixture.run(null);
+        try testing.expect(!result.succeeded());
+        try testing.expectEqual(@as(?bool, true), result.process_cleanup_complete);
+        try testing.expect(result.failures.recording != null);
+        if (std.mem.eql(u8, mode, "blocked_lock_failure")) {
+            try testing.expectEqual(.timeout, result.failures.primary.?.category);
+            try testing.expectEqual(.unknown, result.side_effect);
+            try testing.expect(result.progress == null);
+        } else {
+            try testing.expect(result.failures.primary == null);
+            try testing.expectEqual(.accepted, result.side_effect);
+            try testing.expectEqual(@as(u64, 17), result.progress.?.bytes_confirmed);
+            try testing.expectEqual(.complete, result.outcome.?.completion);
+        }
+        try testing.expectError(error.FileNotFound, fixture.directory.dir.statFile(io, core.transfer.job.supervised_name, .{}));
+        try safeReport(result);
+        try noChildren();
+    }
+}
+
+test "outcome v2 preserves independent source metadata certainty and failure lanes" {
+    const d = core.transfer.diagnostic;
+    for ([_]d.Metadata{
+        .{ .state = .malformed, .header = .known, .header_code = .AuthorizationServiceMismatch, .body = .malformed },
+        .{ .state = .unknown, .body = .unknown },
+        .{ .state = .conflicting, .header = .known, .header_code = .LeaseIdMismatchWithBlobOperation, .body = .known, .body_code = .PendingCopyOperation },
+        .{},
+    }) |metadata| {
+        var outcome = d.Outcome.fail(.input_verify, .input_changed);
+        outcome.diagnostic.status = 403;
+        outcome.diagnostic.service = metadata;
+        outcome.side_effect = .accepted;
+        outcome.bytes_accepted = 17;
+        outcome.bytes_streamed = 17;
+        outcome.cleanup_failed = true;
+        try outcome.failures.record(.recording, .{ .stage = .state_record, .category = .local_io });
+        var buffer: [4096]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try outcome.write(&writer);
+        const document = try core.contracts.SensitiveDocument.parse(allocator, writer.buffered(), .{});
+        defer document.deinit();
+        try document.requireCanonical(writer.buffered());
+        const parsed = try d.Outcome.parse(document.value());
+        try testing.expectEqualDeep(outcome, parsed);
+        const failures = try parsed.failureSummary();
+        try testing.expect(failures.primary != null and failures.cleanup != null and failures.recording != null);
+        try testing.expectEqual(@as(?u16, 403), failures.primary.?.http_status);
+    }
+    try testing.expectError(error.InvalidOutcome, (d.Metadata{
+        .state = .known,
+        .code = .InvalidBlobType,
+        .header = .known,
+        .header_code = .PendingCopyOperation,
+    }).validate());
+}

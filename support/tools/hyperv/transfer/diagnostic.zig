@@ -1,47 +1,43 @@
 const std = @import("std");
 const core = @import("azure_sdk_core");
+const shared = @import("hyperv_core");
+const contracts = shared.contracts;
 
 pub const max_error_body = 8192;
 pub const Stage = enum { contract, request_file, input_open, input_hash, container_create, block_put, page_put, download_open, download_read, output_create, output_sync, input_verify, footer_readback, finished };
 pub const Category = enum { none, invalid_contract, unsafe_file, input_changed, local_io, allocation, cancelled, deadline, transport, redirect, condition, authentication, authorization, not_found, throttled, service, unexpected_status, response_limit, malformed_response, integrity, footer_mismatch };
 pub const Certainty = enum { not_started, accepted, rejected, unknown, incomplete, not_applicable };
 pub const Completion = enum { complete, failed };
-pub const MetadataState = enum { absent, known, unknown, malformed, conflicting };
-pub const ServiceCode = enum {
-    AuthenticationFailed,
-    AuthorizationFailure,
-    AuthorizationPermissionMismatch,
-    AuthorizationSourceIPMismatch,
-    AuthorizationProtocolMismatch,
-    AuthorizationServiceMismatch,
-    KeyBasedAuthenticationNotPermitted,
-    ConditionNotMet,
-    BlobAlreadyExists,
-    ContainerAlreadyExists,
-    BlobNotFound,
-    ContainerNotFound,
-    ResourceNotFound,
-    Md5Mismatch,
-    InvalidMd5,
-    InvalidHeaderValue,
-    InvalidRange,
-    InvalidPageRange,
-    InvalidBlobType,
-    InvalidQueryParameterValue,
-    MissingRequiredHeader,
-    LeaseIdMissing,
-    LeaseIdMismatchWithBlob,
-    LeaseAlreadyPresent,
-    PendingCopyOperation,
-    ServerBusy,
-    OperationTimedOut,
-    InternalError,
-};
+pub const MetadataState = shared.diagnostics.MetadataState;
+pub const ServiceCode = shared.diagnostics.ServiceCode;
 pub const Metadata = struct {
     state: MetadataState = .absent,
     code: ?ServiceCode = null,
     header: MetadataState = .absent,
     body: MetadataState = .absent,
+    header_code: ?ServiceCode = null,
+    body_code: ?ServiceCode = null,
+
+    pub fn validate(self: Metadata) !void {
+        try validateCode(self.state, self.code);
+        try validateCode(self.header, self.header_code);
+        try validateCode(self.body, self.body_code);
+        if (self.header == .absent) {
+            if (self.state != self.body or self.code != self.body_code) return error.InvalidOutcome;
+        } else if (self.body == .absent) {
+            if (self.state != self.header or self.code != self.header_code) return error.InvalidOutcome;
+        } else if (self.header == .conflicting or self.body == .conflicting) {
+            if (self.state != .conflicting) return error.InvalidOutcome;
+        } else if (self.header == .known and self.body == .known) {
+            if (self.header_code == self.body_code) {
+                if (self.state != .known or self.code != self.header_code) return error.InvalidOutcome;
+            } else if (self.state != .conflicting) return error.InvalidOutcome;
+        } else if (self.header == .malformed or self.body == .malformed) {
+            if (self.state != .malformed and self.state != .conflicting) return error.InvalidOutcome;
+        } else if (self.header == .unknown and self.body == .unknown) {
+            if (self.state != .unknown and self.state != .conflicting) return error.InvalidOutcome;
+        } else if (self.state != .conflicting) return error.InvalidOutcome;
+    }
 };
 pub const Diagnostic = struct {
     stage: Stage,
@@ -61,6 +57,7 @@ pub const Outcome = struct {
     sha256: ?[32]u8 = null,
     footer_sha256: ?[32]u8 = null,
     cleanup_failed: bool = false,
+    failures: shared.diagnostics.Failures = .{},
 
     pub fn fail(stage: Stage, category: Category) Outcome {
         return .{ .diagnostic = .{ .stage = stage, .category = category } };
@@ -69,20 +66,164 @@ pub const Outcome = struct {
     /// This is the only diagnostic rendering surface. All text is compile-time
     /// enum vocabulary; never pass an SDK error, request or response to a logger.
     pub fn write(self: Outcome, writer: *std.Io.Writer) !void {
-        try writer.print(
-            "{{\"schema\":1,\"completion\":\"{s}\",\"side_effect\":\"{s}\",\"stage\":\"{s}\",\"category\":\"{s}\",\"status\":",
-            .{ @tagName(self.completion), @tagName(self.side_effect), @tagName(self.diagnostic.stage), @tagName(self.diagnostic.category) },
-        );
-        if (self.diagnostic.status) |status| try writer.print("{d}", .{status}) else try writer.writeAll("null");
-        try writer.print(",\"metadata\":\"{s}\",\"header_metadata\":\"{s}\",\"body_metadata\":\"{s}\",\"service_code\":", .{
-            @tagName(self.diagnostic.service.state), @tagName(self.diagnostic.service.header), @tagName(self.diagnostic.service.body),
+        try self.writeValue(writer);
+        try writer.writeByte('\n');
+    }
+
+    pub fn writeValue(self: Outcome, writer: *std.Io.Writer) !void {
+        try self.validate();
+        try writer.writeAll("{\"body_code\":");
+        try std.json.Stringify.value(self.diagnostic.service.body_code, .{}, writer);
+        try writer.print(",\"body_metadata\":\"{s}\",\"bytes_accepted\":{d},\"bytes_downloaded\":{d},\"bytes_streamed\":{d},\"category\":\"{s}\",\"cleanup_failed\":{s},\"completion\":\"{s}\",\"failures\":", .{
+            @tagName(self.diagnostic.service.body), self.bytes_accepted,                          self.bytes_downloaded,     self.bytes_streamed,
+            @tagName(self.diagnostic.category),     if (self.cleanup_failed) "true" else "false", @tagName(self.completion),
         });
-        if (self.diagnostic.service.code) |code| try writer.print("\"{s}\"", .{@tagName(code)}) else try writer.writeAll("null");
-        try writer.print(",\"bytes_streamed\":{d},\"bytes_accepted\":{d},\"bytes_downloaded\":{d},\"cleanup_failed\":{s}}}\n", .{
-            self.bytes_streamed, self.bytes_accepted, self.bytes_downloaded, if (self.cleanup_failed) "true" else "false",
+        try self.failures.writeValue(writer);
+        try writer.writeAll(",\"footer_sha256\":");
+        try writeHash(self.footer_sha256, writer);
+        try writer.writeAll(",\"header_code\":");
+        try std.json.Stringify.value(self.diagnostic.service.header_code, .{}, writer);
+        try writer.print(",\"header_metadata\":\"{s}\",\"metadata\":\"{s}\",\"schema_version\":2,\"service_code\":", .{
+            @tagName(self.diagnostic.service.header), @tagName(self.diagnostic.service.state),
         });
+        try std.json.Stringify.value(self.diagnostic.service.code, .{}, writer);
+        try writer.writeAll(",\"sha256\":");
+        try writeHash(self.sha256, writer);
+        try writer.print(",\"side_effect\":\"{s}\",\"stage\":\"{s}\",\"status\":", .{ @tagName(self.side_effect), @tagName(self.diagnostic.stage) });
+        try std.json.Stringify.value(self.diagnostic.status, .{}, writer);
+        try writer.writeByte('}');
+    }
+
+    pub fn parse(value: std.json.Value) !Outcome {
+        const object = try contracts.exactFields(value, &.{
+            "schema_version", "completion",      "side_effect",      "stage",        "category",      "status",
+            "metadata",       "header_metadata", "body_metadata",    "service_code", "header_code",   "body_code",
+            "bytes_streamed", "bytes_accepted",  "bytes_downloaded", "sha256",       "footer_sha256", "cleanup_failed",
+            "failures",
+        });
+        if (try contracts.integer(u32, object.get("schema_version").?) != 2) return error.InvalidOutcome;
+        const status = object.get("status").?;
+        const cleanup = object.get("cleanup_failed").?;
+        if (cleanup != .bool) return error.InvalidOutcome;
+        const result: Outcome = .{
+            .completion = try contracts.enumeration(Completion, object.get("completion").?),
+            .side_effect = try contracts.enumeration(Certainty, object.get("side_effect").?),
+            .diagnostic = .{
+                .stage = try contracts.enumeration(Stage, object.get("stage").?),
+                .category = try contracts.enumeration(Category, object.get("category").?),
+                .status = if (status == .null) null else try contracts.integer(u16, status),
+                .service = .{
+                    .state = try contracts.enumeration(MetadataState, object.get("metadata").?),
+                    .header = try contracts.enumeration(MetadataState, object.get("header_metadata").?),
+                    .body = try contracts.enumeration(MetadataState, object.get("body_metadata").?),
+                    .code = try parseCode(object.get("service_code").?),
+                    .header_code = try parseCode(object.get("header_code").?),
+                    .body_code = try parseCode(object.get("body_code").?),
+                },
+            },
+            .bytes_streamed = try contracts.integer(u64, object.get("bytes_streamed").?),
+            .bytes_accepted = try contracts.integer(u64, object.get("bytes_accepted").?),
+            .bytes_downloaded = try contracts.integer(u64, object.get("bytes_downloaded").?),
+            .sha256 = try parseHash(object.get("sha256").?),
+            .footer_sha256 = try parseHash(object.get("footer_sha256").?),
+            .cleanup_failed = cleanup.bool,
+            .failures = try shared.diagnostics.Failures.parse(object.get("failures").?),
+        };
+        try result.validate();
+        return result;
+    }
+
+    pub fn validate(self: Outcome) !void {
+        const metadata = self.diagnostic.service;
+        try metadata.validate();
+        if (self.diagnostic.status) |status| {
+            if (status < 100 or status > 599) return error.InvalidOutcome;
+        } else if (metadata.state != .absent or metadata.header != .absent or metadata.body != .absent) return error.InvalidOutcome;
+        if (self.completion == .complete and
+            (self.diagnostic.category != .none or self.diagnostic.status == null or
+                self.diagnostic.status.? < 200 or self.diagnostic.status.? >= 300 or self.cleanup_failed or
+                (self.side_effect != .accepted and self.side_effect != .not_applicable) or
+                self.failures.primary != null or self.failures.cleanup != null or self.failures.recording != null))
+            return error.InvalidOutcome;
+        if (self.completion == .failed and self.diagnostic.category == .none and !self.cleanup_failed and
+            self.failures.primary == null and self.failures.cleanup == null and self.failures.recording == null)
+            return error.InvalidOutcome;
+    }
+
+    pub fn failureSummary(self: Outcome) !shared.diagnostics.Failures {
+        var result = self.failures;
+        if (self.completion == .failed and self.diagnostic.category != .none)
+            try result.record(.primary, self.aggregateDiagnostic());
+        if (self.cleanup_failed) try result.record(.cleanup, .{ .stage = .private_file, .category = .cleanup_failed });
+        return result;
+    }
+
+    pub fn aggregateDiagnostic(self: Outcome) shared.diagnostics.Diagnostic {
+        return .{
+            .stage = switch (self.diagnostic.stage) {
+                .contract => .contract,
+                .request_file, .input_open, .input_hash, .input_verify, .output_create, .output_sync => .private_file,
+                .container_create, .block_put => .blob_upload,
+                .page_put, .footer_readback => .page_upload,
+                .download_open, .download_read => .blob_download,
+                .finished => .transfer_worker,
+            },
+            .category = switch (self.diagnostic.category) {
+                .none => .unavailable,
+                .invalid_contract => .invalid_input,
+                .unsafe_file => .unsafe_file,
+                .input_changed, .integrity, .footer_mismatch => .integrity,
+                .local_io => .local_io,
+                .allocation => .internal,
+                .cancelled => .cancelled,
+                .deadline => .timeout,
+                .transport => .transport,
+                .redirect, .unexpected_status, .malformed_response => .invalid_response,
+                .condition => .conflict,
+                .authentication => .authentication,
+                .authorization => .authorization,
+                .not_found => .not_found,
+                .throttled => .throttled,
+                .service => .service,
+                .response_limit => .output_limit,
+            },
+            .http_status = self.diagnostic.status,
+            .service_code = switch (self.diagnostic.service.state) {
+                .absent => .unavailable,
+                .known => self.diagnostic.service.code.?,
+                .unknown => .unknown,
+                .malformed => .malformed,
+                .conflicting => .conflicting,
+            },
+        };
     }
 };
+
+pub fn writeHash(hash: ?[32]u8, writer: *std.Io.Writer) !void {
+    if (hash) |value| try writer.print("\"{s}\"", .{std.fmt.bytesToHex(value, .lower)}) else try writer.writeAll("null");
+}
+
+pub fn parseHash(value: std.json.Value) !?[32]u8 {
+    return if (value == .null) null else try contracts.parseSha256(try contracts.string(value));
+}
+
+fn parseCode(value: std.json.Value) !?ServiceCode {
+    if (value == .null) return null;
+    const code = try contracts.enumeration(ServiceCode, value);
+    try validateCode(.known, code);
+    return code;
+}
+
+fn validateCode(state: MetadataState, code: ?ServiceCode) !void {
+    if (state != .known) {
+        if (code != null) return error.InvalidOutcome;
+        return;
+    }
+    switch (code orelse return error.InvalidOutcome) {
+        .unavailable, .unknown, .malformed, .conflicting => return error.InvalidOutcome,
+        else => {},
+    }
+}
 
 pub fn statusCategory(status: u16) Category {
     return switch (status) {
@@ -102,18 +243,14 @@ const Candidate = struct {
     code: ?ServiceCode = null,
 
     fn add(self: *Candidate, value: []const u8) void {
-        var next: Candidate = .{ .state = .unknown, .raw = value };
-        if (value.len == 0 or value.len > 128) {
-            next.state = .malformed;
-        } else {
-            for (value) |c| {
-                if (!std.ascii.isAlphanumeric(c) and c != '_') next.state = .malformed;
-            }
-        }
-        if (next.state != .malformed) {
-            next.code = std.meta.stringToEnum(ServiceCode, value);
-            if (next.code != null) next.state = .known;
-        }
+        const code = shared.diagnostics.classifyServiceCode(value);
+        const next: Candidate = switch (code) {
+            .unavailable => .{ .state = .absent },
+            .unknown => .{ .state = .unknown, .raw = value },
+            .malformed => .{ .state = .malformed, .raw = value },
+            .conflicting => .{ .state = .conflicting },
+            else => .{ .state = .known, .raw = value, .code = code },
+        };
         self.merge(next);
     }
 
@@ -154,6 +291,7 @@ pub fn extract(operation: *const core.http.HttpOperation, body: []const u8, trun
         if (operation.getHeader("x-ms-error-code")) |value| header.add(value);
     }
     var storage: [64 * 1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &storage);
     var allocator = std.heap.FixedBufferAllocator.init(&storage);
     var parsed: ?std.json.Parsed(std.json.Value) = null;
     defer if (parsed) |*value| value.deinit();
@@ -176,7 +314,14 @@ pub fn extract(operation: *const core.http.HttpOperation, body: []const u8, trun
     }
     var combined = header;
     combined.merge(body_code);
-    return .{ .state = combined.state, .code = if (combined.state == .known) combined.code else null, .header = header.state, .body = body_code.state };
+    return .{
+        .state = combined.state,
+        .code = if (combined.state == .known) combined.code else null,
+        .header = header.state,
+        .body = body_code.state,
+        .header_code = if (header.state == .known) header.code else null,
+        .body_code = if (body_code.state == .known) body_code.code else null,
+    };
 }
 
 pub fn boundedJson(bytes: []const u8) bool {

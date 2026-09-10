@@ -1,41 +1,52 @@
-# Native Hyper-V host-tool foundation
+# Native Hyper-V host tool and supervised transfers
 
 This standalone Zig 0.16.0 package does not import the repository's root build,
-run any legacy controller, use Azure CLI, acquire credentials, or contact Azure.
-It has no package dependencies. Its only installed executable is `uk-hyperv`.
-There is deliberately no placeholder `uk-hyperv-host`, workflow engine, or
-destructive command. This foundation is not preflight or persistence acceptance.
+run any legacy controller, use Azure CLI, or acquire ambient credentials.
+The dependency-free `hyperv_core` foundation is combined with the pinned SDK
+transfer module in the `hyperv` facade. Its only installed executable is
+`uk-hyperv`; its explicit transfer command is a real network implementation,
+not a success-shaped stub. Azure execution remains paused. Local fixture
+results do not authorize execution or establish preflight/persistence acceptance.
 
 ## Build and test
 
 From the repository root, using the already installed Zig 0.16.0 compiler:
 
 ```sh
-CORE_WORK="$PWD/.d/zig-migration-core"
-mkdir -p "$CORE_WORK"/{tmp,home,cache,zig-global,zig-local,fixtures,out}
-chmod 700 "$CORE_WORK" "$CORE_WORK"/{tmp,home,cache,zig-global,zig-local,fixtures,out}
+CORE_WORK="$PWD/.d/zig-migration-transfer-core"
+umask 077
+mkdir -p "$CORE_WORK"/{tmp,home,cache,zig-global,zig-local,fixtures,out,restore}
+chmod 700 "$CORE_WORK" "$CORE_WORK"/{tmp,home,cache,zig-global,zig-local,fixtures,out,restore}
 export TMPDIR="$CORE_WORK/tmp" HOME="$CORE_WORK/home"
 export XDG_CACHE_HOME="$CORE_WORK/cache"
 export ZIG_GLOBAL_CACHE_DIR="$CORE_WORK/zig-global"
 export ZIG_LOCAL_CACHE_DIR="$CORE_WORK/zig-local"
+# This Zig distribution restores beside the build file. Keep that operation
+# in scratch, then disable fetching for every source-tree build.
+cp support/tools/hyperv/build.zig support/tools/hyperv/build.zig.zon "$CORE_WORK/restore/"
+/home/g/.local/bin/zig build --build-file "$CORE_WORK/restore/build.zig" \
+  --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" -j2
 /home/g/.local/bin/zig build --build-file support/tools/hyperv/build.zig \
+  --system "$CORE_WORK/restore/zig-pkg" \
+  --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
   --prefix "$CORE_WORK/out" -Dtest-root="$CORE_WORK/fixtures" \
-  -j2 test install --summary all
+  -j2 test-core test-transfer test-worker install --summary all
 ```
 
 `test` requires an existing, current-user-owned, mode-0700 absolute test root.
 Every filesystem fixture gets a new private child of that root and removes only
 its own child afterward. Tests do not use `std.testing.tmpDir`, an interpreter,
 a shell subprocess, a network endpoint, or external images. The native process
-fixture is built only for tests and is not installed. Tests run on the build
-host even when the operator executable is cross-compiled.
+and injected-transfer fixtures are built only for tests and are not installed.
+Tests run on the build host even when the operator executable is cross-compiled.
 
 The current operating-system implementation requires Linux 5.11 or newer
 (`statx`, `close_range(CLOEXEC)`, and subreaper support); both AArch64 and x86-64
 are supported targets. Other operating systems fail compilation rather than
 silently weakening the file or supervision policy.
 
-## Read-only CLI
+## Local inspection CLI
 
 ```text
 uk-hyperv inspect-json PRIVATE_DIRECTORY BASENAME
@@ -60,13 +71,41 @@ state conversion, or completed handoff. Its exact fields are:
 - `byte_length`: unsigned 64-bit integer.
 
 `inspect-diagnostic` validates and emits a single allowlisted diagnostic.
-All command failures emit the versioned `Failures` object on stderr and exit 1.
-Unknown/destructive commands fail; arguments, input bytes, exception names,
+Inspection failures emit the versioned `Failures` object on stderr and exit 1.
+Unknown commands fail; arguments, input bytes, exception names,
 paths, resource identifiers, and raw process/HTTP output are never echoed.
+
+## Restricted transfer CLI
+
+```text
+uk-hyperv transfer PRIVATE_DIRECTORY JOB_BASENAME
+```
+
+This command validates private inputs, durably admits one attempt, starts the
+same native executable's restricted worker, and supervises it through `process`.
+It supplies an empty environment and descriptor-validated cwd; argv contains
+only the executable, internal command and simple job basename. SAS is loaded
+from a separate private file, never argv or environment. See the
+[transfer contracts](transfer/README.md#restricted-worker-and-parent-protocol)
+for the exact job, state and output interfaces.
+
+The public command emits a bounded `uk.hyperv.transfer-report` on stdout and
+exits 1 unless transfer, protocol delivery, state recording and process cleanup
+all succeed. A valid child report with exit 0 means protocol delivery only,
+not transfer success. The production binary cannot select an injected runtime.
+It replaces SDK log formatting with a fixed literal; raw SDK errors are never
+unwrapped or formatted.
+
+`test-core`, `test-transfer` and `test-worker` are focused selectors; `test`
+depends on all three. Dependencies, including versions and package hashes, are
+pinned in both manifests; the SDK commits are documented in the transfer README.
+The parent owns CI selector/restore updates and producer-pin refresh.
 
 ## Module interfaces
 
-Import `root.zig` (or the build module `hyperv`) to obtain:
+Import build module `hyperv` for the facade, `hyperv_transfer` for transfers,
+or dependency-free `hyperv_core` (`core.zig`) for these foundation interfaces.
+The facade's `root.zig` needs those two named module imports wired by the build.
 
 ### `contracts`
 
@@ -86,9 +125,25 @@ Import `root.zig` (or the build module `hyperv`) to obtain:
 - `parseSha256` and `parseUuid` return fixed byte arrays. UUID spelling does
   **not** establish version, variant, non-nil identity, or workflow authority;
   each owning schema must impose those policies.
+- `SensitiveDocument.parse` uses the same strict parser but owns a stable
+  wiping allocator. Scanner copies, decoded keys/strings, parser arenas,
+  canonicalization copies and failed partial parses are cleared on release.
+  `requireCanonical(source)` uses that allocator internally; `deinit` is
+  mandatory. The caller owns and must clear the original source buffer.
 - `Geometry.byteSize` requires positive 512-byte-sector geometry and checks
   multiplication overflow. Owning schemas must additionally bind exact sector
   counts, LUNs, and original identities.
+
+### `sensitive`
+
+`Allocator { backing }` is a wiping allocator adapter. Keep the adapter's
+address stable until every allocation is released. In-place resize/remap is
+refused so relocation cannot bypass a wiping free. `Buffer.bytes()` exposes
+only the read length; `Buffer.deinit()` clears the entire allocation, including
+the overflow-probe byte. Do not release it with an ordinary allocator free.
+These APIs do not clear independently copied caller data or caller-owned files.
+Forced process death cannot promise userspace destructors; the supervisor must
+reap the worker's address space and retain explicit unresolved-cleanup state.
 
 ### `diagnostics`
 
@@ -107,6 +162,13 @@ Service codes are enumerated. `classifyServiceCode` and
 
 Transport adapters remain responsible for bounded header/XML/JSON extraction,
 observed status, and distinct side-effect certainty. A 403 is not absence.
+The shared allowlist includes `LeaseIdMismatchWithBlobOperation`,
+`AuthorizationServiceMismatch`, `KeyBasedAuthenticationNotPermitted`,
+`InvalidBlobType` and `PendingCopyOperation`. The old undocumented
+`LeaseIdMismatchWithBlob` spelling stays unknown. Transfer `MetadataState`
+retains each header/body source independently; its aggregate maps `absent` to
+core `unavailable` and the other sentinel states by name. Do not flatten those
+sources or infer effects from this summary.
 
 `Failures` has schema version 1 and independent nullable `primary`, `cleanup`,
 and `recording` diagnostics. `record` retains the first error in each lane;
@@ -122,6 +184,18 @@ field. Never serialize private `process.Result` as a public diagnostic.
 - `read` has an explicit byte bound, checks size/timestamps before and after
   descriptor reads, and can verify an expected SHA-256. A hash supplied by the
   owning immutable contract is necessary for adversarial content substitution.
+- `readSensitive` and `readSensitiveAbsolute` return `sensitive.Buffer`, with
+  no unzeroized intermediate copy, including read/hash rejection paths. Use
+  these for private requests, SAS and sensitive JSON. Ordinary `read` clears
+  its intermediate but returns an ordinary caller-owned copy, not a secret API.
+- `openAbsolute(io, path, policy)`, `FileParent`, `snapshot` and `sameSnapshot`
+  centralize descriptor-safe file access. `.private` requires owner-only
+  directories and current-user 0600 single-link files. `.artifact` is distinct:
+  a no-follow regular file in a trusted path, without forcing private mode,
+  ownership or single-link policy. Transfers additionally enforce its exact
+  size, immutable SHA-256, metadata and final pathname binding.
+- `Directory.openWorkerCwd` adopts and checks the inherited descriptor-relative
+  working directory; it does not discover a credential or authority path.
 - `Directory.lock` obtains a nonblocking exclusive lock on `.writer.lock`.
   The stable lock inode is never replaced or removed by this API.
 - `Locked.commit` replaces state atomically; `Locked.createImmutable` uses
@@ -198,9 +272,21 @@ state machines must implement that higher-level recovery protocol.
 | Durable ownership | lock contention/stable inode, closed-guard rejection, atomic file-sync/rename/directory-sync failure boundaries, old/new visibility and scratch cleanup |
 | Native subprocesses | exact stdout cap, stderr cap/disposal, nonzero/missing executable, deadline/active cancellation, TERM-resistant child, grandchild/orphan reaping |
 | Inheritance isolation | private lock descriptor absent after exec, empty explicit environment, no failed output exposed |
+| Sensitive allocation lifecycle | zero-before-free observer for reads/hash failures, scanner/decoded strings, canonicalization, malformed/duplicate JSON, resize and allocation failures |
+
+`transfer/worker_tests.zig` runs real native child processes through the same
+restricted entry and supervisor, using a separately built injected HTTP
+runtime. Cases cover normal Blob/page transfers, shared artifact policy,
+partial and blocked mutations, cancellation/deadline, malformed/stale/flooded
+output, independent metadata and failure lanes, request substitution, consumed
+attempts, strict job/report schemas, and pre-transport recording failure.
+The public production CLI is also invoked with a deliberately missing synthetic
+source, proving native worker dispatch and durable failure reporting with zero
+HTTP attempts. Terminal-status contradictions and post-child lock failures have
+dedicated regressions.
 
 Durability error tests inject failure at the filesystem-operation boundaries;
 they do not claim to simulate a power loss or certify storage hardware.
-Cloud transports, credentials, source receipts, state machines, boot evidence,
+Live transport acceptance, credentials, source receipts, controller state machines, boot evidence,
 original acceptance artifacts, and production CI migration remain separate
 work. No cloud acceptance is authorized by passing these tests.
