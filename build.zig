@@ -10,6 +10,7 @@ const native_postprocess = @import("support/build/native-postprocess.zig");
 const native_image_graph = @import("support/build/native-image-graph.zig");
 const native_target_object = @import("support/build/native-target-object.zig");
 const native_build_tools = @import("support/build/native-build-tools.zig");
+const object_proofs = @import("support/build/hyperv-object-proofs.build.zig");
 
 const supported_zig = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
 
@@ -542,6 +543,7 @@ pub fn build(b: *std.Build) void {
         .os_tag = .freestanding,
         .abi = .none,
     });
+    const object_verifier = object_proofs.Setup.create(b, optimize);
     const hyperv_isr_target = b.resolveTargetQuery(native_target_object.targetQuery(true));
     const hyperv_runtime_object = b.addObject(.{
         .name = "hyperv-runtime-freestanding",
@@ -572,20 +574,16 @@ pub fn build(b: *std.Build) void {
     hyperv_runtime_link.addArg("-o");
     const hyperv_runtime_linked =
         hyperv_runtime_link.addOutputFileArg("hyperv-runtime-linked.o");
-    const verify_hyperv_runtime = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/hyperv-runtime-test.py",
-        "--object",
-    });
+    const verify_hyperv_runtime = b.addRunArtifact(object_verifier.tool);
+    verify_hyperv_runtime.addArgs(&.{ "hyperv-runtime", "--object" });
     verify_hyperv_runtime.addFileArg(hyperv_runtime_linked);
     verify_hyperv_runtime.addArgs(&.{
         "--nm",
-        "llvm-nm",
+        object_verifier.nm,
         "--readelf",
-        "llvm-readelf",
+        object_verifier.readelf,
     });
     verify_hyperv_runtime.setCwd(.{ .cwd_relative = root });
-    verify_hyperv_runtime.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     test_step.dependOn(&verify_hyperv_runtime.step);
     const vmbus_protocol_object = b.addObject(.{
         .name = "vmbus-protocol-freestanding",
@@ -618,18 +616,11 @@ pub fn build(b: *std.Build) void {
     vmbus_protocol_link.addArg("-o");
     const vmbus_protocol_linked =
         vmbus_protocol_link.addOutputFileArg("vmbus-protocol-linked.o");
-    const verify_vmbus_protocol = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/vmbus-protocol-test.py",
-        "--object",
-    });
+    const verify_vmbus_protocol = b.addRunArtifact(object_verifier.tool);
+    verify_vmbus_protocol.addArgs(&.{ "vmbus-protocol", "--object" });
     verify_vmbus_protocol.addFileArg(vmbus_protocol_linked);
-    verify_vmbus_protocol.addArgs(&.{ "--nm", "llvm-nm" });
+    verify_vmbus_protocol.addArgs(&.{ "--nm", object_verifier.nm });
     verify_vmbus_protocol.setCwd(.{ .cwd_relative = root });
-    verify_vmbus_protocol.setEnvironmentVariable(
-        "PYTHONDONTWRITEBYTECODE",
-        "1",
-    );
     test_step.dependOn(&verify_vmbus_protocol.step);
     const vmbus_channel_object = b.addObject(.{
         .name = "vmbus-channel-freestanding",
@@ -662,18 +653,11 @@ pub fn build(b: *std.Build) void {
     vmbus_channel_link.addArg("-o");
     const vmbus_channel_linked =
         vmbus_channel_link.addOutputFileArg("vmbus-channel-linked.o");
-    const verify_vmbus_channel = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/vmbus-channel-test.py",
-        "--object",
-    });
+    const verify_vmbus_channel = b.addRunArtifact(object_verifier.tool);
+    verify_vmbus_channel.addArgs(&.{ "vmbus-channel", "--object" });
     verify_vmbus_channel.addFileArg(vmbus_channel_linked);
-    verify_vmbus_channel.addArgs(&.{ "--nm", "llvm-nm" });
+    verify_vmbus_channel.addArgs(&.{ "--nm", object_verifier.nm });
     verify_vmbus_channel.setCwd(.{ .cwd_relative = root });
-    verify_vmbus_channel.setEnvironmentVariable(
-        "PYTHONDONTWRITEBYTECODE",
-        "1",
-    );
     test_step.dependOn(&verify_vmbus_channel.step);
     const storvsc_core_object = b.addObject(.{
         .name = "storvsc-core-freestanding",
@@ -706,13 +690,11 @@ pub fn build(b: *std.Build) void {
     storvsc_core_link.addArg("-o");
     const storvsc_core_linked =
         storvsc_core_link.addOutputFileArg("storvsc-core-linked.o");
-    const verify_storvsc_core = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/storvsc-core-test.py",
-        "--object",
-    });
+    const verify_storvsc_core = b.addRunArtifact(object_verifier.tool);
+    verify_storvsc_core.addArgs(&.{ "storvsc-core", "--object" });
     verify_storvsc_core.addFileArg(storvsc_core_linked);
-    verify_storvsc_core.addArgs(&.{ "--nm", "llvm-nm" });
+    verify_storvsc_core.addArgs(&.{ "--nm", object_verifier.nm });
+    var mapping_abi_paths: [2]std.Build.LazyPath = undefined;
     for ([_]bool{ false, true }) |cxx| {
         const mapping_abi = b.addObject(.{
             .name = if (cxx) "storvsc-mapping-cxx-abi" else "storvsc-mapping-c-abi",
@@ -745,12 +727,9 @@ pub fn build(b: *std.Build) void {
         });
         verify_storvsc_core.addArg("--mapping-api-object");
         verify_storvsc_core.addFileArg(mapping_abi.getEmittedBin());
+        mapping_abi_paths[@intFromBool(cxx)] = mapping_abi.getEmittedBin();
     }
     verify_storvsc_core.setCwd(.{ .cwd_relative = root });
-    verify_storvsc_core.setEnvironmentVariable(
-        "PYTHONDONTWRITEBYTECODE",
-        "1",
-    );
     test_step.dependOn(&verify_storvsc_core.step);
     const netvsc_protocol_object = b.addObject(.{
         .name = "netvsc-protocol-freestanding",
@@ -783,18 +762,11 @@ pub fn build(b: *std.Build) void {
     netvsc_protocol_link.addArg("-o");
     const netvsc_protocol_linked =
         netvsc_protocol_link.addOutputFileArg("netvsc-protocol-linked.o");
-    const verify_netvsc_protocol = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/netvsc-protocol-test.py",
-        "--object",
-    });
+    const verify_netvsc_protocol = b.addRunArtifact(object_verifier.tool);
+    verify_netvsc_protocol.addArgs(&.{ "netvsc-protocol", "--object" });
     verify_netvsc_protocol.addFileArg(netvsc_protocol_linked);
-    verify_netvsc_protocol.addArgs(&.{ "--nm", "llvm-nm" });
+    verify_netvsc_protocol.addArgs(&.{ "--nm", object_verifier.nm });
     verify_netvsc_protocol.setCwd(.{ .cwd_relative = root });
-    verify_netvsc_protocol.setEnvironmentVariable(
-        "PYTHONDONTWRITEBYTECODE",
-        "1",
-    );
     test_step.dependOn(&verify_netvsc_protocol.step);
     const netvsc_protocol_abi_tests = b.addExecutable(.{
         .name = "netvsc-protocol-abi-test",
@@ -844,6 +816,20 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     test_step.dependOn(&b.addRunArtifact(vmbus_abi_tests).step);
+    const object_proof_tests = b.step(
+        "test-hyperv-object-proofs",
+        "Verify real Hyper-V relocatable objects, ABI contracts, and native negative fixtures (not boot proof)",
+    );
+    for ([_]*std.Build.Step.Run{
+        verify_hyperv_runtime, verify_vmbus_protocol, verify_vmbus_channel, verify_storvsc_core, verify_netvsc_protocol,
+    }) |verify| object_proof_tests.dependOn(&verify.step);
+    for ([_]*std.Build.Step.Compile{
+        vmbus_protocol_tests,      vmbus_channel_tests, storvsc_core_tests, netvsc_protocol_tests,
+        netvsc_protocol_abi_tests, vmbus_abi_tests,
+    }) |fixture| object_proof_tests.dependOn(&b.addRunArtifact(fixture).step);
+    object_verifier.fixtures(b, object_proof_tests, .{
+        hyperv_runtime_linked, vmbus_protocol_linked, vmbus_channel_linked, storvsc_core_linked, netvsc_protocol_linked,
+    }, mapping_abi_paths);
     const vmbus_control_tests = b.addExecutable(.{
         .name = "vmbus-control-test",
         .root_module = b.createModule(.{
@@ -1466,11 +1452,8 @@ pub fn build(b: *std.Build) void {
         hyperv_regression_tests.dependOn(&verify_vmbus_protocol.step);
         for (xpic_correctness_steps) |xpic_step|
             hyperv_regression_tests.dependOn(xpic_step);
-        const x86_host_notice = b.addSystemCommand(&.{
-            "python3",
-            "-c",
-            "print('INFO: x86-only hosted Hyper-V IRQ and SMP fixtures require the x86-64 CI job; running portable and freestanding checks on this host')",
-        });
+        const x86_host_notice = b.addRunArtifact(object_verifier.tool);
+        x86_host_notice.addArg("architecture-notice");
         hyperv_regression_tests.dependOn(&x86_host_notice.step);
     }
     hyperv_regression_tests.dependOn(
