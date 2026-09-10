@@ -851,6 +851,42 @@ jobs:
             -Dfixture-root="${root}/ReleaseSafe/fixtures" \
             -Doptimize=ReleaseSafe -j2 test install --summary all
 
+    - name: Run native agentless Hyper-V host fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-host"
+        fixture_key=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/host/build.zig \
+          support/tools/hyperv/host/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in Debug ReleaseSafe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/host/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dtest-root="${root}/${mode}/fixtures" \
+              -Dimage-trust-key="${fixture_key}" \
+              -Doptimize="${mode}" -j2 test install --summary all
+        done
+        ZIG_LOCAL_CACHE_DIR="${root}/image/zig-local-cache" \
+          zig build --build-file support/tools/hyperv/host/build.zig \
+            --system "${root}/restore/zig-pkg" \
+            --cache-dir "${root}/image/zig-local-cache" \
+            --prefix "${root}/image/out" \
+            -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall \
+            -Dimage-trust-key="${fixture_key}" \
+            -j2 install --summary all
+        runner_bytes="$(stat -c %s "${root}/image/out/bin/uk-hyperv-host")"
+        unit_bytes="$(stat -c %s "${root}/image/out/share/uk-hyperv-host/uk-hyperv-host.service")"
+        test "$((runner_bytes + unit_bytes))" -le 2097152
+        printf 'Synthetic-key host runner/unit bytes: %s/%s; not image admission\n' \
+          "${runner_bytes}" "${unit_bytes}"
+
     - name: Run native Hyper-V image transformation fixtures
       run: |
         set -euo pipefail
