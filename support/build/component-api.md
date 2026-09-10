@@ -84,6 +84,28 @@ image in place. Bootinfo additionally creates its real `.bootinfo` side file.
 Xen ARM/ARM64 alone creates a separate raw image, which is the input to gzip;
 Xen x86 gzip consumes the processed ELF image.
 
+Native Hyper-V profiles select `ExecutorPaths.native_runner` and the Zig
+`native-postprocess-runner.zig` executable for relocations, stripping,
+bootinfo, EFI conversion and compile-database assembly. Unsupported native
+operations fail explicitly; there is no Python recovery or fallback. Other
+profiles retain their existing post-processing selection.
+
+The native runner rejects source/destination and output/output aliases,
+including hardlinks and symlinks, before transformation. It stages changes
+privately and publishes each completed output atomically. Publication is not
+a transaction across multiple outputs; build directories must remain stable
+and exclusively owned by the build.
+
+Run the native ELF/image fixtures and actual strip/objcopy transformations:
+
+```sh
+zig build --build-file support/build/native-postprocess-tests.build.zig integration -j2
+```
+
+The default fixture architecture is x86_64; `-Dfixture-arch=arm64` exercises
+ARM64 images. `-Dobjcopy=...` and `-Dstrip=...` select native tools explicitly.
+These are image-transformation fixtures, not Hyper-V boot evidence.
+
 ```zig
 const build = @import("component-api.zig");
 
