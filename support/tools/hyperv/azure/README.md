@@ -67,10 +67,10 @@ retain delegated interactive identity, a separately approved public-client
 registration and native device/authorization flow remain design work; do not
 borrow Azure CLI's application ID.
 
-The foundation's generic `Directory.read` with an ordinary allocator is not a
-sensitive credential reader: its intermediate copies are not zeroized. Use
-explicit validated handles and zeroizing allocation for any future credential
-file adapter; this module does not add another filesystem implementation.
+The foundation's generic `Directory.read` returns ordinary caller-owned data,
+not a sensitive credential buffer. Use explicit validated handles and zeroizing
+allocation for any future credential file adapter; this module does not add
+another filesystem implementation.
 
 `NativeRuntime.init` requires nonempty caller-supplied DER CA certificates, their
 approved concatenated-byte SHA-256, and an explicit clock. It installs this
@@ -183,52 +183,40 @@ not distributed transactions or an authorization grant.
 ## Standalone build
 
 No repository root build, guest/Make build, interpreter, CLI login or new test
-framework is required. In this worktree:
+framework is required. From the repository root with Zig 0.16.0 on `PATH`:
 
 ```sh
-cd /d/unikraft-worktrees/fleet-ci
 repo="$PWD"
 base="$PWD/.d/zig-migration-arm"
+umask 077
 export TMPDIR="$base/tmp" HOME="$base/home" XDG_CACHE_HOME="$base/cache"
 export ZIG_GLOBAL_CACHE_DIR="$base/zig-global"
 export ZIG_LOCAL_CACHE_DIR="$base/zig-local"
-mkdir -p "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" "$base/packages" "$base/outputs" "$base/build-work"
-cd "$base/build-work"
+mkdir -p "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" "$base/restore" "$base/outputs"
+cp support/tools/hyperv/azure/build.zig \
+  support/tools/hyperv/azure/build.zig.zon "$base/restore/"
+zig build --build-file "$base/restore/build.zig" --fetch=all -j2
 
-/home/g/.local/bin/zig build --build-file "$repo/support/tools/hyperv/azure/build.zig" \
-  --system "$base/packages" --prefix "$base/outputs/debug" \
-  -j2 test install --summary all
-/home/g/.local/bin/zig build --build-file "$repo/support/tools/hyperv/azure/build.zig" \
-  --system "$base/packages" --prefix "$base/outputs/release-safe" \
-  -Doptimize=ReleaseSafe -j2 test install --summary all
+for mode in Debug ReleaseSafe; do
+  ZIG_LOCAL_CACHE_DIR="$base/$mode/zig-local" \
+    zig build --build-file "$repo/support/tools/hyperv/azure/build.zig" \
+      --system "$base/restore/zig-pkg" --prefix "$base/outputs/$mode" \
+      -Doptimize="$mode" -j2 test install --summary all
+done
 ```
 
-The existing isolated package directory contains these immutable dependencies:
+The isolated package directory contains these immutable dependencies:
 
 | Package | Git revision | Zig package hash |
 | --- | --- | --- |
 | Core | `bc77bcacbb64af935ca53d60bf8a351c9592bc41` | `azure_sdk_core-0.3.0-eFY0Ev0-CACjsFaYPL6jS7CpeVNvsqYqTrXRfgQKiRFV` |
 | serde | `73d872776b0361b6fc92f6cecd7ccf2f05e77cdd` | `serde-1.0.1-1DszT1XhDACnteUU3yWahMMjLjkJqB34hwROPIfhZc7l` |
 
-For a **fresh** isolated package directory, restore only those pinned packages:
-
-```sh
-/home/g/.local/bin/zig fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
-  'git+https://github.com/cataggar/azure-sdk-for-zig.git#bc77bcacbb64af935ca53d60bf8a351c9592bc41'
-/home/g/.local/bin/zig fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
-  'git+https://github.com/cataggar/serde.zig#73d872776b0361b6fc92f6cecd7ccf2f05e77cdd'
-```
-
-Require the printed hashes to match the table. Zig 0.16 stores the fetched
-archives at `$ZIG_GLOBAL_CACHE_DIR/p/HASH.tar.gz`, with `HASH/` as their top-level
-directory. Extract each into the new `$base/packages` directory with native
-`tar --no-same-owner --keep-old-files -xzf ARCHIVE -C "$base/packages"`, then use
-the explicit `--system` directory above. Do not overwrite existing package
-directories. Keep both fetch and build working directories under the isolated
-cache tree: Zig 0.16 can also create a working-directory-local `zig-pkg`.
-Do not run restoration from a repository/source directory.
-The same restoration procedure can use existing pinned package directories as
-the `zig fetch` inputs without any network access.
+Restoration verifies the package hashes from the pinned manifests. This Zig
+distribution writes `zig-pkg` beside the build file, so only the scratch copy
+may fetch. Every source-tree build uses `--system` to disable implicit fetching.
+The required Hyper-V integration job uses the same isolated bootstrap and both
+optimization modes.
 
 The native fixtures cover exact HTTP binding, expiry and OAuth errors,
 redaction/zeroization, raw aliases/types/duplicates, authority escapes,
