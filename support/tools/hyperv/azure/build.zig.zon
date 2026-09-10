@@ -1,0 +1,28 @@
+.{
+    .name = .hyperv_azure,
+    .version = "0.1.0",
+    .fingerprint = 0x7e77025fd7676958,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .azure_sdk_core = .{
+            .url = "git+https://github.com/cataggar/azure-sdk-for-zig.git#bc77bcacbb64af935ca53d60bf8a351c9592bc41",
+            .hash = "azure_sdk_core-0.3.0-eFY0Ev0-CACjsFaYPL6jS7CpeVNvsqYqTrXRfgQKiRFV",
+        },
+    },
+    .paths = .{
+        "README.md",
+        "build.zig",
+        "build.zig.zon",
+        "root.zig",
+        "admission.zig",
+        "auth.zig",
+        "client.zig",
+        "json.zig",
+        "models.zig",
+        "operations.zig",
+        "scope.zig",
+        "secret.zig",
+        "tests.zig",
+        "transport.zig",
+    },
+}
