@@ -43,7 +43,7 @@ const Step = struct {
 const Clock = struct {
     now_ms: u64 = 0,
     advance: u64 = 0,
-    fn now(context: *anyopaque) u64 {
+    fn now(context: *anyopaque) !u64 {
         const self: *Clock = @ptrCast(@alignCast(context));
         const value = self.now_ms;
         self.now_ms += self.advance;
@@ -467,9 +467,9 @@ test "bounded download private exclusive file exact hash and integrity" {
     const result = client.downloadBlob(blob, .{ .path = destination, .maximum = bytes.len });
     try testing.expectEqual(d.Completion.complete, result.completion);
     try testing.expectEqual(@as(u64, bytes.len), result.bytes_downloaded);
-    const actual = try files.readPrivate(allocator, io, destination, bytes.len);
-    defer allocator.free(actual);
-    try testing.expectEqualStrings(bytes, actual);
+    var actual = try files.readSensitive(io, allocator, destination, bytes.len, null);
+    defer actual.deinit();
+    try testing.expectEqualStrings(bytes, actual.bytes());
     const existing = client.downloadBlob(blob, .{ .path = destination, .maximum = bytes.len });
     try testing.expectEqual(d.Completion.failed, existing.completion);
     try testing.expectEqual(@as(usize, 1), mock.calls);
@@ -614,21 +614,18 @@ test "private request and SAS files refuse symlink public mode directory and ove
     defer request.deinit();
     const sas_path = try fixture.file("sas", sas, 0o600);
     defer allocator.free(sas_path);
-    const token = try contract.loadSas(allocator, io, sas_path);
-    defer {
-        std.crypto.secureZero(u8, token);
-        allocator.free(token);
-    }
-    try testing.expectEqualStrings(sas, token);
+    var token = try contract.loadSas(allocator, io, sas_path);
+    defer token.deinit();
+    try testing.expectEqualStrings(sas, token.bytes());
     const public = try fixture.file("public", good_request, 0o644);
     defer allocator.free(public);
     try testing.expectError(error.UnsafeFile, contract.Request.load(allocator, io, public));
     try fixture.dir.symLink(io, "request", "link", .{});
     const link = try std.fmt.allocPrint(allocator, "{s}/link", .{fixture.path});
     defer allocator.free(link);
-    try testing.expectError(error.SymLinkLoop, contract.Request.load(allocator, io, link));
-    try testing.expectError(error.UnsafeFile, files.readPrivate(allocator, io, fixture.path, 100));
-    try testing.expectError(error.UnsafeFile, files.readPrivate(allocator, io, request_path, 1));
+    try testing.expectError(error.UnsafeFile, contract.Request.load(allocator, io, link));
+    try testing.expectError(error.UnsafeFile, files.readSensitive(io, allocator, fixture.path, 100, null));
+    try testing.expectError(error.FileTooLarge, files.readSensitive(io, allocator, request_path, 1, null));
 }
 
 test "bad endpoints protocol injection geometry and hash refuse transport" {
@@ -725,12 +722,12 @@ test "FIFO symlink ancestor wrong size and nonprivate output directory refuse wi
     )));
     const fifo = try std.fmt.allocPrint(allocator, "{s}/fifo", .{fixture.path});
     defer allocator.free(fifo);
-    try testing.expectError(error.UnsafeFile, files.openRegular(io, fifo, true));
+    try testing.expectError(error.UnsafeFile, files.openRegular(io, fifo, .private));
     try fixture.dir.createDir(io, "nested", .fromMode(0o700));
     try fixture.dir.symLink(io, "nested", "alias", .{ .is_directory = true });
     const alias = try std.fmt.allocPrint(allocator, "{s}/alias/input", .{fixture.path});
     defer allocator.free(alias);
-    if (files.Parent.open(io, alias, false)) |parent| {
+    if (files.Parent.open(io, alias, .artifact)) |parent| {
         parent.close(io);
         return error.SymlinkAncestorWasAccepted;
     } else |_| {}

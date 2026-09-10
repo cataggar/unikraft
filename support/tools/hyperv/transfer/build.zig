@@ -5,11 +5,17 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const core = b.dependency("azure_sdk_core", .{ .target = target, .optimize = optimize });
     const storage = b.dependency("azure_sdk_storage_common", .{ .target = target, .optimize = optimize });
+    const shared = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = b.pathFromRoot("../core.zig") },
+        .target = target,
+        .optimize = optimize,
+    });
     const module = b.addModule("hyperv_transfer", .{
         .root_source_file = b.path("root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "hyperv_core", .module = shared },
             .{ .name = "azure_sdk_core", .module = core.module("azure_sdk_core") },
             .{ .name = "azure_sdk_storage_common", .module = storage.module("azure_sdk_storage_common") },
         },

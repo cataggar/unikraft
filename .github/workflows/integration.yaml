@@ -812,20 +812,28 @@ jobs:
           zig build -j2 test-build-tools "-Doutput=${root}/build" \
             --summary all
 
-    - name: Run native Hyper-V controller foundation fixtures
+    - name: Run native Hyper-V core, transfer, and worker fixtures
       run: |
         set -euo pipefail
         umask 077
+        restore="${RUNNER_TEMP}/hyperv-ci/native-tools/restore"
+        mkdir -p "${restore}"
+        cp support/tools/hyperv/build.zig support/tools/hyperv/build.zig.zon \
+          "${restore}/"
+        ZIG_LOCAL_CACHE_DIR="${restore}/zig-local-cache" \
+          zig build --build-file "${restore}/build.zig" --fetch=all -j2
         for mode in Debug ReleaseSafe; do
           root="${RUNNER_TEMP}/hyperv-ci/native-${mode}"
           mkdir -p "${root}/fixtures"
           ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
             zig build --build-file support/tools/hyperv/build.zig \
+              --system "${restore}/zig-pkg" \
               --prefix "${root}/out" -Dtest-root="${root}/fixtures" \
-              -Doptimize="${mode}" -j2 test install --summary all
+              -Doptimize="${mode}" -j2 \
+              test-core test-transfer test-worker install --summary all
         done
 
-    - name: Run native Hyper-V transfer fixtures
+    - name: Run standalone native Hyper-V transfer fixtures
       run: |
         set -euo pipefail
         umask 077
@@ -835,15 +843,13 @@ jobs:
           support/tools/hyperv/transfer/build.zig.zon "${root}/restore/"
         ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
           zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        for mode in Debug ReleaseSafe; do
-          mkdir -p "${root}/${mode}/fixtures"
-          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
-            zig build --build-file support/tools/hyperv/transfer/build.zig \
-              --system "${root}/restore/zig-pkg" \
-              --prefix "${root}/${mode}/out" \
-              -Dfixture-root="${root}/${mode}/fixtures" \
-              -Doptimize="${mode}" -j2 test install --summary all
-        done
+        mkdir -p "${root}/ReleaseSafe/fixtures"
+        ZIG_LOCAL_CACHE_DIR="${root}/ReleaseSafe/zig-local-cache" \
+          zig build --build-file support/tools/hyperv/transfer/build.zig \
+            --system "${root}/restore/zig-pkg" \
+            --prefix "${root}/ReleaseSafe/out" \
+            -Dfixture-root="${root}/ReleaseSafe/fixtures" \
+            -Doptimize=ReleaseSafe -j2 test install --summary all
 
     - name: Run native Hyper-V image transformation fixtures
       run: |

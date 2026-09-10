@@ -1,4 +1,5 @@
 const std = @import("std");
+const sensitive = @import("sensitive.zig");
 
 pub const Limits = struct {
     bytes: usize = 256 * 1024,
@@ -55,6 +56,39 @@ pub const Document = struct {
         const canonical = try self.canonicalAlloc(allocator);
         defer allocator.free(canonical);
         if (!std.mem.eql(u8, canonical, source)) return error.NonCanonical;
+    }
+};
+
+/// Scanner temporaries, decoded keys/strings and parser arenas all use a wiping
+/// allocator, including failure paths. The caller still owns the source bytes.
+pub const SensitiveDocument = struct {
+    document: Document,
+    owner: *sensitive.Allocator,
+
+    pub fn parse(allocator: std.mem.Allocator, source: []const u8, limits: Limits) !SensitiveDocument {
+        const owner = try allocator.create(sensitive.Allocator);
+        owner.* = .{ .backing = allocator };
+        errdefer destroyOwner(owner);
+        return .{ .document = try Document.parse(owner.allocator(), source, limits), .owner = owner };
+    }
+
+    pub fn value(self: SensitiveDocument) std.json.Value {
+        return self.document.value();
+    }
+
+    pub fn requireCanonical(self: SensitiveDocument, source: []const u8) !void {
+        try self.document.requireCanonical(self.owner.allocator(), source);
+    }
+
+    pub fn deinit(self: SensitiveDocument) void {
+        self.document.deinit();
+        destroyOwner(self.owner);
+    }
+
+    fn destroyOwner(owner: *sensitive.Allocator) void {
+        const allocator = owner.backing;
+        std.crypto.secureZero(u8, std.mem.asBytes(owner));
+        allocator.rawFree(std.mem.asBytes(owner), .of(sensitive.Allocator), @returnAddress());
     }
 };
 
