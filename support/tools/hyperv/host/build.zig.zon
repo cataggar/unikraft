@@ -1,0 +1,13 @@
+.{
+    .name = .unikraft_hyperv_host,
+    .version = "0.1.0",
+    .fingerprint = 0x543a1f28dfe23df2,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .azure_sdk_core = .{
+            .url = "git+https://github.com/cataggar/azure-sdk-for-zig.git#bc77bcacbb64af935ca53d60bf8a351c9592bc41",
+            .hash = "azure_sdk_core-0.3.0-eFY0Ev0-CACjsFaYPL6jS7CpeVNvsqYqTrXRfgQKiRFV",
+        },
+    },
+    .paths = .{"."},
+}
