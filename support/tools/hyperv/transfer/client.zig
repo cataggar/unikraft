@@ -180,17 +180,15 @@ pub const Client = struct {
         var buffer: [files.buffer_size]u8 = undefined;
         outcome.diagnostic.stage = .download_read;
         while (true) {
-            self.budget.check() catch |err| {
-                operation.cancel();
-                outcome.diagnostic.category = localCategory(err);
-                return outcome;
-            };
             const wanted: usize = @intCast(@min(buffer.len, maximum - outcome.bytes_downloaded + 1));
-            const count = operation.body_reader.readSliceShort(buffer[0..wanted]) catch {
-                outcome.diagnostic.category = .transport;
-                return outcome;
+            const count = self.readResponse(operation, buffer[0..wanted]) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    outcome.diagnostic.category = if (err == error.ReadFailed) .transport else localCategory(err);
+                    return outcome;
+                },
             };
-            if (count == 0) break;
+            if (count == 0) continue;
             if (count > maximum - outcome.bytes_downloaded) {
                 outcome.diagnostic.category = .response_limit;
                 return outcome;
@@ -349,16 +347,13 @@ pub const Client = struct {
         var actual: [513]u8 = undefined;
         var length: usize = 0;
         while (length < actual.len) {
-            self.budget.check() catch |err| {
-                operation.cancel();
-                outcome.diagnostic.category = localCategory(err);
-                return;
+            const count = self.readResponse(operation, actual[length..]) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    outcome.diagnostic.category = if (err == error.ReadFailed) .transport else localCategory(err);
+                    return;
+                },
             };
-            const count = operation.body_reader.readSliceShort(actual[length..]) catch {
-                outcome.diagnostic.category = .transport;
-                return;
-            };
-            if (count == 0) break;
             length += count;
         }
         if (length != 512) {
@@ -509,13 +504,18 @@ pub const Client = struct {
             return outcome;
         }
         var extra: [1]u8 = undefined;
-        const count = operation.body_reader.readSliceShort(&extra) catch {
-            outcome.diagnostic.category = .transport;
-            return outcome;
-        };
-        if (count != 0) {
-            outcome.diagnostic.category = .response_limit;
-            return outcome;
+        while (true) {
+            const count = self.readResponse(operation, &extra) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    outcome.diagnostic.category = if (err == error.ReadFailed) .transport else localCategory(err);
+                    return outcome;
+                },
+            };
+            if (count != 0) {
+                outcome.diagnostic.category = .response_limit;
+                return outcome;
+            }
         }
         self.budget.check() catch |err| {
             outcome.diagnostic.category = localCategory(err);
@@ -532,20 +532,33 @@ pub const Client = struct {
         var used: usize = 0;
         var failed = false;
         while (used < buffer.len) {
-            self.budget.check() catch {
-                operation.cancel();
-                failed = true;
-                break;
+            const count = self.readResponse(operation, buffer[used..]) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => {
+                    failed = true;
+                    break;
+                },
             };
-            const count = operation.body_reader.readSliceShort(buffer[used..]) catch {
-                failed = true;
-                break;
-            };
-            if (count == 0) break;
             used += count;
         }
         outcome.diagnostic.service = d.extract(operation, buffer[0..@min(used, d.max_error_body)], failed or used > d.max_error_body);
         std.crypto.secureZero(u8, &buffer);
+    }
+
+    // readSliceShort fills its destination through repeated progress reads.
+    // Guard a single readVec call instead; zero progress is not EOF.
+    fn readResponse(self: *Client, operation: *core.http.HttpOperation, buffer: []u8) !usize {
+        self.budget.check() catch |err| {
+            operation.cancel();
+            return err;
+        };
+        var slices = [_][]u8{buffer};
+        const result = operation.body_reader.readVec(&slices);
+        self.budget.check() catch |err| {
+            operation.cancel();
+            return err;
+        };
+        return result;
     }
 
     fn erase(self: *Client, bytes: []u8) void {

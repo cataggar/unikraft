@@ -16,6 +16,7 @@ const disk_endpoint = "https://md-fixture.blob.storage.azure.net:8443/upload/vhd
 const disk_url = disk_endpoint ++ "?" ++ sas;
 const blob: transfer.Blob = .{ .account_url = account, .container = "fixture", .name = "input", .sas = sas };
 const disk: transfer.Disk = .{ .endpoint = disk_endpoint, .sas = sas };
+const deadline_ms = 1_000_000;
 
 const Header = core.http.ResponseHeader;
 const Step = struct {
@@ -33,6 +34,8 @@ const Step = struct {
     fail_open_after: ?usize = null,
     response_failure_after: ?usize = null,
     cancel_after_response: ?usize = null,
+    deadline_after_response: ?usize = null,
+    zero_progress_once: bool = false,
     before: ?*const fn (*Mock) anyerror!void = null,
     after: ?*const fn (*Mock) anyerror!void = null,
 };
@@ -53,6 +56,8 @@ const Mock = struct {
     calls: usize = 0,
     bytes_read: u64 = 0,
     response_bytes: usize = 0,
+    response_calls: usize = 0,
+    response_calls_after_stop: usize = 0,
     aborted: usize = 0,
     cancelled: usize = 0,
     source_path: ?[]const u8 = null,
@@ -65,7 +70,7 @@ const Mock = struct {
             .allocator = allocator,
             .io = io,
             .runtime = .init(.{ .context = self, .vtable = &.{ .send = send, .open = open } }, self.provider.asProvider()),
-            .budget = .{ .context = &self.clock, .nowMsFn = Clock.now, .deadline_ms = 1_000_000, .cancellation = &self.token },
+            .budget = .{ .context = &self.clock, .nowMsFn = Clock.now, .deadline_ms = deadline_ms, .cancellation = &self.token },
         };
     }
 
@@ -157,16 +162,29 @@ const MockOperation = struct {
     operation: core.http.HttpOperation,
     reader: std.Io.Reader,
     offset: usize = 0,
+    zero_progress_sent: bool = false,
 
     fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const self: *MockOperation = @alignCast(@fieldParentPtr("reader", reader));
+        self.mock.response_calls += 1;
+        if (self.mock.token.isCancelled() or self.mock.clock.now_ms >= deadline_ms) {
+            self.mock.response_calls_after_stop += 1;
+            return error.ReadFailed;
+        }
         if (self.step.response_failure_after) |offset| if (self.offset >= offset) return error.ReadFailed;
+        if (self.step.zero_progress_once and !self.zero_progress_sent) {
+            self.zero_progress_sent = true;
+            return 0;
+        }
         if (self.offset == self.step.response.len) return error.EndOfStream;
         const wanted = @min(limit.minInt(self.step.fragment), self.step.response.len - self.offset);
         const count = try writer.write(self.step.response[self.offset..][0..wanted]);
         self.offset += count;
         self.mock.response_bytes += count;
         if (self.step.cancel_after_response) |offset| if (self.offset >= offset) self.mock.token.cancel();
+        if (self.step.deadline_after_response) |offset| if (self.offset >= offset) {
+            self.mock.clock.now_ms = deadline_ms;
+        };
         return count;
     }
     fn finish(_: *core.http.HttpOperation) !void {
@@ -236,7 +254,7 @@ test "native runtime is a real Core streaming transport" {
 test "container create exact wire and no replay on conflict" {
     var mock: Mock = .{ .steps = &.{
         .{ .url = container_url, .request_headers = &.{.{ .name = "x-ms-version", .value = transfer.container_api_version }} },
-        .{ .url = container_url, .status = 409, .response = "<Error><Code>ContainerAlreadyExists</Code><Message>private secret</Message></Error>" },
+        .{ .url = container_url, .status = 409, .response = "<Error><Code>ContainerAlreadyExists</Code><Message>private secret</Message></Error>", .zero_progress_once = true },
     } };
     var client = mock.client();
     try testing.expectEqual(d.Completion.complete, client.createContainer(account, "fixture", sas).completion);
@@ -379,7 +397,7 @@ fn cancel(mock: *Mock) !void {
 }
 
 fn expire(mock: *Mock) !void {
-    mock.clock.now_ms = 1_000_000;
+    mock.clock.now_ms = deadline_ms;
 }
 
 test "short growing or modified input never becomes successful" {
@@ -438,6 +456,7 @@ test "bounded download private exclusive file exact hash and integrity" {
         .status = 200,
         .response = bytes,
         .fragment = 3,
+        .zero_progress_once = true,
         .headers = &.{ .{ .name = "Content-Length", .value = "26" }, .{ .name = "Content-MD5", .value = md5_value } },
     }} };
     var client = mock.client();
@@ -499,7 +518,7 @@ test "managed disk page wire alignment chunk boundary SHA256 and footer readback
     const steps = [_]Step{
         .{ .url = disk_url ++ "&comp=page", .length = transfer.page_chunk_size, .body = bytes[0..transfer.page_chunk_size], .verify_md5 = true, .request_headers = &.{ .{ .name = "x-ms-version", .value = "2020-10-02" }, .{ .name = "x-ms-range", .value = "bytes=0-4194303" }, .{ .name = "x-ms-page-write", .value = "update" } }, .absent_headers = &.{ "x-ms-blob-type", "If-None-Match" } },
         .{ .url = disk_url ++ "&comp=page", .length = 512, .body = footer, .verify_md5 = true, .request_headers = &.{.{ .name = "x-ms-range", .value = "bytes=4194304-4194815" }} },
-        .{ .method = .GET, .url = disk_url, .status = 206, .response = footer, .request_headers = &.{ .{ .name = "x-ms-range", .value = "bytes=4194304-4194815" }, .{ .name = "x-ms-range-get-content-md5", .value = "true" } }, .headers = &.{ .{ .name = "Content-Length", .value = "512" }, .{ .name = "Content-Range", .value = "bytes 4194304-4194815/4194816" }, .{ .name = "Content-MD5", .value = std.base64.standard.Encoder.encode(&encoded, &md5) } } },
+        .{ .method = .GET, .url = disk_url, .status = 206, .response = footer, .zero_progress_once = true, .request_headers = &.{ .{ .name = "x-ms-range", .value = "bytes=4194304-4194815" }, .{ .name = "x-ms-range-get-content-md5", .value = "true" } }, .headers = &.{ .{ .name = "Content-Length", .value = "512" }, .{ .name = "Content-Range", .value = "bytes 4194304-4194815/4194816" }, .{ .name = "Content-MD5", .value = std.base64.standard.Encoder.encode(&encoded, &md5) } } },
     };
     var mock: Mock = .{ .steps = &steps };
     var client = mock.client();
@@ -718,27 +737,98 @@ test "FIFO symlink ancestor wrong size and nonprivate output directory refuse wi
     try testing.expectEqual(@as(usize, 0), mock.calls);
 }
 
-test "download deadline cancellation removes partial and empty maximum is exact" {
+test "fragmented downloads stop reader calls immediately on cancellation or deadline" {
     const fixture = try Fixture.init("download-cancel");
     defer fixture.deinit();
     const destination = try fixture.destination();
     defer allocator.free(destination);
     const bytes = [_]u8{0x41} ** 32768;
-    var mock: Mock = .{ .steps = &.{.{
-        .method = .GET,
-        .status = 200,
-        .response = &bytes,
-        .cancel_after_response = 1,
-    }} };
-    var client = mock.client();
-    try expectFailure(client.downloadBlob(blob, .{ .path = destination, .maximum = bytes.len }), .cancelled, .not_applicable, 200);
-    try testing.expectError(error.FileNotFound, fixture.dir.statFile(io, "download", .{}));
-    try testing.expectEqual(@as(usize, 1), mock.cancelled);
+    for ([_]bool{ false, true }) |timed| {
+        var mock: Mock = .{ .steps = &.{.{
+            .method = .GET,
+            .status = 200,
+            .response = &bytes,
+            .fragment = 1,
+            .cancel_after_response = if (timed) null else 1,
+            .deadline_after_response = if (timed) 1 else null,
+        }} };
+        var client = mock.client();
+        const result = client.downloadBlob(blob, .{ .path = destination, .maximum = bytes.len });
+        try testing.expectEqual(@as(usize, 0), mock.response_calls_after_stop);
+        try testing.expectEqual(@as(usize, 1), mock.response_calls);
+        try testing.expectEqual(@as(usize, 1), mock.response_bytes);
+        try expectFailure(result, if (timed) .deadline else .cancelled, .not_applicable, 200);
+        try testing.expectError(error.FileNotFound, fixture.dir.statFile(io, "download", .{}));
+        try testing.expectEqual(@as(usize, 1), mock.cancelled);
+    }
     var empty: Mock = .{ .steps = &.{.{ .method = .GET, .status = 200, .response = "" }} };
     var empty_client = empty.client();
     const result = empty_client.downloadBlob(blob, .{ .path = destination, .maximum = 0 });
     try testing.expectEqual(d.Completion.complete, result.completion);
     try testing.expectEqual(@as(u64, 0), result.bytes_downloaded);
+}
+
+test "fragmented footer stops reader calls immediately on cancellation or deadline" {
+    const fixture = try Fixture.init("footer-stop");
+    defer fixture.deinit();
+    const bytes = [_]u8{0x58} ** 512;
+    const input = try fixture.input(&bytes);
+    defer allocator.free(input.path);
+    var md5: [16]u8 = undefined;
+    var encoded: [24]u8 = undefined;
+    std.crypto.hash.Md5.hash(&bytes, &md5, .{});
+    const md5_text = std.base64.standard.Encoder.encode(&encoded, &md5);
+    for ([_]bool{ false, true }) |timed| {
+        var mock: Mock = .{ .steps = &.{
+            .{ .url = disk_url ++ "&comp=page", .length = 512 },
+            .{
+                .method = .GET,
+                .url = disk_url,
+                .status = 206,
+                .response = &bytes,
+                .fragment = 1,
+                .cancel_after_response = if (timed) null else 1,
+                .deadline_after_response = if (timed) 1 else null,
+                .headers = &.{
+                    .{ .name = "Content-Length", .value = "512" },
+                    .{ .name = "Content-Range", .value = "bytes 0-511/512" },
+                    .{ .name = "Content-MD5", .value = md5_text },
+                },
+            },
+        } };
+        var client = mock.client();
+        const result = client.uploadPages(disk, input);
+        try testing.expectEqual(@as(usize, 0), mock.response_calls_after_stop);
+        try testing.expectEqual(@as(usize, 2), mock.response_calls);
+        try testing.expectEqual(@as(usize, 1), mock.response_bytes);
+        try expectFailure(result, if (timed) .deadline else .cancelled, .accepted, 206);
+        try testing.expectEqual(d.Stage.footer_readback, result.diagnostic.stage);
+        try testing.expectEqual(@as(u64, 512), result.bytes_accepted);
+        try testing.expectEqual(@as(usize, 1), mock.cancelled);
+    }
+}
+
+test "fragmented error extraction stops reader calls without losing rejection certainty" {
+    for ([_]bool{ false, true }) |timed| {
+        var mock: Mock = .{ .steps = &.{.{
+            .url = container_url,
+            .status = 403,
+            .headers = &.{.{ .name = "x-ms-error-code", .value = "AuthorizationFailure" }},
+            .response = "<Error><Code>AuthorizationFailure</Code><Message>private</Message></Error>",
+            .fragment = 1,
+            .cancel_after_response = if (timed) null else 1,
+            .deadline_after_response = if (timed) 1 else null,
+        }} };
+        var client = mock.client();
+        const result = client.createContainer(account, "fixture", sas);
+        try testing.expectEqual(@as(usize, 0), mock.response_calls_after_stop);
+        try testing.expectEqual(@as(usize, 1), mock.response_calls);
+        try testing.expectEqual(@as(usize, 1), mock.response_bytes);
+        try expectFailure(result, .authorization, .rejected, 403);
+        try testing.expectEqual(d.MetadataState.known, result.diagnostic.service.header);
+        try testing.expectEqual(d.MetadataState.malformed, result.diagnostic.service.body);
+        try testing.expectEqual(@as(usize, 1), mock.cancelled);
+    }
 }
 
 test "page deadline at transport entry is unknown and growing source stays accepted but fails verification" {
@@ -764,6 +854,7 @@ test "accepted response body failure and unexpected 2xx do not erase status or s
         .{ .url = container_url, .status = 202 },
         .{ .url = container_url, .status = 201, .response_failure_after = 0 },
         .{ .url = container_url, .status = 201, .response = "unexpected private response" },
+        .{ .url = container_url, .status = 201, .response = "unexpected private response", .zero_progress_once = true },
     }) |step| {
         var mock: Mock = .{ .steps = &.{step} };
         var client = mock.client();

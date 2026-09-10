@@ -50,6 +50,12 @@ ambiguity without mutation replay. The Core cancellation token cannot interrupt
 every blocking filesystem/socket call. This package supplies no retry, redirect,
 reseed, resume, grant or cleanup-authority mechanism.
 
+Each response-consumption step performs one progress read, with budget checks
+before and after that call. Download, footer, error-body and empty-response
+probes use explicit EOF; a zero-byte progress result is not EOF. Fragmentation
+cannot cause a fill-buffer helper to issue further reads after a stop signal.
+This does not remove the separate hard deadline for one blocked syscall.
+
 ## Transfer and diagnostic contracts
 
 - All source/request path components are descriptor-walked with `O_NOFOLLOW`.
@@ -177,7 +183,10 @@ partial and unknown second-page outcomes, footer mismatch/integrity/range/size,
 download excess/short/cancelled streams and partial cleanup, private request/SAS
 files, FIFO/symlink/permission refusal, strict JSON/numeric/endpoint contracts,
 bounded service metadata, response-body failures, redirect refusal, error
-redaction, independent completion/certainty and no automatic replay.
+redaction, independent completion/certainty and no automatic replay. Fragmented
+download/footer/error fixtures assert zero reader calls after cancellation or
+deadline expiry, rather than merely checking eventual failure. Zero-progress
+fixtures distinguish explicit EOF from a reader that has not delivered bytes.
 
 These fixtures verify the local subsystem, not TLS/cloud acceptance or the
 whole Python-free controller workflow. The parent still owns worker subprocess
