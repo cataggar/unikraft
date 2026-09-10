@@ -395,7 +395,20 @@ host with Standard security, a 32 GiB `StandardSSD_LRS` OS disk, one dedicated
 owned resource group, `/29` VNet/subnet, NIC, NSG, and network-deny Blob
 account. The subnet disables default outbound access and enables the
 Microsoft.Storage service endpoint. There is no public IP, SSH ingress, NAT
-gateway, data disk, or reuse of network-acceptance resources. Before creating
+gateway, data disk, or reuse of network-acceptance resources. Its NSG allows
+only TCP 80/32526 to the exact Azure platform virtual IP
+`168.63.129.16/32` and TCP 443 to `Storage.NorthEurope`, then denies all
+other inbound and outbound traffic. It deliberately has no `Allow` rule
+targeting `AzurePlatformDNS` or `AzurePlatformIMDS`. Microsoft documents DNS,
+IMDS, DHCP, health and agent communication as
+[platform traffic exempt from ordinary NSG rules][azure-platform-nsg];
+those special service tags target that otherwise exempt path for an explicit
+deny (documentation source revision
+`aceedff0b0c50c5a106a6dbfa5b6048e181770c2`). Omitting the invalid
+tag-based allows therefore retains platform DNS and IMDS without widening
+Internet access. The exact WireServer ports follow Microsoft's
+[platform virtual-IP contract][azure-platform-ip] (documentation source
+revision `4fd2222b00bd277111ce9f635255aefa0b7b396c`). Before creating
 the group, the controller validates the exact immutable Ubuntu image, SKU,
 generation, x64 architecture, two-vCPU/eight-GiB shape, providers, and
 regional/family quota. Azure's Resource SKUs metadata does not currently
@@ -720,9 +733,18 @@ inventory still rejects unexpected extension software. There is no
 keep-resources mode. Control-plane or
 ownership failures are reported as cleanup failures rather than claimed as
 successful deletion. If both the primary operation and cleanup fail, the
-durable state and raised error retain both sanitized failures; failure to write
-that combined record is also reported without exposing subscription, storage,
-endpoint, identifier, or local private-state values. The final private receipt
+durable state retains only bounded phase/stage, exception category, and Azure
+error-code metadata for the primary, reconciliation, cleanup, and recording
+paths. It never persists free-form diagnostic messages. A failure to write
+that bounded record is itself reported by bounded category/code without
+masking the primary failure. Reload atomically removes the obsolete free-form
+`primary_failure` and `cleanup_failure` fields only in `cleanup-failed` state
+with an active cleanup obligation. Other phases reject those fields without
+rewriting state; they cannot be sanitized into a completed handoff. Raised
+combined errors carry only bounded categories/codes and do not retain the
+originating exception contexts. They omit raw stderr, request
+parameters, subscription, storage, endpoint, identifier, and local
+private-state values. The final private receipt
 binds the exact inputs, tools,
 host identity, four boot outcomes, and cleanup obligations; live nested-KVM
 success still requires the operator-run attempt.
@@ -1095,6 +1117,8 @@ host is available, but only after the local gates pass. Full workload SMP,
 stress testing, and production readiness remain separate milestones.
 
 [trusted-launch]: https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-faq#can-i-disable-trusted-launch-for-a-new-vm-deployment
+[azure-platform-nsg]: https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview#azure-platform-considerations
+[azure-platform-ip]: https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16
 [dsv5-nested]: https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/general-purpose/dsv5-series
 [upload]: https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-upload-vhd-to-managed-disk-cli
 [miz-revision]: https://github.com/cataggar/miz/commit/2db68ca0c3ab12155012a823c3fb8d7aba1cb544

@@ -2670,7 +2670,7 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
             "prepared", "vhd", "build", "cleanup", "sas",
             "deallocated", "deployment", "control", "resource",
             "evidence", "admission", "admission-schema",
-            "admission-memory",
+            "admission-memory", "legacy-primary", "legacy-cleanup",
         ):
             with self.subTest(mutation=mutation), \
                     tempfile.TemporaryDirectory() as temporary:
@@ -2709,6 +2709,10 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
                     ] = True
                 elif mutation == "admission-memory":
                     final["host_capability_admission"]["memory_gb"] = 8.0
+                elif mutation == "legacy-primary":
+                    state["primary_failure"] = "adminPassword=private-secret"
+                elif mutation == "legacy-cleanup":
+                    state["cleanup_failure"] = "?sig=private-secret"
                 else:
                     state["evidence_bytes"] += 1
                     final["budget"]["evidence_bytes"] = state[
@@ -2726,11 +2730,15 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
                 preflight.azure.save_durable_json(
                     root / preflight.STATE_FILE, state
                 )
+                original_state = (root / preflight.STATE_FILE).read_bytes()
                 with mock.patch.object(
                     preflight, "verify_immutable_inputs"
                 ):
                     with self.assertRaises(ValueError):
                         preflight.load_completed_receipt(root)
+                self.assertEqual(
+                    (root / preflight.STATE_FILE).read_bytes(), original_state
+                )
 
     def test_completed_handoff_reparses_private_boot_logs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3003,6 +3011,63 @@ class PrivatePreflightTemplateTest(PrivatePreflightFixture):
                 }],
             },
         )
+
+    def test_private_nsg_uses_only_valid_platform_rule_semantics(self):
+        template = json.loads(preflight.TEMPLATE_PATH.read_text())
+        nsg = next(
+            item for item in template["resources"]
+            if item["type"] == "Microsoft.Network/networkSecurityGroups"
+        )
+        rules = {
+            rule["name"]: rule["properties"]
+            for rule in nsg["properties"]["securityRules"]
+        }
+        self.assertEqual(
+            set(rules),
+            {
+                "AllowAzurePlatformAgent",
+                "AllowRegionalStorage",
+                "DenyAllInbound",
+                "DenyAllOutbound",
+            },
+        )
+        self.assertEqual(
+            rules["AllowAzurePlatformAgent"],
+            {
+                "priority": 120,
+                "access": "Allow",
+                "direction": "Outbound",
+                "protocol": "Tcp",
+                "sourcePortRange": "*",
+                "destinationPortRanges": ["80", "32526"],
+                "sourceAddressPrefix": "VirtualNetwork",
+                "destinationAddressPrefix": "168.63.129.16/32",
+            },
+        )
+        self.assertEqual(
+            rules["AllowRegionalStorage"],
+            {
+                "priority": 130,
+                "access": "Allow",
+                "direction": "Outbound",
+                "protocol": "Tcp",
+                "sourcePortRange": "*",
+                "destinationPortRange": "443",
+                "sourceAddressPrefix": "VirtualNetwork",
+                "destinationAddressPrefix": "Storage.NorthEurope",
+            },
+        )
+        self.assertEqual(
+            rules["DenyAllInbound"]["access"], "Deny"
+        )
+        self.assertEqual(
+            rules["DenyAllOutbound"]["access"], "Deny"
+        )
+        self.assertFalse(any(
+            rule["destinationAddressPrefix"]
+            in ("AzurePlatformDNS", "AzurePlatformIMDS")
+            for rule in rules.values()
+        ))
 
 
 class PrivatePreflightCloudTest(PrivatePreflightFixture):
@@ -3313,6 +3378,74 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 with self.assertRaises(ValueError):
                     preflight.load_state(root)
 
+    def test_state_failure_record_cannot_retain_raw_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = self.cloud_state()
+            state["failure"] = {
+                "category": "AzureCliError",
+                "code": "SecurityRuleInvalidAccessType",
+                "phase": "host-deployment-failed-no-compute",
+                "message": "adminPassword=private-secret",
+            }
+            preflight.azure.save_json(root / "state.json", state)
+            with self.assertRaisesRegex(ValueError, "failure record"):
+                preflight.load_state(root)
+
+    def test_state_reload_eliminates_legacy_diagnostic_strings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = self.cloud_state()
+            state.update({
+                "phase": "cleanup-failed",
+                "primary_failure": (
+                    "adminPassword=private-secret "
+                    "https://private.example/?sig=primary"
+                ),
+                "cleanup_failure": (
+                    f"{state['subscription']} ?sig=cleanup-secret"
+                ),
+            })
+            path = root / "state.json"
+            preflight.azure.save_json(path, state)
+            loaded, loaded_path = preflight.load_state(root)
+            self.assertEqual(loaded_path, path)
+            self.assertTrue(loaded["cleanup_required"])
+            self.assertNotIn("primary_failure", loaded)
+            self.assertNotIn("cleanup_failure", loaded)
+            rewritten = path.read_text()
+            for secret in (
+                "private-secret", "private.example",
+                "cleanup-secret",
+            ):
+                self.assertNotIn(secret, rewritten)
+
+    def test_legacy_diagnostics_require_active_cleanup_recovery(self):
+        for phase, cleanup_required in (
+            ("prepared", False), ("prepared", True), ("accepted", True),
+            ("complete", False), ("complete", True),
+            ("cleanup-failed", False), ("failed", True),
+        ):
+            for field in ("primary_failure", "cleanup_failure"):
+                with self.subTest(phase=phase, cleanup=cleanup_required,
+                                  field=field), \
+                        tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    state = self.cloud_state()
+                    state.update({
+                        "phase": phase,
+                        "cleanup_required": cleanup_required,
+                        field: "adminPassword=private-secret ?sig=private-sas",
+                    })
+                    path = root / "state.json"
+                    preflight.azure.save_json(path, state)
+                    original = path.read_bytes()
+                    with self.assertRaisesRegex(
+                        ValueError, "active cleanup recovery"
+                    ):
+                        preflight.load_state(root)
+                    self.assertEqual(path.read_bytes(), original)
+
     def test_deployment_obligation_is_durable_before_create(self):
         with tempfile.TemporaryDirectory() as temporary:
             run, state = self.run_fixture(Path(temporary))
@@ -3329,6 +3462,106 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             )
             self.assertIs(state["host_deployment"], receipt)
             run.record.assert_called_once()
+
+    def test_failed_no_compute_preserves_private_azure_creation_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            failure = preflight.azure.AzureCliError(
+                ["deployment", "group", "create"],
+                mock.Mock(
+                    returncode=1,
+                    stderr=(
+                        "ERROR: (SecurityRuleInvalidAccessType) "
+                        "invalid access; adminPassword=private-secret "
+                        "https://private.example/?sig=private-sas"
+                    ),
+                ),
+                True,
+            )
+
+            def command(arguments, **_kwargs):
+                if arguments[:3] == ["deployment", "group", "create"]:
+                    raise failure
+                if arguments[:3] == ["deployment", "group", "show"]:
+                    return self.deployment(run, state, "Failed")
+                if arguments[:2] == ["resource", "list"]:
+                    return []
+                self.fail(f"Unexpected Azure operation: {arguments[:3]}")
+
+            run.az.side_effect = command
+            with self.assertRaises(preflight.azure.AzureCliError) as raised:
+                run.deploy_host("0526")
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(
+                failure.code, "SecurityRuleInvalidAccessType"
+            )
+            self.assertEqual(
+                state["host_deployment"]["phase"], "failed-no-compute"
+            )
+            self.assertEqual(
+                state["phase"], "host-deployment-failed-no-compute"
+            )
+            self.assertEqual(state["pending_secret_files"], [])
+            self.assertNotIn("private-secret", str(raised.exception))
+            self.assertNotIn("private-sas", str(raised.exception))
+
+    def test_deployment_reconciliation_retains_both_safe_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run, state = self.run_fixture(Path(temporary))
+            failure = preflight.azure.AzureCliError(
+                ["deployment", "group", "create"],
+                mock.Mock(
+                    returncode=1,
+                    stderr=(
+                        "ERROR: (SecurityRuleInvalidAccessType) "
+                        "adminPassword=private-secret"
+                    ),
+                ),
+                True,
+            )
+            run.az.side_effect = failure
+            run.reconcile_host_deployment = mock.Mock(
+                side_effect=RuntimeError(
+                    f"{state['subscription']} {run.group} "
+                    "adminPassword=reconciliation-secret "
+                    "?sig=private-sas /owner/private/state"
+                )
+            )
+            with self.assertRaises(
+                preflight.PrivateHostDeploymentReconciliationError
+            ) as raised:
+                run.deploy_host("0526")
+            error = raised.exception
+            self.assertEqual(error.failure_category, "AzureCliError")
+            self.assertEqual(
+                error.code, "SecurityRuleInvalidAccessType"
+            )
+            self.assertEqual(
+                error.reconciliation_failure,
+                {"category": "RuntimeError", "code": None},
+            )
+            self.assertNotIn(state["subscription"], str(error))
+            self.assertNotIn("private-secret", str(error))
+            self.assertNotIn(run.group, str(error))
+            for secret in (
+                "reconciliation-secret", "private-sas", "/owner/private/state",
+            ):
+                self.assertNotIn(secret, str(error))
+            self.assertIsNone(error.__cause__)
+            self.assertIsNone(error.__context__)
+            preflight.record_private_failure(run, error, "deployment")
+            self.assertEqual(
+                state["failure"],
+                {
+                    "category": "AzureCliError",
+                    "code": "SecurityRuleInvalidAccessType",
+                    "phase": "deployment",
+                    "reconciliation": {
+                        "category": "RuntimeError",
+                        "code": None,
+                    },
+                },
+            )
 
     def test_partial_persisted_identity_anchors_are_invalid(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3795,14 +4028,41 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 "active_sas": True,
                 "active_sas_signing_key_sha256": "a" * 64,
             })
+            firewall_error = preflight.azure.AzureCliError(
+                ["storage", "account", "network-rule"],
+                mock.Mock(
+                    returncode=1,
+                    stderr=(
+                        "ERROR: (FirewallCleanupDenied) "
+                        "https://private.example/?sig=private-secret"
+                    ),
+                ),
+                True,
+            )
             run.clear_firewall_obligation = mock.Mock(
-                side_effect=RuntimeError("firewall")
+                side_effect=firewall_error
             )
             run.revoke_sas = mock.Mock(side_effect=RuntimeError("sas"))
             run.deallocate_host = mock.Mock(side_effect=RuntimeError("vm"))
             run.delete_owned_group = mock.Mock(side_effect=RuntimeError("group"))
-            with self.assertRaisesRegex(RuntimeError, "did not complete"):
+            with self.assertRaises(
+                preflight.PrivateCleanupError
+            ) as raised:
                 run.cleanup()
+            self.assertEqual(
+                [item["stage"] for item in raised.exception.cleanup_failures],
+                ["firewall", "sas", "deallocate", "resource-group"],
+            )
+            self.assertEqual(
+                raised.exception.cleanup_failures[0],
+                {
+                    "stage": "firewall",
+                    "category": "AzureCliError",
+                    "code": "FirewallCleanupDenied",
+                },
+            )
+            self.assertNotIn("private-secret", str(raised.exception))
+            self.assertNotIn("private.example", str(raised.exception))
             self.assertFalse(secret_path.exists())
             self.assertEqual(state["pending_secret_files"], [])
             run.clear_firewall_obligation.assert_called_once_with()
@@ -3930,17 +4190,9 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
                 "securityRules": [],
             }
             expected = {
-                "AllowAzurePlatformDns": (
-                    100, "Allow", "Outbound", "Udp", "53",
-                    "VirtualNetwork", "AzurePlatformDNS",
-                ),
-                "AllowAzurePlatformImds": (
-                    110, "Allow", "Outbound", "Tcp", "80",
-                    "VirtualNetwork", "AzurePlatformIMDS",
-                ),
                 "AllowAzurePlatformAgent": (
                     120, "Allow", "Outbound", "Tcp", ["80", "32526"],
-                    "VirtualNetwork", "168.63.129.16",
+                    "VirtualNetwork", "168.63.129.16/32",
                 ),
                 "AllowRegionalStorage": (
                     130, "Allow", "Outbound", "Tcp", "443",
@@ -4021,6 +4273,32 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
             run.verify_deployed_envelope()
             run.verify_storage_rules.assert_called_once_with()
             run.verify_resource_inventory.assert_called_once_with()
+            invalid_access = copy.deepcopy(nsg)
+            next(
+                rule for rule in invalid_access["securityRules"]
+                if rule["name"] == "AllowRegionalStorage"
+            )["access"] = "Permit"
+            platform_tag_allow = copy.deepcopy(nsg)
+            platform_tag_allow["securityRules"].append({
+                "name": "AllowAzurePlatformDns",
+                "priority": 100,
+                "access": "Allow",
+                "direction": "Outbound",
+                "protocol": "Udp",
+                "sourcePortRange": "*",
+                "destinationPortRange": "53",
+                "sourceAddressPrefix": "VirtualNetwork",
+                "destinationAddressPrefix": "AzurePlatformDNS",
+            })
+            for name, changed in (
+                ("invalid-access", invalid_access),
+                ("platform-tag-allow", platform_tag_allow),
+            ):
+                with self.subTest(nsg=name):
+                    run.az.reset_mock()
+                    run.az.side_effect = [nic, changed]
+                    with self.assertRaisesRegex(RuntimeError, "NSG"):
+                        run.verify_deployed_envelope()
 
     def test_resource_inventory_rejects_extra_public_ip(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4087,7 +4365,7 @@ class PrivatePreflightCloudTest(PrivatePreflightFixture):
 class PrivatePreflightOrderingTest(PrivatePreflightFixture):
     def execute(
         self, capability_error=None, cleanup_error=None,
-        recording_error=None,
+        recording_error=None, deployment_error=None,
     ):
         state = self.state()
         events = []
@@ -4104,7 +4382,9 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
 
             def record(phase, **fields):
                 if (
-                    phase in ("cleanup-failed", "failed")
+                    phase in (
+                        "failure-recorded", "cleanup-failed", "failed",
+                    )
                     and recording_error is not None
                 ):
                     raise recording_error
@@ -4121,8 +4401,15 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             fake.record.side_effect = record
             fake.account_bytes.side_effect = account
             fake.create_group.side_effect = lambda: events.append("group")
-            fake.deploy_host.side_effect = lambda _: (
-                events.append("host"),
+
+            def deploy_host(_shutdown):
+                events.append("host")
+                if deployment_error is not None:
+                    fake.record(
+                        "host-deployment-failed-no-compute",
+                        host_deployment={"phase": "failed-no-compute"}
+                    )
+                    raise deployment_error
                 state.update(
                     host_vm_id="/private/vm",
                     host_deployment={
@@ -4135,8 +4422,9 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
                         "vm_uuid": "44444444-4444-4444-8444-444444444444",
                         "disk_uuid": "55555555-5555-4555-8555-555555555555",
                     },
-                ),
-            )
+                )
+
+            fake.deploy_host.side_effect = deploy_host
             fake.verify_storage_rules.side_effect = lambda: events.append(
                 "firewall-closed"
             )
@@ -4243,17 +4531,31 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             ), mock.patch.object(
                 preflight.azure, "image_sha256", return_value="e" * 64
             ):
-                if capability_error is not None:
+                primary_error = (
+                    deployment_error or capability_error or cleanup_error
+                )
+                if primary_error is not None:
                     expected = (
-                        preflight.azure.RunCleanupError
-                        if cleanup_error is not None
-                        else type(capability_error)
+                        preflight.PrivateFailurePipelineError
+                        if (
+                            recording_error is not None
+                            or (cleanup_error is not None and (
+                                deployment_error is not None
+                                or capability_error is not None
+                            ))
+                        )
+                        else type(primary_error)
                     )
                     with self.assertRaises(expected) as raised:
                         preflight.run_preflight(
                             root, cloud["subscription"], "8.8.8.8", True
                         )
                     raised_error = raised.exception
+                    if isinstance(
+                        raised_error, preflight.PrivateFailurePipelineError
+                    ):
+                        self.assertIsNone(raised_error.__cause__)
+                        self.assertIsNone(raised_error.__context__)
                 else:
                     preflight.run_preflight(
                         root, cloud["subscription"], "8.8.8.8", True
@@ -4297,6 +4599,125 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
         self.assertEqual(events[-1], "cleanup")
         self.assertIsInstance(raised, RuntimeError)
 
+    def test_failed_no_compute_records_safe_azure_code_and_cleans(self):
+        failure = preflight.azure.AzureCliError(
+            ["deployment", "group", "create"],
+            mock.Mock(
+                returncode=1,
+                stderr=(
+                    "ERROR: (SecurityRuleInvalidAccessType) "
+                    "adminPassword=private-secret "
+                    "https://private.example/?sig=private-sas"
+                ),
+            ),
+            True,
+        )
+        events, state, raised = self.execute(deployment_error=failure)
+        self.assertIs(raised, failure)
+        self.assertEqual(events, ["group", "host", "cleanup"])
+        self.assertIs(state["cleanup_required"], False)
+        self.assertEqual(state["phase"], "failed")
+        self.assertEqual(
+            state["host_deployment"], {"phase": "failed-no-compute"}
+        )
+        self.assertEqual(
+            state["failure"],
+            {
+                "category": "AzureCliError",
+                "code": "SecurityRuleInvalidAccessType",
+                "phase": "host-deployment-failed-no-compute",
+            },
+        )
+        serialized = json.dumps(state["failure"])
+        self.assertNotIn("private-secret", serialized)
+        self.assertNotIn("private-sas", serialized)
+        self.assertNotIn("primary_failure", state)
+        self.assertNotIn("cleanup_failure", state)
+
+    def test_creation_reconcile_and_cleanup_codes_are_all_retained(self):
+        creation = preflight.azure.AzureCliError(
+            ["deployment", "group", "create"],
+            mock.Mock(
+                returncode=1,
+                stderr=(
+                    "ERROR: (SecurityRuleInvalidAccessType) "
+                    "adminPassword=private-secret"
+                ),
+            ),
+            True,
+        )
+        reconciliation = preflight.azure.AzureCliError(
+            ["deployment", "group", "show"],
+            mock.Mock(
+                returncode=1,
+                stderr=(
+                    "ERROR: (DeploymentReadFailed) "
+                    "https://private.example/?sig=reconcile-secret"
+                ),
+            ),
+            True,
+        )
+        cleanup = preflight.azure.AzureCliError(
+            ["group", "delete"],
+            mock.Mock(
+                returncode=1,
+                stderr=(
+                    "ERROR: (CleanupDenied) "
+                    "https://private.example/?sig=cleanup-secret"
+                ),
+            ),
+            True,
+        )
+        deployment = preflight.PrivateHostDeploymentReconciliationError(
+            creation, reconciliation,
+        )
+        events, state, raised = self.execute(
+            cleanup_error=cleanup, deployment_error=deployment
+        )
+        self.assertEqual(events, ["group", "host", "cleanup"])
+        self.assertIsInstance(
+            raised, preflight.PrivateFailurePipelineError
+        )
+        self.assertEqual(raised.failure_category, "AzureCliError")
+        self.assertEqual(
+            raised.code, "SecurityRuleInvalidAccessType"
+        )
+        self.assertEqual(
+            raised.reconciliation_failure,
+            {"category": "AzureCliError", "code": "DeploymentReadFailed"},
+        )
+        self.assertEqual(
+            raised.cleanup_failures,
+            [{
+                "stage": "cleanup",
+                "category": "AzureCliError",
+                "code": "CleanupDenied",
+            }],
+        )
+        self.assertEqual(
+            state["failure"],
+            {
+                "category": "AzureCliError",
+                "code": "SecurityRuleInvalidAccessType",
+                "phase": "host-deployment-failed-no-compute",
+                "reconciliation": {
+                    "category": "AzureCliError",
+                    "code": "DeploymentReadFailed",
+                },
+                "cleanup": [{
+                    "stage": "cleanup",
+                    "category": "AzureCliError",
+                    "code": "CleanupDenied",
+                }],
+            },
+        )
+        diagnostics = str(raised) + json.dumps(state["failure"])
+        for secret in (
+            "private-secret", "reconcile-secret", "cleanup-secret",
+            "private.example",
+        ):
+            self.assertNotIn(secret, diagnostics)
+
     def test_primary_and_cleanup_failures_are_both_sanitized_and_durable(self):
         private = "11111111-2222-3333-4444-555555555555"
         primary = RuntimeError(
@@ -4309,18 +4730,37 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
         )
         events, state, raised = self.execute(primary, cleanup)
         self.assertEqual(events[-1], "cleanup")
-        self.assertIsInstance(raised, preflight.azure.RunCleanupError)
-        self.assertIn("Primary run failure", str(raised))
-        self.assertIn("cleanup also failed", str(raised))
+        self.assertIsInstance(
+            raised, preflight.PrivateFailurePipelineError
+        )
+        self.assertEqual(raised.failure_category, "RuntimeError")
+        self.assertEqual(
+            raised.cleanup_failures,
+            [{
+                "stage": "cleanup",
+                "category": "RuntimeError",
+                "code": None,
+            }],
+        )
         self.assertNotIn("ukhvp1234567890abcd", str(raised))
         self.assertNotIn("/subscriptions/", str(raised))
         self.assertNotIn("/owner/private/state", str(raised))
         self.assertEqual(state["phase"], "cleanup-failed")
-        self.assertIn("primary_failure", state)
-        self.assertIn("cleanup_failure", state)
-        self.assertNotIn(
-            "ukhvp1234567890abcd", state["cleanup_failure"]
+        self.assertEqual(
+            state["failure"],
+            {
+                "category": "RuntimeError",
+                "code": None,
+                "phase": "public-tools-staged",
+                "cleanup": [{
+                    "stage": "cleanup",
+                    "category": "RuntimeError",
+                    "code": None,
+                }],
+            },
         )
+        self.assertNotIn("primary_failure", state)
+        self.assertNotIn("cleanup_failure", state)
 
     def test_cleanup_recording_failure_reports_all_three_failures(self):
         primary = RuntimeError("deployment failed /owner/private/state")
@@ -4332,12 +4772,19 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             primary, cleanup, recording
         )
         self.assertEqual(events[-1], "cleanup")
-        self.assertIsInstance(raised, preflight.azure.RunCleanupError)
+        self.assertIsInstance(
+            raised, preflight.PrivateFailurePipelineError
+        )
         message = str(raised)
-        self.assertIn("Primary run failure", message)
-        self.assertIn("cleanup also failed", message)
+        self.assertIn("primary=RuntimeError(unclassified)", message)
         self.assertIn(
-            "durable cleanup-failure recording also failed", message
+            "cleanup=cleanup:RuntimeError(unclassified)", message
+        )
+        self.assertIn(
+            "recording=initial:RuntimeError(unclassified)", message
+        )
+        self.assertIn(
+            "recording=final:RuntimeError(unclassified)", message
         )
         self.assertNotIn("ukhvp1234567890abcd", message)
         self.assertNotIn("/owner/private/state", message)
@@ -4351,36 +4798,72 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
             primary, recording_error=recording
         )
         self.assertEqual(events[-1], "cleanup")
+        self.assertIsInstance(
+            raised, preflight.PrivateFailurePipelineError
+        )
         message = str(raised)
-        self.assertIn("Primary run failure", message)
-        self.assertIn("durable failure recording also failed", message)
+        self.assertIn("primary=RuntimeError(unclassified)", message)
+        self.assertIn(
+            "recording=initial:RuntimeError(unclassified)", message
+        )
+        self.assertIn(
+            "recording=final:RuntimeError(unclassified)", message
+        )
         self.assertNotIn("ukhvp1234567890abcd", message)
         self.assertNotIn("/owner/private/state", message)
+
+    def test_post_acceptance_cleanup_recording_detaches_raw_context(self):
+        cleanup = preflight.PrivateCleanupError([
+            ("resource-group", RuntimeError("adminPassword=private-secret")),
+        ])
+        recording = OSError("?sig=private-sas /owner/private/state")
+        events, state, raised = self.execute(
+            cleanup_error=cleanup, recording_error=recording,
+        )
+        self.assertIn("retrieve-private", events)
+        self.assertIn("deallocate", events)
+        self.assertEqual(events[-1], "cleanup")
+        self.assertTrue(state["cleanup_required"])
+        self.assertIsInstance(raised, preflight.PrivateFailurePipelineError)
+        self.assertIsNone(raised.__cause__)
+        self.assertIsNone(raised.__context__)
+        for secret in ("private-secret", "private-sas", "/owner/private/state"):
+            self.assertNotIn(secret, str(raised))
 
     def test_cli_error_redacts_ids_secrets_and_paths(self):
         secret = (
             "/subscriptions/private/resourceGroups/private "
             "?sig=private-secret /owner/private/state"
         )
-        output = io.StringIO()
-        with mock.patch.object(
-            preflight.sys, "argv",
-            [
-                "hyperv_private_preflight.py", "cleanup",
-                "--state-dir", "/owner/private/state",
-                "--subscription", "11111111-2222-3333-4444-555555555555",
-            ],
-        ), mock.patch.object(
-            preflight, "cleanup", side_effect=RuntimeError(secret)
-        ), mock.patch.object(preflight.sys, "stderr", output):
-            with self.assertRaises(SystemExit) as stopped:
-                preflight.main()
-            print(stopped.exception, file=preflight.sys.stderr)
-        message = output.getvalue()
-        self.assertNotIn("private-secret", message)
-        self.assertNotIn("/subscriptions/", message)
-        self.assertNotIn("/owner/private", message)
-        self.assertNotIn("Traceback", message)
+        for failure in (
+            RuntimeError(secret),
+            preflight.subprocess.TimeoutExpired(
+                ["private-worker", secret], 1, output=secret, stderr=secret,
+            ),
+        ):
+            with self.subTest(category=type(failure).__name__):
+                output = io.StringIO()
+                with mock.patch.object(
+                    preflight.sys, "argv",
+                    [
+                        "hyperv_private_preflight.py", "cleanup",
+                        "--state-dir", "/owner/private/state",
+                        "--subscription",
+                        "11111111-2222-3333-4444-555555555555",
+                    ],
+                ), mock.patch.object(
+                    preflight, "cleanup", side_effect=failure
+                ), mock.patch.object(preflight.sys, "stderr", output):
+                    with self.assertRaises(SystemExit) as stopped:
+                        preflight.main()
+                    print(stopped.exception, file=preflight.sys.stderr)
+                self.assertIsNone(stopped.exception.__cause__)
+                self.assertIsNone(stopped.exception.__context__)
+                message = output.getvalue()
+                self.assertNotIn("private-secret", message)
+                self.assertNotIn("/subscriptions/", message)
+                self.assertNotIn("/owner/private", message)
+                self.assertNotIn("Traceback", message)
 
 
 if __name__ == "__main__":
