@@ -862,6 +862,24 @@ jobs:
               -j2 integration install --summary all
         done
 
+    - name: Run native Hyper-V ARM and credential fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-azure"
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/azure/build.zig \
+          support/tools/hyperv/azure/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in Debug ReleaseSafe; do
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/azure/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --prefix "${root}/${mode}/out" \
+              -Doptimize="${mode}" -j2 test install --summary all
+        done
+
     - name: Run focused Hyper-V regressions
       run: |
         set -euo pipefail
