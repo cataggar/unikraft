@@ -260,6 +260,9 @@ static int receive_gate_before_entered;
 static int receive_gate_release_drain;
 static int receive_gate_notify_entered;
 static int receive_gate_release_notify;
+static struct uk_thread *receive_gate_thread;
+static struct uk_thread *worker_exit_watch;
+static int worker_exit_observed;
 static int removal_coherence_enabled;
 static int removal_coherence_caller_registered;
 static pthread_t removal_coherence_caller;
@@ -510,6 +513,7 @@ void storvsc_host_receive_hook(unsigned int controller, int before_notify)
 		return;
 	}
 	if (!before_notify) {
+		receive_gate_thread = current_thread;
 		receive_gate_before_entered = 1;
 		pthread_cond_broadcast(&race_condition);
 		while (receive_gate_enabled && !receive_gate_release_drain)
@@ -682,6 +686,12 @@ void uk_sched_thread_exit(void)
 {
 	struct uk_thread *thread = current_thread;
 
+	pthread_mutex_lock(&race_lock);
+	if (thread == worker_exit_watch) {
+		worker_exit_observed = 1;
+		pthread_cond_broadcast(&race_condition);
+	}
+	pthread_mutex_unlock(&race_lock);
 	current_thread = NULL;
 	if (thread != &main_thread)
 		free(thread);
@@ -2092,6 +2102,7 @@ static void release_receive_gate(void)
 	receive_gate_enabled = 0;
 	receive_gate_release_drain = 1;
 	receive_gate_release_notify = 1;
+	receive_gate_thread = NULL;
 	pthread_cond_broadcast(&race_condition);
 	pthread_mutex_unlock(&race_lock);
 }
@@ -2109,12 +2120,51 @@ static int hold_receive_gate(unsigned int controller)
 	receive_gate_release_drain = 0;
 	receive_gate_notify_entered = 0;
 	receive_gate_release_notify = 0;
+	receive_gate_thread = NULL;
 	pthread_mutex_unlock(&race_lock);
 	if (wait_race_flag(&receive_gate_before_entered)) {
 		release_receive_gate();
 		return -ETIMEDOUT;
 	}
 	return 0;
+}
+
+static int release_receive_gate_and_wait_worker(unsigned int limit_ms)
+{
+	struct timespec deadline;
+	struct uk_thread *worker;
+	int observed;
+	int wait_rc = 0;
+
+	pthread_mutex_lock(&race_lock);
+	worker = receive_gate_thread;
+	if (!receive_gate_enabled || !receive_gate_before_entered || !worker) {
+		pthread_mutex_unlock(&race_lock);
+		release_receive_gate();
+		return -EINVAL;
+	}
+	worker_exit_watch = worker;
+	worker_exit_observed = 0;
+	receive_gate_enabled = 0;
+	receive_gate_release_drain = 1;
+	receive_gate_release_notify = 1;
+	receive_gate_thread = NULL;
+	pthread_cond_broadcast(&race_condition);
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += limit_ms / 1000;
+	deadline.tv_nsec += (limit_ms % 1000) * 1000000ULL;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+	while (!worker_exit_observed && !wait_rc)
+		wait_rc = pthread_cond_timedwait(
+			&race_condition, &race_lock, &deadline);
+	observed = worker_exit_observed;
+	if (worker_exit_watch == worker)
+		worker_exit_watch = NULL;
+	pthread_mutex_unlock(&race_lock);
+	return observed ? 0 : -ETIMEDOUT;
 }
 
 static int wait_topology_delivery(
@@ -2184,7 +2234,22 @@ static int wait_connection_fail_calls(unsigned int expected,
 				      unsigned int limit_ms)
 {
 	for (unsigned int i = 0; i < limit_ms; i++) {
-		if (vmbus_bus_host_connection_fail_calls() == expected)
+		unsigned int calls =
+			vmbus_bus_host_connection_fail_calls();
+
+		if (calls == expected)
+			return 0;
+		if (calls > expected)
+			return -EOVERFLOW;
+		uk_sched_thread_sleep(1000000ULL);
+	}
+	return -ETIMEDOUT;
+}
+
+static int wait_persistence_request_done(unsigned int limit_ms)
+{
+	for (unsigned int i = 0; i < limit_ms; i++) {
+		if (hyperv_acceptance_persistence_host_request_done())
 			return 0;
 		uk_sched_thread_sleep(1000000ULL);
 	}
@@ -3170,6 +3235,8 @@ struct integrated_disconnect_context {
 	pthread_cond_t condition;
 	int remove_observed_safe;
 	int remove_wait_result;
+	int failure_wait_result;
+	unsigned int expected_failure_calls;
 	int unload_posted;
 	int release_unload;
 	int acknowledge;
@@ -3183,14 +3250,20 @@ static void integrated_remove_hook(void *arg)
 	remove_test_offer(context->driver, context->vmbus_device);
 	context->remove_wait_result = wait_deferred_vmbus(
 		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	context->failure_wait_result = wait_connection_fail_calls(
+		context->expected_failure_calls,
+		CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
 	context->remove_observed_safe =
 		!context->remove_wait_result &&
+		!context->failure_wait_result &&
 		storvsc_host_deferred_action() == TEST_DEFER_REMOVE &&
 		storvsc_host_deferred_wait_vmbus() &&
 		storvsc_host_deferred_close_required() &&
 		!storvsc_host_deferred_close_busy() &&
 		!atomic_load(context->callbacks) &&
-		storvsc_host_request_bound(context->request);
+		storvsc_host_request_bound(context->request) &&
+		vmbus_bus_host_connection_fail_calls() ==
+			context->expected_failure_calls;
 }
 
 static void integrated_unload_post_hook(void *arg)
@@ -3256,6 +3329,7 @@ static int run_integrated_remove_unload(
 		return error_base;
 	epoch = vmbus_connection_quiesce_epoch();
 	failures_before = vmbus_bus_host_connection_fail_calls();
+	context.expected_failure_calls = failures_before + 1;
 	atomic_init(&callbacks, 0);
 	initialize_request(&request, UK_BLKREQ_READ, 114, 1, buffer,
 			   request_done, &callbacks);
@@ -3287,10 +3361,12 @@ static int run_integrated_remove_unload(
 	    vmbus_bus_host_connection_fail_calls() != failures_before + 1) {
 		fprintf(stderr,
 			"integrated unload observation failed: "
-			"wait=%d safe=%d deferred=%d wait_vmbus=%d "
+			"wait=%d failure_wait=%d safe=%d "
+			"deferred=%d wait_vmbus=%d "
 			"close_required=%d close_busy=%d callbacks=%d "
 			"bound=%d failures=%u/%u\n",
 			context.remove_wait_result,
+			context.failure_wait_result,
 			context.remove_observed_safe,
 			storvsc_host_deferred_action(),
 			storvsc_host_deferred_wait_vmbus(),
@@ -4256,7 +4332,11 @@ static int run_topology_regression(struct vmbus_driver *driver,
 		return 434;
 	}
 	rc = persistence_remove_device(driver, &secondary);
-	release_receive_gate();
+	if (!rc)
+		rc = release_receive_gate_and_wait_worker(
+			CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	else
+		release_receive_gate();
 	if (persistence_remove_device(driver, primary) || rc)
 		return 435;
 
@@ -5801,7 +5881,9 @@ static int run_persistence_workflow_regression(
 	complete_pending(2);
 	pending_count = 0;
 	fire_channel_on(primary->channel);
-	if (!hyperv_acceptance_persistence_host_request_owned() ||
+	if (wait_persistence_request_done(
+		    CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS) ||
+	    !hyperv_acceptance_persistence_host_request_owned() ||
 	    !hyperv_acceptance_persistence_host_request_done())
 		return 615;
 	commands = io_command_count;
