@@ -106,6 +106,7 @@ const Fixture = struct {
         return error.FixtureOwnerDeadline;
     }
     fn waitFile(self: *Fixture, directory: guard.core.private_files.Directory, name: []const u8) !void {
+        errdefer self.reportOwnerFailure(name);
         const deadline = try guard.core.process.Deadline.afterMilliseconds(10000);
         while (!try deadline.expired()) {
             const file = directory.openFile(io, name) catch |err| switch (err) {
@@ -120,6 +121,14 @@ const Fixture = struct {
             return;
         }
         return error.FixtureHandshakeDeadline;
+    }
+    fn reportOwnerFailure(self: *Fixture, awaited: []const u8) void {
+        const bytes = self.work.read(io, a, "owner-error", 4096, null) catch |err| {
+            std.debug.print("Synthetic custody diagnostic unavailable while awaiting {s}: {s}\n", .{ awaited, @errorName(err) });
+            return;
+        };
+        defer a.free(bytes);
+        std.debug.print("Synthetic custody stderr while awaiting {s} ({d} bytes):\n{s}\n", .{ awaited, bytes.len, bytes });
     }
     fn registration(self: *Fixture) !r.Registration {
         try self.waitFile(self.directory, "custody-registration.json");

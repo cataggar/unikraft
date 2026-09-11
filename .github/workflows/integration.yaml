@@ -787,6 +787,43 @@ jobs:
           'import hyperv_private_preflight as p; p.sdk_dependency_contract()'
         echo "${venv}/bin" >> "${GITHUB_PATH}"
 
+    - name: Run native Hyper-V operator custody fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-operator-guard"
+        for mode in Debug ReleaseSafe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/operator_guard/build.zig \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dtest-root="${root}/${mode}/fixtures" \
+              -Doptimize="${mode}" -Dfixture-optimize=ReleaseSafe \
+              -j2 test install --summary all
+          result=0
+          "${root}/${mode}/out/bin/uk-hyperv-operator-guard" \
+            > "${root}/${mode}/stdout" 2> "${root}/${mode}/stderr" \
+            || result=$?
+          test "${result}" -eq 2
+          test ! -s "${root}/${mode}/stdout"
+          grep --fixed-strings --line-regexp --quiet \
+            '{"error":"operator-guard-engine-and-authority-binding-required"}' \
+            "${root}/${mode}/stderr"
+        done
+        for target in x86_64-linux-musl aarch64-linux-musl; do
+          ZIG_LOCAL_CACHE_DIR="${root}/${target}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/operator_guard/build.zig \
+              --cache-dir "${root}/${target}/zig-local-cache" \
+              --prefix "${root}/${target}/out" \
+              -Dtarget="${target}" -Doptimize=ReleaseSafe \
+              -j2 compile-guard --summary all
+          binary_bytes="$(stat -c %s "${root}/${target}/out/bin/operator-guard-target-fixture")"
+          test "$((binary_bytes + 233504))" -le 8388608
+          printf 'Synthetic guard %s bytes: %s + 233504 reserved; not complete operator admission\n' \
+            "${target}" "${binary_bytes}"
+        done
+
     - name: Build pinned miz EFI application tooling
       run: |
         set -euo pipefail
@@ -1008,43 +1045,6 @@ jobs:
         test "$((runner_bytes + unit_bytes))" -le 8388608
         printf 'Synthetic-key host runner/unit bytes: %s/%s; not image admission\n' \
           "${runner_bytes}" "${unit_bytes}"
-
-    - name: Run native Hyper-V operator custody fixtures
-      run: |
-        set -euo pipefail
-        umask 077
-        root="${RUNNER_TEMP}/hyperv-ci/native-operator-guard"
-        for mode in Debug ReleaseSafe; do
-          mkdir -p "${root}/${mode}/fixtures"
-          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
-            zig build --build-file support/tools/hyperv/operator_guard/build.zig \
-              --cache-dir "${root}/${mode}/zig-local-cache" \
-              --prefix "${root}/${mode}/out" \
-              -Dtest-root="${root}/${mode}/fixtures" \
-              -Doptimize="${mode}" -Dfixture-optimize=ReleaseSafe \
-              -j2 test install --summary all
-          result=0
-          "${root}/${mode}/out/bin/uk-hyperv-operator-guard" \
-            > "${root}/${mode}/stdout" 2> "${root}/${mode}/stderr" \
-            || result=$?
-          test "${result}" -eq 2
-          test ! -s "${root}/${mode}/stdout"
-          grep --fixed-strings --line-regexp --quiet \
-            '{"error":"operator-guard-engine-and-authority-binding-required"}' \
-            "${root}/${mode}/stderr"
-        done
-        for target in x86_64-linux-musl aarch64-linux-musl; do
-          ZIG_LOCAL_CACHE_DIR="${root}/${target}/zig-local-cache" \
-            zig build --build-file support/tools/hyperv/operator_guard/build.zig \
-              --cache-dir "${root}/${target}/zig-local-cache" \
-              --prefix "${root}/${target}/out" \
-              -Dtarget="${target}" -Doptimize=ReleaseSafe \
-              -j2 compile-guard --summary all
-          binary_bytes="$(stat -c %s "${root}/${target}/out/bin/operator-guard-target-fixture")"
-          test "$((binary_bytes + 233504))" -le 8388608
-          printf 'Synthetic guard %s bytes: %s + 233504 reserved; not complete operator admission\n' \
-            "${target}" "${binary_bytes}"
-        done
 
     - name: Run native Hyper-V image transformation fixtures
       run: |
