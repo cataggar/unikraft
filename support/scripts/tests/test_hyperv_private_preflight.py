@@ -860,6 +860,11 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             "support/kconfig/lexer.l",
             "support/kconfig/preprocess.c",
             "support/kconfig/unreviewed-native-helper.c",
+            "support/build/hyperv-proof-flow.zig",
+            "lib/ukalloc/include/uk/alloc.h",
+            "lib/isrlib/string.c",
+            "lib/ukprint/print.c",
+            "plat/native/arch/x86_64/ectx.c",
         )
         for relative in mutation_targets:
             with self.subTest(relative=relative), \

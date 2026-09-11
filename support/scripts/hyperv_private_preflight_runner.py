@@ -71,10 +71,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "dd3a12405af5bf0d2ae3bc30132ed8af34725cde14ea1f8c72813ad0244212e0"
+            "09f7dc31d0a0e592bfb291e0f72e1162c0c18060d8b6e00e30bc6fb12e73f5ef"
         ),
-        "size": 1445182,
-        "files": 199,
+        "size": 1756781,
+        "files": 215,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -84,8 +84,131 @@ GUARDED_PRODUCER_CLOSURES = {
         "size": 692952,
         "files": 111,
     },
+    "include": {
+        "name": "include",
+        "sha256": "66217d6181a72e18b050d0a1f64f4e0a240bb09a87879a3338c0ec48611b61a8",
+        "size": 212580,
+        "files": 28,
+    },
+    "arch/x86_64": {
+        "name": "arch/x86_64",
+        "sha256": "92a9b4fa092aa0578279e2e11bf0c438c0de20ba81b1de12a4d4a151b37365df",
+        "size": 43271,
+        "files": 3,
+    },
+    "arch/x86/x86_64": {
+        "name": "arch/x86/x86_64",
+        "sha256": "07f6b1b676bb3584ecef008463facaa65a5700ea4e64a8f40be73afdc329f223",
+        "size": 38133,
+        "files": 15,
+    },
+    "lib/ukalloc": {
+        "name": "lib/ukalloc",
+        "sha256": "f0e21c13e5760a18c2434934e9bd788568e79693acad5dec57f9ea7ae9644d32",
+        "size": 57408,
+        "files": 11,
+    },
+    "lib/ukallocbbuddy": {
+        "name": "lib/ukallocbbuddy",
+        "sha256": "309cef13de29b1294d6f9b59d9961b15f6d51e505a9224c42d5c3cf8705c3c6a",
+        "size": 23686,
+        "files": 5,
+    },
+    "lib/ukallocstack": {
+        "name": "lib/ukallocstack",
+        "sha256": "982af7a7b990417e5796c1618a40527fa2eb9d63e56d702836e38e341a9d2a84",
+        "size": 11229,
+        "files": 5,
+    },
+    "lib/ukboot": {
+        "name": "lib/ukboot",
+        "sha256": "5571c5e8cf6b62cca4e0fc646bf919431822fb5dc91d80ae9ff2830786b67d13",
+        "size": 63826,
+        "files": 20,
+    },
+    "lib/uksched": {
+        "name": "lib/uksched",
+        "sha256": "740a514996ce0906944a30f52983dd517e83444e3d73dbe0799442241665ff38",
+        "size": 119968,
+        "files": 20,
+    },
+    "lib/ukschedcoop": {
+        "name": "lib/ukschedcoop",
+        "sha256": "cc0686ed80ff4db0566bb729c828e138c7e2975360fd23544f7e46fe7735b9c2",
+        "size": 26278,
+        "files": 8,
+    },
+    "lib/isrlib": {
+        "name": "lib/isrlib",
+        "sha256": "4c46471f21ef93579a0c098109c9e75f49ac1c91688d4e8ec313b960e7384518",
+        "size": 11810,
+        "files": 4,
+    },
+    "lib/nolibc": {
+        "name": "lib/nolibc",
+        "sha256": "d6e9b2341186c26d50c5f80b6365a8e57ed2324082d307036f4d723d171db997",
+        "size": 304095,
+        "files": 104,
+    },
+    "lib/ukprint": {
+        "name": "lib/ukprint",
+        "sha256": "8904ddb0c61fd9a55cf4d1924fd5553fcda9557d07d51e48c09029958b28578d",
+        "size": 73165,
+        "files": 18,
+    },
+    "plat/native/arch/x86_64": {
+        "name": "plat/native/arch/x86_64",
+        "sha256": "2bad585345238b9c440a88956c83d155e598eb68749b4e2ff9e1148699e518a2",
+        "size": 105216,
+        "files": 19,
+    },
 }
 GUARDED_PRODUCER_FILES = {
+    "support/build/hyperv-image-proofs.zig": (
+        "dd7b58050e5c2e7fe1a0d6c07bc111bcc5807c46a7b09237f5a9cca94debe0ff"
+    ),
+    "support/build/hyperv-proof-binding.zig": (
+        "8748440c3f6d12b3e1d723fec9f5e8095a54c8f740267260ec09dd0a6772e3fc"
+    ),
+    "support/build/hyperv-proof-build.zig": (
+        "126c878df99bef797d3ccf03f6e011ba326b998d78bedb42d961dac53336f1ac"
+    ),
+    "support/build/hyperv-proof-disasm.zig": (
+        "5968de57f412d9dbf2ec4a16bbb16237d56ac198be81bb712a915fc8d31400e7"
+    ),
+    "support/build/hyperv-proof-fixtures.zig": (
+        "4ebe7456ea3c9aede8e3e3376d54b2e80c1995cffe3587dd17d44af7e7ee06bf"
+    ),
+    "support/build/hyperv-proof-flow.zig": (
+        "ef746e4075bf57c148f6f81911e773ead518eb6277ee9ec4ff5fe7214a91bac4"
+    ),
+    "support/build/hyperv-proof-image.zig": (
+        "3b0a6543f178fde897eb84847663eb611f27cffc58398f170d2aa6f0a0af98f5"
+    ),
+    "support/build/hyperv-proof-instructions.zig": (
+        "06139edf95d95a268460748a4f75796fee81b7b880a349dfaaf7c8b6ed7e8dab"
+    ),
+    "support/build/hyperv-proof-paths.zig": (
+        "9b90a3ccbded4ac7f18f7ea0c2530a69277d555d750248fa963816dac252b900"
+    ),
+    "support/build/hyperv-proof-tests.zig": (
+        "a6620356326c4e3a1d63c029efd4f91c586e7b6ccf690893aad2c2d546cee2f9"
+    ),
+    "support/build/hyperv-proof-tool.zig": (
+        "5320cece80eb649c58200edf8e854dccbbc3340a3f3b4f520716403fd355e759"
+    ),
+    "support/build/tests/cc-option-test.mk": (
+        "a7288ddf1eb5c84dd88e42fcc8720ac10103c0ecdd8aea72e77033787c1c3b27"
+    ),
+    "support/build/tests/hyperv-proof-fixture.c": (
+        "4b1347261f2d7aa5a84726c493b507951572d45703124ba9d05befb5e3effa24"
+    ),
+    "support/build/tests/hyperv-proof-fixture.lds": (
+        "3f5ca3588bef958816510bd88e833daf78d55a38a5012ba66c3beb0ac17663ad"
+    ),
+    "support/build/tests/hyperv-proof-fixture.zig": (
+        "54e350a7d5e2bcc0cc7932bf7713741b18ada4760f2da4a575ebdc2cae646013"
+    ),
     "Config.uk": (
         "31ad9392835d740c86f36c8801dc1d0973ee33c2a40ef6f758ecb8f65cc58d5f"
     ),
@@ -96,7 +219,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "b9afb89b139ed15827aa7313b53f9bf99816260d782328ce94af74c46457cfc8"
+        "897ccd1efd890b3ceed246de4f559737157041fd32507a299c78d69cbfbe052d"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -114,7 +237,7 @@ GUARDED_PRODUCER_FILES = {
         "32a17fdb76ae0c52be5b501d6c5270503b4f235f491a2ac508ff22df95edd538"
     ),
     "support/build/Makefile.rules": (
-        "a8ad0532d523b7acb632f73ea5c4dc81050740452c747e1fdd3af36884233ee5"
+        "37825f1139fb4949c16e69b90882ad11df4ac8ffa1043550faf076389a5580bf"
     ),
     "support/build/build-context.zig": (
         "87e9e9c1b396275ed472d746a1d05b610e1fde97a1a9617087ea850e1b0af495"
@@ -198,7 +321,7 @@ GUARDED_PRODUCER_FILES = {
         "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
     ),
     "support/build/postprocess-elf.zig": (
-        "344fec5ba83ce2a07b1b35595b40d4339786ab861adba462715cc34835df2035"
+        "e227ca4b63adfd76ad5e768b424cf750f7e12d6eac8743b7fe9420e339083180"
     ),
     "support/build/postprocess-files.zig": (
         "246755ac1072ef405b0899eb68383eede069eb5d4d0151e8f54844eb8ad5f33f"

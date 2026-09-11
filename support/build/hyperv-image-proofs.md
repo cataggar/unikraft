@@ -311,7 +311,10 @@ The shared ELF parser's explicit `allow_relocatable` option exists only for
 object-fixture inspection; its normal postprocessing/final-image API still
 rejects ET_REL. The three original Python drivers and their helper regressions
 remain dormant staged-cutover references for other explicit callers. This
-change does not remove them from legacy producer closures, refresh either
-producer-pin map, or replace unrelated controller Python. Integration must add
-the new native sources/fixture dependencies to the complete producer closure;
-the parent owns that refresh and the exclusive full guest build.
+change does not remove them from legacy producer closures or replace unrelated
+controller Python. Both transitional producer-pin maps bind the native sources
+and fixtures, plus complete source directories for the reviewed allocator,
+memory, logger, scheduler-entry and ECTX contracts and the fixture's ABI headers.
+These pins preserve the coexistence boundary; they do not reinterpret old
+receipts or admit a new private build. The dedicated CI step runs both native
+proof modes and the actual Make compiler-option probe.
