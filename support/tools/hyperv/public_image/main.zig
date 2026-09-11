@@ -43,6 +43,34 @@ fn execute(init: std.process.Init) !u8 {
     }
     const self = try std.Io.Dir.cwd().realPathFileAlloc(init.io, "/proc/self/exe", a);
     const state_dir = try take(&map, "--state-dir");
+    if (std.mem.eql(u8, args[1], "import-prepared") or std.mem.eql(u8, args[1], "validate-import")) {
+        const expected: image.importer.Expectations = .{
+            .manifest_sha256 = try take(&map, "--expected-manifest-sha256"),
+            .native_producer_sha256 = try take(&map, "--expected-producer-sha256"),
+            .source = .{
+                .repository = try take(&map, "--expected-repository"),
+                .repository_id = try positive(try take(&map, "--expected-repository-id")),
+                .workflow_ref = try take(&map, "--expected-workflow-ref"),
+                .job = try take(&map, "--expected-job"),
+                .run_id = try positive(try take(&map, "--expected-run-id")),
+                .run_attempt = try positive(try take(&map, "--expected-run-attempt")),
+                .head_sha = try take(&map, "--expected-head-sha"),
+            },
+        };
+        if (std.mem.eql(u8, args[1], "validate-import")) {
+            const receipt_sha256 = try c.sha(try take(&map, "--expected-import-sha256"));
+            if (map.count() != 0) return error.UnknownArgument;
+            _ = try image.importer.load(a, init.io, state_dir, expected, receipt_sha256);
+            try emit(init, .{ .schema_version = @as(u8, 1), .scope = "public_local_import_only", .authority = "not_admitted", .attestation = "not_verified", .validated = true, .receipt_sha256 = try c.hex(a, receipt_sha256) }, false);
+            return 0;
+        }
+        const artifact_dir = try take(&map, "--artifact-dir");
+        if (map.count() != 0) return error.UnknownArgument;
+        const imported = image.importer.importPrepared(a, init.io, artifact_dir, state_dir, expected);
+        var output = (if (imported.succeeded()) std.Io.File.stdout() else std.Io.File.stderr()).writer(init.io, &.{});
+        try output.interface.writeAll(try imported.encode(a));
+        return if (imported.succeeded()) 0 else 1;
+    }
     if (std.mem.eql(u8, args[1], "prepare")) {
         const timeout = optional(&map, "--timeout") orelse "30";
         const input: c.Input = .{
