@@ -61,9 +61,9 @@ test "$(stat -c %h "${disk}")" -eq 1
 chmod 400 "${disk}"
 od -An -v -tu1 -j "${payload_bytes}" -N 512 "${disk}" > "${root}/footer.txt"
 awk -v capacity="${payload_bytes}" '
-  function integer(offset, length, result, i) {
+  function integer(offset, width, result, i) {
     result = 0
-    for (i = 0; i < length; i++) result = result * 256 + bytes[offset + i + 1]
+    for (i = 0; i < width; i++) result = result * 256 + bytes[offset + i + 1]
     return result
   }
   { for (i = 1; i <= NF; i++) bytes[++count] = $i }
