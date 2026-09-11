@@ -63,7 +63,7 @@ if [ "${baseline}" -ne 0 ]; then
   tail -n 60 "${root}/baseline.log"
   grep --fixed-strings --quiet 'MountNamespaceUnavailable' "${root}/baseline.log"
   test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
-  sudo journalctl --kernel --since "${started}" --no-pager --output=cat \
+  sudo journalctl -k --since "${started}" --no-pager --output=cat \
     > "${root}/kernel.log"
   grep --fixed-strings 'apparmor="DENIED"' "${root}/kernel.log" |
     grep --fixed-strings 'comm="uk-custody-test"' > "${root}/namespace-denial.log"
