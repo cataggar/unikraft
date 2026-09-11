@@ -277,3 +277,37 @@ test "integration driver detects unselected control publications without mutatin
     try t.expectError(error.UnexpectedControlFile, selection.requireControlInventory(&world, directory, &selected, &bound));
     try x.fs.requireTree(before.tree, (try x.fs.inventory(world.allocator, t.io, requests, 8, 1024)).tree);
 }
+
+test "integration driver binds receipt phase to the selected pipeline stage" {
+    inline for (std.meta.tags(x.c.Phase)) |expected| {
+        inline for (std.meta.tags(x.c.Phase)) |actual| {
+            if (actual == expected)
+                try x.requireReceiptPhase(actual, expected)
+            else
+                try t.expectError(error.InvalidPhase, x.requireReceiptPhase(actual, expected));
+        }
+    }
+}
+
+test "integration driver rejects data-only and absent compiler or engine executables" {
+    var tool: x.rt.Tool = .{
+        .role = .preparation,
+        .target = .aarch64_linux,
+        .origin = .{ .scheme = .git, .revision = "synthetic-material", .source_sha256 = hash.*, .producer_sha256 = hash.* },
+        .tree = .{ .files = 1, .bytes = 1, .sha256 = hash.* },
+        .executable = .{ .path = "bin/actor", .size = 1, .sha256 = hash.*, .mode = 0o700 },
+        .loader = null,
+        .libraries = &.{},
+    };
+    _ = try x.runtimeExecutable(tool, .preparation);
+    try t.expectError(error.InvalidRuntime, x.runtimeExecutable(tool, .zig));
+    tool.role = .zig;
+    _ = try x.runtimeExecutable(tool, .zig);
+    try t.expectError(error.InvalidRuntime, x.runtimeExecutable(tool, .preparation));
+    tool.executable = null;
+    try t.expectError(error.InvalidRuntime, x.runtimeExecutable(tool, .zig));
+    tool.role = .preparation;
+    try t.expectError(error.InvalidRuntime, x.runtimeExecutable(tool, .preparation));
+    tool.target = .data;
+    try t.expectError(error.InvalidRuntime, x.runtimeExecutable(tool, .preparation));
+}

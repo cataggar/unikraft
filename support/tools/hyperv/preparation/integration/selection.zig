@@ -94,6 +94,7 @@ pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
     if (!std.mem.eql(u8, spec.capability_receipt.path, "capability.receipt.json")) return error.InvalidCapabilityName;
     const receipts = try world.child(workspace, "receipts");
     const packaged = try world.read(p.receipts.Receipt, receipts, "packaged.receipt.json", null);
+    try x.requireReceiptPhase(packaged.value.phase, .packaged);
     try p.receipts.validate(packaged.value);
     try x.synthetic(packaged.value.guard);
     const package_directory = try world.child(workspace, "package");
@@ -124,7 +125,7 @@ pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
     const helper = root.value.binding.isolation.?.helper;
     try builder.runtime(.{ .directory = try world.open(helper.path), .contract = helper.contract }, "controls/namespace", false);
     const engine = if (spec.engine) |selected| try world.tool(selected) else actor;
-    if (engine.contract.role != .preparation) return error.InvalidRuntime;
+    _ = try x.runtimeExecutable(engine.contract, .preparation);
     try builder.runtime(engine, "controls/engine", false);
     for ([_][]const u8{ "requests", "reviews", "controls" }) |name|
         try builder.controlDirectory(try world.child(workspace, name), try std.fs.path.join(world.allocator, &.{ "controls", name }));

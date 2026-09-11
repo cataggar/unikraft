@@ -257,6 +257,7 @@ fn measure(world: *x.World, workspace: fs.Directory, phase: @FieldType(Command, 
         .generate, .importer => blk: {
             const record = try world.read(selection.Material, try world.child(workspace, "reserved-controls"), "selection.json", null);
             const selected = record.value;
+            const engine_executable = try x.runtimeExecutable(selected.engine.contract, .preparation);
             const assets = try selection.bindings(world, selected);
             const capability = try p.inputs.loadCapability(world.allocator, world.io, selected.plan, assets);
             var hashes: [4]x.Sha = undefined;
@@ -270,7 +271,7 @@ fn measure(world: *x.World, workspace: fs.Directory, phase: @FieldType(Command, 
                 .receipt_sha256 = hashes,
                 .execution_sha256 = [2]x.Sha{ selected.plan.publication.executions[0].sha256, selected.plan.publication.executions[1].sha256 },
                 .engine_runtime_sha256 = c.digest(try c.canonical(world.allocator, selected.engine.contract)),
-                .engine_executable_sha256 = selected.engine.contract.executable.?.sha256,
+                .engine_executable_sha256 = engine_executable.sha256,
                 .input_sha256 = if (phase == .importer)
                     (try world.read(p.inputs.Input, try world.child(workspace, "staging"), "input.json", null)).sha256
                 else

@@ -306,6 +306,12 @@ Every phase has a durable immutable attempt marker **before mutation**.
 Failure is not resumable or replayable. Do not delete markers, overwrite
 receipts, replace policies, or rerun against a changed config; retain failed
 evidence and establish a fresh independently reviewed workspace.
+Receipt content must have the phase required by its selected pipeline slot,
+not merely a valid receipt hash or the expected filename. Bootstrap material
+also passes the existing provenance/binding structural validators before use.
+Data-only or absent compiler/engine executables are refused explicitly before
+their executable fields can be used; these shape checks never replace native
+runtime or actual-process identity validation.
 
 Execution calls `Context.verify`, `publishBinding`, `runProducer`, `package`,
 `publish`, and `inputs.generate`, not root Make directly. Configure/build use
@@ -434,6 +440,23 @@ The whole preparation/migration is incomplete until that real producer-to-
 read-only-importer run succeeds; no original seed, historical receipt or cloud
 resource is needed or authorized by this driver.
 
+The concrete phase prerequisites are:
+
+| First blocked stage without its inputs | Required independent input or decision |
+| --- | --- |
+| `material` | Populated `requests/bootstrap.json`; complete native aliases, package/Bison/trust closures and origins; actual actor installation and facade lock; selected frozen Git checkout |
+| `stage ... configure` / configure execution | Exact `requests/expected.config` and separately approved execution/inspection digests, or parent-coordinated durable pending-execution API correction |
+| `selection` | Populated `requests/selection.json`; actual public capability image/receipt/native provenance, x86 QEMU, firmware and complete baked/additional controls |
+| `producer ... generate` / `importer` | Independent phase/import reviews and successful physical full-ledger/closure admission, including later publications |
+
+These are currently unsupplied integration prerequisites, not claimed failures
+from executing the full producer. A trusted Git runtime passing CI fixtures
+can be selected with its actual complete material/provenance; fixture success
+does not populate or approve the bootstrap recipe. Likewise, a separate
+public local-boot report is neither the required capability provenance
+contract nor preparer/host admission. Root CI fixture-cache canonicalization
+is parent-owned and is not reimplemented in this harness.
+
 ## Author's bounded execution record
 
 Only the standalone driver and its non-executing fixtures were compiled/run.
@@ -459,3 +482,12 @@ the two original binaries, not a complete integrated ledger or proof of fit.
 The author did not execute material bootstrap, guest/Make/native-image builds,
 packaging/generation/import against real produced artifacts, or any cloud
 operation; those remain the parent's exclusive integration execution.
+
+A subsequent harness-only stage-guard pass completed **14/14 fixtures and 8/8
+steps in both Debug and ReleaseSafe**, still with `-j2`, no skips and no full
+producer execution. Its fresh scratch is
+`.d/zig-migration-preparation/integration-gates-v1`, with the same focused
+commands and `output/{debug,release-safe}.log`. The added fixtures exercise
+every receipt-phase pairing and missing/wrong-role/data-only executable
+refusals without creating synthetic success receipts. The earlier binary
+sizes above are historical measurements, not sizes of this updated build.

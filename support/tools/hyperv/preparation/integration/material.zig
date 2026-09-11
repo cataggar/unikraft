@@ -8,11 +8,15 @@ const rt = x.rt;
 pub fn bundle(world: *x.World, workspace: fs.Directory, expected: ?x.Sha) !struct { value: x.Bundle, sha256: x.Sha } {
     const result = try world.read(x.Bundle, try world.child(workspace, "controls"), "bootstrap.json", expected);
     try x.synthetic(result.value.guard);
+    try p.provenance.validate(result.value.provenance);
+    try p.producer.validateBindingStructure(world.allocator, result.value.binding);
+    try p.source.require(result.value.binding.source, result.value.provenance.source);
     try result.value.binding.workspace.require(try x.ns.Identity.directory(workspace));
     return .{ .value = result.value, .sha256 = result.sha256 };
 }
 
 fn actor(world: *x.World, directory: []const u8, executable: []const u8, source: c.Source, compiler: rt.Bound) !rt.Bound {
+    const compiler_executable = try x.runtimeExecutable(compiler.contract, .zig);
     return world.tool(.{
         .directory = directory,
         .executable = executable,
@@ -20,7 +24,7 @@ fn actor(world: *x.World, directory: []const u8, executable: []const u8, source:
         .libraries = &.{},
         .role = .preparation,
         .target = compiler.contract.target,
-        .origin = .{ .scheme = .git, .revision = source.head, .source_sha256 = source.physical.sha256, .producer_sha256 = compiler.contract.executable.?.sha256 },
+        .origin = .{ .scheme = .git, .revision = source.head, .source_sha256 = source.physical.sha256, .producer_sha256 = compiler_executable.sha256 },
     });
 }
 
@@ -227,6 +231,7 @@ pub fn stage(world: *x.World, workspace: fs.Directory, phase: @FieldType(x.Stage
     const parent_phase: c.Phase = if (phase == .configure) .prepared else .configured;
     const parent_name = try std.fmt.allocPrint(world.allocator, "{s}.receipt.json", .{@tagName(parent_phase)});
     const parent = try world.read(p.receipts.Receipt, receipts, parent_name, null);
+    try x.requireReceiptPhase(parent.value.phase, parent_phase);
     try p.receipts.validate(parent.value);
     try x.synthetic(parent.value.guard);
     try fs.requireFile(execution.config, parent.value.config_after);

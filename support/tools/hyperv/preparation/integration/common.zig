@@ -95,6 +95,15 @@ pub fn synthetic(guard: p.config.Guard) !void {
     if (guard.sectors > 4096 or guard.lun != 0) return error.NonSyntheticInput;
 }
 
+pub fn requireReceiptPhase(actual: c.Phase, expected: c.Phase) !void {
+    if (actual != expected) return error.InvalidPhase;
+}
+
+pub fn runtimeExecutable(tool: rt.Tool, role: rt.Role) !c.File {
+    if (tool.role != role or tool.target == .data) return error.InvalidRuntime;
+    return tool.executable orelse error.InvalidRuntime;
+}
+
 pub fn inspectionBinding(binding: p.producer.Binding, expected: c.File) !p.producer.Binding {
     var result = binding;
     result.config = try inspectionConfig(binding.config, expected);
@@ -239,6 +248,7 @@ pub const World = struct {
     pub fn receipt(self: *World, directory: fs.Directory, phase: c.Phase, expected: Sha) !p.receipts.Link {
         const name = try std.fmt.allocPrint(self.allocator, "{s}.receipt.json", .{@tagName(phase)});
         const record = try self.read(p.receipts.Receipt, directory, name, expected);
+        try requireReceiptPhase(record.value.phase, phase);
         const result: p.receipts.Link = .{ .receipt = record.value, .sha256 = record.sha256 };
         try p.receipts.requireLink(self.allocator, result);
         return result;
