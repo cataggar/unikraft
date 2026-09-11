@@ -3,6 +3,21 @@
 #include <stddef.h>
 #include <uk/vmbus.h>
 #include <uk/event.h>
+#if PROOF_HEAP_SCHED
+typedef size_t __sz;
+typedef ptrdiff_t __ssz;
+typedef ptrdiff_t __off;
+typedef int64_t __s64;
+#define __NULL NULL
+#include <uk/alloc.h>
+#include <uk/plat/native/arch/ectx.h>
+_Static_assert(offsetof(struct uk_alloc, malloc) == 0, "malloc ABI");
+_Static_assert(offsetof(struct uk_alloc, calloc) == 8, "calloc ABI");
+_Static_assert(offsetof(struct uk_alloc, memalign) == 32, "memalign ABI");
+_Static_assert(offsetof(struct uk_alloc, free) == 40, "free ABI");
+_Static_assert(UK_PLAT_NATIVE_ECTX_SIZE == 2688, "reviewed ECTX footprint");
+_Static_assert(UK_PLAT_NATIVE_ECTX_ALIGN == 64, "reviewed ECTX alignment");
+#endif
 
 #ifndef PROOF_MAX_CPUS
 #define PROOF_MAX_CPUS 4
@@ -33,13 +48,29 @@ struct proof_thread;
 struct proof_sched {
 	void (*other[3])(struct proof_sched *, struct proof_thread *);
 	void (*wake)(struct proof_sched *, struct proof_thread *);
+#if PROOF_HEAP_SCHED
+	struct proof_thread *queue_first;
+	struct proof_thread **queue_tail;
+	struct uk_alloc *allocator;
+	struct proof_thread *worker;
+	struct proof_sched *next;
+#endif
 };
-struct proof_thread { long reserved; struct proof_sched *sched; };
+struct proof_thread {
+	long reserved;
+	struct proof_sched *sched;
+#if PROOF_HEAP_SCHED
+	struct proof_thread *next;
+#endif
+};
 static struct proof_sched proof_scheduler;
 static struct proof_thread proof_thread;
 static struct proof_sched *volatile published_sched;
 #else
-static void (*volatile wake_callback)(void);
+unsigned char proof_callback_storage[136] __attribute__((used, aligned(64)));
+extern void (*volatile wake_callback)(void) __attribute__((visibility("hidden")));
+__asm__(".set wake_callback, proof_callback_storage+64\n"
+	".type wake_callback, @object\n.size wake_callback, 8");
 #endif
 static volatile unsigned long proof_pending;
 static const struct vmbus_driver *volatile registered_driver;
@@ -163,8 +194,92 @@ FN void uk_plat_native_except_irq_handler(void)
 }
 
 #if PROOF_OBJECT_SCHED
+#if PROOF_HEAP_SCHED
+static unsigned char proof_arena[16384] __attribute__((aligned(64)));
+static size_t proof_allocated;
+FN void *proof_malloc(struct uk_alloc *a, size_t size)
+{
+	(void)a;
+	if (size > sizeof(proof_arena) - 15)
+		return NULL;
+	size = (size + 15) & ~(size_t)15;
+	if (size > sizeof(proof_arena) - proof_allocated)
+		return NULL;
+	void *result = proof_arena + proof_allocated;
+	proof_allocated += size;
+	return result;
+}
+FN void *proof_calloc(struct uk_alloc *a, size_t count, size_t size)
+{
+	if (__builtin_mul_overflow(count, size, &size))
+		return NULL;
+	unsigned char *result = proof_malloc(a, size);
+	if (result)
+		for (size_t i = 0; i < size; i++)
+			result[i] = 0;
+	return result;
+}
+FN void proof_free(struct uk_alloc *a, void *pointer)
+{
+	(void)a;
+	(void)pointer;
+}
+static struct uk_alloc proof_allocator = {
+	.malloc = proof_malloc, .calloc = proof_calloc, .free = proof_free,
+};
+struct proof_sched *uk_sched_head;
+static struct proof_sched *volatile proof_cpu_map[2];
+_Static_assert(offsetof(struct proof_sched, other[1]) == 8, "thread_add member ABI");
+_Static_assert(offsetof(struct proof_sched, wake) == 24, "consumer fixture field");
+_Static_assert(offsetof(struct proof_sched, queue_first) == 32, "queue fixture field");
+FN void proof_sched_map(struct proof_sched *sched, unsigned int cpu)
+{
+	if (cpu > 1)
+		return;
+	proof_cpu_map[cpu] = sched;
+}
+FN struct proof_thread *proof_thread_allocate(struct uk_alloc *a,
+					     struct proof_sched *sched)
+{
+	struct proof_thread *thread = a->malloc(a, sizeof(*thread));
+	if (thread) {
+		thread->sched = sched;
+		thread->next = NULL;
+	}
+	return thread;
+}
+FN void proof_thread_add(struct proof_sched *sched, struct proof_thread *thread)
+{
+	*sched->queue_tail = thread;
+	sched->queue_tail = &thread->next;
+}
+FN void proof_heap_hook(struct proof_sched *sched, struct proof_thread *thread)
+{
+	__asm__ volatile("" : : "r"(sched), "r"(thread) : "memory");
+}
+FN void proof_heap_preserve(struct proof_sched *sched, struct proof_thread *thread)
+{
+	(void)thread;
+	sched->other[0] = NULL;
+}
+FN void proof_heap_overwrite(struct proof_sched *sched, struct proof_thread *thread)
+{
+	(void)thread;
+	sched->wake = NULL;
+}
+static void (*volatile proof_heap_refs[])(struct proof_sched *, struct proof_thread *) = {
+	proof_heap_preserve, proof_heap_overwrite,
+};
+#endif
 FN void uk_sched_register(struct proof_sched *sched)
 {
+#if PROOF_HEAP_SCHED
+	struct proof_sched **tail = &uk_sched_head;
+	while (*tail)
+		tail = &(*tail)->next;
+	*tail = sched;
+	sched->next = NULL;
+#endif
 	published_sched = sched;
 }
 FN struct proof_sched *proof_sched_allocate(void)
@@ -177,6 +292,43 @@ FN void proof_sched_initialize(struct proof_sched *sched,
 	sched->wake = callback;
 	uk_sched_register(sched);
 }
+#if PROOF_HEAP_SCHED
+FN struct proof_sched *schedcoop_create(struct uk_alloc *a)
+{
+	struct proof_sched *sched = a->calloc(a, 1, sizeof(*sched));
+	if (!sched)
+		return NULL;
+	sched->allocator = a;
+	sched->queue_first = NULL;
+	sched->queue_tail = &sched->queue_first;
+	sched->other[1] = proof_thread_add;
+	proof_sched_initialize(sched, schedcoop_thread_woken_isr);
+	proof_sched_map(sched, proof_fail & 1);
+	struct proof_thread *thread = proof_thread_allocate(a, sched);
+	if (!thread) {
+		a->free(a, sched);
+		return NULL;
+	}
+	sched->worker = thread;
+	sched->other[1](sched, thread);
+	proof_heap_hook(sched, thread);
+	return sched;
+}
+FN struct proof_sched *uk_schedcoop_create(struct uk_alloc *a, struct uk_alloc *sa,
+					  struct uk_alloc *aux, struct uk_alloc *tls)
+{
+	(void)sa;
+	(void)aux;
+	(void)tls;
+	return schedcoop_create(a);
+}
+__attribute__((naked)) struct proof_sched *uk_schedcoop_create_on(
+	struct uk_alloc *a, struct uk_alloc *sa, struct uk_alloc *aux,
+	struct uk_alloc *tls)
+{
+	__asm__ volatile("jmp schedcoop_create");
+}
+#else
 FN struct proof_sched *schedcoop_create(void)
 {
 	struct proof_sched *sched = proof_sched_allocate();
@@ -193,18 +345,26 @@ __attribute__((naked)) struct proof_sched *uk_schedcoop_create_on(void)
 {
 	__asm__ volatile("jmp schedcoop_create");
 }
+#endif
 #else
+FN void proof_callback_hook(void)
+{
+	__asm__ volatile("");
+}
+
 FN void schedcoop_create(void)
 {
 	if (proof_fail)
 		proof_counter++;
 	wake_callback = schedcoop_thread_woken_isr;
+	proof_callback_hook();
 }
 
 FN void uk_schedcoop_create(void)
 {
 #if PROOF_DIRECT_SCHED
 	wake_callback = schedcoop_thread_woken_isr;
+	proof_callback_hook();
 #else
 	schedcoop_create();
 #endif
@@ -316,17 +476,63 @@ VMBUS_DRIVER_REGISTER(&storvsc_driver);
 #define __LIBNAME__ libnetvsc
 VMBUS_DRIVER_REGISTER(&netvsc_driver);
 
+#define REGISTER_IMUL(name, factor) \
+	__attribute__((naked)) void name(void) \
+	{ \
+		__asm__ volatile("leaq storvsc_driver(%rip), %rdi\n" \
+				 "imulq $" factor ", %rdi, %rdi\n" \
+				 "callq _vmbus_register_driver\nretq"); \
+	}
+REGISTER_IMUL(proof_imul_one, "1")
+REGISTER_IMUL(proof_imul_zero, "0")
+
+#if !PROOF_OBJECT_SCHED
+#define VECTOR_STORE(name, zero, store, offset) \
+	__attribute__((naked)) void name(void) \
+	{ \
+		__asm__ volatile(zero "\n" store ", wake_callback" offset "(%rip)\nretq"); \
+	}
+VECTOR_STORE(proof_xmm_before, "pxor %xmm0, %xmm0", "movdqu %xmm0", "-16")
+VECTOR_STORE(proof_xmm_overlap, "pxor %xmm0, %xmm0", "movdqu %xmm0", "-15")
+VECTOR_STORE(proof_ymm_before, "vpxor %ymm0, %ymm0, %ymm0", "vmovdqu %ymm0", "-32")
+VECTOR_STORE(proof_ymm_overlap, "vpxor %ymm0, %ymm0, %ymm0", "vmovdqu %ymm0", "-24")
+VECTOR_STORE(proof_ymm_exact, "vpxor %ymm0, %ymm0, %ymm0", "vmovdqu %ymm0", "")
+VECTOR_STORE(proof_ymm_after, "vpxor %ymm0, %ymm0, %ymm0", "vmovdqu %ymm0", "+8")
+VECTOR_STORE(proof_zmm_before, "vpxord %zmm0, %zmm0, %zmm0", "vmovdqu64 %zmm0", "-64")
+VECTOR_STORE(proof_zmm_overlap, "vpxord %zmm0, %zmm0, %zmm0", "vmovdqu64 %zmm0", "-56")
+VECTOR_STORE(proof_zmm_after, "vpxord %zmm0, %zmm0, %zmm0", "vmovdqu64 %zmm0", "+8")
+#endif
+static void (*volatile proof_transform_refs[])(void) = {
+	proof_imul_one, proof_imul_zero,
+#if !PROOF_OBJECT_SCHED
+	proof_xmm_before, proof_xmm_overlap, proof_ymm_before,
+	proof_ymm_overlap, proof_ymm_exact, proof_ymm_after,
+	proof_zmm_before, proof_zmm_overlap, proof_zmm_after,
+#endif
+};
+
 FN void _start(void)
 {
+	if (proof_fail)
+		proof_transform_refs[0]();
 	uk_boot_entry();
 	uk_lcpu_init();
 	ukplat_time_init();
-#if PROOF_OBJECT_SCHED
+#if PROOF_HEAP_SCHED
+	if (proof_fail)
+		proof_heap_refs[0](&proof_scheduler, &proof_thread);
+	proof_thread.sched = uk_schedcoop_create(&proof_allocator, &proof_allocator,
+					       &proof_allocator, &proof_allocator);
+	uk_schedcoop_create_on(&proof_allocator, &proof_allocator,
+			       &proof_allocator, &proof_allocator);
+#elif PROOF_OBJECT_SCHED
 	proof_thread.sched = uk_schedcoop_create();
 #else
 	uk_schedcoop_create();
 #endif
+#if !PROOF_HEAP_SCHED
 	uk_schedcoop_create_on();
+#endif
 	uk_plat_native_except_irq_handler();
 	lcpu_halt();
 	__builtin_trap();

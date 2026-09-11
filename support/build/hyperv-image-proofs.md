@@ -41,7 +41,11 @@ constructor, and event macros, with compile-time pointer/descriptor ABI
 assertions. The Zig object retains actual protocol getter exports and GUID
 constants from `vmbus_protocol.zig`. Both object format/symbols and final linked
 bytes are inspected; relocatable objects are refused as final-image proofs.
-No Python generator, oracle, proof executor, or install hook is involved.
+The allocator fixture also includes the actual `uk/alloc.h` and native ECTX
+header, checks their pointer offsets/size/alignment, and uses a real bounded
+bump allocator. Native unit tests and the complete linked-fixture matrix run
+against both Debug and ReleaseSafe proof executables. No Python generator,
+oracle, proof executor, or install hook is involved.
 
 | Legacy assertion / added byte evidence | Native coverage |
 | --- | --- |
@@ -55,6 +59,11 @@ No Python generator, oracle, proof executor, or install hook is involved.
 | Every present scheduler constructor binds the ISR callback | Actual direct store, allocated-object shared initializer, call/tail-wrapper and nullable return fixtures; missing, individually unbound, cyclic and unresolved wrapper refusals |
 | Actual destination and object, not merely callback materialization | Consumer-derived global slot or object field; displacement-only redirection to `registered_driver`, wrong object field and bypassed initializer store all fail |
 | Callback facts survive only valid register/memory operations | Full-width immediate/register stores, copies, stack spills, partial/unary/exchange writes, caller/callee-saved effects; overlapping stores and escaped-stack writes invalidate facts and publication |
+| Every operand and implicit GP write participates in provenance | Real LLVM `imulq $0, %rdi, %rdi` registration refusal and `$1` positive case; numeric multiplication, MUL/DIV/CPUID/RDTSCP and unknown-operation units |
+| Constructor vector stores use their actual footprint | Real XMM16/YMM32/ZMM64 boundary fixtures, including YMM at callback-minus-24, ZMM at callback-minus-56, exact-slot and non-overlap cases; scalar SSE widths and merge-mask uncertainty units |
+| SMP map/queue/worker effects preserve the published object | Heap constructor, bounded two-CPU map, retained tail pointer, independent thread allocation and actual indirect `thread_add` member at offset 8; map/queue redirection and helper/method overwrites refuse |
+| Partial values, flags and stack slots cannot manufacture bindings | Narrow pointer-load, partial scalar/null return, CMPXCHG flag, compare-snapshot, CALL return-address and masked-vector stack-argument regressions |
+| Registered-list and initial-image facts survive only justified writes | Current/previous scheduler callback protection, partial/unknown list-link refusal, dirty constant ranges and non-resurrection cases |
 | Three SynIC/pending callbacks are registered on reachable paths | Must-provenance at each SysV RDI/RSI call site; removed materialization and jump-only bypass fail; valid branch joins and loop-invariant arguments pass |
 | Exactly the reviewed native IRQ event handler | Actual retained event pointer, missing/extra handler entries, and changed pointer refusals |
 | Follow linked calls, tail/local branches, aliases and interior-label fallthrough | ELF function extents, not objdump label blocks; adding only an interior ELF symbol cannot hide unchanged executed SIMD bytes; valid interior labels pass |
@@ -88,6 +97,11 @@ joins. Unreachable materialization is never used, and every reachable
 registration call must have an allowed argument. Full-width pointer null tests
 refine both register and spilled aliases; narrow tests and clobbered flags do
 not establish a null object. Unknown or unsupported control flow is refused.
+Comparison facts describe the operands at the comparison, not a later value
+in the same register. CMPXCHG does not borrow ordinary CMP semantics. Opcode
+classification parses all operands; unsupported forms cannot retain stale
+argument provenance. Partial integers are not full-width ABI lengths or null
+return values, and narrow memory loads never preserve complete pointers.
 
 `hyperv-proof-binding.zig` derives the callback location from the actual
 `uk_thread_wake_isr` indirect load/call. The object form requires a scheduler
@@ -109,6 +123,69 @@ copies/spills, tail wrappers, and allocation-failure returns are exercised.
 Overwrites invalidate publication even for spilled aliases or nullable helper
 summaries. Separate untracked memory loads are not assumed to return the same
 object; repeated allocation sites inside constructor call cycles are refused.
+
+### SMP constructor memory effects
+
+Constructor helpers use the separate bounded path analysis in
+`hyperv-proof-paths.zig`, retaining allocation/error alternatives instead of
+merging them into a success-shaped object. Direct helpers are analyzed, not
+selected merely because they mention a callback symbol. CALL writes its real
+return address; caller-relative stack arguments and callee-local frame cleanup
+remain distinct. Known unmasked vector zeroes can initialize stack arguments;
+merge-masked XOR cannot manufacture zero-valued arguments.
+
+The entry contract is the selected cooperative-scheduler startup ABI: the
+four allocator arguments are valid allocator objects, as supplied by
+`lib/ukboot/{boot,smp}.c`. This is not a claim about calls with invalid/null
+allocator arguments or arbitrary runtime inputs. Allocations themselves remain
+nullable. Only calls through the matching `struct uk_alloc` receiver establish
+fresh storage: malloc/calloc/memalign/free at offsets 0/8/32/40. Sizes, counts,
+alignment and memory-helper lengths require complete scalar evidence.
+Arbitrary call results do not acquire allocator freshness.
+
+Fresh objects are separate from allocated ELF globals and other fresh
+allocations only for bounded, in-object accesses. Member values are retained,
+including queue tail pointers, allocator fields and the actual stored
+`thread_add` function pointer. Indexed global writes require a bounded index
+and a sized allocated ELF object covering the entire write. Known disjoint
+heap writes do not erase caller stack arguments just because another stack
+value escaped; unknown writes still invalidate exposed facts.
+
+Registration also analyzes the existing scheduler-list path. A bounded
+abstract set represents valid previously registered schedulers and the
+current scheduler, not an exact pointer identity. The next-field offset is
+derived from the actual registration body's null store, must lie after the
+consumer-derived callback, and must fit the fresh object. Every registration
+instruction is still analyzed. Writes into any represented node's callback
+are refused, as are partial or unproven next-pointer writes. A list link can
+only retain this abstraction when assigned a full null pointer, the current
+scheduler, or the validated list set. This models the selected heap-allocated
+cooperative-scheduler list, not arbitrary foreign/dangling registrations.
+
+The SMP case requires several narrow, reviewed C API effect contracts:
+
+| Contract | Required evidence and modeled effects |
+| --- | --- |
+| `memset`, `memcpy`, `memmove` and ISR copy/set variants | Strong symbol, complete bounded length; invalidate the entire destination range and return its post-write pointer facts |
+| `uk_plat_native_ectx_init` | Strong symbol; fresh allocation, 64-byte guaranteed alignment, full 2688-byte worst-case footprint in bounds; invalidate that whole range |
+| Returning `_uk_printk` | Strong symbol, unchanged allocated read-only format, supported non-writing conversions; reject `%n`, positional/unknown conversions and incomplete formats; caller-owned memory is not an output |
+
+These contracts rely on the approved implementations and valid C API/allocator
+invariants; they are not independent correctness proofs of libc, the allocator
+backend, the logger, or XSAVE initialization. Their sources are
+`lib/ukalloc/include/uk/alloc.h`, `lib/ukprint/print.c`, the memory APIs, and
+`plat/native/arch/x86_64/{ectx.c,include/uk/plat/native/arch/ectx.h}`. The ECTX
+maximum covers the source's supported XSAVE layouts and smaller fallback save
+formats. Unknown helpers/writes do not gain these contracts. The IRQ graph's
+separate FP/SIMD prohibition is unchanged, including returning logging.
+
+Untouched read-only data and exact RELATIVE relocations provide initial
+constant evidence, including TLS pointers folded into `.data` rather than a
+separate `.got`. Overlapping writes and unknown effects invalidate it; partial
+reads overlapping pointer relocations do not invent relocated scalar values.
+The real parent SMP image now exercises TLS/context initialization, the
+previously failing CPU-map and tail-queue writes, thread allocation and the
+resolved `thread_add` call. This remains linked-image evidence, not execution.
 
 The parent acceptance ELF's former `ukplat_time_init` error actually occurred
 in `uk_intctlr_irq_handle`: LLVM printed `f0 lock` at `0x12ca40` separately
@@ -147,20 +224,23 @@ wrapped instruction bytes. Configured native decoders remain trusted toolchain
 inputs, not an independent instruction decoder. Register proofs deliberately
 fail when required provenance cannot be established. They support modeled
 full-width copies, object-relative/RIP-relative addressing, unescaped spills,
-and must-facts across joins, not arbitrary alias analysis, heap lifetime
-proofs, or arbitrary calling conventions. Constructor-only vector writes do
-not spuriously clobber GP registers, but overlapping memory writes invalidate
-callback facts; this does not authorize vector state in the IRQ graph.
+and must-facts across joins, not arbitrary alias analysis, general heap
+lifetime proofs, or arbitrary calling conventions. Constructor-only vector
+writes use their full XMM/YMM/ZMM or scalar footprint, without spuriously
+clobbering GP registers. Overlap invalidates callback facts; this does not
+authorize vector state in the IRQ graph.
 PIE callback/argument evidence must retain a full-width position-independent
 address: absolute immediates and narrowed register copies are not accepted.
 The selected non-LTO C ABI is SysV x86-64, with the reviewed scheduler
 publication contract above. Analysis is capped at 8,192 instructions per
 function, 131,072 state transfers (also shared across constructor summaries),
-48 tracked memory cells, two load levels, 16 helper levels, 256 call contexts,
-8,192 call-hook operations, 32 candidate-closure rounds, 16,384 normalized
-functions, and 131,072 visited IRQ PCs. Recursive helpers, constructor
+192 tracked memory cells, 64 initial-constant write ranges, two ordinary load
+levels, 16 helper levels, 256 call contexts, 8,192 call-hook operations,
+2,048 constructor states per function, 512 pending constructor states,
+16-MiB allocation/memory-helper extents, 16,384 normalized functions, and
+131,072 visited IRQ PCs. Recursive helpers, constructor
 call-containing cycles, conditional exits beyond function extents, indirect
-tail transfers in provenance analysis, and exhausted bounds explicitly fail.
+transfers whose targets cannot be resolved, and exhausted bounds explicitly fail.
 These conservative restrictions are not silent skips or boot evidence.
 Embedded real-mode bootstrap code,
 GDT bytes, and the post-paging far-transfer suffix are not certified as IRQ

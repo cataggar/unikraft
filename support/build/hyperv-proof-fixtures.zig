@@ -217,9 +217,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[6], "fixed")) {
         try mutations(&fixture);
         try reviewRegressions(&fixture);
+        try operandRegressions(&fixture);
         try processCases(&fixture, args[0], image_path, nm_text, dump);
     }
+
     if (std.mem.eql(u8, args[6], "fixed-object")) try objectRegressions(&fixture);
+    if (std.mem.eql(u8, args[6], "fixed-heap")) try heapRegressions(&fixture);
     if (std.mem.eql(u8, args[6], "single"))
         try fixture.cli(&.{ "smp", "--image", image_path, "--max-cpus", "2", "--nm", nm, "--objdump", objdump }, 1, null);
     const report = try std.fmt.allocPrint(allocator, "PASS: {s}: {d} native CLI cases; real C/Zig object + linked ELF, never executed as a guest\n", .{ args[6], fixture.cases });
@@ -227,6 +230,76 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
 }
 
+fn heapRegressions(f: *Fixture) !void {
+    const hook = try f.edge("schedcoop_create", "proof_heap_hook");
+    for ([_][]const u8{ "proof_heap_preserve", "proof_heap_overwrite" }, [_]u8{ 0, 1 }) |name, status| {
+        const bytes = try f.edit();
+        try f.redirect(bytes, hook, try f.model.address(name));
+        const path = try f.save(name, bytes);
+        try f.check(path, "irq", status, if (status == 1) "MissingSchedulerCallbackBinding" else null);
+    }
+    var maps: usize = 0;
+    for (try f.model.body("proof_sched_map")) |instruction| {
+        const pair = flow.pair(instruction) orelse continue;
+        if (!std.mem.eql(u8, instruction.op, "movq") or !std.mem.eql(u8, pair[0], "%rdi") or std.mem.indexOfScalar(u8, pair[1], '(') == null) continue;
+        try std.testing.expect(instruction.size >= 4);
+        const bytes = try f.edit();
+        const offset = try f.at(instruction.address, instruction.size);
+        @memset(bytes[offset..][0..instruction.size], 0x90);
+        @memcpy(bytes[offset..][0..4], &[_]u8{ 0x48, 0x89, 0x7f, 0x18 });
+        try f.refuse("cpu-map-store-redirected-into-callback", bytes, "irq", "MissingSchedulerCallbackBinding");
+        maps += 1;
+    }
+    try std.testing.expectEqual(1, maps);
+    var queues: usize = 0;
+    var methods: usize = 0;
+    for (try f.model.body("schedcoop_create")) |instruction| {
+        const pair = flow.pair(instruction) orelse continue;
+        const queue_lea = std.mem.eql(u8, instruction.op, "leaq") and std.mem.startsWith(u8, pair[0], "0x20(");
+        const queue_add = std.mem.eql(u8, instruction.op, "addq") and assembly.immediate(pair[0]) == 32;
+        if (queue_lea or queue_add) {
+            const bytes = try f.edit();
+            const displacement = try f.at(instruction.address + instruction.size - 1, 1);
+            try std.testing.expectEqual(0x20, bytes[displacement]);
+            bytes[displacement] = 0x18;
+            try f.refuse("queue-member-redirected-into-callback", bytes, "irq", "MissingSchedulerCallbackBinding");
+            queues += 1;
+        }
+        if (std.mem.eql(u8, instruction.op, "leaq") and instruction.reference() == try f.model.address("proof_thread_add")) {
+            const bytes = try f.edit();
+            const delta: i32 = @intCast(@as(i128, try f.model.address("proof_heap_overwrite")) - instruction.address - instruction.size);
+            std.mem.writeInt(i32, bytes[try f.at(instruction.address + instruction.size - 4, 4)..][0..4], delta, .little);
+            try f.refuse("thread-add-member-resolves-overwriting-helper", bytes, "irq", "MissingSchedulerCallbackBinding");
+            methods += 1;
+        }
+    }
+    try std.testing.expectEqual(1, queues);
+    try std.testing.expectEqual(1, methods);
+}
+
+fn operandRegressions(f: *Fixture) !void {
+    for ([_][]const u8{ "proof_imul_one", "proof_imul_zero" }, [_]u8{ 0, 1 }) |name, status| {
+        const bytes = try f.edit();
+        const body = (try f.model.symbol(name)).header;
+        const constructor = try f.symbolOffset("libstorvsc_vmbus_register_driver");
+        std.mem.writeInt(u64, bytes[constructor + 8 ..][0..8], body.st_value, .little);
+        std.mem.writeInt(u64, bytes[constructor + 16 ..][0..8], body.st_size, .little);
+        try f.pointer(bytes, try f.model.address("__uk_ctortab1_libstorvsc_vmbus_register_driver"), body.st_value);
+        const path = try f.save(name, bytes);
+        try f.check(path, "drivers", status, if (status == 1) "DriverArgumentMismatch" else null);
+    }
+    const hook = try f.edge("schedcoop_create", "proof_callback_hook");
+    for ([_][]const u8{
+        "proof_xmm_before",  "proof_xmm_overlap", "proof_ymm_before",
+        "proof_ymm_overlap", "proof_ymm_exact",   "proof_ymm_after",
+        "proof_zmm_before",  "proof_zmm_overlap", "proof_zmm_after",
+    }, [_]u8{ 0, 1, 0, 1, 1, 0, 0, 1, 0 }) |name, status| {
+        const bytes = try f.edit();
+        try f.redirect(bytes, hook, try f.model.address(name));
+        const path = try f.save(name, bytes);
+        try f.check(path, "irq", status, if (status == 1) "MissingSchedulerCallbackBinding" else null);
+    }
+}
 fn interiorLabel(f: Fixture, bytes: []u8, name: []const u8, address: u64) !void {
     const item = try f.model.symbol(name);
     const offset = try f.symbolOffset("proof_ctor_writable");

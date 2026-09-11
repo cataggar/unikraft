@@ -52,6 +52,128 @@ fn controls() [8]Instruction {
     };
 }
 
+test "narrow pointer loads and partial scalars cannot supply full ABI values" {
+    var initial = flow.State.entry(1);
+    initial.regs[3] = .{ .kind = .heap, .id = 1, .size = 128 };
+    try initial.store(initial.regs[3].plus(16), .{ .kind = .address, .id = 0x1234 }, 8, .{ .field = 16 });
+    for ([_][]const u8{ "movzbq", "movzwq", "movl", "movzbl" }) |op| {
+        var result = try trace(&.{instruction(op, if (std.mem.eql(u8, op, "movl") or std.mem.eql(u8, op, "movzbl")) "16(%rbx), %edi" else "16(%rbx), %rdi")}, initial, .{ .field = 16 });
+        defer result.deinit();
+        try std.testing.expect(!result.analysis.after[0].regs[7].addressIs(0x1234, true));
+    }
+    initial.regs[2] = .{ .kind = .integer, .bits = 8 };
+    try std.testing.expect(!initial.regs[2].isZero());
+    try std.testing.expectEqual(.unknown, flow.source(initial, instruction("callq", ""), "%rdx").kind);
+    for ([_]Instruction{ instruction("andq", "$0xffff, %rdx"), instruction("addq", "$0, %rdx") }) |arithmetic| {
+        var result = try trace(&.{arithmetic}, initial, .none);
+        defer result.deinit();
+        try std.testing.expect(!result.analysis.after[0].regs[2].isZero());
+    }
+    initial.regs[0] = .{ .kind = .integer, .id = 0x2000 };
+    initial.regs[2] = .{ .kind = .integer, .id = 0x2000, .depth = 1 };
+    try std.testing.expectEqual(.unknown, flow.source(initial, instruction("movq", ""), "(%rax)").kind);
+    try std.testing.expectEqual(.unknown, flow.source(initial, instruction("callq", ""), "%rdx").kind);
+}
+
+test "CMPXCHG does not borrow CMP flags and CALL overwrites reused stack slots" {
+    var changed = try trace(&.{
+        instruction("movq", "$1, %rax"),     instruction("movq", "$2, %rbx"),
+        instruction("movq", "$2, %rcx"),     instruction("cmpxchgq", "%rbx, %rcx"),
+        instruction("jne", "7 <reachable>"), instruction("ud2", ""),
+        instruction("nop", ""),
+    }, flow.State.entry(1), .none);
+    defer changed.deinit();
+    try std.testing.expect(changed.analysis.seen[6]);
+    const initial = flow.State.entry(1);
+    var calls = try trace(&.{
+        instruction("leaq", "0x1232(%rip), %rdi"), instruction("pushq", "%rdi"),
+        instruction("popq", "%rdi"),               instruction("callq", "10 <helper>"),
+    }, initial, .none);
+    defer calls.deinit();
+    try std.testing.expect(calls.analysis.after[3].get(initial.regs[4].plus(-8)).addressIs(5, true));
+}
+
+test "list links and merge-masked vector results remain conservative" {
+    const cursor: flow.Value = .{ .kind = .scheduler_list, .id = 42, .size = 160, .link = 152 };
+    for ([_]flow.Value{ .{}, .{ .kind = .integer, .bits = 8 }, .{ .kind = .address, .id = 0x1234 } }) |bad| {
+        var state: flow.State = .{};
+        try std.testing.expectError(error.InvalidSchedulerListLink, state.store(cursor.plus(152), bad, 8, .{ .field = 40 }));
+    }
+    var state: flow.State = .{};
+    try std.testing.expectError(error.InvalidSchedulerListLink, state.store(cursor.plus(153), .{ .kind = .integer }, 1, .{ .field = 40 }));
+    var masked = try trace(&.{
+        instruction("vpxord", "%zmm0, %zmm0, %zmm0 {%k1}"),
+        instruction("vmovdqu64", "%zmm0, 16(%rsp)"),
+        instruction("movq", "16(%rsp), %rdx"),
+    }, flow.State.entry(1), .none);
+    defer masked.deinit();
+    try std.testing.expect(!masked.analysis.after[2].regs[2].isZero());
+}
+
+test "flags are snapshots and multioperand arithmetic cannot retain stale comparisons" {
+    var narrow = try trace(&.{
+        instruction("movl", "$0xffffffff, %eax"), instruction("cmpl", "$-1, %eax"),
+        instruction("je", "5 <taken>"),           instruction("ud2", ""),
+        instruction("nop", ""),
+    }, .{}, .none);
+    defer narrow.deinit();
+    try std.testing.expect(narrow.analysis.seen[4]);
+    try std.testing.expect(!narrow.analysis.seen[3]);
+    var snapshot = try trace(&.{
+        instruction("movl", "$2, %eax"), instruction("cmpl", "$1, %eax"),
+        instruction("movl", "$0, %eax"), instruction("jne", "6 <taken>"),
+        instruction("ud2", ""),          instruction("nop", ""),
+    }, .{}, .none);
+    defer snapshot.deinit();
+    try std.testing.expect(snapshot.analysis.seen[5]);
+    try std.testing.expect(!snapshot.analysis.seen[4]);
+    var changed_flags = try trace(&.{
+        instruction("movl", "$2, %eax"),        instruction("cmpl", "$1, %eax"),
+        instruction("imulq", "$0, %rdi, %rdi"), instruction("je", "6 <possible>"),
+        instruction("ud2", ""),                 instruction("nop", ""),
+    }, .{}, .none);
+    defer changed_flags.deinit();
+    try std.testing.expect(changed_flags.analysis.seen[5]);
+}
+
+test "zeroed vector stack arguments survive disjoint allocated member writes" {
+    var initial = flow.State.entry(1);
+    initial.regs[3] = .{ .kind = .heap, .id = 99, .size = 128 };
+    initial.escaped_stack = true;
+    var result = try trace(&.{
+        instruction("xorps", "%xmm0, %xmm0"), instruction("movups", "%xmm0, 16(%rsp)"),
+        instruction("movq", "$0, 40(%rbx)"),  instruction("movq", "24(%rsp), %rax"),
+    }, initial, .{ .field = 40 });
+    defer result.deinit();
+    try std.testing.expect(result.analysis.after[3].regs[0].isZero());
+    initial.regs[0] = .{ .kind = .integer, .id = 8 };
+    const location = flow.memory(initial, instruction("lea", ""), "(%rax,%rbx)");
+    try std.testing.expect(location.samePointer(initial.regs[3].plus(8)));
+}
+
+test "registered list nodes protect all callback slots and never regain overwritten constants" {
+    const object: flow.Value = .{ .kind = .heap, .id = 42, .size = 256 };
+    const cursor: flow.Value = .{ .kind = .scheduler_list, .id = 42, .size = 160, .link = 152 };
+    var state: flow.State = .{};
+    try state.store(object.plus(40), .{ .kind = .address, .id = 0x1234 }, 8, .{ .field = 40 });
+    try state.store(cursor.plus(152), object, 8, .{ .field = 40 });
+    try std.testing.expect(state.get(object.plus(40)).addressIs(0x1234, true));
+    try std.testing.expectError(error.InvalidRegisteredSchedulerWrite, state.store(cursor.plus(40), .{}, 8, .{ .field = 40 }));
+    try std.testing.expect(!cursor.samePointer(cursor));
+    const constant: flow.Value = .{ .kind = .address, .id = 0x2000 };
+    try std.testing.expect(state.canReadInitial(constant, 8));
+    try state.store(constant.plus(-1), .{}, 2, .none);
+    try std.testing.expect(!state.canReadInitial(constant, 8));
+    try std.testing.expect(state.canReadInitial(constant.plus(8), 8));
+}
+
+test "reviewed logging formats cannot write through percent n or unknown conversions" {
+    const check = @import("hyperv-proof-binding.zig").printFormat;
+    try check("scheduler %p: %08x %llu %.3s %%n");
+    for ([_][]const u8{ "%n", "%hn", "%lln", "%1$n", "%q", "%" }) |format|
+        try std.testing.expectError(error.UnprovenPrintFormat, check(format));
+}
+
 test "IRQ register and implicit state families include x87 MMX SSE AVX mask and tile state" {
     for ([_][]const u8{ "%xmm0", "%xmm31", "%ymm15", "%zmm31", "%mm7", "%st", "%st(0)", "%st(7)", "%k0", "%k7", "%tmm0" }) |reg| {
         try std.testing.expect(proofs.forbiddenRegisters(instruction("movq", reg)));
@@ -111,8 +233,7 @@ test "callback bindings require actual full-width stores and track register clob
         instruction("popq", "%rdi"),            instruction("xchgq", "%rdi, %rax"),
         instruction("xaddq", "%rdi, %rax"),     instruction("movw", "$0, %di"),
         instruction("callq", "0x10 <clobber>"), instruction("cmpxchgq", "%rsi, %rdi"),
-        instruction("movsq", "(%rsi), (%rdi)"), instruction("unmodeled", ""),
-        instruction("cpuid", ""),               instruction("popcntq", "%rax, %rdi"),
+        instruction("movsq", "(%rsi), (%rdi)"), instruction("popcntq", "%rax, %rdi"),
     }) |clobber| {
         try std.testing.expect(!try stored(&.{ materialize, clobber, store }, true));
     }
@@ -121,6 +242,7 @@ test "callback bindings require actual full-width stores and track register clob
         instruction("callq", "0x10 <other>"), instruction("movq", "%r12, 0x10(%rbx)"),
     }, true));
     const narrow = [_]Instruction{ materialize, instruction("movl", "%edi, %edi"), store };
+    try std.testing.expectError(error.UnsupportedProvenanceInstruction, stored(&.{ materialize, instruction("unmodeled", ""), store }, true));
     try std.testing.expect(!try stored(&narrow, true));
     var result = try trace(&.{
         instruction("movabsq", "$0xffffffffffffffff, %rax"),
@@ -146,6 +268,7 @@ test "CFG rejects skipped materialization and meets every predecessor at a call"
         try std.testing.expect(!result.analysis.before[3].regs[7].addressIs(0x1234, true));
         try std.testing.expectEqual(!std.mem.eql(u8, op, "jmp"), result.analysis.seen[1]);
     }
+
     var result = try trace(&.{
         instruction("jne", "3 <join>"),            instruction("nop", ""),
         instruction("leaq", "0x1230(%rip), %rdi"), instruction("callq", "10 <register>"),
@@ -154,6 +277,75 @@ test "CFG rejects skipped materialization and meets every predecessor at a call"
     try std.testing.expect(result.analysis.before[3].regs[7].addressIs(0x1234, true));
 }
 
+test "all IMUL operands and implicit register writes affect provenance" {
+    const parsed = try assembly.Operands.parse(instruction("imulq", "$0, %rdi, %rdi"));
+    try std.testing.expectEqual(3, parsed.len);
+    try std.testing.expectEqualStrings("%rdi", parsed.items[2]);
+    try std.testing.expect(assembly.splitOperands(instruction("imulq", "$0, %rdi, %rdi")) == null);
+    const memory = try assembly.Operands.parse(instruction("imulq", "$2, 8(%rax,%rcx,4), %rdi"));
+    try std.testing.expectEqual(3, memory.len);
+    const materialize = instruction("leaq", "0x1232(%rip), %rdi");
+    for ([_][]const u8{ "$0, %rdi, %rdi", "$2, %rdi, %rdi" }) |operands| {
+        var result = try trace(&.{ materialize, instruction("imulq", operands), instruction("callq", "10 <register>") }, .{}, .none);
+        defer result.deinit();
+        try std.testing.expect(!result.analysis.before[2].regs[7].addressIs(0x1234, true));
+    }
+    var valid = try trace(&.{ materialize, instruction("imulq", "$1, %rdi, %rdi"), instruction("callq", "10 <register>") }, .{}, .none);
+    defer valid.deinit();
+    try std.testing.expect(valid.analysis.before[2].regs[7].addressIs(0x1234, true));
+    var numeric = try trace(&.{ instruction("movq", "$7, %rax"), instruction("imulq", "$2, %rax, %rdx") }, .{}, .none);
+    defer numeric.deinit();
+    try std.testing.expectEqual(14, numeric.analysis.after[1].regs[2].id);
+    for ([_]Instruction{ instruction("mulq", "%rdi"), instruction("divq", "(%rdi)"), instruction("cpuid", ""), instruction("rdtscp", "") }) |writer| {
+        var initial = flow.State.entry(1);
+        for ([_]usize{ 0, 2 }) |reg| initial.regs[reg] = .{ .kind = .address, .id = 0x1234 };
+        var result = try trace(&.{writer}, initial, .none);
+        defer result.deinit();
+        try std.testing.expect(!result.analysis.after[0].regs[0].addressIs(0x1234, true));
+        try std.testing.expect(!result.analysis.after[0].regs[2].addressIs(0x1234, true));
+    }
+    for ([_]Instruction{ instruction("unmodeled", "%rax, %rdi"), instruction("unmodeled", "$0, %rax, %rdi") }) |unknown|
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, trace(&.{ materialize, unknown }, .{}, .none));
+}
+
+test "vector memory writes use full XMM YMM ZMM and scalar widths" {
+    const materialize = instruction("leaq", "0x1232(%rip), %rdi");
+    const store = instruction("movq", "%rdi, 0x10(%rbx)");
+    for ([_][]const u8{ "%xmm0", "%ymm0", "%zmm0" }, [_]i64{ 16, 32, 64 }) |reg, width| {
+        for ([_]i64{ 16 - width, 17 - width, 16, 23, 24 }) |offset| {
+            const operand = try std.fmt.allocPrint(std.testing.allocator, "{s}, {d}(%rbx)", .{ reg, offset });
+            defer std.testing.allocator.free(operand);
+            const op = if (width == 64) "vmovdqu64" else "vmovdqu";
+            const overlap = offset < 24 and offset + width > 16;
+            try std.testing.expectEqual(!overlap, try stored(&.{ materialize, store, instruction(op, operand) }, true));
+        }
+    }
+    try std.testing.expect(!try stored(&.{ materialize, store, instruction("vpxor", "%ymm0, %ymm0, %ymm0"), instruction("vmovdqu", "%ymm0, -8(%rbx)") }, true));
+    try std.testing.expect(try stored(&.{ materialize, store, instruction("movss", "%xmm0, 12(%rbx)") }, true));
+    try std.testing.expect(!try stored(&.{ materialize, store, instruction("movsd", "%xmm0, 12(%rbx)") }, true));
+    try std.testing.expectError(error.UnsupportedProvenanceInstruction, stored(&.{ materialize, store, instruction("unknown_vector_store", "%zmm0, (%rbx)") }, true));
+}
+
+test "only justified allocated objects separate from globals and retain member pointers" {
+    const regions = [_]flow.Region{.{ .start = 0x2000, .end = 0x2010 }};
+    const callback: flow.Value = .{ .kind = .address, .id = 0x1234 };
+    const slot: flow.Slot = .{ .field = 40 };
+    for ([_]bool{ false, true }) |fresh| {
+        const object: flow.Value = .{ .kind = if (fresh) .heap else .result, .id = 99, .size = 128 };
+        var state: flow.State = .{ .globals = &regions };
+        try state.store(object.plus(40), callback, 8, slot);
+        try state.store(.{ .kind = .address, .id = 0x2000, .upper = 0x2008 }, object, 8, slot);
+        try std.testing.expectEqual(fresh, state.get(object.plus(40)).addressIs(0x1234, true));
+        if (fresh) {
+            try state.store(object.plus(96), object.plus(88), 8, slot);
+            try state.store(state.get(object.plus(96)), object, 8, slot);
+            try std.testing.expect(state.get(object.plus(40)).addressIs(0x1234, true));
+            try state.store(object.plus(96), object.plus(40), 8, slot);
+            try state.store(state.get(object.plus(96)), object, 8, slot);
+            try std.testing.expect(!state.get(object.plus(40)).addressIs(0x1234, true));
+        }
+    }
+}
 test "CFG retains loop-invariant provenance and bounds analysis resources" {
     var result = try trace(&.{
         instruction("leaq", "0x1232(%rip), %rdi"),

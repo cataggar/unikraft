@@ -261,16 +261,44 @@ fn lockable(instruction: Instruction) bool {
 }
 
 pub fn splitOperands(instruction: Instruction) ?[2][]const u8 {
-    const text = instruction.operands[0 .. std.mem.indexOfScalar(u8, instruction.operands, '#') orelse instruction.operands.len];
-    var depth: usize = 0;
-    for (text, 0..) |c, i| {
-        if (c == '(') depth += 1;
-        if (c == ')' and depth != 0) depth -= 1;
-        if (c == ',' and depth == 0)
-            return .{ std.mem.trim(u8, text[0..i], " \t"), std.mem.trim(u8, text[i + 1 ..], " \t") };
-    }
-    return null;
+    const operands = Operands.parse(instruction) catch return null;
+    if (operands.len != 2) return null;
+    return .{ operands.items[0], operands.items[1] };
 }
+
+pub const Operands = struct {
+    items: [4][]const u8 = @splat(""),
+    len: usize = 0,
+
+    pub fn parse(instruction: Instruction) !Operands {
+        const text = instruction.operands[0 .. std.mem.indexOfScalar(u8, instruction.operands, '#') orelse instruction.operands.len];
+        var result: Operands = .{};
+        if (std.mem.trim(u8, text, " \t").len == 0) return result;
+        var depth: usize = 0;
+        var start: usize = 0;
+        for (text, 0..) |c, i| {
+            if (c == '(') depth += 1;
+            if (c == ')') {
+                if (depth == 0) return error.MalformedOperands;
+                depth -= 1;
+            }
+            if (c == ',' and depth == 0) {
+                try result.append(text[start..i]);
+                start = i + 1;
+            }
+        }
+        if (depth != 0) return error.MalformedOperands;
+        try result.append(text[start..]);
+        return result;
+    }
+    fn append(self: *Operands, text: []const u8) !void {
+        if (self.len == self.items.len) return error.UnsupportedOperandCount;
+        const item = std.mem.trim(u8, text, " \t");
+        if (item.len == 0) return error.MalformedOperands;
+        self.items[self.len] = item;
+        self.len += 1;
+    }
+};
 
 fn isPrefix(op: []const u8) bool {
     for ([_][]const u8{ "lock", "rep", "repz", "repe", "repne", "repnz", "bnd", "notrack", "data16", "addr32", "cs", "ds", "es", "ss", "fs", "gs" }) |prefix|

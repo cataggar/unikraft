@@ -163,6 +163,10 @@ pub const Model = struct {
 
     pub fn pointer(self: Model, address_value: u64) !u64 {
         const bytes = try self.dataAt(address_value, 8);
+        return (try self.relocatedPointer(address_value)) orelse std.mem.readInt(u64, bytes[0..8], .little);
+    }
+
+    pub fn relocatedPointer(self: Model, address_value: u64) !?u64 {
         var relocated: ?u64 = null;
         for (self.image.sections) |section| {
             const sh = section.header;
@@ -178,7 +182,7 @@ pub const Model = struct {
                 relocated = @bitCast(entry.r_addend);
             }
         }
-        return relocated orelse std.mem.readInt(u64, bytes[0..8], .little);
+        return relocated;
     }
 
     pub fn directCall(self: Model, caller: []const u8, callee: []const u8, tails: bool) !?u64 {
