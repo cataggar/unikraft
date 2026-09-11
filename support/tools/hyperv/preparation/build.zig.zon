@@ -1,0 +1,19 @@
+.{
+    .name = .hyperv_preparation,
+    .version = "0.1.0",
+    .fingerprint = 0xf1d4a11a3f2639b3,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .miz_source = .{
+            .url = "git+https://github.com/cataggar/miz.git#2db68ca0c3ab12155012a823c3fb8d7aba1cb544",
+            .hash = "miz-0.2.0-Z3lHlPw00wAx7bBDTJjcF1O3Vva6085mA_DZS2uWdwzL",
+        },
+    },
+    .paths = .{
+        "build.zig",           "build.zig.zon",  "root.zig",     "main.zig",
+        "contracts.zig",       "files.zig",      "runtime.zig",  "source.zig",
+        "config.zig",          "seed.zig",       "package.zig",  "budget.zig",
+        "producer.zig",        "provenance.zig", "receipts.zig", "inputs.zig",
+        "process_fixture.zig", "tests.zig",      "README.md",
+    },
+}
