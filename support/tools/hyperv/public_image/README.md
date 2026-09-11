@@ -90,9 +90,15 @@ revision-4 producer/embedded-miz semantics and independently expected
 GitHub source plus attestation subject digest; accepting an arbitrary
 caller-supplied producer hash is not sufficient. This package does not
 silently impersonate revision 3 or change legacy import/network behavior.
-Root CLI assembly, workflow selectors, producer maps and importer migration
-are not edited here. The workflow's inline Python matrix assertion can become
-`validate-matrix`; `prepare` already requires the entire matrix.
+CI exercises the native fixtures and a separate real four-boot preparation,
+physical matrix reload and native-v4 export over its root-built public EFI.
+It retains bounded native reports, serial logs and the manifest digest without
+publishing the native VHD through the legacy prepared-image output contract.
+The existing #87 prepare/export path remains unchanged until its importer and
+attestation consumers support revision 4. This temporary coexistence is not a
+claim of complete Python-free CI. Root CLI assembly, producer maps and importer
+migration remain separate. The legacy inline Python matrix assertion can then
+be removed; native `prepare` already requires the entire matrix.
 
 ## Actual preparation and physical reload
 
