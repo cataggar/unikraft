@@ -116,6 +116,15 @@ preparation and independent authority/image/provider/route bindings are wired.
 Neither ordinary input structs nor absent VM-agent metadata establishes that
 admission. The `uk-hyperv` commands above remain unchanged.
 
+## Public local boot driver
+
+The separate [native local-boot package](local_boot/README.md) installs
+`uk-hyperv-local-boot` for public QEMU/KVM EFI and exact read-only raw-disk
+assertions. Dedicated native fixtures and the CI fixed two-CPU SMP boot use it.
+It retains bounded raw serial evidence and independent process/recording
+failures, but establishes no host, storage, network or Azure admission.
+Other legacy controller/CI paths remain until their separate native cutover.
+
 ## Module interfaces
 
 Import build module `hyperv` for the facade, `hyperv_transfer` for transfers,

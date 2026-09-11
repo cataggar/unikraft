@@ -812,6 +812,21 @@ jobs:
           zig build -j2 test-build-tools "-Doutput=${root}/build" \
             --summary all
 
+    - name: Run native public Hyper-V local-boot fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-local-boot"
+        for mode in Debug ReleaseSafe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/local_boot/build.zig \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dtest-root="${root}/${mode}/fixtures" \
+              -Doptimize="${mode}" -j2 test install --summary all
+        done
+
     - name: Exercise explicit private native Make configuration
       run: |
         set -euo pipefail
@@ -1197,18 +1212,27 @@ jobs:
     - name: Boot the fixed scheduled-SMP workload on two CPUs
       run: |
         set -euo pipefail
+        umask 077
         disk="${RUNNER_TEMP}/hyperv-ci/smp.raw"
         "${RUNNER_TEMP}/hyperv-ci/miz/bin/miz" build-efi-application \
           --efi "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi" \
           --architecture x86_64 --esp-size 64M -O raw -o "${disk}"
         test "$(stat -c %s "${disk}")" -eq "$((66 * 1024 * 1024))"
         sha256sum "${disk}" > "${RUNNER_TEMP}/hyperv-ci/smp-disk-sha256.txt"
-        python3 support/build/tests/hyperv-efi-boot-test.py \
-          --raw-disk "${disk}" \
-          --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.fd \
-          --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd \
-          --work-dir "${RUNNER_TEMP}/hyperv-ci/smp-boot" \
-          --qemu "${RUNNER_TEMP}/hyperv-tools/qemu-system-x86_64" \
+        firmware="${RUNNER_TEMP}/hyperv-ci/smp-firmware"
+        mkdir -m 700 "${firmware}" "${RUNNER_TEMP}/hyperv-ci/smp-boot"
+        # Hosted shared-data directories can be writable; use private templates.
+        cp --no-preserve=mode,ownership /usr/share/OVMF/OVMF_CODE_4M.fd \
+          "${firmware}/OVMF_CODE.fd"
+        cp --no-preserve=mode,ownership /usr/share/OVMF/OVMF_VARS_4M.fd \
+          "${firmware}/OVMF_VARS.fd"
+        timeout --signal=TERM --kill-after=5s 180s \
+          "${RUNNER_TEMP}/hyperv-ci/native-local-boot/ReleaseSafe/out/bin/uk-hyperv-local-boot" \
+          --raw-disk "$(readlink -f "${disk}")" \
+          --ovmf-code "$(readlink -f "${firmware}/OVMF_CODE.fd")" \
+          --ovmf-vars "$(readlink -f "${firmware}/OVMF_VARS.fd")" \
+          --work-dir "$(readlink -f "${RUNNER_TEMP}/hyperv-ci/smp-boot")" \
+          --qemu "$(readlink -f "${RUNNER_TEMP}/hyperv-tools/qemu-system-x86_64")" \
           --cpus 2 --timeout 60 \
           --require-marker UK_HYPERV_AP_EXEC \
           --require-marker UK_HYPERV_SCHED_THREAD \
@@ -1273,6 +1297,7 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/smp-image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-disk-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-boot/hyperv-efi-boot.log
+          ${{ runner.temp }}/hyperv-ci/smp-boot/report.json
           ${{ runner.temp }}/hyperv-ci/packaging/packaging.json
           ${{ runner.temp }}/hyperv-ci/packaging/local-*-serial.log
           ${{ runner.temp }}/hyperv-ci/packaging/miz-*.log
