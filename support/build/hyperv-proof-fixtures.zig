@@ -294,6 +294,14 @@ fn operandRegressions(f: *Fixture) !void {
         try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_{s}_zero", .{alias}), 0, null);
         try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_{s}_nonzero", .{alias}), 1, "DriverArgumentMismatch");
     }
+    const before_memory_flags = f.cases;
+    for ([_][]const u8{ "b", "w", "l", "q" }) |suffix| {
+        for ([_][]const u8{ "zero", "bad", "unknown_zero", "unknown_bad" }, [_]u8{ 0, 1, 0, 1 }) |variant, status| {
+            try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_test_{s}_{s}", .{ suffix, variant }), status, if (status == 1) "DriverArgumentMismatch" else null);
+        }
+        try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_cmp_{s}_nonzero", .{suffix}), 0, null);
+    }
+    try std.testing.expectEqual(20, f.cases - before_memory_flags);
     try constructorCase(f, "proof_masked_stack_disjoint", 0, null);
     try constructorCase(f, "proof_masked_stack_overlap", 1, "DriverArgumentMismatch");
     try constructorCase(f, "proof_masked_stack_not_zero", 1, "DriverArgumentMismatch");

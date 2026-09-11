@@ -508,6 +508,21 @@ HIGH_BYTE_CASE(proof_bh_nonzero, "%ebx", "256", "testb %bh, %bh")
 HIGH_BYTE_CASE(proof_high_write_zero, "%eax", "257", "movb $0, %ah\ntestb %ah, %ah")
 HIGH_BYTE_CASE(proof_high_write_nonzero, "%eax", "1", "movb $1, %ah\ntestb %ah, %ah")
 
+#define MEMORY_FLAGS(name, setup, op, branch) \
+	REGISTER_REVIEW(name, "subq $32, %rsp\n" setup "\n" op " $0, 16(%rsp)\n" \
+		       branch " 1f\nleaq storvsc_driver(%rip), %rdi\njmp 2f\n" \
+		       "1: xorl %edi, %edi\n2: addq $32, %rsp")
+#define MEMORY_FLAG_WIDTH(suffix) \
+	MEMORY_FLAGS(proof_test_##suffix##_zero, "movq $1, 16(%rsp)", "test" #suffix, "jne") \
+	MEMORY_FLAGS(proof_test_##suffix##_bad, "movq $1, 16(%rsp)", "test" #suffix, "je") \
+	MEMORY_FLAGS(proof_test_##suffix##_unknown_zero, "", "test" #suffix, "jne") \
+	MEMORY_FLAGS(proof_test_##suffix##_unknown_bad, "", "test" #suffix, "je") \
+	MEMORY_FLAGS(proof_cmp_##suffix##_nonzero, "movq $1, 16(%rsp)", "cmp" #suffix, "je")
+MEMORY_FLAG_WIDTH(b)
+MEMORY_FLAG_WIDTH(w)
+MEMORY_FLAG_WIDTH(l)
+MEMORY_FLAG_WIDTH(q)
+
 #define STACK_DESCRIPTOR \
 	"subq $96, %rsp\nleaq storvsc_driver(%rip), %rdi\nmovq %rdi, 16(%rsp)\n"
 #define RELOAD_DESCRIPTOR "movq 16(%rsp), %rdi\naddq $96, %rsp"
@@ -547,6 +562,15 @@ static void (*volatile proof_transform_refs[])(void) = {
 	proof_ah_zero, proof_ah_nonzero, proof_ch_zero, proof_ch_nonzero,
 	proof_dh_zero, proof_dh_nonzero, proof_bh_zero, proof_bh_nonzero,
 	proof_high_write_zero, proof_high_write_nonzero,
+#define MEMORY_FLAG_REFS(suffix) \
+	proof_test_##suffix##_zero, proof_test_##suffix##_bad, \
+	proof_test_##suffix##_unknown_zero, proof_test_##suffix##_unknown_bad, \
+	proof_cmp_##suffix##_nonzero,
+	MEMORY_FLAG_REFS(b)
+	MEMORY_FLAG_REFS(w)
+	MEMORY_FLAG_REFS(l)
+	MEMORY_FLAG_REFS(q)
+#undef MEMORY_FLAG_REFS
 	proof_masked_stack_overlap, proof_masked_stack_disjoint, proof_masked_stack_not_zero,
 	proof_segment_stack_store, proof_addr32_stack_store,
 #if !PROOF_OBJECT_SCHED

@@ -66,6 +66,7 @@ oracle, proof executor, or install hook is involved.
 | Unmodeled address syntax is not a harmless unknown non-stack write | Checked write-address decoding; real GS and address-size-override refusals, retained prefix metadata, malformed masks/indexes/extra fields, and implicit-string footprint refusals |
 | SMP map/queue/worker effects preserve the published object | Heap constructor, bounded two-CPU map, retained tail pointer, independent thread allocation and actual indirect `thread_add` member at offset 8; map/queue redirection and helper/method overwrites refuse |
 | Partial values, flags and stack slots cannot manufacture bindings | Narrow pointer-load, partial scalar/null return, CMPXCHG flag, compare-snapshot, CALL return-address and masked-vector stack-argument regressions |
+| Memory TEST uses bitwise flags, never CMP's operand-zero comparison | All four widths with nonzero and unknown stack cells; real LLVM constructor branch inversions, preserved CMP-zero behavior, width-masked zero/sign results, stale-flag clearing and high-byte register masks |
 | Own-stack origin cannot become an apparently unrelated scalar address | Parent LEA/MOVL/store regression; same/different-register copies, MOVZX/MOVSX, partial writes, spilled and unaligned reads, unsupported arithmetic/implicit writes, joins and offset overflow; full-width alias/offset/spill positives |
 | Conditional narrowing and memory remnants retain possible stack aliases | Taken and untaken CMOV r32 zero-extension; unpruned narrow stack tests, incoming-only spills, partial/masked overwrites and vector transport; exact overwrite/non-overlap boundaries and bounded heap/global preservation |
 | Registered-list and initial-image facts survive only justified writes | Current/previous scheduler callback protection, partial/unknown list-link refusal, dirty constant ranges and non-resurrection cases |
@@ -107,6 +108,12 @@ in the same register. CMPXCHG does not borrow ordinary CMP semantics. Opcode
 classification parses all operands; unsupported forms cannot retain stale
 argument provenance. Partial integers are not full-width ABI lengths or null
 return values, and narrow memory loads never preserve complete pointers.
+Memory TEST records the width-limited AND result separately from its operand:
+a zero mask establishes ZF=1/SF=0 even for unknown memory, without refining that
+memory to zero. Known scalar operands supply exact zero/sign flags;
+indeterminate results leave both branches possible. CMP-memory-zero retains its
+comparison semantics. Unspecified TEST widths do not supply nonzero flag
+results without a register-width input.
 AH/CH/DH/BH read bits 8 through 15, not the low byte of their parent register.
 Such reads require known bits covering that slice; ranged or incomplete
 evidence becomes unknown. Supported high-byte writes preserve known low and

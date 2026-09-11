@@ -750,6 +750,28 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
                     if (std.mem.startsWith(u8, op, "test")) state.zero_test = .{ .kind = .integer, .id = flag_value };
                     state.sign_test = flag_value & (@as(u64, 1) << @intCast(width - 1)) != 0;
                 }
+            } else if (machine.sized(op, "test")) {
+                const tested = source(state.*, instruction, operands[1]);
+                const right = source(state.*, instruction, operands[0]);
+                const width = if (std.mem.eql(u8, op, "test"))
+                    assembly.registerWidth(operands[0])
+                else
+                    @as(?u8, machine.readBits(instruction));
+                var result: ?u64 = if (tested.isZero() or right.isZero()) 0 else null;
+                if (width) |bits| {
+                    const mask: u64 = if (bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
+                    const known_tested = tested.kind == .integer and tested.depth == 0 and tested.upper == null and tested.bits >= bits;
+                    const known_right = right.kind == .integer and right.depth == 0 and right.upper == null and right.bits >= bits;
+                    if (known_tested and known_right)
+                        result = tested.id & right.id & mask
+                    else if ((known_tested and tested.id & mask == 0) or (known_right and right.id & mask == 0))
+                        result = 0;
+                }
+                if (result) |value| {
+                    // TEST constrains its AND result, never the memory operand.
+                    state.zero_test = .{ .kind = .integer, .id = value };
+                    state.sign_test = if (width) |bits| value & (@as(u64, 1) << @intCast(bits - 1)) != 0 else false;
+                }
             } else if (assembly.immediate(operands[0]) == 0) {
                 state.zero_test = source(state.*, instruction, operands[1]);
             }

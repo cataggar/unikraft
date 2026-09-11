@@ -591,6 +591,139 @@ test "flags are snapshots and multioperand arithmetic cannot retain stale compar
     try std.testing.expect(changed_flags.analysis.seen[5]);
 }
 
+test "review regression memory TEST zero cannot borrow CMP flags or refine the operand" {
+    for ([_][]const u8{ "testb", "testw", "testl", "testq" }) |op| {
+        for ([_]?u64{ 1, 0, std.math.maxInt(u64), null }) |value| {
+            var state = flow.State.entry(1);
+            const slot = state.regs[4].plus(16);
+            if (value) |known| try state.store(slot, .{ .kind = .integer, .id = known }, 8, .none);
+            const previous = state.get(slot);
+            try flow.step(&state, instruction(op, "$0, 16(%rsp)"), .{});
+            try std.testing.expect(state.zero_test != null and state.zero_test.?.isZero());
+            try std.testing.expectEqual(@as(?bool, false), state.sign_test);
+            try std.testing.expect(state.comparison == null);
+            for ([_][]const u8{ "je", "jz", "jne", "jnz", "js", "jns" }, [_]bool{ true, true, false, false, false, true }) |branch, taken| {
+                const outgoing = flow.branch(state, branch, taken) orelse return error.MissingTestZeroEdge;
+                try std.testing.expect(flow.branch(state, branch, !taken) == null);
+                try std.testing.expect(flow.Value.equal(previous, outgoing.get(slot)));
+            }
+        }
+    }
+}
+
+test "memory TEST masks use width limited bitwise zero and sign flags" {
+    for ([_][]const u8{ "testb", "testw", "testl", "testq" }, [_]u8{ 8, 16, 32, 64 }) |op, bits| {
+        const mask: u64 = if (bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(bits)) - 1;
+        const sign = @as(u64, 1) << @intCast(bits - 1);
+        for ([_]u64{ 0, 1, 2, sign, mask, ~mask }) |left| {
+            for ([_]u64{ 0, 1, 2, sign, mask, ~mask }) |right| {
+                var state = flow.State.entry(1);
+                try state.store(state.regs[4].plus(16), .{ .kind = .integer, .id = left }, 8, .none);
+                const operands = try std.fmt.allocPrint(std.testing.allocator, "${d}, 16(%rsp)", .{right});
+                defer std.testing.allocator.free(operands);
+                try flow.step(&state, instruction(op, operands), .{});
+                const result = left & right & mask;
+                try std.testing.expectEqual(result, (state.zero_test orelse return error.MissingTestFlags).id);
+                try std.testing.expectEqual(@as(?bool, result & sign != 0), state.sign_test);
+                try std.testing.expect(flow.branch(state, "je", result == 0) != null);
+                try std.testing.expect(flow.branch(state, "je", result != 0) == null);
+                try std.testing.expect(flow.branch(state, "js", result & sign != 0) != null);
+                try std.testing.expect(flow.branch(state, "js", result & sign == 0) == null);
+            }
+        }
+    }
+}
+
+test "memory TEST unknown and partial values clear stale flags without alias refinement" {
+    for ([_][]const u8{ "testb", "testw", "testl", "testq" }) |op| {
+        for ([_]flow.Value{
+            .{},                                 .{ .kind = .integer, .id = 1, .upper = 255 },
+            .{ .kind = .address, .id = 0x1234 }, .{ .kind = .stack, .context = 1 },
+        }) |value| {
+            var initial = flow.State.entry(1);
+            const slot = initial.regs[4].plus(16);
+            try initial.store(slot, value, 8, .none);
+            initial.zero_test = .{ .kind = .integer, .id = 1 };
+            initial.sign_test = true;
+            initial.comparison = .{ .reg = 0, .left = .{ .kind = .integer, .id = 1 }, .right = .{ .kind = .integer }, .width = 64 };
+            var result = try trace(&.{
+                instruction(op, "$1, 16(%rsp)"), instruction("je", "4 <possible>"),
+                instruction("retq", ""),         instruction("nop", ""),
+            }, initial, .none);
+            defer result.deinit();
+            const state = result.analysis.after[0];
+            try std.testing.expect(state.zero_test == null and state.sign_test == null and state.comparison == null);
+            try std.testing.expect(result.analysis.seen[2] and result.analysis.seen[3]);
+            try std.testing.expect(flow.Value.equal(value, result.analysis.before[3].get(slot)));
+        }
+    }
+    var state = flow.State.entry(1);
+    try state.store(state.regs[4].plus(16), .{ .kind = .integer, .id = 1 }, 1, .none);
+    try flow.step(&state, instruction("testq", "$1, 16(%rsp)"), .{});
+    try std.testing.expect(state.zero_test == null and state.sign_test == null);
+    try flow.step(&state, instruction("testq", "$0, 16(%rsp)"), .{});
+    try std.testing.expect(state.zero_test != null and state.zero_test.?.isZero());
+}
+
+test "memory CMP zero keeps comparison semantics distinct from TEST and register masks" {
+    for ([_][]const u8{ "cmpb", "cmpw", "cmpl", "cmpq" }) |op| {
+        for ([_]u64{ 0, 1 }) |value| {
+            var state = flow.State.entry(1);
+            try state.store(state.regs[4].plus(16), .{ .kind = .integer, .id = value }, 8, .none);
+            try flow.step(&state, instruction(op, "$0, 16(%rsp)"), .{});
+            try std.testing.expect(flow.branch(state, "je", value == 0) != null);
+            try std.testing.expect(flow.branch(state, "je", value != 0) == null);
+        }
+        var state = flow.State.entry(1);
+        try flow.step(&state, instruction(op, "$0, 16(%rsp)"), .{});
+        try std.testing.expect(flow.branch(state, "je", true) != null and flow.branch(state, "je", false) != null);
+    }
+    for ([_][]const u8{ "%ah", "%ch", "%dh", "%bh" }, 0..) |high, reg| {
+        var state = flow.State.entry(1);
+        state.regs[reg] = .{ .kind = .integer, .id = 0x100 };
+        try state.store(state.regs[4].plus(16), .{ .kind = .integer, .id = 1 }, 8, .none);
+        const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, 16(%rsp)", .{high});
+        defer std.testing.allocator.free(operands);
+        try flow.step(&state, instruction("testb", operands), .{});
+        try std.testing.expectEqual(1, (state.zero_test orelse return error.MissingTestFlags).id);
+        try std.testing.expect(flow.branch(state, "je", true) == null);
+    }
+}
+
+test "memory TEST unspecified widths and unknown register masks remain conservative" {
+    var state = flow.State.entry(1);
+    const slot = state.regs[4].plus(16);
+    try state.store(slot, .{ .kind = .integer, .id = 1 }, 8, .none);
+    try flow.step(&state, instruction("test", "$1, 16(%rsp)"), .{});
+    try std.testing.expect(state.zero_test == null and state.sign_test == null);
+    try flow.step(&state, instruction("test", "$0, 16(%rsp)"), .{});
+    try std.testing.expect(state.zero_test != null and state.zero_test.?.isZero());
+    try std.testing.expectEqual(@as(?bool, false), state.sign_test);
+    state.regs[0] = .{ .kind = .integer, .id = 0x101 };
+    try state.store(slot, .{ .kind = .integer, .id = 0x100 }, 8, .none);
+    for ([_][]const u8{ "%al", "%ax", "%eax", "%rax" }, [_]u64{ 0, 0x100, 0x100, 0x100 }) |reg, expected| {
+        const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, 16(%rsp)", .{reg});
+        defer std.testing.allocator.free(operands);
+        try flow.step(&state, instruction("test", operands), .{});
+        try std.testing.expectEqual(expected, (state.zero_test orelse return error.MissingTestFlags).id);
+    }
+    for ([_]u64{ 0, 1 }) |value| {
+        state.regs[0] = .{};
+        try state.store(slot, .{ .kind = .integer, .id = value }, 8, .none);
+        try flow.step(&state, instruction("testq", "%rax, 16(%rsp)"), .{});
+        try std.testing.expectEqual(value == 0, state.zero_test != null);
+        try std.testing.expect(flow.branch(state, "je", true) != null);
+        try std.testing.expectEqual(value != 0, flow.branch(state, "je", false) != null);
+    }
+    const object: flow.Value = .{ .kind = .heap, .id = 7, .size = 128, .nullable = true };
+    try state.store(slot, object, 8, .none);
+    try flow.step(&state, instruction("testq", "$0, 16(%rsp)"), .{});
+    try std.testing.expect(flow.Value.equal(object, flow.branch(state, "je", true).?.get(slot)));
+    try flow.step(&state, instruction("cmpq", "$0, 16(%rsp)"), .{});
+    try std.testing.expect(flow.branch(state, "je", true).?.get(slot).isZero());
+    try std.testing.expect(!flow.branch(state, "je", false).?.get(slot).nullable);
+}
+
 test "zeroed vector stack arguments survive disjoint allocated member writes" {
     var initial = flow.State.entry(1);
     initial.regs[3] = .{ .kind = .heap, .id = 99, .size = 128 };
