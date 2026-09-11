@@ -113,7 +113,10 @@ and restricted StorageV2 definitions, not arbitrary templates. Completion reads
 back every created definition and returns its observed VM/disk UUID through
 `Result.created`, so the caller can persist the original identity. VM definitions
 require original UUID/geometry bindings for existing unattached disks and verify
-them again after attachment. Existing network provisioning is not rewritten.
+them again after attachment. The opt-in persistence network operations create
+only the fixed private NSG/VNet/NIC envelope. Both readiness and cleanup ownership
+readback reject public IPs, NAT/routes and load-balancer/application-gateway
+associations; generic network parsing retains its existing defaults.
 
 VM actions bind the original VM UUID; power completion requires the same UUID
 and the requested instance-view state. VM parsing requires explicit Standard
@@ -121,8 +124,12 @@ security, one owned NIC, and at most one data disk at LUN 7 with no caching.
 Boot diagnostics requests put the exact ten-minute lifetime in the
 `sasUriExpirationTimeInMinutes=10` query parameter, not in a JSON body. The
 initial-request query policy permits that parameter only for boot diagnostics.
-Managed disks require original UUID, raw `diskSizeGB`, explicit 512-byte logical
-sectors, StandardSSD_LRS, and 1--32 GiB geometry. Write grants require an Upload
+Managed disks require original UUID, raw `diskSizeGB` in 1--32 GiB, explicit
+512-byte logical sectors and StandardSSD_LRS. Upload disks retain their exact
+MiB-aligned logical payload from `uploadSizeBytes` minus the 512-byte VHD footer,
+including sub-GiB OS disks; returned `diskSizeBytes` must agree. Upload creation
+omits `diskSizeGB` because sending it requests a resize, not an allocation hint.
+Empty creation retains its explicit size. Write grants require an Upload
 disk in ReadyToUpload with exact VHD upload size. Revocation reads back original
 identity and a non-active-SAS disk state; that control-plane observation is not
 an independent data-plane SAS rejection proof.
