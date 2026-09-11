@@ -228,6 +228,11 @@ test "native Make environment reads only private state and validated explicit pa
     try cache.setPermissions(io, .fromMode(0o755));
     try std.testing.expectError(error.UnsafeFile, read(allocator, io, path));
     try cache.setPermissions(io, .fromMode(0o700));
+    const bison_data = try temporary.dir.openDir(io, "bison_data", .{ .iterate = true });
+    defer bison_data.close(io);
+    try bison_data.setPermissions(io, .fromMode(0o777));
+    try std.testing.expectError(error.UnsafeFile, read(allocator, io, path));
+    try bison_data.setPermissions(io, .fromMode(0o700));
     try temporary.dir.rename("shell", temporary.dir, "original-shell", io);
     try temporary.dir.symLink(io, "original-shell", "shell", .{});
     try std.testing.expectError(error.InvalidNativeMakePath, read(allocator, io, path));

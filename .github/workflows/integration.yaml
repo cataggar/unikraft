@@ -820,6 +820,9 @@ jobs:
         root="${RUNNER_TEMP}/hyperv-ci/native-make-environment"
         mkdir -p "${root}"/{tmp,cache,config,zig-local,zig-global}
         root="$(readlink -f "${root}")"
+        # Hosted /usr/share can be writable; keep fixture data in a private copy.
+        cp -R --no-preserve=mode,ownership \
+          "$(/usr/bin/bison --print-datadir)" "${root}/bison-data"
         for mode in Debug ReleaseSafe; do
           zig build -j2 test-native-make-environment \
             --cache-dir "${root}/tests" \
@@ -828,7 +831,7 @@ jobs:
             --summary all
         done
         printf '{"bison_data":"%s","m4":"%s","schema":"unikraft_native_make_environment_v1","shell":"%s","tmp":"%s","xdg_cache":"%s","xdg_config":"%s","zig_global_cache":"%s","zig_local_cache":"%s"}\n' \
-          "$(readlink -f "$(/usr/bin/bison --print-datadir)")" \
+          "${root}/bison-data" \
           "$(readlink -f /usr/bin/m4)" \
           "$(readlink -f /usr/bin/bash)" \
           "${root}/tmp" "${root}/cache" "${root}/config" \
@@ -836,7 +839,7 @@ jobs:
         cp support/apps/hyperv-acceptance/defconfig "${root}/input.config"
         chmod 600 "${root}/input.config"
         umask 022
-        if ! zig build -j2 olddefconfig \
+        zig build -j2 olddefconfig \
           --cache-dir "${root}/zig-local" \
           --global-cache-dir "${root}/zig-global" \
           "-Dnative-make-environment=${root}/environment.json" \
@@ -845,20 +848,7 @@ jobs:
           "-Doutput=${root}/build" "-Dconfig=${root}/input.config" \
           "-Dcompiler=zig cc -target x86_64-freestanding-none" \
           -Dcompiler-targeted=true "-Dhost-cc=zig cc" "-Dhost-cxx=zig c++" \
-          -Dhost-cflags=-fno-sanitize=null; then
-          id -u
-          stat -c 'mode=%a uid=%u links=%h kind=%F path=%n' \
-            "${root}/environment.json" \
-            "${root}"/{tmp,cache,config,zig-local,zig-global} \
-            /usr/bin/bash /usr/bin/m4
-          for current in "${root}" /usr/share/bison /usr/bin; do
-            while [ "${current}" != / ]; do
-              stat -c 'mode=%a uid=%u links=%h kind=%F path=%n' "${current}"
-              current="$(dirname "${current}")"
-            done
-          done
-          exit 1
-        fi
+          -Dhost-cflags=-fno-sanitize=null
         test "$(stat -c %a "${root}/input.config")" = 600
         grep --fixed-strings --line-regexp --quiet \
           CONFIG_APPHYPERVACCEPTANCE=y "${root}/input.config"
