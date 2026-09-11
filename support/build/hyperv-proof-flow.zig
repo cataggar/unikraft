@@ -373,28 +373,48 @@ pub fn pair(instruction: Instruction) ?[2][]const u8 {
 }
 
 pub fn memory(state: State, instruction: Instruction, operand: []const u8) Value {
-    var text = std.mem.trim(u8, operand[0 .. std.mem.indexOfScalar(u8, operand, '#') orelse operand.len], " \t");
-    if (std.mem.startsWith(u8, text, "*")) text = text[1..];
-    if (std.mem.indexOfScalar(u8, text, ':') != null) return .{};
+    return checkedMemory(state, instruction, operand) catch .{};
+}
+
+fn checkedMemory(state: State, instruction: Instruction, operand: []const u8) error{UnsupportedProvenanceInstruction}!Value {
+    const text = std.mem.trim(u8, operand[0 .. std.mem.indexOfScalar(u8, operand, '#') orelse operand.len], " \t");
+    if (instruction.hasAddressOverride() or std.mem.indexOfAny(u8, text, ":{}*") != null)
+        return error.UnsupportedProvenanceInstruction;
     const open = std.mem.indexOfScalar(u8, text, '(') orelse {
-        return .{ .kind = .address, .id = assembly.hex(text) catch return .{} };
+        return .{ .kind = .address, .id = std.fmt.parseInt(u64, text, 0) catch return error.UnsupportedProvenanceInstruction };
     };
-    if (!std.mem.endsWith(u8, text, ")")) return .{};
-    const displacement = if (open == 0) 0 else std.fmt.parseInt(i64, text[0..open], 0) catch return .{};
+    if (!std.mem.endsWith(u8, text, ")")) return error.UnsupportedProvenanceInstruction;
+    const displacement = if (open == 0) 0 else std.fmt.parseInt(i64, text[0..open], 0) catch return error.UnsupportedProvenanceInstruction;
     var fields = std.mem.splitScalar(u8, text[open + 1 .. text.len - 1], ',');
-    const base = fields.next().?;
-    var value: Value = if (std.mem.eql(u8, base, "%rip"))
-        .{ .kind = .address, .id = instruction.address + instruction.size }
-    else if (assembly.register(base)) |reg|
-        state.regs[reg]
-    else
-        return .{};
-    value = value.plus(displacement);
-    if (fields.next()) |index| {
-        const reg = assembly.register(index) orelse return .{};
-        const scale = std.fmt.parseInt(i64, fields.next() orelse "1", 10) catch return .{};
-        if (scale != 1 and scale != 2 and scale != 4 and scale != 8) return .{};
-        const index_value = state.regs[reg];
+    const base = std.mem.trim(u8, fields.next().?, " \t");
+    const index_text = fields.next();
+    const scale_text = fields.next();
+    if (fields.next() != null) return error.UnsupportedProvenanceInstruction;
+    const rip = std.mem.eql(u8, base, "%rip");
+    const base_reg = if (base.len != 0 and !rip) assembly.register(base) orelse return error.UnsupportedProvenanceInstruction else null;
+    if ((base_reg != null and assembly.registerWidth(base) != 64) or
+        (base.len == 0 and index_text == null) or (rip and index_text != null))
+        return error.UnsupportedProvenanceInstruction;
+    const index_reg = if (index_text) |index| assembly.register(index) orelse return error.UnsupportedProvenanceInstruction else null;
+    if (index_text) |index| if (assembly.registerWidth(index) != 64) {
+        return error.UnsupportedProvenanceInstruction;
+    };
+    const scale = if (scale_text) |text_scale| std.fmt.parseInt(i64, std.mem.trim(u8, text_scale, " \t"), 10) catch return error.UnsupportedProvenanceInstruction else 1;
+    if (scale != 1 and scale != 2 and scale != 4 and scale != 8) return error.UnsupportedProvenanceInstruction;
+    const base_value: Value = if (rip)
+        .{ .kind = .address, .id = std.math.add(u64, instruction.address, instruction.size) catch return error.UnsupportedProvenanceInstruction }
+    else if (base_reg) |reg| state.regs[reg] else .{ .kind = .integer };
+    const index_value: Value = if (index_reg) |reg| state.regs[reg] else .{ .kind = .integer };
+    if (base_value.bits != 64 or index_value.bits != 64) return error.UnsupportedProvenanceInstruction;
+    const result = evaluateMemory(state, base_value.plus(displacement), if (index_reg != null) index_value else null, scale);
+    if (result.kind == .unknown and (base_value.kind == .stack or index_value.kind == .stack))
+        return error.UnsupportedProvenanceInstruction;
+    return result;
+}
+
+fn evaluateMemory(state: State, base: Value, index: ?Value, scale: i64) Value {
+    var value = base;
+    if (index) |index_value| {
         if (scale == 1 and value.kind == .integer and value.depth == 0 and value.upper == null and
             index_value.depth == 0 and (index_value.kind == .heap or index_value.kind == .address or index_value.kind == .stack))
             return index_value.plus(@bitCast(value.id));
@@ -417,15 +437,26 @@ pub fn memory(state: State, instruction: Instruction, operand: []const u8) Value
     return value;
 }
 
+fn storeOperand(instruction: Instruction, operand: []const u8) !struct { address: []const u8, masked: bool } {
+    const text = std.mem.trim(u8, operand, " \t");
+    const mask = std.mem.indexOfScalar(u8, text, '{') orelse return .{ .address = text, .masked = false };
+    const decoration = text[mask..];
+    if (!machine.vectorMove(instruction.op) or decoration.len != 5 or !std.mem.startsWith(u8, decoration, "{%k") or
+        decoration[3] < '1' or decoration[3] > '7' or decoration[4] != '}')
+        return error.UnsupportedProvenanceInstruction;
+    return .{ .address = std.mem.trim(u8, text[0..mask], " \t"), .masked = true };
+}
+
 pub fn source(state: State, instruction: Instruction, operand: []const u8) Value {
     if (assembly.register(operand)) |reg| {
         var value = state.regs[reg];
         const width = assembly.registerWidth(operand).?;
+        const shift = assembly.registerBitOffset(operand);
         if (value.kind == .integer) {
-            if (value.depth != 0 or width > value.bits) return .{};
+            if (value.depth != 0 or @as(u16, width) + shift > value.bits or (shift != 0 and value.upper != null)) return .{};
             const mask: u64 = if (width == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(width)) - 1;
             if (value.upper == null) {
-                value.id &= mask;
+                value.id = (value.id >> shift) & mask;
                 value.bits = 64;
             } else if (value.high() > mask) value = .{ .kind = .integer, .id = 0, .upper = mask } else value.bits = 64;
         } else if (width < 64) return .{};
@@ -499,6 +530,24 @@ pub fn writeRegister(state: *State, reg: u4, width: u8, incoming: Value) void {
         } else value.bits = width;
     } else value = if (width == 32) .{ .kind = .integer, .id = 0, .upper = mask } else .{};
     state.regs[reg] = value;
+}
+
+pub fn writeOperand(state: *State, operand: []const u8, incoming: Value) !void {
+    const reg = assembly.register(operand) orelse return error.UnsupportedProvenanceInstruction;
+    if (assembly.registerBitOffset(operand) == 0) {
+        writeRegister(state, reg, assembly.registerWidth(operand).?, incoming);
+        return;
+    }
+    const previous = state.regs[reg];
+    if (previous.kind != .integer or previous.depth != 0 or previous.upper != null or previous.bits < 8 or
+        incoming.kind != .integer or incoming.depth != 0 or incoming.upper != null or incoming.bits < 8)
+        return error.UnsupportedProvenanceInstruction;
+    const previous_mask: u64 = if (previous.bits == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(previous.bits)) - 1;
+    state.regs[reg] = .{
+        .kind = .integer,
+        .id = (previous.id & previous_mask & ~@as(u64, 0xff00)) | ((incoming.id & 0xff) << 8),
+        .bits = @max(previous.bits, 16),
+    };
 }
 
 pub fn unknownCall(state: *State, instruction: Instruction, options: Options) !void {
@@ -587,7 +636,7 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
         return;
     }
     if (std.mem.eql(u8, op, "cmpxchg8b") or std.mem.eql(u8, op, "cmpxchg16b")) {
-        try state.store(memory(state.*, instruction, instruction.operands), .{}, try machine.writeBytes(instruction, ""), options.slot);
+        try state.store(try checkedMemory(state.*, instruction, instruction.operands), .{}, try machine.writeBytes(instruction, ""), options.slot);
         state.regs[0] = .{};
         state.regs[2] = .{};
         state.zero_test = null;
@@ -639,20 +688,22 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
     }
     for ([_][]const u8{ "movsb", "movsw", "movsl", "movsq", "stosb", "stosw", "stosl", "stosq", "lodsb", "lodsw", "lodsl", "lodsq" }) |string_op| {
         if (std.mem.eql(u8, op, string_op)) {
-            for ([_]usize{ 0, 1, 6, 7 }) |reg| state.regs[reg] = .{};
-            try state.store(.{}, .{}, 16, options.slot);
-            return;
+            return error.UnsupportedProvenanceInstruction;
         }
     }
     for ([_][]const u8{ "cmp", "cmpb", "cmpw", "cmpl", "cmpq", "test", "testb", "testw", "testl", "testq", "nop", "nopl", "nopw", "endbr64", "pause", "cli", "sti", "cld", "std", "clc", "stc", "cmc", "lfence", "sfence", "mfence", "wrmsr" }) |neutral|
         if (std.mem.eql(u8, op, neutral)) return;
     if (std.mem.eql(u8, op, "pushq") or std.mem.eql(u8, op, "push") or std.mem.eql(u8, op, "pushfq")) {
+        if (assembly.register(instruction.operands) != null and assembly.registerWidth(instruction.operands) != 64)
+            return error.UnsupportedProvenanceInstruction;
         const value = source(state.*, instruction, instruction.operands);
         state.regs[4] = state.regs[4].plus(-8);
         try state.store(state.regs[4], value, 8, options.slot);
         return;
     }
     if (std.mem.eql(u8, op, "popq") or std.mem.eql(u8, op, "pop") or std.mem.eql(u8, op, "popfq")) {
+        if (assembly.register(instruction.operands) != null and assembly.registerWidth(instruction.operands) != 64)
+            return error.UnsupportedProvenanceInstruction;
         if (std.mem.eql(u8, op, "popfq")) {
             state.zero_test = null;
             state.comparison = null;
@@ -661,15 +712,18 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
         const value = state.get(state.regs[4]);
         state.regs[4] = state.regs[4].plus(8);
         if (assembly.register(instruction.operands)) |reg| state.regs[reg] = value else if (!std.mem.eql(u8, op, "popfq"))
-            try state.store(memory(state.*, instruction, instruction.operands), value, 8, options.slot);
+            try state.store(try checkedMemory(state.*, instruction, instruction.operands), value, 8, options.slot);
         return;
     }
     if (pair(instruction)) |operands| {
         const destination = assembly.register(operands[1]);
         if (!machine.binary(op) and !machine.vectorMove(op) and !machine.vectorArithmetic(op))
             return error.UnsupportedProvenanceInstruction;
-        const exchange_location = if (std.mem.startsWith(u8, op, "xchg") or std.mem.startsWith(u8, op, "xadd"))
-            memory(state.*, instruction, operands[0])
+        if ((machine.sized(op, "xchg") or machine.sized(op, "xadd")) and
+            (assembly.registerBitOffset(operands[0]) != 0 or assembly.registerBitOffset(operands[1]) != 0))
+            return error.UnsupportedProvenanceInstruction;
+        const exchange_location = if ((std.mem.startsWith(u8, op, "xchg") or std.mem.startsWith(u8, op, "xadd")) and assembly.register(operands[0]) == null)
+            try checkedMemory(state.*, instruction, operands[0])
         else
             Value{};
         var value = source(state.*, instruction, operands[0]);
@@ -683,7 +737,7 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
             }
         }
         if (std.mem.startsWith(u8, op, "lea")) value = memory(state.*, instruction, operands[0]);
-        if (std.mem.eql(u8, op, "xor") or std.mem.eql(u8, op, "xorl") or std.mem.eql(u8, op, "xorq")) {
+        if (machine.sized(op, "xor")) {
             if (std.mem.eql(u8, operands[0], operands[1])) value = .{ .kind = .integer } else value = .{};
         } else if (machine.sized(op, "or") and destination != null) {
             const old = source(state.*, instruction, operands[1]);
@@ -722,19 +776,19 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
                 }
                 value.aligned = ~mask + 1;
             } else value = .{};
-        } else if (!std.mem.eql(u8, op, "mov") and !std.mem.eql(u8, op, "movq") and
-            !std.mem.eql(u8, op, "movl") and !std.mem.eql(u8, op, "movabsq") and
+        } else if (!machine.sized(op, "mov") and !std.mem.eql(u8, op, "movabsq") and
             !std.mem.eql(u8, op, "movabs") and !std.mem.startsWith(u8, op, "movz") and !std.mem.startsWith(u8, op, "lea")) value = .{};
-        if (destination) |reg| {
-            writeRegister(state, reg, assembly.registerWidth(operands[1]).?, value);
+        if (destination != null) {
+            try writeOperand(state, operands[1], value);
         } else if (machine.vectorIndex(operands[1])) |reg| {
             state.vector_zero[reg] = 0;
         } else {
             const width = try machine.writeBytes(instruction, operands[0]);
             if (!std.mem.startsWith(u8, op, "mov")) value = .{};
-            const location = memory(state.*, instruction, operands[1]);
-            try state.store(location, value, width, options.slot);
-            if (location.kind == .stack and machine.vectorMove(op)) {
+            const target = try storeOperand(instruction, operands[1]);
+            const location = try checkedMemory(state.*, instruction, target.address);
+            try state.store(location, if (target.masked) .{} else value, width, options.slot);
+            if (!target.masked and location.kind == .stack and machine.vectorMove(op)) {
                 if (machine.vectorIndex(operands[0])) |reg| {
                     if (state.vector_zero[reg] >= width) {
                         var offset: u8 = 0;
@@ -759,10 +813,11 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
     if (all.len == 1 and assembly.register(instruction.operands) == null and
         (machine.sized(op, "inc") or machine.sized(op, "dec") or machine.sized(op, "neg") or machine.sized(op, "not")))
     {
-        try state.store(memory(state.*, instruction, instruction.operands), .{}, try machine.writeBytes(instruction, ""), options.slot);
+        try state.store(try checkedMemory(state.*, instruction, instruction.operands), .{}, try machine.writeBytes(instruction, ""), options.slot);
         return;
     }
     if (assembly.register(instruction.operands)) |reg| {
+        if (assembly.registerBitOffset(instruction.operands) != 0) return error.UnsupportedProvenanceInstruction;
         if (!machine.sized(op, "inc") and !machine.sized(op, "dec") and !machine.sized(op, "neg") and !machine.sized(op, "not") and !machine.sized(op, "bswap") and machine.condition(op, "set") == null)
             return error.UnsupportedProvenanceInstruction;
         state.regs[reg] = .{};

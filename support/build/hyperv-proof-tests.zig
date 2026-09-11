@@ -52,6 +52,186 @@ fn controls() [8]Instruction {
     };
 }
 
+test "review regression high-byte reads cannot borrow the low byte" {
+    var state = flow.State.entry(1);
+    state.regs[0] = .{ .kind = .integer, .id = 0x100 };
+    const value = flow.source(state, instruction("testb", "%ah, %ah"), "%ah");
+    try std.testing.expect(value.kind == .unknown or
+        (value.kind == .integer and value.id == 1 and value.upper == null));
+}
+
+test "review regression masked stack stores cannot retain old pointer facts" {
+    var state = flow.State.entry(1);
+    const location = state.regs[4].plus(16);
+    try state.store(location, .{ .kind = .address, .id = 0x1234 }, 8, .none);
+    flow.step(&state, instruction("vmovdqu64", "%zmm0, 16(%rsp) {%k1}"), .{}) catch |err| switch (err) {
+        error.UnsupportedProvenanceInstruction, error.UnsupportedMemoryWidth => return,
+        else => return err,
+    };
+    try std.testing.expect(state.get(location).kind == .unknown);
+}
+
+test "high byte aliases read their own slice without inventing unknown bits" {
+    const highs = [_][]const u8{ "%ah", "%ch", "%dh", "%bh" };
+    const lows = [_][]const u8{ "%al", "%cl", "%dl", "%bl" };
+    for (highs, lows, 0..) |high, low, reg| {
+        try std.testing.expectEqual(reg, assembly.register(high).?);
+        try std.testing.expectEqual(8, assembly.registerBitOffset(high));
+        try std.testing.expectEqual(0, assembly.registerBitOffset(low));
+        for ([_]u64{ 0x100, 1, 0x1234, 0xff00, 0x8877665544332211 }) |value| {
+            var state = flow.State.entry(1);
+            state.regs[reg] = .{ .kind = .integer, .id = value };
+            try std.testing.expectEqual((value >> 8) & 255, flow.source(state, instruction("movzbl", ""), high).id);
+            try std.testing.expectEqual(value & 255, flow.source(state, instruction("movzbl", ""), low).id);
+        }
+        var state = flow.State.entry(1);
+        state.regs[reg] = .{ .kind = .integer, .id = 0x34, .bits = 8 };
+        try std.testing.expectEqual(.unknown, flow.source(state, instruction("testb", ""), high).kind);
+        state.regs[reg] = .{ .kind = .integer, .id = 0x1234, .bits = 16 };
+        try std.testing.expectEqual(0x12, flow.source(state, instruction("testb", ""), high).id);
+        state.regs[reg] = .{ .kind = .integer, .upper = 65535 };
+        try std.testing.expectEqual(.unknown, flow.source(state, instruction("testb", ""), high).kind);
+        state.regs[reg] = .{ .kind = .address, .id = 0x100 };
+        try std.testing.expectEqual(.unknown, flow.source(state, instruction("testb", ""), high).kind);
+    }
+}
+
+test "high byte writes preserve low and upper slices without claiming full knowledge" {
+    for ([_][]const u8{ "%ah", "%ch", "%dh", "%bh" }, 0..) |high, reg| {
+        const move = try std.fmt.allocPrint(std.testing.allocator, "$0xaa, {s}", .{high});
+        defer std.testing.allocator.free(move);
+        var state = flow.State.entry(1);
+        state.regs[reg] = .{ .kind = .integer, .id = 0x1122334455667788 };
+        try flow.step(&state, instruction("movb", move), .{});
+        try std.testing.expectEqual(0x112233445566aa88, state.regs[reg].id);
+        try std.testing.expectEqual(64, state.regs[reg].bits);
+        state.regs[reg] = .{ .kind = .integer, .id = 0x34, .bits = 8 };
+        try flow.step(&state, instruction("movb", move), .{});
+        try std.testing.expectEqual(0xaa34, state.regs[reg].id);
+        try std.testing.expectEqual(16, state.regs[reg].bits);
+        try std.testing.expect(!state.regs[reg].isZero());
+        state.regs[reg] = .{ .kind = .heap, .id = 9, .size = 128 };
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, instruction("movb", move), .{}));
+    }
+}
+
+test "high byte TEST CMP MOVZX and conditional writes use the correct flags and slices" {
+    for ([_][]const u8{ "%ah", "%ch", "%dh", "%bh" }, 0..) |high, reg| {
+        for ([_]u64{ 0x100, 1 }) |value| {
+            for ([_][]const u8{ "testb", "cmpb" }) |op| {
+                const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, {s}", .{ if (std.mem.eql(u8, op, "testb")) high else "$0", high });
+                defer std.testing.allocator.free(operands);
+                var initial = flow.State.entry(1);
+                initial.regs[reg] = .{ .kind = .integer, .id = value };
+                var result = try trace(&.{
+                    instruction(op, operands), instruction("je", "4 <zero>"),
+                    instruction("retq", ""),   instruction("nop", ""),
+                }, initial, .none);
+                defer result.deinit();
+                try std.testing.expectEqual(value == 1, result.analysis.seen[3]);
+                try std.testing.expectEqual(value == 0x100, result.analysis.seen[2]);
+            }
+            const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, %esi", .{high});
+            defer std.testing.allocator.free(operands);
+            var initial = flow.State.entry(1);
+            initial.regs[reg] = .{ .kind = .integer, .id = value };
+            var result = try trace(&.{instruction("movzbl", operands)}, initial, .none);
+            defer result.deinit();
+            try std.testing.expectEqual(value >> 8, result.analysis.after[0].regs[6].id);
+            try std.testing.expectEqual(64, result.analysis.after[0].regs[6].bits);
+        }
+        const sign_operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, {s}", .{ high, high });
+        defer std.testing.allocator.free(sign_operands);
+        var initial = flow.State.entry(1);
+        initial.regs[reg] = .{ .kind = .integer, .id = 0x8000 };
+        var sign = try trace(&.{
+            instruction("testb", sign_operands), instruction("js", "4 <negative>"),
+            instruction("retq", ""),             instruction("nop", ""),
+        }, initial, .none);
+        defer sign.deinit();
+        try std.testing.expect(sign.analysis.seen[3]);
+        try std.testing.expect(!sign.analysis.seen[2]);
+    }
+    const NoCalls = struct {
+        fn call(_: ?*anyopaque, _: Instruction, _: flow.State, _: flow.Options) ![]flow.State {
+            return error.UnexpectedCall;
+        }
+    };
+    var initial = flow.State.entry(1);
+    initial.regs[0] = .{ .kind = .integer, .id = 0x12 };
+    initial.regs[7] = .{ .kind = .integer };
+    const ops = [_]Instruction{
+        .{ .address = 1, .size = 1, .op = "testq", .operands = "%rdi, %rdi" },
+        .{ .address = 2, .size = 1, .op = "sete", .operands = "%ah" },
+        .{ .address = 3, .size = 1, .op = "retq" },
+    };
+    const results = try @import("hyperv-proof-paths.zig").run(std.testing.allocator, &ops, initial, .{}, NoCalls.call);
+    defer std.testing.allocator.free(results);
+    try std.testing.expectEqual(1, results.len);
+    try std.testing.expectEqual(0x112, results[0].regs[0].id);
+    for ([_][]const u8{ "%ah", "%ch", "%dh", "%bh" }) |high| {
+        var ap = controls();
+        const operands = try std.fmt.allocPrint(std.testing.allocator, "$0x20, {s}", .{high});
+        defer std.testing.allocator.free(operands);
+        ap[0] = instruction("movb", operands);
+        try std.testing.expectError(error.MissingCr4Pae, proofs.pagingControls(&ap));
+    }
+}
+
+test "masked stores invalidate every possible written byte without manufacturing zero or aliases" {
+    for ([_][]const u8{ "%xmm0", "%ymm0", "%zmm0" }, [_]i64{ 16, 32, 64 }) |reg, width| {
+        for ([_]i64{ 16 - width, 17 - width, 16, 24 }) |offset| {
+            var state = flow.State.entry(1);
+            const slot = state.regs[4].plus(16);
+            const other = state.regs[4].plus(128);
+            try state.store(slot, .{ .kind = .address, .id = 0x1234 }, 8, .none);
+            try state.store(other, .{ .kind = .integer, .id = 91 }, 8, .none);
+            state.vector_zero[0] = 64;
+            const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, {d}(%rsp) {{%k1}}", .{ reg, offset });
+            defer std.testing.allocator.free(operands);
+            try flow.step(&state, instruction("vmovdqu64", operands), .{});
+            const overlaps = offset < 24 and offset + width > 16;
+            try std.testing.expectEqual(!overlaps, state.get(slot).addressIs(0x1234, true));
+            if (overlaps) try std.testing.expectEqual(.unknown, state.get(slot).kind);
+            try std.testing.expectEqual(91, state.get(other).id);
+        }
+    }
+    var state = flow.State.entry(1);
+    state.escaped_stack = true;
+    state.regs[3] = .{ .kind = .heap, .id = 1, .size = 256 };
+    const slot = state.regs[4].plus(16);
+    try state.store(slot, .{ .kind = .address, .id = 0x1234 }, 8, .none);
+    try flow.step(&state, instruction("vmovdqu64", "%zmm0, 128(%rbx){%k7}"), .{});
+    try std.testing.expect(state.get(slot).addressIs(0x1234, true));
+}
+
+test "unsupported memory syntax and implicit footprints refuse instead of preserving stack evidence" {
+    for ([_][]const u8{
+        "%fs:16(%rsp)",    "%gs:16(%rsp)",    "16(%esp)",             "16(%ah)",
+        "16(%rsp,%eax,1)", "16(%rsp,%rax,3)", "16(%rsp,%rax,1,%rbx)", "16(%rsp) trailing",
+        "16(%rsp) {%k0}",  "16(%rsp) {%k8}",  "16(%rsp) {%k1}{z}",
+    }) |destination| {
+        var state = flow.State.entry(1);
+        try state.store(state.regs[4].plus(16), .{ .kind = .address, .id = 0x1234 }, 8, .none);
+        const operands = try std.fmt.allocPrint(std.testing.allocator, "%zmm0, {s}", .{destination});
+        defer std.testing.allocator.free(operands);
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, instruction("vmovdqu64", operands), .{}));
+    }
+    for ([_]u8{ 0x67, 0x64, 0x65, 0x2e }) |prefix| {
+        var state = flow.State.entry(1);
+        var store = instruction("movq", "%rax, 16(%rsp)");
+        store.size = 6;
+        @memcpy(store.bytes[0..6], &[_]u8{ prefix, 0x48, 0x89, 0x44, 0x24, 0x10 });
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, store, .{}));
+    }
+    for ([_][]const u8{ "movsq", "stosq" }) |op| {
+        var state = flow.State.entry(1);
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, instruction(op, ""), .{}));
+    }
+    var state = flow.State.entry(1);
+    try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, instruction("movq", "%rdi, 16(%rsp,%rax)"), .{}));
+}
+
 test "narrow pointer loads and partial scalars cannot supply full ABI values" {
     var initial = flow.State.entry(1);
     initial.regs[3] = .{ .kind = .heap, .id = 1, .size = 128 };
@@ -205,11 +385,15 @@ test "AP paging preserves every legacy required control and rejects clobbering" 
         .{ .index = 0, .replacement = instruction("movl", "$0, %eax"), .err = error.MissingCr4Pae },
         .{ .index = 1, .replacement = instruction("movq", "%rbx, %cr4"), .err = error.OverwrittenPagingControl },
         .{ .index = 2, .replacement = instruction("movl", "$1, %edx"), .err = error.MissingEferNxeLme },
+        .{ .index = 2, .replacement = instruction("xorb", "%dh, %dh"), .err = error.MissingEferNxeLme },
         .{ .index = 3, .replacement = instruction("movl", "$0x100, %eax"), .err = error.MissingEferNxeLme },
+        .{ .index = 3, .replacement = instruction("movb", "$9, %ah"), .err = error.MissingEferNxeLme },
         .{ .index = 3, .replacement = instruction("movl", "$0x800, %eax"), .err = error.MissingEferNxeLme },
         .{ .index = 4, .replacement = instruction("movl", "$0xc0000081, %ecx"), .err = error.MissingEferNxeLme },
+        .{ .index = 4, .replacement = instruction("movb", "$0x80, %ch"), .err = error.MissingEferNxeLme },
         .{ .index = 6, .replacement = instruction("movl", "$0x80000001, %eax"), .err = error.MissingCr0PeWpPg },
         .{ .index = 6, .replacement = instruction("movl", "$0x10001, %eax"), .err = error.MissingCr0PeWpPg },
+        .{ .index = 6, .replacement = instruction("movb", "$1, %ah"), .err = error.MissingCr0PeWpPg },
         .{ .index = 6, .replacement = instruction("movl", "$0x80010000, %eax"), .err = error.MissingCr0PeWpPg },
     };
     for (mutations) |mutation| {
@@ -233,10 +417,13 @@ test "callback bindings require actual full-width stores and track register clob
         instruction("popq", "%rdi"),            instruction("xchgq", "%rdi, %rax"),
         instruction("xaddq", "%rdi, %rax"),     instruction("movw", "$0, %di"),
         instruction("callq", "0x10 <clobber>"), instruction("cmpxchgq", "%rsi, %rdi"),
-        instruction("movsq", "(%rsi), (%rdi)"), instruction("popcntq", "%rax, %rdi"),
+        instruction("popcntq", "%rax, %rdi"),
     }) |clobber| {
         try std.testing.expect(!try stored(&.{ materialize, clobber, store }, true));
     }
+    try std.testing.expectError(error.UnsupportedProvenanceInstruction, stored(&.{
+        materialize, instruction("movsq", "(%rsi), (%rdi)"), store,
+    }, true));
     try std.testing.expect(try stored(&.{
         materialize,                          instruction("movq", "%rdi, %r12"),
         instruction("callq", "0x10 <other>"), instruction("movq", "%r12, 0x10(%rbx)"),

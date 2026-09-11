@@ -46,7 +46,7 @@ pub fn run(allocator: std.mem.Allocator, instructions: []const assembly.Instruct
             const is_set = std.mem.startsWith(u8, pc.op, "set");
             const operands = try assembly.Operands.parse(pc);
             const target = operands.items[operands.len - 1];
-            const reg = assembly.register(target) orelse return error.UnsupportedProvenanceInstruction;
+            _ = assembly.register(target) orelse return error.UnsupportedProvenanceInstruction;
             var choices: std.ArrayList(flow.State) = .empty;
             errdefer choices.deinit(allocator);
             if (operands.len != @as(usize, if (is_set) 1 else 2)) return error.UnsupportedProvenanceInstruction;
@@ -55,9 +55,9 @@ pub fn run(allocator: std.mem.Allocator, instructions: []const assembly.Instruct
             for ([_]bool{ false, true }) |take| {
                 var state = flow.branch(item.state, branch_op, take) orelse continue;
                 if (is_set) {
-                    flow.writeRegister(&state, reg, 8, .{ .kind = .integer, .id = @intFromBool(take) });
+                    try flow.writeOperand(&state, target, .{ .kind = .integer, .id = @intFromBool(take) });
                 } else if (take) {
-                    flow.writeRegister(&state, reg, assembly.registerWidth(target).?, flow.source(state, pc, operands.items[0]));
+                    try flow.writeOperand(&state, target, flow.source(state, pc, operands.items[0]));
                 }
                 try choices.append(allocator, state);
             }

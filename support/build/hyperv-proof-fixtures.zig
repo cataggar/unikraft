@@ -277,17 +277,28 @@ fn heapRegressions(f: *Fixture) !void {
     try std.testing.expectEqual(1, methods);
 }
 
+fn constructorCase(f: *Fixture, name: []const u8, status: u8, diagnostic: ?[]const u8) !void {
+    const bytes = try f.edit();
+    const body = (try f.model.symbol(name)).header;
+    const constructor = try f.symbolOffset("libstorvsc_vmbus_register_driver");
+    std.mem.writeInt(u64, bytes[constructor + 8 ..][0..8], body.st_value, .little);
+    std.mem.writeInt(u64, bytes[constructor + 16 ..][0..8], body.st_size, .little);
+    try f.pointer(bytes, try f.model.address("__uk_ctortab1_libstorvsc_vmbus_register_driver"), body.st_value);
+    try f.check(try f.save(name, bytes), "drivers", status, diagnostic);
+}
+
 fn operandRegressions(f: *Fixture) !void {
-    for ([_][]const u8{ "proof_imul_one", "proof_imul_zero" }, [_]u8{ 0, 1 }) |name, status| {
-        const bytes = try f.edit();
-        const body = (try f.model.symbol(name)).header;
-        const constructor = try f.symbolOffset("libstorvsc_vmbus_register_driver");
-        std.mem.writeInt(u64, bytes[constructor + 8 ..][0..8], body.st_value, .little);
-        std.mem.writeInt(u64, bytes[constructor + 16 ..][0..8], body.st_size, .little);
-        try f.pointer(bytes, try f.model.address("__uk_ctortab1_libstorvsc_vmbus_register_driver"), body.st_value);
-        const path = try f.save(name, bytes);
-        try f.check(path, "drivers", status, if (status == 1) "DriverArgumentMismatch" else null);
+    for ([_][]const u8{ "proof_imul_one", "proof_imul_zero" }, [_]u8{ 0, 1 }) |name, status|
+        try constructorCase(f, name, status, if (status == 1) "DriverArgumentMismatch" else null);
+    for ([_][]const u8{ "ah", "ch", "dh", "bh", "high_write" }) |alias| {
+        try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_{s}_zero", .{alias}), 0, null);
+        try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_{s}_nonzero", .{alias}), 1, "DriverArgumentMismatch");
     }
+    try constructorCase(f, "proof_masked_stack_disjoint", 0, null);
+    try constructorCase(f, "proof_masked_stack_overlap", 1, "DriverArgumentMismatch");
+    try constructorCase(f, "proof_masked_stack_not_zero", 1, "DriverArgumentMismatch");
+    try constructorCase(f, "proof_segment_stack_store", 1, "UnsupportedProvenanceInstruction");
+    try constructorCase(f, "proof_addr32_stack_store", 1, "UnsupportedProvenanceInstruction");
     const hook = try f.edge("schedcoop_create", "proof_callback_hook");
     for ([_][]const u8{
         "proof_xmm_before",  "proof_xmm_overlap", "proof_ymm_before",

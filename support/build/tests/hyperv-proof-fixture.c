@@ -486,6 +486,46 @@ VMBUS_DRIVER_REGISTER(&netvsc_driver);
 REGISTER_IMUL(proof_imul_one, "1")
 REGISTER_IMUL(proof_imul_zero, "0")
 
+#define REGISTER_REVIEW(name, setup) \
+	__attribute__((naked)) void name(void) \
+	{ \
+		__asm__ volatile("pushq %rbx\n" setup "\n" \
+				 "callq _vmbus_register_driver\npopq %rbx\nretq"); \
+	}
+#define SELECT_HIGH_BYTE \
+	"jne 1f\nleaq storvsc_driver(%rip), %rdi\njmp 2f\n" \
+	"1: xorl %edi, %edi\n2:"
+#define HIGH_BYTE_CASE(name, reg, value, read) \
+	REGISTER_REVIEW(name, "movl $" value ", " reg "\n" read "\n" SELECT_HIGH_BYTE)
+HIGH_BYTE_CASE(proof_ah_zero, "%eax", "1", "testb %ah, %ah")
+HIGH_BYTE_CASE(proof_ah_nonzero, "%eax", "256", "testb %ah, %ah")
+HIGH_BYTE_CASE(proof_ch_zero, "%ecx", "1", "cmpb $0, %ch")
+HIGH_BYTE_CASE(proof_ch_nonzero, "%ecx", "256", "cmpb $0, %ch")
+HIGH_BYTE_CASE(proof_dh_zero, "%edx", "1", "movzbl %dh, %eax\ntestl %eax, %eax")
+HIGH_BYTE_CASE(proof_dh_nonzero, "%edx", "256", "movzbl %dh, %eax\ntestl %eax, %eax")
+HIGH_BYTE_CASE(proof_bh_zero, "%ebx", "1", "testb %bh, %bh")
+HIGH_BYTE_CASE(proof_bh_nonzero, "%ebx", "256", "testb %bh, %bh")
+HIGH_BYTE_CASE(proof_high_write_zero, "%eax", "257", "movb $0, %ah\ntestb %ah, %ah")
+HIGH_BYTE_CASE(proof_high_write_nonzero, "%eax", "1", "movb $1, %ah\ntestb %ah, %ah")
+
+#define STACK_DESCRIPTOR \
+	"subq $96, %rsp\nleaq storvsc_driver(%rip), %rdi\nmovq %rdi, 16(%rsp)\n"
+#define RELOAD_DESCRIPTOR "movq 16(%rsp), %rdi\naddq $96, %rsp"
+#define MASKED_STACK(name, offset) \
+	REGISTER_REVIEW(name, STACK_DESCRIPTOR \
+		       "vpxord %zmm0, %zmm0, %zmm0\n" \
+		       "vmovdqu64 %zmm0, " offset "(%rsp) {%k1}\n" RELOAD_DESCRIPTOR)
+MASKED_STACK(proof_masked_stack_overlap, "16")
+MASKED_STACK(proof_masked_stack_disjoint, "32")
+REGISTER_REVIEW(proof_masked_stack_not_zero,
+	"subq $96, %rsp\nmovq $1, 16(%rsp)\n"
+	"vpxord %zmm0, %zmm0, %zmm0\nvmovdqu64 %zmm0, 16(%rsp) {%k1}\n"
+	"cmpq $0, 16(%rsp)\n" SELECT_HIGH_BYTE "\naddq $96, %rsp")
+REGISTER_REVIEW(proof_segment_stack_store,
+	STACK_DESCRIPTOR "movq $0, %gs:16(%rsp)\n" RELOAD_DESCRIPTOR)
+REGISTER_REVIEW(proof_addr32_stack_store,
+	STACK_DESCRIPTOR "movq $0, 16(%esp)\n" RELOAD_DESCRIPTOR)
+
 #if !PROOF_OBJECT_SCHED
 #define VECTOR_STORE(name, zero, store, offset) \
 	__attribute__((naked)) void name(void) \
@@ -504,6 +544,11 @@ VECTOR_STORE(proof_zmm_after, "vpxord %zmm0, %zmm0, %zmm0", "vmovdqu64 %zmm0", "
 #endif
 static void (*volatile proof_transform_refs[])(void) = {
 	proof_imul_one, proof_imul_zero,
+	proof_ah_zero, proof_ah_nonzero, proof_ch_zero, proof_ch_nonzero,
+	proof_dh_zero, proof_dh_nonzero, proof_bh_zero, proof_bh_nonzero,
+	proof_high_write_zero, proof_high_write_nonzero,
+	proof_masked_stack_overlap, proof_masked_stack_disjoint, proof_masked_stack_not_zero,
+	proof_segment_stack_store, proof_addr32_stack_store,
 #if !PROOF_OBJECT_SCHED
 	proof_xmm_before, proof_xmm_overlap, proof_ymm_before,
 	proof_ymm_overlap, proof_ymm_exact, proof_ymm_after,

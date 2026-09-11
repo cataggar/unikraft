@@ -61,6 +61,9 @@ oracle, proof executor, or install hook is involved.
 | Callback facts survive only valid register/memory operations | Full-width immediate/register stores, copies, stack spills, partial/unary/exchange writes, caller/callee-saved effects; overlapping stores and escaped-stack writes invalidate facts and publication |
 | Every operand and implicit GP write participates in provenance | Real LLVM `imulq $0, %rdi, %rdi` registration refusal and `$1` positive case; numeric multiplication, MUL/DIV/CPUID/RDTSCP and unknown-operation units |
 | Constructor vector stores use their actual footprint | Real XMM16/YMM32/ZMM64 boundary fixtures, including YMM at callback-minus-24, ZMM at callback-minus-56, exact-slot and non-overlap cases; scalar SSE widths and merge-mask uncertainty units |
+| High-byte aliases cannot borrow low-byte values or parent-register identity | All AH/CH/DH/BH slices, differing high/low bytes, partial knowledge, MOVZX, TEST/CMP/sign branches, high-byte writes and SETcc; real LLVM positive/negative constructor branches and unchanged AP full-register requirements |
+| Mask-decorated stores cannot retain spilled pointers/lengths or invent zero | Real masked ZMM stack overlap/disjoint and zero-branch fixtures; XMM/YMM/ZMM potential-write boundaries and preserved disjoint heap/stack facts |
+| Unmodeled address syntax is not a harmless unknown non-stack write | Checked write-address decoding; real GS and address-size-override refusals, retained prefix metadata, malformed masks/indexes/extra fields, and implicit-string footprint refusals |
 | SMP map/queue/worker effects preserve the published object | Heap constructor, bounded two-CPU map, retained tail pointer, independent thread allocation and actual indirect `thread_add` member at offset 8; map/queue redirection and helper/method overwrites refuse |
 | Partial values, flags and stack slots cannot manufacture bindings | Narrow pointer-load, partial scalar/null return, CMPXCHG flag, compare-snapshot, CALL return-address and masked-vector stack-argument regressions |
 | Registered-list and initial-image facts survive only justified writes | Current/previous scheduler callback protection, partial/unknown list-link refusal, dirty constant ranges and non-resurrection cases |
@@ -102,6 +105,14 @@ in the same register. CMPXCHG does not borrow ordinary CMP semantics. Opcode
 classification parses all operands; unsupported forms cannot retain stale
 argument provenance. Partial integers are not full-width ABI lengths or null
 return values, and narrow memory loads never preserve complete pointers.
+AH/CH/DH/BH read bits 8 through 15, not the low byte of their parent register.
+Such reads require known bits covering that slice; ranged or incomplete
+evidence becomes unknown. Supported high-byte writes preserve known low and
+upper bits and can extend known low-eight-bit evidence to sixteen bits without
+claiming a complete 64-bit value. Writes that cannot be represented safely
+and unmodeled high-byte unary/exchange forms are refused. Constructor conditional
+writes use the same slice-aware writer; AP control-register proofs still require
+their original full-register evidence.
 
 `hyperv-proof-binding.zig` derives the callback location from the actual
 `uk_thread_wake_isr` indirect load/call. The object form requires a scheduler
@@ -133,6 +144,20 @@ selected merely because they mention a callback symbol. CALL writes its real
 return address; caller-relative stack arguments and callee-local frame cleanup
 remain distinct. Known unmasked vector zeroes can initialize stack arguments;
 merge-masked XOR cannot manufacture zero-valued arguments.
+Masked vector stores with a trailing `{%k1}` through `{%k7}` invalidate their
+entire potentially written scalar/XMM/YMM/ZMM range. They never establish
+zero-valued cells, even when the source vector is known zero: a masked-off
+lane retains its old contents. Disjoint tracked stack slots and justified
+heap-versus-stack separation remain intact.
+
+Memory writes use checked address decoding, distinct from a valid address
+whose value is not known. Segment/address-size overrides (including retained
+raw/textual prefixes), non-64-bit address registers, malformed masks/indexes,
+and unrepresentable stack-dependent indexing refuse provenance analysis
+instead of falling back to a non-stack write. Implicit string instructions
+also refuse rather than approximating an unknown footprint as sixteen bytes.
+The reviewed bounded memory-API contracts below remain available; the
+separate returning-IRQ instruction policy is unchanged.
 
 The entry contract is the selected cooperative-scheduler startup ABI: the
 four allocator arguments are valid allocator objects, as supplied by

@@ -52,6 +52,17 @@ pub const Instruction = struct {
     op: []const u8,
     operands: []const u8 = "",
     annotated_reference: ?u64 = null,
+    address_override: bool = false,
+
+    pub fn hasAddressOverride(self: Instruction) bool {
+        if (self.address_override) return true;
+        for (self.bytes[0..self.size]) |byte| switch (byte) {
+            0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x67 => return true,
+            0x40...0x4f, 0x66, 0xf0, 0xf2, 0xf3 => {},
+            else => break,
+        };
+        return false;
+    }
 
     pub fn isCall(self: Instruction) bool {
         return std.mem.startsWith(u8, self.op, "call");
@@ -201,6 +212,10 @@ pub const Program = struct {
             }
             while (opcode) |op| {
                 if (!isPrefix(op)) break;
+                if (std.mem.eql(u8, op, "addr32") or std.mem.eql(u8, op, "cs") or
+                    std.mem.eql(u8, op, "ds") or std.mem.eql(u8, op, "es") or
+                    std.mem.eql(u8, op, "ss") or std.mem.eql(u8, op, "fs") or std.mem.eql(u8, op, "gs"))
+                    instruction.address_override = true;
                 opcode = tokens.next();
             }
             instruction.op = opcode orelse ".prefix";
@@ -217,6 +232,7 @@ pub const Program = struct {
                     previous.op = instruction.op;
                     previous.operands = instruction.operands;
                     previous.annotated_reference = instruction.annotated_reference;
+                    previous.address_override = previous.address_override or instruction.address_override;
                     continue;
                 }
             }
@@ -360,6 +376,13 @@ pub fn registerWidth(operand: []const u8) ?u8 {
     };
 }
 
+pub fn registerBitOffset(operand: []const u8) u6 {
+    const value = std.mem.trim(u8, operand, " \t");
+    for ([_][]const u8{ "%ah", "%ch", "%dh", "%bh" }) |name|
+        if (std.mem.eql(u8, value, name)) return 8;
+    return 0;
+}
+
 test "NM refuses malformed truncated empty and ambiguous-format tool output" {
     for ([_][]const u8{ "", "0000 T fn", "garbage\n", "0000 TT fn\n", "0000 T\n", "xyz T fn\n" }) |text|
         try std.testing.expectError(error.MalformedNmOutput, Symbols.parse(std.testing.allocator, text));
@@ -385,4 +408,18 @@ test "objdump rejects omitted bytes gaps duplicate instructions and bad architec
     try std.testing.expectError(error.IncompleteDisassembly, Program.parse(std.testing.allocator, prefix ++ " 11: c3 retq\n"));
     try std.testing.expectError(error.IncompleteDisassembly, Program.parse(std.testing.allocator, prefix ++ " 10: 90 nop\n 12: c3 retq\n"));
     try std.testing.expectError(error.UnsupportedDisassemblyArchitecture, Program.parse(std.testing.allocator, "image: file format elf64-littleaarch64\n"));
+}
+
+test "decoded address prefixes remain visible to memory provenance" {
+    var program = try Program.parse(std.testing.allocator, "image: file format elf64-x86-64\n10 <entry>:\n" ++
+        " 10: 67 48 89 44 24 10 addr32 movq %rax, 0x10(%rsp)\n" ++
+        " 16: 65 48 89 44 24 10 movq %rax, %gs:0x10(%rsp)\n" ++
+        " 1c: 48 89 44 24 10 movq %rax, 0x10(%rsp)\n" ++
+        " 21: c3 retq\n");
+    defer program.deinit();
+    const body = try program.body(0x10);
+    try std.testing.expect(body[0].address_override);
+    try std.testing.expect(body[0].hasAddressOverride());
+    try std.testing.expect(body[1].hasAddressOverride());
+    try std.testing.expect(!body[2].hasAddressOverride());
 }

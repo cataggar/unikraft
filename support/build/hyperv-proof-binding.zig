@@ -43,7 +43,7 @@ pub fn arguments(model: Model, caller: []const u8, callee: []const u8, reg: u4, 
 
 fn indirectLocation(state: flow.State, instruction: assembly.Instruction) flow.Value {
     const operand = std.mem.trim(u8, instruction.operands[1..], " \t");
-    if (assembly.register(operand)) |reg| return state.regs[reg].location() orelse .{};
+    if (assembly.register(operand) != null) return flow.source(state, instruction, operand).location() orelse .{};
     return flow.memory(state, instruction, operand);
 }
 
