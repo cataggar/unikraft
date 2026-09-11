@@ -221,7 +221,11 @@ const Fixture = struct {
     }
 
     fn run(self: Fixture) !boot.runner.Report {
-        return boot.runner.run(self.arena.allocator(), io, self.config, .{ .self_executable = self.cli });
+        const report = try boot.runner.run(self.arena.allocator(), io, self.config, .{ .self_executable = self.cli });
+        if (report.serial_bytes == 0) {
+            std.debug.print("native local fixture before serial: {s}", .{try report.encode(self.arena.allocator())});
+        }
+        return report;
     }
 
     fn work(self: Fixture) !core.private_files.Directory {
