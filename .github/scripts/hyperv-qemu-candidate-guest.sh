@@ -241,7 +241,22 @@ if [[ "$1" == build ]]; then
     -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt --summary all
   )
   run_bounded "$evidence/logs/olddefconfig.log" 600 $((8 * 1024 * 1024)) \
-    "$zig" build olddefconfig "${image_args[@]}"
+    "$zig" build olddefconfig "${image_args[@]}" || {
+      status=$?
+      diagnostic=0
+      for selected in "$evidence/native-make-environment.json" "$bison_data" "$m4" \
+        "$shell" "$TMPDIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+        "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"; do
+        path="$selected"
+        while true; do
+          stat -c '%F mode=%a uid=%u gid=%g links=%h %n' -- "$path" || diagnostic=$?
+          [[ "$path" != / ]] || break
+          path="$(dirname "$path")"
+        done
+      done > "$evidence/native-make-paths.txt"
+      printf 'candidate guest: configuration exit=%s path-diagnostics=%s\n' "$status" "$diagnostic" >&2
+      exit "$status"
+    }
   assert_config
   run_bounded "$evidence/logs/native-images.log" 1800 $((8 * 1024 * 1024)) \
     "$zig" build native-images -Dnative-profile=hyperv-x86_64-efi-netvsc "${image_args[@]}"
