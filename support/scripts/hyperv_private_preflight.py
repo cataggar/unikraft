@@ -154,10 +154,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "45e3233ddbea9f55af4d51892b7e2733edcf447039c8dd713ad364553be10a2b"
+            "54a48b14fc9e92bd54240a00a0efa6bc16e9756177e03c42e641ad6645b0962c"
         ),
-        "size": 1433902,
-        "files": 198,
+        "size": 1444868,
+        "files": 199,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -205,6 +205,7 @@ GUARDED_BUILD_CONTROL_FILES = (
     "support/build/native-kconfig-bridge.c",
     "support/build/native-library-link.zig",
     "support/build/native-lto.zig",
+    "support/build/native-make-environment.zig",
     "support/build/native-postprocess-runner.py",
     "support/build/native-postprocess-runner.zig",
     "support/build/native-postprocess.zig",
@@ -219,6 +220,7 @@ GUARDED_BUILD_CONTROL_FILES = (
     "support/build/zig-facade-runner.zig",
     "support/tools/hyperv/contracts.zig",
     "support/tools/hyperv/diagnostics.zig",
+    "support/tools/hyperv/private_files.zig",
     "support/tools/hyperv/process.zig",
     "support/tools/hyperv/sensitive.zig",
 )
@@ -249,7 +251,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "5488c5b65458987a515c081461b2b8c5749a8ec10e61369d261d861ea049fe3f"
+        "e1bc884e9ba8a0186761c5827ac796d1e3ff17cff09fc19d2100d311c8e6a893"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -344,6 +346,9 @@ GUARDED_PRODUCER_FILES = {
     "support/build/native-lto.zig": (
         "cb5a2c661288b243ce97246c27e5c3a6b8b33aa9c037fdb263a42a1774aaba4a"
     ),
+    "support/build/native-make-environment.zig": (
+        "c0378d861818b6af9eb85bc3a30db9355c1f4861c45c1cc22bd6c8f381134063"
+    ),
     "support/build/native-target-object.zig": (
         "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
     ),
@@ -376,6 +381,9 @@ GUARDED_PRODUCER_FILES = {
     ),
     "support/tools/hyperv/diagnostics.zig": (
         "94138509d8f0818818591f8fbe6181bd1cee09cbff0970506e46b00c989484b7"
+    ),
+    "support/tools/hyperv/private_files.zig": (
+        "dac40c596ccba73af72af8022b72af614f149d93ff2ccf3c7a9aead9ae08d997"
     ),
     "support/tools/hyperv/process.zig": (
         "89e501b82c888eae5ab0cb716909e1f035d640f693e965073890bbd015811120"
