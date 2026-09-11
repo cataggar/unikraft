@@ -143,6 +143,8 @@ if [[ "$1" == build ]]; then
     "$guest/zig-global-cache" "$guest/empty-packages" "$guest/public-image" "$guest/image"
   mkdir -m 700 "$evidence/logs" "$guest/public-image/zig-local-cache" "$guest/public-image/out" \
     "$guest/image/zig-local-cache" "$guest/image/out"
+  # Zig 0.16 ZIP fetching does not create this parent before its exclusive file.
+  mkdir -m 700 "$guest/zig-global-cache/tmp"
   export TMPDIR="$guest/tmp" XDG_CACHE_HOME="$guest/cache" XDG_CONFIG_HOME="$guest/xdg-config"
   export ZIG_GLOBAL_CACHE_DIR="$guest/zig-global-cache"
   export ZIG_LOCAL_CACHE_DIR="$guest/public-image/zig-local-cache"
