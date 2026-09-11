@@ -11,9 +11,9 @@ completed preflight, persistence acceptance, or historical evidence.
 executes it.** The native namespace fixtures execute real isolated processes;
 they are not a full root configure/build/package/engine-entry demonstration.
 The parent root bridge and native image proofs are merged upstream at
-`368dade0` (#129) and `53226729` (#130). This stacked branch has not been rebased
-or integrated with them; parent-directed integration and full root-produced
-engine entry remain necessary. After the recorded review release, the targeted
+`368dade0` (#129) and `53226729` (#130), and are included in this branch.
+Full root-produced engine entry remains necessary. After the recorded review
+release, the targeted
 source/runtime corrections replace lexical symlink normalization and
 architecture-specific Git fixture discovery. Native fixture paths are explicit;
 the reported runs are AArch64, not claimed x86_64 execution coverage.
@@ -35,7 +35,7 @@ manifest change or missing-dependency failure, using copied manifests and
 cd /d/unikraft-worktrees/fleet-ci
 umask 077
 scratch="$PWD/.d/zig-migration-preparation/control-cap-8mib"
-proof_fixture="$PWD/.d/zig-migration-preparation/proof-compat-53226729/fixtures"
+proof_fixture="$PWD"
 export TMPDIR="$scratch/tmp" HOME="$scratch/home"
 export XDG_CACHE_HOME="$scratch/cache"
 export XDG_CONFIG_HOME="$scratch/config"
@@ -70,11 +70,12 @@ options; no Git path, library discovery or architecture skip is substituted.
 `runtime.TestFixture.copyRuntime` is shared by both fixture builds. Missing
 fixture options fail tests, but ordinary package installation does not need
 fixture inputs.
+CI copies the trusted installed Git executable, its ELF interpreter and complete
+shared-library closure into private directories before supplying these options.
 
 The proof fixture reads actual root/builder/tool source bytes; it never executes
-the root build. `-Dproof-fixture` defaults to the current checkout root after
-integration. On this older stacked base, the example selects private snapshots
-of these three files from merged commit `53226729aafbc9654240656f6533f88a1dd7b983`:
+the root build. `-Dproof-fixture` defaults to the current checkout root. The
+example selects these actual files from that checkout:
 
 ```text
 build.zig
@@ -82,10 +83,8 @@ support/build/hyperv-proof-build.zig
 support/build/hyperv-proof-tool.zig
 ```
 
-Create a fresh fixture directory with that layout and populate it with
-`git show COMMIT:PATH` output, without changing the working checkout. These are
-read-only public source fixtures, not a complete reviewed producer checkout or
-fresh execution/admission evidence.
+These are read-only public source fixtures, not a complete reviewed producer
+checkout or fresh execution/admission evidence.
 
 The separate existing-runner namespace fixture build uses:
 

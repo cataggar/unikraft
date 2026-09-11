@@ -1063,6 +1063,64 @@ jobs:
               -Doptimize="${mode}" -j2 test install --summary all
         done
 
+    - name: Run native Hyper-V preparation and namespace fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-preparation"
+        runtime="${root}/git-runtime"
+        mkdir -p "${root}/restore" "${runtime}/lib"
+        # Only the installed public Git is inspected; fixtures copy its closure privately.
+        git_executable="$(readlink -f /usr/bin/git)"
+        llvm-readelf --program-headers --wide "${git_executable}" > "${root}/git-elf.txt"
+        loader="$(sed -n 's/.*Requesting program interpreter: \(\/[^]]*\)\].*/\1/p' "${root}/git-elf.txt")"
+        test -n "${loader}"
+        loader="$(readlink -f "${loader}")"
+        ldd "${git_executable}" > "${root}/git-ldd.txt"
+        awk '
+          $1 ~ /^linux-vdso/ { next }
+          $2 == "=>" && $3 ~ /^\// { print $3; next }
+          $1 ~ /^\// && $2 ~ /^\(0x[[:xdigit:]]+\)$/ { print $1; next }
+          NF { exit 1 }
+        ' "${root}/git-ldd.txt" > "${root}/git-runtime-paths.txt"
+        cp --no-preserve=mode,ownership "${git_executable}" "${runtime}/git"
+        cp --no-preserve=mode,ownership "${loader}" "${runtime}/loader"
+        chmod 500 "${runtime}/git" "${runtime}/loader"
+        git_fixture=(
+          "-Dgit-executable=${runtime}/git"
+          "-Dgit-loader=${runtime}/loader"
+        )
+        while IFS= read -r source; do
+          test -f "${source}"
+          if [ "$(readlink -f "${source}")" = "${loader}" ]; then continue; fi
+          destination="${runtime}/lib/$(basename "${source}")"
+          test ! -e "${destination}"
+          cp --no-preserve=mode,ownership "${source}" "${destination}"
+          git_fixture+=("-Dgit-library=${destination}")
+        done < "${root}/git-runtime-paths.txt"
+        test "${#git_fixture[@]}" -gt 2
+        cp support/tools/hyperv/preparation/build.zig \
+          support/tools/hyperv/preparation/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in Debug ReleaseSafe; do
+          mkdir -p "${root}/${mode}/namespace-work"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/preparation/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dproof-fixture="${GITHUB_WORKSPACE}" "${git_fixture[@]}" \
+              -Doptimize="${mode}" -j2 test install --summary all
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/namespace-cache" \
+            zig build --build-file support/tools/hyperv/preparation/namespace/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --cache-dir "${root}/${mode}/namespace-cache" \
+              --prefix "${root}/${mode}/namespace-out" \
+              -Dworkspace="${root}/${mode}/namespace-work" "${git_fixture[@]}" \
+              -Doptimize="${mode}" -j2 test install --summary all
+        done
+
     - name: Run native Hyper-V preflight engine fixtures
       run: |
         set -euo pipefail
