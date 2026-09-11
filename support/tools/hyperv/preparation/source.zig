@@ -2,7 +2,6 @@ const std = @import("std");
 const c = @import("contracts.zig");
 const fs = @import("files.zig");
 const rt = @import("runtime.zig");
-const paths = @import("facade_paths");
 
 pub const Entry = struct {
     path: []const u8,
@@ -248,7 +247,7 @@ pub fn physical(allocator: std.mem.Allocator, io: std.Io, directory: fs.Director
         hash.update(&entry.sha256);
         hash.update(entry.oid);
     }
-    for (entries) |entry| if (entry.target != null) try resolveLink(allocator, directory.path, entries, entry.path, 0);
+    for (entries) |entry| if (entry.target != null) try resolveLink(allocator, entries, entry.path);
     try checkUntracked(allocator, io, directory, directory.dir, entries, "", 0);
     const named_directory = try fs.Directory.open(allocator, io, directory.path);
     defer named_directory.close(allocator, io);
@@ -296,32 +295,59 @@ fn dirMetadata(dir: std.Io.Dir) !fs.Metadata {
     return fs.metadata(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } });
 }
 
-fn resolveLink(allocator: std.mem.Allocator, root: []const u8, entries: []const Entry, path: []const u8, depth: usize) !void {
-    if (depth > 32) return error.UnsafePath;
-    var parts = std.mem.splitScalar(u8, path, '/');
-    var position: usize = 0;
-    while (parts.next()) |part| {
-        position += part.len;
-        const index = entryPosition(entries, path[0..position]);
-        if (index < entries.len and std.mem.eql(u8, entries[index].path, path[0..position]) and entries[index].target != null) {
-            const entry = entries[index];
-            const target = entry.target.?;
-            if (target.len == 0 or std.fs.path.isAbsolute(target)) return error.UnsafePath;
-            const expanded = try std.fs.path.resolve(allocator, &.{
-                root, std.fs.path.dirname(entry.path) orelse ".", target, if (position < path.len) path[position + 1 ..] else ".",
-            });
-            if (!paths.isDescendant(root, expanded)) return error.UnsafePath;
-            const relative = expanded[root.len + 1 ..];
-            if (excluded(relative)) return error.UnsafePath;
-            return resolveLink(allocator, root, entries, relative, depth + 1);
+fn resolveLink(allocator: std.mem.Allocator, entries: []const Entry, path: []const u8) !void {
+    var pending = try allocator.dupe(u8, path);
+    defer allocator.free(pending);
+    var resolved: std.ArrayList(u8) = .empty;
+    defer resolved.deinit(allocator);
+    var offset: usize = 0;
+    var more = true;
+    var links: usize = 0;
+    while (more) {
+        const separator = std.mem.indexOfScalarPos(u8, pending, offset, '/');
+        const part = pending[offset .. separator orelse pending.len];
+        more = separator != null;
+        offset = if (separator) |position| position + 1 else pending.len;
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) {
+            if (resolved.items.len == 0) return error.UnsafePath;
+            resolved.shrinkRetainingCapacity(std.mem.lastIndexOfScalar(u8, resolved.items, '/') orelse 0);
+            continue;
         }
-        position += 1;
+        try c.core.private_files.basename(part);
+        const parent_length = resolved.items.len;
+        if (parent_length != 0) try resolved.append(allocator, '/');
+        try resolved.appendSlice(allocator, part);
+        if (resolved.items.len > 4096 or excluded(resolved.items)) return error.UnsafePath;
+        const index = entryPosition(entries, resolved.items);
+        if (index < entries.len and std.mem.eql(u8, entries[index].path, resolved.items)) {
+            if (entries[index].target) |target| {
+                links += 1;
+                if (links > 32 or target.len == 0 or target.len > 4096 or std.fs.path.isAbsolute(target))
+                    return error.UnsafePath;
+                // Expand a link before interpreting later "." or "..", exactly
+                // as filesystem traversal does. Never lexically cancel a link.
+                const next = if (more)
+                    try std.fmt.allocPrint(allocator, "{s}/{s}", .{ target, pending[offset..] })
+                else
+                    try allocator.dupe(u8, target);
+                allocator.free(pending);
+                pending = next;
+                if (pending.len > 4096) return error.UnsafePath;
+                resolved.shrinkRetainingCapacity(parent_length);
+                offset = 0;
+                more = true;
+                continue;
+            }
+            if (more) return error.UnreviewedInput;
+            return;
+        }
+        const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{resolved.items});
+        defer allocator.free(prefix);
+        const child = entryPosition(entries, prefix);
+        if (child == entries.len or !std.mem.startsWith(u8, entries[child].path, prefix)) return error.UnreviewedInput;
     }
-    const index = entryPosition(entries, path);
-    if (index < entries.len and std.mem.eql(u8, entries[index].path, path)) return;
-    const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{path});
-    const child = entryPosition(entries, prefix);
-    if (child == entries.len or !std.mem.startsWith(u8, entries[child].path, prefix)) return error.UnreviewedInput;
+    if (resolved.items.len == 0) return error.UnsafePath;
 }
 
 fn outputLine(raw: []const u8) ![]const u8 {
@@ -934,6 +960,66 @@ test "source physical symlink closure rejects escapes cycles missing and evidenc
         };
         try std.testing.expectError(if (std.mem.eql(u8, target, "missing")) error.UnreviewedInput else error.UnsafePath, physical(allocator, io, fixture.repository, entries));
     }
+}
+
+test "source real Git follows nested symlinks before parent components and rejects lexical false closure" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var fixture = try rt.TestFixture.init(allocator, io);
+    defer fixture.deinit();
+    try initializeTree(&fixture, "sha1");
+    try fixture.repository.dir.createDir(io, "inside", .fromMode(0o755));
+    try fixture.write("inside/tracked", "synthetic directory marker\n", 0o644);
+    try fixture.repository.dir.symLink(io, "../inside", "dir/ref", .{});
+    try fixture.repository.dir.symLink(io, "dir/ref/../alpha", "chosen", .{});
+    _ = try fixture.setup(&.{ "add", "--all", "--", "." });
+    _ = try fixture.setup(&.{ "commit", "--quiet", "-m", "Synthetic nested symlinks" });
+    const original = try inspect(&fixture.git, fixture.repository);
+    const actual = try fixture.repository.dir.openFile(io, "chosen", .{});
+    defer actual.close(io);
+    const expected = try fixture.repository.openFile(io, "alpha", .source);
+    defer expected.close(io);
+    try std.testing.expectEqual(try fs.metadata(expected), try fs.metadata(actual));
+    const entries = try parseTree(allocator, try fixture.git.command(fixture.repository, .{ .tree = original.tree }), 40);
+    const cases = [_]struct { target: []const u8, err: anyerror }{
+        .{ .target = "dir/ref/../../alpha", .err = error.UnsafePath },
+        .{ .target = "dir/ref/../.d/hidden", .err = error.UnsafePath },
+        .{ .target = ".git/../alpha", .err = error.UnsafePath },
+        .{ .target = "dir/ref/..", .err = error.UnsafePath },
+        .{ .target = "alpha/../dir/file", .err = error.UnreviewedInput },
+        .{ .target = "missing/../alpha", .err = error.UnreviewedInput },
+        .{ .target = "alpha/", .err = error.UnreviewedInput },
+    };
+    for (cases) |case| {
+        try fixture.repository.dir.deleteFile(io, "chosen");
+        try fixture.repository.dir.symLink(io, case.target, "chosen", .{});
+        for (entries) |*entry| if (std.mem.eql(u8, entry.path, "chosen")) {
+            var hash = try Hash.init(40, "blob", case.target.len);
+            hash.update(case.target);
+            entry.oid = try hash.finish(allocator);
+        };
+        try std.testing.expectError(case.err, physical(allocator, io, fixture.repository, entries));
+    }
+}
+
+test "source symlink expansion has a fixed hop and pending-path bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var entries: [34]Entry = undefined;
+    for (entries[0..33], 0..) |*entry, i| entry.* = .{
+        .path = try std.fmt.allocPrint(allocator, "link-{d:0>2}", .{i}),
+        .mode = "120000",
+        .oid = "1" ** 40,
+        .target = if (i == 32) "target" else try std.fmt.allocPrint(allocator, "link-{d:0>2}", .{i + 1}),
+    };
+    entries[33] = .{ .path = "target", .mode = "100644", .oid = "1" ** 40 };
+    try std.testing.expectError(error.UnsafePath, resolveLink(allocator, &entries, "link-00"));
+    try resolveLink(allocator, &entries, "link-01");
+    entries[0].target = "x" ** 4096;
+    try std.testing.expectError(error.UnsafePath, resolveLink(allocator, &entries, "link-00/suffix"));
 }
 
 test "source synthetic linked metadata is physically bound without following evidence or object symlinks" {

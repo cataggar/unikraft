@@ -6,6 +6,61 @@ const fs = @import("files.zig");
 pub const Sha = c.Sha;
 pub const parseDigest = c.sha;
 
+/// Public root-bridge wire contract at 5dbdf050, not an isolation attestation.
+pub const MakeRecord = struct {
+    bison_data: []const u8,
+    m4: []const u8,
+    schema: enum { unikraft_native_make_environment_v1 },
+    shell: []const u8,
+    tmp: []const u8,
+    xdg_cache: []const u8,
+    xdg_config: []const u8,
+    zig_global_cache: []const u8,
+    zig_local_cache: []const u8,
+
+    pub fn validate(self: MakeRecord) !void {
+        inline for (std.meta.fields(MakeRecord)) |field| {
+            if (comptime !std.mem.eql(u8, field.name, "schema")) {
+                const path = @field(self, field.name);
+                try absolute(path);
+                if (path.len > 4095) return error.UnsafePath;
+                for (path) |byte| if (!std.ascii.isAlphanumeric(byte) and
+                    std.mem.indexOfScalar(u8, "/_.-+", byte) == null) return error.UnsafePath;
+            }
+        }
+    }
+};
+
+pub fn loadMake(allocator: std.mem.Allocator, io: std.Io, path: []const u8, sha256: c.Sha) !std.json.Parsed(MakeRecord) {
+    try absolute(path);
+    const parent = try c.core.private_files.Directory.open(io, std.fs.path.dirname(path).?);
+    defer parent.close(io);
+    const bytes = try parent.read(io, allocator, std.fs.path.basename(path), 64 * 1024, null);
+    defer allocator.free(bytes);
+    if (!std.meta.eql(c.digest(bytes), sha256)) return error.HashMismatch;
+    const parsed = try c.parse(MakeRecord, allocator, bytes);
+    errdefer parsed.deinit();
+    try parsed.value.validate();
+    inline for (std.meta.fields(MakeRecord)) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "schema")) {
+            const value = @field(parsed.value, field.name);
+            if (comptime std.mem.eql(u8, field.name, "shell") or std.mem.eql(u8, field.name, "m4")) {
+                const directory = try fs.Directory.open(allocator, io, std.fs.path.dirname(value).?);
+                defer directory.close(allocator, io);
+                const file = try directory.openFile(io, std.fs.path.basename(value), .executable);
+                file.close(io);
+            } else if (comptime std.mem.eql(u8, field.name, "bison_data")) {
+                const directory = try fs.Directory.open(allocator, io, value);
+                directory.close(allocator, io);
+            } else {
+                const directory = try c.core.private_files.Directory.open(io, value);
+                directory.close(io);
+            }
+        }
+    }
+    return parsed;
+}
+
 pub const Record = struct {
     schema: enum { @"uk.native-preparation-environment.v1" } = .@"uk.native-preparation-environment.v1",
     /// The producer's explicitly selected scratch directory, not passwd HOME.
@@ -20,8 +75,7 @@ pub const Record = struct {
             try absolute(@field(self, field));
     }
 
-    /// Call only after loading the dedicated FILE/SHA256 pair. The facade must
-    /// still derive canonical_home from passwd and retain its ordinary lock.
+    /// Internal native namespace/Git policy, not the root Make bridge schema.
     pub fn apply(self: Record, allocator: std.mem.Allocator, map: *std.process.Environ.Map, canonical_home: []const u8) !void {
         try self.validate();
         try absolute(canonical_home);
@@ -131,3 +185,82 @@ pub const Account = struct {
         return std.fmt.allocPrint(allocator, "{s}:x:{d}:{d}::{s}:/bin/sh\n", .{ self.name, self.uid, self.gid, self.home });
     }
 };
+
+test "native Make bridge wire exactly matches canonical parent contract" {
+    const allocator = std.testing.allocator;
+    const record: MakeRecord = .{
+        .bison_data = "/native/bison",
+        .m4 = "/native/m4",
+        .schema = .unikraft_native_make_environment_v1,
+        .shell = "/native/bash",
+        .tmp = "/private/tmp",
+        .xdg_cache = "/private/cache",
+        .xdg_config = "/private/config",
+        .zig_global_cache = "/private/global",
+        .zig_local_cache = "/private/local",
+    };
+    const bytes = try c.canonical(allocator, record);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings(
+        "{\"bison_data\":\"/native/bison\",\"m4\":\"/native/m4\",\"schema\":\"unikraft_native_make_environment_v1\",\"shell\":\"/native/bash\",\"tmp\":\"/private/tmp\",\"xdg_cache\":\"/private/cache\",\"xdg_config\":\"/private/config\",\"zig_global_cache\":\"/private/global\",\"zig_local_cache\":\"/private/local\"}\n",
+        bytes,
+    );
+    const parsed = try c.parse(MakeRecord, allocator, bytes);
+    defer parsed.deinit();
+    try parsed.value.validate();
+    for ([_][]const u8{ "/native/../bash", "/native//bash", "/native/bash ", "/native/bash@", "/native/bash=arg", "/native/bash:other", "/" }) |path| {
+        var invalid = record;
+        invalid.shell = path;
+        try std.testing.expectError(error.UnsafePath, invalid.validate());
+    }
+    const unknown = try std.fmt.allocPrint(allocator, "{{\"HOME\":\"/other\",{s}", .{bytes[1..]});
+    defer allocator.free(unknown);
+    try std.testing.expectError(error.UnexpectedFields, c.parse(MakeRecord, allocator, unknown));
+}
+
+test "native Make bridge requires private hash-bound file and canonical trusted explicit paths" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    const base = try fixture.dir.realPathFileAlloc(io, ".", allocator);
+    var record: MakeRecord = undefined;
+    record.schema = .unikraft_native_make_environment_v1;
+    inline for (std.meta.fields(MakeRecord)) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "schema")) {
+            @field(record, field.name) = try std.fs.path.join(allocator, &.{ base, field.name });
+            if (comptime std.mem.eql(u8, field.name, "shell") or std.mem.eql(u8, field.name, "m4")) {
+                const file = try fixture.dir.createFile(io, field.name, .{ .permissions = .fromMode(0o700) });
+                defer file.close(io);
+                try file.setPermissions(io, .fromMode(0o700));
+                try file.writePositionalAll(io, "public metadata-only fixture, never executed\n", 0);
+            } else {
+                try fixture.dir.createDir(io, field.name, .fromMode(0o700));
+            }
+        }
+    }
+    const bytes = try c.canonical(allocator, record);
+    const path = try std.fs.path.join(allocator, &.{ base, "make.json" });
+    const file = try fixture.dir.createFile(io, "make.json", .{ .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o600));
+    try file.writePositionalAll(io, bytes, 0);
+    const parsed = try loadMake(allocator, io, path, c.digest(bytes));
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(record.shell, parsed.value.shell);
+    try std.testing.expectError(error.HashMismatch, loadMake(allocator, io, path, c.digest("unreviewed")));
+    try file.setPermissions(io, .fromMode(0o644));
+    try std.testing.expectError(error.UnsafeFile, loadMake(allocator, io, path, c.digest(bytes)));
+    try file.setPermissions(io, .fromMode(0o600));
+    const cache = try fixture.dir.openDir(io, "xdg_cache", .{ .iterate = true });
+    defer cache.close(io);
+    try cache.setPermissions(io, .fromMode(0o755));
+    try std.testing.expectError(error.UnsafeFile, loadMake(allocator, io, path, c.digest(bytes)));
+    try cache.setPermissions(io, .fromMode(0o700));
+    try fixture.dir.rename("shell", fixture.dir, "original-shell", io);
+    try fixture.dir.symLink(io, "original-shell", "shell", .{});
+    try std.testing.expectError(error.UnsafeFile, loadMake(allocator, io, path, c.digest(bytes)));
+}

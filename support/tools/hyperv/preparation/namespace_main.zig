@@ -2,6 +2,7 @@
 const std = @import("std");
 const namespace = @import("namespace.zig");
 const c = @import("contracts.zig");
+const git_entry = @import("git_entry.zig");
 
 pub fn main(init: std.process.Init.Minimal) void {
     // Close inherited descriptors even when invoked other than by core.process.
@@ -11,6 +12,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     const allocator = arena.allocator();
     var threaded: std.Io.Threaded = .init_single_threaded;
     const args = init.args.toSlice(allocator) catch |err| fail(err);
+    if (args.len != 0 and std.mem.eql(u8, std.fs.path.basename(args[0]), "git"))
+        git_entry.run(allocator, threaded.io(), args[1..]) catch |err| fail(err);
     if (args.len != 4) fail(error.InvalidArguments);
     const status_file = namespace.StatusFile.openParent(allocator, args[3]) catch |err| fail(err);
     const digest = c.sha(args[2]) catch {
@@ -28,9 +31,5 @@ fn finish(file: namespace.StatusFile, status: namespace.Status) noreturn {
 }
 
 fn fail(err: anyerror) noreturn {
-    // Bounded diagnostic names only; never disclose paths or record contents.
-    const name = @errorName(err);
-    _ = std.os.linux.write(2, name.ptr, name.len);
-    _ = std.os.linux.write(2, "\n", 1);
-    std.os.linux.exit_group(125);
+    git_entry.fail(err);
 }

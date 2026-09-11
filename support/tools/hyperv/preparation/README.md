@@ -1,4 +1,4 @@
-# Native local preparation, version 0.2
+# Native local preparation, version 0.3
 
 This package implements the local #120/#89 preparation boundary: strict native
 contracts, physical source/tool provenance, guarded configuration, synthetic
@@ -10,9 +10,13 @@ completed preflight, persistence acceptance, or historical evidence.
 **The whole preparation workflow remains incomplete until parent integration
 executes it.** The native namespace fixtures execute real isolated processes;
 they are not a full root configure/build/package/engine-entry demonstration.
-Root environment/UMASK integration and corrected native-image proofs remain
-parent-owned dependencies. The frozen runtime/source fixtures still require
-explicit non-AArch64 runtime parameterization; skips are not coverage.
+The parent root bridge and native image proofs are merged upstream at
+`368dade0` (#129) and `53226729` (#130). This stacked branch has not been rebased
+or integrated with them; parent-directed integration and full root-produced
+engine entry remain necessary. After the recorded review release, the targeted
+source/runtime corrections replace lexical symlink normalization and
+architecture-specific Git fixture discovery. Native fixture paths are explicit;
+the reported runs are AArch64, not claimed x86_64 execution coverage.
 
 Only this package is modified. Shared core (`../core.zig`), native Kconfig,
 facade paths, ELF helpers and pinned native miz are reused. No Python, shell
@@ -30,21 +34,40 @@ manifest change or missing-dependency failure, using copied manifests and
 ```sh
 cd /d/unikraft-worktrees/fleet-ci
 umask 077
-scratch="$PWD/.d/zig-migration-preparation/resume"
+scratch="$PWD/.d/zig-migration-preparation/bridge-compat"
 export TMPDIR="$scratch/tmp" HOME="$scratch/home"
 export XDG_CACHE_HOME="$scratch/cache"
+export XDG_CONFIG_HOME="$scratch/config"
 export ZIG_GLOBAL_CACHE_DIR="$scratch/global"
 export ZIG_LOCAL_CACHE_DIR="$scratch/local"
+git_fixture=(
+  -Dgit-executable=/home/g/.pixi/envs/git/bin/git
+  -Dgit-loader=/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1
+  -Dgit-library=/home/g/.pixi/envs/git/lib/libpcre2-8.so.0
+  -Dgit-library=/home/g/.pixi/envs/git/lib/libz.so.1
+  -Dgit-library=/home/g/.pixi/envs/git/lib/libiconv.so.2
+  -Dgit-library=/home/g/.pixi/envs/git/lib/libcrypto.so.3
+  -Dgit-library=/usr/lib/aarch64-linux-gnu/libpthread.so.0
+  -Dgit-library=/usr/lib/aarch64-linux-gnu/libc.so.6
+  -Dgit-library=/usr/lib/aarch64-linux-gnu/libdl.so.2
+)
 cd "$scratch/build-work"
 /home/g/.local/bin/zig build \
   --build-file /d/unikraft-worktrees/fleet-ci/support/tools/hyperv/preparation/build.zig \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
-  --prefix "$scratch/outputs/debug" -j2 test install --summary all
+  --prefix "$scratch/outputs/debug" "${git_fixture[@]}" \
+  -j2 test install --summary all
 ```
 
 Repeat with `-Doptimize=ReleaseSafe` and a different output prefix. Installed
 executables are `uk-hyperv-prepare` and `preparation-namespace`; the latter has
 an actual typed, descriptor/status-channel worker implementation.
+The example selects the installed public AArch64 Git closure. CI must supply
+its own complete native executable/interpreter/library paths with the same
+options; no Git path, library discovery or architecture skip is substituted.
+`runtime.TestFixture.copyRuntime` is shared by both fixture builds. Missing
+fixture options fail tests, but ordinary package installation does not need
+fixture inputs.
 
 The separate existing-runner namespace fixture build uses:
 
@@ -53,8 +76,10 @@ The separate existing-runner namespace fixture build uses:
   --build-file /d/unikraft-worktrees/fleet-ci/support/tools/hyperv/preparation/namespace/build.zig \
   --cache-dir "$scratch/namespace-local" \
   --global-cache-dir "$scratch/namespace-global" \
-  --prefix "$scratch/namespace-install" \
-  -Dworkspace="$scratch/namespace-fixtures" -j2 test install --summary all
+  --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
+  --prefix "$scratch/outputs/namespace-debug" \
+  -Dworkspace="$scratch/namespace-debug-work" "${git_fixture[@]}" \
+  -j2 test install --summary all
 ```
 
 Create the selected scratch directories first. Never execute the reference
@@ -71,7 +96,7 @@ bounds are 4 MiB, depth 32, 4096 items and 65536 tokens.
 | Type | Schema and exact fields |
 | --- | --- |
 | `provenance.Record` | `hyperv_native_producer_provenance_v1`: `schema,source,host_target,guest_target,compiler_version,producer,compiler,git,dependencies,trust` |
-| `producer.Binding` | `hyperv_local_native_producer_binding_v2`: `schema,source,repository,workspace,output,scratch,config,path,native,git,packages,bison_data,trust,trust_bundle,native_execution,native_proof,isolation` |
+| `producer.Binding` | `hyperv_local_native_producer_binding_v3`: `schema,source,repository,workspace,output,scratch,config,path,native,git,packages,bison_data,trust,trust_bundle,native_execution,native_proof,isolation` |
 | `receipts.Receipt` | `hyperv_artifact_preparation_native_v1`: `schema,phase,purpose,run_id,guard,source_before,source_after,provenance,reviewed_provenance_sha256,config_before,config_after,parent_sha256,execution,efi,packaging,authority` |
 | `inputs.SelectionV2` (`Plan`) | `hyperv_native_input_selection_v2`: `schema,packaged_receipt_sha256,solved_metadata,publication,capability_source,capability_receipt,qemu,assets` |
 | `inputs.PreparedInputV2` (`Input`) | `hyperv_native_prepared_input_v2`: `schema,state,authority,receipt,reviewed_selection_sha256,selection,ledger,budget` |
@@ -80,6 +105,8 @@ bounds are 4 MiB, depth 32, 4096 items and 65536 tokens.
 Input/selection v1 are **not reinterpreted or accepted** by v2. The existing
 build-receipt schema is retained, not replaced with a weaker engine receipt.
 `state` is exactly `prepared`; `authority` is exactly `not_admitted`.
+Producer binding v3 requires separately bound Make and Git policy files;
+binding-v2 documents are rejected rather than silently upgraded.
 
 `File = {path,sha256,size,mode}`. `Sha` is **64 lowercase ASCII hex bytes**;
 `admission.rawHash` explicitly converts it into core's **32 raw hash bytes**.
@@ -126,6 +153,13 @@ producer executable also require charged assets. Engine entry additionally
 requires the actual importing engine and namespace helper executables as
 charged control assets. A single actual shared executable may satisfy both
 producer and engine commitments; different copies remain distinct charges.
+`inputs.requireControlBinding(allocator, io, plan, bindings, runtime)` now
+requires the complete physical producer/engine/helper runtime inventory, not
+just its executable: interpreters, libraries and non-ELF support files all need
+charged control assets. Byte-identical files at different inodes cannot cover
+one another. A runtime exceeding the control cap is rejected before inventory.
+All three namespace/Make/Git policy files also require charged, physically
+associated control assets, checked during generation and read-only entry.
 
 Native, producer, publication and baked control classes must be present. The
 remaining control headroom is charged as `publication_reservation`, covering
@@ -145,7 +179,9 @@ Generation is a producer operation, **never an adoption/entry-loader API**.
 
 `producer.plan` composes only `configure`, `inspect` and `build`, using fixed
 application/profile/target/tool options, `-j2`, explicit dependency/cache/output
-paths, and exact `-Dmake-arg=UMASK=0077`. No arbitrary command, Make argument,
+paths, and `-Dnative-make-environment=FILE`. It does not send disallowed direct
+UMASK/SHELL/cache overrides or the former preparation-environment option pair.
+No arbitrary command, Make argument,
 shell string, inherited environment or alternate facade lock hook is exposed
 by the worker protocol.
 
@@ -157,10 +193,36 @@ inputs. No ambiguous mutation is retried.
 
 `Inputs.isolation` contains the reviewed static namespace helper, complete Git
 metadata trees, canonical account, existing facade directory/lock identity
-and private environment-file binding. Other native tools **may be dynamic**:
+and private policy-file bindings. Other native tools **may be dynamic**:
 their executable, ELF interpreter and complete declared native library closure
 are validated and made available at constrained paths. The worker supplies its
 own `/bin` aliases instead of inheriting host PATH.
+
+The same static helper now implements `/bin/git`; no third executable is
+installed. Its fixed read-only `/etc/unikraft-preparation-git.json` policy
+reinstalls canonical HOME, explicit trust/cache paths and fixed Git isolation
+after facade filtering. Inherited `GIT_*`, `LD_*`, HOME and other variables are
+not copied. It revalidates the declared relocated Git/loader/library closure,
+closes descriptors and replaces itself with Git, preserving exit/signal while
+discarding native Git/loader stderr. Wrapper errors use enum-only diagnostics.
+Only `rev-parse --short HEAD` and `ls-files -m`, used by the existing selected
+`gitsha1` helper, are accepted. No path selection, remote operation or generic
+Git proxy is exposed. The separate #87 networking workflow is not rewritten.
+
+`Inputs.isolation.environment`, `.make_environment` and `.git_policy` are
+private `File` bindings. The latter two are nullable only in the generic
+namespace mechanism; v3 producer/admission entry requires both. All original
+workspace paths remain read-only inside the namespace, including the Git policy
+also mounted at its fixed `/etc` path. The helper's source/compiler commitments
+must match the producer source and selected compiler.
+
+Use `producer.bindingEnvironment`, `bindingMakeEnvironment` and
+`bindingGitPolicy` to construct review material. Publish the canonical records
+privately using the existing immutable filesystem API, bind their observed
+`File` records, then obtain independent review of the completed producer
+binding. `validatePolicyFiles` checks the three physical files and their exact
+associations with tools, repository, account and caches; hashing freshly
+constructed records does not grant approval.
 
 The worker creates actual user/mount/PID/network namespaces, a private chroot
 and proc view, read-only source/tool/Git mounts, hidden historical `.d`, and
@@ -232,6 +294,12 @@ HEAD, modes, symlinks and forbidden flags), all stored producer runtimes,
 compiler/dependencies/trust, original directory identities, proof selections,
 environment and metadata records. It separately checks `/proc/self/exe`
 against the current engine's independently reviewed runtime/executable.
+The selected executable descriptor must identify the actual `/proc/self/exe`
+inode/device and stable metadata; hashing a copied executable is insufficient.
+Source symlinks are expanded component-by-component before processing later
+parent components, with 32-link/4096-byte bounds. Missing or regular-file
+intermediates, transient source escapes and evidence/Git traversal are rejected,
+even if lexical normalization would end at a tracked pathname.
 
 Final config must use authoritative native metadata for every symbol and
 select x86_64 Hyper-V. The loader validates actual miz packaging, capability
@@ -264,28 +332,34 @@ approve this semantic mapping before connecting it to signed host
 attempt UUID, startup policy, acceptance/evidence and operator/cleanup-lifetime
 admission remain separately required. No signature is manufactured here.
 
-## Required root integration
+## Root bridge compatibility
 
 Root build/Make/facade/CI changes are not included in this scope.
 
-1. Add optional `-Dpreparation-environment=FILE` and
-   `-Dpreparation-environment-sha256=HEX`, forwarding them as dedicated internal
-   facade arguments, not Make assignments. Reject a partial pair.
-2. After the facade obtains canonical passwd HOME and its normal sanitized
-   environment, call `environment.load(allocator,io,path,parseDigest(hex))`
-   and `record.value.apply(allocator,&environment,canonical_home)`.
-   Preserve normal behavior when options are absent.
-3. Permit the exact `UMASK=0077` assignment in the opt-in preparation path.
-   GNU Make already honors it; its normal default need not change.
-4. Retain actual corrected native-image proof selectors. The legacy selected
-   proof veto remains active; a reviewed flag cannot override it.
+The adapter matches the parent bridge contract first supplied at `5dbdf050`
+and now merged through #129:
+`-Dnative-make-environment=FILE`. `environment.MakeRecord` uses exactly
+`bison_data,m4,schema,shell,tmp,xdg_cache,xdg_config,zig_global_cache,zig_local_cache`,
+with schema `unikraft_native_make_environment_v1`, compact canonical JSON and
+one LF. It requires a private 0600 file/0700 parent, canonical existing tool and
+Bison paths, and private cache directories. Preparation independently binds
+its hash and mounts it read-only; root needs no extra SHA option.
 
-Environment schema is exactly `uk.native-preparation-environment.v1`, fields
-`schema,workspace,bison_pkgdatadir,m4,git_exec_path,trust_bundle`. `workspace`
-means scratch, not HOME. Only fixed cache/temp, Git-isolation, Bison/M4 and
-trust variables are derived. Arbitrary inherited variables are not forwarded.
-Reuse the same named `facade_paths` module for the runner and environment
-module to avoid duplicate Zig file ownership; provide `hyperv_core` too.
+Root generates only fixed `UMASK=0077` plus nine fixed-name assignments for
+SHELL/CONFIG_SHELL, M4, BISON_PKGDATADIR, TMPDIR and the four Zig/XDG caches.
+Canonical passwd HOME, the global facade lock and ordinary invocations remain
+unchanged. This bridge is not isolation, source review or admission. Actual
+root execution with this package waits for parent-directed merged-base
+integration; this branch does not cherry-pick or copy parent root source.
+
+The internal namespace policy retains schema
+`uk.native-preparation-environment.v1` and fields
+`schema,workspace,bison_pkgdatadir,m4,git_exec_path,trust_bundle`. It is no longer
+the root bridge contract. Git policy schema is `hyperv_native_git_entry_v1`,
+fields `schema,repository,runtime_directory,runtime,environment,account`.
+Both are checked against the independently reviewed producer binding.
+The selected legacy image-proof veto remains active. Neither canonical_home
+source strings nor the normal Make UMASK default need deletion.
 
 ## CLI, formats and remaining boundaries
 
@@ -323,21 +397,30 @@ LUN 7 / 8388608 x 512 geometry. Pinned miz revision is
 
 Filesystem traversal/hash byte/count bounds and between-operation deadlines
 do not interrupt every blocked syscall or native miz call. An independent
-parent hard process deadline remains mandatory. Native runtime fixtures on
-other architectures and full integrated producer execution remain necessary;
+parent hard process deadline remains mandatory. Actual runs of the parameterized
+fixtures on other native architectures and full integrated producer execution remain necessary;
 neither the migration nor cloud admission is complete.
 
-The focused preparation suite currently exercises 71 cases in both Debug and
-ReleaseSafe; the separate namespace suite exercises 14 cases in each mode.
+Final focused results are **77/77 preparation cases** (10/10 build steps) and
+**16/16 namespace cases** (11/11 steps), each in Debug and ReleaseSafe under
+umask 077, with no skipped cases. The bridge/Git extension adds exact
+bridge-wire/private-path fixtures, v3 policy substitution cases, and actual Git
+execution after stripped or poisoned facade-like environments, with read-only
+policy and lifetime cases.
 The namespace cases include forced parent death during registration, normal
 exit versus signal, spawn/setup errors, malformed/missing status, cleanup
 failure, timeout and escaped-session descendant cleanup. Entry cases cover
 independent review/receipt/selection substitution, physical current-executable
-binding, authoritative metadata, v1 rejection, read-only missing-state/lock
-behavior, reordered reservations and distinct-copy control accounting.
+binding versus a byte-identical copy, authoritative metadata, v1 rejection,
+read-only missing-state/lock behavior, reordered reservations and complete
+runtime control accounting. Real-Git cases cover nested symlink/parent-component
+order; native-only unit cases cover hop and pending-path bounds.
+Final logs are `bridge-compat/outputs/source-review-{debug,release-safe}.log`
+and `source-review-namespace-{debug,release-safe}.log` under the preparation
+scratch root. Earlier preserved logs contain superseded runs.
 
-The stripped ReleaseSafe standalone producer and helper currently measure
-1093312 and 645760 bytes: 1739072 bytes together, leaving only 358080 of the
+The stripped ReleaseSafe producer and Git-enabled helper measure
+1093312 and 696824 bytes: 1790136 bytes together, leaving only 307016 of the
 2097152-byte control cap before other required controls/publications. This is
 not a complete workflow budget result. A distinct engine executable and actual
 QEMU/image/control selection must fit the unchanged ledger; no exemption or

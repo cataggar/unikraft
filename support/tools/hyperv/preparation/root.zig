@@ -13,6 +13,7 @@ pub const inputs = @import("inputs.zig");
 pub const admission = @import("admission.zig");
 pub const environment = @import("environment.zig");
 pub const namespace = @import("namespace.zig");
+pub const git_entry = @import("git_entry.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

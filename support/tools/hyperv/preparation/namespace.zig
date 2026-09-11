@@ -8,6 +8,7 @@ const c = @import("contracts.zig");
 const fs = @import("files.zig");
 const rt = @import("runtime.zig");
 const env = @import("environment.zig");
+const git_entry = @import("git_entry.zig");
 const paths = @import("facade_paths");
 const elf = @import("producer_elf");
 const producer = @import("producer.zig");
@@ -44,6 +45,8 @@ pub const Inputs = struct {
     facade_lock: Identity,
     /// Relative to producer workspace; immutable for all three actions.
     environment: c.File,
+    make_environment: ?c.File = null,
+    git_policy: ?c.File = null,
 };
 pub const Tool = struct { path: []const u8, contract: rt.Tool };
 pub const GitBinding = struct { directory: Identity, tree: c.Tree };
@@ -54,6 +57,8 @@ pub const Binding = struct {
     facade_runtime: Identity,
     facade_lock: Identity,
     environment: c.File,
+    make_environment: ?c.File = null,
+    git_policy: ?c.File = null,
 };
 
 pub fn describe(allocator: std.mem.Allocator, input: Inputs) !Binding {
@@ -67,6 +72,8 @@ pub fn describe(allocator: std.mem.Allocator, input: Inputs) !Binding {
         .facade_runtime = try Identity.directory(input.facade_runtime),
         .facade_lock = input.facade_lock,
         .environment = input.environment,
+        .make_environment = input.make_environment,
+        .git_policy = input.git_policy,
     };
 }
 
@@ -86,6 +93,8 @@ pub fn reopen(allocator: std.mem.Allocator, io: std.Io, value: Binding) !Inputs 
         .facade_runtime = facade,
         .facade_lock = value.facade_lock,
         .environment = value.environment,
+        .make_environment = value.make_environment,
+        .git_policy = value.git_policy,
     };
 }
 
@@ -133,6 +142,33 @@ pub fn validate(allocator: std.mem.Allocator, io: std.Io, input: Inputs, reposit
         try fs.requireTree((try fs.inventory(allocator, io, git.directory, 100000, 4 * 1024 * 1024 * 1024)).tree, git.tree);
     }
     try fs.requireFile(try workspace.record(allocator, io, input.environment.path, 16 * 1024, .private), input.environment);
+    if (input.make_environment) |file|
+        try fs.requireFile(try workspace.record(allocator, io, file.path, 64 * 1024, .private), file);
+    if (input.git_policy) |file| {
+        try fs.requireFile(try workspace.record(allocator, io, file.path, git_entry.maximum_bytes, .private), file);
+        const policy = try readGitPolicy(allocator, io, workspace, file);
+        defer policy.deinit();
+        if (!std.mem.eql(u8, policy.value.repository, repository.path) or
+            !try sameRecord(allocator, policy.value.account, input.account)) return error.InvalidGitPolicy;
+        const original = try env.load(allocator, io, try std.fs.path.join(allocator, &.{ workspace.path, input.environment.path }), input.environment.sha256);
+        defer original.deinit();
+        if (!try sameRecord(allocator, policy.value.environment, original.value)) return error.InvalidGitPolicy;
+    }
+}
+
+fn readGitPolicy(allocator: std.mem.Allocator, io: std.Io, workspace: fs.Directory, file: c.File) !std.json.Parsed(git_entry.Record) {
+    const bytes = try workspace.read(allocator, io, file.path, git_entry.maximum_bytes, .private);
+    defer allocator.free(bytes);
+    if (!std.meta.eql(c.digest(bytes), file.sha256) or bytes.len != file.size) return error.HashMismatch;
+    return git_entry.parse(allocator, bytes);
+}
+
+fn sameRecord(allocator: std.mem.Allocator, a: anytype, b: @TypeOf(a)) !bool {
+    const left = try c.canonical(allocator, a);
+    defer allocator.free(left);
+    const right = try c.canonical(allocator, b);
+    defer allocator.free(right);
+    return std.mem.eql(u8, left, right);
 }
 
 pub const Request = struct {
@@ -279,11 +315,13 @@ pub fn runRequest(allocator: std.mem.Allocator, io: std.Io, path: []const u8, di
     const command = try producer.plan(allocator, request.step, try producer.commandPaths(allocator, input));
     var runtimes: std.ArrayList(rt.Bound) = .empty;
     for (input.tools.native) |native| try runtimes.append(allocator, native.bound);
-    try runtimes.appendSlice(allocator, &.{ input.tools.git, input.tools.packages, input.tools.bison_data, input.tools.trust });
+    try runtimes.appendSlice(allocator, &.{ input.tools.git, input.tools.packages, input.tools.bison_data, input.tools.trust, input.isolation.?.helper });
     var aliases: std.ArrayList(Alias) = .empty;
-    for (input.tools.native) |native|
+    for (input.tools.native) |native| {
+        if (std.mem.eql(u8, @tagName(native.name), "git")) continue;
         try aliases.append(allocator, .{ .name = @tagName(native.name), .bound = native.bound });
-    if (!hasAlias(aliases.items, "git")) try aliases.append(allocator, .{ .name = "git", .bound = input.tools.git });
+    }
+    try aliases.append(allocator, .{ .name = "git", .bound = input.isolation.?.helper });
     return enter(allocator, io, .{
         .repository = input.repository,
         .workspace = input.workspace.directory,
@@ -334,6 +372,26 @@ pub fn enter(allocator: std.mem.Allocator, io: std.Io, sandbox: Sandbox, argv: [
 pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: Sandbox, argv: []const []const u8, environment: *const std.process.Environ.Map, cleanup_fault: bool) !Status {
     if (!builtin.single_threaded) @compileError("namespace helper must be built single_threaded");
     try validate(allocator, io, sandbox.isolation, sandbox.repository, sandbox.workspace);
+    if (hasAlias(sandbox.aliases, "git")) {
+        const file = sandbox.isolation.git_policy orelse return error.MissingGitPolicy;
+        const policy = try readGitPolicy(allocator, io, sandbox.workspace, file);
+        defer policy.deinit();
+        var helper_mounted = false;
+        var git_mounted = false;
+        for (sandbox.runtimes) |bound| {
+            if (std.mem.eql(u8, bound.directory.path, sandbox.isolation.helper.directory.path) and
+                try sameRecord(allocator, bound.contract, sandbox.isolation.helper.contract)) helper_mounted = true;
+            if (std.mem.eql(u8, bound.directory.path, policy.value.runtime_directory) and
+                try sameRecord(allocator, bound.contract, policy.value.runtime)) git_mounted = true;
+        }
+        if (!helper_mounted or !git_mounted) return error.IncompleteRuntime;
+        for (sandbox.aliases) |alias| {
+            if (!std.mem.eql(u8, alias.name, "git")) continue;
+            if (!std.mem.eql(u8, alias.bound.directory.path, sandbox.isolation.helper.directory.path) or
+                !try sameRecord(allocator, alias.bound.contract, sandbox.isolation.helper.contract)) return error.InvalidGitAlias;
+            try (try Identity.directory(sandbox.isolation.helper.directory)).require(try Identity.directory(alias.bound.directory));
+        }
+    }
     if (!paths.isDescendant(sandbox.workspace.path, sandbox.scratch.path)) return error.UnsafePath;
     var mounts: std.ArrayList(Mount) = .empty;
     const facade = sandbox.isolation.facade_runtime;
@@ -352,7 +410,7 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
             try interpreterMount(allocator, io, &mounts, bound, executable);
             if (bound.contract.loader) |loader| {
                 for (bound.contract.libraries) |library| {
-                    try addFile(allocator, io, &mounts, bound.directory, library, try std.fmt.allocPrint(allocator, "/lib/{s}", .{std.fs.path.basename(library.path)}));
+                    try addFile(allocator, io, &mounts, bound.directory, library, try std.fmt.allocPrint(allocator, "/lib/{s}", .{std.fs.path.basename(library.path)}), .artifact);
                     try interpreterMount(allocator, io, &mounts, bound, library);
                 }
                 // libc can itself require the loader by SONAME.
@@ -360,7 +418,7 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
                 var image = try elf.Image.parse(allocator, bytes);
                 defer image.deinit();
                 const soname = try loaderSoname(image, bytes);
-                if (soname) |name| try addFile(allocator, io, &mounts, bound.directory, loader, try std.fmt.allocPrint(allocator, "/lib/{s}", .{name}));
+                if (soname) |name| try addFile(allocator, io, &mounts, bound.directory, loader, try std.fmt.allocPrint(allocator, "/lib/{s}", .{name}), .artifact);
             }
         }
     }
@@ -374,7 +432,15 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
         try mounts.append(allocator, .{ .file = file, .target = path, .directory = false, .device = true });
     }
     const environment_path = try std.fs.path.join(allocator, &.{ sandbox.workspace.path, sandbox.isolation.environment.path });
-    try addFile(allocator, io, &mounts, sandbox.workspace, sandbox.isolation.environment, environment_path);
+    try addFile(allocator, io, &mounts, sandbox.workspace, sandbox.isolation.environment, environment_path, .private);
+    if (sandbox.isolation.make_environment) |file|
+        try addFile(allocator, io, &mounts, sandbox.workspace, file, try std.fs.path.join(allocator, &.{ sandbox.workspace.path, file.path }), .private);
+    if (sandbox.isolation.git_policy) |file| {
+        // Protect the original inode's workspace spelling as well: a readonly
+        // /etc bind alone would still permit writes through the source path.
+        try addFile(allocator, io, &mounts, sandbox.workspace, file, try std.fs.path.join(allocator, &.{ sandbox.workspace.path, file.path }), .private);
+        try addFile(allocator, io, &mounts, sandbox.workspace, file, git_entry.policy_path, .private);
+    }
     std.mem.sort(Mount, mounts.items, {}, struct {
         fn less(_: void, a: Mount, b: Mount) bool {
             return if (a.target.len == b.target.len) std.mem.lessThan(u8, a.target, b.target) else a.target.len < b.target.len;
@@ -579,11 +645,13 @@ fn addDirectory(allocator: std.mem.Allocator, mounts: *std.ArrayList(Mount), dir
         .readonly = readonly,
     });
 }
-fn addFile(allocator: std.mem.Allocator, io: std.Io, mounts: *std.ArrayList(Mount), directory: fs.Directory, record: c.File, target: []const u8) !void {
+fn addFile(allocator: std.mem.Allocator, io: std.Io, mounts: *std.ArrayList(Mount), directory: fs.Directory, record: c.File, target: []const u8, policy: fs.Policy) !void {
     try env.absolute(target);
-    const file = try directory.openFile(io, record.path, .artifact);
+    const file = try directory.openFile(io, record.path, policy);
     const m = try fs.metadata(file);
-    if (m.size != record.size or !std.crypto.timing_safe.eql(c.Sha, try fs.hashFile(io, file, m.size), record.sha256))
+    if (m.size != record.size or m.mode & 0o7777 != record.mode or
+        !std.crypto.timing_safe.eql(c.Sha, try fs.hashFile(io, file, m.size), record.sha256) or
+        !std.meta.eql(m, try fs.metadata(file)))
         return error.SourceChanged;
     for (mounts.items) |previous| if (std.mem.eql(u8, previous.target, target)) {
         file.close(io);
@@ -602,7 +670,7 @@ fn interpreterMount(allocator: std.mem.Allocator, io: std.Io, mounts: *std.Array
         const interpreter = try elf.range(bytes, program.p_offset, program.p_filesz);
         const path = interpreter[0 .. interpreter.len - 1];
         if (!std.mem.startsWith(u8, path, "/lib/") and !std.mem.startsWith(u8, path, "/lib64/")) return error.InvalidRuntime;
-        try addFile(allocator, io, mounts, bound.directory, bound.contract.loader orelse return error.IncompleteRuntime, try allocator.dupe(u8, path));
+        try addFile(allocator, io, mounts, bound.directory, bound.contract.loader orelse return error.IncompleteRuntime, try allocator.dupe(u8, path), .artifact);
     };
 }
 fn ensureDirectory(allocator: std.mem.Allocator, io: std.Io, root: fs.Directory, absolute: []const u8) !std.Io.Dir {

@@ -789,7 +789,16 @@ test "current engine identity is physically bound without weakening producer sel
     var review = try shapeReview(a, chain, try shapeInput(a, chain));
     review.engine_executable_sha256 = record.sha256;
     review.engine_runtime_sha256 = c.digest(try c.canonical(a, tool));
-    try admission.requireEngine(a, io, bound, review);
+    try std.testing.expectError(error.UnreviewedInput, admission.requireEngine(a, io, bound, review));
+    const actual_path = try std.Io.Dir.cwd().realPathFileAlloc(io, "/proc/self/exe", a);
+    const actual_directory = try fs.Directory.open(a, io, std.fs.path.dirname(actual_path).?);
+    defer actual_directory.close(a, io);
+    var actual_tool = tool;
+    actual_tool.executable = try actual_directory.record(a, io, std.fs.path.basename(actual_path), 128 * 1024 * 1024, .executable);
+    actual_tool.tree = (try fs.inventory(a, io, actual_directory, 16, 512 * 1024 * 1024)).tree;
+    var actual_review = review;
+    actual_review.engine_runtime_sha256 = c.digest(try c.canonical(a, actual_tool));
+    try admission.requireEngine(a, io, .{ .directory = actual_directory, .contract = actual_tool }, actual_review);
     try std.testing.expectError(error.UnreviewedInput, provenance.requireCurrentExecutable(io, chain[0].receipt.provenance));
     var bad = review;
     bad.engine_executable_sha256 = c.digest("another executable");
@@ -830,13 +839,69 @@ test "reservation permutation cannot borrow evidence allowance and identical cop
         .{ .id = "engine", .role = .native_control, .source = record, .destination = "engine", .placement = .staged },
     };
     const bindings = [_]inputs.Binding{ .{ .id = "producer", .directory = producer_dir }, .{ .id = "engine", .directory = engine_dir } };
-    const required: rt.Bound = .{ .directory = engine_dir, .contract = shapeTool(.preparation, record) };
+    var required: rt.Bound = .{ .directory = engine_dir, .contract = shapeTool(.preparation, record) };
+    required.contract.tree = (try fs.inventory(a, io, engine_dir, 4, 1024)).tree;
     plan.assets = assets[0..1];
-    try std.testing.expectError(error.MissingControlBinding, inputs.requireControlBinding(io, plan, &bindings, required));
+    try std.testing.expectError(error.MissingControlBinding, inputs.requireControlBinding(a, io, plan, &bindings, required));
     plan.assets = &assets;
-    try inputs.requireControlBinding(io, plan, &bindings, required);
+    try inputs.requireControlBinding(a, io, plan, &bindings, required);
     plan.assets = assets[0..1];
-    try inputs.requireControlBinding(io, plan, &bindings, .{ .directory = producer_dir, .contract = required.contract });
+    try inputs.requireControlBinding(a, io, plan, &bindings, .{ .directory = producer_dir, .contract = required.contract });
+}
+
+test "physical control accounting requires every runtime file without library support or copy exemptions" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    try fixture.dir.createDir(io, "runtime", .fromMode(0o700));
+    try fixture.dir.createDir(io, "copy", .fromMode(0o700));
+    const path = try fixture.dir.realPathFileAlloc(io, ".", a);
+    const directory = try fs.Directory.open(a, io, try std.fs.path.join(a, &.{ path, "runtime" }));
+    defer directory.close(a, io);
+    const copy = try fs.Directory.open(a, io, try std.fs.path.join(a, &.{ path, "copy" }));
+    defer copy.close(a, io);
+    // These are physical accounting fixtures, not claimed ELF executables.
+    const names = [_][]const u8{ "control", "loader", "library", "support" };
+    const modes = [_]u16{ 0o700, 0o700, 0o600, 0o600 };
+    var records: [4]c.File = undefined;
+    var assets: [4]inputs.Asset = undefined;
+    var bindings: [4]inputs.Binding = undefined;
+    for (names, modes, 0..) |name, mode, i| {
+        try writeFixture(directory.dir, name, name, mode);
+        try writeFixture(copy.dir, name, name, mode);
+        records[i] = try directory.record(a, io, name, 128, .artifact);
+        assets[i] = .{ .id = name, .role = .native_control, .source = records[i], .destination = name, .placement = .staged };
+        bindings[i] = .{ .id = name, .directory = directory };
+    }
+    var tool = shapeTool(.preparation, records[0]);
+    tool.loader = records[1];
+    tool.libraries = records[2..3];
+    tool.tree = (try fs.inventory(a, io, directory, 8, 1024)).tree;
+    const required: rt.Bound = .{ .directory = directory, .contract = tool };
+    const chain = try shapeChain(a);
+    var plan = try shapePlan(a, chain[3]);
+    plan.assets = &assets;
+    try inputs.requireControlBinding(a, io, plan, &bindings, required);
+    for (0..assets.len) |i| {
+        assets[i].role = .qemu_support;
+        try std.testing.expectError(error.MissingControlBinding, inputs.requireControlBinding(a, io, plan, &bindings, required));
+        assets[i].role = .native_control;
+        bindings[i].directory = copy;
+        try std.testing.expectError(error.MissingControlBinding, inputs.requireControlBinding(a, io, plan, &bindings, required));
+        bindings[i].directory = directory;
+    }
+    plan.assets = assets[0..3];
+    try std.testing.expectError(error.MissingControlBinding, inputs.requireControlBinding(a, io, plan, &bindings, required));
+    plan.assets = &assets;
+    try writeFixture(directory.dir, "support", "changed", 0o600);
+    try std.testing.expectError(error.HashMismatch, inputs.requireControlBinding(a, io, plan, &bindings, required));
+    var oversized = required;
+    oversized.contract.tree.bytes = c.control_cap + 1;
+    try std.testing.expectError(error.ControlLimitExceeded, inputs.requireControlBinding(a, io, plan, &bindings, oversized));
 }
 
 test "read-only entry never creates missing state or adopts v1 partial staging or a held writer" {
@@ -932,6 +997,83 @@ test "authoritative metadata entry rejects incomplete invented and wrong platfor
     try std.testing.expectError(error.IncompleteMetadata, inputs.validateAuthoritativeConfig(a, unknown, metadata, guard));
     const bad_types = try replaceOnce(a, metadata, "APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS\tint", "APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS\thex");
     try std.testing.expectError(error.ConflictingMetadata, inputs.validateAuthoritativeConfig(a, solved, bad_types, guard));
+}
+
+test "producer v3 policy documents bind Make Git trust caches and physical control files" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    const path = try fixture.dir.realPathFileAlloc(io, ".", a);
+    const directory: fs.Directory = .{ .dir = fixture.dir, .path = path };
+    for ([_][]const u8{ "tmp", "cache", "config", "zig-local", "zig-global", "disabled-git-exec", "disabled-openssl" }) |name|
+        try fixture.dir.createDir(io, name, .fromMode(0o700));
+    try writeFixture(fixture.dir, "m4", "public metadata-only fixture", 0o700);
+    try writeFixture(fixture.dir, "bash", "public metadata-only fixture", 0o700);
+    const m4 = shapeTool(.m4, try directory.record(a, io, "m4", 128, .executable));
+    const bash = shapeTool(.preparation, try directory.record(a, io, "bash", 128, .executable));
+    var git = shapeTool(.git, shapeFile("bin/git", 128));
+    git.loader = shapeFile("lib/loader", 128);
+    git.libraries = &.{shapeFile("lib/library.so", 128)};
+    var selected: producer.Inputs = .{
+        .repository = directory,
+        .observed_source = shapeSource(),
+        .workspace = .{ .directory = directory, .output = directory, .scratch = directory, .config = shapeFile("guarded.config", 128) },
+        .tools = .{
+            .native = &.{ .{ .name = .m4, .bound = .{ .directory = directory, .contract = m4 } }, .{ .name = .bash, .bound = .{ .directory = directory, .contract = bash } } },
+            .git = .{ .directory = directory, .contract = git },
+            .packages = .{ .directory = directory, .contract = shapeTool(.dependencies, null) },
+            .bison_data = .{ .directory = directory, .contract = shapeTool(.bison_data, null) },
+            .trust = .{ .directory = directory, .contract = shapeTool(.trust, null) },
+            .trust_bundle = shapeFile("trust.pem", 128),
+        },
+        .native_execution = null,
+        .native_proof = null,
+        .isolation = .{
+            .helper = .{ .directory = directory, .contract = bash },
+            .git_metadata = &.{},
+            .account = .{ .name = "synthetic", .uid = std.os.linux.geteuid(), .gid = std.os.linux.getegid(), .home = path },
+            .facade_runtime = directory,
+            .facade_lock = try @import("namespace.zig").Identity.directory(directory),
+            .environment = shapeFile("environment.json", 1),
+            .make_environment = shapeFile("make.json", 1),
+            .git_policy = shapeFile("git.json", 1),
+        },
+    };
+    // Data-construction fixture only: no fake tools are executed or admitted.
+    const description = try producer.describe(a, selected);
+    const environment = try producer.bindingEnvironment(a, description);
+    const make = try producer.bindingMakeEnvironment(a, description);
+    const policy = try producer.bindingGitPolicy(a, description);
+    inline for (.{ "environment", "make_environment", "git_policy" }, .{ environment, make, policy }) |name, value| {
+        const record: c.File = if (comptime std.mem.eql(u8, name, "environment"))
+            selected.isolation.?.environment
+        else
+            @field(selected.isolation.?, name).?;
+        try writeFixture(fixture.dir, record.path, try c.canonical(a, value), 0o600);
+        @field(selected.isolation.?, name) = try directory.record(a, io, record.path, 256 * 1024, .private);
+    }
+    var binding = try producer.describe(a, selected);
+    try producer.validatePolicyFiles(a, io, binding);
+    const encoded = try c.canonical(a, binding);
+    const old = try replaceOnce(a, encoded, "hyperv_local_native_producer_binding_v3", "hyperv_local_native_producer_binding_v2");
+    try std.testing.expectError(error.InvalidEnum, c.parse(producer.Binding, a, old));
+    var substituted_make = make;
+    substituted_make.tmp = make.xdg_cache;
+    try writeFixture(fixture.dir, "make.json", try c.canonical(a, substituted_make), 0o600);
+    binding.isolation.?.make_environment = try directory.record(a, io, "make.json", 64 * 1024, .private);
+    try std.testing.expectError(error.UnreviewedInput, producer.validatePolicyFiles(a, io, binding));
+    try writeFixture(fixture.dir, "make.json", try c.canonical(a, make), 0o600);
+    binding = try producer.describe(a, selected);
+    var substituted_git = policy;
+    substituted_git.runtime.origin.source_sha256 = c.digest("different Git source");
+    try writeFixture(fixture.dir, "git.json", try c.canonical(a, substituted_git), 0o600);
+    binding.isolation.?.git_policy = try directory.record(a, io, "git.json", 256 * 1024, .private);
+    try std.testing.expectError(error.UnreviewedInput, producer.validatePolicyFiles(a, io, binding));
+    try std.testing.expectEqualStrings(environment.workspace, make.tmp[0 .. make.tmp.len - "/tmp".len]);
 }
 
 test "input v2 requires a charged distinct private VHD and rejects v1 wire shapes" {

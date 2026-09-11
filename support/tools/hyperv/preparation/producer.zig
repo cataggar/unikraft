@@ -9,6 +9,7 @@ const process = c.core.process;
 const paths = @import("facade_paths");
 const ns = @import("namespace.zig");
 const env = @import("environment.zig");
+const git_entry = @import("git_entry.zig");
 
 pub const Step = enum { configure, inspect, build };
 pub const profile = "hyperv-x86_64-efi-netvsc";
@@ -31,7 +32,7 @@ pub const CommandPaths = struct {
     zig: []const u8,
     make: []const u8,
     llvm: LlvmPaths,
-    preparation_environment: ?struct { path: []const u8, sha256: c.Sha } = null,
+    native_make_environment: ?[]const u8 = null,
 };
 
 pub const Plan = struct {
@@ -82,15 +83,10 @@ pub fn plan(allocator: std.mem.Allocator, step: Step, command: CommandPaths) !Pl
         try std.fmt.allocPrint(allocator, "-Dmake-arg=STRIP={s}", .{command.llvm.strip}),
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
-        "-Dmake-arg=UMASK=0077",
     });
-    if (command.preparation_environment) |record| {
-        try commandPath(record.path);
-        _ = try c.sha(&record.sha256);
-        try args.appendSlice(allocator, &.{
-            try std.fmt.allocPrint(allocator, "-Dpreparation-environment={s}", .{record.path}),
-            try std.fmt.allocPrint(allocator, "-Dpreparation-environment-sha256={s}", .{record.sha256}),
-        });
+    if (command.native_make_environment) |path| {
+        try commandPath(path);
+        try args.append(allocator, try std.fmt.allocPrint(allocator, "-Dnative-make-environment={s}", .{path}));
     }
     return .{ .step = step, .cwd = command.repository, .argv = try args.toOwnedSlice(allocator) };
 }
@@ -222,8 +218,7 @@ pub const NativeExecution = struct {
     makefile: c.File,
     /// /bin/sh is supplied by the namespace before Make's first $(shell).
     make_default_shell: []const u8,
-    /// Legacy bindings may retain this reviewed native entry. Direct native Git
-    /// in the namespace uses the dedicated environment record instead.
+    /// Required by v3: source of the helper's native /bin/git personality.
     git_entry_source: ?c.File = null,
     compiler_version: []const u8,
 };
@@ -252,7 +247,7 @@ const ToolBinding = ns.Tool;
 const NativeBinding = struct { name: Alias, tool: ToolBinding };
 
 pub const Binding = struct {
-    schema: enum { hyperv_local_native_producer_binding_v2 },
+    schema: enum { hyperv_local_native_producer_binding_v3 },
     source: c.Source,
     repository: DirectoryIdentity,
     workspace: DirectoryIdentity,
@@ -278,7 +273,7 @@ pub fn describe(allocator: std.mem.Allocator, inputs: Inputs) !Binding {
     const native = try allocator.alloc(NativeBinding, inputs.tools.native.len);
     for (inputs.tools.native, native) |item, *binding| binding.* = .{ .name = item.name, .tool = toolBinding(item.bound) };
     return .{
-        .schema = .hyperv_local_native_producer_binding_v2,
+        .schema = .hyperv_local_native_producer_binding_v3,
         .source = inputs.observed_source,
         .repository = try directoryIdentity(inputs.repository),
         .workspace = try directoryIdentity(inputs.workspace.directory),
@@ -353,10 +348,10 @@ pub fn commandPaths(allocator: std.mem.Allocator, inputs: Inputs) !CommandPaths 
             .readelf = try executablePath(allocator, try nativeTool(inputs.tools, .@"llvm-readelf")),
             .strip = try executablePath(allocator, try nativeTool(inputs.tools, .@"llvm-strip")),
         },
-        .preparation_environment = if (inputs.isolation) |isolation| .{
-            .path = try std.fs.path.join(allocator, &.{ inputs.workspace.directory.path, isolation.environment.path }),
-            .sha256 = isolation.environment.sha256,
-        } else null,
+        .native_make_environment = if (inputs.isolation) |isolation|
+            try std.fs.path.join(allocator, &.{ inputs.workspace.directory.path, (isolation.make_environment orelse return error.MissingMakeEnvironment).path })
+        else
+            null,
     };
 }
 
@@ -421,6 +416,18 @@ pub fn validateBindingStructure(allocator: std.mem.Allocator, binding: Binding) 
             tool.libraries.len != 0 or tool.tree.files == 0) return error.InvalidRuntime;
     }
     const execution = binding.native_execution orelse return error.DependencyUnavailable;
+    const isolation = binding.isolation orelse return error.DependencyUnavailable;
+    if (isolation.make_environment == null or isolation.git_policy == null) return error.DependencyUnavailable;
+    if (isolation.helper.contract.role != .preparation or isolation.helper.contract.executable == null or
+        isolation.helper.contract.loader != null or isolation.helper.contract.libraries.len != 0 or
+        !std.meta.eql(isolation.helper.contract.origin.source_sha256, binding.source.physical.sha256))
+        return error.UnreviewedInput;
+    for (binding.native) |native| if (native.name == .zig) {
+        if (!std.meta.eql(isolation.helper.contract.origin.producer_sha256, native.tool.contract.executable.?.sha256))
+            return error.UnreviewedInput;
+    };
+    const entry = execution.git_entry_source orelse return error.DependencyUnavailable;
+    if (!std.mem.eql(u8, entry.path, "support/tools/hyperv/preparation/git_entry.zig")) return error.UnreviewedInput;
     if (!std.mem.eql(u8, execution.make_default_shell, "/bin/sh") or
         !std.mem.eql(u8, execution.compiler_version, c.compiler_version)) return error.UnreviewedInput;
 }
@@ -458,6 +465,67 @@ pub fn bindingEnvironment(allocator: std.mem.Allocator, binding: Binding) !env.R
         .git_exec_path = try std.fs.path.join(allocator, &.{ binding.scratch.path, "disabled-git-exec" }),
         .trust_bundle = try std.fs.path.join(allocator, &.{ binding.trust.path, binding.trust_bundle.path }),
     };
+}
+
+pub fn bindingMakeEnvironment(allocator: std.mem.Allocator, binding: Binding) !env.MakeRecord {
+    const policy = try bindingEnvironment(allocator, binding);
+    var shell: ?[]const u8 = null;
+    for (binding.native) |native| if (native.name == .bash) {
+        if (shell != null) return error.InvalidRuntime;
+        const executable = native.tool.contract.executable orelse return error.InvalidRuntime;
+        shell = try std.fs.path.join(allocator, &.{ native.tool.path, executable.path });
+    };
+    return .{
+        .schema = .unikraft_native_make_environment_v1,
+        .bison_data = policy.bison_pkgdatadir,
+        .m4 = policy.m4,
+        .shell = shell orelse return error.DependencyUnavailable,
+        .tmp = try std.fs.path.join(allocator, &.{ policy.workspace, "tmp" }),
+        .xdg_cache = try std.fs.path.join(allocator, &.{ policy.workspace, "cache" }),
+        .xdg_config = try std.fs.path.join(allocator, &.{ policy.workspace, "config" }),
+        .zig_global_cache = try std.fs.path.join(allocator, &.{ policy.workspace, "zig-global" }),
+        .zig_local_cache = try std.fs.path.join(allocator, &.{ policy.workspace, "zig-local" }),
+    };
+}
+
+pub fn bindingGitPolicy(allocator: std.mem.Allocator, binding: Binding) !git_entry.Record {
+    return .{
+        .schema = .hyperv_native_git_entry_v1,
+        .repository = binding.repository.path,
+        .runtime_directory = binding.git.path,
+        .runtime = binding.git.contract,
+        .environment = try bindingEnvironment(allocator, binding),
+        .account = (binding.isolation orelse return error.DependencyUnavailable).account,
+    };
+}
+
+pub fn validatePolicyFiles(allocator: std.mem.Allocator, io: std.Io, binding: Binding) !void {
+    const isolation = binding.isolation orelse return error.DependencyUnavailable;
+    const make_file = isolation.make_environment orelse return error.MissingMakeEnvironment;
+    const git_file = isolation.git_policy orelse return error.MissingGitPolicy;
+    const files = [_]c.File{ isolation.environment, make_file, git_file };
+    const workspace = try fs.Directory.open(allocator, io, binding.workspace.path);
+    defer workspace.close(allocator, io);
+    try binding.workspace.require(try ns.Identity.directory(workspace));
+    for (files, 0..) |file, i| {
+        for (files[0..i]) |previous| if (std.mem.eql(u8, file.path, previous.path)) return error.InvalidState;
+        try fs.requireFile(try workspace.record(allocator, io, file.path, git_entry.maximum_bytes, .private), file);
+    }
+    const original = try env.load(allocator, io, try std.fs.path.join(allocator, &.{ workspace.path, isolation.environment.path }), isolation.environment.sha256);
+    defer original.deinit();
+    if (!std.mem.eql(u8, try c.canonical(allocator, original.value), try c.canonical(allocator, try bindingEnvironment(allocator, binding))))
+        return error.UnreviewedInput;
+    const make = try env.loadMake(allocator, io, try std.fs.path.join(allocator, &.{ workspace.path, make_file.path }), make_file.sha256);
+    defer make.deinit();
+    if (!std.mem.eql(u8, try c.canonical(allocator, make.value), try c.canonical(allocator, try bindingMakeEnvironment(allocator, binding))))
+        return error.UnreviewedInput;
+    const bytes = try workspace.read(allocator, io, git_file.path, git_entry.maximum_bytes, .private);
+    defer allocator.free(bytes);
+    if (!std.meta.eql(c.digest(bytes), git_file.sha256)) return error.HashMismatch;
+    const git = try git_entry.parse(allocator, bytes);
+    defer git.deinit();
+    if (!std.mem.eql(u8, try c.canonical(allocator, git.value), try c.canonical(allocator, try bindingGitPolicy(allocator, binding))))
+        return error.UnreviewedInput;
 }
 
 test "producer rejects every missing mandatory native alias wrong role compiler and duplicate before IO" {
@@ -657,13 +725,10 @@ fn validateSelection(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs, s
     try commandPath(execution.make_default_shell);
     if (!std.mem.eql(u8, execution.make_default_shell, "/bin/sh"))
         return error.UnreviewedInput;
-    if (execution.git_entry_source) |entry| {
-        try nativeSourceFile(entry);
-        if (!std.mem.startsWith(u8, entry.path, "support/build/") and
-            !std.mem.startsWith(u8, entry.path, "support/tools/hyperv/preparation/"))
-            return error.DependencyUnavailable;
-        try fs.requireFile(try inputs.repository.record(allocator, io, entry.path, 1024 * 1024, .source), entry);
-    }
+    const entry = execution.git_entry_source orelse return error.DependencyUnavailable;
+    try nativeSourceFile(entry);
+    if (!std.mem.eql(u8, entry.path, "support/tools/hyperv/preparation/git_entry.zig")) return error.DependencyUnavailable;
+    try fs.requireFile(try inputs.repository.record(allocator, io, entry.path, 1024 * 1024, .source), entry);
     if (step == .build) {
         for (inputs.native_proof.?.inputs) |input|
             try fs.requireFile(try inputs.repository.record(allocator, io, input.file.path, 1024 * 1024, .source), input.file);
@@ -675,13 +740,9 @@ fn bindingToolDigest(allocator: std.mem.Allocator, bound: runtime.Bound) !c.Sha 
 }
 
 pub fn environmentRecord(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !env.Record {
-    const isolation = inputs.isolation orelse return error.DependencyUnavailable;
-    const path = try std.fs.path.join(allocator, &.{ inputs.workspace.directory.path, isolation.environment.path });
-    const parsed = try env.load(allocator, io, path, isolation.environment.sha256);
-    const expected = try bindingEnvironment(allocator, try describe(allocator, inputs));
-    if (!std.meta.eql(c.digest(try c.canonical(allocator, expected)), c.digest(try c.canonical(allocator, parsed.value))))
-        return error.UnreviewedInput;
-    return parsed.value;
+    const binding = try describe(allocator, inputs);
+    try validatePolicyFiles(allocator, io, binding);
+    return bindingEnvironment(allocator, binding);
 }
 
 /// Safe process observation for the parent to embed in its own state contract.
@@ -924,6 +985,7 @@ pub fn preflight(allocator: std.mem.Allocator, io: std.Io, step: Step, inputs: I
     // This veto precedes even a Git/loader subprocess.
     try validateSelection(allocator, io, inputs, step);
     try source.require(inputs.observed_source, expected.source);
+    try validateBindingStructure(allocator, try describe(allocator, inputs));
     _ = try c.sha(&expected.binding_sha256);
     if (!std.crypto.timing_safe.eql(c.Sha, expected.binding_sha256, try bindingDigest(allocator, try describe(allocator, inputs))))
         return error.UnreviewedInput;
@@ -1006,7 +1068,6 @@ test "producer exact native argv fixes targets flags packages and existing Make 
             "-Dapp=/reviewed/repository/support/apps/hyperv-acceptance", "-Dconfig=/private/work/input.config",                  "-Doutput=/private/work/build",                         "-Dnative-profile=hyperv-x86_64-efi-netvsc",        "-Dmake-command=/reviewed/native/bin/make",  "-Dcompiler=/reviewed/native/bin/zig cc -target x86_64-freestanding-none",
             "-Dcompiler-targeted=true",                                  "-Dhost-cc=/reviewed/native/bin/zig cc",                "-Dhost-cxx=/reviewed/native/bin/zig c++",              "-Dhost-cflags=-fno-sanitize=null",                 "-Dmake-arg=AR=/reviewed/native/bin/zig ar", "-Dmake-arg=NM=/reviewed/native/bin/llvm-nm",
             "-Dmake-arg=OBJCOPY=/reviewed/native/bin/llvm-objcopy",      "-Dmake-arg=OBJDUMP=/reviewed/native/bin/llvm-objdump", "-Dmake-arg=READELF=/reviewed/native/bin/llvm-readelf", "-Dmake-arg=STRIP=/reviewed/native/bin/llvm-strip", "-Dmake-arg=UK_CFLAGS=-std=gnu17",           "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
-            "-Dmake-arg=UMASK=0077",
         };
         try std.testing.expectEqual(step, command.step);
         try std.testing.expectEqualStrings(fixture_paths.repository, command.cwd);
@@ -1035,18 +1096,14 @@ test "producer exact dedicated environment arguments do not enter the Make overr
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var command = fixture_paths;
-    command.preparation_environment = .{ .path = "/private/work/environment.json", .sha256 = c.digest("fixture environment") };
+    command.native_make_environment = "/private/work/make-environment.json";
     const selected = try plan(arena.allocator(), .configure, command);
-    try std.testing.expectEqualStrings("-Dpreparation-environment=/private/work/environment.json", selected.argv[selected.argv.len - 2]);
-    try std.testing.expectEqualStrings(
-        try std.fmt.allocPrint(arena.allocator(), "-Dpreparation-environment-sha256={s}", .{command.preparation_environment.?.sha256}),
-        selected.argv[selected.argv.len - 1],
-    );
-    var masks: usize = 0;
-    for (selected.argv) |arg| if (std.mem.eql(u8, arg, "-Dmake-arg=UMASK=0077")) {
-        masks += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 1), masks);
+    try std.testing.expectEqualStrings("-Dnative-make-environment=/private/work/make-environment.json", selected.argv[selected.argv.len - 1]);
+    for (selected.argv) |arg| {
+        try std.testing.expect(!std.mem.startsWith(u8, arg, "-Dpreparation-environment"));
+        inline for (.{ "UMASK", "SHELL", "CONFIG_SHELL", "M4", "BISON_PKGDATADIR", "TMPDIR", "ZIG_LOCAL_CACHE_DIR", "ZIG_GLOBAL_CACHE_DIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME" }) |name|
+            try std.testing.expect(!std.mem.startsWith(u8, arg, "-Dmake-arg=" ++ name ++ "="));
+    }
 }
 
 test "producer vetoes selected Python proofs before any child or claimed native approval" {

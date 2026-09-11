@@ -415,9 +415,78 @@ pub const TestFixture = struct {
     repository: fs.Directory,
     git: Git,
 
+    pub const Inputs = struct {
+        executable: []const u8,
+        loader: []const u8,
+        libraries: []const []const u8,
+    };
+
+    /// The caller supplies public fixture paths; this never searches the host.
+    pub fn copyRuntime(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory, selected: Inputs) !Bound {
+        if (builtin.os.tag != .linux or (builtin.cpu.arch != .aarch64 and builtin.cpu.arch != .x86_64))
+            return error.UnsupportedFixtureArchitecture;
+        if (selected.libraries.len == 0 or selected.libraries.len > 256) return error.InvalidRuntime;
+        const Input = struct { source: []const u8, destination: []const u8, mode: u16 };
+        var inputs: std.ArrayList(Input) = .empty;
+        defer inputs.deinit(allocator);
+        try inputs.appendSlice(allocator, &.{
+            .{ .source = selected.executable, .destination = "bin/git", .mode = 0o755 },
+            .{ .source = selected.loader, .destination = "lib/loader", .mode = 0o755 },
+        });
+        for (selected.libraries) |library| {
+            const name = std.fs.path.basename(library);
+            try c.core.private_files.basename(name);
+            if (std.mem.eql(u8, name, "loader")) return error.InvalidRuntime;
+            try inputs.append(allocator, .{
+                .source = library,
+                .destination = try std.fs.path.join(allocator, &.{ "lib", name }),
+                .mode = 0o644,
+            });
+        }
+        for (inputs.items) |input| {
+            try absolutePath(input.source);
+            const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, input.source, allocator);
+            defer allocator.free(canonical);
+            const public = try fs.Directory.open(allocator, io, std.fs.path.dirname(canonical).?);
+            defer public.close(allocator, io);
+            const bytes = try public.read(allocator, io, std.fs.path.basename(canonical), 64 * 1024 * 1024, .artifact);
+            defer allocator.free(bytes);
+            const file = try directory.dir.createFile(io, input.destination, .{ .exclusive = true, .permissions = .fromMode(input.mode) });
+            defer file.close(io);
+            try file.writePositionalAll(io, bytes, 0);
+            try file.setPermissions(io, .fromMode(input.mode));
+        }
+        const inventory = try fs.inventory(allocator, io, directory, 258, 128 * 1024 * 1024);
+        var libraries: std.ArrayList(c.File) = .empty;
+        for (inventory.entries) |record| if (!std.mem.eql(u8, record.path, "bin/git") and !std.mem.eql(u8, record.path, "lib/loader")) {
+            try libraries.append(allocator, record);
+        };
+        const result: Bound = .{ .directory = directory, .contract = .{
+            .role = .git,
+            .origin = .{
+                .scheme = .authenticated_distribution,
+                .revision = "public-installed-synthetic-runtime",
+                .source_sha256 = c.digest("synthetic runtime fixture input"),
+                .producer_sha256 = c.digest("synthetic runtime fixture producer"),
+            },
+            .target = if (builtin.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
+            .tree = inventory.tree,
+            .executable = try directory.record(allocator, io, "bin/git", 64 * 1024 * 1024, .executable),
+            .loader = try directory.record(allocator, io, "lib/loader", 64 * 1024 * 1024, .executable),
+            .libraries = try libraries.toOwnedSlice(allocator),
+        } };
+        try result.validate(allocator, io);
+        return result;
+    }
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !TestFixture {
         if (!builtin.is_test) @compileError("Synthetic fixture is test-only");
-        if (builtin.cpu.arch != .aarch64 or builtin.os.tag != .linux) return error.SkipZigTest;
+        const options = @import("test_options");
+        const selected: Inputs = .{
+            .executable = options.git_executable orelse return error.MissingFixtureRuntime,
+            .loader = options.git_loader orelse return error.MissingFixtureRuntime,
+            .libraries = options.git_libraries orelse return error.MissingFixtureRuntime,
+        };
         try c.core.process.initialize();
         var temporary = std.testing.tmpDir(.{ .iterate = true });
         errdefer temporary.cleanup();
@@ -432,35 +501,7 @@ pub const TestFixture = struct {
         const runtime_path = try std.fs.path.join(allocator, &.{ root.path, "runtime" });
         const directory = try fs.Directory.open(allocator, io, runtime_path);
         errdefer directory.close(allocator, io);
-        const inputs = [_]struct { source: []const u8, destination: []const u8, mode: u16 }{
-            .{ .source = "/home/g/.pixi/envs/git/bin/git", .destination = "bin/git", .mode = 0o755 },
-            .{ .source = "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1", .destination = "lib/loader", .mode = 0o755 },
-            .{ .source = "/home/g/.pixi/envs/git/lib/libpcre2-8.so.0", .destination = "lib/libpcre2-8.so.0", .mode = 0o644 },
-            .{ .source = "/home/g/.pixi/envs/git/lib/libz.so.1", .destination = "lib/libz.so.1", .mode = 0o644 },
-            .{ .source = "/home/g/.pixi/envs/git/lib/libiconv.so.2", .destination = "lib/libiconv.so.2", .mode = 0o644 },
-            .{ .source = "/home/g/.pixi/envs/git/lib/libcrypto.so.3", .destination = "lib/libcrypto.so.3", .mode = 0o644 },
-            .{ .source = "/usr/lib/aarch64-linux-gnu/libpthread.so.0", .destination = "lib/libpthread.so.0", .mode = 0o644 },
-            .{ .source = "/usr/lib/aarch64-linux-gnu/libc.so.6", .destination = "lib/libc.so.6", .mode = 0o644 },
-            .{ .source = "/usr/lib/aarch64-linux-gnu/libdl.so.2", .destination = "lib/libdl.so.2", .mode = 0o644 },
-        };
-        for (inputs) |input| {
-            const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, input.source, allocator);
-            if (!std.mem.startsWith(u8, canonical, "/home/g/.pixi/envs/git/") and
-                !std.mem.startsWith(u8, canonical, "/usr/lib/aarch64-linux-gnu/")) return error.UnsafePath;
-            const public = try fs.Directory.open(allocator, io, std.fs.path.dirname(canonical).?);
-            defer public.close(allocator, io);
-            const bytes = try public.read(allocator, io, std.fs.path.basename(canonical), 64 * 1024 * 1024, .artifact);
-            defer allocator.free(bytes);
-            const file = try directory.dir.createFile(io, input.destination, .{ .exclusive = true, .permissions = .fromMode(input.mode) });
-            defer file.close(io);
-            try file.writePositionalAll(io, bytes, 0);
-            try file.setPermissions(io, .fromMode(input.mode));
-        }
-        const inventory = try fs.inventory(allocator, io, directory, 32, 128 * 1024 * 1024);
-        var libraries: std.ArrayList(c.File) = .empty;
-        for (inventory.entries) |record| if (!std.mem.eql(u8, record.path, "bin/git") and !std.mem.eql(u8, record.path, "lib/loader")) {
-            try libraries.append(allocator, record);
-        };
+        const copied = try copyRuntime(allocator, io, directory, selected);
         const repository = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ root.path, "repository" }));
         errdefer repository.close(allocator, io);
         var result: TestFixture = .{
@@ -470,23 +511,7 @@ pub const TestFixture = struct {
             .git = .{
                 .allocator = allocator,
                 .io = io,
-                .runtime = .{
-                    .directory = directory,
-                    .contract = .{
-                        .role = .git,
-                        .origin = .{
-                            .scheme = .authenticated_distribution,
-                            .revision = "public-installed-synthetic-runtime",
-                            .source_sha256 = c.digest("synthetic runtime fixture input"),
-                            .producer_sha256 = c.digest("synthetic runtime fixture producer"),
-                        },
-                        .target = .aarch64_linux,
-                        .tree = inventory.tree,
-                        .executable = try directory.record(allocator, io, "bin/git", 64 * 1024 * 1024, .executable),
-                        .loader = try directory.record(allocator, io, "lib/loader", 64 * 1024 * 1024, .executable),
-                        .libraries = try libraries.toOwnedSlice(allocator),
-                    },
-                },
+                .runtime = copied,
                 .environment = .{ .scratch = root.path, .path = try std.fs.path.join(allocator, &.{ directory.path, "bin" }) },
                 .deadline = try c.core.process.Deadline.afterMilliseconds(120000),
             },

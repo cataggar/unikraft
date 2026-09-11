@@ -1,6 +1,6 @@
 .{
     .name = .hyperv_preparation,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0xf1d4a11a3f2639b3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -16,6 +16,6 @@
         "producer.zig",        "provenance.zig", "receipts.zig",       "inputs.zig",
         "process_fixture.zig", "tests.zig",      "README.md",          "admission.zig",
         "environment.zig",     "namespace.zig",  "namespace_main.zig", "namespace_tests.zig",
-        "namespace",
+        "namespace",           "git_entry.zig",
     },
 }

@@ -158,9 +158,13 @@ pub fn requireEngine(allocator: std.mem.Allocator, io: std.Io, bound: runtime.Bo
     const file = try std.Io.Dir.openFileAbsolute(io, "/proc/self/exe", .{});
     defer file.close(io);
     const before = try fs.metadata(file);
-    if (before.size != executable.size or before.mode & 0o7777 != executable.mode or
+    const selected = try bound.directory.openFile(io, executable.path, .executable);
+    defer selected.close(io);
+    if (!std.meta.eql(before, try fs.metadata(selected)) or
+        before.size != executable.size or before.mode & 0o7777 != executable.mode or
         !std.meta.eql(try fs.hashFile(io, file, before.size), executable.sha256) or
-        !std.meta.eql(before, try fs.metadata(file))) return error.UnreviewedInput;
+        !std.meta.eql(before, try fs.metadata(file)) or
+        !std.meta.eql(before, try fs.metadata(selected))) return error.UnreviewedInput;
 }
 
 fn verifySource(allocator: std.mem.Allocator, io: std.Io, record: provenance.Record, binding: ProducerSource, digest: c.Sha, deadline: Deadline) !void {
@@ -245,7 +249,10 @@ fn requireProducerLocations(allocator: std.mem.Allocator, io: std.Io, bytes: []c
     const helper = selected.isolation.?.helper;
     const helper_directory = try fs.Directory.open(allocator, io, helper.path);
     defer helper_directory.close(allocator, io);
-    try inputs.requireControlBinding(io, input.selection, bindings.assets, .{ .directory = helper_directory, .contract = helper.contract });
+    try inputs.requireControlBinding(allocator, io, input.selection, bindings.assets, .{ .directory = helper_directory, .contract = helper.contract });
+    const isolation = selected.isolation.?;
+    for ([_]c.File{ isolation.environment, isolation.make_environment orelse return error.MissingMakeEnvironment, isolation.git_policy orelse return error.MissingGitPolicy }) |file|
+        try inputs.requireControlFileBinding(io, input.selection, bindings.assets, bindings.config, file, .private);
 }
 
 /// Rechecks stored producer inputs WITHOUT rerunning configure/build, changing
@@ -305,15 +312,7 @@ fn verifyStoredBinding(allocator: std.mem.Allocator, io: std.Io, bytes: []const 
         defer directory.close(allocator, io);
         try fs.requireTree((try fs.inventory(allocator, io, directory, 100000, 4 * 1024 * 1024 * 1024)).tree, git.tree);
     }
-    const workspace = try fs.Directory.open(allocator, io, binding.workspace.path);
-    defer workspace.close(allocator, io);
-    try fs.requireFile(try workspace.record(allocator, io, isolation.environment.path, 16 * 1024, .private), isolation.environment);
-    const env_path = try std.fs.path.join(allocator, &.{ workspace.path, isolation.environment.path });
-    const environment = try @import("environment.zig").load(allocator, io, env_path, isolation.environment.sha256);
-    defer environment.deinit();
-    const expected_environment = try producer.bindingEnvironment(allocator, binding);
-    if (!std.mem.eql(u8, try c.canonical(allocator, expected_environment), try c.canonical(allocator, environment.value)))
-        return error.UnreviewedInput;
+    try producer.validatePolicyFiles(allocator, io, binding);
     const trust = try fs.Directory.open(allocator, io, binding.trust.path);
     defer trust.close(allocator, io);
     try fs.requireFile(try trust.record(allocator, io, binding.trust_bundle.path, 1024 * 1024, .artifact), binding.trust_bundle);
@@ -348,8 +347,8 @@ pub fn load(backing_allocator: std.mem.Allocator, io: std.Io, review: Review, bi
     const input_file: c.File = .{ .path = "input.json", .size = bytes.len, .sha256 = review.input_sha256, .mode = 0o600 };
     const staging_before = try inputs.requireStagedClosure(allocator, io, &lock, input.selection.assets, input_file);
     try requireEngine(allocator, io, bindings.engine, review);
-    try inputs.requireControlBinding(io, input.selection, bindings.assets, bindings.engine);
-    try inputs.requireControlBinding(io, input.selection, bindings.assets, .{
+    try inputs.requireControlBinding(allocator, io, input.selection, bindings.assets, bindings.engine);
+    try inputs.requireControlBinding(allocator, io, input.selection, bindings.assets, .{
         .directory = bindings.producer_source.provenance_bindings.producer,
         .contract = input.receipt.provenance.producer,
     });

@@ -9,6 +9,7 @@ const packaging = @import("package.zig");
 const private = c.core.private_files;
 const provenance = @import("provenance.zig");
 const config = @import("config.zig");
+const producer = @import("producer.zig");
 
 pub const evidence_reservation: u64 = 8 * 1024 * 1024;
 pub const firmware_copy_count = 6;
@@ -147,11 +148,31 @@ pub fn controlAsset(plan: Plan, expected: c.File) !Asset {
     return error.MissingControls;
 }
 
-pub fn requireControlBinding(io: std.Io, plan: Plan, bindings: []const Binding, required: runtime.Bound) !void {
+/// Charge every physical file in an independently validated control runtime,
+/// including its interpreter, libraries and non-ELF support files.
+pub fn requireControlBinding(allocator: std.mem.Allocator, io: std.Io, plan: Plan, bindings: []const Binding, required: runtime.Bound) !void {
     const expected = required.contract.executable orelse return error.InvalidRuntime;
-    const required_file = try required.directory.openFile(io, expected.path, .executable);
+    if (required.contract.tree.bytes > c.control_cap) return error.ControlLimitExceeded;
+    if (required.contract.tree.files > plan.assets.len) return error.MissingControlBinding;
+    try requireControlFileBinding(io, plan, bindings, required.directory, expected, .executable);
+    const inventory = try fs.inventory(allocator, io, required.directory, 240, c.control_cap);
+    defer {
+        for (inventory.entries) |file| allocator.free(file.path);
+        allocator.free(inventory.entries);
+    }
+    try fs.requireTree(inventory.tree, required.contract.tree);
+    for (inventory.entries) |file|
+        try requireControlFileBinding(io, plan, bindings, required.directory, file, .artifact);
+}
+
+pub fn requireControlFileBinding(io: std.Io, plan: Plan, bindings: []const Binding, required_directory: fs.Directory, expected: c.File, policy: fs.Policy) !void {
+    const required_file = try required_directory.openFile(io, expected.path, policy);
     defer required_file.close(io);
     const identity = try fs.metadata(required_file);
+    if (identity.size != expected.size or identity.mode & 0o7777 != expected.mode or
+        expected.size > c.total_cap or
+        !std.meta.eql(try fs.hashFile(io, required_file, expected.size), expected.sha256) or
+        !std.meta.eql(identity, try fs.metadata(required_file))) return error.HashMismatch;
     for (plan.assets) |item| {
         if (!item.role.isControl() or !std.mem.eql(u8, item.source.path, expected.path) or
             !std.meta.eql(item.source.sha256, expected.sha256)) continue;
@@ -160,8 +181,8 @@ pub fn requireControlBinding(io: std.Io, plan: Plan, bindings: []const Binding, 
         const selected = try directory.openFile(io, item.source.path, .artifact);
         defer selected.close(io);
         const actual = try fs.metadata(selected);
-        if (actual.device == identity.device and actual.inode == identity.inode and
-            actual.mode == identity.mode and actual.uid == identity.uid) return;
+        if (std.meta.eql(actual, identity) and
+            std.meta.eql(identity, try fs.metadata(required_file))) return;
     }
     return error.MissingControlBinding;
 }
@@ -173,6 +194,30 @@ pub fn publicationAllowance(entries: []const budget.Entry) !u64 {
         allowance = entry.reserved;
     };
     return allowance orelse error.InvalidSelection;
+}
+
+fn requirePolicyControls(allocator: std.mem.Allocator, io: std.Io, plan: Plan, bindings: []const Binding) !void {
+    for (plan.publication.executions ++ plan.publication.inspections) |file| {
+        const item = try publicationAsset(plan, file);
+        const directory = try binding(bindings, item.id);
+        const bytes = try directory.read(allocator, io, file.path, 4 * 1024 * 1024, .private);
+        defer allocator.free(bytes);
+        if (!std.meta.eql(c.digest(bytes), file.sha256) or bytes.len != file.size) return error.HashMismatch;
+        const parsed = try c.parse(producer.Binding, allocator, bytes);
+        defer parsed.deinit();
+        try producer.validateBindingStructure(allocator, parsed.value);
+        try producer.validatePolicyFiles(allocator, io, parsed.value);
+        const isolated = parsed.value.isolation.?;
+        const helper = try fs.Directory.open(allocator, io, isolated.helper.path);
+        defer helper.close(allocator, io);
+        const helper_runtime: runtime.Bound = .{ .directory = helper, .contract = isolated.helper.contract };
+        try helper_runtime.validate(allocator, io);
+        try requireControlBinding(allocator, io, plan, bindings, helper_runtime);
+        const workspace = try fs.Directory.open(allocator, io, parsed.value.workspace.path);
+        defer workspace.close(allocator, io);
+        for ([_]c.File{ isolated.environment, isolated.make_environment.?, isolated.git_policy.? }) |policy|
+            try requireControlFileBinding(io, plan, bindings, workspace, policy, .private);
+    }
 }
 
 fn requireRuntimeAssets(plan: Plan) !void {
@@ -253,6 +298,8 @@ pub fn ledger(allocator: std.mem.Allocator, plan: Plan, packaged: receipts.Link)
     _ = try publicationAsset(plan, plan.solved_metadata);
     _ = try publicationAsset(plan, plan.capability_receipt);
     _ = try controlAsset(plan, packaged.receipt.provenance.producer.executable.?);
+    if (packaged.receipt.provenance.producer.loader) |loader| _ = try controlAsset(plan, loader);
+    for (packaged.receipt.provenance.producer.libraries) |library| _ = try controlAsset(plan, library);
     _ = try publicationAsset(plan, packaged.receipt.config_after);
     for (plan.publication.receipts, [_][]const u8{ "prepared.receipt.json", "configured.receipt.json", "built.receipt.json", "packaged.receipt.json" }) |file, name| {
         if (!std.mem.eql(u8, file.path, name) or file.mode != 0o600) return error.InvalidSelection;
@@ -422,7 +469,8 @@ pub fn generate(
         const directory = try binding(bindings, item.id);
         try fs.requireFile(try directory.record(allocator, io, item.source.path, c.total_cap, .artifact), item.source);
     }
-    try requireControlBinding(io, plan, bindings, .{ .directory = context.bindings.producer, .contract = context.review.producer });
+    try requireControlBinding(allocator, io, plan, bindings, .{ .directory = context.bindings.producer, .contract = context.review.producer });
+    try requirePolicyControls(allocator, io, plan, bindings);
     const result: Input = .{
         .schema = .hyperv_native_prepared_input_v2,
         .state = .prepared,
