@@ -1,6 +1,7 @@
 const std = @import("std");
 const x = @import("common.zig");
 const main = @import("main.zig");
+const material = @import("material.zig");
 const selection = @import("selection.zig");
 const t = std.testing;
 const a = t.allocator;
@@ -310,4 +311,131 @@ test "integration driver rejects data-only and absent compiler or engine executa
     try t.expectError(error.InvalidRuntime, x.runtimeExecutable(tool, .preparation));
     tool.target = .data;
     try t.expectError(error.InvalidRuntime, x.runtimeExecutable(tool, .preparation));
+}
+
+// Valid contract/hash only. No corresponding source or executable material is
+// installed, so these negative intake fixtures cannot run a real producer.
+fn configuredReceiptFixture(allocator: std.mem.Allocator) !x.p.receipts.Link {
+    const source: x.c.Source = .{
+        .scheme = .git_physical_native_v1,
+        .head = "1" ** 40,
+        .tree = "2" ** 40,
+        .tree_sha256 = hash.*,
+        .physical = .{ .sha256 = hash.*, .files = 1, .bytes = 1 },
+    };
+    const executable: x.rt.Tool = .{
+        .role = .preparation,
+        .target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
+        .origin = .{ .scheme = .git, .revision = "synthetic-receipt", .source_sha256 = hash.*, .producer_sha256 = hash.* },
+        .tree = .{ .files = 1, .bytes = 1, .sha256 = hash.* },
+        .executable = .{ .path = "bin/fixture", .size = 1, .mode = 0o700, .sha256 = hash.* },
+        .loader = null,
+        .libraries = &.{},
+    };
+    var compiler = executable;
+    compiler.role = .zig;
+    compiler.origin.scheme = .zig_package;
+    compiler.origin.revision = x.c.compiler_version;
+    var git = executable;
+    git.role = .git;
+    var trust = executable;
+    trust.role = .trust;
+    trust.target = .data;
+    trust.executable = null;
+    var dependency = trust;
+    dependency.role = .dependencies;
+    dependency.origin.scheme = .zig_package;
+    dependency.origin.revision = x.c.miz_revision;
+    const dependencies = try allocator.alloc(x.p.provenance.Dependency, 1);
+    dependencies[0] = .{ .name = "miz_source", .package_hash = x.p.provenance.miz_package_hash, .content = dependency };
+    const provenance: x.p.provenance.Record = .{
+        .schema = .hyperv_native_producer_provenance_v1,
+        .source = source,
+        .host_target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
+        .guest_target = .x86_64_freestanding_none,
+        .compiler_version = x.c.compiler_version,
+        .producer = executable,
+        .compiler = compiler,
+        .git = git,
+        .trust = trust,
+        .dependencies = dependencies,
+    };
+    const config: x.c.File = .{ .path = "run.config", .size = 1, .mode = 0o600, .sha256 = hash.* };
+    const receipt: x.p.receipts.Receipt = .{
+        .schema = .hyperv_artifact_preparation_native_v1,
+        .phase = .configured,
+        .purpose = .synthetic,
+        .run_id = "1".* ** 32,
+        .guard = .{ .run_id = "1".* ** 32, .disk_id = "2".* ** 32, .sectors = 49, .lun = 0 },
+        .source_before = source,
+        .source_after = source,
+        .provenance = provenance,
+        .reviewed_provenance_sha256 = x.c.digest(try x.c.canonical(allocator, provenance)),
+        .config_before = config,
+        .config_after = config,
+        .parent_sha256 = hash.*,
+        .execution = .{ .step = .configure, .exit_code = 0, .cleanup_complete = true, .admitted_binding_sha256 = hash.* },
+        .efi = null,
+        .packaging = null,
+        .authority = .not_admitted,
+    };
+    const link: x.p.receipts.Link = .{ .receipt = receipt, .sha256 = x.c.digest(try x.c.canonical(allocator, receipt)) };
+    try x.p.receipts.requireLink(allocator, link);
+    return link;
+}
+
+test "integration driver checks internal phase of a valid matching-hash private receipt" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fixture = t.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(t.io, .fromMode(0o700));
+    var world: x.World = .{ .allocator = arena.allocator(), .io = t.io, .deadline = try x.c.core.process.Deadline.afterMilliseconds(30000) };
+    defer world.deinit();
+    const directory = try world.open(try fixture.dir.realPathFileAlloc(t.io, ".", world.allocator));
+    const link = try configuredReceiptFixture(world.allocator);
+    const bytes = try x.c.canonical(world.allocator, link.receipt);
+    try write(directory.dir, "prepared.receipt.json", bytes, 0o600);
+    try write(directory.dir, "configured.receipt.json", bytes, 0o600);
+    const before = try x.fs.inventory(world.allocator, t.io, directory, 8, x.maximum_document);
+    try t.expectError(error.InvalidPhase, world.receipt(directory, .prepared, link.sha256));
+    const accepted = try world.receipt(directory, .configured, link.sha256);
+    try t.expectEqual(x.c.Phase.configured, accepted.receipt.phase);
+    try t.expectEqualStrings(&link.sha256, &accepted.sha256);
+    try t.expectError(error.UnreviewedInput, world.receipt(directory, .configured, x.c.digest("independently mismatching fixture hash")));
+    try x.fs.requireTree(before.tree, (try x.fs.inventory(world.allocator, t.io, directory, 8, x.maximum_document)).tree);
+}
+
+test "integration driver wrong-phase receipt stops real intake paths before attempts or execution" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fixture = t.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(t.io, .fromMode(0o700));
+    for ([_][]const u8{ "receipts", "reviews", "controls" }) |name|
+        try fixture.dir.createDir(t.io, name, .fromMode(0o700));
+    var world: x.World = .{ .allocator = arena.allocator(), .io = t.io, .deadline = try x.c.core.process.Deadline.afterMilliseconds(30000) };
+    defer world.deinit();
+    const directory = try world.open(try fixture.dir.realPathFileAlloc(t.io, ".", world.allocator));
+    const receipts = try world.child(directory, "receipts");
+    const reviews = try world.child(directory, "reviews");
+    const link = try configuredReceiptFixture(world.allocator);
+    const bytes = try x.c.canonical(world.allocator, link.receipt);
+    try write(receipts.dir, "prepared.receipt.json", bytes, 0o600);
+    try write(receipts.dir, "packaged.receipt.json", bytes, 0o600);
+    var approved = review(.configure);
+    approved.parent_sha256 = link.sha256;
+    approved.provenance_sha256 = link.receipt.reviewed_provenance_sha256;
+    try approved.validate(.configure);
+    try write(reviews.dir, "configure.json", try x.c.canonical(world.allocator, approved), 0o600);
+    const before = try x.fs.inventory(world.allocator, t.io, directory, 16, x.maximum_document);
+    try t.expectError(error.InvalidPhase, material.stage(&world, directory, .configure, "expected.config"));
+    try x.fs.requireTree(before.tree, (try x.fs.inventory(world.allocator, t.io, directory, 16, x.maximum_document)).tree);
+    try t.expectError(error.InvalidPhase, main.run(&world, .{ .workspace = directory.path, .command = .{ .producer = .configure } }));
+    try x.fs.requireTree(before.tree, (try x.fs.inventory(world.allocator, t.io, directory, 16, x.maximum_document)).tree);
+    try t.expect(link.receipt.packaging == null);
+    try t.expectError(error.InvalidPhase, selection.create(&world, directory));
+    try x.fs.requireTree(before.tree, (try x.fs.inventory(world.allocator, t.io, directory, 16, x.maximum_document)).tree);
+    const controls = try world.child(directory, "controls");
+    try t.expectEqual(@as(u32, 0), (try x.fs.inventory(world.allocator, t.io, controls, 8, x.maximum_document)).tree.files);
 }

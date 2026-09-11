@@ -222,11 +222,6 @@ pub fn bootstrap(world: *x.World, workspace: fs.Directory) !c.File {
 
 pub fn stage(world: *x.World, workspace: fs.Directory, phase: @FieldType(x.Stage, "phase"), expected_config: ?[]const u8) !c.File {
     const workspace_state = try world.state(workspace);
-    var workspace_lock = try workspace_state.lock(world.io);
-    defer workspace_lock.close(world.io);
-    const base = try bundle(world, workspace, null);
-    var execution = base.value.binding;
-    execution.config = try workspace.record(world.allocator, world.io, execution.config.path, p.config.config_cap, .private);
     const receipts = try world.child(workspace, "receipts");
     const parent_phase: c.Phase = if (phase == .configure) .prepared else .configured;
     const parent_name = try std.fmt.allocPrint(world.allocator, "{s}.receipt.json", .{@tagName(parent_phase)});
@@ -234,6 +229,11 @@ pub fn stage(world: *x.World, workspace: fs.Directory, phase: @FieldType(x.Stage
     try x.requireReceiptPhase(parent.value.phase, parent_phase);
     try p.receipts.validate(parent.value);
     try x.synthetic(parent.value.guard);
+    var workspace_lock = try workspace_state.lock(world.io);
+    defer workspace_lock.close(world.io);
+    const base = try bundle(world, workspace, null);
+    var execution = base.value.binding;
+    execution.config = try workspace.record(world.allocator, world.io, execution.config.path, p.config.config_cap, .private);
     try fs.requireFile(execution.config, parent.value.config_after);
     const expected = if (phase == .configure) blk: {
         const name = expected_config orelse return error.InspectionExpectationRequired;

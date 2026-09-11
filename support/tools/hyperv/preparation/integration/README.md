@@ -307,7 +307,10 @@ Failure is not resumable or replayable. Do not delete markers, overwrite
 receipts, replace policies, or rerun against a changed config; retain failed
 evidence and establish a fresh independently reviewed workspace.
 Receipt content must have the phase required by its selected pipeline slot,
-not merely a valid receipt hash or the expected filename. Bootstrap material
+not merely a valid receipt hash or the expected filename. Stage creation,
+producer dispatch and packaged-selection intake reject a wrong phase before
+workspace-lock creation, material loading, attempt/binding publication or
+producer/package execution. Bootstrap material
 also passes the existing provenance/binding structural validators before use.
 Data-only or absent compiler/engine executables are refused explicitly before
 their executable fields can be used; these shape checks never replace native
@@ -491,3 +494,20 @@ commands and `output/{debug,release-safe}.log`. The added fixtures exercise
 every receipt-phase pairing and missing/wrong-role/data-only executable
 refusals without creating synthetic success receipts. The earlier binary
 sizes above are historical measurements, not sizes of this updated build.
+
+The reviewer follow-up adds native private-file fixtures with a configured
+receipt whose contract and both canonical hashes pass `receipts.requireLink`.
+Its bytes under `prepared.receipt.json` fail the expected-phase loader, while
+the correctly named configured receipt succeeds and a wrong independent hash
+still fails. The actual stage function and CLI dispatcher reject the
+wrong-phase input without any workspace inventory change or attempt file.
+Selection similarly rejects that valid configured receipt, with null
+packaging, under `packaged.receipt.json` before dereferencing packaging.
+No corresponding source/runtime material is installed in these negative
+fixtures, and no actual producer is run.
+The focused standalone `-j2 test install --summary all` commands passed
+**16/16 fixtures and 8/8 steps in each of Debug and ReleaseSafe**. Final logs
+are `.d/zig-migration-preparation/integration-phase-review-v1/output/`
+`debug-final.log` and `release-safe-final.log`; prefixes use the corresponding
+`debug-final` and `release-safe-final` directories. Other command arguments
+match the Build section, with that fresh scratch root.

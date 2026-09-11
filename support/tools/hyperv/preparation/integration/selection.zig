@@ -83,6 +83,11 @@ const Builder = struct {
 
 pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
     const workspace_state = try world.state(workspace);
+    const receipts = try world.child(workspace, "receipts");
+    const packaged = try world.read(p.receipts.Receipt, receipts, "packaged.receipt.json", null);
+    try x.requireReceiptPhase(packaged.value.phase, .packaged);
+    try p.receipts.validate(packaged.value);
+    try x.synthetic(packaged.value.guard);
     var workspace_lock = try workspace_state.lock(world.io);
     defer workspace_lock.close(world.io);
     const root = try material.bundle(world, workspace, null);
@@ -92,11 +97,6 @@ pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
     if (spec.baked_controls.len == 0) return error.MissingBakedControlInventory;
     if (spec.baked_controls.len + spec.extra_controls.len > 128) return error.LimitExceeded;
     if (!std.mem.eql(u8, spec.capability_receipt.path, "capability.receipt.json")) return error.InvalidCapabilityName;
-    const receipts = try world.child(workspace, "receipts");
-    const packaged = try world.read(p.receipts.Receipt, receipts, "packaged.receipt.json", null);
-    try x.requireReceiptPhase(packaged.value.phase, .packaged);
-    try p.receipts.validate(packaged.value);
-    try x.synthetic(packaged.value.guard);
     const package_directory = try world.child(workspace, "package");
     const output = try world.child(workspace, "output");
     _ = try p.package.validate(world.allocator, world.io, try world.state(package_directory), output, packaged.value.packaging.?);

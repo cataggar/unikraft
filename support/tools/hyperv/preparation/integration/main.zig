@@ -56,12 +56,20 @@ pub fn attempt(world: *x.World, directory: fs.Directory, phase: x.Phase, review_
 
 fn producer(world: *x.World, workspace: fs.Directory, phase: x.Phase) !x.Sha {
     const state = try world.state(workspace);
-    var workspace_lock = try state.lock(world.io);
-    defer workspace_lock.close(world.io);
     const reviews = try world.child(workspace, if (phase == .generate) "reserved-controls" else "reviews");
     const reviewed = try world.read(x.Review, reviews, try std.fmt.allocPrint(world.allocator, "{s}.json", .{@tagName(phase)}), null);
     const review = reviewed.value;
     try review.validate(phase);
+    const receipts = try world.child(workspace, "receipts");
+    const parent_phase: c.Phase = switch (phase) {
+        .prepare, .configure => .prepared,
+        .build => .configured,
+        .package => .built,
+        .generate => .packaged,
+    };
+    const parent = if (phase != .prepare) try world.receipt(receipts, parent_phase, review.parent_sha256.?) else null;
+    var workspace_lock = try state.lock(world.io);
+    defer workspace_lock.close(world.io);
     const controls = try world.child(workspace, "controls");
     var stage: ?x.Stage = null;
     var selected: ?selection.Material = null;
@@ -89,18 +97,9 @@ fn producer(world: *x.World, workspace: fs.Directory, phase: x.Phase) !x.Sha {
     defer world.merge(context.failures) catch unreachable;
     defer world.merge(context.git.failures) catch unreachable;
     _ = try context.verify();
-    const receipts = try world.child(workspace, "receipts");
     const receipt_state = try world.state(receipts);
     var receipt_lock = try receipt_state.lock(world.io);
     defer receipt_lock.close(world.io);
-    const parent_phase: c.Phase = switch (phase) {
-        .prepare => .prepared,
-        .configure => .prepared,
-        .build => .configured,
-        .package => .built,
-        .generate => .packaged,
-    };
-    const parent = if (phase != .prepare) try world.receipt(receipts, parent_phase, review.parent_sha256.?) else null;
     if (phase == .generate) {
         const inputs = selected.?;
         const asset_bindings = try selection.bindings(world, inputs);
@@ -197,7 +196,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     run(&world, command) catch |err| fail(world.failures, err);
 }
 
-fn run(world: *x.World, command: Arguments) !void {
+pub fn run(world: *x.World, command: Arguments) !void {
     const workspace = try world.open(command.workspace);
     _ = try world.state(workspace);
     if (command.command == .measure) {
