@@ -103,6 +103,19 @@ The required Hyper-V integration job restores dependencies in scratch and runs
 all three selectors in Debug and ReleaseSafe. It also exercises the standalone
 transfer build in ReleaseSafe, without implicit source-tree fetching.
 
+## Preflight engine integration
+
+The separate [native preflight package](preflight/README.md) implements the
+single-use execution, signed six-boot evidence, cleanup and completed-state
+loader. Its standalone `test` selector exercises native adapters and supervised
+children in Debug and ReleaseSafe in the required Hyper-V job.
+
+This is not yet an operator preflight command. The installed
+`uk-hyperv-preflight-worker` refuses execution with exit 2 until the trusted
+preparation and independent authority/image/provider/route bindings are wired.
+Neither ordinary input structs nor absent VM-agent metadata establishes that
+admission. The `uk-hyperv` commands above remain unchanged.
+
 ## Module interfaces
 
 Import build module `hyperv` for the facade, `hyperv_transfer` for transfers,
@@ -164,6 +177,8 @@ Service codes are enumerated. `classifyServiceCode` and
 
 Transport adapters remain responsible for bounded header/XML/JSON extraction,
 observed status, and distinct side-effect certainty. A 403 is not absence.
+`RoleAssignmentNotFound` is recognized for role-specific absence handling;
+its classification does not make it a generic resource/group absence proof.
 The shared allowlist includes `LeaseIdMismatchWithBlobOperation`,
 `AuthorizationServiceMismatch`, `KeyBasedAuthenticationNotPermitted`,
 `InvalidBlobType` and `PendingCopyOperation`. The old undocumented

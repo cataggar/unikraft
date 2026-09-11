@@ -993,6 +993,36 @@ jobs:
               -Doptimize="${mode}" -j2 test install --summary all
         done
 
+    - name: Run native Hyper-V preflight engine fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-preflight"
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/preflight/build.zig \
+          support/tools/hyperv/preflight/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in Debug ReleaseSafe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/preflight/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dtest-root="${root}/${mode}/fixtures" \
+              -Doptimize="${mode}" -j2 test install --summary all
+          result=0
+          "${root}/${mode}/out/bin/uk-hyperv-preflight-worker" \
+            > "${root}/${mode}/stdout" 2> "${root}/${mode}/stderr" \
+            || result=$?
+          test "${result}" -eq 2
+          test ! -s "${root}/${mode}/stdout"
+          grep --fixed-strings --line-regexp --quiet \
+            '{"error":"native-preparation-and-authority-binding-required","schema":"uk-hyperv-preflight-unavailable-v1"}' \
+            "${root}/${mode}/stderr"
+        done
+
     - name: Run focused Hyper-V regressions
       run: |
         set -euo pipefail
