@@ -8,6 +8,7 @@ const runtime = @import("runtime.zig");
 const packaging = @import("package.zig");
 const private = c.core.private_files;
 const provenance = @import("provenance.zig");
+const config = @import("config.zig");
 
 pub const evidence_reservation: u64 = 8 * 1024 * 1024;
 pub const firmware_copy_count = 6;
@@ -18,16 +19,18 @@ pub const Asset = struct {
     destination: []const u8,
     placement: enum { staged, baked, future_copy },
 };
-pub const Plan = struct {
-    schema: enum { hyperv_native_input_selection_v1 },
+pub const SelectionV2 = struct {
+    schema: enum { hyperv_native_input_selection_v2 },
     packaged_receipt_sha256: c.Sha,
+    solved_metadata: c.File,
+    publication: struct { receipts: [4]c.File, executions: [2]c.File, inspections: [2]c.File },
     capability_source: c.Source,
     capability_receipt: c.File,
     qemu: runtime.Tool,
     assets: []const Asset,
 };
-pub const Input = struct {
-    schema: enum { hyperv_native_prepared_input_v1 },
+pub const PreparedInputV2 = struct {
+    schema: enum { hyperv_native_prepared_input_v2 },
     state: enum { prepared },
     authority: enum { not_admitted },
     receipt: receipts.Receipt,
@@ -36,6 +39,8 @@ pub const Input = struct {
     ledger: []const budget.Entry,
     budget: budget.Totals,
 };
+pub const Plan = SelectionV2;
+pub const Input = PreparedInputV2;
 pub const Binding = struct { id: []const u8, directory: fs.Directory };
 pub const Capability = struct {
     schema: enum { hyperv_public_capability_artifact_native_v1 },
@@ -53,36 +58,121 @@ pub fn requireFresh(io: std.Io, lock: *private.Locked) !void {
     }
 }
 
-fn requireStagedClosure(allocator: std.mem.Allocator, io: std.Io, lock: *private.Locked, assets: []const Asset) !void {
+pub fn requireStagedClosure(allocator: std.mem.Allocator, io: std.Io, lock: *private.Locked, assets: []const Asset, published: ?c.File) !c.Tree {
     try fs.requireLock(io, lock);
+    var directory_count: usize = 0;
+    try requireStagingDirectories(allocator, io, lock.directory.dir, "", assets, &directory_count, 0);
     const inventory = try fs.inventory(allocator, io, .{ .dir = lock.directory.dir, .path = "" }, 256, c.total_cap);
-    var expected_count: usize = 1;
+    var expected_count: usize = if (published != null) 2 else 1;
     for (assets) |item| if (item.placement == .staged) {
         expected_count += 1;
     };
     if (inventory.entries.len != expected_count) return error.InvalidSelection;
     for (inventory.entries) |record| {
-        if (std.mem.eql(u8, record.path, ".writer.lock")) continue;
+        if (std.mem.eql(u8, record.path, ".writer.lock")) {
+            if (record.size != 0 or record.mode != 0o600) return error.InvalidSelection;
+            continue;
+        }
+        if (published) |input| if (std.mem.eql(u8, record.path, "input.json")) {
+            const file = try (fs.Directory{ .dir = lock.directory.dir, .path = "" }).openFile(io, record.path, .private);
+            file.close(io);
+            try fs.requireFile(record, input);
+            continue;
+        };
         var found = false;
         for (assets) |item| {
             if (item.placement != .staged or !std.mem.eql(u8, record.path, item.destination)) continue;
             var expected = item.source;
             expected.path = item.destination;
             expected.mode = 0o600;
+            const file = try (fs.Directory{ .dir = lock.directory.dir, .path = "" }).openFile(io, record.path, .private);
+            file.close(io);
             try fs.requireFile(record, expected);
             found = true;
         }
         if (!found) return error.InvalidSelection;
     }
+    return inventory.tree;
 }
 
-fn asset(entries: []const Asset, role: budget.Role) !Asset {
+fn requireStagingDirectories(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir, prefix: []const u8, assets: []const Asset, count: *usize, depth: usize) !void {
+    if (depth > 32 or count.* > 256) return error.LimitExceeded;
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        count.* += 1;
+        const path = try std.fmt.allocPrint(allocator, "{s}{s}/", .{ prefix, entry.name });
+        defer allocator.free(path);
+        var required = false;
+        for (assets) |item| if (item.placement == .staged and std.mem.startsWith(u8, item.destination, path)) {
+            required = true;
+        };
+        if (!required) return error.InvalidSelection;
+        const child = try directory.openDir(io, entry.name, .{ .follow_symlinks = false, .iterate = true });
+        defer child.close(io);
+        const info = try fs.metadata(.{ .handle = child.handle, .flags = .{ .nonblocking = false } });
+        if (info.mode & 0o7777 != 0o700 or info.uid != std.os.linux.geteuid()) return error.UnsafeFile;
+        try requireStagingDirectories(allocator, io, child, path, assets, count, depth + 1);
+    }
+}
+
+pub fn asset(entries: []const Asset, role: budget.Role) !Asset {
     var found: ?Asset = null;
     for (entries) |entry| if (entry.role == role) {
         if (found != null) return error.InvalidSelection;
         found = entry;
     };
     return found orelse error.InvalidSelection;
+}
+
+pub fn publicationAsset(plan: Plan, expected: c.File) !Asset {
+    var found: ?Asset = null;
+    for (plan.assets) |item| {
+        if (item.role != .publication_control or !std.mem.eql(u8, item.source.path, expected.path)) continue;
+        try fs.requireFile(item.source, expected);
+        if (found != null) return error.InvalidSelection;
+        found = item;
+    }
+    return found orelse error.MissingControls;
+}
+
+pub fn controlAsset(plan: Plan, expected: c.File) !Asset {
+    for (plan.assets) |item| {
+        if (!item.role.isControl() or !std.mem.eql(u8, item.source.path, expected.path)) continue;
+        if (std.meta.eql(item.source.sha256, expected.sha256)) {
+            try fs.requireFile(item.source, expected);
+            return item;
+        }
+    }
+    return error.MissingControls;
+}
+
+pub fn requireControlBinding(io: std.Io, plan: Plan, bindings: []const Binding, required: runtime.Bound) !void {
+    const expected = required.contract.executable orelse return error.InvalidRuntime;
+    const required_file = try required.directory.openFile(io, expected.path, .executable);
+    defer required_file.close(io);
+    const identity = try fs.metadata(required_file);
+    for (plan.assets) |item| {
+        if (!item.role.isControl() or !std.mem.eql(u8, item.source.path, expected.path) or
+            !std.meta.eql(item.source.sha256, expected.sha256)) continue;
+        try fs.requireFile(item.source, expected);
+        const directory = try binding(bindings, item.id);
+        const selected = try directory.openFile(io, item.source.path, .artifact);
+        defer selected.close(io);
+        const actual = try fs.metadata(selected);
+        if (actual.device == identity.device and actual.inode == identity.inode and
+            actual.mode == identity.mode and actual.uid == identity.uid) return;
+    }
+    return error.MissingControlBinding;
+}
+
+pub fn publicationAllowance(entries: []const budget.Entry) !u64 {
+    var allowance: ?u64 = null;
+    for (entries) |entry| if (entry.role == .publication_reservation and std.mem.eql(u8, entry.id, "remaining-controls")) {
+        if (allowance != null or entry.source != null or entry.reserved == 0) return error.InvalidSelection;
+        allowance = entry.reserved;
+    };
+    return allowance orelse error.InvalidSelection;
 }
 
 fn requireRuntimeAssets(plan: Plan) !void {
@@ -120,6 +210,9 @@ pub fn ledger(allocator: std.mem.Allocator, plan: Plan, packaged: receipts.Link)
     try c.objectId(plan.capability_source.tree);
     _ = try c.sha(&plan.capability_receipt.sha256);
     if (plan.capability_receipt.size == 0) return error.InvalidSelection;
+    if (!std.mem.eql(u8, plan.solved_metadata.path, "native-config/metadata.tsv") or
+        plan.solved_metadata.size == 0 or plan.solved_metadata.size > config.config_cap)
+        return error.InvalidMetadata;
     var entries: std.ArrayList(budget.Entry) = .empty;
     errdefer entries.deinit(allocator);
     var working: usize = 0;
@@ -154,6 +247,28 @@ pub fn ledger(allocator: std.mem.Allocator, plan: Plan, packaged: receipts.Link)
     if (working != firmware_copy_count) return error.InvalidSelection;
     for (controls) |count| if (count == 0) return error.MissingControls;
     try fs.requireFile((try asset(plan.assets, .raw)).source, packaged.receipt.packaging.?.raw);
+    try fs.requireFile((try asset(plan.assets, .vhd)).source, packaged.receipt.packaging.?.vhd);
+    if ((try asset(plan.assets, .vhd)).source.size != try std.math.add(u64, (try asset(plan.assets, .raw)).source.size, 512))
+        return error.InvalidSelection;
+    _ = try publicationAsset(plan, plan.solved_metadata);
+    _ = try publicationAsset(plan, plan.capability_receipt);
+    _ = try controlAsset(plan, packaged.receipt.provenance.producer.executable.?);
+    _ = try publicationAsset(plan, packaged.receipt.config_after);
+    for (plan.publication.receipts, [_][]const u8{ "prepared.receipt.json", "configured.receipt.json", "built.receipt.json", "packaged.receipt.json" }) |file, name| {
+        if (!std.mem.eql(u8, file.path, name) or file.mode != 0o600) return error.InvalidSelection;
+        _ = try publicationAsset(plan, file);
+    }
+    if (!std.meta.eql(plan.publication.receipts[3].sha256, packaged.sha256) or
+        !std.meta.eql(plan.publication.receipts[2].sha256, packaged.receipt.parent_sha256.?))
+        return error.ReceiptSubstitution;
+    for (plan.publication.executions, [_][]const u8{ "configured.binding.json", "built.binding.json" }) |file, name| {
+        if (!std.mem.eql(u8, file.path, name) or file.mode != 0o600) return error.InvalidSelection;
+        _ = try publicationAsset(plan, file);
+    }
+    for (plan.publication.inspections, [_][]const u8{ "configured.inspection.binding.json", "built.inspection.binding.json" }) |file, name| {
+        if (!std.mem.eql(u8, file.path, name) or file.mode != 0o600) return error.InvalidSelection;
+        _ = try publicationAsset(plan, file);
+    }
     _ = try asset(plan.assets, .boot_disk);
     _ = try asset(plan.assets, .firmware_code);
     try fs.requireFile((try asset(plan.assets, .qemu)).source, plan.qemu.executable.?);
@@ -174,7 +289,7 @@ pub fn ledger(allocator: std.mem.Allocator, plan: Plan, packaged: receipts.Link)
     return entries.toOwnedSlice(allocator);
 }
 
-fn binding(bindings: []const Binding, id: []const u8) !fs.Directory {
+pub fn binding(bindings: []const Binding, id: []const u8) !fs.Directory {
     var found: ?fs.Directory = null;
     for (bindings) |item| if (std.mem.eql(u8, item.id, id)) {
         if (found != null) return error.InvalidSelection;
@@ -183,7 +298,7 @@ fn binding(bindings: []const Binding, id: []const u8) !fs.Directory {
     return found orelse error.InvalidSelection;
 }
 
-fn checkQemuClosure(allocator: std.mem.Allocator, io: std.Io, plan: Plan, qemu: fs.Directory) !void {
+pub fn checkQemuClosure(allocator: std.mem.Allocator, io: std.Io, plan: Plan, qemu: fs.Directory) !void {
     try (runtime.Bound{ .directory = qemu, .contract = plan.qemu }).validate(allocator, io);
     const inventory = try fs.inventory(allocator, io, qemu, 256, c.total_cap);
     var count: usize = 0;
@@ -204,27 +319,52 @@ fn checkQemuClosure(allocator: std.mem.Allocator, io: std.Io, plan: Plan, qemu: 
     if (count != inventory.entries.len) return error.IncompleteRuntime;
 }
 
-fn checkCapability(allocator: std.mem.Allocator, io: std.Io, plan: Plan, bindings: []const Binding) !void {
-    var selected: ?Asset = null;
-    for (plan.assets) |item| {
-        if (item.role != .publication_control or !std.meta.eql(item.source.sha256, plan.capability_receipt.sha256)) continue;
-        try fs.requireFile(item.source, plan.capability_receipt);
-        if (selected != null) return error.InvalidSelection;
-        selected = item;
-    }
-    const item = selected orelse return error.InvalidSelection;
+pub fn loadCapability(allocator: std.mem.Allocator, io: std.Io, plan: Plan, bindings: []const Binding) !std.json.Parsed(Capability) {
+    const item = try publicationAsset(plan, plan.capability_receipt);
     const directory = try binding(bindings, item.id);
+    try fs.requireFile(try directory.record(allocator, io, item.source.path, 1024 * 1024, .artifact), item.source);
     const bytes = try directory.read(allocator, io, item.source.path, 1024 * 1024, .artifact);
     defer allocator.free(bytes);
     if (!std.meta.eql(c.digest(bytes), plan.capability_receipt.sha256)) return error.HashMismatch;
     const parsed = try c.parse(Capability, allocator, bytes);
-    defer parsed.deinit();
+    errdefer parsed.deinit();
     try provenance.validate(parsed.value.provenance);
     try source.require(parsed.value.provenance.source, plan.capability_source);
     const encoded = try c.canonical(allocator, parsed.value.provenance);
     defer allocator.free(encoded);
     if (!std.meta.eql(c.digest(encoded), parsed.value.reviewed_provenance_sha256)) return error.UnreviewedInput;
     try fs.requireFile(parsed.value.image, (try asset(plan.assets, .boot_disk)).source);
+    return parsed;
+}
+
+pub fn validateSolvedConfig(allocator: std.mem.Allocator, io: std.Io, plan: Plan, bindings: []const Binding, directory: fs.Directory, receipt: receipts.Receipt) !void {
+    const item = try publicationAsset(plan, plan.solved_metadata);
+    const metadata_directory = try binding(bindings, item.id);
+    try fs.requireFile(try metadata_directory.record(allocator, io, item.source.path, config.config_cap, .artifact), item.source);
+    const bytes = try metadata_directory.read(allocator, io, item.source.path, config.config_cap, .artifact);
+    defer allocator.free(bytes);
+    if (!std.meta.eql(c.digest(bytes), item.source.sha256)) return error.HashMismatch;
+    try fs.requireFile(try directory.record(allocator, io, receipt.config_after.path, config.config_cap, .private), receipt.config_after);
+    const solved = try directory.read(allocator, io, receipt.config_after.path, config.config_cap, .private);
+    defer allocator.free(solved);
+    if (!std.meta.eql(c.digest(solved), receipt.config_after.sha256)) return error.HashMismatch;
+    try validateAuthoritativeConfig(allocator, solved, bytes, receipt.guard);
+}
+
+pub fn validateAuthoritativeConfig(allocator: std.mem.Allocator, solved: []const u8, metadata_bytes: []const u8, guard: config.Guard) !void {
+    if (solved.len > config.config_cap or metadata_bytes.len > config.config_cap) return error.LimitExceeded;
+    var metadata = try config.Metadata.parse(allocator, metadata_bytes);
+    defer metadata.deinit();
+    const kconfig = @import("native_kconfig");
+    var diagnostic: kconfig.Diagnostic = .{};
+    var document = try kconfig.parseWithMetadata(allocator, solved, &metadata, &diagnostic);
+    defer document.deinit();
+    for (document.entries.items) |entry|
+        if (entry.symbol_type == null) return error.IncompleteMetadata;
+    if (!document.enabled("ARCH_X86_64") or !document.enabled("PLAT_HYPERV")) return error.InvalidSelection;
+    for ([_][]const u8{ "ARCH_ARM_64", "ARCH_ARM", "ARCH_X86_32", "PLAT_KVM", "PLAT_XEN", "PLAT_LINUXU" }) |name|
+        if (document.enabled(name)) return error.InvalidSelection;
+    try config.validateWithMetadata(allocator, solved, guard, &metadata);
 }
 
 pub fn validate(
@@ -275,13 +415,16 @@ pub fn generate(
     if (!std.meta.eql(c.digest(package_bytes), packaged.sha256)) return error.ReceiptSubstitution;
     _ = try packaging.validate(allocator, io, package_directory, efi_directory, packaged.receipt.packaging.?);
     try checkQemuClosure(allocator, io, plan, qemu_directory);
-    try checkCapability(allocator, io, plan, bindings);
+    const capability = try loadCapability(allocator, io, plan, bindings);
+    defer capability.deinit();
+    try validateSolvedConfig(allocator, io, plan, bindings, context.configuration_directory orelse return error.MissingConfiguration, packaged.receipt);
     for (plan.assets) |item| {
         const directory = try binding(bindings, item.id);
         try fs.requireFile(try directory.record(allocator, io, item.source.path, c.total_cap, .artifact), item.source);
     }
+    try requireControlBinding(io, plan, bindings, .{ .directory = context.bindings.producer, .contract = context.review.producer });
     const result: Input = .{
-        .schema = .hyperv_native_prepared_input_v1,
+        .schema = .hyperv_native_prepared_input_v2,
         .state = .prepared,
         .authority = .not_admitted,
         .receipt = packaged.receipt,
@@ -292,7 +435,7 @@ pub fn generate(
     };
     const bytes = try c.canonical(allocator, result);
     defer allocator.free(bytes);
-    const remaining = entries[entries.len - 2].reserved;
+    const remaining = try publicationAllowance(entries);
     if (bytes.len > remaining) return error.ControlLimitExceeded;
     for (plan.assets) |item| {
         if (item.placement != .staged) continue;
@@ -321,7 +464,7 @@ pub fn generate(
         }
     }
     if (try context.git.deadline.expired()) return error.DeadlineExceeded;
-    try requireStagedClosure(allocator, io, lock, plan.assets);
+    _ = try requireStagedClosure(allocator, io, lock, plan.assets, null);
     const published = try fs.publish(lock, io, "input.json", bytes);
     if (published.failures.cleanup) |value| try context.failures.record(.cleanup, value);
     if (published.failures.recording) |value| try context.failures.record(.recording, value);

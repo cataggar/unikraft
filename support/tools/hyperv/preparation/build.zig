@@ -33,6 +33,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(executable);
+    const helper = b.addExecutable(.{
+        .name = "preparation-namespace",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("namespace_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = optimize != .Debug,
+            .single_threaded = true,
+            .link_libc = false,
+            .imports = imports,
+        }),
+    });
+    b.installArtifact(helper);
     const fixture = b.addExecutable(.{
         .name = "preparation-process-fixture",
         .root_module = b.createModule(.{ .root_source_file = b.path("process_fixture.zig"), .target = target, .optimize = optimize }),

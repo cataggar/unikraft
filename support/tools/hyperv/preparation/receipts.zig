@@ -147,6 +147,8 @@ pub const Context = struct {
     reviewed_provenance_sha256: c.Sha,
     guard: config.Guard,
     purpose: c.Purpose,
+    /// Required by input-v2 generation; never inferred from untrusted receipt paths.
+    configuration_directory: ?fs.Directory = null,
     failures: c.Failure = .{},
 
     /// Pure context binding; physical self/source checks remain in verify.
@@ -254,7 +256,7 @@ pub const Context = struct {
         parent: Link,
         inputs: producer.Inputs,
         expected_binding: c.Sha,
-        metadata: ?*const config.Metadata,
+        expected_inspection_binding: c.Sha,
     ) !Receipt {
         try requireLink(self.allocator, parent);
         try self.requireReceiptBinding(parent.receipt);
@@ -281,7 +283,21 @@ pub const Context = struct {
         const updated = try inputs.workspace.directory.record(self.allocator, self.io, inputs.workspace.config.path, config.config_cap, .private);
         const bytes = try inputs.workspace.directory.read(self.allocator, self.io, updated.path, config.config_cap, .private);
         defer self.allocator.free(bytes);
-        try config.validateWithMetadata(self.allocator, bytes, self.guard, metadata);
+        var inspected_inputs = inputs;
+        inspected_inputs.workspace.config = updated;
+        var inspected = try producer.execute(self.allocator, self.io, .inspect, inspected_inputs, .{
+            .source = after,
+            .binding_sha256 = expected_inspection_binding,
+        }, self.git.deadline);
+        defer inspected.deinit(self.allocator);
+        if (inspected.child.failures.primary) |value| try self.failures.record(.primary, value);
+        if (inspected.child.failures.cleanup) |value| try self.failures.record(.cleanup, value);
+        if (inspected.child.failures.recording) |value| try self.failures.record(.recording, value);
+        if (!inspected.succeeded()) return error.ProducerFailed;
+        const metadata_bytes = try inputs.workspace.output.read(self.allocator, self.io, "native-config/metadata.tsv", config.config_cap, .artifact);
+        defer self.allocator.free(metadata_bytes);
+        try @import("inputs.zig").validateAuthoritativeConfig(self.allocator, bytes, metadata_bytes, self.guard);
+        try source.require(after, try self.verify());
         var receipt = parent.receipt;
         receipt.phase = if (step == .configure) .configured else .built;
         receipt.parent_sha256 = parent.sha256;
@@ -299,6 +315,36 @@ pub const Context = struct {
         );
         try requireParent(self.allocator, receipt, parent);
         return receipt;
+    }
+
+    pub const BindingKind = enum { configured, built, configured_inspection, built_inspection };
+
+    pub fn publishBinding(self: *Context, lock: *private.Locked, kind: BindingKind, inputs: producer.Inputs, expected: c.Sha) !c.File {
+        try self.requireProducerBinding(inputs);
+        const observed = try self.verify();
+        try source.require(observed, inputs.observed_source);
+        try producer.preflight(self.allocator, self.io, switch (kind) {
+            .configured => .configure,
+            .built => .build,
+            .configured_inspection, .built_inspection => .inspect,
+        }, inputs, .{ .source = observed, .binding_sha256 = expected });
+        const encoded = try c.canonical(self.allocator, try producer.describe(self.allocator, inputs));
+        defer self.allocator.free(encoded);
+        if (!std.meta.eql(c.digest(encoded), expected)) return error.UnreviewedInput;
+        const name = switch (kind) {
+            .configured => "configured.binding.json",
+            .built => "built.binding.json",
+            .configured_inspection => "configured.inspection.binding.json",
+            .built_inspection => "built.inspection.binding.json",
+        };
+        const result = try fs.publish(lock, self.io, name, encoded);
+        if (result.failures.primary) |value| try self.failures.record(.primary, value);
+        if (result.failures.cleanup) |value| try self.failures.record(.cleanup, value);
+        if (result.failures.recording) |value| try self.failures.record(.recording, value);
+        if (result.status != .durable or result.failures.primary != null or
+            result.failures.cleanup != null or result.failures.recording != null)
+            return error.PublicationIncomplete;
+        return .{ .path = name, .size = encoded.len, .sha256 = expected, .mode = 0o600 };
     }
 
     pub fn package(self: *Context, parent: Link, lock: *private.Locked, input: fs.Directory) !Receipt {

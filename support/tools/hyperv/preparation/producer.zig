@@ -7,6 +7,8 @@ const runtime = @import("runtime.zig");
 const source = @import("source.zig");
 const process = c.core.process;
 const paths = @import("facade_paths");
+const ns = @import("namespace.zig");
+const env = @import("environment.zig");
 
 pub const Step = enum { configure, inspect, build };
 pub const profile = "hyperv-x86_64-efi-netvsc";
@@ -29,6 +31,7 @@ pub const CommandPaths = struct {
     zig: []const u8,
     make: []const u8,
     llvm: LlvmPaths,
+    preparation_environment: ?struct { path: []const u8, sha256: c.Sha } = null,
 };
 
 pub const Plan = struct {
@@ -79,7 +82,16 @@ pub fn plan(allocator: std.mem.Allocator, step: Step, command: CommandPaths) !Pl
         try std.fmt.allocPrint(allocator, "-Dmake-arg=STRIP={s}", .{command.llvm.strip}),
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
+        "-Dmake-arg=UMASK=0077",
     });
+    if (command.preparation_environment) |record| {
+        try commandPath(record.path);
+        _ = try c.sha(&record.sha256);
+        try args.appendSlice(allocator, &.{
+            try std.fmt.allocPrint(allocator, "-Dpreparation-environment={s}", .{record.path}),
+            try std.fmt.allocPrint(allocator, "-Dpreparation-environment-sha256={s}", .{record.sha256}),
+        });
+    }
     return .{ .step = step, .cwd = command.repository, .argv = try args.toOwnedSlice(allocator) };
 }
 
@@ -89,10 +101,8 @@ fn commandPath(value: []const u8) !void {
     try c.relative(value[1..]);
 }
 
-/// Each PATH entry must be a provisioned, reviewed, static native ELF. In
-/// particular `git` is a fixed native relocated-Git entry, NOT bin/git from an
-/// installed distribution and NOT a shell wrapper. No dispatcher is supplied
-/// by this module; missing provisioned entries are a dependency failure.
+/// Namespace /bin aliases point at validated native ELF closures. Dynamic
+/// loaders and libraries are declared by runtime.Bound, never host-discovered.
 pub const Alias = enum {
     zig,
     make,
@@ -147,6 +157,23 @@ pub const Alias = enum {
     env,
     true,
     false,
+    ls,
+    tee,
+    seq,
+    stat,
+    nproc,
+    sleep,
+    od,
+    gzip,
+    tar,
+    chmod,
+    install,
+    id,
+    timeout,
+    dd,
+    getconf,
+    sha256sum,
+    @"llvm-readobj",
 };
 
 pub const Native = struct { name: Alias, bound: runtime.Bound };
@@ -164,7 +191,9 @@ pub const Workspace = struct {
 /// shell, its absolute-path helpers, and native TLS) use this closed runtime.
 /// A PATH inventory alone does not establish an executed-tool closure.
 pub const Tools = struct {
-    path: fs.Directory,
+    /// Retained in the review binding, not an executable alias inventory.
+    /// The namespace creates its own /bin; no host PATH is inherited.
+    path: ?fs.Directory = null,
     native: []const Native,
     git: runtime.Bound,
     packages: runtime.Bound,
@@ -191,13 +220,11 @@ pub const NativeExecution = struct {
     root_build: c.File,
     facade: c.File,
     makefile: c.File,
-    /// Provisioned GNU Make must select this native shell even for $(shell)
-    /// before the repository Makefile assigns SHELL. A stock /bin/sh default
-    /// is not covered by merely putting a reviewed shell on PATH.
+    /// /bin/sh is supplied by the namespace before Make's first $(shell).
     make_default_shell: []const u8,
-    /// A source-bound native implementation, with no arbitrary executable
-    /// selector, which reinstalls the Git isolation contract for Make children.
-    git_entry_source: c.File,
+    /// Legacy bindings may retain this reviewed native entry. Direct native Git
+    /// in the namespace uses the dedicated environment record instead.
+    git_entry_source: ?c.File = null,
     compiler_version: []const u8,
 };
 
@@ -210,6 +237,7 @@ pub const Inputs = struct {
     tools: Tools,
     native_execution: ?NativeExecution,
     native_proof: ?NativeProof,
+    isolation: ?ns.Inputs = null,
 };
 
 pub const Expected = struct {
@@ -219,25 +247,19 @@ pub const Expected = struct {
     binding_sha256: c.Sha,
 };
 
-const DirectoryIdentity = struct {
-    path: []const u8,
-    device: u64,
-    inode: u64,
-    mode: u16,
-    uid: u32,
-};
-const ToolBinding = struct { path: []const u8, contract: runtime.Tool };
+const DirectoryIdentity = ns.Identity;
+const ToolBinding = ns.Tool;
 const NativeBinding = struct { name: Alias, tool: ToolBinding };
 
 pub const Binding = struct {
-    schema: enum { hyperv_local_native_producer_binding_v1 },
+    schema: enum { hyperv_local_native_producer_binding_v2 },
     source: c.Source,
     repository: DirectoryIdentity,
     workspace: DirectoryIdentity,
     output: DirectoryIdentity,
     scratch: DirectoryIdentity,
     config: c.File,
-    path: DirectoryIdentity,
+    path: ?DirectoryIdentity,
     native: []const NativeBinding,
     git: ToolBinding,
     packages: ToolBinding,
@@ -246,6 +268,7 @@ pub const Binding = struct {
     trust_bundle: c.File,
     native_execution: ?NativeExecution,
     native_proof: ?NativeProof,
+    isolation: ?ns.Binding,
 };
 
 /// A measurement for separate review, not admission. Does not spawn children,
@@ -255,14 +278,14 @@ pub fn describe(allocator: std.mem.Allocator, inputs: Inputs) !Binding {
     const native = try allocator.alloc(NativeBinding, inputs.tools.native.len);
     for (inputs.tools.native, native) |item, *binding| binding.* = .{ .name = item.name, .tool = toolBinding(item.bound) };
     return .{
-        .schema = .hyperv_local_native_producer_binding_v1,
+        .schema = .hyperv_local_native_producer_binding_v2,
         .source = inputs.observed_source,
         .repository = try directoryIdentity(inputs.repository),
         .workspace = try directoryIdentity(inputs.workspace.directory),
         .output = try directoryIdentity(inputs.workspace.output),
         .scratch = try directoryIdentity(inputs.workspace.scratch),
         .config = inputs.workspace.config,
-        .path = try directoryIdentity(inputs.tools.path),
+        .path = if (inputs.tools.path) |path| try directoryIdentity(path) else null,
         .native = native,
         .git = toolBinding(inputs.tools.git),
         .packages = toolBinding(inputs.tools.packages),
@@ -271,6 +294,7 @@ pub fn describe(allocator: std.mem.Allocator, inputs: Inputs) !Binding {
         .trust_bundle = inputs.tools.trust_bundle,
         .native_execution = inputs.native_execution,
         .native_proof = inputs.native_proof,
+        .isolation = if (inputs.isolation) |isolation| try ns.describe(allocator, isolation) else null,
     };
 }
 
@@ -329,6 +353,10 @@ pub fn commandPaths(allocator: std.mem.Allocator, inputs: Inputs) !CommandPaths 
             .readelf = try executablePath(allocator, try nativeTool(inputs.tools, .@"llvm-readelf")),
             .strip = try executablePath(allocator, try nativeTool(inputs.tools, .@"llvm-strip")),
         },
+        .preparation_environment = if (inputs.isolation) |isolation| .{
+            .path = try std.fs.path.join(allocator, &.{ inputs.workspace.directory.path, isolation.environment.path }),
+            .sha256 = isolation.environment.sha256,
+        } else null,
     };
 }
 
@@ -352,7 +380,7 @@ fn validateWorkspace(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs, a
     const config = try workspace.directory.record(allocator, io, workspace.config.path, 1024 * 1024, .private);
     if (!after or step != .configure) try fs.requireFile(config, workspace.config);
     const scratch_names = [_][]const u8{
-        "home", "tmp", "cache", "config", "zig-global", "zig-local", "disabled-git-exec", "disabled-openssl",
+        "tmp", "cache", "config", "zig-global", "zig-local", "disabled-git-exec", "disabled-openssl",
     };
     for (scratch_names) |name| {
         const directory = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ workspace.scratch.path, name }));
@@ -370,43 +398,125 @@ fn requireData(bound: runtime.Bound, role: runtime.Role) !void {
         bound.contract.loader != null or bound.contract.libraries.len != 0) return error.InvalidRuntime;
 }
 
+pub const required_aliases = [_]Alias{ .zig, .make, .bison, .flex, .m4, .@"llvm-nm", .@"llvm-objcopy", .@"llvm-objdump", .@"llvm-readelf", .@"llvm-strip", .sh, .bash };
+
+fn aliasRole(name: Alias) runtime.Role {
+    return switch (name) {
+        .zig => .zig,
+        .make => .make,
+        .bison, .yacc => .bison,
+        .flex, .lex => .flex,
+        .m4 => .m4,
+        .@"llvm-nm", .@"llvm-objcopy", .@"llvm-objdump", .@"llvm-readelf", .@"llvm-strip", .@"llvm-readobj" => .llvm,
+        .git => .git,
+        else => .preparation,
+    };
+}
+
+pub fn validateBindingStructure(allocator: std.mem.Allocator, binding: Binding) !void {
+    try validateNativeStructure(allocator, binding.native, binding.git);
+    inline for (.{ "packages", "bison_data", "trust" }, .{ runtime.Role.dependencies, .bison_data, .trust }) |name, role| {
+        const tool = @field(binding, name).contract;
+        if (tool.role != role or tool.target != .data or tool.executable != null or tool.loader != null or
+            tool.libraries.len != 0 or tool.tree.files == 0) return error.InvalidRuntime;
+    }
+    const execution = binding.native_execution orelse return error.DependencyUnavailable;
+    if (!std.mem.eql(u8, execution.make_default_shell, "/bin/sh") or
+        !std.mem.eql(u8, execution.compiler_version, c.compiler_version)) return error.UnreviewedInput;
+}
+
+fn validateNativeStructure(allocator: std.mem.Allocator, native_tools: []const NativeBinding, git: ToolBinding) !void {
+    if (native_tools.len == 0 or native_tools.len > std.meta.fields(Alias).len) return error.DependencyUnavailable;
+    var seen = std.EnumSet(Alias).initEmpty();
+    for (native_tools) |native| {
+        if (seen.contains(native.name)) return error.InvalidRuntime;
+        seen.insert(native.name);
+        const tool = native.tool;
+        if (tool.contract.role != aliasRole(native.name) or tool.contract.executable == null) return error.DependencyUnavailable;
+        try commandPath(tool.path);
+        try c.relative(tool.contract.executable.?.path);
+        if (native.name == .zig and (tool.contract.origin.scheme != .zig_package or
+            !std.mem.eql(u8, tool.contract.origin.revision, c.compiler_version))) return error.UnreviewedInput;
+        if (native.name == .git and !std.mem.eql(u8, try c.canonical(allocator, tool), try c.canonical(allocator, git)))
+            return error.UnreviewedInput;
+    }
+    for (required_aliases) |name| if (!seen.contains(name)) return error.DependencyUnavailable;
+    if (git.contract.role != .git or git.contract.executable == null) return error.InvalidRuntime;
+}
+
+pub fn bindingEnvironment(allocator: std.mem.Allocator, binding: Binding) !env.Record {
+    var m4: ?[]const u8 = null;
+    for (binding.native) |native| if (native.name == .m4) {
+        if (m4 != null) return error.InvalidRuntime;
+        const executable = native.tool.contract.executable orelse return error.InvalidRuntime;
+        m4 = try std.fs.path.join(allocator, &.{ native.tool.path, executable.path });
+    };
+    return .{
+        .workspace = binding.scratch.path,
+        .bison_pkgdatadir = binding.bison_data.path,
+        .m4 = m4 orelse return error.DependencyUnavailable,
+        .git_exec_path = try std.fs.path.join(allocator, &.{ binding.scratch.path, "disabled-git-exec" }),
+        .trust_bundle = try std.fs.path.join(allocator, &.{ binding.trust.path, binding.trust_bundle.path }),
+    };
+}
+
+test "producer rejects every missing mandatory native alias wrong role compiler and duplicate before IO" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var native: [required_aliases.len]NativeBinding = undefined;
+    for (required_aliases, &native) |name, *entry| {
+        entry.* = .{ .name = name, .tool = .{ .path = "/public/synthetic/runtime", .contract = .{
+            .role = aliasRole(name),
+            .origin = .{ .scheme = .zig_package, .revision = c.compiler_version, .source_sha256 = c.digest("shape"), .producer_sha256 = c.digest("shape") },
+            .target = .x86_64_linux,
+            .tree = .{ .sha256 = c.digest("shape"), .files = 1, .bytes = 1 },
+            .executable = .{ .path = "bin/tool", .size = 1, .mode = 0o700, .sha256 = c.digest("shape") },
+            .loader = null,
+            .libraries = &.{},
+        } } };
+    }
+    var git = native[0].tool;
+    git.contract.role = .git;
+    try validateNativeStructure(allocator, &native, git);
+    for (0..native.len) |missing| {
+        var reduced: std.ArrayList(NativeBinding) = .empty;
+        for (native, 0..) |entry, i| if (i != missing) try reduced.append(allocator, entry);
+        try std.testing.expectError(error.DependencyUnavailable, validateNativeStructure(allocator, reduced.items, git));
+    }
+    var changed = native;
+    changed[0].tool.contract.role = .qemu;
+    try std.testing.expectError(error.DependencyUnavailable, validateNativeStructure(allocator, &changed, git));
+    changed = native;
+    changed[0].tool.contract.origin.revision = "0.15.2";
+    try std.testing.expectError(error.UnreviewedInput, validateNativeStructure(allocator, &changed, git));
+    changed = native;
+    changed[1] = changed[0];
+    try std.testing.expectError(error.InvalidRuntime, validateNativeStructure(allocator, &changed, git));
+}
+
 fn validateTools(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !void {
     const tools = inputs.tools;
-    try requireDirectory(allocator, io, tools.path, true);
+    if (tools.path) |path| try requireDirectory(allocator, io, path, true);
     if (tools.native.len == 0 or tools.native.len > std.meta.fields(Alias).len) return error.DependencyUnavailable;
     for (tools.native, 0..) |item, index| {
         for (tools.native[0..index]) |previous| if (item.name == previous.name) return error.InvalidRuntime;
-        const expected_role: runtime.Role = switch (item.name) {
-            .zig => .zig,
-            .make => .make,
-            .bison, .yacc => .bison,
-            .flex, .lex => .flex,
-            .m4 => .m4,
-            .@"llvm-nm", .@"llvm-objcopy", .@"llvm-objdump", .@"llvm-readelf", .@"llvm-strip" => .llvm,
-            else => .preparation,
-        };
-        if (item.bound.contract.role != expected_role or item.bound.contract.executable == null or
-            item.bound.contract.loader != null or item.bound.contract.libraries.len != 0)
+        const expected_role = aliasRole(item.name);
+        if (item.bound.contract.role != expected_role or item.bound.contract.executable == null)
             return error.DependencyUnavailable;
         if (item.name == .zig and (item.bound.contract.origin.scheme != .zig_package or
             !std.mem.eql(u8, item.bound.contract.origin.revision, c.compiler_version)))
             return error.UnreviewedInput;
-        const executable = try executablePath(allocator, item.bound);
-        const alias = try std.fs.path.join(allocator, &.{ tools.path.path, @tagName(item.name) });
-        if (!std.mem.eql(u8, executable, alias)) return error.InvalidRuntime;
+        _ = try executablePath(allocator, item.bound);
+        if (item.name == .git) {
+            try fs.requireDirectoryIdentity(item.bound.directory, tools.git.directory);
+            if (!std.meta.eql(try bindingToolDigest(allocator, item.bound), try bindingToolDigest(allocator, tools.git)))
+                return error.InvalidRuntime;
+        }
         try item.bound.validate(allocator, io);
     }
-    inline for (.{ Alias.zig, .make, .git, .bison, .flex, .m4, .@"llvm-nm", .@"llvm-objcopy", .@"llvm-objdump", .@"llvm-readelf", .@"llvm-strip", .sh, .bash }) |name|
+    for (required_aliases) |name|
         _ = try nativeTool(tools, name);
-    var count: usize = 0;
-    var iterator = tools.path.dir.iterate();
-    while (try iterator.next(io)) |entry| {
-        if (entry.kind != .file) return error.InvalidRuntime;
-        const name = std.meta.stringToEnum(Alias, entry.name) orelse return error.InvalidRuntime;
-        _ = try nativeTool(tools, name);
-        count += 1;
-    }
-    if (count != tools.native.len) return error.InvalidRuntime;
     if (tools.git.contract.role != .git) return error.InvalidRuntime;
     try requireData(tools.packages, .dependencies);
     try requireData(tools.bison_data, .bison_data);
@@ -418,7 +528,8 @@ fn validateTools(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !void
     try fs.requireFile(try tools.trust.directory.record(allocator, io, tools.trust_bundle.path, 16 * 1024 * 1024, .artifact), tools.trust_bundle);
     if (tools.trust_bundle.size == 0) return error.DependencyUnavailable;
     for (tools.native) |item| try disjointRuntime(inputs, item.bound.directory.path);
-    for ([_]fs.Directory{ tools.path, tools.git.directory, tools.packages.directory, tools.bison_data.directory, tools.trust.directory }) |directory|
+    if (tools.path) |path| try disjointRuntime(inputs, path.path);
+    for ([_]fs.Directory{ tools.git.directory, tools.packages.directory, tools.bison_data.directory, tools.trust.directory }) |directory|
         try disjointRuntime(inputs, directory.path);
 }
 
@@ -540,51 +651,37 @@ fn validateSelection(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs, s
     if (step == .build) try fs.requireFile(root_record, inputs.native_proof.?.root_build);
     try nativeSourceFile(execution.facade);
     if (!std.mem.eql(u8, execution.facade.path, "support/build/zig-facade-runner.zig")) return error.DependencyUnavailable;
-    const facade = try inputs.repository.read(allocator, io, execution.facade.path, 1024 * 1024, .source);
-    const environment_body = try functionBody(allocator, facade, "controlledMakeEnvironment");
-    // The current facade restores passwd HOME and discards Git/Bison/cache
-    // isolation. A reviewed PATH cannot repair that or its absolute shell use.
-    if (std.mem.indexOf(u8, environment_body, "canonical_home") != null) return error.DependencyUnavailable;
     try fs.requireFile(try inputs.repository.record(allocator, io, execution.facade.path, 1024 * 1024, .source), execution.facade);
     if (!std.mem.eql(u8, execution.makefile.path, "Makefile")) return error.DependencyUnavailable;
-    const makefile = try inputs.repository.read(allocator, io, "Makefile", 1024 * 1024, .source);
-    // The present Makefile selects an ambient shell and restores umask 0022,
-    // making C Kconfig's replacement configuration non-private. Neither is
-    // repaired by just forwarding more facade environment variables.
-    if (std.mem.indexOf(u8, makefile, "/bin/bash") != null or
-        std.mem.indexOf(u8, makefile, "UMASK = 0022") != null) return error.DependencyUnavailable;
     try fs.requireFile(try inputs.repository.record(allocator, io, "Makefile", 1024 * 1024, .source), execution.makefile);
     try commandPath(execution.make_default_shell);
-    if (!std.mem.eql(u8, execution.make_default_shell, try executablePath(allocator, try nativeTool(inputs.tools, .sh))))
+    if (!std.mem.eql(u8, execution.make_default_shell, "/bin/sh"))
         return error.UnreviewedInput;
-    try nativeSourceFile(execution.git_entry_source);
-    if (!std.mem.startsWith(u8, execution.git_entry_source.path, "support/build/") and
-        !std.mem.startsWith(u8, execution.git_entry_source.path, "support/tools/hyperv/preparation/"))
-        return error.DependencyUnavailable;
-    try fs.requireFile(try inputs.repository.record(allocator, io, execution.git_entry_source.path, 1024 * 1024, .source), execution.git_entry_source);
+    if (execution.git_entry_source) |entry| {
+        try nativeSourceFile(entry);
+        if (!std.mem.startsWith(u8, entry.path, "support/build/") and
+            !std.mem.startsWith(u8, entry.path, "support/tools/hyperv/preparation/"))
+            return error.DependencyUnavailable;
+        try fs.requireFile(try inputs.repository.record(allocator, io, entry.path, 1024 * 1024, .source), entry);
+    }
     if (step == .build) {
         for (inputs.native_proof.?.inputs) |input|
             try fs.requireFile(try inputs.repository.record(allocator, io, input.file.path, 1024 * 1024, .source), input.file);
     }
 }
 
-fn environment(allocator: std.mem.Allocator, inputs: Inputs) !std.process.Environ.Map {
-    var result = try (runtime.Environment{
-        .scratch = inputs.workspace.scratch.path,
-        .path = inputs.tools.path.path,
-        .bison_data = inputs.tools.bison_data.directory.path,
-        .m4 = try executablePath(allocator, try nativeTool(inputs.tools, .m4)),
-    }).create(allocator);
-    const trust = try std.fs.path.join(allocator, &.{ inputs.tools.trust.directory.path, inputs.tools.trust_bundle.path });
-    try commandPath(trust);
-    try result.put("SSL_CERT_FILE", trust);
-    try result.put("SSL_CERT_DIR", inputs.tools.trust.directory.path);
-    try result.put("GIT_SSL_CAINFO", trust);
-    try result.put("GIT_SSL_CAPATH", inputs.tools.trust.directory.path);
-    try result.put("BASH", try executablePath(allocator, try nativeTool(inputs.tools, .bash)));
-    try result.put("SHELL", try executablePath(allocator, try nativeTool(inputs.tools, .sh)));
-    try result.put("CONFIG_SHELL", try executablePath(allocator, try nativeTool(inputs.tools, .sh)));
-    return result;
+fn bindingToolDigest(allocator: std.mem.Allocator, bound: runtime.Bound) !c.Sha {
+    return c.digest(try c.canonical(allocator, toolBinding(bound)));
+}
+
+pub fn environmentRecord(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !env.Record {
+    const isolation = inputs.isolation orelse return error.DependencyUnavailable;
+    const path = try std.fs.path.join(allocator, &.{ inputs.workspace.directory.path, isolation.environment.path });
+    const parsed = try env.load(allocator, io, path, isolation.environment.sha256);
+    const expected = try bindingEnvironment(allocator, try describe(allocator, inputs));
+    if (!std.meta.eql(c.digest(try c.canonical(allocator, expected)), c.digest(try c.canonical(allocator, parsed.value))))
+        return error.UnreviewedInput;
+    return parsed.value;
 }
 
 /// Safe process observation for the parent to embed in its own state contract.
@@ -601,6 +698,42 @@ pub const Outcome = struct {
     /// Owned storage, bounded stdout, exact termination, enum-only diagnostics,
     /// and private unresolved-cleanup metadata are retained without translation.
     child: process.Result,
+    /// The transport/helper exit is not the payload termination.
+    helper_termination: ?std.process.Child.Term = null,
+
+    pub fn namespaceStatus(self: *Outcome, result: anyerror!ns.Status) void {
+        self.helper_termination = self.child.termination;
+        self.child.termination = null;
+        const status = result catch {
+            if (self.child.failures.recording == null)
+                self.child.failures.recording = .{ .stage = .state_record, .category = .invalid_response };
+            self.discardOutput();
+            return;
+        };
+        self.child.termination = status.termination();
+        if (self.child.failures.primary == null) {
+            self.child.failures.primary = switch (status.primary) {
+                .unknown => null,
+                .exited => if (status.code == 0) null else .{ .stage = .process_run, .category = .child_failed },
+                .signaled => .{ .stage = .process_run, .category = .child_failed },
+                .spawn_failed => .{ .stage = .process_spawn, .category = .spawn_failed },
+                .setup_failed => .{ .stage = .process_spawn, .category = .unavailable },
+            };
+        }
+        if (status.cleanup == .failed) {
+            self.child.cleanup_complete = false;
+            if (self.child.failures.cleanup == null)
+                self.child.failures.cleanup = .{ .stage = .process_cleanup, .category = .cleanup_failed };
+        }
+        if (status.recording != .complete and self.child.failures.recording == null)
+            self.child.failures.recording = .{ .stage = .state_record, .category = .invalid_response };
+        if (!self.succeeded()) self.discardOutput();
+    }
+
+    fn discardOutput(self: *Outcome) void {
+        std.crypto.secureZero(u8, self.child.storage);
+        self.child.stdout = &.{};
+    }
 
     pub fn deinit(self: *Outcome, allocator: std.mem.Allocator) void {
         self.child.deinit(allocator);
@@ -629,6 +762,11 @@ fn admissionFailure(allocator: std.mem.Allocator, step: Step, err: anyerror) !Ou
 
 fn supervisorFailure(allocator: std.mem.Allocator, step: Step, err: anyerror) !Outcome {
     var result: Outcome = .{ .step = step, .child = .{ .storage = try allocator.alloc(u8, 0) } };
+    recordSupervisorFailure(&result, err);
+    return result;
+}
+
+fn recordSupervisorFailure(result: *Outcome, err: anyerror) void {
     if (err == error.UnresolvedCleanup) {
         result.child.cleanup_complete = false;
         result.child.failures.cleanup = .{ .stage = .process_cleanup, .category = .cleanup_failed };
@@ -640,7 +778,6 @@ fn supervisorFailure(allocator: std.mem.Allocator, step: Step, err: anyerror) !O
             else => .local_io,
         } };
     }
-    return result;
 }
 
 /// Dedicated-supervisor entry only. The parent retains its workspace writer
@@ -659,37 +796,131 @@ pub fn execute(
     defer arena.deinit();
     const scratch = arena.allocator();
     preflight(scratch, io, step, inputs, expected) catch |err| return admissionFailure(allocator, step, err);
-    const command = plan(scratch, step, commandPaths(scratch, inputs) catch |err|
-        return admissionFailure(allocator, step, err)) catch |err| return admissionFailure(allocator, step, err);
-    const zig = nativeTool(inputs.tools, .zig) catch |err| return admissionFailure(allocator, step, err);
-    const prefix = zig.prefix(scratch) catch |err| return admissionFailure(allocator, step, err);
-    if (prefix.items.len != 1 or !std.mem.eql(u8, prefix.items[0], command.argv[0]))
-        return admissionFailure(allocator, step, error.DependencyUnavailable);
-    var controlled = environment(scratch, inputs) catch |err| return admissionFailure(allocator, step, err);
-    defer controlled.deinit();
-    process.initialize() catch |err| return supervisorFailure(allocator, step, err);
-    const previous_mask = std.os.linux.syscall1(.umask, 0o077);
-    defer _ = std.os.linux.syscall1(.umask, previous_mask);
-    var outcome: Outcome = .{
-        .step = step,
-        .child = process.run(allocator, io, .{
-            .argv = command.argv,
-            .environment = &controlled,
-            .cwd = inputs.repository.dir,
-            .deadline = deadline,
-            .stdout_limit = if (step == .inspect) inspection_limit else 64 * 1024,
-            .stderr_limit = 1024 * 1024,
-        }) catch |err| return supervisorFailure(allocator, step, err),
+    // Allocate the return value before publishing anything. All later failures
+    // flow through the same independent, exact-resource cleanup path.
+    var outcome: Outcome = .{ .step = step, .child = .{ .storage = try allocator.alloc(u8, 0) } };
+    var resources: NamespaceResources = .{ .directory = inputs.workspace.scratch.dir };
+    executePrepared(allocator, scratch, io, step, inputs, expected, deadline, &resources, &outcome) catch |err| {
+        if (outcome.child.failures.primary == null)
+            outcome.child.failures.primary = .{ .stage = .private_file, .category = switch (err) {
+                error.PathAlreadyExists => .conflict,
+                error.SourceChanged => .integrity,
+                error.UnsafePath, error.UnsafeFile => .unsafe_file,
+                else => .local_io,
+            } };
+        outcome.discardOutput();
     };
-    postflight(scratch, io, step, inputs, expected) catch |err| {
-        if (outcome.child.failures.primary == null) outcome.child.failures.primary = c.failure(err).primary;
-        std.crypto.secureZero(u8, outcome.child.storage);
-        outcome.child.stdout = &.{};
-    };
+    resources.cleanup(io, &outcome);
     return outcome;
 }
 
-fn preflight(allocator: std.mem.Allocator, io: std.Io, step: Step, inputs: Inputs, expected: Expected) !void {
+fn executePrepared(allocator: std.mem.Allocator, scratch: std.mem.Allocator, io: std.Io, step: Step, inputs: Inputs, expected: Expected, deadline: process.Deadline, resources: *NamespaceResources, outcome: *Outcome) !void {
+    const binding = try describe(scratch, inputs);
+    try resources.createRoot(io);
+    const root = try ns.Identity.of(
+        try std.fs.path.join(scratch, &.{ inputs.workspace.scratch.path, "namespace-root" }),
+        .{ .handle = resources.root.?.handle, .flags = .{ .nonblocking = false } },
+    );
+    const bytes = try c.canonical(scratch, ns.Request{ .step = step, .binding = binding, .root = root });
+    try resources.publishRequest(io, bytes);
+    const status_file = try ns.StatusFile.create();
+    defer status_file.close();
+    const argv = [_][]const u8{
+        try executablePath(scratch, inputs.isolation.?.helper),
+        try std.fs.path.join(scratch, &.{ inputs.workspace.scratch.path, "namespace-request.json" }),
+        try scratch.dupe(u8, &c.digest(bytes)),
+        try std.fmt.allocPrint(scratch, "{d}", .{status_file.fd}),
+    };
+    var controlled = std.process.Environ.Map.init(scratch);
+    defer controlled.deinit();
+    process.initialize() catch |err| {
+        recordSupervisorFailure(outcome, err);
+        return;
+    };
+    const previous_mask = std.os.linux.syscall1(.umask, 0o077);
+    defer _ = std.os.linux.syscall1(.umask, previous_mask);
+    const child = process.run(allocator, io, .{
+        .argv = &argv,
+        .environment = &controlled,
+        .cwd = inputs.repository.dir,
+        .deadline = deadline,
+        .stdout_limit = if (step == .inspect) inspection_limit else 64 * 1024,
+        .stderr_limit = 1024 * 1024,
+    }) catch |err| {
+        recordSupervisorFailure(outcome, err);
+        return;
+    };
+    outcome.child.deinit(allocator);
+    outcome.child = child;
+    outcome.namespaceStatus(status_file.read());
+    postflight(scratch, io, step, inputs, expected) catch |err| {
+        if (outcome.child.failures.primary == null) outcome.child.failures.primary = c.failure(err).primary;
+        outcome.discardOutput();
+    };
+}
+
+pub const NamespaceResources = struct {
+    directory: std.Io.Dir,
+    request: ?std.Io.File = null,
+    root: ?std.Io.Dir = null,
+    root_created: bool = false,
+
+    pub fn createRoot(self: *NamespaceResources, io: std.Io) !void {
+        try self.directory.createDir(io, "namespace-root", .fromMode(0o700));
+        self.root_created = true;
+        self.root = try self.directory.openDir(io, "namespace-root", .{ .follow_symlinks = false });
+    }
+
+    pub fn publishRequest(self: *NamespaceResources, io: std.Io, bytes: []const u8) !void {
+        self.request = try self.directory.createFile(io, "namespace-request.json", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        try self.request.?.writeStreamingAll(io, bytes);
+        try self.request.?.sync(io);
+    }
+
+    pub fn cleanup(self: *NamespaceResources, io: std.Io, outcome: *Outcome) void {
+        // Attempt both removals independently, even if the first is refused.
+        if (self.request) |file| {
+            self.remove(io, file, false) catch cleanupFailed(outcome);
+            file.close(io);
+            self.request = null;
+        }
+        if (self.root_created) {
+            if (self.root) |dir| {
+                self.remove(io, .{ .handle = dir.handle, .flags = .{ .nonblocking = false } }, true) catch cleanupFailed(outcome);
+                dir.close(io);
+            } else cleanupFailed(outcome);
+            self.root = null;
+            self.root_created = false;
+        }
+    }
+
+    fn remove(self: NamespaceResources, io: std.Io, held: std.Io.File, directory: bool) !void {
+        const name = if (directory) "namespace-root" else "namespace-request.json";
+        const named = self.directory.openFile(io, name, .{ .path_only = true, .follow_symlinks = false }) catch |err| {
+            if (err == error.FileNotFound) {
+                if ((try fs.metadata(held)).links == 0) return;
+                return error.SourceChanged;
+            }
+            return err;
+        };
+        defer named.close(io);
+        const before = try fs.metadata(held);
+        const after = try fs.metadata(named);
+        if (before.device != after.device or before.inode != after.inode or before.mode != after.mode or before.uid != after.uid)
+            return error.SourceChanged;
+        if (directory) try self.directory.deleteDir(io, name) else try self.directory.deleteFile(io, name);
+        if ((try fs.metadata(held)).links != 0) return error.SourceChanged;
+    }
+
+    fn cleanupFailed(outcome: *Outcome) void {
+        outcome.child.cleanup_complete = false;
+        if (outcome.child.failures.cleanup == null)
+            outcome.child.failures.cleanup = .{ .stage = .private_file, .category = .cleanup_failed };
+        outcome.discardOutput();
+    }
+};
+
+pub fn preflight(allocator: std.mem.Allocator, io: std.Io, step: Step, inputs: Inputs, expected: Expected) !void {
     // This veto precedes even a Git/loader subprocess.
     try validateSelection(allocator, io, inputs, step);
     try source.require(inputs.observed_source, expected.source);
@@ -698,16 +929,53 @@ fn preflight(allocator: std.mem.Allocator, io: std.Io, step: Step, inputs: Input
         return error.UnreviewedInput;
     try validateWorkspace(allocator, io, inputs, false, step);
     try validateTools(allocator, io, inputs);
+    try ns.validate(allocator, io, inputs.isolation orelse return error.DependencyUnavailable, inputs.repository, inputs.workspace.directory);
+    _ = try environmentRecord(allocator, io, inputs);
 }
 
 fn postflight(allocator: std.mem.Allocator, io: std.Io, step: Step, inputs: Inputs, expected: Expected) !void {
     try validateWorkspace(allocator, io, inputs, true, step);
     try validateTools(allocator, io, inputs);
     try validateSelection(allocator, io, inputs, step);
+    try ns.validate(allocator, io, inputs.isolation orelse return error.DependencyUnavailable, inputs.repository, inputs.workspace.directory);
+    _ = try environmentRecord(allocator, io, inputs);
     // describe uses the original config contract; only configure may change its
     // contents. Directory identity excludes mtime/ctime of mutable work areas.
     if (!std.crypto.timing_safe.eql(c.Sha, expected.binding_sha256, try bindingDigest(allocator, try describe(allocator, inputs))))
         return error.SourceChanged;
+}
+
+/// Namespace-helper reconstruction. All paths are descriptor-opened again and
+/// the complete binding is revalidated by preflight before namespace entry.
+pub fn reopenBinding(allocator: std.mem.Allocator, io: std.Io, binding: Binding) !Inputs {
+    const natives = try allocator.alloc(Native, binding.native.len);
+    for (binding.native, natives) |item, *native|
+        native.* = .{ .name = item.name, .bound = try reopenTool(allocator, io, item.tool) };
+    return .{
+        .repository = try fs.Directory.open(allocator, io, binding.repository.path),
+        .observed_source = binding.source,
+        .workspace = .{
+            .directory = try fs.Directory.open(allocator, io, binding.workspace.path),
+            .output = try fs.Directory.open(allocator, io, binding.output.path),
+            .scratch = try fs.Directory.open(allocator, io, binding.scratch.path),
+            .config = binding.config,
+        },
+        .tools = .{
+            .path = if (binding.path) |path| try fs.Directory.open(allocator, io, path.path) else null,
+            .native = natives,
+            .git = try reopenTool(allocator, io, binding.git),
+            .packages = try reopenTool(allocator, io, binding.packages),
+            .bison_data = try reopenTool(allocator, io, binding.bison_data),
+            .trust = try reopenTool(allocator, io, binding.trust),
+            .trust_bundle = binding.trust_bundle,
+        },
+        .native_execution = binding.native_execution,
+        .native_proof = binding.native_proof,
+        .isolation = if (binding.isolation) |isolation| try ns.reopen(allocator, io, isolation) else null,
+    };
+}
+fn reopenTool(allocator: std.mem.Allocator, io: std.Io, tool: ToolBinding) !runtime.Bound {
+    return .{ .directory = try fs.Directory.open(allocator, io, tool.path), .contract = tool.contract };
 }
 
 const fixture_paths: CommandPaths = .{
@@ -738,6 +1006,7 @@ test "producer exact native argv fixes targets flags packages and existing Make 
             "-Dapp=/reviewed/repository/support/apps/hyperv-acceptance", "-Dconfig=/private/work/input.config",                  "-Doutput=/private/work/build",                         "-Dnative-profile=hyperv-x86_64-efi-netvsc",        "-Dmake-command=/reviewed/native/bin/make",  "-Dcompiler=/reviewed/native/bin/zig cc -target x86_64-freestanding-none",
             "-Dcompiler-targeted=true",                                  "-Dhost-cc=/reviewed/native/bin/zig cc",                "-Dhost-cxx=/reviewed/native/bin/zig c++",              "-Dhost-cflags=-fno-sanitize=null",                 "-Dmake-arg=AR=/reviewed/native/bin/zig ar", "-Dmake-arg=NM=/reviewed/native/bin/llvm-nm",
             "-Dmake-arg=OBJCOPY=/reviewed/native/bin/llvm-objcopy",      "-Dmake-arg=OBJDUMP=/reviewed/native/bin/llvm-objdump", "-Dmake-arg=READELF=/reviewed/native/bin/llvm-readelf", "-Dmake-arg=STRIP=/reviewed/native/bin/llvm-strip", "-Dmake-arg=UK_CFLAGS=-std=gnu17",           "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
+            "-Dmake-arg=UMASK=0077",
         };
         try std.testing.expectEqual(step, command.step);
         try std.testing.expectEqualStrings(fixture_paths.repository, command.cwd);
@@ -760,6 +1029,24 @@ test "producer rejects spaces shell metacharacters and ambiguous compiler paths"
         command.make = bad;
         try std.testing.expectError(error.UnsafePath, plan(arena.allocator(), .configure, command));
     }
+}
+
+test "producer exact dedicated environment arguments do not enter the Make override channel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var command = fixture_paths;
+    command.preparation_environment = .{ .path = "/private/work/environment.json", .sha256 = c.digest("fixture environment") };
+    const selected = try plan(arena.allocator(), .configure, command);
+    try std.testing.expectEqualStrings("-Dpreparation-environment=/private/work/environment.json", selected.argv[selected.argv.len - 2]);
+    try std.testing.expectEqualStrings(
+        try std.fmt.allocPrint(arena.allocator(), "-Dpreparation-environment-sha256={s}", .{command.preparation_environment.?.sha256}),
+        selected.argv[selected.argv.len - 1],
+    );
+    var masks: usize = 0;
+    for (selected.argv) |arg| if (std.mem.eql(u8, arg, "-Dmake-arg=UMASK=0077")) {
+        masks += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), masks);
 }
 
 test "producer vetoes selected Python proofs before any child or claimed native approval" {

@@ -8,6 +8,7 @@ pub const maximum_entries = 256;
 
 pub const Role = enum {
     raw,
+    vhd,
     boot_disk,
     qemu,
     qemu_support,

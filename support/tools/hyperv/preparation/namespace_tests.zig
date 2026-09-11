@@ -1,0 +1,647 @@
+// SPDX-License-Identifier: BSD-3-Clause
+const std = @import("std");
+const builtin = @import("builtin");
+const linux = std.os.linux;
+const c = @import("contracts.zig");
+const fs = @import("files.zig");
+const rt = @import("runtime.zig");
+const ns = @import("namespace.zig");
+const env = @import("environment.zig");
+const producer = @import("producer.zig");
+const options = @import("fixture_options");
+
+comptime {
+    _ = producer;
+}
+
+pub fn main(init: std.process.Init.Minimal) void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    const allocator = arena.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const args = init.args.toSlice(allocator) catch |err| fail(err);
+    if (args.len < 2) fail(error.InvalidFixtureMode);
+    if (std.mem.startsWith(u8, args[1], "inside-")) {
+        if (args.len != 2) fail(error.InvalidFixtureMode);
+        inside(allocator, io, args[1], init.environ) catch |err| fail(err);
+        return;
+    }
+    if (args.len != 3) fail(error.InvalidFixtureMode);
+    const status_file = ns.StatusFile.openParent(allocator, args[2]) catch |err| fail(err);
+    if (std.mem.eql(u8, args[1], "status-missing")) return;
+    if (std.mem.eql(u8, args[1], "status-exit143")) linux.exit_group(143);
+    if (std.mem.eql(u8, args[1], "status-partial")) {
+        const bytes = (ns.Status{ .primary = .exited }).encode();
+        _ = linux.pwrite(status_file.fd, &bytes, 3, 0);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "status-malformed")) {
+        _ = linux.pwrite(status_file.fd, "garbage!", 8, 0);
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "parent-death-race")) {
+        parentDeathRace(allocator, io) catch |err| fail(err);
+        status_file.write(.{ .primary = .exited }) catch |err| fail(err);
+        return;
+    }
+    const status = fixture(allocator, io, args[1], status_file) catch |err| fail(err);
+    status_file.write(status) catch |err| fail(err);
+}
+fn fail(err: anyerror) noreturn {
+    const name = @errorName(err);
+    _ = linux.write(2, name.ptr, name.len);
+    _ = linux.write(2, "\n", 1);
+    linux.exit_group(125);
+}
+fn put(io: std.Io, directory: std.Io.Dir, path: []const u8, bytes: []const u8, mode: u16) !void {
+    const file = try directory.createFile(io, path, .{ .exclusive = true, .permissions = .fromMode(mode) });
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+}
+fn makeDir(allocator: std.mem.Allocator, io: std.Io, parent: fs.Directory, relative: []const u8) !fs.Directory {
+    try parent.dir.createDirPath(io, relative);
+    const dir = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ parent.path, relative }));
+    try dir.dir.setPermissions(io, .fromMode(0o700));
+    return dir;
+}
+fn copy(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory, input: []const u8, destination: []const u8, mode: u16) !void {
+    // Only fixed public native fixture inputs (and this fixture's own binary).
+    const file = try std.Io.Dir.openFileAbsolute(io, input, .{});
+    defer file.close(io);
+    const metadata = try fs.metadata(file);
+    if (metadata.size > 64 * 1024 * 1024) return error.FileTooLarge;
+    const bytes = try allocator.alloc(u8, @intCast(metadata.size));
+    defer allocator.free(bytes);
+    if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.SourceChanged;
+    try put(io, directory.dir, destination, bytes, mode);
+}
+const NamespaceIds = struct { user: u64, mnt: u64, pid: u64, net: u64 };
+fn namespaceIds(io: std.Io) !NamespaceIds {
+    var ids: NamespaceIds = undefined;
+    inline for (std.meta.fields(NamespaceIds)) |field| {
+        const file = try std.Io.Dir.openFileAbsolute(io, "/proc/self/ns/" ++ field.name, .{});
+        defer file.close(io);
+        @field(ids, field.name) = (try fs.metadata(file)).inode;
+    }
+    return ids;
+}
+fn tool(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory, executable: []const u8, dynamic: bool) !rt.Bound {
+    const libraries = try allocator.alloc(c.File, if (dynamic) 1 else 0);
+    if (dynamic) libraries[0] = try directory.record(allocator, io, "lib/libc.so.6", 16 * 1024 * 1024, .artifact);
+    return .{ .directory = directory, .contract = .{
+        .role = .preparation,
+        .origin = .{ .scheme = .authenticated_distribution, .revision = "synthetic-public-fixture", .source_sha256 = c.digest("fixture"), .producer_sha256 = c.digest("fixture") },
+        .target = if (builtin.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
+        .tree = (try fs.inventory(allocator, io, directory, 32, 128 * 1024 * 1024)).tree,
+        .executable = try directory.record(allocator, io, executable, 64 * 1024 * 1024, .executable),
+        .loader = if (dynamic) try directory.record(allocator, io, "lib/loader", 16 * 1024 * 1024, .executable) else null,
+        .libraries = libraries,
+    } };
+}
+fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_file: ns.StatusFile) !ns.Status {
+    if (!std.mem.eql(u8, mode, "isolation") and !std.mem.eql(u8, mode, "failure") and
+        !std.mem.eql(u8, mode, "timeout") and !std.mem.eql(u8, mode, "descendant") and
+        !std.mem.eql(u8, mode, "exit143") and !std.mem.eql(u8, mode, "signal") and
+        !std.mem.eql(u8, mode, "exec-missing") and !std.mem.eql(u8, mode, "setup-failure") and
+        !std.mem.eql(u8, mode, "cleanup-failure")) return error.InvalidFixtureMode;
+    const base = try fs.Directory.open(allocator, io, options.workspace);
+    const repository = try makeDir(allocator, io, base, try std.fmt.allocPrint(allocator, "fixture-{s}", .{mode}));
+    try put(io, repository.dir, "source.txt", "readonly synthetic source\n", 0o600);
+    const historical = try makeDir(allocator, io, repository, ".d");
+    try put(io, historical.dir, "hidden-marker", "synthetic historical marker\n", 0o600);
+    const workspace = try makeDir(allocator, io, repository, ".d/zig-migration-preparation/resume-producer/work");
+    const scratch = try makeDir(allocator, io, workspace, "scratch");
+    const root = try makeDir(allocator, io, scratch, "namespace-root");
+    for ([_][]const u8{ "tmp", "cache", "config", "zig-local", "zig-global", "disabled-git-exec", "disabled-openssl" }) |name|
+        _ = try makeDir(allocator, io, scratch, name);
+    const native = try makeDir(allocator, io, workspace, "native");
+    try copy(allocator, io, native, "/proc/self/exe", "fixture", 0o700);
+    const static = try tool(allocator, io, native, "fixture", false);
+    const dynamic_directory = try makeDir(allocator, io, workspace, "dynamic");
+    _ = try makeDir(allocator, io, dynamic_directory, "lib");
+    try copy(allocator, io, dynamic_directory, "/usr/bin/true", "true", 0o700);
+    const system_lib = if (builtin.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu/" else "/usr/lib/x86_64-linux-gnu/";
+    try copy(allocator, io, dynamic_directory, system_lib ++ "libc.so.6", "lib/libc.so.6", 0o600);
+    try copy(allocator, io, dynamic_directory, system_lib ++ (if (builtin.cpu.arch == .aarch64) "ld-linux-aarch64.so.1" else "ld-linux-x86-64.so.2"), "lib/loader", 0o700);
+    const dynamic = try tool(allocator, io, dynamic_directory, "true", true);
+    var incomplete = dynamic;
+    incomplete.contract.libraries = &.{};
+    if (incomplete.validate(allocator, io)) |_| {
+        return error.AcceptedIncompleteRuntime;
+    } else |err| if (err != error.IncompleteRuntime) return err;
+    const metadata = try makeDir(allocator, io, repository, ".git");
+    try put(io, metadata.dir, "fixture", "readonly synthetic Git metadata\n", 0o600);
+    const account = try env.Account.current(allocator, io);
+    const facade_path = try std.fmt.allocPrint(allocator, "{s}/unikraft-zig-facade-{d}", .{ account.home, account.uid });
+    const facade = try fs.Directory.open(allocator, io, facade_path);
+    const lock = try facade.openFile(io, "build.lock", .private);
+    const lock_identity = try ns.Identity.of(try std.fs.path.join(allocator, &.{ facade.path, "build.lock" }), lock);
+    const environment_record: env.Record = .{
+        .workspace = scratch.path,
+        .bison_pkgdatadir = native.path,
+        .m4 = try std.fs.path.join(allocator, &.{ dynamic_directory.path, "true" }),
+        .git_exec_path = try std.fs.path.join(allocator, &.{ scratch.path, "disabled-git-exec" }),
+        .trust_bundle = try std.fs.path.join(allocator, &.{ repository.path, "source.txt" }),
+    };
+    try put(io, workspace.dir, "environment.json", try c.canonical(allocator, environment_record), 0o600);
+    // Store expected lock identity under selected scratch, never change host lock.
+    try put(io, workspace.dir, "lock.json", try c.canonical(allocator, lock_identity), 0o600);
+    try put(io, workspace.dir, "host-namespaces.json", try c.canonical(allocator, try namespaceIds(io)), 0o600);
+    var environment = try environment_record.create(allocator, account.home);
+    const sandbox: ns.Sandbox = .{
+        .repository = repository,
+        .workspace = workspace,
+        .scratch = scratch,
+        .runtimes = &.{ static, dynamic },
+        .aliases = &.{ .{ .name = "true", .bound = dynamic }, .{ .name = if (std.mem.eql(u8, mode, "setup-failure")) "invalid/alias" else "fixture", .bound = static } },
+        .isolation = .{
+            .helper = static,
+            .account = account,
+            .facade_runtime = facade,
+            .facade_lock = lock_identity,
+            .git_metadata = &.{.{ .directory = metadata, .tree = (try fs.inventory(allocator, io, metadata, 32, 1024)).tree }},
+            .environment = try workspace.record(allocator, io, "environment.json", 16 * 1024, .private),
+        },
+        .root = try ns.Identity.directory(root),
+        .status_file = status_file,
+    };
+    // Deliberately inherited non-CLOEXEC host descriptor. The payload must not
+    // find it (or any namespace setup/source/lock descriptor).
+    const leaked = try repository.openFile(io, "source.txt", .artifact);
+    if (linux.errno(linux.fcntl(leaked.handle, linux.F.SETFD, 0)) != .SUCCESS) return error.FixtureFailed;
+    const status = try ns.enterWithCleanupFault(allocator, io, sandbox, &.{
+        if (std.mem.eql(u8, mode, "exec-missing")) "/bin/missing-fixture" else "/bin/fixture",
+        try std.fmt.allocPrint(allocator, "inside-{s}", .{mode}),
+    }, &environment, std.mem.eql(u8, mode, "cleanup-failure"));
+    try scratch.dir.deleteDir(io, "namespace-root");
+    return status;
+}
+fn inside(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, inherited: std.process.Environ) !void {
+    if (linux.getpid() != 2 or linux.getppid() != 1) return error.OutsidePidNamespace;
+    if (std.mem.eql(u8, mode, "inside-failure")) linux.exit_group(19);
+    if (std.mem.eql(u8, mode, "inside-exit143")) linux.exit_group(143);
+    if (std.mem.eql(u8, mode, "inside-signal")) {
+        _ = linux.kill(linux.getpid(), .TERM);
+        return error.FixtureFailed;
+    }
+    if (std.mem.eql(u8, mode, "inside-cleanup-failure")) linux.exit_group(19);
+    if (std.mem.eql(u8, mode, "inside-timeout")) {
+        try detached(io);
+        try put(io, std.Io.Dir.cwd(), ".d/zig-migration-preparation/resume-producer/work/scratch/timeout-ready", "inside namespace\n", 0o600);
+        while (true) _ = linux.syscall0(.sched_yield);
+    }
+    var link_buffer: [4096]u8 = undefined;
+    if (std.Io.Dir.readLinkAbsolute(io, "/proc/1/root", &link_buffer)) |_| {
+        return error.AccessibleSupervisor;
+    } else |err| if (err != error.AccessDenied) return err;
+    if (std.Io.Dir.openDirAbsolute(io, "/proc/1/fd", .{ .iterate = true })) |dir| {
+        dir.close(io);
+        return error.AccessibleSupervisor;
+    } else |err| if (err != error.AccessDenied) return err;
+    for ([_][]const u8{"/proc/self/fd"}) |path| {
+        const fd_dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+        defer fd_dir.close(io);
+        var fds = fd_dir.iterate();
+        while (try fds.next(io)) |entry| {
+            const fd = try std.fmt.parseInt(linux.fd_t, entry.name, 10);
+            if (fd > 2 and fd != fd_dir.handle) return error.InheritedDescriptor;
+        }
+    }
+    const account = try env.Account.current(allocator, io);
+    var map = try inherited.createMap(allocator);
+    defer map.deinit();
+    if (!std.mem.eql(u8, map.get("HOME") orelse "", account.home)) return error.AmbientHome;
+    if (map.get("LD_LIBRARY_PATH") != null or !std.mem.eql(u8, map.get("GIT_CONFIG_GLOBAL") orelse "", "/dev/null") or
+        !std.mem.eql(u8, map.get("GIT_CONFIG_NOSYSTEM") orelse "", "1")) return error.AmbientEnvironment;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    const repository = try fs.Directory.open(allocator, io, cwd);
+    const workspace = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ cwd, ".d/zig-migration-preparation/resume-producer/work" }));
+    const expected = try c.parse(ns.Identity, allocator, try workspace.read(allocator, io, "lock.json", 4096, .private));
+    const facade = try fs.Directory.open(allocator, io, std.fs.path.dirname(expected.value.path).?);
+    const lock = try facade.openFile(io, "build.lock", .private);
+    try expected.value.require(try ns.Identity.of(expected.value.path, lock));
+    lock.close(io);
+    facade.close(allocator, io);
+    for ([_][]const u8{ ".d/hidden-marker", "/etc/ld.so.cache", "/root", "/run/user" }) |path| {
+        const file = repository.dir.openFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        file.close(io);
+        return error.AmbientFilesystem;
+    }
+    for ([_][]const u8{ "source.txt", ".git/fixture", ".d/zig-migration-preparation/resume-producer/work/dynamic/true", ".d/zig-migration-preparation/resume-producer/work/environment.json" }) |path| {
+        const file = repository.dir.openFile(io, path, .{ .mode = .write_only }) catch |err| switch (err) {
+            error.ReadOnlyFileSystem => continue,
+            else => return err,
+        };
+        file.close(io);
+        return error.WritableInput;
+    }
+    try put(io, workspace.dir, "scratch/created", "private scratch output\n", 0o666);
+    const created = try workspace.openFile(io, "scratch/created", .artifact);
+    if ((try fs.metadata(created)).mode & 0o7777 != 0o600) return error.UnsafeUmask;
+    created.close(io);
+    if (linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 1) return error.PrivilegeDropUnavailable;
+    var header: extern struct { version: u32, pid: i32 } = .{ .version = 0x20080522, .pid = 0 };
+    var data = [_]linux.cap_user_data_t{std.mem.zeroes(linux.cap_user_data_t)} ** 2;
+    if (linux.errno(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&data))) != .SUCCESS or !std.mem.allEqual(u8, std.mem.asBytes(&data), 0))
+        return error.PrivilegeDropUnavailable;
+    for (0..64) |cap| {
+        const bounding = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+        if (linux.errno(bounding) == .INVAL) break;
+        if (bounding != 0 or linux.prctl(47, 1, cap, 0, 0) != 0) return error.PrivilegeDropUnavailable;
+    }
+    const host = try c.parse(NamespaceIds, allocator, try workspace.read(allocator, io, "host-namespaces.json", 4096, .private));
+    const isolated = try namespaceIds(io);
+    inline for (std.meta.fields(NamespaceIds)) |field|
+        if (@field(host.value, field.name) == @field(isolated, field.name)) return error.AmbientNamespace;
+    try c.core.process.initialize();
+    var result = try c.core.process.run(allocator, io, .{
+        .argv = &.{"/bin/true"},
+        .environment = &map,
+        .cwd = repository.dir,
+        .deadline = try c.core.process.Deadline.afterMilliseconds(5000),
+    });
+    if (result.failures.primary != null or !result.cleanup_complete) return error.DynamicClosureFailed;
+    result.deinit(allocator);
+    if (std.mem.eql(u8, mode, "inside-descendant")) {
+        try detached(io);
+    }
+    _ = linux.write(1, "namespace-isolation-ok\n", "namespace-isolation-ok\n".len);
+}
+
+fn detached(io: std.Io) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, ".d/zig-migration-preparation/resume-producer/work/scratch/descendant-lock", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    if (linux.errno(linux.flock(file.handle, 2)) != .SUCCESS) return error.FixtureFailed;
+    var pipe: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS) return error.FixtureFailed;
+    const pid = linux.fork();
+    if (linux.errno(pid) != .SUCCESS) return error.FixtureFailed;
+    if (pid == 0) {
+        if (linux.errno(linux.setsid()) != .SUCCESS) linux.exit_group(120);
+        _ = linux.write(pipe[1], "1", 1);
+        while (true) _ = linux.syscall0(.sched_yield);
+    }
+    _ = linux.close(pipe[1]);
+    var ready: [1]u8 = undefined;
+    if (linux.read(pipe[0], &ready, 1) != 1 or ready[0] != '1') return error.FixtureFailed;
+    _ = linux.close(pipe[0]);
+}
+
+fn parentDeathRace(allocator: std.mem.Allocator, io: std.Io) !void {
+    try c.core.process.initialize();
+    const account = try env.Account.current(allocator, io);
+    var ready: [2]linux.fd_t = undefined;
+    var release: [2]linux.fd_t = undefined;
+    var report: [2]linux.fd_t = undefined;
+    for ([_]*[2]linux.fd_t{ &ready, &release, &report }) |pipe|
+        if (linux.errno(linux.pipe2(pipe, .{ .CLOEXEC = true })) != .SUCCESS) return error.FixtureFailed;
+    const parent = linux.fork();
+    if (linux.errno(parent) != .SUCCESS) return error.FixtureFailed;
+    if (parent == 0) {
+        try ns.userNamespace(account);
+        if (linux.errno(linux.unshare(linux.CLONE.NEWPID)) != .SUCCESS) return error.FixtureFailed;
+        const guard = try ns.ParentGuard.acquire();
+        const child = linux.fork();
+        if (linux.errno(child) != .SUCCESS) return error.FixtureFailed;
+        if (child == 0) {
+            _ = linux.write(ready[1], "R", 1);
+            var marker: [1]u8 = undefined;
+            if (linux.read(release[0], &marker, 1) != 1 or marker[0] != 'G') linux.exit_group(121);
+            if (linux.getpid() != 1 or linux.getppid() != 0) linux.exit_group(122);
+            guard.arm() catch |err| {
+                if (err != error.ParentDied) linux.exit_group(123);
+                guard.close();
+                _ = linux.write(report[1], "D", 1);
+                linux.exit_group(0);
+            };
+            // A vulnerable implementation reaches this payload marker.
+            _ = linux.write(report[1], "P", 1);
+            linux.exit_group(124);
+        }
+        while (true) _ = linux.syscall0(.sched_yield);
+    }
+    _ = linux.close(ready[1]);
+    _ = linux.close(release[0]);
+    _ = linux.close(report[1]);
+    var marker: [1]u8 = undefined;
+    if (linux.read(ready[0], &marker, 1) != 1 or marker[0] != 'R') return error.FixtureFailed;
+    if (linux.errno(linux.kill(@intCast(parent), .KILL)) != .SUCCESS) return error.FixtureFailed;
+    var status: u32 = 0;
+    if (linux.waitpid(@intCast(parent), &status, 0) != parent or !linux.W.IFSIGNALED(status)) return error.FixtureFailed;
+    // The original parent is dead and reaped before PID 1 registers PDEATHSIG.
+    if (linux.write(release[1], "G", 1) != 1) return error.FixtureFailed;
+    if (linux.errno(linux.waitpid(-1, &status, 0)) != .SUCCESS or !linux.W.IFEXITED(status) or linux.W.EXITSTATUS(status) != 0)
+        return error.FixtureFailed;
+    if (linux.read(report[0], &marker, 1) != 1 or marker[0] != 'D') return error.FixtureFailed;
+    for ([_]linux.fd_t{ ready[0], release[1], report[0] }) |fd| _ = linux.close(fd);
+    _ = linux.write(1, "parent-death-race-ok\n", "parent-death-race-ok\n".len);
+}
+
+test "namespace native dynamic isolation, nonzero status, deadline and detached cleanup" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try c.core.process.initialize();
+    var map = std.process.Environ.Map.init(allocator);
+    defer map.deinit();
+    const base = try fs.Directory.open(allocator, io, options.workspace);
+    defer base.close(allocator, io);
+    for ([_][]const u8{ "isolation", "failure", "timeout", "descendant", "exit143", "signal", "exec-missing", "setup-failure", "cleanup-failure" }) |mode| {
+        const path = try std.fmt.allocPrint(allocator, "fixture-{s}", .{mode});
+        defer allocator.free(path);
+        defer base.dir.deleteTree(io, path) catch @panic("native fixture cleanup failed");
+        const status_file = try ns.StatusFile.create();
+        defer status_file.close();
+        const fd_arg = try std.fmt.allocPrint(allocator, "{d}", .{status_file.fd});
+        defer allocator.free(fd_arg);
+        var outcome: producer.Outcome = .{ .step = .inspect, .child = try c.core.process.run(allocator, io, .{
+            .argv = &.{ @import("test_options").namespace_fixture, mode, fd_arg },
+            .environment = &map,
+            .cwd = base.dir,
+            .deadline = try c.core.process.Deadline.afterMilliseconds(if (std.mem.eql(u8, mode, "timeout")) 5000 else 15000),
+        }) };
+        defer outcome.deinit(allocator);
+        outcome.namespaceStatus(status_file.read());
+        const result = &outcome.child;
+        // A kernel denial or absent status on a normal run is NOT a skip.
+        if (!std.mem.eql(u8, mode, "timeout")) try std.testing.expect(result.failures.recording == null);
+        try std.testing.expectEqual(!std.mem.eql(u8, mode, "cleanup-failure"), result.cleanup_complete);
+        if (std.mem.eql(u8, mode, "failure") or std.mem.eql(u8, mode, "cleanup-failure")) {
+            try std.testing.expectEqual(@as(u8, 19), result.termination.?.exited);
+            try std.testing.expectEqual(.child_failed, result.failures.primary.?.category);
+            if (std.mem.eql(u8, mode, "cleanup-failure"))
+                try std.testing.expectEqual(.cleanup_failed, result.failures.cleanup.?.category);
+        } else if (std.mem.eql(u8, mode, "exit143")) {
+            try std.testing.expectEqual(@as(u8, 143), result.termination.?.exited);
+        } else if (std.mem.eql(u8, mode, "signal")) {
+            try std.testing.expectEqual(linux.SIG.TERM, result.termination.?.signal);
+        } else if (std.mem.eql(u8, mode, "exec-missing")) {
+            try std.testing.expect(result.termination == null);
+            try std.testing.expectEqual(.spawn_failed, result.failures.primary.?.category);
+        } else if (std.mem.eql(u8, mode, "setup-failure")) {
+            try std.testing.expect(result.termination == null);
+            try std.testing.expectEqual(.unavailable, result.failures.primary.?.category);
+        } else if (std.mem.eql(u8, mode, "timeout")) {
+            try std.testing.expectEqual(.timeout, result.failures.primary.?.category);
+            const ready_path = try std.fmt.allocPrint(allocator, "{s}/.d/zig-migration-preparation/resume-producer/work/scratch/timeout-ready", .{path});
+            defer allocator.free(ready_path);
+            const ready = try base.dir.openFile(io, ready_path, .{});
+            ready.close(io);
+        } else {
+            try std.testing.expect(result.failures.primary == null);
+            try std.testing.expectEqualStrings("namespace-isolation-ok\n", result.stdout);
+        }
+        if (std.mem.eql(u8, mode, "timeout") or std.mem.eql(u8, mode, "descendant")) {
+            const lock_path = try std.fmt.allocPrint(allocator, "{s}/.d/zig-migration-preparation/resume-producer/work/scratch/descendant-lock", .{path});
+            defer allocator.free(lock_path);
+            const lock = try base.dir.openFile(io, lock_path, .{});
+            defer lock.close(io);
+            // A detached survivor retains this native flock even after losing
+            // its process group and stdout. No PIDs or arbitrary logs needed.
+            try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(lock.handle, 2 | 4)));
+        }
+    }
+}
+
+test "namespace forced parent death before PID 1 registration and bounded status failures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try c.core.process.initialize();
+    var map = std.process.Environ.Map.init(allocator);
+    defer map.deinit();
+    for ([_][]const u8{ "parent-death-race", "status-missing", "status-exit143", "status-partial", "status-malformed" }) |mode| {
+        const status_file = try ns.StatusFile.create();
+        defer status_file.close();
+        const arg = try std.fmt.allocPrint(allocator, "{d}", .{status_file.fd});
+        defer allocator.free(arg);
+        var outcome: producer.Outcome = .{ .step = .inspect, .child = try c.core.process.run(allocator, io, .{
+            .argv = &.{ @import("test_options").namespace_fixture, mode, arg },
+            .environment = &map,
+            .cwd = std.Io.Dir.cwd(),
+            .deadline = try c.core.process.Deadline.afterMilliseconds(5000),
+        }) };
+        defer outcome.deinit(allocator);
+        try std.testing.expect(outcome.child.cleanup_complete);
+        if (std.mem.eql(u8, mode, "status-exit143"))
+            try std.testing.expectEqual(@as(u8, 143), outcome.child.termination.?.exited)
+        else
+            try std.testing.expect(outcome.child.failures.primary == null);
+        outcome.namespaceStatus(status_file.read());
+        if (std.mem.eql(u8, mode, "parent-death-race")) {
+            try std.testing.expect(outcome.succeeded());
+            try std.testing.expectEqualStrings("parent-death-race-ok\n", outcome.child.stdout);
+        } else {
+            try std.testing.expect(!outcome.succeeded() and outcome.child.termination == null);
+            try std.testing.expectEqual(.invalid_response, outcome.child.failures.recording.?.category);
+            try std.testing.expectEqual(@as(usize, 0), outcome.child.stdout.len);
+        }
+    }
+}
+
+test "namespace status rejects invalid enums signal ranges inconsistent and oversized records" {
+    try std.testing.expectError(error.MissingNamespaceStatus, ns.Status.decode(&.{}));
+    const valid = (ns.Status{ .primary = .exited, .code = 143 }).encode();
+    try std.testing.expectEqual(@as(u8, 143), (try ns.Status.decode(&valid)).termination().?.exited);
+    for (0..valid.len) |length|
+        if (length != 0) try std.testing.expectError(error.InvalidNamespaceStatus, ns.Status.decode(valid[0..length]));
+    for ([_]usize{ 0, 1, 2, 4, 5, 6, 7 }) |index| {
+        var bad = valid;
+        bad[index] = 0x80;
+        try std.testing.expectError(error.InvalidNamespaceStatus, ns.Status.decode(&bad));
+    }
+    for ([_]ns.Status{
+        .{},
+        .{ .primary = .signaled },
+        .{ .primary = .signaled, .code = 65 },
+        .{ .primary = .setup_failed, .code = 126 },
+        .{ .primary = .spawn_failed, .code = 126 },
+    }) |bad| try std.testing.expectError(error.InvalidNamespaceStatus, ns.Status.decode(&bad.encode()));
+    try std.testing.expectError(error.InvalidNamespaceStatus, ns.Status.decode(&(valid ++ .{0})));
+}
+
+test "namespace early publication errors clean only owned names and preserve independent failure lanes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const base = try fs.Directory.open(allocator, io, options.workspace);
+    defer base.close(allocator, io);
+    try base.dir.createDir(io, "resource-cleanup", .fromMode(0o700));
+    const dir = try base.dir.openDir(io, "resource-cleanup", .{});
+    defer dir.close(io);
+    defer base.dir.deleteDir(io, "resource-cleanup") catch @panic("resource fixture cleanup failed");
+    try put(io, dir, "unrelated", "must remain\n", 0o600);
+    defer dir.deleteFile(io, "unrelated") catch @panic("resource fixture cleanup failed");
+    for ([_]enum { early_error, write_failure, request_replaced, request_moved, request_linked, root_moved, root_nonempty, preexisting }{
+        .early_error, .write_failure, .request_replaced, .request_moved, .request_linked, .root_moved, .root_nonempty, .preexisting,
+    }) |mode| {
+        var resources: producer.NamespaceResources = .{ .directory = dir };
+        var outcome: producer.Outcome = .{
+            .step = .inspect,
+            .child = .{
+                .storage = try allocator.alloc(u8, 0),
+                .failures = .{
+                    .primary = .{ .stage = .process_spawn, .category = .spawn_failed },
+                    .recording = .{ .stage = .state_record, .category = .local_io },
+                },
+            },
+        };
+        defer outcome.deinit(allocator);
+        if (mode == .preexisting) {
+            try dir.createDir(io, "namespace-root", .fromMode(0o700));
+            try put(io, dir, "namespace-request.json", "unowned", 0o600);
+            try std.testing.expectError(error.PathAlreadyExists, resources.createRoot(io));
+            try std.testing.expectError(error.PathAlreadyExists, resources.publishRequest(io, "not published"));
+        } else {
+            try resources.createRoot(io);
+            if (mode == .write_failure) {
+                var old_limit: linux.rlimit = undefined;
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.getrlimit(.FSIZE, &old_limit)));
+                var old_action: linux.Sigaction = undefined;
+                var action: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 };
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.sigaction(.XFSZ, &action, &old_action)));
+                defer if (linux.errno(linux.sigaction(.XFSZ, &old_action, null)) != .SUCCESS) @panic("restore signal failed");
+                const limited: linux.rlimit = .{ .cur = 0, .max = old_limit.max };
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.setrlimit(.FSIZE, &limited)));
+                defer if (linux.errno(linux.setrlimit(.FSIZE, &old_limit)) != .SUCCESS) @panic("restore file limit failed");
+                if (resources.publishRequest(io, "cannot write")) |_| return error.AcceptedFailedWrite else |_| {}
+                try std.testing.expect(resources.request != null);
+                try std.testing.expectEqual(@as(u64, 0), (try fs.metadata(resources.request.?)).size);
+            } else try resources.publishRequest(io, "synthetic request");
+            if (mode == .request_replaced) {
+                try dir.deleteFile(io, "namespace-request.json");
+                try put(io, dir, "namespace-request.json", "replacement", 0o600);
+            }
+            if (mode == .request_moved or mode == .root_moved) {
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.renameat(
+                    dir.handle,
+                    if (mode == .request_moved) "namespace-request.json" else "namespace-root",
+                    dir.handle,
+                    "moved",
+                )));
+            }
+            if (mode == .request_linked)
+                try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.linkat(dir.handle, "namespace-request.json", dir.handle, "linked", 0)));
+            if (mode == .root_nonempty) try put(io, resources.root.?, "retained", "not ours to remove", 0o600);
+        }
+        resources.cleanup(io, &outcome);
+        try std.testing.expectEqual(.spawn_failed, outcome.child.failures.primary.?.category);
+        try std.testing.expectEqual(.local_io, outcome.child.failures.recording.?.category);
+        if (mode == .request_replaced or mode == .request_moved or mode == .request_linked or mode == .root_moved or mode == .root_nonempty)
+            try std.testing.expectEqual(.cleanup_failed, outcome.child.failures.cleanup.?.category)
+        else
+            try std.testing.expect(outcome.child.failures.cleanup == null);
+        if (mode == .request_replaced or mode == .preexisting) {
+            const remaining = try dir.openFile(io, "namespace-request.json", .{});
+            remaining.close(io);
+            try dir.deleteFile(io, "namespace-request.json");
+        } else try std.testing.expectError(error.FileNotFound, dir.openFile(io, "namespace-request.json", .{}));
+        if (mode == .root_nonempty) try dir.deleteFile(io, "namespace-root/retained");
+        if (mode == .root_nonempty or mode == .preexisting)
+            try dir.deleteDir(io, "namespace-root")
+        else
+            try std.testing.expectError(error.FileNotFound, dir.openDir(io, "namespace-root", .{}));
+        if (mode == .request_moved) try dir.deleteFile(io, "moved");
+        if (mode == .request_linked) try dir.deleteFile(io, "linked");
+        if (mode == .root_moved) try dir.deleteDir(io, "moved");
+        const unrelated = try dir.openFile(io, "unrelated", .{});
+        unrelated.close(io);
+    }
+}
+
+test "namespace production helper setup status and producer entry compile without root execution" {
+    std.testing.refAllDecls(producer);
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try c.core.process.initialize();
+    var map = std.process.Environ.Map.init(allocator);
+    defer map.deinit();
+    const status_file = try ns.StatusFile.create();
+    defer status_file.close();
+    const arg = try std.fmt.allocPrint(allocator, "{d}", .{status_file.fd});
+    defer allocator.free(arg);
+    const missing = try std.fs.path.join(allocator, &.{ options.workspace, "missing-request.json" });
+    defer allocator.free(missing);
+    var outcome: producer.Outcome = .{ .step = .inspect, .child = try c.core.process.run(allocator, io, .{
+        .argv = &.{ @import("test_options").namespace_helper, missing, &c.digest("missing"), arg },
+        .environment = &map,
+        .cwd = std.Io.Dir.cwd(),
+        .deadline = try c.core.process.Deadline.afterMilliseconds(5000),
+    }) };
+    defer outcome.deinit(allocator);
+    outcome.namespaceStatus(status_file.read());
+    try std.testing.expectEqual(@as(u8, 0), outcome.helper_termination.?.exited);
+    try std.testing.expect(outcome.child.termination == null);
+    try std.testing.expectEqual(.unavailable, outcome.child.failures.primary.?.category);
+    try std.testing.expect(outcome.child.failures.recording == null and outcome.child.failures.cleanup == null);
+}
+
+test "namespace canonical environment handoff has fixed Git/cache values and no inherited HOME" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const record: env.Record = .{
+        .workspace = "/selected/scratch",
+        .bison_pkgdatadir = "/reviewed/bison",
+        .m4 = "/reviewed/m4",
+        .git_exec_path = "/selected/scratch/disabled-git-exec",
+        .trust_bundle = "/reviewed/ca.pem",
+    };
+    const bytes = try c.canonical(allocator, record);
+    const parsed = try c.parse(env.Record, allocator, bytes);
+    try std.testing.expectEqualStrings("uk.native-preparation-environment.v1", @tagName(parsed.value.schema));
+    var map = try record.create(allocator, "/home/canonical");
+    defer map.deinit();
+    try std.testing.expectEqualStrings("/home/canonical", map.get("HOME").?);
+    try std.testing.expectEqualStrings("/selected/scratch/tmp", map.get("TMPDIR").?);
+    try std.testing.expectEqualStrings("/selected/scratch/zig-local", map.get("ZIG_LOCAL_CACHE_DIR").?);
+    try std.testing.expectEqualStrings("/dev/null", map.get("GIT_CONFIG_GLOBAL").?);
+    try std.testing.expectEqualStrings("1", map.get("GIT_NO_REPLACE_OBJECTS").?);
+    try std.testing.expect(map.get("LD_LIBRARY_PATH") == null and map.get("SSH_AUTH_SOCK") == null);
+    var bad = record;
+    bad.workspace = "/selected/../ambient";
+    try std.testing.expectError(error.UnsafePath, bad.validate());
+}
+
+test "namespace environment loader rejects substitution symlinks public mode and unknown fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const base = try fs.Directory.open(allocator, io, options.workspace);
+    defer base.close(allocator, io);
+    try base.dir.createDir(io, "environment-loader", .fromMode(0o700));
+    defer base.dir.deleteTree(io, "environment-loader") catch {};
+    const directory = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ base.path, "environment-loader" }));
+    defer directory.close(allocator, io);
+    const record: env.Record = .{
+        .workspace = "/selected/scratch",
+        .bison_pkgdatadir = "/reviewed/bison",
+        .m4 = "/reviewed/m4",
+        .git_exec_path = "/selected/scratch/disabled-git-exec",
+        .trust_bundle = "/reviewed/ca.pem",
+    };
+    const bytes = try c.canonical(allocator, record);
+    try put(io, directory.dir, "record.json", bytes, 0o600);
+    const path = try std.fs.path.join(allocator, &.{ directory.path, "record.json" });
+    const loaded = try env.load(allocator, io, path, c.digest(bytes));
+    try std.testing.expectEqualStrings(record.workspace, loaded.value.workspace);
+    try std.testing.expectError(error.HashMismatch, env.load(allocator, io, path, c.digest("substitution")));
+    try put(io, directory.dir, "public.json", bytes, 0o644);
+    try std.testing.expectError(error.UnsafeFile, env.load(allocator, io, try std.fs.path.join(allocator, &.{ directory.path, "public.json" }), c.digest(bytes)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlinkat("record.json", directory.dir.handle, "link.json")));
+    try std.testing.expectError(error.UnsafeFile, env.load(allocator, io, try std.fs.path.join(allocator, &.{ directory.path, "link.json" }), c.digest(bytes)));
+    const unknown = try c.canonical(allocator, .{
+        .schema = record.schema,
+        .workspace = record.workspace,
+        .bison_pkgdatadir = record.bison_pkgdatadir,
+        .m4 = record.m4,
+        .git_exec_path = record.git_exec_path,
+        .trust_bundle = record.trust_bundle,
+        .arbitrary_environment = "not accepted",
+    });
+    try put(io, directory.dir, "unknown.json", unknown, 0o600);
+    if (env.load(allocator, io, try std.fs.path.join(allocator, &.{ directory.path, "unknown.json" }), c.digest(unknown))) |_| {
+        return error.AcceptedUnknownField;
+    } else |_| {}
+}

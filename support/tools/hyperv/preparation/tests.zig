@@ -8,6 +8,7 @@ const inputs = @import("inputs.zig");
 const producer = @import("producer.zig");
 const packaging = @import("package.zig");
 const budget = @import("budget.zig");
+const admission = @import("admission.zig");
 const private = c.core.private_files;
 
 fn cli(allocator: std.mem.Allocator, cwd: std.Io.Dir, arguments: []const []const u8) !c.core.process.Result {
@@ -92,6 +93,8 @@ test "native context entry points compile without executing blocked workflows" {
         provenance.requireCurrentExecutable,
         producer.execute,
         fs.copyImmutable,
+        admission.load,
+        admission.verifyExecution,
     }) |entry| {
         var pointer: *const @TypeOf(entry) = &entry;
         std.mem.doNotOptimizeAway(&pointer);
@@ -454,7 +457,7 @@ test "SHAPE ONLY provenance rejects malformed runtime hashes paths modes and cro
 }
 
 fn shapePlan(allocator: std.mem.Allocator, packaged: receipts.Link) !inputs.Plan {
-    const assets = try allocator.alloc(inputs.Asset, 16);
+    const assets = try allocator.alloc(inputs.Asset, 27);
     const roles = [_]budget.Role{
         .raw,            .boot_disk,        .qemu,                .qemu_support,  .firmware_code, .firmware_vars,
         .native_control, .producer_control, .publication_control, .baked_control,
@@ -473,7 +476,22 @@ fn shapePlan(allocator: std.mem.Allocator, packaged: receipts.Link) !inputs.Plan
     };
     assets[0].source = packaged.receipt.packaging.?.raw;
     assets[2].source.mode = 0o755;
-    for (assets[10..], 0..) |*item, i| item.* = .{
+    assets[7].source = packaged.receipt.provenance.producer.executable.?;
+    assets[10] = .{
+        .id = "private-vhd",
+        .role = .vhd,
+        .source = packaged.receipt.packaging.?.vhd,
+        .destination = "private.vhd",
+        .placement = .staged,
+    };
+    assets[11] = .{
+        .id = "solved-metadata",
+        .role = .publication_control,
+        .source = shapeFile("native-config/metadata.tsv", 256),
+        .destination = "metadata.tsv",
+        .placement = .staged,
+    };
+    for (assets[12..18], 0..) |*item, i| item.* = .{
         .id = try std.fmt.allocPrint(allocator, "vars-copy-{d}", .{i}),
         .role = .firmware_working_copy,
         .source = assets[5].source,
@@ -484,9 +502,29 @@ fn shapePlan(allocator: std.mem.Allocator, packaged: receipts.Link) !inputs.Plan
     qemu.target = .x86_64_linux;
     qemu.tree.files = 2;
     qemu.tree.bytes = assets[2].source.size + assets[3].source.size;
+    const chain = try shapeChain(allocator);
+    var publication: @FieldType(inputs.Plan, "publication") = undefined;
+    for (&publication.receipts, chain, [_][]const u8{ "prepared.receipt.json", "configured.receipt.json", "built.receipt.json", "packaged.receipt.json" }) |*record, link, name|
+        record.* = .{ .path = name, .sha256 = link.sha256, .size = (try c.canonical(allocator, link.receipt)).len, .mode = 0o600 };
+    for (&publication.executions, [_][]const u8{ "configured.binding.json", "built.binding.json" }, 0..) |*record, name, i| {
+        record.* = shapeFile(name, 128);
+        record.sha256 = chain[i + 1].receipt.execution.?.admitted_binding_sha256;
+    }
+    for (&publication.inspections, [_][]const u8{ "configured.inspection.binding.json", "built.inspection.binding.json" }) |*record, name|
+        record.* = shapeFile(name, 128);
+    const controls = publication.receipts ++ publication.executions ++ publication.inspections ++ [_]c.File{packaged.receipt.config_after};
+    for (assets[18..], controls) |*item, record| item.* = .{
+        .id = record.path,
+        .role = .publication_control,
+        .source = record,
+        .destination = record.path,
+        .placement = .staged,
+    };
     return .{
-        .schema = .hyperv_native_input_selection_v1,
+        .schema = .hyperv_native_input_selection_v2,
         .packaged_receipt_sha256 = packaged.sha256,
+        .solved_metadata = assets[11].source,
+        .publication = publication,
         .capability_source = shapeSource(),
         .capability_receipt = assets[8].source,
         .qemu = qemu,
@@ -502,7 +540,7 @@ test "SHAPE ONLY generation ledger charges six firmware copies all controls evid
     const plan = try shapePlan(allocator, packaged);
     const entries = try inputs.ledger(std.testing.allocator, plan, packaged);
     defer std.testing.allocator.free(entries);
-    try std.testing.expectEqual(@as(usize, 18), entries.len);
+    try std.testing.expectEqual(@as(usize, 29), entries.len);
     var copies: usize = 0;
     var firmware_bytes: u64 = 0;
     for (entries) |entry| if (entry.role == .firmware_working_copy) {
@@ -513,17 +551,21 @@ test "SHAPE ONLY generation ledger charges six firmware copies all controls evid
     try std.testing.expectEqual(@as(usize, 6), copies);
     try std.testing.expectEqual(@as(u64, 6 * 256 * 1024), firmware_bytes);
     try std.testing.expectEqual(.publication_reservation, entries[entries.len - 2].role);
-    try std.testing.expectEqual(c.control_cap - 3072, entries[entries.len - 2].reserved);
+    var actual_controls: u64 = 0;
+    for (plan.assets) |item| if (item.role.isControl()) {
+        actual_controls += item.source.size;
+    };
+    try std.testing.expectEqual(c.control_cap - actual_controls, entries[entries.len - 2].reserved);
     try std.testing.expect(entries[entries.len - 2].source == null);
     try std.testing.expectEqual(.evidence, entries[entries.len - 1].role);
     try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), entries[entries.len - 1].reserved);
     const totals = try budget.compute(entries);
     try std.testing.expectEqual(c.control_cap, totals.control);
-    try std.testing.expectEqual(2 * c.image_bytes + 4096 + 512 + 1024 * 1024 + 7 * 256 * 1024 + 3072, totals.used);
+    try std.testing.expectEqual(3 * c.image_bytes + 512 + 4096 + 512 + 1024 * 1024 + 7 * 256 * 1024 + actual_controls, totals.used);
     try std.testing.expectEqual(c.total_cap, totals.used + totals.reserved + totals.total_remaining);
     const selected_sha = c.digest(try c.canonical(allocator, plan));
     const document: inputs.Input = .{
-        .schema = .hyperv_native_prepared_input_v1,
+        .schema = .hyperv_native_prepared_input_v2,
         .state = .prepared,
         .authority = .not_admitted,
         .receipt = packaged.receipt,
@@ -568,15 +610,15 @@ test "SHAPE ONLY generation rejects missing controls partial QEMU duplicate path
         try std.testing.expectError(error.MissingControls, inputs.ledger(std.testing.allocator, changed, packaged));
     }
     var changed = plan;
-    changed.assets = plan.assets[0..15];
+    changed.assets = plan.assets[0..17];
     try std.testing.expectError(error.InvalidSelection, inputs.ledger(allocator, changed, packaged));
     var assets = try allocator.dupe(inputs.Asset, plan.assets);
     changed = plan;
     changed.assets = assets;
-    assets[11].destination = assets[10].destination;
+    assets[13].destination = assets[12].destination;
     try std.testing.expectError(error.DuplicateLedgerArtifact, inputs.ledger(allocator, changed, packaged));
     @memcpy(assets, plan.assets);
-    assets[11].id = assets[10].id;
+    assets[13].id = assets[12].id;
     try std.testing.expectError(error.DuplicateLedgerId, inputs.ledger(allocator, changed, packaged));
     @memcpy(assets, plan.assets);
     assets[3].source = assets[2].source;
@@ -585,10 +627,10 @@ test "SHAPE ONLY generation rejects missing controls partial QEMU duplicate path
     assets[3].role = .publication_control;
     try std.testing.expectError(error.IncompleteRuntime, inputs.ledger(allocator, changed, packaged));
     @memcpy(assets, plan.assets);
-    assets[10].source.sha256 = c.digest("different variable firmware");
+    assets[12].source.sha256 = c.digest("different variable firmware");
     try std.testing.expectError(error.HashMismatch, inputs.ledger(allocator, changed, packaged));
     @memcpy(assets, plan.assets);
-    assets[10].placement = .staged;
+    assets[12].placement = .staged;
     try std.testing.expectError(error.InvalidSelection, inputs.ledger(allocator, changed, packaged));
     @memcpy(assets, plan.assets);
     assets[6].source.size = c.control_cap;
@@ -612,6 +654,317 @@ test "SHAPE ONLY generation rejects missing controls partial QEMU duplicate path
     changed = plan;
     changed.qemu.loader = shapeFile("lib/missing-loader", 128);
     try std.testing.expectError(error.IncompleteRuntime, inputs.ledger(allocator, changed, packaged));
+}
+
+fn shapeInput(allocator: std.mem.Allocator, chain: [4]receipts.Link) !inputs.Input {
+    const plan = try shapePlan(allocator, chain[3]);
+    const entries = try inputs.ledger(allocator, plan, chain[3]);
+    return .{
+        .schema = .hyperv_native_prepared_input_v2,
+        .state = .prepared,
+        .authority = .not_admitted,
+        .receipt = chain[3].receipt,
+        .reviewed_selection_sha256 = c.digest(try c.canonical(allocator, plan)),
+        .selection = plan,
+        .ledger = entries,
+        .budget = try budget.compute(entries),
+    };
+}
+
+fn shapeReview(allocator: std.mem.Allocator, chain: [4]receipts.Link, input: inputs.Input) !admission.Review {
+    var result: admission.Review = .{
+        .input_sha256 = c.digest(try c.canonical(allocator, input)),
+        .selection_sha256 = input.reviewed_selection_sha256,
+        .provenance_sha256 = input.receipt.reviewed_provenance_sha256,
+        .capability_provenance_sha256 = c.digest("independent capability review SHAPE ONLY"),
+        .receipt_sha256 = undefined,
+        .execution_sha256 = .{ chain[1].receipt.execution.?.admitted_binding_sha256, chain[2].receipt.execution.?.admitted_binding_sha256 },
+        .engine_runtime_sha256 = c.digest("independent engine runtime SHAPE ONLY"),
+        .engine_executable_sha256 = c.digest("different engine executable SHAPE ONLY"),
+    };
+    for (chain, &result.receipt_sha256) |link, *hash| hash.* = link.sha256;
+    return result;
+}
+
+test "entry chain requires independent selection provenance receipt and execution commitments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const chain = try shapeChain(a);
+    const input = try shapeInput(a, chain);
+    const review = try shapeReview(a, chain, input);
+    try admission.requireChain(a, chain, input, review);
+    var bad = review;
+    bad.selection_sha256 = c.digest("other selection");
+    try std.testing.expectError(error.UnreviewedInput, admission.requireChain(a, chain, input, bad));
+    bad = review;
+    bad.provenance_sha256 = c.digest("other review");
+    try std.testing.expectError(error.ReceiptSubstitution, admission.requireChain(a, chain, input, bad));
+    for (0..4) |i| {
+        bad = review;
+        bad.receipt_sha256[i] = c.digest("substituted receipt");
+        try std.testing.expectError(error.ReceiptSubstitution, admission.requireChain(a, chain, input, bad));
+    }
+    for (0..2) |i| {
+        bad = review;
+        bad.execution_sha256[i] = c.digest("self-approved execution");
+        try std.testing.expectError(error.UnreviewedInput, admission.requireChain(a, chain, input, bad));
+    }
+    const projection = try admission.project(input, review);
+    try std.testing.expectEqual(review.provenance_sha256, projection.guarded_producer_sha256);
+    try std.testing.expectEqual(review.engine_executable_sha256, projection.engine_executable_sha256);
+    try std.testing.expect(!std.meta.eql(projection.guarded_producer_sha256, projection.producer_executable_sha256));
+    try std.testing.expectEqual(@as(usize, 32), (try admission.rawHash(review.input_sha256)).len);
+    const storage = try admission.storageIdentity(input.receipt.run_id);
+    try std.testing.expectEqual(@as(u8, 0x11), storage.bytes[0]);
+    try std.testing.expectError(error.InvalidSha256, admission.rawHash(("G" ** 64).*));
+    const encoded = try c.canonical(a, input);
+    const legacy = try replaceOnce(a, encoded, "hyperv_native_prepared_input_v2", "hyperv_native_prepared_input_v1");
+    try std.testing.expectError(error.InvalidEnum, c.parse(inputs.PreparedInputV2, a, legacy));
+}
+
+test "read-only staged entry rejects leftover directories changed bytes modes links and forged input" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    const path = try fixture.dir.realPathFileAlloc(io, ".", a);
+    const directory = try fs.openPrivate(io, path);
+    defer directory.close(io);
+    var lock = try directory.lock(io);
+    defer lock.close(io);
+    try fixture.dir.createDir(io, "qemu", .fromMode(0o700));
+    try writeFixture(fixture.dir, "qemu/public.bin", "public synthetic", 0o600);
+    try writeFixture(fixture.dir, "input.json", "{}\n", 0o600);
+    const measured: fs.Directory = .{ .dir = fixture.dir, .path = path };
+    const asset = inputs.Asset{
+        .id = "public",
+        .role = .qemu_support,
+        .source = try measured.record(a, io, "qemu/public.bin", 100, .private),
+        .destination = "qemu/public.bin",
+        .placement = .staged,
+    };
+    const input = try measured.record(a, io, "input.json", 100, .private);
+    _ = try inputs.requireStagedClosure(a, io, &lock, &.{asset}, input);
+    try fixture.dir.createDir(io, "unaccounted-empty", .fromMode(0o700));
+    try std.testing.expectError(error.InvalidSelection, inputs.requireStagedClosure(a, io, &lock, &.{asset}, input));
+    try fixture.dir.deleteDir(io, "unaccounted-empty");
+    try writeFixture(fixture.dir, "qemu/public.bin", "public substitute", 0o600);
+    try std.testing.expectError(error.HashMismatch, inputs.requireStagedClosure(a, io, &lock, &.{asset}, input));
+    try writeFixture(fixture.dir, "qemu/public.bin", "public synthetic", 0o644);
+    try std.testing.expectError(error.UnsafeFile, inputs.requireStagedClosure(a, io, &lock, &.{asset}, input));
+    try writeFixture(fixture.dir, "qemu/public.bin", "public synthetic", 0o600);
+    try writeFixture(fixture.dir, "input.json", "{\"forged\":true}\n", 0o600);
+    try std.testing.expectError(error.HashMismatch, inputs.requireStagedClosure(a, io, &lock, &.{asset}, input));
+    try writeFixture(fixture.dir, "input.json", "{}\n", 0o600);
+    try fixture.dir.symLink(io, "qemu/public.bin", "unaccounted-link", .{});
+    try std.testing.expectError(error.UnsafeFile, inputs.requireStagedClosure(a, io, &lock, &.{asset}, input));
+}
+
+test "current engine identity is physically bound without weakening producer self verification" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    const directory: fs.Directory = .{ .dir = fixture.dir, .path = try fixture.dir.realPathFileAlloc(io, ".", a) };
+    const self = try std.Io.Dir.openFileAbsolute(io, "/proc/self/exe", .{});
+    defer self.close(io);
+    const info = try fs.metadata(self);
+    if (info.size > 128 * 1024 * 1024) return error.LimitExceeded;
+    const bytes = try a.alloc(u8, @intCast(info.size));
+    try std.testing.expectEqual(bytes.len, try self.readPositionalAll(io, bytes, 0));
+    try writeFixture(fixture.dir, "engine", bytes, info.mode & 0o7777);
+    const record = try directory.record(a, io, "engine", bytes.len, .executable);
+    var tool = shapeTool(.preparation, record);
+    tool.target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux;
+    tool.tree = (try fs.inventory(a, io, directory, 4, 128 * 1024 * 1024)).tree;
+    const bound: rt.Bound = .{ .directory = directory, .contract = tool };
+    const chain = try shapeChain(a);
+    var review = try shapeReview(a, chain, try shapeInput(a, chain));
+    review.engine_executable_sha256 = record.sha256;
+    review.engine_runtime_sha256 = c.digest(try c.canonical(a, tool));
+    try admission.requireEngine(a, io, bound, review);
+    try std.testing.expectError(error.UnreviewedInput, provenance.requireCurrentExecutable(io, chain[0].receipt.provenance));
+    var bad = review;
+    bad.engine_executable_sha256 = c.digest("another executable");
+    try std.testing.expectError(error.UnreviewedInput, admission.requireEngine(a, io, bound, bad));
+    bad = review;
+    bad.engine_runtime_sha256 = c.digest("another review");
+    try std.testing.expectError(error.UnreviewedInput, admission.requireEngine(a, io, bound, bad));
+    try writeFixture(fixture.dir, "engine", "substituted", info.mode & 0o7777);
+    try std.testing.expectError(error.HashMismatch, admission.requireEngine(a, io, bound, review));
+}
+
+test "reservation permutation cannot borrow evidence allowance and identical copies need distinct control bindings" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const chain = try shapeChain(a);
+    var plan = try shapePlan(a, chain[3]);
+    const entries = try inputs.ledger(a, plan, chain[3]);
+    const allowance = try inputs.publicationAllowance(entries);
+    std.mem.swap(budget.Entry, &entries[entries.len - 1], &entries[entries.len - 2]);
+    try std.testing.expectEqual(allowance, try inputs.publicationAllowance(entries));
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    try fixture.dir.createDir(io, "producer", .fromMode(0o700));
+    try fixture.dir.createDir(io, "engine", .fromMode(0o700));
+    const path = try fixture.dir.realPathFileAlloc(io, ".", a);
+    const producer_dir = try fs.Directory.open(a, io, try std.fs.path.join(a, &.{ path, "producer" }));
+    defer producer_dir.close(a, io);
+    const engine_dir = try fs.Directory.open(a, io, try std.fs.path.join(a, &.{ path, "engine" }));
+    defer engine_dir.close(a, io);
+    try writeFixture(producer_dir.dir, "control", "identical public controls", 0o700);
+    try writeFixture(engine_dir.dir, "control", "identical public controls", 0o700);
+    const record = try producer_dir.record(a, io, "control", 128, .executable);
+    const assets = [_]inputs.Asset{
+        .{ .id = "producer", .role = .producer_control, .source = record, .destination = "producer", .placement = .staged },
+        .{ .id = "engine", .role = .native_control, .source = record, .destination = "engine", .placement = .staged },
+    };
+    const bindings = [_]inputs.Binding{ .{ .id = "producer", .directory = producer_dir }, .{ .id = "engine", .directory = engine_dir } };
+    const required: rt.Bound = .{ .directory = engine_dir, .contract = shapeTool(.preparation, record) };
+    plan.assets = assets[0..1];
+    try std.testing.expectError(error.MissingControlBinding, inputs.requireControlBinding(io, plan, &bindings, required));
+    plan.assets = &assets;
+    try inputs.requireControlBinding(io, plan, &bindings, required);
+    plan.assets = assets[0..1];
+    try inputs.requireControlBinding(io, plan, &bindings, .{ .directory = producer_dir, .contract = required.contract });
+}
+
+test "read-only entry never creates missing state or adopts v1 partial staging or a held writer" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    const path = try fixture.dir.realPathFileAlloc(io, ".", a);
+    const directory: fs.Directory = .{ .dir = fixture.dir, .path = path };
+    const state = try fs.openPrivate(io, path);
+    defer state.close(io);
+    const tool: rt.Bound = .{ .directory = directory, .contract = shapeTool(.preparation, null) };
+    const deadline = try c.core.process.Deadline.afterMilliseconds(30000);
+    var git: rt.Git = .{
+        .allocator = a,
+        .io = io,
+        .runtime = tool,
+        .environment = .{ .scratch = path, .path = path },
+        .deadline = deadline,
+    };
+    const produced: admission.ProducerSource = .{
+        .repository = directory,
+        .git = &git,
+        .provenance_bindings = .{ .producer = directory, .compiler = directory, .git = directory, .dependencies = &.{}, .trust = directory },
+    };
+    const bindings: admission.Bindings = .{
+        .staging = state,
+        .receipts = directory,
+        .producer_source = produced,
+        .capability_source = produced,
+        .config = directory,
+        .packaged = state,
+        .efi = directory,
+        .assets = &.{},
+        .qemu = directory,
+        .engine = tool,
+    };
+    const chain = try shapeChain(a);
+    const input = try shapeInput(a, chain);
+    var review = try shapeReview(a, chain, input);
+    try std.testing.expectError(error.FileNotFound, admission.load(a, io, review, bindings, deadline));
+    try std.testing.expectError(error.FileNotFound, directory.openFile(io, ".writer.lock", .private));
+    var lock = try state.lock(io);
+    try std.testing.expectError(error.WouldBlock, admission.load(a, io, review, bindings, deadline));
+    lock.close(io);
+    const encoded = try c.canonical(a, input);
+    const legacy = try replaceOnce(a, encoded, "hyperv_native_prepared_input_v2", "hyperv_native_prepared_input_v1");
+    review.input_sha256 = c.digest(legacy);
+    try writeFixture(fixture.dir, "input.json", legacy, 0o600);
+    try std.testing.expectError(error.InvalidEnum, admission.load(a, io, review, bindings, deadline));
+    review.input_sha256 = c.digest(encoded);
+    try writeFixture(fixture.dir, "input.json", encoded, 0o600);
+    for (chain, [_][]const u8{ "prepared.receipt.json", "configured.receipt.json", "built.receipt.json", "packaged.receipt.json" }) |link, name|
+        try writeFixture(fixture.dir, name, try c.canonical(a, link.receipt), 0o600);
+    try std.testing.expectError(error.InvalidSelection, admission.load(a, io, review, bindings, deadline));
+    try std.testing.expectError(error.DeadlineExceeded, admission.load(a, io, review, bindings, .{ .expires_ns = 0 }));
+    try std.testing.expectEqualStrings(encoded, try directory.read(a, io, "input.json", 1024 * 1024, .private));
+    try std.testing.expect(git.failures.primary == null and git.failures.cleanup == null);
+}
+
+test "authoritative metadata entry rejects incomplete invented and wrong platform declarations" {
+    const cfg = @import("config.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const guard = (try shapePrepared(a)).guard;
+    const solved = try std.fmt.allocPrint(a, "{s}CONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\n", .{try cfg.render(a, guard)});
+    const metadata =
+        "unikraft-native-config-metadata-v1\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE\tbool\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE\tbool\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_NETWORK_APPLICATION\tbool\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID\tstring\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID\tstring\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_SECTORS\tint\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE\tint\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY\tint\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_LUN\tint\n" ++
+        "symbol\tLIBSTORVSC\tbool\n" ++
+        "symbol\tLIBSTORVSC_LUN_DISCOVERY\tbool\n" ++
+        "symbol\tLIBSTORVSC_GUARDED_IO\tbool\n" ++
+        "symbol\tLIBSTORVSC_MAX_DEVICES\tint\n" ++
+        "symbol\tLIBSTORVSC_MAX_LUNS\tint\n" ++
+        "symbol\tARCH_X86_64\tbool\nsymbol\tPLAT_HYPERV\tbool\n";
+    try inputs.validateAuthoritativeConfig(a, solved, metadata, guard);
+    try std.testing.expectError(error.InvalidConfig, inputs.validateAuthoritativeConfig(a, solved, "unikraft-native-config-metadata-v1\n", guard));
+    const wrong = try replaceOnce(a, solved, "CONFIG_PLAT_HYPERV=y", "# CONFIG_PLAT_HYPERV is not set");
+    try std.testing.expectError(error.InvalidSelection, inputs.validateAuthoritativeConfig(a, wrong, metadata, guard));
+    const unknown = try std.fmt.allocPrint(a, "{s}CONFIG_UNREVIEWED_FLAG=y\n", .{solved});
+    try std.testing.expectError(error.IncompleteMetadata, inputs.validateAuthoritativeConfig(a, unknown, metadata, guard));
+    const bad_types = try replaceOnce(a, metadata, "APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS\tint", "APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS\thex");
+    try std.testing.expectError(error.ConflictingMetadata, inputs.validateAuthoritativeConfig(a, solved, bad_types, guard));
+}
+
+test "input v2 requires a charged distinct private VHD and rejects v1 wire shapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const packaged = (try shapeChain(allocator))[3];
+    var plan = try shapePlan(allocator, packaged);
+    const assets = try allocator.dupe(inputs.Asset, plan.assets);
+    plan.assets = assets;
+    const original = assets[10];
+    for ([_]budget.Role{ .boot_disk, .raw, .qemu_support }) |role| {
+        assets[10].role = role;
+        try std.testing.expectError(error.InvalidSelection, inputs.ledger(allocator, plan, packaged));
+    }
+    assets[10] = original;
+    assets[10].placement = .baked;
+    try std.testing.expectError(error.InvalidSelection, inputs.ledger(allocator, plan, packaged));
+    assets[10] = original;
+    assets[10].source.size = 1;
+    try std.testing.expectError(error.HashMismatch, inputs.ledger(allocator, plan, packaged));
+    assets[10] = original;
+    const bytes = try c.canonical(allocator, plan);
+    const legacy = try replaceOnce(allocator, bytes, "hyperv_native_input_selection_v2", "hyperv_native_input_selection_v1");
+    try std.testing.expectError(error.InvalidEnum, c.parse(inputs.SelectionV2, allocator, legacy));
+    const entries = try inputs.ledger(allocator, plan, packaged);
+    var charged: u64 = 0;
+    for (entries) |entry| if (entry.role == .vhd) {
+        charged += entry.source.?.size;
+    };
+    try std.testing.expectEqual(c.image_bytes + 512, charged);
+    plan.solved_metadata.path = "invented-symbol-types.tsv";
+    try std.testing.expectError(error.InvalidMetadata, inputs.ledger(allocator, plan, packaged));
 }
 
 fn writeFixture(directory: std.Io.Dir, path: []const u8, bytes: []const u8, mode: u16) !void {
@@ -921,7 +1274,7 @@ test "SHAPE ONLY context rejects foreign receipt bindings before physical verifi
         .native_execution = null,
         .native_proof = null,
     };
-    try std.testing.expectError(error.ReceiptSubstitution, context.runProducer(chain[0], selected, c.digest("not approval"), null));
+    try std.testing.expectError(error.ReceiptSubstitution, context.runProducer(chain[0], selected, c.digest("not approval"), c.digest("not inspection approval")));
     try std.testing.expectError(error.ReceiptSubstitution, context.package(chain[2], &lock, directory));
     try std.testing.expectError(error.ReceiptSubstitution, context.publish(&lock, chain[0].receipt));
     const plan = try shapePlan(allocator, chain[3]);
@@ -964,7 +1317,7 @@ test "SHAPE ONLY context rejects foreign receipt bindings before physical verifi
     try std.testing.expectError(error.UnreviewedInput, context.requireProducerBinding(different_compiler));
     var forged = chain[0];
     forged.sha256 = c.digest("forged receipt link");
-    try std.testing.expectError(error.ReceiptSubstitution, context.runProducer(forged, selected, c.digest("not approval"), null));
+    try std.testing.expectError(error.ReceiptSubstitution, context.runProducer(forged, selected, c.digest("not approval"), c.digest("not inspection approval")));
     var iterator = fixture.dir.iterate();
     while (try iterator.next(io)) |entry| try std.testing.expectEqualStrings(".writer.lock", entry.name);
     try std.testing.expect(context.failures.primary == null and git.failures.primary == null);
