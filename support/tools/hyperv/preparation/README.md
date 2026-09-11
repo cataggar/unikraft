@@ -18,10 +18,10 @@ source/runtime corrections replace lexical symlink normalization and
 architecture-specific Git fixture discovery. Native fixture paths are explicit;
 the reported runs are AArch64, not claimed x86_64 execution coverage.
 
-Only this package is modified. Shared core (`../core.zig`), native Kconfig,
-facade paths, ELF helpers and pinned native miz are reused. No Python, shell
-wrapper, automatic legacy fallback, Azure CLI, credential probing, download or
-failure-message recovery is implemented.
+The production implementation is local to this package. Shared core (`../core.zig`), native Kconfig,
+facade paths, ELF helpers and pinned native miz are reused. No Python, production
+shell wrapper, automatic legacy fallback, Azure CLI, credential probing, download
+or failure-message recovery is implemented.
 
 ## Build and focused fixtures
 
@@ -102,6 +102,104 @@ The separate existing-runner namespace fixture build uses:
 Create the selected scratch directories first. Never execute the reference
 namespace shell scripts, full guest/Make/native-image builds, or original seed
 operations as part of these fixtures.
+
+### Hosted namespace fixture setup
+
+The existing preparation workflow step runs this **hosted-only** setup command:
+
+```sh
+bash support/tools/hyperv/preparation/ci-fixtures.sh
+```
+
+It retains the preparation, namespace and nonexecuting integration-driver suites
+in both Debug and ReleaseSafe with `-j2`, and supplies the actual checkout through
+`-Dproof-fixture`. Its shell is CI orchestration, not a production namespace
+transport. Do not run it locally: it performs the explicitly approved root-owned
+synthetic-fixture installation and, only when justified below, AppArmor setup.
+The native fixtures alone remain locally runnable without changing policy.
+
+The namespace build has two **test-only** options:
+`-Dfixture-executable=/absolute/native/file` selects an existing fixture instead
+of the default cache executable; `-Dci-report=/absolute/private/new.json` writes
+an exclusive mode-0600 canonical baseline report. Relative paths are rejected.
+The `install-fixture` target installs only `preparation-namespace-fixture`; it
+still compiles the real namespace helper whose path is baked into the fixture.
+For example, after creating private cache/workspace directories:
+
+```sh
+cd /d/unikraft-worktrees/fleet-ci
+/home/g/.local/bin/zig build \
+  --build-file support/tools/hyperv/preparation/namespace/build.zig \
+  --cache-dir "$scratch/ns-release-cache" --prefix "$scratch/ns-release-fixture" \
+  -Dworkspace="$scratch/ns-release-work" "${git_fixture[@]}" \
+  -Doptimize=ReleaseSafe -j2 install-fixture --summary all
+/home/g/.local/bin/zig build \
+  --build-file support/tools/hyperv/preparation/namespace/build.zig \
+  --cache-dir "$scratch/ns-release-cache" --prefix "$scratch/ns-release-suite" \
+  -Dworkspace="$scratch/ns-release-work" "${git_fixture[@]}" \
+  -Dfixture-executable="$scratch/ns-release-fixture/bin/preparation-namespace-fixture" \
+  -Dci-report="$scratch/ns-release-baseline.json" \
+  -Doptimize=ReleaseSafe -j2 test install --summary all
+```
+
+The external executable must be built with the same workspace, Git material and
+helper options as its tests. CI builds two native files with distinct baked
+Debug/ReleaseSafe workspaces, then installs them root:root, mode 0555, single-link:
+`/var/lib/unikraft-hyperv-preparation-ci/namespace-fixture-debug` and
+`/var/lib/unikraft-hyperv-preparation-ci/namespace-fixture-release-safe`.
+The existing `/`, `/var` and `/var/lib` ancestors must already be root:root,
+mode 0755 and nonsymlinks. The setup refuses an existing installation directory;
+it neither repairs shared paths nor uses writable `/opt`.
+
+Before any compiler or test invocation, CI checks the canonical passwd account.
+Extra supplementary groups or a different effective primary GID trigger
+`sudo setpriv --reuid=UID --regid=GID --clear-groups --bounding-set=-all
+--inh-caps=-all --ambient-caps=-all`, which drops credentials **before** executing
+the ordinary-user compiler/test process. No Zig/test process runs as root.
+The launcher and native fixture independently require zero host effective,
+permitted, inheritable and ambient capabilities; production's supplementary-group
+restriction is unchanged. HOME remains the actual passwd HOME. The canonical
+facade directory and zero-byte `build.lock` are initialized only if absent;
+existing ownership/modes are checked and lock device/inode are preserved through
+cleanup. The setup never deletes that facade or lock.
+
+A single 15-second native baseline actually crosses the user/mount namespace
+boundary, checks isolation, and cleans up its descendants. Only the synthetic
+fixture sets the stable 15-byte audit comm `uk-prep-ns-test`. A second existing
+eight-byte namespace status memfd carries a closed fixture-only error enum:
+arbitrary stderr is still discarded, not parsed into a policy decision.
+Successful self-copy evidence compares held-file bytes/metadata and requires a
+different physical inode from the selected external executable. Each full-mode
+suite retains its own `namespace-baseline.json`; CI also requires the installed
+files' physical identity, size, ownership, mode, link count and hashes unchanged
+afterwards. These reports and the copy inventory describe synthetic test
+material, not production ledger admission.
+
+If the baseline passes, **no profile is loaded**. Otherwise the setup requires
+both the bounded report's specific namespace/mount-unavailable classification
+with completed outer-process cleanup and actual `journalctl -k` evidence from
+the microsecond-bounded baseline interval. `ci-denial.awk` retains at most eight
+4096-byte lines matching DENIED, the exact fixture comm,
+`profile="unprivileged_userns"`, `operation="capable"`, capability 21 and
+`capname="sys_admin"`. Missing/unrelated/overflowing evidence remains a failure.
+Only then may `ci-debug.apparmor` and `ci-release-safe.apparmor` attach their
+`flags=(unconfined) { userns, }` exception to those **two exact immutable paths**.
+No compiler, shell, test driver, writable cache path or production helper is
+profiled. This userns exception is not a sandbox or production permission.
+`kernel.apparmor_restrict_unprivileged_userns` must stay 1 throughout that path.
+
+Cleanup removes only the two owned profiles, four exact installation files and
+the now-empty dedicated directory. Failed cleanup is separately recorded from
+the primary exit; it does not erase the primary failure or silently remove files
+under a still-active profile. Synthetic logs, credential/baseline/cleanup JSON,
+installed-binary hashes and a size/device/inode/mode/link-count inventory of
+compiled/staged/installed fixture copies are retained at the workflow's exact
+`hyperv-ci/native-preparation` artifact paths. The inventory is a snapshot before
+installation cleanup, not a complete producer staging ledger or authority claim.
+
+This setup does not run configure, Make, guest/native-image builds, a complete
+producer/importer, or any host/cloud/seed operation. Actual hosted AppArmor
+execution remains a separate parent-owned CI gate.
 
 ## Wire versions and types
 

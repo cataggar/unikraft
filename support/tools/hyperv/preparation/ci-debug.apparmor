@@ -1,0 +1,6 @@
+abi <abi/4.0>,
+
+# Synthetic fixture only; never attach to a compiler, cache or production helper.
+profile unikraft-hyperv-preparation-ci-debug /var/lib/unikraft-hyperv-preparation-ci/namespace-fixture-debug flags=(unconfined) {
+  userns,
+}

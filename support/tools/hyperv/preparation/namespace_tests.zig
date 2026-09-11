@@ -16,6 +16,9 @@ comptime {
 }
 
 pub fn main(init: std.process.Init.Minimal) void {
+    // Only this synthetic executable receives the hosted CI audit name.
+    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_NAME), @intFromPtr("uk-prep-ns-test"), 0, 0, 0)) != .SUCCESS)
+        fail(error.FixtureAuditNameUnavailable);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const allocator = arena.allocator();
     var threaded: std.Io.Threaded = .init_single_threaded;
@@ -25,6 +28,19 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (std.mem.startsWith(u8, args[1], "inside-")) {
         if (args.len != 2) fail(error.InvalidFixtureMode);
         inside(allocator, io, args[1], init.environ) catch |err| fail(err);
+        return;
+    }
+    requireOrdinaryCredentials(allocator, io) catch |err| fail(err);
+    if (std.mem.eql(u8, args[1], "ci-isolation")) {
+        if (args.len != 4) fail(error.InvalidFixtureMode);
+        const status_file = ns.StatusFile.openParent(allocator, args[2]) catch |err| fail(err);
+        const diagnostic = ns.StatusFile.openParent(allocator, args[3]) catch |err| fail(err);
+        const status = fixture(allocator, io, "isolation", status_file) catch |err| {
+            diagnostic.write(.{ .primary = .exited, .code = @intFromEnum(namespaceError(err)) }) catch |write_error| fail(write_error);
+            fail(err);
+        };
+        diagnostic.write(.{ .primary = .exited, .code = @intFromEnum(NamespaceError.none) }) catch |err| fail(err);
+        status_file.write(status) catch |err| fail(err);
         return;
     }
     if (args.len != 3) fail(error.InvalidFixtureMode);
@@ -73,8 +89,46 @@ fn copy(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory, input
     if (metadata.size > 64 * 1024 * 1024) return error.FileTooLarge;
     const bytes = try allocator.alloc(u8, @intCast(metadata.size));
     defer allocator.free(bytes);
-    if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.SourceChanged;
+    if (try file.readPositionalAll(io, bytes, 0) != bytes.len or
+        !std.meta.eql(metadata, try fs.metadata(file))) return error.SourceChanged;
     try put(io, directory.dir, destination, bytes, mode);
+}
+
+fn requireOrdinaryCredentials(allocator: std.mem.Allocator, io: std.Io) !void {
+    const account = try env.Account.current(allocator, io);
+    if (account.uid == 0 or linux.getuid() != account.uid or linux.geteuid() != account.uid or
+        linux.getgid() != account.gid or linux.getegid() != account.gid) return error.InvalidFixtureCredentials;
+    var groups: [64]linux.gid_t = undefined;
+    const count = linux.getgroups(groups.len, &groups);
+    if (linux.errno(count) != .SUCCESS) return error.SupplementaryGroupsUnavailable;
+    try requireFixtureGroups(groups[0..count], account.gid);
+    const header: extern struct { version: u32, pid: i32 } = .{ .version = 0x20080522, .pid = 0 };
+    var data = [_]linux.cap_user_data_t{std.mem.zeroes(linux.cap_user_data_t)} ** 2;
+    if (linux.errno(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&data))) != .SUCCESS or
+        !std.mem.allEqual(u8, std.mem.asBytes(&data), 0)) return error.InvalidFixtureCredentials;
+    for (0..64) |cap| {
+        const result = linux.prctl(47, 1, cap, 0, 0); // PR_CAP_AMBIENT_IS_SET
+        if (linux.errno(result) == .INVAL) break;
+        if (linux.errno(result) != .SUCCESS or result != 0) return error.InvalidFixtureCredentials;
+    }
+}
+
+fn requireFixtureGroups(groups: []const linux.gid_t, primary: linux.gid_t) !void {
+    for (groups) |group| if (group != primary) return error.SupplementaryGroupsUnavailable;
+}
+
+fn facadeDirectory(allocator: std.mem.Allocator, io: std.Io, account: env.Account) !fs.Directory {
+    const run_user = try std.fmt.allocPrint(allocator, "/run/user/{d}", .{account.uid});
+    const probe = std.Io.Dir.openDirAbsolute(io, run_user, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (probe) |value| value.close(io);
+    const directory = if (probe != null) try fs.Directory.open(allocator, io, run_user) else null;
+    defer if (directory) |value| value.close(allocator, io);
+    return fs.Directory.open(allocator, io, try std.fmt.allocPrint(allocator, "{s}/unikraft-zig-facade-{d}", .{
+        if (directory != null) run_user else account.home, account.uid,
+    }));
 }
 const NamespaceIds = struct { user: u64, mnt: u64, pid: u64, net: u64 };
 fn namespaceIds(io: std.Io) !NamespaceIds {
@@ -134,8 +188,7 @@ fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_fi
     const metadata = try makeDir(allocator, io, repository, ".git");
     try put(io, metadata.dir, "fixture", "readonly synthetic Git metadata\n", 0o600);
     const account = try env.Account.current(allocator, io);
-    const facade_path = try std.fmt.allocPrint(allocator, "{s}/unikraft-zig-facade-{d}", .{ account.home, account.uid });
-    const facade = try fs.Directory.open(allocator, io, facade_path);
+    const facade = try facadeDirectory(allocator, io, account);
     const lock = try facade.openFile(io, "build.lock", .private);
     const lock_identity = try ns.Identity.of(try std.fs.path.join(allocator, &.{ facade.path, "build.lock" }), lock);
     const environment_record: env.Record = .{
@@ -341,6 +394,147 @@ fn parentDeathRace(allocator: std.mem.Allocator, io: std.Io) !void {
     if (linux.read(report[0], &marker, 1) != 1 or marker[0] != 'D') return error.FixtureFailed;
     for ([_]linux.fd_t{ ready[0], release[1], report[0] }) |fd| _ = linux.close(fd);
     _ = linux.write(1, "parent-death-race-ok\n", "parent-death-race-ok\n".len);
+}
+
+const NamespaceError = enum(u8) {
+    none,
+    namespace_unavailable,
+    mount_namespace_unavailable,
+    other,
+    unavailable,
+    credentials,
+    unsafe_file,
+    unsafe_path,
+    missing_file,
+    source_changed,
+    invalid_runtime,
+    user_namespace_unavailable,
+};
+
+fn namespaceError(err: anyerror) NamespaceError {
+    return switch (err) {
+        error.NamespaceUnavailable => .namespace_unavailable,
+        error.MountNamespaceUnavailable => .mount_namespace_unavailable,
+        error.InvalidFixtureCredentials, error.SupplementaryGroupsUnavailable => .credentials,
+        error.UnsafeFile => .unsafe_file,
+        error.UnsafePath => .unsafe_path,
+        error.FileNotFound => .missing_file,
+        error.SourceChanged => .source_changed,
+        error.InvalidRuntime, error.IncompleteRuntime => .invalid_runtime,
+        error.UserNamespaceUnavailable => .user_namespace_unavailable,
+        else => .other,
+    };
+}
+
+fn readNamespaceError(value: anyerror!ns.Status) !NamespaceError {
+    const status = value catch |err| switch (err) {
+        error.MissingNamespaceStatus => return .unavailable,
+        else => return err,
+    };
+    if (status.primary != .exited or status.cleanup != .complete or status.recording != .complete)
+        return error.InvalidFixtureDiagnostic;
+    return std.enums.fromInt(NamespaceError, status.code) orelse error.InvalidFixtureDiagnostic;
+}
+
+test "namespace CI diagnostics use a bounded side channel not discarded stderr" {
+    try std.testing.expectEqual(NamespaceError.namespace_unavailable, namespaceError(error.NamespaceUnavailable));
+    try std.testing.expectEqual(NamespaceError.mount_namespace_unavailable, namespaceError(error.MountNamespaceUnavailable));
+    try std.testing.expectEqual(NamespaceError.credentials, namespaceError(error.SupplementaryGroupsUnavailable));
+    try std.testing.expectEqual(NamespaceError.user_namespace_unavailable, namespaceError(error.UserNamespaceUnavailable));
+    try std.testing.expectEqual(NamespaceError.unavailable, try readNamespaceError(error.MissingNamespaceStatus));
+    try std.testing.expectEqual(NamespaceError.none, try readNamespaceError(.{ .primary = .exited }));
+    try std.testing.expectError(error.InvalidFixtureDiagnostic, readNamespaceError(.{ .primary = .exited, .code = 255 }));
+    try std.testing.expectError(error.InvalidFixtureDiagnostic, readNamespaceError(.{ .primary = .setup_failed }));
+}
+
+test "namespace CI group prerequisites retain production supplementary group restriction" {
+    try requireFixtureGroups(&.{}, 1000);
+    try requireFixtureGroups(&.{1000}, 1000);
+    try std.testing.expectError(error.SupplementaryGroupsUnavailable, requireFixtureGroups(&.{ 1000, 4 }, 1000));
+    try std.testing.expectError(error.SupplementaryGroupsUnavailable, requireFixtureGroups(&.{999}, 1000));
+}
+
+test "namespace CI baseline crosses native user and mount boundaries" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try requireOrdinaryCredentials(a, io);
+    try c.core.process.initialize();
+    var map = std.process.Environ.Map.init(allocator);
+    defer map.deinit();
+    const base = try fs.Directory.open(allocator, io, options.workspace);
+    defer base.close(allocator, io);
+    defer base.dir.deleteTree(io, "fixture-isolation") catch @panic("native baseline cleanup failed");
+    const status_file = try ns.StatusFile.create();
+    defer status_file.close();
+    const diagnostic = try ns.StatusFile.create();
+    defer diagnostic.close();
+    const arg = try std.fmt.allocPrint(allocator, "{d}", .{status_file.fd});
+    defer allocator.free(arg);
+    const diagnostic_arg = try std.fmt.allocPrint(allocator, "{d}", .{diagnostic.fd});
+    defer allocator.free(diagnostic_arg);
+    var outcome: producer.Outcome = .{ .step = .inspect, .child = try c.core.process.run(allocator, io, .{
+        .argv = &.{ @import("test_options").namespace_fixture, "ci-isolation", arg, diagnostic_arg },
+        .environment = &map,
+        .cwd = base.dir,
+        .deadline = try c.core.process.Deadline.afterMilliseconds(15000),
+        .stdout_limit = 4096,
+        .stderr_limit = 4096,
+    }) };
+    defer outcome.deinit(allocator);
+    const process_cleanup = outcome.child.cleanup_complete;
+    const helper_exit: ?u8 = if (outcome.child.termination) |term|
+        if (term == .exited) term.exited else null
+    else
+        null;
+    const setup_error = try readNamespaceError(diagnostic.read());
+    const status = status_file.read();
+    outcome.namespaceStatus(status);
+    const CopyProof = struct { size: u64, sha256: c.Sha, distinct_physical_copy: bool };
+    var copy_proof: ?CopyProof = null;
+    if (outcome.succeeded()) {
+        const source_path = @import("test_options").namespace_fixture;
+        const source_dir = try fs.Directory.open(a, io, std.fs.path.dirname(source_path).?);
+        defer source_dir.close(a, io);
+        const source_file = try source_dir.openFile(io, std.fs.path.basename(source_path), .executable);
+        defer source_file.close(io);
+        const copied_path = "fixture-isolation/.d/zig-migration-preparation/resume-producer/work/native/fixture";
+        const copied = try base.openFile(io, copied_path, .executable);
+        defer copied.close(io);
+        const original_metadata = try fs.metadata(source_file);
+        const copied_metadata = try fs.metadata(copied);
+        const original_hash = try fs.hashFile(io, source_file, original_metadata.size);
+        const copied_hash = try fs.hashFile(io, copied, copied_metadata.size);
+        try std.testing.expectEqualDeep(original_metadata, try fs.metadata(source_file));
+        try std.testing.expectEqualDeep(copied_metadata, try fs.metadata(copied));
+        try std.testing.expectEqual(original_metadata.size, copied_metadata.size);
+        try std.testing.expectEqualStrings(&original_hash, &copied_hash);
+        const distinct = original_metadata.device != copied_metadata.device or original_metadata.inode != copied_metadata.inode;
+        try std.testing.expect(distinct);
+        copy_proof = .{ .size = copied_metadata.size, .sha256 = copied_hash, .distinct_physical_copy = distinct };
+    }
+    if (@import("test_options").ci_report) |path| {
+        const directory = try fs.openPrivate(io, std.fs.path.dirname(path).?);
+        defer directory.close(io);
+        const bytes = try c.canonical(a, .{
+            .schema = "hyperv_preparation_namespace_ci_baseline_v1",
+            .authority = "synthetic_only",
+            .namespace_error = setup_error,
+            .helper_exit = helper_exit,
+            .process_cleanup_complete = process_cleanup,
+            .namespace_succeeded = outcome.succeeded(),
+            .failures = outcome.child.failures,
+            .runtime_copy = copy_proof,
+        });
+        const report = try directory.dir.createFile(io, std.fs.path.basename(path), .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer report.close(io);
+        try report.writeStreamingAll(io, bytes);
+        try report.sync(io);
+    }
+    try std.testing.expect(outcome.succeeded());
+    try std.testing.expectEqualStrings("namespace-isolation-ok\n", outcome.child.stdout);
 }
 
 test "namespace native dynamic isolation, nonzero status, deadline and detached cleanup" {
@@ -767,7 +961,7 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
     const payload = try tool(allocator, io, payload_dir, "fixture", false);
     const git = try publicGit(allocator, io, workspace);
     const account = try env.Account.current(allocator, io);
-    const facade = try fs.Directory.open(allocator, io, try std.fmt.allocPrint(allocator, "{s}/unikraft-zig-facade-{d}", .{ account.home, account.uid }));
+    const facade = try facadeDirectory(allocator, io, account);
     const lock = try facade.openFile(io, "build.lock", .private);
     const lock_identity = try ns.Identity.of(try std.fs.path.join(allocator, &.{ facade.path, "build.lock" }), lock);
     const record: env.Record = .{
