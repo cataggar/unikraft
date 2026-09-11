@@ -24,8 +24,36 @@ pub const Power = enum { running, deallocated };
 pub const VmAction = struct { vm: s.Ref, original_uuid: s.Uuid };
 pub const DiskIdentity = struct { disk: s.Ref, original_uuid: s.Uuid, geometry: contracts.Geometry };
 pub const Grant = struct { identity: DiskIdentity, seconds: u32 };
-pub const Disk = struct { name: []const u8, size_gib: u32, upload_bytes: ?u64 = null };
-pub const Vm = struct { name: []const u8, os_disk: DiskIdentity, nic: s.Ref, size: []const u8, data_disk: ?DiskIdentity = null };
+pub const Disk = struct {
+    name: []const u8,
+    size_gib: u32,
+    upload_bytes: ?u64 = null,
+    linux_gen2: bool = false,
+    pub fn logicalBytes(self: Disk) u64 {
+        return if (self.upload_bytes) |bytes| bytes - 512 else @as(u64, self.size_gib) * 1024 * 1024 * 1024;
+    }
+};
+pub const Vm = struct {
+    name: []const u8,
+    os_disk: DiskIdentity,
+    nic: s.Ref,
+    size: []const u8,
+    data_disk: ?DiskIdentity = null,
+    persistence_envelope: bool = false,
+};
+pub const PersistenceNetwork = struct {
+    prefix: []const u8,
+    kind: enum { nsg, vnet, nic },
+    pub fn ref(self: PersistenceNetwork, a: std.mem.Allocator) !s.Ref {
+        try s.name(self.prefix);
+        if (self.prefix.len < 6 or self.prefix.len > 32) return error.InvalidNetwork;
+        return .{ .kind = switch (self.kind) {
+            .nsg => .nsg,
+            .vnet => .vnet,
+            .nic => .nic,
+        }, .name = try std.fmt.allocPrint(a, "{s}-{s}", .{ self.prefix, @tagName(self.kind) }) };
+    }
+};
 pub const Storage = struct { name: []const u8 };
 pub const Resource = union(enum) { disk: Disk, vm: Vm, storage: Storage };
 pub const Deployment = struct { name: []const u8, resources: []const Resource };
@@ -56,6 +84,7 @@ pub const Operation = union(enum) {
     group_delete,
     deploy: Deployment,
     disk_create: Disk,
+    persistence_network: PersistenceNetwork,
     grant: Grant,
     revoke: DiskIdentity,
     deallocate: VmAction,
@@ -69,7 +98,7 @@ pub const Operation = union(enum) {
 
     pub fn isMutation(self: Operation) bool {
         return switch (self) {
-            .group_create, .group_delete, .deploy, .disk_create, .grant, .revoke, .deallocate, .start, .firewall, .regenerate_key, .schedule_put, .schedule_delete => true,
+            .group_create, .group_delete, .deploy, .disk_create, .persistence_network, .grant, .revoke, .deallocate, .start, .firewall, .regenerate_key, .schedule_put, .schedule_delete => true,
             else => false,
         };
     }
@@ -177,6 +206,11 @@ pub const Plan = struct {
             .disk_create => |disk| {
                 try plan.resource(a, authority, .{ .kind = .disk, .name = disk.name }, "");
                 plan.body = try diskBody(a, authority, disk, false);
+                plan.method = .PUT;
+            },
+            .persistence_network => |network| {
+                try plan.resource(a, authority, try network.ref(a), "");
+                plan.body = try persistenceNetworkBody(a, authority, network);
                 plan.method = .PUT;
             },
             .grant => |grant| {
@@ -317,7 +351,7 @@ fn resourceBody(a: std.mem.Allocator, authority: s.Authority, resource: Resource
 fn diskBody(a: std.mem.Allocator, authority: s.Authority, disk: Disk, deployment: bool) ![]u8 {
     try s.name(disk.name);
     if (disk.size_gib == 0 or disk.size_gib > 32) return error.InvalidGeometry;
-    if (disk.upload_bytes) |bytes| if (bytes != @as(u64, disk.size_gib) * 1024 * 1024 * 1024 + 512) return error.InvalidGeometry;
+    if (disk.upload_bytes) |bytes| try uploadGeometry(disk.size_gib, bytes);
     const value = .{
         .type = if (deployment) @as(?[]const u8, "Microsoft.Compute/disks") else null,
         .apiVersion = if (deployment) @as(?[]const u8, s.Kind.disk.version()) else null,
@@ -325,7 +359,7 @@ fn diskBody(a: std.mem.Allocator, authority: s.Authority, disk: Disk, deployment
         .location = authority.location,
         .tags = ownerTags(authority),
         .sku = .{ .name = "StandardSSD_LRS" },
-        .properties = .{ .diskSizeGB = disk.size_gib, .logicalSectorSize = @as(u16, 512), .creationData = .{
+        .properties = .{ .diskSizeGB = disk.size_gib, .logicalSectorSize = @as(u16, 512), .osType = if (disk.linux_gen2) @as(?[]const u8, "Linux") else null, .hyperVGeneration = if (disk.linux_gen2) @as(?[]const u8, "V2") else null, .creationData = .{
             .createOption = if (disk.upload_bytes != null) "Upload" else "Empty",
             .uploadSizeBytes = disk.upload_bytes,
         } },
@@ -337,15 +371,25 @@ fn vmBody(a: std.mem.Allocator, authority: s.Authority, vm: Vm) ![]u8 {
     try s.name(vm.size);
     try diskIdentity(a, authority, vm.os_disk);
     try requireKind(vm.nic, .nic);
-    const DataDisk = struct { lun: u8, createOption: []const u8, caching: []const u8, managedDisk: struct { id: []const u8 } };
+    if (vm.persistence_envelope and (vm.data_disk == null or !std.mem.eql(u8, vm.size, "Standard_D2s_v5")))
+        return error.InvalidGeometry;
+    const DataDisk = struct {
+        lun: u8,
+        createOption: []const u8,
+        caching: []const u8,
+        managedDisk: struct { id: []const u8 },
+        name: ?[]const u8 = null,
+        deleteOption: ?[]const u8 = null,
+        writeAcceleratorEnabled: ?bool = null,
+    };
     var disks: [1]DataDisk = undefined;
     if (vm.data_disk) |disk| {
         try diskIdentity(a, authority, disk);
         if (std.ascii.eqlIgnoreCase(disk.disk.name, vm.os_disk.disk.name) or try disk.geometry.byteSize() != 4 * 1024 * 1024 * 1024)
             return error.InvalidGeometry;
-        disks[0] = .{ .lun = 7, .createOption = "Attach", .caching = "None", .managedDisk = .{ .id = try disk.disk.path(a, authority) } };
+        disks[0] = .{ .lun = 7, .createOption = "Attach", .caching = "None", .managedDisk = .{ .id = try disk.disk.path(a, authority) }, .name = if (vm.persistence_envelope) disk.disk.name else null, .deleteOption = if (vm.persistence_envelope) "Detach" else null, .writeAcceleratorEnabled = if (vm.persistence_envelope) false else null };
     }
-    return encode(a, .{
+    return std.json.Stringify.valueAlloc(a, .{
         .type = "Microsoft.Compute/virtualMachines",
         .apiVersion = s.Kind.vm.version(),
         .name = vm.name,
@@ -355,13 +399,44 @@ fn vmBody(a: std.mem.Allocator, authority: s.Authority, vm: Vm) ![]u8 {
             .hardwareProfile = .{ .vmSize = vm.size },
             .securityProfile = .{ .securityType = "Standard" },
             .storageProfile = .{
-                .osDisk = .{ .createOption = "Attach", .osType = "Linux", .caching = "None", .managedDisk = .{ .id = try vm.os_disk.disk.path(a, authority) } },
+                .osDisk = .{ .createOption = "Attach", .osType = "Linux", .caching = if (vm.persistence_envelope) @as([]const u8, "ReadOnly") else "None", .name = if (vm.persistence_envelope) @as(?[]const u8, vm.os_disk.disk.name) else null, .deleteOption = if (vm.persistence_envelope) @as(?[]const u8, "Detach") else null, .managedDisk = .{ .id = try vm.os_disk.disk.path(a, authority) } },
                 .dataDisks = disks[0..@as(usize, if (vm.data_disk != null) 1 else 0)],
             },
-            .networkProfile = .{ .networkInterfaces = &.{.{ .id = try vm.nic.path(a, authority) }} },
+            .networkProfile = .{ .networkInterfaces = &.{.{ .id = try vm.nic.path(a, authority), .properties = if (vm.persistence_envelope) @as(?struct { primary: bool, deleteOption: []const u8 }, .{ .primary = true, .deleteOption = "Delete" }) else null }} },
             .diagnosticsProfile = .{ .bootDiagnostics = .{ .enabled = true } },
         },
-    });
+    }, .{ .emit_null_optional_fields = false });
+}
+
+pub fn uploadGeometry(size_gib: u32, bytes: u64) !void {
+    const mib = 1024 * 1024;
+    const gib = 1024 * mib;
+    if (size_gib == 0 or size_gib > 32 or bytes <= 512 or (bytes - 512) % mib != 0 or
+        (bytes - 512 - 1) / gib + 1 != size_gib) return error.InvalidGeometry;
+}
+
+fn persistenceNetworkBody(a: std.mem.Allocator, authority: s.Authority, network: PersistenceNetwork) ![]u8 {
+    const nsg: s.Ref = .{ .kind = .nsg, .name = try std.fmt.allocPrint(a, "{s}-nsg", .{network.prefix}) };
+    const subnet: s.Ref = .{ .kind = .subnet, .parent = try std.fmt.allocPrint(a, "{s}-vnet", .{network.prefix}), .name = "default" };
+    return switch (network.kind) {
+        .nsg => encode(a, .{ .location = authority.location, .tags = ownerTags(authority), .properties = .{ .securityRules = &[_]struct {}{} } }),
+        .vnet => encode(a, .{ .location = authority.location, .tags = ownerTags(authority), .properties = .{
+            .addressSpace = .{ .addressPrefixes = &.{"10.79.0.0/29"} },
+            .subnets = &.{.{ .name = "default", .properties = .{
+                .addressPrefix = "10.79.0.0/29",
+                .defaultOutboundAccess = false,
+                .networkSecurityGroup = .{ .id = try nsg.path(a, authority) },
+            } }},
+        } }),
+        .nic => encode(a, .{ .location = authority.location, .tags = ownerTags(authority), .properties = .{
+            .enableAcceleratedNetworking = false,
+            .enableIPForwarding = false,
+            .ipConfigurations = &.{.{ .name = "primary", .properties = .{
+                .privateIPAllocationMethod = "Dynamic",
+                .subnet = .{ .id = try subnet.path(a, authority) },
+            } }},
+        } }),
+    };
 }
 fn storageBody(a: std.mem.Allocator, authority: s.Authority, storage: Storage) ![]u8 {
     _ = try (s.Ref{ .kind = .storage, .name = storage.name }).path(a, authority);
