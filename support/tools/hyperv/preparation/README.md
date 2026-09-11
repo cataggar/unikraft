@@ -1,8 +1,8 @@
-# Native local preparation, version 0.4.1
+# Native local preparation, version 0.5.0
 
 This package implements the local #120/#89 preparation boundary: strict native
 contracts, physical source/tool provenance, guarded configuration, synthetic
-storage formats, pinned miz packaging, version-2 VHD-inclusive staging, a
+storage formats, pinned miz packaging, version-3 VHD-inclusive staging, a
 read-only engine-entry loader, and an executing native Linux namespace worker.
 It does **not** admit cloud authority, host images, operator credentials,
 completed preflight, persistence acceptance, or historical evidence.
@@ -27,14 +27,15 @@ or failure-message recovery is implemented.
 
 Use installed Zig 0.16.0, never the repository root build. Put all caches,
 outputs and temporary directories under an explicit fresh preparation scratch.
-The existing dependency cache may be read with `--system`; restore only after a
-manifest change or missing-dependency failure, using copied manifests and
-`--fetch=all -j2` in scratch, never beside source.
+The existing dependency cache is read-only through `--system`. These focused
+commands do not authorize dependency restoration or real evidence acquisition.
 
 ```sh
-cd /d/unikraft-worktrees/fleet-ci
+cd /d/unikraft-worktrees/fleet-origin
 umask 077
-scratch="$PWD/.d/zig-migration-preparation/control-cap-8mib"
+scratch="$PWD/.d/zig-migration-origin-repair/focused-example"
+test ! -e "$scratch"
+mkdir -p "$scratch"/{tmp,home,cache,config,global,local,work}
 proof_fixture="$PWD"
 export TMPDIR="$scratch/tmp" HOME="$scratch/home"
 export XDG_CACHE_HOME="$scratch/cache"
@@ -54,7 +55,7 @@ git_fixture=(
 )
 cd "$scratch/work"
 /home/g/.local/bin/zig build \
-  --build-file /d/unikraft-worktrees/fleet-ci/support/tools/hyperv/preparation/build.zig \
+  --build-file /d/unikraft-worktrees/fleet-origin/support/tools/hyperv/preparation/build.zig \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
   -Dproof-fixture="$proof_fixture" \
   --prefix "$scratch/outputs/debug" "${git_fixture[@]}" \
@@ -90,7 +91,7 @@ The separate existing-runner namespace fixture build uses:
 
 ```sh
 /home/g/.local/bin/zig build \
-  --build-file /d/unikraft-worktrees/fleet-ci/support/tools/hyperv/preparation/namespace/build.zig \
+  --build-file /d/unikraft-worktrees/fleet-origin/support/tools/hyperv/preparation/namespace/build.zig \
   --cache-dir "$scratch/ns-local" \
   --global-cache-dir "$scratch/ns-global" \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
@@ -127,7 +128,7 @@ still compiles the real namespace helper whose path is baked into the fixture.
 For example, after creating private cache/workspace directories:
 
 ```sh
-cd /d/unikraft-worktrees/fleet-ci
+cd /d/unikraft-worktrees/fleet-origin
 /home/g/.local/bin/zig build \
   --build-file support/tools/hyperv/preparation/namespace/build.zig \
   --cache-dir "$scratch/ns-release-cache" --prefix "$scratch/ns-release-fixture" \
@@ -206,29 +207,29 @@ execution remains a separate parent-owned CI gate.
 Canonical JSON has sorted keys, exact fields/types and one final LF, included
 in document hashes. Duplicate/unknown/missing fields, noncanonical encodings,
 floating/exponent integers and unknown enums are rejected. Generic document
-bounds are 4 MiB, depth 32, 4096 items and 65536 tokens.
+bounds are 4 MiB, depth 32, 4096 items, 65536 tokens and 8192-byte strings.
 
 | Type | Schema and exact fields |
 | --- | --- |
-| `provenance.Record` | `hyperv_native_producer_provenance_v1`: `schema,source,host_target,guest_target,compiler_version,producer,compiler,git,dependencies,trust` |
-| `producer.Binding` | `hyperv_local_native_producer_binding_v3`: `schema,source,repository,workspace,output,scratch,config,path,native,git,packages,bison_data,trust,trust_bundle,native_execution,native_proof,isolation` |
+| `provenance.Record` | `hyperv_native_producer_provenance_v2`: `schema,source,host_target,guest_target,compiler_version,producer,compiler,git,dependencies,trust` |
+| `producer.Binding` | `hyperv_local_native_producer_binding_v4`: `schema,source,repository,workspace,output,scratch,config,path,native,git,packages,bison_data,trust,trust_bundle,native_execution,native_proof,isolation` |
 | `producer.NativeProof` | `hyperv_native_elf_proofs_v2`: `schema,source_sha256,root_build,builder,tool,modes` |
-| `receipts.Receipt` | `hyperv_artifact_preparation_native_v1`: `schema,phase,purpose,run_id,guard,source_before,source_after,provenance,reviewed_provenance_sha256,config_before,config_after,parent_sha256,execution,efi,packaging,authority` |
-| `inputs.SelectionV2` (`Plan`) | `hyperv_native_input_selection_v2`: `schema,packaged_receipt_sha256,solved_metadata,publication,capability_source,capability_receipt,qemu,assets` |
-| `inputs.PreparedInputV2` (`Input`) | `hyperv_native_prepared_input_v2`: `schema,state,authority,receipt,reviewed_selection_sha256,selection,ledger,budget` |
-| `inputs.Capability` | `hyperv_public_capability_artifact_native_v1`: `schema,image,provenance,reviewed_provenance_sha256,authority` |
+| `receipts.Receipt` | `hyperv_artifact_preparation_native_v2`: `schema,phase,purpose,run_id,guard,source_before,source_after,provenance,reviewed_provenance_sha256,config_before,config_after,parent_sha256,execution,efi,packaging,authority` |
+| `inputs.SelectionV3` (`Plan`) | `hyperv_native_input_selection_v3`: `schema,packaged_receipt_sha256,solved_metadata,publication,capability_source,capability_receipt,qemu,firmware_origins,assets` |
+| `inputs.PreparedInputV3` (`Input`) | `hyperv_native_prepared_input_v3`: `schema,state,authority,receipt,reviewed_selection_sha256,selection,ledger,budget` |
+| `inputs.Capability` | `hyperv_public_capability_artifact_native_v2`: `schema,image,provenance,reviewed_provenance_sha256,authority` |
 
-Input/selection v1 are **not reinterpreted or accepted** by v2. The existing
-build-receipt schema is retained, not replaced with a weaker engine receipt.
+Earlier Origin, provenance, producer-binding, receipt, capability, input and
+selection epochs are **rejected, never upgraded or reinterpreted**.
 `state` is exactly `prepared`; `authority` is exactly `not_admitted`.
-Producer binding v3 requires separately bound Make and Git policy files;
-binding-v2 documents are rejected rather than silently upgraded.
+Producer binding v4 retains separately bound Make and Git policy files.
 Native proof v2 replaces the obsolete three-direct-source representation:
 `builder` is `support/build/hyperv-proof-build.zig`, `tool` is
 `support/build/hyperv-proof-tool.zig`, and `modes` is exactly
-`["smp","irq","drivers"]`. Proof-v1 records are rejected. Outer producer
-binding v3, input/selection v2 and the existing build-receipt version remain
-unchanged.
+`["smp","irq","drivers"]`. Proof-v1 records are rejected. NativeProof v2,
+Make/Git environment schemas, namespace status bytes, host wire and budgets
+are unchanged. The typed namespace request is now
+`uk.native-preparation-namespace.v2`, not a status-format change.
 
 `File = {path,sha256,size,mode}`. `Sha` is **64 lowercase ASCII hex bytes**;
 `admission.rawHash` explicitly converts it into core's **32 raw hash bytes**.
@@ -242,6 +243,134 @@ Canonical parent hashes, stable source/guard/provenance, successful execution
 and cleanup, config continuity and packaging continuity are required.
 An `Execution` is `{step,exit_code,cleanup_complete,admitted_binding_sha256}`.
 These local states are never completed/accepted states.
+
+## Origin v2: identities, witnesses and independent review
+
+`runtime.Tool` has exact fields
+`role,origin,target,tree,executable,loader,libraries,evidence`. Evidence is a
+separate array of held-set bindings, not a Tool claiming an origin for its own
+catalog. Executable, ELF/SONAME/interpreter/RPATH, complete inventory, native
+target, exact Git file set and actual running-inode checks still apply.
+
+`Origin = {schema:"hyperv_runtime_origin_v2",payload}`. Payload is exactly one
+recognized tag with its exact non-null payload:
+
+| Tag | Payload and digest meanings |
+| --- | --- |
+| `local_build` | `{source_revision,source_physical_sha256,compiler_executable_sha256}`: current reviewed Git HEAD, actual current physical source snapshot, actual selected compiler executable bytes |
+| `distribution` | `{runtime_revision,evidence_set_sha256,components}`: principal runtime version, canonical `Set` commitment, components `{artifact_id,selected_tree,scope}` |
+| `zig_packages` | `{packages}`: each `{package_hash,locator,revision,declaration,selected_tree,scope}` identifies dependency data, not a prebuilt compiler or firmware |
+
+No recipe/archive/tree digest can stand in for a compiler executable digest.
+Actual local actor and same-source static namespace helper require
+`local_build` at their consuming call sites; distribution cannot bypass those
+relations. Utilities also use `role=preparation`, so that role does **not**
+impose local-build or static-only requirements on utilities. Prebuilt Zig must
+be a native executable distribution at runtime revision `0.16.0`.
+Bison data, CA bundles and firmware use data distributions, never package-data
+disguises. The miz hash/revision pins remain immutable.
+
+Scope is `{"whole":{}}` (one component/package only), or
+`{"selected":[{"file":"relative/path"},{"subtree":"relative/directory"}]}`.
+Selectors must resolve within the held root, contain no escapes, overlaps,
+gaps or extras, and cover **every selected file exactly once**, including
+DSOs and non-ELF support. `selected_tree` uses the existing
+`hyperv-native-tree-v1` encoding, directory modes and relative selected paths,
+not an artifact digest. A singleton package's tree is relative to its hash
+root; aggregate scopes retain the hash-basename prefix.
+Compact unchanged tree maps cover 19,546 Zig files without embedding a
+19,546-item JSON array or raising any parser/document limit.
+
+Each evidence `Binding` is
+`{directory,set,physical_sha256,policy}`; `directory` is
+`{path,device,inode,mode,uid}`, `set` is `{tree,catalog:File}`.
+`physical_sha256` commits every physical file/directory's metadata and file
+bytes using `hyperv-native-physical-v1`. `distribution.evidence_set_sha256`
+hashes the complete canonical `set`. Source and runtime directories must be
+separate from evidence roots, including Git's exact root and CA data.
+The immutable catalog has
+`schema:"hyperv_runtime_origin_evidence_v1",artifacts`, with artifacts
+`{id,subject,authentication,realizations}`. A subject is
+`{publisher,repository,asset_id,locator,revision,artifact_sha256}`.
+Artifact SHA means the original acquired package/release artifact only.
+
+Authentication is the independently selected **existing publisher assurance**:
+
+* `pinned_key_signature`: exact subject, `key_id`, detached `signature:File`
+  and `verification:File`.
+* `publisher_https_sha256`: exact subject, retained raw `metadata:File`,
+  `metadata_url`, and `acquisition:File`. This is HTTPS publisher/channel
+  metadata plus SHA256, **not an independent package signature**.
+* `signed_repository_metadata`: exact subject, independently approved
+  `key_id`, retained `metadata:File`, `index:File` and `verification:File`.
+
+The exact policy per artifact is
+`{artifact_id,authority,authentication_sha256,realization_verification_sha256}`.
+`authority` is the same closed method tag with expected publisher/repository,
+and key ID for signed methods. It comes from the separate independent runtime
+review, not from an artifact choosing its method. The authentication hash
+commits the entire typed witness. Each realization verification digest is
+independently approved in catalog order. Unknown/mismatched authorities,
+methods, keys, absent witnesses and failure-to-absence downgrades fail closed.
+Transported `Tool.evidence[].policy` is not itself approval: bootstrap compares
+it against the **separately supplied** review, then remeasures the entire
+material before the first supplied Git/loader invocation.
+
+`hyperv_origin_signature_verification_v1` binds `subject_sha256`,
+`signed_bytes_sha256`, `key_id` and `verifier`.
+`hyperv_origin_https_acquisition_v1` binds `subject_sha256`, raw
+`metadata_sha256`, URL, TLS peer name/certificate SHA256, acquisition time and
+retained transport-evidence file.
+`Verifier = {name,version,executable_sha256,transcript:File}`.
+All referenced physical files must exist and match. Raw metadata is retained
+verbatim, not replaced with a rendered excerpt. Independent review establishes
+authentication of these **actual witnesses**. Parsing/hashing them is not a
+new cryptographic verifier, network client, PKI or trust service. Installer
+flags, arbitrary booleans and self-declared success never grant trust.
+
+Realization is `{payload,verification:File}`. The closed payload is either:
+
+* `unchanged_extraction {artifact_sha256,selected_tree,maps}`. Maps are
+  `file {member:File,destination:File}` with identical sizes/hashes/modes, or
+  `tree {member_prefix,destination_prefix,tree}` with the complete unchanged
+  canonical tree. Empty prefixes denote the root.
+* `declared_prefix_relocation {artifact_sha256,selected_tree,declaration:File,
+  declaration_member,unchanged,relocated}`. Only authenticated
+  `info/paths.json`, paths version 1 and hardlink entries are supported.
+  Every relocated record binds original member and retained original file,
+  exact installed destination, placeholder, `binary|text` mode and installed
+  prefix. Original SHA256/size, declaration mode/placeholder and result
+  bytes/size/mode must agree. Unix binary replacement shortens each complete
+  NUL-terminated string and appends the aggregate shortening as NUL padding;
+  an oversized replacement or unterminated match is rejected. Text mode is
+  literal byte replacement. Hooks, arbitrary transforms, Windows relocation
+  and special shebang rewriting are not supported.
+
+`hyperv_origin_archive_verification_v1` binds original artifact SHA256,
+canonical `realization_payload_sha256` and actual verifier/transcript evidence.
+Out-of-band archive membership is accepted only through that retained,
+independently approved proof—not a mutable mapping or caller success claim.
+Native relocation comparison executes no installer hooks.
+
+Package declarations bind `{directory,file,entry}`: an actual
+`build.zig.zon` in the selected source or another selected package, its exact
+file bytes and named dependency entry. Native bounded ZON AST/token parsing
+checks literal URL/hash/lazy declarations without executing a manifest or root
+build. Revision is explicitly `git_commit` (full commit) or `archive_selector`
+(possibly short, such as progrez's `7d70ce8`); Zig keys are never decoded as
+upstream SHA256. Singleton/aggregate lists, hash basenames, declarations,
+locators and complete dependency bindings must agree.
+
+Firmware selection carries mandatory named `firmware_origins.code` and
+`.vars` mappings `{asset_id,directory,physical_sha256,tool,member}`. Creation, generation and
+read-only admission bind exact asset files to held physical data roots and
+origins. Every support/evidence file required for admission must have a staged,
+physically matching charged control asset. No outside-host exception exists;
+all six firmware working copies and both existing budget caps remain intact.
+
+See [integration/README.md](integration/README.md) for the mandatory
+pure-measure → external runtime review → bootstrap CLI boundary and the
+additional independent complete provenance/build/selection/import reviews.
 
 ## Accounting and immutable publication
 
@@ -294,8 +423,8 @@ Its size must actually cover the canonical input document.
 Fresh ledgers reserve the remaining allowance under the approved 8 MiB policy.
 An older prepared-input ledger reserving only the former allowance does not
 match current recomputation. It is rejected, not silently upgraded or rewritten;
-historical receipts and evidence remain untouched. Wire schema versions and
-document-size bounds are unchanged.
+historical receipts and evidence remain untouched. The cap-only change did not
+alter document limits; the current Origin schema epoch is specified above.
 
 `inputs.generate` only creates a fresh directory containing its existing writer
 lock. It validates config, package, capability, QEMU and physical assets, copies
@@ -352,7 +481,7 @@ Git proxy is exposed. The separate #87 networking workflow is not rewritten.
 
 `Inputs.isolation.environment`, `.make_environment` and `.git_policy` are
 private `File` bindings. The latter two are nullable only in the generic
-namespace mechanism; v3 producer/admission entry requires both. All original
+namespace mechanism; v4 producer/admission entry requires both. All original
 workspace paths remain read-only inside the namespace, including the Git policy
 also mounted at its fixed `/etc` path. The helper's source/compiler commitments
 must match the producer source and selected compiler.
@@ -550,7 +679,9 @@ parent hard process deadline remains mandatory. Actual runs of the parameterized
 fixtures on other native architectures and full integrated producer execution remain necessary;
 neither the migration nor cloud admission is complete.
 
-The cap update passes **80/80 preparation cases** (10/10 build steps) in both
+### Earlier cap/bridge execution record (historical)
+
+The cap update passed **80/80 preparation cases** (10/10 build steps) in both
 Debug and ReleaseSafe under umask 077, with no skipped cases. New cases cover
 physical producer/baked copies and publication reservation above the former cap,
 exact 8 MiB/256 MiB boundaries, one-byte overruns and refusal to reinterpret an
@@ -584,3 +715,71 @@ unmeasured engine/dependency/publication inputs when obtaining the 8 MiB
 approval. Neither partial measurement proves the integrated ledger fits.
 All selected operator, dependency, guard, publication, image-baked and other
 control copies still require measurement and charging inside both caps.
+
+### Origin repair execution record, 2026-09-11
+
+On the AArch64 owned `fleet-origin` worktree, Zig 0.16.0 focused runs passed
+**92/92 preparation, 19/19 namespace and 18/18 integration fixtures in each
+of Debug and ReleaseSafe**, without skips. Build-step totals were 10/10,
+11/11 and 8/8 respectively. The 5-second Git timeout/readiness assertion,
+ordinary fixture credentials, actual passwd HOME and canonical facade/lock
+device/inode/ownership/modes were retained. No AppArmor/credential changes,
+acquisition, dependency restore or full producer/Make/guest execution occurred.
+
+Exact command wrappers, environment, complete six logs, all twelve installed
+component sizes/SHA256s and before/after identity records are retained under:
+
+```text
+/d/unikraft-worktrees/fleet-origin/.d/zig-migration-origin-repair/run-20260911-1/
+  environment.sh
+  focused.sh
+  {preparation,namespace,integration}-{debug,safe}.log
+  installed-components.txt
+  installed-components.sha256
+  physical-before.txt
+  physical-after.txt
+```
+
+The six commands were `bash .../focused.sh SUITE MODE`, with `SUITE=prep,ns,int`
+and `MODE=Debug,ReleaseSafe`. The wrapper uses the build files in this package,
+`test install -j2 -Doptimize=MODE --summary all`, explicit per-suite caches/
+prefixes below that fresh root, and the **read-only**
+`/d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg`
+via `--system`. Preparation and namespace use the exact public Git options
+listed above; preparation supplies `-Dproof-fixture=/d/unikraft-worktrees/fleet-origin`
+and namespace supplies `-Dworkspace=R/ns-{debug,safe}`. Integration has no
+fixture Git option or supplied-tool execution.
+
+Measured installed executable bytes (not a ledger):
+
+| Installation | Executable | Debug | ReleaseSafe |
+| --- | --- | ---: | ---: |
+| preparation | `uk-hyperv-prepare` | 8,716,624 | 1,139,000 |
+| preparation | `preparation-namespace` | 7,564,984 | 926,920 |
+| integration | `uk-hyperv-prepare-integration` | 12,866,576 | 2,228,192 |
+| integration | `preparation-namespace` | 7,564,984 | 926,920 |
+| namespace fixtures | `preparation-namespace` | 7,564,984 | 6,584,672 |
+| namespace fixtures | `preparation-namespace-fixture` | 7,455,192 | 6,555,776 |
+
+The namespace fixture build retains its existing unstripped output policy.
+Its files are not substitutes for the stripped production helper. The current
+ReleaseSafe integration driver/helper pair is **3,155,112 bytes**, not the
+historical 2,598,000-byte pair and not evidence of complete controller fit.
+Every additional control, support/evidence file and physical copy remains
+chargeable under the unchanged 8 MiB/256 MiB caps.
+
+The new witnesses in focused tests are **explicitly synthetic**. None
+authenticates actual installed Zig/LLVM/conda/Ubuntu/firmware material.
+Real remaining gates: retained approved Zig archive/member realization plus
+actual signature-verification evidence under its existing pinned key; LLVM's
+matching retained archive/GitHub asset digest with approved retained HTTPS
+acquisition and member proof (not a package signature); all nine conda package
+hashes' channel HTTPS context, original archives/authenticated `info/paths.json`
+and actual relocation evidence/replay for Git/Bison/Flex/M4/libcrypto.
+The 38 matching local records and five declared binary prefix changes are
+observations, not authentication or replay. Ubuntu's existing-key approval,
+native OpenPGP verifier and verified signed-index/member chain remain material
+gates. Firmware, complete native utility closure (including native `which`),
+public capability artifacts, fresh actual source/compiler/build reviews and
+all new independent runtime/provenance/selection/import commitments remain
+unsupplied. Historical upstream compiler manufacture is not a gate.

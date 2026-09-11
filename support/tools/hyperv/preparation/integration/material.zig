@@ -12,6 +12,7 @@ pub fn bundle(world: *x.World, workspace: fs.Directory, expected: ?x.Sha) !struc
     try p.producer.validateBindingStructure(world.allocator, result.value.binding);
     try p.source.require(result.value.binding.source, result.value.provenance.source);
     try result.value.binding.workspace.require(try x.ns.Identity.directory(workspace));
+    try @import("runtime_material.zig").requireBundle(world, workspace, result.value);
     return .{ .value = result.value, .sha256 = result.sha256 };
 }
 
@@ -24,7 +25,7 @@ fn actor(world: *x.World, directory: []const u8, executable: []const u8, source:
         .libraries = &.{},
         .role = .preparation,
         .target = compiler.contract.target,
-        .origin = .{ .scheme = .git, .revision = source.head, .source_sha256 = source.physical.sha256, .producer_sha256 = compiler_executable.sha256 },
+        .origin = .{ .payload = .{ .local_build = .{ .source_revision = source.head, .source_physical_sha256 = source.physical.sha256, .compiler_executable_sha256 = compiler_executable.sha256 } } },
     });
 }
 
@@ -32,6 +33,7 @@ pub fn bootstrap(world: *x.World, workspace: fs.Directory) !c.File {
     const state = try world.state(workspace);
     var lock = try state.lock(world.io);
     defer lock.close(world.io);
+    try @import("runtime_material.zig").approve(world, workspace);
     const requests = try world.child(workspace, "requests");
     _ = try world.state(requests);
     const spec = (try world.read(x.Spec, requests, "bootstrap.json", null)).value;
@@ -44,7 +46,7 @@ pub fn bootstrap(world: *x.World, workspace: fs.Directory) !c.File {
     const repository = try world.open(spec.repository);
     const prefix = try std.fs.path.join(world.allocator, &.{ repository.path, ".d/zig-migration-preparation/" });
     if (!std.mem.startsWith(u8, workspace.path, prefix)) return error.UnsafePath;
-    for ([_][]const u8{ "controls", "reviews", "reserved-controls", "output", "scratch", "receipts", "package", "staging" }) |name|
+    for ([_][]const u8{ "reserved-controls", "output", "scratch", "receipts", "package", "staging" }) |name|
         try workspace.dir.createDir(world.io, name, .fromMode(0o700));
     const scratch = try world.child(workspace, "scratch");
     for ([_][]const u8{ "home", "tmp", "cache", "config", "zig-local", "zig-global", "disabled-git-exec", "disabled-openssl" }) |name|
@@ -80,6 +82,7 @@ pub fn bootstrap(world: *x.World, workspace: fs.Directory) !c.File {
     const zig = compiler orelse return error.MissingCompiler;
     const git_runtime = try world.tool(spec.git);
     const git = try world.git(git_runtime, scratch.path);
+    try @import("runtime_material.zig").approve(world, workspace);
     const source = p.source.inspect(git, repository) catch |err| {
         try world.merge(git.failures);
         return err;
@@ -112,7 +115,7 @@ pub fn bootstrap(world: *x.World, workspace: fs.Directory) !c.File {
         location.* = .{ .name = item.name, .directory = directory.path };
     }
     const provenance: p.provenance.Record = .{
-        .schema = .hyperv_native_producer_provenance_v1,
+        .schema = .hyperv_native_producer_provenance_v2,
         .source = source,
         .host_target = switch (self.contract.target) {
             .aarch64_linux => .aarch64_linux,
@@ -198,7 +201,7 @@ pub fn bootstrap(world: *x.World, workspace: fs.Directory) !c.File {
     try x.ns.validate(world.allocator, world.io, inputs.isolation.?, repository, workspace);
     try p.producer.requireNativeProofFiles(world.allocator, world.io, repository, source, inputs.native_proof);
     const output: x.Bundle = .{
-        .schema = .hyperv_native_integration_material_v1,
+        .schema = .hyperv_native_integration_material_v2,
         .authority = .not_admitted,
         .guard = spec.guard,
         .provenance = provenance,
@@ -244,7 +247,7 @@ pub fn stage(world: *x.World, workspace: fs.Directory, phase: @FieldType(x.Stage
         break :blk execution.config;
     };
     const value: x.Stage = .{
-        .schema = .hyperv_native_integration_stage_v1,
+        .schema = .hyperv_native_integration_stage_v2,
         .authority = .not_admitted,
         .phase = phase,
         .bootstrap_sha256 = base.sha256,

@@ -1,8 +1,10 @@
-# Native preparation integration driver
+# Native preparation integration driver 0.2.0
 
 This standalone driver uses the existing preparation package. Material creation
-does not approve material. Only independently supplied phase reviews authorize
-producer execution. Import is read-only and grants no operator, host-image,
+does not approve material. An independently trusted native actor may measure
+held files, but a separate runtime review is required **before the first
+supplied Git, loader or other tool executes**. Subsequent independently supplied
+phase reviews authorize producer execution. Import is read-only and grants no operator, host-image,
 cloud, signature, or live-storage authority.
 
 The driver is synthetic-only (storage LUN 0, at most 4096 sectors). It does not
@@ -27,9 +29,9 @@ cache may remain at its explicitly reviewed existing location. A fresh
 parent-selected directory is required; do not overwrite earlier measurements:
 
 ```sh
-cd /d/unikraft-worktrees/fleet-ci
+cd /d/unikraft-worktrees/fleet-origin
 umask 077
-export S="$PWD/.d/zig-migration-preparation/integration-parent-v1"
+export S="$PWD/.d/zig-migration-preparation/integration-parent-v2"
 test ! -e "$S"
 mkdir -p "$S"/{tmp,home,xdg-cache,xdg-config,zig-global,zig-local,run/requests}
 export HOME="$S/home" TMPDIR="$S/tmp"
@@ -37,7 +39,7 @@ export XDG_CACHE_HOME="$S/xdg-cache" XDG_CONFIG_HOME="$S/xdg-config"
 export ZIG_GLOBAL_CACHE_DIR="$S/zig-global" ZIG_LOCAL_CACHE_DIR="$S/zig-local"
 /home/g/.local/bin/zig build \
   --build-file support/tools/hyperv/preparation/integration/build.zig \
-  --system "$PWD/.d/zig-migration-preparation/restore/zig-pkg" \
+  --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
   --prefix "$S/install" -Doptimize=ReleaseSafe -j2 test install --summary all
 export DRIVER="$S/install/bin/uk-hyperv-prepare-integration"
 export WORK="$S/run"
@@ -149,7 +151,7 @@ re-admission of those bindings fail. If mutation occurs mid-run, stop and
 retain the failed workspace; use fresh material and independent approvals,
 not updated hashes pasted into the old receipt chain.
 
-Neither choice changes source/dependency coverage: all eight tracked
+Neither choice changes source/dependency coverage: all tracked
 `integration/` files, the preparation/core modules, and linked native
 ELF/Kconfig/facade/root-proof sources belong to the selected repository
 commit/physical-source closure. The pinned miz source and every other
@@ -174,7 +176,7 @@ or arbitrary child arguments are supported.
 
 | Field | Required value |
 | --- | --- |
-| `schema` | `hyperv_native_integration_spec_v1` |
+| `schema` | `hyperv_native_integration_spec_v2` |
 | `repository` | The selected committed checkout (shared frozen worktree or independent private clone), including the driver sources |
 | `actor_directory` | The physical `$S/install/bin` directory |
 | `facade_runtime` | Existing canonical facade directory described above |
@@ -186,11 +188,18 @@ or arbitrary child arguments are supported.
 | `trust_bundle` | Actual relative certificate-bundle path within `trust` |
 | `dependencies` | Every package as `{name,package_hash,origin}`; directory is `packages.directory/package_hash`, including exact `miz_source` |
 
-`ToolSpec` has exactly `directory,role,target,executable,loader,libraries,origin`.
+`initial_config:null` renders only `config.render`'s **guarded fragment**. It
+does not supply a complete Hyper-V configuration. Parent-owned configuration
+composition and the independently supplied expected inspection `File`
+(content/path/mode, not future inode/timestamps) remain separate prerequisites.
+
+`ToolSpec` has exactly `directory,role,target,executable,loader,libraries,origin,evidence`.
 `executable`/`loader` are relative paths or null; `libraries` is an explicit
-array of relative SONAME paths. `origin` has
-`scheme,revision,source_sha256,producer_sha256` using genuine reviewed upstream
-provenance, not hashes invented to get through validation. Complete physical
+array of relative SONAME paths. `origin` is
+`{schema:"hyperv_runtime_origin_v2",payload}`, with the closed
+`local_build|distribution|zig_packages` payloads and separately held evidence
+bindings documented in [the preparation contract](../README.md#origin-v2-identities-witnesses-and-independent-review).
+There are no generic nullable source/compiler hashes. Complete physical
 tree records are measured by `runtime.Bound`, not supplied as assertions.
 Data roles use target `data`, null executable/loader and empty libraries.
 Native roles use the actual host target. Dynamic ELF tools are supported;
@@ -243,6 +252,10 @@ an approval file. `measure` emits observations with `authority:not_admitted`;
 do not pipe its output into an approval file or treat measurement as approval.
 
 ```sh
+"$DRIVER" runtime-material "$WORK"
+# PURE held-file measurement publishes controls/runtime.json.
+# Independent external review supplies reviews/runtime.json (schema below).
+# No supplied Git/loader/tool has run yet.
 "$DRIVER" material "$WORK"
 "$DRIVER" measure "$WORK" prepare
 # Independent review creates reviews/prepare.json.
@@ -273,6 +286,68 @@ do not pipe its output into an approval file or treat measurement as approval.
 # Independent review creates reserved-controls/import.json.
 "$DRIVER" importer "$WORK"
 ```
+
+### The pre-bootstrap runtime review is a distinct boundary
+
+`runtime-material` uses `World.tool`, physical inventory and bounded witness/
+declaration parsing only. It does not run Git, manifests, hooks, verifiers,
+installers, Make or a producer. Its current actor is already independently
+trusted/built; the selected actor file must be the actual running inode.
+Current-source HEAD is **not** pretended known here.
+
+`controls/runtime.json` is `hyperv_native_runtime_material_v1`, with
+`authority:not_admitted`, exact request `spec` and `spec_physical` metadata,
+repository directory identity, explicit native preparation role/target,
+actual actor/helper files and complete actor
+tree/physical commitment, every named native ToolBinding, Git/package/Bison/
+trust bindings and every individual dependency. A measured ToolBinding has
+`{tool:{path,contract},directory,physical_sha256}`. This binds roles, targets,
+executable selection, all support files, evidence catalogs/witnesses and
+physical copies before any supplied runtime is used.
+
+The externally supplied `reviews/runtime.json` is exactly:
+
+```text
+{
+  schema: "hyperv_native_runtime_review_v1",
+  material_sha256: independently reviewed complete controls/runtime.json hash,
+  authentication: "existing_publisher_assurance",
+  realization: "declared_prefix_relocation",
+  evidence: [{evidence_set_sha256, policy: [origin.Policy, ...]}, ...]
+}
+```
+
+This is a field guide, not admissible JSON or an approval generator. Policies
+must come from independent review of the actual retained witnesses and existing
+approved publisher/channel/key—not the artifact's preferred method. They bind
+expected method/authority/key and exact authentication/realization evidence.
+The policy transported with a Tool is only a candidate until matched against
+this separate review. There is no command to fill expectations from newly
+measured bytes, adopt a publisher/key, or convert signature failure to absence.
+
+`material` reads that review first, verifies its complete retained material,
+remeasures spec/runtime/evidence physical identities, and compares again
+immediately before `source.inspect`'s first supplied Git call.
+A later `reviews/prepare.json`, Bundle or provenance review cannot substitute.
+Every subsequent Bundle load (including direct producer/importer entry)
+requires the retained independent runtime review, matches all selected tools
+against it and revalidates their physical identities. Hand-supplying a Bundle
+cannot skip the boundary. Execution/inspection bindings cannot silently
+exchange the bootstrap-approved runtimes or authority requirements.
+After approved inspection the actor/helper constructors still require actual
+current source physical SHA, reviewed HEAD and selected Zig executable SHA.
+The subsequent full provenance/build reviews remain mandatory.
+The generated Bundle/stage schemas are
+`hyperv_native_integration_material_v2` and
+`hyperv_native_integration_stage_v2`.
+
+Keep bootstrap evidence roots immutable. New selection evidence must have its
+own independently reviewed held root; never append to a hashed bootstrap set.
+Evidence is not placed inside source/runtime/CA/Git roots and is not exempt
+from staging or charging. Existing parser limits (4 MiB/depth 32/items 4096/
+tokens 65536/string 8192), 8 MiB control and 256 MiB total caps are unchanged.
+All expected provenance/binding/input/selection/import hashes require new
+independent reviews after this epoch; old records are rejected, not upgraded.
 
 Each `reviews/PHASE.json` (or `reserved-controls/generate.json`) is `common.Review`:
 `schema:"hyperv_native_integration_review_v1",phase,material_sha256,
@@ -349,21 +424,27 @@ modify the frozen API. Missing expectation is an explicit failure gate.
 ## Selection, complete staged accounting and importer
 
 `requests/selection.json` is `selection.Spec` with exact fields:
-`schema:"hyperv_native_integration_selection_spec_v1",qemu,firmware_code,
+`schema:"hyperv_native_integration_selection_spec_v2",qemu,firmware_code,
 firmware_vars,capability_receipt,capability_images,capability_source,engine,
 baked_controls,extra_controls`.
 
 - `qemu` is a complete ToolSpec, role `qemu`, target **`x86_64_linux`**.
 - Each file spec is `{directory,path}`. `capability_receipt.path` is exactly
   `capability.receipt.json`; its private directory contains the existing
-  `hyperv_public_capability_artifact_native_v1` contract. `capability_images`
+  `hyperv_public_capability_artifact_native_v2` contract. `capability_images`
   holds its independently supplied public boot image.
 - `capability_source` is `common.Locations`:
   `repository,producer,compiler,git,trust,dependencies,git_scratch`, with
   dependencies `{name,directory}`. These actual native source/tool/dependency
   bindings must verify the capability receipt's separate provenance.
-- `firmware_code` and `firmware_vars` are genuine selected firmware files.
-  Six distinct future firmware working copies are charged.
+- `firmware_code` and `firmware_vars` are each `{tool:ToolSpec,member}`.
+  The tool must be a complete `role:firmware,target:data` distribution with
+  no executable/loader/libraries. The relative member is tied to the exact
+  generated asset ID/file, held data-root identity and complete physical
+  file/directory commitment through mandatory named
+  `SelectionV3.firmware_origins.code|vars` mappings. Creation, generation and
+  read-only admission recheck them. Six future firmware working copies and
+  every support/evidence file are charged; there is no file-only firmware path.
 - `engine` is null for the same physical driver, or an explicit ToolSpec for
   a separate driver executable/runtime. Different copies are separately
   charged even when bytes match. Execute importer using the selected file.
@@ -447,7 +528,8 @@ The concrete phase prerequisites are:
 
 | First blocked stage without its inputs | Required independent input or decision |
 | --- | --- |
-| `material` | Populated `requests/bootstrap.json`; complete native aliases, package/Bison/trust closures and origins; actual actor installation and facade lock; selected frozen Git checkout |
+| `runtime-material` | Complete held runtime/evidence/declaration files, current independently trusted actor/helper installation, canonical `requests/bootstrap.json`; no supplied execution |
+| `material` | The above plus **independently supplied** `reviews/runtime.json` approving `controls/runtime.json` and exact policies; existing facade lock and selected frozen Git checkout |
 | `stage ... configure` / configure execution | Exact `requests/expected.config` and separately approved execution/inspection digests, or parent-coordinated durable pending-execution API correction |
 | `selection` | Populated `requests/selection.json`; actual public capability image/receipt/native provenance, x86 QEMU, firmware and complete baked/additional controls |
 | `producer ... generate` / `importer` | Independent phase/import reviews and successful physical full-ledger/closure admission, including later publications |
@@ -460,7 +542,7 @@ public local-boot report is neither the required capability provenance
 contract nor preparer/host admission. Root CI fixture-cache canonicalization
 is parent-owned and is not reimplemented in this harness.
 
-## Author's bounded execution record
+## Earlier bounded execution records (historical)
 
 Only the standalone driver and its non-executing fixtures were compiled/run.
 Both `-Doptimize=Debug -j2 test install --summary all` and
@@ -511,3 +593,32 @@ are `.d/zig-migration-preparation/integration-phase-review-v1/output/`
 `debug-final.log` and `release-safe-final.log`; prefixes use the corresponding
 `debug-final` and `release-safe-final` directories. Other command arguments
 match the Build section, with that fresh scratch root.
+
+## Origin epoch execution record
+
+The 2026-09-11 Origin repair passed **18/18 integration fixtures and 8/8 steps
+in both Debug and ReleaseSafe**, alongside 92/92 preparation and 19/19
+namespace fixtures in both modes, all with `-j2`. Runtime-review tests reject
+the absence of a separate pre-bootstrap review even when a later phase review
+exists, and independently mutate roles/targets/executables, physical
+identities, spec bytes and required authority policies. No full material
+bootstrap or producer was run.
+
+Current measured ReleaseSafe integration files are **2,228,192 bytes** for
+`uk-hyperv-prepare-integration` and **926,920 bytes** for its helper:
+**3,155,112 bytes combined**. Debug files are 12,866,576 and 7,564,984 bytes.
+These are actual installed-file measurements, not compressed estimates,
+historical pair sizes or a complete ledger. Exact six focused commands,
+environment, logs, physical-identity checks, hashes, other installed sizes
+and remaining real authentication/realization material gates are recorded in
+[the preparation execution record](../README.md#origin-repair-execution-record-2026-09-11).
+
+Existing pinned signatures remain required; unsigned LLVM/conda metadata is
+represented honestly as existing publisher/channel HTTPS assurance only when
+independently reviewed with its retained acquisition/TLS context. No verifier
+invocation, new authority, network acquisition, conda hook or relocation of
+real packages was performed. Ubuntu key approval/native verification, actual
+archive/member evidence, firmware and fresh source/compiler/build approvals
+remain material gates. Historical upstream manufacture, parent configuration
+composition, full workflow, ledger fit and cloud/live admission are not
+claimed complete.

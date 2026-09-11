@@ -6,11 +6,12 @@ const c = x.c;
 const fs = x.fs;
 
 pub const FileSpec = struct { directory: []const u8, path: []const u8 };
+pub const DataSpec = struct { tool: x.ToolSpec, member: []const u8 };
 pub const Spec = struct {
-    schema: enum { hyperv_native_integration_selection_spec_v1 },
+    schema: enum { hyperv_native_integration_selection_spec_v2 },
     qemu: x.ToolSpec,
-    firmware_code: FileSpec,
-    firmware_vars: FileSpec,
+    firmware_code: DataSpec,
+    firmware_vars: DataSpec,
     capability_receipt: FileSpec,
     capability_images: []const u8,
     capability_source: x.Locations,
@@ -19,7 +20,7 @@ pub const Spec = struct {
     extra_controls: []const FileSpec,
 };
 pub const Material = struct {
-    schema: enum { hyperv_native_integration_selection_material_v1 },
+    schema: enum { hyperv_native_integration_selection_material_v2 },
     authority: enum { not_admitted },
     bootstrap_sha256: x.Sha,
     plan: p.inputs.Plan,
@@ -63,6 +64,7 @@ const Builder = struct {
     }
     fn runtime(self: *Builder, bound: x.rt.Bound, prefix: []const u8, producer: bool) !void {
         try bound.validate(self.world.allocator, self.world.io);
+        try self.evidence(bound.contract.evidence);
         const inventory = try fs.inventory(self.world.allocator, self.world.io, bound.directory, 240, c.control_cap);
         for (inventory.entries) |file| {
             const held = try bound.directory.openFile(self.world.io, file.path, .artifact);
@@ -78,6 +80,36 @@ const Builder = struct {
             }
             if (!covered) try self.add(bound.directory, file, if (producer and std.mem.eql(u8, file.path, bound.contract.executable.?.path)) .producer_control else .native_control, try std.fs.path.join(self.world.allocator, &.{ prefix, file.path }), .staged);
         }
+    }
+    fn evidence(self: *Builder, selected: []const x.rt.origin.Binding) !void {
+        for (selected) |item| {
+            _ = try x.rt.origin.validateEvidence(self.world.allocator, self.world.io, item);
+            const directory = try self.world.open(item.directory.path);
+            const inventory = try fs.inventory(self.world.allocator, self.world.io, directory, 240, c.control_cap);
+            for (inventory.entries) |file| try self.support(directory, file, "controls/origin-evidence");
+        }
+    }
+    fn support(self: *Builder, directory: fs.Directory, file: c.File, prefix: []const u8) !void {
+        for (self.assets.items, self.bindings.items) |asset, binding|
+            if (std.mem.eql(u8, binding.directory.path, directory.path) and std.mem.eql(u8, asset.source.path, file.path) and asset.placement == .staged) {
+                try fs.requireFile(asset.source, file);
+                return;
+            };
+        try self.add(directory, file, .publication_control, try std.fmt.allocPrint(self.world.allocator, "{s}/{d}/{s}", .{ prefix, self.assets.items.len, file.path }), .staged);
+    }
+    fn firmware(self: *Builder, spec: DataSpec, role: p.budget.Role, destination: []const u8) !p.inputs.FirmwareOrigin {
+        const bound = try self.world.tool(spec.tool);
+        if (bound.contract.role != .firmware or bound.contract.target != .data or bound.contract.origin.payload != .distribution)
+            return error.InvalidFirmwareOrigin;
+        const file = try bound.directory.record(self.world.allocator, self.world.io, spec.member, c.total_cap, .artifact);
+        try self.add(bound.directory, file, role, destination, .staged);
+        const id = self.assets.items[self.assets.items.len - 1].id;
+        try self.evidence(bound.contract.evidence);
+        return .{ .asset_id = id, .directory = try x.rt.origin.Identity.directory(bound.directory), .physical_sha256 = try fs.physicalDigest(self.world.allocator, self.world.io, bound.directory), .tool = bound.contract, .member = file };
+    }
+    fn provenanceEvidence(self: *Builder, record: p.provenance.Record) !void {
+        inline for (.{ "producer", "compiler", "git", "trust" }) |field| try self.evidence(@field(record, field).evidence);
+        for (record.dependencies) |dependency| try self.evidence(dependency.content.evidence);
     }
 };
 
@@ -111,11 +143,22 @@ pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
     const images = try world.open(spec.capability_images);
     try fs.requireFile(try images.record(world.allocator, world.io, capability.value.image.path, c.total_cap, .artifact), capability.value.image);
     try builder.add(images, capability.value.image, .boot_disk, "images/capability.raw", .staged);
-    _ = try builder.addFile(spec.firmware_code, .firmware_code, "firmware/code.fd");
-    const vars = try builder.addFile(spec.firmware_vars, .firmware_vars, "firmware/vars.fd");
+    const firmware_code = try builder.firmware(spec.firmware_code, .firmware_code, "firmware/code.fd");
+    const firmware_vars = try builder.firmware(spec.firmware_vars, .firmware_vars, "firmware/vars.fd");
+    const vars = firmware_vars.member;
+    for ([_]p.inputs.FirmwareOrigin{ firmware_code, firmware_vars }) |selected| {
+        const directory = try world.open(selected.directory.path);
+        const inventory = try fs.inventory(world.allocator, world.io, directory, 240, c.total_cap);
+        for (inventory.entries) |file| try builder.support(directory, file, "controls/firmware-support");
+    }
     for (0..p.inputs.firmware_copy_count) |i|
-        try builder.add(try world.open(spec.firmware_vars.directory), vars, .firmware_working_copy, try std.fmt.allocPrint(world.allocator, "firmware/working-{d}.fd", .{i}), .future_copy);
+        try builder.add(try world.open(spec.firmware_vars.tool.directory), vars, .firmware_working_copy, try std.fmt.allocPrint(world.allocator, "firmware/working-{d}.fd", .{i}), .future_copy);
     const qemu = try world.tool(spec.qemu);
+    try builder.evidence(qemu.contract.evidence);
+    try builder.provenanceEvidence(root.value.provenance);
+    try builder.provenanceEvidence(capability.value.provenance);
+    inline for (.{ "git", "packages", "bison_data", "trust" }) |field| try builder.evidence(@field(root.value.binding, field).contract.evidence);
+    for (root.value.binding.native) |native| try builder.evidence(native.tool.contract.evidence);
     const qemu_files = try fs.inventory(world.allocator, world.io, qemu.directory, 240, c.total_cap);
     for (qemu_files.entries) |file|
         try builder.add(qemu.directory, file, if (std.mem.eql(u8, file.path, qemu.contract.executable.?.path)) .qemu else .qemu_support, try std.fs.path.join(world.allocator, &.{ "qemu", file.path }), .staged);
@@ -138,13 +181,14 @@ pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
     for (spec.extra_controls, 0..) |file, i|
         _ = try builder.addFile(file, .publication_control, try std.fmt.allocPrint(world.allocator, "controls/extra-{d}", .{i}));
     var plan: p.inputs.Plan = .{
-        .schema = .hyperv_native_input_selection_v2,
+        .schema = .hyperv_native_input_selection_v3,
         .packaged_receipt_sha256 = packaged.sha256,
         .solved_metadata = metadata,
         .publication = undefined,
         .capability_source = capability.value.provenance.source,
         .capability_receipt = capability_file,
         .qemu = qemu.contract,
+        .firmware_origins = .{ .code = firmware_code, .vars = firmware_vars },
         .assets = builder.assets.items,
     };
     for ([_][]const u8{ "prepared", "configured", "built", "packaged" }, &plan.publication.receipts) |name, *record|
@@ -156,11 +200,12 @@ pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
     _ = try p.inputs.ledger(world.allocator, plan, .{ .receipt = packaged.value, .sha256 = packaged.sha256 });
     try p.inputs.validateSolvedConfig(world.allocator, world.io, plan, builder.bindings.items, workspace, packaged.value);
     try p.inputs.checkQemuClosure(world.allocator, world.io, plan, qemu.directory);
+    try p.inputs.requireFirmwareOrigins(world.allocator, world.io, plan, builder.bindings.items);
     const locations = try world.allocator.alloc(std.meta.Child(@FieldType(Material, "bindings")), builder.bindings.items.len);
     for (builder.bindings.items, locations) |binding, *location|
         location.* = .{ .id = binding.id, .directory = binding.directory.path };
     const result: Material = .{
-        .schema = .hyperv_native_integration_selection_material_v1,
+        .schema = .hyperv_native_integration_selection_material_v2,
         .authority = .not_admitted,
         .bootstrap_sha256 = root.sha256,
         .plan = plan,

@@ -118,12 +118,7 @@ fn shapeSource() c.Source {
 fn shapeTool(role: rt.Role, executable: ?c.File) rt.Tool {
     return .{
         .role = role,
-        .origin = .{
-            .scheme = .zig_package,
-            .revision = c.compiler_version,
-            .source_sha256 = c.digest("public synthetic origin SHAPE only"),
-            .producer_sha256 = c.digest("public synthetic producer SHAPE only"),
-        },
+        .origin = if (role == .dependencies) @import("origin_fixture.zig").shapePackage() else if (role == .preparation or role == .git or role == .m4) @import("origin_fixture.zig").local() else @import("origin_fixture.zig").shapeDistribution(),
         .target = if (executable == null) .data else .aarch64_linux,
         .tree = .{ .sha256 = c.digest("public synthetic runtime SHAPE only"), .files = 1, .bytes = 128 },
         .executable = executable,
@@ -140,8 +135,8 @@ fn shapePrepared(allocator: std.mem.Allocator) !receipts.Receipt {
     compiler.executable.?.mode = 0o755;
     var native = shapeTool(.preparation, shapeFile("bin/prepare", 128));
     native.executable.?.mode = 0o755;
-    native.origin.source_sha256 = selected_source.physical.sha256;
-    native.origin.producer_sha256 = compiler.executable.?.sha256;
+    native.origin.payload.local_build.source_physical_sha256 = selected_source.physical.sha256;
+    native.origin.payload.local_build.compiler_executable_sha256 = compiler.executable.?.sha256;
     var git = shapeTool(.git, shapeFile("bin/git", 128));
     git.executable.?.mode = 0o755;
     const dependencies = try allocator.alloc(provenance.Dependency, 1);
@@ -150,9 +145,8 @@ fn shapePrepared(allocator: std.mem.Allocator) !receipts.Receipt {
         .package_hash = provenance.miz_package_hash,
         .content = shapeTool(.dependencies, null),
     };
-    dependencies[0].content.origin.revision = c.miz_revision;
     const review: provenance.Record = .{
-        .schema = .hyperv_native_producer_provenance_v1,
+        .schema = .hyperv_native_producer_provenance_v2,
         .source = selected_source,
         .host_target = .aarch64_linux,
         .guest_target = .x86_64_freestanding_none,
@@ -164,7 +158,7 @@ fn shapePrepared(allocator: std.mem.Allocator) !receipts.Receipt {
         .trust = shapeTool(.trust, null),
     };
     return .{
-        .schema = .hyperv_artifact_preparation_native_v1,
+        .schema = .hyperv_artifact_preparation_native_v2,
         .phase = .prepared,
         .purpose = .synthetic,
         .run_id = try c.identity("11111111111111111111111111111111"),
@@ -262,8 +256,8 @@ test "typed native contracts reject duplicate missing unknown float noncanonical
     try std.testing.expectError(error.NonCanonical, c.parse(c.File, allocator, try std.mem.concat(allocator, u8, &.{ " ", bytes })));
     const receipt = try c.canonical(allocator, try shapePrepared(allocator));
     for ([_]struct { from: []const u8, to: []const u8 }{
-        .{ .from = "hyperv_artifact_preparation_native_v1", .to = "hyperv_artifact_preparation_native_v2" },
-        .{ .from = "hyperv_native_producer_provenance_v1", .to = "hyperv_native_producer_provenance_v0" },
+        .{ .from = "hyperv_artifact_preparation_native_v2", .to = "hyperv_artifact_preparation_native_v1" },
+        .{ .from = "hyperv_native_producer_provenance_v2", .to = "hyperv_native_producer_provenance_v1" },
         .{ .from = "\"phase\":\"prepared\"", .to = "\"phase\":\"completed\"" },
         .{ .from = "\"phase\":\"prepared\"", .to = "\"phase\":\"accepted\"" },
         .{ .from = "\"authority\":\"not_admitted\"", .to = "\"authority\":\"accepted\"" },
@@ -398,16 +392,16 @@ test "SHAPE ONLY reviewed provenance rejects substitution of every producer comp
                 deps[0].content.tree.sha256 = c.digest("substitute dependency bytes");
                 changed.provenance.dependencies = deps;
             },
-            5 => changed.provenance.producer.origin.revision = "another native producer",
-            6 => changed.provenance.git.origin.producer_sha256 = c.digest("substitute runtime producer"),
-            7 => changed.provenance.trust.origin.source_sha256 = c.digest("substitute trust source"),
+            5 => changed.provenance.producer.origin.payload.local_build.source_revision = "3" ** 40,
+            6 => changed.provenance.git.origin.payload.local_build.compiler_executable_sha256 = c.digest("substitute runtime producer"),
+            7 => changed.provenance.trust.origin.payload.distribution.evidence_set_sha256 = c.digest("substitute trust source"),
             else => unreachable,
         }
         const bytes = try c.canonical(allocator, changed);
         try std.testing.expectError(error.UnreviewedInput, receipts.parse(allocator, bytes, c.digest(bytes)));
         try std.testing.expectError(error.UnreviewedInput, receipts.requireParent(allocator, changed, chain[0]));
         changed.reviewed_provenance_sha256 = c.digest(try c.canonical(allocator, changed.provenance));
-        try std.testing.expectError(error.ReceiptSubstitution, receipts.requireParent(allocator, changed, chain[0]));
+        try std.testing.expectError(if (kind == 5) error.UnreviewedInput else error.ReceiptSubstitution, receipts.requireParent(allocator, changed, chain[0]));
     }
     var changed = original.provenance;
     changed.compiler_version = "0.16.1";
@@ -425,7 +419,7 @@ test "SHAPE ONLY reviewed provenance rejects substitution of every producer comp
     changed.dependencies = try std.mem.concat(allocator, provenance.Dependency, &.{ original.provenance.dependencies, original.provenance.dependencies });
     try std.testing.expectError(error.InvalidProvenance, provenance.validate(changed));
     changed = original.provenance;
-    changed.producer.origin.producer_sha256 = c.digest("unrelated compiler");
+    changed.producer.origin.payload.local_build.compiler_executable_sha256 = c.digest("unrelated compiler");
     try std.testing.expectError(error.UnreviewedInput, provenance.validate(changed));
 }
 
@@ -440,7 +434,7 @@ test "SHAPE ONLY provenance rejects malformed runtime hashes paths modes and cro
     changed.trust.tree.sha256[0] = 'g';
     try std.testing.expectError(error.InvalidSha256, provenance.validate(changed));
     changed = original;
-    changed.trust.origin.producer_sha256[0] = 'A';
+    changed.trust.origin.payload.distribution.evidence_set_sha256[0] = 'A';
     try std.testing.expectError(error.InvalidSha256, provenance.validate(changed));
     changed = original;
     changed.compiler.executable.?.path = "../outside";
@@ -521,13 +515,17 @@ fn shapePlan(allocator: std.mem.Allocator, packaged: receipts.Link) !inputs.Plan
         .placement = .staged,
     };
     return .{
-        .schema = .hyperv_native_input_selection_v2,
+        .schema = .hyperv_native_input_selection_v3,
         .packaged_receipt_sha256 = packaged.sha256,
         .solved_metadata = assets[11].source,
         .publication = publication,
         .capability_source = shapeSource(),
         .capability_receipt = assets[8].source,
         .qemu = qemu,
+        .firmware_origins = .{
+            .code = .{ .asset_id = assets[4].id, .directory = .{ .path = "/shape/firmware", .device = 1, .inode = 1, .mode = 0o40700, .uid = 1000 }, .physical_sha256 = c.digest("shape"), .tool = shapeTool(.firmware, null), .member = assets[4].source },
+            .vars = .{ .asset_id = assets[5].id, .directory = .{ .path = "/shape/firmware", .device = 1, .inode = 1, .mode = 0o40700, .uid = 1000 }, .physical_sha256 = c.digest("shape"), .tool = shapeTool(.firmware, null), .member = assets[5].source },
+        },
         .assets = assets,
     };
 }
@@ -565,7 +563,7 @@ test "SHAPE ONLY generation ledger charges six firmware copies all controls evid
     try std.testing.expectEqual(c.total_cap, totals.used + totals.reserved + totals.total_remaining);
     const selected_sha = c.digest(try c.canonical(allocator, plan));
     const document: inputs.Input = .{
-        .schema = .hyperv_native_prepared_input_v2,
+        .schema = .hyperv_native_prepared_input_v3,
         .state = .prepared,
         .authority = .not_admitted,
         .receipt = packaged.receipt,
@@ -684,7 +682,7 @@ fn shapeInput(allocator: std.mem.Allocator, chain: [4]receipts.Link) !inputs.Inp
     const plan = try shapePlan(allocator, chain[3]);
     const entries = try inputs.ledger(allocator, plan, chain[3]);
     return .{
-        .schema = .hyperv_native_prepared_input_v2,
+        .schema = .hyperv_native_prepared_input_v3,
         .state = .prepared,
         .authority = .not_admitted,
         .receipt = chain[3].receipt,
@@ -743,8 +741,8 @@ test "entry chain requires independent selection provenance receipt and executio
     try std.testing.expectEqual(@as(u8, 0x11), storage.bytes[0]);
     try std.testing.expectError(error.InvalidSha256, admission.rawHash(("G" ** 64).*));
     const encoded = try c.canonical(a, input);
-    const legacy = try replaceOnce(a, encoded, "hyperv_native_prepared_input_v2", "hyperv_native_prepared_input_v1");
-    try std.testing.expectError(error.InvalidEnum, c.parse(inputs.PreparedInputV2, a, legacy));
+    const legacy = try replaceOnce(a, encoded, "hyperv_native_prepared_input_v3", "hyperv_native_prepared_input_v2");
+    try std.testing.expectError(error.InvalidEnum, c.parse(inputs.PreparedInputV3, a, legacy));
 }
 
 test "read-only staged entry rejects leftover directories changed bytes modes links and forged input" {
@@ -1018,7 +1016,7 @@ test "read-only entry never creates missing state or adopts v1 partial staging o
     const produced: admission.ProducerSource = .{
         .repository = directory,
         .git = &git,
-        .provenance_bindings = .{ .producer = directory, .compiler = directory, .git = directory, .dependencies = &.{}, .trust = directory },
+        .provenance_bindings = .{ .repository = directory, .producer = directory, .compiler = directory, .git = directory, .dependencies = &.{}, .trust = directory },
     };
     const bindings: admission.Bindings = .{
         .staging = state,
@@ -1041,7 +1039,7 @@ test "read-only entry never creates missing state or adopts v1 partial staging o
     try std.testing.expectError(error.WouldBlock, admission.load(a, io, review, bindings, deadline));
     lock.close(io);
     const encoded = try c.canonical(a, input);
-    const legacy = try replaceOnce(a, encoded, "hyperv_native_prepared_input_v2", "hyperv_native_prepared_input_v1");
+    const legacy = try replaceOnce(a, encoded, "hyperv_native_prepared_input_v3", "hyperv_native_prepared_input_v2");
     review.input_sha256 = c.digest(legacy);
     try writeFixture(fixture.dir, "input.json", legacy, 0o600);
     try std.testing.expectError(error.InvalidEnum, admission.load(a, io, review, bindings, deadline));
@@ -1149,7 +1147,7 @@ test "producer v3 policy documents bind Make Git trust caches and physical contr
     var binding = try producer.describe(a, selected);
     try producer.validatePolicyFiles(a, io, binding);
     const encoded = try c.canonical(a, binding);
-    const old = try replaceOnce(a, encoded, "hyperv_local_native_producer_binding_v3", "hyperv_local_native_producer_binding_v2");
+    const old = try replaceOnce(a, encoded, "hyperv_local_native_producer_binding_v4", "hyperv_local_native_producer_binding_v3");
     try std.testing.expectError(error.InvalidEnum, c.parse(producer.Binding, a, old));
     var substituted_make = make;
     substituted_make.tmp = make.xdg_cache;
@@ -1159,7 +1157,7 @@ test "producer v3 policy documents bind Make Git trust caches and physical contr
     try writeFixture(fixture.dir, "make.json", try c.canonical(a, make), 0o600);
     binding = try producer.describe(a, selected);
     var substituted_git = policy;
-    substituted_git.runtime.origin.source_sha256 = c.digest("different Git source");
+    substituted_git.runtime.origin.payload.local_build.source_physical_sha256 = c.digest("different Git source");
     try writeFixture(fixture.dir, "git.json", try c.canonical(a, substituted_git), 0o600);
     binding.isolation.?.git_policy = try directory.record(a, io, "git.json", 256 * 1024, .private);
     try std.testing.expectError(error.UnreviewedInput, producer.validatePolicyFiles(a, io, binding));
@@ -1187,8 +1185,8 @@ test "input v2 requires a charged distinct private VHD and rejects v1 wire shape
     try std.testing.expectError(error.HashMismatch, inputs.ledger(allocator, plan, packaged));
     assets[10] = original;
     const bytes = try c.canonical(allocator, plan);
-    const legacy = try replaceOnce(allocator, bytes, "hyperv_native_input_selection_v2", "hyperv_native_input_selection_v1");
-    try std.testing.expectError(error.InvalidEnum, c.parse(inputs.SelectionV2, allocator, legacy));
+    const legacy = try replaceOnce(allocator, bytes, "hyperv_native_input_selection_v3", "hyperv_native_input_selection_v2");
+    try std.testing.expectError(error.InvalidEnum, c.parse(inputs.SelectionV3, allocator, legacy));
     const entries = try inputs.ledger(allocator, plan, packaged);
     var charged: u64 = 0;
     for (entries) |entry| if (entry.role == .vhd) {
@@ -1483,7 +1481,7 @@ test "SHAPE ONLY context rejects foreign receipt bindings before physical verifi
         .repository = directory,
         .review = chain[0].receipt.provenance,
         .reviewed_provenance_sha256 = chain[0].receipt.reviewed_provenance_sha256,
-        .bindings = .{ .producer = directory, .compiler = directory, .git = directory, .dependencies = &.{}, .trust = directory },
+        .bindings = .{ .repository = directory, .producer = directory, .compiler = directory, .git = directory, .dependencies = &.{}, .trust = directory },
         .guard = chain[0].receipt.guard,
         .purpose = .synthetic,
     };
@@ -1527,7 +1525,7 @@ test "SHAPE ONLY context rejects foreign receipt bindings before physical verifi
     context.reviewed_provenance_sha256 = chain[0].receipt.reviewed_provenance_sha256;
     git.runtime.contract = context.review.git;
     try context.requireGitBinding();
-    git.runtime.contract.origin.producer_sha256 = c.digest("different executed Git");
+    git.runtime.contract.origin.payload.local_build.compiler_executable_sha256 = c.digest("different executed Git");
     try std.testing.expectError(error.UnreviewedInput, context.requireGitBinding());
     git.runtime.contract = context.review.git;
     var other = std.testing.tmpDir(.{ .iterate = true });
@@ -1579,6 +1577,20 @@ test "input generation refuses unrelated staging bytes empty directories and fai
 fn measuredTool(allocator: std.mem.Allocator, directory: fs.Directory, role: rt.Role, executable: ?[]const u8) !rt.Tool {
     var tool = shapeTool(role, if (executable) |path| try directory.record(allocator, std.testing.io, path, 64 * 1024 * 1024, .executable) else null);
     tool.tree = (try fs.inventory(allocator, std.testing.io, directory, 16, 128 * 1024 * 1024)).tree;
+    if (role == .zig or role == .trust) {
+        const synthetic = try @import("origin_fixture.zig").distribution(allocator, std.testing.io, directory);
+        tool.origin = synthetic.origin;
+        tool.evidence = synthetic.evidence;
+    } else if (role == .dependencies) {
+        const packages = try allocator.dupe(rt.origin.Package, tool.origin.payload.zig_packages.packages);
+        packages[0].selected_tree = tool.tree;
+        const parent = try fs.Directory.open(allocator, std.testing.io, try std.fs.path.join(allocator, &.{ std.fs.path.dirname(directory.path).?, "repository" }));
+        defer parent.close(allocator, std.testing.io);
+        packages[0].declaration.directory = try rt.origin.Identity.directory(parent);
+        packages[0].declaration.directory.path = try allocator.dupe(u8, parent.path);
+        packages[0].declaration.file = try parent.record(allocator, std.testing.io, "build.zig.zon", 4096, .artifact);
+        tool.origin.payload.zig_packages.packages = packages;
+    }
     return tool;
 }
 
@@ -1589,11 +1601,11 @@ test "native provenance binding fixtures reject changed physical runtimes depend
     const allocator = arena.allocator();
     var fixture = try rt.TestFixture.init(allocator, io);
     defer fixture.deinit();
-    for ([_][]const u8{ "native-fixture", "dependency-fixture", "trust-fixture" }) |name|
+    for ([_][]const u8{ "native-fixture", provenance.miz_package_hash, "trust-fixture" }) |name|
         try fixture.root.dir.createDir(io, name, .fromMode(0o700));
     const native = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ fixture.root.path, "native-fixture" }));
     defer native.close(allocator, io);
-    const dependency = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ fixture.root.path, "dependency-fixture" }));
+    const dependency = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ fixture.root.path, provenance.miz_package_hash }));
     defer dependency.close(allocator, io);
     const trust = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ fixture.root.path, "trust-fixture" }));
     defer trust.close(allocator, io);
@@ -1604,21 +1616,22 @@ test "native provenance binding fixtures reject changed physical runtimes depend
     try writeFixture(native.dir, "fixture", executable, 0o755);
     try writeFixture(dependency.dir, "fixture.zig", "pub const synthetic = true;\n", 0o644);
     try writeFixture(trust.dir, "fixture.txt", "public synthetic trust fixture; not a CA bundle\n", 0o644);
+    try writeFixture(fixture.repository.dir, "build.zig.zon", ".{ .dependencies = .{ .miz_source = .{ .url = \"git+https://github.com/cataggar/miz.git#" ++ c.miz_revision ++ "\", .hash = \"" ++ provenance.miz_package_hash ++ "\" } } }\n", 0o644);
     var record = (try shapePrepared(allocator)).provenance;
     // The measured static fixture is not the preparation CLI or a compiler;
     // these field bindings test rejection only, never approval or execution.
     record.compiler = try measuredTool(allocator, native, .zig, "fixture");
     record.producer = try measuredTool(allocator, native, .preparation, "fixture");
-    record.producer.origin.source_sha256 = record.source.physical.sha256;
-    record.producer.origin.producer_sha256 = record.compiler.executable.?.sha256;
+    record.producer.origin.payload.local_build.source_physical_sha256 = record.source.physical.sha256;
+    record.producer.origin.payload.local_build.compiler_executable_sha256 = record.compiler.executable.?.sha256;
     record.git = fixture.git.runtime.contract;
     record.trust = try measuredTool(allocator, trust, .trust, null);
     const dependencies = try allocator.dupe(provenance.Dependency, record.dependencies);
     dependencies[0].content = try measuredTool(allocator, dependency, .dependencies, null);
-    dependencies[0].content.origin.revision = c.miz_revision;
     record.dependencies = dependencies;
     const bound_dependencies = [_]provenance.Dependencies{.{ .name = "miz_source", .directory = dependency }};
     const bindings: provenance.Bindings = .{
+        .repository = fixture.repository,
         .producer = native,
         .compiler = native,
         .git = fixture.git.runtime.directory,

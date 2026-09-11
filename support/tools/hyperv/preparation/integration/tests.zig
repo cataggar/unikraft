@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime_material = @import("runtime_material.zig");
 const x = @import("common.zig");
 const main = @import("main.zig");
 const material = @import("material.zig");
@@ -6,6 +7,114 @@ const selection = @import("selection.zig");
 const t = std.testing;
 const a = t.allocator;
 const hash = "1" ** 64;
+
+test "integration driver runtime measurement is explicit and bootstrap cannot borrow a post Bundle review" {
+    const parsed = try main.arguments(&.{ "driver", "runtime-material", "/private/work" });
+    try t.expect(parsed.command == .runtime_material);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var fixture = t.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(t.io, .fromMode(0o700));
+    for ([_][]const u8{ "requests", "controls", "reviews" }) |name|
+        try fixture.dir.createDir(t.io, name, .fromMode(0o700));
+    var world: x.World = .{ .allocator = arena.allocator(), .io = t.io, .deadline = try x.c.core.process.Deadline.afterMilliseconds(30000) };
+    defer world.deinit();
+    const workspace = try world.open(try fixture.dir.realPathFileAlloc(t.io, ".", world.allocator));
+    const requests = try world.child(workspace, "requests");
+    // Invalid spec is deliberately never inspected: separate runtime permission
+    // must be read before constructing or invoking a supplied runtime.
+    try write(requests.dir, "bootstrap.json", "{}\n", 0o600);
+    const reviews = try world.child(workspace, "reviews");
+    try write(reviews.dir, "prepare.json", try x.c.canonical(world.allocator, review(.prepare)), 0o600);
+    try t.expectError(error.FileNotFound, material.bootstrap(&world, workspace));
+    try t.expectError(error.FileNotFound, workspace.dir.openDir(t.io, "scratch", .{}));
+    try t.expectError(error.FileNotFound, workspace.dir.openFile(t.io, "run.config", .{}));
+    try t.expectError(error.FileNotFound, runtime_material.approve(&world, workspace));
+    // The later Bundle cannot be used to jump directly into producer/importer.
+    // The missing runtime review is checked before any Bundle field is read.
+    try t.expectError(error.FileNotFound, runtime_material.requireBundle(&world, workspace, undefined));
+}
+
+test "integration driver runtime review binds complete roles physical identities evidence policies and witnesses" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const identity: x.p.origin.Identity = .{ .path = "/synthetic/runtime", .device = 1, .inode = 2, .mode = 0o40700, .uid = 1000 };
+    const file: x.c.File = .{ .path = "synthetic", .sha256 = hash.*, .size = 1, .mode = 0o600 };
+    const tree: x.c.Tree = .{ .sha256 = hash.*, .files = 1, .bytes = 1 };
+    const policy: x.p.origin.Policy = .{
+        .artifact_id = "synthetic",
+        .authority = .{ .publisher_https_sha256 = .{ .publisher = "synthetic.invalid", .repository = "fixture" } },
+        .authentication_sha256 = hash.*,
+        .realization_verification_sha256 = &.{hash.*},
+    };
+    const evidence = [_]x.p.origin.Binding{.{
+        .directory = identity,
+        .set = .{ .tree = tree, .catalog = file },
+        .physical_sha256 = hash.*,
+        .policy = &.{policy},
+    }};
+    const tool: runtime_material.MeasuredTool = .{
+        .directory = identity,
+        .physical_sha256 = hash.*,
+        .tool = .{ .path = identity.path, .contract = .{
+            .role = .preparation,
+            .target = .aarch64_linux,
+            .origin = x.p.origin_fixture.shapeDistribution(),
+            .tree = tree,
+            .executable = file,
+            .loader = null,
+            .libraries = &.{},
+            .evidence = &evidence,
+        } },
+    };
+    const measured: runtime_material.Material = .{
+        .schema = .hyperv_native_runtime_material_v1,
+        .authority = .not_admitted,
+        .spec = file,
+        .spec_physical = .{ .device = 1, .inode = 1, .size = 1, .mode = 0o100600, .uid = 1000, .links = 1, .modified_ns = 0, .changed_ns = 0 },
+        .repository = identity,
+        .actor = .{ .role = .preparation, .target = .aarch64_linux, .directory = identity, .tree = tree, .physical_sha256 = hash.*, .executable = file, .helper = file },
+        .native = &.{.{ .name = .zig, .measured = tool }},
+        .git = tool,
+        .packages = tool,
+        .bison_data = tool,
+        .trust = tool,
+        .dependencies = &.{},
+    };
+    const expected: runtime_material.Review = .{
+        .schema = .hyperv_native_runtime_review_v1,
+        .material_sha256 = try x.p.origin.hash(allocator, measured),
+        .authentication = .existing_publisher_assurance,
+        .realization = .declared_prefix_relocation,
+        .evidence = &.{.{ .evidence_set_sha256 = try x.p.origin.hash(allocator, evidence[0].set), .policy = &.{policy} }},
+    };
+    try runtime_material.requireReview(allocator, measured, expected);
+    for (0..6) |i| {
+        var changed = measured;
+        switch (i) {
+            0 => changed.git.physical_sha256 = x.c.digest("different physical files"),
+            1 => changed.git.directory.inode += 1,
+            2 => changed.git.tool.contract.role = .zig,
+            3 => changed.git.tool.contract.target = .x86_64_linux,
+            4 => changed.git.tool.contract.executable.?.sha256 = x.c.digest("different executable"),
+            5 => changed.spec_physical.inode += 1,
+            else => unreachable,
+        }
+        try t.expectError(error.UnreviewedInput, runtime_material.requireReview(allocator, changed, expected));
+    }
+    var absent = expected;
+    absent.evidence = &.{};
+    try t.expectError(error.WrongAuthority, runtime_material.requireReview(allocator, measured, absent));
+    var required = policy;
+    required.authority = .{ .pinned_key_signature = .{ .publisher = "synthetic.invalid", .repository = "fixture", .key_id = "independent-required-key" } };
+    absent.evidence = &.{.{ .evidence_set_sha256 = expected.evidence[0].evidence_set_sha256, .policy = &.{required} }};
+    try t.expectError(error.UnreviewedInput, runtime_material.requireReview(allocator, measured, absent));
+    const bytes = try x.c.canonical(allocator, expected);
+    const roundtrip = try x.c.parse(runtime_material.Review, allocator, bytes);
+    try runtime_material.requireReview(allocator, measured, roundtrip.value);
+}
 
 fn review(phase: x.Phase) x.Review {
     return .{
@@ -192,7 +301,7 @@ test "integration driver actual actor identity rejects identical physical copies
     var bound: x.rt.Bound = .{ .directory = directory, .contract = .{
         .role = .preparation,
         .target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
-        .origin = .{ .scheme = .git, .revision = "synthetic", .source_sha256 = hash.*, .producer_sha256 = hash.* },
+        .origin = x.p.origin_fixture.local(),
         .tree = .{ .files = 1, .bytes = executable.size, .sha256 = hash.* },
         .executable = executable,
         .loader = null,
@@ -294,7 +403,7 @@ test "integration driver rejects data-only and absent compiler or engine executa
     var tool: x.rt.Tool = .{
         .role = .preparation,
         .target = .aarch64_linux,
-        .origin = .{ .scheme = .git, .revision = "synthetic-material", .source_sha256 = hash.*, .producer_sha256 = hash.* },
+        .origin = x.p.origin_fixture.local(),
         .tree = .{ .files = 1, .bytes = 1, .sha256 = hash.* },
         .executable = .{ .path = "bin/actor", .size = 1, .sha256 = hash.*, .mode = 0o700 },
         .loader = null,
@@ -326,7 +435,7 @@ fn configuredReceiptFixture(allocator: std.mem.Allocator) !x.p.receipts.Link {
     const executable: x.rt.Tool = .{
         .role = .preparation,
         .target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
-        .origin = .{ .scheme = .git, .revision = "synthetic-receipt", .source_sha256 = hash.*, .producer_sha256 = hash.* },
+        .origin = .{ .payload = .{ .local_build = .{ .source_revision = "1" ** 40, .source_physical_sha256 = hash.*, .compiler_executable_sha256 = hash.* } } },
         .tree = .{ .files = 1, .bytes = 1, .sha256 = hash.* },
         .executable = .{ .path = "bin/fixture", .size = 1, .mode = 0o700, .sha256 = hash.* },
         .loader = null,
@@ -334,22 +443,21 @@ fn configuredReceiptFixture(allocator: std.mem.Allocator) !x.p.receipts.Link {
     };
     var compiler = executable;
     compiler.role = .zig;
-    compiler.origin.scheme = .zig_package;
-    compiler.origin.revision = x.c.compiler_version;
+    compiler.origin = x.p.origin_fixture.shapeDistribution();
     var git = executable;
     git.role = .git;
     var trust = executable;
     trust.role = .trust;
     trust.target = .data;
     trust.executable = null;
+    trust.origin = x.p.origin_fixture.shapeDistribution();
     var dependency = trust;
     dependency.role = .dependencies;
-    dependency.origin.scheme = .zig_package;
-    dependency.origin.revision = x.c.miz_revision;
+    dependency.origin = x.p.origin_fixture.shapePackage();
     const dependencies = try allocator.alloc(x.p.provenance.Dependency, 1);
     dependencies[0] = .{ .name = "miz_source", .package_hash = x.p.provenance.miz_package_hash, .content = dependency };
     const provenance: x.p.provenance.Record = .{
-        .schema = .hyperv_native_producer_provenance_v1,
+        .schema = .hyperv_native_producer_provenance_v2,
         .source = source,
         .host_target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
         .guest_target = .x86_64_freestanding_none,
@@ -362,7 +470,7 @@ fn configuredReceiptFixture(allocator: std.mem.Allocator) !x.p.receipts.Link {
     };
     const config: x.c.File = .{ .path = "run.config", .size = 1, .mode = 0o600, .sha256 = hash.* };
     const receipt: x.p.receipts.Receipt = .{
-        .schema = .hyperv_artifact_preparation_native_v1,
+        .schema = .hyperv_artifact_preparation_native_v2,
         .phase = .configured,
         .purpose = .synthetic,
         .run_id = "1".* ** 32,

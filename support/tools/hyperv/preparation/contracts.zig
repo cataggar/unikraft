@@ -4,6 +4,7 @@ pub const c = core.contracts;
 pub const Sha = [64]u8;
 pub const Identity = [32]u8;
 pub const miz_revision = "2db68ca0c3ab12155012a823c3fb8d7aba1cb544";
+pub const miz_package_hash = "miz-0.2.0-Z3lHlPw00wAx7bBDTJjcF1O3Vva6085mA_DZS2uWdwzL";
 pub const compiler_version = "0.16.0";
 pub const guest_target = "x86_64-freestanding-none";
 pub const total_cap: u64 = 268435456;
@@ -108,6 +109,14 @@ fn shape(comptime T: type, value: std.json.Value) anyerror!void {
             return error.ExpectedBoolean;
         },
         .@"enum" => _ = try c.enumeration(T, value),
+        .@"union" => |info| {
+            if (info.tag_type == null) @compileError("Only tagged unions belong in preparation contracts");
+            if (value != .object or value.object.count() != 1) return error.InvalidUnion;
+            inline for (info.fields) |field| {
+                if (value.object.get(field.name)) |payload| return shape(field.type, payload);
+            }
+            return error.InvalidUnion;
+        },
         else => @compileError("Unsupported preparation contract type"),
     }
 }

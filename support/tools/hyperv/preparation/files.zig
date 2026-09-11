@@ -243,19 +243,50 @@ pub fn inventory(allocator: std.mem.Allocator, io: std.Io, directory: Directory,
         entries.deinit(allocator);
     }
     try collect(allocator, io, directory, directory.dir, "", &entries, &directories, &total, maximum_files, maximum_bytes, 0);
-    std.mem.sort(c.File, entries.items, {}, struct {
+    const tree = inventoryTree(entries.items, directories.items, total);
+    return .{ .entries = try entries.toOwnedSlice(allocator), .tree = tree };
+}
+
+/// The same tree encoding as inventory, retaining selected directory modes and
+/// ancestors. Selection never renames files or substitutes an archive digest.
+pub fn selectedTree(allocator: std.mem.Allocator, io: std.Io, directory: Directory, scope: anytype) !c.Tree {
+    const origin = @import("origin.zig");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entries: std.ArrayList(c.File) = .empty;
+    var directories: std.ArrayList(Subdirectory) = .empty;
+    var total: u64 = 0;
+    try collect(a, io, directory, directory.dir, "", &entries, &directories, &total, 100000, 4 * 1024 * 1024 * 1024, 0);
+    var selected: std.ArrayList(c.File) = .empty;
+    total = 0;
+    for (entries.items) |entry| if (origin.includes(scope, entry.path)) {
+        try selected.append(a, entry);
+        total = try std.math.add(u64, total, entry.size);
+    };
+    var selected_dirs: std.ArrayList(Subdirectory) = .empty;
+    for (directories.items) |dir| {
+        var keep = origin.includes(scope, dir.path);
+        for (selected.items) |file| keep = keep or origin.under(dir.path, file.path);
+        if (keep) try selected_dirs.append(a, dir);
+    }
+    return inventoryTree(selected.items, selected_dirs.items, total);
+}
+
+fn inventoryTree(entries: []c.File, directories: []Subdirectory, total: u64) c.Tree {
+    std.mem.sort(c.File, entries, {}, struct {
         fn less(_: void, a: c.File, b: c.File) bool {
             return std.mem.lessThan(u8, a.path, b.path);
         }
     }.less);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("hyperv-native-tree-v1\x00");
-    std.mem.sort(Subdirectory, directories.items, {}, struct {
+    std.mem.sort(Subdirectory, directories, {}, struct {
         fn less(_: void, a: Subdirectory, b: Subdirectory) bool {
             return std.mem.lessThan(u8, a.path, b.path);
         }
     }.less);
-    for (directories.items) |entry| {
+    for (directories) |entry| {
         var numbers: [6]u8 = undefined;
         std.mem.writeInt(u32, numbers[0..4], @intCast(entry.path.len), .big);
         std.mem.writeInt(u16, numbers[4..6], entry.mode, .big);
@@ -263,7 +294,7 @@ pub fn inventory(allocator: std.mem.Allocator, io: std.Io, directory: Directory,
         hash.update(&numbers);
         hash.update(entry.path);
     }
-    for (entries.items) |entry| {
+    for (entries) |entry| {
         var numbers: [14]u8 = undefined;
         std.mem.writeInt(u32, numbers[0..4], @intCast(entry.path.len), .big);
         std.mem.writeInt(u64, numbers[4..12], entry.size, .big);
@@ -273,12 +304,41 @@ pub fn inventory(allocator: std.mem.Allocator, io: std.Io, directory: Directory,
         hash.update(entry.path);
         hash.update(&entry.sha256);
     }
-    const count: u32 = @intCast(entries.items.len);
-    return .{ .entries = try entries.toOwnedSlice(allocator), .tree = .{
+    const count: u32 = @intCast(entries.len);
+    return .{
         .sha256 = std.fmt.bytesToHex(hash.finalResult(), .lower),
         .files = count,
         .bytes = total,
-    } };
+    };
+}
+
+/// Compact commitment to every physical file and directory, not just contents.
+pub fn physicalDigest(allocator: std.mem.Allocator, io: std.Io, root: Directory) !c.Sha {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var entries: std.ArrayList(c.File) = .empty;
+    var directories: std.ArrayList(Subdirectory) = .empty;
+    var total: u64 = 0;
+    const before = try metadata(.{ .handle = root.dir.handle, .flags = .{ .nonblocking = false } });
+    try collect(a, io, root, root.dir, "", &entries, &directories, &total, 100000, 4 * 1024 * 1024 * 1024, 0);
+    _ = inventoryTree(entries.items, directories.items, total);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("hyperv-native-physical-v1\x00");
+    hash.update(try c.canonical(a, before));
+    for (directories.items) |entry| {
+        const dir = try root.dir.openDir(io, entry.path, .{ .follow_symlinks = false });
+        defer dir.close(io);
+        hash.update(try c.canonical(a, .{ .path = entry.path, .metadata = try metadata(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } }) }));
+    }
+    for (entries.items) |entry| {
+        const file = try root.openFile(io, entry.path, .artifact);
+        defer file.close(io);
+        hash.update(try c.canonical(a, .{ .file = entry, .metadata = try metadata(file) }));
+    }
+    if (!std.meta.eql(before, try metadata(.{ .handle = root.dir.handle, .flags = .{ .nonblocking = false } })))
+        return error.SourceChanged;
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
 }
 
 pub fn requireFile(actual: c.File, expected: c.File) !void {

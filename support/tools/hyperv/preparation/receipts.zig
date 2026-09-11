@@ -16,7 +16,7 @@ pub const Execution = struct {
     admitted_binding_sha256: c.Sha,
 };
 pub const Receipt = struct {
-    schema: enum { hyperv_artifact_preparation_native_v1 },
+    schema: enum { hyperv_artifact_preparation_native_v2 },
     phase: c.Phase,
     purpose: c.Purpose,
     run_id: c.Identity,
@@ -161,6 +161,7 @@ pub const Context = struct {
     }
 
     pub fn verify(self: *Context) !c.Source {
+        try fs.requireDirectoryIdentity(self.repository, self.bindings.repository);
         try self.requireGitBinding();
         try config.validateGuardPurpose(self.guard, self.purpose);
         try provenance.verify(self.allocator, self.io, self.review, self.bindings, self.reviewed_provenance_sha256);
@@ -193,6 +194,8 @@ pub const Context = struct {
             try sameTool(self.allocator, native.bound.contract, self.review.compiler);
         };
         if (!found_compiler) return error.UnreviewedInput;
+        try provenance.requirePackages(self.allocator, inputs.tools.packages.contract, self.review.dependencies);
+        try provenance.requireDeclarationRoots(inputs.tools.packages.contract.origin, self.repository, self.bindings.dependencies);
         if (self.bindings.dependencies.len != self.review.dependencies.len) return error.UnreviewedInput;
         for (self.review.dependencies) |dependency| {
             const path = try std.fs.path.join(self.allocator, &.{ inputs.tools.packages.directory.path, dependency.package_hash });
@@ -228,7 +231,7 @@ pub const Context = struct {
         defer self.allocator.free(bytes);
         try config.validateWithMetadata(self.allocator, bytes, self.guard, metadata);
         const receipt: Receipt = .{
-            .schema = .hyperv_artifact_preparation_native_v1,
+            .schema = .hyperv_artifact_preparation_native_v2,
             .phase = .prepared,
             .purpose = self.purpose,
             .run_id = self.guard.run_id,

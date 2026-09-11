@@ -1,6 +1,8 @@
 pub const contracts = @import("contracts.zig");
 pub const files = @import("files.zig");
 pub const runtime = @import("runtime.zig");
+pub const origin = @import("origin.zig");
+pub const origin_fixture = if (@import("builtin").is_test) @import("origin_fixture.zig") else struct {};
 pub const source = @import("source.zig");
 pub const config = @import("config.zig");
 pub const seed = @import("seed.zig");
@@ -18,4 +20,5 @@ pub const git_entry = @import("git_entry.zig");
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("tests.zig");
+    _ = @import("origin_tests.zig");
 }

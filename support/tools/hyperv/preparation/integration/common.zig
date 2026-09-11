@@ -16,6 +16,7 @@ pub const ToolSpec = struct {
     loader: ?[]const u8,
     libraries: []const []const u8,
     origin: rt.Origin,
+    evidence: []const rt.origin.Binding = &.{},
 };
 pub const Locations = struct {
     repository: []const u8,
@@ -27,7 +28,7 @@ pub const Locations = struct {
     git_scratch: []const u8,
 };
 pub const Spec = struct {
-    schema: enum { hyperv_native_integration_spec_v1 },
+    schema: enum { hyperv_native_integration_spec_v2 },
     repository: []const u8,
     actor_directory: []const u8,
     facade_runtime: []const u8,
@@ -43,7 +44,7 @@ pub const Spec = struct {
     dependencies: []const struct { name: []const u8, package_hash: []const u8, origin: rt.Origin },
 };
 pub const Bundle = struct {
-    schema: enum { hyperv_native_integration_material_v1 },
+    schema: enum { hyperv_native_integration_material_v2 },
     authority: enum { not_admitted },
     guard: p.config.Guard,
     provenance: p.provenance.Record,
@@ -53,7 +54,7 @@ pub const Bundle = struct {
 };
 pub const Phase = enum { prepare, configure, build, package, generate };
 pub const Stage = struct {
-    schema: enum { hyperv_native_integration_stage_v1 },
+    schema: enum { hyperv_native_integration_stage_v2 },
     authority: enum { not_admitted },
     phase: enum { configure, build },
     bootstrap_sha256: Sha,
@@ -182,6 +183,7 @@ pub const World = struct {
             .role = spec.role,
             .target = spec.target,
             .origin = spec.origin,
+            .evidence = spec.evidence,
             .tree = (try fs.inventory(self.allocator, self.io, directory, 100000, 4 * 1024 * 1024 * 1024)).tree,
             .executable = if (spec.executable) |path| try directory.record(self.allocator, self.io, path, 1024 * 1024 * 1024, .executable) else null,
             .loader = if (spec.loader) |path| try directory.record(self.allocator, self.io, path, 64 * 1024 * 1024, .executable) else null,
@@ -206,6 +208,7 @@ pub const World = struct {
         for (locations.dependencies, dependencies) |item, *bound|
             bound.* = .{ .name = item.name, .directory = try self.open(item.directory) };
         return .{
+            .repository = try self.open(locations.repository),
             .producer = try self.open(locations.producer),
             .compiler = try self.open(locations.compiler),
             .git = try self.open(locations.git),

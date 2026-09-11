@@ -63,7 +63,7 @@ pub const Commitments = struct {
 /// This projection is a local, explicitly versioned convention for parent
 /// review. Its provenance digest is NOT the producer executable or host-image
 /// digest. It conveys no live image, operator, signature, or completed admission.
-pub fn project(input: inputs.PreparedInputV2, review: Review) !Commitments {
+pub fn project(input: inputs.PreparedInputV3, review: Review) !Commitments {
     try receipts.validate(input.receipt);
     if (input.receipt.phase != .packaged) return error.InvalidPhase;
     if (!std.meta.eql(input.receipt.reviewed_provenance_sha256, review.provenance_sha256) or
@@ -102,7 +102,7 @@ pub fn storageIdentity(hex: c.Identity) !StorageIdentity {
 
 pub const Loaded = struct {
     arena: std.heap.ArenaAllocator,
-    input: inputs.PreparedInputV2,
+    input: inputs.PreparedInputV3,
     chain: [4]receipts.Link,
     commitments: Commitments,
     staging_tree: c.Tree,
@@ -169,6 +169,7 @@ pub fn requireEngine(allocator: std.mem.Allocator, io: std.Io, bound: runtime.Bo
 
 fn verifySource(allocator: std.mem.Allocator, io: std.Io, record: provenance.Record, binding: ProducerSource, digest: c.Sha, deadline: Deadline) !void {
     try checkDeadline(deadline);
+    try fs.requireDirectoryIdentity(binding.repository, binding.provenance_bindings.repository);
     try fs.requireDirectoryIdentity(binding.git.runtime.directory, binding.provenance_bindings.git);
     const actual = try c.canonical(allocator, binding.git.runtime.contract);
     const expected = try c.canonical(allocator, record.git);
@@ -221,6 +222,10 @@ fn requireProducerLocations(allocator: std.mem.Allocator, io: std.Io, bytes: []c
     const locations = bindings.producer_source.provenance_bindings;
     try sameTool(allocator, selected.git, locations.git, review.git);
     try sameTool(allocator, selected.trust, locations.trust, review.trust);
+    inline for (.{ "git", "packages", "bison_data", "trust" }) |field|
+        try inputs.requireEvidenceBindings(allocator, io, input.selection, bindings.assets, @field(selected, field).contract.evidence);
+    for (selected.native) |native|
+        try inputs.requireEvidenceBindings(allocator, io, input.selection, bindings.assets, native.tool.contract.evidence);
     var compiler_found = false;
     for (selected.native) |native| if (native.name == .zig) {
         if (compiler_found) return error.UnreviewedInput;
@@ -230,6 +235,8 @@ fn requireProducerLocations(allocator: std.mem.Allocator, io: std.Io, bytes: []c
     if (!compiler_found) return error.UnreviewedInput;
     const packages = try fs.Directory.open(allocator, io, selected.packages.path);
     defer packages.close(allocator, io);
+    try provenance.requirePackages(allocator, selected.packages.contract, review.dependencies);
+    try provenance.requireDeclarationRoots(selected.packages.contract.origin, locations.repository, locations.dependencies);
     var iterator = packages.dir.iterate();
     var count: usize = 0;
     while (try iterator.next(io)) |entry| {
@@ -330,7 +337,7 @@ pub fn load(backing_allocator: std.mem.Allocator, io: std.Io, review: Review, bi
     try fs.requireLock(io, &lock);
     const staging: fs.Directory = .{ .dir = bindings.staging.dir, .path = "" };
     const bytes = try readReviewed(allocator, io, staging, "input.json", review.input_sha256);
-    const parsed = try c.parse(inputs.PreparedInputV2, allocator, bytes);
+    const parsed = try c.parse(inputs.PreparedInputV3, allocator, bytes);
     const input = parsed.value;
     var chain: [4]receipts.Link = undefined;
     for ([_][]const u8{ "prepared.receipt.json", "configured.receipt.json", "built.receipt.json", "packaged.receipt.json" }, 0..) |name, i| {
@@ -363,8 +370,12 @@ pub fn load(backing_allocator: std.mem.Allocator, io: std.Io, review: Review, bi
     _ = try package.validate(allocator, io, bindings.packaged, bindings.efi, input.receipt.packaging.?);
     try checkDeadline(deadline);
     try inputs.checkQemuClosure(allocator, io, input.selection, bindings.qemu);
+    try inputs.requireEvidenceBindings(allocator, io, input.selection, bindings.assets, input.selection.qemu.evidence);
+    try inputs.requireFirmwareOrigins(allocator, io, input.selection, bindings.assets);
+    try inputs.requireProvenanceEvidence(allocator, io, input.selection, bindings.assets, input.receipt.provenance);
     const capability = try inputs.loadCapability(allocator, io, input.selection, bindings.assets);
     defer capability.deinit();
+    try inputs.requireProvenanceEvidence(allocator, io, input.selection, bindings.assets, capability.value.provenance);
     if (!std.meta.eql(capability.value.reviewed_provenance_sha256, review.capability_provenance_sha256))
         return error.UnreviewedInput;
     try verifySource(allocator, io, capability.value.provenance, bindings.capability_source, review.capability_provenance_sha256, deadline);
@@ -376,6 +387,7 @@ pub fn load(backing_allocator: std.mem.Allocator, io: std.Io, review: Review, bi
     try verifySource(allocator, io, input.receipt.provenance, bindings.producer_source, review.provenance_sha256, deadline);
     try verifySource(allocator, io, capability.value.provenance, bindings.capability_source, review.capability_provenance_sha256, deadline);
     try inputs.checkQemuClosure(allocator, io, input.selection, bindings.qemu);
+    try inputs.requireFirmwareOrigins(allocator, io, input.selection, bindings.assets);
     try requireEngine(allocator, io, bindings.engine, review);
     try fs.requireTree(staging_before, try inputs.requireStagedClosure(allocator, io, &lock, input.selection.assets, input_file));
     try checkDeadline(deadline);

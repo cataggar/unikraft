@@ -7,6 +7,7 @@ const c = x.c;
 const fs = x.fs;
 
 pub const Command = union(enum) {
+    runtime_material,
     material,
     stage: struct { phase: @FieldType(x.Stage, "phase"), expected: ?[]const u8 },
     producer: x.Phase,
@@ -20,6 +21,8 @@ pub const Arguments = struct { workspace: []const u8, command: Command };
 pub fn arguments(args: []const []const u8) !Arguments {
     if (args.len < 3 or args.len > 5) return error.InvalidArguments;
     try p.environment.absolute(args[2]);
+    if (std.mem.eql(u8, args[1], "runtime-material") and args.len == 3)
+        return .{ .workspace = args[2], .command = .runtime_material };
     if (std.mem.eql(u8, args[1], "material") and args.len == 3)
         return .{ .workspace = args[2], .command = .material };
     if (std.mem.eql(u8, args[1], "selection") and args.len == 3)
@@ -93,6 +96,10 @@ fn producer(world: *x.World, workspace: fs.Directory, phase: x.Phase) !x.Sha {
         },
     };
     const root = (try material.bundle(world, workspace, bootstrap_sha)).value;
+    if (stage) |selected_stage| {
+        try @import("runtime_material.zig").requireExecution(world, root.binding, selected_stage.execution);
+        try @import("runtime_material.zig").requireExecution(world, root.binding, selected_stage.inspection);
+    }
     var context = try world.context(root, review.provenance_sha256);
     defer world.merge(context.failures) catch unreachable;
     defer world.merge(context.git.failures) catch unreachable;
@@ -216,6 +223,7 @@ pub fn run(world: *x.World, command: Arguments) !void {
         return;
     }
     const hash = switch (command.command) {
+        .runtime_material => (try @import("runtime_material.zig").publish(world, workspace)).sha256,
         .material => (try material.bootstrap(world, workspace)).sha256,
         .stage => |stage| (try material.stage(world, workspace, stage.phase, stage.expected)).sha256,
         .producer => |phase| try producer(world, workspace, phase),

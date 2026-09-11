@@ -145,7 +145,7 @@ fn tool(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory, execu
     if (dynamic) libraries[0] = try directory.record(allocator, io, "lib/libc.so.6", 16 * 1024 * 1024, .artifact);
     return .{ .directory = directory, .contract = .{
         .role = .preparation,
-        .origin = .{ .scheme = .authenticated_distribution, .revision = "synthetic-public-fixture", .source_sha256 = c.digest("fixture"), .producer_sha256 = c.digest("fixture") },
+        .origin = @import("origin_fixture.zig").local(),
         .target = if (builtin.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
         .tree = (try fs.inventory(allocator, io, directory, 32, 128 * 1024 * 1024)).tree,
         .executable = try directory.record(allocator, io, executable, 64 * 1024 * 1024, .executable),
@@ -1129,6 +1129,19 @@ fn insideGit(allocator: std.mem.Allocator, io: std.Io, mode: []const u8) !void {
         };
         return error.WritableRuntime;
     }
+    for (record.runtime.evidence) |evidence| {
+        const directory = try fs.Directory.open(allocator, io, evidence.directory.path);
+        defer directory.close(allocator, io);
+        const inventory = try fs.inventory(allocator, io, directory, 256, c.control_cap);
+        for (inventory.entries) |file| {
+            const writable = directory.dir.openFile(io, file.path, .{ .mode = .write_only }) catch |err| switch (err) {
+                error.ReadOnlyFileSystem => continue,
+                else => return err,
+            };
+            writable.close(io);
+            return error.WritableOriginEvidence;
+        }
+    }
     var poison = try poisonedGitEnvironment(allocator, record);
     var stripped = std.process.Environ.Map.init(allocator);
     const unborn = std.mem.eql(u8, mode, "inside-git-unborn");
@@ -1297,12 +1310,7 @@ test "namespace Git policy exact canonical schema has no command or environment 
         .runtime_directory = "/selected/runtime",
         .runtime = .{
             .role = .git,
-            .origin = .{
-                .scheme = .authenticated_distribution,
-                .revision = "synthetic",
-                .source_sha256 = c.digest("public fixture"),
-                .producer_sha256 = c.digest("public fixture"),
-            },
+            .origin = @import("origin_fixture.zig").shapeDistribution(),
             .target = .aarch64_linux,
             .tree = .{ .sha256 = c.digest("public fixture"), .files = 3, .bytes = 3 },
             .executable = executable,

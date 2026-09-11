@@ -20,18 +20,26 @@ pub const Asset = struct {
     destination: []const u8,
     placement: enum { staged, baked, future_copy },
 };
-pub const SelectionV2 = struct {
-    schema: enum { hyperv_native_input_selection_v2 },
+pub const FirmwareOrigin = struct {
+    asset_id: []const u8,
+    directory: runtime.origin.Identity,
+    physical_sha256: c.Sha,
+    tool: runtime.Tool,
+    member: c.File,
+};
+pub const SelectionV3 = struct {
+    schema: enum { hyperv_native_input_selection_v3 },
     packaged_receipt_sha256: c.Sha,
     solved_metadata: c.File,
     publication: struct { receipts: [4]c.File, executions: [2]c.File, inspections: [2]c.File },
     capability_source: c.Source,
     capability_receipt: c.File,
     qemu: runtime.Tool,
+    firmware_origins: struct { code: FirmwareOrigin, vars: FirmwareOrigin },
     assets: []const Asset,
 };
-pub const PreparedInputV2 = struct {
-    schema: enum { hyperv_native_prepared_input_v2 },
+pub const PreparedInputV3 = struct {
+    schema: enum { hyperv_native_prepared_input_v3 },
     state: enum { prepared },
     authority: enum { not_admitted },
     receipt: receipts.Receipt,
@@ -40,11 +48,11 @@ pub const PreparedInputV2 = struct {
     ledger: []const budget.Entry,
     budget: budget.Totals,
 };
-pub const Plan = SelectionV2;
-pub const Input = PreparedInputV2;
+pub const Plan = SelectionV3;
+pub const Input = PreparedInputV3;
 pub const Binding = struct { id: []const u8, directory: fs.Directory };
 pub const Capability = struct {
-    schema: enum { hyperv_public_capability_artifact_native_v1 },
+    schema: enum { hyperv_public_capability_artifact_native_v2 },
     image: c.File,
     provenance: provenance.Record,
     reviewed_provenance_sha256: c.Sha,
@@ -151,6 +159,7 @@ pub fn controlAsset(plan: Plan, expected: c.File) !Asset {
 /// Charge every physical file in an independently validated control runtime,
 /// including its interpreter, libraries and non-ELF support files.
 pub fn requireControlBinding(allocator: std.mem.Allocator, io: std.Io, plan: Plan, bindings: []const Binding, required: runtime.Bound) !void {
+    try requireEvidenceBindings(allocator, io, plan, bindings, required.contract.evidence);
     const expected = required.contract.executable orelse return error.InvalidRuntime;
     if (required.contract.tree.bytes > c.control_cap) return error.ControlLimitExceeded;
     if (required.contract.tree.files > plan.assets.len) return error.MissingControlBinding;
@@ -166,6 +175,10 @@ pub fn requireControlBinding(allocator: std.mem.Allocator, io: std.Io, plan: Pla
 }
 
 pub fn requireControlFileBinding(io: std.Io, plan: Plan, bindings: []const Binding, required_directory: fs.Directory, expected: c.File, policy: fs.Policy) !void {
+    return requireHeldFileBinding(io, plan, bindings, required_directory, expected, policy, true);
+}
+
+fn requireHeldFileBinding(io: std.Io, plan: Plan, bindings: []const Binding, required_directory: fs.Directory, expected: c.File, policy: fs.Policy, control: bool) !void {
     const required_file = try required_directory.openFile(io, expected.path, policy);
     defer required_file.close(io);
     const identity = try fs.metadata(required_file);
@@ -174,8 +187,9 @@ pub fn requireControlFileBinding(io: std.Io, plan: Plan, bindings: []const Bindi
         !std.meta.eql(try fs.hashFile(io, required_file, expected.size), expected.sha256) or
         !std.meta.eql(identity, try fs.metadata(required_file))) return error.HashMismatch;
     for (plan.assets) |item| {
-        if (!item.role.isControl() or !std.mem.eql(u8, item.source.path, expected.path) or
+        if ((control and !item.role.isControl()) or !std.mem.eql(u8, item.source.path, expected.path) or
             !std.meta.eql(item.source.sha256, expected.sha256)) continue;
+        if (item.placement != .staged) continue;
         try fs.requireFile(item.source, expected);
         const directory = try binding(bindings, item.id);
         const selected = try directory.openFile(io, item.source.path, .artifact);
@@ -185,6 +199,58 @@ pub fn requireControlFileBinding(io: std.Io, plan: Plan, bindings: []const Bindi
             std.meta.eql(identity, try fs.metadata(required_file))) return;
     }
     return error.MissingControlBinding;
+}
+
+pub fn requireEvidenceBindings(allocator: std.mem.Allocator, io: std.Io, plan: Plan, bindings: []const Binding, evidence: []const runtime.origin.Binding) !void {
+    if (evidence.len == 0) return;
+    for (plan.assets) |asset_record| switch (asset_record.role) {
+        .native_control, .producer_control, .qemu, .qemu_support, .firmware_code, .firmware_vars => {
+            const directory = try binding(bindings, asset_record.id);
+            try runtime.origin.requireSeparate(evidence, &.{directory.path});
+        },
+        else => {},
+    };
+    for (evidence) |selected| {
+        _ = try runtime.origin.validateEvidence(allocator, io, selected);
+        const directory = try fs.Directory.open(allocator, io, selected.directory.path);
+        defer directory.close(allocator, io);
+        try selected.directory.require(try runtime.origin.Identity.directory(directory));
+        const inventory = try fs.inventory(allocator, io, directory, 240, c.control_cap);
+        for (inventory.entries) |file| try requireControlFileBinding(io, plan, bindings, directory, file, .artifact);
+    }
+}
+pub fn requireProvenanceEvidence(allocator: std.mem.Allocator, io: std.Io, plan: Plan, bindings: []const Binding, record: provenance.Record) !void {
+    inline for (.{ "producer", "compiler", "git", "trust" }) |field|
+        try requireEvidenceBindings(allocator, io, plan, bindings, @field(record, field).evidence);
+    for (record.dependencies) |dependency| try requireEvidenceBindings(allocator, io, plan, bindings, dependency.content.evidence);
+}
+pub fn validateFirmwareOrigins(plan: Plan) !void {
+    inline for (.{ "code", "vars" }, .{ budget.Role.firmware_code, .firmware_vars }) |name, role| {
+        const selected = @field(plan.firmware_origins, name);
+        _ = try c.sha(&selected.physical_sha256);
+        const file = try asset(plan.assets, role);
+        if (!std.mem.eql(u8, selected.asset_id, file.id) or selected.tool.role != .firmware or selected.tool.target != .data or
+            selected.tool.executable != null or selected.tool.loader != null or selected.tool.libraries.len != 0 or
+            selected.tool.origin.payload != .distribution) return error.InvalidFirmwareOrigin;
+        try runtime.origin.validate(selected.tool.origin, selected.tool.role, selected.tool.target);
+        try fs.requireFile(selected.member, file.source);
+    }
+    if (std.mem.eql(u8, plan.firmware_origins.code.asset_id, plan.firmware_origins.vars.asset_id))
+        return error.InvalidFirmwareOrigin;
+}
+pub fn requireFirmwareOrigins(allocator: std.mem.Allocator, io: std.Io, plan: Plan, bindings: []const Binding) !void {
+    try validateFirmwareOrigins(plan);
+    inline for (.{ "code", "vars" }) |name| {
+        const selected = @field(plan.firmware_origins, name);
+        const directory = try binding(bindings, selected.asset_id);
+        try runtime.origin.requireSeparate(selected.tool.evidence, &.{ plan.firmware_origins.code.directory.path, plan.firmware_origins.vars.directory.path });
+        try selected.directory.require(try runtime.origin.Identity.directory(directory));
+        if (!std.meta.eql(selected.physical_sha256, try fs.physicalDigest(allocator, io, directory))) return error.SourceChanged;
+        try (runtime.Bound{ .directory = directory, .contract = selected.tool }).validate(allocator, io);
+        try requireEvidenceBindings(allocator, io, plan, bindings, selected.tool.evidence);
+        const inventory = try fs.inventory(allocator, io, directory, 240, c.total_cap);
+        for (inventory.entries) |file| try requireHeldFileBinding(io, plan, bindings, directory, file, .artifact, false);
+    }
 }
 
 pub fn publicationAllowance(entries: []const budget.Entry) !u64 {
@@ -207,6 +273,10 @@ fn requirePolicyControls(allocator: std.mem.Allocator, io: std.Io, plan: Plan, b
         defer parsed.deinit();
         try producer.validateBindingStructure(allocator, parsed.value);
         try producer.validatePolicyFiles(allocator, io, parsed.value);
+        inline for (.{ "git", "packages", "bison_data", "trust" }) |name|
+            try requireEvidenceBindings(allocator, io, plan, bindings, @field(parsed.value, name).contract.evidence);
+        for (parsed.value.native) |native|
+            try requireEvidenceBindings(allocator, io, plan, bindings, native.tool.contract.evidence);
         const isolated = parsed.value.isolation.?;
         const helper = try fs.Directory.open(allocator, io, isolated.helper.path);
         defer helper.close(allocator, io);
@@ -263,6 +333,7 @@ pub fn ledger(allocator: std.mem.Allocator, plan: Plan, packaged: receipts.Link)
     var working: usize = 0;
     var controls = [_]usize{0} ** 4;
     const vars = try asset(plan.assets, .firmware_vars);
+    try validateFirmwareOrigins(plan);
     for (plan.assets) |item| {
         try c.relative(item.destination);
         if (item.destination[0] == '.' or std.mem.eql(u8, item.destination, "input.json")) return error.UnsafePath;
@@ -462,8 +533,12 @@ pub fn generate(
     if (!std.meta.eql(c.digest(package_bytes), packaged.sha256)) return error.ReceiptSubstitution;
     _ = try packaging.validate(allocator, io, package_directory, efi_directory, packaged.receipt.packaging.?);
     try checkQemuClosure(allocator, io, plan, qemu_directory);
+    try requireEvidenceBindings(allocator, io, plan, bindings, plan.qemu.evidence);
+    try requireFirmwareOrigins(allocator, io, plan, bindings);
+    try requireProvenanceEvidence(allocator, io, plan, bindings, packaged.receipt.provenance);
     const capability = try loadCapability(allocator, io, plan, bindings);
     defer capability.deinit();
+    try requireProvenanceEvidence(allocator, io, plan, bindings, capability.value.provenance);
     try validateSolvedConfig(allocator, io, plan, bindings, context.configuration_directory orelse return error.MissingConfiguration, packaged.receipt);
     for (plan.assets) |item| {
         const directory = try binding(bindings, item.id);
@@ -472,7 +547,7 @@ pub fn generate(
     try requireControlBinding(allocator, io, plan, bindings, .{ .directory = context.bindings.producer, .contract = context.review.producer });
     try requirePolicyControls(allocator, io, plan, bindings);
     const result: Input = .{
-        .schema = .hyperv_native_prepared_input_v2,
+        .schema = .hyperv_native_prepared_input_v3,
         .state = .prepared,
         .authority = .not_admitted,
         .receipt = packaged.receipt,
@@ -495,6 +570,7 @@ pub fn generate(
     }
     try source.require(before, try context.verify());
     try checkQemuClosure(allocator, io, plan, qemu_directory);
+    try requireFirmwareOrigins(allocator, io, plan, bindings);
     for (plan.assets) |item| {
         try fs.requireFile(try (try binding(bindings, item.id)).record(allocator, io, item.source.path, c.total_cap, .artifact), item.source);
         if (item.placement == .staged) {

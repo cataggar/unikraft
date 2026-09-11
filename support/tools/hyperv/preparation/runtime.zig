@@ -12,12 +12,8 @@ const ElfInfo = struct {
 };
 
 pub const Role = enum { git, zig, make, bison, flex, m4, llvm, miz, qemu, firmware, bison_data, dependencies, trust, preparation };
-pub const Origin = struct {
-    scheme: enum { git, zig_package, authenticated_distribution },
-    revision: []const u8,
-    source_sha256: c.Sha,
-    producer_sha256: c.Sha,
-};
+pub const origin = @import("origin.zig");
+pub const Origin = origin.Origin;
 pub const Tool = struct {
     role: Role,
     origin: Origin,
@@ -26,6 +22,7 @@ pub const Tool = struct {
     executable: ?c.File,
     loader: ?c.File,
     libraries: []const c.File,
+    evidence: []const origin.Binding = &.{},
 };
 
 pub const Bound = struct {
@@ -37,10 +34,7 @@ pub const Bound = struct {
         defer arena.deinit();
         const allocator = arena.allocator();
         if (self.contract.libraries.len > 256) return error.LimitExceeded;
-        _ = try c.sha(&self.contract.origin.source_sha256);
-        _ = try c.sha(&self.contract.origin.producer_sha256);
-        if (self.contract.origin.revision.len == 0 or self.contract.origin.revision.len > 256) return error.UnreviewedInput;
-        if (self.contract.role == .miz and !std.mem.eql(u8, self.contract.origin.revision, c.miz_revision)) return error.UnreviewedInput;
+        try origin.validate(self.contract.origin, self.contract.role, self.contract.target);
         const observed = try fs.inventory(allocator, io, self.directory, 100000, 4 * 1024 * 1024 * 1024);
         try fs.requireTree(observed.tree, self.contract.tree);
         const loader_info: ?ElfInfo = if (self.contract.loader) |loader| blk: {
@@ -89,6 +83,7 @@ pub const Bound = struct {
                 !std.mem.eql(u8, self.contract.loader.?.path, "lib/loader") or
                 observed.entries.len != self.contract.libraries.len + 2) return error.IncompleteRuntime;
         }
+        try origin.requirePhysical(allocator, io, self.directory, self.contract.origin, self.contract.evidence, observed);
         const named = try fs.Directory.open(allocator, io, self.directory.path);
         defer named.close(allocator, io);
         if (!std.meta.eql(try directoryMetadata(self.directory.dir), try directoryMetadata(named.dir))) return error.SourceChanged;
@@ -461,14 +456,11 @@ pub const TestFixture = struct {
         for (inventory.entries) |record| if (!std.mem.eql(u8, record.path, "bin/git") and !std.mem.eql(u8, record.path, "lib/loader")) {
             try libraries.append(allocator, record);
         };
+        const synthetic = try @import("origin_fixture.zig").distribution(allocator, io, directory);
         const result: Bound = .{ .directory = directory, .contract = .{
             .role = .git,
-            .origin = .{
-                .scheme = .authenticated_distribution,
-                .revision = "public-installed-synthetic-runtime",
-                .source_sha256 = c.digest("synthetic runtime fixture input"),
-                .producer_sha256 = c.digest("synthetic runtime fixture producer"),
-            },
+            .origin = synthetic.origin,
+            .evidence = synthetic.evidence,
             .target = if (builtin.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
             .tree = inventory.tree,
             .executable = try directory.record(allocator, io, "bin/git", 64 * 1024 * 1024, .executable),

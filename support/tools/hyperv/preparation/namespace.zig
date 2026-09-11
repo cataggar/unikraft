@@ -172,7 +172,7 @@ fn sameRecord(allocator: std.mem.Allocator, a: anytype, b: @TypeOf(a)) !bool {
 }
 
 pub const Request = struct {
-    schema: enum { @"uk.native-preparation-namespace.v1" } = .@"uk.native-preparation-namespace.v1",
+    schema: enum { @"uk.native-preparation-namespace.v2" } = .@"uk.native-preparation-namespace.v2",
     step: producer.Step,
     binding: producer.Binding,
     root: Identity,
@@ -394,6 +394,11 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
     }
     if (!paths.isDescendant(sandbox.workspace.path, sandbox.scratch.path)) return error.UnsafePath;
     var mounts: std.ArrayList(Mount) = .empty;
+    var evidence_directories: std.ArrayList(fs.Directory) = .empty;
+    defer {
+        for (evidence_directories.items) |directory| directory.close(allocator, io);
+        evidence_directories.deinit(allocator);
+    }
     const facade = sandbox.isolation.facade_runtime;
     try addDirectory(allocator, &mounts, sandbox.workspace, false);
     try addDirectory(allocator, &mounts, facade, false);
@@ -406,6 +411,15 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
             if (paths.isSameOrAncestor(bound.directory.path, reserved)) return error.UnsafePath;
         if (paths.isSameOrAncestor(sandbox.scratch.path, bound.directory.path)) return error.UnsafePath;
         try addDirectory(allocator, &mounts, bound.directory, true);
+        for (bound.contract.evidence) |evidence| {
+            for ([_][]const u8{ "/bin", "/lib", "/lib64", "/usr", "/etc", "/dev", "/proc", sandbox.repository.path, sandbox.workspace.path, facade.path, sandbox.isolation.account.home }) |reserved|
+                if (paths.isSameOrAncestor(evidence.directory.path, reserved)) return error.UnsafePath;
+            if (paths.isSameOrAncestor(sandbox.scratch.path, evidence.directory.path)) return error.UnsafePath;
+            const directory = try fs.Directory.open(allocator, io, evidence.directory.path);
+            try evidence_directories.append(allocator, directory);
+            try evidence.directory.require(try rt.origin.Identity.directory(directory));
+            try addDirectory(allocator, &mounts, directory, true);
+        }
         if (bound.contract.executable) |executable| {
             try interpreterMount(allocator, io, &mounts, bound, executable);
             if (bound.contract.loader) |loader| {

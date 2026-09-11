@@ -248,7 +248,7 @@ const ToolBinding = ns.Tool;
 const NativeBinding = struct { name: Alias, tool: ToolBinding };
 
 pub const Binding = struct {
-    schema: enum { hyperv_local_native_producer_binding_v3 },
+    schema: enum { hyperv_local_native_producer_binding_v4 },
     source: c.Source,
     repository: DirectoryIdentity,
     workspace: DirectoryIdentity,
@@ -274,7 +274,7 @@ pub fn describe(allocator: std.mem.Allocator, inputs: Inputs) !Binding {
     const native = try allocator.alloc(NativeBinding, inputs.tools.native.len);
     for (inputs.tools.native, native) |item, *binding| binding.* = .{ .name = item.name, .tool = toolBinding(item.bound) };
     return .{
-        .schema = .hyperv_local_native_producer_binding_v3,
+        .schema = .hyperv_local_native_producer_binding_v4,
         .source = inputs.observed_source,
         .repository = try directoryIdentity(inputs.repository),
         .workspace = try directoryIdentity(inputs.workspace.directory),
@@ -420,12 +420,10 @@ pub fn validateBindingStructure(allocator: std.mem.Allocator, binding: Binding) 
     const isolation = binding.isolation orelse return error.DependencyUnavailable;
     if (isolation.make_environment == null or isolation.git_policy == null) return error.DependencyUnavailable;
     if (isolation.helper.contract.role != .preparation or isolation.helper.contract.executable == null or
-        isolation.helper.contract.loader != null or isolation.helper.contract.libraries.len != 0 or
-        !std.meta.eql(isolation.helper.contract.origin.source_sha256, binding.source.physical.sha256))
+        isolation.helper.contract.loader != null or isolation.helper.contract.libraries.len != 0)
         return error.UnreviewedInput;
     for (binding.native) |native| if (native.name == .zig) {
-        if (!std.meta.eql(isolation.helper.contract.origin.producer_sha256, native.tool.contract.executable.?.sha256))
-            return error.UnreviewedInput;
+        try isolation.helper.contract.origin.requireLocal(binding.source, native.tool.contract.executable.?);
     };
     const entry = execution.git_entry_source orelse return error.DependencyUnavailable;
     if (!std.mem.eql(u8, entry.path, "support/tools/hyperv/preparation/git_entry.zig")) return error.UnreviewedInput;
@@ -443,8 +441,8 @@ fn validateNativeStructure(allocator: std.mem.Allocator, native_tools: []const N
         if (tool.contract.role != aliasRole(native.name) or tool.contract.executable == null) return error.DependencyUnavailable;
         try commandPath(tool.path);
         try c.relative(tool.contract.executable.?.path);
-        if (native.name == .zig and (tool.contract.origin.scheme != .zig_package or
-            !std.mem.eql(u8, tool.contract.origin.revision, c.compiler_version))) return error.UnreviewedInput;
+        if (native.name == .zig and (tool.contract.origin.payload != .distribution or tool.contract.target == .data or
+            !std.mem.eql(u8, try tool.contract.origin.revision(), c.compiler_version))) return error.UnreviewedInput;
         if (native.name == .git and !std.mem.eql(u8, try c.canonical(allocator, tool), try c.canonical(allocator, git)))
             return error.UnreviewedInput;
     }
@@ -537,7 +535,7 @@ test "producer rejects every missing mandatory native alias wrong role compiler 
     for (required_aliases, &native) |name, *entry| {
         entry.* = .{ .name = name, .tool = .{ .path = "/public/synthetic/runtime", .contract = .{
             .role = aliasRole(name),
-            .origin = .{ .scheme = .zig_package, .revision = c.compiler_version, .source_sha256 = c.digest("shape"), .producer_sha256 = c.digest("shape") },
+            .origin = @import("origin_fixture.zig").shapeDistribution(),
             .target = .x86_64_linux,
             .tree = .{ .sha256 = c.digest("shape"), .files = 1, .bytes = 1 },
             .executable = .{ .path = "bin/tool", .size = 1, .mode = 0o700, .sha256 = c.digest("shape") },
@@ -557,7 +555,7 @@ test "producer rejects every missing mandatory native alias wrong role compiler 
     changed[0].tool.contract.role = .qemu;
     try std.testing.expectError(error.DependencyUnavailable, validateNativeStructure(allocator, &changed, git));
     changed = native;
-    changed[0].tool.contract.origin.revision = "0.15.2";
+    changed[0].tool.contract.origin.payload.distribution.runtime_revision = "0.15.2";
     try std.testing.expectError(error.UnreviewedInput, validateNativeStructure(allocator, &changed, git));
     changed = native;
     changed[1] = changed[0];
@@ -566,6 +564,14 @@ test "producer rejects every missing mandatory native alias wrong role compiler 
 
 fn validateTools(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !void {
     const tools = inputs.tools;
+    var roots: std.ArrayList([]const u8) = .empty;
+    defer roots.deinit(allocator);
+    try roots.appendSlice(allocator, &.{ inputs.repository.path, tools.git.directory.path, tools.packages.directory.path, tools.bison_data.directory.path, tools.trust.directory.path });
+    if (inputs.isolation) |isolation| try roots.append(allocator, isolation.helper.directory.path);
+    for (tools.native) |native| try roots.append(allocator, native.bound.directory.path);
+    for (tools.native) |native| try runtime.origin.requireSeparate(native.bound.contract.evidence, roots.items);
+    for ([_]runtime.Bound{ tools.git, tools.packages, tools.bison_data, tools.trust }) |bound|
+        try runtime.origin.requireSeparate(bound.contract.evidence, roots.items);
     if (tools.path) |path| try requireDirectory(allocator, io, path, true);
     if (tools.native.len == 0 or tools.native.len > std.meta.fields(Alias).len) return error.DependencyUnavailable;
     for (tools.native, 0..) |item, index| {
@@ -573,8 +579,8 @@ fn validateTools(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !void
         const expected_role = aliasRole(item.name);
         if (item.bound.contract.role != expected_role or item.bound.contract.executable == null)
             return error.DependencyUnavailable;
-        if (item.name == .zig and (item.bound.contract.origin.scheme != .zig_package or
-            !std.mem.eql(u8, item.bound.contract.origin.revision, c.compiler_version)))
+        if (item.name == .zig and (item.bound.contract.origin.payload != .distribution or item.bound.contract.target == .data or
+            !std.mem.eql(u8, try item.bound.contract.origin.revision(), c.compiler_version)))
             return error.UnreviewedInput;
         _ = try executablePath(allocator, item.bound);
         if (item.name == .git) {
