@@ -138,13 +138,14 @@ image/serial hashes, byte counts and evidence kind. No exit-code-only PASS exist
 
 ## Limits and admission blockers
 
-The user explicitly approved a **2-MiB native-only control cap on 2026-09-10**.
-The cumulative staging limit remains unchanged. This approval changes no cloud,
-image-publication, identity, RBAC or network admission.
+The user explicitly approved an **8-MiB native-only control cap on 2026-09-11**,
+superseding the initial 2-MiB allowance after measuring the larger ReleaseSafe
+control closure. The cumulative staging limit remains unchanged. This approval
+changes no cloud, image-publication, identity, RBAC or network admission.
 
 | Item | Native bound |
 | --- | --- |
-| Control allowance | 2,097,152 bytes, including image-baked controls |
+| Control allowance | 8,388,608 bytes, including image-baked controls |
 | Cumulative staging | 268,435,456 bytes |
 | Command/admission | 65,536 bytes each |
 | Individual artifact | 134,217,728 bytes |
@@ -183,12 +184,20 @@ There are no binary, unit, image-baked, startup, ledger or emergency exemptions.
 Legacy Python policy, historical receipts and existing signed admissions are
 not rewritten or reinterpreted by this native policy change.
 
-The synthetic-key x86_64 Linux-musl ReleaseSmall measurement is **887,336 bytes**
-for the runner and **647 bytes** for the unit: **887,983 bytes together**.
-That known subtotal fits the approved 2,097,152-byte cap, leaving 1,209,169 bytes
-before accounting for every other control, admission/locator, startup,
-emergency reservation and ledger version. It is not whole-image or deployment
-admission, nor permission to exclude any remaining bytes.
+The synthetic-key x86_64 Linux-musl ReleaseSafe baseline measured from #130 is
+**1,526,888 bytes** for the runner and **647 bytes** for the unit. Together with
+the separately measured preparer and namespace helper, those four files total
+**3,266,607 bytes**. Minimum controller and host startup reservations bring that
+incomplete baseline to **3,536,943 bytes**, before the remaining integrated
+operator, runtime dependencies, publications and admission/locator bytes.
+This is why the former 2-MiB cap did not fit that selection. A smaller
+ReleaseSmall executable is not a substitute for the selected ReleaseSafe
+closure.
+
+The new cap is not evidence that the complete final selection fits. Remeasure
+every actual executable and necessary dependency; identical content in separate
+physical files does not discharge distinct-copy accounting. The full ledger
+must fit both limits, including startup, emergency and recording reservations.
 
 Production remains blocked on a reviewed immutable-image closure and signing
 authority, secure delivery/binding of signed admission and non-secret locator,
@@ -222,7 +231,7 @@ cp support/tools/hyperv/host/build.zig support/tools/hyperv/host/build.zig.zon "
 ```
 
 Use `-Doptimize=ReleaseSafe` for checked optimized fixtures. A cross-build uses
-`-Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall` and an explicitly synthetic
+`-Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe` and an explicitly synthetic
 image public key; it is not cloud admission. `-Dtest-filter=TEXT` narrows native
 fixture names. Fixture directories retain private local evidence under scratch.
 `test install` also compiles the CLI and therefore requires an explicit synthetic

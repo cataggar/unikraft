@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("hyperv_core").contracts;
 
-pub const max_control = 2 * 1024 * 1024;
+pub const max_control = 8 * 1024 * 1024;
 pub const max_staging = 256 * 1024 * 1024;
 pub const max_command = 64 * 1024;
 pub const max_locator = 4096;

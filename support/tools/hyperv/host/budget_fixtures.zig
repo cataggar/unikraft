@@ -35,8 +35,8 @@ fn initial(control: u64, staged: u64) !host.state.Record {
     return host.state.Record.initial(f.uuid(f.run_text), f.uuid(f.vm_text), f.uuid(f.public_nonce_text), staged, control);
 }
 
-test "native-only control cap is 2 MiB and complete subtotals have no exemption" {
-    try t.expectEqual(@as(u64, 2097152), p.max_control);
+test "native-only control cap is 8 MiB and complete subtotals have no exemption" {
+    try t.expectEqual(@as(u64, 8388608), p.max_control);
     try t.expectEqual(@as(u64, 268435456), p.max_staging);
     const runner: u64 = 800 * 1024;
     const unit: u64 = p.service_unit_bytes;
@@ -58,8 +58,19 @@ test "signed image accounting rejects omitted unit underreported totals and poli
     try t.expectError(error.InvalidBudget, image(.{ .image_staging_bytes = p.max_staging + 1 }, 256));
     try t.expectError(error.ControlAllowanceExceeded, image(.{}, p.max_control + 1));
     try t.expectError(error.ControlAllowanceExceeded, image(.{ .control_bytes = 524288 }, 256));
+    try t.expectError(error.ControlAllowanceExceeded, image(.{ .control_bytes = 2097152 }, 256));
     try t.expectError(error.ControlAllowanceExceeded, image(.{ .control_bytes = p.max_control + 1 }, 256));
     try t.expectError(error.InvalidBudget, image(.{ .staging_bytes = p.max_staging + 1 }, 256));
+}
+
+test "signed native controls can exceed the former cap while retaining startup headroom" {
+    const controls = 3 * 1024 * 1024;
+    var expanded = try image(.{
+        .image_control_bytes = controls,
+        .image_staging_bytes = controls,
+    }, controls - p.service_unit_bytes);
+    defer expanded.deinit();
+    try expanded.validateStartup(123);
 }
 
 test "pre-network startup gate includes metadata emergency and both bounded ledger writes" {
