@@ -88,7 +88,9 @@ dependency-free merged `core`.
   physical request/artifact/log bindings; a parsed report is not admission.
 - `vhd.validate(io, file)!u64` checks a complete fixed footer, checksum, file/
   original/current size, sector/whole-MiB geometry, CHS bounds, nonnil identity
-  and reserved fields. Dynamic/differencing, partial and excess files refuse.
+  and reserved fields. Legacy `vpc `, `vs  ` and `qemu` creators additionally
+  require CHS size to equal the exact current size; otherwise they refuse.
+  Dynamic/differencing, partial and excess files refuse.
 
 QEMU uses q35/KVM, 512 MiB RAM, the established Hyper-V CPU features,
 `vmbus-bridge,irq=15`, no NIC/display/monitor, no reboot and no user config.
@@ -109,8 +111,13 @@ QEMU receives the retained O_RDONLY descriptor via a JSON `-blockdev` file
 node and an exact-size read-only raw node at offset zero. This both avoids
 comma-based option injection and preserves exact backing-file identity.
 Fixed VHD instead uses a genuine read-only **`vpc`** node over the entire
-descriptor, with `force-size=true` and no raw offset/size. Its footer is not
+descriptor with no raw offset/size or creation-only options. Its footer is not
 sliced off. The virtual-size limit is 256 MiB, plus the 512-byte VHD footer.
+Pinned QEMU v11.0.91-z.15 opens vpc through `BlockdevOptionsGenericFormat`;
+`force-size` is creation-only, and neither it nor `force_size_calc` is sent
+in opening JSON. The pinned miz creator tag `miz ` selects footer
+`current_size`. Legacy CHS-based creators are accepted only when that
+geometry gives the same exact size; no creator/footer bytes are rewritten.
 EFI mode copies only the supplied application into private
 `esp/EFI/BOOT/BOOTX64.EFI`; that disposable ESP retains legacy writable-FAT
 behavior. All modes make private firmware code and variables copies.
@@ -186,3 +193,7 @@ with canonical paths, private firmware templates and an outer command ceiling
 covering local setup/post-exit I/O. The raw disk digest is checked independently
 afterward. The raw log and local report are retained; remaining legacy
 controller and packaging paths are not changed by this integration.
+The public-image fixture checks the pinned QAPI opening-field contract,
+including rejection of creation-only size controls. This is not a real-QEMU
+option probe or an actual VHD guest boot; exact pinned-QEMU x86/KVM execution
+remains a parent-owned CI gate.

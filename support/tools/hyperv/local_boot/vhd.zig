@@ -3,7 +3,7 @@ const core = @import("hyperv_core");
 const c = @import("config.zig");
 
 /// Only a complete fixed VHD is accepted. QEMU receives the full container
-/// through its vpc driver with force-size, never a raw prefix/slice.
+/// through its vpc opening interface, never a raw prefix/slice.
 pub fn footer(bytes: *const [512]u8, file_size: u64) !u64 {
     const size = std.mem.readInt(u64, bytes[48..56], .big);
     if (!std.mem.eql(u8, bytes[0..8], "conectix") or
@@ -27,6 +27,10 @@ pub fn footer(bytes: *const [512]u8, file_size: u64) !u64 {
     const exact = size / 512;
     if (cylinders == 0 or heads == 0 or heads > 16 or sectors == 0 or
         geometry > exact or exact - geometry >= heads * sectors) return error.InvalidFixedVhd;
+    // Pinned QEMU's vpc reader uses CHS for these legacy creators. Its QAPI
+    // opening interface has no size-selection override; never round the disk.
+    for ([_][]const u8{ "vpc ", "vs  ", "qemu" }) |creator|
+        if (std.mem.eql(u8, bytes[28..32], creator) and geometry != exact) return error.InvalidFixedVhd;
     return size;
 }
 

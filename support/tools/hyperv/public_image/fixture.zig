@@ -7,6 +7,21 @@ pub const prefix = "PUBLIC SYNTHETIC FIXTURE: not real QEMU or acceptance\n" ++
     "Hyper-V Hv#1 hypercall page enabled at GPA 0x1000\nHyper-V SynIC: synthetic IRQs\nPowered by Unikraft\n";
 pub const application = "Calling main(1, ['synthetic'])\nUK_HYPERV_PLATFORM_READY\nUK_HYPERV_ACCEPTANCE_UNAVAILABLE:storage+network\n";
 pub const terminal = "[    0.123456] Info: [libukboot] <boot.c @  544> main returned 2\n";
+pub const prefixed_application = "Calling main(1, ['synthetic'])\nprefix UK_HYPERV_PLATFORM_READY\n";
+
+// Emitted subset of QEMU v11.0.91-z.15 qapi/block-core.json:
+// vpc uses BlockdevOptionsGenericFormat (file) plus common BlockdevOptions.
+// force-size belongs to BlockdevCreateOptionsVpc, not the opening interface.
+const VpcOpening = struct {
+    driver: enum { vpc },
+    @"node-name": []const u8,
+    @"read-only": bool,
+    file: struct { driver: enum { file }, filename: []const u8, @"read-only": bool },
+};
+pub fn checkVpcOpening(a: std.mem.Allocator, bytes: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(VpcOpening, a, bytes, .{ .ignore_unknown_fields = false });
+    defer parsed.deinit();
+}
 pub fn main(init: std.process.Init) void {
     execute(init) catch std.process.exit(127);
 }
@@ -31,15 +46,16 @@ fn execute(init: std.process.Init) !void {
     var document = try image.core.contracts.Document.parse(a, args[15], .{});
     defer document.deinit();
     const fixed = request.config.fixed_vhd != null;
+    if (fixed) try checkVpcOpening(a, args[15]);
     const object = try image.core.contracts.exactFields(document.value(), if (fixed)
-        &.{ "driver", "node-name", "read-only", "force-size", "file" }
+        &.{ "driver", "node-name", "read-only", "file" }
     else
         &.{ "driver", "node-name", "read-only", "offset", "size", "file" });
     const string = image.core.contracts.string;
     if (!std.mem.eql(u8, try string(object.get("driver").?), if (fixed) "vpc" else "raw") or
         !std.mem.eql(u8, try string(object.get("node-name").?), "local-boot-disk") or !object.get("read-only").?.bool) return error.Format;
     if (fixed) {
-        if (!object.get("force-size").?.bool or request.pins[0].size != c.vhd_bytes) return error.Vpc;
+        if (request.pins[0].size != c.vhd_bytes) return error.Vpc;
     } else if (try image.core.contracts.integer(u64, object.get("offset").?) != 0 or
         try image.core.contracts.integer(u64, object.get("size").?) != c.raw_bytes) return error.Raw;
     const backing = try image.core.contracts.exactFields(object.get("file").?, &.{ "driver", "filename", "read-only" });
@@ -52,7 +68,13 @@ fn execute(init: std.process.Init) !void {
     const original = try image.core.private_files.openAbsolute(io, request.config.source(), .artifact);
     defer original.close(io);
     if (!image.core.private_files.sameSnapshot(try image.core.private_files.snapshot(descriptor), try image.core.private_files.snapshot(original))) return error.WrongInput;
-    if (fixed) _ = try image.boot.vhd.validate(io, descriptor);
+    if (fixed) {
+        _ = try image.boot.vhd.validate(io, descriptor);
+        var footer: [512]u8 = undefined;
+        if (try descriptor.readPositionalAll(io, &footer, c.raw_bytes) != footer.len or
+            !std.mem.eql(u8, footer[28..32], "miz ") or
+            std.mem.readInt(u64, footer[48..56], .big) != c.raw_bytes) return error.WrongVpcSize;
+    }
     if ((try image.core.private_files.snapshot(descriptor)).size != request.pins[0].size) return error.SlicedInput;
     if (init.environ_map.count() != 1 or !std.mem.eql(u8, init.environ_map.get("TMPDIR") orelse return error.Environment, request.config.work_dir) or
         linux.getpgid(0) != linux.getpid() or linux.getppid() != request.supervisor_pid) return error.Ownership;
@@ -91,7 +113,13 @@ fn execute(init: std.process.Init) !void {
     }
     if (request.config.disable_x2apic != (mode == 1 and fixed)) try out.interface.writeAll(c.legacy_marker ++ "\n");
     if (mode == 10) try out.interface.writeAll(terminal);
-    if (mode != 11) try out.interface.writeAll(application);
+    if (mode == 14) try out.interface.writeAll(c.platform_marker ++ "\n");
+    if (mode == 13 or mode == 14) {
+        try out.interface.writeAll(prefixed_application);
+    } else if (mode == 16) {
+        try out.interface.writeAll(prefixed_application ++ c.platform_marker ++ "\n");
+    } else if (mode != 11) try out.interface.writeAll(application);
+    if (mode == 15) try out.interface.writeAll(c.platform_marker ++ "\n");
     const parent = try image.core.private_files.Directory.open(io, std.fs.path.dirname(request.config.work_dir).?);
     defer parent.close(io);
     const state = try c.read(c.State, a, try parent.read(io, a, "prepare.json", c.max_record, null));
@@ -99,5 +127,6 @@ fn execute(init: std.process.Init) !void {
         try out.interface.print("{s}{s}\n", .{ try image.network.marker(a, net), if (mode == 12) "wrong" else "" });
     }
     if (mode == 2) try out.interface.writeAll("main returned 20\n") else try out.interface.writeAll(terminal);
+    if (mode == 13) try out.interface.writeAll(c.platform_marker ++ "\n");
     if (mode == 3) std.process.exit(19);
 }

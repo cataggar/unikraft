@@ -86,7 +86,7 @@ const Fixture = struct {
     }
 };
 test "native miz creates exact raw GPT fixed VHD genuine four-mode wire and durable exact export" {
-    const f = try Fixture.init(0, false);
+    const f = try Fixture.init(16, false);
     defer f.deinit();
     const alloc = f.arena.allocator();
     const state = try f.prepare();
@@ -165,7 +165,7 @@ test "native input and private evidence permissions and malformed PE refuse" {
     if (root.read(io, f.arena.allocator(), "state.json", c.max_record, null)) |_| return error.AcceptedPublicState else |_| {}
 }
 test "native solved-config transcript and all four public network configuration-only boots" {
-    const f = try Fixture.init(0, true);
+    const f = try Fixture.init(16, true);
     defer f.deinit();
     const state = try f.prepare();
     try t.expectEqual(c.Phase.prepared, state.phase);
@@ -204,6 +204,61 @@ test "public serial rejects colliding return APIC mismatch live IO and duplicate
         try std.mem.replaceOwned(u8, alloc, network_good, "nonce=0123456789abcdef", "nonce=1123456789abcdef"),
         good,
     }) |bad| if (image.network.serial(alloc, bad, config, net)) |_| return error.AcceptedBadNetwork else |_| {};
+}
+
+test "pinned QAPI vpc opening accepts generic format and rejects creation size controls" {
+    const opening =
+        \\{"driver":"vpc","node-name":"fixture-disk","read-only":true,"file":{"driver":"file","filename":"/proc/self/fd/64","read-only":true}}
+    ;
+    try serial_fixture.checkVpcOpening(a, opening);
+    for ([_][]const u8{
+        "\"force-size\":true",
+        "\"force_size_calc\":\"current_size\"",
+        "\"force-size-calc\":\"current_size\"",
+        "\"size\":69206016",
+        "\"offset\":0",
+        "\"subformat\":\"fixed\"",
+    }) |creation_field| {
+        const invalid = try std.fmt.allocPrint(a, "{{{s},{s}", .{ creation_field, opening[1..] });
+        defer a.free(invalid);
+        try t.expectError(error.UnknownField, serial_fixture.checkVpcOpening(a, invalid));
+    }
+}
+
+const late_platform = serial_fixture.prefix ++ serial_fixture.prefixed_application ++ serial_fixture.terminal ++ c.platform_marker ++ "\n";
+const early_platform = serial_fixture.prefix ++ c.platform_marker ++ "\n" ++ serial_fixture.prefixed_application ++ serial_fixture.terminal;
+const duplicate_platform = serial_fixture.prefix ++ serial_fixture.application ++ c.platform_marker ++ "\n" ++ serial_fixture.terminal;
+
+test "exact platform marker is unique between application start and anchored return" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const config: image.boot.config.Config = .{
+        .raw_disk = "/public/raw",
+        .qemu = "/public/qemu",
+        .ovmf_code = "/public/code",
+        .ovmf_vars = "/public/vars",
+        .work_dir = "/public/work",
+        .expect = c.platform_marker,
+        .expect_main_return = 2,
+    };
+    const raw = try image.network.raw(alloc);
+    // The shared substring policy alone admits the late exact line.
+    try image.boot.serial.validate(alloc, late_platform, config);
+    try t.expectError(error.InvalidPublicSerial, image.network.serial(alloc, late_platform, config, raw));
+    try t.expectError(error.ReorderedMilestone, image.network.serial(alloc, early_platform, config, raw));
+    try t.expectError(error.InvalidPublicSerial, image.network.serial(alloc, duplicate_platform, config, raw));
+    try t.expectError(error.InvalidPublicSerial, image.network.serial(alloc, serial_fixture.prefix ++ serial_fixture.prefixed_application ++ serial_fixture.terminal, config, raw));
+    const good = serial_fixture.prefix ++ serial_fixture.prefixed_application ++ c.platform_marker ++ "\n" ++ serial_fixture.terminal;
+    try image.network.serial(alloc, good, config, raw);
+    const decorated = try std.mem.replaceOwned(u8, alloc, good, "\n" ++ c.platform_marker ++ "\n", "\n\x1b[32m" ++ c.platform_marker ++ "\x1b[0m\x00\r\n");
+    try image.network.serial(alloc, decorated, config, raw);
+    const network = try image.network.fromConfig(alloc, config_text);
+    const marker = try image.network.marker(alloc, (try image.network.parse(network)).?);
+    const configured = try std.fmt.allocPrint(alloc, "{s}{s}\n{s}", .{ good[0 .. good.len - serial_fixture.terminal.len], marker, serial_fixture.terminal });
+    try image.network.serial(alloc, configured, config, network);
+    const late_with_config = try std.fmt.allocPrint(alloc, "{s}{s}{s}\n{s}{s}\n", .{ serial_fixture.prefix, serial_fixture.prefixed_application, marker, serial_fixture.terminal, c.platform_marker });
+    try t.expectError(error.InvalidPublicSerial, image.network.serial(alloc, late_with_config, config, network));
 }
 
 test "source provenance exact canonical integers repository workflow revision job and hashes" {
@@ -251,7 +306,7 @@ test "solved config missing duplicate typed noncanonical network settings refuse
     try t.expectEqualStrings("0123456789abcdef", (try image.network.parse(try image.network.fromConfig(alloc, upper))).?.nonce);
 }
 test "native partial matrix nonzero bad markers input mutation and independent failure evidence" {
-    for ([_]u8{ 1, 2, 3, 6, 7, 9, 10, 11, 12 }) |mode| {
+    for ([_]u8{ 1, 2, 3, 6, 7, 9, 10, 11, 12, 13, 14, 15 }) |mode| {
         const f = try Fixture.init(mode, mode == 12);
         defer f.deinit();
         const state = try f.prepare();
@@ -369,6 +424,56 @@ test "physical loader rejects incomplete tampered matrix requests logs packages 
     const azure = try std.fmt.allocPrint(alloc, "{{\"resource_group\":\"not-authorized\",{s}", .{valid[1..]});
     try image.files.durable(try lock.commit(io, "state.json", azure));
     if (image.engine.load(alloc, io, &lock, f.cli)) |_| return error.AcceptedUnknownFields else |_| {}
+}
+test "export reload rejects misplaced exact markers even with coherent synthetic hashes" {
+    const f = try Fixture.init(16, false);
+    defer f.deinit();
+    const alloc = f.arena.allocator();
+    const state = try f.prepare();
+    try t.expectEqual(c.Phase.prepared, state.phase);
+    const root = try f.stateDir();
+    defer root.close(io);
+    var lock = try root.lock(io);
+    defer lock.close(io);
+    const work = try image.core.private_files.Directory.open(io, (try image.engine.bootConfig(alloc, state, 0)).work_dir);
+    defer work.close(io);
+    const original_log = try work.read(io, alloc, image.boot.config.log_name, image.boot.config.max_serial, null);
+    const original_report = try work.read(io, alloc, "report.json", c.max_record, null);
+    const target = try image.files.path(alloc, f.path, "checked-export");
+    for ([_]struct { bytes: []const u8, failure: anyerror }{
+        .{ .bytes = late_platform, .failure = error.InvalidPublicSerial },
+        .{ .bytes = early_platform, .failure = error.ReorderedMilestone },
+        .{ .bytes = duplicate_platform, .failure = error.InvalidPublicSerial },
+    }) |invalid| {
+        // Keep all stored public hashes coherent so failure must come from
+        // actual serial semantics, not an earlier digest-mismatch shortcut.
+        var report = try image.boot.runner.Report.decode(alloc, original_report);
+        report.serial_bytes = invalid.bytes.len;
+        report.serial_sha256 = c.hash(invalid.bytes);
+        try t.expect(report.succeeded());
+        const report_bytes = try report.encode(alloc);
+        try rewriteFixture(work, image.boot.config.log_name, invalid.bytes);
+        try rewriteFixture(work, "report.json", report_bytes);
+        try rewriteFixture(root, "local-raw-x2apic-serial.log", invalid.bytes);
+        var altered = state;
+        altered.boots[0].?.report_sha256 = try c.hex(alloc, c.hash(report_bytes));
+        altered.boots[0].?.serial_sha256 = try c.hex(alloc, c.hash(invalid.bytes));
+        altered.boots[0].?.serial_bytes = invalid.bytes.len;
+        try image.files.durable(try lock.commit(io, "state.json", try c.encode(alloc, altered)));
+        try t.expectError(invalid.failure, image.engine.load(alloc, io, &lock, f.cli));
+        const refused = image.manifest.publish(alloc, io, &lock, f.cli, target, source);
+        try t.expect(refused.sha256 == null and refused.failures.primary != null);
+        try t.expectError(error.FileNotFound, image.core.private_files.Directory.open(io, target));
+    }
+    try rewriteFixture(work, image.boot.config.log_name, original_log);
+    try rewriteFixture(work, "report.json", original_report);
+    try rewriteFixture(root, "local-raw-x2apic-serial.log", original_log);
+    try image.files.durable(try lock.commit(io, "state.json", try c.encode(alloc, state)));
+    _ = try image.engine.load(alloc, io, &lock, f.cli);
+    try t.expect(image.manifest.publish(alloc, io, &lock, f.cli, target, source).sha256 != null);
+}
+fn rewriteFixture(dir: image.core.private_files.Directory, name: []const u8, bytes: []const u8) !void {
+    try dir.dir.writeFile(io, .{ .sub_path = name, .data = bytes, .flags = .{ .permissions = .fromMode(0o600) } });
 }
 fn command(f: Fixture, args: []const []const u8) !std.process.RunResult {
     var environment: std.process.Environ.Map = .init(f.arena.allocator());

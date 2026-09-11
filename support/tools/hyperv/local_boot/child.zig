@@ -25,7 +25,6 @@ pub fn arguments(a: std.mem.Allocator, config: c.Config, raw_size: u64, raw_fd: 
             .driver = "vpc",
             .@"node-name" = "local-boot-disk",
             .@"read-only" = true,
-            .@"force-size" = true,
             .file = .{ .driver = "file", .filename = filename, .@"read-only" = true },
         }, .{}) else try std.json.Stringify.valueAlloc(a, .{
             .driver = "raw",

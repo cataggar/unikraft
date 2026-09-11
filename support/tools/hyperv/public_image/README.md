@@ -116,19 +116,28 @@ not nested supervisor process groups:
 | --- | --- | --- |
 | raw | x2APIC | read-only `raw`, offset 0, exact full size |
 | raw | legacy xAPIC | same raw node, `x2apic=off` |
-| fixed VHD | x2APIC | read-only **`vpc`**, `force-size=true` |
+| fixed VHD | x2APIC | read-only **`vpc`** opening node |
 | fixed VHD | legacy xAPIC | same vpc node, `x2apic=off` |
 
 Both disk modes retain the complete original O_RDONLY descriptor, including
 the VHD footer, without copying/slicing it for a boot. VPC has no raw offset
-or size option. This deliberately corrects the legacy helper which labeled
+or size option. Pinned QEMU v11.0.91-z.15 uses
+`BlockdevOptionsGenericFormat` for vpc opening
+(`qapi/block-core.json`, near line 4890). `force-size` belongs only to
+`BlockdevCreateOptionsVpc` (near line 5524); neither it nor
+`force_size_calc` is sent in opening JSON. The pinned miz creator tag
+`miz ` selects footer `current_size`. For legacy `vpc `, `vs  ` and
+`qemu` creators, CHS must equal that exact size or the input is rejected,
+without rewriting its creator/footer. This deliberately corrects the legacy
+helper which labeled
 a raw prefix of the VHD as VPC coverage. Every source byte and named-file
 identity is checked by the local runner before/after QEMU. Firmware variables
 are separate private copies for every boot; no NIC, user config, reboot,
 display or monitor is enabled.
 
 Serial requires the actual ordered Hyper-V/application-start milestones,
-one exact platform marker, the expected APIC marker presence/absence, no
+one exact platform-marker line strictly after application start and before
+the anchored terminal return, the expected APIC marker presence/absence, no
 crash/live-I/O claims, and a unique anchored **`main returned 2`**. Return 2
 is the selected acceptance application's local storage+network-unavailable
 result, not arbitrary nonzero success. The real ukprint terminal envelope
@@ -236,6 +245,10 @@ zig build --build-file support/tools/hyperv/local_boot/build.zig \
 The separate uninstalled native QEMU fixture checks actual argv, vpc versus
 raw shape, full read-only descriptor identity, CPU/APIC/no-NIC options,
 restricted environment, limits, private variable copies and process groups.
+Its strict VPC opening-field model follows the pinned QAPI generic-format
+contract, with independent literal cases rejecting creation-only and
+unsupported size controls. This is not an exact-binary QEMU option probe;
+real pinned-QEMU opening and four x86/KVM boots remain parent-owned CI gates.
 Fixtures create real miz containers from a public synthetic 512-byte PE,
 not a bootable guest or original seed. Cases include partial matrices,
 nonzero/missing/reordered/wrong markers, optional network transcript/config,
@@ -243,5 +256,10 @@ mutation, timeout/flood/cancel, surviving descendants, independent cleanup/
 recording failures, duplicate/unknown JSON, physical evidence tampering,
 permission refusals, manifest/source compatibility and actual CLI/digest
 serialization. They remove only their own named fixture directories.
+Exact-marker regressions include a prefix-only occurrence before return
+with the sole exact line afterward, a line before application start,
+duplicates and valid order. Prepare and export reload both exercise the
+policy, including deliberately coherent synthetic report/log/state hashes
+so malformed ordering cannot be hidden behind matching digests.
 No real guest, KVM, Python, Azure, token, credential, original data seed or
 historical private artifact is used. Real x86/KVM integration remains CI work.

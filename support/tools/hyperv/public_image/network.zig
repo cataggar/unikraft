@@ -172,6 +172,7 @@ pub fn serial(a: std.mem.Allocator, bytes: []const u8, config: c.boot.config.Con
     try validate(a, acceptance);
     const normalized = try c.boot.serial.normalize(a, bytes);
     defer a.free(normalized);
+    const application_start = std.mem.indexOf(u8, normalized, c.boot.serial.milestones[3]) orelse return error.InvalidPublicSerial;
     const wanted = if (try parse(acceptance)) |n| try marker(a, n) else null;
     defer if (wanted) |text| a.free(text);
     var lines = std.mem.splitScalar(u8, normalized, '\n');
@@ -179,11 +180,16 @@ pub fn serial(a: std.mem.Allocator, bytes: []const u8, config: c.boot.config.Con
     var legacy: usize = 0;
     var configs: usize = 0;
     var returned = false;
+    var offset: usize = 0;
     while (lines.next()) |raw_line| {
+        defer offset += raw_line.len + 1;
         const line = std.mem.trim(u8, raw_line, " \t\r");
         // The shared validator already establishes the unique anchored return.
         if (std.mem.indexOf(u8, line, "main returned") != null) returned = true;
-        if (std.mem.eql(u8, line, config.expect)) platforms += 1;
+        if (std.mem.eql(u8, line, config.expect)) {
+            if (offset <= application_start or returned) return error.InvalidPublicSerial;
+            platforms += 1;
+        }
         if (std.mem.indexOf(u8, line, c.legacy_marker) != null) legacy += 1;
         if (std.mem.indexOf(u8, line, "HYPERV_ACCEPTANCE NETWORK_APP_CONFIG") != null) {
             if (returned or wanted == null or !std.mem.eql(u8, line, wanted.?)) return error.NetworkMarkerMismatch;

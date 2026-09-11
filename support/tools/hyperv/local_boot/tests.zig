@@ -246,6 +246,7 @@ fn fixedFooter() [512]u8 {
     std.mem.writeInt(u32, bytes[8..12], 2, .big);
     std.mem.writeInt(u32, bytes[12..16], 0x10000, .big);
     std.mem.writeInt(u64, bytes[16..24], std.math.maxInt(u64), .big);
+    bytes[28..32].* = "miz ".*;
     std.mem.writeInt(u64, bytes[40..48], 1024 * 1024, .big);
     std.mem.writeInt(u64, bytes[48..56], 1024 * 1024, .big);
     bytes[56..60].* = .{ 0, 30, 4, 17 };
@@ -279,6 +280,29 @@ test "fixed VHD requires complete immutable-sized fixed footer checksum geometry
     checksumFooter(&bad);
     try t.expectError(error.InvalidFixedVhd, boot.vhd.footer(&bad, 1024 * 1024 + 512));
 }
+test "fixed VHD legacy creators cannot expose a rounded CHS size" {
+    const good = fixedFooter();
+    for ([_][]const u8{ "miz ", "qem2", "test", "\x00\x00\x00\x00" }) |creator| {
+        var current_size = good;
+        @memcpy(current_size[28..32], creator);
+        checksumFooter(&current_size);
+        try t.expectEqual(@as(u64, 1024 * 1024), try boot.vhd.footer(&current_size, 1024 * 1024 + 512));
+    }
+    for ([_][]const u8{ "vpc ", "vs  ", "qemu" }) |creator| {
+        var legacy = good;
+        @memcpy(legacy[28..32], creator);
+        checksumFooter(&legacy);
+        const before = legacy;
+        try t.expectError(error.InvalidFixedVhd, boot.vhd.footer(&legacy, 1024 * 1024 + 512));
+        try t.expectEqualSlices(u8, &before, &legacy);
+        // 17 MiB has exact standard CHS geometry: 512 cylinders, 4 heads, 17 sectors.
+        std.mem.writeInt(u64, legacy[40..48], 17 * 1024 * 1024, .big);
+        std.mem.writeInt(u64, legacy[48..56], 17 * 1024 * 1024, .big);
+        legacy[56..60].* = .{ 2, 0, 4, 17 };
+        checksumFooter(&legacy);
+        try t.expectEqual(@as(u64, 17 * 1024 * 1024), try boot.vhd.footer(&legacy, 17 * 1024 * 1024 + 512));
+    }
+}
 test "fixed VHD CLI exclusivity and genuine vpc wire without raw slicing" {
     var arena: std.heap.ArenaAllocator = .init(a);
     defer arena.deinit();
@@ -291,7 +315,8 @@ test "fixed VHD CLI exclusivity and genuine vpc wire without raw slicing" {
     defer parsed.deinit();
     const block = parsed.value.object;
     try t.expectEqualStrings("vpc", block.get("driver").?.string);
-    try t.expect(block.get("force-size").?.bool and block.get("read-only").?.bool);
+    try t.expect(block.get("read-only").?.bool);
+    try t.expect(!block.contains("force-size") and !block.contains("force_size_calc") and !block.contains("force-size-calc"));
     try t.expect(!block.contains("offset") and !block.contains("size"));
     try t.expectEqualStrings("/proc/self/fd/64", block.get("file").?.object.get("filename").?.string);
     for ([_][]const u8{ "--image", "--raw-disk", "--fixed-vhd" }) |extra| {
