@@ -21,7 +21,7 @@ pub fn input() p.contract.Contract {
         .location = "northeurope",
     };
     return .{
-        .run_id = "55555555555545558555555555555555".*,
+        .run_id = "0123456789abcdef0123456789abcdef".*,
         .disk_id = "66666666666646668666666666666666".*,
         .authority = authority,
         .cleanup_authority = authority,

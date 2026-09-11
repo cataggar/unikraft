@@ -43,8 +43,6 @@ pub const Contract = struct {
         }
         if (!std.mem.eql(u8, self.authority.group, self.cleanup_authority.group) or
             !std.mem.eql(u8, self.authority.location, self.cleanup_authority.location)) return error.AuthorityMismatch;
-        const owner = try core.contracts.parseUuid(&self.authority.owner_run);
-        if (!std.mem.eql(u8, &std.fmt.bytesToHex(owner, .lower), &self.run_id)) return error.AuthorityMismatch;
         if (!std.mem.eql(u8, self.authority.location, "northeurope")) return error.InvalidEnvelope;
         try azure.scope.name(self.prefix);
         if (self.prefix.len < 6 or self.prefix.len > 32 or

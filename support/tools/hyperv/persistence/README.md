@@ -47,6 +47,35 @@ It does not select or approve a real principal, operator signing source,
 managed-identity endpoint, route or trust bundle. There is no Azure CLI,
 ambient credential chain, cache borrowing, external broker or shell fallback.
 
+### Preparation handoff constraints
+
+The preparation API documentation at commit
+`012f4f93f24d9304099d324f5d87e8dbeedc51f5` has been reviewed, not imported.
+Its prepared/configured/built/packaged receipts carry `not_admitted`
+authority; none is a COMPLETED-preflight handoff. No engine-side importer,
+receipt reinterpretation or fixture admission path is provided here.
+
+Storage run/disk identities are lowercase nonnil hex32, independent of ARM
+ownership and host attempt RFC UUIDs. Neither identity is regenerated or
+converted into the other. Execution and cleanup must still bind the same ARM
+ownership UUID. Preparation's hex64 `contracts.Sha` must be explicitly
+validated with `core.contracts.parseSha256` before entering a raw32 host hash
+field; matching array widths do not establish equivalent semantics.
+
+Production admission still requires the parent-owned read-only loader and
+versioned input/ledger extension. Input-v1 has no private VHD role:
+`boot_disk` names public `capability.raw`, not an OS disk or private VHD.
+VHD bytes cannot be relabeled as controls/support or copied outside accounting.
+`inputs.generate` is create-only staging, not adoption or crash recovery.
+
+Producer `Context.verify` must retain its `/proc/self/exe` binding and cannot
+be repurposed for a different engine. The loader must independently bind its
+own executable and remeasure the reviewed provenance, physical Git source,
+receipt chain, configuration, package, staged inventory and complete ledger.
+The guarded producer commitment projection is still pending implementation
+and review; `bindings.producer` is not permission to substitute an executable,
+receipt, selection or image digest for that future commitment.
+
 ## Private records and lifecycle
 
 Version 1 exact canonical schemas are `uk.hyperv.persistence-input`,

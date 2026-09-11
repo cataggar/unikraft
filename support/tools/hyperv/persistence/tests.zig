@@ -49,6 +49,30 @@ test "native persistence declarations compile" {
     std.testing.refAllDecls(p.worker.Supervisor);
 }
 
+test "storage identity is independent of cloud ownership UUID without weakening authority binding" {
+    const input = f.input();
+    try input.validate();
+    const owner = try core.contracts.parseUuid(&input.authority.owner_run);
+    try t.expect(!std.mem.eql(u8, &std.fmt.bytesToHex(owner, .lower), &input.run_id));
+    const bytes = try p.local.encode(a, input);
+    defer a.free(bytes);
+    const parsed = try p.local.Document(p.contract.Contract).load(a, bytes);
+    defer parsed.deinit();
+    try parsed.value.validate();
+    try t.expectEqual(input.run_id, parsed.value.run_id);
+    try t.expectEqual(input.authority.owner_run, parsed.value.authority.owner_run);
+    var changed = input;
+    changed.cleanup_authority.owner_run = "99999999-9999-4999-8999-999999999999".*;
+    try t.expectError(error.AuthorityMismatch, changed.validate());
+    changed = input;
+    changed.run_id = [_]u8{'0'} ** 32;
+    try t.expectError(error.NilIdentity, changed.validate());
+    changed = input;
+    changed.run_id[0] = 'A';
+    try t.expectError(error.InvalidHex, changed.validate());
+    try t.expectError(error.PreparationAndCompletedPreflightBindingsUnavailable, p.contract.requireProductionBindings());
+}
+
 test "strict canonical input preserves original identities geometry and separate ledgers" {
     const input = f.input();
     try input.validate();
