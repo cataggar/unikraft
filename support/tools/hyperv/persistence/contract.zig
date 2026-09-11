@@ -87,8 +87,9 @@ pub const Bindings = struct {
     trust: local.Hash,
 };
 
-/// This in-process capability is supplied by the integrated production loader,
-/// not deserialized from a receipt, boolean, hash, CLI flag or worker response.
+/// A callback selected by the trusted production dispatcher, not an opaque
+/// capability. Constructing this struct does not establish admission; the
+/// dispatcher must bind the actual preparer, completed loader and approvals.
 pub const TrustedInputs = struct {
     context: *anyopaque,
     validateFn: *const fn (*anyopaque, Contract, local.Hash, Lane) anyerror!void,

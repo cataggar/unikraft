@@ -76,6 +76,64 @@ The guarded producer commitment projection is still pending implementation
 and review; `bindings.producer` is not permission to substitute an executable,
 receipt, selection or image digest for that future commitment.
 
+### Committed preflight consumer contract
+
+The preflight implementation at
+`45088c9ffe6af2d387c3ab48f7e39f48e191cffc` and API handoff at
+`b166e1ba9bc470f45604463ca5e4530b9fd73646` have been reviewed through Git
+objects without importing that package. The actual consumer is
+`hyperv_preflight.completed.load(allocator, io, directory, expected)`, where
+`expected` is a pointer to an independently validated `contract.Input`.
+`worker.Resolved`, `adapters.Native` and `supervisor.run` are the preflight
+execution interfaces, not substitutes for its completed-state loader.
+
+The integrating dispatcher must run the loader as a hard-supervised read of
+the complete protected preflight attempt directory. The loader acquires that
+directory's writer lock itself; do not pre-lock it or alias it to the
+persistence attempt directory. Do not introduce a nested supervisor inside
+an already supervised persistence leaf. Artifact/source hashing and input
+resolution likewise need an independent hard deadline, not merely a callback
+with elapsed-time checks.
+
+`completed.Handoff` has UUID-text fields `attempt`, `run_id`, `vm_id` and
+`host_boot_id`; raw32 hashes `input_sha256`, `preparation_sha256`,
+`public_receipt_sha256`, `private_receipt_sha256`, `completion_sha256`; and
+`native`, `scope`, `storage`. It owns no allocator-backed storage, has no
+serialized schema, and requires no `deinit`. Its native implementation,
+preparation, source, dependency, tool-runtime and operator-binary hashes bind
+the preflight producer, not this persistence executable. Keep this worker's
+independent executable/artifact pin; do not reuse the preflight operator pin.
+
+The loader, not an engine-side compatibility decoder, must establish production
+COMPLETED state, all operation/consumption proofs and required accepted
+mutations, no primary/cleanup/recording failure, the complete signed completion
+envelope under the independently admitted key, both original commands and
+receipts, all six serial files and launch identities, and independent cleanup/
+group absence. The expected input binds the original authority, source,
+preparation, artifacts, image/key/route/provider and disjoint ledger context;
+none may be selected from the receipt being authenticated. The preparer must
+physically revalidate source and artifacts before reuse: the completed loader
+does not do that work or refresh expired credentials.
+
+`Input`, `Approved`, `Handoff`, and this engine's `TrustedInputs` callback
+container are ordinary structs, not non-forgeable authority. Production
+admission depends on the complete trusted dispatch chain, not on constructing
+one of them, supplying nonzero hashes, selecting `.production`, or verifying
+a signature with a caller-chosen key. No parallel completion receipt/schema or
+serialized Handoff will be added here.
+
+The returned scope is platform-only with storage unavailable. Its original VM
+and host boot UUID identify the completed preflight whose group was removed;
+they must not populate persistence's original VM/disk fields or authorize
+another boot. Persistence still requires separately admitted #89 authority,
+the original unconsumed storage identities/seed, immutable guest bindings and
+its own cleanup lifetime and complete accounting.
+
+The real preparation read-only loader, versioned private-VHD ledger input,
+closed native namespace, and independently admitted authority/key/route/ledger
+remain prerequisites. A native Make bridge or a successful local build cannot
+discharge them. The public production gate remains unchanged and closed.
+
 ## Private records and lifecycle
 
 Version 1 exact canonical schemas are `uk.hyperv.persistence-input`,
