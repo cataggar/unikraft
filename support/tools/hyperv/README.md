@@ -293,6 +293,16 @@ never success. Parent-death signaling alone does not replace independent
 whole-tree cleanup after a supervisor crash. Native controller/parent/host
 state machines must implement that higher-level recovery protocol.
 
+## Native operator process custody
+
+The separate [operator guard](operator_guard/README.md) provides kernel-backed
+PID-namespace custody, latched cancellation and signed stopped-process
+witnesses. Its persisted witness permits only separately authorized cleanup
+and retains publication uncertainty; it cannot admit a completed attempt.
+The production entry remains closed until actual preparation, engine,
+authority and aggregate-budget bindings are integrated. Dedicated CI uses
+ReleaseSafe children without weakening runtime checks to reduce their size.
+
 ## Assertion-to-native-test mapping
 
 `tests.zig` covers these migration-foundation assertions:

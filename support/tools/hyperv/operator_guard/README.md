@@ -238,11 +238,11 @@ All workloads and signing keys are explicitly synthetic; namespace reaping is
 actual kernel behavior, not simulated success.
 
 `test` selects its driver mode with `-Doptimize`; the independently compiled
-native child defaults to ReleaseSmall and has an explicit
-`-Dfixture-optimize` selector. The correction suites passed 19/19 in Debug
-with a ReleaseSmall child and 19/19 with **both driver and child ReleaseSafe**.
-`compile-guard` now honors `-Doptimize` for the complete target fixture and
-its module, rather than silently selecting ReleaseSmall.
+native child defaults to ReleaseSafe and has an explicit
+`-Dfixture-optimize` selector. CI uses Debug and ReleaseSafe drivers with
+ReleaseSafe children. Native child and cross-target fixture builds strip debug
+metadata, not runtime safety checks. `compile-guard` honors `-Doptimize` for the
+complete target fixture and its module.
 
 From the worktree root, using existing private fixture directories:
 
@@ -251,11 +251,9 @@ root="$PWD/.d/zig-migration-operator-guard"
 export TMPDIR="$root/tmp" XDG_CACHE_HOME="$root/cache"
 export ZIG_GLOBAL_CACHE_DIR="$root/global-cache"
 for mode in Debug ReleaseSafe; do
-    child=ReleaseSmall
-    if [ "$mode" = ReleaseSafe ]; then child=ReleaseSafe; fi
     export ZIG_LOCAL_CACHE_DIR="$root/$mode/cache"
     /home/g/.local/bin/zig build --build-file support/tools/hyperv/operator_guard/build.zig test install \
-        -Dtest-root="$root/$mode/fixtures" -Doptimize="$mode" -Dfixture-optimize="$child" -j2 \
+        -Dtest-root="$root/$mode/fixtures" -Doptimize="$mode" -Dfixture-optimize=ReleaseSafe -j2 \
         --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
         --prefix "$root/$mode/install" --summary all
 done
@@ -268,17 +266,19 @@ for target in x86_64-linux-musl aarch64-linux-musl; do
 done
 ```
 
-Measured complete, unstripped `operator-guard-target-fixture` artifacts for
-these actual ReleaseSafe target builds:
+Current complete, stripped `operator-guard-target-fixture` ReleaseSafe
+artifacts measure:
 
 | Target | Executable bytes | Executable + 233,504 reservation |
 | --- | ---: | ---: |
-| x86_64-linux-musl | 5,670,240 | 5,903,744 |
-| aarch64-linux-musl | 5,573,536 | 5,807,040 |
+| x86_64-linux-musl | 743,752 | 977,256 |
+| aarch64-linux-musl | 618,528 | 852,032 |
 
+Before debug-metadata stripping, the corresponding ReleaseSafe executables
+measured 5,670,240 and 5,573,536 bytes. Stripping retains runtime safety checks.
 The earlier 398,584 / 368,288 byte target measurements were **ReleaseSmall**,
-not ReleaseSafe, and preceded these corrections. The current measurements
-include the separately bound synthetic fixture; neither table is a
+not ReleaseSafe, and preceded these corrections. These measurements
+include the separately bound synthetic fixture; none is a
 measurement of the final integrated operator, all copies or its runtime
 assets. **Final 8 MiB / 256 MiB operator-ledger fit remains unproven.**
 
