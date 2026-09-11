@@ -836,7 +836,7 @@ jobs:
         cp support/apps/hyperv-acceptance/defconfig "${root}/input.config"
         chmod 600 "${root}/input.config"
         umask 022
-        zig build -j2 olddefconfig \
+        if ! zig build -j2 olddefconfig \
           --cache-dir "${root}/zig-local" \
           --global-cache-dir "${root}/zig-global" \
           "-Dnative-make-environment=${root}/environment.json" \
@@ -845,7 +845,20 @@ jobs:
           "-Doutput=${root}/build" "-Dconfig=${root}/input.config" \
           "-Dcompiler=zig cc -target x86_64-freestanding-none" \
           -Dcompiler-targeted=true "-Dhost-cc=zig cc" "-Dhost-cxx=zig c++" \
-          -Dhost-cflags=-fno-sanitize=null
+          -Dhost-cflags=-fno-sanitize=null; then
+          id -u
+          stat -c 'mode=%a uid=%u links=%h kind=%F path=%n' \
+            "${root}/environment.json" \
+            "${root}"/{tmp,cache,config,zig-local,zig-global} \
+            /usr/bin/bash /usr/bin/m4
+          for current in "${root}" /usr/share/bison /usr/bin; do
+            while [ "${current}" != / ]; do
+              stat -c 'mode=%a uid=%u links=%h kind=%F path=%n' "${current}"
+              current="$(dirname "${current}")"
+            done
+          done
+          exit 1
+        fi
         test "$(stat -c %a "${root}/input.config")" = 600
         grep --fixed-strings --line-regexp --quiet \
           CONFIG_APPHYPERVACCEPTANCE=y "${root}/input.config"
