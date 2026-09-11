@@ -112,6 +112,8 @@ MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 MAX_CONTROL_BYTES = 512 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
+# Operator-local documents embed the complete native producer pins repeatedly.
+MAX_LOCAL_MANIFEST_BYTES = 128 * 1024
 MAX_STATE_BYTES = 192 * 1024
 MAX_BLOB_SAS_BYTES = 4096
 MAX_TRACKED_ENTRIES = 100_000
@@ -154,9 +156,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "09f7dc31d0a0e592bfb291e0f72e1162c0c18060d8b6e00e30bc6fb12e73f5ef"
+            "a5b8cb9aa1abec0193d560bec32a3aeae82586b1110d2f9a2fe30d437e34c816"
         ),
-        "size": 1756781,
+        "size": 1757166,
         "files": 215,
     },
     "support/kconfig": {
@@ -3201,7 +3203,7 @@ def generate_input(
             "budget": budget,
         })
         manifest_bytes = azure.canonical_json(manifest)
-        if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+        if len(manifest_bytes) > MAX_LOCAL_MANIFEST_BYTES:
             raise ValueError("Generated private-preflight manifest is too large")
         save_private_bytes(
             output_directory / INPUT_MANIFEST, manifest_bytes
@@ -3219,7 +3221,7 @@ def load_input_manifest(input_directory, expected_sha256):
     )
     path = input_directory / INPUT_MANIFEST
     raw = azure.read_regular_file(
-        path, MAX_MANIFEST_BYTES, "Private-preflight input manifest"
+        path, MAX_LOCAL_MANIFEST_BYTES, "Private-preflight input manifest"
     )
     if hashlib.sha256(raw).hexdigest() != require_sha256(
         expected_sha256, "Expected private-preflight manifest"
@@ -3605,7 +3607,7 @@ def verify_immutable_inputs(state, state_directory):
     manifest = state["input_manifest"]
     manifest_path = state_directory / "inputs" / INPUT_MANIFEST
     manifest_bytes = azure.read_regular_file(
-        manifest_path, MAX_MANIFEST_BYTES,
+        manifest_path, MAX_LOCAL_MANIFEST_BYTES,
         "Prepared private-preflight input manifest",
     )
     if (
@@ -6068,7 +6070,7 @@ def load_completed_receipt(state_directory):
 
     receipt_path = state_directory / "private-receipt.json"
     receipt_bytes = azure.read_regular_file(
-        receipt_path, MAX_MANIFEST_BYTES,
+        receipt_path, MAX_LOCAL_MANIFEST_BYTES,
         "Completed private-preflight receipt",
     )
     receipt_sha256 = hashlib.sha256(receipt_bytes).hexdigest()

@@ -318,3 +318,8 @@ memory, logger, scheduler-entry and ECTX contracts and the fixture's ABI headers
 These pins preserve the coexistence boundary; they do not reinterpret old
 receipts or admit a new private build. The dedicated CI step runs both native
 proof modes and the actual Make compiler-option probe.
+The transitional operator-local input manifest and completed receipt have a
+separate 128-KiB read/generation bound for their repeated producer pin records.
+Host-wire manifests and receipts remain bounded to 64 KiB, private state to
+192 KiB, and all existing transfer, control and total staging budgets remain
+unchanged. This is a coexistence serialization bound, not native admission.

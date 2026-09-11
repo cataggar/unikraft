@@ -1135,6 +1135,25 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 with self.assertRaises(ValueError):
                     preflight.validate_input_manifest(value)
 
+    def test_local_manifest_bound_does_not_expand_host_limits(self):
+        self.assertEqual(preflight.MAX_LOCAL_MANIFEST_BYTES, 128 * 1024)
+        self.assertEqual(preflight.MAX_MANIFEST_BYTES, 64 * 1024)
+        self.assertEqual(runner.MAX_MANIFEST_BYTES, 64 * 1024)
+        self.assertEqual(preflight.MAX_STATE_BYTES, 192 * 1024)
+        self.assertEqual(preflight.MAX_CONTROL_BYTES, 512 * 1024)
+        self.assertEqual(preflight.MAX_TOTAL_BYTES, 256 * 1024 * 1024)
+
+    def test_input_manifest_rejects_oversized_local_document(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            raw = b" " * (preflight.MAX_LOCAL_MANIFEST_BYTES + 1)
+            preflight.save_private_bytes(root / preflight.INPUT_MANIFEST, raw)
+            with self.assertRaisesRegex(ValueError, "invalid type or size"):
+                preflight.load_input_manifest(
+                    root, hashlib.sha256(raw).hexdigest()
+                )
+
     def test_host_manifests_bind_qemu_closure_and_never_stage_efi(self):
         state = self.state()
         capability = preflight.host_phase_manifest(state, "capability")
@@ -2706,6 +2725,25 @@ class PrivatePreflightCompletedReceiptTest(PrivatePreflightFixture):
                 validated["private_build"],
                 state["input_manifest"]["private_build"],
             )
+            self.assertLessEqual(
+                receipt_path.stat().st_size,
+                preflight.MAX_LOCAL_MANIFEST_BYTES,
+            )
+            self.assertLessEqual(
+                (root / preflight.STATE_FILE).stat().st_size,
+                preflight.MAX_STATE_BYTES,
+            )
+
+    def test_completed_handoff_rejects_oversized_local_document(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "state"
+            _, _, receipt_path = self.completed_handoff(root)
+            receipt_path.write_bytes(
+                b" " * (preflight.MAX_LOCAL_MANIFEST_BYTES + 1)
+            )
+            with mock.patch.object(preflight, "verify_immutable_inputs"):
+                with self.assertRaisesRegex(ValueError, "invalid type or size"):
+                    preflight.load_completed_receipt(root)
 
     def test_completed_handoff_rejects_prepared_or_stale_bindings(self):
         for mutation in (
