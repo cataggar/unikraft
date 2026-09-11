@@ -1,6 +1,6 @@
 .{
     .name = .hyperv_preparation,
-    .version = "0.4.0",
+    .version = "0.4.1",
     .fingerprint = 0xf1d4a11a3f2639b3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

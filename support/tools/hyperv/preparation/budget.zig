@@ -223,6 +223,8 @@ test "budget includes baked producer publication controls and every copy" {
 }
 
 test "budget accepts exact limits and rejects one byte beyond either cap" {
+    try std.testing.expectEqual(@as(u64, 8388608), control_limit);
+    try std.testing.expectEqual(@as(u64, 268435456), total_limit);
     var entries = [_]Entry{
         fixture("raw", .raw, total_limit - control_limit - 1),
         fixture("native", .native_control, control_limit),
@@ -323,4 +325,40 @@ test "budget admission remeasures actual synthetic bytes instead of trusting rec
     try file.writePositionalAll(io, "changed bytes!", 0);
     try file.sync(io);
     try std.testing.expectError(error.HashMismatch, recompute(allocator, io, &entries, &entries, &bindings));
+}
+
+test "approved eight MiB controls remeasure copies and reservations inside the unchanged total" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var fixture_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture_dir.cleanup();
+    try fixture_dir.dir.setPermissions(io, .fromMode(0o700));
+    const file = try fixture_dir.dir.createFile(io, "public-control", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    try file.setPermissions(io, .fromMode(0o600));
+    try file.setLength(io, 3 * 1024 * 1024);
+    try file.sync(io);
+    const directory: fs.Directory = .{ .dir = fixture_dir.dir, .path = "" };
+    const entries = [_]Entry{
+        try record(allocator, io, directory, "producer", .producer_control, "staging/producer", "public-control"),
+        try record(allocator, io, directory, "baked", .baked_control, "image/producer", "public-control"),
+        .{ .id = "publication", .role = .publication_reservation, .artifact = "publication", .source = null, .reserved = 2 * 1024 * 1024 },
+    };
+    const bindings = [_]Binding{
+        .{ .id = "producer", .directory = directory },
+        .{ .id = "baked", .directory = directory },
+    };
+    const totals = try recompute(allocator, io, &entries, &entries, &bindings);
+    try std.testing.expectEqual(@as(u64, 6 * 1024 * 1024), totals.used);
+    try std.testing.expectEqual(@as(u64, 8388608), totals.control);
+    try std.testing.expectEqual(@as(u64, 268435456 - 8388608), totals.total_remaining);
+    var changed = entries;
+    changed[2].reserved += 1;
+    try std.testing.expectError(error.ControlLimitExceeded, recompute(allocator, io, &changed, &entries, &bindings));
+    changed = entries;
+    changed[1].role = .qemu_support;
+    try std.testing.expectError(error.LedgerClosureMismatch, recompute(allocator, io, &changed, &entries, &bindings));
+    try std.testing.expectError(error.MissingByteBinding, recompute(allocator, io, &entries, &entries, bindings[0..1]));
 }

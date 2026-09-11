@@ -1,4 +1,4 @@
-# Native local preparation, version 0.4
+# Native local preparation, version 0.4.1
 
 This package implements the local #120/#89 preparation boundary: strict native
 contracts, physical source/tool provenance, guarded configuration, synthetic
@@ -34,7 +34,8 @@ manifest change or missing-dependency failure, using copied manifests and
 ```sh
 cd /d/unikraft-worktrees/fleet-ci
 umask 077
-scratch="$PWD/.d/zig-migration-preparation/proof-compat-53226729"
+scratch="$PWD/.d/zig-migration-preparation/control-cap-8mib"
+proof_fixture="$PWD/.d/zig-migration-preparation/proof-compat-53226729/fixtures"
 export TMPDIR="$scratch/tmp" HOME="$scratch/home"
 export XDG_CACHE_HOME="$scratch/cache"
 export XDG_CONFIG_HOME="$scratch/config"
@@ -55,7 +56,7 @@ cd "$scratch/work"
 /home/g/.local/bin/zig build \
   --build-file /d/unikraft-worktrees/fleet-ci/support/tools/hyperv/preparation/build.zig \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
-  -Dproof-fixture="$scratch/fixtures" \
+  -Dproof-fixture="$proof_fixture" \
   --prefix "$scratch/outputs/debug" "${git_fixture[@]}" \
   -j2 test install --summary all
 ```
@@ -147,8 +148,12 @@ These local states are never completed/accepted states.
 
 ## Accounting and immutable publication
 
-The unchanged limits are **268435456 total bytes** and **2097152 control
-bytes**, with no native/baked/producer/publication exemption.
+The explicitly approved native control limit is **8388608 bytes (8 MiB)**
+inside the **unchanged 268435456-byte (256 MiB) total staging limit**.
+There is no native/baked/producer/publication/operator/host exemption.
+This replaces the former 2 MiB native allowance only; it changes no legacy
+512 KiB control policy or 64/128/192/256 KiB document limit, and grants no
+image, operator, cloud, seed or historical-evidence admission.
 
 Every selection requires a private `raw` and distinct private `vhd`, both
 matching the package report; VHD size is raw size + 512. Public capability raw
@@ -189,6 +194,11 @@ Native, producer, publication and baked control classes must be present. The
 remaining control headroom is charged as `publication_reservation`, covering
 `input.json` and future control publication without a self-referential hash.
 Its size must actually cover the canonical input document.
+Fresh ledgers reserve the remaining allowance under the approved 8 MiB policy.
+An older prepared-input ledger reserving only the former allowance does not
+match current recomputation. It is rejected, not silently upgraded or rewritten;
+historical receipts and evidence remain untouched. Wire schema versions and
+document-size bounds are unchanged.
 
 `inputs.generate` only creates a fresh directory containing its existing writer
 lock. It validates config, package, capability, QEMU and physical assets, copies
@@ -443,9 +453,12 @@ parent hard process deadline remains mandatory. Actual runs of the parameterized
 fixtures on other native architectures and full integrated producer execution remain necessary;
 neither the migration nor cloud admission is complete.
 
-Final focused results are **78/78 preparation cases** (10/10 build steps) and
-**16/16 namespace cases** (11/11 steps), each in Debug and ReleaseSafe under
-umask 077, with no skipped cases. The bridge/Git extension adds exact
+The cap update passes **80/80 preparation cases** (10/10 build steps) in both
+Debug and ReleaseSafe under umask 077, with no skipped cases. New cases cover
+physical producer/baked copies and publication reservation above the former cap,
+exact 8 MiB/256 MiB boundaries, one-byte overruns and refusal to reinterpret an
+older prepared ledger. The unchanged namespace suite's last recorded results
+are **16/16 cases** (11/11 steps) in both modes. The bridge/Git extension adds exact
 bridge-wire/private-path fixtures, v3 policy substitution cases, and actual Git
 execution after stripped or poisoned facade-like environments, with read-only
 policy and lifetime cases.
@@ -460,13 +473,17 @@ order; native-only unit cases cover hop and pending-path bounds.
 The additional merged-source case uses the actual #130 root/builder/CLI files
 and rejects missing gate dependencies, redirected roots, wrong modes, changed
 compiler selection/imports, omitted proof calls, stale hashes and symlinks.
-Final logs are `proof-compat-53226729/outputs/debug-2.log`, `release-safe.log`
-and `namespace-{debug,release-safe}.log` under the preparation scratch root.
-Earlier preserved logs contain superseded runs.
+Current cap logs are `control-cap-8mib/outputs/{debug,release-safe}.log` under
+the preparation scratch root. The earlier namespace results remain at
+`proof-compat-53226729/outputs/namespace-{debug,release-safe}.log`.
+All earlier logs are preserved.
 
 The stripped ReleaseSafe producer and Git-enabled helper measure
-1093312 and 705648 bytes: 1798960 bytes together, leaving only 298192 of the
-2097152-byte control cap before other required controls/publications. This is
-not a complete workflow budget result. A distinct engine executable and actual
-QEMU/image/control selection must fit the unchanged ledger; no exemption or
-larger approval is implied.
+1093312 and 705648 bytes: 1798960 bytes together, leaving 6589648 of the
+8388608-byte control cap before other required controls/publications. This
+two-binary measurement is not a complete workflow budget result. The parent
+reported a separate partial control measurement of 3536943 bytes before
+unmeasured engine/dependency/publication inputs when obtaining the 8 MiB
+approval. Neither partial measurement proves the integrated ledger fits.
+All selected operator, dependency, guard, publication, image-baked and other
+control copies still require measurement and charging inside both caps.

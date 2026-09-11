@@ -595,6 +595,30 @@ test "SHAPE ONLY generation ledger charges six firmware copies all controls evid
     try std.testing.expectError(error.UnreviewedInput, inputs.validate(std.testing.allocator, changed, selected_sha));
 }
 
+test "SHAPE ONLY eight MiB policy does not silently adopt a former two MiB prepared ledger" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const chain = try shapeChain(allocator);
+    const current = try shapeInput(allocator, chain);
+    try inputs.validate(allocator, current, current.reviewed_selection_sha256);
+    var previous = current;
+    const entries = try allocator.dupe(budget.Entry, current.ledger);
+    var found = false;
+    for (entries) |*entry| {
+        if (entry.role != .publication_reservation or !std.mem.eql(u8, entry.id, "remaining-controls")) continue;
+        try std.testing.expect(entry.reserved > 8388608 - 2097152);
+        entry.reserved -= 8388608 - 2097152;
+        found = true;
+    }
+    try std.testing.expect(found);
+    previous.ledger = entries;
+    previous.budget = try budget.compute(entries);
+    try std.testing.expectEqual(@as(u64, 2097152), previous.budget.control);
+    try std.testing.expectError(error.LedgerClosureMismatch, inputs.validate(allocator, previous, previous.reviewed_selection_sha256));
+    try inputs.validate(allocator, current, current.reviewed_selection_sha256);
+}
+
 test "SHAPE ONLY generation rejects missing controls partial QEMU duplicate paths and forged package links" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

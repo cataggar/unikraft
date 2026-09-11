@@ -7,7 +7,7 @@ pub const miz_revision = "2db68ca0c3ab12155012a823c3fb8d7aba1cb544";
 pub const compiler_version = "0.16.0";
 pub const guest_target = "x86_64-freestanding-none";
 pub const total_cap: u64 = 268435456;
-pub const control_cap: u64 = 2097152;
+pub const control_cap: u64 = 8388608;
 pub const image_bytes: u64 = 66 * 1024 * 1024;
 
 pub const File = struct { path: []const u8, sha256: Sha, size: u64, mode: u16 };
