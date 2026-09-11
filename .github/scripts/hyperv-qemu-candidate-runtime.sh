@@ -14,6 +14,7 @@ ownership="${root}/evidence/runtime-created.txt"
 expected=66c111808e61c7f6be6715b4b03d0fe75beb5bc5b3a8809608d58d99a6bc9828
 kvm_changed=false
 kvm_identity=
+runtime_started="$(date --iso-8601=seconds)"
 test -f "${source}"
 test ! -L "${source}"
 test "$(sha256sum "${source}" | cut -d ' ' -f 1)" = "${expected}"
@@ -30,6 +31,10 @@ cleanup() {
   if [[ "${kvm_changed}" = true ]]; then
     if [[ -c /dev/kvm && ! -L /dev/kvm ]] &&
        [[ "$(stat -c '%d:%i:%u:%g:%t:%T' /dev/kvm)" = "${kvm_identity}" ]]; then
+      stat -c '%d:%i:%u:%g:%a:%t:%T' /dev/kvm > "${root}/evidence/kvm-before-cleanup.txt" \
+        || cleanup_status=1
+      getfacl --omit-header --no-effective --numeric /dev/kvm \
+        > "${root}/evidence/kvm-before-cleanup.acl" || cleanup_status=1
       sudo setfacl --set-file="${root}/evidence/kvm-before.acl" -- /dev/kvm \
         || cleanup_status=$?
       getfacl --omit-header --no-effective /dev/kvm > "${root}/evidence/kvm-after.acl" \
@@ -39,6 +44,14 @@ cleanup() {
     else
       echo "KVM device identity changed; refusing unrelated ACL cleanup." >&2
       cleanup_status=1
+    fi
+    if [[ "${primary}" -ne 0 ]]; then
+      journalctl --dmesg --no-pager --since "${runtime_started}" \
+        --grep 'apparmor="DENIED".*(qemu|/dev/kvm)' --lines=20 \
+        > "${root}/evidence/kvm-kernel-denials.txt" 2>&1 || {
+          diagnostic=$?
+          printf 'Kernel-denial query exited %s; retained its output.\n' "${diagnostic}" >&2
+        }
     fi
   fi
   if [[ -f "${ownership}" ]]; then
@@ -79,6 +92,8 @@ if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
 fi
 test -r /dev/kvm
 test -w /dev/kvm
+getfacl --omit-header --no-effective --numeric /dev/kvm > "${root}/evidence/kvm-granted.acl"
+id > "${root}/evidence/kvm-caller.txt"
 
 if [[ -e "${target}" || -L "${target}" ]]; then
   test -f "${target}"
@@ -106,6 +121,7 @@ stat -c '%d:%i:%u:%g:%a:%h:%s' "${target}" > "${root}/evidence/managed-libfdt.tx
 
 bash .github/scripts/hyperv-qemu-candidate.sh \
   "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" "${root}/evidence/managed-probe"
+getfacl --omit-header --no-effective --numeric /dev/kvm > "${root}/evidence/kvm-before-boots.acl"
 bash .github/scripts/hyperv-qemu-candidate-guest.sh boot "${root}" "${root}/bin/qemu-system-x86_64"
 sha256sum -c "${root}/evidence/managed-probe/executables.sha256" \
   "${root}/evidence/managed-probe/libraries.sha256" "${root}/evidence/qemu-data.sha256" \
