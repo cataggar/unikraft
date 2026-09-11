@@ -71,10 +71,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "45e3233ddbea9f55af4d51892b7e2733edcf447039c8dd713ad364553be10a2b"
+            "dd3a12405af5bf0d2ae3bc30132ed8af34725cde14ea1f8c72813ad0244212e0"
         ),
-        "size": 1433902,
-        "files": 198,
+        "size": 1445182,
+        "files": 199,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -96,7 +96,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "5488c5b65458987a515c081461b2b8c5749a8ec10e61369d261d861ea049fe3f"
+        "b9afb89b139ed15827aa7313b53f9bf99816260d782328ce94af74c46457cfc8"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -191,6 +191,9 @@ GUARDED_PRODUCER_FILES = {
     "support/build/native-lto.zig": (
         "cb5a2c661288b243ce97246c27e5c3a6b8b33aa9c037fdb263a42a1774aaba4a"
     ),
+    "support/build/native-make-environment.zig": (
+        "7db2a3cefd9576efa62e66453d3ff59dabfdc5ae8ae391f1f8cc08f5362eec51"
+    ),
     "support/build/native-target-object.zig": (
         "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
     ),
@@ -223,6 +226,9 @@ GUARDED_PRODUCER_FILES = {
     ),
     "support/tools/hyperv/diagnostics.zig": (
         "94138509d8f0818818591f8fbe6181bd1cee09cbff0970506e46b00c989484b7"
+    ),
+    "support/tools/hyperv/private_files.zig": (
+        "dac40c596ccba73af72af8022b72af614f149d93ff2ccf3c7a9aead9ae08d997"
     ),
     "support/tools/hyperv/process.zig": (
         "89e501b82c888eae5ab0cb716909e1f035d640f693e965073890bbd015811120"

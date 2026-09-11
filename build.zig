@@ -10,6 +10,7 @@ const native_postprocess = @import("support/build/native-postprocess.zig");
 const native_image_graph = @import("support/build/native-image-graph.zig");
 const native_target_object = @import("support/build/native-target-object.zig");
 const native_build_tools = @import("support/build/native-build-tools.zig");
+const native_make_environment = @import("support/build/native-make-environment.zig");
 const object_proofs = @import("support/build/hyperv-object-proofs.build.zig");
 
 const supported_zig = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
@@ -51,6 +52,7 @@ const MakeOptions = struct {
     host_cxx: ?[]const u8,
     host_cflags: ?[]const u8,
     forwarded: []const []const u8,
+    native_environment: ?native_make_environment.Contract = null,
 };
 
 const Target = struct {
@@ -157,6 +159,17 @@ pub fn build(b: *std.Build) void {
         .exists = context.output_exists,
     };
 
+    var selected_environment: ?std.json.Parsed(native_make_environment.Contract) = null;
+    defer if (selected_environment) |*selected| selected.deinit();
+    if (b.option([]const u8, "native-make-environment", "Private canonical native Make environment contract (Linux only)")) |path| {
+        selected_environment = native_make_environment.read(b.allocator, b.graph.io, path) catch |err| {
+            const message = b.fmt("unable to load explicit native Make environment: {s}", .{@errorName(err)});
+            // Later unregistered options must not hide the actual input failure.
+            std.debug.print("error: {s}\n", .{message});
+            addFailedTargets(b, message);
+            return;
+        };
+    }
     const options = MakeOptions{
         .command = b.option([]const u8, "make-command", "GNU Make executable (default: make)") orelse "make",
         .app = app,
@@ -177,6 +190,7 @@ pub fn build(b: *std.Build) void {
         .host_cxx = b.option([]const u8, "host-cxx", "Host C++ compiler command (Make HOSTCXX=)"),
         .host_cflags = b.option([]const u8, "host-cflags", "Host compiler flags (Make HOSTCFLAGS=)"),
         .forwarded = b.option([]const []const u8, "make-arg", "Allowlisted NAME=VALUE tool/flag assignment; may be repeated") orelse &.{},
+        .native_environment = if (selected_environment) |selected| selected.value else null,
     };
 
     if (validation_message == null) {
@@ -367,6 +381,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_facade_tests = b.addRunArtifact(facade_tests);
     run_facade_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    const native_environment_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+        .filters = &.{ "native Make environment", "Make assignments remain single arguments" },
+    });
+    const run_native_environment_tests = b.addRunArtifact(native_environment_tests);
+    run_native_environment_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    b.step("test-native-make-environment", "Test explicit private Make environment and unchanged default forwarding").dependOn(&run_native_environment_tests.step);
     const runner_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/zig-facade-runner.zig"),
@@ -2868,6 +2893,10 @@ fn makeArguments(
     for (options.forwarded) |assignment| {
         argv.append(assignment) catch @panic("out of memory");
     }
+    if (options.native_environment) |environment| {
+        const assignments = environment.assignments(allocator) catch @panic("out of memory");
+        argv.appendSlice(&assignments) catch @panic("out of memory");
+    }
     return argv.toOwnedSlice() catch @panic("out of memory");
 }
 
@@ -2941,8 +2970,18 @@ fn isAllowedAssignment(name: []const u8) bool {
     return false;
 }
 
+test "native Make environment keeps ordinary forwarding restrictions" {
+    _ = native_make_environment;
+    for ([_][]const u8{
+        "UMASK=0077", "SHELL=/native/bash", "CONFIG_SHELL=/native/bash",
+        "HOME=/private/home", "TMPDIR=/private/tmp", "LD_PRELOAD=/native/library",
+    }) |assignment| {
+        try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment(assignment));
+    }
+}
+
 test "Make assignments remain single arguments" {
-    const options = MakeOptions{
+    var options = MakeOptions{
         .command = "gmake",
         .app = "/workspace/app",
         .output = "/workspace/output",
@@ -2992,6 +3031,26 @@ test "Make assignments remain single arguments" {
     for (expected, actual) |expected_argument, actual_argument| {
         try std.testing.expectEqualStrings(expected_argument, actual_argument);
     }
+    options.native_environment = .{
+        .bison_data = "/native/share/bison",
+        .m4 = "/native/bin/m4",
+        .schema = .unikraft_native_make_environment_v1,
+        .shell = "/native/bin/bash",
+        .tmp = "/private/tmp",
+        .xdg_cache = "/private/cache",
+        .xdg_config = "/private/config",
+        .zig_global_cache = "/private/zig-global",
+        .zig_local_cache = "/private/zig-local",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const native_arguments = makeArguments(arena.allocator(), "images", options);
+    try std.testing.expectEqual(actual.len + 10, native_arguments.len);
+    for (actual, native_arguments[0..actual.len]) |want, argument|
+        try std.testing.expectEqualStrings(want, argument);
+    try std.testing.expectEqualStrings("UMASK=0077", native_arguments[actual.len]);
+    try std.testing.expectEqualStrings("SHELL=/native/bin/bash", native_arguments[actual.len + 1]);
+    try std.testing.expectEqualStrings("ZIG_LOCAL_CACHE_DIR=/private/zig-local", native_arguments[native_arguments.len - 1]);
 }
 
 test "output path rejects repository and application deletion hazards" {
