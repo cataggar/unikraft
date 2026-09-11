@@ -299,8 +299,11 @@ admission before any persistence operation.
 
 ## Byte accounting
 
-Limits remain **2,097,152 control bytes** and **268,435,456 cumulative staged
-bytes**. `Budget` partitions producer/publication, controller, image-baked host,
+The user-approved native limits are **8,388,608 control bytes** inside the
+unchanged **268,435,456 cumulative staged bytes**. The 2026-09-11 control
+allowance supersedes the initial 2 MiB; it changes no authority or other
+document, evidence or execution limit. `Budget` partitions
+producer/publication, controller, image-baked host,
 and host-runtime reservations. The host's starting debit already includes the
 entire controller reservation; actual controller spending is not added to that
 floor again. No image-baked/control binary or unit is exempt.

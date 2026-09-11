@@ -59,7 +59,7 @@ test "strict preparation boundary budget partitions and all proof bindings" {
     var admission = try fixture.input.validate(a, f.now);
     defer admission.deinit();
     const total = try (try fixture.input.approved.budget.floor()).add(fixture.input.approved.budget.host_runtime);
-    try t.expect(total.control < 2097152 and total.staged < 268435456);
+    try t.expect(total.control < p.max_control and total.staged < p.max_staging);
     const before = fixture.input.approved.proofs.native_provider;
     fixture.input.approved.proofs.native_provider = [_]u8{0} ** 32;
     try t.expectError(error.MissingBinding, fixture.input.validate(a, f.now));
@@ -267,9 +267,11 @@ test "local canonical schemas reject Boolean integers duplicates and unknown fie
 test "complete disjoint control and staging totals accept exact limits but reject one byte" {
     const exact = try (c.Debit{ .staged = p.max_staging - 1, .control = p.max_control - 1 }).add(.{ .staged = 1, .control = 1 });
     try t.expectEqual(@as(u64, 268435456), exact.staged);
-    try t.expectEqual(@as(u64, 2097152), exact.control);
+    try t.expectEqual(@as(u64, 8388608), exact.control);
     try t.expectError(error.BudgetExceeded, exact.add(.{ .staged = 1, .control = 0 }));
     try t.expectError(error.BudgetExceeded, (c.Debit{ .staged = p.max_control, .control = p.max_control }).add(.{ .staged = 1, .control = 1 }));
+    const expanded = try (c.Debit{ .staged = 2097152, .control = 2097152 }).add(.{ .staged = 1, .control = 1 });
+    try t.expectEqual(@as(u64, 2097153), expanded.control);
     try t.expectEqual(@as(usize, 245760), c.worker_output_reservation);
 }
 
