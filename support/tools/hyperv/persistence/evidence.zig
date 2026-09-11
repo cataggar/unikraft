@@ -34,7 +34,9 @@ pub fn parse(bytes: []const u8, boot: u8, input: contract.Contract, previous: ?E
     if (boot != 1 and boot != 2) return error.InvalidBoot;
     if ((boot == 1) != (previous == null)) return error.InvalidBoot;
     if (bytes.len == 0 or bytes.len > contract.serial_limit) return error.InvalidSerialLength;
-    if (bytes[bytes.len - 1] != '\n') return error.EvidenceIncomplete;
+    const last_newline = std.mem.lastIndexOfScalar(u8, bytes, '\n') orelse return error.EvidenceIncomplete;
+    // ukprint emits its reset (including NUL) after the message's newline.
+    if (!resetTail(bytes[last_newline + 1 ..])) return error.EvidenceIncomplete;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidSerial;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     var expected: u8 = 0;
@@ -120,9 +122,9 @@ pub fn parse(bytes: []const u8, boot: u8, input: contract.Contract, previous: ?E
         } else if (std.mem.startsWith(u8, line, "HYPERV_PERSISTENCE FINAL ")) {
             marker = 6;
             if (!std.mem.eql(u8, line, "HYPERV_PERSISTENCE FINAL PASS rc=0")) return error.GuestFailure;
-        } else if (std.mem.startsWith(u8, line, "main returned ")) {
+        } else if (terminalBody(line)) |body| {
             marker = 7;
-            if (!std.mem.eql(u8, line, "main returned 0")) return error.GuestFailure;
+            if (!std.mem.eql(u8, body, "main returned 0")) return error.GuestFailure;
         } else if (std.mem.startsWith(u8, line, "HYPERV_PERSISTENCE ") or std.mem.startsWith(u8, line, "UK_HYPERV_PERSISTENCE_")) {
             return error.UnknownProtocolMarker;
         }
@@ -133,6 +135,79 @@ pub fn parse(bytes: []const u8, boot: u8, input: contract.Contract, previous: ?E
     }
     if (expected != 8 or identity == null) return error.EvidenceIncomplete;
     return .{ .boot = boot, .identity = identity.?, .bytes = @intCast(bytes.len), .sha256 = local.hash(bytes), .writes = if (boot == 1) 5 else 0, .flushes = if (boot == 1) 3 else 0 };
+}
+
+fn resetTail(raw: []const u8) bool {
+    var rest = raw;
+    while (rest.len != 0) {
+        if (rest[0] == 0) {
+            rest = rest[1..];
+        } else if (std.mem.startsWith(u8, rest, "\x1b[0m")) {
+            rest = rest[4..];
+        } else return false;
+    }
+    return true;
+}
+
+// Only the boot.c terminal message has a kernel envelope. Protocol markers
+// remain bare. Order/widths follow ukprint/console.c and snprintf.c.
+fn terminalBody(line: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, line, "main returned ")) return line;
+    if (line.len > 256) return null;
+    var rest = line;
+    if (std.mem.startsWith(u8, rest, "[")) {
+        const end = std.mem.indexOf(u8, rest, "] ") orelse return null;
+        const time = rest[1..end];
+        const dot = std.mem.indexOfScalar(u8, time, '.') orelse return null;
+        if (!paddedDecimal(time[0..dot], 5, 20) or time.len - dot - 1 != 6) return null;
+        for (time[dot + 1 ..]) |byte| if (!std.ascii.isDigit(byte)) return null;
+        rest = rest[end + 2 ..];
+    }
+    if (!std.mem.startsWith(u8, rest, "Info: ")) return null;
+    rest = rest["Info: ".len..];
+    if (std.mem.startsWith(u8, rest, "<<n/a>> ")) {
+        rest = rest["<<n/a>> ".len..];
+    } else if (std.mem.startsWith(u8, rest, "<")) {
+        const end = std.mem.indexOf(u8, rest, "> ") orelse return null;
+        const thread = rest[1..end];
+        if (!std.mem.eql(u8, thread, "main") and !std.mem.eql(u8, thread, "init") and !kernelPointer(thread))
+            return null;
+        rest = rest[end + 2 ..];
+    }
+    if (std.mem.startsWith(u8, rest, "{r:")) {
+        const end = std.mem.indexOf(u8, rest, "} ") orelse return null;
+        const caller = rest["{r:".len..end];
+        const comma = std.mem.indexOf(u8, caller, ",f:") orelse return null;
+        if (!kernelPointer(caller[0..comma]) or !kernelPointer(caller[comma + 3 ..])) return null;
+        rest = rest[end + 2 ..];
+    }
+    // boot.c is compiled as libukboot, whose ID is in uklibid's name map.
+    if (!std.mem.startsWith(u8, rest, "[libukboot] ")) return null;
+    rest = rest["[libukboot] ".len..];
+    if (std.mem.startsWith(u8, rest, "<boot.c @ ")) {
+        const end = std.mem.indexOf(u8, rest, "> ") orelse return null;
+        const number = rest["<boot.c @ ".len..end];
+        if (!paddedDecimal(number, 4, 5) or std.mem.eql(u8, std.mem.trimStart(u8, number, " "), "0"))
+            return null;
+        rest = rest[end + 2 ..];
+    }
+    return if (std.mem.startsWith(u8, rest, "main returned ")) rest else null;
+}
+
+fn paddedDecimal(text: []const u8, width: usize, maximum: usize) bool {
+    const digits = std.mem.trimStart(u8, text, " ");
+    if (digits.len == 0 or digits.len > maximum or text.len != @max(width, digits.len) or
+        (digits.len > 1 and digits[0] == '0')) return false;
+    for (digits) |byte| if (!std.ascii.isDigit(byte)) return false;
+    _ = std.fmt.parseInt(u64, digits, 10) catch return false;
+    return true;
+}
+
+fn kernelPointer(text: []const u8) bool {
+    if (std.mem.eql(u8, text, "0")) return true;
+    if (text.len < 3 or text.len > 18 or !std.mem.startsWith(u8, text, "0x") or text[2] == '0') return false;
+    for (text[2..]) |byte| if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;
+    return true;
 }
 
 fn normalize(raw: []const u8, output: []u8) ![]const u8 {

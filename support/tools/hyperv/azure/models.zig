@@ -457,6 +457,10 @@ fn persistenceNetwork(a: std.mem.Allocator, authority: s.Authority, definition: 
             const configuration = try field(configurations[0], "properties");
             if (!std.mem.eql(u8, try string(configurations[0], "name"), "primary") or
                 !std.mem.eql(u8, try string(configuration, "privateIPAllocationMethod"), "Dynamic")) return error.InvalidNetwork;
+            inline for (.{ "loadBalancerBackendAddressPools", "loadBalancerInboundNatRules", "applicationGatewayBackendAddressPools" }) |relationship| {
+                if (configuration.object.get(relationship)) |associations|
+                    if ((try array(associations)).len != 0) return error.InvalidNetwork;
+            }
             const subnet: s.Ref = .{ .kind = .subnet, .name = "default", .parent = try std.fmt.allocPrint(a, "{s}-vnet", .{definition.prefix}) };
             try subnet.requireId(a, authority, try string(try field(configuration, "subnet"), "id"));
         },

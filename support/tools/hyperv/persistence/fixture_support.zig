@@ -46,6 +46,7 @@ pub fn input() p.contract.Contract {
         .control_bytes = 1024,
     };
 }
+pub const terminal = "[    0.123456] Info: [libukboot] <boot.c @  544> main returned 0";
 pub fn segment(a: std.mem.Allocator, boot: u8, writes: u8) ![]u8 {
     const spec = input();
     return std.fmt.allocPrint(a, "synthetic protocol fixture, not boot evidence\n" ++
@@ -55,7 +56,7 @@ pub fn segment(a: std.mem.Allocator, boot: u8, writes: u8) ![]u8 {
         "HYPERV_PERSISTENCE BOOT{d}_{s} PASS run={s}\n" ++
         "UK_HYPERV_PERSISTENCE_IO:1:{d}:{s}:{d}:{d}:receipt-verified\n" ++
         "UK_HYPERV_PERSISTENCE_BOOT{d}_COMPLETE:{s}\n" ++
-        "HYPERV_PERSISTENCE FINAL PASS rc=0\nmain returned 0\n", .{ spec.run_id, @as(u8, if (boot == 1) 0 else 2), spec.run_id, spec.disk_id, boot, if (boot == 1) @as([]const u8, "WRITE") else "READ", spec.run_id, boot, spec.run_id, writes, @as(u8, if (boot == 1) 3 else 0), boot, spec.run_id });
+        "HYPERV_PERSISTENCE FINAL PASS rc=0\n" ++ terminal ++ "\n", .{ spec.run_id, @as(u8, if (boot == 1) 0 else 2), spec.run_id, spec.disk_id, boot, if (boot == 1) @as([]const u8, "WRITE") else "READ", spec.run_id, boot, spec.run_id, writes, @as(u8, if (boot == 1) 3 else 0), boot, spec.run_id });
 }
 pub fn serial(a: std.mem.Allocator, step: p.model.Step, mode: Mode) ![]u8 {
     const first = try segment(a, 1, 5);

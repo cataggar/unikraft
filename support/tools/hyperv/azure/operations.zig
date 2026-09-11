@@ -359,7 +359,9 @@ fn diskBody(a: std.mem.Allocator, authority: s.Authority, disk: Disk, deployment
         .location = authority.location,
         .tags = ownerTags(authority),
         .sku = .{ .name = "StandardSSD_LRS" },
-        .properties = .{ .diskSizeGB = disk.size_gib, .logicalSectorSize = @as(u16, 512), .osType = if (disk.linux_gen2) @as(?[]const u8, "Linux") else null, .hyperVGeneration = if (disk.linux_gen2) @as(?[]const u8, "V2") else null, .creationData = .{
+        // For Upload, diskSizeGB requests resizing; only the exact upload size
+        // belongs on the wire. The GiB ceiling above is a local invariant.
+        .properties = .{ .diskSizeGB = if (disk.upload_bytes == null) @as(?u32, disk.size_gib) else null, .logicalSectorSize = @as(u16, 512), .osType = if (disk.linux_gen2) @as(?[]const u8, "Linux") else null, .hyperVGeneration = if (disk.linux_gen2) @as(?[]const u8, "V2") else null, .creationData = .{
             .createOption = if (disk.upload_bytes != null) "Upload" else "Empty",
             .uploadSizeBytes = disk.upload_bytes,
         } },

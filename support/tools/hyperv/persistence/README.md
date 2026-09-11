@@ -203,14 +203,21 @@ with the actual preparation/preflight ledger. Remote responses retain merged
 ARM byte/poll bounds; serial capture has its separate legacy 4-MiB ceiling.
 
 The narrow shared ARM additions provide the original NSG/VNet/NIC (no public
-IP, acceleration, forwarding, NAT, or custom routes), MiB-aligned VHD upload
-geometry with a GiB allocation ceiling (including the original 66-MiB guest),
-and an opt-in full persistence VM attachment envelope. Existing default VM
-behavior is unchanged. OS creation explicitly selects Linux/Generation 2;
-logical bytes are the VHD payload size, not the GiB billing/allocation ceiling.
+IP, acceleration, forwarding, NAT, custom routes, load-balancer pools/NAT rules,
+or application-gateway pools), MiB-aligned VHD upload geometry with a locally
+checked GiB ceiling (including the original 66-MiB guest), and an opt-in full
+persistence VM attachment envelope. Existing default VM behavior is unchanged.
+OS creation explicitly selects Linux/Generation 2.
+Upload requests specify exact `uploadSizeBytes` including the footer and omit
+`diskSizeGB` entirely: for non-Empty creation that field requests resizing.
+Empty requests still specify `diskSizeGB`. Neither the local GiB ceiling nor
+the response's GiB field rounds or replaces the exact VHD logical byte count.
 Before deployment, detached original disk UUIDs, raw `diskSizeBytes`, roles and
 readiness are checked. Subsequent observations require attachment to the
-original VM; cleanup never accepts an unrelated attachment.
+original VM; cleanup never accepts an unrelated attachment. Both NIC readiness
+and cleanup ownership require absent or empty-array association fields;
+nonempty or malformed association values refuse. Generic network parsing
+remains unchanged.
 
 APIs remain pinned: groups/deployments 2021-04-01,
 compute VM 2025-11-01, disks 2025-01-02, network 2024-05-01, pages 2020-10-02,
@@ -222,9 +229,21 @@ Blob downloads 2024-11-04. No storage account/key/firewall is created by #89.
 run/disk/controller/VPD identity, LUN 7, 8388608x512 geometry, Boot1 5 writes/
 3 flushes, Boot2 0 writes/0 flushes, receipt verification and terminal return.
 It requires the complete raw Boot1 prefix unchanged in accumulated Boot2
-serial. Parsing strips ANSI CSI/NUL decoration only; saved bytes and hashes
-remain exact. VPD is limited to the actual C maximum of 64 bytes. Benign
-unrelated text is not rejected merely for containing `BOOT1` or `RESEED`.
+serial. Terminal `main returned 0` accepts the bare compatibility form or the
+anchored `lib/ukprint/console.c` Info envelope from `lib/ukboot/boot.c`: optional
+`[%5seconds.%06microseconds] `, `Info: `, optional thread then caller,
+`[libukboot] `, and optional `<boot.c @ %4line> `. Thread forms are the boot
+paths' `main`/`init`, an unnamed pointer, or `<<n/a>>`; caller pointers use
+ukprint's lowercase `0x` form (or `0`). Source lines are not pinned to one
+revision, but must fit the producer's six-byte line buffer. Envelopes are
+bounded to 256 normalized bytes and are never found by substring/suffix
+search. Nonzero returns, duplicate/reordered terminals and trailing message
+garbage fail; the other seven protocol markers remain bare and exact.
+Parsing strips ANSI CSI/NUL decoration and accepts CRLF. A complete LF must
+precede any final reset/NUL-only ukprint tail; partial text/escape tails refuse.
+Saved bytes, byte counts and hashes, including those resets, remain exact.
+VPD is limited to the actual C maximum of 64 bytes. Benign unrelated text is
+not rejected merely for containing `BOOT1` or `RESEED`.
 
 `test` covers canonical admission, permissions/locking/consumption, full
 two-boot synthetic models, identity/geometry/serial negatives, all failure

@@ -183,6 +183,117 @@ test "actual C serial order identity IO counts and unchanged complete prefix" {
     try t.expectError(error.InvalidCandidateOrder, p.evidence.parse(candidates, 1, f.input(), null));
 }
 
+test "ukboot terminal supports ukprint feature combinations and exact raw boot prefix" {
+    const first = try f.segment(a, 1, 5);
+    defer a.free(first);
+    const second = try f.segment(a, 2, 0);
+    defer a.free(second);
+    const bare = try std.mem.replaceOwned(u8, a, first, f.terminal, "main returned 0");
+    defer a.free(bare);
+    _ = try p.evidence.parse(bare, 1, f.input(), null);
+    for ([_][]const u8{ "", "[    0.000000] ", "[123456.999999] " }) |timestamp| {
+        for ([_][]const u8{ "", "<main> ", "<init> ", "<<n/a>> ", "<0xffff800012345678> " }) |thread| {
+            for ([_][]const u8{ "", "{r:0xffff800000012345,f:0} ", "{r:0,f:0x1234} " }) |caller| {
+                for ([_][]const u8{ "", "<boot.c @    1> ", "<boot.c @  544> ", "<boot.c @ 9999> ", "<boot.c @ 10000> " }) |source| {
+                    const terminal = try std.fmt.allocPrint(a, "{s}Info: {s}{s}[libukboot] {s}main returned 0", .{ timestamp, thread, caller, source });
+                    defer a.free(terminal);
+                    const bytes = try std.mem.replaceOwned(u8, a, first, f.terminal, terminal);
+                    defer a.free(bytes);
+                    const evidence = try p.evidence.parse(bytes, 1, f.input(), null);
+                    try t.expectEqual(bytes.len, evidence.bytes);
+                    try t.expectEqual(p.local.hash(bytes), evidence.sha256);
+                    const full = try std.mem.concat(a, u8, &.{ bytes, second });
+                    defer a.free(full);
+                    const suffix = try p.evidence.boot2Suffix(full, evidence);
+                    try t.expectEqualStrings(second, suffix);
+                    _ = try p.evidence.parse(suffix, 2, f.input(), evidence);
+                }
+            }
+        }
+    }
+    // console.c writes LVLC_RESET with sizeof(), including NUL, before and
+    // after the body. Its configured CR insertion precedes the LF.
+    const colored = "\x1b[0m\x1b[32m[    0.123456] " ++
+        "\x1b[0m\x1b[1m\x1b[32mInfo:\x1b[0m " ++
+        "\x1b[0m\x1b[34m<main> \x1b[0m\x1b[31m{r:0x1234,f:0} " ++
+        "\x1b[0m\x1b[33m[libukboot] \x1b[0m\x1b[36m<boot.c @  544> " ++
+        "\x1b[0m\x00main returned 0\r\n\x1b[0m\x00";
+    for ([_][]const u8{ colored, "[    0.123456] Info: [libukboot] <boot.c @  544> \x00main returned 0\r\n\x00" }) |terminal| {
+        const bytes = try std.mem.replaceOwned(u8, a, first, f.terminal ++ "\n", terminal);
+        defer a.free(bytes);
+        const evidence = try p.evidence.parse(bytes, 1, f.input(), null);
+        try t.expectEqual(bytes.len, evidence.bytes);
+        try t.expectEqual(p.local.hash(bytes), evidence.sha256);
+        const full = try std.mem.concat(a, u8, &.{ bytes, second });
+        defer a.free(full);
+        _ = try p.evidence.parse(try p.evidence.boot2Suffix(full, evidence), 2, f.input(), evidence);
+        full[bytes.len - 1] = 1;
+        try t.expectError(error.SerialPrefixChanged, p.evidence.boot2Suffix(full, evidence));
+        const truncated = try std.mem.replaceOwned(u8, a, bytes, "\r\n", "\r");
+        defer a.free(truncated);
+        try t.expectError(error.EvidenceIncomplete, p.evidence.parse(truncated, 1, f.input(), null));
+    }
+}
+
+test "ukboot terminal refuses nonzero duplicate reordered spoofed and truncated logs" {
+    const first = try f.segment(a, 1, 5);
+    defer a.free(first);
+    for ([_][]const u8{ "main returned -1", "main returned 1", "main returned 00", "main returned +0", "main returned 0 extra" }) |body| {
+        const bad = try std.mem.replaceOwned(u8, a, first, "main returned 0", body);
+        defer a.free(bad);
+        try t.expectError(error.GuestFailure, p.evidence.parse(bad, 1, f.input(), null));
+    }
+    const duplicate = try std.mem.concat(a, u8, &.{ first, f.terminal, "\n" });
+    defer a.free(duplicate);
+    try t.expectError(error.InvalidEvidenceOrder, p.evidence.parse(duplicate, 1, f.input(), null));
+    const early = try std.mem.concat(a, u8, &.{ f.terminal, "\n", first });
+    defer a.free(early);
+    try t.expectError(error.InvalidEvidenceOrder, p.evidence.parse(early, 1, f.input(), null));
+    for ([_][]const u8{
+        "spoof " ++ f.terminal,
+        "Info: [libukboot] prefix main returned 0",
+        "Info: [libother] <boot.c @  544> main returned 0",
+        "Info: [libukboot] <other.c @  544> main returned 0",
+        "Info: <boot.c @  544> main returned 0",
+        "Info: main returned 0",
+        "ERR:  [libukboot] <boot.c @  544> main returned 0",
+        "[0.123456] Info: [libukboot] main returned 0",
+        "[00000.123456] Info: [libukboot] main returned 0",
+        "[    0.12345] Info: [libukboot] main returned 0",
+        "[    0.1234567] Info: [libukboot] main returned 0",
+        "[    0.12345x] Info: [libukboot] main returned 0",
+        "[18446744073709551616.123456] Info: [libukboot] main returned 0",
+        "Info: [libukboot] <boot.c @ 544> main returned 0",
+        "Info: [libukboot] <boot.c @ 0544> main returned 0",
+        "Info: [libukboot] <boot.c @    0> main returned 0",
+        "Info: [libukboot] <boot.c @ 100000> main returned 0",
+        "Info: [libukboot] <boot.c @  54x> main returned 0",
+        "Info: <spoof> [libukboot] main returned 0",
+        "Info: <main> <main> [libukboot] main returned 0",
+        "Info: {r:0x1,f:0} <main> [libukboot] main returned 0",
+        "Info: {r:1,f:0} [libukboot] main returned 0",
+        "Info: {r:0x01,f:0} [libukboot] main returned 0",
+        "Info: {r:0x10000000000000000,f:0} [libukboot] main returned 0",
+        "Info: {r:0x1,f:0,g:0} [libukboot] main returned 0",
+        "Info: <" ++ "x" ** 256 ++ "> [libukboot] main returned 0",
+    }) |terminal| {
+        const bad = try std.mem.replaceOwned(u8, a, first, f.terminal, terminal);
+        defer a.free(bad);
+        try t.expectError(error.EvidenceIncomplete, p.evidence.parse(bad, 1, f.input(), null));
+    }
+    for ([_][]const u8{ "\x1b[0", "\x1b[", "\x1b[31m", "\x00partial", " ", "\r" }) |tail| {
+        const truncated = try std.mem.concat(a, u8, &.{ first, tail });
+        defer a.free(truncated);
+        try t.expectError(error.EvidenceIncomplete, p.evidence.parse(truncated, 1, f.input(), null));
+    }
+    const prefixed_protocol = try std.mem.replaceOwned(u8, a, first, "HYPERV_PERSISTENCE FINAL PASS rc=0", "Info: [libukboot] HYPERV_PERSISTENCE FINAL PASS rc=0");
+    defer a.free(prefixed_protocol);
+    try t.expectError(error.InvalidEvidenceOrder, p.evidence.parse(prefixed_protocol, 1, f.input(), null));
+    const unrelated = try std.mem.concat(a, u8, &.{ "[    0.123455] Info: [libother] unrelated status\n", first });
+    defer a.free(unrelated);
+    _ = try p.evidence.parse(unrelated, 1, f.input(), null);
+}
+
 test "synthetic admitted model executes exactly deployment boot one and sole restart" {
     var work = try fixture();
     defer work.deinit();
