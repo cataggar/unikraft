@@ -1,0 +1,112 @@
+name: hyperv-qemu-candidate
+
+on:
+  push:
+    branches: [fleet/zig-hyperv-qemu-qualification]
+    paths:
+      - .github/workflows/hyperv-qemu-candidate.yaml
+      - .github/scripts/hyperv-qemu-candidate.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  attestations: read
+
+jobs:
+  fixed-vhd-capability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up verified native downloader
+        uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          cache: 'false'
+
+      - name: Acquire exact candidate and materialize only regular executables
+        run: |
+          set -euo pipefail
+          set -C
+          umask 077
+          export LC_ALL=C
+          root="${RUNNER_TEMP}/qemu-vpc-candidate"
+          mkdir -m 700 "${root}"
+          mkdir -m 700 "${root}/evidence" "${root}/downloads" "${root}/bin" \
+            "${root}/tmp" "${root}/cache" "${root}/ghr-tools" "${root}/ghr-bin"
+          export TMPDIR="${root}/tmp"
+          export GHR_CACHE_DIR="${root}/cache"
+          export XDG_CACHE_HOME="${root}/cache"
+          export GHR_TOOL_DIR="${root}/ghr-tools"
+          export GHR_BIN_DIR="${root}/ghr-bin"
+          metadata="${root}/evidence/release.json"
+          archive="${root}/downloads/qemu-v11.0.50-z.7-linux-x64.tar.gz"
+          expected=f8b9cc818959f95326010c95dad644177ebb0cbb0feef3db9528c4434855e397
+          ghr download --no-auth \
+            https://api.github.com/repos/cataggar/qemu/releases/tags/v11.0.50-z.7 \
+            -o "${metadata}" > "${root}/evidence/metadata-download.txt" 2>&1
+          jq -e --arg digest "sha256:${expected}" '
+            .tag_name == "v11.0.50-z.7" and
+            .target_commitish == "559ac9def5a65912ae602cc5682fc7c045fcbbcd" and
+            ([.assets[] | select(.id == 477103841)] |
+              length == 1 and
+              .[0].name == "qemu-v11.0.50-z.7-linux-x64.tar.gz" and
+              .[0].size == 137302371 and .[0].digest == $digest)
+          ' "${metadata}" > "${root}/evidence/metadata-valid.txt"
+          ghr download --no-auth --sha256 "${expected}" \
+            cataggar/qemu/qemu-v11.0.50-z.7-linux-x64.tar.gz@v11.0.50-z.7 \
+            -o "${archive}" > "${root}/evidence/archive-download.txt" 2>&1
+          test "$(stat -c %s "${archive}")" -eq 137302371
+          printf '%s  %s\n' "${expected}" "${archive}" | sha256sum -c - \
+            > "${root}/evidence/archive-valid.txt"
+          sha256sum "$(readlink -f "$(command -v ghr)")" "$(command -v tar)" \
+            "$(command -v gzip)" > "${root}/evidence/acquisition-tools.sha256"
+          tar --list --gzip --quoting-style=escape --file "${archive}" \
+            > "${root}/evidence/members.txt"
+          tar --list --verbose --gzip --quoting-style=escape --file "${archive}" \
+            > "${root}/evidence/member-types.txt"
+          awk '
+            $0 !~ /^[A-Za-z0-9_.+/-]+$/ || $0 ~ /^\// || $0 ~ /(^|\/)\.\.(\/|$)/ { exit 1 }
+            seen[$0]++ { exit 1 }
+          ' "${root}/evidence/members.txt"
+          for name in qemu-system-x86_64 qemu-img; do
+            mapfile -t members < <(grep -E "(^|/)${name}$" "${root}/evidence/members.txt")
+            test "${#members[@]}" -eq 1
+            member="${members[0]}"
+            awk -v member="${member}" '
+              $NF == member { count++; if (substr($1, 1, 1) != "-") exit 1 }
+              END { if (count != 1) exit 1 }
+            ' "${root}/evidence/member-types.txt"
+            tar --extract --gzip --to-stdout --no-wildcards --file "${archive}" \
+              -- "${member}" > "${root}/bin/${name}"
+            test -s "${root}/bin/${name}"
+            chmod 500 "${root}/bin/${name}"
+          done
+          sha256sum "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" \
+            > "${root}/evidence/candidate-executables.sha256"
+
+      - name: Open a whole read-only fixed VHD without booting a guest
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/qemu-vpc-candidate"
+          bash .github/scripts/hyperv-qemu-candidate.sh \
+            "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" "${root}/evidence/probe"
+
+      - name: Retain bounded candidate evidence, not images or executable archives
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-vpc-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/qemu-vpc-candidate/evidence/**/*.json
+            ${{ runner.temp }}/qemu-vpc-candidate/evidence/**/*.jsonl
+            ${{ runner.temp }}/qemu-vpc-candidate/evidence/**/*.txt
+            ${{ runner.temp }}/qemu-vpc-candidate/evidence/**/*.sha256
+          if-no-files-found: error
+          retention-days: 7
