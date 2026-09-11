@@ -6,6 +6,8 @@ on:
     paths:
       - .github/workflows/hyperv-qemu-candidate.yaml
       - .github/scripts/hyperv-qemu-candidate.sh
+      - .github/scripts/hyperv-qemu-candidate-runtime.sh
+      - .github/scripts/hyperv-qemu-candidate-guest.sh
   workflow_dispatch:
 
 permissions:
@@ -13,9 +15,9 @@ permissions:
   attestations: read
 
 jobs:
-  fixed-vhd-capability:
+  zig-hyperv:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
@@ -67,16 +69,29 @@ jobs:
             > "${root}/evidence/archive-valid.txt"
           sha256sum "$(readlink -f "$(command -v ghr)")" "$(command -v tar)" \
             "$(command -v gzip)" > "${root}/evidence/acquisition-tools.sha256"
-          tar --list --gzip --quoting-style=escape --file "${archive}" \
+          tar --list --gzip --ignore-zeros --quoting-style=escape --file "${archive}" \
             > "${root}/evidence/members.txt"
-          tar --list --verbose --gzip --quoting-style=escape --file "${archive}" \
+          tar --list --verbose --gzip --ignore-zeros --quoting-style=escape --file "${archive}" \
             > "${root}/evidence/member-types.txt"
+          gzip --decompress --stdout "${archive}" > "${root}/downloads/qemu-members.tar"
           awk '
-            $0 !~ /^[A-Za-z0-9_.+,/-]+$/ || $0 ~ /^\// || $0 ~ /(^|\/)\.\.(\/|$)/ {
+            $0 !~ /^qemu-v11\.0\.50-z\.7-linux-x64\/[A-Za-z0-9_.+,/-]*$/ ||
+              $0 ~ /(^|\/)\.\.?($|\/)/ || $0 ~ /\/\// {
               print "Rejected archive member: " $0 > "/dev/stderr"; exit 1
             }
-            seen[$0]++ { print "Duplicate archive member: " $0 > "/dev/stderr"; exit 1 }
+            {
+              name = $0
+              sub(/\/$/, "", name)
+              if (seen[name]++) {
+                print "Duplicate archive member: " $0 > "/dev/stderr"; exit 1
+              }
+            }
           ' "${root}/evidence/members.txt"
+          awk '
+            NF != 6 || $1 !~ /^[-d]/ || $3 !~ /^[0-9]+$/ {
+              print "Unexpected archive member type or listing: " $0 > "/dev/stderr"; exit 1
+            }
+          ' "${root}/evidence/member-types.txt"
           for name in qemu-system-x86_64 qemu-img; do
             mapfile -t members < <(grep -E "(^|/)${name}$" "${root}/evidence/members.txt")
             test "${#members[@]}" -eq 1
@@ -85,13 +100,30 @@ jobs:
               $NF == member { count++; if (substr($1, 1, 1) != "-") exit 1 }
               END { if (count != 1) exit 1 }
             ' "${root}/evidence/member-types.txt"
-            tar --extract --gzip --to-stdout --no-wildcards --file "${archive}" \
+            tar --extract --to-stdout --no-wildcards --occurrence=1 \
+              --file "${root}/downloads/qemu-members.tar" \
               -- "${member}" > "${root}/bin/${name}"
             test -s "${root}/bin/${name}"
             chmod 500 "${root}/bin/${name}"
           done
           sha256sum "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" \
             > "${root}/evidence/candidate-executables.sha256"
+          mkdir -m 700 "${root}/bin/share"
+          : > "${root}/evidence/qemu-data.sha256"
+          # The release uses an empty bindir/suffix: share/ is beside the executable.
+          awk '$1 ~ /^-/ && $NF ~ /^qemu-v11\.0\.50-z\.7-linux-x64\/share\// { print $NF }' \
+            "${root}/evidence/member-types.txt" > "${root}/evidence/qemu-data-members.txt"
+          while IFS= read -r member; do
+            relative="${member#qemu-v11.0.50-z.7-linux-x64/}"
+            output="${root}/bin/${relative}"
+            mkdir -p "$(dirname "${output}")"
+            tar --extract --to-stdout --no-wildcards --occurrence=1 \
+              --file "${root}/downloads/qemu-members.tar" \
+              -- "${member}" > "${output}"
+            chmod 400 "${output}"
+            sha256sum "${output}" >> "${root}/evidence/qemu-data.sha256"
+          done < "${root}/evidence/qemu-data-members.txt"
+          test -s "${root}/evidence/qemu-data.sha256"
 
       - name: Materialize the observed missing libfdt dependency without installation hooks
         run: |
@@ -127,9 +159,7 @@ jobs:
           fi
           apt-get update > "${root}/evidence/apt-update.txt" 2>&1
           apt-cache policy libfdt1 > "${root}/evidence/libfdt-policy.txt"
-          version="$(awk '$1 == "Candidate:" { print $2 }' "${root}/evidence/libfdt-policy.txt")"
-          test -n "${version}"
-          test "${version}" != "(none)"
+          version=1.7.0-2build1
           apt-cache show "libfdt1=${version}" > "${root}/evidence/libfdt-package.txt"
           (
             cd "${root}/downloads"
@@ -139,7 +169,7 @@ jobs:
           test "${#packages[@]}" -eq 1
           test -f "${packages[0]}"
           expected="$(awk '$1 == "SHA256:" { print $2 }' "${root}/evidence/libfdt-package.txt" | sort -u)"
-          [[ "${expected}" =~ ^[0-9a-f]{64}$ ]]
+          test "${expected}" = 274d20dfab9d6b216b5de85446a93f6ce5b2cd82c847b8dfdc508577f76eb96a
           printf '%s  %s\n' "${expected}" "${packages[0]}" | sha256sum -c - \
             > "${root}/evidence/libfdt-package-valid.txt"
           dpkg-deb --fsys-tarfile "${packages[0]}" > "${root}/downloads/libfdt.tar"
@@ -157,13 +187,76 @@ jobs:
             /usr/share/keyrings/ubuntu-archive-keyring.gpg /etc/apt/sources.list.d/ubuntu.sources \
             > "${root}/evidence/libfdt-inputs.sha256"
 
-      - name: Open a whole read-only fixed VHD without booting a guest
+      - name: Install the existing pinned native compiler
+        uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Acquire the existing native LLVM tool distribution
+        uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          dest: ${{ runner.temp }}/qemu-vpc-candidate/llvm
+          extract: 'true'
+          strip-components: '1'
+          cache: 'false'
+
+      - name: Acquire firmware data without installation hooks
+        run: |
+          set -euo pipefail
+          set -C
+          umask 077
+          root="${RUNNER_TEMP}/qemu-vpc-candidate"
+          export APT_CONFIG="${root}/evidence/apt.conf"
+          mkdir -m 700 "${root}/firmware"
+          apt-cache policy ovmf > "${root}/evidence/ovmf-policy.txt"
+          version="$(awk '$1 == "Candidate:" { print $2 }' "${root}/evidence/ovmf-policy.txt")"
+          test -n "${version}"
+          test "${version}" != "(none)"
+          apt-cache show "ovmf=${version}" > "${root}/evidence/ovmf-package.txt"
+          (
+            cd "${root}/downloads"
+            apt-get download "ovmf=${version}" > "${root}/evidence/ovmf-download.txt" 2>&1
+          )
+          packages=("${root}"/downloads/ovmf_*.deb)
+          test "${#packages[@]}" -eq 1
+          expected="$(awk '$1 == "SHA256:" { print $2 }' "${root}/evidence/ovmf-package.txt" | sort -u)"
+          [[ "${expected}" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "${expected}" "${packages[0]}" | sha256sum -c - \
+            > "${root}/evidence/ovmf-package-valid.txt"
+          dpkg-deb --fsys-tarfile "${packages[0]}" > "${root}/downloads/ovmf.tar"
+          tar --list --verbose --file "${root}/downloads/ovmf.tar" \
+            > "${root}/evidence/ovmf-members.txt"
+          for kind in CODE VARS; do
+            member="./usr/share/OVMF/OVMF_${kind}_4M.fd"
+            awk -v member="${member}" '
+              $NF == member { count++; if (substr($1, 1, 1) != "-") exit 1 }
+              END { if (count != 1) exit 1 }
+            ' "${root}/evidence/ovmf-members.txt"
+            name="$(printf '%s' "${kind}" | tr 'A-Z' 'a-z')"
+            tar --extract --to-stdout --no-wildcards --file "${root}/downloads/ovmf.tar" \
+              -- "${member}" > "${root}/firmware/${name}.fd"
+            chmod 600 "${root}/firmware/${name}.fd"
+          done
+          sha256sum "${root}/firmware/code.fd" "${root}/firmware/vars.fd" \
+            > "${root}/evidence/firmware.sha256"
+          echo "${root}/llvm/bin" >> "${GITHUB_PATH}"
+
+      - name: Build a fresh public EFI and the native controller
+        run: |
+          set -euo pipefail
+          bash .github/scripts/hyperv-qemu-candidate-guest.sh build "${RUNNER_TEMP}/qemu-vpc-candidate"
+
+      - name: Exercise the managed native runtime and real four-boot matrix
+        env:
+          QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
+          QUALIFICATION_SOURCE_JOB: zig-hyperv
         run: |
           set -euo pipefail
           root="${RUNNER_TEMP}/qemu-vpc-candidate"
-          bash .github/scripts/hyperv-qemu-candidate.sh \
-            "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" \
-            "${root}/evidence/probe" "${root}/runtime"
+          bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}"
 
       - name: Retain bounded candidate evidence, not images or executable archives
         if: always()
@@ -176,5 +269,14 @@ jobs:
             ${{ runner.temp }}/qemu-vpc-candidate/evidence/**/*.txt
             ${{ runner.temp }}/qemu-vpc-candidate/evidence/**/*.sha256
             ${{ runner.temp }}/qemu-vpc-candidate/evidence/apt.conf
+            ${{ runner.temp }}/qemu-vpc-candidate/evidence/*.acl
+            ${{ runner.temp }}/qemu-vpc-candidate/guest/evidence/**
+            ${{ runner.temp }}/qemu-vpc-candidate/guest/packaging/state.json
+            ${{ runner.temp }}/qemu-vpc-candidate/guest/packaging/packaging.json
+            ${{ runner.temp }}/qemu-vpc-candidate/guest/packaging/package-report.json
+            ${{ runner.temp }}/qemu-vpc-candidate/guest/packaging/local-*-serial.log
+            ${{ runner.temp }}/qemu-vpc-candidate/guest/packaging/boot-*/report.json
+            ${{ runner.temp }}/qemu-vpc-candidate/guest/packaging/boot-*/hyperv-efi-boot.log
+            ${{ runner.temp }}/qemu-vpc-candidate/guest/export/prepared-image-manifest.json
           if-no-files-found: error
           retention-days: 7
