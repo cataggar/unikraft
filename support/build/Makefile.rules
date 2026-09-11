@@ -47,8 +47,9 @@ endef
 
 # Return the first argument when the compiler supports it, otherwise the second.
 # cc-option $option,$fallback
+# Use stdin; not every compiler accepts a device file as C source.
 define cc-option =
-$(shell if $(CC) $(1) -Werror -x c -c /dev/null -o /dev/null >/dev/null 2>&1; then printf '%s' '$(1)'; else printf '%s' '$(2)'; fi)
+$(shell if printf '' | $(CC) $(1) -Werror -x c -c - -o /dev/null >/dev/null 2>&1; then printf '%s' '$(1)'; else printf '%s' '$(2)'; fi)
 endef
 
 # test whether CC version is greater than or equal to the minimum requirement

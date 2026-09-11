@@ -878,6 +878,17 @@ jobs:
               "-Doptimize=${mode}" --summary all
         done
 
+    - name: Run native Hyper-V linked-image proof and compiler-probe fixtures
+      run: |
+        set -euo pipefail
+        root="${RUNNER_TEMP}/hyperv-ci/native-image-proofs"
+        ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+          zig build -j2 test-hyperv-image-proofs build-hyperv-image-proofs \
+            test-native-compiler-options \
+            --cache-dir "${root}/zig-local-cache" \
+            --prefix "${root}/out" "-Doutput=${root}/build" \
+            --summary all
+
     - name: Run native Hyper-V core, transfer, and worker fixtures
       run: |
         set -euo pipefail

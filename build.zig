@@ -12,6 +12,7 @@ const native_target_object = @import("support/build/native-target-object.zig");
 const native_build_tools = @import("support/build/native-build-tools.zig");
 const native_make_environment = @import("support/build/native-make-environment.zig");
 const object_proofs = @import("support/build/hyperv-object-proofs.build.zig");
+const hyperv_proof_build = @import("support/build/hyperv-proof-build.zig");
 
 const supported_zig = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
 
@@ -496,6 +497,22 @@ pub fn build(b: *std.Build) void {
         "test",
         "Test facade, native configuration, native linking, QEMU graphs, and post-processing",
     );
+    const compiler_option_tests = b.step(
+        "test-native-compiler-options",
+        "Test Make compiler-option probes with the native Zig driver",
+    );
+    const compiler_option_run = b.addSystemCommand(&.{ options.command, "-j2", "--no-print-directory", "-f" });
+    compiler_option_run.addFileArg(b.path("support/build/tests/cc-option-test.mk"));
+    compiler_option_run.addArgs(&.{
+        b.fmt("UK_ROOT={s}", .{root}),
+        b.fmt("ZIG={s}", .{b.graph.zig_exe}),
+        "test",
+    });
+    compiler_option_run.addFileInput(b.path("support/build/Makefile.rules"));
+    compiler_option_run.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    compiler_option_run.has_side_effects = true;
+    compiler_option_tests.dependOn(&compiler_option_run.step);
+    test_step.dependOn(compiler_option_tests);
     test_step.dependOn(&run_facade_tests.step);
     test_step.dependOn(&run_runner_tests.step);
     test_step.dependOn(&run_native_config_tests.step);
@@ -1419,6 +1436,8 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_xpic_correctness_tests.step);
         hyperv_irq_tests.dependOn(&run_xpic_correctness_tests.step);
     }
+    const hyperv_image_proofs = hyperv_proof_build.tests(b, b.path("."));
+    test_step.dependOn(hyperv_image_proofs);
     const hyperv_controller_fixtures = b.addSystemCommand(&.{
         "python3",
         "-m",
@@ -1427,7 +1446,6 @@ pub fn build(b: *std.Build) void {
         "support.scripts.tests.test_hyperv_efi_boot",
         "support.scripts.tests.test_hyperv_network_controller",
         "support.scripts.tests.test_hyperv_network_peer",
-        "support.scripts.tests.test_hyperv_irq_register",
         "support.scripts.tests.test_hyperv_storage_manifest",
     });
     hyperv_controller_fixtures.setCwd(.{ .cwd_relative = root });
@@ -1458,6 +1476,8 @@ pub fn build(b: *std.Build) void {
         "Run focused Hyper-V protocol, driver, controller, and IRQ regressions",
     );
     hyperv_regression_tests.dependOn(vmbus_lifecycle_tests);
+    hyperv_regression_tests.dependOn(hyperv_image_proofs);
+    hyperv_regression_tests.dependOn(compiler_option_tests);
     hyperv_regression_tests.dependOn(storvsc_regression_tests);
     hyperv_regression_tests.dependOn(network_regression_tests);
     hyperv_regression_tests.dependOn(&run_schedcoop_smp_tests.step);
@@ -2089,11 +2109,9 @@ fn finishNativeImages(
                 break;
             }
         }
-        const check = b.addSystemCommand(&.{
-            "python3",
-            "support/build/tests/hyperv-smp-link-test.py",
-            "--image",
-        });
+        const proof_tool = hyperv_proof_build.tool(b, b.path("."));
+        const check = b.addRunArtifact(proof_tool);
+        check.addArgs(&.{ "smp", "--image" });
         check.addFileArg(link_output);
         check.addArgs(&.{
             "--max-cpus",
@@ -2107,12 +2125,8 @@ fn finishNativeImages(
                 "llvm-objdump",
         });
         check.setCwd(.{ .cwd_relative = b.build_root.path.? });
-        check.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
-        const irq_check = b.addSystemCommand(&.{
-            "python3",
-            "support/build/tests/hyperv-irq-register-test.py",
-            "--image",
-        });
+        const irq_check = b.addRunArtifact(proof_tool);
+        irq_check.addArgs(&.{ "irq", "--image" });
         irq_check.addFileArg(link_output);
         irq_check.addArgs(&.{
             "--nm",
@@ -2124,18 +2138,14 @@ fn finishNativeImages(
                 "llvm-objdump",
         });
         irq_check.setCwd(.{ .cwd_relative = b.build_root.path.? });
-        irq_check.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
         const gate = b.addSystemCommand(&.{"cp"});
         gate.step.dependOn(&check.step);
         gate.step.dependOn(&irq_check.step);
         if (nativeConfigEnabled(config, "CONFIG_LIBSTORVSC") or
             nativeConfigEnabled(config, "CONFIG_LIBNETVSC"))
         {
-            const driver_check = b.addSystemCommand(&.{
-                "python3",
-                "support/build/tests/hyperv-driver-registration-test.py",
-                "--image",
-            });
+            const driver_check = b.addRunArtifact(proof_tool);
+            driver_check.addArgs(&.{ "drivers", "--image" });
             driver_check.addFileArg(link_output);
             driver_check.addArgs(&.{
                 "--nm",
@@ -2151,10 +2161,6 @@ fn finishNativeImages(
             if (nativeConfigEnabled(config, "CONFIG_LIBNETVSC"))
                 driver_check.addArgs(&.{ "--require-driver", "netvsc" });
             driver_check.setCwd(.{ .cwd_relative = b.build_root.path.? });
-            driver_check.setEnvironmentVariable(
-                "PYTHONDONTWRITEBYTECODE",
-                "1",
-            );
             gate.step.dependOn(&driver_check.step);
         }
         gate.addFileArg(link_output);

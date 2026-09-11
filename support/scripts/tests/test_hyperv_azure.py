@@ -4280,6 +4280,10 @@ class HypervPersistenceControllerTest(unittest.TestCase):
                 guest_raw, guest_vhd, files["miz"], git_runtime,
                 private.GUARDED_BOOT_POLICY,
             )
+            self.assertLessEqual(
+                (generated / private.INPUT_MANIFEST).stat().st_size,
+                private.MAX_LOCAL_MANIFEST_BYTES,
+            )
             private.prepare(
                 generated, self.preflight_state, files["miz"], digest
             )

@@ -392,10 +392,12 @@ path; protocol processing and channel/driver callbacks run in the worker.
 `zig build test-hyperv-irq` runs the targeted hosted correctness tests, including
 8-, 196-, and 240-byte receive payloads. Native Hyper-V image publication also
 checks the final linked IRQ call graph for unsaved FP/SIMD use and strong VMBus
-hook resolution. For GNU Make images, run the same check explicitly:
+hook resolution using compiled Zig proof tools. For GNU Make images, build
+the native checker and run the same check explicitly:
 
 ```shell
-python3 support/build/tests/hyperv-irq-register-test.py --image /path/to/image.dbg
+zig build build-hyperv-image-proofs -j2
+./zig-out/bin/hyperv-image-proof irq --image /path/to/image.dbg
 ```
 
 The checker follows direct calls/tail branches, the native/controller SynIC
@@ -404,6 +406,15 @@ indirect edges. Only terminal assertion
 logging immediately leading to a fatal trap is excluded: it cannot return to
 the interrupted context. This compiler/register check is not live Hyper-V I/O
 or AP workload acceptance.
+
+`zig build test-hyperv-image-proofs -j2` runs the Python-free proof aggregate:
+native parser/register tests, real C/Zig objects and linked x86-64 ELF fixtures,
+and refusal mutations. It does not execute a guest or invoke Make. Set
+`-Dproof-nm=/path/to/llvm-nm` and `-Dproof-objdump=/path/to/llvm-objdump` when
+these native tools are not on `PATH`. The production image gates retain the
+configured NM/objdump commands, maximum CPU count, and StorVSC/NetVSC selection.
+See [native image proof coverage](support/build/hyperv-image-proofs.md) for the
+SMP/IRQ/driver CLI, assertion mapping, and evidence limits.
 
 ```shell
 zig build native-images \
