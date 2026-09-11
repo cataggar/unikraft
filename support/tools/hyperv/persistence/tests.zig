@@ -403,8 +403,10 @@ test "private metadata prepared state lock and source binding cannot rearm consu
 
 const Provision = struct {
     mode: f.Mode,
+    delay_ms: u16 = 0,
     fn call(context: *anyopaque, _: p.model.Job, directory: core.private_files.Directory) !void {
         const self: *Provision = @ptrCast(@alignCast(context));
+        if (self.delay_ms != 0) try std.Io.sleep(t.io, .fromMilliseconds(self.delay_ms), .awake);
         var lock = try directory.lock(t.io);
         defer lock.close(t.io);
         const saved = try lock.createImmutable(t.io, "fixture-mode", @tagName(self.mode));
@@ -618,25 +620,60 @@ test "partial native page checkpoint survives killed delivery without claiming f
     }
 }
 
-fn cancelAfter(flag: *std.atomic.Value(bool)) void {
-    const delay: std.os.linux.timespec = .{ .sec = 0, .nsec = 500 * std.time.ns_per_ms };
-    _ = std.os.linux.nanosleep(&delay, null);
-    flag.store(true, .release);
-}
+const CancelWhenReady = struct {
+    directory: std.Io.Dir,
+    flag: *std.atomic.Value(bool),
+    deadline: core.process.Deadline,
+    failure: ?anyerror = null,
+
+    fn run(self: *CancelWhenReady) void {
+        self.waitReady() catch |err| {
+            self.failure = err;
+        };
+        self.flag.store(true, .release);
+    }
+
+    fn waitReady(self: *CancelWhenReady) !void {
+        while (!try self.deadline.expired()) {
+            const ready = self.directory.openFile(t.io, "worker-08-0/cancel-ready", .{
+                .follow_symlinks = false,
+            }) catch |err| switch (err) {
+                error.FileNotFound => {
+                    try std.Io.sleep(t.io, .fromMilliseconds(10), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+            defer ready.close(t.io);
+            var bytes: [6]u8 = undefined;
+            const count = try ready.readPositionalAll(t.io, &bytes, 0);
+            if (!std.mem.eql(u8, bytes[0..count], "ready\n")) return error.InvalidWorkerReadiness;
+            return;
+        }
+        return error.WorkerReadinessTimeout;
+    }
+};
 test "direct native cancellation interrupts blocked leaf and proves child termination" {
     var work = try fixture();
     defer work.deinit();
     const binary = try executable(options.worker);
     defer a.free(binary.path);
     var cancelled = std.atomic.Value(bool).init(false);
-    var provision: Provision = .{ .mode = .block_upload };
+    // Startup deliberately outlasts the former fixed 500-ms cancellation delay.
+    var provision: Provision = .{ .mode = .block_upload, .delay_ms = 750 };
     var supervisor: p.worker.Supervisor = .{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .cancellation = &cancelled, .provision = .{ .context = &provision, .call = Provision.call } };
     defer supervisor.deinit();
-    const thread = try std.Thread.spawn(.{}, cancelAfter, .{&cancelled});
-    defer thread.join();
+    const deadline = try core.process.Deadline.afterMilliseconds(5000);
+    var cancellation: CancelWhenReady = .{ .directory = work.directory.dir, .flag = &cancelled, .deadline = deadline };
     const driver = supervisor.driver();
-    var reply = try driver.executeFn(driver.context, try f.makeJob(a, .data_upload, (try core.process.Deadline.afterMilliseconds(5000)).expires_ns));
+    const job = try f.makeJob(a, .data_upload, deadline.expires_ns);
+    var reply = blk: {
+        const thread = try std.Thread.spawn(.{}, CancelWhenReady.run, .{&cancellation});
+        defer thread.join();
+        break :blk try driver.executeFn(driver.context, job);
+    };
     defer reply.deinit();
+    if (cancellation.failure) |err| return err;
     try t.expect(reply.value.process_cleanup_complete and !reply.value.complete);
     try t.expectEqual(.cancelled, reply.value.failures.primary.?.category);
     const started = try work.directory.dir.openFile(t.io, "worker-08-0/started.json", .{});

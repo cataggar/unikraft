@@ -58,10 +58,15 @@ const Context = struct {
                 return error.RecordingFailed;
             std.process.exit(9);
         }
-        if (job.step == .data_upload and mode == .block_upload) while (true) {
-            const delay = std.os.linux.timespec{ .sec = 10, .nsec = 0 };
-            _ = std.os.linux.nanosleep(&delay, null);
-        };
+        if (job.step == .data_upload and mode == .block_upload) {
+            const ready = try lock.createImmutable(self.io, "cancel-ready", "ready\n");
+            if (ready.status != .durable or ready.failures.recording != null or ready.failures.cleanup != null)
+                return error.RecordingFailed;
+            while (true) {
+                const delay = std.os.linux.timespec{ .sec = 10, .nsec = 0 };
+                _ = std.os.linux.nanosleep(&delay, null);
+            }
+        }
         if (job.step == .data_upload and mode == .secret_failure) {
             std.debug.print("SYNTHETIC_SECRET?sig=fixture-only\n", .{});
             std.process.exit(7);
