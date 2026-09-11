@@ -189,7 +189,7 @@ if [[ "$1" == build ]]; then
     log="$evidence/logs/cli-system-check.log"
     grep -Fq "$package_hash" "$log" || die 'CLI failure is not the pinned missing package'
     if ! { grep -Fq "unable to open system package directory '" "$log" && grep -Fq FileNotFound "$log"; } &&
-       ! { grep -Fq "package not found at '" "$log" && grep -Fq 'remote package fetching disabled due to --system mode' "$log"; }; then
+       ! grep -Fq "error: package not found at '$packages/$package_hash'" "$log"; then
       die 'CLI failure is not a missing-system-package error'
     fi
     mkdir -m 700 "$guest/public-image/restore" "$guest/public-image/restore-cache"
