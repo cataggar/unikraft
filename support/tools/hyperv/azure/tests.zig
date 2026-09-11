@@ -53,6 +53,232 @@ const account_ref: s.Ref = .{ .kind = .storage, .name = "syntheticaccount" };
 const group_ref: s.Ref = .{ .kind = .group, .name = "synthetic-group" };
 const disk_identity: ops.DiskIdentity = .{ .disk = disk_ref, .original_uuid = disk_uuid.*, .geometry = .{ .sectors = 8388608, .sector_size = 512 } };
 
+test "persistence fixed network uses pinned create readback and rejects altered envelope" {
+    inline for (std.meta.tags(@FieldType(ops.PersistenceNetwork, "kind"))) |kind| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const definition: ops.PersistenceNetwork = .{ .prefix = "synthetic", .kind = kind };
+        const plan = try ops.Plan.create(alloc, authority, .{ .persistence_network = definition });
+        try t.expectEqualStrings("2024-05-01", plan.version);
+        const properties = switch (kind) {
+            .nsg => "\"securityRules\":[]",
+            .vnet => "\"addressSpace\":{\"addressPrefixes\":[\"10.79.0.0/29\"]},\"subnets\":[{\"name\":\"default\",\"id\":\"" ++ group_path ++ "/providers/Microsoft.Network/virtualNetworks/synthetic-vnet/subnets/default\",\"properties\":{\"addressPrefix\":\"10.79.0.0/29\",\"defaultOutboundAccess\":false,\"networkSecurityGroup\":{\"id\":\"" ++ group_path ++ "/providers/Microsoft.Network/networkSecurityGroups/synthetic-nsg\"}}}]",
+            .nic => "\"enableIPForwarding\":false,\"enableAcceleratedNetworking\":false,\"ipConfigurations\":[{\"name\":\"primary\",\"properties\":{\"privateIPAllocationMethod\":\"Dynamic\",\"privateIPAddress\":\"10.79.0.4\",\"subnet\":{\"id\":\"" ++ group_path ++ "/providers/Microsoft.Network/virtualNetworks/synthetic-vnet/subnets/default\"}}}]",
+        };
+        const body = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"name\":\"synthetic-{s}\",\"location\":\"northeurope\",\"tags\":{{\"uk-hyperv-run\":\"{s}\"}},\"properties\":{{\"provisioningState\":\"Succeeded\",{s}}}}}", .{ plan.path, @tagName(kind), run, properties });
+        try models.requirePersistenceNetwork(alloc, authority, definition, try json.parse(alloc, body));
+        const failed = try std.mem.replaceOwned(u8, alloc, body, "\"provisioningState\":\"Succeeded\"", "\"provisioningState\":\"Failed\"");
+        try t.expectError(error.InvalidNetwork, models.requirePersistenceNetwork(alloc, authority, definition, try json.parse(alloc, failed)));
+        try models.requireOwnedPersistenceNetwork(alloc, authority, definition, try json.parse(alloc, failed));
+        const unowned = try std.mem.replaceOwned(u8, alloc, failed, run, vm_uuid);
+        try t.expectError(error.ScopeMismatch, models.requireOwnedPersistenceNetwork(alloc, authority, definition, try json.parse(alloc, unowned)));
+        const bad = try std.mem.replaceOwned(u8, alloc, body, switch (kind) {
+            .nsg => "\"securityRules\":[]",
+            .vnet => "\"defaultOutboundAccess\":false",
+            .nic => "\"enableIPForwarding\":false",
+        }, switch (kind) {
+            .nsg => "\"securityRules\":[{}]",
+            .vnet => "\"defaultOutboundAccess\":true",
+            .nic => "\"enableIPForwarding\":true",
+        });
+        if (models.requirePersistenceNetwork(alloc, authority, definition, try json.parse(alloc, bad))) |_|
+            return error.AcceptedAlteredPersistenceNetwork
+        else |_| {}
+        if (models.requireOwnedPersistenceNetwork(alloc, authority, definition, try json.parse(alloc, bad))) |_|
+            return error.AcceptedUnownedCleanupNetwork
+        else |_| {}
+        var h = try Harness.init(&.{
+            .{ .url = group_url, .response = group_json },
+            .{ .url = plan.url, .status = 404, .response = "{\"error\":{\"code\":\"ResourceNotFound\"}}" },
+            .{ .url = plan.url, .method = .PUT, .status = 201, .response = body, .body_contains = plan.body },
+            .{ .url = plan.url, .response = body },
+        });
+        defer h.deinit();
+        var arm = h.arm();
+        var result = try requireOk(arm.execute(.{ .persistence_network = definition }));
+        defer result.deinit();
+        try t.expectEqual(.accepted, result.effect);
+        try t.expectEqual(.succeeded, result.model.network.state.?);
+    }
+}
+
+test "persistence NIC readiness and cleanup reject foreign association arrays and malformed shapes" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const definition: ops.PersistenceNetwork = .{ .prefix = "synthetic", .kind = .nic };
+    const plan = try ops.Plan.create(alloc, authority, .{ .persistence_network = definition });
+    var value = try json.parse(alloc, plan.body.?);
+    try value.object.put(alloc, "id", .{ .string = plan.path });
+    try value.object.put(alloc, "name", .{ .string = "synthetic-nic" });
+    const properties = value.object.getPtr("properties").?;
+    try properties.object.put(alloc, "provisioningState", .{ .string = "Succeeded" });
+    const config = properties.object.getPtr("ipConfigurations").?.array.items[0].object.getPtr("properties").?;
+    try config.object.put(alloc, "privateIPAddress", .{ .string = "10.79.0.4" });
+    try models.requirePersistenceNetwork(alloc, authority, definition, value);
+    try models.requireOwnedPersistenceNetwork(alloc, authority, definition, value);
+    const foreign = "/subscriptions/" ++ sub ++ "/resourceGroups/foreign-group/providers/Microsoft.Network/";
+    for ([_]struct { field: []const u8, target: []const u8 }{
+        .{ .field = "loadBalancerBackendAddressPools", .target = foreign ++ "loadBalancers/foreign-lb/backendAddressPools/pool" },
+        .{ .field = "loadBalancerInboundNatRules", .target = foreign ++ "loadBalancers/foreign-lb/inboundNatRules/rule" },
+        .{ .field = "applicationGatewayBackendAddressPools", .target = foreign ++ "applicationGateways/foreign-gateway/backendAddressPools/pool" },
+    }) |association| {
+        const nonempty = try std.fmt.allocPrint(alloc, "[{{\"id\":\"{s}\"}}]", .{association.target});
+        for ([_][]const u8{ "[]", nonempty, "[{}]", "[null]", "[\"unknown\"]", "null", "{}", "{\"id\":\"unknown\"}", "\"unknown\"", "false", "0" }) |raw| {
+            try config.object.put(alloc, association.field, try json.parse(alloc, raw));
+            for ([_][]const u8{ "Succeeded", "Failed" }) |state| {
+                try properties.object.put(alloc, "provisioningState", .{ .string = state });
+                const ready = std.mem.eql(u8, state, "Succeeded");
+                if (std.mem.eql(u8, raw, "[]")) {
+                    if (ready)
+                        try models.requirePersistenceNetwork(alloc, authority, definition, value)
+                    else
+                        try t.expectError(error.InvalidNetwork, models.requirePersistenceNetwork(alloc, authority, definition, value));
+                    try models.requireOwnedPersistenceNetwork(alloc, authority, definition, value);
+                } else {
+                    const failure = if (raw[0] == '[') error.InvalidNetwork else error.ExpectedArray;
+                    try t.expectError(if (ready) failure else error.InvalidNetwork, models.requirePersistenceNetwork(alloc, authority, definition, value));
+                    try t.expectError(failure, models.requireOwnedPersistenceNetwork(alloc, authority, definition, value));
+                }
+                // The generic network model intentionally does not enforce the
+                // stricter persistence-only association envelope.
+                _ = try models.parse(alloc, authority, .{ .get = try definition.ref(alloc) }, value);
+            }
+        }
+        try t.expect(config.object.swapRemove(association.field));
+    }
+    try properties.object.put(alloc, "provisioningState", .{ .string = "Succeeded" });
+    try models.requirePersistenceNetwork(alloc, authority, definition, value);
+    try models.requireOwnedPersistenceNetwork(alloc, authority, definition, value);
+}
+
+test "disk Upload wire omits resize field for direct and deployment OS and data disks" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for ([_]ops.Disk{
+        .{ .name = disk_ref.name, .size_gib = 1, .upload_bytes = 66 * 1024 * 1024 + 512, .linux_gen2 = true },
+        .{ .name = disk_ref.name, .size_gib = 4, .upload_bytes = 4294967808 },
+        .{ .name = disk_ref.name, .size_gib = 1 },
+        .{ .name = disk_ref.name, .size_gib = 4 },
+    }) |disk| {
+        for ([_]bool{ false, true }) |deployment| {
+            const resources = [_]ops.Resource{.{ .disk = disk }};
+            const plan = try ops.Plan.create(alloc, authority, if (deployment)
+                .{ .deploy = .{ .name = "synthetic-deployment", .resources = &resources } }
+            else
+                .{ .disk_create = disk });
+            var resource = try json.parse(alloc, plan.body.?);
+            if (deployment) {
+                const template = try models.field(try models.field(resource, "properties"), "template");
+                const items = try models.array(try models.field(template, "resources"));
+                try t.expectEqual(@as(usize, 1), items.len);
+                resource = items[0];
+                try t.expectEqualStrings("Microsoft.Compute/disks", try models.string(resource, "type"));
+                try t.expectEqualStrings("2025-01-02", try models.string(resource, "apiVersion"));
+            } else try t.expectEqualStrings("2025-01-02", plan.version);
+            const properties = try models.field(resource, "properties");
+            const creation = try models.field(properties, "creationData");
+            try t.expectEqual(@as(u16, 512), try foundation.contracts.integer(u16, try models.field(properties, "logicalSectorSize")));
+            if (disk.upload_bytes) |bytes| {
+                try t.expect(!properties.object.contains("diskSizeGB"));
+                try t.expectEqualStrings("Upload", try models.string(creation, "createOption"));
+                try t.expectEqual(bytes, try foundation.contracts.integer(u64, try models.field(creation, "uploadSizeBytes")));
+            } else {
+                try t.expectEqual(disk.size_gib, try foundation.contracts.integer(u32, try models.field(properties, "diskSizeGB")));
+                try t.expectEqualStrings("Empty", try models.string(creation, "createOption"));
+                try t.expect(!creation.object.contains("uploadSizeBytes"));
+            }
+            if (disk.linux_gen2) {
+                try t.expectEqualStrings("Linux", try models.string(properties, "osType"));
+                try t.expectEqualStrings("V2", try models.string(properties, "hyperVGeneration"));
+            } else try t.expect(!properties.object.contains("osType") and !properties.object.contains("hyperVGeneration"));
+        }
+    }
+}
+
+test "persistence guest VHD upload geometry is MiB aligned with locally checked GiB ceiling" {
+    const bytes = 66 * 1024 * 1024 + 512;
+    try ops.uploadGeometry(1, bytes);
+    try ops.uploadGeometry(4, 4294967808);
+    for ([_]u64{ 0, 512, 1024, bytes - 1, bytes + 512, 1024 * 1024 * 1024 + 1024 * 1024 + 512 }) |wrong|
+        try t.expectError(error.InvalidGeometry, ops.uploadGeometry(1, wrong));
+    try t.expectError(error.InvalidGeometry, ops.uploadGeometry(4, bytes));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const plan = try ops.Plan.create(alloc, authority, .{ .disk_create = .{ .name = disk_ref.name, .size_gib = 1, .upload_bytes = bytes, .linux_gen2 = true } });
+    const properties = try models.field(try json.parse(alloc, plan.body.?), "properties");
+    try t.expect(!properties.object.contains("diskSizeGB"));
+    try t.expectEqual(@as(u64, bytes), try foundation.contracts.integer(u64, try models.field(try models.field(properties, "creationData"), "uploadSizeBytes")));
+    try t.expectEqualStrings("Linux", try models.string(properties, "osType"));
+    try t.expectEqualStrings("V2", try models.string(properties, "hyperVGeneration"));
+    const smaller = try std.mem.replaceOwned(u8, alloc, upload_disk_json, "\"diskSizeGB\":4", "\"diskSizeGB\":1");
+    const no_role = try std.mem.replaceOwned(u8, alloc, smaller, "4294967808", "69206528");
+    const body = try std.mem.replaceOwned(u8, alloc, no_role, "\"diskSizeGB\":1", "\"diskSizeGB\":1,\"diskSizeBytes\":69206016,\"osType\":\"Linux\",\"hyperVGeneration\":\"V2\"");
+    for ([_][]const u8{ "1073741824", "69206528", "69206015", "0" }) |wrong_bytes| {
+        const wrong = try std.mem.replaceOwned(u8, alloc, body, "\"diskSizeBytes\":69206016", try std.fmt.allocPrint(alloc, "\"diskSizeBytes\":{s}", .{wrong_bytes}));
+        try t.expectError(error.InvalidGeometry, models.parse(alloc, authority, plan.operation, try json.parse(alloc, wrong)));
+    }
+    const wrong_ceiling = try std.mem.replaceOwned(u8, alloc, body, "\"diskSizeGB\":1", "\"diskSizeGB\":2");
+    try t.expectError(error.InvalidGeometry, models.parse(alloc, authority, plan.operation, try json.parse(alloc, wrong_ceiling)));
+    for ([_][]const u8{ body, no_role }) |response| {
+        var h = try Harness.init(&.{
+            .{ .url = group_url, .response = group_json },
+            .{ .url = disk_url, .status = 404, .response = "{\"error\":{\"code\":\"ResourceNotFound\"}}" },
+            .{ .url = disk_url, .method = .PUT, .status = 201, .response = response, .body_contains = "\"uploadSizeBytes\":69206528" },
+            .{ .url = disk_url, .response = response },
+        });
+        defer h.deinit();
+        var arm = h.arm();
+        const result = arm.execute(plan.operation);
+        if (std.mem.eql(u8, response, body)) {
+            var accepted = try requireOk(result);
+            defer accepted.deinit();
+            try t.expectEqual(@as(u64, bytes), accepted.model.disk.upload_bytes.?);
+            try t.expectEqual(@as(u64, bytes - 512), accepted.model.disk.bytes);
+            try t.expect(accepted.model.disk.linux_gen2);
+        } else try requireFailure(result, .integrity, .accepted, 200);
+    }
+}
+
+test "persistence VM selects full original attachment envelope without changing default VM" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var data = disk_identity;
+    data.disk.name = "synthetic-data";
+    data.original_uuid = operation_uuid.*;
+    for ([_]bool{ false, true }) |persistence| {
+        const plan = try ops.Plan.create(alloc, authority, .{ .deploy = .{ .name = "synthetic-deployment", .resources = &.{.{ .vm = .{
+            .name = vm_ref.name,
+            .size = "Standard_D2s_v5",
+            .nic = .{ .kind = .nic, .name = "synthetic-nic" },
+            .os_disk = disk_identity,
+            .data_disk = data,
+            .persistence_envelope = persistence,
+        } }} } });
+        const template = try models.field(try models.field(try json.parse(alloc, plan.body.?), "properties"), "template");
+        const resources = try models.array(try models.field(template, "resources"));
+        const properties = try models.field(resources[0], "properties");
+        const storage = try models.field(properties, "storageProfile");
+        const os = try models.field(storage, "osDisk");
+        const disk = (try models.array(try models.field(storage, "dataDisks")))[0];
+        try t.expectEqualStrings(if (persistence) "ReadOnly" else "None", try models.string(os, "caching"));
+        try t.expectEqual(@as(u8, 7), try foundation.contracts.integer(u8, try models.field(disk, "lun")));
+        if (persistence) {
+            try t.expectEqualStrings("Detach", try models.string(os, "deleteOption"));
+            try t.expectEqualStrings("Detach", try models.string(disk, "deleteOption"));
+            try t.expect(!try models.boolean(try models.field(disk, "writeAcceleratorEnabled")));
+            const nic = (try models.array(try models.field(try models.field(properties, "networkProfile"), "networkInterfaces")))[0];
+            try t.expectEqualStrings("Delete", try models.string(try models.field(nic, "properties"), "deleteOption"));
+        } else {
+            try t.expect(os.object.get("deleteOption") == null and disk.object.get("writeAcceleratorEnabled") == null);
+        }
+    }
+}
+
 const Progress = struct {
     fragment: usize = 1,
     zero_first: bool = false,
@@ -1222,7 +1448,7 @@ test "typed request constructors encode exact raw strings arrays and numeric fie
     try t.expectEqualStrings(vm_path, try models.string(schedule_properties, "targetResourceId"));
     const disk = try ops.Plan.create(alloc, authority, .{ .disk_create = .{ .name = disk_ref.name, .size_gib = 4, .upload_bytes = 4294967808 } });
     const disk_properties = try models.field(try json.parse(alloc, disk.body.?), "properties");
-    try t.expectEqual(@as(u32, 4), try foundation.contracts.integer(u32, try models.field(disk_properties, "diskSizeGB")));
+    try t.expect(!disk_properties.object.contains("diskSizeGB"));
     try t.expectEqual(@as(u64, 4294967808), try foundation.contracts.integer(u64, try models.field(try models.field(disk_properties, "creationData"), "uploadSizeBytes")));
     const deployment = try ops.Plan.create(alloc, authority, .{ .deploy = .{
         .name = "synthetic-deployment",

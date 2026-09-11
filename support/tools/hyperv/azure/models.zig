@@ -20,9 +20,10 @@ pub const Disk = struct {
     state: State,
     access: DiskAccess,
     upload_bytes: ?u64,
+    linux_gen2: bool = false,
 };
 pub const Storage = struct { id: s.Ref, public_network: bool, ip: ?[4]u8, subnet_rules: usize, subnets: []const s.Ref, state: State };
-pub const Network = struct { id: s.Ref, entries: usize };
+pub const Network = struct { id: s.Ref, entries: usize, state: ?State = null };
 pub const Image = struct { id: s.Ref, generation2: bool, specialized_linux: bool, state: State };
 pub const ImageVersion = struct { id: s.Ref, state: State, in_location: bool, published: []const u8 };
 pub const Keys = struct {
@@ -103,6 +104,10 @@ pub fn parse(a: std.mem.Allocator, authority: s.Authority, operation: ops.Operat
         .group_create => resource(a, authority, .group, .{ .kind = .group, .name = authority.group }, value),
         .deploy => |deployment| resource(a, authority, .deployment, .{ .kind = .deployment, .name = deployment.name }, value),
         .disk_create => |disk| resource(a, authority, .disk, .{ .kind = .disk, .name = disk.name }, value),
+        .persistence_network => |definition| network: {
+            const ref = try definition.ref(a);
+            break :network resource(a, authority, ref.kind, ref, value);
+        },
         .grant => grant(value),
         .list_keys, .regenerate_key => keys(value),
         .boot_diagnostics => boot(value),
@@ -298,16 +303,30 @@ fn parseDisk(id: s.Ref, root: std.json.Value, properties: std.json.Value) !Model
         try c.integer(u64, try field(creation, "uploadSizeBytes"))
     else
         null;
-    if (upload_bytes) |bytes| if (bytes != @as(u64, size) * 1024 * 1024 * 1024 + 512) return error.InvalidGeometry;
+    if (upload_bytes) |bytes| try ops.uploadGeometry(size, bytes);
+    var logical_bytes = if (upload_bytes) |bytes| bytes - 512 else @as(u64, size) * 1024 * 1024 * 1024;
+    if (properties.object.get("diskSizeBytes")) |raw| {
+        const actual = try c.integer(u64, raw);
+        if (actual > 32 * @as(u64, 1024 * 1024 * 1024) or (upload_bytes != null and actual != logical_bytes))
+            return error.InvalidGeometry;
+        try ops.uploadGeometry(size, actual + 512);
+        logical_bytes = actual;
+    }
     return .{ .disk = .{
         .id = id,
         .uuid = try s.uuid(try string(properties, "uniqueId")),
-        .bytes = @as(u64, size) * 1024 * 1024 * 1024,
+        .bytes = logical_bytes,
+        .linux_gen2 = linuxGen2(properties),
         .sector_size = 512,
         .state = try state(try field(properties, "provisioningState")),
         .access = access,
         .upload_bytes = upload_bytes,
     } };
+}
+fn linuxGen2(properties: std.json.Value) bool {
+    const os = properties.object.get("osType") orelse return false;
+    const generation = properties.object.get("hyperVGeneration") orelse return false;
+    return os == .string and generation == .string and std.mem.eql(u8, os.string, "Linux") and std.mem.eql(u8, generation.string, "V2");
 }
 fn storage(a: std.mem.Allocator, authority: s.Authority, id: s.Ref, root: std.json.Value, properties: std.json.Value) !Model {
     if (!try boolean(try field(properties, "supportsHttpsTrafficOnly")) or try boolean(try field(properties, "allowBlobPublicAccess")) or
@@ -397,7 +416,55 @@ fn network(a: std.mem.Allocator, authority: s.Authority, id: s.Ref, properties: 
         },
         else => return error.InvalidNetwork,
     }
-    return .{ .network = .{ .id = id, .entries = entries } };
+    return .{ .network = .{ .id = id, .entries = entries, .state = if (properties.object.get("provisioningState")) |value| try state(value) else null } };
+}
+
+pub fn requirePersistenceNetwork(a: std.mem.Allocator, authority: s.Authority, definition: ops.PersistenceNetwork, value: std.json.Value) !void {
+    try persistenceNetwork(a, authority, definition, value, true);
+}
+/// Cleanup ownership is independent of provisioning success; a failed but
+/// scope-bound, correctly tagged/configured resource must remain deletable.
+pub fn requireOwnedPersistenceNetwork(a: std.mem.Allocator, authority: s.Authority, definition: ops.PersistenceNetwork, value: std.json.Value) !void {
+    try persistenceNetwork(a, authority, definition, value, false);
+}
+fn persistenceNetwork(a: std.mem.Allocator, authority: s.Authority, definition: ops.PersistenceNetwork, value: std.json.Value, ready: bool) !void {
+    const ref = try definition.ref(a);
+    _ = try resource(a, authority, ref.kind, ref, value);
+    if (!std.mem.eql(u8, try string(try field(value, "tags"), "uk-hyperv-run"), &authority.owner_run))
+        return error.ScopeMismatch;
+    const p = try field(value, "properties");
+    const provisioning = try state(try field(p, "provisioningState"));
+    if (ready and provisioning != .succeeded) return error.InvalidNetwork;
+    switch (definition.kind) {
+        .nsg => if ((try array(try field(p, "securityRules"))).len != 0) return error.InvalidNetwork,
+        .vnet => {
+            const prefixes = try array(try field(try field(p, "addressSpace"), "addressPrefixes"));
+            const subnets = try array(try field(p, "subnets"));
+            if (prefixes.len != 1 or subnets.len != 1 or !std.mem.eql(u8, try c.string(prefixes[0]), "10.79.0.0/29") or
+                !std.mem.eql(u8, try string(subnets[0], "name"), "default")) return error.InvalidNetwork;
+            const subnet = try field(subnets[0], "properties");
+            if (!std.mem.eql(u8, try string(subnet, "addressPrefix"), "10.79.0.0/29") or
+                try boolean(try field(subnet, "defaultOutboundAccess"))) return error.InvalidNetwork;
+            const nsg: s.Ref = .{ .kind = .nsg, .name = try std.fmt.allocPrint(a, "{s}-nsg", .{definition.prefix}) };
+            try nsg.requireId(a, authority, try string(try field(subnet, "networkSecurityGroup"), "id"));
+            if (subnet.object.get("natGateway")) |nat| if (nat != .null) return error.InvalidNetwork;
+            if (subnet.object.get("routeTable")) |route| if (route != .null) return error.InvalidNetwork;
+            if (subnet.object.get("serviceEndpoints")) |endpoints| if ((try array(endpoints)).len != 0) return error.InvalidNetwork;
+        },
+        .nic => {
+            if (try boolean(try field(p, "enableAcceleratedNetworking"))) return error.InvalidNetwork;
+            const configurations = try array(try field(p, "ipConfigurations"));
+            const configuration = try field(configurations[0], "properties");
+            if (!std.mem.eql(u8, try string(configurations[0], "name"), "primary") or
+                !std.mem.eql(u8, try string(configuration, "privateIPAllocationMethod"), "Dynamic")) return error.InvalidNetwork;
+            inline for (.{ "loadBalancerBackendAddressPools", "loadBalancerInboundNatRules", "applicationGatewayBackendAddressPools" }) |relationship| {
+                if (configuration.object.get(relationship)) |associations|
+                    if ((try array(associations)).len != 0) return error.InvalidNetwork;
+            }
+            const subnet: s.Ref = .{ .kind = .subnet, .name = "default", .parent = try std.fmt.allocPrint(a, "{s}-vnet", .{definition.prefix}) };
+            try subnet.requireId(a, authority, try string(try field(configuration, "subnet"), "id"));
+        },
+    }
 }
 fn parseSchedule(a: std.mem.Allocator, authority: s.Authority, id: s.Ref, properties: std.json.Value) !Model {
     if (!std.mem.eql(u8, try string(properties, "taskType"), "ComputeVmShutdownTask")) return error.InvalidSchedule;

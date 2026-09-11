@@ -122,6 +122,15 @@ Import build module `hyperv` for the facade, `hyperv_transfer` for transfers,
 or dependency-free `hyperv_core` (`core.zig`) for these foundation interfaces.
 The facade's `root.zig` needs those two named module imports wired by the build.
 
+The separate [persistence engine](persistence/README.md) exports
+`hyperv_persistence` for the exact two-boot state machine, serial evidence,
+typed workers and independent cleanup. Its standalone `test test-arm` selectors
+run both the engine and affected shared ARM fixtures in CI. The installed
+`uk-hyperv-persistence-engine` supports local inspection only; execution remains
+closed until the real preparation/completed-preflight loaders, independent
+authority and outer crash-recovery supervision are integrated. These APIs do
+not add persistence commands to the public `uk-hyperv` facade.
+
 ### `contracts`
 
 - `Document.parse(allocator, bytes, Limits)` owns its parsed data until `deinit`.

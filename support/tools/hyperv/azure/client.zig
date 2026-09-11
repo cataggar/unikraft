@@ -70,6 +70,9 @@ pub const Client = struct {
             .disk_create => |disk| {
                 if (self.requireAbsent(.{ .kind = .disk, .name = disk.name })) |failure| return .{ .failed = failure };
             },
+            .persistence_network => {
+                if (self.requireAbsent(plan.target.?)) |failure| return .{ .failed = failure };
+            },
             .deploy => |deployment| {
                 if (self.requireAbsent(.{ .kind = .deployment, .name = deployment.name })) |failure| return .{ .failed = failure };
                 for (deployment.resources) |resource| {
@@ -364,6 +367,7 @@ pub const Client = struct {
                 .storage => |storage| storage.state == .succeeded,
                 .schedule => true,
                 .vm => |vm| vm.state == .succeeded,
+                .network => |network| network.state == .succeeded,
                 else => false,
             };
             const observed_state: ?models.State = switch (current.model) {
@@ -371,10 +375,16 @@ pub const Client = struct {
                 .vm => |vm| vm.state,
                 .disk => |disk| disk.state,
                 .storage => |storage| storage.state,
+                .network => |network| network.state,
                 else => null,
             };
             if (observed_state == .failed or observed_state == .canceled) return fail(error.RemoteFailed, .accepted, current.reply.status);
             if (ready) {
+                if (plan.operation == .persistence_network) {
+                    const value = json.parse(a, current.reply.body) catch |err| return fail(err, .accepted, current.reply.status);
+                    models.requirePersistenceNetwork(a, self.authority, plan.operation.persistence_network, value) catch |err|
+                        return fail(err, .accepted, current.reply.status);
+                }
                 if (plan.operation == .revoke) {
                     models.requireOriginalDisk(current.model, plan.operation.revoke) catch |err| return fail(err, .accepted, current.reply.status);
                     switch (current.model.disk.access) {
@@ -387,7 +397,8 @@ pub const Client = struct {
                     }
                 }
                 if (plan.operation == .disk_create and (current.model != .disk or current.model.disk.bytes !=
-                    @as(u64, plan.operation.disk_create.size_gib) * 1024 * 1024 * 1024)) return fail(error.OriginalIdentityMismatch, .accepted, current.reply.status);
+                    plan.operation.disk_create.logicalBytes() or
+                    (plan.operation.disk_create.linux_gen2 and !current.model.disk.linux_gen2))) return fail(error.OriginalIdentityMismatch, .accepted, current.reply.status);
                 if (plan.operation == .disk_create and current.model.disk.upload_bytes != plan.operation.disk_create.upload_bytes)
                     return fail(error.OriginalIdentityMismatch, .accepted, current.reply.status);
                 if (plan.operation == .deallocate or plan.operation == .start) {
@@ -571,7 +582,8 @@ pub const Client = struct {
 fn compareDefinition(a: std.mem.Allocator, authority: s.Authority, definition: ops.Resource, actual: models.Model) !void {
     switch (definition) {
         .disk => |disk| {
-            if (actual != .disk or actual.disk.bytes != @as(u64, disk.size_gib) * 1024 * 1024 * 1024 or actual.disk.upload_bytes != disk.upload_bytes)
+            if (actual != .disk or actual.disk.bytes != disk.logicalBytes() or actual.disk.upload_bytes != disk.upload_bytes or
+                (disk.linux_gen2 and !actual.disk.linux_gen2))
                 return error.OriginalIdentityMismatch;
         },
         .storage => {
