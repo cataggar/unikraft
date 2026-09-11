@@ -1119,6 +1119,12 @@ jobs:
               --prefix "${root}/${mode}/namespace-out" \
               -Dworkspace="${root}/${mode}/namespace-work" "${git_fixture[@]}" \
               -Doptimize="${mode}" -j2 test install --summary all
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/integration-cache" \
+            zig build --build-file support/tools/hyperv/preparation/integration/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --cache-dir "${root}/${mode}/integration-cache" \
+              --prefix "${root}/${mode}/integration-out" \
+              -Doptimize="${mode}" -j2 test install --summary all
         done
 
     - name: Run native Hyper-V preflight engine fixtures
