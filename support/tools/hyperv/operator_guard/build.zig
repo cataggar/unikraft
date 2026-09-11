@@ -27,8 +27,14 @@ pub fn build(b: *std.Build) void {
         .strip = true,
         .imports = &.{.{ .name = "operator_guard", .module = addModule(b, b.graph.host, fixture_optimize, null) }},
     }) });
+    b.step("install-fixture", "Install only the native synthetic custody fixture").dependOn(&b.addInstallArtifact(fixture, .{}).step);
     const options = b.addOptions();
-    options.addOptionPath("fixture", fixture.getEmittedBin());
+    if (b.option([]const u8, "fixture-executable", "Existing absolute synthetic fixture executable for profile-scoped CI")) |path| {
+        if (!std.fs.path.isAbsolute(path)) @panic("fixture-executable must be absolute");
+        options.addOption([]const u8, "fixture", path);
+    } else {
+        options.addOptionPath("fixture", fixture.getEmittedBin());
+    }
     options.addOption(?[]const u8, "test_root", b.option([]const u8, "test-root", "Existing private absolute native fixture directory"));
     const tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("tests.zig"),

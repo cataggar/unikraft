@@ -126,6 +126,8 @@ pub fn main(init: std.process.Init) void {
     };
 }
 fn execute(init: std.process.Init) !void {
+    // Scope CI kernel-denial evidence to this synthetic executable.
+    _ = try k.checked(k.linux.prctl(@intFromEnum(k.linux.PR.SET_NAME), @intFromPtr("uk-custody-test"), 0, 0, 0));
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var fault: Fault = .{ .original = init.io };
     var controlled = init;

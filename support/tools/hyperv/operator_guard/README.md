@@ -191,6 +191,33 @@ obligations.
 
 ## Requirements, accounting and native fixtures
 
+### Hosted CI namespace permission
+
+The Ubuntu 24.04 GitHub Actions machine runs `ci-fixtures.sh` as the ordinary
+runner user. It first exercises the real kernel fixture without an exception.
+Only a failed mount-namespace setup accompanied by a matching AppArmor kernel
+denial for the synthetic process permits loading `ci.apparmor`. Other failures
+remain failures; the script does not skip cases or substitute process groups.
+
+The user-approved profile applies only to the root-owned, non-writable
+`/opt/unikraft-hyperv-custody-ci/operator-guard-fixture`, copied from the
+ReleaseSafe native fixture. It allows user namespaces for that executable,
+leaving `kernel.apparmor_restrict_unprivileged_userns=1`. No compiler, shell,
+test-driver wildcard or production executable receives this allowance.
+The profile's `unconfined` mode retains the fixture's ordinary host access;
+it is a per-application user-namespace exception, not an additional sandbox.
+
+Only installation, AppArmor administration and reading kernel audit evidence
+use `sudo`; fixture execution stays unprivileged. Both optimization-mode
+drivers bind and exercise the same immutable physical fixture. The script
+checks its digest, removes the profile and exact installation on exit, and
+retains bounded synthetic startup diagnostics in CI evidence. It makes no
+local-machine, Unikraft-image, Azure-host or production-policy changes.
+`install-fixture` and `-Dfixture-executable` exist solely for this test setup;
+ordinary production installation still excludes synthetic dispatch.
+
+### Native requirements and budgets
+
 Linux 5.11+ on AArch64 or x86_64, enabled unprivileged user/PID/mount namespaces,
 procfs, pidfds/atomic `CLONE_PIDFD`, memfd sealing, `close_range(CLOEXEC)` and
 private descriptor-safe local files are required. Missing kernel facilities
