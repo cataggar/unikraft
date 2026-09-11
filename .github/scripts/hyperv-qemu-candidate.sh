@@ -4,13 +4,18 @@ umask 077
 export LC_ALL=C
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT QEMU_MODULE_DIR
 
-if [[ $# != 3 ]]; then
-  echo "usage: hyperv-qemu-candidate.sh ABSOLUTE_QEMU ABSOLUTE_QEMU_IMG NEW_EVIDENCE_DIR" >&2
+if [[ $# != 3 && $# != 4 ]]; then
+  echo "usage: hyperv-qemu-candidate.sh ABSOLUTE_QEMU ABSOLUTE_QEMU_IMG NEW_EVIDENCE_DIR [PRIVATE_LIBRARY_DIR]" >&2
   exit 2
 fi
 qemu="$1"
 image_tool="$2"
 root="$3"
+if [[ $# == 4 ]]; then
+  [[ "$4" = /* && -d "$4" && ! -L "$4" ]]
+  export LD_LIBRARY_PATH
+  LD_LIBRARY_PATH="$(readlink -f "$4")"
+fi
 for executable in "${qemu}" "${image_tool}"; do
   [[ "${executable}" = /* && -f "${executable}" && ! -L "${executable}" && -x "${executable}" ]]
 done

@@ -93,12 +93,77 @@ jobs:
           sha256sum "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" \
             > "${root}/evidence/candidate-executables.sha256"
 
+      - name: Materialize the observed missing libfdt dependency without installation hooks
+        run: |
+          set -euo pipefail
+          set -C
+          umask 077
+          root="${RUNNER_TEMP}/qemu-vpc-candidate"
+          mkdir -m 700 "${root}/apt-lists" "${root}/apt-cache" "${root}/runtime"
+          test -r /etc/apt/sources.list.d/ubuntu.sources
+          test -r /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          awk '
+            /^Signed-By:/ {
+              count++
+              if (NF != 2 || $2 != "/usr/share/keyrings/ubuntu-archive-keyring.gpg") exit 1
+            }
+            END { if (count == 0) exit 1 }
+          ' /etc/apt/sources.list.d/ubuntu.sources
+          # APT_CONFIG is read before configuration fragments: exclude runner hooks.
+          printf '%s\n' \
+            'Dir::Etc::parts "-";' \
+            'Dir::Etc::main "-";' \
+            'Dir::Etc::sourcelist "/etc/apt/sources.list.d/ubuntu.sources";' \
+            'Dir::Etc::sourceparts "-";' \
+            "Dir::State::lists \"${root}/apt-lists\";" \
+            "Dir::Cache \"${root}/apt-cache\";" \
+            'APT::Update::Error-Mode "any";' \
+            > "${root}/evidence/apt.conf"
+          export APT_CONFIG="${root}/evidence/apt.conf"
+          apt-config dump > "${root}/evidence/apt-config.txt"
+          if grep -Eq '(Pre-Invoke|Post-Invoke|Pre-Install-Pkgs)' "${root}/evidence/apt-config.txt"; then
+            echo "Unexpected package-manager hook in candidate acquisition." >&2
+            exit 1
+          fi
+          apt-get update > "${root}/evidence/apt-update.txt" 2>&1
+          apt-cache policy libfdt1 > "${root}/evidence/libfdt-policy.txt"
+          version="$(awk '$1 == "Candidate:" { print $2 }' "${root}/evidence/libfdt-policy.txt")"
+          test -n "${version}"
+          test "${version}" != "(none)"
+          apt-cache show "libfdt1=${version}" > "${root}/evidence/libfdt-package.txt"
+          (
+            cd "${root}/downloads"
+            apt-get download "libfdt1=${version}" > "${root}/evidence/libfdt-download.txt" 2>&1
+          )
+          packages=("${root}"/downloads/libfdt1_*.deb)
+          test "${#packages[@]}" -eq 1
+          test -f "${packages[0]}"
+          expected="$(awk '$1 == "SHA256:" { print $2 }' "${root}/evidence/libfdt-package.txt" | sort -u)"
+          [[ "${expected}" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "${expected}" "${packages[0]}" | sha256sum -c - \
+            > "${root}/evidence/libfdt-package-valid.txt"
+          dpkg-deb --fsys-tarfile "${packages[0]}" > "${root}/downloads/libfdt.tar"
+          tar --list --verbose --file "${root}/downloads/libfdt.tar" \
+            > "${root}/evidence/libfdt-members.txt"
+          mapfile -t members < <(
+            awk '$1 ~ /^-/ && $NF ~ /^\.\/usr\/lib\/x86_64-linux-gnu\/libfdt-[0-9.]+\.so$/ { print $NF }' \
+              "${root}/evidence/libfdt-members.txt"
+          )
+          test "${#members[@]}" -eq 1
+          tar --extract --to-stdout --no-wildcards --file "${root}/downloads/libfdt.tar" \
+            -- "${members[0]}" > "${root}/runtime/libfdt.so.1"
+          chmod 400 "${root}/runtime/libfdt.so.1"
+          sha256sum "${root}/runtime/libfdt.so.1" \
+            /usr/share/keyrings/ubuntu-archive-keyring.gpg /etc/apt/sources.list.d/ubuntu.sources \
+            > "${root}/evidence/libfdt-inputs.sha256"
+
       - name: Open a whole read-only fixed VHD without booting a guest
         run: |
           set -euo pipefail
           root="${RUNNER_TEMP}/qemu-vpc-candidate"
           bash .github/scripts/hyperv-qemu-candidate.sh \
-            "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" "${root}/evidence/probe"
+            "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" \
+            "${root}/evidence/probe" "${root}/runtime"
 
       - name: Retain bounded candidate evidence, not images or executable archives
         if: always()
@@ -110,5 +175,6 @@ jobs:
             ${{ runner.temp }}/qemu-vpc-candidate/evidence/**/*.jsonl
             ${{ runner.temp }}/qemu-vpc-candidate/evidence/**/*.txt
             ${{ runner.temp }}/qemu-vpc-candidate/evidence/**/*.sha256
+            ${{ runner.temp }}/qemu-vpc-candidate/evidence/apt.conf
           if-no-files-found: error
           retention-days: 7
