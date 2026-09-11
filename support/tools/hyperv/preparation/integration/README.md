@@ -19,8 +19,12 @@ unchanged during the run. The importing mode uses the same physical executable
 by default. A separately selected engine copy is separately inventoried and
 charged, and must itself execute importer mode.
 
-Run this from the owned, clean, committed worktree. A fresh parent-selected
-directory is required; do not overwrite earlier measurements:
+Choose a Git-coherence setup below before material generation. This build
+example uses the owned, clean, committed worktree. A private clone instead
+uses its own checkout as the working directory and its own
+`.d/zig-migration-preparation/integration-parent-v1` as `S`; the pinned package
+cache may remain at its explicitly reviewed existing location. A fresh
+parent-selected directory is required; do not overwrite earlier measurements:
 
 ```sh
 cd /d/unikraft-worktrees/fleet-ci
@@ -54,6 +58,107 @@ The driver does not initialize it. The facade path is
 `/run/user/UID/unikraft-zig-facade-UID` when `/run/user/UID` exists, otherwise
 `PASSWD_HOME/unikraft-zig-facade-UID`.
 
+## Git metadata coherence: parent setup decision
+
+**Recommend a private, independent normal clone for the staged run.** Using
+the shared fleet worktree is also supported, but requires one continuous
+parent-coordinated Git-mutation freeze, not a separate freeze around each
+command. The review pauses make the duration larger than just configure/build;
+there is no promise that the shared freeze will be brief.
+
+Bootstrap resolves the actual `--git-common-dir` and `--absolute-git-dir`
+through the declared native Git runtime. It inventories each distinct complete
+metadata tree into `binding.isolation.git_metadata` (directory physical
+identity plus tree SHA/file count/byte count). In a linked worktree, this
+includes the common objects, refs, reflogs, configuration and other worktrees'
+metadata, not just this branch's HEAD/index. A sibling commit, fetch, ref
+update, index refresh, worktree change, maintenance, GC or repack can therefore
+invalidate the binding even when this checkout's HEAD and source bytes stay
+unchanged. A source commit/tree digest is not the Git metadata inventory.
+
+The existing namespace validates that full inventory before/after producer
+execution, and the read-only importer remeasures the inventories from the
+stored execution/inspection bindings. Discrepancies fail closed; there is no
+ignored-path list, automatic rebaseline or retry against changed metadata.
+Read-only namespace mounts, workspace `.writer.lock`, facade `build.lock`,
+`GIT_OPTIONAL_LOCKS=0` and disabled auto-maintenance do **not** lock out host
+writers in other worktrees.
+
+### Option A: private Git clone (recommended)
+
+Parent-only setup inputs are the local source checkout, an independently
+chosen complete commit containing this driver and every linked repository
+source, a fresh private destination, an empty private Git template directory,
+and the reviewed native Git executable/loader/library closure. No setup
+command is executed by the driver.
+
+Use native Git's local-copy clone mode with **`--local --no-hardlinks
+--no-checkout`**, the empty template, then a detached checkout of that exact
+chosen commit. Setup must use an explicit closed environment, disabled hooks,
+global/system config and maintenance, and local filesystem transport only.
+Do not fall back to remote transport, ambient Git helpers or a shell wrapper.
+Coordinate a short source-Git mutation freeze while making the independent
+copy so concurrent packing/pruning/ref changes cannot corrupt the acquisition.
+Complete checkout and all target configuration/index changes before measuring.
+
+This must be a normal standalone clone with `repository/.git` as its own
+directory, **not** `git worktree add`, a copied worktree `.git` pointer, a bare
+repository pretending to be the working tree, or a filtered/shallow clone.
+Do not use `--shared`, `--reference` (even with later `--dissociate`), alternates,
+hardlinked objects, symlinked metadata, or a live snapshot backed by the fleet
+common directory. Independently confirm that both Git-directory queries
+resolve to the clone's own `.git`, metadata regular files are independent
+single-link files, and no alternates/grafts/replacements/promisor/shallow
+state exists. The existing source validator remains authoritative; don't
+sanitize an invalid clone after approving its binding.
+
+After acquisition, the original fleet repository may resume Git mutations.
+Keep **the clone's** source and all Git metadata unchanged from bootstrap
+through final import (and any later re-admission using those receipts).
+No commits, fetches, checkout/index updates, registration for background
+maintenance, or housekeeping may run in the clone during that interval.
+Clone acquisition copies repository objects and checks out committed source;
+it must not copy the source worktree's `.d`, seed, receipts or historical
+private evidence.
+
+Set `requests/bootstrap.json.repository` to the clone's actual canonical path
+and place `WORK` below **that clone's**
+`.d/zig-migration-preparation/`; a workspace remaining under the original
+worktree is not valid for the clone. Build the driver/helper from that selected
+checkout. Bootstrap then measures the clone's real source HEAD/tree/physical
+closure and new directory identities/metadata trees. Independently review
+those new bindings and all resulting hashes; never relabel or copy a shared
+worktree's bootstrap, execution/inspection approvals or receipts onto the
+clone. Keep the canonical passwd HOME/facade lock unchanged.
+The separately supplied capability-source locations/provenance do not move
+automatically; preserve their actual reviewed source and dependency bindings
+too, or independently prepare and review their replacements.
+
+### Option B: shared-worktree freeze
+
+First finish all source/harness commits, parent integration, fetches and
+setup; prearrange reviewers and the independent expected config/materials.
+The parent then pauses **all writers to the selected Git common directory**,
+including sibling branches/worktrees and background Git maintenance, before
+`material`. Keep that same freeze across prepare, both staged reviews,
+configure/inspection, build/inspection, package, selection review, generate
+and final read-only import. Per-command freezes cannot work: the original
+metadata inventory persists in every later binding. Release only after the
+last intended import; mutating shared metadata afterwards makes later
+re-admission of those bindings fail. If mutation occurs mid-run, stop and
+retain the failed workspace; use fresh material and independent approvals,
+not updated hashes pasted into the old receipt chain.
+
+Neither choice changes source/dependency coverage: all eight tracked
+`integration/` files, the preparation/core modules, and linked native
+ELF/Kconfig/facade/root-proof sources belong to the selected repository
+commit/physical-source closure. The pinned miz source and every other
+external linked dependency remain separately inventoried and reviewed in
+`provenance.dependencies`. `.d` is not a source-code commitment. A private
+clone's equal commit ID does not establish equal namespace identities, build
+artifacts or review hashes. These choices establish local synthetic input
+coherence only, not GitHub publication or cloud/host/live authority.
+
 ## Required material, not approval
 
 All JSON uses the existing `contracts.parse`/`canonical` policy: exact fields
@@ -70,7 +175,7 @@ or arbitrary child arguments are supported.
 | Field | Required value |
 | --- | --- |
 | `schema` | `hyperv_native_integration_spec_v1` |
-| `repository` | This committed worktree, including the driver sources |
+| `repository` | The selected committed checkout (shared frozen worktree or independent private clone), including the driver sources |
 | `actor_directory` | The physical `$S/install/bin` directory |
 | `facade_runtime` | Existing canonical facade directory described above |
 | `guard` | `{run_id,disk_id,sectors,lun,sector_size,identity_policy}`; two distinct synthetic 32-character storage hex identities, 49..4096 sectors, LUN 0, sector size 512, policy 2 |
