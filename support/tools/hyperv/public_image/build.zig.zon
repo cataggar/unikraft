@@ -1,0 +1,13 @@
+.{
+    .name = .unikraft_hyperv_public_image,
+    .version = "0.1.0",
+    .fingerprint = 0xa451ae17f463e7f9,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .miz_source = .{
+            .url = "git+https://github.com/cataggar/miz.git#2db68ca0c3ab12155012a823c3fb8d7aba1cb544",
+            .hash = "miz-0.2.0-Z3lHlPw00wAx7bBDTJjcF1O3Vva6085mA_DZS2uWdwzL",
+        },
+    },
+    .paths = .{""},
+}

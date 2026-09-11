@@ -4,3 +4,4 @@ pub const serial = @import("serial.zig");
 pub const files = @import("files.zig");
 pub const runner = @import("runner.zig");
 pub const child = @import("child.zig");
+pub const vhd = @import("vhd.zig");

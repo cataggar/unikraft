@@ -21,13 +21,14 @@ pub const Set = struct {
             errdefer file.close(io);
             const before = try core.private_files.snapshot(file);
             const maximum: u64 = switch (i) {
-                0 => c.max_input,
+                0 => c.max_input + @as(u64, if (config.fixed_vhd != null) 512 else 0),
                 1 => c.max_firmware,
                 2 => c.max_vars,
                 3 => c.max_qemu,
                 else => unreachable,
             };
             if (before.size == 0 or before.size > maximum or before.mode & 0o022 != 0) return error.InvalidArtifact;
+            if (i == 0 and config.fixed_vhd != null) _ = try @import("vhd.zig").validate(io, file);
             if (i == 3) {
                 if (before.mode & 0o111 == 0 or before.mode & 0o6000 != 0) return error.InvalidExecutable;
                 var magic: [4]u8 = undefined;

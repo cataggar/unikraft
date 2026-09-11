@@ -42,7 +42,7 @@ pub fn validate(a: std.mem.Allocator, raw: []const u8, config: c.Config) !void {
     }
 }
 
-fn normalize(a: std.mem.Allocator, raw: []const u8) ![]u8 {
+pub fn normalize(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (raw.len == 0 or raw.len > c.max_serial) return error.SerialLimit;
     if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidSerial;
     const output = try a.alloc(u8, raw.len);
