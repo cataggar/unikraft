@@ -72,8 +72,10 @@ jobs:
           tar --list --verbose --gzip --quoting-style=escape --file "${archive}" \
             > "${root}/evidence/member-types.txt"
           awk '
-            $0 !~ /^[A-Za-z0-9_.+/-]+$/ || $0 ~ /^\// || $0 ~ /(^|\/)\.\.(\/|$)/ { exit 1 }
-            seen[$0]++ { exit 1 }
+            $0 !~ /^[A-Za-z0-9_.+,/-]+$/ || $0 ~ /^\// || $0 ~ /(^|\/)\.\.(\/|$)/ {
+              print "Rejected archive member: " $0 > "/dev/stderr"; exit 1
+            }
+            seen[$0]++ { print "Duplicate archive member: " $0 > "/dev/stderr"; exit 1 }
           ' "${root}/evidence/members.txt"
           for name in qemu-system-x86_64 qemu-img; do
             mapfile -t members < <(grep -E "(^|/)${name}$" "${root}/evidence/members.txt")
