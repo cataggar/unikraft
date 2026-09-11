@@ -5,7 +5,7 @@ umask 077
 test "$(id -u)" -ne 0
 root="${RUNNER_TEMP:?}/hyperv-ci/native-operator-guard"
 package=support/tools/hyperv/operator_guard
-installation=/opt/unikraft-hyperv-custody-ci
+installation=/var/lib/unikraft-hyperv-custody-ci
 executable="${installation}/operator-guard-fixture"
 profile="${installation}/profile"
 profile_name=unikraft-hyperv-custody-ci
@@ -38,6 +38,9 @@ zig build --build-file "${package}/build.zig" \
   -Dfixture-optimize=ReleaseSafe -j2 install-fixture --summary all
 
 # Never profile a writable cache path, compiler, shell, or arbitrary test runner.
+for directory in / /var /var/lib; do
+  test "$(stat -c '%u:%g:%a' "${directory}")" = '0:0:755'
+done
 sudo mkdir -m 0755 -- "${installation}"
 created=true
 sudo install -o root -g root -m 0555 \

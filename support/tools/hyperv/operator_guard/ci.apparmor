@@ -2,6 +2,6 @@ abi <abi/4.0>,
 
 # Only the root-owned synthetic fixture installed by ci-fixtures.sh can attach.
 # This leaves the host's global unprivileged-userns restriction enabled.
-profile unikraft-hyperv-custody-ci /opt/unikraft-hyperv-custody-ci/operator-guard-fixture flags=(unconfined) {
+profile unikraft-hyperv-custody-ci /var/lib/unikraft-hyperv-custody-ci/operator-guard-fixture flags=(unconfined) {
   userns,
 }

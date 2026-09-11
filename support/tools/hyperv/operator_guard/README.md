@@ -200,12 +200,14 @@ denial for the synthetic process permits loading `ci.apparmor`. Other failures
 remain failures; the script does not skip cases or substitute process groups.
 
 The user-approved profile applies only to the root-owned, non-writable
-`/opt/unikraft-hyperv-custody-ci/operator-guard-fixture`, copied from the
+`/var/lib/unikraft-hyperv-custody-ci/operator-guard-fixture`, copied from the
 ReleaseSafe native fixture. It allows user namespaces for that executable,
 leaving `kernel.apparmor_restrict_unprivileged_userns=1`. No compiler, shell,
 test-driver wildcard or production executable receives this allowance.
 The profile's `unconfined` mode retains the fixture's ordinary host access;
 it is a per-application user-namespace exception, not an additional sandbox.
+The installation's ancestors must already be root-owned mode 0755; CI does
+not repair permissions on shared directories such as the hosted `/opt`.
 
 Only installation, AppArmor administration and reading kernel audit evidence
 use `sudo`; fixture execution stays unprivileged. Both optimization-mode
