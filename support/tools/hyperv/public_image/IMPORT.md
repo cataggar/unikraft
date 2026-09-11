@@ -96,6 +96,17 @@ Exit 0 means only the requested local operation succeeded. Import execution
 failure is exit 1; argument/validation refusal is exit 2; diagnostic-output
 failure is exit 3. Errors contain fixed enumerated diagnostics, not paths,
 raw exception messages, subprocess output or manifest-provided strings.
+Post-import serialization/output failure preserves the known destination and
+receipt publication statuses, suppresses the successful receipt digest, and
+adds a recording failure without replacing earlier failures in any lane.
+The CLI attempts a bounded, independently buffered stderr report and exits 3,
+even when that fallback also cannot be delivered. It does not replay the
+import, remove published files, or claim a prepublication argument refusal.
+After successful `validate-import`, output failure likewise exits 3 with a
+no-digest stderr report preserving `validated=true` as the completed physical
+observation, plus the independent recording failure; it publishes nothing.
+Only a complete exit-0 response is usable. Partial stdout, even if it contains
+a digest, and residual receipts after failed delivery are not recovery inputs.
 There are no `--miz`, location, VM-size, trust-artifact, fixture, acquisition
 or credential options for these commands.
 
@@ -256,6 +267,9 @@ symlinks/FIFOs/hardlinks/modes, aliasing/no-clobber, coherent-hash footer/GPT/
 EFI corruption, exact length, source mutation, separate producer identities,
 receipt/phase/claim/inspection/physical mutations, durable failure states,
 lock contention, original-input independence, and actual native CLI arguments.
+Delivery regressions send real post-import stdout to `/dev/full` and a closed
+pipe, retain and inspect the durable receipt/VHD, and exercise failed reload
+output and error-output delivery without replaying or adopting an import.
 All factory source boot claims are explicitly synthetic, not attested or
 locally observed. Existing public-image/local-boot suites use their separate
 native mock processes, never actual QEMU. No guest/Make/producer build,

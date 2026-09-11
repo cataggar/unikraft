@@ -367,18 +367,21 @@ fn cli(f: fixtures.Fixture, args: []const []const u8) !std.process.RunResult {
     try env.put("TMPDIR", f.path);
     return std.process.run(f.a, io, .{ .argv = args, .cwd = .{ .dir = f.dir.dir }, .environ_map = &env, .stdout_limit = .limited(c.max_record), .stderr_limit = .limited(c.max_record) });
 }
-test "native CLI requires independently supplied artifact and receipt expectations" {
-    const f = try fixture();
-    defer f.deinit(a);
-    const executable = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, f.a);
-    const path = try f.destination("cli-import");
-    const expected_args = [_][]const u8{
+fn expectedArgs(f: fixtures.Fixture) [18][]const u8 {
+    return .{
         "--expected-manifest-sha256", f.expected.manifest_sha256,   "--expected-producer-sha256", f.expected.native_producer_sha256,
         "--expected-repository",      fixtures.source.repository,   "--expected-repository-id",   "123",
         "--expected-workflow-ref",    fixtures.source.workflow_ref, "--expected-job",             fixtures.source.job,
         "--expected-run-id",          "456",                        "--expected-run-attempt",     "1",
         "--expected-head-sha",        fixtures.source.head_sha,
     };
+}
+test "native CLI requires independently supplied artifact and receipt expectations" {
+    const f = try fixture();
+    defer f.deinit(a);
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, f.a);
+    const path = try f.destination("cli-import");
+    const expected_args = expectedArgs(f);
     const prefix = [_][]const u8{ executable, "import-prepared", "--state-dir", path, "--artifact-dir", f.artifact_path };
     for (0..expected_args.len / 2) |omitted| {
         const args = try std.mem.concat(f.a, []const u8, &.{ &prefix, expected_args[0 .. omitted * 2], expected_args[(omitted + 1) * 2 ..] });
@@ -402,4 +405,149 @@ test "native CLI requires independently supplied artifact and receipt expectatio
     try t.expect(override.term == .exited and override.term.exited != 0);
     // API reload cannot silently pretend its different test executable was the importer.
     if (image.importer.load(f.a, io, path, f.expected, try c.sha(digest))) |_| return error.AcceptedDifferentImporter else |_| {}
+}
+
+test "delivery failure keeps operation certainty and first failures without the command allocator" {
+    const completed: ic.Result = .{ .destination = .durable, .publication = .durable, .receipt_sha256 = c.hash("synthetic receipt") };
+    const failed: ic.Result = .{
+        .destination = .durable,
+        .publication = .publication_unknown,
+        .failures = .{
+            .primary = .{ .stage = .inspection, .category = .integrity },
+            .cleanup = .{ .stage = .cleanup, .category = .cleanup_failed },
+            .recording = .{ .stage = .state_record, .category = .output_limit },
+        },
+    };
+    for ([_]ic.Result{ completed, failed }) |original| {
+        try t.expectError(error.OutOfMemory, original.encode(std.testing.failing_allocator));
+        const delivery = original.deliveryFailed();
+        try t.expectEqual(original.destination, delivery.destination);
+        try t.expectEqual(original.publication, delivery.publication);
+        try t.expectEqualDeep(original.failures.primary, delivery.failures.primary);
+        try t.expectEqualDeep(original.failures.cleanup, delivery.failures.cleanup);
+        if (original.failures.recording != null) {
+            try t.expectEqualDeep(original.failures.recording, delivery.failures.recording);
+        } else {
+            try t.expectEqual(.state_record, delivery.failures.recording.?.stage);
+            try t.expectEqual(.local_io, delivery.failures.recording.?.category);
+        }
+        try t.expect(!delivery.succeeded() and delivery.receipt_sha256 == null);
+        var storage: [c.max_record]u8 = undefined;
+        var fallback = std.heap.FixedBufferAllocator.init(&storage);
+        const bytes = try delivery.encode(fallback.allocator());
+        var document = try image.core.contracts.Document.parse(a, bytes, .{ .bytes = c.max_record });
+        defer document.deinit();
+        try document.requireCanonical(a, bytes);
+        try t.expect(document.value().object.get("receipt_sha256").? == .null);
+    }
+}
+
+fn cliOutputFailure(f: fixtures.Fixture, args: []const []const u8, sink: std.Io.File, stream: enum { stdout, stderr }) !std.process.RunResult {
+    var env: std.process.Environ.Map = .init(f.a);
+    defer env.deinit();
+    try env.put("TMPDIR", f.path);
+    var child = try std.process.spawn(io, .{
+        .argv = args,
+        .cwd = .{ .dir = f.dir.dir },
+        .environ_map = &env,
+        .stdin = .ignore,
+        .stdout = if (stream == .stdout) .{ .file = sink } else .pipe,
+        .stderr = if (stream == .stderr) .{ .file = sink } else .pipe,
+    });
+    defer child.kill(io);
+    var buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
+    var reader: std.Io.File.MultiReader = undefined;
+    reader.init(f.a, io, buffer.toStreams(), &.{if (stream == .stdout) child.stderr.? else child.stdout.?});
+    defer reader.deinit();
+    const deadline: std.Io.Timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(120) }) };
+    while (reader.fill(256, deadline)) |_| {
+        if (reader.reader(0).buffered().len > c.max_record) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+    try reader.checkAnyError();
+    const term = try child.wait(io);
+    const captured = try reader.toOwnedSlice(0);
+    return .{ .term = term, .stdout = if (stream == .stderr) captured else &.{}, .stderr = if (stream == .stdout) captured else &.{} };
+}
+
+fn deliveryReport(f: fixtures.Fixture, result: std.process.RunResult) !std.json.ObjectMap {
+    try t.expect(result.term == .exited and result.term.exited == 3);
+    try t.expectEqual(@as(usize, 0), result.stdout.len);
+    var document = try image.core.contracts.Document.parse(f.a, result.stderr, .{ .bytes = c.max_record });
+    defer document.deinit();
+    try document.requireCanonical(f.a, result.stderr);
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, f.a, result.stderr, .{});
+    const object = value.object;
+    try t.expectEqualStrings("public_local_import_only", object.get("scope").?.string);
+    try t.expectEqualStrings("not_admitted", object.get("authority").?.string);
+    try t.expectEqualStrings("not_verified", object.get("attestation").?.string);
+    try t.expect(object.get("receipt_sha256").? == .null);
+    const failures = object.get("failures").?.object;
+    try t.expect(failures.get("primary").? == .null and failures.get("cleanup").? == .null);
+    const recording = failures.get("recording").?.object;
+    try t.expectEqualStrings("state_record", recording.get("stage").?.string);
+    try t.expectEqualStrings("local_io", recording.get("category").?.string);
+    try t.expect(std.mem.indexOf(u8, result.stderr, f.path) == null);
+    return object;
+}
+
+test "real full and broken stdout retain durable import evidence and output failure exit status" {
+    const f = try fixture();
+    defer f.deinit(a);
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, f.a);
+    const expected_args = expectedArgs(f);
+    const full = try std.Io.Dir.openFileAbsolute(io, "/dev/full", .{ .mode = .write_only });
+    defer full.close(io);
+    var descriptors: [2]std.os.linux.fd_t = undefined;
+    try t.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.pipe2(&descriptors, .{ .CLOEXEC = true })));
+    const broken: std.Io.File = .{ .handle = descriptors[1], .flags = .{ .nonblocking = false } };
+    defer broken.close(io);
+    (std.Io.File{ .handle = descriptors[0], .flags = .{ .nonblocking = false } }).close(io);
+    for ([_]std.Io.File{ full, broken }, 0..) |sink, index| {
+        const path = try f.destination(try std.fmt.allocPrint(f.a, "failed-delivery-{d}", .{index}));
+        const args = try std.mem.concat(f.a, []const u8, &.{ &.{ executable, "import-prepared", "--state-dir", path, "--artifact-dir", f.artifact_path }, &expected_args });
+        const report = try deliveryReport(f, try cliOutputFailure(f, args, sink, .stdout));
+        try t.expect(!report.get("succeeded").?.bool);
+        try t.expectEqualStrings("durable", report.get("destination").?.string);
+        try t.expectEqualStrings("durable", report.get("publication").?.string);
+        const root = try p.Directory.open(io, path);
+        defer root.close(io);
+        const receipt_bytes = try root.read(io, f.a, ic.receipt_name, c.max_record, null);
+        const receipt = try c.read(ic.Receipt, f.a, receipt_bytes);
+        try t.expectEqual(.imported, receipt.phase);
+        try t.expectEqualStrings(f.expected.manifest_sha256, receipt.manifest.digest.sha256);
+        try t.expectEqualStrings(f.manifest.artifacts.vhd.sha256, receipt.image.digest.sha256);
+        const disk = try root.openFile(io, ic.image_name);
+        defer disk.close(io);
+        _ = try image.package.inspectVhd(f.a, io, disk, .{
+            .efi = try c.sha(f.manifest.artifacts.efi.sha256),
+            .raw = try c.sha(f.manifest.artifacts.raw.sha256),
+            .vhd = try c.sha(f.manifest.artifacts.vhd.sha256),
+        });
+        // A second invocation is a real conflict; losing its error output must
+        // still exit 3, never replay or alter the already durable import.
+        const conflict = try cli(f, args);
+        try t.expect(conflict.term == .exited and conflict.term.exited == 1);
+        try t.expect(std.mem.indexOf(u8, conflict.stderr, "\"category\":\"conflict\"") != null);
+        const failed_conflict = try cliOutputFailure(f, args, full, .stderr);
+        try t.expect(failed_conflict.term == .exited and failed_conflict.term.exited == 3 and failed_conflict.stdout.len == 0);
+        try t.expectEqualStrings(receipt_bytes, try root.read(io, f.a, ic.receipt_name, c.max_record, null));
+    }
+
+    // Validation uses only a separately successful import's delivered digest.
+    const path = try f.destination("successful-delivery");
+    const imported = try cli(f, try std.mem.concat(f.a, []const u8, &.{ &.{ executable, "import-prepared", "--state-dir", path, "--artifact-dir", f.artifact_path }, &expected_args }));
+    try t.expect(imported.term == .exited and imported.term.exited == 0);
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, f.a, imported.stdout, .{});
+    const digest = value.object.get("receipt_sha256").?.string;
+    const args = try std.mem.concat(f.a, []const u8, &.{ &.{ executable, "validate-import", "--state-dir", path, "--expected-import-sha256", digest }, &expected_args });
+    const validated = try deliveryReport(f, try cliOutputFailure(f, args, full, .stdout));
+    try t.expect(validated.get("validated").?.bool);
+    try t.expect(!validated.contains("destination") and !validated.contains("publication"));
+    const delivered = try cli(f, args);
+    try t.expect(delivered.term == .exited and delivered.term.exited == 0);
+    const validation = try std.json.parseFromSliceLeaky(std.json.Value, f.a, delivered.stdout, .{});
+    try t.expectEqualStrings(digest, validation.object.get("receipt_sha256").?.string);
 }

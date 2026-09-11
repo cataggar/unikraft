@@ -77,6 +77,12 @@ pub const Result = struct {
         return self.destination == .durable and self.publication == .durable and self.receipt_sha256 != null and
             self.failures.primary == null and self.failures.cleanup == null and self.failures.recording == null;
     }
+    pub fn deliveryFailed(self: Result) Result {
+        var failed = self;
+        failed.receipt_sha256 = null;
+        failed.failures.recording = failed.failures.recording orelse .{ .stage = .state_record, .category = .local_io };
+        return failed;
+    }
     pub fn encode(self: Result, a: std.mem.Allocator) ![]u8 {
         return c.encode(a, .{
             .schema_version = @as(u8, 1),
