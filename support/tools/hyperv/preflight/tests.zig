@@ -75,6 +75,7 @@ test "synthetic lifecycle signs exact public acceptance then private phases and 
     defer directory.deinit();
     var fixture = try f.Context.init(a, io, directory.value, directory.path);
     defer fixture.deinit();
+    try fixture.refreshAdmission(f.now - 50);
     try prepare(&fixture);
     const result = try run(&fixture);
     try t.expectEqual(c.Phase.synthetic_completed, result.phase);
@@ -86,6 +87,13 @@ test "synthetic lifecycle signs exact public acceptance then private phases and 
     fixture.input.kind = .production;
     try t.expectError(error.NativeBindingMismatch, pf.completed.load(a, io, directory.value, &fixture.input));
     fixture.input.kind = .synthetic;
+    const completion = try directory.value.read(io, a, "completion.json", p.max_command, null);
+    defer a.free(completion);
+    var signed = try p.verify(a, completion, fixture.input.approved.public_key, "uk-hyperv-preflight-completion-v1");
+    defer signed.deinit();
+    var document = try pf.core.contracts.Document.parse(a, signed.canonical, .{});
+    defer document.deinit();
+    try t.expectEqual(f.now, try pf.core.contracts.integer(u64, document.value().object.get("admitted_at").?));
     try t.expectError(error.AttemptConsumed, prepare(&fixture));
 }
 
@@ -453,4 +461,5 @@ test "interrupted original VM reconciliation remains bound before mutable public
 test {
     _ = @import("wire_fixtures.zig");
     _ = @import("adapter_fixtures.zig");
+    _ = @import("review_fixtures.zig");
 }

@@ -16,6 +16,7 @@ pub const Adapter = struct {
     last: az.transport.Failure = .{ .effect = .not_started, .diagnostic = .{ .stage = .blob_upload, .category = .internal } },
 
     pub fn stage(self: *Adapter, phase: p.Phase) !p.Hash {
+        self.last = .{ .effect = .not_started, .diagnostic = .{ .stage = .blob_upload, .category = .internal } };
         if (phase == .private) try @import("engine.zig").requirePublic(self.store.state);
         const a = self.store.allocator;
         const InputFile = struct { blob: []const u8, path: []const u8, size: u64, sha256: []const u8 };
@@ -27,7 +28,7 @@ pub const Adapter = struct {
             const blob = try p.artifactBlob(scratch, try core.contracts.parseUuid(&self.store.state.run_id), phase, file.artifact.name);
             try records.append(scratch, .{ .blob = blob, .path = file.path, .size = file.artifact.size, .sha256 = try scratch.dupe(u8, &p.hex(file.artifact.sha256)) });
         };
-        var admission = try self.store.input.validate(a, self.store.input.approved.not_before);
+        var admission = try self.store.admission();
         defer admission.deinit();
         const request = try c.canonical(scratch, .{
             .schema = transfer.request.schema,
@@ -90,30 +91,80 @@ pub const Adapter = struct {
         // descriptor before any parent journal access or credential disposal.
         if (std.os.linux.errno(std.os.linux.fchdir(directory.dir.handle)) != .SUCCESS) return error.UnsafeDirectory;
         const report = transfer.worker.execute(a, store.io, "job.json", self.runtime);
-        if (std.os.linux.errno(std.os.linux.fchdir(store.lock.directory.dir.handle)) != .SUCCESS) return error.UnsafeDirectory;
-        if (report.failures.cleanup) |value| store.fail(.cleanup, value);
-        if (report.failures.recording) |value| store.fail(.recording, value);
-        try directory.dir.deleteFile(store.io, "capability");
-        try @import("hyperv_host").files.syncDirectory(store.io, directory.dir);
-        try report.validate();
+        // Preserve the worker's effects and independent lanes before cwd,
+        // credential cleanup, validation or serialization can fail.
+        self.observeWorker(report);
+        var local_error: ?anyerror = null;
+        if (std.os.linux.errno(std.os.linux.fchdir(store.lock.directory.dir.handle)) != .SUCCESS) {
+            self.postFailure(.cleanup, .{ .stage = .private_file, .category = .local_io });
+            local_error = error.UnsafeDirectory;
+        }
+        directory.dir.deleteFile(store.io, "capability") catch |err| {
+            self.postFailure(.cleanup, .{ .stage = .private_file, .category = .cleanup_failed });
+            if (local_error == null) local_error = err;
+        };
+        @import("hyperv_host").files.syncDirectory(store.io, directory.dir) catch |err| {
+            self.postFailure(.cleanup, .{ .stage = .private_file, .category = .cleanup_failed });
+            self.postFailure(.recording, .{ .stage = .state_record, .category = .local_io });
+            if (local_error == null) local_error = err;
+        };
+        report.validate() catch |err| {
+            if (self.last.effect != .accepted) self.last.effect = .unknown;
+            self.postFailure(.recording, .{ .stage = .transfer_worker, .category = .invalid_response });
+            return local_error orelse err;
+        };
+        if (local_error) |err| return err;
         if (!report.delivery_complete or report.process_cleanup_complete != null or report.failures.primary != null or
             report.failures.cleanup != null or report.failures.recording != null or report.outcome == null or report.outcome.?.completion != .complete)
         {
-            const failure = report.failures.primary orelse report.failures.recording orelse report.failures.cleanup orelse
-                core.diagnostics.Diagnostic{ .stage = .transfer_worker, .category = .ambiguous };
-            self.last = .{ .diagnostic = failure, .effect = switch (report.side_effect) {
-                .not_started => .not_started,
-                .accepted => .accepted,
-                .rejected => .rejected,
-                .unknown, .incomplete => .unknown,
-                .not_applicable => .not_applicable,
-            } };
+            if (self.last.diagnostic.category == .internal)
+                self.last.diagnostic = .{ .stage = .transfer_worker, .category = .ambiguous };
             return error.TransferFailed;
         }
         var output: [transfer.worker.protocol.maximum_result]u8 = undefined;
         var result = std.Io.Writer.fixed(&output);
-        try report.write(&result);
+        report.write(&result) catch |err| {
+            self.postFailure(.recording, .{ .stage = .transfer_worker, .category = .invalid_response });
+            return err;
+        };
         return p.hash(result.buffered());
+    }
+
+    fn observeWorker(self: *Adapter, report: transfer.worker.Report) void {
+        self.last = .{
+            .effect = transferEffect(report.side_effect),
+            .diagnostic = report.failures.primary orelse report.failures.recording orelse report.failures.cleanup orelse
+                .{ .stage = .transfer_worker, .category = .internal },
+        };
+        if (report.failures.primary) |value| self.store.fail(.primary, value);
+        if (report.failures.cleanup) |value| self.store.fail(.cleanup, value);
+        if (report.failures.recording) |value| self.store.fail(.recording, value);
+        if (report.outcome) |outcome| {
+            if (self.last.effect != transferEffect(outcome.side_effect) and self.last.effect != .accepted)
+                self.last.effect = .unknown;
+            if (outcome.failures.primary) |value| self.store.fail(.primary, value);
+            if (outcome.failures.cleanup) |value| self.store.fail(.cleanup, value);
+            if (outcome.failures.recording) |value| self.store.fail(.recording, value);
+            if (outcome.cleanup_failed) self.postFailure(.cleanup, .{ .stage = .private_file, .category = .cleanup_failed });
+        }
+    }
+    fn postFailure(self: *Adapter, lane: c.Lane, value: core.diagnostics.Diagnostic) void {
+        self.store.fail(lane, value);
+        if (self.last.diagnostic.category == .internal) self.last.diagnostic = value;
+    }
+
+    pub fn requireRevocation(self: *Adapter, result: transfer.Outcome) !void {
+        const failures = try result.failureSummary();
+        if (failures.cleanup) |value| self.store.fail(.cleanup, value);
+        if (failures.recording) |value| self.store.fail(.recording, value);
+        // Discharge only the expected service rejection, never local failures.
+        if (result.failures.primary) |value| self.store.fail(.cleanup, value);
+        try result.validate();
+        const diagnostic = result.aggregateDiagnostic();
+        if (result.completion == .complete or diagnostic.http_status != 403 or diagnostic.service_code != .AuthenticationFailed or
+            (diagnostic.category != .authentication and diagnostic.category != .authorization) or
+            failures.cleanup != null or failures.recording != null or result.failures.primary != null)
+            return error.DataPlaneRevocationUnproved;
     }
 
     pub fn publish(self: *Adapter, phase: p.Phase, bytes: []const u8) !p.Hash {
@@ -126,7 +177,7 @@ pub const Adapter = struct {
         defer a.free(path);
         const account = try std.fmt.allocPrint(a, "https://{s}.blob.core.windows.net", .{store.input.approved.resources.storage.name});
         defer a.free(account);
-        var admission = try store.input.validate(a, store.input.approved.not_before);
+        var admission = try store.admission();
         defer admission.deinit();
         const blob = try std.fmt.allocPrint(a, "runs/{s}/commands/{s}.json", .{ store.state.run_id, @tagName(phase) });
         defer a.free(blob);
@@ -177,7 +228,7 @@ pub const Adapter = struct {
         defer a.free(path);
         var sas = try store.lock.directory.readSensitive(store.io, a, "storage-capability", transfer.request.maximum_sas, null);
         defer sas.deinit();
-        var admission = try store.input.validate(a, store.input.approved.not_before);
+        var admission = try store.admission();
         defer admission.deinit();
         var client: transfer.Client = .{ .allocator = a, .io = store.io, .runtime = self.runtime, .budget = self.budget };
         for (0..600) |_| {
@@ -211,16 +262,20 @@ pub const Adapter = struct {
         if (failures.cleanup) |failure| self.store.fail(.cleanup, failure);
         if (failures.recording) |failure| self.store.fail(.recording, failure);
         if (value.completion == .complete and failures.primary == null and failures.cleanup == null and failures.recording == null) return;
-        self.last = .{ .diagnostic = value.aggregateDiagnostic(), .effect = switch (value.side_effect) {
-            .not_started => .not_started,
-            .accepted => .accepted,
-            .rejected => .rejected,
-            .unknown, .incomplete => .unknown,
-            .not_applicable => .not_applicable,
-        } };
+        self.last = .{ .diagnostic = value.aggregateDiagnostic(), .effect = transferEffect(value.side_effect) };
         return error.TransferFailed;
     }
 };
+
+fn transferEffect(certainty: transfer.diagnostic.Certainty) az.transport.Effect {
+    return switch (certainty) {
+        .not_started => .not_started,
+        .accepted => .accepted,
+        .rejected => .rejected,
+        .unknown, .incomplete => .unknown,
+        .not_applicable => .not_applicable,
+    };
+}
 
 /// The historical owned-account scope is deliberately rcw / b / sco / HTTPS.
 /// This signs native bytes, not an Azure CLI account-SAS operation.

@@ -241,6 +241,7 @@ pub const Engine = struct {
                 .input_sha256 = store.state.input_sha256,
                 .preparation_sha256 = store.state.preparation_sha256,
                 .authority_sha256 = store.state.authority_sha256,
+                .admitted_at = store.state.admitted_at,
                 .public = store.state.public.?,
                 .private = store.state.private.?,
                 .group_absence = store.state.actions[@intFromEnum(c.Action.prove_group_absent)].proof.?,

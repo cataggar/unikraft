@@ -90,6 +90,7 @@ pub const ServiceCode = enum {
     MissingSubscriptionRegistration,
     SkuNotAvailable,
     AllocationFailed,
+    RoleAssignmentNotFound,
 };
 pub const MetadataState = enum { absent, known, unknown, malformed, conflicting };
 
@@ -200,4 +201,19 @@ pub fn classifyServiceCode(raw: ?[]const u8) ServiceCode {
 pub fn reconcileServiceCodes(header: ?[]const u8, body: ?[]const u8) ServiceCode {
     if (header != null and body != null and !std.mem.eql(u8, header.?, body.?)) return .conflicting;
     return classifyServiceCode(header orelse body);
+}
+
+test "role assignment service code is exact and round trips through diagnostics" {
+    const t = std.testing;
+    try t.expectEqual(ServiceCode.RoleAssignmentNotFound, classifyServiceCode("RoleAssignmentNotFound"));
+    try t.expectEqual(ServiceCode.unknown, classifyServiceCode("roleassignmentnotfound"));
+    try t.expectEqual(ServiceCode.malformed, classifyServiceCode("RoleAssignmentNotFound?scope=other"));
+    try t.expectEqual(ServiceCode.conflicting, reconcileServiceCodes("RoleAssignmentNotFound", "ResourceNotFound"));
+    const diagnostic: Diagnostic = .{ .stage = .arm, .category = .not_found, .http_status = 404, .service_code = .RoleAssignmentNotFound };
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try diagnostic.write(&writer);
+    var document = try contracts.Document.parse(t.allocator, writer.buffered(), .{});
+    defer document.deinit();
+    try t.expectEqual(diagnostic, try Diagnostic.parse(document.value()));
 }

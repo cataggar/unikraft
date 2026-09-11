@@ -135,13 +135,13 @@ pub const Adapter = struct {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         for ([_]bool{ false, true }) |evidence_role| {
             const a = self.client.allocator;
-            const path = try rolePath(a, self.input, evidence_role);
+            const path = try rolePath(a, self.input, state.admitted_at, evidence_role);
             defer a.free(path);
             const properties = try roleProperties(a, self.input, principal, evidence_role);
             defer a.free(properties);
             if (!remove) {
                 var before = self.roleRequest(.GET, path, null) catch |err| {
-                    if (!absence(self.failure, false)) return err;
+                    if (!roleAbsent(self.failure)) return err;
                     var added = try self.roleRequest(.PUT, path, properties);
                     defer added.deinit();
                     if (added.status != 200 and added.status != 201) return error.RoleAssignmentFailed;
@@ -155,7 +155,7 @@ pub const Adapter = struct {
                 return error.RoleAlreadyExists;
             }
             var prior = self.roleRequest(.GET, path, null) catch |err| {
-                if (absence(self.failure, false)) {
+                if (roleAbsent(self.failure)) {
                     hash.update(path);
                     hash.update("absent");
                     continue;
@@ -170,7 +170,7 @@ pub const Adapter = struct {
             var gone = false;
             for (0..self.client.channel.budget.max_polls) |_| {
                 var observed = self.roleRequest(.GET, path, null) catch |err| {
-                    if (absence(self.failure, false)) {
+                    if (roleAbsent(self.failure)) {
                         gone = true;
                         break;
                     }
@@ -234,6 +234,10 @@ pub fn absence(failure: az.transport.Failure, group: bool) bool {
     return failure.diagnostic.http_status == 404 and failure.diagnostic.category == .not_found and
         (failure.diagnostic.service_code == .ResourceGroupNotFound or (!group and failure.diagnostic.service_code == .ResourceNotFound));
 }
+pub fn roleAbsent(failure: az.transport.Failure) bool {
+    return failure.diagnostic.http_status == 404 and failure.diagnostic.category == .not_found and
+        failure.diagnostic.service_code == .RoleAssignmentNotFound;
+}
 fn same(a: az.scope.Ref, b: az.scope.Ref) bool {
     return a.kind == b.kind and std.ascii.eqlIgnoreCase(a.name, b.name) and
         std.mem.eql(u8, a.parent orelse "", b.parent orelse "") and std.mem.eql(u8, a.gallery_image orelse "", b.gallery_image orelse "");
@@ -260,11 +264,11 @@ pub fn validateAgentless(input: *const c.Input, value: std.json.Value) !c.Uuid {
     return principal;
 }
 
-fn rolePath(a: std.mem.Allocator, input: *const c.Input, evidence_role: bool) ![]u8 {
+fn rolePath(a: std.mem.Allocator, input: *const c.Input, admitted_at: u64, evidence_role: bool) ![]u8 {
     const account = try input.approved.resources.storage.path(a, input.approved.authority);
     defer a.free(account);
     // Admission has already checked this container through the host contract.
-    var admission = try input.validate(a, input.approved.not_before);
+    var admission = try input.validate(a, admitted_at);
     defer admission.deinit();
     return std.fmt.allocPrint(a, "{s}/blobServices/default/containers/{s}/providers/Microsoft.Authorization/roleAssignments/{s}", .{ account, admission.container, if (evidence_role) input.approved.resources.evidence_role else input.approved.resources.input_role });
 }

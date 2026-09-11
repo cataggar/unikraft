@@ -19,6 +19,7 @@ pub const State = struct {
     input_sha256: p.Hash,
     preparation_sha256: p.Hash,
     authority_sha256: p.Hash,
+    admitted_at: u64,
     attempt: c.Uuid,
     public_nonce: c.Uuid,
     private_nonce: c.Uuid,
@@ -44,6 +45,9 @@ pub const State = struct {
     failures: core.diagnostics.Failures = .{},
 
     pub fn validate(self: State, input: *const c.Input) !void {
+        if (self.admitted_at < input.approved.not_before or self.admitted_at >= input.approved.expires_at)
+            return error.InvalidAdmissionTime;
+        if (self.started_at) |started| if (started < self.admitted_at) return error.InvalidAdmissionTime;
         if (self.owner_pid) |pid| if (pid <= 1) return error.InvalidState;
         if (!std.mem.eql(u8, self.schema, "uk-hyperv-preflight-state-v1") or self.kind != input.kind or
             !std.mem.eql(u8, &self.run_id, &input.approved.authority.owner_run) or
@@ -84,8 +88,8 @@ pub const Store = struct {
     recovery_only: bool = false,
 
     pub fn prepare(allocator: std.mem.Allocator, io: std.Io, lock: *core.private_files.Locked, input: *const c.Input, now: u64) !Store {
-        var admission = try input.validate(allocator, now);
-        defer admission.deinit();
+        var admitted = try input.validate(allocator, now);
+        defer admitted.deinit();
         const authority = try c.canonical(allocator, input.approved);
         defer allocator.free(authority);
         const preparation = try c.canonical(allocator, input.preparation);
@@ -97,20 +101,20 @@ pub const Store = struct {
             .input_sha256 = input.preparation.input_manifest_sha256,
             .preparation_sha256 = p.hash(preparation),
             .authority_sha256 = p.hash(authority),
+            .admitted_at = now,
             .attempt = randomUuid(io),
             .public_nonce = randomUuid(io),
             .private_nonce = randomUuid(io),
         } };
         try store.charge(authority.len, true);
-        const admitted = lock.createImmutable(io, "admitted-context.json", authority) catch |err| switch (err) {
+        const published = lock.createImmutable(io, "admitted-context.json", authority) catch |err| switch (err) {
             error.PathAlreadyExists => return error.AttemptConsumed,
             else => return err,
         };
-        try durable(admitted);
-        const bytes = try c.canonical(allocator, store.state);
+        try durable(published);
+        const bytes = try store.reserveStateCopies(1);
         defer allocator.free(bytes);
         try durable(try lock.createImmutable(io, "state.json", bytes));
-        try store.charge(bytes.len, true);
         try store.save();
         return store;
     }
@@ -140,6 +144,8 @@ pub const Store = struct {
         const admitted = try lock.directory.read(io, allocator, "admitted-context.json", c.max_state, state.authority_sha256);
         defer allocator.free(admitted);
         var store: Store = .{ .allocator = allocator, .io = io, .lock = lock, .input = input, .state = state, .recovery_only = recovery };
+        var validated = try store.admission();
+        defer validated.deinit();
         const consumed = lock.directory.read(io, allocator, "attempt-consumed.json", c.max_state, null) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
@@ -150,6 +156,7 @@ pub const Store = struct {
             defer claim.deinit();
             try claim.value.validate(input);
             if (claim.value.phase != .running or !std.mem.eql(u8, &claim.value.attempt, &state.attempt) or
+                claim.value.admitted_at != state.admitted_at or
                 !std.mem.eql(u8, &claim.value.authority_sha256, &state.authority_sha256) or
                 !std.mem.eql(u8, &claim.value.preparation_sha256, &state.preparation_sha256)) return error.InvalidIntent;
             if (state.phase == .prepared) {
@@ -225,20 +232,28 @@ pub const Store = struct {
     }
 
     pub fn save(self: *Store) !void {
+        const bytes = try self.reserveStateCopies(if (self.recovery_only) 1 else 2);
+        defer self.allocator.free(bytes);
+        try durable(self.lock.commit(self.io, "recovery.json", bytes) catch return error.RecordingFailed);
+        if (!self.recovery_only) try durable(self.lock.commit(self.io, "state.json", bytes) catch return error.RecordingFailed);
+    }
+    pub fn admission(self: *const Store) !p.Admission {
+        // Historical validation instant is independent of the live execution
+        // and cleanup authority clocks, which never renew this admission.
+        return self.input.validate(self.allocator, self.state.admitted_at);
+    }
+    fn reserveStateCopies(self: *Store, count: usize) ![]u8 {
         try self.state.validate(self.input);
         const before = self.state.spent;
         var accounted: usize = 0;
         for (0..6) |_| {
             const bytes = try c.canonical(self.allocator, self.state);
-            defer self.allocator.free(bytes);
-            const copies = (if (self.recovery_only) @as(usize, 1) else 2) * bytes.len;
+            errdefer self.allocator.free(bytes);
+            const copies = count * bytes.len;
             if (bytes.len > c.max_state or copies > self.input.approved.budget.controller.staged - before.staged or
                 copies > self.input.approved.budget.controller.control - before.control) return error.RecordingBudgetExceeded;
-            if (copies == accounted) {
-                try durable(self.lock.commit(self.io, "recovery.json", bytes) catch return error.RecordingFailed);
-                if (!self.recovery_only) try durable(self.lock.commit(self.io, "state.json", bytes) catch return error.RecordingFailed);
-                return;
-            }
+            if (copies == accounted) return bytes;
+            self.allocator.free(bytes);
             accounted = copies;
             self.state.spent = .{ .staged = before.staged + accounted, .control = before.control + accounted };
         }

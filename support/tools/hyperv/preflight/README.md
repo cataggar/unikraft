@@ -109,6 +109,26 @@ claim interruption before mutable publication also remains consumed.
 Primary, cleanup, and recording failures are separate. Cleanup cannot renew an
 expired attempt or erase prior uncertainty.
 
+The required `State.admitted_at` is the instant at which preparation actually
+validated the signed admission, not the beginning of its authority window.
+Normal loading, recovery, and native helper parsing revalidate that same
+instant; the consumed claim and signed completion bind it. Live execution and
+cleanup still enforce their own current authority deadlines. An admission
+issued after the authority window began is valid when prepared later, and
+expiration of execution does not disable independently authorized cleanup.
+There is no default or compatibility fallback for records missing this field.
+
+Initial serialized state is reserved before publication, including its own
+debit. Every later checkpoint reserves both recovery and state copies (only
+recovery during cleanup-only recovery). A preparation that exhausts its
+reservation leaves its already-published admission consumed, without publishing
+unreserved state or permitting reuse.
+
+Transfer effects and all worker failure lanes are retained immediately on
+worker return, before cwd restoration, capability removal, directory fsync,
+report validation, or serialization. Accepted/uncertain mutations cannot
+become not-started because one of those local operations fails.
+
 The run sequence performs metadata admission, owned group/deployment creation,
 host/inventory readback, access setup, public staging/publication/evidence,
 signed public acceptance, and only then private staging/publication/evidence.
@@ -136,6 +156,13 @@ replaced. Unprovable or extra resources retain cleanup obligations rather than
 being force-deleted. A 403 or unrecognized 404 is not absence; absence is not a
 successful DELETE or successful key rotation.
 
+Role assignment absence specifically requires HTTP 404 with the exact
+`RoleAssignmentNotFound` service code on the generated assignment scope.
+Generic resource/group absence codes are not accepted there. Revocation proof
+requires the exact old-capability 403 `AuthenticationFailed` rejection with no
+local cleanup or recording failure; that expected HTTP diagnostic cannot erase
+independent failure lanes.
+
 Local schemas are `uk-hyperv-preflight-state-v1`,
 `uk-hyperv-preflight-operation-v1`,
 `uk-hyperv-preflight-worker-result-v1`, and the signed
@@ -154,7 +181,8 @@ substituted-native, and synthetic receipts are not a handoff.
 ## Persistence consumer contract
 
 This describes the engine API introduced by commit
-`45088c9ffe6af2d387c3ab48f7e39f48e191cffc`. Persistence must use the actual
+`45088c9ffe6af2d387c3ab48f7e39f48e191cffc`, including the required original
+admission-time binding added during corrective review. Persistence must use the actual
 committed preparer and this loader through parent-integrated imports, not copy
 another lane's working sources or implement a receipt-compatibility parser.
 
@@ -202,6 +230,7 @@ module's canonical codec and typed loader rather than reconstructing them.
 | `intent-<action>.json` | `uk-hyperv-preflight-operation-v1`; exact action, consumed attempt, original run, authority digest, native implementation binding and retained debit. Missing or interrupted intents cannot qualify. |
 | `completion.json` | Envelope fields `body` and `signature`; body schema and Ed25519 signature domain both `uk-hyperv-preflight-completion-v1`. `completion_sha256` hashes the entire envelope bytes. |
 | Original authority | `authority_sha256 = SHA256(canonical(expected.approved))`; the private `admitted-context.json` must hash to it. This binds the original authority/resource/image/key/route/provider/budget context, not new persistence approvals. |
+| Original admission time | Required `State.admitted_at` lies in the original authority window, passes the signed admission parser, does not follow run start, and equals the consumed claim and signed completion body. |
 | Native source and artifacts | State `binding` equals `expected.preparation.binding`; `input_sha256` equals its validated input-manifest digest; `preparation_sha256 = SHA256(canonical(expected.preparation))`, including the exact paths, artifact descriptors and both manifests. |
 | Commands and acceptance | Existing `uk-hyperv-host-command-v1` and `uk-hyperv-public-acceptance-v1` signed contracts; exact original run/VM, distinct saved phase nonces, phase, manifest/image/runner hashes, artifact roles/names/sizes/hashes and derived Blob scope. The private acceptance binds the exact public command digest, public receipt digest, public nonce and host boot UUID. |
 | Host receipts and serial | Existing `uk-hyperv-host-evidence-v1`; production `qemu_kvm`, `PASS`, platform-only scope, matching command/manifest/runner/guest-image/host-image hashes. Exactly two public and four private launches, unique valid launch UUIDs across all six, continuous host boot UUID, required image/APIC order, exact serial lengths/hashes and reused serial-semantic assertions. |
@@ -209,7 +238,7 @@ module's canonical codec and typed loader rather than reconstructing them.
 
 The exact signed completion body fields are `schema`, `kind`, `attempt`,
 `run_id`, `binding`, `input_sha256`, `preparation_sha256`, `authority_sha256`,
-`public`, `private`, `group_absence`, `scope`, and `storage`. The final two wire
+`admitted_at`, `public`, `private`, `group_absence`, `scope`, and `storage`. The final two wire
 values are `"platform-only"` and `"UNAVAILABLE"`. The signature is 128
 lowercase hexadecimal characters encoding Ed25519's 64 signature bytes over
 `domain + "\n" + canonical(body)`; canonical body bytes include their final LF.
@@ -230,8 +259,9 @@ accepted mandatory mutations.
 
 The loader reopens both command files, both receipt files, and `boot-0.log`
 through `boot-5.log`; it does not accept receipt digests without those bytes.
-Commands/admission are evaluated at the recorded public/private evidence
-times. Public evidence cannot precede start, private evidence cannot precede
+Original admission is revalidated at `admitted_at`; phase commands/admission are
+also evaluated at the recorded public/private evidence times. Public evidence
+cannot precede start, private evidence cannot precede
 public evidence or reach attempt expiry, and the last operation observation
 must precede cleanup-authority expiry. This is offline verification of a
 completed native attempt, not a live Azure absence check, a refresh of expired

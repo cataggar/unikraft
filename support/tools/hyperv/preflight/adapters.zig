@@ -23,16 +23,18 @@ pub const Native = struct {
         return .{ .context = self, .controlFn = control, .stageFn = stage, .publishFn = publish, .fetchFn = fetch, .releaseFn = release, .failureFn = failure };
     }
     fn checked(self: *Native, action: c.Action) !arm.Adapter {
+        self.last = .{ .effect = .not_started, .diagnostic = .{ .stage = .admission, .category = .internal } };
         const approved = &self.store.input.approved;
         const now = self.arm_client.channel.budget.clock.unixSecondsFn(self.arm_client.channel.budget.clock.context);
         if (now <= 0) return error.InvalidClock;
         const expiry = if (action.cleanup()) approved.cleanup_expires_at else approved.expires_at;
-        if (now >= expiry) return error.AuthorityExpired;
+        if (now < approved.not_before or now >= expiry) return error.AuthorityExpired;
+        var admission = try self.store.admission();
+        defer admission.deinit();
         if (action.cleanup()) self.arm_client.token = self.cleanup_token;
         // Cleanup-capable authority must outlive the operation, not just its first HTTP read.
         const remaining: u32 = @intCast(approved.cleanup_expires_at - @as(u64, @intCast(now)));
         try self.arm_client.token.require(approved.authority, now, remaining);
-        self.last = .{ .effect = .not_started, .diagnostic = .{ .stage = .admission, .category = .internal } };
         return .{ .client = self.arm_client, .input = self.store.input };
     }
     fn control(context: *anyopaque, action: c.Action, state: *const j.State) !e.Proof {
@@ -90,7 +92,7 @@ pub const Native = struct {
                 try store.save();
                 var firewall = try api.execute(.{ .firewall = .{ .account = r.storage, .before_address = null, .address = input.approved.uploader_ipv4, .subnets = &.{r.subnet} } });
                 defer firewall.deinit();
-                var admission = try input.validate(store.allocator, input.approved.not_before);
+                var admission = try store.admission();
                 defer admission.deinit();
                 const account = try std.fmt.allocPrint(store.allocator, "https://{s}.blob.core.windows.net", .{r.storage.name});
                 defer store.allocator.free(account);
@@ -250,7 +252,7 @@ pub const Native = struct {
         const a = store.allocator;
         var sas = try store.lock.directory.readSensitive(store.io, a, "storage-capability", transfer.request.maximum_sas, null);
         defer sas.deinit();
-        var admission = try store.input.validate(a, store.input.approved.not_before);
+        var admission = try store.admission();
         defer admission.deinit();
         const account = try std.fmt.allocPrint(a, "https://{s}.blob.core.windows.net", .{admission.account});
         defer a.free(account);
@@ -264,9 +266,7 @@ pub const Native = struct {
         try store.charge(p.max_command, true);
         try store.save();
         const result = client.downloadBlob(.{ .account_url = account, .container = admission.container, .name = blob, .sas = sas.bytes() }, .{ .path = output, .maximum = p.max_command });
-        const failure_value = result.aggregateDiagnostic();
-        if (result.completion == .complete or failure_value.http_status != 403 or failure_value.service_code != .AuthenticationFailed)
-            return error.DataPlaneRevocationUnproved;
+        try self.storage_adapter.requireRevocation(result);
     }
     fn absentProof(self: *Native, action: c.Action) e.Proof {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});

@@ -79,7 +79,7 @@ test "role readback binds exact assignment id container scope principal definiti
     try t.expectError(error.RoleMismatch, pf.adapters.arm.validateRole(a, actual, wanted, path ++ "-other"));
 }
 
-const BlobWire = struct {
+pub const BlobWire = struct {
     mock: pf.sdk.http.MockTransport = .init(a, 201, ""),
     crypto: pf.sdk.crypto.StdCryptoProvider = .init(io),
     token: pf.sdk.http.CancellationToken = .{},
@@ -87,10 +87,10 @@ const BlobWire = struct {
     calls: usize = 0,
     downloads: usize = 0,
     status: ?u16 = null,
-    fn runtime(self: *BlobWire) pf.sdk.http.HttpRuntime {
+    pub fn runtime(self: *BlobWire) pf.sdk.http.HttpRuntime {
         return .init(.{ .context = self, .vtable = &.{ .send = forbidden, .open = open } }, self.crypto.asProvider());
     }
-    fn budget(self: *BlobWire) !pf.transfer.Budget {
+    pub fn budget(self: *BlobWire) !pf.transfer.Budget {
         return .{ .context = self, .nowMsFn = now, .deadline_ms = try now(self) + 300000, .cancellation = &self.token };
     }
     fn now(_: *anyopaque) !u64 {
@@ -120,7 +120,7 @@ const BlobWire = struct {
         return self.mock.asTransport().open(request, options);
     }
 };
-fn capability(store: *pf.journal.Store) !void {
+pub fn capability(store: *pf.journal.Store) !void {
     try store.immutable("storage-capability", "sv=2024-11-04&sp=rcw&sig=SYNTHETIC%2BONLY%3D", true);
     try store.save();
 }
@@ -217,24 +217,28 @@ test "partial native command upload preserves ambiguity and conflicting lengths 
     try t.expectError(error.FileNotFound, directory.value.openFile(io, "download-public-receipt"));
 }
 
+pub fn publicFiles(fixture: *f.Context) !void {
+    const scratch = fixture.arena.allocator();
+    const files = try scratch.dupe(c.File, fixture.input.preparation.files);
+    fixture.input.preparation.files = files;
+    try fixture.directory.dir.createDir(io, "qemu", .fromMode(0o700));
+    try fixture.directory.dir.createDir(io, "qemu/bin", .fromMode(0o700));
+    for (files[0..4]) |*file| {
+        const bytes = try scratch.alloc(u8, @intCast(file.artifact.size));
+        @memset(bytes, 0xa5);
+        file.artifact.sha256 = p.hash(bytes);
+        try fixture.directory.dir.writeFile(io, .{ .sub_path = file.artifact.name, .data = bytes, .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
+    }
+    fixture.input.preparation.public = try f.manifest(scratch, files, .public, fixture.input.preparation.binding.preparation);
+    fixture.input.preparation.private = try f.manifest(scratch, files, .private, fixture.input.preparation.binding.preparation);
+}
+
 test "merged native transfer worker stages public files once without a nested supervisor" {
     const directory = try helpers.Directory.create("native-stage");
     defer directory.deinit();
     var fixture = try f.Context.init(a, io, directory.value, directory.path);
     defer fixture.deinit();
-    const scratch = fixture.arena.allocator();
-    const files = try scratch.dupe(c.File, fixture.input.preparation.files);
-    fixture.input.preparation.files = files;
-    try directory.value.dir.createDir(io, "qemu", .fromMode(0o700));
-    try directory.value.dir.createDir(io, "qemu/bin", .fromMode(0o700));
-    for (files[0..4]) |*file| {
-        const bytes = try scratch.alloc(u8, @intCast(file.artifact.size));
-        @memset(bytes, 0xa5);
-        file.artifact.sha256 = p.hash(bytes);
-        try directory.value.dir.writeFile(io, .{ .sub_path = file.artifact.name, .data = bytes, .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
-    }
-    fixture.input.preparation.public = try f.manifest(scratch, files, .public, fixture.input.preparation.binding.preparation);
-    fixture.input.preparation.private = try f.manifest(scratch, files, .private, fixture.input.preparation.binding.preparation);
+    try publicFiles(&fixture);
     try helpers.prepare(&fixture);
     var lock = try directory.value.lock(io);
     defer lock.close(io);

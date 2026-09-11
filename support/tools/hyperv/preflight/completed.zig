@@ -52,6 +52,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, directory: core.private_fi
         .input_sha256 = state.input_sha256,
         .preparation_sha256 = state.preparation_sha256,
         .authority_sha256 = state.authority_sha256,
+        .admitted_at = state.admitted_at,
         .public = state.public.?,
         .private = state.private.?,
         .group_absence = state.actions[@intFromEnum(c.Action.prove_group_absent)].proof.?,

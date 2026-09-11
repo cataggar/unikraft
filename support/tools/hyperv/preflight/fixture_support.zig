@@ -144,6 +144,17 @@ pub const Context = struct {
         self.signer.deinit();
         self.arena.deinit();
     }
+    pub fn refreshAdmission(self: *Context, issued_at: u64) !void {
+        const a = self.arena.allocator();
+        var document = try pf.core.contracts.Document.parse(a, self.input.approved.signed_host_admission, .{ .bytes = p.max_command });
+        defer document.deinit();
+        var body = document.value().object.get("body").?;
+        const floor = try self.input.approved.budget.floor();
+        body.object.getPtr("issued_at").?.* = .{ .integer = @intCast(issued_at) };
+        body.object.getPtr("image_staging_bytes").?.* = .{ .integer = @intCast(floor.staged) };
+        body.object.getPtr("image_control_bytes").?.* = .{ .integer = @intCast(floor.control) };
+        self.input.approved.signed_host_admission = try sign(a, body, "uk-hyperv-image-admission-v1");
+    }
     pub fn backend(context: *anyopaque, _: *pf.journal.Store) !pf.engine.Backend {
         return .{ .context = context, .controlFn = control, .stageFn = stage, .publishFn = publish, .fetchFn = fetch, .releaseFn = release, .failureFn = failure };
     }
