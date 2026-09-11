@@ -208,6 +208,24 @@ allowlist for compiler flags and non-path tools such as `AR`, `NM`, `OBJCOPY`,
 Facade-managed, path, cleanup, configuration, and internal graph variables are
 rejected and must use dedicated facade options where available.
 
+On Linux, `-Dnative-make-environment=/absolute/private/environment.json`
+provides an opt-in machine-generated environment for private native producers.
+The file must be current-user-owned, single-link `0600` in a private `0700`
+directory. Its schema is `unikraft_native_make_environment_v1`, with required
+`bison_data`, `m4`, `shell`, `tmp`, `xdg_cache`, `xdg_config`,
+`zig_global_cache`, and `zig_local_cache` absolute canonical paths. JSON is
+compact, has sorted keys and exactly one final LF, and rejects unknown,
+duplicate, or missing fields. Tools and Bison data must already exist under
+trusted directory chains; cache/temp directories must already be private.
+This emits only fixed-name Make assignments, including `UMASK=0077`,
+`SHELL`/`CONFIG_SHELL`, `M4`, `BISON_PKGDATADIR`, and the explicit temp/cache
+paths. GNU Make propagates these command-line assignments to its children.
+It neither forwards arbitrary environment variables nor changes canonical
+passwd `HOME` or the stable facade lock. Without the option, behavior is
+unchanged. This is configuration plumbing, not tool/runtime admission or a
+Python-free isolation guarantee: callers must separately bind the exact
+contract, executable/runtime closure, source, and resulting artifacts.
+
 Make runs with a newly constructed environment rather than inheriting the
 caller's environment. Only the Make-safe canonical passwd `HOME`, a validated
 absolute-entry `PATH` (or `/usr/bin:/bin` fallback), and validated

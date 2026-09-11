@@ -177,7 +177,7 @@ pub fn readSensitiveAbsolute(io: std.Io, allocator: std.mem.Allocator, path: []c
     return (Directory{ .dir = parent.directory }).readSensitive(io, allocator, parent.name, maximum, expected);
 }
 
-fn openDirectory(io: std.Io, path: []const u8, policy: FilePolicy) !std.Io.Dir {
+pub fn openDirectory(io: std.Io, path: []const u8, policy: FilePolicy) !std.Io.Dir {
     if (!std.fs.path.isAbsolute(path) or path.len == 0 or path.len > 4095 or
         (path.len > 1 and path[path.len - 1] == '/')) return error.UnsafePath;
     var current = try std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false, .iterate = true });

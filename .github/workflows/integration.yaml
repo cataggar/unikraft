@@ -812,6 +812,41 @@ jobs:
           zig build -j2 test-build-tools "-Doutput=${root}/build" \
             --summary all
 
+    - name: Exercise explicit private native Make configuration
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-make-environment"
+        mkdir -p "${root}"/{tmp,cache,config,zig-local,zig-global}
+        for mode in Debug ReleaseSafe; do
+          zig build -j2 test-native-make-environment \
+            --cache-dir "${root}/tests" \
+            --global-cache-dir "${root}/zig-global" \
+            "-Doutput=${root}/test-build" "-Doptimize=${mode}" \
+            --summary all
+        done
+        printf '{"bison_data":"%s","m4":"%s","schema":"unikraft_native_make_environment_v1","shell":"%s","tmp":"%s","xdg_cache":"%s","xdg_config":"%s","zig_global_cache":"%s","zig_local_cache":"%s"}\n' \
+          "$(readlink -f "$(bison --print-datadir)")" \
+          "$(readlink -f "$(command -v m4)")" \
+          "$(readlink -f "$(command -v bash)")" \
+          "${root}/tmp" "${root}/cache" "${root}/config" \
+          "${root}/zig-global" "${root}/zig-local" > "${root}/environment.json"
+        cp support/apps/hyperv-acceptance/defconfig "${root}/input.config"
+        chmod 600 "${root}/input.config"
+        umask 022
+        zig build -j2 olddefconfig \
+          --cache-dir "${root}/zig-local" \
+          --global-cache-dir "${root}/zig-global" \
+          "-Dnative-make-environment=${root}/environment.json" \
+          "-Dapp=${GITHUB_WORKSPACE}/support/apps/hyperv-acceptance" \
+          "-Doutput=${root}/build" "-Dconfig=${root}/input.config" \
+          "-Dcompiler=zig cc -target x86_64-freestanding-none" \
+          -Dcompiler-targeted=true "-Dhost-cc=zig cc" "-Dhost-cxx=zig c++" \
+          -Dhost-cflags=-fno-sanitize=null
+        test "$(stat -c %a "${root}/input.config")" = 600
+        grep --fixed-strings --line-regexp --quiet \
+          CONFIG_APPHYPERVACCEPTANCE=y "${root}/input.config"
+
     - name: Run native Hyper-V object and ABI verifier fixtures
       run: |
         set -euo pipefail
