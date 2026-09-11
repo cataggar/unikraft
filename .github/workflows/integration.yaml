@@ -787,6 +787,10 @@ jobs:
           'import hyperv_private_preflight as p; p.sdk_dependency_contract()'
         echo "${venv}/bin" >> "${GITHUB_PATH}"
 
+    - name: Run native Hyper-V operator custody fixtures
+      run: |
+        bash support/tools/hyperv/operator_guard/ci-fixtures.sh
+
     - name: Build pinned miz EFI application tooling
       run: |
         set -euo pipefail
@@ -1293,6 +1297,9 @@ jobs:
       with:
         name: zig-hyperv-local-evidence
         path: |
+          ${{ runner.temp }}/hyperv-ci/native-operator-guard/baseline.log
+          ${{ runner.temp }}/hyperv-ci/native-operator-guard/namespace-denial.log
+          ${{ runner.temp }}/hyperv-ci/native-operator-guard/fixture-sha256.txt
           ${{ runner.temp }}/hyperv-ci/image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-disk-sha256.txt
