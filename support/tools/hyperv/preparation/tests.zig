@@ -774,6 +774,11 @@ test "native immutable copy rejects escaped symlink parents stale hashes deadlin
     try expectAbsent(source.dir, "no-write");
     try output.deleteFile(io, "escape");
     try output.createDir(io, "public-parent", .fromMode(0o755));
+    {
+        const public_parent = try output.openDir(io, "public-parent", .{ .follow_symlinks = false, .iterate = true });
+        defer public_parent.close(io);
+        try public_parent.setPermissions(io, .fromMode(0o755));
+    }
     try std.testing.expectError(error.UnsafeFile, fs.copyImmutable(allocator, io, &lock, source, original, "public-parent/no-write", deadline));
     try expectAbsent(output, "public-parent/no-write");
     try output.deleteDir(io, "public-parent");
