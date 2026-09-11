@@ -253,7 +253,7 @@ test "Origin pinned signature binds exact signature bytes key verification and f
     const verification: o.SignatureVerification = .{
         .schema = .hyperv_origin_signature_verification_v1,
         .subject_sha256 = try o.hash(a, artifact.subject),
-        .signed_bytes_sha256 = signature.sha256,
+        .signed_bytes_sha256 = artifact.subject.artifact_sha256,
         .key_id = "independently-selected-fixture-key",
         .verifier = .{ .name = "synthetic", .version = "fixture", .executable_sha256 = c.digest("synthetic verifier"), .transcript = transcript },
     };
@@ -267,6 +267,15 @@ test "Origin pinned signature binds exact signature bytes key verification and f
     data.policy().authentication_sha256 = try o.hash(a, artifact.authentication);
     try data.rebind(&.{artifact});
     try data.validate();
+    for ([_]c.Sha{ signature.sha256, c.digest("another artifact") }, 0..) |wrong_digest, i| {
+        var wrong_verification = verification;
+        wrong_verification.signed_bytes_sha256 = wrong_digest;
+        var wrong_artifact = artifact;
+        wrong_artifact.authentication.pinned_key_signature.verification = try fixture.write(a, std.testing.io, evidence, try std.fmt.allocPrint(a, "wrong-signed-input-{d}.json", .{i}), try c.canonical(a, wrong_verification));
+        data.policy().authentication_sha256 = try o.hash(a, wrong_artifact.authentication);
+        try data.rebind(&.{wrong_artifact});
+        try std.testing.expectError(error.WrongSubject, data.validate());
+    }
     var wrong = artifact;
     wrong.authentication.pinned_key_signature.key_id = "self-selected-key";
     data.policy().authentication_sha256 = try o.hash(a, wrong.authentication);
@@ -440,6 +449,35 @@ test "Origin Zig package singleton aggregate manifest pins roots and complete co
     try std.testing.expectError(error.PackageRootMismatch, (rt.Bound{ .directory = aggregate, .contract = tool }).validate(a, io));
     const nested = ".{ .dependencies = .{ .data = .{ .fake = .{ .url = \"https://synthetic.invalid/archive/7d70ce8.tar.gz\", .hash = \"pkg-pinned\" } } } }\n";
     try std.testing.expectError(error.InvalidPackageDeclaration, o.requirePackageDeclaration(a, nested, packages[0]));
+}
+
+test "Origin package declarations require literal ZON throughout without duplicate fields or expressions" {
+    const a = std.testing.allocator;
+    var package = fixture.shapePackage().payload.zig_packages.packages[0];
+    package.declaration.entry = "data";
+    package.locator = "https://synthetic.invalid/archive/r";
+    package.package_hash = "pkg-pinned";
+    const pin = ".{ .url = \"https://synthetic.invalid/archive/r\", .hash = \"pkg-pinned\" }";
+    const dependencies = ".{ .data = " ++ pin ++ " }";
+    const manifest = ".{ .dependencies = " ++ dependencies ++ " }";
+    try o.requirePackageDeclaration(a, manifest, package);
+    try o.requirePackageDeclaration(a, ".{ .name = .example, .dependencies = .{ .@\"data\" = .{ .@\"url\" = \"https://synthetic.invalid/archive/r\", .hash = \"pkg-pinned\", .lazy = false } }, .paths = .{ \"src\", \"build.zig.zon\" } }", package);
+    for ([_][]const u8{
+        "ignored(" ++ manifest ++ ")",
+        ".{ .dependencies = ignored(" ++ dependencies ++ ") }",
+        ".{ .dependencies = .{ .data = ignored(" ++ pin ++ ") } }",
+        ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/r\" ++ \"suffix\", .hash = \"pkg-pinned\" } } }",
+        ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/r\", .hash = ignored(\"pkg-pinned\") } } }",
+        ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/r\", .hash = \"pkg-pinned\", .lazy = true and false } } }",
+        ".{ .dependencies = " ++ dependencies ++ ", .dependencies = " ++ dependencies ++ " }",
+        ".{ .dependencies = .{ .data = " ++ pin ++ ", .data = " ++ pin ++ " } }",
+        ".{ .dependencies = .{ .data = " ++ pin ++ ", .other = .{ .path = \"one\" }, .other = .{ .path = \"two\" } } }",
+        ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/r\", .url = \"https://synthetic.invalid/archive/r\", .hash = \"pkg-pinned\" } } }",
+        ".{ .dependencies = .{ .data = " ++ pin ++ ", .other = ignored(.{ .path = \"one\" }) } }",
+        ".{ .dependencies = .{ .data = " ++ pin ++ ", .other = null } }",
+        ".{ .nested = " ++ manifest ++ " }",
+        ".{ " ++ manifest ++ " }",
+    }) |bytes| try std.testing.expectError(error.InvalidPackageDeclaration, o.requirePackageDeclaration(a, bytes, package));
 }
 
 test "Origin unchanged member maps cannot borrow a proof or omit overlap escape or change selected bytes" {

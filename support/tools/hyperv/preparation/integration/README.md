@@ -597,16 +597,16 @@ match the Build section, with that fresh scratch root.
 ## Origin epoch execution record
 
 The 2026-09-11 Origin repair passed **18/18 integration fixtures and 8/8 steps
-in both Debug and ReleaseSafe**, alongside 92/92 preparation and 19/19
+in both Debug and ReleaseSafe**, alongside 93/93 preparation and 19/19
 namespace fixtures in both modes, all with `-j2`. Runtime-review tests reject
 the absence of a separate pre-bootstrap review even when a later phase review
 exists, and independently mutate roles/targets/executables, physical
 identities, spec bytes and required authority policies. No full material
 bootstrap or producer was run.
 
-Current measured ReleaseSafe integration files are **2,228,192 bytes** for
-`uk-hyperv-prepare-integration` and **926,920 bytes** for its helper:
-**3,155,112 bytes combined**. Debug files are 12,866,576 and 7,564,984 bytes.
+Current measured ReleaseSafe integration files are **2,311,568 bytes** for
+`uk-hyperv-prepare-integration` and **1,011,912 bytes** for its helper:
+**3,323,480 bytes combined**. Debug files are 13,466,168 and 8,168,400 bytes.
 These are actual installed-file measurements, not compressed estimates,
 historical pair sizes or a complete ledger. Exact six focused commands,
 environment, logs, physical-identity checks, hashes, other installed sizes

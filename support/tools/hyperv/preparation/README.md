@@ -317,7 +317,10 @@ it against the **separately supplied** review, then remeasures the entire
 material before the first supplied Git/loader invocation.
 
 `hyperv_origin_signature_verification_v1` binds `subject_sha256`,
-`signed_bytes_sha256`, `key_id` and `verifier`.
+`signed_bytes_sha256`, `key_id` and `verifier`. The signed-input digest is the
+artifact digest for a detached signature and the metadata digest for signed
+repository metadata; it is never the detached signature file's digest. The
+signature file is independently retained and bound by the authentication witness.
 `hyperv_origin_https_acquisition_v1` binds `subject_sha256`, raw
 `metadata_sha256`, URL, TLS peer name/certificate SHA256, acquisition time and
 retained transport-evidence file.
@@ -354,9 +357,10 @@ Native relocation comparison executes no installer hooks.
 
 Package declarations bind `{directory,file,entry}`: an actual
 `build.zig.zon` in the selected source or another selected package, its exact
-file bytes and named dependency entry. Native bounded ZON AST/token parsing
-checks literal URL/hash/lazy declarations without executing a manifest or root
-build. Revision is explicitly `git_commit` (full commit) or `archive_selector`
+file bytes and named dependency entry. Native bounded ZON AST generation and
+literal-value validation reject expressions and duplicate fields throughout the
+manifest, then check literal URL/hash/lazy declarations without executing a
+manifest or root build. Revision is explicitly `git_commit` (full commit) or `archive_selector`
 (possibly short, such as progrez's `7d70ce8`); Zig keys are never decoded as
 upstream SHA256. Singleton/aggregate lists, hash basenames, declarations,
 locators and complete dependency bindings must agree.
@@ -719,7 +723,7 @@ control copies still require measurement and charging inside both caps.
 ### Origin repair execution record, 2026-09-11
 
 On the AArch64 owned `fleet-origin` worktree, Zig 0.16.0 focused runs passed
-**92/92 preparation, 19/19 namespace and 18/18 integration fixtures in each
+**93/93 preparation, 19/19 namespace and 18/18 integration fixtures in each
 of Debug and ReleaseSafe**, without skips. Build-step totals were 10/10,
 11/11 and 8/8 respectively. The 5-second Git timeout/readiness assertion,
 ordinary fixture credentials, actual passwd HOME and canonical facade/lock
@@ -727,7 +731,9 @@ device/inode/ownership/modes were retained. No AppArmor/credential changes,
 acquisition, dependency restore or full producer/Make/guest execution occurred.
 
 Exact command wrappers, environment, complete six logs, all twelve installed
-component sizes/SHA256s and before/after identity records are retained under:
+component sizes/SHA256s and before/after identity records are retained under
+the following directory. The final review-correction runs and remeasurements
+use its `review-*` filenames:
 
 ```text
 /d/unikraft-worktrees/fleet-origin/.d/zig-migration-origin-repair/run-20260911-1/
@@ -755,15 +761,15 @@ Measured installed executable bytes (not a ledger):
 | Installation | Executable | Debug | ReleaseSafe |
 | --- | --- | ---: | ---: |
 | preparation | `uk-hyperv-prepare` | 8,716,624 | 1,139,000 |
-| preparation | `preparation-namespace` | 7,564,984 | 926,920 |
-| integration | `uk-hyperv-prepare-integration` | 12,866,576 | 2,228,192 |
-| integration | `preparation-namespace` | 7,564,984 | 926,920 |
-| namespace fixtures | `preparation-namespace` | 7,564,984 | 6,584,672 |
-| namespace fixtures | `preparation-namespace-fixture` | 7,455,192 | 6,555,776 |
+| preparation | `preparation-namespace` | 8,168,400 | 1,011,912 |
+| integration | `uk-hyperv-prepare-integration` | 13,466,168 | 2,311,568 |
+| integration | `preparation-namespace` | 8,168,400 | 1,011,912 |
+| namespace fixtures | `preparation-namespace` | 8,168,400 | 7,114,664 |
+| namespace fixtures | `preparation-namespace-fixture` | 8,046,920 | 7,072,024 |
 
 The namespace fixture build retains its existing unstripped output policy.
 Its files are not substitutes for the stripped production helper. The current
-ReleaseSafe integration driver/helper pair is **3,155,112 bytes**, not the
+ReleaseSafe integration driver/helper pair is **3,323,480 bytes**, not the
 historical 2,598,000-byte pair and not evidence of complete controller fit.
 Every additional control, support/evidence file and physical copy remains
 chargeable under the unchanged 8 MiB/256 MiB caps.

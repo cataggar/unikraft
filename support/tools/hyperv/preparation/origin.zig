@@ -346,13 +346,17 @@ fn authentication(allocator: std.mem.Allocator, io: std.Io, directory: fs.Direct
             } else {
                 if (!std.mem.eql(u8, auth.key_id, authority.key_id)) return error.WrongAuthority;
                 try text(auth.key_id);
-                const signed = if (comptime tag == .pinned_key_signature) auth.signature else auth.metadata;
-                try retained(allocator, io, directory, signed);
+                const witness = if (comptime tag == .pinned_key_signature) auth.signature else auth.metadata;
+                try retained(allocator, io, directory, witness);
+                const signed_bytes_sha256 = if (comptime tag == .pinned_key_signature)
+                    artifact.subject.artifact_sha256
+                else
+                    auth.metadata.sha256;
                 if (comptime tag == .signed_repository_metadata)
                     try retained(allocator, io, directory, auth.index);
                 const verified = try document(SignatureVerification, allocator, io, directory, auth.verification);
                 if (!std.meta.eql(verified.subject_sha256, try hash(allocator, artifact.subject)) or
-                    !std.meta.eql(verified.signed_bytes_sha256, signed.sha256) or
+                    !std.meta.eql(verified.signed_bytes_sha256, signed_bytes_sha256) or
                     !std.mem.eql(u8, verified.key_id, auth.key_id)) return error.WrongSubject;
                 try verifier(allocator, io, directory, verified.verifier);
             }
@@ -581,7 +585,7 @@ pub fn requirePhysical(allocator: std.mem.Allocator, io: std.Io, root: fs.Direct
     }
 }
 
-/// Parse the ZON AST only. No manifest or root build is executed.
+/// Parse and validate literal ZON. No manifest or root build is executed.
 pub fn requirePackageDeclaration(backing_allocator: std.mem.Allocator, bytes: []const u8, package: Package) !void {
     if (bytes.len > 4 * 1024 * 1024) return error.LimitExceeded;
     var arena = std.heap.ArenaAllocator.init(backing_allocator);
@@ -589,16 +593,16 @@ pub fn requirePackageDeclaration(backing_allocator: std.mem.Allocator, bytes: []
     const allocator = arena.allocator();
     const terminated = try allocator.dupeZ(u8, bytes);
     defer allocator.free(terminated);
-    // ZON is restricted here to literal named struct fields. Token boundaries
-    // prevent comments, strings, or unrelated dependency entries granting pins.
+    // Bound work before parsing; ZonGen then rejects non-ZON expressions and
+    // duplicate fields throughout the entire manifest, not just the selected pin.
     var tokenizer = std.zig.Tokenizer.init(terminated);
-    var tokens: std.ArrayList(std.zig.Token) = .empty;
-    defer tokens.deinit(allocator);
+    var token_count: usize = 0;
     var nesting: usize = 0;
     while (true) {
         const token = tokenizer.next();
         if (token.tag == .eof) break;
-        if (tokens.items.len >= 65536 or token.loc.end - token.loc.start > 8192) return error.LimitExceeded;
+        if (token_count >= 65536 or token.loc.end - token.loc.start > 8192) return error.LimitExceeded;
+        token_count += 1;
         switch (token.tag) {
             .l_brace, .l_paren, .l_bracket => {
                 nesting += 1;
@@ -610,69 +614,36 @@ pub fn requirePackageDeclaration(backing_allocator: std.mem.Allocator, bytes: []
             },
             else => {},
         }
-        try tokens.append(allocator, token);
     }
     var ast = try std.zig.Ast.parse(allocator, terminated, .zon);
     defer ast.deinit(allocator);
     if (ast.errors.len != 0) return error.InvalidPackageDeclaration;
-    const list = tokens.items;
-    var dependencies: ?usize = null;
-    var depth: usize = 0;
-    for (list, 0..) |token, i| {
-        if (token.tag == .l_brace) depth += 1;
-        if (token.tag == .r_brace) depth -= 1;
-        if (depth == 1 and token.tag == .identifier and std.mem.eql(u8, bytes[token.loc.start..token.loc.end], "dependencies")) {
-            if (dependencies != null or i + 3 >= list.len or list[i + 1].tag != .equal or list[i + 2].tag != .period or list[i + 3].tag != .l_brace)
-                return error.InvalidPackageDeclaration;
-            dependencies = i + 4;
-        }
+    const zoir = try std.zig.ZonGen.generate(allocator, ast, .{});
+    defer zoir.deinit(allocator);
+    if (zoir.hasCompileErrors()) return error.InvalidPackageDeclaration;
+    if (zoir.nodes.len > 4096) return error.LimitExceeded;
+    const root = std.zig.Zoir.Node.Index.root.get(zoir);
+    if (root != .struct_literal) return error.InvalidPackageDeclaration;
+    var dependencies: ?std.zig.Zoir.Node = null;
+    for (root.struct_literal.names, 0..) |name, i| {
+        if (std.mem.eql(u8, name.get(zoir), "dependencies"))
+            dependencies = root.struct_literal.vals.at(@intCast(i)).get(zoir);
     }
-    var i = dependencies orelse return error.InvalidPackageDeclaration;
-    depth = 0;
+    const list = dependencies orelse return error.InvalidPackageDeclaration;
+    if (list != .struct_literal) return error.InvalidPackageDeclaration;
     var found = false;
-    while (i < list.len) : (i += 1) {
-        const token = list[i];
-        if (token.tag == .r_brace and depth == 0) break;
-        if (token.tag == .l_brace) depth += 1;
-        if (token.tag == .r_brace) depth -= 1;
-        if (depth != 0 or token.tag != .identifier or !std.mem.eql(u8, bytes[token.loc.start..token.loc.end], package.declaration.entry)) continue;
-        if (found or i + 3 >= list.len or list[i + 1].tag != .equal or list[i + 2].tag != .period or list[i + 3].tag != .l_brace)
-            return error.InvalidPackageDeclaration;
+    for (list.struct_literal.names, 0..) |name, i| {
+        const node = list.struct_literal.vals.at(@intCast(i));
+        if (node.get(zoir) != .struct_literal) return error.InvalidPackageDeclaration;
+        if (!std.mem.eql(u8, name.get(zoir), package.declaration.entry)) continue;
         found = true;
-        var url: ?[]const u8 = null;
-        var pin: ?[]const u8 = null;
-        var lazy = false;
-        var j = i + 4;
-        var inner_depth: usize = 0;
-        while (j < list.len and list[j].tag != .r_brace) : (j += 1) {
-            if (list[j].tag == .l_brace) inner_depth += 1;
-            if (inner_depth != 0) return error.InvalidPackageDeclaration;
-            if (list[j].tag != .identifier) continue;
-            const name = bytes[list[j].loc.start..list[j].loc.end];
-            if (std.mem.eql(u8, name, "lazy")) {
-                if (lazy or j + 2 >= list.len or list[j + 1].tag != .equal or list[j + 2].tag != .identifier)
-                    return error.InvalidPackageDeclaration;
-                const boolean = bytes[list[j + 2].loc.start..list[j + 2].loc.end];
-                if (!std.mem.eql(u8, boolean, "true") and !std.mem.eql(u8, boolean, "false")) return error.InvalidPackageDeclaration;
-                lazy = true;
-                j += 2;
-                continue;
-            }
-            if (!std.mem.eql(u8, name, "url") and !std.mem.eql(u8, name, "hash")) return error.InvalidPackageDeclaration;
-            if (j + 2 >= list.len or list[j + 1].tag != .equal or list[j + 2].tag != .string_literal)
-                return error.InvalidPackageDeclaration;
-            const literal = list[j + 2];
-            const parsed = try std.zig.string_literal.parseAlloc(allocator, bytes[literal.loc.start..literal.loc.end]);
-            if (std.mem.eql(u8, name, "url")) {
-                if (url != null) return error.InvalidPackageDeclaration;
-                url = parsed;
-            } else {
-                if (pin != null) return error.InvalidPackageDeclaration;
-                pin = parsed;
-            }
-        }
-        if (!std.mem.eql(u8, url orelse return error.InvalidPackageDeclaration, package.locator) or
-            !std.mem.eql(u8, pin orelse return error.InvalidPackageDeclaration, package.package_hash)) return error.InvalidPackageDeclaration;
+        const Pin = struct { url: []const u8, hash: []const u8, lazy: bool = false };
+        const pin = std.zon.parse.fromZoirNodeAlloc(Pin, allocator, ast, zoir, node, null, .{}) catch |err| switch (err) {
+            error.ParseZon => return error.InvalidPackageDeclaration,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, pin.url, package.locator) or
+            !std.mem.eql(u8, pin.hash, package.package_hash)) return error.InvalidPackageDeclaration;
     }
     if (!found) return error.InvalidPackageDeclaration;
 }
