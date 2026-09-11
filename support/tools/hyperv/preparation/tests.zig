@@ -904,6 +904,72 @@ test "physical control accounting requires every runtime file without library su
     try std.testing.expectError(error.ControlLimitExceeded, inputs.requireControlBinding(a, io, plan, &bindings, oversized));
 }
 
+test "merged native proof root builder and CLI are physically bound without running a root build" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const reference = try fs.Directory.open(a, io, @import("test_options").proof_fixture);
+    defer reference.close(a, io);
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    try fixture.dir.createDirPath(io, "support/build");
+    const directory: fs.Directory = .{ .dir = fixture.dir, .path = try fixture.dir.realPathFileAlloc(io, ".", a) };
+    const names = [_][]const u8{ "build.zig", "support/build/hyperv-proof-build.zig", "support/build/hyperv-proof-tool.zig" };
+    var contents: [3][]const u8 = undefined;
+    var records: [3]c.File = undefined;
+    for (names, 0..) |name, i| {
+        contents[i] = try reference.read(a, io, name, 1024 * 1024, .source);
+        try writeFixture(fixture.dir, name, contents[i], 0o600);
+        records[i] = try directory.record(a, io, name, 1024 * 1024, .source);
+    }
+    // Only selection/physical-file fixtures: no source review or execution
+    // admission is conferred by this synthetic Source record.
+    const observed = (try shapeChain(a))[0].receipt.source_before;
+    const proof: producer.NativeProof = .{
+        .schema = .hyperv_native_elf_proofs_v2,
+        .source_sha256 = observed.tree_sha256,
+        .root_build = records[0],
+        .builder = records[1],
+        .tool = records[2],
+        .modes = .{ .smp, .irq, .drivers },
+    };
+    try producer.requireNativeProofFiles(a, io, directory, observed, proof);
+    const encoded = try c.canonical(a, proof);
+    const parsed = try c.parse(producer.NativeProof, a, encoded);
+    defer parsed.deinit();
+    const legacy = try replaceOnce(a, encoded, "hyperv_native_elf_proofs_v2", "hyperv_native_elf_proofs_v1");
+    try std.testing.expectError(error.InvalidEnum, c.parse(producer.NativeProof, a, legacy));
+
+    const mutations = [_]struct { index: usize, old: []const u8, new: []const u8 }{
+        .{ .index = 0, .old = "gate.step.dependOn(&driver_check.step);", .new = "// gate.step.dependOn(&driver_check.step);" },
+        .{ .index = 0, .old = "hyperv_proof_build.tool(b, b.path(\".\"))", .new = "hyperv_proof_build.tool(b, b.path(\"substituted\"))" },
+        .{ .index = 0, .old = "check.addArgs(&.{ \"smp\", \"--image\" });", .new = "check.addArgs(&.{ \"drivers\", \"--image\" });" },
+        .{ .index = 1, .old = "\"support/build/hyperv-proof-tool.zig\", b.graph.host, .ReleaseSafe", .new = "\"support/build/hyperv-proof-tool.zig\", b.graph.host, .Debug" },
+        .{ .index = 1, .old = "drivers/hyperv/vmbus/vmbus_protocol.zig", .new = "drivers/hyperv/vmbus/unselected.zig" },
+        .{ .index = 2, .old = "try proofs.drivers(model, required.items, diagnostic);", .new = "// try proofs.drivers(model, required.items, diagnostic);" },
+    };
+    for (mutations) |mutation| {
+        const changed = try replaceOnce(a, contents[mutation.index], mutation.old, mutation.new);
+        try writeFixture(fixture.dir, names[mutation.index], changed, 0o600);
+        try std.testing.expectError(if (mutation.index == 0) error.UnreviewedInput else error.HashMismatch, producer.requireNativeProofFiles(a, io, directory, observed, proof));
+        const record = try directory.record(a, io, names[mutation.index], 1024 * 1024, .source);
+        var changed_proof = proof;
+        switch (mutation.index) {
+            0 => changed_proof.root_build = record,
+            1 => changed_proof.builder = record,
+            2 => changed_proof.tool = record,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.DependencyUnavailable, producer.requireNativeProofFiles(a, io, directory, observed, changed_proof));
+        try writeFixture(fixture.dir, names[mutation.index], contents[mutation.index], 0o600);
+    }
+    try fixture.dir.deleteFile(io, names[2]);
+    try fixture.dir.symLink(io, "hyperv-proof-build.zig", names[2], .{});
+    try std.testing.expectError(error.UnsafeFile, producer.requireNativeProofFiles(a, io, directory, observed, proof));
+}
+
 test "read-only entry never creates missing state or adopts v1 partial staging or a held writer" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

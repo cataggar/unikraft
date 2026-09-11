@@ -57,6 +57,8 @@ pub fn build(b: *std.Build) void {
         .imports = imports,
     }) });
     const options = b.addOptions();
+    options.addOption([]const u8, "proof_fixture", b.option([]const u8, "proof-fixture", "Explicit directory containing reviewed native proof source fixtures") orelse
+        (std.fs.path.resolve(b.allocator, &.{ b.build_root.path.?, "../../../.." }) catch @panic("cannot resolve proof fixture root")));
     options.addOption(?[]const u8, "git_executable", b.option([]const u8, "git-executable", "Explicit public native Git fixture executable"));
     options.addOption(?[]const u8, "git_loader", b.option([]const u8, "git-loader", "Explicit public native Git fixture ELF interpreter"));
     options.addOption(?[]const []const u8, "git_libraries", b.option([]const []const u8, "git-library", "Explicit public Git fixture library; repeat for the complete closure"));

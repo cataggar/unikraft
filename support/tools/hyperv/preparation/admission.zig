@@ -299,10 +299,7 @@ fn verifyStoredBinding(allocator: std.mem.Allocator, io: std.Io, bytes: []const 
     if (execution.git_entry_source) |file|
         try fs.requireFile(try repository.record(allocator, io, file.path, 1024 * 1024, .source), file);
     if (needs_proof) {
-        const root = try repository.read(allocator, io, "build.zig", 1024 * 1024, .source);
-        try producer.requireNativeProof(allocator, root, binding.source, binding.native_proof);
-        for (binding.native_proof.?.inputs) |proof|
-            try fs.requireFile(try repository.record(allocator, io, proof.file.path, 1024 * 1024, .source), proof.file);
+        try producer.requireNativeProofFiles(allocator, io, repository, binding.source, binding.native_proof);
     }
     if (!std.meta.eql(execution.source_sha256, binding.source.tree_sha256) or
         !std.mem.eql(u8, execution.compiler_version, c.compiler_version)) return error.UnreviewedInput;

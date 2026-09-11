@@ -199,15 +199,16 @@ pub const Tools = struct {
 };
 
 pub const ProofKind = enum { smp, irq, drivers };
-pub const ProofInput = struct { kind: ProofKind, file: c.File };
 
 /// No current approval is built in. The independent expected binding must
 /// include this attestation and the exact reviewed root-build/source hashes.
 pub const NativeProof = struct {
-    schema: enum { hyperv_native_elf_proofs_v1 },
+    schema: enum { hyperv_native_elf_proofs_v2 },
     source_sha256: c.Sha,
     root_build: c.File,
-    inputs: [3]ProofInput,
+    builder: c.File,
+    tool: c.File,
+    modes: [3]ProofKind,
 };
 
 pub const NativeExecution = struct {
@@ -675,8 +676,43 @@ fn nativeSourceFile(record: c.File) !void {
     _ = try c.sha(&record.sha256);
 }
 
+fn requireSequences(allocator: std.mem.Allocator, source_text: []const u8, sequences: []const [:0]const u8) !void {
+    if (source_text.len > 1024 * 1024) return error.LimitExceeded;
+    const text = try allocator.dupeZ(u8, source_text);
+    defer allocator.free(text);
+    var tokens: std.ArrayList(std.zig.Token) = .empty;
+    defer tokens.deinit(allocator);
+    var tokenizer = std.zig.Tokenizer.init(text);
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) break;
+        if (token.tag == .invalid) return error.DependencyUnavailable;
+        if (tokens.items.len == 65536) return error.LimitExceeded;
+        try tokens.append(allocator, token);
+    }
+    for (sequences) |sequence| {
+        var matches: usize = 0;
+        for (0..tokens.items.len) |start| {
+            var expected = std.zig.Tokenizer.init(sequence);
+            var index = start;
+            while (true) : (index += 1) {
+                const wanted = expected.next();
+                if (wanted.tag == .eof) {
+                    matches += 1;
+                    break;
+                }
+                if (index == tokens.items.len) break;
+                const actual = tokens.items[index];
+                if (actual.tag != wanted.tag or
+                    !std.mem.eql(u8, text[actual.loc.start..actual.loc.end], sequence[wanted.loc.start..wanted.loc.end])) break;
+            }
+        }
+        if (matches != 1) return error.DependencyUnavailable;
+    }
+}
+
 pub fn requireNativeProof(allocator: std.mem.Allocator, root_build: []const u8, expected_source: c.Source, proof: ?NativeProof) !void {
-    // Deliberately first: callers cannot bless the current Python gate by
+    // Deliberately first: callers cannot bless a selected Python gate by
     // submitting a purported native attestation.
     try rejectLegacyProofs(allocator, root_build);
     const native = proof orelse return error.DependencyUnavailable;
@@ -685,30 +721,81 @@ pub fn requireNativeProof(allocator: std.mem.Allocator, root_build: []const u8, 
         !std.crypto.timing_safe.eql(c.Sha, native.root_build.sha256, c.digest(root_build)) or
         !std.crypto.timing_safe.eql(c.Sha, native.source_sha256, expected_source.tree_sha256))
         return error.UnreviewedInput;
+    try nativeSourceFile(native.builder);
+    try nativeSourceFile(native.tool);
+    if (!std.mem.eql(u8, native.builder.path, "support/build/hyperv-proof-build.zig") or
+        !std.mem.eql(u8, native.tool.path, "support/build/hyperv-proof-tool.zig")) return error.DependencyUnavailable;
+    for (native.modes, 0..) |mode, index|
+        if (@intFromEnum(mode) != index) return error.DependencyUnavailable;
+    try requireSequences(allocator, root_build, &.{
+        \\const hyperv_proof_build = @import("support/build/hyperv-proof-build.zig");
+    });
     const body = try functionBody(allocator, root_build, "finishNativeImages");
-    for (native.inputs, 0..) |input, index| {
-        if (@intFromEnum(input.kind) != index) return error.DependencyUnavailable;
-        try nativeSourceFile(input.file);
-        if (!std.mem.startsWith(u8, input.file.path, "support/build/")) return error.DependencyUnavailable;
-        for (native.inputs[0..index]) |previous| if (std.mem.eql(u8, input.file.path, previous.file.path))
-            return error.DependencyUnavailable;
-        var selected = false;
-        var tokenizer = std.zig.Tokenizer.init(body);
-        while (true) {
-            const token = tokenizer.next();
-            if (token.tag == .eof) break;
-            if (token.tag != .string_literal) continue;
-            const value = std.zig.string_literal.parseAlloc(allocator, body[token.loc.start..token.loc.end]) catch
-                return error.DependencyUnavailable;
-            selected = selected or std.mem.eql(u8, value, input.file.path);
-        }
-        if (!selected) return error.DependencyUnavailable;
-    }
+    try requireSequences(allocator, body, &.{
+        \\const proof_tool = hyperv_proof_build.tool(b, b.path("."));
+        ,
+        \\const check = b.addRunArtifact(proof_tool);
+        \\check.addArgs(&.{ "smp", "--image" });
+        \\check.addFileArg(link_output);
+        ,
+        \\const irq_check = b.addRunArtifact(proof_tool);
+        \\irq_check.addArgs(&.{ "irq", "--image" });
+        \\irq_check.addFileArg(link_output);
+        ,
+        \\const driver_check = b.addRunArtifact(proof_tool);
+        \\driver_check.addArgs(&.{ "drivers", "--image" });
+        \\driver_check.addFileArg(link_output);
+        ,
+        "gate.step.dependOn(&check.step);",
+        "gate.step.dependOn(&irq_check.step);",
+        "gate.step.dependOn(&driver_check.step);",
+        "gate.addFileArg(link_output);",
+        \\validated_link_output = gate.addOutputFileArg("hyperv-validated-final.dbg");
+    });
+}
+
+/// The complete physical source/provenance review remains mandatory. This
+/// recognizes the supported shared-tool wiring, not arbitrary Zig semantics.
+pub fn requireNativeProofFiles(allocator: std.mem.Allocator, io: std.Io, repository: fs.Directory, expected_source: c.Source, proof: ?NativeProof) !void {
+    const native = proof orelse return error.DependencyUnavailable;
+    const root = try repository.read(allocator, io, "build.zig", 1024 * 1024, .source);
+    defer allocator.free(root);
+    try requireNativeProof(allocator, root, expected_source, native);
+    for ([_]c.File{ native.root_build, native.builder, native.tool }) |file|
+        try fs.requireFile(try repository.record(allocator, io, file.path, 1024 * 1024, .source), file);
+    const builder = try repository.read(allocator, io, native.builder.path, 1024 * 1024, .source);
+    defer allocator.free(builder);
+    try requireSequences(allocator, try functionBody(allocator, builder, "tool"), &.{
+        \\return b.addExecutable(.{
+        \\    .name = "hyperv-image-proof",
+        \\    .root_module = module(b, root, "support/build/hyperv-proof-tool.zig", b.graph.host, .ReleaseSafe),
+        \\});
+    });
+    try requireSequences(allocator, try functionBody(allocator, builder, "module"), &.{
+        \\const result = b.createModule(.{
+        \\    .root_source_file = root.path(b, source),
+        \\    .target = target,
+        \\    .optimize = optimize,
+        \\    .pic = true,
+        \\});
+        ,
+        \\result.addImport("vmbus_protocol", b.createModule(.{
+        \\    .root_source_file = root.path(b, "drivers/hyperv/vmbus/vmbus_protocol.zig"),
+    });
+    const tool = try repository.read(allocator, io, native.tool.path, 1024 * 1024, .source);
+    defer allocator.free(tool);
+    try requireSequences(allocator, tool, &.{
+        \\const proofs = @import("hyperv-image-proofs.zig");
+    });
+    try requireSequences(allocator, try functionBody(allocator, tool, "execute"), &.{
+        "try proofs.smp(model, cpus.?, diagnostic);",
+        "const report = try proofs.irq(model, diagnostic);",
+        "try proofs.drivers(model, required.items, diagnostic);",
+    });
 }
 
 fn validateSelection(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs, step: Step) !void {
-    const root_build = try inputs.repository.read(allocator, io, "build.zig", 1024 * 1024, .source);
-    if (step == .build) try requireNativeProof(allocator, root_build, inputs.observed_source, inputs.native_proof);
+    if (step == .build) try requireNativeProofFiles(allocator, io, inputs.repository, inputs.observed_source, inputs.native_proof);
     const execution = inputs.native_execution orelse return error.DependencyUnavailable;
     if (!std.crypto.timing_safe.eql(c.Sha, execution.source_sha256, inputs.observed_source.tree_sha256) or
         !std.mem.eql(u8, execution.compiler_version, c.compiler_version)) return error.UnreviewedInput;
@@ -729,10 +816,6 @@ fn validateSelection(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs, s
     try nativeSourceFile(entry);
     if (!std.mem.eql(u8, entry.path, "support/tools/hyperv/preparation/git_entry.zig")) return error.DependencyUnavailable;
     try fs.requireFile(try inputs.repository.record(allocator, io, entry.path, 1024 * 1024, .source), entry);
-    if (step == .build) {
-        for (inputs.native_proof.?.inputs) |input|
-            try fs.requireFile(try inputs.repository.record(allocator, io, input.file.path, 1024 * 1024, .source), input.file);
-    }
 }
 
 fn bindingToolDigest(allocator: std.mem.Allocator, bound: runtime.Bound) !c.Sha {
@@ -1130,12 +1213,25 @@ test "producer native proof selection is source-bound ordered and separately rev
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    // Only a parser fixture: these strings are not existing approved drivers.
+    // Parser fixture for the merged shared-tool shape, not a build approval.
     const root =
+        \\const hyperv_proof_build = @import("support/build/hyperv-proof-build.zig");
         \\fn finishNativeImages() void {
-        \\    _ = "support/build/fixture-smp.zig";
-        \\    _ = "support/build/fixture-irq.zig";
-        \\    _ = "support/build/fixture-drivers.zig";
+        \\    const proof_tool = hyperv_proof_build.tool(b, b.path("."));
+        \\    const check = b.addRunArtifact(proof_tool);
+        \\    check.addArgs(&.{ "smp", "--image" });
+        \\    check.addFileArg(link_output);
+        \\    const irq_check = b.addRunArtifact(proof_tool);
+        \\    irq_check.addArgs(&.{ "irq", "--image" });
+        \\    irq_check.addFileArg(link_output);
+        \\    const driver_check = b.addRunArtifact(proof_tool);
+        \\    driver_check.addArgs(&.{ "drivers", "--image" });
+        \\    driver_check.addFileArg(link_output);
+        \\    gate.step.dependOn(&check.step);
+        \\    gate.step.dependOn(&irq_check.step);
+        \\    gate.step.dependOn(&driver_check.step);
+        \\    gate.addFileArg(link_output);
+        \\    validated_link_output = gate.addOutputFileArg("hyperv-validated-final.dbg");
         \\}
     ;
     const fixture_source: c.Source = .{
@@ -1145,17 +1241,13 @@ test "producer native proof selection is source-bound ordered and separately rev
         .tree_sha256 = c.digest("synthetic proof-selection source"),
         .physical = .{ .sha256 = c.digest("synthetic physical tree"), .files = 4, .bytes = 1000 },
     };
-    var proof: NativeProof = .{
-        .schema = .hyperv_native_elf_proofs_v1,
+    const proof: NativeProof = .{
+        .schema = .hyperv_native_elf_proofs_v2,
         .source_sha256 = fixture_source.tree_sha256,
         .root_build = .{ .path = "build.zig", .sha256 = c.digest(root), .size = root.len, .mode = 0o644 },
-        .inputs = undefined,
-    };
-    for ([_]ProofKind{ .smp, .irq, .drivers }, [_][]const u8{
-        "support/build/fixture-smp.zig", "support/build/fixture-irq.zig", "support/build/fixture-drivers.zig",
-    }, &proof.inputs) |kind, path, *input| input.* = .{
-        .kind = kind,
-        .file = .{ .path = path, .sha256 = c.digest("synthetic proof input"), .size = 1, .mode = 0o644 },
+        .builder = .{ .path = "support/build/hyperv-proof-build.zig", .sha256 = c.digest("synthetic builder"), .size = 1, .mode = 0o644 },
+        .tool = .{ .path = "support/build/hyperv-proof-tool.zig", .sha256 = c.digest("synthetic tool"), .size = 1, .mode = 0o644 },
+        .modes = .{ .smp, .irq, .drivers },
     };
     try requireNativeProof(allocator, root, fixture_source, proof);
     var changed = proof;
@@ -1165,13 +1257,13 @@ test "producer native proof selection is source-bound ordered and separately rev
     changed.root_build.sha256 = c.digest("different root");
     try std.testing.expectError(error.UnreviewedInput, requireNativeProof(allocator, root, fixture_source, changed));
     changed = proof;
-    changed.inputs[1].kind = .smp;
+    changed.modes[1] = .smp;
     try std.testing.expectError(error.DependencyUnavailable, requireNativeProof(allocator, root, fixture_source, changed));
     changed = proof;
-    changed.inputs[1].file.path = "elsewhere/fixture-irq.zig";
+    changed.builder.path = "elsewhere/hyperv-proof-build.zig";
     try std.testing.expectError(error.DependencyUnavailable, requireNativeProof(allocator, root, fixture_source, changed));
     changed = proof;
-    changed.inputs[1].file.path = "support/build/not-selected.zig";
+    changed.tool.path = "support/build/not-selected.zig";
     try std.testing.expectError(error.DependencyUnavailable, requireNativeProof(allocator, root, fixture_source, changed));
 }
 

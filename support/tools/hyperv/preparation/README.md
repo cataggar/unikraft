@@ -1,4 +1,4 @@
-# Native local preparation, version 0.3
+# Native local preparation, version 0.4
 
 This package implements the local #120/#89 preparation boundary: strict native
 contracts, physical source/tool provenance, guarded configuration, synthetic
@@ -34,7 +34,7 @@ manifest change or missing-dependency failure, using copied manifests and
 ```sh
 cd /d/unikraft-worktrees/fleet-ci
 umask 077
-scratch="$PWD/.d/zig-migration-preparation/bridge-compat"
+scratch="$PWD/.d/zig-migration-preparation/proof-compat-53226729"
 export TMPDIR="$scratch/tmp" HOME="$scratch/home"
 export XDG_CACHE_HOME="$scratch/cache"
 export XDG_CONFIG_HOME="$scratch/config"
@@ -51,10 +51,11 @@ git_fixture=(
   -Dgit-library=/usr/lib/aarch64-linux-gnu/libc.so.6
   -Dgit-library=/usr/lib/aarch64-linux-gnu/libdl.so.2
 )
-cd "$scratch/build-work"
+cd "$scratch/work"
 /home/g/.local/bin/zig build \
   --build-file /d/unikraft-worktrees/fleet-ci/support/tools/hyperv/preparation/build.zig \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
+  -Dproof-fixture="$scratch/fixtures" \
   --prefix "$scratch/outputs/debug" "${git_fixture[@]}" \
   -j2 test install --summary all
 ```
@@ -69,16 +70,32 @@ options; no Git path, library discovery or architecture skip is substituted.
 fixture options fail tests, but ordinary package installation does not need
 fixture inputs.
 
+The proof fixture reads actual root/builder/tool source bytes; it never executes
+the root build. `-Dproof-fixture` defaults to the current checkout root after
+integration. On this older stacked base, the example selects private snapshots
+of these three files from merged commit `53226729aafbc9654240656f6533f88a1dd7b983`:
+
+```text
+build.zig
+support/build/hyperv-proof-build.zig
+support/build/hyperv-proof-tool.zig
+```
+
+Create a fresh fixture directory with that layout and populate it with
+`git show COMMIT:PATH` output, without changing the working checkout. These are
+read-only public source fixtures, not a complete reviewed producer checkout or
+fresh execution/admission evidence.
+
 The separate existing-runner namespace fixture build uses:
 
 ```sh
 /home/g/.local/bin/zig build \
   --build-file /d/unikraft-worktrees/fleet-ci/support/tools/hyperv/preparation/namespace/build.zig \
-  --cache-dir "$scratch/namespace-local" \
-  --global-cache-dir "$scratch/namespace-global" \
+  --cache-dir "$scratch/ns-local" \
+  --global-cache-dir "$scratch/ns-global" \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
   --prefix "$scratch/outputs/namespace-debug" \
-  -Dworkspace="$scratch/namespace-debug-work" "${git_fixture[@]}" \
+  -Dworkspace="$scratch/ns-debug-work" "${git_fixture[@]}" \
   -j2 test install --summary all
 ```
 
@@ -97,6 +114,7 @@ bounds are 4 MiB, depth 32, 4096 items and 65536 tokens.
 | --- | --- |
 | `provenance.Record` | `hyperv_native_producer_provenance_v1`: `schema,source,host_target,guest_target,compiler_version,producer,compiler,git,dependencies,trust` |
 | `producer.Binding` | `hyperv_local_native_producer_binding_v3`: `schema,source,repository,workspace,output,scratch,config,path,native,git,packages,bison_data,trust,trust_bundle,native_execution,native_proof,isolation` |
+| `producer.NativeProof` | `hyperv_native_elf_proofs_v2`: `schema,source_sha256,root_build,builder,tool,modes` |
 | `receipts.Receipt` | `hyperv_artifact_preparation_native_v1`: `schema,phase,purpose,run_id,guard,source_before,source_after,provenance,reviewed_provenance_sha256,config_before,config_after,parent_sha256,execution,efi,packaging,authority` |
 | `inputs.SelectionV2` (`Plan`) | `hyperv_native_input_selection_v2`: `schema,packaged_receipt_sha256,solved_metadata,publication,capability_source,capability_receipt,qemu,assets` |
 | `inputs.PreparedInputV2` (`Input`) | `hyperv_native_prepared_input_v2`: `schema,state,authority,receipt,reviewed_selection_sha256,selection,ledger,budget` |
@@ -107,6 +125,12 @@ build-receipt schema is retained, not replaced with a weaker engine receipt.
 `state` is exactly `prepared`; `authority` is exactly `not_admitted`.
 Producer binding v3 requires separately bound Make and Git policy files;
 binding-v2 documents are rejected rather than silently upgraded.
+Native proof v2 replaces the obsolete three-direct-source representation:
+`builder` is `support/build/hyperv-proof-build.zig`, `tool` is
+`support/build/hyperv-proof-tool.zig`, and `modes` is exactly
+`["smp","irq","drivers"]`. Proof-v1 records are rejected. Outer producer
+binding v3, input/selection v2 and the existing build-receipt version remain
+unchanged.
 
 `File = {path,sha256,size,mode}`. `Sha` is **64 lowercase ASCII hex bytes**;
 `admission.rawHash` explicitly converts it into core's **32 raw hash bytes**.
@@ -191,6 +215,16 @@ binding commitment, revalidates source-bound selection and tools, invokes the
 reviewed native helper under core supervision, then revalidates immutable
 inputs. No ambiguous mutation is retried.
 
+`producer.requireNativeProofFiles(allocator, io, repository, source, proof)`
+is shared by producer execution and read-only entry. It remeasures the root,
+builder and tool records and recognizes the actual merged shared-tool calls,
+three fixed mode invocations and gate dependencies. It also binds the builder's
+host/ReleaseSafe tool construction and native CLI proof calls. Comments or
+unconnected source-path strings cannot supply the required wiring. This is a
+bounded supported-shape guard, not a general Zig semantic proof: complete
+independent physical source/compiler/dependency/runtime review remains required
+and binds all transitively compiled proof inputs.
+
 `Inputs.isolation` contains the reviewed static namespace helper, complete Git
 metadata trees, canonical account, existing facade directory/lock identity
 and private policy-file bindings. Other native tools **may be dynamic**:
@@ -260,6 +294,14 @@ not inferred by hashing a fresh measurement and declaring it approved.
 then reads its canonical metadata file through checked descriptors. It does
 not parse stdout/stderr or accept a caller-invented metadata model.
 `Context.configuration_directory` is required for `inputs.generate`.
+
+No full `Context.runProducer` configure/build execution result is claimed by
+the current standalone results. Its root command sequence is `olddefconfig`,
+then `config-inspect`, then `native-images`, then `config-inspect`, with the
+fixed argv built by `producer.plan`. The current committed base predates both
+merged root changes; parent-directed integration and the permitted full producer
+run must provide actual command/results and fresh metadata/receipts. Neither
+the bridge nor native-proof source implementation is pending upstream.
 
 ## Read-only engine entry
 
@@ -401,7 +443,7 @@ parent hard process deadline remains mandatory. Actual runs of the parameterized
 fixtures on other native architectures and full integrated producer execution remain necessary;
 neither the migration nor cloud admission is complete.
 
-Final focused results are **77/77 preparation cases** (10/10 build steps) and
+Final focused results are **78/78 preparation cases** (10/10 build steps) and
 **16/16 namespace cases** (11/11 steps), each in Debug and ReleaseSafe under
 umask 077, with no skipped cases. The bridge/Git extension adds exact
 bridge-wire/private-path fixtures, v3 policy substitution cases, and actual Git
@@ -415,12 +457,15 @@ binding versus a byte-identical copy, authoritative metadata, v1 rejection,
 read-only missing-state/lock behavior, reordered reservations and complete
 runtime control accounting. Real-Git cases cover nested symlink/parent-component
 order; native-only unit cases cover hop and pending-path bounds.
-Final logs are `bridge-compat/outputs/source-review-{debug,release-safe}.log`
-and `source-review-namespace-{debug,release-safe}.log` under the preparation
-scratch root. Earlier preserved logs contain superseded runs.
+The additional merged-source case uses the actual #130 root/builder/CLI files
+and rejects missing gate dependencies, redirected roots, wrong modes, changed
+compiler selection/imports, omitted proof calls, stale hashes and symlinks.
+Final logs are `proof-compat-53226729/outputs/debug-2.log`, `release-safe.log`
+and `namespace-{debug,release-safe}.log` under the preparation scratch root.
+Earlier preserved logs contain superseded runs.
 
 The stripped ReleaseSafe producer and Git-enabled helper measure
-1093312 and 696824 bytes: 1790136 bytes together, leaving only 307016 of the
+1093312 and 705648 bytes: 1798960 bytes together, leaving only 298192 of the
 2097152-byte control cap before other required controls/publications. This is
 not a complete workflow budget result. A distinct engine executable and actual
 QEMU/image/control selection must fit the unchanged ledger; no exemption or
