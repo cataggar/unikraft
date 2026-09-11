@@ -1,0 +1,7 @@
+.{
+    .name = .unikraft_hyperv_local_boot,
+    .version = "0.1.0",
+    .fingerprint = 0xaec47cd93c6c45e2,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{""},
+}
