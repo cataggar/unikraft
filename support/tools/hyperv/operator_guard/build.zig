@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const fixture_optimize = b.option(std.builtin.OptimizeMode, "fixture-optimize", "Native synthetic child optimization (default: ReleaseSmall)") orelse .ReleaseSmall;
     const module = addModule(b, target, optimize, "hyperv_operator_guard");
     const executable = b.addExecutable(.{ .name = "uk-hyperv-operator-guard", .root_module = b.createModule(.{
         .root_source_file = b.path("main.zig"),
@@ -14,15 +15,15 @@ pub fn build(b: *std.Build) void {
     const cross = b.addExecutable(.{ .name = "operator-guard-target-fixture", .root_module = b.createModule(.{
         .root_source_file = b.path("fixture.zig"),
         .target = target,
-        .optimize = .ReleaseSmall,
-        .imports = &.{.{ .name = "operator_guard", .module = addModule(b, target, .ReleaseSmall, null) }},
+        .optimize = optimize,
+        .imports = &.{.{ .name = "operator_guard", .module = addModule(b, target, optimize, null) }},
     }) });
     b.step("compile-guard", "Build the complete bound guard fixture for the selected Linux target").dependOn(&b.addInstallArtifact(cross, .{}).step);
     const fixture = b.addExecutable(.{ .name = "operator-guard-fixture", .root_module = b.createModule(.{
         .root_source_file = b.path("fixture.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSmall,
-        .imports = &.{.{ .name = "operator_guard", .module = addModule(b, b.graph.host, .ReleaseSmall, null) }},
+        .optimize = fixture_optimize,
+        .imports = &.{.{ .name = "operator_guard", .module = addModule(b, b.graph.host, fixture_optimize, null) }},
     }) });
     const options = b.addOptions();
     options.addOptionPath("fixture", fixture.getEmittedBin());

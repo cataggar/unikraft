@@ -67,10 +67,13 @@ pub const Registration = struct {
     control_reserved: u64,
 };
 pub const Cause = enum { completed, worker_failed, owner_died, cancelled, deadline, output_limit, initializer_failed };
+pub const seal_schema = "uk-operator-custody-seal-v2";
+pub const Publication = enum { unconfirmed };
 pub const Seal = struct {
     schema: []const u8,
     registration: Hash,
     witness: enum { pid_namespace_init_reaped },
+    publication: Publication,
     cause: Cause,
     init_status: u32,
     worker_status: ?u32,
@@ -84,8 +87,16 @@ pub const Proof = struct {
     boot: Uuid,
     namespace_init: Identity,
     cause: Cause,
+    publication: Publication,
+    scope: enum { cleanup_only },
     failures: core.diagnostics.Failures,
 };
+pub fn publicationFailures(prior: core.diagnostics.Failures) !core.diagnostics.Failures {
+    var failures = prior;
+    try failures.record(.recording, .{ .stage = .state_record, .category = .ambiguous });
+    try failures.record(.cleanup, .{ .stage = .private_file, .category = .ambiguous });
+    return failures;
+}
 pub const Signer = struct {
     seed: [32]u8,
     public_key: [32]u8,

@@ -56,7 +56,7 @@ const Fixture = struct {
         };
         if (mode == .recording) try directory.dir.writeFile(io, .{ .sub_path = "custody-seal.json", .data = "occupied\n", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
         if (mode == .registration) try directory.dir.writeFile(io, .{ .sub_path = "custody-registration.json", .data = "occupied\n", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
-        if (mode == .after_registration) try directory.dir.writeFile(io, .{ .sub_path = "fixture-owner-death", .data = "", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
+        try directory.dir.writeFile(io, .{ .sub_path = "fixture-mode", .data = @tagName(mode), .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
         const bytes = try r.canonical(a, f.Request{ .mode = mode, .expected = expected });
         defer a.free(bytes);
         const request = try k.memfd(bytes);
@@ -150,6 +150,14 @@ test "kernel guard completes after namespace-wide reaping and refuses unbound pr
     try t.expect(k.linux.W.IFEXITED(status) and k.linux.W.EXITSTATUS(status) == 0);
     const proof = try guard.recovery.load(a, io, fixture.directory, fixture.expected);
     try t.expectEqual(r.Cause.completed, proof.cause);
+    try requireCleanupOnly(proof);
+    for ([_][]const u8{ "custody-claim.json", "custody-registration.json", "custody-seal.json" }) |name| {
+        const bytes = try fixture.directory.read(io, a, name, r.max_record, null);
+        defer a.free(bytes);
+        try t.expect(bytes.len <= r.max_record);
+    }
+    const result = try ownerResult(&fixture);
+    try t.expectEqual(guard.core.diagnostics.Failures{}, result.failures);
     try descendants.requireReaped();
     var wrong = fixture.expected;
     wrong.kind = .production;
@@ -194,6 +202,21 @@ const Descendants = struct {
     }
 };
 
+fn requireCleanupOnly(proof: r.Proof) !void {
+    try t.expectEqual(.cleanup_only, proof.scope);
+    try t.expectEqual(r.Publication.unconfirmed, proof.publication);
+    try t.expectEqual(guard.core.diagnostics.Category.ambiguous, proof.failures.recording.?.category);
+    try t.expectEqual(guard.core.diagnostics.Category.ambiguous, proof.failures.cleanup.?.category);
+}
+
+fn ownerResult(fixture: *Fixture) !guard.WaitResult {
+    const bytes = try fixture.work.read(io, a, "owner-result.json", r.max_record, null);
+    defer a.free(bytes);
+    const parsed = try r.parse(guard.WaitResult, a, bytes);
+    defer parsed.deinit();
+    return parsed.value;
+}
+
 test "owner SIGKILL recovers only through a sealed namespace witness and kills escaped sessions" {
     for ([_]bool{ false, true }) |stop_init| {
         var fixture = try Fixture.init(.normal);
@@ -213,7 +236,8 @@ test "owner SIGKILL recovers only through a sealed namespace witness and kills e
         try t.expect(k.linux.W.IFSIGNALED(status));
         const proof = try guard.recovery.awaitStopped(a, io, fixture.directory, fixture.expected, try guard.core.process.Deadline.afterMilliseconds(5000));
         try t.expectEqual(r.Cause.owner_died, proof.cause);
-        try t.expect(proof.failures.primary != null and proof.failures.cleanup == null and proof.failures.recording == null);
+        try t.expect(proof.failures.primary != null);
+        try requireCleanupOnly(proof);
         try descendants.requireReaped();
     }
 }
@@ -296,8 +320,132 @@ test "native custody deadlines and output bounds terminate actual workloads" {
         defer a.free(bytes);
         const result = try r.parse(guard.WaitResult, a, bytes);
         defer result.deinit();
-        try t.expectEqual(proof.failures, result.value.failures);
+        try t.expectEqual(proof.failures.primary, result.value.failures.primary);
+        try t.expect(result.value.failures.cleanup == null and result.value.failures.recording == null);
+        try requireCleanupOnly(proof);
     }
+}
+
+test "queued cancellation stops PID1 before the durable registration worker gate opens" {
+    var fixture = try Fixture.init(.pre_dispatch_cancel);
+    defer fixture.deinit();
+    _ = try fixture.wait();
+    const observed = try fixture.work.openFile(io, "pre-dispatch-observed");
+    observed.close(io);
+    const proof = try guard.recovery.load(a, io, fixture.directory, fixture.expected);
+    try t.expectEqual(r.Cause.cancelled, proof.cause);
+    try requireCleanupOnly(proof);
+    try t.expectError(error.FileNotFound, fixture.work.openFile(io, "entered"));
+    try t.expectError(error.FileNotFound, fixture.work.openFile(io, "ready"));
+    const result = try ownerResult(&fixture);
+    try t.expectEqual(guard.core.diagnostics.Category.cancelled, result.failures.primary.?.category);
+    try t.expect(result.failures.cleanup == null and result.failures.recording == null);
+}
+
+test "latched cancellation survives paused PID1 and bounds shutdown with both observers paused" {
+    for ([_]bool{ true, false }) |resume_custodian| {
+        var fixture = try Fixture.init(.cancel_observed);
+        defer fixture.deinit();
+        const registration = try fixture.registration();
+        try fixture.waitFile(fixture.work, "ready");
+        const descendants = try Descendants.retain(registration.namespace_init.pid);
+        defer descendants.close();
+        const init_fd = try k.pidfd(registration.namespace_init.pid);
+        defer k.close(init_fd);
+        _ = try k.checked(k.linux.pidfd_send_signal(fixture.custody_fd.?, .STOP, null, 0));
+        const started = try k.now();
+        try fixture.work.dir.writeFile(io, .{ .sub_path = "request-cancel", .data = "cancel\n", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
+        // The synthetic I/O adapter blocks precisely after PID1 observed the
+        // cancellation, before it reports/exits. The custodian cannot observe
+        // that event until the test explicitly resumes it.
+        try fixture.waitFile(fixture.work, "cancel-observed");
+        _ = try k.checked(k.linux.pidfd_send_signal(init_fd, .STOP, null, 0));
+        if (resume_custodian)
+            _ = try k.checked(k.linux.pidfd_send_signal(fixture.custody_fd.?, .CONT, null, 0));
+        _ = try fixture.wait();
+        try t.expect(try k.now() - started < 5000 * std.time.ns_per_ms);
+        try descendants.requireReaped();
+        const result = try ownerResult(&fixture);
+        try t.expectEqual(guard.core.diagnostics.Category.cancelled, result.failures.primary.?.category);
+        if (resume_custodian) {
+            const proof = try guard.recovery.load(a, io, fixture.directory, fixture.expected);
+            try t.expectEqual(r.Cause.cancelled, proof.cause);
+            try requireCleanupOnly(proof);
+            try t.expect(result.failures.cleanup == null and result.failures.recording == null);
+        } else {
+            try t.expect(result.failures.cleanup != null and result.failures.recording != null);
+            try t.expectError(error.ProcessRecoveryRequired, guard.recovery.load(a, io, fixture.directory, fixture.expected));
+            // With both original observers lost, the test subreaper owns PID1.
+            // This fixture cleanup does not create a production custody witness.
+            const deadline = try guard.core.process.Deadline.afterMilliseconds(3000);
+            while (try k.reap(registration.namespace_init.pid) == null) {
+                if (try deadline.expired()) return error.FixtureInitNotReaped;
+                k.pause();
+            }
+        }
+    }
+}
+
+test "visible seal fsync failure retains publication uncertainty with and without owner feedback" {
+    for ([_]bool{ false, true }) |lose_owner| {
+        var fixture = try Fixture.init(if (lose_owner) .seal_sync_owner_loss else .seal_sync_failure);
+        defer fixture.deinit();
+        const registration = try fixture.registration();
+        try fixture.waitFile(fixture.work, "ready");
+        const descendants = try Descendants.retain(registration.namespace_init.pid);
+        defer descendants.close();
+        try k.kill(descendants.fds[0]);
+        _ = try fixture.wait();
+        const proof = try guard.recovery.awaitStopped(a, io, fixture.directory, fixture.expected, try guard.core.process.Deadline.afterMilliseconds(5000));
+        try descendants.requireReaped();
+        try t.expectEqual(r.Cause.worker_failed, proof.cause);
+        try t.expectEqual(guard.core.diagnostics.Category.child_failed, proof.failures.primary.?.category);
+        try requireCleanupOnly(proof);
+        if (lose_owner) {
+            try t.expectError(error.FileNotFound, fixture.work.openFile(io, "owner-result.json"));
+        } else {
+            const result = try ownerResult(&fixture);
+            try t.expectEqual(guard.core.diagnostics.Category.child_failed, result.failures.primary.?.category);
+            try t.expectEqual(guard.core.diagnostics.Category.local_io, result.failures.recording.?.category);
+            try t.expect(result.failures.cleanup != null);
+        }
+    }
+}
+
+test "interruption after seal visibility cannot certify final fsync even after owner loss" {
+    for ([_]bool{ false, true }) |lose_owner| {
+        var fixture = try Fixture.init(.seal_interrupted);
+        defer fixture.deinit();
+        const registration = try fixture.registration();
+        try fixture.waitFile(fixture.work, "ready");
+        const descendants = try Descendants.retain(registration.namespace_init.pid);
+        defer descendants.close();
+        try fixture.release();
+        try fixture.waitFile(fixture.work, "seal-visible");
+        try descendants.requireReaped();
+        try t.expectError(error.ProcessRecoveryRequired, guard.recovery.load(a, io, fixture.directory, fixture.expected));
+        if (lose_owner) try k.kill(fixture.owner_fd);
+        try k.kill(fixture.custody_fd.?);
+        _ = try fixture.wait();
+        const proof = try guard.recovery.awaitStopped(a, io, fixture.directory, fixture.expected, try guard.core.process.Deadline.afterMilliseconds(5000));
+        try t.expectEqual(r.Cause.completed, proof.cause);
+        try requireCleanupOnly(proof);
+        if (lose_owner) {
+            try t.expectError(error.FileNotFound, fixture.work.openFile(io, "owner-result.json"));
+        } else {
+            const result = try ownerResult(&fixture);
+            try t.expect(result.failures.primary != null and result.failures.cleanup != null and result.failures.recording != null);
+        }
+    }
+}
+
+test "publication uncertainty never overwrites any prior failure lane" {
+    const prior: guard.core.diagnostics.Failures = .{
+        .primary = .{ .stage = .process_run, .category = .child_failed },
+        .cleanup = .{ .stage = .state_record, .category = .cleanup_failed },
+        .recording = .{ .stage = .state_record, .category = .local_io },
+    };
+    try t.expectEqual(prior, try r.publicationFailures(prior));
 }
 
 test "crash before handoff has no witness and cannot authorize recovery by PID absence" {
@@ -400,7 +548,8 @@ test "owner death after durable registration seals stopped custody without dispa
     _ = try fixture.wait();
     const proof = try guard.recovery.awaitStopped(a, io, fixture.directory, fixture.expected, try guard.core.process.Deadline.afterMilliseconds(5000));
     try t.expectEqual(r.Cause.owner_died, proof.cause);
-    try t.expect(proof.failures.primary != null and proof.failures.cleanup == null and proof.failures.recording == null);
+    try t.expect(proof.failures.primary != null);
+    try requireCleanupOnly(proof);
     try t.expectError(error.FileNotFound, fixture.work.openFile(io, "ready"));
 }
 
@@ -415,7 +564,7 @@ test "recovery rejects cross boot stale reused live writer missing claim and tam
     defer a.free(registration_bytes);
     const seal_bytes = try fixture.directory.read(io, a, "custody-seal.json", r.max_record, null);
     defer a.free(seal_bytes);
-    const original_seal = try r.verify(r.Seal, a, seal_bytes, fixture.expected.public_key, "uk-operator-custody-seal-v1");
+    const original_seal = try r.verify(r.Seal, a, seal_bytes, fixture.expected.public_key, r.seal_schema);
     defer original_seal.deinit();
     var signer = try guard.Signer.fromSeed(f.seed, fixture.expected.public_key);
     defer signer.deinit();
@@ -441,7 +590,7 @@ test "recovery rejects cross boot stale reused live writer missing claim and tam
         defer a.free(signed);
         var seal = original_seal.value;
         seal.registration = r.hash(signed);
-        const sealed = try signer.sign(a, seal, "uk-operator-custody-seal-v1");
+        const sealed = try signer.sign(a, seal, r.seal_schema);
         defer a.free(sealed);
         try r.durable(try lock.commit(io, "custody-registration.json", signed));
         try r.durable(try lock.commit(io, "custody-seal.json", sealed));
@@ -456,6 +605,26 @@ test "recovery rejects cross boot stale reused live writer missing claim and tam
     const missing = try document.canonicalAlloc(a);
     defer a.free(missing);
     try r.durable(try lock.commit(io, "custody-seal.json", missing));
+    try t.expectError(error.ProcessRecoveryRequired, guard.recovery.load(a, io, fixture.directory, fixture.expected));
+    try r.durable(try lock.commit(io, "custody-seal.json", seal_bytes));
+    var publication_document = try guard.core.contracts.Document.parse(a, seal_bytes, .{ .bytes = r.max_record, .items = 1024 });
+    defer publication_document.deinit();
+    const publication_body = publication_document.parsed.value.object.getPtr("body").?;
+    publication_body.object.getPtr("publication").?.* = .{ .string = "confirmed" };
+    const invented_publication = try signer.sign(a, publication_body.*, r.seal_schema);
+    defer a.free(invented_publication);
+    try r.durable(try lock.commit(io, "custody-seal.json", invented_publication));
+    try t.expectError(error.ProcessRecoveryRequired, guard.recovery.load(a, io, fixture.directory, fixture.expected));
+    try t.expect(publication_body.object.swapRemove("publication"));
+    const missing_publication = try signer.sign(a, publication_body.*, r.seal_schema);
+    defer a.free(missing_publication);
+    try r.durable(try lock.commit(io, "custody-seal.json", missing_publication));
+    try t.expectError(error.ProcessRecoveryRequired, guard.recovery.load(a, io, fixture.directory, fixture.expected));
+    var legacy_seal = original_seal.value;
+    legacy_seal.schema = "uk-operator-custody-seal-v1";
+    const legacy = try signer.sign(a, legacy_seal, "uk-operator-custody-seal-v1");
+    defer a.free(legacy);
+    try r.durable(try lock.commit(io, "custody-seal.json", legacy));
     try t.expectError(error.ProcessRecoveryRequired, guard.recovery.load(a, io, fixture.directory, fixture.expected));
     try r.durable(try lock.commit(io, "custody-seal.json", seal_bytes));
     try fixture.directory.dir.rename("custody-claim.json", fixture.directory.dir, "fixture-saved-claim.json", io);

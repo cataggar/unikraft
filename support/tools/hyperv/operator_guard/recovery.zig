@@ -62,12 +62,12 @@ fn loadChecked(a: std.mem.Allocator, io: std.Io, directory: r.core.private_files
         else => return err,
     };
     defer a.free(seal_bytes);
-    const sealed = try r.verify(r.Seal, a, seal_bytes, expected.public_key, "uk-operator-custody-seal-v1");
+    const sealed = try r.verify(r.Seal, a, seal_bytes, expected.public_key, r.seal_schema);
     defer sealed.deinit();
     const seal = sealed.value;
-    if (!std.mem.eql(u8, seal.schema, "uk-operator-custody-seal-v1") or
-        !std.mem.eql(u8, &seal.registration, &r.hash(bytes)) or seal.stopped_ns < value.registered_ns or seal.stopped_ns > try k.now() or
-        seal.failures.cleanup != null or seal.failures.recording != null) return error.InvalidSeal;
+    if (!std.mem.eql(u8, seal.schema, r.seal_schema) or
+        !std.mem.eql(u8, &seal.registration, &r.hash(bytes)) or seal.stopped_ns < value.registered_ns or seal.stopped_ns > try k.now())
+        return error.InvalidSeal;
     if (seal.cause == .completed and (seal.failures.primary != null or seal.worker_status == null or
         !k.linux.W.IFEXITED(seal.worker_status.?) or k.linux.W.EXITSTATUS(seal.worker_status.?) != 0 or
         !k.linux.W.IFEXITED(seal.init_status) or k.linux.W.EXITSTATUS(seal.init_status) != 0))
@@ -85,7 +85,19 @@ fn loadChecked(a: std.mem.Allocator, io: std.Io, directory: r.core.private_files
         },
         else => return error.ProcessRecoveryRequired,
     }
-    return .{ .registration = r.hash(bytes), .seal = r.hash(seal_bytes), .expected = expected, .boot = value.boot, .namespace_init = value.namespace_init, .cause = seal.cause, .failures = seal.failures };
+    // Valid signed bytes witness the preceding kernel reap, not the subsequent
+    // outcome of publishing those bytes. No persisted file certifies its own fsync.
+    return .{
+        .registration = r.hash(bytes),
+        .seal = r.hash(seal_bytes),
+        .expected = expected,
+        .boot = value.boot,
+        .namespace_init = value.namespace_init,
+        .cause = seal.cause,
+        .publication = seal.publication,
+        .scope = .cleanup_only,
+        .failures = try r.publicationFailures(seal.failures),
+    };
 }
 
 pub fn awaitStopped(a: std.mem.Allocator, io: std.Io, directory: r.core.private_files.Directory, expected: r.Expected, deadline: r.core.process.Deadline) !r.Proof {

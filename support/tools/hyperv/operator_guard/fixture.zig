@@ -3,44 +3,119 @@ const guard = @import("operator_guard");
 const k = guard.kernel;
 const r = guard.records;
 
-pub const Mode = enum { normal, deadline, flood, before, recording, registration, cancel, after_registration };
+pub const Mode = enum {
+    normal,
+    deadline,
+    flood,
+    before,
+    recording,
+    registration,
+    cancel,
+    after_registration,
+    pre_dispatch_cancel,
+    cancel_observed,
+    seal_sync_failure,
+    seal_sync_owner_loss,
+    seal_interrupted,
+};
 pub const Request = struct { mode: Mode, expected: r.Expected };
 pub const seed = [_]u8{0x59} ** 32;
 pub const budget: r.Budget = .{ .control = 8388608, .staging = 268435456 };
 
-// Test-only I/O adapter in this separately compiled synthetic executable. Kill
-// the real owner after registration directory fsync, before publication returns.
-const RegistrationDeath = struct {
+// Faults exist only in this separately bound synthetic executable. File markers
+// coordinate actual process interruption; they never act as recovery evidence.
+const Fault = struct {
     original: std.Io,
+    mode: Mode = .normal,
     table: std.Io.VTable = undefined,
     fired: bool = false,
-    threadlocal var active: *RegistrationDeath = undefined;
-    fn install(self: *RegistrationDeath) std.Io {
+    threadlocal var active: *Fault = undefined;
+    fn install(self: *Fault) std.Io {
         self.table = self.original.vtable.*;
         self.table.fileSync = sync;
+        self.table.operate = operate;
         active = self;
         return .{ .userdata = self.original.userdata, .vtable = &self.table };
     }
     fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
         const self = active;
-        try self.original.vtable.fileSync(userdata, file);
-        if (self.fired) return;
+        if (self.fired) return self.original.vtable.fileSync(userdata, file);
         const before = k.directory(4) catch return error.InputOutput;
         const actual = k.directory(file.handle) catch return error.InputOutput;
-        if (!std.meta.eql(before, actual)) return;
-        const registration = k.linux.openat(4, "custody-registration.json", .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
-        switch (k.linux.errno(registration)) {
+        if (!std.meta.eql(before, actual)) return self.original.vtable.fileSync(userdata, file);
+        const registration_boundary = self.mode == .after_registration or self.mode == .pre_dispatch_cancel;
+        if (registration_boundary) try self.original.vtable.fileSync(userdata, file);
+        const name: [:0]const u8 = if (registration_boundary) "custody-registration.json" else "custody-seal.json";
+        const visible = k.linux.openat(4, name, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        switch (k.linux.errno(visible)) {
             .SUCCESS => {
-                k.close(@intCast(registration));
+                k.close(@intCast(visible));
                 self.fired = true;
-                k.kill(5) catch return error.InputOutput;
-                while (!(k.readable(5) catch return error.InputOutput)) k.pause();
+                switch (self.mode) {
+                    .after_registration => self.killOwner() catch return error.InputOutput,
+                    .pre_dispatch_cancel => self.cancelBeforeGate() catch return error.InputOutput,
+                    .seal_sync_failure => return error.InputOutput,
+                    .seal_sync_owner_loss => {
+                        self.killOwner() catch return error.InputOutput;
+                        return error.InputOutput;
+                    },
+                    .seal_interrupted => {
+                        mark(7, "seal-visible") catch return error.InputOutput;
+                        while (true) k.pause();
+                    },
+                    else => return error.InputOutput,
+                }
+                return;
             },
             .NOENT => {},
             else => return error.InputOutput,
         }
+        if (!registration_boundary) try self.original.vtable.fileSync(userdata, file);
+    }
+    fn killOwner(_: *Fault) !void {
+        try k.kill(5);
+        while (!try k.readable(5)) k.pause();
+    }
+    fn cancelBeforeGate(self: *Fault) !void {
+        const cancel: u64 = 1;
+        try k.write(9, std.mem.asBytes(&cancel));
+        const directory: guard.core.private_files.Directory = .{ .dir = .{ .handle = 4 } };
+        const bytes = try directory.read(self.original, std.heap.page_allocator, "custody-registration.json", r.max_record, null);
+        defer std.heap.page_allocator.free(bytes);
+        const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+        const parsed = try r.verify(r.Registration, std.heap.page_allocator, bytes, pair.public_key.toBytes(), "uk-operator-custody-registration-v1");
+        defer parsed.deinit();
+        const init_fd = try k.pidfd(parsed.value.namespace_init.pid);
+        defer k.close(init_fd);
+        const deadline = try guard.core.process.Deadline.afterMilliseconds(750);
+        while (!try k.readable(init_fd)) {
+            if (try deadline.expired()) return error.PreDispatchCancellationIgnored;
+            k.pause();
+        }
+        try mark(7, "pre-dispatch-observed");
+    }
+    fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        const self = active;
+        switch (operation) {
+            .file_write_streaming => |write| {
+                if (self.mode == .cancel_observed and write.file.handle == 8) {
+                    if (!(k.readable(10) catch return .{ .file_write_streaming = error.InputOutput }))
+                        return .{ .file_write_streaming = error.InputOutput };
+                    mark(4, "cancel-observed") catch return .{ .file_write_streaming = error.InputOutput };
+                    while (true) k.pause();
+                }
+            },
+            else => {},
+        }
+        return self.original.vtable.operate(userdata, operation);
     }
 };
+
+fn mark(directory: i32, name: [:0]const u8) !void {
+    const file = try k.fd(k.linux.openat(directory, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o600));
+    defer k.close(file);
+    try k.write(file, "observed\n");
+}
 
 pub fn main(init: std.process.Init) void {
     execute(init) catch |err| {
@@ -52,12 +127,23 @@ pub fn main(init: std.process.Init) void {
 }
 fn execute(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    var fault: RegistrationDeath = .{ .original = init.io };
+    var fault: Fault = .{ .original = init.io };
     var controlled = init;
     if (args.len == 2 and std.mem.eql(u8, args[1], "--operator-guard-custodian")) {
-        const marker = k.linux.openat(4, "fixture-owner-death", .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
-        if (k.linux.errno(marker) == .SUCCESS) {
-            k.close(@intCast(marker));
+        const directory: guard.core.private_files.Directory = .{ .dir = .{ .handle = 4 } };
+        const mode = try directory.read(init.io, init.gpa, "fixture-mode", 64, null);
+        defer init.gpa.free(mode);
+        fault.mode = std.meta.stringToEnum(Mode, mode) orelse return error.InvalidFixture;
+        if (switch (fault.mode) {
+            .after_registration, .pre_dispatch_cancel, .seal_sync_failure, .seal_sync_owner_loss, .seal_interrupted => true,
+            else => false,
+        }) controlled.io = fault.install();
+    } else if (args.len == 2 and std.mem.eql(u8, args[1], "--operator-guard-init")) {
+        const directory: guard.core.private_files.Directory = .{ .dir = .{ .handle = 4 } };
+        const mode = try directory.read(init.io, init.gpa, "mode", 64, null);
+        defer init.gpa.free(mode);
+        if (std.mem.eql(u8, mode, "cancel_observed")) {
+            fault.mode = .cancel_observed;
             controlled.io = fault.install();
         }
     }
@@ -86,9 +172,9 @@ fn execute(init: std.process.Init) !void {
         .cleanup_ms = 2000,
         .control_reserved = parsed.value.expected.budget.control,
     });
-    if (parsed.value.mode == .cancel) {
+    if (parsed.value.mode == .cancel or parsed.value.mode == .cancel_observed) {
         while (true) {
-            const ready = work.openFile(init.io, "ready") catch |err| switch (err) {
+            const ready = work.openFile(init.io, if (parsed.value.mode == .cancel) "ready" else "request-cancel") catch |err| switch (err) {
                 error.FileNotFound => {
                     if (try handle.deadline.expired()) return error.FixtureDeadline;
                     k.pause();
@@ -100,6 +186,12 @@ fn execute(init: std.process.Init) !void {
             break;
         }
         try handle.cancel();
+        if (parsed.value.mode == .cancel) {
+            const first_deadline = handle.cancellation_deadline_ns;
+            k.pause();
+            try handle.cancel();
+            if (handle.cancellation_deadline_ns != first_deadline) return error.CancellationBudgetRenewed;
+        }
     }
     const result = try handle.wait(init.gpa);
     try handle.close();
@@ -111,6 +203,7 @@ fn execute(init: std.process.Init) !void {
 fn worker(input: guard.WorkerInput) !void {
     const io = input.io;
     const directory = input.directory;
+    try mark(directory.dir.handle, "entered");
     const mode = try directory.read(io, std.heap.page_allocator, "mode", 64, null);
     defer std.heap.page_allocator.free(mode);
     var status_buffer: [4096]u8 = undefined;

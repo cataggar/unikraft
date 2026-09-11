@@ -282,7 +282,7 @@ fn spawnImpl(namespace: bool, executable: linux.fd_t, mode: [:0]const u8, descri
             // Mapping must precede exec, which otherwise drops capabilities
             // for the as-yet-unmapped UID. This child performs raw syscalls only.
             while (true) {
-                if ((readable(5) catch true) or (readable(7) catch true) or (now() catch deadline_ns) >= deadline_ns)
+                if ((readable(5) catch true) or (readable(7) catch true) or (readable(10) catch true) or (now() catch deadline_ns) >= deadline_ns)
                     linux.exit_group(126);
                 var marker: [1]u8 = undefined;
                 const n = linux.read(9, &marker, 1);

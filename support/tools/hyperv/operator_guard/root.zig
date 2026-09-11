@@ -30,24 +30,31 @@ pub const Handle = struct {
     deadline: core.process.Deadline,
     cleanup_ms: u32,
     reaped: bool = false,
+    cancellation_deadline_ns: ?u64 = null,
 
     pub fn cancel(self: *Handle) !void {
         if (self.reaped) return error.ProcessRecoveryRequired;
+        try self.observeCancellation();
+        if (self.cancellation_deadline_ns == null)
+            self.cancellation_deadline_ns = (try core.process.Deadline.afterMilliseconds(self.cleanup_ms)).expires_ns;
+        if (try k.readable(self.cancel_fd)) return;
         const value: u64 = 1;
         try k.write(self.cancel_fd, std.mem.asBytes(&value));
     }
+    fn observeCancellation(self: *Handle) !void {
+        if (self.cancellation_deadline_ns == null and try k.readable(self.cancel_fd))
+            self.cancellation_deadline_ns = (try core.process.Deadline.afterMilliseconds(self.cleanup_ms)).expires_ns;
+    }
     pub fn wait(self: *Handle, a: std.mem.Allocator) !WaitResult {
-        const ceiling = try std.math.add(u64, self.deadline.expires_ns, @as(u64, self.cleanup_ms) * std.time.ns_per_ms);
-        const kill_at = ceiling - @as(u64, @min(1000, self.cleanup_ms / 2)) * std.time.ns_per_ms;
+        const attempt_ceiling = try std.math.add(u64, self.deadline.expires_ns, @as(u64, self.cleanup_ms) * std.time.ns_per_ms);
         var killed = false;
         while (true) {
+            try self.observeCancellation();
+            const ceiling = @min(attempt_ceiling, self.cancellation_deadline_ns orelse attempt_ceiling);
+            const kill_at = ceiling - @as(u64, @min(1000, self.cleanup_ms / 2)) * std.time.ns_per_ms;
             if (try k.reap(self.pid)) |status| {
                 self.reaped = true;
                 var result: WaitResult = .{ .status = status };
-                if (killed) {
-                    result.failures.primary = .{ .stage = .process_run, .category = .timeout };
-                    result.failures.cleanup = .{ .stage = .process_cleanup, .category = .cleanup_failed };
-                }
                 var buffer: [r.feedback_limit]u8 = undefined;
                 const length = k.read(self.feedback_fd, &buffer) catch return error.FailureDeliveryLost;
                 if (length != 0) {
@@ -58,6 +65,12 @@ pub const Handle = struct {
                     if (parsed.value.recording) |value| try result.failures.record(.recording, value);
                 } else {
                     try result.failures.record(.recording, .{ .stage = .process_run, .category = .invalid_response });
+                    try result.failures.record(.cleanup, .{ .stage = .process_cleanup, .category = .cleanup_failed });
+                }
+                if (self.cancellation_deadline_ns != null)
+                    try result.failures.record(.primary, .{ .stage = .process_run, .category = .cancelled });
+                if (killed) {
+                    try result.failures.record(.primary, .{ .stage = .process_run, .category = .timeout });
                     try result.failures.record(.cleanup, .{ .stage = .process_cleanup, .category = .cleanup_failed });
                 }
                 if (!k.linux.W.IFEXITED(status) or k.linux.W.EXITSTATUS(status) != 0)
@@ -162,7 +175,7 @@ pub fn dispatch(comptime kind: r.Kind, init: std.process.Init, comptime handler:
         runtime.custodian(kind, init.gpa, init.io, &failures) catch |err| {
             if (err == error.RecordingFailed) {
                 try failures.record(.recording, .{ .stage = .state_record, .category = .local_io });
-            } else try failures.record(.primary, .{ .stage = .process_run, .category = .child_failed });
+            } else try failures.record(.primary, .{ .stage = .process_run, .category = if (err == error.Cancelled) .cancelled else .child_failed });
             try failures.record(.cleanup, .{ .stage = .process_cleanup, .category = .cleanup_failed });
             try deliver(init.gpa, failures);
             return err;

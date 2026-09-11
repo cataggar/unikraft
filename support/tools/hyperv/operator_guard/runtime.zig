@@ -58,6 +58,7 @@ pub fn custodian(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io, failur
         !std.meta.eql(value.directory, try k.directory(4)) or !std.meta.eql(value.worker_directory, try k.directory(7)))
         return error.DispatchIdentityMismatch;
     if (try k.readable(5) or try k.now() >= value.deadline_ns) return error.OwnerUnavailable;
+    if (try k.readable(9)) return error.Cancelled;
     _ = try k.checked(linux.fchdir(4));
     const directory = try r.core.private_files.Directory.openWorkerCwd(io);
     defer directory.close(io);
@@ -79,6 +80,7 @@ pub fn custodian(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io, failur
     const self = try k.identity(8, linux.getpid());
     const self_fd = try k.pidfd(self.pid);
     defer k.close(self_fd);
+    var ceiling = try std.math.add(u64, value.deadline_ns, @as(u64, value.cleanup_ms) * std.time.ns_per_ms);
     const child = try k.spawnNamespace(6, &.{ public_fd, 7, 5, 6, self_fd, events[1], gate[0], 9 }, value.deadline_ns);
     const pid = child.pid;
     const retained = child.pidfd;
@@ -87,13 +89,14 @@ pub fn custodian(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io, failur
     defer if (!reaped) {
         // No proof can be emitted on this path. PID1 also watches the original
         // owner independently, so a blocked recording writer cannot keep work alive.
-        terminateAndReap(child, value.cleanup_ms) catch {
+        terminateAndReap(child, value.cleanup_ms, ceiling) catch {
             if (failures.cleanup == null) failures.cleanup = .{ .stage = .process_cleanup, .category = .cleanup_failed };
         };
     };
     const ready_deadline = @min(value.deadline_ns, try k.now() + 5 * std.time.ns_per_s);
     var ready: [1]u8 = undefined;
     while (!try k.readable(events[0])) {
+        if (try k.readable(9)) return error.Cancelled;
         if (try k.readable(retained) or try k.readable(5) or try k.now() >= ready_deadline) return error.NamespaceSetupFailed;
         k.pause();
     }
@@ -102,8 +105,10 @@ pub fn custodian(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io, failur
     try k.requirePid1(8, pid);
     if (std.meta.eql(namespace_init.namespace, self.namespace)) return error.NamespaceIsolationMissing;
     try k.mapChild(8, pid);
+    if (try k.readable(9)) return error.Cancelled;
     try k.write(gate[1], &.{0x55});
     while (!try k.readable(events[0])) {
+        if (try k.readable(9)) return error.Cancelled;
         if (try k.readable(retained) or try k.readable(5) or try k.now() >= ready_deadline) return error.NamespaceSetupFailed;
         k.pause();
     }
@@ -136,13 +141,15 @@ pub fn custodian(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io, failur
     try publish(&lock, io, "custody-registration.json", registration_bytes);
     var status: u32 = undefined;
     var owner_lost = try k.readable(5);
-    var cancelled = false;
+    var cancelled = try k.readable(9);
     // Once registered, even a pre-dispatch interruption must reach the kernel
     // reap/seal path. Never open the worker gate after authority has ended.
-    if (!owner_lost and try k.now() < value.deadline_ns) {
+    if (!owner_lost and !cancelled and try k.now() < value.deadline_ns) {
         try k.write(gate[1], &.{0x47});
-    } else try k.kill(retained);
-    const ceiling = try std.math.add(u64, value.deadline_ns, @as(u64, value.cleanup_ms) * std.time.ns_per_ms);
+    } else {
+        ceiling = @min(ceiling, (try r.core.process.Deadline.afterMilliseconds(value.cleanup_ms)).expires_ns);
+        try k.kill(retained);
+    }
     while (true) {
         if (try k.reap(pid)) |exited| {
             status = exited;
@@ -151,10 +158,12 @@ pub fn custodian(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io, failur
         }
         if (try k.readable(5)) {
             owner_lost = true;
+            ceiling = @min(ceiling, (try r.core.process.Deadline.afterMilliseconds(value.cleanup_ms)).expires_ns);
             try k.kill(retained);
         }
         if (try k.readable(9)) {
             cancelled = true;
+            ceiling = @min(ceiling, (try r.core.process.Deadline.afterMilliseconds(value.cleanup_ms)).expires_ns);
             try k.kill(retained);
         }
         if (try k.now() >= value.deadline_ns) try k.kill(retained);
@@ -172,6 +181,7 @@ pub fn custodian(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io, failur
         cause = std.enums.fromInt(r.Cause, event.cause) orelse return error.InvalidInitializerReport;
         if (event.worker_status != std.math.maxInt(u32)) worker_status = event.worker_status;
     }
+    cancelled = cancelled or try k.readable(9);
     if (owner_lost and cause == .initializer_failed) cause = .owner_died;
     if (cancelled and cause == .initializer_failed) cause = .cancelled;
     if (cause == .initializer_failed and try k.now() >= value.deadline_ns) cause = .deadline;
@@ -187,13 +197,13 @@ pub fn custodian(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io, failur
             else => .child_failed,
         },
     };
-    const seal: r.Seal = .{ .schema = "uk-operator-custody-seal-v1", .witness = .pid_namespace_init_reaped, .registration = r.hash(registration_bytes), .cause = cause, .init_status = status, .worker_status = worker_status, .stopped_ns = try k.now(), .failures = failures.* };
-    const sealed = try signer.sign(a, seal, "uk-operator-custody-seal-v1");
+    const seal: r.Seal = .{ .schema = r.seal_schema, .witness = .pid_namespace_init_reaped, .publication = .unconfirmed, .registration = r.hash(registration_bytes), .cause = cause, .init_status = status, .worker_status = worker_status, .stopped_ns = try k.now(), .failures = failures.* };
+    const sealed = try signer.sign(a, seal, r.seal_schema);
     defer a.free(sealed);
     try publish(&lock, io, "custody-seal.json", sealed);
 }
-fn terminateAndReap(child: k.Child, cleanup_ms: u32) !void {
-    const deadline = try r.core.process.Deadline.afterMilliseconds(cleanup_ms);
+fn terminateAndReap(child: k.Child, cleanup_ms: u32, ceiling: u64) !void {
+    const deadline: r.core.process.Deadline = .{ .expires_ns = @min(ceiling, (try r.core.process.Deadline.afterMilliseconds(cleanup_ms)).expires_ns) };
     try k.kill(child.pidfd);
     while (try k.reap(child.pid) == null) {
         if (try deadline.expired()) return error.ProcessRecoveryRequired;
@@ -209,6 +219,7 @@ pub fn namespaceInit(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io) !v
     if (linux.getpid() != 1 or linux.getppid() != 0) return error.NotNamespaceInit;
     _ = try k.checked(linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0));
     if (try k.readable(7) or try k.readable(5)) return error.OwnerUnavailable;
+    if (try k.readable(10)) return error.Cancelled;
     const configuration = try readDispatch(Dispatch, a, io);
     defer configuration.deinit();
     const value = configuration.value;
@@ -218,18 +229,20 @@ pub fn namespaceInit(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io) !v
     try k.write(8, &.{0x52});
     // No worker exists until registration durability has been acknowledged.
     while (!try k.readable(9)) {
+        if (try k.readable(10)) return error.Cancelled;
         if (try k.readable(5) or try k.readable(7) or try k.now() >= value.deadline_ns) return error.OwnerUnavailable;
         k.pause();
     }
     var gate: [1]u8 = undefined;
     if (try k.read(9, &gate) != 1 or gate[0] != 0x47 or try k.readable(5) or try k.readable(7) or
-        try k.now() >= value.deadline_ns) return error.DispatchNotAdmitted;
+        try k.readable(10) or try k.now() >= value.deadline_ns) return error.DispatchNotAdmitted;
     const stdout = try k.pipe();
     defer for (stdout) |descriptor| k.close(descriptor);
     const stderr = try k.pipe();
     defer for (stderr) |descriptor| k.close(descriptor);
     _ = try k.checked(linux.fcntl(stdout[1], linux.F.SETFL, 0));
     _ = try k.checked(linux.fcntl(stderr[1], linux.F.SETFL, 0));
+    if (try k.readable(10)) return error.Cancelled;
     const child = try k.spawn(6, "--operator-guard-worker", &.{ 3, 4, 6 }, .{ stdout[1], stderr[1] });
     const pid = child.pid;
     defer k.close(child.pidfd);
@@ -247,11 +260,9 @@ pub fn namespaceInit(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io) !v
             break;
         }
         if (try k.readable(10)) {
-            var cancel: u64 = 0;
-            if (try k.read(10, std.mem.asBytes(&cancel)) == 8 and cancel != 0) {
-                cause = .cancelled;
-                break;
-            }
+            // Readiness is the latch. Neither independent observer consumes it.
+            cause = .cancelled;
+            break;
         }
         var overflow = false;
         for ([_]i32{ stdout[0], stderr[0] }, &counts) |descriptor, *count| {
@@ -293,7 +304,8 @@ pub fn namespaceInit(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io) !v
         k.pause();
     }
     const event: Event = .{ .cause = @intFromEnum(cause), .worker_status = worker_status };
-    try k.write(8, std.mem.asBytes(&event));
+    const report: std.Io.File = .{ .handle = 8, .flags = .{ .nonblocking = true } };
+    try report.writeStreamingAll(io, std.mem.asBytes(&event));
     // Exiting PID1 is the containment primitive, including setsid/double-fork
     // descendants. The custodian must reap this init before signing a witness.
 }

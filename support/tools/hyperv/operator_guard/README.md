@@ -34,10 +34,13 @@ custodian pidfd, the dispatch gate and the monotonic deadline. It arms
 `PDEATHSIG=SIGKILL` and checks parent-death races both before exec and before
 dispatch. Both PID1 and the custodian observe owner death independently.
 
-PID1 remains a raw-syscall supervisor while the typed worker executes, with
+PID1 uses a raw-syscall monitoring loop while the typed worker executes, with
 64 KiB stdout and stderr limits. Existing engine/process supervisors may run
 inside the worker. Their new process groups, `setsid`, double-forked children
 and nested PID namespaces remain inside this PID namespace.
+The final fixed-size event uses the nonblocking I/O report pipe; a stalled
+reporter cannot prevent the independently observing custodian from terminating
+the namespace.
 
 Linux kills every member when namespace PID1 exits. The custodian must actually
 `waitpid` and reap that pinned PID1 before signing a
@@ -89,7 +92,16 @@ only an explicit bounded private seed file matching that public key. No
 ambient credentials, host trust override or private key in argv/env/image is
 introduced. The signer and sensitive buffers must be destroyed.
 
-`Handle.cancel()` requests local termination. `Handle.wait(allocator)` reaps
+`Handle.cancel()` latches local termination in the shared eventfd. Neither PID1
+nor the custodian reads/drains that counter: both independently poll it,
+including before mapping/dispatch gates and worker creation. Repeated
+cancellation cannot clear the event or renew the first cancellation deadline.
+`Handle.wait` also observes externally queued cancellation and shortens its
+ceiling to the earlier of the original attempt-plus-cleanup deadline and the
+first cancellation observation plus `cleanup_ms`. It reserves termination and
+reaping inside that ceiling even if both namespace observers are paused.
+
+`Handle.wait(allocator)` reaps
 the custodian and returns status plus independent primary/cleanup/recording
 lanes. **That result is not a stopped-process proof.** If the custodian cannot
 be reaped, `wait` returns `ProcessRecoveryRequired` and the handle retains its
@@ -129,10 +141,30 @@ are trusted; this does not sandbox a hostile same-UID host administrator.
 Private create-only files are `custody-claim.json`,
 `custody-registration.json`, and `custody-seal.json`; the existing stable core
 writer lock is reused. The signed schemas/domains are
-`uk-operator-custody-registration-v1` and `uk-operator-custody-seal-v1`.
+`uk-operator-custody-registration-v1` and `uk-operator-custody-seal-v2`.
 Signatures are Ed25519 over `domain + "\n" + canonical(body)`; canonical JSON
 has sorted keys and a final LF. The seal hashes the entire signed registration.
-Fields, including schema and witness, are required; there is no legacy import.
+Fields, including schema, witness and `publication: "unconfirmed"`, are
+required; there is no legacy import. A v1 seal, omitted publication field or
+signed assertion of confirmed publication is refused.
+
+A seal is created **before** its own final name and parent-directory fsync.
+Consequently it can witness the preceding kernel reap, but cannot certify
+its own subsequent publication outcome. There is no second finalization
+marker repeating that circular assertion. Every persisted `recovery.load`,
+`inspect` or `awaitStopped` proof has `publication = .unconfirmed` and
+`scope = .cleanup_only`, even when the worker's cause is `.completed`.
+The loader retains all signed prior failures and fills otherwise empty
+recording and local-file cleanup lanes with `.ambiguous`. A visible signed
+seal after failed/interrupted fsync therefore never becomes all-clear
+recording. `inspect.reason = .stopped` describes process custody only.
+
+Live feedback reports the actual publication return, including known
+fsync/cleanup failures, independently of the earlier worker failure.
+Successful live feedback is not a persistable replacement for this loader,
+nor may a caller boolean, serialized `WaitResult` or missing feedback erase
+recovery uncertainty. Integration must carry both the live failure lanes and
+the cleanup-only persisted proof without promoting it to a completed run.
 
 Owner death normally leaves the custodian able to reap PID1 and seal a
 cleanup-only witness, preserving the primary interruption. Killing the
@@ -143,17 +175,19 @@ and witness, an uninterruptible kernel exit, or lost/uncertain recording is
 No privileged persistent witness service or broader approval is requested.
 Old attempts without this registration cannot be adopted.
 
-The witness discharges only local process custody. A non-completed cause
-permits the integrating engine's separately authorized cleanup path, never
-run resumption. Cloud mutation uncertainty, cleanup authority expiry, state
-recording failure, exact resource ownership and engine admission remain the
-engines' independent obligations.
+The witness discharges only local process custody. Its only recovery scope is
+the integrating engine's separately authorized cleanup path, never run
+resumption or completed-state admission. Cloud mutation uncertainty, cleanup
+authority expiry, state recording failure, exact resource ownership and engine
+admission remain the engines' independent obligations.
 
-Owner death or deadline expiry immediately after registration durability also
-goes through termination, reaping and cleanup-only sealing, without opening the
-worker gate. A surviving custodian does not abandon an already registered
-attempt. Live owners receive all accumulated failure lanes even when sealing
-succeeds; recovery after owner death instead consumes the durable seal.
+Owner death, cancellation or deadline expiry immediately after registration
+durability also goes through termination, reaping and cleanup-only sealing,
+without opening the worker gate. A surviving custodian does not abandon an
+already registered attempt. Live owners receive all accumulated failure lanes
+even when sealing succeeds; recovery after owner death instead consumes the
+signed stop witness while retaining unconfirmed publication and cleanup
+obligations.
 
 ## Requirements, accounting and native fixtures
 
@@ -168,6 +202,8 @@ three 16 KiB persistent-record slots, both 16 KiB sealed dispatch copies, a
 16 KiB emergency reservation, 4 KiB failure feedback, the 32-byte sealed key
 copy and both 64 KiB output limits. Failed or uncertain operations retain the
 reservation. The record/output/feedback limits are unchanged.
+The v2 publication field remains inside the existing seal slot; no new
+persistent marker, sealed descriptor copy or feedback copy was introduced.
 
 `Budget.admit(binary_bytes, control_reserved)` requires that complete charge
 to fit the reservation and that the reservation fit **both** explicit remaining
@@ -190,8 +226,61 @@ owner/custodian/PID1/worker/escaped-descendant kills, deadline/output limits,
 paused owner-observers, death at the registration-fsync boundary, pre-dispatch
 and recording failures, kernel pidfd reaping observations, exact
 budget bounds, cross-boot/stale/reused identities and malformed/missing proofs.
+Cancellation fixtures hold the registration gate until PID1 observes a queued
+event, pause PID1 after a single cancellation while the custodian is stopped
+(without any later signal that could relatch a drained event), and exercise
+both resumed-custodian termination and the owner's bounded
+both-observers-paused shutdown. Worker and escaped-descendant pidfds must
+report kernel reaping, not just exit. Publication fixtures inject failure or
+actual process interruption after the final seal is visible but before its
+directory fsync, with and without original-owner feedback.
 All workloads and signing keys are explicitly synthetic; namespace reaping is
-actual kernel behavior, not simulated success. `compile-guard` compiles the
-complete bound fixture for another supported Linux target without executing it.
+actual kernel behavior, not simulated success.
+
+`test` selects its driver mode with `-Doptimize`; the independently compiled
+native child defaults to ReleaseSmall and has an explicit
+`-Dfixture-optimize` selector. The correction suites passed 19/19 in Debug
+with a ReleaseSmall child and 19/19 with **both driver and child ReleaseSafe**.
+`compile-guard` now honors `-Doptimize` for the complete target fixture and
+its module, rather than silently selecting ReleaseSmall.
+
+From the worktree root, using existing private fixture directories:
+
+```sh
+root="$PWD/.d/zig-migration-operator-guard"
+export TMPDIR="$root/tmp" XDG_CACHE_HOME="$root/cache"
+export ZIG_GLOBAL_CACHE_DIR="$root/global-cache"
+for mode in Debug ReleaseSafe; do
+    child=ReleaseSmall
+    if [ "$mode" = ReleaseSafe ]; then child=ReleaseSafe; fi
+    export ZIG_LOCAL_CACHE_DIR="$root/$mode/cache"
+    /home/g/.local/bin/zig build --build-file support/tools/hyperv/operator_guard/build.zig test install \
+        -Dtest-root="$root/$mode/fixtures" -Doptimize="$mode" -Dfixture-optimize="$child" -j2 \
+        --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+        --prefix "$root/$mode/install" --summary all
+done
+for target in x86_64-linux-musl aarch64-linux-musl; do
+    export ZIG_LOCAL_CACHE_DIR="$root/targets-release-safe/$target/cache"
+    /home/g/.local/bin/zig build --build-file support/tools/hyperv/operator_guard/build.zig compile-guard \
+        -Dtarget="$target" -Doptimize=ReleaseSafe -j2 \
+        --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+        --prefix "$root/targets-release-safe/$target/install" --summary all
+done
+```
+
+Measured complete, unstripped `operator-guard-target-fixture` artifacts for
+these actual ReleaseSafe target builds:
+
+| Target | Executable bytes | Executable + 233,504 reservation |
+| --- | ---: | ---: |
+| x86_64-linux-musl | 5,670,240 | 5,903,744 |
+| aarch64-linux-musl | 5,573,536 | 5,807,040 |
+
+The earlier 398,584 / 368,288 byte target measurements were **ReleaseSmall**,
+not ReleaseSafe, and preceded these corrections. The current measurements
+include the separately bound synthetic fixture; neither table is a
+measurement of the final integrated operator, all copies or its runtime
+assets. **Final 8 MiB / 256 MiB operator-ledger fit remains unproven.**
+
 Use explicit private `-Dtest-root`, `--cache-dir`, `--global-cache-dir`,
 `--prefix`, and `-j2`. No public CLI or existing engine is integrated here.
