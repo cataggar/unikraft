@@ -6,6 +6,7 @@ const r = guard.records;
 pub const Mode = enum { normal, deadline, flood, before, recording, registration, cancel, after_registration };
 pub const Request = struct { mode: Mode, expected: r.Expected };
 pub const seed = [_]u8{0x59} ** 32;
+pub const budget: r.Budget = .{ .control = 8388608, .staging = 268435456 };
 
 // Test-only I/O adapter in this separately compiled synthetic executable. Kill
 // the real owner after registration directory fsync, before publication returns.
@@ -83,7 +84,7 @@ fn execute(init: std.process.Init) !void {
         .worker_directory = work,
         .deadline = try guard.core.process.Deadline.afterMilliseconds(if (parsed.value.mode == .deadline) 2000 else 20000),
         .cleanup_ms = 2000,
-        .control_reserved = r.max_control,
+        .control_reserved = parsed.value.expected.budget.control,
     });
     if (parsed.value.mode == .cancel) {
         while (true) {

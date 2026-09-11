@@ -52,6 +52,7 @@ const Fixture = struct {
             .context = r.hash(name),
             .implementation = identity.digest,
             .public_key = pair.public_key.toBytes(),
+            .budget = f.budget,
         };
         if (mode == .recording) try directory.dir.writeFile(io, .{ .sub_path = "custody-seal.json", .data = "occupied\n", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
         if (mode == .registration) try directory.dir.writeFile(io, .{ .sub_path = "custody-registration.json", .data = "occupied\n", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
@@ -330,10 +331,53 @@ test "recording failure retains prior worker failure and independent cleanup obl
 }
 
 test "guard control reservation includes executable records and output at exact policy boundary" {
-    try t.expectEqual(@as(u64, 2097152), try guard.requiredControl(2097152 - r.overhead));
-    try t.expectError(error.ControlReservationExceeded, guard.requiredControl(2097152 - r.overhead + 1));
+    try t.expectEqual(@as(u64, 8388608), try guard.requiredControl(8388608 - r.overhead));
+    try f.budget.admit(8388608 - r.overhead, 8388608);
+    try t.expectError(error.ControlReservationExceeded, f.budget.admit(8388608 - r.overhead + 1, 8388608));
+    try t.expectError(error.ControlReservationExceeded, f.budget.admit(8388608 - r.overhead + 1, 8388609));
+    try f.budget.admit(4 * 1024 * 1024, try guard.requiredControl(4 * 1024 * 1024));
     try t.expectError(error.ControlReservationExceeded, guard.requiredControl(std.math.maxInt(u64)));
-    try t.expectEqual(@as(u64, 268435456), r.max_staging);
+    try t.expectEqual(@as(u64, 268435456), f.budget.staging);
+    try t.expectEqual(@as(usize, 233504), r.overhead);
+    try t.expectEqual(@as(usize, 16 * 1024), r.max_record);
+    try t.expectEqual(@as(usize, 64 * 1024), r.output_limit);
+    try t.expectEqual(@as(usize, 4096), r.feedback_limit);
+}
+
+test "explicit component budget enforces both remaining ledger allowances and all copies" {
+    const available: r.Budget = .{ .control = 500001, .staging = 500000 };
+    try available.admit(500000 - r.overhead, 500000);
+    try t.expectError(error.ControlReservationExceeded, available.admit(500001 - r.overhead, 500001));
+    const control_limited: r.Budget = .{ .control = 499999, .staging = 500000 };
+    try t.expectError(error.ControlReservationExceeded, control_limited.admit(500000 - r.overhead, 500000));
+    try t.expectError(error.ControlReservationExceeded, available.admit(0, r.overhead - 1));
+    try t.expectError(error.InvalidBudget, (r.Budget{ .control = 0, .staging = 500000 }).reserve(r.overhead));
+    try t.expectError(error.InvalidBudget, (r.Budget{ .control = 500000, .staging = 0 }).reserve(r.overhead));
+}
+
+test "signed custody binds the explicit budget without a missing-field default" {
+    var fixture = try Fixture.init(.normal);
+    defer fixture.deinit();
+    _ = try fixture.registration();
+    try fixture.waitFile(fixture.work, "ready");
+    try fixture.release();
+    _ = try fixture.wait();
+    const proof = try guard.recovery.load(a, io, fixture.directory, fixture.expected);
+    try t.expectEqual(f.budget, proof.expected.budget);
+    var changed = fixture.expected;
+    changed.budget.control -= 1;
+    try t.expectError(error.ProcessRecoveryRequired, guard.recovery.load(a, io, fixture.directory, changed));
+    changed = fixture.expected;
+    changed.budget.staging -= 1;
+    try t.expectError(error.ProcessRecoveryRequired, guard.recovery.load(a, io, fixture.directory, changed));
+    const bytes = try r.canonical(a, fixture.expected);
+    defer a.free(bytes);
+    var document = try guard.core.contracts.Document.parse(a, bytes, .{});
+    defer document.deinit();
+    try t.expect(document.parsed.value.object.swapRemove("budget"));
+    const missing = try document.canonicalAlloc(a);
+    defer a.free(missing);
+    try t.expectError(error.MissingField, r.parse(r.Expected, a, missing));
 }
 
 test "registration publication failure cannot release the worker gate" {

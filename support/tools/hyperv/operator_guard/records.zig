@@ -4,9 +4,30 @@ pub const Hash = [32]u8;
 pub const Uuid = [36]u8;
 pub const max_record = 16 * 1024;
 pub const output_limit = 64 * 1024;
-pub const overhead = 4 * max_record + 2 * output_limit;
-pub const max_control = 2097152;
-pub const max_staging = 268435456;
+pub const feedback_limit = 4096;
+// Claim, registration, seal, both sealed dispatch copies, emergency capacity,
+// failure feedback, the sealed key copy, and both bounded output streams.
+pub const overhead = 6 * max_record + feedback_limit + 32 + 2 * output_limit;
+pub const Budget = struct {
+    control: u64,
+    staging: u64,
+
+    pub fn validate(self: Budget) !void {
+        if (self.control == 0 or self.staging == 0) return error.InvalidBudget;
+    }
+    pub fn reserve(self: Budget, bytes: u64) !void {
+        try self.validate();
+        if (bytes < overhead or bytes > self.control or bytes > self.staging)
+            return error.ControlReservationExceeded;
+    }
+    pub fn admit(self: Budget, binary_bytes: u64, reserved: u64) !void {
+        try self.reserve(reserved);
+        if (try requiredControl(binary_bytes) > reserved) return error.ControlReservationExceeded;
+    }
+};
+pub fn requiredControl(binary_bytes: u64) !u64 {
+    return std.math.add(u64, binary_bytes, overhead) catch error.ControlReservationExceeded;
+}
 pub const Operation = enum { preflight, persistence, cleanup };
 pub const Kind = enum { production, synthetic };
 pub const Namespace = struct { device_major: u32, device_minor: u32, inode: u64 };
@@ -20,8 +41,10 @@ pub const Expected = struct {
     context: Hash,
     implementation: Hash,
     public_key: [32]u8,
+    budget: Budget,
 
     pub fn validate(self: Expected) !void {
+        try self.budget.validate();
         _ = try core.contracts.parseUuid(&self.attempt);
         _ = try core.contracts.parseUuid(&self.run);
         if (std.mem.allEqual(u8, &self.context, 0) or std.mem.allEqual(u8, &self.implementation, 0) or

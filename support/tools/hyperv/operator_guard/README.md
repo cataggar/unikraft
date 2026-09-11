@@ -78,8 +78,12 @@ pub fn start(allocator, io, options: Options) !Handle;
 `Options` requires independently admitted `Expected`, a matching explicit
 `Signer`, separate private guard and engine-worker directory descriptors, a
 monotonic deadline and cleanup/control reservations. `Expected` contains kind,
-operation, run/attempt UUIDs, complete context digest, exact executable digest
-and trusted proof public key. The library rehashes its actual executable;
+operation, run/attempt UUIDs, complete context digest, exact executable digest,
+trusted proof public key and required `budget: Budget`. The budget contains
+independent remaining `control` and `staging` byte allowances for this guard
+component, derived by the trusted parent from its admitted ledger. Both are
+bound into the consumed claim, dispatch and signed registration. The library
+rehashes its actual executable;
 callers cannot select a different worker executable. `Signer.load` accepts
 only an explicit bounded private seed file matching that public key. No
 ambient credentials, host trust override or private key in argv/env/image is
@@ -159,12 +163,24 @@ private descriptor-safe local files are required. Missing kernel facilities
 fail closed without a process-group fallback. No host capability, daemon,
 shell child, Python, cloud call or package dependency is needed.
 
-`requiredControl(binary_bytes)` charges the executable plus four 16 KiB record/
-dispatch/emergency reservations and both 64 KiB output limits. Every call must
-fit its explicitly reserved component budget; the integrating parent must also
-charge all guard/engine binaries, state, worker controls and any actual copies
-in the unchanged **2,097,152 control / 268,435,456 cumulative staging** ledger.
-These component bounds are not whole-workflow admission or an exemption.
+`requiredControl(binary_bytes)` charges the executable plus **233,504 bytes**:
+three 16 KiB persistent-record slots, both 16 KiB sealed dispatch copies, a
+16 KiB emergency reservation, 4 KiB failure feedback, the 32-byte sealed key
+copy and both 64 KiB output limits. Failed or uncertain operations retain the
+reservation. The record/output/feedback limits are unchanged.
+
+`Budget.admit(binary_bytes, control_reserved)` requires that complete charge
+to fit the reservation and that the reservation fit **both** explicit remaining
+allowances. The guard contains no independent hardcoded workflow cap. The
+trusted parent must derive the allowances from the approved **8,388,608 control /
+268,435,456 cumulative staging** policy, after charging other reservations,
+all guard/engine copies and runtime assets. They are not caller-controlled
+runtime policy overrides, whole-workflow admission or exemptions. The still
+unmeasured components must fit the final ledger; this approval changes no cloud
+or seed authority and no legacy, wire or document limit.
+
+The required budget has no missing-field default. Older guard records lacking
+it fail closed; no receipt/history rewriting or attempt reuse is provided.
 The parent must start all relevant engine writers inside the namespace; a
 guard cannot adopt an older process forest. Separately authorized cleanup
 uses a fresh guard directory without resetting the consumed engine attempt.

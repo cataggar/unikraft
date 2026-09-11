@@ -48,9 +48,9 @@ fn loadChecked(a: std.mem.Allocator, io: std.Io, directory: r.core.private_files
         value.custodian.start_ticks == 0 or value.namespace_init.start_ticks == 0 or
         value.registered_ns == 0 or value.registered_ns >= value.deadline_ns or
         value.cleanup_ms < 100 or value.cleanup_ms > 1200000 or
-        std.meta.eql(value.namespace_init.namespace, value.custodian.namespace) or
-        value.control_reserved > r.max_control or value.control_reserved < r.overhead)
+        std.meta.eql(value.namespace_init.namespace, value.custodian.namespace))
         return error.InvalidRegistration;
+    try expected.budget.reserve(value.control_reserved);
     const claim_bytes = try directory.read(io, a, "custody-claim.json", r.max_record, null);
     defer a.free(claim_bytes);
     const Claim = struct { nonce: r.Hash, expected: r.Expected };

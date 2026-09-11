@@ -6,6 +6,8 @@ pub const runtime = @import("runtime.zig");
 pub const recovery = @import("recovery.zig");
 pub const Signer = records.Signer;
 pub const Expected = records.Expected;
+pub const Budget = records.Budget;
+pub const requiredControl = records.requiredControl;
 pub const Proof = records.Proof;
 pub const WorkerInput = runtime.WorkerInput;
 const k = kernel;
@@ -46,7 +48,7 @@ pub const Handle = struct {
                     result.failures.primary = .{ .stage = .process_run, .category = .timeout };
                     result.failures.cleanup = .{ .stage = .process_cleanup, .category = .cleanup_failed };
                 }
-                var buffer: [4096]u8 = undefined;
+                var buffer: [r.feedback_limit]u8 = undefined;
                 const length = k.read(self.feedback_fd, &buffer) catch return error.FailureDeliveryLost;
                 if (length != 0) {
                     const parsed = try r.parse(core.diagnostics.Failures, a, buffer[0..length]);
@@ -95,8 +97,7 @@ pub fn start(a: std.mem.Allocator, io: std.Io, options: Options) !Handle {
     defer k.close(executable);
     const identity = try selfIdentity(io, executable);
     if (!std.mem.eql(u8, &identity.digest, &options.expected.implementation)) return error.NativeBindingMismatch;
-    if (options.control_reserved > r.max_control or try requiredControl(identity.bytes) > options.control_reserved)
-        return error.ControlReservationExceeded;
+    try options.expected.budget.admit(identity.bytes, options.control_reserved);
     const proc = try k.openProc();
     defer k.close(proc);
     try k.requireUnprivileged(proc);
@@ -134,11 +135,6 @@ pub fn start(a: std.mem.Allocator, io: std.Io, options: Options) !Handle {
     return .{ .pid = child.pid, .pidfd = child.pidfd, .cancel_fd = cancellation, .feedback_fd = feedback[0], .deadline = options.deadline, .cleanup_ms = options.cleanup_ms };
 }
 pub const ExecutableIdentity = struct { digest: r.Hash, bytes: u64 };
-pub fn requiredControl(binary_bytes: u64) !u64 {
-    const bytes = std.math.add(u64, binary_bytes, r.overhead) catch return error.ControlReservationExceeded;
-    if (bytes > r.max_control) return error.ControlReservationExceeded;
-    return bytes;
-}
 pub fn selfIdentity(io: std.Io, descriptor: k.linux.fd_t) !ExecutableIdentity {
     const file: std.Io.File = .{ .handle = descriptor, .flags = .{ .nonblocking = false } };
     const before = try core.private_files.snapshot(file);
@@ -185,6 +181,6 @@ fn deliver(a: std.mem.Allocator, failures: core.diagnostics.Failures) !void {
     if (try k.readable(5)) return;
     const bytes = try r.canonical(a, failures);
     defer a.free(bytes);
-    if (bytes.len > 4096) return error.FailureDeliveryLost;
+    if (bytes.len > r.feedback_limit) return error.FailureDeliveryLost;
     try k.write(11, bytes);
 }

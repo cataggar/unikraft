@@ -36,7 +36,7 @@ fn validate(comptime kind: r.Kind, io: std.Io, value: Dispatch, executable: i32)
     if (value.expected.kind != kind) return error.KindMismatch;
     const image = try root.selfIdentity(io, executable);
     if (!std.mem.eql(u8, &image.digest, &value.expected.implementation)) return error.NativeBindingMismatch;
-    if (image.bytes + r.overhead > value.control_reserved or value.control_reserved > r.max_control) return error.ControlReservationExceeded;
+    try value.expected.budget.admit(image.bytes, value.control_reserved);
     if (value.cleanup_ms < 100 or value.cleanup_ms > 1200000) return error.InvalidDeadline;
     const now = try k.now();
     if (value.deadline_ns <= now or value.deadline_ns - now > 3600 * std.time.ns_per_s) return error.InvalidDeadline;
