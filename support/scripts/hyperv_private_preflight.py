@@ -251,7 +251,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "e1bc884e9ba8a0186761c5827ac796d1e3ff17cff09fc19d2100d311c8e6a893"
+        "b9afb89b139ed15827aa7313b53f9bf99816260d782328ce94af74c46457cfc8"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"

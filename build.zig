@@ -163,7 +163,10 @@ pub fn build(b: *std.Build) void {
     defer if (selected_environment) |*selected| selected.deinit();
     if (b.option([]const u8, "native-make-environment", "Private canonical native Make environment contract (Linux only)")) |path| {
         selected_environment = native_make_environment.read(b.allocator, b.graph.io, path) catch |err| {
-            addFailedTargets(b, b.fmt("unable to load explicit native Make environment: {s}", .{@errorName(err)}));
+            const message = b.fmt("unable to load explicit native Make environment: {s}", .{@errorName(err)});
+            // Later unregistered options must not hide the actual input failure.
+            std.debug.print("error: {s}\n", .{message});
+            addFailedTargets(b, message);
             return;
         };
     }

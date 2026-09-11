@@ -815,9 +815,11 @@ jobs:
     - name: Exercise explicit private native Make configuration
       run: |
         set -euo pipefail
+        export PATH="/usr/bin:/bin:${GHR_BIN_DIR}"
         umask 077
         root="${RUNNER_TEMP}/hyperv-ci/native-make-environment"
         mkdir -p "${root}"/{tmp,cache,config,zig-local,zig-global}
+        root="$(readlink -f "${root}")"
         for mode in Debug ReleaseSafe; do
           zig build -j2 test-native-make-environment \
             --cache-dir "${root}/tests" \
@@ -826,9 +828,9 @@ jobs:
             --summary all
         done
         printf '{"bison_data":"%s","m4":"%s","schema":"unikraft_native_make_environment_v1","shell":"%s","tmp":"%s","xdg_cache":"%s","xdg_config":"%s","zig_global_cache":"%s","zig_local_cache":"%s"}\n' \
-          "$(readlink -f "$(bison --print-datadir)")" \
-          "$(readlink -f "$(command -v m4)")" \
-          "$(readlink -f "$(command -v bash)")" \
+          "$(readlink -f "$(/usr/bin/bison --print-datadir)")" \
+          "$(readlink -f /usr/bin/m4)" \
+          "$(readlink -f /usr/bin/bash)" \
           "${root}/tmp" "${root}/cache" "${root}/config" \
           "${root}/zig-global" "${root}/zig-local" > "${root}/environment.json"
         cp support/apps/hyperv-acceptance/defconfig "${root}/input.config"
@@ -838,6 +840,7 @@ jobs:
           --cache-dir "${root}/zig-local" \
           --global-cache-dir "${root}/zig-global" \
           "-Dnative-make-environment=${root}/environment.json" \
+          -Dmake-command=/usr/bin/make \
           "-Dapp=${GITHUB_WORKSPACE}/support/apps/hyperv-acceptance" \
           "-Doutput=${root}/build" "-Dconfig=${root}/input.config" \
           "-Dcompiler=zig cc -target x86_64-freestanding-none" \
@@ -846,6 +849,19 @@ jobs:
         test "$(stat -c %a "${root}/input.config")" = 600
         grep --fixed-strings --line-regexp --quiet \
           CONFIG_APPHYPERVACCEPTANCE=y "${root}/input.config"
+        chmod 644 "${root}/environment.json"
+        if zig build -j2 olddefconfig \
+          --cache-dir "${root}/zig-local" \
+          --global-cache-dir "${root}/zig-global" \
+          "-Dnative-make-environment=${root}/environment.json" \
+          "-Doutput=${root}/build" "-Dcompiler=zig cc" \
+          > "${root}/refusal.log" 2>&1; then
+          echo "non-private native Make environment was accepted" >&2
+          exit 1
+        fi
+        grep --fixed-strings --line-regexp --quiet \
+          'error: unable to load explicit native Make environment: UnsafeFile' \
+          "${root}/refusal.log"
 
     - name: Run native Hyper-V object and ABI verifier fixtures
       run: |
