@@ -3,8 +3,9 @@
 Standalone Zig 0.16 replacement for `support/build/tests/hyperv-efi-boot-test.py`
 and its focused Python fixtures. No Python interpreter, SDK, cloud client,
 shell, package dependency, preparation engine, or host admission is used.
-Root build/CI wiring and removal of dormant Python references are separate
-parent integration work.
+Dedicated native CI fixtures and the fixed two-CPU SMP boot use this package.
+Public root CLI assembly and the remaining legacy Python call sites are separate
+integration work; this is not the complete Python-free controller cutover.
 
 **This is only a public local QEMU/KVM boot and log assertion. It does not
 establish VMBus, StorVSC, NetVSC, Azure, #120, or #89 acceptance, and cannot
@@ -166,6 +167,10 @@ artifact changes and unsafe files, independent failure lanes and actual CLI
 serialization/refusals. Only small public synthetic files are used; the
 over-limit input case is sparse metadata, not a seed copy.
 
-No actual guest boot, KVM, Python, Azure, credential, original seed, or
-historical private evidence is accessed. Real x86/KVM CI boot execution and
-root selector integration remain parent-owned.
+Offline fixtures access no actual guest, KVM, Python, Azure, credential,
+original seed or historical private evidence. Separately, Hyper-V CI invokes
+the installed ReleaseSafe driver for the real fixed two-CPU SMP raw-disk boot,
+with canonical paths, private firmware templates and an outer command ceiling
+covering local setup/post-exit I/O. The raw disk digest is checked independently
+afterward. The raw log and local report are retained; remaining legacy
+controller and packaging paths are not changed by this integration.
