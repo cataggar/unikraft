@@ -151,6 +151,122 @@ and revalidated exact commands/receipts/private serial files. Standalone,
 PREPARED, build-only, historical Python, FAILED, consumed noncomplete,
 substituted-native, and synthetic receipts are not a handoff.
 
+## Persistence consumer contract
+
+This describes the engine API introduced by commit
+`45088c9ffe6af2d387c3ab48f7e39f48e191cffc`. Persistence must use the actual
+committed preparer and this loader through parent-integrated imports, not copy
+another lane's working sources or implement a receipt-compatibility parser.
+
+The public entry is `@import("hyperv_preflight").completed.load`:
+
+```zig
+pub fn load(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    directory: core.private_files.Directory,
+    expected: *const contract.Input,
+) !completed.Handoff
+```
+
+The caller retains the private directory descriptor and runs the load under a
+hard-supervised read operation. The loader takes the directory lock itself;
+the caller must not already hold that lock. It reads the full private attempt
+directory, not a standalone completion file. The returned value owns no
+allocator-backed storage and needs no `deinit`.
+
+`Handoff` has exactly these data fields: `attempt`, `run_id`, `vm_id`,
+`host_boot_id`, `native`, `input_sha256`, `preparation_sha256`,
+`public_receipt_sha256`, `private_receipt_sha256`, `completion_sha256`, `scope`,
+and `storage`. UUID fields are `contract.Uuid` (`[36]u8` UUID text); hashes are
+`host.protocol.Hash` (`[32]u8`). `native` is `contract.NativeBinding` with
+`implementation`, `preparation`, `source`, `dependencies`, `tool_runtime`, and
+`operator_binary` hashes. These identify the preflight producer, not the
+future persistence executable.
+
+There is **no serialized Handoff schema or version**. It is an in-process
+result, not a portable admission token. Its `scope` is `.platform_only` and
+`storage` is `.unavailable`; neither authorizes persistence or fresh cloud
+operations. The preflight VM and its host boot UUID identify the completed
+preflight execution, whose owned group has been removed, not a VM to reuse.
+
+### Exact records and bindings
+
+Native preflight versions are encoded in the `schema` string's `-v1` suffix;
+there is no separate numeric `schema_version` in these records. Use the
+module's canonical codec and typed loader rather than reconstructing them.
+
+| Record or binding | Required relationship |
+| --- | --- |
+| `state.json` | `uk-hyperv-preflight-state-v1`, `kind = production`, `phase = completed`; every action complete with a non-null proof; all three failure lanes null. Recovery state alone cannot qualify. |
+| `intent-<action>.json` | `uk-hyperv-preflight-operation-v1`; exact action, consumed attempt, original run, authority digest, native implementation binding and retained debit. Missing or interrupted intents cannot qualify. |
+| `completion.json` | Envelope fields `body` and `signature`; body schema and Ed25519 signature domain both `uk-hyperv-preflight-completion-v1`. `completion_sha256` hashes the entire envelope bytes. |
+| Original authority | `authority_sha256 = SHA256(canonical(expected.approved))`; the private `admitted-context.json` must hash to it. This binds the original authority/resource/image/key/route/provider/budget context, not new persistence approvals. |
+| Native source and artifacts | State `binding` equals `expected.preparation.binding`; `input_sha256` equals its validated input-manifest digest; `preparation_sha256 = SHA256(canonical(expected.preparation))`, including the exact paths, artifact descriptors and both manifests. |
+| Commands and acceptance | Existing `uk-hyperv-host-command-v1` and `uk-hyperv-public-acceptance-v1` signed contracts; exact original run/VM, distinct saved phase nonces, phase, manifest/image/runner hashes, artifact roles/names/sizes/hashes and derived Blob scope. The private acceptance binds the exact public command digest, public receipt digest, public nonce and host boot UUID. |
+| Host receipts and serial | Existing `uk-hyperv-host-evidence-v1`; production `qemu_kvm`, `PASS`, platform-only scope, matching command/manifest/runner/guest-image/host-image hashes. Exactly two public and four private launches, unique valid launch UUIDs across all six, continuous host boot UUID, required image/APIC order, exact serial lengths/hashes and reused serial-semantic assertions. |
+| Cleanup and accounting | Complete recorded cleanup actions, separate independent group-absence proof, no retained failure lane, and host ledger snapshots within the approved disjoint reservations. No 403-to-absence or absence-to-DELETE-success conversion. |
+
+The exact signed completion body fields are `schema`, `kind`, `attempt`,
+`run_id`, `binding`, `input_sha256`, `preparation_sha256`, `authority_sha256`,
+`public`, `private`, `group_absence`, `scope`, and `storage`. The final two wire
+values are `"platform-only"` and `"UNAVAILABLE"`. The signature is 128
+lowercase hexadecimal characters encoding Ed25519's 64 signature bytes over
+`domain + "\n" + canonical(body)`; canonical body bytes include their final LF.
+The loader reconstructs and compares the entire body, not a subset of hashes.
+
+`public` and `private` are `evidence.Summary` values containing `kind`, `phase`,
+`receipt_sha256`, `command_sha256`, `phase_nonce`, `vm_id`, `host_boot_id`,
+`launches`, `count`, `host_staged`, `host_control`, and `host_evidence`.
+`group_absence` equals the proof recorded for `prove_group_absent`.
+
+The loader additionally requires accepted mutation effects for `create_group`,
+`deploy_host`, `grant_access`, `stage_public`, `publish_public`,
+`stage_private`, `publish_private`, `deallocate`, `revoke_roles`, `revoke_sas`,
+and `delete_group`. The cleanup sequence also includes `prove_sas_revoked`,
+`clear_firewall`, `prove_group_absent`, and `dispose_credentials`; all require
+complete recorded proofs. Merely observing absence does not substitute for the
+accepted mandatory mutations.
+
+The loader reopens both command files, both receipt files, and `boot-0.log`
+through `boot-5.log`; it does not accept receipt digests without those bytes.
+Commands/admission are evaluated at the recorded public/private evidence
+times. Public evidence cannot precede start, private evidence cannot precede
+public evidence or reach attempt expiry, and the last operation observation
+must precede cleanup-authority expiry. This is offline verification of a
+completed native attempt, not a live Azure absence check, a refresh of expired
+credentials, or permission to allocate again. It also does not rehash source
+Git or reopen/revalidate every guest artifact: that remains the actual
+preparer's job before the trusted input is supplied and before later reuse.
+
+### Non-forgeable production admission is an integration gate
+
+`Input`, `Approved`, and `Handoff` are ordinary public Zig structs. They are
+**not opaque, non-forgeable capabilities**. A `.production` enum, nonzero proof
+hashes, a structurally valid `Handoff`, or a signature verified under a key
+chosen by the same untrusted request cannot establish production admission.
+`Input.validate` checks consistency and the signed host contract under its
+supplied key; it does not authenticate the external approval-hash provenance.
+Likewise, the completion signature authenticates the native controller's
+record under the admitted key, not a separately signed Azure attestation.
+
+The required boundary is the complete trusted call chain: actual committed
+preparer validation and independently admitted original authority/image/key/
+route/provider/ledger inputs, then this loader over the protected native
+execution records, then internal consumption of its returned value. None of
+those trusted inputs may be selected from the receipt being authenticated.
+Persistence must not deserialize or manually assemble `Handoff`, accept
+`validated = true`, accept hashes alone, treat `qemu_kvm` as a self-proving
+label, or add standalone/build-only/historical receipt compatibility.
+
+That concrete preparer/authority-to-production-dispatch binding is **not
+implemented by this standalone engine commit**. Until the parent supplies and
+wires the real admitted interfaces, both preflight and persistence production
+execution must remain refused. Synthetic injection is limited to separately
+built fixtures and cannot discharge this gate. Even a successfully loaded
+preflight handoff requires separate #89 authority, artifact and lifecycle
+admission before any persistence operation.
+
 ## Byte accounting
 
 Limits remain **2,097,152 control bytes** and **268,435,456 cumulative staged
