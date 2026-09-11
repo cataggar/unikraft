@@ -56,8 +56,9 @@ pub fn run(allocator: std.mem.Allocator, instructions: []const assembly.Instruct
                 var state = flow.branch(item.state, branch_op, take) orelse continue;
                 if (is_set) {
                     try flow.writeOperand(&state, target, .{ .kind = .integer, .id = @intFromBool(take) });
-                } else if (take) {
-                    try flow.writeOperand(&state, target, flow.source(state, pc, operands.items[0]));
+                } else if (take or assembly.registerWidth(target) == 32) {
+                    // CMOV r32 zero-extends the destination even when not taken.
+                    try flow.writeOperand(&state, target, flow.source(state, pc, if (take) operands.items[0] else target));
                 }
                 try choices.append(allocator, state);
             }

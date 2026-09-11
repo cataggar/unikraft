@@ -71,6 +71,281 @@ test "review regression masked stack stores cannot retain old pointer facts" {
     try std.testing.expect(state.get(location).kind == .unknown);
 }
 
+test "review regression narrowed stack aliases cannot preserve overwritten facts" {
+    var state = flow.State.entry(1);
+    const location = state.regs[4].plus(16);
+    try state.store(location, .{ .kind = .address, .id = 0x1234 }, 8, .none);
+    for ([_]Instruction{
+        instruction("leaq", "16(%rsp), %rax"),
+        instruction("movl", "%eax, %eax"),
+        instruction("movq", "$0, (%rax)"),
+    }) |op| {
+        flow.step(&state, op, .{}) catch |err| switch (err) {
+            error.UnsupportedProvenanceInstruction, error.UnprovenMemoryFootprint => return,
+            else => return err,
+        };
+    }
+    try std.testing.expect(state.get(location).kind == .unknown);
+}
+
+test "own stack narrowing refuses copies extensions partial writes and vector transfers" {
+    for ([_]Instruction{
+        instruction("movl", "%eax, %eax"),
+        instruction("movl", "%eax, %ecx"),
+        instruction("movw", "%ax, %cx"),
+        instruction("movb", "%al, %cl"),
+        instruction("movb", "%ah, %cl"),
+        instruction("movzbl", "%al, %ecx"),
+        instruction("movzbq", "%ah, %rcx"),
+        instruction("movzwl", "%ax, %ecx"),
+        instruction("movzwq", "%ax, %rcx"),
+        instruction("movslq", "%eax, %rcx"),
+        instruction("movsbq", "%al, %rcx"),
+        instruction("movl", "%esp, %ecx"),
+        instruction("leal", "16(%rsp), %ecx"),
+        instruction("movl", "%eax, 32(%rsp)"),
+        instruction("movb", "$1, %al"),
+        instruction("movw", "$1, %ax"),
+        instruction("movb", "$1, %ah"),
+        instruction("movq", "%rax, %xmm0"),
+    }) |op| {
+        var state = flow.State.entry(1);
+        state.regs[0] = state.regs[4].plus(16);
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, op, .{}));
+    }
+}
+
+test "own stack unsupported arithmetic and implicit writes cannot discard aliases" {
+    for ([_]Instruction{
+        instruction("andq", "$0xffffffff, %rax"),
+        instruction("orq", "$0, %rax"),
+        instruction("shrq", "$0, %rax"),
+        instruction("addl", "$0, %eax"),
+        instruction("imulq", "$2, %rax, %rcx"),
+        instruction("imull", "$1, %eax, %ecx"),
+        instruction("imulq", "%rcx, %rax"),
+        instruction("mulq", "%rcx"),
+        instruction("idivq", "%rcx"),
+        instruction("mulxq", "%rax, %rcx, %rsi"),
+        instruction("xchgq", "%rax, %rcx"),
+        instruction("xaddq", "%rax, %rcx"),
+        instruction("cmpxchgq", "%rcx, 32(%rsp)"),
+        instruction("cmpxchg16b", "32(%rsp)"),
+        instruction("incq", "%rax"),
+        instruction("negq", "%rax"),
+        instruction("notq", "%rax"),
+        instruction("bswapq", "%rax"),
+        instruction("sete", "%al"),
+        instruction("cltd", ""),
+    }) |op| {
+        var state = flow.State.entry(1);
+        state.regs[0] = state.regs[4].plus(16);
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, op, .{}));
+    }
+    var state = flow.State.entry(1);
+    state.regs[2] = state.regs[4].plus(16);
+    try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, instruction("cwtd", ""), .{}));
+    state.regs[1] = state.regs[4];
+    try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, instruction("loop", "1"), .{}));
+}
+
+test "own stack full width aliases offsets spills and independent replacements stay supported" {
+    var state = flow.State.entry(1);
+    const slot = state.regs[4].plus(16);
+    const callback: flow.Value = .{ .kind = .address, .id = 0x1234 };
+    try state.store(slot, callback, 8, .none);
+    for ([_]Instruction{
+        instruction("leaq", "8(%rsp), %rax"),
+        instruction("addq", "$16, %rax"),
+        instruction("subq", "$8, %rax"),
+        instruction("movq", "%rax, 32(%rsp)"),
+        instruction("movq", "32(%rsp), %rcx"),
+        instruction("imulq", "$1, %rcx, %rax"),
+    }) |op| try flow.step(&state, op, .{});
+    try std.testing.expect(state.regs[0].samePointer(slot));
+    try flow.step(&state, instruction("movq", "$0, (%rax)"), .{});
+    try std.testing.expect(!state.get(slot).addressIs(0x1234, true));
+    try std.testing.expect(!state.escaped_stack);
+
+    for ([_]Instruction{
+        instruction("movl", "$0, %eax"),
+        instruction("movq", "$0, %rax"),
+        instruction("xorl", "%eax, %eax"),
+        instruction("xorq", "%rax, %rax"),
+        instruction("imulq", "$0, %rax, %rax"),
+    }) |op| {
+        state.regs[0] = slot;
+        try flow.step(&state, op, .{});
+        try std.testing.expect(state.regs[0].isZero());
+    }
+    state.regs[2] = slot;
+    try flow.step(&state, instruction("cmpxchgq", "%rsi, 48(%rsp)"), .{});
+    try std.testing.expect(state.regs[2].samePointer(slot));
+}
+
+test "own stack spill narrowing and unsupported address reads never yield harmless scalars" {
+    var initial = flow.State.entry(1);
+    try initial.store(initial.regs[4].plus(32), initial.regs[4].plus(16), 8, .none);
+    for ([_]Instruction{
+        instruction("movl", "32(%rsp), %ecx"),
+        instruction("movl", "33(%rsp), %ecx"),
+        instruction("movzbl", "39(%rsp), %ecx"),
+        instruction("movzwq", "31(%rsp), %rcx"),
+        instruction("movq", "33(%rsp), %rcx"),
+        instruction("movzbl", "32(%rsp), %ecx"),
+        instruction("movzwq", "32(%rsp), %rcx"),
+        instruction("movslq", "32(%rsp), %rcx"),
+        instruction("movq", "%ss:32(%rsp), %rcx"),
+        instruction("movq", "32(%esp), %rcx"),
+        instruction("movq", "32(%rsp,%rdi), %rcx"),
+        instruction("leaq", "32(%rsp,%rdi), %rcx"),
+    }) |op| {
+        var state = initial;
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, op, .{}));
+    }
+    var state = initial;
+    try state.store(state.regs[4].plus(32), .{ .kind = .integer, .id = 0x1234 }, 8, .none);
+    try flow.step(&state, instruction("movzwq", "32(%rsp), %rcx"), .{});
+    try std.testing.expectEqual(0x1234, state.regs[1].id);
+    try std.testing.expect(!state.escaped_stack);
+    try flow.step(&state, instruction("movl", "40(%rsp), %esi"), .{});
+    try std.testing.expectEqual(.integer, state.regs[6].kind);
+    try flow.step(&state, instruction("movl", "64(%rsp), %esi"), .{});
+    try std.testing.expectEqual(.integer, state.regs[6].kind);
+    try std.testing.expect(!state.escaped_stack);
+    try flow.step(&state, instruction("movq", "%gs:16(%rip), %rax"), .{});
+    try std.testing.expectEqual(.unknown, state.regs[0].kind);
+    try std.testing.expect(!state.escaped_stack);
+}
+
+test "own stack slice tests cannot prune branches or conditionally manufacture aliases" {
+    const NoCalls = struct {
+        fn call(_: ?*anyopaque, _: Instruction, _: flow.State, _: flow.Options) ![]flow.State {
+            return error.UnexpectedCall;
+        }
+    };
+    for ([_][]const u8{ "%eax", "%ax", "%al", "%ah" }, [_][]const u8{ "testl", "testw", "testb", "testb" }) |reg, op| {
+        var initial = flow.State.entry(1);
+        initial.regs[0] = initial.regs[4].plus(16);
+        const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, {s}", .{ reg, reg });
+        defer std.testing.allocator.free(operands);
+        var result = try trace(&.{
+            instruction(op, operands), instruction("je", "4 <zero>"),
+            instruction("retq", ""),   instruction("nop", ""),
+        }, initial, .none);
+        defer result.deinit();
+        try std.testing.expect(result.analysis.seen[2] and result.analysis.seen[3]);
+    }
+    for ([_]bool{ false, true }) |take| {
+        var initial = flow.State.entry(1);
+        initial.regs[7] = .{ .kind = .integer, .id = @intFromBool(!take) };
+        initial.regs[0] = if (take) initial.regs[4].plus(16) else .{ .kind = .integer };
+        initial.regs[1] = if (take) .{ .kind = .integer } else initial.regs[4].plus(16);
+        const ops = [_]Instruction{
+            .{ .address = 1, .size = 1, .op = "testq", .operands = "%rdi, %rdi" },
+            .{ .address = 2, .size = 1, .op = "cmovel", .operands = "%eax, %ecx" },
+            .{ .address = 3, .size = 1, .op = "retq" },
+        };
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, @import("hyperv-proof-paths.zig").run(std.testing.allocator, &ops, initial, .{}, NoCalls.call));
+        initial.regs[0] = .{ .kind = .integer, .id = 0x123456789 };
+        initial.regs[1] = .{ .kind = .integer, .id = 0xabcdef012 };
+        const results = try @import("hyperv-proof-paths.zig").run(std.testing.allocator, &ops, initial, .{}, NoCalls.call);
+        defer std.testing.allocator.free(results);
+        try std.testing.expectEqual(1, results.len);
+        try std.testing.expectEqual(@as(u64, if (take) 0x23456789 else 0xbcdef012), results[0].regs[1].id);
+        try std.testing.expectEqual(64, results[0].regs[1].bits);
+    }
+}
+
+test "own stack origin survives joins offset overflow and indexed address evaluation" {
+    for ([_]bool{ false, true }) |reverse| {
+        var left = flow.State.entry(1);
+        var right = left;
+        left.regs[0] = left.regs[4].plus(16);
+        right.regs[0] = .{ .kind = .integer, .id = 32 };
+        var state = if (reverse) right else left;
+        _ = state.merge(if (reverse) left else right);
+        const value = state.regs[0];
+        try std.testing.expect(!value.samePointer(value));
+        try std.testing.expect(!value.isZero());
+        try std.testing.expectError(error.UnprovenMemoryFootprint, flow.step(&state, instruction("movq", "$0, (%rax)"), .{}));
+        try std.testing.expectError(error.UnprovenMemoryFootprint, flow.step(&state, instruction("movq", "$0, 16(%rsp,%rax)"), .{}));
+        try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, instruction("movl", "%eax, %ecx"), .{}));
+        state.regs[7] = value;
+        try flow.unknownCall(&state, instruction("callq", ""), .{});
+        try std.testing.expect(state.escaped_stack);
+    }
+    var state = flow.State.entry(1);
+    state.regs[0] = state.regs[4].plus(std.math.maxInt(i64));
+    try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, instruction("addq", "$1, %rax"), .{}));
+}
+
+test "own stack memory remnants and incoming only spills retain possible escape" {
+    for ([_]bool{ false, true }) |reverse| {
+        var state = flow.State.entry(1);
+        var incoming = state;
+        const slot = state.regs[4].plus(16);
+        const spill = state.regs[4].plus(32);
+        try incoming.store(spill, slot, 8, .none);
+        if (reverse) std.mem.swap(flow.State, &state, &incoming);
+        _ = state.merge(incoming);
+        flow.step(&state, instruction("movl", "32(%rsp), %eax"), .{}) catch |err| {
+            try std.testing.expectEqual(error.UnsupportedProvenanceInstruction, err);
+            continue;
+        };
+        try state.store(slot, .{ .kind = .address, .id = 0x1234 }, 8, .none);
+        try flow.step(&state, instruction("movq", "$0, (%rax)"), .{});
+        try std.testing.expect(!state.get(slot).addressIs(0x1234, true));
+    }
+    for ([_]Instruction{
+        instruction("movb", "$0, 32(%rsp)"),
+        instruction("movb", "$0, 39(%rsp)"),
+        instruction("vmovdqu8", "%zmm0, 32(%rsp) {%k1}"),
+        instruction("movdqu", "24(%rsp), %xmm0"),
+    }) |op| {
+        var state = flow.State.entry(1);
+        const slot = state.regs[4].plus(16);
+        try state.store(state.regs[4].plus(32), slot, 8, .none);
+        try state.store(slot, .{ .kind = .address, .id = 0x1234 }, 8, .none);
+        try flow.step(&state, op, .{});
+        try std.testing.expect(state.escaped_stack);
+        try state.store(.{}, .{}, 8, .none);
+        try std.testing.expectEqual(.unknown, state.get(slot).kind);
+    }
+}
+
+test "own stack conservative escape preserves bounded heap globals and distinct frame slots" {
+    var state = flow.State.entry(1);
+    const slot = state.regs[4].plus(16);
+    const spill = state.regs[4].plus(32);
+    const callback: flow.Value = .{ .kind = .address, .id = 0x1234 };
+    try state.store(slot, callback, 8, .none);
+    try state.store(spill, slot, 8, .none);
+    try state.store(spill, .{ .kind = .integer }, 1, .none);
+    try std.testing.expect(state.escaped_stack);
+    state.globals = &.{.{ .start = 0x2000, .end = 0x2100 }};
+    try state.store(.{ .kind = .heap, .id = 9, .size = 128 }, .{}, 64, .none);
+    try state.store(.{ .kind = .address, .id = 0x2000 }, .{}, 128, .none);
+    try state.store(state.regs[4].plus(64), .{}, 8, .none);
+    try std.testing.expect(state.get(slot).addressIs(0x1234, true));
+    try flow.unknownCall(&state, instruction("callq", ""), .{});
+    try std.testing.expectEqual(.unknown, state.get(slot).kind);
+}
+
+test "own stack partial overwrites expose only possible surviving pointer bytes" {
+    for ([_]i64{ 24, 25, 31, 32, 33, 39, 40 }) |offset| {
+        for ([_]u64{ 1, 4, 8, 16 }) |width| {
+            var state = flow.State.entry(1);
+            const spill = state.regs[4].plus(32);
+            try state.store(spill, state.regs[4].plus(16), 8, .none);
+            try state.store(state.regs[4].plus(offset), .{ .kind = .integer }, width, .none);
+            const overlap = offset < 40 and offset + @as(i64, @intCast(width)) > 32;
+            const covers = offset <= 32 and offset + @as(i64, @intCast(width)) >= 40;
+            try std.testing.expectEqual(overlap and !covers, state.escaped_stack);
+        }
+    }
+}
+
 test "high byte aliases read their own slice without inventing unknown bits" {
     const highs = [_][]const u8{ "%ah", "%ch", "%dh", "%bh" };
     const lows = [_][]const u8{ "%al", "%cl", "%dl", "%bl" };

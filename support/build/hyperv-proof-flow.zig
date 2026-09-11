@@ -50,7 +50,7 @@ pub const Graph = struct {
 };
 
 pub const Value = struct {
-    kind: enum { unknown, integer, address, argument, result, stack, allocator, heap, scheduler_list } = .unknown,
+    kind: enum { unknown, integer, address, argument, result, stack, lost_stack, allocator, heap, scheduler_list } = .unknown,
     id: u64 = 0,
     context: u64 = 0,
     offset: i64 = 0,
@@ -69,6 +69,9 @@ pub const Value = struct {
     pub fn equal(a: Value, b: Value) bool {
         return std.meta.eql(a, b);
     }
+    fn ownStack(self: Value) bool {
+        return self.kind == .lost_stack or (self.kind == .stack and self.depth == 0);
+    }
     pub fn samePointer(a: Value, b: Value) bool {
         var x = a;
         var y = b;
@@ -79,15 +82,16 @@ pub const Value = struct {
         x.aligned = 1;
         y.aligned = 1;
         // A list set denotes potentially different nodes, never an exact alias.
-        return x.kind != .unknown and x.kind != .scheduler_list and x.upper == null and equal(x, y);
+        return x.kind != .unknown and x.kind != .lost_stack and x.kind != .scheduler_list and x.upper == null and equal(x, y);
     }
     pub fn plus(self: Value, delta: i64) Value {
         var result = self;
         if (self.kind == .unknown) return .{};
+        if (self.kind == .lost_stack) return self;
         if (self.depth == 0 and (self.kind == .address or self.kind == .integer)) {
             result.id +%= @bitCast(delta);
             if (result.upper) |upper| result.upper = std.math.add(u64, upper, @bitCast(delta)) catch return .{};
-        } else result.offset = std.math.add(i64, self.offset, delta) catch return .{};
+        } else result.offset = std.math.add(i64, self.offset, delta) catch return if (self.ownStack()) .{ .kind = .lost_stack } else .{};
         if (self.kind == .heap and self.upper != null) {
             result.upper = if (delta < 0) std.math.sub(u64, self.upper.?, @intCast(-delta)) catch return .{} else std.math.add(u64, self.upper.?, @intCast(delta)) catch return .{};
         }
@@ -96,6 +100,7 @@ pub const Value = struct {
         return result;
     }
     pub fn load(self: Value, site: u64) Value {
+        if (self.kind == .lost_stack) return self;
         if (self.kind == .scheduler_list and self.depth == 0 and self.offset == self.link) {
             var next = self;
             next.offset = 0;
@@ -150,6 +155,7 @@ fn meet(a: Value, b: Value) Value {
         return result;
     }
     if (b.isZero() and (a.bound or a.kind == .heap)) return meet(b, a);
+    if (a.ownStack() or b.ownStack()) return .{ .kind = .lost_stack };
     return .{};
 }
 
@@ -183,6 +189,14 @@ pub const State = struct {
     pub fn get(self: State, key: Value) Value {
         for (self.cells) |cell| if (cell.key.samePointer(key)) return cell.value;
         return .{};
+    }
+    fn exposeStackCells(self: *State, location: Value, width: u64) void {
+        for (self.cells) |cell| {
+            if (cell.value.ownStack() and self.overlaps(cell.key, location, width)) {
+                self.escaped_stack = true;
+                return;
+            }
+        }
     }
     pub fn global(self: State, key: Value, width: u64) bool {
         if (key.kind != .address or key.depth != 0) return false;
@@ -221,6 +235,8 @@ pub const State = struct {
     }
     pub fn store(self: *State, key: Value, value: Value, width: u64, slot: Slot) !void {
         if (width == 0) return;
+        if (key.kind == .lost_stack) return error.UnprovenMemoryFootprint;
+        if (value.kind == .lost_stack or (value.ownStack() and width < 8)) return error.UnsupportedProvenanceInstruction;
         if (key.kind == .address and key.depth == 0) {
             const end = std.math.add(u64, key.upper orelse key.id, width) catch return error.UnprovenMemoryFootprint;
             self.recordWrite(.{ .start = key.id, .end = end });
@@ -257,6 +273,9 @@ pub const State = struct {
                 continue;
             }
             if (self.overlaps(cell.key, key, width)) {
+                // A partial overwrite can leave a recoverable stack pointer in
+                // otherwise unknown bytes. Later opaque writes must account for it.
+                if (cell.value.ownStack() and !coversCell(key, width, cell.key)) self.escaped_stack = true;
                 if (cell.key.bound and !(cell.key.samePointer(key) and width == 8 and Value.equal(cell.value, value))) {
                     cell.key.bound = false;
                 }
@@ -336,6 +355,15 @@ pub const State = struct {
                 changed = true;
             }
         }
+        // The must-cell intersection can omit an incoming-only stack alias.
+        // Retain its possible escape even when no exact cell survives the join.
+        if (!self.escaped_stack) for (incoming.cells) |cell| {
+            if (cell.value.ownStack() and !self.get(cell.key).ownStack()) {
+                self.escaped_stack = true;
+                changed = true;
+                break;
+            }
+        };
         return changed;
     }
     pub fn markBound(self: *State, object: Value) void {
@@ -366,6 +394,16 @@ fn mayOverlap(cell: Value, destination: Value, width: u64) bool {
     if (b.kind == .address and b.depth == 0) b.id = 0 else b.offset = 0;
     if (!a.samePointer(b)) return true;
     return x < y + width and y < x + 8;
+}
+
+fn coversCell(destination: Value, width: u64, cell: Value) bool {
+    var a = destination;
+    var b = cell;
+    const start: i128 = if (a.kind == .address and a.depth == 0) a.id else a.offset;
+    const offset: i128 = if (b.kind == .address and b.depth == 0) b.id else b.offset;
+    if (a.kind == .address and a.depth == 0) a.id = 0 else a.offset = 0;
+    if (b.kind == .address and b.depth == 0) b.id = 0 else b.offset = 0;
+    return a.samePointer(b) and start <= offset and start + width >= offset + 8;
 }
 
 pub fn pair(instruction: Instruction) ?[2][]const u8 {
@@ -406,6 +444,7 @@ fn checkedMemory(state: State, instruction: Instruction, operand: []const u8) er
     else if (base_reg) |reg| state.regs[reg] else .{ .kind = .integer };
     const index_value: Value = if (index_reg) |reg| state.regs[reg] else .{ .kind = .integer };
     if (base_value.bits != 64 or index_value.bits != 64) return error.UnsupportedProvenanceInstruction;
+    if (base_value.kind == .lost_stack or index_value.kind == .lost_stack) return .{ .kind = .lost_stack };
     const result = evaluateMemory(state, base_value.plus(displacement), if (index_reg != null) index_value else null, scale);
     if (result.kind == .unknown and (base_value.kind == .stack or index_value.kind == .stack))
         return error.UnsupportedProvenanceInstruction;
@@ -447,11 +486,22 @@ fn storeOperand(instruction: Instruction, operand: []const u8) !struct { address
     return .{ .address = std.mem.trim(u8, text[0..mask], " \t"), .masked = true };
 }
 
+fn undecodedRead(state: State, operand: []const u8) Value {
+    // This only retains possible origin on failed reads; it never authorizes
+    // a memory write or interprets an undecoded address as an exact location.
+    var tokens = std.mem.tokenizeAny(u8, operand, " \t(),:{}*+");
+    while (tokens.next()) |token| {
+        if (assembly.register(token)) |reg| if (state.regs[reg].ownStack()) return .{ .kind = .lost_stack };
+    }
+    return .{};
+}
+
 pub fn source(state: State, instruction: Instruction, operand: []const u8) Value {
     if (assembly.register(operand)) |reg| {
         var value = state.regs[reg];
         const width = assembly.registerWidth(operand).?;
         const shift = assembly.registerBitOffset(operand);
+        if (value.kind == .lost_stack or (width < 64 and value.ownStack())) return .{ .kind = .lost_stack };
         if (value.kind == .integer) {
             if (value.depth != 0 or @as(u16, width) + shift > value.bits or (shift != 0 and value.upper != null)) return .{};
             const mask: u64 = if (width == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(width)) - 1;
@@ -463,8 +513,16 @@ pub fn source(state: State, instruction: Instruction, operand: []const u8) Value
         return value;
     }
     if (assembly.immediate(operand)) |integer| return .{ .kind = .integer, .id = integer };
-    const location = memory(state, instruction, operand);
+    if (operand.len == 0 or machine.vectorIndex(operand) != null) return .{};
+    const location = checkedMemory(state, instruction, operand) catch return undecodedRead(state, operand);
+    if (location.kind == .lost_stack) return location;
     const stored = state.get(location);
+    for (state.cells) |cell| {
+        if (cell.value.ownStack() and !cell.key.samePointer(location) and
+            state.overlaps(cell.key, location, machine.readBits(instruction) / 8))
+            return .{ .kind = .lost_stack };
+    }
+    if (stored.kind == .lost_stack or (machine.readBits(instruction) < 64 and stored.ownStack())) return .{ .kind = .lost_stack };
     if (stored.kind == .integer) {
         const width = machine.readBits(instruction);
         if (stored.depth != 0 or width > stored.bits) return .{};
@@ -513,7 +571,9 @@ pub fn clobberCall(state: *State, instruction: Instruction, options: Options) vo
     state.regs[0] = .{ .kind = .result, .id = instruction.address, .context = options.context };
 }
 
-pub fn writeRegister(state: *State, reg: u4, width: u8, incoming: Value) void {
+pub fn writeRegister(state: *State, reg: u4, width: u8, incoming: Value) !void {
+    if (incoming.kind == .lost_stack or (width < 64 and incoming.ownStack()) or
+        (width < 32 and state.regs[reg].ownStack())) return error.UnsupportedProvenanceInstruction;
     var value = incoming;
     if (width == 64) {
         state.regs[reg] = value;
@@ -535,7 +595,7 @@ pub fn writeRegister(state: *State, reg: u4, width: u8, incoming: Value) void {
 pub fn writeOperand(state: *State, operand: []const u8, incoming: Value) !void {
     const reg = assembly.register(operand) orelse return error.UnsupportedProvenanceInstruction;
     if (assembly.registerBitOffset(operand) == 0) {
-        writeRegister(state, reg, assembly.registerWidth(operand).?, incoming);
+        try writeRegister(state, reg, assembly.registerWidth(operand).?, incoming);
         return;
     }
     const previous = state.regs[reg];
@@ -552,7 +612,7 @@ pub fn writeOperand(state: *State, operand: []const u8, incoming: Value) !void {
 
 pub fn unknownCall(state: *State, instruction: Instruction, options: Options) !void {
     for ([_]usize{ 7, 6, 2, 1, 8, 9 }) |reg| {
-        if (state.regs[reg].kind == .stack) state.escaped_stack = true;
+        if (state.regs[reg].kind == .stack or state.regs[reg].kind == .lost_stack) state.escaped_stack = true;
     }
     try state.store(.{}, .{}, 16, options.slot);
     if (state.escaped_stack) {
@@ -572,7 +632,10 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
         return;
     }
     if (instruction.isBranch() or instruction.stops()) {
-        if (std.mem.startsWith(u8, op, "loop")) state.regs[1] = .{};
+        if (std.mem.startsWith(u8, op, "loop")) {
+            if (state.regs[1].ownStack()) return error.UnsupportedProvenanceInstruction;
+            state.regs[1] = .{};
+        }
         return;
     }
     const all = try assembly.Operands.parse(instruction);
@@ -590,6 +653,8 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
             const reg = assembly.register(all.items[2]) orelse return error.UnsupportedProvenanceInstruction;
             const factor = assembly.immediate(all.items[0]) orelse return error.UnsupportedProvenanceInstruction;
             var value = source(state.*, instruction, all.items[1]);
+            if (value.ownStack() and factor != 0 and (factor != 1 or assembly.registerWidth(all.items[2]) != 64))
+                return error.UnsupportedProvenanceInstruction;
             if (factor == 0) value = .{ .kind = .integer } else if (factor != 1) {
                 if (value.kind == .integer and value.depth == 0 and value.upper == null) value.id *%= factor else value = .{};
             }
@@ -599,8 +664,10 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
                 else
                     value = .{};
             }
-            state.regs[reg] = value;
+            try writeRegister(state, reg, assembly.registerWidth(all.items[2]).?, value);
         } else if (machine.sized(op, "mulx") and all.len == 3) {
+            if (state.regs[2].ownStack() or source(state.*, instruction, all.items[0]).ownStack())
+                return error.UnsupportedProvenanceInstruction;
             state.regs[assembly.register(all.items[1]) orelse return error.UnsupportedProvenanceInstruction] = .{};
             state.regs[assembly.register(all.items[2]) orelse return error.UnsupportedProvenanceInstruction] = .{};
         } else return error.UnsupportedProvenanceInstruction;
@@ -614,6 +681,8 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
         return;
     }
     if (std.mem.eql(u8, op, "cpuid")) {
+        if (source(state.*, instruction, "%eax").ownStack() or source(state.*, instruction, "%ecx").ownStack())
+            return error.UnsupportedProvenanceInstruction;
         for ([_]usize{ 0, 1, 2, 3 }) |reg| state.regs[reg] = .{};
         return;
     }
@@ -624,10 +693,14 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
         return;
     }
     if (std.mem.eql(u8, op, "cqto") or std.mem.eql(u8, op, "cltd") or std.mem.eql(u8, op, "cwtd")) {
+        if (state.regs[0].ownStack() or (std.mem.eql(u8, op, "cwtd") and state.regs[2].ownStack()))
+            return error.UnsupportedProvenanceInstruction;
         state.regs[2] = .{};
         return;
     }
     if (all.len == 1 and (machine.sized(op, "mul") or machine.sized(op, "imul") or machine.sized(op, "div") or machine.sized(op, "idiv"))) {
+        if (state.regs[0].ownStack() or state.regs[2].ownStack() or source(state.*, instruction, all.items[0]).ownStack())
+            return error.UnsupportedProvenanceInstruction;
         state.regs[0] = .{};
         state.regs[2] = .{};
         state.zero_test = null;
@@ -636,6 +709,8 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
         return;
     }
     if (std.mem.eql(u8, op, "cmpxchg8b") or std.mem.eql(u8, op, "cmpxchg16b")) {
+        for ([_]usize{ 0, 1, 2, 3 }) |reg| if (state.regs[reg].ownStack()) return error.UnsupportedProvenanceInstruction;
+        if (source(state.*, instruction, instruction.operands).ownStack()) return error.UnsupportedProvenanceInstruction;
         try state.store(try checkedMemory(state.*, instruction, instruction.operands), .{}, try machine.writeBytes(instruction, ""), options.slot);
         state.regs[0] = .{};
         state.regs[2] = .{};
@@ -726,7 +801,15 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
             try checkedMemory(state.*, instruction, operands[0])
         else
             Value{};
-        var value = source(state.*, instruction, operands[0]);
+        var value = if (std.mem.startsWith(u8, op, "lea"))
+            try checkedMemory(state.*, instruction, operands[0])
+        else
+            source(state.*, instruction, operands[0]);
+        const move = machine.sized(op, "mov") or std.mem.startsWith(u8, op, "movabs") or
+            std.mem.startsWith(u8, op, "movz") or std.mem.startsWith(u8, op, "lea") or machine.vectorMove(op);
+        const stack_input = value.ownStack() or (!move and source(state.*, instruction, operands[1]).ownStack());
+        const clears = machine.sized(op, "xor") and destination != null and std.mem.eql(u8, operands[0], operands[1]);
+        if (std.mem.startsWith(u8, op, "cmpxchg") and state.regs[0].ownStack()) return error.UnsupportedProvenanceInstruction;
         if ((value.kind == .unknown or value.depth != 0) and !std.mem.startsWith(u8, op, "lea") and assembly.register(operands[0]) == null and assembly.immediate(operands[0]) == null) {
             if (options.constant_read) |read| {
                 const bytes: u8 = machine.readBits(instruction) / 8;
@@ -736,7 +819,6 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
                 }
             }
         }
-        if (std.mem.startsWith(u8, op, "lea")) value = memory(state.*, instruction, operands[0]);
         if (machine.sized(op, "xor")) {
             if (std.mem.eql(u8, operands[0], operands[1])) value = .{ .kind = .integer } else value = .{};
         } else if (machine.sized(op, "or") and destination != null) {
@@ -778,15 +860,26 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
             } else value = .{};
         } else if (!machine.sized(op, "mov") and !std.mem.eql(u8, op, "movabsq") and
             !std.mem.eql(u8, op, "movabs") and !std.mem.startsWith(u8, op, "movz") and !std.mem.startsWith(u8, op, "lea")) value = .{};
+        if (stack_input and !clears and !value.ownStack()) return error.UnsupportedProvenanceInstruction;
         if (destination != null) {
             try writeOperand(state, operands[1], value);
         } else if (machine.vectorIndex(operands[1])) |reg| {
+            if (value.ownStack()) return error.UnsupportedProvenanceInstruction;
+            if (assembly.register(operands[0]) == null and machine.vectorIndex(operands[0]) == null) {
+                const location = try checkedMemory(state.*, instruction, operands[0]);
+                const width = if (machine.vectorMove(op))
+                    try machine.writeBytes(instruction, operands[1])
+                else
+                    machine.readBits(instruction) / 8;
+                state.exposeStackCells(location, width);
+            }
             state.vector_zero[reg] = 0;
         } else {
             const width = try machine.writeBytes(instruction, operands[0]);
             if (!std.mem.startsWith(u8, op, "mov")) value = .{};
             const target = try storeOperand(instruction, operands[1]);
             const location = try checkedMemory(state.*, instruction, target.address);
+            if (target.masked) state.exposeStackCells(location, width);
             try state.store(location, if (target.masked) .{} else value, width, options.slot);
             if (!target.masked and location.kind == .stack and machine.vectorMove(op)) {
                 if (machine.vectorIndex(operands[0])) |reg| {
@@ -806,13 +899,13 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
         }
         if (std.mem.startsWith(u8, op, "cmpxchg")) {
             state.regs[0] = .{};
-            state.regs[2] = .{};
         }
         return;
     }
     if (all.len == 1 and assembly.register(instruction.operands) == null and
         (machine.sized(op, "inc") or machine.sized(op, "dec") or machine.sized(op, "neg") or machine.sized(op, "not")))
     {
+        if (source(state.*, instruction, instruction.operands).ownStack()) return error.UnsupportedProvenanceInstruction;
         try state.store(try checkedMemory(state.*, instruction, instruction.operands), .{}, try machine.writeBytes(instruction, ""), options.slot);
         return;
     }
@@ -820,6 +913,7 @@ pub fn step(state: *State, instruction: Instruction, options: Options) !void {
         if (assembly.registerBitOffset(instruction.operands) != 0) return error.UnsupportedProvenanceInstruction;
         if (!machine.sized(op, "inc") and !machine.sized(op, "dec") and !machine.sized(op, "neg") and !machine.sized(op, "not") and !machine.sized(op, "bswap") and machine.condition(op, "set") == null)
             return error.UnsupportedProvenanceInstruction;
+        if (state.regs[reg].ownStack()) return error.UnsupportedProvenanceInstruction;
         state.regs[reg] = .{};
         if (std.mem.startsWith(u8, op, "mul") or std.mem.startsWith(u8, op, "div") or std.mem.startsWith(u8, op, "idiv") or std.mem.startsWith(u8, op, "imul")) {
             state.regs[0] = .{};

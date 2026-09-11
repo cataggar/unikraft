@@ -66,6 +66,8 @@ oracle, proof executor, or install hook is involved.
 | Unmodeled address syntax is not a harmless unknown non-stack write | Checked write-address decoding; real GS and address-size-override refusals, retained prefix metadata, malformed masks/indexes/extra fields, and implicit-string footprint refusals |
 | SMP map/queue/worker effects preserve the published object | Heap constructor, bounded two-CPU map, retained tail pointer, independent thread allocation and actual indirect `thread_add` member at offset 8; map/queue redirection and helper/method overwrites refuse |
 | Partial values, flags and stack slots cannot manufacture bindings | Narrow pointer-load, partial scalar/null return, CMPXCHG flag, compare-snapshot, CALL return-address and masked-vector stack-argument regressions |
+| Own-stack origin cannot become an apparently unrelated scalar address | Parent LEA/MOVL/store regression; same/different-register copies, MOVZX/MOVSX, partial writes, spilled and unaligned reads, unsupported arithmetic/implicit writes, joins and offset overflow; full-width alias/offset/spill positives |
+| Conditional narrowing and memory remnants retain possible stack aliases | Taken and untaken CMOV r32 zero-extension; unpruned narrow stack tests, incoming-only spills, partial/masked overwrites and vector transport; exact overwrite/non-overlap boundaries and bounded heap/global preservation |
 | Registered-list and initial-image facts survive only justified writes | Current/previous scheduler callback protection, partial/unknown list-link refusal, dirty constant ranges and non-resurrection cases |
 | Three SynIC/pending callbacks are registered on reachable paths | Must-provenance at each SysV RDI/RSI call site; removed materialization and jump-only bypass fail; valid branch joins and loop-invariant arguments pass |
 | Exactly the reviewed native IRQ event handler | Actual retained event pointer, missing/extra handler entries, and changed pointer refusals |
@@ -113,6 +115,30 @@ claiming a complete 64-bit value. Writes that cannot be represented safely
 and unmodeled high-byte unary/exchange forms are refused. Constructor conditional
 writes use the same slice-aware writer; AP control-register proofs still require
 their original full-register evidence.
+
+Known own-frame addresses carry stack origin independently of numeric width.
+Narrow register/spill reads and unrepresentable joins retain a `lost_stack`
+fact rather than becoming an ordinary unknown or a zero-extended scalar range.
+It cannot establish an exact pointer, numeric flag result, allocation, or memory
+footprint. Register writes that would discard this origin, partial GP-register
+updates to own-stack pointers, and unsupported stack-dependent arithmetic refuse
+analysis.
+The shared conditional writer also handles the architectural zero-extension
+of an untaken 32-bit CMOV destination. Full-width copies, representable LEA and
+ADD/SUB offsets, full-width spills, and independent complete replacements
+(including zeroing XOR and multiplication by zero) remain supported.
+
+An own-stack address is not the same as an otherwise unknown scalar loaded
+from a stack argument. Undecoded reads retain possible origin when they depend
+on an already stack-derived register; they never authorize a write or create
+an exact memory location. This preserves existing opaque per-CPU reads without
+using address spelling as non-alias evidence. Reads crossing tracked stack
+pointer bytes cannot erase that origin. Partial or masked pointer overwrites,
+unmodeled vector transport, and incoming-only pointer spills at joins retain
+possible escape through the existing conservative stack-write policy. Complete
+overwrites and disjoint writes do not introduce escape unnecessarily. Proven
+bounded heap/global separation and caller/callee private-frame handling remain
+unchanged. No assumption places the stack above 4 GiB.
 
 `hyperv-proof-binding.zig` derives the callback location from the actual
 `uk_thread_wake_isr` indirect load/call. The object form requires a scheduler
