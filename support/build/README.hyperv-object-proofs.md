@@ -129,9 +129,11 @@ CLI fixture driver and fake tool use the selected optimization mode.
 Producer-closure additions for parent integration: the six
 `hyperv-object-*.zig` implementation/build/fixture files, this documentation,
 `tests/hyperv-object-undefined.c`, existing `elf-common-validator.zig`, and
-the shared `support/tools/hyperv/process.zig` / `diagnostics.zig` modules.
-There are no new package dependencies or package restores. Parent-owned
-producer pins and CI are intentionally not edited.
+the shared `support/tools/hyperv/process.zig` / `diagnostics.zig` modules and
+their transitive `contracts.zig` / `sensitive.zig` dependencies.
+There are no new package dependencies or package restores. Required CI runs the
+focused selector in Debug and ReleaseSafe. Both guarded producer maps bind the
+complete build closure and the shared core dependencies.
 
 This selector supplies object/link/ABI evidence only. It does not run
 remaining controller/persistence/preparation Python aggregates, linked-image

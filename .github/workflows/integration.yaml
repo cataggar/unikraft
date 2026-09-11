@@ -812,6 +812,18 @@ jobs:
           zig build -j2 test-build-tools "-Doutput=${root}/build" \
             --summary all
 
+    - name: Run native Hyper-V object and ABI verifier fixtures
+      run: |
+        set -euo pipefail
+        for mode in Debug ReleaseSafe; do
+          root="${RUNNER_TEMP}/hyperv-ci/native-object-proofs-${mode}"
+          ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+            zig build -j2 hyperv-object-proofs test-hyperv-object-proofs \
+              --cache-dir "${root}/zig-local-cache" \
+              --prefix "${root}/out" "-Doutput=${root}/build" \
+              "-Doptimize=${mode}" --summary all
+        done
+
     - name: Run native Hyper-V core, transfer, and worker fixtures
       run: |
         set -euo pipefail

@@ -71,10 +71,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "9bdc54e5c9a9a59367966c2b55b5c628b76d9f2989a31bc0b3b49fb36f42fd51"
+            "45e3233ddbea9f55af4d51892b7e2733edcf447039c8dd713ad364553be10a2b"
         ),
-        "size": 1365900,
-        "files": 190,
+        "size": 1433902,
+        "files": 198,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -96,7 +96,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "53bf356cdd9836b7009ccf2063b1669ccef829e2b3cdf5555a2ba297ebec508e"
+        "5488c5b65458987a515c081461b2b8c5749a8ec10e61369d261d861ea049fe3f"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -133,6 +133,24 @@ GUARDED_PRODUCER_FILES = {
     ),
     "support/build/final-link.zig": (
         "2b2934844c13e511351ae5a6f63fd7f4168a98ee007a1cc37e2411016fb71067"
+    ),
+    "support/build/hyperv-object-elf.zig": (
+        "5f875a510bda0220409fa4bc9c23ae5da19e3d314e5b009aae518e84ad9cd96e"
+    ),
+    "support/build/hyperv-object-proofs.build.zig": (
+        "4fb2d39721bb9e2b656f0257689943d692d2dfc4a5c48fdbf6808aa073be13fc"
+    ),
+    "support/build/hyperv-object-proofs.zig": (
+        "d287564200048482edde82d9eb17ba88f4a09560d550dbf17a554395f59652fa"
+    ),
+    "support/build/hyperv-object-tests.zig": (
+        "8226540d853cb37ae40eb25c3eed1163fd240d224c9f8338d767bfc267f21243"
+    ),
+    "support/build/hyperv-object-tool-fixture.zig": (
+        "1d9aea3e733325ec76cbeeb3d288ff2e3236b785b60bb4e811494481264731a9"
+    ),
+    "support/build/hyperv-object-tools.zig": (
+        "72344d506608f7297a6b8c84aa08dd818609796cc7f88c011c0d98c4dc45d483"
     ),
     "support/build/kconfig.zig": (
         "e3f8ea0dbb9b136038f4c462e67a88394407e299b0ff87cae803a698d630c624"
@@ -191,11 +209,26 @@ GUARDED_PRODUCER_FILES = {
     "support/build/target/native-profile.zig": (
         "ab321fb4434415ddd6ed4e34e173956a9555af91b91f26557b47673b6fe310de"
     ),
+    "support/build/tests/hyperv-object-undefined.c": (
+        "13ab823738d09c0b1d479c523c034f891081871a2a7d69f0cc556828346c2793"
+    ),
     "support/build/zig-facade-paths.zig": (
         "38325cf826d855004e9808924e2687dc70bc42264b952da98f2dce0ad801b8f0"
     ),
     "support/build/zig-facade-runner.zig": (
         "5ba4f753fd4a0537564009a47298f242d10a1b831fe6fda00b5172023de8db77"
+    ),
+    "support/tools/hyperv/contracts.zig": (
+        "57e37d089f7de3fba56a8415e9451b359cac33b63b816ef5a17639c6d1f8d6e1"
+    ),
+    "support/tools/hyperv/diagnostics.zig": (
+        "94138509d8f0818818591f8fbe6181bd1cee09cbff0970506e46b00c989484b7"
+    ),
+    "support/tools/hyperv/process.zig": (
+        "89e501b82c888eae5ab0cb716909e1f035d640f693e965073890bbd015811120"
+    ),
+    "support/tools/hyperv/sensitive.zig": (
+        "e5845b7623116f3ef6e6e062463f39c2f3840bec5d36c75ccf413643dfae1eca"
     ),
     "support/build/tests/hyperv-smp-link-test.py": (
         "dc40554f6da6ddca3e9f65b5b6c12243c734d24992a342d3564750ecc5e71488"
