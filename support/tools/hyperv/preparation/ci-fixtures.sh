@@ -85,7 +85,10 @@ if [ "${qualify_strip}" = true ]; then
   test -x "${objcopy}"
   native "${objcopy}" --version > "${root}/fixture-objcopy-version.txt"
   test "$(stat -c '%s' "${root}/fixture-objcopy-version.txt")" -le 4096
-  grep -Fxq 'LLVM version 22.1.8' "${root}/fixture-objcopy-version.txt"
+  if ! awk -f "${package}/ci-objcopy-version.awk" "${root}/fixture-objcopy-version.txt"; then
+    echo 'Qualification requires the pinned LLVM 22.1.8 objcopy' >&2
+    exit 1
+  fi
   sha256sum -- "${objcopy}" > "${root}/fixture-objcopy-sha256.txt"
   namespace_variant+=("-Dfixture-objcopy=${objcopy}")
 fi

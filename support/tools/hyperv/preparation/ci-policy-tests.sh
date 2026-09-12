@@ -62,6 +62,26 @@ printf '%s%4096s\n' "${denial}" '' | check_denial 1
 for ((i=0; i<8; i++)); do printf '%s\n' "${denial}"; done | check_denial 0
 for ((i=0; i<9; i++)); do printf '%s\n' "${denial}"; done | check_denial 1
 
+check_objcopy_version() {
+  local expected="$1" result=0
+  awk -f "${package}/ci-objcopy-version.awk" > /dev/null || result=$?
+  if [ "${result}" -ne "${expected}" ]; then
+    printf 'Unexpected objcopy version result %s; expected %s\n' "${result}" "${expected}" >&2
+    exit 1
+  fi
+}
+for line in 'LLVM version 22.1.8' '  LLVM version 22.1.8' $'\tLLVM version 22.1.8'; do
+  printf '%s\n' 'llvm-objcopy, compatible with GNU objcopy' 'LLVM (http://llvm.org/):' \
+    "${line}" '  Optimized build.' | check_objcopy_version 0
+done
+for line in 'LLVM version 22.1.7' 'LLVM version 22.1.80' 'LLVM version 22.1.8git' \
+  'LLVM version 22x1x8' 'prefix LLVM version 22.1.8' 'LLVM version 22.1.8 '; do
+  printf '%s\n' "${line}" | check_objcopy_version 1
+done
+printf '' | check_objcopy_version 1
+printf '%s\n' 'LLVM version 22.1.8' 'LLVM version 22.1.8' | check_objcopy_version 1
+printf '%s\n' 'LLVM version 22.1.8' 'LLVM version 22.1.7' | check_objcopy_version 1
+
 umask 077
 scratch="$(mktemp -d)"
 trap 'rm -f -- "${scratch}/report" "${scratch}/fixture" "${scratch}/report-link" "${scratch}/fixture-link" "${scratch}/error.log"; rmdir -- "${scratch}"' EXIT
