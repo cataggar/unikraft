@@ -266,6 +266,17 @@ strip option that might change code generation. Ordinary preparation CI,
 production artifacts, required checks, namespace policy, complete hashing and
 all deadlines are unchanged.
 
+The explicit `-Dfixture-file-relayout=true` qualification option permits only
+validated program-file offset relocation. Its default remains false: stripping
+without this option still requires identical program headers. The version2
+proof records `layout_policy`, every program mapping and separate literal and
+normalized/mapped hashes. It preserves entry, virtual layout, permissions,
+sizes and corresponding program-backed bytes, except for the precisely
+recorded ELF section-locator and changed program-offset bookkeeping fields.
+It does not claim debugger or arbitrary executable self-inspection equivalence.
+This additional qualification is necessary for the x64 Debug linker layout;
+no automatic retry or architecture-based policy selection is performed.
+
 The candidate must pass the native raw/candidate ELF equivalence gate before
 installation or execution. Per-mode `fixture-strip-proof.json` files and the
 expanded fixture/helper copy inventory are retained alongside the existing
@@ -278,6 +289,9 @@ before execution. The selected transformer's version and full hash are retained
 and its hash is rechecked. These metadata checks supplement, not replace, the
 mandatory native equivalence gate. `ci-policy-tests.sh` exercises the report
 filter and file-boundary checks without installing fixtures or changing policy.
+The caller's optional third argument selects the expected layout policy and
+defaults to `identical_program_headers`; qualification explicitly requests
+`file_offset_relayout`. Version1 and mismatched-policy reports are rejected.
 The trial is synthetic qualification,
 not adoption, runtime authentication, producer admission or a full ledger fit.
 

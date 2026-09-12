@@ -30,7 +30,7 @@ esac
 namespace_variant=()
 fixture_find_names=(-name preparation-namespace-fixture)
 if [ "${qualify_strip}" = true ]; then
-  namespace_variant=(-Dstrip-fixture-debug=true)
+  namespace_variant=(-Dstrip-fixture-debug=true -Dfixture-file-relayout=true)
   fixture_find_names=('(' -name preparation-namespace-fixture -o -name preparation-namespace ')')
 fi
 root="${RUNNER_TEMP:?}/hyperv-ci/native-preparation"
@@ -230,7 +230,7 @@ for mode in Debug ReleaseSafe; do
     > "${root}/${mode}/fixture-build.log" 2>&1
   if [ "${qualify_strip}" = true ]; then
     bash "${package}/ci-strip-proof.sh" "${root}/${mode}/fixture-strip-proof.json" \
-      "${root}/${mode}/fixture-out/bin/preparation-namespace-fixture"
+      "${root}/${mode}/fixture-out/bin/preparation-namespace-fixture" file_offset_relayout
   fi
 done
 if [ "${qualify_strip}" = true ]; then
@@ -257,9 +257,9 @@ cmp "${root}/Debug/fixture-out/bin/preparation-namespace-fixture" "${installatio
 cmp "${root}/ReleaseSafe/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-release-safe"
 if [ "${qualify_strip}" = true ]; then
   bash "${package}/ci-strip-proof.sh" "${root}/Debug/fixture-strip-proof.json" \
-    "${installation}/namespace-fixture-debug"
+    "${installation}/namespace-fixture-debug" file_offset_relayout
   bash "${package}/ci-strip-proof.sh" "${root}/ReleaseSafe/fixture-strip-proof.json" \
-    "${installation}/namespace-fixture-release-safe"
+    "${installation}/namespace-fixture-release-safe" file_offset_relayout
 fi
 sha256sum "${installation}/namespace-fixture-debug" "${installation}/namespace-fixture-release-safe" \
   > "${root}/fixture-sha256.txt"

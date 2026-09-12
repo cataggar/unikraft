@@ -86,6 +86,7 @@ umask 077
 scratch="$(mktemp -d)"
 trap 'rm -f -- "${scratch}/report" "${scratch}/fixture" "${scratch}/report-link" "${scratch}/fixture-link" "${scratch}/error.log"; rmdir -- "${scratch}"' EXIT
 printf '%s\n' 'synthetic policy fixture' > "${scratch}/fixture"
+printf '%8192s' '' >> "${scratch}/fixture"
 chmod 500 "${scratch}/fixture"
 fixture_hash="$(sha256sum -- "${scratch}/fixture")"
 fixture_sha="${fixture_hash%% *}"
@@ -112,18 +113,45 @@ jq -nc --argjson uid "$(id -u)" --arg hash "${fixture_sha}" --argjson size "${fi
     role: "namespace_fixture", candidate: $file,
     raw: ($file | .path = "/synthetic/raw" | .sha256 = ("0" * 64) | .size += 1),
     content: {
-      program_headers_sha256: ("1" * 64), loaded_content_sha256: ("2" * 64),
+      elf_class: "elf64", endian: "little", machine: "X86_64",
+      layout_policy: "identical_program_headers", load_offset_modulus: 4096,
+      raw_program_headers_sha256: ("1" * 64),
+      candidate_program_headers_sha256: ("1" * 64),
+      normalized_program_headers_sha256: ("1" * 64),
+      mapped_program_content_sha256: ("2" * 64),
+      mapped_loaded_content_sha256: ("3" * 64),
+      program_mappings: [{
+        index: 0, raw_offset: 0, candidate_offset: 0, changed: false,
+        offset_field_file_offset: 72, offset_field_width: 8,
+        logical_mapping: {
+          type: 1, flags: 4, virtual_address: 4096, physical_address: 4096,
+          file_bytes: 1, memory_bytes: 1, alignment: 4096
+        },
+        logical_mapping_sha256: ("4" * 64)
+      }],
       load_segments: 1, loaded_file_bytes: 1, removed_debug_sections: 1,
       removed_debug_bytes: 1, size_reduction: 1
     }
   } as $pair |
   {
-    schema: "hyperv_fixture_debug_stripping_v1", authority: "synthetic_only_not_admitted",
+    schema: "hyperv_fixture_debug_stripping_v2", authority: "synthetic_only_not_admitted",
     passed: true, synthetic: true, admitted: false, qualification_only: true,
+    layout_policy: "identical_program_headers",
     pairs: [($pair | .role = "namespace_helper"), $pair], external_fixture: null
   } as $proof |
+  ($proof | .layout_policy = "file_offset_relayout" |
+    .pairs[].content.layout_policy = "file_offset_relayout") as $relayout |
+  ($relayout | .pairs[].content |= (
+    .candidate_program_headers_sha256 = ("5" * 64) |
+    .program_mappings[0].candidate_offset = 4096 |
+    .program_mappings[0].changed = true)) as $moved |
   [
     {expected: 0, report: $proof},
+    {expected: 0, policy: "file_offset_relayout", report: $relayout},
+    {expected: 0, policy: "file_offset_relayout", report: $moved},
+    {expected: 1, report: $relayout},
+    {expected: 1, policy: "file_offset_relayout", report: $proof},
+    {expected: 1, report: ($proof | .schema = "hyperv_fixture_debug_stripping_v1")},
     {expected: 1, report: ($proof | .schema = "unknown")},
     {expected: 1, report: ($proof | .authority = "production")},
     {expected: 1, report: ($proof | .passed = false)},
@@ -133,6 +161,23 @@ jq -nc --argjson uid "$(id -u)" --arg hash "${fixture_sha}" --argjson size "${fi
     {expected: 1, report: ($proof | .external_fixture = {})},
     {expected: 1, report: ($proof | .unknown = true)},
     {expected: 1, report: ($proof | del(.passed))},
+    {expected: 1, report: ($proof | .layout_policy = "unknown")},
+    {expected: 1, report: ($proof | .pairs[0].content.layout_policy = "file_offset_relayout")},
+    {expected: 1, report: ($proof | .pairs[0].content.program_mappings = [])},
+    {expected: 1, report: ($proof | .pairs[0].content.program_mappings = null)},
+    {expected: 1, report: ($proof |
+      .pairs[0].content.program_mappings |= (.[0] as $mapping | [range(129) | $mapping]))},
+    {expected: 1, report: ($proof | .pairs[0].content.program_mappings[0].index = 1)},
+    {expected: 1, report: ($proof | .pairs[0].content.program_mappings[0].offset_field_width = 4)},
+    {expected: 1, report: ($proof | .pairs[0].content.program_mappings[0].changed = true)},
+    {expected: 1, report: ($proof | .pairs[0].content.program_mappings[0].logical_mapping.flags = null)},
+    {expected: 1, report: ($proof | .pairs[0].content.candidate_program_headers_sha256 = ("5" * 64))},
+    {expected: 1, report: ($proof | .pairs[0].content.normalized_program_headers_sha256 = "")},
+    {expected: 1, report: ($proof | .pairs[0].content.load_offset_modulus = 8192)},
+    {expected: 1, policy: "file_offset_relayout",
+      report: ($moved | .pairs[0].content.program_mappings[0].candidate_offset = 999999)},
+    {expected: 1, policy: "file_offset_relayout",
+      report: ($moved | .pairs[0].content.program_mappings[0].logical_mapping.file_bytes = 0)},
     {expected: 1, report: ($proof | .pairs = null)},
     {expected: 1, report: ($proof | .pairs = [])},
     {expected: 1, report: ($proof | .pairs |= reverse)},
@@ -152,17 +197,19 @@ jq -nc --argjson uid "$(id -u)" --arg hash "${fixture_sha}" --argjson size "${fi
     {expected: 1, report: ($proof | .pairs[0].content.removed_debug_sections = 0)},
     {expected: 1, report: ($proof | .pairs[0].content.removed_debug_bytes = 0)},
     {expected: 1, report: ($proof | .pairs[0].content.size_reduction = 2)},
-    {expected: 1, report: ($proof | .pairs[0].content.loaded_content_sha256 = "")},
+    {expected: 1, report: ($proof | .pairs[0].content.mapped_loaded_content_sha256 = "")},
     {expected: 1, report: null},
     {expected: 1, report: []},
     {expected: 0, report: $proof}
   ] | .[]
 ' | while IFS= read -r item; do
   expected="$(jq -r '.expected' <<< "${item}")"
+  policy="$(jq -r '.policy // "identical_program_headers"' <<< "${item}")"
   jq '.report' <<< "${item}" > "${scratch}/report"
-  check_strip_proof "${expected}" "${scratch}/report" "${scratch}/fixture"
+  check_strip_proof "${expected}" "${scratch}/report" "${scratch}/fixture" "${policy}"
 done
 check_strip_proof 2
+check_strip_proof 2 "${scratch}/report" "${scratch}/fixture" unknown
 check_strip_proof 1 "${scratch}/missing" "${scratch}/fixture"
 valid_proof="$(jq -c . "${scratch}/report")"
 printf 'null\n%s\n' "${valid_proof}" > "${scratch}/report"
