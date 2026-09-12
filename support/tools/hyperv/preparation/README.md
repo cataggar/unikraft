@@ -183,6 +183,11 @@ allowance gate. Neither diagnostic can authorize a profile.
 Inner synthetic payload failures use the same bounded private error-name
 recording. Fixed Git-timeout stage markers distinguish setup from the blocked
 child; they are read only after cleanup and do not alter deadlines or admission.
+The isolation fixture permits `/run/user` only as the exact ancestor chain of
+the selected facade, rejecting sibling entries, files and symlinks. Git policy
+variants run in their dedicated cases rather than consuming the timeout case's
+five-second budget; production entry validation and blocked-child requirements
+are unchanged.
 Successful self-copy evidence compares held-file bytes/metadata and requires a
 different physical inode from the selected external executable. Each full-mode
 suite retains its own `namespace-baseline.json`; CI also requires the installed

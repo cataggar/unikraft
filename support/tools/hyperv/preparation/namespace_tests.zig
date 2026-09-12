@@ -122,7 +122,7 @@ fn recordInsideError(allocator: std.mem.Allocator, io: std.Io, mode: []const u8,
     defer directory.close(allocator, io);
     try recordErrorFile(io, directory.dir, "inside-error.txt", err);
 }
-const FixtureStage = enum { setup_started, runtime_ready, namespace_enter, inside_ready, policy_commands, blocked_probe, write_observed };
+const FixtureStage = enum { setup_started, runtime_ready, namespace_enter, inside_ready, policy_ready, blocked_probe, write_observed };
 fn markStage(io: std.Io, scratch: std.Io.Dir, stage: FixtureStage) !void {
     var name: [64]u8 = undefined;
     try put(io, scratch, try std.fmt.bufPrint(&name, "stage-{s}", .{@tagName(stage)}), "1\n", 0o600);
@@ -237,6 +237,12 @@ fn namespaceIds(io: std.Io) !NamespaceIds {
         @field(ids, field.name) = (try fs.metadata(file)).inode;
     }
     return ids;
+}
+fn requireOnlyDirectory(io: std.Io, directory: std.Io.Dir, name: []const u8) !void {
+    var entries = directory.iterate();
+    const entry = (try entries.next(io)) orelse return error.AmbientFilesystem;
+    if (entry.kind != .directory or !std.mem.eql(u8, entry.name, name) or
+        try entries.next(io) != null) return error.AmbientFilesystem;
 }
 fn tool(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory, executable: []const u8, dynamic: bool) !rt.Bound {
     const libraries = try allocator.alloc(c.File, if (dynamic) 1 else 0);
@@ -376,13 +382,32 @@ fn inside(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, inherited:
     try expected.value.require(try ns.Identity.of(expected.value.path, lock));
     lock.close(io);
     facade.close(allocator, io);
-    for ([_][]const u8{ ".d/hidden-marker", "/etc/ld.so.cache", "/root", "/run/user" }) |path| {
+    for ([_][]const u8{ ".d/hidden-marker", "/etc/ld.so.cache", "/root" }) |path| {
         const file = repository.dir.openFile(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
         file.close(io);
         return error.AmbientFilesystem;
+    }
+    if (std.mem.startsWith(u8, expected.value.path, "/run/user/")) {
+        // Only the selected facade requires these otherwise empty ancestors.
+        const runtime_parent = try std.Io.Dir.openDirAbsolute(io, "/run/user", .{ .iterate = true, .follow_symlinks = false });
+        defer runtime_parent.close(io);
+        const uid = try std.fmt.allocPrint(allocator, "{d}", .{account.uid});
+        try requireOnlyDirectory(io, runtime_parent, uid);
+        const user_parent = try runtime_parent.openDir(io, uid, .{ .iterate = true, .follow_symlinks = false });
+        defer user_parent.close(io);
+        try requireOnlyDirectory(io, user_parent, std.fs.path.basename(std.fs.path.dirname(expected.value.path).?));
+    } else {
+        const unexpected = std.Io.Dir.openDirAbsolute(io, "/run/user", .{}) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (unexpected) |directory| {
+            directory.close(io);
+            return error.AmbientFilesystem;
+        }
     }
     for ([_][]const u8{ "source.txt", ".git/fixture", ".d/zig-migration-preparation/resume-producer/work/dynamic/true", ".d/zig-migration-preparation/resume-producer/work/environment.json" }) |path| {
         const file = repository.dir.openFile(io, path, .{ .mode = .write_only }) catch |err| switch (err) {
@@ -601,6 +626,25 @@ test "namespace CI private fixture diagnostics reject replacement" {
     const bytes = try directory.read(allocator, io, "inside-error.txt", 256, .private);
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("FixtureFailed\n", bytes);
+}
+
+test "namespace facade ancestors expose only the selected directory" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try std.testing.expectError(error.AmbientFilesystem, requireOnlyDirectory(io, temporary.dir, "selected"));
+    try temporary.dir.createDir(io, "selected", .fromMode(0o700));
+    try requireOnlyDirectory(io, temporary.dir, "selected");
+    try std.testing.expectError(error.AmbientFilesystem, requireOnlyDirectory(io, temporary.dir, "another"));
+    try temporary.dir.createDir(io, "unrelated", .fromMode(0o700));
+    try std.testing.expectError(error.AmbientFilesystem, requireOnlyDirectory(io, temporary.dir, "selected"));
+    try temporary.dir.deleteDir(io, "unrelated");
+    try temporary.dir.deleteDir(io, "selected");
+    try put(io, temporary.dir, "selected", "not a directory\n", 0o600);
+    try std.testing.expectError(error.AmbientFilesystem, requireOnlyDirectory(io, temporary.dir, "selected"));
+    try temporary.dir.deleteFile(io, "selected");
+    try temporary.dir.symLink(io, ".", "selected", .{});
+    try std.testing.expectError(error.AmbientFilesystem, requireOnlyDirectory(io, temporary.dir, "selected"));
 }
 
 test "namespace CI baseline crosses native user and mount boundaries" {
@@ -1216,28 +1260,32 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
         .root = try ns.Identity.directory(root),
         .status_file = status_file,
     };
-    const serialized = try c.parse(ns.Binding, allocator, try c.canonical(allocator, try ns.describe(allocator, sandbox.isolation)));
-    const reopened = try ns.reopen(allocator, io, serialized.value);
-    try ns.validate(allocator, io, reopened, repository, workspace);
-    if (reopened.make_environment == null or reopened.git_policy == null) return error.FixtureFailed;
-    for ([_]c.File{ sandbox.isolation.make_environment.?, sandbox.isolation.git_policy.? }) |file| {
-        const opened = try workspace.dir.openFile(io, file.path, .{});
-        defer opened.close(io);
-        try opened.setPermissions(io, .fromMode(0o644));
-        if (ns.validate(allocator, io, sandbox.isolation, repository, workspace)) |_| return error.AcceptedPublicPolicy else |err| if (err != error.UnsafeFile) return err;
-        try opened.setPermissions(io, .fromMode(0o600));
+    // The other Git cases exercise these policy variants. The timeout case
+    // keeps its full production entry validation, without repeating them first.
+    if (!std.mem.eql(u8, mode, "git-timeout")) {
+        const serialized = try c.parse(ns.Binding, allocator, try c.canonical(allocator, try ns.describe(allocator, sandbox.isolation)));
+        const reopened = try ns.reopen(allocator, io, serialized.value);
+        try ns.validate(allocator, io, reopened, repository, workspace);
+        if (reopened.make_environment == null or reopened.git_policy == null) return error.FixtureFailed;
+        for ([_]c.File{ sandbox.isolation.make_environment.?, sandbox.isolation.git_policy.? }) |file| {
+            const opened = try workspace.dir.openFile(io, file.path, .{});
+            defer opened.close(io);
+            try opened.setPermissions(io, .fromMode(0o644));
+            if (ns.validate(allocator, io, sandbox.isolation, repository, workspace)) |_| return error.AcceptedPublicPolicy else |err| if (err != error.UnsafeFile) return err;
+            try opened.setPermissions(io, .fromMode(0o600));
+        }
+        var bad = sandbox;
+        bad.isolation.git_policy = null;
+        if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingPolicy else |err| if (err != error.MissingGitPolicy) return err;
+        bad = sandbox;
+        bad.aliases = &.{.{ .name = "git", .bound = git }};
+        if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedRealGitAlias else |err| if (err != error.InvalidGitAlias) return err;
+        bad = sandbox;
+        bad.runtimes = &.{ payload, git };
+        if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingHelper else |err| if (err != error.IncompleteRuntime) return err;
+        bad.runtimes = &.{ payload, helper };
+        if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingGit else |err| if (err != error.IncompleteRuntime) return err;
     }
-    var bad = sandbox;
-    bad.isolation.git_policy = null;
-    if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingPolicy else |err| if (err != error.MissingGitPolicy) return err;
-    bad = sandbox;
-    bad.aliases = &.{.{ .name = "git", .bound = git }};
-    if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedRealGitAlias else |err| if (err != error.InvalidGitAlias) return err;
-    bad = sandbox;
-    bad.runtimes = &.{ payload, git };
-    if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingHelper else |err| if (err != error.IncompleteRuntime) return err;
-    bad.runtimes = &.{ payload, helper };
-    if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingGit else |err| if (err != error.IncompleteRuntime) return err;
     if (std.mem.eql(u8, mode, "git-timeout")) try markStage(io, scratch.dir, .namespace_enter);
     const status = try ns.enter(allocator, io, sandbox, &.{ "/bin/fixture", try std.fmt.allocPrint(allocator, "inside-{s}", .{mode}) }, &clean);
     try scratch.dir.deleteDir(io, "namespace-root");
@@ -1327,17 +1375,19 @@ fn insideGit(allocator: std.mem.Allocator, io: std.Io, mode: []const u8) !void {
     var poison = try poisonedGitEnvironment(allocator, record);
     var stripped = std.process.Environ.Map.init(allocator);
     const unborn = std.mem.eql(u8, mode, "inside-git-unborn");
-    if (timeout) try markStage(io, scratch.dir, .policy_commands);
-    for ([_]*const std.process.Environ.Map{ &stripped, &poison }) |map| {
-        const head = try (try spawnFixture(allocator, &.{ "/bin/git", "rev-parse", "--short", "HEAD" }, map, scratch, false)).collect(allocator);
-        if (head.status.primary != .exited or head.status.code != (if (unborn) @as(u8, 128) else 0) or head.stderr.len != 0)
-            return error.GitStatusMismatch;
-        const expected = if (unborn) "" else try workspace.read(allocator, io, "short-head", 128, .private);
-        if (!std.mem.eql(u8, head.stdout, expected)) return error.GitHeadMismatch;
-        const modified = try (try spawnFixture(allocator, &.{ "/bin/git", "ls-files", "-m" }, map, scratch, false)).collect(allocator);
-        if (modified.status.primary != .exited or modified.status.code != 0 or modified.stderr.len != 0 or
-            !std.mem.eql(u8, modified.stdout, if (std.mem.eql(u8, mode, "inside-git-modified")) "tracked.txt\n" else ""))
-            return error.GitIndexMismatch;
+    if (timeout) try markStage(io, scratch.dir, .policy_ready);
+    if (!timeout) {
+        for ([_]*const std.process.Environ.Map{ &stripped, &poison }) |map| {
+            const head = try (try spawnFixture(allocator, &.{ "/bin/git", "rev-parse", "--short", "HEAD" }, map, scratch, false)).collect(allocator);
+            if (head.status.primary != .exited or head.status.code != (if (unborn) @as(u8, 128) else 0) or head.stderr.len != 0)
+                return error.GitStatusMismatch;
+            const expected = if (unborn) "" else try workspace.read(allocator, io, "short-head", 128, .private);
+            if (!std.mem.eql(u8, head.stdout, expected)) return error.GitHeadMismatch;
+            const modified = try (try spawnFixture(allocator, &.{ "/bin/git", "ls-files", "-m" }, map, scratch, false)).collect(allocator);
+            if (modified.status.primary != .exited or modified.status.code != 0 or modified.stderr.len != 0 or
+                !std.mem.eql(u8, modified.stdout, if (std.mem.eql(u8, mode, "inside-git-modified")) "tracked.txt\n" else ""))
+                return error.GitIndexMismatch;
+        }
     }
     if (timeout) try markStage(io, scratch.dir, .blocked_probe);
     if (!unborn) try inspectBlockedGit(allocator, io, record, scratch, &poison, timeout);
