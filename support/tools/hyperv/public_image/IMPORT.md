@@ -217,6 +217,28 @@ elapsed checks interrupt stalled filesystem syscalls**. A trusted outer
 native supervisor/deadline is a separate integration responsibility; this
 leaf creates no nested process group or child workload.
 
+## CI integration boundary
+
+The native public CI driver imports the exact native-v4 artifact produced
+after its real four-boot matrix, then performs a separate physical reload.
+Its expected manifest digest comes only from successful exporter stdout.
+The source exporter executable digest is captured before preparation, and
+source fields come from the actual GitHub job context, never the supplied
+manifest. In pull-request runs the source head is the actual merge checkout,
+not a substituted PR-head SHA.
+
+The caller retains the receipt digest only after a complete exit-0 import
+response with both durable statuses and the closed local-only labels.
+Reload uses that separate caller record, not a digest inferred from the
+receipt file. The source exporter and original export are rehashed after
+import/reload. Reports, requests, inspection and receipt metadata are retained,
+but neither VHD copy is added to the legacy #87 artifact contract.
+
+This is local producer-to-importer integration using a known in-job source.
+It does not approve an externally supplied artifact, authenticate a GitHub
+download/attestation or replace the independent trust inputs described above.
+Source boot claims remain source claims; import does not run another guest.
+
 ## API and focused fixtures
 
 `root.zig` exports `importer` and `import_contracts`:

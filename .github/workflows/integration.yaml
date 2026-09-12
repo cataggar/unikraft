@@ -831,7 +831,7 @@ jobs:
               -Doptimize="${mode}" -j2 test install --summary all
         done
 
-    - name: Run native public Hyper-V packaging and export fixtures
+    - name: Run native public Hyper-V packaging, export and import fixtures
       run: |
         set -euo pipefail
         umask 077
@@ -842,13 +842,14 @@ jobs:
         ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
           zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
         for mode in Debug ReleaseSafe; do
-          mkdir -p "${root}/${mode}/fixtures"
+          mkdir -p "${root}/${mode}/fixtures" "${root}/${mode}/import-fixtures"
           zig build --build-file support/tools/hyperv/public_image/build.zig \
             --system "${root}/restore/zig-pkg" \
             --cache-dir "${root}/${mode}/zig-local-cache" \
             --prefix "${root}/${mode}/out" \
             -Dtest-root="${root}/${mode}/fixtures" \
-            -Doptimize="${mode}" -j2 test install --summary all
+            -Dimport-test-root="${root}/${mode}/import-fixtures" \
+            -Doptimize="${mode}" -j2 test test-import install --summary all
         done
 
     - name: Exercise explicit private native Make configuration
@@ -1347,6 +1348,16 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-public-boot/export-digest.txt
           ${{ runner.temp }}/hyperv-ci/native-public-boot/export-sha256.txt
           ${{ runner.temp }}/hyperv-ci/native-public-boot/export/prepared-image-manifest.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/source-exporter.sha256
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/import-result.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/import-receipt-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/validate-import-result.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/import-validated.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/import-inputs-unchanged.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/imported/import-request.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/imported/prepared-image-manifest.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/imported/inspection.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/imported/import-receipt.json
           ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/state.json
           ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/packaging.json
           ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/package-report.json

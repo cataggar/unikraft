@@ -123,6 +123,8 @@ manifest/source/source-producer expectations and a separately retained
 successful import-receipt digest for reload. It does not change revision-3
 consumers, verify attestations, manufacture local boot observations or admit
 an image/authority. Trusted acquisition and root binding remain separate.
+The native CI driver follows its real export with physical import and reload,
+retaining local-only receipts without changing the legacy artifact contract.
 
 ## Actual preparation and physical reload
 
