@@ -713,6 +713,7 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-preparation/baseline.log
           ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/baseline.json
           ${{ runner.temp }}/hyperv-ci/native-preparation/namespace-denial.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/namespace-capability-diagnostics.log
           ${{ runner.temp }}/hyperv-ci/native-preparation/credentials.json
           ${{ runner.temp }}/hyperv-ci/native-preparation/cleanup.json
           ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-sha256.txt

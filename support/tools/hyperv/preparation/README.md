@@ -175,6 +175,11 @@ boundary, checks isolation, and cleans up its descendants. Only the synthetic
 fixture sets the stable 15-byte audit comm `uk-prep-ns-test`. A second existing
 eight-byte namespace status memfd carries a closed fixture-only error enum:
 arbitrary stderr is still discarded, not parsed into a policy decision.
+On refusal, a fixture-only exclusive private sidecar retains a fixed error name.
+The parent reads at most 256 bytes after process cleanup, reports the name in
+the baseline log, and removes the sidecar. Bounded fixture capability-denial
+records are also retained for diagnosis, including failures outside the
+allowance gate. Neither diagnostic can authorize a profile.
 Successful self-copy evidence compares held-file bytes/metadata and requires a
 different physical inode from the selected external executable. Each full-mode
 suite retains its own `namespace-baseline.json`; CI also requires the installed
