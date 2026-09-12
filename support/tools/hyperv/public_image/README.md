@@ -117,6 +117,15 @@ preserves network-application selection, and retains runtime/credential
 evidence separately. The standalone candidate workflow uses the same
 acquisition and runtime owner with its fresh native guest-build driver.
 
+The standalone native-v4 **physical** `import-prepared` / `validate-import`
+leaf is documented in [IMPORT.md](IMPORT.md). It requires independent
+manifest/source/source-producer expectations and a separately retained
+successful import-receipt digest for reload. It does not change revision-3
+consumers, verify attestations, manufacture local boot observations or admit
+an image/authority. Trusted acquisition and root binding remain separate.
+The native CI driver follows its real export with physical import and reload,
+retaining local-only receipts without changing the legacy artifact contract.
+
 ## Actual preparation and physical reload
 
 Native miz builds a 64-MiB FAT32 ESP in a **66-MiB GPT raw disk**, and a
@@ -215,7 +224,8 @@ ledger or establishes live authority.
 ## Module API
 
 `root.zig` exports `contracts`, `files`, `network`, `package`, `engine`,
-`worker`, `manifest`, `boot` and `core`. Use an arena per bounded command.
+`worker`, `manifest`, `importer`, `import_contracts`, `boot` and `core`.
+Use an arena per bounded command.
 
 - `engine.prepare(a, io, contracts.Input, Options)!State`: requires dedicated
   `core.process.initialize()`; `Options` contains the actual producer path

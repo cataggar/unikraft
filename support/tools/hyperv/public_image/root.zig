@@ -7,3 +7,5 @@ pub const package = @import("package.zig");
 pub const engine = @import("engine.zig");
 pub const manifest = @import("manifest.zig");
 pub const worker = @import("worker.zig");
+pub const importer = @import("importer.zig");
+pub const import_contracts = @import("import_contracts.zig");

@@ -30,6 +30,9 @@ cp --no-preserve=mode,ownership \
 cli="$(readlink -f "${ci}/native-public-image/ReleaseSafe/out/bin/uk-hyperv-public-image")"
 efi="$(readlink -f "${ci}/build/helloworld_hyperv-x86_64-efi-netvsc")"
 qemu="${runtime}/bin/qemu-system-x86_64"
+sha256sum "${cli}" > "${root}/source-exporter.sha256"
+source_exporter_sha256="$(cut -d ' ' -f 1 "${root}/source-exporter.sha256")"
+[[ "${source_exporter_sha256}" =~ ^[0-9a-f]{64}$ ]]
 solved_config=()
 if [[ "$3" == true ]]; then
   solved_config=(--solved-config "$(readlink -f "${ci}/hyperv-acceptance.config")")
@@ -60,3 +63,40 @@ test "$(sha256sum "${root}/export/prepared-image-manifest.json" | cut -d ' ' -f 
 test "$(find "${root}/export" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = $'prepared-image-manifest.json\nunikraft.vhd'
 sha256sum "${root}/export/prepared-image-manifest.json" \
   "${root}/export/unikraft.vhd" > "${root}/export-sha256.txt"
+
+# Expectations come from this caller's exporter and GitHub context, not the
+# artifact being imported. This exercises local import, not attestation.
+expected=(
+  --expected-manifest-sha256 "${digest}"
+  --expected-producer-sha256 "${source_exporter_sha256}"
+  --expected-repository "${GITHUB_REPOSITORY}"
+  --expected-repository-id "${GITHUB_REPOSITORY_ID}"
+  --expected-workflow-ref "${GITHUB_WORKFLOW_REF}"
+  --expected-job "${GITHUB_JOB}"
+  --expected-run-id "${GITHUB_RUN_ID}"
+  --expected-run-attempt "${GITHUB_RUN_ATTEMPT}"
+  --expected-head-sha "${GITHUB_SHA}"
+)
+timeout --signal=TERM --kill-after=5s 120s \
+  "${cli}" import-prepared --artifact-dir "${root}/export" \
+    --state-dir "${root}/imported" "${expected[@]}" > "${root}/import-result.json"
+jq -er '
+  select(.schema_version == 1 and .scope == "public_local_import_only" and
+    .authority == "not_admitted" and .attestation == "not_verified" and
+    .succeeded == true and .destination == "durable" and .publication == "durable" and
+    .failures == {primary:null,cleanup:null,recording:null}) |
+  .receipt_sha256 | select(type == "string" and test("^[0-9a-f]{64}$"))
+' "${root}/import-result.json" > "${root}/import-receipt-sha256.txt"
+test "$(wc -c < "${root}/import-receipt-sha256.txt")" -eq 65
+receipt="$(< "${root}/import-receipt-sha256.txt")"
+timeout --signal=TERM --kill-after=5s 120s \
+  "${cli}" validate-import --state-dir "${root}/imported" \
+    --expected-import-sha256 "${receipt}" "${expected[@]}" \
+    > "${root}/validate-import-result.json"
+jq -e --arg receipt "${receipt}" '
+  .schema_version == 1 and .scope == "public_local_import_only" and
+  .authority == "not_admitted" and .attestation == "not_verified" and
+  .validated == true and .receipt_sha256 == $receipt
+' "${root}/validate-import-result.json" > "${root}/import-validated.txt"
+sha256sum --check "${root}/source-exporter.sha256" "${root}/export-sha256.txt" \
+  > "${root}/import-inputs-unchanged.txt"

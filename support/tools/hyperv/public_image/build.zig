@@ -49,4 +49,15 @@ pub fn build(b: *std.Build) void {
     }) });
     tests.root_module.addOptions("test_options", options);
     b.step("test", "Test native public packaging/export without real guest boots").dependOn(&b.addRunArtifact(tests).step);
+    const import_options = b.addOptions();
+    import_options.addOptionPath("cli", cli.getEmittedBin());
+    import_options.addOption(?[]const u8, "test_root", b.option([]const u8, "import-test-root", "Existing private native import fixture directory"));
+    const import_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("import_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "public_image", .module = module }},
+    }) });
+    import_tests.root_module.addOptions("test_options", import_options);
+    b.step("test-import", "Test physical native import and reload without guests or networking").dependOn(&b.addRunArtifact(import_tests).step);
 }
