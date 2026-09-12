@@ -186,6 +186,56 @@ artifact changes and unsafe files, independent failure lanes and actual CLI
 serialization/refusals. Only small public synthetic files are used; the
 over-limit input case is sparse metadata, not a seed copy.
 
+The standalone test build also creates separate, uninstalled
+`local-boot-cli-fixture` and `local-boot-qemu-diagnostic-fixture` roots. Only
+those executable roots declare the compile-time
+`local_boot_synthetic_diagnostics` constant; codec/writer unit tests use
+`builtin.is_test`. Installed/public CLI roots have
+no declaration: the diagnostic imports and calls are not compiled into their
+execution path. There is no runtime switch, environment hook, callback,
+arbitrary command or diagnostic-path option. The fixture CLI uses the same
+`main.zig`, validation and execution code as the installed CLI.
+
+Each instrumented child writes the fixed private
+`synthetic-local-boot-phases-v1` file, separate from serial and `report.json`.
+Eight 512-byte slots bound it to 4096 bytes. Fixed-schema records contain
+the effective compiler backend, target architecture, optimization mode,
+AArch64 SHA2 and x86 SHA/AVX2 feature flags, actual pinned executable size,
+monotonic time and process-CPU time. Slots bracket initial artifact hashing,
+firmware copying including its existing fsyncs, final verification, exec
+handoff and mock entry. The gap between firmware-copy end and final-verify
+begin includes optional EFI staging and argument construction. Mock entry
+means the synthetic process reached its private-cwd hook, not a kernel exec
+receipt. It independently stats `/proc/self/exe` for the fixture byte count.
+No pre-TERM PID sampling, signal handler or core supervisor change is made.
+
+Diagnostic writes add no fsyncs and claim no durability or completion.
+Termination can leave missing metadata, an aligned prefix, a partial slot
+or an invalid slot. The bounded decoder retains only valid preceding records,
+never treats absence as process absence and never admits authority or success.
+Instrumentation has nonzero overhead and its actual executable size is
+reported; these observations alone are not a performance diagnosis.
+Existing deadlines, complete hashes, assertions and serial semantics remain
+unchanged. A diagnostic write failure fails the synthetic helper explicitly;
+it does not change production behavior or yield a successful observation.
+
+On test error, before the existing fixture teardown, the harness emits
+`native local synthetic phases:` and `native local stored report:` lines.
+Only decoded fixed-schema metadata and the canonical stored `report.json`
+are eligible; missing, malformed, oversized or unavailable files get fixed
+status labels. Failed stdout/stderr and raw serial are not inspected for
+diagnostic retention. Existing CI test logs capture these lines, including
+the two actual-CLI exit-code assertion cases; no new artifact wiring is
+required. Phase JSON is bounded to 4352 bytes per case. The stored report is
+an observed copy, not proof that its publication fsync succeeded or that it
+contains failures arising after publication. Teardown still removes only
+each test's own directory. Additional
+fixtures cover bounds, interrupted/invalid records, non-authority, separation
+from serial/report output, teardown and the uninstrumented production path.
+The dedicated retention fixtures also emit one validated synthetic CLI-failure
+sample and fixed invalid-file labels during a passing test run, so the CI log
+format itself is exercised without weakening any expected process outcome.
+
 Offline fixtures access no actual guest, KVM, Python, Azure, credential,
 original seed or historical private evidence. Separately, Hyper-V CI invokes
 the installed ReleaseSafe driver for the real fixed two-CPU SMP raw-disk boot,
