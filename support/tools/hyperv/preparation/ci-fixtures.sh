@@ -2,39 +2,59 @@
 set -euo pipefail
 umask 077
 
-# Hosted CI only. Local validation must not invoke this policy/setup entrypoint.
-test "${GITHUB_ACTIONS:-}" = true
+# Shared-host invocation is forbidden; local mode requires the prepared guest.
 test "$(id -u)" -ne 0
 qualify_strip=false
+local_vm=false
 case "$#" in
   0) ;;
   1)
-    if [ "$1" != --qualify-fixture-debug-stripping ]; then
-      echo 'Unknown preparation CI qualification argument' >&2
-      exit 2
-    fi
-    if [ "${GITHUB_REPOSITORY:-}" != cataggar/unikraft ] ||
-       [ "${GITHUB_WORKFLOW:-}" != 'Hyper-V fixture debug qualification' ] ||
-       [ "${GITHUB_JOB:-}" != fixture-debug-qualification ] ||
-       [ "${GITHUB_REF:-}" != refs/heads/fleet/zig-hyperv-fixture-strip-qualification ]; then
-      echo 'Fixture stripping is restricted to the explicit qualification workflow' >&2
-      exit 2
-    fi
-    qualify_strip=true
+    case "$1" in
+      --qualify-fixture-debug-stripping)
+        if [ "${GITHUB_REPOSITORY:-}" != cataggar/unikraft ] ||
+           [ "${GITHUB_WORKFLOW:-}" != 'Hyper-V fixture debug qualification' ] ||
+           [ "${GITHUB_JOB:-}" != fixture-debug-qualification ] ||
+           [ "${GITHUB_REF:-}" != refs/heads/fleet/zig-hyperv-fixture-strip-qualification ]; then
+          echo 'Fixture stripping is restricted to the explicit qualification workflow' >&2
+          exit 2
+        fi
+        qualify_strip=true
+        ;;
+      --vm-raw-fixtures) local_vm=true ;;
+      --vm-qualify-fixture-debug-stripping) local_vm=true; qualify_strip=true ;;
+      *)
+        echo 'Unknown preparation CI qualification argument' >&2
+        exit 2
+        ;;
+    esac
     ;;
   *)
     echo 'Unexpected preparation CI arguments' >&2
     exit 2
     ;;
 esac
+package=support/tools/hyperv/preparation
+if [ "${local_vm}" = true ]; then
+  variant=raw
+  if [ "${qualify_strip}" = true ]; then variant=qualified; fi
+  vm_context="$(bash "${package}/ci-vm-context.sh" "${variant}")"
+  root="/work/hyperv-ci/native-preparation/${variant}"
+  proof_workspace=/work/unikraft
+  llvm_directory=/work/tools/llvm/bin
+  packages=/work/packages/preparation/zig-pkg
+else
+  test "${GITHUB_ACTIONS:-}" = true
+  root="${RUNNER_TEMP:?}/hyperv-ci/native-preparation"
+  proof_workspace="${GITHUB_WORKSPACE:?}"
+  llvm_directory="${RUNNER_TEMP}/hyperv-preparation-llvm/bin"
+  packages="${root}/restore/zig-pkg"
+fi
 namespace_variant=()
 fixture_find_names=(-name preparation-namespace-fixture)
 if [ "${qualify_strip}" = true ]; then
   namespace_variant=(-Dstrip-fixture-debug=true -Dfixture-file-relayout=true)
   fixture_find_names=('(' -name preparation-namespace-fixture -o -name preparation-namespace ')')
 fi
-root="${RUNNER_TEMP:?}/hyperv-ci/native-preparation"
-package=support/tools/hyperv/preparation
 bash "${package}/ci-policy-tests.sh"
 installation=/var/lib/unikraft-hyperv-preparation-ci
 parser=/usr/sbin/apparmor_parser
@@ -55,6 +75,9 @@ done
 test ! -e "${root}"
 mkdir -p "${root}/restore" "${root}/git-runtime/lib" "${root}/tmp" \
   "${root}/cache" "${root}/config" "${root}/global/tmp" "${root}/driver-cache"
+if [ "${local_vm}" = true ]; then
+  printf '%s\n' "${vm_context}" > "${root}/execution-context.json"
+fi
 clean_environment=(
   /usr/bin/env -i PATH=/usr/bin:/bin
   "HOME=${canonical_home}" "USER=${username}" "LOGNAME=${username}" LC_ALL=C TZ=UTC
@@ -80,7 +103,7 @@ native /usr/bin/awk -v uid="${uid}" -v gid="${gid}" '
 ' /proc/self/status
 test "$(native "${zig}" version)" = 0.16.0
 if [ "${qualify_strip}" = true ]; then
-  objcopy="$(readlink -f "${RUNNER_TEMP}/hyperv-preparation-llvm/bin/llvm-objcopy")"
+  objcopy="$(readlink -f "${llvm_directory}/llvm-objcopy")"
   test -f "${objcopy}"
   test -x "${objcopy}"
   native "${objcopy}" --version > "${root}/fixture-objcopy-version.txt"
@@ -212,8 +235,15 @@ while IFS= read -r source; do
 done < "${root}/git-runtime-paths.txt"
 test "${#git_fixture[@]}" -gt 2
 cp "${package}/build.zig" "${package}/build.zig.zon" "${root}/restore/"
-native "${zig}" build --build-file "${root}/restore/build.zig" \
-  --cache-dir "${root}/restore-cache" --fetch=all -j2
+if [ "${local_vm}" = true ]; then
+  cmp "${package}/build.zig" /work/packages/preparation/build.zig
+  cmp "${package}/build.zig.zon" /work/packages/preparation/build.zig.zon
+  test -d "${packages}"
+  test ! -L "${packages}"
+else
+  native "${zig}" build --build-file "${root}/restore/build.zig" \
+    --cache-dir "${root}/restore-cache" --fetch=all -j2
+fi
 
 # Two physical native children: each embeds its mode's actual workspace/helper.
 for mode in Debug ReleaseSafe; do
@@ -322,8 +352,8 @@ for mode in Debug ReleaseSafe; do
   variant=debug
   if [ "${mode}" = ReleaseSafe ]; then variant=release-safe; fi
   native "${zig}" build --build-file "${package}/build.zig" \
-    --system "${root}/restore/zig-pkg" --cache-dir "${root}/${mode}/zig-local-cache" \
-    --prefix "${root}/${mode}/out" "-Dproof-fixture=${GITHUB_WORKSPACE:?}" "${git_fixture[@]}" \
+    --system "${packages}" --cache-dir "${root}/${mode}/zig-local-cache" \
+    --prefix "${root}/${mode}/out" "-Dproof-fixture=${proof_workspace}" "${git_fixture[@]}" \
     "-Doptimize=${mode}" -j2 test install --summary all \
     > "${root}/${mode}/preparation.log" 2>&1
   native "${zig}" build --build-file "${package}/namespace/build.zig" \
@@ -335,7 +365,7 @@ for mode in Debug ReleaseSafe; do
     "-Doptimize=${mode}" -j2 test install --summary all \
     > "${root}/${mode}/namespace.log" 2>&1
   native "${zig}" build --build-file "${package}/integration/build.zig" \
-    --system "${root}/restore/zig-pkg" --cache-dir "${root}/${mode}/integration-cache" \
+    --system "${packages}" --cache-dir "${root}/${mode}/integration-cache" \
     --prefix "${root}/${mode}/integration-out" "-Doptimize=${mode}" -j2 test install --summary all \
     > "${root}/${mode}/integration.log" 2>&1
 done
@@ -347,4 +377,8 @@ if [ "${qualify_strip}" = true ]; then
   sha256sum --check "${root}/fixture-objcopy-sha256.txt"
 fi
 test "$(stat -c '%d:%i:%u:%a:%h:%s' "${facade}/build.lock")" = "${facade_identity}"
-printf '%s\n' 'Synthetic preparation CI only; no full producer, staging-ledger or host/cloud admission.'
+if [ "${local_vm}" = true ]; then
+  printf '%s\n' 'Synthetic disposable-VM fixtures only; no GitHub, producer or host/cloud admission.'
+else
+  printf '%s\n' 'Synthetic preparation CI only; no full producer, staging-ledger or host/cloud admission.'
+fi

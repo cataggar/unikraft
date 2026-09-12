@@ -5,6 +5,53 @@ package="$(dirname -- "${BASH_SOURCE[0]}")"
 
 jq -nc '
   {
+    schema:"unikraft_fixture_vm_v1",authority:"disposable_test_only_not_admitted",
+    vm_uuid:"12345678-1234-4234-8234-123456789abc",nonce:("a"*32),
+    test_user:"uktest",uid:1001,gid:1001,source_root:"/work/unikraft",
+    test_root:"/work/hyperv-ci/native-preparation",python_guard:true,
+    image_sha256:"612b2c0cc1bc413a6cb8c38fd611794caf0f2b436c50013d8b3794db12ad7354",
+    kernel_sha256:"0066409132868538bc0c9076f60131025775d5bbd8617df074d059f91b584918",
+    initrd_sha256:"e7732308dee547d2455f6203b664d4ff47da050227fd6f2ad6a331dbff4ec0d2"
+  } as $marker |
+  [
+    {allowed:true,marker:$marker},
+    {allowed:false,marker:($marker | .schema="unknown")},
+    {allowed:false,marker:($marker | .authority="production")},
+    {allowed:false,marker:($marker | .vm_uuid="not-a-uuid")},
+    {allowed:false,marker:($marker | .nonce="unknown")},
+    {allowed:false,marker:($marker | .uid=0)},
+    {allowed:false,marker:($marker | .gid=0)},
+    {allowed:false,marker:($marker | .test_user="root")},
+    {allowed:false,marker:($marker | .source_root="/d/unikraft")},
+    {allowed:false,marker:($marker | .test_root="/tmp")},
+    {allowed:false,marker:($marker | .python_guard=false)},
+    {allowed:false,marker:($marker | del(.python_guard))},
+    {allowed:false,marker:($marker | .image_sha256="unknown")},
+    {allowed:false,marker:($marker | .kernel_sha256="unknown")},
+    {allowed:false,marker:($marker | .initrd_sha256="unknown")},
+    {allowed:false,marker:($marker | .extra=true)},
+    {allowed:false,marker:[]},
+    {allowed:false,marker:null}
+  ] | .[]
+' | while IFS= read -r item; do
+  expected="$(jq -r '.allowed' <<< "${item}")"
+  result=0
+  jq '.marker' <<< "${item}" | jq -se -f "${package}/ci-vm-marker.jq" > /dev/null || result=$?
+  if { [ "${expected}" = true ] && [ "${result}" -ne 0 ]; } ||
+     { [ "${expected}" = false ] && [ "${result}" -ne 1 ]; }; then
+    printf 'Unexpected VM marker result %s for %s\n' "${result}" "${item}" >&2
+    exit 1
+  fi
+done
+result=0
+GITHUB_ACTIONS=true bash "${package}/ci-vm-context.sh" raw > /dev/null 2>&1 || result=$?
+if [ "${result}" -ne 1 ]; then
+  echo 'VM context guard accepted a GitHub invocation' >&2
+  exit 1
+fi
+
+jq -nc '
+  {
     schema: "hyperv_preparation_namespace_ci_baseline_v1",
     authority: "synthetic_only", process_cleanup_complete: true,
     helper_exit: 125, namespace_succeeded: false,

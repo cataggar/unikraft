@@ -115,7 +115,8 @@ bash support/tools/hyperv/preparation/ci-fixtures.sh
 It retains the preparation, namespace and nonexecuting integration-driver suites
 in both Debug and ReleaseSafe with `-j2`, and supplies the actual checkout through
 `-Dproof-fixture`. Its shell is CI orchestration, not a production namespace
-transport. Do not run it locally: it performs the explicitly approved root-owned
+transport. Do not run its hosted invocation on a shared local host: it performs
+the explicitly approved root-owned
 synthetic-fixture installation and, only when justified below, AppArmor setup.
 The native fixtures alone remain locally runnable without changing policy.
 The job uses the pinned native Zig/LLVM distributions and the installed Git
@@ -294,6 +295,34 @@ defaults to `identical_program_headers`; qualification explicitly requests
 `file_offset_relayout`. Version1 and mismatched-policy reports are rejected.
 The trial is synthetic qualification,
 not adoption, runtime authentication, producer admission or a full ledger fit.
+
+### Prepared local VM fixtures
+
+The same fixture pipeline has two explicit local entrypoints:
+`--vm-raw-fixtures` and `--vm-qualify-fixture-debug-stripping`. They are only for
+the separately prepared disposable Ubuntu24.04 x64 KVM guest, never the shared
+Azure Linux host or an arbitrary local checkout. They reject GitHub context
+rather than fabricating GitHub environment variables.
+
+`ci-vm-context.sh` requires the root-owned read-only VM marker, matching DMI
+UUID, fixed kernel and ordinary UID/GID1001, systemd, active AppArmor with
+userns support and global restriction1, and the interpreter execution-bit
+guard. The caller must supply `UK_FIXTURE_SOURCE_SHA` from the independently
+held reviewed commit; `/work/unikraft` must be clean at that exact commit.
+The parent must already have accepted the complete bootstrap protocol and
+ordinary-boot readiness; the marker alone is not proof of those observations.
+
+The parent stages Zig and LLVM under `/work/tools`, and the existing native
+preparation dependency material under `/work/packages/preparation` with its
+matching `build.zig` and `build.zig.zon`. Local mode requires those manifests
+to match the checkout and uses the existing `zig-pkg` directory without a
+network fetch. Native compiler/test credential handling, deadlines, report
+gates, exact conditional AppArmor profiles and cleanup use the shared pipeline.
+Each mode has a fresh `/work/hyperv-ci/native-preparation/raw` or `qualified`
+root and records a separate `execution-context.json` labelled
+`local_disposable_vm`. Run them one at a time; owned fixture installation
+paths are intentionally exclusive. These results are synthetic local fixture
+evidence, not GitHub execution, production admission or authorization to adopt.
 
 ## Wire versions and types
 
