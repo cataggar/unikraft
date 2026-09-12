@@ -20,6 +20,9 @@ pub fn build(b: *std.Build) void {
     const ci_report = b.option([]const u8, "ci-report", "Private absolute baseline report for TESTS ONLY");
     if (ci_report) |path| if (!std.fs.path.isAbsolute(path)) @panic("ci-report must be absolute");
     const strip_debug = b.option(bool, "strip-fixture-debug", "QUALIFICATION ONLY: verify post-compilation debug stripping of synthetic fixture copies") orelse false;
+    const file_relayout = b.option(bool, "fixture-file-relayout", "QUALIFICATION ONLY: explicitly verify file-offset-only ELF relayout") orelse false;
+    if (file_relayout and !strip_debug) @panic("fixture-file-relayout requires strip-fixture-debug=true");
+    const layout_policy = if (file_relayout) "file_offset_relayout" else "identical_program_headers";
     const fixture_objcopy = b.option([]const u8, "fixture-objcopy", "Explicit absolute pinned native llvm-objcopy for QUALIFICATION ONLY");
     if (strip_debug and fixture_objcopy == null) @panic("strip-fixture-debug=true requires -Dfixture-objcopy=ABS");
     if (fixture_objcopy) |path| {
@@ -71,6 +74,33 @@ pub fn build(b: *std.Build) void {
     const run_gate_tests = b.addRunArtifact(gate_tests);
     run_gate_tests.setCwd(.{ .cwd_relative = workspace });
     b.step("test-strip-equivalence", "Test qualification-only ELF preservation and private file gates").dependOn(&run_gate_tests.step);
+    const sample_raw = b.option([]const u8, "relayout-sample-raw", "Explicit read-only x64 regression data, never executed");
+    const sample_candidate = b.option([]const u8, "relayout-sample-candidate", "Explicit read-only x64 regression candidate data, never executed");
+    const sample_report = b.option([]const u8, "relayout-sample-report", "Optional private create-only report for the data-only regression");
+    if ((sample_raw == null) != (sample_candidate == null) or (sample_report != null and sample_raw == null))
+        @panic("relayout sample requires both raw and candidate data paths");
+    for ([_]?[]const u8{ sample_raw, sample_candidate, sample_report }) |path| {
+        if (path) |value| if (!std.fs.path.isAbsolute(value)) @panic("relayout sample paths must be absolute");
+    }
+    if (sample_raw) |raw_path| {
+        const sample_options = b.addOptions();
+        sample_options.addOption([]const u8, "raw", raw_path);
+        sample_options.addOption([]const u8, "candidate", sample_candidate.?);
+        sample_options.addOption(?[]const u8, "report", sample_report);
+        const sample_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("fixture_debug_relayout_sample_tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "equivalence", .module = equivalence }},
+        }) });
+        sample_tests.root_module.addOptions("sample_options", sample_options);
+        const run_sample = b.addRunArtifact(sample_tests);
+        run_sample.has_side_effects = true;
+        run_sample.addFileInput(.{ .cwd_relative = raw_path });
+        run_sample.addFileInput(.{ .cwd_relative = sample_candidate.? });
+        run_sample.setCwd(.{ .cwd_relative = workspace });
+        b.step("test-strip-sample", "Compare the copied x64 regression data without executing it").dependOn(&run_sample.step);
+    }
     const helper = b.addExecutable(.{
         .name = "preparation-namespace",
         .root_module = b.createModule(.{
@@ -89,6 +119,7 @@ pub fn build(b: *std.Build) void {
         check.addArg("pair");
         check.addFileArg(helper.getEmittedBin());
         check.addFileArg(selected_helper);
+        check.addArgs(&.{ "--layout-policy", layout_policy });
         check.expectExitCode(0);
         break :gate check;
     } else null;
@@ -122,6 +153,7 @@ pub fn build(b: *std.Build) void {
         check.addFileArg(selected_helper);
         check.addFileArg(fixture.getEmittedBin());
         check.addFileArg(selected_fixture);
+        check.addArgs(&.{ "--layout-policy", layout_policy });
         if (fixture_path) |path| {
             check.addArg("--external");
             check.addFileArg(.{ .cwd_relative = path });
