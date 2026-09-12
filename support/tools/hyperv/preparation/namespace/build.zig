@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "equivalence", .module = equivalence }},
     }) });
+    gate_tests.step.dependOn(&verifier.step);
     const run_gate_tests = b.addRunArtifact(gate_tests);
     run_gate_tests.setCwd(.{ .cwd_relative = workspace });
     b.step("test-strip-equivalence", "Test qualification-only ELF preservation and private file gates").dependOn(&run_gate_tests.step);

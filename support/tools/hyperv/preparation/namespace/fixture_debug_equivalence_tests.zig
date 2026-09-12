@@ -143,6 +143,31 @@ test "debug equivalence pins identity hashes and rejects symlinks and input muta
     const pair = try gate.Pair.open(a, io, raw_path, candidate_path);
     defer pair.close(a, io);
     try pair.recheck(io);
+    const proof: gate.SuiteProof = .{
+        .pairs = .{ pair.proof(.namespace_helper), pair.proof(.namespace_fixture) },
+    };
+    const json = try std.json.Stringify.valueAlloc(a, proof, .{});
+    defer a.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try t.expectEqual(@as(usize, 8), object.count());
+    try t.expectEqualStrings("hyperv_fixture_debug_stripping_v1", object.get("schema").?.string);
+    try t.expectEqualStrings("synthetic_only_not_admitted", object.get("authority").?.string);
+    try t.expect(object.get("passed").?.bool and object.get("synthetic").?.bool and object.get("qualification_only").?.bool);
+    try t.expect(!object.get("admitted").?.bool);
+    try t.expect(object.get("external_fixture").? == .null);
+    const pairs = object.get("pairs").?.array.items;
+    try t.expectEqual(@as(usize, 2), pairs.len);
+    for (pairs, [_][]const u8{ "namespace_helper", "namespace_fixture" }) |item, role| {
+        try t.expectEqualStrings(role, item.object.get("role").?.string);
+        for ([_][]const u8{ "raw", "candidate" }, [_]gate.Pinned{ pair.raw, pair.candidate }) |field, input| {
+            const file = item.object.get(field).?.object;
+            try t.expectEqual(@as(i64, @intCast(input.bytes.len)), file.get("size").?.integer);
+            try t.expectEqualStrings(&std.fmt.bytesToHex(input.hash, .lower), file.get("sha256").?.string);
+            try t.expect(file.get("stable_identity_and_hash").?.bool);
+        }
+    }
     try temporary.dir.symLink(io, "raw", "link", .{});
     if (gate.Pinned.open(a, io, link_path)) |value| {
         value.close(a, io);

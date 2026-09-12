@@ -274,6 +274,17 @@ pub const Pinned = struct {
 };
 
 pub const PairProof = struct { role: Role, raw: FileProof, candidate: FileProof, content: ContentProof };
+pub const SuiteProof = struct {
+    schema: enum { hyperv_fixture_debug_stripping_v1 } = .hyperv_fixture_debug_stripping_v1,
+    authority: enum { synthetic_only_not_admitted } = .synthetic_only_not_admitted,
+    passed: bool = true,
+    synthetic: bool = true,
+    admitted: bool = false,
+    qualification_only: bool = true,
+    pairs: [2]PairProof,
+    external_fixture: ?FileProof = null,
+};
+
 pub const Pair = struct {
     raw: Pinned,
     candidate: Pinned,

@@ -45,10 +45,7 @@ fn run(init: std.process.Init) !void {
     try fixture.recheck(io);
     // The caller owns these private caches through subsequent consumption.
     // This is a fresh observation, not a lock against later owner mutation.
-    if (report) |path| try gate.publish(allocator, io, path, .{
-        .schema = "hyperv_fixture_debug_stripping_v1",
-        .authority = "synthetic_only_not_admitted",
-        .qualification_only = true,
+    if (report) |path| try gate.publish(allocator, io, path, gate.SuiteProof{
         .pairs = [_]gate.PairProof{ helper.proof(.namespace_helper), fixture.proof(.namespace_fixture) },
         .external_fixture = if (copy) |file| @as(?gate.FileProof, file.proof()) else null,
     });
