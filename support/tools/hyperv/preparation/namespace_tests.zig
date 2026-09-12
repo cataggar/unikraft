@@ -1674,6 +1674,10 @@ test "namespace Git actual static dispatch restores stripped and poisoned policy
             defer root.close(io);
             var entries = root.iterate();
             try std.testing.expect(try entries.next(io) == null);
+            if (@import("test_options").strip_fixture_debug) {
+                var buffer: [observations.log_bytes]u8 = undefined;
+                std.debug.print("{s}", .{try stages.log(allocator, &buffer)});
+            }
             continue;
         }
         if (!outcome.succeeded()) std.debug.print("Git fixture {s}: {any}, {any}\n", .{ mode, outcome.child.termination, outcome.child.failures });

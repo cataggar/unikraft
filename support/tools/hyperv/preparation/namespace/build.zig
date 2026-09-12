@@ -142,6 +142,7 @@ pub fn build(b: *std.Build) void {
     else
         test_options.addOptionPath("namespace_fixture", selected_fixture);
     test_options.addOption(?[]const u8, "ci_report", ci_report);
+    test_options.addOption(bool, "strip_fixture_debug", strip_debug);
     test_options.addOptionPath("process_fixture", child.getEmittedBin());
     const tests = b.addTest(.{
         .filters = if (filter) |selected| &.{selected} else &.{ "namespace", "producer exact", "producer rejects", "producer vetoes", "producer native proof", "producer outcome" },
