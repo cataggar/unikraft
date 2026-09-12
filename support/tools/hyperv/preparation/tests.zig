@@ -10,6 +10,7 @@ const packaging = @import("package.zig");
 const budget = @import("budget.zig");
 const admission = @import("admission.zig");
 const private = c.core.private_files;
+const host_is_aarch64 = @import("builtin").cpu.arch == .aarch64;
 
 fn cli(allocator: std.mem.Allocator, cwd: std.Io.Dir, arguments: []const []const u8) !c.core.process.Result {
     var argv: std.ArrayList([]const u8) = .empty;
@@ -119,7 +120,7 @@ fn shapeTool(role: rt.Role, executable: ?c.File) rt.Tool {
     return .{
         .role = role,
         .origin = if (role == .dependencies) @import("origin_fixture.zig").shapePackage() else if (role == .preparation or role == .git or role == .m4) @import("origin_fixture.zig").local() else @import("origin_fixture.zig").shapeDistribution(),
-        .target = if (executable == null) .data else .aarch64_linux,
+        .target = if (executable == null) .data else if (host_is_aarch64) .aarch64_linux else .x86_64_linux,
         .tree = .{ .sha256 = c.digest("public synthetic runtime SHAPE only"), .files = 1, .bytes = 128 },
         .executable = executable,
         .loader = null,
@@ -148,7 +149,7 @@ fn shapePrepared(allocator: std.mem.Allocator) !receipts.Receipt {
     const review: provenance.Record = .{
         .schema = .hyperv_native_producer_provenance_v2,
         .source = selected_source,
-        .host_target = .aarch64_linux,
+        .host_target = if (host_is_aarch64) .aarch64_linux else .x86_64_linux,
         .guest_target = .x86_64_freestanding_none,
         .compiler_version = c.compiler_version,
         .producer = native,
@@ -407,10 +408,10 @@ test "SHAPE ONLY reviewed provenance rejects substitution of every producer comp
     changed.compiler_version = "0.16.1";
     try std.testing.expectError(error.CompilerMismatch, provenance.validate(changed));
     changed = original.provenance;
-    changed.host_target = .x86_64_linux;
+    changed.host_target = if (host_is_aarch64) .x86_64_linux else .aarch64_linux;
     try std.testing.expectError(error.CompilerMismatch, provenance.validate(changed));
     changed = original.provenance;
-    changed.compiler.target = .x86_64_linux;
+    changed.compiler.target = if (host_is_aarch64) .x86_64_linux else .aarch64_linux;
     try std.testing.expectError(error.CompilerMismatch, provenance.validate(changed));
     changed = original.provenance;
     changed.dependencies = &.{};
@@ -428,7 +429,7 @@ test "SHAPE ONLY provenance rejects malformed runtime hashes paths modes and cro
     defer arena.deinit();
     const original = (try shapePrepared(arena.allocator())).provenance;
     var changed = original;
-    changed.git.target = .x86_64_linux;
+    changed.git.target = if (host_is_aarch64) .x86_64_linux else .aarch64_linux;
     try std.testing.expectError(error.CompilerMismatch, provenance.validate(changed));
     changed = original;
     changed.trust.tree.sha256[0] = 'g';

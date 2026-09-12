@@ -599,26 +599,24 @@ test "runtime real relocated Git binds all ELF bytes modes and transitive depend
     const allocator = arena.allocator();
     var fixture = try TestFixture.init(allocator, std.testing.io);
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 7), fixture.git.runtime.contract.libraries.len);
+    try std.testing.expectEqual(@import("test_options").git_libraries.?.len, fixture.git.runtime.contract.libraries.len);
     try std.testing.expect(std.mem.startsWith(u8, try fixture.setup(&.{"--version"}), "git version "));
     const original = fixture.git.runtime.contract;
-    fixture.git.runtime.contract.libraries = original.libraries[1..];
-    try std.testing.expectError(error.IncompleteRuntime, fixture.git.validate());
-    fixture.git.runtime.contract = original;
+    for (original.libraries, 0..) |_, omitted| {
+        const incomplete_libraries = try allocator.alloc(c.File, original.libraries.len - 1);
+        @memcpy(incomplete_libraries[0..omitted], original.libraries[0..omitted]);
+        @memcpy(incomplete_libraries[omitted..], original.libraries[omitted + 1 ..]);
+        fixture.git.runtime.contract.libraries = incomplete_libraries;
+        try std.testing.expectError(error.IncompleteRuntime, fixture.git.validate());
+        fixture.git.runtime.contract = original;
+    }
     const duplicate = try allocator.alloc(c.File, original.libraries.len + 1);
     @memcpy(duplicate[0..original.libraries.len], original.libraries);
     duplicate[original.libraries.len] = duplicate[0];
     fixture.git.runtime.contract.libraries = duplicate;
     try std.testing.expectError(error.InvalidRuntime, fixture.git.validate());
     fixture.git.runtime.contract = original;
-    var no_transitive: std.ArrayList(c.File) = .empty;
-    for (original.libraries) |library| if (!std.mem.eql(u8, library.path, "lib/libdl.so.2")) {
-        try no_transitive.append(allocator, library);
-    };
-    fixture.git.runtime.contract.libraries = no_transitive.items;
-    try std.testing.expectError(error.IncompleteRuntime, fixture.git.validate());
-    fixture.git.runtime.contract = original;
-    fixture.git.runtime.contract.target = .x86_64_linux;
+    fixture.git.runtime.contract.target = if (original.target == .aarch64_linux) .x86_64_linux else .aarch64_linux;
     try std.testing.expectError(error.InvalidRuntime, fixture.git.validate());
     fixture.git.runtime.contract = original;
     try std.testing.expectError(error.AmbientRuntimeForbidden, fixture.git.runtime.originPaths(allocator, "bin/git", "/usr/lib"));
@@ -650,26 +648,37 @@ test "runtime rehashed ambient ELF search metadata and undeclared runtime extras
     const bytes = try directory.read(allocator, io, "bin/git", 64 * 1024 * 1024, .executable);
     var image = try elf.Image.parse(allocator, bytes);
     defer image.deinit();
-    var search_offset: ?u64 = null;
+    var location: ?struct { tag: u64, string: u64 } = null;
     for (image.sections) |section| {
         if (section.header.sh_type != std.elf.SHT_DYNAMIC) continue;
         var offset: u64 = 0;
         while (offset < section.header.sh_size) : (offset += @sizeOf(std.elf.Elf64_Dyn)) {
             const dynamic = try elf.structure(std.elf.Elf64_Dyn, bytes, section.header.sh_offset + offset, image.header.endian);
-            if (dynamic.d_tag == std.elf.DT_RPATH or dynamic.d_tag == std.elf.DT_RUNPATH)
-                search_offset = image.sections[section.header.sh_link].header.sh_offset + dynamic.d_val;
+            if (dynamic.d_tag == std.elf.DT_NEEDED and location == null)
+                location = .{
+                    .tag = section.header.sh_offset + offset,
+                    .string = image.sections[section.header.sh_link].header.sh_offset + dynamic.d_val,
+                };
         }
     }
-    try std.testing.expect(search_offset != null);
+    const offsets = location orelse return error.MissingFixtureDependency;
     const file = try directory.dir.openFile(io, "bin/git", .{ .mode = .read_write, .follow_symlinks = false });
     defer file.close(io);
-    try file.writePositionalAll(io, "/", search_offset.?);
-    fixture.git.runtime.contract.executable = try directory.record(allocator, io, "bin/git", 64 * 1024 * 1024, .executable);
-    fixture.git.runtime.contract.tree = (try fs.inventory(allocator, io, directory, 32, 128 * 1024 * 1024)).tree;
-    try std.testing.expectError(error.AmbientRuntimeForbidden, fixture.git.validate());
-    try file.writePositionalAll(io, bytes[@intCast(search_offset.?)..][0..1], search_offset.?);
-    fixture.git.runtime.contract = original;
-    try fixture.git.validate();
+    // Inject both search tags in this private copy; installed Git need not have
+    // either tag. Altered bytes are validated, never executed.
+    for ([_]i64{ std.elf.DT_RPATH, std.elf.DT_RUNPATH }) |tag| {
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(i64, &encoded, tag, image.header.endian);
+        try file.writePositionalAll(io, &encoded, offsets.tag);
+        try file.writePositionalAll(io, "/", offsets.string);
+        fixture.git.runtime.contract.executable = try directory.record(allocator, io, "bin/git", 64 * 1024 * 1024, .executable);
+        fixture.git.runtime.contract.tree = (try fs.inventory(allocator, io, directory, 32, 128 * 1024 * 1024)).tree;
+        try std.testing.expectError(error.AmbientRuntimeForbidden, fixture.git.validate());
+        try file.writePositionalAll(io, bytes[@intCast(offsets.tag)..][0..8], offsets.tag);
+        try file.writePositionalAll(io, bytes[@intCast(offsets.string)..][0..1], offsets.string);
+        fixture.git.runtime.contract = original;
+        try fixture.git.validate();
+    }
     const extra = try directory.dir.createFile(io, "unreviewed", .{ .exclusive = true, .permissions = .fromMode(0o644) });
     defer extra.close(io);
     try extra.writePositionalAll(io, "unreviewed extra runtime file", 0);
