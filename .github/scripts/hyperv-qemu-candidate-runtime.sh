@@ -3,11 +3,23 @@ set -euo pipefail
 umask 077
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT QEMU_MODULE_DIR
 
-if [[ $# != 1 || "$1" != /* || "${GITHUB_ACTIONS:-}" != true || "$(id -u)" -eq 0 ]]; then
-  echo "The managed candidate runtime requires an ordinary-user GitHub runner and an absolute root." >&2
+if [[ ( $# != 1 && $# != 4 ) || "${1:-}" != /* ||
+      "${GITHUB_ACTIONS:-}" != true || "$(id -u)" -eq 0 ]]; then
+  echo "usage: hyperv-qemu-candidate-runtime.sh ROOT [integration CI_ROOT NETWORK_APPLICATION] on an ordinary-user GitHub runner" >&2
   exit 2
 fi
 root="$(readlink -f "$1")"
+if [[ $# == 4 ]]; then
+  if [[ "$2" != integration || "$3" != /* || ( "$4" != true && "$4" != false ) ]]; then
+    echo "Invalid native integration driver selection." >&2
+    exit 2
+  fi
+  driver="$(readlink -f .github/scripts/hyperv-native-public-ci.sh)"
+  driver_args=("${root}" "$3" "$4")
+else
+  driver="$(readlink -f .github/scripts/hyperv-qemu-candidate-guest.sh)"
+  driver_args=(boot "${root}" "${root}/bin/qemu-system-x86_64")
+fi
 source="${root}/runtime/libfdt.so.1"
 target=/usr/lib/x86_64-linux-gnu/libfdt.so.1
 ownership="${root}/evidence/runtime-created.txt"
@@ -166,9 +178,11 @@ sudo /usr/bin/setpriv --reuid="${runner_uid}" --regid="${runner_gid}" --groups="
     test "$(stat -c "%d:%i:%u:%g:%t:%T" /dev/kvm)" = "$6"
     test -r /dev/kvm
     test -w /dev/kvm
-    exec /usr/bin/bash "$5" boot "$4" "$4/bin/qemu-system-x86_64"
+    driver="$5"
+    shift 6
+    exec /usr/bin/bash "$driver" "$@"
   ' _ "${runner_uid}" "${runner_gid}" "${guest_groups}" "${root}" \
-  "$(readlink -f .github/scripts/hyperv-qemu-candidate-guest.sh)" "${kvm_identity}"
+  "${driver}" "${kvm_identity}" "${driver_args[@]}"
 id > "${root}/evidence/kvm-caller-after.txt"
 cmp "${root}/evidence/kvm-caller.txt" "${root}/evidence/kvm-caller-after.txt"
 sha256sum -c "${root}/evidence/managed-probe/executables.sha256" \

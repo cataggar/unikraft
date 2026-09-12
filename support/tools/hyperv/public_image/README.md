@@ -100,6 +100,23 @@ claim of complete Python-free CI. Root CLI assembly, producer maps and importer
 migration remain separate. The legacy inline Python matrix assertion can then
 be removed; native `prepare` already requires the entire matrix.
 
+The x64 native public CI path separately pins QEMU `v11.0.50-z.7` (archive
+SHA256 `f8b9cc818959f95326010c95dad644177ebb0cbb0feef3db9528c4434855e397`).
+The shared `v11.0.91-z.15` binary excludes VPC and remains unchanged for
+unrelated and legacy consumers. The native acquisition helper authenticates
+the archive, extracts only regular executable/data members, and obtains
+the exact missing libfdt package through hook-free private APT state.
+The hosted runtime owner places only that exact library at its normal loader
+path and removes only its own file. QEMU retains its `TMPDIR`-only child
+environment; no loader override or QEMU wrapper is used.
+Only the ordinary-user controller tree receives the existing KVM group,
+with original user/primary group preserved, all capabilities dropped and
+no-new-privileges required. No ACL, device mode, group database or udev rule
+is changed. This native step runs before the unchanged legacy boot step,
+preserves network-application selection, and retains runtime/credential
+evidence separately. The standalone candidate workflow uses the same
+acquisition and runtime owner with its fresh native guest-build driver.
+
 ## Actual preparation and physical reload
 
 Native miz builds a 64-MiB FAT32 ESP in a **66-MiB GPT raw disk**, and a
@@ -127,10 +144,8 @@ not nested supervisor process groups:
 
 Both disk modes retain the complete original O_RDONLY descriptor, including
 the VHD footer, without copying/slicing it for a boot. VPC has no raw offset
-or size option. Pinned QEMU v11.0.91-z.15 uses
-`BlockdevOptionsGenericFormat` for vpc opening
-(`qapi/block-core.json`, near line 4890). `force-size` belongs only to
-`BlockdevCreateOptionsVpc` (near line 5524); neither it nor
+or size option. QEMU uses `BlockdevOptionsGenericFormat` for VPC opening.
+`force-size` belongs only to `BlockdevCreateOptionsVpc`; neither it nor
 `force_size_calc` is sent in opening JSON. The pinned miz creator tag
 `miz ` selects footer `current_size`. For legacy `vpc `, `vs  ` and
 `qemu` creators, CHS must equal that exact size or the input is rejected,

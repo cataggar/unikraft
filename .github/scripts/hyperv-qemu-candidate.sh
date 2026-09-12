@@ -125,7 +125,6 @@ jq -n --arg executable_sha256 "${qemu_sha256}" --arg disk_sha256 "${disk_sha256}
     scope: "synthetic_fixed_vhd_open_only",
     authority: "not_admitted",
     guest_booted: false,
-    pin_changed: false,
     executable_sha256: $executable_sha256,
     disk_sha256: $disk_sha256,
     virtual_size: $capacity,

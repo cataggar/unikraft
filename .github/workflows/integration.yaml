@@ -1189,6 +1189,20 @@ jobs:
           "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi.dbg" \
           > "${RUNNER_TEMP}/hyperv-ci/smp-image-sha256.txt"
 
+    - name: Acquire the separately pinned native public QEMU runtime
+      run: |
+        bash .github/scripts/hyperv-native-qemu-acquire.sh "${RUNNER_TEMP}/hyperv-ci/native-qemu"
+
+    - name: Prepare and boot native raw GPT and fixed VHD in both APIC modes
+      env:
+        HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
+        QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
+        QUALIFICATION_SOURCE_JOB: zig-hyperv
+      run: |
+        bash .github/scripts/hyperv-qemu-candidate-runtime.sh \
+          "${RUNNER_TEMP}/hyperv-ci/native-qemu" integration \
+          "${RUNNER_TEMP}/hyperv-ci" "${HYPERV_NETWORK_APPLICATION}"
+
     - name: Boot exact raw GPT and fixed VHD in both APIC modes
       env:
         HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
@@ -1232,58 +1246,6 @@ jobs:
                 f"{state.get('local_platform_boot_modes')!r}"
             )
         PY
-
-    - name: Prepare and boot native raw GPT and fixed VHD in both APIC modes
-      env:
-        HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
-      run: |
-        set -euo pipefail
-        umask 077
-        test -r /dev/kvm
-        test -w /dev/kvm
-        root="${RUNNER_TEMP}/hyperv-ci/native-public-boot"
-        mkdir -p "${root}/firmware"
-        root="$(readlink -f "${root}")"
-        cp --no-preserve=mode,ownership \
-          "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
-        cp --no-preserve=mode,ownership \
-          "$(readlink -f /usr/share/OVMF/OVMF_VARS_4M.fd)" "${root}/firmware/vars.fd"
-        cli="$(readlink -f "${RUNNER_TEMP}/hyperv-ci/native-public-image/ReleaseSafe/out/bin/uk-hyperv-public-image")"
-        efi="$(readlink -f "${RUNNER_TEMP}/hyperv-ci/build/helloworld_hyperv-x86_64-efi-netvsc")"
-        qemu="$(readlink -f "${RUNNER_TEMP}/hyperv-tools/qemu-system-x86_64")"
-        solved_config=()
-        if [ "${HYPERV_NETWORK_APPLICATION}" = "true" ]; then
-          solved_config=(
-            --solved-config
-            "$(readlink -f "${RUNNER_TEMP}/hyperv-ci/hyperv-acceptance.config")"
-          )
-        fi
-        timeout --signal=TERM --kill-after=5s 480s \
-          "${cli}" prepare --efi "${efi}" --qemu "${qemu}" \
-            --ovmf-code "${root}/firmware/code.fd" \
-            --ovmf-vars "${root}/firmware/vars.fd" \
-            --state-dir "${root}/packaging" "${solved_config[@]}" --timeout 60 \
-            > "${root}/prepare-result.json"
-        timeout --signal=TERM --kill-after=5s 60s \
-          "${cli}" validate-matrix --state-dir "${root}/packaging" \
-            > "${root}/matrix.json"
-        # Exercise native-v4 export separately; legacy #87 consumers remain unchanged.
-        digest="$(
-          timeout --signal=TERM --kill-after=5s 90s \
-            "${cli}" export-prepared --state-dir "${root}/packaging" \
-              --artifact-dir "${root}/export" \
-              --source-repository "${GITHUB_REPOSITORY}" \
-              --source-repository-id "${{ github.repository_id }}" \
-              --source-workflow-ref "${GITHUB_WORKFLOW_REF}" --source-job zig-hyperv \
-              --source-run-id "${GITHUB_RUN_ID}" \
-              --source-run-attempt "${GITHUB_RUN_ATTEMPT}" \
-              --source-head-sha "${GITHUB_SHA}"
-        )"
-        [[ "${digest}" =~ ^[0-9a-f]{64}$ ]]
-        test "$(sha256sum "${root}/export/prepared-image-manifest.json" | cut -d ' ' -f 1)" = "${digest}"
-        test "$(find "${root}/export" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)" = $'prepared-image-manifest.json\nunikraft.vhd'
-        sha256sum "${root}/export/prepared-image-manifest.json" \
-          "${root}/export/unikraft.vhd" > "${root}/export-sha256.txt"
 
     - name: Boot the fixed scheduled-SMP workload on two CPUs
       run: |
@@ -1382,6 +1344,7 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/packaging/miz-*.log
           ${{ runner.temp }}/hyperv-ci/native-public-boot/prepare-result.json
           ${{ runner.temp }}/hyperv-ci/native-public-boot/matrix.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export-digest.txt
           ${{ runner.temp }}/hyperv-ci/native-public-boot/export-sha256.txt
           ${{ runner.temp }}/hyperv-ci/native-public-boot/export/prepared-image-manifest.json
           ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/state.json
@@ -1390,6 +1353,12 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/local-*-serial.log
           ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/boot-*/hyperv-efi-boot.log
           ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/boot-*/report.json
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.json
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.jsonl
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.txt
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.sha256
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/*.acl
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/apt.conf
         retention-days: 7
         if-no-files-found: warn
 
