@@ -30,17 +30,20 @@ pub fn main(init: std.process.Init.Minimal) void {
         inside(allocator, io, args[1], init.environ) catch |err| fail(err);
         return;
     }
-    requireOrdinaryCredentials(allocator, io) catch |err| fail(err);
+    requireOrdinaryCredentials(allocator, io) catch |err| {
+        if (std.mem.eql(u8, args[1], "ci-isolation")) failCi(allocator, io, err);
+        fail(err);
+    };
     if (std.mem.eql(u8, args[1], "ci-isolation")) {
-        if (args.len != 4) fail(error.InvalidFixtureMode);
-        const status_file = ns.StatusFile.openParent(allocator, args[2]) catch |err| fail(err);
-        const diagnostic = ns.StatusFile.openParent(allocator, args[3]) catch |err| fail(err);
+        if (args.len != 4) failCi(allocator, io, error.InvalidFixtureMode);
+        const status_file = ns.StatusFile.openParent(allocator, args[2]) catch |err| failCi(allocator, io, err);
+        const diagnostic = ns.StatusFile.openParent(allocator, args[3]) catch |err| failCi(allocator, io, err);
         const status = fixture(allocator, io, "isolation", status_file) catch |err| {
-            diagnostic.write(.{ .primary = .exited, .code = @intFromEnum(namespaceError(err)) }) catch |write_error| fail(write_error);
-            fail(err);
+            diagnostic.write(.{ .primary = .exited, .code = @intFromEnum(namespaceError(err)) }) catch |write_error| failCi(allocator, io, write_error);
+            failCi(allocator, io, err);
         };
-        diagnostic.write(.{ .primary = .exited, .code = @intFromEnum(NamespaceError.none) }) catch |err| fail(err);
-        status_file.write(status) catch |err| fail(err);
+        diagnostic.write(.{ .primary = .exited, .code = @intFromEnum(NamespaceError.none) }) catch |err| failCi(allocator, io, err);
+        status_file.write(status) catch |err| failCi(allocator, io, err);
         return;
     }
     if (args.len != 3) fail(error.InvalidFixtureMode);
@@ -69,6 +72,39 @@ fn fail(err: anyerror) noreturn {
     _ = linux.write(2, name.ptr, name.len);
     _ = linux.write(2, "\n", 1);
     linux.exit_group(125);
+}
+fn failCi(allocator: std.mem.Allocator, io: std.Io, err: anyerror) noreturn {
+    recordCiError(allocator, io, err) catch |recording_error| {
+        const name = @errorName(recording_error);
+        _ = linux.write(2, name.ptr, name.len);
+        _ = linux.write(2, "\n", 1);
+    };
+    fail(err);
+}
+fn ciErrorName(allocator: std.mem.Allocator, parent: linux.pid_t) ![]u8 {
+    return std.fmt.allocPrint(allocator, "ci-fixture-error-{d}.txt", .{parent});
+}
+fn recordCiError(allocator: std.mem.Allocator, io: std.Io, err: anyerror) !void {
+    // A fixed error name from this synthetic fixture only. Failed process output
+    // remains discarded; this private sidecar cannot authorize a profile.
+    const directory = try fs.Directory.open(allocator, io, options.workspace);
+    defer directory.close(allocator, io);
+    const name = try ciErrorName(allocator, linux.getppid());
+    defer allocator.free(name);
+    const file = try directory.dir.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    try file.writeStreamingAll(io, @errorName(err));
+    try file.writeStreamingAll(io, "\n");
+    try file.sync(io);
+}
+fn requireNoCiError(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory) ![]u8 {
+    const name = try ciErrorName(allocator, linux.getpid());
+    errdefer allocator.free(name);
+    if (base.openFile(io, name, .private)) |file| {
+        file.close(io);
+        return error.ExistingCiDiagnostic;
+    } else |err| if (err != error.FileNotFound) return err;
+    return name;
 }
 fn put(io: std.Io, directory: std.Io.Dir, path: []const u8, bytes: []const u8, mode: u16) !void {
     const file = try directory.createFile(io, path, .{ .exclusive = true, .permissions = .fromMode(mode) });
@@ -454,6 +490,39 @@ test "namespace CI group prerequisites retain production supplementary group res
     try std.testing.expectError(error.SupplementaryGroupsUnavailable, requireFixtureGroups(&.{999}, 1000));
 }
 
+test "namespace CI startup error is private and does not turn refusal into success" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try requireOrdinaryCredentials(arena.allocator(), io);
+    try c.core.process.initialize();
+    var map = std.process.Environ.Map.init(allocator);
+    defer map.deinit();
+    const base = try fs.Directory.open(allocator, io, options.workspace);
+    defer base.close(allocator, io);
+    const name = try requireNoCiError(allocator, io, base);
+    defer allocator.free(name);
+    var result = try c.core.process.run(allocator, io, .{
+        .argv = &.{ @import("test_options").namespace_fixture, "ci-isolation", "0", "0" },
+        .environment = &map,
+        .cwd = base.dir,
+        .deadline = try c.core.process.Deadline.afterMilliseconds(15000),
+        .stdout_limit = 4096,
+        .stderr_limit = 4096,
+    });
+    defer result.deinit(allocator);
+    try std.testing.expect(result.cleanup_complete);
+    const bytes = try base.read(allocator, io, name, 256, .private);
+    defer allocator.free(bytes);
+    try base.dir.deleteFile(io, name);
+    try std.testing.expect(result.termination != null and result.termination.? == .exited);
+    try std.testing.expectEqual(@as(u8, 125), result.termination.?.exited);
+    try std.testing.expect(result.failures.primary != null);
+    try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try std.testing.expectEqualStrings("InvalidNamespaceStatus\n", bytes);
+}
+
 test "namespace CI baseline crosses native user and mount boundaries" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -466,6 +535,8 @@ test "namespace CI baseline crosses native user and mount boundaries" {
     defer map.deinit();
     const base = try fs.Directory.open(allocator, io, options.workspace);
     defer base.close(allocator, io);
+    const error_name = try requireNoCiError(allocator, io, base);
+    defer allocator.free(error_name);
     defer base.dir.deleteTree(io, "fixture-isolation") catch @panic("native baseline cleanup failed");
     const status_file = try ns.StatusFile.create();
     defer status_file.close();
@@ -489,6 +560,18 @@ test "namespace CI baseline crosses native user and mount boundaries" {
     }) };
     defer outcome.deinit(allocator);
     const process_cleanup = outcome.child.cleanup_complete;
+    if (process_cleanup) {
+        const bytes = base.read(allocator, io, error_name, 256, .private) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (bytes) |diagnostic_bytes| {
+            defer allocator.free(diagnostic_bytes);
+            try base.dir.deleteFile(io, error_name);
+            std.debug.print("Namespace CI fixture error: {s}", .{diagnostic_bytes});
+            try std.testing.expect(outcome.child.failures.primary != null);
+        }
+    }
     const helper_exit: ?u8 = if (outcome.child.termination) |term|
         if (term == .exited) term.exited else null
     else
