@@ -131,7 +131,45 @@ printf '%s\n' 'LLVM version 22.1.8' 'LLVM version 22.1.7' | check_objcopy_versio
 
 umask 077
 scratch="$(mktemp -d)"
-trap 'rm -f -- "${scratch}/report" "${scratch}/fixture" "${scratch}/report-link" "${scratch}/fixture-link" "${scratch}/error.log"; rmdir -- "${scratch}"' EXIT
+trap 'rm -f -- "${scratch}/report" "${scratch}/fixture" "${scratch}/report-link" "${scratch}/fixture-link" "${scratch}/git-stub" "${scratch}/error.log"; rmdir -- "${scratch}"' EXIT
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -eu' \
+  'case "$1" in' \
+  '  rev-parse)' \
+  '    if [ "${SOURCE_CHECK_MODE}" = bad-head ]; then exit 23; fi' \
+  '    printf "%s\n" 1111111111111111111111111111111111111111 ;;' \
+  '  -c)' \
+  '    test "$2" = core.fsmonitor=false && test "$3" = status && test "$4" = --porcelain' \
+  '    case "${SOURCE_CHECK_MODE}" in' \
+  '      bad-status) exit 42 ;;' \
+  '      dirty) printf "%s\n" " M changed-file" ;;' \
+  '      clean) ;;' \
+  '      *) exit 24 ;;' \
+  '    esac ;;' \
+  '  *) exit 25 ;;' \
+  'esac' > "${scratch}/git-stub"
+chmod 0500 "${scratch}/git-stub"
+for source_mode in clean bad-head bad-status dirty; do
+  expected=1
+  if [ "${source_mode}" = clean ]; then expected=0; fi
+  result=0
+  SOURCE_CHECK_MODE="${source_mode}" bash "${package}/ci-source-context.sh" \
+    1111111111111111111111111111111111111111 "${scratch}/git-stub" \
+    > /dev/null 2> "${scratch}/error.log" || result=$?
+  if [ "${result}" -ne "${expected}" ]; then
+    printf 'Unexpected source-query result %s for %s\n' "${result}" "${source_mode}" >&2
+    exit 1
+  fi
+done
+result=0
+SOURCE_CHECK_MODE=clean bash "${package}/ci-source-context.sh" \
+  2222222222222222222222222222222222222222 "${scratch}/git-stub" \
+  > /dev/null 2> "${scratch}/error.log" || result=$?
+if [ "${result}" -ne 1 ]; then
+  echo 'Source check accepted a different commit' >&2
+  exit 1
+fi
 printf '%s\n' 'synthetic policy fixture' > "${scratch}/fixture"
 printf '%8192s' '' >> "${scratch}/fixture"
 chmod 500 "${scratch}/fixture"

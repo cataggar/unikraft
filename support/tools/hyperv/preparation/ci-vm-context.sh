@@ -55,15 +55,9 @@ if [[ ! "${python_mode}" =~ ^[0-7]{3,4}$ ]] ||
   echo 'The guest interpreter execution-bit guard is not intact' >&2
   exit 1
 fi
-if [[ ! "${UK_FIXTURE_SOURCE_SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
-  echo 'Local fixture mode requires an independently supplied source commit' >&2
-  exit 2
-fi
-source_sha="$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null /usr/bin/git rev-parse HEAD)"
-if [ "${source_sha}" != "${UK_FIXTURE_SOURCE_SHA}" ] ||
-   [ -n "$(GIT_OPTIONAL_LOCKS=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null /usr/bin/git -c core.fsmonitor=false status --porcelain)" ] ||
-   [ "$(stat -c '%d:%i:%u:%g:%a:%h:%s:%y:%z' "${marker}")" != "${identity}" ]; then
-  echo 'Local fixture source or VM marker changed' >&2
+source_sha="$(bash "${package}/ci-source-context.sh" "${UK_FIXTURE_SOURCE_SHA:-}" /usr/bin/git)"
+if [ "$(stat -c '%d:%i:%u:%g:%a:%h:%s:%y:%z' "${marker}")" != "${identity}" ]; then
+  echo 'Local fixture VM marker changed' >&2
   exit 1
 fi
 jq -nc --arg uuid "${uuid}" --arg source "${source_sha}" --arg variant "$1" '
