@@ -2,6 +2,8 @@
 const std = @import("std");
 const boot = @import("local_boot");
 const linux = std.os.linux;
+const synthetic_diagnostics = @hasDecl(@import("root"), "local_boot_synthetic_diagnostics") and
+    @import("root").local_boot_synthetic_diagnostics;
 pub const log = "synthetic local-boot fixture, not a guest or acceptance proof\n" ++
     "Hyper-V Hv#1 hypercall page enabled at GPA 0x1000\n" ++
     "Hyper-V SynIC: synthetic IRQs\nPowered by Unikraft\n" ++
@@ -19,9 +21,10 @@ pub fn main(init: std.process.Init) void {
 fn execute(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const io = init.io;
-    const args = try init.minimal.args.toSlice(a);
     const work = try boot.core.private_files.Directory.openWorkerCwd(io);
     defer work.close(io);
+    if (synthetic_diagnostics) try @import("synthetic_diagnostics").mockEntry(io, work);
+    const args = try init.minimal.args.toSlice(a);
     const raw = try work.read(io, a, "request.json", boot.config.max_record, null);
     const parsed = try std.json.parseFromSlice(boot.runner.Request, a, raw, .{});
     defer parsed.deinit();
