@@ -188,12 +188,16 @@ afterwards. These reports and the copy inventory describe synthetic test
 material, not production ledger admission.
 
 If the baseline passes, **no profile is loaded**. Otherwise the setup requires
-both the bounded report's specific namespace/mount-unavailable classification
+both the bounded report's specific namespace/mount/user-mapping-unavailable classification
 with completed outer-process cleanup and actual `journalctl -k` evidence from
 the microsecond-bounded baseline interval. `ci-denial.awk` retains at most eight
 4096-byte lines matching DENIED, the exact fixture comm,
 `profile="unprivileged_userns"`, `operation="capable"`, capability 21 and
 `capname="sys_admin"`. Missing/unrelated/overflowing evidence remains a failure.
+The mapping classification covers the same observed capability denial during
+mapping setup; it does not admit an opaque helper failure or another capability.
+`ci-policy-tests.sh` exercises the actual report filter and exact denial matcher
+with accepted, unrelated, missing, failed-cleanup, and overflowing evidence.
 Only then may `ci-debug.apparmor` and `ci-release-safe.apparmor` attach their
 `flags=(unconfined) { userns, }` exception to those **two exact immutable paths**.
 No compiler, shell, test driver, writable cache path or production helper is

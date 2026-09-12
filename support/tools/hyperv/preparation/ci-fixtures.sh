@@ -7,6 +7,7 @@ test "${GITHUB_ACTIONS:-}" = true
 test "$(id -u)" -ne 0
 root="${RUNNER_TEMP:?}/hyperv-ci/native-preparation"
 package=support/tools/hyperv/preparation
+bash "${package}/ci-policy-tests.sh"
 installation=/var/lib/unikraft-hyperv-preparation-ci
 parser=/usr/sbin/apparmor_parser
 uid="$(id -u)"
@@ -228,12 +229,7 @@ if [ "${baseline}" -ne 0 ]; then
       }
     ' > "${root}/namespace-capability-diagnostics.log"
   # A supervised failure alone never authorizes a profile.
-  jq -e '
-    .schema == "hyperv_preparation_namespace_ci_baseline_v1" and
-    .authority == "synthetic_only" and .process_cleanup_complete == true and
-    .helper_exit == 125 and .namespace_succeeded == false and
-    (.namespace_error == "namespace_unavailable" or .namespace_error == "mount_namespace_unavailable")
-  ' "${root}/Debug/baseline.json" > /dev/null
+  jq -e -f "${package}/ci-baseline.jq" "${root}/Debug/baseline.json" > /dev/null
   test "$(/usr/sbin/sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
   sudo -n /usr/bin/journalctl -k --since "${started}" --until "${finished}" \
     --no-pager --output=cat --lines=256 |
