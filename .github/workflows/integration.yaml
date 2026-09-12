@@ -661,6 +661,75 @@ jobs:
           echo '```'
         } >> "${GITHUB_STEP_SUMMARY}"
 
+  zig-hyperv-preparation:
+    name: zig-hyperv-preparation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        persist-credentials: false
+
+    - name: Install the pinned native compiler
+      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+      with:
+        ghr-version: v0.8.0
+        tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+    - name: Acquire the pinned native LLVM tools
+      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
+      with:
+        ghr-version: v0.8.0
+        tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+        dest: ${{ runner.temp }}/hyperv-preparation-llvm
+        extract: 'true'
+        strip-components: '1'
+        cache: 'false'
+
+    - name: Select the native ELF inspection tools
+      run: |
+        set -euo pipefail
+        tools="${RUNNER_TEMP}/hyperv-preparation-llvm/bin"
+        test -x "${tools}/llvm-readelf"
+        echo "${tools}" >> "${GITHUB_PATH}"
+
+    - name: Run native Hyper-V preparation and namespace fixtures
+      run: |
+        bash support/tools/hyperv/preparation/ci-fixtures.sh
+
+    - name: Retain bounded preparation fixture evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-preparation-evidence
+        path: |
+          ${{ runner.temp }}/hyperv-ci/native-preparation/baseline.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/baseline.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/namespace-denial.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/credentials.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/cleanup.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-copies.tsv
+          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/fixture-build.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace-baseline.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/preparation.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/integration.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/fixture-build.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace-baseline.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/preparation.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/integration.log
+        retention-days: 7
+        if-no-files-found: error
+
   zig-hyperv:
     name: zig-hyperv
     runs-on: ubuntu-24.04
@@ -1063,10 +1132,6 @@ jobs:
               -Doptimize="${mode}" -j2 test install --summary all
         done
 
-    - name: Run native Hyper-V preparation and namespace fixtures
-      run: |
-        bash support/tools/hyperv/preparation/ci-fixtures.sh
-
     - name: Run native Hyper-V preflight engine fixtures
       run: |
         set -euo pipefail
@@ -1339,23 +1404,6 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/baseline.log
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/namespace-denial.log
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/fixture-sha256.txt
-          ${{ runner.temp }}/hyperv-ci/native-preparation/baseline.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/baseline.json
-          ${{ runner.temp }}/hyperv-ci/native-preparation/namespace-denial.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/credentials.json
-          ${{ runner.temp }}/hyperv-ci/native-preparation/cleanup.json
-          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-sha256.txt
-          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-copies.tsv
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/fixture-build.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace-baseline.json
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/preparation.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/integration.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/fixture-build.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace-baseline.json
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/preparation.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/integration.log
           ${{ runner.temp }}/hyperv-ci/image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-disk-sha256.txt

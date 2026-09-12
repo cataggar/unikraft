@@ -25,7 +25,7 @@ for group in $(id -G); do
 done
 test ! -e "${root}"
 mkdir -p "${root}/restore" "${root}/git-runtime/lib" "${root}/tmp" \
-  "${root}/cache" "${root}/config" "${root}/global" "${root}/driver-cache"
+  "${root}/cache" "${root}/config" "${root}/global/tmp" "${root}/driver-cache"
 clean_environment=(
   /usr/bin/env -i PATH=/usr/bin:/bin
   "HOME=${canonical_home}" "USER=${username}" "LOGNAME=${username}" LC_ALL=C TZ=UTC

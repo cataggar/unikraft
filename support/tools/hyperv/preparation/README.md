@@ -106,7 +106,7 @@ operations as part of these fixtures.
 
 ### Hosted namespace fixture setup
 
-The existing preparation workflow step runs this **hosted-only** setup command:
+The separate `zig-hyperv-preparation` job runs this **hosted-only** setup command:
 
 ```sh
 bash support/tools/hyperv/preparation/ci-fixtures.sh
@@ -118,6 +118,12 @@ in both Debug and ReleaseSafe with `-j2`, and supplies the actual checkout throu
 transport. Do not run it locally: it performs the explicitly approved root-owned
 synthetic-fixture installation and, only when justified below, AppArmor setup.
 The native fixtures alone remain locally runnable without changing policy.
+The job uses the pinned native Zig/LLVM distributions and the installed Git
+closure without Python or package-installation hooks. It has its own
+60-minute ceiling, keeping the existing Hyper-V job's identity and deadline
+unchanged. The new check is required alongside, not instead of, the existing
+branch-protection checks. Evidence is retained in its separate bounded
+artifact; synthetic namespace success is not a full producer or admission.
 
 The namespace build has two **test-only** options:
 `-Dfixture-executable=/absolute/native/file` selects an existing fixture instead
