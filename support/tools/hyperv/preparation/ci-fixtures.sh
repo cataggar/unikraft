@@ -215,6 +215,18 @@ native "${zig}" build --build-file "${package}/namespace/build.zig" \
 finished="$(date --utc '+%Y-%m-%d %H:%M:%S.%6N UTC')"
 if [ "${baseline}" -ne 0 ]; then
   tail -n 60 "${root}/baseline.log"
+  # Diagnostic only: these bounded records never authorize a profile.
+  sudo -n /usr/bin/journalctl -k --since "${started}" --until "${finished}" \
+    --no-pager --output=cat --lines=256 |
+    awk '
+      /(^|[[:space:]])apparmor="DENIED"([[:space:]]|$)/ &&
+      /(^|[[:space:]])comm="uk-prep-ns-test"([[:space:]]|$)/ &&
+      /(^|[[:space:]])profile="unprivileged_userns"([[:space:]]|$)/ &&
+      /(^|[[:space:]])operation="capable"([[:space:]]|$)/ {
+        if (length($0) > 4096 || ++matched > 8) exit 1
+        print
+      }
+    ' > "${root}/namespace-capability-diagnostics.log"
   # A supervised failure alone never authorizes a profile.
   jq -e '
     .schema == "hyperv_preparation_namespace_ci_baseline_v1" and

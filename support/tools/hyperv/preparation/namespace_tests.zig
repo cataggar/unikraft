@@ -445,6 +445,7 @@ const NamespaceError = enum(u8) {
     source_changed,
     invalid_runtime,
     user_namespace_unavailable,
+    user_mapping_unavailable,
 };
 
 fn namespaceError(err: anyerror) NamespaceError {
@@ -458,6 +459,7 @@ fn namespaceError(err: anyerror) NamespaceError {
         error.SourceChanged => .source_changed,
         error.InvalidRuntime, error.IncompleteRuntime => .invalid_runtime,
         error.UserNamespaceUnavailable => .user_namespace_unavailable,
+        error.UserMappingUnavailable => .user_mapping_unavailable,
         else => .other,
     };
 }
@@ -477,6 +479,7 @@ test "namespace CI diagnostics use a bounded side channel not discarded stderr" 
     try std.testing.expectEqual(NamespaceError.mount_namespace_unavailable, namespaceError(error.MountNamespaceUnavailable));
     try std.testing.expectEqual(NamespaceError.credentials, namespaceError(error.SupplementaryGroupsUnavailable));
     try std.testing.expectEqual(NamespaceError.user_namespace_unavailable, namespaceError(error.UserNamespaceUnavailable));
+    try std.testing.expectEqual(NamespaceError.user_mapping_unavailable, namespaceError(error.UserMappingUnavailable));
     try std.testing.expectEqual(NamespaceError.unavailable, try readNamespaceError(error.MissingNamespaceStatus));
     try std.testing.expectEqual(NamespaceError.none, try readNamespaceError(.{ .primary = .exited }));
     try std.testing.expectError(error.InvalidFixtureDiagnostic, readNamespaceError(.{ .primary = .exited, .code = 255 }));
