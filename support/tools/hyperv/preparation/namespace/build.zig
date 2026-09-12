@@ -20,6 +20,12 @@ pub fn build(b: *std.Build) void {
     const ci_report = b.option([]const u8, "ci-report", "Private absolute baseline report for TESTS ONLY");
     if (ci_report) |path| if (!std.fs.path.isAbsolute(path)) @panic("ci-report must be absolute");
     const strip_debug = b.option(bool, "strip-fixture-debug", "QUALIFICATION ONLY: verify post-compilation debug stripping of synthetic fixture copies") orelse false;
+    const fixture_objcopy = b.option([]const u8, "fixture-objcopy", "Explicit absolute pinned native llvm-objcopy for QUALIFICATION ONLY");
+    if (strip_debug and fixture_objcopy == null) @panic("strip-fixture-debug=true requires -Dfixture-objcopy=ABS");
+    if (fixture_objcopy) |path| {
+        if (!strip_debug) @panic("fixture-objcopy requires strip-fixture-debug=true");
+        if (!std.fs.path.isAbsolute(path)) @panic("fixture-objcopy must be absolute");
+    }
     const strip_report = b.option([]const u8, "strip-fixture-report", "Optional private create-only absolute equivalence report for QUALIFICATION ONLY");
     if (strip_report) |path| {
         if (!strip_debug) @panic("strip-fixture-report requires strip-fixture-debug=true");
@@ -76,7 +82,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(helper);
-    const selected_helper = if (strip_debug) strippedCopy(b, helper.getEmittedBin(), "preparation-namespace") else helper.getEmittedBin();
+    const selected_helper = if (strip_debug) strippedCopy(b, fixture_objcopy.?, helper.getEmittedBin(), "preparation-namespace") else helper.getEmittedBin();
     const helper_gate: ?*std.Build.Step.Run = if (strip_debug) gate: {
         const check = b.addRunArtifact(verifier);
         check.has_side_effects = true;
@@ -105,7 +111,7 @@ pub fn build(b: *std.Build) void {
     fixture.root_module.addOptions("fixture_options", options);
     fixture.root_module.addImport("synthetic_measurement", measurement);
     if (helper_gate) |check| fixture.step.dependOn(&check.step);
-    const selected_fixture = if (strip_debug) strippedCopy(b, fixture.getEmittedBin(), "preparation-namespace-fixture") else fixture.getEmittedBin();
+    const selected_fixture = if (strip_debug) strippedCopy(b, fixture_objcopy.?, fixture.getEmittedBin(), "preparation-namespace-fixture") else fixture.getEmittedBin();
     const suite_gate: ?*std.Build.Step.Run = if (strip_debug) gate: {
         const check = b.addRunArtifact(verifier);
         // A path/options cache hit never substitutes for reading all current
@@ -163,8 +169,10 @@ pub fn build(b: *std.Build) void {
     b.step("test", "Run small native namespace and typed producer fixtures").dependOn(&run.step);
 }
 
-fn strippedCopy(b: *std.Build, raw: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {
-    const strip = b.addSystemCommand(&.{ b.graph.zig_exe, "objcopy", "--strip-debug" });
+fn strippedCopy(b: *std.Build, objcopy: []const u8, raw: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {
+    const strip = b.addSystemCommand(&.{ objcopy, "--strip-debug" });
+    // The executable's contents, not only its argv spelling, key this output.
+    strip.addFileInput(.{ .cwd_relative = objcopy });
     strip.addFileArg(raw);
     return strip.addOutputFileArg(basename);
 }
