@@ -253,6 +253,34 @@ This setup does not run configure, Make, guest/native-image builds, a complete
 producer/importer, or any host/cloud/seed operation. Actual hosted AppArmor
 execution remains a separate parent-owned CI gate.
 
+### Synthetic debug-data qualification
+
+The separate `Hyper-V fixture debug qualification` workflow is confined to
+`fleet/zig-hyperv-fixture-strip-qualification`. Its explicit
+`--qualify-fixture-debug-stripping` adapter argument selects the default-off
+`-Dstrip-fixture-debug=true` fixture build variant with an explicit
+`-Dfixture-objcopy=ABS` path to the pinned native LLVM22.1.8 `llvm-objcopy`.
+Zig0.16's advertised ELF-to-ELF objcopy operation is unimplemented. The
+qualification uses LLVM's post-compilation `--strip-debug`, not a compiler
+strip option that might change code generation. Ordinary preparation CI,
+production artifacts, required checks, namespace policy, complete hashing and
+all deadlines are unchanged.
+
+The candidate must pass the native raw/candidate ELF equivalence gate before
+installation or execution. Per-mode `fixture-strip-proof.json` files and the
+expanded fixture/helper copy inventory are retained alongside the existing
+bounded namespace and cleanup evidence. The adapter requires a private,
+single-link, nonempty report of at most32768 bytes; the actual
+`ci-strip-proof.jq` filter checks its closed qualification labels, both roles,
+hash/size contract and binding to the selected fixture. That binding is checked
+before privileged installation and again against the immutable root-owned copy
+before execution. The selected transformer's version and full hash are retained
+and its hash is rechecked. These metadata checks supplement, not replace, the
+mandatory native equivalence gate. `ci-policy-tests.sh` exercises the report
+filter and file-boundary checks without installing fixtures or changing policy.
+The trial is synthetic qualification,
+not adoption, runtime authentication, producer admission or a full ledger fit.
+
 ## Wire versions and types
 
 Canonical JSON has sorted keys, exact fields/types and one final LF, included

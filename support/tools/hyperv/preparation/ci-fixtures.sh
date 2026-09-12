@@ -5,6 +5,34 @@ umask 077
 # Hosted CI only. Local validation must not invoke this policy/setup entrypoint.
 test "${GITHUB_ACTIONS:-}" = true
 test "$(id -u)" -ne 0
+qualify_strip=false
+case "$#" in
+  0) ;;
+  1)
+    if [ "$1" != --qualify-fixture-debug-stripping ]; then
+      echo 'Unknown preparation CI qualification argument' >&2
+      exit 2
+    fi
+    if [ "${GITHUB_REPOSITORY:-}" != cataggar/unikraft ] ||
+       [ "${GITHUB_WORKFLOW:-}" != 'Hyper-V fixture debug qualification' ] ||
+       [ "${GITHUB_JOB:-}" != fixture-debug-qualification ] ||
+       [ "${GITHUB_REF:-}" != refs/heads/fleet/zig-hyperv-fixture-strip-qualification ]; then
+      echo 'Fixture stripping is restricted to the explicit qualification workflow' >&2
+      exit 2
+    fi
+    qualify_strip=true
+    ;;
+  *)
+    echo 'Unexpected preparation CI arguments' >&2
+    exit 2
+    ;;
+esac
+namespace_variant=()
+fixture_find_names=(-name preparation-namespace-fixture)
+if [ "${qualify_strip}" = true ]; then
+  namespace_variant=(-Dstrip-fixture-debug=true)
+  fixture_find_names=('(' -name preparation-namespace-fixture -o -name preparation-namespace ')')
+fi
 root="${RUNNER_TEMP:?}/hyperv-ci/native-preparation"
 package=support/tools/hyperv/preparation
 bash "${package}/ci-policy-tests.sh"
@@ -51,6 +79,16 @@ native /usr/bin/awk -v uid="${uid}" -v gid="${gid}" '
   END { if (!u || !g || !s || c != 4) exit 1 }
 ' /proc/self/status
 test "$(native "${zig}" version)" = 0.16.0
+if [ "${qualify_strip}" = true ]; then
+  objcopy="$(readlink -f "${RUNNER_TEMP}/hyperv-preparation-llvm/bin/llvm-objcopy")"
+  test -f "${objcopy}"
+  test -x "${objcopy}"
+  native "${objcopy}" --version > "${root}/fixture-objcopy-version.txt"
+  test "$(stat -c '%s' "${root}/fixture-objcopy-version.txt")" -le 4096
+  grep -Fxq 'LLVM version 22.1.8' "${root}/fixture-objcopy-version.txt"
+  sha256sum -- "${objcopy}" > "${root}/fixture-objcopy-sha256.txt"
+  namespace_variant+=("-Dfixture-objcopy=${objcopy}")
+fi
 printf '{"schema":"hyperv_preparation_ci_credentials_v1","uid":%s,"gid":%s,"supplementaries_normalized":%s,"host_caps_zero":true}\n' \
   "${uid}" "${gid}" "${normalize}" > "${root}/credentials.json"
 
@@ -77,22 +115,24 @@ record_fixture_copies() {
   for mode in Debug ReleaseSafe; do
     for directory in "${root}/${mode}/namespace-cache" "${root}/${mode}/fixture-out" "${root}/${mode}/namespace-out"; do
       if [ -d "${directory}" ]; then
-        find "${directory}" -type f -name preparation-namespace-fixture \
+        find "${directory}" -type f "${fixture_find_names[@]}" \
           -exec stat --printf='%n\t%s\t%d:%i\t%u:%g:%a:%h\n' {} + || return
       fi
     done
   done
-  for variant in debug release-safe; do
-    if [ -f "${installation}/namespace-fixture-${variant}" ]; then
-      stat --printf='%n\t%s\t%d:%i\t%u:%g:%a:%h\n' "${installation}/namespace-fixture-${variant}" || return
-    fi
-  done
+  if [ "${created}" = true ]; then
+    for variant in debug release-safe; do
+      if [ -f "${installation}/namespace-fixture-${variant}" ]; then
+        stat --printf='%n\t%s\t%d:%i\t%u:%g:%a:%h\n' "${installation}/namespace-fixture-${variant}" || return
+      fi
+    done
+  fi
 }
 cleanup() {
   primary=$?
   trap - EXIT
   cleanup_failed=false
-  if [ "${created}" = true ] &&
+  if { [ "${created}" = true ] || [ "${qualify_strip}" = true ]; } &&
      ! record_fixture_copies > "${root}/fixture-copies.tsv"; then
     echo 'Failed to record the synthetic fixture copies' >&2
     cleanup_failed=true
@@ -175,12 +215,24 @@ native "${zig}" build --build-file "${root}/restore/build.zig" \
 # Two physical native children: each embeds its mode's actual workspace/helper.
 for mode in Debug ReleaseSafe; do
   mkdir -p "${root}/${mode}/namespace-work"
+  strip_report=()
+  if [ "${qualify_strip}" = true ]; then
+    strip_report=("-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json")
+  fi
   native "${zig}" build --build-file "${package}/namespace/build.zig" \
     --cache-dir "${root}/${mode}/namespace-cache" --prefix "${root}/${mode}/fixture-out" \
     "-Dworkspace=${root}/${mode}/namespace-work" "${git_fixture[@]}" \
+    "${namespace_variant[@]}" "${strip_report[@]}" \
     "-Doptimize=${mode}" -j2 install-fixture --summary all \
     > "${root}/${mode}/fixture-build.log" 2>&1
+  if [ "${qualify_strip}" = true ]; then
+    bash "${package}/ci-strip-proof.sh" "${root}/${mode}/fixture-strip-proof.json" \
+      "${root}/${mode}/fixture-out/bin/preparation-namespace-fixture"
+  fi
 done
+if [ "${qualify_strip}" = true ]; then
+  sha256sum --check "${root}/fixture-objcopy-sha256.txt"
+fi
 for directory in / /var /var/lib; do
   test ! -L "${directory}"
   test "$(stat -c '%u:%g:%a' "${directory}")" = 0:0:755
@@ -200,6 +252,12 @@ for variant in debug release-safe; do
 done
 cmp "${root}/Debug/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-debug"
 cmp "${root}/ReleaseSafe/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-release-safe"
+if [ "${qualify_strip}" = true ]; then
+  bash "${package}/ci-strip-proof.sh" "${root}/Debug/fixture-strip-proof.json" \
+    "${installation}/namespace-fixture-debug"
+  bash "${package}/ci-strip-proof.sh" "${root}/ReleaseSafe/fixture-strip-proof.json" \
+    "${installation}/namespace-fixture-release-safe"
+fi
 sha256sum "${installation}/namespace-fixture-debug" "${installation}/namespace-fixture-release-safe" \
   > "${root}/fixture-sha256.txt"
 record_fixture_copies > "${root}/fixture-copies.tsv"
@@ -211,6 +269,7 @@ native "${zig}" build --build-file "${package}/namespace/build.zig" \
   "-Dworkspace=${root}/Debug/namespace-work" "${git_fixture[@]}" \
   "-Dfixture-executable=${installation}/namespace-fixture-debug" \
   "-Dci-report=${root}/Debug/baseline.json" \
+  "${namespace_variant[@]}" \
   -Dtest-filter='namespace CI baseline crosses' -Doptimize=Debug -j2 test --summary all \
   > "${root}/baseline.log" 2>&1 || baseline=$?
 finished="$(date --utc '+%Y-%m-%d %H:%M:%S.%6N UTC')"
@@ -269,6 +328,7 @@ for mode in Debug ReleaseSafe; do
     "-Dworkspace=${root}/${mode}/namespace-work" "${git_fixture[@]}" \
     "-Dfixture-executable=${installation}/namespace-fixture-${variant}" \
     "-Dci-report=${root}/${mode}/namespace-baseline.json" \
+    "${namespace_variant[@]}" \
     "-Doptimize=${mode}" -j2 test install --summary all \
     > "${root}/${mode}/namespace.log" 2>&1
   native "${zig}" build --build-file "${package}/integration/build.zig" \
@@ -280,5 +340,8 @@ for variant in debug release-safe; do
   test "$(stat -c '%d:%i:%s:%u:%g:%a:%h' "${installation}/namespace-fixture-${variant}")" = "${fixture_identity[${variant}]}"
 done
 sha256sum --check "${root}/fixture-sha256.txt"
+if [ "${qualify_strip}" = true ]; then
+  sha256sum --check "${root}/fixture-objcopy-sha256.txt"
+fi
 test "$(stat -c '%d:%i:%u:%a:%h:%s' "${facade}/build.lock")" = "${facade_identity}"
 printf '%s\n' 'Synthetic preparation CI only; no full producer, staging-ledger or host/cloud admission.'
