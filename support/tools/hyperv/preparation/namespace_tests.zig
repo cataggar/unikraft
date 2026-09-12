@@ -475,6 +475,10 @@ test "namespace CI baseline crosses native user and mount boundaries" {
     defer allocator.free(arg);
     const diagnostic_arg = try std.fmt.allocPrint(allocator, "{d}", .{diagnostic.fd});
     defer allocator.free(diagnostic_arg);
+    const status_metadata = try fs.metadata(.{ .handle = status_file.fd, .flags = .{ .nonblocking = false } });
+    const diagnostic_metadata = try fs.metadata(.{ .handle = diagnostic.fd, .flags = .{ .nonblocking = false } });
+    const status_seals = linux.fcntl(status_file.fd, linux.F.GET_SEALS, 0);
+    const diagnostic_seals = linux.fcntl(diagnostic.fd, linux.F.GET_SEALS, 0);
     var outcome: producer.Outcome = .{ .step = .inspect, .child = try c.core.process.run(allocator, io, .{
         .argv = &.{ @import("test_options").namespace_fixture, "ci-isolation", arg, diagnostic_arg },
         .environment = &map,
@@ -532,6 +536,12 @@ test "namespace CI baseline crosses native user and mount boundaries" {
         defer report.close(io);
         try report.writeStreamingAll(io, bytes);
         try report.sync(io);
+    }
+    if (!outcome.succeeded()) {
+        std.debug.print("Namespace CI status mode={o} uid={d} links={d} size={d} seals={x}; diagnostic mode={o} uid={d} links={d} size={d} seals={x}\n", .{
+            status_metadata.mode,     status_metadata.uid,     status_metadata.links,     status_metadata.size,     status_seals,
+            diagnostic_metadata.mode, diagnostic_metadata.uid, diagnostic_metadata.links, diagnostic_metadata.size, diagnostic_seals,
+        });
     }
     try std.testing.expect(outcome.succeeded());
     try std.testing.expectEqualStrings("namespace-isolation-ok\n", outcome.child.stdout);
