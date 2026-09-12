@@ -15,6 +15,7 @@ pub const log_name = "hyperv-efi-boot.log";
 pub const Config = struct {
     image: ?[]const u8 = null,
     raw_disk: ?[]const u8 = null,
+    fixed_vhd: ?[]const u8 = null,
     ovmf_code: []const u8,
     ovmf_vars: []const u8,
     qemu: []const u8,
@@ -28,7 +29,8 @@ pub const Config = struct {
     timeout_ms: u32 = 30_000,
 
     pub fn validate(self: Config) !void {
-        if ((self.image == null) == (self.raw_disk == null)) return error.InvalidSource;
+        if (@as(u8, @intFromBool(self.image != null)) + @as(u8, @intFromBool(self.raw_disk != null)) +
+            @as(u8, @intFromBool(self.fixed_vhd != null)) != 1) return error.InvalidSource;
         for ([_][]const u8{ self.source(), self.ovmf_code, self.ovmf_vars, self.qemu, self.work_dir }) |path|
             try core.private_files.absoluteFilePath(path);
         if (self.cpus < 1 or self.cpus > 8 or (self.disable_x2apic and self.cpus != 1)) return error.InvalidCpuCount;
@@ -48,7 +50,7 @@ pub const Config = struct {
     }
 
     pub fn source(self: Config) []const u8 {
-        return self.image orelse self.raw_disk orelse "";
+        return self.image orelse self.raw_disk orelse self.fixed_vhd orelse "";
     }
 
     pub fn paths(self: Config) [4][]const u8 {
@@ -109,13 +111,13 @@ pub fn parse(a: std.mem.Allocator, args: []const []const u8) !Config {
     defer forbidden.deinit(a);
     var seen: u16 = 0;
     var i: usize = 0;
-    const names = [_][]const u8{ "--image", "--raw-disk", "--ovmf-code", "--ovmf-vars", "--qemu", "--work-dir", "--expect", "--expect-main-return", "--cpus", "--timeout", "--disable-x2apic", "--require-marker", "--forbid-marker" };
+    const names = [_][]const u8{ "--image", "--raw-disk", "--ovmf-code", "--ovmf-vars", "--qemu", "--work-dir", "--expect", "--expect-main-return", "--cpus", "--timeout", "--disable-x2apic", "--require-marker", "--forbid-marker", "--fixed-vhd" };
     while (i < args.len) {
         const selected = for (names, 0..) |name, index| {
             if (std.mem.eql(u8, args[i], name)) break index;
         } else return error.UnknownArgument;
         i += 1;
-        if (selected < 11) {
+        if (selected < 11 or selected == 13) {
             const bit = @as(u16, 1) << @intCast(selected);
             if (seen & bit != 0) return error.DuplicateArgument;
             seen |= bit;
@@ -138,6 +140,7 @@ pub fn parse(a: std.mem.Allocator, args: []const []const u8) !Config {
             7 => result.expect_main_return = try integer(i32, value),
             8 => result.cpus = try integer(u8, value),
             9 => result.timeout_ms = try timeout(value),
+            13 => result.fixed_vhd = value,
             11 => {
                 if (required.items.len == max_markers) return error.TooManyMarkers;
                 try required.append(a, value);

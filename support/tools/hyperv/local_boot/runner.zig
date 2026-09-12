@@ -14,7 +14,7 @@ pub const Request = struct {
         if (self.schema_version != 1 or self.supervisor_pid < 1) return error.InvalidRequest;
         try self.config.validate();
         for (self.pins, 0..) |pin, i| {
-            const maximum: u64 = if (i == 1) c.max_firmware else if (i == 2) c.max_vars else c.max_input;
+            const maximum: u64 = if (i == 1) c.max_firmware else if (i == 2) c.max_vars else c.max_input + @as(u64, if (i == 0 and self.config.fixed_vhd != null) 512 else 0);
             if (pin.size == 0 or pin.size > maximum) return error.InvalidRequest;
         }
     }
@@ -55,6 +55,47 @@ pub const Report = struct {
             .failures = self.failures,
             .termination = self.termination,
         });
+    }
+
+    pub fn decode(a: std.mem.Allocator, bytes: []const u8) !Report {
+        const Saved = struct {
+            schema_version: u8,
+            scope: []const u8,
+            acceptance: []const u8,
+            passed: bool,
+            failures: core.diagnostics.Failures,
+            consumed: bool,
+            cleanup_complete: bool,
+            input_unchanged: bool,
+            serial_valid: bool,
+            serial_limit_reached: bool,
+            serial_bytes: u64,
+            serial_sha256: ?[]const u8,
+            termination: ?std.process.Child.Term,
+        };
+        var document = try core.contracts.Document.parse(a, bytes, .{ .bytes = c.max_record });
+        defer document.deinit();
+        try document.requireCanonical(a, bytes);
+        const saved = try std.json.parseFromSlice(Saved, a, bytes, .{ .ignore_unknown_fields = false });
+        defer saved.deinit();
+        const s = saved.value;
+        if (s.schema_version != 1 or !std.mem.eql(u8, s.scope, "public_local_qemu_only") or
+            !std.mem.eql(u8, s.acceptance, "not_established")) return error.InvalidReport;
+        const result: Report = .{
+            .failures = s.failures,
+            .consumed = s.consumed,
+            .cleanup_complete = s.cleanup_complete,
+            .input_unchanged = s.input_unchanged,
+            .serial_valid = s.serial_valid,
+            .serial_limit_reached = s.serial_limit_reached,
+            .serial_bytes = s.serial_bytes,
+            .serial_sha256 = if (s.serial_sha256) |text| try core.contracts.parseSha256(text) else null,
+            .termination = s.termination,
+        };
+        const canonical = try result.encode(a);
+        defer a.free(canonical);
+        if (!std.mem.eql(u8, canonical, bytes)) return error.InvalidReport;
+        return result;
     }
 };
 

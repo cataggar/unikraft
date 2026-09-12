@@ -221,7 +221,11 @@ const Fixture = struct {
     }
 
     fn run(self: Fixture) !boot.runner.Report {
-        return boot.runner.run(self.arena.allocator(), io, self.config, .{ .self_executable = self.cli });
+        const report = try boot.runner.run(self.arena.allocator(), io, self.config, .{ .self_executable = self.cli });
+        if (report.serial_bytes == 0) {
+            std.debug.print("native local fixture before serial: {s}", .{try report.encode(self.arena.allocator())});
+        }
+        return report;
     }
 
     fn work(self: Fixture) !core.private_files.Directory {
@@ -240,6 +244,90 @@ const Fixture = struct {
     }
 };
 
+fn fixedFooter() [512]u8 {
+    var bytes = [_]u8{0} ** 512;
+    bytes[0..8].* = "conectix".*;
+    std.mem.writeInt(u32, bytes[8..12], 2, .big);
+    std.mem.writeInt(u32, bytes[12..16], 0x10000, .big);
+    std.mem.writeInt(u64, bytes[16..24], std.math.maxInt(u64), .big);
+    bytes[28..32].* = "miz ".*;
+    std.mem.writeInt(u64, bytes[40..48], 1024 * 1024, .big);
+    std.mem.writeInt(u64, bytes[48..56], 1024 * 1024, .big);
+    bytes[56..60].* = .{ 0, 30, 4, 17 };
+    std.mem.writeInt(u32, bytes[60..64], 2, .big);
+    bytes[68] = 1;
+    checksumFooter(&bytes);
+    return bytes;
+}
+fn checksumFooter(bytes: *[512]u8) void {
+    @memset(bytes[64..68], 0);
+    var sum: u32 = 0;
+    for (bytes) |byte| sum +%= byte;
+    std.mem.writeInt(u32, bytes[64..68], ~sum, .big);
+}
+test "fixed VHD requires complete immutable-sized fixed footer checksum geometry and reserved fields" {
+    const good = fixedFooter();
+    try t.expectEqual(@as(u64, 1024 * 1024), try boot.vhd.footer(&good, 1024 * 1024 + 512));
+    for ([_]usize{ 0, 8, 12, 16, 40, 48, 56, 58, 59, 60, 84, 90 }) |offset| {
+        var bad = good;
+        bad[offset] ^= 0xff;
+        checksumFooter(&bad);
+        try t.expectError(error.InvalidFixedVhd, boot.vhd.footer(&bad, 1024 * 1024 + 512));
+    }
+    var bad = good;
+    bad[64] ^= 1;
+    try t.expectError(error.InvalidFixedVhd, boot.vhd.footer(&bad, 1024 * 1024 + 512));
+    try t.expectError(error.InvalidFixedVhd, boot.vhd.footer(&good, 1024 * 1024 + 511));
+    try t.expectError(error.InvalidFixedVhd, boot.vhd.footer(&good, 1024 * 1024 + 513));
+    bad = good;
+    @memset(bad[68..84], 0);
+    checksumFooter(&bad);
+    try t.expectError(error.InvalidFixedVhd, boot.vhd.footer(&bad, 1024 * 1024 + 512));
+}
+test "fixed VHD legacy creators cannot expose a rounded CHS size" {
+    const good = fixedFooter();
+    for ([_][]const u8{ "miz ", "qem2", "test", "\x00\x00\x00\x00" }) |creator| {
+        var current_size = good;
+        @memcpy(current_size[28..32], creator);
+        checksumFooter(&current_size);
+        try t.expectEqual(@as(u64, 1024 * 1024), try boot.vhd.footer(&current_size, 1024 * 1024 + 512));
+    }
+    for ([_][]const u8{ "vpc ", "vs  ", "qemu" }) |creator| {
+        var legacy = good;
+        @memcpy(legacy[28..32], creator);
+        checksumFooter(&legacy);
+        const before = legacy;
+        try t.expectError(error.InvalidFixedVhd, boot.vhd.footer(&legacy, 1024 * 1024 + 512));
+        try t.expectEqualSlices(u8, &before, &legacy);
+        // 17 MiB has exact standard CHS geometry: 512 cylinders, 4 heads, 17 sectors.
+        std.mem.writeInt(u64, legacy[40..48], 17 * 1024 * 1024, .big);
+        std.mem.writeInt(u64, legacy[48..56], 17 * 1024 * 1024, .big);
+        legacy[56..60].* = .{ 2, 0, 4, 17 };
+        checksumFooter(&legacy);
+        try t.expectEqual(@as(u64, 17 * 1024 * 1024), try boot.vhd.footer(&legacy, 17 * 1024 * 1024 + 512));
+    }
+}
+test "fixed VHD CLI exclusivity and genuine vpc wire without raw slicing" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const args = [_][]const u8{ "--fixed-vhd", "/synthetic/disk,one.vhd" } ++ base_args[2..].*;
+    const config = try boot.config.parse(alloc, &args);
+    try t.expect(config.image == null and config.raw_disk == null and config.fixed_vhd != null);
+    const command_args = try boot.child.arguments(alloc, config, 1024 * 1024 + 512, 64);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, command_args[15], .{});
+    defer parsed.deinit();
+    const block = parsed.value.object;
+    try t.expectEqualStrings("vpc", block.get("driver").?.string);
+    try t.expect(block.get("read-only").?.bool);
+    try t.expect(!block.contains("force-size") and !block.contains("force_size_calc") and !block.contains("force-size-calc"));
+    try t.expect(!block.contains("offset") and !block.contains("size"));
+    try t.expectEqualStrings("/proc/self/fd/64", block.get("file").?.object.get("filename").?.string);
+    for ([_][]const u8{ "--image", "--raw-disk", "--fixed-vhd" }) |extra| {
+        const duplicate = try std.mem.concat(alloc, []const u8, &.{ &args, &.{ extra, "/synthetic/other" } });
+        if (boot.config.parse(alloc, duplicate)) |_| return error.AcceptedSourceConflict else |_| {}
+    }
+}
 test "native QEMU fixture validates every argument CPU default and explicit SMP readonly raw source" {
     for ([_]u8{ 1, 2, 8 }) |cpus| {
         for ([_]bool{ false, true }) |raw_disk| {

@@ -25,8 +25,9 @@ uk-hyperv-local-boot --raw-disk /canonical/public/smp.raw \
   --forbid-marker 'unwanted marker'
 ```
 
-Use `--image /canonical/application.efi` instead of `--raw-disk` for a
-directory-backed ESP. Exactly one is required. All five paths must be
+Use `--image /canonical/application.efi` for a directory-backed ESP, or
+`--fixed-vhd /canonical/disk.vhd` for an actual fixed-VHD/vpc boot.
+Exactly one of image, raw disk, or fixed VHD is required. All five paths must be
 explicit, absolute, canonical, and free of symlink components. In particular,
 there is no QEMU PATH search or inherited environment. Commas/spaces in input
 paths are safe. Resolve external tool symlinks before invocation.
@@ -70,7 +71,7 @@ only that the local assertions passed; 1 is execution/evidence failure,
 
 ## Execution and evidence
 
-`root.zig` exports `config`, `serial`, `files`, `runner`, `child`, and the
+`root.zig` exports `config`, `serial`, `files`, `runner`, `child`, `vhd`, and the
 dependency-free merged `core`.
 
 - `config.parse(allocator, args)!Config` borrows strings and allocates its two
@@ -82,6 +83,14 @@ dependency-free merged `core`.
   fixed QEMU operation. Arena allocation is appropriate for an execution.
 - `serial.validate(allocator, raw, Config)!void` is a local marker validator,
   deliberately separate from the single-CPU signed host serial policies.
+- `runner.Report.decode(allocator, canonical_bytes)!Report` checks the exact
+  stored report shape and consistency. Consumers must separately verify
+  physical request/artifact/log bindings; a parsed report is not admission.
+- `vhd.validate(io, file)!u64` checks a complete fixed footer, checksum, file/
+  original/current size, sector/whole-MiB geometry, CHS bounds, nonnil identity
+  and reserved fields. Legacy `vpc `, `vs  ` and `qemu` creators additionally
+  require CHS size to equal the exact current size; otherwise they refuse.
+  Dynamic/differencing, partial and excess files refuse.
 
 QEMU uses q35/KVM, 512 MiB RAM, the established Hyper-V CPU features,
 `vmbus-bridge,irq=15`, no NIC/display/monitor, no reboot and no user config.
@@ -97,18 +106,26 @@ are supported. Source, firmware templates and QEMU are hashed in bounded
 full afterward, including inode/device, length and modification metadata.
 Path replacement, growth, truncation, or changed bytes cannot pass.
 
-The raw disk is **never copied, staged, linked, reseeded, or writable**.
+The raw disk or fixed VHD is **never copied, staged, linked, reseeded, or writable**.
 QEMU receives the retained O_RDONLY descriptor via a JSON `-blockdev` file
 node and an exact-size read-only raw node at offset zero. This both avoids
 comma-based option injection and preserves exact backing-file identity.
+Fixed VHD instead uses a genuine read-only **`vpc`** node over the entire
+descriptor with no raw offset/size or creation-only options. Its footer is not
+sliced off. The virtual-size limit is 256 MiB, plus the 512-byte VHD footer.
+Pinned QEMU v11.0.91-z.15 opens vpc through `BlockdevOptionsGenericFormat`;
+`force-size` is creation-only, and neither it nor `force_size_calc` is sent
+in opening JSON. The pinned miz creator tag `miz ` selects footer
+`current_size`. Legacy CHS-based creators are accepted only when that
+geometry gives the same exact size; no creator/footer bytes are rewritten.
 EFI mode copies only the supplied application into private
 `esp/EFI/BOOT/BOOTX64.EFI`; that disposable ESP retains legacy writable-FAT
-behavior. Both modes make private firmware code and variables copies.
+behavior. All modes make private firmware code and variables copies.
 
 Finite limits are 256 MiB per input/QEMU binary, 16 MiB firmware code,
 4 MiB firmware variables, 64 KiB control records, 4 MiB serial, and 8192
 normalized bytes per line. EFI preparation may copy up to the input plus
-firmware limits; raw mode copies **only** firmware. The 4-MiB process file
+firmware limits; disk modes copy **only** firmware. The 4-MiB process file
 limit also bounds regular-file writes to the variables/temporary files.
 These local limits are not a preflight staging ledger or data-upload authority.
 
@@ -160,6 +177,8 @@ Repeat with `-Doptimize=ReleaseSafe` and a separate output prefix.
 randomly named child directories. The native fake QEMU is a separate,
 uninstalled executable; the production CLI has no synthetic switch.
 Fixtures cover the legacy cases and native CPU/EFI/raw argument execution,
+fixed-VHD footer/geometry/exclusivity and unsliced vpc argument construction
+(the public-image suite additionally executes native four-mode vpc fixtures),
 read-only exact backing identity, private variables mutation, merged failure
 logs, deadlines/cancellation/ignored TERM, descendant reaping, process exit/
 kill/crash, cap exhaustion, consumption/locking, strict child records,
@@ -174,3 +193,7 @@ with canonical paths, private firmware templates and an outer command ceiling
 covering local setup/post-exit I/O. The raw disk digest is checked independently
 afterward. The raw log and local report are retained; remaining legacy
 controller and packaging paths are not changed by this integration.
+The public-image fixture checks the pinned QAPI opening-field contract,
+including rejection of creation-only size controls. This is not a real-QEMU
+option probe or an actual VHD guest boot; exact pinned-QEMU x86/KVM execution
+remains a parent-owned CI gate.

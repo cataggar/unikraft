@@ -422,6 +422,17 @@ fn executable(path: []const u8) !@import("hyperv_transfer").files.Input {
     defer a.free(bytes);
     return .{ .path = absolute, .size = bytes.len, .sha256 = try core.contracts.parseSha256(&p.local.hash(bytes)) };
 }
+fn reportNativeFailure(mode: f.Mode, state: p.model.State) void {
+    std.debug.print("native fixture {s}: failures={any}, boots={d}, consumed={}, cleanup={}, group_absent={}\n", .{
+        @tagName(mode), state.failures, state.boot_count, state.consumed, state.process_cleanup_complete, state.group_absent,
+    });
+    for (state.records, 0..) |record, index| {
+        if (record.progress != .failed and record.progress != .intent) continue;
+        std.debug.print("  {s}: progress={s}, effect={s}\n", .{
+            @tagName(@as(p.model.Step, @enumFromInt(index))), @tagName(record.progress), @tagName(record.effect),
+        });
+    }
+}
 test "real native leaf workers deliver bound private results and exact serial model" {
     var work = try fixture();
     defer work.deinit();
@@ -435,6 +446,7 @@ test "real native leaf workers deliver bound private results and exact serial mo
     var runtime_options = model.options();
     runtime_options.driver = supervisor.driver();
     const state = try p.engine.execute(a, t.io, work.directory, runtime_options, false);
+    errdefer reportNativeFailure(.good, state);
     try t.expect(state.succeeded());
     try t.expectEqual(@as(u8, 2), state.boot_count);
 }
@@ -454,6 +466,7 @@ test "blocked native worker is killed and malformed delivery retains accepted ef
         runtime_options.driver = supervisor.driver();
         const before = try core.process.monotonicNanoseconds();
         const state = try p.engine.execute(a, t.io, work.directory, runtime_options, false);
+        errdefer reportNativeFailure(mode, state);
         try t.expect(!state.succeeded());
         try t.expect(state.consumed and state.process_cleanup_complete);
         try t.expect(state.failures.primary != null);
@@ -609,6 +622,7 @@ test "partial native page checkpoint survives killed delivery without claiming f
         var runtime = model.options();
         runtime.driver = supervisor.driver();
         const state = try p.engine.execute(a, t.io, work.directory, runtime, false);
+        errdefer reportNativeFailure(mode, state);
         try t.expect(!state.succeeded() and state.consumed and state.group_absent and state.process_cleanup_complete);
         const record = state.records[@intFromEnum(p.model.Step.data_upload)];
         try t.expectEqual(.unknown, record.effect);
@@ -760,6 +774,7 @@ test "failed native creation delivery retains UUID and refuses cleanup replaceme
         var runtime = model.options();
         runtime.driver = supervisor.driver();
         const state = try p.engine.execute(a, t.io, work.directory, runtime, false);
+        errdefer reportNativeFailure(mode, state);
         try t.expect(!state.succeeded() and state.failures.primary != null and state.consumed);
         try t.expectEqual(f.ids.os, state.originals.os);
         const saved = try p.engine.loadState(a, t.io, work.directory, binding);

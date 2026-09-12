@@ -18,10 +18,15 @@ pub fn arguments(a: std.mem.Allocator, config: c.Config, raw_size: u64, raw_fd: 
         "-drive",    "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
         "-drive",    "if=pflash,format=raw,file=OVMF_VARS.fd",
     });
-    if (config.raw_disk != null) {
-        if (raw_fd < 3 or raw_size == 0 or raw_size > c.max_input) return error.InvalidRawDisk;
+    if (config.image == null) {
+        if (raw_fd < 3 or raw_size == 0 or raw_size > c.max_input + @as(u64, if (config.fixed_vhd != null) 512 else 0)) return error.InvalidRawDisk;
         const filename = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{raw_fd});
-        const block = try std.json.Stringify.valueAlloc(a, .{
+        const block = if (config.fixed_vhd != null) try std.json.Stringify.valueAlloc(a, .{
+            .driver = "vpc",
+            .@"node-name" = "local-boot-disk",
+            .@"read-only" = true,
+            .file = .{ .driver = "file", .filename = filename, .@"read-only" = true },
+        }, .{}) else try std.json.Stringify.valueAlloc(a, .{
             .driver = "raw",
             .@"node-name" = "local-boot-disk",
             .offset = @as(u64, 0),

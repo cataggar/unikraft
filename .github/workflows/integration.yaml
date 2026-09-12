@@ -831,6 +831,26 @@ jobs:
               -Doptimize="${mode}" -j2 test install --summary all
         done
 
+    - name: Run native public Hyper-V packaging and export fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-public-image"
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/public_image/build.zig \
+          support/tools/hyperv/public_image/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in Debug ReleaseSafe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          zig build --build-file support/tools/hyperv/public_image/build.zig \
+            --system "${root}/restore/zig-pkg" \
+            --cache-dir "${root}/${mode}/zig-local-cache" \
+            --prefix "${root}/${mode}/out" \
+            -Dtest-root="${root}/${mode}/fixtures" \
+            -Doptimize="${mode}" -j2 test install --summary all
+        done
+
     - name: Exercise explicit private native Make configuration
       run: |
         set -euo pipefail
@@ -1169,6 +1189,20 @@ jobs:
           "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi.dbg" \
           > "${RUNNER_TEMP}/hyperv-ci/smp-image-sha256.txt"
 
+    - name: Acquire the separately pinned native public QEMU runtime
+      run: |
+        bash .github/scripts/hyperv-native-qemu-acquire.sh "${RUNNER_TEMP}/hyperv-ci/native-qemu"
+
+    - name: Prepare and boot native raw GPT and fixed VHD in both APIC modes
+      env:
+        HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
+        QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
+        QUALIFICATION_SOURCE_JOB: zig-hyperv
+      run: |
+        bash .github/scripts/hyperv-qemu-candidate-runtime.sh \
+          "${RUNNER_TEMP}/hyperv-ci/native-qemu" integration \
+          "${RUNNER_TEMP}/hyperv-ci" "${HYPERV_NETWORK_APPLICATION}"
+
     - name: Boot exact raw GPT and fixed VHD in both APIC modes
       env:
         HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
@@ -1308,6 +1342,23 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/packaging/packaging.json
           ${{ runner.temp }}/hyperv-ci/packaging/local-*-serial.log
           ${{ runner.temp }}/hyperv-ci/packaging/miz-*.log
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/prepare-result.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/matrix.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export-digest.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export/prepared-image-manifest.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/state.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/packaging.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/package-report.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/local-*-serial.log
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/boot-*/hyperv-efi-boot.log
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/boot-*/report.json
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.json
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.jsonl
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.txt
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.sha256
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/*.acl
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/apt.conf
         retention-days: 7
         if-no-files-found: warn
 
