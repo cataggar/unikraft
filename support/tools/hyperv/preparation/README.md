@@ -183,6 +183,34 @@ allowance gate. Neither diagnostic can authorize a profile.
 Inner synthetic payload failures use the same bounded private error-name
 recording. Fixed Git-timeout stage markers distinguish setup from the blocked
 child; they are read only after cleanup and do not alter deadlines or admission.
+The Git-timeout markers now use eight fixed, private, create-only 512-byte
+records (4096 bytes total) under the existing scratch directory. Their typed
+canonical schema is `hyperv_preparation_namespace_stage_v1`, with
+`authority=none`. They include backend, architecture, optimization, effective
+AArch64 SHA2 and x86 SHA/AVX2 features, self-executable byte count, monotonic
+time and process-CPU time. The sampling helper is shared with local-boot
+synthetic diagnostics; local-boot's flat v1 wire and 4096/4352-byte bounds
+are unchanged. No production helper imports the sampling module.
+
+`clock_scope=outer_helper` describes the original synthetic fixture process
+through `namespace_enter`; `clock_scope=inner_payload` describes the separate
+payload process. `inner_payload_entry` is written before `git_entry.load`,
+using the same cwd-to-scratch opening as the closed inner-error sidecar.
+`inside_ready` remains after that load. CPU differences are meaningful only
+within one scope and exclude CPU consumed by subprocesses such as Git.
+Cross-scope monotonic wall comparisons use the same time namespace; records
+from different CI runners must not be combined. No PID lookup, signal handler,
+pre-TERM observation or stop/completion proof is added.
+
+After process cleanup, a missing-ready failure retains one bounded
+`Namespace Git timeout observations:` line in the existing namespace log.
+The entire line is limited to 6144 bytes. Missing, partial, invalid, oversized,
+unavailable and out-of-order observations are explicit; invalid bytes are
+never echoed. Reading diagnostics cannot replace the original missing-ready
+error. Marker writes add no fsyncs and make no durability claim. Clock/stat,
+encoding and write overhead are nonzero; this is measurement, not a
+performance repair. The actual five-second deadline/start, ready and rootfs
+assertions, closed error classifications and cleanup requirements remain.
 The isolation fixture permits `/run/user` only as the exact ancestor chain of
 the selected facade, rejecting sibling entries, files and symlinks. Git policy
 variants run in their dedicated cases rather than consuming the timeout case's

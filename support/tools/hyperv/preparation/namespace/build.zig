@@ -20,6 +20,11 @@ pub fn build(b: *std.Build) void {
     const ci_report = b.option([]const u8, "ci-report", "Private absolute baseline report for TESTS ONLY");
     if (ci_report) |path| if (!std.fs.path.isAbsolute(path)) @panic("ci-report must be absolute");
     const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+    const measurement = b.createModule(.{
+        .root_source_file = b.path("../../synthetic_measurement.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
     const paths = b.createModule(.{ .root_source_file = b.path("../../../../build/zig-facade-paths.zig"), .target = target, .optimize = optimize });
     const imports: []const std.Build.Module.Import = &.{
@@ -55,6 +60,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     fixture.root_module.addOptions("fixture_options", options);
+    fixture.root_module.addImport("synthetic_measurement", measurement);
     b.installArtifact(fixture);
     b.step("install-fixture", "Install only the native synthetic namespace fixture").dependOn(&b.addInstallArtifact(fixture, .{}).step);
     const child = b.addExecutable(.{
@@ -81,6 +87,7 @@ pub fn build(b: *std.Build) void {
     });
     tests.root_module.addOptions("fixture_options", options);
     tests.root_module.addOptions("test_options", test_options);
+    tests.root_module.addImport("synthetic_measurement", measurement);
     const run = b.addRunArtifact(tests);
     run.setCwd(.{ .cwd_relative = workspace });
     b.step("test", "Run small native namespace and typed producer fixtures").dependOn(&run.step);

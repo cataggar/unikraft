@@ -833,6 +833,31 @@ test "synthetic phase codec bounds partial writes malformed records and authorit
     try t.expect(std.mem.indexOf(u8, encoded, "SYNTHETIC_SECRET") == null);
 }
 
+test "synthetic sampling preserves the exact local boot flat v1 wire and bounds" {
+    const record: diagnostics.Record = .{
+        .phase = .artifact_hash_begin,
+        .backend = .stage2_llvm,
+        .arch = .aarch64,
+        .optimize = .Debug,
+        .aarch64_sha2 = true,
+        .x86_sha = false,
+        .x86_avx2 = false,
+        .fixture_bytes = 1234,
+        .monotonic_ns = 2000,
+        .process_cpu_ns = 1000,
+    };
+    const bytes = try record.encode();
+    try t.expectEqualStrings(
+        "{\"schema_version\":1,\"scope\":\"synthetic_observation_only\",\"authority\":\"none\",\"phase\":\"artifact_hash_begin\",\"backend\":\"stage2_llvm\",\"arch\":\"aarch64\",\"optimize\":\"Debug\",\"aarch64_sha2\":true,\"x86_sha\":false,\"x86_avx2\":false,\"fixture_bytes\":1234,\"monotonic_ns\":2000,\"process_cpu_ns\":1000}\n",
+        std.mem.trimEnd(u8, &bytes, "\x00"),
+    );
+    try t.expectEqual(@as(usize, 8), diagnostics.slot_count);
+    try t.expectEqual(@as(usize, 4096), diagnostics.max_bytes);
+    try t.expectEqual(@as(usize, 4352), diagnostics.max_log_bytes);
+    const phases = [_]diagnostics.Phase{ .artifact_hash_begin, .artifact_hash_end, .firmware_copy_begin, .firmware_copy_end, .final_verify_begin, .final_verify_end, .exec_handoff, .mock_entry };
+    for (phases, 0..) |phase, index| try t.expectEqual(index, @intFromEnum(phase));
+}
+
 test "synthetic native phase times sizes serial separation and teardown" {
     const name = block: {
         const f = try Fixture.init(0, true);

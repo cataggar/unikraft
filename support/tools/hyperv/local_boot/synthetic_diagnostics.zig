@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("hyperv_core");
 const linux = std.os.linux;
+const measurement = @import("synthetic_measurement");
 
 pub const enabled = builtin.is_test or (@hasDecl(@import("root"), "local_boot_synthetic_diagnostics") and
     @import("root").local_boot_synthetic_diagnostics);
@@ -37,17 +38,18 @@ pub const Record = struct {
     process_cpu_ns: u64,
 
     pub fn observe(phase: Phase, fixture_bytes: u64) !Record {
+        const sample = try measurement.capture();
         return .{
             .phase = phase,
-            .backend = builtin.zig_backend,
-            .arch = builtin.cpu.arch,
-            .optimize = builtin.mode,
-            .aarch64_sha2 = builtin.cpu.arch == .aarch64 and builtin.cpu.has(.aarch64, .sha2),
-            .x86_sha = builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .sha),
-            .x86_avx2 = builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .avx2),
+            .backend = sample.backend,
+            .arch = sample.arch,
+            .optimize = sample.optimize,
+            .aarch64_sha2 = sample.aarch64_sha2,
+            .x86_sha = sample.x86_sha,
+            .x86_avx2 = sample.x86_avx2,
             .fixture_bytes = fixture_bytes,
-            .monotonic_ns = try clock(.MONOTONIC),
-            .process_cpu_ns = try clock(.PROCESS_CPUTIME_ID),
+            .monotonic_ns = sample.monotonic_ns,
+            .process_cpu_ns = sample.process_cpu_ns,
         };
     }
 
@@ -60,13 +62,6 @@ pub const Record = struct {
         return slot;
     }
 };
-
-fn clock(id: linux.clockid_t) !u64 {
-    var timestamp: linux.timespec = undefined;
-    if (linux.errno(linux.clock_gettime(id, &timestamp)) != .SUCCESS or timestamp.sec < 0 or
-        timestamp.nsec < 0 or timestamp.nsec >= std.time.ns_per_s) return error.DiagnosticClockUnavailable;
-    return std.math.add(u64, try std.math.mul(u64, @intCast(timestamp.sec), std.time.ns_per_s), @intCast(timestamp.nsec));
-}
 
 // Fixed slots preserve a complete prefix if termination interrupts a write.
 // These writes deliberately do not add fsyncs or claim crash-durable evidence.

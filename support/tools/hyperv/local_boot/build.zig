@@ -4,11 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
+    const measurement = b.createModule(.{
+        .root_source_file = b.path("../synthetic_measurement.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const diagnostics = b.createModule(.{
         .root_source_file = b.path("synthetic_diagnostics.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "synthetic_measurement", .module = measurement },
+        },
     });
     const module = b.addModule("hyperv_local_boot", .{
         .root_source_file = b.path("root.zig"),
