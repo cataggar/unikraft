@@ -27,7 +27,14 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (args.len < 2) fail(error.InvalidFixtureMode);
     if (std.mem.startsWith(u8, args[1], "inside-")) {
         if (args.len != 2) fail(error.InvalidFixtureMode);
-        inside(allocator, io, args[1], init.environ) catch |err| fail(err);
+        inside(allocator, io, args[1], init.environ) catch |err| {
+            recordInsideError(allocator, io, args[1], err) catch |recording_error| {
+                const name = @errorName(recording_error);
+                _ = linux.write(2, name.ptr, name.len);
+                _ = linux.write(2, "\n", 1);
+            };
+            fail(err);
+        };
         return;
     }
     requireOrdinaryCredentials(allocator, io) catch |err| {
@@ -91,11 +98,66 @@ fn recordCiError(allocator: std.mem.Allocator, io: std.Io, err: anyerror) !void 
     defer directory.close(allocator, io);
     const name = try ciErrorName(allocator, linux.getppid());
     defer allocator.free(name);
-    const file = try directory.dir.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    try recordErrorFile(io, directory.dir, name, err);
+}
+fn recordErrorFile(io: std.Io, directory: std.Io.Dir, name: []const u8, err: anyerror) !void {
+    const file = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(io);
     try file.writeStreamingAll(io, @errorName(err));
     try file.writeStreamingAll(io, "\n");
     try file.sync(io);
+}
+fn fixtureScratch(mode: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, mode, "git-") or std.mem.startsWith(u8, mode, "inside-git-"))
+        ".d/zig-migration-preparation/bridge-git/work/scratch"
+    else
+        ".d/zig-migration-preparation/resume-producer/work/scratch";
+}
+fn recordInsideError(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, err: anyerror) !void {
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const path = try std.fs.path.join(allocator, &.{ cwd, fixtureScratch(mode) });
+    defer allocator.free(path);
+    const directory = try fs.Directory.open(allocator, io, path);
+    defer directory.close(allocator, io);
+    try recordErrorFile(io, directory.dir, "inside-error.txt", err);
+}
+const FixtureStage = enum { setup_started, runtime_ready, namespace_enter, inside_ready, policy_commands, blocked_probe, write_observed };
+fn markStage(io: std.Io, scratch: std.Io.Dir, stage: FixtureStage) !void {
+    var name: [64]u8 = undefined;
+    try put(io, scratch, try std.fmt.bufPrint(&name, "stage-{s}", .{@tagName(stage)}), "1\n", 0o600);
+}
+fn reportInsideError(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory, mode: []const u8) !void {
+    const scratch = try std.fmt.allocPrint(allocator, "fixture-{s}/{s}", .{ mode, fixtureScratch(mode) });
+    defer allocator.free(scratch);
+    const error_path = try std.fs.path.join(allocator, &.{ scratch, "inside-error.txt" });
+    defer allocator.free(error_path);
+    const bytes = base.read(allocator, io, error_path, 256, .private) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (bytes) |message| {
+        defer allocator.free(message);
+        std.debug.print("Namespace inner fixture {s}: {s}", .{ mode, message });
+        try base.dir.deleteFile(io, error_path);
+    } else {
+        std.debug.print("Namespace inner fixture {s}: no error record\n", .{mode});
+    }
+    if (std.mem.eql(u8, mode, "git-timeout")) {
+        inline for (std.meta.fields(FixtureStage)) |stage| {
+            const path = try std.fmt.allocPrint(allocator, "{s}/stage-{s}", .{ scratch, stage.name });
+            defer allocator.free(path);
+            const marker = base.read(allocator, io, path, 2, .private) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+            if (marker) |value| {
+                defer allocator.free(value);
+                if (!std.mem.eql(u8, value, "1\n")) return error.InvalidFixtureDiagnostic;
+                std.debug.print("Namespace Git timeout stage: {s}\n", .{stage.name});
+            }
+        }
+    }
 }
 fn requireNoCiError(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory) ![]u8 {
     const name = try ciErrorName(allocator, linux.getpid());
@@ -526,6 +588,21 @@ test "namespace CI startup error is private and does not turn refusal into succe
     try std.testing.expectEqualStrings("InvalidNamespaceStatus\n", bytes);
 }
 
+test "namespace CI private fixture diagnostics reject replacement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try recordErrorFile(io, temporary.dir, "inside-error.txt", error.FixtureFailed);
+    try std.testing.expectError(error.PathAlreadyExists, recordErrorFile(io, temporary.dir, "inside-error.txt", error.InvalidFixtureMode));
+    const path = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    const directory: fs.Directory = .{ .dir = temporary.dir, .path = path };
+    const bytes = try directory.read(allocator, io, "inside-error.txt", 256, .private);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("FixtureFailed\n", bytes);
+}
+
 test "namespace CI baseline crosses native user and mount boundaries" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -624,6 +701,8 @@ test "namespace CI baseline crosses native user and mount boundaries" {
         try report.sync(io);
     }
     if (!outcome.succeeded()) {
+        std.debug.print("Namespace CI payload status: {any}\n", .{status});
+        if (process_cleanup) try reportInsideError(allocator, io, base, "isolation");
         std.debug.print("Namespace CI status mode={o} uid={d} links={d} size={d} seals={x}; diagnostic mode={o} uid={d} links={d} size={d} seals={x}\n", .{
             status_metadata.mode,     status_metadata.uid,     status_metadata.links,     status_metadata.size,     status_seals,
             diagnostic_metadata.mode, diagnostic_metadata.uid, diagnostic_metadata.links, diagnostic_metadata.size, diagnostic_seals,
@@ -683,6 +762,8 @@ test "namespace native dynamic isolation, nonzero status, deadline and detached 
             const ready = try base.dir.openFile(io, ready_path, .{});
             ready.close(io);
         } else {
+            if (result.failures.primary != null and result.cleanup_complete)
+                try reportInsideError(allocator, io, base, mode);
             try std.testing.expect(result.failures.primary == null);
             try std.testing.expectEqualStrings("namespace-isolation-ok\n", result.stdout);
         }
@@ -1046,6 +1127,7 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
     try put(io, repository.dir, "tracked.txt", "public synthetic Git fixture\n", 0o600);
     const workspace = try makeDir(allocator, io, repository, ".d/zig-migration-preparation/bridge-git/work");
     const scratch = try makeDir(allocator, io, workspace, "scratch");
+    if (std.mem.eql(u8, mode, "git-timeout")) try markStage(io, scratch.dir, .setup_started);
     const root = try makeDir(allocator, io, scratch, "namespace-root");
     for ([_][]const u8{ "tmp", "cache", "config", "zig-local", "zig-global", "disabled-git-exec", "disabled-openssl", "empty-template", "poison-home" }) |name|
         _ = try makeDir(allocator, io, scratch, name);
@@ -1056,6 +1138,7 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
     try copy(allocator, io, payload_dir, "/proc/self/exe", "fixture", 0o700);
     const payload = try tool(allocator, io, payload_dir, "fixture", false);
     const git = try publicGit(allocator, io, workspace);
+    if (std.mem.eql(u8, mode, "git-timeout")) try markStage(io, scratch.dir, .runtime_ready);
     const account = try env.Account.current(allocator, io);
     const facade = try facadeDirectory(allocator, io, account);
     const lock = try facade.openFile(io, "build.lock", .private);
@@ -1155,6 +1238,7 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
     if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingHelper else |err| if (err != error.IncompleteRuntime) return err;
     bad.runtimes = &.{ payload, helper };
     if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingGit else |err| if (err != error.IncompleteRuntime) return err;
+    if (std.mem.eql(u8, mode, "git-timeout")) try markStage(io, scratch.dir, .namespace_enter);
     const status = try ns.enter(allocator, io, sandbox, &.{ "/bin/fixture", try std.fmt.allocPrint(allocator, "inside-{s}", .{mode}) }, &clean);
     try scratch.dir.deleteDir(io, "namespace-root");
     return status;
@@ -1188,6 +1272,8 @@ fn insideGit(allocator: std.mem.Allocator, io: std.Io, mode: []const u8) !void {
     const record = parsed.value;
     const workspace = try fs.Directory.open(allocator, io, std.fs.path.dirname(record.environment.workspace).?);
     const scratch = try fs.Directory.open(allocator, io, record.environment.workspace);
+    const timeout = std.mem.eql(u8, mode, "inside-git-timeout");
+    if (timeout) try markStage(io, scratch.dir, .inside_ready);
     const account = try env.Account.current(allocator, io);
     if (!std.mem.eql(u8, account.home, record.account.home)) return error.AmbientHome;
     const expected_lock = try c.parse(ns.Identity, allocator, try workspace.read(allocator, io, "lock.json", 4096, .private));
@@ -1241,6 +1327,7 @@ fn insideGit(allocator: std.mem.Allocator, io: std.Io, mode: []const u8) !void {
     var poison = try poisonedGitEnvironment(allocator, record);
     var stripped = std.process.Environ.Map.init(allocator);
     const unborn = std.mem.eql(u8, mode, "inside-git-unborn");
+    if (timeout) try markStage(io, scratch.dir, .policy_commands);
     for ([_]*const std.process.Environ.Map{ &stripped, &poison }) |map| {
         const head = try (try spawnFixture(allocator, &.{ "/bin/git", "rev-parse", "--short", "HEAD" }, map, scratch, false)).collect(allocator);
         if (head.status.primary != .exited or head.status.code != (if (unborn) @as(u8, 128) else 0) or head.stderr.len != 0)
@@ -1252,7 +1339,8 @@ fn insideGit(allocator: std.mem.Allocator, io: std.Io, mode: []const u8) !void {
             !std.mem.eql(u8, modified.stdout, if (std.mem.eql(u8, mode, "inside-git-modified")) "tracked.txt\n" else ""))
             return error.GitIndexMismatch;
     }
-    if (!unborn) try inspectBlockedGit(allocator, io, record, scratch, &poison, std.mem.eql(u8, mode, "inside-git-timeout"));
+    if (timeout) try markStage(io, scratch.dir, .blocked_probe);
+    if (!unborn) try inspectBlockedGit(allocator, io, record, scratch, &poison, timeout);
     const invalid: []const []const []const u8 = &.{
         &.{},                                                         &.{"--version"},                             &.{ "rev-parse", "HEAD" },                             &.{ "rev-parse", "--short=12", "HEAD" },
         &.{ "rev-parse", "--short", "HEAD", "--git-dir" },            &.{ "ls-files", "-m", "--", "tracked.txt" }, &.{ "ls-files", "--modified" },                        &.{ "-C", "/", "ls-files", "-m" },
@@ -1304,6 +1392,7 @@ fn inspectBlockedGit(allocator: std.mem.Allocator, io: std.Io, record: git_entry
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
     if (!observed) return error.GitExecNotObserved;
+    if (timeout) try markStage(io, scratch.dir, .write_observed);
     // A full stdout pipe holds the actual native Git at its write, not a fake
     // runtime or a wrapper supervisor. Inspect only our public synthetic child.
     const file = try std.Io.Dir.openFileAbsolute(io, try std.fs.path.join(allocator, &.{ proc, "environ" }), .{});
@@ -1381,7 +1470,10 @@ test "namespace Git actual static dispatch restores stripped and poisoned policy
             defer allocator.free(scratch_path);
             const scratch = try base.dir.openDir(io, scratch_path, .{});
             defer scratch.close(io);
-            const ready = try scratch.openFile(io, "timeout-ready", .{});
+            const ready = scratch.openFile(io, "timeout-ready", .{}) catch |err| {
+                try reportInsideError(allocator, io, base, mode);
+                return err;
+            };
             ready.close(io);
             const root = try scratch.openDir(io, "namespace-root", .{ .iterate = true });
             defer root.close(io);

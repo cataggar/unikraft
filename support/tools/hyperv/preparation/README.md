@@ -180,6 +180,9 @@ The parent reads at most 256 bytes after process cleanup, reports the name in
 the baseline log, and removes the sidecar. Bounded fixture capability-denial
 records are also retained for diagnosis, including failures outside the
 allowance gate. Neither diagnostic can authorize a profile.
+Inner synthetic payload failures use the same bounded private error-name
+recording. Fixed Git-timeout stage markers distinguish setup from the blocked
+child; they are read only after cleanup and do not alter deadlines or admission.
 Successful self-copy evidence compares held-file bytes/metadata and requires a
 different physical inode from the selected external executable. Each full-mode
 suite retains its own `namespace-baseline.json`; CI also requires the installed
