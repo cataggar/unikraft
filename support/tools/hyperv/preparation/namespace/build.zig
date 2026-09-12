@@ -19,6 +19,12 @@ pub fn build(b: *std.Build) void {
     if (fixture_path) |path| if (!std.fs.path.isAbsolute(path)) @panic("fixture-executable must be absolute");
     const ci_report = b.option([]const u8, "ci-report", "Private absolute baseline report for TESTS ONLY");
     if (ci_report) |path| if (!std.fs.path.isAbsolute(path)) @panic("ci-report must be absolute");
+    const strip_debug = b.option(bool, "strip-fixture-debug", "QUALIFICATION ONLY: verify post-compilation debug stripping of synthetic fixture copies") orelse false;
+    const strip_report = b.option([]const u8, "strip-fixture-report", "Optional private create-only absolute equivalence report for QUALIFICATION ONLY");
+    if (strip_report) |path| {
+        if (!strip_debug) @panic("strip-fixture-report requires strip-fixture-debug=true");
+        if (!std.fs.path.isAbsolute(path)) @panic("strip-fixture-report must be absolute");
+    }
     const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
     const measurement = b.createModule(.{
         .root_source_file = b.path("../../synthetic_measurement.zig"),
@@ -32,6 +38,32 @@ pub fn build(b: *std.Build) void {
         .{ .name = "producer_elf", .module = elf },
         .{ .name = "facade_paths", .module = paths },
     };
+    const gate_core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    const equivalence = b.createModule(.{
+        .root_source_file = b.path("fixture_debug_equivalence.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+        .imports = &.{ .{ .name = "hyperv_core", .module = gate_core }, .{ .name = "producer_elf", .module = gate_elf } },
+    });
+    const verifier = b.addExecutable(.{
+        .name = "fixture-debug-equivalence",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("fixture_debug_verifier.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "equivalence", .module = equivalence }},
+        }),
+    });
+    const gate_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("fixture_debug_equivalence_tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "equivalence", .module = equivalence }},
+    }) });
+    const run_gate_tests = b.addRunArtifact(gate_tests);
+    run_gate_tests.setCwd(.{ .cwd_relative = workspace });
+    b.step("test-strip-equivalence", "Test qualification-only ELF preservation and private file gates").dependOn(&run_gate_tests.step);
     const helper = b.addExecutable(.{
         .name = "preparation-namespace",
         .root_module = b.createModule(.{
@@ -43,12 +75,22 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(helper);
+    const selected_helper = if (strip_debug) strippedCopy(b, helper.getEmittedBin(), "preparation-namespace") else helper.getEmittedBin();
+    const helper_gate: ?*std.Build.Step.Run = if (strip_debug) gate: {
+        const check = b.addRunArtifact(verifier);
+        check.has_side_effects = true;
+        check.addArg("pair");
+        check.addFileArg(helper.getEmittedBin());
+        check.addFileArg(selected_helper);
+        check.expectExitCode(0);
+        break :gate check;
+    } else null;
     const options = b.addOptions();
     options.addOption([]const u8, "workspace", workspace);
     options.addOption([]const u8, "git_executable", git_executable);
     options.addOption([]const u8, "git_loader", git_loader);
     options.addOption([]const []const u8, "git_libraries", git_libraries);
-    options.addOptionPath("namespace_helper", helper.getEmittedBin());
+    options.addOptionPath("namespace_helper", selected_helper);
     const fixture = b.addExecutable(.{
         .name = "preparation-namespace-fixture",
         .root_module = b.createModule(.{
@@ -61,18 +103,43 @@ pub fn build(b: *std.Build) void {
     });
     fixture.root_module.addOptions("fixture_options", options);
     fixture.root_module.addImport("synthetic_measurement", measurement);
-    b.installArtifact(fixture);
-    b.step("install-fixture", "Install only the native synthetic namespace fixture").dependOn(&b.addInstallArtifact(fixture, .{}).step);
+    if (helper_gate) |check| fixture.step.dependOn(&check.step);
+    const selected_fixture = if (strip_debug) strippedCopy(b, fixture.getEmittedBin(), "preparation-namespace-fixture") else fixture.getEmittedBin();
+    const suite_gate: ?*std.Build.Step.Run = if (strip_debug) gate: {
+        const check = b.addRunArtifact(verifier);
+        // A path/options cache hit never substitutes for reading all current
+        // raw, candidate and external-copy bytes on this invocation.
+        check.has_side_effects = true;
+        check.addArg("suite");
+        check.addFileArg(helper.getEmittedBin());
+        check.addFileArg(selected_helper);
+        check.addFileArg(fixture.getEmittedBin());
+        check.addFileArg(selected_fixture);
+        if (fixture_path) |path| {
+            check.addArg("--external");
+            check.addFileArg(.{ .cwd_relative = path });
+        }
+        if (strip_report) |path| check.addArgs(&.{ "--report", path });
+        check.expectExitCode(0);
+        break :gate check;
+    } else null;
+    const install_fixture: *std.Build.Step = if (strip_debug)
+        &b.addInstallFileWithDir(selected_fixture, .bin, "preparation-namespace-fixture").step
+    else
+        &b.addInstallArtifact(fixture, .{}).step;
+    if (suite_gate) |check| install_fixture.dependOn(&check.step);
+    b.getInstallStep().dependOn(install_fixture);
+    b.step("install-fixture", "Install only the native synthetic namespace fixture").dependOn(install_fixture);
     const child = b.addExecutable(.{
         .name = "preparation-process-fixture",
         .root_module = b.createModule(.{ .root_source_file = b.path("../process_fixture.zig"), .target = target, .optimize = optimize }),
     });
     const test_options = b.addOptions();
-    test_options.addOptionPath("namespace_helper", helper.getEmittedBin());
+    test_options.addOptionPath("namespace_helper", selected_helper);
     if (fixture_path) |path|
         test_options.addOption([]const u8, "namespace_fixture", path)
     else
-        test_options.addOptionPath("namespace_fixture", fixture.getEmittedBin());
+        test_options.addOptionPath("namespace_fixture", selected_fixture);
     test_options.addOption(?[]const u8, "ci_report", ci_report);
     test_options.addOptionPath("process_fixture", child.getEmittedBin());
     const tests = b.addTest(.{
@@ -89,6 +156,13 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("test_options", test_options);
     tests.root_module.addImport("synthetic_measurement", measurement);
     const run = b.addRunArtifact(tests);
+    if (suite_gate) |check| run.step.dependOn(&check.step);
     run.setCwd(.{ .cwd_relative = workspace });
     b.step("test", "Run small native namespace and typed producer fixtures").dependOn(&run.step);
+}
+
+fn strippedCopy(b: *std.Build, raw: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {
+    const strip = b.addSystemCommand(&.{ b.graph.zig_exe, "objcopy", "--strip-debug" });
+    strip.addFileArg(raw);
+    return strip.addOutputFileArg(basename);
 }
