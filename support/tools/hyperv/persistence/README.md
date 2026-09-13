@@ -417,3 +417,170 @@ Fixture directories/sidecars retain the original test cleanup lifetime; only
 sanitized parent log observations survive that cleanup. Do not promote them
 to accepted-effect or recovery evidence. For just the six focused diagnostic
 tests, use the same build command with `-Dtest-filter='persistence timing'`.
+
+### Default-off synthetic worker stripping qualification
+
+This is **qualification only**, not production adoption or a proven fix. The
+historical Debug failure remains unreproduced: the later unmodified `9ebaf`
+Debug control passed 28/28 with the same 18300386-byte worker. The subsequent
+default-off/on timing controls passed 34/34 each. The targeted timing data
+showed expensive guarded hashing and narrow headroom, not a demonstrated cause.
+
+`-Dstrip-fixture-debug=true` selects a separately produced copy of **only**
+`hyperv-persistence-worker-fixture`. The quiet default still selects the raw
+fixture. Neither this worker nor the verifier is installed. The installed CLI,
+engine test executable, libraries, unrelated fixtures and production materials
+are not stripped. The compiler/backend/optimization options and all original
+runtime hashes, 1000-ms fixture budgets, guards, assertions, protocol, result,
+ack and recovery behavior are unchanged.
+
+| Build option | Contract |
+| --- | --- |
+| `-Dstrip-fixture-debug=true` | Explicitly qualify/select the non-installed worker copy. Default false. |
+| `-Dfixture-objcopy=ABS` | Required with stripping; explicit approved pinned native LLVM 22.1.8 `llvm-objcopy`. No PATH lookup or Zig-objcopy fallback. |
+| `-Dfixture-file-relayout=true` | Explicitly select the existing `file_offset_relayout` policy. Default remains `identical_program_headers`; there is no automatic retry or fallback. |
+| `-Dstrip-fixture-report=ABS` | Optional private, create-only report. Requires stripping. Existing files, aliases and symlinks refuse rather than being overwritten. |
+| `-Dpersistence-timing=true` | Independent, default-off timing of the actual selected candidate bytes and original runtime checks. |
+
+Tool/report arguments without stripping, relayout without stripping, a missing
+tool with stripping, and relative tool/report paths refuse. The caller remains
+responsible for the tool's approved distribution/pin; version text alone does
+not establish provenance. The objcopy executable is a build `addFileInput`, so
+its contents participate in the candidate cache key. No dependencies are fetched
+during these runs: use the exact already-staged persistence SDKs with `--system`.
+
+The build invokes the explicit tool as `--strip-debug RAW CANDIDATE`, retains
+both artifacts in separate cache directories with the original worker basename,
+and never overwrites raw. `qualify-fixture` builds and verifies just that worker
+pair without installing or executing it; it refuses without the opt-in.
+Every explicitly qualified build target depends on the fresh host-native
+ReleaseSafe verifier. In particular, the engine test run cannot consume the
+candidate until verification succeeds. `Run.has_side_effects=true` prevents a
+cached success from replacing this check, including when the report is omitted.
+An existing report on an otherwise identical repeat invocation therefore
+refuses; use a new private report path, not deletion/retry.
+
+The verifier calls the unchanged namespace `gate.Pair.openWithPolicy` and
+`recheck`, which retain the existing 64-MiB input limit and ELF acceptance
+algorithm. Strict policy requires identical program headers. The explicit
+relayout policy retains exact entry, virtual layout, flags, sizes, order and
+corresponding program-backed bytes, and all existing offset/anchor/backing/
+overlap/congruence/page-residue checks. Unknown, zero-byte, PHDR, NULL and STACK
+movement remains rejected. No namespace roles or acceptance rules were extended.
+
+The optional report has schema
+`hyperv_persistence_fixture_debug_stripping_v1`, authority
+`synthetic_only_not_admitted`, `passed=true`, `synthetic=true`,
+`admitted=false`, `qualification_only=true`, and the chosen `layout_policy`.
+Its sole `worker` contains role `persistence_worker` and the existing gate's
+`raw`, `candidate` literal file proofs and `content` proof. There is no invented
+second namespace role, `pairs` array or external namespace fixture. The existing
+namespace proof consumer rejects this distinct schema.
+
+Reports reuse the bounded 32768-byte, 0600, exclusive-create shared publisher
+with file/directory fsync. Publication is followed by private single-link
+readback, exact content comparison and renewed input identity/full-hash checks.
+The literal full-file hashes differ; normalized mapped-content hashes do not
+claim literal byte identity, debugger equivalence or arbitrary executable
+self-inspection equivalence. A successful check is a fresh observation, not a
+lock against later owner mutation. The caller must retain private cache custody
+through execution. A failure after publication may leave a report, but the
+invocation fails and that report must not be consumed as a successful handoff.
+Neither stripping nor its report establishes 8-MiB/256-MiB ledger fit or any
+production admission.
+
+#### Focused author checks
+
+Use a process-local `umask 077`; the existing shared fixtures require private
+temporary directories. `test-strip-equivalence` runs the original 13 byte-only
+ELF/private-file cases, including synthetic x64 data without executing it.
+`test-strip-proof` runs five persistence argument/report cases against the real
+qualified pair and requires the stripping opt-in. The engine `test` suite
+remains the same 34 cases.
+
+```bash
+umask 077
+"$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
+  --system "$PERSISTENCE_PACKAGES" --cache-dir "$SCRATCH/cache" \
+  --global-cache-dir "$SCRATCH/global" --prefix "$SCRATCH/out" \
+  -Dtest-root="$SCRATCH/fixtures" -Doptimize=Debug \
+  -Dstrip-fixture-debug=true -Dfixture-objcopy="$LLVM_OBJCOPY" \
+  -j2 test-strip-equivalence test-strip-proof --summary all
+bash support/tools/hyperv/persistence/fixture-strip-build-tests.sh \
+  "$ZIG" "$LLVM_OBJCOPY" "$PERSISTENCE_PACKAGES" "$PRIVATE_TEST_ROOT"
+```
+
+The Bash runner requires a new existing owner-only root. It uses the real
+build/run graph to cover quiet raw selection, invalid flags, qualified native
+execution, create-only report refusal on a cache hit, uncached verification
+with no report, namespace-schema refusal, invalid tool output and cached
+candidate tampering. Deliberately invalid shell payloads would leave a marker
+if incorrectly executed; both rejection paths must leave none. Only the
+runner's candidate cache copy is corrupted, after retaining full good raw/
+candidate copies. The selected raw is never modified, and a final default-off
+run remains independent of the rejected candidate.
+
+#### Parent-owned native x64 qualification recipe
+
+After independent review, use the already-approved native Zig 0.16, exact
+persistence SDKs and pinned LLVM 22.1.8. Set the absolute variables below and a
+new private `QUALIFICATION_ROOT`; the parent separately owns VM/readiness,
+source/tool provenance and disk bindings. Choose `LAYOUT_POLICY` **before**
+the run: either `identical_program_headers` or the explicitly qualified
+`file_offset_relayout`. A refusal is retained, never automatically retried.
+
+```bash
+cd "${REVIEWED_SOURCE:?}"
+umask 077
+root="${QUALIFICATION_ROOT:?}"
+mkdir -m 700 -- "$root"
+mkdir -- "$root/home" "$root/tmp" "$root/global"
+export HOME="$root/home" TMPDIR="$root/tmp" XDG_CACHE_HOME="$root/global"
+"${ZIG:?}" version > "$root/zig.version"
+test "$(tr -d '\n' < "$root/zig.version")" = 0.16.0
+"${LLVM_OBJCOPY:?}" --version > "$root/objcopy.version"
+awk -f support/tools/hyperv/preparation/ci-objcopy-version.awk "$root/objcopy.version"
+sha256sum -- "$LLVM_OBJCOPY" > "$root/objcopy.sha256"
+git rev-parse HEAD > "$root/source.sha"
+sha256sum support/tools/hyperv/persistence/build.zig.zon > "$root/manifest.sha256"
+case "${LAYOUT_POLICY:?}" in
+  identical_program_headers) layout=() ;;
+  file_offset_relayout) layout=(-Dfixture-file-relayout=true) ;;
+  *) echo 'Unsupported layout policy' >&2; exit 2 ;;
+esac
+filters=(
+  'real native leaf workers deliver bound private results and exact serial model'
+  'partial native page checkpoint survives killed delivery without claiming full upload'
+  'cleanup recovery requires bound parent reaping proof and never replays mutations'
+  'failed native creation delivery retains UUID and refuses cleanup replacement'
+)
+for mode in Debug ReleaseSafe; do
+  for variant in raw qualified; do
+    index=0
+    for filter in "${filters[@]}"; do
+      run="$root/$mode-$variant-$index"
+      mkdir -p -- "$run/fixtures"
+      selection=()
+      if [ "$variant" = qualified ]; then
+        selection=(-Dstrip-fixture-debug=true "-Dfixture-objcopy=$LLVM_OBJCOPY"
+          "${layout[@]}" "-Dstrip-fixture-report=$run/qualification.json")
+      fi
+      status=0
+      "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
+        --system "${PERSISTENCE_PACKAGES:?}" --cache-dir "$run/cache" \
+        --global-cache-dir "$root/global" --prefix "$run/out" \
+        -Dtest-root="$run/fixtures" -Dtest-filter="$filter" \
+        -Doptimize="$mode" -Dpersistence-timing=true "${selection[@]}" \
+        -j2 test --summary all > "$run/engine.log" 2>&1 || status=$?
+      printf '%s\n' "$status" > "$run/engine.exit"
+      index=$((index + 1))
+    done
+  done
+done
+```
+
+Keep logs, exits, proofs and full raw/candidate cache artifacts, including
+refusals. Compare only matching mode/filter/timing-enabled controls using each
+log's selected byte count; quiet historical off logs supply no timing baseline.
+This recipe changes no backend/CPU flags, runtime budget, hashing or production
+gate. No CI activation, publication or production adoption is implied.
