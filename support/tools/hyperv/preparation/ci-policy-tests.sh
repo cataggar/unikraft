@@ -50,6 +50,30 @@ if [ "${result}" -ne 1 ]; then
   exit 1
 fi
 
+check_apparmor_feature() {
+  local expected="$1" result=0
+  awk -f "${package}/ci-apparmor-feature.awk" > /dev/null || result=$?
+  if [ "${result}" -ne "${expected}" ]; then
+    printf 'Unexpected AppArmor feature result %s; expected %s\n' "${result}" "${expected}" >&2
+    exit 1
+  fi
+}
+printf '%s\n' yes | check_apparmor_feature 0
+printf '' | check_apparmor_feature 1
+for value in '' 1 0 no true YES ' yes' 'yes ' $'yes\r'; do
+  printf '%s\n' "${value}" | check_apparmor_feature 1
+done
+printf '%s\n' yes yes | check_apparmor_feature 1
+printf '%s\n' yes '' | check_apparmor_feature 1
+printf '%s\n' yes no | check_apparmor_feature 1
+result=0
+(printf '%s\n' yes; exit 1) |
+  awk -f "${package}/ci-apparmor-feature.awk" > /dev/null || result=$?
+if [ "${result}" -ne 1 ]; then
+  echo 'AppArmor feature pipeline accepted a failed read' >&2
+  exit 1
+fi
+
 jq -nc '
   {
     schema: "hyperv_preparation_namespace_ci_baseline_v1",

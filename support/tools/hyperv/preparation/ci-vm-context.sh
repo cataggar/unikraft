@@ -44,7 +44,8 @@ if [ "${uuid}" != "$(jq -r .vm_uuid <<< "${document}")" ] ||
 fi
 if ! systemctl is-active --quiet apparmor ||
    [ "$(cat /sys/module/apparmor/parameters/enabled)" != Y ] ||
-   [ "$(sudo -n /usr/bin/cat /sys/kernel/security/apparmor/features/policy/unconfined_restrictions/userns)" != 1 ] ||
+   ! sudo -n /usr/bin/cat /sys/kernel/security/apparmor/features/policy/unconfined_restrictions/userns |
+     awk -f "${package}/ci-apparmor-feature.awk" ||
    [ "$(/usr/sbin/sysctl -n kernel.apparmor_restrict_unprivileged_userns)" != 1 ]; then
   echo 'The prepared guest must retain active AppArmor and the global userns restriction' >&2
   exit 1

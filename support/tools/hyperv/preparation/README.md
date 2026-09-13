@@ -307,7 +307,10 @@ rather than fabricating GitHub environment variables.
 `ci-vm-context.sh` requires the root-owned read-only VM marker, matching DMI
 UUID, fixed kernel and ordinary UID/GID1001, systemd, active AppArmor with
 userns support and global restriction1, and the interpreter execution-bit
-guard. The caller must supply `UK_FIXTURE_SOURCE_SHA` from the independently
+guard. The securityfs userns feature must report exactly one `yes` record;
+this is distinct from the numeric
+`kernel.apparmor_restrict_unprivileged_userns=1` required after ordinary boot.
+The caller must supply `UK_FIXTURE_SOURCE_SHA` from the independently
 held reviewed commit; `/work/unikraft` must be clean at that exact commit.
 The parent must already have accepted the complete bootstrap protocol and
 ordinary-boot readiness; the marker alone is not proof of those observations.
