@@ -3,6 +3,7 @@ const p = @import("root.zig");
 const core = @import("hyperv_core");
 const f = @import("fixture_support.zig");
 const options = @import("test_options");
+const timing = @import("fixture_timing.zig");
 const t = std.testing;
 const a = t.allocator;
 fn fixture() !f.Fixture {
@@ -414,12 +415,16 @@ const Provision = struct {
     }
 };
 fn executable(path: []const u8) !@import("hyperv_transfer").files.Input {
+    const selection = timing.Selection.begin(options.persistence_timing and std.mem.eql(u8, path, options.worker));
+    var selected_bytes: u64 = 0;
+    defer selection.end(selected_bytes);
     const resolved = try std.Io.Dir.cwd().realPathFileAlloc(t.io, path, a);
     defer a.free(resolved);
     const absolute = try a.dupe(u8, resolved);
     errdefer a.free(absolute);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(t.io, absolute, a, .limited(32 * 1024 * 1024));
     defer a.free(bytes);
+    selected_bytes = bytes.len;
     return .{ .path = absolute, .size = bytes.len, .sha256 = try core.contracts.parseSha256(&p.local.hash(bytes)) };
 }
 fn reportNativeFailure(mode: f.Mode, state: p.model.State) void {
@@ -441,7 +446,8 @@ test "real native leaf workers deliver bound private results and exact serial mo
     const binary = try executable(options.worker);
     defer a.free(binary.path);
     var provision = Provision{ .mode = .good };
-    var supervisor = p.worker.Supervisor{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call } };
+    var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = provision.mode, .enabled = options.persistence_timing };
+    var supervisor = p.worker.Supervisor{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call }, .observer = trace.observer() };
     defer supervisor.deinit();
     var runtime_options = model.options();
     runtime_options.driver = supervisor.driver();
@@ -460,7 +466,8 @@ test "blocked native worker is killed and malformed delivery retains accepted ef
         _ = try p.engine.prepare(a, t.io, work.directory, f.input());
         var model = f.Model{ .allocator = a };
         var provision = Provision{ .mode = mode };
-        var supervisor = p.worker.Supervisor{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call } };
+        var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = provision.mode, .enabled = options.persistence_timing };
+        var supervisor = p.worker.Supervisor{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call }, .observer = trace.observer() };
         defer supervisor.deinit();
         var runtime_options = model.options();
         runtime_options.driver = supervisor.driver();
@@ -617,7 +624,8 @@ test "partial native page checkpoint survives killed delivery without claiming f
         _ = try p.engine.prepare(a, t.io, work.directory, f.input());
         var model = f.Model{ .allocator = a };
         var provision: Provision = .{ .mode = mode };
-        var supervisor: p.worker.Supervisor = .{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call } };
+        var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = provision.mode, .enabled = options.persistence_timing };
+        var supervisor: p.worker.Supervisor = .{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call }, .observer = trace.observer() };
         defer supervisor.deinit();
         var runtime = model.options();
         runtime.driver = supervisor.driver();
@@ -675,7 +683,8 @@ test "direct native cancellation interrupts blocked leaf and proves child termin
     var cancelled = std.atomic.Value(bool).init(false);
     // Startup deliberately outlasts the former fixed 500-ms cancellation delay.
     var provision: Provision = .{ .mode = .block_upload, .delay_ms = 750 };
-    var supervisor: p.worker.Supervisor = .{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .cancellation = &cancelled, .provision = .{ .context = &provision, .call = Provision.call } };
+    var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = provision.mode, .enabled = options.persistence_timing };
+    var supervisor: p.worker.Supervisor = .{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .cancellation = &cancelled, .provision = .{ .context = &provision, .call = Provision.call }, .observer = trace.observer() };
     defer supervisor.deinit();
     const deadline = try core.process.Deadline.afterMilliseconds(5000);
     var cancellation: CancelWhenReady = .{ .directory = work.directory.dir, .flag = &cancelled, .deadline = deadline };
@@ -702,11 +711,13 @@ test "cleanup recovery requires bound parent reaping proof and never replays mut
     defer a.free(binary.path);
     var model = f.Model{ .allocator = a };
     var provision: Provision = .{ .mode = .partial_pages };
-    var supervisor: p.worker.Supervisor = .{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call } };
+    var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = provision.mode, .enabled = options.persistence_timing };
+    var supervisor: p.worker.Supervisor = .{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call }, .observer = trace.observer() };
     defer supervisor.deinit();
     var runtime = model.options();
     runtime.driver = supervisor.driver();
     var state = try p.engine.execute(a, t.io, work.directory, runtime, false);
+    timing.recoverySnapshot(options.persistence_timing, .recovery_initial, state);
     state.phase = .running;
     state.cleanup_required = true;
     state.cleanup_deadline_ns = null;
@@ -715,7 +726,9 @@ test "cleanup recovery requires bound parent reaping proof and never replays mut
     state.data_access_pending = true;
     for (state.records[@intFromEnum(p.model.Step.data_upload)..]) |*record| record.* = .{};
     state.records[@intFromEnum(p.model.Step.data_upload)] = .{ .progress = .intent, .effect = .unknown };
+    timing.recoverySnapshot(options.persistence_timing, .recovery_rewritten, state);
     try state.validate();
+    timing.recoverySnapshot(options.persistence_timing, .recovery_validated, state);
     const driver = supervisor.driver();
     var recovered = state;
     try driver.recoverFn.?(driver.context, &recovered);
@@ -769,7 +782,8 @@ test "failed native creation delivery retains UUID and refuses cleanup replaceme
         const binding = try p.engine.prepare(a, t.io, work.directory, f.input());
         var model = f.Model{ .allocator = a };
         var provision: Provision = .{ .mode = mode };
-        var supervisor: p.worker.Supervisor = .{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call } };
+        var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = provision.mode, .enabled = options.persistence_timing };
+        var supervisor: p.worker.Supervisor = .{ .allocator = a, .io = t.io, .directory = work.directory, .root_path = work.path, .executable = binary, .provision = .{ .context = &provision, .call = Provision.call }, .observer = trace.observer() };
         defer supervisor.deinit();
         var runtime = model.options();
         runtime.driver = supervisor.driver();
@@ -817,4 +831,238 @@ test "strict result serialization rejects contradictory absence and zero-byte mu
     try result.validate();
     result.http_status = 403;
     try t.expectError(error.InvalidAbsence, result.validate());
+}
+
+fn timingHeader() !timing.Header {
+    return .{ .identity = .from(try f.makeJob(a, .os_create, 1000000000)), .worker_bytes = 4096, .mode = .malformed_create, .sequence = 1 };
+}
+
+test "persistence timing canonical bounded schema rejects invalid and cross-process records" {
+    const header = try timingHeader();
+    const record = try timing.Record.observe(header, .child_entry, null);
+    var bytes = [_]u8{0} ** timing.max_bytes;
+    @memcpy(bytes[0..timing.slot_size], &try header.encode());
+    @memcpy(bytes[timing.slot_size..][0..timing.slot_size], &try record.encode());
+    const end = 2 * timing.slot_size;
+    const prefix = try timing.decode(a, bytes[0..end], header);
+    try t.expectEqual(.prefix, prefix.status);
+    try t.expectEqual(@as(usize, 1), prefix.count);
+    try t.expectEqual(.partial_slot, (try timing.decode(a, bytes[0 .. end + 1], header)).status);
+    try t.expectEqual(.empty, (try timing.decode(a, bytes[0..timing.slot_size], header)).status);
+    try t.expectError(error.DiagnosticOverflow, timing.decode(a, &([_]u8{0} ** (timing.max_bytes + 1)), header));
+    try t.expectError(error.InvalidDiagnostic, timing.decode(a, bytes[0 .. timing.slot_size - 1], header));
+    var other = header;
+    other.identity.nonce[0] = '9';
+    try t.expectError(error.InvalidDiagnostic, timing.decode(a, bytes[0..end], other));
+    other = header;
+    other.identity.deadline_ns += 1;
+    try t.expectError(error.InvalidDiagnostic, timing.decode(a, bytes[0..end], other));
+    for ([_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = "\"schema_version\":1", .to = "\"schema_version\":2" },
+        .{ .from = "\"schema_version\":1", .to = "\"schema_version\":1,\"schema_version\":1" },
+        .{ .from = "\"authority\":\"none\"", .to = "\"authority\":\"accepted\"" },
+        .{ .from = "\"child_entry\"", .to = "\"unknown_stage\"" },
+        .{ .from = "\"worker_bytes\":4096", .to = "\"worker_bytes\":0" },
+        .{ .from = "\"worker_bytes\":4096", .to = "\"worker_bytes\":4096,\"secret\":\"SYNTHETIC_SECRET\"" },
+    }) |mutation| {
+        const slot = try record.encode();
+        const bad = try std.mem.replaceOwned(u8, a, std.mem.trimEnd(u8, &slot, "\x00"), mutation.from, mutation.to);
+        defer a.free(bad);
+        @memset(bytes[timing.slot_size..end], 0);
+        @memcpy(bytes[timing.slot_size..][0..bad.len], bad);
+        const rejected = try timing.decode(a, bytes[0..end], header);
+        try t.expectEqual(.invalid, rejected.status);
+        try t.expectEqual(@as(usize, 0), rejected.count);
+    }
+    var records: timing.Records = .{ .child = true };
+    try records.push(record);
+    try t.expectError(error.InvalidDiagnostic, records.push(record));
+    var next = record;
+    next.stage = .child_job_begin;
+    next.sample.process_cpu_ns = record.sample.process_cpu_ns - 1;
+    try t.expectError(error.InvalidDiagnostic, records.push(next));
+    next = record;
+    next.stage = .parent_end;
+    try t.expectError(error.InvalidDiagnostic, records.push(next));
+    records = .{ .child = true };
+    for (0..timing.child_slots) |index| {
+        next = record;
+        next.stage = @enumFromInt(timing.parent_slots + index);
+        try records.push(next);
+    }
+    try t.expectError(error.DiagnosticOverflow, records.push(next));
+}
+
+test "persistence timing private sidecar is identity-bound and cleanup-gated" {
+    var work = try fixture();
+    defer work.deinit();
+    const header = try timingHeader();
+    const sidecar = try timing.Sidecar.create(t.io, work.directory, header);
+    defer sidecar.close(t.io);
+    const record = try timing.Record.observe(header, .child_entry, null);
+    try sidecar.file.writePositionalAll(t.io, &try record.encode(), timing.slot_size);
+    try t.expectError(error.DiagnosticCleanupUnconfirmed, sidecar.read(a, t.io, work.directory, false));
+    // No process exists in this unit: exercise the post-cleanup reader directly.
+    try t.expectEqual(@as(usize, 1), (try sidecar.read(a, t.io, work.directory, true)).count);
+    try t.expectError(error.PathAlreadyExists, timing.Sidecar.create(t.io, work.directory, header));
+    try work.directory.dir.deleteFile(t.io, timing.file_name);
+    const replacement = try timing.Sidecar.create(t.io, work.directory, header);
+    defer replacement.close(t.io);
+    try t.expectError(error.InvalidDiagnostic, sidecar.read(a, t.io, work.directory, true));
+}
+
+test "persistence timing shared observer refuses sidecar reads without cleanup" {
+    var work = try fixture();
+    defer work.deinit();
+    const header = try timingHeader();
+    var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = header.mode, .enabled = true, .emit_log = false };
+    const observer = trace.observer();
+    p.worker.Observer.emit(observer, .{ .stage = .parent_begin, .identity = header.identity, .worker_bytes = header.worker_bytes });
+    p.worker.Observer.emit(observer, .{ .stage = .provision_begin, .directory = work.directory });
+    // An invalid file would be rejected if the callback attempted to read it.
+    try trace.sidecar.?.file.writePositionalAll(t.io, "invalid", 0);
+    p.worker.Observer.emit(observer, .{ .stage = .process_return, .cleanup_complete = false });
+    p.worker.Observer.emit(observer, .{ .stage = .parent_end });
+    try t.expectEqual(.cleanup_unconfirmed, trace.child_records.status);
+    try t.expectEqual(@as(usize, 0), trace.child_records.count);
+    try t.expect(trace.sidecar == null);
+}
+
+test "persistence timing default off is inert and shared sealing failure keeps exact deadline" {
+    var work = try fixture();
+    defer work.deinit();
+    var provision: Provision = .{ .mode = .good };
+    var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = .good, .emit_log = false };
+    try t.expect(trace.observer() == null);
+    var supervisor: p.worker.Supervisor = .{
+        .allocator = a,
+        .io = t.io,
+        .directory = work.directory,
+        .root_path = work.path,
+        .executable = .{ .path = "/synthetic-never-opened", .size = 4096, .sha256 = [_]u8{1} ** 32 },
+        .provision = .{ .context = &provision, .call = Provision.call },
+    };
+    defer supervisor.deinit();
+    try t.expect(supervisor.observer == null);
+    const driver = supervisor.driver();
+    const job = try f.makeJob(a, .os_create, 1);
+    try t.expectError(error.Deadline, driver.executeFn(driver.context, job));
+    try t.expectEqual(@as(u16, 0), trace.sequence);
+    try t.expectEqual(@as(usize, 0), trace.records.count);
+    trace.enabled = true;
+    supervisor.observer = trace.observer();
+    try t.expectError(error.Deadline, driver.executeFn(driver.context, job));
+    try t.expectEqual(.ok, trace.records.status);
+    try t.expectEqual(.not_started, trace.child_records.status);
+    try t.expectEqual(@as(usize, 4), trace.records.count);
+    for ([_]timing.Stage{ .parent_begin, .seal_begin, .parent_error, .parent_end }, trace.records.values[0..4]) |stage, record| {
+        try t.expectEqual(stage, record.stage);
+        try t.expectEqual(@as(u64, 1), record.deadline_ns);
+        try t.expectEqual(@as(u32, 1000), record.operation_ms);
+    }
+    try t.expectError(error.FileNotFound, work.directory.openFile(t.io, timing.file_name));
+    while (trace.sequence < timing.max_jobs) {
+        p.worker.Observer.emit(trace.observer(), .{ .stage = .parent_begin, .identity = .from(job), .worker_bytes = 4096 });
+        p.worker.Observer.emit(trace.observer(), .{ .stage = .parent_end });
+    }
+    p.worker.Observer.emit(trace.observer(), .{ .stage = .parent_begin, .identity = .from(job), .worker_bytes = 4096 });
+    try t.expect(trace.overflow_reported);
+    try t.expectEqual(timing.max_jobs, trace.sequence);
+}
+
+const TimingProvision = struct {
+    remove_timing: bool,
+    fn call(context: *anyopaque, job: p.model.Job, directory: core.private_files.Directory) !void {
+        const self: *TimingProvision = @ptrCast(@alignCast(context));
+        var provision: Provision = .{ .mode = .malformed_create };
+        try Provision.call(&provision, job, directory);
+        if (self.remove_timing and options.persistence_timing) try directory.dir.deleteFile(t.io, timing.file_name);
+    }
+};
+
+test "persistence timing native malformed delivery preserves failure even when diagnostics are missing" {
+    const binary = try executable(options.worker);
+    defer a.free(binary.path);
+    for ([_]bool{ false, true }) |remove_timing| {
+        var work = try fixture();
+        defer work.deinit();
+        var provision: TimingProvision = .{ .remove_timing = remove_timing };
+        var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = .malformed_create, .enabled = options.persistence_timing, .emit_log = false };
+        var supervisor: p.worker.Supervisor = .{
+            .allocator = a,
+            .io = t.io,
+            .directory = work.directory,
+            .root_path = work.path,
+            .executable = binary,
+            .provision = .{ .context = &provision, .call = TimingProvision.call },
+            .observer = trace.observer(),
+        };
+        defer supervisor.deinit();
+        const driver = supervisor.driver();
+        const job = try f.makeJob(a, .os_create, (try core.process.Deadline.afterMilliseconds(1000)).expires_ns);
+        var reply = try driver.executeFn(driver.context, job);
+        defer reply.deinit();
+        try t.expect(!reply.value.complete and reply.value.process_cleanup_complete);
+        try t.expectEqual(.invalid_response, reply.value.failures.primary.?.category);
+        try t.expectEqual(.accepted, reply.value.effect);
+        if (options.persistence_timing) {
+            try t.expectEqual(.ok, trace.records.status);
+            try t.expectEqual(if (remove_timing) timing.Status.missing else .prefix, trace.child_records.status);
+            if (!remove_timing) {
+                try t.expectEqual(.child_fixture_ack_end, trace.child_records.values[trace.child_records.count - 1].stage);
+                try t.expectEqual(.child_entry, trace.child_records.values[0].stage);
+            }
+
+            try t.expectEqual(.parent_end, trace.records.values[trace.records.count - 1].stage);
+        } else {
+            try t.expectEqual(@as(usize, 0), trace.records.count);
+            const directory = try core.private_files.Directory.open(t.io, supervisor.directories[@intFromEnum(job.step)].?);
+            defer directory.close(t.io);
+            try t.expectError(error.FileNotFound, directory.openFile(t.io, timing.file_name));
+        }
+    }
+}
+
+test "persistence timing shared child success timeout and checkpoint stages survive cleanup" {
+    const binary = try executable(options.worker);
+    defer a.free(binary.path);
+    for ([_]f.Mode{ .good, .block_upload, .secret_failure, .partial_pages }) |mode| {
+        var work = try fixture();
+        defer work.deinit();
+        var provision: Provision = .{ .mode = mode };
+        var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = mode, .enabled = options.persistence_timing, .emit_log = mode == .good or mode == .secret_failure };
+        var supervisor: p.worker.Supervisor = .{
+            .allocator = a,
+            .io = t.io,
+            .directory = work.directory,
+            .root_path = work.path,
+            .executable = binary,
+            .provision = .{ .context = &provision, .call = Provision.call },
+            .observer = trace.observer(),
+        };
+        defer supervisor.deinit();
+        const driver = supervisor.driver();
+        const job = try f.makeJob(a, if (mode == .good) .group_create else .data_upload, (try core.process.Deadline.afterMilliseconds(1000)).expires_ns);
+        var reply = try driver.executeFn(driver.context, job);
+        defer reply.deinit();
+        try t.expect(reply.value.process_cleanup_complete);
+        try t.expectEqual(mode == .good, reply.value.complete);
+        if (mode != .good) try t.expectEqual(if (mode == .block_upload) core.diagnostics.Category.timeout else .child_failed, reply.value.failures.primary.?.category);
+        if (mode == .partial_pages) try t.expectEqual(@as(u64, 4194304), reply.value.page_report.?.progress.?.bytes_confirmed);
+        if (options.persistence_timing) {
+            try t.expectEqual(.ok, trace.records.status);
+            try t.expectEqual(if (mode == .good) timing.Status.complete else .prefix, trace.child_records.status);
+            const last = trace.child_records.values[trace.child_records.count - 1];
+            try t.expectEqual(switch (mode) {
+                .good => timing.Stage.child_end,
+                .partial_pages => .child_fixture_checkpoint,
+                else => .child_backend_begin,
+            }, last.stage);
+            for (trace.records.values[0..trace.records.count]) |record| {
+                try t.expectEqual(job.deadline_ns, record.deadline_ns);
+                try t.expectEqual(@as(u32, 1000), record.operation_ms);
+                if (record.stage == .process_return) try t.expectEqual(true, record.cleanup_complete.?);
+            }
+        } else try t.expectEqual(@as(usize, 0), trace.records.count);
+    }
 }

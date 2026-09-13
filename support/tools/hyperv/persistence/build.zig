@@ -3,6 +3,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const test_root = b.option([]const u8, "test-root", "Existing private absolute fixture directory");
+    const timing = b.option(bool, "persistence-timing", "Synthetic timing only (inside unchanged deadlines; never installed)") orelse false;
+    const filter = b.option([]const u8, "test-filter", "Run only matching native fixture names");
     const sdk = b.dependency("azure_sdk_core", .{ .target = target, .optimize = optimize }).module("azure_sdk_core");
     const storage = b.dependency("azure_sdk_storage_common", .{ .target = target, .optimize = optimize }).module("azure_sdk_storage_common");
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
@@ -42,20 +44,27 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(cli);
     const test_options = b.addOptions();
+    test_options.addOption(bool, "persistence_timing", timing);
     test_options.addOption(?[]const u8, "test_root", test_root);
     test_options.addOptionPath("cli", cli.getEmittedBin());
     const worker_fixture = b.addExecutable(.{
         .name = "hyperv-persistence-worker-fixture",
         .root_module = b.createModule(.{ .root_source_file = b.path("worker_fixture.zig"), .target = target, .optimize = optimize, .imports = imports }),
     });
+    const measurement = b.createModule(.{ .root_source_file = b.path("../synthetic_measurement.zig"), .target = target, .optimize = optimize });
+    worker_fixture.root_module.addImport("synthetic_measurement", measurement);
+    const fixture_options = b.addOptions();
+    fixture_options.addOption(bool, "persistence_timing", timing);
+    worker_fixture.root_module.addOptions("fixture_options", fixture_options);
     test_options.addOptionPath("worker", worker_fixture.getEmittedBin());
-    const tests = b.addTest(.{ .root_module = b.createModule(.{
+    const tests = b.addTest(.{ .filters = if (filter) |value| &.{value} else &.{}, .root_module = b.createModule(.{
         .root_source_file = b.path("tests.zig"),
         .target = target,
         .optimize = optimize,
         .imports = imports,
     }) });
     tests.root_module.addOptions("test_options", test_options);
+    tests.root_module.addImport("synthetic_measurement", measurement);
     const run = b.addRunArtifact(tests);
     b.step("test", "Run offline persistence engine fixtures").dependOn(&run.step);
     const arm_tests = b.addTest(.{ .root_module = azure });

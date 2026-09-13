@@ -272,3 +272,148 @@ zig build --build-file support/tools/hyperv/persistence/build.zig \
 Repeat with `-Doptimize=ReleaseSafe` and a distinct output prefix. No new SDK
 surface, dependency, tool installation, root build, CI, producer-pin or
 legacy-controller change is required by this package.
+
+### Default-off synthetic persistence timing
+
+`-Dpersistence-timing=true` instruments **only** the non-installed worker
+fixture and engine tests. Omit it for the quiet default. Neither the installed
+CLI nor serialized job data can select this diagnostic or synthetic backend.
+`-Dtest-filter=TEXT` uses Zig's standard fixture-name filter, as in the other
+native packages; it filters `test`, not `test-arm`. The original 28 engine
+tests and assertions remain, with six additional `persistence timing` tests.
+
+The sole shared extension is the null-by-default, trusted in-process
+`worker.Observer` callback (`void`, no errors entering worker failure lanes),
+`Supervisor.observer`, and `childObserved(..., ?Observer)`. Ordinary `child`
+supplies null. No clocks, sidecars or timing output are used with null observers.
+The sampler is the existing `../synthetic_measurement.zig`, also used by
+local-boot/namespace diagnostics. No hashing algorithm, hash frequency, wire
+schema, deadline construction/check, process ownership, descriptor allowlist,
+ack, result validation, recording or recovery rule changes.
+
+Output lines start with `persistence_timing`. Stage records are canonical
+closed-schema JSON v1: `scope=synthetic_timing_only`, `authority=none`, fixed
+`stage`, fixture `mode`, numeric `sequence`, fixed model `step`, selected
+`worker_bytes`, absolute `deadline_ns`, original `operation_ms`, nullable
+`cleanup_complete` (only at `process_return`), and the shared `sample` fields:
+compiler backend, architecture, optimization mode, aarch64 SHA2/x86 SHA/AVX2
+feature booleans, monotonic nanoseconds and **process-local** CPU nanoseconds.
+No path, URL, credential, arbitrary error, job/result body or failed
+stdout/stderr is rendered. Fixed-label summary/status and recovery-precondition
+lines are not worker records and must never be fed to a result/admission loader.
+
+| Stages | Measured interval / boundary |
+| --- | --- |
+| `selection_begin/end` | Test helper's initial path resolution, full read and SHA256 pin; **before** any job budget. These two records have only size and shared sample metadata, not job fields. |
+| `parent_begin`, `seal_begin/end` | Supervisor entry; full guarded `SealedInput.open` (SHA256 **and** MD5). |
+| `job_prepare_begin/end`, `provision_begin/end` | Worker directory/job record preparation, then fixture provisioning including diagnostic sidecar creation. |
+| `verify_begin/end` | Original second full guarded SHA256/MD5 hash and path/metadata verification. |
+| `process_begin/return` | Entire existing `process.run`: spawn, monitor and terminate/reap. This is not a separate kernel exec or cleanup-duration measurement. |
+| `result_read_begin/end`, `result_validate_begin/end`, `delivery_begin/end`, `supervision_begin/end` | Private result read/validation, bound ack check, original supervision recording, including failure branches. |
+| `parent_error/end` | Error-return marker if applicable, then end of the supervisor call after its original defers. |
+| `child_entry`, `child_job_begin/validated`, `child_started_recorded` | Earliest fixture Zig entry, existing job/canonical/input/parent/deadline validation, and original started-record durability. Runtime/loader time before Zig entry is not sampled. |
+| `child_backend_begin/end`, `child_result_validated/recorded`, `child_ack_begin/end`, `child_error/end` | Synthetic backend and normal result/ack lifecycle. Malformed fixture delivery instead uses `child_fixture_result_begin/end` and `child_fixture_ack_begin/end`; partial-page exit uses `child_fixture_checkpoint`. |
+
+Compare wall clocks across parent/child only for the **same** step, deadline,
+mode and sequence. Subtract CPU clocks only between parent records or between
+records from one child; never parent minus child or two different children.
+`process_begin` to `child_entry` bounds startup; `process_begin/return` includes
+the independent original 2000-ms cleanup allowance. The exact job expiry is
+copied, not recomputed. Entry is slightly after the engine created the deadline,
+and a job clipped by its enclosing deadline need not have a full 1000 ms left.
+An end marker or `child_status=complete` means observation coverage, **not**
+worker success, admission, accepted effects, or a reaping proof.
+
+The private 0600, exclusive-create `synthetic-persistence-timing-v1` file lives
+in the existing private worker directory. It has one 1024-byte header followed
+by at most 17 1024-byte child slots (18432 bytes total). The header binds the
+attempt nonce, input digest, step, exact deadline, parent PID, operation budget,
+fixture size/mode and bounded sequence. The child compares that identity with
+the validated job. This is an observation identity, not another job/result
+signature or recovery claim. The parent retains its descriptor, checks the
+pathname's private inode/snapshot and exact header, and reads only on the
+existing `process.run` cleanup-complete return (including no-child start
+refusals). Unconfirmed cleanup never permits a read. No FD is passed through
+exec; no new descriptor is added to any allowlist.
+
+There are at most 21 parent and 17 child records per call, each at most
+1024 bytes plus its fixed log prefix, and one bounded summary. A fixture
+collector allows at most `8 * step_count + 1 = 265` calls and one overflow
+notice. Unknown/duplicate/noncanonical fields, identity changes, stage
+regressions, process-local clock regressions and oversized files refuse.
+Summaries distinguish `empty`, `prefix`, `partial_slot`, `complete`, `invalid`,
+`overflow`, `clock_failed`, `io_failed`, `missing`, `not_started` and
+`cleanup_unconfirmed`; parent `ok` means its samples were collected. Diagnostic
+failures never replace the original primary/cleanup/recording failures.
+Missing child observations remain empty/prefix observations: they cannot
+distinguish death from a child diagnostic clock/write/open failure.
+
+**Overhead is real and is not reimbursed.** Sampling/slot encoding, sidecar
+opening and writes occur under the unchanged running budgets. Slots use
+positional writes without additional fsyncs, not crash-durable logging. Parent
+decoding after reaping contributes to the gap before result reading; bounded
+printing at call exit contributes to the enclosing attempt/cleanup budget.
+No deadline is paused, reset or extended. The instrumented executable itself
+can be larger, so use its reported byte count and retain default-off controls.
+Timing can perturb or cause a failure; these observations do not yet establish
+the native x64 Debug failure's cause.
+
+The cleanup-recovery fixture emits `recovery_initial`, `recovery_rewritten`
+and (only if the original validation succeeds) `recovery_validated`. They
+show only phase and the OS/data grant/access preconditions. The historical
+`InvalidAccessProof` stack identifies validation of the **rewritten** state:
+OS access was not pending, a grant obligation existed, and neither normal nor
+cleanup OS-access proof was done. Rewriting clears records from `data_upload`
+onward, including cleanup proofs, but does not change `os_access_pending`.
+That stack alone does not identify the earlier failed worker or prove a
+timing cause. The new before/after observations expose the distinction;
+validation and fixture rewriting remain untouched.
+
+#### Parent-owned native x64 trial recipe
+
+After independent review, the parent can use the same native x64 environment
+and exact already-staged **persistence** SDK dependencies (not preparation's).
+Set `ZIG`, `REVIEWED_SOURCE`, `PERSISTENCE_PACKAGES`, and a new private
+`TRIAL_ROOT` to absolute paths. This recipe neither fetches dependencies nor
+performs VM, hardware, cloud, publication or integration operations:
+
+```bash
+cd "${REVIEWED_SOURCE:?}"
+mkdir -p "${TRIAL_ROOT:?}"/{home,tmp,global}
+chmod 700 "$TRIAL_ROOT"
+export HOME="$TRIAL_ROOT/home" TMPDIR="$TRIAL_ROOT/tmp"
+export XDG_CACHE_HOME="$TRIAL_ROOT/global"
+filters=(
+  'real native leaf workers deliver bound private results and exact serial model'
+  'partial native page checkpoint survives killed delivery without claiming full upload'
+  'cleanup recovery requires bound parent reaping proof and never replays mutations'
+  'failed native creation delivery retains UUID and refuses cleanup replacement'
+)
+for mode in Debug ReleaseSafe; do
+  for timing in false true; do
+    index=0
+    for filter in "${filters[@]}"; do
+      run="$TRIAL_ROOT/$mode-$timing-$index"
+      mkdir -p "$run/fixtures"
+      chmod 700 "$run" "$run/fixtures"
+      status=0
+      "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
+        --system "${PERSISTENCE_PACKAGES:?}" \
+        --cache-dir "$run/cache" --global-cache-dir "$TRIAL_ROOT/global" \
+        --prefix "$run/out" -Dtest-root="$run/fixtures" \
+        -Dtest-filter="$filter" -Doptimize="$mode" \
+        -Dpersistence-timing="$timing" -j2 test --summary all \
+        > "$run/engine.log" 2>&1 || status=$?
+      printf '%s\n' "$status" > "$run/engine.exit"
+      index=$((index + 1))
+    done
+  done
+done
+```
+
+No native target, backend, CPU feature, stripping or budget override is used.
+Keep both exit codes and full bounded timing logs, including failed cases.
+Fixture directories/sidecars retain the original test cleanup lifetime; only
+sanitized parent log observations survive that cleanup. Do not promote them
+to accepted-effect or recovery evidence. For just the six focused diagnostic
+tests, use the same build command with `-Dtest-filter='persistence timing'`.

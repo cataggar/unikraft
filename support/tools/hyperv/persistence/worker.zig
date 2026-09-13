@@ -6,6 +6,76 @@ const m = @import("model.zig");
 const engine = @import("engine.zig");
 const native = @import("native.zig");
 
+/// Trusted in-process observation only; never selected by CLI or job data.
+/// Callbacks cannot return errors into the worker's result/cleanup lanes.
+pub const Observer = struct {
+    pub const Stage = enum {
+        parent_begin,
+        seal_begin,
+        seal_end,
+        job_prepare_begin,
+        job_prepare_end,
+        provision_begin,
+        provision_end,
+        verify_begin,
+        verify_end,
+        process_begin,
+        process_return,
+        result_read_begin,
+        result_read_end,
+        result_validate_begin,
+        result_validate_end,
+        delivery_begin,
+        delivery_end,
+        supervision_begin,
+        supervision_end,
+        parent_error,
+        parent_end,
+        child_entry,
+        child_job_begin,
+        child_job_validated,
+        child_started_recorded,
+        child_backend_begin,
+        child_fixture_checkpoint,
+        child_fixture_result_begin,
+        child_fixture_result_end,
+        child_fixture_ack_begin,
+        child_fixture_ack_end,
+        child_backend_end,
+        child_result_validated,
+        child_result_recorded,
+        child_ack_begin,
+        child_ack_end,
+        child_error,
+        child_end,
+    };
+    pub const Identity = struct {
+        nonce: local.Hash,
+        input_sha256: local.Hash,
+        step: m.Step,
+        deadline_ns: u64,
+        parent_pid: u32,
+        operation_ms: u32,
+
+        pub fn from(job: m.Job) Identity {
+            return .{ .nonce = job.nonce, .input_sha256 = job.input_sha256, .step = job.step, .deadline_ns = job.deadline_ns, .parent_pid = job.parent_pid, .operation_ms = job.input.operation_ms };
+        }
+    };
+    pub const Event = struct {
+        stage: Stage,
+        identity: ?Identity = null,
+        worker_bytes: u64 = 0,
+        directory: ?core.private_files.Directory = null,
+        cleanup_complete: ?bool = null,
+    };
+    context: *anyopaque,
+    call: *const fn (*anyopaque, Event) void,
+
+    pub fn emit(observer: ?Observer, event: Event) void {
+        if (observer) |value| value.call(value.context, event);
+    }
+};
+
 pub const Backend = struct {
     context: *anyopaque,
     executeFn: *const fn (*anyopaque, m.Job, core.private_files.Directory, *core.private_files.Locked) anyerror!m.Result,
@@ -29,6 +99,13 @@ const Stopped = struct {
 /// The production facade must provide its committed admission/credential
 /// bootstrap. This entry never forks or installs another process reaper.
 pub fn child(allocator: std.mem.Allocator, io: std.Io, backend: Backend) !void {
+    return childObserved(allocator, io, backend, null);
+}
+
+pub fn childObserved(allocator: std.mem.Allocator, io: std.Io, backend: Backend, observer: ?Observer) !void {
+    defer Observer.emit(observer, .{ .stage = .child_end });
+    errdefer Observer.emit(observer, .{ .stage = .child_error });
+    Observer.emit(observer, .{ .stage = .child_job_begin });
     const directory = try core.private_files.Directory.openWorkerCwd(io);
     defer directory.close(io);
     var lock = try directory.lock(io);
@@ -45,18 +122,25 @@ pub fn child(allocator: std.mem.Allocator, io: std.Io, backend: Backend) !void {
     const input = try local.encode(allocator, job.input);
     defer allocator.free(input);
     if (!std.mem.eql(u8, &local.hash(input), &job.input_sha256)) return error.ContractSubstitution;
+    Observer.emit(observer, .{ .stage = .child_job_validated, .identity = .from(job) });
     const started = try lock.createImmutable(io, "started.json", "{\"schema_version\":1}\n");
     if (started.status != .durable or started.failures.recording != null or started.failures.cleanup != null)
         return error.RecordingFailed;
+    Observer.emit(observer, .{ .stage = .child_started_recorded });
+    Observer.emit(observer, .{ .stage = .child_backend_begin });
     var result = try backend.executeFn(backend.context, job, directory, &lock);
+    Observer.emit(observer, .{ .stage = .child_backend_end });
     try result.validate();
     if (!std.mem.eql(u8, &result.job_sha256, &local.hash(raw.bytes())) or
         !std.mem.eql(u8, &result.nonce, &job.nonce) or result.step != job.step) return error.StaleWorker;
+    Observer.emit(observer, .{ .stage = .child_result_validated });
     const bytes = try local.encode(allocator, result);
     defer allocator.free(bytes);
     const written = try lock.createImmutable(io, "result.json", bytes);
     if (written.status != .durable or written.failures.recording != null or written.failures.cleanup != null)
         return error.RecordingFailed;
+    Observer.emit(observer, .{ .stage = .child_result_recorded });
+    Observer.emit(observer, .{ .stage = .child_ack_begin });
     const ack = try local.encode(allocator, Ack{
         .job_sha256 = result.job_sha256,
         .nonce = job.nonce,
@@ -65,6 +149,7 @@ pub fn child(allocator: std.mem.Allocator, io: std.Io, backend: Backend) !void {
     defer allocator.free(ack);
     var output = std.Io.File.stdout().writer(io, &.{});
     try output.interface.writeAll(ack);
+    Observer.emit(observer, .{ .stage = .child_ack_end });
 }
 
 pub const Supervisor = struct {
@@ -74,6 +159,7 @@ pub const Supervisor = struct {
     root_path: []const u8,
     executable: transfer.files.Input,
     cancellation: ?*const std.atomic.Value(bool) = null,
+    observer: ?Observer = null,
     provision: struct {
         context: *anyopaque,
         call: *const fn (*anyopaque, m.Job, core.private_files.Directory) anyerror!void,
@@ -175,11 +261,17 @@ pub const Supervisor = struct {
 
     fn execute(context: *anyopaque, job: m.Job) !engine.Reply {
         const self: *Supervisor = @ptrCast(@alignCast(context));
+        Observer.emit(self.observer, .{ .stage = .parent_begin, .identity = .from(job), .worker_bytes = self.executable.size });
+        defer Observer.emit(self.observer, .{ .stage = .parent_end });
+        errdefer Observer.emit(self.observer, .{ .stage = .parent_error });
         try job.validate();
         try core.process.initialize();
         var guard = Guard{ .deadline = job.deadline_ns };
+        Observer.emit(self.observer, .{ .stage = .seal_begin });
         var binary = try transfer.files.SealedInput.open(self.io, self.executable, .{ .context = &guard, .checkFn = Guard.check });
         defer binary.close();
+        Observer.emit(self.observer, .{ .stage = .seal_end });
+        Observer.emit(self.observer, .{ .stage = .job_prepare_begin });
         const index = @intFromEnum(job.step);
         var name_buffer: [48]u8 = undefined;
         var selected: ?[]const u8 = null;
@@ -211,12 +303,18 @@ pub const Supervisor = struct {
             if (prepared.status != .durable or prepared.failures.recording != null or prepared.failures.cleanup != null)
                 return error.RecordingFailed;
         }
+        Observer.emit(self.observer, .{ .stage = .job_prepare_end });
+        Observer.emit(self.observer, .{ .stage = .provision_begin, .directory = directory });
         try self.provision.call(self.provision.context, job, directory);
+        Observer.emit(self.observer, .{ .stage = .provision_end });
+        Observer.emit(self.observer, .{ .stage = .verify_begin });
         try binary.verify(.{ .context = &guard, .checkFn = Guard.check });
+        Observer.emit(self.observer, .{ .stage = .verify_end });
         var environment = std.process.Environ.Map.init(self.allocator);
         defer environment.deinit();
         // This supervisor is the outer process owner. The restricted worker is
         // a leaf; calling transfer.worker.supervise here would escape its group.
+        Observer.emit(self.observer, .{ .stage = .process_begin });
         var process = try core.process.run(self.allocator, self.io, .{
             .argv = &.{ self.executable.path, "__persistence-worker" },
             .environment = &environment,
@@ -228,6 +326,7 @@ pub const Supervisor = struct {
             .cancel = if (job.step.cleanup()) null else self.cancellation,
         });
         defer process.deinit(self.allocator);
+        Observer.emit(self.observer, .{ .stage = .process_return, .cleanup_complete = process.cleanup_complete });
         var fallback = try native.initial(self.allocator, job);
         fallback.effect = if (job.step.mutation()) .unknown else .not_applicable;
         fallback.process_cleanup_complete = process.cleanup_complete;
@@ -235,6 +334,7 @@ pub const Supervisor = struct {
         if (!process.cleanup_complete) return .{ .value = fallback };
         var lock = try directory.lock(self.io);
         defer lock.close(self.io);
+        Observer.emit(self.observer, .{ .stage = .result_read_begin });
         const readback = directory.read(self.io, self.allocator, "result.json", local.maximum, null) catch |err| switch (err) {
             error.FileNotFound => {
                 try recoverPages(self, directory, job, &fallback);
@@ -245,6 +345,8 @@ pub const Supervisor = struct {
             else => return err,
         };
         defer self.allocator.free(readback);
+        Observer.emit(self.observer, .{ .stage = .result_read_end });
+        Observer.emit(self.observer, .{ .stage = .result_validate_begin });
         const parsed = local.Document(m.Result).load(self.allocator, readback) catch {
             fallback.failures.primary = fallback.failures.primary orelse .{ .stage = .process_run, .category = .invalid_response };
             try recoverPages(self, directory, job, &fallback);
@@ -265,7 +367,9 @@ pub const Supervisor = struct {
             try recordSupervision(self, &lock, job, &fallback);
             return .{ .value = fallback };
         }
+        Observer.emit(self.observer, .{ .stage = .result_validate_end });
         m.merge(&result.failures, process.failures);
+        Observer.emit(self.observer, .{ .stage = .delivery_begin });
         const delivered = blk: {
             if (process.failures.primary != null) break :blk false;
             const ack = local.Document(Ack).load(self.allocator, process.stdout) catch break :blk false;
@@ -278,6 +382,7 @@ pub const Supervisor = struct {
             result.complete = false;
             result.failures.primary = result.failures.primary orelse .{ .stage = .process_run, .category = .invalid_response };
         }
+        Observer.emit(self.observer, .{ .stage = .delivery_end });
         try recordSupervision(self, &lock, job, &result);
         keep = true;
         return .{ .value = result, .document = parsed };
@@ -300,6 +405,8 @@ const Guard = struct {
     }
 };
 fn recordSupervision(self: *Supervisor, lock: *core.private_files.Locked, job: m.Job, result: *m.Result) !void {
+    Observer.emit(self.observer, .{ .stage = .supervision_begin });
+    defer Observer.emit(self.observer, .{ .stage = .supervision_end });
     writeSupervision(self, lock, job, result) catch {
         result.complete = false;
         result.failures.recording = result.failures.recording orelse .{ .stage = .state_record, .category = .local_io };
