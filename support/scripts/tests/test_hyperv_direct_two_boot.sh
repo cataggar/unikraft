@@ -66,6 +66,10 @@ UK_HYPERV_PERSISTENCE_BOOT${boot}_COMPLETE:11111111111111111111111111111111
 HYPERV_PERSISTENCE FINAL PASS rc=0
 main returned 0
 EOF
+		if [[ $scenario == "boot$boot-missing-platform" ]]; then
+			sed '/^UK_HYPERV_PLATFORM_READY$/d' "$root/boot$boot.log" > "$root/without-platform.log"
+			mv "$root/without-platform.log" "$root/boot$boot.log"
+		fi
 	done
 }
 execute() {
@@ -131,7 +135,8 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 	ambiguous-start identity-drift attachment-mismatch serial-failure boot2-writes \
 	cleanup-unowned foreign-resource delete-failure boot1-mutated-before-start \
 	boot1-mutated-after-start boot2-admission-mutated stale-boot1-log cumulative-prefix-drift \
-	running-reserved retained-attached final-attached retained-unattached; do
+	running-reserved retained-attached final-attached retained-unattached \
+	boot1-missing-platform boot2-missing-platform; do
 	fixture "$scenario"
 	if [[ $scenario == cumulative-prefix-drift ]]; then
 		root="$base/$scenario"
@@ -149,6 +154,15 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 	case $scenario in
 		running-reserved|retained-attached|retained-unattached) [[ $starts == 0 ]] ;;
 		final-attached) [[ $starts == 1 ]] ;;
+		boot1-missing-platform|boot2-missing-platform)
+			expected_boots=1
+			[[ $scenario != boot2-missing-platform ]] || expected_boots=2
+			[[ $starts == $((expected_boots - 1)) ]]
+			"$jq" -e --argjson boots "$expected_boots" \
+				'.reserved_boots == $boots and .cleanup_exit == 0' \
+				"$root/attempt/outcome.json" >/dev/null
+			grep -qx 'direct validation failed: PlatformNotReady' "$root/attempt/serial-check.stderr"
+			;;
 	esac
 	[[ $(grep -c '^deployment group ' "$root/calls" || :) -le 1 ]]
 	case $scenario in
