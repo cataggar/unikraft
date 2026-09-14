@@ -698,11 +698,13 @@ jobs:
         set -euo pipefail
         tools="${RUNNER_TEMP}/hyperv-preparation-llvm/bin"
         test -x "${tools}/llvm-readelf"
+        test -x "${tools}/llvm-objcopy"
         echo "${tools}" >> "${GITHUB_PATH}"
 
     - name: Run native Hyper-V preparation and namespace fixtures
       run: |
-        bash support/tools/hyperv/preparation/ci-fixtures.sh
+        bash support/tools/hyperv/preparation/ci-fixtures.sh \
+          --ci-verified-fixture-debug-stripping
 
     - name: Retain bounded preparation fixture evidence
       if: always()
@@ -718,11 +720,19 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-preparation/cleanup.json
           ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-sha256.txt
           ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-copies.tsv
+          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-objcopy-version.txt
+          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-objcopy-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace-cache/**/preparation-namespace
+          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace-cache/**/preparation-namespace-fixture
           ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/fixture-build.log
           ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace-baseline.json
           ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/preparation.log
           ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace.log
           ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/integration.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace-cache/**/preparation-namespace
+          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace-cache/**/preparation-namespace-fixture
           ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/fixture-build.log
           ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace-baseline.json
           ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/preparation.log
@@ -1044,6 +1054,14 @@ jobs:
         umask 077
         root="${RUNNER_TEMP}/hyperv-ci/native-persistence"
         mkdir -p "${root}/restore"
+        objcopy="$(readlink -f "${RUNNER_TEMP}/hyperv-tools/bin/llvm-objcopy")"
+        test -f "${objcopy}"
+        test -x "${objcopy}"
+        "${objcopy}" --version > "${root}/fixture-objcopy-version.txt"
+        test "$(stat -c '%s' "${root}/fixture-objcopy-version.txt")" -le 4096
+        awk -f support/tools/hyperv/preparation/ci-objcopy-version.awk \
+          "${root}/fixture-objcopy-version.txt"
+        sha256sum -- "${objcopy}" > "${root}/fixture-objcopy-sha256.txt"
         cp support/tools/hyperv/persistence/build.zig \
           support/tools/hyperv/persistence/build.zig.zon "${root}/restore/"
         ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
@@ -1056,7 +1074,12 @@ jobs:
               --cache-dir "${root}/${mode}/zig-local-cache" \
               --prefix "${root}/${mode}/out" \
               -Dtest-root="${root}/${mode}/fixtures" \
-              -Doptimize="${mode}" -j2 test test-arm install --summary all
+              -Dstrip-fixture-debug=true -Dfixture-file-relayout=true \
+              "-Dfixture-objcopy=${objcopy}" \
+              "-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json" \
+              -Doptimize="${mode}" -j2 \
+              test test-arm test-strip-equivalence test-strip-proof install --summary all \
+              2>&1 | tee "${root}/${mode}/fixtures.log"
           result=0
           "${root}/${mode}/out/bin/uk-hyperv-persistence-engine" run \
             > "${root}/${mode}/stdout" 2> "${root}/${mode}/stderr" \
@@ -1067,6 +1090,7 @@ jobs:
             '"reason":"production_bindings_unavailable"' \
             "${root}/${mode}/stderr"
         done
+        sha256sum --check "${root}/fixture-objcopy-sha256.txt"
 
     - name: Run native agentless Hyper-V host fixtures
       run: |
@@ -1405,6 +1429,18 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/baseline.log
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/namespace-denial.log
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/fixture-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-version.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/zig-local-cache/**/hyperv-persistence-worker-fixture
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stdout
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stderr
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/zig-local-cache/**/hyperv-persistence-worker-fixture
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stdout
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stderr
           ${{ runner.temp }}/hyperv-ci/image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-disk-sha256.txt

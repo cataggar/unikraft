@@ -4,6 +4,7 @@ umask 077
 
 # Shared-host invocation is forbidden; local mode requires the prepared guest.
 test "$(id -u)" -ne 0
+package=support/tools/hyperv/preparation
 qualify_strip=false
 local_vm=false
 case "$#" in
@@ -11,13 +12,11 @@ case "$#" in
   1)
     case "$1" in
       --qualify-fixture-debug-stripping)
-        if [ "${GITHUB_REPOSITORY:-}" != cataggar/unikraft ] ||
-           [ "${GITHUB_WORKFLOW:-}" != 'Hyper-V fixture debug qualification' ] ||
-           [ "${GITHUB_JOB:-}" != fixture-debug-qualification ] ||
-           [ "${GITHUB_REF:-}" != refs/heads/fleet/zig-hyperv-fixture-strip-qualification ]; then
-          echo 'Fixture stripping is restricted to the explicit qualification workflow' >&2
-          exit 2
-        fi
+        bash "${package}/ci-workflow-context.sh" qualification
+        qualify_strip=true
+        ;;
+      --ci-verified-fixture-debug-stripping)
+        bash "${package}/ci-workflow-context.sh" verified
         qualify_strip=true
         ;;
       --vm-raw-fixtures) local_vm=true ;;
@@ -33,7 +32,6 @@ case "$#" in
     exit 2
     ;;
 esac
-package=support/tools/hyperv/preparation
 if [ "${local_vm}" = true ]; then
   variant=raw
   if [ "${qualify_strip}" = true ]; then variant=qualified; fi

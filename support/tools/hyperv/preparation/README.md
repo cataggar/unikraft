@@ -263,9 +263,9 @@ The separate `Hyper-V fixture debug qualification` workflow is confined to
 `-Dfixture-objcopy=ABS` path to the pinned native LLVM22.1.8 `llvm-objcopy`.
 Zig0.16's advertised ELF-to-ELF objcopy operation is unimplemented. The
 qualification uses LLVM's post-compilation `--strip-debug`, not a compiler
-strip option that might change code generation. Ordinary preparation CI,
-production artifacts, required checks, namespace policy, complete hashing and
-all deadlines are unchanged.
+strip option that might change code generation. Direct build defaults,
+production artifacts, required check names, namespace policy, complete hashing
+and all deadlines are unchanged.
 
 The explicit `-Dfixture-file-relayout=true` qualification option permits only
 validated program-file offset relocation. Its default remains false: stripping
@@ -295,6 +295,23 @@ defaults to `identical_program_headers`; qualification explicitly requests
 `file_offset_relayout`. Version1 and mismatched-policy reports are rejected.
 The trial is synthetic qualification,
 not adoption, runtime authentication, producer admission or a full ledger fit.
+
+### Verified synthetic fixtures in integration CI
+
+The selected `integration` workflow's `zig-hyperv-preparation` job explicitly
+uses `--ci-verified-fixture-debug-stripping` for Debug and ReleaseSafe.
+`ci-workflow-context.sh` checks the selected repository/workflow/job metadata;
+the separate qualification entrypoint retains its branch restriction.
+These checks select fixture behavior, not production or cloud authority.
+The no-argument adapter and direct fixture builds remain raw by default.
+
+The integration job uses the same pinned native LLVM distribution, explicit
+file-offset-relayout policy, mandatory uncached ELF checks, private proof
+consumer and immutable-copy binding as qualification. Exact fresh AppArmor
+denial evidence is still required before installing the scoped fixture
+profiles; global policy and cleanup requirements are unchanged. CI retains
+the raw/candidate cache binaries, proofs, transformer identity and existing
+fixture/cleanup evidence. The reports remain synthetic and not admitted.
 
 ### Prepared local VM fixtures
 

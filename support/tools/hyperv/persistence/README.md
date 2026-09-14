@@ -489,6 +489,23 @@ invocation fails and that report must not be consumed as a successful handoff.
 Neither stripping nor its report establishes 8-MiB/256-MiB ledger fit or any
 production admission.
 
+#### Selected synthetic integration CI
+
+The `integration` workflow's native `zig-hyperv` persistence-fixture step
+explicitly selects verified stripped worker copies in Debug and ReleaseSafe.
+It uses the already acquired pinned LLVM 22.1.8 distribution, an absolute
+objcopy path and explicit file-offset-relayout policy. Version evidence and
+the executable hash are retained, with a final hash recheck.
+
+Each mode runs the engine, affected ARM and shared ELF/proof cases together
+with installation, behind the fresh native verifier and a private per-mode
+report. Raw/candidate cache binaries, reports and fixture logs are retained.
+Timing remains default-off. The installed CLI is not stripped and must still
+refuse with `production_bindings_unavailable`; direct build defaults and all
+runtime hashing, deadlines and production gates remain unchanged. This CI
+selection does not retire the separate legacy controller workflow or confer
+production admission.
+
 #### Focused author checks
 
 Use a process-local `umask 077`; the existing shared fixtures require private

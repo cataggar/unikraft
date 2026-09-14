@@ -3,6 +3,38 @@ set -euo pipefail
 
 package="$(dirname -- "${BASH_SOURCE[0]}")"
 
+check_workflow_context() {
+  local expected="$1" mode="$2" result=0
+  shift 2
+  env -i "PATH=${PATH}" GITHUB_ACTIONS=true GITHUB_REPOSITORY=cataggar/unikraft \
+    "$@" bash "${package}/ci-workflow-context.sh" "${mode}" > /dev/null 2>&1 || result=$?
+  if [ "${result}" -ne "${expected}" ]; then
+    printf 'Unexpected workflow context result %s for %s; expected %s\n' \
+      "${result}" "${mode}" "${expected}" >&2
+    exit 1
+  fi
+}
+verified_context=(GITHUB_WORKFLOW=integration GITHUB_JOB=zig-hyperv-preparation)
+qualification_context=(
+  'GITHUB_WORKFLOW=Hyper-V fixture debug qualification'
+  GITHUB_JOB=fixture-debug-qualification
+  GITHUB_REF=refs/heads/fleet/zig-hyperv-fixture-strip-qualification
+)
+check_workflow_context 0 verified "${verified_context[@]}"
+check_workflow_context 0 qualification "${qualification_context[@]}"
+for mode in verified qualification; do
+  context=("${verified_context[@]}")
+  if [ "${mode}" = qualification ]; then context=("${qualification_context[@]}"); fi
+  for invalid in GITHUB_ACTIONS=false GITHUB_REPOSITORY=other/unikraft \
+    GITHUB_WORKFLOW=other GITHUB_JOB=zig-hyperv; do
+    check_workflow_context 2 "${mode}" "${context[@]}" "${invalid}"
+  done
+done
+check_workflow_context 2 qualification "${qualification_context[@]}" GITHUB_REF=refs/heads/other
+check_workflow_context 2 verified "${qualification_context[@]}"
+check_workflow_context 2 qualification "${verified_context[@]}"
+check_workflow_context 2 unknown "${verified_context[@]}"
+
 jq -nc '
   {
     schema:"unikraft_fixture_vm_v1",authority:"disposable_test_only_not_admitted",
