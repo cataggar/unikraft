@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
         .name = "preparation-process-fixture",
         .root_module = b.createModule(.{ .root_source_file = b.path("process_fixture.zig"), .target = target, .optimize = optimize }),
     });
-    const tests = b.addTest(.{ .root_module = b.createModule(.{
+    const tests = b.addTest(.{ .filters = b.option([]const []const u8, "test-filter", "Run matching native tests; repeat to select multiple groups") orelse &.{}, .root_module = b.createModule(.{
         .root_source_file = b.path("root.zig"),
         .target = target,
         .optimize = optimize,

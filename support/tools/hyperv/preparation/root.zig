@@ -13,6 +13,7 @@ pub const provenance = @import("provenance.zig");
 pub const receipts = @import("receipts.zig");
 pub const inputs = @import("inputs.zig");
 pub const admission = @import("admission.zig");
+pub const production_local = @import("production_local.zig");
 pub const environment = @import("environment.zig");
 pub const namespace = @import("namespace.zig");
 pub const git_entry = @import("git_entry.zig");

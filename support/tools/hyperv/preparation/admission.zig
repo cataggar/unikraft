@@ -167,12 +167,16 @@ pub fn requireEngine(allocator: std.mem.Allocator, io: std.Io, bound: runtime.Bo
         !std.meta.eql(before, try fs.metadata(selected))) return error.UnreviewedInput;
 }
 
-fn verifySource(allocator: std.mem.Allocator, io: std.Io, record: provenance.Record, binding: ProducerSource, digest: c.Sha, deadline: Deadline) !void {
+/// Verify an independently reviewed source/runtime binding before using its Git.
+/// This does not bind the calling executable or confer admission authority.
+pub fn verifySource(allocator: std.mem.Allocator, io: std.Io, record: provenance.Record, binding: ProducerSource, digest: c.Sha, deadline: Deadline) !void {
     try checkDeadline(deadline);
     try fs.requireDirectoryIdentity(binding.repository, binding.provenance_bindings.repository);
     try fs.requireDirectoryIdentity(binding.git.runtime.directory, binding.provenance_bindings.git);
     const actual = try c.canonical(allocator, binding.git.runtime.contract);
+    defer allocator.free(actual);
     const expected = try c.canonical(allocator, record.git);
+    defer allocator.free(expected);
     if (!std.mem.eql(u8, actual, expected)) return error.UnreviewedInput;
     try provenance.verify(allocator, io, record, binding.provenance_bindings, digest);
     try checkDeadline(deadline);

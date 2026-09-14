@@ -23,12 +23,71 @@ facade paths, ELF helpers and pinned native miz are reused. No Python, productio
 shell wrapper, automatic legacy fallback, Azure CLI, credential probing, download
 or failure-message recovery is implemented.
 
+## Production-local embedding seam
+
+`production_local` is a production-only in-process facade for
+`platform_preflight`. It is not an argv/JSON approval resolver, a material
+acquirer, a production controller executable, or a cloud command. The synthetic
+integration driver and existing production CLI refusal defaults are unchanged.
+No wire epoch, Origin policy, image geometry or budget changes are introduced.
+
+A trusted caller supplies an existing `receipts.Context`, complete
+`producer.Inputs`, a held receipt lock, and `Configuration`. Reviews must come
+from an independent selection/review boundary, not hashes freshly measured by
+the facade. The configuration contract requires private, committed file records
+for initial native metadata, an independent solved-config expectation, and its
+native metadata. The live initial config must already exist in the bound
+workspace; there is no nullable initial config, merge, rendering fallback, or
+installation step. Expectations cannot alias the mutable config/output.
+Existing authoritative validation requires x86-64 Hyper-V, the exact guard,
+metadata for every supplied symbol and no conflicting target. It is not a
+Kconfig solver: independent review still selects the complete desired profile.
+
+Call `Facade.prepared`, then `Facade.runProducer` for configure and build with
+separately supplied execution/inspection binding digests. Both complete binding
+digests are checked before any supplied Git can execute. The actual native
+operations, inspection, source checks and failure lanes remain in
+`receipts.Context`. Inspection uses the independently expected solved bytes at
+the actual workspace config path; actual emitted metadata must also match the
+independent expectation byte-for-byte. Each execution binding is durably
+published before its operation, so an error cannot be retried in the same
+receipt root. Do not delete partial publications to retry; a separately reviewed
+fresh run is required. The facade updates its workspace config record only after
+successful receipt publication.
+
+`Facade.package` uses the held producer output and existing native packager.
+`Facade.generate` requires the independent selection and capability-provenance
+reviews, verifies the capability's separately held source/runtime, and uses
+existing `inputs.generate`. All three configuration expectation records must
+have physically matching staged control bindings in the selection; their bytes
+are not exempt from the existing ledger. Generation remains **not admitted**.
+
+Release the generation staging lock, independently review the actual output,
+and call `production_local.load` from the selected importing executable with
+the expected guard and existing `admission.Review`/`Bindings`. The facade does
+not compute that review or replace the importer with the producer. The existing
+loader still binds actual executable identity, all physical source/runtime and
+asset directories, receipts, inspections, origins and the exact ledger. Keep its
+returned lock alive and retain the existing revalidation obligations.
+Provenance, producer-executable and engine-executable commitments stay separate.
+
+This seam alone produces no reviewed material or Azure-ready handoff. A real
+current-source producer/package/input/load run still needs independently
+selected and reviewed physical material, controls, full configuration, and
+applicable production Origin evidence and authority. Cloud, immutable-host and
+operator authority remain separate launch gates, not permissions supplied by
+this local run. Qualification-VM approval does not supply production
+Ubuntu/archive authority.
+
 ## Build and focused fixtures
 
 Use installed Zig 0.16.0, never the repository root build. Put all caches,
 outputs and temporary directories under an explicit fresh preparation scratch.
 The existing dependency cache is read-only through `--system`. These focused
 commands do not authorize dependency restoration or real evidence acquisition.
+The existing `test` target accepts repeatable `-Dtest-filter=...` selectors;
+`-Dtest-filter="production local"` selects the non-producer facade tests.
+Without a selector the existing complete test set is unchanged.
 
 ```sh
 cd /d/unikraft-worktrees/fleet-origin
