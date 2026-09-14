@@ -6,6 +6,7 @@ const a = t.allocator;
 const io = t.io;
 const options = @import("test_options");
 const fixture_log = @import("fixture.zig").log;
+const diagnostics = @import("synthetic_diagnostics");
 
 fn unitConfig() boot.config.Config {
     return .{ .image = "/synthetic/image", .ovmf_code = "/synthetic/code", .ovmf_vars = "/synthetic/vars", .qemu = "/synthetic/qemu", .work_dir = "/synthetic/work", .expect = "Hello world!" };
@@ -232,6 +233,47 @@ const Fixture = struct {
         return core.private_files.Directory.open(io, self.config.work_dir);
     }
 
+    fn storedReport(self: Fixture, work_dir: core.private_files.Directory) ![]const u8 {
+        const alloc = self.arena.allocator();
+        const bytes = try work_dir.read(io, alloc, "report.json", boot.config.max_record, null);
+        const report = try boot.runner.Report.decode(alloc, bytes);
+        return report.encode(alloc);
+    }
+
+    fn emitPhases(self: Fixture, work_dir: core.private_files.Directory) !void {
+        const observation = try diagnostics.read(self.arena.allocator(), io, work_dir);
+        var buffer: [diagnostics.max_log_bytes]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try std.json.Stringify.value(.{
+            .schema_version = @as(u8, 1),
+            .scope = "synthetic_observation_only",
+            .authority = "none",
+            .tail = observation.tail,
+            .records = observation.slice(),
+        }, .{}, &writer);
+        std.debug.print("native local synthetic phases: {s}\n", .{writer.buffered()});
+    }
+
+    fn retainDiagnostics(self: Fixture) void {
+        const work_dir = self.work() catch {
+            std.debug.print("native local synthetic diagnostics: {{\"status\":\"workspace_unavailable\"}}\n", .{});
+            return;
+        };
+        defer work_dir.close(io);
+        self.emitPhases(work_dir) catch |err| {
+            std.debug.print("native local synthetic phases: {{\"status\":\"{s}\"}}\n", .{
+                if (err == error.FileNotFound) "absent" else "invalid_or_unavailable",
+            });
+        };
+        if (self.storedReport(work_dir)) |encoded| {
+            std.debug.print("native local stored report: {s}", .{encoded});
+        } else |err| {
+            std.debug.print("native local stored report: {{\"status\":\"{s}\"}}\n", .{
+                if (err == error.FileNotFound) "absent" else "invalid_or_unavailable",
+            });
+        }
+    }
+
     fn cliArgs(self: Fixture) ![]const []const u8 {
         return self.arena.allocator().dupe([]const u8, &.{
             self.cli,              if (self.config.raw_disk != null) "--raw-disk" else "--image", self.config.source(),
@@ -333,6 +375,7 @@ test "native QEMU fixture validates every argument CPU default and explicit SMP 
         for ([_]bool{ false, true }) |raw_disk| {
             var f = try Fixture.init(0, raw_disk);
             defer f.deinit();
+            errdefer f.retainDiagnostics();
             f.config.cpus = cpus;
             const original = try boot.files.Set.open(io, f.config);
             defer original.close(io);
@@ -364,6 +407,7 @@ test "native QEMU fixture validates every argument CPU default and explicit SMP 
 test "native legacy APIC exactly one CPU" {
     var f = try Fixture.init(0, true);
     defer f.deinit();
+    errdefer f.retainDiagnostics();
     f.config.disable_x2apic = true;
     try t.expect((try f.run()).succeeded());
 }
@@ -371,6 +415,7 @@ test "native legacy APIC exactly one CPU" {
 test "success predicate requires real zero termination and complete nonlimited serial" {
     const f = try Fixture.init(0, true);
     defer f.deinit();
+    errdefer f.retainDiagnostics();
     const good = try f.run();
     try t.expect(good.succeeded());
     var changed = good;
@@ -397,6 +442,7 @@ test "native child nonzero crash missing reordered and prefix-colliding return r
     for ([_]u8{ 1, 2, 6, 10, 11, 12 }) |mode| {
         const f = try Fixture.init(mode, true);
         defer f.deinit();
+        errdefer f.retainDiagnostics();
         const report = try f.run();
         try t.expect(!report.succeeded());
         try t.expect(report.failures.primary != null);
@@ -419,6 +465,7 @@ test "native hard timeout and serial file limit retain bounded evidence" {
     for ([_]u8{ 3, 4 }) |mode| {
         var f = try Fixture.init(mode, true);
         defer f.deinit();
+        errdefer f.retainDiagnostics();
         f.config.timeout_ms = 1200;
         const start = try core.process.monotonicNanoseconds();
         const report = try f.run();
@@ -440,6 +487,7 @@ test "native hard timeout and serial file limit retain bounded evidence" {
 test "native successful leader cannot strand descendant" {
     const f = try Fixture.init(5, true);
     defer f.deinit();
+    errdefer f.retainDiagnostics();
     const report = try f.run();
     try t.expect(report.succeeded());
     const work = try f.work();
@@ -467,6 +515,7 @@ fn cancelAfterInvocation(work: core.private_files.Directory, flag: *std.atomic.V
 test "native cancellation interrupts blocking child and preserves its evidence" {
     var f = try Fixture.init(3, true);
     defer f.deinit();
+    errdefer f.retainDiagnostics();
     f.config.timeout_ms = 8000;
     const work = try f.work();
     defer work.close(io);
@@ -482,6 +531,7 @@ test "native cleanup recording and primary failures remain independent" {
     for ([_]u8{ 7, 8, 14 }) |mode| {
         const f = try Fixture.init(mode, false);
         defer f.deinit();
+        errdefer f.retainDiagnostics();
         const report = try f.run();
         try t.expect(!report.succeeded());
         if (mode == 7 or mode == 14) try t.expect(report.failures.cleanup != null);
@@ -494,6 +544,7 @@ test "native cleanup recording and primary failures remain independent" {
 test "full raw input hash detects writes away from its first byte" {
     const f = try Fixture.init(9, true);
     defer f.deinit();
+    errdefer f.retainDiagnostics();
     const report = try f.run();
     try t.expect(!report.succeeded() and !report.input_unchanged);
     try t.expectEqual(.integrity, report.failures.primary.?.category);
@@ -504,6 +555,7 @@ test "artifact snapshots reject shrinking growing replacement empty and over-lim
     for ([_]u8{ 0, 1, 2 }) |mode| {
         const f = try Fixture.init(0, true);
         defer f.deinit();
+        errdefer f.retainDiagnostics();
         const original = try boot.files.Set.open(io, f.config);
         defer original.close(io);
         if (mode == 2) {
@@ -521,6 +573,7 @@ test "artifact snapshots reject shrinking growing replacement empty and over-lim
     for ([_]i64{ 0, boot.config.max_input + 1 }) |size| {
         const f = try Fixture.init(0, true);
         defer f.deinit();
+        errdefer f.retainDiagnostics();
         const file = try f.directory.dir.openFile(io, "public,source.raw", .{ .mode = .read_write });
         defer file.close(io);
         try t.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.ftruncate(file.handle, size)));
@@ -535,6 +588,7 @@ test "typed child records reject unknown duplicate incomplete malformed and rebo
     for ([_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 }) |mode| {
         const f = try Fixture.init(0, true);
         defer f.deinit();
+        errdefer f.retainDiagnostics();
         const alloc = f.arena.allocator();
         const work = try f.work();
         defer work.close(io);
@@ -576,6 +630,7 @@ test "typed child records reject unknown duplicate incomplete malformed and rebo
 test "pre-cancelled request consumes once without executing QEMU" {
     const f = try Fixture.init(0, true);
     defer f.deinit();
+    errdefer f.retainDiagnostics();
     var cancelled = std.atomic.Value(bool).init(true);
     const report = try boot.runner.run(f.arena.allocator(), io, f.config, .{ .self_executable = f.cli, .cancel = &cancelled });
     try t.expect(report.consumed and !report.succeeded());
@@ -589,6 +644,7 @@ test "pre-cancelled request consumes once without executing QEMU" {
 test "private workspace lock and artifact policy reject unsafe files before execution" {
     const f = try Fixture.init(0, true);
     defer f.deinit();
+    errdefer f.retainDiagnostics();
     const work = try f.work();
     defer work.close(io);
     var lock = try work.lock(io);
@@ -620,6 +676,7 @@ test "actual CLI serializes public-only success and failure without paths or log
     for ([_]u8{ 0, 1 }) |mode| {
         var f = try Fixture.init(mode, true);
         defer f.deinit();
+        errdefer f.retainDiagnostics();
         f.config.cpus = 2;
         var env: std.process.Environ.Map = .init(a);
         defer env.deinit();
@@ -633,6 +690,7 @@ test "actual CLI serializes public-only success and failure without paths or log
         });
         defer a.free(result.stdout);
         defer a.free(result.stderr);
+        try t.expect(result.term == .exited);
         try t.expectEqual(@as(u8, if (mode == 0) 0 else 1), result.term.exited);
         try t.expectEqual(@as(usize, 0), result.stderr.len);
         for ([_][]const u8{ f.path, "SYNTHETIC_SECRET", "Hello world!", "synthetic stderr" }) |forbidden|
@@ -650,6 +708,7 @@ test "actual CLI expected nonzero guest return and repeated marker flags reach v
     for ([_]bool{ false, true }) |forbidden| {
         const f = try Fixture.init(11, true);
         defer f.deinit();
+        errdefer f.retainDiagnostics();
         const args = try std.mem.concat(f.arena.allocator(), []const u8, &.{
             try f.cliArgs(),
             &.{ "--expect-main-return", "10", "--require-marker", "at GPA", "--require-marker", "synthetic IRQs" },
@@ -666,6 +725,7 @@ test "actual CLI expected nonzero guest return and repeated marker flags reach v
         });
         defer a.free(result.stdout);
         defer a.free(result.stderr);
+        try t.expect(result.term == .exited);
         try t.expectEqual(@as(u8, if (forbidden) 1 else 0), result.term.exited);
         if (forbidden) {
             const work = try f.work();
@@ -680,6 +740,7 @@ test "actual CLI expected nonzero guest return and repeated marker flags reach v
 test "actual CLI refuses missing source invalid flags and standalone worker" {
     const f = try Fixture.init(0, true);
     defer f.deinit();
+    errdefer f.retainDiagnostics();
     for ([_][]const []const u8{ &.{}, &.{"--fixture-mode"}, &.{ "--qemu", "SYNTHETIC_SECRET" }, &.{"--exec"} }) |extra| {
         const args = try std.mem.concat(a, []const u8, &.{ &.{f.cli}, extra });
         defer a.free(args);
@@ -704,6 +765,7 @@ test "actual CLI rejects invalid CPU conflicting sources and legacy SMP before w
     for ([_]u8{ 0, 9, 2 }) |cpus| {
         var f = try Fixture.init(0, true);
         defer f.deinit();
+        errdefer f.retainDiagnostics();
         f.config.cpus = cpus;
         const argv = try f.cliArgs();
         const args = if (cpus == 2) try std.mem.concat(f.arena.allocator(), []const u8, &.{ argv, &.{"--disable-x2apic"} }) else argv;
@@ -725,6 +787,7 @@ test "actual CLI rejects invalid CPU conflicting sources and legacy SMP before w
     }
     const f = try Fixture.init(0, true);
     defer f.deinit();
+    errdefer f.retainDiagnostics();
     const argv = try f.cliArgs();
     const args = try std.mem.concat(f.arena.allocator(), []const u8, &.{ argv, &.{ "--image", f.config.source() } });
     var env: std.process.Environ.Map = .init(a);
@@ -736,4 +799,173 @@ test "actual CLI rejects invalid CPU conflicting sources and legacy SMP before w
     const work = try f.work();
     defer work.close(io);
     try t.expectError(error.FileNotFound, work.openFile(io, "request.json"));
+}
+
+test "synthetic phase codec bounds partial writes malformed records and authority" {
+    var bytes: [diagnostics.max_bytes]u8 = undefined;
+    inline for (@typeInfo(diagnostics.Phase).@"enum".fields, 0..) |field, index| {
+        const record = try diagnostics.Record.observe(@enumFromInt(field.value), std.math.maxInt(u64));
+        @memcpy(bytes[index * diagnostics.slot_size ..][0..diagnostics.slot_size], &try record.encode());
+    }
+    const complete = try diagnostics.decode(a, &bytes);
+    try t.expectEqual(diagnostics.slot_count, complete.count);
+    try t.expectEqual(.aligned_prefix, complete.tail);
+    const partial = try diagnostics.decode(a, bytes[0 .. 2 * diagnostics.slot_size + 17]);
+    try t.expectEqual(@as(usize, 2), partial.count);
+    try t.expectEqual(.partial_slot, partial.tail);
+    try t.expectEqual(@as(usize, 0), (try diagnostics.decode(a, &.{})).count);
+    try t.expectError(error.DiagnosticTooLarge, diagnostics.decode(a, &([_]u8{0} ** (diagnostics.max_bytes + 1))));
+    bytes[2 * diagnostics.slot_size] = '!';
+    const malformed = try diagnostics.decode(a, &bytes);
+    try t.expectEqual(@as(usize, 2), malformed.count);
+    try t.expectEqual(.invalid_slot, malformed.tail);
+    const json = std.mem.trimEnd(u8, bytes[0..diagnostics.slot_size], "\x00");
+    if (boot.runner.Report.decode(a, json)) |_| return error.DiagnosticGrantedAuthority else |_| {}
+    const injected = try std.mem.replaceOwned(u8, a, json, "\"none\"", "\"SYNTHETIC_SECRET\"");
+    defer a.free(injected);
+    var invalid = [_]u8{0} ** diagnostics.slot_size;
+    @memcpy(invalid[0..injected.len], injected);
+    const rejected = try diagnostics.decode(a, &invalid);
+    try t.expectEqual(@as(usize, 0), rejected.count);
+    try t.expectEqual(.invalid_slot, rejected.tail);
+    const encoded = try std.json.Stringify.valueAlloc(a, rejected.slice(), .{});
+    defer a.free(encoded);
+    try t.expect(std.mem.indexOf(u8, encoded, "SYNTHETIC_SECRET") == null);
+}
+
+test "synthetic sampling preserves the exact local boot flat v1 wire and bounds" {
+    const record: diagnostics.Record = .{
+        .phase = .artifact_hash_begin,
+        .backend = .stage2_llvm,
+        .arch = .aarch64,
+        .optimize = .Debug,
+        .aarch64_sha2 = true,
+        .x86_sha = false,
+        .x86_avx2 = false,
+        .fixture_bytes = 1234,
+        .monotonic_ns = 2000,
+        .process_cpu_ns = 1000,
+    };
+    const bytes = try record.encode();
+    try t.expectEqualStrings(
+        "{\"schema_version\":1,\"scope\":\"synthetic_observation_only\",\"authority\":\"none\",\"phase\":\"artifact_hash_begin\",\"backend\":\"stage2_llvm\",\"arch\":\"aarch64\",\"optimize\":\"Debug\",\"aarch64_sha2\":true,\"x86_sha\":false,\"x86_avx2\":false,\"fixture_bytes\":1234,\"monotonic_ns\":2000,\"process_cpu_ns\":1000}\n",
+        std.mem.trimEnd(u8, &bytes, "\x00"),
+    );
+    try t.expectEqual(@as(usize, 8), diagnostics.slot_count);
+    try t.expectEqual(@as(usize, 4096), diagnostics.max_bytes);
+    try t.expectEqual(@as(usize, 4352), diagnostics.max_log_bytes);
+    const phases = [_]diagnostics.Phase{ .artifact_hash_begin, .artifact_hash_end, .firmware_copy_begin, .firmware_copy_end, .final_verify_begin, .final_verify_end, .exec_handoff, .mock_entry };
+    for (phases, 0..) |phase, index| try t.expectEqual(index, @intFromEnum(phase));
+}
+
+test "synthetic native phase times sizes serial separation and teardown" {
+    const name = block: {
+        const f = try Fixture.init(0, true);
+        defer f.deinit();
+        errdefer f.retainDiagnostics();
+        const report = try f.run();
+        try t.expect(report.succeeded());
+        const work = try f.work();
+        defer work.close(io);
+        const metadata = try work.openFile(io, diagnostics.file_name);
+        defer metadata.close(io);
+        try t.expectEqual(@as(u64, diagnostics.max_bytes), (try core.private_files.snapshot(metadata)).size);
+        const observed = try diagnostics.read(a, io, work);
+        try t.expectEqual(diagnostics.slot_count, observed.count);
+        try t.expectEqual(.aligned_prefix, observed.tail);
+        const executable = try core.private_files.openAbsolute(io, f.config.qemu, .artifact);
+        defer executable.close(io);
+        const size = (try core.private_files.snapshot(executable)).size;
+        const expected = try diagnostics.Record.observe(.mock_entry, size);
+        for (observed.slice()) |record| {
+            try t.expectEqual(size, record.fixture_bytes);
+            try t.expectEqual(expected.backend, record.backend);
+            try t.expectEqual(expected.arch, record.arch);
+            try t.expectEqual(expected.optimize, record.optimize);
+            try t.expectEqual(expected.aarch64_sha2, record.aarch64_sha2);
+            try t.expectEqual(expected.x86_sha, record.x86_sha);
+            try t.expectEqual(expected.x86_avx2, record.x86_avx2);
+            try t.expect(record.monotonic_ns > 0 and record.process_cpu_ns > 0);
+            try t.expectEqual(.none, record.authority);
+        }
+        try t.expectError(error.DiagnosticPhaseOrder, diagnostics.mockEntry(io, work));
+        const serial = try work.read(io, a, boot.config.log_name, boot.config.max_serial, null);
+        defer a.free(serial);
+        try t.expect(std.mem.indexOf(u8, serial, "synthetic_observation_only") == null);
+        try t.expect(std.mem.indexOf(u8, serial, "monotonic_ns") == null);
+        const saved = try f.storedReport(work);
+        try t.expectEqualStrings(try report.encode(f.arena.allocator()), saved);
+        try t.expect(std.mem.indexOf(u8, saved, "monotonic_ns") == null);
+        break :block try a.dupe(u8, f.name);
+    };
+    defer a.free(name);
+    const root = try core.private_files.Directory.open(io, options.test_root.?);
+    defer root.close(io);
+    try t.expectError(error.FileNotFound, root.dir.openDir(io, name, .{}));
+}
+
+test "synthetic writers refuse reuse phase overflow and oversized metadata never admits work" {
+    const f = try Fixture.init(0, true);
+    defer f.deinit();
+    errdefer f.retainDiagnostics();
+    const work = try f.work();
+    defer work.close(io);
+    var trace = try diagnostics.Trace.create(io, work, 1234);
+    defer trace.close(io);
+    try t.expectError(error.PathAlreadyExists, diagnostics.Trace.create(io, work, 1234));
+    try t.expectError(error.DiagnosticPhaseOrder, trace.mark(io, .artifact_hash_end));
+    inline for (@typeInfo(diagnostics.Phase).@"enum".fields[0 .. diagnostics.slot_count - 1]) |field|
+        try trace.mark(io, @enumFromInt(field.value));
+    try t.expectError(error.DiagnosticPhaseOrder, trace.mark(io, .exec_handoff));
+    try trace.file.writePositionalAll(io, "!", diagnostics.max_bytes);
+    try t.expectError(error.FileTooLarge, diagnostics.read(a, io, work));
+    try t.expectError(error.WorkspaceConsumed, f.run());
+    try t.expectError(error.FileNotFound, work.openFile(io, "request.json"));
+    try t.expectError(error.FileNotFound, work.openFile(io, "launched"));
+    try work.dir.writeFile(io, .{
+        .sub_path = "report.json",
+        .data = "SYNTHETIC_SECRET is not a stored report",
+        .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) },
+    });
+    if (f.storedReport(work)) |_| return error.AcceptedInvalidStoredReport else |_| {}
+    f.retainDiagnostics();
+}
+
+test "synthetic CLI failure retention reads stored JSON without consulting failed streams" {
+    const f = try Fixture.init(1, true);
+    defer f.deinit();
+    errdefer f.retainDiagnostics();
+    var environment: std.process.Environ.Map = .init(a);
+    defer environment.deinit();
+    const result = try std.process.run(a, io, .{
+        .argv = try f.cliArgs(),
+        .cwd = .{ .dir = f.directory.dir },
+        .environ_map = &environment,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(result.stdout);
+    defer a.free(result.stderr);
+    try t.expect(result.term == .exited);
+    try t.expectEqual(@as(u8, 1), result.term.exited);
+    const work = try f.work();
+    defer work.close(io);
+    const report = try boot.runner.Report.decode(a, try f.storedReport(work));
+    try t.expect(!report.succeeded() and report.cleanup_complete and report.serial_valid);
+    try t.expectEqual(.child_failed, report.failures.primary.?.category);
+    try t.expectEqual(@as(u8, 19), report.termination.?.exited);
+    try t.expectEqual(diagnostics.slot_count, (try diagnostics.read(a, io, work)).count);
+    f.retainDiagnostics();
+}
+
+test "installed production CLI and plain native fixture have no diagnostic seam" {
+    var f = try Fixture.init(0, true);
+    defer f.deinit();
+    errdefer f.retainDiagnostics();
+    f.cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.production_cli, f.arena.allocator());
+    f.config.qemu = try std.Io.Dir.cwd().realPathFileAlloc(io, options.plain_fixture, f.arena.allocator());
+    try t.expect((try f.run()).succeeded());
+    const work = try f.work();
+    defer work.close(io);
+    try t.expectError(error.FileNotFound, work.openFile(io, diagnostics.file_name));
 }

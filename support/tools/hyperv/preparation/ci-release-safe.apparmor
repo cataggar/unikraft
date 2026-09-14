@@ -1,0 +1,6 @@
+abi <abi/4.0>,
+
+# Separate fixed executable because the fixture has a baked workspace.
+profile unikraft-hyperv-preparation-ci-release-safe /var/lib/unikraft-hyperv-preparation-ci/namespace-fixture-release-safe flags=(unconfined) {
+  userns,
+}

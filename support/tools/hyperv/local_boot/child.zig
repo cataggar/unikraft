@@ -4,6 +4,9 @@ const core = @import("hyperv_core");
 const c = @import("config.zig");
 const files = @import("files.zig");
 const runner = @import("runner.zig");
+const synthetic_diagnostics = @hasDecl(@import("root"), "local_boot_synthetic_diagnostics") and
+    @import("root").local_boot_synthetic_diagnostics;
+const diagnostics = if (synthetic_diagnostics) @import("synthetic_diagnostics") else void;
 
 pub fn arguments(a: std.mem.Allocator, config: c.Config, raw_size: u64, raw_fd: linux.fd_t) ![]const []const u8 {
     try config.validate();
@@ -86,11 +89,18 @@ pub fn execute(init: std.process.Init) !void {
     if (linux.errno(linux.fcntl(log.handle, linux.F.SETFL, @as(u32, @bitCast(append)))) != .SUCCESS or
         linux.errno(linux.dup3(log.handle, 1, 0)) != .SUCCESS or
         linux.errno(linux.dup3(log.handle, 2, 0)) != .SUCCESS) return error.RedirectFailed;
+    var trace: if (synthetic_diagnostics) diagnostics.Trace else void =
+        if (synthetic_diagnostics) try diagnostics.Trace.create(io, work, request.pins[3].size) else {};
+    defer if (synthetic_diagnostics) trace.close(io);
+    if (synthetic_diagnostics) try trace.mark(io, .artifact_hash_begin);
     const artifacts = try files.Set.open(io, request.config);
     defer artifacts.close(io);
     if (!std.meta.eql(artifacts.pins(), request.pins)) return error.ArtifactChanged;
+    if (synthetic_diagnostics) try trace.mark(io, .artifact_hash_end);
+    if (synthetic_diagnostics) try trace.mark(io, .firmware_copy_begin);
     try files.copy(io, artifacts.items[1], work.dir, "OVMF_CODE.fd");
     try files.copy(io, artifacts.items[2], work.dir, "OVMF_VARS.fd");
+    if (synthetic_diagnostics) try trace.mark(io, .firmware_copy_end);
     var raw_fd: linux.fd_t = -1;
     defer if (raw_fd >= 0) {
         _ = linux.close(raw_fd);
@@ -114,10 +124,13 @@ pub fn execute(init: std.process.Init) !void {
     defer environment.deinit();
     try environment.put("TMPDIR", request.config.work_dir);
     const env = try environment.createPosixBlock(a, .{ .zig_progress_fd = -1 });
+    if (synthetic_diagnostics) try trace.mark(io, .final_verify_begin);
     try artifacts.verify(io, request.config);
+    if (synthetic_diagnostics) try trace.mark(io, .final_verify_end);
     const no_core: linux.rlimit = .{ .cur = 0, .max = 0 };
     if (linux.errno(linux.setrlimit(.FSIZE, &limit)) != .SUCCESS or
         linux.errno(linux.setrlimit(.CORE, &no_core)) != .SUCCESS) return error.LimitFailed;
+    if (synthetic_diagnostics) try trace.mark(io, .exec_handoff);
     _ = linux.execveat(artifacts.items[3].file.handle, "", argv.ptr, env.slice.ptr, .{ .EMPTY_PATH = true, .SYMLINK_NOFOLLOW = true });
     return error.ExecFailed;
 }

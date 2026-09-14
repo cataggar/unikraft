@@ -3,6 +3,9 @@ const std = @import("std");
 const core = @import("hyperv_core");
 const p = @import("root.zig");
 const f = @import("fixture_support.zig");
+const timing = @import("fixture_timing.zig");
+const options = @import("fixture_options");
+pub const persistence_timing_fixture = true;
 
 pub fn main(init: std.process.Init) void {
     run(init) catch {
@@ -11,14 +14,20 @@ pub fn main(init: std.process.Init) void {
     };
 }
 fn run(init: std.process.Init) !void {
+    var trace: ?timing.Child = if (options.persistence_timing) timing.Child.start(init.io) else null;
+    defer if (trace) |*value| value.close();
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 2 or !std.mem.eql(u8, args[1], "__persistence-worker")) return error.InvalidArguments;
-    var context = Context{ .allocator = std.heap.page_allocator, .io = init.io };
-    try p.worker.child(context.allocator, init.io, .{ .context = &context, .executeFn = Context.execute });
+    var context = Context{ .allocator = std.heap.page_allocator, .io = init.io, .observer = if (trace) |*value| value.observer() else null };
+    const backend: p.worker.Backend = .{ .context = &context, .executeFn = Context.execute };
+    if (trace) |*value| {
+        try p.worker.childObserved(context.allocator, init.io, backend, value.observer());
+    } else try p.worker.child(context.allocator, init.io, backend);
 }
 const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
+    observer: ?p.worker.Observer = null,
     fn execute(context: *anyopaque, job: p.model.Job, directory: core.private_files.Directory, lock: *core.private_files.Locked) !p.model.Result {
         const self: *Context = @ptrCast(@alignCast(context));
         const raw = try directory.read(self.io, self.allocator, "fixture-mode", 64, null);
@@ -56,6 +65,7 @@ const Context = struct {
             try report.write(&writer);
             if ((try lock.createImmutable(self.io, transfer.job.state_name, writer.buffered())).status != .durable)
                 return error.RecordingFailed;
+            p.worker.Observer.emit(self.observer, .{ .stage = .child_fixture_checkpoint });
             std.process.exit(9);
         }
         if (job.step == .data_upload and mode == .block_upload) {
@@ -82,12 +92,16 @@ const Context = struct {
         if ((job.step == .data_upload and mode == .malformed_output) or
             (job.step == .os_create and (mode == .malformed_create or mode == .replaced_after_create)))
         {
+            p.worker.Observer.emit(self.observer, .{ .stage = .child_fixture_result_begin });
             const bytes = try p.local.encode(self.allocator, result);
             defer self.allocator.free(bytes);
             const saved = try lock.createImmutable(self.io, "result.json", bytes);
             if (saved.status != .durable) return error.RecordingFailed;
+            p.worker.Observer.emit(self.observer, .{ .stage = .child_fixture_result_end });
+            p.worker.Observer.emit(self.observer, .{ .stage = .child_fixture_ack_begin });
             var stdout = std.Io.File.stdout().writer(self.io, &.{});
             try stdout.interface.writeAll("{\"not-a-worker-ack\":true}\n");
+            p.worker.Observer.emit(self.observer, .{ .stage = .child_fixture_ack_end });
             std.process.exit(0);
         }
         return result;
