@@ -791,6 +791,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             "plat/hyperv/time.c",
             "drivers/hyperv/vmbus/Makefile.uk",
             "drivers/hyperv/vmbus/include/uk/vmbus.h",
+            "drivers/hyperv/vmbus/include/uk/vmbus_storage.h",
             "drivers/hyperv/vmbus/vmbus_bus.c",
             "drivers/hyperv/vmbus/vmbus_channel.c",
             "drivers/hyperv/vmbus/vmbus_protocol.h",
@@ -837,6 +838,7 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
 
     def test_guarded_matcher_mutations_fail_before_packaging(self):
         mutation_targets = (
+            "drivers/hyperv/vmbus/include/uk/vmbus_storage.h",
             "drivers/hyperv/vmbus/vmbus_protocol.zig",
             "drivers/hyperv/vmbus/vmbus_protocol.h",
             "drivers/hyperv/vmbus/vmbus_channel.c",
