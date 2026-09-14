@@ -156,9 +156,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "9f656ca52135bfaf55873f95893c7ec60c4f9368488f253f1efe67d7266b2db9"
+            "8e2bdc3ad492b372531f60f646f1b3736a045a0e63bda0ddf889d09b47b7d5c3"
         ),
-        "size": 1757372,
+        "size": 1757720,
         "files": 215,
     },
     "support/kconfig": {
@@ -685,7 +685,7 @@ GUARDED_PRODUCER_FILES = {
         "50e0dbc21c583d0bd7711cf928320574e4ade118d36def3d58fce9353af9efd4"
     ),
     "support/apps/hyperv-acceptance/persistence.c": (
-        "29cffe739b7c908a93afb55515f9e33e7cffd34633a639aa732b07a6cad23900"
+        "2393e8c46d83508c77a709036eb1cf5d249ee40ae87c9c5eaad0532ec6d1a363"
     ),
     "support/apps/hyperv-acceptance/persistence.h": (
         "8ef53f9ed76286b945212ea487bed1e6d51ec161078d4a2283f9054b962bd70f"
