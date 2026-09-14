@@ -23,6 +23,7 @@
 #include <uk/vmbus.h>
 
 #include "storvsc_core.h"
+#include "../vmbus/include/uk/vmbus_storage.h"
 
 #define DRIVER_NAME			"hyperv-storvsc"
 #define STORVSC_PAGE_SIZE		4096U
@@ -148,6 +149,8 @@ struct storvsc_device {
 	struct vmbus_channel *deferred_channel;
 	__u64 deferred_vmbus_epoch;
 	__u64 deferred_close_deadline;
+	__u64 binding_quiesce_epoch;
+	int discovery_quarantine_error;
 };
 
 struct storvsc_unresolved_offer {
@@ -929,6 +932,8 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 
 	if (!channel)
 		return -ENODEV;
+	if (storvsc_core_active_count(device->core))
+		return -EBUSY;
 	rc = storvsc_core_prepare_scsi(device->core, spec,
 				       ukplat_monotonic_clock(), &tx);
 	if (rc)
@@ -951,8 +956,7 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 		if (rc == -EAGAIN) {
 			(void)storvsc_core_tick(device->core,
 				ukplat_monotonic_clock(), &event);
-			if (event.kind == STORVSC_EVENT_REQUEST_TIMEOUT &&
-			    event.transaction_id == tx.transaction_id)
+			if (event.kind == STORVSC_EVENT_REQUEST_TIMEOUT)
 				return -ETIMEDOUT;
 			if (event.kind == STORVSC_EVENT_INITIALIZATION_FAILED ||
 			    event.kind == STORVSC_EVENT_PROTOCOL_ERROR)
@@ -1717,7 +1721,8 @@ static int storvsc_submit(struct uk_blkdev *blkdev,
 		return -EINVAL;
 	}
 	if (storvsc_guarded_io_enabled) {
-		if (lun->session_state == STORVSC_SESSION_NONE ||
+		if (vmbus_storage_binding_status() ||
+		    lun->session_state == STORVSC_SESSION_NONE ||
 		    lun->session_topology_generation !=
 			    __atomic_load_n(&storvsc_topology_generation,
 					    __ATOMIC_ACQUIRE) ||
@@ -2193,6 +2198,7 @@ storvsc_collect_mappings(struct storvsc_lun **entries,
 		if (unresolved &&
 		    (device->binding || device->recovering ||
 		     device->removing || device->fatal_error ||
+		     device->discovery_quarantine_error ||
 		     (!device->online && device->vmbus_device) ||
 		     device->deferred_action != STORVSC_DEFER_NONE))
 			*unresolved = 1;
@@ -2332,7 +2338,8 @@ int uk_storvsc_inventory_get(
 			&storvsc_topology_generation, __ATOMIC_ACQUIRE);
 		if (before == UINT64_MAX)
 			return -EOVERFLOW;
-		unresolved = storvsc_has_unresolved_offer();
+		unresolved = storvsc_has_unresolved_offer() ||
+			vmbus_storage_binding_status();
 		count = storvsc_collect_mappings(
 			entries, CONFIG_LIBSTORVSC_MAX_DEVICES *
 					 CONFIG_LIBSTORVSC_MAX_LUNS,
@@ -2340,7 +2347,7 @@ int uk_storvsc_inventory_get(
 		after = __atomic_load_n(
 			&storvsc_topology_generation, __ATOMIC_ACQUIRE);
 		if (before == after) {
-			if (unresolved)
+			if (unresolved || vmbus_storage_binding_status())
 				return -EAGAIN;
 			snapshot->version =
 				UK_STORVSC_INVENTORY_SNAPSHOT_VERSION;
@@ -2351,6 +2358,43 @@ int uk_storvsc_inventory_get(
 		}
 	}
 	return -EAGAIN;
+}
+
+int uk_storvsc_discovery_status(void)
+{
+	struct uk_storvsc_inventory_snapshot inventory;
+	unsigned long flags;
+	unsigned int i;
+	int error = vmbus_storage_binding_status();
+
+	if (error)
+		return error;
+	ukplat_spin_lock_irqsave(&storvsc_topology_lock, flags);
+	if (storvsc_unresolved_offer_overflow) {
+		error = -ENOSPC;
+	} else {
+		for (i = 0; i < CONFIG_LIBSTORVSC_MAX_DEVICES; i++) {
+			const struct storvsc_unresolved_offer *offer =
+				&storvsc_unresolved_offers[i];
+
+			if (!offer->active)
+				continue;
+			error = offer->error;
+			if (error != -EAGAIN)
+				break;
+		}
+	}
+	ukplat_spin_unlock_irqrestore(&storvsc_topology_lock, flags);
+	if (!error) {
+		for (i = 0; i < CONFIG_LIBSTORVSC_MAX_DEVICES; i++) {
+			error = __atomic_load_n(
+				&storvsc_devices[i].discovery_quarantine_error,
+				__ATOMIC_ACQUIRE);
+			if (error)
+				break;
+		}
+	}
+	return error ? error : uk_storvsc_inventory_get(&inventory);
 }
 
 int uk_storvsc_inventory_pristine_empty(
@@ -2378,6 +2422,7 @@ int uk_storvsc_inventory_pristine_empty(
 	ukplat_spin_lock_irqsave(&storvsc_topology_lock, flags);
 	if (storvsc_storage_lifetime_observed ||
 	    vmbus_storage_offer_lifetime_observed() ||
+	    vmbus_storage_binding_status() ||
 	    storvsc_topology_generation_exhausted ||
 	    storvsc_topology_generation !=
 		    UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION ||
@@ -2561,6 +2606,8 @@ int uk_storvsc_session_begin_read(
 	    snapshot->mapping.controller_index >=
 		    CONFIG_LIBSTORVSC_MAX_DEVICES)
 		return -EINVAL;
+	if (vmbus_storage_binding_status())
+		return -ESTALE;
 	device = &storvsc_devices[snapshot->mapping.controller_index];
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
@@ -2626,13 +2673,23 @@ int uk_storvsc_session_authorize_write(struct uk_storvsc_session *session)
 	struct storvsc_device *device;
 	struct storvsc_lun *lun;
 	unsigned long flags;
+	int discovery_error;
 	int rc;
 
 	if (!storvsc_guarded_io_enabled)
 		return -ENOTSUP;
+	discovery_error = uk_storvsc_discovery_status();
 	rc = storvsc_session_lock(session, &device, &lun, &flags);
 	if (rc)
 		return rc;
+	if (discovery_error) {
+		rc = discovery_error;
+		goto out;
+	}
+	if (vmbus_storage_binding_status()) {
+		rc = -ESTALE;
+		goto out;
+	}
 	if (lun->media.read_only) {
 		rc = -EROFS;
 		goto out;
@@ -2700,6 +2757,8 @@ int uk_storvsc_session_validate(
 	memset(snapshot, 0, sizeof(*snapshot));
 	if (!storvsc_guarded_io_enabled)
 		return -ENOTSUP;
+	if (vmbus_storage_binding_status())
+		return -ESTALE;
 	rc = storvsc_session_lock(session, &device, &lun, &flags);
 	if (rc)
 		return rc;
@@ -2787,7 +2846,9 @@ storvsc_reserve_controller(struct vmbus_device *vmbus_device,
 	}
 	*device_out = device;
 	ukplat_spin_lock_irqsave(&device->lock, device_flags);
-	if (device->deferred_action != STORVSC_DEFER_NONE ||
+	if (device->discovery_quarantine_error)
+		rc = device->discovery_quarantine_error;
+	else if (device->deferred_action != STORVSC_DEFER_NONE ||
 	    device->finish_active || device->notify_active)
 		rc = -EAGAIN;
 	else if (!device->binding && !device->online &&
@@ -2991,6 +3052,7 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 		rc = -ENODEV;
 		goto failed;
 	}
+	device->binding_quiesce_epoch = vmbus_connection_quiesce_epoch();
 	rc = storvsc_send_initialization(device);
 	if (rc)
 		goto failed;
@@ -3034,6 +3096,8 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 				  ": controller%u %u:%u:%u discovery failed: %d\n",
 				  device->index, address->path_id,
 				  address->target_id, address->lun, rc);
+			if (storvsc_core_active_count(device->core))
+				goto failed_registered;
 			continue;
 		}
 		if (!capacity.sectors || capacity.sectors > SIZE_MAX ||
@@ -3091,7 +3155,8 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 		storvsc_note_unresolved_offer(
 			&vmbus_device->instance_id,
 			vmbus_device->channel_id,
-			bind_token.device_generation, first_error);
+			bind_token.device_generation,
+			first_error == -EAGAIN ? -EIO : first_error);
 		uk_pr_err(DRIVER_NAME
 			  ": controller%u inventory unresolved: %d\n",
 			  device->index, first_error);
@@ -3140,8 +3205,39 @@ failed:
 		&vmbus_device->instance_id,
 		vmbus_device->channel_id,
 		bind_token.device_generation, rc);
-	if (storvsc_channel_get(device))
-		(void)storvsc_close_channel(device);
+	{
+		struct storvsc_event event;
+		struct uk_blkreq *request;
+		int owned = storvsc_core_active_count(device->core) != 0;
+		int close_rc = -ENODEV;
+		int quiesced;
+
+		if (storvsc_channel_get(device))
+			close_rc = storvsc_close_channel(device);
+		quiesced = !close_rc ||
+			vmbus_connection_quiesce_epoch() !=
+				device->binding_quiesce_epoch;
+		if (owned && !quiesced) {
+			/*
+			 * Initial discovery has no timeout worker. Retain its
+			 * static request/GPA buffers and identity for the boot;
+			 * a failed close is not a GPADL teardown proof.
+			 */
+			ukplat_spin_lock_irqsave(&device->lock, flags);
+			__atomic_store_n(&device->discovery_quarantine_error,
+				rc && rc != -EAGAIN ? rc : -EIO, __ATOMIC_RELEASE);
+			ukplat_spin_unlock_irqrestore(&device->lock, flags);
+			identity_committed = 1;
+			storvsc_fail_connection();
+		} else if (owned) {
+			ukplat_spin_lock_irqsave(&device->lock, flags);
+			(void)storvsc_core_cancel_all(device->core, rc);
+			while (!storvsc_take_completion_locked(
+				       device, &request, &event))
+				;
+			ukplat_spin_unlock_irqrestore(&device->lock, flags);
+		}
+	}
 	ukplat_spin_lock_irqsave(&device->lock, flags);
 	device->online = 0;
 	if (!allocated_identity || identity_committed)
@@ -3367,6 +3463,16 @@ static struct vmbus_driver storvsc_driver = {
 VMBUS_DRIVER_REGISTER(&storvsc_driver);
 
 #ifdef STORVSC_HOST_TEST
+unsigned int storvsc_host_discovery_owned(unsigned int controller)
+{
+	return storvsc_core_active_count(storvsc_devices[controller].core);
+}
+
+int storvsc_host_discovery_quarantined(unsigned int controller)
+{
+	return storvsc_devices[controller].discovery_quarantine_error;
+}
+
 struct vmbus_driver *storvsc_host_driver(void)
 {
 	return &storvsc_driver;

@@ -5,7 +5,8 @@ Hyper-V guest. Its default configuration preserves the lightweight hardware
 smoke:
 
 - inventory VMBus offers and bound StorVSC/NetVSC devices;
-- read only OS-disk LBAs 0 and 1 and require MBR plus primary GPT signatures;
+- select the unique LUN 0 OS candidate independently of registration order,
+  read only LBAs 0 and 1, and require MBR plus primary GPT signatures;
 - send a checksummed raw DHCP Discover and accept one bounded, validated Offer;
 - emit `HYPERV_ACCEPTANCE ... PASS|FAIL|UNAVAILABLE` serial markers.
 
@@ -253,29 +254,37 @@ compatibility name.
 
 `CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y` replaces the ordinary probe with a
 destructive workload that is valid only for a disposable, run-owned data disk.
-Generate the private seed and matching Kconfig fragment before the one final
-guest image build:
+For the bounded direct-Azure #89 lane, retain the **original** private seed,
+run ID, disk ID, and matching configuration. Do not generate a replacement,
+reseed after Boot 1, or enroll a different disk to retry a failed run. The
+selected native image build consumes the existing configuration with:
 
-```sh
-python3 support/scripts/hyperv-storage-manifest.py \
-  --output-prefix "$PWD/.d/persistence/run" \
-  --identity-policy seed-enrollment-v2 \
-  --sectors 262144 --lun 1 --fixed-vhd
-cat .d/persistence/run.config >> support/apps/hyperv-acceptance/.config
+```text
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=8388608
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=7
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID="<original 32 lowercase hex digits>"
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID="<original 32 lowercase hex digits>"
+CONFIG_LIBSTORVSC_MAX_DEVICES=2
+CONFIG_LIBSTORVSC_MAX_LUNS=2
+CONFIG_LIBSTORVSC_LUN_DISCOVERY=y
+CONFIG_LIBSTORVSC_GUARDED_IO=y
 ```
 
-The helper creates a sparse raw disk with identical immutable manifests at
-LBAs 8 and 9, plus a private JSON receipt for orchestration. With
-`--fixed-vhd`, it also creates a sparse fixed VHD whose data region is
-byte-for-byte equal to the raw seed and whose deterministic footer UUID is the
-private disk ID. This conversion must happen before the final guest build and
-controller contract; neither file may subsequently be reseeded or mutated.
-The controller provisions the requested exact logical geometry, attaches the
-same managed data disk at the configured LUN, and retains the exact guest image
-and data-disk UUIDs for both boots.
+The data region is exactly 4 GiB; the fixed VHD adds a 512-byte footer, for a
+file length of 4294967808 bytes. Identical immutable manifests occupy LBAs 8
+and 9, and the footer UUID is the original private disk ID. The controller
+attaches that same managed data disk at LUN 7 and retains the exact image,
+original VM, OS disk, and data disk across deallocation and the sole restart.
+The guest does not use a `ukblkdev` index or controller registration index as
+target authority. OS and unintended disks never acquire write authorization.
+The native synthetic seed helper in `support/tools/hyperv/preparation/seed.zig`
+is fixture-only and is not a replacement-seed path for this run.
 
-Identity policy 1 (`address-v1`, the generator default for compatibility)
-requires `--path`, `--target`, and `--lun` and emits the original `UKPSEED1`,
+Identity policy 1 (`address-v1`, retained for compatibility)
+binds path, target, and LUN in the seed and emits the original `UKPSEED1`,
 `UKPINT01`, and `UKPDONE1` records unchanged. Identity policy 2
 (`seed-enrollment-v2`) fixes LUN, geometry, run ID, and disk ID before the
 build, but deliberately does not guess path or target. The guest considers
@@ -295,8 +304,12 @@ a supported nonzero VPD identity. Boot 1 then authorizes that session, flushes
 an intent at LBA 16, writes and verifies deterministic patterns at LBA 0, the
 final LBA, and LBAs 32..47, flushes and verifies again, and flushes a
 completion receipt at LBA 17. Boot 2 requires the complete enrolled address,
-controller, and VPD identity plus a valid receipt, rereads every pattern, and
-performs no writes.
+controller, and VPD identity plus a valid receipt, rereads every pattern, then
+rereads both seeds, intent, and receipt. It performs no writes **or flushes**
+and never upgrades its read session. Boot 1 exercises READ/WRITE(10) and
+READ/WRITE(16); the 16-sector extent spans two aligned 4-KiB pages. Boot 2 uses
+the read session's automatic CDB selection. Unsupported commands and any I/O
+or completion error fail, rather than silently skipping coverage.
 
 The controller and LUN limits reserve identities for the life of the boot;
 they are not reusable active-slot limits after removal. Mapping and inventory
@@ -306,6 +319,31 @@ to one topology generation, and any enumerate, removal, reset, or rebind makes
 the session permanently stale. If an accepted request exceeds the workload
 deadline, its descriptor and DMA storage remain reserved and immutable and
 the workload cannot issue more I/O or end the session during that boot.
+The solved persistence profile must retain the explicit two-controller,
+two-LUN bound and REPORT LUNS discovery (`LIBSTORVSC_LUN_DISCOVERY`), not
+silently restore older defaults when applying the retained seed configuration.
+This admits only the intended OS/data topology, not wider multi-data acceptance.
+`uk_storvsc_discovery_status()` distinguishes pending discovery (`-EAGAIN`)
+from terminal rejection before the workload uses an inventory. Pending status
+is polled within the existing bind deadline; every other negative status fails
+immediately without further workload I/O. Target acquisition and validation
+require complete discovery as well, while release remains available for cleanup.
+Selection brackets inventory enumeration with this status and distinguishes
+terminal discovery errors from transient snapshot errors. Even `-ESTALE` from
+discovery is terminal; it cannot enter the snapshot retry path if the next
+status observation happens to clear.
+The ordinary read-only smoke selects exactly one LUN 0 OS candidate across
+the complete inventory. A LUN 7 data disk registered first cannot become its
+OS target; absent or ambiguous LUN 0 candidates fail rather than guessing a
+controller or registration index. The subsequent MBR/GPT check is still
+required. This is separate from persistence's original-seed target enrollment.
+The legacy inventory API still fails closed on unresolved offers; partial
+inventory is never treated as ready. Observing pending discovery disqualifies
+the later platform-only unavailable result.
+Non-timeout candidate errors release both the rejected session and any earlier
+retained candidate when the driver permits release. Both boots revalidate the
+selected target after their final readback. No boot success, I/O ledger, or
+completion marker is emitted until that validation and session release succeed.
 
 Persistence and application-network workloads are mutually exclusive Kconfig
 choices. The default selection remains the non-destructive storage/network
@@ -363,3 +401,64 @@ seed from a genuine first boot. During the expected second boot, orchestration
 must therefore reject any boot-1/write marker; a receipt alone is not accepted
 without the guest's boot-2 pattern-read marker. Incomplete or corrupt
 intent/receipt state fails closed and is never restarted.
+
+The native parser to reuse is
+`support/tools/hyperv/persistence/evidence.zig`:
+`parse(bytes, boot, input, previous)` returns checked `Evidence`;
+the additive `parseWorkload(bytes, boot, input, previous)` accepts only
+`EvidenceInput { run_id: [32]u8, disk_id: [32]u8, sectors: u64, lun: u8 }`.
+Direct native helpers can import that module without constructing dummy cloud
+authority or engine contracts. The original `parse` signature is unchanged
+and delegates to the same parser. Neither entrypoint admits a cloud operation;
+the caller must independently bind the expected inputs to the retained seed,
+image, and authorized attempt. Boot 2 requires previous evidence for Boot 1,
+not evidence from another Boot 2.
+`boot2Suffix(full, first)` checks the byte-exact Boot 1 prefix before admitting
+the appended Boot 2 serial suffix. Its complete ordered policy-2 contract is
+START, SELECT, IDENTITY, BOOT action PASS, IO ledger, BOOT completion,
+`HYPERV_PERSISTENCE FINAL PASS rc=0`, and `main returned 0` (with the supported
+ukboot log envelope). Missing, duplicate, conflicting, reordered, truncated,
+unknown persistence markers, or any failure are not acceptance.
+Selection errors emit `HYPERV_PERSISTENCE SELECT FAIL rc=<errno> writes=0`;
+post-selection errors emit `HYPERV_PERSISTENCE FINAL FAIL rc=<errno>`.
+Invalid configuration or an abandoned request can instead emit
+`HYPERV_PERSISTENCE FINAL FAIL reason=invalid-expectation|request-owned`.
+
+The controller must durably admit Boot 2 before restarting the same
+deallocated VM. Disk state alone cannot distinguish a third read-only boot
+from Boot 2; preventing any third boot or ambiguous mutation resume is a
+controller obligation, not additional guest write permission. The earlier
+`UK_HYPERV_PLATFORM_READY` marker is never persistence acceptance, and the
+retired nested-host handoff is not evidence for this direct route.
+
+### Native workload regression tests
+
+Run the standalone C fixture and the existing production-backed driver fixture
+from the repository root (Zig 0.16):
+
+```sh
+ZIG=zig sh support/apps/hyperv-acceptance/tests/persistence-workload-test.sh
+export TMPDIR="$PWD/.d/workload-native/scratch"
+export XDG_CACHE_HOME="$PWD/.d/workload-native/cache"
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.d/workload-native/cache/global"
+export ZIG_LOCAL_CACHE_DIR="$PWD/.d/workload-native/cache/local"
+zig build test-hyperv-persistence-workflow -j2
+zig test --dep evidence \
+  -Mroot=support/apps/hyperv-acceptance/tests/persistence-evidence-test.zig \
+  -Mevidence=support/tools/hyperv/persistence/evidence.zig
+```
+
+The C fixture uses only sparse in-memory sectors with 4-GiB/LUN7 geometry,
+including a target registered as block device zero while the boot-shaped OS
+disk has another ID. It checks unchanged seeds and unintended media, first and
+last LBAs, the multi-page extent, read-only Boot 2, exact write/flush counts,
+all request-error and timeout positions, late completion ownership, wrong
+geometry/identity, duplicates, incomplete records, post-read record corruption,
+final topology drift, and session-release errors. The existing driver fixture
+separately covers real StorVSC wire/CDB/scatter-gather and completion paths.
+Neither fixture touches a disk device or establishes live Azure durability.
+The standalone Zig parser fixture exercises the same strict ordered serial
+protocol through the narrow input API, without SDK/controller dependencies.
+It covers valid two-boot evidence, exact accumulated prefixes, fresh-capture
+parsing (not restart attribution), phase refusal, malformed or conflicting
+evidence, identity drift, and nonzero Boot 2 mutation counters.

@@ -84,11 +84,27 @@ int uk_storvsc_mapping_find(uint16_t blkdev_id,
  * Returns a coherent active mapping count and topology generation. Callers
  * that enumerate targets must require every target and a final inventory
  * snapshot to carry the same generation. A snapshot does not pin a target;
- * use a session for that purpose. Returns -EAGAIN while a controller has an
- * unresolved bind, recovery, removal, or deferred topology transition.
+ * use a session for that purpose. Returns -EAGAIN while a storage offer is
+ * unexamined or rejected (including before driver admission), or a controller
+ * has an unresolved bind, recovery, removal, or deferred topology transition.
+ * discovery_status() distinguishes terminal rejection from pending work.
  */
 int uk_storvsc_inventory_get(
 	struct uk_storvsc_inventory_snapshot *snapshot);
+/*
+ * Strict discovery readiness, including primary storage offers rejected
+ * before driver admission. Zero means complete discovery; -EAGAIN denotes
+ * pending binding or topology work; other negative errors are terminal for
+ * the current admitted offer lifetime. Pre-admission rejection remains
+ * terminal for the boot because complete discovery cannot be established.
+ * Failed discovery with unquiesced request buffers is also quarantined for
+ * the boot; no later offer can reuse that controller's retained memory.
+ * Call before and after enumerating inventory_get()/target_get() for target
+ * selection to distinguish terminal rejection from pending work; readiness
+ * does not pin a target. inventory_get() also refuses incomplete discovery,
+ * retaining its -EAGAIN result rather than exposing terminal offer errors.
+ */
+int uk_storvsc_discovery_status(void);
 int uk_storvsc_target_get(unsigned int index,
 			  struct uk_storvsc_target_snapshot *snapshot);
 /*

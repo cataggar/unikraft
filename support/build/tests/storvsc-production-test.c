@@ -6138,7 +6138,7 @@ static int run_persistence_unavailable_regression(
 	    vmbus_bus_host_reject_storage_wire(
 		    driver, &device->instance_id, 690, 1690) ||
 	    !vmbus_storage_offer_lifetime_observed() ||
-	    uk_storvsc_inventory_get(&inventory) || inventory.count ||
+	    uk_storvsc_inventory_get(&inventory) != -EAGAIN || inventory.count ||
 	    inventory.topology_generation !=
 		    UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION)
 		return 697;
@@ -6169,6 +6169,9 @@ static int run_persistence_unavailable_regression(
 	    flush_command_count != flushes)
 		return 700;
 
+	/* The next independent case must not inherit admission failure. */
+	if (vmbus_bus_host_offer_lifetime_setup(driver))
+		return 699;
 	hyperv_acceptance_persistence_host_reset();
 	hyperv_acceptance_persistence_host_set_identity_policy(
 		HYPERV_ACCEPTANCE_PERSISTENCE_IDENTITY_SEED_ENROLLMENT_V2);
@@ -6258,6 +6261,8 @@ static int storvsc_production_test(void)
 			 0xb6, 0x05, 0x72, 0xe2, 0xff, 0xb1, 0xdc, 0x7f },
 	    16))
 		return 1;
+	if (vmbus_bus_host_offer_lifetime_setup(driver))
+		return 2;
 	rc = run_persistence_unavailable_regression(
 		driver, &vmbus_device);
 	if (rc)

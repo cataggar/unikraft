@@ -1,5 +1,20 @@
 # Hyper-V / Azure acceptance
 
+## Selected #89 route: direct VM boot
+
+Use [the bounded direct two-boot lane](DIRECT-TWO-BOOT.md) for the separately
+authorized original-seed persistence attempt. It uses Azure CLI only for
+resource management and the native transfer/image tooling, with no nested
+Linux/QEMU/KVM host or guest agent. A platform boot is not full acceptance;
+the 2026-09-14 direct native boot reached main but failed storage binding.
+New 4 GiB/LUN7/two-boot/cleanup authorization remains mandatory.
+
+The historical Python and nested-preflight contracts below are retained for
+reference, **not prerequisites or the selected execution route for #89**.
+Their receipts are not converted into direct-lane readiness or write authority.
+
+## Historical tooling contracts
+
 `../scripts/hyperv-azure.py` packages an already-built x86-64 Hyper-V EFI
 application, boots the resulting disks locally, and then optionally runs a
 bounded Azure Generation 2 acceptance deployment. A platform boot is not a

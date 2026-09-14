@@ -10,21 +10,21 @@ int hyperv_acceptance_storage_target_acquire(
 	struct uk_storvsc_inventory_snapshot inventory;
 	struct uk_storvsc_inventory_snapshot final_inventory;
 	struct uk_storvsc_target_snapshot candidate;
-	struct uk_blkdev *expected;
+	struct uk_blkdev *expected = NULL;
 	int rc;
 
 	if (!target)
 		return -EINVAL;
 	memset(target, 0, sizeof(*target));
+	rc = uk_storvsc_discovery_status();
+	if (rc)
+		return rc;
 	rc = uk_storvsc_inventory_get(&inventory);
 	if (rc)
 		return rc;
 	if (!inventory.count)
 		return -ENODEV;
-	expected = uk_blkdev_get(0);
-	if (!expected)
-		return -ENODEV;
-	/* The acceptance contract designates the first registered disk as OS. */
+	/* The bounded smoke profile has one OS candidate at LUN 0. */
 	for (unsigned int index = 0; index < inventory.count; index++) {
 		rc = uk_storvsc_target_get(index, &candidate);
 		if (rc)
@@ -32,11 +32,22 @@ int hyperv_acceptance_storage_target_acquire(
 		if (candidate.topology_generation !=
 		    inventory.topology_generation)
 			return -ESTALE;
-		if (candidate.mapping.blkdev_id == 0)
-			target->snapshot = candidate;
+		if (candidate.mapping.lun)
+			continue;
+		if (expected)
+			return -EEXIST;
+		expected = uk_blkdev_get(candidate.mapping.blkdev_id);
+		if (!expected)
+			return -ENODEV;
+		if (!candidate.size)
+			return -ESTALE;
+		target->snapshot = candidate;
 	}
-	if (!target->snapshot.size)
-		return -ESTALE;
+	if (!expected)
+		return -ENODEV;
+	rc = uk_storvsc_discovery_status();
+	if (rc)
+		return rc;
 	rc = uk_storvsc_inventory_get(&final_inventory);
 	if (rc)
 		return rc;
@@ -72,6 +83,9 @@ int hyperv_acceptance_storage_target_validate(
 	if (!target || !target->device || !target->snapshot.size ||
 	    !target->inventory_count)
 		return -EINVAL;
+	rc = uk_storvsc_discovery_status();
+	if (rc)
+		return rc;
 	if (target->session.opaque[0]) {
 		rc = uk_storvsc_session_validate(&target->session, &current);
 		if (rc)
@@ -91,9 +105,13 @@ int hyperv_acceptance_storage_target_validate(
 		if (rc)
 			return rc;
 		if (current.mapping.blkdev_id ==
-		    target->snapshot.mapping.blkdev_id)
+		    target->snapshot.mapping.blkdev_id) {
+			rc = uk_storvsc_discovery_status();
+			if (rc)
+				return rc;
 			return memcmp(&current, &target->snapshot,
 				      sizeof(current)) ? -ESTALE : 0;
+		}
 	}
 	return -ESTALE;
 }

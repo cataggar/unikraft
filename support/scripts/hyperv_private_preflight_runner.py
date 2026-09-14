@@ -71,9 +71,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "a5b8cb9aa1abec0193d560bec32a3aeae82586b1110d2f9a2fe30d437e34c816"
+            "9f656ca52135bfaf55873f95893c7ec60c4f9368488f253f1efe67d7266b2db9"
         ),
-        "size": 1757166,
+        "size": 1757372,
         "files": 215,
     },
     "support/kconfig": {
@@ -219,7 +219,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "897ccd1efd890b3ceed246de4f559737157041fd32507a299c78d69cbfbe052d"
+        "b34a9e1cc4a942ec13379881eea68e1d32b24de1b3c2484ccdd0f56e3a5ef0e1"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -408,13 +408,13 @@ GUARDED_PRODUCER_FILES = {
         "9ea0883afdb3e08df3110347df9a3917dbd602a151a302b6d3bceea02ec6b905"
     ),
     "drivers/hyperv/storvsc/exportsyms.uk": (
-        "0d15682c08580e5dd5f9546b66990e2b053ed1b2b8b0746a05670aaeadc61a6d"
+        "96d418ad387c2fa392afc96dfc8b1eb77cc20a0bcdb8a88fbd44038a5fdfa5de"
     ),
     "drivers/hyperv/storvsc/include/uk/storvsc.h": (
-        "e0e666ff4faefc2ba1186403a4320170fb3163375cc31a04312bbce011aa9f10"
+        "b21ed97379de228acf41ecc4d5929058dc85368a009a6e0abf742bc5d3096c17"
     ),
     "drivers/hyperv/storvsc/storvsc.c": (
-        "42e59853180fa7aa039e0895fe6d217d4fcbf0874d6cdb927dad4237ab92a6f0"
+        "c896f4d42dc0eb86ed8f001577446126e44a10ed9eb92c2c25d8eab7091e6767"
     ),
     "drivers/hyperv/storvsc/storvsc_core.h": (
         "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
@@ -429,13 +429,16 @@ GUARDED_PRODUCER_FILES = {
         "7622b3998629db41f2e1c8f8538872cf3efc64fff16e5832d0fb053ba2437a57"
     ),
     "drivers/hyperv/vmbus/exportsyms.uk": (
-        "340c49783a88696b2027f815ac0db70bc2b0ae34a331aac8bac0f6a0314a1918"
+        "f26fc7b7de9220cb994e4a81722bfa44e900c9ed84eefab480db9deedaf3a9bb"
     ),
     "drivers/hyperv/vmbus/include/uk/vmbus.h": (
         "13bc5450a7a8eb9c360e240c35907e1b5d82f683e36c2ee4e9a19f90f4d76bcb"
     ),
+    "drivers/hyperv/vmbus/include/uk/vmbus_storage.h": (
+        "6be9c46611eb45dfe32ec6f6e11c279452b70db32ec95f4b00948f9f299b49b9"
+    ),
     "drivers/hyperv/vmbus/vmbus_bus.c": (
-        "6428a549e5b41155103e6d66ea31b4baf4a90d2657114edc9e7b60dd4746f28e"
+        "2e239f3738b1bcca7ab6c5f25a698586606c8df59068415162024b3783307964"
     ),
     "drivers/hyperv/vmbus/vmbus_channel.c": (
         "088cc06d1db460cb52525aeee56d980a2074be5c0c0d8cdfa15eef72b656cc1c"
@@ -507,10 +510,10 @@ GUARDED_PRODUCER_FILES = {
         "dba07b1331d6a6f02c3f017c2fabe5a0c1c03f61ffd1df7e07e49c84427d2231"
     ),
     "support/apps/hyperv-acceptance/main.c": (
-        "deaf231ec5edf0746e99e7a657a73fcb813da8bc18116b8ef5b6543213064ddb"
+        "50e0dbc21c583d0bd7711cf928320574e4ade118d36def3d58fce9353af9efd4"
     ),
     "support/apps/hyperv-acceptance/persistence.c": (
-        "2cad1014dbc49fe9c8d5a3d6c31a282f2ec045b9990ce6b013041681a8df3741"
+        "29cffe739b7c908a93afb55515f9e33e7cffd34633a639aa732b07a6cad23900"
     ),
     "support/apps/hyperv-acceptance/persistence.h": (
         "8ef53f9ed76286b945212ea487bed1e6d51ec161078d4a2283f9054b962bd70f"
@@ -519,10 +522,10 @@ GUARDED_PRODUCER_FILES = {
         "29f1f4f0f272225ae1d2578612a4f8320f1bc8d245e9447ce6696300b80ad23c"
     ),
     "support/apps/hyperv-acceptance/storage_target.c": (
-        "f1ea10aca41b49e0a82c9cb8bc855cb7ddf86354abb8331c198127345b018a03"
+        "bafd1cee28270d5c251da83dcd89fcb670c2d87f3cf84b57fc5c0de1aafac94d"
     ),
     "support/apps/hyperv-acceptance/storage_target.h": (
-        "8e357584c2544f25f511b61e486719dea66b526a2e01539e282a67d95530d915"
+        "df7216687e9827977e58c675f4ca9640954524d174a87fa930e09084a933cc37"
     ),
 }
 LIVE_IO_MARKERS = (

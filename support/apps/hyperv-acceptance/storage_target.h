@@ -12,6 +12,7 @@ struct hyperv_acceptance_storage_target {
 	unsigned int inventory_count;
 };
 
+/* Select the unique read-only LUN 0 OS candidate, never a registration index. */
 int hyperv_acceptance_storage_target_acquire(
 	struct hyperv_acceptance_storage_target *target);
 int hyperv_acceptance_storage_target_validate(

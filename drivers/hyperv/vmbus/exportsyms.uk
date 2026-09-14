@@ -10,6 +10,7 @@ vmbus_device_bind_retry
 vmbus_device_bind_ready
 _vmbus_register_driver
 vmbus_storage_offer_lifetime_observed
+vmbus_storage_binding_status
 vmbus_storage_guid
 vmbus_network_guid
 vmbus_channel_open
