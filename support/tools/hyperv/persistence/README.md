@@ -1,5 +1,14 @@
 # Native persistence execution engine
 
+The selected #89 execution route is now the separately authorized
+[direct specialized-Gen2 two-boot harness](../../../azure/DIRECT-TWO-BOOT.md):
+bounded Azure CLI resource management plus native validation/transfer, not
+this engine's unconnected production dispatcher or a nested #120 host.
+The legacy engine contracts and closed gates documented below remain honest
+and unchanged. `evidence.EvidenceInput` / `evidence.parseWorkload` expose only
+the pure serial identity/geometry parser for the direct lane; they carry no authority
+and cannot turn a synthetic or nested receipt into accepted persistence.
+
 This standalone Zig 0.16 package implements the #89 two-boot execution and
 cleanup state machine. It does **not** constitute real boot, upload, or
 persistence acceptance. No production preparation/COMPLETED-preflight loader

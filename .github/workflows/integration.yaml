@@ -1199,6 +1199,19 @@ jobs:
         set -euo pipefail
         make -C support/apps/hyperv-acceptance network-stack
 
+    - name: Exercise the direct Azure lifecycle without cloud access
+      run: |
+        set -euo pipefail
+        root="${RUNNER_TEMP}/hyperv-ci/direct"
+        mkdir -p "${root}/tmp"
+        export TMPDIR="${root}/tmp"
+        zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
+          --cache-dir "${root}/cache" --global-cache-dir "${root}/global" \
+          --prefix "${root}/tools" -Doptimize=ReleaseSafe test install
+        support/scripts/tests/test_hyperv_direct_two_boot.sh \
+          "${GITHUB_WORKSPACE}/.d/direct-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          "${root}/tools/bin/uk-hyperv-direct-validate"
+
     - name: Solve and build native Hyper-V acceptance and SMP images
       env:
         HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}

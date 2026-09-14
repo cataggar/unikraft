@@ -1033,6 +1033,39 @@ pub fn build(b: *std.Build) void {
             "-pthread",
         },
     });
+    const storvsc_host_include_paths = [_][]const u8{
+        "support/build/tests/storvsc-host-include",
+        "drivers/hyperv/storvsc",
+        "drivers/hyperv/storvsc/include",
+        "support/apps/hyperv-acceptance",
+    };
+    const storvsc_host_sources = [_][]const u8{
+        "drivers/hyperv/storvsc/storvsc.c",
+        "support/apps/hyperv-acceptance/acceptance_protocol.c",
+        "support/apps/hyperv-acceptance/persistence.c",
+        "support/apps/hyperv-acceptance/storage_target.c",
+    };
+    const storvsc_host_flags = [_][]const u8{
+        "-std=gnu11",
+        "-DSTORVSC_HOST_TEST",
+        "-DHYPERV_PERSISTENCE_HOST_TEST",
+        "-DPERSISTENCE_TIMEOUT_NS=5000000ULL",
+        "-DPERSISTENCE_BIND_TIMEOUT_NS=50000000ULL",
+        "-DPERSISTENCE_POLL_NS=1000000ULL",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID=\"00112233445566778899aabbccddeeff\"",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID=\"102132435465768798a9bacbdcedfe0f\"",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=1000",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH=0",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET=0",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wno-unused-function",
+        "-pthread",
+    };
     const storvsc_production_tests = b.addExecutable(.{
         .name = "storvsc-production-test",
         .root_module = b.createModule(.{
@@ -1041,47 +1074,13 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    storvsc_production_tests.root_module.addIncludePath(
-        b.path("support/build/tests/storvsc-host-include"),
-    );
-    storvsc_production_tests.root_module.addIncludePath(
-        b.path("drivers/hyperv/storvsc"),
-    );
-    storvsc_production_tests.root_module.addIncludePath(
-        b.path("drivers/hyperv/storvsc/include"),
-    );
-    storvsc_production_tests.root_module.addIncludePath(
-        b.path("support/apps/hyperv-acceptance"),
-    );
+    for (storvsc_host_include_paths) |path|
+        storvsc_production_tests.root_module.addIncludePath(b.path(path));
     storvsc_production_tests.root_module.addCSourceFiles(.{
-        .files = &.{
-            "drivers/hyperv/storvsc/storvsc.c",
-            "support/apps/hyperv-acceptance/acceptance_protocol.c",
-            "support/apps/hyperv-acceptance/persistence.c",
-            "support/apps/hyperv-acceptance/storage_target.c",
+        .files = &(storvsc_host_sources ++ [_][]const u8{
             "support/build/tests/storvsc-production-test.c",
-        },
-        .flags = &.{
-            "-std=gnu11",
-            "-DSTORVSC_HOST_TEST",
-            "-DHYPERV_PERSISTENCE_HOST_TEST",
-            "-DPERSISTENCE_TIMEOUT_NS=5000000ULL",
-            "-DPERSISTENCE_BIND_TIMEOUT_NS=50000000ULL",
-            "-DPERSISTENCE_POLL_NS=1000000ULL",
-            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID=\"00112233445566778899aabbccddeeff\"",
-            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID=\"102132435465768798a9bacbdcedfe0f\"",
-            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=1000",
-            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512",
-            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2",
-            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH=0",
-            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET=0",
-            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-Wno-unused-function",
-            "-pthread",
-        },
+        }),
+        .flags = &storvsc_host_flags,
     });
     storvsc_production_tests.root_module.addObject(
         storvsc_core_host_object,
@@ -1101,6 +1100,125 @@ pub fn build(b: *std.Build) void {
         "Run production-backed guarded persistence workflow fixtures",
     );
     persistence_workflow_tests.dependOn(&run_storvsc_production_tests.step);
+    const persistence_workload_tests = b.addExecutable(.{
+        .name = "hyperv-persistence-workload-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    for (storvsc_host_include_paths) |path|
+        persistence_workload_tests.root_module.addIncludePath(b.path(path));
+    persistence_workload_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/apps/hyperv-acceptance/persistence.c",
+            "support/apps/hyperv-acceptance/storage_target.c",
+            "support/apps/hyperv-acceptance/tests/persistence-workload-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DHYPERV_PERSISTENCE_HOST_TEST",
+            "-DPERSISTENCE_TIMEOUT_NS=5000000ULL",
+            "-DPERSISTENCE_BIND_TIMEOUT_NS=50000000ULL",
+            "-DPERSISTENCE_POLL_NS=1000000ULL",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID=\"00112233445566778899aabbccddeeff\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID=\"102132435465768798a9bacbdcedfe0f\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=8388608",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=7",
+        },
+    });
+    persistence_workflow_tests.dependOn(&b.addRunArtifact(persistence_workload_tests).step);
+    const persistence_evidence_core = b.createModule(.{
+        .root_source_file = b.path("support/tools/hyperv/core.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const persistence_evidence = b.createModule(.{
+        .root_source_file = b.path("support/tools/hyperv/persistence/evidence.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{.{ .name = "hyperv_core", .module = persistence_evidence_core }},
+    });
+    const persistence_evidence_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/apps/hyperv-acceptance/tests/persistence-evidence-test.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "evidence", .module = persistence_evidence }},
+        }),
+    });
+    persistence_workflow_tests.dependOn(&b.addRunArtifact(persistence_evidence_tests).step);
+    const storage_binding_tests = b.step(
+        "test-hyperv-storage-binding",
+        "Run native bounded storage discovery and acceptance readiness fixtures",
+    );
+    storage_binding_tests.dependOn(persistence_workflow_tests);
+    storage_binding_tests.dependOn(&run_storvsc_core_tests.step);
+    storage_binding_tests.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);
+    for ([_]usize{ 1, 2 }) |controllers| {
+        const binding_tests = b.addExecutable(.{
+            .name = b.fmt("storvsc-storage-binding-{d}-test", .{controllers}),
+            .root_module = b.createModule(.{
+                .target = b.graph.host,
+                .optimize = .Debug,
+                .link_libc = true,
+            }),
+        });
+        for (storvsc_host_include_paths) |path|
+            binding_tests.root_module.addIncludePath(b.path(path));
+        binding_tests.root_module.addCSourceFiles(.{
+            .files = &(storvsc_host_sources ++ [_][]const u8{
+                "drivers/hyperv/storvsc/tests/storage-binding-test.c",
+            }),
+            .flags = &(storvsc_host_flags ++ [_][]const u8{
+                "-include",
+                b.path("drivers/hyperv/storvsc/tests/storage-binding-config.h").getPath(b),
+                b.fmt("-DSTORAGE_BINDING_CONTROLLERS={d}", .{controllers}),
+                "-ffunction-sections",
+                "-fdata-sections",
+            }),
+        });
+        inline for (.{
+            storvsc_core_host_object,
+            storvsc_vmbus_epoch_object,
+            vmbus_protocol_host_object,
+        }) |object| binding_tests.root_module.addObject(object);
+        binding_tests.root_module.linkSystemLibrary("pthread", .{});
+        binding_tests.link_gc_sections = true;
+        const case_count: usize = if (controllers == 1) 4 else 33;
+        for (0..case_count) |case| {
+            const run = b.addRunArtifact(binding_tests);
+            run.addArg(b.fmt("{d}", .{case}));
+            storage_binding_tests.dependOn(&run.step);
+        }
+    }
+    const storage_binding_main_tests = b.addExecutable(.{
+        .name = "hyperv-storage-binding-main-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .link_libc = true,
+        }),
+    });
+    storage_binding_main_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
+    );
+    storage_binding_main_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/apps/hyperv-acceptance/tests/storage-binding-main-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    storage_binding_tests.dependOn(&b.addRunArtifact(storage_binding_main_tests).step);
+    test_step.dependOn(storage_binding_tests);
     const storvsc_regression_tests = b.step(
         "test-storvsc-regression",
         "Run StorVSC protocol, topology, guarded-I/O, and ABI fixtures",
@@ -1109,6 +1227,7 @@ pub fn build(b: *std.Build) void {
     storvsc_regression_tests.dependOn(&verify_storvsc_core.step);
     storvsc_regression_tests.dependOn(&run_storvsc_production_tests.step);
     storvsc_regression_tests.dependOn(&run_native_image_graph_tests.step);
+    storvsc_regression_tests.dependOn(storage_binding_tests);
     const netvsc_binding_protocol = b.addObject(.{
         .name = "netvsc-protocol-host-binding",
         .root_module = b.createModule(.{
@@ -1401,6 +1520,7 @@ pub fn build(b: *std.Build) void {
     vmbus_lifecycle_tests.dependOn(&run_vmbus_control_tests.step);
     vmbus_lifecycle_tests.dependOn(&run_vmbus_production_tests.step);
     vmbus_lifecycle_tests.dependOn(&run_vmbus_disconnect_tests.step);
+    storage_binding_tests.dependOn(vmbus_lifecycle_tests);
     const hyperv_irq_tests = b.step("test-hyperv-irq", "Run Hyper-V IRQ-path hosted correctness tests");
     hyperv_irq_tests.dependOn(&b.addRunArtifact(hyperv_runtime_tests).step);
     hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);

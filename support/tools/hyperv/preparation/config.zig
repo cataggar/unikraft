@@ -149,6 +149,22 @@ pub fn validatePurpose(
     try validate(allocator, bytes, expected);
 }
 
+/// Direct REPORT LUNS uses two retained slots per controller, not addresses
+/// zero and one. The original seed may therefore still select LUN seven.
+pub fn validateDirectPersistence(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    expected: Guard,
+) !void {
+    try validateGuardPurpose(expected, .persistence);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var document = try parseDocument(arena.allocator(), bytes, null);
+    defer document.deinit();
+    const actual = try documentGuardWithLuns(&document, 2);
+    if (!contracts.same(actual, expected)) return error.IdentityChanged;
+}
+
 /// Re-emit all parsed options, including unrelated ones, without changing guard
 /// identity. Comments/blank lines are not retained by the native document parser.
 pub fn normalize(
@@ -249,6 +265,10 @@ fn identity(document: *const kconfig.Document, name: []const u8) !contracts.Iden
 }
 
 fn documentGuard(document: *const kconfig.Document) !Guard {
+    return documentGuardWithLuns(document, 8);
+}
+
+fn documentGuardWithLuns(document: *const kconfig.Document, max_luns: u64) !Guard {
     for (document.entries.items) |entry| {
         if (dangerous(entry.name) and !known(entry.name)) return error.UnknownDangerousOverride;
     }
@@ -265,7 +285,7 @@ fn documentGuard(document: *const kconfig.Document) !Guard {
     if ((try document.getBool("APPHYPERVACCEPTANCE_NETWORK_APPLICATION")) orelse false)
         return error.InvalidGuardProfile;
     if (try integer(document, "LIBSTORVSC_MAX_DEVICES") != 2 or
-        try integer(document, "LIBSTORVSC_MAX_LUNS") != 8)
+        try integer(document, "LIBSTORVSC_MAX_LUNS") != max_luns)
         return error.InvalidGuardProfile;
     const guard: Guard = .{
         .run_id = try identity(document, prefix ++ "_RUN_ID"),

@@ -23,6 +23,14 @@ pub const Evidence = struct {
     flushes: u8,
 };
 
+/// Expected workload identity only; parsing does not admit a cloud operation.
+pub const EvidenceInput = struct {
+    run_id: local.Id,
+    disk_id: local.Id,
+    sectors: u64,
+    lun: u8,
+};
+
 pub fn boot2Suffix(full: []const u8, first: Evidence) ![]const u8 {
     if (first.boot != 1 or first.bytes == 0 or full.len > contract.serial_limit or full.len < first.bytes or
         !std.mem.eql(u8, &local.hash(full[0..first.bytes]), &first.sha256)) return error.SerialPrefixChanged;
@@ -31,8 +39,18 @@ pub fn boot2Suffix(full: []const u8, first: Evidence) ![]const u8 {
 }
 
 pub fn parse(bytes: []const u8, boot: u8, input: contract.Contract, previous: ?Evidence) !Evidence {
+    return parseWorkload(bytes, boot, .{
+        .run_id = input.run_id,
+        .disk_id = input.disk_id,
+        .sectors = input.sectors,
+        .lun = input.lun,
+    }, previous);
+}
+
+pub fn parseWorkload(bytes: []const u8, boot: u8, input: EvidenceInput, previous: ?Evidence) !Evidence {
     if (boot != 1 and boot != 2) return error.InvalidBoot;
     if ((boot == 1) != (previous == null)) return error.InvalidBoot;
+    if (previous) |first| if (first.boot != 1) return error.InvalidBoot;
     if (bytes.len == 0 or bytes.len > contract.serial_limit) return error.InvalidSerialLength;
     const last_newline = std.mem.lastIndexOfScalar(u8, bytes, '\n') orelse return error.EvidenceIncomplete;
     // ukprint emits its reset (including NUL) after the message's newline.

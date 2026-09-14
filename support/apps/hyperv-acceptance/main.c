@@ -1,14 +1,17 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "acceptance_protocol.h"
+#ifndef HYPERV_ACCEPTANCE_BINDING_HOST_TEST
 #include "application_network.h"
 #include "persistence.h"
 #include "storage_target.h"
+#endif
 
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 
+#ifndef HYPERV_ACCEPTANCE_BINDING_HOST_TEST
 #include <uk/config.h>
 #include <uk/alloc.h>
 #include <uk/blkdev.h>
@@ -18,6 +21,7 @@
 #include <uk/sched.h>
 #include <uk/storvsc.h>
 #include <uk/vmbus.h>
+#endif
 
 #if defined(CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE) && \
 	CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE && \
@@ -46,6 +50,7 @@
 #define DHCP_RETRY_NS (2ULL * 1000000000ULL)
 #endif
 #define POLL_INTERVAL_NS 10000000ULL
+#ifndef HYPERV_ACCEPTANCE_BINDING_HOST_TEST
 #if !CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
 #define MAX_RX_PACKETS 256U
 
@@ -72,6 +77,7 @@ static const char *result_name(enum hyperv_acceptance_result result)
 	}
 	return "FAIL";
 }
+#endif
 
 static int guid_equal(const struct vmbus_guid *left,
 		      const struct vmbus_guid *right)
@@ -102,7 +108,7 @@ static void count_vmbus_classes(unsigned int *storage, unsigned int *network)
 		if (!device)
 			continue;
 		class_name = vmbus_class_name(&device->class_id);
-		if (!strcmp(class_name, "storage"))
+		if (!strcmp(class_name, "storage") && !device->subchannel_index)
 			(*storage)++;
 		else if (!strcmp(class_name, "network"))
 			(*network)++;
@@ -116,6 +122,7 @@ static void count_vmbus_classes(unsigned int *storage, unsigned int *network)
 struct target_binding_status {
 	int storage;
 	int network;
+	int storage_error;
 };
 
 static void current_bound_offers(unsigned int *storage,
@@ -131,7 +138,8 @@ static void current_bound_offers(unsigned int *storage,
 
 		if (!device || !vmbus_device_is_bound(device))
 			continue;
-		if (guid_equal(&device->class_id, &vmbus_storage_guid))
+		if (guid_equal(&device->class_id, &vmbus_storage_guid) &&
+		    !device->subchannel_index)
 			(*storage)++;
 		else if (guid_equal(&device->class_id, &vmbus_network_guid))
 			(*network)++;
@@ -146,27 +154,27 @@ wait_for_target_bindings(unsigned int storage_offers,
 	struct target_binding_status status = { 0 };
 
 	while (ukplat_monotonic_clock() < deadline) {
-		struct uk_storvsc_inventory_snapshot inventory = { 0 };
 		unsigned int storage_bound;
 		unsigned int network_bound;
-		unsigned int storage_targets = 0;
 
 		current_bound_offers(&storage_bound, &network_bound);
-		if (!uk_storvsc_inventory_get(&inventory))
-			storage_targets = inventory.count;
-		status.storage = hyperv_acceptance_binding_ready(
-			storage_offers, storage_bound, storage_targets);
+		status.storage_error = uk_storvsc_discovery_status();
+		status.storage = !status.storage_error &&
+			(!storage_offers || storage_bound == storage_offers);
 		status.network = hyperv_acceptance_binding_ready(
 			network_offers, network_bound, uk_netdev_count());
-		if (status.storage && status.network)
+		if ((status.storage ||
+		     (status.storage_error && status.storage_error != -EAGAIN)) &&
+		    status.network)
 			return status;
 		uk_sched_thread_sleep(POLL_INTERVAL_NS);
 	}
 	return status;
 }
 
+#ifndef HYPERV_ACCEPTANCE_BINDING_HOST_TEST
 static enum hyperv_acceptance_result probe_storage(
-	unsigned int storage_offers, int binding_ready)
+	unsigned int storage_offers, const struct target_binding_status *bindings)
 {
 	struct hyperv_acceptance_storage_target selected = { 0 };
 	struct uk_blkdev *device;
@@ -184,7 +192,16 @@ static enum hyperv_acceptance_result probe_storage(
 	int release_rc;
 	unsigned int index;
 
-	if (storage_offers && !binding_ready) {
+	if (bindings->storage_error && bindings->storage_error != -EAGAIN) {
+		printf("HYPERV_ACCEPTANCE STORAGE_INVENTORY FAIL "
+		       "reason=discovery-rejected rc=%d\n",
+		       bindings->storage_error);
+		printf("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
+		       "reason=discovery-rejected rc=%d\n",
+		       bindings->storage_error);
+		return HYPERV_ACCEPTANCE_FAIL;
+	}
+	if (!bindings->storage) {
 		puts("HYPERV_ACCEPTANCE STORAGE_INVENTORY FAIL "
 		     "reason=binding-timeout");
 		puts("HYPERV_ACCEPTANCE STORAGE_READ FAIL "
@@ -621,7 +638,9 @@ static enum hyperv_acceptance_result probe_network(
 }
 #endif
 #endif
+#endif
 
+#ifndef HYPERV_ACCEPTANCE_BINDING_HOST_TEST
 int main(void)
 {
 #if HYPERV_ACCEPTANCE_PERSISTENCE_ENABLED
@@ -639,7 +658,7 @@ int main(void)
 	puts("UK_HYPERV_PLATFORM_READY");
 	count_vmbus_classes(&storage_offers, &network_offers);
 	bindings = wait_for_target_bindings(storage_offers, network_offers);
-	storage = probe_storage(storage_offers, bindings.storage);
+	storage = probe_storage(storage_offers, &bindings);
 #if CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
 	network = hyperv_acceptance_probe_application_network(
 		network_offers, bindings.network);
@@ -673,3 +692,4 @@ int main(void)
 	return (int)final;
 #endif
 }
+#endif

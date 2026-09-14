@@ -13,6 +13,7 @@
 #include <uk/sched.h>
 #include <uk/thread.h>
 #include <uk/vmbus.h>
+#include "include/uk/vmbus_storage.h"
 
 #include "vmbus_protocol.h"
 #include "vmbus_lifecycle.h"
@@ -66,6 +67,7 @@ struct vmbus_device_binding {
 	__u8 pending_offer_valid;
 	__u8 remove_called;
 	__u8 offer_remove_notified;
+	int error;
 };
 
 const struct vmbus_guid vmbus_storage_guid = {
@@ -113,6 +115,9 @@ static __u64 relid_sequence;
 static __u64 device_generation = 1;
 static __u64 channel_resource_epoch = 1;
 static int storage_offer_lifetime_observed;
+static int storage_admission_error;
+static int storage_enumeration_status = -EAGAIN;
+static int initial_probe_succeeded;
 static int bind_work_pending;
 static int bind_work_running;
 static int bind_attempt_active;
@@ -255,6 +260,55 @@ static int guid_equal_bytes(const struct vmbus_guid *a, const __u8 *b)
 	return 1;
 }
 
+static void enumeration_failed(int error)
+{
+	int current = __atomic_load_n(&storage_enumeration_status,
+				      __ATOMIC_ACQUIRE);
+
+	while (current == 0 || current == -EAGAIN) {
+		int terminal = error && error != -EAGAIN ? error : -EIO;
+
+		if (__atomic_compare_exchange_n(&storage_enumeration_status,
+				&current, terminal, 0,
+				__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			break;
+	}
+}
+
+static void enumeration_pending(void)
+{
+	int complete = 0;
+
+	(void)__atomic_compare_exchange_n(&storage_enumeration_status,
+		&complete, -EAGAIN, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static void enumeration_begin(void)
+{
+	if (__atomic_load_n(&initial_probe_succeeded, __ATOMIC_ACQUIRE))
+		__atomic_store_n(&storage_enumeration_status, -EAGAIN,
+				 __ATOMIC_RELEASE);
+	else
+		enumeration_pending();
+}
+
+/* A short/unknown class cannot exclude an independent storage controller. */
+static int storage_offer_uncertain(const __u8 *data, size_t length)
+{
+	__u8 nonzero = 0;
+
+	if (length < 4)
+		return 1;
+	if (data[0] != 1 || data[1] || data[2] || data[3])
+		return 0;
+	if (length < 24)
+		return 1;
+	for (unsigned int i = 8; i < 24; i++)
+		nonzero |= data[i];
+	return !nonzero || vmbus_protocol_offer_matches_class(
+		data, length, vmbus_storage_guid.bytes);
+}
+
 static int guid_is_zero(const struct vmbus_guid *guid)
 {
 	unsigned int i;
@@ -324,6 +378,10 @@ void hyperv_vmbus_message(const struct hyperv_message *message)
 	if (message->message_type != VMBUS_HV_MESSAGE_TYPE ||
 	    message->payload_size < 8 ||
 	    message->payload_size > HYPERV_MESSAGE_PAYLOAD_SIZE) {
+		if (message->message_type == VMBUS_HV_MESSAGE_TYPE &&
+		    storage_offer_uncertain(message->payload, inspected_size))
+			__atomic_store_n(&storage_admission_error, -EPROTO,
+					 __ATOMIC_RELEASE);
 		__atomic_add_fetch(&malformed_hv_messages, 1, __ATOMIC_RELAXED);
 		signal_worker();
 		return;
@@ -858,6 +916,7 @@ static void bind_device(struct vmbus_device *dev)
 	}
 	generation = binding->generation;
 	binding->state = VMBUS_BIND_ADDING;
+	binding->error = 0;
 	binding->adding_driver = driver;
 	binding->offer_driver = driver;
 	binding->capacity_failure = 0;
@@ -913,6 +972,7 @@ static void bind_device(struct vmbus_device *dev)
 		return;
 	}
 	binding->state = VMBUS_BIND_PERMANENT_FAILED;
+	binding->error = rc == -EAGAIN ? -EIO : rc;
 	bind_state_unlock(state_flags);
 	uk_pr_err("VMBus: driver %s rejected channel %u (%d)\n",
 		  driver->name, dev->channel_id, rc);
@@ -1177,6 +1237,10 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 		return 0;
 	}
 	if (!free_slot) {
+		if (guid_equal_bytes(&vmbus_storage_guid, offer->class_id) &&
+		    !offer->subchannel_index)
+			__atomic_store_n(&storage_admission_error, -ENOSPC,
+					 __ATOMIC_RELEASE);
 		rc = vmbus_relid_offer(relids, VMBUS_RELID_CAPACITY,
 				       offer->channel_id, 0,
 				       &relid_sequence);
@@ -1226,6 +1290,43 @@ static int add_offer(const struct vmbus_decoded_offer *offer)
 			   free_slot->channel_id, kind);
 	}
 	return 0;
+}
+
+int vmbus_storage_binding_status(void)
+{
+	unsigned long flags;
+	unsigned int i;
+	int status = __atomic_load_n(&storage_admission_error,
+				    __ATOMIC_ACQUIRE);
+
+	if (status)
+		return status;
+	status = __atomic_load_n(&storage_enumeration_status,
+				 __ATOMIC_ACQUIRE);
+	if (status)
+		return status;
+	bind_state_lock(&flags);
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
+		const struct vmbus_device *dev = &devices[i];
+		const struct vmbus_device_binding *binding = &device_bindings[i];
+
+		if (binding->pending_offer_valid &&
+		    !binding->pending_offer.subchannel_index &&
+		    guid_equal_bytes(&vmbus_storage_guid,
+				     binding->pending_offer.class_id))
+			status = -EAGAIN;
+		if (!dev->present || dev->subchannel_index ||
+		    !guid_equal(&dev->class_id, &vmbus_storage_guid))
+			continue;
+		if (binding->state == VMBUS_BIND_PERMANENT_FAILED) {
+			status = binding->error ? binding->error : -EIO;
+			break;
+		}
+		if (binding->state != VMBUS_BIND_BOUND)
+			status = -EAGAIN;
+	}
+	bind_state_unlock(flags);
+	return status;
 }
 
 int vmbus_storage_offer_lifetime_observed(void)
@@ -1291,6 +1392,12 @@ static int handle_action(const struct vmbus_action *action)
 		return transmit(action);
 	case VMBUS_ACTION_OFFER:
 		rc = add_offer(&action->offer);
+		if (rc && !action->offer.subchannel_index &&
+		    guid_equal_bytes(&vmbus_storage_guid,
+				     action->offer.class_id))
+			__atomic_store_n(&storage_admission_error,
+					 rc == -EAGAIN ? -EIO : rc,
+					 __ATOMIC_RELEASE);
 		if (rc == -ENOSPC)
 			uk_pr_err("VMBus: device capacity %u exhausted\n",
 				  CONFIG_LIBVMBUS_MAX_DEVICES);
@@ -1301,6 +1408,11 @@ static int handle_action(const struct vmbus_action *action)
 	case VMBUS_ACTION_RESCIND:
 		return rescind_offer(action->channel_id);
 	case VMBUS_ACTION_REJECT_OFFER:
+		if (!action->offer.subchannel_index &&
+		    guid_equal_bytes(&vmbus_storage_guid,
+				     action->offer.class_id))
+			__atomic_store_n(&storage_admission_error, -EPROTO,
+					 __ATOMIC_RELEASE);
 		rc = vmbus_relid_offer(relids, VMBUS_RELID_CAPACITY,
 				       action->channel_id, 0,
 				       &relid_sequence);
@@ -1310,12 +1422,20 @@ static int handle_action(const struct vmbus_action *action)
 			return rc;
 		return release_channel(action->channel_id, 1);
 	case VMBUS_ACTION_OFFERS_COMPLETE:
+	{
+		int pending = -EAGAIN;
+
+		(void)__atomic_compare_exchange_n(&storage_enumeration_status,
+			&pending, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 		uk_pr_info("VMBus: protocol %u.%u enumerated %u device(s)\n",
 			   vmbus_protocol_version() >> 16,
 			   vmbus_protocol_version() & 0xffff,
 			   device_count);
 		return 0;
+	}
 	case VMBUS_ACTION_CLEANUP:
+		if (action->error)
+			enumeration_failed(-ETIMEDOUT);
 		clear_devices();
 		return action->error ? -ETIMEDOUT : 0;
 	case VMBUS_ACTION_MALFORMED:
@@ -1323,6 +1443,7 @@ static int handle_action(const struct vmbus_action *action)
 			   "(%d)\n", action->error);
 		return 0;
 	case VMBUS_ACTION_FAILED:
+		enumeration_failed(-EIO);
 		uk_pr_err("VMBus: protocol transaction failed (%d)\n",
 			  action->error);
 		return -EIO;
@@ -1353,6 +1474,11 @@ static int process_messages(void)
 		}
 		vmbus_protocol_receive(entry.data, entry.len, entry.generation,
 				       hyperv_reference_time(), &action);
+		if ((action.kind == VMBUS_ACTION_REJECT_OFFER ||
+		     action.kind == VMBUS_ACTION_MALFORMED) &&
+		    storage_offer_uncertain(entry.data, entry.len))
+			__atomic_store_n(&storage_admission_error, -EPROTO,
+					 __ATOMIC_RELEASE);
 		rc = handle_action(&action);
 		if (rc)
 			return rc;
@@ -1494,6 +1620,7 @@ static int connect_protocol(void)
 	__paddr_t gpa;
 	int rc;
 
+	enumeration_begin();
 	if (live_connection_generation)
 		return -EBUSY;
 	if (!next_connection_generation)
@@ -1577,6 +1704,7 @@ static int disconnect_locked(void)
 	int state = vmbus_protocol_state();
 	int rc = 0;
 
+	enumeration_pending();
 	drain_queues();
 	{
 		unsigned long flags;
@@ -1711,6 +1839,7 @@ static int probe_unwind_locked(int primary_error)
 		.reset_protocol = unwind_reset,
 	};
 
+	enumeration_failed(primary_error);
 	return vmbus_probe_unwind_run(&ops, NULL, primary_error);
 }
 
@@ -1730,6 +1859,7 @@ static void vmbus_worker(void *arg __unused)
 				if (!rc)
 					rc = connect_protocol();
 				if (rc) {
+					enumeration_failed(rc);
 					(void)disconnect_locked();
 					__atomic_store_n(&connection_failed, 1,
 							 __ATOMIC_RELEASE);
@@ -2170,8 +2300,10 @@ int vmbus_reconnect(void)
 	rc = connect_protocol();
 	if (!rc)
 		rc = start_worker();
-	if (rc)
+	if (rc) {
+		enumeration_failed(rc);
 		(void)disconnect_locked();
+	}
 	release_control();
 	return rc;
 }
@@ -2276,6 +2408,7 @@ static int vmbus_bus_init(struct uk_alloc *a __unused)
 	ukarch_spin_init(&deferred_release_lock);
 	ukarch_spin_init(&bind_lock);
 	if (gpa == UK_PAGING_PADDR_INV || (gpa & 0xff)) {
+		enumeration_failed(-EINVAL);
 		uk_pr_err("VMBus: invalid PostMessage input GPA 0x%lx\n", gpa);
 		return -EINVAL;
 	}
@@ -2288,14 +2421,17 @@ static int vmbus_bus_probe(void)
 	int rc;
 
 	rc = acquire_control();
-	if (rc)
+	if (rc) {
+		enumeration_failed(rc);
 		return rc;
+	}
 	rc = connect_protocol();
 	if (rc)
 		goto failed;
 	rc = start_worker();
 	if (rc)
 		goto failed;
+	__atomic_store_n(&initial_probe_succeeded, 1, __ATOMIC_RELEASE);
 	initialized = 1;
 	release_control();
 	return (int)device_count;
@@ -2638,6 +2774,10 @@ static void host_reset_state(void)
 {
 	unsigned int i;
 
+	storage_admission_error = 0;
+	/* Ordinary channel fixtures start after synthetic offer enumeration. */
+	storage_enumeration_status = 0;
+	initial_probe_succeeded = 1;
 	clearing_devices = 1;
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
 		host_zero(&devices[i], sizeof(devices[i]));
@@ -2996,7 +3136,8 @@ static int host_test_bind_retries(void)
 	host_make_offer(&offer, 3);
 	if (add_offer(&offer) || host_add_b != 1)
 		return 111;
-	if (vmbus_device_is_bound(&devices[0]))
+	if (vmbus_device_is_bound(&devices[0]) ||
+	    vmbus_storage_binding_status() != -ENOSPC)
 		return 112;
 	vmbus_control_channel_resource_released();
 	process_bind_work();
@@ -3005,7 +3146,8 @@ static int host_test_bind_retries(void)
 	    host_remove_count || host_offer_removed_count)
 		return 112;
 	if (rescind_offer(3) || host_offer_removed_count != 1 ||
-	    host_last_removed_offer.channel_id != 3)
+	    host_last_removed_offer.channel_id != 3 ||
+	    vmbus_storage_binding_status())
 		return 112;
 
 	host_reset_state();
@@ -3023,7 +3165,8 @@ static int host_test_bind_retries(void)
 	host_make_offer(&offer, 4);
 	if (add_offer(&offer) || host_add_b != 1)
 		return 114;
-	if (vmbus_device_is_bound(&devices[0]))
+	if (vmbus_device_is_bound(&devices[0]) ||
+	    vmbus_storage_binding_status() != -EAGAIN)
 		return 115;
 	process_bind_work();
 	if (host_add_b != 1)
@@ -3033,7 +3176,8 @@ static int host_test_bind_retries(void)
 	process_bind_work();
 	if (host_add_b != 2 ||
 	    device_bindings[0].state != VMBUS_BIND_BOUND ||
-	    !vmbus_device_is_bound(&devices[0]))
+	    !vmbus_device_is_bound(&devices[0]) ||
+	    vmbus_storage_binding_status())
 		return 117;
 	host_pump_hook = host_auto_control_pump;
 	if (vmbus_channel_close(devices[0].channel))
@@ -3052,10 +3196,12 @@ static int host_test_late_driver(void)
 	driver_count = 0;
 	host_bind_mode = HOST_BIND_NESTED;
 	host_make_offer(&offer, 8);
-	if (add_offer(&offer) || host_add_b || bind_work_pending)
+	if (add_offer(&offer) || host_add_b || bind_work_pending ||
+	    vmbus_storage_binding_status() != -EAGAIN)
 		return 116;
 	if (_vmbus_register_driver(&host_driver) || host_add_b != 1 ||
-	    device_bindings[0].state != VMBUS_BIND_BOUND)
+	    device_bindings[0].state != VMBUS_BIND_BOUND ||
+	    vmbus_storage_binding_status())
 		return 117;
 
 	host_reset_state();
@@ -3063,7 +3209,7 @@ static int host_test_late_driver(void)
 	host_make_offer(&offer, 5);
 	if (add_offer(&offer) || host_add_b != 1 ||
 	    device_bindings[0].state != VMBUS_BIND_TRANSIENT_WAIT ||
-	    bind_work_pending)
+	    bind_work_pending || vmbus_storage_binding_status() != -EAGAIN)
 		return 118;
 	process_bind_work();
 	if (host_add_b != 1)
@@ -3071,7 +3217,8 @@ static int host_test_late_driver(void)
 	vmbus_device_bind_ready();
 	process_bind_work();
 	if (host_add_b != 2 ||
-	    device_bindings[0].state != VMBUS_BIND_BOUND)
+	    device_bindings[0].state != VMBUS_BIND_BOUND ||
+	    vmbus_storage_binding_status())
 		return 120;
 	return 0;
 }
@@ -3495,6 +3642,7 @@ static int host_test_connection_start(void)
 	struct vmbus_action action;
 	int rc;
 
+	enumeration_begin();
 	vmbus_protocol_reset();
 	drain_queues();
 	vmbus_queue_recover(&rx_state);
@@ -3504,6 +3652,74 @@ static int host_test_connection_start(void)
 	if (rc)
 		return rc;
 	return connection_generation_begin();
+}
+
+int vmbus_bus_host_storage_enumeration(unsigned int stage)
+{
+	struct vmbus_action complete = { .kind = VMBUS_ACTION_OFFERS_COMPLETE };
+	int error = stage == 3 ? -ENOMEM : -ETIMEDOUT;
+
+	host_reset_state();
+	storage_enumeration_status = -EAGAIN;
+	initial_probe_succeeded = 0;
+	initialized = 0;
+	vmbus_protocol_reset();
+	if (stage == 0)
+		return 0;
+	if (stage == 1 || stage == 3)
+		(void)handle_action(&complete);
+	if (stage >= 2) {
+		if (probe_unwind_locked(error) != error ||
+		    vmbus_protocol_state() != VMBUS_STATE_DISCONNECTED ||
+		    device_count)
+			return -EIO;
+		if (stage == 4) {
+			enumeration_begin();
+			(void)handle_action(&complete);
+		}
+	}
+	return 0;
+}
+
+int vmbus_bus_host_storage_prefix(unsigned int length, int nonstorage)
+{
+	struct hyperv_message message = {
+		.message_type = VMBUS_HV_MESSAGE_TYPE,
+	};
+	struct vmbus_action action;
+	__u8 response[16] = { 15 };
+	int rc;
+
+	if (length > UINT8_MAX)
+		return -EINVAL;
+	host_reset_state();
+	rc = host_test_connection_start();
+	if (rc)
+		return rc;
+	response[8] = 1;
+	host_write32(response + 12, 0x1234);
+	vmbus_protocol_receive(response, sizeof(response),
+		vmbus_protocol_generation(), hyperv_reference_time(), &action);
+	if (action.kind != VMBUS_ACTION_TRANSMIT || handle_action(&action))
+		return -EIO;
+	/* Exercise parser/classification on bounded prefixes of an offer. */
+	host_write32(message.payload, 1);
+	host_encode_guid(message.payload + 8,
+		nonstorage ? &vmbus_network_guid : &vmbus_storage_guid);
+	host_encode_guid(message.payload + 24, &vmbus_storage_guid);
+	host_write32(message.payload + 184, 37);
+	host_write32(message.payload + 192, 137);
+	message.payload_size = (__u8)length;
+	hyperv_vmbus_message(&message);
+	rc = process_messages();
+	if (rc)
+		return rc;
+	host_zero(&message, sizeof(message));
+	message.message_type = VMBUS_HV_MESSAGE_TYPE;
+	message.payload_size = 8;
+	host_write32(message.payload, 4);
+	hyperv_vmbus_message(&message);
+	return process_messages();
 }
 
 int vmbus_bus_host_quiesce_epoch_test(void)
@@ -3731,7 +3947,15 @@ int vmbus_bus_host_disconnect_remove(
 
 int vmbus_bus_host_connection_begin(void)
 {
-	return connection_generation_begin();
+	struct vmbus_action complete = { .kind = VMBUS_ACTION_OFFERS_COMPLETE };
+	int rc = connection_generation_begin();
+
+	/* Channel-only fixtures model a fresh, fully enumerated connection. */
+	if (!rc) {
+		enumeration_begin();
+		(void)handle_action(&complete);
+	}
+	return rc;
 }
 
 int vmbus_bus_host_connection_quiesce(void)
