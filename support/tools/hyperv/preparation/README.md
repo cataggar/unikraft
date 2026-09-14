@@ -74,8 +74,10 @@ Provenance, producer-executable and engine-executable commitments stay separate.
 This seam alone produces no reviewed material or Azure-ready handoff. A real
 current-source producer/package/input/load run still needs independently
 selected and reviewed physical material, controls, full configuration, and
-production publisher/host authority. Qualification-VM approval does not supply
-production Ubuntu/archive authority.
+applicable production Origin evidence and authority. Cloud, immutable-host and
+operator authority remain separate launch gates, not permissions supplied by
+this local run. Qualification-VM approval does not supply production
+Ubuntu/archive authority.
 
 ## Build and focused fixtures
 
