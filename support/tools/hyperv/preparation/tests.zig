@@ -746,6 +746,51 @@ test "entry chain requires independent selection provenance receipt and executio
     try std.testing.expectError(error.InvalidEnum, c.parse(inputs.PreparedInputV3, a, legacy));
 }
 
+test "production local read-only load refuses synthetic packets and propagates missing state and parse errors" {
+    const local = @import("production_local.zig");
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    const chain = try shapeChain(a);
+    var input = try shapeInput(a, chain);
+    var review = try shapeReview(a, chain, input);
+    const guard = input.receipt.guard;
+    const deadline = try c.core.process.Deadline.afterMilliseconds(30000);
+    // Every case must refuse before any downstream descriptor or tool is used.
+    var bindings: admission.Bindings = undefined;
+    bindings.staging = .{ .dir = fixture.dir };
+    try std.testing.expectError(error.FileNotFound, local.load(a, io, guard, review, bindings, deadline));
+    const encoded = try c.canonical(a, input);
+    try writeFixture(fixture.dir, "input.json", encoded, 0o600);
+    try std.testing.expectError(error.ProductionPurposeRequired, local.load(a, io, guard, review, bindings, deadline));
+    review.input_sha256 = c.digest("unreviewed substitute");
+    try std.testing.expectError(error.UnreviewedInput, local.load(a, io, guard, review, bindings, deadline));
+    try writeFixture(fixture.dir, "input.json", "{}", 0o600);
+    review.input_sha256 = c.digest("{}");
+    try std.testing.expectError(error.NonCanonical, local.load(a, io, guard, review, bindings, deadline));
+    try writeFixture(fixture.dir, "input.json", "{}\n", 0o600);
+    review.input_sha256 = c.digest("{}\n");
+    try std.testing.expectError(error.UnexpectedFields, local.load(a, io, guard, review, bindings, deadline));
+    // Mutated SHAPE ONLY records are rejection cases, never production receipts.
+    input.receipt.purpose = .persistence;
+    var bytes = try c.canonical(a, input);
+    review.input_sha256 = c.digest(bytes);
+    try writeFixture(fixture.dir, "input.json", bytes, 0o600);
+    try std.testing.expectError(error.ProductionPurposeRequired, local.load(a, io, guard, review, bindings, deadline));
+    input.receipt.purpose = .platform_preflight;
+    input.receipt.guard.lun = 7;
+    bytes = try c.canonical(a, input);
+    review.input_sha256 = c.digest(bytes);
+    try writeFixture(fixture.dir, "input.json", bytes, 0o600);
+    try std.testing.expectError(error.IdentityChanged, local.load(a, io, guard, review, bindings, deadline));
+    try std.testing.expectError(error.DeadlineExceeded, local.load(a, io, guard, review, bindings, .{ .expires_ns = 0 }));
+    try expectAbsent(fixture.dir, ".writer.lock");
+}
+
 test "read-only staged entry rejects leftover directories changed bytes modes links and forged input" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
