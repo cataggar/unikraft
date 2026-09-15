@@ -39,10 +39,15 @@ fn inspect(init: std.process.Init) !void {
         return;
     }
     if (args.len == 4 and std.mem.eql(u8, args[1], "transfer")) {
+        var cancellation = try core.process.SignalCancellation.install();
+        defer cancellation.deinit();
         var wiping: core.sensitive.Allocator = .{ .backing = std.heap.page_allocator };
         const executable = try std.process.executablePathAlloc(init.io, wiping.allocator());
         defer wiping.allocator().free(executable);
-        const report = core.transfer.worker.supervise(wiping.allocator(), init.io, args[2], args[3], .{ .executable = executable });
+        const report = core.transfer.worker.supervise(wiping.allocator(), init.io, args[2], args[3], .{
+            .executable = executable,
+            .cancel = cancellation.flag(),
+        });
         var buffer: [core.transfer.worker.protocol.maximum_result]u8 = undefined;
         var writer = std.Io.File.stdout().writer(init.io, &buffer);
         try report.write(&writer.interface);

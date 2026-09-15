@@ -423,6 +423,41 @@ test "cancellation terminates a native blocked worker under an independent clean
     try noChildren();
 }
 
+test "handled uploader signals cancel and reap an admitted native worker" {
+    for ([_]linux.SIG{ .HUP, .INT, .TERM }) |signal| {
+        const fixture = try Fixture.init("blocked", .blob, 4096, false, 5000);
+        defer fixture.deinit();
+        var cancellation = try core.process.SignalCancellation.install();
+        defer cancellation.deinit();
+        const thread = try std.Thread.spawn(.{}, struct {
+            fn send(directory: std.Io.Dir, pid: linux.pid_t, number: linux.SIG) void {
+                for (0..400) |_| {
+                    if (directory.statFile(io, "entered", .{})) |_| {
+                        if (linux.errno(linux.kill(pid, number)) != .SUCCESS)
+                            @panic("uploader fixture signal failed");
+                        return;
+                    } else |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => @panic("uploader fixture observation failed"),
+                    }
+                    const duration: linux.timespec = .{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+                    _ = linux.nanosleep(&duration, null);
+                }
+                @panic("uploader fixture never entered transport");
+            }
+        }.send, .{ fixture.directory.dir, linux.getpid(), signal });
+        defer thread.join();
+        const result = fixture.run(cancellation.flag());
+        try testing.expectEqual(@as(?u8, @intCast(@intFromEnum(signal))), cancellation.signal());
+        try testing.expectEqual(.cancelled, result.failures.primary.?.category);
+        try testing.expectEqual(@as(?bool, true), result.process_cleanup_complete);
+        try testing.expectEqual(.unknown, result.side_effect);
+        try testing.expect(result.progress.?.pending);
+        try safeReport(result);
+        try noChildren();
+    }
+}
+
 test "malformed stale or excessive native output never substitutes successful delivery" {
     for ([_][]const u8{ "malformed", "stale", "flood" }) |mode| {
         const fixture = try Fixture.init(mode, .blob, 17, false, 5000);
