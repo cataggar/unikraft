@@ -76,6 +76,38 @@ EOF
 			mkdir -m 0700 "$root/hash-tools"
 			ln -s "$fake" "$root/hash-tools/sha256sum" ;;
 	esac
+	case $scenario in
+		azure-*|per-boot-azure-log|cumulative-azure-log)
+			local mode=azure_cumulative
+			[[ $scenario != per-boot-azure-log ]] || mode=per_boot
+			[[ $scenario != cumulative-azure-log ]] || mode=cumulative
+			"$jq" --arg mode "$mode" '.serial_mode=$mode' "$root/scope.json" > "$root/scope-next.json"
+			mv "$root/scope-next.json" "$root/scope.json"
+			{
+				case $scenario in
+					azure-interior-nul|azure-interior-nul-removed) printf 'provider\0banner \t\033[0m\n' ;;
+				esac
+				cat "$root/boot1.log"
+			} > "$root/boot1-body.log"
+			cp "$root/boot1-body.log" "$root/boot1.log"
+			printf '%464s' '' | tr ' ' '\000' >> "$root/boot1.log"
+			local filter=
+			case $scenario in
+				azure-wrong-identity) filter='s/44444444444444444444444444444444/55555555555555555555555555555555/' ;;
+				azure-writes) filter='s/:0:0:receipt-verified/:1:0:receipt-verified/' ;;
+				azure-flushes) filter='s/:0:0:receipt-verified/:0:1:receipt-verified/' ;;
+				azure-failure) filter='s/FINAL PASS rc=0/FINAL FAIL rc=1/' ;;
+				azure-missing-platform) filter='/^UK_HYPERV_PLATFORM_READY$/d' ;;
+			esac
+			sed "$filter" "$root/boot2.log" > "$root/boot2-body.log"
+			{
+				if [[ $scenario == azure-full-prefix ]]; then cat "$root/boot1.log"
+				else cat "$root/boot1-body.log"; fi
+				cat "$root/boot2-body.log"
+				printf '\0\0'
+			} > "$root/boot2.log"
+			;;
+	esac
 }
 execute() {
 	local root="$base/$1" tool_path=$PATH
@@ -91,7 +123,9 @@ assert_no_secret() {
 	! grep -R -l 'PRIVATE_FIXTURE_SAS' "$root/attempt" "$root/public.stdout" "$root/public.stderr" >/dev/null
 }
 for scenario in success lowercase-grant storage-azure-grant cumulative-serial incomplete-serial \
-	stopped-boot1 stopped-boot2 stopped-both cached-then-fresh cumulative-cached-then-fresh; do
+	stopped-boot1 stopped-boot2 stopped-both cached-then-fresh cumulative-cached-then-fresh \
+	azure-overwritten-padding azure-full-prefix azure-no-advance-then-fresh \
+	azure-interior-nul azure-cached-then-fresh; do
 	fixture "$scenario"
 	if [[ $scenario == cumulative-serial || $scenario == cumulative-cached-then-fresh ]]; then
 		root="$base/$scenario"
@@ -136,7 +170,7 @@ for scenario in success lowercase-grant storage-azure-grant cumulative-serial in
 	[[ $(grep -c '^vm deallocate ' "$root/calls") == 2 ]]
 	[[ $(grep -c '^transfer$' "$root/calls") == 2 ]]
 	case $scenario in
-		cached-then-fresh|cumulative-cached-then-fresh)
+		cached-then-fresh|cumulative-cached-then-fresh|azure-cached-then-fresh)
 			"$jq" -e '.boot2_freshness == {cached_reads:1,cached_reason:"identical-pinned-boot1"}' \
 				"$root/attempt/outcome.json" >/dev/null
 			"$jq" -e '.boot == 2 and .poll == 2' "$root/attempt/boot2-capture.json" >/dev/null
@@ -144,6 +178,23 @@ for scenario in success lowercase-grant storage-azure-grant cumulative-serial in
 			[[ $(grep -c '^validator serial$' "$root/calls") == 2 ]]
 			"$jq" -rj . "$root/attempt/boot2-serial-1.json" | cmp - "$root/attempt/boot1.log"
 			cmp "$root/boot2.log" "$root/attempt/boot2.log" ;;
+		azure-no-advance-then-fresh)
+			"$jq" -e '.boot2_freshness == {cached_reads:1,cached_reason:"identical-pinned-boot1"}' \
+				"$root/attempt/outcome.json" >/dev/null
+			"$jq" -e '.boot == 2 and .poll == 4' "$root/attempt/boot2-capture.json" >/dev/null
+			"$jq" -e '.boot2_reads == 4' "$root/fake-cloud.json" >/dev/null
+			[[ $(grep -c '^validator serial$' "$root/calls") == 4 ]]
+			"$jq" -rj . "$root/attempt/boot2-serial-1.json" | cmp - "$root/boot1-body.log"
+			"$jq" -rj . "$root/attempt/boot2-serial-3.json" | cmp - "$root/attempt/boot1.log" ;;
+	esac
+	case $scenario in
+		azure-*)
+			cmp "$root/boot1.log" "$root/attempt/boot1.log"
+			cmp "$root/boot2.log" "$root/attempt/boot2.log"
+			second=$(sha256sum "$root/attempt/boot2.log"); second=${second%% *}
+			"$jq" -s -e --arg second "$second" \
+				'all(.[]; .serial_mode == "azure_cumulative") and .[1].serial_sha256 == $second' \
+				"$root/attempt/boot1-capture.json" "$root/attempt/boot2-capture.json" >/dev/null ;;
 	esac
 	! grep -q '^failure diagnostics$' "$root/calls"
 	assert_no_secret "$scenario"
@@ -173,7 +224,11 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 	diagnostics-delete-failure diagnostics-read-delete-failure \
 	different-boot1-log cumulative-different-boot1 cache-boot1-mutated cache-capture-mutated \
 	cache-scope-mutated cache-admission-mutated cache-hash-error cache-binding-hash-error \
-	cache-admission-hash-error cache-then-wrong-identity cache-then-failure; do
+	cache-admission-hash-error cache-then-wrong-identity cache-then-failure \
+	azure-padding-only azure-prefix-changed azure-prefix-truncated azure-interior-nul-removed \
+	azure-missing-prefix azure-wrong-boot azure-wrong-identity azure-writes azure-flushes \
+	azure-failure azure-missing-platform azure-all-zero-boot1 azure-incomplete-boot1 \
+	per-boot-azure-log cumulative-azure-log; do
 	fixture "$scenario"
 	root="$base/$scenario"
 	if [[ $scenario == diagnostics-timeout || $scenario == diagnostics-no-budget ]]; then
@@ -299,15 +354,42 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 	cached_reads=$("$jq" -r .boot2_freshness.cached_reads "$root/attempt/outcome.json")
 	[[ $(grep -c '^Boot2 cached read ' "$root/attempt/driver.stderr" || :) == "$cached_reads" ]]
 	case $scenario in
-		stale-boot1-log)
+		stale-boot1-log|azure-padding-only)
 			reads=$("$jq" -r .boot2_reads "$root/fake-cloud.json")
-			(( cached_reads > 0 && cached_reads <= reads && reads <= 60 ))
+			(( reads > 0 && reads <= 60 ))
+			if [[ $scenario == stale-boot1-log ]]; then
+				(( cached_reads > 0 && cached_reads <= reads ))
+				[[ $(grep -c '^validator serial$' "$root/calls") == 1 ]]
+			else
+				[[ $cached_reads == 0 ]]
+				parses=$(grep -c '^validator serial$' "$root/calls")
+				(( parses > 1 && parses <= reads + 1 ))
+			fi
 			"$jq" -e '.runtime_seconds == 60 and .poll_seconds == 1' "$root/scope.json" >/dev/null
 			(( $(cat "$root/cleanup.seconds") - $(cat "$root/boot2-start.seconds") <= 60 ))
-			[[ $(grep -c '^validator serial$' "$root/calls") == 1 ]]
 			# A later successful-looking cleanup log is still not Boot2 evidence.
 			cmp "$root/boot2.log" "$root/attempt/failure-boot-diagnostics.log"
 			;;
+		azure-all-zero-boot1|azure-incomplete-boot1)
+			[[ $starts == 0 && ! -e $root/attempt/boot2-admission.json &&
+				! -e $root/attempt/boot1.log && ! -e $root/attempt/boot1-capture.json ]]
+			"$jq" -e '.serial_reads == 2' "$root/fake-cloud.json" >/dev/null
+			"$jq" -e '.reserved_boots == 1 and .cleanup_exit == 0 and .accepted == false' \
+				"$root/attempt/outcome.json" >/dev/null
+			[[ $(grep -c '^validator serial$' "$root/calls") == 2 ]]
+			cmp "$root/boot1.log" "$root/attempt/failure-boot-diagnostics.log" ;;
+		azure-*|per-boot-azure-log|cumulative-azure-log)
+			[[ $cached_reads == 0 && $(grep -c '^validator serial$' "$root/calls") == 2 ]]
+			"$jq" -e '.boot2_reads == 1' "$root/fake-cloud.json" >/dev/null
+			case $scenario in
+				azure-prefix-*|azure-interior-nul-removed|azure-missing-prefix|cumulative-azure-log) error=SerialPrefixChanged ;;
+				azure-wrong-boot|per-boot-azure-log) error=WrongBootState ;;
+				azure-wrong-identity) error=IdentityDrift ;;
+				azure-writes|azure-flushes) error=WrongIoLedger ;;
+				azure-failure) error=GuestFailure ;;
+				azure-missing-platform) error=PlatformNotReady ;;
+			esac
+			grep -qx "direct validation failed: $error" "$root/attempt/serial-check.stderr" ;;
 		different-boot1-log|cumulative-different-boot1)
 			[[ $cached_reads == 0 && $(grep -c '^validator serial$' "$root/calls") == 2 ]]
 			"$jq" -e '.boot2_reads == 1' "$root/fake-cloud.json" >/dev/null
@@ -331,12 +413,16 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 			;;
 	esac
 	case $scenario in
-		stale-boot1-log|different-boot1-log|cumulative-different-boot1|cache-*)
+		azure-all-zero-boot1|azure-incomplete-boot1) ;;
+		stale-boot1-log|different-boot1-log|cumulative-different-boot1|cache-*|azure-*|per-boot-azure-log|cumulative-azure-log)
 			[[ $starts == 1 && $(grep -c '^vm deallocate ' "$root/calls") == 1 &&
 				! -e $root/attempt/boot2.log && ! -e $root/attempt/boot2-capture.json ]]
 			"$jq" -e '.reserved_boots == 2 and .primary_exit != 0 and .cleanup_exit == 0 and
 				.accepted == false and .failure_diagnostics == {attempted:true,exit:0,decoded:true}' \
 				"$root/attempt/outcome.json" >/dev/null
+			case $scenario in
+				azure-*|per-boot-azure-log|cumulative-azure-log) cmp "$root/boot1.log" "$root/attempt/boot1.log" ;;
+			esac
 			;;
 	esac
 	assert_no_secret "$scenario"

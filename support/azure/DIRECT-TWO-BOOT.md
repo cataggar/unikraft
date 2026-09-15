@@ -33,9 +33,24 @@ the sole admitted start. Its first post-start diagnostic capture was
 byte-identical to pinned Boot1, including the old timings and write/flush
 markers. The failure-only capture was also the old Boot1 text. No genuine
 Boot2 result was observed; the attempt failed and owned cleanup completed.
-All three experiment grants remain consumed, with their local seed sets and
+Those three experiment grants remain consumed, with their local seed sets and
 prior evidence unchanged. This readonly polling correction authorizes no
 new cloud attempt.
+
+A fourth separately authorized fresh experiment on 2026-09-15 passed Boot1,
+retained deallocation/identity checks and the sole Boot2 start. Three exact
+cached Boot1 snapshots were skipped. A later **normal** diagnostic capture
+contained appended boot data, but the approved `per_boot` mode rejected it:
+the original 5632-byte Boot1 capture had 5168 log bytes followed by 464 terminal
+NULs; the new 10752-byte capture preserved those 5168 bytes and replaced the
+padding with appended data, not the entire raw Boot1 prefix. Read-only,
+non-authoritative postrun analysis of the exact suffix from that original
+normal capture passed the unchanged native Boot2 identity, receipt, zero-I/O,
+platform and completion checks. Failure-only diagnostics were not used for
+that analysis. The original scope/mode, raw captures, ledger and outcome
+remain immutable: **accepted=false, primary=1, cleanup=0, boots=2, cached=3**.
+That analysis does not retrospectively accept the run. All four grants are
+consumed; this opt-in framing change authorizes no fifth attempt.
 
 ## Authorization and input custody
 
@@ -209,7 +224,26 @@ are capped at 8 MiB. Serial's Azure JSON-string wrapper is
 retained privately then decoded; escaped one-line JSON is never grepped as a
 guest transcript. Select `per_boot` for logs replaced on each boot, or
 `cumulative` only when the complete Boot1 bytes are retained as a prefix.
-Both require exact phase-specific evidence, not a fresh platform marker alone.
+These existing modes are unchanged, with no fallback or auto-detection.
+Explicitly select `"serial_mode": "azure_cumulative"` only for Azure's
+append-over-terminal-NUL framing:
+
+- First validate the **raw** Boot1 log with every canonical stage and the
+  platform gate, as before. Empty, all-NUL or incomplete Boot1 cannot admit
+  Boot2. Raw log/capture/scope/admission hashes continue to bind unchanged bytes.
+- Derive an in-memory Boot1 view by removing **only its terminal NUL run**.
+  Canonical `parseWorkload` supplies this view's exact byte length and SHA256.
+  Interior NULs, whitespace, ANSI sequences and every nonzero byte remain
+  inside that exact prefix gate; no marker scanning or normalization repairs
+  a missing, changed or truncated prefix.
+- Apply existing `boot2Suffix` to the unmodified cumulative candidate and
+  that prefix evidence, then require full canonical Boot2, unchanged identity,
+  zero writes/flushes, platform readiness and completion on the exact suffix.
+  Both overwritten terminal padding and a fully retained raw Boot1 prefix
+  work. Candidate terminal NULs need no trimming: canonical parsing already
+  handles them, including a padding-only suffix as incomplete.
+
+All modes require exact phase-specific evidence, not a fresh platform marker alone.
 During Boot2 only, a decoded candidate whose full SHA256 exactly matches the
 unchanged pinned Boot1 is classified as **not yet fresh**. Before every such
 skip, the controller revalidates original Boot1, its capture record, scope
@@ -217,10 +251,14 @@ and Boot2 admission hashes. It does not invoke the native parser on cached
 bytes or promote them to `boot2.log` or a Boot2 capture. The read consumes the
 existing poll count, delay and execution deadline; none is increased, and no
 additional start or refresh mutation is issued. Cumulative exact no-advance
-remains incomplete under the same bounds.
+remains incomplete under the same bounds. In `azure_cumulative`, unchanged
+nonpadding Boot1 bytes alone, or with only a different amount of terminal NUL
+padding, also remain incomplete under those existing bounds. No new time,
+read-count or output-size budget is introduced.
 Every different candidate still goes through the unchanged full native
-canonical, platform, identity and zero-write/flush checks; a different old
-Boot1 is not treated as cache. Hash-read failures propagate instead of being
+canonical, platform, identity and zero-write/flush checks in its explicitly
+selected framing mode; a nonpadding change to old Boot1 is not treated as
+cache. Hash-read failures propagate instead of being
 classified as fresh or cached. Private `driver.stderr` records cached-read
 indices and `outcome.boot2_freshness` records `cached_reads` and
 `cached_reason` (`identical-pinned-boot1`, or null when none were skipped).
@@ -232,8 +270,10 @@ and rechecked before admission, before Boot2 parsing and before acceptance.
 `boot2-capture.json` attributes the new capture to the original VM UUID, its
 post-start observation, the durable Boot2 admission, selected serial mode,
 raw CLI wrapper and decoded log hashes. Reset diagnostics never replace or
-reinterpret Boot1 evidence; cumulative diagnostics must preserve its exact
-bytes. These are local custody/operation records, not a fabricated guest boot
+reinterpret Boot1 evidence; `cumulative` must preserve its exact raw bytes,
+while `azure_cumulative` must preserve its exact terminal-NUL-unpadded view.
+No stripped log replaces a raw capture or custody hash. These are local
+custody/operation records, not a fabricated guest boot
 receipt or evidence that an unobserved external restart could not occur.
 
 `outcome.json` keeps primary and cleanup exits separate. Successful deletion
@@ -285,5 +325,13 @@ support/scripts/tests/test_hyperv_direct_two_boot.sh \
 The shell suite explicitly substitutes a checked-in isolated fake CLI and
 transfer/input reader, whose source has no real-CLI/network/disk delegation.
 The native serial parser still processes fixture bytes. Native fixtures
-exercise seed/manifest/footer validation in memory, not on real disks.
+exercise seed/manifest/footer validation in memory, not on real disks, and
+call the same direct-helper framing functions used by the production CLI.
+Framing cases cover overwritten/retained padding, no advancement, interior
+NUL/ANSI/whitespace custody, prefix drift/truncation, canonical refusals and
+unchanged legacy modes. Lifecycle cases also retain raw hashes/captures,
+the sole start, bounded polling and failure-only diagnostic non-authority.
 These tests cannot authorize or establish live #89 acceptance.
+
+The shell/jq orchestration and fixture migration remains follow-up #144;
+this change adds only opt-in native serial framing, not that rewrite.
