@@ -1733,6 +1733,16 @@ static int persistence_log_has_unavailable(const char *output)
 		       output, "UK_HYPERV_PLATFORM_READY", 0);
 }
 
+static int persistence_ready_log_valid(const char *output)
+{
+	return persistence_log_line_count(
+		       output, "UK_HYPERV_PLATFORM_READY", 0) == 1 &&
+	       !persistence_log_line_count(
+		       output, "HYPERV_PERSISTENCE SELECT UNAVAILABLE ", 1) &&
+	       !persistence_log_line_count(
+		       output, "UK_HYPERV_PERSISTENCE_UNAVAILABLE:", 1);
+}
+
 static void retained_request_done(struct uk_blkreq *request, void *cookie)
 {
 	(void)request;
@@ -5777,7 +5787,7 @@ static int run_persistence_workflow_regression(
 	rc = capture_persistence_output(
 		output, sizeof(output), &result);
 	if (rc || result != HYPERV_ACCEPTANCE_PASS ||
-	    persistence_log_has_unavailable(output) ||
+	    !persistence_ready_log_valid(output) ||
 	    persistence_log_line_count(
 		    output, "HYPERV_PERSISTENCE BOOT1_WRITE PASS ", 1) != 1 ||
 	    persistence_log_line_count(
@@ -5798,7 +5808,7 @@ static int run_persistence_workflow_regression(
 	rc = capture_persistence_output(
 		output, sizeof(output), &result);
 	if (rc || result != HYPERV_ACCEPTANCE_PASS ||
-	    persistence_log_has_unavailable(output) ||
+	    !persistence_ready_log_valid(output) ||
 	    persistence_log_line_count(
 		    output, "HYPERV_PERSISTENCE BOOT2_READ PASS ", 1) != 1 ||
 	    persistence_log_line_count(

@@ -458,7 +458,14 @@ static int run(void)
 
 static void success(unsigned int boot)
 {
+	const char *ready;
+	const char *selected;
+
 	assert(run() == HYPERV_ACCEPTANCE_PASS);
+	ready = strstr(serial, "UK_HYPERV_PLATFORM_READY\n");
+	selected = strstr(serial, "HYPERV_PERSISTENCE SELECT PASS ");
+	assert(ready && selected && ready < selected);
+	assert(!strstr(ready + 1, "UK_HYPERV_PLATFORM_READY"));
 	assert(strstr(serial,
 		"UK_HYPERV_PERSISTENCE_IDENTITY:1:2:"
 		"00112233445566778899aabbccddeeff:"
@@ -754,6 +761,7 @@ static void test_discovery_readiness(void)
 			 "HYPERV_PERSISTENCE SELECT FAIL rc=%d writes=0\n",
 			 terminal[i]);
 		assert(strstr(serial, marker));
+		assert(!strstr(serial, "UK_HYPERV_PLATFORM_READY"));
 		assert(status_calls == 1 && !inventory_calls && !submitted);
 		assert(!clock_ns);
 	}
@@ -775,11 +783,13 @@ static void test_discovery_readiness(void)
 	no_mutation();
 	assert(clock_ns == PERSISTENCE_BIND_TIMEOUT_NS);
 	assert(!inventory_calls && !submitted);
+	assert(!strstr(serial, "UK_HYPERV_PLATFORM_READY"));
 
 	fixture();
 	visible_disks = 0;
 	assert(run() == HYPERV_ACCEPTANCE_UNAVAILABLE);
 	assert(strstr(serial, "UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices"));
+	assert(strstr(serial, "UK_HYPERV_PLATFORM_READY\n"));
 	assert(clock_ns == PERSISTENCE_BIND_TIMEOUT_NS);
 	assert(!submitted && !disks[DATA].writes && !disks[DATA].flushes);
 	cases++;

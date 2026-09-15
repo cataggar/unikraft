@@ -10,7 +10,14 @@ or reinterpret a nested #120 completion receipt.
 The direct native platform boot observed on 2026-09-14 reached
 `UK_HYPERV_PLATFORM_READY` and passed networking, but subsequently failed
 storage binding and returned 1. Its boot-only exit 0 was **not #89 acceptance**.
-This harness has offline fixture coverage, not a live persistence result.
+A later guarded direct attempt on the same date completed real Boot1
+enrollment, five writes, three flushes and receipt/readback, but the controller
+refused Boot2 because the successful workload omitted its platform marker.
+That attempt was cleaned up and remains consumed; it did not establish
+reboot persistence. The guarded workload now emits `UK_HYPERV_PLATFORM_READY`
+after complete discovery and unique target admission, before workload
+mutation. The controller still requires that marker and the full persistence
+evidence independently; neither one substitutes for the other.
 
 ## Authorization and input custody
 

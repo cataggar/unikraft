@@ -883,6 +883,7 @@ int hyperv_acceptance_persistence_main(void)
 		printf("HYPERV_PERSISTENCE SELECT FAIL rc=%d writes=0\n", rc);
 		return HYPERV_ACCEPTANCE_FAIL;
 	}
+	puts("UK_HYPERV_PLATFORM_READY");
 	printf("HYPERV_PERSISTENCE SELECT PASS id=%" PRIu16
 	       " controller=%" PRIu16 " state=%d\n",
 	       persistence_selected.target.mapping.blkdev_id,
