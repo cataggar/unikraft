@@ -65,6 +65,11 @@ pub fn main(init: std.process.Init) !void {
         try emit(1, "before-term\n");
         while (!cancellation.flag().load(.acquire)) sleep(10);
         try emit(2, "private-after-term\n");
+    } else if (std.mem.eql(u8, mode, "closed-running")) {
+        try ignoreTerm();
+        _ = linux.close(1);
+        _ = linux.close(2);
+        while (true) sleep(1000);
     } else if (std.mem.eql(u8, mode, "transfer")) {
         if (args.len != 4) return error.InvalidFixture;
         try emit(1, "{\"fixture_only\":true}\n");
@@ -97,6 +102,47 @@ pub fn main(init: std.process.Init) !void {
         sleep(try std.fmt.parseInt(u32, args[2], 10));
         try emit(1, "nested-reaped\n");
         std.process.exit(if (result.failures.primary != null) 7 else 0);
+    } else if (std.mem.eql(u8, mode, "orphan-pipes") or std.mem.eql(u8, mode, "orphan-closed") or
+        std.mem.eql(u8, mode, "escaped-closed"))
+    {
+        const close_output = !std.mem.eql(u8, mode, "orphan-pipes");
+        const escape = std.mem.eql(u8, mode, "escaped-closed");
+        var ready: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+        defer _ = linux.close(ready[0]);
+        const child = linux.fork();
+        if (linux.errno(child) != .SUCCESS) {
+            _ = linux.close(ready[1]);
+            return error.ForkFailed;
+        }
+        if (child == 0) {
+            // Only raw syscalls and stack operations after fork. The leader
+            // cannot exit until this live child's pipe/signal state is fixed.
+            _ = linux.close(ready[0]);
+            ignoreTerm() catch linux.exit_group(126);
+            if (close_output) {
+                _ = linux.close(1);
+                _ = linux.close(2);
+            }
+            if (escape and linux.errno(linux.setpgid(0, 0)) != .SUCCESS) linux.exit_group(126);
+            const marker = [_]u8{1};
+            if (linux.write(ready[1], &marker, 1) != 1) linux.exit_group(126);
+            _ = linux.close(ready[1]);
+            while (true) {
+                var fds: [0]linux.pollfd = .{};
+                _ = linux.poll(&fds, 0, 1000);
+            }
+        }
+        _ = linux.close(ready[1]);
+        var marker: [1]u8 = undefined;
+        while (true) {
+            const count = linux.read(ready[0], &marker, 1);
+            if (linux.errno(count) == .INTR) continue;
+            if (count != 1 or marker[0] != 1) return error.FixtureHandshake;
+            break;
+        }
+        var text: [32]u8 = undefined;
+        try emit(1, try std.fmt.bufPrint(&text, "{d}\n", .{child}));
     } else if (std.mem.eql(u8, mode, "escaped") or std.mem.eql(u8, mode, "tree")) {
         const child = linux.fork();
         if (linux.errno(child) != .SUCCESS) return error.ForkFailed;

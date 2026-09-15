@@ -135,6 +135,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
 /// Opt-in private raw capture. Borrows a live writer guard and never hands file
 /// descriptors to the child. Both names are consume-once, including failures.
 /// This dedicated supervisor must have no unrelated children or child reapers.
+/// For non-nested commands, observed leader exit plus both pipe EOFs ends the
+/// command: any remaining group members are abandoned and killed without grace.
+/// EOF is not proof of descendant exit; the final group signal and full reaping
+/// are still required. Running work and inherited open pipes retain TERM grace.
 pub fn runPrivate(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -279,6 +283,8 @@ const CleanupPolicy = struct {
     fault: ?PrivateTestFault = null,
 };
 
+const Completion = enum { unfinished, closed_command };
+
 fn supervise(allocator: std.mem.Allocator, options: Options, capture: *Capture, policy: CleanupPolicy) !Execution {
     var result: Execution = .{};
     if (try options.deadline.expired()) {
@@ -297,7 +303,7 @@ fn supervise(allocator: std.mem.Allocator, options: Options, capture: *Capture, 
     defer _ = linux.close(child.stdout);
     defer _ = linux.close(child.stderr);
     defer _ = linux.close(child.control);
-    monitor(&child, options, capture) catch |err| {
+    const leader_exited = if (monitor(&child, options, capture)) true else |err| failure: {
         result.failures.primary = .{
             .stage = if (err == error.SpawnFailed) .process_spawn else .process_run,
             .category = switch (err) {
@@ -308,10 +314,13 @@ fn supervise(allocator: std.mem.Allocator, options: Options, capture: *Capture, 
                 else => .local_io,
             },
         };
+        break :failure false;
     };
+    const completion: Completion = if (capture.private != null and !policy.nested_supervisor and
+        leader_exited and capture.stdout_eof and capture.stderr_eof) .closed_command else .unfinished;
     // This is an independent budget, also used after normal leader exit so a
     // successful parent cannot strand background descendants holding pipes.
-    cleanup(pid, options.cleanup_ms, &result, policy) catch {
+    cleanup(pid, options.cleanup_ms, &result, policy, completion) catch {
         result.cleanup_complete = false;
         result.unreaped_group = pid;
         result.failures.cleanup = .{ .stage = .process_cleanup, .category = .cleanup_failed };
@@ -473,22 +482,25 @@ fn exited(pid: linux.pid_t) !bool {
     }
 }
 
-fn cleanup(pid: linux.pid_t, milliseconds: u32, result: *Execution, policy: CleanupPolicy) !void {
+fn cleanup(pid: linux.pid_t, milliseconds: u32, result: *Execution, policy: CleanupPolicy, completion: Completion) !void {
     var final_signal_sent = false;
     errdefer if (!final_signal_sent) signalGroup(pid, .KILL) catch {};
     var deadline = try Deadline.afterMilliseconds(milliseconds);
     if (policy.deadline) |outer| deadline.expires_ns = @min(deadline.expires_ns, outer.expires_ns);
-    if (policy.nested_supervisor) {
-        try signalLeader(pid, .TERM);
-    } else try signalGroup(pid, .TERM);
-    // Retain the unreaped group leader until the final group signal to prevent
-    // PID/PGID reuse from ever directing a signal at an unrelated process.
-    var grace = try Deadline.afterMilliseconds(policy.term_grace_ms orelse @min(50, milliseconds / 4));
-    grace.expires_ns = @min(grace.expires_ns, deadline.expires_ns -| (@as(u64, policy.reap_reserve_ms) * std.time.ns_per_ms));
-    while (!try grace.expired()) {
-        if (policy.nested_supervisor and try exited(pid)) break;
-        try pause(try grace.waitMilliseconds(10));
+    if (completion == .unfinished) {
+        if (policy.nested_supervisor) {
+            try signalLeader(pid, .TERM);
+        } else try signalGroup(pid, .TERM);
+        var grace = try Deadline.afterMilliseconds(policy.term_grace_ms orelse @min(50, milliseconds / 4));
+        grace.expires_ns = @min(grace.expires_ns, deadline.expires_ns -| (@as(u64, policy.reap_reserve_ms) * std.time.ns_per_ms));
+        while (!try grace.expired()) {
+            if (policy.nested_supervisor and try exited(pid)) break;
+            try pause(try grace.waitMilliseconds(10));
+        }
     }
+    // Even a closed command can leave live descendants with closed output.
+    // Its unreaped leader pins PID/PGID ownership through the final signal.
+    // Only the subsequent reaping proof permits a successful cleanup.
     try signalGroup(pid, .KILL);
     final_signal_sent = true;
     while (true) {

@@ -43,6 +43,22 @@ pub fn noChildren() !void {
     try std.testing.expectEqual(.CHILD, std.os.linux.errno(std.os.linux.waitpid(-1, &status, std.os.linux.W.NOHANG)));
 }
 
+/// Failing cleanup regressions must not strand their synthetic descendants.
+/// Never signal a PID already reaped by the supervisor and possibly reused.
+pub fn reapFixtureChildIfOwned(pid: std.os.linux.pid_t) void {
+    if (pid <= 0) return;
+    const linux = std.os.linux;
+    var info = std.mem.zeroes(linux.siginfo_t);
+    while (true) switch (linux.errno(linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT, null))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return,
+    };
+    _ = linux.kill(pid, .KILL);
+    var status: u32 = 0;
+    while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+}
+
 pub fn cancelAfter(flag: *std.atomic.Value(bool), milliseconds: u32) void {
     const duration: std.os.linux.timespec = .{
         .sec = milliseconds / 1000,

@@ -6,6 +6,121 @@ const allocator = support.allocator;
 const io = support.io;
 const linux = std.os.linux;
 
+test "completed private commands return promptly including nonzero private output" {
+    const executable = try support.executable();
+    defer allocator.free(executable);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    for ([_][]const u8{ "0", "7" }) |code| {
+        for (0..3) |_| {
+            var fixture = try support.Fixture.init();
+            defer fixture.deinit();
+            var lock = try fixture.directory.lock(io);
+            defer lock.close(io);
+            const started = try process.monotonicNanoseconds();
+            const result = try process.runPrivate(allocator, io, &lock, "out", "err", .{ .process = .{
+                .argv = &.{ executable, "bytes", "17", "23", code },
+                .environment = &environment,
+                .cwd = fixture.directory.dir,
+                .deadline = try process.Deadline.afterMilliseconds(5000),
+                .cleanup_ms = 3000,
+            } });
+            const elapsed = (try process.monotonicNanoseconds()) - started;
+            // This permits substantial scheduler/filesystem jitter but rejects
+            // the former unconditional two-second completed-command delay.
+            try testing.expect(elapsed < 1500 * std.time.ns_per_ms);
+            try testing.expect(result.execution.cleanup_complete);
+            try testing.expect(result.execution.failures.cleanup == null);
+            try testing.expectEqual(@as(u8, code[0] - '0'), result.execution.termination.?.exited);
+            if (code[0] == '0') {
+                try result.requireSuccess();
+            } else {
+                try testing.expectEqual(.child_failed, result.execution.failures.primary.?.category);
+                try testing.expectEqual(.partial, result.capture);
+                try testing.expectError(error.UnsuccessfulCapture, result.requireSuccess());
+            }
+            var out = try fixture.read("out");
+            defer out.deinit();
+            var err = try fixture.read("err");
+            defer err.deinit();
+            try testing.expectEqual(@as(usize, 17), out.bytes().len);
+            try testing.expectEqual(@as(usize, 23), err.bytes().len);
+            try testing.expect(std.mem.allEqual(u8, out.bytes(), 'o'));
+            try testing.expect(std.mem.allEqual(u8, err.bytes(), 'e'));
+            try support.noChildren();
+        }
+    }
+}
+
+test "exited leaders cannot abandon either open-pipe or closed-pipe descendants" {
+    const executable = try support.executable();
+    defer allocator.free(executable);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    for ([_][]const u8{ "orphan-pipes", "orphan-closed" }, 0..) |mode, i| {
+        var fixture = try support.Fixture.init();
+        defer fixture.deinit();
+        var lock = try fixture.directory.lock(io);
+        defer lock.close(io);
+        const started = try process.monotonicNanoseconds();
+        const result = try process.runPrivate(allocator, io, &lock, "out", "err", .{ .process = .{
+            .argv = &.{ executable, mode },
+            .environment = &environment,
+            .cwd = fixture.directory.dir,
+            .deadline = try process.Deadline.afterMilliseconds(5000),
+            .cleanup_ms = 3000,
+        } });
+        const elapsed = (try process.monotonicNanoseconds()) - started;
+        var output = try fixture.read("out");
+        defer output.deinit();
+        const descendant = try std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, output.bytes(), "\n"), 10);
+        defer support.reapFixtureChildIfOwned(descendant);
+        if (i == 0) {
+            try testing.expect(elapsed >= 2000 * std.time.ns_per_ms and elapsed < 3200 * std.time.ns_per_ms);
+        } else {
+            try testing.expect(elapsed < 1500 * std.time.ns_per_ms);
+        }
+        try result.requireSuccess();
+        try testing.expectEqual(.SRCH, linux.errno(linux.kill(descendant, @enumFromInt(0))));
+        try support.noChildren();
+    }
+}
+
+test "closed output alone cannot bypass timeout or cancellation TERM grace" {
+    const executable = try support.executable();
+    defer allocator.free(executable);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    for ([_]bool{ false, true }) |cancelled| {
+        var fixture = try support.Fixture.init();
+        defer fixture.deinit();
+        var lock = try fixture.directory.lock(io);
+        defer lock.close(io);
+        var cancel = std.atomic.Value(bool).init(false);
+        const thread = try std.Thread.spawn(.{}, support.cancelAfter, .{ &cancel, @as(u32, 150) });
+        defer thread.join();
+        const started = try process.monotonicNanoseconds();
+        const result = try process.runPrivate(allocator, io, &lock, "out", "err", .{ .process = .{
+            .argv = &.{ executable, "closed-running" },
+            .environment = &environment,
+            .cwd = fixture.directory.dir,
+            .deadline = try process.Deadline.afterMilliseconds(if (cancelled) 5000 else 150),
+            .cleanup_ms = 3000,
+            .cancel = if (cancelled) &cancel else null,
+        } });
+        const elapsed = (try process.monotonicNanoseconds()) - started;
+        try testing.expect(elapsed >= 2000 * std.time.ns_per_ms and elapsed < 3200 * std.time.ns_per_ms);
+        try testing.expectEqual(@as(support.core.diagnostics.Category, if (cancelled) .cancelled else .timeout), result.execution.failures.primary.?.category);
+        try testing.expectEqual(.KILL, result.execution.termination.?.signal);
+        try testing.expectEqual(.partial, result.capture);
+        try testing.expectEqual(@as(usize, 0), result.stdout_bytes);
+        try testing.expectEqual(@as(usize, 0), result.stderr_bytes);
+        try testing.expect(result.execution.cleanup_complete);
+        try testing.expectError(error.UnsuccessfulCapture, result.requireSuccess());
+        try support.noChildren();
+    }
+}
+
 test "private capture accepts exact eight MiB per stream while legacy stays at four" {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
