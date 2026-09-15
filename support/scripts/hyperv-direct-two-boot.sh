@@ -60,6 +60,7 @@ failure_diagnostics_attempted=false failure_diagnostics_exit=null failure_diagno
 grant_os=0 grant_data=0
 os_uuid= data_uuid= vm_uuid=
 boot1_sha= boot1_capture_sha= admission_sha=
+boot2_cached_reads=0
 scope_sha=$(sha256sum -- "$scope")
 scope_sha=${scope_sha%% *}
 tags=("uk-direct-run=$owner" "unikraft-run=$prefix" "image-sha256=$image_sha" "managed-by=unikraft-hyperv")
@@ -208,10 +209,13 @@ cleanup() {
 		--argjson boots "$boots" --argjson absent "$absent" --argjson accepted "$accepted" --argjson created "$group_intended" \
 		--argjson diagnostics_attempted "$failure_diagnostics_attempted" \
 		--argjson diagnostics_exit "$failure_diagnostics_exit" --argjson diagnostics_decoded "$failure_diagnostics_decoded" \
+		--argjson cached_reads "$boot2_cached_reads" \
 		'{phase:$phase,primary_exit:$primary,cleanup_exit:$cleanup,reserved_boots:$boots,
 		  persistence_evidence_complete:$accepted,owned_group_absent:$absent,
 		  group_creation_attempted:($created == 1),
 		  failure_diagnostics:{attempted:$diagnostics_attempted,exit:$diagnostics_exit,decoded:$diagnostics_decoded},
+		  boot2_freshness:{cached_reads:$cached_reads,
+		    cached_reason:(if $cached_reads > 0 then "identical-pinned-boot1" else null end)},
 		  accepted:($primary == 0 and $cleanup == 0 and $accepted and $absent)}' > "$run/outcome.json"
 	local recording=$?
 	sync -f "$run/outcome.json" || recording=1
@@ -347,10 +351,20 @@ digest() {
 	bounded sha256sum -- "$1" | cut -d ' ' -f 1
 }
 verify_boot1() {
-	[[ -n $boot1_sha && -n $boot1_capture_sha &&
-		$(digest "$run/boot1.log") == "$boot1_sha" &&
-		$(digest "$run/boot1-capture.json") == "$boot1_capture_sha" &&
-		$(digest "$scope") == "$scope_sha" ]] || die "original Boot1 evidence or scope changed"
+	local serial_sha capture_sha current_scope_sha
+	[[ -n $boot1_sha && -n $boot1_capture_sha ]] || die "original Boot1 evidence or scope changed"
+	serial_sha=$(digest "$run/boot1.log") || return
+	capture_sha=$(digest "$run/boot1-capture.json") || return
+	current_scope_sha=$(digest "$scope") || return
+	[[ $serial_sha == "$boot1_sha" && $capture_sha == "$boot1_capture_sha" &&
+		$current_scope_sha == "$scope_sha" ]] || die "original Boot1 evidence or scope changed"
+}
+verify_boot2_admission() {
+	local current_admission_sha
+	verify_boot1 || return
+	[[ -n $admission_sha ]] || die "Boot2 admission changed"
+	current_admission_sha=$(digest "$run/boot2-admission.json") || return
+	[[ $current_admission_sha == "$admission_sha" ]] || die "Boot2 admission changed"
 }
 capture_record() {
 	local boot=$1 count=$2 serial_sha raw_sha observed mode
@@ -359,9 +373,7 @@ capture_record() {
 	observed=$(digest "$run/boot$boot-vm.json")
 	mode=$(get .serial_mode)
 	if [[ $boot == 2 ]]; then
-		verify_boot1
-		[[ -n $admission_sha && $(digest "$run/boot2-admission.json") == "$admission_sha" ]] ||
-			die "Boot2 admission changed"
+		verify_boot2_admission
 	else boot1_sha=$serial_sha; fi
 	(
 		set -C
@@ -404,7 +416,7 @@ admit_boot2() {
 	admission_sha=$(digest "$run/boot2-admission.json")
 }
 serial() {
-	local boot=$1 count=0 result
+	local boot=$1 count=0 result candidate_sha
 	while (( SECONDS < deadline && count < 60 )); do
 		count=$((count + 1))
 		if az_call "boot$boot-serial-$count" vm boot-diagnostics get-boot-log --resource-group "$group" --name "$vm"; then
@@ -416,9 +428,16 @@ serial() {
 				bounded "$validator" serial "$scope" "$run/boot1-candidate.log" \
 					> "$run/serial-check.stdout" 2> "$run/serial-check.stderr" || result=$?
 			else
-				verify_boot1
-				bounded "$validator" serial "$scope" "$run/boot1.log" "$run/boot2-candidate.log" \
-					> "$run/serial-check.stdout" 2> "$run/serial-check.stderr" || result=$?
+				verify_boot2_admission
+				candidate_sha=$(digest "$run/boot2-candidate.log") || return
+				if [[ $candidate_sha == "$boot1_sha" ]]; then
+					boot2_cached_reads=$((boot2_cached_reads + 1))
+					printf 'Boot2 cached read %d: identical-pinned-boot1; waiting for fresh bytes\n' "$count" >&2
+					result=2
+				else
+					bounded "$validator" serial "$scope" "$run/boot1.log" "$run/boot2-candidate.log" \
+						> "$run/serial-check.stdout" 2> "$run/serial-check.stderr" || result=$?
+				fi
 			fi
 			if (( result == 0 )); then
 				mv -- "$run/boot$boot-candidate.log" "$run/boot$boot.log"
