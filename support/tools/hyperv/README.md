@@ -103,6 +103,19 @@ The required Hyper-V integration job restores dependencies in scratch and runs
 all three selectors in Debug and ReleaseSafe. It also exercises the standalone
 transfer build in ReleaseSafe, without implicit source-tree fetching.
 
+The `zig-hyperv` image producer also invokes
+`.github/scripts/hyperv-native-public-fixtures.sh` for the public-image Debug
+and ReleaseSafe packaging/export/import suites, and
+`.github/scripts/hyperv-native-proofs-ci.sh` for linked-image proofs and
+compiler probes. These credential-free CI helpers run from the repository
+root with the workflow's pinned tools and `RUNNER_TEMP` setup. Public-image
+dependencies are restored beside copied manifests outside the checkout;
+optimization modes retain separate caches, fixture roots and installed tools.
+The helpers print elapsed, user and system seconds alongside the existing Zig
+build summaries, including timings on failure. Public-image timings separate
+restore, each mode and the total; they are observations, not image admission or
+a claim of reduced critical-path latency.
+
 ## Preflight engine integration
 
 The separate [native preflight package](preflight/README.md) implements the

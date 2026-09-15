@@ -917,24 +917,7 @@ jobs:
 
     - name: Run native public Hyper-V packaging, export and import fixtures
       run: |
-        set -euo pipefail
-        umask 077
-        root="${RUNNER_TEMP}/hyperv-ci/native-public-image"
-        mkdir -p "${root}/restore"
-        cp support/tools/hyperv/public_image/build.zig \
-          support/tools/hyperv/public_image/build.zig.zon "${root}/restore/"
-        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
-          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        for mode in Debug ReleaseSafe; do
-          mkdir -p "${root}/${mode}/fixtures" "${root}/${mode}/import-fixtures"
-          zig build --build-file support/tools/hyperv/public_image/build.zig \
-            --system "${root}/restore/zig-pkg" \
-            --cache-dir "${root}/${mode}/zig-local-cache" \
-            --prefix "${root}/${mode}/out" \
-            -Dtest-root="${root}/${mode}/fixtures" \
-            -Dimport-test-root="${root}/${mode}/import-fixtures" \
-            -Doptimize="${mode}" -j2 test test-import install --summary all
-        done
+        bash .github/scripts/hyperv-native-public-fixtures.sh
 
     - name: Exercise explicit private native Make configuration
       run: |
@@ -1004,14 +987,7 @@ jobs:
 
     - name: Run native Hyper-V linked-image proof and compiler-probe fixtures
       run: |
-        set -euo pipefail
-        root="${RUNNER_TEMP}/hyperv-ci/native-image-proofs"
-        ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
-          zig build -j2 test-hyperv-image-proofs build-hyperv-image-proofs \
-            test-native-compiler-options \
-            --cache-dir "${root}/zig-local-cache" \
-            --prefix "${root}/out" "-Doutput=${root}/build" \
-            --summary all
+        bash .github/scripts/hyperv-native-proofs-ci.sh
 
     - name: Run native Hyper-V core, transfer, and worker fixtures
       run: |
