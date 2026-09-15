@@ -8,6 +8,7 @@ const c = core.contracts;
 const files = core.private_files;
 
 pub const Artifact = struct { path: []const u8, size: u64, sha256: []const u8 };
+pub const SerialMode = enum { cumulative, per_boot, azure_cumulative };
 pub const Scope = struct {
     schema: []const u8,
     version: u8,
@@ -31,7 +32,7 @@ pub const Scope = struct {
     lun: u8,
     sectors: u64,
     sector_size: u16,
-    serial_mode: enum { cumulative, per_boot },
+    serial_mode: SerialMode,
     runtime_seconds: u32,
     cleanup_seconds: u32,
     operation_seconds: u32,
@@ -293,6 +294,30 @@ pub fn inspect(allocator: std.mem.Allocator, io: std.Io, scope: Scope) !void {
     try inspectDisk(io, scope.os_vhd, null, true);
 }
 
+pub fn serialFirst(raw: []const u8, mode: SerialMode, input: evidence.EvidenceInput) !evidence.Evidence {
+    if (raw.len == 0) return error.EvidenceIncomplete;
+    const first = try evidence.parseWorkload(raw, 1, input, null);
+    if (std.mem.indexOf(u8, raw, "UK_HYPERV_PLATFORM_READY") == null) return error.PlatformNotReady;
+    // Azure may overwrite terminal NUL padding when appending the next boot.
+    // This is only a prefix view; the harness still pins the complete raw log.
+    return if (mode == .azure_cumulative)
+        evidence.parseWorkload(std.mem.trimEnd(u8, raw, "\x00"), 1, input, null)
+    else
+        first;
+}
+
+pub fn serialSecond(raw: []const u8, mode: SerialMode, input: evidence.EvidenceInput, first: evidence.Evidence) !void {
+    if (raw.len == 0) return error.EvidenceIncomplete;
+    const second = switch (mode) {
+        .per_boot => raw,
+        .cumulative, .azure_cumulative => try evidence.boot2Suffix(raw, first),
+    };
+    // Keep candidate padding intact: canonical parsing handles NULs, including
+    // a padding-only suffix as incomplete rather than evidence of another boot.
+    _ = try evidence.parseWorkload(second, 2, input, first);
+    if (std.mem.indexOf(u8, second, "UK_HYPERV_PLATFORM_READY") == null) return error.PlatformNotReady;
+}
+
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         // No raw serial, paths, ARM response, or credential may reach diagnostics.
@@ -329,15 +354,11 @@ fn run(init: std.process.Init) !void {
         if (first.bytes().len == 0) return error.EvidenceIncomplete;
         const parameters = try scope.value.parameters();
         const input: evidence.EvidenceInput = .{ .run_id = parameters.run_id, .disk_id = parameters.disk_id, .sectors = parameters.sectors, .lun = parameters.lun };
-        const boot1 = try evidence.parseWorkload(first.bytes(), 1, input, null);
-        if (std.mem.indexOf(u8, first.bytes(), "UK_HYPERV_PLATFORM_READY") == null) return error.PlatformNotReady;
+        const boot1 = try serialFirst(first.bytes(), scope.value.serial_mode, input);
         if (args.len == 5) {
             var full = try files.readSensitiveAbsolute(init.io, a, args[4], 4 * 1024 * 1024, null);
             defer full.deinit();
-            if (full.bytes().len == 0) return error.EvidenceIncomplete;
-            const second = if (scope.value.serial_mode == .cumulative) try evidence.boot2Suffix(full.bytes(), boot1) else full.bytes();
-            _ = try evidence.parseWorkload(second, 2, input, boot1);
-            if (std.mem.indexOf(u8, second, "UK_HYPERV_PLATFORM_READY") == null) return error.PlatformNotReady;
+            try serialSecond(full.bytes(), scope.value.serial_mode, input, boot1);
         }
         return;
     }

@@ -218,6 +218,26 @@ case "$cmd $action" in
 			case $scenario in
 				boot1-mutated-after-start) printf 'benign-looking appended line\n' >> "$root/attempt/boot1.log" ;;
 				stale-boot1-log) "$jq" -Rs . "$root/boot1.log"; exit ;;
+				azure-cached-then-fresh)
+					if (( reads == 1 )); then "$jq" -Rs . "$root/boot1.log"; exit; fi ;;
+				azure-no-advance-then-fresh)
+					case $reads in
+						1) "$jq" -Rs . "$root/boot1-body.log"; exit ;;
+						2) { cat "$root/boot1-body.log"; printf '\0'; } | "$jq" -Rs .; exit ;;
+						3) "$jq" -Rs . "$root/boot1.log"; exit ;;
+					esac ;;
+				azure-padding-only)
+					{ cat "$root/boot1-body.log"; printf '\0'; } | "$jq" -Rs .; exit ;;
+				azure-prefix-changed)
+					sed '1s/UK_HYPERV_PLATFORM_READY/UK_HYPERV_PLATFORM_DRIFT/' "$root/boot2.log" |
+						"$jq" -Rs .; exit ;;
+				azure-prefix-truncated)
+					head -c -1 "$root/boot1-body.log" | "$jq" -Rs .; exit ;;
+				azure-interior-nul-removed)
+					tr -d '\000' < "$root/boot2.log" | "$jq" -Rs .; exit ;;
+				azure-missing-prefix) "$jq" -Rs . "$root/boot2-body.log"; exit ;;
+				azure-wrong-boot)
+					cat "$root/boot1-body.log" "$root/boot1.log" | "$jq" -Rs .; exit ;;
 				different-boot1-log|cumulative-different-boot1)
 					sed 's/SELECT PASS id=1/SELECT PASS id=2/' "$root/boot1.log" | "$jq" -Rs .
 					exit ;;
@@ -241,6 +261,14 @@ case "$cmd $action" in
 					if [[ $scenario == cache-* ]]; then "$jq" -Rs . "$root/boot1.log"; exit; fi
 					;;
 			esac
+		fi
+		if [[ $boot == 1 && ( $scenario == azure-all-zero-boot1 || $scenario == azure-incomplete-boot1 ) ]]; then
+			mutate '.serial_reads = ((.serial_reads // 0) + 1)'
+			if [[ $("$jq" -r .serial_reads "$state") == 1 ]]; then
+				if [[ $scenario == azure-all-zero-boot1 ]]; then printf '\0\0'
+				else printf 'UK_HYPERV_PLATFORM_READY\n\0\0'; fi | "$jq" -Rs .
+			else printf '"UK_HYPERV_ACCEPTANCE_FAIL:fixture\\n"\n'; fi
+			exit
 		fi
 		if [[ $scenario == incomplete-serial && $("$jq" -r '.serial_reads // 0' "$state") == 0 ]]; then
 			mutate '.serial_reads=1'
