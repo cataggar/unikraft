@@ -6398,7 +6398,10 @@ static int storvsc_production_test(void)
 	    !(reentry.submit_result & UK_BLKDEV_STATUS_SUCCESS))
 		return 17;
 	fire_channel();
-	if (request2.result || atomic_load(&reentry.callbacks) != 1)
+	if (wait_request_completion(
+		    &request2, &callbacks, 9,
+		    CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS) ||
+	    request2.result || atomic_load(&reentry.callbacks) != 1)
 		return 18;
 
 	storvsc_host_stop_timeout_worker();
