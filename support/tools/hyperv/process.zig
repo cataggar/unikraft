@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const diagnostics = @import("diagnostics.zig");
+const files = @import("private_files.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("Hyper-V process supervision currently requires Linux");
@@ -53,8 +54,52 @@ pub const Result = struct {
     }
 };
 
+pub const Execution = struct {
+    termination: ?std.process.Child.Term = null,
+    failures: diagnostics.Failures = .{},
+    cleanup_complete: bool = true,
+    /// Private recovery metadata, not a reusable PID or public diagnostic.
+    unreaped_group: ?linux.pid_t = null,
+};
+
+pub const private_output_limit = 8 * 1024 * 1024;
+pub const CaptureState = enum { complete, partial, overflow, io_failed, durability_failed };
+pub const PrivateOptions = struct {
+    /// cleanup_ms must cover the TERM grace and a separate reaping reserve.
+    process: Options,
+    term_grace_ms: u32 = 2000,
+    /// An optional outer cleanup bound; never extends process.cleanup_ms.
+    cleanup_deadline: ?Deadline = null,
+    /// TERM only the supervisor first, allowing it to clean its own groups.
+    nested_supervisor: bool = false,
+};
+
+pub const PrivateResult = struct {
+    execution: Execution,
+    capture: CaptureState,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+
+    pub fn succeeded(self: PrivateResult) bool {
+        if (self.execution.failures.primary != null or self.execution.failures.cleanup != null or self.execution.failures.recording != null or
+            !self.execution.cleanup_complete or self.capture != .complete) return false;
+        return if (self.execution.termination) |termination| switch (termination) {
+            .exited => |code| code == 0,
+            else => false,
+        } else false;
+    }
+
+    /// Failure output remains private diagnostic evidence, never accepted input.
+    pub fn requireSuccess(self: PrivateResult) !void {
+        if (!self.succeeded()) return error.UnsuccessfulCapture;
+    }
+};
+
 var busy = std.atomic.Value(bool).init(false);
 var poisoned = std.atomic.Value(bool).init(false);
+// An unresolved writer keeps its lock until process exit, even if the caller
+// closes its original guard. Poison is deliberately irreversible.
+var retained_writer: ?linux.fd_t = null;
 
 /// Explicit process-wide ownership policy. Use in a dedicated supervisor, not an
 /// application with unrelated waitpid users. Children may not escape their group.
@@ -67,8 +112,134 @@ pub fn initialize() !void {
 /// A failed cleanup poisons this supervisor; writer ownership must not transfer.
 pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
     _ = io;
+    try validateOptions(options, 4 * 1024 * 1024);
+    try enter();
+    defer busy.store(false, .release);
+    var result: Result = .{ .storage = try allocator.alloc(u8, options.stdout_limit) };
+    @memset(result.storage, 0);
+    errdefer result.deinit(allocator);
+    var capture: Capture = .{ .output = result.storage, .stderr_limit = options.stderr_limit };
+    const execution = try supervise(allocator, options, &capture, .{});
+    result.termination = execution.termination;
+    result.failures = execution.failures;
+    result.cleanup_complete = execution.cleanup_complete;
+    result.unreaped_group = execution.unreaped_group;
+    if (result.failures.primary == null and result.cleanup_complete) {
+        result.stdout = result.storage[0..capture.stdout_count];
+    } else {
+        std.crypto.secureZero(u8, result.storage);
+    }
+    return result;
+}
+
+/// Opt-in private raw capture. Borrows a live writer guard and never hands file
+/// descriptors to the child. Both names are consume-once, including failures.
+/// This dedicated supervisor must have no unrelated children or child reapers.
+pub fn runPrivate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    lock: *files.Locked,
+    stdout_name: []const u8,
+    stderr_name: []const u8,
+    options: PrivateOptions,
+) !PrivateResult {
+    return runPrivateImpl(allocator, io, lock, stdout_name, stderr_name, options, null);
+}
+
+pub const PrivateTestFault = enum { pre_exec_stall, capture_write, sync };
+
+pub fn runPrivateTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    lock: *files.Locked,
+    stdout_name: []const u8,
+    stderr_name: []const u8,
+    options: PrivateOptions,
+    fault: PrivateTestFault,
+) !PrivateResult {
+    if (!builtin.is_test) @compileError("Private supervision faults are test-only");
+    return runPrivateImpl(allocator, io, lock, stdout_name, stderr_name, options, fault);
+}
+
+fn runPrivateImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    lock: *files.Locked,
+    stdout_name: []const u8,
+    stderr_name: []const u8,
+    options: PrivateOptions,
+    fault: ?PrivateTestFault,
+) !PrivateResult {
+    try validateOptions(options.process, private_output_limit);
+    if (options.term_grace_ms == 0 or options.term_grace_ms >= options.process.cleanup_ms or
+        std.mem.eql(u8, stdout_name, stderr_name)) return error.InvalidOptions;
+    try files.basename(stdout_name);
+    try files.basename(stderr_name);
+    if (stdout_name[0] == '.' or stderr_name[0] == '.') return error.InvalidOptions;
+    try enter();
+    defer busy.store(false, .release);
+    try requireNoChildren();
+    const guard = lock.file orelse return error.LockNotHeld;
+    const lease = linux.fcntl(guard.handle, linux.F.DUPFD_CLOEXEC, 3);
+    if (linux.errno(lease) != .SUCCESS) return error.LockNotHeld;
+    defer {
+        if (poisoned.load(.acquire)) {
+            retained_writer = @intCast(lease);
+        } else {
+            _ = linux.close(@intCast(lease));
+        }
+    }
+    try validatePrivateDirectory(lock.directory.dir);
+    const stdout = try createCapture(lock.directory.dir, stdout_name);
+    defer stdout.close(io);
+    const stderr = try createCapture(lock.directory.dir, stderr_name);
+    defer stderr.close(io);
+    var capture: Capture = .{
+        .output = &.{},
+        .stderr_limit = options.process.stderr_limit,
+        .private = .{ .stdout = stdout, .stderr = stderr, .limit = options.process.stdout_limit },
+        .fault = fault,
+    };
+    const execution = try supervise(allocator, options.process, &capture, .{
+        .term_grace_ms = options.term_grace_ms,
+        .deadline = options.cleanup_deadline,
+        .all_children = true,
+        .nested_supervisor = options.nested_supervisor,
+        .reap_reserve_ms = @min(1000, options.process.cleanup_ms - options.term_grace_ms),
+        .fault = fault,
+    });
+    // Preserve partial output, including failed execution, but never label it
+    // complete merely because the bytes and their directory entry are durable.
+    stdout.sync(io) catch {
+        capture.state = .durability_failed;
+    };
+    stderr.sync(io) catch {
+        capture.state = .durability_failed;
+    };
+    if (linux.errno(linux.fsync(lock.directory.dir.handle)) != .SUCCESS) capture.state = .durability_failed;
+    if (fault == .sync) capture.state = .durability_failed;
+    validateCapture(io, lock.directory, stdout_name, stdout, capture.stdout_count) catch {
+        capture.state = .io_failed;
+    };
+    validateCapture(io, lock.directory, stderr_name, stderr, capture.stderr_count) catch {
+        capture.state = .io_failed;
+    };
+    validatePrivateDirectory(lock.directory.dir) catch {
+        capture.state = .io_failed;
+    };
+    if (capture.state == .complete and (!capture.stdout_eof or !capture.stderr_eof or
+        execution.failures.primary != null or !execution.cleanup_complete)) capture.state = .partial;
+    return .{
+        .execution = execution,
+        .capture = capture.state,
+        .stdout_bytes = capture.stdout_count,
+        .stderr_bytes = capture.stderr_count,
+    };
+}
+
+fn validateOptions(options: Options, maximum: usize) !void {
     if (options.argv.len == 0 or options.argv.len > 128 or !std.fs.path.isAbsolute(options.argv[0]) or
-        options.stdout_limit > 4 * 1024 * 1024 or options.stderr_limit > 4 * 1024 * 1024 or
+        options.stdout_limit > maximum or options.stderr_limit > maximum or
         options.cleanup_ms < 100 or options.cleanup_ms > 30 * 60 * 1000)
         return error.InvalidOptions;
     var argument_bytes: usize = 0;
@@ -88,16 +259,28 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
         environment_bytes += key.len + value.len;
     }
     if (environment_bytes > 256 * 1024) return error.InvalidOptions;
+}
+
+fn enter() !void {
     if (busy.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.SupervisorBusy;
-    defer busy.store(false, .release);
+    errdefer busy.store(false, .release);
     if (poisoned.load(.acquire)) return error.UnresolvedCleanup;
     var subreaper: c_int = 0;
     if (linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_CHILD_SUBREAPER), @intFromPtr(&subreaper), 0, 0, 0)) != .SUCCESS or subreaper != 1)
         return error.SubreaperRequired;
+}
 
-    var result: Result = .{ .storage = try allocator.alloc(u8, options.stdout_limit) };
-    @memset(result.storage, 0);
-    errdefer result.deinit(allocator);
+const CleanupPolicy = struct {
+    term_grace_ms: ?u32 = null,
+    deadline: ?Deadline = null,
+    all_children: bool = false,
+    nested_supervisor: bool = false,
+    reap_reserve_ms: u32 = 0,
+    fault: ?PrivateTestFault = null,
+};
+
+fn supervise(allocator: std.mem.Allocator, options: Options, capture: *Capture, policy: CleanupPolicy) !Execution {
+    var result: Execution = .{};
     if (try options.deadline.expired()) {
         result.failures.primary = .{ .stage = .process_spawn, .category = .timeout };
         return result;
@@ -106,7 +289,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
         result.failures.primary = .{ .stage = .process_spawn, .category = .cancelled };
         return result;
     }
-    var child = spawnOwned(allocator, options) catch {
+    var child = spawnOwned(allocator, options, policy.fault) catch {
         result.failures.primary = .{ .stage = .process_spawn, .category = .spawn_failed };
         return result;
     };
@@ -114,8 +297,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
     defer _ = linux.close(child.stdout);
     defer _ = linux.close(child.stderr);
     defer _ = linux.close(child.control);
-    var capture: Capture = .{ .output = result.storage, .stderr_limit = options.stderr_limit };
-    monitor(&child, options, &capture) catch |err| {
+    monitor(&child, options, capture) catch |err| {
         result.failures.primary = .{
             .stage = if (err == error.SpawnFailed) .process_spawn else .process_run,
             .category = switch (err) {
@@ -129,12 +311,18 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
     };
     // This is an independent budget, also used after normal leader exit so a
     // successful parent cannot strand background descendants holding pipes.
-    cleanup(pid, options.cleanup_ms, &result) catch {
+    cleanup(pid, options.cleanup_ms, &result, policy) catch {
         result.cleanup_complete = false;
         result.unreaped_group = pid;
         result.failures.cleanup = .{ .stage = .process_cleanup, .category = .cleanup_failed };
         poisoned.store(true, .release);
     };
+    if (capture.private != null and result.cleanup_complete) {
+        // No writers survive successful cleanup. Drain already-buffered bytes
+        // even after timeout/cancellation, without restarting their execution.
+        capture.drainFinal(child.stdout, false) catch {};
+        capture.drainFinal(child.stderr, true) catch {};
+    }
     if (result.failures.primary == null) {
         if (result.termination) |termination| {
             switch (termination) {
@@ -147,11 +335,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
             result.failures.primary = .{ .stage = .process_run, .category = .child_failed };
         }
     }
-    if (result.failures.primary == null and result.cleanup_complete) {
-        result.stdout = result.storage[0..capture.stdout_count];
-    } else {
-        std.crypto.secureZero(u8, result.storage);
-    }
     return result;
 }
 
@@ -162,15 +345,28 @@ const Capture = struct {
     stderr_count: usize = 0,
     stdout_eof: bool = false,
     stderr_eof: bool = false,
+    private: ?struct { stdout: std.Io.File, stderr: std.Io.File, limit: usize } = null,
+    state: CaptureState = .complete,
+    fault: ?PrivateTestFault = null,
 
     fn drain(self: *Capture, fd: linux.fd_t, stderr: bool, options: Options) !void {
+        try self.drainImpl(fd, stderr, options);
+    }
+
+    fn drainFinal(self: *Capture, fd: linux.fd_t, stderr: bool) !void {
+        try self.drainImpl(fd, stderr, null);
+    }
+
+    fn drainImpl(self: *Capture, fd: linux.fd_t, stderr: bool, options: ?Options) !void {
         var buffer: [4096]u8 = undefined;
         defer std.crypto.secureZero(u8, &buffer);
         const count = if (stderr) &self.stderr_count else &self.stdout_count;
-        const limit = if (stderr) self.stderr_limit else self.output.len;
+        const limit = if (stderr) self.stderr_limit else if (self.private) |sink| sink.limit else self.output.len;
         while (true) {
-            if (cancelled(options)) return error.Cancelled;
-            if (try options.deadline.expired()) return error.DeadlineExceeded;
+            if (options) |active| {
+                if (cancelled(active)) return error.Cancelled;
+                if (try active.deadline.expired()) return error.DeadlineExceeded;
+            }
             const n = linux.read(fd, &buffer, @min(buffer.len, limit - count.* + 1));
             switch (linux.errno(n)) {
                 .SUCCESS => {
@@ -178,13 +374,48 @@ const Capture = struct {
                         if (stderr) self.stderr_eof = true else self.stdout_eof = true;
                         return;
                     }
-                    if (n > limit - count.*) return error.OutputLimit;
-                    if (!stderr) @memcpy(self.output[count.*..][0..n], buffer[0..n]);
-                    count.* += n;
+                    const fitting = @min(n, limit - count.*);
+                    if (self.private) |sink| {
+                        const out = if (stderr) sink.stderr.handle else sink.stdout.handle;
+                        var written: usize = 0;
+                        while (written < fitting) {
+                            if (self.fault == .capture_write and count.* >= 4) {
+                                self.state = .io_failed;
+                                return error.CaptureFailed;
+                            }
+                            const amount = linux.write(out, buffer[written..].ptr, if (self.fault == .capture_write) @min(4, fitting - written) else fitting - written);
+                            switch (linux.errno(amount)) {
+                                .SUCCESS => {
+                                    if (amount == 0) {
+                                        self.state = .io_failed;
+                                        return error.CaptureFailed;
+                                    }
+                                    written += amount;
+                                    count.* += amount;
+                                },
+                                .INTR => continue,
+                                else => {
+                                    self.state = .io_failed;
+                                    return error.CaptureFailed;
+                                },
+                            }
+                        }
+                    } else {
+                        if (n > fitting) return error.OutputLimit;
+                        if (!stderr) @memcpy(self.output[count.*..][0..n], buffer[0..n]);
+                        count.* += n;
+                    }
+                    if (n > fitting) {
+                        self.state = .overflow;
+                        return error.OutputLimit;
+                    }
                 },
                 .AGAIN => return,
                 .INTR => continue,
-                else => return error.CaptureFailed,
+                else => {
+                    self.state = .io_failed;
+                    return error.CaptureFailed;
+                },
             }
         }
     }
@@ -242,20 +473,27 @@ fn exited(pid: linux.pid_t) !bool {
     }
 }
 
-fn cleanup(pid: linux.pid_t, milliseconds: u32, result: *Result) !void {
+fn cleanup(pid: linux.pid_t, milliseconds: u32, result: *Execution, policy: CleanupPolicy) !void {
     var final_signal_sent = false;
     errdefer if (!final_signal_sent) signalGroup(pid, .KILL) catch {};
-    const deadline = try Deadline.afterMilliseconds(milliseconds);
-    try signalGroup(pid, .TERM);
+    var deadline = try Deadline.afterMilliseconds(milliseconds);
+    if (policy.deadline) |outer| deadline.expires_ns = @min(deadline.expires_ns, outer.expires_ns);
+    if (policy.nested_supervisor) {
+        try signalLeader(pid, .TERM);
+    } else try signalGroup(pid, .TERM);
     // Retain the unreaped group leader until the final group signal to prevent
     // PID/PGID reuse from ever directing a signal at an unrelated process.
-    const grace = try Deadline.afterMilliseconds(@min(50, milliseconds / 4));
-    while (!try grace.expired()) try pause(try grace.waitMilliseconds(10));
+    var grace = try Deadline.afterMilliseconds(policy.term_grace_ms orelse @min(50, milliseconds / 4));
+    grace.expires_ns = @min(grace.expires_ns, deadline.expires_ns -| (@as(u64, policy.reap_reserve_ms) * std.time.ns_per_ms));
+    while (!try grace.expired()) {
+        if (policy.nested_supervisor and try exited(pid)) break;
+        try pause(try grace.waitMilliseconds(10));
+    }
     try signalGroup(pid, .KILL);
     final_signal_sent = true;
     while (true) {
         var status: u32 = 0;
-        const child = linux.waitpid(if (result.termination == null) pid else -pid, &status, linux.W.NOHANG);
+        const child = linux.waitpid(if (result.termination == null) pid else if (policy.all_children) -1 else -pid, &status, linux.W.NOHANG);
         switch (linux.errno(child)) {
             .SUCCESS => {
                 if (child != 0) {
@@ -290,6 +528,10 @@ fn signalGroup(pid: linux.pid_t, signal: linux.SIG) !void {
     }
     // The leader may not yet have run setpgid; it cannot create descendants until
     // after that succeeds. Its unreaped PID is independently owned throughout.
+    try signalLeader(pid, signal);
+}
+
+fn signalLeader(pid: linux.pid_t, signal: linux.SIG) !void {
     switch (linux.errno(linux.kill(pid, signal))) {
         .SUCCESS, .SRCH => {},
         else => return error.SignalFailed,
@@ -324,7 +566,7 @@ const Spawned = struct {
 
 // Zig 0.16 Threaded.spawn loses PID and pipe ownership on exec failure. Keep the
 // fork/exec handshake here so both spawn errors and pre-exec stalls are supervised.
-fn spawnOwned(allocator: std.mem.Allocator, options: Options) !Spawned {
+fn spawnOwned(allocator: std.mem.Allocator, options: Options, fault: ?PrivateTestFault) !Spawned {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -351,6 +593,12 @@ fn spawnOwned(allocator: std.mem.Allocator, options: Options) !Spawned {
         // No allocation, std.Io, libc, or locks are permitted between fork and exec.
         if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS or
             linux.getppid() != parent_pid) childFailure(control[1]);
+        if (fault == .pre_exec_stall) {
+            while (true) {
+                var fds: [0]linux.pollfd = .{};
+                _ = linux.poll(&fds, 0, 1000);
+            }
+        }
         if (linux.errno(linux.setpgid(0, 0)) != .SUCCESS) childFailure(control[1]);
         if (options.cwd.handle != linux.AT.FDCWD and linux.errno(linux.fchdir(options.cwd.handle)) != .SUCCESS)
             childFailure(control[1]);
@@ -414,3 +662,104 @@ fn aboveStdio(fd: linux.fd_t) !linux.fd_t {
 fn closePipe(pipe: [2]linux.fd_t) void {
     for (pipe) |fd| _ = linux.close(fd);
 }
+
+fn requireNoChildren() !void {
+    var info = std.mem.zeroes(linux.siginfo_t);
+    while (true) switch (linux.errno(linux.waitid(.ALL, 0, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT, null))) {
+        .CHILD => return,
+        .INTR => continue,
+        else => return error.UnownedChildren,
+    };
+}
+
+fn validatePrivateDirectory(directory: std.Io.Dir) !void {
+    const stat = try files.snapshot(.{ .handle = directory.handle, .flags = .{ .nonblocking = false } });
+    if (stat.mode & linux.S.IFMT != linux.S.IFDIR or stat.mode & 0o7777 != 0o700 or
+        stat.uid != linux.geteuid()) return error.UnsafeFile;
+}
+
+fn createCapture(directory: std.Io.Dir, name: []const u8) !std.Io.File {
+    var buffer: [256:0]u8 = undefined;
+    @memcpy(buffer[0..name.len], name);
+    buffer[name.len] = 0;
+    const fd = linux.openat(directory.handle, buffer[0..name.len :0], .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    switch (linux.errno(fd)) {
+        .SUCCESS => {},
+        .EXIST => return error.PathAlreadyExists,
+        else => return error.CaptureOpenFailed,
+    }
+    errdefer _ = linux.close(@intCast(fd));
+    const result: std.Io.File = .{ .handle = @intCast(fd), .flags = .{ .nonblocking = true } };
+    const stat = try files.snapshot(result);
+    if (stat.mode & linux.S.IFMT != linux.S.IFREG or stat.mode & 0o7777 != 0o600 or
+        stat.uid != linux.geteuid() or stat.nlink != 1 or stat.size != 0) return error.UnsafeFile;
+    return result;
+}
+
+fn validateCapture(io: std.Io, directory: files.Directory, name: []const u8, file: std.Io.File, size: usize) !void {
+    const observed = try directory.openFile(io, name);
+    defer observed.close(io);
+    const stat = try files.snapshot(file);
+    if (stat.size != size or !files.sameSnapshot(stat, try files.snapshot(observed))) return error.CaptureChanged;
+}
+
+var signals_busy = std.atomic.Value(bool).init(false);
+var signal_cancelled = std.atomic.Value(bool).init(false);
+var received_signal = std.atomic.Value(u8).init(0);
+
+/// Install before starting work, retain through separately budgeted cleanup.
+/// The handler only writes lock-free atomics; cleanup must not reset the latch.
+pub const SignalCancellation = struct {
+    previous: [3]linux.Sigaction,
+    const handled = [_]linux.SIG{ .HUP, .INT, .TERM };
+
+    pub fn install() !SignalCancellation {
+        if (signals_busy.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.SignalHandlerBusy;
+        errdefer signals_busy.store(false, .release);
+        signal_cancelled.store(false, .release);
+        received_signal.store(0, .release);
+        var result: SignalCancellation = undefined;
+        var installed: usize = 0;
+        errdefer for (handled[0..installed], 0..) |item, i| {
+            _ = linux.sigaction(item, &result.previous[i], null);
+        };
+        var action: linux.Sigaction = .{
+            .handler = .{ .handler = handle },
+            .mask = linux.sigemptyset(),
+            .flags = 0,
+        };
+        for (handled, 0..) |item, i| {
+            if (linux.errno(linux.sigaction(item, &action, &result.previous[i])) != .SUCCESS)
+                return error.SignalSetupFailed;
+            installed += 1;
+        }
+        return result;
+    }
+
+    pub fn flag(_: *const SignalCancellation) *const std.atomic.Value(bool) {
+        return &signal_cancelled;
+    }
+
+    pub fn signal(_: *const SignalCancellation) ?u8 {
+        const value = received_signal.load(.acquire);
+        return if (value == 0) null else value;
+    }
+
+    pub fn deinit(self: *SignalCancellation) void {
+        for (handled, 0..) |item, i| _ = linux.sigaction(item, &self.previous[i], null);
+        signals_busy.store(false, .release);
+        self.* = undefined;
+    }
+
+    fn handle(number: linux.SIG) callconv(.c) void {
+        _ = received_signal.cmpxchgStrong(0, @intCast(@intFromEnum(number)), .acq_rel, .acquire);
+        signal_cancelled.store(true, .release);
+    }
+};
