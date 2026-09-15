@@ -69,5 +69,65 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("test_options", options);
     const run = b.addRunArtifact(tests);
     run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
-    b.step("test", "Run native synthetic preparation and provenance fixtures").dependOn(&run.step);
+    const test_step = b.step("test", "Run native synthetic preparation and provenance fixtures");
+    test_step.dependOn(&run.step);
+
+    // Direct readers are qualification-only dependencies. The producer never
+    // imports a controller, approval schema, or the direct build graph.
+    const evidence = b.createModule(.{
+        .root_source_file = b.path("../persistence/evidence.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+    });
+    const direct = b.createModule(.{
+        .root_source_file = b.path("../direct/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "preparation", .module = module },
+            .{ .name = "evidence", .module = evidence },
+        },
+    });
+    const seed_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "preparation", .module = module },
+        .{ .name = "direct_validation", .module = direct },
+    };
+    const seed_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("original_seed_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = seed_imports,
+    }) });
+    seed_tests.root_module.addOptions("test_options", options);
+    const seed_run = b.addRunArtifact(seed_tests);
+    seed_run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+    const seed_step = b.step("test-original-seed", "Run bounded original-seed native fixtures (no full-size disks)");
+    seed_step.dependOn(&seed_run.step);
+    test_step.dependOn(seed_step);
+
+    const qualify = b.step("qualify-original-seed", "Explicit full 4-GiB local seed creation and independent direct-reader validation");
+    if (b.option([]const u8, "original-seed-root", "Fresh nonexistent absolute private full-size qualification directory")) |root| {
+        if (!std.fs.path.isAbsolute(root)) {
+            qualify.dependOn(&b.addFail("original-seed-root must be an absolute fresh directory").step);
+        } else {
+            const qualification = b.addExecutable(.{
+                .name = "original-seed-qualification",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("original_seed_qualification.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = seed_imports,
+                }),
+            });
+            qualification.root_module.addOptions("test_options", options);
+            const qualify_run = b.addRunArtifact(qualification);
+            qualify_run.has_side_effects = true;
+            qualify_run.addArg(root);
+            qualify.dependOn(&qualify_run.step);
+        }
+    } else {
+        qualify.dependOn(&b.addFail("qualify-original-seed requires -Doriginal-seed-root=FRESH_ABSOLUTE_PATH").step);
+    }
 }

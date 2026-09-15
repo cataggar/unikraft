@@ -26,9 +26,19 @@ fn execute(init: std.process.Init, failures: *core.diagnostics.Failures) !void {
         var output = std.Io.File.stdout().writer(init.io, &.{});
         try output.interface.writeAll(
             "uk-hyperv-prepare synthetic-seed PRIVATE_DIRECTORY REQUEST_BASENAME\n" ++
+                "uk-hyperv-prepare original-seed PRIVATE_PARENT FRESH_BASENAME\n" ++
                 "uk-hyperv-prepare package PRIVATE_DIRECTORY REQUEST_BASENAME\n" ++
                 "uk-hyperv-prepare inspect-receipt PRIVATE_DIRECTORY BASENAME EXPECTED_SHA256\n" ++
                 "Local native primitives only; no build, completed-state, acceptance, or cloud approval is implied.\n",
+        );
+        return;
+    }
+    if (args.len == 4 and std.mem.eql(u8, args[1], "original-seed")) {
+        const sha = try preparation.original_seed.create(allocator, init.io, args[2], args[3], failures);
+        var output = std.Io.File.stdout().writer(init.io, &.{});
+        try output.interface.print(
+            "{{\"scope\":\"local_original_seed_production_only\",\"authority\":\"not_admitted\",\"state\":\"validated_local_files\",\"production_record_sha256\":\"{s}\"}}\n",
+            .{sha},
         );
         return;
     }

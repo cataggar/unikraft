@@ -6,6 +6,7 @@ pub const origin_fixture = if (@import("builtin").is_test) @import("origin_fixtu
 pub const source = @import("source.zig");
 pub const config = @import("config.zig");
 pub const seed = @import("seed.zig");
+pub const original_seed = @import("original_seed.zig");
 pub const package = @import("package.zig");
 pub const budget = @import("budget.zig");
 pub const producer = @import("producer.zig");
