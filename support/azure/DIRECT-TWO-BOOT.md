@@ -19,6 +19,14 @@ after complete discovery and unique target admission, before workload
 mutation. The controller still requires that marker and the full persistence
 evidence independently; neither one substitutes for the other.
 
+A separately authorized attempt on 2026-09-15 used a fresh native seed and
+matching image, but failed the controller's running-only post-deployment
+check when Azure reported `PowerState/stopped`. No serial was fetched before
+owned cleanup deleted the VM, so its guest result is **unknown**. No Boot2
+admission or start occurred. Cleanup independently confirmed group absence;
+the local seed bytes remained unchanged and the attempt's ledger remains
+consumed. This fix does not authorize a retry.
+
 ## Authorization and input custody
 
 Do not execute this lane under an earlier OS-only boot grant. A human must
@@ -108,8 +116,13 @@ permission. The guarded guest's exact seeded-target selection is the write
 boundary. Data caching is `None`.
 
 Disk-state admission follows the observed VM phase: both disks must be
-`Attached` while running and `Reserved` after deallocation, still owned by
-the same VM with unchanged disk UUIDs, attachments and geometry.
+`Attached` while allocated (`PowerState/running` **or** `PowerState/stopped`)
+and `Reserved` after explicit deallocation, still owned by the same VM with
+unchanged disk UUIDs, attachments and geometry. Retained/final deallocation
+requires exactly `PowerState/deallocated`; stopped is not a substitute.
+Normal kernel halt and crash both use EFI shutdown, so stopped alone proves
+neither guest success nor failure. Both boot phases still require the full
+native canonical, platform-marker and fresh-serial gates.
 
 ## Build and invoke
 
@@ -174,7 +187,8 @@ group is never adopted or deleted.
    writes and flushes**, and unchanged enrolled controller/address/VPD.
    Deallocate and observe the original objects again.
 7. Always run separately bounded cleanup. Revoke outstanding grants, verify
-   group ownership/inventory, delete only the owned group, independently
+   group ownership/inventory and original identities, retain eligible
+   failure-only diagnostics, delete only the owned group, independently
    observe absence, remove SAS/grant inputs, and retain private outcome/state.
 
 No mutation/start retry, reset, replacement enrollment, third boot, reseed or
@@ -198,6 +212,27 @@ receipt or evidence that an unobserved external restart could not occur.
 `outcome.json` keeps primary and cleanup exits separate. Successful deletion
 never erases a failed upload or guest failure; failed empty-upload revoke
 (`InvalidVhd`) remains a cleanup failure even if owner-checked deletion works.
+Failed jq observations identify only their internal observation filename in
+private `driver.stderr`, preserving the original nonzero status and the
+existing cleanup control paths.
+
+On nonzero primary failure, cleanup may make **one** read-only boot-log
+request before deleting the group, only after the existing group, inventory,
+VM and disk identity/ownership checks pass, with known original UUIDs and a
+reserved boot. Uncertain ownership or identity prohibits diagnostic access.
+The capture shares the existing cleanup deadline and is capped at 30 seconds,
+including termination grace; it reserves full delete/absence operation
+budgets and is skipped if that cleanup budget is unavailable.
+`failure-boot-diagnostics.json` retains the private CLI wrapper;
+`failure-boot-diagnostics.log` is its privately decoded JSON string. Read and
+decode errors have separate private stderr files. `outcome.failure_diagnostics`
+records `attempted`, `exit` (read/decode status, or null when skipped) and
+`decoded`, independently of primary and cleanup exits. Diagnostic failures
+do not become cleanup failures or erase the primary failure.
+These files are **never parsed as acceptance evidence or promoted** to
+Boot1/Boot2 captures or admission, even if the text appears to contain a full
+pass. There is no diagnostic retry, resume, start or resource creation.
+
 Grant/credential inputs are removed even on failure; no Azure account/token
 cache is copied into the attempt. Raw CLI/native diagnostics and logs are
 private. Do not publish the attempt directory.

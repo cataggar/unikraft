@@ -83,7 +83,8 @@ assert_no_secret() {
 	[[ ! -e $root/attempt/upload-os/sas.txt && ! -e $root/attempt/upload-data/sas.txt ]]
 	! grep -R -l 'PRIVATE_FIXTURE_SAS' "$root/attempt" "$root/public.stdout" "$root/public.stderr" >/dev/null
 }
-for scenario in success lowercase-grant storage-azure-grant cumulative-serial incomplete-serial; do
+for scenario in success lowercase-grant storage-azure-grant cumulative-serial incomplete-serial \
+	stopped-boot1 stopped-boot2 stopped-both; do
 	fixture "$scenario"
 	if [[ $scenario == cumulative-serial ]]; then
 		root="$base/$scenario"
@@ -95,6 +96,8 @@ for scenario in success lowercase-grant storage-azure-grant cumulative-serial in
 	execute "$scenario"
 	root="$base/$scenario"
 	"$jq" -e '.accepted == true and .reserved_boots == 2 and .primary_exit == 0 and .cleanup_exit == 0' "$root/attempt/outcome.json" >/dev/null
+	"$jq" -e '.failure_diagnostics == {attempted:false,exit:null,decoded:false}' \
+		"$root/attempt/outcome.json" >/dev/null
 	first=$(sha256sum "$root/attempt/boot1.log"); first=${first%% *}
 	admission=$(sha256sum "$root/attempt/boot2-admission.json"); admission=${admission%% *}
 	"$jq" -s -e --arg first "$first" --arg admission "$admission" '
@@ -108,15 +111,24 @@ for scenario in success lowercase-grant storage-azure-grant cumulative-serial in
 		"$root/attempt/boot2-admission.json" >/dev/null
 	for phase in boot1 boot2 retained final; do
 		expected=Attached
-		if [[ $phase == retained || $phase == final ]]; then expected=Reserved; fi
+		expected_power=running
+		case "$scenario:$phase" in
+			stopped-boot1:boot1|stopped-boot2:boot2|stopped-both:boot1|stopped-both:boot2)
+				expected_power=stopped ;;
+		esac
+		if [[ $phase == retained || $phase == final ]]; then expected=Reserved; expected_power=deallocated; fi
 		"$jq" -s -e --arg expected "$expected" \
 			'all(.[]; .diskState == $expected and .managedBy != null)' \
 			"$root/attempt/$phase-os.json" "$root/attempt/$phase-data.json" >/dev/null
+		"$jq" -e --arg power "PowerState/$expected_power" \
+			'[.instanceView.statuses[] | select(.code|startswith("PowerState/"))] == [{code:$power}]' \
+			"$root/attempt/$phase-power.json" >/dev/null
 	done
 	[[ $(grep -c '^vm start ' "$root/calls") == 1 ]]
 	[[ $(grep -c '^deployment group ' "$root/calls") == 1 ]]
 	[[ $(grep -c '^vm deallocate ' "$root/calls") == 2 ]]
 	[[ $(grep -c '^transfer$' "$root/calls") == 2 ]]
+	! grep -q '^failure diagnostics$' "$root/calls"
 	assert_no_secret "$scenario"
 	if [[ $scenario == success ]]; then
 		# A different attempt cannot consume the same persistent seed ledger.
@@ -136,8 +148,21 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 	cleanup-unowned foreign-resource delete-failure boot1-mutated-before-start \
 	boot1-mutated-after-start boot2-admission-mutated stale-boot1-log cumulative-prefix-drift \
 	running-reserved retained-attached final-attached retained-unattached \
-	boot1-missing-platform boot2-missing-platform; do
+	boot1-missing-platform boot2-missing-platform stopped-bad-serial \
+	unexpected-boot1-power unexpected-boot2-power malformed-power retained-stopped final-stopped \
+	diagnostics-power-failure diagnostics-read-failure diagnostics-decode-failure diagnostics-timeout \
+	diagnostics-no-budget diagnostics-unowned-group diagnostics-foreign-resource \
+	diagnostics-vm-identity-drift diagnostics-disk-identity-drift diagnostics-unknown-vm \
+	diagnostics-delete-failure diagnostics-read-delete-failure; do
 	fixture "$scenario"
+	root="$base/$scenario"
+	if [[ $scenario == diagnostics-timeout || $scenario == diagnostics-no-budget ]]; then
+		cleanup_seconds=60
+		[[ $scenario != diagnostics-timeout ]] || cleanup_seconds=180
+		"$jq" --argjson cleanup "$cleanup_seconds" '.operation_seconds=40 | .cleanup_seconds=$cleanup' \
+			"$root/scope.json" > "$root/scope-next.json"
+		mv "$root/scope-next.json" "$root/scope.json"
+	fi
 	if [[ $scenario == cumulative-prefix-drift ]]; then
 		root="$base/$scenario"
 		cat "$root/boot1.log" "$root/boot2.log" > "$root/combined.log"
@@ -145,15 +170,22 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 		"$jq" '.serial_mode="cumulative"' "$root/scope.json" > "$root/scope-next.json"
 		mv "$root/scope-next.json" "$root/scope.json"
 	fi
-	! execute "$scenario"
+	result=0
+	execute "$scenario" || result=$?
+	(( result != 0 ))
 	root="$base/$scenario"
-	"$jq" -e '.accepted == false' "$root/attempt/outcome.json" >/dev/null
+	"$jq" -e --argjson result "$result" \
+		'.accepted == false and (if .primary_exit != 0 then .primary_exit == $result else true end)' \
+		"$root/attempt/outcome.json" >/dev/null
 	starts=$(grep -c '^vm start ' "$root/calls" || :)
 	(( starts <= 1 ))
 	[[ $scenario != boot1-mutated-before-start || $starts == 0 ]]
 	case $scenario in
 		running-reserved|retained-attached|retained-unattached) [[ $starts == 0 ]] ;;
 		final-attached) [[ $starts == 1 ]] ;;
+		stopped-bad-serial|unexpected-boot1-power|malformed-power|retained-stopped|diagnostics-*)
+			[[ $starts == 0 && ! -e $root/attempt/boot2-admission.json ]] ;;
+		unexpected-boot2-power|final-stopped) [[ $starts == 1 ]] ;;
 		boot1-missing-platform|boot2-missing-platform)
 			expected_boots=1
 			[[ $scenario != boot2-missing-platform ]] || expected_boots=2
@@ -166,15 +198,80 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 	esac
 	[[ $(grep -c '^deployment group ' "$root/calls" || :) -le 1 ]]
 	case $scenario in
-		cleanup-unowned|foreign-resource|identity-drift)
+		cleanup-unowned|foreign-resource|identity-drift|diagnostics-unowned-group|diagnostics-foreign-resource|\
+		diagnostics-vm-identity-drift|diagnostics-disk-identity-drift)
 			! grep -q '^group delete ' "$root/calls"
-			"$jq" -e '.cleanup_exit != 0' "$root/attempt/outcome.json" >/dev/null ;;
+			"$jq" -e '.cleanup_exit != 0 and .failure_diagnostics.attempted == false' "$root/attempt/outcome.json" >/dev/null ;;
 		preexisting-group) ! grep -q '^group create ' "$root/calls" ;;
 		bad-input) [[ ! -s $root/calls ]] ;;
 		delete-failure) "$jq" -e '.primary_exit == 0 and .cleanup_exit != 0' "$root/attempt/outcome.json" >/dev/null ;;
+		diagnostics-delete-failure|diagnostics-read-delete-failure)
+			"$jq" -e '.primary_exit == 1 and .cleanup_exit != 0 and .owned_group_absent == false' \
+				"$root/attempt/outcome.json" >/dev/null ;;
 		*)
 			"$jq" -e '.primary_exit != 0 and .owned_group_absent == true' "$root/attempt/outcome.json" >/dev/null ;;
 	esac
+	diagnostic_calls=$(grep -c '^failure diagnostics$' "$root/calls" || :)
+	if "$jq" -e '.failure_diagnostics.attempted' "$root/attempt/outcome.json" >/dev/null; then
+		[[ $diagnostic_calls == 1 && $(stat -c %a "$root/attempt/failure-boot-diagnostics.json") == 600 ]]
+		[[ $(stat -c %a "$root/attempt/failure-boot-diagnostics.stderr") == 600 ]]
+		# The failure-only read must follow all identity observations and
+		# precede the sole delete, even when either operation fails.
+		awk '
+			/^vm show / { vm=NR }
+			/^disk show / { disk=NR }
+			/^resource list / { inventory=NR }
+			/^failure diagnostics$/ { diagnostic=NR }
+			/^group delete / { deletion=NR }
+			END { exit !(inventory < disk && disk < vm && vm < diagnostic && diagnostic < deletion) }
+		' "$root/calls"
+	else
+		[[ $diagnostic_calls == 0 && ! -e $root/attempt/failure-boot-diagnostics.json ]]
+		"$jq" -e '.failure_diagnostics == {attempted:false,exit:null,decoded:false}' \
+			"$root/attempt/outcome.json" >/dev/null
+	fi
+	case $scenario in
+		unexpected-boot1-power|malformed-power|diagnostics-*)
+			[[ ! -e $root/attempt/boot1.log && ! -e $root/attempt/boot1-capture.json &&
+				! -e $root/attempt/boot2-capture.json ]]
+			! grep -q '^validator serial$' "$root/calls"
+			[[ $(grep -c '^vm boot-diagnostics ' "$root/calls" || :) == "$diagnostic_calls" ]]
+			;;
+	esac
+	case $scenario in
+		malformed-power)
+			[[ $result == 5 ]]
+			grep -qx 'direct observation failed: boot1-power.json' "$root/attempt/driver.stderr" ;;
+		diagnostics-power-failure|unexpected-boot1-power|unexpected-boot2-power|stopped-bad-serial)
+			"$jq" -e '.primary_exit != 0 and .cleanup_exit == 0 and
+				.failure_diagnostics == {attempted:true,exit:0,decoded:true}' "$root/attempt/outcome.json" >/dev/null ;;
+		diagnostics-read-failure|diagnostics-read-delete-failure)
+			"$jq" -e '.failure_diagnostics == {attempted:true,exit:23,decoded:false}' \
+				"$root/attempt/outcome.json" >/dev/null
+			grep -qx 'fixture diagnostic read failure' "$root/attempt/failure-boot-diagnostics.stderr" ;;
+		diagnostics-decode-failure)
+			"$jq" -e '.primary_exit == 1 and .cleanup_exit == 0 and
+				.failure_diagnostics == {attempted:true,exit:5,decoded:false}' "$root/attempt/outcome.json" >/dev/null
+			[[ -s $root/attempt/failure-boot-diagnostics-decode.stderr ]]
+			"$jq" -e '.unexpected == "not a JSON string"' "$root/attempt/failure-boot-diagnostics.json" >/dev/null ;;
+		diagnostics-timeout)
+			"$jq" -e '.primary_exit == 1 and .cleanup_exit == 0 and
+				.failure_diagnostics == {attempted:true,exit:124,decoded:false}' "$root/attempt/outcome.json" >/dev/null
+			(( $(cat "$root/delete.seconds") - $(cat "$root/diagnostics.seconds") <= 30 )) ;;
+		diagnostics-no-budget)
+			"$jq" -e '.cleanup_exit == 0 and .owned_group_absent == true' "$root/attempt/outcome.json" >/dev/null
+			grep -qx 'failure boot diagnostics skipped: cleanup budget' "$root/attempt/driver.stderr" ;;
+		retained-stopped|final-stopped)
+			phase=retained
+			[[ $scenario != final-stopped ]] || phase=final
+			"$jq" -s -e 'all(.[]; .diskState == "Reserved")' \
+				"$root/attempt/$phase-os.json" "$root/attempt/$phase-data.json" >/dev/null
+			grep -qx "direct observation failed: $phase-power.json" "$root/attempt/driver.stderr" ;;
+	esac
+	if [[ $scenario == diagnostics-power-failure ]]; then
+		cmp "$root/boot1.log" "$root/attempt/failure-boot-diagnostics.log"
+		[[ $(stat -c %a "$root/attempt/failure-boot-diagnostics.log") == 600 ]]
+	fi
 	assert_no_secret "$scenario"
 	cases=$((cases + 1))
 done

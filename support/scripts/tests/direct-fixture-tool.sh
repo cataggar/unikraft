@@ -27,6 +27,7 @@ case ${1:-} in
 		exit ;;
 	serial)
 		[[ $2 == "$root/"* && $3 == "$root/"* ]] || exit 90
+		printf 'validator serial\n' >> "$root/calls"
 		"$native" "$@"
 		exit ;;
 	transfer)
@@ -71,6 +72,8 @@ disk() {
 	local uuid="original-$role" logical=4294967296 os=null gen=null
 	[[ $role != os ]] || { logical=1048576; os='"Linux"'; gen='"V2"'; }
 	if [[ $scenario == identity-drift && $role == data && $("$jq" -r .boots "$state") == 2 ]]; then uuid=replacement; fi
+	if [[ $scenario == diagnostics-disk-identity-drift && $role == data &&
+		$("$jq" -r '.cleanup // false' "$state") == true ]]; then uuid=replacement; fi
 	"$jq" -n --argjson state "$(cat "$state")" --arg role "$role" --arg base "$base" \
 		--arg prefix "$prefix" --argjson tags "$tags" --arg uuid "$uuid" --arg vm "$vm_id" \
 		--argjson logical "$logical" --argjson os "$os" --argjson gen "$gen" --arg scenario "$scenario" '
@@ -93,11 +96,15 @@ disk() {
 virtual_machine() {
 	local os_id="$base/providers/Microsoft.Compute/disks/$prefix-os"
 	local data_id="$base/providers/Microsoft.Compute/disks/$prefix-data"
+	local uuid=original-vm vm_size=Standard_D2s_v5
 	[[ $scenario != attachment-mismatch ]] || data_id="$base/providers/Microsoft.Compute/disks/replacement"
+	[[ $scenario != diagnostics-unknown-vm ]] || vm_size=unapproved-size
+	if [[ $scenario == diagnostics-vm-identity-drift &&
+		$("$jq" -r '.cleanup // false' "$state") == true ]]; then uuid=replacement; fi
 	"$jq" -n --arg vm "$vm_id" --arg prefix "$prefix" --arg base "$base" --argjson tags "$tags" \
-		--arg os "$os_id" --arg data "$data_id" '
-		{id:$vm,name:($prefix+"-vm"),type:"Microsoft.Compute/virtualMachines",tags:$tags,vmId:"original-vm",
-		 securityProfile:{securityType:"Standard"},hardwareProfile:{vmSize:"Standard_D2s_v5"},
+		--arg os "$os_id" --arg data "$data_id" --arg uuid "$uuid" --arg size "$vm_size" '
+		{id:$vm,name:($prefix+"-vm"),type:"Microsoft.Compute/virtualMachines",tags:$tags,vmId:$uuid,
+		 securityProfile:{securityType:"Standard"},hardwareProfile:{vmSize:$size},
 		 diagnosticsProfile:{bootDiagnostics:{enabled:true}},
 		 networkProfile:{networkInterfaces:[{id:($base+"/providers/Microsoft.Network/networkInterfaces/"+$prefix+"-nic")}]},
 		 storageProfile:{diskControllerType:"SCSI",osDisk:{createOption:"Attach",caching:"ReadOnly",
@@ -112,11 +119,14 @@ case "$cmd $action" in
 		mutate '.exists=true'
 		"$jq" -n --arg id "$base" --argjson tags "$tags" '{id:$id,tags:$tags}' ;;
 	"group show")
+		mutate '.cleanup=true'
 		[[ $("$jq" -r .exists "$state") == true ]] || exit 3
-		[[ $scenario != cleanup-unowned ]] || tags='{}'
+		[[ $scenario != cleanup-unowned && $scenario != diagnostics-unowned-group ]] || tags='{}'
 		"$jq" -n --arg id "$base" --argjson tags "$tags" '{id:$id,tags:$tags}' ;;
 	"group delete")
-		[[ $scenario != delete-failure ]] || exit 17
+		date +%s > "$root/delete.seconds"
+		[[ $scenario != delete-failure && $scenario != diagnostics-delete-failure &&
+			$scenario != diagnostics-read-delete-failure ]] || exit 17
 		mutate '.exists=false' ;;
 	"disk create")
 		role=${name##*-}
@@ -143,7 +153,18 @@ case "$cmd $action" in
 		printf '{}\n' ;;
 	"vm show") virtual_machine ;;
 	"vm get-instance-view")
-		"$jq" '{instanceView:{statuses:[{code:("PowerState/"+.power)}]}}' "$state" ;;
+		boot=$("$jq" -r .boots "$state")
+		power=$("$jq" -r .power "$state")
+		case "$scenario:$boot:$power" in
+			stopped-boot1:1:running|stopped-boot2:2:running|stopped-both:*:running|stopped-bad-serial:1:running)
+				power=stopped ;;
+			unexpected-boot1-power:1:running|diagnostics-*:1:running) power=starting ;;
+			unexpected-boot2-power:2:running) power=deallocating ;;
+			retained-stopped:1:deallocated|final-stopped:2:deallocated) power=stopped ;;
+		esac
+		"$jq" -n --arg power "$power" --arg scenario "$scenario" '
+			{instanceView:{statuses:[{code:"ProvisioningState/succeeded"},
+			  {code:(if $scenario == "malformed-power" then null else "PowerState/"+$power end)}]}}' ;;
 	"vm deallocate")
 		mutate '.power="deallocated"'
 		if [[ $scenario == boot1-mutated-before-start && $("$jq" -r .boots "$state") == 1 ]]; then
@@ -163,6 +184,18 @@ case "$cmd $action" in
 		[[ $scenario != ambiguous-start ]] || exit 22 ;;
 	"vm boot-diagnostics")
 		boot=$("$jq" -r .boots "$state")
+		if [[ $("$jq" -r '.cleanup // false' "$state") == true ]]; then
+			printf 'failure diagnostics\n' >> "$root/calls"
+			date +%s > "$root/diagnostics.seconds"
+			case $scenario in
+				diagnostics-read-failure|diagnostics-read-delete-failure)
+					printf 'fixture diagnostic read failure\n' >&2; exit 23 ;;
+				diagnostics-decode-failure) printf '{"unexpected":"not a JSON string"}\n'; exit ;;
+				diagnostics-timeout) sleep 35 ;;
+			esac
+			"$jq" -Rs . "$root/boot$boot.log"
+			exit
+		fi
 		if [[ $boot == 2 ]]; then
 			case $scenario in
 				boot1-mutated-after-start) printf 'benign-looking appended line\n' >> "$root/attempt/boot1.log" ;;
@@ -177,7 +210,8 @@ case "$cmd $action" in
 			printf '""\n'
 			exit
 		fi
-		[[ $scenario != serial-failure ]] || { printf '"UK_HYPERV_ACCEPTANCE_FAIL:fixture\\n"\n'; exit; }
+		[[ $scenario != serial-failure && $scenario != stopped-bad-serial ]] ||
+			{ printf '"UK_HYPERV_ACCEPTANCE_FAIL:fixture\\n"\n'; exit; }
 		[[ $scenario != boot2-writes || $boot != 2 ]] || {
 			sed 's/:2:11111111111111111111111111111111:0:0:/:2:11111111111111111111111111111111:1:0:/' "$root/boot2.log" |
 				"$jq" -Rs .; exit;
@@ -189,7 +223,8 @@ case "$cmd $action" in
 				[[ $("$jq" -r --arg role "$role" '.[$role].created // false' "$state") != true ]] || disk "$role"
 			done
 			[[ $("$jq" -r .boots "$state") == 0 ]] || virtual_machine
-			[[ $scenario != foreign-resource ]] || printf '{"id":"foreign","name":"foreign","type":"Microsoft.Compute/disks","tags":{}}\n'
+			[[ $scenario != foreign-resource && $scenario != diagnostics-foreign-resource ]] ||
+				printf '{"id":"foreign","name":"foreign","type":"Microsoft.Compute/disks","tags":{}}\n'
 		} | "$jq" -s . ;;
 	*) exit 94 ;;
 esac
