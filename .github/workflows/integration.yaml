@@ -1208,13 +1208,13 @@ jobs:
         set -euo pipefail
         umask 077
         root="${RUNNER_TEMP}/hyperv-ci/direct"
-        mkdir -p "${root}/tmp" "${root}/fixtures"
+        mkdir -p "${root}/tmp" "${root}/fixtures" "${root}/.d"
         export TMPDIR="${root}/tmp"
         zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
           --cache-dir "${root}/cache" --global-cache-dir "${root}/global" \
           --prefix "${root}/tools" -Doptimize=ReleaseSafe \
           -Dtest-root="${root}/fixtures" test test-foundation install fixture-tools
-        reference="${GITHUB_WORKSPACE}/.d/direct-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        reference="${root}/.d/direct-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
         "${root}/tools/bin/hyperv-direct-lifecycle-fixtures" \
           --backend reference \
           --controller "${GITHUB_WORKSPACE}/support/scripts/hyperv-direct-two-boot.sh" \
