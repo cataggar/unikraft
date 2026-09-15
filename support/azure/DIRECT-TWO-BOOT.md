@@ -326,10 +326,13 @@ Do not describe an uncertain cleanup as absent or accepted.
 ## Offline validation
 
 ```sh
+umask 077
+mkdir -p .d/direct-runtime .d/direct-foundation-fixtures
 TMPDIR="$PWD/.d/direct-runtime" zig build \
   --build-file support/tools/hyperv/direct/build.zig \
   --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
-  -Doptimize=ReleaseSafe test
+  -Dtest-root="$PWD/.d/direct-foundation-fixtures" \
+  -Doptimize=ReleaseSafe test test-foundation
 support/scripts/tests/test_hyperv_direct_two_boot.sh \
   "$PWD/.d/NEW-direct-fixtures" \
   "$PWD/.d/direct-tools/bin/uk-hyperv-direct-validate"
@@ -346,5 +349,86 @@ unchanged legacy modes. Lifecycle cases also retain raw hashes/captures,
 the sole start, bounded polling and failure-only diagnostic non-authority.
 These tests cannot authorize or establish live #89 acceptance.
 
-The shell/jq orchestration and fixture migration remains follow-up #144;
-this change adds only opt-in native serial framing, not that rewrite.
+## Native migration foundation contract (#144)
+
+The observation, custody and private subprocess libraries are implemented
+under `support/tools/hyperv/direct/`. `test-foundation` exercises these
+libraries, including isolated process-poison cases, and compiles their
+production interfaces without running them. It does not install a cloud
+controller. The shell entry point and its 92-case lifecycle reference remain
+in place until the complete native controller and native parity suite land.
+
+The migration retains the six explicit command inputs shown above. It does
+not add a broad `uk-hyperv` execution mode or enable the parked production
+stubs. The native validator remains a bounded child; transfer remains the
+existing native `transfer PRIVATE_DIRECTORY JOB_BASENAME` protocol.
+
+The local JSON contract is unchanged. In the table, **identity fields** means
+`vm_id`, `vm_uuid`, `os_id`, `os_uuid`, `data_id`, `data_uuid`, all exact
+strings. Hash fields are lowercase SHA256 strings, not paths or substitute
+guest receipts.
+
+| Record | Fields |
+|---|---|
+| `scope.json`, ledger `consumed.json` | Byte-for-byte copies of the complete admitted scope above; no reserialization or alternate approval. |
+| `events.jsonl` | `phase`, `reserved_boots`; append-only, synced records using the existing hyphenated phase names. |
+| `boot1-capture.json`, `boot2-capture.json` | `schema` = `uk.hyperv.direct-serial-capture`, `version` = 1, `boot`, `poll`, `serial_mode`, `serial_sha256`, `cli_wrapper_sha256`, `scope_sha256`, identity fields, `vm_observation_sha256`, `original_boot1_sha256`, `boot2_admission_sha256`. |
+| `boot2-admission.json` | `schema` = `uk.hyperv.direct-boot2-admission`, `version` = 1, `reserved_boots` = 2, `scope_sha256`, `original_boot1_sha256`, `boot1_capture_sha256`, identity fields, `retained_vm_sha256`, `retained_os_sha256`, `retained_data_sha256`, `deallocated_power_sha256`. |
+| `outcome.json` | `phase`, `primary_exit`, `cleanup_exit`, `reserved_boots`, `persistence_evidence_complete`, `owned_group_absent`, `group_creation_attempted`, `failure_diagnostics`, `boot2_freshness`, `accepted`. |
+| `outcome.failure_diagnostics` | `attempted`, nullable `exit`, `decoded`; diagnostic failure is separate from primary and cleanup failure. |
+| `outcome.boot2_freshness` | `cached_reads`, nullable `cached_reason`; the sole nonnull reason is `identical-pinned-boot1`. |
+| Native page `request.json` | `schema` = `unikraft.hyperv.managed-disk-page-worker`, `schema_version` = 1, `endpoint` without SAS, `path`, `size`, `sha256`. |
+| Native transfer job | `contract` = `uk.hyperv.transfer-job`, `schema_version` = 1, `kind` = `pages`, `request`, `sas`, `timeout_ms`, `cleanup_ms`; SAS is a private filename, never the capability value. |
+
+Ledger names remain `attempt-<attempt_id>`, `<run_id>-<disk_id>`, and
+`sha256-<seed_vhd.sha256>`. Every reservation and its containing directory
+must become durable before effects. Partial creation remains consumed.
+The stable `.writer.lock` inode is never replaced or removed. Scope,
+capture, admission and outcome publication is create-only; collisions do
+not authorize overwrite, resume or another ledger. Raw captures use
+bounded streaming publication, not the small-record API.
+
+The existing executable-status baseline is also explicit:
+
+| Condition | Existing observable behavior to preserve |
+|---|---|
+| Invalid command/local admission or explicit controller refusal | Nonzero, normally 1; no effects before admission and consumption. |
+| Propagated Azure/native child failure | Retain the actual nonzero child status; successful deletion never replaces it with 0. |
+| Execution budget exhausted / approval expires before a primary Azure call | 124 / 125 respectively. The initial expired-approval admission is a local refusal. |
+| Handled HUP / INT / TERM | 129 / 130 / 143 respectively, followed by separately budgeted owned cleanup. |
+| Canonical serial validator | 0 may establish a capture; 2 means incomplete and consumes the existing poll/delay budget; other statuses reject guest evidence. Read-only serial-provider failures may consume a poll, not authorize another mutation. |
+| Legacy jq observations | False is normally 1, malformed JSON 4, filter/type failure 5; jq invocation/compilation failures are tool failures, not evidence. |
+| Successful primary with failed cleanup, final input validation or outcome recording | Nonzero final status; no acceptance. |
+
+Native observation errors retain separate `refused`, `filter_error`,
+`malformed`, `capture` and `local` categories rather than pretending that
+every error is jq false. Runtime results separately retain the actual child
+exit/signal, execution failures, capture state, byte counts and cleanup
+completion. Partial, overflowed, failed or undurable output is private
+diagnostic material, never an admissible observation. The controller's
+integer mapping must preserve the lifecycle contract above and its named
+parity assertions; libraries do not invent an exit status for their callers.
+
+Intentional parser strictness is limited and explicit: reject duplicate
+JSON keys, bounded structural overflow, object-shaped status collections,
+and fractional numbers that floating-point jq evaluation might round to an
+integer. Exact integral JSON numbers and canonical decimal strings retain
+their field-specific rules; missing/null/extra ARM fields are accepted only
+where the existing observation contract permits them. Resource identifiers
+are not globally case-normalized.
+
+Native `runPrivate` does not widen existing `process.run` callers: their
+4-MiB limits, failed-stdout clearing and stderr redaction remain unchanged.
+The new private capture path permits at most 8 MiB per stream. Native transfer
+now latches handled signals and passes cancellation to its existing worker
+supervisor, so its own child groups can be reconciled. Unresolved descendants
+poison the dedicated supervisor and retain writer ownership until process
+exit; they prohibit further supervised operations, including cloud cleanup.
+No poison reset, unbounded wait or success-shaped cleanup fallback exists.
+
+Acceptance requires successful process completion as well as durable
+records. An immutable `outcome.json` can become visible before its final
+directory sync fails; even an `accepted` field in such a partial publication
+cannot establish acceptance. Do not infer success from that file alone or
+retry the consumed attempt. The five historical live grants remain consumed;
+these offline foundations grant no new cloud authority.
