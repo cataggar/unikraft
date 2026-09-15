@@ -56,6 +56,7 @@ deadline=$((SECONDS + runtime))
 cleanup_lane=false
 phase=local-admission
 boots=0 group_intended=0 cleanup_exit=0 absent=false accepted=false
+failure_diagnostics_attempted=false failure_diagnostics_exit=null failure_diagnostics_decoded=false
 grant_os=0 grant_data=0
 os_uuid= data_uuid= vm_uuid=
 boot1_sha= boot1_capture_sha= admission_sha=
@@ -88,9 +89,11 @@ az_call() {
 	) > "$run/$label.json" 2> "$run/$label.stderr"
 }
 check() {
-	local file=$1 filter=$2
+	local file=$1 filter=$2 status=0
 	shift 2
-	"$jq" -e -L "$azure" "$@" "include \"direct-two-boot\"; $filter" "$run/$file.json" >/dev/null
+	"$jq" -e -L "$azure" "$@" "include \"direct-two-boot\"; $filter" "$run/$file.json" >/dev/null || status=$?
+	if (( status != 0 )); then printf 'direct observation failed: %s.json\n' "$file" >&2; fi
+	return "$status"
 }
 ownership() {
 	check "$1" 'owned($id; $owner; $prefix; $sha)' \
@@ -133,6 +136,28 @@ cleanup_identities() {
 		check cleanup-vm-identity '.vmId == $uuid' --arg uuid "$vm_uuid" || return
 	fi
 }
+failure_diagnostics() {
+	local cleanup_deadline=$deadline budget=$((deadline - SECONDS - 2 * operation - 2))
+	# Reserve full delete/absence operations; the optional capture gets at
+	# most 28 seconds plus bounded()'s two-second termination grace.
+	if (( budget <= 0 )); then
+		printf 'failure boot diagnostics skipped: cleanup budget\n' >&2
+		return
+	fi
+	(( budget <= 28 )) || budget=28
+	deadline=$((SECONDS + budget))
+	failure_diagnostics_attempted=true
+	az_call failure-boot-diagnostics vm boot-diagnostics get-boot-log --resource-group "$group" --name "$vm"
+	failure_diagnostics_exit=$?
+	if (( failure_diagnostics_exit == 0 )); then
+		bounded "$jq" -erj 'if type == "string" then . else error("serial wrapper") end' \
+			"$run/failure-boot-diagnostics.json" > "$run/failure-boot-diagnostics.log" \
+			2> "$run/failure-boot-diagnostics-decode.stderr"
+		failure_diagnostics_exit=$?
+		if (( failure_diagnostics_exit == 0 )); then failure_diagnostics_decoded=true; fi
+	fi
+	deadline=$cleanup_deadline
+}
 cleanup() {
 	local primary=$? prior_phase=$phase
 	trap - EXIT HUP INT TERM
@@ -159,6 +184,9 @@ cleanup() {
 			done
 			if az_call cleanup-inventory resource list --resource-group "$group" &&
 				inventory_owned cleanup-inventory && cleanup_identities; then
+				if (( primary != 0 && boots > 0 )) && [[ -n $vm_uuid && -n $os_uuid && -n $data_uuid ]]; then
+					failure_diagnostics
+				fi
 				event cleanup-delete-intent || cleanup_exit=1
 				az_call cleanup-delete group delete --name "$group" --yes || cleanup_exit=1
 				# Even a lost delete response needs an independent absence read.
@@ -178,9 +206,12 @@ cleanup() {
 	fi
 	"$jq" -n --arg phase "$prior_phase" --argjson primary "$primary" --argjson cleanup "$cleanup_exit" \
 		--argjson boots "$boots" --argjson absent "$absent" --argjson accepted "$accepted" --argjson created "$group_intended" \
+		--argjson diagnostics_attempted "$failure_diagnostics_attempted" \
+		--argjson diagnostics_exit "$failure_diagnostics_exit" --argjson diagnostics_decoded "$failure_diagnostics_decoded" \
 		'{phase:$phase,primary_exit:$primary,cleanup_exit:$cleanup,reserved_boots:$boots,
 		  persistence_evidence_complete:$accepted,owned_group_absent:$absent,
 		  group_creation_attempted:($created == 1),
+		  failure_diagnostics:{attempted:$diagnostics_attempted,exit:$diagnostics_exit,decoded:$diagnostics_decoded},
 		  accepted:($primary == 0 and $cleanup == 0 and $accepted and $absent)}' > "$run/outcome.json"
 	local recording=$?
 	sync -f "$run/outcome.json" || recording=1
@@ -270,9 +301,9 @@ upload os os_vhd "$os_id"
 upload data seed_vhd "$data_id"
 
 observe() {
-	local label=$1 power=$2 disk_state
-	case $power in
-		running) disk_state=Attached ;;
+	local label=$1 observation=$2 disk_state
+	case $observation in
+		allocated) disk_state=Attached ;;
 		deallocated) disk_state=Reserved ;;
 		*) die "unsupported observation power state" ;;
 	esac
@@ -306,7 +337,11 @@ observe() {
 			--arg state "$disk_state" --argjson bytes "$((bytes - 512))"
 	done
 	az_call "$label-power" vm get-instance-view --resource-group "$group" --name "$vm"
-	check "$label-power" 'power == $expected' --arg expected "PowerState/$power"
+	check "$label-power" '
+		power as $observed |
+		if $observation == "allocated" then
+			$observed == "PowerState/running" or $observed == "PowerState/stopped"
+		else $observed == "PowerState/deallocated" end' --arg observation "$observation"
 }
 digest() {
 	bounded sha256sum -- "$1" | cut -d ' ' -f 1
@@ -407,7 +442,7 @@ boots=1
 event boot1-deploy-intent
 az_call deployment deployment group create --resource-group "$group" --name "$prefix" \
 	--template-file "$azure/hyperv-direct-two-boot.json" --parameters "@$run/deployment-parameters.json"
-observe boot1 running
+observe boot1 allocated
 serial 1
 event boot1-evidence-complete
 event deallocate-intent
@@ -420,7 +455,7 @@ admit_boot2
 event boot2-start-intent
 # There is exactly one start call. An ambiguous response exits into cleanup.
 az_call started vm start --resource-group "$group" --name "$vm"
-observe boot2 running
+observe boot2 allocated
 serial 2
 event boot2-evidence-complete
 event final-deallocate-intent
