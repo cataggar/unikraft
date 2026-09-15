@@ -421,7 +421,14 @@ Native `runPrivate` does not widen existing `process.run` callers: their
 4-MiB limits, failed-stdout clearing and stderr redaction remain unchanged.
 The new private capture path permits at most 8 MiB per stream. Native transfer
 now latches handled signals and passes cancellation to its existing worker
-supervisor, so its own child groups can be reconciled. Unresolved descendants
+supervisor, so its own child groups can be reconciled. For a nonnested private
+command, an observed leader exit and both pipe EOFs end the command without
+an artificial two-second delay. Any remaining group members with closed output
+are treated as abandoned and killed immediately. The unreaped leader remains
+pinned through that final group signal, and bounded reaping is still mandatory:
+EOF alone never proves that descendants are gone. Running work, inherited open
+pipes, timeout/cancellation, nested supervision and legacy callers retain
+their previous termination behavior. Unresolved descendants
 poison the dedicated supervisor and retain writer ownership until process
 exit; they prohibit further supervised operations, including cloud cleanup.
 No poison reset, unbounded wait or success-shaped cleanup fallback exists.

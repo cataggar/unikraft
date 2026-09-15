@@ -92,6 +92,7 @@ pub fn build(b: *std.Build) void {
         "../process_private_tests.zig",
         "runtime_tests.zig",
         "../process_private_poison_tests.zig",
+        "../process_private_completion_poison_tests.zig",
     }) |source| {
         const tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(source),
