@@ -10,6 +10,20 @@ root=${UK_DIRECT_FIXTURE_ROOT:?isolated fixture root required}
 jq=/usr/bin/jq
 state="$root/fake-cloud.json"
 scenario=$(cat "$root/scenario")
+if [[ ${0##*/} == sha256sum ]]; then
+	[[ $# == 2 && $1 == -- && $2 == "$root/"* ]] || exit 90
+	/usr/bin/sha256sum "$@"
+	reads=$("$jq" -r '.boot2_reads // 0' "$state")
+	if [[ $scenario == cache-hash-error && $2 == "$root/attempt/boot2-candidate.log" ]] ||
+		{ (( reads >= 2 )) && {
+			[[ $scenario == cache-binding-hash-error && $2 == "$root/attempt/boot1.log" ]] ||
+			[[ $scenario == cache-admission-hash-error && $2 == "$root/attempt/boot2-admission.json" ]];
+		}; }; then
+		printf 'fixture hash read failed\n' >&2
+		exit 17
+	fi
+	exit
+fi
 native=${UK_DIRECT_FIXTURE_VALIDATOR:?native serial validator required}
 [[ $native == /* && -x $native ]] || exit 90
 [[ ${native##*/} == uk-hyperv-direct-validate ]] || exit 90
@@ -119,6 +133,7 @@ case "$cmd $action" in
 		mutate '.exists=true'
 		"$jq" -n --arg id "$base" --argjson tags "$tags" '{id:$id,tags:$tags}' ;;
 	"group show")
+		date +%s > "$root/cleanup.seconds"
 		mutate '.cleanup=true'
 		[[ $("$jq" -r .exists "$state") == true ]] || exit 3
 		[[ $scenario != cleanup-unowned && $scenario != diagnostics-unowned-group ]] || tags='{}'
@@ -177,7 +192,8 @@ case "$cmd $action" in
 		"$jq" -e --arg vm "$vm_id" \
 			'.reserved_boots == 2 and .vm_id == $vm and (.original_boot1_sha256|length) == 64' \
 			"$root/attempt/boot2-admission.json" >/dev/null
-		mutate '.boots=2 | .power="running"'
+		date +%s > "$root/boot2-start.seconds"
+		mutate '.boots=2 | .power="running" | .boot2_reads=0'
 		if [[ $scenario == boot2-admission-mutated ]]; then
 			printf ' \n' >> "$root/attempt/boot2-admission.json"
 		fi
@@ -197,12 +213,33 @@ case "$cmd $action" in
 			exit
 		fi
 		if [[ $boot == 2 ]]; then
+			mutate '.boot2_reads += 1'
+			reads=$("$jq" -r .boot2_reads "$state")
 			case $scenario in
 				boot1-mutated-after-start) printf 'benign-looking appended line\n' >> "$root/attempt/boot1.log" ;;
 				stale-boot1-log) "$jq" -Rs . "$root/boot1.log"; exit ;;
+				different-boot1-log|cumulative-different-boot1)
+					sed 's/SELECT PASS id=1/SELECT PASS id=2/' "$root/boot1.log" | "$jq" -Rs .
+					exit ;;
 				cumulative-prefix-drift)
 					sed '1s/UK_HYPERV_PLATFORM_READY/UK_HYPERV_PLATFORM_DRIFT/' "$root/boot2.log" |
 						"$jq" -Rs .; exit ;;
+			esac
+			case $scenario in
+				cached-then-fresh|cumulative-cached-then-fresh|cache-*)
+					if (( reads == 1 )); then "$jq" -Rs . "$root/boot1.log"; exit; fi
+					case $scenario in
+						cache-boot1-mutated) printf 'changed during cache wait\n' >> "$root/attempt/boot1.log" ;;
+						cache-capture-mutated) printf ' \n' >> "$root/attempt/boot1-capture.json" ;;
+						cache-scope-mutated) printf ' \n' >> "$root/attempt/scope.json" ;;
+						cache-admission-mutated) printf ' \n' >> "$root/attempt/boot2-admission.json" ;;
+						cache-then-wrong-identity)
+							sed 's/44444444444444444444444444444444/55555555555555555555555555555555/' "$root/boot2.log" |
+								"$jq" -Rs .; exit ;;
+						cache-then-failure) printf '"UK_HYPERV_ACCEPTANCE_FAIL:fixture\\n"\n'; exit ;;
+					esac
+					if [[ $scenario == cache-* ]]; then "$jq" -Rs . "$root/boot1.log"; exit; fi
+					;;
 			esac
 		fi
 		if [[ $scenario == incomplete-serial && $("$jq" -r '.serial_reads // 0' "$state") == 0 ]]; then

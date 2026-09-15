@@ -71,10 +71,17 @@ EOF
 			mv "$root/without-platform.log" "$root/boot$boot.log"
 		fi
 	done
+	case $scenario in
+		cache-hash-error|cache-binding-hash-error|cache-admission-hash-error)
+			mkdir -m 0700 "$root/hash-tools"
+			ln -s "$fake" "$root/hash-tools/sha256sum" ;;
+	esac
 }
 execute() {
-	local root="$base/$1"
+	local root="$base/$1" tool_path=$PATH
+	[[ ! -d $root/hash-tools ]] || tool_path="$root/hash-tools:$PATH"
 	UK_DIRECT_FIXTURE_ROOT="$root" UK_DIRECT_FIXTURE_VALIDATOR="$native" \
+		PATH="$tool_path" \
 		"$harness" "$root/scope.json" "$root/attempt" "$root/ledger" "$fake" "$fake" "$fake" \
 		> "$root/public.stdout" 2> "$root/public.stderr"
 }
@@ -84,9 +91,9 @@ assert_no_secret() {
 	! grep -R -l 'PRIVATE_FIXTURE_SAS' "$root/attempt" "$root/public.stdout" "$root/public.stderr" >/dev/null
 }
 for scenario in success lowercase-grant storage-azure-grant cumulative-serial incomplete-serial \
-	stopped-boot1 stopped-boot2 stopped-both; do
+	stopped-boot1 stopped-boot2 stopped-both cached-then-fresh cumulative-cached-then-fresh; do
 	fixture "$scenario"
-	if [[ $scenario == cumulative-serial ]]; then
+	if [[ $scenario == cumulative-serial || $scenario == cumulative-cached-then-fresh ]]; then
 		root="$base/$scenario"
 		cat "$root/boot1.log" "$root/boot2.log" > "$root/combined.log"
 		mv "$root/combined.log" "$root/boot2.log"
@@ -128,6 +135,16 @@ for scenario in success lowercase-grant storage-azure-grant cumulative-serial in
 	[[ $(grep -c '^deployment group ' "$root/calls") == 1 ]]
 	[[ $(grep -c '^vm deallocate ' "$root/calls") == 2 ]]
 	[[ $(grep -c '^transfer$' "$root/calls") == 2 ]]
+	case $scenario in
+		cached-then-fresh|cumulative-cached-then-fresh)
+			"$jq" -e '.boot2_freshness == {cached_reads:1,cached_reason:"identical-pinned-boot1"}' \
+				"$root/attempt/outcome.json" >/dev/null
+			"$jq" -e '.boot == 2 and .poll == 2' "$root/attempt/boot2-capture.json" >/dev/null
+			"$jq" -e '.boot2_reads == 2' "$root/fake-cloud.json" >/dev/null
+			[[ $(grep -c '^validator serial$' "$root/calls") == 2 ]]
+			"$jq" -rj . "$root/attempt/boot2-serial-1.json" | cmp - "$root/attempt/boot1.log"
+			cmp "$root/boot2.log" "$root/attempt/boot2.log" ;;
+	esac
 	! grep -q '^failure diagnostics$' "$root/calls"
 	assert_no_secret "$scenario"
 	if [[ $scenario == success ]]; then
@@ -153,7 +170,10 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 	diagnostics-power-failure diagnostics-read-failure diagnostics-decode-failure diagnostics-timeout \
 	diagnostics-no-budget diagnostics-unowned-group diagnostics-foreign-resource \
 	diagnostics-vm-identity-drift diagnostics-disk-identity-drift diagnostics-unknown-vm \
-	diagnostics-delete-failure diagnostics-read-delete-failure; do
+	diagnostics-delete-failure diagnostics-read-delete-failure \
+	different-boot1-log cumulative-different-boot1 cache-boot1-mutated cache-capture-mutated \
+	cache-scope-mutated cache-admission-mutated cache-hash-error cache-binding-hash-error \
+	cache-admission-hash-error cache-then-wrong-identity cache-then-failure; do
 	fixture "$scenario"
 	root="$base/$scenario"
 	if [[ $scenario == diagnostics-timeout || $scenario == diagnostics-no-budget ]]; then
@@ -167,6 +187,10 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 		root="$base/$scenario"
 		cat "$root/boot1.log" "$root/boot2.log" > "$root/combined.log"
 		mv "$root/combined.log" "$root/boot2.log"
+		"$jq" '.serial_mode="cumulative"' "$root/scope.json" > "$root/scope-next.json"
+		mv "$root/scope-next.json" "$root/scope.json"
+	fi
+	if [[ $scenario == cumulative-different-boot1 ]]; then
 		"$jq" '.serial_mode="cumulative"' "$root/scope.json" > "$root/scope-next.json"
 		mv "$root/scope-next.json" "$root/scope.json"
 	fi
@@ -272,6 +296,49 @@ for scenario in bad-input preexisting-group both-grants unknown-grant duplicate-
 		cmp "$root/boot1.log" "$root/attempt/failure-boot-diagnostics.log"
 		[[ $(stat -c %a "$root/attempt/failure-boot-diagnostics.log") == 600 ]]
 	fi
+	cached_reads=$("$jq" -r .boot2_freshness.cached_reads "$root/attempt/outcome.json")
+	[[ $(grep -c '^Boot2 cached read ' "$root/attempt/driver.stderr" || :) == "$cached_reads" ]]
+	case $scenario in
+		stale-boot1-log)
+			reads=$("$jq" -r .boot2_reads "$root/fake-cloud.json")
+			(( cached_reads > 0 && cached_reads <= reads && reads <= 60 ))
+			"$jq" -e '.runtime_seconds == 60 and .poll_seconds == 1' "$root/scope.json" >/dev/null
+			(( $(cat "$root/cleanup.seconds") - $(cat "$root/boot2-start.seconds") <= 60 ))
+			[[ $(grep -c '^validator serial$' "$root/calls") == 1 ]]
+			# A later successful-looking cleanup log is still not Boot2 evidence.
+			cmp "$root/boot2.log" "$root/attempt/failure-boot-diagnostics.log"
+			;;
+		different-boot1-log|cumulative-different-boot1)
+			[[ $cached_reads == 0 && $(grep -c '^validator serial$' "$root/calls") == 2 ]]
+			"$jq" -e '.boot2_reads == 1' "$root/fake-cloud.json" >/dev/null
+			grep -Eq '^direct validation failed: (WrongBootState|SerialPrefixChanged)$' \
+				"$root/attempt/serial-check.stderr" ;;
+		cache-hash-error)
+			[[ $result == 17 && $cached_reads == 0 && $(grep -c '^validator serial$' "$root/calls") == 1 ]]
+			"$jq" -e '.boot2_reads == 1' "$root/fake-cloud.json" >/dev/null ;;
+		cache-*)
+			[[ $cached_reads == 1 ]]
+			"$jq" -e '.boot2_reads == 2' "$root/fake-cloud.json" >/dev/null
+			case $scenario in
+				cache-then-wrong-identity|cache-then-failure)
+					[[ $(grep -c '^validator serial$' "$root/calls") == 2 ]] ;;
+				*)
+					[[ $(grep -c '^validator serial$' "$root/calls") == 1 ]] ;;
+			esac
+			case $scenario in
+				cache-binding-hash-error|cache-admission-hash-error) [[ $result == 17 ]] ;;
+			esac
+			;;
+	esac
+	case $scenario in
+		stale-boot1-log|different-boot1-log|cumulative-different-boot1|cache-*)
+			[[ $starts == 1 && $(grep -c '^vm deallocate ' "$root/calls") == 1 &&
+				! -e $root/attempt/boot2.log && ! -e $root/attempt/boot2-capture.json ]]
+			"$jq" -e '.reserved_boots == 2 and .primary_exit != 0 and .cleanup_exit == 0 and
+				.accepted == false and .failure_diagnostics == {attempted:true,exit:0,decoded:true}' \
+				"$root/attempt/outcome.json" >/dev/null
+			;;
+	esac
 	assert_no_secret "$scenario"
 	cases=$((cases + 1))
 done

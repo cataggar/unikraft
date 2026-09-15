@@ -27,6 +27,16 @@ admission or start occurred. Cleanup independently confirmed group absence;
 the local seed bytes remained unchanged and the attempt's ledger remains
 consumed. This fix does not authorize a retry.
 
+A third separately authorized fresh experiment on 2026-09-15 passed full
+Boot1 evidence, verified deallocation and original identities, and issued
+the sole admitted start. Its first post-start diagnostic capture was
+byte-identical to pinned Boot1, including the old timings and write/flush
+markers. The failure-only capture was also the old Boot1 text. No genuine
+Boot2 result was observed; the attempt failed and owned cleanup completed.
+All three experiment grants remain consumed, with their local seed sets and
+prior evidence unchanged. This readonly polling correction authorizes no
+new cloud attempt.
+
 ## Authorization and input custody
 
 Do not execute this lane under an earlier OS-only boot grant. A human must
@@ -200,6 +210,23 @@ retained privately then decoded; escaped one-line JSON is never grepped as a
 guest transcript. Select `per_boot` for logs replaced on each boot, or
 `cumulative` only when the complete Boot1 bytes are retained as a prefix.
 Both require exact phase-specific evidence, not a fresh platform marker alone.
+During Boot2 only, a decoded candidate whose full SHA256 exactly matches the
+unchanged pinned Boot1 is classified as **not yet fresh**. Before every such
+skip, the controller revalidates original Boot1, its capture record, scope
+and Boot2 admission hashes. It does not invoke the native parser on cached
+bytes or promote them to `boot2.log` or a Boot2 capture. The read consumes the
+existing poll count, delay and execution deadline; none is increased, and no
+additional start or refresh mutation is issued. Cumulative exact no-advance
+remains incomplete under the same bounds.
+Every different candidate still goes through the unchanged full native
+canonical, platform, identity and zero-write/flush checks; a different old
+Boot1 is not treated as cache. Hash-read failures propagate instead of being
+classified as fresh or cached. Private `driver.stderr` records cached-read
+indices and `outcome.boot2_freshness` records `cached_reads` and
+`cached_reason` (`identical-pinned-boot1`, or null when none were skipped).
+If diagnostics never become fresh, the attempt fails under the existing
+60-read/runtime limits and follows ordinary owned cleanup. A later
+successful-looking failure-only diagnostic cannot establish Boot2 acceptance.
 The original `boot1.log` and its create-only `boot1-capture.json` are hash-pinned
 and rechecked before admission, before Boot2 parsing and before acceptance.
 `boot2-capture.json` attributes the new capture to the original VM UUID, its
