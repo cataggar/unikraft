@@ -1206,12 +1206,14 @@ jobs:
     - name: Exercise the direct Azure lifecycle without cloud access
       run: |
         set -euo pipefail
+        umask 077
         root="${RUNNER_TEMP}/hyperv-ci/direct"
-        mkdir -p "${root}/tmp"
+        mkdir -p "${root}/tmp" "${root}/fixtures"
         export TMPDIR="${root}/tmp"
         zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
           --cache-dir "${root}/cache" --global-cache-dir "${root}/global" \
-          --prefix "${root}/tools" -Doptimize=ReleaseSafe test install
+          --prefix "${root}/tools" -Doptimize=ReleaseSafe \
+          -Dtest-root="${root}/fixtures" test test-foundation install
         support/scripts/tests/test_hyperv_direct_two_boot.sh \
           "${GITHUB_WORKSPACE}/.d/direct-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
           "${root}/tools/bin/uk-hyperv-direct-validate"

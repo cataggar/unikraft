@@ -49,8 +49,21 @@ normal capture passed the unchanged native Boot2 identity, receipt, zero-I/O,
 platform and completion checks. Failure-only diagnostics were not used for
 that analysis. The original scope/mode, raw captures, ledger and outcome
 remain immutable: **accepted=false, primary=1, cleanup=0, boots=2, cached=3**.
-That analysis does not retrospectively accept the run. All four grants are
-consumed; this opt-in framing change authorizes no fifth attempt.
+That analysis does not retrospectively accept the run. Those four grants
+remain consumed; the opt-in framing change itself authorized no fifth attempt.
+
+A fifth, separately approved experiment on 2026-09-15 ran from 04:06:47 to
+04:18:09 UTC using `azure_cumulative` and the source tree subsequently merged
+in #145 (`577f64b6`). Both boots passed the native canonical/platform gates:
+Boot1 enrolled the original seed, wrote and flushed data, and read it back;
+Boot2 verified the persisted receipt/data with unchanged identity and zero
+workload writes or flushes. The original VM/image/disks survived the sole
+deallocate/start transition, and final deallocation was observed. The recorded
+result was **accepted=true, primary=0, cleanup=0, boots=2, cached=3**.
+Owned resource absence and capability removal were independently confirmed.
+All five seed sets and earlier evidence remain unchanged; all five grants are
+consumed. This accepted #89 result is the behavioral baseline for the #144
+native controller migration, not authorization for another cloud run.
 
 ## Authorization and input custody
 
