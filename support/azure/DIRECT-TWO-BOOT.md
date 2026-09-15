@@ -338,12 +338,14 @@ Do not describe an uncertain cleanup as absent or accepted.
 ```sh
 umask 077
 mkdir -p .d/direct-runtime .d/direct-foundation-fixtures
+fixture_parent="$PWD/.d/NEW-direct-fixture-parent"
+mkdir -m 0700 "$fixture_parent"
 TMPDIR="$PWD/.d/direct-runtime" zig build \
   --build-file support/tools/hyperv/direct/build.zig -j2 \
   --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
   --prefix "$PWD/.d/direct-tools" \
   -Dtest-root="$PWD/.d/direct-foundation-fixtures" \
-  -Dlifecycle-root="$PWD/.d/NEW-direct-native-fixtures" \
+  -Dlifecycle-root="$fixture_parent/native" \
   -Doptimize=ReleaseSafe test test-foundation test-controller test-lifecycle-native install
 ```
 
@@ -353,7 +355,10 @@ budgets. Its explicit fake programs cannot delegate to Azure, a real transfer,
 or real input disks; the real native serial validator still processes fixture
 bytes. Production has no fixture backend, clock, admission or hash-failure
 switch. `-Dlifecycle-cases=name,name` selects cases. The root must be absolute
-and nonexistent; no root is needed for an ordinary production build.
+and nonexistent, beneath a fresh private mode-0700 parent inside the
+checkout's `.d`. This preserves repository-template resolution without
+changing shared ancestor permissions. No fixture root is needed for an
+ordinary production build.
 
 An optional development-only comparison still exercises the frozen reference
 before its removal. Only that explicit reference requires Bash, jq and the
@@ -366,15 +371,15 @@ zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
 "$PWD/.d/direct-tools/bin/hyperv-direct-lifecycle-fixtures" \
   --backend reference \
   --controller "$PWD/support/scripts/hyperv-direct-two-boot.sh" \
-  --root "$PWD/.d/NEW-direct-fixtures" \
+  --root "$fixture_parent/reference" \
   --fake "$PWD/.d/direct-tools/bin/hyperv-direct-fixture-cli" \
   --validator "$PWD/.d/direct-tools/bin/uk-hyperv-direct-validate"
 
 TMPDIR="$PWD/.d/direct-runtime" zig build \
   --build-file support/tools/hyperv/direct/build.zig -j2 \
   --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
-  -Dlifecycle-root="$PWD/.d/NEW-direct-comparison" \
-  -Dlifecycle-compare="$PWD/.d/NEW-direct-fixtures" \
+  -Dlifecycle-root="$fixture_parent/comparison" \
+  -Dlifecycle-compare="$fixture_parent/reference" \
   -Doptimize=ReleaseSafe test-lifecycle-native
 ```
 
