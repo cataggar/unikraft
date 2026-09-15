@@ -1,6 +1,6 @@
 # Direct Azure #89: one guarded image, two boots
 
-`support/scripts/hyperv-direct-two-boot.sh` is the bounded **direct specialized
+The native `uk-hyperv-direct-two-boot` is the bounded **direct specialized
 Generation 2 Unikraft VM** lane. Azure CLI manages only run-owned resources;
 the existing native `uk-hyperv transfer` uploads each exact fixed VHD. It does
 not run a Linux host, guest agent, nested QEMU/KVM, SSH, cloud-init, Python
@@ -63,7 +63,9 @@ result was **accepted=true, primary=0, cleanup=0, boots=2, cached=3**.
 Owned resource absence and capability removal were independently confirmed.
 All five seed sets and earlier evidence remain unchanged; all five grants are
 consumed. This accepted #89 result is the behavioral baseline for the #144
-native controller migration, not authorization for another cloud run.
+native controller migration, not authorization for another cloud run. That
+accepted run used the shell orchestrator; it is not live qualification of the
+native replacement.
 
 ## Authorization and input custody
 
@@ -164,25 +166,25 @@ native canonical, platform-marker and fresh-serial gates.
 
 ## Build and invoke
 
-Requirements: Bash, GNU `timeout`/`sync`/`stat`, `/usr/bin/jq`, native Zig
-0.16, an explicitly selected authenticated Azure CLI (tested wire shapes
-include 2.81/2.90), and the already-built native transfer CLI. No SDK download
-or new auth provider is needed for the small validation helper.
-Integrate the owner-frozen workload parser change
-`5a75a470fc8651d4141ffed1c8adab8f8a8f42e6` (or its reviewed integration replay)
-before building: it supplies the real `EvidenceInput`/`parseWorkload` module
-API. This harness does not carry a competing parser implementation.
+Requirements: Linux, native Zig 0.16, an explicitly selected authenticated
+Azure CLI (tested wire shapes include 2.81/2.90), and the already-built native
+transfer CLI. The selected native controller and fixtures do not invoke Bash,
+jq, a Python controller, or coreutils as a fallback. Azure CLI and its
+implementation dependencies remain permitted for resource management.
+The direct build needs no SDK download or new auth provider and reuses the
+existing `EvidenceInput`/`parseWorkload` module APIs, not a competing parser.
 
 ```sh
+umask 077
 mkdir -p .d/direct-cache .d/direct-global .d/direct-runtime
 TMPDIR="$PWD/.d/direct-runtime" zig build \
-  --build-file support/tools/hyperv/direct/build.zig \
+  --build-file support/tools/hyperv/direct/build.zig -j2 \
   --cache-dir "$PWD/.d/direct-cache" \
   --global-cache-dir "$PWD/.d/direct-global" \
   --prefix "$PWD/.d/direct-tools" -Doptimize=ReleaseSafe
 
 # ONLY after new explicit destructive approval, never as part of build/test:
-support/scripts/hyperv-direct-two-boot.sh \
+"$PWD/.d/direct-tools/bin/uk-hyperv-direct-two-boot" \
   /PRIVATE/approved-direct-scope.json \
   /PRIVATE/NEW-attempt \
   /PRIVATE/original-seed-consumption-ledger \
@@ -195,7 +197,7 @@ The scope and private seed files must be owner-private regular files in
 safe, non-symlinked directories. The attempt path must not exist. The ledger
 must already exist, mode 0700, and be the operator-selected **persistent
 ledger for this original seed**, not a fresh alternative ledger on retry.
-The script reserves attempt UUID, original run/disk identity and seed digest with
+The controller reserves attempt UUID, original run/disk identity and seed digest with
 atomic directories, then syncs consumption before the first cloud effect.
 It never removes those records. An incomplete reservation remains consumed.
 
@@ -203,6 +205,13 @@ The fresh group name is `prefix-rg`; VM, OS/data disks and private networking
 are named from the same prefix. All resources must match the attempt UUID,
 prefix, image hash, and managed-by tags. A preexisting or unobservably absent
 group is never adopted or deleted.
+
+The default build installs only the production controller and read-only
+validator. The controller embeds the unchanged ARM template and publishes
+its exact bytes privately as `ATTEMPT/deployment-template.json`; it never
+searches the checkout for a deployment template at runtime. The seven ARM
+parameters are unchanged. The old shell entry is temporarily retained only
+as an explicit offline migration reference, not a production fallback.
 
 ## Lifecycle and failure semantics
 
@@ -292,9 +301,8 @@ receipt or evidence that an unobserved external restart could not occur.
 `outcome.json` keeps primary and cleanup exits separate. Successful deletion
 never erases a failed upload or guest failure; failed empty-upload revoke
 (`InvalidVhd`) remains a cleanup failure even if owner-checked deletion works.
-Failed jq observations identify only their internal observation filename in
-private `driver.stderr`, preserving the original nonzero status and the
-existing cleanup control paths.
+Typed observation failures preserve their public nonzero category and private
+raw capture without promoting failed, partial or undurable output to evidence.
 
 On nonzero primary failure, cleanup may make **one** read-only boot-log
 request before deleting the group, only after the existing group, inventory,
@@ -320,7 +328,7 @@ private. Do not publish the attempt directory.
 TERM/INT/HUP use cleanup; an uncatchable kill or machine loss may interrupt
 it. Retained consumption and intent records forbid rerun. The operator must
 then reconcile the retained IDs and perform separately authorized bounded
-cleanup; this script has no crash-resume or automatic reauthorization mode.
+cleanup; this controller has no crash-resume or automatic reauthorization mode.
 Do not describe an uncertain cleanup as absent or accepted.
 
 ## Offline validation
@@ -329,11 +337,30 @@ Do not describe an uncertain cleanup as absent or accepted.
 umask 077
 mkdir -p .d/direct-runtime .d/direct-foundation-fixtures
 TMPDIR="$PWD/.d/direct-runtime" zig build \
-  --build-file support/tools/hyperv/direct/build.zig \
+  --build-file support/tools/hyperv/direct/build.zig -j2 \
   --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
   --prefix "$PWD/.d/direct-tools" \
   -Dtest-root="$PWD/.d/direct-foundation-fixtures" \
-  -Doptimize=ReleaseSafe test test-foundation install fixture-tools
+  -Dlifecycle-root="$PWD/.d/NEW-direct-native-fixtures" \
+  -Doptimize=ReleaseSafe test test-foundation test-controller test-lifecycle-native install
+```
+
+`test-lifecycle-native` builds a separate **noninstalled** fixture controller
+that uses the same state machine and real clocks, with unchanged scope
+budgets. Its explicit fake programs cannot delegate to Azure, a real transfer,
+or real input disks; the real native serial validator still processes fixture
+bytes. Production has no fixture backend, clock, admission or hash-failure
+switch. `-Dlifecycle-cases=name,name` selects cases. The root must be absolute
+and nonexistent; no root is needed for an ordinary production build.
+
+An optional development-only comparison still exercises the frozen reference
+before its removal. Only that explicit reference requires Bash, jq and the
+legacy GNU utilities:
+
+```sh
+zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
+  --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
+  --prefix "$PWD/.d/direct-tools" -Doptimize=ReleaseSafe fixture-tools
 "$PWD/.d/direct-tools/bin/hyperv-direct-lifecycle-fixtures" \
   --backend reference \
   --controller "$PWD/support/scripts/hyperv-direct-two-boot.sh" \
@@ -341,14 +368,12 @@ TMPDIR="$PWD/.d/direct-runtime" zig build \
   --fake "$PWD/.d/direct-tools/bin/hyperv-direct-fixture-cli" \
   --validator "$PWD/.d/direct-tools/bin/uk-hyperv-direct-validate"
 
-# A separate fresh run exercises the development-only comparison path.
-"$PWD/.d/direct-tools/bin/hyperv-direct-lifecycle-fixtures" \
-  --backend reference \
-  --controller "$PWD/support/scripts/hyperv-direct-two-boot.sh" \
-  --root "$PWD/.d/NEW-direct-comparison" \
-  --fake "$PWD/.d/direct-tools/bin/hyperv-direct-fixture-cli" \
-  --validator "$PWD/.d/direct-tools/bin/uk-hyperv-direct-validate" \
-  --compare "$PWD/.d/NEW-direct-fixtures"
+TMPDIR="$PWD/.d/direct-runtime" zig build \
+  --build-file support/tools/hyperv/direct/build.zig -j2 \
+  --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
+  -Dlifecycle-root="$PWD/.d/NEW-direct-comparison" \
+  -Dlifecycle-compare="$PWD/.d/NEW-direct-fixtures" \
+  -Doptimize=ReleaseSafe test-lifecycle-native
 ```
 
 `fixture-tools` is explicit and separate from the default installation.
@@ -373,8 +398,9 @@ records on both sides, and preserves within-run exit bindings. The declared
 1/124 deadline race is normalized only for `stale-boot1-log` and
 `azure-padding-only`. Negative controls cover missing records, natural
 completion mistaken for overflow termination, and undeclared exit changes.
-CI runs all cases and a targeted comparison of those affected refusal/deadline
-paths; full comparison remains available for offline qualification.
+CI runs all 94 native cases once, plus the controller and foundation cases.
+Full reference comparison remains an offline migration qualification gate,
+rather than duplicating the lifecycle in the existing bounded CI job.
 
 Read-only validator fixtures exercise seed/manifest/footer validation in
 memory, not on real disks, and call the same direct-helper framing functions.
@@ -384,15 +410,16 @@ unchanged legacy modes. Lifecycle cases also retain raw hashes/captures,
 the sole start, bounded polling and failure-only diagnostic non-authority.
 These tests cannot authorize or establish live #89 acceptance.
 
-## Native migration foundation contract (#144)
+## Native controller contract (#144)
 
 The observation, custody and private subprocess libraries are implemented
 under `support/tools/hyperv/direct/`. `test-foundation` exercises these
 libraries, including isolated process-poison cases, and compiles their
-production interfaces without running them. It does not install a cloud
-controller. The native fixture runner currently exercises the shell entry
-point as its explicit migration reference. Complete native orchestration and
-removal of the obsolete selected shell/jq files remain subsequent stages.
+production interfaces without running them. `test-controller` exercises
+controller policies and private IO; `test-lifecycle-native` exercises the
+complete orchestration without cloud access. Neither test target installs
+the fixture controller. Only removal of the obsolete selected shell/jq files
+and temporary reference machinery remains for migration cutover.
 
 The migration retains the six explicit command inputs shown above. It does
 not add a broad `uk-hyperv` execution mode or enable the parked production
@@ -433,7 +460,8 @@ The existing executable-status baseline is also explicit:
 | Execution budget exhausted / approval expires before a primary Azure call | 124 / 125 respectively. The initial expired-approval admission is a local refusal. |
 | Handled HUP / INT / TERM | 129 / 130 / 143 respectively, followed by separately budgeted owned cleanup. |
 | Canonical serial validator | 0 may establish a capture; 2 means incomplete and consumes the existing poll/delay budget; other statuses reject guest evidence. Read-only serial-provider failures may consume a poll, not authorize another mutation. |
-| Legacy jq observations | False is normally 1, malformed JSON 4, filter/type failure 5; jq invocation/compilation failures are tool failures, not evidence. |
+| Typed observations | Refusal/capture/local failure 1, malformed JSON 4, filter/type failure 5; the mapping preserves the declared legacy categories without invoking jq. |
+| Private output limit | Public status 153 preserves the legacy file-size refusal, only for a confirmed `output_limit` failure. Actual native child termination remains separately recorded; it is not misreported as SIGXFSZ. |
 | Successful primary with failed cleanup, final input validation or outcome recording | Nonzero final status; no acceptance. |
 
 Native observation errors retain separate `refused`, `filter_error`,

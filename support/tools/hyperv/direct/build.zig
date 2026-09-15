@@ -23,10 +23,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "preparation", .module = preparation },
         .{ .name = "evidence", .module = persistence },
     };
-    b.installArtifact(b.addExecutable(.{
+    const validator = b.addExecutable(.{
         .name = "uk-hyperv-direct-validate",
         .root_module = b.createModule(.{ .root_source_file = b.path("main.zig"), .target = target, .optimize = optimize, .imports = &imports }),
-    }));
+    });
+    b.installArtifact(validator);
     const fixtures = b.addExecutable(.{
         .name = "hyperv-direct-validation-fixtures",
         .root_module = b.createModule(.{ .root_source_file = b.path("fixtures.zig"), .target = target, .optimize = optimize, .imports = &imports }),
@@ -34,19 +35,15 @@ pub fn build(b: *std.Build) void {
     b.step("test", "Run native read-only direct validation fixtures (no cloud or disks)").dependOn(&b.addRunArtifact(fixtures).step);
 
     const fixture_tools = b.step("fixture-tools", "Install isolated native lifecycle fixture tools (no controller)");
-    inline for (.{
-        .{ "hyperv-direct-fixture-cli", "fixture_cli.zig" },
-        .{ "hyperv-direct-lifecycle-fixtures", "lifecycle_fixtures.zig" },
-    }) |item| {
-        const tool = b.addExecutable(.{
-            .name = item[0],
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(item[1]),
-                .target = target,
-                .optimize = optimize,
-                .imports = &imports,
-            }),
-        });
+    const fake = b.addExecutable(.{
+        .name = "hyperv-direct-fixture-cli",
+        .root_module = b.createModule(.{ .root_source_file = b.path("fixture_cli.zig"), .target = target, .optimize = optimize, .imports = &imports }),
+    });
+    const lifecycle = b.addExecutable(.{
+        .name = "hyperv-direct-lifecycle-fixtures",
+        .root_module = b.createModule(.{ .root_source_file = b.path("lifecycle_fixtures.zig"), .target = target, .optimize = optimize, .imports = &imports }),
+    });
+    inline for (.{ fake, lifecycle }) |tool| {
         fixture_tools.dependOn(&b.addInstallArtifact(tool, .{}).step);
     }
 
@@ -121,4 +118,93 @@ pub fn build(b: *std.Build) void {
         runtime_tests.dependOn(&b.addRunArtifact(tests).step);
     }
     foundation.dependOn(runtime_tests);
+
+    const controller_imports = imports ++ [_]std.Build.Module.Import{
+        .{ .name = "transfer_job", .module = transfer_job },
+    };
+    const controller = b.addExecutable(.{
+        .name = "uk-hyperv-direct-two-boot",
+        .root_module = controllerModule(b, "controller_main.zig", target, optimize, &controller_imports),
+    });
+    b.installArtifact(controller);
+    const controller_fixture = b.addExecutable(.{
+        .name = "hyperv-direct-controller-fixture",
+        .root_module = controllerModule(b, "controller_fixture_main.zig", target, optimize, &controller_imports),
+    });
+    const controller_tests = b.addTest(.{
+        .root_module = controllerModule(b, "controller_tests.zig", target, optimize, &runtime_imports),
+    });
+    controller_tests.root_module.addOptions("test_options", test_options);
+    b.step("test-controller", "Run native controller policy and private IO fixtures").dependOn(&b.addRunArtifact(controller_tests).step);
+
+    const lifecycle_root = b.option([]const u8, "lifecycle-root", "Fresh nonexistent absolute native lifecycle fixture root");
+    const lifecycle_compare = b.option([]const u8, "lifecycle-compare", "Existing absolute reference fixture root for strict comparison");
+    const lifecycle_cases = b.option([]const u8, "lifecycle-cases", "Comma-separated native lifecycle case selectors");
+    const native_lifecycle = b.step("test-lifecycle-native", "Run the complete native lifecycle with isolated fake resources");
+    if (lifecycle_root) |root| {
+        if (!std.fs.path.isAbsolute(root) or (lifecycle_compare != null and !std.fs.path.isAbsolute(lifecycle_compare.?))) {
+            native_lifecycle.dependOn(&b.addFail("Lifecycle fixture and comparison roots must be absolute").step);
+        } else {
+            const run = b.addRunArtifact(lifecycle);
+            run.has_side_effects = true;
+            run.addArgs(&.{ "--backend", "native", "--root", root });
+            NativeLifecycleArgs.add(b, run, .{ controller_fixture, fake, validator });
+            if (lifecycle_cases) |cases| run.addArgs(&.{ "--case", cases });
+            if (lifecycle_compare) |reference| run.addArgs(&.{ "--compare", reference });
+            native_lifecycle.dependOn(&run.step);
+        }
+    } else {
+        native_lifecycle.dependOn(&b.addFail("test-lifecycle-native requires -Dlifecycle-root=FRESH_ABSOLUTE_PATH").step);
+    }
+}
+
+const NativeLifecycleArgs = struct {
+    step: std.Build.Step,
+    run: *std.Build.Step.Run,
+    programs: [3]*std.Build.Step.Compile,
+
+    fn add(b: *std.Build, run: *std.Build.Step.Run, programs: [3]*std.Build.Step.Compile) void {
+        const args = b.allocator.create(NativeLifecycleArgs) catch @panic("OOM");
+        args.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = "Resolve absolute native fixture program paths",
+                .owner = b,
+                .makeFn = make,
+            }),
+            .run = run,
+            .programs = programs,
+        };
+        for (programs) |program| program.getEmittedBin().addStepDependencies(&args.step);
+        run.step.dependOn(&args.step);
+    }
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
+        const args: *NativeLifecycleArgs = @fieldParentPtr("step", step);
+        const b = step.owner;
+        // Run.addFileArg intentionally relativizes paths; the fixture CLI requires absolute inputs.
+        for (args.programs, [_][]const u8{ "--controller", "--fake", "--validator" }) |program, flag| {
+            const path = try program.getEmittedBin().getPath4(b, step);
+            args.run.addArgs(&.{ flag, b.pathResolve(&.{ b.graph.cache.cwd, path.root_dir.path orelse ".", path.sub_path }) });
+        }
+    }
+};
+
+fn controllerModule(
+    b: *std.Build,
+    source: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    imports: []const std.Build.Module.Import,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path(source),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    });
+    module.addAnonymousImport("direct_arm_template", .{
+        .root_source_file = b.path("../../../azure/hyperv-direct-two-boot.json"),
+    });
+    return module;
 }
