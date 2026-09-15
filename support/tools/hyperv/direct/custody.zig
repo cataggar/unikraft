@@ -373,7 +373,7 @@ pub const Store = struct {
         try self.writerReady();
     }
 
-    fn recordingFailed(self: *Store, err: anyerror) void {
+    pub fn recordingFailed(self: *Store, err: anyerror) void {
         self.healthy = false;
         if (self.recording_failure == null) self.recording_failure = err;
     }

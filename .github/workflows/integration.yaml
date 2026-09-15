@@ -1215,22 +1215,9 @@ jobs:
         zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
           --cache-dir "${root}/cache" --global-cache-dir "${root}/global" \
           --prefix "${root}/tools" -Doptimize=ReleaseSafe \
-          -Dtest-root="${root}/fixtures" test test-foundation install fixture-tools
-        reference="${parent}/reference"
-        "${root}/tools/bin/hyperv-direct-lifecycle-fixtures" \
-          --backend reference \
-          --controller "${GITHUB_WORKSPACE}/support/scripts/hyperv-direct-two-boot.sh" \
-          --root "${reference}" \
-          --fake "${root}/tools/bin/hyperv-direct-fixture-cli" \
-          --validator "${root}/tools/bin/uk-hyperv-direct-validate"
-        "${root}/tools/bin/hyperv-direct-lifecycle-fixtures" \
-          --backend reference \
-          --controller "${GITHUB_WORKSPACE}/support/scripts/hyperv-direct-two-boot.sh" \
-          --root "${reference}-comparison" \
-          --fake "${root}/tools/bin/hyperv-direct-fixture-cli" \
-          --validator "${root}/tools/bin/uk-hyperv-direct-validate" \
-          --case delete-failure,stale-boot1-log,azure-padding-only \
-          --compare "${reference}"
+          -Dtest-root="${root}/fixtures" \
+          -Dlifecycle-root="${parent}/native" \
+          test test-foundation test-controller test-lifecycle-native install
 
     - name: Solve and build native Hyper-V acceptance and SMP images
       env:
