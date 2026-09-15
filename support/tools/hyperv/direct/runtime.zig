@@ -133,9 +133,12 @@ pub const Budgets = struct {
         if (monotonic_ns >= outer.expires_ns) return error.BudgetExhausted;
         var remaining_ms = (outer.expires_ns - monotonic_ns) / std.time.ns_per_ms;
         if (lane == .diagnostic) {
-            const reserve = @as(u64, self.operation_ms) * 2 + term_grace_ms + reap_ms;
+            const termination_ms = term_grace_ms + reap_ms;
+            const reserve = (@as(u64, self.operation_ms) + termination_ms) * 2;
             if (remaining_ms <= reserve) return error.BudgetExhausted;
-            remaining_ms = @min(28000, remaining_ms - reserve);
+            const window_ms = @min(30000, remaining_ms - reserve);
+            if (window_ms <= termination_ms) return error.BudgetExhausted;
+            remaining_ms = window_ms - termination_ms;
         }
         const milliseconds: u64 = @min(self.operation_ms, remaining_ms);
         if (milliseconds == 0) return error.BudgetExhausted;

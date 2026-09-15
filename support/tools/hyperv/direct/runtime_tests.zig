@@ -59,8 +59,33 @@ test "optional diagnostics leave two full operations plus termination and reapin
     try runtime.Budgets.Test.cleanup(&budgets, 0);
     const diagnostic = try runtime.Budgets.Test.call(budgets, .diagnostic, .azure, 0, 500);
     try testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), diagnostic.deadline.expires_ns);
-    try testing.expect(diagnostic.cleanup_deadline.expires_ns <= 40 * std.time.ns_per_s);
-    try testing.expectError(error.BudgetExhausted, runtime.Budgets.Test.call(budgets, .diagnostic, .azure, 37 * std.time.ns_per_s, 500));
+    try testing.expectEqual(@as(u64, 13 * std.time.ns_per_s), diagnostic.cleanup_deadline.expires_ns);
+    const tail = try runtime.Budgets.Test.call(budgets, .diagnostic, .azure, 30 * std.time.ns_per_s, 500);
+    try testing.expectEqual(@as(u64, 31 * std.time.ns_per_s), tail.deadline.expires_ns);
+    try testing.expectEqual(@as(u64, 34 * std.time.ns_per_s), tail.cleanup_deadline.expires_ns);
+    for ([_]u64{ 31, 36, 37 }) |second|
+        try testing.expectError(error.BudgetExhausted, runtime.Budgets.Test.call(budgets, .diagnostic, .azure, second * std.time.ns_per_s, 500));
+}
+
+test "diagnostic execution TERM and reaping fit thirty seconds before two complete cleanup calls" {
+    var scope = timingScope();
+    scope.operation_seconds = 30;
+    scope.cleanup_seconds = 120;
+    var budgets = try runtime.Budgets.Test.start(scope, 0, 1);
+    try runtime.Budgets.Test.cleanup(&budgets, 0);
+    const start = 24 * std.time.ns_per_s;
+    const diagnostic = try runtime.Budgets.Test.call(budgets, .diagnostic, .azure, start, 500);
+    try testing.expectEqual(@as(u64, 27 * std.time.ns_per_s), diagnostic.deadline.expires_ns - start);
+    try testing.expectEqual(@as(u64, 30 * std.time.ns_per_s), diagnostic.cleanup_deadline.expires_ns - start);
+    try testing.expectEqual(@as(u64, 3 * std.time.ns_per_s), diagnostic.cleanup_deadline.expires_ns - diagnostic.deadline.expires_ns);
+
+    const deletion = try runtime.Budgets.Test.call(budgets, .cleanup, .azure, diagnostic.cleanup_deadline.expires_ns, 500);
+    try testing.expectEqual(@as(u64, 84 * std.time.ns_per_s), deletion.deadline.expires_ns);
+    const deletion_reaped = deletion.deadline.expires_ns + 3 * std.time.ns_per_s;
+    try testing.expect(deletion_reaped <= deletion.cleanup_deadline.expires_ns);
+    const absence = try runtime.Budgets.Test.call(budgets, .cleanup, .azure, deletion_reaped, 500);
+    try testing.expectEqual(@as(u64, 117 * std.time.ns_per_s), absence.deadline.expires_ns);
+    try testing.expectEqual(absence.cleanup_deadline.expires_ns, absence.deadline.expires_ns + 3 * std.time.ns_per_s);
 }
 
 test "explicit selected operator environment excludes ambient secrets paths and runtime hooks" {

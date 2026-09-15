@@ -426,6 +426,12 @@ poison the dedicated supervisor and retain writer ownership until process
 exit; they prohibit further supervised operations, including cloud cleanup.
 No poison reset, unbounded wait or success-shaped cleanup fallback exists.
 
+Optional native diagnostics reserve two complete cleanup operations,
+including each operation's termination and reaping allowance. Their own
+absolute cap remains 30 seconds: at most 27 seconds of execution, two seconds
+of TERM grace and one second of reaping. Reaping consumes that existing cap;
+it never adds time to it.
+
 Acceptance requires successful process completion as well as durable
 records. An immutable `outcome.json` can become visible before its final
 directory sync fails; even an `accepted` field in such a partial publication
