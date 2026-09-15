@@ -33,6 +33,23 @@ pub fn build(b: *std.Build) void {
     });
     b.step("test", "Run native read-only direct validation fixtures (no cloud or disks)").dependOn(&b.addRunArtifact(fixtures).step);
 
+    const fixture_tools = b.step("fixture-tools", "Install isolated native lifecycle fixture tools (no controller)");
+    inline for (.{
+        .{ "hyperv-direct-fixture-cli", "fixture_cli.zig" },
+        .{ "hyperv-direct-lifecycle-fixtures", "lifecycle_fixtures.zig" },
+    }) |item| {
+        const tool = b.addExecutable(.{
+            .name = item[0],
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(item[1]),
+                .target = target,
+                .optimize = optimize,
+                .imports = &imports,
+            }),
+        });
+        fixture_tools.dependOn(&b.addInstallArtifact(tool, .{}).step);
+    }
+
     const test_options = b.addOptions();
     test_options.addOption(?[]const u8, "test_root", b.option([]const u8, "test-root", "Existing private absolute native fixture directory"));
     const foundation = b.step("test-foundation", "Run native direct observation, custody and runtime fixtures");

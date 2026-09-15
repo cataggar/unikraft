@@ -331,18 +331,46 @@ mkdir -p .d/direct-runtime .d/direct-foundation-fixtures
 TMPDIR="$PWD/.d/direct-runtime" zig build \
   --build-file support/tools/hyperv/direct/build.zig \
   --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
+  --prefix "$PWD/.d/direct-tools" \
   -Dtest-root="$PWD/.d/direct-foundation-fixtures" \
-  -Doptimize=ReleaseSafe test test-foundation
-support/scripts/tests/test_hyperv_direct_two_boot.sh \
-  "$PWD/.d/NEW-direct-fixtures" \
-  "$PWD/.d/direct-tools/bin/uk-hyperv-direct-validate"
+  -Doptimize=ReleaseSafe test test-foundation install fixture-tools
+"$PWD/.d/direct-tools/bin/hyperv-direct-lifecycle-fixtures" \
+  --backend reference \
+  --controller "$PWD/support/scripts/hyperv-direct-two-boot.sh" \
+  --root "$PWD/.d/NEW-direct-fixtures" \
+  --fake "$PWD/.d/direct-tools/bin/hyperv-direct-fixture-cli" \
+  --validator "$PWD/.d/direct-tools/bin/uk-hyperv-direct-validate"
+
+# A separate fresh run exercises the development-only comparison path.
+"$PWD/.d/direct-tools/bin/hyperv-direct-lifecycle-fixtures" \
+  --backend reference \
+  --controller "$PWD/support/scripts/hyperv-direct-two-boot.sh" \
+  --root "$PWD/.d/NEW-direct-comparison" \
+  --fake "$PWD/.d/direct-tools/bin/hyperv-direct-fixture-cli" \
+  --validator "$PWD/.d/direct-tools/bin/uk-hyperv-direct-validate" \
+  --compare "$PWD/.d/NEW-direct-fixtures"
 ```
 
-The shell suite explicitly substitutes a checked-in isolated fake CLI and
-transfer/input reader, whose source has no real-CLI/network/disk delegation.
-The native serial parser still processes fixture bytes. Native fixtures
-exercise seed/manifest/footer validation in memory, not on real disks, and
-call the same direct-helper framing functions used by the production CLI.
+`fixture-tools` is explicit and separate from the default installation.
+The native suite retains all 92 named legacy cases plus signal and overflow
+process cases. It supplies a checked-in native fake CLI and transfer/input
+reader with no real-CLI/network/disk delegation. The real native serial
+validator still processes fixture bytes. `--inventory` lists the coverage
+map; `--case name,name` selects a subset. Use absolute paths, preserve source
+executable modes, and do not precreate either suite root.
+
+Reference mode deliberately exercises the frozen shell controller during
+migration. It is not a fallback from a failed native run. Comparison uses
+distinct roots, recomputes each run's hashes, requires case-specific custody
+records on both sides, and preserves within-run exit bindings. The declared
+1/124 deadline race is normalized only for `stale-boot1-log` and
+`azure-padding-only`. Negative controls cover missing records, natural
+completion mistaken for overflow termination, and undeclared exit changes.
+CI runs all cases and a targeted comparison of those affected refusal/deadline
+paths; full comparison remains available for offline qualification.
+
+Read-only validator fixtures exercise seed/manifest/footer validation in
+memory, not on real disks, and call the same direct-helper framing functions.
 Framing cases cover overwritten/retained padding, no advancement, interior
 NUL/ANSI/whitespace custody, prefix drift/truncation, canonical refusals and
 unchanged legacy modes. Lifecycle cases also retain raw hashes/captures,
@@ -355,8 +383,9 @@ The observation, custody and private subprocess libraries are implemented
 under `support/tools/hyperv/direct/`. `test-foundation` exercises these
 libraries, including isolated process-poison cases, and compiles their
 production interfaces without running them. It does not install a cloud
-controller. The shell entry point and its 92-case lifecycle reference remain
-in place until the complete native controller and native parity suite land.
+controller. The native fixture runner currently exercises the shell entry
+point as its explicit migration reference. Complete native orchestration and
+removal of the obsolete selected shell/jq files remain subsequent stages.
 
 The migration retains the six explicit command inputs shown above. It does
 not add a broad `uk-hyperv` execution mode or enable the parked production
