@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
-//! Native offline lifecycle runner. `reference` is a frozen development-only
-//! Bash comparison scaffold, not a native controller fallback or CI closure.
+//! Native-only offline lifecycle runner.
 //!
-//! CLI: --backend reference|native --controller ABSOLUTE --root FRESH_PRIVATE
-//!      --fake ABSOLUTE --validator ABSOLUTE [--case NAME,NAME] [--compare ROOT]
-//! `--inventory` emits each frozen case's actual assertion functions.
+//! CLI: --controller ABSOLUTE --root FRESH_PRIVATE
+//!      --fake ABSOLUTE --validator ABSOLUTE [--case NAME,NAME]
+//! `--inventory` emits each named case's actual assertion functions.
 //! Both executables use the direct build's existing hyperv_core/preparation/
 //! evidence imports. The native controller retains its ordinary six arguments.
 //! Its test-only hash adapter can import lifecycle_fixture_seams.zig; the three
@@ -20,15 +19,12 @@ const one = f.oneOf;
 const starts = f.starts;
 const expect = f.expect;
 const Case = inventory.Case;
-const Backend = f.Backend;
 const Config = struct {
-    backend: Backend,
     controller: []const u8,
     root: []const u8,
     fake: []const u8,
     validator: []const u8,
     selected: ?[]const u8 = null,
-    compare: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) void {
@@ -48,60 +44,21 @@ fn run(init: std.process.Init) !void {
         return;
     }
     try seams.selfCheck();
-    var options: std.StringHashMap([]const u8) = .init(a);
-    var i: usize = 0;
-    while (i < args.len) : (i += 2) {
-        try expect(i + 1 < args.len and one(args[i], &.{ "--backend", "--controller", "--root", "--fake", "--validator", "--case", "--compare" }) and !options.contains(args[i]));
-        try options.put(args[i], args[i + 1]);
-    }
-    const cfg: Config = .{
-        .backend = std.meta.stringToEnum(Backend, options.get("--backend") orelse return error.BackendRequired) orelse return error.InvalidBackend,
-        .controller = options.get("--controller") orelse return error.ControllerRequired,
-        .root = options.get("--root") orelse return error.FreshRootRequired,
-        .fake = options.get("--fake") orelse return error.FakeRequired,
-        .validator = options.get("--validator") orelse return error.ValidatorRequired,
-        .selected = options.get("--case"),
-        .compare = options.get("--compare"),
-    };
-    if (cfg.selected) |selected| {
-        var selected_names = std.mem.splitScalar(u8, selected, ',');
-        var seen: std.StringHashMap(void) = .init(a);
-        while (selected_names.next()) |name| {
-            try expect(!seen.contains(name));
-            var known = false;
-            for (inventory.all_cases) |case| if (eq(case.name, name)) {
-                known = true;
-            };
-            try expect(known);
-            try seen.put(name, {});
-        }
-    }
-    inline for (.{ cfg.controller, cfg.root, cfg.fake, cfg.validator }) |path| try f.files.absoluteFilePath(path);
-    try expect(std.mem.indexOf(u8, cfg.root, "/.d/") != null);
-    try checkExecutable(init.io, cfg.fake, true);
-    try checkExecutable(init.io, cfg.validator, true);
+    const cfg = try parseConfig(a, args);
+    try checkExecutable(init.io, cfg.fake);
+    try checkExecutable(init.io, cfg.validator);
     try expect(eq(std.fs.path.basename(cfg.validator), "uk-hyperv-direct-validate"));
-    try checkExecutable(init.io, cfg.controller, cfg.backend == .native);
-    if (cfg.backend == .reference) {
-        const file = try f.files.openAbsolute(init.io, cfg.controller, .artifact);
-        defer file.close(init.io);
-        const size = (try file.stat(init.io)).size;
-        try expect(size < 65536);
-        const bytes = try a.alloc(u8, @intCast(size));
-        try expect(try file.readPositionalAll(init.io, bytes, 0) == bytes.len);
-        try expect(eq(&f.hash(bytes), "ef2d06e605a2463fcbec3642792b52a247a133c263e93a2ca1247a09aad2d350"));
-        try out.interface.writeAll("REFERENCE ONLY: native fixtures, frozen Bash controller; no native-production closure claim.\n");
-    }
+    try checkExecutable(init.io, cfg.controller);
     const parent = try f.files.Directory.open(init.io, std.fs.path.dirname(cfg.root).?);
     defer parent.close(init.io);
     try parent.dir.createDir(init.io, std.fs.path.basename(cfg.root), .fromMode(0o700));
     const base: f.Context = .{ .a = a, .io = init.io, .root = cfg.root };
     try base.write("ISOLATED_OFFLINE_FIXTURE", f.marker);
     try template(base);
-    var regression_count = try comparisonRegressions(base);
-    try base.writeJson("comparison-regressions.json", .{ .assertions = regression_count });
-    regression_count += try @import("lifecycle_fixture_compat.zig").run(base, cfg.fake);
-    try base.writeJson("runner.json", .{ .backend = cfg.backend, .controller = cfg.controller, .legacy_case_count = inventory.cases.len, .process_case_count = inventory.process_cases.len });
+    var regression_count = try cliRegressions(a);
+    try base.writeJson("cli-regressions.json", .{ .assertions = regression_count });
+    regression_count += try @import("lifecycle_fixture_controls.zig").run(base, cfg.fake);
+    try base.writeJson("runner.json", .{ .backend = "native", .controller = cfg.controller, .legacy_case_count = inventory.cases.len, .process_case_count = inventory.process_cases.len });
     var count: usize = 0;
     var failed: usize = 0;
     for (inventory.all_cases) |case| {
@@ -120,21 +77,92 @@ fn run(init: std.process.Init) !void {
         if (try c.exists("assertion-regressions.json")) regression_count += @intCast(try f.num(try c.document("assertion-regressions.json"), "assertions"));
     }
     try expect(count > 0);
-    try base.writeJson("fixture-summary.json", .{ .backend = cfg.backend, .cases = count, .failed = failed, .assertion_regressions = regression_count });
-    try out.interface.print("{d}/{d} native fixture cases passed ({s}; no cloud/network/disks).\n", .{ count - failed, count, @tagName(cfg.backend) });
+    try base.writeJson("fixture-summary.json", .{ .backend = "native", .cases = count, .failed = failed, .assertion_regressions = regression_count });
+    try out.interface.print("{d}/{d} native fixture cases passed (no cloud/network/disks).\n", .{ count - failed, count });
     try out.interface.print("{d} native assertion-regression checks passed.\n", .{regression_count});
-    if (failed != 0) return error.LifecycleParityFailed;
+    if (failed != 0) return error.LifecycleCasesFailed;
 }
 
-fn checkExecutable(io: std.Io, path: []const u8, elf: bool) !void {
+fn parseConfig(a: std.mem.Allocator, args: []const []const u8) !Config {
+    var options: std.StringHashMap([]const u8) = .init(a);
+    defer options.deinit();
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        if (!one(args[i], &.{ "--controller", "--root", "--fake", "--validator", "--case" })) return error.UnknownOption;
+        if (i + 1 == args.len) return error.MissingOptionValue;
+        if (options.contains(args[i])) return error.DuplicateOption;
+        try options.put(args[i], args[i + 1]);
+    }
+    const cfg: Config = .{
+        .controller = options.get("--controller") orelse return error.ControllerRequired,
+        .root = options.get("--root") orelse return error.FreshRootRequired,
+        .fake = options.get("--fake") orelse return error.FakeRequired,
+        .validator = options.get("--validator") orelse return error.ValidatorRequired,
+        .selected = options.get("--case"),
+    };
+    if (cfg.selected) |selected| {
+        var selected_names = std.mem.splitScalar(u8, selected, ',');
+        var seen: std.StringHashMap(void) = .init(a);
+        defer seen.deinit();
+        while (selected_names.next()) |name| {
+            if (seen.contains(name)) return error.DuplicateCase;
+            var known = false;
+            for (inventory.all_cases) |case| if (eq(case.name, name)) {
+                known = true;
+            };
+            if (!known) return error.UnknownCase;
+            try seen.put(name, {});
+        }
+    }
+    inline for (.{ cfg.controller, cfg.root, cfg.fake, cfg.validator }) |path| try f.files.absoluteFilePath(path);
+    if (std.mem.indexOf(u8, cfg.root, "/.d/") == null) return error.UnsafeFixtureRoot;
+    return cfg;
+}
+
+fn checkConfig(a: std.mem.Allocator, args: []const []const u8) !void {
+    _ = try parseConfig(a, args);
+}
+
+fn cliRegressions(a: std.mem.Allocator) !usize {
+    const valid = [_][]const u8{ "--controller", "/native/controller", "--root", "/checkout/.d/fresh/native", "--fake", "/native/fake", "--validator", "/native/validator" };
+    try checkConfig(a, &valid);
+    var count: usize = 1;
+    inline for (.{
+        .{ "--backend", "reference" },
+        .{ "--backend", "native" },
+        .{ "--compare", "/checkout/.d/retired" },
+    }) |retired| {
+        try expectError(error.UnknownOption, checkConfig(a, &(retired ++ valid)));
+        try expectError(error.UnknownOption, checkConfig(a, &(valid ++ retired)));
+        count += 2;
+    }
+    try expectError(error.MissingOptionValue, checkConfig(a, &(valid ++ .{"--case"})));
+    try expectError(error.DuplicateOption, checkConfig(a, &(valid ++ .{ "--root", "/checkout/.d/other" })));
+    try expectError(error.DuplicateCase, checkConfig(a, &(valid ++ .{ "--case", "success,success" })));
+    inline for (.{ "", "unknown", "success," }) |selected|
+        try expectError(error.UnknownCase, checkConfig(a, &(valid ++ .{ "--case", selected })));
+    count += 6;
+    inline for (.{ error.ControllerRequired, error.FreshRootRequired, error.FakeRequired, error.ValidatorRequired }, 0..) |expected, pair| {
+        try expectError(expected, checkConfig(a, &(valid[0 .. pair * 2].* ++ valid[pair * 2 + 2 ..].*)));
+        var relative = valid;
+        relative[pair * 2 + 1] = "relative";
+        try expectError(error.UnsafePath, checkConfig(a, &relative));
+        count += 2;
+    }
+    var outside = valid;
+    outside[3] = "/outside/native";
+    try expectError(error.UnsafeFixtureRoot, checkConfig(a, &outside));
+    try checkConfig(a, &(valid ++ .{ "--case", "success,process-signal-term,process-output-overflow" }));
+    return count + 2;
+}
+
+fn checkExecutable(io: std.Io, path: []const u8) !void {
     const file = try f.files.openAbsolute(io, path, .artifact);
     defer file.close(io);
     const stat = try f.files.snapshot(file);
     try expect(stat.mode & 0o111 != 0);
-    if (elf) {
-        var magic: [4]u8 = undefined;
-        try expect(try file.readPositionalAll(io, &magic, 0) == 4 and eq(&magic, "\x7fELF"));
-    }
+    var magic: [4]u8 = undefined;
+    try expect(try file.readPositionalAll(io, &magic, 0) == 4 and eq(&magic, "\x7fELF"));
 }
 fn selectedCase(selected: []const u8, name: []const u8) bool {
     var names = std.mem.splitScalar(u8, selected, ',');
@@ -144,10 +172,10 @@ fn selectedCase(selected: []const u8, name: []const u8) bool {
 fn artifact(c: f.Context, name: []const u8, size: u64) !validation.Artifact {
     return .{ .path = try c.path(name), .size = size, .sha256 = f.image_sha };
 }
-fn setup(c: f.Context, cfg: Config, name: []const u8) !void {
+fn setup(c: f.Context, name: []const u8) !void {
     try c.mkdir("ledger");
     try c.write("ISOLATED_OFFLINE_FIXTURE", f.marker);
-    try c.writeJson("fixture-backend.json", .{ .backend = cfg.backend });
+    try c.writeJson("fixture-backend.json", .{ .backend = "native" });
     try c.write("scenario", try std.mem.concat(c.a, u8, &.{ name, "\n" }));
     try c.write("fake-cloud.json", "{\"exists\":false,\"boots\":0,\"power\":\"deallocated\"}\n");
     try c.write("calls", "");
@@ -215,32 +243,13 @@ fn setup(c: f.Context, cfg: Config, name: []const u8) !void {
     try c.write("boot1.log", first);
     try c.write("boot2.log", second);
     try c.writeJson("scope.json", scope);
-    if (one(name, &.{ "cache-hash-error", "cache-binding-hash-error", "cache-admission-hash-error" }) and cfg.backend == .reference) {
-        try c.mkdir("hash-tools");
-        const source = try f.files.openAbsolute(c.io, cfg.fake, .artifact);
-        defer source.close(c.io);
-        const size = (try source.stat(c.io)).size;
-        try expect(size <= 64 * 1024 * 1024);
-        const bytes = try c.a.alloc(u8, @intCast(size));
-        try expect(try source.readPositionalAll(c.io, bytes, 0) == size);
-        const target = try c.create("hash-tools/sha256sum");
-        defer target.close(c.io);
-        try target.writeStreamingAll(c.io, bytes);
-        try target.setPermissions(c.io, .fromMode(0o700));
-        try target.sync(c.io);
-    }
 }
 fn execute(c: f.Context, cfg: Config, attempt: []const u8, label: []const u8) !u8 {
     var environment = std.process.Environ.Map.init(c.a);
     try environment.put("UK_DIRECT_FIXTURE_ROOT", c.root);
     try environment.put("UK_DIRECT_FIXTURE_VALIDATOR", cfg.validator);
     try environment.put("LC_ALL", "C");
-    // Only the explicitly selected frozen reference has shell/coreutils on PATH.
-    // Native controller test executables must use explicit executable paths.
-    try environment.put("PATH", if (cfg.backend == .reference)
-        (if (try c.exists("hash-tools")) try std.mem.concat(c.a, u8, &.{ try c.path("hash-tools"), ":/usr/bin:/bin" }) else "/usr/bin:/bin")
-    else
-        "");
+    try environment.put("PATH", "");
     const stdout = try c.create(try std.mem.concat(c.a, u8, &.{ label, ".stdout" }));
     defer stdout.close(c.io);
     const stderr = try c.create(try std.mem.concat(c.a, u8, &.{ label, ".stderr" }));
@@ -283,7 +292,7 @@ fn execute(c: f.Context, cfg: Config, attempt: []const u8, label: []const u8) !u
     return status;
 }
 fn runCase(c: f.Context, cfg: Config, case: Case) !void {
-    try setup(c, cfg, case.name);
+    try setup(c, case.name);
     const result = try execute(c, cfg, "attempt", "public");
     if (case.assertions == .inadmissible_no_claim) {
         try expect(result != 0 and (try c.read("calls")).len == 0);
@@ -291,14 +300,6 @@ fn runCase(c: f.Context, cfg: Config, case: Case) !void {
         try expect(!try c.exists("ledger/attempt-" ++ f.owner));
         try privacy(c, "attempt");
         inline for (.{ "public.stdout", "public.stderr" }) |path| try expect(std.mem.indexOf(u8, try c.read(path), f.sentinel) == null);
-        if (cfg.compare) |other| {
-            const reference: f.Context = .{ .a = c.a, .io = c.io, .root = try std.fs.path.join(c.a, &.{ other, case.name }) };
-            try reference.validate();
-            _ = try evidencePresence(reference, case.name);
-            try expect(try f.num(try reference.document("public.exit.json"), "status") == result);
-            try expect((try reference.read("calls")).len == 0 and !try reference.exists("ledger/attempt-" ++ f.owner));
-            try compareScopes(c, reference);
-        }
         return;
     }
     const outcome = try c.document("attempt/outcome.json");
@@ -321,8 +322,9 @@ fn runCase(c: f.Context, cfg: Config, case: Case) !void {
         if (case.assertions == .refused_serial_custody) try serialRefusal(c, case.name, result, outcome);
         try refusedCustody(c, case.name);
     }
-    if (cfg.compare) |other| try compare(c, .{ .a = c.a, .io = c.io, .root = try std.fs.path.join(c.a, &.{ other, case.name }) }, case.name);
-    var regression_count = try recordRemovalRegressions(c, cfg, case);
+    var regression_count = try recordRemovalRegressions(c, case);
+    regression_count += try outcomeRegressions(c, case, result, outcome);
+    if (eq(case.name, "success")) regression_count += try malformedRecordRegressions(c);
     if (eq(case.name, "process-output-overflow")) regression_count += try overflowRegressions(c, cfg);
     try c.writeJson("assertion-regressions.json", .{ .assertions = regression_count });
 }
@@ -378,10 +380,6 @@ fn privacy(c: f.Context, relative: []const u8) anyerror!void {
 }
 fn common(c: f.Context, case: Case, result: u8, outcome: std.json.Value) !void {
     _ = try evidencePresence(c, case.name);
-    const success = case.assertions == .accepted_custody;
-    try expect((result == 0) == success and try f.yes(outcome, "accepted") == success);
-    const primary = try f.num(outcome, "primary_exit");
-    if (primary != 0) try expect(primary == result);
     try outcomeContract(case, result, outcome);
     try mutations(c, case);
     try privacy(c, "attempt");
@@ -398,6 +396,10 @@ fn common(c: f.Context, case: Case, result: u8, outcome: std.json.Value) !void {
 }
 
 fn outcomeContract(case: Case, result: u8, outcome: std.json.Value) !void {
+    const success = case.assertions == .accepted_custody;
+    try expect((result == 0) == success and try f.yes(outcome, "accepted") == success);
+    const primary = try f.num(outcome, "primary_exit");
+    if (primary != 0) try expect(primary == result);
     const name = case.name;
     const last = lastMutation(case);
     const boots: i64 = if (last < 10) 0 else if (last >= 12 or eq(name, "boot1-mutated-before-start")) 2 else 1;
@@ -407,7 +409,6 @@ fn outcomeContract(case: Case, result: u8, outcome: std.json.Value) !void {
     try expect(try f.num(outcome, "cleanup_exit") == @as(i64, if (cleanup_failed) 1 else 0));
     const complete = case.assertions == .accepted_custody or one(name, &.{ "cleanup-unowned", "foreign-resource", "delete-failure" });
     try expect(try f.yes(outcome, "persistence_evidence_complete") == complete);
-    const primary = try f.num(outcome, "primary_exit");
     if (complete) {
         try expect(primary == 0 and result == @as(u8, if (cleanup_failed) 1 else 0));
         return;
@@ -417,7 +418,7 @@ fn outcomeContract(case: Case, result: u8, outcome: std.json.Value) !void {
         return;
     }
     if (deadlineRace(name)) {
-        // Legacy bounded sleep can win the final deadline race (124), or the
+        // Bounded sleep can win the final deadline race (124), or the
         // serial loop can observe its exhausted deadline/poll count first (1).
         try expect(primary == 1 or primary == 124);
         return;
@@ -791,8 +792,7 @@ fn observeOverflow(c: f.Context) !void {
 }
 
 fn overflowStatus(primary: i64) !void {
-    if (primary == 0 or primary == 124 or primary == seams.Overflow.natural_exit)
-        return error.OverflowNotTerminated;
+    if (primary != 153) return error.OverflowNotTerminated;
 }
 
 fn overflowTermination(c: f.Context, primary: i64) !void {
@@ -806,107 +806,63 @@ fn overflowTermination(c: f.Context, primary: i64) !void {
         return error.OverflowTerminationDeadline;
     try expect(try f.num(try c.document("scope.json"), "operation_seconds") == 10);
     try expect((try c.read("attempt/deployment.json")).len == seams.Overflow.limit);
+    const record = try c.document("attempt/deployment.process.json");
+    try expect(try f.num(record, "exit") == 153 and eq(try f.str(record, "capture"), "overflow"));
+    try expect(try f.num(record, "stdout_bytes") == seams.Overflow.limit and try f.yes(record, "cleanup_complete"));
+    const termination = try f.field(record, "termination");
+    const signal = try f.num(termination, "signal");
+    try expect((signal == 15 or signal == 9) and try f.field(termination, "exit") == .null);
+    try expect(eq(try f.str(try f.field(try f.field(record, "failures"), "primary"), "category"), "output_limit"));
 }
 
 fn deadlineRace(name: []const u8) bool {
     return one(name, &.{ "stale-boot1-log", "azure-padding-only" });
 }
-fn comparisonStatus(name: []const u8, status: i64) i64 {
-    return if (deadlineRace(name) and status == 124) 1 else status;
-}
-fn compareOutcomes(name: []const u8, left: std.json.Value, left_status: i64, right: std.json.Value, right_status: i64) !void {
-    inline for (.{ "phase", "accepted", "cleanup_exit", "reserved_boots", "persistence_evidence_complete", "owned_group_absent", "group_creation_attempted", "failure_diagnostics" }) |key|
-        if (!jsonEqual(try f.field(left, key), try f.field(right, key))) return error.ComparisonMismatch;
-    const left_primary = try f.num(left, "primary_exit");
-    const right_primary = try f.num(right, "primary_exit");
-    if ((left_primary != 0 and left_primary != left_status) or (right_primary != 0 and right_primary != right_status))
-        return error.InconsistentProcessStatus;
-    // Normalize only the declared deadline race, never other exit codes,
-    // cleanup status, diagnostic status, or within-run outcome/exit bindings.
-    if (comparisonStatus(name, left_primary) != comparisonStatus(name, right_primary) or
-        comparisonStatus(name, left_status) != comparisonStatus(name, right_status)) return error.ComparisonMismatch;
-}
-
-fn compare(c: f.Context, other: f.Context, name: []const u8) !void {
-    try c.validate();
-    try other.validate();
-    try expect(eq(std.mem.trimEnd(u8, try c.read("scenario"), "\n"), name) and eq(std.mem.trimEnd(u8, try other.read("scenario"), "\n"), name));
-    try refusedCustody(c, name);
-    try refusedCustody(other, name);
-    const left = try c.document("attempt/outcome.json");
-    const right = try other.document("attempt/outcome.json");
-    // Do not compare JSON formatting or timestamps, and do not erase hashes or
-    // identities. Acceptance has already independently checked every hash edge.
-    const left_exit = try c.document("public.exit.json");
-    const right_exit = try other.document("public.exit.json");
-    try compareOutcomes(name, left, try f.num(left_exit, "status"), right, try f.num(right_exit, "status"));
-    try compareScopes(c, other);
-    var expected: std.ArrayList([]const u8) = .empty;
-    var reference_lines = std.mem.splitScalar(u8, try other.read("calls"), '\n');
-    while (reference_lines.next()) |line| if (mutation(line)) try expected.append(c.a, line);
-    var lines = std.mem.splitScalar(u8, try c.read("calls"), '\n');
-    var count: usize = 0;
-    while (lines.next()) |line| if (mutation(line)) {
-        try expect(count < expected.items.len and eq(line, expected.items[count]));
-        count += 1;
-    };
-    try expect(count == expected.items.len);
-    if (!eq(name, "stale-boot1-log")) {
-        try expect(jsonEqual(try f.field(left, "boot2_freshness"), try f.field(right, "boot2_freshness")));
-    }
-}
-
 fn expectError(expected: anyerror, result: anyerror!void) !void {
     if (result) |_| return error.AssertionRegressionAccepted else |err| {
         if (err != expected) return err;
     }
 }
 
-fn comparisonRegressions(c: f.Context) !usize {
-    const initial = .{
-        .phase = "boot2-start-intent",
-        .accepted = false,
-        .primary_exit = 1,
-        .cleanup_exit = 0,
-        .reserved_boots = 2,
-        .persistence_evidence_complete = false,
-        .owned_group_absent = true,
-        .group_creation_attempted = true,
-        .failure_diagnostics = .{ .attempted = true, .exit = 0, .decoded = true },
-    };
-    const left = try f.parse(c.a, try f.json(c.a, initial));
-    var right = try f.parse(c.a, try f.json(c.a, initial));
-    try right.object.put(c.a, "primary_exit", .{ .integer = 124 });
-    var count: usize = 0;
-    for (inventory.all_cases) |case| {
-        if (deadlineRace(case.name)) {
-            try compareOutcomes(case.name, left, 1, right, 124);
-            try compareOutcomes(case.name, right, 124, left, 1);
-        } else {
-            try expectError(error.ComparisonMismatch, compareOutcomes(case.name, left, 1, right, 124));
-            try expectError(error.ComparisonMismatch, compareOutcomes(case.name, right, 124, left, 1));
-        }
-        try compareOutcomes(case.name, right, 124, right, 124);
-        count += 3;
+fn outcomeRegressions(c: f.Context, case: Case, result: u8, outcome: std.json.Value) !usize {
+    inline for (.{ "primary_exit", "cleanup_exit", "reserved_boots" }) |key| {
+        var changed = try f.parse(c.a, try f.json(c.a, outcome));
+        try changed.object.put(c.a, key, .{ .integer = -1 });
+        try expectError(error.FixtureAssertionFailed, outcomeContract(case, result, changed));
     }
-    inline for (.{ "stale-boot1-log", "azure-padding-only" }) |name| {
-        try expectError(error.InconsistentProcessStatus, compareOutcomes(name, left, 124, right, 124));
-        try expectError(error.InconsistentProcessStatus, compareOutcomes(name, left, 1, right, 1));
-        var changed = try f.parse(c.a, try f.json(c.a, initial));
-        try changed.object.put(c.a, "primary_exit", .{ .integer = 17 });
-        try expectError(error.ComparisonMismatch, compareOutcomes(name, left, 1, changed, 17));
-        try changed.object.put(c.a, "primary_exit", .{ .integer = 124 });
-        try changed.object.put(c.a, "cleanup_exit", .{ .integer = 1 });
-        try expectError(error.ComparisonMismatch, compareOutcomes(name, left, 1, changed, 124));
-        try changed.object.put(c.a, "cleanup_exit", .{ .integer = 0 });
-        try changed.object.put(c.a, "failure_diagnostics", try f.parse(c.a, "{\"attempted\":true,\"exit\":124,\"decoded\":false}"));
-        try expectError(error.ComparisonMismatch, compareOutcomes(name, left, 1, changed, 124));
-        count += 5;
-    }
-    return count;
+    var changed = try f.parse(c.a, try f.json(c.a, outcome));
+    try changed.object.put(c.a, "primary_exit", .{ .string = "0" });
+    try expectError(error.ExpectedInteger, outcomeContract(case, result, changed));
+    try expect(changed.object.swapRemove("primary_exit"));
+    try expectError(error.MissingField, outcomeContract(case, result, changed));
+    return 5;
 }
 
-fn hideAndCheck(c: f.Context, other: ?f.Context, name: []const u8, mask: u5, hidden: *u5) !void {
+fn malformedRecordRegressions(c: f.Context) !usize {
+    inline for (.{ "attempt/boot1-capture.json", "attempt/boot2-capture.json", "attempt/boot2-admission.json" }) |path| {
+        const backup = try c.path("assertion-backups/" ++ comptime std.fs.path.basename(path));
+        const original = try c.read(path);
+        const drift = if (comptime eq(path, "attempt/boot2-capture.json")) blk: {
+            var changed = try f.parse(c.a, original);
+            try changed.object.put(c.a, "scope_sha256", .{ .string = "0" ** 64 });
+            break :blk try f.json(c.a, changed);
+        } else try std.mem.concat(c.a, u8, &.{ original, " \n" });
+        inline for (.{ false, true }) |malformed| {
+            try std.Io.Dir.renameAbsolute(try c.path(path), backup, c.io);
+            const checked = blk: {
+                c.write(path, if (malformed) "{" else drift) catch |err| break :blk err;
+                break :blk expectError(if (malformed) error.UnexpectedEndOfInput else error.FixtureAssertionFailed, refusedCustody(c, "success"));
+            };
+            if (try c.exists(path)) try std.Io.Dir.deleteFileAbsolute(c.io, try c.path(path));
+            try std.Io.Dir.renameAbsolute(backup, try c.path(path), c.io);
+            try checked;
+        }
+    }
+    try refusedCustody(c, "success");
+    return 7;
+}
+
+fn hideAndCheck(c: f.Context, name: []const u8, mask: u5, hidden: *u5) !void {
     for (evidence_files, 0..) |file, index| {
         const bit = @as(u5, 1) << @as(u3, @intCast(index));
         if (mask & bit == 0) continue;
@@ -915,18 +871,11 @@ fn hideAndCheck(c: f.Context, other: ?f.Context, name: []const u8, mask: u5, hid
         hidden.* |= bit;
     }
     try expectError(error.MissingEvidenceRecord, refusedCustody(c, name));
-    // Both sides can lose records together: equality of incomplete subjects
-    // must not substitute for each named case's independent presence contract.
-    try expectError(error.MissingEvidenceRecord, compare(c, c, name));
-    if (other) |reference| {
-        try expectError(error.MissingEvidenceRecord, compare(c, reference, name));
-        try expectError(error.MissingEvidenceRecord, compare(reference, c, name));
-    }
 }
 
-fn missingRecordsRegression(c: f.Context, other: ?f.Context, name: []const u8, mask: u5) !void {
+fn missingRecordsRegression(c: f.Context, name: []const u8, mask: u5) !void {
     var hidden: u5 = 0;
-    const result = hideAndCheck(c, other, name, mask, &hidden);
+    const result = hideAndCheck(c, name, mask, &hidden);
     for (evidence_files, 0..) |file, index| {
         if (hidden & (@as(u5, 1) << @as(u3, @intCast(index))) == 0) continue;
         const backup = try c.path(try std.mem.concat(c.a, u8, &.{ "assertion-backups/", std.fs.path.basename(file.path) }));
@@ -935,10 +884,8 @@ fn missingRecordsRegression(c: f.Context, other: ?f.Context, name: []const u8, m
     try result;
 }
 
-fn recordRemovalRegressions(c: f.Context, cfg: Config, case: Case) !usize {
+fn recordRemovalRegressions(c: f.Context, case: Case) !usize {
     if (case.evidence == .none) return 0;
-    const other: ?f.Context = if (cfg.compare) |root| .{ .a = c.a, .io = c.io, .root = try std.fs.path.join(c.a, &.{ root, case.name }) } else null;
-    const checks: usize = if (other != null) 4 else 2;
     try c.mkdir("assertion-backups");
     var all: u5 = 0;
     var count: usize = 0;
@@ -946,35 +893,36 @@ fn recordRemovalRegressions(c: f.Context, cfg: Config, case: Case) !usize {
         if (@intFromEnum(case.evidence) < @intFromEnum(file.first_required)) continue;
         const bit = @as(u5, 1) << @as(u3, @intCast(index));
         all |= bit;
-        try missingRecordsRegression(c, other, case.name, bit);
-        count += checks;
+        try missingRecordsRegression(c, case.name, bit);
+        count += 1;
     }
-    try missingRecordsRegression(c, other, case.name, all);
-    count += checks;
+    try missingRecordsRegression(c, case.name, all);
+    count += 1;
     if (case.evidence == .boot2) {
-        try missingRecordsRegression(c, other, case.name, 0b10010);
-        count += checks;
+        try missingRecordsRegression(c, case.name, 0b10010);
+        count += 1;
     }
     try refusedCustody(c, case.name);
-    try compare(c, c, case.name);
-    return count + 2;
+    return count + 1;
 }
 
 fn overflowRegressions(c: f.Context, cfg: Config) !usize {
     try expectError(error.OverflowNotTerminated, overflowStatus(124));
     try expectError(error.OverflowNotTerminated, overflowStatus(seams.Overflow.natural_exit));
     try expectError(error.OverflowNotTerminated, overflowStatus(0));
+    try expectError(error.OverflowNotTerminated, overflowStatus(1));
+    try expectError(error.OverflowNotTerminated, overflowStatus(143));
     const saved_observation = try c.document("overflow-observed.json");
     var late = try f.parse(c.a, try f.json(c.a, saved_observation));
     const start_ns = try f.num(try c.document("overflow-start.json"), "monotonic_ns");
     try late.object.put(c.a, "monotonic_ns", .{ .integer = start_ns + 10 * std.time.ns_per_s });
     try c.replaceJson("overflow-observed.json", late);
-    const late_result = expectError(error.OverflowTerminationDeadline, overflowTermination(c, 1));
+    const late_result = expectError(error.OverflowTerminationDeadline, overflowTermination(c, 153));
     try c.replaceJson("overflow-observed.json", saved_observation);
     try late_result;
     try c.mkdir("overflow-negative-control");
     const control: f.Context = .{ .a = c.a, .io = c.io, .root = try c.path("overflow-negative-control") };
-    try setup(control, cfg, "process-output-overflow");
+    try setup(control, "process-output-overflow");
     try control.mkdir("attempt");
     var environment = std.process.Environ.Map.init(c.a);
     try environment.put("UK_DIRECT_FIXTURE_ROOT", control.root);
@@ -1013,54 +961,12 @@ fn overflowRegressions(c: f.Context, cfg: Config) !usize {
     try expect((try control.read("attempt/deployment.json")).len == seams.Overflow.limit);
     try expectError(error.OverflowNaturalCompletion, overflowTermination(control, term.exited));
     // Even a forged nonzero primary cannot hide natural completion.
-    try expectError(error.OverflowNaturalCompletion, overflowTermination(control, 1));
-    return 6;
-}
-
-fn compareScopes(c: f.Context, other: f.Context) !void {
-    var left = (try validation.parse(validation.Scope, c.a, try c.read("scope.json"))).value;
-    var right = (try validation.parse(validation.Scope, c.a, try other.read("scope.json"))).value;
-    // Only the declared generated wall-clock expiry and isolated path roots
-    // differ. Artifact hashes, sizes, all identities and budgets remain exact.
-    left.approval.expires_unix = 0;
-    right.approval.expires_unix = 0;
-    inline for (.{ "os_vhd", "seed_raw", "seed_vhd", "manifest", "config" }) |name| {
-        try c.confined(@field(left, name).path);
-        try other.confined(@field(right, name).path);
-        @field(left, name).path = @field(left, name).path[c.root.len + 1 ..];
-        @field(right, name).path = @field(right, name).path[other.root.len + 1 ..];
-    }
-    try expect(eq(try f.json(c.a, left), try f.json(c.a, right)));
-}
-
-fn jsonEqual(left: std.json.Value, right: std.json.Value) bool {
-    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
-    return switch (left) {
-        .null => true,
-        .bool => |v| v == right.bool,
-        .integer => |v| v == right.integer,
-        .float => |v| v == right.float,
-        .number_string => |v| eq(v, right.number_string),
-        .string => |v| eq(v, right.string),
-        .array => |v| blk: {
-            if (v.items.len != right.array.items.len) break :blk false;
-            for (v.items, right.array.items) |a, b| if (!jsonEqual(a, b)) break :blk false;
-            break :blk true;
-        },
-        .object => |v| blk: {
-            if (v.count() != right.object.count()) break :blk false;
-            var iterator = v.iterator();
-            while (iterator.next()) |entry| {
-                const other = right.object.get(entry.key_ptr.*) orelse break :blk false;
-                if (!jsonEqual(entry.value_ptr.*, other)) break :blk false;
-            }
-            break :blk true;
-        },
-    };
+    try expectError(error.OverflowNaturalCompletion, overflowTermination(control, 153));
+    return 8;
 }
 
 fn template(c: f.Context) !void {
-    const bytes = try f.referenceTemplate(c);
+    const bytes = try f.repositoryTemplate(c);
     const resources = try f.field(try f.parse(c.a, bytes), "resources");
     try expect(resources == .array and resources.array.items.len == 4);
     var vm: ?std.json.Value = null;

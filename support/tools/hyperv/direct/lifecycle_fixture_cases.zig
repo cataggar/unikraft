@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-//! Named migration inventory: each legacy case selects real native assertions.
+//! Named lifecycle inventory: each legacy case selects real native assertions.
 //! Assertion names are emitted by the runner's --inventory command.
 pub const Assertions = enum {
     accepted_custody,
@@ -119,5 +119,6 @@ pub const process_cases = [_]Case{
 };
 pub const all_cases = cases ++ process_cases;
 comptime {
-    if (cases.len != 92) @compileError("The frozen reference has 92 lifecycle cases");
+    if (cases.len != 92) @compileError("All 92 named legacy lifecycle cases are required");
+    if (all_cases.len != 94) @compileError("Both real-process lifecycle cases are required");
 }

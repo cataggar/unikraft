@@ -446,22 +446,6 @@ fn run(init: std.process.Init) !void {
     var fake: Fake = .{ .c = c, .scenario = scenario, .state = (try std.json.parseFromSlice(State, a, try c.read("fake-cloud.json"), .{})).value };
     const args = argv[1..];
     for (argv) |arg| try f.expect(std.mem.indexOf(u8, arg, f.sentinel) == null);
-    if (eq(std.fs.path.basename(argv[0]), "sha256sum")) {
-        // Reference-only fault role: emit an independently computed plausible
-        // digest before returning 17, so a caller must honor pipeline failure.
-        try f.expect(args.len == 2 and eq(args[0], "--"));
-        try c.confined(args[1]);
-        const relative = args[1][c.root.len + 1 ..];
-        const role: seams.HashRole = if (eq(relative, "attempt/boot2-candidate.log")) .candidate else if (eq(relative, "attempt/boot1.log")) .boot1 else if (eq(relative, "attempt/boot2-admission.json")) .admission else .other;
-        const result = seams.hash(scenario, role, fake.state.boot2_reads, try c.read(relative));
-        try fake.output(try std.fmt.allocPrint(a, "{s}  {s}\n", .{ result.digest, args[1] }));
-        if (result.exit != 0) {
-            var err = std.Io.File.stderr().writerStreaming(init.io, &.{});
-            try err.interface.writeAll("fixture hash read failed\n");
-            std.process.exit(result.exit);
-        }
-        return;
-    }
     try f.expect(args.len > 0);
     if (eq(args[0], "__overflow-payload")) {
         try f.expect(args.len == 1 and fake.is("process-output-overflow"));

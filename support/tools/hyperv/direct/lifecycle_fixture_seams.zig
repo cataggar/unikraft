@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-//! Test-only seams for a future in-process controller fixture adapter. Neither
+//! Test-only seams for the noninstalled controller fixture adapter. Neither
 //! a production clock environment switch nor permission to bypass admission.
 const std = @import("std");
 const f = @import("lifecycle_fixture_support.zig");
