@@ -245,10 +245,7 @@ const Fake = struct {
                 if (self.is("process-signal-term")) {
                     try std.Io.sleep(self.c.io, .fromSeconds(35), .awake);
                 } else {
-                    // Bounded by the controller's 8-MiB capture limit, not by
-                    // an artificial fixture success response after truncation.
-                    const chunk = "x" ** 4096;
-                    for (0..4096) |_| try std.Io.File.stdout().writeStreamingAll(self.c.io, chunk);
+                    return seams.Overflow.emit(self.c);
                 }
                 return error.ProcessFaultDidNotTerminate;
             }
@@ -472,6 +469,10 @@ fn run(init: std.process.Init) !void {
         return;
     }
     try f.expect(args.len > 0);
+    if (eq(args[0], "__overflow-payload")) {
+        try f.expect(args.len == 1 and fake.is("process-output-overflow"));
+        return seams.Overflow.emit(c);
+    }
     if (one(args[0], &.{ "scope", "ledger", "json", "serial", "inputs" })) {
         try f.expect(args.len >= 2);
         for (args[1..]) |path| try c.confined(path);

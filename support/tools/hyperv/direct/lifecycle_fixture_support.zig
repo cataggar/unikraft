@@ -36,6 +36,7 @@ pub fn hash(bytes: []const u8) [64]u8 {
 pub fn now(io: std.Io) i64 {
     return std.Io.Clock.real.now(io).toSeconds();
 }
+pub const monotonicNanoseconds = @import("hyperv_core").process.monotonicNanoseconds;
 pub fn privateUmask() void {
     _ = std.os.linux.syscall1(.umask, 0o077);
 }

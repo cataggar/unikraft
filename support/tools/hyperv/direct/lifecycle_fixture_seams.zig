@@ -16,6 +16,26 @@ pub const Clock = struct {
 pub const HashRole = enum { candidate, boot1, capture, scope, admission, other };
 pub const HashResult = struct { digest: [64]u8, exit: u8 };
 
+pub const Overflow = struct {
+    pub const limit = 8 * 1024 * 1024;
+    pub const termination_ms = 6000;
+    pub const natural_hold_ms = 20000;
+    pub const natural_exit = 96;
+
+    pub fn emit(c: f.Context) !void {
+        try c.replaceJson("overflow-start.json", .{ .pid = std.os.linux.getpid(), .monotonic_ns = try f.monotonicNanoseconds() });
+        const chunk = "x" ** 4096;
+        for (0..2 * limit / chunk.len) |_| try std.Io.File.stdout().writeStreamingAll(c.io, chunk);
+        // Finishing the burst is not evidence of failed termination: a fast
+        // reader may drain it before the supervisor's signal arrives. Remain
+        // alive well beyond both the overflow bound and the 10-second operation
+        // deadline, making natural completion an unambiguous negative control.
+        try std.Io.sleep(c.io, .fromMilliseconds(natural_hold_ms), .awake);
+        try c.writeJson("overflow-natural-completion.json", .{ .exit = natural_exit });
+        std.process.exit(natural_exit);
+    }
+};
+
 /// The digest remains plausible even on failure. A native test adapter must
 /// propagate `exit` instead of treating the digest as fresh/cached authority.
 pub fn hash(scenario: []const u8, role: HashRole, boot2_reads: u8, bytes: []const u8) HashResult {
