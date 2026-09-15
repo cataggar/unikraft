@@ -88,7 +88,9 @@ complete local bytes; that digest still does not authenticate the producer.
 
 Stdout explicitly reports `scope=local_original_seed_production_only`,
 `authority=not_admitted`, `state=validated_local_files` and the local record
-digest. This means **no build, local boot, device I/O or cloud acceptance**.
+digest. Both stdout and the production record explicitly include
+`not_evidence_of=build_local_boot_device_or_cloud_acceptance`.
+This means **no build, local boot, device I/O or cloud acceptance**.
 Neither the record nor fresh randomness is a consumption ledger or independent
 approval. The formatter cannot guarantee global nonreuse: later trusted
 admission must check the authoritative ledger and separately selected source,

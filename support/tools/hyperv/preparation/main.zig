@@ -37,7 +37,7 @@ fn execute(init: std.process.Init, failures: *core.diagnostics.Failures) !void {
         const sha = try preparation.original_seed.create(allocator, init.io, args[2], args[3], failures);
         var output = std.Io.File.stdout().writer(init.io, &.{});
         try output.interface.print(
-            "{{\"scope\":\"local_original_seed_production_only\",\"authority\":\"not_admitted\",\"state\":\"validated_local_files\",\"production_record_sha256\":\"{s}\"}}\n",
+            "{{\"scope\":\"local_original_seed_production_only\",\"authority\":\"not_admitted\",\"not_evidence_of\":\"build_local_boot_device_or_cloud_acceptance\",\"state\":\"validated_local_files\",\"production_record_sha256\":\"{s}\"}}\n",
             .{sha},
         );
         return;

@@ -41,6 +41,7 @@ pub const Record = struct {
     schema_version: u8 = 1,
     scope: enum { local_original_seed_production_only } = .local_original_seed_production_only,
     authority: enum { not_admitted } = .not_admitted,
+    not_evidence_of: enum { build_local_boot_device_or_cloud_acceptance } = .build_local_boot_device_or_cloud_acceptance,
     provenance: enum { producer_self_report_not_authenticated } = .producer_self_report_not_authenticated,
     identity_generation: enum { os_csprng_fresh } = .os_csprng_fresh,
     configuration: enum { original_seed_fragment_unsolved } = .original_seed_fragment_unsolved,

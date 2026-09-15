@@ -10,6 +10,7 @@ const process = c.core.process;
 const Output = struct {
     scope: enum { local_original_seed_production_only },
     authority: enum { not_admitted },
+    not_evidence_of: enum { build_local_boot_device_or_cloud_acceptance },
     state: enum { validated_local_files },
     production_record_sha256: []const u8,
 };
