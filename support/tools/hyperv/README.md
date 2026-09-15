@@ -99,15 +99,66 @@ unwrapped or formatted.
 `test-core`, `test-transfer` and `test-worker` are focused selectors; `test`
 depends on all three. Dependencies, including versions and package hashes, are
 pinned in both manifests; the SDK commits are documented in the transfer README.
-The required Hyper-V integration job restores dependencies in scratch and runs
+The Hyper-V runtime fixture lane restores dependencies in scratch and runs
 all three selectors in Debug and ReleaseSafe. It also exercises the standalone
 transfer build in ReleaseSafe, without implicit source-tree fetching.
 
-The `zig-hyperv` image producer also invokes
-`.github/scripts/hyperv-native-public-fixtures.sh` for the public-image Debug
-and ReleaseSafe packaging/export/import suites, and
-`.github/scripts/hyperv-native-proofs-ci.sh` for linked-image proofs, compiler
-probes and focused regressions in one build graph/cache namespace. Regression
+## Credential-free integration lanes
+
+Three explicit fixture jobs in `.github/workflows/integration.yaml` feed the
+unchanged required **real image producer**, whose job ID and display name remain
+`zig-hyperv`:
+
+| Job | Complete coverage |
+| --- | --- |
+| `zig-hyperv-public-debug` | Debug public-image packaging/export and import: 14 + 14 tests, including complete physical image bytes and unchanged real-clock bounds. |
+| `zig-hyperv-runtime` | Operator custody; core/transfer/worker in both modes; standalone ReleaseSafe transfer; persistence in both modes including `test-arm`, `test-strip-equivalence`, `test-strip-proof` and parked CLI refusal; direct `test test-foundation test-controller test-lifecycle-native install`, unfiltered (85 foundation + 18 controller tests, 94 lifecycle cases / 890 controls). |
+| `zig-hyperv-build-protocol` | Build tools; explicit private Make positive/refusal; object/ABI proofs with both outer Debug/ReleaseSafe passes; consolidated image/compiler/regression graph; host in both modes and synthetic-key cross-compile size bound; postprocess on both fixture arches; ARM/credential and preflight in both modes including parked CLI refusal. |
+| `zig-hyperv` | Local-boot fixtures in both modes; all 28 ReleaseSafe public-image tests/install; standalone pinned miz; fresh acceptance/SMP solve/build and proofs; separately pinned native QEMU acquisition; native and legacy exact-image four-boot APIC paths; two-CPU SMP boot; native export/import/reload and bounded evidence; unchanged opt-in legacy #87 prepared-image outputs. |
+
+```text
+zig-hyperv-public-debug ---+
+zig-hyperv-runtime --------+--> zig-hyperv: dependency guard -> real producer
+zig-hyperv-build-protocol -+                                -> cancellation guard
+
+zig-hyperv-preparation remains independently scheduled and required.
+All other required jobs and context names are unchanged.
+```
+
+The producer explicitly needs all three fixture jobs. Job-level `always()`
+schedules its first, checkout-free guard even when a child fails, is cancelled,
+times out (Actions reports failure), is missing, or unexpectedly skips. Every
+named result must equal `success`. All image/setup steps additionally require
+`success() && !cancelled()`. The final `cancelled()` step exits unsuccessfully,
+including cancellation after a successful initial guard; a successful evidence
+upload is never authority to qualify images or hide failure/cancellation.
+The existing Python unittest workflow tests execute the actual guard bodies
+over all 216 dependency combinations both with and without workflow cancellation,
+plus unset bindings. This is deterministic orchestration coverage, not a claim
+to emulate the Actions scheduler.
+
+Each fixture job has only `contents: read`, disables checkout credential
+persistence, and runs on its own ordinary-user Ubuntu runner. The shared local
+setup action independently restores pinned compiler/LLVM/shared-QEMU inputs and
+private cache directories; it is not a central prerequisite for other jobs.
+There are no cross-job tool/image artifacts or shared mutable caches, ledgers,
+fixture roots or suite directories. Runtime custody/persistence diagnostics move
+to `zig-hyperv-runtime-evidence`, retaining the existing bounded file inventory.
+Native direct uses a fresh private checkout-local `.d/` parent; the suite child
+must not already exist. Existing namespace/host-isolation fixtures retain their
+supported Actions context and must not be run by spoofing that context on a
+shared development host. No Azure credentials, OIDC grants, runner enrollment,
+seed production, resource creation, cloud admission or recovery are added.
+
+`.github/scripts/hyperv-native-public-fixtures.sh` accepts one optional mode,
+`Debug` or `ReleaseSafe`; no argument still runs both. Each invocation restores
+beside copied manifests outside the checkout and uses pinned `--system` inputs.
+The helper creates the global-cache `tmp` child before SQLite ZIP restoration,
+so the independent Debug lane does not rely on an earlier compiler build.
+Mode-specific cache, fixture, import-fixture and installation paths are unchanged.
+The build/protocol lane invokes `.github/scripts/hyperv-native-proofs-ci.sh` for
+linked-image proofs, compiler probes and focused regressions in one build
+graph/cache namespace. Regression
 already depends on the proof and compiler selectors; the combined invocation
 retains the full target union and proof-tool installation without running those
 dependencies twice. Proof unit coverage still selects both optimization modes
@@ -120,7 +171,17 @@ optimization modes retain separate caches, fixture roots and installed tools.
 The helpers print elapsed, user and system seconds alongside the existing Zig
 build summaries, including timings on failure. Public-image timings separate
 restore, each mode and the total; they are observations, not image admission or
-a claim of reduced critical-path latency.
+a claim of reduced critical-path latency. Per-phase timing remains in nested
+subshells so the aggregate reports `total` on success and failure.
+
+This partition has **no measured latency claim**. The model target is at most
+35 minutes median across at least five comparable cold all-required-context
+runs; retain the 60-minute required-context timeout. Future naturally occurring
+Actions runs must report queue delay separately, cold setup/restoration overhead,
+critical-path elapsed time and total runner-minutes, plus median and maximum.
+Do not dispatch a benchmark fleet implicitly. Native QEMU `v11.0.50-z.7` and
+shared/legacy QEMU `v11.0.91-z.15` remain distinct. Legacy regression and prepared
+image assertions still need Python; the whole workflow is not Python-free.
 
 ## Preflight engine integration
 

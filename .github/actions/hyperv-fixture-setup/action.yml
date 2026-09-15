@@ -1,0 +1,97 @@
+name: Hyper-V fixture tools
+description: Restore pinned inputs independently on each unprivileged fixture runner.
+
+runs:
+  using: composite
+  steps:
+  - name: Install checkout, build, and OVMF dependencies
+    shell: bash
+    run: |
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      # Fixture runners use only Ubuntu packages, not optional repositories.
+      test -s /etc/apt/sources.list.d/ubuntu.sources
+      ubuntu_apt=(
+        -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+        -o Dir::Etc::sourceparts=-
+      )
+      sudo apt-get "${ubuntu_apt[@]}" update
+      sudo apt-get "${ubuntu_apt[@]}" install -y --no-install-recommends \
+        bison \
+        ca-certificates \
+        curl \
+        file \
+        flex \
+        git \
+        libncurses-dev \
+        make \
+        ovmf \
+        patch \
+        python3 \
+        python3-venv \
+        tar \
+        unzip \
+        wget \
+        xz-utils
+      sudo rm -rf /var/lib/apt/lists/*
+
+  - name: Load configuration
+    uses: ./.github/actions/ci-versions
+
+  - name: Download LLVM and QEMU tools
+    uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
+    env:
+      GH_TOKEN: ${{ github.token }}
+    with:
+      ghr-version: v0.8.0
+      tools: |
+        cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+        cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+      dest: ${{ runner.temp }}/hyperv-tools
+      extract: 'true'
+      strip-components: '1'
+
+  - name: Add LLVM and QEMU tools to PATH
+    shell: bash
+    run: |
+      set -euo pipefail
+      tools="${RUNNER_TEMP}/hyperv-tools"
+      for command in \
+        "${tools}/bin/llvm-nm" \
+        "${tools}/bin/llvm-objcopy" \
+        "${tools}/bin/llvm-objdump" \
+        "${tools}/bin/llvm-readelf" \
+        "${tools}/bin/llvm-strip" \
+        "${tools}/qemu-system-x86_64"; do
+        test -x "${command}"
+      done
+      {
+        echo "${tools}/bin"
+        echo "${tools}"
+      } >> "${GITHUB_PATH}"
+
+  - name: Install Zig with ghr
+    uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+    env:
+      GH_TOKEN: ${{ github.token }}
+    with:
+      ghr-version: v0.8.0
+      tools: |
+        cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+  - name: Configure bounded local tool directories
+    shell: bash
+    run: |
+      set -euo pipefail
+      umask 077
+      root="${RUNNER_TEMP}/hyperv-ci"
+      mkdir -p \
+        "${root}/cache" \
+        "${root}/tmp" \
+        "${root}/zig-global-cache/tmp"
+      {
+        echo "TMPDIR=${root}/tmp"
+        echo "XDG_CACHE_HOME=${root}/cache"
+        echo "ZIG_GLOBAL_CACHE_DIR=${root}/zig-global-cache"
+        echo 'MAKEFLAGS=-j2'
+      } >> "${GITHUB_ENV}"

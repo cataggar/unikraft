@@ -7,6 +7,7 @@ import hashlib
 import importlib
 from importlib.metadata import PackageNotFoundError, version
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -2161,6 +2162,233 @@ class HypervAzureControllerTest(unittest.TestCase):
 
 
 class HypervWorkflowTest(unittest.TestCase):
+    def test_public_fixture_mode_api_and_failure_timing(self):
+        helper = SUPPORT.parent / ".github/scripts/hyperv-native-public-fixtures.sh"
+        harness = r"""
+        set -euo pipefail
+        zig() {
+          printf 'fixture-zig %s\n' "$*"
+          if [[ "${FAIL_PHASE:-}" == restore && "$*" == *--fetch=all* ]] ||
+             [[ -n "${FAIL_PHASE:-}" && "$*" == *"-Doptimize=${FAIL_PHASE}"* ]]; then
+            return 17
+          fi
+        }
+        export -f zig
+        exec bash "$@"
+        """
+        for args, expected_modes in (
+            ((), ("Debug", "ReleaseSafe")),
+            (("Debug",), ("Debug",)),
+            (("ReleaseSafe",), ("ReleaseSafe",)),
+        ):
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as root:
+                env = dict(os.environ, RUNNER_TEMP=root,
+                           ZIG_GLOBAL_CACHE_DIR=str(Path(root) / "global"),
+                           FAIL_PHASE="")
+                result = subprocess.run(
+                    ["bash", "-c", harness, "fixture-api", str(helper), *args],
+                    cwd=SUPPORT.parent, env=env, capture_output=True,
+                    text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((Path(root) / "global/tmp").is_dir())
+                calls = result.stdout.splitlines()
+                self.assertEqual(len(calls), len(expected_modes) + 1)
+                self.assertIn("--fetch=all -j2", calls[0])
+                for call, mode in zip(calls[1:], expected_modes):
+                    self.assertIn(f"-Doptimize={mode}", call)
+                    self.assertIn("test test-import install --summary all", call)
+                    self.assertIn(f"/{mode}/fixtures", call)
+                    self.assertIn(f"/{mode}/import-fixtures", call)
+                    self.assertIn("--system ", call)
+                    self.assertIn(f"public-image {mode}:", result.stderr)
+                self.assertIn("public-image restore:", result.stderr)
+                self.assertIn("public-image total:", result.stderr.splitlines()[-1])
+        for phase in ("restore", "Debug", "ReleaseSafe"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as root:
+                env = dict(os.environ, RUNNER_TEMP=root,
+                           ZIG_GLOBAL_CACHE_DIR=str(Path(root) / "global"),
+                           FAIL_PHASE=phase)
+                result = subprocess.run(
+                    ["bash", "-c", harness, "fixture-api", str(helper)],
+                    cwd=SUPPORT.parent, env=env, capture_output=True,
+                    text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 17)
+                self.assertIn(f"public-image {phase}:", result.stderr)
+                self.assertIn("public-image total:", result.stderr.splitlines()[-1])
+        for args in (("ReleaseFast",), ("",), ("Debug", "ReleaseSafe")):
+            result = subprocess.run(
+                ["bash", "-c", harness, "fixture-api", str(helper), *args],
+                cwd=SUPPORT.parent, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+
+    def test_explicit_fixture_lanes_retain_complete_target_inventory(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        inventory = (
+            ("public-debug", (
+                "hyperv-native-public-fixtures.sh Debug",
+            )),
+            ("runtime", (
+                "operator_guard/ci-fixtures.sh",
+                "test-core test-transfer test-worker install --summary all",
+                "support/tools/hyperv/transfer/build.zig",
+                "test test-arm test-strip-equivalence test-strip-proof install",
+                '"reason":"production_bindings_unavailable"',
+                "test test-foundation test-controller test-lifecycle-native install",
+                'parent="${GITHUB_WORKSPACE}/.d/direct-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',
+                '-Dlifecycle-root="${parent}/native"',
+                'mkdir -m 0700 "${parent}"',
+                "zig-hyperv-runtime-evidence",
+            )),
+            ("build-protocol", (
+                "test-build-tools",
+                "test-native-make-environment",
+                "unable to load explicit native Make environment: UnsafeFile",
+                "hyperv-object-proofs test-hyperv-object-proofs",
+                "hyperv-native-proofs-ci.sh",
+                "Synthetic-key host runner/unit bytes:",
+                'test "$((runner_bytes + unit_bytes))" -le 8388608',
+                "for arch in x86_64 arm64; do",
+                "integration install --summary all",
+                "support/tools/hyperv/azure/build.zig",
+                "support/tools/hyperv/preflight/build.zig",
+                "native-preparation-and-authority-binding-required",
+            )),
+        )
+        for lane, targets in inventory:
+            job = workflow.split(f"  zig-hyperv-{lane}:\n", 1)[1].split(
+                "\n  zig-hyperv", 1
+            )[0]
+            header = job.split("    steps:\n", 1)[0]
+            with self.subTest(lane=lane):
+                self.assertIn("    runs-on: ubuntu-24.04\n", header)
+                self.assertIn("    permissions:\n      contents: read\n", header)
+                self.assertIn("        persist-credentials: false\n", job)
+                self.assertIn("uses: ./.github/actions/hyperv-fixture-setup", job)
+                for forbidden in ("    if:", "    needs:", "    strategy:",
+                                  "id-token:", "environment:"):
+                    self.assertNotIn(forbidden, header)
+                for forbidden in ("continue-on-error:", "-Dlifecycle-cases=",
+                                  "actions/download-artifact", "actions/cache"):
+                    self.assertNotIn(forbidden, job)
+                for target in targets:
+                    self.assertIn(target, job)
+        producer = workflow.split("  zig-hyperv:\n", 1)[1].split(
+            "\n  zig-helloworld-arm64:", 1
+        )[0]
+        for target in (
+            "hyperv-native-public-fixtures.sh ReleaseSafe",
+            "support/tools/hyperv/local_boot/build.zig",
+            "for mode in Debug ReleaseSafe; do",
+            "for variant in acceptance smp; do",
+            "hyperv-native-qemu-acquire.sh",
+            "QUALIFICATION_SOURCE_JOB: zig-hyperv",
+            'native-qemu" integration',
+            "local_platform_boot_modes",
+            "--cpus 2 --timeout 60",
+            "--source-job zig-hyperv",
+            "prepared_image_manifest_sha256:",
+            "prepared_image_artifact:",
+        ):
+            self.assertIn(target, producer)
+
+    def test_fixture_fan_in_and_workflow_cancellation_fail_closed(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        job = workflow.split("  zig-hyperv:\n", 1)[1].split(
+            "\n  zig-helloworld-arm64:", 1
+        )[0]
+        header, steps = job.split("    steps:\n", 1)
+        self.assertIn("    if: ${{ always() }}\n", header)
+        self.assertIn(
+            "    needs:\n"
+            "    - zig-hyperv-public-debug\n"
+            "    - zig-hyperv-runtime\n"
+            "    - zig-hyperv-build-protocol\n",
+            header,
+        )
+        guard = steps.split("\n    - ", 1)[0]
+        self.assertTrue(guard.startswith(
+            "    - name: Require every Hyper-V fixture lane to succeed\n"
+        ))
+        self.assertIn("      if: ${{ always() }}\n", guard)
+        for binding in (
+            "PUBLIC_DEBUG_RESULT: ${{ needs.zig-hyperv-public-debug.result }}",
+            "RUNTIME_RESULT: ${{ needs.zig-hyperv-runtime.result }}",
+            "BUILD_PROTOCOL_RESULT: ${{ needs.zig-hyperv-build-protocol.result }}",
+        ):
+            self.assertIn(binding, guard)
+        lines = guard.split("      run: |\n", 1)[1].splitlines()
+        self.assertTrue(all(not line or line.startswith(" " * 8)
+                            for line in lines))
+        script = "\n".join(line[8:] for line in lines)
+        terminal = job.split(
+            "    - name: Preserve Hyper-V workflow cancellation\n", 1
+        )[1]
+        self.assertTrue(terminal.startswith(
+            "      if: ${{ cancelled() }}\n"
+        ))
+        lines = terminal.split("      run: |\n", 1)[1].splitlines()
+        self.assertTrue(all(not line or line.startswith(" " * 8)
+                            for line in lines))
+        cancellation_script = "\n".join(line[8:] for line in lines)
+        for step in steps.split("\n    - ")[1:-1]:
+            if step.startswith("name: Retain bounded local image evidence\n"):
+                self.assertIn(
+                    "      if: ${{ always() && "
+                    "steps.hyperv_dependencies.outcome == 'success' }}\n",
+                    step,
+                )
+            else:
+                self.assertIn("      if: ${{ success() && !cancelled()", step)
+        self.assertNotIn("continue-on-error:", job)
+        self.assertIn("    name: zig-hyperv\n", header)
+        self.assertIn("    timeout-minutes: 60\n", header)
+        names = ("PUBLIC_DEBUG_RESULT", "RUNTIME_RESULT",
+                 "BUILD_PROTOCOL_RESULT")
+        # Actions maps timeouts to failure; also refuse a literal timeout result.
+        results = ("success", "failure", "cancelled", "timed_out", "skipped", "")
+        for cancelled, *children in itertools.product(
+            ("false", "true"), results, results, results
+        ):
+            with self.subTest(cancelled=cancelled, children=children):
+                env = dict(os.environ)
+                env.update(zip(names, children))
+                result = subprocess.run(
+                    ["bash", "-c", script], env=env, capture_output=True,
+                    text=True, timeout=10,
+                )
+                passed = result.returncode == 0
+                # Execute the actual terminal refusal under its exact cancelled()
+                # condition, including cancellation after all children succeeded.
+                if cancelled == "true":
+                    terminal_result = subprocess.run(
+                        ["bash", "-c", cancellation_script],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertNotEqual(terminal_result.returncode, 0)
+                    passed = passed and terminal_result.returncode == 0
+                self.assertEqual(
+                    passed,
+                    cancelled == "false" and
+                    all(child == "success" for child in children),
+                )
+        for missing in names:
+            env = dict(os.environ)
+            env.update(dict.fromkeys(names, "success"))
+            env.pop(missing)
+            result = subprocess.run(
+                ["bash", "-c", script], env=env, capture_output=True,
+                text=True, timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0, missing)
+
     def test_bootstrap_uses_only_ubuntu_package_sources(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/integration.yaml"
@@ -2168,6 +2396,7 @@ class HypervWorkflowTest(unittest.TestCase):
         job = workflow.split("  zig-hyperv:\n", 1)[1]
         header, body = job.split(
             "    - name: Install checkout, build, and OVMF dependencies\n"
+            "      if: ${{ success() && !cancelled() }}\n"
             "      run: |\n",
             1,
         )
@@ -2177,41 +2406,59 @@ class HypervWorkflowTest(unittest.TestCase):
         self.assertTrue(all(not line or line.startswith(" " * 8)
                             for line in lines))
         script = "\n".join(line[8:] for line in lines)
-        self.assertIn(
-            "test -s /etc/apt/sources.list.d/ubuntu.sources", script
-        )
-        self.assertIn(
-            "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources",
-            script,
-        )
-        self.assertIn("-o Dir::Etc::sourceparts=-", script)
-        self.assertIn('sudo apt-get "${ubuntu_apt[@]}" update', script)
-        self.assertIn(
-            'sudo apt-get "${ubuntu_apt[@]}" install -y '
-            "--no-install-recommends", script,
-        )
-        for bypass in ("--allow-unauthenticated", "AllowInsecureRepositories",
-                       "Check-Valid-Until=false", "trusted=yes"):
-            self.assertNotIn(bypass, script)
-        subprocess.run(
-            ["bash", "-n"], input=script, text=True, check=True, timeout=10
-        )
+        setup = (
+            SUPPORT.parent / ".github/actions/hyperv-fixture-setup/action.yml"
+        ).read_text()
+        body = setup.split("    run: |\n", 1)[1].split("\n  - ", 1)[0]
+        lines = body.splitlines()
+        self.assertTrue(all(not line or line.startswith(" " * 6)
+                            for line in lines))
+        fixture_script = "\n".join(line[6:] for line in lines)
+        for script in (script, fixture_script):
+            self.assertIn(
+                "test -s /etc/apt/sources.list.d/ubuntu.sources", script
+            )
+            self.assertIn(
+                "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources",
+                script,
+            )
+            self.assertIn("-o Dir::Etc::sourceparts=-", script)
+            self.assertIn('sudo apt-get "${ubuntu_apt[@]}" update', script)
+            self.assertIn(
+                'sudo apt-get "${ubuntu_apt[@]}" install -y '
+                "--no-install-recommends", script,
+            )
+            for bypass in ("--allow-unauthenticated", "AllowInsecureRepositories",
+                           "Check-Valid-Until=false", "trusted=yes"):
+                self.assertNotIn(bypass, script)
+            subprocess.run(
+                ["bash", "-n"], input=script, text=True, check=True, timeout=10
+            )
 
     def test_hyperv_regressions_require_the_pinned_sdk(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/integration.yaml"
         ).read_text()
-        job = workflow.split("  zig-hyperv:\n", 1)[1]
+        job = workflow.split("  zig-hyperv-build-protocol:\n", 1)[1].split(
+            "\n  zig-hyperv:", 1
+        )[0]
+        setup = (
+            SUPPORT.parent / ".github/actions/hyperv-fixture-setup/action.yml"
+        ).read_text()
         step = "    - name: Install pinned Hyper-V controller dependencies\n"
         self.assertLess(
-            job.index("    - name: Configure bounded local tool directories\n"),
+            job.index("    - name: Restore independent fixture tools\n"),
             job.index(step),
+        )
+        self.assertIn("uses: ./.github/actions/hyperv-fixture-setup\n", job)
+        self.assertIn(
+            "  - name: Configure bounded local tool directories\n", setup
         )
         self.assertLess(
             job.index(step),
             job.index("    - name: Run focused Hyper-V regressions\n"),
         )
-        self.assertIn("          python3-venv \\\n", job)
+        self.assertIn("        python3-venv \\\n", setup)
         body = job.split(step + "      run: |\n", 1)[1]
         lines = body.split("\n    - ", 1)[0].splitlines()
         self.assertTrue(all(not line or line.startswith(" " * 8)
