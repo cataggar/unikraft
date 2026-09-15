@@ -85,16 +85,18 @@ test "scratch replacement never reuses immutable authoritative evidence names" {
     defer fixture.deinit();
     var writer = try fixture.directory.lock(io);
     defer writer.close(io);
-    try local.scratch(io, &writer, .@"boot2-candidate.log", "first");
+    var cleanup_failure: ?anyerror = null;
+    try local.scratch(io, &writer, .@"boot2-candidate.log", "first", &cleanup_failure);
     const pin = try local.pin(a, io, fixture.directory, "boot2-candidate.log", custody.cli_limit);
-    try local.scratch(io, &writer, .@"boot2-candidate.log", "different");
+    try local.scratch(io, &writer, .@"boot2-candidate.log", "different", &cleanup_failure);
     try t.expectError(error.FileChanged, local.verify(a, io, fixture.directory, "boot2-candidate.log", pin, custody.cli_limit));
-    try local.immutableRaw(io, &writer, "boot2.log", "authoritative");
-    try t.expectError(error.PathAlreadyExists, local.immutableRaw(io, &writer, "boot2.log", "replaced"));
+    try local.immutableRaw(io, &writer, "boot2.log", "authoritative", &cleanup_failure);
+    try t.expectError(error.PathAlreadyExists, local.immutableRaw(io, &writer, "boot2.log", "replaced", &cleanup_failure));
     var bytes = try fixture.read("boot2.log");
     defer bytes.deinit();
     try t.expectEqualStrings("authoritative", bytes.bytes());
     try local.verifyLock(io, &writer);
+    try t.expect(cleanup_failure == null);
 }
 
 test "large raw publication preserves eight-MiB boundary and byte-exact NULs" {
@@ -102,17 +104,19 @@ test "large raw publication preserves eight-MiB boundary and byte-exact NULs" {
     defer fixture.deinit();
     var writer = try fixture.directory.lock(io);
     defer writer.close(io);
+    var cleanup_failure: ?anyerror = null;
     const bytes = try a.alloc(u8, custody.cli_limit + 1);
     defer a.free(bytes);
     @memset(bytes, 0);
     bytes[0] = 'x';
     bytes[custody.cli_limit - 1] = 'z';
-    try local.scratch(io, &writer, .@"boot1-candidate.log", bytes[0..custody.cli_limit]);
-    try local.immutableRaw(io, &writer, "boot1.log", bytes[0..custody.cli_limit]);
-    try t.expectError(error.InvalidCapture, local.immutableRaw(io, &writer, "overflow.log", bytes));
+    try local.scratch(io, &writer, .@"boot1-candidate.log", bytes[0..custody.cli_limit], &cleanup_failure);
+    try local.immutableRaw(io, &writer, "boot1.log", bytes[0..custody.cli_limit], &cleanup_failure);
+    try t.expectError(error.InvalidCapture, local.immutableRaw(io, &writer, "overflow.log", bytes, &cleanup_failure));
     var actual = try fixture.read("boot1.log");
     defer actual.deinit();
     try t.expectEqualSlices(u8, bytes[0..custody.cli_limit], actual.bytes());
+    try t.expect(cleanup_failure == null);
 }
 
 test "unsafe scratch entries and replaced lock inode are refused" {
@@ -120,9 +124,10 @@ test "unsafe scratch entries and replaced lock inode are refused" {
     defer fixture.deinit();
     var writer = try fixture.directory.lock(io);
     defer writer.close(io);
-    try local.immutableRaw(io, &writer, "target", "untouched");
+    var cleanup_failure: ?anyerror = null;
+    try local.immutableRaw(io, &writer, "target", "untouched", &cleanup_failure);
     try fixture.directory.dir.symLink(io, "target", "boot1-candidate.log", .{});
-    if (local.scratch(io, &writer, .@"boot1-candidate.log", "unsafe")) |_| return error.ExpectedRefusal else |_| {}
+    if (local.scratch(io, &writer, .@"boot1-candidate.log", "unsafe", &cleanup_failure)) |_| return error.ExpectedRefusal else |_| {}
     var bytes = try fixture.read("target");
     defer bytes.deinit();
     try t.expectEqualStrings("untouched", bytes.bytes());
@@ -130,6 +135,7 @@ test "unsafe scratch entries and replaced lock inode are refused" {
     var replacement = try fixture.directory.lock(io);
     defer replacement.close(io);
     try t.expectError(error.LockChanged, local.verifyLock(io, &writer));
+    try t.expect(cleanup_failure == null);
 }
 
 test "directory path binding permits local writes but refuses replacement directories" {
@@ -142,12 +148,42 @@ test "directory path binding permits local writes but refuses replacement direct
     try local.verifyDirectory(io, original, path);
     var writer = try original.lock(io);
     defer writer.close(io);
-    try local.immutableRaw(io, &writer, "observation.json", "{}");
+    var cleanup_failure: ?anyerror = null;
+    try local.immutableRaw(io, &writer, "observation.json", "{}", &cleanup_failure);
     try local.verifyDirectory(io, original, path);
     try fixture.directory.dir.rename("attempt", fixture.directory.dir, "original-attempt", io);
     const replacement = try local.directory(io, fixture.directory, "attempt");
     defer replacement.close(io);
     try t.expectError(error.DirectoryChanged, local.verifyDirectory(io, original, path));
+    try t.expect(cleanup_failure == null);
+}
+
+test "named controller scratch cleanup is independent and never silently retried" {
+    for ([_]@FieldType(local.ScratchTest, "cleanup"){ .none, .unlink, .directory_sync }) |failure| {
+        var fixture = try support.Fixture.init();
+        defer fixture.deinit();
+        var writer = try fixture.directory.lock(io);
+        defer writer.close(io);
+        var cleanup_failure: ?anyerror = null;
+        var fault: local.ScratchTest = .{ .cleanup = failure };
+        try t.expectError(error.InjectedPublicationRefusal, local.scratchFault(io, &writer, .@"boot1-candidate.log", "private candidate", &cleanup_failure, &fault));
+        try t.expectEqual(@as(usize, 1), fault.unlink_attempts);
+        try t.expectEqual(@as(usize, if (failure == .unlink) 0 else 1), fault.sync_attempts);
+        const name = std.fmt.hex(fault.named_scratch orelse return error.NamedTemporaryRequired);
+        if (failure == .unlink) {
+            var retained = try fixture.read(&name);
+            defer retained.deinit();
+            try t.expectEqualStrings("private candidate", retained.bytes());
+            try t.expect(cleanup_failure.? == error.InjectedScratchUnlinkFailure);
+        } else {
+            try t.expectError(error.FileNotFound, fixture.directory.openFile(io, &name));
+            if (failure == .directory_sync) {
+                try t.expect(cleanup_failure.? == error.InjectedScratchSyncFailure);
+            } else try t.expect(cleanup_failure == null);
+        }
+        try t.expectError(error.FileNotFound, fixture.directory.openFile(io, "boot1-candidate.log"));
+        try local.verifyLock(io, &writer);
+    }
 }
 
 test "uploader lock handoff retains the original inode without holding the worker lock" {

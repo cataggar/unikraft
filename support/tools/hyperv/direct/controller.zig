@@ -667,7 +667,7 @@ fn Controller(comptime Hooks: type) type {
                     defer bytes.deinit();
                     const decoded = observations.Diagnostics.decode(self.temporary, .{ .complete = bytes.bytes() }, .primary) catch |err| return self.refused(label, err);
                     defer decoded.deinit();
-                    try local.scratch(self.io, &self.store.writer, candidate, try decoded.evidenceBytes());
+                    try local.scratch(self.io, &self.store.writer, candidate, try decoded.evidenceBytes(), &self.store.cleanup_failure);
                     try self.store.verifyFile(wrapper_name, wrapper_pin, custody.cli_limit);
                     try self.store.verifyFile(vm_name, self.boot_vm[boot - 1].?, custody.cli_limit);
                     const sources = try self.store.captureSources(boot, @intCast(count));
@@ -690,7 +690,7 @@ fn Controller(comptime Hooks: type) type {
                             const suffix = if (alias == .@"serial-check.stdout") "stdout" else "stderr";
                             var output = try self.store.directory.readSensitive(self.io, self.temporary, try self.fmt("{s}.{s}", .{ serial_label, suffix }), custody.cli_limit, null);
                             defer output.deinit();
-                            try local.scratch(self.io, &self.store.writer, alias, output.bytes());
+                            try local.scratch(self.io, &self.store.writer, alias, output.bytes(), &self.store.cleanup_failure);
                         }
                     }
                     if (result == 0) {
@@ -857,7 +857,7 @@ fn Controller(comptime Hooks: type) type {
             const decoded = try observations.Diagnostics.decode(self.temporary, .{ .complete = bytes.bytes() }, .failure_only);
             defer decoded.deinit();
             if (try deadline.expired()) return error.BudgetExhausted;
-            try local.immutableRaw(self.io, &self.store.writer, "failure-boot-diagnostics.log", decoded.privateBytes());
+            try local.immutableRaw(self.io, &self.store.writer, "failure-boot-diagnostics.log", decoded.privateBytes(), &self.store.cleanup_failure);
             if (try deadline.expired()) return error.BudgetExhausted;
             try custody.requireDurable(try self.store.writer.createImmutable(self.io, "failure-boot-diagnostics-decode.stderr", ""));
         }
