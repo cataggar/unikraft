@@ -210,8 +210,8 @@ The default build installs only the production controller and read-only
 validator. The controller embeds the unchanged ARM template and publishes
 its exact bytes privately as `ATTEMPT/deployment-template.json`; it never
 searches the checkout for a deployment template at runtime. The seven ARM
-parameters are unchanged. The old shell entry is temporarily retained only
-as an explicit offline migration reference, not a production fallback.
+parameters are unchanged. The selected runtime and offline lifecycle are
+native-only; there is no shell entry or reference-controller fallback.
 
 ## Lifecycle and failure semantics
 
@@ -360,27 +360,16 @@ checkout's `.d`. This preserves repository-template resolution without
 changing shared ancestor permissions. No fixture root is needed for an
 ordinary production build.
 
-An optional development-only comparison still exercises the frozen reference
-before its removal. Only that explicit reference requires Bash, jq and the
-legacy GNU utilities:
+The optional `fixture-tools` target installs only the native fake and runner
+for inventory or explicitly isolated native runs, never the fixture controller:
 
 ```sh
-zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
-  --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
-  --prefix "$PWD/.d/direct-tools" -Doptimize=ReleaseSafe fixture-tools
-"$PWD/.d/direct-tools/bin/hyperv-direct-lifecycle-fixtures" \
-  --backend reference \
-  --controller "$PWD/support/scripts/hyperv-direct-two-boot.sh" \
-  --root "$fixture_parent/reference" \
-  --fake "$PWD/.d/direct-tools/bin/hyperv-direct-fixture-cli" \
-  --validator "$PWD/.d/direct-tools/bin/uk-hyperv-direct-validate"
-
 TMPDIR="$PWD/.d/direct-runtime" zig build \
   --build-file support/tools/hyperv/direct/build.zig -j2 \
   --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
-  -Dlifecycle-root="$fixture_parent/comparison" \
-  -Dlifecycle-compare="$fixture_parent/reference" \
-  -Doptimize=ReleaseSafe test-lifecycle-native
+  --prefix "$PWD/.d/direct-tools" -Doptimize=ReleaseSafe fixture-tools
+"$PWD/.d/direct-tools/bin/hyperv-direct-lifecycle-fixtures" \
+  --inventory
 ```
 
 `fixture-tools` is explicit and separate from the default installation.
@@ -388,26 +377,57 @@ The native suite retains all 92 named legacy cases plus signal and overflow
 process cases. It supplies a checked-in native fake CLI and transfer/input
 reader with no real-CLI/network/disk delegation. The real native serial
 validator still processes fixture bytes. `--inventory` lists the coverage
-map; `--case name,name` selects a subset. Use absolute paths, preserve source
-executable modes, and do not precreate either suite root.
+map; `--case name,name` selects a subset. Direct runner invocation requires
+`--controller ABS --root NONEXISTENT_ABS --fake ABS --validator ABS`, with
+all three programs verified as native executables. The retired `--backend`
+and `--compare` options are refused, not ignored; the build no longer accepts
+`-Dlifecycle-compare`. Use absolute paths, preserve source executable modes,
+and do not precreate a suite root. Use a separate nonexistent child of the
+fresh private parent for each additional invocation.
 The immediate parent of each suite root must already be owner-private
 (mode 0700), and suite roots must remain beneath the checkout's `.d` so the
 fixture tools resolve the unchanged repository template. If that shared `.d`
 directory is not private, create a dedicated fresh mode-0700 parent beneath
 it rather than changing shared permissions or moving suites outside the
 checkout. CI uses one such parent per run/attempt; build tools and caches
-remain in its separate private temporary tree.
+remain in the separate external `${RUNNER_TEMP}/hyperv-ci/direct` tree.
 
-Reference mode deliberately exercises the frozen shell controller during
-migration. It is not a fallback from a failed native run. Comparison uses
-distinct roots, recomputes each run's hashes, requires case-specific custody
-records on both sides, and preserves within-run exit bindings. The declared
-1/124 deadline race is normalized only for `stale-boot1-log` and
-`azure-padding-only`. Negative controls cover missing records, natural
-completion mistaken for overflow termination, and undeclared exit changes.
+The native suite recomputes every custody hash and requires each named
+case's mandatory evidence records, including refusal cases. Missing-record
+controls remove each required file, all required files together, and both
+captures together where required. Malformed JSON and byte-only record drift,
+within-run exit bindings, exact mutation/cleanup order, and native adapter
+privacy/template guards remain independently checked. Only
+`stale-boot1-log` and `azure-padding-only` allow the declared 1/124 deadline
+race; no other statuses or budgets are normalized. Overflow requires public
+status 153, an independently recorded actual TERM/KILL termination, exactly
+8 MiB retained, and observed termination before the original deadline.
+The defective drain-without-termination negative control remains rejected.
 CI runs all 94 native cases once, plus the controller and foundation cases.
-Full reference comparison remains an offline migration qualification gate,
-rather than duplicating the lifecycle in the existing bounded CI job.
+Reference-controller comparison and its comparison-only checks are retired;
+there is no duplicate lifecycle or additional CI pipeline.
+
+The full native runner reports **890 assertion-regression checks**, in
+addition to the ordinary assertions for all 94 lifecycle cases:
+
+| Native regression group | Checks |
+|---|---:|
+| Case-specific missing custody records (287 removal masks, 58 restored cases) | 345 |
+| Native grant-output, private-context and exact-template controls | 52 |
+| Explicit CLI inputs, retired-option refusals and selectors | 23 |
+| Within-run outcome status, type and mandatory-field controls | 455 |
+| Malformed capture/admission JSON, hash drift and restored custody | 7 |
+| Overflow status, termination deadline and defective natural-completion controls | 8 |
+
+Cutover removes 292 cross-run outcome-comparison checks, 345 redundant
+self-comparison custody checks, and 22 reference-only adapter checks from
+the former 1,060-check native run. The former 1,634-check strict comparison
+also had 574 additional cross-run custody checks, which are retired.
+All 401 noncomparison native checks remain, with 489 new native checks:
+23 CLI, 455 outcome, 7 malformed-record/restoration, 2 retired-context and
+2 stricter overflow-status controls. The separate controller and foundation
+targets retain their 18 and 85 tests, including permanent local-failure
+latches, supervisor poison and unconditional final local custody auditing.
 
 Read-only validator fixtures exercise seed/manifest/footer validation in
 memory, not on real disks, and call the same direct-helper framing functions.
@@ -425,10 +445,10 @@ libraries, including isolated process-poison cases, and compiles their
 production interfaces without running them. `test-controller` exercises
 controller policies and private IO; `test-lifecycle-native` exercises the
 complete orchestration without cloud access. Neither test target installs
-the fixture controller. Only removal of the obsolete selected shell/jq files
-and temporary reference machinery remains for migration cutover.
+the fixture controller. The selected obsolete shell/jq entry, shell fixture
+tools and temporary reference-comparison machinery have been removed.
 
-The migration retains the six explicit command inputs shown above. It does
+The native cutover retains the six explicit command inputs shown above. It does
 not add a broad `uk-hyperv` execution mode or enable the parked production
 stubs. The native validator remains a bounded child; transfer remains the
 existing native `transfer PRIVATE_DIRECTORY JOB_BASENAME` protocol.

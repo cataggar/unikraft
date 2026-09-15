@@ -4,7 +4,6 @@ const std = @import("std");
 pub const files = @import("hyperv_core").private_files;
 pub const marker = "direct-two-boot-offline-only\n";
 pub const sentinel = "PRIVATE_FIXTURE_SAS";
-pub const Backend = enum { reference, native };
 pub const private_template = "attempt/deployment-template.json";
 pub const template_limit = 65536;
 pub const owner = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa";
@@ -75,33 +74,33 @@ pub fn yes(value: std.json.Value, name: []const u8) !bool {
     return boolean(try field(value, name));
 }
 
-pub fn backend(c: Context) !Backend {
+pub fn nativeContext(c: Context) !void {
     try c.validate();
     var bytes = try files.readSensitiveAbsolute(c.io, c.a, try c.path("fixture-backend.json"), 1024, null);
     defer bytes.deinit();
-    const selection = try std.json.parseFromSlice(struct { backend: Backend }, c.a, bytes.bytes(), .{});
+    const selection = try std.json.parseFromSlice(struct { backend: enum { native } }, c.a, bytes.bytes(), .{});
     defer selection.deinit();
-    return selection.value.backend;
 }
 
-pub fn grantOutputMetadata(selected: Backend, stat: files.Snapshot, uid: u32) !void {
+pub fn grantOutputMetadata(stat: files.Snapshot, uid: u32) !void {
     const kind = stat.mode & 0o170000;
-    const allowed = kind == 0o100000 or (selected == .native and kind == 0o010000);
+    const allowed = kind == 0o100000 or kind == 0o010000;
     if (!allowed or stat.mode & 0o7777 != 0o600 or stat.uid != uid or stat.nlink != 1)
         return error.UnsafeFixtureGrantOutput;
 }
 
 pub fn grantOutput(c: Context, output: std.Io.File) !void {
-    try grantOutputMetadata(try backend(c), try files.snapshot(output), std.os.linux.getuid());
+    try nativeContext(c);
+    try grantOutputMetadata(try files.snapshot(output), std.os.linux.getuid());
 }
 
-pub fn referenceTemplatePath(c: Context) ![]const u8 {
+pub fn repositoryTemplatePath(c: Context) ![]const u8 {
     const at = std.mem.indexOf(u8, c.root, "/.d/") orelse return error.UnsafeFixtureRoot;
     return std.mem.concat(c.a, u8, &.{ c.root[0..at], "/support/azure/hyperv-direct-two-boot.json" });
 }
 
-pub fn referenceTemplate(c: Context) ![]const u8 {
-    const file = try files.openAbsolute(c.io, try referenceTemplatePath(c), .artifact);
+pub fn repositoryTemplate(c: Context) ![]const u8 {
+    const file = try files.openAbsolute(c.io, try repositoryTemplatePath(c), .artifact);
     defer file.close(c.io);
     const before = try files.snapshot(file);
     if (before.size >= template_limit) return error.FileTooLarge;
@@ -112,18 +111,12 @@ pub fn referenceTemplate(c: Context) ![]const u8 {
 }
 
 pub fn deploymentTemplate(c: Context, path: []const u8) !void {
-    if (try backend(c) == .reference) {
-        try expect(std.fs.path.isAbsolute(path));
-        const normalized = try std.fs.path.resolve(c.a, &.{path});
-        try files.absoluteFilePath(normalized);
-        if (!eq(normalized, try referenceTemplatePath(c))) return error.InvalidFixtureTemplatePath;
-        return;
-    }
+    try nativeContext(c);
     try files.absoluteFilePath(path);
     if (!eq(path, try c.path(private_template))) return error.InvalidFixtureTemplatePath;
     var published = try files.readSensitiveAbsolute(c.io, c.a, path, template_limit, null);
     defer published.deinit();
-    if (!eq(published.bytes(), try referenceTemplate(c))) return error.FixtureTemplateMismatch;
+    if (!eq(published.bytes(), try repositoryTemplate(c))) return error.FixtureTemplateMismatch;
 }
 
 pub const Context = struct {
@@ -195,7 +188,6 @@ pub const Context = struct {
         try c.append("calls", try std.mem.concat(c.a, u8, &.{ line, "\n" }));
     }
     pub fn timestamp(c: Context, relative: []const u8) !void {
-        // The reference may enter cleanup twice only in separate failed runs.
         if (!try c.exists(relative)) try c.write(relative, try std.fmt.allocPrint(c.a, "{d}\n", .{now(c.io)}));
     }
     pub fn digest(c: Context, relative: []const u8) ![64]u8 {

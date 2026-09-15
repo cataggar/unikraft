@@ -138,19 +138,17 @@ pub fn build(b: *std.Build) void {
     b.step("test-controller", "Run native controller policy and private IO fixtures").dependOn(&b.addRunArtifact(controller_tests).step);
 
     const lifecycle_root = b.option([]const u8, "lifecycle-root", "Fresh nonexistent absolute native lifecycle fixture root");
-    const lifecycle_compare = b.option([]const u8, "lifecycle-compare", "Existing absolute reference fixture root for strict comparison");
     const lifecycle_cases = b.option([]const u8, "lifecycle-cases", "Comma-separated native lifecycle case selectors");
     const native_lifecycle = b.step("test-lifecycle-native", "Run the complete native lifecycle with isolated fake resources");
     if (lifecycle_root) |root| {
-        if (!std.fs.path.isAbsolute(root) or (lifecycle_compare != null and !std.fs.path.isAbsolute(lifecycle_compare.?))) {
-            native_lifecycle.dependOn(&b.addFail("Lifecycle fixture and comparison roots must be absolute").step);
+        if (!std.fs.path.isAbsolute(root)) {
+            native_lifecycle.dependOn(&b.addFail("Lifecycle fixture root must be absolute").step);
         } else {
             const run = b.addRunArtifact(lifecycle);
             run.has_side_effects = true;
-            run.addArgs(&.{ "--backend", "native", "--root", root });
+            run.addArgs(&.{ "--root", root });
             NativeLifecycleArgs.add(b, run, .{ controller_fixture, fake, validator });
             if (lifecycle_cases) |cases| run.addArgs(&.{ "--case", cases });
-            if (lifecycle_compare) |reference| run.addArgs(&.{ "--compare", reference });
             native_lifecycle.dependOn(&run.step);
         }
     } else {

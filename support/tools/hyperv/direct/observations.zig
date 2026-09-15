@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
-//! Read-only Azure observation contracts from direct-two-boot.jq and the inline
-//! controller filters. These checks neither authorize effects nor parse evidence.
+//! Native read-only Azure observation contracts.
+//! These checks neither authorize effects nor parse evidence.
 const std = @import("std");
 const core = @import("hyperv_core");
 const direct = @import("main.zig");
