@@ -359,9 +359,12 @@ validator still processes fixture bytes. `--inventory` lists the coverage
 map; `--case name,name` selects a subset. Use absolute paths, preserve source
 executable modes, and do not precreate either suite root.
 The immediate parent of each suite root must already be owner-private
-(mode 0700). If a shared checkout's `.d` directory is not private, create a
-dedicated private parent beneath it rather than changing shared permissions.
-CI uses its private temporary tree with a `.d` child for this purpose.
+(mode 0700), and suite roots must remain beneath the checkout's `.d` so the
+fixture tools resolve the unchanged repository template. If that shared `.d`
+directory is not private, create a dedicated fresh mode-0700 parent beneath
+it rather than changing shared permissions or moving suites outside the
+checkout. CI uses one such parent per run/attempt; build tools and caches
+remain in its separate private temporary tree.
 
 Reference mode deliberately exercises the frozen shell controller during
 migration. It is not a fallback from a failed native run. Comparison uses
