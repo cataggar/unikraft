@@ -35,13 +35,20 @@ pub const Inputs = struct {
     }
 };
 
-/// Frozen jq compatibility: false=1, filter runtime error=5, malformed=1.
+/// Frozen jq compatibility: false=1, filter runtime error=5, malformed JSON=4.
 /// Malformed grants first pass the native JSON child and retain its exit.
 pub fn observationExit(err: anyerror) u8 {
     return switch (observations.failureClass(err)) {
         .filter_error => 5,
-        .refused, .malformed, .capture, .local => 1,
+        .malformed => 4,
+        .refused, .capture, .local => 1,
     };
+}
+
+pub const CallPolicy = enum { required, serial_poll, serial_parser };
+
+pub fn primaryStatus(policy: CallPolicy, code: u8) ?u8 {
+    return if (policy == .required and code != 0) code else null;
 }
 
 pub fn errorExit(err: anyerror, cancellation: *const process.SignalCancellation) u8 {
@@ -77,16 +84,14 @@ pub const Native = struct {
         return runtime.Environment.init(a, operator);
     }
 
-    pub fn hash(_: Native, _: *custody.Store, _: []const u8) !u8 {
+    // The offline adapter can inject failure; Store always performs real hashing.
+    pub fn checkHashFault(_: Native, _: *custody.Store, _: []const u8) !u8 {
         return 0;
     }
 
     pub fn sleep(_: Native, io: std.Io, milliseconds: u64) !void {
         try std.Io.sleep(io, .fromMilliseconds(@intCast(milliseconds)), .awake);
     }
-
-    pub fn beforeCall(_: Native, _: *runtime.Budgets, _: Lane, _: []const u8) !void {}
-    pub fn afterCall(_: Native, _: *runtime.Budgets, _: Lane, _: []const u8) !void {}
 };
 
 /// The installed entry point instantiates Native only. Offline hooks live in a
@@ -240,26 +245,28 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn call(self: *Self, lane: Lane, role: runtime.Role, label: []const u8, args: []const []const u8, extension: []const u8) !u8 {
+            return self.callWithPolicy(lane, role, .required, label, args, extension);
+        }
+
+        fn callWithPolicy(self: *Self, lane: Lane, role: runtime.Role, policy: CallPolicy, label: []const u8, args: []const []const u8, extension: []const u8) !u8 {
             if (self.poisoned) return error.UnresolvedCleanup;
             if (lane == .primary) try self.verifyPrimary() else try self.verifyTools();
-            try self.hooks.beforeCall(self.runtime.budgets, lane, label);
             const result = self.runtime.run(lane, role, args, &self.store.writer, try self.fmt("{s}.{s}", .{ label, extension }), try self.fmt("{s}.stderr", .{label})) catch |err| {
                 if (err == error.UnresolvedCleanup) self.poisoned = true;
                 return err;
             };
-            try self.hooks.afterCall(self.runtime.budgets, lane, label);
             if (!result.execution.cleanup_complete or result.execution.unreaped_group != null) self.poisoned = true;
             const status = processExit(result, self.runtime.cancellation);
             // Preserve child failures before any local recording or recheck.
             // Poll failures and serial parser statuses have their own policy.
-            if (status != 0 and lane == .primary and
-                !(role == .validator and std.mem.startsWith(u8, label, "serial-check-")) and
-                !(role == .azure and std.mem.indexOf(u8, label, "-serial-") != null))
-                self.primary_exit = status;
+            if (lane == .primary) {
+                if (primaryStatus(policy, status)) |code| self.primary_exit = code;
+            }
             // Process/capture/cleanup lanes remain visible even on child exits.
             const record = try custody.encode(self.a, .{
                 .role = role,
                 .lane = lane,
+                .policy = policy,
                 .exit = status,
                 .capture = result.capture,
                 .stdout_bytes = result.stdout_bytes,
@@ -284,19 +291,23 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn az(self: *Self, lane: Lane, label: []const u8, args: []const []const u8) !u8 {
+            return self.azWithPolicy(lane, .required, label, args);
+        }
+
+        fn azWithPolicy(self: *Self, lane: Lane, policy: CallPolicy, label: []const u8, args: []const []const u8) !u8 {
             if (lane == .primary) try self.store.requireConsumed();
             const tail: []const []const u8 = &.{ "--subscription", self.expected.scope.subscription, "--only-show-errors", "--output", "json" };
             const arguments = try std.mem.concat(self.a, []const u8, &.{ args, tail });
-            return self.call(lane, .azure, label, arguments, "json");
+            return self.callWithPolicy(lane, .azure, policy, label, arguments, "json");
         }
 
         fn azRequired(self: *Self, label: []const u8, args: []const []const u8) !void {
             try self.required(try self.az(.primary, label, args));
         }
 
-        fn validate(self: *Self, lane: Lane, label: []const u8, verb: []const u8, extra: []const []const u8) !u8 {
-            const args = try std.mem.concat(self.a, []const u8, &.{ &.{ verb, try self.path("scope.json") }, extra });
-            return self.call(lane, .validator, label, args, "stdout");
+        fn validate(self: *Self, lane: Lane, label: []const u8, verb: enum { scope, inputs, json, serial }, extra: []const []const u8) !u8 {
+            const args = try std.mem.concat(self.a, []const u8, &.{ &.{ @tagName(verb), try self.path("scope.json") }, extra });
+            return self.callWithPolicy(lane, .validator, if (verb == .serial) .serial_parser else .required, label, args, "stdout");
         }
 
         const Read = struct {
@@ -341,12 +352,18 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn groupAbsent(self: *Self, lane: Lane, label: []const u8) !void {
-            const status = try self.az(lane, label, &.{ "group", "exists", "--name", try self.groupName() });
+            const status = self.az(lane, label, &.{ "group", "exists", "--name", try self.groupName() }) catch |err| {
+                if (lane == .primary and !self.runtime.cancellation.flag().load(.acquire)) self.primary_exit = 1;
+                return err;
+            };
             if (status != 0) {
                 if (lane == .primary) self.primary_exit = 1; // reference `group_absent || die`
                 return error.GroupAbsenceUncertain;
             }
-            const document = try self.read(label);
+            const document = self.read(label) catch |err| {
+                if (lane == .primary) self.primary_exit = 1;
+                return err;
+            };
             defer document.deinit();
             observations.freshAbsence(document.value()) catch |err| {
                 const failure = self.refused(label, err);
@@ -374,10 +391,10 @@ fn Controller(comptime Hooks: type) type {
             };
             try self.required(try self.call(.primary, .validator, "source-scope-check", &.{ "scope", self.inputs.scope }, "stdout"));
             try self.required(try self.call(.primary, .validator, "ledger-check", &.{ "ledger", self.inputs.scope, self.inputs.ledger }, "stdout"));
-            try self.required(try self.validate(.primary, "scope-check", "scope", &.{}));
+            try self.required(try self.validate(.primary, "scope-check", .scope, &.{}));
             try self.event(.@"local-admission");
             self.references = try self.hooks.references(self.io, self.expected.scope, self.inputs.programs);
-            try self.required(try self.validate(.primary, "input-check", "inputs", &.{}));
+            try self.required(try self.validate(.primary, "input-check", .inputs, &.{}));
             try self.store.consume();
             try self.event(.@"seed-consumed");
             try self.groupAbsent(.primary, "group-before");
@@ -401,9 +418,9 @@ fn Controller(comptime Hooks: type) type {
             try self.serial(1);
             try self.event(.@"boot1-evidence-complete");
             try self.event(.@"deallocate-intent");
-            try self.vmOperation("deallocated", "deallocate");
+            try self.vmOperation("deallocated", .deallocate);
             const retained = try self.observe("retained", .deallocated);
-            try self.required(try self.validate(.primary, "retained-input-check", "inputs", &.{}));
+            try self.required(try self.validate(.primary, "retained-input-check", .inputs, &.{}));
             _ = self.runtime.budgets.call(.primary, .azure) catch |err| {
                 if (err == error.ApprovalExpired) self.primary_exit = 1;
                 return err;
@@ -412,13 +429,13 @@ fn Controller(comptime Hooks: type) type {
             try self.store.admitBoot2(self.identities(), retained);
             try self.event(.@"boot2-start-intent");
             try self.verifyAdmission();
-            try self.vmOperation("started", "start");
+            try self.vmOperation("started", .start);
             const second = try self.observe("boot2", .allocated);
             self.boot_vm[1] = second.vm;
             try self.serial(2);
             try self.event(.@"boot2-evidence-complete");
             try self.event(.@"final-deallocate-intent");
-            try self.vmOperation("final-deallocated", "deallocate");
+            try self.vmOperation("final-deallocated", .deallocate);
             self.final_observations = try self.observe("final", .deallocated);
             try self.verifyFinal();
             try self.store.verifyBoot1();
@@ -458,7 +475,7 @@ fn Controller(comptime Hooks: type) type {
             try self.azRequired(grant_label, &.{ "disk", "grant-access", "--resource-group", try self.groupName(), "--name", try self.diskName(role), "--access-level", "Write", "--duration-in-seconds", "1800" });
             const grant_name = try self.fmt("{s}.json", .{grant_label});
             const grant_pin = try self.store.pinFile(grant_name, 65536);
-            try self.required(try self.validate(.primary, try self.fmt("{s}-grant-check", .{name}), "json", &.{try self.path(grant_name)}));
+            try self.required(try self.validate(.primary, try self.fmt("{s}-grant-check", .{name}), .json, &.{try self.path(grant_name)}));
             try self.store.verifyFile(grant_name, grant_pin, 65536);
             {
                 var bytes = try self.store.directory.readSensitive(self.io, self.temporary, grant_name, 65536, grant_pin.sha256);
@@ -536,8 +553,8 @@ fn Controller(comptime Hooks: type) type {
             try self.store.verifyFile("deployment-template.json", template_pin, custody.record_limit);
         }
 
-        fn vmOperation(self: *Self, label: []const u8, operation: []const u8) !void {
-            try self.azRequired(label, &.{ "vm", operation, "--resource-group", try self.groupName(), "--name", try self.vmName() });
+        fn vmOperation(self: *Self, label: []const u8, operation: enum { deallocate, start }) !void {
+            try self.azRequired(label, &.{ "vm", @tagName(operation), "--resource-group", try self.groupName(), "--name", try self.vmName() });
         }
 
         fn diskShow(self: *Self, lane: Lane, label: []const u8, role: Role) !void {
@@ -590,7 +607,7 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn hashHook(self: *Self, name: []const u8) !void {
-            const status = try self.hooks.hash(self.store, name);
+            const status = try self.hooks.checkHashFault(self.store, name);
             if (status != 0) {
                 self.primary_exit = status;
                 return error.HashFailed;
@@ -613,7 +630,9 @@ fn Controller(comptime Hooks: type) type {
                 if (try self.runtime.budgets.execution.expired()) return error.SerialExhausted;
                 if (boot == 2) try self.verifyAdmission();
                 const label = try self.fmt("boot{d}-serial-{d}", .{ boot, count });
-                const status = try self.az(.primary, label, &.{ "vm", "boot-diagnostics", "get-boot-log", "--resource-group", try self.groupName(), "--name", try self.vmName() });
+                // Provider read failures may poll again; local admission or
+                // custody failures abort instead of admitting another call.
+                const status = try self.azWithPolicy(.primary, .serial_poll, label, &.{ "vm", "boot-diagnostics", "get-boot-log", "--resource-group", try self.groupName(), "--name", try self.vmName() });
                 if (status == 0) {
                     const wrapper_name = try self.fmt("{s}.json", .{label});
                     const wrapper_pin = try self.store.pinFile(wrapper_name, custody.cli_limit);
@@ -637,7 +656,7 @@ fn Controller(comptime Hooks: type) type {
                     } else {
                         const serial_label = try self.fmt("serial-check-{d}-{d}", .{ boot, count });
                         const extra: []const []const u8 = if (boot == 1) &.{try self.path(@tagName(candidate))} else &.{ try self.path("boot1.log"), try self.path(@tagName(candidate)) };
-                        result = try self.validate(.primary, serial_label, "serial", extra);
+                        result = try self.validate(.primary, serial_label, .serial, extra);
                         // Compatibility aliases are mutable scratch, never the
                         // immutable validator captures used to audit a poll.
                         inline for (.{ local.Scratch.@"serial-check.stdout", local.Scratch.@"serial-check.stderr" }) |alias| {
@@ -690,7 +709,7 @@ fn Controller(comptime Hooks: type) type {
                 self.cleanup_exit = 1;
             };
             if (!self.poisoned) {
-                self.final_input_exit = self.validate(.cleanup, "final-input-check", "inputs", &.{}) catch 1;
+                self.final_input_exit = self.validate(.cleanup, "final-input-check", .inputs, &.{}) catch 1;
                 // Independent local checks do not prevent authorized deletion.
                 self.source.verify(self.io) catch {
                     self.final_input_exit = 1;

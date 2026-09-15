@@ -22,8 +22,19 @@ test "typed observation classifications preserve declared reference statuses" {
     try t.expectEqual(@as(u8, 1), controller.observationExit(error.ObservationRefused));
     inline for (.{ error.InvalidUint, error.InvalidPowerCode, error.InvalidGrantShape, error.InvalidSerialWrapper }) |err|
         try t.expectEqual(@as(u8, 5), controller.observationExit(err));
-    inline for (.{ error.MalformedJson, error.DuplicateField, error.CaptureFailed, error.FileChanged }) |err|
+    inline for (.{ error.MalformedJson, error.DuplicateField }) |err|
+        try t.expectEqual(@as(u8, 4), controller.observationExit(err));
+    inline for (.{ error.CaptureFailed, error.FileChanged }) |err|
         try t.expectEqual(@as(u8, 1), controller.observationExit(err));
+}
+
+test "serial call policies do not latch poll failures or incomplete parser status as primary" {
+    try t.expectEqual(@as(?u8, null), controller.primaryStatus(.required, 0));
+    for ([_]u8{ 1, 2, 12, 17, 23, 124, 125, 143 }) |code| {
+        try t.expectEqual(@as(?u8, code), controller.primaryStatus(.required, code));
+        try t.expectEqual(@as(?u8, null), controller.primaryStatus(.serial_poll, code));
+        try t.expectEqual(@as(?u8, null), controller.primaryStatus(.serial_parser, code));
+    }
 }
 
 test "child exit timeout cancellation and capture outcomes remain distinct" {
@@ -110,6 +121,43 @@ test "unsafe scratch entries and replaced lock inode are refused" {
     var replacement = try fixture.directory.lock(io);
     defer replacement.close(io);
     try t.expectError(error.LockChanged, local.verifyLock(io, &writer));
+}
+
+test "directory path binding permits local writes but refuses replacement directories" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    const original = try local.directory(io, fixture.directory, "attempt");
+    defer original.close(io);
+    const path = try std.fmt.allocPrint(a, "{s}/{s}/attempt", .{ support.options.test_root.?, fixture.name });
+    defer a.free(path);
+    try local.verifyDirectory(io, original, path);
+    var writer = try original.lock(io);
+    defer writer.close(io);
+    try local.immutableRaw(io, &writer, "observation.json", "{}");
+    try local.verifyDirectory(io, original, path);
+    try fixture.directory.dir.rename("attempt", fixture.directory.dir, "original-attempt", io);
+    const replacement = try local.directory(io, fixture.directory, "attempt");
+    defer replacement.close(io);
+    try t.expectError(error.DirectoryChanged, local.verifyDirectory(io, original, path));
+}
+
+test "uploader lock handoff retains the original inode without holding the worker lock" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    const upload = try local.directory(io, fixture.directory, "upload-os");
+    defer upload.close(io);
+    var writer = try upload.lock(io);
+    defer writer.close(io);
+    const original = try core.private_files.snapshot(writer.file.?);
+    writer.close(io);
+    {
+        var worker = try upload.lock(io);
+        defer worker.close(io);
+        try custody.requireDurable(try worker.createImmutable(io, "transfer-intent.json", "{}"));
+    }
+    writer = try upload.lock(io);
+    try t.expect(core.private_files.sameSnapshot(original, try core.private_files.snapshot(writer.file.?)));
+    try local.verifyLock(io, &writer);
 }
 
 test "custody uncertainty conservatively retains cleanup failure without erasing primary exit" {
