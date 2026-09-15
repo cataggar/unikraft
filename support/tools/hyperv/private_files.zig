@@ -245,6 +245,11 @@ pub const Locked = struct {
         return self.commitImpl(io, name, contents, true, fault);
     }
 
+    pub fn createImmutableFault(self: *Locked, io: std.Io, name: []const u8, contents: []const u8, fault: TestFault) !CommitResult {
+        if (!builtin.is_test) @compileError("Fault injection is only available to native tests");
+        return self.commitImpl(io, name, contents, false, fault);
+    }
+
     fn commitImpl(self: *Locked, io: std.Io, name: []const u8, contents: []const u8, replace: bool, fault: ?TestFault) !CommitResult {
         if (self.file == null) return error.LockNotHeld;
         try basename(name);
@@ -267,7 +272,9 @@ pub const Locked = struct {
             return result;
         };
         defer atomic.deinit(io);
-        writeAndReplace(io, &atomic, contents, replace, fault, &result) catch {
+        writeAndReplace(io, &atomic, contents, replace, fault, &result) catch |err| {
+            // A racing create-only publisher is still an immutable collision.
+            if (!replace and err == error.PathAlreadyExists) return error.PathAlreadyExists;
             result.failures.recording = recordingFailure();
         };
         // std.Io owns the atomic-file mechanism; explicitly observe cleanup errors its
