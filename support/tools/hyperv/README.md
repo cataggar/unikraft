@@ -188,7 +188,8 @@ image assertions still need Python; the whole workflow is not Python-free.
 The separate [native preflight package](preflight/README.md) implements the
 single-use execution, signed six-boot evidence, cleanup and completed-state
 loader. Its standalone `test` selector exercises native adapters and supervised
-children in Debug and ReleaseSafe in the required Hyper-V job.
+children in Debug and ReleaseSafe in `zig-hyperv-build-protocol`, a mandatory
+fixture dependency of the required `zig-hyperv` producer.
 
 This is not yet an operator preflight command. The installed
 `uk-hyperv-preflight-worker` refuses execution with exit 2 until the trusted
