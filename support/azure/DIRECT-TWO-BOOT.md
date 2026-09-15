@@ -409,6 +409,17 @@ diagnostic material, never an admissible observation. The controller's
 integer mapping must preserve the lifecycle contract above and its named
 parity assertions; libraries do not invent an exit status for their callers.
 
+Primary evidence refusal is permanent but does not itself fabricate a cleanup
+failure. The two cleanup intent phases may append only after independently
+revalidating the original private directory, stable writer lock and event-log
+custody; they never clear refusal or enable another primary operation.
+Cleanup authority remains the original admitted in-memory scope and identities.
+Real writer/durability, capability, final-input and outcome-recording failures
+remain independent failures. The final-input status is the actual bounded
+validator result, not an already-recorded primary scope-byte-hash refusal.
+`FinalResult.evidence_error` is an internal final-evidence result, not a new
+JSON field; callers must always honor the final `exit_code`.
+
 Intentional parser strictness is limited and explicit: reject duplicate
 JSON keys, bounded structural overflow, object-shaped status collections,
 and fractional numbers that floating-point jq evaluation might round to an
