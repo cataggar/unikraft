@@ -262,6 +262,14 @@ pub const TestFault = union(enum) {
     capability_sync,
 };
 
+pub const RawTest = struct {
+    source_failure: enum { none, read, hash, proof } = .none,
+    cleanup_failure: enum { none, delete, directory_sync } = .none,
+    named_scratch: ?u64 = null,
+    delete_attempts: usize = 0,
+    sync_attempts: usize = 0,
+};
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -678,6 +686,15 @@ pub const Store = struct {
     /// Large CLI/serial records use streaming create-only publication, not the
     /// small-record helper. Disks are references, never copied by this API.
     pub fn publishRaw(self: *Store, source: []const u8, destination: []const u8, expected: FileSnapshot) !FileSnapshot {
+        return self.publishRawImpl(source, destination, expected, null);
+    }
+
+    pub fn publishRawFault(self: *Store, source: []const u8, destination: []const u8, expected: FileSnapshot, fault: *RawTest) !FileSnapshot {
+        if (!builtin.is_test) @compileError("Fault injection is only available to native tests");
+        return self.publishRawImpl(source, destination, expected, fault);
+    }
+
+    fn publishRawImpl(self: *Store, source: []const u8, destination: []const u8, expected: FileSnapshot, fault: ?*RawTest) !FileSnapshot {
         try self.ready();
         errdefer self.healthy = false;
         try files.basename(destination);
@@ -689,20 +706,35 @@ pub const Store = struct {
         if (!files.sameSnapshot(expected.metadata, try files.snapshot(file))) return error.FileChanged;
         var atomic = self.directory.dir.createFileAtomic(self.io, destination, .{
             .permissions = .fromMode(0o600),
-            .replace = false,
+            // Tests disable O_TMPFILE. Publication still exclusively uses link(),
+            // never replace(), exactly as on a filesystem with named fallback.
+            .replace = builtin.is_test and fault != null,
         }) catch |err| {
             self.recordingFailed(err);
             return err;
         };
-        defer atomic.deinit(self.io);
+        defer self.releaseRaw(&atomic, fault);
         validatePrivate(atomic.file, true) catch |err| {
             self.recordingFailed(err);
             return err;
         };
+        if (builtin.is_test) {
+            if (fault) |test_fault| {
+                if (!atomic.file_exists) return error.NamedTemporaryRequired;
+                const name = std.fmt.hex(atomic.file_basename_hex);
+                const named = try (files.Directory{ .dir = atomic.dir }).openFile(self.io, &name);
+                defer named.close(self.io);
+                if (!files.sameSnapshot(try files.snapshot(atomic.file), try files.snapshot(named)))
+                    return error.FileChanged;
+                test_fault.named_scratch = atomic.file_basename_hex;
+            }
+        }
         var buffer: [65536]u8 = undefined;
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
         var offset: u64 = 0;
         while (offset < expected.metadata.size) {
+            if (builtin.is_test and fault != null and fault.?.source_failure == .read)
+                return error.InjectedReadFailure;
             const length: usize = @intCast(@min(buffer.len, expected.metadata.size - offset));
             if (try file.readPositionalAll(self.io, buffer[0..length], offset) != length) return error.FileChanged;
             sha.update(buffer[0..length]);
@@ -712,9 +744,50 @@ pub const Store = struct {
             };
             offset += length;
         }
-        if (!std.crypto.timing_safe.eql(Digest, sha.finalResult(), expected.sha256)) return error.HashMismatch;
+        const digest = sha.finalResult();
+        if (builtin.is_test and fault != null and fault.?.source_failure == .hash)
+            return error.InjectedHashFailure;
+        if (!std.crypto.timing_safe.eql(Digest, digest, expected.sha256)) return error.HashMismatch;
+        if (builtin.is_test) {
+            if (fault != null and fault.?.source_failure == .proof) {
+                const changed = try self.directory.dir.createFile(self.io, source, .{ .truncate = false, .permissions = .fromMode(0o600) });
+                defer changed.close(self.io);
+                try changed.writePositionalAll(self.io, "\x00", 0);
+                try changed.sync(self.io);
+            }
+        }
         try self.verifyFile(source, expected, cli_limit);
         return self.commitRaw(&atomic, destination, expected.sha256);
+    }
+
+    fn releaseRaw(self: *Store, atomic: *std.Io.File.Atomic, fault: ?*RawTest) void {
+        defer atomic.deinit(self.io);
+        if (!atomic.file_exists) return;
+        const name = std.fmt.hex(atomic.file_basename_hex);
+        // This path owns the one unlink attempt, including an uncertain failure.
+        // deinit may close descriptors, but must not silently retry the deletion.
+        atomic.file_exists = false;
+        self.removeRawScratch(atomic.dir, &name, fault) catch |err| {
+            self.healthy = false;
+            if (self.cleanup_failure == null) self.cleanup_failure = err;
+        };
+    }
+
+    fn removeRawScratch(self: *Store, directory: std.Io.Dir, name: []const u8, fault: ?*RawTest) !void {
+        if (builtin.is_test) {
+            if (fault) |test_fault| {
+                test_fault.delete_attempts += 1;
+                if (test_fault.cleanup_failure == .delete) return error.InjectedScratchDeleteFailure;
+            }
+        }
+        try directory.deleteFile(self.io, name);
+        if (builtin.is_test) {
+            if (fault) |test_fault| {
+                test_fault.sync_attempts += 1;
+                if (test_fault.cleanup_failure == .directory_sync) return error.InjectedScratchSyncFailure;
+            }
+        }
+        try syncDirectory(self.io, directory);
     }
 
     fn commitRaw(self: *Store, atomic: *std.Io.File.Atomic, destination: []const u8, expected: Digest) !FileSnapshot {

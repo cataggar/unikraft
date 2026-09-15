@@ -1257,3 +1257,159 @@ test "healthy primary completion still accepts after independently recorded clea
     try t.expect(result.outcome.accepted);
     try t.expect(result.evidence_error == null and result.recording_error == null and result.cleanup_error == null);
 }
+
+fn entryCount(directory: files.Directory) !usize {
+    var iterator = directory.dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(io)) |_| count += 1;
+    return count;
+}
+
+const RawSourceFailure = @TypeOf((custody.RawTest{}).source_failure);
+const RawCleanupFailure = @TypeOf((custody.RawTest{}).cleanup_failure);
+
+test "named raw scratch cleanup preserves source failures and separately reports unlink or sync failures" {
+    const raw = try a.alloc(u8, 128 * 1024);
+    defer a.free(raw);
+    @memset(raw, 'R');
+    for ([_]RawSourceFailure{ .read, .hash, .proof }) |source_failure| {
+        for ([_]RawCleanupFailure{ .none, .delete, .directory_sync }) |cleanup_failure| {
+            var fixture = try Fixture.init();
+            defer fixture.deinit();
+            var store = try fixture.store("attempt", sampleScope(.per_boot));
+            defer store.close();
+            try admitted(&store);
+            try write(store.directory, "boot2-candidate.log", raw);
+            const source = try store.pinFile("boot2-candidate.log", custody.cli_limit);
+            const count = try entryCount(store.directory);
+            const inode = (try files.snapshot(store.writer.file.?)).ino;
+            var fault: custody.RawTest = .{ .source_failure = source_failure, .cleanup_failure = cleanup_failure };
+            try t.expectError(switch (source_failure) {
+                .read => error.InjectedReadFailure,
+                .hash => error.InjectedHashFailure,
+                .proof => error.FileChanged,
+                .none => unreachable,
+            }, store.publishRawFault("boot2-candidate.log", "boot2.log", source, &fault));
+            // The hook records a name only after opening the actual private
+            // named inode and matching it to Atomic.file; O_TMPFILE cannot pass.
+            try t.expect(fault.named_scratch != null);
+            const name = std.fmt.hex(fault.named_scratch.?);
+            try t.expectEqual(@as(usize, 1), fault.delete_attempts);
+            try t.expectEqual(@as(usize, if (cleanup_failure == .delete) 0 else 1), fault.sync_attempts);
+            try t.expectEqual(count + @as(usize, if (cleanup_failure == .delete) 1 else 0), try entryCount(store.directory));
+            try expectMissing(store.directory, "boot2.log");
+            try expectMissing(store.directory, "boot2-capture.json");
+            if (cleanup_failure == .delete) {
+                const leftover = try store.directory.openFile(io, &name);
+                defer leftover.close(io);
+                const metadata = try files.snapshot(leftover);
+                try t.expectEqual(@as(u16, 0o600), metadata.mode & 0o7777);
+                try t.expectEqual(@as(u32, 1), metadata.nlink);
+                try t.expectEqual(@as(u64, if (source_failure == .read) 0 else raw.len), metadata.size);
+            } else try expectMissing(store.directory, &name);
+            try t.expect(!store.healthy and store.recording_failure == null);
+            try t.expectError(error.CustodyPoisoned, store.verifyBoot2Admission());
+            try store.event(.@"cleanup-intent");
+            try store.event(.@"cleanup-delete-intent");
+            const primary: u8 = if (source_failure == .proof) 1 else 17;
+            const result = store.finish(failedCompletion(.@"boot2-start-intent", primary));
+            try t.expectEqual(primary, result.exit_code);
+            try t.expectEqual(primary, result.outcome.primary_exit);
+            try t.expectEqual(@as(u8, if (cleanup_failure == .none) 0 else 1), result.outcome.cleanup_exit);
+            try t.expectEqual(.durable, result.recording.status);
+            try t.expect(!result.outcome.accepted and result.recording_error == null);
+            if (cleanup_failure == .none) {
+                try t.expect(result.cleanup_error == null);
+            } else try t.expectEqual(
+                if (cleanup_failure == .delete) error.InjectedScratchDeleteFailure else error.InjectedScratchSyncFailure,
+                result.cleanup_error.?,
+            );
+            try t.expectEqual(inode, (try files.snapshot(store.writer.file.?)).ino);
+            if (cleanup_failure == .delete) {
+                // Neither deferred Atomic.deinit nor finish gets a hidden retry.
+                const leftover = try store.directory.openFile(io, &name);
+                leftover.close(io);
+            } else try expectMissing(store.directory, &name);
+            var bytes = try store.directory.readSensitive(io, a, "outcome.json", 65536, null);
+            defer bytes.deinit();
+            const parsed = try direct.parse(custody.Outcome, a, bytes.bytes());
+            defer parsed.deinit();
+            try t.expectEqual(result.outcome.cleanup_exit, parsed.value.cleanup_exit);
+            try t.expectEqual(primary, parsed.value.primary_exit);
+        }
+    }
+}
+
+test "forced named raw publication stays immutable and removes scratch on success or collision" {
+    for ([_]bool{ false, true }) |collision| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var store = try fixture.store("attempt", sampleScope(.per_boot));
+        defer store.close();
+        try write(store.directory, "candidate.log", padded_raw);
+        const source = try store.pinFile("candidate.log", custody.cli_limit);
+        if (collision) try write(store.directory, "boot1.log", "original");
+        const count = try entryCount(store.directory);
+        var fault: custody.RawTest = .{};
+        if (collision) {
+            try t.expectError(error.PathAlreadyExists, store.publishRawFault("candidate.log", "boot1.log", source, &fault));
+            try expectFile(store.directory, "boot1.log", "original");
+            try t.expectEqual(@as(usize, 1), fault.delete_attempts);
+            try t.expectEqual(@as(usize, 1), fault.sync_attempts);
+        } else {
+            const published = try store.publishRawFault("candidate.log", "boot1.log", source, &fault);
+            try t.expectEqual(source.sha256, published.sha256);
+            try expectFile(store.directory, "boot1.log", padded_raw);
+            try t.expectEqual(@as(usize, 0), fault.delete_attempts);
+            try t.expectEqual(@as(usize, 0), fault.sync_attempts);
+        }
+        try t.expect(fault.named_scratch != null);
+        const name = std.fmt.hex(fault.named_scratch.?);
+        try expectMissing(store.directory, &name);
+        try t.expectEqual(count + @as(usize, if (collision) 0 else 1), try entryCount(store.directory));
+        try t.expect(store.cleanup_failure == null);
+    }
+}
+
+test "named publication errors retain independent scratch cleanup failures without duplicate unlink" {
+    for ([_]custody.TestFault{ .raw_file_sync, .raw_publication, .raw_directory_sync }) |publication_failure| {
+        for ([_]RawCleanupFailure{ .none, .delete, .directory_sync }) |cleanup_failure| {
+            var fixture = try Fixture.init();
+            defer fixture.deinit();
+            var store = try fixture.store("attempt", sampleScope(.per_boot));
+            defer store.close();
+            try write(store.directory, "candidate.log", padded_raw);
+            const source = try store.pinFile("candidate.log", custody.cli_limit);
+            var fault: custody.RawTest = .{ .cleanup_failure = cleanup_failure };
+            store.injectFault(publication_failure);
+            const primary_error = switch (publication_failure) {
+                .raw_file_sync => error.NotCommitted,
+                .raw_publication => error.PublicationUnknown,
+                .raw_directory_sync => error.VisibleNotDurable,
+                else => unreachable,
+            };
+            try t.expectError(primary_error, store.publishRawFault("candidate.log", "boot1.log", source, &fault));
+            try t.expectEqual(primary_error, store.recording_failure.?);
+            try t.expect(fault.named_scratch != null);
+            const name = std.fmt.hex(fault.named_scratch.?);
+            const published = publication_failure == .raw_directory_sync;
+            try t.expectEqual(@as(usize, if (published) 0 else 1), fault.delete_attempts);
+            try t.expectEqual(@as(usize, if (published or cleanup_failure == .delete) 0 else 1), fault.sync_attempts);
+            if (published) try expectFile(store.directory, "boot1.log", padded_raw) else try expectMissing(store.directory, "boot1.log");
+            if (!published and cleanup_failure == .delete) {
+                const leftover = try store.directory.openFile(io, &name);
+                leftover.close(io);
+            } else try expectMissing(store.directory, &name);
+            const result = store.finish(failedCompletion(.@"boot1-deploy-intent", 17));
+            try t.expectEqual(@as(u8, 17), result.exit_code);
+            try t.expectEqual(@as(u8, 1), result.outcome.cleanup_exit);
+            try t.expectEqual(primary_error, result.recording_error.?);
+            if (published or cleanup_failure == .none) {
+                try t.expect(result.cleanup_error == null);
+            } else try t.expectEqual(
+                if (cleanup_failure == .delete) error.InjectedScratchDeleteFailure else error.InjectedScratchSyncFailure,
+                result.cleanup_error.?,
+            );
+        }
+    }
+}
