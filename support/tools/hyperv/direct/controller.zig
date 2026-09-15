@@ -51,6 +51,13 @@ pub fn primaryStatus(policy: CallPolicy, code: u8) ?u8 {
     return if (policy == .required and code != 0) code else null;
 }
 
+pub fn checkScopeEvidence(store: *custody.Store, primary: *u8) !void {
+    store.verifyScope() catch |err| {
+        if (primary.* == 0) primary.* = 1;
+        return err;
+    };
+}
+
 pub fn finalExit(result: custody.FinalResult, signal: ?u8) u8 {
     custody.requireDurable(result.recording) catch
         return if (result.outcome.primary_exit != 0) result.outcome.primary_exit else 1;
@@ -743,8 +750,11 @@ fn Controller(comptime Hooks: type) type {
                     self.cleanup_exit = 1;
                     self.log("final input custody failed: {s}\n", .{@errorName(err)});
                 };
-                // finish independently checks scope/boot proof before acceptance.
-                // A previous byte-proof refusal is not the final validator exit.
+                checkScopeEvidence(self.store, &self.primary_exit) catch |err| {
+                    self.log("final scope evidence refused: {s}\n", .{@errorName(err)});
+                };
+                // Proof rechecks never rewrite the independently bounded
+                // final-input result, including an already known refusal.
                 if (self.complete) self.verifyFinal() catch |err| {
                     if (self.primary_exit == 0) self.primary_exit = 1;
                     self.log("final primary evidence refused: {s}\n", .{@errorName(err)});

@@ -169,6 +169,56 @@ test "uploader lock handoff retains the original inode without holding the worke
     try local.verifyLock(io, &writer);
 }
 
+test "late scope proof refusal is recorded without replacing final-input or earlier primary status" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var writer = try fixture.directory.lock(io);
+    defer writer.close(io);
+    const bytes = try custody.encode(a, @import("observation_fixtures.zig").scope);
+    defer a.free(bytes);
+    try custody.requireDurable(try writer.createImmutable(io, "source.json", bytes));
+    const ledger = try local.directory(io, fixture.directory, "ledger");
+    defer ledger.close(io);
+    const base = try std.fmt.allocPrint(a, "{s}/{s}", .{ support.options.test_root.?, fixture.name });
+    defer a.free(base);
+    const source_path = try std.fs.path.join(a, &.{ base, "source.json" });
+    defer a.free(source_path);
+    const attempt_path = try std.fs.path.join(a, &.{ base, "attempt" });
+    defer a.free(attempt_path);
+    const ledger_path = try std.fs.path.join(a, &.{ base, "ledger" });
+    defer a.free(ledger_path);
+    var store = try custody.Store.create(a, io, source_path, attempt_path, ledger_path);
+    defer store.close();
+    var earlier_primary: u8 = 12;
+    try controller.checkScopeEvidence(&store, &earlier_primary);
+    {
+        const changed = try store.directory.dir.createFile(io, "scope.json", .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
+        defer changed.close(io);
+        try changed.writePositionalAll(io, " \n", store.scope_pin.metadata.size);
+        try changed.sync(io);
+    }
+    try t.expectError(error.FileChanged, controller.checkScopeEvidence(&store, &earlier_primary));
+    try t.expectEqual(@as(u8, 12), earlier_primary);
+    var new_primary: u8 = 0;
+    try t.expectError(error.FileChanged, controller.checkScopeEvidence(&store, &new_primary));
+    try t.expectEqual(@as(u8, 1), new_primary);
+    try t.expect(!store.healthy);
+    try store.event(.@"cleanup-intent");
+    const result = store.finish(.{
+        .phase = .@"local-admission",
+        .primary_exit = earlier_primary,
+        .cleanup_exit = 0,
+        .persistence_evidence_complete = false,
+        .owned_group_absent = false,
+        .group_creation_attempted = false,
+        .final_input_exit = 0,
+    });
+    try custody.requireDurable(result.recording);
+    try t.expectEqual(@as(u8, 12), result.exit_code);
+    try t.expectEqual(@as(u8, 0), result.outcome.cleanup_exit);
+    try t.expect(!result.outcome.accepted);
+}
+
 fn finalResult(primary: u8, cleanup: u8, accepted: bool) custody.FinalResult {
     return .{
         .outcome = .{
