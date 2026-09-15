@@ -985,7 +985,7 @@ jobs:
               "-Doptimize=${mode}" --summary all
         done
 
-    - name: Run native Hyper-V linked-image proof and compiler-probe fixtures
+    - name: Run focused Hyper-V regressions
       run: |
         bash .github/scripts/hyperv-native-proofs-ci.sh
 
@@ -1166,12 +1166,6 @@ jobs:
             '{"error":"native-preparation-and-authority-binding-required","schema":"uk-hyperv-preflight-unavailable-v1"}' \
             "${root}/${mode}/stderr"
         done
-
-    - name: Run focused Hyper-V regressions
-      run: |
-        set -euo pipefail
-        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/regression-zig-local-cache"
-        zig build -j2 test-hyperv-regression --summary all
 
     - name: Fetch pinned application-network stack
       if: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}

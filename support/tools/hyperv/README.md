@@ -106,8 +106,14 @@ transfer build in ReleaseSafe, without implicit source-tree fetching.
 The `zig-hyperv` image producer also invokes
 `.github/scripts/hyperv-native-public-fixtures.sh` for the public-image Debug
 and ReleaseSafe packaging/export/import suites, and
-`.github/scripts/hyperv-native-proofs-ci.sh` for linked-image proofs and
-compiler probes. These credential-free CI helpers run from the repository
+`.github/scripts/hyperv-native-proofs-ci.sh` for linked-image proofs, compiler
+probes and focused regressions in one build graph/cache namespace. Regression
+already depends on the proof and compiler selectors; the combined invocation
+retains the full target union and proof-tool installation without running those
+dependencies twice. Proof unit coverage still selects both optimization modes
+internally, and the workflow retains separate Debug/ReleaseSafe object-verifier
+passes. The broad regression target retains its legacy Python dependencies.
+These credential-free CI helpers run from the repository
 root with the workflow's pinned tools and `RUNNER_TEMP` setup. Public-image
 dependencies are restored beside copied manifests outside the checkout;
 optimization modes retain separate caches, fixture roots and installed tools.
