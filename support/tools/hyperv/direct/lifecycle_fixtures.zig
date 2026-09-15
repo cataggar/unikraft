@@ -20,7 +20,7 @@ const one = f.oneOf;
 const starts = f.starts;
 const expect = f.expect;
 const Case = inventory.Case;
-const Backend = enum { reference, native };
+const Backend = f.Backend;
 const Config = struct {
     backend: Backend,
     controller: []const u8,
@@ -100,6 +100,7 @@ fn run(init: std.process.Init) !void {
     try template(base);
     var regression_count = try comparisonRegressions(base);
     try base.writeJson("comparison-regressions.json", .{ .assertions = regression_count });
+    regression_count += try @import("lifecycle_fixture_compat.zig").run(base, cfg.fake);
     try base.writeJson("runner.json", .{ .backend = cfg.backend, .controller = cfg.controller, .legacy_case_count = inventory.cases.len, .process_case_count = inventory.process_cases.len });
     var count: usize = 0;
     var failed: usize = 0;
@@ -146,6 +147,7 @@ fn artifact(c: f.Context, name: []const u8, size: u64) !validation.Artifact {
 fn setup(c: f.Context, cfg: Config, name: []const u8) !void {
     try c.mkdir("ledger");
     try c.write("ISOLATED_OFFLINE_FIXTURE", f.marker);
+    try c.writeJson("fixture-backend.json", .{ .backend = cfg.backend });
     try c.write("scenario", try std.mem.concat(c.a, u8, &.{ name, "\n" }));
     try c.write("fake-cloud.json", "{\"exists\":false,\"boots\":0,\"power\":\"deallocated\"}\n");
     try c.write("calls", "");
@@ -1058,14 +1060,7 @@ fn jsonEqual(left: std.json.Value, right: std.json.Value) bool {
 }
 
 fn template(c: f.Context) !void {
-    const repository = c.root[0..std.mem.indexOf(u8, c.root, "/.d/").?];
-    const path = try std.mem.concat(c.a, u8, &.{ repository, "/support/azure/hyperv-direct-two-boot.json" });
-    const file = try f.files.openAbsolute(c.io, path, .artifact);
-    defer file.close(c.io);
-    const size = (try file.stat(c.io)).size;
-    try expect(size < 65536);
-    const bytes = try c.a.alloc(u8, @intCast(size));
-    try expect(try file.readPositionalAll(c.io, bytes, 0) == bytes.len);
+    const bytes = try f.referenceTemplate(c);
     const resources = try f.field(try f.parse(c.a, bytes), "resources");
     try expect(resources == .array and resources.array.items.len == 4);
     var vm: ?std.json.Value = null;

@@ -31,9 +31,7 @@ const Fake = struct {
     }
     fn output(self: Fake, bytes: []const u8) !void {
         if (std.mem.indexOf(u8, bytes, f.sentinel) != null) {
-            const stat = try f.files.snapshot(std.Io.File.stdout());
-            try f.expect(stat.mode & 0o777 == 0o600 and stat.mode & 0o170000 == 0o100000 and
-                stat.uid == std.os.linux.getuid() and stat.nlink == 1);
+            try f.grantOutput(self.c, std.Io.File.stdout());
         }
         var out = std.Io.File.stdout().writerStreaming(self.c.io, &.{});
         try out.interface.writeAll(bytes);
@@ -376,11 +374,7 @@ const Options = struct {
                     try f.expect(item.object.count() == 1 and eq(try f.str(item, "value"), parameter[1]));
                 }
             } else if (eq(flag, "--template-file")) {
-                try f.expect(std.fs.path.isAbsolute(value));
-                const normalized = try std.fs.path.resolve(c.a, &.{value});
-                try f.files.absoluteFilePath(normalized);
-                const repository = c.root[0..std.mem.indexOf(u8, c.root, "/.d/").?];
-                try f.expect(eq(normalized, try std.mem.concat(c.a, u8, &.{ repository, "/support/azure/hyperv-direct-two-boot.json" })));
+                try f.deploymentTemplate(c, value);
             } else {
                 const expected: []const u8 = if (eq(flag, "--location")) "fixture" else if (eq(flag, "--upload-type")) "Upload" else if (eq(flag, "--sku")) "StandardSSD_LRS" else if (eq(flag, "--os-type")) "Linux" else if (eq(flag, "--hyper-v-generation")) "V2" else if (eq(flag, "--access-level")) "Write" else if (eq(flag, "--duration-in-seconds")) "1800" else "";
                 if (eq(flag, "--upload-size-bytes")) {
