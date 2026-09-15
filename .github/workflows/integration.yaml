@@ -750,6 +750,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
+      attestations: read
       contents: read
     defaults:
       run:
@@ -772,6 +773,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
+      attestations: read
       contents: read
     defaults:
       run:
@@ -917,6 +919,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
+      attestations: read
       contents: read
     defaults:
       run:
@@ -1116,8 +1119,9 @@ jobs:
 
   zig-hyperv:
     name: zig-hyperv
-    # Schedule the guard even when a fixture failed, was cancelled, or skipped.
-    if: ${{ always() }}
+    # Keep the real producer cancelable; the separate completion gate rejects
+    # every non-success result, including a producer cancelled before starting.
+    if: ${{ !cancelled() }}
     needs:
     - zig-hyperv-public-debug
     - zig-hyperv-runtime
@@ -1584,14 +1588,32 @@ jobs:
         retention-days: 7
         if-no-files-found: warn
 
-    # Cancellation after the initial guard must not turn this always-scheduled
-    # required context green, even when evidence upload succeeds.
-    - name: Preserve Hyper-V workflow cancellation
-      if: ${{ cancelled() }}
+  zig-hyperv-complete:
+    name: zig-hyperv-complete
+    if: ${{ always() }}
+    needs:
+    - zig-hyperv-public-debug
+    - zig-hyperv-runtime
+    - zig-hyperv-build-protocol
+    - zig-hyperv
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+    - name: Require every Hyper-V fixture and the real producer to succeed
+      if: ${{ always() }}
+      shell: bash
+      env:
+        PUBLIC_DEBUG_RESULT: ${{ needs.zig-hyperv-public-debug.result }}
+        RUNTIME_RESULT: ${{ needs.zig-hyperv-runtime.result }}
+        BUILD_PROTOCOL_RESULT: ${{ needs.zig-hyperv-build-protocol.result }}
+        PRODUCER_RESULT: ${{ needs.zig-hyperv.result }}
       run: |
         set -euo pipefail
-        echo "Hyper-V integration was cancelled; image work cannot qualify." >&2
-        exit 1
+        test "${PUBLIC_DEBUG_RESULT:-}" = success
+        test "${RUNTIME_RESULT:-}" = success
+        test "${BUILD_PROTOCOL_RESULT:-}" = success
+        test "${PRODUCER_RESULT:-}" = success
 
   zig-helloworld-arm64:
     name: zig-helloworld-arm64

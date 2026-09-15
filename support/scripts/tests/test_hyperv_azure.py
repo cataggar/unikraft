@@ -2267,7 +2267,12 @@ class HypervWorkflowTest(unittest.TestCase):
             header = job.split("    steps:\n", 1)[0]
             with self.subTest(lane=lane):
                 self.assertIn("    runs-on: ubuntu-24.04\n", header)
-                self.assertIn("    permissions:\n      contents: read\n", header)
+                self.assertIn(
+                    "    permissions:\n"
+                    "      attestations: read\n"
+                    "      contents: read\n",
+                    header,
+                )
                 self.assertIn("        persist-credentials: false\n", job)
                 self.assertIn("uses: ./.github/actions/hyperv-fixture-setup", job)
                 for forbidden in ("    if:", "    needs:", "    strategy:",
@@ -2279,7 +2284,7 @@ class HypervWorkflowTest(unittest.TestCase):
                 for target in targets:
                     self.assertIn(target, job)
         producer = workflow.split("  zig-hyperv:\n", 1)[1].split(
-            "\n  zig-helloworld-arm64:", 1
+            "\n  zig-hyperv-complete:", 1
         )[0]
         for target in (
             "hyperv-native-public-fixtures.sh ReleaseSafe",
@@ -2297,15 +2302,16 @@ class HypervWorkflowTest(unittest.TestCase):
         ):
             self.assertIn(target, producer)
 
-    def test_fixture_fan_in_and_workflow_cancellation_fail_closed(self):
+    def test_producer_dependency_guard_is_failure_aware_and_cancelable(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/integration.yaml"
         ).read_text()
         job = workflow.split("  zig-hyperv:\n", 1)[1].split(
-            "\n  zig-helloworld-arm64:", 1
+            "\n  zig-hyperv-complete:", 1
         )[0]
         header, steps = job.split("    steps:\n", 1)
-        self.assertIn("    if: ${{ always() }}\n", header)
+        self.assertIn("    if: ${{ !cancelled() }}\n", header)
+        self.assertNotIn("always()", header)
         self.assertIn(
             "    needs:\n"
             "    - zig-hyperv-public-debug\n"
@@ -2328,17 +2334,7 @@ class HypervWorkflowTest(unittest.TestCase):
         self.assertTrue(all(not line or line.startswith(" " * 8)
                             for line in lines))
         script = "\n".join(line[8:] for line in lines)
-        terminal = job.split(
-            "    - name: Preserve Hyper-V workflow cancellation\n", 1
-        )[1]
-        self.assertTrue(terminal.startswith(
-            "      if: ${{ cancelled() }}\n"
-        ))
-        lines = terminal.split("      run: |\n", 1)[1].splitlines()
-        self.assertTrue(all(not line or line.startswith(" " * 8)
-                            for line in lines))
-        cancellation_script = "\n".join(line[8:] for line in lines)
-        for step in steps.split("\n    - ")[1:-1]:
+        for step in steps.split("\n    - ")[1:]:
             if step.startswith("name: Retain bounded local image evidence\n"):
                 self.assertIn(
                     "      if: ${{ always() && "
@@ -2348,35 +2344,96 @@ class HypervWorkflowTest(unittest.TestCase):
             else:
                 self.assertIn("      if: ${{ success() && !cancelled()", step)
         self.assertNotIn("continue-on-error:", job)
+        self.assertNotIn("Preserve Hyper-V workflow cancellation", job)
+        self.assertNotIn("if: ${{ cancelled() }}", job)
         self.assertIn("    name: zig-hyperv\n", header)
         self.assertIn("    timeout-minutes: 60\n", header)
         names = ("PUBLIC_DEBUG_RESULT", "RUNTIME_RESULT",
                  "BUILD_PROTOCOL_RESULT")
         # Actions maps timeouts to failure; also refuse a literal timeout result.
         results = ("success", "failure", "cancelled", "timed_out", "skipped", "")
-        for cancelled, *children in itertools.product(
-            ("false", "true"), results, results, results
-        ):
-            with self.subTest(cancelled=cancelled, children=children):
+        for children in itertools.product(results, repeat=3):
+            with self.subTest(children=children):
                 env = dict(os.environ)
                 env.update(zip(names, children))
                 result = subprocess.run(
                     ["bash", "-c", script], env=env, capture_output=True,
                     text=True, timeout=10,
                 )
-                passed = result.returncode == 0
-                # Execute the actual terminal refusal under its exact cancelled()
-                # condition, including cancellation after all children succeeded.
-                if cancelled == "true":
-                    terminal_result = subprocess.run(
-                        ["bash", "-c", cancellation_script],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    self.assertNotEqual(terminal_result.returncode, 0)
-                    passed = passed and terminal_result.returncode == 0
                 self.assertEqual(
-                    passed,
-                    cancelled == "false" and
+                    result.returncode == 0,
+                    all(child == "success" for child in children),
+                )
+        for missing in names:
+            env = dict(os.environ)
+            env.update(dict.fromkeys(names, "success"))
+            env.pop(missing)
+            result = subprocess.run(
+                ["bash", "-c", script], env=env, capture_output=True,
+                text=True, timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0, missing)
+
+    def test_completion_guard_requires_all_four_actual_results(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        job = workflow.split("  zig-hyperv-complete:\n", 1)[1].split(
+            "\n  zig-helloworld-arm64:", 1
+        )[0]
+        header, steps = job.split("    steps:\n", 1)
+        self.assertIn("    name: zig-hyperv-complete\n", header)
+        self.assertIn("    if: ${{ always() }}\n", header)
+        self.assertIn("    permissions: {}\n", header)
+        self.assertIn("    timeout-minutes: 5\n", header)
+        self.assertEqual(
+            header.split("    needs:\n", 1)[1].split("    runs-on:", 1)[0],
+            "    - zig-hyperv-public-debug\n"
+            "    - zig-hyperv-runtime\n"
+            "    - zig-hyperv-build-protocol\n"
+            "    - zig-hyperv\n",
+        )
+        self.assertEqual(steps.count("    - "), 1)
+        self.assertTrue(steps.startswith(
+            "    - name: Require every Hyper-V fixture and the real producer to succeed\n"
+        ))
+        self.assertIn("      if: ${{ always() }}\n", steps)
+        self.assertIn("      shell: bash\n", steps)
+        for forbidden in ("uses:", "outputs:", "continue-on-error:",
+                          "strategy:", "source-job", "cancelled()"):
+            self.assertNotIn(forbidden, job)
+        bindings = (
+            ("PUBLIC_DEBUG_RESULT", "zig-hyperv-public-debug"),
+            ("RUNTIME_RESULT", "zig-hyperv-runtime"),
+            ("BUILD_PROTOCOL_RESULT", "zig-hyperv-build-protocol"),
+            ("PRODUCER_RESULT", "zig-hyperv"),
+        )
+        for name, dependency in bindings:
+            self.assertIn(
+                f"        {name}: ${{{{ needs.{dependency}.result }}}}\n", steps
+            )
+        lines = steps.split("      run: |\n", 1)[1].splitlines()
+        self.assertTrue(all(not line or line.startswith(" " * 8)
+                            for line in lines))
+        script = "\n".join(line[8:] for line in lines).strip()
+        names = tuple(name for name, _ in bindings)
+        self.assertEqual(
+            script.splitlines(),
+            ["set -euo pipefail"] +
+            [f'test "${{{name}:-}}" = success' for name in names],
+        )
+        # Exercise result admission only, not propagation of server cancellation.
+        results = ("success", "failure", "cancelled", "timed_out", "skipped", "")
+        for children in itertools.product(results, repeat=4):
+            with self.subTest(children=children):
+                env = dict(os.environ)
+                env.update(zip(names, children))
+                result = subprocess.run(
+                    ["bash", "-c", script], env=env, capture_output=True,
+                    text=True, timeout=10,
+                )
+                self.assertEqual(
+                    result.returncode == 0,
                     all(child == "success" for child in children),
                 )
         for missing in names:

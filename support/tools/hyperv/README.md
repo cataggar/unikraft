@@ -115,30 +115,51 @@ unchanged required **real image producer**, whose job ID and display name remain
 | `zig-hyperv-runtime` | Operator custody; core/transfer/worker in both modes; standalone ReleaseSafe transfer; persistence in both modes including `test-arm`, `test-strip-equivalence`, `test-strip-proof` and parked CLI refusal; direct `test test-foundation test-controller test-lifecycle-native install`, unfiltered (85 foundation + 18 controller tests, 94 lifecycle cases / 890 controls). |
 | `zig-hyperv-build-protocol` | Build tools; explicit private Make positive/refusal; object/ABI proofs with both outer Debug/ReleaseSafe passes; consolidated image/compiler/regression graph; host in both modes and synthetic-key cross-compile size bound; postprocess on both fixture arches; ARM/credential and preflight in both modes including parked CLI refusal. |
 | `zig-hyperv` | Local-boot fixtures in both modes; all 28 ReleaseSafe public-image tests/install; standalone pinned miz; fresh acceptance/SMP solve/build and proofs; separately pinned native QEMU acquisition; native and legacy exact-image four-boot APIC paths; two-CPU SMP boot; native export/import/reload and bounded evidence; unchanged opt-in legacy #87 prepared-image outputs. |
+| `zig-hyperv-complete` | Result-only guard requiring all three fixtures and the real producer to report `success`; no checkout, tools, image work, outputs or artifacts. |
 
 ```text
 zig-hyperv-public-debug ---+
 zig-hyperv-runtime --------+--> zig-hyperv: dependency guard -> real producer
-zig-hyperv-build-protocol -+                                -> cancellation guard
+zig-hyperv-build-protocol -+
+
+all three fixture results + zig-hyperv result
+  -> zig-hyperv-complete: require all four successes
 
 zig-hyperv-preparation remains independently scheduled and required.
-All other required jobs and context names are unchanged.
+All eleven existing required contexts are retained; completion is additive.
 ```
 
-The producer explicitly needs all three fixture jobs. Job-level `always()`
-schedules its first, checkout-free guard even when a child fails, is cancelled,
-times out (Actions reports failure), is missing, or unexpectedly skips. Every
-named result must equal `success`. All image/setup steps additionally require
-`success() && !cancelled()`. The final `cancelled()` step exits unsuccessfully,
-including cancellation after a successful initial guard; a successful evidence
-upload is never authority to qualify images or hide failure/cancellation.
-The existing Python unittest workflow tests execute the actual guard bodies
-over all 216 dependency combinations both with and without workflow cancellation,
-plus unset bindings. This is deterministic orchestration coverage, not a claim
-to emulate the Actions scheduler.
+The producer explicitly needs all three fixture jobs and uses job-level
+`!cancelled()`, not `always()`, so a running producer can actually be cancelled.
+Its first, checkout-free guard requires all three named results to equal
+`success`, including when a failed or skipped dependency permits scheduling.
+Image/setup steps additionally require `success() && !cancelled()`. A skipped
+producer is never interpreted as successful.
 
-Each fixture job has only `contents: read`, disables checkout credential
-persistence, and runs on its own ordinary-user Ubuntu runner. The shared local
+The separate `zig-hyperv-complete` job explicitly needs all four results and
+uses job-level `always()` only for its single result-checking step. Its guard
+rejects missing, failed, cancelled, timed-out (normally reported as failure),
+or skipped fixture/producer results, including a producer cancelled before
+starting. It has `permissions: {}` and a five-minute timeout. It is not the
+image producer and does not emit source-job fields or image artifacts.
+Cancellation truth comes from the cancelable producer and the actual job
+results, not an assumed independent workflow-cancellation signal in an
+always-running job. If all four jobs actually completed successfully before
+a later workflow cancellation, the result-only completion guard can succeed;
+it does not claim retroactive cancellation of completed work.
+
+The existing Python unittest workflow tests execute the actual producer guard
+over all 216 three-result combinations and the actual completion guard over
+all 1,296 four-result combinations, plus individually unset bindings. They
+enforce the job scheduling policies structurally. This is deterministic
+result-checking coverage, not an Actions scheduler emulator or proof of
+cancellation-message propagation. A successful evidence upload is never
+authority to hide a non-success job result.
+
+Each fixture job grants only `contents: read` and `attestations: read`, disables
+checkout credential persistence, and runs on its own ordinary-user Ubuntu
+runner. Attestation read access is required by the pinned ghr bootstrap and
+downstream public verification; verification is not skipped. The shared local
 setup action independently restores pinned compiler/LLVM/shared-QEMU inputs and
 private cache directories; it is not a central prerequisite for other jobs.
 There are no cross-job tool/image artifacts or shared mutable caches, ledgers,
@@ -149,6 +170,36 @@ must not already exist. Existing namespace/host-isolation fixtures retain their
 supported Actions context and must not be run by spoofing that context on a
 shared development host. No Azure credentials, OIDC grants, runner enrollment,
 seed production, resource creation, cloud admission or recovery are added.
+
+### User-approved additive required context
+
+The user explicitly approved adding `zig-hyperv-complete`, not replacing or
+renaming any existing required context. The intended twelve-context protection
+set retains GitHub Actions app **15368**, strict/up-to-date checks and admin
+enforcement:
+
+- `libc-test (qemu, x86_64)`
+- `self-test (qemu, x86_64)`
+- `helloworld (qemu, x86_64)`
+- `helloworld (qemu, arm64)`
+- `helloworld (xen, x86_64)`
+- `helloworld (fc, x86_64)`
+- `zig-helloworld`
+- `zig-helloworld-arm64`
+- `static-analysis`
+- `zig-hyperv`
+- `zig-hyperv-preparation`
+- `zig-hyperv-complete` (additive)
+
+Publication and protection activation remain parent/integrator-owned. After
+the protected predecessor merge, independent review and affected qualification,
+publish the lane PR **without auto-merge**. Once the new Actions check has
+emitted, add its approved required context and verify all eleven old contexts,
+app bindings, strictness and admin enforcement remain intact. Only then enable
+exact-head protected auto-merge. This workflow change does not itself modify
+branch protection or authorize any cloud activation.
+
+### Existing helper contracts and measurements
 
 `.github/scripts/hyperv-native-public-fixtures.sh` accepts one optional mode,
 `Debug` or `ReleaseSafe`; no argument still runs both. Each invocation restores
@@ -176,7 +227,8 @@ subshells so the aggregate reports `total` on success and failure.
 
 This partition has **no measured latency claim**. The model target is at most
 35 minutes median across at least five comparable cold all-required-context
-runs; retain the 60-minute required-context timeout. Future naturally occurring
+runs; retain the real producer's 60-minute timeout. The result-only completion
+guard has its own five-minute timeout. Future naturally occurring
 Actions runs must report queue delay separately, cold setup/restoration overhead,
 critical-path elapsed time and total runner-minutes, plus median and maximum.
 Do not dispatch a benchmark fleet implicitly. Native QEMU `v11.0.50-z.7` and
