@@ -51,6 +51,17 @@ pub fn primaryStatus(policy: CallPolicy, code: u8) ?u8 {
     return if (policy == .required and code != 0) code else null;
 }
 
+pub fn finalExit(result: custody.FinalResult, signal: ?u8) u8 {
+    custody.requireDurable(result.recording) catch
+        return if (result.outcome.primary_exit != 0) result.outcome.primary_exit else 1;
+    if (result.exit_code == 0 and (result.evidence_error != null or result.recording_error != null or
+        result.cleanup_error != null or !result.outcome.accepted)) return 1;
+    if (result.exit_code == 0) {
+        if (signal) |number| return 128 + number;
+    }
+    return result.exit_code;
+}
+
 pub fn errorExit(err: anyerror, cancellation: *const process.SignalCancellation) u8 {
     return switch (err) {
         error.Cancelled => if (cancellation.signal()) |signal| 128 + signal else 130,
@@ -64,6 +75,9 @@ pub fn processExit(result: process.PrivateResult, cancellation: *const process.S
     if (result.execution.failures.primary) |failure| {
         if (failure.category == .cancelled) return errorExit(error.Cancelled, cancellation);
         if (failure.category == .timeout) return 124;
+        // Match the reference's file-size refusal, not the supervisor's TERM.
+        // The actual child termination remains independent in process records.
+        if (failure.category == .output_limit) return 128 + @intFromEnum(std.os.linux.SIG.XFSZ);
     }
     if (result.execution.termination) |termination| switch (termination) {
         .exited => |code| if (code != 0) return code,
@@ -71,6 +85,17 @@ pub fn processExit(result: process.PrivateResult, cancellation: *const process.S
         else => {},
     };
     return if (result.succeeded()) 0 else 1;
+}
+
+pub const ChildTermination = struct { exit: ?u8 = null, signal: ?u32 = null, stopped: ?u32 = null, unknown: ?u32 = null };
+
+pub fn childTermination(result: process.PrivateResult) ChildTermination {
+    return if (result.execution.termination) |termination| switch (termination) {
+        .exited => |code| .{ .exit = code },
+        .signal => |signal| .{ .signal = @intFromEnum(signal) },
+        .stopped => |signal| .{ .stopped = @intFromEnum(signal) },
+        .unknown => |status| .{ .unknown = status },
+    } else .{};
 }
 
 pub const Native = struct {
@@ -152,13 +177,7 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
         .failure_diagnostics = controller.diagnostics,
         .final_input_exit = controller.final_input_exit,
     });
-    custody.requireDurable(final.recording) catch
-        return if (final.outcome.primary_exit != 0) final.outcome.primary_exit else 1;
-    if (final.exit_code == 0 and (final.recording_error != null or final.cleanup_error != null or !final.outcome.accepted))
-        return 1;
-    if (final.exit_code == 0 and cancellation.flag().load(.acquire))
-        return errorExit(error.Cancelled, &cancellation);
-    return final.exit_code;
+    return finalExit(final, cancellation.signal());
 }
 
 fn Controller(comptime Hooks: type) type {
@@ -268,6 +287,7 @@ fn Controller(comptime Hooks: type) type {
                 .lane = lane,
                 .policy = policy,
                 .exit = status,
+                .termination = childTermination(result),
                 .capture = result.capture,
                 .stdout_bytes = result.stdout_bytes,
                 .stderr_bytes = result.stderr_bytes,
@@ -709,19 +729,25 @@ fn Controller(comptime Hooks: type) type {
                 self.cleanup_exit = 1;
             };
             if (!self.poisoned) {
-                self.final_input_exit = self.validate(.cleanup, "final-input-check", .inputs, &.{}) catch 1;
+                self.final_input_exit = self.validate(.cleanup, "final-input-check", .inputs, &.{}) catch |err| blk: {
+                    self.cleanup_exit = 1;
+                    self.log("final input validation unavailable: {s}\n", .{@errorName(err)});
+                    break :blk null;
+                };
                 // Independent local checks do not prevent authorized deletion.
-                self.source.verify(self.io) catch {
-                    self.final_input_exit = 1;
+                self.source.verify(self.io) catch |err| {
+                    self.cleanup_exit = 1;
+                    self.log("final source custody failed: {s}\n", .{@errorName(err)});
                 };
-                if (self.references) |references| references.verify(self.io) catch {
-                    self.final_input_exit = 1;
+                if (self.references) |references| references.verify(self.io) catch |err| {
+                    self.cleanup_exit = 1;
+                    self.log("final input custody failed: {s}\n", .{@errorName(err)});
                 };
-                self.store.verifyScope() catch {
-                    self.final_input_exit = 1;
-                };
-                if (self.complete) self.verifyFinal() catch {
-                    self.final_input_exit = 1;
+                // finish independently checks scope/boot proof before acceptance.
+                // A previous byte-proof refusal is not the final validator exit.
+                if (self.complete) self.verifyFinal() catch |err| {
+                    if (self.primary_exit == 0) self.primary_exit = 1;
+                    self.log("final primary evidence refused: {s}\n", .{@errorName(err)});
                 };
             }
         }

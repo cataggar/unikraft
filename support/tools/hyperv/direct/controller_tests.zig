@@ -59,6 +59,15 @@ test "child exit timeout cancellation and capture outcomes remain distinct" {
     try t.expectEqual(@as(u8, 124), controller.processExit(result, &cancellation));
     result.execution.failures.primary = null;
     try t.expectEqual(@as(u8, 143), controller.processExit(result, &cancellation));
+    result.execution.failures.primary = .{ .stage = .process_run, .category = .output_limit };
+    result.capture = .overflow;
+    try t.expectEqual(@as(u8, 153), controller.processExit(result, &cancellation));
+    try t.expectEqual(@as(?u32, 15), controller.childTermination(result).signal);
+    try t.expectEqual(@as(?u8, null), controller.childTermination(result).exit);
+    result.execution.termination = .{ .exited = 12 };
+    try t.expectEqual(@as(u8, 153), controller.processExit(result, &cancellation));
+    try t.expectEqual(@as(?u8, 12), controller.childTermination(result).exit);
+    result.execution.failures.primary = null;
     result.execution.termination = .{ .exited = 0 };
     for ([_]core.process.CaptureState{ .partial, .overflow, .io_failed, .durability_failed }) |capture| {
         result.capture = capture;
@@ -160,36 +169,55 @@ test "uploader lock handoff retains the original inode without holding the worke
     try local.verifyLock(io, &writer);
 }
 
-test "custody uncertainty conservatively retains cleanup failure without erasing primary exit" {
-    var fixture = try support.Fixture.init();
-    defer fixture.deinit();
-    var writer = try fixture.directory.lock(io);
-    defer writer.close(io);
-    // No accepted evidence is asserted, so finishing only needs the private
-    // record writer and capability cleanup, not synthetic scope/artifact data.
-    var store: custody.Store = .{
-        .allocator = a,
-        .io = io,
-        .directory = fixture.directory,
-        .writer = writer,
-        .ledger = fixture.directory,
-        .scope = undefined,
-        .scope_bytes = undefined,
-        .scope_pin = undefined,
-        .healthy = false,
+fn finalResult(primary: u8, cleanup: u8, accepted: bool) custody.FinalResult {
+    return .{
+        .outcome = .{
+            .phase = .@"persistence-evidence-complete",
+            .primary_exit = primary,
+            .cleanup_exit = cleanup,
+            .reserved_boots = 2,
+            .persistence_evidence_complete = true,
+            .owned_group_absent = true,
+            .group_creation_attempted = true,
+            .failure_diagnostics = .{},
+            .boot2_freshness = .{ .cached_reads = 0, .cached_reason = null },
+            .accepted = accepted,
+        },
+        .recording = .{ .status = .durable },
+        .exit_code = if (primary != 0) primary else if (accepted) 0 else 1,
     };
-    const finished = store.finish(.{
-        .phase = .@"boot2-start-intent",
-        .primary_exit = 17,
-        .cleanup_exit = 0,
-        .persistence_evidence_complete = false,
-        .owned_group_absent = true,
-        .group_creation_attempted = true,
-        .final_input_exit = 0,
-    });
-    try custody.requireDurable(finished.recording);
-    try t.expectEqual(@as(u8, 17), finished.exit_code);
-    try t.expectEqual(@as(u8, 17), finished.outcome.primary_exit);
-    try t.expectEqual(@as(u8, 1), finished.outcome.cleanup_exit);
-    try t.expect(!finished.outcome.accepted);
+}
+
+test "final evidence refusal does not become cleanup failure or erase primary status" {
+    var result = finalResult(17, 0, false);
+    result.evidence_error = error.FileChanged;
+    try t.expectEqual(@as(u8, 17), controller.finalExit(result, null));
+    try t.expectEqual(@as(u8, 17), controller.finalExit(result, 15));
+    try t.expectEqual(@as(u8, 0), result.outcome.cleanup_exit);
+    result.recording.status = .publication_unknown;
+    try t.expectEqual(@as(u8, 17), controller.finalExit(result, null));
+}
+
+test "final result rejects every uncertainty and retains a late cancellation" {
+    const success = finalResult(0, 0, true);
+    try t.expectEqual(@as(u8, 0), controller.finalExit(success, null));
+    try t.expectEqual(@as(u8, 143), controller.finalExit(success, 15));
+    inline for (.{ "evidence_error", "recording_error", "cleanup_error" }) |field| {
+        var result = success;
+        @field(result, field) = error.Injected;
+        try t.expectEqual(@as(u8, 1), controller.finalExit(result, null));
+    }
+    for ([_]core.private_files.CommitStatus{ .not_committed, .publication_unknown, .visible_not_durable }) |status| {
+        var result = success;
+        result.recording.status = status;
+        try t.expectEqual(@as(u8, 1), controller.finalExit(result, null));
+    }
+    inline for (.{ "primary", "cleanup", "recording" }) |field| {
+        var result = success;
+        @field(result.recording.failures, field) = .{ .stage = .state_record, .category = .local_io };
+        try t.expectEqual(@as(u8, 1), controller.finalExit(result, null));
+    }
+    var refused = success;
+    refused.outcome.accepted = false;
+    try t.expectEqual(@as(u8, 1), controller.finalExit(refused, null));
 }
