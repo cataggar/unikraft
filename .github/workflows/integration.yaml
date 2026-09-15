@@ -745,249 +745,51 @@ jobs:
         retention-days: 7
         if-no-files-found: error
 
-  zig-hyperv:
-    name: zig-hyperv
+  zig-hyperv-public-debug:
+    name: zig-hyperv-public-debug
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    outputs:
-      prepared_image_manifest_sha256: ${{ steps.hyperv_prepared_image.outputs.manifest_sha256 }}
-      prepared_image_artifact: ${{ steps.hyperv_prepared_image.outputs.artifact_name }}
     permissions:
       attestations: read
       contents: read
     defaults:
       run:
         shell: bash
-
     steps:
-    - name: Install checkout, build, and OVMF dependencies
-      run: |
-        set -euxo pipefail
-        export DEBIAN_FRONTEND=noninteractive
-        # This job needs only Ubuntu packages, not optional runner repositories.
-        test -s /etc/apt/sources.list.d/ubuntu.sources
-        ubuntu_apt=(
-          -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
-          -o Dir::Etc::sourceparts=-
-        )
-        sudo apt-get "${ubuntu_apt[@]}" update
-        sudo apt-get "${ubuntu_apt[@]}" install -y --no-install-recommends \
-          bison \
-          ca-certificates \
-          curl \
-          file \
-          flex \
-          git \
-          libncurses-dev \
-          make \
-          ovmf \
-          patch \
-          python3 \
-          python3-venv \
-          tar \
-          unzip \
-          wget \
-          xz-utils
-        sudo rm -rf /var/lib/apt/lists/*
-
     - uses: actions/checkout@v4
       with:
         submodules: recursive
+        persist-credentials: false
 
-    - name: Load configuration
-      uses: ./.github/actions/ci-versions
+    - name: Restore independent fixture tools
+      uses: ./.github/actions/hyperv-fixture-setup
 
-    - name: Fetch pinned miz source
-      uses: actions/checkout@v4
-      with:
-        repository: cataggar/miz
-        ref: 2db68ca0c3ab12155012a823c3fb8d7aba1cb544
-        fetch-depth: 1
-        path: .d/ci-miz
-
-    - name: Download LLVM and QEMU tools
-      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
-      env:
-        GH_TOKEN: ${{ github.token }}
-      with:
-        ghr-version: v0.8.0
-        tools: |
-          cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
-          cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
-        dest: ${{ runner.temp }}/hyperv-tools
-        extract: 'true'
-        strip-components: '1'
-
-    - name: Add LLVM and QEMU tools to PATH
+    - name: Run native public Hyper-V Debug packaging, export and import fixtures
       run: |
-        set -euo pipefail
-        tools="${RUNNER_TEMP}/hyperv-tools"
-        for command in \
-          "${tools}/bin/llvm-nm" \
-          "${tools}/bin/llvm-objcopy" \
-          "${tools}/bin/llvm-objdump" \
-          "${tools}/bin/llvm-readelf" \
-          "${tools}/bin/llvm-strip" \
-          "${tools}/qemu-system-x86_64"; do
-          test -x "${command}"
-        done
-        {
-          echo "${tools}/bin"
-          echo "${tools}"
-        } >> "${GITHUB_PATH}"
+        bash .github/scripts/hyperv-native-public-fixtures.sh Debug
 
-    - name: Install Zig with ghr
-      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
-      env:
-        GH_TOKEN: ${{ github.token }}
+  zig-hyperv-runtime:
+    name: zig-hyperv-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
       with:
-        ghr-version: v0.8.0
-        tools: |
-          cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+        submodules: recursive
+        persist-credentials: false
 
-    - name: Configure bounded local tool directories
-      run: |
-        set -euo pipefail
-        root="${RUNNER_TEMP}/hyperv-ci"
-        mkdir -p \
-          "${root}/cache" \
-          "${root}/tmp" \
-          "${root}/zig-global-cache"
-        {
-          echo "TMPDIR=${root}/tmp"
-          echo "XDG_CACHE_HOME=${root}/cache"
-          echo "ZIG_GLOBAL_CACHE_DIR=${root}/zig-global-cache"
-          echo 'MAKEFLAGS=-j2'
-        } >> "${GITHUB_ENV}"
-
-    - name: Install pinned Hyper-V controller dependencies
-      run: |
-        set -euo pipefail
-        venv="${RUNNER_TEMP}/hyperv-ci/python"
-        python3 -m venv "${venv}"
-        "${venv}/bin/python" -m pip install \
-          --disable-pip-version-check -r support/azure/requirements.txt
-        PYTHONPATH=support/scripts "${venv}/bin/python" -c \
-          'import hyperv_private_preflight as p; p.sdk_dependency_contract()'
-        echo "${venv}/bin" >> "${GITHUB_PATH}"
+    - name: Restore independent fixture tools
+      uses: ./.github/actions/hyperv-fixture-setup
 
     - name: Run native Hyper-V operator custody fixtures
       run: |
         bash support/tools/hyperv/operator_guard/ci-fixtures.sh
-
-    - name: Build pinned miz EFI application tooling
-      run: |
-        set -euo pipefail
-        test "$(zig version)" = "${ZIG_VERSION}"
-        test "$(git -C .d/ci-miz rev-parse HEAD)" = "${MIZ_REVISION}"
-        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/miz-zig-local-cache"
-        (
-          cd .d/ci-miz
-          zig build -j2 install-miz \
-            -Doptimize=ReleaseSafe \
-            --prefix "${RUNNER_TEMP}/hyperv-ci/miz"
-        )
-        miz="${RUNNER_TEMP}/hyperv-ci/miz/bin/miz"
-        test -x "${miz}"
-        "${miz}" build-efi-application --help
-        "${miz}" check-efi-application --help
-
-    - name: Run native configuration, linker, and LTO fixtures
-      run: |
-        set -euo pipefail
-        root="${RUNNER_TEMP}/hyperv-ci/native-build-tools"
-        ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
-          zig build -j2 test-build-tools "-Doutput=${root}/build" \
-            --summary all
-
-    - name: Run native public Hyper-V local-boot fixtures
-      run: |
-        set -euo pipefail
-        umask 077
-        root="${RUNNER_TEMP}/hyperv-ci/native-local-boot"
-        for mode in Debug ReleaseSafe; do
-          mkdir -p "${root}/${mode}/fixtures"
-          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
-            zig build --build-file support/tools/hyperv/local_boot/build.zig \
-              --cache-dir "${root}/${mode}/zig-local-cache" \
-              --prefix "${root}/${mode}/out" \
-              -Dtest-root="${root}/${mode}/fixtures" \
-              -Doptimize="${mode}" -j2 test install --summary all
-        done
-
-    - name: Run native public Hyper-V packaging, export and import fixtures
-      run: |
-        bash .github/scripts/hyperv-native-public-fixtures.sh
-
-    - name: Exercise explicit private native Make configuration
-      run: |
-        set -euo pipefail
-        export PATH="/usr/bin:/bin:${GHR_BIN_DIR}"
-        umask 077
-        root="${RUNNER_TEMP}/hyperv-ci/native-make-environment"
-        mkdir -p "${root}"/{tmp,cache,config,zig-local,zig-global}
-        root="$(readlink -f "${root}")"
-        # Hosted /usr/share can be writable; keep fixture data in a private copy.
-        cp -R --no-preserve=mode,ownership \
-          "$(/usr/bin/bison --print-datadir)" "${root}/bison-data"
-        for mode in Debug ReleaseSafe; do
-          zig build -j2 test-native-make-environment \
-            --cache-dir "${root}/tests" \
-            --global-cache-dir "${root}/zig-global" \
-            "-Doutput=${root}/test-build" "-Doptimize=${mode}" \
-            --summary all
-        done
-        printf '{"bison_data":"%s","m4":"%s","schema":"unikraft_native_make_environment_v1","shell":"%s","tmp":"%s","xdg_cache":"%s","xdg_config":"%s","zig_global_cache":"%s","zig_local_cache":"%s"}\n' \
-          "${root}/bison-data" \
-          "$(readlink -f /usr/bin/m4)" \
-          "$(readlink -f /usr/bin/bash)" \
-          "${root}/tmp" "${root}/cache" "${root}/config" \
-          "${root}/zig-global" "${root}/zig-local" > "${root}/environment.json"
-        cp support/apps/hyperv-acceptance/defconfig "${root}/input.config"
-        chmod 600 "${root}/input.config"
-        umask 022
-        zig build -j2 olddefconfig \
-          --cache-dir "${root}/zig-local" \
-          --global-cache-dir "${root}/zig-global" \
-          "-Dnative-make-environment=${root}/environment.json" \
-          -Dmake-command=/usr/bin/make \
-          "-Dapp=${GITHUB_WORKSPACE}/support/apps/hyperv-acceptance" \
-          "-Doutput=${root}/build" "-Dconfig=${root}/input.config" \
-          "-Dcompiler=zig cc -target x86_64-freestanding-none" \
-          -Dcompiler-targeted=true "-Dhost-cc=zig cc" "-Dhost-cxx=zig c++" \
-          -Dhost-cflags=-fno-sanitize=null
-        test "$(stat -c %a "${root}/input.config")" = 600
-        grep --fixed-strings --line-regexp --quiet \
-          CONFIG_APPHYPERVACCEPTANCE=y "${root}/input.config"
-        chmod 644 "${root}/environment.json"
-        if zig build -j2 olddefconfig \
-          --cache-dir "${root}/zig-local" \
-          --global-cache-dir "${root}/zig-global" \
-          "-Dnative-make-environment=${root}/environment.json" \
-          "-Doutput=${root}/build" "-Dcompiler=zig cc" \
-          > "${root}/refusal.log" 2>&1; then
-          echo "non-private native Make environment was accepted" >&2
-          exit 1
-        fi
-        grep --fixed-strings --line-regexp --quiet \
-          'error: unable to load explicit native Make environment: UnsafeFile' \
-          "${root}/refusal.log"
-
-    - name: Run native Hyper-V object and ABI verifier fixtures
-      run: |
-        set -euo pipefail
-        for mode in Debug ReleaseSafe; do
-          root="${RUNNER_TEMP}/hyperv-ci/native-object-proofs-${mode}"
-          ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
-            zig build -j2 hyperv-object-proofs test-hyperv-object-proofs \
-              --cache-dir "${root}/zig-local-cache" \
-              --prefix "${root}/out" "-Doutput=${root}/build" \
-              "-Doptimize=${mode}" --summary all
-        done
-
-    - name: Run focused Hyper-V regressions
-      run: |
-        bash .github/scripts/hyperv-native-proofs-ci.sh
 
     - name: Run native Hyper-V core, transfer, and worker fixtures
       run: |
@@ -1071,6 +873,154 @@ jobs:
             "${root}/${mode}/stderr"
         done
         sha256sum --check "${root}/fixture-objcopy-sha256.txt"
+
+    - name: Exercise the direct Azure lifecycle without cloud access
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/direct"
+        parent="${GITHUB_WORKSPACE}/.d/direct-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        mkdir -p "${root}/tmp" "${root}/fixtures" "${GITHUB_WORKSPACE}/.d"
+        mkdir -m 0700 "${parent}"
+        export TMPDIR="${root}/tmp"
+        zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
+          --cache-dir "${root}/cache" --global-cache-dir "${root}/global" \
+          --prefix "${root}/tools" -Doptimize=ReleaseSafe \
+          -Dtest-root="${root}/fixtures" \
+          -Dlifecycle-root="${parent}/native" \
+          test test-foundation test-controller test-lifecycle-native install
+
+    - name: Retain bounded runtime fixture evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-runtime-evidence
+        path: |
+          ${{ runner.temp }}/hyperv-ci/native-operator-guard/baseline.log
+          ${{ runner.temp }}/hyperv-ci/native-operator-guard/namespace-denial.log
+          ${{ runner.temp }}/hyperv-ci/native-operator-guard/fixture-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-version.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/zig-local-cache/**/hyperv-persistence-worker-fixture
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stdout
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stderr
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/zig-local-cache/**/hyperv-persistence-worker-fixture
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stdout
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stderr
+        retention-days: 7
+        if-no-files-found: warn
+
+  zig-hyperv-build-protocol:
+    name: zig-hyperv-build-protocol
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        persist-credentials: false
+
+    - name: Restore independent fixture tools
+      uses: ./.github/actions/hyperv-fixture-setup
+
+    - name: Install pinned Hyper-V controller dependencies
+      run: |
+        set -euo pipefail
+        venv="${RUNNER_TEMP}/hyperv-ci/python"
+        python3 -m venv "${venv}"
+        "${venv}/bin/python" -m pip install \
+          --disable-pip-version-check -r support/azure/requirements.txt
+        PYTHONPATH=support/scripts "${venv}/bin/python" -c \
+          'import hyperv_private_preflight as p; p.sdk_dependency_contract()'
+        echo "${venv}/bin" >> "${GITHUB_PATH}"
+
+    - name: Run native configuration, linker, and LTO fixtures
+      run: |
+        set -euo pipefail
+        root="${RUNNER_TEMP}/hyperv-ci/native-build-tools"
+        ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+          zig build -j2 test-build-tools "-Doutput=${root}/build" \
+            --summary all
+
+    - name: Exercise explicit private native Make configuration
+      run: |
+        set -euo pipefail
+        export PATH="/usr/bin:/bin:${GHR_BIN_DIR}"
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-make-environment"
+        mkdir -p "${root}"/{tmp,cache,config,zig-local,zig-global}
+        root="$(readlink -f "${root}")"
+        # Hosted /usr/share can be writable; keep fixture data in a private copy.
+        cp -R --no-preserve=mode,ownership \
+          "$(/usr/bin/bison --print-datadir)" "${root}/bison-data"
+        for mode in Debug ReleaseSafe; do
+          zig build -j2 test-native-make-environment \
+            --cache-dir "${root}/tests" \
+            --global-cache-dir "${root}/zig-global" \
+            "-Doutput=${root}/test-build" "-Doptimize=${mode}" \
+            --summary all
+        done
+        printf '{"bison_data":"%s","m4":"%s","schema":"unikraft_native_make_environment_v1","shell":"%s","tmp":"%s","xdg_cache":"%s","xdg_config":"%s","zig_global_cache":"%s","zig_local_cache":"%s"}\n' \
+          "${root}/bison-data" \
+          "$(readlink -f /usr/bin/m4)" \
+          "$(readlink -f /usr/bin/bash)" \
+          "${root}/tmp" "${root}/cache" "${root}/config" \
+          "${root}/zig-global" "${root}/zig-local" > "${root}/environment.json"
+        cp support/apps/hyperv-acceptance/defconfig "${root}/input.config"
+        chmod 600 "${root}/input.config"
+        umask 022
+        zig build -j2 olddefconfig \
+          --cache-dir "${root}/zig-local" \
+          --global-cache-dir "${root}/zig-global" \
+          "-Dnative-make-environment=${root}/environment.json" \
+          -Dmake-command=/usr/bin/make \
+          "-Dapp=${GITHUB_WORKSPACE}/support/apps/hyperv-acceptance" \
+          "-Doutput=${root}/build" "-Dconfig=${root}/input.config" \
+          "-Dcompiler=zig cc -target x86_64-freestanding-none" \
+          -Dcompiler-targeted=true "-Dhost-cc=zig cc" "-Dhost-cxx=zig c++" \
+          -Dhost-cflags=-fno-sanitize=null
+        test "$(stat -c %a "${root}/input.config")" = 600
+        grep --fixed-strings --line-regexp --quiet \
+          CONFIG_APPHYPERVACCEPTANCE=y "${root}/input.config"
+        chmod 644 "${root}/environment.json"
+        if zig build -j2 olddefconfig \
+          --cache-dir "${root}/zig-local" \
+          --global-cache-dir "${root}/zig-global" \
+          "-Dnative-make-environment=${root}/environment.json" \
+          "-Doutput=${root}/build" "-Dcompiler=zig cc" \
+          > "${root}/refusal.log" 2>&1; then
+          echo "non-private native Make environment was accepted" >&2
+          exit 1
+        fi
+        grep --fixed-strings --line-regexp --quiet \
+          'error: unable to load explicit native Make environment: UnsafeFile' \
+          "${root}/refusal.log"
+
+    - name: Run native Hyper-V object and ABI verifier fixtures
+      run: |
+        set -euo pipefail
+        for mode in Debug ReleaseSafe; do
+          root="${RUNNER_TEMP}/hyperv-ci/native-object-proofs-${mode}"
+          ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+            zig build -j2 hyperv-object-proofs test-hyperv-object-proofs \
+              --cache-dir "${root}/zig-local-cache" \
+              --prefix "${root}/out" "-Doutput=${root}/build" \
+              "-Doptimize=${mode}" --summary all
+        done
+
+    - name: Run focused Hyper-V regressions
+      run: |
+        bash .github/scripts/hyperv-native-proofs-ci.sh
 
     - name: Run native agentless Hyper-V host fixtures
       run: |
@@ -1167,29 +1117,208 @@ jobs:
             "${root}/${mode}/stderr"
         done
 
+  zig-hyperv:
+    name: zig-hyperv
+    # Keep the real producer cancelable; the separate completion gate rejects
+    # every non-success result, including a producer cancelled before starting.
+    if: ${{ !cancelled() }}
+    needs:
+    - zig-hyperv-public-debug
+    - zig-hyperv-runtime
+    - zig-hyperv-build-protocol
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      prepared_image_manifest_sha256: ${{ steps.hyperv_prepared_image.outputs.manifest_sha256 }}
+      prepared_image_artifact: ${{ steps.hyperv_prepared_image.outputs.artifact_name }}
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Require every Hyper-V fixture lane to succeed
+      id: hyperv_dependencies
+      if: ${{ always() }}
+      env:
+        PUBLIC_DEBUG_RESULT: ${{ needs.zig-hyperv-public-debug.result }}
+        RUNTIME_RESULT: ${{ needs.zig-hyperv-runtime.result }}
+        BUILD_PROTOCOL_RESULT: ${{ needs.zig-hyperv-build-protocol.result }}
+      run: |
+        set -euo pipefail
+        test "${PUBLIC_DEBUG_RESULT:-}" = success
+        test "${RUNTIME_RESULT:-}" = success
+        test "${BUILD_PROTOCOL_RESULT:-}" = success
+
+    - name: Install checkout, build, and OVMF dependencies
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        # This job needs only Ubuntu packages, not optional runner repositories.
+        test -s /etc/apt/sources.list.d/ubuntu.sources
+        ubuntu_apt=(
+          -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+          -o Dir::Etc::sourceparts=-
+        )
+        sudo apt-get "${ubuntu_apt[@]}" update
+        sudo apt-get "${ubuntu_apt[@]}" install -y --no-install-recommends \
+          bison \
+          ca-certificates \
+          curl \
+          file \
+          flex \
+          git \
+          libncurses-dev \
+          make \
+          ovmf \
+          patch \
+          python3 \
+          python3-venv \
+          tar \
+          unzip \
+          wget \
+          xz-utils
+        sudo rm -rf /var/lib/apt/lists/*
+
+    - uses: actions/checkout@v4
+      if: ${{ success() && !cancelled() }}
+      with:
+        submodules: recursive
+
+    - name: Load configuration
+      if: ${{ success() && !cancelled() }}
+      uses: ./.github/actions/ci-versions
+
+    - name: Fetch pinned miz source
+      if: ${{ success() && !cancelled() }}
+      uses: actions/checkout@v4
+      with:
+        repository: cataggar/miz
+        ref: 2db68ca0c3ab12155012a823c3fb8d7aba1cb544
+        fetch-depth: 1
+        path: .d/ci-miz
+
+    - name: Download LLVM and QEMU tools
+      if: ${{ success() && !cancelled() }}
+      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.8.0
+        tools: |
+          cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+        dest: ${{ runner.temp }}/hyperv-tools
+        extract: 'true'
+        strip-components: '1'
+
+    - name: Add LLVM and QEMU tools to PATH
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        tools="${RUNNER_TEMP}/hyperv-tools"
+        for command in \
+          "${tools}/bin/llvm-nm" \
+          "${tools}/bin/llvm-objcopy" \
+          "${tools}/bin/llvm-objdump" \
+          "${tools}/bin/llvm-readelf" \
+          "${tools}/bin/llvm-strip" \
+          "${tools}/qemu-system-x86_64"; do
+          test -x "${command}"
+        done
+        {
+          echo "${tools}/bin"
+          echo "${tools}"
+        } >> "${GITHUB_PATH}"
+
+    - name: Install Zig with ghr
+      if: ${{ success() && !cancelled() }}
+      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.8.0
+        tools: |
+          cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+    - name: Configure bounded local tool directories
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        root="${RUNNER_TEMP}/hyperv-ci"
+        mkdir -p \
+          "${root}/cache" \
+          "${root}/tmp" \
+          "${root}/zig-global-cache"
+        {
+          echo "TMPDIR=${root}/tmp"
+          echo "XDG_CACHE_HOME=${root}/cache"
+          echo "ZIG_GLOBAL_CACHE_DIR=${root}/zig-global-cache"
+          echo 'MAKEFLAGS=-j2'
+        } >> "${GITHUB_ENV}"
+
+    - name: Install pinned Hyper-V controller dependencies
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        venv="${RUNNER_TEMP}/hyperv-ci/python"
+        python3 -m venv "${venv}"
+        "${venv}/bin/python" -m pip install \
+          --disable-pip-version-check -r support/azure/requirements.txt
+        PYTHONPATH=support/scripts "${venv}/bin/python" -c \
+          'import hyperv_private_preflight as p; p.sdk_dependency_contract()'
+        echo "${venv}/bin" >> "${GITHUB_PATH}"
+
+    - name: Build pinned miz EFI application tooling
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        test "$(zig version)" = "${ZIG_VERSION}"
+        test "$(git -C .d/ci-miz rev-parse HEAD)" = "${MIZ_REVISION}"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/miz-zig-local-cache"
+        (
+          cd .d/ci-miz
+          zig build -j2 install-miz \
+            -Doptimize=ReleaseSafe \
+            --prefix "${RUNNER_TEMP}/hyperv-ci/miz"
+        )
+        miz="${RUNNER_TEMP}/hyperv-ci/miz/bin/miz"
+        test -x "${miz}"
+        "${miz}" build-efi-application --help
+        "${miz}" check-efi-application --help
+
+    - name: Run native public Hyper-V local-boot fixtures
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-local-boot"
+        for mode in Debug ReleaseSafe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/local_boot/build.zig \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dtest-root="${root}/${mode}/fixtures" \
+              -Doptimize="${mode}" -j2 test install --summary all
+        done
+
+    - name: Run native public Hyper-V ReleaseSafe packaging, export and import fixtures
+      if: ${{ success() && !cancelled() }}
+      run: |
+        bash .github/scripts/hyperv-native-public-fixtures.sh ReleaseSafe
+
     - name: Fetch pinned application-network stack
-      if: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
+      if: ${{ success() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
       run: |
         set -euo pipefail
         make -C support/apps/hyperv-acceptance network-stack
 
-    - name: Exercise the direct Azure lifecycle without cloud access
-      run: |
-        set -euo pipefail
-        umask 077
-        root="${RUNNER_TEMP}/hyperv-ci/direct"
-        parent="${GITHUB_WORKSPACE}/.d/direct-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-        mkdir -p "${root}/tmp" "${root}/fixtures" "${GITHUB_WORKSPACE}/.d"
-        mkdir -m 0700 "${parent}"
-        export TMPDIR="${root}/tmp"
-        zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
-          --cache-dir "${root}/cache" --global-cache-dir "${root}/global" \
-          --prefix "${root}/tools" -Doptimize=ReleaseSafe \
-          -Dtest-root="${root}/fixtures" \
-          -Dlifecycle-root="${parent}/native" \
-          test test-foundation test-controller test-lifecycle-native install
-
     - name: Solve and build native Hyper-V acceptance and SMP images
+      if: ${{ success() && !cancelled() }}
       env:
         HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
       run: |
@@ -1262,6 +1391,7 @@ jobs:
         done
 
     - name: Record local image digests
+      if: ${{ success() && !cancelled() }}
       run: |
         set -euo pipefail
         build="${RUNNER_TEMP}/hyperv-ci/build"
@@ -1275,10 +1405,12 @@ jobs:
           > "${RUNNER_TEMP}/hyperv-ci/smp-image-sha256.txt"
 
     - name: Acquire the separately pinned native public QEMU runtime
+      if: ${{ success() && !cancelled() }}
       run: |
         bash .github/scripts/hyperv-native-qemu-acquire.sh "${RUNNER_TEMP}/hyperv-ci/native-qemu"
 
     - name: Prepare and boot native raw GPT and fixed VHD in both APIC modes
+      if: ${{ success() && !cancelled() }}
       env:
         HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
         QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
@@ -1289,6 +1421,7 @@ jobs:
           "${RUNNER_TEMP}/hyperv-ci" "${HYPERV_NETWORK_APPLICATION}"
 
     - name: Boot exact raw GPT and fixed VHD in both APIC modes
+      if: ${{ success() && !cancelled() }}
       env:
         HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
       run: |
@@ -1333,6 +1466,7 @@ jobs:
         PY
 
     - name: Boot the fixed scheduled-SMP workload on two CPUs
+      if: ${{ success() && !cancelled() }}
       run: |
         set -euo pipefail
         umask 077
@@ -1364,7 +1498,7 @@ jobs:
         sha256sum --check "${RUNNER_TEMP}/hyperv-ci/smp-disk-sha256.txt"
 
     - name: Export exact prepared Hyper-V image
-      if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
+      if: ${{ success() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
       id: hyperv_prepared_image
       run: |
         set -euo pipefail
@@ -1399,7 +1533,7 @@ jobs:
         } >> "${GITHUB_STEP_SUMMARY}"
 
     - name: Retain explicitly requested exact prepared image
-      if: ${{ github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
+      if: ${{ success() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
       uses: actions/upload-artifact@v4
       with:
         name: zig-hyperv-prepared-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1411,26 +1545,11 @@ jobs:
         if-no-files-found: error
 
     - name: Retain bounded local image evidence
-      if: always()
+      if: ${{ always() && steps.hyperv_dependencies.outcome == 'success' }}
       uses: actions/upload-artifact@v4
       with:
         name: zig-hyperv-local-evidence
         path: |
-          ${{ runner.temp }}/hyperv-ci/native-operator-guard/baseline.log
-          ${{ runner.temp }}/hyperv-ci/native-operator-guard/namespace-denial.log
-          ${{ runner.temp }}/hyperv-ci/native-operator-guard/fixture-sha256.txt
-          ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-version.txt
-          ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-sha256.txt
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixtures.log
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/zig-local-cache/**/hyperv-persistence-worker-fixture
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stdout
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stderr
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixtures.log
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/zig-local-cache/**/hyperv-persistence-worker-fixture
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stdout
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stderr
           ${{ runner.temp }}/hyperv-ci/image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-disk-sha256.txt
@@ -1468,6 +1587,33 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/apt.conf
         retention-days: 7
         if-no-files-found: warn
+
+  zig-hyperv-complete:
+    name: zig-hyperv-complete
+    if: ${{ always() }}
+    needs:
+    - zig-hyperv-public-debug
+    - zig-hyperv-runtime
+    - zig-hyperv-build-protocol
+    - zig-hyperv
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+    - name: Require every Hyper-V fixture and the real producer to succeed
+      if: ${{ always() }}
+      shell: bash
+      env:
+        PUBLIC_DEBUG_RESULT: ${{ needs.zig-hyperv-public-debug.result }}
+        RUNTIME_RESULT: ${{ needs.zig-hyperv-runtime.result }}
+        BUILD_PROTOCOL_RESULT: ${{ needs.zig-hyperv-build-protocol.result }}
+        PRODUCER_RESULT: ${{ needs.zig-hyperv.result }}
+      run: |
+        set -euo pipefail
+        test "${PUBLIC_DEBUG_RESULT:-}" = success
+        test "${RUNTIME_RESULT:-}" = success
+        test "${BUILD_PROTOCOL_RESULT:-}" = success
+        test "${PRODUCER_RESULT:-}" = success
 
   zig-helloworld-arm64:
     name: zig-helloworld-arm64

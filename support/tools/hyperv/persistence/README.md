@@ -500,7 +500,7 @@ production admission.
 
 #### Selected synthetic integration CI
 
-The `integration` workflow's native `zig-hyperv` persistence-fixture step
+The `integration` workflow's native `zig-hyperv-runtime` persistence-fixture step
 explicitly selects verified stripped worker copies in Debug and ReleaseSafe.
 It uses the already acquired pinned LLVM 22.1.8 distribution, an absolute
 objcopy path and explicit file-offset-relayout policy. Version evidence and
@@ -508,7 +508,9 @@ the executable hash are retained, with a final hash recheck.
 
 Each mode runs the engine, affected ARM and shared ELF/proof cases together
 with installation, behind the fresh native verifier and a private per-mode
-report. Raw/candidate cache binaries, reports and fixture logs are retained.
+report. Raw/candidate cache binaries, reports and fixture logs are retained in
+`zig-hyperv-runtime-evidence`. This lane must succeed before the unchanged real
+`zig-hyperv` image producer can run.
 Timing remains default-off. The installed CLI is not stripped and must still
 refuse with `production_bindings_unavailable`; direct build defaults and all
 runtime hashing, deadlines and production gates remain unchanged. This CI
