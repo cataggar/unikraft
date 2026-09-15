@@ -51,6 +51,18 @@ pub fn primaryStatus(policy: CallPolicy, code: u8) ?u8 {
     return if (policy == .required and code != 0) code else null;
 }
 
+pub fn recordCaptureFailure(store: *custody.Store, lane: Lane, primary: *u8, capture: process.CaptureState, status: u8) ?anyerror {
+    const err = switch (capture) {
+        .io_failed => error.CaptureIoFailed,
+        .durability_failed => error.CaptureDurabilityFailed,
+        .complete, .partial, .overflow => return null,
+    };
+    std.debug.assert(status != 0);
+    store.recordingFailed(err);
+    if (lane == .primary and primary.* == 0) primary.* = status;
+    return err;
+}
+
 pub fn checkScopeEvidence(store: *custody.Store, primary: *u8) !void {
     store.verifyScope() catch |err| {
         if (primary.* == 0) primary.* = 1;
@@ -187,6 +199,14 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
     return finalExit(final, cancellation.signal());
 }
 
+pub const testing = if (@import("builtin").is_test) struct {
+    pub const State = Controller(Native);
+
+    pub fn cleanup(state: *State) void {
+        state.cleanup();
+    }
+} else struct {};
+
 fn Controller(comptime Hooks: type) type {
     return struct {
         const Self = @This();
@@ -288,23 +308,28 @@ fn Controller(comptime Hooks: type) type {
             if (lane == .primary) {
                 if (primaryStatus(policy, status)) |code| self.primary_exit = code;
             }
+            const capture_error = recordCaptureFailure(self.store, lane, &self.primary_exit, result.capture, status);
             // Process/capture/cleanup lanes remain visible even on child exits.
-            const record = try custody.encode(self.a, .{
-                .role = role,
-                .lane = lane,
-                .policy = policy,
-                .exit = status,
-                .termination = childTermination(result),
-                .capture = result.capture,
-                .stdout_bytes = result.stdout_bytes,
-                .stderr_bytes = result.stderr_bytes,
-                .cleanup_complete = result.execution.cleanup_complete,
-                .failures = result.execution.failures,
-            });
-            custody.requireDurable(try self.store.writer.createImmutable(self.io, try self.fmt("{s}.process.json", .{label}), record)) catch |err| {
-                self.cleanup_exit = 1;
-                return err;
-            };
+            {
+                errdefer |err| {
+                    self.store.recordingFailed(err);
+                    self.cleanup_exit = 1;
+                }
+                const record = try custody.encode(self.a, .{
+                    .role = role,
+                    .lane = lane,
+                    .policy = policy,
+                    .exit = status,
+                    .termination = childTermination(result),
+                    .capture = result.capture,
+                    .stdout_bytes = result.stdout_bytes,
+                    .stderr_bytes = result.stderr_bytes,
+                    .cleanup_complete = result.execution.cleanup_complete,
+                    .failures = result.execution.failures,
+                });
+                try custody.requireDurable(try self.store.writer.createImmutable(self.io, try self.fmt("{s}.process.json", .{label}), record));
+            }
+            if (capture_error) |err| return err;
             if (lane == .primary) try self.verifyPrimary() else try self.verifyTools();
             if (self.poisoned) return error.UnresolvedCleanup;
             return status;
@@ -721,6 +746,7 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn cleanup(self: *Self) void {
+            defer self.finalCustody();
             self.runtime.budgets.beginCleanup() catch {
                 self.cleanup_exit = 1;
                 return;
@@ -741,25 +767,29 @@ fn Controller(comptime Hooks: type) type {
                     self.log("final input validation unavailable: {s}\n", .{@errorName(err)});
                     break :blk null;
                 };
-                // Independent local checks do not prevent authorized deletion.
-                self.source.verify(self.io) catch |err| {
-                    self.cleanup_exit = 1;
-                    self.log("final source custody failed: {s}\n", .{@errorName(err)});
-                };
-                if (self.references) |references| references.verify(self.io) catch |err| {
-                    self.cleanup_exit = 1;
-                    self.log("final input custody failed: {s}\n", .{@errorName(err)});
-                };
-                checkScopeEvidence(self.store, &self.primary_exit) catch |err| {
-                    self.log("final scope evidence refused: {s}\n", .{@errorName(err)});
-                };
-                // Proof rechecks never rewrite the independently bounded
-                // final-input result, including an already known refusal.
-                if (self.complete) self.verifyFinal() catch |err| {
-                    if (self.primary_exit == 0) self.primary_exit = 1;
-                    self.log("final primary evidence refused: {s}\n", .{@errorName(err)});
-                };
             }
+        }
+
+        fn finalCustody(self: *Self) void {
+            // These local checks remain mandatory when supervision is poisoned
+            // or the cleanup budget cannot start; they never launch children.
+            self.source.verify(self.io) catch |err| {
+                self.cleanup_exit = 1;
+                self.log("final source custody failed: {s}\n", .{@errorName(err)});
+            };
+            if (self.references) |references| references.verify(self.io) catch |err| {
+                self.cleanup_exit = 1;
+                self.log("final input custody failed: {s}\n", .{@errorName(err)});
+            };
+            checkScopeEvidence(self.store, &self.primary_exit) catch |err| {
+                self.log("final scope evidence refused: {s}\n", .{@errorName(err)});
+            };
+            // Proof rechecks never rewrite the independently bounded
+            // final-input result, including an already known refusal.
+            if (self.complete) self.verifyFinal() catch |err| {
+                if (self.primary_exit == 0) self.primary_exit = 1;
+                self.log("final primary evidence refused: {s}\n", .{@errorName(err)});
+            };
         }
 
         fn cleanupGroup(self: *Self) !void {

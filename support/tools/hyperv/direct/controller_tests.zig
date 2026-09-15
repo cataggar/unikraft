@@ -8,6 +8,55 @@ const t = std.testing;
 const a = t.allocator;
 const io = t.io;
 const core = @import("hyperv_core");
+const runtime = @import("runtime.zig");
+
+const StoreFixture = struct {
+    backing: support.Fixture,
+    arena: std.heap.ArenaAllocator,
+    store: custody.Store,
+    source: []const u8,
+    attempt: []const u8,
+    ledger: []const u8,
+
+    fn init() !StoreFixture {
+        var backing = try support.Fixture.init();
+        errdefer backing.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const memory = arena.allocator();
+        var writer = try backing.directory.lock(io);
+        defer writer.close(io);
+        const bytes = try custody.encode(memory, @import("observation_fixtures.zig").scope);
+        try custody.requireDurable(try writer.createImmutable(io, "source.json", bytes));
+        const directory = try local.directory(io, backing.directory, "ledger");
+        defer directory.close(io);
+        const base = try std.fmt.allocPrint(memory, "{s}/{s}", .{ support.options.test_root.?, backing.name });
+        const source = try std.fs.path.join(memory, &.{ base, "source.json" });
+        const attempt = try std.fs.path.join(memory, &.{ base, "attempt" });
+        const ledger = try std.fs.path.join(memory, &.{ base, "ledger" });
+        return .{
+            .backing = backing,
+            .arena = arena,
+            .store = try custody.Store.create(a, io, source, attempt, ledger),
+            .source = source,
+            .attempt = attempt,
+            .ledger = ledger,
+        };
+    }
+
+    fn driftScope(self: *StoreFixture) !void {
+        const changed = try self.store.directory.dir.createFile(io, "scope.json", .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
+        defer changed.close(io);
+        try changed.writePositionalAll(io, " \n", self.store.scope_pin.metadata.size);
+        try changed.sync(io);
+    }
+
+    fn deinit(self: *StoreFixture) void {
+        self.store.close();
+        self.arena.deinit();
+        self.backing.deinit();
+    }
+};
 
 test "exact six-input CLI has no bypass or resume surface" {
     try t.expectError(error.InvalidArguments, controller.Inputs.parse(&.{}));
@@ -78,6 +127,110 @@ test "child exit timeout cancellation and capture outcomes remain distinct" {
     try t.expectEqual(@as(u8, 1), controller.processExit(result, &cancellation));
     try t.expectEqual(@as(u8, 125), controller.errorExit(error.ApprovalExpired, &cancellation));
     try t.expectEqual(@as(u8, 124), controller.errorExit(error.BudgetExhausted, &cancellation));
+}
+
+test "local capture failures permanently deny retry admission and preserve meaningful exits" {
+    var cancellation = try core.process.SignalCancellation.install();
+    defer cancellation.deinit();
+    for ([_]core.process.CaptureState{ .io_failed, .durability_failed }) |capture| {
+        for ([_]runtime.Lane{ .primary, .cleanup, .diagnostic }) |lane| {
+            for ([_]u8{ 0, 12 }) |child_exit| {
+                var fixture = try StoreFixture.init();
+                defer fixture.deinit();
+                const store = &fixture.store;
+                try store.consume();
+                const result: core.process.PrivateResult = .{
+                    .execution = .{ .termination = .{ .exited = child_exit } },
+                    .capture = capture,
+                    .stdout_bytes = 17,
+                    .stderr_bytes = 23,
+                };
+                const status = controller.processExit(result, &cancellation);
+                try t.expectEqual(@as(u8, if (child_exit == 0) 1 else child_exit), status);
+                var primary: u8 = 0;
+                const failure = controller.recordCaptureFailure(store, lane, &primary, capture, status) orelse return error.ExpectedCaptureFailure;
+                try t.expectEqual(@as(u8, if (lane == .primary) status else 0), primary);
+                try t.expect(store.recording_failure.? == failure);
+                try t.expect(!store.healthy);
+                try t.expectError(error.CustodyPoisoned, store.requireConsumed());
+                try t.expect(controller.recordCaptureFailure(store, lane, &primary, .complete, 0) == null);
+                try t.expect(!store.healthy);
+                var earlier_primary: u8 = 19;
+                const later_capture: core.process.CaptureState = if (capture == .io_failed) .durability_failed else .io_failed;
+                try t.expect(controller.recordCaptureFailure(store, lane, &earlier_primary, later_capture, 1) != null);
+                try t.expectEqual(@as(u8, 19), earlier_primary);
+                try t.expect(store.recording_failure.? == failure);
+                try store.event(.@"cleanup-intent");
+                const final = store.finish(.{
+                    .phase = .@"seed-consumed",
+                    .primary_exit = primary,
+                    .cleanup_exit = 0,
+                    .persistence_evidence_complete = false,
+                    .owned_group_absent = true,
+                    .group_creation_attempted = false,
+                    .final_input_exit = 0,
+                });
+                try custody.requireDurable(final.recording);
+                try t.expect(final.recording_error.? == failure);
+                try t.expectEqual(@as(u8, 1), final.outcome.cleanup_exit);
+                try t.expectEqual(primary, final.outcome.primary_exit);
+                try t.expect(!final.outcome.accepted);
+                try t.expect(final.exit_code != 0);
+            }
+        }
+    }
+}
+
+test "ordinary provider and overflow outcomes do not fabricate local recording failures" {
+    var fixture = try StoreFixture.init();
+    defer fixture.deinit();
+    try fixture.store.consume();
+    var primary: u8 = 0;
+    for ([_]core.process.CaptureState{ .complete, .partial, .overflow }) |capture| {
+        try t.expect(controller.recordCaptureFailure(&fixture.store, .primary, &primary, capture, if (capture == .overflow) 153 else 12) == null);
+        try t.expectEqual(@as(u8, 0), primary);
+        try t.expect(fixture.store.healthy);
+        try t.expect(fixture.store.recording_failure == null);
+        try fixture.store.requireConsumed();
+    }
+}
+
+test "real private write and sync failures remain refused after a successful synthetic poll" {
+    var cancellation = try core.process.SignalCancellation.install();
+    defer cancellation.deinit();
+    const executable = try support.executable();
+    defer a.free(executable);
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    for ([_]core.process.PrivateTestFault{ .capture_write, .sync }) |fault| {
+        var fixture = try StoreFixture.init();
+        defer fixture.deinit();
+        try fixture.store.consume();
+        var options: core.process.PrivateOptions = .{ .process = .{
+            .argv = &.{ executable, "bytes", "17", "23", "0" },
+            .environment = &environment,
+            .cwd = fixture.store.directory.dir,
+            .deadline = try core.process.Deadline.afterMilliseconds(3000),
+            .cleanup_ms = 3000,
+        } };
+        const failed = try core.process.runPrivateTest(a, io, &fixture.store.writer, "failed.stdout", "failed.stderr", options, fault);
+        try t.expectEqual(@as(core.process.CaptureState, if (fault == .sync) .durability_failed else .io_failed), failed.capture);
+        const status = controller.processExit(failed, &cancellation);
+        var primary: u8 = 0;
+        try t.expect(controller.recordCaptureFailure(&fixture.store, .primary, &primary, failed.capture, status) != null);
+        if (fault == .sync) {
+            try t.expectEqual(@as(?u8, 0), controller.childTermination(failed).exit);
+            try t.expectEqual(@as(u8, 1), primary);
+        }
+        options.process.deadline = try core.process.Deadline.afterMilliseconds(3000);
+        const next = try core.process.runPrivate(a, io, &fixture.store.writer, "next.stdout", "next.stderr", options);
+        try t.expect(next.succeeded());
+        try t.expect(controller.recordCaptureFailure(&fixture.store, .primary, &primary, next.capture, 0) == null);
+        try t.expectEqual(status, primary);
+        try t.expectError(error.CustodyPoisoned, fixture.store.requireConsumed());
+        try t.expect(fixture.store.recording_failure != null);
+        try support.noChildren();
+    }
 }
 
 test "scratch replacement never reuses immutable authoritative evidence names" {
@@ -206,37 +359,16 @@ test "uploader lock handoff retains the original inode without holding the worke
 }
 
 test "late scope proof refusal is recorded without replacing final-input or earlier primary status" {
-    var fixture = try support.Fixture.init();
+    var fixture = try StoreFixture.init();
     defer fixture.deinit();
-    var writer = try fixture.directory.lock(io);
-    defer writer.close(io);
-    const bytes = try custody.encode(a, @import("observation_fixtures.zig").scope);
-    defer a.free(bytes);
-    try custody.requireDurable(try writer.createImmutable(io, "source.json", bytes));
-    const ledger = try local.directory(io, fixture.directory, "ledger");
-    defer ledger.close(io);
-    const base = try std.fmt.allocPrint(a, "{s}/{s}", .{ support.options.test_root.?, fixture.name });
-    defer a.free(base);
-    const source_path = try std.fs.path.join(a, &.{ base, "source.json" });
-    defer a.free(source_path);
-    const attempt_path = try std.fs.path.join(a, &.{ base, "attempt" });
-    defer a.free(attempt_path);
-    const ledger_path = try std.fs.path.join(a, &.{ base, "ledger" });
-    defer a.free(ledger_path);
-    var store = try custody.Store.create(a, io, source_path, attempt_path, ledger_path);
-    defer store.close();
+    const store = &fixture.store;
     var earlier_primary: u8 = 12;
-    try controller.checkScopeEvidence(&store, &earlier_primary);
-    {
-        const changed = try store.directory.dir.createFile(io, "scope.json", .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
-        defer changed.close(io);
-        try changed.writePositionalAll(io, " \n", store.scope_pin.metadata.size);
-        try changed.sync(io);
-    }
-    try t.expectError(error.FileChanged, controller.checkScopeEvidence(&store, &earlier_primary));
+    try controller.checkScopeEvidence(store, &earlier_primary);
+    try fixture.driftScope();
+    try t.expectError(error.FileChanged, controller.checkScopeEvidence(store, &earlier_primary));
     try t.expectEqual(@as(u8, 12), earlier_primary);
     var new_primary: u8 = 0;
-    try t.expectError(error.FileChanged, controller.checkScopeEvidence(&store, &new_primary));
+    try t.expectError(error.FileChanged, controller.checkScopeEvidence(store, &new_primary));
     try t.expectEqual(@as(u8, 1), new_primary);
     try t.expect(!store.healthy);
     try store.event(.@"cleanup-intent");
@@ -253,6 +385,57 @@ test "late scope proof refusal is recorded without replacing final-input or earl
     try t.expectEqual(@as(u8, 12), result.exit_code);
     try t.expectEqual(@as(u8, 0), result.outcome.cleanup_exit);
     try t.expect(!result.outcome.accepted);
+}
+
+test "poisoned cleanup always audits new scope drift without running a final child" {
+    for ([_]bool{ false, true }) |cleanup_already_started| {
+        for ([_]u8{ 0, 17 }) |earlier_primary| {
+            var fixture = try StoreFixture.init();
+            defer fixture.deinit();
+            const memory = fixture.arena.allocator();
+            var cancellation = try core.process.SignalCancellation.install();
+            defer cancellation.deinit();
+            var environment: runtime.Environment = .{ .azure = .init(a), .native = .init(a) };
+            defer environment.deinit();
+            var budgets = try runtime.Budgets.start(fixture.store.scope.value);
+            if (cleanup_already_started) try budgets.beginCleanup();
+            const source = try core.private_files.openAbsolute(io, fixture.source, .private);
+            defer source.close(io);
+            const programs: runtime.Programs = .{
+                .azure = "/nonexistent-poisoned-controller-program",
+                .uploader = "/nonexistent-poisoned-controller-program",
+                .validator = "/nonexistent-poisoned-controller-program",
+            };
+            const expected = try @import("observations.zig").Expectations.init(memory, fixture.store.scope.value);
+            defer expected.deinit();
+            var state: controller.testing.State = .{
+                .a = memory,
+                .temporary = a,
+                .io = io,
+                .inputs = .{ .scope = fixture.source, .attempt = fixture.attempt, .ledger = fixture.ledger, .programs = programs },
+                .hooks = .{},
+                .store = &fixture.store,
+                .expected = expected,
+                .source = .{ .path = fixture.source, .policy = .private, .metadata = try core.private_files.snapshot(source) },
+                .runtime = .{ .allocator = a, .io = io, .programs = programs, .environment = &environment, .budgets = &budgets, .cancellation = &cancellation },
+                .poisoned = true,
+                .primary_exit = earlier_primary,
+            };
+            const run_id = fixture.store.scope.value.run_id;
+            try fixture.driftScope();
+            controller.testing.cleanup(&state);
+            try t.expectEqual(@as(u8, if (earlier_primary == 0) 1 else earlier_primary), state.primary_exit);
+            try t.expectEqual(@as(u8, 1), state.cleanup_exit);
+            try t.expectEqual(@as(?u8, null), state.final_input_exit);
+            try t.expect(!state.complete);
+            try t.expect(!fixture.store.healthy);
+            try t.expect(fixture.store.recording_failure == null);
+            try t.expectEqualStrings(run_id, fixture.store.scope.value.run_id);
+            try t.expect(std.mem.indexOf(u8, state.log_bytes.items, "final scope evidence refused: FileChanged") != null);
+            try t.expect(std.mem.indexOf(u8, state.log_bytes.items, "final input validation unavailable") == null);
+            try support.noChildren();
+        }
+    }
 }
 
 fn finalResult(primary: u8, cleanup: u8, accepted: bool) custody.FinalResult {

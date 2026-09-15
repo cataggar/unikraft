@@ -315,9 +315,11 @@ budgets and is skipped if that cleanup budget is unavailable.
 `failure-boot-diagnostics.log` is its privately decoded JSON string. Read and
 decode errors have separate private stderr files. `outcome.failure_diagnostics`
 records `attempted`, `exit` (read/decode status, or null when skipped) and
-`decoded`, independently of primary and cleanup exits. Diagnostic failures
+`decoded`, independently of primary and cleanup exits. Provider/decode failures
 do not become cleanup failures or erase the primary failure.
-These files are **never parsed as acceptance evidence or promoted** to
+Actual local capture IO or durability failures permanently latch a recording
+failure, including for diagnostic captures, rather than being retried into
+acceptance. These files are **never parsed as acceptance evidence or promoted** to
 Boot1/Boot2 captures or admission, even if the text appears to contain a full
 pass. There is no diagnostic retry, resume, start or resource creation.
 
@@ -469,7 +471,11 @@ Native observation errors retain separate `refused`, `filter_error`,
 every error is jq false. Runtime results separately retain the actual child
 exit/signal, execution failures, capture state, byte counts and cleanup
 completion. Partial, overflowed, failed or undurable output is private
-diagnostic material, never an admissible observation. The controller's
+diagnostic material, never an admissible observation. Capture IO/durability
+and process-record publication failures permanently poison primary admission
+and retain an independent recording failure, even if a later read succeeds.
+The actual child status and the explicit overflow mapping remain unchanged.
+The controller's
 integer mapping must preserve the lifecycle contract above and its named
 parity assertions; libraries do not invent an exit status for their callers.
 
@@ -483,6 +489,10 @@ remain independent failures. The final-input status is the actual bounded
 validator result, not an already-recorded primary scope-byte-hash refusal.
 `FinalResult.evidence_error` is an internal final-evidence result, not a new
 JSON field; callers must always honor the final `exit_code`.
+Final local scope/source/reference checks run even when supervisor poison
+prevents another child or cleanup budgeting fails. A new scope-proof refusal
+is recorded without replacing an earlier primary failure or the actual final
+validator status; it never changes cleanup authority.
 
 Intentional parser strictness is limited and explicit: reject duplicate
 JSON keys, bounded structural overflow, object-shaped status collections,
