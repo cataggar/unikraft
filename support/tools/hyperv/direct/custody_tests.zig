@@ -951,3 +951,309 @@ test "final hash errors and a primary failure survive outcome recording failures
         try t.expect(!result.outcome.accepted);
     }
 }
+
+fn failedCompletion(phase: custody.Phase, primary: u8) custody.Completion {
+    var completion = success;
+    completion.phase = phase;
+    completion.primary_exit = primary;
+    completion.persistence_evidence_complete = false;
+    completion.failure_diagnostics = .{ .attempted = true, .exit = 0, .decoded = true };
+    return completion;
+}
+
+fn expectIndependentCleanup(result: custody.FinalResult, primary: u8) !void {
+    try t.expectEqual(primary, result.exit_code);
+    try t.expectEqual(primary, result.outcome.primary_exit);
+    try t.expectEqual(@as(u8, 0), result.outcome.cleanup_exit);
+    try t.expect(!result.outcome.accepted);
+    try t.expect(result.outcome.owned_group_absent);
+    try t.expectEqual(.durable, result.recording.status);
+    try t.expect(result.recording_error == null and result.cleanup_error == null);
+}
+
+test "primary raw capture admission scope and hash refusals preserve independently successful cleanup" {
+    inline for (.{ custody.SerialMode.per_boot, .cumulative, .azure_cumulative }) |mode| {
+        for (0..6) |which| {
+            var fixture = try Fixture.init();
+            defer fixture.deinit();
+            var store = try fixture.store("attempt", sampleScope(mode));
+            defer store.close();
+            try admitted(&store);
+            try store.event(.@"boot2-start-intent");
+            const prior_phase = store.phase;
+            const lock_inode = (try files.snapshot(store.writer.file.?)).ino;
+            switch (which) {
+                0 => try write(store.directory, "boot1.log", "changed during cache wait\n"),
+                1, 2 => {
+                    const name = if (which == 1) "boot1-capture.json" else "boot2-admission.json";
+                    var original = try store.directory.readSensitive(io, a, name, 65536, null);
+                    defer original.deinit();
+                    const changed = try std.fmt.allocPrint(a, "{s} \n", .{original.bytes()});
+                    defer a.free(changed);
+                    try write(store.directory, name, changed);
+                },
+                3 => {
+                    const changed = try std.mem.replaceOwned(u8, a, store.scope_bytes.bytes(), "\"prefix\":\"fixture\"", "\"prefix\":\"changed\"");
+                    defer a.free(changed);
+                    try write(store.directory, "scope.json", changed);
+                },
+                4 => store.injectFault(.hash_read),
+                5 => store.injectFault(.hash_after_digest),
+                else => unreachable,
+            }
+            try t.expectError(switch (which) {
+                4 => error.InjectedReadFailure,
+                5 => error.InjectedHashFailure,
+                else => error.FileChanged,
+            }, store.verifyBoot2Admission());
+            try t.expect(!store.healthy);
+            try t.expect(store.recording_failure == null);
+            try store.event(.@"cleanup-intent");
+            try store.event(.@"cleanup-delete-intent");
+            // A cleanup append is not a reset or authorization for any primary phase.
+            inline for (std.meta.fields(custody.Phase)) |field| {
+                const phase: custody.Phase = @enumFromInt(field.value);
+                if (phase != .@"cleanup-intent" and phase != .@"cleanup-delete-intent")
+                    try t.expectError(error.CustodyPoisoned, store.event(phase));
+            }
+            try t.expectError(error.CustodyPoisoned, store.requireConsumed());
+            try t.expectError(error.CustodyPoisoned, store.verifyBoot2Admission());
+            try t.expectError(error.CustodyPoisoned, store.admitBoot2(ids, store.boot2.?.retained));
+            try t.expectError(error.CustodyPoisoned, store.capture(2, 1, ids, undefined, 0));
+            try t.expectEqual(@as(u8, 2), store.reserved_boots);
+            try t.expectEqualStrings("fixture", store.scope.value.prefix);
+            try t.expectEqualStrings(sampleScope(mode).attempt_id, store.scope.value.attempt_id);
+            inline for (std.meta.fields(custody.Identities)) |field|
+                try t.expectEqualStrings(@field(ids, field.name), @field(store.identities.?, field.name));
+            const primary: u8 = if (which >= 4) 17 else 1;
+            const result = store.finish(failedCompletion(prior_phase, primary));
+            try expectIndependentCleanup(result, primary);
+            try t.expectEqual(prior_phase, result.outcome.phase);
+            try t.expectEqual(lock_inode, (try files.snapshot(store.writer.file.?)).ino);
+            var bytes = try store.directory.readSensitive(io, a, "outcome.json", 65536, null);
+            defer bytes.deinit();
+            const parsed = try direct.parse(custody.Outcome, a, bytes.bytes());
+            defer parsed.deinit();
+            try t.expectEqual(@as(u8, 0), parsed.value.cleanup_exit);
+            try t.expectEqual(primary, parsed.value.primary_exit);
+            try t.expectEqual(@as(u8, 2), parsed.value.reserved_boots);
+            try t.expectEqual(.@"boot2-start-intent", parsed.value.phase);
+            try t.expect(!parsed.value.accepted and !parsed.value.persistence_evidence_complete);
+        }
+    }
+}
+
+test "Boot1 tamper before admission reserves no start authority but does not poison cleanup events" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var store = try fixture.store("attempt", sampleScope(.azure_cumulative));
+    defer store.close();
+    try boot1(&store);
+    try store.event(.@"deallocate-intent");
+    const retained = try retainedFiles(&store);
+    try write(store.directory, "boot1.log", "changed");
+    try t.expectError(error.FileChanged, store.admitBoot2(ids, retained));
+    try t.expectEqual(@as(u8, 2), store.reserved_boots);
+    try t.expect(store.boot2 == null);
+    try expectMissing(store.directory, "boot2-admission.json");
+    try store.event(.@"cleanup-intent");
+    try store.event(.@"cleanup-delete-intent");
+    try t.expectError(error.CustodyPoisoned, store.event(.@"boot2-start-intent"));
+    try expectIndependentCleanup(store.finish(failedCompletion(.@"deallocate-intent", 1)), 1);
+}
+
+test "writer and event safety are independently revalidated after primary evidence refusal" {
+    for (0..8) |which| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var store = try fixture.store("attempt", sampleScope(.per_boot));
+        defer store.close();
+        try admitted(&store);
+        try write(store.directory, "boot1.log", "tamper");
+        try t.expectError(error.FileChanged, store.verifyBoot2Admission());
+        switch (which) {
+            0 => try write(store.directory, "events.jsonl", "untrusted event\n"),
+            1 => {
+                try store.directory.dir.deleteFile(io, "events.jsonl");
+                try t.expectEqual(.SUCCESS, linux.errno(linux.symlinkat("scope.json", store.directory.dir.handle, "events.jsonl")));
+            },
+            2 => try store.directory.dir.setPermissions(io, .fromMode(0o750)),
+            3 => try store.writer.file.?.setPermissions(io, .fromMode(0o644)),
+            4 => try t.expectEqual(.SUCCESS, linux.errno(linux.linkat(store.directory.dir.handle, ".writer.lock", store.directory.dir.handle, "lock-alias", 0))),
+            5 => {
+                try t.expectEqual(.SUCCESS, linux.errno(linux.renameat(store.directory.dir.handle, ".writer.lock", store.directory.dir.handle, "retired-lock")));
+                try write(store.directory, ".writer.lock", "");
+            },
+            6 => store.writer.close(io),
+            7 => try store.directory.dir.deleteFile(io, ".writer.lock"),
+            else => unreachable,
+        }
+        defer store.directory.dir.setPermissions(io, .fromMode(0o700)) catch {};
+        if (store.event(.@"cleanup-intent")) |_| return error.UnsafeCleanupAppend else |_| {}
+        try t.expect(store.recording_failure != null);
+        const result = store.finish(failedCompletion(.@"deallocate-intent", 17));
+        try t.expectEqual(@as(u8, 17), result.exit_code);
+        try t.expectEqual(@as(u8, 17), result.outcome.primary_exit);
+        try t.expectEqual(@as(u8, 1), result.outcome.cleanup_exit);
+        try t.expect(result.recording_error != null);
+        try t.expect(!result.outcome.accepted);
+        if (which == 5) try t.expectEqual(error.WriterLockChanged, result.recording_error.?);
+        if (which <= 1) try t.expectEqual(.durable, result.recording.status) else try t.expectEqual(.not_committed, result.recording.status);
+    }
+}
+
+test "cleanup event failures and undetected event drift cannot disappear into a primary failure" {
+    for (0..3) |which| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var store = try fixture.store("attempt", sampleScope(.per_boot));
+        defer store.close();
+        try admitted(&store);
+        try write(store.directory, "boot1.log", "tamper");
+        try t.expectError(error.FileChanged, store.verifyBoot2Admission());
+        if (which == 2) {
+            try write(store.directory, "events.jsonl", "tamper");
+        } else {
+            store.injectFault(if (which == 0) .event_write else .event_sync);
+            try t.expectError(error.Injected, store.event(.@"cleanup-intent"));
+            if (store.event(.@"cleanup-delete-intent")) |_| return error.ResumedPartialEvent else |_| {}
+        }
+        const result = store.finish(failedCompletion(.@"deallocate-intent", 1));
+        try t.expectEqual(@as(u8, 1), result.exit_code);
+        try t.expectEqual(@as(u8, 1), result.outcome.cleanup_exit);
+        try t.expect(result.recording_error != null);
+        try t.expectEqual(.durable, result.recording.status);
+        try t.expect(!result.outcome.accepted);
+    }
+}
+
+test "reservation and admission recording uncertainty remains independent nonzero custody failure" {
+    for ([_]custody.TestFault{
+        .directory_sync,
+        .after_first_reservation,
+        .after_identity_reservation,
+        .ledger_sync,
+        .{ .record = .before_file_sync },
+        .{ .record = .publication },
+        .{ .record = .after_rename },
+    }) |fault| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var store = try fixture.store("attempt", sampleScope(.per_boot));
+        defer store.close();
+        if (fault == .record) {
+            try boot1(&store);
+            const retained = try retainedFiles(&store);
+            store.injectFault(fault);
+            if (store.admitBoot2(ids, retained)) |_| return error.AcceptedUncertainAdmission else |_| {}
+        } else {
+            store.injectFault(fault);
+            if (store.consume()) |_| return error.AcceptedUncertainReservation else |_| {}
+        }
+        try t.expect(store.recording_failure != null);
+        // An intact event writer can record cleanup, without forgetting the failure.
+        try store.event(.@"cleanup-intent");
+        try store.event(.@"cleanup-delete-intent");
+        try t.expectError(error.CustodyPoisoned, store.requireConsumed());
+        const result = store.finish(failedCompletion(.@"deallocate-intent", 17));
+        try t.expectEqual(@as(u8, 17), result.exit_code);
+        try t.expectEqual(@as(u8, 1), result.outcome.cleanup_exit);
+        try t.expect(result.recording_error != null);
+        try t.expectEqual(.durable, result.recording.status);
+    }
+}
+
+test "raw publication failures remain recording failures even when event cleanup is safe" {
+    for ([_]custody.TestFault{ .raw_file_sync, .raw_publication, .raw_directory_sync }) |fault| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var store = try fixture.store("attempt", sampleScope(.per_boot));
+        defer store.close();
+        try store.consume();
+        try write(store.directory, "candidate.log", padded_raw);
+        const candidate = try store.pinFile("candidate.log", custody.cli_limit);
+        store.injectFault(fault);
+        if (store.publishRaw("candidate.log", "boot1.log", candidate)) |_| return error.AcceptedUncertainPublication else |_| {}
+        try store.event(.@"cleanup-intent");
+        const result = store.finish(failedCompletion(.@"boot1-deploy-intent", 1));
+        try t.expectEqual(@as(u8, 1), result.outcome.primary_exit);
+        try t.expectEqual(@as(u8, 1), result.outcome.cleanup_exit);
+        try t.expect(result.recording_error != null and !result.outcome.accepted);
+    }
+}
+
+test "capability final input and outcome failures are not masked by primary tamper" {
+    for (0..6) |which| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var store = try fixture.store("attempt", sampleScope(.per_boot));
+        defer store.close();
+        try admitted(&store);
+        try write(store.directory, "boot1.log", "tamper");
+        try t.expectError(error.FileChanged, store.verifyBoot2Admission());
+        try store.event(.@"cleanup-intent");
+        try store.event(.@"cleanup-delete-intent");
+        var completion = failedCompletion(.@"deallocate-intent", 17);
+        switch (which) {
+            0, 1 => {
+                try capabilities(&store);
+                store.injectFault(if (which == 0) .capability_unlink else .capability_sync);
+                try t.expectError(error.Injected, store.removeCapabilities());
+                try store.removeCapabilities();
+            },
+            2 => completion.final_input_exit = 1,
+            3 => completion.final_input_exit = null,
+            4 => store.injectFault(.{ .record = .publication }),
+            5 => store.injectFault(.{ .record = .after_rename }),
+            else => unreachable,
+        }
+        const result = store.finish(completion);
+        try t.expectEqual(@as(u8, 17), result.exit_code);
+        try t.expectEqual(@as(u8, 17), result.outcome.primary_exit);
+        try t.expect(!result.outcome.accepted);
+        if (which < 4) {
+            try t.expectEqual(@as(u8, 1), result.outcome.cleanup_exit);
+            try t.expectEqual(.durable, result.recording.status);
+            if (which < 2) try t.expect(result.cleanup_error != null);
+        } else {
+            try t.expect(result.recording_error != null);
+            try t.expectEqual(if (which == 4) files.CommitStatus.publication_unknown else .visible_not_durable, result.recording.status);
+        }
+    }
+}
+
+test "a successful primary status cannot accept uncertain evidence even with clean independent cleanup" {
+    for (0..2) |which| {
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        var store = try fixture.store("attempt", sampleScope(.per_boot));
+        defer store.close();
+        try complete(&store);
+        try write(store.directory, "boot1.log", "tamper");
+        if (which == 0) try t.expectError(error.FileChanged, store.verifyBoot1());
+        try store.event(.@"cleanup-intent");
+        try store.event(.@"cleanup-delete-intent");
+        const result = store.finish(success);
+        try t.expectEqual(@as(u8, 0), result.outcome.primary_exit);
+        try t.expectEqual(@as(u8, 0), result.outcome.cleanup_exit);
+        try t.expectEqual(@as(u8, 1), result.exit_code);
+        try t.expect(!result.outcome.accepted);
+        try t.expect(result.evidence_error != null);
+        try t.expect(result.recording_error == null and result.cleanup_error == null);
+        try t.expectEqual(.durable, result.recording.status);
+    }
+}
+
+test "healthy primary completion still accepts after independently recorded cleanup intents" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var store = try fixture.store("attempt", sampleScope(.per_boot));
+    defer store.close();
+    try complete(&store);
+    try store.event(.@"cleanup-intent");
+    try store.event(.@"cleanup-delete-intent");
+    const result = store.finish(success);
+    try t.expectEqual(@as(u8, 0), result.exit_code);
+    try t.expect(result.outcome.accepted);
+    try t.expect(result.evidence_error == null and result.recording_error == null and result.cleanup_error == null);
+}

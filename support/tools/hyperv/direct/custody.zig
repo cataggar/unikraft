@@ -136,6 +136,8 @@ pub const Completion = struct {
 pub const FinalResult = struct {
     outcome: Outcome,
     recording: files.CommitResult = .{},
+    /// Final evidence verification is separate from writing the outcome record.
+    evidence_error: ?anyerror = null,
     recording_error: ?anyerror = null,
     cleanup_error: ?anyerror = null,
     exit_code: u8,
@@ -272,7 +274,10 @@ pub const Store = struct {
     phase: Phase = .@"local-admission",
     reserved_boots: u8 = 0,
     consumed: bool = false,
+    // Primary refusal is permanent, but is not itself a cleanup failure.
     healthy: bool = true,
+    recording_failure: ?anyerror = null,
+    cleanup_failure: ?anyerror = null,
     finished: bool = false,
     boot1: ?Boot1 = null,
     boot2: ?Boot2 = null,
@@ -357,8 +362,39 @@ pub const Store = struct {
         errdefer self.healthy = false;
         if (self.finished) return error.AlreadyFinished;
         if (!self.healthy) return error.CustodyPoisoned;
-        if (self.writer.file == null) return error.LockNotHeld;
+        try self.writerReady();
+    }
+
+    fn recordingFailed(self: *Store, err: anyerror) void {
+        self.healthy = false;
+        if (self.recording_failure == null) self.recording_failure = err;
+    }
+
+    /// Cleanup uses only the original admitted descriptors and in-memory
+    /// identities; revalidating this writer never reloads scope or clears refusal.
+    fn writerReady(self: *Store) !void {
+        if (self.finished) return error.AlreadyFinished;
+        errdefer |err| self.recordingFailed(err);
         try validatePrivateDirectory(self.directory.dir);
+        const held = self.writer.file orelse return error.LockNotHeld;
+        try validatePrivate(held, false);
+        const named = try self.directory.openFile(self.io, ".writer.lock");
+        defer named.close(self.io);
+        if (!files.sameSnapshot(try files.snapshot(held), try files.snapshot(named)))
+            return error.WriterLockChanged;
+    }
+
+    fn verifyEvents(self: *Store) !void {
+        if (self.event_pin) |pin| {
+            try self.verifyFile("events.jsonl", pin, record_limit);
+        } else {
+            const unexpected = self.directory.openFile(self.io, "events.jsonl") catch |err| switch (err) {
+                error.FileNotFound => return,
+                else => return err,
+            };
+            unexpected.close(self.io);
+            return error.PathAlreadyExists;
+        }
     }
 
     /// Each mkdir and parent entry is synced separately. Never remove a claim,
@@ -368,6 +404,15 @@ pub const Store = struct {
         errdefer self.healthy = false;
         if (self.consumed) return error.PathAlreadyExists;
         try self.verifyScope();
+        self.reserveSeed() catch |err| {
+            if (err != error.PathAlreadyExists) self.recordingFailed(err);
+            return err;
+        };
+        try self.verifyScope();
+        self.consumed = true;
+    }
+
+    fn reserveSeed(self: *Store) !void {
         try validatePrivateDirectory(self.ledger.dir);
         var ledger_writer = try self.ledger.lock(self.io);
         defer ledger_writer.close(self.io);
@@ -389,8 +434,6 @@ pub const Store = struct {
         try requireDurable(try self.immutable(&identity_writer, "consumed.json", self.scope_bytes.bytes()));
         if (self.take(.ledger_sync)) return error.Injected;
         try syncDirectory(self.io, self.ledger.dir);
-        try self.verifyScope();
-        self.consumed = true;
     }
 
     /// Gate primary effects, in addition to the caller's approval/budget gates.
@@ -406,18 +449,23 @@ pub const Store = struct {
         self.reserved_boots = 1;
     }
 
+    /// Only cleanup intent phases can append after primary refusal, and only
+    /// through independently revalidated directory, lock and event custody.
     pub fn event(self: *Store, phase: Phase) !void {
-        try self.ready();
+        switch (phase) {
+            .@"cleanup-intent", .@"cleanup-delete-intent" => try self.writerReady(),
+            else => try self.ready(),
+        }
         // The failing phase is observable even if its event append fails.
         self.phase = phase;
-        errdefer self.healthy = false;
+        errdefer |err| self.recordingFailed(err);
         const bytes = try encode(self.allocator, Event{ .phase = phase, .reserved_boots = self.reserved_boots });
         defer self.allocator.free(bytes);
         var expected_hash = self.event_hash;
         expected_hash.update(bytes);
         var offset: u64 = 0;
+        try self.verifyEvents();
         if (self.event_pin) |pin| {
-            try self.verifyFile("events.jsonl", pin, record_limit);
             offset = pin.metadata.size;
         }
         const file = try openEvent(self.directory, self.event_pin == null);
@@ -601,6 +649,7 @@ pub const Store = struct {
     }
 
     fn record(self: *Store, name: []const u8, value: anytype) !FileSnapshot {
+        errdefer |err| self.recordingFailed(err);
         const bytes = try encode(self.allocator, value);
         defer self.allocator.free(bytes);
         try requireDurable(try self.immutable(&self.writer, name, bytes));
@@ -610,6 +659,13 @@ pub const Store = struct {
     }
 
     fn immutable(self: *Store, writer: *files.Locked, name: []const u8, bytes: []const u8) !files.CommitResult {
+        errdefer |err| self.recordingFailed(err);
+        const result = try self.immutableResult(writer, name, bytes);
+        requireDurable(result) catch |err| self.recordingFailed(err);
+        return result;
+    }
+
+    fn immutableResult(self: *Store, writer: *files.Locked, name: []const u8, bytes: []const u8) !files.CommitResult {
         if (builtin.is_test) {
             if (self.fault) |fault| if (fault == .record) {
                 self.fault = null;
@@ -631,12 +687,18 @@ pub const Store = struct {
         const file = try self.directory.openFile(self.io, source);
         defer file.close(self.io);
         if (!files.sameSnapshot(expected.metadata, try files.snapshot(file))) return error.FileChanged;
-        var atomic = try self.directory.dir.createFileAtomic(self.io, destination, .{
+        var atomic = self.directory.dir.createFileAtomic(self.io, destination, .{
             .permissions = .fromMode(0o600),
             .replace = false,
-        });
+        }) catch |err| {
+            self.recordingFailed(err);
+            return err;
+        };
         defer atomic.deinit(self.io);
-        try validatePrivate(atomic.file, true);
+        validatePrivate(atomic.file, true) catch |err| {
+            self.recordingFailed(err);
+            return err;
+        };
         var buffer: [65536]u8 = undefined;
         var sha = std.crypto.hash.sha2.Sha256.init(.{});
         var offset: u64 = 0;
@@ -644,11 +706,19 @@ pub const Store = struct {
             const length: usize = @intCast(@min(buffer.len, expected.metadata.size - offset));
             if (try file.readPositionalAll(self.io, buffer[0..length], offset) != length) return error.FileChanged;
             sha.update(buffer[0..length]);
-            try atomic.file.writePositionalAll(self.io, buffer[0..length], offset);
+            atomic.file.writePositionalAll(self.io, buffer[0..length], offset) catch |err| {
+                self.recordingFailed(err);
+                return err;
+            };
             offset += length;
         }
         if (!std.crypto.timing_safe.eql(Digest, sha.finalResult(), expected.sha256)) return error.HashMismatch;
         try self.verifyFile(source, expected, cli_limit);
+        return self.commitRaw(&atomic, destination, expected.sha256);
+    }
+
+    fn commitRaw(self: *Store, atomic: *std.Io.File.Atomic, destination: []const u8, expected: Digest) !FileSnapshot {
+        errdefer |err| self.recordingFailed(err);
         if (self.take(.raw_file_sync)) return error.NotCommitted;
         try atomic.file.sync(self.io);
         if (self.take(.raw_publication)) return error.PublicationUnknown;
@@ -656,7 +726,7 @@ pub const Store = struct {
         if (self.take(.raw_directory_sync)) return error.VisibleNotDurable;
         try syncDirectory(self.io, self.directory.dir);
         const pin = try self.pinFile(destination, cli_limit);
-        if (!std.crypto.timing_safe.eql(Digest, pin.sha256, expected.sha256)) return error.HashMismatch;
+        if (!std.crypto.timing_safe.eql(Digest, pin.sha256, expected)) return error.HashMismatch;
         return pin;
     }
 
@@ -684,7 +754,10 @@ pub const Store = struct {
         } else syncDirectory(self.io, self.directory.dir) catch |err| {
             if (first_error == null) first_error = err;
         };
-        if (first_error) |err| return err;
+        if (first_error) |err| {
+            if (self.cleanup_failure == null) self.cleanup_failure = err;
+            return err;
+        }
     }
 
     fn removeOne(self: *Store, directory: files.Directory, name: []const u8) !void {
@@ -732,17 +805,22 @@ pub const Store = struct {
             outcome.cleanup_exit = 1;
         };
         if (completion.final_input_exit == null or completion.final_input_exit.? != 0) outcome.cleanup_exit = 1;
+        const writer_ready = if (self.writerReady()) |_| true else |_| false;
+        if (writer_ready) self.verifyEvents() catch |err| self.recordingFailed(err);
         if (outcome.persistence_evidence_complete) {
             self.verifyCompleted() catch |err| {
-                result.recording_error = err;
-                outcome.cleanup_exit = 1;
+                result.evidence_error = err;
             };
         }
-        if (!self.healthy) outcome.cleanup_exit = 1;
+        result.recording_error = self.recording_failure;
+        result.cleanup_error = self.cleanup_failure;
+        if (result.recording_error != null or result.cleanup_error != null) outcome.cleanup_exit = 1;
         outcome.accepted = outcome.primary_exit == 0 and outcome.cleanup_exit == 0 and
-            outcome.persistence_evidence_complete and outcome.owned_group_absent;
+            outcome.persistence_evidence_complete and outcome.owned_group_absent and
+            self.healthy and result.evidence_error == null;
         result.outcome = outcome;
         self.finished = true;
+        if (!writer_ready) return result;
         const bytes = encode(self.allocator, outcome) catch |err| {
             result.recording_error = err;
             return result;
