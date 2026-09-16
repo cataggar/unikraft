@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
-//! Small synthetic pristine seeds only. Sector admission is independently usable
-//! by a future descriptor-streaming importer; no original-disk renderer exists.
+//! Small synthetic pristine seeds and shared sector/footer primitives.
+//! Production original-disk creation lives separately in original_seed.zig.
 const std = @import("std");
 const contracts = @import("contracts.zig");
 const configuration = @import("config.zig");
@@ -165,7 +165,7 @@ pub fn validateSector(bytes: []const u8, expected: Parameters) !void {
     if (!contracts.same(try decodeSector(bytes), expected)) return error.IdentityChanged;
 }
 
-fn fixedFooter(parameters: Parameters) !miz_vhd.Footer {
+pub fn fixedFooter(parameters: Parameters) !miz_vhd.Footer {
     try validateParameters(parameters);
     var footer = miz_vhd.Footer.forFixedDisk(
         parameters.sectors * sector_size,
