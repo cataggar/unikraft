@@ -10,6 +10,9 @@ fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     };
     const azure = b.createModule(.{ .root_source_file = b.path("../azure/root.zig"), .target = target, .optimize = optimize, .imports = shared });
     const host = b.createModule(.{ .root_source_file = b.path("../host/root.zig"), .target = target, .optimize = optimize, .imports = shared });
+    const host_options = b.addOptions();
+    host_options.addOption(bool, "timing", false);
+    host.addOptions("host_options", host_options);
     const transfer = b.createModule(.{ .root_source_file = b.path("../transfer/root.zig"), .target = target, .optimize = optimize, .imports = &.{
         .{ .name = "hyperv_core", .module = core },                 .{ .name = "azure_sdk_core", .module = sdk },
         .{ .name = "azure_sdk_storage_common", .module = storage },

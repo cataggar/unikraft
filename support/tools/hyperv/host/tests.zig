@@ -8,6 +8,7 @@ test {
     _ = @import("phase_fixtures.zig");
     _ = @import("serial_fixtures.zig");
     _ = @import("budget_fixtures.zig");
+    if (@import("test_options").host_timing) _ = @import("timing_fixtures.zig");
 }
 
 test "scope and native Ed25519 reject untrusted configuration" {

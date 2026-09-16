@@ -856,6 +856,7 @@ jobs:
               --cache-dir "${root}/${mode}/zig-local-cache" \
               --prefix "${root}/${mode}/out" \
               -Dtest-root="${root}/${mode}/fixtures" \
+              -Dpersistence-timing=true \
               -Dstrip-fixture-debug=true -Dfixture-file-relayout=true \
               "-Dfixture-objcopy=${objcopy}" \
               "-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json" \
@@ -890,6 +891,10 @@ jobs:
           -Dlifecycle-root="${parent}/native" \
           test test-foundation test-controller test-lifecycle-native install
 
+    - name: Collect bounded persistence observations
+      if: always()
+      run: bash .github/scripts/hyperv-fixture-observation-evidence.sh persistence
+
     - name: Retain bounded runtime fixture evidence
       if: always()
       uses: actions/upload-artifact@v4
@@ -902,12 +907,12 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-version.txt
           ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-sha256.txt
           ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/Debug-fixtures.log
           ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/zig-local-cache/**/hyperv-persistence-worker-fixture
           ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stdout
           ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stderr
           ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/ReleaseSafe-fixtures.log
           ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/zig-local-cache/**/hyperv-persistence-worker-fixture
           ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stdout
           ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stderr
@@ -1041,8 +1046,10 @@ jobs:
               --cache-dir "${root}/${mode}/zig-local-cache" \
               --prefix "${root}/${mode}/out" \
               -Dtest-root="${root}/${mode}/fixtures" \
+              -Dhost-timing=true \
               -Dimage-trust-key="${fixture_key}" \
-              -Doptimize="${mode}" -j2 test install --summary all
+              -Doptimize="${mode}" -j2 test install --summary all \
+              2>&1 | tee "${root}/${mode}/fixtures.log"
         done
         ZIG_LOCAL_CACHE_DIR="${root}/image/zig-local-cache" \
           zig build --build-file support/tools/hyperv/host/build.zig \
@@ -1057,6 +1064,19 @@ jobs:
         test "$((runner_bytes + unit_bytes))" -le 8388608
         printf 'Synthetic-key host runner/unit bytes: %s/%s; not image admission\n' \
           "${runner_bytes}" "${unit_bytes}"
+
+    - name: Collect bounded host observations
+      if: always()
+      run: bash .github/scripts/hyperv-fixture-observation-evidence.sh host
+
+    - name: Retain bounded host fixture evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-host-evidence
+        path: ${{ runner.temp }}/hyperv-ci/native-host/observation-evidence/
+        retention-days: 7
+        if-no-files-found: warn
 
     - name: Run native Hyper-V image transformation fixtures
       run: |

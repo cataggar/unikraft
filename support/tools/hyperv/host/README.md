@@ -84,8 +84,9 @@ mutations remain **unknown**, never a retry or a success-shaped fallback.
 `worker.Engine` connects signature verification, the durable store, streaming
 artifact staging, real subprocess supervision, serial validation and publication.
 `native.Supervised` is its concrete process-isolated transport adapter. The
-exported build module is `hyperv_host`; import names are `hyperv_core` and the
-pinned `azure_sdk_core`. Parent integration can use `worker.Engine`,
+exported build module is `hyperv_host`; import names are `hyperv_core`, the
+pinned `azure_sdk_core`, and build-generated `host_options` with `timing=false`
+for production (including preflight's direct module instantiation). Parent integration can use `worker.Engine`,
 `native.Supervised`, `wire.Client`, or the standalone executable.
 The production `native.run`, `wireChild`, and `authorizeBootChild` entrypoints
 require a compile-time key. An embedding CLI must retain the supplied child
@@ -211,6 +212,62 @@ resource, image-publication, network, original artifact or private seed operatio
 was used in these fixtures.
 
 ## Focused local build
+
+### Fixture-only wire observations
+
+`-Dhost-timing=true` is an explicit, default-off **test build** option. It
+does not enable anything in the installed executable or exported production
+module. Those roots, preflight's host module, and the independent
+`test-exclusion` build have `host_options.timing=false` and no `host_timing` or
+`synthetic_measurement` dependency. Native test modules explicitly receive the
+observer; they do not rely on declarations in a test source being visible through
+Zig's default test-runner `@import("root")`. The uninstalled child fixture is
+also explicitly build-gated. No runtime argument, environment variable,
+production bypass, or status/authority/durable-state schema is added.
+
+Enable the option on the existing full `test` command in each native CI mode.
+`test-observations test-exclusion -Dhost-timing=true` selects only the format,
+scope/order, refusal, retention, native wire, and exclusion development checks.
+Full host coverage remains on `test`. The success variant uses the **same full
+child fixture source and build settings**, with a build-only synthetic
+`not_found` response; the original wire fixture still writes its entry marker
+and sleeps under its original 200-ms deadline. No helper shrinking, stripping,
+CPU/backend/optimization change, timeout fix, QEMU, namespace or image pipeline
+is part of these observations.
+
+Parent samples are preallocated in memory and cover call entry, request
+encoding, reservation, durable state, operation directory/lock, durable job and
+payload, the **before-call process boundary**, process return, and terminal
+success/error. `process_call` is not a completed-spawn claim. Errors retain the
+available prefix. Child entry is sampled in the actual synthetic child before
+the unchanged readiness write and flushed immediately after it (also on a
+readiness-write error). Each observer descriptor is opened and closed inside
+its flush; none is inherited or added to process whitelists. Parent and child
+`PROCESS_CPUTIME_ID` samples have separate scopes; never subtract across them.
+Samples include the existing synthetic measurement's backend, architecture,
+optimization and compiled CPU-feature metadata.
+
+Fixture defers retain observations on both assertion success and failure,
+before fixture disposal. Child evidence is opened only when the existing
+supervisor returned `cleanup_complete=true`; otherwise the summary says
+`cleanup_unconfirmed` (or `not_called` before the process-call boundary).
+A missing child record is explicitly `missing`, never proof of no launch.
+Malformed, oversized and unreadable records remain separately labelled.
+Observation/retention faults cannot replace the original result or assertion.
+
+The closed v1 format permits nine parent samples, one child sample, and one
+summary, each bounded by 1,024 bytes: at most 11,264 bytes per fixture, and
+67,584 bytes across the six fixed labels. Records contain no paths, argv,
+environment, credentials, run/VM IDs or nonces. Retention writes bounded JSONL
+to stderr and create-only mode-0600
+`<test-root>/synthetic-host-timing-<fixed-label>-v1.jsonl`. Normal credential-free
+CI enables this option in both native fixture modes and retains these files
+and the test log on **success and failure**. The always-run fixed-name copier
+accepts only private, single-link regular files: at most six 11,264-byte records
+and an 8-MiB log per mode. `zig-hyperv-host-evidence` contains only those bounded
+copies, and a failed run may have only a prefix of the fixed labels.
+The later image-target compile remains default-off. These records are diagnostic-only,
+`authority=none`, not production acceptance or cleanup proof.
 
 Zig 0.16.0 is required. Run from the owned worktree. Restore only the pinned
 package manifests, into scratch; this distribution otherwise creates `zig-pkg`

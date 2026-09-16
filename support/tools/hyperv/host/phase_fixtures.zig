@@ -6,6 +6,8 @@ const wf = @import("wire_fixtures.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
 const t = std.testing;
+const timing_enabled = @import("test_options").host_timing;
+const timing = if (timing_enabled) @import("host_timing") else void;
 
 const Assets = struct {
     arena: std.heap.ArenaAllocator,
@@ -400,6 +402,9 @@ test "actual child exit failure missing serial timeout and output ceiling stop p
 test "native wire child hard deadline persists interrupted operation separately" {
     const fixture = try Fixture.init(0);
     defer fixture.deinit();
+    var observation = if (timing_enabled) timing.Parent.init(.hard_deadline, fixture.assets.qemu.len) else {};
+    if (timing_enabled) observation.start();
+    defer if (timing_enabled) observation.stop();
     var remote: host.native.Supervised = .{
         .allocator = a,
         .io = io,
@@ -412,6 +417,7 @@ test "native wire child hard deadline persists interrupted operation separately"
         .deadline = try host.core.process.Deadline.afterMilliseconds(200),
     };
     defer remote.deinit();
+    defer if (timing_enabled) observation.retain(a, io, @import("test_options").test_root.?, remote.last_directory);
     const job: host.native.Job = .{ .version = 1, .action = .command, .scope = f.scope(), .vm_id = f.uuid(f.vm_text), .phase = .public, .command_sha256 = null, .role = null, .artifact_name = null, .evidence_name = null, .payload_sha256 = null, .deadline_ns = remote.deadline.expires_ns };
     try t.expectError(error.WireWorkerFailed, remote.call(job, null));
     try t.expect(fixture.store.record.wire_inflight);
@@ -422,6 +428,75 @@ test "native wire child hard deadline persists interrupted operation separately"
     defer operation.close(io);
     const started = try operation.openFile(io, "fixture-wire-started");
     started.close(io);
+}
+
+test "host timing native success setup deadline launch and observer failures retain prefixes" {
+    if (!timing_enabled) return;
+    for ([_]timing.Fixture{ .success, .setup_refusal, .expired, .launch_failure, .observer_refusal }) |mode| {
+        const fixture = try Fixture.init(0);
+        defer fixture.deinit();
+        const success_path = try std.Io.Dir.cwd().realPathFileAlloc(io, @import("test_options").wire_success_fixture, a);
+        defer a.free(success_path);
+        const success_bytes = size: {
+            const file = try std.Io.Dir.openFileAbsolute(io, success_path, .{ .mode = .read_only });
+            defer file.close(io);
+            break :size (try file.stat(io)).size;
+        };
+        var observation: timing.Parent = .init(mode, if (mode == .launch_failure) null else success_bytes);
+        observation.start();
+        defer observation.stop();
+        var remote: host.native.Supervised = .{
+            .allocator = a,
+            .io = io,
+            .directory_path = fixture.directory.path,
+            .self_executable = if (mode == .launch_failure) fixture.work_root else success_path,
+            .locked = &fixture.locked,
+            .store = &fixture.store,
+            .scope = f.scope(),
+            .vm_id = f.uuid(f.vm_text),
+            .deadline = if (mode == .expired) .{ .expires_ns = 0 } else try host.core.process.Deadline.afterMilliseconds(2000),
+        };
+        defer remote.deinit();
+        defer observation.retain(a, io, @import("test_options").test_root.?, remote.last_directory);
+        if (mode == .setup_refusal)
+            try fixture.directory.directory.dir.createDir(io, "wire-0", .fromMode(0o700));
+        if (mode == .observer_refusal) observation.fault = .clock_failed;
+        const job: host.native.Job = .{ .version = 1, .action = .command, .scope = f.scope(), .vm_id = f.uuid(f.vm_text), .phase = .public, .command_sha256 = null, .role = null, .artifact_name = null, .evidence_name = null, .payload_sha256 = null, .deadline_ns = remote.deadline.expires_ns };
+        switch (mode) {
+            .success, .observer_refusal => {
+                const result = try remote.call(job, null);
+                try t.expect(result.not_found);
+                try t.expect(!fixture.store.record.wire_inflight);
+            },
+            .setup_refusal => try t.expectError(error.PathAlreadyExists, remote.call(job, null)),
+            .expired => try t.expectError(error.AttemptExpired, remote.call(job, null)),
+            .launch_failure => try t.expectError(error.WireWorkerFailed, remote.call(job, null)),
+            else => unreachable,
+        }
+        const report = observation.collect(a, io, remote.last_directory);
+        try t.expectEqual(@as(u8, 0), fixture.store.record.boots_attempted);
+        switch (mode) {
+            .success => {
+                try t.expectEqual(@as(usize, timing.parent_slots), report.parent.count);
+                try t.expectEqual(timing.Stage.call_success, report.parent.values[report.parent.count - 1].stage);
+                try t.expectEqual(timing.ChildStatus.entry, report.summary.child);
+            },
+            .observer_refusal => {
+                try t.expectEqual(timing.Fault.clock_failed, report.summary.parent_fault.?);
+                try t.expectEqual(@as(usize, 0), report.parent.count);
+                try t.expectEqual(timing.ChildStatus.entry, report.summary.child);
+            },
+            .expired, .setup_refusal => {
+                try t.expectEqual(timing.ChildStatus.not_called, report.summary.child);
+                try t.expectEqual(timing.Stage.call_error, report.parent.values[report.parent.count - 1].stage);
+            },
+            .launch_failure => {
+                try t.expectEqual(timing.ChildStatus.missing, report.summary.child);
+                try t.expectEqual(timing.Stage.call_error, report.parent.values[report.parent.count - 1].stage);
+            },
+            else => unreachable,
+        }
+    }
 }
 
 test "separate primary cleanup recording outcomes persist without overwriting" {
