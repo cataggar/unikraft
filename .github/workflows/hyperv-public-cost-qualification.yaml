@@ -21,6 +21,13 @@ jobs:
       with:
         persist-credentials: false
 
+    - name: Checkout the immutable pre-fix production baseline with its probe
+      uses: actions/checkout@v4
+      with:
+        ref: f082a44c62386f86aa6bd6238dff8b665db34197
+        path: .d/public-cost-baseline
+        persist-credentials: false
+
     - name: Install the pinned native compiler
       uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
       with:
@@ -38,7 +45,16 @@ jobs:
         cp support/tools/hyperv/public_image/build.zig \
           support/tools/hyperv/public_image/build.zig.zon "${root}/restore/"
         zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        mkdir -p "${root}/native/fixtures" "${root}/native/import-fixtures"
+        mkdir -p "${root}/baseline/fixtures" "${root}/native/fixtures" \
+          "${root}/native/import-fixtures"
+        echo "public-image synthetic configuration: unchanged merged production baseline"
+        zig build \
+          --build-file .d/public-cost-baseline/support/tools/hyperv/public_image/build.zig \
+          --system "${root}/restore/zig-pkg" \
+          --cache-dir "${root}/baseline/cache" \
+          -Dtest-root="${root}/baseline/fixtures" \
+          -Doptimize=Debug -j2 diagnose-cost --summary all
+        echo "public-image synthetic configuration: candidate on the same runner"
         zig build --build-file support/tools/hyperv/public_image/build.zig \
           --system "${root}/restore/zig-pkg" \
           --cache-dir "${root}/native/cache" \
