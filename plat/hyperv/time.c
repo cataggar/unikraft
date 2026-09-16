@@ -39,6 +39,7 @@
 #define HYPERV_CPU_INIT_TIMEOUT_TICKS	1000000ULL
 
 static __u64 hyperv_epoch_ns;
+static struct hyperv_realtime_sample hyperv_realtime;
 /* Paired with hyperv_epoch_ns before ExitBootServices. */
 static __u64 hyperv_efi_ref;
 /* Keeps the public monotonic clock anchored at ukplat_time_init(). */
@@ -113,6 +114,19 @@ void hyperv_clock_set_efi_sample(__u64 epoch_ns, __u64 reference_time)
 {
 	hyperv_epoch_ns = epoch_ns;
 	hyperv_efi_ref = reference_time;
+	hyperv_realtime.caps.source = 0;
+}
+
+void hyperv_clock_set_realtime_sample(
+	const struct hyperv_realtime_sample *sample)
+{
+	hyperv_realtime = *sample;
+}
+
+int hyperv_clock_realtime(struct hyperv_realtime_caps *caps, uint64_t *ns)
+{
+	return hyperv_realtime_read(&hyperv_realtime, hyperv_reference_time(),
+				    caps, ns);
 }
 
 void __weak hyperv_vmbus_message(const struct hyperv_message *message)

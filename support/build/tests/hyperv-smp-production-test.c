@@ -8,6 +8,7 @@
 #include <stdlib.h>
 
 #include <hyperv/hyperv.h>
+#include <hyperv/clock.h>
 #include <hyperv/cpu_lifecycle.h>
 #include <uk/boot/smp.h>
 #include <uk/config.h>
@@ -728,8 +729,44 @@ static void test_crash_keeps_pinned_pages_programmed(void)
 	hyperv_vmbus_target_release(vp, generation);
 }
 
+static void test_realtime_handoff(void)
+{
+	const struct hyperv_realtime_sample sample = {
+		.caps = {
+			.version = HYPERV_REALTIME_ABI_VERSION,
+			.source = HYPERV_REALTIME_EFI_UTC,
+			.resolution_ns = 1000000000,
+			.efi_accuracy_pptrillion = 50000000,
+			.sample_span_ns = 500,
+		},
+		.epoch_ns = 1700000000000000000ULL,
+		.reference_ticks = 100,
+	};
+	struct hyperv_realtime_caps caps;
+	uint64_t ns = 99;
+
+	reference_time = 100;
+	hyperv_clock_set_efi_sample(sample.epoch_ns, 100);
+	assert(hyperv_clock_realtime(&caps, &ns) == -ENOTSUP);
+	assert(ns == 99);
+	hyperv_clock_set_realtime_sample(&sample);
+	reference_time = 104;
+	assert(hyperv_clock_realtime(&caps, &ns) == 0);
+	assert(ns == sample.epoch_ns + 500);
+	assert(caps.resolution_ns == 1000000000);
+	reference_time = UINT64_MAX - 1;
+	assert(hyperv_clock_realtime(&caps, &ns) == -EOVERFLOW);
+	assert(ns == sample.epoch_ns + 500);
+	reference_time = 98;
+	assert(hyperv_clock_realtime(&caps, &ns) == -EOVERFLOW);
+	hyperv_clock_set_efi_sample(123, 99);
+	assert(hyperv_clock_realtime(&caps, &ns) == -ENOTSUP);
+	reference_time = 0;
+}
+
 int main(void)
 {
+	test_realtime_handoff();
 	test_single_cpu_startup_noop();
 	test_cpu_setup_routing_and_ap_shutdown();
 	test_partial_ap_start_rollback();

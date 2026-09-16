@@ -6,6 +6,7 @@ APPWAMRAOT_SRCS-y += $(APPWAMRAOT_BASE)/selftest.c
 APPWAMRAOT_SRCS-y += $(APPWAMRAOT_BASE)/build/artifacts/embedded.c
 APPWAMRAOT_CINCLUDES-y += -I$(APPWAMRAOT_BASE)
 APPWAMRAOT_CINCLUDES-y += -I$(APPWAMRAOT_BASE)/build/artifacts
+APPWAMRAOT_CINCLUDES-y += -I$(UK_PLAT_BASE)/hyperv/include
 APPWAMRAOT_OBJS-y += $(APPWAMRAOT_BASE)/build/artifacts/libwamr-aot.a
 
 .PHONY: wamr_aot_verify

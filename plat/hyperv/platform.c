@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <errno.h>
 #include <hyperv/hyperv.h>
+#include <hyperv/efi_clock.h>
 #include <uk/efi.h>
 #include <uk/lcpu.h>
 #include <uk/paging.h>
@@ -11,9 +12,11 @@
 
 #define HYPERV_SMOKE_INVALID_CALL	0xffffULL
 #define HYPERV_UNIKRAFT_VERSION		0x00150000U
-#define HYPERV_EFI_UNSPECIFIED_TZ	0x07ff
 #define HYPERV_NS_PER_MINUTE		60000000000LL
 #define HYPERV_SHUTDOWN_HANDOFF_TICKS	1000000ULL
+
+_Static_assert(sizeof(struct uk_efi_time) == 16, "EFI_TIME ABI");
+_Static_assert(sizeof(struct uk_efi_time_caps) == 12, "EFI capabilities ABI");
 
 static struct uk_efi_runtime_services *hyperv_efi_rs;
 #if CONFIG_HAVE_SMP
@@ -51,8 +54,17 @@ static const char *hyperv_detect_error(int rc)
 void ukplat_efi_pre_exit(struct uk_efi_runtime_services *rs)
 {
 	struct uktimeconv_bmkclock date;
-	struct uk_efi_time now;
+	struct uk_efi_time now = {
+		.year = UINT16_MAX, .month = UINT8_MAX, .day = UINT8_MAX,
+		.hour = UINT8_MAX, .minute = UINT8_MAX, .second = UINT8_MAX,
+		.nanosecond = UINT32_MAX,
+		.time_zone = UK_EFI_UNSPECIFIED_TIMEZONE,
+		.daylight = UINT8_MAX,
+	};
+	struct uk_efi_time_caps caps = { 0 };
+	struct hyperv_realtime_sample realtime;
 	uk_efi_status_t status;
+	__u64 reference_before;
 	__u64 reference_time;
 	__u64 epoch_ns;
 	__s64 utc_ns;
@@ -63,10 +75,19 @@ void ukplat_efi_pre_exit(struct uk_efi_runtime_services *rs)
 		UK_CRASH("Hyper-V discovery failed before ExitBootServices: %s\n",
 			 hyperv_detect_error(rc));
 
-	status = rs->get_time(&now, NULL);
+	reference_before = hyperv_time_ref_count();
+	status = rs->get_time(&now, &caps);
 	if (unlikely(status != UK_EFI_SUCCESS))
 		UK_CRASH("Hyper-V: UEFI GetTime failed: 0x%lx\n", status);
 	reference_time = hyperv_time_ref_count();
+	if (!hyperv_efi_realtime_sample(&now, &caps, reference_before,
+				       reference_time, &realtime)) {
+		hyperv_clock_set_efi_sample(realtime.epoch_ns, reference_time);
+		hyperv_clock_set_realtime_sample(&realtime);
+		hyperv_efi_rs = rs;
+		return;
+	}
+	/* Preserve legacy wall-clock policy for unqualified native sources. */
 	if (unlikely(now.year < 1970 || now.month < 1 || now.month > 12 ||
 		     now.day < 1 || now.day > 31 || now.hour > 23 ||
 		     now.minute > 59 || now.second > 59 ||
@@ -81,7 +102,7 @@ void ukplat_efi_pre_exit(struct uk_efi_runtime_services *rs)
 	date.dt_sec = now.second;
 	epoch_ns = uktimeconv_bmkclock_to_nsec(&date) + now.nanosecond;
 	utc_ns = (__s64)epoch_ns;
-	if (now.time_zone != HYPERV_EFI_UNSPECIFIED_TZ) {
+	if (now.time_zone != UK_EFI_UNSPECIFIED_TIMEZONE) {
 		if (unlikely(now.time_zone < -1440 || now.time_zone > 1440))
 			UK_CRASH("Hyper-V: UEFI returned an invalid timezone\n");
 		utc_ns -= (__s64)now.time_zone * HYPERV_NS_PER_MINUTE;

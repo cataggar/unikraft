@@ -47,16 +47,26 @@ static int coremark(wamr_aot_config *config, const char *name,
 				       guest_output.stdout_length);
 	correct &= !guest_output.output_error && !guest_output.pending_stdout &&
 		   !guest_output.pending_stderr && !guest_output.unsupported_clock &&
-		   !guest_output.stderr_length;
+		   !guest_output.stderr_length && guest_output.realtime_supported;
 	printf("WAMR_NATIVE_WASI={\"version\":1,\"correctness_only\":true,"
 	       "\"workload\":\"%s\",\"wasm_sha256\":\"%s\",\"cwasm_sha256\":\"%s\","
 	       "\"terminal\":%u,\"detail\":%u,\"crc_ok\":%s,\"output_error\":%u,"
 	       "\"pending_stdout\":%u,\"pending_stderr\":%u,"
-	       "\"unsupported_clock\":%u,\"realtime_supported\":false,\"stdout_base64\":\"",
+	       "\"unsupported_clock\":%u,\"realtime_supported\":%s,"
+	       "\"realtime_capability_version\":%u,\"realtime_source\":%u,"
+	       "\"realtime_resolution_ns\":%lu,\"efi_accuracy_pptrillion\":%u,"
+	       "\"efi_sample_span_ns\":%lu,\"epoch_accuracy_ns\":null,"
+	       "\"stdout_base64\":\"",
 	       name, wasm_hash, cwasm_hash, r.kind, r.detail,
 	       correct ? "true" : "false", guest_output.output_error,
 	       guest_output.pending_stdout, guest_output.pending_stderr,
-	       guest_output.unsupported_clock);
+	       guest_output.unsupported_clock,
+	       guest_output.realtime_supported ? "true" : "false",
+	       guest_output.realtime_caps.version,
+	       guest_output.realtime_caps.source,
+	       guest_output.realtime_caps.resolution_ns,
+	       guest_output.realtime_caps.efi_accuracy_pptrillion,
+	       guest_output.realtime_caps.sample_span_ns);
 	base64(guest_output.stdout_bytes, guest_output.stdout_length);
 	printf("\",\"stderr_base64\":\"");
 	base64(guest_output.stderr_bytes, guest_output.stderr_length);
