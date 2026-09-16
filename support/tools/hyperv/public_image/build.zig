@@ -79,5 +79,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     cost_probe.root_module.addOptions("test_options", options);
+    b.step("build-cost-probe", "Compile the uninstalled synthetic cost probe without running it").dependOn(&cost_probe.step);
     b.step("diagnose-cost", "Measure actual synthetic package and independent boot hashes without a guest").dependOn(&b.addRunArtifact(cost_probe).step);
 }
