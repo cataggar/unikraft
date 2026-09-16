@@ -30,6 +30,18 @@ HOST_TOOLS = ("zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
               "llvm-readelf", "llvm-strip", "bison", "flex",
               "python3", "git", "bash", "m4", "timeout", "head")
 ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+COMMAND_ERROR_MARKERS = (
+    "AccessDenied", "BrokenPipe", "FileNotFound", "FileTooBig", "InputOutput",
+    "InvalidEnumTag", "InvalidNativeMakeEnvironment", "InvalidNativeMakePath",
+    "InvalidPath", "MissingField", "ModuleNotFound", "NameTooLong", "NoSpaceLeft",
+    "NoncanonicalNativeMakeEnvironment", "NotDir", "OutOfMemory",
+    "PathAlreadyExists", "PermissionDenied", "ReadOnlyFileSystem",
+    "SystemResources", "TooManySymbolicLinkLevels", "UnexpectedToken",
+    "UnsafeFile", "UnsafeNativeMakeTool", "UnsupportedNativeMakeHost",
+    "UnsupportedTarget",
+)
+COMMAND_ERROR_PATTERN = re.compile(
+    rb"\b(?:" + b"|".join(name.encode("ascii") for name in COMMAND_ERROR_MARKERS) + rb")\b")
 
 
 class Refusal(ValueError):
@@ -120,6 +132,11 @@ def producer_inputs():
             "tools": {name: digest(Path(tool(name))) for name in HOST_TOOLS}}
 
 
+def command_error_markers(raw):
+    observed = {match.group() for match in COMMAND_ERROR_PATTERN.finditer(raw)}
+    return [name for name in COMMAND_ERROR_MARKERS if name.encode("ascii") in observed]
+
+
 def run(root, stage, args, seconds=600, limit=8 * MIB):
     """Fixed timeout/head ceiling; raw output stays private, never in Actions stdout."""
     output = root / "private" / (stage + ".log")
@@ -132,11 +149,14 @@ def run(root, stage, args, seconds=600, limit=8 * MIB):
         ], cwd=REPO, stdout=stream, stderr=subprocess.STDOUT,
             env=dict(os.environ, WAMR_CI_CAPTURE_LIMIT=str(limit + 1)), check=False)
     size = output.stat().st_size
+    markers = (command_error_markers(read(output, limit + 1))
+               if size <= limit + 1 else None)
     save(root / "evidence" / ("command-" + stage + ".json"), {
         "scope": "command_diagnostic_not_acceptance", "stage": stage,
         "exit_code": result.returncode, "bytes": size,
         "sha256": digest(output) if size else hashlib.sha256(b"").hexdigest(),
         "over_limit": size > limit,
+        "known_error_markers": markers,
     })
     require(result.returncode == 0 and size <= limit, "bounded command failed")
     return output

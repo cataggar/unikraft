@@ -300,6 +300,28 @@ class Evidence(unittest.TestCase):
         self.assertNotIn(str(self.root).encode(), raw)
         self.assertFalse((root / "evidence/result.json").exists())
 
+    def test_command_markers_are_closed_diagnostics_not_external_text(self):
+        raw = (b"\xff\0error: UnsafeFile\nerror: InvalidNativeMakePath\n"
+               b"error: PRIVATE_SYNTHETIC_STATE\nUnsafeFileSuffix\n"
+               b"/private/fixture/secret\nerror: UnsafeFile\n")
+        self.assertEqual(ci.command_error_markers(raw),
+                         ["InvalidNativeMakePath", "UnsafeFile"])
+        self.assertEqual(ci.command_error_markers(
+            b"UnsafeFileSuffix PrefixUnsafeFile PRIVATE_SYNTHETIC_STATE"), [])
+        source = "import sys; sys.stdout.buffer.write(" + repr(raw) + "); sys.exit(3)"
+        with self.assertRaises(ci.Refusal):
+            ci.run(self.root, "closed-markers", [sys.executable, "-c", source])
+        record_path = self.root / "evidence/command-closed-markers.json"
+        record = ci.document(record_path)
+        self.assertEqual(record["known_error_markers"],
+                         ["InvalidNativeMakePath", "UnsafeFile"])
+        self.assertEqual(record["exit_code"], 3)
+        self.assertEqual(record["sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(record["bytes"], len(raw))
+        self.assertNotIn(b"PRIVATE_SYNTHETIC_STATE", record_path.read_bytes())
+        self.assertNotIn(b"/private/fixture", record_path.read_bytes())
+        self.assertFalse((self.root / "evidence/result.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

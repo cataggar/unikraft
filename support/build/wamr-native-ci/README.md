@@ -76,7 +76,10 @@ The seven-day Actions artifact includes only explicit `compute/evidence/*.json`:
 build/content hashes, typed successful compute observations, native packaging
 inspection, and allowlisted failure flags/byte counts/hashes. Diagnostics do
 not copy paths, arbitrary exceptions, environment, raw serial or runtime/account
-state. A failed/missing boot never creates `result.json`. Evidence collection
+state. Command records also report only fixed, allowlisted error-name markers
+observed in bounded output, not copied error messages or a diagnosis. A null
+marker list means the capture exceeded the scan bound. A failed/missing boot
+never creates `result.json`. Evidence collection
 is diagnostic only and cannot turn failure into success.
 
 ## Focused checks
