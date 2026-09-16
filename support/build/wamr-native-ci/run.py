@@ -127,17 +127,14 @@ def source():
     return {"revision": head, "tree": git("rev-parse", "HEAD^{tree}")}
 
 
-def producer_inputs():
+def producer_inputs(runtime):
     return {"source": source(),
             "tools": {name: digest(Path(tool(name))) for name in HOST_TOOLS},
-            "bison_data": bison_inputs()}
+            "bison_data": bison_inputs(runtime / "bison")}
 
 
-def bison_inputs():
-    configured = os.environ.get("BISON_PKGDATADIR")
-    require(configured is not None and Path(configured).is_absolute(),
-            "explicit private Bison data required")
-    root = Path(configured)
+def bison_inputs(root):
+    require(root.is_absolute(), "absolute private Bison data required")
     require(root.resolve(strict=True) == root
             and stat.S_ISDIR(root.lstat().st_mode)
             and root.stat().st_uid == os.getuid()
@@ -348,7 +345,9 @@ def build(runtime, wamr):
     os.environ.update(TMPDIR=str(root / "scratch"), MAKEFLAGS="-j2",
                       ZIG_LOCAL_CACHE_DIR=str(root / "cache"),
                       ZIG_GLOBAL_CACHE_DIR=str(root / "global-cache"))
-    initial = producer_inputs()
+    require(os.environ.get("BISON_PKGDATADIR") == str(runtime / "bison"),
+            "Bison build environment differs from bound producer input")
+    initial = producer_inputs(runtime)
     save(root / "evidence/build-start.json", initial)
     require(subprocess.check_output([tool("zig"), "version"]).strip() == b"0.16.0",
             "Zig 0.16.0 required")
@@ -366,7 +365,7 @@ def build(runtime, wamr):
     run(root, "config", [sys.executable, APP / "build-image.py", "olddefconfig"])
     # This target includes the unchanged final ELF IRQ/constructor/SMP proofs.
     run(root, "native-image", [sys.executable, APP / "build-image.py", "native-images"], 1800)
-    require(producer_inputs() == initial, "source or producer tool changed during build")
+    require(producer_inputs(runtime) == initial, "source or producer tool changed during build")
     save(root / "evidence/build.json", check_build())
     save(root / "evidence/boot-inputs.json", {
         "package_tool": digest(root / "tools/bin/wamr-ci-package"),
@@ -382,7 +381,7 @@ def boot(runtime):
             and os.access("/dev/kvm", os.R_OK | os.W_OK),
             "x86 KVM runner required; no successful skip")
     root = runtime / "compute"
-    require(producer_inputs() == document(root / "evidence/build-start.json"),
+    require(producer_inputs(runtime) == document(root / "evidence/build-start.json"),
             "producer inputs changed")
     require(check_build() == document(root / "evidence/build.json"), "build identity changed")
     inputs = document(root / "evidence/boot-inputs.json")
@@ -425,7 +424,7 @@ def boot(runtime):
                  150, 64 * 1024)
     require(document(output) == package, "physical package reload changed")
     verify_inputs()
-    require(producer_inputs() == document(root / "evidence/build-start.json"),
+    require(producer_inputs(runtime) == document(root / "evidence/build-start.json"),
             "producer inputs changed after boot")
     require(check_build() == document(root / "evidence/build.json"), "source or image changed")
     # No self hash: this final record binds earlier immutable observations only.

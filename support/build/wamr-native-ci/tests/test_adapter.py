@@ -201,37 +201,58 @@ class Evidence(unittest.TestCase):
         file = root / "skeleton"
         self.put(file, b"first")
         self.put(root / "empty", b"")
-        with mock.patch.dict(os.environ, {"BISON_PKGDATADIR": str(root)}):
-            before = ci.bison_inputs()
-            self.assertEqual((before["files"], before["bytes"]), (2, 5))
-            self.put(file, b"other")
-            self.assertNotEqual(before["sha256"], ci.bison_inputs()["sha256"])
-            file.chmod(0o666)
-            with self.assertRaises(ci.Refusal):
-                ci.bison_inputs()
-            file.chmod(0o600)
-            (root / "link").symlink_to(file)
-            with self.assertRaises(ci.Refusal):
-                ci.bison_inputs()
-            (root / "link").unlink()
-            root.chmod(0o755)
-            with self.assertRaises(ci.Refusal):
-                ci.bison_inputs()
+        before = ci.bison_inputs(root)
+        self.assertEqual((before["files"], before["bytes"]), (2, 5))
+        self.put(file, b"other")
+        self.assertNotEqual(before["sha256"], ci.bison_inputs(root)["sha256"])
+        file.chmod(0o666)
+        with self.assertRaises(ci.Refusal):
+            ci.bison_inputs(root)
+        file.chmod(0o600)
+        (root / "link").symlink_to(file)
+        with self.assertRaises(ci.Refusal):
+            ci.bison_inputs(root)
+        (root / "link").unlink()
+        root.chmod(0o755)
+        with self.assertRaises(ci.Refusal):
+            ci.bison_inputs(root)
 
     def test_bison_entry_and_byte_bounds(self):
         root = self.root / "bison"
         root.mkdir(mode=0o700)
-        with mock.patch.dict(os.environ, {"BISON_PKGDATADIR": str(root)}):
-            with self.assertRaises(ci.Refusal):
-                ci.bison_inputs()
-            self.put(root / "oversized", b"x" * (8 * ci.MIB + 1))
-            with self.assertRaises(ci.Refusal):
-                ci.bison_inputs()
-            (root / "oversized").unlink()
-            for index in range(513):
-                self.put(root / str(index), b"")
-            with self.assertRaises(ci.Refusal):
-                ci.bison_inputs()
+        with self.assertRaises(ci.Refusal):
+            ci.bison_inputs(root)
+        self.put(root / "oversized", b"x" * (8 * ci.MIB + 1))
+        with self.assertRaises(ci.Refusal):
+            ci.bison_inputs(root)
+        (root / "oversized").unlink()
+        for index in range(513):
+            self.put(root / str(index), b"")
+        with self.assertRaises(ci.Refusal):
+            ci.bison_inputs(root)
+
+    def test_boot_revalidation_does_not_need_inherited_build_environment(self):
+        root = self.root / "bison"
+        root.mkdir(mode=0o700)
+        self.put(root / "skeleton", b"fixture")
+        expected = ci.bison_inputs(root)
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ci, "source", return_value={"fixture": True}), \
+                mock.patch.object(ci, "tool", return_value="/synthetic-tool"), \
+                mock.patch.object(ci, "digest", return_value="f" * 64):
+            self.assertEqual(ci.producer_inputs(self.root)["bison_data"], expected)
+            self.assertNotIn("BISON_PKGDATADIR", os.environ)
+
+    def test_build_refuses_an_unbound_bison_environment(self):
+        for index, override in enumerate((None, str(self.root / "different"))):
+            runtime = self.root / ("build-" + str(index))
+            runtime.mkdir(mode=0o700)
+            values = {} if override is None else {"BISON_PKGDATADIR": override}
+            with mock.patch.dict(os.environ, values, clear=True), \
+                    mock.patch.object(ci, "producer_inputs") as inputs:
+                with self.assertRaises(ci.Refusal):
+                    ci.build(runtime, self.root)
+                inputs.assert_not_called()
 
     def synthetic_boot(self, raw=None):
         config = ci.config_for(self.root, self.root, 0)

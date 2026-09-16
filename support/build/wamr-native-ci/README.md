@@ -22,6 +22,10 @@ executable comparison. Native Make uses that private copy, not writable
 runner `/usr/share` data. Its complete regular-file contents are bound before
 and after use, capped at 512 entries and 8 MiB; the published record contains
 only the aggregate digest, file count and byte count.
+Boot revalidation addresses the fixed private runtime input directly after
+the managed credential boundary clears the environment; it does not forward
+build variables through that boundary. Build admission separately requires
+the configured Bison directory to match that bound input.
 
 ## Why this adapter exists
 
