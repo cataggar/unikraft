@@ -16,6 +16,9 @@ pub const parent_slots = @intFromEnum(Stage.child_entry);
 pub const child_slots = @typeInfo(Stage).@"enum".fields.len - parent_slots;
 pub const max_bytes = (1 + child_slots) * slot_size;
 pub const max_jobs = 8 * m.step_count + 1;
+pub const log_prefix = "persistence_timing ";
+pub const report_bytes = (parent_slots + child_slots) * (slot_size + log_prefix.len) + slot_size;
+pub const collector_log_bytes = max_jobs * report_bytes + slot_size;
 pub const Status = enum { ok, empty, prefix, partial_slot, complete, invalid, overflow, clock_failed, io_failed, missing, not_started, cleanup_unconfirmed };
 
 pub const Header = struct {
@@ -369,21 +372,34 @@ pub const Parent = struct {
         }
     }
 
-    fn report(self: *Parent) void {
-        for (self.records.values[0..self.records.count]) |record| printRecord(record);
-        for (self.child_records.values[0..self.child_records.count]) |record| printRecord(record);
-        std.debug.print("persistence_timing scope=synthetic_timing_only authority=none mode={s} sequence={d} parent_status={s} child_status={s} parent_records={d} child_records={d}\n", .{
+    pub fn encodeReport(self: *const Parent, buffer: *[report_bytes]u8) ![]const u8 {
+        if (self.records.count > parent_slots or self.child_records.count > child_slots)
+            return error.DiagnosticOverflow;
+        var out: std.Io.Writer = .fixed(buffer);
+        for (self.records.values[0..self.records.count]) |record| try writeRecord(&out, record);
+        for (self.child_records.values[0..self.child_records.count]) |record| try writeRecord(&out, record);
+        try out.print("persistence_timing scope=synthetic_timing_only authority=none mode={s} sequence={d} parent_status={s} child_status={s} parent_records={d} child_records={d}\n", .{
             @tagName(self.mode), self.sequence, @tagName(self.records.status), @tagName(self.child_records.status), self.records.count, self.child_records.count,
         });
+        return out.buffered();
+    }
+
+    fn report(self: *const Parent) void {
+        var buffer: [report_bytes]u8 = undefined;
+        const bytes = self.encodeReport(&buffer) catch |err| {
+            std.debug.print("persistence_timing scope=synthetic_timing_only authority=none status={s}\n", .{
+                if (err == error.DiagnosticOverflow or err == error.WriteFailed) @as([]const u8, "overflow") else "invalid",
+            });
+            return;
+        };
+        std.debug.print("{s}", .{bytes});
     }
 };
 
-fn printRecord(record: Record) void {
-    const slot = record.encode() catch {
-        std.debug.print("persistence_timing scope=synthetic_timing_only authority=none status=invalid\n", .{});
-        return;
-    };
-    std.debug.print("persistence_timing {s}", .{std.mem.trimEnd(u8, &slot, "\x00")});
+fn writeRecord(out: *std.Io.Writer, record: Record) !void {
+    const slot = try record.encode();
+    try out.writeAll(log_prefix);
+    try out.writeAll(std.mem.trimEnd(u8, &slot, "\x00"));
 }
 
 pub const Selection = struct {

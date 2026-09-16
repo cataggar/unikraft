@@ -2162,6 +2162,131 @@ class HypervAzureControllerTest(unittest.TestCase):
 
 
 class HypervWorkflowTest(unittest.TestCase):
+    def test_fixture_observation_options_and_always_retention(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        for family, lane, step_name, flag in (
+            ("persistence", "runtime",
+             "Run native Hyper-V persistence engine fixtures",
+             "-Dpersistence-timing=true"),
+            ("host", "build-protocol",
+             "Run native agentless Hyper-V host fixtures",
+             "-Dhost-timing=true"),
+        ):
+            job = workflow.split(f"  zig-hyperv-{lane}:\n", 1)[1].split(
+                "\n  zig-hyperv", 1
+            )[0]
+            step = job.split(f"    - name: {step_name}\n", 1)[1].split(
+                "\n    - name:", 1
+            )[0]
+            self.assertIn(flag, step)
+            self.assertIn("for mode in Debug ReleaseSafe; do", step)
+            self.assertIn("set -euo pipefail", step)
+            self.assertIn('2>&1 | tee "${root}/${mode}/fixtures.log"', step)
+            self.assertNotIn("-Dtest-filter=", step)
+            self.assertNotIn("|| true", step)
+            retained = job.split(
+                f"    - name: Collect bounded {family} observations\n", 1
+            )[1].split("\n    - name:", 1)[0]
+            self.assertIn("      if: always()\n", retained)
+            self.assertIn(
+                f"hyperv-fixture-observation-evidence.sh {family}", retained
+            )
+            self.assertIn(f"/native-{family}/observation-evidence/", job)
+            if family == "host":
+                image_build = step.split('root}/image/zig-local-cache', 1)[1]
+                self.assertNotIn(flag, image_build)
+                self.assertNotIn("--strip-debug", step)
+                upload = job.split(
+                    "    - name: Retain bounded host fixture evidence\n", 1
+                )[1].split("\n    - name:", 1)[0]
+                self.assertIn("      if: always()\n", upload)
+                self.assertIn("name: zig-hyperv-host-evidence", upload)
+
+    def test_fixture_observation_copy_retains_success_failure_and_prefix(self):
+        helper = SUPPORT.parent / ".github/scripts/hyperv-fixture-observation-evidence.sh"
+        for family in ("host", "persistence"):
+            for outcome in ("success", "failure"):
+                with self.subTest(family=family, outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "hyperv-ci" / f"native-{family}"
+                    root.mkdir(parents=True, mode=0o700)
+                    expected = {}
+                    modes = ("Debug", "ReleaseSafe") if outcome == "success" else ("Debug",)
+                    for mode in modes:
+                        work = root / mode
+                        work.mkdir(mode=0o700)
+                        log = work / "fixtures.log"
+                        log.write_bytes(f"native {outcome}\npartial prefix\n".encode())
+                        log.chmod(0o600)
+                        expected[f"{mode}-fixtures.log"] = log.read_bytes()
+                        if family == "host":
+                            fixtures = work / "fixtures"
+                            fixtures.mkdir(mode=0o700)
+                            record = fixtures / "synthetic-host-timing-hard_deadline-v1.jsonl"
+                            record.write_bytes(b'{"synthetic":"opaque-copy"}\n')
+                            record.chmod(0o600)
+                            expected[f"{mode}-{record.name}"] = record.read_bytes()
+                    command = ["bash", str(helper), family]
+                    env = dict(os.environ, RUNNER_TEMP=tmp)
+                    result = subprocess.run(command, env=env, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    retained = root / "observation-evidence"
+                    self.assertEqual({p.name for p in retained.iterdir()}, set(expected))
+                    for name, data in expected.items():
+                        self.assertEqual((retained / name).read_bytes(), data)
+                        self.assertEqual((retained / name).stat().st_mode & 0o777, 0o600)
+                    repeated = subprocess.run(command, env=env, capture_output=True, timeout=10)
+                    self.assertNotEqual(repeated.returncode, 0)
+                    for name, data in expected.items():
+                        self.assertEqual((retained / name).read_bytes(), data)
+
+    def test_fixture_observation_copy_refuses_unsafe_and_oversized_inputs(self):
+        helper = SUPPORT.parent / ".github/scripts/hyperv-fixture-observation-evidence.sh"
+        for invalid in ("symlink", "hardlink", "public", "oversized",
+                        "directory-link", "root-link", "dangling-root-link"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "hyperv-ci/native-host"
+                root.mkdir(parents=True, mode=0o700)
+                work = root / "Debug"
+                work.mkdir(mode=0o700)
+                log = work / "fixtures.log"
+                log.write_bytes(b"bounded\n")
+                log.chmod(0o600)
+                if invalid == "symlink":
+                    log.rename(work / "other")
+                    log.symlink_to("other")
+                elif invalid == "hardlink":
+                    os.link(log, work / "other")
+                elif invalid == "public":
+                    log.chmod(0o644)
+                elif invalid == "oversized":
+                    with log.open("r+b") as stream:
+                        stream.truncate(8388609)
+                elif invalid == "directory-link":
+                    work.rename(root / "other")
+                    work.symlink_to("other", target_is_directory=True)
+                else:
+                    root.rename(root.with_name("other"))
+                    root.symlink_to(
+                        "missing" if invalid == "dangling-root-link" else "other",
+                        target_is_directory=True,
+                    )
+                result = subprocess.run(
+                    ["bash", str(helper), "host"], env=dict(os.environ, RUNNER_TEMP=tmp),
+                    capture_output=True, timeout=10,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((root / "observation-evidence/Debug-fixtures.log").exists())
+        with tempfile.TemporaryDirectory() as tmp:
+            for family, expected in (("host", 0), ("persistence", 0), ("unknown", 2)):
+                result = subprocess.run(
+                    ["bash", str(helper), family], env=dict(os.environ, RUNNER_TEMP=tmp),
+                    capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, expected)
+                self.assertEqual(result.stdout, b"")
+
     def test_public_fixture_mode_api_and_failure_timing(self):
         helper = SUPPORT.parent / ".github/scripts/hyperv-native-public-fixtures.sh"
         harness = r"""
@@ -2301,6 +2426,47 @@ class HypervWorkflowTest(unittest.TestCase):
             "prepared_image_artifact:",
         ):
             self.assertIn(target, producer)
+
+    def test_local_boot_synthetic_strip_gate_and_failure_evidence_wiring(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        producer = workflow.split("  zig-hyperv:\n", 1)[1].split(
+            "\n  zig-hyperv-complete:", 1
+        )[0]
+        step = producer.split(
+            "    - name: Run native public Hyper-V local-boot fixtures\n", 1
+        )[1].split("\n    - name:", 1)[0]
+        for required in (
+            "if: ${{ success() && !cancelled() }}",
+            "set -euo pipefail", "umask 077",
+            'readlink -f "${RUNNER_TEMP}/hyperv-tools/bin/llvm-objcopy"',
+            "ci-objcopy-version.awk",
+            'sha256sum -- "${objcopy}"',
+            'sha256sum --check "${root}/fixture-objcopy-sha256.txt"',
+            "for mode in Debug ReleaseSafe; do",
+            '-Dstrip-fixture-debug=true "-Dfixture-objcopy=${objcopy}"',
+            '"-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json"',
+            '-Doptimize="${mode}" -j2',
+            "test test-strip-equivalence test-strip-proof install --summary all",
+            '2>&1 | tee "${root}/${mode}/fixtures.log"',
+        ):
+            self.assertIn(required, step)
+        for forbidden in ("--strip-all", "-Dstrip=true", "|| true",
+                          "continue-on-error:", "-Dtest-filter="):
+            self.assertNotIn(forbidden, step)
+        retained = producer.split(
+            "    - name: Retain bounded local image evidence\n", 1
+        )[1]
+        for mode in ("Debug", "ReleaseSafe"):
+            for artifact in (
+                "fixtures.log", "fixture-strip-proof.json",
+                "zig-local-cache/**/local-boot-qemu-fixture",
+                "zig-local-cache/**/local-boot-qemu-diagnostic-fixture",
+            ):
+                self.assertIn(
+                    f"/native-local-boot/{mode}/{artifact}", retained
+                )
 
     def test_producer_dependency_guard_is_failure_aware_and_cancelable(self):
         workflow = (

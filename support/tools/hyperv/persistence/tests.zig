@@ -987,7 +987,7 @@ test "persistence timing native malformed delivery preserves failure even when d
         var work = try fixture();
         defer work.deinit();
         var provision: TimingProvision = .{ .remove_timing = remove_timing };
-        var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = .malformed_create, .enabled = options.persistence_timing, .emit_log = false };
+        var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = .malformed_create, .enabled = options.persistence_timing };
         var supervisor: p.worker.Supervisor = .{
             .allocator = a,
             .io = t.io,
@@ -1030,7 +1030,7 @@ test "persistence timing shared child success timeout and checkpoint stages surv
         var work = try fixture();
         defer work.deinit();
         var provision: Provision = .{ .mode = mode };
-        var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = mode, .enabled = options.persistence_timing, .emit_log = mode == .good or mode == .secret_failure };
+        var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = mode, .enabled = options.persistence_timing };
         var supervisor: p.worker.Supervisor = .{
             .allocator = a,
             .io = t.io,
@@ -1065,4 +1065,45 @@ test "persistence timing shared child success timeout and checkpoint stages surv
             }
         } else try t.expectEqual(@as(usize, 0), trace.records.count);
     }
+}
+
+test "persistence timing bounded report survives fixture cleanup for success and failure prefixes" {
+    var trace: timing.Parent = .{ .allocator = a, .io = t.io, .mode = .good, .enabled = true, .emit_log = false };
+    const header = try timingHeader();
+    trace.sequence = header.sequence;
+    {
+        var work = try fixture();
+        defer work.deinit();
+        const sidecar = try timing.Sidecar.create(t.io, work.directory, header);
+        defer sidecar.close(t.io);
+        for (0..timing.child_slots) |index| {
+            var record = try timing.Record.observe(header, @enumFromInt(timing.parent_slots + index), null);
+            record.sample.monotonic_ns = index;
+            record.sample.process_cpu_ns = index;
+            try sidecar.file.writePositionalAll(t.io, &try record.encode(), (index + 1) * timing.slot_size);
+        }
+        trace.child_records = try sidecar.read(a, t.io, work.directory, true);
+    }
+    try t.expectEqual(timing.Status.complete, trace.child_records.status);
+    for (0..timing.parent_slots) |index| {
+        const stage: timing.Stage = @enumFromInt(index);
+        var record = try timing.Record.observe(header, stage, if (stage == .process_return) true else null);
+        record.sample.monotonic_ns = index;
+        record.sample.process_cpu_ns = index;
+        try trace.records.push(record);
+    }
+    var buffer: [timing.report_bytes]u8 = undefined;
+    const complete = try trace.encodeReport(&buffer);
+    try t.expect(complete.len <= timing.report_bytes);
+    try t.expectEqual(timing.parent_slots + timing.child_slots + 1, std.mem.count(u8, complete, "\n"));
+    for ([_][]const u8{ "nonce", "parent_pid", "input_sha256", "SYNTHETIC_SECRET" }) |forbidden|
+        try t.expect(std.mem.indexOf(u8, complete, forbidden) == null);
+    trace.child_records = .{ .child = true, .status = .not_started };
+    trace.records.count = 2;
+    const prefix = try trace.encodeReport(&buffer);
+    try t.expectEqual(@as(usize, 3), std.mem.count(u8, prefix, "\n"));
+    try t.expect(std.mem.indexOf(u8, prefix, "child_status=not_started") != null);
+    try t.expectEqual(timing.max_jobs * timing.report_bytes + timing.slot_size, timing.collector_log_bytes);
+    trace.records.count = timing.parent_slots + 1;
+    try t.expectError(error.DiagnosticOverflow, trace.encodeReport(&buffer));
 }

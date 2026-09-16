@@ -289,7 +289,7 @@ fixture and engine tests. Omit it for the quiet default. Neither the installed
 CLI nor serialized job data can select this diagnostic or synthetic backend.
 `-Dtest-filter=TEXT` uses Zig's standard fixture-name filter, as in the other
 native packages; it filters `test`, not `test-arm`. The original 28 engine
-tests and assertions remain, with six additional `persistence timing` tests.
+tests and assertions remain, with seven additional `persistence timing` tests.
 
 The sole shared extension is the null-by-default, trusted in-process
 `worker.Observer` callback (`void`, no errors entering worker failure lanes),
@@ -366,6 +366,27 @@ No deadline is paused, reset or extended. The instrumented executable itself
 can be larger, so use its reported byte count and retain default-off controls.
 Timing can perturb or cause a failure; these observations do not yet establish
 the native x64 Debug failure's cause.
+
+Normal credential-free fixture CI explicitly enables this existing option in
+both modes. Every actual native timing case now emits its bounded report on
+success and failure, including blocked-upload, partial-page and deliberately
+missing-diagnostic controls. Pure codec/overflow controls may suppress printing.
+Parent reports are encoded into a fixed `report_bytes` buffer; the existing
+265-call cap plus one overflow notice also bounds each collector's aggregate.
+A native test covers full-size reports, refusal of excessive counts and
+retention of copied child records after their fixture directory is removed.
+Neither the shared worker nor its complete SHA256/MD5 sealing/verification
+passes are changed.
+
+The existing always-run runtime artifact now retains validated copies of
+`Debug-fixtures.log` and `ReleaseSafe-fixtures.log` under
+`native-persistence/observation-evidence/`. A fixed-name workflow copier drains
+no subprocess and never parses diagnostics as status: it runs after the test
+step, accepts only owner-private single-link regular files, and refuses logs
+larger than 64 MiB rather than truncating or changing native execution.
+Both successful and failed test outputs remain eligible for retention.
+The native raw/candidate proof and artifacts remain in the same runtime upload.
+This activation is diagnostic only, not a demonstrated timeout correction.
 
 The cleanup-recovery fixture emits `recovery_initial`, `recovery_rewritten`
 and (only if the original validation succeeds) `recovery_validated`. They

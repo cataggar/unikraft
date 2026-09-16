@@ -294,6 +294,50 @@ Create the selected scratch directories first. Never execute the reference
 namespace shell scripts, full guest/Make/native-image builds, or original seed
 operations as part of these fixtures.
 
+### Unprivileged namespace observation selector
+
+The namespace build also has a deliberately separate, native **test-only**
+selector for bounded synthetic observations. It runs the fourteen
+`namespace observations ` tests and one hook-free shared-root refusal test.
+An uninstalled, single-threaded native probe opts into the same shared hooks:
+one case refuses namespace entry with `InvalidAccount` before file or namespace
+operations, and one copies its own executable into a private synthetic runtime
+and executes the actual complete runtime hashing/ELF validation. This separate
+executable is needed because Zig's default test-runner root does not expose the
+fixture root declaration. The probe has no namespace-success operation.
+This selector neither builds nor launches the namespace fixture/helper, invokes
+Git, initializes a facade, changes credentials, nor requires namespace or
+AppArmor permission. No Git closure, dependency restore, CI environment or
+disposable-VM marker is needed:
+
+```sh
+# Run from the selected checkout. Use a different fresh root for each mode.
+umask 077
+scratch="$PWD/.d/namespace-observations-debug"
+test ! -e "$scratch"
+mkdir -p "$scratch"/{work,cache,global,compiler-scratch}
+TMPDIR="$scratch/compiler-scratch" zig build \
+  --build-file support/tools/hyperv/preparation/namespace/build.zig \
+  --cache-dir "$scratch/cache" --global-cache-dir "$scratch/global" \
+  -Dworkspace="$scratch/work" -Dobservations-only=true -Doptimize=Debug \
+  -j2 test-observations --summary all
+```
+
+Repeat with `-Doptimize=ReleaseSafe` and a new private root. Both the boolean
+and the `test-observations` step are required: the boolean selects an independent
+build graph before the ordinary Git/fixture options are processed. The hook-free
+test also has an explicit `test-observer-exclusion` step and is a dependency of
+both observation-only and ordinary namespace tests. The existing namespace
+fixture selection and debug-equivalence gates are unchanged. The
+tests cover maximum fixed-record/log sizes, exact canonical bytes, closed modes
+and phase refusal, native clock/stat capture, process-local CPU ordering through
+outer return, unsafe/partial/cross-mode files, failure retention after fixture
+deletion, refusal to inspect records before cleanup, fixed internal ordering
+across repeated runtimes, recorder failure without replacing primary errors,
+descriptor counts, pre-setup disarming and the process-identity guard. They do
+not qualify namespace execution, repair a timeout, or replace native
+per-architecture CI.
+
 ### Hosted namespace fixture setup
 
 The separate `zig-hyperv-preparation` job runs this **hosted-only** setup command:
@@ -372,36 +416,154 @@ the baseline log, and removes the sidecar. Bounded fixture capability-denial
 records are also retained for diagnosis, including failures outside the
 allowance gate. Neither diagnostic can authorize a profile.
 Inner synthetic payload failures use the same bounded private error-name
-recording. Fixed Git-timeout stage markers distinguish setup from the blocked
-child; they are read only after cleanup and do not alter deadlines or admission.
-The Git-timeout markers now use eight fixed, private, create-only 512-byte
-records (4096 bytes total) under the existing scratch directory. Their typed
-canonical schema is `hyperv_preparation_namespace_stage_v1`, with
-`authority=none`. They include backend, architecture, optimization, effective
+recording. Fixed stage markers now cover **only** the dedicated
+`namespace_tests.zig` fixture's `timeout`, `git-policy`, `git-unborn`,
+`git-modified` and `git-timeout` modes, under their existing fixture scratch
+roots. They do not instrument any production CLI/helper, the production runtime,
+process runner or admission path. There are 58 closed, private, create-only 512-byte
+record names (at most 29,696 bytes total). Their typed canonical schema is
+`hyperv_preparation_namespace_stage_v2`, with `authority=none` and a closed
+fixture-mode enum. Wrong-mode and inapplicable-phase records are refused.
+Deliberately unused stages are `not_applicable`, not a misleading missing
+readiness event. Records include backend, architecture, optimization, effective
 AArch64 SHA2 and x86 SHA/AVX2 features, self-executable byte count, monotonic
 time and process-CPU time. The sampling helper is shared with local-boot
 synthetic diagnostics; local-boot's flat v1 wire and 4096/4352-byte bounds
 are unchanged. No production helper imports the sampling module.
 
 `clock_scope=outer_helper` describes the original synthetic fixture process
-through `namespace_enter`; `clock_scope=inner_payload` describes the separate
-payload process. `inner_payload_entry` is written before `git_entry.load`,
-using the same cwd-to-scratch opening as the closed inner-error sidecar.
-`inside_ready` remains after that load. CPU differences are meaningful only
-within one scope and exclude CPU consumed by subprocesses such as Git.
-Cross-scope monotonic wall comparisons use the same time namespace; records
-from different CI runners must not be combined. No PID lookup, signal handler,
-pre-TERM observation or stop/completion proof is added.
+through `namespace_enter`, and again at `namespace_return`;
+`clock_scope=inner_payload` describes the separate payload process. The latter
+is not the CPU of the detached child or native Git. CPU differences are checked
+only within one scope, including the original outer scope on return.
+Cross-scope monotonic comparisons use the same time namespace; records from
+different invocations/runners must not be combined. These outer records add no PID lookup, signal
+handler, pre-TERM observation or stop/completion proof is added.
 
-After process cleanup, a missing-ready failure retains one bounded
-`Namespace Git timeout observations:` line in the existing namespace log.
-The entire line is limited to 6144 bytes. Missing, partial, invalid, oversized,
-unavailable and out-of-order observations are explicit; invalid bytes are
-never echoed. Reading diagnostics cannot replace the original missing-ready
-error. Marker writes add no fsyncs and make no durability claim. Clock/stat,
-encoding and write overhead are nonzero; this is measurement, not a
-performance repair. The actual five-second deadline/start, ready and rootfs
-assertions, closed error classifications and cleanup requirements remain.
+The fixed boundaries distinguish:
+
+- Helper/payload copy from complete inventory/file recording:
+  `helper_copy` / `helper_copied` / `helper_recorded`, and the equivalent
+  `payload_*` stages.
+- The timeout fixture's dynamic copy/record and incomplete-runtime validation:
+  `dynamic_copy` / `dynamic_copied` / `dynamic_recorded` /
+  `incomplete_validated`, then `runtime_ready`.
+- Git's existing combined public-runtime copy/record/validation call:
+  `git_runtime_copy` / `runtime_ready`; account/facade/environment setup
+  through `context_ready`; synthetic repository commands within
+  `git_setup` / `git_setup_ready`.
+- Sandbox inventory/policy recording: `sandbox_record` / `sandbox_ready`;
+  ordinary Git binding reopen and validation: `binding_reopen` /
+  `binding_reopened` / `binding_validated`. Each public-policy validation
+  and each deliberately refused `ns.enter` variant has its own before/after
+  markers (`make_policy_*`, `git_policy_*`, `missing_policy_*`, `alias_*`,
+  `missing_helper_*`, `missing_git_*`).
+- Actual entry: `namespace_enter` / `inner_payload_entry` /
+  `namespace_return`. For `timeout`, `detached_setup` / `detached_forked` /
+  `detached_ready` bracket the lock/pipe/fork and parent readiness wait.
+  `timeout_ready` is sampled only **after** the unchanged readiness file write.
+- For Git, `inner_payload_entry` is before `git_entry.load`, using the existing
+  fixed cwd-to-scratch opening; `inside_ready` remains after that load.
+  `policy_ready` follows the payload's existing policy/readonly checks.
+  Each stripped/poisoned head/index dispatch has separate before/after markers.
+  `blocked_probe` / `blocked_spawned` / `write_observed` / `blocked_checked`
+  separate spawning, the existing bounded readiness loop and child checks.
+  The intentional stall then records `timeout_ready`; ordinary Git records
+  `blocked_reaped`, `invalid_commands` / `invalid_commands_ready` and
+  `inner_complete`.
+
+On an assertion/error return in these tests, an `errdefer` retains one bounded
+line **before fixture deletion**, including the pre-`timeout-ready` five-second
+failure and ordinary `git-policy` thirty-second failure. Its prefix is
+`Namespace fixture observations:` (the existing
+`Namespace Git timeout observations:` prefix remains for `git-timeout`).
+The entire v2 line is limited to 37,376 bytes. Records are read only after
+reported complete cleanup; otherwise only `cleanup_incomplete` is logged,
+without accessing the fixture. An absent/unreadable scratch or collection
+failure produces a fixed `unavailable` envelope. Missing, partial, invalid,
+oversized, unavailable and out-of-order records are explicit. No paths, argv,
+private environment, origins or invalid raw bytes are emitted. Diagnostic
+collection cannot replace the original test error.
+
+Blind spots remain before scratch creation, inside the production helper's
+entry/validation/mount/exec path, and within the unchanged combined public-Git
+runtime call, repository-setup batch and invalid-command batch. A final marker
+only bounds where progress stopped; it cannot establish filesystem latency,
+CPU contention, a deadlock or a successful stopped payload. Return markers
+normally remain missing for intentional timeouts. Marker writes add no fsyncs
+and make no durability claim. Clock/stat, encoding and write overhead are
+nonzero: **these namespace failures are not claimed fixed**. The actual
+5/15/30-second deadlines and their start positions, readiness/rootfs assertions,
+the original eight required Git-timeout stage assertions, closed errors and
+cleanup/recording requirements remain unchanged.
+
+#### Fixture-only internal entry observations
+
+Shared `namespace.zig` and `runtime.zig` additionally have compile-time hooks
+selected only by the dedicated synthetic executable roots'
+`namespace_fixture_observer` declaration. Ordinary production, helper and
+controller roots have neither that declaration nor an observer/measurement
+dependency. There is no runtime option, request field, installed probe or
+admission authority. Hook absence does not imply bit-identical rebuilt Debug
+binaries: debug metadata and exact-source commitments can change.
+
+Only the final `namespace_enter` in the five observed fixture modes arms this
+recorder. Earlier validations and negative controls retain their existing
+distinct outer stages without allocating internal slots. Internal context
+`isolation` covers initial isolation/helper validation; `runtime_0` through
+`runtime_2` identify successive entries in the existing sandbox runtime array.
+They are not private runtime names. A fresh process/scratch family is required;
+reusing a record never overwrites or adopts it.
+
+The closed `namespace_internal_v1` schema has `authority=none`, fixed context
+and phase enums, sequence, the known synthetic executable size, and the existing
+native clock/backend sample. Up to 96 exclusive 0600 files,
+`internal-entry-00` through `internal-entry-95`, each hold at most 512 bytes.
+The bounded collection log is at most 50,176 bytes, prefixed
+`Namespace internal observations:`. No paths, arguments, environment, private
+identities, original bytes or successful-entry/status fields are included.
+
+`isolation_begin/end` bracket the initial validation. Within each complete
+runtime validation, `inventory_begin/end` include full inventory hashing,
+`loader_begin/end` include any loader recording/hash/ELF work, and
+`executable_record_begin/end` bracket separate complete executable recording.
+`executable_read_begin/end`, `executable_hash_end` and `executable_elf_end`
+separate its existing full read, digest check and ELF validation.
+`libraries_begin/end` include dependency validation and role checks;
+`origin_begin/end` bracket physical-origin validation, and `validation_end`
+follows the existing named-directory metadata recheck.
+`mounts_begin/end` bracket initial mount planning; each repeated runtime has
+`runtime_begin` and `runtime_mount_begin/end`, including its existing ELF,
+interpreter and file/directory mount preparation.
+`mounts_finalize_begin/end` cover the remaining device/environment/policy,
+sorting and fresh-root checks. `namespace_setup_begin` is the final observation,
+immediately before the unchanged first user-namespace call. It is an observed
+transition only, not successful namespace setup, readiness or completion.
+
+All internal samples use the original process's `outer_helper` CPU scope.
+The writer checks its process identity and disarms before namespace setup and
+every fork; there are no post-fork CPU samples or invented terminal samples.
+It borrows only the fixture's existing scratch descriptor, opening and closing
+each record within one write. No extra persistent/inherited descriptors,
+whitelist changes or post-setup mount access are needed.
+`returned_error` records an actual pre-setup error return without serializing
+the error or replacing it. Recorder faults stop observations, leave a bounded
+closed fault record when possible, and emit only a fixed diagnostic when that
+also fails. They never preempt validation. Retention rejects unsafe, partial,
+gapped, out-of-order and regressing-clock files, preserves the valid prefix
+before fixture deletion after complete cleanup, and reports faults separately.
+An empty/missing prefix means no observed start, not a successful entry.
+
+These hooks add nonzero stat/clock/encoding/write work inside the **unchanged**
+deadlines. They are further diagnosis, not a timeout correction or device-I/O
+measurement. No validation read, integrity/error ordering, optimization,
+hash implementation, readiness, cleanup or timeout control is changed.
+Actual privileged namespace qualification and the final stopped internal stage
+still require the normal CI pipeline or separately approved isolated execution.
+Changes to shared source and rebuilt binaries require fresh exact-source,
+producer/helper/runtime and canonical provenance commitments and independent
+review; prior approvals must not be transplanted. Zig/Miz/LLVM pins are unchanged.
+
 The isolation fixture permits `/run/user` only as the exact ancestor chain of
 the selected facade, rejecting sibling entries, files and symlinks. Git policy
 variants run in their dedicated cases rather than consuming the timeout case's

@@ -8,6 +8,8 @@ const files = @import("files.zig");
 const wire = @import("wire.zig");
 const state = @import("state.zig");
 const worker = @import("worker.zig");
+const timing_enabled = @import("host_options").timing;
+const timing = if (timing_enabled) @import("host_timing") else void;
 
 pub const policy_root = "/etc/uk-hyperv-host";
 pub const state_root = "/var/lib/uk-hyperv-host";
@@ -187,16 +189,20 @@ pub const Supervised = struct {
     }
 
     pub fn call(self: *Supervised, request: Job, payload: ?[]const u8) !JobResult {
+        if (timing_enabled) timing.begin(self.deadline.expires_ns);
+        errdefer if (timing_enabled) timing.mark(.call_error);
         if (try self.deadline.expired()) return error.AttemptExpired;
         self.last_failures = .{};
         const encoded = try self.encode(request);
         defer self.allocator.free(encoded);
+        if (timing_enabled) timing.mark(.request_encoded);
         const call_index = if (self.store) |store| store.record.wire_calls else self.next_call;
         if (call_index >= 256) return error.OperationLimit;
         if (self.store) |store| {
             const reserve: u64 = encoded.len + p.max_record + @as(u64, if (request.action == .command) p.max_command else 0);
             try store.reserve(reserve, true, false);
             if (payload) |bytes| try store.reserve(bytes.len, request.evidence_name != null and std.mem.eql(u8, request.evidence_name.?, "receipt.json"), false);
+            if (timing_enabled) timing.mark(.reservation_ready);
             store.record.wire_calls += 1;
             store.record.wire_inflight = true;
             try store.save();
@@ -205,6 +211,7 @@ pub const Supervised = struct {
             if (encoded.len > p.startup_control - p.max_record - p.attempt_marker_bytes) return error.ControlAllowanceExceeded;
             self.next_call += 1;
         }
+        if (timing_enabled) timing.mark(.state_ready);
         var name_buffer: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buffer, "wire-{d}", .{call_index});
         try self.locked.directory.dir.createDir(self.io, name, .fromMode(0o700));
@@ -214,14 +221,17 @@ pub const Supervised = struct {
         defer directory.close(self.io);
         var lock = try directory.lock(self.io);
         defer lock.close(self.io);
+        if (timing_enabled) timing.mark(.operation_ready);
         if (!files.isDurable(try lock.createImmutable(self.io, "job.json", encoded))) return error.StateNotDurable;
         if (payload) |bytes| {
             const result = try lock.createImmutable(self.io, "payload.bin", bytes);
             if (!files.isDurable(result)) return error.StateNotDurable;
         }
         lock.close(self.io);
+        if (timing_enabled) timing.mark(.job_ready);
         var environment: std.process.Environ.Map = .init(self.allocator);
         defer environment.deinit();
+        if (timing_enabled) timing.mark(.process_call);
         var result = try core.process.run(self.allocator, self.io, .{
             .argv = &.{ self.self_executable, "--wire-child" },
             .environment = &environment,
@@ -232,6 +242,7 @@ pub const Supervised = struct {
             .stderr_limit = 1024,
         });
         defer result.deinit(self.allocator);
+        if (timing_enabled) timing.returned(result.cleanup_complete);
         self.last_failures = result.failures;
         if (result.failures.primary != null or !result.cleanup_complete) {
             if (self.store) |store| store.fail(result.failures);
@@ -262,6 +273,7 @@ pub const Supervised = struct {
             store.record.wire_inflight = false;
             try store.save();
         }
+        if (timing_enabled) timing.mark(.call_success);
         return response;
     }
 

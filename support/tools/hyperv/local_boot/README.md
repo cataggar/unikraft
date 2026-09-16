@@ -173,6 +173,35 @@ zig build --build-file support/tools/hyperv/local_boot/build.zig \
 ```
 
 Repeat with `-Doptimize=ReleaseSafe` and a separate output prefix.
+CI additionally selects the explicit test-only path:
+
+```text
+-Dstrip-fixture-debug=true -Dfixture-objcopy=/absolute/pinned/llvm-objcopy \
+-Dstrip-fixture-report=/absolute/private/fixture-strip-proof.json \
+test test-strip-equivalence test-strip-proof install
+```
+
+This invokes pinned LLVM `--strip-debug` **after compilation**, only on copies
+of the two uninstalled synthetic QEMU executables. Raw outputs remain in their
+original cache locations. Every test invocation first runs the existing native
+preparation `fixture_debug_verifier` on both current pairs with the reviewed
+`file_offset_relayout` policy. The gate checks complete ELF/loadable content,
+entry, machine, logical segments and allowed file-offset/section-locator
+normalizations, then rechecks complete hashes and file identities. Gate failure
+blocks fixture execution, including on a cached candidate. Native selection
+tests repeat the checks, refuse aliases/substitution/unknown policy, and may
+publish the separately named, create-only private pair proof. The existing
+13 shared equivalence/refusal cases are reused without a second ELF parser.
+
+The installed CLI, synthetic CLI, compilation mode/backend/CPU features,
+whole-file hashing and deadline placement are unchanged. `install` alone
+does not strip or qualify anything. The plain synthetic QEMU copy remains
+uninstrumented and still runs against the production CLI in the existing
+diagnostic-separation test. No real QEMU, firmware, guest image or production
+binary is stripped. This reduces nonloaded debug bytes subject to actual
+measured deadline coverage; it is not evidence that an unstripped timed run
+passed, a guest optimization, or a namespace-timeout fix.
+
 `test-root` must exist with mode 0700. Tests create and remove only their own
 randomly named child directories. The native fake QEMU is a separate,
 uninstalled executable; the production CLI has no synthetic switch.
@@ -235,6 +264,14 @@ from serial/report output, teardown and the uninstrumented production path.
 The dedicated retention fixtures also emit one validated synthetic CLI-failure
 sample and fixed invalid-file labels during a passing test run, so the CI log
 format itself is exercised without weakening any expected process outcome.
+The successful phase test and the 1200-ms intentional-stall case also emit
+complete phase samples and require mock entry before their unchanged budget,
+measured from the first hash event. This measured interval excludes the
+earlier request/child startup; the existing supervisor deadline still covers
+that startup and remains authoritative. Both initial and final full-hash
+CPU/wall intervals can be computed from the retained records. CI retains
+these logs and both raw/candidate synthetic executable pairs with their
+private equivalence proof even when later image stages never execute.
 
 Offline fixtures access no actual guest, KVM, Python, Azure, credential,
 original seed or historical private evidence. Separately, Hyper-V CI invokes

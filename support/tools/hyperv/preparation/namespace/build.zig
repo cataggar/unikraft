@@ -8,6 +8,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const workspace = b.option([]const u8, "workspace", "Explicit preparation validation subtree") orelse
         @panic("-Dworkspace is required");
+    const exclusion = exclusionTests(b, target, optimize, workspace);
+    if (b.option(bool, "observations-only", "Build only unprivileged synthetic namespace observation tests; no namespace fixture/helper") orelse false) {
+        const observations = observationTests(b, target, optimize, workspace);
+        observations.step.dependOn(&exclusion.step);
+        return;
+    }
     const git_executable = b.option([]const u8, "git-executable", "Explicit public native Git fixture executable") orelse
         @panic("-Dgit-executable is required");
     const git_loader = b.option([]const u8, "git-loader", "Explicit public native Git fixture ELF interpreter") orelse
@@ -174,6 +180,8 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{ .root_source_file = b.path("../process_fixture.zig"), .target = target, .optimize = optimize }),
     });
     const test_options = b.addOptions();
+    const internal_probe = internalProbe(b, target, optimize, workspace);
+    test_options.addOptionPath("internal_probe", internal_probe.getEmittedBin());
     test_options.addOptionPath("namespace_helper", selected_helper);
     if (fixture_path) |path|
         test_options.addOption([]const u8, "namespace_fixture", path)
@@ -196,9 +204,87 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("test_options", test_options);
     tests.root_module.addImport("synthetic_measurement", measurement);
     const run = b.addRunArtifact(tests);
+    run.step.dependOn(&exclusion.step);
     if (suite_gate) |check| run.step.dependOn(&check.step);
     run.setCwd(.{ .cwd_relative = workspace });
     b.step("test", "Run small native namespace and typed producer fixtures").dependOn(&run.step);
+}
+
+fn observationTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) *std.Build.Step.Run {
+    const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+    const elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
+    const paths = b.createModule(.{ .root_source_file = b.path("../../../../build/zig-facade-paths.zig"), .target = target, .optimize = optimize });
+    const measurement = b.createModule(.{ .root_source_file = b.path("../../synthetic_measurement.zig"), .target = target, .optimize = optimize });
+    const tests = b.addTest(.{
+        .filters = &.{"namespace observations "},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../namespace_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .single_threaded = true,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = core },
+                .{ .name = "producer_elf", .module = elf },
+                .{ .name = "facade_paths", .module = paths },
+                .{ .name = "synthetic_measurement", .module = measurement },
+            },
+        }),
+    });
+    const options = b.addOptions();
+    options.addOption([]const u8, "workspace", workspace);
+    tests.root_module.addOptions("fixture_options", options);
+    const test_options = b.addOptions();
+    test_options.addOptionPath("internal_probe", internalProbe(b, target, optimize, workspace).getEmittedBin());
+    tests.root_module.addOptions("test_options", test_options);
+    const run = b.addRunArtifact(tests);
+    run.setCwd(.{ .cwd_relative = workspace });
+    b.step("test-observations", "Run only bounded observation format, phase, refusal and failure-retention tests").dependOn(&run.step);
+    return run;
+}
+
+fn exclusionTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) *std.Build.Step.Run {
+    const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+    const elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
+    const paths = b.createModule(.{ .root_source_file = b.path("../../../../build/zig-facade-paths.zig"), .target = target, .optimize = optimize });
+    // Deliberately no synthetic_measurement or observer import in this root.
+    const tests = b.addTest(.{ .filters = &.{"production root compiles"}, .root_module = b.createModule(.{
+        .root_source_file = b.path("../namespace_observer_exclusion_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "producer_elf", .module = elf },
+            .{ .name = "facade_paths", .module = paths },
+        },
+    }) });
+    const run = b.addRunArtifact(tests);
+    run.setCwd(.{ .cwd_relative = workspace });
+    b.step("test-observer-exclusion", "Compile hook-free shared roots and exercise only pre-IO refusals").dependOn(&run.step);
+    return run;
+}
+
+fn internalProbe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) *std.Build.Step.Compile {
+    const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+    const elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
+    const paths = b.createModule(.{ .root_source_file = b.path("../../../../build/zig-facade-paths.zig"), .target = target, .optimize = optimize });
+    const measurement = b.createModule(.{ .root_source_file = b.path("../../synthetic_measurement.zig"), .target = target, .optimize = optimize });
+    const probe = b.addExecutable(.{ .name = "namespace-observer-probe", .root_module = b.createModule(.{
+        .root_source_file = b.path("../namespace_observer_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "producer_elf", .module = elf },
+            .{ .name = "facade_paths", .module = paths },
+            .{ .name = "synthetic_measurement", .module = measurement },
+        },
+    }) });
+    const options = b.addOptions();
+    options.addOption([]const u8, "workspace", workspace);
+    probe.root_module.addOptions("fixture_options", options);
+    return probe;
 }
 
 fn strippedCopy(b: *std.Build, objcopy: []const u8, raw: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {

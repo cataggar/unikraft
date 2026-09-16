@@ -1,6 +1,9 @@
 const std = @import("std");
 const host = @import("host");
 const linux = std.os.linux;
+const options = @import("fixture_options");
+const timing = if (options.timing) @import("host_timing") else void;
+pub const host_timing_fixture = options.timing;
 
 pub fn main(init: std.process.Init) void {
     execute(init) catch |err| {
@@ -13,7 +16,20 @@ fn execute(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len == 2 and std.mem.eql(u8, args[1], "--boot-child")) return host.boot.execChild(init);
     if (args.len == 2 and std.mem.eql(u8, args[1], "--wire-child")) {
+        const entry = if (options.timing) timing.Child.capture() else {};
+        errdefer if (options.timing) entry.write(init.io);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = "fixture-wire-started", .data = "native child started\n", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
+        if (options.timing) entry.write(init.io);
+        if (options.wire_success) {
+            const raw = try std.json.Stringify.valueAlloc(init.gpa, host.native.JobResult{ .not_found = true }, .{});
+            defer init.gpa.free(raw);
+            var doc = try host.core.contracts.Document.parse(init.gpa, raw, .{});
+            defer doc.deinit();
+            const bytes = try doc.canonicalAlloc(init.gpa);
+            defer init.gpa.free(bytes);
+            try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = "result.json", .data = bytes, .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
+            return;
+        }
         while (true) try std.Io.sleep(init.io, .fromSeconds(1), .awake);
     }
     if (args.len != 30) return error.InvalidFixtureArguments;
