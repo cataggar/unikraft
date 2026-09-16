@@ -36,8 +36,8 @@ jobs:
           test -c /dev/kvm
           export PATH="/usr/bin:/bin:${PATH}"
           if ! (
-            for name in make bison yacc flex lex m4 python3 getfacl; do
-              command -v "${name}" >/dev/null || exit 1
+            for name in bash make bison yacc flex lex m4 python3 getfacl; do
+              test -x "/usr/bin/${name}" || exit 1
             done
             test -r /usr/share/OVMF/OVMF_CODE_4M.fd
             test -r /usr/share/OVMF/OVMF_VARS_4M.fd
@@ -59,6 +59,11 @@ jobs:
       - name: Acquire the existing pinned VPC-capable native QEMU runtime
         run: |
           bash .github/scripts/hyperv-native-qemu-acquire.sh "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+
+      - name: Reuse authenticated private Bison data for the native Make contract
+        run: |
+          export PATH="/usr/bin:/bin:${PATH}"
+          bash .github/scripts/hyperv-native-bison-acquire.sh "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
 
       - name: Install the existing pinned Zig compiler
         uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
@@ -87,12 +92,10 @@ jobs:
             "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
           cp --no-preserve=mode,ownership \
             "$(readlink -f /usr/share/OVMF/OVMF_VARS_4M.fd)" "${root}/firmware/vars.fd"
-          # Use the distro's safe Bison data path, not an optional runner shim.
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           echo "${zig_dir}" >> "${GITHUB_PATH}"
           echo "${root}/llvm/bin" >> "${GITHUB_PATH}"
-          export BISON_PKGDATADIR=/usr/share/bison
           python3 support/build/wamr-native-ci/run.py build --runtime "${root}" \
             --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
 

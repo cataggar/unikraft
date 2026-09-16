@@ -16,6 +16,13 @@ There is no guest compiler or hosted-runtime substitute. Only the tiny
 answer/growth/trap/native-memory-selftest mode is enabled; CoreMark, native
 benchmarks and JIT workloads are deliberately separate.
 
+Bison data is materialized by the same authenticated package acquisition
+used by the existing QEMU candidate workflow, including the exact installed
+executable comparison. Native Make uses that private copy, not writable
+runner `/usr/share` data. Its complete regular-file contents are bound before
+and after use, capped at 512 entries and 8 MiB; the published record contains
+only the aggregate digest, file count and byte count.
+
 ## Why this adapter exists
 
 The existing `public_image` **engine** binds the hardware application's

@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import unittest
+from unittest import mock
 import uuid
 
 HERE = Path(__file__).resolve().parents[1]
@@ -193,6 +194,44 @@ class Evidence(unittest.TestCase):
         self.put(path, b"fresh build artifact")
         os.utime(path, ns=(1, path.stat().st_mtime_ns))
         self.assertEqual(ci.digest(path), hashlib.sha256(b"fresh build artifact").hexdigest())
+
+    def test_private_bison_content_binding_and_refusals(self):
+        root = self.root / "bison"
+        root.mkdir(mode=0o700)
+        file = root / "skeleton"
+        self.put(file, b"first")
+        self.put(root / "empty", b"")
+        with mock.patch.dict(os.environ, {"BISON_PKGDATADIR": str(root)}):
+            before = ci.bison_inputs()
+            self.assertEqual((before["files"], before["bytes"]), (2, 5))
+            self.put(file, b"other")
+            self.assertNotEqual(before["sha256"], ci.bison_inputs()["sha256"])
+            file.chmod(0o666)
+            with self.assertRaises(ci.Refusal):
+                ci.bison_inputs()
+            file.chmod(0o600)
+            (root / "link").symlink_to(file)
+            with self.assertRaises(ci.Refusal):
+                ci.bison_inputs()
+            (root / "link").unlink()
+            root.chmod(0o755)
+            with self.assertRaises(ci.Refusal):
+                ci.bison_inputs()
+
+    def test_bison_entry_and_byte_bounds(self):
+        root = self.root / "bison"
+        root.mkdir(mode=0o700)
+        with mock.patch.dict(os.environ, {"BISON_PKGDATADIR": str(root)}):
+            with self.assertRaises(ci.Refusal):
+                ci.bison_inputs()
+            self.put(root / "oversized", b"x" * (8 * ci.MIB + 1))
+            with self.assertRaises(ci.Refusal):
+                ci.bison_inputs()
+            (root / "oversized").unlink()
+            for index in range(513):
+                self.put(root / str(index), b"")
+            with self.assertRaises(ci.Refusal):
+                ci.bison_inputs()
 
     def synthetic_boot(self, raw=None):
         config = ci.config_for(self.root, self.root, 0)

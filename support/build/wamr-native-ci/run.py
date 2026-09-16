@@ -129,7 +129,37 @@ def source():
 
 def producer_inputs():
     return {"source": source(),
-            "tools": {name: digest(Path(tool(name))) for name in HOST_TOOLS}}
+            "tools": {name: digest(Path(tool(name))) for name in HOST_TOOLS},
+            "bison_data": bison_inputs()}
+
+
+def bison_inputs():
+    configured = os.environ.get("BISON_PKGDATADIR")
+    require(configured is not None and Path(configured).is_absolute(),
+            "explicit private Bison data required")
+    root = Path(configured)
+    require(root.resolve(strict=True) == root
+            and stat.S_ISDIR(root.lstat().st_mode)
+            and root.stat().st_uid == os.getuid()
+            and stat.S_IMODE(root.stat().st_mode) == 0o700,
+            "private Bison directory required")
+    files = {}
+    total = 0
+    for index, path in enumerate(root.rglob("*")):
+        info = path.lstat()
+        require(index < 512 and info.st_uid == os.getuid()
+                and not info.st_mode & 0o7022, "unsafe Bison data input")
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        require(stat.S_ISREG(info.st_mode), "nonregular Bison data input")
+        raw = read(path, 8 * MIB - total)
+        total += len(raw)
+        files[path.relative_to(root).as_posix()] = {
+            "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    require(files, "empty Bison data")
+    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return {"files": len(files), "bytes": total,
+            "sha256": hashlib.sha256(encoded).hexdigest()}
 
 
 def command_error_markers(raw):
