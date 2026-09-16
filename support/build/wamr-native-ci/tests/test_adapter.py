@@ -48,6 +48,24 @@ class Contract(unittest.TestCase):
         for legacy in (False, True):
             self.assertEqual(ci.compute(self.log(legacy), self.identity, legacy), self.result)
 
+    def test_console_nul_and_ansi_framing(self):
+        for legacy in (False, True):
+            raw = self.log(legacy).replace(
+                b"Calling main(0, 0)\n",
+                b"\x1b[1mCalling main(0, 0)\x1b[0m\r\n\0")
+            raw = raw.replace(ci.MARKER.encode(),
+                              b"\x1b[32m" + ci.MARKER.encode() + b"\x1b[0m\0")
+            self.assertEqual(ci.compute(raw, self.identity, legacy), self.result)
+
+    def test_normalization_keeps_native_serial_refusals(self):
+        raw = self.log()
+        malformed = [raw + suffix for suffix in
+                     (b"\x1b", b"\x1b[", b"\x1b[0\0m", b"\x07", b"\xc2\0\xa3")]
+        malformed.append(b"x" * 8193 + b"\n" + raw)
+        for value in malformed:
+            with self.subTest(raw=value), self.assertRaises(ValueError):
+                ci.compute(value, self.identity, False)
+
     def test_wrong_result_trap_growth_selftest_accounting_and_identity(self):
         for key, value in (("answer", 43), ("checks", 1), ("terminal", 0),
                            ("detail", 0), ("frame_bytes", 4096),
@@ -176,7 +194,7 @@ class Evidence(unittest.TestCase):
         os.utime(path, ns=(1, path.stat().st_mtime_ns))
         self.assertEqual(ci.digest(path), hashlib.sha256(b"fresh build artifact").hexdigest())
 
-    def synthetic_boot(self):
+    def synthetic_boot(self, raw=None):
         config = ci.config_for(self.root, self.root, 0)
         for name in ("package/unikraft.raw", "firmware/code.fd",
                      "firmware/vars.fd", "bin/qemu-system-x86_64"):
@@ -190,7 +208,8 @@ class Evidence(unittest.TestCase):
             "pins": [{"size": Path(p).stat().st_size,
                       "sha256": list(bytes.fromhex(ci.digest(Path(p))))} for p in paths],
         })
-        raw = self.contract.log()
+        if raw is None:
+            raw = self.contract.log()
         self.put(work / "hyperv-efi-boot.log", raw)
         self.put(work / "launched", b"")
         ci.save(work / "report.json", {
@@ -203,6 +222,22 @@ class Evidence(unittest.TestCase):
             "failures": {"primary": None, "cleanup": None, "recording": None},
         })
         return config
+
+    def test_console_normalization_preserves_raw_hash_binding(self):
+        raw = self.contract.log().replace(b"\n", b"\x1b[0m\0\r\n\0")
+        config = self.synthetic_boot(raw)
+        observed = ci.check_boot(config, self.contract.identity)
+        raw_hash = hashlib.sha256(raw).hexdigest()
+        normalized_hash = hashlib.sha256(ci.normalize_serial(raw).encode()).hexdigest()
+        self.assertNotEqual(raw_hash, normalized_hash)
+        self.assertEqual(observed["report"]["serial_sha256"], raw_hash)
+        self.assertEqual(observed["compute"], self.contract.result)
+        report_path = Path(config["work_dir"]) / "report.json"
+        report = ci.document(report_path)
+        report["serial_sha256"] = normalized_hash
+        self.put(report_path, json.dumps(report).encode())
+        with self.assertRaises(ValueError):
+            ci.check_boot(config, self.contract.identity)
 
     def test_physical_request_log_and_report_bindings(self):
         config = self.synthetic_boot()

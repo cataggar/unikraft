@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -28,6 +29,7 @@ MIB = 1024 * 1024
 HOST_TOOLS = ("zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
               "llvm-readelf", "llvm-strip", "bison", "flex",
               "python3", "git", "bash", "m4", "timeout", "head")
+ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 class Refusal(ValueError):
@@ -186,10 +188,21 @@ def check_build():
     return {"source": source(), "runtime": identity, "image": image}
 
 
+def normalize_serial(raw):
+    # Match local_boot/serial.zig; evidence identities remain over the raw bytes.
+    require(0 < len(raw) < 4 * MIB, "serial bound")
+    raw.decode("utf-8")
+    normalized = ANSI_ESCAPE.sub(b"", raw).replace(b"\0", b"")
+    require(all(byte >= 0x20 or byte in b"\n\r\t" for byte in normalized),
+            "invalid serial control")
+    require(all(len(line) <= 8192 for line in normalized.split(b"\n")),
+            "serial line bound")
+    return normalized.decode("utf-8").replace("\r\n", "\n")
+
+
 def compute(raw, identity, legacy):
-    require(len(raw) < 4 * MIB, "serial bound")
-    text = raw.decode("utf-8").replace("\r\n", "\n")
-    lines = text.splitlines()
+    text = normalize_serial(raw)
+    lines = text.split("\n")
     require(lines.count(MARKER) == 1 and text.count(MARKER) == 1,
             "completion must be one exact line")
     require(text.count(LEGACY) == int(legacy), "wrong APIC observation")
