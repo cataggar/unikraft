@@ -11,9 +11,8 @@ import subprocess
 import tarfile
 
 ROOT = Path(__file__).resolve().parent
-REVISION = "2399694fb7ed11fffff0a34c82172dfdd54d7439"
-# Set only after the dependent SDK changes have merged upstream.
-WORKLOAD_REVISION = None
+REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
+WORKLOAD_REVISION = REVISION
 PROFILE = "unikraft-x86_64"
 ARTIFACTS = ROOT / "build" / "artifacts"
 VARIANTS = {"tiny": 0, "snapshot": 1, "jit": 2, "sample-aot": 3}

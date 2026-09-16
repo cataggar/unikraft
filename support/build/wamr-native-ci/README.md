@@ -9,7 +9,7 @@ unchanged. This does not complete #88's guarded Azure authority or image handoff
 
 The job builds the distinct `hyperv-x86_64-efi-wamr` target using the
 app-owned `prepare.py` and `build-image.py`, pinned WAMR
-`2399694fb7ed11fffff0a34c82172dfdd54d7439`, Zig 0.16.0, the existing LLVM
+`a53205d77be3b880eb8f8b96679512ba58e2331a`, Zig 0.16.0, the existing LLVM
 distribution and the native final-image graph. Its constructor/returning-IRQ,
 SMP, relocation and EFI checks are not replaced, mocked or disabled.
 There is no guest compiler or hosted-runtime substitute. Only the tiny

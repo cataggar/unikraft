@@ -26,7 +26,7 @@ python3 support/apps/wamr-aot/build-image.py native-images
 ```
 
 `prepare.py` exports exactly WAMR
-`2399694fb7ed11fffff0a34c82172dfdd54d7439` from the local Git object
+`a53205d77be3b880eb8f8b96679512ba58e2331a` from the local Git object
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
@@ -35,10 +35,9 @@ then the integration archive. The tiny wasm is genuinely generated from
 --profile=unikraft-x86_64`. Hosted artifacts are not renamed or relabelled.
 Only trusted output of this pinned producer is admissible.
 
-This local follow-up still awaits the final merged producer/sampler SDK pin.
-The shared-root CoreMark bridge and optional workloads require the explicit
-development SDK selection in [WORKLOADS.md](WORKLOADS.md) until that repin;
-the retained tiny pin is not a supported pin for those new APIs.
+The same merged SDK supplies the single-root CoreMark bridge and optional
+workloads in [WORKLOADS.md](WORKLOADS.md). This source pin does not establish
+native boot, hardware or measurement qualification.
 
 The integration archive explicitly uses x86_64 SysV, PIC, no red zone,
 stack protector, stack checking, unwind tables, libc, or error tracing, and

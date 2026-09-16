@@ -142,7 +142,14 @@ class SnapshotRecords(unittest.TestCase):
 
 
 class BuildBoundary(unittest.TestCase):
-    def test_optional_images_require_explicit_unpublished_source_selection(self):
+    def test_all_consumers_and_ci_use_the_same_supported_sdk(self):
+        ci = load("workload_ci_pin", "../../build/wamr-native-ci/run.py")
+        self.assertEqual(prepare.REVISION, prepare.WORKLOAD_REVISION)
+        self.assertEqual(prepare.REVISION, ci.REVISION)
+        workflow = ROOT.parents[2] / ".github/workflows/wamr-native-compute.yaml"
+        self.assertIn(f"ref: {prepare.REVISION}", workflow.read_text())
+
+    def test_unavailable_optional_pin_requires_explicit_development_selection(self):
         with patch.object(prepare, "capture", return_value="0.16.0"), \
                 patch.object(prepare, "WORKLOAD_REVISION", None):
             for variant in ("snapshot", "jit", "sample-aot"):

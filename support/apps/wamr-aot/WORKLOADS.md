@@ -35,16 +35,16 @@ explicit diagnostic
 `independent-image-deployment-and-memory-qualification-unavailable`.
 Request fields are never echoed into independent observations.
 
-### Development source selection (not supported deployment lineage)
+### Supported SDK and explicit development selection
 
-The optional SDK pin is deliberately unset until its independently reviewed
-upstream changes have merged. `--variant` alone fails explicitly in this state.
-For local development only:
+All variants use merged WAMR
+`a53205d77be3b880eb8f8b96679512ba58e2331a`, including the AOT producer and the
+PIC, final-link-owned compiler-runtime sampler APIs. This supported source pin
+is not qualified image or deployment lineage:
 
 ```sh
 python3 support/apps/wamr-aot/prepare.py prepare \
-  --source /path/to/local/wamr --variant snapshot \
-  --development-revision FULL_40_CHARACTER_LOCAL_SDK_COMMIT
+  --source /path/to/local/wamr --variant snapshot
 python3 support/apps/wamr-aot/build-image.py olddefconfig
 python3 support/apps/wamr-aot/build-image.py native-images
 ```
@@ -53,7 +53,9 @@ Repeat in fresh worktrees with `sample-aot`, `jit --jit-mode fast` and
 `jit --jit-mode full`. The selected Git commit
 is exported into the application's ignored private build directory; the source
 checkout, its branches, dirty files and outputs are never modified.
-Development manifests say `local-development-build-only-not-supported-lineage`.
+For local experiments only, an explicit
+`--development-revision FULL_40_CHARACTER_LOCAL_SDK_COMMIT` overrides the pin.
+Those manifests say `local-development-build-only-not-supported-lineage`.
 This escape hatch is **not** an upstream source pin or a qualified deployment.
 An explicitly selected development revision also supports local tiny/CoreMark
 bridge integration, but its manifest remains development-only and the
