@@ -136,6 +136,12 @@ offset/length and exact virtual/file geometry. No guest image or seed is
 downloaded, regenerated or borrowed. Public source EFI bytes are copied once
 to private `BOOTX64.EFI`; the original is rehashed.
 
+The VHD scan finalizes a copy of the SHA256 state at the exact raw-prefix
+boundary, then continues the original state through the complete footer.
+This avoids hashing the same prefix twice within that scan. Every byte is
+still read, and all separate artifact revalidation, snapshot/EOF, structural,
+cross-file comparison and deadline checks remain unchanged.
+
 An exclusive private package stage contains miz's outputs/temporaries.
 Artifacts are normalized to 0600, fsynced, structurally checked, and published
 without replacement. The native packaging leaf is supervised for at most

@@ -90,7 +90,11 @@ test "native miz creates exact raw GPT fixed VHD genuine four-mode wire and dura
     defer f.deinit();
     const alloc = f.arena.allocator();
     const state = try f.prepare();
-    if (state.phase != .prepared) std.debug.print("synthetic failure: {any}\n", .{state.failures});
+    if (state.phase != .prepared) std.debug.print("synthetic failure: packaged={} boots={any} failures={any}\n", .{
+        state.package != null,
+        .{ state.boots[0] != null, state.boots[1] != null, state.boots[2] != null, state.boots[3] != null },
+        state.failures,
+    });
     try t.expectEqual(c.Phase.prepared, state.phase);
     try t.expectEqual(@as(u64, c.raw_bytes), state.package.?.raw.size);
     try t.expectEqual(@as(u64, c.vhd_bytes), state.package.?.vhd.size);
