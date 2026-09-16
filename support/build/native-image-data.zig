@@ -146,6 +146,33 @@ pub const x86_64_efi_hyperv_acceptance_app = Library{
     },
 };
 
+pub const wamr_app = Library{
+    .name = "appwamraot",
+    .origin = .application,
+    .objects = &.{
+        "appwamraot/main.o",
+        "appwamraot/platform.o",
+        "appwamraot/selftest.o",
+        "appwamraot/embedded.o",
+        "appwamraot/libinfo.libuklibid.o",
+    },
+    .archives = &.{.{ .root = .app, .relative = "build/artifacts/libwamr-aot.a" }},
+};
+
+pub const wamr_vmem = Library{
+    .name = "libukvmem",
+    .origin = .library,
+    .objects = &.{
+        "libukvmem/vmem.isr.o",
+        "libukvmem/vma_rsvd.isr.o",
+        "libukvmem/vma_anon.isr.o",
+        "libukvmem/vma_stack.isr.o",
+        "libukvmem/vma_dma.isr.o",
+        "libukvmem/pagefault.isr.o",
+        "libukvmem/libinfo.libuklibid.o",
+    },
+};
+
 pub const x86_64_efi_hyperv_persistence_app = Library{
     .name = "apphelloworld",
     .origin = .application,

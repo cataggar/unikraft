@@ -436,6 +436,13 @@ zig build native-images \
   -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
 ```
 
+The separate `hyperv-x86_64-efi-wamr` profile registers the
+[source-pinned native WAMR AOT application](support/apps/wamr-aot/README.md),
+its explicitly initialized VM capabilities, trusted embedded fixture and
+optional minimal WASI/CoreMarks. It retains the existing image safety gates
+and packaging/local-boot machinery. Build/link evidence is not native boot,
+hardware, networking or benchmark acceptance.
+
 The `hyperv-x86_64-efi-netvsc` profile extends that graph with `libuknetdev`,
 the NetVSC C binding, and the freestanding NVS/RNDIS Zig protocol object. Its
 solved configuration must additionally select `CONFIG_LIBUKNETDEV=y` and

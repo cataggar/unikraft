@@ -78,6 +78,7 @@ pub fn requireLtoProfile(profile: native_image_graph.Profile) ProfileError!void 
         .@"qemu-arm64",
         .@"hyperv-x86_64-efi",
         .@"hyperv-x86_64-efi-netvsc",
+        .@"hyperv-x86_64-efi-wamr",
         => return error.UnsupportedLtoProfile,
     }
 }

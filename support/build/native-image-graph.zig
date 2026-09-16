@@ -16,6 +16,7 @@ pub const Profile = enum {
     @"qemu-arm64",
     @"hyperv-x86_64-efi",
     @"hyperv-x86_64-efi-netvsc",
+    @"hyperv-x86_64-efi-wamr",
 };
 
 pub const Error = component.RegistrationError || component.ValidationError || error{
@@ -54,6 +55,7 @@ pub const RegisteredGraph = struct {
             .@"qemu-arm64" => data.arm64,
             .@"hyperv-x86_64-efi",
             .@"hyperv-x86_64-efi-netvsc",
+            .@"hyperv-x86_64-efi-wamr",
             => data.x86_64,
         };
         const target = targetFor(options.profile);
@@ -91,6 +93,7 @@ fn targetFor(profile: Profile) component.Target {
         .@"qemu-x86_64",
         .@"hyperv-x86_64-efi",
         .@"hyperv-x86_64-efi-netvsc",
+        .@"hyperv-x86_64-efi-wamr",
         => .{
             .architecture = .x86_64,
             .family = .x86,
@@ -108,7 +111,8 @@ fn targetFor(profile: Profile) component.Target {
 
 fn isHyperv(profile: Profile) bool {
     return profile == .@"hyperv-x86_64-efi" or
-        profile == .@"hyperv-x86_64-efi-netvsc";
+        profile == .@"hyperv-x86_64-efi-netvsc" or
+        profile == .@"hyperv-x86_64-efi-wamr";
 }
 
 fn hasNetvsc(profile: Profile) bool {
@@ -151,6 +155,16 @@ fn registerLibraries(
     profile: data.Profile,
 ) Error!void {
     for (profile.libraries) |library| {
+        if (options.profile == .@"hyperv-x86_64-efi-wamr" and
+            std.mem.eql(u8, library.name, "libuksglist"))
+            continue;
+        if (options.profile == .@"hyperv-x86_64-efi-wamr" and
+            std.mem.eql(u8, library.name, "apphelloworld"))
+        {
+            try registerLibrary(context, allocator, options, data.wamr_app, &.{});
+            try registerLibrary(context, allocator, options, data.wamr_vmem, &.{});
+            continue;
+        }
         if (isHyperv(options.profile) and
             std.mem.eql(u8, library.name, "libvgacons"))
         {
@@ -593,6 +607,7 @@ fn registerPlatform(
         .@"qemu-arm64" => "-Wl,--entry=_libkvmplat_entry",
         .@"hyperv-x86_64-efi",
         .@"hyperv-x86_64-efi-netvsc",
+        .@"hyperv-x86_64-efi-wamr",
         => "-Wl,--entry=uk_efi_entry64",
     } };
     sequence_index += 1;
@@ -652,6 +667,7 @@ fn registerPlatform(
         switch (options.profile) {
             .@"hyperv-x86_64-efi" => "helloworld_hyperv-x86_64-efi.dbg",
             .@"hyperv-x86_64-efi-netvsc" => "helloworld_hyperv-x86_64-efi-netvsc.dbg",
+            .@"hyperv-x86_64-efi-wamr" => "wamr_hyperv-x86_64-efi.dbg",
             else => profile.final_output,
         },
     );
@@ -710,6 +726,7 @@ fn postProcess(
         .@"qemu-arm64" => "helloworld_qemu-arm64",
         .@"hyperv-x86_64-efi" => "helloworld_hyperv-x86_64-efi",
         .@"hyperv-x86_64-efi-netvsc" => "helloworld_hyperv-x86_64-efi-netvsc",
+        .@"hyperv-x86_64-efi-wamr" => "wamr_hyperv-x86_64-efi",
     };
     const image = try joinPath(allocator, output_root, image_relative);
     const bootinfo = try std.fmt.allocPrint(allocator, "{s}.bootinfo", .{image});
@@ -721,6 +738,7 @@ fn postProcess(
         .@"qemu-arm64" => "linux-header",
         .@"hyperv-x86_64-efi",
         .@"hyperv-x86_64-efi-netvsc",
+        .@"hyperv-x86_64-efi-wamr",
         => "efi",
     };
     const transformations = try allocator.alloc(
@@ -1213,6 +1231,35 @@ test "Hyper-V block libraries follow the solved configuration" {
         try std.testing.expect(!std.mem.eql(u8, library.name, "libuknetdev"));
         try std.testing.expect(!std.mem.eql(u8, library.name, "libnetvsc"));
     }
+}
+
+test "WAMR native profile has distinct application, VM ownership, and image identity" {
+    var registered = try RegisteredGraph.init(std.testing.allocator, .{
+        .roots = .{
+            .base = "/src/unikraft",
+            .app = "/src/wamr-aot",
+            .output = "/build",
+            .config = "/build/.config",
+        },
+        .profile = .@"hyperv-x86_64-efi-wamr",
+    });
+    defer registered.deinit();
+    var app = false;
+    var vmem = false;
+    for (registered.graph.libraries) |library| {
+        for ([_][]const u8{ "apphelloworld", "libnetvsc", "libstorvsc", "libuknetdev" }) |other|
+            try std.testing.expect(!std.mem.eql(u8, library.name, other));
+        if (std.mem.eql(u8, library.name, "libukvmem")) vmem = true;
+        if (std.mem.eql(u8, library.name, "appwamraot")) {
+            app = true;
+            try std.testing.expectEqual(@as(usize, 1), library.archives.len);
+            try std.testing.expectEqualStrings("/src/wamr-aot/build/artifacts/libwamr-aot.a", library.archives[0].path);
+        }
+    }
+    try std.testing.expect(app and vmem);
+    const post = registered.graph.selectedPlatform().post_process;
+    try std.testing.expect(post[3].kind == .efi);
+    try std.testing.expectEqualStrings("/build/wamr_hyperv-x86_64-efi.dbg", registered.graph.selectedPlatform().link_stages[1].output);
 }
 
 test "Hyper-V NetVSC profile registers protocol and uknetdev" {
