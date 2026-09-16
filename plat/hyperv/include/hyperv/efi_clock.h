@@ -16,9 +16,8 @@ hyperv_efi_realtime_sample(const struct uk_efi_time *now,
 			  uint64_t before, uint64_t after,
 			  struct hyperv_realtime_sample *sample)
 {
-	struct uktimeconv_bmkclock start = { 0 };
 	uint64_t epoch, offset, days, resolution, span;
-	unsigned int month;
+	unsigned int month, year;
 
 	if (now->time_zone != 0 || now->daylight != 0)
 		return -ENOTSUP;
@@ -42,13 +41,14 @@ hyperv_efi_realtime_sample(const struct uk_efi_time *now,
 	if (span == UINT64_MAX)
 		return -EOVERFLOW;
 
-	/* January 1 fits through 2554. Add the checked remainder separately:
-	 * the existing whole-calendar converter otherwise wraps in July 2554.
+	/* Count completed Gregorian years without the legacy century
+	 * approximation. January 1 fits through 2554; check the remainder below.
 	 */
-	start.dt_year = now->year;
-	start.dt_mon = 1;
-	start.dt_day = 1;
-	epoch = uktimeconv_bmkclock_to_nsec(&start);
+	year = now->year - 1;
+	days = 365ULL * (now->year - 1970) +
+		(year / 4 - 1969 / 4) - (year / 100 - 1969 / 100) +
+		(year / 400 - 1969 / 400);
+	epoch = days * 86400000000000ULL;
 	days = now->day - 1;
 	for (month = 1; month < now->month; month++)
 		days += uktimeconv_days_in_month(

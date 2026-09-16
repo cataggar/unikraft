@@ -143,6 +143,36 @@ static void test_qualified_efi_realtime(void)
 				   &result, &ns) == -EOVERFLOW);
 }
 
+static void test_qualified_efi_gregorian_years(void)
+{
+	const struct uk_efi_time_caps caps = {
+		.resolution = 10000000, .accuracy = 50000000,
+	};
+	struct uk_efi_time now = {
+		.month = 1, .day = 1, .nanosecond = 1,
+	};
+	struct hyperv_realtime_sample sample;
+	uint64_t expected = 1;
+	unsigned int year;
+
+	for (year = 1970; year <= 2554; year++) {
+		now.year = year;
+		assert(hyperv_efi_realtime_sample(&now, &caps, 100, 105,
+						  &sample) == 0);
+		assert(sample.epoch_ns == expected);
+		if (year < 2554)
+			expected += (365ULL + (year % 4 == 0 &&
+				(year % 100 != 0 || year % 400 == 0))) *
+				86400000000000ULL;
+	}
+	now = (struct uk_efi_time) { .year = 2100, .month = 3, .day = 1 };
+	assert(hyperv_efi_realtime_sample(&now, &caps, 100, 105, &sample) == 0);
+	assert(sample.epoch_ns == 4107542400000000000ULL);
+	now.year = 2400;
+	assert(hyperv_efi_realtime_sample(&now, &caps, 100, 105, &sample) == 0);
+	assert(sample.epoch_ns == 13574649600000000000ULL);
+}
+
 static void test_efi_runtime_permissions(void)
 {
 	unsigned int flags = 0;
@@ -220,6 +250,7 @@ int main(void)
 	test_efi_runtime_permissions();
 	test_paired_wall_clock_baseline();
 	test_qualified_efi_realtime();
+	test_qualified_efi_gregorian_years();
 	test_hyperv_cpu_lifecycle();
 	return 0;
 }
