@@ -2243,7 +2243,8 @@ class HypervWorkflowTest(unittest.TestCase):
 
     def test_fixture_observation_copy_refuses_unsafe_and_oversized_inputs(self):
         helper = SUPPORT.parent / ".github/scripts/hyperv-fixture-observation-evidence.sh"
-        for invalid in ("symlink", "hardlink", "public", "oversized", "directory-link"):
+        for invalid in ("symlink", "hardlink", "public", "oversized",
+                        "directory-link", "root-link", "dangling-root-link"):
             with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "hyperv-ci/native-host"
                 root.mkdir(parents=True, mode=0o700)
@@ -2262,9 +2263,15 @@ class HypervWorkflowTest(unittest.TestCase):
                 elif invalid == "oversized":
                     with log.open("r+b") as stream:
                         stream.truncate(8388609)
-                else:
+                elif invalid == "directory-link":
                     work.rename(root / "other")
                     work.symlink_to("other", target_is_directory=True)
+                else:
+                    root.rename(root.with_name("other"))
+                    root.symlink_to(
+                        "missing" if invalid == "dangling-root-link" else "other",
+                        target_is_directory=True,
+                    )
                 result = subprocess.run(
                     ["bash", str(helper), "host"], env=dict(os.environ, RUNNER_TEMP=tmp),
                     capture_output=True, timeout=10,

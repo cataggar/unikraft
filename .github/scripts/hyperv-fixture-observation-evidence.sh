@@ -10,7 +10,7 @@ case "$1" in
   *) exit 2 ;;
 esac
 root="${RUNNER_TEMP:?}/hyperv-ci/native-$1"
-if [ ! -e "${root}" ]; then exit 0; fi
+if [ ! -e "${root}" ] && [ ! -L "${root}" ]; then exit 0; fi
 test -d "${root}"
 test ! -L "${root}"
 test "$(stat -c '%a' "${root}")" = 700
