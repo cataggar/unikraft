@@ -27,6 +27,7 @@ fn execute(init: std.process.Init, failures: *core.diagnostics.Failures) !void {
         try output.interface.writeAll(
             "uk-hyperv-prepare synthetic-seed PRIVATE_DIRECTORY REQUEST_BASENAME\n" ++
                 "uk-hyperv-prepare original-seed PRIVATE_PARENT FRESH_BASENAME\n" ++
+                "uk-hyperv-prepare direct-config ORIGINAL_SEED_DIR EXPECTED_PRODUCTION_SHA256 PRIVATE_PARENT FRESH_BASENAME\n" ++
                 "uk-hyperv-prepare package PRIVATE_DIRECTORY REQUEST_BASENAME\n" ++
                 "uk-hyperv-prepare inspect-receipt PRIVATE_DIRECTORY BASENAME EXPECTED_SHA256\n" ++
                 "Local native primitives only; no build, completed-state, acceptance, or cloud approval is implied.\n",
@@ -38,6 +39,23 @@ fn execute(init: std.process.Init, failures: *core.diagnostics.Failures) !void {
         var output = std.Io.File.stdout().writer(init.io, &.{});
         try output.interface.print(
             "{{\"scope\":\"local_original_seed_production_only\",\"authority\":\"not_admitted\",\"not_evidence_of\":\"build_local_boot_device_or_cloud_acceptance\",\"state\":\"validated_local_files\",\"production_record_sha256\":\"{s}\"}}\n",
+            .{sha},
+        );
+        return;
+    }
+    if (args.len == 6 and std.mem.eql(u8, args[1], "direct-config")) {
+        const sha = try preparation.direct_config.create(
+            allocator,
+            init.io,
+            args[2],
+            try preparation.contracts.sha(args[3]),
+            args[4],
+            args[5],
+            failures,
+        );
+        var output = std.Io.File.stdout().writer(init.io, &.{});
+        try output.interface.print(
+            "{{\"scope\":\"local_direct_configuration_only\",\"authority\":\"not_admitted\",\"configuration\":\"unsolved_fragment\",\"not_evidence_of\":\"solved_approval_source_authentication_build_boot_device_or_cloud_acceptance\",\"derivation_sha256\":\"{s}\"}}\n",
             .{sha},
         );
         return;
