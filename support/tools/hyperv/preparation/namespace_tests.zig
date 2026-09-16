@@ -127,18 +127,18 @@ fn recordInsideError(allocator: std.mem.Allocator, io: std.Io, mode: []const u8,
     try recordErrorFile(io, directory.dir, "inside-error.txt", err);
 }
 const FixtureStage = observations.Stage;
-fn markStage(allocator: std.mem.Allocator, io: std.Io, scratch: std.Io.Dir, comptime stage: FixtureStage) !void {
-    const record = try observations.Record.observe(io, stage);
+fn markStage(allocator: std.mem.Allocator, io: std.Io, scratch: std.Io.Dir, selected: ?observations.Fixture, stage: FixtureStage) !void {
+    const fixture_mode = selected orelse return;
+    const record = try observations.Record.observe(io, fixture_mode, stage);
     const bytes = try record.encode(allocator);
     try put(io, scratch, observations.fileName(stage), &bytes, 0o600);
 }
-fn readStages(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory) !observations.Collection {
-    var result: observations.Collection = .{};
-    inline for (std.meta.fields(FixtureStage), 0..) |field, index| {
-        const stage: FixtureStage = @enumFromInt(field.value);
+fn readStages(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory, selected: observations.Fixture) !observations.Collection {
+    var result = observations.Collection.init(selected);
+    for (std.enums.values(FixtureStage), 0..) |stage, index| {
         const bytes = directory.read(allocator, io, observations.fileName(stage), observations.record_bytes, .private) catch |err| blk: {
             result.observations[index].state = switch (err) {
-                error.FileNotFound => .missing,
+                error.FileNotFound => result.observations[index].state,
                 error.FileTooLarge => .oversized,
                 else => .unavailable,
             };
@@ -146,29 +146,36 @@ fn readStages(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory)
         };
         if (bytes) |value| {
             defer allocator.free(value);
-            result.observations[index] = try observations.decode(allocator, stage, value);
+            result.observations[index] = try observations.decode(allocator, selected, stage, value);
         }
     }
     result.checkOrder();
     return result;
 }
-fn reportStages(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory, scratch: []const u8) !void {
-    const path = try std.fs.path.join(allocator, &.{ base.path, scratch });
+fn retainStageLog(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory, selected: observations.Fixture, buffer: *[observations.log_bytes]u8) ![]const u8 {
+    const path = try std.fmt.allocPrint(allocator, "{s}/fixture-{s}/{s}", .{ base.path, selected.mode(), fixtureScratch(selected.mode()) });
     defer allocator.free(path);
     const directory = try fs.Directory.open(allocator, io, path);
     defer directory.close(allocator, io);
-    const stages = try readStages(allocator, io, directory);
+    const stages = try readStages(allocator, io, directory, selected);
+    return stages.log(allocator, buffer);
+}
+fn failureStageLog(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory, selected: observations.Fixture, cleanup_complete: bool, buffer: *[observations.log_bytes]u8) []const u8 {
+    const state: enum { unavailable, cleanup_incomplete } = if (cleanup_complete) state: {
+        return retainStageLog(allocator, io, base, selected, buffer) catch break :state .unavailable;
+    } else .cleanup_incomplete;
+    return std.fmt.bufPrint(buffer, "{s}{{\"schema\":\"hyperv_preparation_namespace_observations_v2\",\"authority\":\"none\",\"fixture\":\"{s}\",\"state\":\"{s}\"}}\n", .{
+        selected.logPrefix(), @tagName(selected), @tagName(state),
+    }) catch unreachable;
+}
+fn reportFailureStages(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory, mode: []const u8, cleanup_complete: bool) void {
+    const selected = observations.Fixture.fromMode(mode) catch return;
     var buffer: [observations.log_bytes]u8 = undefined;
-    std.debug.print("{s}", .{try stages.log(allocator, &buffer)});
+    std.debug.print("{s}", .{failureStageLog(allocator, io, base, selected, cleanup_complete, &buffer)});
 }
 fn reportInsideError(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory, mode: []const u8) !void {
     const scratch = try std.fmt.allocPrint(allocator, "fixture-{s}/{s}", .{ mode, fixtureScratch(mode) });
     defer allocator.free(scratch);
-    if (std.mem.eql(u8, mode, "git-timeout")) {
-        reportStages(allocator, io, base, scratch) catch {
-            std.debug.print("Namespace Git timeout observations: {{\"authority\":\"none\",\"state\":\"unavailable\"}}\n", .{});
-        };
-    }
     const error_path = try std.fs.path.join(allocator, &.{ scratch, "inside-error.txt" });
     defer allocator.free(error_path);
     const bytes = base.read(allocator, io, error_path, 256, .private) catch |err| switch (err) {
@@ -288,6 +295,7 @@ fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_fi
         !std.mem.eql(u8, mode, "exit143") and !std.mem.eql(u8, mode, "signal") and
         !std.mem.eql(u8, mode, "exec-missing") and !std.mem.eql(u8, mode, "setup-failure") and
         !std.mem.eql(u8, mode, "cleanup-failure")) return error.InvalidFixtureMode;
+    const diagnostic: ?observations.Fixture = if (std.mem.eql(u8, mode, "timeout")) .timeout else null;
     const base = try fs.Directory.open(allocator, io, options.workspace);
     const repository = try makeDir(allocator, io, base, try std.fmt.allocPrint(allocator, "fixture-{s}", .{mode}));
     try put(io, repository.dir, "source.txt", "readonly synthetic source\n", 0o600);
@@ -295,24 +303,33 @@ fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_fi
     try put(io, historical.dir, "hidden-marker", "synthetic historical marker\n", 0o600);
     const workspace = try makeDir(allocator, io, repository, ".d/zig-migration-preparation/resume-producer/work");
     const scratch = try makeDir(allocator, io, workspace, "scratch");
+    try markStage(allocator, io, scratch.dir, diagnostic, .setup_started);
     const root = try makeDir(allocator, io, scratch, "namespace-root");
     for ([_][]const u8{ "tmp", "cache", "config", "zig-local", "zig-global", "disabled-git-exec", "disabled-openssl" }) |name|
         _ = try makeDir(allocator, io, scratch, name);
     const native = try makeDir(allocator, io, workspace, "native");
+    try markStage(allocator, io, scratch.dir, diagnostic, .payload_copy);
     try copy(allocator, io, native, "/proc/self/exe", "fixture", 0o700);
+    try markStage(allocator, io, scratch.dir, diagnostic, .payload_copied);
     const static = try tool(allocator, io, native, "fixture", false);
+    try markStage(allocator, io, scratch.dir, diagnostic, .payload_recorded);
     const dynamic_directory = try makeDir(allocator, io, workspace, "dynamic");
     _ = try makeDir(allocator, io, dynamic_directory, "lib");
+    try markStage(allocator, io, scratch.dir, diagnostic, .dynamic_copy);
     try copy(allocator, io, dynamic_directory, "/usr/bin/true", "true", 0o700);
     const system_lib = if (builtin.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu/" else "/usr/lib/x86_64-linux-gnu/";
     try copy(allocator, io, dynamic_directory, system_lib ++ "libc.so.6", "lib/libc.so.6", 0o600);
     try copy(allocator, io, dynamic_directory, system_lib ++ (if (builtin.cpu.arch == .aarch64) "ld-linux-aarch64.so.1" else "ld-linux-x86-64.so.2"), "lib/loader", 0o700);
+    try markStage(allocator, io, scratch.dir, diagnostic, .dynamic_copied);
     const dynamic = try tool(allocator, io, dynamic_directory, "true", true);
+    try markStage(allocator, io, scratch.dir, diagnostic, .dynamic_recorded);
     var incomplete = dynamic;
     incomplete.contract.libraries = &.{};
     if (incomplete.validate(allocator, io)) |_| {
         return error.AcceptedIncompleteRuntime;
     } else |err| if (err != error.IncompleteRuntime) return err;
+    try markStage(allocator, io, scratch.dir, diagnostic, .incomplete_validated);
+    try markStage(allocator, io, scratch.dir, diagnostic, .runtime_ready);
     const metadata = try makeDir(allocator, io, repository, ".git");
     try put(io, metadata.dir, "fixture", "readonly synthetic Git metadata\n", 0o600);
     const account = try env.Account.current(allocator, io);
@@ -331,6 +348,8 @@ fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_fi
     try put(io, workspace.dir, "lock.json", try c.canonical(allocator, lock_identity), 0o600);
     try put(io, workspace.dir, "host-namespaces.json", try c.canonical(allocator, try namespaceIds(io)), 0o600);
     var environment = try environment_record.create(allocator, account.home);
+    try markStage(allocator, io, scratch.dir, diagnostic, .context_ready);
+    try markStage(allocator, io, scratch.dir, diagnostic, .sandbox_record);
     const sandbox: ns.Sandbox = .{
         .repository = repository,
         .workspace = workspace,
@@ -348,14 +367,17 @@ fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_fi
         .root = try ns.Identity.directory(root),
         .status_file = status_file,
     };
+    try markStage(allocator, io, scratch.dir, diagnostic, .sandbox_ready);
     // Deliberately inherited non-CLOEXEC host descriptor. The payload must not
     // find it (or any namespace setup/source/lock descriptor).
     const leaked = try repository.openFile(io, "source.txt", .artifact);
     if (linux.errno(linux.fcntl(leaked.handle, linux.F.SETFD, 0)) != .SUCCESS) return error.FixtureFailed;
+    try markStage(allocator, io, scratch.dir, diagnostic, .namespace_enter);
     const status = try ns.enterWithCleanupFault(allocator, io, sandbox, &.{
         if (std.mem.eql(u8, mode, "exec-missing")) "/bin/missing-fixture" else "/bin/fixture",
         try std.fmt.allocPrint(allocator, "inside-{s}", .{mode}),
     }, &environment, std.mem.eql(u8, mode, "cleanup-failure"));
+    try markStage(allocator, io, scratch.dir, diagnostic, .namespace_return);
     try scratch.dir.deleteDir(io, "namespace-root");
     return status;
 }
@@ -370,8 +392,14 @@ fn inside(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, inherited:
     }
     if (std.mem.eql(u8, mode, "inside-cleanup-failure")) linux.exit_group(19);
     if (std.mem.eql(u8, mode, "inside-timeout")) {
-        try detached(io);
+        const scratch = try insideScratch(allocator, io, mode);
+        defer scratch.close(allocator, io);
+        try markStage(allocator, io, scratch.dir, .timeout, .inner_payload_entry);
+        try markStage(allocator, io, scratch.dir, .timeout, .detached_setup);
+        try detached(allocator, io, scratch.dir);
+        try markStage(allocator, io, scratch.dir, .timeout, .detached_ready);
         try put(io, std.Io.Dir.cwd(), ".d/zig-migration-preparation/resume-producer/work/scratch/timeout-ready", "inside namespace\n", 0o600);
+        try markStage(allocator, io, scratch.dir, .timeout, .timeout_ready);
         while (true) _ = linux.syscall0(.sched_yield);
     }
     var link_buffer: [4096]u8 = undefined;
@@ -469,12 +497,12 @@ fn inside(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, inherited:
     if (result.failures.primary != null or !result.cleanup_complete) return error.DynamicClosureFailed;
     result.deinit(allocator);
     if (std.mem.eql(u8, mode, "inside-descendant")) {
-        try detached(io);
+        try detached(allocator, io, null);
     }
     _ = linux.write(1, "namespace-isolation-ok\n", "namespace-isolation-ok\n".len);
 }
 
-fn detached(io: std.Io) !void {
+fn detached(allocator: std.mem.Allocator, io: std.Io, diagnostic_scratch: ?std.Io.Dir) !void {
     const file = try std.Io.Dir.cwd().createFile(io, ".d/zig-migration-preparation/resume-producer/work/scratch/descendant-lock", .{ .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(io);
     if (linux.errno(linux.flock(file.handle, 2)) != .SUCCESS) return error.FixtureFailed;
@@ -488,6 +516,7 @@ fn detached(io: std.Io) !void {
         while (true) _ = linux.syscall0(.sched_yield);
     }
     _ = linux.close(pipe[1]);
+    if (diagnostic_scratch) |scratch| try markStage(allocator, io, scratch, .timeout, .detached_forked);
     var ready: [1]u8 = undefined;
     if (linux.read(pipe[0], &ready, 1) != 1 or ready[0] != '1') return error.FixtureFailed;
     _ = linux.close(pipe[0]);
@@ -652,8 +681,9 @@ test "namespace CI private fixture diagnostics reject replacement" {
     try std.testing.expectEqualStrings("FixtureFailed\n", bytes);
 }
 
-fn stageRecord(stage: FixtureStage, wall: u64, cpu: u64) observations.Record {
+fn stageRecord(selected: observations.Fixture, stage: FixtureStage, wall: u64, cpu: u64) observations.Record {
     return .{
+        .fixture = selected,
         .stage = stage,
         .clock_scope = stage.clockScope(),
         .self_executable_bytes = 1234,
@@ -670,56 +700,120 @@ fn stageRecord(stage: FixtureStage, wall: u64, cpu: u64) observations.Record {
     };
 }
 
-test "namespace stage observations are bounded canonical and non-authoritative" {
+test "namespace observations bounded canonical format and maximum log" {
     const allocator = std.testing.allocator;
-    var record = stageRecord(.setup_started, std.math.maxInt(u64), std.math.maxInt(u64));
-    record.self_executable_bytes = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(usize, 58), observations.stage_count);
+    try std.testing.expectEqual(@as(usize, 29696), observations.total_record_bytes);
+    try std.testing.expectEqual(@as(usize, 37376), observations.log_bytes);
+    for (std.enums.values(observations.Fixture)) |selected| {
+        var collection = observations.Collection.init(selected);
+        for (std.enums.values(FixtureStage), 0..) |stage, index| {
+            if (stage.appliesTo(selected)) {
+                var record = stageRecord(selected, stage, std.math.maxInt(u64), std.math.maxInt(u64));
+                record.self_executable_bytes = std.math.maxInt(u64);
+                record.sample.optimize = .ReleaseSafe;
+                record.sample.aarch64_sha2 = false;
+                const bytes = try record.encode(allocator);
+                try std.testing.expectEqual(@as(usize, 512), bytes.len);
+                const decoded = try observations.decode(allocator, selected, stage, &bytes);
+                try std.testing.expectEqual(.observed, decoded.state);
+                try std.testing.expectEqualDeep(record, decoded.record.?);
+                try std.testing.expectEqual(.none, decoded.record.?.authority);
+                collection.observations[index] = decoded;
+            }
+        }
+        collection.checkOrder();
+        var buffer: [observations.log_bytes]u8 = undefined;
+        const line = try collection.log(allocator, &buffer);
+        try std.testing.expect(line.len <= observations.log_bytes);
+        try std.testing.expect(std.mem.startsWith(u8, line, selected.logPrefix()));
+        try std.testing.expect(line[line.len - 1] == '\n');
+    }
+}
+
+test "namespace observations refuse malformed private data and authority" {
+    const allocator = std.testing.allocator;
+    const record = stageRecord(.git_timeout, .setup_started, 10000, 1000);
     const bytes = try record.encode(allocator);
-    try std.testing.expectEqual(@as(usize, 512), bytes.len);
-    try std.testing.expectEqual(@as(usize, 4096), observations.total_record_bytes);
-    try std.testing.expectEqual(@as(usize, 6144), observations.log_bytes);
-    const decoded = try observations.decode(allocator, .setup_started, &bytes);
-    try std.testing.expectEqual(.observed, decoded.state);
-    try std.testing.expectEqualDeep(record, decoded.record.?);
-    try std.testing.expectEqual(.none, decoded.record.?.authority);
-    try std.testing.expectEqual(.partial, (try observations.decode(allocator, .setup_started, bytes[0..511])).state);
-    try std.testing.expectEqual(.partial, (try observations.decode(allocator, .setup_started, "1\n")).state);
-    try std.testing.expectEqual(.oversized, (try observations.decode(allocator, .setup_started, &([_]u8{0} ** 513))).state);
-    try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .runtime_ready, &bytes)).state);
+    try std.testing.expectEqual(.partial, (try observations.decode(allocator, .git_timeout, .setup_started, bytes[0..511])).state);
+    try std.testing.expectEqual(.partial, (try observations.decode(allocator, .git_timeout, .setup_started, "1\n")).state);
+    try std.testing.expectEqual(.oversized, (try observations.decode(allocator, .git_timeout, .setup_started, &([_]u8{0} ** 513))).state);
+    try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .git_timeout, .runtime_ready, &bytes)).state);
     var wrong_scope = record;
     wrong_scope.clock_scope = .inner_payload;
     try std.testing.expectError(error.InvalidFixtureObservation, wrong_scope.encode(allocator));
+    var no_executable = record;
+    no_executable.self_executable_bytes = 0;
+    try std.testing.expectError(error.InvalidFixtureObservation, no_executable.encode(allocator));
     var malformed = bytes;
     const authority = std.mem.indexOf(u8, &malformed, "\"none\"").?;
     @memcpy(malformed[authority + 1 ..][0..4], "root");
-    try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .setup_started, &malformed)).state);
+    try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .git_timeout, .setup_started, &malformed)).state);
+    var unknown = [_]u8{0} ** observations.record_bytes;
+    const json = std.mem.trimEnd(u8, &bytes, "\x00\n");
+    _ = try std.fmt.bufPrint(&unknown, "{s},\"argv\":\"SYNTHETIC_PRIVATE\"}}\n", .{json[0 .. json.len - 1]});
+    try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .git_timeout, .setup_started, &unknown)).state);
+    var bad_padding = bytes;
+    bad_padding[bad_padding.len - 1] = ' ';
+    try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .git_timeout, .setup_started, &bad_padding)).state);
     if (c.parse(ns.Status, allocator, std.mem.trimEnd(u8, &bytes, "\x00"))) |parsed| {
         parsed.deinit();
         return error.ObservationAcceptedAsStatus;
     } else |_| {}
 }
 
-test "namespace stage ordering compares CPU only within its process scope" {
+test "namespace observations closed fixture modes and phase refusal" {
     const allocator = std.testing.allocator;
-    var baseline: observations.Collection = .{};
-    inline for (std.meta.fields(FixtureStage), 0..) |field, index| {
-        const stage: FixtureStage = @enumFromInt(field.value);
-        const record = stageRecord(stage, 10000 + index, if (stage.clockScope() == .outer_helper) 1000 + index else index);
-        baseline.observations[index] = try observations.decode(allocator, stage, &try record.encode(allocator));
+    for (std.enums.values(observations.Fixture)) |selected| {
+        try std.testing.expectEqual(selected, try observations.Fixture.fromMode(selected.mode()));
+        const collection = observations.Collection.init(selected);
+        for (collection.observations) |value| {
+            try std.testing.expectEqual(if (value.stage.appliesTo(selected)) observations.State.missing else .not_applicable, value.state);
+        }
+    }
+    for ([_][]const u8{ "", "isolation", "inside-timeout", "git", "git-policy/../../other", "git-policy\n", "preparation-namespace" }) |mode|
+        try std.testing.expectError(error.InvalidFixtureObservationMode, observations.Fixture.fromMode(mode));
+    try std.testing.expectError(error.InvalidFixtureObservationPhase, stageRecord(.git_policy, .detached_setup, 1, 1).encode(allocator));
+    try std.testing.expectError(error.InvalidFixtureObservationPhase, observations.Record.observe(std.testing.io, .timeout, .git_runtime_copy));
+    try std.testing.expectError(error.InvalidFixtureObservationPhase, stageRecord(.git_timeout, .binding_reopen, 1, 1).encode(allocator));
+    try std.testing.expectError(error.InvalidFixtureObservationPhase, stageRecord(.git_unborn, .blocked_probe, 1, 1).encode(allocator));
+    const bytes = try stageRecord(.git_policy, .setup_started, 1, 1).encode(allocator);
+    try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .git_timeout, .setup_started, &bytes)).state);
+}
+
+test "namespace observations ordering keeps CPU process local through return" {
+    const allocator = std.testing.allocator;
+    var baseline = observations.Collection.init(.git_policy);
+    for (std.enums.values(FixtureStage), 0..) |stage, index| {
+        if (stage.appliesTo(.git_policy)) {
+            const record = stageRecord(.git_policy, stage, 10000 + index, if (stage.clockScope() == .outer_helper) 1000 + index else index);
+            baseline.observations[index] = try observations.decode(allocator, .git_policy, stage, &try record.encode(allocator));
+        }
     }
     var valid = baseline;
     valid.checkOrder();
-    for (valid.observations) |value| try std.testing.expectEqual(.observed, value.state);
-    try std.testing.expect(valid.observations[2].record.?.sample.process_cpu_ns > valid.observations[3].record.?.sample.process_cpu_ns);
+    for (valid.observations) |value|
+        try std.testing.expectEqual(if (value.stage.appliesTo(.git_policy)) observations.State.observed else .not_applicable, value.state);
+    const enter = @intFromEnum(FixtureStage.namespace_enter);
+    const entry = @intFromEnum(FixtureStage.inner_payload_entry);
+    const ready = @intFromEnum(FixtureStage.inside_ready);
+    const returned = @intFromEnum(FixtureStage.namespace_return);
+    try std.testing.expect(valid.observations[enter].record.?.sample.process_cpu_ns > valid.observations[entry].record.?.sample.process_cpu_ns);
     var cpu_regression = baseline;
-    cpu_regression.observations[4].record.?.sample.process_cpu_ns = 2;
+    cpu_regression.observations[ready].record.?.sample.process_cpu_ns = 0;
+    cpu_regression.observations[returned].record.?.sample.process_cpu_ns = 0;
     cpu_regression.checkOrder();
-    try std.testing.expectEqual(.invalid_order, cpu_regression.observations[4].state);
-    try std.testing.expect(cpu_regression.observations[4].record == null);
+    try std.testing.expectEqual(.invalid_order, cpu_regression.observations[ready].state);
+    try std.testing.expect(cpu_regression.observations[ready].record == null);
+    try std.testing.expectEqual(.invalid_order, cpu_regression.observations[returned].state);
     var wall_regression = baseline;
-    wall_regression.observations[3].record.?.sample.monotonic_ns = 9999;
+    wall_regression.observations[entry].record.?.sample.monotonic_ns = 9999;
     wall_regression.checkOrder();
-    try std.testing.expectEqual(.invalid_order, wall_regression.observations[3].state);
+    try std.testing.expectEqual(.invalid_order, wall_regression.observations[entry].state);
+    var scope_changed = baseline;
+    scope_changed.observations[entry].record.?.clock_scope = .outer_helper;
+    scope_changed.checkOrder();
+    try std.testing.expectEqual(.invalid, scope_changed.observations[entry].state);
     var buffer: [observations.log_bytes]u8 = undefined;
     const line = try valid.log(allocator, &buffer);
     try std.testing.expect(line.len <= observations.log_bytes);
@@ -728,7 +822,7 @@ test "namespace stage ordering compares CPU only within its process scope" {
     try std.testing.expect(std.mem.indexOf(u8, line, "\"authority\":\"none\"") != null);
 }
 
-test "namespace private stage files retain incomplete observations without raw payloads" {
+test "namespace observations private files refuse incomplete and unsafe records" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var temporary = std.testing.tmpDir(.{ .iterate = true });
@@ -736,8 +830,9 @@ test "namespace private stage files retain incomplete observations without raw p
     const path = try temporary.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(path);
     const directory: fs.Directory = .{ .dir = temporary.dir, .path = path };
-    try markStage(allocator, io, temporary.dir, .setup_started);
-    try std.testing.expectError(error.PathAlreadyExists, markStage(allocator, io, temporary.dir, .setup_started));
+    try markStage(allocator, io, temporary.dir, .git_timeout, .setup_started);
+    try std.testing.expectError(error.PathAlreadyExists, markStage(allocator, io, temporary.dir, .git_timeout, .setup_started));
+    try std.testing.expectError(error.InvalidFixtureObservationPhase, markStage(allocator, io, temporary.dir, .git_timeout, .detached_ready));
     try put(io, temporary.dir, observations.fileName(.runtime_ready), "1\n", 0o600);
     var invalid = [_]u8{0} ** observations.record_bytes;
     @memcpy(invalid[0.."SYNTHETIC_SECRET".len], "SYNTHETIC_SECRET");
@@ -747,9 +842,27 @@ test "namespace private stage files retain incomplete observations without raw p
     const public = try temporary.dir.openFile(io, observations.fileName(.inside_ready), .{});
     defer public.close(io);
     try public.setPermissions(io, .fromMode(0o644));
-    const values = try readStages(allocator, io, directory);
-    const expected = [_]observations.State{ .observed, .partial, .invalid, .oversized, .unavailable, .missing, .missing, .missing };
-    for (values.observations, expected) |value, state| try std.testing.expectEqual(state, value.state);
+    try temporary.dir.symLink(io, observations.fileName(.setup_started), observations.fileName(.policy_ready), .{});
+    try temporary.dir.createDir(io, observations.fileName(.blocked_probe), .fromMode(0o700));
+    try put(io, temporary.dir, "linked-record", &invalid, 0o600);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.linkat(temporary.dir.handle, "linked-record", temporary.dir.handle, observations.fileName(.write_observed), 0)));
+    try put(io, temporary.dir, observations.fileName(.helper_copy), &try stageRecord(.git_policy, .helper_copy, 1, 1).encode(allocator), 0o600);
+    try put(io, temporary.dir, observations.fileName(.dynamic_copy), &try stageRecord(.timeout, .dynamic_copy, 1, 1).encode(allocator), 0o600);
+    const values = try readStages(allocator, io, directory, .git_timeout);
+    inline for (.{
+        .{ FixtureStage.setup_started, observations.State.observed },
+        .{ FixtureStage.runtime_ready, observations.State.partial },
+        .{ FixtureStage.namespace_enter, observations.State.invalid },
+        .{ FixtureStage.inner_payload_entry, observations.State.oversized },
+        .{ FixtureStage.inside_ready, observations.State.unavailable },
+        .{ FixtureStage.policy_ready, observations.State.unavailable },
+        .{ FixtureStage.blocked_probe, observations.State.unavailable },
+        .{ FixtureStage.write_observed, observations.State.unavailable },
+        .{ FixtureStage.helper_copy, observations.State.invalid },
+        .{ FixtureStage.dynamic_copy, observations.State.invalid },
+        .{ FixtureStage.detached_ready, observations.State.not_applicable },
+        .{ FixtureStage.timeout_ready, observations.State.missing },
+    }) |expected| try std.testing.expectEqual(expected[1], values.observations[@intFromEnum(expected[0])].state);
     const self = try std.Io.Dir.openFileAbsolute(io, "/proc/self/exe", .{});
     defer self.close(io);
     try std.testing.expectEqual((try fs.metadata(self)).size, values.observations[0].record.?.self_executable_bytes);
@@ -757,6 +870,82 @@ test "namespace private stage files retain incomplete observations without raw p
     const line = try values.log(allocator, &buffer);
     try std.testing.expect(line.len <= observations.log_bytes);
     try std.testing.expect(std.mem.indexOf(u8, line, "SYNTHETIC_SECRET") == null);
+    try std.testing.expect(std.mem.indexOf(u8, line, path) == null);
+}
+
+test "namespace observations native sampling uses the current test process" {
+    const allocator = std.testing.allocator;
+    const first = try observations.Record.observe(std.testing.io, .timeout, .setup_started);
+    const second = try observations.Record.observe(std.testing.io, .timeout, .payload_copy);
+    try std.testing.expectEqual(builtin.zig_backend, first.sample.backend);
+    try std.testing.expectEqual(builtin.cpu.arch, first.sample.arch);
+    try std.testing.expectEqual(builtin.mode, first.sample.optimize);
+    try std.testing.expect(first.sample.monotonic_ns <= second.sample.monotonic_ns);
+    try std.testing.expect(first.sample.process_cpu_ns <= second.sample.process_cpu_ns);
+    try std.testing.expect(first.self_executable_bytes > 0);
+    const bytes = try first.encode(allocator);
+    try std.testing.expectEqual(.observed, (try observations.decode(allocator, .timeout, .setup_started, &bytes)).state);
+}
+
+test "namespace observations failure logs survive fixture deletion without masking failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const path = try temporary.dir.realPathFileAlloc(io, ".", a);
+    const base: fs.Directory = .{ .dir = temporary.dir, .path = path };
+    const Probe = struct {
+        fn fail(a_: std.mem.Allocator, io_: std.Io, base_: fs.Directory, selected: observations.Fixture, buffer: *[observations.log_bytes]u8, line: *[]const u8) !void {
+            const name = try std.fmt.allocPrint(a_, "fixture-{s}", .{selected.mode()});
+            defer base_.dir.deleteTree(io_, name) catch @panic("synthetic diagnostic cleanup failed");
+            // Same ordering as the native test: preserve the diagnostic before
+            // deletion, and never replace the assertion's original error.
+            errdefer line.* = failureStageLog(a_, io_, base_, selected, true, buffer);
+            return if (selected.timesOut()) error.FileNotFound else error.TestUnexpectedResult;
+        }
+    };
+    for (std.enums.values(observations.Fixture)) |selected| {
+        const name = try std.fmt.allocPrint(a, "fixture-{s}", .{selected.mode()});
+        const scratch_name = try std.fmt.allocPrint(a, "{s}/{s}", .{ name, fixtureScratch(selected.mode()) });
+        {
+            const scratch = try makeDir(a, io, base, scratch_name);
+            defer scratch.close(a, io);
+            try markStage(a, io, scratch.dir, selected, .setup_started);
+            try markStage(a, io, scratch.dir, selected, .payload_copy);
+            var invalid = [_]u8{0} ** observations.record_bytes;
+            @memcpy(invalid[0.."SYNTHETIC_PRIVATE".len], "SYNTHETIC_PRIVATE");
+            try put(io, scratch.dir, observations.fileName(.payload_copied), &invalid, 0o600);
+        }
+        var buffer: [observations.log_bytes]u8 = undefined;
+        var line: []const u8 = "";
+        try std.testing.expectError(if (selected.timesOut()) error.FileNotFound else error.TestUnexpectedResult, Probe.fail(a, io, base, selected, &buffer, &line));
+        try std.testing.expectError(error.FileNotFound, base.dir.openDir(io, name, .{}));
+        try std.testing.expect(line.len > 0 and line.len <= observations.log_bytes);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"state\":\"observed\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"state\":\"invalid\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"state\":\"missing\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"authority\":\"none\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, @tagName(selected)) != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "SYNTHETIC_PRIVATE") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, path) == null);
+        try std.testing.expect(std.mem.indexOf(u8, failureStageLog(a, io, base, selected, true, &buffer), "\"state\":\"unavailable\"") != null);
+    }
+}
+
+test "namespace observations incomplete cleanup never reads fixture records" {
+    const allocator = std.testing.allocator;
+    var buffer: [observations.log_bytes]u8 = undefined;
+    // An unusable directory must not be inspected when descendants may survive.
+    const base: fs.Directory = .{ .dir = .{ .handle = -1 }, .path = "SYNTHETIC_PRIVATE" };
+    for ([_]observations.Fixture{ .timeout, .git_policy, .git_timeout }) |selected| {
+        const line = failureStageLog(allocator, std.testing.io, base, selected, false, &buffer);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"state\":\"cleanup_incomplete\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "SYNTHETIC_PRIVATE") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"sample\"") == null);
+    }
 }
 
 test "namespace facade ancestors expose only the selected directory" {
@@ -912,6 +1101,7 @@ test "namespace native dynamic isolation, nonzero status, deadline and detached 
         defer outcome.deinit(allocator);
         outcome.namespaceStatus(status_file.read());
         const result = &outcome.child;
+        errdefer reportFailureStages(allocator, io, base, mode, result.cleanup_complete);
         // A kernel denial or absent status on a normal run is NOT a skip.
         if (!std.mem.eql(u8, mode, "timeout")) try std.testing.expect(result.failures.recording == null);
         try std.testing.expectEqual(!std.mem.eql(u8, mode, "cleanup-failure"), result.cleanup_complete);
@@ -1297,23 +1487,31 @@ fn setupGit(allocator: std.mem.Allocator, bound: rt.Bound, repository: fs.Direct
 fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_file: ns.StatusFile) !ns.Status {
     if (!std.mem.eql(u8, mode, "git-policy") and !std.mem.eql(u8, mode, "git-unborn") and
         !std.mem.eql(u8, mode, "git-modified") and !std.mem.eql(u8, mode, "git-timeout")) return error.InvalidFixtureMode;
+    const diagnostic = try observations.Fixture.fromMode(mode);
     const base = try fs.Directory.open(allocator, io, options.workspace);
     const repository = try makeDir(allocator, io, base, try std.fmt.allocPrint(allocator, "fixture-{s}", .{mode}));
     try put(io, repository.dir, "tracked.txt", "public synthetic Git fixture\n", 0o600);
     const workspace = try makeDir(allocator, io, repository, ".d/zig-migration-preparation/bridge-git/work");
     const scratch = try makeDir(allocator, io, workspace, "scratch");
-    if (std.mem.eql(u8, mode, "git-timeout")) try markStage(allocator, io, scratch.dir, .setup_started);
+    try markStage(allocator, io, scratch.dir, diagnostic, .setup_started);
     const root = try makeDir(allocator, io, scratch, "namespace-root");
     for ([_][]const u8{ "tmp", "cache", "config", "zig-local", "zig-global", "disabled-git-exec", "disabled-openssl", "empty-template", "poison-home" }) |name|
         _ = try makeDir(allocator, io, scratch, name);
     const helper_dir = try makeDir(allocator, io, workspace, "helper");
+    try markStage(allocator, io, scratch.dir, diagnostic, .helper_copy);
     try copy(allocator, io, helper_dir, options.namespace_helper, "preparation-namespace", 0o700);
+    try markStage(allocator, io, scratch.dir, diagnostic, .helper_copied);
     const helper = try tool(allocator, io, helper_dir, "preparation-namespace", false);
+    try markStage(allocator, io, scratch.dir, diagnostic, .helper_recorded);
     const payload_dir = try makeDir(allocator, io, workspace, "payload");
+    try markStage(allocator, io, scratch.dir, diagnostic, .payload_copy);
     try copy(allocator, io, payload_dir, "/proc/self/exe", "fixture", 0o700);
+    try markStage(allocator, io, scratch.dir, diagnostic, .payload_copied);
     const payload = try tool(allocator, io, payload_dir, "fixture", false);
+    try markStage(allocator, io, scratch.dir, diagnostic, .payload_recorded);
+    try markStage(allocator, io, scratch.dir, diagnostic, .git_runtime_copy);
     const git = try publicGit(allocator, io, workspace);
-    if (std.mem.eql(u8, mode, "git-timeout")) try markStage(allocator, io, scratch.dir, .runtime_ready);
+    try markStage(allocator, io, scratch.dir, diagnostic, .runtime_ready);
     const account = try env.Account.current(allocator, io);
     const facade = try facadeDirectory(allocator, io, account);
     const lock = try facade.openFile(io, "build.lock", .private);
@@ -1332,6 +1530,8 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
         try setup.put("GIT_" ++ kind ++ "_EMAIL", "synthetic@example.invalid");
         try setup.put("GIT_" ++ kind ++ "_DATE", "2001-01-01T00:00:00Z");
     }
+    try markStage(allocator, io, scratch.dir, diagnostic, .context_ready);
+    try markStage(allocator, io, scratch.dir, diagnostic, .git_setup);
     _ = try setupGit(allocator, git, repository, &setup, &.{
         "init",                                                                              "--quiet", "--initial-branch=main",
         try std.fmt.allocPrint(allocator, "--template={s}/empty-template", .{scratch.path}),
@@ -1346,6 +1546,7 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
         defer file.close(io);
         try file.writePositionalAll(io, "modified synthetic source\n", 0);
     }
+    try markStage(allocator, io, scratch.dir, diagnostic, .git_setup_ready);
     try put(io, workspace.dir, "environment.json", try c.canonical(allocator, record), 0o600);
     const make: env.MakeRecord = .{
         .schema = .unikraft_native_make_environment_v1,
@@ -1372,6 +1573,7 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
     try put(io, scratch.dir, "poison-home/.gitconfig", "[core]\nabbrev = 40\n", 0o600);
     try put(io, scratch.dir, "poison-index", "not a Git index\n", 0o600);
     const metadata = try fs.Directory.open(allocator, io, try std.fs.path.join(allocator, &.{ repository.path, ".git" }));
+    try markStage(allocator, io, scratch.dir, diagnostic, .sandbox_record);
     const sandbox: ns.Sandbox = .{
         .repository = repository,
         .workspace = workspace,
@@ -1391,34 +1593,49 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
         .root = try ns.Identity.directory(root),
         .status_file = status_file,
     };
+    try markStage(allocator, io, scratch.dir, diagnostic, .sandbox_ready);
     // The other Git cases exercise these policy variants. The timeout case
     // keeps its full production entry validation, without repeating them first.
     if (!std.mem.eql(u8, mode, "git-timeout")) {
+        try markStage(allocator, io, scratch.dir, diagnostic, .binding_reopen);
         const serialized = try c.parse(ns.Binding, allocator, try c.canonical(allocator, try ns.describe(allocator, sandbox.isolation)));
         const reopened = try ns.reopen(allocator, io, serialized.value);
+        try markStage(allocator, io, scratch.dir, diagnostic, .binding_reopened);
         try ns.validate(allocator, io, reopened, repository, workspace);
+        try markStage(allocator, io, scratch.dir, diagnostic, .binding_validated);
         if (reopened.make_environment == null or reopened.git_policy == null) return error.FixtureFailed;
-        for ([_]c.File{ sandbox.isolation.make_environment.?, sandbox.isolation.git_policy.? }) |file| {
+        for ([_]c.File{ sandbox.isolation.make_environment.?, sandbox.isolation.git_policy.? }, 0..) |file, index| {
             const opened = try workspace.dir.openFile(io, file.path, .{});
             defer opened.close(io);
             try opened.setPermissions(io, .fromMode(0o644));
+            try markStage(allocator, io, scratch.dir, diagnostic, if (index == 0) .make_policy_refusal else .git_policy_refusal);
             if (ns.validate(allocator, io, sandbox.isolation, repository, workspace)) |_| return error.AcceptedPublicPolicy else |err| if (err != error.UnsafeFile) return err;
+            try markStage(allocator, io, scratch.dir, diagnostic, if (index == 0) .make_policy_refused else .git_policy_refused);
             try opened.setPermissions(io, .fromMode(0o600));
         }
         var bad = sandbox;
         bad.isolation.git_policy = null;
+        try markStage(allocator, io, scratch.dir, diagnostic, .missing_policy_enter);
         if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingPolicy else |err| if (err != error.MissingGitPolicy) return err;
+        try markStage(allocator, io, scratch.dir, diagnostic, .missing_policy_refused);
         bad = sandbox;
         bad.aliases = &.{.{ .name = "git", .bound = git }};
+        try markStage(allocator, io, scratch.dir, diagnostic, .alias_enter);
         if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedRealGitAlias else |err| if (err != error.InvalidGitAlias) return err;
+        try markStage(allocator, io, scratch.dir, diagnostic, .alias_refused);
         bad = sandbox;
         bad.runtimes = &.{ payload, git };
+        try markStage(allocator, io, scratch.dir, diagnostic, .missing_helper_enter);
         if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingHelper else |err| if (err != error.IncompleteRuntime) return err;
+        try markStage(allocator, io, scratch.dir, diagnostic, .missing_helper_refused);
         bad.runtimes = &.{ payload, helper };
+        try markStage(allocator, io, scratch.dir, diagnostic, .missing_git_enter);
         if (ns.enter(allocator, io, bad, &.{"/bin/git"}, &clean)) |_| return error.AcceptedMissingGit else |err| if (err != error.IncompleteRuntime) return err;
+        try markStage(allocator, io, scratch.dir, diagnostic, .missing_git_refused);
     }
-    if (std.mem.eql(u8, mode, "git-timeout")) try markStage(allocator, io, scratch.dir, .namespace_enter);
+    try markStage(allocator, io, scratch.dir, diagnostic, .namespace_enter);
     const status = try ns.enter(allocator, io, sandbox, &.{ "/bin/fixture", try std.fmt.allocPrint(allocator, "inside-{s}", .{mode}) }, &clean);
+    try markStage(allocator, io, scratch.dir, diagnostic, .namespace_return);
     try scratch.dir.deleteDir(io, "namespace-root");
     return status;
 }
@@ -1448,16 +1665,17 @@ fn poisonedGitEnvironment(allocator: std.mem.Allocator, record: git_entry.Record
 
 fn insideGit(allocator: std.mem.Allocator, io: std.Io, mode: []const u8) !void {
     const timeout = std.mem.eql(u8, mode, "inside-git-timeout");
-    if (timeout) {
+    const diagnostic = try observations.Fixture.fromMode(mode["inside-".len..]);
+    {
         const scratch = try insideScratch(allocator, io, mode);
         defer scratch.close(allocator, io);
-        try markStage(allocator, io, scratch.dir, .inner_payload_entry);
+        try markStage(allocator, io, scratch.dir, diagnostic, .inner_payload_entry);
     }
     const parsed = try git_entry.load(allocator, io);
     const record = parsed.value;
     const workspace = try fs.Directory.open(allocator, io, std.fs.path.dirname(record.environment.workspace).?);
     const scratch = try fs.Directory.open(allocator, io, record.environment.workspace);
-    if (timeout) try markStage(allocator, io, scratch.dir, .inside_ready);
+    try markStage(allocator, io, scratch.dir, diagnostic, .inside_ready);
     const account = try env.Account.current(allocator, io);
     if (!std.mem.eql(u8, account.home, record.account.home)) return error.AmbientHome;
     const expected_lock = try c.parse(ns.Identity, allocator, try workspace.read(allocator, io, "lock.json", 4096, .private));
@@ -1511,27 +1729,34 @@ fn insideGit(allocator: std.mem.Allocator, io: std.Io, mode: []const u8) !void {
     var poison = try poisonedGitEnvironment(allocator, record);
     var stripped = std.process.Environ.Map.init(allocator);
     const unborn = std.mem.eql(u8, mode, "inside-git-unborn");
-    if (timeout) try markStage(allocator, io, scratch.dir, .policy_ready);
+    try markStage(allocator, io, scratch.dir, diagnostic, .policy_ready);
     if (!timeout) {
-        for ([_]*const std.process.Environ.Map{ &stripped, &poison }) |map| {
+        for ([_]*const std.process.Environ.Map{ &stripped, &poison }, 0..) |map, index| {
+            try markStage(allocator, io, scratch.dir, diagnostic, if (index == 0) .stripped_head else .poisoned_head);
             const head = try (try spawnFixture(allocator, &.{ "/bin/git", "rev-parse", "--short", "HEAD" }, map, scratch, false)).collect(allocator);
+            try markStage(allocator, io, scratch.dir, diagnostic, if (index == 0) .stripped_head_ready else .poisoned_head_ready);
             if (head.status.primary != .exited or head.status.code != (if (unborn) @as(u8, 128) else 0) or head.stderr.len != 0)
                 return error.GitStatusMismatch;
             const expected = if (unborn) "" else try workspace.read(allocator, io, "short-head", 128, .private);
             if (!std.mem.eql(u8, head.stdout, expected)) return error.GitHeadMismatch;
+            try markStage(allocator, io, scratch.dir, diagnostic, if (index == 0) .stripped_index else .poisoned_index);
             const modified = try (try spawnFixture(allocator, &.{ "/bin/git", "ls-files", "-m" }, map, scratch, false)).collect(allocator);
+            try markStage(allocator, io, scratch.dir, diagnostic, if (index == 0) .stripped_index_ready else .poisoned_index_ready);
             if (modified.status.primary != .exited or modified.status.code != 0 or modified.stderr.len != 0 or
                 !std.mem.eql(u8, modified.stdout, if (std.mem.eql(u8, mode, "inside-git-modified")) "tracked.txt\n" else ""))
                 return error.GitIndexMismatch;
         }
     }
-    if (timeout) try markStage(allocator, io, scratch.dir, .blocked_probe);
-    if (!unborn) try inspectBlockedGit(allocator, io, record, scratch, &poison, timeout);
+    if (!unborn) {
+        try markStage(allocator, io, scratch.dir, diagnostic, .blocked_probe);
+        try inspectBlockedGit(allocator, io, record, scratch, &poison, diagnostic);
+    }
     const invalid: []const []const []const u8 = &.{
         &.{},                                                         &.{"--version"},                             &.{ "rev-parse", "HEAD" },                             &.{ "rev-parse", "--short=12", "HEAD" },
         &.{ "rev-parse", "--short", "HEAD", "--git-dir" },            &.{ "ls-files", "-m", "--", "tracked.txt" }, &.{ "ls-files", "--modified" },                        &.{ "-C", "/", "ls-files", "-m" },
         &.{ "-c", "core.abbrev=40", "rev-parse", "--short", "HEAD" }, &.{ "remote", "-v" },                        &.{ "fetch", "https://public.invalid/not-contacted" }, &.{ "help", "rev-parse" },
     };
+    try markStage(allocator, io, scratch.dir, diagnostic, .invalid_commands);
     for (invalid) |args| {
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(allocator, "/bin/git");
@@ -1540,16 +1765,20 @@ fn insideGit(allocator: std.mem.Allocator, io: std.Io, mode: []const u8) !void {
         if (result.status.primary != .exited or result.status.code != 125 or result.stdout.len != 0 or result.stderr.len > 1024)
             return error.AcceptedGitOperation;
         const document = try c.c.Document.parse(allocator, std.mem.trimEnd(u8, result.stderr, "\n"), .{});
-        const diagnostic = try c.core.diagnostics.Failures.parse(document.value());
-        if (diagnostic.primary == null or diagnostic.primary.?.category != .invalid_input or
-            diagnostic.cleanup != null or diagnostic.recording != null) return error.UnboundedGitDiagnostic;
+        const failures = try c.core.diagnostics.Failures.parse(document.value());
+        if (failures.primary == null or failures.primary.?.category != .invalid_input or
+            failures.cleanup != null or failures.recording != null) return error.UnboundedGitDiagnostic;
     }
+    try markStage(allocator, io, scratch.dir, diagnostic, .invalid_commands_ready);
     try expected_lock.value.require(try ns.Identity.of(expected_lock.value.path, lock));
+    try markStage(allocator, io, scratch.dir, diagnostic, .inner_complete);
     _ = linux.write(1, "namespace-git-policy-ok\n", "namespace-git-policy-ok\n".len);
 }
 
-fn inspectBlockedGit(allocator: std.mem.Allocator, io: std.Io, record: git_entry.Record, scratch: fs.Directory, poison: *const std.process.Environ.Map, timeout: bool) !void {
+fn inspectBlockedGit(allocator: std.mem.Allocator, io: std.Io, record: git_entry.Record, scratch: fs.Directory, poison: *const std.process.Environ.Map, diagnostic: observations.Fixture) !void {
+    const timeout = diagnostic == .git_timeout;
     const child = try spawnFixture(allocator, &.{ "/bin/git", "rev-parse", "--short", "HEAD" }, poison, scratch, true);
+    try markStage(allocator, io, scratch.dir, diagnostic, .blocked_spawned);
     const proc = try std.fmt.allocPrint(allocator, "/proc/{d}", .{child.pid});
     const executable = try std.fs.path.join(allocator, &.{ record.runtime_directory, "lib/loader" });
     var link: [4096]u8 = undefined;
@@ -1578,7 +1807,7 @@ fn inspectBlockedGit(allocator: std.mem.Allocator, io: std.Io, record: git_entry
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
     if (!observed) return error.GitExecNotObserved;
-    if (timeout) try markStage(allocator, io, scratch.dir, .write_observed);
+    try markStage(allocator, io, scratch.dir, diagnostic, .write_observed);
     // A full stdout pipe holds the actual native Git at its write, not a fake
     // runtime or a wrapper supervisor. Inspect only our public synthetic child.
     const file = try std.Io.Dir.openFileAbsolute(io, try std.fs.path.join(allocator, &.{ proc, "environ" }), .{});
@@ -1612,8 +1841,10 @@ fn inspectBlockedGit(allocator: std.mem.Allocator, io: std.Io, record: git_entry
         if (try std.fmt.parseInt(usize, entry.name, 10) > 2) return error.InheritedDescriptor;
     const stderr = link[0..try std.Io.Dir.readLinkAbsolute(io, try std.fs.path.join(allocator, &.{ proc, "fd/2" }), &link)];
     if (!std.mem.eql(u8, stderr, "/dev/null")) return error.RawGitDiagnostic;
+    try markStage(allocator, io, scratch.dir, diagnostic, .blocked_checked);
     if (timeout) {
         try put(io, scratch.dir, "timeout-ready", "native Git blocked on stdout\n", 0o600);
+        try markStage(allocator, io, scratch.dir, diagnostic, .timeout_ready);
         _ = try child.collect(allocator);
         return error.GitUnexpectedCompletion;
     }
@@ -1621,6 +1852,7 @@ fn inspectBlockedGit(allocator: std.mem.Allocator, io: std.Io, record: git_entry
     const result = try child.collect(allocator);
     if (result.status.primary != .signaled or result.status.code != @intFromEnum(linux.SIG.TERM) or
         result.stderr.len != 0 or result.stdout.len != 4096) return error.GitSignalMismatch;
+    try markStage(allocator, io, scratch.dir, diagnostic, .blocked_reaped);
 }
 
 test "namespace Git actual static dispatch restores stripped and poisoned policy with native status" {
@@ -1649,6 +1881,7 @@ test "namespace Git actual static dispatch restores stripped and poisoned policy
         }) };
         defer outcome.deinit(allocator);
         outcome.namespaceStatus(status_file.read());
+        errdefer reportFailureStages(allocator, io, base, mode, outcome.child.cleanup_complete);
         if (std.mem.eql(u8, mode, "git-timeout")) {
             try std.testing.expectEqual(.timeout, outcome.child.failures.primary.?.category);
             try std.testing.expect(outcome.child.cleanup_complete and outcome.child.failures.cleanup == null);
@@ -1665,8 +1898,9 @@ test "namespace Git actual static dispatch restores stripped and poisoned policy
             ready.close(io);
             const absolute_scratch = try std.fs.path.join(allocator, &.{ base.path, scratch_path });
             defer allocator.free(absolute_scratch);
-            const stages = try readStages(allocator, io, .{ .dir = scratch, .path = absolute_scratch });
-            for (stages.observations) |stage| {
+            const stages = try readStages(allocator, io, .{ .dir = scratch, .path = absolute_scratch }, .git_timeout);
+            for ([_]FixtureStage{ .setup_started, .runtime_ready, .namespace_enter, .inner_payload_entry, .inside_ready, .policy_ready, .blocked_probe, .write_observed }) |required| {
+                const stage = stages.observations[@intFromEnum(required)];
                 try std.testing.expectEqual(.observed, stage.state);
                 try std.testing.expectEqual(stage.stage.clockScope(), stage.record.?.clock_scope);
             }

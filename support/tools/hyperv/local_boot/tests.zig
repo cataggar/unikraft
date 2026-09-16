@@ -479,6 +479,9 @@ test "native hard timeout and serial file limit retain bounded evidence" {
         }
         const work = try f.work();
         defer work.close(io);
+        const phases = try diagnostics.read(a, io, work);
+        try expectBeforeDeadline(phases, f.config.timeout_ms);
+        if (mode == 3) try f.emitPhases(work);
         try t.expectError(error.FileNotFound, work.openFile(io, "OVMF_VARS.fd"));
         try t.expectError(error.WorkspaceConsumed, f.run());
     }
@@ -858,6 +861,13 @@ test "synthetic sampling preserves the exact local boot flat v1 wire and bounds"
     for (phases, 0..) |phase, index| try t.expectEqual(index, @intFromEnum(phase));
 }
 
+fn expectBeforeDeadline(observed: diagnostics.Observation, timeout_ms: u64) !void {
+    try t.expectEqual(diagnostics.slot_count, observed.count);
+    const records = observed.slice();
+    const elapsed = records[diagnostics.slot_count - 1].monotonic_ns - records[0].monotonic_ns;
+    try t.expect(elapsed < timeout_ms * std.time.ns_per_ms);
+}
+
 test "synthetic native phase times sizes serial separation and teardown" {
     const name = block: {
         const f = try Fixture.init(0, true);
@@ -873,6 +883,8 @@ test "synthetic native phase times sizes serial separation and teardown" {
         const observed = try diagnostics.read(a, io, work);
         try t.expectEqual(diagnostics.slot_count, observed.count);
         try t.expectEqual(.aligned_prefix, observed.tail);
+        try expectBeforeDeadline(observed, f.config.timeout_ms);
+        try f.emitPhases(work);
         const executable = try core.private_files.openAbsolute(io, f.config.qemu, .artifact);
         defer executable.close(io);
         const size = (try core.private_files.snapshot(executable)).size;

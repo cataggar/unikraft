@@ -2302,6 +2302,47 @@ class HypervWorkflowTest(unittest.TestCase):
         ):
             self.assertIn(target, producer)
 
+    def test_local_boot_synthetic_strip_gate_and_failure_evidence_wiring(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        producer = workflow.split("  zig-hyperv:\n", 1)[1].split(
+            "\n  zig-hyperv-complete:", 1
+        )[0]
+        step = producer.split(
+            "    - name: Run native public Hyper-V local-boot fixtures\n", 1
+        )[1].split("\n    - name:", 1)[0]
+        for required in (
+            "if: ${{ success() && !cancelled() }}",
+            "set -euo pipefail", "umask 077",
+            'readlink -f "${RUNNER_TEMP}/hyperv-tools/bin/llvm-objcopy"',
+            "ci-objcopy-version.awk",
+            'sha256sum -- "${objcopy}"',
+            'sha256sum --check "${root}/fixture-objcopy-sha256.txt"',
+            "for mode in Debug ReleaseSafe; do",
+            '-Dstrip-fixture-debug=true "-Dfixture-objcopy=${objcopy}"',
+            '"-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json"',
+            '-Doptimize="${mode}" -j2',
+            "test test-strip-equivalence test-strip-proof install --summary all",
+            '2>&1 | tee "${root}/${mode}/fixtures.log"',
+        ):
+            self.assertIn(required, step)
+        for forbidden in ("--strip-all", "-Dstrip=true", "|| true",
+                          "continue-on-error:", "-Dtest-filter="):
+            self.assertNotIn(forbidden, step)
+        retained = producer.split(
+            "    - name: Retain bounded local image evidence\n", 1
+        )[1]
+        for mode in ("Debug", "ReleaseSafe"):
+            for artifact in (
+                "fixtures.log", "fixture-strip-proof.json",
+                "zig-local-cache/**/local-boot-qemu-fixture",
+                "zig-local-cache/**/local-boot-qemu-diagnostic-fixture",
+            ):
+                self.assertIn(
+                    f"/native-local-boot/{mode}/{artifact}", retained
+                )
+
     def test_producer_dependency_guard_is_failure_aware_and_cancelable(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/integration.yaml"

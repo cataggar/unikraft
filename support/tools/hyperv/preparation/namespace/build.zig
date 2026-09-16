@@ -8,6 +8,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const workspace = b.option([]const u8, "workspace", "Explicit preparation validation subtree") orelse
         @panic("-Dworkspace is required");
+    if (b.option(bool, "observations-only", "Build only unprivileged synthetic namespace observation tests; no namespace fixture/helper") orelse false) {
+        observationTests(b, target, optimize, workspace);
+        return;
+    }
     const git_executable = b.option([]const u8, "git-executable", "Explicit public native Git fixture executable") orelse
         @panic("-Dgit-executable is required");
     const git_loader = b.option([]const u8, "git-loader", "Explicit public native Git fixture ELF interpreter") orelse
@@ -199,6 +203,34 @@ pub fn build(b: *std.Build) void {
     if (suite_gate) |check| run.step.dependOn(&check.step);
     run.setCwd(.{ .cwd_relative = workspace });
     b.step("test", "Run small native namespace and typed producer fixtures").dependOn(&run.step);
+}
+
+fn observationTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) void {
+    const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+    const elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
+    const paths = b.createModule(.{ .root_source_file = b.path("../../../../build/zig-facade-paths.zig"), .target = target, .optimize = optimize });
+    const measurement = b.createModule(.{ .root_source_file = b.path("../../synthetic_measurement.zig"), .target = target, .optimize = optimize });
+    const tests = b.addTest(.{
+        .filters = &.{"namespace observations "},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../namespace_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .single_threaded = true,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = core },
+                .{ .name = "producer_elf", .module = elf },
+                .{ .name = "facade_paths", .module = paths },
+                .{ .name = "synthetic_measurement", .module = measurement },
+            },
+        }),
+    });
+    const options = b.addOptions();
+    options.addOption([]const u8, "workspace", workspace);
+    tests.root_module.addOptions("fixture_options", options);
+    const run = b.addRunArtifact(tests);
+    run.setCwd(.{ .cwd_relative = workspace });
+    b.step("test-observations", "Run only bounded observation format, phase, refusal and failure-retention tests").dependOn(&run.step);
 }
 
 fn strippedCopy(b: *std.Build, objcopy: []const u8, raw: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {
