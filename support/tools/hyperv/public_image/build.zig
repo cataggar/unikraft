@@ -78,6 +78,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (target.result.cpu.arch == .x86_64)
+        cost_probe.root_module.addAssemblyFile(b.path("cost_clear_upper.S"));
     cost_probe.root_module.addOptions("test_options", options);
     b.step("build-cost-probe", "Compile the uninstalled synthetic cost probe without running it").dependOn(&cost_probe.step);
     b.step("diagnose-cost", "Measure actual synthetic package and independent boot hashes without a guest").dependOn(&b.addRunArtifact(cost_probe).step);

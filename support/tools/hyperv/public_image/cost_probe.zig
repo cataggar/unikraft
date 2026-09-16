@@ -5,6 +5,7 @@ const image = @import("public_image");
 const measurement = @import("synthetic_measurement");
 const options = @import("test_options");
 const fixtures = @import("import_fixture.zig");
+extern fn hyperv_public_cost_clear_upper() callconv(.c) void;
 const Phase = enum {
     entry,
     package_begin,
@@ -63,24 +64,7 @@ fn clearedDigest(io: std.Io, path: []const u8, expected: [32]u8) !void {
         const length: usize = @intCast(@min(buffer.len, before.size - position));
         if (try file.readPositionalAll(io, buffer[0..length], position) != length) return error.ArtifactChanged;
         if (comptime builtin.cpu.arch == .x86_64 and builtin.cpu.hasAll(.x86, &.{ .sha, .avx2 })) {
-            asm volatile ("vzeroupper" ::: .{
-                    .ymm0 = true,
-                    .ymm1 = true,
-                    .ymm2 = true,
-                    .ymm3 = true,
-                    .ymm4 = true,
-                    .ymm5 = true,
-                    .ymm6 = true,
-                    .ymm7 = true,
-                    .ymm8 = true,
-                    .ymm9 = true,
-                    .ymm10 = true,
-                    .ymm11 = true,
-                    .ymm12 = true,
-                    .ymm13 = true,
-                    .ymm14 = true,
-                    .ymm15 = true,
-                });
+            hyperv_public_cost_clear_upper();
         }
         sha.update(buffer[0..length]);
         position += length;
