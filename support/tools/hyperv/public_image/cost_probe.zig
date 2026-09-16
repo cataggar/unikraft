@@ -6,12 +6,15 @@ const measurement = @import("synthetic_measurement");
 const options = @import("test_options");
 const fixtures = @import("import_fixture.zig");
 extern fn hyperv_public_cost_clear_upper() callconv(.c) void;
+extern fn hyperv_public_cost_dirty_upper() callconv(.c) void;
 const Phase = enum {
     entry,
     package_begin,
     package_end,
     raw_digest_begin,
     raw_digest_end,
+    raw_dirty_upper_digest_begin,
+    raw_dirty_upper_digest_end,
     raw_clear_upper_digest_begin,
     raw_clear_upper_digest_end,
     qemu_digest_begin,
@@ -51,12 +54,12 @@ fn digest(io: std.Io, path: []const u8, begin: Phase, end: Phase) ![32]u8 {
     return sha;
 }
 
-fn clearedDigest(io: std.Io, path: []const u8, expected: [32]u8) !void {
+fn standardDigest(io: std.Io, path: []const u8, expected: [32]u8, comptime clear_upper: bool) !void {
     const p = image.core.private_files;
     const file = try p.openAbsolute(io, path, .artifact);
     defer file.close(io);
     const before = try p.snapshot(file);
-    try mark(io, .raw_clear_upper_digest_begin, before.size);
+    try mark(io, if (clear_upper) .raw_clear_upper_digest_begin else .raw_dirty_upper_digest_begin, before.size);
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [32768]u8 = undefined;
     var position: u64 = 0;
@@ -64,7 +67,8 @@ fn clearedDigest(io: std.Io, path: []const u8, expected: [32]u8) !void {
         const length: usize = @intCast(@min(buffer.len, before.size - position));
         if (try file.readPositionalAll(io, buffer[0..length], position) != length) return error.ArtifactChanged;
         if (comptime builtin.cpu.arch == .x86_64 and builtin.cpu.hasAll(.x86, &.{ .sha, .avx2 })) {
-            hyperv_public_cost_clear_upper();
+            hyperv_public_cost_dirty_upper();
+            if (clear_upper) hyperv_public_cost_clear_upper();
         }
         sha.update(buffer[0..length]);
         position += length;
@@ -73,7 +77,7 @@ fn clearedDigest(io: std.Io, path: []const u8, expected: [32]u8) !void {
         !p.sameSnapshot(before, try p.snapshot(file))) return error.ArtifactChanged;
     const actual = sha.finalResult();
     if (!std.mem.eql(u8, &actual, &expected)) return error.DigestMismatch;
-    try mark(io, .raw_clear_upper_digest_end, before.size);
+    try mark(io, if (clear_upper) .raw_clear_upper_digest_end else .raw_dirty_upper_digest_end, before.size);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -88,7 +92,8 @@ pub fn main(init: std.process.Init) !void {
     const qemu = try std.Io.Dir.cwd().realPathFileAlloc(io, options.fixture, a);
     const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, a);
     const raw_sha = try digest(io, raw, .raw_digest_begin, .raw_digest_end);
-    try clearedDigest(io, raw, raw_sha);
+    try standardDigest(io, raw, raw_sha, false);
+    try standardDigest(io, raw, raw_sha, true);
     _ = try digest(io, qemu, .qemu_digest_begin, .qemu_digest_end);
     _ = try digest(io, cli, .producer_digest_begin, .producer_digest_end);
     try f.dir.dir.writeFile(io, .{ .sub_path = "code.fd", .data = "synthetic firmware", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });

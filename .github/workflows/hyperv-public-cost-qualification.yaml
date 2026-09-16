@@ -12,6 +12,10 @@ jobs:
   native-public-cost:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3]
     steps:
     - uses: actions/checkout@v4
       with:
@@ -23,7 +27,7 @@ jobs:
         ghr-version: v0.8.0
         tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-    - name: Measure Debug native and software SHA on the same native x86 runner
+    - name: Compare dirty and clean SHA transitions and run every Debug fixture
       shell: bash
       run: |
         set -euo pipefail
@@ -34,13 +38,16 @@ jobs:
         cp support/tools/hyperv/public_image/build.zig \
           support/tools/hyperv/public_image/build.zig.zon "${root}/restore/"
         zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        for cpu in native native-sha; do
-          mkdir -p "${root}/${cpu}/fixtures"
-          echo "public-image synthetic configuration: cpu=${cpu}"
-          timeout --signal=TERM --kill-after=5s 8m \
-            zig build --build-file support/tools/hyperv/public_image/build.zig \
-            --system "${root}/restore/zig-pkg" \
-            --cache-dir "${root}/${cpu}/cache" \
-            -Dtest-root="${root}/${cpu}/fixtures" \
-            -Doptimize=Debug "-Dcpu=${cpu}" -j2 diagnose-cost --summary all
-        done
+        mkdir -p "${root}/native/fixtures" "${root}/native/import-fixtures"
+        zig build --build-file support/tools/hyperv/public_image/build.zig \
+          --system "${root}/restore/zig-pkg" \
+          --cache-dir "${root}/native/cache" \
+          -Dtest-root="${root}/native/fixtures" \
+          -Doptimize=Debug -j2 diagnose-cost --summary all
+        zig build --build-file support/tools/hyperv/public_image/build.zig \
+          --system "${root}/restore/zig-pkg" \
+          --cache-dir "${root}/native/cache" \
+          --prefix "${root}/native/out" \
+          -Dtest-root="${root}/native/fixtures" \
+          -Dimport-test-root="${root}/native/import-fixtures" \
+          -Doptimize=Debug -j2 test test-import install --summary all
