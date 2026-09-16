@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Synthetic framing/lifecycle regressions, not native execution evidence."""
 import copy
+import ctypes
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -144,16 +147,65 @@ class BuildBoundary(unittest.TestCase):
                 patch.object(prepare, "WORKLOAD_REVISION", None):
             for variant in ("snapshot", "jit", "sample-aot"):
                 with self.subTest(variant=variant), self.assertRaisesRegex(ValueError, "merged SDK pin"):
-                    prepare.prepare(ROOT, False, variant)
+                    prepare.prepare(ROOT, False, variant,
+                                    jit_mode="fast" if variant == "jit" else None)
 
     def test_default_and_coremark_cannot_silently_become_jit(self):
         with patch.object(prepare, "capture", return_value="0.16.0"):
             with self.assertRaisesRegex(ValueError, "Coremark|coremark"):
                 prepare.prepare(ROOT, True, "jit")
-            with self.assertRaisesRegex(ValueError, "only for optional"):
-                prepare.prepare(ROOT, False, "tiny", "f" * 40)
+            with self.assertRaisesRegex(ValueError, "other variants forbid"):
+                prepare.prepare(ROOT, False, "tiny", jit_mode="fast")
+            with self.assertRaisesRegex(ValueError, "requires exactly"):
+                prepare.prepare(ROOT, False, "jit")
         self.assertIn("-fPIC", prepare.NATIVE_FLAGS)
         self.assertIn("-fno-compiler-rt", prepare.NATIVE_FLAGS)
+
+
+class BootMode(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        (ROOT / "build").mkdir(mode=0o700, exist_ok=True)
+        cls.scratch = tempfile.TemporaryDirectory(dir=ROOT / "build")
+        cls.addClassCleanup(cls.scratch.cleanup)
+        library = Path(cls.scratch.name) / "workload-mode.so"
+        subprocess.run(["zig", "cc", "-shared", "-fPIC", "-std=c11",
+                        "-Wall", "-Wextra", "-Werror",
+                        str(ROOT / "tests/workload-mode.c"), "-o", str(library)],
+                       check=True)
+        cls.native = ctypes.CDLL(str(library)).check_mode
+        cls.native.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_int,
+                               ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_uint)]
+        cls.native.restype = ctypes.c_int
+
+    def check_mode(self, variant, configured, args, expected):
+        argv = (ctypes.c_char_p * len(args))(*args)
+        mode = ctypes.c_uint(99)
+        status = self.native(variant, configured, len(args), argv, ctypes.byref(mode))
+        self.assertEqual(status == 0, expected is not None)
+        self.assertEqual(mode.value, 99 if expected is None else expected)
+
+    def test_fixed_jit_images_boot_without_firmware_arguments(self):
+        for mode, name in ((1, b"correctness-fast"), (2, b"correctness-full")):
+            self.check_mode(2, mode, [b"wamr"], mode)
+            self.check_mode(2, mode, [b"wamr", name], mode)
+
+    def test_absent_contradictory_measurement_and_unknown_modes_refuse(self):
+        for mode in (0, 3):
+            self.check_mode(2, mode, [b"wamr"], None)
+        for mode, argument in ((1, b"correctness-full"), (2, b"correctness-fast"),
+                               (1, b"measurement"), (2, b"correctness"), (1, b"fast")):
+            self.check_mode(2, mode, [b"wamr", argument], None)
+        self.check_mode(2, 1, [b"wamr", b"correctness-fast", b"extra"], None)
+        self.check_mode(2, 1, [], None)
+        self.check_mode(4, 0, [b"wamr"], None)
+
+    def test_compiler_free_images_do_not_inherit_jit_modes(self):
+        for variant in (1, 3):
+            self.check_mode(variant, 0, [b"wamr"], 0)
+            self.check_mode(variant, 0, [b"wamr", b"correctness"], 0)
+            self.check_mode(variant, 1, [b"wamr"], None)
+            self.check_mode(variant, 0, [b"wamr", b"correctness-fast"], None)
 
 
 if __name__ == "__main__":

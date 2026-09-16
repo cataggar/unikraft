@@ -18,12 +18,17 @@ silently replacing previously identified inputs.
 | `tiny` (default) | unchanged | Original compiler-free tiny check; optional original CoreMarks |
 | `snapshot` | none or `correctness` | `wamr-aot.benchmark` / `.runner`, one root |
 | `sample-aot` | none or `correctness` | Only `wamr-jit-aot-sample`, compiler-free comparator |
-| `jit` | exactly `correctness-fast` or `correctness-full` | Only `wamr-jit`, explicit bounded preset |
+| `jit --jit-mode fast` | none, or exactly `correctness-fast` | Only `wamr-jit`, fixed fast correctness image |
+| `jit --jit-mode full` | none, or exactly `correctness-full` | Only `wamr-jit`, fixed full correctness image |
 
 Both matched images import the public `wamr-jit-workload` source module.
 They do **not** import both sampler roots or duplicate the SDK's API types.
-Fast/full are modes of the **same JIT image**, not separately compiled workloads.
-Missing/unknown JIT modes fail before execution. Arguments cannot change fuel,
+Fast/full use the same compiler/runtime and workload, but are **separately
+identified correctness images**. Preparation requires the explicit `--jit-mode`;
+there is no implicit fast default. The existing application Kconfig mechanism
+binds `APPWAMRAOT_JIT_BOOT_MODE` to that prepared identity. Each image selects its
+fixed preset when ordinary EFI fallback boot supplies only argv[0]. Contradictory
+or unknown arguments fail before execution. Arguments cannot change fuel,
 heap/code/reservation/compiler limits, input Wasm, exports, rounds or repeats.
 Every optional image rejects `measurement` before any execution, with the
 explicit diagnostic
@@ -44,12 +49,15 @@ python3 support/apps/wamr-aot/build-image.py olddefconfig
 python3 support/apps/wamr-aot/build-image.py native-images
 ```
 
-Repeat in fresh worktrees with `sample-aot` and `jit`. The selected Git commit
+Repeat in fresh worktrees with `sample-aot`, `jit --jit-mode fast` and
+`jit --jit-mode full`. The selected Git commit
 is exported into the application's ignored private build directory; the source
 checkout, its branches, dirty files and outputs are never modified.
 Development manifests say `local-development-build-only-not-supported-lineage`.
 This escape hatch is **not** an upstream source pin or a qualified deployment.
-It cannot override the tiny image's supported source selection.
+An explicitly selected development revision also supports local tiny/CoreMark
+bridge integration, but its manifest remains development-only and the
+credential-free CI adapter refuses it.
 
 The same existing `hyperv-x86_64-efi-wamr` graph produces the real native ELF and
 EFI, including its final IRQ/SMP/relocation safety gates. No selector-only or
@@ -58,6 +66,16 @@ application stack**; compilation rejects a smaller config. This leaves 256 KiB
 for admitted generated frames and 768 KiB for compiler/embedder/callback frames,
 but is build provisioning, **not an independently measured/qualified stack
 high-water guarantee**. Default tiny stacks are not changed.
+
+The wrapper writes the fixed JIT preset only when creating a fresh `.config`;
+compilation refuses a solved-config/header mismatch rather than silently changing
+an existing configuration. This uses ordinary Unikraft application configuration,
+not a new boot-info or public runner ABI. EFI LoadOptions and the existing
+`HYPERV_EFI_STUB_CMDLINE_FNAME` mechanism can carry a matching optional argument,
+but are unnecessary. Neither existing miz packaging nor `local_boot` is asked
+to invent an argument or an unbound sidecar. The two correctness images cannot
+be presented as the single JIT image expected by a future independently qualified
+fast/full measurement transport.
 
 All consumers and imported SDK modules are PIC, ReleaseSafe, single-threaded,
 x86_64 freestanding SysV, with no red zone, libc, stack checker/protector, unwind
@@ -147,7 +165,7 @@ consumer archive** SHA256 identities. The archive is hashed first; the identity
 data is supplied separately by the final C application object, avoiding a
 self-hash cycle. Source tree identity hashes sorted compact JSON mapping actual
 exported relative file paths to byte counts and SHA256, before generating build
-outputs. `source-files.json`, exact commands and tool/input hashes stay private.
+outputs. `build/source-files.json`, exact commands and tool/input hashes stay private.
 The external image wrapper hashes the completed EFI and ELF; neither is a
 qualified complete-disk/boot identity.
 
@@ -181,3 +199,11 @@ x86 KVM/OVMF prerequisites. A cross-compiled EFI, successful final safety gate,
 packaged disk or qemu-user/Linux result is not a native boot or four-boot pass.
 Do not weaken those gates on an ARM development host. Independent boot/hardware,
 guarded transport and physical memory qualification remain outstanding.
+
+The inherited compute-specific `support/build/wamr-native-ci` packager supports
+physical packaging without a boot and avoids the network application's return-2
+contract. For an optional EFI check, `uk-hyperv-local-boot --image ...` uses
+`--expect-main-return 0` and the exact mode marker (variant 2, mode 1 for fast or
+mode 2 for full). Do not pass nonexistent guest-argument flags to that CLI.
+Its successful process/image/serial checks and this app's compute validator are
+both required; packaging alone is not a four-boot result.

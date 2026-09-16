@@ -192,6 +192,9 @@ def run(root, stage, args, seconds=600, limit=8 * MIB):
 def check_build():
     identity = document(APP / "build/artifacts/identity.json")
     require(identity["wamr_revision"] == REVISION
+            and identity.get("development_only", False) is False
+            and identity.get("variant", "tiny") == "tiny"
+            and identity.get("jit_mode") is None
             and identity["compiler_profile"] == "unikraft-x86_64"
             and identity["zig_version"] == "0.16.0"
             and identity["minimal_wasi"] is False, "not the pinned tiny producer")

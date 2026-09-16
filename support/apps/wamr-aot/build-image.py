@@ -96,6 +96,8 @@ def main():
         if manifest.get("variant", "tiny") != "tiny":
             with (ROOT / ".config").open("a") as config:
                 config.write("\nCONFIG_STACK_SIZE_PAGE_ORDER=8\n")
+                mode = {None: 0, "fast": 1, "full": 2}[manifest["jit_mode"]]
+                config.write(f"CONFIG_APPWAMRAOT_JIT_BOOT_MODE={mode}\n")
     zig = tool("zig")
     command = [
         zig, "build", args.step, "-j2",

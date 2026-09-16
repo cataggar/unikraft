@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "workloads.h"
 #include "identity.h"
+#include "workload-mode.h"
 #include <stdio.h>
 #include <string.h>
 #include <uk/alloc.h>
@@ -10,6 +11,9 @@
 #if WAMR_APP_VARIANT
 #if CONFIG_STACK_SIZE_PAGE_ORDER < 8
 #error "Optional WAMR workloads require a separately provisioned 1 MiB native stack"
+#endif
+#if CONFIG_APPWAMRAOT_JIT_BOOT_MODE != WAMR_JIT_BOOT_MODE
+#error "Solved JIT boot mode differs from the prepared artifact identity"
 #endif
 
 int wamr_workload_write(const uint8_t *bytes, size_t length)
@@ -71,17 +75,9 @@ int wamr_workload_main(int argc, char **argv)
 		       "independent-image-deployment-and-memory-qualification-unavailable\n");
 		return 1;
 	}
-#if WAMR_APP_VARIANT == 2
-	if (argc == 2 && !strcmp(argv[1], "correctness-fast"))
-		mode = 1;
-	else if (argc == 2 && !strcmp(argv[1], "correctness-full"))
-		mode = 2;
-	else
+	if (wamr_workload_mode(WAMR_APP_VARIANT,
+			      CONFIG_APPWAMRAOT_JIT_BOOT_MODE, argc, argv, &mode))
 		goto invalid;
-#else
-	if (argc != 1 && (argc != 2 || strcmp(argv[1], "correctness")))
-		goto invalid;
-#endif
 	status = wamr_platform_config(&platform, uk_alloc_get_default(), &config);
 	if (!status)
 		status = wamr_platform_selftest(&platform, &config);

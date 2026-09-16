@@ -153,6 +153,8 @@ def validate(raw, identity, mode, sampler_validator=None):
     else:
         require(variant in ("jit", "sample-aot") and
                 mode in (("fast", "full") if variant == "jit" else ("aot",)), "wrong sampler mode")
+        require(identity["jit_mode"] == (mode if variant == "jit" else None),
+                "sample mode differs from the built image preset")
         require(all(not found[key] for key in PREFIXES[1:4]), "mixed snapshot protocol")
         require(len(found["WAMR_JIT_SAMPLE"]) == 1, "missing/duplicate sampler record")
         require(order == ["WAMR_JIT_SAMPLE", "WAMR_NATIVE_WORKLOAD_BUILD", "completed"],

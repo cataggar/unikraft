@@ -1,5 +1,5 @@
 menuconfig APPWAMRAOT
-	bool "Compiler-free native WAMR AOT correctness application"
+	bool "Native WAMR correctness application (compiler-free by default)"
 	default y
 	depends on PLAT_HYPERV && ARCH_X86_64
 	select LIBNOLIBC
@@ -8,4 +8,16 @@ menuconfig APPWAMRAOT
 	select LIBUKPAGING_STATS
 	help
 	  Run trusted, source-pinned precompiled code and native memory checks.
-	  No guest filesystem, network, compiler, or benchmark acceptance.
+	  The default has no guest filesystem, network, or compiler. Optional
+	  workloads remain correctness-only, without benchmark acceptance.
+
+config APPWAMRAOT_JIT_BOOT_MODE
+	int "Prepared JIT correctness preset (0=none, 1=fast, 2=full)"
+	depends on APPWAMRAOT
+	range 0 2
+	default 0
+	help
+	  Set by the image wrapper from prepare.py --variant jit --jit-mode.
+	  The value must match the independently generated artifact header.
+	  It selects a fixed correctness-only preset when firmware provides no
+	  application arguments. It cannot enable a compiler in an AOT image.

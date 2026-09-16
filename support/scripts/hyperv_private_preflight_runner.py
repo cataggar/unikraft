@@ -305,7 +305,7 @@ GUARDED_PRODUCER_FILES = {
         "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
     ),
     "support/build/native-image-data.zig": (
-        "c51c41d14050bfbdaa3ccca99f75c61d1e62eed2b4946fc58a0726f79e8d0a6d"
+        "9ded751a325eb43ab2d09af26c31e1cb666134bb3b36f30ca0f186cb64f4820b"
     ),
     "support/build/native-kconfig-bridge.c": (
         "457137bfa280d69f8c3c819ca059c20b76a6c5dcb190575d10a7e5b1ea05f93a"
@@ -500,7 +500,7 @@ GUARDED_PRODUCER_FILES = {
         "82e672e9659bfb4851d574c0c1ce4a48b55c415e9ffc6bc36eda57dde9e7764b"
     ),
     "support/build/native-image-graph.zig": (
-        "24b15c23cc7dc70c880e4fd9d302a58d2823cf2b085fe8a616c8f8317aea18e5"
+        "58b744a6b02de3e3a8fccce2626346e5cd1ddb87ba5a90c1080135bdb1147e4e"
     ),
     "support/build/native-postprocess-runner.py": (
         "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"
