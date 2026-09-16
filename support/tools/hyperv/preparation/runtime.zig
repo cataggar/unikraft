@@ -4,6 +4,8 @@ const c = @import("contracts.zig");
 const fs = @import("files.zig");
 const elf = @import("producer_elf");
 const paths = @import("facade_paths");
+const observe_fixture = @hasDecl(@import("root"), "namespace_fixture_observer");
+const observer = if (observe_fixture) @import("root").namespace_fixture_observer else void;
 
 const ElfInfo = struct {
     needed: []const []const u8,
@@ -35,17 +37,25 @@ pub const Bound = struct {
         const allocator = arena.allocator();
         if (self.contract.libraries.len > 256) return error.LimitExceeded;
         try origin.validate(self.contract.origin, self.contract.role, self.contract.target);
+        if (observe_fixture) observer.mark(.inventory_begin);
         const observed = try fs.inventory(allocator, io, self.directory, 100000, 4 * 1024 * 1024 * 1024);
         try fs.requireTree(observed.tree, self.contract.tree);
+        if (observe_fixture) {
+            observer.mark(.inventory_end);
+            observer.mark(.loader_begin);
+        }
         const loader_info: ?ElfInfo = if (self.contract.loader) |loader| blk: {
             try fs.requireFile(try self.directory.record(allocator, io, loader.path, 64 * 1024 * 1024, .executable), loader);
             const info = try self.checkElf(allocator, io, loader, false);
             if (info.needed.len != 0 or info.interpreter != null or info.soname == null) return error.IncompleteRuntime;
             break :blk info;
         } else null;
+        if (observe_fixture) observer.mark(.loader_end);
         if (self.contract.executable) |executable| {
             if (self.contract.target == .data) return error.InvalidRuntime;
+            if (observe_fixture) observer.mark(.executable_record_begin);
             try fs.requireFile(try self.directory.record(allocator, io, executable.path, 1024 * 1024 * 1024, .executable), executable);
+            if (observe_fixture) observer.mark(.executable_record_end);
             const info = try self.checkElf(allocator, io, executable, true);
             if (loader_info == null and (info.needed.len != 0 or info.interpreter != null)) return error.IncompleteRuntime;
             if (loader_info) |loader| {
@@ -56,6 +66,7 @@ pub const Bound = struct {
             for (info.needed) |name| if (!hasLibrary(self.contract, name) and
                 !(loader_info != null and std.mem.eql(u8, name, loader_info.?.soname.?))) return error.IncompleteRuntime;
         } else if (self.contract.target != .data or self.contract.loader != null or self.contract.libraries.len != 0) return error.InvalidRuntime;
+        if (observe_fixture) observer.mark(.libraries_begin);
         if (self.contract.loader) |loader| {
             for (self.contract.libraries, 0..) |library, i| {
                 try c.relative(library.path);
@@ -83,16 +94,25 @@ pub const Bound = struct {
                 !std.mem.eql(u8, self.contract.loader.?.path, "lib/loader") or
                 observed.entries.len != self.contract.libraries.len + 2) return error.IncompleteRuntime;
         }
+        if (observe_fixture) {
+            observer.mark(.libraries_end);
+            observer.mark(.origin_begin);
+        }
         try origin.requirePhysical(allocator, io, self.directory, self.contract.origin, self.contract.evidence, observed);
+        if (observe_fixture) observer.mark(.origin_end);
         const named = try fs.Directory.open(allocator, io, self.directory.path);
         defer named.close(allocator, io);
         if (!std.meta.eql(try directoryMetadata(self.directory.dir), try directoryMetadata(named.dir))) return error.SourceChanged;
+        if (observe_fixture) observer.mark(.validation_end);
     }
 
     fn checkElf(self: Bound, allocator: std.mem.Allocator, io: std.Io, record: c.File, executable: bool) !ElfInfo {
+        if (observe_fixture and executable) observer.mark(.executable_read_begin);
         const bytes = try self.directory.read(allocator, io, record.path, 1024 * 1024 * 1024, if (executable) .executable else .artifact);
         defer allocator.free(bytes);
+        if (observe_fixture and executable) observer.mark(.executable_read_end);
         if (bytes.len != record.size or !std.crypto.timing_safe.eql(c.Sha, c.digest(bytes), record.sha256)) return error.HashMismatch;
+        if (observe_fixture and executable) observer.mark(.executable_hash_end);
         var image = try elf.Image.parse(allocator, bytes);
         defer image.deinit();
         const expected: std.elf.EM = switch (self.contract.target) {
@@ -177,6 +197,7 @@ pub const Bound = struct {
         }
         if (dynamic != null and dynamic_count != 1) return error.InvalidRuntime;
         result.needed = try needed.toOwnedSlice(allocator);
+        if (observe_fixture and executable) observer.mark(.executable_elf_end);
         return result;
     }
     fn originPaths(self: Bound, allocator: std.mem.Allocator, object: []const u8, value: []const u8) !void {

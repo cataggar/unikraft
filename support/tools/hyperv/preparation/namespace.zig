@@ -12,6 +12,8 @@ const git_entry = @import("git_entry.zig");
 const paths = @import("facade_paths");
 const elf = @import("producer_elf");
 const producer = @import("producer.zig");
+const observe_fixture = @hasDecl(@import("root"), "namespace_fixture_observer");
+const observer = if (observe_fixture) @import("root").namespace_fixture_observer else void;
 
 pub const Identity = struct {
     path: []const u8,
@@ -371,7 +373,10 @@ pub fn enter(allocator: std.mem.Allocator, io: std.Io, sandbox: Sandbox, argv: [
 /// corresponding field, and the production entry always supplies false.
 pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: Sandbox, argv: []const []const u8, environment: *const std.process.Environ.Map, cleanup_fault: bool) !Status {
     if (!builtin.single_threaded) @compileError("namespace helper must be built single_threaded");
+    if (observe_fixture) observer.mark(.isolation_begin);
+    errdefer if (observe_fixture) observer.mark(.returned_error);
     try validate(allocator, io, sandbox.isolation, sandbox.repository, sandbox.workspace);
+    if (observe_fixture) observer.mark(.isolation_end);
     if (hasAlias(sandbox.aliases, "git")) {
         const file = sandbox.isolation.git_policy orelse return error.MissingGitPolicy;
         const policy = try readGitPolicy(allocator, io, sandbox.workspace, file);
@@ -393,6 +398,7 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
         }
     }
     if (!paths.isDescendant(sandbox.workspace.path, sandbox.scratch.path)) return error.UnsafePath;
+    if (observe_fixture) observer.mark(.mounts_begin);
     var mounts: std.ArrayList(Mount) = .empty;
     var evidence_directories: std.ArrayList(fs.Directory) = .empty;
     defer {
@@ -405,8 +411,11 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
     const lock = try facade.openFile(io, "build.lock", .private);
     try mounts.append(allocator, .{ .file = lock, .target = sandbox.isolation.facade_lock.path, .directory = false, .readonly = false });
     for (sandbox.isolation.git_metadata) |git| try addDirectory(allocator, &mounts, git.directory, true);
+    if (observe_fixture) observer.mark(.mounts_end);
     for (sandbox.runtimes) |bound| {
+        if (observe_fixture) observer.runtimeBegin();
         try bound.validate(allocator, io);
+        if (observe_fixture) observer.mark(.runtime_mount_begin);
         for ([_][]const u8{ "/bin", "/lib", "/lib64", "/usr", "/etc", "/dev", "/proc", sandbox.repository.path, sandbox.workspace.path, facade.path, sandbox.isolation.account.home }) |reserved|
             if (paths.isSameOrAncestor(bound.directory.path, reserved)) return error.UnsafePath;
         if (paths.isSameOrAncestor(sandbox.scratch.path, bound.directory.path)) return error.UnsafePath;
@@ -435,7 +444,9 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
                 if (soname) |name| try addFile(allocator, io, &mounts, bound.directory, loader, try std.fmt.allocPrint(allocator, "/lib/{s}", .{name}), .artifact);
             }
         }
+        if (observe_fixture) observer.mark(.runtime_mount_end);
     }
+    if (observe_fixture) observer.mark(.mounts_finalize_begin);
     for ([_][]const u8{ "null", "zero", "random", "urandom" }, [_]u32{ 3, 5, 8, 9 }) |name, minor| {
         const path = try std.fmt.allocPrint(allocator, "/dev/{s}", .{name});
         const file = try std.Io.Dir.openFileAbsolute(io, path, .{ .path_only = true, .follow_symlinks = false });
@@ -468,6 +479,10 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
     // A fresh directory is mandatory. Do not reuse a historical root.
     var it = root_before.dir.iterate();
     if (try it.next(io) != null) return error.UnsafeFile;
+    if (observe_fixture) {
+        observer.mark(.mounts_finalize_end);
+        observer.mark(.namespace_setup_begin);
+    }
     try userNamespace(sandbox.isolation.account);
     if (linux.errno(linux.unshare(linux.CLONE.NEWNS | linux.CLONE.NEWPID | linux.CLONE.NEWNET | linux.CLONE.NEWIPC | linux.CLONE.NEWUTS)) != .SUCCESS)
         return error.NamespaceUnavailable;

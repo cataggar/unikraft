@@ -11,6 +11,8 @@ const git_entry = @import("git_entry.zig");
 const producer = @import("producer.zig");
 const options = @import("fixture_options");
 const observations = @import("namespace_observations.zig");
+pub const namespace_fixture_observer = @import("namespace_internal_observer.zig");
+const internal = namespace_fixture_observer;
 
 comptime {
     _ = producer;
@@ -172,6 +174,22 @@ fn reportFailureStages(allocator: std.mem.Allocator, io: std.Io, base: fs.Direct
     const selected = observations.Fixture.fromMode(mode) catch return;
     var buffer: [observations.log_bytes]u8 = undefined;
     std.debug.print("{s}", .{failureStageLog(allocator, io, base, selected, cleanup_complete, &buffer)});
+    var internal_buffer: [internal.log_bytes]u8 = undefined;
+    std.debug.print("{s}", .{internalFailureLog(allocator, io, base, selected, cleanup_complete, &internal_buffer)});
+}
+fn internalFailureLog(a: std.mem.Allocator, io: std.Io, base: fs.Directory, selected: observations.Fixture, cleanup_complete: bool, buffer: *[internal.log_bytes]u8) []const u8 {
+    const status = if (cleanup_complete) status: {
+        return retainInternalLog(a, io, base, selected, buffer) catch break :status "unavailable";
+    } else "cleanup_incomplete";
+    return std.fmt.bufPrint(buffer, "Namespace internal observations: {{\"authority\":\"none\",\"state\":\"{s}\"}}\n", .{status}) catch unreachable;
+}
+fn retainInternalLog(a: std.mem.Allocator, io: std.Io, base: fs.Directory, selected: observations.Fixture, buffer: *[internal.log_bytes]u8) ![]const u8 {
+    const path = try std.fmt.allocPrint(a, "{s}/fixture-{s}/{s}", .{ base.path, selected.mode(), fixtureScratch(selected.mode()) });
+    defer a.free(path);
+    const directory = try fs.Directory.open(a, io, path);
+    defer directory.close(a, io);
+    const collection = try internal.read(a, io, directory, selected);
+    return collection.log(a, buffer);
 }
 fn reportInsideError(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory, mode: []const u8) !void {
     const scratch = try std.fmt.allocPrint(allocator, "fixture-{s}/{s}", .{ mode, fixtureScratch(mode) });
@@ -373,6 +391,8 @@ fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_fi
     const leaked = try repository.openFile(io, "source.txt", .artifact);
     if (linux.errno(linux.fcntl(leaked.handle, linux.F.SETFD, 0)) != .SUCCESS) return error.FixtureFailed;
     try markStage(allocator, io, scratch.dir, diagnostic, .namespace_enter);
+    internal.start(allocator, io, scratch.dir, diagnostic);
+    defer internal.stop();
     const status = try ns.enterWithCleanupFault(allocator, io, sandbox, &.{
         if (std.mem.eql(u8, mode, "exec-missing")) "/bin/missing-fixture" else "/bin/fixture",
         try std.fmt.allocPrint(allocator, "inside-{s}", .{mode}),
@@ -946,6 +966,246 @@ test "namespace observations incomplete cleanup never reads fixture records" {
         try std.testing.expect(std.mem.indexOf(u8, line, "SYNTHETIC_PRIVATE") == null);
         try std.testing.expect(std.mem.indexOf(u8, line, "\"sample\"") == null);
     }
+}
+
+fn internalRecord(context: internal.Context, phase: internal.Phase, sequence: u8) internal.Record {
+    return .{
+        .fixture = .git_policy,
+        .sequence = sequence,
+        .context = context,
+        .phase = phase,
+        .self_bytes = 1234,
+        .sample = stageRecord(.git_policy, .namespace_enter, 10000 + @as(u64, sequence), 1000 + @as(u64, sequence)).sample,
+    };
+}
+
+test "namespace observations internal fixed format and maximum log exclude authority and private fields" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 96), internal.slots);
+    try std.testing.expectEqual(@as(usize, 512), internal.record_bytes);
+    try std.testing.expectEqual(@as(usize, 50176), internal.log_bytes);
+    var maximum: internal.Collection = .{ .fixture = .git_policy };
+    for (0..internal.slots) |index| {
+        var record = internalRecord(.runtime_2, .executable_record_begin, @intCast(index));
+        record.self_bytes = std.math.maxInt(u64);
+        record.sample.monotonic_ns = std.math.maxInt(u64);
+        record.sample.process_cpu_ns = std.math.maxInt(u64);
+        record.sample.optimize = .ReleaseSafe;
+        const bytes = try record.encode(a);
+        try std.testing.expectEqualDeep(record, try internal.decode(a, &bytes));
+        maximum.records[index] = record;
+        maximum.count += 1;
+    }
+    var buffer: [internal.log_bytes]u8 = undefined;
+    const line = try maximum.log(a, &buffer);
+    try std.testing.expect(line.len <= internal.log_bytes and line[line.len - 1] == '\n');
+    var bytes = try internalRecord(.isolation, .isolation_begin, 0).encode(a);
+    const authority = std.mem.indexOf(u8, &bytes, "\"none\"").?;
+    @memcpy(bytes[authority + 1 ..][0..4], "root");
+    if (internal.decode(a, &bytes)) |_| return error.AcceptedObservationAuthority else |_| {}
+    const valid = try internalRecord(.isolation, .isolation_begin, 0).encode(a);
+    bytes = valid;
+    const scope = std.mem.indexOf(u8, &bytes, "outer_helper").?;
+    @memcpy(bytes[scope..][0..12], "inner_helper");
+    if (internal.decode(a, &bytes)) |_| return error.AcceptedForeignClockScope else |_| {}
+    var unknown = [_]u8{0} ** internal.record_bytes;
+    const json = std.mem.trimEnd(u8, &valid, "\x00\n");
+    _ = try std.fmt.bufPrint(&unknown, "{s},\"argv\":\"SYNTHETIC_PRIVATE\"}}\n", .{json[0 .. json.len - 1]});
+    if (internal.decode(a, &unknown)) |_| return error.AcceptedPrivateObservationField else |_| {}
+    if (c.parse(ns.Status, a, std.mem.trimEnd(u8, &valid, "\x00"))) |status| {
+        status.deinit();
+        return error.ObservationAcceptedAsStatus;
+    } else |_| {}
+    var name: [32]u8 = undefined;
+    try std.testing.expectError(error.InternalObservationLimit, internal.fileName(internal.slots, &name));
+}
+
+fn validationPhases(order: *internal.Order, context: internal.Context) !void {
+    inline for (@typeInfo(internal.Phase).@"enum".fields[@intFromEnum(internal.Phase.inventory_begin) .. @intFromEnum(internal.Phase.validation_end) + 1]) |field|
+        try order.advance(context, @enumFromInt(field.value));
+}
+
+test "namespace observations internal order separates repeated runtimes and stops before namespace setup" {
+    var order: internal.Order = .{};
+    try std.testing.expectError(error.InvalidInternalSequence, order.advance(.isolation, .returned_error));
+    try order.advance(.isolation, .isolation_begin);
+    try validationPhases(&order, .isolation);
+    try order.advance(.isolation, .isolation_end);
+    try order.advance(.isolation, .mounts_begin);
+    try order.advance(.isolation, .mounts_end);
+    try std.testing.expectError(error.InvalidInternalSequence, order.advance(.runtime_1, .runtime_begin));
+    for ([_]internal.Context{ .runtime_0, .runtime_1, .runtime_2 }) |context| {
+        try order.advance(context, .runtime_begin);
+        try validationPhases(&order, context);
+        try order.advance(context, .runtime_mount_begin);
+        try order.advance(context, .runtime_mount_end);
+    }
+    try std.testing.expectError(error.InvalidInternalSequence, order.advance(.runtime_2, .runtime_begin));
+    try order.advance(.runtime_2, .mounts_finalize_begin);
+    try order.advance(.runtime_2, .mounts_finalize_end);
+    try order.advance(.runtime_2, .namespace_setup_begin);
+    try std.testing.expect(order.terminal);
+    try std.testing.expectError(error.InvalidInternalSequence, order.advance(.runtime_2, .returned_error));
+    var failed: internal.Order = .{};
+    try failed.advance(.isolation, .isolation_begin);
+    try failed.advance(.isolation, .returned_error);
+    try std.testing.expectError(error.InvalidInternalSequence, failed.advance(.isolation, .inventory_begin));
+}
+
+fn openFdCount(io: std.Io) !usize {
+    const directory = try std.Io.Dir.openDirAbsolute(io, "/proc/self/fd", .{ .iterate = true });
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    var count: usize = 0;
+    while (try iterator.next(io) != null) count += 1;
+    return count;
+}
+
+pub const InternalProbe = enum { refusal, runtime };
+
+pub fn internalProbe(a: std.mem.Allocator, io: std.Io, directory: fs.Directory, mode: InternalProbe) !void {
+    if (mode == .runtime) return internalRuntimeProbe(a, io, directory);
+    const sandbox = try @import("namespace/entry_refusal_fixture.zig").invalidAccount(a, io);
+    var environment = std.process.Environ.Map.init(a);
+    defer environment.deinit();
+    const before = try openFdCount(io);
+    internal.start(a, io, directory.dir, .timeout);
+    defer internal.stop();
+    try std.testing.expectError(error.InvalidAccount, ns.enter(a, io, sandbox, &.{"/unused"}, &environment));
+    try std.testing.expectEqual(before, try openFdCount(io));
+    var collection = try internal.read(a, io, directory, .timeout);
+    try std.testing.expectEqual(@as(usize, 2), collection.count);
+    try std.testing.expectEqual(internal.Phase.isolation_begin, collection.records[0].phase);
+    try std.testing.expectEqual(internal.Phase.returned_error, collection.records[1].phase);
+    try std.testing.expect(internal.fault() == null);
+    internal.start(a, io, directory.dir, .timeout);
+    try std.testing.expectError(error.InvalidAccount, ns.enter(a, io, sandbox, &.{"/unused"}, &environment));
+    try std.testing.expectEqual(internal.Fault.record_unavailable, internal.fault().?);
+    try std.testing.expectEqual(before, try openFdCount(io));
+    collection = try internal.read(a, io, directory, .timeout);
+    try std.testing.expectEqual(@as(usize, 2), collection.count);
+    try std.testing.expectEqual(internal.Fault.record_unavailable, collection.observer_fault.?);
+    internal.start(a, io, directory.dir, .timeout);
+    try std.testing.expectError(error.InvalidAccount, ns.enter(a, io, sandbox, &.{"/unused"}, &environment));
+    try std.testing.expectEqual(internal.Fault.record_unavailable, internal.fault().?);
+    try std.testing.expectEqual(before, try openFdCount(io));
+    var buffer: [internal.log_bytes]u8 = undefined;
+    std.debug.print("{s}", .{try collection.log(a, &buffer)});
+}
+
+fn internalRuntimeProbe(a: std.mem.Allocator, io: std.Io, directory: fs.Directory) !void {
+    const runtime = try makeDir(a, io, directory, "runtime");
+    defer runtime.close(a, io);
+    try copy(a, io, runtime, "/proc/self/exe", "fixture", 0o700);
+    const bound = try tool(a, io, runtime, "fixture", false);
+    const before = try openFdCount(io);
+    internal.start(a, io, directory.dir, .timeout);
+    defer internal.stop();
+    internal.mark(.isolation_begin);
+    try bound.validate(a, io);
+    internal.mark(.isolation_end);
+    try std.testing.expect(internal.fault() == null);
+    try std.testing.expectEqual(before, try openFdCount(io));
+    const collection = try internal.read(a, io, directory, .timeout);
+    try std.testing.expectEqual(@as(usize, @intFromEnum(internal.Phase.isolation_end)) + 1, collection.count);
+    try std.testing.expectEqual(internal.Tail.prefix, collection.tail);
+    for (collection.records[0..collection.count], 0..) |record, index| {
+        try std.testing.expectEqual(@as(internal.Phase, @enumFromInt(index)), record.phase);
+        try std.testing.expectEqual(internal.Context.isolation, record.context);
+        try std.testing.expectEqual(builtin.mode, record.sample.optimize);
+        try std.testing.expectEqual(builtin.zig_backend, record.sample.backend);
+    }
+    var buffer: [internal.log_bytes]u8 = undefined;
+    std.debug.print("{s}", .{try collection.log(a, &buffer)});
+}
+
+test "namespace observations internal shared hooks run unprivileged in the dedicated executable root" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(InternalProbe)) |mode| {
+        var temporary = std.testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const path = try temporary.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(path);
+        var environment = std.process.Environ.Map.init(a);
+        defer environment.deinit();
+        const result = try std.process.run(a, io, .{
+            .argv = &.{ @import("test_options").internal_probe, @tagName(mode), path },
+            .environ_map = &environment,
+            .stdout_limit = .limited(1024),
+            .stderr_limit = .limited(internal.log_bytes + 512),
+        });
+        defer a.free(result.stdout);
+        defer a.free(result.stderr);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+        try std.testing.expectEqual(@as(usize, 0), result.stdout.len);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "Namespace internal observations: ") != null);
+        std.debug.print("{s}", .{result.stderr});
+    }
+}
+
+test "namespace observations internal records reject unsafe files gaps clocks and partial slots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    for (0..7) |variant| {
+        var temporary = std.testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const directory: fs.Directory = .{ .dir = temporary.dir, .path = try temporary.dir.realPathFileAlloc(io, ".", a) };
+        const first = try internalRecord(.isolation, .isolation_begin, 0).encode(a);
+        var second_record = internalRecord(.isolation, .inventory_begin, 1);
+        if (variant == 0) second_record.sample.process_cpu_ns = 0;
+        const second = try second_record.encode(a);
+        var first_name: [32]u8 = undefined;
+        var second_name: [32]u8 = undefined;
+        const one = try internal.fileName(0, &first_name);
+        const two = try internal.fileName(if (variant == 1) 2 else 1, &second_name);
+        try put(io, temporary.dir, one, &first, 0o600);
+        switch (variant) {
+            2 => try put(io, temporary.dir, two, second[0..100], 0o600),
+            3 => try put(io, temporary.dir, two, &([_]u8{'S'} ** 513), 0o600),
+            4 => try temporary.dir.symLink(io, one, two, .{}),
+            5 => {
+                try put(io, temporary.dir, two, &second, 0o600);
+                const file = try temporary.dir.openFile(io, two, .{});
+                defer file.close(io);
+                try file.setPermissions(io, .fromMode(0o644));
+            },
+            6 => try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.linkat(temporary.dir.handle, "internal-entry-00", temporary.dir.handle, "internal-entry-01", 0))),
+            else => try put(io, temporary.dir, two, &second, 0o600),
+        }
+        const collection = try internal.read(a, io, directory, .git_policy);
+        const expected = [_]internal.Tail{ .invalid, .gap, .partial, .oversized, .unavailable, .unavailable, .unavailable };
+        try std.testing.expectEqual(expected[variant], collection.tail);
+        var buffer: [internal.log_bytes]u8 = undefined;
+        const line = try collection.log(a, &buffer);
+        try std.testing.expect(std.mem.indexOf(u8, line, directory.path) == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "SSSS") == null);
+    }
+}
+
+test "namespace observations internal failure retention outlives deletion and avoids incomplete cleanup reads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const base: fs.Directory = .{ .dir = temporary.dir, .path = try temporary.dir.realPathFileAlloc(io, ".", a) };
+    const scratch = try makeDir(a, io, base, "fixture-timeout/.d/zig-migration-preparation/resume-producer/work/scratch");
+    internal.start(a, io, scratch.dir, .timeout);
+    internal.mark(.isolation_begin);
+    internal.stop();
+    scratch.close(a, io);
+    var buffer: [internal.log_bytes]u8 = undefined;
+    const line = internalFailureLog(a, io, base, .timeout, true, &buffer);
+    try base.dir.deleteTree(io, "fixture-timeout");
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"phase\":\"isolation_begin\"") != null);
+    const invalid: fs.Directory = .{ .dir = .{ .handle = -1 }, .path = "SYNTHETIC_PRIVATE" };
+    const incomplete = internalFailureLog(a, io, invalid, .timeout, false, &buffer);
+    try std.testing.expect(std.mem.indexOf(u8, incomplete, "\"state\":\"cleanup_incomplete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, incomplete, "SYNTHETIC_PRIVATE") == null);
 }
 
 test "namespace facade ancestors expose only the selected directory" {
@@ -1634,6 +1894,8 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
         try markStage(allocator, io, scratch.dir, diagnostic, .missing_git_refused);
     }
     try markStage(allocator, io, scratch.dir, diagnostic, .namespace_enter);
+    internal.start(allocator, io, scratch.dir, diagnostic);
+    defer internal.stop();
     const status = try ns.enter(allocator, io, sandbox, &.{ "/bin/fixture", try std.fmt.allocPrint(allocator, "inside-{s}", .{mode}) }, &clean);
     try markStage(allocator, io, scratch.dir, diagnostic, .namespace_return);
     try scratch.dir.deleteDir(io, "namespace-root");
