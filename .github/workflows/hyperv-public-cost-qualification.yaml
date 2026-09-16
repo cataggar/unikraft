@@ -1,0 +1,46 @@
+name: Hyper-V public synthetic cost qualification
+
+on:
+  push:
+    branches: [fleet/wamr-public-boot-budget]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-public-cost:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Install the pinned native compiler
+      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+      with:
+        ghr-version: v0.8.0
+        tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+    - name: Measure Debug native and software SHA on the same native x86 runner
+      shell: bash
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${GITHUB_WORKSPACE}/.d/public-cost"
+        export ZIG_GLOBAL_CACHE_DIR="${root}/global"
+        mkdir -p "${root}/restore" "${ZIG_GLOBAL_CACHE_DIR}/tmp"
+        cp support/tools/hyperv/public_image/build.zig \
+          support/tools/hyperv/public_image/build.zig.zon "${root}/restore/"
+        zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for cpu in native native-sha; do
+          mkdir -p "${root}/${cpu}/fixtures"
+          echo "public-image synthetic configuration: cpu=${cpu}"
+          timeout --signal=TERM --kill-after=5s 8m \
+            zig build --build-file support/tools/hyperv/public_image/build.zig \
+            --system "${root}/restore/zig-pkg" \
+            --cache-dir "${root}/${cpu}/cache" \
+            -Dtest-root="${root}/${cpu}/fixtures" \
+            -Doptimize=Debug "-Dcpu=${cpu}" -j2 diagnose-cost --summary all
+        done

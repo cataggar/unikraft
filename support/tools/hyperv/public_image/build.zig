@@ -2,6 +2,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const filters = b.option([]const []const u8, "test-filter", "Run only tests matching these filters") orelse &.{};
     const source = b.dependency("miz_source", .{ .target = target, .optimize = optimize });
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
     const local = b.createModule(.{ .root_source_file = b.path("../local_boot/root.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "hyperv_core", .module = core }} });
@@ -46,7 +47,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "public_image", .module = module }},
-    }) });
+    }), .filters = filters });
     tests.root_module.addOptions("test_options", options);
     b.step("test", "Test native public packaging/export without real guest boots").dependOn(&b.addRunArtifact(tests).step);
     const import_options = b.addOptions();
@@ -57,7 +58,26 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "public_image", .module = module }},
-    }) });
+    }), .filters = filters });
     import_tests.root_module.addOptions("test_options", import_options);
     b.step("test-import", "Test physical native import and reload without guests or networking").dependOn(&b.addRunArtifact(import_tests).step);
+    const measurement = b.createModule(.{
+        .root_source_file = b.path("../synthetic_measurement.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cost_probe = b.addExecutable(.{
+        .name = "public-image-cost-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cost_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "public_image", .module = module },
+                .{ .name = "synthetic_measurement", .module = measurement },
+            },
+        }),
+    });
+    cost_probe.root_module.addOptions("test_options", options);
+    b.step("diagnose-cost", "Measure actual synthetic package and independent boot hashes without a guest").dependOn(&b.addRunArtifact(cost_probe).step);
 }
