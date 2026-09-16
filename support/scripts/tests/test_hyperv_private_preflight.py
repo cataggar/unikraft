@@ -787,8 +787,14 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
         proof_roles = {
             "plat/hyperv/Makefile.uk",
             "plat/hyperv/hyperv_runtime.zig",
+            "plat/hyperv/include/hyperv/clock.h",
+            "plat/hyperv/include/hyperv/efi_clock.h",
             "plat/hyperv/include/hyperv/hyperv.h",
             "plat/hyperv/time.c",
+            "drivers/firmware/ukefi/include/uk/efi.h",
+            "drivers/firmware/ukefi/include/uk/efi/time.h",
+            "lib/uktimeconv/include/uk/timeconv.h",
+            "lib/uktimeconv/timeconv.c",
             "drivers/hyperv/vmbus/Makefile.uk",
             "drivers/hyperv/vmbus/include/uk/vmbus.h",
             "drivers/hyperv/vmbus/include/uk/vmbus_storage.h",
@@ -838,6 +844,12 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
 
     def test_guarded_matcher_mutations_fail_before_packaging(self):
         mutation_targets = (
+            "drivers/firmware/ukefi/include/uk/efi.h",
+            "drivers/firmware/ukefi/include/uk/efi/time.h",
+            "lib/uktimeconv/include/uk/timeconv.h",
+            "lib/uktimeconv/timeconv.c",
+            "plat/hyperv/include/hyperv/clock.h",
+            "plat/hyperv/include/hyperv/efi_clock.h",
             "drivers/hyperv/vmbus/include/uk/vmbus_storage.h",
             "drivers/hyperv/vmbus/vmbus_protocol.zig",
             "drivers/hyperv/vmbus/vmbus_protocol.h",
