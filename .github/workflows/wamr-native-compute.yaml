@@ -1,0 +1,125 @@
+name: wamr-native-compute
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [zig16, fleet/wamr-native-156]
+
+# No dispatch, protected environment, cloud credentials, OIDC, or write token.
+# This additive context does not replace any existing required Hyper-V gate.
+permissions:
+  contents: read
+
+jobs:
+  wamr-native-compute:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: cataggar/wamr
+          ref: 2399694fb7ed11fffff0a34c82172dfdd54d7439
+          path: .d/wamr-source
+          persist-credentials: false
+
+      - name: Check the supported x86 runner and existing build prerequisites
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm
+          export PATH="/usr/bin:/bin:${PATH}"
+          if ! (
+            for name in make bison yacc flex lex m4 python3 getfacl; do
+              command -v "${name}" >/dev/null || exit 1
+            done
+            test -r /usr/share/OVMF/OVMF_CODE_4M.fd
+            test -r /usr/share/OVMF/OVMF_VARS_4M.fd
+          ); then
+            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
+              -o Dir::Etc::sourceparts=- update -qq
+            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
+              -o Dir::Etc::sourceparts=- install -y --no-install-recommends \
+              make bison flex m4 python3 acl ovmf
+          fi
+          mkdir -p .d
+
+      - name: Set up the existing verified native downloader
+        uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          cache: 'false'
+
+      - name: Acquire the existing pinned VPC-capable native QEMU runtime
+        run: |
+          bash .github/scripts/hyperv-native-qemu-acquire.sh "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+
+      - name: Install the existing pinned Zig compiler
+        uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Acquire the existing native LLVM distribution
+        uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          dest: ${{ github.workspace }}/.d/wamr-native-runtime/llvm
+          extract: 'true'
+          strip-components: '1'
+          cache: 'false'
+
+      - name: Build the distinct tiny AOT image through the existing safety graph
+        timeout-minutes: 45
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          mkdir -m 700 "${root}/firmware"
+          cp --no-preserve=mode,ownership \
+            "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
+          cp --no-preserve=mode,ownership \
+            "$(readlink -f /usr/share/OVMF/OVMF_VARS_4M.fd)" "${root}/firmware/vars.fd"
+          # Use the distro's safe Bison data path, not an optional runner shim.
+          zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
+          export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
+          echo "${zig_dir}" >> "${GITHUB_PATH}"
+          echo "${root}/llvm/bin" >> "${GITHUB_PATH}"
+          export BISON_PKGDATADIR=/usr/share/bison
+          python3 support/build/wamr-native-ci/run.py build --runtime "${root}" \
+            --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
+
+      - name: Boot the exact raw and full fixed VHD under both APIC configurations
+        timeout-minutes: 15
+        env:
+          QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
+          QUALIFICATION_SOURCE_JOB: wamr-native-compute
+        run: |
+          set -euo pipefail
+          root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
+          export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
+          bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
+
+      - name: Retain redacted compute diagnostics, never raw private state or images
+        if: always()
+        run: |
+          python3 support/build/wamr-native-ci/run.py diagnostics \
+            --runtime "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+
+      - name: Publish bounded local-only records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wamr-native-compute-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/.d/wamr-native-runtime/compute/evidence/*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
