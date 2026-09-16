@@ -13,11 +13,26 @@ PREFIXES = (
     "WAMR_NATIVE_WORKLOAD_BUILD", "WAMR_NATIVE_SNAPSHOT_SETUP",
     "WAMR_NATIVE_SNAPSHOT_RESET", "WAMR_NATIVE_INVOCATION", "WAMR_JIT_SAMPLE",
 )
+FORBIDDEN = (
+    "Unikraft Crash", "Assertion failure", "Exception Type", "HYPERV_ACCEPTANCE",
+    "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY", "UK_HYPERV_PLATFORM_READY",
+)
 DOMAINS = [
     "globals", "invocation-output", "linear-memory-access-protection",
     "linear-memory-contents", "linear-memory-logical-size",
     "passive-segment-drop-state", "table-entries-signatures", "wasi-context",
 ]
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+native_ci = load_module(
+    "wamr_optional_serial", ROOT.parents[1] / "build/wamr-native-ci/run.py")
 
 
 def require(condition, message):
@@ -38,24 +53,32 @@ def number(value, minimum=0):
 
 
 def records(raw):
-    require(len(raw) <= MAX_SERIAL, "oversized raw serial")
+    require(0 < len(raw) <= MAX_SERIAL, "empty/oversized raw serial")
+    text = native_ci.normalize_serial(raw)
+    require(all(char.isprintable() or char in "\n\t" for char in text),
+            "invalid optional serial control")
+    require(text.endswith("\n"), "truncated serial line")
+    require(not any(marker in text for marker in FORBIDDEN),
+        "failure/acceptance marker in optional serial")
     found = {prefix: [] for prefix in PREFIXES}
     ok = []
     order = []
-    for line in raw.splitlines(keepends=True):
-        if not line.startswith(b"WAMR_"):
+    for line in text.split("\n"):
+        if "WAMR_" not in line:
+            require(not line.strip() or not order or order[-1] == "completed",
+                    "unexpected noise within workload transcript")
             continue
-        require(line.endswith(b"\n"), "truncated record")
-        require(len(line) <= 16384, "oversized record")
-        text = line.rstrip(b"\r\n").decode("utf-8")
-        if text.startswith("WAMR_NATIVE_WORKLOAD_CHECK_OK "):
-            ok.append(text)
+        require(line.startswith("WAMR_") and line.count("WAMR_") == 1,
+                "unanchored/embedded workload marker")
+        require(len(line.encode("utf-8")) + 1 <= 16384, "oversized record")
+        if line.startswith("WAMR_NATIVE_WORKLOAD_CHECK_OK "):
+            ok.append(line)
             order.append("completed")
             continue
-        prefix, separator, payload = text.partition("=")
+        prefix, separator, payload = line.partition("=")
         require(separator and prefix in found, "unexpected/failure/measurement marker")
         if prefix == "WAMR_JIT_SAMPLE":
-            require(len(line) <= 8192, "oversized sampler record")
+            require(len(line.encode("utf-8")) + 1 <= 8192, "oversized sampler record")
         found[prefix].append(json.loads(payload, object_pairs_hook=pairs))
         order.append(prefix)
     require(len(ok) == 1, "exactly one completed correctness marker required")
@@ -170,6 +193,7 @@ def validate(raw, identity, mode, sampler_validator=None):
         if mode == "aot":
             require(sample["cwasm_sha256"] == identity["files"]["matched.cwasm"],
                     "changed comparator artifact")
+    return {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
 def main():
@@ -179,17 +203,17 @@ def main():
     parser.add_argument("--mode", choices=("snapshot", "aot", "fast", "full"), required=True)
     parser.add_argument("--sdk", type=Path, default=ROOT / "build/wamr-source")
     args = parser.parse_args()
-    with args.log.open("rb") as stream:
-        raw = stream.read(MAX_SERIAL + 1)
+    raw = native_ci.read(args.log, MAX_SERIAL)
     validator = None
     if args.mode != "snapshot":
-        spec = importlib.util.spec_from_file_location(
+        sdk = load_module(
             "native_jit_benchmark", args.sdk / "scripts/native_jit_benchmark.py")
-        sdk = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(sdk)
         validator = sdk.validate_sample
-    validate(raw, json.loads(args.identity.read_text()), args.mode, validator)
-    print("Optional workload correctness records valid; no boot/measurement qualification.")
+    observed = validate(raw, json.loads(args.identity.read_text(), object_pairs_hook=pairs),
+                        args.mode, validator)
+    print("Optional workload correctness records valid; "
+          f"raw_serial_bytes={observed['bytes']} raw_serial_sha256={observed['sha256']}; "
+          "no boot/measurement qualification.")
 
 
 if __name__ == "__main__":

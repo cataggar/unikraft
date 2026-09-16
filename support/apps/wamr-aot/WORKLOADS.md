@@ -184,8 +184,8 @@ teardown. Base adapter page-permission/failure selftests still execute first.
 ## Validation, without relabeling emulation
 
 ```sh
-python3 -m unittest discover -s support/apps/wamr-aot/tests -v
-python3 support/apps/wamr-aot/check-workload-log.py \
+python3 -B -m unittest discover -s support/apps/wamr-aot/tests -v
+python3 -B support/apps/wamr-aot/check-workload-log.py \
   --mode snapshot --log /private/exact-boot/serial.log
 # Use --mode aot, fast or full for the corresponding matched image;
 # those modes reuse the actual source-pinned SDK's strict sampler validator.
@@ -195,6 +195,25 @@ The bounded checker requires exact workload/build identities, phase/reset/call
 counts, exact results and native teardown. It rejects mixed v2/sampler protocols,
 duplicate, truncated, failed or oversized records. Its success is only a
 **compute correctness check**, not native boot or deployment acceptance.
+
+The checker reuses the inherited native CI serial normalizer: validate UTF-8
+**before** removing NUL padding and complete ANSI CSI sequences, then normalize
+CRLF to LF. The original capture is limited to 2 MiB and normalized lines to
+8192 bytes. Other controls, including standalone CR, DEL and Unicode control/
+separator/format characters, are refused. Malformed UTF-8 or escapes cannot
+be repaired by extraction. Printable boot context outside the contiguous
+workload transcript is retained as context, not boot evidence; nonblank
+interleaved noise, unanchored/embedded WAMR markers, crashes and unrelated
+acceptance markers fail. Both snapshot and sampler extraction use this path.
+
+The CLI reuses the native CI bounded, regular-file read with change detection.
+It never rewrites the log and reports the **complete original capture's**
+`raw_serial_bytes` and `raw_serial_sha256`, including framing and boot context.
+Normalized text and extracted JSON are only parser inputs, never replacements
+for the raw identity in external exact-boot records. This diagnostic is not a
+measurement receipt. `-B` avoids creating Python cache files in the reviewed
+source closure while loading the shared helper. The framing regressions are
+synthetic; observed tiny-image console framing does not qualify optional images.
 
 Use the unchanged existing exact-image EFI/four-boot packaging tools and their
 x86 KVM/OVMF prerequisites. A cross-compiled EFI, successful final safety gate,
