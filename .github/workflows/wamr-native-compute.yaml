@@ -3,7 +3,7 @@ name: wamr-native-compute
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [zig16, fleet/wamr-native-156]
+    branches: [zig16, fleet/wamr-native-156, fleet/wamr-realtime-clock]
 
 # No dispatch, protected environment, cloud credentials, OIDC, or write token.
 # This additive context does not replace any existing required Hyper-V gate.
