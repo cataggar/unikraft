@@ -47,9 +47,9 @@ static int active(struct wamr_platform *p)
 	       p->pt->pt_pbase == uk_pal_pt_read_base();
 }
 
-static void *allocate(void *ctx, size_t size, size_t alignment)
+static void *allocate_from(struct wamr_platform *p, struct uk_alloc *allocator,
+			   size_t size, size_t alignment)
 {
-	struct wamr_platform *p = ctx;
 	void *result = NULL;
 
 	if (!size || !alignment || (alignment & (alignment - 1)) ||
@@ -57,10 +57,27 @@ static void *allocate(void *ctx, size_t size, size_t alignment)
 		return NULL;
 	if (alignment < sizeof(void *))
 		alignment = sizeof(void *);
-	if (uk_posix_memalign(p->allocator, &result, alignment, size))
+	if (uk_posix_memalign(allocator, &result, alignment, size))
 		return NULL;
 	p->allocation_bytes += size;
 	return result;
+}
+
+static void *allocate(void *ctx, size_t size, size_t alignment)
+{
+	struct wamr_platform *p = ctx;
+
+	return allocate_from(p, p->allocator, size, alignment);
+}
+
+static void release_from(struct wamr_platform *p, struct uk_alloc *allocator,
+			 void *address, size_t size)
+{
+	if (!address)
+		return;
+	invariant(size <= p->allocation_bytes);
+	uk_free(allocator, address);
+	p->allocation_bytes -= size;
 }
 
 static void release_allocation(void *ctx, void *address, size_t size,
@@ -68,11 +85,7 @@ static void release_allocation(void *ctx, void *address, size_t size,
 {
 	struct wamr_platform *p = ctx;
 
-	if (!address)
-		return;
-	invariant(size <= p->allocation_bytes);
-	uk_free(p->allocator, address);
-	p->allocation_bytes -= size;
+	release_from(p, p->allocator, address, size);
 }
 
 static struct wamr_mapping *find(struct wamr_platform *p, uintptr_t address,
@@ -156,7 +169,9 @@ static void destroy_vma(struct uk_vma *vma)
 	}
 	*link = m->next;
 	p->reserved_bytes -= vma->end - vma->start;
-	release_allocation(p, m, m->allocation_size, _Alignof(struct wamr_mapping));
+	invariant(m->allocation_size <= p->allocation_bytes);
+	p->allocation_bytes -= m->allocation_size;
+	/* ukvmem reads vma->vas after this callback and frees the VMA itself. */
 }
 
 static int unmap_vma(struct uk_vma *vma, __vaddr_t address, __sz len)
@@ -206,7 +221,8 @@ static void *reserve(void *ctx, size_t size)
 	    p->reserved_bytes > MAX_RESERVATION - size)
 		return NULL;
 	metadata = sizeof(*m) + size / PAGE * sizeof(m->pages[0]);
-	m = allocate(p, metadata, _Alignof(struct wamr_mapping));
+	/* ukvmem owns the eventual free through vas->a, not the runtime heap. */
+	m = allocate_from(p, p->vas->a, metadata, _Alignof(struct wamr_mapping));
 	if (!m)
 		return NULL;
 	memset(m, 0, metadata);
@@ -214,7 +230,7 @@ static void *reserve(void *ctx, size_t size)
 	m->allocation_size = metadata;
 	if (uk_vma_map(p->vas, &address, size, 0,
 		       UK_VMA_MAP_SIZE(12), "wamr-owned", &reservation_ops, m)) {
-		release_allocation(p, m, metadata, _Alignof(struct wamr_mapping));
+		release_from(p, p->vas->a, m, metadata);
 		return NULL;
 	}
 	m->next = p->mappings;
@@ -345,7 +361,8 @@ int wamr_platform_config(struct wamr_platform *p, struct uk_alloc *allocator,
 	p->allocator = allocator;
 	p->vas = uk_vas_get_active();
 	p->pt = uk_paging_pt_get_active();
-	if (!allocator || !p->vas || !p->pt || p->vas->pt != p->pt || !active(p))
+	if (!allocator || !p->vas || !p->vas->a || !p->pt ||
+	    p->vas->pt != p->pt || !active(p))
 		return -ENOTSUP;
 	*config = (wamr_aot_config){
 		.context = p, .alloc = allocate, .free = release_allocation,

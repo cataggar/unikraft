@@ -11,6 +11,7 @@ extern const unsigned char wamr_fixture[];
 extern const size_t wamr_fixture_size;
 
 #if WAMR_HAS_COREMARK
+#include "coremark.h"
 extern const unsigned char wamr_coremark[], wamr_coremark_nofp[];
 extern const size_t wamr_coremark_size, wamr_coremark_nofp_size;
 static struct wamr_wasi_output guest_output;
@@ -34,38 +35,24 @@ static void base64(const uint8_t *bytes, size_t length)
 	}
 }
 
-static int contains(const uint8_t *bytes, size_t length, const char *text)
-{
-	size_t i, n = strlen(text);
-
-	for (i = 0; n <= length && i <= length - n; i++)
-		if (!memcmp(bytes + i, text, n))
-			return 1;
-	return 0;
-}
-
 static int coremark(wamr_aot_config *config, const char *name,
 		    const uint8_t *bytes, size_t length,
 		    const char *wasm_hash, const char *cwasm_hash)
 {
-	static const char *const crc[] = {
-		"0xe9f5", "0xe714", "0x1fd7", "0x8e3a", "0x988c",
-	};
 	wamr_aot_result r = wamr_wasi_check(config, bytes, length, &guest_output);
 	int correct = r.kind == WAMR_AOT_RETURNED ||
 		      (r.kind == WAMR_AOT_EXIT && r.detail == 0);
-	size_t i;
 
-	for (i = 0; i < sizeof(crc) / sizeof(crc[0]); i++)
-		correct &= contains(guest_output.stdout_bytes,
-				    guest_output.stdout_length, crc[i]);
+	correct &= wamr_coremark_crc_ok(guest_output.stdout_bytes,
+				       guest_output.stdout_length);
 	correct &= !guest_output.output_error && !guest_output.pending_stdout &&
-		   !guest_output.pending_stderr && !guest_output.unsupported_clock;
+		   !guest_output.pending_stderr && !guest_output.unsupported_clock &&
+		   !guest_output.stderr_length;
 	printf("WAMR_NATIVE_WASI={\"version\":1,\"correctness_only\":true,"
 	       "\"workload\":\"%s\",\"wasm_sha256\":\"%s\",\"cwasm_sha256\":\"%s\","
 	       "\"terminal\":%u,\"detail\":%u,\"crc_ok\":%s,\"output_error\":%u,"
 	       "\"pending_stdout\":%u,\"pending_stderr\":%u,"
-	       "\"unsupported_clock\":%u,\"stdout_base64\":\"",
+	       "\"unsupported_clock\":%u,\"realtime_supported\":false,\"stdout_base64\":\"",
 	       name, wasm_hash, cwasm_hash, r.kind, r.detail,
 	       correct ? "true" : "false", guest_output.output_error,
 	       guest_output.pending_stdout, guest_output.pending_stderr,

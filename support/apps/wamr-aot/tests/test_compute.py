@@ -2,15 +2,100 @@
 """Synthetic parser regressions; never native execution evidence."""
 import base64
 import copy
+import ctypes
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
+ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
-    "compute", Path(__file__).resolve().parents[1] / "check-log.py")
+    "compute", ROOT / "check-log.py")
 compute = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(compute)
+
+COREMARK = b"""\
+2K performance run parameters for coremark.
+CoreMark Size    : 666
+Total ticks      : 1
+Total time (secs): 0.001000
+Iterations/Sec   : 100000.000000
+ERROR! Must execute for at least 10 secs for a valid result!
+Iterations       : 100
+Compiler version : synthetic fixture, not execution evidence
+Compiler flags   : synthetic
+Memory location  : STACK
+seedcrc          : 0xe9f5
+[0]crclist       : 0xe714
+[0]crcmatrix     : 0x1fd7
+[0]crcstate      : 0x8e3a
+[0]crcfinal      : 0x988c
+Errors detected
+"""
+
+
+class CoreMarkOutput(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        (ROOT / "build").mkdir(mode=0o700, exist_ok=True)
+        cls.scratch = tempfile.TemporaryDirectory(dir=ROOT / "build")
+        cls.addClassCleanup(cls.scratch.cleanup)
+        library = Path(cls.scratch.name) / "coremark.so"
+        subprocess.run(
+            ["zig", "cc", "-shared", "-fPIC", "-std=c11",
+             "-Wall", "-Wextra", "-Werror", str(ROOT / "tests/coremark-output.c"),
+             "-o", str(library)], check=True)
+        cls.native = ctypes.CDLL(str(library)).check_coremark
+        cls.native.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+        cls.native.restype = ctypes.c_int
+
+    def assert_output(self, output, expected):
+        self.assertEqual(bool(self.native(output, len(output))), expected)
+        if expected:
+            compute.validate_coremark(output)
+        else:
+            with self.assertRaises(ValueError):
+                compute.validate_coremark(output)
+
+    def test_exact_fields_and_documented_short_warning(self):
+        self.assert_output(COREMARK, True)
+        self.assert_output(COREMARK.replace(b"\n", b"\r\n"), True)
+        self.assert_output(COREMARK.replace(b" : ", b"\t:\t"), True)
+
+    def test_diagnostic_expected_values_are_not_results(self):
+        bad = COREMARK.replace(b"0xe714", b"0xdead")
+        bad += b"ERROR! list crc 0xdead - should be 0xe714\n"
+        self.assert_output(bad, False)
+        self.assert_output(
+            b"0xe9f5 0xe714 0x1fd7 0x8e3a 0x988c\n"
+            b"Must execute for at least 10 secs\n", False)
+
+    def test_duplicate_missing_wrong_and_ambiguous_fields(self):
+        for original, replacement in (
+            (b"Iterations       : 100", b"Iterations       : 1000"),
+            (b"0xe714", b"0xe7140"), (b"0x988c", b"0x0000"),
+            (b"[0]crclist       : 0xe714\n", b""),
+            (b"[0]crclist", b"[1]crclist"),
+            (b"seedcrc", b"not-seedcrc"),
+            (b"Errors detected\n", b""),
+            (b"for a valid result!", b"for a valid result! extra"),
+            (b"0xe714", b"0xe714\x00"),
+        ):
+            with self.subTest(replacement=replacement):
+                self.assert_output(COREMARK.replace(original, replacement), False)
+        for extra in (
+            b"[0]crclist : 0xe714\n", b"[1]crclist : 0xe714\n",
+            b"seedcrc : 0xe9f5\n", b"Errors detected\n",
+            b"ERROR! matrix crc 0x0000 - should be 0x1fd7\n",
+            b"ERROR! other failure\n", b"unrecognized output\n",
+            b"\x00\n", b"\xff\n",
+        ):
+            with self.subTest(extra=extra):
+                self.assert_output(COREMARK + extra, False)
+        self.assert_output(COREMARK[:-1], False)
+        self.assert_output(b"", False)
 
 
 class ComputeContract(unittest.TestCase):
@@ -59,7 +144,6 @@ class ComputeContract(unittest.TestCase):
     def wasi_fixture(self):
         self.identity["minimal_wasi"] = True
         records = []
-        output = b"0xe9f5 0xe714 0x1fd7 0x8e3a 0x988c\nMust execute for at least 10 secs\n"
         for name in ("coremark", "coremark-nofp"):
             self.identity["files"][name + ".wasm"] = "3" * 64
             self.identity["files"][name + ".cwasm"] = "4" * 64
@@ -68,7 +152,8 @@ class ComputeContract(unittest.TestCase):
                 "wasm_sha256": "3" * 64, "cwasm_sha256": "4" * 64,
                 "terminal": 2, "detail": 0, "crc_ok": True,
                 "output_error": 0, "pending_stdout": 0, "pending_stderr": 0,
-                "unsupported_clock": 0, "stdout_base64": base64.b64encode(output).decode(),
+                "unsupported_clock": 0, "realtime_supported": True,
+                "stdout_base64": base64.b64encode(COREMARK).decode(),
                 "stderr_base64": "",
             })
         return records
@@ -78,11 +163,21 @@ class ComputeContract(unittest.TestCase):
         compute.validate(self.log(records), self.identity)
         for field, value in (("stdout_base64", ""), ("pending_stdout", 29),
                              ("unsupported_clock", 1), ("detail", 0xFFFFFFFF),
-                             ("terminal", 1), ("stdout_base64", "@@")):
+                             ("terminal", 1), ("stdout_base64", "@@"),
+                             ("realtime_supported", False),
+                             ("stderr_base64", base64.b64encode(b"ERROR!\n").decode())):
             mutated = copy.deepcopy(records)
             mutated[0][field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
                 compute.validate(self.log(mutated), self.identity)
+
+    def test_claimed_crc_success_cannot_override_wrong_actual_values(self):
+        records = self.wasi_fixture()
+        bad = COREMARK.replace(b"0xe714", b"0xdead")
+        bad += b"ERROR! list crc 0xdead - should be 0xe714\n"
+        records[0]["stdout_base64"] = base64.b64encode(bad).decode()
+        with self.assertRaises(ValueError):
+            compute.validate(self.log(records), self.identity)
 
 
 if __name__ == "__main__":

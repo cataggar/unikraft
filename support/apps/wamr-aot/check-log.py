@@ -23,6 +23,41 @@ def records(text, prefix):
             if line.startswith(prefix)]
 
 
+def validate_coremark(output):
+    require(output and output.endswith(b"\n"), "incomplete CoreMark output")
+    required = {
+        b"Iterations": b"100", b"seedcrc": b"0xe9f5",
+        b"[0]crclist": b"0xe714", b"[0]crcmatrix": b"0x1fd7",
+        b"[0]crcstate": b"0x8e3a", b"[0]crcfinal": b"0x988c",
+    }
+    metadata = {b"CoreMark Size", b"Total ticks", b"Total time (secs)",
+                b"Iterations/Sec", b"Compiler version", b"Compiler flags",
+                b"Memory location"}
+    markers = {
+        b"2K performance run parameters for coremark.",
+        b"ERROR! Must execute for at least 10 secs for a valid result!",
+        b"Errors detected",
+    }
+    seen_fields, seen_markers = set(), set()
+    for raw in output[:-1].split(b"\n"):
+        require(all(32 <= b <= 126 or b in (9, 13) for b in raw),
+                "non-ASCII CoreMark output")
+        line = raw.removesuffix(b"\r").strip(b" \t")
+        if b":" not in line:
+            require(line in markers and line not in seen_markers,
+                    "unexpected or duplicate CoreMark diagnostic")
+            seen_markers.add(line)
+            continue
+        key, value = (part.strip(b" \t") for part in line.split(b":", 1))
+        require(key in required.keys() | metadata and key not in seen_fields,
+                "unexpected or duplicate CoreMark field/context")
+        if key in required:
+            require(value == required[key], f"wrong CoreMark {key!r}")
+        seen_fields.add(key)
+    require(required.keys() <= seen_fields and seen_markers == markers,
+            "missing exact CoreMark fields or short-run diagnostic")
+
+
 def validate(text, identity):
     compute = records(text, "WAMR_NATIVE_COMPUTE=")
     require(len(compute) == 1, "one compute result required")
@@ -63,6 +98,8 @@ def validate(text, identity):
                 (r["terminal"] != 2 or r.get("detail") == 0),
                 "guest trapped, failed, or exited nonzero")
         require(r.get("crc_ok") is True, "guest CRC/clock/output check failed")
+        require(r.get("realtime_supported") is True,
+                "original CoreMarks require qualified realtime clock ID 0")
         for field in ("output_error", "pending_stdout", "pending_stderr", "unsupported_clock"):
             require(type(r.get(field)) is int and r[field] == 0,
                     f"unresolved {field}")
@@ -72,9 +109,8 @@ def validate(text, identity):
             require(len(raw) <= 4096 and base64.b64encode(raw).decode() == r[field],
                     "noncanonical or oversized output")
             output.append(raw)
-        for marker in (b"0xe9f5", b"0xe714", b"0x1fd7", b"0x8e3a", b"0x988c",
-                       b"Must execute for at least 10 secs"):
-            require(marker in output[0], "missing raw CRC/short-run diagnostic")
+        require(not output[1], "unexpected CoreMark stderr")
+        validate_coremark(output[0])
     require(text.count("WAMR_NATIVE_AOT_OK answer=42 teardown=0") == 1,
             "missing or duplicate completion marker")
 

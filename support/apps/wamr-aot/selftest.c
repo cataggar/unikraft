@@ -2,11 +2,116 @@
 #include "platform.h"
 #include <errno.h>
 #include <string.h>
+#include <uk/alloc.h>
+#include <uk/assert.h>
 #include <uk/falloc.h>
 #include <uk/lcpu.h>
+#include <uk/vmem.h>
 
 #define PAGE 4096UL
 #define CHECK(test) do { if (!(test)) { result = __LINE__; goto out; } } while (0)
+
+struct heap_probe {
+	struct uk_alloc *real;
+	void *live[2];
+	size_t allocations;
+	size_t frees;
+	int deny;
+	struct uk_alloc proxy;
+};
+
+static int heap_allocate(struct uk_alloc *a, void **out, __sz alignment, __sz size)
+{
+	struct heap_probe *s = __containerof(a, struct heap_probe, proxy);
+	size_t i;
+	int rc;
+
+	*out = NULL;
+	if (s->deny)
+		return ENOMEM;
+	for (i = 0; i < 2 && s->live[i]; i++)
+		;
+	if (i == 2)
+		return ENOMEM;
+	rc = uk_posix_memalign(s->real, out, alignment, size);
+	if (!rc) {
+		s->live[i] = *out;
+		s->allocations++;
+	}
+	return rc;
+}
+
+static void heap_release(struct uk_alloc *a, void *address)
+{
+	struct heap_probe *s = __containerof(a, struct heap_probe, proxy);
+	size_t i;
+
+	for (i = 0; i < 2; i++)
+		if (s->live[i] == address) {
+			s->live[i] = NULL;
+			s->frees++;
+			uk_free(s->real, address);
+			return;
+		}
+	UK_CRASH("WAMR self-test: wrong allocator or repeated metadata free");
+}
+
+static int heap_ownership(struct wamr_platform *p, wamr_aot_config *c)
+{
+	struct heap_probe runtime = {
+		.proxy = { .posix_memalign = heap_allocate, .free = heap_release },
+		.real = p->allocator,
+	};
+	struct heap_probe metadata = {
+		.proxy = { .posix_memalign = heap_allocate, .free = heap_release },
+		.real = p->vas->a,
+	};
+	void *aligned = NULL, *first = NULL, *second = NULL;
+	unsigned long irq = uk_lcpu_save_irqf();
+	int result = 0;
+
+	/* Distinct owners catch both destructor double frees and allocating VMA
+	 * storage from the runtime heap instead of the framework's VAS heap. */
+	p->allocator = &runtime.proxy;
+	p->vas->a = &metadata.proxy;
+	aligned = c->alloc(p, 129, 8192);
+	CHECK(aligned && (uintptr_t)aligned % 8192 == 0);
+	c->free(p, aligned, 129, 8192);
+	aligned = NULL;
+	CHECK(runtime.allocations == 1 && runtime.frees == 1);
+	runtime.deny = 1;
+	aligned = c->alloc(p, 129, 8192);
+	CHECK(!aligned);
+	metadata.deny = 1;
+	first = c->reserve(p, PAGE);
+	CHECK(!first && !p->allocation_bytes && !p->reserved_bytes);
+	metadata.deny = 0;
+	first = c->reserve(p, PAGE);
+	CHECK(first);
+	second = c->reserve(p, PAGE);
+	CHECK(second && second != first);
+	CHECK(metadata.allocations == 2 && metadata.frees == 0);
+	metadata.deny = 1;
+	c->unmap(p, first, PAGE);
+	first = NULL;
+	CHECK(metadata.frees == 1 && p->reserved_bytes == PAGE);
+out:
+	if (second)
+		c->unmap(p, second, PAGE);
+	if (first)
+		c->unmap(p, first, PAGE);
+	if (aligned)
+		c->free(p, aligned, 129, 8192);
+	p->allocator = runtime.real;
+	p->vas->a = metadata.real;
+	uk_lcpu_restore_irqf(irq);
+	if (!result && (runtime.allocations != runtime.frees ||
+			metadata.allocations != metadata.frees || p->mappings ||
+			p->allocation_bytes || p->reserved_bytes ||
+			p->frame_bytes || p->accessible_bytes))
+		result = __LINE__;
+	return result;
+}
 
 struct pressure {
 	struct uk_falloc proxy;
@@ -56,8 +161,10 @@ int wamr_platform_selftest(struct wamr_platform *p, wamr_aot_config *c)
 	struct pressure s = { 0 };
 	long prior;
 	size_t budget, i;
-	int result = 0;
+	int result = heap_ownership(p, c);
 
+	if (result)
+		return result;
 	aligned = c->alloc(p, 129, 8192);
 	if (!aligned || (uintptr_t)aligned % 8192)
 		return __LINE__;

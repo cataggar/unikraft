@@ -72,13 +72,19 @@ generated directories after retaining needed evidence.
 `platform.c` is specific to the pinned native x86_64 PAL, direct-mapped
 page tables, four-level paging, buddy frames and one CPU:
 
-* Runtime and mapping metadata use the **explicit caller-selected
-  `uk_alloc`**, `uk_posix_memalign` and `uk_free`. Requested alignment is
-  preserved; there is no hidden allocator fallback.
+* Runtime allocations use the **explicit caller-selected `uk_alloc`**,
+  `uk_posix_memalign` and `uk_free`. Requested alignment is preserved;
+  there is no hidden allocator fallback. VMA storage uses the initialized
+  **VAS allocator**, because ukvmem owns its final `uk_free(vas->a, vma)`.
+  These allocators may be different.
 * A reservation is one custom `uk_vma_map` VMA with **no populate/fault/
   advise/set-attribute handler**. Its split and merge hooks deny both
-  operations. Metadata and the VMA are one owned allocation. Addresses are
-  stable and initially inaccessible; no virtual hole is guessed.
+  operations. Metadata and the VMA are one allocation owned by ukvmem
+  after successful mapping. The destroy callback only unregisters and
+  accounts it; it must not free storage that ukvmem subsequently reads
+  and frees. A failed map has no populate/replacement stage and leaves
+  that allocation caller-owned for cleanup. Addresses are stable and
+  initially inaccessible; no virtual hole is guessed.
 * Commit prevalidates the complete inaccessible range and maps real frames
   eagerly, one forced **4 KiB** leaf at a time. On frame or intermediate
   page-table allocation failure it unmaps every newly mapped leaf and empty
@@ -115,10 +121,14 @@ Wasm bounds/import checks and explicit traps are unchanged.
 Accounting distinguishes reserved VA, owned physical data frames (including
 NONE), accessible committed bytes, and allocator-requested runtime/adapter
 bytes. VMA metadata is included in the latter; allocator overhead and heap
-backing are not. `system_page_table_bytes` is the actual **whole active
+backing are not; requested bytes from both explicit allocator owners are
+counted, not just the runtime heap. `system_page_table_bytes` is the actual **whole active
 page table's** counter, not guest frames and not a zero-on-teardown claim.
 
-`selftest.c` runs before the fixture. It checks real alignment/zero filling,
+`selftest.c` runs before the fixture. Distinct runtime/VAS allocator probes
+check allocator-specific allocation denial, correct-owner frees exactly
+once, two live reservations released out of order, and teardown with
+metadata allocation denied. It also checks real alignment/zero filling,
 stable earlier bytes after failed growth, PTE permissions and reactivation,
 and full release with hidden pages and an uncommitted suffix. A scoped
 allocator proxy injects actual native frame/page-table allocation denial
@@ -137,6 +147,18 @@ It preserves exactly its twelve `wasi_unstable` signatures, guest-pointer
 checks, descriptor state, partial-write progress/deferred errors, full u32
 `proc_exit`, returned/trap/host-error distinctions and fresh-instance lifetime.
 
+**The optional CoreMark image is currently build-only, not a passing native
+correctness profile.** Both original guests request realtime clock ID 0.
+This bridge deliberately exposes only monotonic ID 1, so both guests
+encounter an unsupported clock and the image cannot qualify. Its record
+explicitly reports `realtime_supported:false`; the external validator
+refuses it even if CRC fields happen to match. A qualified EFI realtime
+capability is prerequisite code work, not merely a pending boot. The
+existing `ukplat_wall_clock()` value alone does not expose whether the
+firmware epoch/timezone was qualified, or its resolution; it must not be
+used as an unqualified substitute. Other profiles' clocks are unchanged.
+The tiny image and its memory checks have no realtime dependency.
+
 Each guest receives only `coremark 0 0 0 100 0`, an empty environment and
 bounded caller-owned stdout/stderr buffers. Known consumed bytes, including
 partial failure prefixes, are preserved in canonical base64 records. Pending
@@ -148,6 +170,11 @@ source's **100 ns resolution**. `UINT64_MAX`/provider saturation fails.
 Realtime is unsupported without a qualified EFI epoch; process/thread CPU
 time is unsupported. An unsupported guest clock request is retained and
 prevents qualification. No clock is fabricated to make CoreMark pass.
+CRC admission in both guest and host requires unique exact key/value
+fields for all five CRCs, context zero and 100 iterations. Only the
+documented short-duration warning and its `Errors detected` summary are
+allowed; CRC error diagnostics, expected-value mentions, duplicate or
+extra-context fields, truncation and unexpected stderr are rejected.
 Short CRC checks retain the “Must execute for at least 10 secs” diagnostics.
 Printed timing/throughput text in the preserved guest output is **not a
 benchmark score**. No reuse/replay or performance lifecycle is claimed here.
@@ -181,9 +208,10 @@ compute check, **not a replacement for exact-image boot validation**.
 
 No Azure provisioning, cloud dispatch, hardware acceptance, networking,
 storage, performance, or resource-cleanup claim is made by this work.
-Native boot/pressure/permissions qualification and both CRC executions
-remain external until the exact image is run on an appropriate x86 KVM/
-Hyper-V host. The implementation host is ARM with no `/dev/kvm`, x86 QEMU
+Native boot/pressure/permissions qualification remains external until the
+exact image is run on an appropriate x86 KVM/Hyper-V host. Both CRC
+executions additionally require the qualified realtime capability above.
+The implementation host is ARM with no `/dev/kvm`, x86 QEMU
 or OVMF: its native boot attempt was refused, not counted as a passing run.
 
 ## Focused developer checks
@@ -195,6 +223,7 @@ zig build test-hyperv-image-proofs test-native-compiler-options -j2
 python3 -m unittest discover -s support/apps/wamr-aot/tests -v
 ```
 
-The host parser fixtures are explicitly synthetic and never become native
+The host parser fixtures exercise the production C parser and independent
+Python validator. They are explicitly synthetic and never become native
 evidence. Actual native compilation and the existing linked-image proofs
 are separate from executing the in-image memory checks.
