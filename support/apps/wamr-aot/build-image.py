@@ -39,12 +39,13 @@ def bison_data():
     return str(path)
 
 
-def record():
+def record(command):
     output = ROOT / "build"
     names = ("wamr_hyperv-x86_64-efi", "wamr_hyperv-x86_64-efi.dbg",
              "wamr_hyperv-x86_64-efi.bootinfo")
     manifest = {
         "schema_version": 1,
+        "command": command,
         "scope": "native-build-only-not-boot-or-hardware-qualification",
         "unikraft_revision": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
@@ -91,6 +92,10 @@ def main():
     environment.chmod(0o600)
     if not (ROOT / ".config").exists():
         shutil.copyfile(ROOT / "defconfig", ROOT / ".config")
+        manifest = json.loads((ROOT / "build/artifacts/identity.json").read_text())
+        if manifest.get("variant", "tiny") != "tiny":
+            with (ROOT / ".config").open("a") as config:
+                config.write("\nCONFIG_STACK_SIZE_PAGE_ORDER=8\n")
     zig = tool("zig")
     command = [
         zig, "build", args.step, "-j2",
@@ -112,7 +117,7 @@ def main():
     subprocess.run(command, cwd=REPO, check=True,
                    env=dict(os.environ, TMPDIR=contract["tmp"]))
     if args.step == "native-images":
-        record()
+        record(command)
 
 
 if __name__ == "__main__":

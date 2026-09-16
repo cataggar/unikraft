@@ -9,8 +9,9 @@ filesystem, network, or host-thread dependency is added for WAMR.
 
 Refs #156, [cataggar/wamr#1045](https://github.com/cataggar/wamr/issues/1045)
 and [cataggar/wamr#1046](https://github.com/cataggar/wamr/issues/1046).
-The freestanding benchmark producer and optional JIT sampler are separate
-dependent integrations; this application produces **no benchmark score**.
+The optional [snapshot guest and matched JIT/AOT sampler images](WORKLOADS.md)
+are explicit dependent integrations. The default remains this tiny,
+compiler-free image; all current application modes produce **no benchmark score**.
 
 ## Build the actual EFI image
 

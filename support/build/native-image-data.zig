@@ -153,6 +153,7 @@ pub const wamr_app = Library{
         "appwamraot/main.o",
         "appwamraot/platform.o",
         "appwamraot/selftest.o",
+        "appwamraot/workloads.o",
         "appwamraot/embedded.o",
         "appwamraot/libinfo.libuklibid.o",
     },

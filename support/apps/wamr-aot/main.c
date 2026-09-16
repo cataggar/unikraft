@@ -6,7 +6,9 @@
 #include <uk/alloc.h>
 #include <uk/paging.h>
 #include "wasi.h"
+#include "workloads.h"
 
+#if !WAMR_APP_VARIANT
 extern const unsigned char wamr_fixture[];
 extern const size_t wamr_fixture_size;
 
@@ -162,3 +164,9 @@ done:
 	}
 	return 1;
 }
+#else
+int main(int argc, char **argv)
+{
+	return wamr_workload_main(argc, argv);
+}
+#endif

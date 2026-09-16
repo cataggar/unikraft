@@ -12,8 +12,16 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parent
 REVISION = "2399694fb7ed11fffff0a34c82172dfdd54d7439"
+# Set only after the dependent SDK changes have merged upstream.
+WORKLOAD_REVISION = None
 PROFILE = "unikraft-x86_64"
 ARTIFACTS = ROOT / "build" / "artifacts"
+VARIANTS = {"tiny": 0, "snapshot": 1, "jit": 2, "sample-aot": 3}
+WORKLOAD_SOURCES = (
+    "workloads.build.zig", "snapshot.zig", "sampler.zig",
+    "native-services.zig", "workloads.h", "platform.h",
+)
+COMMANDS = []
 NATIVE_FLAGS = [
     "-target", "x86_64-freestanding-none", "-O", "ReleaseSafe", "-fPIC",
     "-mno-red-zone", "-fno-stack-check", "-fno-stack-protector",
@@ -27,6 +35,7 @@ def digest(path):
 
 
 def run(args, cwd=ROOT, **kwargs):
+    COMMANDS.append({"argv": [str(arg) for arg in args], "cwd": str(cwd)})
     return subprocess.run(args, cwd=cwd, check=True, **kwargs)
 
 
@@ -36,7 +45,13 @@ def capture(args, cwd=ROOT):
 
 def verify():
     manifest = json.loads((ARTIFACTS / "identity.json").read_text())
-    if (manifest["wamr_revision"] != REVISION or
+    variant = manifest.get("variant", "tiny")
+    revision = REVISION if variant == "tiny" else WORKLOAD_REVISION
+    development = manifest.get("development_only", False)
+    if (variant not in VARIANTS or
+            type(development) is not bool or (development and variant == "tiny") or
+            (not development and manifest["wamr_revision"] != revision) or
+            (development and manifest["scope"] != "local-development-build-only-not-supported-lineage") or
             manifest["compiler_profile"] != PROFILE or
             manifest["zig_version"] != "0.16.0"):
         raise ValueError("unsupported native producer identity")
@@ -50,6 +65,12 @@ def verify():
     if (manifest["minimal_wasi"] and
             manifest["wasi_bridge_sha256"] != digest(ROOT / "wasi.zig")):
         raise ValueError("minimal WASI bridge changed; rebuild native artifacts")
+    if variant != "tiny":
+        for name in WORKLOAD_SOURCES:
+            if manifest["workload_sources"][name] != digest(ROOT / name):
+                raise ValueError(f"workload consumer changed: {name}")
+        if manifest["runtime_options"] != NATIVE_FLAGS:
+            raise ValueError("unexpected native consumer options")
 
 
 def embed(name, payload):
@@ -61,20 +82,86 @@ def embed(name, payload):
     )
 
 
-def prepare(source, coremark):
+def source_identity(work):
+    """Canonical actual source file set: relative path, byte count and SHA256."""
+    files = {p.relative_to(work).as_posix(): {
+        "bytes": p.stat().st_size, "sha256": digest(p),
+    } for p in sorted(work.rglob("*")) if p.is_file()}
+    canonical = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    (ARTIFACTS / "source-files.json").write_bytes(canonical + b"\n")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def workload_library(work, variant, env):
+    consumer = ROOT / "build" / "workload-consumer"
+    consumer.mkdir(exist_ok=False)
+    for name in WORKLOAD_SOURCES:
+        shutil.copyfile(ROOT / name, consumer / (
+            "build.zig" if name == "workloads.build.zig" else name))
+    (consumer / "build.zig.zon").write_text(
+        '.{ .name = .wamr_workload_image, .version = "0.0.0", '
+        '.fingerprint = 0xcb36ebabb0542062, '
+        '.dependencies = .{ .wamr = .{ .path = "../wamr-source" } }, '
+        '.paths = .{ "." } }\n')
+    if variant == "snapshot":
+        embedded = ""
+        for name, original in (("compute", "unroll4"), ("memory", "iv_store")):
+            wasm = ARTIFACTS / f"{name}.wasm"
+            aot = ARTIFACTS / f"{name}.cwasm"
+            shutil.copyfile(work / "tests/benchmarks/loop-passes" / f"{original}.wasm", wasm)
+            run([str(ARTIFACTS / "wamrc"), "compile", "--target=x86_64",
+                 f"--profile={PROFILE}", str(wasm), "-o", str(aot)], env=env)
+            for path, suffix in ((wasm, "wasm"), (aot, "aot")):
+                shutil.copyfile(path, consumer / path.name)
+                embedded += f'pub const {name}_{suffix} = @embedFile("{path.name}");\n'
+    else:
+        # Same tracked source and exact wasm compiler options as the SDK module.
+        wasm = ARTIFACTS / "matched.wasm"
+        aot = ARTIFACTS / "matched.cwasm"
+        run(["zig", "build-exe", str(work / "tests/unikraft-jit/fixture.zig"),
+             "-target", "wasm32-freestanding", "-O", "ReleaseSmall",
+             "-fno-entry", "-rdynamic", "--stack", "16384",
+             "--initial-memory=131072", "--max-memory=524288",
+             f"-femit-bin={wasm}"], env=env)
+        run([str(ARTIFACTS / "wamrc"), "compile", "--target=x86_64",
+             f"--profile={PROFILE}", str(wasm), "-o", str(aot)], env=env)
+        shutil.copyfile(aot, consumer / aot.name)
+        embedded = (f'pub const with_compiler = {str(variant == "jit").lower()};\n'
+                    'pub const aot = @embedFile("matched.cwasm");\n')
+    (consumer / "artifacts.zig").write_text(embedded)
+    run(["zig", "build", f"-Dvariant={variant}", "-j2",
+         "--prefix", str(consumer / "out")], consumer, env=env)
+    if variant != "snapshot" and digest(consumer / "out/matched.wasm") != digest(ARTIFACTS / "matched.wasm"):
+        raise ValueError("SDK's actual embedded sampler source differs from the comparator input")
+    shutil.copyfile(consumer / "out/lib/libwamr-aot.a", ARTIFACTS / "libwamr-aot.a")
+
+
+def prepare(source, coremark, variant="tiny", development_revision=None):
     if capture(["zig", "version"]) != "0.16.0":
         raise ValueError("Zig 0.16.0 is required")
-    if capture(["git", "rev-parse", f"{REVISION}^{{commit}}"], source) != REVISION:
+    if coremark and variant != "tiny":
+        raise ValueError("--coremark belongs to the unchanged tiny image only")
+    if development_revision and variant == "tiny":
+        raise ValueError("development SDK selection is only for optional images")
+    revision = development_revision or (REVISION if variant == "tiny" else WORKLOAD_REVISION)
+    if revision is None:
+        raise ValueError("optional images await a merged SDK pin; use an explicit "
+                         "--development-revision only for local development")
+    if (len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision) or
+            capture(["git", "rev-parse", f"{revision}^{{commit}}"], source) != revision):
         raise ValueError("pinned source commit unavailable")
     ARTIFACTS.mkdir(parents=True, exist_ok=False)
+    (ROOT / "build").chmod(0o700)
+    ARTIFACTS.chmod(0o700)
     work = ROOT / "build" / "wamr-source"
     work.mkdir(exist_ok=False)
     archive = ROOT / "build" / "wamr-source.tar"
     with archive.open("wb") as stream:
-        run(["git", "archive", REVISION], source, stdout=stream)
+        run(["git", "archive", revision], source, stdout=stream)
     with tarfile.open(archive) as tar:
         tar.extractall(work, filter="data")
     archive.unlink()
+    tree_sha256 = source_identity(work)
     # All compiler scratch/output stays under this application's build tree.
     scratch = ROOT / "build" / "scratch"
     scratch.mkdir(exist_ok=True)
@@ -88,7 +175,12 @@ def prepare(source, coremark):
     # compiler-free root with the explicit native object ABI, not a host ELF.
     # Unikraft's final link supplies compiler intrinsics; bundling another
     # copy would hide its strong memory helpers from the IRQ binding proof.
-    if coremark:
+    shutil.copyfile(work / "include/wamr_aot.h", ARTIFACTS / "wamr_aot.h")
+    shutil.copyfile(ROOT / "build/host/bin/wamrc", ARTIFACTS / "wamrc")
+    (ARTIFACTS / "wamrc").chmod(0o700)
+    if variant != "tiny":
+        workload_library(work, variant, env)
+    elif coremark:
         run(["zig", "build-lib", *NATIVE_FLAGS, "--dep", "wamr-native",
              "--dep", "minimal-wasi", f"-Mroot={ROOT / 'wasi.zig'}",
              *NATIVE_FLAGS, "-Mwamr-native=src/aot_native.zig",
@@ -97,9 +189,6 @@ def prepare(source, coremark):
     else:
         run(["zig", "build-lib", "src/aot_native.zig", *NATIVE_FLAGS,
              f"-femit-bin={ARTIFACTS / 'libwamr-aot.a'}"], work, env=env)
-    shutil.copyfile(work / "include/wamr_aot.h", ARTIFACTS / "wamr_aot.h")
-    shutil.copyfile(ROOT / "build/host/bin/wamrc", ARTIFACTS / "wamrc")
-    (ARTIFACTS / "wamrc").chmod(0o700)
     run(["zig", "build-exe", str(ROOT / "fixture.zig"),
          "-target", "wasm32-freestanding", "-O", "ReleaseSmall",
          "-fno-entry", "-rdynamic", "--stack", "16384",
@@ -124,7 +213,10 @@ def prepare(source, coremark):
             embedded += embed(symbol, cwasm.read_bytes())
     (ARTIFACTS / "embedded.c").write_text(embedded)
     header = (
-        f'#define WAMR_REVISION "{REVISION}"\n'
+        f'#define WAMR_REVISION "{revision}"\n'
+        f'#define WAMR_APP_VARIANT {VARIANTS[variant]}\n'
+        f'#define WAMR_SOURCE_TREE_SHA256 "{tree_sha256}"\n'
+        f'#define WAMR_COMPILER_SHA256 "{digest(ARTIFACTS / "wamrc")}"\n'
         f'#define WAMR_HAS_COREMARK {int(coremark)}\n'
         f'#define WAMR_WASM_SHA256 "{digest(ARTIFACTS / "tiny.wasm")}"\n'
         f'#define WAMR_CWASM_SHA256 "{digest(ARTIFACTS / "tiny.cwasm")}"\n'
@@ -137,16 +229,26 @@ def prepare(source, coremark):
     (ARTIFACTS / "identity.h").write_text(header)
     manifest = {
         "schema_version": 1,
-        "scope": "native-build-inputs-not-hardware-qualification",
-        "wamr_revision": REVISION,
+        "scope": ("local-development-build-only-not-supported-lineage" if development_revision
+                  else "native-build-inputs-not-hardware-qualification"),
+        "development_only": bool(development_revision),
+        "variant": variant,
+        "wamr_revision": revision,
+        "source_tree_sha256": tree_sha256,
+        "source_identity_recipe": "sorted-compact-json-relative-file-path-to-bytes-and-sha256-v1",
+        "source_tracked_diff_sha256": hashlib.sha256(b"").hexdigest(),
         "compiler_profile": PROFILE,
         "zig_version": "0.16.0",
         "runtime_options": NATIVE_FLAGS,
+        "compiler_runtime_provider": "unikraft-final-link-not-bundled-in-consumer",
+        "commands": COMMANDS,
         "compiler_options": ["optimize=ReleaseSafe"],
         "minimal_wasi": coremark,
         "wasi_bridge_sha256": digest(ROOT / "wasi.zig") if coremark else None,
         "fixture_source_sha256": digest(ROOT / "fixture.zig"),
         "prepare_source_sha256": digest(Path(__file__).resolve()),
+        "workload_sources": {name: digest(ROOT / name) for name in WORKLOAD_SOURCES}
+        if variant != "tiny" else {},
         "files": {p.name: digest(p) for p in sorted(ARTIFACTS.iterdir())},
     }
     (ARTIFACTS / "identity.json").write_text(
@@ -160,13 +262,16 @@ def main():
     parser.add_argument("--source", type=Path)
     parser.add_argument("--coremark", action="store_true",
                         help="also embed both pinned CoreMarks and minimal WASI")
+    parser.add_argument("--variant", choices=VARIANTS, default="tiny")
+    parser.add_argument("--development-revision",
+                        help="explicit local-only full SDK commit, never supported deployment lineage")
     args = parser.parse_args()
     if args.command == "verify":
         verify()
     elif args.source is None:
         parser.error("prepare requires --source pointing to a local WAMR checkout")
     else:
-        prepare(args.source.resolve(), args.coremark)
+        prepare(args.source.resolve(), args.coremark, args.variant, args.development_revision)
 
 
 if __name__ == "__main__":
