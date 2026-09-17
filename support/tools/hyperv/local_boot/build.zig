@@ -48,6 +48,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "synthetic_diagnostics", .module = diagnostics },
         },
     });
+    if (target.result.cpu.arch == .x86_64) {
+        module.addAssemblyFile(b.path("sha256_clear_upper.S"));
+        synthetic_module.addAssemblyFile(b.path("sha256_clear_upper.S"));
+    }
     const cli = b.addExecutable(.{
         .name = "uk-hyperv-local-boot",
         .root_module = b.createModule(.{
@@ -175,6 +179,16 @@ pub fn build(b: *std.Build) void {
         run_proof_tests.step.dependOn(&run_gate_tests.step);
     }
     b.step("test", "Run public synthetic local-boot fixtures, never a real guest").dependOn(&run.step);
+    const hash_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("sha256_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    if (target.result.cpu.arch == .x86_64)
+        hash_tests.root_module.addAssemblyFile(b.path("sha256_clear_upper.S"));
+    const run_hash_tests = b.addRunArtifact(hash_tests);
+    b.step("test-sha256", "Check full-byte standard SHA equivalence and streaming boundaries").dependOn(&run_hash_tests.step);
+    run.step.dependOn(&run_hash_tests.step);
 }
 
 fn strippedCopy(b: *std.Build, objcopy: []const u8, raw: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {

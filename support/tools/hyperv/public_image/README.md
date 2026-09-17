@@ -136,6 +136,12 @@ offset/length and exact virtual/file geometry. No guest image or seed is
 downloaded, regenerated or borrowed. Public source EFI bytes are copied once
 to private `BOOTX64.EFI`; the original is rehashed.
 
+The VHD scan finalizes a copy of the SHA256 state at the exact raw-prefix
+boundary, then continues the original state through the complete footer.
+This avoids hashing the same prefix twice within that scan. Every byte is
+still read, and all separate artifact revalidation, snapshot/EOF, structural,
+cross-file comparison and deadline checks remain unchanged.
+
 An exclusive private package stage contains miz's outputs/temporaries.
 Artifacts are normalized to 0600, fsynced, structurally checked, and published
 without replacement. The native packaging leaf is supervised for at most
@@ -294,3 +300,33 @@ policy, including deliberately coherent synthetic report/log/state hashes
 so malformed ordering cannot be hidden behind matching digests.
 No real guest, KVM, Python, Azure, token, credential, original data seed or
 historical private artifact is used. Real x86/KVM integration remains CI work.
+
+### Debug SHA transition and cost qualification
+
+File hashing still uses Zig's standard SHA-256, in the selected optimization
+mode. On the self-hosted x86 backend with SHA and AVX2, the shared local file
+hasher places a two-instruction SysV `VZEROUPPER; RET` leaf before each standard
+update/final call. This prevents legacy SHA instructions from inheriting dirty
+upper AVX registers. It does not replace compression, optimize a module in a
+different mode, strip an executable, cache a digest, or omit any bytes or
+independent snapshot/EOF/revalidation pass. The original 120-second package,
+10-second normal synthetic boot, 3-second deadline cases and cleanup budgets
+are unchanged. Known-vector and streaming/peek equivalence tests run before
+both local-boot and public-image fixture suites.
+
+After the same restore above, `test-sha256` runs only those equivalence tests;
+`diagnose-cost -Dtest-root="$S/fixtures"` runs an **uninstalled** native probe.
+The latter creates fresh real 66-MiB miz images, measures actual file hashing
+and the two independent child input passes, and compares full-byte standard
+SHA digests with deliberately dirty versus cleared vector state. It reuses
+`synthetic_measurement.zig` for compiler backend, optimization, architecture,
+SHA/AVX2 flags, executable size, monotonic time and process CPU time. Logs
+contain bounded synthetic metadata and digests, not paths, input records,
+environment or authority claims. `build-cost-probe` compiles without running.
+
+The credential-free cost qualification workflow samples three genuine native
+x86 runners and then executes every Debug packaging/export/import fixture on
+each. CPU-specific measurements are not guest benchmarks or qualification.
+The regular required integration contexts remain unchanged. A repeated
+`-Dtest-filter=...` selector is available for targeted local diagnosis; CI
+does not filter or exclude any original fixture case.

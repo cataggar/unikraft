@@ -2,9 +2,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const filters = b.option([]const []const u8, "test-filter", "Run only tests matching these filters") orelse &.{};
     const source = b.dependency("miz_source", .{ .target = target, .optimize = optimize });
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
     const local = b.createModule(.{ .root_source_file = b.path("../local_boot/root.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "hyperv_core", .module = core }} });
+    if (target.result.cpu.arch == .x86_64)
+        local.addAssemblyFile(b.path("../local_boot/sha256_clear_upper.S"));
     const kconfig = b.createModule(.{ .root_source_file = b.path("../../../build/kconfig.zig"), .target = target, .optimize = optimize });
     const elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
     const miz = b.createModule(.{ .root_source_file = source.path("packages/miz/src/root.zig"), .target = target, .optimize = optimize });
@@ -46,9 +49,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "public_image", .module = module }},
-    }) });
+    }), .filters = filters });
     tests.root_module.addOptions("test_options", options);
-    b.step("test", "Test native public packaging/export without real guest boots").dependOn(&b.addRunArtifact(tests).step);
+    const run_tests = b.addRunArtifact(tests);
+    b.step("test", "Test native public packaging/export without real guest boots").dependOn(&run_tests.step);
+    const hash_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("../local_boot/sha256_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    if (target.result.cpu.arch == .x86_64)
+        hash_tests.root_module.addAssemblyFile(b.path("../local_boot/sha256_clear_upper.S"));
+    const run_hash_tests = b.addRunArtifact(hash_tests);
+    b.step("test-sha256", "Check full-byte standard SHA equivalence and streaming boundaries").dependOn(&run_hash_tests.step);
+    run_tests.step.dependOn(&run_hash_tests.step);
     const import_options = b.addOptions();
     import_options.addOptionPath("cli", cli.getEmittedBin());
     import_options.addOption(?[]const u8, "test_root", b.option([]const u8, "import-test-root", "Existing private native import fixture directory"));
@@ -57,7 +71,29 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "public_image", .module = module }},
-    }) });
+    }), .filters = filters });
     import_tests.root_module.addOptions("test_options", import_options);
     b.step("test-import", "Test physical native import and reload without guests or networking").dependOn(&b.addRunArtifact(import_tests).step);
+    const measurement = b.createModule(.{
+        .root_source_file = b.path("../synthetic_measurement.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cost_probe = b.addExecutable(.{
+        .name = "public-image-cost-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cost_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "public_image", .module = module },
+                .{ .name = "synthetic_measurement", .module = measurement },
+            },
+        }),
+    });
+    if (target.result.cpu.arch == .x86_64)
+        cost_probe.root_module.addAssemblyFile(b.path("cost_clear_upper.S"));
+    cost_probe.root_module.addOptions("test_options", options);
+    b.step("build-cost-probe", "Compile the uninstalled synthetic cost probe without running it").dependOn(&cost_probe.step);
+    b.step("diagnose-cost", "Measure actual synthetic package and independent boot hashes without a guest").dependOn(&b.addRunArtifact(cost_probe).step);
 }

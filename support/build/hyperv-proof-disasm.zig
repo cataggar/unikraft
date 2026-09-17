@@ -102,7 +102,10 @@ pub const Instruction = struct {
         if (!self.isBranch() or self.indirect()) return error.UnresolvedEdge;
         var tokens = std.mem.tokenizeAny(u8, self.operands, " \t");
         const address = hex(tokens.next() orelse return error.UnresolvedEdge) catch return error.UnresolvedEdge;
-        if (tokens.next()) |label| {
+        // LLVM's demangled Zig symbols may contain spaces. The numeric
+        // operand remains authoritative; consume one complete annotation.
+        const label = std.mem.trim(u8, tokens.rest(), " \t");
+        if (label.len != 0) {
             if (label.len < 3 or label[0] != '<' or label[label.len - 1] != '>') return error.UnresolvedEdge;
         }
         return address;
@@ -119,6 +122,22 @@ pub const Instruction = struct {
         return immediate(std.mem.trim(u8, operands.first(), " \t"));
     }
 };
+
+test "direct branch annotations include full demangled Zig names" {
+    const instruction = Instruction{
+        .address = 0x100,
+        .op = "callq",
+        .operands = "0x163260 <debug.FullPanic((function 'defaultPanic')).outOfBounds>",
+    };
+    try std.testing.expectEqual(@as(u64, 0x163260), try instruction.target());
+    var invalid = instruction;
+    invalid.operands = "0x163260 <valid> trailing-garbage";
+    try std.testing.expectError(error.UnresolvedEdge, invalid.target());
+    invalid.operands = "0x163260 <unterminated symbol";
+    try std.testing.expectError(error.UnresolvedEdge, invalid.target());
+    invalid.operands = "*%rax";
+    try std.testing.expectError(error.UnresolvedEdge, invalid.target());
+}
 
 pub const Function = struct {
     address: u64,

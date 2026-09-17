@@ -115,7 +115,7 @@ pub const Fixture = struct {
         var changed = manifest;
         const file = try self.artifact.openFile(self.io, "unikraft.vhd");
         defer file.close(self.io);
-        var raw_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var raw_hash = image.boot.files.Sha256.init(.{});
         var buffer: [32768]u8 = undefined;
         var offset: u64 = 0;
         while (offset < c.raw_bytes) {

@@ -41,20 +41,26 @@ pub fn inspectVhd(a: std.mem.Allocator, io: std.Io, file: std.Io.File, expected:
     if (before.size != c.vhd_bytes) return error.InvalidGeometry;
     _ = try c.boot.vhd.validate(io, file);
     var buffer: [32768]u8 = undefined;
-    var raw_hash = std.crypto.hash.sha2.Sha256.init(.{});
-    var vhd_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = c.boot.files.Sha256.init(.{});
     var offset: u64 = 0;
+    while (offset < c.raw_bytes) {
+        const count: usize = @intCast(@min(buffer.len, c.raw_bytes - offset));
+        if (try file.readPositionalAll(io, buffer[0..count], offset) != count) return error.ArtifactChanged;
+        hash.update(buffer[0..count]);
+        offset += count;
+    }
+    // The complete raw image is the fixed VHD's prefix. Finalize a copy of
+    // that state, then continue the original through every footer byte.
+    const raw_digest = hash.peek();
     while (offset < before.size) {
         const count: usize = @intCast(@min(buffer.len, before.size - offset));
         if (try file.readPositionalAll(io, buffer[0..count], offset) != count) return error.ArtifactChanged;
-        vhd_hash.update(buffer[0..count]);
-        if (offset < c.raw_bytes) raw_hash.update(buffer[0..@intCast(@min(count, c.raw_bytes - offset))]);
+        hash.update(buffer[0..count]);
         offset += count;
     }
     if (try file.readPositionalAll(io, buffer[0..1], offset) != 0 or
         !p.sameSnapshot(before, try p.snapshot(file))) return error.ArtifactChanged;
-    const raw_digest = raw_hash.finalResult();
-    const vhd_digest = vhd_hash.finalResult();
+    const vhd_digest = hash.finalResult();
     if (!std.mem.eql(u8, &raw_digest, &expected.raw) or !std.mem.eql(u8, &vhd_digest, &expected.vhd)) return error.PayloadMismatch;
     var footer: [512]u8 = undefined;
     if (try file.readPositionalAll(io, &footer, c.raw_bytes) != footer.len) return error.ArtifactChanged;

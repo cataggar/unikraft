@@ -1,0 +1,10 @@
+.{
+    .name = .unikraft_wamr_compute_ci,
+    .version = "0.1.0",
+    .fingerprint = 0x688a8d9fbe773421,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .public_image = .{ .path = "../../tools/hyperv/public_image" },
+    },
+    .paths = .{""},
+}
