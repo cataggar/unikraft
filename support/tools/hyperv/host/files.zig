@@ -88,7 +88,7 @@ pub fn open(io: std.Io, directory: core.private_files.Directory, name: []const u
 pub fn digest(io: std.Io, file: std.Io.File, size: u64) !p.Hash {
     const before = try file.stat(io);
     if (before.kind != .file or before.size != size or size > p.max_artifact) return error.ArtifactIntegrity;
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var sha = core.Sha256.init(.{});
     var buffer: [32 * 1024]u8 = undefined;
     defer std.crypto.secureZero(u8, &buffer);
     var position: u64 = 0;
@@ -132,7 +132,7 @@ pub fn copy(io: std.Io, source: std.Io.File, destination: std.Io.File, size: u64
 pub fn verifyVhd(io: std.Io, file: std.Io.File, raw_size: u64, expected: p.Hash) !void {
     const before = try file.stat(io);
     if (before.size != raw_size + 512) return error.InvalidVhd;
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var sha = core.Sha256.init(.{});
     var buffer: [32 * 1024]u8 = undefined;
     defer std.crypto.secureZero(u8, &buffer);
     var position: u64 = 0;

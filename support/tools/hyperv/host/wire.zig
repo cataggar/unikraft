@@ -149,7 +149,7 @@ pub const Client = struct {
         var buffer: [32 * 1024]u8 = undefined;
         defer std.crypto.secureZero(u8, &buffer);
         var size: u64 = 0;
-        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        var sha = core.Sha256.init(.{});
         while (true) {
             _ = try self.budget.remaining();
             const count = try (try operation.reader()).readSliceShort(buffer[0..@min(buffer.len, artifact.size - size + 1)]);

@@ -73,9 +73,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "931edc70a6e36e92cd1162d530b1c0862082ae375df664956fe90a7bc6827ef5"
+            "c8f603ce5e25de5fcfce3447663da5762cadfdb31860dbdf5a5954af15effe29"
         ),
-        "size": 1817929,
+        "size": 1818072,
         "files": 222,
     },
     "support/kconfig": {
@@ -221,7 +221,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "38c9a402dd23c7e46a3bb61c522b49961a367c17e61c7cdfd55ca4d4dda77b09"
+        "483a5878fdfd97b6fc1ccb60ee86f9ea24efbfa775fac5d780f8fb8f2a5ca245"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -263,7 +263,7 @@ GUARDED_PRODUCER_FILES = {
         "5f875a510bda0220409fa4bc9c23ae5da19e3d314e5b009aae518e84ad9cd96e"
     ),
     "support/build/hyperv-object-proofs.build.zig": (
-        "4fb2d39721bb9e2b656f0257689943d692d2dfc4a5c48fdbf6808aa073be13fc"
+        "807f946664ee48b07c87984147eed50bd4ede954a4b989cc0b352072f85dae76"
     ),
     "support/build/hyperv-object-proofs.zig": (
         "d287564200048482edde82d9eb17ba88f4a09560d550dbf17a554395f59652fa"
@@ -349,17 +349,29 @@ GUARDED_PRODUCER_FILES = {
     "support/tools/hyperv/contracts.zig": (
         "57e37d089f7de3fba56a8415e9451b359cac33b63b816ef5a17639c6d1f8d6e1"
     ),
+    "support/tools/hyperv/core.zig": (
+        "6ea44534c393fad97245488701c74b911cc639f7cbf24275a09a55f8b9b15092"
+    ),
     "support/tools/hyperv/diagnostics.zig": (
         "39db3cd37dffe39608220e267b627010c6b0aabcfd0a436b98fe9556f5d92516"
     ),
     "support/tools/hyperv/private_files.zig": (
-        "742631633362ad97bd8e99345ad2ec3ce81c423a30fdf7ce848ad60132d60f9b"
+        "7d9b493c241aced6da467cafaa12464214df86eb7bf7a5903723ea7e5f40516a"
     ),
     "support/tools/hyperv/process.zig": (
         "f1393d12951e8a85acb0bf3ae9c5a4b51909d8283ec98121257870f0c088cc95"
     ),
     "support/tools/hyperv/sensitive.zig": (
         "e5845b7623116f3ef6e6e062463f39c2f3840bec5d36c75ccf413643dfae1eca"
+    ),
+    "support/tools/hyperv/sha256.zig": (
+        "9df4a987600791dd1b8497143d40e40b86adcc345a7dec51963467b6bdb8ec9a"
+    ),
+    "support/tools/hyperv/sha256_clear_upper.S": (
+        "b7a0c49539870ecb32d4a36a5409154d15d89fcecba97f98b6918539c81c2834"
+    ),
+    "support/tools/hyperv/sha256_tests.zig": (
+        "f7c9feecf8d6e34f94d225065100c47b72e22a6fc9f7866f970b02de5c03c7fa"
     ),
     "support/build/tests/hyperv-smp-link-test.py": (
         "dc40554f6da6ddca3e9f65b5b6c12243c734d24992a342d3564750ecc5e71488"

@@ -207,8 +207,8 @@ fn scan(io: std.Io, raw: Pinned, vhd: Pinned, parameters: seed.Parameters) ![2]c
         if (try raw.file.readPositionalAll(io, &sector, lba * seed.sector_size) != sector.len) return error.SourceChanged;
         try seed.validateSector(&sector, parameters);
     }
-    var raw_hash = std.crypto.hash.sha2.Sha256.init(.{});
-    var vhd_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var raw_hash = c.core.Sha256.init(.{});
+    var vhd_hash = c.core.Sha256.init(.{});
     var left: [64 * 1024]u8 = undefined;
     var right: [64 * 1024]u8 = undefined;
     var offset: u64 = 0;

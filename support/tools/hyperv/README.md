@@ -46,6 +46,28 @@ The current operating-system implementation requires Linux 5.11 or newer
 are supported targets. Other operating systems fail compilation rather than
 silently weakening the file or supervision policy.
 
+### Shared full-file SHA256
+
+`core.Sha256` wraps Zig's standard SHA256; it does not replace compression.
+On Zig's self-hosted x86-64 backend with both SHA and AVX2, its existing
+C-ABI-safe `VZEROUPPER` leaf clears upper-vector state before updates and
+finalization. Other backends and CPU profiles keep the standard path.
+Compile-time hashing retains standard evaluation without native register work.
+The runtime fence avoids the legacy-SHA/dirty-AVX transition penalty observed on affected
+native Intel runners without changing optimization modes or file bytes.
+
+Every standalone core constructor, including direct process consumers in the
+root native build, links the same `sha256_clear_upper.S`. Literal-null sensitive
+reads are type-specialized: those existing no-hash reads, including the Zig
+build runner's native Make contract reader, need no hash-link dependency.
+Runtime optional and nonnull expected digests retain the fenced full hash.
+Shared private-file, preparation, transfer, persistence, host, custody, Azure and preflight
+hashing retains each independent complete pass, SHA256/MD5 comparison,
+snapshot, EOF/identity check and deadline. `test-sha256`, also included in
+`test-core` and persistence `test`, retains runtime and compile-time known-vector, streaming, `peek`
+and continuation equivalence. The producer and runner source guards
+independently pin the shared implementation, assembly and test dependency.
+
 ## Local inspection CLI
 
 ```text

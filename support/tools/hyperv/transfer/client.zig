@@ -184,7 +184,7 @@ pub const Client = struct {
             outcome.diagnostic.category = .integrity;
             return outcome;
         };
-        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        var digest = @import("hyperv_core").Sha256.init(.{});
         var md5 = std.crypto.hash.Md5.init(.{});
         var buffer: [files.buffer_size]u8 = undefined;
         outcome.diagnostic.stage = .download_read;
@@ -264,7 +264,7 @@ pub const Client = struct {
         if ((source.file.readPositionalAll(self.io, &footer, input.size - footer.len) catch 0) != footer.len)
             return d.Outcome.fail(.input_hash, .input_changed);
         var outcome = d.Outcome.fail(.page_put, .local_io);
-        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        var digest = @import("hyperv_core").Sha256.init(.{});
         var offset: u64 = 0;
         while (offset < input.size) {
             if (offset > 0) outcome.side_effect = .incomplete;
@@ -387,7 +387,7 @@ pub const Client = struct {
         outcome.diagnostic.stage = .finished;
         outcome.diagnostic.category = .none;
         var footer_hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(actual[0..512], &footer_hash, .{});
+        @import("hyperv_core").Sha256.hash(actual[0..512], &footer_hash, .{});
         outcome.footer_sha256 = footer_hash;
     }
 

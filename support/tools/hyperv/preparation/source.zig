@@ -14,7 +14,7 @@ pub const Entry = struct {
 
 const Hash = union(enum) {
     sha1: std.crypto.hash.Sha1,
-    sha256: std.crypto.hash.sha2.Sha256,
+    sha256: c.core.Sha256,
     fn init(width: usize, kind: []const u8, size: u64) !Hash {
         var value: Hash = switch (width) {
             40 => .{ .sha1 = .init(.{}) },
@@ -180,7 +180,7 @@ pub fn physical(allocator: std.mem.Allocator, io: std.Io, directory: fs.Director
     _ = try treeObject(allocator, entries, entries[0].oid.len);
     std.mem.sort(Entry, entries, {}, entryLess);
     const before_directory = try dirMetadata(directory.dir);
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = c.core.Sha256.init(.{});
     var total: u64 = 0;
     for (entries) |*entry| {
         var object: Hash = undefined;
@@ -217,7 +217,7 @@ pub fn physical(allocator: std.mem.Allocator, io: std.Io, directory: fs.Director
                 before.size > 256 * 1024 * 1024)
                 return error.SourceChanged;
             object = try Hash.init(entry.oid.len, "blob", before.size);
-            var content = std.crypto.hash.sha2.Sha256.init(.{});
+            var content = c.core.Sha256.init(.{});
             var buffer: [64 * 1024]u8 = undefined;
             var offset: u64 = 0;
             while (offset < before.size) {
@@ -625,7 +625,7 @@ fn physicalIndex(allocator: std.mem.Allocator, bytes: []const u8, entries: []con
         if (!std.mem.eql(u8, &digest, bytes[end..])) return error.InvalidIndex;
     } else {
         var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes[0..end], &digest, .{});
+        c.core.Sha256.hash(bytes[0..end], &digest, .{});
         if (!std.mem.eql(u8, &digest, bytes[end..])) return error.InvalidIndex;
     }
     var position: usize = 12;

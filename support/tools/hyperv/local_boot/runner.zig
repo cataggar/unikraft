@@ -163,7 +163,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, config: c.Config, options: Options)
             defer a.free(bytes);
             report.serial_bytes = bytes.len;
             var hash: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+            core.Sha256.hash(bytes, &hash, .{});
             report.serial_sha256 = hash;
             // A full file might end at the cap while the last write failed.
             if (bytes.len == c.max_serial) {

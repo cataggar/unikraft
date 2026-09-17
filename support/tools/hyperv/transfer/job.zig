@@ -150,6 +150,6 @@ pub const Spec = struct {
 
 pub fn hash(bytes: []const u8) [32]u8 {
     var result: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &result, .{});
+    core.Sha256.hash(bytes, &result, .{});
     return result;
 }

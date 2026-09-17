@@ -64,7 +64,7 @@ pub const SealedInput = struct {
 };
 
 fn hash(file: std.Io.File, io: std.Io, size: u64, guard: Guard) !Fingerprint {
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var sha = @import("hyperv_core").Sha256.init(.{});
     var md5 = std.crypto.hash.Md5.init(.{});
     var buffer: [buffer_size]u8 = undefined;
     var offset: u64 = 0;
@@ -90,7 +90,7 @@ pub const InputReader = struct {
     source: *const SealedInput,
     guard: Guard,
     offset: u64 = 0,
-    sha: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    sha: @import("hyperv_core").Sha256 = .init(.{}),
     failure: ?anyerror = null,
 
     fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {

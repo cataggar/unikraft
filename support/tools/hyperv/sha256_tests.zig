@@ -3,7 +3,21 @@ const Sha256 = @import("sha256.zig").Sha256;
 const Standard = std.crypto.hash.sha2.Sha256;
 const t = std.testing;
 
-test "native file SHA256 retains standard known digests" {
+test "shared native file SHA256 retains standard known digests" {
+    const compile_digest = comptime value: {
+        @setEvalBranchQuota(100_000);
+        var hash = Sha256.init(.{});
+        hash.update("a");
+        var prefix: [32]u8 = undefined;
+        Standard.hash("a", &prefix, .{});
+        if (!std.mem.eql(u8, &prefix, &hash.peek())) @compileError("comptime SHA prefix differs");
+        hash.update("bc");
+        var once: [32]u8 = undefined;
+        Sha256.hash("abc", &once, .{});
+        if (!std.mem.eql(u8, &once, &hash.finalResult())) @compileError("comptime SHA continuation differs");
+        break :value once;
+    };
+    try t.expectEqualStrings("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", &std.fmt.bytesToHex(compile_digest, .lower));
     for ([_]struct { input: []const u8, sha: []const u8 }{
         .{ .input = "", .sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
         .{ .input = "abc", .sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },

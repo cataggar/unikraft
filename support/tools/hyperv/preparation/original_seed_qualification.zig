@@ -86,8 +86,8 @@ fn independent(allocator: std.mem.Allocator, io: std.Io, directory: private.Dire
         return error.WrongDiskSize;
     var left: [1024 * 1024]u8 = undefined;
     var right: [1024 * 1024]u8 = undefined;
-    var raw_sha = std.crypto.hash.sha2.Sha256.init(.{});
-    var vhd_sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var raw_sha = c.core.Sha256.init(.{});
+    var vhd_sha = c.core.Sha256.init(.{});
     var offset: u64 = 0;
     while (offset < prep.original_seed.logical_size) {
         if (try raw.readPositionalAll(io, &left, offset) != left.len or

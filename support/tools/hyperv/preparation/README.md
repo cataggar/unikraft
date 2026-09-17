@@ -294,6 +294,38 @@ Create the selected scratch directories first. Never execute the reference
 namespace shell scripts, full guest/Make/native-image builds, or original seed
 operations as part of these fixtures.
 
+### Shared SHA and pre-entry hash qualification
+
+Preparation uses the shared `hyperv_core.Sha256` standard-SHA wrapper for
+inventory/file records, executable byte validation, immutable copies, source
+and Git SHA256 bindings, image/seed streams and fixture equivalence. SHA1
+remains independent. Every full read/hash, snapshot, named-path revalidation,
+byte/identity comparison and original 5/15/30-second namespace bound remains.
+The wrapper only fences dirty upper AVX state on the affected native backend;
+compile-time evaluation, other backends and CPU profiles retain standard SHA.
+The shared implementation, assembly and equivalence tests remain independently
+pinned by both producer source guards.
+
+`namespace/build.zig -Dhash-cost-only=true` exposes uninstalled
+`build-hash-cost-probe` and `diagnose-hash-cost` selectors, requiring the existing
+private `-Dworkspace`. The latter accepts one or two explicitly selected
+executable paths after `--`. It copies their complete bytes unchanged and
+observes the same `inventory`, `record`, `read` and `contracts.digest` APIs used
+by `runtime.Bound.validate`; each result must match independent standard SHA.
+No executable is launched, namespace entered, operation deadline substituted,
+or admission produced. A second observation pass explicitly dirties upper AVX
+state when supported. Bounded records reuse `synthetic_measurement`, retain
+artifact/pass indexes and actual byte counts, and carry no authority.
+
+The shared-hash qualification workflow builds the actual raw and selected
+namespace fixtures, reuses the existing native ELF-equivalence gate, then gives
+the **identical full files** to immutable-baseline and candidate probes on each
+same native runner. The required preparation workflow separately runs every
+privileged fixture with its unchanged admission, policy and cleanup orchestration.
+Existing internal-entry records must be grouped by collection and context:
+`isolation`, `runtime_0`, `runtime_1` and `runtime_2` repeat phase names and may
+not be collapsed into a phase-only map.
+
 ### Unprivileged namespace observation selector
 
 The namespace build also has a deliberately separate, native **test-only**

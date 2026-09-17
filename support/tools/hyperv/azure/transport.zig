@@ -326,7 +326,7 @@ pub const NativeRuntime = struct {
     pub fn init(parent: std.mem.Allocator, io: std.Io, certs: []const []const u8, expected: [32]u8, clock: Clock) !NativeRuntime {
         const now = clock.unixSecondsFn(clock.context);
         if (certs.len == 0 or certs.len > 64 or now <= 0) return error.InvalidTrust;
-        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        var sha = foundation.Sha256.init(.{});
         var total: usize = 0;
         for (certs) |cert| {
             if (cert.len == 0 or cert.len > 64 * 1024) return error.InvalidTrust;

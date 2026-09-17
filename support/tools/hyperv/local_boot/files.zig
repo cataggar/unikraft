@@ -2,7 +2,7 @@ const std = @import("std");
 const core = @import("hyperv_core");
 const c = @import("config.zig");
 const linux = std.os.linux;
-pub const Sha256 = @import("sha256.zig").Sha256;
+pub const Sha256 = core.Sha256;
 
 pub const Pin = struct { size: u64, sha256: [32]u8 };
 pub const Artifact = struct {

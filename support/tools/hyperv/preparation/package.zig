@@ -222,7 +222,7 @@ fn normalize(io: std.Io, dir: std.Io.Dir, name: []const u8) !void {
 }
 
 fn prefixHash(io: std.Io, file: std.Io.File) !c.Sha {
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = c.core.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     defer std.crypto.secureZero(u8, &buffer);
     var offset: u64 = 0;

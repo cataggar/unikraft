@@ -269,7 +269,7 @@ pub const Native = struct {
         try self.storage_adapter.requireRevocation(result);
     }
     fn absentProof(self: *Native, action: c.Action) e.Proof {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var hash = core.Sha256.init(.{});
         hash.update(&self.store.state.authority_sha256);
         hash.update(@tagName(action));
         hash.update("independent-owned-group-absence");

@@ -5,6 +5,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const sdk = b.dependency("azure_sdk_core", .{ .target = target, .optimize = optimize });
     const foundation = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == .x86_64)
+        foundation.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const module = b.addModule("hyperv_azure", .{
         .root_source_file = b.path("root.zig"),
         .target = target,

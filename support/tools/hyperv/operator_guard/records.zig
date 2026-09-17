@@ -157,7 +157,7 @@ pub fn verify(comptime T: type, a: std.mem.Allocator, bytes: []const u8, key: [3
 }
 pub fn hash(bytes: []const u8) Hash {
     var digest: Hash = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    core.Sha256.hash(bytes, &digest, .{});
     return digest;
 }
 pub fn durable(result: core.private_files.CommitResult) !void {

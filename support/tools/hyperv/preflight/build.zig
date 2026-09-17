@@ -2,6 +2,8 @@ const std = @import("std");
 
 fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const sdk = b.dependency("azure_sdk_core", .{ .target = target, .optimize = optimize }).module("azure_sdk_core");
     const storage = b.dependency("azure_sdk_storage_common", .{ .target = target, .optimize = optimize }).module("azure_sdk_storage_common");
     const shared: []const std.Build.Module.Import = &.{

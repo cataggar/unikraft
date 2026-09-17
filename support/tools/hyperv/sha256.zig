@@ -5,6 +5,7 @@ const Standard = std.crypto.hash.sha2.Sha256;
 extern fn hyperv_sha256_clear_upper() callconv(.c) void;
 
 fn clearUpper() void {
+    if (@inComptime()) return;
     if (comptime builtin.zig_backend == .stage2_x86_64 and
         builtin.cpu.hasAll(.x86, &.{ .sha, .avx2 }))
     {
@@ -12,7 +13,7 @@ fn clearUpper() void {
     }
 }
 
-/// Keep the standard SHA-256 implementation and all Debug runtime checks.
+/// Shared standard SHA-256 implementation with all Debug runtime checks.
 /// Its legacy SHA instructions must not inherit dirty upper AVX registers
 /// from self-hosted code, which does not insert the usual ABI transition fence.
 pub const Sha256 = struct {

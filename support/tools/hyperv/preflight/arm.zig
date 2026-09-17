@@ -42,7 +42,7 @@ pub const Adapter = struct {
         const expected = [_]az.scope.Ref{ r.vm, r.disk, r.nic, r.nsg, r.vnet, r.storage, r.schedule };
         var seen = [_]bool{false} ** expected.len;
         if ((!partial and collection.items.len != expected.len) or collection.items.len > expected.len) return error.InventoryMismatch;
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var hash = core.Sha256.init(.{});
         for (collection.items) |item| {
             if (item != .summary) return error.InventoryMismatch;
             var index: ?usize = null;
@@ -132,7 +132,7 @@ pub const Adapter = struct {
 
     pub fn roles(self: *Adapter, state: *const j.State, remove: bool) !p.Hash {
         const principal = state.principal_id orelse return error.MissingHostIdentity;
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var hash = core.Sha256.init(.{});
         for ([_]bool{ false, true }) |evidence_role| {
             const a = self.client.allocator;
             const path = try rolePath(a, self.input, state.admitted_at, evidence_role);

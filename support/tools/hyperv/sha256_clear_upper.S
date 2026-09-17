@@ -1,4 +1,4 @@
-/* SysV vector registers are caller-saved. No hashing or runtime checks here. */
+/* Shared SysV vector fence. No hashing or runtime checks here. */
 .text
 .global hyperv_sha256_clear_upper
 .hidden hyperv_sha256_clear_upper

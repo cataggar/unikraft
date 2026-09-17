@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
         if (!std.fs.path.isAbsolute(path)) @panic("strip-fixture-report must be absolute");
     }
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const measurement = b.createModule(.{
         .root_source_file = b.path("../synthetic_measurement.zig"),
         .target = target,
@@ -48,10 +50,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "synthetic_diagnostics", .module = diagnostics },
         },
     });
-    if (target.result.cpu.arch == .x86_64) {
-        module.addAssemblyFile(b.path("sha256_clear_upper.S"));
-        synthetic_module.addAssemblyFile(b.path("sha256_clear_upper.S"));
-    }
     const cli = b.addExecutable(.{
         .name = "uk-hyperv-local-boot",
         .root_module = b.createModule(.{
@@ -97,6 +95,8 @@ pub fn build(b: *std.Build) void {
     const selected_plain = if (strip_debug) strippedCopy(b, objcopy.?, raw_plain, "local-boot-qemu-fixture") else raw_plain;
     const selected_diagnostic = if (strip_debug) strippedCopy(b, objcopy.?, raw_diagnostic, "local-boot-qemu-diagnostic-fixture") else raw_diagnostic;
     const gate_core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        gate_core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     const equivalence = b.createModule(.{
         .root_source_file = b.path("../preparation/namespace/fixture_debug_equivalence.zig"),
@@ -180,12 +180,12 @@ pub fn build(b: *std.Build) void {
     }
     b.step("test", "Run public synthetic local-boot fixtures, never a real guest").dependOn(&run.step);
     const hash_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("sha256_tests.zig"),
+        .root_source_file = b.path("../sha256_tests.zig"),
         .target = target,
         .optimize = optimize,
     }) });
     if (target.result.cpu.arch == .x86_64)
-        hash_tests.root_module.addAssemblyFile(b.path("sha256_clear_upper.S"));
+        hash_tests.root_module.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const run_hash_tests = b.addRunArtifact(hash_tests);
     b.step("test-sha256", "Check full-byte standard SHA equivalence and streaming boundaries").dependOn(&run_hash_tests.step);
     run.step.dependOn(&run_hash_tests.step);
