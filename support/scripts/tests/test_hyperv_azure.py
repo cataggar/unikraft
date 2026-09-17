@@ -2286,6 +2286,32 @@ class HypervWorkflowTest(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, expected_success, result.stderr)
 
+    def test_persistence_failed_before_baseline_marker_is_complete(self):
+        helper = SUPPORT.parent / ".github/scripts/hyperv-persistence-build-evidence.sh"
+        valid = (b"1\n", b"9\n", b"10\n", b"99\n", b"100\n", b"137\n", b"254\n", b"255\n")
+        invalid = (
+            b"", b"\n", b"1", b"0\n", b"00\n", b"01\n", b"256\n", b"-1\n",
+            b"+1\n", b"1 \n", b"1\r\n", b"1\n\n", b"1\nx", b"13\nx",
+            b"1\n\x00", b"13\n\x00", b"1\x00\n", b"\x001\n", b"1\x00\x00\n",
+        )
+        for marker in valid + invalid:
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp) / "hyperv-ci/native-persistence/Debug"
+                work.mkdir(parents=True, mode=0o700)
+                work.parent.chmod(0o700)
+                log = work / "fixtures.log"
+                log.write_bytes(b"original build failure\n")
+                log.chmod(0o600)
+                exit_file = work / "fixture-build-exit.txt"
+                exit_file.write_bytes(marker)
+                exit_file.chmod(0o600)
+                result = subprocess.run(
+                    ["bash", str(helper)], env=dict(os.environ, RUNNER_TEMP=tmp),
+                    capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, marker in valid, result.stderr)
+                self.assertEqual(exit_file.read_bytes(), marker)
+
     def test_fixture_observation_options_and_always_retention(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/integration.yaml"

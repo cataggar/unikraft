@@ -41,6 +41,8 @@ for mode in Debug ReleaseSafe; do
       private_file "${work}/fixture-build-exit.txt" 600 4
       IFS= read -r status < "${work}/fixture-build-exit.txt"
       [[ "${status}" =~ ^[1-9][0-9]{0,2}$ ]]
+      # read stops at LF and skips NULs; account for every input byte.
+      test "$(stat -c '%s' "${work}/fixture-build-exit.txt")" -eq "$((${#status} + 1))"
       test "${status}" -le 255
       printf 'persistence_build_evidence: %s_build_failed_before_baseline\n' "${mode}"
     else
