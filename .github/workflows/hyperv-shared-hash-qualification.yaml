@@ -61,12 +61,16 @@ jobs:
           "${root}/objcopy-version.txt"
         sha256sum "${objcopy}" > "${root}/objcopy-sha256.txt"
         cp support/tools/hyperv/persistence/build.zig \
-          support/tools/hyperv/persistence/build.zig.zon "${root}/restore/"
+          support/tools/hyperv/persistence/build.zig.zon \
+          support/tools/hyperv/persistence/fixture_build_schema.zig \
+          support/tools/hyperv/persistence/fixture_parent_metadata.zig "${root}/restore/"
         zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
         # Add only probe/build dependencies. Baseline production callers remain
         # the immutable merged source and still use their original standard SHA.
         cp support/tools/hyperv/persistence/build.zig \
           support/tools/hyperv/persistence/cost_probe.zig \
+          support/tools/hyperv/persistence/fixture_build_schema.zig \
+          support/tools/hyperv/persistence/fixture_parent_metadata.zig \
           "${baseline}/support/tools/hyperv/persistence/"
         cp support/tools/hyperv/sha256.zig \
           support/tools/hyperv/sha256_clear_upper.S \
@@ -102,7 +106,8 @@ jobs:
             -Dfixture-file-relayout=true "-Dfixture-objcopy=${objcopy}" \
             "-Dstrip-fixture-report=${root}/candidate/${mode}/fixture-strip-proof.json" \
             "-Doptimize=${mode}" -j2 \
-            test test-arm test-strip-equivalence test-strip-proof install --summary all
+            test test-arm test-strip-equivalence test-strip-proof \
+            test-build-evidence test-build-evidence-exclusion install --summary all
           if "${root}/candidate/${mode}/out/bin/uk-hyperv-persistence-engine" run \
             > "${root}/candidate/${mode}/parked-refusal.json" 2>&1; then
             echo "unexpected production admission" >&2
