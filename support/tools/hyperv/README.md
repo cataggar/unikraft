@@ -55,8 +55,11 @@ finalization. Other backends and CPU profiles keep the standard path.
 This avoids the legacy-SHA/dirty-AVX transition penalty observed on affected
 native Intel runners without changing optimization modes or file bytes.
 
-Every standalone core constructor, including direct private-file/process
-consumers in the root native build, links the same `sha256_clear_upper.S`.
+Every standalone core constructor, including direct process consumers in the
+root native build, links the same `sha256_clear_upper.S`. Literal-null sensitive
+reads are type-specialized: those existing no-hash reads, including the Zig
+build runner's native Make contract reader, need no hash-link dependency.
+Runtime optional and nonnull expected digests retain the fenced full hash.
 Shared private-file, transfer, persistence, host, custody, Azure and preflight
 hashing retains each independent complete pass, SHA256/MD5 comparison,
 snapshot, EOF/identity check and deadline. `test-sha256`, also included in

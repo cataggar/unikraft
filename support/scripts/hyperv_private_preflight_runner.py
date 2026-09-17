@@ -221,7 +221,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "1269fc61835314966ab64ecd35a52f4fb7b0f6b0b576b17036227f6e507eaac6"
+        "38c9a402dd23c7e46a3bb61c522b49961a367c17e61c7cdfd55ca4d4dda77b09"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -356,7 +356,7 @@ GUARDED_PRODUCER_FILES = {
         "39db3cd37dffe39608220e267b627010c6b0aabcfd0a436b98fe9556f5d92516"
     ),
     "support/tools/hyperv/private_files.zig": (
-        "d7df4952cdac331f27b33eda0dcc3eca7161c2406bf7d6d3af4909808032be6f"
+        "7d9b493c241aced6da467cafaa12464214df86eb7bf7a5903723ea7e5f40516a"
     ),
     "support/tools/hyperv/process.zig": (
         "f1393d12951e8a85acb0bf3ae9c5a4b51909d8283ec98121257870f0c088cc95"

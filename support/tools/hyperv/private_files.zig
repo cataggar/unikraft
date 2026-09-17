@@ -40,7 +40,7 @@ pub const Directory = struct {
         allocator: std.mem.Allocator,
         name: []const u8,
         maximum: usize,
-        expected_sha256: ?contracts.Sha256,
+        expected_sha256: anytype,
     ) ![]u8 {
         var contents = try self.readSensitive(io, allocator, name, maximum, expected_sha256);
         defer contents.deinit();
@@ -53,7 +53,7 @@ pub const Directory = struct {
         allocator: std.mem.Allocator,
         name: []const u8,
         maximum: usize,
-        expected_sha256: ?contracts.Sha256,
+        expected_sha256: anytype,
     ) !sensitive.Buffer {
         if (maximum == 0 or maximum > 64 * 1024 * 1024) return error.InvalidLimit;
         const file = try self.openFile(io, name);
@@ -71,11 +71,15 @@ pub const Directory = struct {
         try validateFile(io, file);
         if (count != before.size or !sameSnapshot(before, after))
             return error.FileChanged;
-        if (expected_sha256) |expected| {
-            var observed: contracts.Sha256 = undefined;
-            @import("sha256.zig").Sha256.hash(result.bytes(), &observed, .{});
-            if (!std.crypto.timing_safe.eql(contracts.Sha256, observed, expected))
-                return error.HashMismatch;
+        // Literal-null readers, including Zig's build runner, have never
+        // hashed. Specialize that existing path without a hash-link dependency.
+        if (comptime @TypeOf(expected_sha256) != @TypeOf(null)) {
+            if (@as(?contracts.Sha256, expected_sha256)) |expected| {
+                var observed: contracts.Sha256 = undefined;
+                @import("sha256.zig").Sha256.hash(result.bytes(), &observed, .{});
+                if (!std.crypto.timing_safe.eql(contracts.Sha256, observed, expected))
+                    return error.HashMismatch;
+            }
         }
         return result;
     }
@@ -171,7 +175,7 @@ pub fn openAbsolute(io: std.Io, path: []const u8, policy: FilePolicy) !std.Io.Fi
     return parent.openFile(io);
 }
 
-pub fn readSensitiveAbsolute(io: std.Io, allocator: std.mem.Allocator, path: []const u8, maximum: usize, expected: ?contracts.Sha256) !sensitive.Buffer {
+pub fn readSensitiveAbsolute(io: std.Io, allocator: std.mem.Allocator, path: []const u8, maximum: usize, expected: anytype) !sensitive.Buffer {
     const parent = try FileParent.open(io, path, .private);
     defer parent.close(io);
     return (Directory{ .dir = parent.directory }).readSensitive(io, allocator, parent.name, maximum, expected);
