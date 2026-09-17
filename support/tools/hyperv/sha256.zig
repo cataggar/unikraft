@@ -12,7 +12,7 @@ fn clearUpper() void {
     }
 }
 
-/// Keep the standard SHA-256 implementation and all Debug runtime checks.
+/// Shared standard SHA-256 implementation with all Debug runtime checks.
 /// Its legacy SHA instructions must not inherit dirty upper AVX registers
 /// from self-hosted code, which does not insert the usual ABI transition fence.
 pub const Sha256 = struct {

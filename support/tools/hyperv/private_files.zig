@@ -73,7 +73,7 @@ pub const Directory = struct {
             return error.FileChanged;
         if (expected_sha256) |expected| {
             var observed: contracts.Sha256 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(result.bytes(), &observed, .{});
+            @import("sha256.zig").Sha256.hash(result.bytes(), &observed, .{});
             if (!std.crypto.timing_safe.eql(contracts.Sha256, observed, expected))
                 return error.HashMismatch;
         }

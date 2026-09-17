@@ -1,0 +1,110 @@
+name: Hyper-V shared hash qualification
+
+on:
+  push:
+    branches: [fleet/wamr-shared-hash-budget]
+  workflow_dispatch:
+
+permissions:
+  attestations: read
+  contents: read
+
+jobs:
+  native-shared-hash:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [1, 2, 3]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Checkout unchanged merged persistence baseline
+      uses: actions/checkout@v4
+      with:
+        ref: 3d024e0eead73099230aac278ec106bd0d8561a7
+        path: .d/shared-hash-baseline
+        persist-credentials: false
+
+    - name: Install the pinned native compiler
+      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+      with:
+        ghr-version: v0.8.0
+        tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+    - name: Acquire pinned native ELF qualification tools
+      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
+      with:
+        ghr-version: v0.8.0
+        tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+        dest: ${{ github.workspace }}/.d/shared-hash-llvm
+        extract: 'true'
+        strip-components: '1'
+        cache: 'false'
+
+    - name: Compare actual worker hashes and run all persistence cases
+      shell: bash
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${GITHUB_WORKSPACE}/.d/shared-hash-native"
+        baseline="${GITHUB_WORKSPACE}/.d/shared-hash-baseline"
+        export ZIG_GLOBAL_CACHE_DIR="${root}/global"
+        mkdir -p "${root}/restore" "${ZIG_GLOBAL_CACHE_DIR}/tmp"
+        objcopy="${GITHUB_WORKSPACE}/.d/shared-hash-llvm/bin/llvm-objcopy"
+        test -x "${objcopy}"
+        "${objcopy}" --version > "${root}/objcopy-version.txt"
+        awk -f support/tools/hyperv/preparation/ci-objcopy-version.awk \
+          "${root}/objcopy-version.txt"
+        sha256sum "${objcopy}" > "${root}/objcopy-sha256.txt"
+        cp support/tools/hyperv/persistence/build.zig \
+          support/tools/hyperv/persistence/build.zig.zon "${root}/restore/"
+        zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        # Add only probe/build dependencies. Baseline production callers remain
+        # the immutable merged source and still use their original standard SHA.
+        cp support/tools/hyperv/persistence/build.zig \
+          support/tools/hyperv/persistence/cost_probe.zig \
+          "${baseline}/support/tools/hyperv/persistence/"
+        cp support/tools/hyperv/sha256.zig \
+          support/tools/hyperv/sha256_clear_upper.S \
+          support/tools/hyperv/sha256_tests.zig \
+          "${baseline}/support/tools/hyperv/"
+        git -C "${baseline}" diff --exit-code HEAD -- \
+          support/tools/hyperv/core.zig \
+          support/tools/hyperv/private_files.zig \
+          support/tools/hyperv/persistence/local.zig \
+          support/tools/hyperv/persistence/worker.zig \
+          support/tools/hyperv/transfer/files.zig
+        for variant in baseline candidate; do
+          source="${GITHUB_WORKSPACE}"
+          if [[ "${variant}" == baseline ]]; then source="${baseline}"; fi
+          mkdir -p "${root}/${variant}/Debug/fixtures"
+          echo "persistence synthetic configuration: ${variant} on the same native runner"
+          zig build --build-file "${source}/support/tools/hyperv/persistence/build.zig" \
+            --system "${root}/restore/zig-pkg" \
+            --cache-dir "${root}/${variant}/Debug/cache" \
+            -Dtest-root="${root}/${variant}/Debug/fixtures" \
+            -Dpersistence-timing=true -Dstrip-fixture-debug=true \
+            -Dfixture-file-relayout=true "-Dfixture-objcopy=${objcopy}" \
+            -Doptimize=Debug -j2 diagnose-cost --summary all
+        done
+        for mode in Debug ReleaseSafe; do
+          mkdir -p "${root}/candidate/${mode}/fixtures"
+          zig build --build-file support/tools/hyperv/persistence/build.zig \
+            --system "${root}/restore/zig-pkg" \
+            --cache-dir "${root}/candidate/${mode}/cache" \
+            --prefix "${root}/candidate/${mode}/out" \
+            -Dtest-root="${root}/candidate/${mode}/fixtures" \
+            -Dpersistence-timing=true -Dstrip-fixture-debug=true \
+            -Dfixture-file-relayout=true "-Dfixture-objcopy=${objcopy}" \
+            "-Dstrip-fixture-report=${root}/candidate/${mode}/fixture-strip-proof.json" \
+            "-Doptimize=${mode}" -j2 \
+            test test-arm test-strip-equivalence test-strip-proof install --summary all
+        done
+        zig build test-native-make-environment hyperv-object-proofs \
+          -Doptimize=Debug -j2 \
+          --cache-dir "${root}/native-build-cache" \
+          --prefix "${root}/native-build-out" --summary all

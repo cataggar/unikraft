@@ -381,6 +381,33 @@ arbitrary executables secret-free. Actual sensitive input outside that approved
 boundary must stop collection/publication. Local AArch64/x86 qualification
 binaries remain in private evidence roots and must not be uploaded as CI evidence.
 
+### Shared native hash cost qualification
+
+Worker selection and transfer sealing/independent verification use
+[`core.Sha256`](../README.md#shared-full-file-sha256), retaining the actual
+selected executable, every complete hash pass, MD5, snapshots, named identity,
+guard boundaries and all original operation/cleanup deadlines.
+
+The uninstalled `diagnose-cost` selector observes that selected fixture's
+complete bytes through `local.hash`, `transfer.files.SealedInput.open` and
+`verify`. It compares both digests with standard SHA256/MD5 and checks
+selection again after explicitly dirtying upper AVX state when supported.
+Its bounded `persistence synthetic cost` records reuse `synthetic_measurement`
+for the actual compiler/backend, CPU features, monotonic/process CPU clocks,
+worker/self sizes and observed guard count. These measurements neither launch
+a worker nor admit anything; the ordinary suites still enforce real deadlines.
+
+`.github/workflows/hyperv-shared-hash-qualification.yaml` compares the immutable
+merged `3d024e0eead73099230aac278ec106bd0d8561a7` production callers with the
+candidate on each same native x86 runner. Only build/probe dependencies are
+added to that baseline; it retains its original standard SHA calls. Each
+variant measures its actual qualified worker bytes, explicitly recorded rather
+than assumed identical. The candidate then runs every existing Debug and
+ReleaseSafe persistence/ARM/ELF-equivalence/proof case, plus shared SHA tests.
+No optimization mode, deadline, input geometry or required context is changed.
+`build-cost-probe` and `build-fixtures` allow compile-only cross-target checks;
+they provide no native execution or timing evidence.
+
 ### Default-off synthetic persistence timing
 
 `-Dpersistence-timing=true` instruments **only** the non-installed worker

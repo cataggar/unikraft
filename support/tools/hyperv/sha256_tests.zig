@@ -3,7 +3,7 @@ const Sha256 = @import("sha256.zig").Sha256;
 const Standard = std.crypto.hash.sha2.Sha256;
 const t = std.testing;
 
-test "native file SHA256 retains standard known digests" {
+test "shared native file SHA256 retains standard known digests" {
     for ([_]struct { input: []const u8, sha: []const u8 }{
         .{ .input = "", .sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
         .{ .input = "abc", .sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },

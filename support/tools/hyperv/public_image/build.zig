@@ -5,9 +5,9 @@ pub fn build(b: *std.Build) void {
     const filters = b.option([]const []const u8, "test-filter", "Run only tests matching these filters") orelse &.{};
     const source = b.dependency("miz_source", .{ .target = target, .optimize = optimize });
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
-    const local = b.createModule(.{ .root_source_file = b.path("../local_boot/root.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "hyperv_core", .module = core }} });
     if (target.result.cpu.arch == .x86_64)
-        local.addAssemblyFile(b.path("../local_boot/sha256_clear_upper.S"));
+        core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
+    const local = b.createModule(.{ .root_source_file = b.path("../local_boot/root.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "hyperv_core", .module = core }} });
     const kconfig = b.createModule(.{ .root_source_file = b.path("../../../build/kconfig.zig"), .target = target, .optimize = optimize });
     const elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
     const miz = b.createModule(.{ .root_source_file = source.path("packages/miz/src/root.zig"), .target = target, .optimize = optimize });
@@ -54,12 +54,12 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Test native public packaging/export without real guest boots").dependOn(&run_tests.step);
     const hash_tests = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("../local_boot/sha256_tests.zig"),
+        .root_source_file = b.path("../sha256_tests.zig"),
         .target = target,
         .optimize = optimize,
     }) });
     if (target.result.cpu.arch == .x86_64)
-        hash_tests.root_module.addAssemblyFile(b.path("../local_boot/sha256_clear_upper.S"));
+        hash_tests.root_module.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const run_hash_tests = b.addRunArtifact(hash_tests);
     b.step("test-sha256", "Check full-byte standard SHA equivalence and streaming boundaries").dependOn(&run_hash_tests.step);
     run_tests.step.dependOn(&run_hash_tests.step);

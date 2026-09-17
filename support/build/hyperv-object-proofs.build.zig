@@ -15,6 +15,8 @@ pub const Setup = struct {
             .target = b.graph.host,
             .optimize = optimize,
         });
+        if (b.graph.host.result.cpu.arch == .x86_64)
+            process.addAssemblyFile(b.path("support/tools/hyperv/sha256_clear_upper.S"));
         const tool = b.addExecutable(.{
             .name = "hyperv-object-proofs",
             .root_module = b.createModule(.{

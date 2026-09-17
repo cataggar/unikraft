@@ -153,7 +153,7 @@ fn readArtifact(allocator: std.mem.Allocator, io: std.Io, item: Artifact) ![]u8 
     if (try file.readPositionalAll(io, bytes, 0) != bytes.len or !files.sameSnapshot(before, try files.snapshot(file)))
         return error.ArtifactChanged;
     var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+    core.Sha256.hash(bytes, &hash, .{});
     if (!std.mem.eql(u8, &hash, &try c.parseSha256(item.sha256))) return error.HashMismatch;
     return bytes;
 }
@@ -199,7 +199,7 @@ fn inspectDisk(io: std.Io, item: Artifact, parameters: ?prep.seed.Parameters, vh
     if (before.size != item.size) return error.WrongDiskSize;
     const logical = item.size - @as(u64, if (vhd) 512 else 0);
     var buffer: [1024 * 1024]u8 = undefined;
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var sha = core.Sha256.init(.{});
     var offset: u64 = 0;
     while (offset < logical) {
         const length: usize = @intCast(@min(logical - offset, buffer.len));

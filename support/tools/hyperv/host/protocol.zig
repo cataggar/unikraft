@@ -76,7 +76,7 @@ pub const Verified = struct {
 
 pub fn hash(bytes: []const u8) Hash {
     var result: Hash = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &result, .{});
+    @import("hyperv_core").Sha256.hash(bytes, &result, .{});
     return result;
 }
 
@@ -299,7 +299,7 @@ pub const Command = struct {
         const artifacts = try allocator.alloc(Artifact, records.array.items.len);
         errdefer allocator.free(artifacts);
         var roles = [_]usize{0} ** @typeInfo(Role).@"enum".fields.len;
-        var infrastructure = std.crypto.hash.sha2.Sha256.init(.{});
+        var infrastructure = @import("hyperv_core").Sha256.init(.{});
         infrastructure.update("uk-hyperv-host-infrastructure-v1\n");
         var total: u64 = 0;
         for (records.array.items, 0..) |record, index| {

@@ -293,7 +293,7 @@ pub const Store = struct {
     identities: ?Identities = null,
     cached_reads: u8 = 0,
     event_pin: ?FileSnapshot = null,
-    event_hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
+    event_hash: core.Sha256 = .init(.{}),
     fault: if (builtin.is_test) ?TestFault else void = if (builtin.is_test) null else {},
 
     /// Only this constructor exists: no opening/resuming an earlier attempt.
@@ -730,7 +730,7 @@ pub const Store = struct {
             }
         }
         var buffer: [65536]u8 = undefined;
-        var sha = std.crypto.hash.sha2.Sha256.init(.{});
+        var sha = core.Sha256.init(.{});
         var offset: u64 = 0;
         while (offset < expected.metadata.size) {
             if (builtin.is_test and fault != null and fault.?.source_failure == .read)
@@ -937,7 +937,7 @@ pub const Store = struct {
 
 fn hashBytes(bytes: []const u8) Digest {
     var digest: Digest = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    core.Sha256.hash(bytes, &digest, .{});
     return digest;
 }
 
@@ -947,7 +947,7 @@ fn hashPrivate(io: std.Io, directory: files.Directory, name: []const u8, maximum
     defer file.close(io);
     const before = try files.snapshot(file);
     if (before.size > maximum) return error.FileTooLarge;
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var sha = core.Sha256.init(.{});
     var buffer: [65536]u8 = undefined;
     var offset: u64 = 0;
     while (offset < before.size) {

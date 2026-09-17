@@ -10,6 +10,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    if (target.result.cpu.arch == .x86_64)
+        shared.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const module = b.addModule("hyperv_transfer", .{
         .root_source_file = b.path("root.zig"),
         .target = target,

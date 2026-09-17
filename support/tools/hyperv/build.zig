@@ -9,6 +9,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("sha256_clear_upper.S"));
     const transfer = b.addModule("hyperv_transfer", transferOptions(b, core, target, optimize));
     const aggregate = b.addModule("hyperv", .{
         .root_source_file = b.path("root.zig"),
@@ -45,6 +47,8 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        host_core.addAssemblyFile(b.path("sha256_clear_upper.S"));
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests.zig"),
@@ -57,6 +61,16 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const core_step = b.step("test-core", "Run shared native core fixtures");
     core_step.dependOn(&run_tests.step);
+    const hash_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("sha256_tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        hash_tests.root_module.addAssemblyFile(b.path("sha256_clear_upper.S"));
+    const run_hash_tests = b.addRunArtifact(hash_tests);
+    b.step("test-sha256", "Retain standard SHA known-vector and streaming equivalence").dependOn(&run_hash_tests.step);
+    core_step.dependOn(&run_hash_tests.step);
     const host_transfer = b.createModule(transferOptions(b, host_core, b.graph.host, optimize));
     const transfer_tests = b.addTest(.{ .root_module = host_transfer });
     const transfer_run = b.addRunArtifact(transfer_tests);

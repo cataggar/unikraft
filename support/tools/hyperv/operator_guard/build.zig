@@ -48,6 +48,8 @@ pub fn build(b: *std.Build) void {
 
 fn addModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, name: ?[]const u8) *std.Build.Module {
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const options: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("root.zig"),
         .target = target,

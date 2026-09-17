@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) void {
     const sdk = b.dependency("azure_sdk_core", .{ .target = target, .optimize = optimize }).module("azure_sdk_core");
     const storage = b.dependency("azure_sdk_storage_common", .{ .target = target, .optimize = optimize }).module("azure_sdk_storage_common");
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const azure = b.createModule(.{
         .root_source_file = b.path("../azure/root.zig"),
         .target = target,
@@ -103,6 +105,8 @@ pub fn build(b: *std.Build) void {
     } else raw_worker;
     test_options.addOptionPath("worker", selected_worker);
     const gate_core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        gate_core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     const equivalence = b.createModule(.{
         .root_source_file = b.path("../preparation/namespace/fixture_debug_equivalence.zig"),
@@ -173,6 +177,33 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("test_options", test_options);
     tests.root_module.addImport("synthetic_measurement", measurement);
     const run = b.addRunArtifact(tests);
+    b.step("build-fixtures", "Compile the actual persistence fixtures without executing them").dependOn(&tests.step);
+    const hash_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("../sha256_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    if (target.result.cpu.arch == .x86_64)
+        hash_tests.root_module.addAssemblyFile(b.path("../sha256_clear_upper.S"));
+    const run_hash_tests = b.addRunArtifact(hash_tests);
+    b.step("test-sha256", "Retain standard SHA known-vector and streaming equivalence").dependOn(&run_hash_tests.step);
+    run.step.dependOn(&run_hash_tests.step);
+    const cost = b.addExecutable(.{
+        .name = "persistence-cost-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("cost_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+        }),
+    });
+    cost.root_module.addOptions("test_options", test_options);
+    cost.root_module.addImport("synthetic_measurement", measurement);
+    const run_cost = b.addRunArtifact(cost);
+    run_cost.has_side_effects = true;
+    if (check) |verify| run_cost.step.dependOn(&verify.step);
+    b.step("build-cost-probe", "Compile the uninstalled actual-worker cost probe").dependOn(&cost.step);
+    b.step("diagnose-cost", "Measure actual worker selection, seal and independent verification").dependOn(&run_cost.step);
     b.step("test", "Run offline persistence engine fixtures").dependOn(&run.step);
     const arm_tests = b.addTest(.{ .root_module = azure });
     const arm_run = b.addRunArtifact(arm_tests);

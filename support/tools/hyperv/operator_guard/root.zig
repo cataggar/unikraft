@@ -152,7 +152,7 @@ pub fn selfIdentity(io: std.Io, descriptor: k.linux.fd_t) !ExecutableIdentity {
     const file: std.Io.File = .{ .handle = descriptor, .flags = .{ .nonblocking = false } };
     const before = try core.private_files.snapshot(file);
     if (before.mode & 0o6000 != 0 or before.size > 64 * 1024 * 1024) return error.UnsafeExecutable;
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = core.Sha256.init(.{});
     var offset: u64 = 0;
     var buffer: [16384]u8 = undefined;
     while (offset < before.size) {

@@ -134,7 +134,7 @@ pub fn inspect(arm: *client.Client, spec: Spec) wire.Outcome(Evidence) {
 }
 fn hashMatches(bytes: []const u8, expected: [32]u8) bool {
     var actual: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+    @import("hyperv_core").Sha256.hash(bytes, &actual, .{});
     return std.crypto.timing_safe.eql([32]u8, actual, expected);
 }
 fn unavailable() wire.Outcome(Evidence) {

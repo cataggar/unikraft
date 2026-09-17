@@ -390,6 +390,10 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{ "native Make environment", "Make assignments remain single arguments" },
     });
+    if (b.graph.host.result.cpu.arch == .x86_64) {
+        facade_tests.root_module.addAssemblyFile(b.path("support/tools/hyperv/sha256_clear_upper.S"));
+        native_environment_tests.root_module.addAssemblyFile(b.path("support/tools/hyperv/sha256_clear_upper.S"));
+    }
     const run_native_environment_tests = b.addRunArtifact(native_environment_tests);
     run_native_environment_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
     b.step("test-native-make-environment", "Test explicit private Make environment and unchanged default forwarding").dependOn(&run_native_environment_tests.step);

@@ -41,6 +41,8 @@ pub fn build(b: *std.Build) void {
         if (!std.fs.path.isAbsolute(path)) @panic("strip-fixture-report must be absolute");
     }
     const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));
     const measurement = b.createModule(.{
         .root_source_file = b.path("../../synthetic_measurement.zig"),
         .target = target,
@@ -54,6 +56,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "facade_paths", .module = paths },
     };
     const gate_core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        gate_core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));
     const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     const equivalence = b.createModule(.{
         .root_source_file = b.path("fixture_debug_equivalence.zig"),
@@ -212,6 +216,8 @@ pub fn build(b: *std.Build) void {
 
 fn observationTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) *std.Build.Step.Run {
     const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));
     const elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
     const paths = b.createModule(.{ .root_source_file = b.path("../../../../build/zig-facade-paths.zig"), .target = target, .optimize = optimize });
     const measurement = b.createModule(.{ .root_source_file = b.path("../../synthetic_measurement.zig"), .target = target, .optimize = optimize });
@@ -244,6 +250,8 @@ fn observationTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
 
 fn exclusionTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) *std.Build.Step.Run {
     const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));
     const elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
     const paths = b.createModule(.{ .root_source_file = b.path("../../../../build/zig-facade-paths.zig"), .target = target, .optimize = optimize });
     // Deliberately no synthetic_measurement or observer import in this root.
@@ -266,6 +274,8 @@ fn exclusionTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
 
 fn internalProbe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) *std.Build.Step.Compile {
     const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));
     const elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
     const paths = b.createModule(.{ .root_source_file = b.path("../../../../build/zig-facade-paths.zig"), .target = target, .optimize = optimize });
     const measurement = b.createModule(.{ .root_source_file = b.path("../../synthetic_measurement.zig"), .target = target, .optimize = optimize });

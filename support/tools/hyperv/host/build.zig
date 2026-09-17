@@ -2,16 +2,19 @@ const std = @import("std");
 
 fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const sdk = b.dependency("azure_sdk_core", .{ .target = target, .optimize = optimize });
+    const core = b.createModule(.{
+        .root_source_file = b.path("../core.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (target.result.cpu.arch == .x86_64)
+        core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
     const host = b.createModule(.{
         .root_source_file = b.path("root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "hyperv_core", .module = b.createModule(.{
-                .root_source_file = b.path("../core.zig"),
-                .target = target,
-                .optimize = optimize,
-            }) },
+            .{ .name = "hyperv_core", .module = core },
             .{ .name = "azure_sdk_core", .module = sdk.module("azure_sdk_core") },
         },
     });

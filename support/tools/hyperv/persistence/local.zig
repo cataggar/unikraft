@@ -7,7 +7,7 @@ pub const Id = [32]u8;
 
 pub fn hash(bytes: []const u8) Hash {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    @import("hyperv_core").Sha256.hash(bytes, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
 }
 

@@ -46,7 +46,7 @@ pub fn pin(allocator: std.mem.Allocator, io: std.Io, dir: files.Directory, name:
     var bytes = try dir.readSensitive(io, allocator, name, limit, null);
     defer bytes.deinit();
     var digest: custody.Digest = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes.bytes(), &digest, .{});
+    core.Sha256.hash(bytes.bytes(), &digest, .{});
     const named = try dir.openFile(io, name);
     defer named.close(io);
     if (!files.sameSnapshot(metadata, try files.snapshot(named)) or !files.sameSnapshot(metadata, try files.snapshot(file)))
