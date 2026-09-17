@@ -282,6 +282,105 @@ Repeat with `-Doptimize=ReleaseSafe` and a distinct output prefix. No new SDK
 surface, dependency, tool installation, root build, CI, producer-pin or
 legacy-controller change is required by this package.
 
+### Default-off exact parent build evidence
+
+This independent diagnostic option retains the **actual main `tests.zig`
+executable**, not an ARM-client/equivalence test, worker, sibling probe, stripped
+replacement, or reconstructed historical executable. It does not fix a timeout,
+establish a CPU-cost cause, authenticate source, or grant admission.
+
+The normal credential-free CI fixture invocation adds:
+
+```text
+-Dfixture-build-evidence-root=PRIVATE_MODE_DIRECTORY/build-evidence
+-Dfixture-source-commit=EXACT_CHECKOUT_COMMIT
+-Dfixture-source-tree=EXACT_CHECKOUT_TREE
+```
+
+The root must be a fresh nonexistent child of a validated private directory.
+These options require the existing full unfiltered suite, timing-enabled
+synthetic workers, verified debug stripping, explicit file-relayout policy,
+private fixture root and worker proof. They do not change parent/worker backend,
+CPU, target, optimization, checks, reads, deadlines, or the installed engine.
+`test-build-evidence` adds native format/refusal tests after the main fixture
+execution when capture is enabled. `test-build-evidence-exclusion` separately
+checks the actual default-off parent and production executable/library without
+executing the functional fixtures.
+
+The build graph binds exact `LazyPath`s for the main parent, both worker files,
+generated options, compiler, active complete compiler `lib/` tree, and configured
+module roots. A metadata-only baseline precedes the parent compilation; a
+metadata-only preparation step follows it and precedes fixture execution. The
+baseline includes every bounded source/lib entry and explicitly refuses
+symlinks, hardlinks, special files and unsupported custody. Worker compilation
+precedes this baseline and is not claimed to have that same compile-time
+bookend. No worker or parent content is hashed by these preparatory operations.
+
+Only the opt-in actual parent exports nonexecuting `.note.uk.persistence.build`
+data. A declaration-level section and a bounded native ELF-note envelope retain
+the data without changing compiler or linker flags. LLVM produces `SHT_NOTE`;
+the self-hosted x86 Debug backend produces nonexecuting `PROGBITS` and a local
+symbol, which the reader accepts only for that exact reported backend/mode.
+The reader validates section, symbol, load bounds, note header and padding.
+It records that compilation's `builtin` backend, optimize mode, full CPU
+model/baseline/resolved features, OS/version/ABI/object target and exposed flags.
+The report separately records configured nullable/default options, the test
+seed and configured module graph. Unexposed effective options are listed as
+unavailable; a null configured setting is not reported as observed false.
+Configured compiler-runtime optimization, incremental settings and effective
+build-ID selection are also bound, including explicit/default distinctions.
+The static data can change binary bytes/layout and is not a claim of equivalence
+to an earlier parent. Default parent and installed/exported production roots
+exclude the export and diagnostic dependencies.
+
+After the original build/test command finishes, its original pipeline exit code
+is recorded without rewriting its log or converting a failure to success.
+The always-run retention step executes only the already-built private
+`build-evidence/collector collect build-evidence`; it does not invoke Zig,
+rebuild a replacement, run the parent, or repeat fixtures. It copies full parent
+and worker bytes, validates actual-parent metadata with the shared native ELF
+reader, rederives the existing worker equivalence proof, and binds the unchanged
+fixture log/observations and exit marker. It hashes the compiler, entire active
+`lib/` tree (including `std`, `compiler_rt`, libc and other material), generated
+options and configured source/module envelopes. Compact complete tree
+commitments are retained instead of uploading toolchains. These envelopes are
+not claimed to be a compiler-resolved import/embed file list.
+
+All copied files first remain under private `pending/`. Only complete validated
+collection is promoted with a non-replacing directory rename to fixed
+`evidence/{parent-test,worker-raw,worker-selected,report.json}`. Failures retain
+their private partial history and cannot overwrite/adopt an earlier collection.
+Missing earlier/later modes are distinguished from malformed or unsafe input.
+The collector's success is diagnostic publication only; the recorded original
+fixture exit may still be nonzero.
+
+| Bound | Maximum |
+| --- | --- |
+| Exact parent / raw worker / selected worker | 96 / 64 / 16 MiB |
+| Compiler executable | 256 MiB, hashed only |
+| Each complete input tree | 32,768 files and 32,768 directories; 256 MiB file bytes |
+| Individual input-tree file / recursion / relative path | 16 MiB / 64 levels / 4,095 bytes |
+| Configured modules | 32 |
+| Parent metadata / exported report / original log | 32 KiB / 32 KiB / 64 MiB |
+| Private plan or baseline | 4 MiB |
+| Copied binary collection plus report | 256 MiB aggregate |
+
+Every admitted file range is fully read; sparse files count their logical bytes,
+not physical device traffic. Metadata scans do not count as content hashes.
+Names and physical identities are rechecked through held descriptors and named
+paths, including before/after content reads. The records do not defend against
+an owner replacing the entire tool/source/custody history or authenticate source.
+
+The existing seven-day repository artifact route retains only normal
+GitHub-hosted CI products. Ordinary embedded CI build-location strings are
+explicitly allowed **inside the unmodified binaries**; existing native logs and
+proofs stay unchanged. Newly structured metadata contains fixed roles and
+relative artifact names, not absolute HOME/fixture/cache paths, environment
+dumps, credentials or private-file contents. No string scan is claimed to prove
+arbitrary executables secret-free. Actual sensitive input outside that approved
+boundary must stop collection/publication. Local AArch64/x86 qualification
+binaries remain in private evidence roots and must not be uploaded as CI evidence.
+
 ### Default-off synthetic persistence timing
 
 `-Dpersistence-timing=true` instruments **only** the non-installed worker
