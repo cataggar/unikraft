@@ -25,6 +25,20 @@ def sha(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def bison_data():
+    configured = os.environ.get("BISON_PKGDATADIR")
+    if configured is None:
+        configured = subprocess.check_output(
+            [tool("bison"), "--print-datadir"], text=True).strip()
+    path = Path(configured)
+    if not path.is_absolute():
+        raise ValueError("Bison data must be an explicit absolute directory")
+    path = path.resolve(strict=True)
+    if not path.is_dir():
+        raise ValueError("Bison data must be a directory")
+    return str(path)
+
+
 def record():
     output = ROOT / "build"
     names = ("wamr_hyperv-x86_64-efi", "wamr_hyperv-x86_64-efi.dbg",
@@ -60,8 +74,7 @@ def main():
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     state.chmod(0o700)
     contract = {
-        "bison_data": subprocess.check_output(
-            [tool("bison"), "--print-datadir"], text=True).strip(),
+        "bison_data": bison_data(),
         "m4": tool("m4"),
         "schema": "unikraft_native_make_environment_v1",
         "shell": tool("bash"),
@@ -72,7 +85,6 @@ def main():
         path.mkdir(mode=0o700, exist_ok=True)
         path.chmod(0o700)
         contract[name] = str(path)
-    contract["bison_data"] = str(Path(contract["bison_data"]).resolve())
     environment = state / "environment.json"
     environment.write_text(json.dumps(contract, sort_keys=True,
                                       separators=(",", ":")) + "\n")

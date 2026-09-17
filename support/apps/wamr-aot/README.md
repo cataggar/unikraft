@@ -67,6 +67,11 @@ Keep `build/` private. Re-preparation deliberately refuses existing artifact
 or source-export directories; use a fresh worktree or remove only those two
 generated directories after retaining needed evidence.
 
+`BISON_PKGDATADIR` can explicitly select a private, absolute Bison data
+directory. The existing native Make environment guard still validates it;
+an invalid override never falls back to ambient data. Hosted CI reuses the
+authenticated package-data acquisition rather than writable `/usr/share`.
+
 ## Memory ownership and failure paths
 
 `platform.c` is specific to the pinned native x86_64 PAL, direct-mapped

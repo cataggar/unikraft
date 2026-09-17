@@ -3,13 +3,20 @@ set -euo pipefail
 umask 077
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT QEMU_MODULE_DIR
 
-if [[ ( $# != 1 && $# != 4 ) || "${1:-}" != /* ||
+if [[ ( $# != 1 && $# != 2 && $# != 4 ) || "${1:-}" != /* ||
       "${GITHUB_ACTIONS:-}" != true || "$(id -u)" -eq 0 ]]; then
-  echo "usage: hyperv-qemu-candidate-runtime.sh ROOT [integration CI_ROOT NETWORK_APPLICATION] on an ordinary-user GitHub runner" >&2
+  echo "usage: hyperv-qemu-candidate-runtime.sh ROOT [compute | integration CI_ROOT NETWORK_APPLICATION] on an ordinary-user GitHub runner" >&2
   exit 2
 fi
 root="$(readlink -f "$1")"
-if [[ $# == 4 ]]; then
+if [[ $# == 2 ]]; then
+  if [[ "$2" != compute || "${GITHUB_JOB:-}" != wamr-native-compute ]]; then
+    echo "Invalid native compute driver selection." >&2
+    exit 2
+  fi
+  driver="$(readlink -f .github/scripts/wamr-native-ci.sh)"
+  driver_args=("${root}")
+elif [[ $# == 4 ]]; then
   if [[ "$2" != integration || "$3" != /* || ( "$4" != true && "$4" != false ) ]]; then
     echo "Invalid native integration driver selection." >&2
     exit 2
