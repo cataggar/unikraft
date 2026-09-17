@@ -2162,6 +2162,107 @@ class HypervAzureControllerTest(unittest.TestCase):
 
 
 class HypervWorkflowTest(unittest.TestCase):
+    def test_persistence_build_evidence_exact_roles_and_post_test_retention(self):
+        workflow = (SUPPORT.parent / ".github/workflows/integration.yaml").read_text()
+        job = workflow.split("  zig-hyperv-runtime:\n", 1)[1].split("\n  zig-hyperv", 1)[0]
+        fixture = job.split("    - name: Run native Hyper-V persistence engine fixtures\n", 1)[1].split("\n    - name:", 1)[0]
+        for required in (
+            '"-Dfixture-build-evidence-root=${root}/${mode}/build-evidence"',
+            '"-Dfixture-source-commit=$(git rev-parse HEAD)"',
+            '"-Dfixture-source-tree=$(git rev-parse HEAD^{tree})"',
+            "test test-arm test-strip-equivalence test-strip-proof test-build-evidence install",
+            '|| fixture_result=$?',
+            'if [ "${fixture_result}" -ne 0 ]; then exit "${fixture_result}"; fi',
+            "set -C;",
+        ):
+            self.assertIn(required, fixture)
+        retained = job.split("    - name: Collect exact persistence parent build evidence\n", 1)[1].split("\n    - name:", 1)[0]
+        self.assertIn("if: always()", retained)
+        self.assertIn("bash .github/scripts/hyperv-persistence-build-evidence.sh", retained)
+        self.assertNotIn("zig build", retained)
+        upload = job.split("    - name: Retain bounded runtime fixture evidence\n", 1)[1]
+        self.assertIn("retention-days: 7", upload)
+        self.assertIn("actions/upload-artifact@v4", upload)
+        for mode in ("Debug", "ReleaseSafe"):
+            for name in ("parent-test", "worker-raw", "worker-selected", "report.json"):
+                self.assertIn(f"/{mode}/build-evidence/evidence/{name}", upload)
+        for forbidden in ("**/test", "build-evidence/pending", "build-evidence/collector",
+                          "build-evidence/plan.json", "build-evidence/baseline.json"):
+            self.assertNotIn(forbidden, upload)
+        self.assertNotIn("zig-local-cache/**/hyperv-persistence-worker-fixture", upload)
+        for forbidden in ("continue-on-error:", "|| true", "-Dtest-filter="):
+            self.assertNotIn(forbidden, fixture)
+
+    def test_persistence_build_retention_calls_only_existing_collector(self):
+        helper = SUPPORT.parent / ".github/scripts/hyperv-persistence-build-evidence.sh"
+        for result_code in (0, 13):
+            with self.subTest(result_code=result_code), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp) / "hyperv-ci/native-persistence/Debug"
+                work.mkdir(parents=True, mode=0o700)
+                work.parent.chmod(0o700)
+                capture = work / "build-evidence"
+                capture.mkdir(mode=0o700)
+                log = work / "fixtures.log"
+                log.write_bytes(b"unaltered original fixture failure\n")
+                log.chmod(0o600)
+                collector = capture / "collector"
+                collector.write_text(
+                    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$0.calls"\n'
+                    f"exit {result_code}\n"
+                )
+                collector.chmod(0o700)
+                result = subprocess.run(
+                    ["bash", str(helper)], env=dict(os.environ, RUNNER_TEMP=tmp),
+                    capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, result_code, result.stderr)
+                self.assertEqual((capture / "collector.calls").read_text(), f"collect {capture}\n")
+                self.assertEqual(log.read_bytes(), b"unaltered original fixture failure\n")
+
+    def test_persistence_build_retention_prefix_and_unsafe_refusals(self):
+        helper = SUPPORT.parent / ".github/scripts/hyperv-persistence-build-evidence.sh"
+        for case in ("absent", "failed-before-baseline", "success-without-baseline",
+                     "dangling-root", "dangling-capture", "linked-collector",
+                     "public-collector", "oversized-collector"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "hyperv-ci/native-persistence"
+                root.parent.mkdir()
+                expected_success = case in ("absent", "failed-before-baseline")
+                if case == "dangling-root":
+                    root.symlink_to(root.parent / "missing", target_is_directory=True)
+                elif case != "absent":
+                    root.mkdir(mode=0o700)
+                    work = root / "Debug"
+                    work.mkdir(mode=0o700)
+                    if case in ("failed-before-baseline", "success-without-baseline"):
+                        (work / "fixtures.log").write_bytes(b"original build log\n")
+                        (work / "fixtures.log").chmod(0o600)
+                        (work / "fixture-build-exit.txt").write_bytes(
+                            b"1\n" if case == "failed-before-baseline" else b"0\n"
+                        )
+                        (work / "fixture-build-exit.txt").chmod(0o600)
+                    else:
+                        capture = work / "build-evidence"
+                        if case == "dangling-capture":
+                            capture.symlink_to(work / "missing", target_is_directory=True)
+                        else:
+                            capture.mkdir(mode=0o700)
+                            collector = capture / "collector"
+                            collector.write_text("#!/bin/sh\nexit 0\n")
+                            collector.chmod(0o700)
+                            if case == "linked-collector":
+                                os.link(collector, capture / "other")
+                            elif case == "public-collector":
+                                collector.chmod(0o755)
+                            else:
+                                with collector.open("r+b") as stream:
+                                    stream.truncate(100663297)
+                result = subprocess.run(
+                    ["bash", str(helper)], env=dict(os.environ, RUNNER_TEMP=tmp),
+                    capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode == 0, expected_success, result.stderr)
+
     def test_fixture_observation_options_and_always_retention(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/integration.yaml"
@@ -2362,7 +2463,7 @@ class HypervWorkflowTest(unittest.TestCase):
                 "operator_guard/ci-fixtures.sh",
                 "test-core test-transfer test-worker install --summary all",
                 "support/tools/hyperv/transfer/build.zig",
-                "test test-arm test-strip-equivalence test-strip-proof install",
+                "test test-arm test-strip-equivalence test-strip-proof test-build-evidence install",
                 '"reason":"production_bindings_unavailable"',
                 "test test-foundation test-controller test-lifecycle-native install",
                 'parent="${GITHUB_WORKSPACE}/.d/direct-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"',

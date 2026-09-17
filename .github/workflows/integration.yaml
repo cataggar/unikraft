@@ -850,6 +850,7 @@ jobs:
           zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
         for mode in Debug ReleaseSafe; do
           mkdir -p "${root}/${mode}/fixtures"
+          fixture_result=0
           ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
             zig build --build-file support/tools/hyperv/persistence/build.zig \
               --system "${root}/restore/zig-pkg" \
@@ -860,9 +861,14 @@ jobs:
               -Dstrip-fixture-debug=true -Dfixture-file-relayout=true \
               "-Dfixture-objcopy=${objcopy}" \
               "-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json" \
+              "-Dfixture-build-evidence-root=${root}/${mode}/build-evidence" \
+              "-Dfixture-source-commit=$(git rev-parse HEAD)" \
+              "-Dfixture-source-tree=$(git rev-parse HEAD^{tree})" \
               -Doptimize="${mode}" -j2 \
-              test test-arm test-strip-equivalence test-strip-proof install --summary all \
-              2>&1 | tee "${root}/${mode}/fixtures.log"
+              test test-arm test-strip-equivalence test-strip-proof test-build-evidence install --summary all \
+              2>&1 | tee "${root}/${mode}/fixtures.log" || fixture_result=$?
+          (set -C; printf '%s\n' "${fixture_result}" > "${root}/${mode}/fixture-build-exit.txt")
+          if [ "${fixture_result}" -ne 0 ]; then exit "${fixture_result}"; fi
           result=0
           "${root}/${mode}/out/bin/uk-hyperv-persistence-engine" run \
             > "${root}/${mode}/stdout" 2> "${root}/${mode}/stderr" \
@@ -895,6 +901,10 @@ jobs:
       if: always()
       run: bash .github/scripts/hyperv-fixture-observation-evidence.sh persistence
 
+    - name: Collect exact persistence parent build evidence
+      if: always()
+      run: bash .github/scripts/hyperv-persistence-build-evidence.sh
+
     - name: Retain bounded runtime fixture evidence
       if: always()
       uses: actions/upload-artifact@v4
@@ -908,12 +918,20 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-sha256.txt
           ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixture-strip-proof.json
           ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/Debug-fixtures.log
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/zig-local-cache/**/hyperv-persistence-worker-fixture
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/build-evidence/evidence/parent-test
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/build-evidence/evidence/worker-raw
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/build-evidence/evidence/worker-selected
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/build-evidence/evidence/report.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixture-build-exit.txt
           ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stdout
           ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stderr
           ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixture-strip-proof.json
           ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/ReleaseSafe-fixtures.log
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/zig-local-cache/**/hyperv-persistence-worker-fixture
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/build-evidence/evidence/parent-test
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/build-evidence/evidence/worker-raw
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/build-evidence/evidence/worker-selected
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/build-evidence/evidence/report.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixture-build-exit.txt
           ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stdout
           ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stderr
         retention-days: 7

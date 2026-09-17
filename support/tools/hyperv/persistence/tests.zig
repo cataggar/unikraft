@@ -3,6 +3,10 @@ const p = @import("root.zig");
 const core = @import("hyperv_core");
 const f = @import("fixture_support.zig");
 const options = @import("test_options");
+comptime {
+    if (@hasDecl(options, "fixture_build_evidence") and options.fixture_build_evidence)
+        @import("fixture_parent_metadata.zig").exportSection();
+}
 const timing = @import("fixture_timing.zig");
 const t = std.testing;
 const a = t.allocator;
