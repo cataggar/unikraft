@@ -158,10 +158,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "c8f603ce5e25de5fcfce3447663da5762cadfdb31860dbdf5a5954af15effe29"
+            "20942636e70e267655dcca31e271721988a33c49ca6831c3b5eb0c2eb1d8bbc4"
         ),
-        "size": 1818072,
-        "files": 222,
+        "size": 1825744,
+        "files": 223,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -397,7 +397,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "483a5878fdfd97b6fc1ccb60ee86f9ea24efbfa775fac5d780f8fb8f2a5ca245"
+        "527d0c45da210a12164ac0d7b47729609d124362f9208bb85d7190892448d624"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -579,6 +579,12 @@ GUARDED_PRODUCER_FILES = {
     "support/scripts/uk-gdb.py": (
         "cc0d9b9c1c2e8721aa267c2fc1885bb72a6662e2d2573cdc04227e6998a79434"
     ),
+    "drivers/firmware/ukefi/include/uk/efi.h": (
+        "bfde6e4790460f1fdbb9d7fa74bbd338b826e6276aaca0b29c94910b46bfcab4"
+    ),
+    "drivers/firmware/ukefi/include/uk/efi/time.h": (
+        "5a7e349ed5300c3fe0603740dfb34320e72de1ca3bffcab35e6fa9a728a9162c"
+    ),
     "drivers/hyperv/netvsc/Makefile.uk": (
         "4d3f452f93db4bf3f7f48618a6b5e4eb60e42808e258616d4170d7a1a9c6f636"
     ),
@@ -639,6 +645,12 @@ GUARDED_PRODUCER_FILES = {
     "drivers/hyperv/vmbus/vmbus_protocol.zig": (
         "4815d095de1aefcbc8f9bd40c87f7b17b1ff5e51bc816b8ba0b73980b5eab2a3"
     ),
+    "lib/uktimeconv/include/uk/timeconv.h": (
+        "022634efc8985d508279fead89c925268df5cd290551d41c2f2aabbeb2e5dd5f"
+    ),
+    "lib/uktimeconv/timeconv.c": (
+        "52310af5a7934859733fa6d8e6164b0a5c29cea051494f240b67a5bad08e21b4"
+    ),
     "plat/hyperv/Config.uk": (
         "c5fe6226a426333e2119845366cac6c712b4258d8c7ead82980d7ac57c7c0505"
     ),
@@ -648,14 +660,20 @@ GUARDED_PRODUCER_FILES = {
     "plat/hyperv/hyperv_runtime.zig": (
         "901a9caf76b33fa9990acdc061139553862caf394d1c78039cb71008262ec076"
     ),
+    "plat/hyperv/include/hyperv/clock.h": (
+        "378e4b267ca5330d5a7a1fd9da306d1fd59244528e15560d1ef8842ce26eea35"
+    ),
+    "plat/hyperv/include/hyperv/efi_clock.h": (
+        "5927caa03f0ff5bde3df68eb7073c93c345b9ea5920f697dafd0c0370fa39e33"
+    ),
     "plat/hyperv/include/hyperv/hyperv.h": (
         "af844d90dea4b706ad00ef50beaa0df54697a6b324888d4d41dc918ae2b57b3c"
     ),
     "plat/hyperv/platform.c": (
-        "0129808beafd31996448bc8a636a1329feda5d538f19704875a908125e37da5a"
+        "79b79a74cdc03c3c83bde9da212835e8367a6709d04c4ec9fee156e5139e689b"
     ),
     "plat/hyperv/time.c": (
-        "3b97fcf27fa0a76b93e565b770bb2b1d8b0d7496267387039b6c88d0e1a1cce1"
+        "82e672e9659bfb4851d574c0c1ce4a48b55c415e9ffc6bc36eda57dde9e7764b"
     ),
     "support/build/native-image-graph.zig": (
         "24b15c23cc7dc70c880e4fd9d302a58d2823cf2b085fe8a616c8f8317aea18e5"

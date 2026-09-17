@@ -1345,13 +1345,22 @@ pub fn build(b: *std.Build) void {
     platform_correctness_tests.root_module.addIncludePath(
         b.path("plat/hyperv/include"),
     );
-    platform_correctness_tests.root_module.addCSourceFile(.{
-        .file = b.path(
+    for ([_][]const u8{
+        "support/build/tests/hyperv-smp-host-include",
+        "drivers/firmware/ukefi/include",
+        "lib/uktimeconv/include",
+    }) |path| platform_correctness_tests.root_module.addIncludePath(b.path(path));
+    platform_correctness_tests.root_module.addCSourceFiles(.{
+        .files = &.{
             "support/build/tests/platform-runtime-correctness-test.c",
-        ),
+            "lib/uktimeconv/timeconv.c",
+        },
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
-    test_step.dependOn(&b.addRunArtifact(platform_correctness_tests).step);
+    const run_platform_correctness = b.addRunArtifact(platform_correctness_tests);
+    test_step.dependOn(&run_platform_correctness.step);
+    const clock_tests = b.step("test-hyperv-clock", "Test qualified EFI realtime and native clock handoff");
+    clock_tests.dependOn(&run_platform_correctness.step);
     const hyperv_smp_tests = b.addExecutable(.{
         .name = "hyperv-smp-production-test",
         .root_module = b.createModule(.{
@@ -1381,7 +1390,9 @@ pub fn build(b: *std.Build) void {
         },
     });
     hyperv_smp_tests.root_module.linkSystemLibrary("pthread", .{});
-    test_step.dependOn(&b.addRunArtifact(hyperv_smp_tests).step);
+    const run_hyperv_smp_tests = b.addRunArtifact(hyperv_smp_tests);
+    test_step.dependOn(&run_hyperv_smp_tests.step);
+    clock_tests.dependOn(&run_hyperv_smp_tests.step);
     const hyperv_fixed_smp_tests = b.addExecutable(.{
         .name = "hyperv-fixed-smp-production-test",
         .root_module = b.createModule(.{
@@ -1415,6 +1426,7 @@ pub fn build(b: *std.Build) void {
     const run_hyperv_fixed_smp_tests =
         b.addRunArtifact(hyperv_fixed_smp_tests);
     test_step.dependOn(&run_hyperv_fixed_smp_tests.step);
+    clock_tests.dependOn(&run_hyperv_fixed_smp_tests.step);
     const schedcoop_smp_tests = b.addExecutable(.{
         .name = "ukschedcoop-smp-production-test",
         .root_module = b.createModule(.{

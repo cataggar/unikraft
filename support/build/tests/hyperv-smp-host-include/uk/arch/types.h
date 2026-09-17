@@ -6,7 +6,9 @@
 #define __u16 uint16_t
 #define __u32 uint32_t
 #define __u64 uint64_t
+#define __s16 int16_t
 #define __s64 int64_t
+#define __bool _Bool
 #define __paddr_t uintptr_t
 #define __vaddr_t uintptr_t
 #define __uptr uintptr_t

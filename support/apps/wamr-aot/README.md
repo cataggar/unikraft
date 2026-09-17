@@ -152,16 +152,13 @@ It preserves exactly its twelve `wasi_unstable` signatures, guest-pointer
 checks, descriptor state, partial-write progress/deferred errors, full u32
 `proc_exit`, returned/trap/host-error distinctions and fresh-instance lifetime.
 
-**The optional CoreMark image is currently build-only, not a passing native
-correctness profile.** Both original guests request realtime clock ID 0.
-This bridge deliberately exposes only monotonic ID 1, so both guests
-encounter an unsupported clock and the image cannot qualify. Its record
-explicitly reports `realtime_supported:false`; the external validator
-refuses it even if CRC fields happen to match. A qualified EFI realtime
-capability is prerequisite code work, not merely a pending boot. The
-existing `ukplat_wall_clock()` value alone does not expose whether the
-firmware epoch/timezone was qualified, or its resolution; it must not be
-used as an unqualified substitute. Other profiles' clocks are unchanged.
+Both original guests request realtime clock ID 0. The bridge enables it
+**only** through the explicit native capability described below. Firmware
+without qualified UTC semantics remains unsupported: the record reports
+`realtime_supported:false` and the unchanged external validator refuses
+it even if CRC fields happen to match. A native boot with a qualified
+source, followed by both actual CRC executions, is still required.
+Compilation and hosted tests are not evidence that this occurred.
 The tiny image and its memory checks have no realtime dependency.
 
 Each guest receives only `coremark 0 0 0 100 0`, an empty environment and
@@ -170,11 +167,12 @@ partial failure prefixes, are preserved in canonical base64 records. Pending
 errors are inspected before destroying the context and prevent success.
 No output byte is silently replaced by a debug logger.
 
-Only real Hyper-V **monotonic nanoseconds** are supplied, at the reference
-source's **100 ns resolution**. `UINT64_MAX`/provider saturation fails.
-Realtime is unsupported without a qualified EFI epoch; process/thread CPU
-time is unsupported. An unsupported guest clock request is retained and
-prevents qualification. No clock is fabricated to make CoreMark pass.
+Hyper-V **monotonic nanoseconds** remain ID 1, at the reference source's
+**100 ns resolution**. Realtime uses a validated EFI Unix epoch plus
+Hyper-V reference elapsed time, never the monotonic origin as an epoch.
+`UINT64_MAX`/provider saturation fails. Process/thread CPU time remains
+unsupported. An unsupported guest clock request is retained and prevents
+qualification. No clock is fabricated to make CoreMark pass.
 CRC admission in both guest and host requires unique exact key/value
 fields for all five CRCs, context zero and 100 iterations. Only the
 documented short-duration warning and its `Errors detected` summary are
@@ -183,6 +181,85 @@ extra-context fields, truncation and unexpected stderr are rejected.
 Short CRC checks retain the “Must execute for at least 10 secs” diagnostics.
 Printed timing/throughput text in the preserved guest output is **not a
 benchmark score**. No reuse/replay or performance lifecycle is claimed here.
+
+### Native EFI realtime capability and its limits
+
+The supported source is deliberately a conservative subset of UEFI
+[GetTime / EFI_TIME_CAPABILITIES](https://uefi.org/specs/UEFI/2.10/08_Services_Runtime_Services.html#gettime):
+
+* The existing pre-exit Hyper-V discovery checks must succeed.
+  `uk_efi_main()` calls `ukplat_efi_pre_exit()` before boot-info memory-map
+  construction and `ExitBootServices`. The hook brackets its one real
+  Microsoft-ABI `GetTime(&time, &capabilities)` call with partition reference
+  counter MSR reads. Missing fields start invalid/unknown, not implicitly UTC.
+* `efi_clock.h` requires **explicit `TimeZone == 0` and `Daylight == 0`**.
+  `EFI_UNSPECIFIED_TIMEZONE` (2047) is not evidence of UTC. All nonzero
+  timezones, daylight flags (including valid adjustment flags), unknown
+  bits, and invalid timezone values are unsupported by this capability.
+  This is a refusal policy, not a guessed timezone sign or DST correction.
+* Gregorian month/day/leap-year validation reuses `uktimeconv` helpers.
+  Checked conversion supports positive Unix nanoseconds through
+  `UINT64_MAX - 1`; zero, pre-epoch, invalid calendar and overflow/sentinel
+  values cannot qualify. A checked January-1 conversion plus a bounded
+  remainder avoids the legacy converter's whole-date multiplication wrap.
+* EFI `Resolution` is **counts per second**, not nanoseconds or accuracy.
+  Reporting resolution is conservatively
+  `max(ceil(1e9 / Resolution), 100)` ns. Zero and `UINT32_MAX` capability
+  values, invalid BOOLEAN representations, and unknown accuracy are refused.
+  `SetsToZero` describes **SetTime** behavior only; it does not justify
+  discarding or manufacturing GetTime subseconds.
+* EFI `Accuracy` is a **rate error in 1E-6 ppm (parts per trillion)**.
+  It is retained as `efi_accuracy_pptrillion`, not converted into an
+  absolute epoch-error promise. The bracket width is retained separately
+  as `sample_span_ns`; the epoch is anchored at the bracket's final tick.
+  Interpolation improves neither firmware UTC correctness nor its initial
+  sampling uncertainty. No synchronization to an external UTC authority,
+  absolute epoch accuracy, or Hyper-V frequency-error bound is attested.
+
+The validated sample is copied into kernel-owned static storage in `time.c`
+before the EFI handoff. It is not a pointer into firmware memory and is
+immutable after early boot. Native boot info remains **version 1, 80 bytes**;
+its `efi_st` field is still a system-table address, not a UTC attestation.
+There is no serialized clock/shim field or boot-info ABI change. EFI entry
+relocation, `uk_efi_jmp_to_kern()` and the existing page-table/IRQ handoff
+remain unchanged. No GetTime/runtime-service call is introduced after
+ExitBootServices or memory initialization.
+
+`hyperv_clock_realtime(caps, ns)` is a separate **version-1 C capability
+ABI**, leaving the pinned WAMR config ABI and legacy native wall-clock and
+monotonic policies in place. It returns zero only with both outputs valid:
+
+| Capability field | Contract |
+| --- | --- |
+| `version`, `source` | 1, 1 (`HYPERV_REALTIME_EFI_UTC`) |
+| `resolution_ns` | Conservative reporting resolution above |
+| `efi_accuracy_pptrillion` | Firmware-reported rate error, not epoch accuracy |
+| `reserved` | Must be zero |
+| `sample_span_ns` | Pre-exit GetTime bracket width in ns |
+
+The 32-byte layout is checked on the C and Zig sides. `-ENOTSUP` means no
+qualified sample; `-EOVERFLOW` means invalid/regressing reference ticks or
+saturated arithmetic. Outputs are untouched on error. The running source
+is the existing sequence-checked Hyper-V reference-TSC page with checked
+scale/offset, or its partition-counter MSR fallback. Both use 100 ns ticks.
+The qualified path refuses sentinel ticks and wrap/regression rather than
+treating them as valid elapsed time. It reuses the saturating delta/add
+helpers without changing legacy callers' behavior.
+
+The WASI bridge binds the actual capability, uses it for ID 0 reads, checks
+provider status/ABI/metadata and zero/sentinel timestamps again, and fails
+closed if the provider changes or fails during execution. The bounded
+record carries actual support, capability version/source/resolution,
+firmware rate error and sample span; `epoch_accuracy_ns:null` explicitly
+means no absolute accuracy claim. No validator requirement is relaxed.
+
+**Extension boundary:** non-UTC/DST or unspecified-timezone firmware needs
+an independently justified native conversion/provenance policy, or a real
+qualified time source. A build flag, assumed cloud/OVMF UTC convention,
+static date, imported boot record, or monotonic-only fallback is not such
+a policy. This hook intentionally stays unsupported on those sources.
+Even explicit UTC fields are firmware declarations, not hardware receipts;
+actual source behavior still needs native execution/qualification.
 
 ## Existing packaging and exact-image boot
 
@@ -215,7 +292,7 @@ No Azure provisioning, cloud dispatch, hardware acceptance, networking,
 storage, performance, or resource-cleanup claim is made by this work.
 Native boot/pressure/permissions qualification remains external until the
 exact image is run on an appropriate x86 KVM/Hyper-V host. Both CRC
-executions additionally require the qualified realtime capability above.
+executions additionally require firmware admitted by the realtime capability above.
 The implementation host is ARM with no `/dev/kvm`, x86 QEMU
 or OVMF: its native boot attempt was refused, not counted as a passing run.
 
@@ -225,8 +302,29 @@ or OVMF: its native boot attempt was refused, not counted as a passing run.
 zig test build.zig --test-filter 'native WAMR'
 zig test support/build/native-image-graph.zig
 zig build test-hyperv-image-proofs test-native-compiler-options -j2
+zig build test-hyperv-clock -j2
 python3 -m unittest discover -s support/apps/wamr-aot/tests -v
 ```
+
+After preparation, run the hosted WASI bridge clock tests with the pinned
+source export (on an ARM host, append `--test-cmd /path/to/qemu-x86_64
+--test-cmd-bin` to execute the **Linux test binary**, not an EFI image):
+
+```sh
+zig test -target x86_64-linux-musl \
+  --dep wamr-native --dep minimal-wasi -Mroot=support/apps/wamr-aot/wasi.zig \
+  -target x86_64-linux-musl \
+  -Mwamr-native=support/apps/wamr-aot/build/wamr-source/src/aot_native.zig \
+  -target x86_64-linux-musl \
+  -Mminimal-wasi=support/apps/wamr-aot/build/wamr-source/src/wasi/minimal.zig \
+  --test-filter clock
+```
+
+`test-hyperv-clock` exercises the production calendar helpers, actual EFI
+time-structure layout, overflow/invalid-source refusals, and `time.c`'s
+handoff/getter with the existing hosted native SMP test doubles. WASI
+tests inject synthetic capability values and check exact ID 0 guest-memory
+writes and untouched outputs on refusal; they do not execute CoreMark.
 
 The host parser fixtures exercise the production C parser and independent
 Python validator. They are explicitly synthetic and never become native
