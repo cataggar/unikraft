@@ -9,6 +9,7 @@ import shutil
 import stat
 import sys
 import uuid
+import zipfile
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("wamr_native_ci", HERE / "run.py")
@@ -183,18 +184,36 @@ def main():
     pln = sub.add_parser("plan")
     pln.add_argument("--bundle", type=Path, required=True)
     pln.add_argument("--output", type=Path, required=True)
+    sub.add_parser("public-source-bundle", help="Explicit fixed public-repository tiny CI publication only")
+    imp = sub.add_parser("import-public-source-bundle")
+    imp.add_argument("--archive", type=Path, required=True)
+    imp.add_argument("--output", type=Path, required=True)
+    imp.add_argument("--expected-source", required=True)
+    imp.add_argument("--expected-tree", required=True)
+    imp.add_argument("--run-id", required=True)
+    imp.add_argument("--run-attempt", required=True)
+    imp.add_argument("--validator", type=Path, required=True)
     args = parser.parse_args()
     os.umask(0o077)
     if args.command == "export":
         export(args.runtime, args.output)
-    else:
+    elif args.command == "plan":
         plan(args.bundle, args.output)
-    print("Private compute handoff/plan prepared; authority=not_admitted. No Azure operations.")
+    else:
+        import public_bundle
+        if args.command == "public-source-bundle":
+            public_bundle.publish_ci(sys.modules[__name__])
+        else:
+            expected = dict(repository="cataggar/unikraft", run_id=args.run_id,
+                            run_attempt=args.run_attempt, source_revision=args.expected_source,
+                            source_tree=args.expected_tree, wamr_revision=ci.REVISION)
+            public_bundle.import_bundle(sys.modules[__name__], args.archive, args.output, expected, args.validator)
+    print("Compute handoff/plan prepared; authority=not_admitted. No Azure operations.")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile):
         print("Compute handoff refused; original local records are unchanged.", file=sys.stderr)
         sys.exit(1)

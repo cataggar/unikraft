@@ -125,11 +125,46 @@ review handoff, not an authenticated build/source attestation. Native
 verification checks the recorded relationships; the human must review the
 actual final build provenance and local execution before granting cloud use.
 
-Keep the complete handoff, raw serial and attempt directory private (0700
-directories/0600 files). Do not upload them as ordinary public PR artifacts.
-The ordinary native workflow continues publishing only its allowlisted JSON
-metadata. Retention/export on a suitable private runner is a separate offline
-operator step; this change does not modify that workflow.
+Keep operator handoffs and all Azure attempt/campaign data private (0700
+directories/0600 files). Private `export` never opts into publication. The
+separately authorized [public-source CI image lane](../build/wamr-native-ci/README.md#expressly-authorized-public-source-image-bundle)
+now retains only a fixed tiny image/local-outcome allowlist, alongside the
+existing redacted metadata artifact. It never uploads operator state, approval
+files, Azure/account data, command raw logs or arbitrary private images.
+
+### Download, independently revalidate and plan a public-source CI image
+
+Select a successful **current-source** native CI run and independently verify
+its run attempt, tested source commit/tree and four local outcomes. On PRs,
+`SOURCE_SHA`/`SOURCE_TREE` identify the tested synthetic merge commit/tree, not
+silently the branch head. Retain that distinction in the final approval.
+Download only the named artifact; no old metadata-only artifact supplies the
+required bytes. The following commands are offline/GitHub-only, not Azure:
+
+```sh
+umask 077
+mkdir -p .d/wamr-download
+gh run download "$RUN_ID" --repo cataggar/unikraft \
+  --name "wamr-public-source-tiny-${RUN_ID}-${RUN_ATTEMPT}-${SOURCE_SHA}" \
+  --dir "$PWD/.d/wamr-download"
+python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
+  --archive "$PWD/.d/wamr-download/tiny-aot-public-source.zip" \
+  --output "$PRIVATE_PARENT/FRESH-imported-image" \
+  --expected-source "$SOURCE_SHA" --expected-tree "$SOURCE_TREE" \
+  --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate"
+"$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" handoff \
+  "$PRIVATE_PARENT/FRESH-imported-image/bundle.json"
+python3 support/build/wamr-native-ci/handoff.py plan \
+  --bundle "$PRIVATE_PARENT/FRESH-imported-image/bundle.json" \
+  --output "$PRIVATE_PARENT/FRESH-unapproved-plan.json"
+```
+
+The importer bounds and verifies every member and rejects extra files,
+symlinks, changed source/image/serial/report/hash or failed local outcomes.
+It preserves original bytes and request hashes, changes only the handoff's
+local file references, and invokes native production revalidation. An
+incomplete import never publishes the final operator `bundle.json`.
 
 ## Final approval, run and cleanup boundary
 
@@ -173,6 +208,14 @@ allows only the exact Boot1 prefix excluding terminal NUL padding to be
 overwritten by appended bytes. The complete original serial remains pinned;
 cached reads cannot establish another boot. Per-boot and strict cumulative
 modes are also explicit, never auto-detected.
+Offline fixtures include byte-identical deterministic WAMR output for both
+boots: only a complete **second appended frame** establishes Boot2, and a
+cached-first-only stream expires/refuses. This does not prove Azure retains
+cumulative diagnostic bytes. If Azure resets its diagnostic log after
+deallocate/start, an approved `azure_cumulative` attempt fails closed; there
+is no automatic mode switch, reused-Boot1 acceptance or requirement that the
+workload artificially vary its output. A different mode would need separate
+concrete approval, not postrun reinterpretation.
 
 Cleanup starts independently even after a failed primary lane. It rechecks
 exact group ownership, allowlisted inventory and known immutable VM/disk

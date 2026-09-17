@@ -7,12 +7,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import struct
 import subprocess
 import time
 import unittest
 from unittest import mock
 import uuid
+import zipfile
 
 REPO = Path(__file__).resolve().parents[5]
 TOOLS = Path(os.environ["WAMR_DIRECT_TOOLS"]).resolve(strict=True)
@@ -26,6 +28,10 @@ spec = importlib.util.spec_from_file_location(
     "wamr_handoff", REPO / "support/build/wamr-native-ci/handoff.py")
 handoff = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(handoff)
+public_spec = importlib.util.spec_from_file_location(
+    "wamr_public_bundle", REPO / "support/build/wamr-native-ci/public_bundle.py")
+public_bundle = importlib.util.module_from_spec(public_spec)
+public_spec.loader.exec_module(public_bundle)
 
 
 def write(path, value):
@@ -174,7 +180,7 @@ class Compute(unittest.TestCase):
                                env={"HOME": str(self.root)}, capture_output=True, timeout=30)
         self.assertNotEqual(other.returncode, 0)
 
-    def lifecycle(self, scenario="success", log1=None):
+    def lifecycle(self, scenario="success", log1=None, log2=None):
         root = self.root
         write(root / "ISOLATED_OFFLINE_FIXTURE", b"direct-two-boot-offline-only\n")
         write(root / "fixture-backend.json", {"backend": "native"})
@@ -182,7 +188,7 @@ class Compute(unittest.TestCase):
         write(root / "fake-cloud.json", {})
         write(root / "calls", b"")
         write(root / "boot1.log", serial() if log1 is None else log1)
-        write(root / "boot2.log", serial(2))
+        write(root / "boot2.log", serial(2) if log2 is None else log2)
         (root / "ledger").mkdir(mode=0o700)
         args = [CONTROLLER, self.scope_path, root / "attempt", root / "ledger",
                 FAKE, FAKE, FAKE]
@@ -234,6 +240,33 @@ class Compute(unittest.TestCase):
         self.assertNotEqual(outcome["cleanup_exit"], 0)
         self.assertFalse(outcome["accepted"])
         self.assertFalse(outcome["owned_group_absent"])
+
+    def test_cumulative_identical_boot_output_requires_two_real_frames(self):
+        self.scope["serial_mode"] = "azure_cumulative"
+        write(self.scope_path, self.scope)
+        deterministic = serial()
+        completed, outcome, *_ = self.lifecycle(
+            "cached-then-fresh", deterministic + b"\0" * 16,
+            deterministic + deterministic + b"\0" * 16)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(outcome["accepted"])
+        self.assertEqual(outcome["boot2_freshness"]["cached_reads"], 1)
+        self.assertEqual(read(self.root / "attempt/boot1-compute.json")["compute"],
+                         read(self.root / "attempt/boot2-compute.json")["compute"])
+
+    def test_cumulative_cached_first_only_expires_without_boot2_evidence(self):
+        self.scope["serial_mode"] = "azure_cumulative"
+        self.scope["approval"]["expires_unix"] = int(time.time()) + 5
+        write(self.scope_path, self.scope)
+        deterministic = serial()
+        completed, outcome, *_ = self.lifecycle(
+            "stale-boot1-log", deterministic, deterministic)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(outcome["reserved_boots"], 2)
+        self.assertGreater(outcome["boot2_freshness"]["cached_reads"], 0)
+        self.assertFalse(outcome["accepted"])
+        self.assertTrue(outcome["owned_group_absent"])
+        self.assertFalse((self.root / "attempt/boot2-compute.json").exists())
 
     def test_foreign_inventory_never_deleted(self):
         completed, outcome, calls, *_ = self.lifecycle("foreign-resource")
@@ -339,7 +372,10 @@ class Compute(unittest.TestCase):
 
     def test_physical_handoff_reopens_full_image_and_all_four_local_records(self):
         package_tool = Path(os.environ["WAMR_CI_PACKAGE"]).resolve(strict=True)
-        runtime = self.root / "runtime"
+        workspace = self.root / "unikraft"
+        workspace.mkdir(mode=0o700)
+        (workspace / ".d").mkdir(mode=0o700)
+        runtime = workspace / ".d/wamr-native-runtime"
         root = runtime / "compute"
         app = self.root / "app"
         for path in (runtime, root, app, app / "build", app / "build/artifacts",
@@ -417,7 +453,7 @@ class Compute(unittest.TestCase):
                 paths = [config["raw_disk"] or config["fixed_vhd"],
                          config["ovmf_code"], config["ovmf_vars"], config["qemu"]]
                 write(work / "request.json", dict(
-                    schema_version=1, config=config,
+                    schema_version=1, supervisor_pid=12345, config=config,
                     pins=[dict(size=Path(path).stat().st_size,
                                sha256=list(bytes.fromhex(ci.digest(Path(path))))) for path in paths]))
                 write(work / "report.json", dict(
@@ -427,6 +463,11 @@ class Compute(unittest.TestCase):
                     serial_sha256=digest(raw), termination={"exited": 0},
                     failures=dict(primary=None, cleanup=None, recording=None)))
                 write(root / "evidence" / (mode + "-compute.json"), ci.check_boot(config, runtime_identity))
+            for stage in public_bundle.STAGES:
+                write(root / "evidence" / ("command-" + stage + ".json"), dict(
+                    scope="command_diagnostic_not_acceptance", stage=stage,
+                    exit_code=0, bytes=1, sha256=digest(b"\n"), over_limit=False,
+                    known_error_markers=[]))
             write(root / "evidence/result.json", dict(
                 schema_version=1, scope="local_native_compute_only", passed=True,
                 hardware_acceptance="not_established", cloud_authority="not_admitted",
@@ -445,6 +486,7 @@ class Compute(unittest.TestCase):
                                     env={}, capture_output=True, timeout=60)
         self.assertEqual(revalidated.returncode, 0, revalidated.stderr)
         self.assertIn(b"authority=not_admitted", revalidated.stdout)
+        self.public_archive_checks(bundle_path)
         self.scope.update(
             bundle=handoff.artifact(bundle_path),
             os_vhd=bundle["artifacts"][handoff.NAMES.index("vhd")],
@@ -469,6 +511,114 @@ class Compute(unittest.TestCase):
         with self.assertRaises(ValueError):
             handoff.plan(bundle_path, self.root / "mutated-plan.json")
 
+    def public_archive_checks(self, bundle_path):
+        stage = bundle_path.parent
+        bundle = read(bundle_path)
+        source = dict(repository="cataggar/unikraft", run_id="1234567", run_attempt="1",
+                      source_revision=bundle["source_revision"], source_tree=bundle["source_tree"],
+                      wamr_revision=SDK)
+        archive = self.root / "public.zip"
+        for name in ("subscription.json", "sas.txt", "credentials", "extra"):
+            write(stage / name, b"must never be published")
+            with self.subTest(member=name), self.assertRaises(ValueError):
+                public_bundle.pack(handoff, stage, archive, source, VALIDATOR)
+            (stage / name).unlink()
+            self.assertFalse(archive.exists())
+        (stage / "unexpected-link").symlink_to(stage / "artifacts/raw")
+        with self.assertRaises(ValueError):
+            public_bundle.pack(handoff, stage, archive, source, VALIDATOR)
+        (stage / "unexpected-link").unlink()
+        public_bundle.pack(handoff, stage, archive, source, VALIDATOR)
+        portable = public_bundle.verify_archive(handoff, archive, source)
+        selected = public_bundle.members(handoff, portable)
+        with zipfile.ZipFile(archive) as zipped:
+            self.assertEqual(set(zipped.namelist()), set(selected) | {"bundle.json", "public-source.json"})
+            self.assertFalse(any("private/" in name or "diagnostic" in name for name in zipped.namelist()))
+            self.assertEqual(zipped.read("boots/raw-x2apic/serial"),
+                             (stage / "boots/raw-x2apic/serial").read_bytes())
+            self.assertNotIn(str(self.root).encode(), zipped.read("bundle.json"))
+            self.assertNotIn(str(self.root).encode(), zipped.read("public-source.json"))
+        output = self.root / "imported"
+        imported = public_bundle.import_bundle(handoff, archive, output, source, VALIDATOR)
+        self.assertEqual(imported["authority"], "not_admitted")
+        self.assertEqual((output / "artifacts/vhd").read_bytes(), (stage / "artifacts/vhd").read_bytes())
+        self.assertEqual(handoff.plan(output / "bundle.json", self.root / "public-plan.json")["authority"],
+                         "not_admitted")
+        for key in ("source_revision", "source_tree", "wamr_revision", "run_id", "run_attempt"):
+            wrong = dict(source, **{key: "2" if key.startswith("run_") else "c" * 40})
+            with self.subTest(binding=key), self.assertRaises(ValueError):
+                public_bundle.verify_archive(handoff, archive, wrong)
+        for name in ("extra", "sas.txt", "../escape", "/absolute", "artifacts/raw/link"):
+            bad = self.root / "bad-member.zip"
+            shutil.copyfile(archive, bad)
+            with zipfile.ZipFile(bad, "a") as zipped:
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                zipped.writestr(info, b"x")
+            with self.subTest(member=name), self.assertRaises(ValueError):
+                public_bundle.verify_archive(handoff, bad, source)
+            bad.unlink()
+        for name in ("artifacts/efi", "boots/raw-x2apic/report",
+                     "boots/raw-x2apic/serial", "evidence/raw-x2apic-compute.json"):
+            bad = self.root / "changed.zip"
+            with zipfile.ZipFile(archive) as original, zipfile.ZipFile(bad, "w") as zipped:
+                for info in original.infolist():
+                    raw = original.read(info)
+                    if info.filename == name:
+                        raw = b"x" + raw[1:]
+                    zipped.writestr(info, raw)
+            with self.subTest(changed=name), self.assertRaises(ValueError):
+                public_bundle.verify_archive(handoff, bad, source)
+            bad.unlink()
+        bad = self.root / "symlink.zip"
+        with zipfile.ZipFile(archive) as original, zipfile.ZipFile(bad, "w") as zipped:
+            for info in original.infolist():
+                raw = original.read(info)
+                if info.filename == "artifacts/raw":
+                    info.external_attr = (stat.S_IFLNK | 0o600) << 16
+                zipped.writestr(info, raw)
+        with self.assertRaises(ValueError):
+            public_bundle.verify_archive(handoff, bad, source)
+        # Recomputed member digests still cannot promote a failed boot receipt.
+        bad = self.root / "failed-receipt.zip"
+        portable = copy.deepcopy(portable)
+        with zipfile.ZipFile(archive) as original:
+            report = json.loads(original.read("boots/raw-x2apic/report"))
+            report["passed"] = False
+            changed = public_bundle.encoded(report)
+            item = portable["boots"][0]["report"]
+            item.update(size=len(changed), sha256=digest(changed))
+            manifest = json.loads(original.read("public-source.json"))
+            manifest["members"]["boots/raw-x2apic/report"] = {
+                "size": len(changed), "sha256": digest(changed)}
+            with zipfile.ZipFile(bad, "w") as zipped:
+                for info in original.infolist():
+                    raw = original.read(info)
+                    if info.filename == "boots/raw-x2apic/report":
+                        raw = changed
+                    elif info.filename == "bundle.json":
+                        raw = public_bundle.encoded(portable)
+                    elif info.filename == "public-source.json":
+                        raw = public_bundle.encoded(manifest)
+                    zipped.writestr(info, raw)
+        failed = self.root / "failed-import"
+        with self.assertRaises(ValueError):
+            public_bundle.import_bundle(handoff, bad, failed, source, VALIDATOR)
+        self.assertFalse((failed / "bundle.json").exists())
+
+    def test_public_export_has_no_arbitrary_private_tree_mode(self):
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
+            public_bundle.publish_ci(handoff)
+        with mock.patch.dict(os.environ, {
+                "GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "private/repo",
+                "GITHUB_JOB": "wamr-native-compute"}, clear=True), self.assertRaises(ValueError):
+            public_bundle.publish_ci(handoff)
+        import io
+        for secret in public_bundle.SENSITIVE:
+            with self.subTest(secret=secret), self.assertRaises(ValueError):
+                public_bundle.copy_checked(io.BytesIO(secret), None,
+                                           {"size": len(secret), "sha256": digest(secret)})
 
 if __name__ == "__main__":
     unittest.main()

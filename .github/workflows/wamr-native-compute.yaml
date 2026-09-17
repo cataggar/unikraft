@@ -111,7 +111,31 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
 
-      - name: Retain redacted compute diagnostics, never raw private state or images
+      - name: Retain the expressly authorized public-source tiny image bundle
+        timeout-minutes: 15
+        env:
+          GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.private == false && 'public' || 'private' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          export TMPDIR="${root}/compute/scratch"
+          export PYTHONDONTWRITEBYTECODE=1
+          zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
+          export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
+          python3 support/build/wamr-native-ci/handoff.py public-source-bundle
+
+      - name: Publish only the standalone verified public-source image archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: wamr-public-source-tiny-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: ${{ github.workspace }}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Retain redacted diagnostics separately from the public-source image bundle
         if: always()
         run: |
           python3 support/build/wamr-native-ci/run.py diagnostics \
