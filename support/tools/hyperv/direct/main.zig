@@ -124,7 +124,12 @@ fn shape(comptime T: type, value: std.json.Value) anyerror!void {
             if (value != .array or value.array.items.len != info.len) return error.InvalidArray;
             for (value.array.items) |item| try shape(info.child, item);
         },
-        .pointer => _ = try c.string(value),
+        .pointer => |info| if (info.child == u8) {
+            _ = try c.string(value);
+        } else {
+            if (info.size != .slice or value != .array or value.array.items.len > 64) return error.InvalidArray;
+            for (value.array.items) |item| try shape(info.child, item);
+        },
         .int => _ = try c.integer(T, value),
         .bool => if (value != .bool) {
             return error.ExpectedBoolean;

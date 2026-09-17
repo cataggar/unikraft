@@ -3,7 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("hyperv_core");
-const validator = @import("main.zig");
+const validator = @import("profile.zig").contract;
 const transfer_job = @import("transfer_job");
 const process = core.process;
 

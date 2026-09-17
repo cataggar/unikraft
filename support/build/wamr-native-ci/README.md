@@ -83,7 +83,7 @@ compute ceiling also bounds the orchestration and post-exit hashing.
 Each attempt is create-only, with no resume, overwrite or automatic retry.
 
 Raw build, runtime and bounded 4-MiB serial logs stay in private local slots.
-The seven-day Actions artifact includes only explicit `compute/evidence/*.json`:
+The seven-day **metadata** Actions artifact includes only explicit `compute/evidence/*.json`:
 build/content hashes, typed successful compute observations, native packaging
 inspection, and allowlisted failure flags/byte counts/hashes. Diagnostics do
 not copy paths, arbitrary exceptions, environment, raw serial or runtime/account
@@ -118,3 +118,63 @@ production orchestration has no fixture, executable-override or skip switch.
 ARM development can run these fixtures, but cannot qualify the guest.
 Only a successful real x86 PR run of the corrected, committed native base
 establishes the first local tiny-compute observation.
+
+## Private final-image handoff
+
+After a successful final-source build and all four boots, `handoff.py export`
+can retain and revalidate the **actual private bytes** before the runner is
+discarded. It uses the existing native physical package inspector, original
+request/report/compute checks, and complete earlier result hashes. Its bundle
+and `handoff.py plan` output remain `authority=not_admitted`; they do not
+promote this lane's local result to cloud acceptance. Metadata-only Actions
+artifacts cannot be used in place of missing raw/VHD/EFI/log bytes.
+
+See [WAMR direct compute](../../azure/WAMR-DIRECT-COMPUTE.md) for the private
+export, independent native revalidation, offline plan and separate final
+image-specific approval boundary. The default private export/plan remains
+unchanged. No cloud execution is added.
+
+## Expressly authorized public-source image bundle
+
+The separate `public-source-bundle` command is enabled only by the named
+`wamr-native-compute` PR job in the **public** `cataggar/unikraft` repository.
+It accepts no runtime/output/operator-tree arguments. It checks the clean
+current CI revision/tree, clean pinned public `cataggar/wamr` SDK checkout,
+fixed workflow/job/run/attempt context and successful managed-runtime cleanup.
+After all four genuine boots, while the complete runner files still exist,
+the workflow invokes the production private export and native handoff checker,
+then copies only its closed image/local-evidence allowlist into a standalone
+ZIP. It reopens, re-extracts and natively reconciles the ZIP before upload.
+
+Artifact name:
+`wamr-public-source-tiny-RUN_ID-RUN_ATTEMPT-SOURCE_SHA`.
+Its sole uploaded file is `tiny-aot-public-source.zip`, stored for seven days.
+It contains the 17 exact image/compiler/runtime/config/manifest artifacts,
+four original serial/request/report/compute sets, the fixed 20 earlier local
+JSON records, portable `bundle.json`, and `public-source.json` (55 regular
+files, at most 512 MiB total). Member names, modes/types, individual sizes,
+complete SHA256/EOF, source/run bindings and successful receipts are checked.
+Symlinks/hardlinks, duplicate/extra/absolute/traversal members, compression,
+oversize inputs and known credential/account/approval patterns are refused.
+
+There are **no Azure credentials, subscription/VM identities, SAS, grants,
+approval files, campaign state, raw command logs or private diagnostics** in
+the allowlist. Public tiny local serial is expressly authorized here; it is
+not arbitrary private guest output. The portable manifests use relative
+member paths and no operator/account data. Original request bytes retain
+only the validated public CI checkout paths, so their original hashes and
+four local outcomes remain intact. Config/compiler/debug bytes may likewise
+contain public build paths; no paths are rewritten inside original evidence.
+
+The ordinary metadata artifact is still published on failure. The public
+image upload is success-only; failed export, cleanup, revalidation or boot
+cannot publish a successful image bundle. This public-source permission does
+not authorize public export from the private operator CLI and supplies no
+Azure permission, measurement or acceptance.
+
+Download and import as described in the operator documentation. The importer
+requires independently selected source/tree/run/attempt values, safely copies
+only bounded regular members to a fresh private directory, rebuilds local
+artifact references (not original requests), and uses the production native
+checker before publishing a usable `bundle.json`. Its plan remains
+`authority=not_admitted`; new final artifact-bound human approval is required.

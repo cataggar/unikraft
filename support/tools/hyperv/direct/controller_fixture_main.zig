@@ -5,7 +5,7 @@ const std = @import("std");
 const controller = @import("controller.zig");
 const custody = @import("custody.zig");
 const runtime = @import("runtime.zig");
-const direct = @import("main.zig");
+const direct = @import("profile.zig").contract;
 const f = @import("lifecycle_fixture_support.zig");
 const seams = @import("lifecycle_fixture_seams.zig");
 
@@ -23,7 +23,7 @@ const Offline = struct {
 
     pub fn references(self: Offline, io: std.Io, scope: direct.Scope, programs: runtime.Programs) !References {
         try self.context.validate();
-        inline for (.{ .{ "os_vhd", "os.vhd" }, .{ "seed_raw", "seed.raw" }, .{ "seed_vhd", "seed.vhd" }, .{ "manifest", "seed.json" }, .{ "config", "config" } }) |entry| {
+        inline for (f.input_names) |entry| {
             const artifact = @field(scope, entry[0]);
             try f.expect(f.eq(artifact.path, try self.context.path(entry[1])) and f.eq(artifact.sha256, f.image_sha));
         }
@@ -80,9 +80,9 @@ fn run(init: std.process.Init) !u8 {
     try c.validate();
     for ([_][]const u8{ inputs.scope, inputs.attempt, inputs.ledger }) |path| try c.confined(path);
     try f.expect(f.eq(inputs.programs.azure, inputs.programs.uploader) and f.eq(inputs.programs.azure, inputs.programs.validator));
-    try f.expect(f.eq(std.fs.path.basename(inputs.programs.azure), "hyperv-direct-fixture-cli"));
+    try f.expect(f.eq(std.fs.path.basename(inputs.programs.azure), f.fake_name));
     const real_validator = init.environ_map.get("UK_DIRECT_FIXTURE_VALIDATOR") orelse return error.NoNativeValidator;
-    try f.expect(f.eq(std.fs.path.basename(real_validator), "uk-hyperv-direct-validate"));
+    try f.expect(f.eq(std.fs.path.basename(real_validator), f.validator_name));
     inline for (.{ inputs.programs.azure, real_validator }) |path| {
         const file = try f.files.openAbsolute(init.io, path, .artifact);
         defer file.close(init.io);

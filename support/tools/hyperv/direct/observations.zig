@@ -3,7 +3,8 @@
 //! These checks neither authorize effects nor parse evidence.
 const std = @import("std");
 const core = @import("hyperv_core");
-const direct = @import("main.zig");
+const profile = @import("profile.zig");
+const direct = profile.contract;
 const c = core.contracts;
 const sensitive = core.sensitive;
 const files = core.private_files;
@@ -193,6 +194,10 @@ pub const Expectations = struct {
     }
 
     pub fn artifact(self: Expectations, role: Role) direct.Artifact {
+        if (profile.compute) {
+            std.debug.assert(role == .os);
+            return self.scope.os_vhd;
+        }
         return if (role == .os) self.scope.os_vhd else self.scope.seed_vhd;
     }
 };
@@ -344,6 +349,7 @@ pub fn inventory(value: std.json.Value, expected: Expectations) !InventoryObserv
             .{ "microsoft.network/networksecuritygroups", "nsg" },
             .{ "microsoft.network/virtualnetworks", "vnet" },
         }) |entry| {
+            if (profile.compute and comptime std.mem.eql(u8, entry[1], "data")) continue;
             if (std.ascii.eqlIgnoreCase(kind, entry[0]) and name == .string and
                 matchesParts(name.string, &.{ expected.scope.prefix, "-", entry[1] }, false))
                 allowed = true;
@@ -420,10 +426,15 @@ pub fn vm(value: std.json.Value, expected: Expectations, original_uuid: ?[]const
     try require(eq(try field(storage, "diskControllerType"), "SCSI") and
         eq(try field(os, "createOption"), "Attach") and eq(try field(os, "caching"), "ReadOnly") and
         eq(try field(os, "deleteOption"), "Detach") and eq(try at(os, &.{ "managedDisk", "id" }), expected.os_id));
-    const data = try singleton(try field(storage, "dataDisks"));
-    try require(try uint(try field(data, "lun")) == 7 and eq(try field(data, "createOption"), "Attach") and
-        eq(try field(data, "caching"), "None") and eq(try field(data, "deleteOption"), "Detach") and
-        eq(try at(data, &.{ "managedDisk", "id" }), expected.data_id));
+    if (profile.compute) {
+        const data = try field(storage, "dataDisks");
+        try require(data == .array and data.array.items.len == 0);
+    } else {
+        const data = try singleton(try field(storage, "dataDisks"));
+        try require(try uint(try field(data, "lun")) == 7 and eq(try field(data, "createOption"), "Attach") and
+            eq(try field(data, "caching"), "None") and eq(try field(data, "deleteOption"), "Detach") and
+            eq(try at(data, &.{ "managedDisk", "id" }), expected.data_id));
+    }
     const nic = try singleton(try at(value, &.{ "networkProfile", "networkInterfaces" }));
     try require(eq(try field(nic, "id"), expected.nic_id));
     const uuid = try nonempty(try field(value, "vmId"));

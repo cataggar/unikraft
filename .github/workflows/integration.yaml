@@ -897,7 +897,7 @@ jobs:
           --prefix "${root}/tools" -Doptimize=ReleaseSafe \
           -Dtest-root="${root}/fixtures" \
           -Dlifecycle-root="${parent}/native" \
-          test test-foundation test-controller test-lifecycle-native install
+          test test-foundation test-controller test-lifecycle-native install compute-fixture-tools
 
     - name: Collect bounded persistence observations
       if: always()
@@ -906,6 +906,25 @@ jobs:
     - name: Collect exact persistence parent build evidence
       if: always()
       run: bash .github/scripts/hyperv-persistence-build-evidence.sh
+
+    - name: Exercise WAMR compute only after persistence source custody ends
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/direct"
+        export TMPDIR="${root}/tmp"
+        # Even creating/removing ignored zig-pkg changes pinned directory metadata.
+        # Do not move this independent dependency restoration before collection.
+        # WAMR uses the same isolated fake backend, never an authenticated CLI.
+        export PYTHONDONTWRITEBYTECODE=1
+        zig build --build-file support/build/wamr-native-ci/build.zig -j2 \
+          --cache-dir "${root}/compute-cache" --global-cache-dir "${root}/global" \
+          --prefix "${root}/compute-tools" -Doptimize=ReleaseSafe test install
+        WAMR_DIRECT_TOOLS="${root}/tools/bin" \
+        WAMR_CI_PACKAGE="${root}/compute-tools/bin/wamr-ci-package" \
+          python3 -m unittest discover -s support/tools/hyperv/direct/tests -v
+        # Generated package sources are not part of the guarded source closure.
+        mv support/build/wamr-native-ci/zig-pkg "${root}/compute-zig-pkg"
 
     - name: Retain bounded runtime fixture evidence
       if: always()

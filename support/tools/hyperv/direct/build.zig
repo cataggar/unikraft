@@ -24,6 +24,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "hyperv_core", .module = core },
         .{ .name = "preparation", .module = preparation },
         .{ .name = "evidence", .module = persistence },
+        .{ .name = "local_serial", .module = b.createModule(.{
+            .root_source_file = b.path("../local_boot/serial.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "hyperv_core", .module = core }},
+        }) },
     };
     const validator = b.addExecutable(.{
         .name = "uk-hyperv-direct-validate",
@@ -129,6 +135,27 @@ pub fn build(b: *std.Build) void {
         .root_module = controllerModule(b, "controller_main.zig", target, optimize, &controller_imports),
     });
     b.installArtifact(controller);
+    const compute_validator = b.addExecutable(.{
+        .name = "uk-wamr-direct-validate",
+        .root_module = b.createModule(.{ .root_source_file = b.path("compute_main.zig"), .target = target, .optimize = optimize, .imports = &imports }),
+    });
+    b.installArtifact(compute_validator);
+    const compute_controller = b.addExecutable(.{
+        .name = "uk-wamr-direct-compute",
+        .root_module = controllerModule(b, "compute_controller_main.zig", target, optimize, &controller_imports),
+    });
+    b.installArtifact(compute_controller);
+    const compute_fixture_tools = b.step("compute-fixture-tools", "Install explicitly isolated WAMR fake backend and controller (no cloud)");
+    inline for (.{
+        .{ "wamr-direct-fixture-cli", "compute_fixture_cli.zig" },
+        .{ "wamr-direct-controller-fixture", "compute_controller_fixture.zig" },
+    }) |entry| {
+        const tool = b.addExecutable(.{
+            .name = entry[0],
+            .root_module = controllerModule(b, entry[1], target, optimize, &controller_imports),
+        });
+        compute_fixture_tools.dependOn(&b.addInstallArtifact(tool, .{}).step);
+    }
     const controller_fixture = b.addExecutable(.{
         .name = "hyperv-direct-controller-fixture",
         .root_module = controllerModule(b, "controller_fixture_main.zig", target, optimize, &controller_imports),
@@ -204,7 +231,7 @@ fn controllerModule(
         .imports = imports,
     });
     module.addAnonymousImport("direct_arm_template", .{
-        .root_source_file = b.path("../../../azure/hyperv-direct-two-boot.json"),
+        .root_source_file = b.path(if (std.mem.startsWith(u8, source, "compute_")) "../../../azure/wamr-direct-compute.json" else "../../../azure/hyperv-direct-two-boot.json"),
     });
     return module;
 }
