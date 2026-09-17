@@ -41,7 +41,7 @@ pub fn inspectVhd(a: std.mem.Allocator, io: std.Io, file: std.Io.File, expected:
     if (before.size != c.vhd_bytes) return error.InvalidGeometry;
     _ = try c.boot.vhd.validate(io, file);
     var buffer: [32768]u8 = undefined;
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = c.boot.files.Sha256.init(.{});
     var offset: u64 = 0;
     while (offset < c.raw_bytes) {
         const count: usize = @intCast(@min(buffer.len, c.raw_bytes - offset));

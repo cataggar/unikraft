@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("hyperv_core");
 const c = @import("config.zig");
 const linux = std.os.linux;
+pub const Sha256 = @import("sha256.zig").Sha256;
 
 pub const Pin = struct { size: u64, sha256: [32]u8 };
 pub const Artifact = struct {
@@ -62,7 +63,7 @@ pub const Set = struct {
 
 pub fn digest(io: std.Io, file: std.Io.File, before: core.private_files.Snapshot) ![32]u8 {
     if (!core.private_files.sameSnapshot(before, try core.private_files.snapshot(file))) return error.ArtifactChanged;
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var sha = Sha256.init(.{});
     var buffer: [32 * 1024]u8 = undefined;
     var position: u64 = 0;
     while (position < before.size) {
@@ -81,7 +82,7 @@ pub fn copy(io: std.Io, artifact: Artifact, directory: std.Io.Dir, name: []const
     defer output.close(io);
     var buffer: [32 * 1024]u8 = undefined;
     var position: u64 = 0;
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var sha = Sha256.init(.{});
     while (position < artifact.pin.size) {
         const length: usize = @intCast(@min(buffer.len, artifact.pin.size - position));
         if (try artifact.file.readPositionalAll(io, buffer[0..length], position) != length) return error.ArtifactChanged;
