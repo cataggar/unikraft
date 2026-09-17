@@ -67,13 +67,15 @@ GUARDED_CONTRACT_SCHEMA = (
 )
 GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
 GUARDED_PRODUCER_SCHEMA_VERSION = 4
+# Keep these independently enforced pins aligned with the reviewed controller
+# source set; this does not expand the guarded platform-only contract.
 GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "53b1b87eb2ffab827678dc78bb9412d1487506bd4498279b4e1232eb41c3fbe5"
+            "471df909a913bde0269271dd6a42956cc92e702cd3b4cf47a80d8888171d2502"
         ),
-        "size": 1757829,
+        "size": 1761719,
         "files": 215,
     },
     "support/kconfig": {
@@ -174,7 +176,7 @@ GUARDED_PRODUCER_FILES = {
         "126c878df99bef797d3ccf03f6e011ba326b998d78bedb42d961dac53336f1ac"
     ),
     "support/build/hyperv-proof-disasm.zig": (
-        "5968de57f412d9dbf2ec4a16bbb16237d56ac198be81bb712a915fc8d31400e7"
+        "17102f939527f340d8db18911536de9388b829865ce37cc492364340082b342a"
     ),
     "support/build/hyperv-proof-fixtures.zig": (
         "4ebe7456ea3c9aede8e3e3376d54b2e80c1995cffe3587dd17d44af7e7ee06bf"
@@ -219,7 +221,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "b34a9e1cc4a942ec13379881eea68e1d32b24de1b3c2484ccdd0f56e3a5ef0e1"
+        "38c9a402dd23c7e46a3bb61c522b49961a367c17e61c7cdfd55ca4d4dda77b09"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -303,7 +305,7 @@ GUARDED_PRODUCER_FILES = {
         "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
     ),
     "support/build/native-image-data.zig": (
-        "8800b7373be0a4e995d259fdf3369476d028b322a589ff03e49762a705ba4d9a"
+        "c51c41d14050bfbdaa3ccca99f75c61d1e62eed2b4946fc58a0726f79e8d0a6d"
     ),
     "support/build/native-kconfig-bridge.c": (
         "457137bfa280d69f8c3c819ca059c20b76a6c5dcb190575d10a7e5b1ea05f93a"
@@ -312,7 +314,7 @@ GUARDED_PRODUCER_FILES = {
         "562a0b713e67e6e3de6897077f6bd18cc0ee135b8522bfaecd6d8c11a61423fe"
     ),
     "support/build/native-lto.zig": (
-        "cb5a2c661288b243ce97246c27e5c3a6b8b33aa9c037fdb263a42a1774aaba4a"
+        "c1c75f1364efe3a84da48f5fb399030822901262d0e6c728529e89341e72b63d"
     ),
     "support/build/native-make-environment.zig": (
         "7db2a3cefd9576efa62e66453d3ff59dabfdc5ae8ae391f1f8cc08f5362eec51"
@@ -468,7 +470,7 @@ GUARDED_PRODUCER_FILES = {
         "3b97fcf27fa0a76b93e565b770bb2b1d8b0d7496267387039b6c88d0e1a1cce1"
     ),
     "support/build/native-image-graph.zig": (
-        "503321662757432253b462a3bcb0e85403d3cf871b5fbb1f846921a6f966e463"
+        "24b15c23cc7dc70c880e4fd9d302a58d2823cf2b085fe8a616c8f8317aea18e5"
     ),
     "support/build/native-postprocess-runner.py": (
         "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"

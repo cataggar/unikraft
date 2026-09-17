@@ -1942,7 +1942,7 @@ fn registerNativeGraph(
     const profile_name = b.option(
         []const u8,
         "native-profile",
-        "Registered native graph: qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, or hyperv-x86_64-efi-netvsc",
+        "Registered native graph: qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, hyperv-x86_64-efi-netvsc, or hyperv-x86_64-efi-wamr",
     ) orelse b.option(
         []const u8,
         "native-qemu-graph",
@@ -2218,7 +2218,8 @@ fn finishNativeImages(
 ) *std.Build.Step {
     var validated_link_output = link_output;
     if (registered.profile == .@"hyperv-x86_64-efi" or
-        registered.profile == .@"hyperv-x86_64-efi-netvsc")
+        registered.profile == .@"hyperv-x86_64-efi-netvsc" or
+        registered.profile == .@"hyperv-x86_64-efi-wamr")
     {
         const max_cpu_prefix = "CONFIG_UKPLAT_CPU_MAXCOUNT=";
         var max_cpus: []const u8 = "1";
@@ -2438,6 +2439,16 @@ fn nativeProfileMatchesConfig(
 ) bool {
     const architecture = nativeConfigValue(config, "CONFIG_UK_ARCH") orelse return false;
     return switch (profile) {
+        .@"hyperv-x86_64-efi-wamr" => nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", config) and
+            nativeConfigEnabled(config, "CONFIG_APPWAMRAOT") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKVMEM") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKPAGING_STATS") and
+            !nativeConfigEnabled(config, "CONFIG_LIBUKPAGING_5LEVEL") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKFALLOCBUDDY") and
+            std.mem.eql(u8, nativeConfigValue(config, "CONFIG_UKPLAT_CPU_MAXCOUNT") orelse "", "1") and
+            !nativeConfigEnabled(config, "CONFIG_LIBNETVSC") and
+            !nativeConfigEnabled(config, "CONFIG_LIBSTORVSC") and
+            !nativeConfigEnabled(config, "CONFIG_APPHYPERVACCEPTANCE"),
         .@"qemu-x86_64" => nativeConfigEnabled(config, "CONFIG_PLAT_KVM") and
             std.mem.eql(u8, architecture, "x86_64") and
             nativeConfigEnabled(config, "CONFIG_KVM_BOOT_PROTO_MULTIBOOT"),
@@ -2585,6 +2596,32 @@ test "LTO mode detection from solved config" {
     };
     const sq = configQuery(&standard_config);
     try std.testing.expectEqual(native_lto.LinkMode.standard, native_lto.LinkMode.detect(sq));
+}
+
+test "native WAMR profile requires initialized-capable VM and a single CPU" {
+    const wamr_config = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_HYPERV=y
+        \\CONFIG_OPTIMIZE_PIE=y
+        \\CONFIG_LIBUKPAGING=y
+        \\CONFIG_APPWAMRAOT=y
+        \\CONFIG_LIBUKVMEM=y
+        \\CONFIG_LIBUKPAGING_STATS=y
+        \\CONFIG_LIBUKFALLOCBUDDY=y
+        \\CONFIG_UKPLAT_CPU_MAXCOUNT=1
+        \\
+    };
+    try std.testing.expect(nativeProfileMatchesConfig(.@"hyperv-x86_64-efi-wamr", &wamr_config));
+    for ([_][]const u8{
+        "CONFIG_LIBUKVMEM=y",        "CONFIG_LIBUKPAGING_STATS=y",
+        "CONFIG_LIBUKFALLOCBUDDY=y", "CONFIG_UKPLAT_CPU_MAXCOUNT=1",
+        "CONFIG_APPWAMRAOT=y",
+    }) |setting| {
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, wamr_config.source, setting, "");
+        defer std.testing.allocator.free(changed);
+        const missing = NativeConfig{ .source = changed };
+        try std.testing.expect(!nativeProfileMatchesConfig(.@"hyperv-x86_64-efi-wamr", &missing));
+    }
 }
 
 test "LTO rejects ARM64 profile" {

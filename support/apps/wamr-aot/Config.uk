@@ -1,0 +1,11 @@
+menuconfig APPWAMRAOT
+	bool "Compiler-free native WAMR AOT correctness application"
+	default y
+	depends on PLAT_HYPERV && ARCH_X86_64
+	select LIBNOLIBC
+	select LIBUKALLOC
+	select LIBUKVMEM
+	select LIBUKPAGING_STATS
+	help
+	  Run trusted, source-pinned precompiled code and native memory checks.
+	  No guest filesystem, network, compiler, or benchmark acceptance.
