@@ -316,12 +316,19 @@ symlinks, hardlinks, special files and unsupported custody. Worker compilation
 precedes this baseline and is not claimed to have that same compile-time
 bookend. No worker or parent content is hashed by these preparatory operations.
 
-Only the opt-in actual parent exports nonexecuting `.uk.persistence.build`
-data. It records that compilation's `builtin` backend, optimize mode, full CPU
+Only the opt-in actual parent exports nonexecuting `.note.uk.persistence.build`
+data. A declaration-level section and a bounded native ELF-note envelope retain
+the data without changing compiler or linker flags. LLVM produces `SHT_NOTE`;
+the self-hosted x86 Debug backend produces nonexecuting `PROGBITS` and a local
+symbol, which the reader accepts only for that exact reported backend/mode.
+The reader validates section, symbol, load bounds, note header and padding.
+It records that compilation's `builtin` backend, optimize mode, full CPU
 model/baseline/resolved features, OS/version/ABI/object target and exposed flags.
 The report separately records configured nullable/default options, the test
 seed and configured module graph. Unexposed effective options are listed as
 unavailable; a null configured setting is not reported as observed false.
+Configured compiler-runtime optimization, incremental settings and effective
+build-ID selection are also bound, including explicit/default distinctions.
 The static data can change binary bytes/layout and is not a claim of equivalence
 to an earlier parent. Default parent and installed/exported production roots
 exclude the export and diagnostic dependencies.

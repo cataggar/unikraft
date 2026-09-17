@@ -2174,6 +2174,8 @@ class HypervWorkflowTest(unittest.TestCase):
             '|| fixture_result=$?',
             'if [ "${fixture_result}" -ne 0 ]; then exit "${fixture_result}"; fi',
             "set -C;",
+            "|| marker_result=$?",
+            'if [ "${marker_result}" -ne 0 ]; then exit "${marker_result}"; fi',
         ):
             self.assertIn(required, fixture)
         retained = job.split("    - name: Collect exact persistence parent build evidence\n", 1)[1].split("\n    - name:", 1)[0]
@@ -2192,6 +2194,25 @@ class HypervWorkflowTest(unittest.TestCase):
         self.assertNotIn("zig-local-cache/**/hyperv-persistence-worker-fixture", upload)
         for forbidden in ("continue-on-error:", "|| true", "-Dtest-filter="):
             self.assertNotIn(forbidden, fixture)
+
+    def test_persistence_exit_marker_failure_preserves_original_primary(self):
+        workflow = (SUPPORT.parent / ".github/workflows/integration.yaml").read_text()
+        fixture = workflow.split("    - name: Run native Hyper-V persistence engine fixtures\n", 1)[1].split("\n    - name:", 1)[0]
+        marker = fixture.split("          marker_result=0\n", 1)[1].split("          result=0\n", 1)[0]
+        for primary in (0, 137):
+            with self.subTest(primary=primary), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp) / "Debug"
+                work.mkdir()
+                (work / "fixture-build-exit.txt").write_bytes(b"prior immutable record\n")
+                command = (
+                    "set -euo pipefail\n"
+                    'root="$1"\nmode=Debug\n'
+                    f"fixture_result={primary}\nmarker_result=0\n"
+                    + marker
+                )
+                result = subprocess.run(["bash", "-c", command, "--", tmp], capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, primary or 1)
+                self.assertEqual((work / "fixture-build-exit.txt").read_bytes(), b"prior immutable record\n")
 
     def test_persistence_build_retention_calls_only_existing_collector(self):
         helper = SUPPORT.parent / ".github/scripts/hyperv-persistence-build-evidence.sh"

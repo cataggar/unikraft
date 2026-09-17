@@ -129,10 +129,23 @@ fn encode() Encoded {
 const encoded = encode();
 pub const payload = encoded.bytes[0..encoded.len].*;
 
+// LLVM emits SHT_NOTE, which the native ELF linker retains without references.
+// The x86 self-hosted Debug backend emits retained PROGBITS instead. Both carry
+// the same bounded, nonexecuting note record; the collector checks the backend.
+pub const transport align(schema.note_alignment) linksection(schema.section_name) = extern struct {
+    header: std.elf.Elf64_Nhdr = .{
+        .n_namesz = schema.note_name.len,
+        .n_descsz = payload.len,
+        .n_type = schema.note_type,
+    },
+    name: [schema.note_name.len]u8 = schema.note_name.*,
+    description: [std.mem.alignForward(usize, payload.len, schema.note_alignment)]u8 =
+        payload ++ [_]u8{0} ** ((schema.note_alignment - payload.len % schema.note_alignment) % schema.note_alignment),
+}{};
+
 pub fn exportSection() void {
-    @export(&payload, .{
-        .name = "uk_persistence_fixture_parent_build",
-        .section = schema.section_name,
+    @export(&transport, .{
+        .name = schema.symbol_name,
         .linkage = .strong,
     });
 }

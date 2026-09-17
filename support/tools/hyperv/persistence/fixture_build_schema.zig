@@ -1,7 +1,13 @@
 //! Private fixture build capture. No production or admission interface.
 const std = @import("std");
 
-pub const section_name = ".uk.persistence.build";
+pub const section_name = ".note.uk.persistence.build";
+pub const symbol_name = "uk_persistence_fixture_parent_build";
+pub const note_name = "UKP\x00";
+pub const note_type: u32 = 0x554b0001;
+pub const note_alignment = 4;
+pub const note_prefix_bytes = @sizeOf(std.elf.Elf64_Nhdr) + note_name.len;
+pub const max_note_bytes = note_prefix_bytes + std.mem.alignForward(usize, max_metadata_bytes, note_alignment);
 pub const max_parent_bytes: u64 = 96 * 1024 * 1024;
 pub const max_raw_worker_bytes: u64 = 64 * 1024 * 1024;
 pub const max_selected_worker_bytes: u64 = 16 * 1024 * 1024;

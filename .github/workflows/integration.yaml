@@ -867,8 +867,10 @@ jobs:
               -Doptimize="${mode}" -j2 \
               test test-arm test-strip-equivalence test-strip-proof test-build-evidence install --summary all \
               2>&1 | tee "${root}/${mode}/fixtures.log" || fixture_result=$?
-          (set -C; printf '%s\n' "${fixture_result}" > "${root}/${mode}/fixture-build-exit.txt")
+          marker_result=0
+          (set -C; printf '%s\n' "${fixture_result}" > "${root}/${mode}/fixture-build-exit.txt") || marker_result=$?
           if [ "${fixture_result}" -ne 0 ]; then exit "${fixture_result}"; fi
+          if [ "${marker_result}" -ne 0 ]; then exit "${marker_result}"; fi
           result=0
           "${root}/${mode}/out/bin/uk-hyperv-persistence-engine" run \
             > "${root}/${mode}/stdout" 2> "${root}/${mode}/stderr" \

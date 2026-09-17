@@ -310,6 +310,11 @@ const QueryVersion = struct {
 fn configuredJson(b: *std.Build, compile: *std.Build.Step.Compile, graph: []const CapturedModule) []const u8 {
     const metadata = @import("fixture_parent_metadata.zig");
     const m = compile.root_module;
+    const build_id = compile.build_id orelse b.build_id;
+    const build_id_hex = if (build_id) |value| switch (value) {
+        .hexstring => |hex| std.fmt.allocPrint(b.allocator, "{x}", .{hex.toSlice()}) catch @panic("cannot serialize build ID"),
+        else => @as(?[]const u8, null),
+    } else null;
     const resolved = m.resolved_target.?;
     const q = resolved.query;
     const explicit_model: ?struct {
@@ -355,6 +360,12 @@ fn configuredJson(b: *std.Build, compile: *std.Build.Step.Compile, graph: []cons
         .resolved_target = metadata.Target{ .value = resolved.result },
         .compile = .{
             .kind = compile.kind,
+            .debug_compiler_runtime_libs = b.graph.debug_compiler_runtime_libs,
+            .incremental = b.graph.incremental,
+            .debug_incremental = b.debug_incremental,
+            .build_id_kind = if (build_id) |value| @tagName(value) else null,
+            .build_id_hex = build_id_hex,
+            .build_id_override = compile.build_id != null,
             .use_llvm = compile.use_llvm,
             .use_lld = compile.use_lld,
             .use_new_linker = compile.use_new_linker,

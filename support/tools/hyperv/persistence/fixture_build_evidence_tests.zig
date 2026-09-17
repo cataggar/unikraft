@@ -379,10 +379,18 @@ test "post-run worker proof is rederived from exact synthetic ELF pair not accep
 
 // Data-only ELF samples exercise the parser. None is executed or represented as
 // a qualification run of the real parent, toolchain, or persistence fixtures.
+const parent_names = "\x00.shstrtab\x00" ++ schema.section_name ++ "\x00.symtab\x00.strtab\x00";
+const parent_symbol_names = "\x00" ++ schema.symbol_name ++ "\x00";
+const parent_names_offset = 448;
+const parent_symbol_names_offset = parent_names_offset + parent_names.len;
+const parent_symbols_offset = std.mem.alignForward(usize, parent_symbol_names_offset + parent_symbol_names.len, 8);
+const parent_note_offset = parent_symbols_offset + 48;
+const parent_note_section = 256;
+const parent_address = 0x1000000;
+
 fn parentImage(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
-    const names = "\x00.shstrtab\x00.uk.persistence.build\x00";
-    const payload_offset = 256 + names.len;
-    const bytes = try allocator.alloc(u8, payload_offset + payload.len);
+    const note_size = schema.note_prefix_bytes + std.mem.alignForward(usize, payload.len, schema.note_alignment);
+    const bytes = try allocator.alloc(u8, parent_note_offset + note_size);
     @memset(bytes, 0);
     @memcpy(bytes[0..7], "\x7fELF\x02\x01\x01");
     put(u16, bytes, 16, 2);
@@ -392,23 +400,58 @@ fn parentImage(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
         else => unreachable,
     });
     put(u32, bytes, 20, 1);
-    put(u64, bytes, 40, 64);
+    put(u64, bytes, 32, 64);
+    put(u64, bytes, 40, 128);
     put(u16, bytes, 52, 64);
+    put(u16, bytes, 54, 56);
+    put(u16, bytes, 56, 1);
     put(u16, bytes, 58, 64);
-    put(u16, bytes, 60, 3);
+    put(u16, bytes, 60, 5);
     put(u16, bytes, 62, 1);
-    put(u32, bytes, 128, 1);
-    put(u32, bytes, 132, std.elf.SHT_STRTAB);
-    put(u64, bytes, 152, 256);
-    put(u64, bytes, 160, names.len);
-    put(u64, bytes, 176, 1);
-    put(u32, bytes, 192, 11);
-    put(u32, bytes, 196, std.elf.SHT_PROGBITS);
-    put(u64, bytes, 216, payload_offset);
-    put(u64, bytes, 224, payload.len);
+    put(u32, bytes, 64, std.elf.PT_LOAD);
+    put(u32, bytes, 68, std.elf.PF_R);
+    put(u64, bytes, 80, parent_address);
+    put(u64, bytes, 96, bytes.len);
+    put(u64, bytes, 104, bytes.len);
+    put(u64, bytes, 112, 4096);
+    put(u32, bytes, 192, 1);
+    put(u32, bytes, 196, std.elf.SHT_STRTAB);
+    put(u64, bytes, 216, parent_names_offset);
+    put(u64, bytes, 224, parent_names.len);
     put(u64, bytes, 240, 1);
-    @memcpy(bytes[256..][0..names.len], names);
-    @memcpy(bytes[payload_offset..], payload);
+    put(u32, bytes, parent_note_section, 11);
+    put(u32, bytes, parent_note_section + 4, std.elf.SHT_NOTE);
+    put(u64, bytes, parent_note_section + 8, std.elf.SHF_ALLOC);
+    put(u64, bytes, parent_note_section + 16, parent_address + parent_note_offset);
+    put(u64, bytes, parent_note_section + 24, parent_note_offset);
+    put(u64, bytes, parent_note_section + 32, note_size);
+    put(u64, bytes, parent_note_section + 48, schema.note_alignment);
+    put(u32, bytes, 320, 12 + schema.section_name.len);
+    put(u32, bytes, 324, std.elf.SHT_SYMTAB);
+    put(u64, bytes, 344, parent_symbols_offset);
+    put(u64, bytes, 352, 48);
+    put(u32, bytes, 360, 4);
+    put(u32, bytes, 364, 1);
+    put(u64, bytes, 368, 8);
+    put(u64, bytes, 376, 24);
+    put(u32, bytes, 384, 20 + schema.section_name.len);
+    put(u32, bytes, 388, std.elf.SHT_STRTAB);
+    put(u64, bytes, 408, parent_symbol_names_offset);
+    put(u64, bytes, 416, parent_symbol_names.len);
+    put(u64, bytes, 432, 1);
+    @memcpy(bytes[parent_names_offset..][0..parent_names.len], parent_names);
+    @memcpy(bytes[parent_symbol_names_offset..][0..parent_symbol_names.len], parent_symbol_names);
+    const symbol = parent_symbols_offset + 24;
+    put(u32, bytes, symbol, 1);
+    bytes[symbol + 4] = @as(u8, std.elf.STB_GLOBAL) << 4 | std.elf.STT_OBJECT;
+    put(u16, bytes, symbol + 6, 2);
+    put(u64, bytes, symbol + 8, parent_address + parent_note_offset);
+    put(u64, bytes, symbol + 16, note_size);
+    put(u32, bytes, parent_note_offset, schema.note_name.len);
+    put(u32, bytes, parent_note_offset + 4, @intCast(payload.len));
+    put(u32, bytes, parent_note_offset + 8, schema.note_type);
+    @memcpy(bytes[parent_note_offset + @sizeOf(std.elf.Elf64_Nhdr) ..][0..schema.note_name.len], schema.note_name);
+    @memcpy(bytes[parent_note_offset + schema.note_prefix_bytes ..][0..payload.len], payload);
     return bytes;
 }
 
@@ -446,6 +489,12 @@ fn syntheticConfigured(allocator: std.mem.Allocator) ![]const u8 {
         },
         .resolved_target = target,
         .compile = .{
+            .debug_compiler_runtime_libs = null,
+            .incremental = null,
+            .debug_incremental = false,
+            .build_id_kind = null,
+            .build_id_hex = null,
+            .build_id_override = false,
             .kind = "test",
             .use_llvm = null,
             .use_lld = null,
@@ -489,7 +538,7 @@ fn syntheticConfigured(allocator: std.mem.Allocator) ![]const u8 {
     return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
-test "synthetic parent ELF metadata uses its section rejects malformed bounds and closed schema" {
+test "synthetic parent ELF metadata uses its note rejects malformed bounds and closed schema" {
     var fixture = try Case.init();
     defer fixture.close();
     var request = try fixture.request();
@@ -509,6 +558,76 @@ test "synthetic parent ELF metadata uses its section rejects malformed bounds an
     const extra_payload = try std.json.Stringify.valueAlloc(fixture.allocator(), parent, .{});
     const extra = try parentImage(fixture.allocator(), extra_payload);
     try t.expectError(error.InvalidBuildMetadata, evidence.parentMetadata(fixture.allocator(), extra, request));
+}
+
+test "synthetic note transport rejects missing duplicate unloaded executable and ambiguous metadata" {
+    var fixture = try Case.init();
+    defer fixture.close();
+    const request = try fixture.request();
+    const payload = &@import("fixture_parent_metadata.zig").payload;
+    const original = try parentImage(fixture.allocator(), payload);
+    const mutations = [_]struct { offset: usize, width: enum { byte, word, wide }, value: u64 }{
+        .{ .offset = parent_note_section, .width = .word, .value = 1 },
+        .{ .offset = parent_note_section + 4, .width = .word, .value = std.elf.SHT_NOBITS },
+        .{ .offset = parent_note_section + 8, .width = .wide, .value = 0 },
+        .{ .offset = parent_note_section + 8, .width = .wide, .value = std.elf.SHF_ALLOC | std.elf.SHF_EXECINSTR },
+        .{ .offset = parent_note_section + 8, .width = .wide, .value = std.elf.SHF_ALLOC | std.elf.SHF_WRITE },
+        .{ .offset = parent_note_section + 16, .width = .wide, .value = parent_address + parent_note_offset + 4 },
+        .{ .offset = parent_note_section + 48, .width = .wide, .value = 8 },
+        .{ .offset = 68, .width = .word, .value = std.elf.PF_R | std.elf.PF_X },
+        .{ .offset = 96, .width = .wide, .value = parent_note_offset },
+        .{ .offset = parent_note_offset, .width = .word, .value = schema.note_name.len - 1 },
+        .{ .offset = parent_note_offset + 4, .width = .word, .value = 0 },
+        .{ .offset = parent_note_offset + 4, .width = .word, .value = schema.max_metadata_bytes + 1 },
+        .{ .offset = parent_note_offset + 4, .width = .word, .value = std.math.maxInt(u32) },
+        .{ .offset = parent_note_offset + 8, .width = .word, .value = schema.note_type + 1 },
+        .{ .offset = parent_note_offset + 12, .width = .byte, .value = 'X' },
+        .{ .offset = parent_note_offset + 15, .width = .byte, .value = 'X' },
+        .{ .offset = parent_symbols_offset + 24, .width = .word, .value = 0 },
+        .{ .offset = parent_symbols_offset + 28, .width = .byte, .value = @as(u8, std.elf.STB_GLOBAL) << 4 | std.elf.STT_FUNC },
+        .{ .offset = parent_symbols_offset + 28, .width = .byte, .value = std.elf.STT_OBJECT },
+        .{ .offset = parent_symbols_offset + 29, .width = .byte, .value = 2 },
+        .{ .offset = parent_symbols_offset + 30, .width = .byte, .value = 1 },
+        .{ .offset = parent_symbols_offset + 32, .width = .wide, .value = parent_address + parent_note_offset + 4 },
+        .{ .offset = parent_symbols_offset + 40, .width = .wide, .value = payload.len },
+    };
+    for (mutations) |mutation| {
+        const bytes = try fixture.allocator().dupe(u8, original);
+        switch (mutation.width) {
+            .byte => bytes[mutation.offset] = @intCast(mutation.value),
+            .word => put(u32, bytes, mutation.offset, @intCast(mutation.value)),
+            .wide => put(u64, bytes, mutation.offset, mutation.value),
+        }
+        if (evidence.parentMetadata(fixture.allocator(), bytes, request)) |_| return error.AcceptedInvalidTransport else |_| {}
+    }
+    const duplicate_section = try fixture.allocator().dupe(u8, original);
+    put(u32, duplicate_section, 192, 11);
+    try t.expectError(error.DuplicateSection, evidence.parentMetadata(fixture.allocator(), duplicate_section, request));
+    const duplicate_symbol = try fixture.allocator().dupe(u8, original);
+    @memcpy(duplicate_symbol[parent_symbols_offset..][0..24], original[parent_symbols_offset + 24 ..][0..24]);
+    try t.expectError(error.DuplicateSymbol, evidence.parentMetadata(fixture.allocator(), duplicate_symbol, request));
+    const padded_payload = try std.mem.concat(fixture.allocator(), u8, &.{ payload, " " ** (4 - payload.len % 4), " " });
+    const padding = try parentImage(fixture.allocator(), padded_payload);
+    _ = try evidence.parentMetadata(fixture.allocator(), padding, request);
+    padding[padding.len - 1] = 1;
+    try t.expectError(error.InvalidBuildMetadata, evidence.parentMetadata(fixture.allocator(), padding, request));
+    const trailing = try parentImage(fixture.allocator(), try std.mem.concat(fixture.allocator(), u8, &.{ payload, "    " }));
+    put(u32, trailing, parent_note_offset + 4, @intCast(payload.len));
+    try t.expectError(error.InvalidBuildMetadata, evidence.parentMetadata(fixture.allocator(), trailing, request));
+}
+
+test "synthetic PROGBITS transport is limited to the self hosted x86 Debug representation" {
+    var fixture = try Case.init();
+    defer fixture.close();
+    const request = try fixture.request();
+    const bytes = try parentImage(fixture.allocator(), &@import("fixture_parent_metadata.zig").payload);
+    put(u32, bytes, parent_note_section + 4, std.elf.SHT_PROGBITS);
+    put(u64, bytes, parent_note_section + 8, std.elf.SHF_ALLOC | std.elf.SHF_WRITE);
+    bytes[parent_symbols_offset + 28] = std.elf.STT_OBJECT;
+    const builtin = @import("builtin");
+    if (builtin.zig_backend == .stage2_x86_64 and builtin.mode == .Debug) {
+        _ = try evidence.parentMetadata(fixture.allocator(), bytes, request);
+    } else try t.expectError(error.InvalidBuildMetadata, evidence.parentMetadata(fixture.allocator(), bytes, request));
 }
 
 test "synthetic collection retains exact bytes full envelopes and failed original status without admission" {

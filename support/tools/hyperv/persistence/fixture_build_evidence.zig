@@ -849,9 +849,10 @@ pub fn configuredMetadata(a: std.mem.Allocator, bytes: []const u8) !std.json.Val
     try literal(value.object.get("target_query").?.object.get("dynamic_linker_path").?, "omitted_path");
     try validateTarget(value.object.get("resolved_target").?);
     try objectFields(value.object.get("compile").?, &.{
-        "kind",               "use_llvm",         "use_lld",                "use_new_linker",     "linkage",                 "pie",                "lto",             "stack_size",
-        "rdynamic",           "link_gc_sections", "link_function_sections", "link_data_sections", "compress_debug_sections", "bundle_compiler_rt", "bundle_ubsan_rt", "zig_lib_dir_override",
-        "custom_test_runner",
+        "debug_compiler_runtime_libs", "incremental",        "debug_incremental", "build_id_kind",        "build_id_hex",           "build_id_override",
+        "kind",                        "use_llvm",           "use_lld",           "use_new_linker",       "linkage",                "pie",
+        "lto",                         "stack_size",         "rdynamic",          "link_gc_sections",     "link_function_sections", "link_data_sections",
+        "compress_debug_sections",     "bundle_compiler_rt", "bundle_ubsan_rt",   "zig_lib_dir_override", "custom_test_runner",
     });
     try literal(value.object.get("compile").?.object.get("kind").?, "test");
     try objectFields(value.object.get("root_module").?, &.{
@@ -869,15 +870,53 @@ pub fn parentMetadata(a: std.mem.Allocator, bytes: []const u8, request: schema.R
     var image = try elf.Image.parse(a, bytes);
     defer image.deinit();
     const section = try image.section(schema.section_name);
-    if (section.header.sh_type != std.elf.SHT_PROGBITS or section.header.sh_size == 0 or
-        section.header.sh_size > schema.max_metadata_bytes) return error.InvalidBuildMetadata;
-    const value = try parse(std.json.Value, a, try image.sectionData(section));
+    const sh = section.header;
+    if ((sh.sh_type != std.elf.SHT_NOTE and sh.sh_type != std.elf.SHT_PROGBITS) or
+        sh.sh_size < schema.note_prefix_bytes or sh.sh_size > schema.max_note_bytes or
+        sh.sh_addralign != schema.note_alignment or sh.sh_addr % schema.note_alignment != 0 or
+        sh.sh_offset % schema.note_alignment != 0 or
+        sh.sh_flags & ~@as(u64, std.elf.SHF_ALLOC | std.elf.SHF_WRITE) != 0 or
+        (sh.sh_type == std.elf.SHT_NOTE and sh.sh_flags & std.elf.SHF_WRITE != 0))
+        return error.InvalidBuildMetadata;
+    try image.requireLoadedSection(section);
+    for (image.programs) |program| {
+        if (program.p_type == std.elf.PT_LOAD and program.p_flags & std.elf.PF_X != 0 and
+            sh.sh_addr < program.p_vaddr + program.p_memsz and program.p_vaddr < sh.sh_addr + sh.sh_size)
+            return error.InvalidBuildMetadata;
+    }
+    if (try image.symbol(schema.symbol_name) != sh.sh_addr) return error.InvalidBuildMetadata;
+    for (image.symbols) |symbol| {
+        if (!std.mem.eql(u8, symbol.name, schema.symbol_name)) continue;
+        const sym = symbol.header;
+        const binding = sym.st_info >> 4;
+        // The self-hosted linker localizes this export in its final executable.
+        if (sym.st_info & 15 != std.elf.STT_OBJECT or
+            (binding != std.elf.STB_GLOBAL and !(sh.sh_type == std.elf.SHT_PROGBITS and binding == std.elf.STB_LOCAL)) or sym.st_other != 0 or
+            sym.st_size != sh.sh_size or sym.st_shndx >= image.sections.len or
+            !std.mem.eql(u8, image.sections[sym.st_shndx].name, schema.section_name))
+            return error.InvalidBuildMetadata;
+    }
+    const data = try image.sectionData(section);
+    const note = try elf.structure(std.elf.Elf64_Nhdr, data, 0, image.header.endian);
+    if (note.n_namesz != schema.note_name.len or note.n_type != schema.note_type or
+        note.n_descsz == 0 or note.n_descsz > schema.max_metadata_bytes or
+        data.len != schema.note_prefix_bytes + std.mem.alignForward(usize, note.n_descsz, schema.note_alignment) or
+        !std.mem.eql(u8, data[@sizeOf(std.elf.Elf64_Nhdr)..schema.note_prefix_bytes], schema.note_name))
+        return error.InvalidBuildMetadata;
+    const end = schema.note_prefix_bytes + note.n_descsz;
+    for (data[end..]) |byte| if (byte != 0) return error.InvalidBuildMetadata;
+    const value = try parse(std.json.Value, a, data[schema.note_prefix_bytes..end]);
     try objectFields(value, &.{ "schema", "role", "origin", "observed" });
     try literal(value.object.get("schema").?, "hyperv_persistence_fixture_parent_build_v1");
     try literal(value.object.get("role").?, "persistence_main_test_parent");
     try literal(value.object.get("origin").?, "actual_tests_zig_compile_builtin");
     const observed = value.object.get("observed").?;
     if (observed != .object) return error.InvalidBuildMetadata;
+    if (sh.sh_type == std.elf.SHT_PROGBITS) {
+        if (image.header.machine != .X86_64) return error.InvalidBuildMetadata;
+        try literal(observed.object.get("zig_backend") orelse return error.InvalidBuildMetadata, "stage2_x86_64");
+        try literal(observed.object.get("mode") orelse return error.InvalidBuildMetadata, "Debug");
+    }
     var iterator = observed.object.iterator();
     while (iterator.next()) |entry| {
         if (!knownName(entry.key_ptr.*, &observed_names) and

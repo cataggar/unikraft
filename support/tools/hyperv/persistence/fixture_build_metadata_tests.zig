@@ -17,6 +17,23 @@ test "static serialization is bounded JSON with explicit compilation origin" {
     try noPaths(value);
 }
 
+test "native transport is a single aligned ELF note wrapping the unchanged JSON payload" {
+    const transport = std.mem.asBytes(&metadata.transport);
+    const header = metadata.transport.header;
+    try t.expectEqual(schema.note_name.len, header.n_namesz);
+    try t.expectEqual(metadata.payload.len, header.n_descsz);
+    try t.expectEqual(schema.note_type, header.n_type);
+    try t.expectEqualStrings(schema.note_name, &metadata.transport.name);
+    try t.expectEqualSlices(u8, &metadata.payload, metadata.transport.description[0..header.n_descsz]);
+    try t.expectEqual(@as(usize, 0), transport.len % schema.note_alignment);
+    try t.expectEqual(schema.note_prefix_bytes + metadata.transport.description.len, transport.len);
+    try t.expect(transport.len <= schema.max_note_bytes);
+    for (metadata.transport.description[header.n_descsz..]) |byte| try t.expectEqual(@as(u8, 0), byte);
+    const source = @embedFile("fixture_parent_metadata.zig");
+    try t.expect(std.mem.indexOf(u8, source, "linksection(schema.section_name)") != null);
+    try t.expect(std.mem.indexOf(u8, source, ".section =") == null);
+}
+
 test "CPU serialization preserves model baseline and every resolved feature and bit" {
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, &metadata.payload, .{});
     defer parsed.deinit();
