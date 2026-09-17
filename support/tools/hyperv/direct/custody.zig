@@ -4,7 +4,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("hyperv_core");
-const direct = @import("main.zig");
+const profile = @import("profile.zig");
+const direct = profile.contract;
 const files = core.private_files;
 const linux = std.os.linux;
 
@@ -18,6 +19,7 @@ pub const record_limit = 4 * 1024 * 1024;
 pub const Phase = enum {
     @"local-admission",
     @"seed-consumed",
+    @"attempt-consumed",
     @"group-create-intent",
     @"os-create-intent",
     @"os-grant-intent",
@@ -34,6 +36,7 @@ pub const Phase = enum {
     @"boot2-evidence-complete",
     @"final-deallocate-intent",
     @"persistence-evidence-complete",
+    @"compute-evidence-complete",
     @"cleanup-intent",
     @"cleanup-delete-intent",
 };
@@ -44,30 +47,37 @@ pub const Identities = struct {
     vm_uuid: []const u8,
     os_id: []const u8,
     os_uuid: []const u8,
-    data_id: []const u8,
-    data_uuid: []const u8,
+    data_id: if (profile.compute) ?[]const u8 else []const u8,
+    data_uuid: if (profile.compute) ?[]const u8 else []const u8,
 
     fn validate(self: Identities) !void {
-        inline for (std.meta.fields(Identities)) |field|
-            if (@field(self, field.name).len == 0) return error.MissingIdentity;
+        inline for (std.meta.fields(Identities)) |field| {
+            const value = @field(self, field.name);
+            if (comptime @typeInfo(field.type) == .optional) {
+                if (value != null) return error.UnexpectedDataDisk;
+            } else if (value.len == 0) return error.MissingIdentity;
+        }
     }
 
     fn equal(a: Identities, b: Identities) bool {
-        inline for (std.meta.fields(Identities)) |field|
-            if (!std.mem.eql(u8, @field(a, field.name), @field(b, field.name))) return false;
+        inline for (std.meta.fields(Identities)) |field| {
+            if (comptime @typeInfo(field.type) == .optional) {
+                if (@field(a, field.name) != null or @field(b, field.name) != null) return false;
+            } else if (!std.mem.eql(u8, @field(a, field.name), @field(b, field.name))) return false;
+        }
         return true;
     }
 
     fn clone(self: Identities, allocator: std.mem.Allocator) !Identities {
         var result: Identities = undefined;
         inline for (std.meta.fields(Identities)) |field|
-            @field(result, field.name) = try allocator.dupe(u8, @field(self, field.name));
+            @field(result, field.name) = if (comptime @typeInfo(field.type) == .optional) null else try allocator.dupe(u8, @field(self, field.name));
         return result;
     }
 };
 
-pub const CaptureRecord = struct {
-    schema: []const u8 = "uk.hyperv.direct-serial-capture",
+pub const CaptureRecord = if (profile.compute) direct.CaptureRecord else struct {
+    schema: []const u8 = if (profile.compute) "uk.wamr.direct-serial-capture" else "uk.hyperv.direct-serial-capture",
     version: u8 = 1,
     boot: u8,
     poll: u8,
@@ -79,15 +89,15 @@ pub const CaptureRecord = struct {
     vm_uuid: []const u8,
     os_id: []const u8,
     os_uuid: []const u8,
-    data_id: []const u8,
-    data_uuid: []const u8,
+    data_id: if (profile.compute) ?[]const u8 else []const u8,
+    data_uuid: if (profile.compute) ?[]const u8 else []const u8,
     vm_observation_sha256: []const u8,
     original_boot1_sha256: []const u8,
     boot2_admission_sha256: []const u8,
 };
 
 pub const AdmissionRecord = struct {
-    schema: []const u8 = "uk.hyperv.direct-boot2-admission",
+    schema: []const u8 = if (profile.compute) "uk.wamr.direct-boot2-admission" else "uk.hyperv.direct-boot2-admission",
     version: u8 = 1,
     reserved_boots: u8 = 2,
     scope_sha256: []const u8,
@@ -97,11 +107,11 @@ pub const AdmissionRecord = struct {
     vm_uuid: []const u8,
     os_id: []const u8,
     os_uuid: []const u8,
-    data_id: []const u8,
-    data_uuid: []const u8,
+    data_id: if (profile.compute) ?[]const u8 else []const u8,
+    data_uuid: if (profile.compute) ?[]const u8 else []const u8,
     retained_vm_sha256: []const u8,
     retained_os_sha256: []const u8,
-    retained_data_sha256: []const u8,
+    retained_data_sha256: if (profile.compute) ?[]const u8 else []const u8,
     deallocated_power_sha256: []const u8,
 };
 
@@ -195,18 +205,15 @@ pub const Reference = struct {
 };
 
 pub const References = struct {
-    artifacts: [5]Reference,
+    artifacts: [profile.artifacts.len]Reference,
     tools: [3]Reference,
 
     pub fn capture(io: std.Io, scope: Scope, az: []const u8, uploader: []const u8, validator: []const u8) !References {
+        var artifacts: [profile.artifacts.len]Reference = undefined;
+        inline for (profile.artifacts, 0..) |name, i|
+            artifacts[i] = try Reference.artifact(io, @field(scope, name), if (comptime std.mem.startsWith(u8, name, "seed_")) .private else .artifact);
         return .{
-            .artifacts = .{
-                try Reference.artifact(io, scope.os_vhd, .artifact),
-                try Reference.artifact(io, scope.seed_raw, .private),
-                try Reference.artifact(io, scope.seed_vhd, .private),
-                try Reference.artifact(io, scope.manifest, .artifact),
-                try Reference.artifact(io, scope.config, .artifact),
-            },
+            .artifacts = artifacts,
             .tools = .{ try Reference.tool(io, az), try Reference.tool(io, uploader), try Reference.tool(io, validator) },
         };
     }
@@ -238,7 +245,7 @@ pub const CaptureSources = struct {
 pub const Retained = struct {
     vm: FileSnapshot,
     os: FileSnapshot,
-    data: FileSnapshot,
+    data: if (profile.compute) ?FileSnapshot else FileSnapshot,
     power: FileSnapshot,
 };
 pub const Boot1 = struct { serial: FileSnapshot, capture: FileSnapshot };
@@ -430,11 +437,14 @@ pub const Store = struct {
         const attempt = try createDirectory(self.io, self.ledger.dir, attempt_name, self.take(.directory_sync));
         attempt.close(self.io);
         if (self.take(.after_first_reservation)) return error.Injected;
-        const identity_name = try std.fmt.bufPrint(&buffer, "{s}-{s}", .{ s.run_id, s.disk_id });
+        const identity_name = if (profile.compute)
+            try std.fmt.bufPrint(&buffer, "compute-{s}", .{s.source_tree})
+        else
+            try std.fmt.bufPrint(&buffer, "{s}-{s}", .{ s.run_id, s.disk_id });
         const identity = try createDirectory(self.io, self.ledger.dir, identity_name, false);
         defer identity.close(self.io);
         if (self.take(.after_identity_reservation)) return error.Injected;
-        const digest_name = try std.fmt.bufPrint(&buffer, "sha256-{s}", .{s.seed_vhd.sha256});
+        const digest_name = try std.fmt.bufPrint(&buffer, "sha256-{s}", .{if (profile.compute) s.os_vhd.sha256 else s.seed_vhd.sha256});
         const digest = try createDirectory(self.io, self.ledger.dir, digest_name, false);
         digest.close(self.io);
         var identity_writer = try identity.lock(self.io);
@@ -536,7 +546,7 @@ pub const Store = struct {
         const vm_sha = sources.vm_observation.hex();
         const first_sha = if (boot == 1) raw.hex() else self.boot1.?.serial.hex();
         const admission_sha = if (self.boot2) |admission| admission.admission.hex() else [_]u8{0} ** 64;
-        const capture_record: CaptureRecord = .{
+        var capture_record: CaptureRecord = .{
             .boot = boot,
             .poll = poll,
             .serial_mode = self.scope.value.serial_mode,
@@ -553,6 +563,32 @@ pub const Store = struct {
             .original_boot1_sha256 = &first_sha,
             .boot2_admission_sha256 = if (boot == 2) &admission_sha else "",
         };
+        var compute_sha: [64]u8 = undefined;
+        if (profile.compute) {
+            var current = try self.directory.readSensitive(self.io, self.allocator, log, cli_limit, raw.sha256);
+            defer current.deinit();
+            var first = try self.directory.readSensitive(self.io, self.allocator, "boot1.log", cli_limit, if (boot == 1) raw.sha256 else self.boot1.?.serial.sha256);
+            defer first.deinit();
+            const result = try direct.checkSerial(self.allocator, if (boot == 1) current.bytes() else try direct.secondBytes(current.bytes(), first.bytes(), self.scope.value.serial_mode), self.scope.value.identity);
+            const result_pin = try self.record(try std.fmt.bufPrint(&name, "boot{d}-compute.json", .{boot}), .{
+                .schema = "uk.wamr.direct-boot-result",
+                .version = @as(u8, 1),
+                .attempt_id = self.scope.value.attempt_id,
+                .expires_unix = self.scope.value.approval.expires_unix,
+                .scope_sha256 = &scope_sha,
+                .serial_sha256 = &serial_sha,
+                .serial_bytes = raw.metadata.size,
+                .boot = boot,
+                .vm_id = ids.vm_id,
+                .vm_uuid = ids.vm_uuid,
+                .os_id = ids.os_id,
+                .os_uuid = ids.os_uuid,
+                .compute = result,
+            });
+            compute_sha = result_pin.hex();
+            capture_record.compute_result_sha256 = &compute_sha;
+            capture_record.serial_bytes = raw.metadata.size;
+        }
         const record_name = try std.fmt.bufPrint(&name, "boot{d}-capture.json", .{boot});
         const pin = try self.record(record_name, capture_record);
         if (boot == 1) {
@@ -565,7 +601,7 @@ pub const Store = struct {
         return .{
             .vm = try self.pinFile("retained-vm.json", cli_limit),
             .os = try self.pinFile("retained-os.json", cli_limit),
-            .data = try self.pinFile("retained-data.json", cli_limit),
+            .data = if (profile.compute) null else try self.pinFile("retained-data.json", cli_limit),
             .power = try self.pinFile("retained-power.json", cli_limit),
         };
     }
@@ -585,7 +621,7 @@ pub const Store = struct {
         const capture_sha = self.boot1.?.capture.hex();
         const vm_sha = retained.vm.hex();
         const os_sha = retained.os.hex();
-        const data_sha = retained.data.hex();
+        const data_sha = if (profile.compute) null else retained.data.hex();
         const power_sha = retained.power.hex();
         const record_value: AdmissionRecord = .{
             .scope_sha256 = &scope_sha,
@@ -599,7 +635,7 @@ pub const Store = struct {
             .data_uuid = ids.data_uuid,
             .retained_vm_sha256 = &vm_sha,
             .retained_os_sha256 = &os_sha,
-            .retained_data_sha256 = &data_sha,
+            .retained_data_sha256 = if (profile.compute) null else &data_sha,
             .deallocated_power_sha256 = &power_sha,
         };
         const admission = try self.record("boot2-admission.json", record_value);
@@ -615,6 +651,18 @@ pub const Store = struct {
         try self.verifyFile("boot1.log", first.serial, cli_limit);
         try self.verifyFile("boot1-capture.json", first.capture, record_limit);
         try self.verifyScope();
+        if (profile.compute) try self.verifyComputeResult(1);
+    }
+
+    fn verifyComputeResult(self: *Store, boot: u8) !void {
+        var name: [80]u8 = undefined;
+        var bytes = try self.directory.readSensitive(self.io, self.allocator, try std.fmt.bufPrint(&name, "boot{d}-capture.json", .{boot}), record_limit, null);
+        defer bytes.deinit();
+        const capture_record = try direct.parse(CaptureRecord, self.allocator, bytes.bytes());
+        defer capture_record.deinit();
+        const pin = try self.pinFile(try std.fmt.bufPrint(&name, "boot{d}-compute.json", .{boot}), record_limit);
+        if (!std.mem.eql(u8, &pin.sha256, &try core.contracts.parseSha256(capture_record.value.compute_result_sha256)))
+            return error.HashMismatch;
     }
 
     /// Must succeed immediately before the sole VM start and each Boot2 poll.
@@ -629,7 +677,7 @@ pub const Store = struct {
     fn verifyRetained(self: *Store, retained: Retained) !void {
         try self.verifyFile("retained-vm.json", retained.vm, cli_limit);
         try self.verifyFile("retained-os.json", retained.os, cli_limit);
-        try self.verifyFile("retained-data.json", retained.data, cli_limit);
+        if (!profile.compute) try self.verifyFile("retained-data.json", retained.data, cli_limit);
         try self.verifyFile("retained-power.json", retained.power, cli_limit);
     }
 
@@ -894,7 +942,28 @@ pub const Store = struct {
         result.outcome = outcome;
         self.finished = true;
         if (!writer_ready) return result;
-        const bytes = encode(self.allocator, outcome) catch |err| {
+        const scope_sha = self.scope_pin.hex();
+        const bytes = (if (profile.compute) encode(self.allocator, .{
+            .schema = "uk.wamr.direct-compute-result",
+            .version = @as(u8, 1),
+            .purpose = "tiny-aot-two-boot",
+            .scope_sha256 = &scope_sha,
+            .attempt_id = self.scope.value.attempt_id,
+            .expires_unix = self.scope.value.approval.expires_unix,
+            .phase = outcome.phase,
+            .primary_exit = outcome.primary_exit,
+            .cleanup_exit = outcome.cleanup_exit,
+            .reserved_boots = outcome.reserved_boots,
+            .compute_evidence_complete = outcome.persistence_evidence_complete,
+            .owned_group_absent = outcome.owned_group_absent,
+            .group_creation_attempted = outcome.group_creation_attempted,
+            .failure_diagnostics = outcome.failure_diagnostics,
+            .boot2_freshness = outcome.boot2_freshness,
+            .accepted = outcome.accepted,
+            .hardware_acceptance = "not_established",
+            .whole_guest_memory = "not_qualified",
+            .benchmark = "not_measured",
+        }) else encode(self.allocator, outcome)) catch |err| {
             result.recording_error = err;
             return result;
         };
@@ -925,6 +994,7 @@ pub const Store = struct {
         try self.verifyBoot2Admission();
         const capture_pin = self.boot2_capture orelse return error.EvidenceIncomplete;
         try self.verifyFile("boot2-capture.json", capture_pin, record_limit);
+        if (profile.compute) try self.verifyComputeResult(2);
         var bytes = try self.directory.readSensitive(self.io, self.allocator, "boot2-capture.json", record_limit, capture_pin.sha256);
         defer bytes.deinit();
         const record_value = try direct.parse(CaptureRecord, self.allocator, bytes.bytes());

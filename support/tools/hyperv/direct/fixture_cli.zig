@@ -55,7 +55,7 @@ const Fake = struct {
         const os = eq(role, "os");
         const saved = if (os) self.state.os else self.state.data;
         var uuid: []const u8 = if (os) "original-os" else "original-data";
-        if (!os and ((self.is("identity-drift") and self.state.boots == 2) or
+        if ((f.compute or !os) and ((self.is("identity-drift") and self.state.boots == 2) or
             (self.is("diagnostics-disk-identity-drift") and self.state.cleanup))) uuid = "replacement";
         var state: []const u8 = if (self.state.boots == 0)
             (if (saved.uploaded) "Unattached" else "ReadyToUpload")
@@ -76,10 +76,10 @@ const Fake = struct {
             .hyperVGeneration = @as(?[]const u8, if (os) "V2" else null),
             .sku = .{ .name = "StandardSSD_LRS" },
             .logicalSectorSize = "512",
-            .diskSizeBytes = if (os) "1048576" else "4294967296",
+            .diskSizeBytes = if (os) (if (f.compute) "69206016" else "1048576") else "4294967296",
             .diskState = state,
             .managedBy = @as(?[]const u8, if (self.state.boots > 0) f.vm_id else null),
-            .creationData = .{ .createOption = "Upload", .uploadSizeBytes = if (self.is("numeric-exponent")) "1e6" else if (os) "1049088" else "4294967808" },
+            .creationData = .{ .createOption = "Upload", .uploadSizeBytes = if (self.is("numeric-exponent")) "1e6" else if (os) (if (f.compute) "69206528" else "1049088") else "4294967808" },
         }));
     }
     fn vm(self: Fake) !std.json.Value {
@@ -96,7 +96,7 @@ const Fake = struct {
             .storageProfile = .{
                 .diskControllerType = "SCSI",
                 .osDisk = .{ .createOption = "Attach", .caching = "ReadOnly", .deleteOption = "Detach", .managedDisk = .{ .id = f.os_id } },
-                .dataDisks = .{.{
+                .dataDisks = if (f.compute) .{} else .{.{
                     .lun = "7",
                     .createOption = "Attach",
                     .caching = "None",
@@ -234,7 +234,7 @@ const Fake = struct {
             return self.save();
         }
         if (eq(cmd, "deployment group")) {
-            try f.expect(self.state.boots == 0 and self.state.os.uploaded and self.state.data.uploaded);
+            try f.expect(self.state.boots == 0 and self.state.os.uploaded and (f.compute or self.state.data.uploaded));
             self.state.boots = 1;
             self.state.power = "running";
             try self.save();
@@ -368,17 +368,18 @@ const Options = struct {
                 try f.expect(eq(value, try std.mem.concat(c.a, u8, &.{ "@", try c.path("attempt/deployment-parameters.json") })));
                 const document = try c.document("attempt/deployment-parameters.json");
                 const parameters = try f.field(document, "parameters");
-                try f.expect(document.object.count() == 1 and parameters.object.count() == 7);
-                inline for (.{ .{ "ownerRun", f.owner }, .{ "osDiskId", f.os_id }, .{ "dataDiskId", f.data_id }, .{ "namePrefix", f.prefix }, .{ "imageSha256", f.image_sha }, .{ "location", "fixture" }, .{ "vmSize", "Standard_D2s_v5" } }) |parameter| {
+                try f.expect(document.object.count() == 1 and parameters.object.count() == @as(usize, if (f.compute) 6 else 7));
+                inline for (.{ .{ "ownerRun", f.owner }, .{ "osDiskId", f.os_id }, .{ "dataDiskId", f.data_id }, .{ "namePrefix", f.prefix }, .{ "imageSha256", f.image_sha }, .{ "location", f.location }, .{ "vmSize", "Standard_D2s_v5" } }) |parameter| {
+                    if (f.compute and comptime eq(parameter[0], "dataDiskId")) continue;
                     const item = try f.field(parameters, parameter[0]);
                     try f.expect(item.object.count() == 1 and eq(try f.str(item, "value"), parameter[1]));
                 }
             } else if (eq(flag, "--template-file")) {
                 try f.deploymentTemplate(c, value);
             } else {
-                const expected: []const u8 = if (eq(flag, "--location")) "fixture" else if (eq(flag, "--upload-type")) "Upload" else if (eq(flag, "--sku")) "StandardSSD_LRS" else if (eq(flag, "--os-type")) "Linux" else if (eq(flag, "--hyper-v-generation")) "V2" else if (eq(flag, "--access-level")) "Write" else if (eq(flag, "--duration-in-seconds")) "1800" else "";
+                const expected: []const u8 = if (eq(flag, "--location")) f.location else if (eq(flag, "--upload-type")) "Upload" else if (eq(flag, "--sku")) "StandardSSD_LRS" else if (eq(flag, "--os-type")) "Linux" else if (eq(flag, "--hyper-v-generation")) "V2" else if (eq(flag, "--access-level")) "Write" else if (eq(flag, "--duration-in-seconds")) "1800" else "";
                 if (eq(flag, "--upload-size-bytes")) {
-                    try f.expect(one(value, &.{ "1049088", "4294967808" }));
+                    try f.expect(one(value, &.{ if (f.compute) "69206528" else "1049088", "4294967808" }));
                 } else try f.expect(eq(value, expected));
             }
         }
@@ -388,7 +389,7 @@ const Options = struct {
         if (eq(args[0], "vm")) try f.expect(eq(result.name, f.prefix ++ "-vm"));
         if (eq(command, "disk create")) {
             const size = flags.get("--upload-size-bytes") orelse return error.MissingUploadSize;
-            try f.expect(eq(size, if (eq(result.name, f.prefix ++ "-os")) "1049088" else "4294967808"));
+            try f.expect(eq(size, if (eq(result.name, f.prefix ++ "-os")) (if (f.compute) "69206528" else "1049088") else "4294967808"));
         }
         const required: []const []const u8 = if (eq(command, "group create"))
             &.{ "--name", "--location", "--tags" }
@@ -457,14 +458,14 @@ fn run(init: std.process.Init) !void {
         if (eq(args[0], "inputs")) {
             try f.expect(args.len == 2);
             const scope = try c.document(args[1][c.root.len + 1 ..]);
-            inline for (.{ .{ "os_vhd", "os.vhd" }, .{ "seed_raw", "seed.raw" }, .{ "seed_vhd", "seed.vhd" }, .{ "manifest", "seed.json" }, .{ "config", "config" } }) |item|
+            inline for (f.input_names) |item|
                 try f.expect(eq(try f.str(try f.field(scope, item[0]), "path"), try c.path(item[1])));
             try f.expect(eq(try f.str(scope, "attempt_id"), f.owner) and eq(try f.str(scope, "subscription"), f.subscription));
             if (fake.is("bad-input")) std.process.exit(1);
             return;
         }
         const native = init.environ_map.get("UK_DIRECT_FIXTURE_VALIDATOR") orelse return error.NoNativeValidator;
-        try f.expect(eq(std.fs.path.basename(native), "uk-hyperv-direct-validate"));
+        try f.expect(eq(std.fs.path.basename(native), f.validator_name));
         try executable(init.io, native);
         if (eq(args[0], "serial")) try c.log("validator serial");
         var environment = std.process.Environ.Map.init(a);
@@ -483,7 +484,7 @@ fn run(init: std.process.Init) !void {
         try f.expect(request.object.count() == 6);
         try f.expect(eq(try f.str(request, "schema"), "unikraft.hyperv.managed-disk-page-worker") and try f.num(request, "schema_version") == 1);
         try f.expect(eq(try f.str(request, "path"), try c.path(if (os) "os.vhd" else "seed.vhd")));
-        try f.expect(try f.num(request, "size") == @as(i64, if (os) 1049088 else 4294967808) and eq(try f.str(request, "sha256"), f.image_sha));
+        try f.expect(try f.num(request, "size") == @as(i64, if (os) f.os_size else 4294967808) and eq(try f.str(request, "sha256"), f.image_sha));
         try f.expect(eq(try f.str(request, "endpoint"), if (fake.is("storage-azure-grant")) "https://md-fixture.z99.blob.storage.azure.net/upload" else "https://fixture.blob.core.windows.net/upload"));
         const job = try upload.document("job.json");
         try f.expect(job.object.count() == 7 and eq(try f.str(job, "contract"), "uk.hyperv.transfer-job") and try f.num(job, "schema_version") == 1);

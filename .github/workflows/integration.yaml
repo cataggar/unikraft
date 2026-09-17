@@ -897,7 +897,17 @@ jobs:
           --prefix "${root}/tools" -Doptimize=ReleaseSafe \
           -Dtest-root="${root}/fixtures" \
           -Dlifecycle-root="${parent}/native" \
-          test test-foundation test-controller test-lifecycle-native install
+          test test-foundation test-controller test-lifecycle-native install compute-fixture-tools
+        # WAMR uses the same isolated fake backend, never an authenticated CLI.
+        export PYTHONDONTWRITEBYTECODE=1
+        zig build --build-file support/build/wamr-native-ci/build.zig -j2 \
+          --cache-dir "${root}/compute-cache" --global-cache-dir "${root}/global" \
+          --prefix "${root}/compute-tools" -Doptimize=ReleaseSafe test install
+        WAMR_DIRECT_TOOLS="${root}/tools/bin" \
+        WAMR_CI_PACKAGE="${root}/compute-tools/bin/wamr-ci-package" \
+          python3 -m unittest discover -s support/tools/hyperv/direct/tests -v
+        # Generated package sources are not part of the guarded source closure.
+        mv support/build/wamr-native-ci/zig-pkg "${root}/compute-zig-pkg"
 
     - name: Collect bounded persistence observations
       if: always()

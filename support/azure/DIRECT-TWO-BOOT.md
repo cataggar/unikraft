@@ -1,5 +1,10 @@
 # Direct Azure #89: one guarded image, two boots
 
+WAMR tiny-AOT has a [separate purpose-specific adapter](WAMR-DIRECT-COMPUTE.md).
+It shares the native lifecycle machinery but accepts neither this persistence
+scope nor its seed/approval/result contract. This document remains the
+two-disk persistence lane.
+
 The native `uk-hyperv-direct-two-boot` is the bounded **direct specialized
 Generation 2 Unikraft VM** lane. Azure CLI manages only run-owned resources;
 the existing native `uk-hyperv transfer` uploads each exact fixed VHD. It does

@@ -5,11 +5,16 @@ pub const milestones = [_][]const u8{ "Hyper-V Hv#1 hypercall page enabled", "Hy
 
 pub fn validate(a: std.mem.Allocator, raw: []const u8, config: c.Config) !void {
     try config.validate();
+    return validateEnvelope(a, raw, config.expect, config.expect_main_return, config.required, config.forbidden);
+}
+
+/// Shared guest framing only; this carries no boot or cloud authority.
+pub fn validateEnvelope(a: std.mem.Allocator, raw: []const u8, expect: []const u8, expect_main_return: i32, required: []const []const u8, forbidden_markers: []const []const u8) !void {
     const text = try normalize(a, raw);
     defer a.free(text);
     for ([_][]const u8{ "Unikraft Crash", "Assertion failure", "Exception Type" }) |failure|
         if (std.mem.indexOf(u8, text, failure) != null) return error.GuestCrash;
-    for (config.forbidden) |forbidden|
+    for (forbidden_markers) |forbidden|
         if (std.mem.indexOf(u8, text, forbidden) != null) return error.ForbiddenMarker;
     var position: usize = 0;
     for (milestones, 0..) |milestone, i| {
@@ -17,7 +22,7 @@ pub fn validate(a: std.mem.Allocator, raw: []const u8, config: c.Config) !void {
         if (i != 0 and found <= position) return error.ReorderedMilestone;
         position = found;
     }
-    const expected = std.mem.indexOf(u8, text, config.expect) orelse return error.MissingExpected;
+    const expected = std.mem.indexOf(u8, text, expect) orelse return error.MissingExpected;
     if (expected <= position) return error.ReorderedMilestone;
     var terminal: ?usize = null;
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -26,7 +31,7 @@ pub fn validate(a: std.mem.Allocator, raw: []const u8, config: c.Config) !void {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (std.mem.indexOf(u8, line, "main returned") != null) {
             const body = terminalBody(line) orelse return error.InvalidMainReturn;
-            if (try c.integer(i32, body["main returned ".len..]) != config.expect_main_return) return error.UnexpectedMainReturn;
+            if (try c.integer(i32, body["main returned ".len..]) != expect_main_return) return error.UnexpectedMainReturn;
             if (terminal != null) return error.DuplicateMainReturn;
             terminal = offset;
         }
@@ -35,8 +40,8 @@ pub fn validate(a: std.mem.Allocator, raw: []const u8, config: c.Config) !void {
     const end = terminal orelse return error.MissingMainReturn;
     if (end <= expected) return error.ReorderedMilestone;
     var previous: ?usize = null;
-    for (config.required) |required| {
-        const found = std.mem.indexOf(u8, text, required) orelse return error.MissingRequired;
+    for (required) |marker| {
+        const found = std.mem.indexOf(u8, text, marker) orelse return error.MissingRequired;
         if (found >= end or (previous != null and found <= previous.?)) return error.ReorderedRequired;
         previous = found;
     }

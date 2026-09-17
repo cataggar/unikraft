@@ -2,7 +2,8 @@
 //! Native, non-resumable two-boot lifecycle. No cloud authority is discovered.
 const std = @import("std");
 const core = @import("hyperv_core");
-const direct = @import("main.zig");
+const profile = @import("profile.zig");
+const direct = profile.contract;
 const runtime = @import("runtime.zig");
 const custody = @import("custody.zig");
 const observations = @import("observations.zig");
@@ -448,7 +449,7 @@ fn Controller(comptime Hooks: type) type {
             self.references = try self.hooks.references(self.io, self.expected.scope, self.inputs.programs);
             try self.required(try self.validate(.primary, "input-check", .inputs, &.{}));
             try self.store.consume();
-            try self.event(.@"seed-consumed");
+            try self.event(if (profile.compute) .@"attempt-consumed" else .@"seed-consumed");
             try self.groupAbsent(.primary, "group-before");
             try self.event(.@"group-create-intent");
             self.group_intended = true;
@@ -463,7 +464,7 @@ fn Controller(comptime Hooks: type) type {
                 observations.group(doc.value(), self.expected) catch |err| return self.refused("group-created", err);
             }
             try self.upload(.os);
-            try self.upload(.data);
+            if (!profile.compute) try self.upload(.data);
             try self.deployment();
             const first = try self.observe("boot1", .allocated);
             self.boot_vm[0] = first.vm;
@@ -493,7 +494,7 @@ fn Controller(comptime Hooks: type) type {
             try self.store.verifyBoot1();
             try self.verifyPrimary();
             self.complete = true;
-            try self.event(.@"persistence-evidence-complete");
+            try self.event(if (profile.compute) .@"compute-evidence-complete" else .@"persistence-evidence-complete");
         }
 
         fn upload(self: *Self, role: Role) !void {
@@ -582,14 +583,22 @@ fn Controller(comptime Hooks: type) type {
 
         fn deployment(self: *Self) !void {
             const s = self.expected.scope;
-            const parameters = try custody.encode(self.a, .{ .parameters = .{
+            const common = .{
                 .namePrefix = .{ .value = s.prefix },
                 .location = .{ .value = s.location },
                 .ownerRun = .{ .value = s.attempt_id },
                 .imageSha256 = .{ .value = s.os_vhd.sha256 },
                 .osDiskId = .{ .value = self.expected.os_id },
-                .dataDiskId = .{ .value = self.expected.data_id },
                 .vmSize = .{ .value = s.vm_size },
+            };
+            const parameters = try custody.encode(self.a, .{ .parameters = if (profile.compute) common else .{
+                .namePrefix = common.namePrefix,
+                .location = common.location,
+                .ownerRun = common.ownerRun,
+                .imageSha256 = common.imageSha256,
+                .osDiskId = common.osDiskId,
+                .vmSize = common.vmSize,
+                .dataDiskId = .{ .value = self.expected.data_id },
             } });
             try custody.requireDurable(try self.store.writer.createImmutable(self.io, "deployment-parameters.json", parameters));
             try custody.requireDurable(try self.store.writer.createImmutable(self.io, "deployment-template.json", @embedFile("direct_arm_template")));
@@ -625,20 +634,21 @@ fn Controller(comptime Hooks: type) type {
             const observed = observations.vm(vm_doc.value(), self.expected, self.vm_uuid) catch |err| return self.refused(vm_label, err);
             if (self.vm_uuid == null) self.vm_uuid = try self.a.dupe(u8, observed.unique_id);
             var disks: [2]custody.FileSnapshot = undefined;
-            for ([_]Role{ .os, .data }, &disks) |role, *snapshot| {
+            inline for (profile.roles) |role_name| {
+                const role: Role = role_name;
                 const disk_label = try self.fmt("{s}-{s}", .{ label, @tagName(role) });
                 try self.diskShow(.primary, disk_label, role);
                 const doc = try self.read(disk_label);
                 defer doc.deinit();
                 _ = observations.retainedDisk(doc.value(), self.expected, role, allocation, self.disk_uuids[@intFromEnum(role)].?) catch |err| return self.refused(disk_label, err);
-                snapshot.* = doc.pin;
+                disks[@intFromEnum(role)] = doc.pin;
             }
             const power_label = try self.fmt("{s}-power", .{label});
             try self.azRequired(power_label, &.{ "vm", "get-instance-view", "--resource-group", try self.groupName(), "--name", try self.vmName() });
             const power_doc = try self.read(power_label);
             defer power_doc.deinit();
             _ = observations.power(power_doc.value(), allocation) catch |err| return self.refused(power_label, err);
-            return .{ .vm = vm_doc.pin, .os = disks[0], .data = disks[1], .power = power_doc.pin };
+            return .{ .vm = vm_doc.pin, .os = disks[0], .data = if (profile.compute) null else disks[1], .power = power_doc.pin };
         }
 
         fn identities(self: *Self) custody.Identities {
@@ -647,14 +657,14 @@ fn Controller(comptime Hooks: type) type {
                 .vm_uuid = self.vm_uuid.?,
                 .os_id = self.expected.os_id,
                 .os_uuid = self.disk_uuids[0].?,
-                .data_id = self.expected.data_id,
-                .data_uuid = self.disk_uuids[1].?,
+                .data_id = if (profile.compute) null else self.expected.data_id,
+                .data_uuid = if (profile.compute) null else self.disk_uuids[1].?,
             };
         }
 
         fn verifyFinal(self: *Self) !void {
             const retained = self.final_observations orelse return error.MissingFinalObservation;
-            inline for (.{ "vm", "os", "data", "power" }) |name|
+            inline for (profile.retained) |name|
                 try self.store.verifyFile("final-" ++ name ++ ".json", @field(retained, name), custody.cli_limit);
         }
 
@@ -806,7 +816,8 @@ fn Controller(comptime Hooks: type) type {
                 self.absent = true;
                 return;
             }
-            for ([_]Role{ .os, .data }) |role| {
+            inline for (profile.roles) |role_name| {
+                const role: Role = role_name;
                 if (self.granted[@intFromEnum(role)])
                     self.cleanupRevoke(role) catch {
                         self.cleanup_exit = 1;
@@ -819,13 +830,15 @@ fn Controller(comptime Hooks: type) type {
                 defer doc.deinit();
                 _ = try observations.inventory(doc.value(), self.expected);
             }
-            for ([_]Role{ .os, .data }) |role| {
-                const uuid = self.disk_uuids[@intFromEnum(role)] orelse continue;
-                const label = try self.fmt("cleanup-{s}-identity", .{@tagName(role)});
-                try self.diskShow(.cleanup, label, role);
-                const doc = try self.read(label);
-                defer doc.deinit();
-                try observations.cleanupDisk(doc.value(), self.expected, role, uuid);
+            inline for (profile.roles) |role_name| {
+                const role: Role = role_name;
+                if (self.disk_uuids[@intFromEnum(role)]) |uuid| {
+                    const label = try self.fmt("cleanup-{s}-identity", .{@tagName(role)});
+                    try self.diskShow(.cleanup, label, role);
+                    const doc = try self.read(label);
+                    defer doc.deinit();
+                    try observations.cleanupDisk(doc.value(), self.expected, role, uuid);
+                }
             }
             if (self.vm_uuid) |uuid| {
                 if (try self.az(.cleanup, "cleanup-vm-identity", &.{ "vm", "show", "--resource-group", try self.groupName(), "--name", try self.vmName() }) != 0) return error.IdentityUncertain;
@@ -833,7 +846,7 @@ fn Controller(comptime Hooks: type) type {
                 defer doc.deinit();
                 try observations.cleanupVm(doc.value(), self.expected, uuid);
             }
-            if (self.primary_exit != 0 and self.store.reserved_boots > 0 and self.vm_uuid != null and self.disk_uuids[0] != null and self.disk_uuids[1] != null)
+            if (self.primary_exit != 0 and self.store.reserved_boots > 0 and self.vm_uuid != null and self.disk_uuids[0] != null and (profile.compute or self.disk_uuids[1] != null))
                 self.failureDiagnostics();
             if (self.poisoned) return error.UnresolvedCleanup;
             self.event(.@"cleanup-delete-intent") catch {

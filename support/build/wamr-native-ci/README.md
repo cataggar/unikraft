@@ -118,3 +118,18 @@ production orchestration has no fixture, executable-override or skip switch.
 ARM development can run these fixtures, but cannot qualify the guest.
 Only a successful real x86 PR run of the corrected, committed native base
 establishes the first local tiny-compute observation.
+
+## Private final-image handoff
+
+After a successful final-source build and all four boots, `handoff.py export`
+can retain and revalidate the **actual private bytes** before the runner is
+discarded. It uses the existing native physical package inspector, original
+request/report/compute checks, and complete earlier result hashes. Its bundle
+and `handoff.py plan` output remain `authority=not_admitted`; they do not
+promote this lane's local result to cloud acceptance. Metadata-only Actions
+artifacts cannot be used in place of missing raw/VHD/EFI/log bytes.
+
+See [WAMR direct compute](../../azure/WAMR-DIRECT-COMPUTE.md) for the private
+export, independent native revalidation, offline plan and separate final
+image-specific approval boundary. The ordinary PR workflow is unchanged:
+no raw/private handoff upload and no cloud execution.

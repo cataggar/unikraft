@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! Offline fixture plumbing only. No production controller imports this module.
 const std = @import("std");
+pub const compute = @import("profile.zig").compute;
+pub const validator_name = if (compute) "uk-wamr-direct-validate" else "uk-hyperv-direct-validate";
+pub const fake_name = if (compute) "wamr-direct-fixture-cli" else "hyperv-direct-fixture-cli";
+pub const os_size: u64 = if (compute) 69206528 else 1049088;
+pub const location = if (compute) "northeurope" else "fixture";
+pub const input_names = if (compute) .{ .{ "os_vhd", "os.vhd" }, .{ "bundle", "bundle.json" } } else .{ .{ "os_vhd", "os.vhd" }, .{ "seed_raw", "seed.raw" }, .{ "seed_vhd", "seed.vhd" }, .{ "manifest", "seed.json" }, .{ "config", "config" } };
 pub const files = @import("hyperv_core").private_files;
 pub const marker = "direct-two-boot-offline-only\n";
 pub const sentinel = "PRIVATE_FIXTURE_SAS";
@@ -96,7 +102,7 @@ pub fn grantOutput(c: Context, output: std.Io.File) !void {
 
 pub fn repositoryTemplatePath(c: Context) ![]const u8 {
     const at = std.mem.indexOf(u8, c.root, "/.d/") orelse return error.UnsafeFixtureRoot;
-    return std.mem.concat(c.a, u8, &.{ c.root[0..at], "/support/azure/hyperv-direct-two-boot.json" });
+    return std.mem.concat(c.a, u8, &.{ c.root[0..at], if (compute) "/support/azure/wamr-direct-compute.json" else "/support/azure/hyperv-direct-two-boot.json" });
 }
 
 pub fn repositoryTemplate(c: Context) ![]const u8 {
