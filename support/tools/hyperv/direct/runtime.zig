@@ -6,6 +6,7 @@ const core = @import("hyperv_core");
 const validator = @import("profile.zig").contract;
 const transfer_job = @import("transfer_job");
 const process = core.process;
+const custody = @import("custody.zig");
 
 pub const Role = enum { azure, uploader, validator };
 pub const Lane = enum { primary, cleanup, diagnostic };
@@ -16,15 +17,45 @@ pub const minimum_transfer_ms = 8000;
 pub const term_grace_ms = 2000;
 const reap_ms = 1000;
 
+pub fn errorExit(err: anyerror, cancellation: *const process.SignalCancellation) u8 {
+    return switch (err) {
+        error.Cancelled => if (cancellation.signal()) |signal| 128 + signal else 130,
+        error.ApprovalExpired => 125,
+        error.BudgetExhausted => 124,
+        else => 1,
+    };
+}
+
+pub fn processExit(result: process.PrivateResult, cancellation: *const process.SignalCancellation) u8 {
+    if (result.execution.failures.primary) |failure| {
+        if (failure.category == .cancelled) return errorExit(error.Cancelled, cancellation);
+        if (failure.category == .timeout) return 124;
+        // Match the reference's file-size refusal, not the supervisor's TERM.
+        // The actual child termination remains independent in process records.
+        if (failure.category == .output_limit) return 128 + @intFromEnum(std.os.linux.SIG.XFSZ);
+    }
+    if (result.execution.termination) |termination| switch (termination) {
+        .exited => |code| if (code != 0) return code,
+        .signal => |signal| return @intCast(@min(255, 128 + @intFromEnum(signal))),
+        else => {},
+    };
+    return if (result.succeeded()) 0 else 1;
+}
+
 pub const Programs = struct {
     azure: []const u8,
     uploader: []const u8,
     validator: []const u8,
+    azure_python: ?[]const u8 = null,
 
     pub fn validate(self: Programs) !void {
         inline for (.{ "azure", "uploader", "validator" }) |field| {
             try core.private_files.absoluteFilePath(@field(self, field));
             try publicArgument(@field(self, field));
+        }
+        if (self.azure_python) |path_value| {
+            try core.private_files.absoluteFilePath(path_value);
+            try publicArgument(path_value);
         }
     }
 
@@ -71,6 +102,7 @@ pub const Environment = struct {
         }
         try result.azure.put("LC_ALL", "C");
         try result.azure.put("AZURE_CORE_COLLECT_TELEMETRY", "0");
+        try result.azure.put("PYTHONDONTWRITEBYTECODE", "1");
         try result.native.put("LC_ALL", "C");
         return result;
     }
@@ -180,9 +212,22 @@ pub const Runtime = struct {
     environment: *const Environment,
     budgets: *Budgets,
     cancellation: *const process.SignalCancellation,
+    interpreter: ?custody.Reference = null,
+
+    pub fn verifyInterpreter(self: Runtime) !void {
+        if (self.programs.azure_python) |path| {
+            const reference = self.interpreter orelse return error.InterpreterNotPinned;
+            if (!std.mem.eql(u8, path, reference.path) or
+                !std.mem.eql(u8, path, self.environment.azure.get("AZ_PYTHON") orelse return error.InterpreterNotSelected))
+                return error.InterpreterChanged;
+            try reference.verify(self.io);
+        } else if (self.interpreter != null or self.environment.azure.get("AZ_PYTHON") != null)
+            return error.UnexpectedInterpreter;
+    }
 
     pub fn initialize(self: Runtime) !void {
         try self.programs.validate();
+        try self.verifyInterpreter();
         try process.initialize();
     }
 
@@ -202,8 +247,31 @@ pub const Runtime = struct {
         stdout_name: []const u8,
         stderr_name: []const u8,
     ) !process.PrivateResult {
+        return self.runBounded(lane, role, arguments, lock, stdout_name, stderr_name, false);
+    }
+
+    pub fn version(self: Runtime, lock: *core.private_files.Locked) !process.PrivateResult {
+        return self.runBounded(.primary, .azure, &.{ "version", "--output", "json", "--only-show-errors" }, lock, "cli-version.stdout", "cli-version.stderr", true);
+    }
+
+    fn runBounded(
+        self: Runtime,
+        lane: Lane,
+        role: Role,
+        arguments: []const []const u8,
+        lock: *core.private_files.Locked,
+        stdout_name: []const u8,
+        stderr_name: []const u8,
+        version_only: bool,
+    ) !process.PrivateResult {
         try self.programs.validate();
+        try self.verifyInterpreter();
         var budget = try self.budgets.call(lane, role);
+        if (version_only) {
+            const limit = try process.Deadline.afterMilliseconds(30000);
+            budget.deadline.expires_ns = @min(budget.deadline.expires_ns, limit.expires_ns);
+            budget.cleanup_deadline.expires_ns = @min(budget.cleanup_deadline.expires_ns, budget.deadline.expires_ns + (term_grace_ms + reap_ms) * std.time.ns_per_ms);
+        }
         if (lane == .primary and self.cancellation.flag().load(.acquire)) return error.Cancelled;
         if (arguments.len > 127) return error.InvalidArguments;
         var argv: [128][]const u8 = undefined;
@@ -230,8 +298,8 @@ pub const Runtime = struct {
                 .cwd = lock.directory.dir,
                 .deadline = budget.deadline,
                 .cleanup_ms = if (role == .uploader) transfer_reserve_ms + reap_ms else term_grace_ms + reap_ms,
-                .stdout_limit = output_limit,
-                .stderr_limit = output_limit,
+                .stdout_limit = if (version_only) 4096 else output_limit,
+                .stderr_limit = if (version_only) 4096 else output_limit,
                 .cancel = if (lane == .primary) self.cancellation.flag() else null,
             },
             .term_grace_ms = if (role == .uploader) transfer_reserve_ms else term_grace_ms,

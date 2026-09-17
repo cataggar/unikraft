@@ -179,6 +179,10 @@ implementation dependencies remain permitted for resource management.
 The direct build needs no SDK download or new auth provider and reuses the
 existing `EvidenceInput`/`parseWorkload` module APIs, not a competing parser.
 
+Both direct controllers support the same [local launcher preflight and explicit
+interpreter option](#local-cli-startup-before-consumption). This does not change
+their separate approval, topology, seed/image or result contracts.
+
 ```sh
 umask 077
 mkdir -p .d/direct-cache .d/direct-global .d/direct-runtime
@@ -196,6 +200,8 @@ TMPDIR="$PWD/.d/direct-runtime" zig build \
   /EXPLICIT/path/to/az \
   /EXPLICIT/native/bin/uk-hyperv \
   "$PWD/.d/direct-tools/bin/uk-hyperv-direct-validate"
+# For a reviewed tarball launcher requiring Python, append:
+#   --az-python /EXPLICIT/CANONICAL/path/to/python3.14
 ```
 
 The scope and private seed files must be owner-private regular files in
@@ -205,6 +211,89 @@ ledger for this original seed**, not a fresh alternative ledger on retry.
 The controller reserves attempt UUID, original run/disk identity and seed digest with
 atomic directories, then syncs consumption before the first cloud effect.
 It never removes those records. An incomplete reservation remains consumed.
+
+### Local CLI startup before consumption
+
+An offline/tarball Azure CLI launcher can require `AZ_PYTHON` even though a
+self-contained CLI does not. The controller deliberately **does not inherit**
+ambient `AZ_PYTHON`, `PATH`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`,
+`LD_PRELOAD` or `LD_LIBRARY_PATH`. Do not work around this by changing system
+installations, exporting language hooks or wrapping the controller.
+
+Select the reviewed CLI and, only if needed, its interpreter with explicit
+canonical absolute paths. The CLI and interpreter must be regular executable
+files; no path component may be a symlink. For example, an operator may inspect
+`readlink -f` on their selected versioned install to find the canonical path,
+but must review it rather than blindly copying ambient `AZ_PYTHON`. The
+interpreter must not be group/world writable. Its inode/device, size, mode,
+owner, link count and modification/change timestamps are pinned through the
+existing executable custody mechanism, rechecked after successful startup and
+before/after lifecycle child operations. The selected interpreter is supplied
+as `AZ_PYTHON` **only to the Azure child**, never to the native validator or
+uploader. The reviewed tarball launcher still establishes its own bundled
+Python package path; no ambient Python hook is restored. The controller sets
+the fixed `PYTHONDONTWRITEBYTECODE=1` to avoid writing into the selected tool
+installation, independently of any operator value.
+
+Run this local-only command before obtaining a future live approval:
+
+```sh
+umask 077
+# Existing private parent; use a fresh directory for these local captures.
+mkdir -m 700 "$PRIVATE_PARENT/FRESH-cli-startup"
+AZURE_CONFIG_DIR="$REVIEWED_OPERATOR_AZURE_CONFIG" \
+  "$DIRECT_TOOLS/uk-hyperv-direct-two-boot" preflight \
+  "$PRIVATE_PARENT/FRESH-cli-startup" "$REVIEWED_CANONICAL_AZ" \
+  --az-python "$REVIEWED_CANONICAL_PYTHON"
+# Omit the final flag/value for a self-contained CLI.
+# uk-wamr-direct-compute has the identical preflight interface.
+```
+
+`preflight` accepts no scope, subscription, attempt or ledger argument. It runs
+only `az version --output json --only-show-errors` under the same selected,
+cleared environment as the lifecycle. It requires exit zero, complete bounded
+capture, confirmed process cleanup, empty stderr and the exact supported Azure
+version object (`azure-cli`, matching `azure-cli-core`, `azure-cli-telemetry`,
+`extensions` with bounded names/three-part numeric versions). It fails closed
+on malformed/duplicate/extra/noisy output, timeout or output overflow.
+The ceiling is 30 seconds, 4096 bytes per stream, plus the existing two-second
+TERM/one-second reap budget. Captures and separate child/cleanup/recording
+status stay private; stdout reports only `authority=not_admitted`. This is
+launcher compatibility, **not account/resource preflight, provenance
+attestation, cloud authority or an admission receipt**.
+
+Normal invocation automatically repeats that exact check after scope/input
+validation and **before any attempt/seed/source/image reservation or resource
+call**. It uses the lesser of that ceiling and the original operation/execution
+budget, rechecks expiry/cancellation/custody before consumption, and does not
+restart or extend a deadline. This invocation has already created a private
+attempt directory for diagnostics: startup failure leaves that directory
+non-resumable but the ledger unconsumed. Use standalone preflight to detect
+launcher failures without creating an attempt at all. A standalone pass cannot
+be replayed to skip the automatic check.
+
+The planned campaign ledger must already exist and be owner-private (0700).
+For a genuinely new campaign, create its reviewed persistent ledger once,
+**before the first invocation**:
+
+```sh
+# New campaign initialization ONLY, not recovery/reset of an existing ledger.
+mkdir -m 700 "$REVIEWED_NEW_CAMPAIGN_LEDGER"
+```
+
+For an existing campaign, use its original ledger unchanged; do not create a
+replacement. Missing ledger now reports sanitized
+`phase=pre-admission reason=CampaignLedgerMissing` without claiming that
+nonexistent attempt records can be inspected. Other early failures expose an
+error name, never arbitrary child output, credentials or private paths.
+
+An already consumed failure stays consumed even if no resource was created.
+Never delete, clear, copy, rename or substitute its ledger/claims, never resume
+its attempt, and never reuse its grant. Fresh human approval is required before
+any further live invocation, even while an earlier window remains open. A fresh
+attempt UUID alone cannot bypass the same persistent ledger's seed/source/image
+reservation. If those bytes/identities are already consumed, this software
+continues to refuse them; it introduces no retry or administrative override.
 
 The fresh group name is `prefix-rg`; VM, OS/data disks and private networking
 are named from the same prefix. All resources must match the attempt UUID,
@@ -220,7 +309,7 @@ native-only; there is no shell entry or reference-controller fallback.
 
 ## Lifecycle and failure semantics
 
-1. Validate approval and exact local inputs; durably consume the original seed.
+1. Validate approval, exact local inputs and local CLI startup; durably consume the original seed.
 2. Create one fresh tagged group and the exact OS/data upload disks. Upload
    sizes include the footer; no `diskSizeGB` resize is requested. Native pages
    retain their existing <=4 MiB PUT/MD5/hash/footer checks.

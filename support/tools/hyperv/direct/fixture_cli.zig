@@ -448,6 +448,32 @@ fn run(init: std.process.Init) !void {
     const args = argv[1..];
     for (argv) |arg| try f.expect(std.mem.indexOf(u8, arg, f.sentinel) == null);
     try f.expect(args.len > 0);
+    if (eq(args[0], "version")) {
+        try f.expect(args.len == 4 and eq(args[1], "--output") and eq(args[2], "json") and eq(args[3], "--only-show-errors"));
+        for ([_][]const u8{ "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH" }) |key|
+            try f.expect(init.environ_map.get(key) == null);
+        // This confined fixture control is not recognized by production.
+        const control = c.read("cli-version-control") catch |err| switch (err) {
+            error.FileNotFound => "success",
+            else => return err,
+        };
+        const dir = try f.files.Directory.open(init.io, try c.path("ledger"));
+        defer dir.close(init.io);
+        var it = dir.dir.iterate();
+        try f.expect(try it.next(init.io) == null);
+        try c.write("cli-version-called", "before-consumption\n");
+        if (eq(control, "fail")) std.process.exit(29);
+        if (eq(control, "malformed")) return fake.output("{\"azure-cli\":\"2.0.0\"}\n");
+        if (eq(control, "overflow")) return fake.output(try a.dupe(u8, &([_]u8{'x'} ** 8192)));
+        if (eq(control, "timeout") or eq(control, "expire"))
+            try std.Io.sleep(init.io, .fromSeconds(if (eq(control, "timeout")) 20 else 6), .awake);
+        if (eq(control, "stderr")) {
+            var stderr = std.Io.File.stderr().writerStreaming(init.io, &.{});
+            try stderr.interface.writeAll("private synthetic startup diagnostic\n");
+        } else try f.expect(one(control, &.{ "success", "timeout", "expire" }));
+        if (init.environ_map.get("AZ_PYTHON")) |python| try f.expect(eq(python, argv[0]));
+        return fake.output("{\"azure-cli\":\"2.80.0\",\"azure-cli-core\":\"2.80.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}\n");
+    }
     if (eq(args[0], "__overflow-payload")) {
         try f.expect(args.len == 1 and fake.is("process-output-overflow"));
         return seams.Overflow.emit(c);

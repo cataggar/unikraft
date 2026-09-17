@@ -180,7 +180,7 @@ class Compute(unittest.TestCase):
                                env={"HOME": str(self.root)}, capture_output=True, timeout=30)
         self.assertNotEqual(other.returncode, 0)
 
-    def lifecycle(self, scenario="success", log1=None, log2=None):
+    def lifecycle(self, scenario="success", log1=None, log2=None, python=False):
         root = self.root
         write(root / "ISOLATED_OFFLINE_FIXTURE", b"direct-two-boot-offline-only\n")
         write(root / "fixture-backend.json", {"backend": "native"})
@@ -192,6 +192,8 @@ class Compute(unittest.TestCase):
         (root / "ledger").mkdir(mode=0o700)
         args = [CONTROLLER, self.scope_path, root / "attempt", root / "ledger",
                 FAKE, FAKE, FAKE]
+        if python:
+            args += ["--az-python", FAKE]
         # No inherited HOME, Azure config, PATH, credentials or real CLI. The
         # existing native fixture checks its marker, ELF names and confinement.
         env = {"UK_DIRECT_FIXTURE_ROOT": str(root),
@@ -240,6 +242,185 @@ class Compute(unittest.TestCase):
         self.assertNotEqual(outcome["cleanup_exit"], 0)
         self.assertFalse(outcome["accepted"])
         self.assertFalse(outcome["owned_group_absent"])
+
+    def test_explicit_interpreter_preflight_precedes_consumption(self):
+        completed, outcome, *_ = self.lifecycle(python=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(outcome["accepted"])
+        self.assertEqual((self.root / "cli-version-called").read_bytes(), b"before-consumption\n")
+        record = read(self.root / "attempt/cli-version.process.json")
+        self.assertEqual(record["interpreter"]["path"], str(FAKE))
+        self.assertEqual(record["authority"], "not_admitted")
+
+    def test_cli_startup_failure_leaves_ledger_unconsumed(self):
+        write(self.root / "cli-version-control", b"fail")
+        completed, outcome, calls, *_ = self.lifecycle()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(outcome["primary_exit"], 29)
+        self.assertEqual(outcome["cleanup_exit"], 0)
+        self.assertFalse(outcome["group_creation_attempted"])
+        self.assertFalse(outcome["owned_group_absent"])
+        self.assertEqual(outcome["reserved_boots"], 0)
+        self.assertEqual(calls, "")
+        self.assertEqual(list((self.root / "ledger").iterdir()), [])
+        self.assertFalse((self.root / "attempt/consumed.json").exists())
+        self.assertEqual(read(self.root / "attempt/cli-version.process.json")["termination"], {"exited": 29})
+
+    def test_malformed_cli_version_cannot_consume(self):
+        write(self.root / "cli-version-control", b"malformed")
+        completed, outcome, calls, *_ = self.lifecycle()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(list((self.root / "ledger").iterdir()), [])
+        self.assertEqual(calls, "")
+        self.assertFalse(outcome["accepted"])
+        self.assertIn("CliVersionInvalid", (self.root / "attempt/driver.stderr").read_text())
+
+    def test_cli_startup_timeout_preserves_original_operation_budget(self):
+        self.scope["operation_seconds"] = 10
+        write(self.scope_path, self.scope)
+        write(self.root / "cli-version-control", b"timeout")
+        start = time.monotonic()
+        completed, outcome, calls, *_ = self.lifecycle()
+        self.assertEqual(completed.returncode, 124)
+        self.assertEqual(outcome["primary_exit"], 124)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertEqual(list((self.root / "ledger").iterdir()), [])
+        self.assertEqual(calls, "")
+        record = read(self.root / "attempt/cli-version.process.json")
+        self.assertEqual(record["failures"]["primary"]["category"], "timeout")
+        self.assertTrue(record["cleanup_complete"])
+
+    def test_approval_expiring_during_successful_startup_cannot_consume(self):
+        self.scope["approval"]["expires_unix"] = int(time.time()) + 5
+        write(self.scope_path, self.scope)
+        write(self.root / "cli-version-control", b"expire")
+        completed, outcome, calls, *_ = self.lifecycle()
+        self.assertEqual(completed.returncode, 125)
+        self.assertEqual(outcome["primary_exit"], 125)
+        self.assertEqual(list((self.root / "ledger").iterdir()), [])
+        self.assertEqual(calls, "")
+        self.assertEqual(read(self.root / "attempt/cli-version.process.json")["termination"], {"exited": 0})
+
+    def test_bounded_cli_version_cannot_consume(self):
+        write(self.root / "cli-version-control", b"overflow")
+        completed, outcome, calls, *_ = self.lifecycle()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(list((self.root / "ledger").iterdir()), [])
+        self.assertEqual(calls, "")
+        self.assertFalse(outcome["accepted"])
+        self.assertLessEqual((self.root / "attempt/cli-version.stdout").stat().st_size, 4096)
+
+    def test_cli_stderr_cannot_consume(self):
+        write(self.root / "cli-version-control", b"stderr")
+        completed, outcome, calls, *_ = self.lifecycle()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(list((self.root / "ledger").iterdir()), [])
+        self.assertEqual(calls, "")
+        self.assertFalse(outcome["accepted"])
+        self.assertNotIn(b"private synthetic", completed.stderr + completed.stdout)
+
+    def test_missing_campaign_ledger_has_preadmission_diagnostic(self):
+        for name in ("uk-wamr-direct-compute", "uk-hyperv-direct-two-boot"):
+            completed = subprocess.run(
+                [TOOLS / name, self.scope_path, self.root / "attempt", self.root / "missing-ledger",
+                 FAKE, FAKE, FAKE], env={"HOME": str(self.root)},
+                capture_output=True, timeout=10)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(b"phase=pre-admission reason=CampaignLedgerMissing", completed.stderr)
+            self.assertNotIn(str(self.root).encode(), completed.stderr)
+            self.assertFalse((self.root / "attempt").exists())
+            self.assertFalse((self.root / "missing-ledger").exists())
+
+    def test_interpreter_path_refused_before_attempt_creation(self):
+        binary = self.root / "python"
+        shutil.copyfile(FAKE, binary)
+        binary.chmod(0o700)
+        link = self.root / "python-link"
+        link.symlink_to(binary)
+        directory = self.root / "directory"
+        directory.mkdir(mode=0o700)
+        nonexec = self.root / "nonexec"
+        write(nonexec, b"not executable")
+        unsafe = self.root / "unsafe"
+        write(unsafe, b"not a trusted interpreter")
+        unsafe.chmod(0o777)
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo, 0o600)
+        for path in ("relative-python", self.root / "missing", link, directory, nonexec, unsafe, fifo):
+            with self.subTest(kind=str(path.name) if isinstance(path, Path) else path):
+                completed = subprocess.run(
+                    [TOOLS / "uk-wamr-direct-compute", self.scope_path, self.root / "attempt",
+                     self.root / "ledger", FAKE, FAKE, FAKE, "--az-python", path],
+                    env={"HOME": str(self.root)}, capture_output=True, timeout=10)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"phase=pre-admission", completed.stderr)
+                self.assertNotIn(str(self.root).encode(), completed.stderr)
+                self.assertFalse((self.root / "attempt").exists())
+                self.assertFalse((self.root / "ledger").exists())
+
+    def test_production_standalone_preflight_never_needs_attempt_or_ledger(self):
+        fixture = TOOLS / "hyperv-direct-runtime-fixture"
+        with fixture.open("rb") as stream:
+            self.assertEqual(stream.read(4), b"\x7fELF")
+        for name in ("uk-wamr-direct-compute", "uk-hyperv-direct-two-boot"):
+            for python in (False, True):
+                capture = self.root / (name + str(python))
+                capture.mkdir(mode=0o700)
+                args = [TOOLS / name, "preflight", capture, fixture]
+                if python:
+                    args += ["--az-python", fixture]
+                env = dict.fromkeys(("AZ_PYTHON", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+                                     "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH"), "/never/inherit")
+                # Loader hooks cannot be supplied to the controller executable
+                # itself; native Environment tests cover their removal directly.
+                del env["LD_PRELOAD"]
+                del env["LD_LIBRARY_PATH"]
+                env["HOME"] = str(self.root)
+                completed = subprocess.run(args, env=env, capture_output=True, timeout=10)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(b"authority=not_admitted", completed.stdout)
+                self.assertEqual(completed.stderr, b"")
+                self.assertEqual(set(p.name for p in capture.iterdir()), {
+                    ".writer.lock", "cli-version.stdout", "cli-version.stderr", "cli-version.process.json"})
+        self.assertFalse((self.root / "attempt").exists())
+        self.assertFalse((self.root / "ledger").exists())
+
+    def test_standalone_preserves_child_and_recording_failures(self):
+        fixture = self.root / "cli-version-exit29"
+        shutil.copyfile(TOOLS / "hyperv-direct-runtime-fixture", fixture)
+        fixture.chmod(0o700)
+        capture = self.root / "preflight-capture"
+        capture.mkdir(mode=0o700)
+        write(capture / "cli-version.process.json", b"existing immutable record")
+        completed = subprocess.run(
+            [TOOLS / "uk-wamr-direct-compute", "preflight", capture, fixture],
+            env={"HOME": str(self.root)}, capture_output=True, timeout=10)
+        self.assertEqual(completed.returncode, 29)
+        status = json.loads(completed.stderr)
+        self.assertEqual(status["phase"], "local-cli-startup")
+        self.assertEqual(status["termination"], {"exited": 29})
+        self.assertIsNotNone(status["recording_error"])
+        self.assertTrue(status["cleanup_complete"])
+        self.assertNotIn(str(self.root).encode(), completed.stderr)
+        self.assertEqual((capture / "cli-version.process.json").read_bytes(), b"existing immutable record")
+
+    def test_required_interpreter_is_not_recovered_from_ambient_variable(self):
+        fixture = self.root / "requires-python"
+        shutil.copyfile(TOOLS / "hyperv-direct-runtime-fixture", fixture)
+        fixture.chmod(0o700)
+        for explicit in (False, True):
+            capture = self.root / ("required-python" + str(explicit))
+            capture.mkdir(mode=0o700)
+            args = [TOOLS / "uk-wamr-direct-compute", "preflight", capture, fixture]
+            if explicit:
+                args += ["--az-python", TOOLS / "hyperv-direct-runtime-fixture"]
+            completed = subprocess.run(args, env={"HOME": str(self.root), "AZ_PYTHON": str(fixture)},
+                                       capture_output=True, timeout=10)
+            self.assertEqual(completed.returncode == 0, explicit, completed.stderr)
+            if not explicit:
+                self.assertEqual(json.loads(completed.stderr)["reason"], "CliStartupFailed")
+        self.assertFalse((self.root / "attempt").exists())
+        self.assertFalse((self.root / "ledger").exists())
 
     def test_cumulative_identical_boot_output_requires_two_real_frames(self):
         self.scope["serial_mode"] = "azure_cumulative"

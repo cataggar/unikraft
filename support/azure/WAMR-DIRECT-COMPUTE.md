@@ -168,6 +168,39 @@ incomplete import never publishes the final operator `bundle.json`.
 
 ## Final approval, run and cleanup boundary
 
+Before seeking approval, use the shared [local CLI startup preflight](DIRECT-TWO-BOOT.md#local-cli-startup-before-consumption):
+
+```sh
+umask 077
+mkdir -m 700 "$PRIVATE_PARENT/FRESH-cli-startup"
+"$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-compute" preflight \
+  "$PRIVATE_PARENT/FRESH-cli-startup" "$REVIEWED_CANONICAL_AZ" \
+  --az-python "$REVIEWED_CANONICAL_PYTHON"
+```
+
+The final option is required only for a reviewed launcher needing `AZ_PYTHON`;
+omit it for a self-contained CLI. Use reviewed canonical executable paths,
+not a symlinked version alias or an unchecked ambient variable. The interpreter
+is explicitly pinned/rechecked, while arbitrary Python settings and loader
+hooks remain excluded. The only child command is bounded local `az version`;
+passing does not authenticate an account, inspect resources, consume an attempt
+or authorize Azure use. Raw output and tool identities remain private.
+
+Create the reviewed persistent campaign ledger once, mode 0700, before its
+first invocation; for an existing campaign use the original ledger unchanged.
+Do not confuse this existing ledger with the required **nonexistent** attempt
+directory. A missing ledger is a pre-admission refusal with a sanitized reason.
+
+The initial explicitly approved tiny attempt failed before resource creation
+because the selected tarball CLI needed an interpreter that the restricted
+environment correctly did not inherit. That attempt's reservations remain
+consumed, its records and grant are frozen, and it established no VM boot or
+Azure compute result. This software fix grants no retry. A subsequent live
+invocation needs fresh approval even if the old window has not expired; it
+must still use the same persistent ledger and satisfy its unchanged
+attempt/source-tree/image consumption rules. Do not clear/copy/substitute
+claims or reinterpret the old failure as an unconsumed attempt.
+
 Planning ceilings (USD1000/72h/three concurrent campaign VMs), Azure
 authentication, provider/quota availability, old grants and earlier images are
 **not** execution authority. This adapter is deliberately smaller: one VM,
@@ -195,10 +228,11 @@ to execute now**) is:
 ```text
 uk-wamr-direct-compute APPROVED_SCOPE_JSON FRESH_ATTEMPT_DIR CAMPAIGN_LEDGER \
   EXPLICIT_AZ_EXECUTABLE EXPLICIT_UK_HYPERV_TRANSFER_CLI \
-  EXPLICIT_UK_WAMR_DIRECT_VALIDATE
+  EXPLICIT_UK_WAMR_DIRECT_VALIDATE [--az-python EXPLICIT_CANONICAL_INTERPRETER]
 ```
 
-The engine checks source scope custody, approval, bundle and exact inputs
+The engine checks source scope custody, approval, bundle, exact inputs and
+bounded clean-environment CLI startup
 before consuming attempt/source-tree/image reservations in that ledger and
 before the first Azure call. Reservations are retained on failure. A fresh
 attempt directory is mandatory; neither resume nor an automatic retry exists.

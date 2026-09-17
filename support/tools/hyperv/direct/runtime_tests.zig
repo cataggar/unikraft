@@ -98,6 +98,8 @@ test "explicit selected operator environment excludes ambient secrets paths and 
     try source.put("SAS", "?sig=never-inherit");
     try source.put("PATH", "/never/discover");
     try source.put("PYTHONPATH", "/never/discover");
+    inline for (.{ "AZ_PYTHON", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD", "LD_LIBRARY_PATH" }) |key|
+        try source.put(key, "/never/inherit");
     try source.put("LC_ALL", "other");
     try source.put("AZURE_CORE_COLLECT_TELEMETRY", "1");
     var environment = try runtime.Environment.init(allocator, &source);
@@ -105,11 +107,109 @@ test "explicit selected operator environment excludes ambient secrets paths and 
     try testing.expectEqualStrings("/private/operator/azure", environment.azure.get("AZURE_CONFIG_DIR").?);
     try testing.expectEqualStrings("C", environment.azure.get("LC_ALL").?);
     try testing.expectEqualStrings("0", environment.azure.get("AZURE_CORE_COLLECT_TELEMETRY").?);
-    for ([_][]const u8{ "PRIVATE_SECRET", "SAS", "PATH", "PYTHONPATH" }) |key|
+    try testing.expectEqualStrings("1", environment.azure.get("PYTHONDONTWRITEBYTECODE").?);
+    for ([_][]const u8{ "PRIVATE_SECRET", "SAS", "PATH", "PYTHONPATH", "AZ_PYTHON", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD", "LD_LIBRARY_PATH" }) |key|
         try testing.expect(environment.azure.get(key) == null);
     try testing.expect(environment.native.get("HOME") == null);
     try source.put("HTTPS_PROXY", "https://proxy.invalid?sig=secret");
     try testing.expectError(error.SecretArgument, runtime.Environment.init(allocator, &source));
+}
+
+test "local version executes self contained and explicitly pinned interpreter under clean environment" {
+    const launcher = @import("launcher.zig");
+    const custody = @import("custody.zig");
+    for ([_]bool{ false, true }) |python| {
+        var fixture = try support.Fixture.init();
+        defer fixture.deinit();
+        var lock = try fixture.directory.lock(io);
+        defer lock.close(io);
+        const executable = try support.executable();
+        defer allocator.free(executable);
+        var operator = std.process.Environ.Map.init(allocator);
+        defer operator.deinit();
+        try operator.put("HOME", support.options.test_root.?);
+        inline for (.{ "AZ_PYTHON", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "PRIVATE_SECRET" }) |key|
+            try operator.put(key, "/never/inherit");
+        var environment = try runtime.Environment.init(allocator, &operator);
+        defer environment.deinit();
+        const interpreter = try launcher.selectInterpreter(io, &environment, if (python) executable else null);
+        var cancellation = try core.process.SignalCancellation.install();
+        defer cancellation.deinit();
+        var scope = timingScope();
+        scope.approval.expires_unix = std.math.maxInt(u64);
+        var budgets = try runtime.Budgets.start(scope);
+        const adapter: runtime.Runtime = .{
+            .allocator = allocator,
+            .io = io,
+            .programs = .{ .azure = executable, .uploader = executable, .validator = executable, .azure_python = if (python) executable else null },
+            .environment = &environment,
+            .budgets = &budgets,
+            .cancellation = &cancellation,
+            .interpreter = interpreter,
+        };
+        try adapter.initialize();
+        var status: launcher.Status = .{};
+        try launcher.check(adapter, &lock, try custody.Reference.tool(io, executable), &status);
+        try testing.expect(status.child.?.succeeded());
+        try testing.expect(status.recording_error == null);
+        try testing.expectError(error.FileNotFound, fixture.directory.openFile(io, "consumed.json"));
+        try support.noChildren();
+    }
+}
+
+test "pinned interpreter changed in place or replaced refuses before child creation" {
+    const launcher = @import("launcher.zig");
+    for ([_]bool{ false, true }) |replace| {
+        var fixture = try support.Fixture.init();
+        defer fixture.deinit();
+        var lock = try fixture.directory.lock(io);
+        defer lock.close(io);
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}/python", .{ support.options.test_root.?, fixture.name });
+        defer allocator.free(path);
+        var file = try fixture.directory.dir.createFile(io, "python", .{ .permissions = .fromMode(0o700) });
+        try file.writePositionalAll(io, "synthetic interpreter", 0);
+        file.close(io);
+        var operator = std.process.Environ.Map.init(allocator);
+        defer operator.deinit();
+        try operator.put("HOME", support.options.test_root.?);
+        var environment = try runtime.Environment.init(allocator, &operator);
+        defer environment.deinit();
+        const interpreter = try launcher.selectInterpreter(io, &environment, path);
+        if (replace) try fixture.directory.dir.deleteFile(io, "python");
+        file = try fixture.directory.dir.createFile(io, "python", .{ .permissions = .fromMode(0o700) });
+        try file.writePositionalAll(io, if (replace) "synthetic interpreter" else "changed interpreter", 0);
+        file.close(io);
+        var cancellation = try core.process.SignalCancellation.install();
+        defer cancellation.deinit();
+        var scope = timingScope();
+        scope.approval.expires_unix = std.math.maxInt(u64);
+        var budgets = try runtime.Budgets.start(scope);
+        const executable = try support.executable();
+        defer allocator.free(executable);
+        const adapter: runtime.Runtime = .{
+            .allocator = allocator,
+            .io = io,
+            .programs = .{ .azure = executable, .uploader = executable, .validator = executable, .azure_python = path },
+            .environment = &environment,
+            .budgets = &budgets,
+            .cancellation = &cancellation,
+            .interpreter = interpreter,
+        };
+        try testing.expectError(error.ReferenceChanged, adapter.version(&lock));
+        try testing.expectError(error.FileNotFound, fixture.directory.openFile(io, "cli-version.stdout"));
+        try support.noChildren();
+    }
+}
+
+test "local version parser requires complete exact bounded Azure version schema" {
+    const launcher = @import("launcher.zig");
+    const valid = "{\"azure-cli\":\"2.80.0\",\"azure-cli-core\":\"2.80.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}";
+    try launcher.validateVersion(allocator, valid);
+    for ([_][]const u8{
+        "",                                                                                                                                      "{}",                                                                                                           "null",                                                                                                           "true",                                                                                                                        "[]", valid ++ valid, "noise" ++ valid,
+        "{\"azure-cli\":\"2.80.0\",\"azure-cli\":\"2.80.0\",\"azure-cli-core\":\"2.80.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}", "{\"azure-cli\":\"2.80.0\",\"azure-cli-core\":\"2.81.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}", "{\"azure-cli\":\"-2.80.0\",\"azure-cli-core\":\"-2.80.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}", "{\"azure-cli\":\"2.80.0\",\"azure-cli-core\":\"2.80.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":[],\"extra\":true}",
+    }) |invalid| try testing.expectError(error.CliVersionInvalid, launcher.validateVersion(allocator, invalid));
+    try testing.expectError(error.CliVersionInvalid, launcher.validateVersion(allocator, &([_]u8{'x'} ** 4097)));
 }
 
 test "uploader uses the original native job parser and checks actual file budgets before spawning" {

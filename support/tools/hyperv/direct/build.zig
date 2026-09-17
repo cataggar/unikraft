@@ -146,6 +146,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(compute_controller);
     const compute_fixture_tools = b.step("compute-fixture-tools", "Install explicitly isolated WAMR fake backend and controller (no cloud)");
+    compute_fixture_tools.dependOn(&b.addInstallArtifact(runtime_fixture, .{}).step);
     inline for (.{
         .{ "wamr-direct-fixture-cli", "compute_fixture_cli.zig" },
         .{ "wamr-direct-controller-fixture", "compute_controller_fixture.zig" },

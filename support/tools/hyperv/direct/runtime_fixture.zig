@@ -39,6 +39,23 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.InvalidFixture;
     const mode = args[1];
+    if (std.mem.eql(u8, mode, "version") or std.mem.eql(u8, mode, "cli-interpreter")) {
+        for ([_][]const u8{ "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "PRIVATE_SECRET" }) |key|
+            if (init.environ_map.get(key) != null) return error.InvalidEnvironment;
+        if (std.mem.eql(u8, mode, "version")) {
+            if (args.len != 5 or !std.mem.eql(u8, args[2], "--output") or
+                !std.mem.eql(u8, args[3], "json") or !std.mem.eql(u8, args[4], "--only-show-errors")) return error.InvalidFixture;
+            const name = std.fs.path.basename(args[0]);
+            if (std.mem.eql(u8, name, "cli-version-exit29")) std.process.exit(29);
+            if (std.mem.eql(u8, name, "requires-python") and init.environ_map.get("AZ_PYTHON") == null)
+                return error.MissingExplicitInterpreter;
+            if (init.environ_map.get("AZ_PYTHON")) |python| {
+                return std.process.replace(init.io, .{ .argv = &.{ python, "cli-interpreter" }, .environ_map = init.environ_map });
+            }
+        } else if (init.environ_map.get("AZ_PYTHON") == null) return error.InvalidEnvironment;
+        try emit(1, "{\"azure-cli\":\"2.80.0\",\"azure-cli-core\":\"2.80.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}\n");
+        return;
+    }
     if (std.mem.eql(u8, mode, "bytes")) {
         if (args.len != 5) return error.InvalidFixture;
         const stdout = try std.fmt.parseInt(usize, args[2], 10);

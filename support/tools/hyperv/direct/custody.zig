@@ -207,6 +207,7 @@ pub const Reference = struct {
 pub const References = struct {
     artifacts: [profile.artifacts.len]Reference,
     tools: [3]Reference,
+    interpreter: ?Reference = null,
 
     pub fn capture(io: std.Io, scope: Scope, az: []const u8, uploader: []const u8, validator: []const u8) !References {
         var artifacts: [profile.artifacts.len]Reference = undefined;
@@ -221,6 +222,7 @@ pub const References = struct {
     pub fn verify(self: References, io: std.Io) !void {
         for (self.artifacts) |reference| try reference.verify(io);
         for (self.tools) |reference| try reference.verify(io);
+        if (self.interpreter) |reference| try reference.verify(io);
     }
 };
 
@@ -315,7 +317,10 @@ pub const Store = struct {
     }
 
     fn createImpl(allocator: std.mem.Allocator, io: std.Io, source_scope: []const u8, fresh_attempt: []const u8, existing_ledger: []const u8, fault: ?TestFault) !Store {
-        const ledger = try files.Directory.open(io, existing_ledger);
+        const ledger = files.Directory.open(io, existing_ledger) catch |err| switch (err) {
+            error.FileNotFound => return error.CampaignLedgerMissing,
+            else => return err,
+        };
         errdefer ledger.close(io);
         const parent = try files.FileParent.open(io, fresh_attempt, .artifact);
         defer parent.close(io);
