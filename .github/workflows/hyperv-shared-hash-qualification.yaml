@@ -103,8 +103,16 @@ jobs:
             "-Dstrip-fixture-report=${root}/candidate/${mode}/fixture-strip-proof.json" \
             "-Doptimize=${mode}" -j2 \
             test test-arm test-strip-equivalence test-strip-proof install --summary all
+          if "${root}/candidate/${mode}/out/bin/uk-hyperv-persistence-engine" run \
+            > "${root}/candidate/${mode}/parked-refusal.json" 2>&1; then
+            echo "unexpected production admission" >&2
+            exit 1
+          fi
+          grep -Fq '"reason":"production_bindings_unavailable"' \
+            "${root}/candidate/${mode}/parked-refusal.json"
         done
         zig build test-native-make-environment hyperv-object-proofs \
+          test-hyperv-persistence-workflow \
           -Doptimize=Debug -j2 \
           --cache-dir "${root}/native-build-cache" \
           --prefix "${root}/native-build-out" --summary all

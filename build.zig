@@ -1140,6 +1140,8 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .Debug,
     });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        persistence_evidence_core.addAssemblyFile(b.path("support/tools/hyperv/sha256_clear_upper.S"));
     const persistence_evidence = b.createModule(.{
         .root_source_file = b.path("support/tools/hyperv/persistence/evidence.zig"),
         .target = b.graph.host,

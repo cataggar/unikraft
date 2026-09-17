@@ -403,7 +403,10 @@ candidate on each same native x86 runner. Only build/probe dependencies are
 added to that baseline; it retains its original standard SHA calls. Each
 variant measures its actual qualified worker bytes, explicitly recorded rather
 than assumed identical. The candidate then runs every existing Debug and
-ReleaseSafe persistence/ARM/ELF-equivalence/proof case, plus shared SHA tests.
+ReleaseSafe persistence/ARM/ELF-equivalence/proof case, shared SHA tests and the
+installed CLI's parked-production refusal.
+Root native Make, object-verifier and acceptance-evidence consumers are also
+exercised through their existing runners.
 No optimization mode, deadline, input geometry or required context is changed.
 `build-cost-probe` and `build-fixtures` allow compile-only cross-target checks;
 they provide no native execution or timing evidence.
