@@ -7,6 +7,7 @@ const contracts = @import("contracts.zig");
 pub const Metadata = kconfig.Metadata;
 pub const Purpose = contracts.Purpose;
 pub const format = "unikraft-hyperv-guarded-config-native-v1";
+pub const direct_format = "unikraft-hyperv-direct-config-native-v1";
 pub const min_sectors: u64 = 49;
 pub const max_sectors: u64 = @as(u64, std.math.maxInt(i64)) / 512;
 pub const persistence_sectors: u64 = 8388608;
@@ -83,15 +84,32 @@ pub fn validateGuardPurpose(guard: Guard, purpose: Purpose) !void {
 
 pub fn render(allocator: std.mem.Allocator, guard: Guard) ![]u8 {
     try validateGuard(guard);
+    const bytes = try renderFragment(allocator, guard, false);
+    errdefer allocator.free(bytes);
+    try validate(allocator, bytes, guard);
+    return bytes;
+}
+
+/// A separate unsolved fragment, never a rewrite of the original seed config.
+pub fn renderDirectPersistence(allocator: std.mem.Allocator, guard: Guard) ![]u8 {
+    try validateGuardPurpose(guard, .persistence);
+    if (contracts.same(guard.run_id, guard.disk_id)) return error.IdentityCollision;
+    const bytes = try renderFragment(allocator, guard, true);
+    errdefer allocator.free(bytes);
+    try validateDirectPersistence(allocator, bytes, guard);
+    return bytes;
+}
+
+fn renderFragment(allocator: std.mem.Allocator, guard: Guard, comptime direct: bool) ![]u8 {
     const bytes = try std.fmt.allocPrint(allocator,
         \\# {s}
-        \\CONFIG_APPHYPERVACCEPTANCE=y
+        \\{s}CONFIG_APPHYPERVACCEPTANCE=y
         \\CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y
         \\CONFIG_LIBSTORVSC=y
         \\CONFIG_LIBSTORVSC_LUN_DISCOVERY=y
         \\CONFIG_LIBSTORVSC_GUARDED_IO=y
         \\CONFIG_LIBSTORVSC_MAX_DEVICES=2
-        \\CONFIG_LIBSTORVSC_MAX_LUNS=8
+        \\CONFIG_LIBSTORVSC_MAX_LUNS={d}
         \\# CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION is not set
         \\CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID="{s}"
         \\CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID="{s}"
@@ -100,9 +118,15 @@ pub fn render(allocator: std.mem.Allocator, guard: Guard) ![]u8 {
         \\CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2
         \\CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN={d}
         \\
-    , .{ format, &guard.run_id, &guard.disk_id, guard.sectors, guard.lun });
-    errdefer allocator.free(bytes);
-    try validate(allocator, bytes, guard);
+    , .{
+        if (direct) direct_format else format,
+        if (direct) "CONFIG_UKPLAT_CPU_MAXCOUNT=1\n" else "",
+        @as(u8, if (direct) 2 else 8),
+        &guard.run_id,
+        &guard.disk_id,
+        guard.sectors,
+        guard.lun,
+    });
     return bytes;
 }
 
@@ -156,13 +180,45 @@ pub fn validateDirectPersistence(
     bytes: []const u8,
     expected: Guard,
 ) !void {
+    return validateDirectPersistenceWithMetadata(allocator, bytes, expected, null);
+}
+
+/// With actual metadata, every supplied candidate setting must be declared.
+/// This checks types/guard/CPU limits, not whether a solver ran, the complete
+/// target profile, source authentication, or independent approval of its bytes.
+pub fn validateDirectPersistenceWithMetadata(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    expected: Guard,
+    metadata: ?*const Metadata,
+) !void {
     try validateGuardPurpose(expected, .persistence);
+    if (contracts.same(expected.run_id, expected.disk_id)) return error.IdentityCollision;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    var document = try parseDocument(arena.allocator(), bytes, null);
+    var types = Metadata.init(arena.allocator());
+    defer types.deinit();
+    try types.addSymbol("UKPLAT_CPU_MAXCOUNT", .integer);
+    if (metadata) |actual| {
+        for (actual.symbols.items) |symbol| {
+            if (std.mem.eql(u8, symbol.name, "UKPLAT_CPU_MAXCOUNT")) {
+                if (symbol.symbol_type != .integer) return error.ConflictingMetadata;
+            } else try types.addSymbol(symbol.name, symbol.symbol_type);
+        }
+    }
+    var document = try parseDocument(arena.allocator(), bytes, &types);
     defer document.deinit();
     const actual = try documentGuardWithLuns(&document, 2);
     if (!contracts.same(actual, expected)) return error.IdentityChanged;
+    if (document.get("UKPLAT_CPU_MAXCOUNT") != null or metadata != null) {
+        if (try integer(&document, "UKPLAT_CPU_MAXCOUNT") != 1) return error.InvalidGuardProfile;
+    }
+    if (metadata) |provided| {
+        for (document.entries.items) |entry|
+            if (provided.typeOf(entry.name) == null) return error.IncompleteMetadata;
+        if (!(try document.getBool("APPHYPERVACCEPTANCE") orelse return error.MissingRequired))
+            return error.InvalidGuardProfile;
+    }
 }
 
 /// Re-emit all parsed options, including unrelated ones, without changing guard

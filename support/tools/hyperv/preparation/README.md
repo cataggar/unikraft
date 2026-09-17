@@ -154,6 +154,121 @@ AArch64 and x86_64 hosts, not cross-compilation, is required before publication.
 Tools/caches/fixtures must be distinct from CI or other worktrees' mutable state;
 no namespace, privileged fixture, service, runner or cloud setup is needed.
 
+## Original-to-direct configuration (offline #88 substage)
+
+```text
+uk-hyperv-prepare direct-config ORIGINAL_SEED_DIR EXPECTED_PRODUCTION_SHA256 PRIVATE_PARENT FRESH_BASENAME
+```
+
+This command completely validates the expected original-seed production record
+and all original bytes through `original_seed.inspect`, then emits a **separate
+unsolved direct fragment**. It generates no identities: only `original-seed`
+generates fresh run/disk IDs. No caller-supplied config text, override sequence,
+solver/compiler, namespace, subprocess, VM, source review, build receipt or
+approval participates in derivation.
+
+Set `umask 077`. Both input and parent must be existing canonical private
+mode-0700 roots satisfying the shared owner/ancestor/no-link policy. The
+original's existing lock is opened read-only and held exclusively; a missing
+lock is refused, never recreated. All six original artifact/control descriptors
+remain pinned, including the production record and start marker. Original
+names, full metadata, directory identity and lock custody are rechecked.
+Outputs inside the original directory are refused.
+
+`FRESH_BASENAME` must be a single non-hidden component. Any existing child,
+including a file or dangling symlink, is refused. The parent/child use stable
+native writer locks and create-only durable publication. The new child contains
+mode-0600, single-link files:
+
+| File | Meaning |
+| --- | --- |
+| `direct.config` | Fixed direct policy-2 fragment with the original run/disk IDs, 8,388,608 sectors, 512-byte sectors, LUN 7, `MAX_DEVICES=2`, `MAX_LUNS=2`, persistence/guarded I/O/REPORT LUNS enabled and application networking disabled. It explicitly pins the tracked `UKPLAT_CPU_MAXCOUNT=1` symbol. |
+| `derivation.started.json` | Local start marker; retained on success or failure, never acceptance. |
+| `derivation.json` | Canonical `hyperv_direct_configuration_derivation_native_v1` record. Separately binds the original production record, manifest, **original MAX_LUNS=8 config**, raw/VHD, and derived config by path/size/mode/full SHA-256, with the exact unchanged guard. |
+| `.writer.lock` | Stable native writer lock. |
+
+`config.renderDirectPersistence` emits the typed fragment directly; it neither
+parses arbitrary caller options nor edits/normalizes the original fragment.
+Original `config.render` output remains byte-for-byte unchanged.
+`MAX_LUNS` counts retained identities, not the largest numeric LUN.
+
+The original pair is fully scanned twice: before creating the output child and
+again immediately before final record publication. The final record/config,
+inventory, original descriptors and all directory/lock bindings are checked
+after publication before stdout. This costs about **16 GiB of logical reads**
+for derivation alone, not sparse-extent sampling. Originals are never copied,
+rewritten or relabelled. The original SHA supplied by the caller is a byte
+commitment, not authenticated provenance or proof of global ledger nonreuse.
+
+Failures leave private partial output/history intact. Missing/invalid records,
+file or directory sync failures, publication ambiguity, changed originals or
+locks, and incomplete output never produce a success digest. A visible record
+after failure is not durable acceptance. Never adopt/delete a partial child to
+retry in place; choose a different fresh basename. No shared root is deleted.
+
+Stdout and the record say `authority=not_admitted`, local configuration only,
+`configuration=unsolved_fragment`, and explicitly disclaim solved approval,
+source authentication, build, boot, device and cloud acceptance. The fragment is
+for later application to the tracked acceptance profile under a fixed producer;
+it is **not** a complete target configuration, proof that Kconfig was solved, or
+an independently approved solution.
+
+### Metadata-aware direct validation primitive
+
+`config.validateDirectPersistenceWithMetadata(allocator, candidate, guard,
+metadata)` is the metadata-aware counterpart of `validateDirectPersistence`.
+With actual non-null native `config.Metadata`, **every supplied candidate
+setting must be declared**. Existing guarded type/allowlist, duplicate,
+identity, geometry, policy, network and forbidden policy-2 address checks remain.
+CPU count must be 1; when metadata is supplied, CPU count and the enabled
+application root must be present. Conflicting CPU/guard types, unknown guarded
+metadata and undeclared candidate settings fail.
+
+The legacy no-metadata API still accepts a guarded fragment without a CPU
+setting; a supplied CPU setting must be 1. Both direct APIs reject equal
+run/disk identities. Original MAX_LUNS=8, synthetic and platform config APIs
+retain their existing behavior and do not become direct-config validators.
+The metadata-aware API is exposed through the preparation module but has no
+solver/production consumer in this substage. It checks supplied types and
+guarded constraints, **not** the complete target/profile, solver execution,
+metadata/source authenticity or independent approval. Later guarded building
+still requires reviewed namespace execution and independently approved solved
+bytes/metadata; no nonisolated fallback is added.
+
+### Focused and full-size qualification
+
+`test-direct-config` uses small native config/control/custody fixtures, not
+accepted miniature original seeds. It also runs under the existing `test`
+target, alongside unchanged `test-original-seed`. Use existing repeated
+`-Dtest-filter` selections for related config, seed, publication and real CLI
+tests in Debug and ReleaseSafe, with private distinct scratch/cache directories
+outside the checkout and `-j2`.
+
+An explicit, noninstalled native driver exercises the actual CLI pipeline:
+
+```text
+zig build --build-file support/tools/hyperv/preparation/build.zig \
+  --system PACKAGES --cache-dir SCRATCH/cache --global-cache-dir SCRATCH/global \
+  --prefix SCRATCH/installed -Doptimize=ReleaseSafe -j2 \
+  -Ddirect-config-root=FRESH_ABSOLUTE_PRIVATE_PATH qualify-direct-config --summary all
+```
+
+Use the existing copied-manifest restore convention after an actual missing
+dependency or dependency-manifest change. The qualification parent must exist
+privately; the selected child must not exist. The driver generates a **fresh
+actual 4-GiB original seed**, derives its config, checks five real CLI refusals,
+then independently validates every original raw/VHD byte with the existing
+direct readers and compares original metadata before/after. It verifies exact
+separate original/derived config bindings and keeps all reports private.
+
+Per architecture this is two producer passes, two derivation passes, and one
+independent 8,589,935,104-byte validation: approximately **40 GiB of logical
+reads**, plus small controls/metadata and hashing CPU. Timings, counts and
+artifact/executable hashes are retained in private `qualification.json`.
+Run on actual AArch64 and vm31e x86_64; no QEMU, namespace fixture or privileged
+host context is required. These remain local file/config qualification
+artifacts, not admitted seeds or acceptance evidence.
+
 ## Production-local embedding seam
 
 `production_local` is a production-only in-process facade for

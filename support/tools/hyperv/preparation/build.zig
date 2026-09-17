@@ -109,6 +109,43 @@ pub fn build(b: *std.Build) void {
     seed_step.dependOn(&seed_run.step);
     test_step.dependOn(seed_step);
 
+    const config_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("direct_config_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = seed_imports,
+    }) });
+    config_tests.root_module.addOptions("test_options", options);
+    const config_run = b.addRunArtifact(config_tests);
+    config_run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+    const config_step = b.step("test-direct-config", "Run bounded direct configuration and custody fixtures");
+    config_step.dependOn(&config_run.step);
+    test_step.dependOn(config_step);
+
+    const qualify_config = b.step("qualify-direct-config", "Fresh full-size original-seed to direct-config CLI qualification");
+    if (b.option([]const u8, "direct-config-root", "Fresh nonexistent absolute private direct configuration qualification directory")) |root| {
+        if (!std.fs.path.isAbsolute(root)) {
+            qualify_config.dependOn(&b.addFail("direct-config-root must be an absolute fresh directory").step);
+        } else {
+            const qualification = b.addExecutable(.{
+                .name = "direct-config-qualification",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("direct_config_qualification.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = seed_imports,
+                }),
+            });
+            qualification.root_module.addOptions("test_options", options);
+            const qualified = b.addRunArtifact(qualification);
+            qualified.has_side_effects = true;
+            qualified.addArg(root);
+            qualify_config.dependOn(&qualified.step);
+        }
+    } else {
+        qualify_config.dependOn(&b.addFail("qualify-direct-config requires -Ddirect-config-root=FRESH_ABSOLUTE_PATH").step);
+    }
+
     const qualify = b.step("qualify-original-seed", "Explicit full 4-GiB local seed creation and independent direct-reader validation");
     if (b.option([]const u8, "original-seed-root", "Fresh nonexistent absolute private full-size qualification directory")) |root| {
         if (!std.fs.path.isAbsolute(root)) {

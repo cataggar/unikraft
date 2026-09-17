@@ -19,6 +19,6 @@
         "namespace",                       "git_entry.zig",              "origin.zig",                      "origin_tests.zig",
         "origin_fixture.zig",              "integration",                "original_seed.zig",               "original_seed_tests.zig",
         "original_seed_qualification.zig", "namespace_observations.zig", "namespace_internal_observer.zig", "namespace_observer_exclusion_tests.zig",
-        "namespace_observer_probe.zig",
+        "namespace_observer_probe.zig",    "direct_config.zig",          "direct_config_tests.zig",         "direct_config_qualification.zig",
     },
 }

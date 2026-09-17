@@ -50,7 +50,7 @@ fn publish(io: std.Io, lock: *private.Locked, name: []const u8, bytes: []const u
 
 /// Separate descriptor reader using the existing production direct contracts.
 /// No fake Scope/approval is fabricated to reach these read-only checks.
-fn independent(allocator: std.mem.Allocator, io: std.Io, directory: private.Directory, record: prep.original_seed.Record) !void {
+pub fn independent(allocator: std.mem.Allocator, io: std.Io, directory: private.Directory, record: prep.original_seed.Record) !void {
     if (!std.mem.eql(u8, record.schema, prep.original_seed.schema) or record.schema_version != 1 or
         !std.mem.eql(u8, record.producer.compiler_version, c.compiler_version) or
         !std.mem.eql(u8, record.producer.miz_revision, c.miz_revision) or
