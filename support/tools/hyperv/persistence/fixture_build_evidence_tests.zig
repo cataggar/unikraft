@@ -177,6 +177,31 @@ test "tree metadata refuses symbolic links hard links specials and bounds" {
     try t.expectError(error.UnsafeFile, evidence.observeTree(a, io, path, .{}, false));
 }
 
+test "ignored restore creation and removal changes held source metadata while out of tree work does not" {
+    var fixture = try Case.init();
+    defer fixture.close();
+    const request = try fixture.request();
+    const allocator = fixture.allocator();
+    var inputs = try evidence.testing.HeldInputs.open(allocator, io, request);
+    defer inputs.close(allocator, io);
+    try fixture.directory("outside");
+    try fixture.directory("outside/zig-pkg");
+    try fixture.write("outside/zig-pkg/package", "dependency bytes");
+    try inputs.recheck(allocator, io);
+    try fixture.dir.deleteTree(io, "outside/zig-pkg");
+    try inputs.recheck(allocator, io);
+    const before = try evidence.observeTree(allocator, io, request.repository_build, .{}, true);
+    try fixture.directory("build-inputs/zig-pkg");
+    try fixture.write("build-inputs/zig-pkg/package", "dependency bytes");
+    try fixture.dir.deleteTree(io, "build-inputs/zig-pkg");
+    const after = try evidence.observeTree(allocator, io, request.repository_build, .{}, true);
+    try t.expectEqual(before.files, after.files);
+    try t.expectEqual(before.directories, after.directories);
+    try t.expectEqualStrings(&before.content_sha256.?, &after.content_sha256.?);
+    try t.expect(!std.mem.eql(u8, &before.metadata_sha256, &after.metadata_sha256));
+    try t.expectError(error.SourceChanged, inputs.recheck(allocator, io));
+}
+
 test "held named file checks reject changed contents truncation and replacement" {
     var fixture = try Case.init();
     defer fixture.close();

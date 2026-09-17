@@ -1110,6 +1110,18 @@ pub fn collect(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !void
 
 pub const testing = if (@import("builtin").is_test) struct {
     pub const Pin = FilePin;
+    pub const HeldInputs = struct {
+        inner: Inputs,
+        pub fn open(allocator: std.mem.Allocator, input_io: std.Io, request: schema.Request) !@This() {
+            return .{ .inner = try Inputs.open(allocator, input_io, request) };
+        }
+        pub fn recheck(self: @This(), allocator: std.mem.Allocator, input_io: std.Io) !void {
+            return self.inner.recheck(allocator, input_io);
+        }
+        pub fn close(self: *@This(), allocator: std.mem.Allocator, input_io: std.Io) void {
+            self.inner.close(allocator, input_io);
+        }
+    };
 
     pub fn copy(a: std.mem.Allocator, io: std.Io, source: []const u8, target: std.Io.Dir, name: []const u8, limit: u64) !Observation {
         const pin = try FilePin.open(a, io, source, limit);
