@@ -5,7 +5,10 @@ pub const wamr_direct_compute = true;
 
 pub fn main(init: std.process.Init) void {
     _ = std.os.linux.syscall1(.umask, 0o077);
-    const status = run(init) catch 1;
+    const status = run(init) catch |err| {
+        @import("launcher.zig").report(init, err);
+        std.process.exit(1);
+    };
     var writer = std.Io.File.stderr().writerStreaming(init.io, &.{});
     writer.interface.writeAll(if (status == 0)
         "WAMR tiny direct two-boot compute passed; owned group independently absent.\n"
@@ -16,5 +19,8 @@ pub fn main(init: std.process.Init) void {
 
 fn run(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 1 and std.mem.eql(u8, args[1], "preflight")) {
+        std.process.exit(try @import("launcher.zig").standalone(init, args[2..]));
+    }
     return controller.execute(controller.Native, .{}, init, try controller.Inputs.parse(args[1..]));
 }

@@ -12,6 +12,7 @@ const process = core.process;
 const files = core.private_files;
 const Role = observations.Role;
 const Lane = runtime.Lane;
+const launcher = @import("launcher.zig");
 
 pub const Inputs = struct {
     scope: []const u8,
@@ -20,8 +21,9 @@ pub const Inputs = struct {
     programs: runtime.Programs,
 
     pub fn parse(args: []const []const u8) !Inputs {
-        if (args.len != 6) return error.InvalidArguments;
-        for (args) |arg| {
+        if (args.len != 6 and args.len != 8) return error.InvalidArguments;
+        if (args.len == 8 and !std.mem.eql(u8, args[6], "--az-python")) return error.InvalidArguments;
+        for (args[0..6]) |arg| {
             try files.absoluteFilePath(arg);
             if (std.mem.indexOfAny(u8, arg, "\r\n") != null) return error.InvalidArguments;
         }
@@ -29,7 +31,7 @@ pub const Inputs = struct {
             .scope = args[0],
             .attempt = args[1],
             .ledger = args[2],
-            .programs = .{ .azure = args[3], .uploader = args[4], .validator = args[5] },
+            .programs = .{ .azure = args[3], .uploader = args[4], .validator = args[5], .azure_python = if (args.len == 8) args[7] else null },
         };
         try result.programs.validate();
         return result;
@@ -82,30 +84,8 @@ pub fn finalExit(result: custody.FinalResult, signal: ?u8) u8 {
     return result.exit_code;
 }
 
-pub fn errorExit(err: anyerror, cancellation: *const process.SignalCancellation) u8 {
-    return switch (err) {
-        error.Cancelled => if (cancellation.signal()) |signal| 128 + signal else 130,
-        error.ApprovalExpired => 125,
-        error.BudgetExhausted => 124,
-        else => 1,
-    };
-}
-
-pub fn processExit(result: process.PrivateResult, cancellation: *const process.SignalCancellation) u8 {
-    if (result.execution.failures.primary) |failure| {
-        if (failure.category == .cancelled) return errorExit(error.Cancelled, cancellation);
-        if (failure.category == .timeout) return 124;
-        // Match the reference's file-size refusal, not the supervisor's TERM.
-        // The actual child termination remains independent in process records.
-        if (failure.category == .output_limit) return 128 + @intFromEnum(std.os.linux.SIG.XFSZ);
-    }
-    if (result.execution.termination) |termination| switch (termination) {
-        .exited => |code| if (code != 0) return code,
-        .signal => |signal| return @intCast(@min(255, 128 + @intFromEnum(signal))),
-        else => {},
-    };
-    return if (result.succeeded()) 0 else 1;
-}
+pub const errorExit = runtime.errorExit;
+pub const processExit = runtime.processExit;
 
 pub const ChildTermination = struct { exit: ?u8 = null, signal: ?u32 = null, stopped: ?u32 = null, unknown: ?u32 = null };
 
@@ -122,7 +102,9 @@ pub const Native = struct {
     pub const References = custody.References;
 
     pub fn references(_: Native, io: std.Io, scope: direct.Scope, programs: runtime.Programs) !References {
-        return References.capture(io, scope, programs.azure, programs.uploader, programs.validator);
+        var refs = try References.capture(io, scope, programs.azure, programs.uploader, programs.validator);
+        if (programs.azure_python) |path| refs.interpreter = try custody.Reference.tool(io, path);
+        return refs;
     }
 
     pub fn environment(_: Native, a: std.mem.Allocator, operator: *const std.process.Environ.Map) !runtime.Environment {
@@ -147,6 +129,12 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
     defer cancellation.deinit();
     var environment = try hooks.environment(a, init.environ_map);
     defer environment.deinit();
+    const interpreter = try launcher.selectInterpreter(init.io, &environment, inputs.programs.azure_python);
+    const tools: [3]custody.Reference = .{
+        try custody.Reference.tool(init.io, inputs.programs.azure),
+        try custody.Reference.tool(init.io, inputs.programs.uploader),
+        try custody.Reference.tool(init.io, inputs.programs.validator),
+    };
     const source = try files.openAbsolute(init.io, inputs.scope, .private);
     defer source.close(init.io);
     const source_pin: custody.Reference = .{ .path = inputs.scope, .policy = .private, .metadata = try files.snapshot(source) };
@@ -165,6 +153,7 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
         .store = &store,
         .expected = expected,
         .source = source_pin,
+        .tools = tools,
         .runtime = .{
             .allocator = init.gpa,
             .io = init.io,
@@ -172,6 +161,7 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
             .environment = &environment,
             .budgets = &budgets,
             .cancellation = &cancellation,
+            .interpreter = interpreter,
         },
     };
     try controller.runtime.initialize();
@@ -281,6 +271,7 @@ fn Controller(comptime Hooks: type) type {
             if (self.tools) |tools| {
                 for (tools) |tool| try tool.verify(self.io);
             } else return error.MissingToolReferences;
+            try self.runtime.verifyInterpreter();
         }
 
         fn verifyPrimary(self: *Self) !void {
@@ -437,17 +428,30 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn primary(self: *Self) !void {
-            self.tools = .{
-                try custody.Reference.tool(self.io, self.inputs.programs.azure),
-                try custody.Reference.tool(self.io, self.inputs.programs.uploader),
-                try custody.Reference.tool(self.io, self.inputs.programs.validator),
-            };
             try self.required(try self.call(.primary, .validator, "source-scope-check", &.{ "scope", self.inputs.scope }, "stdout"));
             try self.required(try self.call(.primary, .validator, "ledger-check", &.{ "ledger", self.inputs.scope, self.inputs.ledger }, "stdout"));
             try self.required(try self.validate(.primary, "scope-check", .scope, &.{}));
             try self.event(.@"local-admission");
             self.references = try self.hooks.references(self.io, self.expected.scope, self.inputs.programs);
             try self.required(try self.validate(.primary, "input-check", .inputs, &.{}));
+            var startup: launcher.Status = .{};
+            launcher.check(self.runtime, &self.store.writer, self.tools.?[0], &startup) catch |err| {
+                if (startup.child) |child| {
+                    const status = processExit(child, self.runtime.cancellation);
+                    if (status != 0) self.primary_exit = status;
+                    _ = recordCaptureFailure(self.store, .primary, &self.primary_exit, child.capture, status);
+                    if (!child.execution.cleanup_complete or child.execution.unreaped_group != null) self.poisoned = true;
+                }
+                if (startup.recording_error) |failure| {
+                    self.store.recordingFailed(failure);
+                    self.cleanup_exit = 1;
+                }
+                if (err == error.UnresolvedCleanup or err == error.CliStartupCleanupFailed) self.poisoned = true;
+                self.log("local CLI startup refused before consumption: {s}\n", .{@errorName(err)});
+                return err;
+            };
+            try self.verifyPrimary();
+            _ = try self.runtime.budgets.call(.primary, .azure);
             try self.store.consume();
             try self.event(if (profile.compute) .@"attempt-consumed" else .@"seed-consumed");
             try self.groupAbsent(.primary, "group-before");
