@@ -365,13 +365,13 @@ GUARDED_PRODUCER_FILES = {
         "e5845b7623116f3ef6e6e062463f39c2f3840bec5d36c75ccf413643dfae1eca"
     ),
     "support/tools/hyperv/sha256.zig": (
-        "301e80c1aea7516cf1c408f92008ff7616e2c22e6314a917ef9049d5d7bdac98"
+        "9df4a987600791dd1b8497143d40e40b86adcc345a7dec51963467b6bdb8ec9a"
     ),
     "support/tools/hyperv/sha256_clear_upper.S": (
         "b7a0c49539870ecb32d4a36a5409154d15d89fcecba97f98b6918539c81c2834"
     ),
     "support/tools/hyperv/sha256_tests.zig": (
-        "15e157752b459d84c7333e453bbdf37c8e323896dcf6b4671e4cbdb3d28de600"
+        "f7c9feecf8d6e34f94d225065100c47b72e22a6fc9f7866f970b02de5c03c7fa"
     ),
     "support/build/tests/hyperv-smp-link-test.py": (
         "dc40554f6da6ddca3e9f65b5b6c12243c734d24992a342d3564750ecc5e71488"
