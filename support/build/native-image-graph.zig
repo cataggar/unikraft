@@ -1254,6 +1254,12 @@ test "WAMR native profile has distinct application, VM ownership, and image iden
             app = true;
             try std.testing.expectEqual(@as(usize, 1), library.archives.len);
             try std.testing.expectEqualStrings("/src/wamr-aot/build/artifacts/libwamr-aot.a", library.archives[0].path);
+            var workload_object = false;
+            for (library.raw_objects) |object| {
+                if (std.mem.endsWith(u8, object.path, "/appwamraot/workloads.o"))
+                    workload_object = true;
+            }
+            try std.testing.expect(workload_object);
         }
     }
     try std.testing.expect(app and vmem);

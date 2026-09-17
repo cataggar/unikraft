@@ -111,6 +111,21 @@ class Contract(unittest.TestCase):
             self.assertIn("60", args)
             self.assertIn(ci.MARKER, args)
 
+    def test_build_refuses_development_and_optional_images(self):
+        identity = {
+            "wamr_revision": ci.REVISION, "minimal_wasi": False,
+            "compiler_profile": "unikraft-x86_64", "zig_version": "0.16.0",
+            "variant": "tiny", "development_only": False, "jit_mode": None,
+        }
+        for key, value in (("development_only", True), ("variant", "snapshot"),
+                           ("variant", "jit"), ("variant", "sample-aot"),
+                           ("jit_mode", "fast"), ("jit_mode", "full")):
+            with self.subTest(key=key, value=value), \
+                    mock.patch.object(ci, "document", return_value=dict(identity, **{key: value})), \
+                    mock.patch.object(ci, "digest", side_effect=AssertionError("artifact read")), \
+                    self.assertRaisesRegex(ci.Refusal, "not the pinned tiny producer"):
+                ci.check_build()
+
 
 class PhysicalPackage(unittest.TestCase):
     """Run the actual native adapter + pinned miz on a nonbootable synthetic PE."""

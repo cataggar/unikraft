@@ -9,8 +9,9 @@ filesystem, network, or host-thread dependency is added for WAMR.
 
 Refs #156, [cataggar/wamr#1045](https://github.com/cataggar/wamr/issues/1045)
 and [cataggar/wamr#1046](https://github.com/cataggar/wamr/issues/1046).
-The freestanding benchmark producer and optional JIT sampler are separate
-dependent integrations; this application produces **no benchmark score**.
+The optional [snapshot guest and matched JIT/AOT sampler images](WORKLOADS.md)
+are explicit dependent integrations. The default remains this tiny,
+compiler-free image; all current application modes produce **no benchmark score**.
 
 ## Build the actual EFI image
 
@@ -25,7 +26,7 @@ python3 support/apps/wamr-aot/build-image.py native-images
 ```
 
 `prepare.py` exports exactly WAMR
-`2399694fb7ed11fffff0a34c82172dfdd54d7439` from the local Git object
+`a53205d77be3b880eb8f8b96679512ba58e2331a` from the local Git object
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
@@ -34,10 +35,14 @@ then the integration archive. The tiny wasm is genuinely generated from
 --profile=unikraft-x86_64`. Hosted artifacts are not renamed or relabelled.
 Only trusted output of this pinned producer is admissible.
 
+The same merged SDK supplies the single-root CoreMark bridge and optional
+workloads in [WORKLOADS.md](WORKLOADS.md). This source pin does not establish
+native boot, hardware or measurement qualification.
+
 The integration archive explicitly uses x86_64 SysV, PIC, no red zone,
 stack protector, stack checking, unwind tables, libc, or error tracing, and
-single-threaded Zig support. ReleaseSafe checks remain enabled. Two necessary
-differences from the baseline standalone archive are recorded:
+single-threaded Zig support. ReleaseSafe checks remain enabled. The wrapper
+records the actual required native-link properties:
 
 * **PIC** is necessary for Unikraft's EFI PIE link; non-PIC absolute 32-bit
   relocations are not compatible.
@@ -147,7 +152,8 @@ into the image; **only a real native boot executes them**.
 Add `--coremark` to fresh preparation to embed **both original pinned**
 `coremark_wasi.wasm` and `coremark_wasi_nofp.wasm`, compiled ahead of time
 by the matching host compiler. `wasi.zig` is a small C bridge to the pinned
-allocation-free `wasi/minimal.zig`, not another WASI implementation.
+allocation-free `wamr-aot.benchmark.wasi`, not another WASI implementation.
+It imports that single public SDK root, sharing its actual WASI/API types.
 It preserves exactly its twelve `wasi_unstable` signatures, guest-pointer
 checks, descriptor state, partial-write progress/deferred errors, full u32
 `proc_exit`, returned/trap/host-error distinctions and fresh-instance lifetime.
@@ -263,13 +269,14 @@ actual source behavior still needs native execution/qualification.
 
 ## Existing packaging and exact-image boot
 
-Use the existing native
-[`public_image` tool](../../tools/hyperv/public_image/README.md) with
-`--efi /absolute/.../build/wamr_hyperv-x86_64-efi` and
-`--expect 'WAMR_NATIVE_AOT_OK answer=42 teardown=0'`. It uses pinned native
-**miz** and the existing four-boot exact raw/fixed-VHD matrix. Do not pass
-the network application's solved-config contract or export a networking
-receipt. Retain the full raw disk and fixed-VHD hashes, including the footer.
+Use the compute-specific
+[`wamr-native-ci` adapter](../../build/wamr-native-ci/README.md), which composes
+the existing pinned native **miz** package/inspect machinery and
+`local_boot` four-boot exact raw/fixed-VHD matrix with main return 0.
+The network application's `public_image prepare` return-2 contract is not a
+WAMR boot contract and cannot be changed with `--expect` alone. Do not pass its
+solved-config contract or export a networking receipt. Retain the full raw disk
+and fixed-VHD hashes, including the footer.
 Do not substitute a `.text` hash, hosted binary or earlier EFI for that image.
 
 For an initial EFI-only local check, use the existing native
@@ -312,11 +319,13 @@ source export (on an ARM host, append `--test-cmd /path/to/qemu-x86_64
 
 ```sh
 zig test -target x86_64-linux-musl \
-  --dep wamr-native --dep minimal-wasi -Mroot=support/apps/wamr-aot/wasi.zig \
-  -target x86_64-linux-musl \
-  -Mwamr-native=support/apps/wamr-aot/build/wamr-source/src/aot_native.zig \
+  --dep wamr-aot -Mroot=support/apps/wamr-aot/wasi.zig \
+  -target x86_64-linux-musl --dep minimal-wasi --dep native-wasi \
+  -Mwamr-aot=support/apps/wamr-aot/build/wamr-source/src/aot_native.zig \
   -target x86_64-linux-musl \
   -Mminimal-wasi=support/apps/wamr-aot/build/wamr-source/src/wasi/minimal.zig \
+  -target x86_64-linux-musl --dep minimal-wasi \
+  -Mnative-wasi=support/apps/wamr-aot/build/wamr-source/src/wasi/native_aot.zig \
   --test-filter clock
 ```
 

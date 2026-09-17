@@ -2,8 +2,8 @@
 //! Optional C bridge to the pinned allocation-free minimal WASI context.
 //! A single fresh, bounded CoreMark invocation, not a benchmark producer.
 const std = @import("std");
-const runtime = @import("wamr-native");
-const wasi = @import("minimal-wasi");
+const runtime = @import("wamr-aot");
+const wasi = runtime.benchmark.wasi;
 
 const RealtimeCaps = extern struct {
     version: u32,

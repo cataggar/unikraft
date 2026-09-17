@@ -17,7 +17,7 @@ import sys
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 APP = REPO / "support/apps/wamr-aot"
-REVISION = "2399694fb7ed11fffff0a34c82172dfdd54d7439"
+REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 MARKER = "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
 LEGACY = "Using legacy xAPIC MMIO"
 MODES = ("raw-x2apic", "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic")
@@ -192,6 +192,9 @@ def run(root, stage, args, seconds=600, limit=8 * MIB):
 def check_build():
     identity = document(APP / "build/artifacts/identity.json")
     require(identity["wamr_revision"] == REVISION
+            and identity.get("development_only", False) is False
+            and identity.get("variant", "tiny") == "tiny"
+            and identity.get("jit_mode") is None
             and identity["compiler_profile"] == "unikraft-x86_64"
             and identity["zig_version"] == "0.16.0"
             and identity["minimal_wasi"] is False, "not the pinned tiny producer")
