@@ -121,3 +121,73 @@ jobs:
           -Doptimize=Debug -j2 \
           --cache-dir "${root}/native-build-cache" \
           --prefix "${root}/native-build-out" --summary all
+
+    - name: Compare original preparation hashes on identical actual namespace fixtures
+      shell: bash
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${GITHUB_WORKSPACE}/.d/preparation-hash-native"
+        baseline="${GITHUB_WORKSPACE}/.d/shared-hash-baseline"
+        tools="${GITHUB_WORKSPACE}/.d/shared-hash-llvm/bin"
+        export ZIG_GLOBAL_CACHE_DIR="${GITHUB_WORKSPACE}/.d/shared-hash-native/global"
+        mkdir -p "${root}/git-runtime/lib" "${root}/fixtures"
+        # Metadata/copies only, matching the existing public Git fixture closure.
+        git_executable="$(readlink -f /usr/bin/git)"
+        "${tools}/llvm-readelf" --program-headers --wide "${git_executable}" > "${root}/git-elf.txt"
+        loader="$(sed -n 's/.*Requesting program interpreter: \(\/[^]]*\)\].*/\1/p' "${root}/git-elf.txt")"
+        test -n "${loader}"
+        loader="$(readlink -f "${loader}")"
+        ldd "${git_executable}" > "${root}/git-ldd.txt"
+        awk '
+          $1 ~ /^linux-vdso/ { next }
+          $2 == "=>" && $3 ~ /^\// { print $3; next }
+          $1 ~ /^\// && $2 ~ /^\(0x[[:xdigit:]]+\)$/ { print $1; next }
+          NF { exit 1 }
+        ' "${root}/git-ldd.txt" > "${root}/git-runtime-paths.txt"
+        cp --no-preserve=mode,ownership "${git_executable}" "${root}/git-runtime/git"
+        cp --no-preserve=mode,ownership "${loader}" "${root}/git-runtime/loader"
+        chmod 500 "${root}/git-runtime/git" "${root}/git-runtime/loader"
+        git_fixture=("-Dgit-executable=${root}/git-runtime/git" "-Dgit-loader=${root}/git-runtime/loader")
+        while IFS= read -r source; do
+          test -f "${source}"
+          if [ "$(readlink -f "${source}")" = "${loader}" ]; then continue; fi
+          destination="${root}/git-runtime/lib/$(basename "${source}")"
+          test ! -e "${destination}"
+          cp --no-preserve=mode,ownership "${source}" "${destination}"
+          git_fixture+=("-Dgit-library=${destination}")
+        done < "${root}/git-runtime-paths.txt"
+        test "${#git_fixture[@]}" -gt 2
+        for kind in raw selected; do
+          qualification=()
+          if [[ "${kind}" == selected ]]; then
+            qualification=(-Dstrip-fixture-debug=true -Dfixture-file-relayout=true
+              "-Dfixture-objcopy=${tools}/llvm-objcopy"
+              "-Dstrip-fixture-report=${root}/fixture-strip-proof.json")
+          fi
+          # Only compile the real fixture and run the existing unprivileged ELF
+          # equivalence verifier. Never execute a namespace fixture/helper here.
+          zig build --build-file support/tools/hyperv/preparation/namespace/build.zig \
+            --cache-dir "${root}/${kind}/cache" --prefix "${root}/${kind}/out" \
+            "-Dworkspace=${root}/fixtures" "${git_fixture[@]}" "${qualification[@]}" \
+            -Doptimize=Debug -j2 install-fixture --summary all
+        done
+        cp support/tools/hyperv/preparation/namespace/build.zig \
+          "${baseline}/support/tools/hyperv/preparation/namespace/"
+        cp support/tools/hyperv/preparation/hash_cost_probe.zig \
+          "${baseline}/support/tools/hyperv/preparation/"
+        git -C "${baseline}" diff --exit-code HEAD -- \
+          support/tools/hyperv/preparation/files.zig \
+          support/tools/hyperv/preparation/contracts.zig \
+          support/tools/hyperv/preparation/runtime.zig
+        for variant in baseline candidate; do
+          source="${GITHUB_WORKSPACE}"
+          if [[ "${variant}" == baseline ]]; then source="${baseline}"; fi
+          echo "preparation synthetic configuration: ${variant}; identical full actual fixture inputs"
+          zig build --build-file "${source}/support/tools/hyperv/preparation/namespace/build.zig" \
+            --cache-dir "${root}/${variant}-probe-cache" \
+            "-Dworkspace=${root}/fixtures" -Dhash-cost-only=true \
+            -Doptimize=Debug -j2 diagnose-hash-cost --summary all -- \
+            "${root}/raw/out/bin/preparation-namespace-fixture" \
+            "${root}/selected/out/bin/preparation-namespace-fixture"
+        done

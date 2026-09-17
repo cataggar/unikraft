@@ -138,7 +138,7 @@ fn compareRange(raw: []const u8, candidate: []const u8, raw_offset: u64, candida
     if (!std.mem.eql(u8, left[cursor..], right[cursor..])) return error.LoadedContentChanged;
 }
 
-fn hashRange(sha: *std.crypto.hash.sha2.Sha256, bytes: []const u8, offset: u64, length: u64, masks: []const Mask) !void {
+fn hashRange(sha: *core.Sha256, bytes: []const u8, offset: u64, length: u64, masks: []const Mask) !void {
     const data = try elf.range(bytes, offset, length);
     const zeroes = [_]u8{0} ** 8;
     var cursor: usize = 0;
@@ -239,7 +239,7 @@ fn sameOverlap(raw_a: std.elf.Elf64_Phdr, raw_b: std.elf.Elf64_Phdr, candidate_a
 }
 
 fn logicalIdentity(index: usize, header_bytes: []const u8) [64]u8 {
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var sha = core.Sha256.init(.{});
     sha.update("hyperv-fixture-logical-program-v2\x00");
     var encoded_index: [8]u8 = undefined;
     std.mem.writeInt(u64, &encoded_index, index, .little);
@@ -357,13 +357,13 @@ pub fn compareWithPolicy(allocator: std.mem.Allocator, raw: []const u8, candidat
     }
     // These masks are anchored metadata, never a license to ignore bytes at a
     // relocated code/data offset. Overlapping PHDR/LOAD views use the same mask.
-    var normalized_phdr = std.crypto.hash.sha2.Sha256.init(.{});
+    var normalized_phdr = core.Sha256.init(.{});
     try hashRange(&normalized_phdr, raw, left.header.phoff, phdr_bytes, masks.slice());
     const normalized_phdr_hash = normalized_phdr.finalResult();
-    var all_binding = std.crypto.hash.sha2.Sha256.init(.{});
+    var all_binding = core.Sha256.init(.{});
     all_binding.update("hyperv-fixture-mapped-program-content-v2\x00");
     all_binding.update(&normalized_phdr_hash);
-    var binding = std.crypto.hash.sha2.Sha256.init(.{});
+    var binding = core.Sha256.init(.{});
     binding.update("hyperv-fixture-mapped-pt-load-v2\x00");
     binding.update(&normalized_phdr_hash);
     var load_segments: usize = 0;
@@ -410,9 +410,9 @@ pub fn compareWithPolicy(allocator: std.mem.Allocator, raw: []const u8, candidat
         value.* = .{ .field = field.field, .offset = field.offset, .width = field.width, .raw = before, .candidate = after, .changed = before != after };
     }
     var phdr_hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(raw_programs, &phdr_hash, .{});
+    core.Sha256.hash(raw_programs, &phdr_hash, .{});
     var candidate_phdr_hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(candidate_programs, &candidate_phdr_hash, .{});
+    core.Sha256.hash(candidate_programs, &candidate_phdr_hash, .{});
     return .{
         .endian = left.header.endian,
         .machine = left.header.machine,
@@ -464,7 +464,7 @@ pub const Pinned = struct {
         errdefer allocator.free(bytes);
         if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.InputChanged;
         var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        core.Sha256.hash(bytes, &hash, .{});
         const result: Pinned = .{ .file = file, .path = path, .before = before, .bytes = bytes, .hash = hash };
         try result.recheck(io);
         return result;
@@ -477,7 +477,7 @@ pub const Pinned = struct {
 
     pub fn recheck(self: Pinned, io: std.Io) !void {
         if (!pf.sameSnapshot(self.before, try pf.snapshot(self.file))) return error.InputChanged;
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var hash = core.Sha256.init(.{});
         var buffer: [32 * 1024]u8 = undefined;
         var offset: u64 = 0;
         while (offset < self.before.size) {

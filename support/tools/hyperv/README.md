@@ -61,7 +61,7 @@ root native build, links the same `sha256_clear_upper.S`. Literal-null sensitive
 reads are type-specialized: those existing no-hash reads, including the Zig
 build runner's native Make contract reader, need no hash-link dependency.
 Runtime optional and nonnull expected digests retain the fenced full hash.
-Shared private-file, transfer, persistence, host, custody, Azure and preflight
+Shared private-file, preparation, transfer, persistence, host, custody, Azure and preflight
 hashing retains each independent complete pass, SHA256/MD5 comparison,
 snapshot, EOF/identity check and deadline. `test-sha256`, also included in
 `test-core` and persistence `test`, retains runtime and compile-time known-vector, streaming, `peek`

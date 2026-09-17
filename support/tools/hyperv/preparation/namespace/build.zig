@@ -8,6 +8,32 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const workspace = b.option([]const u8, "workspace", "Explicit preparation validation subtree") orelse
         @panic("-Dworkspace is required");
+    if (b.option(bool, "hash-cost-only", "Build only the uninstalled file-hash probe; no namespace execution or fixture") orelse false) {
+        const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
+        if (target.result.cpu.arch == .x86_64)
+            core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));
+        const paths = b.createModule(.{ .root_source_file = b.path("../../../../build/zig-facade-paths.zig"), .target = target, .optimize = optimize });
+        const measurement = b.createModule(.{ .root_source_file = b.path("../../synthetic_measurement.zig"), .target = target, .optimize = optimize });
+        const probe = b.addExecutable(.{ .name = "preparation-hash-cost-probe", .root_module = b.createModule(.{
+            .root_source_file = b.path("../hash_cost_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = core },
+                .{ .name = "facade_paths", .module = paths },
+                .{ .name = "synthetic_measurement", .module = measurement },
+            },
+        }) });
+        const options = b.addOptions();
+        options.addOption([]const u8, "workspace", workspace);
+        probe.root_module.addOptions("hash_cost_options", options);
+        const run = b.addRunArtifact(probe);
+        run.has_side_effects = true;
+        if (b.args) |args| run.addArgs(args);
+        b.step("build-hash-cost-probe", "Compile the uninstalled actual-fixture hash probe").dependOn(&probe.step);
+        b.step("diagnose-hash-cost", "Observe original file-hash APIs without namespace operations").dependOn(&run.step);
+        return;
+    }
     const exclusion = exclusionTests(b, target, optimize, workspace);
     if (b.option(bool, "observations-only", "Build only unprivileged synthetic namespace observation tests; no namespace fixture/helper") orelse false) {
         const observations = observationTests(b, target, optimize, workspace);

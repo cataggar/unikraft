@@ -1302,6 +1302,35 @@ test "physical native file records reject mutation size mode path symlink and pr
     try directory.dir.setPermissions(io, .fromMode(0o700));
 }
 
+test "native full-file SHA preserves standard bytes across read-buffer boundaries" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    try fixture.dir.setPermissions(io, .fromMode(0o700));
+    const directory: fs.Directory = .{ .dir = fixture.dir, .path = "" };
+    const bytes = try a.alloc(u8, 2 * 65536 + 65);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 131 +% 17);
+    for ([_]usize{ 0, 1, 55, 56, 63, 64, 65, 65535, 65536, 65537, bytes.len }) |length| {
+        try writeFixture(directory.dir, "bytes", bytes[0..length], 0o600);
+        var expected: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes[0..length], &expected, .{});
+        const hex = std.fmt.bytesToHex(expected, .lower);
+        const record = try directory.record(a, io, "bytes", bytes.len, .private);
+        try std.testing.expectEqualSlices(u8, &hex, &record.sha256);
+        try std.testing.expectEqualSlices(u8, &hex, &c.digest(bytes[0..length]));
+        const inventory = try fs.inventory(a, io, directory, 1, bytes.len);
+        try fs.requireFile(inventory.entries[0], record);
+        const file = try directory.openFile(io, "bytes", .private);
+        defer file.close(io);
+        try std.testing.expectEqualSlices(u8, &hex, &try fs.hashFile(io, file, length));
+        try std.testing.expectError(error.SourceChanged, fs.hashFile(io, file, length + 1));
+        if (length != 0) try std.testing.expectError(error.SourceChanged, fs.hashFile(io, file, length - 1));
+    }
+}
+
 test "native inventory hashes empty directory paths modes and file bytes with descriptor relative nofollow" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

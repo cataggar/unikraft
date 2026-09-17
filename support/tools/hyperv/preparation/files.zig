@@ -153,7 +153,7 @@ fn checkFile(value: Metadata, policy: Policy) !void {
     if (policy == .executable and value.mode & 0o111 == 0) return error.UnsafeFile;
 }
 pub fn hashFile(io: std.Io, file: std.Io.File, size: u64) !c.Sha {
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = c.core.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     defer std.crypto.secureZero(u8, &buffer);
     var offset: u64 = 0;
@@ -279,7 +279,7 @@ fn inventoryTree(entries: []c.File, directories: []Subdirectory, total: u64) c.T
             return std.mem.lessThan(u8, a.path, b.path);
         }
     }.less);
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = c.core.Sha256.init(.{});
     hash.update("hyperv-native-tree-v1\x00");
     std.mem.sort(Subdirectory, directories, {}, struct {
         fn less(_: void, a: Subdirectory, b: Subdirectory) bool {
@@ -323,7 +323,7 @@ pub fn physicalDigest(allocator: std.mem.Allocator, io: std.Io, root: Directory)
     const before = try metadata(.{ .handle = root.dir.handle, .flags = .{ .nonblocking = false } });
     try collect(a, io, root, root.dir, "", &entries, &directories, &total, 100000, 4 * 1024 * 1024 * 1024, 0);
     _ = inventoryTree(entries.items, directories.items, total);
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = c.core.Sha256.init(.{});
     hash.update("hyperv-native-physical-v1\x00");
     hash.update(try c.canonical(a, before));
     for (directories.items) |entry| {
@@ -450,7 +450,7 @@ fn copyAndPublish(
     result: *c.core.private_files.CommitResult,
 ) !void {
     _ = allocator;
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = c.core.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     defer std.crypto.secureZero(u8, &buffer);
     var offset: u64 = 0;

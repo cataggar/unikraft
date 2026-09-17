@@ -26,7 +26,7 @@ pub const Failure = core.diagnostics.Failures;
 
 pub fn digest(bytes: []const u8) Sha {
     var value: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &value, .{});
+    core.Sha256.hash(bytes, &value, .{});
     return std.fmt.bytesToHex(value, .lower);
 }
 pub fn sha(bytes: []const u8) !Sha {
