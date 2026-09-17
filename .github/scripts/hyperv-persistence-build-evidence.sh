@@ -52,5 +52,6 @@ for mode in Debug ReleaseSafe; do
   fi
   private_directory "${capture}"
   private_file "${capture}/collector" 700 100663296
+  test -s "${capture}/collector"
   "${capture}/collector" collect "${capture}"
 done

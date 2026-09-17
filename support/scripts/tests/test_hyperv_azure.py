@@ -2244,7 +2244,7 @@ class HypervWorkflowTest(unittest.TestCase):
         helper = SUPPORT.parent / ".github/scripts/hyperv-persistence-build-evidence.sh"
         for case in ("absent", "failed-before-baseline", "success-without-baseline",
                      "dangling-root", "dangling-capture", "linked-collector",
-                     "public-collector", "oversized-collector"):
+                     "public-collector", "empty-collector", "oversized-collector"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "hyperv-ci/native-persistence"
                 root.parent.mkdir()
@@ -2275,6 +2275,8 @@ class HypervWorkflowTest(unittest.TestCase):
                                 os.link(collector, capture / "other")
                             elif case == "public-collector":
                                 collector.chmod(0o755)
+                            elif case == "empty-collector":
+                                collector.write_bytes(b"")
                             else:
                                 with collector.open("r+b") as stream:
                                     stream.truncate(100663297)
