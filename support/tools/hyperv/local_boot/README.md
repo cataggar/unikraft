@@ -127,18 +127,26 @@ geometry gives the same exact size; no creator/footer bytes are rewritten.
 
 QCOW2 admission never reopens its pathname. The retained custody descriptor is
 duplicated once with close-on-exec for
-`miz.Image.openStandaloneQcow2File(io, duplicate)`; ownership transfers only
-after a successful open, `Image.close()` closes that duplicate, and the
-retained descriptor remains available for hashing and the later QEMU
-duplicate. Backing-file and external-data references are rejected by Miz's
-standalone entry point before referenced path I/O. The accepted profile is
-QCOW2 v3, native Miz zstd compression type 1, 64-KiB clusters, the exact
-supported incompatible feature bit, one bounded L1/refcount-table/refcount
-block shape, no encryption or snapshots, and no backing/data dependency.
-Checked metadata/refcount and physical mappings are validated before a bounded
-full virtual read exercises every allocated compressed cluster. QEMU receives two
-explicit nodes in order: a read-only `file` node over `/proc/self/fd/N`, then a
-read-only `qcow2` node named `local-boot-disk` referring to it. The existing
+`miz.Image.openStandaloneQcow2FileWithLimits(io, duplicate, limits)`;
+ownership transfers only after a successful open, `Image.close()` closes that
+duplicate, and the retained descriptor remains available for hashing and the
+later QEMU duplicate. Before header-controlled scans or allocations, the
+reviewed limits cap physical and virtual size at 256 MiB, require cluster bits
+16 (64 KiB), permit one L1 entry/eight L1 bytes, one 64-KiB refcount-table
+cluster/8192 entries, and permit no snapshot records or snapshot L1 geometry.
+Aggregate open metadata is capped at 65,664 bytes and 8,194 work units: the
+112-byte header, one L1 entry, one refcount-table cluster, its 8192 slots, and
+one terminating extension record. Miz charges the complete refcount-table
+entry count before its first table read, so sparse geometry cannot amplify
+admission into millions of reads. Backing-file and external-data references
+are rejected before referenced path I/O. The accepted profile is QCOW2 v3,
+native Miz zstd compression type 1, the exact supported incompatible feature
+bit, one bounded L1/refcount-table/refcount block shape, no encryption or
+snapshots, and no backing/data dependency. Checked metadata/refcount and
+physical mappings are validated before a bounded full virtual read exercises
+every allocated compressed cluster. QEMU receives two explicit nodes in order:
+a read-only `file` node over `/proc/self/fd/N`, then a read-only `qcow2` node
+named `local-boot-disk` referring to it. The existing
 `virtio-blk-pci,drive=local-boot-disk` device is unchanged.
 Malformed, unsupported, over-limit, or decompression-invalid QCOW2 content
 remains an `invalid_input` refusal. Host stat/read failures, cancellation,
@@ -192,7 +200,9 @@ or trailing-garbage returns, malformed serial, crash markers anywhere
 
 ## Offline build and fixtures
 
-The build restores only the exact Miz revision and hash recorded in
+The build restores reviewed Miz revision
+`669a27982b376311f558e820b69e9a692735b0cd` with package hash
+`miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx` from
 `build.zig.zon`; Miz's exported `dependency.module("miz")` supplies its native
 zstd wiring. After that pinned restore is available, builds can run offline.
 Use Zig 0.16, `-j2`, and explicit owned scratch for HOME, TMPDIR, XDG/Zig

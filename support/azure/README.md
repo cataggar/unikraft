@@ -68,7 +68,7 @@ Azure account identifiers or credential-bearing diagnostics.
 - A `miz` build providing `build-efi-application` and the
   `check-efi-application` version-1 `miz.efi-application-image` JSON contract.
   These APIs and their reviewed hardening are available at
-  [`2db68ca0c3ab12155012a823c3fb8d7aba1cb544`][miz-revision].
+  [`669a27982b376311f558e820b69e9a692735b0cd`][miz-revision].
   Generic `miz check`/`info` do not validate the embedded EFI payload, and
   `miz azure fixup` can modify an image; neither substitutes for this gate.
 - QEMU with KVM and `vmbus-bridge`, plus x86-64 OVMF code and
@@ -1179,7 +1179,7 @@ stress testing, and production readiness remain separate milestones.
 [compute-security-profile]: https://learn.microsoft.com/en-us/javascript/api/@azure/arm-compute/securityprofile?view=azure-node-latest
 [storage-regional-endpoints]: https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security#access-from-a-paired-region
 [upload]: https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-upload-vhd-to-managed-disk-cli
-[miz-revision]: https://github.com/cataggar/miz/commit/2db68ca0c3ab12155012a823c3fb8d7aba1cb544
+[miz-revision]: https://github.com/cataggar/miz/commit/669a27982b376311f558e820b69e9a692735b0cd
 [unikraft-revision]: https://github.com/cataggar/unikraft/commit/8c87f56ab3eaa71974812cd748c3a6bfa61c563b
 [amd-revision]: https://github.com/cataggar/unikraft/commit/4cdabd975ab4bc39dcdabeca496d8ee8630e3759
 [amd-irq]: https://github.com/cataggar/unikraft/issues/81

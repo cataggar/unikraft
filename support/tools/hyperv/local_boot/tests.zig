@@ -382,12 +382,15 @@ const Qcow2IoFault = struct {
         stat_system_resources,
         header_canceled,
         compressed_input_output,
+        observe,
     };
 
     table: std.Io.VTable = io.vtable.*,
     retained: linux.fd_t,
     kind: Kind,
     failures: usize = 0,
+    duplicate_reads: usize = 0,
+    highest_duplicate_read_offset: u64 = 0,
     threadlocal var active: ?*Qcow2IoFault = null;
 
     fn install(self: *Qcow2IoFault) std.Io {
@@ -418,17 +421,21 @@ const Qcow2IoFault = struct {
         offset: u64,
     ) std.Io.File.ReadPositionalError!usize {
         const self = active.?;
-        if (file.handle != self.retained and self.failures == 0) {
-            switch (self.kind) {
-                .header_canceled => if (offset == 0) {
-                    self.failures += 1;
-                    return error.Canceled;
-                },
-                .compressed_input_output => if (offset == 64 * 1024) {
-                    self.failures += 1;
-                    return error.InputOutput;
-                },
-                .stat_system_resources => {},
+        if (file.handle != self.retained) {
+            self.duplicate_reads += 1;
+            self.highest_duplicate_read_offset = @max(self.highest_duplicate_read_offset, offset);
+            if (self.failures == 0) {
+                switch (self.kind) {
+                    .header_canceled => if (offset == 0) {
+                        self.failures += 1;
+                        return error.Canceled;
+                    },
+                    .compressed_input_output => if (offset == 64 * 1024) {
+                        self.failures += 1;
+                        return error.InputOutput;
+                    },
+                    .stat_system_resources, .observe => {},
+                }
             }
         }
         return io.vtable.fileReadPositional(userdata, file, data, offset);
@@ -442,6 +449,25 @@ fn openFdCount() !usize {
     var count: usize = 0;
     while (try iterator.next(io) != null) count += 1;
     return count;
+}
+
+test "qcow2 bounded profile exactly matches the reviewed native producer geometry" {
+    const limits = boot.files.qcow2_standalone_open_limits;
+    try t.expectEqual(@as(u64, 256 * 1024 * 1024), limits.max_file_bytes);
+    try t.expectEqual(@as(u64, 256 * 1024 * 1024), limits.max_virtual_size);
+    try t.expectEqual(@as(u32, 16), limits.min_cluster_bits);
+    try t.expectEqual(@as(u32, 16), limits.max_cluster_bits);
+    try t.expectEqual(@as(u64, 1), limits.max_l1_entries);
+    try t.expectEqual(@as(u64, 8), limits.max_l1_table_bytes);
+    try t.expectEqual(@as(u64, 1), limits.max_refcount_table_clusters);
+    try t.expectEqual(@as(u64, 64 * 1024), limits.max_refcount_table_bytes);
+    try t.expectEqual(@as(u64, 8192), limits.max_refcount_table_entries);
+    try t.expectEqual(@as(u64, 0), limits.max_snapshot_count);
+    try t.expectEqual(@as(u64, 0), limits.max_snapshot_table_bytes);
+    try t.expectEqual(@as(u64, 0), limits.max_snapshot_l1_entries);
+    try t.expectEqual(@as(u64, 0), limits.max_snapshot_l1_table_bytes);
+    try t.expectEqual(@as(u64, 65_664), limits.max_metadata_bytes);
+    try t.expectEqual(@as(u64, 8194), limits.max_metadata_work);
 }
 
 test "native zstd standalone qcow2 succeeds through the retained read-only descriptor" {
@@ -491,6 +517,7 @@ test "qcow2 operational errors propagate and validation duplicates always close"
                     error.InputOutput,
                     boot.files.validateQcow2(fault_io, retained, retained_snapshot),
                 ),
+                .observe => unreachable,
             }
             try t.expectEqual(@as(usize, 1), fault.failures);
         }
@@ -504,6 +531,98 @@ test "qcow2 operational errors propagate and validation duplicates always close"
     );
     try t.expectEqual(descriptor_count, try openFdCount());
     try boot.files.validateQcow2(io, retained, retained_snapshot);
+}
+
+test "qcow2 bounded admission rejects sparse 512-byte-cluster amplification before table reads" {
+    const f = try Fixture.initSource(0, .qcow2);
+    defer f.deinit();
+    const cluster_bytes: u64 = 512;
+    const refcount_table_clusters: u32 = @intCast(boot.config.max_input / cluster_bytes - 1);
+    const refcount_table_entries = @as(u64, refcount_table_clusters) * cluster_bytes / @sizeOf(u64);
+    try t.expectEqual(@as(u64, 33_554_368), refcount_table_entries);
+
+    {
+        const file = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setLength(io, boot.config.max_input);
+        var header = [_]u8{0} ** 112;
+        header[0..4].* = .{ 0x51, 0x46, 0x49, 0xfb };
+        std.mem.writeInt(u32, header[4..8], 3, .big);
+        std.mem.writeInt(u32, header[20..24], 9, .big);
+        std.mem.writeInt(u64, header[24..32], boot.config.max_virtual, .big);
+        std.mem.writeInt(u32, header[36..40], 1, .big);
+        std.mem.writeInt(u64, header[40..48], cluster_bytes, .big);
+        std.mem.writeInt(u64, header[48..56], cluster_bytes, .big);
+        std.mem.writeInt(u32, header[56..60], refcount_table_clusters, .big);
+        std.mem.writeInt(u64, header[72..80], boot.miz.qcow2.incompatible_compression, .big);
+        std.mem.writeInt(u32, header[96..100], boot.miz.qcow2.default_refcount_order, .big);
+        std.mem.writeInt(u32, header[100..104], 112, .big);
+        header[104] = 1;
+        try file.writePositionalAll(io, &header, 0);
+        var first_table_entry: [8]u8 = undefined;
+        std.mem.writeInt(u64, &first_table_entry, 3, .big);
+        try file.writePositionalAll(io, &first_table_entry, cluster_bytes);
+    }
+
+    const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+    defer retained.close(io);
+    const retained_snapshot = try core.private_files.snapshot(retained);
+    const descriptor_count = try openFdCount();
+    {
+        var probe: Qcow2IoFault = .{ .retained = retained.handle, .kind = .observe };
+        const probe_io = probe.install();
+        defer probe.deinit();
+        try t.expectError(error.InvalidQcow2, boot.files.validateQcow2(probe_io, retained, retained_snapshot));
+        try t.expectEqual(@as(usize, 1), probe.duplicate_reads);
+        try t.expectEqual(@as(u64, 0), probe.highest_duplicate_read_offset);
+    }
+    try t.expectEqual(descriptor_count, try openFdCount());
+    try t.expectEqual(.SUCCESS, linux.errno(linux.fcntl(retained.handle, linux.F.GETFD, 0)));
+}
+
+test "qcow2 bounded header limits reject virtual L1 refcount and snapshot excess before table reads" {
+    for (0..4) |case| {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        switch (case) {
+            0 => try writeQcowInt(f, u64, 24, boot.config.max_virtual + 512),
+            1 => try writeQcowInt(f, u32, 36, 2),
+            2 => try writeQcowInt(f, u32, 56, 2),
+            3 => try writeQcowInt(f, u32, 60, 1),
+            else => unreachable,
+        }
+        const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+        defer retained.close(io);
+        const retained_snapshot = try core.private_files.snapshot(retained);
+        {
+            var probe: Qcow2IoFault = .{ .retained = retained.handle, .kind = .observe };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(error.InvalidQcow2, boot.files.validateQcow2(probe_io, retained, retained_snapshot));
+            try t.expectEqual(@as(usize, 1), probe.duplicate_reads);
+            try t.expectEqual(@as(u64, 0), probe.highest_duplicate_read_offset);
+        }
+    }
+}
+
+test "qcow2 aggregate metadata work stops extension amplification before table reads" {
+    const f = try Fixture.initSource(0, .qcow2);
+    defer f.deinit();
+    try writeQcowInt(f, u32, 112, 0x1234_5678);
+    try writeQcowInt(f, u32, 116, 0);
+    try writeQcowBytes(f, 120, &([_]u8{0} ** 8));
+
+    const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+    defer retained.close(io);
+    const retained_snapshot = try core.private_files.snapshot(retained);
+    {
+        var probe: Qcow2IoFault = .{ .retained = retained.handle, .kind = .observe };
+        const probe_io = probe.install();
+        defer probe.deinit();
+        try t.expectError(error.InvalidQcow2, boot.files.validateQcow2(probe_io, retained, retained_snapshot));
+        try t.expectEqual(@as(usize, 2), probe.duplicate_reads);
+        try t.expectEqual(@as(u64, 112), probe.highest_duplicate_read_offset);
+    }
 }
 
 test "qcow2 structural corruption remains invalid input and closes its duplicate" {
@@ -532,7 +651,7 @@ test "qcow2 physical and decoded capacity limits are independent" {
         const f = try Fixture.initSource(0, .qcow2);
         defer f.deinit();
         try writeQcowInt(f, u64, 24, boot.config.max_virtual + 512);
-        try t.expectError(error.InvalidQcow2Profile, boot.files.Set.open(io, f.config));
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
     }
 }
 
@@ -572,7 +691,7 @@ test "qcow2 narrow producer profile rejects features snapshots encryption cluste
         defer f.deinit();
         try writeQcowInt(f, u32, 60, 1);
         try writeQcowInt(f, u64, 64, 64 * 1024);
-        try t.expectError(error.InvalidQcow2Profile, boot.files.Set.open(io, f.config));
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
     }
     {
         const f = try Fixture.initSource(0, .qcow2);
@@ -593,13 +712,13 @@ test "qcow2 narrow producer profile rejects features snapshots encryption cluste
         const f = try Fixture.initSource(0, .qcow2);
         defer f.deinit();
         try writeQcowBytes(f, 104, &.{0});
-        try t.expectError(error.InvalidQcow2Profile, boot.files.Set.open(io, f.config));
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
     }
     {
         const f = try Fixture.initSource(0, .qcow2);
         defer f.deinit();
         try writeQcowInt(f, u64, 72, 0);
-        try t.expectError(error.InvalidQcow2Profile, boot.files.Set.open(io, f.config));
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
     }
 }
 

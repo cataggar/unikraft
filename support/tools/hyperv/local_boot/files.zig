@@ -6,6 +6,65 @@ const c = @import("config.zig");
 const linux = std.os.linux;
 pub const Sha256 = core.Sha256;
 
+const qcow2_l2_entry_bytes: u64 = @sizeOf(u64);
+const qcow2_cluster_bits: u32 = miz.qcow2.default_cluster_bits;
+const qcow2_cluster_bytes: u64 = @as(u64, 1) << @intCast(qcow2_cluster_bits);
+const qcow2_l2_entries: u64 = qcow2_cluster_bytes / qcow2_l2_entry_bytes;
+const qcow2_max_guest_clusters: u64 = checkedDivCeil(c.max_virtual, qcow2_cluster_bytes);
+const qcow2_max_l1_entries: u64 = checkedDivCeil(qcow2_max_guest_clusters, qcow2_l2_entries);
+const qcow2_max_l1_table_bytes: u64 = checkedMul(qcow2_max_l1_entries, qcow2_l2_entry_bytes);
+const qcow2_refcount_table_clusters: u64 = 1;
+const qcow2_refcount_table_bytes: u64 = checkedMul(qcow2_refcount_table_clusters, qcow2_cluster_bytes);
+const qcow2_refcount_table_entries: u64 = qcow2_refcount_table_bytes / qcow2_l2_entry_bytes;
+const qcow2_header_bytes: u64 = 112;
+const qcow2_header_terminator_bytes: u64 = 8;
+const qcow2_metadata_bytes: u64 = checkedAdd(
+    checkedAdd(qcow2_header_bytes, qcow2_max_l1_table_bytes),
+    checkedAdd(qcow2_refcount_table_bytes, qcow2_header_terminator_bytes),
+);
+const qcow2_metadata_work: u64 = checkedAdd(qcow2_refcount_table_entries, 2);
+
+pub const qcow2_standalone_open_limits: miz.Qcow2StandaloneOpenLimits = .{
+    .max_file_bytes = c.max_input,
+    .max_virtual_size = c.max_virtual,
+    .min_cluster_bits = qcow2_cluster_bits,
+    .max_cluster_bits = qcow2_cluster_bits,
+    .max_l1_entries = qcow2_max_l1_entries,
+    .max_l1_table_bytes = qcow2_max_l1_table_bytes,
+    .max_refcount_table_clusters = qcow2_refcount_table_clusters,
+    .max_refcount_table_bytes = qcow2_refcount_table_bytes,
+    .max_refcount_table_entries = qcow2_refcount_table_entries,
+    .max_snapshot_count = 0,
+    .max_snapshot_table_bytes = 0,
+    .max_snapshot_l1_entries = 0,
+    .max_snapshot_l1_table_bytes = 0,
+    .max_metadata_bytes = qcow2_metadata_bytes,
+    .max_metadata_work = qcow2_metadata_work,
+};
+
+comptime {
+    if (qcow2_cluster_bits != 16 or
+        qcow2_max_l1_entries != 1 or
+        qcow2_refcount_table_entries != 8192 or
+        qcow2_metadata_bytes != 65_664 or
+        qcow2_metadata_work != 8194)
+    {
+        @compileError("QCOW2 bounded-open limits no longer match the reviewed native Miz producer profile");
+    }
+}
+
+fn checkedAdd(comptime left: u64, comptime right: u64) u64 {
+    return std.math.add(u64, left, right) catch @compileError("QCOW2 profile addition overflow");
+}
+
+fn checkedMul(comptime left: u64, comptime right: u64) u64 {
+    return std.math.mul(u64, left, right) catch @compileError("QCOW2 profile multiplication overflow");
+}
+
+fn checkedDivCeil(comptime numerator: u64, comptime denominator: u64) u64 {
+    return std.math.divCeil(u64, numerator, denominator) catch @compileError("invalid QCOW2 profile division");
+}
+
 pub const Pin = struct { size: u64, sha256: [32]u8 };
 pub const Artifact = struct {
     file: std.Io.File,
@@ -170,10 +229,11 @@ fn validationDuplicate(file: std.Io.File) !std.Io.File {
 }
 
 pub fn openStandaloneQcow2Image(io: std.Io, file: std.Io.File) !miz.Image {
-    return miz.Image.openStandaloneQcow2File(io, file) catch |err| switch (err) {
+    return miz.Image.openStandaloneQcow2FileWithLimits(io, file, qcow2_standalone_open_limits) catch |err| switch (err) {
         error.BackingFileNotSupported,
         error.ExternalDataFileNotSupported,
         => return err,
+        error.InvalidStandaloneOpenLimits => unreachable,
         error.BadFileSignature,
         error.UnsupportedVersion,
         error.UnsupportedClusterSize,
@@ -199,6 +259,25 @@ pub fn openStandaloneQcow2Image(io: std.Io, file: std.Io.File) !miz.Image {
         error.RefcountTablePastEndOfFile,
         error.L1TablePastEndOfFile,
         error.L1TableTooSmall,
+        error.FileSizeLimitExceeded,
+        error.VirtualSizeLimitExceeded,
+        error.ClusterGeometryLimitExceeded,
+        error.L1EntriesLimitExceeded,
+        error.L1TableBytesLimitExceeded,
+        error.RefcountTableClustersLimitExceeded,
+        error.RefcountTableBytesLimitExceeded,
+        error.RefcountTableEntriesLimitExceeded,
+        error.SnapshotCountLimitExceeded,
+        error.SnapshotTableBytesLimitExceeded,
+        error.SnapshotL1EntriesLimitExceeded,
+        error.SnapshotL1TableBytesLimitExceeded,
+        error.MetadataBytesLimitExceeded,
+        error.MetadataWorkLimitExceeded,
+        error.SnapshotTablePastEndOfFile,
+        error.InvalidSnapshotEntry,
+        error.MisalignedSnapshotL1Table,
+        error.SnapshotL1TablePastEndOfFile,
+        error.SnapshotL1TableTooSmall,
         => return error.InvalidQcow2,
         else => return err,
     };
@@ -239,19 +318,19 @@ fn validateQcow2Impl(
     transferred = true;
     defer image.close(io);
 
-    const info = image.qcow2 orelse return error.InvalidQcow2Profile;
+    const info = image.qcow2 orelse return error.InvalidQcow2;
     if (image.format != .qcow2 or info.file_size != retained_snapshot.size or
         info.virtual_size == 0 or info.virtual_size > c.max_virtual or info.virtual_size % 512 != 0 or
         info.version != 3 or info.cluster_bits != miz.qcow2.default_cluster_bits or
         info.cluster_size != 64 * 1024 or info.header_length != 112 or
         info.l2_entries != 8192)
     {
-        return error.InvalidQcow2Profile;
+        return error.InvalidQcow2;
     }
     const guest_clusters = std.math.divCeil(u64, info.virtual_size, info.cluster_size) catch
-        return error.InvalidQcow2Profile;
+        return error.InvalidQcow2;
     const expected_l1_size = std.math.divCeil(u64, guest_clusters, info.l2_entries) catch
-        return error.InvalidQcow2Profile;
+        return error.InvalidQcow2;
     if (info.l1_size != @max(1, expected_l1_size) or
         info.active_l1_table_offset != info.l1_table_offset or
         info.refcount_order != miz.qcow2.default_refcount_order or
@@ -263,7 +342,7 @@ fn validateQcow2Impl(
         info.source_path_len != 0 or info.data_file_len != 0 or info.data_file_size != 0 or
         info.backing_file_len != 0 or info.backing_depth != 0)
     {
-        return error.InvalidQcow2Profile;
+        return error.InvalidQcow2;
     }
 
     miz.qcow2.check(image.file, io, info) catch |err| switch (err) {

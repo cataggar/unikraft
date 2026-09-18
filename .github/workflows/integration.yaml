@@ -1256,7 +1256,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: cataggar/miz
-        ref: 2db68ca0c3ab12155012a823c3fb8d7aba1cb544
+        ref: 669a27982b376311f558e820b69e9a692735b0cd
         fetch-depth: 1
         path: .d/ci-miz
 
