@@ -759,7 +759,7 @@ class Compute(unittest.TestCase):
             consumer_files,
             {name: root / "tools/consumer-tree"
              for name in (
-                 "bison", "python-stdlib", "system-bin", "zig", "llvm")})
+                 "bison", "python-stdlib", "zig", "llvm")})
         producer = dict(
             source=source,
             source_custody=source_custody(),

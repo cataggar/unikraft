@@ -73,9 +73,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "900390be16a1d30a6e1096712c4d789caac9b1d4962ad04150a945e7232a820e"
+            "d4ae4a607194aac87c14d148ae7bddba703079e88cb3e2927e0906989816319b"
         ),
-        "size": 2078222,
+        "size": 2079715,
         "files": 226,
     },
     "support/kconfig": {
@@ -503,13 +503,13 @@ GUARDED_PRODUCER_FILES = {
         "6465bc8c33deba57d3ae86edbc97a0f78f3b0cfea1669896855ad3c0a7b3c2c9"
     ),
     "support/build/native-postprocess-runner.py": (
-        "efafac66a29fdf12320e2f8f779b92f43b8ebf75fb90fff4695e0aec7f39e703"
+        "3379115753b149a6f16675cb3d5f315c25bfb49bf702720cdc882470434ef0f1"
     ),
     "support/build/native-postprocess-runner.zig": (
-        "d0e66bea11f3f0e0c0344c43f9d8133f8a017b680e5a3997aaad44c83ab49a3c"
+        "3077b7aa0af7ed5be4ce2506da7d1941f595622b6a70f7af4d3b8ac77821e766"
     ),
     "support/build/native-postprocess.zig": (
-        "943fd3dbd2c3328e34696ae4240c8f7f36a3f573ffc31e4c2a02c493ceea89ec"
+        "294ffe3767a69e7cb60aecf4a8417924e27eb69996562afe954f7efdc6b57381"
     ),
     "support/scripts/elf_tools.py": (
         "0aad63e7830a814a5c29a7330925f64e8c844cf28700aa959002a629d5019820"

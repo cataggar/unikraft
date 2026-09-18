@@ -609,9 +609,16 @@ pub fn execute(
             try nativeArguments(b.allocator, operation)
         else
             operation.arguments;
-        for (arguments) |argument| {
+        for (arguments, 0..) |argument, index| {
             switch (argument) {
-                .literal => |item| run.addArg(item),
+                .literal => |item| {
+                    run.addArg(item);
+                    if (index == 0 and operation.kind == .strip and
+                        std.mem.eql(u8, tools.strip, tools.objcopy))
+                    {
+                        run.addArg("--objcopy-interface");
+                    }
+                },
                 .directory => |path| run.addDirectoryArg(.{ .cwd_relative = path }),
                 .input => |artifact_index| {
                     run.addFileArg(resolved[artifact_index] orelse

@@ -33,6 +33,8 @@ const Case = struct {
             .database => &.{ "compile-database", "--search-root", self.database },
         };
         try argv.appendSlice(self.allocator, prefix);
+        if (action == .strip and std.mem.eql(u8, self.strip, self.objcopy))
+            try argv.append(self.allocator, "--objcopy-interface");
         try argv.append(self.allocator, self.input);
         switch (action) {
             .efi => try argv.append(self.allocator, self.debug),
