@@ -25,6 +25,11 @@ GIT = os.environ.get("WAMR_CI_GIT", "git")
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+ci.COMMAND_TOOL_PATHS.update({
+    name: os.environ["WAMR_CI_TOOL_" + name.upper().replace("-", "_")]
+    for name in ci.HOST_TOOLS
+    if "WAMR_CI_TOOL_" + name.upper().replace("-", "_") in os.environ
+})
 
 
 class Contract(unittest.TestCase):
@@ -536,12 +541,16 @@ class Evidence(unittest.TestCase):
                 for name in ci.HOST_TOOLS
             }
         }
-        environment = ci.bind_command_tools(tools)
-        self.assertEqual(environment["PATH"], "/usr/bin:/bin")
-        self.assertEqual(environment["WAMR_CI_GIT"], "/selected/git")
-        self.assertEqual(
-            environment["WAMR_CI_TOOL_DASH"], "/system/dash")
-        ci.COMMAND_TOOL_PATHS.clear()
+        original_tools = dict(ci.COMMAND_TOOL_PATHS)
+        try:
+            environment = ci.bind_command_tools(tools)
+            self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+            self.assertEqual(environment["WAMR_CI_GIT"], "/selected/git")
+            self.assertEqual(
+                environment["WAMR_CI_TOOL_DASH"], "/system/dash")
+        finally:
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_TOOL_PATHS.update(original_tools)
 
     def test_compute_dynamic_validator_never_writes_bytecode(self):
         app = self.root / "validator-app"
@@ -630,6 +639,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             commands.append((stage, list(map(str, args))))
             return root / "private" / (stage + ".log")
 
+        original_tools = dict(ci.COMMAND_TOOL_PATHS)
         with mock.patch.dict(os.environ, {
                 "BISON_PKGDATADIR": str(runtime / "bison")}, clear=True), \
                 mock.patch.object(ci, "prepare_source_outputs"), \
@@ -663,6 +673,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 mock.patch.object(ci.subprocess, "check_output", return_value=b"0.16.0\n"):
             ci.build(runtime, self.root)
         ci.COMMAND_TOOL_PATHS.clear()
+        ci.COMMAND_TOOL_PATHS.update(original_tools)
 
         self.assertEqual(events[:2], ["restore", "custody"])
         selected = dict(commands)
