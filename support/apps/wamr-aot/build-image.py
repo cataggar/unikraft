@@ -102,6 +102,7 @@ def main():
     command = [
         zig, "build", args.step, "-j2",
         f"-Dapp={ROOT}", f"-Dnative-make-environment={environment}",
+        f"-Dconfig={ROOT / 'build/.config'}",
         f"-Dmake-command={tool('make')}",
         f"-Dcompiler={zig} cc -target x86_64-freestanding-none",
         "-Dcompiler-targeted=true", f"-Dhost-cc={zig} cc",

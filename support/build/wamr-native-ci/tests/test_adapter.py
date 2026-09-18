@@ -711,6 +711,10 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             '"-Dmake-arg=KCONFIG_OVERWRITECONFIG=1"',
             (ci.APP / "build-image.py").read_text(),
         )
+        self.assertIn(
+            'f"-Dconfig={ROOT / \'build/.config\'}"',
+            (ci.APP / "build-image.py").read_text(),
+        )
         app = self.root / "app"
         app.mkdir(mode=0o700)
         self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")
