@@ -642,37 +642,42 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             return root / "private" / (stage + ".log")
 
         original_tools = dict(ci.COMMAND_TOOL_PATHS)
-        with mock.patch.dict(os.environ, {
-                "BISON_PKGDATADIR": str(runtime / "bison")}, clear=True), \
-                mock.patch.object(ci, "prepare_source_outputs"), \
-                mock.patch.object(
-                    ci, "seal_wamr_source",
-                    return_value=runtime / "custody/wamr-source.tar"), \
-                mock.patch.object(
-                    ci, "consumer_input_state", return_value=consumer), \
-                mock.patch.object(ci, "source", return_value=source), \
-                mock.patch.object(ci, "source_metadata", return_value=[]), \
-                mock.patch.object(ci, "restore_dependencies", side_effect=restore), \
-                mock.patch.object(ci, "producer_inputs", side_effect=inputs), \
-                mock.patch.object(ci, "run_custodied", side_effect=command), \
-                mock.patch.object(ci, "require_no_config_backup"), \
-                mock.patch.object(ci, "retain_solved_config"), \
-                mock.patch.object(ci, "solved_config", return_value="f" * 64), \
-                mock.patch.object(ci, "require_build_custody"), \
-                mock.patch.object(ci, "save"), \
-                mock.patch.object(ci, "check_build", return_value={}), \
-                mock.patch.object(ci, "digest", return_value="f" * 64), \
-                mock.patch.object(
-                    ci, "consumer_file_records", return_value={}), \
-                mock.patch.object(
-                    ci, "retained_executables",
-                    return_value=contextlib.nullcontext(
-                        ({"/tools/zig": "/tools/zig"}, ()))), \
-                mock.patch.object(
-                    ci, "bounded_subprocess_output",
-                    return_value=b"0.16.0\n"), \
-                mock.patch.object(ci, "tool", side_effect=lambda name: "/tools/" + name), \
-                mock.patch.object(ci.subprocess, "check_output", return_value=b"0.16.0\n"):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(
+                os.environ,
+                {"BISON_PKGDATADIR": str(runtime / "bison")},
+                clear=True,
+            ))
+            for name, kwargs in (
+                ("prepare_source_outputs", {}),
+                ("seal_wamr_source", {
+                    "return_value": runtime / "custody/wamr-source.tar"}),
+                ("consumer_input_state", {"return_value": consumer}),
+                ("source", {"return_value": source}),
+                ("source_metadata", {"return_value": []}),
+                ("restore_dependencies", {"side_effect": restore}),
+                ("producer_inputs", {"side_effect": inputs}),
+                ("run_custodied", {"side_effect": command}),
+                ("require_no_config_backup", {}),
+                ("retain_solved_config", {}),
+                ("solved_config", {"return_value": "f" * 64}),
+                ("require_build_custody", {}),
+                ("save", {}),
+                ("check_build", {"return_value": {}}),
+                ("digest", {"return_value": "f" * 64}),
+                ("consumer_file_records", {"return_value": {}}),
+                ("retained_executables", {
+                    "return_value": contextlib.nullcontext(
+                        ({"/tools/zig": "/tools/zig"}, ())),
+                }),
+                ("bounded_subprocess_output", {
+                    "return_value": b"0.16.0\n"}),
+                ("tool", {
+                    "side_effect": lambda name: "/tools/" + name}),
+            ):
+                stack.enter_context(mock.patch.object(ci, name, **kwargs))
+            stack.enter_context(mock.patch.object(
+                ci.subprocess, "check_output", return_value=b"0.16.0\n"))
             ci.build(runtime, self.root)
         ci.COMMAND_TOOL_PATHS.clear()
         ci.COMMAND_TOOL_PATHS.update(original_tools)

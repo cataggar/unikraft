@@ -62,6 +62,22 @@ fn commandPath(path: []const u8) !void {
     }
 }
 
+fn retainedDescriptorPath(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "/proc/")) return false;
+    var components = std.mem.splitScalar(u8, path["/proc/".len..], '/');
+    const process = components.next() orelse return false;
+    const fd = components.next() orelse return false;
+    const descriptor = components.next() orelse return false;
+    if (components.next() != null or !std.mem.eql(u8, fd, "fd") or
+        descriptor.len == 0)
+        return false;
+    if (!std.mem.eql(u8, process, "self")) {
+        for (process) |byte| if (!std.ascii.isDigit(byte)) return false;
+    }
+    for (descriptor) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(Contract) {
     if (bytes.len == 0 or bytes.len > maximum_bytes) return error.InvalidNativeMakeEnvironment;
     var parsed = try std.json.parseFromSlice(Contract, allocator, bytes, .{
@@ -95,12 +111,20 @@ fn readLinux(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.js
     inline for (std.meta.fields(Contract)) |field| {
         if (comptime !std.mem.eql(u8, field.name, "schema")) {
             const value = @field(parsed.value, field.name);
-            const canonical = try paths.canonicalizeNearestExisting(allocator, io, value);
-            defer allocator.free(canonical.path);
-            if (!canonical.exists or !std.mem.eql(u8, value, canonical.path))
-                return error.InvalidNativeMakePath;
-            if (comptime std.mem.eql(u8, field.name, "shell") or std.mem.eql(u8, field.name, "m4")) {
-                const file = try private.openAbsolute(io, value, .artifact);
+            const tool_field = comptime std.mem.eql(u8, field.name, "shell") or
+                std.mem.eql(u8, field.name, "m4");
+            const retained = tool_field and retainedDescriptorPath(value);
+            if (!retained) {
+                const canonical = try paths.canonicalizeNearestExisting(allocator, io, value);
+                defer allocator.free(canonical.path);
+                if (!canonical.exists or !std.mem.eql(u8, value, canonical.path))
+                    return error.InvalidNativeMakePath;
+            }
+            if (tool_field) {
+                const file = if (retained)
+                    try std.Io.Dir.openFileAbsolute(io, value, .{ .mode = .read_only })
+                else
+                    try private.openAbsolute(io, value, .artifact);
                 defer file.close(io);
                 const metadata = try private.snapshot(file);
                 if (metadata.mode & 0o7022 != 0 or metadata.mode & 0o111 == 0 or
@@ -218,6 +242,26 @@ test "native Make environment reads only private state and validated explicit pa
     var loaded = try read(std.testing.allocator, io, path);
     defer loaded.deinit();
     try std.testing.expectEqualStrings(contract.shell, loaded.value.shell);
+    const retained_shell = try temporary.dir.openFile(io, "shell", .{ .mode = .read_only });
+    defer retained_shell.close(io);
+    var retained_contract = contract;
+    retained_contract.shell = try std.fmt.allocPrint(
+        allocator,
+        "/proc/{d}/fd/{d}",
+        .{ std.os.linux.getpid(), retained_shell.handle },
+    );
+    const retained_json = try std.json.Stringify.valueAlloc(allocator, retained_contract, .{});
+    const retained_bytes = try std.fmt.allocPrint(allocator, "{s}\n", .{retained_json});
+    const retained_environment = try temporary.dir.createFile(io, "retained-environment.json", .{
+        .permissions = .fromMode(0o600),
+        .exclusive = true,
+    });
+    defer retained_environment.close(io);
+    try retained_environment.writePositionalAll(io, retained_bytes, 0);
+    const retained_path = try std.fs.path.join(allocator, &.{ base, "retained-environment.json" });
+    var retained_loaded = try read(std.testing.allocator, io, retained_path);
+    defer retained_loaded.deinit();
+    try std.testing.expectEqualStrings(retained_contract.shell, retained_loaded.value.shell);
     try file.setPermissions(io, .fromMode(0o644));
     try std.testing.expectError(error.UnsafeFile, read(allocator, io, path));
     try file.setPermissions(io, .fromMode(0o600));

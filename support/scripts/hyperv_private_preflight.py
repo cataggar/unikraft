@@ -158,9 +158,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "d3397e6f28d06c8d1cfbbf4ee2871fe6a26dceb5408bdba1c70845770ab1444c"
+            "e8e61ede1df7550fa6ba62448fd3f18c9be8b089ed5bed0805de774c5d28b8c5"
         ),
-        "size": 2064304,
+        "size": 2066307,
         "files": 226,
     },
     "support/kconfig": {
@@ -493,7 +493,7 @@ GUARDED_PRODUCER_FILES = {
         "c1c75f1364efe3a84da48f5fb399030822901262d0e6c728529e89341e72b63d"
     ),
     "support/build/native-make-environment.zig": (
-        "7db2a3cefd9576efa62e66453d3ff59dabfdc5ae8ae391f1f8cc08f5362eec51"
+        "8ce57b5cff098a11ba95d4453c919c23a6639146daa94fd687f5f0399638860b"
     ),
     "support/build/native-target-object.zig": (
         "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
