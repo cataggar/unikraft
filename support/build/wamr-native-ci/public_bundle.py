@@ -535,6 +535,12 @@ def native(handoff, validator, bundle):
         {}, {}, content=True, expected=validator_input)
 
 
+def require_consumer_tree_roles(value, legacy):
+    roles = set(value["trees"])
+    require({"bison", "python-stdlib", "zig", "llvm"} <= roles)
+    require("system-bin" not in roles or legacy)
+
+
 def publication_records(handoff, stage, source):
     """The uploaded originals must be the successful fixed public lane records."""
     ci = handoff.ci
@@ -565,9 +571,8 @@ def publication_records(handoff, stage, source):
             require(
                 {f"tool:{name}" for name in ci.HOST_TOOLS}
                 | {"wamr-source-archive"}
-                <= set(start["consumer_inputs"]["files"])
-                and {"bison", "python-stdlib", "system-bin", "zig", "llvm"}
-                <= set(start["consumer_inputs"]["trees"]))
+                <= set(start["consumer_inputs"]["files"]))
+            require_consumer_tree_roles(start["consumer_inputs"], legacy)
     boot_inputs = ci.document(stage / "evidence/boot-inputs.json")
     if boot_inputs.get("schema") == "uk.wamr.consumer-input-custody":
         consumer_input_record(ci, boot_inputs)

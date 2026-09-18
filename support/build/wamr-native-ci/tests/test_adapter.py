@@ -375,6 +375,16 @@ class Evidence(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "bundle refused"):
             public_bundle.ci_runtime(runtime_owner)
 
+    def test_public_bundle_rejects_current_system_bin_tree(self):
+        current = {"trees": {
+            "bison": {}, "python-stdlib": {}, "zig": {}, "llvm": {},
+        }}
+        public_bundle.require_consumer_tree_roles(current, False)
+        current["trees"]["system-bin"] = {}
+        with self.assertRaisesRegex(ValueError, "bundle refused"):
+            public_bundle.require_consumer_tree_roles(current, False)
+        public_bundle.require_consumer_tree_roles(current, True)
+
     def test_boot_output_slots_preserve_their_shared_parent(self):
         runtime = self.root / "runtime"
         compute = runtime / "compute"
