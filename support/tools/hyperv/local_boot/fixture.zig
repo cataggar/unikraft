@@ -29,8 +29,13 @@ fn execute(init: std.process.Init) !void {
     const parsed = try std.json.parseFromSlice(boot.runner.Request, a, raw, .{});
     defer parsed.deinit();
     const request = parsed.value;
-    const is_raw = request.config.raw_disk != null;
-    if (args.len != @as(usize, if (is_raw) 29 else 27)) return error.Arguments;
+    const kind = request.config.source.kind;
+    const expected_arguments: usize = switch (kind) {
+        .image => 27,
+        .raw_disk, .fixed_vhd => 29,
+        .qcow2 => 31,
+    };
+    if (args.len != expected_arguments) return error.Arguments;
     const leading = [_][]const u8{
         "-no-user-config",                                    "-machine", "q35,accel=kvm",                          "-cpu", "",
         "-smp",                                               "",         "-m",                                     "512M", "-drive",
@@ -47,30 +52,56 @@ fn execute(init: std.process.Init) !void {
     var limit: linux.rlimit = undefined;
     if (linux.errno(linux.getrlimit(.FSIZE, &limit)) != .SUCCESS or limit.cur != boot.config.max_serial or limit.max != limit.cur) return error.OutputLimit;
     if (linux.errno(linux.getrlimit(.CORE, &limit)) != .SUCCESS or limit.cur != 0 or limit.max != 0) return error.OutputLimit;
-    const original = try boot.core.private_files.openAbsolute(io, request.config.source(), .artifact);
+    const original = try boot.core.private_files.openAbsolute(io, request.config.source.path, .artifact);
     defer original.close(io);
     const source: std.Io.File = source: {
-        if (is_raw) {
-            if (!std.mem.eql(u8, args[14], "-blockdev") or !std.mem.eql(u8, args[16], "-device") or
-                !std.mem.eql(u8, args[17], "virtio-blk-pci,drive=local-boot-disk")) return error.RawArguments;
-            const Block = struct {
-                driver: []const u8,
-                @"node-name": []const u8,
-                offset: u64,
-                size: u64,
-                @"read-only": bool,
-                file: struct { driver: []const u8, filename: []const u8, @"read-only": bool },
+        if (kind != .image) {
+            if (!std.mem.eql(u8, args[14], "-blockdev")) return error.DiskArguments;
+            const filename = filename: {
+                if (kind == .qcow2) {
+                    if (!std.mem.eql(u8, args[16], "-blockdev") or !std.mem.eql(u8, args[18], "-device") or
+                        !std.mem.eql(u8, args[19], "virtio-blk-pci,drive=local-boot-disk")) return error.DiskArguments;
+                    var file_document = try boot.core.contracts.Document.parse(a, args[15], .{});
+                    defer file_document.deinit();
+                    const file_node = try boot.core.contracts.exactFields(file_document.value(), &.{ "driver", "node-name", "filename", "read-only" });
+                    const string = boot.core.contracts.string;
+                    if (!std.mem.eql(u8, try string(file_node.get("driver").?), "file") or
+                        !std.mem.eql(u8, try string(file_node.get("node-name").?), "local-boot-qcow2-file") or
+                        !file_node.get("read-only").?.bool) return error.DiskArguments;
+                    var qcow_document = try boot.core.contracts.Document.parse(a, args[17], .{});
+                    defer qcow_document.deinit();
+                    const qcow_node = try boot.core.contracts.exactFields(qcow_document.value(), &.{ "driver", "node-name", "file", "read-only" });
+                    if (!std.mem.eql(u8, try string(qcow_node.get("driver").?), "qcow2") or
+                        !std.mem.eql(u8, try string(qcow_node.get("node-name").?), "local-boot-disk") or
+                        !std.mem.eql(u8, try string(qcow_node.get("file").?), "local-boot-qcow2-file") or
+                        !qcow_node.get("read-only").?.bool) return error.DiskArguments;
+                    break :filename try string(file_node.get("filename").?);
+                }
+                if (!std.mem.eql(u8, args[16], "-device") or
+                    !std.mem.eql(u8, args[17], "virtio-blk-pci,drive=local-boot-disk")) return error.DiskArguments;
+                var document = try boot.core.contracts.Document.parse(a, args[15], .{});
+                defer document.deinit();
+                const fixed = kind == .fixed_vhd;
+                const object = try boot.core.contracts.exactFields(document.value(), if (fixed)
+                    &.{ "driver", "node-name", "read-only", "file" }
+                else
+                    &.{ "driver", "node-name", "offset", "size", "read-only", "file" });
+                const string = boot.core.contracts.string;
+                if (!std.mem.eql(u8, try string(object.get("driver").?), if (fixed) "vpc" else "raw") or
+                    !std.mem.eql(u8, try string(object.get("node-name").?), "local-boot-disk") or
+                    !object.get("read-only").?.bool) return error.DiskArguments;
+                if (!fixed and (try boot.core.contracts.integer(u64, object.get("offset").?) != 0 or
+                    try boot.core.contracts.integer(u64, object.get("size").?) != request.pins[0].size)) return error.DiskArguments;
+                const file_node = try boot.core.contracts.exactFields(object.get("file").?, &.{ "driver", "filename", "read-only" });
+                if (!std.mem.eql(u8, try string(file_node.get("driver").?), "file") or !file_node.get("read-only").?.bool)
+                    return error.DiskArguments;
+                break :filename try string(file_node.get("filename").?);
             };
-            const block = try std.json.parseFromSlice(Block, a, args[15], .{ .ignore_unknown_fields = false });
-            defer block.deinit();
-            const b = block.value;
-            if (!std.mem.eql(u8, b.driver, "raw") or !std.mem.eql(u8, b.@"node-name", "local-boot-disk") or
-                b.offset != 0 or b.size != request.pins[0].size or !b.@"read-only" or !b.file.@"read-only" or
-                !std.mem.eql(u8, b.file.driver, "file") or !std.mem.startsWith(u8, b.file.filename, "/proc/self/fd/")) return error.RawArguments;
-            const fd = try std.fmt.parseInt(linux.fd_t, b.file.filename["/proc/self/fd/".len..], 10);
+            if (!std.mem.startsWith(u8, filename, "/proc/self/fd/")) return error.DiskArguments;
+            const fd = try std.fmt.parseInt(linux.fd_t, filename["/proc/self/fd/".len..], 10);
             const flags = linux.fcntl(fd, linux.F.GETFL, 0);
-            if (linux.errno(flags) != .SUCCESS or flags & 3 != 0) return error.WritableRaw;
-            const file = try std.Io.Dir.openFileAbsolute(io, b.file.filename, .{ .mode = .read_only });
+            if (linux.errno(flags) != .SUCCESS or flags & 3 != 0) return error.WritableDisk;
+            const file = try std.Io.Dir.openFileAbsolute(io, filename, .{ .mode = .read_only });
             if (!boot.core.private_files.sameSnapshot(try boot.core.private_files.snapshot(original), try boot.core.private_files.snapshot(file))) return error.WrongBacking;
             if (work.dir.openDir(io, "esp", .{})) |esp| {
                 esp.close(io);
@@ -87,7 +118,17 @@ fn execute(init: std.process.Init) !void {
     const source_stat = try boot.core.private_files.snapshot(source);
     if (!std.mem.eql(u8, &try boot.files.digest(io, source, source_stat), &request.pins[0].sha256)) return error.SourceChanged;
     var mode: [1]u8 = undefined;
-    if (try source.readPositionalAll(io, &mode, 0) != 1) return error.EmptySource;
+    if (kind == .qcow2) {
+        const duplicate_fd = linux.fcntl(source.handle, linux.F.DUPFD_CLOEXEC, 64);
+        if (linux.errno(duplicate_fd) != .SUCCESS) return error.DescriptorFailed;
+        const duplicate: std.Io.File = .{ .handle = @intCast(duplicate_fd), .flags = .{ .nonblocking = false } };
+        var image = boot.files.openStandaloneQcow2Image(io, duplicate) catch |err| {
+            duplicate.close(io);
+            return err;
+        };
+        defer image.close(io);
+        if (try image.pread(io, &mode, 0) != 1) return error.EmptySource;
+    } else if (try source.readPositionalAll(io, &mode, 0) != 1) return error.EmptySource;
     const vars = try work.dir.openFile(io, "OVMF_VARS.fd", .{ .mode = .read_write });
     defer vars.close(io);
     var byte: [1]u8 = undefined;
@@ -125,7 +166,7 @@ fn execute(init: std.process.Init) !void {
             try work.dir.createDir(io, "OVMF_VARS.fd", .fromMode(0o700));
         },
         9 => {
-            const changed = try std.Io.Dir.openFileAbsolute(io, request.config.source(), .{ .mode = .read_write });
+            const changed = try std.Io.Dir.openFileAbsolute(io, request.config.source.path, .{ .mode = .read_write });
             defer changed.close(io);
             try changed.writePositionalAll(io, "changed", source_stat.size - 7);
         },

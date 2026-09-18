@@ -3,14 +3,21 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const filters = b.option([]const []const u8, "test-filter", "Run only tests matching these filters") orelse &.{};
-    const source = b.dependency("miz_source", .{ .target = target, .optimize = optimize });
+    const miz = b.dependency("miz_source", .{ .target = target, .optimize = optimize }).module("miz");
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
     if (target.result.cpu.arch == .x86_64)
         core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
-    const local = b.createModule(.{ .root_source_file = b.path("../local_boot/root.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "hyperv_core", .module = core }} });
+    const local = b.createModule(.{
+        .root_source_file = b.path("../local_boot/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "miz", .module = miz },
+        },
+    });
     const kconfig = b.createModule(.{ .root_source_file = b.path("../../../build/kconfig.zig"), .target = target, .optimize = optimize });
     const elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
-    const miz = b.createModule(.{ .root_source_file = source.path("packages/miz/src/root.zig"), .target = target, .optimize = optimize });
     const peer = b.build_root.handle.readFileAlloc(b.graph.io, "../../../scripts/hyperv-network-peer.py", b.allocator, .limited(4 * 1024 * 1024)) catch @panic("public peer source unavailable");
     var peer_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(peer, &peer_hash, .{});

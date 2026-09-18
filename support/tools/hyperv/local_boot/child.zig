@@ -8,7 +8,7 @@ const synthetic_diagnostics = @hasDecl(@import("root"), "local_boot_synthetic_di
     @import("root").local_boot_synthetic_diagnostics;
 const diagnostics = if (synthetic_diagnostics) @import("synthetic_diagnostics") else void;
 
-pub fn arguments(a: std.mem.Allocator, config: c.Config, raw_size: u64, raw_fd: linux.fd_t) ![]const []const u8 {
+pub fn arguments(a: std.mem.Allocator, config: c.Config, source_size: u64, source_fd: linux.fd_t) ![]const []const u8 {
     try config.validate();
     var args: std.ArrayList([]const u8) = .empty;
     errdefer args.deinit(a);
@@ -21,24 +21,49 @@ pub fn arguments(a: std.mem.Allocator, config: c.Config, raw_size: u64, raw_fd: 
         "-drive",    "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
         "-drive",    "if=pflash,format=raw,file=OVMF_VARS.fd",
     });
-    if (config.image == null) {
-        if (raw_fd < 3 or raw_size == 0 or raw_size > c.max_input + @as(u64, if (config.fixed_vhd != null) 512 else 0)) return error.InvalidRawDisk;
-        const filename = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{raw_fd});
-        const block = if (config.fixed_vhd != null) try std.json.Stringify.valueAlloc(a, .{
-            .driver = "vpc",
-            .@"node-name" = "local-boot-disk",
-            .@"read-only" = true,
-            .file = .{ .driver = "file", .filename = filename, .@"read-only" = true },
-        }, .{}) else try std.json.Stringify.valueAlloc(a, .{
-            .driver = "raw",
-            .@"node-name" = "local-boot-disk",
-            .offset = @as(u64, 0),
-            .size = raw_size,
-            .@"read-only" = true,
-            .file = .{ .driver = "file", .filename = filename, .@"read-only" = true },
-        }, .{});
-        try args.appendSlice(a, &.{ "-blockdev", block, "-device", "virtio-blk-pci,drive=local-boot-disk" });
-    } else try args.appendSlice(a, &.{ "-drive", "format=raw,file=fat:rw:esp" });
+    switch (config.source.kind) {
+        .image => try args.appendSlice(a, &.{ "-drive", "format=raw,file=fat:rw:esp" }),
+        .raw_disk, .fixed_vhd => {
+            if (source_fd < 3 or source_size == 0 or source_size > config.source.maximumPhysicalSize())
+                return error.InvalidRawDisk;
+            const filename = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{source_fd});
+            const block = if (config.source.kind == .fixed_vhd) try std.json.Stringify.valueAlloc(a, .{
+                .driver = "vpc",
+                .@"node-name" = "local-boot-disk",
+                .@"read-only" = true,
+                .file = .{ .driver = "file", .filename = filename, .@"read-only" = true },
+            }, .{}) else try std.json.Stringify.valueAlloc(a, .{
+                .driver = "raw",
+                .@"node-name" = "local-boot-disk",
+                .offset = @as(u64, 0),
+                .size = source_size,
+                .@"read-only" = true,
+                .file = .{ .driver = "file", .filename = filename, .@"read-only" = true },
+            }, .{});
+            try args.appendSlice(a, &.{ "-blockdev", block, "-device", "virtio-blk-pci,drive=local-boot-disk" });
+        },
+        .qcow2 => {
+            if (source_fd < 3 or source_size == 0 or source_size > c.max_input) return error.InvalidQcow2Profile;
+            const filename = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{source_fd});
+            const file_block = try std.json.Stringify.valueAlloc(a, .{
+                .driver = "file",
+                .@"node-name" = "local-boot-qcow2-file",
+                .filename = filename,
+                .@"read-only" = true,
+            }, .{});
+            const qcow2_block = try std.json.Stringify.valueAlloc(a, .{
+                .driver = "qcow2",
+                .@"node-name" = "local-boot-disk",
+                .file = "local-boot-qcow2-file",
+                .@"read-only" = true,
+            }, .{});
+            try args.appendSlice(a, &.{
+                "-blockdev", file_block,
+                "-blockdev", qcow2_block,
+                "-device",   "virtio-blk-pci,drive=local-boot-disk",
+            });
+        },
+    }
     try args.appendSlice(a, &.{
         "-device",    "vmbus-bridge,irq=15",
         "-display",   "none",
@@ -101,11 +126,11 @@ pub fn execute(init: std.process.Init) !void {
     try files.copy(io, artifacts.items[1], work.dir, "OVMF_CODE.fd");
     try files.copy(io, artifacts.items[2], work.dir, "OVMF_VARS.fd");
     if (synthetic_diagnostics) try trace.mark(io, .firmware_copy_end);
-    var raw_fd: linux.fd_t = -1;
-    defer if (raw_fd >= 0) {
-        _ = linux.close(raw_fd);
+    var source_fd: linux.fd_t = -1;
+    defer if (source_fd >= 0) {
+        _ = linux.close(source_fd);
     };
-    if (request.config.image != null) {
+    if (request.config.source.kind == .image) {
         try work.dir.createDir(io, "esp", .fromMode(0o700));
         const esp = try work.dir.openDir(io, "esp", .{ .follow_symlinks = false, .iterate = true });
         defer esp.close(io);
@@ -116,8 +141,8 @@ pub fn execute(init: std.process.Init) !void {
         const boot = try efi.openDir(io, "BOOT", .{ .follow_symlinks = false, .iterate = true });
         defer boot.close(io);
         try files.copy(io, artifacts.items[0], boot, "BOOTX64.EFI");
-    } else raw_fd = try files.inheritedReadOnly(artifacts.items[0].file);
-    const args = try arguments(a, request.config, request.pins[0].size, raw_fd);
+    } else source_fd = try files.inheritedReadOnly(artifacts.items[0].file);
+    const args = try arguments(a, request.config, request.pins[0].size, source_fd);
     const argv = try a.allocSentinel(?[*:0]const u8, args.len, null);
     for (args, 0..) |arg, i| argv[i] = (try a.dupeZ(u8, arg)).ptr;
     var environment: std.process.Environ.Map = .init(a);

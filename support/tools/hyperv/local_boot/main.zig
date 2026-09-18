@@ -4,6 +4,7 @@ const boot = @import("local_boot");
 pub fn main(init: std.process.Init) void {
     const code = execute(init) catch |err| {
         const category: boot.core.diagnostics.Category = switch (err) {
+            error.Canceled => .cancelled,
             error.WouldBlock => .contention,
             error.WorkspaceConsumed, error.PathAlreadyExists => .conflict,
             error.UnsafeFile, error.UnsafePath, error.InvalidArtifact, error.InvalidExecutable => .unsafe_file,
@@ -23,6 +24,10 @@ pub fn main(init: std.process.Init) void {
             error.DuplicateArgument,
             error.MissingArgument,
             error.InputInsideWorkspace,
+            error.InvalidQcow2,
+            error.InvalidQcow2Profile,
+            error.BackingFileNotSupported,
+            error.ExternalDataFileNotSupported,
             => .invalid_input,
             else => .local_io,
         };

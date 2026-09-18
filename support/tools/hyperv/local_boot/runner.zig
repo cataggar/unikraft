@@ -14,7 +14,14 @@ pub const Request = struct {
         if (self.schema_version != 1 or self.supervisor_pid < 1) return error.InvalidRequest;
         try self.config.validate();
         for (self.pins, 0..) |pin, i| {
-            const maximum: u64 = if (i == 1) c.max_firmware else if (i == 2) c.max_vars else c.max_input + @as(u64, if (i == 0 and self.config.fixed_vhd != null) 512 else 0);
+            const maximum: u64 = if (i == 0)
+                self.config.source.maximumPhysicalSize()
+            else if (i == 1)
+                c.max_firmware
+            else if (i == 2)
+                c.max_vars
+            else
+                c.max_qemu;
             if (pin.size == 0 or pin.size > maximum) return error.InvalidRequest;
         }
     }
@@ -185,7 +192,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, config: c.Config, options: Options)
     } else |_| {
         try report.failures.record(.primary, .{ .stage = .private_file, .category = .integrity });
     }
-    files.cleanup(io, work, config.image != null) catch {
+    files.cleanup(io, work, config.source.kind == .image) catch {
         try report.failures.record(.cleanup, .{ .stage = .cleanup, .category = .cleanup_failed });
     };
     const output = report.encode(a) catch {

@@ -33,7 +33,8 @@ fn execute(init: std.process.Init) !void {
     defer work.close(io);
     const request = try c.read(image.boot.runner.Request, a, try work.read(io, a, "request.json", c.max_record, null));
     try request.validate();
-    if (args.len != 29 or request.config.image != null or request.config.cpus != 1) return error.Arguments;
+    if (args.len != 29 or !request.config.source.isDisk() or request.config.source.kind == .qcow2 or request.config.cpus != 1)
+        return error.Arguments;
     const leading = [_][]const u8{
         "-no-user-config",                                    "-machine", "q35,accel=kvm",                          "-cpu",      "", "-smp", "1", "-m", "512M", "-drive",
         "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd", "-drive",   "if=pflash,format=raw,file=OVMF_VARS.fd", "-blockdev",
@@ -45,7 +46,7 @@ fn execute(init: std.process.Init) !void {
     for (ending, args[16..]) |want, got| if (!std.mem.eql(u8, want, got)) return error.Arguments;
     var document = try image.core.contracts.Document.parse(a, args[15], .{});
     defer document.deinit();
-    const fixed = request.config.fixed_vhd != null;
+    const fixed = request.config.source.kind == .fixed_vhd;
     if (fixed) try checkVpcOpening(a, args[15]);
     const object = try image.core.contracts.exactFields(document.value(), if (fixed)
         &.{ "driver", "node-name", "read-only", "file" }
@@ -65,7 +66,7 @@ fn execute(init: std.process.Init) !void {
     const fd = try std.fmt.parseInt(linux.fd_t, filename["/proc/self/fd/".len..], 10);
     if (linux.fcntl(fd, linux.F.GETFL, 0) & 3 != 0) return error.Writable;
     const descriptor: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-    const original = try image.core.private_files.openAbsolute(io, request.config.source(), .artifact);
+    const original = try image.core.private_files.openAbsolute(io, request.config.source.path, .artifact);
     defer original.close(io);
     if (!image.core.private_files.sameSnapshot(try image.core.private_files.snapshot(descriptor), try image.core.private_files.snapshot(original))) return error.WrongInput;
     if (fixed) {
@@ -107,7 +108,7 @@ fn execute(init: std.process.Init) !void {
         try work.dir.writeFile(io, .{ .sub_path = "descendant.pid", .data = try std.fmt.allocPrint(a, "{d}", .{pid}), .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
     }
     if (mode == 9) {
-        const writable = try std.Io.Dir.openFileAbsolute(io, request.config.source(), .{ .mode = .read_write });
+        const writable = try std.Io.Dir.openFileAbsolute(io, request.config.source.path, .{ .mode = .read_write });
         defer writable.close(io);
         try writable.writePositionalAll(io, "changed", 1024);
     }

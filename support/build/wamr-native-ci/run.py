@@ -276,10 +276,12 @@ def compute(raw, identity, legacy):
 
 def config_for(runtime, root, index):
     legacy = bool(index % 2)
+    source_kind = "raw_disk" if index < 2 else "fixed_vhd"
     return {
-        "image": None,
-        "raw_disk": str(root / "package/unikraft.raw") if index < 2 else None,
-        "fixed_vhd": str(root / "package/unikraft.vhd") if index >= 2 else None,
+        "source": {
+            "kind": source_kind,
+            "path": str(root / "package" / ("unikraft.raw" if index < 2 else "unikraft.vhd")),
+        },
         "ovmf_code": str(runtime / "firmware/code.fd"),
         "ovmf_vars": str(runtime / "firmware/vars.fd"),
         "qemu": str(runtime / "bin/qemu-system-x86_64"),
@@ -292,11 +294,11 @@ def config_for(runtime, root, index):
 
 
 def boot_args(cli, config):
-    args = [str(cli)]
-    for key in ("raw_disk", "fixed_vhd", "qemu", "ovmf_code", "ovmf_vars",
-                "work_dir", "expect", "expect_main_return", "cpus"):
-        if config[key] is not None:
-            args += ["--" + key.replace("_", "-"), str(config[key])]
+    source = config["source"]
+    args = [str(cli), "--" + source["kind"].replace("_", "-"), source["path"]]
+    for key in ("qemu", "ovmf_code", "ovmf_vars", "work_dir", "expect",
+                "expect_main_return", "cpus"):
+        args += ["--" + key.replace("_", "-"), str(config[key])]
     args += ["--timeout", "60"]
     if config["disable_x2apic"]:
         args += ["--disable-x2apic"]
@@ -311,7 +313,7 @@ def check_boot(config, identity):
     request = document(work / "request.json")
     require(request["schema_version"] == 1 and request["config"] == config,
             "wrong boot request")
-    paths = [config["raw_disk"] or config["fixed_vhd"],
+    paths = [config["source"]["path"],
              config["ovmf_code"], config["ovmf_vars"], config["qemu"]]
     require(len(request["pins"]) == 4, "missing physical pins")
     for path, pin in zip(paths, request["pins"]):
@@ -420,7 +422,7 @@ def boot(runtime):
         run(root, mode, boot_args(paths["local_boot_tool"], config), 90, 64 * 1024)
         result = check_boot(config, identity)
         expected = package["image"]["raw" if index < 2 else "vhd"]["sha256"]
-        require(digest(Path(config["raw_disk"] or config["fixed_vhd"])) == expected,
+        require(digest(Path(config["source"]["path"])) == expected,
                 "booted package changed")
         save(root / "evidence" / (mode + "-compute.json"), result)
     output = run(root, "inspect", [paths["package_tool"], "inspect", efi, root / "package"],

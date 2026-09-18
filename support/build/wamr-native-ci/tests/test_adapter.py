@@ -104,6 +104,8 @@ class Contract(unittest.TestCase):
             args = ci.boot_args(Path("/native-local-boot"), config)
             self.assertEqual(config["expect_main_return"], 0)
             self.assertEqual(config["cpus"], 1)
+            self.assertEqual(config["source"]["kind"],
+                             "raw_disk" if index < 2 else "fixed_vhd")
             self.assertEqual("--disable-x2apic" in args, bool(index % 2))
             self.assertEqual("--raw-disk" in args, index < 2)
             self.assertEqual("--fixed-vhd" in args, index >= 2)
@@ -276,7 +278,7 @@ class Evidence(unittest.TestCase):
             self.put(self.root / name, b"explicitly synthetic, never native boot evidence")
         work = Path(config["work_dir"])
         work.mkdir(mode=0o700)
-        paths = [config["raw_disk"], config["ovmf_code"],
+        paths = [config["source"]["path"], config["ovmf_code"],
                  config["ovmf_vars"], config["qemu"]]
         ci.save(work / "request.json", {
             "schema_version": 1, "supervisor_pid": 123, "config": config,
@@ -328,7 +330,7 @@ class Evidence(unittest.TestCase):
         with self.assertRaises(ValueError):
             ci.check_boot(config, identity)
         self.put(work / "hyperv-efi-boot.log", original)
-        self.put(Path(config["raw_disk"]), b"different package")
+        self.put(Path(config["source"]["path"]), b"different package")
         with self.assertRaises(ValueError):
             ci.check_boot(config, identity)
 

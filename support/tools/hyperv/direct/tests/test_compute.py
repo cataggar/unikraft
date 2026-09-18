@@ -631,7 +631,7 @@ class Compute(unittest.TestCase):
                 raw = (b"Using legacy xAPIC MMIO\n" if i % 2 else b"") + serial(i, observation)
                 write(work / "hyperv-efi-boot.log", raw)
                 write(work / "launched", b"")
-                paths = [config["raw_disk"] or config["fixed_vhd"],
+                paths = [config["source"]["path"],
                          config["ovmf_code"], config["ovmf_vars"], config["qemu"]]
                 write(work / "request.json", dict(
                     schema_version=1, supervisor_pid=12345, config=config,

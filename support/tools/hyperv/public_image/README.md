@@ -80,9 +80,11 @@ validator requires a fingerprint of two Python controllers and two ARM
 templates. Those are not this producer. Revision 4 sets `controller_sha256`
 to the physically reverified native executable SHA256;
 `artifacts.miz.sha256` identifies that same executable containing embedded
-miz, rather than an unused external miz CLI. `artifacts.miz.revision` remains
-`2db68ca0c3ab12155012a823c3fb8d7aba1cb544`, with its exact package hash pinned
-in `build.zig.zon`.
+miz, rather than an unused external miz CLI. `artifacts.miz.revision` is the
+reviewed bounded-open commit
+`669a27982b376311f558e820b69e9a692735b0cd`, with package hash
+`miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx` pinned in
+`build.zig.zon`.
 
 Consequently the **unchanged legacy revision-3 importer intentionally
 rejects this export**. Parent integration must explicitly admit native
@@ -253,7 +255,11 @@ Use an arena per bounded command.
 ## Focused offline fixtures
 
 Use only explicitly owned scratch, Zig 0.16 and `-j2`. Dependency restore is
-from copied manifests, followed by `--system`; no SDK checkout is modified:
+from copied manifests, followed by `--system`; no SDK checkout is modified.
+The public-image graph obtains the pinned Miz package once through
+`dependency.module("miz")` and passes that same module identity to its embedded
+local-boot module, preserving Miz's native zstd wiring without a duplicate
+module graph:
 
 ```sh
 S="$PWD/.d/zig-migration-public-image"

@@ -1,6 +1,7 @@
 const std = @import("std");
 const boot = @import("local_boot");
 const core = boot.core;
+const linux = std.os.linux;
 const t = std.testing;
 const a = t.allocator;
 const io = t.io;
@@ -9,7 +10,7 @@ const fixture_log = @import("fixture.zig").log;
 const diagnostics = @import("synthetic_diagnostics");
 
 fn unitConfig() boot.config.Config {
-    return .{ .image = "/synthetic/image", .ovmf_code = "/synthetic/code", .ovmf_vars = "/synthetic/vars", .qemu = "/synthetic/qemu", .work_dir = "/synthetic/work", .expect = "Hello world!" };
+    return .{ .source = .{ .kind = .image, .path = "/synthetic/image" }, .ovmf_code = "/synthetic/code", .ovmf_vars = "/synthetic/vars", .qemu = "/synthetic/qemu", .work_dir = "/synthetic/work", .expect = "Hello world!" };
 }
 
 test "legacy application and each required milestone including terminal" {
@@ -158,6 +159,63 @@ test "CLI rejects invalid source counts paths markers repetitions and unknown co
     try t.expectEqualSlices([]const u8, &.{ "first", "second" }, parsed.required);
 }
 
+test "all four source tags are exclusive and duplicate qcow2 is explicit" {
+    const cases = [_]struct { option: []const u8, kind: boot.config.SourceKind }{
+        .{ .option = "--image", .kind = .image },
+        .{ .option = "--raw-disk", .kind = .raw_disk },
+        .{ .option = "--fixed-vhd", .kind = .fixed_vhd },
+        .{ .option = "--qcow2", .kind = .qcow2 },
+    };
+    for (cases) |case| {
+        const args = [_][]const u8{ case.option, "/synthetic/source" } ++ base_args[2..].*;
+        const parsed = try boot.config.parse(a, &args);
+        defer a.free(parsed.required);
+        defer a.free(parsed.forbidden);
+        try t.expectEqual(case.kind, parsed.source.kind);
+        try t.expectEqualStrings("/synthetic/source", parsed.source.path);
+        for (cases) |other| {
+            const conflicting = args ++ [_][]const u8{ other.option, "/synthetic/other" };
+            if (other.kind == case.kind) {
+                try t.expectError(error.DuplicateArgument, boot.config.parse(a, &conflicting));
+            } else {
+                try t.expectError(error.InvalidSource, boot.config.parse(a, &conflicting));
+            }
+        }
+    }
+    const duplicate_qcow2 = [_][]const u8{ "--qcow2", "/synthetic/one", "--qcow2", "/synthetic/two" } ++ base_args[2..].*;
+    try t.expectError(error.DuplicateArgument, boot.config.parse(a, &duplicate_qcow2));
+}
+
+test "canonical request serializes and validates the typed qcow2 source tag" {
+    var config = unitConfig();
+    config.source = .{ .kind = .qcow2, .path = "/synthetic/disk.qcow2" };
+    const request: boot.runner.Request = .{
+        .supervisor_pid = 123,
+        .config = config,
+        .pins = .{
+            .{ .size = 64 * 1024, .sha256 = [_]u8{1} ** 32 },
+            .{ .size = 4096, .sha256 = [_]u8{2} ** 32 },
+            .{ .size = 4096, .sha256 = [_]u8{3} ** 32 },
+            .{ .size = 4096, .sha256 = [_]u8{4} ** 32 },
+        },
+    };
+    try request.validate();
+    const encoded = try boot.config.encode(a, request);
+    defer a.free(encoded);
+    var document = try core.contracts.Document.parse(a, encoded, .{ .bytes = boot.config.max_record });
+    defer document.deinit();
+    try document.requireCanonical(a, encoded);
+    try t.expect(std.mem.indexOf(u8, encoded, "\"source\":{\"kind\":\"qcow2\",\"path\":\"/synthetic/disk.qcow2\"}") != null);
+    const parsed = try std.json.parseFromSlice(boot.runner.Request, a, encoded, .{ .ignore_unknown_fields = false });
+    defer parsed.deinit();
+    try parsed.value.validate();
+    try t.expectEqual(boot.config.SourceKind.qcow2, parsed.value.config.source.kind);
+    try t.expectEqualStrings(config.source.path, parsed.value.config.source.path);
+    const roundtrip = try boot.config.encode(a, parsed.value);
+    defer a.free(roundtrip);
+    try t.expectEqualStrings(encoded, roundtrip);
+}
+
 const Fixture = struct {
     arena: *std.heap.ArenaAllocator,
     root: core.private_files.Directory,
@@ -168,6 +226,10 @@ const Fixture = struct {
     config: boot.config.Config,
 
     fn init(mode: u8, raw_disk: bool) !Fixture {
+        return initSource(mode, if (raw_disk) .raw_disk else .image);
+    }
+
+    fn initSource(mode: u8, source_kind: boot.config.SourceKind) !Fixture {
         try core.process.initialize();
         const arena = try a.create(std.heap.ArenaAllocator);
         arena.* = .init(a);
@@ -192,7 +254,23 @@ const Fixture = struct {
         try dir.dir.writeFile(io, .{ .sub_path = "code,template.fd", .data = "synthetic OVMF code", .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) } });
         try dir.dir.writeFile(io, .{ .sub_path = "vars,template.fd", .data = &([_]u8{0xa5} ** 128), .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) } });
         try dir.dir.createDir(io, "work", .fromMode(0o700));
-        const source = try std.fs.path.join(alloc, &.{ path, "public,source.raw" });
+        const source_name = if (source_kind == .qcow2) "public,source.qcow2" else "public,source.raw";
+        if (source_kind == .qcow2) {
+            const raw = try dir.dir.openFile(io, "public,source.raw", .{ .mode = .read_only });
+            defer raw.close(io);
+            const output = try dir.dir.createFile(io, source_name, .{ .exclusive = true, .permissions = .fromMode(0o644) });
+            defer output.close(io);
+            const raw_source: boot.miz.qcow2.RawSourceContext = .{ .file = raw, .readable_len = bytes.len };
+            _ = try boot.miz.qcow2.writeStandaloneCompressed(
+                alloc,
+                io,
+                output,
+                64 * 1024,
+                raw_source.reader(),
+                .{},
+            );
+        }
+        const source = try std.fs.path.join(alloc, &.{ path, source_name });
         return .{
             .arena = arena,
             .root = root,
@@ -201,8 +279,7 @@ const Fixture = struct {
             .path = path,
             .cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, alloc),
             .config = .{
-                .image = if (raw_disk) null else source,
-                .raw_disk = if (raw_disk) source else null,
+                .source = .{ .kind = source_kind, .path = source },
                 .ovmf_code = try std.fs.path.join(alloc, &.{ path, "code,template.fd" }),
                 .ovmf_vars = try std.fs.path.join(alloc, &.{ path, "vars,template.fd" }),
                 .qemu = try std.Io.Dir.cwd().realPathFileAlloc(io, options.fixture, alloc),
@@ -276,15 +353,456 @@ const Fixture = struct {
 
     fn cliArgs(self: Fixture) ![]const []const u8 {
         return self.arena.allocator().dupe([]const u8, &.{
-            self.cli,              if (self.config.raw_disk != null) "--raw-disk" else "--image", self.config.source(),
-            "--ovmf-code",         self.config.ovmf_code,                                         "--ovmf-vars",
-            self.config.ovmf_vars, "--qemu",                                                      self.config.qemu,
-            "--work-dir",          self.config.work_dir,                                          "--expect",
-            self.config.expect,    "--cpus",                                                      try std.fmt.allocPrint(self.arena.allocator(), "{d}", .{self.config.cpus}),
+            self.cli,              self.config.source.optionName(), self.config.source.path,
+            "--ovmf-code",         self.config.ovmf_code,           "--ovmf-vars",
+            self.config.ovmf_vars, "--qemu",                        self.config.qemu,
+            "--work-dir",          self.config.work_dir,            "--expect",
+            self.config.expect,    "--cpus",                        try std.fmt.allocPrint(self.arena.allocator(), "{d}", .{self.config.cpus}),
             "--timeout",           "3",
         });
     }
 };
+
+fn writeQcowInt(f: Fixture, comptime T: type, offset: u64, value: T) !void {
+    const file = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_write });
+    defer file.close(io);
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, value, .big);
+    try file.writePositionalAll(io, &bytes, offset);
+}
+
+fn writeQcowBytes(f: Fixture, offset: u64, bytes: []const u8) !void {
+    const file = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_write });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, offset);
+}
+
+const Qcow2IoFault = struct {
+    const Kind = enum {
+        stat_system_resources,
+        header_canceled,
+        compressed_input_output,
+        observe,
+    };
+
+    table: std.Io.VTable = io.vtable.*,
+    retained: linux.fd_t,
+    kind: Kind,
+    failures: usize = 0,
+    duplicate_reads: usize = 0,
+    highest_duplicate_read_offset: u64 = 0,
+    threadlocal var active: ?*Qcow2IoFault = null;
+
+    fn install(self: *Qcow2IoFault) std.Io {
+        std.debug.assert(active == null);
+        active = self;
+        self.table.fileStat = stat;
+        self.table.fileReadPositional = readPositional;
+        return .{ .userdata = io.userdata, .vtable = &self.table };
+    }
+
+    fn deinit(_: *Qcow2IoFault) void {
+        active = null;
+    }
+
+    fn stat(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+        const self = active.?;
+        if (file.handle != self.retained and self.kind == .stat_system_resources and self.failures == 0) {
+            self.failures += 1;
+            return error.SystemResources;
+        }
+        return io.vtable.fileStat(userdata, file);
+    }
+
+    fn readPositional(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        data: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        const self = active.?;
+        if (file.handle != self.retained) {
+            self.duplicate_reads += 1;
+            self.highest_duplicate_read_offset = @max(self.highest_duplicate_read_offset, offset);
+            if (self.failures == 0) {
+                switch (self.kind) {
+                    .header_canceled => if (offset == 0) {
+                        self.failures += 1;
+                        return error.Canceled;
+                    },
+                    .compressed_input_output => if (offset == 64 * 1024) {
+                        self.failures += 1;
+                        return error.InputOutput;
+                    },
+                    .stat_system_resources, .observe => {},
+                }
+            }
+        }
+        return io.vtable.fileReadPositional(userdata, file, data, offset);
+    }
+};
+
+fn openFdCount() !usize {
+    const directory = try std.Io.Dir.openDirAbsolute(io, "/proc/self/fd", .{ .iterate = true });
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    var count: usize = 0;
+    while (try iterator.next(io) != null) count += 1;
+    return count;
+}
+
+test "qcow2 bounded profile exactly matches the reviewed native producer geometry" {
+    const limits = boot.files.qcow2_standalone_open_limits;
+    try t.expectEqual(@as(u64, 256 * 1024 * 1024), limits.max_file_bytes);
+    try t.expectEqual(@as(u64, 256 * 1024 * 1024), limits.max_virtual_size);
+    try t.expectEqual(@as(u32, 16), limits.min_cluster_bits);
+    try t.expectEqual(@as(u32, 16), limits.max_cluster_bits);
+    try t.expectEqual(@as(u64, 1), limits.max_l1_entries);
+    try t.expectEqual(@as(u64, 8), limits.max_l1_table_bytes);
+    try t.expectEqual(@as(u64, 1), limits.max_refcount_table_clusters);
+    try t.expectEqual(@as(u64, 64 * 1024), limits.max_refcount_table_bytes);
+    try t.expectEqual(@as(u64, 8192), limits.max_refcount_table_entries);
+    try t.expectEqual(@as(u64, 0), limits.max_snapshot_count);
+    try t.expectEqual(@as(u64, 0), limits.max_snapshot_table_bytes);
+    try t.expectEqual(@as(u64, 0), limits.max_snapshot_l1_entries);
+    try t.expectEqual(@as(u64, 0), limits.max_snapshot_l1_table_bytes);
+    try t.expectEqual(@as(u64, 65_664), limits.max_metadata_bytes);
+    try t.expectEqual(@as(u64, 8194), limits.max_metadata_work);
+}
+
+test "native zstd standalone qcow2 succeeds through the retained read-only descriptor" {
+    const f = try Fixture.initSource(0, .qcow2);
+    defer f.deinit();
+    errdefer f.retainDiagnostics();
+    const original = try boot.files.Set.open(io, f.config);
+    defer original.close(io);
+    const report = try f.run();
+    try t.expect(report.succeeded() and report.input_unchanged);
+    try original.verify(io, f.config);
+    const work = try f.work();
+    defer work.close(io);
+    try t.expectError(error.FileNotFound, work.dir.openDir(io, "esp", .{}));
+    const request_bytes = try work.read(io, a, "request.json", boot.config.max_record, null);
+    defer a.free(request_bytes);
+    try t.expect(std.mem.indexOf(u8, request_bytes, "\"source\":{\"kind\":\"qcow2\"") != null);
+}
+
+test "qcow2 operational errors propagate and validation duplicates always close" {
+    const f = try Fixture.initSource(0, .qcow2);
+    defer f.deinit();
+    const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+    defer retained.close(io);
+    const retained_snapshot = try core.private_files.snapshot(retained);
+    const descriptor_count = try openFdCount();
+
+    for ([_]Qcow2IoFault.Kind{
+        .stat_system_resources,
+        .header_canceled,
+        .compressed_input_output,
+    }) |kind| {
+        {
+            var fault: Qcow2IoFault = .{ .retained = retained.handle, .kind = kind };
+            const fault_io = fault.install();
+            defer fault.deinit();
+            switch (kind) {
+                .stat_system_resources => try t.expectError(
+                    error.SystemResources,
+                    boot.files.validateQcow2(fault_io, retained, retained_snapshot),
+                ),
+                .header_canceled => try t.expectError(
+                    error.Canceled,
+                    boot.files.validateQcow2(fault_io, retained, retained_snapshot),
+                ),
+                .compressed_input_output => try t.expectError(
+                    error.InputOutput,
+                    boot.files.validateQcow2(fault_io, retained, retained_snapshot),
+                ),
+                .observe => unreachable,
+            }
+            try t.expectEqual(@as(usize, 1), fault.failures);
+        }
+        try t.expectEqual(descriptor_count, try openFdCount());
+        try t.expectEqual(.SUCCESS, linux.errno(linux.fcntl(retained.handle, linux.F.GETFD, 0)));
+    }
+
+    try t.expectError(
+        error.OutOfMemory,
+        boot.files.validateQcow2Fault(io, retained, retained_snapshot, .pread_out_of_memory),
+    );
+    try t.expectEqual(descriptor_count, try openFdCount());
+    try boot.files.validateQcow2(io, retained, retained_snapshot);
+}
+
+test "qcow2 bounded admission rejects sparse 512-byte-cluster amplification before table reads" {
+    const f = try Fixture.initSource(0, .qcow2);
+    defer f.deinit();
+    const cluster_bytes: u64 = 512;
+    const refcount_table_clusters: u32 = @intCast(boot.config.max_input / cluster_bytes - 1);
+    const refcount_table_entries = @as(u64, refcount_table_clusters) * cluster_bytes / @sizeOf(u64);
+    try t.expectEqual(@as(u64, 33_554_368), refcount_table_entries);
+
+    {
+        const file = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setLength(io, boot.config.max_input);
+        var header = [_]u8{0} ** 112;
+        header[0..4].* = .{ 0x51, 0x46, 0x49, 0xfb };
+        std.mem.writeInt(u32, header[4..8], 3, .big);
+        std.mem.writeInt(u32, header[20..24], 9, .big);
+        std.mem.writeInt(u64, header[24..32], boot.config.max_virtual, .big);
+        std.mem.writeInt(u32, header[36..40], 1, .big);
+        std.mem.writeInt(u64, header[40..48], cluster_bytes, .big);
+        std.mem.writeInt(u64, header[48..56], cluster_bytes, .big);
+        std.mem.writeInt(u32, header[56..60], refcount_table_clusters, .big);
+        std.mem.writeInt(u64, header[72..80], boot.miz.qcow2.incompatible_compression, .big);
+        std.mem.writeInt(u32, header[96..100], boot.miz.qcow2.default_refcount_order, .big);
+        std.mem.writeInt(u32, header[100..104], 112, .big);
+        header[104] = 1;
+        try file.writePositionalAll(io, &header, 0);
+        var first_table_entry: [8]u8 = undefined;
+        std.mem.writeInt(u64, &first_table_entry, 3, .big);
+        try file.writePositionalAll(io, &first_table_entry, cluster_bytes);
+    }
+
+    const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+    defer retained.close(io);
+    const retained_snapshot = try core.private_files.snapshot(retained);
+    const descriptor_count = try openFdCount();
+    {
+        var probe: Qcow2IoFault = .{ .retained = retained.handle, .kind = .observe };
+        const probe_io = probe.install();
+        defer probe.deinit();
+        try t.expectError(error.InvalidQcow2, boot.files.validateQcow2(probe_io, retained, retained_snapshot));
+        try t.expectEqual(@as(usize, 1), probe.duplicate_reads);
+        try t.expectEqual(@as(u64, 0), probe.highest_duplicate_read_offset);
+    }
+    try t.expectEqual(descriptor_count, try openFdCount());
+    try t.expectEqual(.SUCCESS, linux.errno(linux.fcntl(retained.handle, linux.F.GETFD, 0)));
+}
+
+test "qcow2 bounded header limits reject virtual L1 refcount and snapshot excess before table reads" {
+    for (0..4) |case| {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        switch (case) {
+            0 => try writeQcowInt(f, u64, 24, boot.config.max_virtual + 512),
+            1 => try writeQcowInt(f, u32, 36, 2),
+            2 => try writeQcowInt(f, u32, 56, 2),
+            3 => try writeQcowInt(f, u32, 60, 1),
+            else => unreachable,
+        }
+        const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+        defer retained.close(io);
+        const retained_snapshot = try core.private_files.snapshot(retained);
+        {
+            var probe: Qcow2IoFault = .{ .retained = retained.handle, .kind = .observe };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(error.InvalidQcow2, boot.files.validateQcow2(probe_io, retained, retained_snapshot));
+            try t.expectEqual(@as(usize, 1), probe.duplicate_reads);
+            try t.expectEqual(@as(u64, 0), probe.highest_duplicate_read_offset);
+        }
+    }
+}
+
+test "qcow2 aggregate metadata work stops extension amplification before table reads" {
+    const f = try Fixture.initSource(0, .qcow2);
+    defer f.deinit();
+    try writeQcowInt(f, u32, 112, 0x1234_5678);
+    try writeQcowInt(f, u32, 116, 0);
+    try writeQcowBytes(f, 120, &([_]u8{0} ** 8));
+
+    const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+    defer retained.close(io);
+    const retained_snapshot = try core.private_files.snapshot(retained);
+    {
+        var probe: Qcow2IoFault = .{ .retained = retained.handle, .kind = .observe };
+        const probe_io = probe.install();
+        defer probe.deinit();
+        try t.expectError(error.InvalidQcow2, boot.files.validateQcow2(probe_io, retained, retained_snapshot));
+        try t.expectEqual(@as(usize, 2), probe.duplicate_reads);
+        try t.expectEqual(@as(u64, 112), probe.highest_duplicate_read_offset);
+    }
+}
+
+test "qcow2 structural corruption remains invalid input and closes its duplicate" {
+    const f = try Fixture.initSource(0, .qcow2);
+    defer f.deinit();
+    try writeQcowBytes(f, 0, "bad!");
+    const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+    defer retained.close(io);
+    const retained_snapshot = try core.private_files.snapshot(retained);
+    const descriptor_count = try openFdCount();
+    try t.expectError(error.InvalidQcow2, boot.files.validateQcow2(io, retained, retained_snapshot));
+    try t.expectEqual(descriptor_count, try openFdCount());
+    try t.expectEqual(.SUCCESS, linux.errno(linux.fcntl(retained.handle, linux.F.GETFD, 0)));
+}
+
+test "qcow2 physical and decoded capacity limits are independent" {
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        const file = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.setLength(io, boot.config.max_input + 1);
+        try t.expectError(error.InvalidArtifact, boot.files.Set.open(io, f.config));
+    }
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        try writeQcowInt(f, u64, 24, boot.config.max_virtual + 512);
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
+    }
+}
+
+test "qcow2 refuses backing and external data references before path resolution" {
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        const backing = "/definitely/not/opened";
+        try writeQcowInt(f, u64, 8, 112);
+        try writeQcowInt(f, u32, 16, backing.len);
+        try writeQcowBytes(f, 112, backing);
+        try t.expectError(error.BackingFileNotSupported, boot.files.Set.open(io, f.config));
+    }
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        const external = "/definitely/not/opened.data";
+        try writeQcowInt(f, u64, 72, boot.miz.qcow2.incompatible_compression | boot.miz.qcow2.incompatible_data_file);
+        try writeQcowInt(f, u32, 112, 0x4441_5441);
+        try writeQcowInt(f, u32, 116, external.len);
+        try writeQcowBytes(f, 120, external);
+        const end = std.mem.alignForward(u64, 120 + external.len, 8);
+        try writeQcowInt(f, u32, end, 0);
+        try t.expectError(error.ExternalDataFileNotSupported, boot.files.Set.open(io, f.config));
+    }
+}
+
+test "qcow2 narrow producer profile rejects features snapshots encryption clusters and compression mismatch" {
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        try writeQcowInt(f, u64, 72, boot.miz.qcow2.incompatible_compression | (@as(u64, 1) << 63));
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
+    }
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        try writeQcowInt(f, u32, 60, 1);
+        try writeQcowInt(f, u64, 64, 64 * 1024);
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
+    }
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        try writeQcowInt(f, u32, 32, 1);
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
+    }
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        try writeQcowInt(f, u32, 20, 15);
+        if (boot.files.Set.open(io, f.config)) |set| {
+            set.close(io);
+            return error.AcceptedClusterMismatch;
+        } else |_| {}
+    }
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        try writeQcowBytes(f, 104, &.{0});
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
+    }
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        try writeQcowInt(f, u64, 72, 0);
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
+    }
+}
+
+test "qcow2 rejects checked metadata overflow invalid physical extents and damaged zstd" {
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        try writeQcowInt(f, u64, 48, std.math.maxInt(u64) - 31);
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
+    }
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        const file = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_write });
+        defer file.close(io);
+        const info = try boot.miz.qcow2.openStandalone(io, file);
+        var l1_entry: [8]u8 = undefined;
+        _ = try file.readPositionalAll(io, &l1_entry, info.l1_table_offset);
+        const l2_offset = std.mem.readInt(u64, &l1_entry, .big) & boot.miz.qcow2.host_offset_mask;
+        var invalid: [8]u8 = undefined;
+        std.mem.writeInt(u64, &invalid, boot.miz.qcow2.compressed_mask | info.file_size, .big);
+        try file.writePositionalAll(io, &invalid, l2_offset);
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
+    }
+    {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        try writeQcowBytes(f, 64 * 1024, &.{ 0, 0, 0, 0 });
+        try t.expectError(error.InvalidQcow2, boot.files.Set.open(io, f.config));
+    }
+}
+
+test "qcow2 custody detects truncation growth path replacement and changed bytes" {
+    for ([_]u8{ 0, 1, 2, 3 }) |mode| {
+        const f = try Fixture.initSource(0, .qcow2);
+        defer f.deinit();
+        const originals = try boot.files.Set.open(io, f.config);
+        defer originals.close(io);
+        if (mode == 2) {
+            try t.expectEqual(.SUCCESS, linux.errno(linux.renameat(f.directory.dir.handle, "public,source.qcow2", f.directory.dir.handle, "old.qcow2")));
+            try f.directory.dir.writeFile(io, .{ .sub_path = "public,source.qcow2", .data = "replacement", .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) } });
+        } else {
+            const file = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_write });
+            defer file.close(io);
+            const size = (try file.stat(io)).size;
+            if (mode == 0) {
+                try file.setLength(io, size - 1);
+            } else if (mode == 1) {
+                try file.setLength(io, size + 1);
+            } else {
+                try file.writePositionalAll(io, &.{0xff}, 64 * 1024);
+            }
+        }
+        try t.expectError(error.ArtifactChanged, originals.verify(io, f.config));
+    }
+}
+
+test "qcow2 preserves serial cap timeout descendant cleanup and post-exec mutation evidence" {
+    for ([_]u8{ 3, 4, 5, 9 }) |mode| {
+        var f = try Fixture.initSource(mode, .qcow2);
+        defer f.deinit();
+        errdefer f.retainDiagnostics();
+        if (mode == 3 or mode == 4) f.config.timeout_ms = 1200;
+        const report = try f.run();
+        if (mode == 3) {
+            try t.expectEqual(.timeout, report.failures.primary.?.category);
+            try t.expect(report.cleanup_complete);
+        } else if (mode == 4) {
+            try t.expect(report.serial_limit_reached);
+            try t.expectEqual(@as(u64, boot.config.max_serial), report.serial_bytes);
+        } else if (mode == 5) {
+            try t.expect(report.succeeded());
+            const work = try f.work();
+            defer work.close(io);
+            const bytes = try work.read(io, a, "descendant.pid", 32, null);
+            defer a.free(bytes);
+            const pid = try std.fmt.parseInt(linux.pid_t, bytes, 10);
+            try t.expectEqual(linux.E.SRCH, linux.errno(linux.syscall2(.kill, @intCast(pid), 0)));
+        } else {
+            try t.expect(!report.succeeded() and !report.input_unchanged);
+            try t.expectEqual(.integrity, report.failures.primary.?.category);
+        }
+    }
+}
 
 fn fixedFooter() [512]u8 {
     var bytes = [_]u8{0} ** 512;
@@ -355,8 +873,13 @@ test "fixed VHD CLI exclusivity and genuine vpc wire without raw slicing" {
     const alloc = arena.allocator();
     const args = [_][]const u8{ "--fixed-vhd", "/synthetic/disk,one.vhd" } ++ base_args[2..].*;
     const config = try boot.config.parse(alloc, &args);
-    try t.expect(config.image == null and config.raw_disk == null and config.fixed_vhd != null);
+    try t.expectEqual(boot.config.SourceKind.fixed_vhd, config.source.kind);
+    try t.expectEqualStrings("/synthetic/disk,one.vhd", config.source.path);
     const command_args = try boot.child.arguments(alloc, config, 1024 * 1024 + 512, 64);
+    try t.expectEqualStrings(
+        "{\"driver\":\"vpc\",\"node-name\":\"local-boot-disk\",\"read-only\":true,\"file\":{\"driver\":\"file\",\"filename\":\"/proc/self/fd/64\",\"read-only\":true}}",
+        command_args[15],
+    );
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, command_args[15], .{});
     defer parsed.deinit();
     const block = parsed.value.object;
@@ -365,10 +888,37 @@ test "fixed VHD CLI exclusivity and genuine vpc wire without raw slicing" {
     try t.expect(!block.contains("force-size") and !block.contains("force_size_calc") and !block.contains("force-size-calc"));
     try t.expect(!block.contains("offset") and !block.contains("size"));
     try t.expectEqualStrings("/proc/self/fd/64", block.get("file").?.object.get("filename").?.string);
-    for ([_][]const u8{ "--image", "--raw-disk", "--fixed-vhd" }) |extra| {
+    for ([_][]const u8{ "--image", "--raw-disk", "--fixed-vhd", "--qcow2" }) |extra| {
         const duplicate = try std.mem.concat(alloc, []const u8, &.{ &args, &.{ extra, "/synthetic/other" } });
         if (boot.config.parse(alloc, duplicate)) |_| return error.AcceptedSourceConflict else |_| {}
     }
+}
+test "qcow2 wire uses exact separate read-only file and format nodes" {
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var config = unitConfig();
+    config.source = .{ .kind = .raw_disk, .path = "/synthetic/disk,one.raw" };
+    const raw_args = try boot.child.arguments(alloc, config, 384 * 1024, 64);
+    try t.expectEqualStrings(
+        "{\"driver\":\"raw\",\"node-name\":\"local-boot-disk\",\"offset\":0,\"size\":393216,\"read-only\":true,\"file\":{\"driver\":\"file\",\"filename\":\"/proc/self/fd/64\",\"read-only\":true}}",
+        raw_args[15],
+    );
+    config.source = .{ .kind = .qcow2, .path = "/synthetic/disk,one.qcow2" };
+    const args = try boot.child.arguments(alloc, config, 384 * 1024, 64);
+    try t.expectEqual(@as(usize, 31), args.len);
+    try t.expectEqualStrings("-blockdev", args[14]);
+    try t.expectEqualStrings(
+        "{\"driver\":\"file\",\"node-name\":\"local-boot-qcow2-file\",\"filename\":\"/proc/self/fd/64\",\"read-only\":true}",
+        args[15],
+    );
+    try t.expectEqualStrings("-blockdev", args[16]);
+    try t.expectEqualStrings(
+        "{\"driver\":\"qcow2\",\"node-name\":\"local-boot-disk\",\"file\":\"local-boot-qcow2-file\",\"read-only\":true}",
+        args[17],
+    );
+    try t.expectEqualStrings("-device", args[18]);
+    try t.expectEqualStrings("virtio-blk-pci,drive=local-boot-disk", args[19]);
 }
 test "native QEMU fixture validates every argument CPU default and explicit SMP readonly raw source" {
     for ([_]u8{ 1, 2, 8 }) |cpus| {
@@ -658,7 +1208,7 @@ test "private workspace lock and artifact policy reject unsafe files before exec
     try work.dir.setPermissions(io, .fromMode(0o700));
     try f.directory.dir.symLink(io, "public,source.raw", "linked.raw", .{});
     var config = f.config;
-    config.raw_disk = try std.fs.path.join(f.arena.allocator(), &.{ f.path, "linked.raw" });
+    config.source = .{ .kind = .raw_disk, .path = try std.fs.path.join(f.arena.allocator(), &.{ f.path, "linked.raw" }) };
     try t.expectError(error.UnsafeFile, boot.runner.run(f.arena.allocator(), io, config, .{ .self_executable = f.cli }));
     try f.directory.dir.writeFile(io, .{ .sub_path = "script", .data = "#!/bin/sh\nexit 0\n", .flags = .{ .exclusive = true, .permissions = .fromMode(0o700) } });
     config = f.config;
@@ -666,11 +1216,11 @@ test "private workspace lock and artifact policy reject unsafe files before exec
     try t.expectError(error.InvalidExecutable, boot.runner.run(f.arena.allocator(), io, config, .{ .self_executable = f.cli }));
     try t.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.mknodat(f.directory.dir.handle, "fifo", std.os.linux.S.IFIFO | 0o600, 0)));
     config = f.config;
-    config.raw_disk = try std.fs.path.join(f.arena.allocator(), &.{ f.path, "fifo" });
+    config.source = .{ .kind = .raw_disk, .path = try std.fs.path.join(f.arena.allocator(), &.{ f.path, "fifo" }) };
     try t.expectError(error.UnsafeFile, boot.runner.run(f.arena.allocator(), io, config, .{ .self_executable = f.cli }));
-    config.raw_disk = f.path;
+    config.source.path = f.path;
     try t.expectError(error.UnsafeFile, boot.runner.run(f.arena.allocator(), io, config, .{ .self_executable = f.cli }));
-    config.raw_disk = try std.fs.path.join(f.arena.allocator(), &.{ f.config.work_dir, "source" });
+    config.source.path = try std.fs.path.join(f.arena.allocator(), &.{ f.config.work_dir, "source" });
     try t.expectError(error.InputInsideWorkspace, boot.runner.run(f.arena.allocator(), io, config, .{ .self_executable = f.cli }));
     try t.expectError(error.FileNotFound, work.openFile(io, "launched"));
 }
@@ -792,7 +1342,7 @@ test "actual CLI rejects invalid CPU conflicting sources and legacy SMP before w
     defer f.deinit();
     errdefer f.retainDiagnostics();
     const argv = try f.cliArgs();
-    const args = try std.mem.concat(f.arena.allocator(), []const u8, &.{ argv, &.{ "--image", f.config.source() } });
+    const args = try std.mem.concat(f.arena.allocator(), []const u8, &.{ argv, &.{ "--image", f.config.source.path } });
     var env: std.process.Environ.Map = .init(a);
     defer env.deinit();
     const result = try std.process.run(a, io, .{ .argv = args, .cwd = .{ .dir = f.directory.dir }, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) });

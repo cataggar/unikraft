@@ -395,16 +395,16 @@ fn localReport(a: std.mem.Allocator, io: std.Io, boot: Boot, image: Artifact, re
     const request = try c.Document.parse(a, request_bytes, .{ .bytes = 65536 });
     defer request.deinit();
     const config = try field(request.value(), "config");
+    const source = try field(config, "source");
     const mode = @intFromEnum(boot.mode);
     if (try c.integer(u8, try field(request.value(), "schema_version")) != 1 or
         !eq(try string(config, "expect"), marker) or
         try c.integer(i32, try field(config, "expect_main_return")) != 0 or
         try c.integer(u8, try field(config, "cpus")) != 1 or
         try c.integer(u32, try field(config, "timeout_ms")) != 60000 or
-        try field(config, "image") != .null or
-        try field(config, if (mode < 2) "fixed_vhd" else "raw_disk") != .null)
+        !eq(try string(source, "kind"), if (mode < 2) "raw_disk" else "fixed_vhd"))
         return error.WrongLocalReport;
-    _ = try string(config, if (mode < 2) "raw_disk" else "fixed_vhd");
+    _ = try string(source, "path");
     const legacy = try field(config, "disable_x2apic");
     if (legacy != .bool or legacy.bool != (mode % 2 == 1)) return error.WrongLocalMode;
     const pins = try field(request.value(), "pins");

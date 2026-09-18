@@ -3,5 +3,11 @@
     .version = "0.1.0",
     .fingerprint = 0xaec47cd93c6c45e2,
     .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .miz_source = .{
+            .url = "git+https://github.com/cataggar/miz.git#669a27982b376311f558e820b69e9a692735b0cd",
+            .hash = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx",
+        },
+    },
     .paths = .{""},
 }
