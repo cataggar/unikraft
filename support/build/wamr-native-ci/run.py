@@ -976,6 +976,10 @@ def input_directory_custody_reason(kind, name):
             return "consumer runtime directory custody changed"
         if name == "wamr-source-archive":
             return "consumer archive directory custody changed"
+        if name in {
+                "efi", "local_boot_tool", "ovmf_code", "ovmf_vars",
+                "package_tool", "qemu"}:
+            return f"consumer {name} directory custody changed"
     elif kind == "tree" and name in {
             "bison", "llvm", "python-stdlib", "zig"}:
         return f"consumer {name} directory custody changed"
