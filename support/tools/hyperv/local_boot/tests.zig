@@ -1241,7 +1241,7 @@ test "v2 pins reject metadata-only and link-count changes while preserving publi
         const before = original.items[0].pin;
         const source = try f.directory.dir.openFile(io, "public,source.raw", .{ .mode = .read_write });
         defer source.close(io);
-        try source.setPermissions(io, .fromMode(0o600));
+        try source.setPermissions(io, .fromMode((before.mode & 0o777) ^ 0o100));
         const changed = try boot.files.Set.open(io, f.config);
         defer changed.close(io);
         try t.expectEqual(before.sha256, changed.items[0].pin.sha256);
