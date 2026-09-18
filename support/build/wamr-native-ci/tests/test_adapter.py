@@ -362,6 +362,21 @@ class Evidence(unittest.TestCase):
                     ci.Refusal, "physical input tree hash limit exceeded"):
             ci.physical_tree_record(links)
 
+        directory_links = self.root / "directory-symlink-tree"
+        data = directory_links / "data"
+        data.mkdir(parents=True, mode=0o700)
+        self.put(data / "input", b"bounded")
+        (directory_links / "alias").symlink_to("data")
+        record, unused_directories = ci.physical_tree_record(directory_links)
+        del unused_directories
+        self.assertEqual(record["symlinks"], 1)
+        outside = self.root / "outside-directory"
+        outside.mkdir(mode=0o700)
+        (directory_links / "escape").symlink_to(outside)
+        with self.assertRaisesRegex(
+                ci.Refusal, "unsafe physical input tree symlink"):
+            ci.physical_tree_record(directory_links)
+
     def test_retained_executable_descriptor_survives_path_swap(self):
         directory = self.root / "retained-executable"
         directory.mkdir(mode=0o700)

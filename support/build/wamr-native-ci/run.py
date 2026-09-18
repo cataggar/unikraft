@@ -639,46 +639,63 @@ def physical_tree_record(root, content=True, expected_content_sha256=None):
                     try:
                         target = os.readlink(name, dir_fd=directory_handle)
                         resolved = (root / relative).resolve(strict=True)
+                        target_is_directory = stat.S_ISDIR(
+                            resolved.lstat().st_mode)
                     except (OSError, RuntimeError) as error:
                         raise Refusal("unsafe physical input tree symlink") from error
                     with retained_absolute(
-                            resolved, reason="unsafe physical input tree symlink") as (
+                            resolved, directory=target_is_directory,
+                            reason="unsafe physical input tree symlink") as (
                                 target_handle, target_directories, target_parent):
                         target_info = os.fstat(target_handle)
-                        require(
-                            stat.S_ISREG(target_info.st_mode)
-                            and target_info.st_uid in (0, os.getuid())
-                            and target_info.st_nlink > 0
-                            and not target_info.st_mode & 0o022
-                            and target_info.st_size <= 512 * MIB
-                            and (target_info.st_uid == 0
-                                 or target_info.st_nlink == 1),
-                            "unsafe physical input tree symlink",
-                        )
-                        target_identity = snapshot(target_info)
-                        target_sha256 = content_identities.get(target_identity)
-                        if content and target_sha256 is None:
+                        if target_is_directory:
                             require(
-                                hash_work + target_info.st_size
-                                <= INPUT_TREE_MAX_BYTES,
-                                "physical input tree hash limit exceeded",
+                                stat.S_ISDIR(target_info.st_mode)
+                                and target_info.st_uid in (0, os.getuid())
+                                and not target_info.st_mode & 0o022
+                                and (resolved == root or root in resolved.parents),
+                                "unsafe physical input tree symlink",
                             )
-                            hash_work += target_info.st_size
-                            target_sha256 = digest_descriptor(
-                                target_handle, target_info,
-                                INPUT_TREE_MAX_BYTES,
-                                "physical input tree changed",
-                                allow_empty=True,
+                        else:
+                            require(
+                                stat.S_ISREG(target_info.st_mode)
+                                and target_info.st_uid in (0, os.getuid())
+                                and target_info.st_nlink > 0
+                                and not target_info.st_mode & 0o022
+                                and target_info.st_size <= 512 * MIB
+                                and (target_info.st_uid == 0
+                                     or target_info.st_nlink == 1),
+                                "unsafe physical input tree symlink",
                             )
-                            content_identities[target_identity] = target_sha256
-                        elif not content:
-                            target_sha256 = "0" * 64
+                        target_identity = snapshot(target_info)
+                        target_sha256 = (
+                            "directory" if target_is_directory
+                            else content_identities.get(target_identity)
+                        )
+                        if not target_is_directory:
+                            if content and target_sha256 is None:
+                                require(
+                                    hash_work + target_info.st_size
+                                    <= INPUT_TREE_MAX_BYTES,
+                                    "physical input tree hash limit exceeded",
+                                )
+                                hash_work += target_info.st_size
+                                target_sha256 = digest_descriptor(
+                                    target_handle, target_info,
+                                    INPUT_TREE_MAX_BYTES,
+                                    "physical input tree changed",
+                                    allow_empty=True,
+                                )
+                                content_identities[target_identity] = target_sha256
+                            elif not content:
+                                target_sha256 = "0" * 64
                         require(target_sha256 is not None,
                                 "invalid physical input tree identity")
                         if target_parent is not None:
                             try:
                                 named_target = os.open(
-                                    resolved.name, open_flags(),
+                                    resolved.name,
+                                    open_flags(directory=target_is_directory),
                                     dir_fd=target_parent)
                             except OSError as error:
                                 raise Refusal(
@@ -707,7 +724,9 @@ def physical_tree_record(root, content=True, expected_content_sha256=None):
                             <= INPUT_TREE_MAX_ENTRIES,
                             "physical input tree limit exceeded")
                     bind(content_hash, [
-                        "symlink", relative, target, target_sha256,
+                        "symlink-directory" if target_is_directory
+                        else "symlink",
+                        relative, target, target_sha256,
                     ])
                     bind(physical_hash, [
                         "symlink", relative, target, snapshot(info),
