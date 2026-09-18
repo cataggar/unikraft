@@ -1603,9 +1603,17 @@ source/generated/
         root = runtime / "compute"
         root.mkdir(mode=0o700)
         (root / "evidence").mkdir(mode=0o700)
+        (root / "private").mkdir(mode=0o700)
         work = root / "boot-raw-x2apic"
         work.mkdir(mode=0o700)
         self.put(work / "hyperv-efi-boot.log", b"PRIVATE_SYNTHETIC_STATE")
+        self.put(root / "private/fixtures.log", (
+            b"test_safe_name (test_adapter.Evidence.test_safe_name) ... ERROR\n"
+            b"PRIVATE_SYNTHETIC_STATE\n"
+        ))
+        ci.save(root / "evidence/command-fixtures.json", {
+            "exit_code": 1,
+        })
         ci.save(work / "report.json", {
             "passed": False, "cleanup_complete": True, "input_unchanged": True,
             "serial_valid": False, "serial_limit_reached": False,
@@ -1616,6 +1624,8 @@ source/generated/
         raw = (root / "evidence/diagnostics.json").read_bytes()
         self.assertNotIn(b"PRIVATE_SYNTHETIC_STATE", raw)
         self.assertNotIn(str(self.root).encode(), raw)
+        self.assertIn(
+            b"test_adapter.Evidence.test_safe_name", raw)
         self.assertFalse((root / "evidence/result.json").exists())
 
     def test_command_markers_are_closed_diagnostics_not_external_text(self):

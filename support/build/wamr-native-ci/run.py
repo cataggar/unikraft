@@ -95,6 +95,11 @@ COMMAND_ERROR_MARKERS = (
 )
 COMMAND_ERROR_PATTERN = re.compile(
     rb"\b(?:" + b"|".join(name.encode("ascii") for name in COMMAND_ERROR_MARKERS) + rb")\b")
+UNITTEST_FAILURE_PATTERN = re.compile(
+    rb"^(test_[A-Za-z0-9_]+) \(([A-Za-z0-9_.]+)\).* \.\.\. "
+    rb"(?:FAIL|ERROR)$",
+    re.MULTILINE,
+)
 
 
 class Refusal(ValueError):
@@ -1676,6 +1681,19 @@ def command_error_markers(raw):
     return [name for name in COMMAND_ERROR_MARKERS if name.encode("ascii") in observed]
 
 
+def unittest_failure_markers(raw):
+    markers = []
+    for match in UNITTEST_FAILURE_PATTERN.finditer(raw):
+        marker = (
+            match.group(2).decode("ascii") + "." + match.group(1).decode("ascii")
+        )
+        if marker not in markers:
+            markers.append(marker)
+        if len(markers) == 8:
+            break
+    return markers
+
+
 @contextlib.contextmanager
 def retained_executables(paths, records):
     opened = {}
@@ -3022,9 +3040,22 @@ def diagnostics(runtime):
         except (OSError, ValueError, KeyError, TypeError):
             pass
         observations[mode] = entry
+    build_failures = {}
+    try:
+        command = document(root / "evidence/command-fixtures.json")
+        require(type(command["exit_code"]) is int, "invalid diagnostic")
+        if command["exit_code"] != 0:
+            build_failures["fixtures"] = {
+                "exit_code": command["exit_code"],
+                "tests": unittest_failure_markers(
+                    read(root / "private/fixtures.log", 64 * 1024)),
+            }
+    except (OSError, ValueError, KeyError, TypeError, Refusal):
+        pass
     save(root / "evidence/diagnostics.json", {
         "scope": "diagnostics_not_acceptance",
         "redaction": "no_raw_serial_paths_environment_or_account_state",
+        "build_failures": build_failures,
         "boots": observations,
     })
 
