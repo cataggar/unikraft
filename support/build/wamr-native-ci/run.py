@@ -966,6 +966,20 @@ def record_digest(value):
     return hashlib.sha256(raw).hexdigest()
 
 
+def input_directory_custody_reason(kind, name):
+    if kind == "file":
+        if name.startswith("tool:"):
+            return "consumer tool directory custody changed"
+        if name.startswith("runtime:"):
+            return "consumer runtime directory custody changed"
+        if name == "wamr-source-archive":
+            return "consumer archive directory custody changed"
+    elif kind == "tree" and name in {
+            "bison", "llvm", "python-stdlib", "zig"}:
+        return f"consumer {name} directory custody changed"
+    return "consumer input directory custody changed"
+
+
 def record_input_paths(file_paths, tree_paths, content=True, expected=None):
     files = {}
     trees = {}
@@ -994,6 +1008,11 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None):
             path, content=content,
             expected_sha256=None if prior is None else prior["sha256"])
         files[name] = record
+        if expected is not None:
+            require(all(
+                expected["directories"].get(path) == metadata
+                for path, metadata in components.items()
+            ), input_directory_custody_reason("file", name))
         merge_directory_records(directories, components)
     for name, path in sorted(tree_paths.items()):
         prior = None if expected is None else expected["trees"][name]
@@ -1002,6 +1021,11 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None):
             expected_content_sha256=(
                 None if prior is None else prior["content_sha256"]))
         trees[name] = record
+        if expected is not None:
+            require(all(
+                expected["directories"].get(path) == metadata
+                for path, metadata in components.items()
+            ), input_directory_custody_reason("tree", name))
         merge_directory_records(directories, components)
     result = {
         "schema": "uk.wamr.consumer-input-custody",
