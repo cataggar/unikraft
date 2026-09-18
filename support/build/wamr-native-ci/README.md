@@ -90,7 +90,10 @@ type/mode, uid/gid, link count, size, nanosecond mtime/ctime and content
 identity, with deduplicated absolute directory-component identities. The
 pinned tree scanner refuses on the first excess entry before sorting and
 separately bounds all unique regular-file bytes hashed through symlinks.
-pinned WAMR checkout is consumed only while creating a fixed-revision Git
+Dangling system-tree links are accepted only when their retained deepest
+existing target ancestor is root-owned and cannot be modified by the build
+principal; the missing suffix and ancestor identity are part of the record.
+The pinned WAMR checkout is consumed only while creating a fixed-revision Git
 archive through retained repository and Git descriptors; all later WAMR build
 steps read the create-only archived object. Top-level build tools execute
 through retained no-follow descriptors, while indirect tool/data and Miz-tree

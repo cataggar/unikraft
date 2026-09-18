@@ -519,6 +519,52 @@ def bind_tree_file(content_hash, physical_hash, relative, handle, info,
     return sha256
 
 
+def missing_tree_symlink_target(path, reason):
+    path = Path(path)
+    require(
+        path.is_absolute()
+        and len(os.fsencode(str(path))) <= SOURCE_IGNORED_MAX_PATH
+        and len(path.parts) - 1 <= SOURCE_IGNORED_MAX_DEPTH,
+        reason,
+    )
+    missing = []
+    probe = path
+    while probe != Path("/"):
+        try:
+            with retained_absolute(
+                    probe, directory=True, reason=reason) as (
+                        handle, directories, unused_parent):
+                del unused_parent
+                info = os.fstat(handle)
+                require(
+                    missing and os.getuid() != 0 and info.st_uid == 0
+                    and not info.st_mode & 0o022,
+                    reason,
+                )
+                try:
+                    os.stat(
+                        missing[0], dir_fd=handle, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    raise Refusal(reason) from error
+                else:
+                    raise Refusal(reason)
+                identity = snapshot(info)
+                component_records = stable_directories(directories, reason)
+                require(snapshot(os.fstat(handle)) == identity, reason)
+                return {
+                    "ancestor": str(probe),
+                    "missing": missing,
+                    "metadata": list(identity),
+                    "directories": component_records,
+                }
+        except Refusal:
+            missing.insert(0, probe.name)
+            probe = probe.parent
+    raise Refusal(reason)
+
+
 def physical_tree_record(root, content=True, expected_content_sha256=None):
     root = Path(root)
     content_hash = hashlib.sha256(b"uk.wamr.consumer-input-tree-content-v2\0")
@@ -640,9 +686,46 @@ def physical_tree_record(root, content=True, expected_content_sha256=None):
                             symlink_reason)
                     try:
                         target = os.readlink(name, dir_fd=directory_handle)
+                    except OSError as error:
+                        raise Refusal(symlink_reason) from error
+                    try:
                         resolved = (root / relative).resolve(strict=True)
+                        require(
+                            len(os.fsencode(str(resolved)))
+                            <= SOURCE_IGNORED_MAX_PATH
+                            and len(resolved.parts) - 1
+                            <= SOURCE_IGNORED_MAX_DEPTH,
+                            symlink_reason,
+                        )
                         target_is_directory = stat.S_ISDIR(
                             resolved.lstat().st_mode)
+                    except FileNotFoundError:
+                        try:
+                            unresolved = (
+                                (root / relative).parent / target
+                            ).resolve(strict=False)
+                            missing_target = missing_tree_symlink_target(
+                                unresolved, symlink_reason)
+                        except (OSError, RuntimeError) as error:
+                            raise Refusal(symlink_reason) from error
+                        symlinks += 1
+                        total += len(os.fsencode(target))
+                        require(
+                            total <= INPUT_TREE_MAX_BYTES
+                            and files + directories_count + symlinks
+                            <= INPUT_TREE_MAX_ENTRIES,
+                            "physical input tree limit exceeded",
+                        )
+                        bind(content_hash, [
+                            "symlink-missing", relative, target,
+                            missing_target["ancestor"],
+                            missing_target["missing"],
+                        ])
+                        bind(physical_hash, [
+                            "symlink-missing", relative, target, snapshot(info),
+                            missing_target,
+                        ])
+                        continue
                     except (OSError, RuntimeError) as error:
                         raise Refusal(symlink_reason) from error
                     with retained_absolute(

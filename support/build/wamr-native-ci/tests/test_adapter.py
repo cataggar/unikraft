@@ -377,6 +377,22 @@ class Evidence(unittest.TestCase):
                 ci.Refusal, "unsafe physical input tree symlink"):
             ci.physical_tree_record(directory_links)
 
+        dangling = self.root / "dangling-symlink-tree"
+        dangling.mkdir(mode=0o700)
+        missing = (
+            Path("/usr/share")
+            / f"wamr-ci-missing-tree-target-{os.getpid()}")
+        self.assertFalse(missing.exists())
+        (dangling / "stable-missing").symlink_to(missing)
+        record, unused_directories = ci.physical_tree_record(dangling)
+        del unused_directories
+        self.assertEqual(record["symlinks"], 1)
+        (dangling / "stable-missing").unlink()
+        (dangling / "mutable-missing").symlink_to(self.root / "missing")
+        with self.assertRaisesRegex(
+                ci.Refusal, "unsafe physical input tree symlink"):
+            ci.physical_tree_record(dangling)
+
     def test_retained_executable_descriptor_survives_path_swap(self):
         directory = self.root / "retained-executable"
         directory.mkdir(mode=0o700)
