@@ -140,7 +140,13 @@ else
     cat -- "$1" >&9
     chmod 444 /usr/lib/x86_64-linux-gnu/libfdt.so.1
     sync -f /usr/lib/x86_64-linux-gnu/libfdt.so.1
-  ' _ "${source}" "${ownership}"
+    chown --no-dereference "$3:$4" "$2"
+  ' _ "${source}" "${ownership}" "${runner_uid}" "${runner_gid}"
+fi
+if [[ -f "${ownership}" ]]; then
+  test ! -L "${ownership}"
+  test "$(stat -c '%u:%g:%a:%h' "${ownership}")" = \
+    "${runner_uid}:${runner_gid}:600:1"
 fi
 test "$(sha256sum "${target}" | cut -d ' ' -f 1)" = "${expected}"
 stat -c '%d:%i:%u:%g:%a:%h:%s' "${target}" > "${root}/evidence/managed-libfdt.txt"

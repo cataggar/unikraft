@@ -2674,6 +2674,16 @@ class HypervWorkflowTest(unittest.TestCase):
             'rm -rf -- "${root}/apt-lists" "${root}/apt-cache"',
             bison_acquire,
         )
+        runtime = (
+            SUPPORT.parent
+            / ".github/scripts/hyperv-qemu-candidate-runtime.sh"
+        ).read_text()
+        for required in (
+            'chown --no-dereference "$3:$4" "$2"',
+            '\' _ "${source}" "${ownership}" "${runner_uid}" "${runner_gid}"',
+            '"${runner_uid}:${runner_gid}:600:1"',
+        ):
+            self.assertIn(required, runtime)
 
     def test_wamr_public_bundle_uses_external_archive_digest(self):
         repository = SUPPORT.parent
