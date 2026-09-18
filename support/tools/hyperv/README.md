@@ -453,11 +453,19 @@ contract for controllers that need ordinary Linux detached-child cleanup.
 It does not change `run` or `runPrivate`, and there is no user-facing command
 wrapper. `CommandRequest` borrows an `Executable` opened with
 `Executable.open`; the retained descriptor and full stat identity select the
-exact executable used by `execveat`. The request also supplies explicit argv,
-environment and cwd, one absolute primary `Deadline`, one independent absolute
-cleanup `Deadline`, optional cancellation, and fixed limits. The executable
-identity is checked before launch and after cleanup to detect persistent or
-accidental mutation.
+exact executable used by `execveat`. `Executable.open` accepts only regular,
+non-set-ID, executable native 64-bit little-endian ELF `ET_EXEC`/`ET_DYN`
+images with bounded program headers and an executable entry point. It rejects
+shebang scripts, executable text, truncated/malformed ELF, and foreign
+architectures with `error.UnsupportedExecutableFormat` before spawn. A
+validated ELF `PT_INTERP` remains supported, including dynamically linked WAMR
+tools; no script pathname is reopened and no ambient shell/interpreter is
+selected. The caller owns the retained close-on-exec descriptor until
+`Executable.close`. The request also supplies explicit argv, environment and
+cwd, one absolute primary `Deadline`, one independent absolute cleanup
+`Deadline`, optional cancellation, and fixed limits. The executable identity
+is checked around format validation, before launch, and after cleanup to detect
+persistent or accidental mutation.
 
 The command mode requires an authority-free Linux 5.11-or-newer host with
 procfs, child-subreaper support, pidfds and `pidfd_send_signal`. It requires a
@@ -468,10 +476,15 @@ the leader and discovered ancestors unreaped until all live descendants have
 been signalled. This includes ordinary children that call `setsid()` and
 ordinary double-fork descendants adopted by the subreaper. Every exact pidfd
 receives TERM and, if it remains live after the one fixed grace interval, KILL.
-Only after a final stable discovery pass reports no live owned process does
-the supervisor reap until `ECHILD`. Escaped writers cannot extend the primary
-deadline: pipes are nonblocking, bounded, finally drained after proven cleanup,
-and always closed.
+A candidate whose numeric parent matches a tracked entry is not opened or
+signalled until that parent's retained pidfd is still live and `/proc` still
+reports the recorded PID/start identity; the proof is repeated after the
+candidate itself is pinned and verified. An exited/reaped parent therefore
+causes a rescan for subreaper adoption instead of admitting a recycled PID,
+while contradictory live identity evidence poisons cleanup. Only after a final
+stable discovery pass reports no live owned process does the supervisor reap
+until `ECHILD`. Escaped writers cannot extend the primary deadline: pipes are
+nonblocking, bounded, finally drained after proven cleanup, and always closed.
 
 Primary and cleanup time do not accumulate or restart per output event,
 descendant, signal or reap. Defaults are 64 KiB per output stream, 64
@@ -480,7 +493,9 @@ cleanup events, 262,144 proc entries per scan, 512 reap events, and one 100 ms
 TERM grace. Hard maxima are 4 MiB per stream, 256 requested descendants, ten
 million events, one million proc entries per scan, 1,024 reap events, 128 argv
 items/256 KiB argv, 256 environment entries/256 KiB environment, and a 4,095
-byte executable path.
+byte executable path. `reap_events` must be at least `descendants + 3`: one
+event each for the leader, every requested descendant, the retained first
+excess sentinel, and the terminal `ECHILD` observation.
 
 `CommandResult` owns zeroized bounded stdout/stderr storage and reports the
 leader's primary outcome, termination, deadline/cancellation observations,

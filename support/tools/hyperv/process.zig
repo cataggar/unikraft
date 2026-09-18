@@ -90,8 +90,10 @@ pub const ExecutableIdentity = struct {
     }
 };
 
-/// Borrowed by CommandRequest. The retained descriptor pins the executable
-/// selected by the caller; runCommand validates this identity before exec.
+/// Borrowed by CommandRequest. open accepts only a native 64-bit little-endian
+/// ELF executable with bounded load headers; scripts and executable text return
+/// UnsupportedExecutableFormat. The caller owns the retained descriptor until
+/// close, and runCommand validates its recorded identity before exec.
 pub const Executable = struct {
     file: std.Io.File,
     identity: ExecutableIdentity,
@@ -113,11 +115,126 @@ pub const Executable = struct {
         const stat = try files.snapshot(file);
         if (stat.mode & linux.S.IFMT != linux.S.IFREG or stat.mode & 0o111 == 0 or stat.mode & 0o6000 != 0)
             return error.InvalidExecutable;
-        return .{ .file = file, .identity = .fromStat(stat) };
+        _ = try validateElfExecutable(file.handle, stat.size);
+        const verified = try files.snapshot(file);
+        if (!std.meta.eql(stat, verified)) return error.ExecutableIdentityChanged;
+        return .{ .file = file, .identity = .fromStat(verified) };
     }
 
     pub fn close(self: Executable, io: std.Io) void {
         self.file.close(io);
+    }
+};
+
+fn validateElfExecutable(descriptor: linux.fd_t, size: u64) !bool {
+    const header_size = 64;
+    if (size < header_size or size > std.math.maxInt(i64)) return error.UnsupportedExecutableFormat;
+    var header: [header_size]u8 = undefined;
+    try preadExecutable(descriptor, &header, 0);
+    if (!std.mem.eql(u8, header[0..4], "\x7fELF") or
+        header[4] != 2 or header[5] != 1 or header[6] != 1)
+        return error.UnsupportedExecutableFormat;
+
+    const executable_type = readLittle16(header[16..18]);
+    if (executable_type != 2 and executable_type != 3) return error.UnsupportedExecutableFormat;
+    const expected_machine: u16 = switch (builtin.cpu.arch) {
+        .x86_64 => 62,
+        .aarch64 => 183,
+        else => return error.UnsupportedExecutableFormat,
+    };
+    if (readLittle16(header[18..20]) != expected_machine or
+        readLittle32(header[20..24]) != 1 or readLittle16(header[52..54]) != header_size)
+        return error.UnsupportedExecutableFormat;
+
+    const entry = readLittle64(header[24..32]);
+    const program_offset = readLittle64(header[32..40]);
+    const program_entry_size = readLittle16(header[54..56]);
+    const program_count = readLittle16(header[56..58]);
+    if (entry == 0 or program_entry_size != 56 or program_count == 0 or program_count > 1024)
+        return error.UnsupportedExecutableFormat;
+    const program_bytes = std.math.mul(u64, program_entry_size, program_count) catch
+        return error.UnsupportedExecutableFormat;
+    if (!fileRange(size, program_offset, program_bytes)) return error.UnsupportedExecutableFormat;
+
+    var executable_entry = false;
+    var interpreter_seen = false;
+    var index: u16 = 0;
+    while (index < program_count) : (index += 1) {
+        var program: [56]u8 = undefined;
+        const offset = std.math.add(u64, program_offset, @as(u64, index) * program_entry_size) catch
+            return error.UnsupportedExecutableFormat;
+        try preadExecutable(descriptor, &program, offset);
+        const program_type = readLittle32(program[0..4]);
+        const flags = readLittle32(program[4..8]);
+        const file_offset = readLittle64(program[8..16]);
+        const virtual_address = readLittle64(program[16..24]);
+        const file_size = readLittle64(program[32..40]);
+        const memory_size = readLittle64(program[40..48]);
+        if (!fileRange(size, file_offset, file_size)) return error.UnsupportedExecutableFormat;
+        if (program_type == 1) {
+            if (file_size > memory_size) return error.UnsupportedExecutableFormat;
+            const virtual_end = std.math.add(u64, virtual_address, memory_size) catch
+                return error.UnsupportedExecutableFormat;
+            if (flags & 1 != 0 and entry >= virtual_address and entry < virtual_end)
+                executable_entry = true;
+        } else if (program_type == 3) {
+            if (interpreter_seen or file_size < 2 or file_size > 4096)
+                return error.UnsupportedExecutableFormat;
+            var interpreter: [4096]u8 = undefined;
+            try preadExecutable(descriptor, interpreter[0..@intCast(file_size)], file_offset);
+            const path = interpreter[0..@intCast(file_size)];
+            if (path[0] != '/' or path[path.len - 1] != 0 or
+                std.mem.indexOfScalar(u8, path[0 .. path.len - 1], 0) != null)
+                return error.UnsupportedExecutableFormat;
+            interpreter_seen = true;
+        }
+    }
+    if (!executable_entry) return error.UnsupportedExecutableFormat;
+    return interpreter_seen;
+}
+
+fn preadExecutable(descriptor: linux.fd_t, bytes: []u8, offset: u64) !void {
+    var read: usize = 0;
+    while (read < bytes.len) {
+        const position = std.math.add(u64, offset, read) catch return error.UnsupportedExecutableFormat;
+        const amount = linux.pread(descriptor, bytes[read..].ptr, bytes.len - read, @intCast(position));
+        switch (linux.errno(amount)) {
+            .SUCCESS => {
+                if (amount == 0) return error.UnsupportedExecutableFormat;
+                read += amount;
+            },
+            .INTR => continue,
+            else => return error.ExecutableUnavailable,
+        }
+    }
+}
+
+fn fileRange(size: u64, offset: u64, length: u64) bool {
+    const end = std.math.add(u64, offset, length) catch return false;
+    return end <= size;
+}
+
+fn readLittle16(bytes: *const [2]u8) u16 {
+    return @as(u16, bytes[0]) | @as(u16, bytes[1]) << 8;
+}
+
+fn readLittle32(bytes: *const [4]u8) u32 {
+    return @as(u32, bytes[0]) |
+        @as(u32, bytes[1]) << 8 |
+        @as(u32, bytes[2]) << 16 |
+        @as(u32, bytes[3]) << 24;
+}
+
+fn readLittle64(bytes: *const [8]u8) u64 {
+    return @as(u64, readLittle32(bytes[0..4])) |
+        @as(u64, readLittle32(bytes[4..8])) << 32;
+}
+
+pub const ExecutableFormatTest = struct {
+    pub fn usesInterpreter(executable: Executable) !bool {
+        if (!builtin.is_test) @compileError("executable format evidence is test-only");
+        const stat = try files.snapshot(executable.file);
+        return validateElfExecutable(executable.file.handle, stat.size);
     }
 };
 
@@ -128,6 +245,7 @@ pub const CommandLimits = struct {
     primary_events: u32 = 1_000_000,
     cleanup_events: u32 = 1_000_000,
     proc_entries_per_scan: u32 = 262_144,
+    /// Must cover leader, requested descendants, first-excess sentinel and ECHILD.
     reap_events: u16 = 512,
     term_grace_ms: u32 = 100,
 };
@@ -357,8 +475,9 @@ pub fn runCommand(
         result.cleanup = switch (err) {
             error.IdentityChanged => .identity_changed,
             error.ProcessGone, error.ProcUnavailable, error.PidfdUnavailable => .proc_unavailable,
+            error.PollFailed => .local_io,
         };
-        poisonAndRecoverLeader(child.pid, request.cleanup_deadline, &result);
+        poisonAndRecoverLeader(proc, child.pid, request.cleanup_deadline, &result);
         return result;
     };
 
@@ -580,7 +699,7 @@ fn validateCommandLimits(limits: CommandLimits) !void {
         limits.primary_events < 16 or limits.primary_events > 10_000_000 or
         limits.cleanup_events < 32 or limits.cleanup_events > 10_000_000 or
         limits.proc_entries_per_scan < 16 or limits.proc_entries_per_scan > 1_000_000 or
-        limits.reap_events < limits.descendants + 1 or limits.reap_events > 1024 or
+        limits.reap_events < limits.descendants + 3 or limits.reap_events > 1024 or
         limits.term_grace_ms == 0 or limits.term_grace_ms > 60_000)
         return error.InvalidOptions;
 }
@@ -962,11 +1081,14 @@ const OwnedTracker = struct {
     }
 
     fn addLeader(self: *OwnedTracker, proc: linux.fd_t, pid: linux.pid_t) !void {
+        const observed = try readProcStat(proc, pid);
+        if (observed.pid != pid or observed.parent != linux.getpid() or observed.start_ticks == 0)
+            return error.IdentityChanged;
         const descriptor = try commandPidfd(pid);
         errdefer _ = linux.close(descriptor);
-        const identity = try readProcStat(proc, pid);
-        if (identity.pid != pid or identity.parent != linux.getpid() or identity.start_ticks == 0)
+        const identity = (try verifiedLiveIdentity(proc, observed.pid, observed.start_ticks, descriptor)) orelse
             return error.IdentityChanged;
+        if (identity.parent != linux.getpid()) return error.IdentityChanged;
         self.items[0] = .{ .pid = pid, .start_ticks = identity.start_ticks, .pidfd = descriptor };
         self.len = 1;
     }
@@ -976,9 +1098,15 @@ const OwnedTracker = struct {
         return null;
     }
 
-    fn ownsParent(self: *const OwnedTracker, parent: linux.pid_t) bool {
+    fn ownsLiveParent(self: *const OwnedTracker, proc: linux.fd_t, parent: linux.pid_t) !bool {
         if (parent == linux.getpid()) return true;
-        return self.findPid(parent) != null;
+        const index = self.findPid(parent) orelse return false;
+        return (try verifiedLiveIdentity(
+            proc,
+            self.items[index].pid,
+            self.items[index].start_ticks,
+            self.items[index].pidfd,
+        )) != null;
     }
 
     fn addDescendant(self: *OwnedTracker, identity: ProcStat, descriptor: linux.fd_t) bool {
@@ -1074,31 +1202,36 @@ fn scanOwned(
             const pid = std.fmt.parseInt(linux.pid_t, entry.name, 10) catch continue;
             if (pid <= 1 or pid == linux.getpid()) continue;
             if (tracker.findPid(pid)) |index| {
-                const current = readProcStat(proc, pid) catch |err| switch (err) {
-                    error.ProcessGone => continue,
-                    else => return error.ProcUnavailable,
-                };
-                if (current.start_ticks != tracker.items[index].start_ticks) return error.IdentityChanged;
+                _ = try verifiedLiveIdentity(
+                    proc,
+                    tracker.items[index].pid,
+                    tracker.items[index].start_ticks,
+                    tracker.items[index].pidfd,
+                );
                 continue;
             }
-            const observed = readProcStat(proc, pid) catch continue;
-            if (!tracker.ownsParent(observed.parent)) continue;
+            const observed = readProcStat(proc, pid) catch |err| switch (err) {
+                error.ProcessGone => continue,
+                else => return error.ProcUnavailable,
+            };
+            if (!try tracker.ownsLiveParent(proc, observed.parent)) continue;
             const descriptor = commandPidfd(pid) catch |err| switch (err) {
                 error.ProcessGone => continue,
                 else => return error.PidfdUnavailable,
             };
-            const verified = readProcStat(proc, pid) catch |err| {
+            const verified = verifiedLiveIdentity(proc, observed.pid, observed.start_ticks, descriptor) catch |err| {
                 _ = linux.close(descriptor);
-                switch (err) {
-                    error.ProcessGone => continue,
-                    else => return error.ProcUnavailable,
-                }
+                return err;
             };
-            if (verified.start_ticks != observed.start_ticks or !tracker.ownsParent(verified.parent)) {
+            const identity = verified orelse {
                 _ = linux.close(descriptor);
-                return error.IdentityChanged;
+                continue;
+            };
+            if (!try tracker.ownsLiveParent(proc, identity.parent)) {
+                _ = linux.close(descriptor);
+                continue;
             }
-            if (!tracker.addDescendant(verified, descriptor)) {
+            if (!tracker.addDescendant(identity, descriptor)) {
                 try signalTemporary(descriptor, phase);
                 _ = linux.close(descriptor);
             } else {
@@ -1171,6 +1304,87 @@ fn pidfdExited(descriptor: linux.fd_t) !bool {
     if (pollfds[0].revents & linux.POLL.NVAL != 0) return error.PollFailed;
     return pollfds[0].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0;
 }
+
+const IdentityAction = enum { live, gone, poison };
+
+fn identityAction(
+    expected_pid: linux.pid_t,
+    expected_start_ticks: u64,
+    exited_before: bool,
+    current: ?ProcStat,
+    exited_after: bool,
+) IdentityAction {
+    if (exited_before or exited_after) return .gone;
+    const observed = current orelse return .poison;
+    if (observed.pid != expected_pid or expected_start_ticks == 0 or
+        observed.start_ticks != expected_start_ticks) return .poison;
+    return .live;
+}
+
+fn verifiedLiveIdentity(
+    proc: linux.fd_t,
+    expected_pid: linux.pid_t,
+    expected_start_ticks: u64,
+    descriptor: linux.fd_t,
+) !?ProcStat {
+    const exited_before = try pidfdExited(descriptor);
+    if (exited_before) return null;
+    const current: ?ProcStat = readProcStat(proc, expected_pid) catch |err| switch (err) {
+        error.ProcessGone => null,
+        else => return error.ProcUnavailable,
+    };
+    const exited_after = try pidfdExited(descriptor);
+    return switch (identityAction(expected_pid, expected_start_ticks, exited_before, current, exited_after)) {
+        .live => current.?,
+        .gone => null,
+        .poison => error.IdentityChanged,
+    };
+}
+
+pub const CommandIdentityTest = struct {
+    pub const Action = enum { open_candidate, rescan_without_open, poison };
+
+    pub fn parentAction(
+        expected_pid: linux.pid_t,
+        expected_start_ticks: u64,
+        exited_before: bool,
+        observed_pid: ?linux.pid_t,
+        observed_start_ticks: u64,
+        exited_after: bool,
+    ) Action {
+        if (!builtin.is_test) @compileError("command identity evidence is test-only");
+        const current: ?ProcStat = if (observed_pid) |pid| .{
+            .pid = pid,
+            .parent = 0,
+            .start_ticks = observed_start_ticks,
+        } else null;
+        return switch (identityAction(
+            expected_pid,
+            expected_start_ticks,
+            exited_before,
+            current,
+            exited_after,
+        )) {
+            .live => .open_candidate,
+            .gone => .rescan_without_open,
+            .poison => .poison,
+        };
+    }
+
+    pub fn startTicks(pid: linux.pid_t) !u64 {
+        if (!builtin.is_test) @compileError("command identity evidence is test-only");
+        const proc = try openCommandProc();
+        defer _ = linux.close(proc);
+        return (try readProcStat(proc, pid)).start_ticks;
+    }
+
+    pub fn identityLive(pid: linux.pid_t, start_ticks: u64, descriptor: linux.fd_t) !bool {
+        if (!builtin.is_test) @compileError("command identity evidence is test-only");
+        const proc = try openCommandProc();
+        defer _ = linux.close(proc);
+        return (try verifiedLiveIdentity(proc, pid, start_ticks, descriptor)) != null;
+    }
+};
 
 fn reapCommand(request: CommandRequest, tracker: *OwnedTracker, result: *CommandResult) !void {
     while (true) {
@@ -1361,8 +1575,19 @@ fn poisonCommand(
     poisoned.store(true, .release);
 }
 
-fn poisonAndRecoverLeader(pid: linux.pid_t, deadline: Deadline, result: *CommandResult) void {
-    _ = linux.kill(pid, .KILL);
+fn poisonAndRecoverLeader(proc: linux.fd_t, pid: linux.pid_t, deadline: Deadline, result: *CommandResult) void {
+    const observed = readProcStat(proc, pid) catch null;
+    if (observed) |identity| {
+        if (identity.pid == pid and identity.parent == linux.getpid() and identity.start_ticks != 0) {
+            if (commandPidfd(pid)) |descriptor| {
+                defer _ = linux.close(descriptor);
+                if (verifiedLiveIdentity(proc, pid, identity.start_ticks, descriptor) catch null) |verified| {
+                    if (verified.parent == linux.getpid())
+                        _ = linux.pidfd_send_signal(descriptor, .KILL, null, 0);
+                }
+            } else |_| {}
+        }
+    }
     var attempts: u16 = 0;
     while (attempts < 1024 and !(deadline.expired() catch true)) : (attempts += 1) {
         var status: u32 = 0;

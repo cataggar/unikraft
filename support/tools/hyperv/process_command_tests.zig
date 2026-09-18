@@ -12,6 +12,70 @@ fn openExecutable() !process.Executable {
     return process.Executable.open(io, path);
 }
 
+fn writeAll(descriptor: linux.fd_t, bytes: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const amount = linux.write(descriptor, bytes[offset..].ptr, bytes.len - offset);
+        switch (linux.errno(amount)) {
+            .SUCCESS => {
+                if (amount == 0) return error.FixtureWrite;
+                offset += amount;
+            },
+            .INTR => continue,
+            else => return error.FixtureWrite,
+        }
+    }
+}
+
+fn createExecutableFile(fixture: *support.Fixture, name: [:0]const u8, bytes: []const u8) ![:0]u8 {
+    const opened = linux.openat(fixture.directory.dir.handle, name, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .CLOEXEC = true,
+    }, 0o700);
+    if (linux.errno(opened) != .SUCCESS) return error.FixtureOpen;
+    const descriptor: linux.fd_t = @intCast(opened);
+    errdefer _ = linux.close(descriptor);
+    try writeAll(descriptor, bytes);
+    _ = linux.close(descriptor);
+    return fixture.directory.dir.realPathFileAlloc(io, name, allocator);
+}
+
+fn copyExecutableFile(fixture: *support.Fixture, name: [:0]const u8, source: [:0]const u8) ![:0]u8 {
+    const opened = linux.openat(linux.AT.FDCWD, source, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.FixtureOpen;
+    const source_descriptor: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(source_descriptor);
+    const destination = linux.openat(fixture.directory.dir.handle, name, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .CLOEXEC = true,
+    }, 0o700);
+    if (linux.errno(destination) != .SUCCESS) return error.FixtureOpen;
+    const destination_descriptor: linux.fd_t = @intCast(destination);
+    errdefer _ = linux.close(destination_descriptor);
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const amount = linux.read(source_descriptor, &buffer, buffer.len);
+        switch (linux.errno(amount)) {
+            .SUCCESS => {
+                if (amount == 0) break;
+                try writeAll(destination_descriptor, buffer[0..amount]);
+            },
+            .INTR => continue,
+            else => return error.FixtureRead,
+        }
+    }
+    _ = linux.close(destination_descriptor);
+    return fixture.directory.dir.realPathFileAlloc(io, name, allocator);
+}
+
 fn expectPidsGone(bytes: []const u8, expected: usize) !void {
     var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
     var count: usize = 0;
@@ -64,6 +128,188 @@ test "command contract captures successful bounded stdout and stderr" {
     try testing.expect(std.mem.allEqual(u8, result.stderr, 'e'));
     try testing.expect(result.executable_stable);
     try testing.expectEqual(@as(u16, 0), result.descendants.observed);
+    try support.noChildren();
+}
+
+test "executable contract accepts native and dynamically linked ELF binaries" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+
+    var native = try openExecutable();
+    const native_descriptor = native.file.handle;
+    try testing.expectEqual(.SUCCESS, linux.errno(linux.fcntl(native_descriptor, linux.F.GETFD, 0)));
+    native.close(io);
+    try testing.expectEqual(.BADF, linux.errno(linux.fcntl(native_descriptor, linux.F.GETFD, 0)));
+
+    const dynamic_path = try std.Io.Dir.cwd().realPathFileAlloc(io, "/usr/bin/true", allocator);
+    defer allocator.free(dynamic_path);
+    var dynamic = try process.Executable.open(io, dynamic_path);
+    defer dynamic.close(io);
+    try testing.expect(try process.ExecutableFormatTest.usesInterpreter(dynamic));
+    var result = try process.runCommand(allocator, io, try request(
+        dynamic,
+        &.{dynamic_path},
+        &environment,
+        fixture.directory.dir,
+    ));
+    defer result.deinit(allocator);
+    try testing.expect(result.succeeded());
+    try support.noChildren();
+}
+
+test "executable contract rejects scripts text and malformed ELF before spawn" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    const cases = [_]struct { name: [:0]const u8, bytes: []const u8 }{
+        .{ .name = "shebang", .bytes = "#!/bin/sh\nexit 0\n" },
+        .{ .name = "text", .bytes = "echo executable text\n" },
+        .{ .name = "truncated", .bytes = "\x7fELF" },
+        .{ .name = "magic-only", .bytes = "\x7fELF\x02\x01\x01" ++ "\x00" ** 57 },
+    };
+    for (cases) |case| {
+        const path = try createExecutableFile(&fixture, case.name, case.bytes);
+        defer allocator.free(path);
+        try testing.expectError(error.UnsupportedExecutableFormat, process.Executable.open(io, path));
+    }
+
+    const probe = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(probe) != .SUCCESS) return error.FixtureOpen;
+    const expected_descriptor: linux.fd_t = @intCast(probe);
+    _ = linux.close(expected_descriptor);
+    const text_path = try fixture.directory.dir.realPathFileAlloc(io, "text", allocator);
+    defer allocator.free(text_path);
+    try testing.expectError(error.UnsupportedExecutableFormat, process.Executable.open(io, text_path));
+    const reused = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(reused) != .SUCCESS) return error.FixtureOpen;
+    defer _ = linux.close(@intCast(reused));
+    try testing.expectEqual(expected_descriptor, @as(linux.fd_t, @intCast(reused)));
+    try support.noChildren();
+}
+
+test "executable descriptor mutation is rejected and ownership remains with caller" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    const source = try support.executable();
+    defer allocator.free(source);
+    const path = try copyExecutableFile(&fixture, "mutable-elf", source);
+    defer allocator.free(path);
+    var executable = try process.Executable.open(io, path);
+    const descriptor = executable.file.handle;
+    var executable_open = true;
+    defer if (executable_open) executable.close(io);
+
+    const mutation = linux.openat(linux.AT.FDCWD, path, .{
+        .ACCMODE = .WRONLY,
+        .APPEND = true,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    if (linux.errno(mutation) != .SUCCESS) return error.FixtureOpen;
+    const mutation_descriptor: linux.fd_t = @intCast(mutation);
+    errdefer _ = linux.close(mutation_descriptor);
+    try writeAll(mutation_descriptor, "x");
+    _ = linux.close(mutation_descriptor);
+
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    try testing.expectError(error.ExecutableIdentityChanged, process.runCommand(
+        allocator,
+        io,
+        try request(executable, &.{path}, &environment, fixture.directory.dir),
+    ));
+    try testing.expectEqual(.SUCCESS, linux.errno(linux.fcntl(descriptor, linux.F.GETFD, 0)));
+    try support.noChildren();
+    executable.close(io);
+    executable_open = false;
+    try testing.expectEqual(.BADF, linux.errno(linux.fcntl(descriptor, linux.F.GETFD, 0)));
+}
+
+test "tracked parent identity rejects reaped PID reuse before candidate open" {
+    const expected_pid: linux.pid_t = 1234;
+    const expected_start: u64 = 5678;
+    try testing.expectEqual(
+        process.CommandIdentityTest.Action.rescan_without_open,
+        process.CommandIdentityTest.parentAction(
+            expected_pid,
+            expected_start,
+            true,
+            expected_pid,
+            expected_start + 1,
+            true,
+        ),
+    );
+    try testing.expectEqual(
+        process.CommandIdentityTest.Action.poison,
+        process.CommandIdentityTest.parentAction(
+            expected_pid,
+            expected_start,
+            false,
+            expected_pid,
+            expected_start + 1,
+            false,
+        ),
+    );
+    try testing.expectEqual(
+        process.CommandIdentityTest.Action.poison,
+        process.CommandIdentityTest.parentAction(
+            expected_pid,
+            expected_start,
+            false,
+            null,
+            0,
+            false,
+        ),
+    );
+    try testing.expectEqual(
+        process.CommandIdentityTest.Action.open_candidate,
+        process.CommandIdentityTest.parentAction(
+            expected_pid,
+            expected_start,
+            false,
+            expected_pid,
+            expected_start,
+            false,
+        ),
+    );
+}
+
+test "pidfd liveness and proc start identity agree across exit and reap" {
+    try process.initialize();
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.FixtureFork;
+    if (forked == 0) {
+        while (true) {
+            var pollfds: [0]linux.pollfd = .{};
+            _ = linux.poll(&pollfds, 0, 1000);
+        }
+    }
+    const pid: linux.pid_t = @intCast(forked);
+    const opened = linux.pidfd_open(pid, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.FixturePidfd;
+    const descriptor: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(descriptor);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.pidfd_send_signal(descriptor, .KILL, null, 0);
+        var status: u32 = 0;
+        while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+    };
+
+    const start_ticks = try process.CommandIdentityTest.startTicks(pid);
+    try testing.expect(try process.CommandIdentityTest.identityLive(pid, start_ticks, descriptor));
+    try testing.expectEqual(.SUCCESS, linux.errno(linux.pidfd_send_signal(descriptor, .KILL, null, 0)));
+    var status: u32 = 0;
+    while (true) switch (linux.errno(linux.waitpid(pid, &status, 0))) {
+        .SUCCESS => {
+            reaped = true;
+            break;
+        },
+        .INTR => continue,
+        else => return error.FixtureReap,
+    };
+    try testing.expect(!(try process.CommandIdentityTest.identityLive(pid, start_ticks, descriptor)));
     try support.noChildren();
 }
 
@@ -218,7 +464,7 @@ test "stdout and stderr overflow are explicit and bounded" {
     }
 }
 
-test "nonzero and real exec-format failure retain primary outcomes" {
+test "nonzero exits remain primary and non-ELF is refused before spawn" {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
     var environment = std.process.Environ.Map.init(allocator);
@@ -252,17 +498,7 @@ test "nonzero and real exec-format failure retain primary outcomes" {
         _ = linux.close(descriptor);
         const invalid_path = try fixture.directory.dir.realPathFileAlloc(io, "invalid-executable", allocator);
         defer allocator.free(invalid_path);
-        var executable = try process.Executable.open(io, invalid_path);
-        defer executable.close(io);
-        var result = try process.runCommand(allocator, io, try request(
-            executable,
-            &.{invalid_path},
-            &environment,
-            fixture.directory.dir,
-        ));
-        defer result.deinit(allocator);
-        try testing.expectEqual(.exec_failed, result.primary);
-        try testing.expect(result.cleanup_complete);
+        try testing.expectError(error.UnsupportedExecutableFormat, process.Executable.open(io, invalid_path));
     }
     try support.noChildren();
 }
@@ -290,6 +526,43 @@ test "descendant limit accepts the limit and reports the first excess without po
         try expectPidsGone(result.stdout, 4);
         try support.noChildren();
     }
+}
+
+test "reap event minimum covers sentinel and terminal ECHILD proof" {
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var below = try request(executable, &.{ path, "many-children", "4" }, &environment, fixture.directory.dir);
+    below.limits.descendants = 4;
+    below.limits.reap_events = 6;
+    try testing.expectError(error.InvalidOptions, process.runCommand(allocator, io, below));
+
+    var sentinel = try request(executable, &.{ path, "many-children", "5" }, &environment, fixture.directory.dir);
+    sentinel.limits.descendants = 4;
+    sentinel.limits.reap_events = 7;
+    var excess = try process.runCommand(allocator, io, sentinel);
+    defer excess.deinit(allocator);
+    try testing.expect(excess.cleanup_complete);
+    try testing.expect(excess.descendants.limit_exceeded);
+    try testing.expectEqual(@as(u16, 7), excess.reap_events);
+    try expectPidsGone(excess.stdout, 5);
+    try support.noChildren();
+
+    var within = try request(executable, &.{ path, "many-children", "4" }, &environment, fixture.directory.dir);
+    within.limits.descendants = 4;
+    within.limits.reap_events = 7;
+    var complete = try process.runCommand(allocator, io, within);
+    defer complete.deinit(allocator);
+    try testing.expect(complete.succeeded());
+    try testing.expectEqual(@as(u16, 6), complete.reap_events);
+    try expectPidsGone(complete.stdout, 4);
+    try support.noChildren();
 }
 
 test "cleanup grace and deadline are absolute across many descendants" {
