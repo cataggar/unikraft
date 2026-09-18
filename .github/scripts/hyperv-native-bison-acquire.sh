@@ -73,3 +73,4 @@ while IFS= read -r member; do
   sha256sum "${output}" >> "${root}/evidence/bison-data.sha256"
 done < "${root}/evidence/bison-data-members.txt"
 echo "BISON_PKGDATADIR=${root}/bison" >> "${GITHUB_ENV}"
+rm -rf -- "${root}/apt-lists" "${root}/apt-cache"

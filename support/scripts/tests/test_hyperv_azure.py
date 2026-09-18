@@ -2666,6 +2666,14 @@ class HypervWorkflowTest(unittest.TestCase):
             'mv -- "${temporary}" "${alias}"',
         ):
             self.assertIn(required, native)
+        bison_acquire = (
+            SUPPORT.parent
+            / ".github/scripts/hyperv-native-bison-acquire.sh"
+        ).read_text()
+        self.assertIn(
+            'rm -rf -- "${root}/apt-lists" "${root}/apt-cache"',
+            bison_acquire,
+        )
 
     def test_wamr_public_bundle_uses_external_archive_digest(self):
         repository = SUPPORT.parent
