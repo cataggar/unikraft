@@ -56,10 +56,17 @@ umask 077
 mkdir -p .d/wamr-direct/scratch .d/wamr-direct/tests
 export TMPDIR="$PWD/.d/wamr-direct/scratch"
 export PYTHONDONTWRITEBYTECODE=1
+mkdir -p .d/wamr-direct/restore
+cp support/tools/hyperv/local_boot/build.zig \
+  support/tools/hyperv/local_boot/build.zig.zon .d/wamr-direct/restore/
+zig build --build-file .d/wamr-direct/restore/build.zig --fetch=all \
+  --cache-dir "$PWD/.d/wamr-direct/restore-cache" \
+  --global-cache-dir "$PWD/.d/wamr-direct/global-cache" -j2
 zig build --build-file support/tools/hyperv/direct/build.zig \
   --cache-dir "$PWD/.d/wamr-direct/cache" \
   --prefix "$PWD/.d/wamr-direct/tools" -j2 install compute-fixture-tools
 zig build --build-file support/build/wamr-native-ci/build.zig \
+  --system "$PWD/.d/wamr-direct/restore/zig-pkg" \
   --cache-dir "$PWD/.d/wamr-direct/package-cache" \
   --prefix "$PWD/.d/wamr-direct/package-tools" \
   -Doptimize=ReleaseSafe -j2 test install

@@ -10,9 +10,9 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
-import uuid
 
 HERE = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
@@ -133,8 +133,8 @@ class PhysicalPackage(unittest.TestCase):
     """Run the actual native adapter + pinned miz on a nonbootable synthetic PE."""
 
     def setUp(self):
-        self.root = HERE / (".fixture-" + uuid.uuid4().hex)
-        self.root.mkdir(mode=0o700)
+        self.root = Path(tempfile.mkdtemp(prefix="wamr-native-ci-"))
+        self.root.chmod(0o700)
         self.addCleanup(shutil.rmtree, self.root)
         self.cli = Path(os.environ["WAMR_CI_PACKAGE"]).resolve(strict=True)
         self.efi = self.root / "synthetic.efi"
@@ -194,8 +194,8 @@ class PhysicalPackage(unittest.TestCase):
 
 class Evidence(unittest.TestCase):
     def setUp(self):
-        self.root = HERE / (".fixture-" + uuid.uuid4().hex)
-        self.root.mkdir(mode=0o700)
+        self.root = Path(tempfile.mkdtemp(prefix="wamr-native-ci-"))
+        self.root.chmod(0o700)
         self.addCleanup(shutil.rmtree, self.root)
         for name in ("private", "evidence", "package", "firmware", "bin"):
             (self.root / name).mkdir(mode=0o700)
@@ -270,6 +270,66 @@ class Evidence(unittest.TestCase):
                 with self.assertRaises(ci.Refusal):
                     ci.build(runtime, self.root)
                 inputs.assert_not_called()
+
+    def test_restore_precedes_custody_and_both_builds_use_one_system_tree(self):
+        runtime = self.root / "runtime"
+        runtime.mkdir(mode=0o700)
+        packages = runtime / "packages"
+        packages.mkdir(mode=0o700)
+        events = []
+        commands = []
+
+        def restore(root):
+            events.append("restore")
+            return packages
+
+        def inputs(root):
+            events.append("custody")
+            return {"source": {"revision": "1" * 40, "tree": "2" * 40}}
+
+        def command(root, stage, args, *unused):
+            commands.append((stage, list(map(str, args))))
+            return root / "private" / (stage + ".log")
+
+        with mock.patch.dict(os.environ, {
+                "BISON_PKGDATADIR": str(runtime / "bison")}, clear=True), \
+                mock.patch.object(ci, "restore_dependencies", side_effect=restore), \
+                mock.patch.object(ci, "producer_inputs", side_effect=inputs), \
+                mock.patch.object(ci, "run", side_effect=command), \
+                mock.patch.object(ci, "save"), \
+                mock.patch.object(ci, "check_build", return_value={}), \
+                mock.patch.object(ci, "digest", return_value="f" * 64), \
+                mock.patch.object(ci, "tool", side_effect=lambda name: "/tools/" + name), \
+                mock.patch.object(ci.subprocess, "check_output", return_value=b"0.16.0\n"):
+            ci.build(runtime, self.root)
+
+        self.assertEqual(events[:2], ["restore", "custody"])
+        selected = dict(commands)
+        for stage in ("adapter", "local-boot-tool"):
+            self.assertIn("--system", selected[stage])
+            self.assertEqual(
+                selected[stage][selected[stage].index("--system") + 1],
+                str(packages),
+            )
+        self.assertFalse((ci.LOCAL_BOOT / "zig-pkg").exists())
+        self.assertFalse((ci.HERE / "zig-pkg").exists())
+
+    def test_restore_requires_the_private_fetched_package_tree(self):
+        missing = self.root / "missing-source"
+        missing_root = self.root / "missing-restore"
+        missing_root.mkdir(mode=0o700)
+        with mock.patch.object(ci, "LOCAL_BOOT", missing):
+            with self.assertRaisesRegex(
+                    ci.Refusal, "pinned dependency manifest unavailable"):
+                ci.restore_dependencies(missing_root)
+        root = self.root / "restore"
+        root.mkdir(mode=0o700)
+        for name in ("private", "evidence", "cache", "global-cache"):
+            (root / name).mkdir(mode=0o700)
+        with mock.patch.object(ci, "run"):
+            with self.assertRaisesRegex(
+                    ci.Refusal, "private pinned dependency restore required"):
+                ci.restore_dependencies(root)
 
     def synthetic_boot(self, raw=None):
         config = ci.config_for(self.root, self.root, 0)

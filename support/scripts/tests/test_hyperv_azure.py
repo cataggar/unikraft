@@ -2594,6 +2594,9 @@ class HypervWorkflowTest(unittest.TestCase):
             "ci-objcopy-version.awk",
             'sha256sum -- "${objcopy}"',
             'sha256sum --check "${root}/fixture-objcopy-sha256.txt"',
+            "support/tools/hyperv/local_boot/build.zig.zon",
+            '--build-file "${root}/restore/build.zig" --fetch=all',
+            '--system "${root}/restore/zig-pkg"',
             "for mode in Debug ReleaseSafe; do",
             '-Dstrip-fixture-debug=true "-Dfixture-objcopy=${objcopy}"',
             '"-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json"',
@@ -2617,6 +2620,29 @@ class HypervWorkflowTest(unittest.TestCase):
                 self.assertIn(
                     f"/native-local-boot/{mode}/{artifact}", retained
                 )
+
+    def test_wamr_and_local_boot_packages_restore_outside_source(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        self.assertNotIn(
+            "mv support/build/wamr-native-ci/zig-pkg", workflow
+        )
+        for build_file in (
+            "support/build/wamr-native-ci/build.zig",
+            "support/tools/hyperv/local_boot/build.zig",
+        ):
+            step = workflow.split(
+                f"zig build --build-file {build_file}", 1
+            )[1].split("\n\n", 1)[0]
+            self.assertIn('--system "${root}/restore/zig-pkg"', step)
+        self.assertGreaterEqual(
+            workflow.count(
+                'zig build --build-file "${root}/restore/build.zig" '
+                "--fetch=all"
+            ),
+            2,
+        )
 
     def test_producer_dependency_guard_is_failure_aware_and_cancelable(self):
         workflow = (

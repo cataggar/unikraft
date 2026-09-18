@@ -17,7 +17,7 @@ MAX_JSON = 65536
 BOOT_KEYS = ("serial", "request", "report", "compute")
 STAGES = ("adapter", "local-boot-tool", "fixtures", "prepare", "config",
           "native-image", "package", "raw-x2apic", "raw-legacy-apic",
-          "vpc-x2apic", "vpc-legacy-apic", "inspect")
+          "vpc-x2apic", "vpc-legacy-apic", "inspect", "dependency-restore")
 EVIDENCE = frozenset(
     ["build-start.json", "build.json", "boot-inputs.json", "package.json"]
     + [f"command-{stage}.json" for stage in STAGES]

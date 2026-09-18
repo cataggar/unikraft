@@ -204,18 +204,36 @@ The build restores reviewed Miz revision
 `669a27982b376311f558e820b69e9a692735b0cd` with package hash
 `miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx` from
 `build.zig.zon`; Miz's exported `dependency.module("miz")` supplies its native
-zstd wiring. After that pinned restore is available, builds can run offline.
-Use Zig 0.16, `-j2`, and explicit owned scratch for HOME, TMPDIR, XDG/Zig
-caches and outputs, for example:
+zstd wiring. After that pinned restore is available, builds run offline through `--system`.
+This Zig distribution creates `zig-pkg` beside the selected build file, so
+restore copied manifests under owned scratch before source custody is
+established. Never fetch beside the tracked build file. Use Zig 0.16, `-j2`,
+and explicit owned scratch for HOME, TMPDIR, XDG/Zig caches and outputs:
 
-```text
+```sh
+SCRATCH="$PWD/.d/local-boot"
+umask 077
+mkdir -p "$SCRATCH"/{home,tmp,cache,global-cache,restore,fixtures,outputs}
+export HOME="$SCRATCH/home" TMPDIR="$SCRATCH/tmp"
+export XDG_CACHE_HOME="$SCRATCH/cache"
+export ZIG_LOCAL_CACHE_DIR="$SCRATCH/cache"
+export ZIG_GLOBAL_CACHE_DIR="$SCRATCH/global-cache"
+cp support/tools/hyperv/local_boot/build.zig \
+  support/tools/hyperv/local_boot/build.zig.zon "$SCRATCH/restore/"
+zig build --build-file "$SCRATCH/restore/build.zig" --fetch=all \
+  --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" -j2
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
-  --cache-dir SCRATCH/cache --global-cache-dir SCRATCH/global-cache \
-  --prefix SCRATCH/outputs/debug -Dtest-root=/absolute/SCRATCH/fixtures \
-  -j2 test install
+  --system "$SCRATCH/restore/zig-pkg" \
+  --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+  --prefix "$SCRATCH/outputs/debug" -Dtest-root="$SCRATCH/fixtures" \
+  -j2 test install --summary all
 ```
 
-Repeat with `-Doptimize=ReleaseSafe` and a separate output prefix.
+Repeat with `-Doptimize=ReleaseSafe` and a separate output prefix. A missing
+or incomplete `--system` package tree is an explicit build error; builds do
+not fall back to fetching into tracked source.
 CI additionally selects the explicit test-only path:
 
 ```text

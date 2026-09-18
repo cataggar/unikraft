@@ -73,7 +73,10 @@ observations, not authenticated source attestations or deployment receipts.
 
 Writable build, package, firmware and boot slots are under the checkout's
 ignored `.d/wamr-native-runtime` or the app's ignored `build/`. Zig's
-source-pinned dependency restoration also uses this helper's ignored `zig-pkg/`.
+source-pinned dependency restoration copies the local-boot manifests into
+`compute/dependencies` and creates `zig-pkg` there before source custody is
+recorded. Both the adapter and local-boot builds use that one package tree
+through `--system`; no package-manager state is created below tracked source.
 Build commands use `-j2`; the workflow has a 60-minute ceiling. Each build
 command has a fixed deadline and an 8-MiB log limit (one extra byte detects
 overflow). The native packaging worker retains its 120-second deadline and
@@ -98,11 +101,16 @@ is diagnostic only and cannot turn failure into success.
 From a checkout with Zig 0.16:
 
 ```sh
-mkdir -p .d/wamr-ci-check/cache .d/wamr-ci-check/global-cache/tmp \
-  .d/wamr-ci-check/scratch
+mkdir -p .d/wamr-ci-check/{cache,global-cache/tmp,scratch,restore,out}
 export TMPDIR="$PWD/.d/wamr-ci-check/scratch"
 export ZIG_GLOBAL_CACHE_DIR="$PWD/.d/wamr-ci-check/global-cache"
+cp support/tools/hyperv/local_boot/build.zig \
+  support/tools/hyperv/local_boot/build.zig.zon .d/wamr-ci-check/restore/
+zig build --build-file .d/wamr-ci-check/restore/build.zig --fetch=all \
+  --cache-dir .d/wamr-ci-check/cache \
+  --global-cache-dir .d/wamr-ci-check/global-cache -j2
 zig build --build-file support/build/wamr-native-ci/build.zig \
+  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
   --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
   -Doptimize=ReleaseSafe -j2 test install
 WAMR_CI_PACKAGE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-package" \
@@ -150,8 +158,8 @@ Artifact name:
 `wamr-public-source-tiny-RUN_ID-RUN_ATTEMPT-SOURCE_SHA`.
 Its sole uploaded file is `tiny-aot-public-source.zip`, stored for seven days.
 It contains the 17 exact image/compiler/runtime/config/manifest artifacts,
-four original serial/request/report/compute sets, the fixed 20 earlier local
-JSON records, portable `bundle.json`, and `public-source.json` (55 regular
+four original serial/request/report/compute sets, the fixed 21 earlier local
+JSON records, portable `bundle.json`, and `public-source.json` (56 regular
 files, at most 512 MiB total). Member names, modes/types, individual sizes,
 complete SHA256/EOF, source/run bindings and successful receipts are checked.
 Symlinks/hardlinks, duplicate/extra/absolute/traversal members, compression,

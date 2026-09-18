@@ -276,9 +276,11 @@ export ZIG_LOCAL_CACHE_DIR="$S/cache" ZIG_GLOBAL_CACHE_DIR="$S/global-cache"
   -Dimport-test-root="$S/fixtures" -Dtest-root="$S/fixtures" \
   -j2 test-import test install --summary all
 /home/g/.local/bin/zig build --build-file support/tools/hyperv/local_boot/build.zig \
-  --prefix "$S/outputs/local-debug" -Dtest-root="$S/fixtures" -j2 test install
+  --system "$PKGS" --prefix "$S/outputs/local-debug" \
+  -Dtest-root="$S/fixtures" -j2 test install
 /home/g/.local/bin/zig build --build-file support/tools/hyperv/local_boot/build.zig \
-  --prefix "$S/outputs/local-release" -Dtest-root="$S/fixtures" \
+  --system "$PKGS" --prefix "$S/outputs/local-release" \
+  -Dtest-root="$S/fixtures" \
   -Doptimize=ReleaseSafe -j2 test install
 ```
 

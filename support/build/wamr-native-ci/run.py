@@ -17,6 +17,7 @@ import sys
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 APP = REPO / "support/apps/wamr-aot"
+LOCAL_BOOT = REPO / "support/tools/hyperv/local_boot"
 REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 MARKER = "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
 LEGACY = "Using legacy xAPIC MMIO"
@@ -189,6 +190,36 @@ def run(root, stage, args, seconds=600, limit=8 * MIB):
     return output
 
 
+def restore_dependencies(root):
+    restore = root / "dependencies"
+    restore.mkdir(mode=0o700)
+    for name in ("build.zig", "build.zig.zon"):
+        target = restore / name
+        try:
+            data = read(LOCAL_BOOT / name, MIB)
+        except FileNotFoundError as error:
+            raise Refusal("pinned dependency manifest unavailable") from error
+        with target.open("xb") as stream:
+            stream.write(data)
+        target.chmod(0o600)
+    run(root, "dependency-restore", [
+        tool("zig"), "build", "--build-file", restore / "build.zig",
+        "--fetch=all", "--cache-dir", root / "cache",
+        "--global-cache-dir", root / "global-cache", "-j2",
+    ], 900)
+    packages = restore / "zig-pkg"
+    try:
+        info = packages.lstat()
+    except FileNotFoundError as error:
+        raise Refusal("private pinned dependency restore required") from error
+    require(packages.resolve(strict=True) == packages
+            and stat.S_ISDIR(info.st_mode)
+            and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700,
+            "private pinned dependency restore required")
+    return packages
+
+
 def check_build():
     identity = document(APP / "build/artifacts/identity.json")
     require(identity["wamr_revision"] == REVISION
@@ -352,15 +383,16 @@ def build(runtime, wamr):
                       ZIG_GLOBAL_CACHE_DIR=str(root / "global-cache"))
     require(os.environ.get("BISON_PKGDATADIR") == str(runtime / "bison"),
             "Bison build environment differs from bound producer input")
+    packages = restore_dependencies(root)
     initial = producer_inputs(runtime)
     save(root / "evidence/build-start.json", initial)
     require(subprocess.check_output([tool("zig"), "version"]).strip() == b"0.16.0",
             "Zig 0.16.0 required")
     run(root, "adapter", [tool("zig"), "build", "--build-file", HERE / "build.zig",
-                          "--prefix", root / "tools", "-Doptimize=ReleaseSafe",
-                          "-j2", "test", "install"], 900)
+                          "--system", packages, "--prefix", root / "tools",
+                          "-Doptimize=ReleaseSafe", "-j2", "test", "install"], 900)
     run(root, "local-boot-tool", [tool("zig"), "build", "--build-file",
-                                REPO / "support/tools/hyperv/local_boot/build.zig",
+                                LOCAL_BOOT / "build.zig", "--system", packages,
                                 "--prefix", root / "tools", "-Doptimize=ReleaseSafe",
                                 "-j2", "install"], 900)
     os.environ["WAMR_CI_PACKAGE"] = str(root / "tools/bin/wamr-ci-package")
