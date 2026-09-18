@@ -1023,7 +1023,9 @@ def canonical_input_paths(paths, reason):
     return result
 
 
-def record_input_paths(file_paths, tree_paths, content=True, expected=None):
+def record_input_paths(file_paths, tree_paths, content=True, expected=None,
+                       scope="consumer"):
+    require(scope in ("consumer", "boot"), "invalid input custody scope")
     file_paths = canonical_input_paths(
         file_paths, "invalid consumer input file discovery")
     tree_paths = canonical_input_paths(
@@ -1061,18 +1063,28 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None):
             ),
             "invalid consumer input custody",
         )
-        require(set(file_paths) == set(expected["files"]),
-                "consumer input file roles changed")
+        actual_file_roles = set(file_paths)
+        expected_file_roles = set(expected["files"])
+        if actual_file_roles != expected_file_roles:
+            added = actual_file_roles - expected_file_roles
+            missing = expected_file_roles - actual_file_roles
+            raise Refusal(
+                f"{scope} input file roles changed "
+                f"(direct -{sum(not role.startswith('runtime:') for role in missing)}"
+                f"/+{sum(not role.startswith('runtime:') for role in added)}, "
+                f"runtime -{sum(role.startswith('runtime:') for role in missing)}"
+                f"/+{sum(role.startswith('runtime:') for role in added)})"
+            )
         require(set(tree_paths) == set(expected["trees"]),
-                "consumer input tree roles changed")
+                f"{scope} input tree roles changed")
         require(all(
             expected["files"][name]["path"] == str(path)
             for name, path in file_paths.items()
-        ), "consumer input file paths changed")
+        ), f"{scope} input file paths changed")
         require(all(
             expected["trees"][name]["path"] == str(path)
             for name, path in tree_paths.items()
-        ), "consumer input tree paths changed")
+        ), f"{scope} input tree paths changed")
     for name, path in sorted(file_paths.items()):
         prior = None if expected is None else expected["files"][name]
         record, components = physical_file_record(
@@ -1172,7 +1184,8 @@ def discover_boot_input_paths(runtime, paths):
 def boot_input_state(runtime, paths, content=True, expected=None):
     file_paths, tree_paths = discover_boot_input_paths(runtime, paths)
     return record_input_paths(
-        file_paths, tree_paths, content=content, expected=expected)
+        file_paths, tree_paths, content=content, expected=expected,
+        scope="boot")
 
 
 def consumer_file_records(value):

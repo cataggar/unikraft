@@ -433,7 +433,11 @@ class Evidence(unittest.TestCase):
                 del forged["files"][role]
                 forged = rehash(forged)
                 with self.subTest(boot_omission=kind), \
-                        self.assertRaisesRegex(ci.Refusal, "roles changed"):
+                        self.assertRaisesRegex(
+                            ci.Refusal,
+                            "boot input file roles changed.*"
+                            + (r"direct -0/\+1"
+                               if kind == "boot" else r"runtime -0/\+1")):
                     ci.boot_input_state(
                         inputs, {"qemu": boot}, content=False,
                         expected=forged)
