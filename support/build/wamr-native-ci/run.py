@@ -730,27 +730,48 @@ def physical_tree_record(root, content=True, expected_content_sha256=None):
                         raise Refusal(symlink_reason) from error
                     with retained_absolute(
                             resolved, directory=target_is_directory,
-                            reason=symlink_reason) as (
+                            reason=symlink_reason + " target path") as (
                                 target_handle, target_directories, target_parent):
                         target_info = os.fstat(target_handle)
                         if target_is_directory:
                             require(
-                                stat.S_ISDIR(target_info.st_mode)
-                                and target_info.st_uid in (0, os.getuid())
-                                and not target_info.st_mode & 0o022
-                                and (resolved == root or root in resolved.parents),
-                                symlink_reason,
+                                stat.S_ISDIR(target_info.st_mode),
+                                symlink_reason + " target type",
+                            )
+                            require(
+                                target_info.st_uid in (0, os.getuid()),
+                                symlink_reason + " target owner",
+                            )
+                            require(
+                                not target_info.st_mode & 0o022,
+                                symlink_reason + " writable target",
+                            )
+                            require(
+                                resolved == root or root in resolved.parents,
+                                symlink_reason + " external directory",
                             )
                         else:
                             require(
-                                stat.S_ISREG(target_info.st_mode)
-                                and target_info.st_uid in (0, os.getuid())
-                                and target_info.st_nlink > 0
-                                and not target_info.st_mode & 0o022
-                                and target_info.st_size <= 512 * MIB
+                                stat.S_ISREG(target_info.st_mode),
+                                symlink_reason + " target type",
+                            )
+                            require(
+                                target_info.st_uid in (0, os.getuid()),
+                                symlink_reason + " target owner",
+                            )
+                            require(
+                                target_info.st_nlink > 0
                                 and (target_info.st_uid == 0
                                      or target_info.st_nlink == 1),
-                                symlink_reason,
+                                symlink_reason + " target links",
+                            )
+                            require(
+                                not target_info.st_mode & 0o022,
+                                symlink_reason + " writable target",
+                            )
+                            require(
+                                target_info.st_size <= 512 * MIB,
+                                symlink_reason + " target size",
                             )
                         target_identity = snapshot(target_info)
                         target_sha256 = (
