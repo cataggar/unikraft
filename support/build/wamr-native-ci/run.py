@@ -44,6 +44,7 @@ PACKAGE_MAX_FILE = 64 * MIB
 PACKAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,159}")
 SOURCE_OUTPUT_ROLES = (
     ".d",
+    ".zig-cache",
     "support/apps/wamr-aot/.config",
     "support/apps/wamr-aot/build",
 )
@@ -1241,10 +1242,13 @@ def prepare_source_outputs():
     output = APP / "build"
     config = APP / ".config"
     backup = APP / ".config.old"
+    cache = REPO / ".zig-cache"
     require(not output.exists() and not output.is_symlink()
             and not config.exists() and not config.is_symlink()
-            and not backup.exists() and not backup.is_symlink(),
+            and not backup.exists() and not backup.is_symlink()
+            and not cache.exists() and not cache.is_symlink(),
             "fresh precreated source output roots required")
+    cache.mkdir(mode=0o700)
     output.mkdir(mode=0o700)
     definition = read(APP / "defconfig", MIB)
     create_exact_copy(output / ".config", definition)

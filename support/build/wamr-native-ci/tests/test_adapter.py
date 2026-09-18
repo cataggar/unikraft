@@ -773,17 +773,30 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         app = self.root / "app"
         app.mkdir(mode=0o700)
         self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")
-        with mock.patch.object(ci, "APP", app):
+        repository = self.root / "repository"
+        repository.mkdir(mode=0o700)
+        cache = repository / ".zig-cache"
+        with mock.patch.object(ci, "APP", app), \
+                mock.patch.object(ci, "REPO", repository):
             self.put(app / ".config.old", b"stale\n")
             with self.assertRaisesRegex(ci.Refusal, "fresh precreated"):
                 ci.prepare_source_outputs()
             (app / ".config.old").unlink()
+            cache.mkdir(mode=0o700)
+            with self.assertRaisesRegex(ci.Refusal, "fresh precreated"):
+                ci.prepare_source_outputs()
+            cache.rmdir()
             ci.prepare_source_outputs()
+            self.assertTrue(cache.is_dir())
+            self.assertEqual(stat.S_IMODE(cache.stat().st_mode), 0o700)
+            root_before = ci.snapshot(repository.lstat())
             before = ci.snapshot(app.lstat())
             ci.require_no_config_backup()
             self.put(app / "build/.config",
                      b"CONFIG_FIXTURE=y\nCONFIG_SOLVED=y\n")
             self.assertEqual(ci.snapshot(app.lstat()), before)
+            self.put(cache / "child-cache-entry", b"cache\n")
+            self.assertEqual(ci.snapshot(repository.lstat()), root_before)
             ci.retain_solved_config()
             self.assertEqual(ci.snapshot(app.lstat()), before)
             self.assertEqual(

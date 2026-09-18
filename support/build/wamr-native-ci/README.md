@@ -65,7 +65,8 @@ independently hashes every tracked blob/symlink target against its Git object
 ID and binds every tracked parent directory's device/inode/type, ownership,
 links, size, mtime and ctime. Its bounded summary records file, directory and
 byte counts plus content and physical SHA256 values. The only role-excluded
-output roots are `.d`, `support/apps/wamr-aot/build`, and the precreated
+output roots are `.d`, the fail-closed precreated `.zig-cache`,
+`support/apps/wamr-aot/build`, and the precreated
 `support/apps/wamr-aot/.config`; Python bytecode is disabled. The same physical
 record is required around each build/boot consumer and at inspection/handoff,
 so a create/delete transient cannot be hidden by a finally clean Git status.
