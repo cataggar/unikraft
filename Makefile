@@ -738,7 +738,8 @@ GZIP		:= gzip
 TAR		:= tar
 UNZIP		:= unzip -qq -u
 GIT		:= git
-ifneq (,$(findstring Wget2,$(shell wget --version)))
+WGET_VERSION ?= $(shell wget --version)
+ifneq (,$(findstring Wget2,$(WGET_VERSION)))
 WGET := wget -q --force-progress --progress=bar
 else
 WGET := wget -q --show-progress --progress=bar

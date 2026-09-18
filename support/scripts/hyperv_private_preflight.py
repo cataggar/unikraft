@@ -158,9 +158,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "999712274d7af8422ae9143f378c8922b7cd01197754ccd67e4c6df4406ff04b"
+            "cd0e4198341d08429dceb1736f3dca7c653310a8fcdcaaa1a341f2edb1634ac7"
         ),
-        "size": 2066486,
+        "size": 2066738,
         "files": 226,
     },
     "support/kconfig": {
@@ -391,7 +391,7 @@ GUARDED_PRODUCER_FILES = {
         "31ad9392835d740c86f36c8801dc1d0973ee33c2a40ef6f758ecb8f65cc58d5f"
     ),
     "Makefile": (
-        "c790738ac50a85be2e7def288a32890a1c2703b9a148ffb2dd633d200305d562"
+        "6dd447ae720971d034a15960511cceaa05e109f7b239529d9568185c62f6e6e0"
     ),
     "Makefile.uk": (
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
@@ -586,7 +586,7 @@ GUARDED_PRODUCER_FILES = {
         "5a7e349ed5300c3fe0603740dfb34320e72de1ca3bffcab35e6fa9a728a9162c"
     ),
     "drivers/hyperv/netvsc/Makefile.uk": (
-        "4d3f452f93db4bf3f7f48618a6b5e4eb60e42808e258616d4170d7a1a9c6f636"
+        "452014b4e98da4bece34f18bc59b4fdbda46abf6a15627611580912fb31a81c4"
     ),
     "drivers/hyperv/netvsc/exportsyms.uk": (
         "664a748b4fabfa6a175994cfa828054b2d8626fd2efbe1227ba43a962b9a8571"
@@ -601,7 +601,7 @@ GUARDED_PRODUCER_FILES = {
         "4ee6997ebb98a63bf8cc39ac219e447c5bcec0b783140d2802ba19238711b12c"
     ),
     "drivers/hyperv/storvsc/Makefile.uk": (
-        "9ea0883afdb3e08df3110347df9a3917dbd602a151a302b6d3bceea02ec6b905"
+        "29cfdd7a324e52cc4ada63321311b34b6f119190c0afef38b55543165fba8dba"
     ),
     "drivers/hyperv/storvsc/exportsyms.uk": (
         "96d418ad387c2fa392afc96dfc8b1eb77cc20a0bcdb8a88fbd44038a5fdfa5de"
@@ -622,7 +622,7 @@ GUARDED_PRODUCER_FILES = {
         "05a880a38a10e130510fafbfa786f080d3da1413feb84ca7fc2a068c04a4d069"
     ),
     "drivers/hyperv/vmbus/Makefile.uk": (
-        "7622b3998629db41f2e1c8f8538872cf3efc64fff16e5832d0fb053ba2437a57"
+        "c25184fea66e2de8612bb39a49d3daeb13da68617a03cef066303583ba655763"
     ),
     "drivers/hyperv/vmbus/exportsyms.uk": (
         "f26fc7b7de9220cb994e4a81722bfa44e900c9ed84eefab480db9deedaf3a9bb"
@@ -655,7 +655,7 @@ GUARDED_PRODUCER_FILES = {
         "c5fe6226a426333e2119845366cac6c712b4258d8c7ead82980d7ac57c7c0505"
     ),
     "plat/hyperv/Makefile.uk": (
-        "672e146edc8058fce245a05e475564a89e634b2e41394625236a17167d7a08a4"
+        "5d88fbd2aa40331b421a76817533e3a00b3c2692dcb04acac05a562869418acb"
     ),
     "plat/hyperv/hyperv_runtime.zig": (
         "901a9caf76b33fa9990acdc061139553862caf394d1c78039cb71008262ec076"

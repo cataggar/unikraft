@@ -77,3 +77,14 @@ class NativeMakeEnvironment(unittest.TestCase):
                 command.call_args.kwargs["env"]["TMPDIR"],
                 str(state / "tmp"),
             )
+            for argument in (
+                    "-Dbison-command=/tools/bison",
+                    "-Dflex-command=/tools/flex",
+                    "-Dmake-arg=CP=/tools/cp -f",
+                    "-Dmake-arg=MKDIR=/tools/mkdir",
+                    "-Dmake-arg=READLINK=/tools/readlink",
+                    "-Dmake-arg=HOSTOSENV=Linux",
+                    "-Dmake-arg=WGET_VERSION=unavailable",
+                    "-Dmake-arg=WGET=false",
+                    "-Dmake-arg=ZIG=/tools/zig"):
+                self.assertIn(argument, args)

@@ -69,7 +69,7 @@ SOURCE_OUTPUT_DIRECTORY_ROLES = (
 )
 SOURCE_OUTPUT_FILE_ROLES = ("support/apps/wamr-aot/.config",)
 SOURCE_OUTPUT_PREEXISTING_DESCENDANT_ROLES = (".d",)
-INDIRECT_HOST_TOOLS = ("dash", "cp", "env", "readlink", "uname")
+INDIRECT_HOST_TOOLS = ("dash", "cp", "env", "mkdir", "readlink", "uname")
 HOST_TOOLS = (
     "git", "python3", "bash", "head", "timeout", *INDIRECT_HOST_TOOLS,
     "zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
