@@ -236,8 +236,9 @@ It accepts no runtime/output/operator-tree arguments. It checks the clean
 current CI revision/tree, clean pinned public `cataggar/wamr` SDK checkout,
 fixed workflow/job/run/attempt context and successful managed-runtime cleanup.
 The protected job builds and boots from the fixed private
-`/d/wamr-native-runtime` root, with the sealed Zig distribution beside it
-under `/d/wamr-native-tools`; this avoids mutable hosted-runner home
+`/d/wamr-ci/wamr-native-runtime` root, with the sealed Zig distribution
+beside it under `/d/wamr-ci/wamr-native-tools`; the root-owned `/d` boundary
+and precreated private `wamr-ci` directory avoid mutable hosted-runner home
 ancestors while retaining exact component custody. Its authenticated QEMU
 `libfdt` runtime is established before the build-input baseline and removed
 by exact recorded identity only after final handoff revalidation, so neither

@@ -23,9 +23,10 @@ GIT_INVENTORY_ARGS = (
 class ProductionSourceCustodyLimits(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        fixture_parent = Path("/d")
+        fixture_parent = Path("/d/wamr-ci")
         if fixture_parent.resolve(strict=True) != fixture_parent:
-            raise RuntimeError("production limit fixtures require canonical /d")
+            raise RuntimeError(
+                "production limit fixtures require canonical /d/wamr-ci")
         cls.fixture = fixture_parent / (
             f"wamr-native-ci-source-custody-limits-{os.getpid()}"
         )
@@ -35,9 +36,9 @@ class ProductionSourceCustodyLimits(unittest.TestCase):
     @classmethod
     def _remove_fixture(cls):
         expected = Path(
-            f"/d/wamr-native-ci-source-custody-limits-{os.getpid()}"
+            f"/d/wamr-ci/wamr-native-ci-source-custody-limits-{os.getpid()}"
         )
-        if cls.fixture != expected or cls.fixture.parent != Path("/d"):
+        if cls.fixture != expected or cls.fixture.parent != Path("/d/wamr-ci"):
             raise RuntimeError("refusing non-PID-scoped fixture cleanup")
         if cls.fixture.exists():
             shutil.rmtree(cls.fixture)

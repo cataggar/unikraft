@@ -356,10 +356,11 @@ class Evidence(unittest.TestCase):
                 ci.REPO / ".d/wamr-native-runtime",
             )
         with mock.patch.dict(
-                os.environ, {"WAMR_CI_RUNTIME": "/d/wamr-native-runtime"}):
+                os.environ,
+                {"WAMR_CI_RUNTIME": "/d/wamr-ci/wamr-native-runtime"}):
             self.assertEqual(
                 public_bundle.ci_runtime(runtime_owner),
-                Path("/d/wamr-native-runtime"),
+                Path("/d/wamr-ci/wamr-native-runtime"),
             )
         with mock.patch.dict(
                 os.environ, {"WAMR_CI_RUNTIME": "/d/other-runtime"}), \

@@ -406,7 +406,7 @@ def context(value):
 def ci_runtime(ci):
     default = ci.REPO / ".d/wamr-native-runtime"
     selected = Path(os.environ.get("WAMR_CI_RUNTIME", str(default)))
-    require(selected in (default, Path("/d/wamr-native-runtime")))
+    require(selected in (default, Path("/d/wamr-ci/wamr-native-runtime")))
     return selected
 
 
@@ -643,7 +643,7 @@ def publication_records(handoff, stage, source):
         runtime = path.parent.parent
         require(runtime in (
             ci.REPO / ".d/wamr-native-runtime",
-            Path("/d/wamr-native-runtime"),
+            Path("/d/wamr-ci/wamr-native-runtime"),
         ))
         require(cfg == ci.config_for(runtime, runtime / "compute", ci.MODES.index(mode)))
         if request["schema_version"] == 2:
