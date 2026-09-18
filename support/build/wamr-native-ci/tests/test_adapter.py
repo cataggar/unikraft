@@ -880,6 +880,11 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         with self.assertRaisesRegex(ci.Refusal, "already exists"):
             ci.create_exact_copy(link, b"replacement")
         self.assertEqual(existing.read_bytes(), b"original")
+        large = directory / "large"
+        payload = b"x" * (ci.MIB + 1)
+        record = ci.create_exact_copy(large, payload)
+        self.assertEqual(record["bytes"], len(payload))
+        self.assertEqual(large.read_bytes(), payload)
 
     def test_restore_rejects_manifest_swap_restore_before_zig_returns(self):
         root = self.root / "restore-swap"

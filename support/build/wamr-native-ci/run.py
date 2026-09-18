@@ -1901,7 +1901,7 @@ def create_exact_copy(path, data):
         copied = snapshot(os.fstat(handle))
     finally:
         os.close(handle)
-    require(read(path, MIB) == data and snapshot(path.lstat()) == copied,
+    require(read(path, len(data)) == data and snapshot(path.lstat()) == copied,
             "dependency manifest copy changed")
     return {
         "bytes": len(data),
