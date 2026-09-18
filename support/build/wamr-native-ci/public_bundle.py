@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Explicit public-source tiny CI bundle; no arbitrary private export or authority."""
 import copy
+import contextlib
 import hashlib
 import json
 import os
@@ -480,6 +481,44 @@ def regular(path):
     return info
 
 
+@contextlib.contextmanager
+def retained_archive(handoff, archive, expected_archive_sha256):
+    archive = Path(archive)
+    require(archive.is_absolute() and handoff.ci.canonical(archive))
+    with handoff.ci.retained_absolute(
+            archive, reason="public-source bundle refused") as (
+                handle, directories, parent):
+        del directories, parent
+        info = os.fstat(handle)
+        require(
+            stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+            and info.st_uid in (0, os.getuid()) and not info.st_mode & 0o022
+            and 0 < info.st_size <= MAX_TOTAL
+        )
+        before = handoff.ci.snapshot(info)
+        archive_sha256 = handoff.ci.digest_descriptor(
+            handle, info, MAX_TOTAL, "public-source bundle refused")
+        if expected_archive_sha256 is not None:
+            require(archive_sha256 == expected_archive_sha256)
+        try:
+            yield handle, archive_sha256
+        finally:
+            require(handoff.ci.snapshot(os.fstat(handle)) == before)
+
+
+@contextlib.contextmanager
+def descriptor_zip(handle):
+    duplicate = os.dup(handle)
+    try:
+        with os.fdopen(duplicate, "rb") as source:
+            duplicate = -1
+            with zipfile.ZipFile(source) as zipped:
+                yield zipped
+    finally:
+        if duplicate >= 0:
+            os.close(duplicate)
+
+
 def inspect_tree(root, expected):
     found = set()
     directories = {str(Path(name).parent) for name in expected}
@@ -532,7 +571,7 @@ def native(handoff, validator, bundle):
     require(handoff.ci.read(output, 4096)
             == b"Compute handoff revalidated; authority=not_admitted.\n")
     handoff.ci.record_input_paths(
-        {}, {}, content=True, expected=validator_input)
+        {"validator": validator}, {}, content=True, expected=validator_input)
 
 
 def require_consumer_tree_roles(value, legacy):
@@ -737,20 +776,15 @@ def pack(handoff, stage, archive, source, validator):
     return archive_sha256
 
 
-def verify_archive(handoff, archive, expected, expected_archive_sha256):
+def verify_archive_descriptor(handoff, handle, expected,
+                              expected_archive_sha256):
     context(expected)
     if expected_archive_sha256 is None:
         require((expected["source_revision"], expected["source_tree"])
                 in LEGACY_V1_SOURCES)
     else:
         digest_string(expected_archive_sha256)
-    info = regular(archive)
-    require(0 < info.st_size <= MAX_TOTAL)
-    before = handoff.ci.snapshot(info)
-    if expected_archive_sha256 is not None:
-        require(handoff.ci.digest(archive, MAX_TOTAL) == expected_archive_sha256
-                and handoff.ci.snapshot(regular(archive)) == before)
-    with zipfile.ZipFile(archive) as zipped:
+    with descriptor_zip(handle) as zipped:
         entries = zipped.infolist()
         require(2 < len(entries) <= MAX_MEMBERS and not zipped.comment)
         names = {info.filename for info in entries}
@@ -791,31 +825,56 @@ def verify_archive(handoff, archive, expected, expected_archive_sha256):
         if expected_archive_sha256 is None:
             start = decode(zipped.read("evidence/build-start.json"))
             require("dependencies" not in start)
-    require(handoff.ci.snapshot(regular(archive)) == before)
+    return bundle
+
+
+def verify_archive_with_digest(
+        handoff, archive, expected, expected_archive_sha256):
+    context(expected)
+    if expected_archive_sha256 is not None:
+        digest_string(expected_archive_sha256)
+    with retained_archive(
+            handoff, archive, expected_archive_sha256) as (
+                handle, archive_sha256):
+        bundle = verify_archive_descriptor(
+            handoff, handle, expected, expected_archive_sha256)
+    return bundle, archive_sha256
+
+
+def verify_archive(handoff, archive, expected, expected_archive_sha256):
+    bundle, unused_archive_sha256 = verify_archive_with_digest(
+        handoff, archive, expected, expected_archive_sha256)
+    del unused_archive_sha256
     return bundle
 
 
 def import_bundle(
         handoff, archive, output, expected, expected_archive_sha256, validator):
     handoff.private(output.parent)
-    bundle = verify_archive(
-        handoff, archive, expected, expected_archive_sha256)
-    before = handoff.ci.snapshot(regular(archive))
-    output.mkdir(mode=0o700)
-    with zipfile.ZipFile(archive) as zipped:
-        for name, item in members(handoff, bundle).items():
-            path = output / name
-            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with zipped.open(name) as src, path.open("xb") as dst:
-                os.fchmod(dst.fileno(), 0o600)
-                copy_checked(src, dst, item)
-                dst.flush()
-                os.fsync(dst.fileno())
-            path.chmod(0o600)
-        for name in ("bundle.json", "public-source.json"):
-            handoff.ci.save(output / ("portable-bundle.json" if name == "bundle.json" else name),
-                            decode(zipped.read(name)))
-    require(handoff.ci.snapshot(regular(archive)) == before)
+    with retained_archive(
+            handoff, archive, expected_archive_sha256) as (
+                handle, unused_archive_sha256):
+        del unused_archive_sha256
+        bundle = verify_archive_descriptor(
+            handoff, handle, expected, expected_archive_sha256)
+        output.mkdir(mode=0o700)
+        with descriptor_zip(handle) as zipped:
+            for name, item in members(handoff, bundle).items():
+                path = output / name
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                with zipped.open(name) as src, path.open("xb") as dst:
+                    os.fchmod(dst.fileno(), 0o600)
+                    copy_checked(src, dst, item)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                path.chmod(0o600)
+            for name in ("bundle.json", "public-source.json"):
+                handoff.ci.save(
+                    output / (
+                        "portable-bundle.json"
+                        if name == "bundle.json" else name),
+                    decode(zipped.read(name)),
+                )
     for item in members(handoff, bundle).values():
         item["path"] = str(output / item["path"])
     publication_records(handoff, output, expected)
@@ -865,4 +924,4 @@ def publish_ci(handoff):
         source, archive_sha256, validator)
     handoff.FAILURE_STAGE = "public-final-context"
     require(ci_context(handoff) == source)
-    return archive
+    return archive, archive_sha256, source["source_tree"]

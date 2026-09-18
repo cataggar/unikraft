@@ -3,8 +3,9 @@
 Refs #156. `wamr-native-compute.yaml` is an **additive ordinary
 `pull_request` job**, including the native integration's stacked base.
 It has only `contents: read`, a GitHub-hosted Ubuntu 24.04 x86 runner, no
-protected environment, no dispatch, no cloud identity and no upload/deployment
-entry. All existing required contexts, default images and safety gates stay
+protected environment, no dispatch, no cloud identity and no deployment
+entry. Its only uploads are the bounded Actions artifacts described below.
+All existing required contexts, default images and safety gates stay
 unchanged. This does not complete #88's guarded Azure authority or image handoff.
 
 The job builds the distinct `hyperv-x86_64-efi-wamr` target using the
@@ -78,9 +79,11 @@ walks every allowed root without following links and rejects escaping links,
 hard-linked or nonregular files, unsafe root/directory ownership or modes, path
 or depth excess, and changes during inspection. Regular-file modes remain
 physical metadata and are separately enforced for every consumed dependency or
-tool input. Python bytecode is disabled. The same physical record is required
-around each build/boot consumer and at inspection/handoff, so a create/delete
-transient cannot be hidden by a finally clean Git status.
+tool input. Python bytecode is disabled. The same physical/content snapshots
+are required immediately before and after each build/boot consumer and again
+at inspection/handoff. This detects accidental mutation and mutation that
+persists across an observation boundary; it is not continuous isolation from
+a hostile same-UID process between those checks.
 
 `build-start.json` now carries
 `uk.wamr.consumer-input-custody` version 2. It inventories each selected host
@@ -88,11 +91,13 @@ tool and dynamic runtime object plus the bounded Zig, LLVM,
 Python-standard-library and authenticated Bison data trees. The selected tools
 include the exact indirect shell/coreutils executables used by the native build
 graph (`dash`, `cp`, `env`, `mkdir`, `readlink` and `uname`) rather than
-unrelated `/usr/bin` members. Native Make receives retained descriptor paths
-for Zig, Python and its consumed copy/directory/readlink helpers; the Zig-owned
-link and post-processing graph receives the retained compiler, binutils,
-readelf and copy paths and uses the objcopy interface for descriptor-safe
-stripping. The hosted workflow first materializes the pinned Zig distribution
+unrelated `/usr/bin` members. Selected executable invocations use retained
+descriptor paths for Zig, Python, compiler/binutils and the recorded helper
+tools. Data trees, package paths and other pathname inputs remain path-based
+and are protected by their physical/content snapshots immediately before and
+after consumption; custody does not claim arbitrary pathname data is read
+through retained descriptors. The post-processing graph uses the objcopy
+interface for descriptor-safe stripping. The hosted workflow first materializes the pinned Zig distribution
 create-only beneath the owned ignored `.d` tool root, avoiding mutable
 runner-managed ancestor directories. Native Make's unused Wget version probe is disabled by a fixed
 offline build-contract value. Every record binds device/inode,
@@ -105,11 +110,11 @@ existing target ancestor is root-owned and cannot be modified by the build
 principal; the missing suffix and ancestor identity are part of the record.
 The pinned WAMR checkout is consumed only while creating a fixed-revision Git
 archive through retained repository and Git descriptors; all later WAMR build
-steps read the create-only archived object. Top-level build tools execute
-through retained no-follow descriptors. Build scripts receive those same
-retained descriptor paths through closed adapter variables, while `PATH` is
-restricted to the root-owned system directory containing the separately
-recorded indirect executables. Tool/data and Miz-tree lookups are physically revalidated
+steps use the create-only archived object by its recorded pathname. Top-level
+build-tool executables use retained no-follow descriptors and closed adapter
+variables, while `PATH` is restricted to the root-owned system directory
+containing the separately recorded indirect executables. Tool/data and
+Miz-tree lookups are physically revalidated
 immediately before and after each consumer and fully rehashed at final
 inspection and export. Consumer subprocesses use adapter-owned
 cache/configuration paths; ambient loader, shell-startup, Python, Make and Zig
@@ -147,7 +152,10 @@ package/root/file/directory/byte counts, per-package
 content/physical/manifests, and aggregate closure, physical, manifest,
 hash-verification and root-metadata SHA256 values. Limits
 are 128 roots, 16,384 entries, 256 MiB total, 64 MiB per file, depth 64 and
-4 MiB per manifest. Both builds use that one tree through `--system`; it is
+4 MiB per manifest. Restore-root, package-root, package-tree and directory
+inventory scans enumerate at most the remaining budget plus the first excess
+entry before sorting, and always close their iterators. Both builds use that
+one tree through `--system`; it is
 revalidated around every consumer and at final inspection/export. No
 package-manager state is created below tracked source. The ignored-source
 policy allows at most 131,072 entries, 8 GiB total regular-file/link bytes,
@@ -157,12 +165,15 @@ parsing. Failure diagnostics use a separately terminated-and-drained 1-MiB Git
 status capture, retain at most 128 ignored paths, and refuse immediately on the
 129th repository-root entry before sorting the bounded collection.
 The subprocess collector gives termination, kill and post-kill/post-leader
-pipe draining separate absolute one-second budgets. Escaped `setsid()`
-descendants therefore cannot keep a captured pipe open indefinitely; the
-collector closes the pipe at its absolute drain deadline and always reaps the
-leader while preserving the original overflow, timeout or command-failure
-lane. Git runs with system/global configuration, hooks, credential helpers,
-replacement objects, terminal prompts and pagers disabled where applicable.
+pipe draining separate absolute one-second budgets. An escaped `setsid()`
+descendant cannot keep this collector waiting indefinitely because the pipe is
+closed at the absolute drain deadline, but standard descendant supervision is
+still a prerequisite for closing the escaped-process lifetime gap. That
+separate prerequisite remains pending; this lane does not add a
+success-shaped production exception or manual cleanup contract. Git runs with
+system/global configuration, hooks, repository fsmonitor helpers, credential
+helpers, replacement objects, terminal prompts and pagers disabled where
+applicable.
 Build commands use `-j2`; the workflow has a 60-minute ceiling. Each build
 command has a fixed deadline and an 8-MiB log limit (one extra byte detects
 overflow). The native packaging worker retains its 120-second deadline and
@@ -255,7 +266,10 @@ the legacy in-worktree runtime.
 After all four genuine boots, while the complete runner files still exist,
 the workflow invokes the production private export and native handoff checker,
 then copies only its closed image/local-evidence allowlist into a standalone
-ZIP. It reopens, re-extracts and natively reconciles the ZIP before upload.
+ZIP. Verification hashes and parses one retained no-follow archive descriptor;
+import extracts through another duplicate of that same descriptor and requires
+the final descriptor identity to match. The workflow natively reconciles the
+ZIP before upload.
 
 Artifact name:
 `wamr-public-source-tiny-RUN_ID-RUN_ATTEMPT-SOURCE_SHA`.
@@ -278,6 +292,17 @@ checked.
 Symlinks/hardlinks, duplicate/extra/absolute/traversal members, compression,
 oversize inputs and known credential/account/approval patterns are refused.
 
+The final upload copy is create-only in a dedicated root-owned, group-readable
+directory. `actions/upload-artifact@v4` retains its artifact ID, URL and
+container digest. The latter is explicitly an Actions-container digest and is
+never compared with the inner ZIP digest. A later trusted step downloads that
+exact artifact ID into a fresh private directory, requires exactly the one
+regular `tiny-aot-public-source.zip` member, and verifies it through the same
+retained-descriptor archive API against the pre-upload inner digest. Only that
+successful comparison publishes the job outputs and summary containing the
+inner ZIP digest, separate container digest, artifact ID/URL, run ID/attempt
+and source SHA. No attestation or OIDC permission is added.
+
 There are **no Azure credentials, subscription/VM identities, SAS, grants,
 approval files, campaign state, raw command logs or private diagnostics** in
 the allowlist. Public tiny local serial is expressly authorized here; it is
@@ -294,9 +319,10 @@ not authorize public export from the private operator CLI and supplies no
 Azure permission, measurement or acceptance.
 
 Download and import as described in the operator documentation. Current
-imports require an independently selected SHA256 of the complete ZIP from the
-successful workflow summary or an independently verified attestation subject;
-computing the expected value from the downloaded ZIP is not a trust decision.
+imports require the independently selected inner-ZIP SHA256 from the
+successful exact-artifact redownload summary/output; the Actions container
+digest is separate and is not an acceptable substitute. Computing the expected
+value from a later downloaded ZIP is not a trust decision.
 The exact expected source commit and tree must also be available in the local
 Git object database. The importer resolves both dependency manifests from that
 tree and compares their blob OIDs, bytes and SHA256 values, then recomputes

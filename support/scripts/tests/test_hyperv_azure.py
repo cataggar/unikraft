@@ -2734,7 +2734,7 @@ class HypervWorkflowTest(unittest.TestCase):
         ):
             self.assertIn(f"refuse {refusal}", driver)
 
-    def test_wamr_public_bundle_uses_external_archive_digest(self):
+    def test_wamr_public_bundle_binds_exact_redownloaded_artifact(self):
         repository = SUPPORT.parent
         workflow = (
             repository / ".github/workflows/wamr-native-compute.yaml"
@@ -2744,16 +2744,64 @@ class HypervWorkflowTest(unittest.TestCase):
             1,
         )[1].split("- name:", 1)[0]
         self.assertIn(
-            'sha256sum -- "${archive}" | cut -d \' \' -f 1',
+            "Public source archive SHA-256:",
             publication,
         )
-        self.assertIn("Archive SHA-256:", publication)
-        self.assertIn("GITHUB_STEP_SUMMARY", publication)
+        self.assertIn("verify-public-source-bundle", publication)
+        self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", publication)
+        self.assertIn("os.fchown(destination_fd, 0, int(group))", publication)
+        self.assertIn("os.fchmod(destination_fd, 0o440)", publication)
+        self.assertNotIn("sha256sum", publication)
+        self.assertNotIn("GITHUB_STEP_SUMMARY", publication)
+        upload = workflow.split(
+            "Publish only the standalone verified public-source image archive",
+            1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn("id: public_upload", upload)
+        self.assertIn("actions/upload-artifact@v4", upload)
+        self.assertIn(
+            "path: ${{ steps.public_bundle.outputs.upload_file }}", upload)
+        download = workflow.split(
+            "Redownload only the uploaded public-source artifact ID", 1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn("actions/download-artifact@v4", download)
+        self.assertIn(
+            "artifact-ids: ${{ steps.public_upload.outputs.artifact-id }}",
+            download,
+        )
+        reserve = workflow.split(
+            "Reserve the exact-artifact redownload destination", 1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn("os.mkdir(destination, 0o700)", reserve)
+        self.assertIn("stat.S_IMODE(info.st_mode) != 0o700", reserve)
+        binding = workflow.split(
+            "Bind and publish the redownloaded inner public-source ZIP", 1,
+        )[1].split("- name:", 1)[0]
+        for required in (
+                "unexpected exact-artifact download members",
+                "downloaded inner ZIP is not one regular file",
+                "verify-public-source-bundle",
+                'test "${downloaded_sha256}" = "${INNER_ZIP_SHA256}"',
+                "Artifact container digest:",
+                "Artifact ID:",
+                "Artifact URL:",
+                "GITHUB_STEP_SUMMARY",
+                "GITHUB_OUTPUT"):
+            self.assertIn(required, binding)
+        self.assertNotIn("id-token:", workflow)
+        self.assertLess(
+            workflow.index("actions/download-artifact@v4"),
+            workflow.index("GITHUB_STEP_SUMMARY"),
+        )
         handoff = (
             repository / "support/build/wamr-native-ci/handoff.py"
         ).read_text()
         self.assertIn(
             'imp.add_argument("--expected-archive-sha256")',
+            handoff,
+        )
+        self.assertIn(
+            'verify.add_argument("--expected-archive-sha256", required=True)',
             handoff,
         )
         operator = (

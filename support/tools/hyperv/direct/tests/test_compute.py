@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Existing native fake backend only. These are synthetic, non-cloud observations."""
 import copy
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -785,8 +786,7 @@ class Compute(unittest.TestCase):
             image={key: package["image"][key] for key in (
                 "schema_version", "miz_revision", "efi", "raw", "vhd",
                 "footer_sha256", "packaging")}))
-        boot_inputs = ci.record_input_paths(
-            tools, {"qemu-data": runtime / "bin/share"})
+        boot_inputs = ci.boot_input_state(runtime, tools)
         write(root / "evidence/boot-inputs.json", boot_inputs)
         observation = dict(result(), **{
             key + "_sha256": files[name] for key, name in (
@@ -900,6 +900,8 @@ class Compute(unittest.TestCase):
             handoff, archive, source, archive_sha256)
         with self.assertRaises(ValueError):
             public_bundle.verify_archive(handoff, archive, source, None)
+        self.public_archive_descriptor_races(
+            archive, source, archive_sha256)
         selected = public_bundle.members(handoff, portable)
         self.assertEqual(len(public_bundle.EVIDENCE), 20)
         self.assertNotIn("command-dependency-restore.json", public_bundle.EVIDENCE)
@@ -1328,6 +1330,140 @@ class Compute(unittest.TestCase):
             public_bundle.pack(
                 handoff, unrelated_stage, self.root / "unrelated-v1.zip",
                 unrelated_source, VALIDATOR)
+
+    def public_archive_descriptor_races(
+            self, archive, source, archive_sha256):
+        link = self.root / "public-archive-link.zip"
+        link.symlink_to(archive)
+        with self.assertRaises(ValueError):
+            public_bundle.verify_archive(
+                handoff, link, source, archive_sha256)
+
+        original_descriptor_zip = public_bundle.descriptor_zip
+
+        @contextlib.contextmanager
+        def swapped_before_parse(handle):
+            saved = self.root / "public-archive-saved.zip"
+            archive.rename(saved)
+            write(archive, b"substituted archive")
+            try:
+                with original_descriptor_zip(handle) as zipped:
+                    yield zipped
+            finally:
+                archive.unlink()
+                saved.rename(archive)
+
+        with mock.patch.object(
+                public_bundle, "descriptor_zip",
+                side_effect=swapped_before_parse), \
+                self.assertRaises(ValueError):
+            public_bundle.verify_archive(
+                handoff, archive, source, archive_sha256)
+
+        calls = 0
+
+        @contextlib.contextmanager
+        def swapped_before_extract(handle):
+            nonlocal calls
+            calls += 1
+            saved = self.root / "public-archive-extract-saved.zip"
+            if calls == 2:
+                archive.rename(saved)
+                write(archive, b"substituted archive")
+            try:
+                with original_descriptor_zip(handle) as zipped:
+                    yield zipped
+            finally:
+                if calls == 2:
+                    archive.unlink()
+                    saved.rename(archive)
+
+        output = self.root / "descriptor-race-import"
+        with mock.patch.object(
+                public_bundle, "descriptor_zip",
+                side_effect=swapped_before_extract), \
+                self.assertRaises(ValueError):
+            public_bundle.import_bundle(
+                handoff, archive, output, source, archive_sha256, VALIDATOR)
+        self.assertFalse((output / "bundle.json").exists())
+
+        @contextlib.contextmanager
+        def swapped_and_restored_inode(handle):
+            saved = self.root / "public-archive-inode-saved.zip"
+            replacement = self.root / "public-archive-inode-replacement.zip"
+            archive.rename(saved)
+            write(replacement, b"replacement")
+            replacement.rename(archive)
+            archive.unlink()
+            saved.rename(archive)
+            with original_descriptor_zip(handle) as zipped:
+                yield zipped
+
+        with mock.patch.object(
+                public_bundle, "descriptor_zip",
+                side_effect=swapped_and_restored_inode), \
+                self.assertRaises(ValueError):
+            public_bundle.verify_archive(
+                handoff, archive, source, archive_sha256)
+
+        backup = self.root / "public-archive-race-backup.zip"
+        shutil.copyfile(archive, backup)
+        backup.chmod(0o600)
+        for operation in ("truncate", "mutate"):
+            @contextlib.contextmanager
+            def changed_open_inode(handle):
+                if operation == "truncate":
+                    os.truncate(archive, archive.stat().st_size - 1)
+                else:
+                    with archive.open("r+b") as stream:
+                        stream.seek(0)
+                        stream.write(b"X")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                with original_descriptor_zip(handle) as zipped:
+                    yield zipped
+
+            try:
+                with self.subTest(open_inode=operation), \
+                        mock.patch.object(
+                            public_bundle, "descriptor_zip",
+                            side_effect=changed_open_inode), \
+                        self.assertRaises((ValueError, zipfile.BadZipFile)):
+                    public_bundle.verify_archive(
+                        handoff, archive, source, archive_sha256)
+            finally:
+                shutil.copyfile(backup, archive)
+                archive.chmod(0o600)
+        backup.unlink()
+
+        duplicated = []
+        original_dup = os.dup
+
+        def tracked_dup(handle):
+            duplicate = original_dup(handle)
+            duplicated.append(duplicate)
+            return duplicate
+
+        with mock.patch.object(public_bundle.os, "dup", side_effect=tracked_dup):
+            public_bundle.verify_archive(
+                handoff, archive, source, archive_sha256)
+        self.assertTrue(duplicated)
+        for handle in duplicated:
+            with self.assertRaises(OSError):
+                os.fstat(handle)
+        duplicated.clear()
+        with mock.patch.object(
+                public_bundle.os, "dup", side_effect=tracked_dup), \
+                mock.patch.object(
+                    public_bundle.zipfile, "ZipFile",
+                    side_effect=zipfile.BadZipFile("fixture")), \
+                self.assertRaises(zipfile.BadZipFile):
+            public_bundle.verify_archive(
+                handoff, archive, source, archive_sha256)
+        self.assertTrue(duplicated)
+        for handle in duplicated:
+            with self.assertRaises(OSError):
+                os.fstat(handle)
 
     def test_public_export_has_no_arbitrary_private_tree_mode(self):
         with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):

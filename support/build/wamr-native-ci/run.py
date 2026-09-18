@@ -374,14 +374,20 @@ def git_environment():
     }
 
 
-def git_command(*args):
+def git_arguments(*args):
     return [
-        tool("git"), "--no-pager",
+        "--no-pager",
         "-c", "core.hooksPath=/dev/null",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.fsmonitorHookVersion=",
         "-c", "credential.helper=",
         "-c", "core.pager=cat",
         *args,
     ]
+
+
+def git_command(*args):
+    return [tool("git"), *git_arguments(*args)]
 
 
 def command_environment(root, input_records=None, extra=None):
@@ -424,6 +430,25 @@ def git_raw(repository, *args):
         timeout_reason="Git command timed out",
         failure_reason="Git command failed",
     )
+
+
+def bounded_scandir(directory, limit, limit_reason, failure_reason):
+    require(type(limit) is int and limit >= 0, limit_reason)
+    entries = []
+    try:
+        iterator = os.scandir(directory)
+    except OSError as error:
+        raise Refusal(failure_reason) from error
+    try:
+        for entry in iterator:
+            require(len(entries) < limit, limit_reason)
+            entries.append(entry)
+    except OSError as error:
+        raise Refusal(failure_reason) from error
+    finally:
+        iterator.close()
+    entries.sort(key=lambda entry: entry.name)
+    return entries
 
 
 @contextlib.contextmanager
@@ -610,19 +635,13 @@ def physical_tree_record(root, content=True, expected_content_sha256=None):
                     <= INPUT_TREE_MAX_ENTRIES,
                     "physical input tree entry limit exceeded")
             bind(physical_hash, ["directory", prefix, snapshot(before)])
-            try:
-                entries = []
-                with os.scandir(directory_handle) as iterator:
-                    for entry in iterator:
-                        entries.append(entry)
-                        require(
-                            files + directories_count + symlinks
-                            + len(entries) <= INPUT_TREE_MAX_ENTRIES,
-                            "physical input tree entry limit exceeded",
-                        )
-                entries.sort(key=lambda entry: entry.name)
-            except OSError as error:
-                raise Refusal("physical input tree enumeration failed") from error
+            entries = bounded_scandir(
+                directory_handle,
+                INPUT_TREE_MAX_ENTRIES
+                - files - directories_count - symlinks,
+                "physical input tree entry limit exceeded",
+                "physical input tree enumeration failed",
+            )
             for entry in entries:
                 name = entry.name
                 require(name not in ("", ".", "..") and "/" not in name
@@ -994,28 +1013,66 @@ def require_input_directories(components, expected, reason):
             raise Refusal(f"{reason} at ancestor-{distance}")
 
 
+def canonical_input_paths(paths, reason):
+    result = {}
+    for name, path in paths.items():
+        require(isinstance(name, str) and name, reason)
+        path = Path(path)
+        require(path.is_absolute() and canonical(path), reason)
+        result[name] = path
+    return result
+
+
 def record_input_paths(file_paths, tree_paths, content=True, expected=None):
+    file_paths = canonical_input_paths(
+        file_paths, "invalid consumer input file discovery")
+    tree_paths = canonical_input_paths(
+        tree_paths, "invalid consumer input tree discovery")
     files = {}
     trees = {}
     directories = {}
     if expected is not None:
         require(
             isinstance(expected, dict)
+            and set(expected) == {
+                "schema", "version", "files", "trees", "directories",
+                "aggregate_sha256",
+            }
             and expected.get("schema") == "uk.wamr.consumer-input-custody"
             and expected.get("version") == 2
             and isinstance(expected.get("files"), dict)
             and isinstance(expected.get("trees"), dict)
-            and isinstance(expected.get("directories"), dict),
+            and isinstance(expected.get("directories"), dict)
+            and isinstance(expected.get("aggregate_sha256"), str)
+            and all(
+                isinstance(record, dict)
+                and set(record) == {"path", "metadata", "sha256"}
+                and isinstance(record["path"], str)
+                for record in expected["files"].values()
+            )
+            and all(
+                isinstance(record, dict)
+                and set(record) == {
+                    "path", "files", "directories", "symlinks", "bytes",
+                    "content_sha256", "physical_sha256",
+                }
+                and isinstance(record["path"], str)
+                for record in expected["trees"].values()
+            ),
             "invalid consumer input custody",
         )
-        file_paths = {
-            name: Path(record["path"])
-            for name, record in expected["files"].items()
-        }
-        tree_paths = {
-            name: Path(record["path"])
-            for name, record in expected["trees"].items()
-        }
+        require(set(file_paths) == set(expected["files"]),
+                "consumer input file roles changed")
+        require(set(tree_paths) == set(expected["trees"]),
+                "consumer input tree roles changed")
+        require(all(
+            expected["files"][name]["path"] == str(path)
+            for name, path in file_paths.items()
+        ), "consumer input file paths changed")
+        require(all(
+            expected["trees"][name]["path"] == str(path)
+            for name, path in tree_paths.items()
+        ), "consumer input tree paths changed")
     for name, path in sorted(file_paths.items()):
         prior = None if expected is None else expected["files"][name]
         record, components = physical_file_record(
@@ -1058,10 +1115,8 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None):
     return result
 
 
-def consumer_input_state(runtime, content=True, expected=None):
+def discover_consumer_input_paths(runtime):
     runtime = Path(runtime)
-    if expected is not None:
-        return record_input_paths({}, {}, content=content, expected=expected)
     tool_paths = {name: Path(tool(name)) for name in HOST_TOOLS}
     runtime_paths = set()
     for path in tool_paths.values():
@@ -1081,12 +1136,21 @@ def consumer_input_state(runtime, content=True, expected=None):
     archive = runtime / "custody/wamr-source.tar"
     if archive.is_file() and not archive.is_symlink():
         file_paths["wamr-source-archive"] = archive
-    return record_input_paths(file_paths, tree_paths, content=content)
+    return (
+        canonical_input_paths(
+            file_paths, "invalid consumer input file discovery"),
+        canonical_input_paths(
+            tree_paths, "invalid consumer input tree discovery"),
+    )
 
 
-def boot_input_state(runtime, paths, content=True, expected=None):
-    if expected is not None:
-        return record_input_paths({}, {}, content=content, expected=expected)
+def consumer_input_state(runtime, content=True, expected=None):
+    file_paths, tree_paths = discover_consumer_input_paths(runtime)
+    return record_input_paths(
+        file_paths, tree_paths, content=content, expected=expected)
+
+
+def discover_boot_input_paths(runtime, paths):
     file_paths = dict(paths)
     runtime_paths = set()
     for path in paths.values():
@@ -1095,11 +1159,20 @@ def boot_input_state(runtime, paths, content=True, expected=None):
     file_paths.update({
         f"runtime:{path}": path for path in sorted(runtime_paths)
     })
-    tree_paths = {}
     qemu_data = Path(runtime) / "bin/share"
-    if qemu_data.is_dir() and not qemu_data.is_symlink():
-        tree_paths["qemu-data"] = qemu_data
-    return record_input_paths(file_paths, tree_paths, content=content)
+    tree_paths = {"qemu-data": qemu_data}
+    return (
+        canonical_input_paths(
+            file_paths, "invalid boot input file discovery"),
+        canonical_input_paths(
+            tree_paths, "invalid boot input tree discovery"),
+    )
+
+
+def boot_input_state(runtime, paths, content=True, expected=None):
+    file_paths, tree_paths = discover_boot_input_paths(runtime, paths)
+    return record_input_paths(
+        file_paths, tree_paths, content=content, expected=expected)
 
 
 def consumer_file_records(value):
@@ -1195,21 +1268,13 @@ def source_output_role(relative, roles):
 def bounded_directory_paths(directory, parent, existing, limit, limit_reason,
                             path_reason):
     paths = []
-    try:
-        iterator = os.scandir(directory)
-    except OSError as error:
-        raise Refusal(path_reason) from error
-    try:
-        for entry in iterator:
-            relative = entry.name if not parent else parent + "/" + entry.name
-            path = normalized_repository_relative(relative, path_reason)
-            require(existing + len(paths) < limit, limit_reason)
-            paths.append((entry.name, path))
-    except OSError as error:
-        raise Refusal(path_reason) from error
-    finally:
-        iterator.close()
-    return sorted(paths, key=lambda item: item[0])
+    require(existing <= limit, limit_reason)
+    for entry in bounded_scandir(
+            directory, limit - existing, limit_reason, path_reason):
+        relative = entry.name if not parent else parent + "/" + entry.name
+        path = normalized_repository_relative(relative, path_reason)
+        paths.append((entry.name, path))
+    return paths
 
 
 def source_output_root(path, kind):
@@ -1971,10 +2036,7 @@ def git_directory_output(repository, limit, *args):
                         git_handle, git_directories, git_parent):
             del repository_parent, git_parent
             result = bounded_subprocess_output(
-                [f"/proc/self/fd/{git_handle}", "--no-pager",
-                 "-c", "core.hooksPath=/dev/null",
-                 "-c", "credential.helper=",
-                 "-c", "core.pager=cat", *args],
+                [f"/proc/self/fd/{git_handle}", *git_arguments(*args)],
                 f"/proc/self/fd/{repository_handle}", limit, 60,
                 "Git output too large", "Git command timed out",
                 "Git command failed", env=git_environment(),
@@ -2163,7 +2225,11 @@ def restored_manifest_state(restore, expected):
             and before.st_uid == os.getuid()
             and stat.S_IMODE(before.st_mode) == 0o700,
             "unsafe dependency restore directory")
-    entries = sorted(entry.name for entry in os.scandir(restore))
+    entries = [
+        entry.name for entry in bounded_scandir(
+            restore, 3, "unexpected dependency restore entry",
+            "dependency restore enumeration failed")
+    ]
     require(entries == ["build.zig", "build.zig.zon", "zig-pkg"],
             "unexpected dependency restore entry")
     packages = restore / "zig-pkg"
@@ -2229,10 +2295,16 @@ def package_tree_state(packages):
         directories[prefix] = snapshot(before)
         require(len(files) + len(directories) - 1 <= PACKAGE_MAX_ENTRIES,
                 "dependency package entry limit exceeded")
-        try:
-            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        except OSError as error:
-            raise Refusal("dependency package enumeration failed") from error
+        used = len(files) + len(directories) - 1
+        remaining = PACKAGE_MAX_ENTRIES - used
+        if not prefix:
+            remaining = min(remaining, PACKAGE_MAX_ROOTS)
+        entries = bounded_scandir(
+            directory, remaining,
+            "invalid dependency package roots" if not prefix
+            else "dependency package entry limit exceeded",
+            "dependency package enumeration failed",
+        )
         if not prefix:
             require(0 < len(entries) <= PACKAGE_MAX_ROOTS,
                     "invalid dependency package roots")
@@ -2304,10 +2376,11 @@ def directory_inventory(packages, name, state):
                 "dependency package entry limit exceeded")
         bind(tree, ["directory", prefix, stat.S_IMODE(before[2])])
         bind(physical, ["directory", prefix, before])
-        try:
-            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        except OSError as error:
-            raise Refusal("dependency package enumeration failed") from error
+        entries = bounded_scandir(
+            directory, PACKAGE_MAX_ENTRIES - files - directories,
+            "dependency package entry limit exceeded",
+            "dependency package enumeration failed",
+        )
         for entry in entries:
             safe_package_component(entry.name)
             relative = entry.name if not prefix else prefix + "/" + entry.name
@@ -2354,7 +2427,8 @@ def directory_inventory(packages, name, state):
     }
 
 
-def package_roots(packages):
+def package_roots(
+        packages, empty_reason="invalid dependency package roots"):
     try:
         before = packages.lstat()
     except FileNotFoundError as error:
@@ -2364,8 +2438,10 @@ def package_roots(packages):
             and before.st_uid == os.getuid()
             and stat.S_IMODE(before.st_mode) == 0o700,
             "private pinned dependency restore required")
-    entries = sorted(os.scandir(packages), key=lambda entry: entry.name)
-    require(0 < len(entries) <= PACKAGE_MAX_ROOTS, "invalid dependency package roots")
+    entries = bounded_scandir(
+        packages, PACKAGE_MAX_ROOTS, "invalid dependency package roots",
+        "dependency package enumeration failed")
+    require(entries, empty_reason)
     names = []
     for entry in entries:
         safe_package_name(entry.name)
@@ -2591,8 +2667,7 @@ def restore_dependencies(runtime, root, expected_source, expected_inputs):
     require(restored_manifest_state(restore, manifest_data) == restored,
             "copied dependency manifest identity changed")
     packages = restore / "zig-pkg"
-    require(any(os.scandir(packages)), "private pinned dependency restore required")
-    package_roots(packages)
+    package_roots(packages, "private pinned dependency restore required")
     verify_package_hashes(runtime, root, packages, expected_inputs)
     custody = dependency_custody(root)
     require(custody["source_manifests"] == {

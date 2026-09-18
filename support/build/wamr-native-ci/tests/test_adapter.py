@@ -315,9 +315,12 @@ class Evidence(unittest.TestCase):
         self.put(executable, b"#!/bin/sh\nexit 0\n")
         executable.chmod(0o700)
         self.put(tree / "data", b"same bytes")
+        file_paths = {"tool:fixture": executable}
+        tree_paths = {"fixture": tree}
         expected = ci.record_input_paths(
-            {"tool:fixture": executable}, {"fixture": tree})
-        ci.record_input_paths({}, {}, content=False, expected=expected)
+            file_paths, tree_paths)
+        ci.record_input_paths(
+            file_paths, tree_paths, content=False, expected=expected)
 
         retained = inputs / "retained"
         executable.rename(retained)
@@ -336,14 +339,16 @@ class Evidence(unittest.TestCase):
         executable.unlink()
         retained.rename(executable)
         with self.assertRaisesRegex(ci.Refusal, "custody changed"):
-            ci.record_input_paths({}, {}, content=False, expected=expected)
+            ci.record_input_paths(
+                file_paths, tree_paths, content=False, expected=expected)
 
         refreshed = ci.record_input_paths(
             {"tool:fixture": executable}, {"fixture": tree})
         executable.chmod(0o500)
         executable.chmod(0o700)
         with self.assertRaisesRegex(ci.Refusal, "custody changed"):
-            ci.record_input_paths({}, {}, content=False, expected=refreshed)
+            ci.record_input_paths(
+                file_paths, tree_paths, content=False, expected=refreshed)
 
         hardlink = inputs / "hardlink"
         os.link(executable, hardlink)
@@ -354,6 +359,90 @@ class Evidence(unittest.TestCase):
         symlink.symlink_to(executable)
         with self.assertRaisesRegex(ci.Refusal, "unsafe physical input"):
             ci.physical_file_record(symlink)
+
+    def test_current_input_records_reject_rehashed_omissions_and_substitutions(self):
+        inputs = self.root / "independent-input-discovery"
+        consumer_tree = inputs / "consumer-tree"
+        qemu_data = inputs / "qemu-data"
+        consumer_tree.mkdir(parents=True, mode=0o700)
+        qemu_data.mkdir(mode=0o700)
+        self.put(consumer_tree / "data", b"consumer")
+        self.put(qemu_data / "firmware", b"qemu")
+        direct = inputs / "direct"
+        runtime = inputs / "runtime"
+        boot = inputs / "boot"
+        replacement = inputs / "replacement"
+        for path, data in (
+                (direct, b"direct"), (runtime, b"runtime"),
+                (boot, b"boot"), (replacement, b"replacement")):
+            self.put(path, data)
+        consumer_files = {
+            "tool:direct": direct,
+            f"runtime:{runtime}": runtime,
+        }
+        consumer_trees = {"zig": consumer_tree}
+        consumer = ci.record_input_paths(consumer_files, consumer_trees)
+        boot_files = {
+            "qemu": boot,
+            f"runtime:{runtime}": runtime,
+        }
+        boot_trees = {"qemu-data": qemu_data}
+        boot_record = ci.record_input_paths(boot_files, boot_trees)
+
+        def rehash(value):
+            value = copy.deepcopy(value)
+            value.pop("aggregate_sha256")
+            value["aggregate_sha256"] = ci.record_digest(value)
+            return value
+
+        with mock.patch.object(
+                ci, "discover_consumer_input_paths",
+                return_value=(consumer_files, consumer_trees)):
+            for role in consumer_files:
+                forged = copy.deepcopy(consumer)
+                del forged["files"][role]
+                forged = rehash(forged)
+                with self.subTest(consumer_omission=role), \
+                        self.assertRaisesRegex(ci.Refusal, "roles changed"):
+                    ci.consumer_input_state(
+                        inputs, content=False, expected=forged)
+            forged = copy.deepcopy(consumer)
+            del forged["trees"]["zig"]
+            forged = rehash(forged)
+            with self.assertRaisesRegex(ci.Refusal, "roles changed"):
+                ci.consumer_input_state(inputs, content=False, expected=forged)
+            forged = copy.deepcopy(consumer)
+            forged["files"]["tool:direct"]["path"] = str(replacement)
+            forged = rehash(forged)
+            with self.assertRaisesRegex(ci.Refusal, "paths changed"):
+                ci.consumer_input_state(inputs, content=False, expected=forged)
+            forged = copy.deepcopy(consumer)
+            forged["version"] = 1
+            forged = rehash(forged)
+            with self.assertRaisesRegex(
+                    ci.Refusal, "invalid consumer input custody"):
+                ci.consumer_input_state(inputs, content=False, expected=forged)
+
+        with mock.patch.object(
+                ci, "discover_boot_input_paths",
+                return_value=(boot_files, boot_trees)):
+            for kind, role in (
+                    ("boot", "qemu"),
+                    ("runtime", f"runtime:{runtime}")):
+                forged = copy.deepcopy(boot_record)
+                del forged["files"][role]
+                forged = rehash(forged)
+                with self.subTest(boot_omission=kind), \
+                        self.assertRaisesRegex(ci.Refusal, "roles changed"):
+                    ci.boot_input_state(
+                        inputs, {"qemu": boot}, content=False,
+                        expected=forged)
+            forged = copy.deepcopy(boot_record)
+            del forged["trees"]["qemu-data"]
+            forged = rehash(forged)
+            with self.assertRaisesRegex(ci.Refusal, "roles changed"):
+                ci.boot_input_state(
+                    inputs, {"qemu": boot}, content=False, expected=forged)
 
     def test_public_bundle_accepts_only_fixed_ci_runtime_roots(self):
         runtime_owner = type("RuntimeOwner", (), {"REPO": ci.REPO})
@@ -496,7 +585,8 @@ class Evidence(unittest.TestCase):
             executable.unlink()
             saved.rename(executable)
         with self.assertRaisesRegex(ci.Refusal, "custody changed"):
-            ci.record_input_paths({}, {}, content=False, expected=state)
+            ci.record_input_paths(
+                {"tool": executable}, {}, content=False, expected=state)
 
     def test_indirect_tool_environment_uses_retained_descriptor(self):
         root = self.root / "retained-indirect"
@@ -595,6 +685,9 @@ class Evidence(unittest.TestCase):
                 ci, "tool", side_effect=lambda name: f"/tools/{name}"), \
                 mock.patch.object(
                     ci, "executable_runtime_paths", return_value=set()), \
+                mock.patch.object(
+                    ci, "canonical_input_paths",
+                    side_effect=lambda paths, unused_reason: dict(paths)), \
                 mock.patch.object(
                     ci, "record_input_paths", side_effect=record):
             self.assertEqual(
@@ -1410,6 +1503,51 @@ source/generated/
                 self.assertRaisesRegex(ci.Refusal, "source output role policy"):
             ci.source(repository)
 
+    def test_custody_git_commands_disable_repository_fsmonitor(self):
+        repository = self.source_repository("fsmonitor-disabled")
+        marker = repository / ".git/fsmonitor-executed"
+        hook = repository / ".git/malicious-fsmonitor"
+        hook.write_text(
+            "#!/bin/sh\n"
+            f"printf executed > {str(marker)!r}\n"
+            "exit 1\n",
+            encoding="ascii",
+        )
+        hook.chmod(0o700)
+        wrapper = self.root / "fsmonitor-git-wrapper"
+        real_git = Path(shutil.which(GIT)).resolve(strict=True)
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            "case \" $* \" in\n"
+            "  *' -c core.fsmonitor=false '*) ;;\n"
+            f"  *) printf missing-fsmonitor > {str(marker)!r}; exit 97 ;;\n"
+            "esac\n"
+            "case \" $* \" in\n"
+            "  *' -c core.fsmonitorHookVersion= '*) ;;\n"
+            f"  *) printf missing-version > {str(marker)!r}; exit 98 ;;\n"
+            "esac\n"
+            f"exec {str(real_git)!r} \"$@\"\n",
+            encoding="ascii",
+        )
+        wrapper.chmod(0o700)
+        subprocess.run(
+            [GIT, "config", "core.fsmonitor", str(hook)],
+            cwd=repository, check=True)
+        subprocess.run(
+            [GIT, "config", "core.fsmonitorHookVersion", "2"],
+            cwd=repository, check=True)
+        with mock.patch.dict(
+                ci.COMMAND_TOOL_PATHS, {"git": str(wrapper)}, clear=False):
+            ci.source(repository)
+            self.assertRegex(
+                ci.git_directory_output(
+                    repository, 65, "rev-parse", "HEAD").decode().strip(),
+                r"^[0-9a-f]{40}$",
+            )
+        self.assertFalse(marker.exists())
+        self.assertIn("core.fsmonitor=false", ci.git_command("status"))
+        self.assertIn("core.fsmonitorHookVersion=", ci.git_command("status"))
+
     def test_bounded_directory_collection_stops_on_first_excess(self):
         class Entry:
             def __init__(self, name):
@@ -1440,6 +1578,43 @@ source/generated/
                 "invalid source root inventory",
             )
         self.assertEqual(scan.count, 129)
+
+    def test_package_scans_bound_before_sorting_or_materializing(self):
+        restore = self.root / "bounded-restore"
+        restore.mkdir(mode=0o700)
+        for name in ("build.zig", "build.zig.zon", "zig-pkg", "excess"):
+            path = restore / name
+            if name == "zig-pkg":
+                path.mkdir(mode=0o700)
+            else:
+                self.put(path, b"x")
+        with self.assertRaisesRegex(
+                ci.Refusal, "unexpected dependency restore entry"):
+            ci.restored_manifest_state(restore, {})
+
+        packages = self.root / "bounded-package-roots"
+        packages.mkdir(mode=0o700)
+        for name in ("package-a", "package-b", "package-c"):
+            (packages / name).mkdir(mode=0o700)
+        with mock.patch.object(ci, "PACKAGE_MAX_ROOTS", 2):
+            with self.assertRaisesRegex(
+                    ci.Refusal, "invalid dependency package roots"):
+                ci.package_tree_state(packages)
+            with self.assertRaisesRegex(
+                    ci.Refusal, "invalid dependency package roots"):
+                ci.package_roots(packages)
+
+        inventory_packages = self.root / "bounded-inventory"
+        package = inventory_packages / "package"
+        package.mkdir(parents=True, mode=0o700)
+        inventory_packages.chmod(0o700)
+        self.put(package / "first", b"first")
+        self.put(package / "second", b"second")
+        state = ci.package_tree_state(inventory_packages)
+        with mock.patch.object(ci, "PACKAGE_MAX_ENTRIES", 2), \
+                self.assertRaisesRegex(
+                    ci.Refusal, "dependency package entry limit exceeded"):
+            ci.directory_inventory(inventory_packages, "package", state)
 
     def test_bounded_subprocess_collection_terminates_on_first_excess(self):
         marker = self.root / "unbounded-reader-finished"

@@ -193,6 +193,13 @@ def main():
     pln.add_argument("--bundle", type=Path, required=True)
     pln.add_argument("--output", type=Path, required=True)
     sub.add_parser("public-source-bundle", help="Explicit fixed public-repository tiny CI publication only")
+    verify = sub.add_parser("verify-public-source-bundle")
+    verify.add_argument("--archive", type=Path, required=True)
+    verify.add_argument("--expected-source", required=True)
+    verify.add_argument("--expected-tree", required=True)
+    verify.add_argument("--expected-archive-sha256", required=True)
+    verify.add_argument("--run-id", required=True)
+    verify.add_argument("--run-attempt", required=True)
     imp = sub.add_parser("import-public-source-bundle")
     imp.add_argument("--archive", type=Path, required=True)
     imp.add_argument("--output", type=Path, required=True)
@@ -213,15 +220,30 @@ def main():
 
         if args.command == "public-source-bundle":
             FAILURE_STAGE = "public-entry"
-            public_bundle.publish_ci(sys.modules[__name__])
+            unused_archive, archive_sha256, source_tree = (
+                public_bundle.publish_ci(sys.modules[__name__]))
+            del unused_archive
+            print("Public source archive SHA-256: " + archive_sha256)
+            print("Public source tree: " + source_tree)
         else:
-            FAILURE_STAGE = "public-import"
+            FAILURE_STAGE = (
+                "public-verify"
+                if args.command == "verify-public-source-bundle"
+                else "public-import")
             expected = dict(repository="cataggar/unikraft", run_id=args.run_id,
                             run_attempt=args.run_attempt, source_revision=args.expected_source,
                             source_tree=args.expected_tree, wamr_revision=ci.REVISION)
-            public_bundle.import_bundle(
-                sys.modules[__name__], args.archive, args.output, expected,
-                args.expected_archive_sha256, args.validator)
+            if args.command == "verify-public-source-bundle":
+                unused_bundle, archive_sha256 = (
+                    public_bundle.verify_archive_with_digest(
+                        sys.modules[__name__], args.archive, expected,
+                        args.expected_archive_sha256))
+                del unused_bundle
+                print("Public source archive SHA-256: " + archive_sha256)
+            else:
+                public_bundle.import_bundle(
+                    sys.modules[__name__], args.archive, args.output, expected,
+                    args.expected_archive_sha256, args.validator)
     print("Compute handoff/plan prepared; authority=not_admitted. No Azure operations.")
 
 
