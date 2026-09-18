@@ -158,9 +158,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "cd0e4198341d08429dceb1736f3dca7c653310a8fcdcaaa1a341f2edb1634ac7"
+            "b74489dd25c4b75dfa467d2e8034926d6c337e703f4d9440e98f34ec23e3796c"
         ),
-        "size": 2066738,
+        "size": 2068678,
         "files": 226,
     },
     "support/kconfig": {
@@ -397,7 +397,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "30585aab92a9430a9a2cc27d1d78eac4b4c76665c3589e1a7733b600b30e80c0"
+        "e483adefc423000cb84b29f9ec91daf1655833670a6b22bde86de1b15ef0a66c"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -676,7 +676,7 @@ GUARDED_PRODUCER_FILES = {
         "82e672e9659bfb4851d574c0c1ce4a48b55c415e9ffc6bc36eda57dde9e7764b"
     ),
     "support/build/native-image-graph.zig": (
-        "58b744a6b02de3e3a8fccce2626346e5cd1ddb87ba5a90c1080135bdb1147e4e"
+        "6465bc8c33deba57d3ae86edbc97a0f78f3b0cfea1669896855ad3c0a7b3c2c9"
     ),
     "support/build/native-postprocess-runner.py": (
         "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"

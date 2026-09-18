@@ -229,7 +229,7 @@ pub fn build(b: *std.Build) void {
         return;
     }
 
-    const native_graph = registerNativeGraph(b, context);
+    const native_graph = registerNativeGraph(b, context, options);
     if (native_graph) |registered| {
         std.debug.assert(registered.graph.selectedPlatform().name.len != 0);
     }
@@ -1958,6 +1958,7 @@ pub fn build(b: *std.Build) void {
 fn registerNativeGraph(
     b: *std.Build,
     context: build_context.Context,
+    options: MakeOptions,
 ) ?*native_image_graph.RegisteredGraph {
     const step = b.step(
         "native-link-graph",
@@ -2035,6 +2036,13 @@ fn registerNativeGraph(
             .config = context.config,
         },
         .profile = profile,
+        .tools = .{
+            .compiler = forwardedCommand(options.forwarded, "ZIG"),
+            .nm = forwardedCommand(options.forwarded, "NM"),
+            .objcopy = forwardedCommand(options.forwarded, "OBJCOPY"),
+            .objdump = forwardedCommand(options.forwarded, "OBJDUMP"),
+            .strip = forwardedCommand(options.forwarded, "STRIP"),
+        },
         .enable_ukblkdev = enable_ukblkdev,
         .enable_storvsc = enable_storvsc,
         .enable_uklibparam = enable_uklibparam,
@@ -2100,6 +2108,7 @@ fn registerNativePipeline(
         ).step);
         return step;
     };
+    const copy_command = forwardedCommand(options.forwarded, "CP") orelse "cp";
 
     const config = loadNativeConfig(b, context.config) catch |err| {
         step.dependOn(&b.addFail(b.fmt(
@@ -2177,6 +2186,7 @@ fn registerNativePipeline(
             b,
             step,
             registered,
+            copy_command,
             config,
             lto_result.stage_name,
             lto_result.output,
@@ -2225,6 +2235,7 @@ fn registerNativePipeline(
         b,
         step,
         registered,
+        copy_command,
         config,
         linked[0].stage_name,
         linked[0].output,
@@ -2236,6 +2247,7 @@ fn finishNativeImages(
     b: *std.Build,
     step: *std.Build.Step,
     registered: *native_image_graph.RegisteredGraph,
+    copy_command: []const u8,
     config: *const NativeConfig,
     stage_name: []const u8,
     link_output: std.Build.LazyPath,
@@ -2283,7 +2295,7 @@ fn finishNativeImages(
                 "llvm-objdump",
         });
         irq_check.setCwd(.{ .cwd_relative = b.build_root.path.? });
-        const gate = b.addSystemCommand(&.{"cp"});
+        const gate = b.addSystemCommand(&.{copy_command});
         gate.step.dependOn(&check.step);
         gate.step.dependOn(&irq_check.step);
         if (nativeConfigEnabled(config, "CONFIG_LIBSTORVSC") or
@@ -2388,6 +2400,7 @@ fn finishNativeImages(
     addPublishedOutput(
         b,
         step,
+        copy_command,
         post.publicationPath(linked_logical_path, validated_link_output),
         linked_logical_path,
     );
@@ -2401,7 +2414,7 @@ fn finishNativeImages(
             }
         }
         if (!superseded) {
-            addPublishedOutput(b, step, output.path, output.logical_path);
+            addPublishedOutput(b, step, copy_command, output.path, output.logical_path);
         }
     }
     return step;
@@ -2549,10 +2562,11 @@ fn finalStageOutput(
 fn addPublishedOutput(
     b: *std.Build,
     parent: *std.Build.Step,
+    copy_command: []const u8,
     source: std.Build.LazyPath,
     destination: []const u8,
 ) void {
-    const copy = b.addSystemCommand(&.{"cp"});
+    const copy = b.addSystemCommand(&.{copy_command});
     copy.setName(b.fmt("publish native output {s}", .{std.fs.path.basename(destination)}));
     copy.addFileArg(source);
     copy.addArg(destination);
@@ -3115,6 +3129,22 @@ fn validateForwardedAssignment(assignment: []const u8) error{InvalidAssignment}!
     }
     if (!isAllowedAssignment(name)) return error.InvalidAssignment;
     if (firstUnsafeCommandByte(assignment[separator + 1 ..]) != null) return error.InvalidAssignment;
+}
+
+fn forwardedCommand(
+    assignments: []const []const u8,
+    name: []const u8,
+) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    for (assignments) |assignment| {
+        const separator = std.mem.indexOfScalar(u8, assignment, '=') orelse
+            continue;
+        if (!std.mem.eql(u8, assignment[0..separator], name)) continue;
+        const value = assignment[separator + 1 ..];
+        const end = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
+        if (end != 0) result = value[0..end];
+    }
+    return result;
 }
 
 fn isMakeNameStart(character: u8) bool {
@@ -3716,6 +3746,18 @@ test "forwarded Make assignments require allowlisted names" {
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("AR=zig ar;true"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_CFLAGS=$(shell true)"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_LDFLAGS=-Wl,*"));
+}
+
+test "forwarded native commands select exact executables" {
+    const assignments = [_][]const u8{
+        "CP=/proc/100/fd/3 -f",
+        "ZIG=/proc/100/fd/4",
+        "NM=/proc/100/fd/5",
+    };
+    try std.testing.expectEqualStrings("/proc/100/fd/3", forwardedCommand(&assignments, "CP").?);
+    try std.testing.expectEqualStrings("/proc/100/fd/4", forwardedCommand(&assignments, "ZIG").?);
+    try std.testing.expectEqualStrings("/proc/100/fd/5", forwardedCommand(&assignments, "NM").?);
+    try std.testing.expect(forwardedCommand(&assignments, "STRIP") == null);
 }
 
 fn testingMakeOptions() MakeOptions {

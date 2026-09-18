@@ -27,6 +27,7 @@ pub const Error = component.RegistrationError || component.ValidationError || er
 pub const Options = struct {
     roots: component.Roots,
     profile: Profile,
+    tools: ToolOverrides = .{},
     enable_ukblkdev: bool = false,
     enable_storvsc: bool = false,
     enable_uklibparam: bool = false,
@@ -35,6 +36,14 @@ pub const Options = struct {
     enable_lwip: bool = false,
     enable_ukrandom_lcpu: bool = false,
     lwip_root: ?[]const u8 = null,
+};
+
+pub const ToolOverrides = struct {
+    compiler: ?[]const u8 = null,
+    nm: ?[]const u8 = null,
+    objcopy: ?[]const u8 = null,
+    objdump: ?[]const u8 = null,
+    strip: ?[]const u8 = null,
 };
 
 pub fn parseProfile(name: []const u8) error{UnsupportedConfiguration}!Profile {
@@ -59,10 +68,21 @@ pub const RegisteredGraph = struct {
             => data.x86_64,
         };
         const target = targetFor(options.profile);
+        var toolchain = toolchainFor(target);
+        if (options.tools.compiler) |command|
+            toolchain.compiler.tool.command = command;
+        if (options.tools.nm) |command|
+            toolchain.binutils.nm.command = command;
+        if (options.tools.objcopy) |command|
+            toolchain.binutils.objcopy.command = command;
+        if (options.tools.objdump) |command|
+            toolchain.binutils.objdump = .{ .command = command };
+        if (options.tools.strip) |command|
+            toolchain.binutils.strip.command = command;
         var context = component.BuildContext.init(allocator, .{
             .roots = options.roots,
             .target = target,
-            .toolchain = toolchainFor(target),
+            .toolchain = toolchain,
             .config = empty_config,
         }) catch return error.OutOfMemory;
         errdefer context.deinit();
@@ -1036,6 +1056,32 @@ test "registered profiles use the native Zig library executor contract" {
             }
         }
     }
+}
+
+test "registered graph applies retained tool overrides" {
+    var registered = try RegisteredGraph.init(std.testing.allocator, .{
+        .roots = .{
+            .base = "/src/unikraft",
+            .app = "/src/app-helloworld",
+            .output = "/build",
+            .config = "/build/.config",
+        },
+        .profile = .@"qemu-x86_64",
+        .tools = .{
+            .compiler = "/proc/100/fd/3",
+            .nm = "/proc/100/fd/4",
+            .objcopy = "/proc/100/fd/5",
+            .objdump = "/proc/100/fd/6",
+            .strip = "/proc/100/fd/7",
+        },
+    });
+    defer registered.deinit();
+
+    try std.testing.expectEqualStrings("/proc/100/fd/3", registered.graph.toolchain.compiler.tool.command);
+    try std.testing.expectEqualStrings("/proc/100/fd/4", registered.graph.toolchain.binutils.nm.command);
+    try std.testing.expectEqualStrings("/proc/100/fd/5", registered.graph.toolchain.binutils.objcopy.command);
+    try std.testing.expectEqualStrings("/proc/100/fd/6", registered.graph.toolchain.binutils.objdump.?.command);
+    try std.testing.expectEqualStrings("/proc/100/fd/7", registered.graph.toolchain.binutils.strip.command);
 }
 
 test "registered profiles satisfy the native final-link planner contract" {
