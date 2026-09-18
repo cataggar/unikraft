@@ -969,7 +969,9 @@ def record_digest(value):
 def input_directory_custody_reason(kind, name):
     if kind == "file":
         if name.startswith("tool:"):
-            return "consumer tool directory custody changed"
+            tool_name = name.removeprefix("tool:")
+            if tool_name in HOST_TOOLS:
+                return f"consumer {tool_name} tool directory custody changed"
         if name.startswith("runtime:"):
             return "consumer runtime directory custody changed"
         if name == "wamr-source-archive":
