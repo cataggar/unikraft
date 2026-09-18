@@ -2653,6 +2653,19 @@ class HypervWorkflowTest(unittest.TestCase):
             '"$SCRATCH"/{home,tmp,cache,global-cache,restore,fixtures,outputs}',
             local_boot_readme,
         )
+        native = (
+            SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
+        ).read_text()
+        for required in (
+            "for name in llvm-readelf llvm-strip; do",
+            'target="$(readlink -f "${alias}")"',
+            'temporary="${alias}.materialized"',
+            'cp --no-preserve=mode,ownership -- "${target}" "${temporary}"',
+            'chmod 500 "${temporary}"',
+            'rm -- "${alias}"',
+            'mv -- "${temporary}" "${alias}"',
+        ):
+            self.assertIn(required, native)
 
     def test_wamr_public_bundle_uses_external_archive_digest(self):
         repository = SUPPORT.parent

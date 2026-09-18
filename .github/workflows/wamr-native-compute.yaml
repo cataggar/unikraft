@@ -92,6 +92,17 @@ jobs:
             "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
           cp --no-preserve=mode,ownership \
             "$(readlink -f /usr/share/OVMF/OVMF_VARS_4M.fd)" "${root}/firmware/vars.fd"
+          for name in llvm-readelf llvm-strip; do
+            alias="${root}/llvm/bin/${name}"
+            target="$(readlink -f "${alias}")"
+            test -f "${target}"
+            temporary="${alias}.materialized"
+            test ! -e "${temporary}"
+            cp --no-preserve=mode,ownership -- "${target}" "${temporary}"
+            chmod 500 "${temporary}"
+            rm -- "${alias}"
+            mv -- "${temporary}" "${alias}"
+          done
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           echo "${zig_dir}" >> "${GITHUB_PATH}"
