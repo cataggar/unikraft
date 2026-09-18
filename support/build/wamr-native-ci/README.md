@@ -172,7 +172,10 @@ compute ceiling also bounds the orchestration and post-exit hashing.
 The empty private package output and four boot work directories are created
 before boot-input custody, and the native packager accepts its slot only while
 empty; later package and serial writes therefore keep the shared
-compute-directory identity stable without allowing package reuse.
+compute-directory identity stable without allowing package reuse. An empty
+publication container is reserved at the same time; validator, handoff and
+archive-reopen outputs are later created only beneath it, so final export does
+not mutate any recorded input ancestor.
 Each attempt is create-only, with no resume, overwrite or automatic retry.
 
 Raw build, runtime and bounded 4-MiB serial logs stay in private local slots.

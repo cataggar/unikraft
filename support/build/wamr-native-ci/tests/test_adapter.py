@@ -382,6 +382,9 @@ class Evidence(unittest.TestCase):
         package, configs = ci.prepare_boot_output_slots(runtime, compute)
         parent = ci.snapshot(compute.lstat())
         (package / "artifact").write_bytes(b"package")
+        publication = compute / "public-source"
+        (publication / "handoff").mkdir(mode=0o700)
+        (publication / "tools").mkdir(mode=0o700)
         for config in configs:
             (Path(config["work_dir"]) / "serial").write_bytes(b"boot")
         self.assertEqual(ci.snapshot(compute.lstat()), parent)

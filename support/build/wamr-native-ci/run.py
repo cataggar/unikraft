@@ -2759,8 +2759,12 @@ def config_for(runtime, root, index):
 
 def prepare_boot_output_slots(runtime, root):
     package = root / "package"
+    publication = root / "public-source"
     configs = [config_for(runtime, root, index) for index in range(len(MODES))]
-    slots = [package, *(Path(config["work_dir"]) for config in configs)]
+    slots = [
+        package, publication,
+        *(Path(config["work_dir"]) for config in configs),
+    ]
     require(all(not path.exists() and not path.is_symlink() for path in slots),
             "boot output already exists")
     for path in slots:
