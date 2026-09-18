@@ -2717,7 +2717,11 @@ def build(runtime, wamr):
         tool("zig"), "build", "--build-file", LOCAL_BOOT / "build.zig",
         "--system", packages, "--prefix", root / "tools",
         "-Doptimize=ReleaseSafe", "-j2", "install"], 900)
-    os.environ["WAMR_CI_PACKAGE"] = str(root / "tools/bin/wamr-ci-package")
+    COMMAND_ENVIRONMENT.update({
+        "WAMR_CI_PACKAGE": str(root / "tools/bin/wamr-ci-package"),
+        "WAMR_CI_PYTHON": tool("python3"),
+    })
+    os.environ.update(COMMAND_ENVIRONMENT)
     run_custodied(runtime, initial, root, "fixtures", [
         sys.executable, "-m", "unittest", "discover", "-s", HERE / "tests", "-v"])
     run_custodied(runtime, initial, root, "prepare", [

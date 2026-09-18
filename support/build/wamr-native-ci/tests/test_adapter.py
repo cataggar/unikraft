@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
+PYTHON = os.environ.get("WAMR_CI_PYTHON", sys.executable)
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
@@ -434,7 +435,7 @@ scope["APP"] = Path(sys.argv[2])
 scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
 """
         completed = subprocess.run(
-            [sys.executable, "-c", script, str(HERE / "run.py"), str(app), str(log)],
+            [PYTHON, "-c", script, str(HERE / "run.py"), str(app), str(log)],
             env={}, capture_output=True, timeout=30)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(list(app.iterdir()), [checker])
@@ -1222,7 +1223,7 @@ source/generated/
         started = time.monotonic()
         with self.assertRaisesRegex(ci.Refusal, "fixture overflow"):
             ci.bounded_subprocess_output(
-                [sys.executable, "-c", script], self.root, ci.MIB, 20,
+                [PYTHON, "-c", script], self.root, ci.MIB, 20,
                 "fixture overflow", "fixture timeout", "fixture failed",
             )
         self.assertLess(time.monotonic() - started, 5)
@@ -1248,7 +1249,7 @@ source/generated/
         try:
             with self.assertRaisesRegex(ci.Refusal, "escaped fixture failed"):
                 ci.bounded_subprocess_output(
-                    [sys.executable, "-c", script], self.root, 1024, 10,
+                    [PYTHON, "-c", script], self.root, 1024, 10,
                     "escaped fixture overflow", "escaped fixture timeout",
                     "escaped fixture failed",
                 )
@@ -1286,7 +1287,7 @@ source/generated/
         with mock.patch.dict(os.environ, ambient, clear=False):
             output, unused_record = ci.execute(
                 root, "closed-environment",
-                [sys.executable, "-c", script],
+                [PYTHON, "-c", script],
                 evidence=False,
                 input_records=None,
             )
@@ -1438,7 +1439,7 @@ source/generated/
                 ("overflow", "print('x' * 4096)", 10, 32),
                 ("timeout", "import time; time.sleep(20)", 1, 1024)):
             with self.subTest(stage=stage), self.assertRaises(ValueError):
-                ci.run(self.root, stage, [sys.executable, "-c", source], seconds, limit)
+                ci.run(self.root, stage, [PYTHON, "-c", source], seconds, limit)
             record = ci.document(self.root / "evidence" / ("command-" + stage + ".json"))
             self.assertLessEqual(record["bytes"], limit + 1)
             self.assertEqual(record["scope"], "command_diagnostic_not_acceptance")
@@ -1474,7 +1475,7 @@ source/generated/
             b"UnsafeFileSuffix PrefixUnsafeFile PRIVATE_SYNTHETIC_STATE"), [])
         source = "import sys; sys.stdout.buffer.write(" + repr(raw) + "); sys.exit(3)"
         with self.assertRaises(ci.Refusal):
-            ci.run(self.root, "closed-markers", [sys.executable, "-c", source])
+            ci.run(self.root, "closed-markers", [PYTHON, "-c", source])
         record_path = self.root / "evidence/command-closed-markers.json"
         record = ci.document(record_path)
         self.assertEqual(record["known_error_markers"],
