@@ -229,9 +229,11 @@ def source_metadata(repository=REPO):
     records = []
     for relative in sorted(directories):
         path = repository if not relative else repository / relative
-        records.append(["directory", relative, snapshot(path.lstat())])
+        records.append(["directory", relative, list(snapshot(path.lstat()))])
     for relative, _, _ in entries:
-        records.append(["file", relative, snapshot((repository / relative).lstat())])
+        records.append([
+            "file", relative, list(snapshot((repository / relative).lstat())),
+        ])
     return records
 
 
@@ -1045,6 +1047,15 @@ def require_build_custody(runtime, expected):
             report = source_metadata_changes(
                 source_metadata_document(baseline)["records"], source_metadata())
             report["source"] = source_identity(current_source)
+            ignored = git_raw(
+                REPO, "status", "--short", "--ignored", "--untracked-files=normal")
+            require(len(ignored) <= MIB, "ignored source inventory too large")
+            try:
+                ignored_paths = ignored.decode("utf-8").splitlines()
+            except UnicodeDecodeError as error:
+                raise Refusal("invalid ignored source inventory") from error
+            report["ignored_paths"] = ignored_paths[:128]
+            report["ignored_paths_truncated"] = len(ignored_paths) > 128
             save(failure, report)
     require(source_matches, "immutable source custody changed")
     require_dependency_custody(runtime / "compute", expected["dependencies"])
