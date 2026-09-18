@@ -1718,6 +1718,10 @@ def retained_process_path(path):
     return f"/proc/{os.getpid()}/fd/{match.group(1)}"
 
 
+def is_retained_process_path(path):
+    return re.fullmatch(r"/proc/(?:self|[0-9]+)/fd/[0-9]+", path) is not None
+
+
 def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
             evidence=True, input_records=None):
     """Fixed timeout/head ceiling; raw output stays private, never in Actions stdout."""
@@ -1726,21 +1730,32 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
     shell = tool("bash")
     head = tool("head")
     executable = str(Path(args[0]))
-    indirect = tuple(dict.fromkeys(COMMAND_TOOL_PATHS.values()))
+    indirect = tuple(dict.fromkeys(
+        path for path in COMMAND_TOOL_PATHS.values()
+        if not is_retained_process_path(path)
+    ))
+    executables = (timeout, shell, head, executable, *indirect)
+    to_open = tuple(
+        path for path in executables if not is_retained_process_path(path))
     context = (
-        retained_executables(
-            (timeout, shell, head, executable, *indirect), input_records)
+        retained_executables(to_open, input_records)
         if input_records is not None
         else contextlib.nullcontext(({}, ()))
     )
     with context as (retained, pass_fds), output.open("xb") as stream:
+        def retained_tool_path(path):
+            if is_retained_process_path(path):
+                return path
+            require(path in retained, "unbound retained tool input")
+            return retained_process_path(retained[path])
+
         retained_environment = {}
         if "git" in COMMAND_TOOL_PATHS:
-            retained_environment["WAMR_CI_GIT"] = retained_process_path(
-                retained[COMMAND_TOOL_PATHS["git"]])
+            retained_environment["WAMR_CI_GIT"] = retained_tool_path(
+                COMMAND_TOOL_PATHS["git"])
         retained_environment.update({
             "WAMR_CI_TOOL_" + name.upper().replace("-", "_"):
-                retained_process_path(retained[path])
+                retained_tool_path(path)
             for name, path in COMMAND_TOOL_PATHS.items()
         })
         environment = command_environment(root, input_records, {

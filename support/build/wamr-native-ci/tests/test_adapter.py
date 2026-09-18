@@ -447,8 +447,10 @@ class Evidence(unittest.TestCase):
         )
         records = {}
         for path in {
-                Path(ci.tool("timeout")), Path(ci.tool("bash")),
-                Path(ci.tool("head")), Path(PYTHON).resolve(strict=True),
+                Path(ci.tool("timeout")).resolve(strict=True),
+                Path(ci.tool("bash")).resolve(strict=True),
+                Path(ci.tool("head")).resolve(strict=True),
+                Path(PYTHON).resolve(strict=True),
                 executable}:
             record, unused_directories = ci.physical_file_record(path)
             del unused_directories
