@@ -2994,6 +2994,10 @@ def boot(runtime):
     require(producer_inputs(runtime, consumer_inputs) == initial,
             "producer inputs changed")
     require(check_build() == document(root / "evidence/build.json"), "build identity changed")
+    package_output = root / "package"
+    require(not package_output.exists() and not package_output.is_symlink(),
+            "package output already exists")
+    package_output.mkdir(mode=0o700)
     efi = APP / "build" / EFI
     paths = {"package_tool": root / "tools/bin/wamr-ci-package",
              "local_boot_tool": root / "tools/bin/uk-hyperv-local-boot",
@@ -3011,7 +3015,7 @@ def boot(runtime):
     verify_inputs()
     output = run_custodied(
         runtime, initial, root, "package",
-        [paths["package_tool"], "package", efi, root / "package"],
+        [paths["package_tool"], "package", efi, package_output],
         150, 64 * 1024, extra_inputs=inputs)
     package = document(output)
     require(package["image"]["efi"]["sha256"] == digest(efi)

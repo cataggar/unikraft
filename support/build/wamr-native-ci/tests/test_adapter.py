@@ -165,7 +165,9 @@ class PhysicalPackage(unittest.TestCase):
         self.efi.chmod(0o600)
         self.state = self.root / "package"
 
-    def call(self, command, success=True):
+    def call(self, command, success=True, precreate=True):
+        if command == "package" and precreate and not self.state.exists():
+            self.state.mkdir(mode=0o700)
         result = subprocess.run([self.cli, command, self.efi, self.state],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=150, check=False)
@@ -206,6 +208,12 @@ class PhysicalPackage(unittest.TestCase):
             stream.seek(511)
             stream.write(b"\x01")
         self.call("inspect", success=False)
+
+    def test_package_requires_precreated_empty_state(self):
+        self.call("package", success=False, precreate=False)
+        self.state.mkdir(mode=0o700)
+        (self.state / "unexpected").write_bytes(b"x")
+        self.call("package", success=False)
 
 
 class Evidence(unittest.TestCase):
