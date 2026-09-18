@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("hyperv_core");
+const miz = @import("miz");
 const c = @import("config.zig");
 const linux = std.os.linux;
 pub const Sha256 = core.Sha256;
@@ -22,14 +23,15 @@ pub const Set = struct {
             errdefer file.close(io);
             const before = try core.private_files.snapshot(file);
             const maximum: u64 = switch (i) {
-                0 => c.max_input + @as(u64, if (config.fixed_vhd != null) 512 else 0),
+                0 => config.source.maximumPhysicalSize(),
                 1 => c.max_firmware,
                 2 => c.max_vars,
                 3 => c.max_qemu,
                 else => unreachable,
             };
             if (before.size == 0 or before.size > maximum or before.mode & 0o022 != 0) return error.InvalidArtifact;
-            if (i == 0 and config.fixed_vhd != null) _ = try @import("vhd.zig").validate(io, file);
+            if (i == 0 and config.source.kind == .fixed_vhd) _ = try @import("vhd.zig").validate(io, file);
+            if (i == 0 and config.source.kind == .qcow2) try validateQcow2(io, file, before);
             if (i == 3) {
                 if (before.mode & 0o111 == 0 or before.mode & 0o6000 != 0) return error.InvalidExecutable;
                 var magic: [4]u8 = undefined;
@@ -151,7 +153,72 @@ fn removeEsp(io: std.Io, work: std.Io.Dir) !void {
 
 pub fn inheritedReadOnly(file: std.Io.File) !linux.fd_t {
     // Keep only this O_RDONLY artifact descriptor across the one QEMU exec.
+    const flags = linux.fcntl(file.handle, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS or flags & 3 != 0) return error.DescriptorFailed;
     const fd = linux.fcntl(file.handle, linux.F.DUPFD, 64);
     if (linux.errno(fd) != .SUCCESS) return error.DescriptorFailed;
     return @intCast(fd);
+}
+
+fn validationDuplicate(file: std.Io.File) !std.Io.File {
+    const flags = linux.fcntl(file.handle, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS or flags & 3 != 0) return error.DescriptorFailed;
+    const fd = linux.fcntl(file.handle, linux.F.DUPFD_CLOEXEC, 64);
+    if (linux.errno(fd) != .SUCCESS) return error.DescriptorFailed;
+    return .{ .handle = @intCast(fd), .flags = .{ .nonblocking = false } };
+}
+
+pub fn validateQcow2(
+    io: std.Io,
+    retained: std.Io.File,
+    retained_snapshot: core.private_files.Snapshot,
+) !void {
+    var duplicate = try validationDuplicate(retained);
+    var transferred = false;
+    defer if (!transferred) duplicate.close(io);
+    var image = miz.Image.openStandaloneQcow2File(io, duplicate) catch |err| switch (err) {
+        error.BackingFileNotSupported, error.ExternalDataFileNotSupported => return err,
+        else => return error.InvalidQcow2,
+    };
+    transferred = true;
+    defer image.close(io);
+
+    const info = image.qcow2 orelse return error.InvalidQcow2Profile;
+    if (image.format != .qcow2 or info.file_size != retained_snapshot.size or
+        info.virtual_size == 0 or info.virtual_size > c.max_virtual or info.virtual_size % 512 != 0 or
+        info.version != 3 or info.cluster_bits != miz.qcow2.default_cluster_bits or
+        info.cluster_size != 64 * 1024 or info.header_length != 112 or
+        info.l2_entries != 8192)
+    {
+        return error.InvalidQcow2Profile;
+    }
+    const guest_clusters = std.math.divCeil(u64, info.virtual_size, info.cluster_size) catch
+        return error.InvalidQcow2Profile;
+    const expected_l1_size = std.math.divCeil(u64, guest_clusters, info.l2_entries) catch
+        return error.InvalidQcow2Profile;
+    if (info.l1_size != @max(1, expected_l1_size) or
+        info.active_l1_table_offset != info.l1_table_offset or
+        info.refcount_order != miz.qcow2.default_refcount_order or
+        info.refcount_table_clusters != 1 or info.refcount_table_capacity_blocks != 8192 or
+        info.refcount_block_count != 1 or
+        info.incompatible_features != miz.qcow2.incompatible_compression or
+        info.compression_type != 1 or info.crypt_method != 0 or
+        info.snapshot_count != 0 or info.snapshots_offset != 0 or
+        info.source_path_len != 0 or info.data_file_len != 0 or info.data_file_size != 0 or
+        info.backing_file_len != 0 or info.backing_depth != 0)
+    {
+        return error.InvalidQcow2Profile;
+    }
+
+    miz.qcow2.check(image.file, io, info) catch return error.InvalidQcow2;
+    var buffer: [64 * 1024]u8 = undefined;
+    var position: u64 = 0;
+    while (position < info.virtual_size) {
+        const length: usize = @intCast(@min(buffer.len, info.virtual_size - position));
+        const read = image.pread(io, buffer[0..length], position) catch return error.InvalidQcow2;
+        if (read != length) return error.InvalidQcow2;
+        position += length;
+    }
+    if (!core.private_files.sameSnapshot(retained_snapshot, try core.private_files.snapshot(retained)))
+        return error.ArtifactChanged;
 }

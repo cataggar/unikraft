@@ -253,7 +253,11 @@ Use an arena per bounded command.
 ## Focused offline fixtures
 
 Use only explicitly owned scratch, Zig 0.16 and `-j2`. Dependency restore is
-from copied manifests, followed by `--system`; no SDK checkout is modified:
+from copied manifests, followed by `--system`; no SDK checkout is modified.
+The public-image graph obtains the pinned Miz package once through
+`dependency.module("miz")` and passes that same module identity to its embedded
+local-boot module, preserving Miz's native zstd wiring without a duplicate
+module graph:
 
 ```sh
 S="$PWD/.d/zig-migration-public-image"

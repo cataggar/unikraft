@@ -3,6 +3,7 @@ const core = @import("hyperv_core");
 
 pub const max_serial = 4 * 1024 * 1024;
 pub const max_input = 256 * 1024 * 1024;
+pub const max_virtual = 256 * 1024 * 1024;
 pub const max_firmware = 16 * 1024 * 1024;
 pub const max_vars = max_serial;
 pub const max_qemu = 256 * 1024 * 1024;
@@ -12,10 +13,37 @@ pub const cleanup_ms = 2000;
 pub const cpu_features = "host,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-time,hv-synic,hv-stimer,hv-vpindex,hv-runtime,hv-frequencies";
 pub const log_name = "hyperv-efi-boot.log";
 
+pub const SourceKind = enum {
+    image,
+    raw_disk,
+    fixed_vhd,
+    qcow2,
+};
+
+pub const Source = struct {
+    kind: SourceKind,
+    path: []const u8,
+
+    pub fn maximumPhysicalSize(self: Source) u64 {
+        return max_input + @as(u64, if (self.kind == .fixed_vhd) 512 else 0);
+    }
+
+    pub fn isDisk(self: Source) bool {
+        return self.kind != .image;
+    }
+
+    pub fn optionName(self: Source) []const u8 {
+        return switch (self.kind) {
+            .image => "--image",
+            .raw_disk => "--raw-disk",
+            .fixed_vhd => "--fixed-vhd",
+            .qcow2 => "--qcow2",
+        };
+    }
+};
+
 pub const Config = struct {
-    image: ?[]const u8 = null,
-    raw_disk: ?[]const u8 = null,
-    fixed_vhd: ?[]const u8 = null,
+    source: Source,
     ovmf_code: []const u8,
     ovmf_vars: []const u8,
     qemu: []const u8,
@@ -29,9 +57,7 @@ pub const Config = struct {
     timeout_ms: u32 = 30_000,
 
     pub fn validate(self: Config) !void {
-        if (@as(u8, @intFromBool(self.image != null)) + @as(u8, @intFromBool(self.raw_disk != null)) +
-            @as(u8, @intFromBool(self.fixed_vhd != null)) != 1) return error.InvalidSource;
-        for ([_][]const u8{ self.source(), self.ovmf_code, self.ovmf_vars, self.qemu, self.work_dir }) |path|
+        for ([_][]const u8{ self.source.path, self.ovmf_code, self.ovmf_vars, self.qemu, self.work_dir }) |path|
             try core.private_files.absoluteFilePath(path);
         if (self.cpus < 1 or self.cpus > 8 or (self.disable_x2apic and self.cpus != 1)) return error.InvalidCpuCount;
         if (self.timeout_ms == 0 or self.timeout_ms > 120_000) return error.InvalidTimeout;
@@ -49,12 +75,8 @@ pub const Config = struct {
         }
     }
 
-    pub fn source(self: Config) []const u8 {
-        return self.image orelse self.raw_disk orelse self.fixed_vhd orelse "";
-    }
-
     pub fn paths(self: Config) [4][]const u8 {
-        return .{ self.source(), self.ovmf_code, self.ovmf_vars, self.qemu };
+        return .{ self.source.path, self.ovmf_code, self.ovmf_vars, self.qemu };
     }
 };
 
@@ -104,20 +126,28 @@ pub fn parse(a: std.mem.Allocator, args: []const []const u8) !Config {
         total += arg.len;
     }
     if (total > max_record) return error.TooManyArguments;
-    var result: Config = .{ .ovmf_code = "", .ovmf_vars = "", .qemu = "", .work_dir = "", .expect = "" };
+    var result: Config = .{
+        .source = .{ .kind = .image, .path = "" },
+        .ovmf_code = "",
+        .ovmf_vars = "",
+        .qemu = "",
+        .work_dir = "",
+        .expect = "",
+    };
+    var source_seen = false;
     var required: std.ArrayList([]const u8) = .empty;
     defer required.deinit(a);
     var forbidden: std.ArrayList([]const u8) = .empty;
     defer forbidden.deinit(a);
     var seen: u16 = 0;
     var i: usize = 0;
-    const names = [_][]const u8{ "--image", "--raw-disk", "--ovmf-code", "--ovmf-vars", "--qemu", "--work-dir", "--expect", "--expect-main-return", "--cpus", "--timeout", "--disable-x2apic", "--require-marker", "--forbid-marker", "--fixed-vhd" };
+    const names = [_][]const u8{ "--image", "--raw-disk", "--ovmf-code", "--ovmf-vars", "--qemu", "--work-dir", "--expect", "--expect-main-return", "--cpus", "--timeout", "--disable-x2apic", "--require-marker", "--forbid-marker", "--fixed-vhd", "--qcow2" };
     while (i < args.len) {
         const selected = for (names, 0..) |name, index| {
             if (std.mem.eql(u8, args[i], name)) break index;
         } else return error.UnknownArgument;
         i += 1;
-        if (selected < 11 or selected == 13) {
+        if (selected != 11 and selected != 12) {
             const bit = @as(u16, 1) << @intCast(selected);
             if (seen & bit != 0) return error.DuplicateArgument;
             seen |= bit;
@@ -130,8 +160,20 @@ pub fn parse(a: std.mem.Allocator, args: []const []const u8) !Config {
         const value = args[i];
         i += 1;
         switch (selected) {
-            0 => result.image = value,
-            1 => result.raw_disk = value,
+            0, 1, 13, 14 => {
+                if (source_seen) return error.InvalidSource;
+                result.source = .{
+                    .kind = switch (selected) {
+                        0 => .image,
+                        1 => .raw_disk,
+                        13 => .fixed_vhd,
+                        14 => .qcow2,
+                        else => unreachable,
+                    },
+                    .path = value,
+                };
+                source_seen = true;
+            },
             2 => result.ovmf_code = value,
             3 => result.ovmf_vars = value,
             4 => result.qemu = value,
@@ -140,7 +182,6 @@ pub fn parse(a: std.mem.Allocator, args: []const []const u8) !Config {
             7 => result.expect_main_return = try integer(i32, value),
             8 => result.cpus = try integer(u8, value),
             9 => result.timeout_ms = try timeout(value),
-            13 => result.fixed_vhd = value,
             11 => {
                 if (required.items.len == max_markers) return error.TooManyMarkers;
                 try required.append(a, value);
@@ -152,6 +193,7 @@ pub fn parse(a: std.mem.Allocator, args: []const []const u8) !Config {
             else => unreachable,
         }
     }
+    if (!source_seen) return error.InvalidSource;
     result.required = required.items;
     result.forbidden = forbidden.items;
     try result.validate();

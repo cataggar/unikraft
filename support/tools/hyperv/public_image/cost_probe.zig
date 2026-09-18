@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
     try f.dir.dir.writeFile(io, .{ .sub_path = "code.fd", .data = "synthetic firmware", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
     try f.dir.dir.writeFile(io, .{ .sub_path = "vars.fd", .data = "synthetic variables", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
     const config: image.boot.config.Config = .{
-        .raw_disk = raw,
+        .source = .{ .kind = .raw_disk, .path = raw },
         .qemu = qemu,
         .ovmf_code = try image.files.path(a, f.path, "code.fd"),
         .ovmf_vars = try image.files.path(a, f.path, "vars.fd"),

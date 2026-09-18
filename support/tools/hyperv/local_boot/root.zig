@@ -1,4 +1,5 @@
 pub const core = @import("hyperv_core");
+pub const miz = @import("miz");
 pub const config = @import("config.zig");
 pub const serial = @import("serial.zig");
 pub const files = @import("files.zig");

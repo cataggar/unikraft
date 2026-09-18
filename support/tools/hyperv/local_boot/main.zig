@@ -23,6 +23,10 @@ pub fn main(init: std.process.Init) void {
             error.DuplicateArgument,
             error.MissingArgument,
             error.InputInsideWorkspace,
+            error.InvalidQcow2,
+            error.InvalidQcow2Profile,
+            error.BackingFileNotSupported,
+            error.ExternalDataFileNotSupported,
             => .invalid_input,
             else => .local_io,
         };

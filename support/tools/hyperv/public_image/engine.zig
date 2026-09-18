@@ -105,8 +105,10 @@ fn retainSerial(a: std.mem.Allocator, io: std.Io, root: p.Directory, config: c.b
 pub fn bootConfig(a: std.mem.Allocator, state: c.State, index: usize) !c.boot.config.Config {
     if (index >= 4 or state.package == null) return error.InvalidMatrix;
     return .{
-        .raw_disk = if (index < 2) state.package.?.raw.path else null,
-        .fixed_vhd = if (index >= 2) state.package.?.vhd.path else null,
+        .source = if (index < 2)
+            .{ .kind = .raw_disk, .path = state.package.?.raw.path }
+        else
+            .{ .kind = .fixed_vhd, .path = state.package.?.vhd.path },
         .qemu = state.inputs.qemu.path,
         .ovmf_code = state.inputs.code.path,
         .ovmf_vars = state.inputs.vars.path,

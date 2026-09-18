@@ -187,7 +187,7 @@ test "public serial rejects colliding return APIC mismatch live IO and duplicate
     defer arena.deinit();
     const alloc = arena.allocator();
     const raw = try image.network.raw(alloc);
-    const config: image.boot.config.Config = .{ .raw_disk = "/public/raw", .qemu = "/public/qemu", .ovmf_code = "/public/code", .ovmf_vars = "/public/vars", .work_dir = "/public/work", .expect = c.platform_marker, .expect_main_return = 2 };
+    const config: image.boot.config.Config = .{ .source = .{ .kind = .raw_disk, .path = "/public/raw" }, .qemu = "/public/qemu", .ovmf_code = "/public/code", .ovmf_vars = "/public/vars", .work_dir = "/public/work", .expect = c.platform_marker, .expect_main_return = 2 };
     const good = serial_fixture.prefix ++ serial_fixture.application ++ serial_fixture.terminal;
     try image.network.serial(alloc, good, config, raw);
     for ([_][]const u8{ "main returned 20", "main returned 0", "main returned 2 trailing", "spoof main returned 2" }) |replacement| {
@@ -238,7 +238,7 @@ test "exact platform marker is unique between application start and anchored ret
     defer arena.deinit();
     const alloc = arena.allocator();
     const config: image.boot.config.Config = .{
-        .raw_disk = "/public/raw",
+        .source = .{ .kind = .raw_disk, .path = "/public/raw" },
         .qemu = "/public/qemu",
         .ovmf_code = "/public/code",
         .ovmf_vars = "/public/vars",

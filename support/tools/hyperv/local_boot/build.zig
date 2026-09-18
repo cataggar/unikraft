@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const test_root = b.option([]const u8, "test-root", "Existing absolute 0700 native fixture directory");
+    const miz = b.dependency("miz_source", .{ .target = target, .optimize = optimize }).module("miz");
     const strip_debug = b.option(bool, "strip-fixture-debug", "TESTS ONLY: gate debug-stripped copies of the two uninstalled synthetic QEMU fixtures") orelse false;
     const objcopy = b.option([]const u8, "fixture-objcopy", "Explicit absolute pinned native llvm-objcopy for TESTS ONLY");
     if (strip_debug and objcopy == null) @panic("strip-fixture-debug=true requires -Dfixture-objcopy=ABS");
@@ -39,7 +40,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "miz", .module = miz },
+        },
     });
     const synthetic_module = b.createModule(.{
         .root_source_file = b.path("root.zig"),
@@ -47,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hyperv_core", .module = core },
+            .{ .name = "miz", .module = miz },
             .{ .name = "synthetic_diagnostics", .module = diagnostics },
         },
     });

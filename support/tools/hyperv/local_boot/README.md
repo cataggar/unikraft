@@ -2,7 +2,8 @@
 
 Standalone Zig 0.16 replacement for `support/build/tests/hyperv-efi-boot-test.py`
 and its focused Python fixtures. No Python interpreter, SDK, cloud client,
-shell, package dependency, preparation engine, or host admission is used.
+shell, preparation engine, or host admission is used. QCOW2 inspection uses
+the exact pinned Miz host library and its native zstd dependency.
 Dedicated native CI fixtures and the fixed two-CPU SMP boot use this package.
 Public root CLI assembly and the remaining legacy Python call sites are separate
 integration work; this is not the complete Python-free controller cutover.
@@ -25,12 +26,14 @@ uk-hyperv-local-boot --raw-disk /canonical/public/smp.raw \
   --forbid-marker 'unwanted marker'
 ```
 
-Use `--image /canonical/application.efi` for a directory-backed ESP, or
-`--fixed-vhd /canonical/disk.vhd` for an actual fixed-VHD/vpc boot.
-Exactly one of image, raw disk, or fixed VHD is required. All five paths must be
-explicit, absolute, canonical, and free of symlink components. In particular,
-there is no QEMU PATH search or inherited environment. Commas/spaces in input
-paths are safe. Resolve external tool symlinks before invocation.
+Use `--image /canonical/application.efi` for a directory-backed ESP,
+`--fixed-vhd /canonical/disk.vhd` for an actual fixed-VHD/vpc boot, or
+`--qcow2 /canonical/disk.qcow2` for the narrow standalone native-Miz zstd
+profile. Exactly one of image, raw disk, fixed VHD, or QCOW2 is required. The
+selected source and the four supporting paths must be explicit, absolute,
+canonical, and free of symlink components. In particular, there is no QEMU
+PATH search or inherited environment. Commas/spaces in input paths are safe.
+Resolve external tool symlinks before invocation.
 
 The work directory must already exist, be current-user-owned mode 0700, and
 be empty except for the core's stable `.writer.lock`. It is **consumed once**;
@@ -71,15 +74,17 @@ only that the local assertions passed; 1 is execution/evidence failure,
 
 ## Execution and evidence
 
-`root.zig` exports `config`, `serial`, `files`, `runner`, `child`, `vhd`, and the
-dependency-free merged `core`.
+`root.zig` exports `config`, `serial`, `files`, `runner`, `child`, `vhd`, the
+dependency-free merged `core`, and the single pinned Miz module identity used
+by QCOW2 validation and native fixtures.
 
 - `config.parse(allocator, args)!Config` borrows strings and allocates its two
-  marker slices. `Config.validate()` also supports typed in-process callers.
+  marker slices. `Config.source` is the canonical `{kind,path}` tagged source;
+  `Config.validate()` also supports typed in-process callers.
 - `runner.run(allocator, io, Config, Options)!Report` requires a dedicated
   `core.process.initialize()` supervisor. `Options.self_executable` identifies
   this CLI; an optional atomic cancellation flag interrupts its leaf.
-- `child.arguments(allocator, Config, raw_size, raw_fd)` constructs only the
+- `child.arguments(allocator, Config, source_size, source_fd)` constructs only the
   fixed QEMU operation. Arena allocation is appropriate for an execution.
 - `serial.validate(allocator, raw, Config)!void` is a local marker validator,
   deliberately separate from the single-CPU signed host serial policies.
@@ -106,10 +111,11 @@ are supported. Source, firmware templates and QEMU are hashed in bounded
 full afterward, including inode/device, length and modification metadata.
 Path replacement, growth, truncation, or changed bytes cannot pass.
 
-The raw disk or fixed VHD is **never copied, staged, linked, reseeded, or writable**.
-QEMU receives the retained O_RDONLY descriptor via a JSON `-blockdev` file
-node and an exact-size read-only raw node at offset zero. This both avoids
-comma-based option injection and preserves exact backing-file identity.
+The raw disk, fixed VHD, or QCOW2 is **never copied, staged, linked, reseeded,
+or writable**. QEMU receives a separately inherited duplicate of the retained
+O_RDONLY descriptor. Raw uses the existing nested JSON `-blockdev` file node
+and exact-size read-only raw node at offset zero. This both avoids comma-based
+option injection and preserves exact backing-file identity.
 Fixed VHD instead uses a genuine read-only **`vpc`** node over the entire
 descriptor with no raw offset/size or creation-only options. Its footer is not
 sliced off. The virtual-size limit is 256 MiB, plus the 512-byte VHD footer.
@@ -118,16 +124,35 @@ Pinned QEMU v11.0.91-z.15 opens vpc through `BlockdevOptionsGenericFormat`;
 in opening JSON. The pinned miz creator tag `miz ` selects footer
 `current_size`. Legacy CHS-based creators are accepted only when that
 geometry gives the same exact size; no creator/footer bytes are rewritten.
+
+QCOW2 admission never reopens its pathname. The retained custody descriptor is
+duplicated once with close-on-exec for
+`miz.Image.openStandaloneQcow2File(io, duplicate)`; ownership transfers only
+after a successful open, `Image.close()` closes that duplicate, and the
+retained descriptor remains available for hashing and the later QEMU
+duplicate. Backing-file and external-data references are rejected by Miz's
+standalone entry point before referenced path I/O. The accepted profile is
+QCOW2 v3, native Miz zstd compression type 1, 64-KiB clusters, the exact
+supported incompatible feature bit, one bounded L1/refcount-table/refcount
+block shape, no encryption or snapshots, and no backing/data dependency.
+Checked metadata/refcount and physical mappings are validated before a bounded
+full virtual read exercises every allocated compressed cluster. QEMU receives two
+explicit nodes in order: a read-only `file` node over `/proc/self/fd/N`, then a
+read-only `qcow2` node named `local-boot-disk` referring to it. The existing
+`virtio-blk-pci,drive=local-boot-disk` device is unchanged.
+
 EFI mode copies only the supplied application into private
 `esp/EFI/BOOT/BOOTX64.EFI`; that disposable ESP retains legacy writable-FAT
 behavior. All modes make private firmware code and variables copies.
 
-Finite limits are 256 MiB per input/QEMU binary, 16 MiB firmware code,
-4 MiB firmware variables, 64 KiB control records, 4 MiB serial, and 8192
-normalized bytes per line. EFI preparation may copy up to the input plus
-firmware limits; disk modes copy **only** firmware. The 4-MiB process file
-limit also bounds regular-file writes to the variables/temporary files.
-These local limits are not a preflight staging ledger or data-upload authority.
+Finite limits are 256 MiB per physical input/QEMU binary, an independent
+256-MiB QCOW2 decoded/virtual capacity, 16 MiB firmware code, 4 MiB firmware
+variables, 64 KiB control records, 4 MiB serial, and 8192 normalized bytes per
+line. EFI preparation may copy up to the input plus firmware limits; disk
+modes copy **only** firmware. Neither QCOW2 bound is derived from
+`RLIMIT_FSIZE`: the child retains the existing 4-MiB writable-file limit for
+serial, variables, and temporary writes. These local limits are not a
+preflight staging ledger or data-upload authority.
 
 The hard monotonic leaf deadline includes its validation/copy/exec and QEMU
 work. Parent-side local admission and post-exit full-file hashing are bounded
@@ -162,8 +187,11 @@ or trailing-garbage returns, malformed serial, crash markers anywhere
 
 ## Offline build and fixtures
 
-No package restore is needed. Use Zig 0.16, `-j2`, and explicit owned scratch
-for HOME, TMPDIR, XDG/Zig caches and outputs, for example:
+The build restores only the exact Miz revision and hash recorded in
+`build.zig.zon`; Miz's exported `dependency.module("miz")` supplies its native
+zstd wiring. After that pinned restore is available, builds can run offline.
+Use Zig 0.16, `-j2`, and explicit owned scratch for HOME, TMPDIR, XDG/Zig
+caches and outputs, for example:
 
 ```text
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
@@ -208,8 +236,13 @@ uninstalled executable; the production CLI has no synthetic switch.
 Fixtures cover the legacy cases and native CPU/EFI/raw argument execution,
 fixed-VHD footer/geometry/exclusivity and unsliced vpc argument construction
 (the public-image suite additionally executes native four-mode vpc fixtures),
-read-only exact backing identity, private variables mutation, merged failure
-logs, deadlines/cancellation/ignored TERM, descendant reaping, process exit/
+plus a genuine native-zstd standalone QCOW2. QCOW2 coverage includes typed
+source serialization/exclusivity, exact two-node JSON, retained read-only
+descriptor identity, external-reference refusal, independent physical/virtual
+caps, malformed metadata/extents/features, decompression failure, source
+replacement/mutation, serial cap, timeout and descendant cleanup. Existing
+coverage retains read-only exact backing identity, private variables mutation,
+merged failure logs, deadlines/cancellation/ignored TERM, descendant reaping, process exit/
 kill/crash, cap exhaustion, consumption/locking, strict child records,
 artifact changes and unsafe files, independent failure lanes and actual CLI
 serialization/refusals. Only small public synthetic files are used; the
