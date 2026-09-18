@@ -62,6 +62,162 @@ pub const Execution = struct {
     unreaped_group: ?linux.pid_t = null,
 };
 
+pub const ExecutableIdentity = struct {
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+    size: u64,
+    mode: u16,
+    uid: u32,
+    mtime_seconds: i64,
+    mtime_nanoseconds: u32,
+    ctime_seconds: i64,
+    ctime_nanoseconds: u32,
+
+    fn fromStat(stat: files.Snapshot) ExecutableIdentity {
+        return .{
+            .device_major = stat.dev_major,
+            .device_minor = stat.dev_minor,
+            .inode = stat.ino,
+            .size = stat.size,
+            .mode = stat.mode,
+            .uid = stat.uid,
+            .mtime_seconds = stat.mtime.sec,
+            .mtime_nanoseconds = stat.mtime.nsec,
+            .ctime_seconds = stat.ctime.sec,
+            .ctime_nanoseconds = stat.ctime.nsec,
+        };
+    }
+};
+
+/// Borrowed by CommandRequest. The retained descriptor pins the executable
+/// selected by the caller; runCommand validates this identity before exec.
+pub const Executable = struct {
+    file: std.Io.File,
+    identity: ExecutableIdentity,
+
+    pub fn open(io: std.Io, path: []const u8) !Executable {
+        try files.absoluteFilePath(path);
+        var path_buffer: [4096:0]u8 = undefined;
+        @memcpy(path_buffer[0..path.len], path);
+        path_buffer[path.len] = 0;
+        const opened = linux.openat(linux.AT.FDCWD, path_buffer[0..path.len :0], .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+            .NOFOLLOW = true,
+        }, 0);
+        if (linux.errno(opened) != .SUCCESS) return error.ExecutableUnavailable;
+        const handle = aboveStdio(@intCast(opened)) catch return error.ExecutableUnavailable;
+        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        errdefer file.close(io);
+        const stat = try files.snapshot(file);
+        if (stat.mode & linux.S.IFMT != linux.S.IFREG or stat.mode & 0o111 == 0 or stat.mode & 0o6000 != 0)
+            return error.InvalidExecutable;
+        return .{ .file = file, .identity = .fromStat(stat) };
+    }
+
+    pub fn close(self: Executable, io: std.Io) void {
+        self.file.close(io);
+    }
+};
+
+pub const CommandLimits = struct {
+    stdout_bytes: usize = 64 * 1024,
+    stderr_bytes: usize = 64 * 1024,
+    descendants: u16 = 64,
+    primary_events: u32 = 1_000_000,
+    cleanup_events: u32 = 1_000_000,
+    proc_entries_per_scan: u32 = 262_144,
+    reap_events: u16 = 512,
+    term_grace_ms: u32 = 100,
+};
+
+/// Internal trusted-command contract. This is deliberately not a general CLI:
+/// argv, environment, cwd, executable descriptor and both absolute deadlines
+/// are supplied by the owning controller.
+pub const CommandRequest = struct {
+    executable: Executable,
+    argv: []const []const u8,
+    environment: *const std.process.Environ.Map,
+    cwd: std.Io.Dir,
+    primary_deadline: Deadline,
+    cleanup_deadline: Deadline,
+    cancel: ?*const std.atomic.Value(bool) = null,
+    limits: CommandLimits = .{},
+};
+
+pub const CommandPrimary = union(enum) {
+    exited: u8,
+    signal: linux.SIG,
+    unknown: u32,
+    timeout,
+    cancelled,
+    output_overflow,
+    exec_failed,
+    event_limit,
+    local_io,
+    executable_changed,
+};
+
+pub const CommandStreamStatus = enum { complete, overflow, io_failed, incomplete };
+
+pub const CommandCleanup = enum {
+    complete,
+    not_required,
+    deadline,
+    event_limit,
+    descendant_untracked,
+    identity_changed,
+    signal_failed,
+    reap_failed,
+    proc_unavailable,
+    local_io,
+};
+
+pub const CommandDescendants = struct {
+    observed: u16 = 0,
+    adopted: u16 = 0,
+    identity_validated: u16 = 0,
+    limit_exceeded: bool = false,
+    untracked: bool = false,
+};
+
+pub const CommandResult = struct {
+    storage: []u8,
+    stdout: []const u8 = &.{},
+    stderr: []const u8 = &.{},
+    executable: ExecutableIdentity,
+    executable_stable: bool = true,
+    primary: CommandPrimary,
+    termination: ?std.process.Child.Term = null,
+    primary_deadline_reached: bool = false,
+    cancellation_observed: bool = false,
+    stdout_status: CommandStreamStatus = .incomplete,
+    stderr_status: CommandStreamStatus = .incomplete,
+    descendants: CommandDescendants = .{},
+    cleanup: CommandCleanup = .not_required,
+    cleanup_complete: bool = true,
+    primary_events: u32 = 0,
+    cleanup_events: u32 = 0,
+    reap_events: u16 = 0,
+
+    pub fn succeeded(self: CommandResult) bool {
+        return switch (self.primary) {
+            .exited => |code| code == 0 and self.cleanup_complete and
+                self.cleanup == .complete and !self.descendants.limit_exceeded and
+                self.stdout_status == .complete and self.stderr_status == .complete and
+                self.executable_stable,
+            else => false,
+        };
+    }
+
+    pub fn deinit(self: *CommandResult, allocator: std.mem.Allocator) void {
+        std.crypto.secureZero(u8, self.storage);
+        allocator.free(self.storage);
+        self.* = undefined;
+    }
+};
+
 pub const private_output_limit = 8 * 1024 * 1024;
 pub const CaptureState = enum { complete, partial, overflow, io_failed, durability_failed };
 pub const PrivateOptions = struct {
@@ -102,7 +258,8 @@ var poisoned = std.atomic.Value(bool).init(false);
 var retained_writer: ?linux.fd_t = null;
 
 /// Explicit process-wide ownership policy. Use in a dedicated supervisor, not an
-/// application with unrelated waitpid users. Children may not escape their group.
+/// application with unrelated waitpid users. Legacy run/runPrivate require group
+/// containment; runCommand opts into bounded pidfd/procfs descendant discovery.
 pub fn initialize() !void {
     if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
         return error.SubreaperUnavailable;
@@ -129,6 +286,144 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
     } else {
         std.crypto.secureZero(u8, result.storage);
     }
+    return result;
+}
+
+/// Supervise one trusted Linux command and all ordinary descendants in a
+/// dedicated subreaper process. Descendants are identified by procfs
+/// parentage/start time, pinned with pidfds, signalled exactly, and fully
+/// reaped. Cleanup failure irreversibly poisons this process.
+pub fn runCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: CommandRequest,
+) !CommandResult {
+    const options = commandOptions(request);
+    try validateOptions(options, 4 * 1024 * 1024);
+    try validateCommandLimits(request.limits);
+    try enter();
+    defer busy.store(false, .release);
+    try requireNoChildren();
+    const proc = try openCommandProc();
+    defer _ = linux.close(proc);
+    try requirePidfds();
+    const before = try files.snapshot(request.executable.file);
+    if (!std.meta.eql(request.executable.identity, ExecutableIdentity.fromStat(before)))
+        return error.ExecutableIdentityChanged;
+
+    const total = try std.math.add(usize, request.limits.stdout_bytes, request.limits.stderr_bytes);
+    var result: CommandResult = .{
+        .storage = try allocator.alloc(u8, total),
+        .executable = request.executable.identity,
+        .primary = .local_io,
+    };
+    @memset(result.storage, 0);
+    errdefer result.deinit(allocator);
+    var capture: Capture = .{
+        .output = result.storage[0..request.limits.stdout_bytes],
+        .stderr_output = result.storage[request.limits.stdout_bytes..],
+        .stderr_limit = request.limits.stderr_bytes,
+    };
+    if (try request.primary_deadline.expired()) {
+        result.primary = .timeout;
+        result.primary_deadline_reached = true;
+        result.stdout_status = .complete;
+        result.stderr_status = .complete;
+        return result;
+    }
+    if (cancelled(options)) {
+        result.primary = .cancelled;
+        result.cancellation_observed = true;
+        result.stdout_status = .complete;
+        result.stderr_status = .complete;
+        return result;
+    }
+
+    var tracker = try OwnedTracker.init(allocator, request.limits.descendants);
+    defer tracker.deinit(allocator);
+    var child = spawnOwned(allocator, options, null, request.executable.file.handle) catch |err| {
+        if (err != error.SpawnFailed) return err;
+        result.primary = .local_io;
+        result.stdout_status = .complete;
+        result.stderr_status = .complete;
+        return result;
+    };
+    defer _ = linux.close(child.stdout);
+    defer _ = linux.close(child.stderr);
+    defer _ = linux.close(child.control);
+
+    tracker.addLeader(proc, child.pid) catch |err| {
+        result.cleanup_complete = false;
+        result.cleanup = switch (err) {
+            error.IdentityChanged => .identity_changed,
+            error.ProcessGone, error.ProcUnavailable, error.PidfdUnavailable => .proc_unavailable,
+        };
+        poisonAndRecoverLeader(child.pid, request.cleanup_deadline, &result);
+        return result;
+    };
+
+    var monitor_completed = true;
+    monitorCommand(&child, options, &capture, request.limits.primary_events, &result.primary_events) catch |err| {
+        monitor_completed = false;
+        switch (err) {
+            error.DeadlineExceeded => {
+                result.primary = .timeout;
+                result.primary_deadline_reached = true;
+            },
+            error.Cancelled => {
+                result.primary = .cancelled;
+                result.cancellation_observed = true;
+            },
+            error.StdoutLimit => {
+                result.primary = .output_overflow;
+                result.stdout_status = .overflow;
+            },
+            error.StderrLimit => {
+                result.primary = .output_overflow;
+                result.stderr_status = .overflow;
+            },
+            error.SpawnFailed => result.primary = .exec_failed,
+            error.EventLimit => result.primary = .event_limit,
+            error.StdoutIo => result.stdout_status = .io_failed,
+            error.StderrIo => result.stderr_status = .io_failed,
+            else => {},
+        }
+        if (err == error.StdoutIo or err == error.StderrIo or err == error.PollFailed or err == error.WaitFailed)
+            result.primary = .local_io;
+    };
+
+    cleanupCommand(io, proc, request, &tracker, &result) catch |err| {
+        result.cleanup_complete = false;
+        result.cleanup = switch (err) {
+            error.CleanupDeadline => .deadline,
+            error.EventLimit, error.ProcEntryLimit, error.ReapLimit => .event_limit,
+            error.DescendantUntracked => .descendant_untracked,
+            error.IdentityChanged => .identity_changed,
+            error.SignalFailed => .signal_failed,
+            error.ReapFailed => .reap_failed,
+            error.ProcUnavailable, error.PidfdUnavailable => .proc_unavailable,
+            error.ClockUnavailable, error.PollFailed => .local_io,
+            else => .local_io,
+        };
+        poisonCommand(io, proc, request, &tracker, &result);
+    };
+    result.descendants = tracker.report;
+
+    finishCommandCapture(&capture, child.stdout, child.stderr, &result);
+    result.stdout = capture.output[0..capture.stdout_count];
+    result.stderr = capture.stderr_output[0..capture.stderr_count];
+    if (monitor_completed) result.primary = primaryFromTermination(result.termination);
+    if (primaryExitedZero(result.primary) and
+        (result.stdout_status == .overflow or result.stderr_status == .overflow))
+        result.primary = .output_overflow;
+
+    const after: ?files.Snapshot = files.snapshot(request.executable.file) catch null;
+    result.executable_stable = if (after) |stat|
+        std.meta.eql(request.executable.identity, ExecutableIdentity.fromStat(stat))
+    else
+        false;
+    if (!result.executable_stable and primaryExitedZero(result.primary))
+        result.primary = .executable_changed;
     return result;
 }
 
@@ -265,6 +560,31 @@ fn validateOptions(options: Options, maximum: usize) !void {
     if (environment_bytes > 256 * 1024) return error.InvalidOptions;
 }
 
+fn commandOptions(request: CommandRequest) Options {
+    return .{
+        .argv = request.argv,
+        .environment = request.environment,
+        .cwd = request.cwd,
+        .deadline = request.primary_deadline,
+        .cleanup_ms = 100,
+        .stdout_limit = request.limits.stdout_bytes,
+        .stderr_limit = request.limits.stderr_bytes,
+        .cancel = request.cancel,
+    };
+}
+
+fn validateCommandLimits(limits: CommandLimits) !void {
+    if (limits.stdout_bytes == 0 or limits.stderr_bytes == 0 or
+        limits.stdout_bytes > 4 * 1024 * 1024 or limits.stderr_bytes > 4 * 1024 * 1024 or
+        limits.descendants == 0 or limits.descendants > 256 or
+        limits.primary_events < 16 or limits.primary_events > 10_000_000 or
+        limits.cleanup_events < 32 or limits.cleanup_events > 10_000_000 or
+        limits.proc_entries_per_scan < 16 or limits.proc_entries_per_scan > 1_000_000 or
+        limits.reap_events < limits.descendants + 1 or limits.reap_events > 1024 or
+        limits.term_grace_ms == 0 or limits.term_grace_ms > 60_000)
+        return error.InvalidOptions;
+}
+
 fn enter() !void {
     if (busy.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.SupervisorBusy;
     errdefer busy.store(false, .release);
@@ -295,7 +615,7 @@ fn supervise(allocator: std.mem.Allocator, options: Options, capture: *Capture, 
         result.failures.primary = .{ .stage = .process_spawn, .category = .cancelled };
         return result;
     }
-    var child = spawnOwned(allocator, options, policy.fault) catch {
+    var child = spawnOwned(allocator, options, policy.fault, null) catch {
         result.failures.primary = .{ .stage = .process_spawn, .category = .spawn_failed };
         return result;
     };
@@ -349,6 +669,7 @@ fn supervise(allocator: std.mem.Allocator, options: Options, capture: *Capture, 
 
 const Capture = struct {
     output: []u8,
+    stderr_output: []u8 = &.{},
     stderr_limit: usize,
     stdout_count: usize = 0,
     stderr_count: usize = 0,
@@ -410,9 +731,19 @@ const Capture = struct {
                             }
                         }
                     } else {
-                        if (n > fitting) return error.OutputLimit;
-                        if (!stderr) @memcpy(self.output[count.*..][0..n], buffer[0..n]);
-                        count.* += n;
+                        if (fitting != 0) {
+                            if (stderr) {
+                                if (self.stderr_output.len != 0)
+                                    @memcpy(self.stderr_output[count.*..][0..fitting], buffer[0..fitting]);
+                            } else {
+                                @memcpy(self.output[count.*..][0..fitting], buffer[0..fitting]);
+                            }
+                            count.* += fitting;
+                        }
+                        if (n > fitting) {
+                            self.state = .overflow;
+                            return error.OutputLimit;
+                        }
                     }
                     if (n > fitting) {
                         self.state = .overflow;
@@ -459,6 +790,70 @@ fn monitor(child: *Spawned, options: Options, capture: *Capture) !void {
             else => return error.PollFailed,
         }
     }
+}
+
+fn monitorCommand(
+    child: *Spawned,
+    options: Options,
+    capture: *Capture,
+    event_limit: u32,
+    events: *u32,
+) !void {
+    try nonblocking(child.stdout);
+    try nonblocking(child.stderr);
+    try nonblocking(child.control);
+    var exec_confirmed = false;
+    while (true) {
+        try takeCommandEvent(event_limit, events);
+        if (cancelled(options)) return error.Cancelled;
+        if (try options.deadline.expired()) return error.DeadlineExceeded;
+        if (!capture.stdout_eof) capture.drain(child.stdout, false, options) catch |err| switch (err) {
+            error.OutputLimit => return error.StdoutLimit,
+            error.CaptureFailed => return error.StdoutIo,
+            error.Cancelled => return error.Cancelled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.StdoutIo,
+        };
+        if (!capture.stderr_eof) capture.drain(child.stderr, true, options) catch |err| switch (err) {
+            error.OutputLimit => return error.StderrLimit,
+            error.CaptureFailed => return error.StderrIo,
+            error.Cancelled => return error.Cancelled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.StderrIo,
+        };
+        if (!exec_confirmed) exec_confirmed = try execStatus(child.control);
+        if (try exited(child.pid)) {
+            if (!exec_confirmed and !try execStatus(child.control)) return error.SpawnFailed;
+            if (!capture.stdout_eof) capture.drain(child.stdout, false, options) catch |err| switch (err) {
+                error.OutputLimit => return error.StdoutLimit,
+                error.CaptureFailed => return error.StdoutIo,
+                error.Cancelled => return error.Cancelled,
+                error.DeadlineExceeded => return error.DeadlineExceeded,
+                else => return error.StdoutIo,
+            };
+            if (!capture.stderr_eof) capture.drain(child.stderr, true, options) catch |err| switch (err) {
+                error.OutputLimit => return error.StderrLimit,
+                error.CaptureFailed => return error.StderrIo,
+                error.Cancelled => return error.Cancelled,
+                error.DeadlineExceeded => return error.DeadlineExceeded,
+                else => return error.StderrIo,
+            };
+            return;
+        }
+        var pollfds = [_]linux.pollfd{
+            .{ .fd = if (capture.stdout_eof) -1 else child.stdout, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = if (capture.stderr_eof) -1 else child.stderr, .events = linux.POLL.IN, .revents = 0 },
+        };
+        switch (linux.errno(linux.poll(&pollfds, pollfds.len, try options.deadline.waitMilliseconds(10)))) {
+            .SUCCESS, .INTR => {},
+            else => return error.PollFailed,
+        }
+    }
+}
+
+fn takeCommandEvent(limit: u32, events: *u32) !void {
+    if (events.* >= limit) return error.EventLimit;
+    events.* += 1;
 }
 
 fn cancelled(options: Options) bool {
@@ -533,6 +928,455 @@ fn cleanup(pid: linux.pid_t, milliseconds: u32, result: *Execution, policy: Clea
     }
 }
 
+const ProcStat = struct {
+    pid: linux.pid_t,
+    parent: linux.pid_t,
+    start_ticks: u64,
+};
+
+const OwnedProcess = struct {
+    pid: linux.pid_t,
+    start_ticks: u64,
+    pidfd: linux.fd_t,
+    term_sent: bool = false,
+    kill_sent: bool = false,
+};
+
+const OwnedTracker = struct {
+    items: []OwnedProcess,
+    len: usize = 0,
+    descendant_limit: u16,
+    report: CommandDescendants = .{},
+
+    fn init(allocator: std.mem.Allocator, descendant_limit: u16) !OwnedTracker {
+        return .{
+            .items = try allocator.alloc(OwnedProcess, @as(usize, descendant_limit) + 2),
+            .descendant_limit = descendant_limit,
+        };
+    }
+
+    fn deinit(self: *OwnedTracker, allocator: std.mem.Allocator) void {
+        for (self.items[0..self.len]) |item| _ = linux.close(item.pidfd);
+        allocator.free(self.items);
+        self.* = undefined;
+    }
+
+    fn addLeader(self: *OwnedTracker, proc: linux.fd_t, pid: linux.pid_t) !void {
+        const descriptor = try commandPidfd(pid);
+        errdefer _ = linux.close(descriptor);
+        const identity = try readProcStat(proc, pid);
+        if (identity.pid != pid or identity.parent != linux.getpid() or identity.start_ticks == 0)
+            return error.IdentityChanged;
+        self.items[0] = .{ .pid = pid, .start_ticks = identity.start_ticks, .pidfd = descriptor };
+        self.len = 1;
+    }
+
+    fn findPid(self: *const OwnedTracker, pid: linux.pid_t) ?usize {
+        for (self.items[0..self.len], 0..) |item, index| if (item.pid == pid) return index;
+        return null;
+    }
+
+    fn ownsParent(self: *const OwnedTracker, parent: linux.pid_t) bool {
+        if (parent == linux.getpid()) return true;
+        return self.findPid(parent) != null;
+    }
+
+    fn addDescendant(self: *OwnedTracker, identity: ProcStat, descriptor: linux.fd_t) bool {
+        if (self.len == self.items.len) {
+            self.report.untracked = true;
+            return false;
+        }
+        self.items[self.len] = .{
+            .pid = identity.pid,
+            .start_ticks = identity.start_ticks,
+            .pidfd = descriptor,
+        };
+        self.len += 1;
+        self.report.observed += 1;
+        self.report.identity_validated += 1;
+        if (identity.parent == linux.getpid()) self.report.adopted += 1;
+        if (self.report.observed > self.descendant_limit) self.report.limit_exceeded = true;
+        return true;
+    }
+};
+
+const CleanupSignal = enum { term, kill };
+
+fn cleanupCommand(
+    io: std.Io,
+    proc: linux.fd_t,
+    request: CommandRequest,
+    tracker: *OwnedTracker,
+    result: *CommandResult,
+) !void {
+    const started = try now();
+    const grace_ns = try std.math.mul(u64, request.limits.term_grace_ms, std.time.ns_per_ms);
+    const grace: Deadline = .{
+        .expires_ns = @min(request.cleanup_deadline.expires_ns, try std.math.add(u64, started, grace_ns)),
+    };
+
+    _ = try scanOwned(io, proc, request, tracker, result, .term);
+    try signalTracked(request, tracker, result, .term);
+    while (!try allTrackedExited(request, tracker, result)) {
+        if (try grace.expired()) break;
+        _ = try scanOwned(io, proc, request, tracker, result, .term);
+        if (tracker.report.untracked) break;
+        try signalTracked(request, tracker, result, .term);
+        try pause(try grace.waitMilliseconds(5));
+    }
+
+    _ = try scanOwned(io, proc, request, tracker, result, .kill);
+    try signalTracked(request, tracker, result, .kill);
+    if (tracker.report.untracked) return error.DescendantUntracked;
+    while (true) {
+        const added = try scanOwned(io, proc, request, tracker, result, .kill);
+        try signalTracked(request, tracker, result, .kill);
+        if (tracker.report.untracked) return error.DescendantUntracked;
+        if (try allTrackedExited(request, tracker, result)) {
+            const final_added = try scanOwned(io, proc, request, tracker, result, .kill);
+            try signalTracked(request, tracker, result, .kill);
+            if (!added and !final_added and try allTrackedExited(request, tracker, result)) break;
+        }
+        if (try request.cleanup_deadline.expired()) return error.CleanupDeadline;
+        try pause(try request.cleanup_deadline.waitMilliseconds(5));
+    }
+    try reapCommand(request, tracker, result);
+    result.cleanup = .complete;
+    result.cleanup_complete = true;
+}
+
+fn scanOwned(
+    io: std.Io,
+    proc: linux.fd_t,
+    request: CommandRequest,
+    tracker: *OwnedTracker,
+    result: *CommandResult,
+    phase: CleanupSignal,
+) !bool {
+    var discovered_any = false;
+    while (true) {
+        const opened = linux.openat(proc, ".", .{
+            .ACCMODE = .RDONLY,
+            .DIRECTORY = true,
+            .CLOEXEC = true,
+            .NOFOLLOW = true,
+        }, 0);
+        if (linux.errno(opened) != .SUCCESS) return error.ProcUnavailable;
+        const directory: std.Io.Dir = .{ .handle = @intCast(opened) };
+        defer directory.close(io);
+        var iterator = directory.iterate();
+        var entries: u32 = 0;
+        var discovered_pass = false;
+        while (iterator.next(io) catch return error.ProcUnavailable) |entry| {
+            if (entries >= request.limits.proc_entries_per_scan) return error.ProcEntryLimit;
+            entries += 1;
+            try takeCleanupEvent(request, result);
+            const pid = std.fmt.parseInt(linux.pid_t, entry.name, 10) catch continue;
+            if (pid <= 1 or pid == linux.getpid()) continue;
+            if (tracker.findPid(pid)) |index| {
+                const current = readProcStat(proc, pid) catch |err| switch (err) {
+                    error.ProcessGone => continue,
+                    else => return error.ProcUnavailable,
+                };
+                if (current.start_ticks != tracker.items[index].start_ticks) return error.IdentityChanged;
+                continue;
+            }
+            const observed = readProcStat(proc, pid) catch continue;
+            if (!tracker.ownsParent(observed.parent)) continue;
+            const descriptor = commandPidfd(pid) catch |err| switch (err) {
+                error.ProcessGone => continue,
+                else => return error.PidfdUnavailable,
+            };
+            const verified = readProcStat(proc, pid) catch |err| {
+                _ = linux.close(descriptor);
+                switch (err) {
+                    error.ProcessGone => continue,
+                    else => return error.ProcUnavailable,
+                }
+            };
+            if (verified.start_ticks != observed.start_ticks or !tracker.ownsParent(verified.parent)) {
+                _ = linux.close(descriptor);
+                return error.IdentityChanged;
+            }
+            if (!tracker.addDescendant(verified, descriptor)) {
+                try signalTemporary(descriptor, phase);
+                _ = linux.close(descriptor);
+            } else {
+                try signalOwned(request, &tracker.items[tracker.len - 1], result, phase);
+            }
+            discovered_pass = true;
+            discovered_any = true;
+        }
+        if (!discovered_pass or tracker.report.untracked) return discovered_any;
+    }
+}
+
+fn signalTracked(
+    request: CommandRequest,
+    tracker: *OwnedTracker,
+    result: *CommandResult,
+    phase: CleanupSignal,
+) !void {
+    for (tracker.items[0..tracker.len]) |*item| try signalOwned(request, item, result, phase);
+}
+
+fn signalOwned(
+    request: CommandRequest,
+    item: *OwnedProcess,
+    result: *CommandResult,
+    phase: CleanupSignal,
+) !void {
+    const already = if (phase == .term) item.term_sent else item.kill_sent;
+    if (already) return;
+    try takeCleanupEvent(request, result);
+    if (try pidfdExited(item.pidfd)) {
+        if (phase == .term) item.term_sent = true else item.kill_sent = true;
+        return;
+    }
+    const signal: linux.SIG = if (phase == .term) .TERM else .KILL;
+    switch (linux.errno(linux.pidfd_send_signal(item.pidfd, signal, null, 0))) {
+        .SUCCESS, .SRCH => {},
+        else => return error.SignalFailed,
+    }
+    if (phase == .term) item.term_sent = true else item.kill_sent = true;
+}
+
+fn signalTemporary(descriptor: linux.fd_t, phase: CleanupSignal) !void {
+    const signal: linux.SIG = if (phase == .term) .TERM else .KILL;
+    switch (linux.errno(linux.pidfd_send_signal(descriptor, signal, null, 0))) {
+        .SUCCESS, .SRCH => {},
+        else => return error.SignalFailed,
+    }
+}
+
+fn allTrackedExited(
+    request: CommandRequest,
+    tracker: *const OwnedTracker,
+    result: *CommandResult,
+) !bool {
+    for (tracker.items[0..tracker.len]) |item| {
+        try takeCleanupEvent(request, result);
+        if (!try pidfdExited(item.pidfd)) return false;
+    }
+    return true;
+}
+
+fn pidfdExited(descriptor: linux.fd_t) !bool {
+    var pollfds = [_]linux.pollfd{.{ .fd = descriptor, .events = linux.POLL.IN, .revents = 0 }};
+    switch (linux.errno(linux.poll(&pollfds, pollfds.len, 0))) {
+        .SUCCESS => {},
+        .INTR => return false,
+        else => return error.PollFailed,
+    }
+    if (pollfds[0].revents & linux.POLL.NVAL != 0) return error.PollFailed;
+    return pollfds[0].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0;
+}
+
+fn reapCommand(request: CommandRequest, tracker: *OwnedTracker, result: *CommandResult) !void {
+    while (true) {
+        if (result.reap_events >= request.limits.reap_events) return error.ReapLimit;
+        result.reap_events += 1;
+        var status: u32 = 0;
+        const child = linux.waitpid(-1, &status, linux.W.NOHANG);
+        switch (linux.errno(child)) {
+            .SUCCESS => {
+                if (child != 0) {
+                    const pid: linux.pid_t = @intCast(child);
+                    if (pid == tracker.items[0].pid) result.termination = terminationFromStatus(status);
+                    continue;
+                }
+            },
+            .CHILD => {
+                if (result.termination == null) return error.ReapFailed;
+                return;
+            },
+            .INTR => continue,
+            else => return error.ReapFailed,
+        }
+        if (try request.cleanup_deadline.expired()) return error.CleanupDeadline;
+        try pause(try request.cleanup_deadline.waitMilliseconds(2));
+    }
+}
+
+fn terminationFromStatus(status: u32) std.process.Child.Term {
+    if (linux.W.IFEXITED(status)) return .{ .exited = linux.W.EXITSTATUS(status) };
+    if (linux.W.IFSIGNALED(status)) return .{ .signal = linux.W.TERMSIG(status) };
+    return .{ .unknown = status };
+}
+
+fn primaryFromTermination(termination: ?std.process.Child.Term) CommandPrimary {
+    if (termination) |value| return switch (value) {
+        .exited => |code| .{ .exited = code },
+        .signal => |signal| .{ .signal = signal },
+        .unknown => |status| .{ .unknown = status },
+        else => .{ .unknown = 0 },
+    };
+    return .local_io;
+}
+
+fn primaryExitedZero(primary: CommandPrimary) bool {
+    return switch (primary) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn finishCommandCapture(
+    capture: *Capture,
+    stdout: linux.fd_t,
+    stderr: linux.fd_t,
+    result: *CommandResult,
+) void {
+    if (result.stdout_status != .overflow) capture.drainFinal(stdout, false) catch |err| {
+        result.stdout_status = if (err == error.OutputLimit) .overflow else .io_failed;
+    };
+    if (result.stderr_status != .overflow) capture.drainFinal(stderr, true) catch |err| {
+        result.stderr_status = if (err == error.OutputLimit) .overflow else .io_failed;
+    };
+    if (result.stdout_status != .overflow and result.stdout_status != .io_failed)
+        result.stdout_status = if (capture.stdout_eof) .complete else .incomplete;
+    if (result.stderr_status != .overflow and result.stderr_status != .io_failed)
+        result.stderr_status = if (capture.stderr_eof) .complete else .incomplete;
+}
+
+fn takeCleanupEvent(request: CommandRequest, result: *CommandResult) !void {
+    if (try request.cleanup_deadline.expired()) return error.CleanupDeadline;
+    if (result.cleanup_events >= request.limits.cleanup_events) return error.EventLimit;
+    result.cleanup_events += 1;
+}
+
+fn commandPidfd(pid: linux.pid_t) !linux.fd_t {
+    const opened = linux.pidfd_open(pid, 0);
+    return switch (linux.errno(opened)) {
+        .SUCCESS => @intCast(opened),
+        .SRCH => error.ProcessGone,
+        else => error.PidfdUnavailable,
+    };
+}
+
+fn readProcStat(proc: linux.fd_t, pid: linux.pid_t) !ProcStat {
+    var path: [64:0]u8 = undefined;
+    const name = std.fmt.bufPrintZ(&path, "{d}/stat", .{pid}) catch return error.ProcUnavailable;
+    const opened = linux.openat(proc, name, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    switch (linux.errno(opened)) {
+        .SUCCESS => {},
+        .NOENT, .SRCH => return error.ProcessGone,
+        else => return error.ProcUnavailable,
+    }
+    const descriptor: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(descriptor);
+    var buffer: [4096]u8 = undefined;
+    var length: usize = 0;
+    while (true) {
+        const amount = linux.read(descriptor, buffer[length..].ptr, buffer.len - length);
+        switch (linux.errno(amount)) {
+            .SUCCESS => {
+                if (amount == 0) break;
+                length += amount;
+                if (length == buffer.len) return error.ProcUnavailable;
+            },
+            .INTR => continue,
+            else => return error.ProcUnavailable,
+        }
+    }
+    const record = buffer[0..length];
+    const end = std.mem.lastIndexOfScalar(u8, record, ')') orelse return error.ProcUnavailable;
+    var fields = std.mem.tokenizeScalar(u8, record[end + 2 ..], ' ');
+    var index: usize = 3;
+    var parent: ?linux.pid_t = null;
+    var start_ticks: ?u64 = null;
+    while (fields.next()) |field| : (index += 1) {
+        if (index == 4) parent = std.fmt.parseInt(linux.pid_t, field, 10) catch return error.ProcUnavailable;
+        if (index == 22) {
+            start_ticks = std.fmt.parseInt(u64, field, 10) catch return error.ProcUnavailable;
+            break;
+        }
+    }
+    return .{
+        .pid = pid,
+        .parent = parent orelse return error.ProcUnavailable,
+        .start_ticks = start_ticks orelse return error.ProcUnavailable,
+    };
+}
+
+fn openCommandProc() !linux.fd_t {
+    const opened = linux.openat(linux.AT.FDCWD, "/proc", .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.ProcUnavailable;
+    const descriptor: linux.fd_t = @intCast(opened);
+    errdefer _ = linux.close(descriptor);
+    const Statfs = extern struct {
+        f_type: usize,
+        bsize: usize,
+        blocks: u64,
+        bfree: u64,
+        bavail: u64,
+        files_count: u64,
+        ffree: u64,
+        fsid: [2]i32,
+        namelen: usize,
+        frsize: usize,
+        flags: usize,
+        spare: [4]usize,
+    };
+    var metadata: Statfs = undefined;
+    if (linux.errno(linux.syscall2(.fstatfs, @intCast(descriptor), @intFromPtr(&metadata))) != .SUCCESS or
+        metadata.f_type != 0x9fa0) return error.ProcUnavailable;
+    return descriptor;
+}
+
+fn requirePidfds() !void {
+    const descriptor = try commandPidfd(linux.getpid());
+    defer _ = linux.close(descriptor);
+    const signal: linux.SIG = @enumFromInt(0);
+    if (linux.errno(linux.pidfd_send_signal(descriptor, signal, null, 0)) != .SUCCESS)
+        return error.PidfdUnavailable;
+}
+
+fn poisonCommand(
+    io: std.Io,
+    proc: linux.fd_t,
+    request: CommandRequest,
+    tracker: *OwnedTracker,
+    result: *CommandResult,
+) void {
+    for (tracker.items[0..tracker.len]) |*item| {
+        _ = linux.pidfd_send_signal(item.pidfd, .KILL, null, 0);
+        item.kill_sent = true;
+    }
+    _ = scanOwned(io, proc, request, tracker, result, .kill) catch false;
+    var attempts: u16 = 0;
+    while (attempts < request.limits.reap_events) : (attempts += 1) {
+        var status: u32 = 0;
+        const child = linux.waitpid(-1, &status, linux.W.NOHANG);
+        if (linux.errno(child) == .CHILD or child == 0) break;
+        if (linux.errno(child) != .SUCCESS and linux.errno(child) != .INTR) break;
+        if (linux.errno(child) == .SUCCESS and @as(linux.pid_t, @intCast(child)) == tracker.items[0].pid)
+            result.termination = terminationFromStatus(status);
+    }
+    poisoned.store(true, .release);
+}
+
+fn poisonAndRecoverLeader(pid: linux.pid_t, deadline: Deadline, result: *CommandResult) void {
+    _ = linux.kill(pid, .KILL);
+    var attempts: u16 = 0;
+    while (attempts < 1024 and !(deadline.expired() catch true)) : (attempts += 1) {
+        var status: u32 = 0;
+        const child = linux.waitpid(pid, &status, linux.W.NOHANG);
+        if (linux.errno(child) == .SUCCESS and child != 0) {
+            result.termination = terminationFromStatus(status);
+            break;
+        }
+        if (linux.errno(child) == .CHILD) break;
+        pause(deadline.waitMilliseconds(2) catch 0) catch break;
+    }
+    poisoned.store(true, .release);
+}
+
 fn signalGroup(pid: linux.pid_t, signal: linux.SIG) !void {
     switch (linux.errno(linux.kill(-pid, signal))) {
         .SUCCESS, .SRCH => {},
@@ -578,7 +1422,12 @@ const Spawned = struct {
 
 // Zig 0.16 Threaded.spawn loses PID and pipe ownership on exec failure. Keep the
 // fork/exec handshake here so both spawn errors and pre-exec stalls are supervised.
-fn spawnOwned(allocator: std.mem.Allocator, options: Options, fault: ?PrivateTestFault) !Spawned {
+fn spawnOwned(
+    allocator: std.mem.Allocator,
+    options: Options,
+    fault: ?PrivateTestFault,
+    executable: ?linux.fd_t,
+) !Spawned {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -621,7 +1470,14 @@ fn spawnOwned(allocator: std.mem.Allocator, options: Options, fault: ?PrivateTes
         // are shifted by one. Preserve only stdio at exec, including private locks.
         if (linux.errno(linux.close_range(3, std.math.maxInt(linux.fd_t), @bitCast(@as(u32, 1 << 2)))) != .SUCCESS)
             childFailure(control[1]);
-        _ = linux.execve(argv[0].?, argv.ptr, environment.slice.ptr);
+        if (executable) |descriptor| {
+            _ = linux.execveat(descriptor, "", argv.ptr, environment.slice.ptr, .{
+                .EMPTY_PATH = true,
+                .SYMLINK_NOFOLLOW = true,
+            });
+        } else {
+            _ = linux.execve(argv[0].?, argv.ptr, environment.slice.ptr);
+        }
         childFailure(control[1]);
     }
     // Establish the group from both sides of fork, before a deadline can race

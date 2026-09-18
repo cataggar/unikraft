@@ -448,6 +448,61 @@ never success. Parent-death signaling alone does not replace independent
 whole-tree cleanup after a supervisor crash. Native controller/parent/host
 state machines must implement that higher-level recovery protocol.
 
+`runCommand(allocator, io, CommandRequest)` is a separate opt-in internal
+contract for controllers that need ordinary Linux detached-child cleanup.
+It does not change `run` or `runPrivate`, and there is no user-facing command
+wrapper. `CommandRequest` borrows an `Executable` opened with
+`Executable.open`; the retained descriptor and full stat identity select the
+exact executable used by `execveat`. The request also supplies explicit argv,
+environment and cwd, one absolute primary `Deadline`, one independent absolute
+cleanup `Deadline`, optional cancellation, and fixed limits. The executable
+identity is checked before launch and after cleanup to detect persistent or
+accidental mutation.
+
+The command mode requires an authority-free Linux 5.11-or-newer host with
+procfs, child-subreaper support, pidfds and `pidfd_send_signal`. It requires a
+dedicated process with no pre-existing children. During cleanup it scans
+bounded procfs records, traces parentage from the unreaped leader or the
+subreaper, validates `/proc/PID/stat` start ticks around `pidfd_open`, and keeps
+the leader and discovered ancestors unreaped until all live descendants have
+been signalled. This includes ordinary children that call `setsid()` and
+ordinary double-fork descendants adopted by the subreaper. Every exact pidfd
+receives TERM and, if it remains live after the one fixed grace interval, KILL.
+Only after a final stable discovery pass reports no live owned process does
+the supervisor reap until `ECHILD`. Escaped writers cannot extend the primary
+deadline: pipes are nonblocking, bounded, finally drained after proven cleanup,
+and always closed.
+
+Primary and cleanup time do not accumulate or restart per output event,
+descendant, signal or reap. Defaults are 64 KiB per output stream, 64
+descendants plus one bounded first-excess observation, one million primary and
+cleanup events, 262,144 proc entries per scan, 512 reap events, and one 100 ms
+TERM grace. Hard maxima are 4 MiB per stream, 256 requested descendants, ten
+million events, one million proc entries per scan, 1,024 reap events, 128 argv
+items/256 KiB argv, 256 environment entries/256 KiB environment, and a 4,095
+byte executable path.
+
+`CommandResult` owns zeroized bounded stdout/stderr storage and reports the
+leader's primary outcome, termination, deadline/cancellation observations,
+per-stream completion/overflow/I/O status, executable stability, descendant
+count/adoption/identity validation and first-excess state, fixed event/reap
+counts, plus an independent `CommandCleanup`. A first excess is reported and
+cleaned when it is the only excess, but makes `succeeded()` false. Untracked
+additional descendants, identity ambiguity, signal/reap/proc failures, or
+cleanup-deadline exhaustion make cleanup incomplete and irreversibly poison
+the supervisor. No later call can turn that uncertainty into success.
+
+This mode cleans cooperative or accidentally detached descendants owned by the
+subreaper. It is not a security boundary against a malicious concurrent
+same-UID process or a compromised child. It does not add PID, user or mount
+namespaces, capabilities, privileged admission, Azure credentials/authority,
+or crash recovery. Credential changes, a descendant installing a nearer
+subreaper, kernel-uninterruptible tasks, procfs/pidfd denial, and other
+unsupported kernel escape mechanisms can make proof impossible; the result is
+explicit cleanup failure and poison, not a custody claim. Use the separate
+operator guard only where its namespace custody contract is explicitly
+required.
+
 ## Native operator process custody
 
 The separate [operator guard](operator_guard/README.md) provides kernel-backed
