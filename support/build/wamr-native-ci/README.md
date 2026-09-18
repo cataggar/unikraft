@@ -92,7 +92,9 @@ unrelated `/usr/bin` members. Native Make receives retained descriptor paths
 for Zig, Python and its consumed copy/directory/readlink helpers; the Zig-owned
 link and post-processing graph receives the retained compiler, binutils,
 readelf and copy paths and uses the objcopy interface for descriptor-safe
-stripping. Native Make's unused Wget version probe is disabled by a fixed
+stripping. The hosted workflow first materializes the pinned Zig distribution
+create-only beneath the owned ignored `.d` tool root, avoiding mutable
+runner-managed ancestor directories. Native Make's unused Wget version probe is disabled by a fixed
 offline build-contract value. Every record binds device/inode,
 type/mode, uid/gid, link count, size, nanosecond mtime/ctime and content
 identity, with deduplicated absolute directory-component identities. The

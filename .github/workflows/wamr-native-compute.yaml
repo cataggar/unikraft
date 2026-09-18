@@ -95,6 +95,12 @@ jobs:
           set -euo pipefail
           umask 077
           root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          zig_source="$(dirname "$(readlink -f "$(command -v zig)")")"
+          zig_dir="${GITHUB_WORKSPACE}/.d/wamr-native-tools/zig-0.16.0"
+          test ! -e "${zig_dir}"
+          mkdir -p -m 700 "${zig_dir}"
+          cp -a -- "${zig_source}/." "${zig_dir}/"
+          chmod -R u=rwX,go= "${zig_dir}"
           mkdir -m 700 "${root}/firmware"
           cp --no-preserve=mode,ownership \
             "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
@@ -111,7 +117,6 @@ jobs:
             rm -- "${alias}"
             mv -- "${temporary}" "${alias}"
           done
-          zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           echo "${zig_dir}" >> "${GITHUB_PATH}"
           echo "${root}/llvm/bin" >> "${GITHUB_PATH}"
