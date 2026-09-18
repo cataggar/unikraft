@@ -633,19 +633,21 @@ def physical_tree_record(root, content=True, expected_content_sha256=None):
                     finally:
                         os.close(handle)
                 elif stat.S_ISLNK(info.st_mode):
+                    symlink_reason = (
+                        "unsafe physical input tree symlink: " + relative)
                     require(info.st_uid in (0, os.getuid())
                             and 0 < info.st_size < 4096,
-                            "unsafe physical input tree symlink")
+                            symlink_reason)
                     try:
                         target = os.readlink(name, dir_fd=directory_handle)
                         resolved = (root / relative).resolve(strict=True)
                         target_is_directory = stat.S_ISDIR(
                             resolved.lstat().st_mode)
                     except (OSError, RuntimeError) as error:
-                        raise Refusal("unsafe physical input tree symlink") from error
+                        raise Refusal(symlink_reason) from error
                     with retained_absolute(
                             resolved, directory=target_is_directory,
-                            reason="unsafe physical input tree symlink") as (
+                            reason=symlink_reason) as (
                                 target_handle, target_directories, target_parent):
                         target_info = os.fstat(target_handle)
                         if target_is_directory:
@@ -654,7 +656,7 @@ def physical_tree_record(root, content=True, expected_content_sha256=None):
                                 and target_info.st_uid in (0, os.getuid())
                                 and not target_info.st_mode & 0o022
                                 and (resolved == root or root in resolved.parents),
-                                "unsafe physical input tree symlink",
+                                symlink_reason,
                             )
                         else:
                             require(
@@ -665,7 +667,7 @@ def physical_tree_record(root, content=True, expected_content_sha256=None):
                                 and target_info.st_size <= 512 * MIB
                                 and (target_info.st_uid == 0
                                      or target_info.st_nlink == 1),
-                                "unsafe physical input tree symlink",
+                                symlink_reason,
                             )
                         target_identity = snapshot(target_info)
                         target_sha256 = (
