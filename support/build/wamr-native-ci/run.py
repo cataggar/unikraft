@@ -13,9 +13,12 @@ import os
 from pathlib import Path, PurePosixPath
 import platform
 import re
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
+import time
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
@@ -37,6 +40,14 @@ SOURCE_MAX_ENTRIES = 40_000
 SOURCE_MAX_BYTES = 2 * 1024 * MIB
 SOURCE_MAX_FILE = 256 * MIB
 SOURCE_DIAGNOSTIC_MAX_CHANGES = 64
+SOURCE_DIAGNOSTIC_MAX_IGNORED = 128
+SOURCE_DIAGNOSTIC_MAX_ROOT_ENTRIES = 128
+SOURCE_IGNORED_MAX_ENTRIES = 128 * 1024
+SOURCE_IGNORED_MAX_BYTES = 8 * 1024 * MIB
+SOURCE_IGNORED_MAX_FILE = 512 * MIB
+SOURCE_IGNORED_MAX_PATH = 1024
+SOURCE_IGNORED_MAX_DEPTH = 64
+SOURCE_IGNORED_GIT_MAX_BYTES = 8 * MIB
 PACKAGE_MAX_ROOTS = 128
 PACKAGE_MAX_ENTRIES = 16_384
 PACKAGE_MAX_BYTES = 256 * MIB
@@ -48,6 +59,13 @@ SOURCE_OUTPUT_ROLES = (
     "support/apps/wamr-aot/.config",
     "support/apps/wamr-aot/build",
 )
+SOURCE_OUTPUT_DIRECTORY_ROLES = (
+    ".d",
+    ".zig-cache",
+    "support/apps/wamr-aot/build",
+)
+SOURCE_OUTPUT_FILE_ROLES = ("support/apps/wamr-aot/.config",)
+SOURCE_OUTPUT_PREEXISTING_DESCENDANT_ROLES = (".d",)
 HOST_TOOLS = ("zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
               "llvm-readelf", "llvm-strip", "bison", "flex",
               "python3", "git", "bash", "m4", "timeout", "head")
@@ -150,6 +168,99 @@ def tool(name):
     return str(Path(path).resolve(strict=True))
 
 
+def signal_process_group(process, process_signal):
+    try:
+        os.killpg(process.pid, process_signal)
+    except ProcessLookupError:
+        pass
+
+
+def bounded_subprocess_output(args, cwd, limit, seconds, overflow_reason,
+                              timeout_reason, failure_reason):
+    require(type(limit) is int and limit >= 0 and seconds > 0, failure_reason)
+    try:
+        process = subprocess.Popen(
+            list(map(str, args)), cwd=cwd, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    except (OSError, ValueError) as error:
+        raise Refusal(failure_reason) from error
+    stream = process.stdout
+    require(stream is not None, failure_reason)
+    selector = selectors.DefaultSelector()
+    collected = bytearray()
+    exceeded = False
+    timed_out = False
+    stopping = False
+    killed = False
+    stop_deadline = None
+    deadline = time.monotonic() + seconds
+    try:
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            now = time.monotonic()
+            if not stopping and now >= deadline:
+                timed_out = True
+                stopping = True
+                stop_deadline = now + 5
+                signal_process_group(process, signal.SIGTERM)
+            if stopping and not killed and now >= stop_deadline:
+                signal_process_group(process, signal.SIGKILL)
+                killed = True
+            wake = deadline if not stopping else stop_deadline
+            wait = max(0, min(0.1, wake - now)) if not killed else 0.1
+            for key, _ in selector.select(wait):
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if exceeded or timed_out:
+                    continue
+                remaining = limit + 1 - len(collected)
+                collected.extend(chunk[:remaining])
+                if len(collected) > limit:
+                    exceeded = True
+                    stopping = True
+                    stop_deadline = time.monotonic() + 5
+                    signal_process_group(process, signal.SIGTERM)
+        if process.poll() is None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                signal_process_group(process, signal.SIGKILL)
+                process.wait(timeout=5)
+        else:
+            process.wait()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Refusal(failure_reason) from error
+    finally:
+        selector.close()
+        stream.close()
+        if process.poll() is None:
+            try:
+                signal_process_group(process, signal.SIGTERM)
+                process.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                signal_process_group(process, signal.SIGKILL)
+                process.wait()
+    require(not exceeded, overflow_reason)
+    require(not timed_out, timeout_reason)
+    require(process.returncode == 0, failure_reason)
+    return bytes(collected)
+
+
+def bounded_git_raw(repository, limit, *args, overflow_reason, timeout_reason,
+                    failure_reason):
+    return bounded_subprocess_output(
+        ["git", *args], repository, limit, 60, overflow_reason,
+        timeout_reason, failure_reason,
+    )
+
+
 def git(*args, repository=REPO):
     return subprocess.check_output(
         ["git", *args], cwd=repository, timeout=60).decode().strip()
@@ -157,6 +268,257 @@ def git(*args, repository=REPO):
 
 def git_raw(repository, *args):
     return subprocess.check_output(["git", *args], cwd=repository, timeout=60)
+
+
+def normalized_repository_relative(value, reason, trailing_slash=False):
+    if not isinstance(value, str):
+        raise Refusal(reason)
+    if trailing_slash and value.endswith("/"):
+        value = value[:-1]
+    path = PurePosixPath(value)
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise Refusal(reason) from error
+    require(
+        value and value == path.as_posix() and not path.is_absolute()
+        and "." not in path.parts and ".." not in path.parts
+        and len(encoded) <= SOURCE_IGNORED_MAX_PATH
+        and len(path.parts) <= SOURCE_IGNORED_MAX_DEPTH,
+        reason,
+    )
+    return path
+
+
+def source_output_policy():
+    require(
+        len(SOURCE_OUTPUT_ROLES) == len(set(SOURCE_OUTPUT_ROLES))
+        and (
+            set(SOURCE_OUTPUT_DIRECTORY_ROLES)
+            | set(SOURCE_OUTPUT_FILE_ROLES)
+        ) == set(SOURCE_OUTPUT_ROLES)
+        and not (
+            set(SOURCE_OUTPUT_DIRECTORY_ROLES)
+            & set(SOURCE_OUTPUT_FILE_ROLES)
+        )
+        and set(SOURCE_OUTPUT_PREEXISTING_DESCENDANT_ROLES)
+        <= set(SOURCE_OUTPUT_DIRECTORY_ROLES),
+        "invalid source output role policy",
+    )
+    roles = []
+    for value in SOURCE_OUTPUT_ROLES:
+        path = normalized_repository_relative(
+            value, "invalid source output role policy")
+        require(
+            not any(path in other.parents or other in path.parents
+                    for other, _ in roles),
+            "invalid source output role policy",
+        )
+        roles.append((
+            path,
+            "directory" if value in SOURCE_OUTPUT_DIRECTORY_ROLES else "file",
+        ))
+    return tuple(roles)
+
+
+def source_output_role(relative, roles):
+    matches = [
+        (role, kind) for role, kind in roles
+        if relative == role or role in relative.parents
+    ]
+    require(len(matches) == 1, "ignored source entry outside output roles")
+    return matches[0]
+
+
+def bounded_directory_paths(directory, parent, existing, limit, limit_reason,
+                            path_reason):
+    paths = []
+    try:
+        iterator = os.scandir(directory)
+    except OSError as error:
+        raise Refusal(path_reason) from error
+    try:
+        for entry in iterator:
+            relative = entry.name if not parent else parent + "/" + entry.name
+            path = normalized_repository_relative(relative, path_reason)
+            require(existing + len(paths) < limit, limit_reason)
+            paths.append((entry.name, path))
+    except OSError as error:
+        raise Refusal(path_reason) from error
+    finally:
+        iterator.close()
+    return sorted(paths, key=lambda item: item[0])
+
+
+def source_output_root(path, kind):
+    try:
+        info = path.lstat()
+    except FileNotFoundError as error:
+        raise Refusal("source output role unavailable") from error
+    require(
+        canonical(path) and info.st_uid == os.getuid()
+        and not info.st_mode & 0o022
+        and (
+            stat.S_ISDIR(info.st_mode) if kind == "directory"
+            else stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+            and info.st_size <= SOURCE_IGNORED_MAX_FILE
+        ),
+        "unsafe source output role",
+    )
+    return info
+
+
+def source_output_roots(repository):
+    roles = source_output_policy()
+    result = []
+    for relative, kind in roles:
+        path = repository.joinpath(*relative.parts)
+        result.append((relative, kind, path, source_output_root(path, kind)))
+    return roles, result
+
+
+def ignored_git_roots(repository, roles):
+    raw = bounded_git_raw(
+        repository, SOURCE_IGNORED_GIT_MAX_BYTES,
+        "ls-files", "--others", "--ignored", "--exclude-standard",
+        "--directory", "-z",
+        overflow_reason="ignored source inventory too large",
+        timeout_reason="ignored source inventory timed out",
+        failure_reason="ignored source inventory failed",
+    )
+    require(not raw or raw.endswith(b"\0"), "invalid ignored source inventory")
+    paths = []
+    seen = set()
+    for encoded in raw[:-1].split(b"\0") if raw else ():
+        try:
+            value = encoded.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Refusal("invalid ignored source inventory") from error
+        path = normalized_repository_relative(
+            value, "invalid ignored source inventory", trailing_slash=True)
+        require(
+            path not in seen and len(paths) < SOURCE_IGNORED_MAX_ENTRIES,
+            "invalid ignored source inventory",
+        )
+        source_output_role(path, roles)
+        seen.add(path)
+        paths.append(path.as_posix())
+    return paths
+
+
+def require_safe_ignored_symlink_target(repository, role, target):
+    role_root = repository.joinpath(*role.parts)
+    try:
+        target.relative_to(role_root)
+        return
+    except ValueError:
+        pass
+    try:
+        relative = target.relative_to(repository)
+        encoded = relative.as_posix().encode("utf-8")
+    except (UnicodeEncodeError, ValueError):
+        raise Refusal("ignored source symlink escapes repository") from None
+    require(target.is_file() and not target.is_symlink(),
+            "ignored source symlink escapes repository")
+    try:
+        tracked = bounded_git_raw(
+            repository, SOURCE_IGNORED_MAX_PATH + 1,
+            "ls-files", "--error-unmatch", "-z", "--", relative.as_posix(),
+            overflow_reason="ignored source symlink target invalid",
+            timeout_reason="ignored source symlink target timed out",
+            failure_reason="ignored source symlink target invalid",
+        )
+    except Refusal:
+        raise Refusal("ignored source symlink escapes repository") from None
+    require(tracked == encoded + b"\0",
+            "ignored source symlink escapes repository")
+
+
+def ignored_source_state(repository=REPO):
+    repository = Path(repository)
+    require(repository.is_absolute() and canonical(repository)
+            and stat.S_ISDIR(repository.lstat().st_mode),
+            "canonical source required")
+    roles, roots = source_output_roots(repository)
+    ignored = ignored_git_roots(repository, roles)
+    physical = hashlib.sha256(b"uk.wamr.ignored-source-policy-v1\0")
+    entries = 0
+    total = 0
+
+    def add(relative, kind, info, extra=None):
+        nonlocal entries, total
+        require(entries < SOURCE_IGNORED_MAX_ENTRIES,
+                "ignored source entry limit exceeded")
+        entries += 1
+        if kind == "file":
+            require(info.st_size <= SOURCE_IGNORED_MAX_FILE,
+                    "ignored source file limit exceeded")
+            total += info.st_size
+        elif kind == "symlink":
+            total += len(extra)
+        require(total <= SOURCE_IGNORED_MAX_BYTES,
+                "ignored source byte limit exceeded")
+        bind(physical, [kind, relative.as_posix(), snapshot(info), extra])
+
+    def collect(role, directory, relative):
+        before = directory.lstat()
+        require(
+            stat.S_ISDIR(before.st_mode) and before.st_uid == os.getuid()
+            and not before.st_mode & 0o022,
+            "unsafe ignored source directory",
+        )
+        add(relative, "directory", before)
+        paths = bounded_directory_paths(
+            directory, relative.as_posix(), entries,
+            SOURCE_IGNORED_MAX_ENTRIES,
+            "ignored source entry limit exceeded",
+            "invalid ignored source path",
+        )
+        for name, child_relative in paths:
+            path = directory / name
+            try:
+                info = path.lstat()
+            except FileNotFoundError as error:
+                raise Refusal("ignored source entry changed") from error
+            require(info.st_uid == os.getuid(), "unsafe ignored source entry")
+            if stat.S_ISDIR(info.st_mode):
+                require(not info.st_mode & 0o022,
+                        "unsafe ignored source entry")
+                collect(role, path, child_relative)
+            elif stat.S_ISREG(info.st_mode):
+                require(info.st_nlink == 1, "unsafe ignored source entry")
+                add(child_relative, "file", info)
+            elif stat.S_ISLNK(info.st_mode):
+                require(info.st_nlink == 1 and 0 < info.st_size < 4096,
+                        "unsafe ignored source symlink")
+                raw = os.readlink(os.fsencode(path))
+                require(len(raw) == info.st_size,
+                        "ignored source symlink changed")
+                try:
+                    target = path.resolve(strict=True)
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise Refusal(
+                        "ignored source symlink escapes repository") from error
+                require_safe_ignored_symlink_target(repository, role, target)
+                add(child_relative, "symlink", info, os.fsdecode(raw))
+            else:
+                raise Refusal("unsupported ignored source entry type")
+        require(snapshot(directory.lstat()) == snapshot(before),
+                "ignored source directory changed")
+
+    for relative, kind, path, before in roots:
+        if kind == "directory":
+            collect(relative, path, relative)
+        else:
+            add(relative, "file", before)
+            require(snapshot(path.lstat()) == snapshot(before),
+                    "ignored source entry changed")
+    return {
+        "ignored": ignored,
+        "entries": entries,
+        "bytes": total,
+        "physical_sha256": physical.hexdigest(),
+    }
 
 
 def source_file(repository, relative, mode, oid, object_format):
@@ -193,7 +555,12 @@ def source_file(repository, relative, mode, oid, object_format):
 
 
 def tracked_source_map(repository, head, object_format):
-    listing = git_raw(repository, "ls-tree", "-r", "-z", "--full-tree", head)
+    listing = bounded_git_raw(
+        repository, 4 * MIB, "ls-tree", "-r", "-z", "--full-tree", head,
+        overflow_reason="invalid tracked source map",
+        timeout_reason="tracked source map timed out",
+        failure_reason="invalid tracked source map",
+    )
     require(0 < len(listing) <= 4 * MIB and listing.endswith(b"\0"),
             "invalid tracked source map")
     entries = []
@@ -290,11 +657,63 @@ def source_metadata_document(path):
     return value
 
 
+def ignored_status_diagnostic(repository):
+    raw = bounded_git_raw(
+        repository, MIB, "status", "--short", "--ignored",
+        "--untracked-files=all", "-z",
+        overflow_reason="ignored source inventory too large",
+        timeout_reason="ignored source inventory timed out",
+        failure_reason="ignored source inventory failed",
+    )
+    require(not raw or raw.endswith(b"\0"), "invalid ignored source inventory")
+    paths = []
+    total = 0
+    for record in raw[:-1].split(b"\0") if raw else ():
+        if not record.startswith(b"!! "):
+            continue
+        try:
+            value = record[3:].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Refusal("invalid ignored source inventory") from error
+        path = normalized_repository_relative(
+            value, "invalid ignored source inventory")
+        total += 1
+        if len(paths) < SOURCE_DIAGNOSTIC_MAX_IGNORED:
+            paths.append("!! " + path.as_posix())
+    return paths, total > len(paths)
+
+
+def source_root_inventory(repository):
+    before = repository.lstat()
+    paths = bounded_directory_paths(
+        repository, "", 0, SOURCE_DIAGNOSTIC_MAX_ROOT_ENTRIES,
+        "source root inventory too large", "invalid source root inventory",
+    )
+    result = []
+    for name, _ in paths:
+        info = (repository / name).lstat()
+        kind = (
+            "directory" if stat.S_ISDIR(info.st_mode)
+            else "symlink" if stat.S_ISLNK(info.st_mode)
+            else "file"
+        )
+        result.append({"name": name, "kind": kind})
+    require(snapshot(repository.lstat()) == snapshot(before),
+            "source root inventory changed")
+    return result
+
+
 def source(repository=REPO):
     repository = Path(repository)
     require(repository.is_absolute() and canonical(repository)
             and stat.S_ISDIR(repository.lstat().st_mode), "canonical source required")
-    status = git_raw(repository, "status", "--porcelain=v2", "--untracked-files=all")
+    ignored_before = ignored_source_state(repository)
+    status = bounded_git_raw(
+        repository, MIB, "status", "--porcelain=v2", "--untracked-files=all",
+        "-z", overflow_reason="source status too large",
+        timeout_reason="source status timed out",
+        failure_reason="source status failed",
+    )
     require(not status, "clean committed source required")
     head = git("rev-parse", "HEAD", repository=repository)
     tree = git("rev-parse", "HEAD^{tree}", repository=repository)
@@ -328,10 +747,18 @@ def source(repository=REPO):
     for relative, expected in directory_state.items():
         path = repository if not relative else repository / relative
         require(snapshot(path.lstat()) == expected, "tracked source directory changed")
-    require(not git_raw(repository, "status", "--porcelain=v2", "--untracked-files=all")
+    final_status = bounded_git_raw(
+        repository, MIB, "status", "--porcelain=v2", "--untracked-files=all",
+        "-z", overflow_reason="source status too large",
+        timeout_reason="source status timed out",
+        failure_reason="source status failed",
+    )
+    require(not final_status
             and git("rev-parse", "HEAD", repository=repository) == head
             and git("rev-parse", "HEAD^{tree}", repository=repository) == tree,
             "tracked source changed during inspection")
+    require(ignored_source_state(repository) == ignored_before,
+            "ignored source outputs changed during inspection")
     return {
         "revision": head,
         "tree": tree,
@@ -529,7 +956,8 @@ def validate_restore_manifest(raw):
             "package_hash": MIZ_PACKAGE_HASH}
 
 
-def tracked_manifest(relative, repository=REPO):
+def tracked_manifest(relative, repository=None):
+    repository = REPO if repository is None else Path(repository)
     encoded = relative.encode("utf-8")
     raw = git_raw(repository, "ls-tree", "-z", "HEAD", "--", relative)
     if not raw:
@@ -555,6 +983,33 @@ def tracked_manifest(relative, repository=REPO):
         "metadata_sha256": hashlib.sha256(
             json.dumps(snapshot(info), separators=(",", ":")).encode("ascii")).hexdigest(),
     }, data
+
+
+def repository_relative_source(path, reason):
+    path = Path(path)
+    repository = Path(REPO)
+    try:
+        resolved_repository = repository.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        relative = resolved.relative_to(resolved_repository)
+    except (OSError, RuntimeError, ValueError):
+        raise Refusal(reason) from None
+    require(
+        repository == resolved_repository and path.is_absolute()
+        and path == resolved and relative.parts
+        and normalized_repository_relative(relative.as_posix(), reason)
+        == PurePosixPath(relative.as_posix()),
+        reason,
+    )
+    return relative.as_posix()
+
+
+def dependency_manifest_sources():
+    return tuple(
+        (name, repository_relative_source(
+            LOCAL_BOOT / name, "pinned dependency manifest unavailable"))
+        for name in ("build.zig", "build.zig.zon")
+    )
 
 
 def create_exact_copy(path, data):
@@ -845,8 +1300,7 @@ def dependency_custody(root):
             "private dependency restore directory required")
     manifests = {}
     manifest_data = {}
-    for name in ("build.zig", "build.zig.zon"):
-        relative = (LOCAL_BOOT / name).relative_to(REPO).as_posix()
+    for name, relative in dependency_manifest_sources():
         source_record, expected = tracked_manifest(relative)
         manifest_data[name] = expected
         manifests[name] = {"source": source_record}
@@ -985,18 +1439,15 @@ def verify_package_hashes(root, packages):
 
 
 def restore_dependencies(root, expected_source):
+    manifest_sources = dependency_manifest_sources()
     restore = root / "dependencies"
     restore.mkdir(mode=0o700)
     require_source(expected_source)
     source_manifests = {}
     manifest_data = {}
     copied_manifests = {}
-    for name in ("build.zig", "build.zig.zon"):
-        try:
-            record, data = tracked_manifest(
-                (LOCAL_BOOT / name).relative_to(REPO).as_posix())
-        except FileNotFoundError as error:
-            raise Refusal("pinned dependency manifest unavailable") from error
+    for name, relative in manifest_sources:
+        record, data = tracked_manifest(relative)
         source_manifests[name] = record
         manifest_data[name] = data
         copied_manifests[name] = create_exact_copy(restore / name, data)
@@ -1048,26 +1499,10 @@ def require_build_custody(runtime, expected):
             report = source_metadata_changes(
                 source_metadata_document(baseline)["records"], source_metadata())
             report["source"] = source_identity(current_source)
-            ignored = git_raw(
-                REPO, "status", "--short", "--ignored", "--untracked-files=normal")
-            require(len(ignored) <= MIB, "ignored source inventory too large")
-            try:
-                ignored_paths = ignored.decode("utf-8").splitlines()
-            except UnicodeDecodeError as error:
-                raise Refusal("invalid ignored source inventory") from error
-            report["ignored_paths"] = ignored_paths[:128]
-            report["ignored_paths_truncated"] = len(ignored_paths) > 128
-            root_entries = []
-            for path in sorted(REPO.iterdir(), key=lambda item: item.name):
-                info = path.lstat()
-                kind = (
-                    "directory" if stat.S_ISDIR(info.st_mode)
-                    else "symlink" if stat.S_ISLNK(info.st_mode)
-                    else "file"
-                )
-                root_entries.append({"name": path.name, "kind": kind})
-            require(len(root_entries) <= 128, "source root inventory too large")
-            report["root_entries"] = root_entries
+            ignored_paths, truncated = ignored_status_diagnostic(REPO)
+            report["ignored_paths"] = ignored_paths
+            report["ignored_paths_truncated"] = truncated
+            report["root_entries"] = source_root_inventory(REPO)
             save(failure, report)
     require(source_matches, "immutable source custody changed")
     require_dependency_custody(runtime / "compute", expected["dependencies"])
@@ -1239,10 +1674,14 @@ def check_boot(config, identity):
 
 
 def prepare_source_outputs():
-    output = APP / "build"
-    config = APP / ".config"
+    require(APP == REPO / "support/apps/wamr-aot",
+            "invalid source output role policy")
+    output = REPO / "support/apps/wamr-aot/build"
+    config = REPO / "support/apps/wamr-aot/.config"
     backup = APP / ".config.old"
     cache = REPO / ".zig-cache"
+    runtime = REPO / ".d"
+    source_output_root(runtime, "directory")
     require(not output.exists() and not output.is_symlink()
             and not config.exists() and not config.is_symlink()
             and not backup.exists() and not backup.is_symlink()
@@ -1253,6 +1692,7 @@ def prepare_source_outputs():
     definition = read(APP / "defconfig", MIB)
     create_exact_copy(output / ".config", definition)
     create_exact_copy(config, definition)
+    source_output_roots(REPO)
 
 
 def require_no_config_backup():

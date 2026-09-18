@@ -65,11 +65,22 @@ independently hashes every tracked blob/symlink target against its Git object
 ID and binds every tracked parent directory's device/inode/type, ownership,
 links, size, mtime and ctime. Its bounded summary records file, directory and
 byte counts plus content and physical SHA256 values. The only role-excluded
-output roots are `.d`, the fail-closed precreated `.zig-cache`,
+output roots are exactly `.d`, the fail-closed precreated `.zig-cache`,
 `support/apps/wamr-aot/build`, and the precreated
-`support/apps/wamr-aot/.config`; Python bytecode is disabled. The same physical
-record is required around each build/boot consumer and at inspection/handoff,
-so a create/delete transient cannot be hidden by a finally clean Git status.
+`support/apps/wamr-aot/.config`. `.d` alone may already contain the workflow's
+pinned WAMR checkout and acquired runtime; those consumed inputs are separately
+content- and physical-identity-bound by the source archive, tool, Bison,
+firmware, QEMU and package records. The other three roots must not preexist and
+are created by the adapter before custody. Every custody check uses normalized
+repository-relative path components, not string prefixes, to reject all
+ignored entries outside those exact roots, including sibling names. It then
+walks every allowed root without following links and rejects escaping links,
+hard-linked or nonregular files, unsafe root/directory ownership or modes, path
+or depth excess, and changes during inspection. Regular-file modes remain
+physical metadata and are separately enforced for every consumed dependency or
+tool input. Python bytecode is disabled. The same physical record is required
+around each build/boot consumer and at inspection/handoff, so a create/delete
+transient cannot be hidden by a finally clean Git status.
 
 Records also bind the Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
 actual tools, wasm/cwasm/compiler/library bytes, solved configuration,
@@ -104,7 +115,13 @@ hash-verification and root-metadata SHA256 values. Limits
 are 128 roots, 16,384 entries, 256 MiB total, 64 MiB per file, depth 64 and
 4 MiB per manifest. Both builds use that one tree through `--system`; it is
 revalidated around every consumer and at final inspection/export. No
-package-manager state is created below tracked source.
+package-manager state is created below tracked source. The ignored-source
+policy allows at most 131,072 entries, 8 GiB total regular-file/link bytes,
+512 MiB per regular file, 1,024 UTF-8 bytes per repository-relative path and
+64 path components. Its collapsed Git inventory is capped at 8 MiB before
+parsing. Failure diagnostics use a separately terminated-and-drained 1-MiB Git
+status capture, retain at most 128 ignored paths, and refuse immediately on the
+129th repository-root entry before sorting the bounded collection.
 Build commands use `-j2`; the workflow has a 60-minute ceiling. Each build
 command has a fixed deadline and an 8-MiB log limit (one extra byte detects
 overflow). The native packaging worker retains its 120-second deadline and

@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -207,6 +208,41 @@ class Evidence(unittest.TestCase):
         path.write_bytes(value)
         path.chmod(0o600)
 
+    def source_repository(self, name="source-repository", extra=None):
+        repository = self.root / name
+        app = repository / "support/apps/wamr-aot"
+        app.mkdir(parents=True, mode=0o700)
+        source = repository / "source"
+        source.mkdir(mode=0o700)
+        self.put(source / "input", b"tracked\n")
+        self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")
+        self.put(repository / ".gitignore", b"""\
+/.d/
+/.zig-cache/
+/support/apps/wamr-aot/.config
+/support/apps/wamr-aot/build/
+*.o
+*.a
+*.pyc
+""")
+        for relative, data in (extra or {}).items():
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.put(path, data)
+        subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.email", "fixture@example.invalid"],
+                       cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.name", "Fixture"],
+                       cwd=repository, check=True)
+        subprocess.run(["git", "add", "."], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-qm", "fixture"],
+                       cwd=repository, check=True)
+        (repository / ".d").mkdir(mode=0o700)
+        (repository / ".zig-cache").mkdir(mode=0o700)
+        (app / "build").mkdir(mode=0o700)
+        self.put(app / ".config", b"CONFIG_FIXTURE=y\n")
+        return repository
+
     def test_reading_can_update_atime_without_changing_identity(self):
         path = self.root / "first-read"
         self.put(path, b"fresh build artifact")
@@ -396,6 +432,53 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             with self.assertRaisesRegex(
                     ci.Refusal, "private pinned dependency restore required"):
                 ci.restore_dependencies(root, {"source": "fixture"})
+
+    def test_dependency_paths_refuse_outside_or_missing_repository_without_leak(self):
+        manifests = {
+            "build.zig": b"const std = @import(\"std\");\n",
+            "build.zig.zon": (
+                '.{ .dependencies = .{ .miz_source = .{ '
+                f'.url = "{ci.MIZ_URL}", .hash = "{ci.MIZ_PACKAGE_HASH}" '
+                '} } }\n'
+            ).encode(),
+        }
+        repository = self.source_repository(
+            "dependency-source",
+            {
+                "support/tools/hyperv/local_boot/" + name: data
+                for name, data in manifests.items()
+            },
+        )
+        outside = self.root / "outside-local-boot"
+        outside.mkdir(mode=0o700)
+        for name, data in manifests.items():
+            self.put(outside / name, data)
+
+        for index, local_boot in enumerate((
+                outside,
+                repository / "support/tools/hyperv/missing-local-boot",
+        )):
+            restore_root = self.root / f"path-restore-{index}"
+            restore_root.mkdir(mode=0o700)
+            fixture_root, _, _ = self.dependency_fixture()
+            custody_root = self.root / f"path-custody-{index}"
+            fixture_root.rename(custody_root)
+            with self.subTest(local_boot=local_boot), \
+                    mock.patch.object(ci, "REPO", repository), \
+                    mock.patch.object(ci, "LOCAL_BOOT", local_boot):
+                for operation in (
+                        lambda: ci.restore_dependencies(
+                            restore_root, {"source": "unused"}),
+                        lambda: ci.dependency_custody(custody_root),
+                ):
+                    with self.assertRaises(ci.Refusal) as refusal:
+                        operation()
+                    self.assertEqual(
+                        str(refusal.exception),
+                        "pinned dependency manifest unavailable",
+                    )
+                    self.assertIsNone(refusal.exception.__cause__)
+                    self.assertNotIn(str(local_boot), str(refusal.exception))
 
     def dependency_fixture(self):
         root = self.root / "dependency-fixture"
@@ -709,15 +792,29 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         (repository / "source").mkdir(mode=0o700)
         self.put(repository / "source/input", b"tracked\n")
         (repository / "source/link").symlink_to("input")
-        self.put(repository / ".gitignore", b"source/generated/\n")
+        self.put(repository / ".gitignore", b"""\
+/.d/
+/.zig-cache/
+/support/apps/wamr-aot/.config
+/support/apps/wamr-aot/build/
+source/generated/
+""")
+        app = repository / "support/apps/wamr-aot"
+        app.mkdir(parents=True, mode=0o700)
+        self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")
         subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
         subprocess.run(["git", "config", "user.email", "fixture@example.invalid"],
                        cwd=repository, check=True)
         subprocess.run(["git", "config", "user.name", "Fixture"],
                        cwd=repository, check=True)
-        subprocess.run(["git", "add", ".gitignore", "source/input", "source/link"],
+        subprocess.run(["git", "add", ".gitignore", "source/input", "source/link",
+                        "support/apps/wamr-aot/defconfig"],
                        cwd=repository, check=True)
         subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repository, check=True)
+        (repository / ".d").mkdir(mode=0o700)
+        (repository / ".zig-cache").mkdir(mode=0o700)
+        (app / "build").mkdir(mode=0o700)
+        self.put(app / ".config", b"CONFIG_FIXTURE=y\n")
         expected = ci.source(repository)
         self.assertEqual(ci.source(repository), expected)
         generated = repository / "source/generated"
@@ -761,6 +858,140 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         with self.assertRaisesRegex(ci.Refusal, "symlink escapes repository"):
             ci.source(repository)
 
+    def test_ignored_source_policy_rejects_existing_and_late_global_ignores(self):
+        for index, suffix in enumerate(("o", "a", "pyc")):
+            repository = self.source_repository(f"ignored-{index}")
+            ignored = repository / "source" / ("hidden." + suffix)
+            self.put(ignored, b"unreviewed ignored input\n")
+            with self.subTest(suffix=suffix), self.assertRaisesRegex(
+                    ci.Refusal, "outside output roles"):
+                ci.source(repository)
+
+        repository = self.source_repository("ignored-late")
+        expected = ci.source(repository)
+        self.put(repository / "source/late.o", b"created after baseline\n")
+        with self.assertRaisesRegex(ci.Refusal, "outside output roles"):
+            ci.require_source(expected, repository)
+
+    def test_ignored_source_policy_uses_exact_roles_and_safe_types(self):
+        repository = self.source_repository("ignored-roles")
+        expected = ci.source(repository)
+        for relative in (
+                ".d/runtime.o",
+                ".zig-cache/cache.a",
+                "support/apps/wamr-aot/build/generated.pyc",
+        ):
+            self.put(repository / relative, b"approved output\n")
+        (repository / "support/apps/wamr-aot/build/Makefile").symlink_to(
+            repository / "source/input")
+        self.put(
+            repository / "support/apps/wamr-aot/.config",
+            b"CONFIG_SOLVED=y\n",
+        )
+        self.assertEqual(ci.source(repository), expected)
+        (repository / ".d-sibling").mkdir(mode=0o700)
+        self.put(repository / ".d-sibling/escape.o", b"sibling escape\n")
+        with self.assertRaisesRegex(ci.Refusal, "outside output roles"):
+            ci.source(repository)
+
+    def test_ignored_source_policy_rejects_symlink_type_and_path_escape(self):
+        repository = self.source_repository("ignored-unsafe")
+        self.put(repository / ".d/tool", b"tool\n")
+        (repository / ".d/tool-link").symlink_to("tool")
+        ci.source(repository)
+        (repository / ".d/tool-link").unlink()
+        outside = self.root / "ignored-unsafe-outside"
+        self.put(outside, b"outside\n")
+        (repository / ".d/tool-link").symlink_to(
+            os.path.relpath(outside, repository / ".d"))
+        with self.assertRaisesRegex(ci.Refusal, "symlink escapes repository"):
+            ci.source(repository)
+        (repository / ".d/tool-link").unlink()
+        fifo = repository / ".d/fifo"
+        os.mkfifo(fifo, 0o600)
+        with self.assertRaisesRegex(ci.Refusal, "unsupported ignored source entry type"):
+            ci.source(repository)
+        fifo.unlink()
+        cache = repository / ".zig-cache"
+        cache.rmdir()
+        cache.symlink_to(".d")
+        with self.assertRaisesRegex(ci.Refusal, "unsafe source output role"):
+            ci.source(repository)
+
+    def test_ignored_source_policy_enforces_entry_byte_path_and_depth_limits(self):
+        repository = self.source_repository("ignored-bounds")
+        for name in ("a", "b", "c"):
+            self.put(repository / ".d" / name, b"x")
+        with mock.patch.object(ci, "SOURCE_IGNORED_MAX_ENTRIES", 6), \
+                self.assertRaisesRegex(ci.Refusal, "entry limit exceeded"):
+            ci.source(repository)
+        with mock.patch.object(ci, "SOURCE_IGNORED_MAX_BYTES", 2), \
+                self.assertRaisesRegex(ci.Refusal, "byte limit exceeded"):
+            ci.source(repository)
+        with mock.patch.object(ci, "SOURCE_IGNORED_MAX_PATH", 3), \
+                self.assertRaisesRegex(ci.Refusal, "source output role policy"):
+            ci.source(repository)
+        with mock.patch.object(ci, "SOURCE_IGNORED_MAX_DEPTH", 1), \
+                self.assertRaisesRegex(ci.Refusal, "source output role policy"):
+            ci.source(repository)
+
+    def test_bounded_directory_collection_stops_on_first_excess(self):
+        class Entry:
+            def __init__(self, name):
+                self.name = name
+
+        class Scan:
+            def __init__(self):
+                self.count = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.count += 1
+                if self.count > 129:
+                    raise AssertionError("enumerated beyond first excess")
+                return Entry(f"entry-{self.count:03d}")
+
+            def close(self):
+                pass
+
+        scan = Scan()
+        with mock.patch.object(ci.os, "scandir", return_value=scan), \
+                self.assertRaisesRegex(ci.Refusal, "root inventory too large"):
+            ci.bounded_directory_paths(
+                self.root, "", 0, 128,
+                "source root inventory too large",
+                "invalid source root inventory",
+            )
+        self.assertEqual(scan.count, 129)
+
+    def test_bounded_subprocess_collection_terminates_on_first_excess(self):
+        marker = self.root / "unbounded-reader-finished"
+        script = (
+            "import os,time\n"
+            "from pathlib import Path\n"
+            f"os.write(1, b'x' * {ci.MIB + 1})\n"
+            "time.sleep(10)\n"
+            f"Path({str(marker)!r}).write_text('late')\n"
+        )
+        started = time.monotonic()
+        with self.assertRaisesRegex(ci.Refusal, "fixture overflow"):
+            ci.bounded_subprocess_output(
+                [sys.executable, "-c", script], self.root, ci.MIB, 20,
+                "fixture overflow", "fixture timeout", "fixture failed",
+            )
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(marker.exists())
+
+    def test_source_root_inventory_refuses_the_129th_entry(self):
+        repository = self.root / "root-inventory"
+        repository.mkdir(mode=0o700)
+        for index in range(129):
+            self.put(repository / f"entry-{index:03d}", b"")
+        with self.assertRaisesRegex(ci.Refusal, "root inventory too large"):
+            ci.source_root_inventory(repository)
+
     def test_precreated_output_roots_keep_source_parent_metadata_exact(self):
         self.assertIn(
             '"-Dmake-arg=KCONFIG_OVERWRITECONFIG=1"',
@@ -770,11 +1001,11 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             'f"-Dconfig={ROOT / \'build/.config\'}"',
             (ci.APP / "build-image.py").read_text(),
         )
-        app = self.root / "app"
-        app.mkdir(mode=0o700)
-        self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")
         repository = self.root / "repository"
-        repository.mkdir(mode=0o700)
+        app = repository / "support/apps/wamr-aot"
+        app.mkdir(parents=True, mode=0o700)
+        self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")
+        (repository / ".d").mkdir(mode=0o700)
         cache = repository / ".zig-cache"
         with mock.patch.object(ci, "APP", app), \
                 mock.patch.object(ci, "REPO", repository):
