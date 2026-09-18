@@ -158,9 +158,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "e7af695deedb6b2e97ceffbd190d434630cbec8b56c1ea16adea07ce0cec1e70"
+            "941413d5b598a7ae553823057e9517cd861b8c5a1f0b9c1231952ca856eff6a2"
         ),
-        "size": 2078150,
+        "size": 2078272,
         "files": 226,
     },
     "support/kconfig": {
@@ -679,7 +679,7 @@ GUARDED_PRODUCER_FILES = {
         "6465bc8c33deba57d3ae86edbc97a0f78f3b0cfea1669896855ad3c0a7b3c2c9"
     ),
     "support/build/native-postprocess-runner.py": (
-        "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"
+        "77d12bcce631c539c7ffbbadcec916627dbc149eb68630caf3647dba6c2914cd"
     ),
     "support/build/native-postprocess-runner.zig": (
         "d0e66bea11f3f0e0c0344c43f9d8133f8a017b680e5a3997aaad44c83ab49a3c"

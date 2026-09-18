@@ -105,7 +105,10 @@ def main():
         )
     elif args.action == "strip":
         remove = [item for section in args.remove_section for item in ("-R", section)]
-        run([*command(args.tool), "-s", *remove, args.input, "-o", args.output])
+        run([
+            *command(args.tool), "--strip-all", *remove,
+            args.input, "-o", args.output,
+        ])
     elif args.action == "bootinfo":
         env = os.environ.copy()
         env["OBJDUMP"] = args.objdump

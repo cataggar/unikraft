@@ -50,6 +50,8 @@ def main():
             fake_strip,
             """#!/usr/bin/env python3
 import pathlib, shutil, sys
+if "--strip-all" not in sys.argv or "-s" in sys.argv:
+    raise SystemExit(2)
 shutil.copyfile(sys.argv[sys.argv.index("-o") - 1], sys.argv[sys.argv.index("-o") + 1])
 """,
         )
