@@ -169,6 +169,10 @@ sudo /usr/bin/setpriv --reuid="${runner_uid}" --regid="${runner_gid}" --groups="
     set -euo pipefail
     set -C
     umask 077
+    refuse() {
+      echo "Restricted native guest refused: $1" >&2
+      exit 2
+    }
     awk "/^(Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb|NoNewPrivs):/" \
       "/proc/$$/status" > "$4/evidence/guest-credentials.txt"
     awk -v uid="$1" -v gid="$2" "
@@ -184,13 +188,14 @@ sudo /usr/bin/setpriv --reuid="${runner_uid}" --regid="${runner_gid}" --groups="
       }
       /^NoNewPrivs:/ { if (NF != 2 || \$2 != 1) exit 1; restricted++ }
       END { if (identities != 2 || capabilities != 5 || restricted != 1) exit 1 }
-    " "$4/evidence/guest-credentials.txt"
+    " "$4/evidence/guest-credentials.txt" || refuse credentials
     actual_groups="$(awk "/^Groups:/ { for (i=2; i<=NF; i++) print \$i }" \
       "$4/evidence/guest-credentials.txt" | sort -nu | tr "\n" ,)"
-    test "${actual_groups%,}" = "$3"
-    test "$(stat -c "%d:%i:%u:%g:%t:%T" /dev/kvm)" = "$6"
-    test -r /dev/kvm
-    test -w /dev/kvm
+    test "${actual_groups%,}" = "$3" || refuse groups
+    test "$(stat -c "%d:%i:%u:%g:%t:%T" /dev/kvm)" = "$6" ||
+      refuse kvm-identity
+    test -r /dev/kvm || refuse kvm-read
+    test -w /dev/kvm || refuse kvm-write
     driver="$5"
     shift 6
     exec /usr/bin/bash "$driver" "$@"

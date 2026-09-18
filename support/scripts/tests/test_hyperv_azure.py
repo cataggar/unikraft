@@ -2682,6 +2682,10 @@ class HypervWorkflowTest(unittest.TestCase):
             'chown --no-dereference "$3:$4" "$2"',
             '\' _ "${source}" "${ownership}" "${runner_uid}" "${runner_gid}"',
             '"${runner_uid}:${runner_gid}:600:1"',
+            "Restricted native guest refused: $1",
+            "refuse credentials",
+            "refuse groups",
+            "refuse kvm-identity",
         ):
             self.assertIn(required, runtime)
         driver = (
