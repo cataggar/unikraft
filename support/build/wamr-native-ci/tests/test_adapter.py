@@ -369,6 +369,7 @@ class Evidence(unittest.TestCase):
                     ci.Refusal, "physical input tree hash limit exceeded"):
             ci.physical_tree_record(links)
 
+    def test_physical_tree_directory_symlink_custody(self):
         directory_links = self.root / "directory-symlink-tree"
         data = directory_links / "data"
         data.mkdir(parents=True, mode=0o700)
@@ -384,6 +385,7 @@ class Evidence(unittest.TestCase):
                 ci.Refusal, "unsafe physical input tree symlink"):
             ci.physical_tree_record(directory_links)
 
+    def test_physical_tree_dangling_symlink_custody(self):
         dangling = self.root / "dangling-symlink-tree"
         dangling.mkdir(mode=0o700)
         missing = (
