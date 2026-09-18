@@ -30,8 +30,6 @@ else
   driver_args=(boot "${root}" "${root}/bin/qemu-system-x86_64")
 fi
 source="${root}/runtime/libfdt.so.1"
-target=/usr/lib/x86_64-linux-gnu/libfdt.so.1
-ownership="${root}/evidence/runtime-created.txt"
 expected=66c111808e61c7f6be6715b4b03d0fe75beb5bc5b3a8809608d58d99a6bc9828
 kvm_identity=
 runtime_started="$(date --iso-8601=seconds)"
@@ -68,18 +66,6 @@ cleanup() {
           diagnostic=$?
           printf 'Kernel-denial query exited %s; retained its output.\n' "${diagnostic}" >&2
         }
-    fi
-  fi
-  if [[ -f "${ownership}" ]]; then
-    identity="$(< "${ownership}")"
-    if [[ -f "${target}" && ! -L "${target}" ]] &&
-       [[ "$(stat -c '%d:%i:%u:%g' "${target}")" = "${identity}" ]] &&
-       [[ "$(stat -c %h "${target}")" = 1 ]]; then
-      sudo rm -- "${target}" || cleanup_status=$?
-      if [[ -e "${target}" || -L "${target}" ]]; then cleanup_status=1; fi
-    else
-      echo "Managed runtime identity changed; refusing unrelated cleanup." >&2
-      cleanup_status=1
     fi
   fi
   printf 'primary=%s cleanup=%s\n' "${primary}" "${cleanup_status}" \
@@ -126,35 +112,7 @@ sha256sum /usr/bin/setpriv /usr/bin/env /usr/bin/bash /etc/group \
   > "${root}/evidence/credential-inputs.sha256"
 
 failure_stage=libfdt
-if [[ -e "${target}" || -L "${target}" ]]; then
-  test -f "${target}"
-  test ! -L "${target}"
-  test "$(stat -c '%u:%g:%h' "${target}")" = 0:0:1
-  [[ "$(stat -c %a "${target}")" = 444 || "$(stat -c %a "${target}")" = 644 ]]
-  test "$(sha256sum "${target}" | cut -d ' ' -f 1)" = "${expected}"
-else
-  # Root opens the exact new file exclusively; record its identity before writing.
-  sudo bash -c '
-    set -euo pipefail
-    set -C
-    umask 077
-    exec 8> "$2"
-    chmod 600 "$2"
-    exec 9> /usr/lib/x86_64-linux-gnu/libfdt.so.1
-    stat -Lc "%d:%i:%u:%g" /proc/self/fd/9 >&8
-    cat -- "$1" >&9
-    chmod 444 /usr/lib/x86_64-linux-gnu/libfdt.so.1
-    sync -f /usr/lib/x86_64-linux-gnu/libfdt.so.1
-    chown --no-dereference "$3:$4" "$2"
-  ' _ "${source}" "${ownership}" "${runner_uid}" "${runner_gid}"
-fi
-if [[ -f "${ownership}" ]]; then
-  test ! -L "${ownership}"
-  test "$(stat -c '%u:%g:%a:%h' "${ownership}")" = \
-    "${runner_uid}:${runner_gid}:600:1"
-fi
-test "$(sha256sum "${target}" | cut -d ' ' -f 1)" = "${expected}"
-stat -c '%d:%i:%u:%g:%a:%h:%s' "${target}" > "${root}/evidence/managed-libfdt.txt"
+bash .github/scripts/hyperv-native-libfdt-prepare.sh "${root}"
 
 failure_stage=qemu-probe
 bash .github/scripts/hyperv-qemu-candidate.sh \

@@ -89,6 +89,10 @@ jobs:
           strip-components: '1'
           cache: 'false'
 
+      - name: Establish the exact QEMU dynamic runtime before custody
+        run: |
+          bash .github/scripts/hyperv-native-libfdt-prepare.sh /d/wamr-native-runtime
+
       - name: Build the distinct tiny AOT image through the existing safety graph
         timeout-minutes: 45
         run: |
@@ -163,6 +167,11 @@ jobs:
             echo "Source: \`${GITHUB_SHA}/$(git rev-parse HEAD^{tree})\`"
             echo "Source job: \`${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}:wamr-native-compute\`"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Remove only the managed QEMU dynamic runtime
+        if: always()
+        run: |
+          bash .github/scripts/hyperv-native-libfdt-cleanup.sh /d/wamr-native-runtime
 
       - name: Publish only the standalone verified public-source image archive
         uses: actions/upload-artifact@v4

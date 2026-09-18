@@ -238,8 +238,12 @@ fixed workflow/job/run/attempt context and successful managed-runtime cleanup.
 The protected job builds and boots from the fixed private
 `/d/wamr-native-runtime` root, with the sealed Zig distribution beside it
 under `/d/wamr-native-tools`; this avoids mutable hosted-runner home
-ancestors while retaining exact component custody. The publication command
-accepts only that literal CI runtime or the legacy in-worktree runtime.
+ancestors while retaining exact component custody. Its authenticated QEMU
+`libfdt` runtime is established before the build-input baseline and removed
+by exact recorded identity only after final handoff revalidation, so neither
+boot setup nor pre-export cleanup can mutate a recorded system-library
+directory. The publication command accepts only that literal CI runtime or
+the legacy in-worktree runtime.
 After all four genuine boots, while the complete runner files still exist,
 the workflow invokes the production private export and native handoff checker,
 then copies only its closed image/local-evidence allowlist into a standalone
