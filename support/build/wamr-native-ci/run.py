@@ -3036,7 +3036,8 @@ def boot(runtime):
     FAILURE_STAGE = "boot-package-result"
     package = document(output)
     require(package["image"]["efi"]["sha256"] == digest(efi)
-            and package["producer_sha256"] == inputs["package_tool"],
+            and package["producer_sha256"]
+            == inputs["files"]["package_tool"]["sha256"],
             "package identity changed")
     save(root / "evidence/package.json", {
         "scope": package["scope"], "acceptance": package["acceptance"],

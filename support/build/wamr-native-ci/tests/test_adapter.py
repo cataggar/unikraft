@@ -388,6 +388,15 @@ class Evidence(unittest.TestCase):
         with self.assertRaisesRegex(ci.Refusal, "boot output already exists"):
             ci.prepare_boot_output_slots(runtime, compute)
 
+    def test_package_producer_uses_v2_boot_file_record(self):
+        state = ci.record_input_paths(
+            {"package_tool": Path(os.environ["WAMR_CI_PACKAGE"])}, {})
+        self.assertEqual(
+            state["files"]["package_tool"]["sha256"],
+            ci.digest(Path(os.environ["WAMR_CI_PACKAGE"])),
+        )
+        self.assertNotIn("package_tool", state)
+
     def test_physical_tree_bounds_enumeration_and_symlink_hash_work(self):
         entries = self.root / "bounded-tree"
         entries.mkdir(mode=0o700)
