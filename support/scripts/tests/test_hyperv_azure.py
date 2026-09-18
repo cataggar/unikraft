@@ -2686,6 +2686,13 @@ class HypervWorkflowTest(unittest.TestCase):
             "refuse credentials",
             "refuse groups",
             "refuse kvm-identity",
+            "Native runtime wrapper refused: ${failure_stage}",
+            "failure_stage=kvm-device",
+            "failure_stage=credentials",
+            "failure_stage=libfdt",
+            "failure_stage=qemu-probe",
+            "failure_stage=guest-launch",
+            "failure_stage=post-guest",
         ):
             self.assertIn(required, runtime)
         driver = (

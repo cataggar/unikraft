@@ -2,6 +2,8 @@
 set -euo pipefail
 umask 077
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT QEMU_MODULE_DIR
+failure_stage=invocation
+trap 'status=$?; echo "Native runtime wrapper refused: ${failure_stage}" >&2; exit "${status}"' ERR
 
 if [[ ( $# != 1 && $# != 2 && $# != 4 ) || "${1:-}" != /* ||
       "${GITHUB_ACTIONS:-}" != true || "$(id -u)" -eq 0 ]]; then
@@ -44,7 +46,7 @@ done
 
 cleanup() {
   primary=$?
-  trap - EXIT HUP INT TERM
+  trap - ERR EXIT HUP INT TERM
   cleanup_status=0
   if [[ -n "${kvm_identity}" ]]; then
     if [[ -c /dev/kvm && ! -L /dev/kvm ]] &&
@@ -90,6 +92,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+failure_stage=kvm-device
 test -c /dev/kvm
 test ! -L /dev/kvm
 test "$(stat -c %u /dev/kvm)" = 0
@@ -102,6 +105,7 @@ grep -Eq '^group::rw-$' "${root}/evidence/kvm-before.acl"
 if grep -Eq '^mask::' "${root}/evidence/kvm-before.acl"; then
   grep -Eq '^mask::rw-$' "${root}/evidence/kvm-before.acl"
 fi
+failure_stage=credentials
 runner_uid="$(id -u)"
 runner_gid="$(id -g)"
 test "$(id -ru)" = "${runner_uid}"
@@ -121,6 +125,7 @@ done
 sha256sum /usr/bin/setpriv /usr/bin/env /usr/bin/bash /etc/group \
   > "${root}/evidence/credential-inputs.sha256"
 
+failure_stage=libfdt
 if [[ -e "${target}" || -L "${target}" ]]; then
   test -f "${target}"
   test ! -L "${target}"
@@ -151,11 +156,13 @@ fi
 test "$(sha256sum "${target}" | cut -d ' ' -f 1)" = "${expected}"
 stat -c '%d:%i:%u:%g:%a:%h:%s' "${target}" > "${root}/evidence/managed-libfdt.txt"
 
+failure_stage=qemu-probe
 bash .github/scripts/hyperv-qemu-candidate.sh \
   "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" "${root}/evidence/managed-probe"
 getfacl --omit-header --no-effective --numeric /dev/kvm > "${root}/evidence/kvm-before-boots.acl"
 # Only this ordinary-user process tree receives the existing device group.
 # No persistent membership, ACL, device mode or udev rule is changed.
+failure_stage=guest-launch
 sudo /usr/bin/setpriv --reuid="${runner_uid}" --regid="${runner_gid}" --groups="${guest_groups}" \
   --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
   /usr/bin/env -i "HOME=${HOME}" "PATH=${PATH}" LC_ALL=C \
@@ -201,6 +208,7 @@ sudo /usr/bin/setpriv --reuid="${runner_uid}" --regid="${runner_gid}" --groups="
     exec /usr/bin/bash "$driver" "$@"
   ' _ "${runner_uid}" "${runner_gid}" "${guest_groups}" "${root}" \
   "${driver}" "${kvm_identity}" "${driver_args[@]}"
+failure_stage=post-guest
 id > "${root}/evidence/kvm-caller-after.txt"
 cmp "${root}/evidence/kvm-caller.txt" "${root}/evidence/kvm-caller-after.txt"
 sha256sum -c "${root}/evidence/managed-probe/executables.sha256" \
