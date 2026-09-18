@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -253,8 +254,13 @@ class Evidence(unittest.TestCase):
         root.mkdir(mode=0o700)
         self.put(root / "skeleton", b"fixture")
         expected = ci.bison_inputs(root)
+        source = {
+            "revision": "1" * 40,
+            "tree": "2" * 40,
+            "custody": {"fixture": True},
+        }
         with mock.patch.dict(os.environ, {}, clear=True), \
-                mock.patch.object(ci, "source", return_value={"fixture": True}), \
+                mock.patch.object(ci, "source", return_value=source), \
                 mock.patch.object(ci, "tool", return_value="/synthetic-tool"), \
                 mock.patch.object(ci, "digest", return_value="f" * 64), \
                 mock.patch.object(ci, "dependency_custody",
@@ -324,7 +330,11 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
 
         def inputs(root):
             events.append("custody")
-            return {"source": source, "dependencies": {}}
+            return {
+                "source": ci.source_identity(source),
+                "source_custody": source["custody"],
+                "dependencies": {},
+            }
 
         def command(runtime, expected, root, stage, args, *unused):
             if stage == "config":
@@ -363,7 +373,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         self.assertFalse((ci.HERE / "zig-pkg").exists())
 
     def test_restore_requires_the_private_fetched_package_tree(self):
-        missing = self.root / "missing-source"
+        missing = ci.REPO / ".d/missing-dependency-source"
         missing_root = self.root / "missing-restore"
         missing_root.mkdir(mode=0o700)
         with mock.patch.object(ci, "LOCAL_BOOT", missing), \
@@ -412,10 +422,16 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
 
         def manifest_record(relative, repository=ci.REPO):
             data = (restore / Path(relative).name).read_bytes()
+            metadata = [
+                1, 2, stat.S_IFREG | 0o644,
+                os.getuid(), os.getgid(), 1, len(data), 1, 1,
+            ]
             return ({
                 "path": relative, "mode": "100644", "bytes": len(data),
                 "sha256": hashlib.sha256(data).hexdigest(), "git_oid": "1" * 40,
-                "metadata_sha256": "2" * 64,
+                "metadata": metadata,
+                "metadata_sha256": hashlib.sha256(json.dumps(
+                    metadata, separators=(",", ":")).encode()).hexdigest(),
             }, data)
 
         return root, packages, mock.patch.object(
@@ -575,10 +591,16 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
 
         def manifest_record(relative, repository=ci.REPO):
             data = manifests[Path(relative).name]
+            metadata = [
+                1, 2, stat.S_IFREG | 0o644,
+                os.getuid(), os.getgid(), 1, len(data), 1, 1,
+            ]
             return ({
                 "path": relative, "mode": "100644", "bytes": len(data),
                 "sha256": hashlib.sha256(data).hexdigest(), "git_oid": "1" * 40,
-                "metadata_sha256": "2" * 64,
+                "metadata": metadata,
+                "metadata_sha256": hashlib.sha256(json.dumps(
+                    metadata, separators=(",", ":")).encode()).hexdigest(),
             }, data)
 
         def swap_restore(*unused, **kwargs):
@@ -640,16 +662,26 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
 
         def manifest_record(relative, repository=ci.REPO):
             data = (restore / Path(relative).name).read_bytes()
+            metadata = [
+                1, 2, stat.S_IFREG | 0o644,
+                os.getuid(), os.getgid(), 1, len(data), 1, 1,
+            ]
             return ({
                 "path": relative, "mode": "100644", "bytes": len(data),
                 "sha256": hashlib.sha256(data).hexdigest(), "git_oid": "1" * 40,
-                "metadata_sha256": "2" * 64,
+                "metadata": metadata,
+                "metadata_sha256": hashlib.sha256(json.dumps(
+                    metadata, separators=(",", ":")).encode()).hexdigest(),
             }, data)
 
         patch = mock.patch.object(ci, "tracked_manifest", side_effect=manifest_record)
         with patch:
             dependency = ci.dependency_custody(compute)
-            expected = {"source": source_record, "dependencies": dependency}
+            expected = {
+                "source": ci.source_identity(source_record),
+                "source_custody": source_record["custody"],
+                "dependencies": dependency,
+            }
             target = packages / ci.MIZ_PACKAGE_HASH / "source.zig"
             self.put(target, b"changed before build\n")
             with mock.patch.object(ci, "source", return_value=source_record), \

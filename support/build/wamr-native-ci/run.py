@@ -278,8 +278,14 @@ def require_source(expected, repository=REPO):
     require(source(repository) == expected, "immutable source custody changed")
 
 
+def source_identity(value):
+    return {"revision": value["revision"], "tree": value["tree"]}
+
+
 def producer_inputs(runtime):
-    return {"source": source(),
+    current_source = source()
+    return {"source": source_identity(current_source),
+            "source_custody": current_source["custody"],
             "tools": {name: digest(Path(tool(name))) for name in HOST_TOOLS},
             "bison_data": bison_inputs(runtime / "bison"),
             "dependencies": dependency_custody(runtime / "compute")}
@@ -470,6 +476,7 @@ def tracked_manifest(relative, repository=REPO):
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
         "git_oid": oid,
+        "metadata": list(snapshot(info)),
         "metadata_sha256": hashlib.sha256(
             json.dumps(snapshot(info), separators=(",", ":")).encode("ascii")).hexdigest(),
     }, data
@@ -846,6 +853,7 @@ def dependency_custody(root):
             "bytes": sum(item["content"]["bytes"] for item in records),
             "closure_sha256": closure.hexdigest(),
             "physical_sha256": physical.hexdigest(),
+            "root_metadata": list(root_info),
             "root_metadata_sha256": hashlib.sha256(json.dumps(
                 root_info, separators=(",", ":")).encode("ascii")).hexdigest(),
             "manifests": {
@@ -952,7 +960,10 @@ def restore_dependencies(root, expected_source):
 
 
 def require_build_custody(runtime, expected):
-    require(source() == expected["source"], "immutable source custody changed")
+    current_source = source()
+    require(source_identity(current_source) == expected["source"]
+            and current_source["custody"] == expected["source_custody"],
+            "immutable source custody changed")
     require_dependency_custody(runtime / "compute", expected["dependencies"])
 
 
@@ -982,9 +993,10 @@ def check_build():
     for name, expected in identity["files"].items():
         require(digest(APP / "build/artifacts" / name) == expected,
                 "runtime artifact changed")
+    current_source = source()
     image = document(APP / "build/image-identity.json")
     require(image["schema_version"] == 1
-            and image["unikraft_revision"] == source()["revision"]
+            and image["unikraft_revision"] == current_source["revision"]
             and image["unikraft_diff_sha256"] == hashlib.sha256(b"").hexdigest(),
             "dirty or different image source")
     require(image["runtime_inputs_sha256"] == digest(APP / "build/artifacts/identity.json"),
@@ -1013,7 +1025,8 @@ def check_build():
                    "LIBNETVSC", "LIBLWIP"):
         require("CONFIG_" + symbol + "=y" not in config.splitlines(),
                 "hardware application configuration")
-    return {"source": source(), "runtime": identity, "image": image}
+    return {"source": source_identity(current_source),
+            "runtime": identity, "image": image}
 
 
 def normalize_serial(raw):
@@ -1194,7 +1207,8 @@ def build(runtime, wamr):
     initial_source = source()
     packages = restore_dependencies(root, initial_source)
     initial = producer_inputs(runtime)
-    require(initial["source"] == initial_source,
+    require(initial["source"] == source_identity(initial_source)
+            and initial["source_custody"] == initial_source["custody"],
             "source changed during dependency restoration")
     save(root / "evidence/build-start.json", initial)
     require(subprocess.check_output([tool("zig"), "version"]).strip() == b"0.16.0",

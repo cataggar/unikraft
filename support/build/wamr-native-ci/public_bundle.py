@@ -7,16 +7,23 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import stat
 import subprocess
+import time
 import zipfile
 
 MAX_TOTAL = 512 * 1024 * 1024
 MAX_MEMBERS = 64
 MAX_JSON = 65536
 LEGACY_V1_SOURCES = frozenset({
-    ("71eba1fdfe863d2b0d56a02165e44bbb888b83a7",
-     "40450504eda1cb8ca5b5f9209f07feaea1ab18f0"),
+    ("993e4d0d394c08202c0d0c57ea97450a19a4f394",
+     "54f8e118146c78c24e7c802657c6ec62b268a5de"),
+    ("34e5c88a165c4da878b3122b8b91716116d65d4b",
+     "54f8e118146c78c24e7c802657c6ec62b268a5de"),
+    # Retained run 35277215611 archive source, independently inspected.
+    ("b5a8fdbee033349f7145fbc76aebfee29b2fa04f",
+     "54f8e118146c78c24e7c802657c6ec62b268a5de"),
 })
 BOOT_KEYS = ("serial", "request", "report", "compute")
 STAGES = ("adapter", "local-boot-tool", "fixtures", "prepare", "config",
@@ -70,6 +77,94 @@ def physical_metadata(value, kind, permissions, size=None):
     return value
 
 
+def metadata_sha256(value):
+    return hashlib.sha256(json.dumps(
+        value, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def git_output(ci, limit, *args):
+    environment = dict(os.environ)
+    for name in tuple(environment):
+        if name.startswith("GIT_") or name in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
+            environment.pop(name)
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    process = None
+    selector = None
+    try:
+        process = subprocess.Popen(
+            [ci.tool("git"), "--no-pager", *args],
+            cwd=ci.REPO, env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + 60
+        output = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, 60)
+            if not selector.select(remaining):
+                raise subprocess.TimeoutExpired(process.args, 60)
+            chunk = os.read(
+                process.stdout.fileno(),
+                min(65536, limit + 1 - len(output)))
+            if not chunk:
+                break
+            output.extend(chunk)
+            require(len(output) <= limit)
+        require(process.wait(timeout=max(
+            0.001, deadline - time.monotonic())) == 0)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("public-source bundle refused") from error
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+    return bytes(output)
+
+
+def trusted_source_manifests(ci, expected):
+    revision = expected["source_revision"]
+    tree = expected["source_tree"]
+    commit = git_output(
+        ci, 65, "rev-parse", "--verify", revision + "^{commit}").decode().strip()
+    actual_tree = git_output(
+        ci, 65, "rev-parse", revision + "^{tree}").decode().strip()
+    object_format = git_output(
+        ci, 16, "rev-parse", "--show-object-format").decode().strip()
+    require(commit == revision and actual_tree == tree and object_format == "sha1")
+    result = {}
+    for name in ("build.zig", "build.zig.zon"):
+        relative = "support/tools/hyperv/local_boot/" + name
+        raw = git_output(ci, 2048, "ls-tree", "-z", tree, "--", relative)
+        require(raw.endswith(b"\0") and raw.count(b"\0") == 1)
+        try:
+            header, found = raw[:-1].split(b"\t", 1)
+            mode, kind, oid = header.decode("ascii").split(" ")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError("public-source bundle refused") from error
+        require(found == relative.encode("ascii") and mode == "100644"
+                and kind == "blob" and re.fullmatch(r"[0-9a-f]{40}", oid))
+        size_raw = git_output(ci, 32, "cat-file", "-s", oid)
+        require(re.fullmatch(rb"[1-9][0-9]{0,6}\n", size_raw) is not None)
+        size = int(size_raw)
+        require(size <= 1024 * 1024)
+        data = git_output(ci, size, "cat-file", "blob", oid)
+        require(len(data) == size)
+        result[name] = {
+            "path": relative,
+            "mode": mode,
+            "bytes": size,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "git_oid": oid,
+        }
+    return result
+
+
 def command_record(value, stage, limit):
     require(set(value) == {"scope", "stage", "exit_code", "bytes", "sha256",
                            "over_limit", "known_error_markers"}
@@ -83,7 +178,23 @@ def command_record(value, stage, limit):
     return value
 
 
-def dependency_record(ci, value):
+def source_custody_record(ci, value):
+    require(set(value) == {
+        "schema", "version", "object_format", "files", "directories", "bytes",
+        "content_sha256", "physical_sha256", "role_excluded_outputs",
+    } and value["schema"] == "uk.wamr.git-physical-source"
+      and type(value["version"]) is int and value["version"] == 1
+      and value["object_format"] == "sha1"
+      and value["role_excluded_outputs"] == list(ci.SOURCE_OUTPUT_ROLES))
+    bounded_integer(value["files"], 1, ci.SOURCE_MAX_ENTRIES)
+    bounded_integer(value["directories"], 1, ci.SOURCE_MAX_ENTRIES)
+    bounded_integer(value["bytes"], 1, ci.SOURCE_MAX_BYTES)
+    digest_string(value["content_sha256"])
+    digest_string(value["physical_sha256"])
+    return value
+
+
+def dependency_record(ci, value, expected):
     require(set(value) == {
         "schema", "version", "request", "source_manifests",
         "restore_directory", "restore", "packages",
@@ -98,6 +209,7 @@ def dependency_record(ci, value):
         "build.zig": "support/tools/hyperv/local_boot/build.zig",
         "build.zig.zon": "support/tools/hyperv/local_boot/build.zig.zon",
     }
+    trusted = trusted_source_manifests(ci, expected)
     manifests = value["source_manifests"]
     require(set(manifests) == set(expected_paths))
     for name, expected_path in expected_paths.items():
@@ -105,13 +217,13 @@ def dependency_record(ci, value):
         require(set(item) == {"source", "copy"})
         source = item["source"]
         require(set(source) == {
-            "path", "mode", "bytes", "sha256", "git_oid", "metadata_sha256"}
+            "path", "mode", "bytes", "sha256", "git_oid", "metadata",
+            "metadata_sha256"}
                 and source["path"] == expected_path
-                and source["mode"] == "100644")
-        bounded_integer(source["bytes"], 1, 1024 * 1024)
-        digest_string(source["sha256"])
-        digest_string(source["git_oid"], (40,))
-        digest_string(source["metadata_sha256"])
+                and {key: source[key] for key in trusted[name]} == trusted[name])
+        physical_metadata(
+            source["metadata"], "file", 0o644, source["bytes"])
+        require(source["metadata_sha256"] == metadata_sha256(source["metadata"]))
         copied = item["copy"]
         require(set(copied) == {"bytes", "sha256", "metadata"})
         bounded_integer(copied["bytes"], 1, 1024 * 1024)
@@ -127,7 +239,7 @@ def dependency_record(ci, value):
     packages = value["packages"]
     require(set(packages) == {
         "roots", "files", "directories", "bytes", "closure_sha256",
-        "physical_sha256", "root_metadata_sha256", "manifests",
+        "physical_sha256", "root_metadata", "root_metadata_sha256", "manifests",
         "hash_verification", "records",
     })
     roots = bounded_integer(packages["roots"], 1, ci.PACKAGE_MAX_ROOTS)
@@ -138,6 +250,9 @@ def dependency_record(ci, value):
     require(files + directories <= ci.PACKAGE_MAX_ENTRIES)
     for key in ("closure_sha256", "physical_sha256", "root_metadata_sha256"):
         digest_string(packages[key])
+    root_metadata = physical_metadata(
+        packages["root_metadata"], "directory", 0o700)
+    require(packages["root_metadata_sha256"] == metadata_sha256(root_metadata))
     records = packages["records"]
     require(type(records) is list and len(records) == roots)
     names = []
@@ -218,7 +333,13 @@ def dependency_record(ci, value):
             and hash_verification["algorithm"] == "zig-0.16.0-fetch-path")
     bounded_integer(hash_verification["count"], 1, ci.PACKAGE_MAX_ROOTS)
     require(hash_verification["count"] == roots)
-    digest_string(hash_verification["sha256"])
+    hash_records = [{
+        "package_hash": name,
+        "sha256": hashlib.sha256((name + "\n").encode("ascii")).hexdigest(),
+    } for name in names]
+    require(hash_verification["sha256"] == hashlib.sha256(json.dumps(
+        hash_records, sort_keys=True,
+        separators=(",", ":")).encode("ascii")).hexdigest())
     closure = hashlib.sha256(b"uk.wamr.package-closure-v1\0")
     physical = hashlib.sha256(b"uk.wamr.package-physical-closure-v1\0")
     for record in records:
@@ -382,16 +503,19 @@ def publication_records(handoff, stage, source):
     require(set(value["records"]) == EVIDENCE
             and value["passed"] is True and value["cloud_authority"] == "not_admitted")
     build = ci.document(stage / "artifacts/build")
-    require(build["source"]["revision"] == source["source_revision"]
-            and build["source"]["tree"] == source["source_tree"])
+    expected_source = {
+        "revision": source["source_revision"],
+        "tree": source["source_tree"],
+    }
+    require(build["source"] == expected_source)
     start = ci.document(stage / "evidence/build-start.json")
-    require(start["source"]["revision"] == source["source_revision"]
-            and start["source"]["tree"] == source["source_tree"])
+    require(start["source"] == expected_source)
     if "dependencies" not in start:
         require((source["source_revision"], source["source_tree"])
-                in LEGACY_V1_SOURCES)
+                in LEGACY_V1_SOURCES and "source_custody" not in start)
     else:
-        dependency_record(ci, start["dependencies"])
+        source_custody_record(ci, start["source_custody"])
+        dependency_record(ci, start["dependencies"], source)
     for name in sorted(EVIDENCE):
         item = ci.document(stage / "evidence" / name)
         if name.startswith("command-"):
@@ -469,13 +593,24 @@ def pack(handoff, stage, archive, source, validator):
         os.fsync(output.fileno())
     require(archive.stat().st_size <= MAX_TOTAL)
     # Reopen the complete exported bytes, not just the pre-copy manifest.
-    verify_archive(handoff, archive, source)
+    archive_sha256 = handoff.ci.digest(archive, MAX_TOTAL)
+    verify_archive(handoff, archive, source, archive_sha256)
+    return archive_sha256
 
 
-def verify_archive(handoff, archive, expected):
+def verify_archive(handoff, archive, expected, expected_archive_sha256):
     context(expected)
-    require(0 < regular(archive).st_size <= MAX_TOTAL)
-    before = handoff.ci.snapshot(archive.stat())
+    if expected_archive_sha256 is None:
+        require((expected["source_revision"], expected["source_tree"])
+                in LEGACY_V1_SOURCES)
+    else:
+        digest_string(expected_archive_sha256)
+    info = regular(archive)
+    require(0 < info.st_size <= MAX_TOTAL)
+    before = handoff.ci.snapshot(info)
+    if expected_archive_sha256 is not None:
+        require(handoff.ci.digest(archive, MAX_TOTAL) == expected_archive_sha256
+                and handoff.ci.snapshot(regular(archive)) == before)
     with zipfile.ZipFile(archive) as zipped:
         entries = zipped.infolist()
         require(2 < len(entries) <= MAX_MEMBERS and not zipped.comment)
@@ -514,13 +649,18 @@ def verify_archive(handoff, archive, expected):
             require(zipped.getinfo(name).file_size == item["size"])
             with zipped.open(name) as stream:
                 copy_checked(stream, None, item)
+        if expected_archive_sha256 is None:
+            start = decode(zipped.read("evidence/build-start.json"))
+            require("dependencies" not in start)
     require(handoff.ci.snapshot(regular(archive)) == before)
     return bundle
 
 
-def import_bundle(handoff, archive, output, expected, validator):
+def import_bundle(
+        handoff, archive, output, expected, expected_archive_sha256, validator):
     handoff.private(output.parent)
-    bundle = verify_archive(handoff, archive, expected)
+    bundle = verify_archive(
+        handoff, archive, expected, expected_archive_sha256)
     before = handoff.ci.snapshot(regular(archive))
     output.mkdir(mode=0o700)
     with zipfile.ZipFile(archive) as zipped:
@@ -567,8 +707,10 @@ def publish_ci(handoff):
     handoff.export(runtime, stage)
     validator = runtime / "compute/public-tools/bin/uk-wamr-direct-validate"
     archive = output / "tiny-aot-public-source.zip"
-    pack(handoff, stage, archive, source, validator)
+    archive_sha256 = pack(handoff, stage, archive, source, validator)
     # Re-extract and run the actual production checker on the exported archive.
-    import_bundle(handoff, archive, runtime / "public-source-reopened", source, validator)
+    import_bundle(
+        handoff, archive, runtime / "public-source-reopened",
+        source, archive_sha256, validator)
     require(ci_context(handoff) == source)
     return archive

@@ -2652,6 +2652,36 @@ class HypervWorkflowTest(unittest.TestCase):
             local_boot_readme,
         )
 
+    def test_wamr_public_bundle_uses_external_archive_digest(self):
+        repository = SUPPORT.parent
+        workflow = (
+            repository / ".github/workflows/wamr-native-compute.yaml"
+        ).read_text()
+        publication = workflow.split(
+            "Retain the expressly authorized public-source tiny image bundle",
+            1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn(
+            'sha256sum -- "${archive}" | cut -d \' \' -f 1',
+            publication,
+        )
+        self.assertIn("Archive SHA-256:", publication)
+        self.assertIn("GITHUB_STEP_SUMMARY", publication)
+        handoff = (
+            repository / "support/build/wamr-native-ci/handoff.py"
+        ).read_text()
+        self.assertIn(
+            'imp.add_argument("--expected-archive-sha256")',
+            handoff,
+        )
+        operator = (
+            repository / "support/azure/WAMR-DIRECT-COMPUTE.md"
+        ).read_text()
+        self.assertIn(
+            '--expected-archive-sha256 "$ARCHIVE_SHA256"',
+            operator,
+        )
+
     def test_producer_dependency_guard_is_failure_aware_and_cancelable(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/integration.yaml"

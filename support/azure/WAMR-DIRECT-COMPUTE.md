@@ -145,6 +145,10 @@ Select a successful **current-source** native CI run and independently verify
 its run attempt, tested source commit/tree and four local outcomes. On PRs,
 `SOURCE_SHA`/`SOURCE_TREE` identify the tested synthetic merge commit/tree, not
 silently the branch head. Retain that distinction in the final approval.
+Retain `ARCHIVE_SHA256` from the successful job summary or an independently
+verified artifact-attestation subject; never derive that expected value from
+the downloaded ZIP. Ensure the exact reviewed `SOURCE_SHA` commit object is
+available in this repository and verify that it resolves to `SOURCE_TREE`.
 Download only the named artifact; no old metadata-only artifact supplies the
 required bytes. The following commands are offline/GitHub-only, not Azure:
 
@@ -158,6 +162,7 @@ python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
   --archive "$PWD/.d/wamr-download/tiny-aot-public-source.zip" \
   --output "$PRIVATE_PARENT/FRESH-imported-image" \
   --expected-source "$SOURCE_SHA" --expected-tree "$SOURCE_TREE" \
+  --expected-archive-sha256 "$ARCHIVE_SHA256" \
   --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
   --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate"
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" handoff \

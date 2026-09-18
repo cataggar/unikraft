@@ -11,6 +11,7 @@ import stat
 import struct
 import subprocess
 import time
+import types
 import unittest
 from unittest import mock
 import uuid
@@ -62,21 +63,43 @@ def result():
         error_name="")
 
 
-def dependency_custody():
+def source_custody():
+    ci = handoff.ci
+    return {
+        "schema": "uk.wamr.git-physical-source",
+        "version": 1,
+        "object_format": "sha1",
+        "files": 1,
+        "directories": 1,
+        "bytes": 1,
+        "content_sha256": digest(b"source-content"),
+        "physical_sha256": digest(b"source-physical"),
+        "role_excluded_outputs": list(ci.SOURCE_OUTPUT_ROLES),
+    }
+
+
+def dependency_custody(source):
     ci = handoff.ci
     source_manifests = {}
+    trusted = public_bundle.trusted_source_manifests(ci, {
+        "source_revision": source["revision"],
+        "source_tree": source["tree"],
+    })
     for index, name in enumerate(("build.zig", "build.zig.zon"), 1):
-        size = 20 + index
-        sha256 = str(index) * 64
+        source_record = trusted[name]
+        size = source_record["bytes"]
+        sha256 = source_record["sha256"]
+        source_metadata = [
+            1, 10 + index, stat.S_IFREG | 0o644,
+            1000, 1000, 1, size, 1, 1,
+        ]
         source_manifests[name] = {
-            "source": {
-                "path": "support/tools/hyperv/local_boot/" + name,
-                "mode": "100644",
-                "bytes": size,
-                "sha256": sha256,
-                "git_oid": str(index) * 40,
-                "metadata_sha256": str(index + 2) * 64,
-            },
+            "source": dict(
+                source_record,
+                metadata=source_metadata,
+                metadata_sha256=public_bundle.metadata_sha256(
+                    source_metadata),
+            ),
             "copy": {
                 "bytes": size,
                 "sha256": sha256,
@@ -108,6 +131,14 @@ def dependency_custody():
     public_bundle.bind(closure, record)
     physical = hashlib.sha256(b"uk.wamr.package-physical-closure-v1\0")
     public_bundle.bind(physical, [ci.MIZ_PACKAGE_HASH, "7" * 64])
+    root_metadata = [
+        1, 10, stat.S_IFDIR | 0o700,
+        1000, 1000, 3, 4096, 1, 1,
+    ]
+    hash_records = [{
+        "package_hash": ci.MIZ_PACKAGE_HASH,
+        "sha256": digest((ci.MIZ_PACKAGE_HASH + "\n").encode("ascii")),
+    }]
     return {
         "schema": "uk.wamr.zig-dependency-custody",
         "version": 1,
@@ -139,7 +170,9 @@ def dependency_custody():
             "bytes": 64,
             "closure_sha256": closure.hexdigest(),
             "physical_sha256": physical.hexdigest(),
-            "root_metadata_sha256": "8" * 64,
+            "root_metadata": root_metadata,
+            "root_metadata_sha256": public_bundle.metadata_sha256(
+                root_metadata),
             "manifests": {
                 "count": 1,
                 "bytes": 24,
@@ -148,11 +181,24 @@ def dependency_custody():
             "hash_verification": {
                 "algorithm": "zig-0.16.0-fetch-path",
                 "count": 1,
-                "sha256": "9" * 64,
+                "sha256": digest(json.dumps(
+                    hash_records, sort_keys=True,
+                    separators=(",", ":")).encode("ascii")),
             },
             "records": [record],
         },
     }
+
+
+def delivered_public_bundle():
+    raw = subprocess.check_output([
+        "git", "show",
+        "993e4d0d394c08202c0d0c57ea97450a19a4f394:"
+        "support/build/wamr-native-ci/public_bundle.py",
+    ], cwd=REPO, timeout=60)
+    module = types.ModuleType("delivered_wamr_public_bundle")
+    exec(compile(raw, "delivered-public-bundle.py", "exec"), module.__dict__)
+    return module
 
 
 def serial(boot=1, value=None):
@@ -684,7 +730,10 @@ class Compute(unittest.TestCase):
                                 compiler_profile="unikraft-x86_64", zig_version="0.16.0",
                                 files=files)
         write(app / "build/artifacts/identity.json", runtime_identity)
-        source = dict(revision="a" * 40, tree="b" * 40)
+        source = dict(
+            revision=ci.git("rev-parse", "HEAD"),
+            tree=ci.git("rev-parse", "HEAD^{tree}"),
+        )
         image_identity = dict(
             unikraft_revision=source["revision"],
             runtime_inputs_sha256=ci.digest(app / "build/artifacts/identity.json"),
@@ -695,7 +744,8 @@ class Compute(unittest.TestCase):
         build = dict(source=source, runtime=runtime_identity, image=image_identity)
         producer = dict(
             source=source,
-            dependencies=dependency_custody(),
+            source_custody=source_custody(),
+            dependencies=dependency_custody(source),
             fixture_only=True,
         )
         write(root / "evidence/build.json", build)
@@ -769,7 +819,9 @@ class Compute(unittest.TestCase):
         self.scope.update(
             bundle=handoff.artifact(bundle_path),
             os_vhd=bundle["artifacts"][handoff.NAMES.index("vhd")],
-            identity=bundle["identity"])
+            identity=bundle["identity"],
+            source_revision=bundle["source_revision"],
+            source_tree=bundle["source_tree"])
         write(self.scope_path, self.scope)
         self.validate("inputs")
         for key in ("source_tree", "source_revision"):
@@ -807,8 +859,12 @@ class Compute(unittest.TestCase):
         with self.assertRaises(ValueError):
             public_bundle.pack(handoff, stage, archive, source, VALIDATOR)
         (stage / "unexpected-link").unlink()
-        public_bundle.pack(handoff, stage, archive, source, VALIDATOR)
-        portable = public_bundle.verify_archive(handoff, archive, source)
+        archive_sha256 = public_bundle.pack(
+            handoff, stage, archive, source, VALIDATOR)
+        portable = public_bundle.verify_archive(
+            handoff, archive, source, archive_sha256)
+        with self.assertRaises(ValueError):
+            public_bundle.verify_archive(handoff, archive, source, None)
         selected = public_bundle.members(handoff, portable)
         self.assertEqual(len(public_bundle.EVIDENCE), 20)
         self.assertNotIn("command-dependency-restore.json", public_bundle.EVIDENCE)
@@ -820,8 +876,19 @@ class Compute(unittest.TestCase):
                              (stage / "boots/raw-x2apic/serial").read_bytes())
             self.assertNotIn(str(self.root).encode(), zipped.read("bundle.json"))
             self.assertNotIn(str(self.root).encode(), zipped.read("public-source.json"))
+        self.assertEqual(
+            read(stage / "artifacts/build")["source"],
+            {
+                "revision": source["source_revision"],
+                "tree": source["source_tree"],
+            },
+        )
+        delivered = delivered_public_bundle()
+        delivered.verify_archive(handoff, archive, source)
+        delivered.publication_records(handoff, stage, source)
         output = self.root / "imported"
-        imported = public_bundle.import_bundle(handoff, archive, output, source, VALIDATOR)
+        imported = public_bundle.import_bundle(
+            handoff, archive, output, source, archive_sha256, VALIDATOR)
         self.assertEqual(imported["authority"], "not_admitted")
         self.assertEqual((output / "artifacts/vhd").read_bytes(), (stage / "artifacts/vhd").read_bytes())
         self.assertEqual(handoff.plan(output / "bundle.json", self.root / "public-plan.json")["authority"],
@@ -829,7 +896,8 @@ class Compute(unittest.TestCase):
         for key in ("source_revision", "source_tree", "wamr_revision", "run_id", "run_attempt"):
             wrong = dict(source, **{key: "2" if key.startswith("run_") else "c" * 40})
             with self.subTest(binding=key), self.assertRaises(ValueError):
-                public_bundle.verify_archive(handoff, archive, wrong)
+                public_bundle.verify_archive(
+                    handoff, archive, wrong, archive_sha256)
         for name in ("extra", "sas.txt", "../escape", "/absolute", "artifacts/raw/link"):
             bad = self.root / "bad-member.zip"
             shutil.copyfile(archive, bad)
@@ -839,7 +907,9 @@ class Compute(unittest.TestCase):
                 info.external_attr = (stat.S_IFREG | 0o600) << 16
                 zipped.writestr(info, b"x")
             with self.subTest(member=name), self.assertRaises(ValueError):
-                public_bundle.verify_archive(handoff, bad, source)
+                public_bundle.verify_archive(
+                    handoff, bad, source,
+                    handoff.ci.digest(bad, public_bundle.MAX_TOTAL))
             bad.unlink()
         for name in ("artifacts/efi", "boots/raw-x2apic/report",
                      "boots/raw-x2apic/serial", "evidence/raw-x2apic-compute.json"):
@@ -851,7 +921,9 @@ class Compute(unittest.TestCase):
                         raw = b"x" + raw[1:]
                     zipped.writestr(info, raw)
             with self.subTest(changed=name), self.assertRaises(ValueError):
-                public_bundle.verify_archive(handoff, bad, source)
+                public_bundle.verify_archive(
+                    handoff, bad, source,
+                    handoff.ci.digest(bad, public_bundle.MAX_TOTAL))
             bad.unlink()
         bad = self.root / "symlink.zip"
         with zipfile.ZipFile(archive) as original, zipfile.ZipFile(bad, "w") as zipped:
@@ -861,7 +933,9 @@ class Compute(unittest.TestCase):
                     info.external_attr = (stat.S_IFLNK | 0o600) << 16
                 zipped.writestr(info, raw)
         with self.assertRaises(ValueError):
-            public_bundle.verify_archive(handoff, bad, source)
+            public_bundle.verify_archive(
+                handoff, bad, source,
+                handoff.ci.digest(bad, public_bundle.MAX_TOTAL))
         # Recomputed member digests still cannot promote a failed boot receipt.
         bad = self.root / "failed-receipt.zip"
         portable = copy.deepcopy(portable)
@@ -886,10 +960,12 @@ class Compute(unittest.TestCase):
                     zipped.writestr(info, raw)
         failed = self.root / "failed-import"
         with self.assertRaises(ValueError):
-            public_bundle.import_bundle(handoff, bad, failed, source, VALIDATOR)
+            public_bundle.import_bundle(
+                handoff, bad, failed, source,
+                handoff.ci.digest(bad, public_bundle.MAX_TOTAL), VALIDATOR)
         self.assertFalse((failed / "bundle.json").exists())
 
-        for label in ("removed", "skeletal", "tampered"):
+        def rewritten_archive(label, mutate):
             changed_archive = self.root / ("current-" + label + ".zip")
             with zipfile.ZipFile(archive) as original:
                 content = {
@@ -897,17 +973,7 @@ class Compute(unittest.TestCase):
                     for info in original.infolist()
                 }
                 start = json.loads(content["evidence/build-start.json"])
-                if label == "removed":
-                    start.pop("dependencies")
-                elif label == "skeletal":
-                    start["dependencies"] = {
-                        "schema": "uk.wamr.zig-dependency-custody",
-                        "version": 1,
-                        "request": dependency_custody()["request"],
-                    }
-                else:
-                    start["dependencies"]["packages"]["records"][0][
-                        "content"]["tree_sha256"] = "f" * 64
+                mutate(start)
                 start_raw = public_bundle.encoded(start)
                 content["evidence/build-start.json"] = start_raw
                 content["artifacts/build_start"] = start_raw
@@ -938,11 +1004,102 @@ class Compute(unittest.TestCase):
                 with zipfile.ZipFile(changed_archive, "w") as changed:
                     for info in original.infolist():
                         changed.writestr(info, content[info.filename])
+            return changed_archive
+
+        def remove_dependencies(start):
+            start.pop("dependencies")
+
+        def skeletal_dependencies(start):
+            request = start["dependencies"]["request"]
+            start["dependencies"] = {
+                "schema": "uk.wamr.zig-dependency-custody",
+                "version": 1,
+                "request": request,
+            }
+
+        def tamper_package_tree(start):
+            start["dependencies"]["packages"]["records"][0][
+                "content"]["tree_sha256"] = "f" * 64
+
+        for label, mutate in (
+                ("removed", remove_dependencies),
+                ("skeletal", skeletal_dependencies),
+                ("tampered", tamper_package_tree)):
+            changed_archive = rewritten_archive(label, mutate)
             changed_output = self.root / ("current-" + label + "-import")
             with self.subTest(dependency=label), self.assertRaises(ValueError):
                 public_bundle.import_bundle(
-                    handoff, changed_archive, changed_output, source, VALIDATOR)
+                    handoff, changed_archive, changed_output, source,
+                    handoff.ci.digest(
+                        changed_archive, public_bundle.MAX_TOTAL),
+                    VALIDATOR)
             self.assertFalse((changed_output / "bundle.json").exists())
+
+        def mutate_git_oid(start):
+            start["dependencies"]["source_manifests"]["build.zig"][
+                "source"]["git_oid"] = "f" * 40
+
+        def mutate_source_metadata_sha256(start):
+            start["dependencies"]["source_manifests"]["build.zig"][
+                "source"]["metadata_sha256"] = "f" * 64
+
+        def mutate_hash_verification_sha256(start):
+            start["dependencies"]["packages"]["hash_verification"][
+                "sha256"] = "f" * 64
+
+        def mutate_root_metadata_sha256(start):
+            start["dependencies"]["packages"][
+                "root_metadata_sha256"] = "f" * 64
+
+        for label, mutate in (
+                ("source-git-oid", mutate_git_oid),
+                ("source-metadata-sha256", mutate_source_metadata_sha256),
+                ("hash-verification-sha256",
+                 mutate_hash_verification_sha256),
+                ("root-metadata-sha256", mutate_root_metadata_sha256)):
+            changed_archive = rewritten_archive(label, mutate)
+            changed_sha256 = handoff.ci.digest(
+                changed_archive, public_bundle.MAX_TOTAL)
+            changed_output = self.root / (label + "-source-refusal")
+            with self.subTest(custody=label), self.assertRaises(ValueError):
+                public_bundle.import_bundle(
+                    handoff, changed_archive, changed_output, source,
+                    changed_sha256, VALIDATOR)
+            self.assertFalse((changed_output / "bundle.json").exists())
+            with self.subTest(external=label), self.assertRaises(ValueError):
+                public_bundle.verify_archive(
+                    handoff, changed_archive, source, archive_sha256)
+
+        def forge_source_metadata(start):
+            source_record = start["dependencies"]["source_manifests"][
+                "build.zig"]["source"]
+            source_record["metadata"][8] += 1
+            source_record["metadata_sha256"] = public_bundle.metadata_sha256(
+                source_record["metadata"])
+
+        def forge_package_physical_custody(start):
+            packages = start["dependencies"]["packages"]
+            packages["records"][0]["content"]["physical_sha256"] = "f" * 64
+            closure = hashlib.sha256(b"uk.wamr.package-closure-v1\0")
+            physical = hashlib.sha256(
+                b"uk.wamr.package-physical-closure-v1\0")
+            for record in packages["records"]:
+                public_bundle.bind(closure, record)
+                public_bundle.bind(physical, [
+                    record["package_hash"],
+                    record["content"]["physical_sha256"],
+                ])
+            packages["closure_sha256"] = closure.hexdigest()
+            packages["physical_sha256"] = physical.hexdigest()
+
+        for label, mutate in (
+                ("self-consistent-source-metadata", forge_source_metadata),
+                ("self-consistent-package-physical",
+                 forge_package_physical_custody)):
+            changed_archive = rewritten_archive(label, mutate)
+            with self.subTest(external=label), self.assertRaises(ValueError):
+                public_bundle.verify_archive(
+                    handoff, changed_archive, source, archive_sha256)
 
         def copied_stage(name):
             target = self.root / name
@@ -998,35 +1155,89 @@ class Compute(unittest.TestCase):
                     size=path.stat().st_size, sha256=handoff.ci.digest(path))
             write(target / "bundle.json", public_bundle.encoded(copied))
 
-        old_stage, old_bundle = copied_stage("old-v1-stage")
-        legacy_revision, legacy_tree = next(iter(public_bundle.LEGACY_V1_SOURCES))
-        old_source = dict(
-            source, source_revision=legacy_revision, source_tree=legacy_tree)
-        old_start = dict(
-            source={"revision": legacy_revision, "tree": legacy_tree},
-            fixture_only=True,
+        legacy_sources = (
+            (
+                "993e4d0d394c08202c0d0c57ea97450a19a4f394",
+                "54f8e118146c78c24e7c802657c6ec62b268a5de",
+            ),
+            (
+                "34e5c88a165c4da878b3122b8b91716116d65d4b",
+                "54f8e118146c78c24e7c802657c6ec62b268a5de",
+            ),
+            (
+                "b5a8fdbee033349f7145fbc76aebfee29b2fa04f",
+                "54f8e118146c78c24e7c802657c6ec62b268a5de",
+            ),
         )
-        old_build = read(old_stage / "artifacts/build")
-        old_build["source"] = {
-            "revision": legacy_revision,
-            "tree": legacy_tree,
+        self.assertEqual(
+            public_bundle.LEGACY_V1_SOURCES, frozenset(legacy_sources))
+        for index, (legacy_revision, legacy_tree) in enumerate(
+                legacy_sources):
+            old_stage, old_bundle = copied_stage(
+                f"old-v1-stage-{index}")
+            old_source = dict(
+                source, source_revision=legacy_revision,
+                source_tree=legacy_tree)
+            old_start = dict(
+                source={
+                    "revision": legacy_revision,
+                    "tree": legacy_tree,
+                },
+                fixture_only=True,
+            )
+            old_build = read(old_stage / "artifacts/build")
+            old_build["source"] = {
+                "revision": legacy_revision,
+                "tree": legacy_tree,
+            }
+            old_image_identity = read(
+                old_stage / "artifacts/image_identity")
+            old_image_identity["unikraft_revision"] = legacy_revision
+            old_build["image"] = old_image_identity
+            rewrite_stage(
+                old_stage, old_bundle, old_start, build=old_build,
+                image_identity=old_image_identity, identity=old_source)
+            old_archive = self.root / f"old-v1-{index}.zip"
+            public_bundle.pack(
+                handoff, old_stage, old_archive, old_source, VALIDATOR)
+            old_output = self.root / f"old-v1-imported-{index}"
+            public_bundle.import_bundle(
+                handoff, old_archive, old_output, old_source,
+                None, VALIDATOR)
+            self.assertNotIn(
+                "dependencies",
+                read(old_output / "evidence/build-start.json"),
+            )
+
+        unrelated_stage, unrelated_bundle = copied_stage(
+            "unrelated-v1-stage")
+        unrelated_revision = "f" * 40
+        unrelated_tree = legacy_sources[0][1]
+        unrelated_source = dict(
+            source, source_revision=unrelated_revision,
+            source_tree=unrelated_tree)
+        unrelated_start = {
+            "source": {
+                "revision": unrelated_revision,
+                "tree": unrelated_tree,
+            },
+            "fixture_only": True,
         }
-        old_image_identity = read(old_stage / "artifacts/image_identity")
-        old_image_identity["unikraft_revision"] = legacy_revision
-        old_build["image"] = old_image_identity
+        unrelated_build = read(unrelated_stage / "artifacts/build")
+        unrelated_build["source"] = unrelated_start["source"]
+        unrelated_image_identity = read(
+            unrelated_stage / "artifacts/image_identity")
+        unrelated_image_identity["unikraft_revision"] = unrelated_revision
+        unrelated_build["image"] = unrelated_image_identity
         rewrite_stage(
-            old_stage, old_bundle, old_start, build=old_build,
-            image_identity=old_image_identity, identity=old_source)
-        old_archive = self.root / "old-v1.zip"
-        public_bundle.pack(
-            handoff, old_stage, old_archive, old_source, VALIDATOR)
-        old_output = self.root / "old-v1-imported"
-        public_bundle.import_bundle(
-            handoff, old_archive, old_output, old_source, VALIDATOR)
-        self.assertNotIn(
-            "dependencies",
-            read(old_output / "evidence/build-start.json"),
-        )
+            unrelated_stage, unrelated_bundle, unrelated_start,
+            build=unrelated_build,
+            image_identity=unrelated_image_identity,
+            identity=unrelated_source)
+        with self.assertRaises(ValueError):
+            public_bundle.pack(
+                handoff, unrelated_stage, self.root / "unrelated-v1.zip",
+                unrelated_source, VALIDATOR)
 
     def test_public_export_has_no_arbitrary_private_tree_mode(self):
         with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):

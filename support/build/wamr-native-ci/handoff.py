@@ -191,6 +191,7 @@ def main():
     imp.add_argument("--output", type=Path, required=True)
     imp.add_argument("--expected-source", required=True)
     imp.add_argument("--expected-tree", required=True)
+    imp.add_argument("--expected-archive-sha256")
     imp.add_argument("--run-id", required=True)
     imp.add_argument("--run-attempt", required=True)
     imp.add_argument("--validator", type=Path, required=True)
@@ -208,7 +209,9 @@ def main():
             expected = dict(repository="cataggar/unikraft", run_id=args.run_id,
                             run_attempt=args.run_attempt, source_revision=args.expected_source,
                             source_tree=args.expected_tree, wamr_revision=ci.REVISION)
-            public_bundle.import_bundle(sys.modules[__name__], args.archive, args.output, expected, args.validator)
+            public_bundle.import_bundle(
+                sys.modules[__name__], args.archive, args.output, expected,
+                args.expected_archive_sha256, args.validator)
     print("Compute handoff/plan prepared; authority=not_admitted. No Azure operations.")
 
 

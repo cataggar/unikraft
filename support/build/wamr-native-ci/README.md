@@ -188,12 +188,17 @@ It contains the 17 exact image/compiler/runtime/config/manifest artifacts,
 four original serial/request/report/compute sets, the original fixed 20 local
 JSON records, portable `bundle.json`, and `public-source.json` (55 regular
 files, at most 512 MiB total). Dependency custody is embedded in the existing
-`build-start.json`; it is not a 21st evidence member. Old 20-record public
-bundle v1 archives from source `71eba1fdfe863d2b0d56a02165e44bbb888b83a7`
-and tree `40450504eda1cb8ca5b5f9209f07feaea1ab18f0` remain import-compatible;
-all other identities require the complete dependency-custody record. Member
-names, modes/types, individual sizes, complete SHA256/EOF, source/run bindings
-and successful receipts are checked.
+`build-start.json`; it is not a 21st evidence member. The delivered source
+`993e4d0d394c08202c0d0c57ea97450a19a4f394`, its reference PR head
+`34e5c88a165c4da878b3122b8b91716116d65d4b`, and retained run
+`35277215611` merge source `b5a8fdbee033349f7145fbc76aebfee29b2fa04f`
+all have tree `54f8e118146c78c24e7c802657c6ec62b268a5de` and remain
+import-compatible without the later custody record. No other identity may
+omit it. Those exact legacy archives retain their source/run/member trust
+contract and may omit the new external-digest input; any archive containing a
+current custody claim requires it. Member names, modes/types, individual
+sizes, complete SHA256/EOF, source/run bindings and successful receipts are
+checked.
 Symlinks/hardlinks, duplicate/extra/absolute/traversal members, compression,
 oversize inputs and known credential/account/approval patterns are refused.
 
@@ -212,9 +217,22 @@ cannot publish a successful image bundle. This public-source permission does
 not authorize public export from the private operator CLI and supplies no
 Azure permission, measurement or acceptance.
 
-Download and import as described in the operator documentation. The importer
-requires independently selected source/tree/run/attempt values, safely copies
-only bounded regular members to a fresh private directory, rebuilds local
-artifact references (not original requests), and uses the production native
-checker before publishing a usable `bundle.json`. Its plan remains
-`authority=not_admitted`; new final artifact-bound human approval is required.
+Download and import as described in the operator documentation. Current
+imports require an independently selected SHA256 of the complete ZIP from the
+successful workflow summary or an independently verified attestation subject;
+computing the expected value from the downloaded ZIP is not a trust decision.
+The exact expected source commit and tree must also be available in the local
+Git object database. The importer resolves both dependency manifests from that
+tree and compares their blob OIDs, bytes and SHA256 values, then recomputes
+manifest, closure, root-metadata and Zig hash-verification summaries.
+
+Package-tree physical metadata and the recorded Zig executions are producer
+observations: their package bytes are intentionally not included in this tiny
+archive, so import does not pretend to re-run those observations. They are
+authenticated to the selected successful run only by the independently
+trusted complete-archive SHA256. Missing archive trust is a refusal, never a
+best-effort downgrade. The importer then safely copies only bounded regular
+members to a fresh private directory, rebuilds local artifact references (not
+original requests), and uses the production native checker before publishing
+a usable `bundle.json`. Its plan remains `authority=not_admitted`; new final
+artifact-bound human approval is required.

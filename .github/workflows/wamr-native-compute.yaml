@@ -124,6 +124,20 @@ jobs:
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           python3 support/build/wamr-native-ci/handoff.py public-source-bundle
+          archive="${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip"
+          archive_sha256="$(sha256sum -- "${archive}" | cut -d ' ' -f 1)"
+          if [[ ! "${archive_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid public-source archive digest" >&2
+            exit 1
+          fi
+          {
+            echo '## Exact WAMR public-source image'
+            echo
+            echo "Archive SHA-256: \`${archive_sha256}\`"
+            echo
+            echo "Source: \`${GITHUB_SHA}/$(git rev-parse HEAD^{tree})\`"
+            echo "Source job: \`${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}:wamr-native-compute\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Publish only the standalone verified public-source image archive
         uses: actions/upload-artifact@v4
