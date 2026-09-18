@@ -385,7 +385,7 @@ class Evidence(unittest.TestCase):
                 ci.Refusal, "unsafe physical input tree symlink"):
             ci.physical_tree_record(directory_links)
 
-    def test_physical_tree_dangling_symlink_custody(self):
+    def test_physical_tree_stable_dangling_symlink_custody(self):
         dangling = self.root / "dangling-symlink-tree"
         dangling.mkdir(mode=0o700)
         missing = (
@@ -396,7 +396,10 @@ class Evidence(unittest.TestCase):
         record, unused_directories = ci.physical_tree_record(dangling)
         del unused_directories
         self.assertEqual(record["symlinks"], 1)
-        (dangling / "stable-missing").unlink()
+
+    def test_physical_tree_mutable_dangling_symlink_custody(self):
+        dangling = self.root / "dangling-symlink-tree"
+        dangling.mkdir(mode=0o700)
         (dangling / "mutable-missing").symlink_to(self.root / "missing")
         with self.assertRaisesRegex(
                 ci.Refusal, "unsafe physical input tree symlink"):
