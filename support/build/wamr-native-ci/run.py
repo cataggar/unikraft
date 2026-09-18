@@ -1056,6 +1056,17 @@ def require_build_custody(runtime, expected):
                 raise Refusal("invalid ignored source inventory") from error
             report["ignored_paths"] = ignored_paths[:128]
             report["ignored_paths_truncated"] = len(ignored_paths) > 128
+            root_entries = []
+            for path in sorted(REPO.iterdir(), key=lambda item: item.name):
+                info = path.lstat()
+                kind = (
+                    "directory" if stat.S_ISDIR(info.st_mode)
+                    else "symlink" if stat.S_ISLNK(info.st_mode)
+                    else "file"
+                )
+                root_entries.append({"name": path.name, "kind": kind})
+            require(len(root_entries) <= 128, "source root inventory too large")
+            report["root_entries"] = root_entries
             save(failure, report)
     require(source_matches, "immutable source custody changed")
     require_dependency_custody(runtime / "compute", expected["dependencies"])
