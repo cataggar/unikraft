@@ -2684,6 +2684,14 @@ class HypervWorkflowTest(unittest.TestCase):
             '"${runner_uid}:${runner_gid}:600:1"',
         ):
             self.assertIn(required, runtime)
+        driver = (
+            SUPPORT.parent / ".github/scripts/wamr-native-ci.sh"
+        ).read_text()
+        for refusal in (
+            "invocation", "qualification-source", "repository-identity",
+            "source-revision", "architecture", "kvm-read", "kvm-write",
+        ):
+            self.assertIn(f"refuse {refusal}", driver)
 
     def test_wamr_public_bundle_uses_external_archive_digest(self):
         repository = SUPPORT.parent
