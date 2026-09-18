@@ -52,7 +52,7 @@ def main():
 import pathlib, shutil, sys
 if "--strip-all" not in sys.argv or "-s" in sys.argv:
     raise SystemExit(2)
-shutil.copyfile(sys.argv[sys.argv.index("-o") - 1], sys.argv[sys.argv.index("-o") + 1])
+shutil.copyfile(sys.argv[-2], sys.argv[-1])
 """,
         )
         write_executable(

@@ -107,7 +107,7 @@ def main():
         remove = [item for section in args.remove_section for item in ("-R", section)]
         run([
             *command(args.tool), "--strip-all", *remove,
-            args.input, "-o", args.output,
+            args.input, args.output,
         ])
     elif args.action == "bootinfo":
         env = os.environ.copy()

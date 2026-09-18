@@ -700,7 +700,7 @@ class Compute(unittest.TestCase):
         app = self.root / "app"
         for path in (runtime, root, app, app / "build", app / "build/artifacts",
                      root / "evidence", root / "tools", root / "tools/bin",
-                     root / "tools/consumer-tree", runtime / "bin",
+                     root / "tools/consumer-tree", root / "package", runtime / "bin",
                      runtime / "bin/share", runtime / "firmware"):
             path.mkdir(mode=0o700)
         shutil.copyfile(REPO / "support/apps/wamr-aot/check-log.py", app / "check-log.py")

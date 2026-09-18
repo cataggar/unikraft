@@ -2679,10 +2679,6 @@ class HypervWorkflowTest(unittest.TestCase):
             / ".github/scripts/hyperv-qemu-candidate-runtime.sh"
         ).read_text()
         for required in (
-            'chmod 600 "$2"',
-            'chown --no-dereference "$3:$4" "$2"',
-            '\' _ "${source}" "${ownership}" "${runner_uid}" "${runner_gid}"',
-            '"${runner_uid}:${runner_gid}:600:1"',
             "Restricted native guest refused: $1",
             "refuse credentials",
             "refuse groups",
@@ -2696,6 +2692,29 @@ class HypervWorkflowTest(unittest.TestCase):
             "failure_stage=post-guest",
         ):
             self.assertIn(required, runtime)
+        libfdt_prepare = (
+            SUPPORT.parent
+            / ".github/scripts/hyperv-native-libfdt-prepare.sh"
+        ).read_text()
+        for required in (
+            'chmod 600 "$2"',
+            'chown --no-dereference "$3:$4" "$2"',
+            '\' _ "${source}" "${ownership}" "${runner_uid}" "${runner_gid}"',
+            '"${runner_uid}:${runner_gid}:600:1"',
+            "refuse ownership-identity",
+            "refuse managed-record-identity",
+        ):
+            self.assertIn(required, libfdt_prepare)
+        libfdt_cleanup = (
+            SUPPORT.parent
+            / ".github/scripts/hyperv-native-libfdt-cleanup.sh"
+        ).read_text()
+        for required in (
+            'test "$(stat -c \'%d:%i:%u:%g\' "${target}")" = "${identity}"',
+            'sudo rm -- "${target}"',
+            "managed=1 cleanup=0",
+        ):
+            self.assertIn(required, libfdt_cleanup)
         driver = (
             SUPPORT.parent / ".github/scripts/wamr-native-ci.sh"
         ).read_text()
