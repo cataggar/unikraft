@@ -3130,6 +3130,10 @@ fn isAllowedAssignment(name: []const u8) bool {
         "ARCH",
         "LLVM_TARGET_ARCH",
         "AR",
+        "CP",
+        "MKDIR",
+        "READLINK",
+        "ZIG",
         "YACC",
         "LEX",
         "RANLIB",
@@ -3147,7 +3151,10 @@ fn isAllowedAssignment(name: []const u8) bool {
         "HOSTNM",
         "HOSTOBJCOPY",
         "HOSTRANLIB",
+        "HOSTOSENV",
         "KCONFIG_OVERWRITECONFIG",
+        "WGET",
+        "WGET_VERSION",
         "UK_ASFLAGS",
         "UK_CFLAGS",
         "UK_CXXFLAGS",
@@ -3685,6 +3692,13 @@ test "path lists resolve from the repository root" {
 
 test "forwarded Make assignments require allowlisted names" {
     try validateForwardedAssignment("AR=zig ar");
+    try validateForwardedAssignment("CP=/native/bin/cp -f");
+    try validateForwardedAssignment("MKDIR=/native/bin/mkdir");
+    try validateForwardedAssignment("READLINK=/native/bin/readlink");
+    try validateForwardedAssignment("HOSTOSENV=Linux");
+    try validateForwardedAssignment("WGET_VERSION=unavailable");
+    try validateForwardedAssignment("WGET=false");
+    try validateForwardedAssignment("ZIG=/native/bin/zig");
     try validateForwardedAssignment("YACC=/native/bin/bison");
     try validateForwardedAssignment("LEX=/native/bin/flex");
     try validateForwardedAssignment("KCONFIG_OVERWRITECONFIG=1");
