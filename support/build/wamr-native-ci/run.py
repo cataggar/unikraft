@@ -495,7 +495,7 @@ def ignored_source_state(repository=REPO):
                 require(len(raw) == info.st_size,
                         "ignored source symlink changed")
                 try:
-                    target = path.resolve(strict=True)
+                    target = path.resolve(strict=False)
                 except (OSError, RuntimeError, ValueError) as error:
                     raise Refusal(
                         "ignored source symlink escapes repository") from error

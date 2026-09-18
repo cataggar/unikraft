@@ -900,6 +900,9 @@ source/generated/
         (repository / ".d/tool-link").symlink_to("tool")
         ci.source(repository)
         (repository / ".d/tool-link").unlink()
+        (repository / ".d/tool-link").symlink_to("future-tool")
+        ci.source(repository)
+        (repository / ".d/tool-link").unlink()
         outside = self.root / "ignored-unsafe-outside"
         self.put(outside, b"outside\n")
         (repository / ".d/tool-link").symlink_to(
