@@ -3087,6 +3087,8 @@ def boot(runtime):
     consumer_inputs = initial["consumer_inputs"]
     require(producer_inputs(runtime, consumer_inputs) == initial,
             "producer inputs changed")
+    COMMAND_ENVIRONMENT.update(bind_command_tools(consumer_inputs))
+    os.environ.update(COMMAND_ENVIRONMENT)
     require(check_build() == document(root / "evidence/build.json"), "build identity changed")
     FAILURE_STAGE = "boot-output-slots"
     package_output, configs = prepare_boot_output_slots(runtime, root)

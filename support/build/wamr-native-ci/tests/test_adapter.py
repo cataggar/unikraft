@@ -669,6 +669,42 @@ class Evidence(unittest.TestCase):
             self.assertEqual(ci.producer_inputs(self.root)["bison_data"], expected)
             self.assertNotIn("BISON_PKGDATADIR", os.environ)
 
+    def test_boot_binds_only_independently_revalidated_consumer_tools(self):
+        consumer = {
+            "files": {
+                "tool:" + name: {"path": "/trusted/" + name}
+                for name in ci.HOST_TOOLS
+            },
+        }
+        initial = {"consumer_inputs": consumer}
+
+        def independently_validate(runtime, expected):
+            self.assertEqual(runtime, self.root)
+            self.assertEqual(expected, consumer)
+            self.assertFalse(ci.COMMAND_TOOL_PATHS)
+            return initial
+
+        def check_after_binding():
+            self.assertEqual(
+                ci.COMMAND_TOOL_PATHS,
+                {name: "/trusted/" + name for name in ci.HOST_TOOLS},
+            )
+            raise RuntimeError("stop after validated binding")
+
+        with mock.patch.dict(ci.COMMAND_TOOL_PATHS, {}, clear=True), \
+                mock.patch.dict(ci.COMMAND_ENVIRONMENT, {}, clear=True), \
+                mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(ci.platform, "machine", return_value="x86_64"), \
+                mock.patch.object(Path, "is_char_device", return_value=True), \
+                mock.patch.object(ci.os, "access", return_value=True), \
+                mock.patch.object(ci, "document", return_value=initial), \
+                mock.patch.object(
+                    ci, "producer_inputs", side_effect=independently_validate), \
+                mock.patch.object(ci, "check_build", side_effect=check_after_binding), \
+                self.assertRaisesRegex(
+                    RuntimeError, "stop after validated binding"):
+            ci.boot(self.root)
+
     def test_consumer_inventory_uses_exact_indirect_tools_not_system_bin(self):
         runtime = self.root / "inventory"
         runtime.mkdir(mode=0o700)
