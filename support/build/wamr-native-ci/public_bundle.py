@@ -675,6 +675,7 @@ def publication_records(handoff, stage, source):
 
 
 def pack(handoff, stage, archive, source, validator):
+    handoff.FAILURE_STAGE = "public-pack-context"
     source = context(source)
     handoff.private(stage)
     handoff.private(archive.parent)
@@ -682,11 +683,15 @@ def pack(handoff, stage, archive, source, validator):
     require(bundle["source_revision"] == source["source_revision"]
             and bundle["source_tree"] == source["source_tree"]
             and bundle["identity"]["wamr_revision"] == source["wamr_revision"])
+    handoff.FAILURE_STAGE = "public-pack-members"
     original = members(handoff, bundle, stage)
+    handoff.FAILURE_STAGE = "public-pack-records"
     publication_records(handoff, stage, source)
     # The private handoff's known inspection captures exist but are never copied.
+    handoff.FAILURE_STAGE = "public-pack-tree"
     inspect_tree(stage, set(original) | {
         "bundle.json", "private/handoff-inspect.log", "evidence/command-handoff-inspect.json"})
+    handoff.FAILURE_STAGE = "public-pack-native"
     native(handoff, validator, stage / "bundle.json")
     portable = copy.deepcopy(bundle)
     for item in members(handoff, portable, stage).values():
@@ -698,6 +703,7 @@ def pack(handoff, stage, archive, source, validator):
                              for name, item in selected.items()})
     bundle_bytes, manifest_bytes = encoded(portable), encoded(manifest)
     require(len(bundle_bytes) <= MAX_JSON and len(manifest_bytes) <= MAX_JSON)
+    handoff.FAILURE_STAGE = "public-pack-zip"
     with archive.open("xb") as output:
         os.fchmod(output.fileno(), 0o600)
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED, allowZip64=False) as zipped:
@@ -720,6 +726,7 @@ def pack(handoff, stage, archive, source, validator):
         os.fsync(output.fileno())
     require(archive.stat().st_size <= MAX_TOTAL)
     # Reopen the complete exported bytes, not just the pre-copy manifest.
+    handoff.FAILURE_STAGE = "public-pack-archive"
     archive_sha256 = handoff.ci.digest(archive, MAX_TOTAL)
     verify_archive(handoff, archive, source, archive_sha256)
     return archive_sha256
