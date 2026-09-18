@@ -36,6 +36,7 @@ MIZ_URL = "git+https://github.com/cataggar/miz.git#" + MIZ_REVISION
 SOURCE_MAX_ENTRIES = 40_000
 SOURCE_MAX_BYTES = 2 * 1024 * MIB
 SOURCE_MAX_FILE = 256 * MIB
+SOURCE_DIAGNOSTIC_MAX_CHANGES = 64
 PACKAGE_MAX_ROOTS = 128
 PACKAGE_MAX_ENTRIES = 16_384
 PACKAGE_MAX_BYTES = 256 * MIB
@@ -190,18 +191,7 @@ def source_file(repository, relative, mode, oid, object_format):
     return raw, before
 
 
-def source(repository=REPO):
-    repository = Path(repository)
-    require(repository.is_absolute() and canonical(repository)
-            and stat.S_ISDIR(repository.lstat().st_mode), "canonical source required")
-    status = git_raw(repository, "status", "--porcelain=v2", "--untracked-files=all")
-    require(not status, "clean committed source required")
-    head = git("rev-parse", "HEAD", repository=repository)
-    tree = git("rev-parse", "HEAD^{tree}", repository=repository)
-    if repository == REPO:
-        require(head == os.environ.get("GITHUB_SHA", head), "unexpected source revision")
-    object_format = git("rev-parse", "--show-object-format", repository=repository)
-    require(object_format in ("sha1", "sha256"), "unsupported Git object format")
+def tracked_source_map(repository, head, object_format):
     listing = git_raw(repository, "ls-tree", "-r", "-z", "--full-tree", head)
     require(0 < len(listing) <= 4 * MIB and listing.endswith(b"\0"),
             "invalid tracked source map")
@@ -228,6 +218,59 @@ def source(repository=REPO):
         for parent in path.parents:
             if str(parent) != ".":
                 directories.add(parent.as_posix())
+    return entries, directories
+
+
+def source_metadata(repository=REPO):
+    repository = Path(repository)
+    head = git("rev-parse", "HEAD", repository=repository)
+    object_format = git("rev-parse", "--show-object-format", repository=repository)
+    entries, directories = tracked_source_map(repository, head, object_format)
+    records = []
+    for relative in sorted(directories):
+        path = repository if not relative else repository / relative
+        records.append(["directory", relative, snapshot(path.lstat())])
+    for relative, _, _ in entries:
+        records.append(["file", relative, snapshot((repository / relative).lstat())])
+    return records
+
+
+def source_metadata_changes(before, after):
+    expected = {(kind, path): metadata for kind, path, metadata in before}
+    current = {(kind, path): metadata for kind, path, metadata in after}
+    changed = []
+    total = 0
+    for kind, path in sorted(set(expected) | set(current)):
+        old = expected.get((kind, path))
+        new = current.get((kind, path))
+        if old != new:
+            total += 1
+            if len(changed) < SOURCE_DIAGNOSTIC_MAX_CHANGES:
+                changed.append({
+                    "kind": kind, "path": path, "before": old, "after": new,
+                })
+    return {
+        "schema": "uk.wamr.git-physical-source-diagnostic",
+        "version": 1,
+        "changed": changed,
+        "changed_records": total,
+        "truncated": total > len(changed),
+    }
+
+
+def source(repository=REPO):
+    repository = Path(repository)
+    require(repository.is_absolute() and canonical(repository)
+            and stat.S_ISDIR(repository.lstat().st_mode), "canonical source required")
+    status = git_raw(repository, "status", "--porcelain=v2", "--untracked-files=all")
+    require(not status, "clean committed source required")
+    head = git("rev-parse", "HEAD", repository=repository)
+    tree = git("rev-parse", "HEAD^{tree}", repository=repository)
+    if repository == REPO:
+        require(head == os.environ.get("GITHUB_SHA", head), "unexpected source revision")
+    object_format = git("rev-parse", "--show-object-format", repository=repository)
+    require(object_format in ("sha1", "sha256"), "unsupported Git object format")
+    entries, directories = tracked_source_map(repository, head, object_format)
     directory_state = {}
     for relative in sorted(directories, key=lambda item: (item.count("/"), item)):
         path = repository if not relative else repository / relative
@@ -961,9 +1004,20 @@ def restore_dependencies(root, expected_source):
 
 def require_build_custody(runtime, expected):
     current_source = source()
-    require(source_identity(current_source) == expected["source"]
-            and current_source["custody"] == expected["source_custody"],
-            "immutable source custody changed")
+    source_matches = (
+        source_identity(current_source) == expected["source"]
+        and current_source["custody"] == expected["source_custody"]
+    )
+    if not source_matches:
+        root = runtime / "compute"
+        baseline = root / "private/source-metadata.json"
+        failure = root / "evidence/source-custody-failure.json"
+        if baseline.is_file() and not failure.exists():
+            report = source_metadata_changes(
+                document(baseline)["records"], source_metadata())
+            report["source"] = source_identity(current_source)
+            save(failure, report)
+    require(source_matches, "immutable source custody changed")
     require_dependency_custody(runtime / "compute", expected["dependencies"])
 
 
@@ -1205,6 +1259,11 @@ def build(runtime, wamr):
     require(os.environ.get("BISON_PKGDATADIR") == str(runtime / "bison"),
             "Bison build environment differs from bound producer input")
     initial_source = source()
+    save(root / "private/source-metadata.json", {
+        "schema": "uk.wamr.git-physical-source-baseline",
+        "version": 1,
+        "records": source_metadata(),
+    })
     packages = restore_dependencies(root, initial_source)
     initial = producer_inputs(runtime)
     require(initial["source"] == source_identity(initial_source)

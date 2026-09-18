@@ -347,6 +347,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 "BISON_PKGDATADIR": str(runtime / "bison")}, clear=True), \
                 mock.patch.object(ci, "prepare_source_outputs"), \
                 mock.patch.object(ci, "source", return_value=source), \
+                mock.patch.object(ci, "source_metadata", return_value=[]), \
                 mock.patch.object(ci, "restore_dependencies", side_effect=restore), \
                 mock.patch.object(ci, "producer_inputs", side_effect=inputs), \
                 mock.patch.object(ci, "run_custodied", side_effect=command), \
@@ -730,6 +731,17 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         )
         with self.assertRaisesRegex(ci.Refusal, "immutable source custody changed"):
             ci.require_source(expected, repository)
+        baseline = ci.source_metadata(repository)
+        generated.mkdir(mode=0o700)
+        generated.rmdir()
+        changes = ci.source_metadata_changes(
+            baseline, ci.source_metadata(repository))
+        self.assertEqual(changes["changed_records"], 1)
+        self.assertEqual(
+            [(item["kind"], item["path"]) for item in changes["changed"]],
+            [("directory", "source")],
+        )
+        self.assertFalse(changes["truncated"])
         self.put(self.root / "outside", b"not source\n")
         (repository / "source/link").unlink()
         (repository / "source/link").symlink_to("../../outside")
