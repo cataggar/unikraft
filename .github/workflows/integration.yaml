@@ -783,6 +783,7 @@ jobs:
       with:
         submodules: recursive
         persist-credentials: false
+        fetch-depth: 0
 
     - name: Restore independent fixture tools
       uses: ./.github/actions/hyperv-fixture-setup

@@ -2549,6 +2549,8 @@ class HypervWorkflowTest(unittest.TestCase):
                     header,
                 )
                 self.assertIn("        persist-credentials: false\n", job)
+                if lane == "runtime":
+                    self.assertIn("        fetch-depth: 0\n", job)
                 self.assertIn("uses: ./.github/actions/hyperv-fixture-setup", job)
                 for forbidden in ("    if:", "    needs:", "    strategy:",
                                   "id-token:", "environment:"):
