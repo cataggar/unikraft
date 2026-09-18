@@ -2643,6 +2643,14 @@ class HypervWorkflowTest(unittest.TestCase):
             ),
             2,
         )
+        local_boot_readme = (
+            SUPPORT / "tools/hyperv/local_boot/README.md"
+        ).read_text()
+        self.assertIn('"$SCRATCH/global-cache/tmp"', local_boot_readme)
+        self.assertNotIn(
+            '"$SCRATCH"/{home,tmp,cache,global-cache,restore,fixtures,outputs}',
+            local_boot_readme,
+        )
 
     def test_producer_dependency_guard_is_failure_aware_and_cancelable(self):
         workflow = (

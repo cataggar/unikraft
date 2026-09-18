@@ -213,7 +213,8 @@ and explicit owned scratch for HOME, TMPDIR, XDG/Zig caches and outputs:
 ```sh
 SCRATCH="$PWD/.d/local-boot"
 umask 077
-mkdir -p "$SCRATCH"/{home,tmp,cache,global-cache,restore,fixtures,outputs}
+mkdir -p "$SCRATCH"/{home,tmp,cache,restore,fixtures,outputs} \
+  "$SCRATCH/global-cache/tmp" "$SCRATCH/restore/zig-pkg"
 export HOME="$SCRATCH/home" TMPDIR="$SCRATCH/tmp"
 export XDG_CACHE_HOME="$SCRATCH/cache"
 export ZIG_LOCAL_CACHE_DIR="$SCRATCH/cache"

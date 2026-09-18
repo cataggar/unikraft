@@ -76,6 +76,7 @@ def export(runtime, output):
         checked = ci.check_boot(ci.config_for(runtime, root, i), build["runtime"])
         ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
                    "physical local result changed")
+    ci.require_build_custody(runtime, before)
     output.mkdir(mode=0o700)
     for name in ("private", "evidence", "artifacts", "boots"):
         (output / name).mkdir(mode=0o700)

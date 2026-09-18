@@ -62,6 +62,99 @@ def result():
         error_name="")
 
 
+def dependency_custody():
+    ci = handoff.ci
+    source_manifests = {}
+    for index, name in enumerate(("build.zig", "build.zig.zon"), 1):
+        size = 20 + index
+        sha256 = str(index) * 64
+        source_manifests[name] = {
+            "source": {
+                "path": "support/tools/hyperv/local_boot/" + name,
+                "mode": "100644",
+                "bytes": size,
+                "sha256": sha256,
+                "git_oid": str(index) * 40,
+                "metadata_sha256": str(index + 2) * 64,
+            },
+            "copy": {
+                "bytes": size,
+                "sha256": sha256,
+                "metadata": [
+                    1, 10 + index, stat.S_IFREG | 0o600,
+                    1000, 1000, 1, size, 1, 1,
+                ],
+            },
+        }
+    manifest = {
+        "bytes": 24,
+        "sha256": "5" * 64,
+        "dependencies": [],
+    }
+    record = {
+        "package_hash": ci.MIZ_PACKAGE_HASH,
+        "content": {
+            "files": 2,
+            "directories": 1,
+            "bytes": 64,
+            "tree_sha256": "6" * 64,
+            "physical_sha256": "7" * 64,
+        },
+        "manifest": manifest,
+    }
+    manifest_digest = hashlib.sha256(b"uk.wamr.package-manifests-v1\0")
+    public_bundle.bind(manifest_digest, [ci.MIZ_PACKAGE_HASH, manifest])
+    closure = hashlib.sha256(b"uk.wamr.package-closure-v1\0")
+    public_bundle.bind(closure, record)
+    physical = hashlib.sha256(b"uk.wamr.package-physical-closure-v1\0")
+    public_bundle.bind(physical, [ci.MIZ_PACKAGE_HASH, "7" * 64])
+    return {
+        "schema": "uk.wamr.zig-dependency-custody",
+        "version": 1,
+        "request": {
+            "url": ci.MIZ_URL,
+            "revision": ci.MIZ_REVISION,
+            "package_hash": ci.MIZ_PACKAGE_HASH,
+        },
+        "source_manifests": source_manifests,
+        "restore_directory": {
+            "metadata": [
+                1, 10, stat.S_IFDIR | 0o700,
+                1000, 1000, 3, 4096, 1, 1,
+            ],
+        },
+        "restore": {
+            "scope": "command_diagnostic_not_acceptance",
+            "stage": "dependency-restore",
+            "exit_code": 0,
+            "bytes": 0,
+            "sha256": digest(b""),
+            "over_limit": False,
+            "known_error_markers": [],
+        },
+        "packages": {
+            "roots": 1,
+            "files": 2,
+            "directories": 1,
+            "bytes": 64,
+            "closure_sha256": closure.hexdigest(),
+            "physical_sha256": physical.hexdigest(),
+            "root_metadata_sha256": "8" * 64,
+            "manifests": {
+                "count": 1,
+                "bytes": 24,
+                "sha256": manifest_digest.hexdigest(),
+            },
+            "hash_verification": {
+                "algorithm": "zig-0.16.0-fetch-path",
+                "count": 1,
+                "sha256": "9" * 64,
+            },
+            "records": [record],
+        },
+    }
+
+
 def serial(boot=1, value=None):
     return ("\n".join([
         f"synthetic boot {boot}", "Hyper-V Hv#1 hypercall page enabled",
@@ -600,7 +693,11 @@ class Compute(unittest.TestCase):
                    for name in (ci.EFI, ci.EFI + ".dbg", ci.EFI + ".bootinfo")})
         write(app / "build/image-identity.json", image_identity)
         build = dict(source=source, runtime=runtime_identity, image=image_identity)
-        producer = dict(source=source, fixture_only=True)
+        producer = dict(
+            source=source,
+            dependencies=dependency_custody(),
+            fixture_only=True,
+        )
         write(root / "evidence/build.json", build)
         write(root / "evidence/build-start.json", producer)
         tools = dict(
@@ -657,7 +754,8 @@ class Compute(unittest.TestCase):
             original = (root / "evidence/result.json").read_bytes()
             with mock.patch.object(ci, "check_build", return_value=build), \
                     mock.patch.object(ci, "producer_inputs", return_value=producer):
-                handoff.export(runtime, self.root / "handoff")
+                with mock.patch.object(ci, "require_build_custody"):
+                    handoff.export(runtime, self.root / "handoff")
         self.assertEqual((root / "evidence/result.json").read_bytes(), original)
         bundle_path = self.root / "handoff/bundle.json"
         bundle = read(bundle_path)
@@ -712,8 +810,11 @@ class Compute(unittest.TestCase):
         public_bundle.pack(handoff, stage, archive, source, VALIDATOR)
         portable = public_bundle.verify_archive(handoff, archive, source)
         selected = public_bundle.members(handoff, portable)
+        self.assertEqual(len(public_bundle.EVIDENCE), 20)
+        self.assertNotIn("command-dependency-restore.json", public_bundle.EVIDENCE)
         with zipfile.ZipFile(archive) as zipped:
             self.assertEqual(set(zipped.namelist()), set(selected) | {"bundle.json", "public-source.json"})
+            self.assertEqual(len(zipped.namelist()), 55)
             self.assertFalse(any("private/" in name or "diagnostic" in name for name in zipped.namelist()))
             self.assertEqual(zipped.read("boots/raw-x2apic/serial"),
                              (stage / "boots/raw-x2apic/serial").read_bytes())
@@ -787,6 +888,145 @@ class Compute(unittest.TestCase):
         with self.assertRaises(ValueError):
             public_bundle.import_bundle(handoff, bad, failed, source, VALIDATOR)
         self.assertFalse((failed / "bundle.json").exists())
+
+        for label in ("removed", "skeletal", "tampered"):
+            changed_archive = self.root / ("current-" + label + ".zip")
+            with zipfile.ZipFile(archive) as original:
+                content = {
+                    info.filename: original.read(info)
+                    for info in original.infolist()
+                }
+                start = json.loads(content["evidence/build-start.json"])
+                if label == "removed":
+                    start.pop("dependencies")
+                elif label == "skeletal":
+                    start["dependencies"] = {
+                        "schema": "uk.wamr.zig-dependency-custody",
+                        "version": 1,
+                        "request": dependency_custody()["request"],
+                    }
+                else:
+                    start["dependencies"]["packages"]["records"][0][
+                        "content"]["tree_sha256"] = "f" * 64
+                start_raw = public_bundle.encoded(start)
+                content["evidence/build-start.json"] = start_raw
+                content["artifacts/build_start"] = start_raw
+                local_result = json.loads(content["artifacts/local_result"])
+                local_result["records"]["build-start.json"] = digest(start_raw)
+                local_result_raw = public_bundle.encoded(local_result)
+                content["artifacts/local_result"] = local_result_raw
+                changed_bundle = json.loads(content["bundle.json"])
+                by_name = dict(zip(handoff.NAMES, changed_bundle["artifacts"]))
+                by_name["build_start"].update(
+                    size=len(start_raw), sha256=digest(start_raw))
+                by_name["local_result"].update(
+                    size=len(local_result_raw), sha256=digest(local_result_raw))
+                evidence = dict(zip(
+                    sorted(public_bundle.EVIDENCE), changed_bundle["evidence"]))
+                evidence["build-start.json"].update(
+                    size=len(start_raw), sha256=digest(start_raw))
+                content["bundle.json"] = public_bundle.encoded(changed_bundle)
+                manifest = json.loads(content["public-source.json"])
+                for name in (
+                        "artifacts/build_start", "artifacts/local_result",
+                        "evidence/build-start.json"):
+                    manifest["members"][name] = {
+                        "size": len(content[name]),
+                        "sha256": digest(content[name]),
+                    }
+                content["public-source.json"] = public_bundle.encoded(manifest)
+                with zipfile.ZipFile(changed_archive, "w") as changed:
+                    for info in original.infolist():
+                        changed.writestr(info, content[info.filename])
+            changed_output = self.root / ("current-" + label + "-import")
+            with self.subTest(dependency=label), self.assertRaises(ValueError):
+                public_bundle.import_bundle(
+                    handoff, changed_archive, changed_output, source, VALIDATOR)
+            self.assertFalse((changed_output / "bundle.json").exists())
+
+        def copied_stage(name):
+            target = self.root / name
+            shutil.copytree(stage, target)
+            (target / "private/native-revalidation.log").unlink()
+            (target / "evidence/command-native-revalidation.json").unlink()
+            copied = read(target / "bundle.json")
+            for item in copied["artifacts"] + copied["evidence"] + [
+                    boot[key] for boot in copied["boots"]
+                    for key in public_bundle.BOOT_KEYS]:
+                item["path"] = str(target / Path(item["path"]).relative_to(stage))
+            return target, copied
+
+        def rewrite_stage(
+                target, copied, start, build=None, image_identity=None, identity=None):
+            start_raw = public_bundle.encoded(start)
+            for path in (target / "artifacts/build_start",
+                         target / "evidence/build-start.json"):
+                write(path, start_raw)
+            changed_records = {"build-start.json": digest(start_raw)}
+            if build is not None:
+                build_raw = public_bundle.encoded(build)
+                for path in (target / "artifacts/build",
+                             target / "evidence/build.json"):
+                    write(path, build_raw)
+                changed_records["build.json"] = digest(build_raw)
+            local_result_path = target / "artifacts/local_result"
+            local_result = read(local_result_path)
+            local_result["records"].update(changed_records)
+            write(local_result_path, public_bundle.encoded(local_result))
+            if identity is not None:
+                copied["source_revision"] = identity["source_revision"]
+                copied["source_tree"] = identity["source_tree"]
+            by_name = dict(zip(handoff.NAMES, copied["artifacts"]))
+            for name, path in (
+                    ("build_start", target / "artifacts/build_start"),
+                    ("local_result", local_result_path)):
+                by_name[name].update(
+                    size=path.stat().st_size, sha256=handoff.ci.digest(path))
+            if build is not None:
+                path = target / "artifacts/build"
+                by_name["build"].update(
+                    size=path.stat().st_size, sha256=handoff.ci.digest(path))
+            if image_identity is not None:
+                path = target / "artifacts/image_identity"
+                write(path, public_bundle.encoded(image_identity))
+                by_name["image_identity"].update(
+                    size=path.stat().st_size, sha256=handoff.ci.digest(path))
+            evidence = dict(zip(sorted(public_bundle.EVIDENCE), copied["evidence"]))
+            for name in changed_records:
+                path = target / "evidence" / name
+                evidence[name].update(
+                    size=path.stat().st_size, sha256=handoff.ci.digest(path))
+            write(target / "bundle.json", public_bundle.encoded(copied))
+
+        old_stage, old_bundle = copied_stage("old-v1-stage")
+        legacy_revision, legacy_tree = next(iter(public_bundle.LEGACY_V1_SOURCES))
+        old_source = dict(
+            source, source_revision=legacy_revision, source_tree=legacy_tree)
+        old_start = dict(
+            source={"revision": legacy_revision, "tree": legacy_tree},
+            fixture_only=True,
+        )
+        old_build = read(old_stage / "artifacts/build")
+        old_build["source"] = {
+            "revision": legacy_revision,
+            "tree": legacy_tree,
+        }
+        old_image_identity = read(old_stage / "artifacts/image_identity")
+        old_image_identity["unikraft_revision"] = legacy_revision
+        old_build["image"] = old_image_identity
+        rewrite_stage(
+            old_stage, old_bundle, old_start, build=old_build,
+            image_identity=old_image_identity, identity=old_source)
+        old_archive = self.root / "old-v1.zip"
+        public_bundle.pack(
+            handoff, old_stage, old_archive, old_source, VALIDATOR)
+        old_output = self.root / "old-v1-imported"
+        public_bundle.import_bundle(
+            handoff, old_archive, old_output, old_source, VALIDATOR)
+        self.assertNotIn(
+            "dependencies",
+            read(old_output / "evidence/build-start.json"),
+        )
 
     def test_public_export_has_no_arbitrary_private_tree_mode(self):
         with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):

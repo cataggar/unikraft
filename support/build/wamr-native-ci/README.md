@@ -60,8 +60,17 @@ not change those semantics or spoof unavailable-storage markers:
   outcome and zero owned teardown accounting. Hardware/network and optional
   WASI records are forbidden.
 
-The source must be clean and committed before building. Records bind the
-Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
+The source must be clean and committed before building. The source record
+independently hashes every tracked blob/symlink target against its Git object
+ID and binds every tracked parent directory's device/inode/type, ownership,
+links, size, mtime and ctime. Its bounded summary records file, directory and
+byte counts plus content and physical SHA256 values. The only role-excluded
+output roots are `.d`, `support/apps/wamr-aot/build`, and the precreated
+`support/apps/wamr-aot/.config`; Python bytecode is disabled. The same physical
+record is required around each build/boot consumer and at inspection/handoff,
+so a create/delete transient cannot be hidden by a finally clean Git status.
+
+Records also bind the Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
 actual tools, wasm/cwasm/compiler/library bytes, solved configuration,
 entire EFI/debug ELF/bootinfo, native package producer, QEMU and OVMF,
 complete raw/VHD/footer, and each request/report/raw serial. Inputs are
@@ -73,10 +82,28 @@ observations, not authenticated source attestations or deployment receipts.
 
 Writable build, package, firmware and boot slots are under the checkout's
 ignored `.d/wamr-native-runtime` or the app's ignored `build/`. Zig's
-source-pinned dependency restoration copies the local-boot manifests into
-`compute/dependencies` and creates `zig-pkg` there before source custody is
-recorded. Both the adapter and local-boot builds use that one package tree
-through `--system`; no package-manager state is created below tracked source.
+source-pinned dependency restoration first establishes clean physical source
+custody, then copies the exact Git-identified local-boot manifests create-only
+into `compute/dependencies`. Before Zig runs it binds each copy's exact
+device/inode/type, ownership, links, size, mtime and ctime plus the parent
+directory metadata, and requires the same identities immediately afterward.
+It also byte-compares the copies, parses the one exact Miz
+URL/revision/package hash, and only then performs the bounded fetch. Before
+reading package content it enumerates and snapshots the complete bounded
+directory set, including `zig-pkg`, then requires the exact set and metadata
+after traversal. The restored tree rejects links, nonregular entries, unsafe
+names, extra/missing/duplicate roots and incomplete transitive manifests. Zig 0.16
+`fetch PATH` independently recomputes every package hash, including Miz rather
+than trusting its directory name. `build-start.json` embeds
+`uk.wamr.zig-dependency-custody` version 1: request and source/copy manifest
+identities and restore-parent metadata, bounded restore diagnostics,
+package/root/file/directory/byte counts, per-package
+content/physical/manifests, and aggregate closure, physical, manifest,
+hash-verification and root-metadata SHA256 values. Limits
+are 128 roots, 16,384 entries, 256 MiB total, 64 MiB per file, depth 64 and
+4 MiB per manifest. Both builds use that one tree through `--system`; it is
+revalidated around every consumer and at final inspection/export. No
+package-manager state is created below tracked source.
 Build commands use `-j2`; the workflow has a 60-minute ceiling. Each build
 command has a fixed deadline and an 8-MiB log limit (one extra byte detects
 overflow). The native packaging worker retains its 120-second deadline and
@@ -158,10 +185,15 @@ Artifact name:
 `wamr-public-source-tiny-RUN_ID-RUN_ATTEMPT-SOURCE_SHA`.
 Its sole uploaded file is `tiny-aot-public-source.zip`, stored for seven days.
 It contains the 17 exact image/compiler/runtime/config/manifest artifacts,
-four original serial/request/report/compute sets, the fixed 21 earlier local
-JSON records, portable `bundle.json`, and `public-source.json` (56 regular
-files, at most 512 MiB total). Member names, modes/types, individual sizes,
-complete SHA256/EOF, source/run bindings and successful receipts are checked.
+four original serial/request/report/compute sets, the original fixed 20 local
+JSON records, portable `bundle.json`, and `public-source.json` (55 regular
+files, at most 512 MiB total). Dependency custody is embedded in the existing
+`build-start.json`; it is not a 21st evidence member. Old 20-record public
+bundle v1 archives from source `71eba1fdfe863d2b0d56a02165e44bbb888b83a7`
+and tree `40450504eda1cb8ca5b5f9209f07feaea1ab18f0` remain import-compatible;
+all other identities require the complete dependency-custody record. Member
+names, modes/types, individual sizes, complete SHA256/EOF, source/run bindings
+and successful receipts are checked.
 Symlinks/hardlinks, duplicate/extra/absolute/traversal members, compression,
 oversize inputs and known credential/account/approval patterns are refused.
 

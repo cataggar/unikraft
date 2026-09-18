@@ -14,10 +14,14 @@ import zipfile
 MAX_TOTAL = 512 * 1024 * 1024
 MAX_MEMBERS = 64
 MAX_JSON = 65536
+LEGACY_V1_SOURCES = frozenset({
+    ("71eba1fdfe863d2b0d56a02165e44bbb888b83a7",
+     "40450504eda1cb8ca5b5f9209f07feaea1ab18f0"),
+})
 BOOT_KEYS = ("serial", "request", "report", "compute")
 STAGES = ("adapter", "local-boot-tool", "fixtures", "prepare", "config",
           "native-image", "package", "raw-x2apic", "raw-legacy-apic",
-          "vpc-x2apic", "vpc-legacy-apic", "inspect", "dependency-restore")
+          "vpc-x2apic", "vpc-legacy-apic", "inspect")
 EVIDENCE = frozenset(
     ["build-start.json", "build.json", "boot-inputs.json", "package.json"]
     + [f"command-{stage}.json" for stage in STAGES]
@@ -35,6 +39,195 @@ SENSITIVE = (
 def require(ok):
     if not ok:
         raise ValueError("public-source bundle refused")
+
+
+def bind(hasher, value):
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    hasher.update(len(raw).to_bytes(8, "big"))
+    hasher.update(raw)
+
+
+def bounded_integer(value, lower, upper):
+    require(type(value) is int and lower <= value <= upper)
+    return value
+
+
+def digest_string(value, lengths=(64,)):
+    require(type(value) is str and len(value) in lengths
+            and re.fullmatch(r"[0-9a-f]+", value))
+    return value
+
+
+def physical_metadata(value, kind, permissions, size=None):
+    require(type(value) is list and len(value) == 9)
+    for item in value:
+        bounded_integer(item, 0, (1 << 64) - 1)
+    require(value[0] > 0 and value[1] > 0 and value[5] > 0
+            and stat.S_IMODE(value[2]) == permissions)
+    require(stat.S_ISREG(value[2]) if kind == "file" else stat.S_ISDIR(value[2]))
+    if size is not None:
+        require(value[6] == size)
+    return value
+
+
+def command_record(value, stage, limit):
+    require(set(value) == {"scope", "stage", "exit_code", "bytes", "sha256",
+                           "over_limit", "known_error_markers"}
+            and value["scope"] == "command_diagnostic_not_acceptance"
+            and value["stage"] == stage
+            and type(value["exit_code"]) is int and value["exit_code"] == 0
+            and value["over_limit"] is False
+            and value["known_error_markers"] == [])
+    bounded_integer(value["bytes"], 0, limit)
+    digest_string(value["sha256"])
+    return value
+
+
+def dependency_record(ci, value):
+    require(set(value) == {
+        "schema", "version", "request", "source_manifests",
+        "restore_directory", "restore", "packages",
+    } and value["schema"] == "uk.wamr.zig-dependency-custody"
+      and type(value["version"]) is int and value["version"] == 1
+      and value["request"] == {
+          "url": ci.MIZ_URL,
+          "revision": ci.MIZ_REVISION,
+          "package_hash": ci.MIZ_PACKAGE_HASH,
+      })
+    expected_paths = {
+        "build.zig": "support/tools/hyperv/local_boot/build.zig",
+        "build.zig.zon": "support/tools/hyperv/local_boot/build.zig.zon",
+    }
+    manifests = value["source_manifests"]
+    require(set(manifests) == set(expected_paths))
+    for name, expected_path in expected_paths.items():
+        item = manifests[name]
+        require(set(item) == {"source", "copy"})
+        source = item["source"]
+        require(set(source) == {
+            "path", "mode", "bytes", "sha256", "git_oid", "metadata_sha256"}
+                and source["path"] == expected_path
+                and source["mode"] == "100644")
+        bounded_integer(source["bytes"], 1, 1024 * 1024)
+        digest_string(source["sha256"])
+        digest_string(source["git_oid"], (40,))
+        digest_string(source["metadata_sha256"])
+        copied = item["copy"]
+        require(set(copied) == {"bytes", "sha256", "metadata"})
+        bounded_integer(copied["bytes"], 1, 1024 * 1024)
+        require(copied["bytes"] == source["bytes"]
+                and copied["sha256"] == source["sha256"])
+        physical_metadata(copied["metadata"], "file", 0o600, copied["bytes"])
+        require(copied["metadata"][5] == 1)
+    restore_directory = value["restore_directory"]
+    require(set(restore_directory) == {"metadata"})
+    physical_metadata(restore_directory["metadata"], "directory", 0o700)
+    command_record(value["restore"], "dependency-restore", 8 * 1024 * 1024)
+
+    packages = value["packages"]
+    require(set(packages) == {
+        "roots", "files", "directories", "bytes", "closure_sha256",
+        "physical_sha256", "root_metadata_sha256", "manifests",
+        "hash_verification", "records",
+    })
+    roots = bounded_integer(packages["roots"], 1, ci.PACKAGE_MAX_ROOTS)
+    files = bounded_integer(packages["files"], 1, ci.PACKAGE_MAX_ENTRIES)
+    directories = bounded_integer(
+        packages["directories"], roots, ci.PACKAGE_MAX_ENTRIES)
+    package_bytes = bounded_integer(packages["bytes"], 1, ci.PACKAGE_MAX_BYTES)
+    require(files + directories <= ci.PACKAGE_MAX_ENTRIES)
+    for key in ("closure_sha256", "physical_sha256", "root_metadata_sha256"):
+        digest_string(packages[key])
+    records = packages["records"]
+    require(type(records) is list and len(records) == roots)
+    names = []
+    manifest_count = 0
+    manifest_bytes = 0
+    dependency_graph = {}
+    total_files = 0
+    total_directories = 0
+    total_bytes = 0
+    manifest_digest = hashlib.sha256(b"uk.wamr.package-manifests-v1\0")
+    for record in records:
+        require(set(record) == {"package_hash", "content", "manifest"})
+        name = record["package_hash"]
+        require(type(name) is str
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,159}", name)
+                and name not in (".", ".."))
+        names.append(name)
+        content = record["content"]
+        require(set(content) == {
+            "files", "directories", "bytes", "tree_sha256", "physical_sha256"})
+        count_files = bounded_integer(
+            content["files"], 1, ci.PACKAGE_MAX_ENTRIES)
+        count_directories = bounded_integer(
+            content["directories"], 1, ci.PACKAGE_MAX_ENTRIES)
+        count_bytes = bounded_integer(content["bytes"], 1, ci.PACKAGE_MAX_BYTES)
+        require(count_files + count_directories <= ci.PACKAGE_MAX_ENTRIES)
+        digest_string(content["tree_sha256"])
+        digest_string(content["physical_sha256"])
+        total_files += count_files
+        total_directories += count_directories
+        total_bytes += count_bytes
+        manifest = record["manifest"]
+        if manifest is None:
+            dependencies = []
+        else:
+            require(set(manifest) == {"bytes", "sha256", "dependencies"})
+            size = bounded_integer(manifest["bytes"], 1, 4 * 1024 * 1024)
+            digest_string(manifest["sha256"])
+            dependencies = manifest["dependencies"]
+            require(type(dependencies) is list
+                    and len(dependencies) <= ci.PACKAGE_MAX_ROOTS)
+            for dependency in dependencies:
+                require(type(dependency) is str
+                        and re.fullmatch(
+                            r"[A-Za-z0-9][A-Za-z0-9._+-]{0,159}", dependency)
+                        and dependency not in (".", ".."))
+            require(dependencies == sorted(set(dependencies)))
+            manifest_count += 1
+            manifest_bytes += size
+            bind(manifest_digest, [name, manifest])
+        dependency_graph[name] = dependencies
+    require(names == sorted(set(names))
+            and total_files == files
+            and total_directories == directories
+            and total_bytes == package_bytes
+            and ci.MIZ_PACKAGE_HASH in dependency_graph)
+    reachable = set()
+    pending = [ci.MIZ_PACKAGE_HASH]
+    while pending:
+        name = pending.pop()
+        require(name in dependency_graph)
+        if name in reachable:
+            continue
+        reachable.add(name)
+        pending.extend(dependency_graph[name])
+        require(len(reachable) + len(pending) <= ci.PACKAGE_MAX_ROOTS * 2)
+    require(reachable == set(names))
+
+    manifest_summary = packages["manifests"]
+    require(set(manifest_summary) == {"count", "bytes", "sha256"})
+    bounded_integer(manifest_summary["count"], 0, roots)
+    bounded_integer(manifest_summary["bytes"], 0, package_bytes)
+    require(manifest_summary["count"] == manifest_count
+            and manifest_summary["bytes"] == manifest_bytes
+            and manifest_summary["sha256"] == manifest_digest.hexdigest())
+    hash_verification = packages["hash_verification"]
+    require(set(hash_verification) == {"algorithm", "count", "sha256"}
+            and hash_verification["algorithm"] == "zig-0.16.0-fetch-path")
+    bounded_integer(hash_verification["count"], 1, ci.PACKAGE_MAX_ROOTS)
+    require(hash_verification["count"] == roots)
+    digest_string(hash_verification["sha256"])
+    closure = hashlib.sha256(b"uk.wamr.package-closure-v1\0")
+    physical = hashlib.sha256(b"uk.wamr.package-physical-closure-v1\0")
+    for record in records:
+        bind(closure, record)
+        bind(physical, [
+            record["package_hash"], record["content"]["physical_sha256"]])
+    require(packages["closure_sha256"] == closure.hexdigest()
+            and packages["physical_sha256"] == physical.hexdigest())
+    return value
 
 
 def encoded(value):
@@ -189,7 +382,16 @@ def publication_records(handoff, stage, source):
     require(set(value["records"]) == EVIDENCE
             and value["passed"] is True and value["cloud_authority"] == "not_admitted")
     build = ci.document(stage / "artifacts/build")
-    require(build["source"] == {"revision": source["source_revision"], "tree": source["source_tree"]})
+    require(build["source"]["revision"] == source["source_revision"]
+            and build["source"]["tree"] == source["source_tree"])
+    start = ci.document(stage / "evidence/build-start.json")
+    require(start["source"]["revision"] == source["source_revision"]
+            and start["source"]["tree"] == source["source_tree"])
+    if "dependencies" not in start:
+        require((source["source_revision"], source["source_tree"])
+                in LEGACY_V1_SOURCES)
+    else:
+        dependency_record(ci, start["dependencies"])
     for name in sorted(EVIDENCE):
         item = ci.document(stage / "evidence" / name)
         if name.startswith("command-"):

@@ -256,9 +256,45 @@ class Evidence(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), \
                 mock.patch.object(ci, "source", return_value={"fixture": True}), \
                 mock.patch.object(ci, "tool", return_value="/synthetic-tool"), \
-                mock.patch.object(ci, "digest", return_value="f" * 64):
+                mock.patch.object(ci, "digest", return_value="f" * 64), \
+                mock.patch.object(ci, "dependency_custody",
+                                  return_value={"fixture": True}):
             self.assertEqual(ci.producer_inputs(self.root)["bison_data"], expected)
             self.assertNotIn("BISON_PKGDATADIR", os.environ)
+
+    def test_compute_dynamic_validator_never_writes_bytecode(self):
+        app = self.root / "validator-app"
+        app.mkdir(mode=0o700)
+        checker = app / "check-log.py"
+        self.put(checker, b"def validate(text, identity):\n    return None\n")
+        log = self.root / "serial.log"
+        self.put(log, self.contract.log())
+        before = {
+            path: ci.snapshot(path.lstat())
+            for path in (app, checker)
+        }
+        script = """
+import os
+from pathlib import Path
+import sys
+assert "PYTHONDONTWRITEBYTECODE" not in os.environ
+assert sys.dont_write_bytecode is False
+path = Path(sys.argv[1])
+scope = {"__file__": str(path), "__name__": "wamr_ci_fixture"}
+exec(compile(path.read_bytes(), str(path), "exec"), scope)
+assert sys.dont_write_bytecode is True
+scope["APP"] = Path(sys.argv[2])
+scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(HERE / "run.py"), str(app), str(log)],
+            env={}, capture_output=True, timeout=30)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(list(app.iterdir()), [checker])
+        self.assertEqual(
+            {path: ci.snapshot(path.lstat()) for path in (app, checker)},
+            before,
+        )
 
     def test_build_refuses_an_unbound_bison_environment(self):
         for index, override in enumerate((None, str(self.root / "different"))):
@@ -279,23 +315,31 @@ class Evidence(unittest.TestCase):
         events = []
         commands = []
 
-        def restore(root):
+        source = {"revision": "1" * 40, "tree": "2" * 40, "custody": {}}
+
+        def restore(root, expected):
             events.append("restore")
+            self.assertEqual(expected, source)
             return packages
 
         def inputs(root):
             events.append("custody")
-            return {"source": {"revision": "1" * 40, "tree": "2" * 40}}
+            return {"source": source, "dependencies": {}}
 
-        def command(root, stage, args, *unused):
+        def command(runtime, expected, root, stage, args, *unused):
             commands.append((stage, list(map(str, args))))
             return root / "private" / (stage + ".log")
 
         with mock.patch.dict(os.environ, {
                 "BISON_PKGDATADIR": str(runtime / "bison")}, clear=True), \
+                mock.patch.object(ci, "prepare_source_outputs"), \
+                mock.patch.object(ci, "source", return_value=source), \
                 mock.patch.object(ci, "restore_dependencies", side_effect=restore), \
                 mock.patch.object(ci, "producer_inputs", side_effect=inputs), \
-                mock.patch.object(ci, "run", side_effect=command), \
+                mock.patch.object(ci, "run_custodied", side_effect=command), \
+                mock.patch.object(ci, "retain_solved_config"), \
+                mock.patch.object(ci, "solved_config", return_value="f" * 64), \
+                mock.patch.object(ci, "require_build_custody"), \
                 mock.patch.object(ci, "save"), \
                 mock.patch.object(ci, "check_build", return_value={}), \
                 mock.patch.object(ci, "digest", return_value="f" * 64), \
@@ -318,18 +362,341 @@ class Evidence(unittest.TestCase):
         missing = self.root / "missing-source"
         missing_root = self.root / "missing-restore"
         missing_root.mkdir(mode=0o700)
-        with mock.patch.object(ci, "LOCAL_BOOT", missing):
+        with mock.patch.object(ci, "LOCAL_BOOT", missing), \
+                mock.patch.object(
+                    ci, "tracked_manifest",
+                    side_effect=ci.Refusal("pinned dependency manifest unavailable")), \
+                mock.patch.object(ci, "require_source"):
             with self.assertRaisesRegex(
                     ci.Refusal, "pinned dependency manifest unavailable"):
-                ci.restore_dependencies(missing_root)
+                ci.restore_dependencies(missing_root, {"source": "fixture"})
         root = self.root / "restore"
         root.mkdir(mode=0o700)
         for name in ("private", "evidence", "cache", "global-cache"):
             (root / name).mkdir(mode=0o700)
-        with mock.patch.object(ci, "run"):
+        with mock.patch.object(ci, "require_source"), \
+                mock.patch.object(ci, "execute", return_value=(
+                    root / "private/dependency-restore.log",
+                    {"known_error_markers": []})):
             with self.assertRaisesRegex(
                     ci.Refusal, "private pinned dependency restore required"):
-                ci.restore_dependencies(root)
+                ci.restore_dependencies(root, {"source": "fixture"})
+
+    def dependency_fixture(self):
+        root = self.root / "dependency-fixture"
+        root.mkdir(mode=0o700)
+        private = root / "private"
+        private.mkdir(mode=0o700)
+        restore = root / "dependencies"
+        restore.mkdir(mode=0o700)
+        self.put(restore / "build.zig", b"const std = @import(\"std\");\n")
+        manifest = (
+            '.{ .dependencies = .{ .miz_source = .{ '
+            f'.url = "{ci.MIZ_URL}", .hash = "{ci.MIZ_PACKAGE_HASH}" '
+            '} } }\n'
+        ).encode()
+        self.put(restore / "build.zig.zon", manifest)
+        self.put(private / "dependency-restore.log", b"")
+        packages = restore / "zig-pkg"
+        packages.mkdir(mode=0o700)
+        miz = packages / ci.MIZ_PACKAGE_HASH
+        miz.mkdir(mode=0o700)
+        self.put(miz / "build.zig.zon", b".{ .dependencies = .{} }\n")
+        self.put(miz / "source.zig", b"pub const answer = 42;\n")
+        self.put(private / "dependency-hash-000.log",
+                 (ci.MIZ_PACKAGE_HASH + "\n").encode())
+
+        def manifest_record(relative, repository=ci.REPO):
+            data = (restore / Path(relative).name).read_bytes()
+            return ({
+                "path": relative, "mode": "100644", "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(), "git_oid": "1" * 40,
+                "metadata_sha256": "2" * 64,
+            }, data)
+
+        return root, packages, mock.patch.object(
+            ci, "tracked_manifest", side_effect=manifest_record)
+
+    def test_restore_manifest_requires_exact_miz_revision_hash_and_one_pin(self):
+        valid = (
+            '.{ .dependencies = .{ .miz_source = .{ '
+            f'.url = "{ci.MIZ_URL}", .hash = "{ci.MIZ_PACKAGE_HASH}" '
+            '} } }\n'
+        ).encode()
+        self.assertEqual(ci.validate_restore_manifest(valid)["revision"],
+                         ci.MIZ_REVISION)
+        for malformed in (
+                valid.replace(ci.MIZ_REVISION.encode(), b"1" * 40),
+                valid.replace(ci.MIZ_PACKAGE_HASH.encode(), b"miz-0.2.0-wrong"),
+                valid.replace(b"} } }\n", (
+                    f'}}, .alias = .{{ .hash = "{ci.MIZ_PACKAGE_HASH}" }} }} }}\n'
+                ).encode()),
+        ):
+            with self.subTest(manifest=malformed), self.assertRaises(ci.Refusal):
+                ci.validate_restore_manifest(malformed)
+
+    def test_tracked_restore_manifests_keep_exact_miz_module_wiring(self):
+        build_record, build = ci.tracked_manifest(
+            "support/tools/hyperv/local_boot/build.zig")
+        zon_record, zon = ci.tracked_manifest(
+            "support/tools/hyperv/local_boot/build.zig.zon")
+        self.assertEqual(build.count(
+            b'b.dependency("miz_source", .{ .target = target, .optimize = optimize })'
+            b'.module("miz")'), 1)
+        self.assertEqual(build.count(b'.{ .name = "miz", .module = miz }'), 2)
+        self.assertEqual(ci.validate_restore_manifest(zon), {
+            "url": ci.MIZ_URL,
+            "revision": ci.MIZ_REVISION,
+            "package_hash": ci.MIZ_PACKAGE_HASH,
+        })
+        self.assertEqual(build_record["bytes"], len(build))
+        self.assertEqual(zon_record["bytes"], len(zon))
+
+    def test_dependency_custody_detects_same_hash_name_mutation_and_replacement(self):
+        root, packages, patch = self.dependency_fixture()
+        with patch:
+            expected = ci.dependency_custody(root)
+            source = packages / ci.MIZ_PACKAGE_HASH / "source.zig"
+            self.put(source, b"pub const answer = 41;\n")
+            with self.assertRaisesRegex(ci.Refusal, "dependency custody changed"):
+                ci.require_dependency_custody(root, expected)
+            self.put(source, b"pub const answer = 42;\n")
+            original = packages / ci.MIZ_PACKAGE_HASH
+            retained = root / "retained-package"
+            original.rename(retained)
+            shutil.copytree(retained, original)
+            with self.assertRaisesRegex(ci.Refusal, "dependency custody changed"):
+                ci.require_dependency_custody(root, expected)
+
+    def test_dependency_custody_rejects_symlink_type_missing_and_extra_roots(self):
+        root, packages, patch = self.dependency_fixture()
+        miz = packages / ci.MIZ_PACKAGE_HASH
+        with patch:
+            link = miz / "link"
+            link.symlink_to("source.zig")
+            with self.assertRaises(ci.Refusal):
+                ci.dependency_custody(root)
+            link.unlink()
+            fifo = miz / "fifo"
+            os.mkfifo(fifo, 0o600)
+            with self.assertRaises(ci.Refusal):
+                ci.dependency_custody(root)
+            fifo.unlink()
+            extra = packages / "extra-0.1.0-aaaaaaaa"
+            extra.mkdir(mode=0o700)
+            self.put(extra / "source.zig", b"extra\n")
+            with self.assertRaisesRegex(ci.Refusal, "unexpected transitive"):
+                ci.dependency_custody(root)
+            shutil.rmtree(extra)
+            self.put(miz / "build.zig.zon", (
+                '.{ .dependencies = .{ .missing = .{ '
+                '.hash = "missing-0.1.0-aaaaaaaa" } } }\n'
+            ).encode())
+            with self.assertRaisesRegex(ci.Refusal, "missing transitive"):
+                ci.dependency_custody(root)
+
+    def test_zig_hash_recomputation_rejects_wrong_named_content(self):
+        root, packages, _ = self.dependency_fixture()
+        (root / "dependency-hash-work").mkdir(mode=0o700)
+        (root / "dependency-hash-cache").mkdir(mode=0o700)
+        shutil.rmtree(root / "dependency-hash-work")
+        shutil.rmtree(root / "dependency-hash-cache")
+        (root / "private/dependency-hash-000.log").unlink()
+
+        def wrong(*args, **kwargs):
+            output = root / "private/dependency-hash-000.log"
+            self.put(output, b"miz-0.2.0-wrong\n")
+            return output, {}
+
+        with mock.patch.object(ci, "execute", side_effect=wrong), \
+                self.assertRaisesRegex(ci.Refusal, "content hash mismatch"):
+            ci.verify_package_hashes(root, packages)
+
+    def test_create_exact_copy_never_follows_or_overwrites(self):
+        directory = self.root / "copies"
+        directory.mkdir(mode=0o700)
+        existing = directory / "existing"
+        self.put(existing, b"original")
+        with self.assertRaisesRegex(ci.Refusal, "already exists"):
+            ci.create_exact_copy(existing, b"replacement")
+        link = directory / "link"
+        link.symlink_to(existing)
+        with self.assertRaisesRegex(ci.Refusal, "already exists"):
+            ci.create_exact_copy(link, b"replacement")
+        self.assertEqual(existing.read_bytes(), b"original")
+
+    def test_restore_rejects_manifest_swap_restore_before_zig_returns(self):
+        root = self.root / "restore-swap"
+        root.mkdir(mode=0o700)
+        for name in ("private", "evidence", "cache", "global-cache"):
+            (root / name).mkdir(mode=0o700)
+        manifests = {
+            "build.zig": b"const std = @import(\"std\");\n",
+            "build.zig.zon": (
+                '.{ .dependencies = .{ .miz_source = .{ '
+                f'.url = "{ci.MIZ_URL}", .hash = "{ci.MIZ_PACKAGE_HASH}" '
+                '} } }\n'
+            ).encode(),
+        }
+
+        def manifest_record(relative, repository=ci.REPO):
+            data = manifests[Path(relative).name]
+            return ({
+                "path": relative, "mode": "100644", "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(), "git_oid": "1" * 40,
+                "metadata_sha256": "2" * 64,
+            }, data)
+
+        def swap_restore(*unused, **kwargs):
+            target = root / "dependencies/build.zig"
+            retained = root / "retained-build.zig"
+            target.rename(retained)
+            shutil.copyfile(retained, target)
+            target.chmod(0o600)
+            target.unlink()
+            retained.rename(target)
+            return root / "private/dependency-restore.log", {
+                "known_error_markers": [],
+            }
+
+        with mock.patch.object(ci, "require_source"), \
+                mock.patch.object(ci, "tracked_manifest", side_effect=manifest_record), \
+                mock.patch.object(ci, "execute", side_effect=swap_restore), \
+                self.assertRaisesRegex(
+                    ci.Refusal, "copied dependency manifest identity changed"):
+            ci.restore_dependencies(root, {"source": "fixture"})
+        self.assertEqual(
+            (root / "dependencies/build.zig").read_bytes(),
+            manifests["build.zig"],
+        )
+
+    def test_dependency_inventory_rejects_later_directory_transient(self):
+        root, packages, patch = self.dependency_fixture()
+        miz = packages / ci.MIZ_PACKAGE_HASH
+        self.put(miz / "a-first", b"read first\n")
+        later = miz / "z-later"
+        later.mkdir(mode=0o700)
+        self.put(later / "retained", b"retained\n")
+        original = ci.package_file
+        mutated = False
+
+        def transient(path, expected):
+            nonlocal mutated
+            if not mutated and path.name == "a-first":
+                changed = later / "transient"
+                self.put(changed, b"created and removed\n")
+                changed.unlink()
+                mutated = True
+            return original(path, expected)
+
+        with patch, mock.patch.object(ci, "package_file", side_effect=transient), \
+                self.assertRaisesRegex(
+                    ci.Refusal, "dependency package directory changed"):
+            ci.dependency_custody(root)
+        self.assertTrue(mutated)
+
+    def test_dependency_toctou_refuses_before_build_and_after_stage(self):
+        root, packages, _ = self.dependency_fixture()
+        source_record = {"revision": "1" * 40, "tree": "2" * 40, "custody": {}}
+        runtime = root.parent
+        compute = runtime / "compute"
+        root.rename(compute)
+        packages = compute / "dependencies/zig-pkg"
+        restore = compute / "dependencies"
+
+        def manifest_record(relative, repository=ci.REPO):
+            data = (restore / Path(relative).name).read_bytes()
+            return ({
+                "path": relative, "mode": "100644", "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(), "git_oid": "1" * 40,
+                "metadata_sha256": "2" * 64,
+            }, data)
+
+        patch = mock.patch.object(ci, "tracked_manifest", side_effect=manifest_record)
+        with patch:
+            dependency = ci.dependency_custody(compute)
+            expected = {"source": source_record, "dependencies": dependency}
+            target = packages / ci.MIZ_PACKAGE_HASH / "source.zig"
+            self.put(target, b"changed before build\n")
+            with mock.patch.object(ci, "source", return_value=source_record), \
+                    mock.patch.object(ci, "run") as command, \
+                    self.assertRaisesRegex(ci.Refusal, "dependency custody changed"):
+                ci.run_custodied(runtime, expected, compute, "adapter", ["false"])
+            command.assert_not_called()
+            self.put(target, b"pub const answer = 42;\n")
+            dependency = ci.dependency_custody(compute)
+            expected["dependencies"] = dependency
+
+            def mutate(*unused):
+                self.put(target, b"changed during build\n")
+                return compute / "private/adapter.log"
+
+            with mock.patch.object(ci, "source", return_value=source_record), \
+                    mock.patch.object(ci, "run", side_effect=mutate), \
+                    self.assertRaisesRegex(ci.Refusal, "dependency custody changed"):
+                ci.run_custodied(runtime, expected, compute, "adapter", ["fixture"])
+
+    def test_source_custody_detects_ignored_create_delete_metadata(self):
+        repository = self.root / "repository"
+        repository.mkdir(mode=0o700)
+        (repository / "source").mkdir(mode=0o700)
+        self.put(repository / "source/input", b"tracked\n")
+        (repository / "source/link").symlink_to("input")
+        self.put(repository / ".gitignore", b"source/generated/\n")
+        subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.email", "fixture@example.invalid"],
+                       cwd=repository, check=True)
+        subprocess.run(["git", "config", "user.name", "Fixture"],
+                       cwd=repository, check=True)
+        subprocess.run(["git", "add", ".gitignore", "source/input", "source/link"],
+                       cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repository, check=True)
+        expected = ci.source(repository)
+        self.assertEqual(ci.source(repository), expected)
+        generated = repository / "source/generated"
+        generated.mkdir(mode=0o700)
+        generated.rmdir()
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "status", "--porcelain=v2", "--untracked-files=all"],
+                cwd=repository),
+            b"",
+        )
+        with self.assertRaisesRegex(ci.Refusal, "immutable source custody changed"):
+            ci.require_source(expected, repository)
+        self.put(self.root / "outside", b"not source\n")
+        (repository / "source/link").unlink()
+        (repository / "source/link").symlink_to("../../outside")
+        subprocess.run(["git", "add", "source/link"], cwd=repository, check=True)
+        subprocess.run(["git", "commit", "-qm", "escaping link"],
+                       cwd=repository, check=True)
+        with self.assertRaisesRegex(ci.Refusal, "symlink escapes repository"):
+            ci.source(repository)
+
+    def test_precreated_output_roots_keep_source_parent_metadata_exact(self):
+        app = self.root / "app"
+        app.mkdir(mode=0o700)
+        self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")
+        with mock.patch.object(ci, "APP", app):
+            ci.prepare_source_outputs()
+            before = ci.snapshot(app.lstat())
+            self.put(app / "build/.config",
+                     b"CONFIG_FIXTURE=y\nCONFIG_SOLVED=y\n")
+            self.assertEqual(ci.snapshot(app.lstat()), before)
+            ci.retain_solved_config()
+            self.assertEqual(ci.snapshot(app.lstat()), before)
+            self.assertEqual(
+                (app / ".config").read_bytes(),
+                b"CONFIG_FIXTURE=y\nCONFIG_SOLVED=y\n",
+            )
+            self.assertEqual(
+                ci.solved_config(),
+                hashlib.sha256(
+                    b"CONFIG_FIXTURE=y\nCONFIG_SOLVED=y\n").hexdigest(),
+            )
+            self.put(app / "build/.config", b"CONFIG_CHANGED=y\n")
+            with self.assertRaisesRegex(ci.Refusal, "build configuration changed"):
+                ci.solved_config()
 
     def synthetic_boot(self, raw=None):
         config = ci.config_for(self.root, self.root, 0)
