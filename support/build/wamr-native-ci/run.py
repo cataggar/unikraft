@@ -258,6 +258,35 @@ def source_metadata_changes(before, after):
     }
 
 
+def source_metadata_document(path):
+    try:
+        value = json.loads(read(path, 4 * MIB), object_pairs_hook=unique)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise Refusal("invalid source metadata baseline") from error
+    require(
+        isinstance(value, dict)
+        and set(value) == {"schema", "version", "records"}
+        and value["schema"] == "uk.wamr.git-physical-source-baseline"
+        and value["version"] == 1
+        and isinstance(value["records"], list)
+        and len(value["records"]) <= 2 * SOURCE_MAX_ENTRIES,
+        "invalid source metadata baseline",
+    )
+    for record in value["records"]:
+        require(
+            isinstance(record, list)
+            and len(record) == 3
+            and record[0] in ("directory", "file")
+            and isinstance(record[1], str)
+            and len(record[1].encode()) <= 1024
+            and isinstance(record[2], list)
+            and len(record[2]) == 9
+            and all(isinstance(item, int) for item in record[2]),
+            "invalid source metadata baseline",
+        )
+    return value
+
+
 def source(repository=REPO):
     repository = Path(repository)
     require(repository.is_absolute() and canonical(repository)
@@ -1014,7 +1043,7 @@ def require_build_custody(runtime, expected):
         failure = root / "evidence/source-custody-failure.json"
         if baseline.is_file() and not failure.exists():
             report = source_metadata_changes(
-                document(baseline)["records"], source_metadata())
+                source_metadata_document(baseline)["records"], source_metadata())
             report["source"] = source_identity(current_source)
             save(failure, report)
     require(source_matches, "immutable source custody changed")

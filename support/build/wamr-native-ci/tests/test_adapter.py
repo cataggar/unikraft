@@ -732,6 +732,16 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         with self.assertRaisesRegex(ci.Refusal, "immutable source custody changed"):
             ci.require_source(expected, repository)
         baseline = ci.source_metadata(repository)
+        baseline_path = self.root / "source-metadata.json"
+        ci.save(baseline_path, {
+            "schema": "uk.wamr.git-physical-source-baseline",
+            "version": 1,
+            "records": baseline,
+        })
+        self.assertEqual(
+            ci.source_metadata_document(baseline_path)["records"],
+            json.loads(json.dumps(baseline)),
+        )
         generated.mkdir(mode=0o700)
         generated.rmdir()
         changes = ci.source_metadata_changes(
