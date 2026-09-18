@@ -2679,6 +2679,7 @@ class HypervWorkflowTest(unittest.TestCase):
             / ".github/scripts/hyperv-qemu-candidate-runtime.sh"
         ).read_text()
         for required in (
+            'chmod 600 "$2"',
             'chown --no-dereference "$3:$4" "$2"',
             '\' _ "${source}" "${ownership}" "${runner_uid}" "${runner_gid}"',
             '"${runner_uid}:${runner_gid}:600:1"',

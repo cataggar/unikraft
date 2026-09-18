@@ -139,7 +139,7 @@ else
     set -C
     umask 077
     exec 8> "$2"
-    chmod 644 "$2"
+    chmod 600 "$2"
     exec 9> /usr/lib/x86_64-linux-gnu/libfdt.so.1
     stat -Lc "%d:%i:%u:%g" /proc/self/fd/9 >&8
     cat -- "$1" >&9
