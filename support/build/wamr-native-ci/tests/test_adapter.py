@@ -493,7 +493,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 mock.patch.object(ci, "prepare_source_outputs"), \
                 mock.patch.object(
                     ci, "seal_wamr_source",
-                    return_value=runtime / "compute/custody/wamr-source.tar"), \
+                    return_value=runtime / "custody/wamr-source.tar"), \
                 mock.patch.object(
                     ci, "consumer_input_state", return_value=consumer), \
                 mock.patch.object(ci, "source", return_value=source), \

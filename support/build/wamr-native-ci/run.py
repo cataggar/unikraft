@@ -904,7 +904,7 @@ def consumer_input_state(runtime, content=True, expected=None):
     llvm = runtime / "llvm"
     if llvm.is_dir() and not llvm.is_symlink():
         tree_paths["llvm"] = llvm
-    archive = runtime / "compute/custody/wamr-source.tar"
+    archive = runtime / "custody/wamr-source.tar"
     if archive.is_file() and not archive.is_symlink():
         file_paths["wamr-source-archive"] = archive
     return record_input_paths(file_paths, tree_paths, content=content)
@@ -1751,7 +1751,7 @@ def git_directory_output(repository, limit, *args):
 
 def seal_wamr_source(runtime, source):
     source = Path(source)
-    root = Path(runtime) / "compute"
+    root = Path(runtime)
     custody = root / "custody"
     custody.mkdir(mode=0o700)
     require(source.is_absolute(), "pinned WAMR checkout required")
