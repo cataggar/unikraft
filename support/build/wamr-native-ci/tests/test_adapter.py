@@ -389,7 +389,7 @@ class Evidence(unittest.TestCase):
         dangling = self.root / "dangling-symlink-tree"
         dangling.mkdir(mode=0o700)
         missing = (
-            Path("/usr/share")
+            Path("/usr/bin")
             / f"wamr-ci-missing-tree-target-{os.getpid()}")
         self.assertFalse(missing.exists())
         (dangling / "stable-missing").symlink_to(missing)
