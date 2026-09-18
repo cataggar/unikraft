@@ -167,6 +167,8 @@ def main():
         f"-Dapp={ROOT}", f"-Dnative-make-environment={environment}",
         f"-Dconfig={ROOT / 'build/.config'}",
         f"-Dmake-command={tool('make')}",
+        f"-Dbison-command={tool('bison')}",
+        f"-Dflex-command={tool('flex')}",
         f"-Dcompiler={zig} cc -target x86_64-freestanding-none",
         "-Dcompiler-targeted=true", f"-Dhost-cc={zig} cc",
         f"-Dhost-cxx={zig} c++", "-Dhost-cflags=-fno-sanitize=null",

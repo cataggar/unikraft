@@ -242,7 +242,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const config_input = std.Build.LazyPath{ .cwd_relative = context.config };
-    const metadata_tool = native_build_tools.metadataTool(b, b.path("."));
+    const bison_command = b.option(
+        []const u8,
+        "bison-command",
+        "Bison executable (default: bison)",
+    ) orelse "bison";
+    const flex_command = b.option(
+        []const u8,
+        "flex-command",
+        "Flex executable (default: flex)",
+    ) orelse "flex";
+    const metadata_tool = native_build_tools.metadataTool(b, b.path("."), bison_command, flex_command);
     const metadata_path = std.fs.path.join(
         b.allocator,
         &.{ context.output, "native-config", "metadata.tsv" },
@@ -1699,7 +1709,7 @@ pub fn build(b: *std.Build) void {
     run_build_tools_integration.addArg(root);
     run_build_tools_integration.addFileInput(b.path("Config.uk"));
     run_build_tools_integration.addFileInput(b.path("support/build/config-submenu.sh"));
-    run_build_tools_integration.addArtifactArg(native_build_tools.legacyConfigFixture(b, b.path(".")));
+    run_build_tools_integration.addArtifactArg(native_build_tools.legacyConfigFixture(b, b.path("."), bison_command, flex_command));
     build_tools_tests.dependOn(&run_build_tools_integration.step);
     test_step.dependOn(build_tools_tests);
     const integration_output = resolvePath(

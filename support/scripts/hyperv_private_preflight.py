@@ -158,9 +158,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "e8e61ede1df7550fa6ba62448fd3f18c9be8b089ed5bed0805de774c5d28b8c5"
+            "999712274d7af8422ae9143f378c8922b7cd01197754ccd67e4c6df4406ff04b"
         ),
-        "size": 2066307,
+        "size": 2066486,
         "files": 226,
     },
     "support/kconfig": {
@@ -397,7 +397,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "e6325a9418b87db4e7679f027cd12aaa7143a69a1f323ec44ed7dcf6f98b6b91"
+        "fbc8db2719f6e801be60e2e732cd8121c434c3f57f7a4a940babf0c1a490c861"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -469,7 +469,7 @@ GUARDED_PRODUCER_FILES = {
         "dd39b9cec861bdf4771fba05c0b477aea37e2b2f1d40d843f31d3c1df011ee3a"
     ),
     "support/build/native-build-tools.zig": (
-        "7d04586443a85ae6712673b7b47f7ac67622bfc656fe930c9c16082f1362132d"
+        "d6ae0548d15f54eecbfe333490b648165047e1a63e72a61aafea62aec2b8aeab"
     ),
     "support/build/native-config-metadata.py": (
         "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
