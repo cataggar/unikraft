@@ -413,6 +413,24 @@ def ignored_symlink_escape_reason(relative):
     if parts[:2] == (".d", "wamr-native-runtime"):
         if len(parts) > 2 and parts[2] == "llvm":
             return "ignored LLVM runtime symlink escapes repository"
+        lanes = {
+            "apt-cache": "APT cache",
+            "apt-lists": "APT lists",
+            "bin": "QEMU runtime",
+            "bison": "Bison data",
+            "cache": "acquisition cache",
+            "downloads": "acquisition download",
+            "evidence": "acquisition evidence",
+            "ghr-bin": "GHR binary",
+            "ghr-tools": "GHR tool",
+            "runtime": "QEMU library",
+            "tmp": "acquisition temporary",
+        }
+        if len(parts) > 2 and parts[2] in lanes:
+            return (
+                "ignored native runtime " + lanes[parts[2]]
+                + " symlink escapes repository"
+            )
         return "ignored native runtime symlink escapes repository"
     if parts and parts[0] == ".d":
         return "ignored private output symlink escapes repository"
