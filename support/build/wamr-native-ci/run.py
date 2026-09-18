@@ -982,6 +982,13 @@ def input_directory_custody_reason(kind, name):
     return "consumer input directory custody changed"
 
 
+def require_input_directories(components, expected, reason):
+    for index, (path, metadata) in enumerate(components.items()):
+        if expected.get(path) != metadata:
+            distance = len(components) - index - 1
+            raise Refusal(f"{reason} at ancestor-{distance}")
+
+
 def record_input_paths(file_paths, tree_paths, content=True, expected=None):
     files = {}
     trees = {}
@@ -1011,10 +1018,9 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None):
             expected_sha256=None if prior is None else prior["sha256"])
         files[name] = record
         if expected is not None:
-            require(all(
-                expected["directories"].get(path) == metadata
-                for path, metadata in components.items()
-            ), input_directory_custody_reason("file", name))
+            require_input_directories(
+                components, expected["directories"],
+                input_directory_custody_reason("file", name))
         merge_directory_records(directories, components)
     for name, path in sorted(tree_paths.items()):
         prior = None if expected is None else expected["trees"][name]
@@ -1024,10 +1030,9 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None):
                 None if prior is None else prior["content_sha256"]))
         trees[name] = record
         if expected is not None:
-            require(all(
-                expected["directories"].get(path) == metadata
-                for path, metadata in components.items()
-            ), input_directory_custody_reason("tree", name))
+            require_input_directories(
+                components, expected["directories"],
+                input_directory_custody_reason("tree", name))
         merge_directory_records(directories, components)
     result = {
         "schema": "uk.wamr.consumer-input-custody",
