@@ -1531,14 +1531,17 @@ def command_error_markers(raw):
 @contextlib.contextmanager
 def retained_executables(paths, records):
     opened = {}
+    aliases = {}
     try:
         for path in paths:
-            path = str(Path(path))
-            if path in opened:
+            original = str(Path(path))
+            canonical_path = str(Path(path).resolve(strict=True))
+            aliases[original] = canonical_path
+            if canonical_path in opened:
                 continue
-            require(path in records, "unbound executable input")
-            record = records[path]
-            handle = os.open(path, open_flags())
+            require(canonical_path in records, "unbound executable input")
+            record = records[canonical_path]
+            handle = os.open(canonical_path, open_flags())
             info = os.fstat(handle)
             require(
                 list(snapshot(info)) == record["metadata"]
@@ -1546,10 +1549,10 @@ def retained_executables(paths, records):
                 and bool(info.st_mode & 0o111),
                 "executable input changed",
             )
-            opened[path] = handle
+            opened[canonical_path] = handle
         yield {
-            path: f"/proc/self/fd/{handle}"
-            for path, handle in opened.items()
+            original: f"/proc/self/fd/{opened[canonical_path]}"
+            for original, canonical_path in aliases.items()
         }, tuple(opened.values())
     except OSError as error:
         raise Refusal("executable input changed") from error

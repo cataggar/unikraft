@@ -371,7 +371,9 @@ class Evidence(unittest.TestCase):
         executable.chmod(0o700)
         state = ci.record_input_paths({"tool": executable}, {})
         records = ci.consumer_file_records(state)
-        with ci.retained_executables((executable,), records) as (
+        alias = directory / "tool-alias"
+        alias.symlink_to("tool")
+        with ci.retained_executables((alias,), records) as (
                 retained, unused_fds):
             del unused_fds
             saved = directory / "saved"
@@ -379,7 +381,7 @@ class Evidence(unittest.TestCase):
             self.put(executable, replacement)
             executable.chmod(0o700)
             self.assertEqual(
-                Path(retained[str(executable)]).read_bytes(), original)
+                Path(retained[str(alias)]).read_bytes(), original)
             executable.unlink()
             saved.rename(executable)
         with self.assertRaisesRegex(ci.Refusal, "custody changed"):
