@@ -34,6 +34,7 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = x86_64
           test -c /dev/kvm
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d
           export PATH="/usr/bin:/bin:${PATH}"
           if ! (
             for name in bash make bison yacc flex lex m4 python3 getfacl; do
@@ -54,7 +55,6 @@ jobs:
         timeout-minutes: 15
         run: |
           set -euo pipefail
-          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d
           export PYTHONDONTWRITEBYTECODE=1
           python3 support/build/wamr-native-ci/tests/source_custody_production_limits.py
 
@@ -66,12 +66,12 @@ jobs:
 
       - name: Acquire the existing pinned VPC-capable native QEMU runtime
         run: |
-          bash .github/scripts/hyperv-native-qemu-acquire.sh "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          bash .github/scripts/hyperv-native-qemu-acquire.sh /d/wamr-native-runtime
 
       - name: Reuse authenticated private Bison data for the native Make contract
         run: |
           export PATH="/usr/bin:/bin:${PATH}"
-          bash .github/scripts/hyperv-native-bison-acquire.sh "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          bash .github/scripts/hyperv-native-bison-acquire.sh /d/wamr-native-runtime
 
       - name: Install the existing pinned Zig compiler
         uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
@@ -84,7 +84,7 @@ jobs:
         with:
           ghr-version: v0.8.0
           tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
-          dest: ${{ github.workspace }}/.d/wamr-native-runtime/llvm
+          dest: /d/wamr-native-runtime/llvm
           extract: 'true'
           strip-components: '1'
           cache: 'false'
@@ -94,9 +94,9 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          root=/d/wamr-native-runtime
           zig_source="$(dirname "$(readlink -f "$(command -v zig)")")"
-          zig_dir="${GITHUB_WORKSPACE}/.d/wamr-native-tools/zig-0.16.0"
+          zig_dir=/d/wamr-native-tools/zig-0.16.0
           test ! -e "${zig_dir}"
           mkdir -p -m 700 "${zig_dir}"
           cp -a -- "${zig_source}/." "${zig_dir}/"
@@ -130,7 +130,7 @@ jobs:
           QUALIFICATION_SOURCE_JOB: wamr-native-compute
         run: |
           set -euo pipefail
-          root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          root=/d/wamr-native-runtime
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
@@ -139,10 +139,11 @@ jobs:
         timeout-minutes: 15
         env:
           GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.private == false && 'public' || 'private' }}
+          WAMR_CI_RUNTIME: /d/wamr-native-runtime
         run: |
           set -euo pipefail
           umask 077
-          root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          root=/d/wamr-native-runtime
           export TMPDIR="${root}/compute/scratch"
           export PYTHONDONTWRITEBYTECODE=1
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
@@ -177,14 +178,14 @@ jobs:
         if: always()
         run: |
           python3 support/build/wamr-native-ci/run.py diagnostics \
-            --runtime "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+            --runtime /d/wamr-native-runtime
 
       - name: Publish bounded local-only records
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: wamr-native-compute-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/.d/wamr-native-runtime/compute/evidence/*.json
+          path: /d/wamr-native-runtime/compute/evidence/*.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7

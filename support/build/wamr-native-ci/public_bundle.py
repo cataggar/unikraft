@@ -403,6 +403,13 @@ def context(value):
     return value
 
 
+def ci_runtime(ci):
+    default = ci.REPO / ".d/wamr-native-runtime"
+    selected = Path(os.environ.get("WAMR_CI_RUNTIME", str(default)))
+    require(selected in (default, Path("/d/wamr-native-runtime")))
+    return selected
+
+
 def ci_context(handoff):
     ci = handoff.ci
     require(os.environ.get("GITHUB_ACTIONS") == "true"
@@ -414,7 +421,7 @@ def ci_context(handoff):
             and os.environ.get("GITHUB_WORKFLOW_REF", "").startswith(
                 "cataggar/unikraft/.github/workflows/wamr-native-compute.yaml@"))
     source = ci.source()
-    runtime = ci.REPO / ".d/wamr-native-runtime"
+    runtime = ci_runtime(ci)
     start = ci.document(runtime / "compute/evidence/build-start.json")
     consumer_input_record(ci, start["consumer_inputs"])
     ci.consumer_input_state(
@@ -634,10 +641,10 @@ def publication_records(handoff, stage, source):
         path = Path(cfg["work_dir"])
         require(path.name == "boot-" + mode and path.parent.name == "compute")
         runtime = path.parent.parent
-        require(runtime.name == "wamr-native-runtime" and runtime.parent.name == ".d")
-        workspace = runtime.parent.parent
-        require(workspace.is_absolute() and ".." not in workspace.parts
-                and workspace.name == "unikraft")
+        require(runtime in (
+            ci.REPO / ".d/wamr-native-runtime",
+            Path("/d/wamr-native-runtime"),
+        ))
         require(cfg == ci.config_for(runtime, runtime / "compute", ci.MODES.index(mode)))
         if request["schema_version"] == 2:
             for index, name in enumerate(("ovmf_code", "ovmf_vars", "qemu"), 1):
@@ -810,7 +817,7 @@ def import_bundle(
 def publish_ci(handoff):
     """Only the named public repository lane may select this fixed publication."""
     source = ci_context(handoff)
-    runtime = handoff.ci.REPO / ".d/wamr-native-runtime"
+    runtime = ci_runtime(handoff.ci)
     stage = runtime / "public-source-handoff"
     output = handoff.ci.REPO / ".d/wamr-public-source-bundle"
     handoff.private(runtime)

@@ -25,6 +25,10 @@ GIT = os.environ.get("WAMR_CI_GIT", "git")
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+bundle_spec = importlib.util.spec_from_file_location(
+    "wamr_public_bundle", HERE / "public_bundle.py")
+public_bundle = importlib.util.module_from_spec(bundle_spec)
+bundle_spec.loader.exec_module(public_bundle)
 ci.COMMAND_TOOL_PATHS.update({
     name: os.environ["WAMR_CI_TOOL_" + name.upper().replace("-", "_")]
     for name in ci.HOST_TOOLS
@@ -342,6 +346,25 @@ class Evidence(unittest.TestCase):
         symlink.symlink_to(executable)
         with self.assertRaisesRegex(ci.Refusal, "unsafe physical input"):
             ci.physical_file_record(symlink)
+
+    def test_public_bundle_accepts_only_fixed_ci_runtime_roots(self):
+        runtime_owner = type("RuntimeOwner", (), {"REPO": ci.REPO})
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WAMR_CI_RUNTIME", None)
+            self.assertEqual(
+                public_bundle.ci_runtime(runtime_owner),
+                ci.REPO / ".d/wamr-native-runtime",
+            )
+        with mock.patch.dict(
+                os.environ, {"WAMR_CI_RUNTIME": "/d/wamr-native-runtime"}):
+            self.assertEqual(
+                public_bundle.ci_runtime(runtime_owner),
+                Path("/d/wamr-native-runtime"),
+            )
+        with mock.patch.dict(
+                os.environ, {"WAMR_CI_RUNTIME": "/d/other-runtime"}), \
+                self.assertRaisesRegex(ValueError, "bundle refused"):
+            public_bundle.ci_runtime(runtime_owner)
 
     def test_physical_tree_bounds_enumeration_and_symlink_hash_work(self):
         entries = self.root / "bounded-tree"

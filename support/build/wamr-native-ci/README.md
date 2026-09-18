@@ -125,8 +125,9 @@ observations, not authenticated source attestations or deployment receipts.
 
 ## Bounds and diagnostics
 
-Writable build, package, firmware and boot slots are under the checkout's
-ignored `.d/wamr-native-runtime` or the app's ignored `build/`. Zig's
+Writable build, package, firmware and boot slots are under the protected
+CI job's private `/d/wamr-native-runtime` (or the local in-worktree runtime)
+or the app's ignored `build/`. Zig's
 source-pinned dependency restoration first establishes clean physical source
 custody, then copies the exact Git-identified local-boot manifests create-only
 into `compute/dependencies`. Before Zig runs it binds each copy's exact
@@ -234,6 +235,11 @@ The separate `public-source-bundle` command is enabled only by the named
 It accepts no runtime/output/operator-tree arguments. It checks the clean
 current CI revision/tree, clean pinned public `cataggar/wamr` SDK checkout,
 fixed workflow/job/run/attempt context and successful managed-runtime cleanup.
+The protected job builds and boots from the fixed private
+`/d/wamr-native-runtime` root, with the sealed Zig distribution beside it
+under `/d/wamr-native-tools`; this avoids mutable hosted-runner home
+ancestors while retaining exact component custody. The publication command
+accepts only that literal CI runtime or the legacy in-worktree runtime.
 After all four genuine boots, while the complete runner files still exist,
 the workflow invokes the production private export and native handoff checker,
 then copies only its closed image/local-evidence allowlist into a standalone
