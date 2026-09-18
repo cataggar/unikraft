@@ -98,6 +98,16 @@ pub fn build(b: *std.Build) void {
     };
     const root = root_result.path;
     const app_option = b.option([]const u8, "app", "Application directory (Make A=)");
+    const bison_command = b.option(
+        []const u8,
+        "bison-command",
+        "Bison executable (default: bison)",
+    ) orelse "bison";
+    const flex_command = b.option(
+        []const u8,
+        "flex-command",
+        "Flex executable (default: flex)",
+    ) orelse "flex";
     if (app_option) |value| {
         if (firstUnsafePathByte(value, false)) |byte| {
             addFailedTargets(b, b.fmt(
@@ -242,16 +252,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const config_input = std.Build.LazyPath{ .cwd_relative = context.config };
-    const bison_command = b.option(
-        []const u8,
-        "bison-command",
-        "Bison executable (default: bison)",
-    ) orelse "bison";
-    const flex_command = b.option(
-        []const u8,
-        "flex-command",
-        "Flex executable (default: flex)",
-    ) orelse "flex";
     const metadata_tool = native_build_tools.metadataTool(b, b.path("."), bison_command, flex_command);
     const metadata_path = std.fs.path.join(
         b.allocator,
