@@ -3135,6 +3135,7 @@ fn isAllowedAssignment(name: []const u8) bool {
         "HOSTNM",
         "HOSTOBJCOPY",
         "HOSTRANLIB",
+        "KCONFIG_OVERWRITECONFIG",
         "UK_ASFLAGS",
         "UK_CFLAGS",
         "UK_CXXFLAGS",
@@ -3672,6 +3673,7 @@ test "path lists resolve from the repository root" {
 
 test "forwarded Make assignments require allowlisted names" {
     try validateForwardedAssignment("AR=zig ar");
+    try validateForwardedAssignment("KCONFIG_OVERWRITECONFIG=1");
     try validateForwardedAssignment("UK_CFLAGS=-std=gnu17");
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("not-an-assignment"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("-j=8"));

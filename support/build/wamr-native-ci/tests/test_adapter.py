@@ -707,6 +707,10 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             ci.source(repository)
 
     def test_precreated_output_roots_keep_source_parent_metadata_exact(self):
+        self.assertIn(
+            '"-Dmake-arg=KCONFIG_OVERWRITECONFIG=1"',
+            (ci.APP / "build-image.py").read_text(),
+        )
         app = self.root / "app"
         app.mkdir(mode=0o700)
         self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")

@@ -107,6 +107,7 @@ def main():
         "-Dcompiler-targeted=true", f"-Dhost-cc={zig} cc",
         f"-Dhost-cxx={zig} c++", "-Dhost-cflags=-fno-sanitize=null",
         f"-Dmake-arg=AR={zig} ar",
+        "-Dmake-arg=KCONFIG_OVERWRITECONFIG=1",
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
     ]
