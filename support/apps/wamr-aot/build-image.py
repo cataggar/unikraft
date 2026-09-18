@@ -101,6 +101,8 @@ def main():
     zig = tool("zig")
     command = [
         zig, "build", args.step, "-j2",
+        "--cache-dir", contract["zig_local_cache"],
+        "--global-cache-dir", contract["zig_global_cache"],
         f"-Dapp={ROOT}", f"-Dnative-make-environment={environment}",
         f"-Dconfig={ROOT / 'build/.config'}",
         f"-Dmake-command={tool('make')}",
