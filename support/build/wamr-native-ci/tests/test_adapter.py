@@ -327,6 +327,8 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             return {"source": source, "dependencies": {}}
 
         def command(runtime, expected, root, stage, args, *unused):
+            if stage == "config":
+                self.assertEqual(os.environ["KCONFIG_OVERWRITECONFIG"], "1")
             commands.append((stage, list(map(str, args))))
             return root / "private" / (stage + ".log")
 
@@ -337,6 +339,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 mock.patch.object(ci, "restore_dependencies", side_effect=restore), \
                 mock.patch.object(ci, "producer_inputs", side_effect=inputs), \
                 mock.patch.object(ci, "run_custodied", side_effect=command), \
+                mock.patch.object(ci, "require_no_config_backup"), \
                 mock.patch.object(ci, "retain_solved_config"), \
                 mock.patch.object(ci, "solved_config", return_value="f" * 64), \
                 mock.patch.object(ci, "require_build_custody"), \
@@ -708,8 +711,13 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         app.mkdir(mode=0o700)
         self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")
         with mock.patch.object(ci, "APP", app):
+            self.put(app / ".config.old", b"stale\n")
+            with self.assertRaisesRegex(ci.Refusal, "fresh precreated"):
+                ci.prepare_source_outputs()
+            (app / ".config.old").unlink()
             ci.prepare_source_outputs()
             before = ci.snapshot(app.lstat())
+            ci.require_no_config_backup()
             self.put(app / "build/.config",
                      b"CONFIG_FIXTURE=y\nCONFIG_SOLVED=y\n")
             self.assertEqual(ci.snapshot(app.lstat()), before)
@@ -724,6 +732,10 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 hashlib.sha256(
                     b"CONFIG_FIXTURE=y\nCONFIG_SOLVED=y\n").hexdigest(),
             )
+            self.put(app / ".config.old", b"unexpected\n")
+            with self.assertRaisesRegex(ci.Refusal, "configuration backup"):
+                ci.require_no_config_backup()
+            (app / ".config.old").unlink()
             self.put(app / "build/.config", b"CONFIG_CHANGED=y\n")
             with self.assertRaisesRegex(ci.Refusal, "build configuration changed"):
                 ci.solved_config()

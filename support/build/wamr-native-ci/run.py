@@ -1122,13 +1122,21 @@ def check_boot(config, identity):
 def prepare_source_outputs():
     output = APP / "build"
     config = APP / ".config"
+    backup = APP / ".config.old"
     require(not output.exists() and not output.is_symlink()
-            and not config.exists() and not config.is_symlink(),
+            and not config.exists() and not config.is_symlink()
+            and not backup.exists() and not backup.is_symlink(),
             "fresh precreated source output roots required")
     output.mkdir(mode=0o700)
     definition = read(APP / "defconfig", MIB)
     create_exact_copy(output / ".config", definition)
     create_exact_copy(config, definition)
+
+
+def require_no_config_backup():
+    backup = APP / ".config.old"
+    require(not backup.exists() and not backup.is_symlink(),
+            "unexpected configuration backup")
 
 
 def retain_solved_config():
@@ -1178,6 +1186,7 @@ def build(runtime, wamr):
                       ZIG_LOCAL_CACHE_DIR=str(root / "cache"),
                       ZIG_GLOBAL_CACHE_DIR=str(root / "global-cache"),
                       KCONFIG_CONFIG=str(APP / "build/.config"),
+                      KCONFIG_OVERWRITECONFIG="1",
                       PYTHONDONTWRITEBYTECODE="1")
     require(os.environ.get("BISON_PKGDATADIR") == str(runtime / "bison"),
             "Bison build environment differs from bound producer input")
@@ -1204,6 +1213,7 @@ def build(runtime, wamr):
         sys.executable, APP / "prepare.py", "prepare", "--source", wamr], 1800)
     run_custodied(runtime, initial, root, "config", [
         sys.executable, APP / "build-image.py", "olddefconfig"])
+    require_no_config_backup()
     retain_solved_config()
     solved_config()
     require_build_custody(runtime, initial)
