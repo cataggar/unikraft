@@ -82,6 +82,7 @@ INPUT_TREE_MAX_ENTRIES = 100_000
 INPUT_TREE_MAX_BYTES = 2 * 1024 * MIB
 COMMAND_ENVIRONMENT = {}
 COMMAND_TOOL_PATHS = {}
+FAILURE_STAGE = "startup"
 ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 COMMAND_ERROR_MARKERS = (
     "AccessDenied", "BrokenPipe", "FileNotFound", "FileTooBig", "InputOutput",
@@ -2996,15 +2997,19 @@ def build(runtime, wamr):
 
 
 def boot(runtime):
+    global FAILURE_STAGE
+    FAILURE_STAGE = "boot-platform"
     require(platform.machine() == "x86_64" and Path("/dev/kvm").is_char_device()
             and os.access("/dev/kvm", os.R_OK | os.W_OK),
             "x86 KVM runner required; no successful skip")
     root = runtime / "compute"
+    FAILURE_STAGE = "boot-build-custody"
     initial = document(root / "evidence/build-start.json")
     consumer_inputs = initial["consumer_inputs"]
     require(producer_inputs(runtime, consumer_inputs) == initial,
             "producer inputs changed")
     require(check_build() == document(root / "evidence/build.json"), "build identity changed")
+    FAILURE_STAGE = "boot-output-slots"
     package_output, configs = prepare_boot_output_slots(runtime, root)
     efi = APP / "build" / EFI
     paths = {"package_tool": root / "tools/bin/wamr-ci-package",
@@ -3013,6 +3018,7 @@ def boot(runtime):
              "ovmf_code": runtime / "firmware/code.fd",
              "ovmf_vars": runtime / "firmware/vars.fd",
              "efi": efi}
+    FAILURE_STAGE = "boot-input-record"
     inputs = boot_input_state(runtime, paths)
     save(root / "evidence/boot-inputs.json", inputs)
 
@@ -3020,11 +3026,14 @@ def boot(runtime):
         boot_input_state(
             runtime, paths, content=content, expected=inputs)
 
+    FAILURE_STAGE = "boot-package-precheck"
     verify_inputs()
+    FAILURE_STAGE = "boot-package-command"
     output = run_custodied(
         runtime, initial, root, "package",
         [paths["package_tool"], "package", efi, package_output],
         150, 64 * 1024, extra_inputs=inputs)
+    FAILURE_STAGE = "boot-package-result"
     package = document(output)
     require(package["image"]["efi"]["sha256"] == digest(efi)
             and package["producer_sha256"] == inputs["package_tool"],
@@ -3039,21 +3048,25 @@ def boot(runtime):
     identity = document(APP / "build/artifacts/identity.json")
     for index, mode in enumerate(MODES):
         config = configs[index]
+        FAILURE_STAGE = mode + "-command"
         run_custodied(
             runtime, initial, root, mode,
             boot_args(paths["local_boot_tool"], config), 90, 64 * 1024,
             extra_inputs=inputs)
+        FAILURE_STAGE = mode + "-result"
         result = check_boot(config, identity, inputs)
         expected = package["image"]["raw" if index < 2 else "vhd"]["sha256"]
         require(digest(Path(config["source"]["path"])) == expected,
                 "booted package changed")
         save(root / "evidence" / (mode + "-compute.json"), result)
+    FAILURE_STAGE = "boot-inspect-command"
     output = run_custodied(
         runtime, initial, root, "inspect",
         [paths["package_tool"], "inspect", efi, root / "package"],
         150, 64 * 1024, extra_inputs=inputs)
     require(document(output) == package, "physical package reload changed")
     verify_inputs(content=True)
+    FAILURE_STAGE = "boot-final-custody"
     require(producer_inputs(runtime, consumer_inputs) == initial,
             "producer inputs changed after boot")
     require(check_build() == document(root / "evidence/build.json"), "source or image changed")
@@ -3140,6 +3153,7 @@ if __name__ == "__main__":
         sys.exit(1)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError,
             subprocess.SubprocessError):
-        print("WAMR native compute CI failed; bounded private logs and redacted diagnostics retained.",
+        print("WAMR_CI_FAILED_STAGE: " + FAILURE_STAGE
+              + "; bounded private logs and redacted diagnostics retained.",
               file=sys.stderr)
         sys.exit(1)
