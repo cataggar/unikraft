@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("hyperv_core");
 const miz = @import("miz");
 const c = @import("config.zig");
@@ -168,18 +169,73 @@ fn validationDuplicate(file: std.Io.File) !std.Io.File {
     return .{ .handle = @intCast(fd), .flags = .{ .nonblocking = false } };
 }
 
+pub fn openStandaloneQcow2Image(io: std.Io, file: std.Io.File) !miz.Image {
+    return miz.Image.openStandaloneQcow2File(io, file) catch |err| switch (err) {
+        error.BackingFileNotSupported,
+        error.ExternalDataFileNotSupported,
+        => return err,
+        error.BadFileSignature,
+        error.UnsupportedVersion,
+        error.UnsupportedClusterSize,
+        error.HeaderTooShort,
+        error.HeaderExceedsClusterSize,
+        error.HeaderPastEndOfFile,
+        error.EncryptionNotSupported,
+        error.UnsupportedIncompatibleFeature,
+        error.UnsupportedCompressionType,
+        error.ExtendedL2NotSupported,
+        error.MissingExternalDataFileName,
+        error.RelativeExternalDataFilePath,
+        error.RelativeBackingFilePath,
+        error.BackingChainTooDeep,
+        error.BackingChainLoop,
+        error.HeaderStringTooLong,
+        error.InvalidHeaderStringRange,
+        error.InvalidRefcountOrder,
+        error.MissingRefcountTable,
+        error.MisalignedRefcountTable,
+        error.InvalidRefcountBlock,
+        error.MisalignedL1Table,
+        error.RefcountTablePastEndOfFile,
+        error.L1TablePastEndOfFile,
+        error.L1TableTooSmall,
+        => return error.InvalidQcow2,
+        else => return err,
+    };
+}
+
+pub const Qcow2TestFault = enum {
+    pread_out_of_memory,
+};
+
+pub fn validateQcow2Fault(
+    io: std.Io,
+    retained: std.Io.File,
+    retained_snapshot: core.private_files.Snapshot,
+    fault: Qcow2TestFault,
+) !void {
+    if (!builtin.is_test) @compileError("QCOW2 faults are available only to native tests");
+    return validateQcow2Impl(io, retained, retained_snapshot, fault);
+}
+
 pub fn validateQcow2(
     io: std.Io,
     retained: std.Io.File,
     retained_snapshot: core.private_files.Snapshot,
 ) !void {
+    return validateQcow2Impl(io, retained, retained_snapshot, null);
+}
+
+fn validateQcow2Impl(
+    io: std.Io,
+    retained: std.Io.File,
+    retained_snapshot: core.private_files.Snapshot,
+    fault: ?Qcow2TestFault,
+) !void {
     var duplicate = try validationDuplicate(retained);
     var transferred = false;
     defer if (!transferred) duplicate.close(io);
-    var image = miz.Image.openStandaloneQcow2File(io, duplicate) catch |err| switch (err) {
-        error.BackingFileNotSupported, error.ExternalDataFileNotSupported => return err,
-        else => return error.InvalidQcow2,
-    };
+    var image = try openStandaloneQcow2Image(io, duplicate);
     transferred = true;
     defer image.close(io);
 
@@ -210,15 +266,47 @@ pub fn validateQcow2(
         return error.InvalidQcow2Profile;
     }
 
-    miz.qcow2.check(image.file, io, info) catch return error.InvalidQcow2;
+    miz.qcow2.check(image.file, io, info) catch |err| switch (err) {
+        error.L1TableTooSmall,
+        error.InvalidL1Entry,
+        error.InvalidL2Entry,
+        error.CompressedClusterNotSupported,
+        error.ImageMarkedDirty,
+        error.ImageMarkedCorrupt,
+        error.MissingRefcountBlock,
+        error.ReferencedClusterHasZeroRefcount,
+        => return error.InvalidQcow2,
+        else => return err,
+    };
     var buffer: [64 * 1024]u8 = undefined;
     var position: u64 = 0;
     while (position < info.virtual_size) {
         const length: usize = @intCast(@min(buffer.len, info.virtual_size - position));
-        const read = image.pread(io, buffer[0..length], position) catch return error.InvalidQcow2;
+        const read = preadQcow2(image.file, io, info, buffer[0..length], position, fault) catch |err| switch (err) {
+            error.L1TableTooSmall,
+            error.InvalidL1Entry,
+            error.InvalidL2Entry,
+            error.CompressedClusterNotSupported,
+            error.InvalidCompressedCluster,
+            error.UnsupportedCompressionType,
+            => return error.InvalidQcow2,
+            else => return err,
+        };
         if (read != length) return error.InvalidQcow2;
         position += length;
     }
     if (!core.private_files.sameSnapshot(retained_snapshot, try core.private_files.snapshot(retained)))
         return error.ArtifactChanged;
+}
+
+fn preadQcow2(
+    file: std.Io.File,
+    io: std.Io,
+    info: miz.qcow2.Info,
+    buffer: []u8,
+    position: u64,
+    fault: ?Qcow2TestFault,
+) miz.qcow2.PreadError!usize {
+    if (fault == .pread_out_of_memory) return error.OutOfMemory;
+    return miz.qcow2.pread(file, io, info, buffer, position);
 }

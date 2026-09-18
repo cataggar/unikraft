@@ -140,6 +140,11 @@ full virtual read exercises every allocated compressed cluster. QEMU receives tw
 explicit nodes in order: a read-only `file` node over `/proc/self/fd/N`, then a
 read-only `qcow2` node named `local-boot-disk` referring to it. The existing
 `virtio-blk-pci,drive=local-boot-disk` device is unchanged.
+Malformed, unsupported, over-limit, or decompression-invalid QCOW2 content
+remains an `invalid_input` refusal. Host stat/read failures, cancellation,
+allocation failure, descriptor/resource exhaustion, and other operational
+errors retain their original error instead of being relabeled as malformed
+image content; the validation duplicate is closed on every such failure.
 
 EFI mode copies only the supplied application into private
 `esp/EFI/BOOT/BOOTX64.EFI`; that disposable ESP retains legacy writable-FAT

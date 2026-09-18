@@ -122,9 +122,9 @@ fn execute(init: std.process.Init) !void {
         const duplicate_fd = linux.fcntl(source.handle, linux.F.DUPFD_CLOEXEC, 64);
         if (linux.errno(duplicate_fd) != .SUCCESS) return error.DescriptorFailed;
         const duplicate: std.Io.File = .{ .handle = @intCast(duplicate_fd), .flags = .{ .nonblocking = false } };
-        var image = boot.miz.Image.openStandaloneQcow2File(io, duplicate) catch {
+        var image = boot.files.openStandaloneQcow2Image(io, duplicate) catch |err| {
             duplicate.close(io);
-            return error.InvalidQcow2;
+            return err;
         };
         defer image.close(io);
         if (try image.pread(io, &mode, 0) != 1) return error.EmptySource;

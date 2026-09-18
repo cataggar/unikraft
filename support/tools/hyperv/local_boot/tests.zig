@@ -377,6 +377,73 @@ fn writeQcowBytes(f: Fixture, offset: u64, bytes: []const u8) !void {
     try file.writePositionalAll(io, bytes, offset);
 }
 
+const Qcow2IoFault = struct {
+    const Kind = enum {
+        stat_system_resources,
+        header_canceled,
+        compressed_input_output,
+    };
+
+    table: std.Io.VTable = io.vtable.*,
+    retained: linux.fd_t,
+    kind: Kind,
+    failures: usize = 0,
+    threadlocal var active: ?*Qcow2IoFault = null;
+
+    fn install(self: *Qcow2IoFault) std.Io {
+        std.debug.assert(active == null);
+        active = self;
+        self.table.fileStat = stat;
+        self.table.fileReadPositional = readPositional;
+        return .{ .userdata = io.userdata, .vtable = &self.table };
+    }
+
+    fn deinit(_: *Qcow2IoFault) void {
+        active = null;
+    }
+
+    fn stat(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+        const self = active.?;
+        if (file.handle != self.retained and self.kind == .stat_system_resources and self.failures == 0) {
+            self.failures += 1;
+            return error.SystemResources;
+        }
+        return io.vtable.fileStat(userdata, file);
+    }
+
+    fn readPositional(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        data: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        const self = active.?;
+        if (file.handle != self.retained and self.failures == 0) {
+            switch (self.kind) {
+                .header_canceled => if (offset == 0) {
+                    self.failures += 1;
+                    return error.Canceled;
+                },
+                .compressed_input_output => if (offset == 64 * 1024) {
+                    self.failures += 1;
+                    return error.InputOutput;
+                },
+                .stat_system_resources => {},
+            }
+        }
+        return io.vtable.fileReadPositional(userdata, file, data, offset);
+    }
+};
+
+fn openFdCount() !usize {
+    const directory = try std.Io.Dir.openDirAbsolute(io, "/proc/self/fd", .{ .iterate = true });
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    var count: usize = 0;
+    while (try iterator.next(io) != null) count += 1;
+    return count;
+}
+
 test "native zstd standalone qcow2 succeeds through the retained read-only descriptor" {
     const f = try Fixture.initSource(0, .qcow2);
     defer f.deinit();
@@ -392,6 +459,64 @@ test "native zstd standalone qcow2 succeeds through the retained read-only descr
     const request_bytes = try work.read(io, a, "request.json", boot.config.max_record, null);
     defer a.free(request_bytes);
     try t.expect(std.mem.indexOf(u8, request_bytes, "\"source\":{\"kind\":\"qcow2\"") != null);
+}
+
+test "qcow2 operational errors propagate and validation duplicates always close" {
+    const f = try Fixture.initSource(0, .qcow2);
+    defer f.deinit();
+    const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+    defer retained.close(io);
+    const retained_snapshot = try core.private_files.snapshot(retained);
+    const descriptor_count = try openFdCount();
+
+    for ([_]Qcow2IoFault.Kind{
+        .stat_system_resources,
+        .header_canceled,
+        .compressed_input_output,
+    }) |kind| {
+        {
+            var fault: Qcow2IoFault = .{ .retained = retained.handle, .kind = kind };
+            const fault_io = fault.install();
+            defer fault.deinit();
+            switch (kind) {
+                .stat_system_resources => try t.expectError(
+                    error.SystemResources,
+                    boot.files.validateQcow2(fault_io, retained, retained_snapshot),
+                ),
+                .header_canceled => try t.expectError(
+                    error.Canceled,
+                    boot.files.validateQcow2(fault_io, retained, retained_snapshot),
+                ),
+                .compressed_input_output => try t.expectError(
+                    error.InputOutput,
+                    boot.files.validateQcow2(fault_io, retained, retained_snapshot),
+                ),
+            }
+            try t.expectEqual(@as(usize, 1), fault.failures);
+        }
+        try t.expectEqual(descriptor_count, try openFdCount());
+        try t.expectEqual(.SUCCESS, linux.errno(linux.fcntl(retained.handle, linux.F.GETFD, 0)));
+    }
+
+    try t.expectError(
+        error.OutOfMemory,
+        boot.files.validateQcow2Fault(io, retained, retained_snapshot, .pread_out_of_memory),
+    );
+    try t.expectEqual(descriptor_count, try openFdCount());
+    try boot.files.validateQcow2(io, retained, retained_snapshot);
+}
+
+test "qcow2 structural corruption remains invalid input and closes its duplicate" {
+    const f = try Fixture.initSource(0, .qcow2);
+    defer f.deinit();
+    try writeQcowBytes(f, 0, "bad!");
+    const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
+    defer retained.close(io);
+    const retained_snapshot = try core.private_files.snapshot(retained);
+    const descriptor_count = try openFdCount();
+    try t.expectError(error.InvalidQcow2, boot.files.validateQcow2(io, retained, retained_snapshot));
+    try t.expectEqual(descriptor_count, try openFdCount());
+    try t.expectEqual(.SUCCESS, linux.errno(linux.fcntl(retained.handle, linux.F.GETFD, 0)));
 }
 
 test "qcow2 physical and decoded capacity limits are independent" {
