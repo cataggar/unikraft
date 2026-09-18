@@ -1187,6 +1187,7 @@ def build(runtime, wamr):
                       ZIG_GLOBAL_CACHE_DIR=str(root / "global-cache"),
                       KCONFIG_CONFIG=str(APP / "build/.config"),
                       KCONFIG_OVERWRITECONFIG="1",
+                      M4=tool("m4"),
                       PYTHONDONTWRITEBYTECODE="1")
     require(os.environ.get("BISON_PKGDATADIR") == str(runtime / "bison"),
             "Bison build environment differs from bound producer input")

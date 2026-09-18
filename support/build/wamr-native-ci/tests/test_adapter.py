@@ -329,6 +329,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         def command(runtime, expected, root, stage, args, *unused):
             if stage == "config":
                 self.assertEqual(os.environ["KCONFIG_OVERWRITECONFIG"], "1")
+                self.assertEqual(os.environ["M4"], "/tools/m4")
             commands.append((stage, list(map(str, args))))
             return root / "private" / (stage + ".log")
 
