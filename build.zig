@@ -2186,6 +2186,7 @@ fn registerNativePipeline(
             b,
             step,
             registered,
+            options,
             copy_command,
             config,
             lto_result.stage_name,
@@ -2235,6 +2236,7 @@ fn registerNativePipeline(
         b,
         step,
         registered,
+        options,
         copy_command,
         config,
         linked[0].stage_name,
@@ -2247,6 +2249,7 @@ fn finishNativeImages(
     b: *std.Build,
     step: *std.Build.Step,
     registered: *native_image_graph.RegisteredGraph,
+    options: MakeOptions,
     copy_command: []const u8,
     config: *const NativeConfig,
     stage_name: []const u8,
@@ -2354,15 +2357,15 @@ fn finishNativeImages(
         post_plan,
         &.{validated_link_output},
         .{
-            .python_executable = "python3",
-            .strip = registered.graph.toolchain.binutils.strip.command,
+            .python_executable = forwardedCommand(options.forwarded, "PYTHON") orelse "python3",
+            .strip = registered.graph.toolchain.binutils.objcopy.command,
             .objcopy = registered.graph.toolchain.binutils.objcopy.command,
             .objdump = if (registered.graph.toolchain.binutils.objdump) |tool|
                 tool.command
             else
                 null,
             .nm = registered.graph.toolchain.binutils.nm.command,
-            .readelf = "llvm-readelf",
+            .readelf = forwardedCommand(options.forwarded, "READELF") orelse "llvm-readelf",
         },
         .{
             .native_runner = if (std.mem.eql(u8, registered.graph.selectedPlatform().name, "hyperv"))
@@ -3162,6 +3165,7 @@ fn isAllowedAssignment(name: []const u8) bool {
         "AR",
         "CP",
         "MKDIR",
+        "PYTHON",
         "READLINK",
         "ZIG",
         "YACC",
@@ -3724,6 +3728,7 @@ test "forwarded Make assignments require allowlisted names" {
     try validateForwardedAssignment("AR=zig ar");
     try validateForwardedAssignment("CP=/native/bin/cp -f");
     try validateForwardedAssignment("MKDIR=/native/bin/mkdir");
+    try validateForwardedAssignment("PYTHON=/native/bin/python3");
     try validateForwardedAssignment("READLINK=/native/bin/readlink");
     try validateForwardedAssignment("HOSTOSENV=Linux");
     try validateForwardedAssignment("WGET_VERSION=unavailable");

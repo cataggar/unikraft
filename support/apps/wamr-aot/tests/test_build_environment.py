@@ -82,6 +82,7 @@ class NativeMakeEnvironment(unittest.TestCase):
                     "-Dflex-command=/tools/flex",
                     "-Dmake-arg=CP=/tools/cp -f",
                     "-Dmake-arg=MKDIR=/tools/mkdir",
+                    "-Dmake-arg=PYTHON=/tools/python3",
                     "-Dmake-arg=READLINK=/tools/readlink",
                     "-Dmake-arg=HOSTOSENV=Linux",
                     "-Dmake-arg=WGET_VERSION=unavailable",

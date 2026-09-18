@@ -89,8 +89,11 @@ Python-standard-library and authenticated Bison data trees. The selected tools
 include the exact indirect shell/coreutils executables used by the native build
 graph (`dash`, `cp`, `env`, `mkdir`, `readlink` and `uname`) rather than
 unrelated `/usr/bin` members. Native Make receives retained descriptor paths
-for Zig and its consumed copy/directory/readlink helpers; its unused Wget
-version probe is disabled by a fixed offline build-contract value. Every record binds device/inode,
+for Zig, Python and its consumed copy/directory/readlink helpers; the Zig-owned
+link and post-processing graph receives the retained compiler, binutils,
+readelf and copy paths and uses the objcopy interface for descriptor-safe
+stripping. Native Make's unused Wget version probe is disabled by a fixed
+offline build-contract value. Every record binds device/inode,
 type/mode, uid/gid, link count, size, nanosecond mtime/ctime and content
 identity, with deduplicated absolute directory-component identities. The
 pinned tree scanner refuses on the first excess entry before sorting and

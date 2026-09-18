@@ -175,6 +175,7 @@ def main():
         f"-Dmake-arg=AR={zig} ar",
         f"-Dmake-arg=CP={tool('cp')} -f",
         f"-Dmake-arg=MKDIR={tool('mkdir')}",
+        f"-Dmake-arg=PYTHON={tool('python3')}",
         f"-Dmake-arg=READLINK={tool('readlink')}",
         "-Dmake-arg=HOSTOSENV=Linux",
         "-Dmake-arg=WGET_VERSION=unavailable",

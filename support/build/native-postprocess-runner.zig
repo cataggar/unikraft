@@ -129,11 +129,11 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
         defer freeCommand(allocator, tool);
         try command.appendSlice(allocator, tool);
         if (strip) {
-            try command.append(allocator, "-s");
+            try command.append(allocator, "--strip-all");
             for (options.remove.items) |section| {
                 try command.appendSlice(allocator, &.{ "-R", section });
             }
-            try command.appendSlice(allocator, &.{ paths[0], "-o", files.path(0) });
+            try command.appendSlice(allocator, &.{ paths[0], files.path(0) });
         } else {
             try command.appendSlice(allocator, &.{ "-O", "binary", paths[0], files.path(0) });
         }
