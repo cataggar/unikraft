@@ -14,6 +14,22 @@ REPO = ROOT.parents[2]
 
 
 def tool(name):
+    selected = os.environ.get(
+        "WAMR_CI_TOOL_" + name.upper().replace("-", "_"))
+    if selected is not None:
+        path = Path(selected)
+        retained = (
+            len(path.parts) == 5
+            and path.parts[:2] == ("/", "proc")
+            and (path.parts[2] == "self" or path.parts[2].isdigit())
+            and path.parts[3] == "fd"
+            and path.name.isdigit()
+        )
+        if (not path.is_absolute() or (not retained
+                and path.resolve(strict=True) != path)
+                or not path.is_file() or not os.access(path, os.X_OK)):
+            raise RuntimeError(f"invalid recorded build tool: {name}")
+        return str(path)
     path = shutil.which(name)
     if not path:
         raise RuntimeError(f"required build tool unavailable: {name}")

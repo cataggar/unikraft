@@ -84,22 +84,26 @@ transient cannot be hidden by a finally clean Git status.
 
 `build-start.json` now carries
 `uk.wamr.consumer-input-custody` version 2. It inventories each selected host
-tool and dynamic runtime object plus the bounded Zig, LLVM, system executable,
-Python-standard-library and authenticated Bison data trees. Every record binds device/inode,
+tool and dynamic runtime object plus the bounded Zig, LLVM,
+Python-standard-library and authenticated Bison data trees. The selected tools
+include the exact indirect shell/coreutils executables used by the native build
+graph rather than unrelated `/usr/bin` members. Every record binds device/inode,
 type/mode, uid/gid, link count, size, nanosecond mtime/ctime and content
 identity, with deduplicated absolute directory-component identities. The
 pinned tree scanner refuses on the first excess entry before sorting and
 separately bounds all unique regular-file bytes hashed through symlinks.
-Dangling system-tree links are accepted only when their retained deepest
+Dangling input-tree links are accepted only when their retained deepest
 existing target ancestor is root-owned and cannot be modified by the build
 principal; the missing suffix and ancestor identity are part of the record.
 The pinned WAMR checkout is consumed only while creating a fixed-revision Git
 archive through retained repository and Git descriptors; all later WAMR build
 steps read the create-only archived object. Top-level build tools execute
-through retained no-follow descriptors, while indirect tool/data and Miz-tree
-lookups are physically revalidated immediately before and after each consumer
-and fully rehashed at final inspection and export. Consumer subprocesses use a
-closed environment derived only from recorded input parents and adapter-owned
+through retained no-follow descriptors. Build scripts receive those same
+retained descriptor paths through closed adapter variables, while `PATH` is
+restricted to the root-owned system directory containing the separately
+recorded indirect executables. Tool/data and Miz-tree lookups are physically revalidated
+immediately before and after each consumer and fully rehashed at final
+inspection and export. Consumer subprocesses use adapter-owned
 cache/configuration paths; ambient loader, shell-startup, Python, Make and Zig
 injection variables are not inherited.
 

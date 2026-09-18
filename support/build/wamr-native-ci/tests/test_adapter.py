@@ -14,12 +14,14 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 PYTHON = os.environ.get("WAMR_CI_PYTHON", sys.executable)
+GIT = os.environ.get("WAMR_CI_GIT", "git")
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
@@ -232,13 +234,13 @@ class Evidence(unittest.TestCase):
             path = repository / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             self.put(path, data)
-        subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
-        subprocess.run(["git", "config", "user.email", "fixture@example.invalid"],
+        subprocess.run([GIT, "init", "-q"], cwd=repository, check=True)
+        subprocess.run([GIT, "config", "user.email", "fixture@example.invalid"],
                        cwd=repository, check=True)
-        subprocess.run(["git", "config", "user.name", "Fixture"],
+        subprocess.run([GIT, "config", "user.name", "Fixture"],
                        cwd=repository, check=True)
-        subprocess.run(["git", "add", "."], cwd=repository, check=True)
-        subprocess.run(["git", "commit", "-qm", "fixture"],
+        subprocess.run([GIT, "add", "."], cwd=repository, check=True)
+        subprocess.run([GIT, "commit", "-qm", "fixture"],
                        cwd=repository, check=True)
         (repository / ".d").mkdir(mode=0o700)
         (repository / ".zig-cache").mkdir(mode=0o700)
@@ -419,6 +421,63 @@ class Evidence(unittest.TestCase):
         with self.assertRaisesRegex(ci.Refusal, "custody changed"):
             ci.record_input_paths({}, {}, content=False, expected=state)
 
+    def test_indirect_tool_environment_uses_retained_descriptor(self):
+        root = self.root / "retained-indirect"
+        (root / "private").mkdir(parents=True, mode=0o700)
+        executable = root / "tool"
+        original = b"#!/bin/sh\nprintf original\n"
+        replacement = b"#!/bin/sh\nprintf replacement\n"
+        self.put(executable, original)
+        executable.chmod(0o700)
+        ready = root / "ready"
+        consumed = root / "consumed"
+        script = (
+            "import os,pathlib,subprocess,time\n"
+            f"pathlib.Path({str(ready)!r}).touch()\n"
+            "time.sleep(0.2)\n"
+            "value=subprocess.check_output([os.environ['WAMR_CI_TOOL_GIT']])\n"
+            f"pathlib.Path({str(consumed)!r}).touch()\n"
+            "time.sleep(0.2)\n"
+            "print(value.decode(),end='')\n"
+        )
+        records = {}
+        for path in {
+                Path(ci.tool("timeout")), Path(ci.tool("bash")),
+                Path(ci.tool("head")), Path(PYTHON).resolve(strict=True),
+                executable}:
+            record, unused_directories = ci.physical_file_record(path)
+            del unused_directories
+            records[record["path"]] = record
+
+        def swap_and_restore():
+            while not ready.exists():
+                time.sleep(0.005)
+            saved = root / "saved"
+            executable.rename(saved)
+            self.put(executable, replacement)
+            executable.chmod(0o700)
+            while not consumed.exists():
+                time.sleep(0.005)
+            executable.unlink()
+            saved.rename(executable)
+
+        attacker = threading.Thread(target=swap_and_restore)
+        attacker.start()
+        try:
+            with mock.patch.dict(
+                    ci.COMMAND_TOOL_PATHS,
+                    {"git": str(executable)}, clear=True):
+                output, unused_record = ci.execute(
+                    root, "retained-indirect-command",
+                    [PYTHON, "-c", script], evidence=False,
+                    input_records=records)
+            del unused_record
+        finally:
+            attacker.join(timeout=2)
+        self.assertFalse(attacker.is_alive())
+        self.assertEqual(output.read_bytes(), b"original")
+        self.assertEqual(executable.read_bytes(), original)
+
     def test_boot_revalidation_does_not_need_inherited_build_environment(self):
         root = self.root / "bison"
         root.mkdir(mode=0o700)
@@ -440,6 +499,49 @@ class Evidence(unittest.TestCase):
                                   return_value={"fixture": True}):
             self.assertEqual(ci.producer_inputs(self.root)["bison_data"], expected)
             self.assertNotIn("BISON_PKGDATADIR", os.environ)
+
+    def test_consumer_inventory_uses_exact_indirect_tools_not_system_bin(self):
+        runtime = self.root / "inventory"
+        runtime.mkdir(mode=0o700)
+        captured = {}
+
+        def record(file_paths, tree_paths, content=True, expected=None):
+            captured["files"] = file_paths
+            captured["trees"] = tree_paths
+            self.assertTrue(content)
+            self.assertIsNone(expected)
+            return {"schema": "fixture"}
+
+        with mock.patch.object(
+                ci, "tool", side_effect=lambda name: f"/tools/{name}"), \
+                mock.patch.object(
+                    ci, "executable_runtime_paths", return_value=set()), \
+                mock.patch.object(
+                    ci, "record_input_paths", side_effect=record):
+            self.assertEqual(
+                ci.consumer_input_state(runtime), {"schema": "fixture"})
+
+        self.assertNotIn("system-bin", captured["trees"])
+        for name in ci.INDIRECT_HOST_TOOLS:
+            self.assertEqual(
+                captured["files"][f"tool:{name}"], Path(f"/tools/{name}"))
+        tools = {
+            "files": {
+                f"tool:{name}": {
+                    "path": (
+                        f"/system/{name}" if name in ci.INDIRECT_HOST_TOOLS
+                        else f"/selected/{name}"
+                    )
+                }
+                for name in ci.HOST_TOOLS
+            }
+        }
+        environment = ci.bind_command_tools(tools)
+        self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+        self.assertEqual(environment["WAMR_CI_GIT"], "/selected/git")
+        self.assertEqual(
+            environment["WAMR_CI_TOOL_DASH"], "/system/dash")
+        ci.COMMAND_TOOL_PATHS.clear()
 
     def test_compute_dynamic_validator_never_writes_bytecode(self):
         app = self.root / "validator-app"
@@ -486,7 +588,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                     ci.build(runtime, self.root)
                 inputs.assert_not_called()
 
-    def test_restore_precedes_custody_and_both_builds_use_one_system_tree(self):
+    def test_restore_precedes_custody_and_both_builds_use_one_package_tree(self):
         runtime = self.root / "runtime"
         runtime.mkdir(mode=0o700)
         packages = runtime / "packages"
@@ -495,7 +597,13 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         commands = []
 
         source = {"revision": "1" * 40, "tree": "2" * 40, "custody": {}}
-        consumer = {"schema": "fixture"}
+        consumer = {
+            "schema": "fixture",
+            "files": {
+                f"tool:{name}": {"path": f"/tools/{name}"}
+                for name in ci.HOST_TOOLS
+            },
+        }
 
         def restore(runtime_value, root, expected, expected_inputs):
             events.append("restore")
@@ -554,6 +662,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 mock.patch.object(ci, "tool", side_effect=lambda name: "/tools/" + name), \
                 mock.patch.object(ci.subprocess, "check_output", return_value=b"0.16.0\n"):
             ci.build(runtime, self.root)
+        ci.COMMAND_TOOL_PATHS.clear()
 
         self.assertEqual(events[:2], ["restore", "custody"])
         selected = dict(commands)
@@ -1075,15 +1184,15 @@ source/generated/
         app = repository / "support/apps/wamr-aot"
         app.mkdir(parents=True, mode=0o700)
         self.put(app / "defconfig", b"CONFIG_FIXTURE=y\n")
-        subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
-        subprocess.run(["git", "config", "user.email", "fixture@example.invalid"],
+        subprocess.run([GIT, "init", "-q"], cwd=repository, check=True)
+        subprocess.run([GIT, "config", "user.email", "fixture@example.invalid"],
                        cwd=repository, check=True)
-        subprocess.run(["git", "config", "user.name", "Fixture"],
+        subprocess.run([GIT, "config", "user.name", "Fixture"],
                        cwd=repository, check=True)
-        subprocess.run(["git", "add", ".gitignore", "source/input", "source/link",
+        subprocess.run([GIT, "add", ".gitignore", "source/input", "source/link",
                         "support/apps/wamr-aot/defconfig"],
                        cwd=repository, check=True)
-        subprocess.run(["git", "commit", "-qm", "fixture"], cwd=repository, check=True)
+        subprocess.run([GIT, "commit", "-qm", "fixture"], cwd=repository, check=True)
         (repository / ".d").mkdir(mode=0o700)
         (repository / ".zig-cache").mkdir(mode=0o700)
         (app / "build").mkdir(mode=0o700)
@@ -1095,7 +1204,7 @@ source/generated/
         generated.rmdir()
         self.assertEqual(
             subprocess.check_output(
-                ["git", "status", "--porcelain=v2", "--untracked-files=all"],
+                [GIT, "status", "--porcelain=v2", "--untracked-files=all"],
                 cwd=repository),
             b"",
         )
@@ -1125,8 +1234,8 @@ source/generated/
         self.put(self.root / "outside", b"not source\n")
         (repository / "source/link").unlink()
         (repository / "source/link").symlink_to("../../outside")
-        subprocess.run(["git", "add", "source/link"], cwd=repository, check=True)
-        subprocess.run(["git", "commit", "-qm", "escaping link"],
+        subprocess.run([GIT, "add", "source/link"], cwd=repository, check=True)
+        subprocess.run([GIT, "commit", "-qm", "escaping link"],
                        cwd=repository, check=True)
         with self.assertRaisesRegex(ci.Refusal, "symlink escapes repository"):
             ci.source(repository)

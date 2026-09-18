@@ -69,15 +69,19 @@ SOURCE_OUTPUT_DIRECTORY_ROLES = (
 )
 SOURCE_OUTPUT_FILE_ROLES = ("support/apps/wamr-aot/.config",)
 SOURCE_OUTPUT_PREEXISTING_DESCENDANT_ROLES = (".d",)
-HOST_TOOLS = ("zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
-              "llvm-readelf", "llvm-strip", "bison", "flex",
-              "python3", "git", "bash", "m4", "timeout", "head")
+INDIRECT_HOST_TOOLS = ("dash", "cp", "env", "readlink", "uname")
+HOST_TOOLS = (
+    "git", "python3", "bash", "head", "timeout", *INDIRECT_HOST_TOOLS,
+    "zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
+    "llvm-readelf", "llvm-strip", "bison", "flex", "m4",
+)
 SUBPROCESS_TERM_GRACE = 1.0
 SUBPROCESS_KILL_GRACE = 1.0
 SUBPROCESS_DRAIN_GRACE = 1.0
 INPUT_TREE_MAX_ENTRIES = 100_000
 INPUT_TREE_MAX_BYTES = 2 * 1024 * MIB
 COMMAND_ENVIRONMENT = {}
+COMMAND_TOOL_PATHS = {}
 ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 COMMAND_ERROR_MARKERS = (
     "AccessDenied", "BrokenPipe", "FileNotFound", "FileTooBig", "InputOutput",
@@ -215,6 +219,9 @@ def save(path, value):
 
 
 def tool(name):
+    selected = COMMAND_TOOL_PATHS.get(name)
+    if selected is not None:
+        return selected
     path = shutil.which(name)
     require(path is not None, "required tool unavailable")
     return str(Path(path).resolve(strict=True))
@@ -372,16 +379,12 @@ def git_command(*args):
 
 
 def command_environment(root, input_records=None, extra=None):
-    path_entries = ["/usr/bin", "/bin"]
-    for path in (() if input_records is None else input_records):
-        parent = str(Path(path).parent)
-        if parent not in path_entries:
-            path_entries.append(parent)
+    del input_records
     environment = {
         "HOME": str(Path(root) / "private"),
         "LANG": "C",
         "LC_ALL": "C",
-        "PATH": os.pathsep.join(path_entries),
+        "PATH": "/usr/bin:/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
         "TMPDIR": str(Path(root) / "private"),
         **COMMAND_ENVIRONMENT,
@@ -1023,7 +1026,6 @@ def consumer_input_state(runtime, content=True, expected=None):
     tree_paths = {
         "bison": runtime / "bison",
         "python-stdlib": Path(sysconfig.get_paths()["stdlib"]).resolve(strict=True),
-        "system-bin": Path("/usr/bin").resolve(strict=True),
         "zig": tool_paths["zig"].parent,
     }
     llvm = runtime / "llvm"
@@ -1060,6 +1062,27 @@ def consumer_file_records(value):
     return {
         record["path"]: record for record in value["files"].values()
     }
+
+
+def bind_command_tools(value):
+    selected = {}
+    for name in HOST_TOOLS:
+        record = value["files"].get("tool:" + name)
+        require(isinstance(record, dict), "missing consumer tool input")
+        path = Path(record["path"])
+        require(path.is_absolute(), "invalid consumer tool input")
+        selected[name] = str(path)
+    COMMAND_TOOL_PATHS.clear()
+    COMMAND_TOOL_PATHS.update(selected)
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "WAMR_CI_GIT": selected["git"],
+    }
+    for name, path in selected.items():
+        environment[
+            "WAMR_CI_TOOL_" + name.upper().replace("-", "_")
+        ] = path
+    return environment
 
 
 def normalized_repository_relative(value, reason, trailing_slash=False):
@@ -1689,6 +1712,12 @@ def retained_executables(paths, records):
                 pass
 
 
+def retained_process_path(path):
+    match = re.fullmatch(r"/proc/self/fd/([0-9]+)", path)
+    require(match is not None, "invalid retained executable path")
+    return f"/proc/{os.getpid()}/fd/{match.group(1)}"
+
+
 def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
             evidence=True, input_records=None):
     """Fixed timeout/head ceiling; raw output stays private, never in Actions stdout."""
@@ -1697,16 +1726,27 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
     shell = tool("bash")
     head = tool("head")
     executable = str(Path(args[0]))
+    indirect = tuple(dict.fromkeys(COMMAND_TOOL_PATHS.values()))
     context = (
         retained_executables(
-            (timeout, shell, head, executable), input_records)
+            (timeout, shell, head, executable, *indirect), input_records)
         if input_records is not None
         else contextlib.nullcontext(({}, ()))
     )
     with context as (retained, pass_fds), output.open("xb") as stream:
+        retained_environment = {}
+        if "git" in COMMAND_TOOL_PATHS:
+            retained_environment["WAMR_CI_GIT"] = retained_process_path(
+                retained[COMMAND_TOOL_PATHS["git"]])
+        retained_environment.update({
+            "WAMR_CI_TOOL_" + name.upper().replace("-", "_"):
+                retained_process_path(retained[path])
+            for name, path in COMMAND_TOOL_PATHS.items()
+        })
         environment = command_environment(root, input_records, {
             "WAMR_CI_CAPTURE_LIMIT": str(limit + 1),
             "WAMR_CI_HEAD": retained.get(head, head),
+            **retained_environment,
         })
         command = [
             retained.get(timeout, timeout),
@@ -2796,6 +2836,7 @@ def build(runtime, wamr):
     require(bison_data == str(runtime / "bison"),
             "Bison build environment differs from bound producer input")
     COMMAND_ENVIRONMENT.clear()
+    COMMAND_TOOL_PATHS.clear()
     COMMAND_ENVIRONMENT.update({
         "BISON_PKGDATADIR": bison_data,
         "KCONFIG_CONFIG": str(APP / "build/.config"),
@@ -2809,6 +2850,8 @@ def build(runtime, wamr):
     os.environ.update(COMMAND_ENVIRONMENT)
     source_archive = seal_wamr_source(runtime, wamr)
     consumer_inputs = consumer_input_state(runtime)
+    COMMAND_ENVIRONMENT.update(bind_command_tools(consumer_inputs))
+    os.environ.update(COMMAND_ENVIRONMENT)
     initial_source = source()
     save(root / "private/source-metadata.json", {
         "schema": "uk.wamr.git-physical-source-baseline",
