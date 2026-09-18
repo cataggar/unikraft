@@ -1012,6 +1012,12 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None):
     }
     result["aggregate_sha256"] = record_digest(result)
     if expected is not None:
+        require(result["files"] == expected["files"],
+                "consumer input file custody changed")
+        require(result["trees"] == expected["trees"],
+                "consumer input tree custody changed")
+        require(result["directories"] == expected["directories"],
+                "consumer input directory custody changed")
         require(result == expected, "consumer input custody changed")
     return result
 
