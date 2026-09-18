@@ -18,6 +18,7 @@ spec.loader.exec_module(ci)
 NAMES = ("efi", "debug_elf", "bootinfo", "raw", "vhd", "runtime", "compiler",
          "wasm", "cwasm", "config", "runtime_identity", "image_identity",
          "local_result", "package", "build", "build_start", "boot_inputs")
+FAILURE_STAGE = "handoff"
 
 
 def private(path):
@@ -182,6 +183,7 @@ def plan(bundle_path, output):
 
 
 def main():
+    global FAILURE_STAGE
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     exp = sub.add_parser("export")
@@ -208,9 +210,12 @@ def main():
         plan(args.bundle, args.output)
     else:
         import public_bundle
+
         if args.command == "public-source-bundle":
+            FAILURE_STAGE = "public-entry"
             public_bundle.publish_ci(sys.modules[__name__])
         else:
+            FAILURE_STAGE = "public-import"
             expected = dict(repository="cataggar/unikraft", run_id=args.run_id,
                             run_attempt=args.run_attempt, source_revision=args.expected_source,
                             source_tree=args.expected_tree, wamr_revision=ci.REVISION)
@@ -224,5 +229,6 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile):
-        print("Compute handoff refused; original local records are unchanged.", file=sys.stderr)
+        print("Compute handoff refused at " + FAILURE_STAGE
+              + "; original local records are unchanged.", file=sys.stderr)
         sys.exit(1)

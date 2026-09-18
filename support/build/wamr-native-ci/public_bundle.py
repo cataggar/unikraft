@@ -816,6 +816,7 @@ def import_bundle(
 
 def publish_ci(handoff):
     """Only the named public repository lane may select this fixed publication."""
+    handoff.FAILURE_STAGE = "public-context"
     source = ci_context(handoff)
     runtime = ci_runtime(handoff.ci)
     publication = runtime / "compute/public-source"
@@ -823,11 +824,13 @@ def publish_ci(handoff):
     output = handoff.ci.REPO / ".d/wamr-public-source-bundle"
     handoff.private(runtime)
     handoff.private(publication)
+    handoff.FAILURE_STAGE = "public-cleanup-record"
     require(handoff.ci.read(runtime / "evidence/runtime-cleanup.txt", 128)
             == b"primary=0 cleanup=0\n")
     output.mkdir(mode=0o700)
     start = handoff.ci.document(
         runtime / "compute/evidence/build-start.json")
+    handoff.FAILURE_STAGE = "public-validator-build"
     handoff.ci.run(runtime / "compute", "public-validator-build", [
         handoff.ci.tool("zig"), "build", "--build-file",
         handoff.ci.REPO / "support/tools/hyperv/direct/build.zig",
@@ -837,13 +840,17 @@ def publish_ci(handoff):
         "-Doptimize=ReleaseSafe", "-j2", "install"], 600,
         input_records=handoff.ci.consumer_file_records(
             start["consumer_inputs"]))
+    handoff.FAILURE_STAGE = "public-export"
     handoff.export(runtime, stage)
     validator = publication / "tools/bin/uk-wamr-direct-validate"
     archive = output / "tiny-aot-public-source.zip"
+    handoff.FAILURE_STAGE = "public-pack"
     archive_sha256 = pack(handoff, stage, archive, source, validator)
     # Re-extract and run the actual production checker on the exported archive.
+    handoff.FAILURE_STAGE = "public-reopen"
     import_bundle(
         handoff, archive, publication / "reopened",
         source, archive_sha256, validator)
+    handoff.FAILURE_STAGE = "public-final-context"
     require(ci_context(handoff) == source)
     return archive
