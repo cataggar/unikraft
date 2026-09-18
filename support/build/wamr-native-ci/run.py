@@ -406,7 +406,24 @@ def ignored_git_roots(repository, roles):
     return paths
 
 
-def require_safe_ignored_symlink_target(repository, role, target):
+def ignored_symlink_escape_reason(relative):
+    parts = relative.parts
+    if parts[:2] == (".d", "wamr-source"):
+        return "ignored WAMR source symlink escapes repository"
+    if parts[:2] == (".d", "wamr-native-runtime"):
+        if len(parts) > 2 and parts[2] == "llvm":
+            return "ignored LLVM runtime symlink escapes repository"
+        return "ignored native runtime symlink escapes repository"
+    if parts and parts[0] == ".d":
+        return "ignored private output symlink escapes repository"
+    if parts and parts[0] == ".zig-cache":
+        return "ignored Zig cache symlink escapes repository"
+    if parts[:3] == ("support", "apps", "wamr-aot"):
+        return "ignored WAMR output symlink escapes repository"
+    return "ignored source symlink escapes repository"
+
+
+def require_safe_ignored_symlink_target(repository, role, target, reason):
     role_root = repository.joinpath(*role.parts)
     try:
         target.relative_to(role_root)
@@ -417,9 +434,9 @@ def require_safe_ignored_symlink_target(repository, role, target):
         relative = target.relative_to(repository)
         encoded = relative.as_posix().encode("utf-8")
     except (UnicodeEncodeError, ValueError):
-        raise Refusal("ignored source symlink escapes repository") from None
+        raise Refusal(reason) from None
     require(target.is_file() and not target.is_symlink(),
-            "ignored source symlink escapes repository")
+            reason)
     try:
         tracked = bounded_git_raw(
             repository, SOURCE_IGNORED_MAX_PATH + 1,
@@ -429,9 +446,8 @@ def require_safe_ignored_symlink_target(repository, role, target):
             failure_reason="ignored source symlink target invalid",
         )
     except Refusal:
-        raise Refusal("ignored source symlink escapes repository") from None
-    require(tracked == encoded + b"\0",
-            "ignored source symlink escapes repository")
+        raise Refusal(reason) from None
+    require(tracked == encoded + b"\0", reason)
 
 
 def ignored_source_state(repository=REPO):
@@ -494,12 +510,13 @@ def ignored_source_state(repository=REPO):
                 raw = os.readlink(os.fsencode(path))
                 require(len(raw) == info.st_size,
                         "ignored source symlink changed")
+                reason = ignored_symlink_escape_reason(child_relative)
                 try:
                     target = path.resolve(strict=False)
                 except (OSError, RuntimeError, ValueError) as error:
-                    raise Refusal(
-                        "ignored source symlink escapes repository") from error
-                require_safe_ignored_symlink_target(repository, role, target)
+                    raise Refusal(reason) from error
+                require_safe_ignored_symlink_target(
+                    repository, role, target, reason)
                 add(child_relative, "symlink", info, os.fsdecode(raw))
             else:
                 raise Refusal("unsupported ignored source entry type")
