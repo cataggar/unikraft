@@ -34,6 +34,13 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def tool(name):
+    path = shutil.which(name)
+    if path is None:
+        raise ValueError(f"required tool unavailable: {name}")
+    return str(Path(path).resolve(strict=True))
+
+
 def run(args, cwd=ROOT, **kwargs):
     COMMANDS.append({"argv": [str(arg) for arg in args], "cwd": str(cwd)})
     return subprocess.run(args, cwd=cwd, check=True, **kwargs)
@@ -94,7 +101,7 @@ def source_identity(work):
     return hashlib.sha256(canonical).hexdigest()
 
 
-def workload_library(work, variant, coremark, env):
+def workload_library(work, variant, coremark, env, zig):
     consumer = ROOT / "build" / "workload-consumer"
     consumer.mkdir(exist_ok=False)
     for name in WORKLOAD_SOURCES:
@@ -122,7 +129,7 @@ def workload_library(work, variant, coremark, env):
         # Same tracked source and exact wasm compiler options as the SDK module.
         wasm = ARTIFACTS / "matched.wasm"
         aot = ARTIFACTS / "matched.cwasm"
-        run(["zig", "build-exe", str(work / "tests/unikraft-jit/fixture.zig"),
+        run([zig, "build-exe", str(work / "tests/unikraft-jit/fixture.zig"),
              "-target", "wasm32-freestanding", "-O", "ReleaseSmall",
              "-fno-entry", "-rdynamic", "--stack", "16384",
              "--initial-memory=131072", "--max-memory=524288",
@@ -133,15 +140,17 @@ def workload_library(work, variant, coremark, env):
         embedded = (f'pub const with_compiler = {str(variant == "jit").lower()};\n'
                     'pub const aot = @embedFile("matched.cwasm");\n')
     (consumer / "artifacts.zig").write_text(embedded)
-    run(["zig", "build", f"-Dvariant={variant}", f"-Dcoremark={str(coremark).lower()}", "-j2",
+    run([zig, "build", f"-Dvariant={variant}", f"-Dcoremark={str(coremark).lower()}", "-j2",
          "--prefix", str(consumer / "out")], consumer, env=env)
     if variant in ("jit", "sample-aot") and digest(consumer / "out/matched.wasm") != digest(ARTIFACTS / "matched.wasm"):
         raise ValueError("SDK's actual embedded sampler source differs from the comparator input")
     shutil.copyfile(consumer / "out/lib/libwamr-aot.a", ARTIFACTS / "libwamr-aot.a")
 
 
-def prepare(source, coremark, variant="tiny", development_revision=None, jit_mode=None):
-    if capture(["zig", "version"]) != "0.16.0":
+def prepare(source, coremark, variant="tiny", development_revision=None,
+            jit_mode=None, source_archive=None):
+    zig = tool("zig")
+    if capture([zig, "version"]) != "0.16.0":
         raise ValueError("Zig 0.16.0 is required")
     if coremark and variant != "tiny":
         raise ValueError("--coremark belongs to the unchanged tiny image only")
@@ -152,34 +161,42 @@ def prepare(source, coremark, variant="tiny", development_revision=None, jit_mod
     if revision is None:
         raise ValueError("optional images await a merged SDK pin; use an explicit "
                          "--development-revision only for local development")
-    if (len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision) or
-            capture(["git", "rev-parse", f"{revision}^{{commit}}"], source) != revision):
-        raise ValueError("pinned source commit unavailable")
+    if source_archive is None:
+        if (len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision) or
+                capture(["git", "rev-parse", f"{revision}^{{commit}}"], source) != revision):
+            raise ValueError("pinned source commit unavailable")
+    elif (source is not None or development_revision is not None or
+          revision != REVISION or not source_archive.is_absolute()):
+        raise ValueError("sealed source archive requires the fixed supported revision")
     ARTIFACTS.mkdir(parents=True, exist_ok=False)
     (ROOT / "build").chmod(0o700)
     ARTIFACTS.chmod(0o700)
     work = ROOT / "build" / "wamr-source"
     work.mkdir(exist_ok=False)
-    archive = ROOT / "build" / "wamr-source.tar"
-    with archive.open("wb") as stream:
-        run(["git", "archive", revision], source, stdout=stream)
+    archive = source_archive
+    created_archive = archive is None
+    if created_archive:
+        archive = ROOT / "build" / "wamr-source.tar"
+        with archive.open("wb") as stream:
+            run(["git", "archive", revision], source, stdout=stream)
     with tarfile.open(archive) as tar:
         tar.extractall(work, filter="data")
-    archive.unlink()
+    if created_archive:
+        archive.unlink()
     tree_sha256 = source_identity(work)
     # All compiler scratch/output stays under this application's build tree.
     scratch = ROOT / "build" / "scratch"
     scratch.mkdir(exist_ok=True)
     env = dict(os.environ, TMPDIR=str(scratch))
-    run(["zig", "build", "-Dprofile=unikraft-aot", "-Doptimize=ReleaseSafe",
+    run([zig, "build", "-Dprofile=unikraft-aot", "-Doptimize=ReleaseSafe",
          "--prefix", str(ROOT / "build" / "runtime"), "-j2"], work, env=env)
-    run(["zig", "build", "native-aot-fixture", "-Doptimize=ReleaseSafe",
+    run([zig, "build", "native-aot-fixture", "-Doptimize=ReleaseSafe",
          "--prefix", str(ROOT / "build" / "host"), "-j2"], work, env=env)
     shutil.copyfile(work / "include/wamr_aot.h", ARTIFACTS / "wamr_aot.h")
     shutil.copyfile(ROOT / "build/host/bin/wamrc", ARTIFACTS / "wamrc")
     (ARTIFACTS / "wamrc").chmod(0o700)
-    workload_library(work, variant, coremark, env)
-    run(["zig", "build-exe", str(ROOT / "fixture.zig"),
+    workload_library(work, variant, coremark, env, zig)
+    run([zig, "build-exe", str(ROOT / "fixture.zig"),
          "-target", "wasm32-freestanding", "-O", "ReleaseSmall",
          "-fno-entry", "-rdynamic", "--stack", "16384",
          "--initial-memory=131072", "--max-memory=524288",
@@ -251,6 +268,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("prepare", "verify"))
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--source-archive", type=Path)
     parser.add_argument("--coremark", action="store_true",
                         help="also embed both pinned CoreMarks and minimal WASI")
     parser.add_argument("--variant", choices=VARIANTS, default="tiny")
@@ -261,11 +279,16 @@ def main():
     args = parser.parse_args()
     if args.command == "verify":
         verify()
-    elif args.source is None:
-        parser.error("prepare requires --source pointing to a local WAMR checkout")
+    elif (args.source is None) == (args.source_archive is None):
+        parser.error("prepare requires exactly one of --source or --source-archive")
     else:
-        prepare(args.source.resolve(), args.coremark, args.variant,
-                args.development_revision, args.jit_mode)
+        prepare(
+            args.source.resolve() if args.source is not None else None,
+            args.coremark, args.variant, args.development_revision,
+            args.jit_mode,
+            args.source_archive.resolve(strict=True)
+            if args.source_archive is not None else None,
+        )
 
 
 if __name__ == "__main__":

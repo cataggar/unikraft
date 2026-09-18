@@ -59,8 +59,9 @@ def export(runtime, output):
     private(output.parent)
     root = runtime / "compute"
     records = result_records(root)
-    before = ci.producer_inputs(runtime)
-    ci.require(before == ci.document(root / "evidence/build-start.json"),
+    expected = ci.document(root / "evidence/build-start.json")
+    before = ci.producer_inputs(runtime, expected["consumer_inputs"])
+    ci.require(before == expected,
                "producer inputs changed")
     build = ci.check_build()
     ci.require(build == ci.document(root / "evidence/build.json"), "build changed")
@@ -69,21 +70,24 @@ def export(runtime, output):
              "local_boot_tool": root / "tools/bin/uk-hyperv-local-boot",
              "qemu": runtime / "bin/qemu-system-x86_64",
              "ovmf_code": runtime / "firmware/code.fd",
-             "ovmf_vars": runtime / "firmware/vars.fd"}
-    ci.require(inputs == {key: ci.digest(path) for key, path in tools.items()},
-               "boot tools changed")
+             "ovmf_vars": runtime / "firmware/vars.fd",
+             "efi": ci.APP / "build" / ci.EFI}
+    ci.boot_input_state(runtime, tools, expected=inputs)
     for i, mode in enumerate(ci.MODES):
-        checked = ci.check_boot(ci.config_for(runtime, root, i), build["runtime"])
+        checked = ci.check_boot(
+            ci.config_for(runtime, root, i), build["runtime"], inputs)
         ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
                    "physical local result changed")
     ci.require_build_custody(runtime, before)
     output.mkdir(mode=0o700)
     for name in ("private", "evidence", "artifacts", "boots"):
         (output / name).mkdir(mode=0o700)
+    input_records = ci.consumer_file_records(expected["consumer_inputs"])
+    input_records.update(ci.consumer_file_records(inputs))
     inspected = ci.document(ci.run(
         output, "handoff-inspect",
         [tools["package_tool"], "inspect", ci.APP / "build" / ci.EFI, root / "package"],
-        150, 64 * 1024))
+        150, 64 * 1024, input_records=input_records))
     packaged = ci.document(root / "evidence/package.json")
     ci.require(inspected["producer_sha256"] == packaged["producer_sha256"]
                and all(inspected["image"][key] == value
@@ -127,9 +131,10 @@ def export(runtime, output):
     evidence = [retain(root / "evidence" / name, output / "evidence" / name)
                 for name in sorted(records)]
     ci.require(result_records(root) == records and ci.check_build() == build
-               and ci.producer_inputs(runtime) == before
-               and inputs == {key: ci.digest(path) for key, path in tools.items()},
+               and ci.producer_inputs(
+                   runtime, expected["consumer_inputs"]) == before,
                "inputs changed during handoff")
+    ci.boot_input_state(runtime, tools, content=True, expected=inputs)
     by_name = dict(zip(NAMES, artifacts))
     bundle = {
         "schema": "uk.wamr.local-image-handoff", "version": 1,

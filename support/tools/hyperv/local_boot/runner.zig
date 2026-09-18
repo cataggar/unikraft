@@ -5,15 +5,16 @@ const files = @import("files.zig");
 const serial = @import("serial.zig");
 
 pub const Request = struct {
-    schema_version: u8 = 1,
+    schema_version: u8 = 2,
     supervisor_pid: u32,
     config: c.Config,
     pins: [4]files.Pin,
 
     pub fn validate(self: Request) !void {
-        if (self.schema_version != 1 or self.supervisor_pid < 1) return error.InvalidRequest;
+        if (self.schema_version != 2 or self.supervisor_pid < 1) return error.InvalidRequest;
         try self.config.validate();
         for (self.pins, 0..) |pin, i| {
+            try pin.validate();
             const maximum: u64 = if (i == 0)
                 self.config.source.maximumPhysicalSize()
             else if (i == 1)
@@ -22,7 +23,8 @@ pub const Request = struct {
                 c.max_vars
             else
                 c.max_qemu;
-            if (pin.size == 0 or pin.size > maximum) return error.InvalidRequest;
+            if (pin.size == 0 or pin.size > maximum or
+                (i == 3 and (pin.mode & 0o111 == 0 or pin.mode & 0o6000 != 0))) return error.InvalidRequest;
         }
     }
 };

@@ -6,6 +6,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -17,8 +18,10 @@ import selectors
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import time
+import sysconfig
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
@@ -69,6 +72,12 @@ SOURCE_OUTPUT_PREEXISTING_DESCENDANT_ROLES = (".d",)
 HOST_TOOLS = ("zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
               "llvm-readelf", "llvm-strip", "bison", "flex",
               "python3", "git", "bash", "m4", "timeout", "head")
+SUBPROCESS_TERM_GRACE = 1.0
+SUBPROCESS_KILL_GRACE = 1.0
+SUBPROCESS_DRAIN_GRACE = 1.0
+INPUT_TREE_MAX_ENTRIES = 100_000
+INPUT_TREE_MAX_BYTES = 2 * 1024 * MIB
+COMMAND_ENVIRONMENT = {}
 ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 COMMAND_ERROR_MARKERS = (
     "AccessDenied", "BrokenPipe", "FileNotFound", "FileTooBig", "InputOutput",
@@ -114,21 +123,50 @@ def snapshot(info):
         "st_size", "st_mtime_ns", "st_ctime_ns"))
 
 
+def open_flags(directory=False):
+    flags = os.O_RDONLY
+    if directory:
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
 def bind(hasher, value):
     raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
     hasher.update(len(raw).to_bytes(8, "big"))
     hasher.update(raw)
 
 
+def read_descriptor(handle, expected, limit, reason):
+    require(stat.S_ISREG(expected.st_mode) and not expected.st_mode & 0o022
+            and expected.st_size <= limit, reason)
+    require(snapshot(os.fstat(handle)) == snapshot(expected), reason)
+    data = bytearray()
+    while len(data) <= limit:
+        chunk = os.read(handle, min(65536, limit + 1 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    require(len(data) == expected.st_size
+            and snapshot(os.fstat(handle)) == snapshot(expected), reason)
+    return bytes(data)
+
+
 def read(path, limit):
-    info = path.lstat()
-    require(stat.S_ISREG(info.st_mode) and not info.st_mode & 0o022
-            and info.st_size <= limit, "unsafe or oversized file")
-    with path.open("rb") as stream:
-        require(snapshot(os.fstat(stream.fileno())) == snapshot(info), "file replaced")
-        data = stream.read(limit + 1)
-    require(len(data) == info.st_size and snapshot(path.lstat()) == snapshot(info),
-            "file changed")
+    path = Path(path)
+    try:
+        info = path.lstat()
+        handle = os.open(path, open_flags())
+    except OSError as error:
+        raise Refusal("unsafe or oversized file") from error
+    try:
+        data = read_descriptor(handle, info, limit, "unsafe or oversized file")
+    finally:
+        os.close(handle)
+    require(snapshot(path.lstat()) == snapshot(info), "file changed")
     return data
 
 
@@ -136,23 +174,37 @@ def document(path):
     return json.loads(read(path, 64 * 1024), object_pairs_hook=unique)
 
 
-def digest(path, limit=256 * MIB + 512):
-    info = path.lstat()
-    require(stat.S_ISREG(info.st_mode) and not info.st_mode & 0o022
-            and 0 < info.st_size <= limit, "unsafe hash input")
+def digest_descriptor(handle, expected, limit, reason, allow_empty=False):
+    require(stat.S_ISREG(expected.st_mode) and not expected.st_mode & 0o022
+            and (allow_empty or expected.st_size > 0)
+            and expected.st_size <= limit, reason)
+    require(snapshot(os.fstat(handle)) == snapshot(expected), reason)
     value = hashlib.sha256()
-    with path.open("rb") as stream:
-        require(snapshot(os.fstat(stream.fileno())) == snapshot(info), "hash input replaced")
-        remaining = info.st_size
-        while remaining:
-            chunk = stream.read(min(remaining, 65536))
-            require(chunk, "hash input truncated")
-            value.update(chunk)
-            remaining -= len(chunk)
-        require(not stream.read(1), "hash input grew")
+    position = 0
+    while position < expected.st_size:
+        chunk = os.pread(handle, min(65536, expected.st_size - position), position)
+        require(chunk, reason)
+        value.update(chunk)
+        position += len(chunk)
+    require(not os.pread(handle, 1, position)
+            and snapshot(os.fstat(handle)) == snapshot(expected), reason)
+    return value.hexdigest()
+
+
+def digest(path, limit=256 * MIB + 512):
+    path = Path(path)
+    try:
+        info = path.lstat()
+        handle = os.open(path, open_flags())
+    except OSError as error:
+        raise Refusal("unsafe hash input") from error
+    try:
+        value = digest_descriptor(handle, info, limit, "unsafe hash input")
+    finally:
+        os.close(handle)
     # Reading may update atime; it is not a content/identity mutation.
     require(snapshot(path.lstat()) == snapshot(info), "hash input changed")
-    return value.hexdigest()
+    return value
 
 
 def save(path, value):
@@ -175,13 +227,26 @@ def signal_process_group(process, process_signal):
         pass
 
 
+def close_selector_stream(selector, stream):
+    try:
+        selector.unregister(stream)
+    except (KeyError, ValueError):
+        pass
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
 def bounded_subprocess_output(args, cwd, limit, seconds, overflow_reason,
-                              timeout_reason, failure_reason):
+                              timeout_reason, failure_reason, env=None,
+                              pass_fds=()):
     require(type(limit) is int and limit >= 0 and seconds > 0, failure_reason)
     try:
         process = subprocess.Popen(
             list(map(str, args)), cwd=cwd, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, start_new_session=True,
+            stderr=subprocess.STDOUT, start_new_session=True, env=env,
+            pass_fds=tuple(pass_fds),
         )
     except (OSError, ValueError) as error:
         raise Refusal(failure_reason) from error
@@ -193,23 +258,40 @@ def bounded_subprocess_output(args, cwd, limit, seconds, overflow_reason,
     timed_out = False
     stopping = False
     killed = False
-    stop_deadline = None
+    drain_incomplete = False
+    term_deadline = None
+    kill_deadline = None
+    drain_deadline = None
+    exit_drain_deadline = None
     deadline = time.monotonic() + seconds
     try:
         os.set_blocking(stream.fileno(), False)
         selector.register(stream, selectors.EVENT_READ)
         while selector.get_map():
             now = time.monotonic()
+            if process.poll() is not None and exit_drain_deadline is None:
+                exit_drain_deadline = now + SUBPROCESS_DRAIN_GRACE
             if not stopping and now >= deadline:
                 timed_out = True
                 stopping = True
-                stop_deadline = now + 5
+                term_deadline = now + SUBPROCESS_TERM_GRACE
+                kill_deadline = term_deadline + SUBPROCESS_KILL_GRACE
+                drain_deadline = kill_deadline + SUBPROCESS_DRAIN_GRACE
                 signal_process_group(process, signal.SIGTERM)
-            if stopping and not killed and now >= stop_deadline:
+            if stopping and not killed and now >= term_deadline:
                 signal_process_group(process, signal.SIGKILL)
                 killed = True
-            wake = deadline if not stopping else stop_deadline
-            wait = max(0, min(0.1, wake - now)) if not killed else 0.1
+            pipe_deadline = drain_deadline if stopping else exit_drain_deadline
+            if pipe_deadline is not None and now >= pipe_deadline:
+                drain_incomplete = True
+                close_selector_stream(selector, stream)
+                break
+            wake = deadline
+            if stopping:
+                wake = term_deadline if not killed else drain_deadline
+            if exit_drain_deadline is not None:
+                wake = min(wake, exit_drain_deadline)
+            wait = max(0, min(0.1, wake - now))
             for key, _ in selector.select(wait):
                 try:
                     chunk = os.read(key.fd, 65536)
@@ -225,49 +307,634 @@ def bounded_subprocess_output(args, cwd, limit, seconds, overflow_reason,
                 if len(collected) > limit:
                     exceeded = True
                     stopping = True
-                    stop_deadline = time.monotonic() + 5
+                    now = time.monotonic()
+                    term_deadline = now + SUBPROCESS_TERM_GRACE
+                    kill_deadline = term_deadline + SUBPROCESS_KILL_GRACE
+                    drain_deadline = kill_deadline + SUBPROCESS_DRAIN_GRACE
                     signal_process_group(process, signal.SIGTERM)
         if process.poll() is None:
             try:
-                process.wait(timeout=5)
+                process.wait(timeout=SUBPROCESS_TERM_GRACE)
             except subprocess.TimeoutExpired:
                 signal_process_group(process, signal.SIGKILL)
-                process.wait(timeout=5)
+                process.kill()
+                process.wait(timeout=SUBPROCESS_KILL_GRACE)
         else:
             process.wait()
     except (OSError, subprocess.SubprocessError) as error:
         raise Refusal(failure_reason) from error
     finally:
         selector.close()
-        stream.close()
+        if not stream.closed:
+            stream.close()
         if process.poll() is None:
             try:
                 signal_process_group(process, signal.SIGTERM)
-                process.wait(timeout=5)
+                process.wait(timeout=SUBPROCESS_TERM_GRACE)
             except (OSError, subprocess.SubprocessError):
                 signal_process_group(process, signal.SIGKILL)
-                process.wait()
+                process.kill()
+                try:
+                    process.wait(timeout=SUBPROCESS_KILL_GRACE)
+                except subprocess.TimeoutExpired as error:
+                    raise Refusal(failure_reason) from error
     require(not exceeded, overflow_reason)
     require(not timed_out, timeout_reason)
+    require(not drain_incomplete, failure_reason)
     require(process.returncode == 0, failure_reason)
     return bytes(collected)
+
+
+def git_environment():
+    return {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PAGER": "cat",
+        "PATH": "/usr/bin:/bin",
+    }
+
+
+def git_command(*args):
+    return [
+        tool("git"), "--no-pager",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "credential.helper=",
+        "-c", "core.pager=cat",
+        *args,
+    ]
+
+
+def command_environment(root, input_records=None, extra=None):
+    path_entries = ["/usr/bin", "/bin"]
+    for path in (() if input_records is None else input_records):
+        parent = str(Path(path).parent)
+        if parent not in path_entries:
+            path_entries.append(parent)
+    environment = {
+        "HOME": str(Path(root) / "private"),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": os.pathsep.join(path_entries),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": str(Path(root) / "private"),
+        **COMMAND_ENVIRONMENT,
+    }
+    if extra is not None:
+        environment.update(extra)
+    return environment
 
 
 def bounded_git_raw(repository, limit, *args, overflow_reason, timeout_reason,
                     failure_reason):
     return bounded_subprocess_output(
-        ["git", *args], repository, limit, 60, overflow_reason,
-        timeout_reason, failure_reason,
+        git_command(*args), repository, limit, 60, overflow_reason,
+        timeout_reason, failure_reason, env=git_environment(),
     )
 
 
 def git(*args, repository=REPO):
-    return subprocess.check_output(
-        ["git", *args], cwd=repository, timeout=60).decode().strip()
+    return bounded_git_raw(
+        repository, 64 * 1024, *args,
+        overflow_reason="Git output too large",
+        timeout_reason="Git command timed out",
+        failure_reason="Git command failed",
+    ).decode().strip()
 
 
 def git_raw(repository, *args):
-    return subprocess.check_output(["git", *args], cwd=repository, timeout=60)
+    return bounded_git_raw(
+        repository, 16 * MIB, *args,
+        overflow_reason="Git output too large",
+        timeout_reason="Git command timed out",
+        failure_reason="Git command failed",
+    )
+
+
+@contextlib.contextmanager
+def retained_absolute(path, directory=False, reason="unsafe input path"):
+    path = Path(path)
+    require(path.is_absolute() and path.parts[0] == "/", reason)
+    handles = []
+    directories = []
+    try:
+        current = os.open("/", open_flags(directory=True))
+        handles.append(current)
+        directories.append(("/", current, snapshot(os.fstat(current))))
+        built = Path("/")
+        for index, part in enumerate(path.parts[1:]):
+            final = index == len(path.parts[1:]) - 1
+            handle = os.open(
+                part, open_flags(directory=directory if final else True),
+                dir_fd=current,
+            )
+            handles.append(handle)
+            built /= part
+            if not final or directory:
+                info = os.fstat(handle)
+                require(stat.S_ISDIR(info.st_mode), reason)
+                directories.append((str(built), handle, snapshot(info)))
+            current = handle
+        yield current, directories, handles[-2] if len(handles) > 1 else None
+    except OSError as error:
+        raise Refusal(reason) from error
+    finally:
+        for handle in reversed(handles):
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+
+
+def stable_directories(directories, reason):
+    result = {}
+    for path, handle, expected in directories:
+        require(snapshot(os.fstat(handle)) == expected, reason)
+        result[path] = list(expected)
+    return result
+
+
+def physical_file_record(path, maximum=512 * MIB, content=True,
+                         expected_sha256=None):
+    path = Path(path)
+    with retained_absolute(path, reason="unsafe physical input") as (
+            handle, directories, parent):
+        info = os.fstat(handle)
+        require(
+            stat.S_ISREG(info.st_mode) and info.st_uid in (0, os.getuid())
+            and info.st_nlink > 0 and not info.st_mode & 0o022
+            and 0 < info.st_size <= maximum
+            and (info.st_uid == 0 or info.st_nlink == 1),
+            "unsafe physical input",
+        )
+        identity = snapshot(info)
+        sha256 = (
+            digest_descriptor(handle, info, maximum, "physical input changed")
+            if content else expected_sha256
+        )
+        require(isinstance(sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", sha256),
+                "invalid physical input identity")
+        if parent is not None:
+            try:
+                named = os.open(path.name, open_flags(), dir_fd=parent)
+            except OSError as error:
+                raise Refusal("physical input replaced") from error
+            try:
+                require(snapshot(os.fstat(named)) == identity,
+                        "physical input replaced")
+            finally:
+                os.close(named)
+        directory_records = stable_directories(
+            directories, "physical input directory changed")
+        require(snapshot(os.fstat(handle)) == identity,
+                "physical input changed")
+    return {
+        "path": str(path),
+        "metadata": list(identity),
+        "sha256": sha256,
+    }, directory_records
+
+
+def bind_tree_file(content_hash, physical_hash, relative, handle, info,
+                   hash_content, expected_sha256=None):
+    sha256 = (
+        expected_sha256 if expected_sha256 is not None else
+        digest_descriptor(
+            handle, info, INPUT_TREE_MAX_BYTES, "physical input tree changed",
+            allow_empty=True)
+        if hash_content else "0" * 64
+    )
+    require(isinstance(sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", sha256),
+            "invalid physical input tree identity")
+    bind(content_hash, ["file", relative, info.st_size, sha256])
+    bind(physical_hash, ["file", relative, snapshot(info)])
+    return sha256
+
+
+def physical_tree_record(root, content=True, expected_content_sha256=None):
+    root = Path(root)
+    content_hash = hashlib.sha256(b"uk.wamr.consumer-input-tree-content-v2\0")
+    physical_hash = hashlib.sha256(b"uk.wamr.consumer-input-tree-physical-v2\0")
+    files = 0
+    directories_count = 0
+    symlinks = 0
+    total = 0
+    hash_work = 0
+    content_identities = {}
+    require(content or (
+        isinstance(expected_content_sha256, str)
+        and re.fullmatch(r"[0-9a-f]{64}", expected_content_sha256)
+    ), "invalid physical input tree identity")
+
+    with retained_absolute(root, directory=True,
+                           reason="unsafe physical input tree") as (
+            root_handle, components, unused_parent):
+        del unused_parent
+
+        def collect(directory_handle, prefix, depth):
+            nonlocal files, directories_count, symlinks, total, hash_work
+            require(depth <= SOURCE_IGNORED_MAX_DEPTH,
+                    "physical input tree depth exceeded")
+            before = os.fstat(directory_handle)
+            require(
+                stat.S_ISDIR(before.st_mode)
+                and before.st_uid in (0, os.getuid())
+                and not before.st_mode & 0o022,
+                "unsafe physical input tree",
+            )
+            directories_count += 1
+            require(files + directories_count + symlinks
+                    <= INPUT_TREE_MAX_ENTRIES,
+                    "physical input tree entry limit exceeded")
+            bind(physical_hash, ["directory", prefix, snapshot(before)])
+            try:
+                entries = []
+                with os.scandir(directory_handle) as iterator:
+                    for entry in iterator:
+                        entries.append(entry)
+                        require(
+                            files + directories_count + symlinks
+                            + len(entries) <= INPUT_TREE_MAX_ENTRIES,
+                            "physical input tree entry limit exceeded",
+                        )
+                entries.sort(key=lambda entry: entry.name)
+            except OSError as error:
+                raise Refusal("physical input tree enumeration failed") from error
+            for entry in entries:
+                name = entry.name
+                require(name not in ("", ".", "..") and "/" not in name
+                        and "\0" not in name,
+                        "unsafe physical input tree path")
+                relative = name if not prefix else prefix + "/" + name
+                require(len(relative.encode("utf-8")) <= SOURCE_IGNORED_MAX_PATH,
+                        "physical input tree path too long")
+                try:
+                    info = os.stat(
+                        name, dir_fd=directory_handle, follow_symlinks=False)
+                except OSError as error:
+                    raise Refusal("physical input tree changed") from error
+                if stat.S_ISDIR(info.st_mode):
+                    try:
+                        child = os.open(
+                            name, open_flags(directory=True),
+                            dir_fd=directory_handle)
+                    except OSError as error:
+                        raise Refusal("physical input tree changed") from error
+                    try:
+                        require(snapshot(os.fstat(child)) == snapshot(info),
+                                "physical input tree changed")
+                        collect(child, relative, depth + 1)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(info.st_mode):
+                    require(
+                        info.st_uid in (0, os.getuid())
+                        and info.st_nlink > 0 and not info.st_mode & 0o022
+                        and info.st_size <= 512 * MIB
+                        and (info.st_uid == 0 or info.st_nlink == 1),
+                        "unsafe physical input tree entry",
+                    )
+                    total += info.st_size
+                    files += 1
+                    require(total <= INPUT_TREE_MAX_BYTES
+                            and files + directories_count + symlinks
+                            <= INPUT_TREE_MAX_ENTRIES,
+                            "physical input tree limit exceeded")
+                    try:
+                        handle = os.open(
+                            name, open_flags(), dir_fd=directory_handle)
+                    except OSError as error:
+                        raise Refusal("physical input tree changed") from error
+                    try:
+                        require(snapshot(os.fstat(handle)) == snapshot(info),
+                                "physical input tree changed")
+                        identity = snapshot(info)
+                        known_sha256 = content_identities.get(identity)
+                        if content and known_sha256 is None:
+                            require(
+                                hash_work + info.st_size
+                                <= INPUT_TREE_MAX_BYTES,
+                                "physical input tree hash limit exceeded",
+                            )
+                            hash_work += info.st_size
+                        sha256 = bind_tree_file(
+                            content_hash, physical_hash, relative, handle, info,
+                            content, known_sha256)
+                        if content:
+                            content_identities[identity] = sha256
+                    finally:
+                        os.close(handle)
+                elif stat.S_ISLNK(info.st_mode):
+                    require(info.st_uid in (0, os.getuid())
+                            and 0 < info.st_size < 4096,
+                            "unsafe physical input tree symlink")
+                    try:
+                        target = os.readlink(name, dir_fd=directory_handle)
+                        resolved = (root / relative).resolve(strict=True)
+                    except (OSError, RuntimeError) as error:
+                        raise Refusal("unsafe physical input tree symlink") from error
+                    with retained_absolute(
+                            resolved, reason="unsafe physical input tree symlink") as (
+                                target_handle, target_directories, target_parent):
+                        target_info = os.fstat(target_handle)
+                        require(
+                            stat.S_ISREG(target_info.st_mode)
+                            and target_info.st_uid in (0, os.getuid())
+                            and target_info.st_nlink > 0
+                            and not target_info.st_mode & 0o022
+                            and target_info.st_size <= 512 * MIB
+                            and (target_info.st_uid == 0
+                                 or target_info.st_nlink == 1),
+                            "unsafe physical input tree symlink",
+                        )
+                        target_identity = snapshot(target_info)
+                        target_sha256 = content_identities.get(target_identity)
+                        if content and target_sha256 is None:
+                            require(
+                                hash_work + target_info.st_size
+                                <= INPUT_TREE_MAX_BYTES,
+                                "physical input tree hash limit exceeded",
+                            )
+                            hash_work += target_info.st_size
+                            target_sha256 = digest_descriptor(
+                                target_handle, target_info,
+                                INPUT_TREE_MAX_BYTES,
+                                "physical input tree changed",
+                                allow_empty=True,
+                            )
+                            content_identities[target_identity] = target_sha256
+                        elif not content:
+                            target_sha256 = "0" * 64
+                        require(target_sha256 is not None,
+                                "invalid physical input tree identity")
+                        if target_parent is not None:
+                            try:
+                                named_target = os.open(
+                                    resolved.name, open_flags(),
+                                    dir_fd=target_parent)
+                            except OSError as error:
+                                raise Refusal(
+                                    "physical input tree changed") from error
+                            try:
+                                require(
+                                    snapshot(os.fstat(named_target))
+                                    == target_identity,
+                                    "physical input tree changed",
+                                )
+                            finally:
+                                os.close(named_target)
+                        target_components = stable_directories(
+                            target_directories,
+                            "physical input tree path changed",
+                        )
+                        require(
+                            snapshot(os.fstat(target_handle))
+                            == target_identity,
+                            "physical input tree changed",
+                        )
+                    symlinks += 1
+                    total += len(os.fsencode(target))
+                    require(total <= INPUT_TREE_MAX_BYTES
+                            and files + directories_count + symlinks
+                            <= INPUT_TREE_MAX_ENTRIES,
+                            "physical input tree limit exceeded")
+                    bind(content_hash, [
+                        "symlink", relative, target, target_sha256,
+                    ])
+                    bind(physical_hash, [
+                        "symlink", relative, target, snapshot(info),
+                        list(target_identity), target_components,
+                    ])
+                else:
+                    raise Refusal("unsupported physical input tree entry")
+            require(snapshot(os.fstat(directory_handle)) == snapshot(before),
+                    "physical input tree directory changed")
+
+        collect(root_handle, "", 0)
+        component_records = stable_directories(
+            components, "physical input tree path changed")
+    record = {
+        "path": str(root),
+        "files": files,
+        "directories": directories_count,
+        "symlinks": symlinks,
+        "bytes": total,
+        "content_sha256": (
+            content_hash.hexdigest() if content else expected_content_sha256),
+        "physical_sha256": physical_hash.hexdigest(),
+    }
+    return record, component_records
+
+
+def elf_interpreter(path):
+    try:
+        with retained_absolute(path, reason="unsafe executable input") as (
+                handle, directories, parent):
+            del directories, parent
+            header = os.pread(handle, 64, 0)
+            if len(header) < 52 or header[:4] != b"\x7fELF":
+                return None
+            if header[5] != 1:
+                raise Refusal("unsupported executable byte order")
+            if header[4] == 2:
+                program_offset = struct.unpack_from("<Q", header, 32)[0]
+                entry_size = struct.unpack_from("<H", header, 54)[0]
+                entry_count = struct.unpack_from("<H", header, 56)[0]
+                offset_index, size_index = 8, 32
+                offset_format, size_format = "<Q", "<Q"
+            elif header[4] == 1:
+                program_offset = struct.unpack_from("<I", header, 28)[0]
+                entry_size = struct.unpack_from("<H", header, 42)[0]
+                entry_count = struct.unpack_from("<H", header, 44)[0]
+                offset_index, size_index = 4, 16
+                offset_format, size_format = "<I", "<I"
+            else:
+                raise Refusal("unsupported executable class")
+            require(0 < entry_size <= 256 and entry_count <= 256,
+                    "invalid executable program headers")
+            for index in range(entry_count):
+                entry = os.pread(
+                    handle, entry_size, program_offset + index * entry_size)
+                require(len(entry) == entry_size,
+                        "invalid executable program headers")
+                if struct.unpack_from("<I", entry, 0)[0] != 3:
+                    continue
+                offset = struct.unpack_from(offset_format, entry, offset_index)[0]
+                size = struct.unpack_from(size_format, entry, size_index)[0]
+                require(1 < size <= 4096, "invalid executable interpreter")
+                raw = os.pread(handle, size, offset)
+                require(len(raw) == size and raw.endswith(b"\0"),
+                        "invalid executable interpreter")
+                value = os.fsdecode(raw[:-1])
+                interpreter = Path(value)
+                require(interpreter.is_absolute(), "invalid executable interpreter")
+                return interpreter.resolve(strict=True)
+            return None
+    except OSError as error:
+        raise Refusal("invalid executable input") from error
+
+
+def executable_runtime_paths(path):
+    interpreter = elf_interpreter(path)
+    if interpreter is None:
+        return set()
+    with retained_absolute(path, reason="unsafe executable input") as (
+            executable, executable_directories, executable_parent), \
+            retained_absolute(interpreter, reason="unsafe executable runtime") as (
+                loader, loader_directories, loader_parent):
+        del executable_directories, executable_parent
+        del loader_directories, loader_parent
+        output = bounded_subprocess_output(
+            [f"/proc/self/fd/{loader}", "--list",
+             f"/proc/self/fd/{executable}"],
+            "/", MIB, 30,
+            "executable runtime inventory too large",
+            "executable runtime inventory timed out",
+            "executable runtime inventory failed",
+            env={"LC_ALL": "C"}, pass_fds=(loader, executable),
+        )
+        result = {interpreter}
+        descriptor_paths = {
+            f"/proc/self/fd/{loader}", f"/proc/self/fd/{executable}",
+        }
+        for raw in output.splitlines():
+            match = re.search(rb"=> (/[^\s]+) \(", raw)
+            if match is None:
+                match = re.match(rb"\s*(/[^\s]+) \(", raw)
+            if match is not None:
+                value = os.fsdecode(match.group(1))
+                if value in descriptor_paths:
+                    continue
+                try:
+                    result.add(Path(value).resolve(strict=True))
+                except (OSError, RuntimeError) as error:
+                    raise Refusal(
+                        "invalid executable runtime inventory") from error
+    return result
+
+
+def merge_directory_records(target, values):
+    for path, metadata in values.items():
+        require(path not in target or target[path] == metadata,
+                "physical input directory identity changed")
+        target[path] = metadata
+
+
+def record_digest(value):
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def record_input_paths(file_paths, tree_paths, content=True, expected=None):
+    files = {}
+    trees = {}
+    directories = {}
+    if expected is not None:
+        require(
+            isinstance(expected, dict)
+            and expected.get("schema") == "uk.wamr.consumer-input-custody"
+            and expected.get("version") == 2
+            and isinstance(expected.get("files"), dict)
+            and isinstance(expected.get("trees"), dict)
+            and isinstance(expected.get("directories"), dict),
+            "invalid consumer input custody",
+        )
+        file_paths = {
+            name: Path(record["path"])
+            for name, record in expected["files"].items()
+        }
+        tree_paths = {
+            name: Path(record["path"])
+            for name, record in expected["trees"].items()
+        }
+    for name, path in sorted(file_paths.items()):
+        prior = None if expected is None else expected["files"][name]
+        record, components = physical_file_record(
+            path, content=content,
+            expected_sha256=None if prior is None else prior["sha256"])
+        files[name] = record
+        merge_directory_records(directories, components)
+    for name, path in sorted(tree_paths.items()):
+        prior = None if expected is None else expected["trees"][name]
+        record, components = physical_tree_record(
+            path, content=content,
+            expected_content_sha256=(
+                None if prior is None else prior["content_sha256"]))
+        trees[name] = record
+        merge_directory_records(directories, components)
+    result = {
+        "schema": "uk.wamr.consumer-input-custody",
+        "version": 2,
+        "files": files,
+        "trees": trees,
+        "directories": directories,
+    }
+    result["aggregate_sha256"] = record_digest(result)
+    if expected is not None:
+        require(result == expected, "consumer input custody changed")
+    return result
+
+
+def consumer_input_state(runtime, content=True, expected=None):
+    runtime = Path(runtime)
+    if expected is not None:
+        return record_input_paths({}, {}, content=content, expected=expected)
+    tool_paths = {name: Path(tool(name)) for name in HOST_TOOLS}
+    runtime_paths = set()
+    for path in tool_paths.values():
+        runtime_paths.update(executable_runtime_paths(path))
+    file_paths = {
+        **{f"tool:{name}": path for name, path in tool_paths.items()},
+        **{f"runtime:{path}": path for path in sorted(runtime_paths)},
+    }
+    tree_paths = {
+        "bison": runtime / "bison",
+        "python-stdlib": Path(sysconfig.get_paths()["stdlib"]).resolve(strict=True),
+        "system-bin": Path("/usr/bin").resolve(strict=True),
+        "zig": tool_paths["zig"].parent,
+    }
+    llvm = runtime / "llvm"
+    if llvm.is_dir() and not llvm.is_symlink():
+        tree_paths["llvm"] = llvm
+    archive = runtime / "compute/custody/wamr-source.tar"
+    if archive.is_file() and not archive.is_symlink():
+        file_paths["wamr-source-archive"] = archive
+    return record_input_paths(file_paths, tree_paths, content=content)
+
+
+def boot_input_state(runtime, paths, content=True, expected=None):
+    if expected is not None:
+        return record_input_paths({}, {}, content=content, expected=expected)
+    file_paths = dict(paths)
+    runtime_paths = set()
+    for path in paths.values():
+        if os.access(path, os.X_OK):
+            runtime_paths.update(executable_runtime_paths(path))
+    file_paths.update({
+        f"runtime:{path}": path for path in sorted(runtime_paths)
+    })
+    tree_paths = {}
+    qemu_data = Path(runtime) / "bin/share"
+    if qemu_data.is_dir() and not qemu_data.is_symlink():
+        tree_paths["qemu-data"] = qemu_data
+    return record_input_paths(file_paths, tree_paths, content=content)
+
+
+def consumer_file_records(value):
+    require(value.get("schema") == "uk.wamr.consumer-input-custody"
+            and value.get("version") == 2,
+            "invalid consumer input custody")
+    return {
+        record["path"]: record for record in value["files"].values()
+    }
 
 
 def normalized_repository_relative(value, reason, trailing_slash=False):
@@ -819,13 +1486,15 @@ def source_identity(value):
     return {"revision": value["revision"], "tree": value["tree"]}
 
 
-def producer_inputs(runtime):
+def producer_inputs(runtime, expected_consumer=None, content=True):
     current_source = source()
     return {"source": source_identity(current_source),
             "source_custody": current_source["custody"],
             "tools": {name: digest(Path(tool(name))) for name in HOST_TOOLS},
             "bison_data": bison_inputs(runtime / "bison"),
-            "dependencies": dependency_custody(runtime / "compute")}
+            "dependencies": dependency_custody(runtime / "compute"),
+            "consumer_inputs": consumer_input_state(
+                runtime, content=content, expected=expected_consumer)}
 
 
 def bison_inputs(root):
@@ -859,17 +1528,71 @@ def command_error_markers(raw):
     return [name for name in COMMAND_ERROR_MARKERS if name.encode("ascii") in observed]
 
 
-def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO, evidence=True):
+@contextlib.contextmanager
+def retained_executables(paths, records):
+    opened = {}
+    try:
+        for path in paths:
+            path = str(Path(path))
+            if path in opened:
+                continue
+            require(path in records, "unbound executable input")
+            record = records[path]
+            handle = os.open(path, open_flags())
+            info = os.fstat(handle)
+            require(
+                list(snapshot(info)) == record["metadata"]
+                and stat.S_ISREG(info.st_mode)
+                and bool(info.st_mode & 0o111),
+                "executable input changed",
+            )
+            opened[path] = handle
+        yield {
+            path: f"/proc/self/fd/{handle}"
+            for path, handle in opened.items()
+        }, tuple(opened.values())
+    except OSError as error:
+        raise Refusal("executable input changed") from error
+    finally:
+        for handle in reversed(tuple(opened.values())):
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+
+
+def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
+            evidence=True, input_records=None):
     """Fixed timeout/head ceiling; raw output stays private, never in Actions stdout."""
     output = root / "private" / (stage + ".log")
-    with output.open("xb") as stream:
-        result = subprocess.run([
-            tool("timeout"), "--signal=TERM", "--kill-after=5s", str(seconds),
-            tool("bash"), "--noprofile", "--norc", "-o", "pipefail", "-c",
-            '"$@" 2>&1 | head -c "$WAMR_CI_CAPTURE_LIMIT"', "_",
-            *map(str, args),
-        ], cwd=cwd, stdout=stream, stderr=subprocess.STDOUT,
-            env=dict(os.environ, WAMR_CI_CAPTURE_LIMIT=str(limit + 1)), check=False)
+    timeout = tool("timeout")
+    shell = tool("bash")
+    head = tool("head")
+    executable = str(Path(args[0]))
+    context = (
+        retained_executables(
+            (timeout, shell, head, executable), input_records)
+        if input_records is not None
+        else contextlib.nullcontext(({}, ()))
+    )
+    with context as (retained, pass_fds), output.open("xb") as stream:
+        environment = command_environment(root, input_records, {
+            "WAMR_CI_CAPTURE_LIMIT": str(limit + 1),
+            "WAMR_CI_HEAD": retained.get(head, head),
+        })
+        command = [
+            retained.get(timeout, timeout),
+            "--signal=TERM", "--kill-after=5s", str(seconds),
+            retained.get(shell, shell),
+            "--noprofile", "--norc", "-o", "pipefail", "-c",
+            '"$@" 2>&1 | "$WAMR_CI_HEAD" -c "$WAMR_CI_CAPTURE_LIMIT"',
+            "_", retained.get(executable, executable), *map(str, args[1:]),
+        ]
+        result = subprocess.run(
+            command, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT,
+            env=environment,
+            pass_fds=pass_fds, check=False,
+        )
     size = output.stat().st_size
     markers = (command_error_markers(read(output, limit + 1))
                if size <= limit + 1 else None)
@@ -886,8 +1609,9 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO, evidence=Tr
     return output, record
 
 
-def run(root, stage, args, seconds=600, limit=8 * MIB):
-    output, _ = execute(root, stage, args, seconds, limit)
+def run(root, stage, args, seconds=600, limit=8 * MIB, input_records=None):
+    output, _ = execute(
+        root, stage, args, seconds, limit, input_records=input_records)
     return output
 
 
@@ -991,23 +1715,148 @@ def validate_restore_manifest(raw):
             "package_hash": MIZ_PACKAGE_HASH}
 
 
+def git_directory_output(repository, limit, *args):
+    repository = Path(repository)
+    git_path = Path(tool("git"))
+    try:
+        with retained_absolute(
+                repository, directory=True,
+                reason="pinned source repository unavailable") as (
+                    repository_handle, repository_directories, repository_parent), \
+                retained_absolute(
+                    git_path, reason="required Git executable unavailable") as (
+                        git_handle, git_directories, git_parent):
+            del repository_parent, git_parent
+            result = bounded_subprocess_output(
+                [f"/proc/self/fd/{git_handle}", "--no-pager",
+                 "-c", "core.hooksPath=/dev/null",
+                 "-c", "credential.helper=",
+                 "-c", "core.pager=cat", *args],
+                f"/proc/self/fd/{repository_handle}", limit, 60,
+                "Git output too large", "Git command timed out",
+                "Git command failed", env=git_environment(),
+                pass_fds=(git_handle, repository_handle),
+            )
+            stable_directories(
+                repository_directories,
+                "pinned source repository changed")
+            stable_directories(
+                git_directories, "required Git executable changed")
+            return result
+    except Refusal:
+        raise
+    except (OSError, RuntimeError, ValueError) as error:
+        raise Refusal("pinned source repository unavailable") from error
+
+
+def seal_wamr_source(runtime, source):
+    source = Path(source)
+    root = Path(runtime) / "compute"
+    custody = root / "custody"
+    custody.mkdir(mode=0o700)
+    require(source.is_absolute(), "pinned WAMR checkout required")
+    revision = git_directory_output(
+        source, 65, "rev-parse", "--verify", REVISION + "^{commit}").decode().strip()
+    status = git_directory_output(
+        source, MIB, "status", "--porcelain=v2",
+        "--untracked-files=normal", "-z")
+    require(revision == REVISION and not status,
+            "pinned WAMR checkout required")
+    archive = git_directory_output(
+        source, 256 * MIB, "archive", "--format=tar", REVISION)
+    require(0 < len(archive) <= 256 * MIB, "invalid WAMR source archive")
+    path = custody / "wamr-source.tar"
+    copied = create_exact_copy(path, archive)
+    require(copied["sha256"] == hashlib.sha256(archive).hexdigest(),
+            "WAMR source archive changed")
+    return path
+
+
 def tracked_manifest(relative, repository=None):
     repository = REPO if repository is None else Path(repository)
     encoded = relative.encode("utf-8")
-    raw = git_raw(repository, "ls-tree", "-z", "HEAD", "--", relative)
-    if not raw:
-        raise Refusal("pinned dependency manifest unavailable")
-    require(raw.endswith(b"\0") and raw.count(b"\0") == 1,
-            "pinned dependency manifest is not uniquely tracked")
     try:
+        relative_path = normalized_repository_relative(
+            relative, "pinned dependency manifest unavailable")
+        with retained_absolute(
+                repository, directory=True,
+                reason="pinned dependency manifest unavailable") as (
+                    root_handle, root_directories, root_parent):
+            del root_parent
+            raw = bounded_subprocess_output(
+                [*git_command("ls-tree", "-z", "HEAD", "--", relative)],
+                f"/proc/self/fd/{root_handle}", 2048, 60,
+                "pinned dependency manifest unavailable",
+                "pinned dependency manifest unavailable",
+                "pinned dependency manifest unavailable",
+                env=git_environment(), pass_fds=(root_handle,),
+            )
+            require(raw.endswith(b"\0") and raw.count(b"\0") == 1,
+                    "pinned dependency manifest is not uniquely tracked")
+            object_format = bounded_subprocess_output(
+                [*git_command("rev-parse", "--show-object-format")],
+                f"/proc/self/fd/{root_handle}", 16, 60,
+                "invalid pinned dependency manifest identity",
+                "invalid pinned dependency manifest identity",
+                "invalid pinned dependency manifest identity",
+                env=git_environment(), pass_fds=(root_handle,),
+            ).decode().strip()
+            opened = []
+            current = root_handle
+            component_state = []
+            built = repository
+            for part in relative_path.parts[:-1]:
+                handle = os.open(
+                    part, open_flags(directory=True), dir_fd=current)
+                opened.append(handle)
+                info = os.fstat(handle)
+                require(stat.S_ISDIR(info.st_mode),
+                        "pinned dependency manifest unavailable")
+                built /= part
+                component_state.append((str(built), handle, snapshot(info)))
+                current = handle
+            handle = os.open(relative_path.name, open_flags(), dir_fd=current)
+            opened.append(handle)
+            info = os.fstat(handle)
+            require(
+                stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                and info.st_uid in (0, os.getuid())
+                and not info.st_mode & 0o022,
+                "invalid pinned dependency manifest identity",
+            )
+            identity = snapshot(info)
+            data = read_descriptor(
+                handle, info, MIB, "pinned dependency manifest changed")
+            named = os.open(relative_path.name, open_flags(), dir_fd=current)
+            try:
+                require(snapshot(os.fstat(named)) == identity,
+                        "pinned dependency manifest changed")
+            finally:
+                os.close(named)
+            stable_directories(
+                root_directories + component_state,
+                "pinned dependency manifest path changed")
+            require(snapshot(os.fstat(handle)) == identity,
+                    "pinned dependency manifest changed")
         header, found = raw[:-1].split(b"\t", 1)
         mode, kind, oid = header.decode("ascii").split(" ")
-    except (UnicodeDecodeError, ValueError) as error:
-        raise Refusal("invalid pinned dependency manifest identity") from error
-    object_format = git("rev-parse", "--show-object-format", repository=repository)
-    require(found == encoded and kind == "blob" and mode in ("100644", "100755"),
-            "invalid pinned dependency manifest identity")
-    data, info = source_file(repository, relative, mode, oid, object_format)
+        require(found == encoded and kind == "blob"
+                and mode in ("100644", "100755")
+                and object_format in ("sha1", "sha256"),
+                "invalid pinned dependency manifest identity")
+        object_hash = hashlib.new(object_format)
+        object_hash.update(f"blob {len(data)}\0".encode("ascii"))
+        object_hash.update(data)
+        require(object_hash.hexdigest() == oid,
+                "tracked source content differs from Git")
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
+        raise Refusal("pinned dependency manifest unavailable") from None
+    finally:
+        for descriptor in reversed(locals().get("opened", [])):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
     return {
         "path": relative,
         "mode": mode,
@@ -1020,29 +1869,13 @@ def tracked_manifest(relative, repository=None):
     }, data
 
 
-def repository_relative_source(path, reason):
-    path = Path(path)
-    repository = Path(REPO)
-    try:
-        resolved_repository = repository.resolve(strict=True)
-        resolved = path.resolve(strict=True)
-        relative = resolved.relative_to(resolved_repository)
-    except (OSError, RuntimeError, ValueError):
-        raise Refusal(reason) from None
-    require(
-        repository == resolved_repository and path.is_absolute()
-        and path == resolved and relative.parts
-        and normalized_repository_relative(relative.as_posix(), reason)
-        == PurePosixPath(relative.as_posix()),
-        reason,
-    )
-    return relative.as_posix()
-
-
 def dependency_manifest_sources():
+    require(
+        Path(LOCAL_BOOT) == Path(REPO) / "support/tools/hyperv/local_boot",
+        "pinned dependency manifest unavailable",
+    )
     return tuple(
-        (name, repository_relative_source(
-            LOCAL_BOOT / name, "pinned dependency manifest unavailable"))
+        (name, "support/tools/hyperv/local_boot/" + name)
         for name in ("build.zig", "build.zig.zon")
     )
 
@@ -1443,7 +2276,12 @@ def dependency_custody(root):
     return record
 
 
-def verify_package_hashes(root, packages):
+def require_consumer_inputs(runtime, expected, content=False):
+    consumer_input_state(
+        runtime, content=content, expected=expected)
+
+
+def verify_package_hashes(runtime, root, packages, expected_inputs):
     work = root / "dependency-hash-work"
     cache = root / "dependency-hash-cache"
     work.mkdir(mode=0o700)
@@ -1461,10 +2299,13 @@ def verify_package_hashes(root, packages):
     names = package_roots(packages)
     for index, name in enumerate(names):
         try:
+            require_consumer_inputs(runtime, expected_inputs)
             output, _ = execute(
                 root, f"dependency-hash-{index:03d}",
                 [tool("zig"), "fetch", "--global-cache-dir", cache, packages / name],
-                300, 511, cwd=work, evidence=False)
+                300, 511, cwd=work, evidence=False,
+                input_records=consumer_file_records(expected_inputs))
+            require_consumer_inputs(runtime, expected_inputs)
         except Refusal as error:
             raise Refusal("Zig package hash recomputation failed") from error
         require(read(output, 512) == (name + "\n").encode("ascii"),
@@ -1473,7 +2314,7 @@ def verify_package_hashes(root, packages):
                 "dependency hash workspace manifest identity changed")
 
 
-def restore_dependencies(root, expected_source):
+def restore_dependencies(runtime, root, expected_source, expected_inputs):
     manifest_sources = dependency_manifest_sources()
     restore = root / "dependencies"
     restore.mkdir(mode=0o700)
@@ -1493,11 +2334,14 @@ def restore_dependencies(root, expected_source):
             "copied dependency manifest identity changed")
     require_source(expected_source)
     try:
+        require_consumer_inputs(runtime, expected_inputs)
         _, command = execute(root, "dependency-restore", [
             tool("zig"), "build", "--build-file", restore / "build.zig",
             "--fetch=all", "--cache-dir", root / "cache",
             "--global-cache-dir", root / "global-cache", "-j2",
-        ], 900, evidence=False)
+        ], 900, evidence=False,
+            input_records=consumer_file_records(expected_inputs))
+        require_consumer_inputs(runtime, expected_inputs)
     except Refusal as error:
         raise Refusal("pinned dependency restore command failed") from error
     require(command["known_error_markers"] == [], "dependency restore reported an error")
@@ -1506,7 +2350,7 @@ def restore_dependencies(root, expected_source):
     packages = restore / "zig-pkg"
     require(any(os.scandir(packages)), "private pinned dependency restore required")
     package_roots(packages)
-    verify_package_hashes(root, packages)
+    verify_package_hashes(runtime, root, packages, expected_inputs)
     custody = dependency_custody(root)
     require(custody["source_manifests"] == {
         name: {
@@ -1541,15 +2385,25 @@ def require_build_custody(runtime, expected):
             save(failure, report)
     require(source_matches, "immutable source custody changed")
     require_dependency_custody(runtime / "compute", expected["dependencies"])
+    require_consumer_inputs(runtime, expected["consumer_inputs"])
 
 
 def require_dependency_custody(root, expected):
     require(dependency_custody(root) == expected, "dependency custody changed")
 
 
-def run_custodied(runtime, expected, root, stage, args, seconds=600, limit=8 * MIB):
+def run_custodied(runtime, expected, root, stage, args, seconds=600,
+                  limit=8 * MIB, extra_inputs=None):
     require_build_custody(runtime, expected)
-    output = run(root, stage, args, seconds, limit)
+    if extra_inputs is not None:
+        require_consumer_inputs(runtime, extra_inputs)
+    records = consumer_file_records(expected["consumer_inputs"])
+    if extra_inputs is not None:
+        records.update(consumer_file_records(extra_inputs))
+    output = run(
+        root, stage, args, seconds, limit, input_records=records)
+    if extra_inputs is not None:
+        require_consumer_inputs(runtime, extra_inputs)
     require_build_custody(runtime, expected)
     return output
 
@@ -1675,18 +2529,48 @@ def boot_args(cli, config):
     return args
 
 
-def check_boot(config, identity):
+def pin_from_record(record):
+    metadata = record["metadata"]
+    mtime_seconds, mtime_nanoseconds = divmod(metadata[7], 1_000_000_000)
+    ctime_seconds, ctime_nanoseconds = divmod(metadata[8], 1_000_000_000)
+    return {
+        "device_major": os.major(metadata[0]),
+        "device_minor": os.minor(metadata[0]),
+        "inode": metadata[1],
+        "mode": metadata[2],
+        "uid": metadata[3],
+        "gid": metadata[4],
+        "nlink": metadata[5],
+        "size": metadata[6],
+        "mtime_seconds": mtime_seconds,
+        "mtime_nanoseconds": mtime_nanoseconds,
+        "ctime_seconds": ctime_seconds,
+        "ctime_nanoseconds": ctime_nanoseconds,
+        "sha256": list(bytes.fromhex(record["sha256"])),
+    }
+
+
+def check_boot(config, identity, boot_inputs=None):
     work = Path(config["work_dir"])
     request = document(work / "request.json")
-    require(request["schema_version"] == 1 and request["config"] == config,
+    require(request["schema_version"] == 2 and request["config"] == config,
             "wrong boot request")
-    paths = [config["source"]["path"],
-             config["ovmf_code"], config["ovmf_vars"], config["qemu"]]
+    paths = [
+        ("source", Path(config["source"]["path"])),
+        ("ovmf_code", Path(config["ovmf_code"])),
+        ("ovmf_vars", Path(config["ovmf_vars"])),
+        ("qemu", Path(config["qemu"])),
+    ]
     require(len(request["pins"]) == 4, "missing physical pins")
-    for path, pin in zip(paths, request["pins"]):
-        file = Path(path)
-        require(pin == {"size": file.stat().st_size,
-                        "sha256": list(bytes.fromhex(digest(file)))}, "boot input changed")
+    for (name, path), pin in zip(paths, request["pins"]):
+        if name == "source" or boot_inputs is None:
+            record, unused = physical_file_record(path)
+            del unused
+        else:
+            require(name in boot_inputs["files"], "missing boot input custody")
+            record = boot_inputs["files"][name]
+            require(record["path"] == str(path), "wrong boot input path")
+        require(pin == pin_from_record(record), "boot input changed")
     require(read(work / "launched", 1) == b"", "invalid launch")
     report = document(work / "report.json")
     require(report["schema_version"] == 1
@@ -1703,6 +2587,7 @@ def check_boot(config, identity):
             and report["serial_sha256"] == hashlib.sha256(raw).hexdigest(),
             "serial binding changed")
     return {"scope": "local_native_compute_only", "report": report,
+            "input_pins": request["pins"],
             "request_sha256": digest(work / "request.json"),
             "report_sha256": digest(work / "report.json"),
             "compute": compute(raw, identity, config["disable_x2apic"])}
@@ -1779,29 +2664,48 @@ def build(runtime, wamr):
                  "global-cache/tmp", "fixtures"):
         (root / name).mkdir(mode=0o700)
     prepare_source_outputs()
-    os.environ.update(TMPDIR=str(root / "scratch"), MAKEFLAGS="-j2",
-                      ZIG_LOCAL_CACHE_DIR=str(root / "cache"),
-                      ZIG_GLOBAL_CACHE_DIR=str(root / "global-cache"),
-                      KCONFIG_CONFIG=str(APP / "build/.config"),
-                      KCONFIG_OVERWRITECONFIG="1",
-                      M4=tool("m4"),
-                      PYTHONDONTWRITEBYTECODE="1")
-    require(os.environ.get("BISON_PKGDATADIR") == str(runtime / "bison"),
+    bison_data = os.environ.get("BISON_PKGDATADIR")
+    require(bison_data == str(runtime / "bison"),
             "Bison build environment differs from bound producer input")
+    COMMAND_ENVIRONMENT.clear()
+    COMMAND_ENVIRONMENT.update({
+        "BISON_PKGDATADIR": bison_data,
+        "KCONFIG_CONFIG": str(APP / "build/.config"),
+        "KCONFIG_OVERWRITECONFIG": "1",
+        "M4": tool("m4"),
+        "MAKEFLAGS": "-j2",
+        "TMPDIR": str(root / "scratch"),
+        "ZIG_GLOBAL_CACHE_DIR": str(root / "global-cache"),
+        "ZIG_LOCAL_CACHE_DIR": str(root / "cache"),
+    })
+    os.environ.update(COMMAND_ENVIRONMENT)
+    source_archive = seal_wamr_source(runtime, wamr)
+    consumer_inputs = consumer_input_state(runtime)
     initial_source = source()
     save(root / "private/source-metadata.json", {
         "schema": "uk.wamr.git-physical-source-baseline",
         "version": 1,
         "records": source_metadata(),
     })
-    packages = restore_dependencies(root, initial_source)
-    initial = producer_inputs(runtime)
+    packages = restore_dependencies(
+        runtime, root, initial_source, consumer_inputs)
+    initial = producer_inputs(runtime, consumer_inputs)
     require(initial["source"] == source_identity(initial_source)
             and initial["source_custody"] == initial_source["custody"],
             "source changed during dependency restoration")
     save(root / "evidence/build-start.json", initial)
-    require(subprocess.check_output([tool("zig"), "version"]).strip() == b"0.16.0",
-            "Zig 0.16.0 required")
+    zig = tool("zig")
+    consumer_records = consumer_file_records(consumer_inputs)
+    with retained_executables(
+            (zig,), consumer_records) as (
+                retained, pass_fds):
+        version = bounded_subprocess_output(
+            [retained[zig], "version"], REPO, 64, 30,
+            "Zig version output too large", "Zig version check timed out",
+            "Zig version check failed",
+            env=command_environment(root, consumer_records),
+            pass_fds=pass_fds)
+    require(version.strip() == b"0.16.0", "Zig 0.16.0 required")
     run_custodied(runtime, initial, root, "adapter", [
         tool("zig"), "build", "--build-file", HERE / "build.zig",
         "--system", packages, "--prefix", root / "tools",
@@ -1814,7 +2718,8 @@ def build(runtime, wamr):
     run_custodied(runtime, initial, root, "fixtures", [
         sys.executable, "-m", "unittest", "discover", "-s", HERE / "tests", "-v"])
     run_custodied(runtime, initial, root, "prepare", [
-        sys.executable, APP / "prepare.py", "prepare", "--source", wamr], 1800)
+        sys.executable, APP / "prepare.py", "prepare",
+        "--source-archive", source_archive], 1800)
     run_custodied(runtime, initial, root, "config", [
         sys.executable, APP / "build-image.py", "olddefconfig"])
     require_no_config_backup()
@@ -1825,15 +2730,9 @@ def build(runtime, wamr):
     run_custodied(runtime, initial, root, "native-image", [
         sys.executable, APP / "build-image.py", "native-images"], 1800)
     solved_config()
-    require(producer_inputs(runtime) == initial, "source or producer tool changed during build")
+    require(producer_inputs(runtime, consumer_inputs) == initial,
+            "source or producer tool changed during build")
     save(root / "evidence/build.json", check_build())
-    save(root / "evidence/boot-inputs.json", {
-        "package_tool": digest(root / "tools/bin/wamr-ci-package"),
-        "local_boot_tool": digest(root / "tools/bin/uk-hyperv-local-boot"),
-        "qemu": digest(runtime / "bin/qemu-system-x86_64"),
-        "ovmf_code": digest(runtime / "firmware/code.fd"),
-        "ovmf_vars": digest(runtime / "firmware/vars.fd"),
-    })
 
 
 def boot(runtime):
@@ -1842,24 +2741,29 @@ def boot(runtime):
             "x86 KVM runner required; no successful skip")
     root = runtime / "compute"
     initial = document(root / "evidence/build-start.json")
-    require(producer_inputs(runtime) == initial, "producer inputs changed")
+    consumer_inputs = initial["consumer_inputs"]
+    require(producer_inputs(runtime, consumer_inputs) == initial,
+            "producer inputs changed")
     require(check_build() == document(root / "evidence/build.json"), "build identity changed")
-    inputs = document(root / "evidence/boot-inputs.json")
+    efi = APP / "build" / EFI
     paths = {"package_tool": root / "tools/bin/wamr-ci-package",
              "local_boot_tool": root / "tools/bin/uk-hyperv-local-boot",
              "qemu": runtime / "bin/qemu-system-x86_64",
              "ovmf_code": runtime / "firmware/code.fd",
-             "ovmf_vars": runtime / "firmware/vars.fd"}
+             "ovmf_vars": runtime / "firmware/vars.fd",
+             "efi": efi}
+    inputs = boot_input_state(runtime, paths)
+    save(root / "evidence/boot-inputs.json", inputs)
 
-    def verify_inputs():
-        require(inputs == {name: digest(path) for name, path in paths.items()},
-                "boot tool or firmware changed")
+    def verify_inputs(content=False):
+        boot_input_state(
+            runtime, paths, content=content, expected=inputs)
 
     verify_inputs()
-    efi = APP / "build" / EFI
     output = run_custodied(
         runtime, initial, root, "package",
-        [paths["package_tool"], "package", efi, root / "package"], 150, 64 * 1024)
+        [paths["package_tool"], "package", efi, root / "package"],
+        150, 64 * 1024, extra_inputs=inputs)
     package = document(output)
     require(package["image"]["efi"]["sha256"] == digest(efi)
             and package["producer_sha256"] == inputs["package_tool"],
@@ -1877,18 +2781,21 @@ def boot(runtime):
         Path(config["work_dir"]).mkdir(mode=0o700)
         run_custodied(
             runtime, initial, root, mode,
-            boot_args(paths["local_boot_tool"], config), 90, 64 * 1024)
-        result = check_boot(config, identity)
+            boot_args(paths["local_boot_tool"], config), 90, 64 * 1024,
+            extra_inputs=inputs)
+        result = check_boot(config, identity, inputs)
         expected = package["image"]["raw" if index < 2 else "vhd"]["sha256"]
         require(digest(Path(config["source"]["path"])) == expected,
                 "booted package changed")
         save(root / "evidence" / (mode + "-compute.json"), result)
     output = run_custodied(
         runtime, initial, root, "inspect",
-        [paths["package_tool"], "inspect", efi, root / "package"], 150, 64 * 1024)
+        [paths["package_tool"], "inspect", efi, root / "package"],
+        150, 64 * 1024, extra_inputs=inputs)
     require(document(output) == package, "physical package reload changed")
-    verify_inputs()
-    require(producer_inputs(runtime) == initial, "producer inputs changed after boot")
+    verify_inputs(content=True)
+    require(producer_inputs(runtime, consumer_inputs) == initial,
+            "producer inputs changed after boot")
     require(check_build() == document(root / "evidence/build.json"), "source or image changed")
     # No self hash: this final record binds earlier immutable observations only.
     save(root / "evidence/result.json", {

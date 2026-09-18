@@ -39,7 +39,11 @@ pub const Held = struct {
         if (before.size == 0 or before.size > maximum or before.nlink != 1 or
             (before.uid != 0 and before.uid != std.os.linux.geteuid()) or
             (mode != 0o400 and mode != 0o444 and mode != 0o600 and mode != 0o644)) return error.UnsafeFile;
-        return .{ .artifact = .{ .file = file, .before = before, .pin = .{ .size = before.size, .sha256 = try c.boot.files.digest(io, file, before) } } };
+        return .{ .artifact = .{
+            .file = file,
+            .before = before,
+            .pin = try c.boot.files.Pin.init(before, try c.boot.files.digest(io, file, before)),
+        } };
     }
     pub fn read(self: Held, a: std.mem.Allocator, io: std.Io, maximum: usize) ![]u8 {
         if (self.artifact.pin.size > maximum) return error.InvalidFileSize;
@@ -86,7 +90,11 @@ pub fn lockIdentity(a: std.mem.Allocator, io: std.Io, lock: *p.Locked) !ic.FileI
     const named = try lock.directory.openFile(io, ".writer.lock");
     defer named.close(io);
     if (before.size != 0 or !p.sameSnapshot(before, try p.snapshot(named))) return error.ArtifactChanged;
-    return (Held{ .artifact = .{ .file = file, .before = before, .pin = .{ .size = 0, .sha256 = c.hash("") } } }).identity(a);
+    return (Held{ .artifact = .{
+        .file = file,
+        .before = before,
+        .pin = try c.boot.files.Pin.init(before, c.hash("")),
+    } }).identity(a);
 }
 
 /// Check retained directory ancestry, not just path spellings (including aliases).
@@ -122,7 +130,11 @@ pub const Self = struct {
         errdefer actual.close(io);
         const before = try p.snapshot(actual);
         if (before.size != recorded.size) return error.ArtifactChanged;
-        const held: Held = .{ .artifact = .{ .file = actual, .before = before, .pin = .{ .size = before.size, .sha256 = try c.sha(recorded.sha256) } } };
+        const held: Held = .{ .artifact = .{
+            .file = actual,
+            .before = before,
+            .pin = try c.boot.files.Pin.init(before, try c.sha(recorded.sha256)),
+        } };
         try held.verify(io, parent.directory, parent.name, .artifact);
         return .{ .path = path, .file = held };
     }

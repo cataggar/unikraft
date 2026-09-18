@@ -50,6 +50,14 @@ jobs:
           fi
           mkdir -p .d
 
+      - name: Exercise the production source-custody limits explicitly
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d
+          export PYTHONDONTWRITEBYTECODE=1
+          python3 support/build/wamr-native-ci/tests/source_custody_production_limits.py
+
       - name: Set up the existing verified native downloader
         uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
         with:

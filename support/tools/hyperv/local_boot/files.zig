@@ -65,7 +65,54 @@ fn checkedDivCeil(comptime numerator: u64, comptime denominator: u64) u64 {
     return std.math.divCeil(u64, numerator, denominator) catch @compileError("invalid QCOW2 profile division");
 }
 
-pub const Pin = struct { size: u64, sha256: [32]u8 };
+pub const Pin = struct {
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    size: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: u32,
+    ctime_seconds: i64,
+    ctime_nanoseconds: u32,
+    sha256: [32]u8,
+
+    pub fn init(value: core.private_files.Snapshot, sha256: [32]u8) !Pin {
+        try completeSnapshot(value);
+        return .{
+            .device_major = value.dev_major,
+            .device_minor = value.dev_minor,
+            .inode = value.ino,
+            .mode = value.mode,
+            .uid = value.uid,
+            .gid = value.gid,
+            .nlink = value.nlink,
+            .size = value.size,
+            .mtime_seconds = value.mtime.sec,
+            .mtime_nanoseconds = value.mtime.nsec,
+            .ctime_seconds = value.ctime.sec,
+            .ctime_nanoseconds = value.ctime.nsec,
+            .sha256 = sha256,
+        };
+    }
+
+    pub fn validate(self: Pin) !void {
+        if (self.inode == 0 or self.mode & 0o170000 != 0o100000 or self.mode & 0o022 != 0 or
+            self.nlink == 0 or self.mtime_nanoseconds >= std.time.ns_per_s or
+            self.ctime_nanoseconds >= std.time.ns_per_s) return error.InvalidRequest;
+    }
+
+    pub fn matches(self: Pin, value: core.private_files.Snapshot) bool {
+        return hasCompleteSnapshot(value) and self.device_major == value.dev_major and self.device_minor == value.dev_minor and
+            self.inode == value.ino and self.mode == value.mode and self.uid == value.uid and self.gid == value.gid and
+            self.nlink == value.nlink and self.size == value.size and
+            self.mtime_seconds == value.mtime.sec and self.mtime_nanoseconds == value.mtime.nsec and
+            self.ctime_seconds == value.ctime.sec and self.ctime_nanoseconds == value.ctime.nsec;
+    }
+};
 pub const Artifact = struct {
     file: std.Io.File,
     before: core.private_files.Snapshot,
@@ -81,7 +128,7 @@ pub const Set = struct {
         for (config.paths(), 0..) |path, i| {
             const file = try core.private_files.openAbsolute(io, path, .artifact);
             errdefer file.close(io);
-            const before = try core.private_files.snapshot(file);
+            const before = try snapshot(file);
             const maximum: u64 = switch (i) {
                 0 => config.source.maximumPhysicalSize(),
                 1 => c.max_firmware,
@@ -97,7 +144,7 @@ pub const Set = struct {
                 var magic: [4]u8 = undefined;
                 if (try file.readPositionalAll(io, &magic, 0) != 4 or !std.mem.eql(u8, &magic, "\x7fELF")) return error.InvalidExecutable;
             }
-            result.items[i] = .{ .file = file, .before = before, .pin = .{ .size = before.size, .sha256 = try digest(io, file, before) } };
+            result.items[i] = .{ .file = file, .before = before, .pin = try Pin.init(before, try digest(io, file, before)) };
             count += 1;
         }
         return result;
@@ -114,7 +161,7 @@ pub const Set = struct {
             if (!std.mem.eql(u8, &try digest(io, item.file, item.before), &item.pin.sha256)) return error.ArtifactChanged;
             const current = try core.private_files.openAbsolute(io, path, .artifact);
             defer current.close(io);
-            if (!core.private_files.sameSnapshot(item.before, try core.private_files.snapshot(current))) return error.ArtifactChanged;
+            if (!item.pin.matches(try snapshot(current))) return error.ArtifactChanged;
         }
     }
 
@@ -124,7 +171,8 @@ pub const Set = struct {
 };
 
 pub fn digest(io: std.Io, file: std.Io.File, before: core.private_files.Snapshot) ![32]u8 {
-    if (!core.private_files.sameSnapshot(before, try core.private_files.snapshot(file))) return error.ArtifactChanged;
+    try completeSnapshot(before);
+    if (!sameSnapshot(before, try snapshot(file))) return error.ArtifactChanged;
     var sha = Sha256.init(.{});
     var buffer: [32 * 1024]u8 = undefined;
     var position: u64 = 0;
@@ -135,7 +183,7 @@ pub fn digest(io: std.Io, file: std.Io.File, before: core.private_files.Snapshot
         position += length;
     }
     if (try file.readPositionalAll(io, buffer[0..1], position) != 0 or
-        !core.private_files.sameSnapshot(before, try core.private_files.snapshot(file))) return error.ArtifactChanged;
+        !sameSnapshot(before, try snapshot(file))) return error.ArtifactChanged;
     return sha.finalResult();
 }
 
@@ -153,9 +201,30 @@ pub fn copy(io: std.Io, artifact: Artifact, directory: std.Io.Dir, name: []const
         position += length;
     }
     if (!std.mem.eql(u8, &sha.finalResult(), &artifact.pin.sha256) or
-        !core.private_files.sameSnapshot(artifact.before, try core.private_files.snapshot(artifact.file))) return error.ArtifactChanged;
+        !artifact.pin.matches(try snapshot(artifact.file))) return error.ArtifactChanged;
     try output.sync(io);
     try sync(io, directory);
+}
+
+pub fn snapshot(file: std.Io.File) !core.private_files.Snapshot {
+    const value = try core.private_files.snapshot(file);
+    try completeSnapshot(value);
+    return value;
+}
+
+pub fn sameSnapshot(left: core.private_files.Snapshot, right: core.private_files.Snapshot) bool {
+    return hasCompleteSnapshot(left) and hasCompleteSnapshot(right) and
+        left.gid == right.gid and core.private_files.sameSnapshot(left, right);
+}
+
+fn completeSnapshot(value: core.private_files.Snapshot) !void {
+    if (!hasCompleteSnapshot(value)) return error.IncompleteMetadata;
+}
+
+fn hasCompleteSnapshot(value: core.private_files.Snapshot) bool {
+    const mask = value.mask;
+    return mask.TYPE and mask.MODE and mask.UID and mask.GID and mask.INO and mask.SIZE and
+        mask.CTIME and mask.MTIME and mask.NLINK;
 }
 
 pub fn sync(io: std.Io, directory: std.Io.Dir) !void {
@@ -374,7 +443,7 @@ fn validateQcow2Impl(
         if (read != length) return error.InvalidQcow2;
         position += length;
     }
-    if (!core.private_files.sameSnapshot(retained_snapshot, try core.private_files.snapshot(retained)))
+    if (!sameSnapshot(retained_snapshot, try snapshot(retained)))
         return error.ArtifactChanged;
 }
 

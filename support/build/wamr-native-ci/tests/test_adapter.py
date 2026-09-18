@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Synthetic unit/physical packaging fixtures; never real guest boot evidence."""
 import copy
+import contextlib
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
 import struct
 import subprocess
@@ -285,6 +287,104 @@ class Evidence(unittest.TestCase):
         with self.assertRaises(ci.Refusal):
             ci.bison_inputs(root)
 
+    def test_consumer_input_records_bind_inode_metadata_directories_and_content(self):
+        inputs = self.root / "consumer-inputs"
+        tree = inputs / "tree"
+        tree.mkdir(parents=True, mode=0o700)
+        executable = inputs / "tool"
+        self.put(executable, b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+        self.put(tree / "data", b"same bytes")
+        expected = ci.record_input_paths(
+            {"tool:fixture": executable}, {"fixture": tree})
+        ci.record_input_paths({}, {}, content=False, expected=expected)
+
+        retained = inputs / "retained"
+        executable.rename(retained)
+        self.put(executable, retained.read_bytes())
+        executable.chmod(0o700)
+        changed = ci.record_input_paths(
+            {"tool:fixture": executable}, {"fixture": tree})
+        self.assertEqual(
+            expected["files"]["tool:fixture"]["sha256"],
+            changed["files"]["tool:fixture"]["sha256"],
+        )
+        self.assertNotEqual(
+            expected["files"]["tool:fixture"]["metadata"],
+            changed["files"]["tool:fixture"]["metadata"],
+        )
+        executable.unlink()
+        retained.rename(executable)
+        with self.assertRaisesRegex(ci.Refusal, "custody changed"):
+            ci.record_input_paths({}, {}, content=False, expected=expected)
+
+        refreshed = ci.record_input_paths(
+            {"tool:fixture": executable}, {"fixture": tree})
+        executable.chmod(0o500)
+        executable.chmod(0o700)
+        with self.assertRaisesRegex(ci.Refusal, "custody changed"):
+            ci.record_input_paths({}, {}, content=False, expected=refreshed)
+
+        hardlink = inputs / "hardlink"
+        os.link(executable, hardlink)
+        with self.assertRaisesRegex(ci.Refusal, "unsafe physical input"):
+            ci.physical_file_record(executable)
+        hardlink.unlink()
+        symlink = inputs / "symlink"
+        symlink.symlink_to(executable)
+        with self.assertRaisesRegex(ci.Refusal, "unsafe physical input"):
+            ci.physical_file_record(symlink)
+
+    def test_physical_tree_bounds_enumeration_and_symlink_hash_work(self):
+        entries = self.root / "bounded-tree"
+        entries.mkdir(mode=0o700)
+        for index in range(3):
+            self.put(entries / f"entry-{index}", b"")
+        with mock.patch.object(ci, "INPUT_TREE_MAX_ENTRIES", 3), \
+                self.assertRaisesRegex(
+                    ci.Refusal, "physical input tree entry limit exceeded"):
+            ci.physical_tree_record(entries)
+
+        target = self.root / "t"
+        self.put(target, b"12345678")
+        links = self.root / "symlink-tree"
+        links.mkdir(mode=0o700)
+        (links / "first").symlink_to("../t")
+        (links / "second").symlink_to("../t")
+        with mock.patch.object(ci, "INPUT_TREE_MAX_BYTES", 8):
+            record, unused_directories = ci.physical_tree_record(links)
+            del unused_directories
+        self.assertEqual(record["symlinks"], 2)
+        self.put(target, b"123456789")
+        with mock.patch.object(ci, "INPUT_TREE_MAX_BYTES", 8), \
+                self.assertRaisesRegex(
+                    ci.Refusal, "physical input tree hash limit exceeded"):
+            ci.physical_tree_record(links)
+
+    def test_retained_executable_descriptor_survives_path_swap(self):
+        directory = self.root / "retained-executable"
+        directory.mkdir(mode=0o700)
+        executable = directory / "tool"
+        original = b"#!/bin/sh\nprintf original\n"
+        replacement = b"#!/bin/sh\nprintf replacement\n"
+        self.put(executable, original)
+        executable.chmod(0o700)
+        state = ci.record_input_paths({"tool": executable}, {})
+        records = ci.consumer_file_records(state)
+        with ci.retained_executables((executable,), records) as (
+                retained, unused_fds):
+            del unused_fds
+            saved = directory / "saved"
+            executable.rename(saved)
+            self.put(executable, replacement)
+            executable.chmod(0o700)
+            self.assertEqual(
+                Path(retained[str(executable)]).read_bytes(), original)
+            executable.unlink()
+            saved.rename(executable)
+        with self.assertRaisesRegex(ci.Refusal, "custody changed"):
+            ci.record_input_paths({}, {}, content=False, expected=state)
+
     def test_boot_revalidation_does_not_need_inherited_build_environment(self):
         root = self.root / "bison"
         root.mkdir(mode=0o700)
@@ -299,6 +399,9 @@ class Evidence(unittest.TestCase):
                 mock.patch.object(ci, "source", return_value=source), \
                 mock.patch.object(ci, "tool", return_value="/synthetic-tool"), \
                 mock.patch.object(ci, "digest", return_value="f" * 64), \
+                mock.patch.object(
+                    ci, "consumer_input_state",
+                    return_value={"schema": "fixture"}), \
                 mock.patch.object(ci, "dependency_custody",
                                   return_value={"fixture": True}):
             self.assertEqual(ci.producer_inputs(self.root)["bison_data"], expected)
@@ -358,18 +461,24 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         commands = []
 
         source = {"revision": "1" * 40, "tree": "2" * 40, "custody": {}}
+        consumer = {"schema": "fixture"}
 
-        def restore(root, expected):
+        def restore(runtime_value, root, expected, expected_inputs):
             events.append("restore")
+            self.assertEqual(runtime_value, runtime)
             self.assertEqual(expected, source)
+            self.assertEqual(expected_inputs, consumer)
             return packages
 
-        def inputs(root):
+        def inputs(root, expected_consumer=None, content=True):
             events.append("custody")
+            self.assertEqual(expected_consumer, consumer)
+            self.assertTrue(content)
             return {
                 "source": ci.source_identity(source),
                 "source_custody": source["custody"],
                 "dependencies": {},
+                "consumer_inputs": consumer,
             }
 
         def command(runtime, expected, root, stage, args, *unused):
@@ -382,6 +491,11 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         with mock.patch.dict(os.environ, {
                 "BISON_PKGDATADIR": str(runtime / "bison")}, clear=True), \
                 mock.patch.object(ci, "prepare_source_outputs"), \
+                mock.patch.object(
+                    ci, "seal_wamr_source",
+                    return_value=runtime / "compute/custody/wamr-source.tar"), \
+                mock.patch.object(
+                    ci, "consumer_input_state", return_value=consumer), \
                 mock.patch.object(ci, "source", return_value=source), \
                 mock.patch.object(ci, "source_metadata", return_value=[]), \
                 mock.patch.object(ci, "restore_dependencies", side_effect=restore), \
@@ -394,6 +508,15 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 mock.patch.object(ci, "save"), \
                 mock.patch.object(ci, "check_build", return_value={}), \
                 mock.patch.object(ci, "digest", return_value="f" * 64), \
+                mock.patch.object(
+                    ci, "consumer_file_records", return_value={}), \
+                mock.patch.object(
+                    ci, "retained_executables",
+                    return_value=contextlib.nullcontext(
+                        ({"/tools/zig": "/tools/zig"}, ()))), \
+                mock.patch.object(
+                    ci, "bounded_subprocess_output",
+                    return_value=b"0.16.0\n"), \
                 mock.patch.object(ci, "tool", side_effect=lambda name: "/tools/" + name), \
                 mock.patch.object(ci.subprocess, "check_output", return_value=b"0.16.0\n"):
             ci.build(runtime, self.root)
@@ -420,18 +543,25 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 mock.patch.object(ci, "require_source"):
             with self.assertRaisesRegex(
                     ci.Refusal, "pinned dependency manifest unavailable"):
-                ci.restore_dependencies(missing_root, {"source": "fixture"})
+                ci.restore_dependencies(
+                    missing_root.parent, missing_root,
+                    {"source": "fixture"}, {"schema": "fixture"})
         root = self.root / "restore"
         root.mkdir(mode=0o700)
         for name in ("private", "evidence", "cache", "global-cache"):
             (root / name).mkdir(mode=0o700)
         with mock.patch.object(ci, "require_source"), \
+                mock.patch.object(ci, "require_consumer_inputs"), \
+                mock.patch.object(ci, "consumer_file_records",
+                                  return_value={}), \
                 mock.patch.object(ci, "execute", return_value=(
                     root / "private/dependency-restore.log",
                     {"known_error_markers": []})):
             with self.assertRaisesRegex(
                     ci.Refusal, "private pinned dependency restore required"):
-                ci.restore_dependencies(root, {"source": "fixture"})
+                ci.restore_dependencies(
+                    root.parent, root, {"source": "fixture"},
+                    {"schema": "fixture"})
 
     def test_dependency_paths_refuse_outside_or_missing_repository_without_leak(self):
         manifests = {
@@ -468,7 +598,8 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                     mock.patch.object(ci, "LOCAL_BOOT", local_boot):
                 for operation in (
                         lambda: ci.restore_dependencies(
-                            restore_root, {"source": "unused"}),
+                            restore_root.parent, restore_root,
+                            {"source": "unused"}, {"schema": "fixture"}),
                         lambda: ci.dependency_custody(custody_root),
                 ):
                     with self.assertRaises(ci.Refusal) as refusal:
@@ -479,6 +610,89 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                     )
                     self.assertIsNone(refusal.exception.__cause__)
                     self.assertNotIn(str(local_boot), str(refusal.exception))
+
+    def test_tracked_manifest_descriptor_walk_rejects_component_and_file_races(self):
+        manifests = {
+            "build.zig": b"const std = @import(\"std\");\n",
+            "build.zig.zon": (
+                '.{ .dependencies = .{ .miz_source = .{ '
+                f'.url = "{ci.MIZ_URL}", .hash = "{ci.MIZ_PACKAGE_HASH}" '
+                '} } }\n'
+            ).encode(),
+        }
+        repository = self.source_repository(
+            "manifest-races",
+            {
+                "support/tools/hyperv/local_boot/" + name: data
+                for name, data in manifests.items()
+            },
+        )
+        external = self.root / "external-manifests"
+        external.mkdir(mode=0o700)
+        for name in manifests:
+            self.put(external / name, b"external bytes must not be read\n")
+        real_open = ci.os.open
+
+        def race_component(path, flags, mode=0o777, *, dir_fd=None):
+            if path == "local_boot" and dir_fd is not None:
+                target = repository / "support/tools/hyperv/local_boot"
+                saved = target.with_name("local_boot-retained")
+                target.rename(saved)
+                target.symlink_to(external, target_is_directory=True)
+                try:
+                    return real_open(path, flags, mode, dir_fd=dir_fd)
+                finally:
+                    target.unlink()
+                    saved.rename(target)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(ci.os, "open", side_effect=race_component), \
+                self.assertRaisesRegex(
+                    ci.Refusal, "pinned dependency manifest unavailable"):
+            ci.tracked_manifest(
+                "support/tools/hyperv/local_boot/build.zig", repository)
+
+        def race_file(path, flags, mode=0o777, *, dir_fd=None):
+            if path == "build.zig" and dir_fd is not None:
+                target = repository / "support/tools/hyperv/local_boot/build.zig"
+                saved = target.with_name("build.zig-retained")
+                target.rename(saved)
+                target.symlink_to(external / "build.zig")
+                try:
+                    return real_open(path, flags, mode, dir_fd=dir_fd)
+                finally:
+                    target.unlink()
+                    saved.rename(target)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(ci.os, "open", side_effect=race_file), \
+                self.assertRaisesRegex(
+                    ci.Refusal, "pinned dependency manifest unavailable"):
+            ci.tracked_manifest(
+                "support/tools/hyperv/local_boot/build.zig", repository)
+
+        original_read = ci.read_descriptor
+        raced = False
+
+        def rename_restore(handle, info, limit, reason):
+            nonlocal raced
+            if not raced:
+                raced = True
+                target = repository / "support/tools/hyperv/local_boot"
+                saved = target.with_name("local_boot-retained")
+                target.rename(saved)
+                target.symlink_to(external, target_is_directory=True)
+                target.unlink()
+                saved.rename(target)
+            return original_read(handle, info, limit, reason)
+
+        with mock.patch.object(ci, "read_descriptor",
+                               side_effect=rename_restore), \
+                self.assertRaisesRegex(
+                    ci.Refusal, "pinned dependency manifest unavailable"):
+            ci.tracked_manifest(
+                "support/tools/hyperv/local_boot/build.zig", repository)
+        self.assertTrue(raced)
 
     def dependency_fixture(self):
         root = self.root / "dependency-fixture"
@@ -619,9 +833,13 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             self.put(output, b"miz-0.2.0-wrong\n")
             return output, {}
 
-        with mock.patch.object(ci, "execute", side_effect=wrong), \
+        with mock.patch.object(ci, "require_consumer_inputs"), \
+                mock.patch.object(ci, "consumer_file_records",
+                                  return_value={}), \
+                mock.patch.object(ci, "execute", side_effect=wrong), \
                 self.assertRaisesRegex(ci.Refusal, "content hash mismatch"):
-            ci.verify_package_hashes(root, packages)
+            ci.verify_package_hashes(
+                root.parent, root, packages, {"schema": "fixture"})
 
     def test_zig_hash_recomputation_never_creates_a_repository_package_root(self):
         root, packages, _ = self.dependency_fixture()
@@ -641,8 +859,12 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         (root / "private/dependency-hash-000.log").unlink()
         repository_packages = ci.REPO / "zig-pkg"
         self.assertFalse(repository_packages.exists())
-        with self.assertRaisesRegex(ci.Refusal, "content hash mismatch"):
-            ci.verify_package_hashes(root, packages)
+        with mock.patch.object(ci, "require_consumer_inputs"), \
+                mock.patch.object(ci, "consumer_file_records",
+                                  return_value=None), \
+                self.assertRaisesRegex(ci.Refusal, "content hash mismatch"):
+            ci.verify_package_hashes(
+                root.parent, root, packages, {"schema": "fixture"})
         self.assertFalse(repository_packages.exists())
         self.assertTrue((root / "dependency-hash-work/zig-pkg").is_dir())
 
@@ -700,11 +922,16 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             }
 
         with mock.patch.object(ci, "require_source"), \
+                mock.patch.object(ci, "require_consumer_inputs"), \
+                mock.patch.object(ci, "consumer_file_records",
+                                  return_value={}), \
                 mock.patch.object(ci, "tracked_manifest", side_effect=manifest_record), \
                 mock.patch.object(ci, "execute", side_effect=swap_restore), \
                 self.assertRaisesRegex(
                     ci.Refusal, "copied dependency manifest identity changed"):
-            ci.restore_dependencies(root, {"source": "fixture"})
+            ci.restore_dependencies(
+                root.parent, root, {"source": "fixture"},
+                {"schema": "fixture"})
         self.assertEqual(
             (root / "dependencies/build.zig").read_bytes(),
             manifests["build.zig"],
@@ -765,10 +992,14 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 "source": ci.source_identity(source_record),
                 "source_custody": source_record["custody"],
                 "dependencies": dependency,
+                "consumer_inputs": {"schema": "fixture"},
             }
             target = packages / ci.MIZ_PACKAGE_HASH / "source.zig"
             self.put(target, b"changed before build\n")
             with mock.patch.object(ci, "source", return_value=source_record), \
+                    mock.patch.object(ci, "require_consumer_inputs"), \
+                    mock.patch.object(ci, "consumer_file_records",
+                                      return_value={}), \
                     mock.patch.object(ci, "run") as command, \
                     self.assertRaisesRegex(ci.Refusal, "dependency custody changed"):
                 ci.run_custodied(runtime, expected, compute, "adapter", ["false"])
@@ -777,11 +1008,14 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             dependency = ci.dependency_custody(compute)
             expected["dependencies"] = dependency
 
-            def mutate(*unused):
+            def mutate(*unused, **unused_keywords):
                 self.put(target, b"changed during build\n")
                 return compute / "private/adapter.log"
 
             with mock.patch.object(ci, "source", return_value=source_record), \
+                    mock.patch.object(ci, "require_consumer_inputs"), \
+                    mock.patch.object(ci, "consumer_file_records",
+                                      return_value={}), \
                     mock.patch.object(ci, "run", side_effect=mutate), \
                     self.assertRaisesRegex(ci.Refusal, "dependency custody changed"):
                 ci.run_custodied(runtime, expected, compute, "adapter", ["fixture"])
@@ -987,6 +1221,71 @@ source/generated/
         self.assertLess(time.monotonic() - started, 5)
         self.assertFalse(marker.exists())
 
+    def test_bounded_subprocess_refuses_escaped_descendant_pipe_writer(self):
+        pid_file = self.root / "escaped-descendant.pid"
+        script = (
+            "import os,time\n"
+            f"pid_file={str(pid_file)!r}\n"
+            "pid=os.fork()\n"
+            "if pid:\n"
+            "  raise SystemExit(7)\n"
+            "os.setsid()\n"
+            "with open(pid_file,'w') as stream:\n"
+            "  stream.write(str(os.getpid()))\n"
+            "  stream.flush()\n"
+            "os.write(1,b'held-open\\n')\n"
+            "time.sleep(30)\n"
+        )
+        started = time.monotonic()
+        escaped = None
+        try:
+            with self.assertRaisesRegex(ci.Refusal, "escaped fixture failed"):
+                ci.bounded_subprocess_output(
+                    [sys.executable, "-c", script], self.root, 1024, 10,
+                    "escaped fixture overflow", "escaped fixture timeout",
+                    "escaped fixture failed",
+                )
+            self.assertLess(
+                time.monotonic() - started,
+                ci.SUBPROCESS_DRAIN_GRACE + 2,
+            )
+            for _ in range(100):
+                if pid_file.exists():
+                    escaped = int(pid_file.read_text())
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(escaped)
+        finally:
+            if escaped is not None:
+                try:
+                    os.kill(escaped, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_execute_drops_ambient_loader_shell_python_and_make_injection(self):
+        root = self.root / "closed-command-environment"
+        (root / "private").mkdir(parents=True, mode=0o700)
+        injected = root / "injected"
+        self.put(injected, b"printf injected\n")
+        names = (
+            "BASH_ENV", "ENV", "LD_AUDIT", "LD_LIBRARY_PATH", "LD_PRELOAD",
+            "MAKEFILES", "PYTHONHOME", "PYTHONPATH", "ZIG_LIB_DIR",
+        )
+        script = (
+            "import json,os\n"
+            f"print(json.dumps(sorted(set(os.environ) & set({names!r}))))\n"
+        )
+        ambient = {name: str(injected) for name in names}
+        with mock.patch.dict(os.environ, ambient, clear=False):
+            output, unused_record = ci.execute(
+                root, "closed-environment",
+                [sys.executable, "-c", script],
+                evidence=False,
+                input_records=None,
+            )
+        del unused_record
+        self.assertEqual(output.read_bytes(), b"[]\n")
+
     def test_source_root_inventory_refuses_the_129th_entry(self):
         repository = self.root / "root-inventory"
         repository.mkdir(mode=0o700)
@@ -1060,9 +1359,11 @@ source/generated/
         paths = [config["source"]["path"], config["ovmf_code"],
                  config["ovmf_vars"], config["qemu"]]
         ci.save(work / "request.json", {
-            "schema_version": 1, "supervisor_pid": 123, "config": config,
-            "pins": [{"size": Path(p).stat().st_size,
-                      "sha256": list(bytes.fromhex(ci.digest(Path(p))))} for p in paths],
+            "schema_version": 2, "supervisor_pid": 123, "config": config,
+            "pins": [
+                ci.pin_from_record(ci.physical_file_record(Path(p))[0])
+                for p in paths
+            ],
         })
         if raw is None:
             raw = self.contract.log()

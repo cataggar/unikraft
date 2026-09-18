@@ -3120,6 +3120,8 @@ fn isAllowedAssignment(name: []const u8) bool {
         "ARCH",
         "LLVM_TARGET_ARCH",
         "AR",
+        "YACC",
+        "LEX",
         "RANLIB",
         "NM",
         "READELF",
@@ -3151,7 +3153,7 @@ fn isAllowedAssignment(name: []const u8) bool {
 test "native Make environment keeps ordinary forwarding restrictions" {
     _ = native_make_environment;
     for ([_][]const u8{
-        "UMASK=0077", "SHELL=/native/bash", "CONFIG_SHELL=/native/bash",
+        "UMASK=0077",         "SHELL=/native/bash",  "CONFIG_SHELL=/native/bash",
         "HOME=/private/home", "TMPDIR=/private/tmp", "LD_PRELOAD=/native/library",
     }) |assignment| {
         try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment(assignment));
@@ -3673,6 +3675,8 @@ test "path lists resolve from the repository root" {
 
 test "forwarded Make assignments require allowlisted names" {
     try validateForwardedAssignment("AR=zig ar");
+    try validateForwardedAssignment("YACC=/native/bin/bison");
+    try validateForwardedAssignment("LEX=/native/bin/flex");
     try validateForwardedAssignment("KCONFIG_OVERWRITECONFIG=1");
     try validateForwardedAssignment("UK_CFLAGS=-std=gnu17");
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("not-an-assignment"));

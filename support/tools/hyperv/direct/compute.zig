@@ -117,6 +117,13 @@ pub const Bundle = struct {
     }
 };
 
+fn legacyLocalPins(source_revision: []const u8, source_tree: []const u8) bool {
+    return (eq(source_revision, "993e4d0d394c08202c0d0c57ea97450a19a4f394") or
+        eq(source_revision, "34e5c88a165c4da878b3122b8b91716116d65d4b") or
+        eq(source_revision, "b5a8fdbee033349f7145fbc76aebfee29b2fa04f")) and
+        eq(source_tree, "54f8e118146c78c24e7c802657c6ec62b268a5de");
+}
+
 pub const Result = struct {
     version: u8,
     workload: enum { tiny },
@@ -300,7 +307,14 @@ pub fn verifyBundle(a: std.mem.Allocator, io: std.Io, bundle: Bundle) !void {
         const text = try serial.normalize(a, raw);
         defer a.free(text);
         if (std.mem.count(u8, text, "Using legacy xAPIC MMIO") != i % 2) return error.WrongLocalMode;
-        try localReport(a, io, boot, if (i < 2) bundle.get("raw") else bundle.get("vhd"), result);
+        try localReport(
+            a,
+            io,
+            boot,
+            if (i < 2) bundle.get("raw") else bundle.get("vhd"),
+            result,
+            legacyLocalPins(bundle.source_revision, bundle.source_tree),
+        );
     }
 }
 
@@ -370,7 +384,14 @@ fn evidenceRecords(a: std.mem.Allocator, io: std.Io, bundle: Bundle) !void {
     }
 }
 
-fn localReport(a: std.mem.Allocator, io: std.Io, boot: Boot, image: Artifact, result: Result) !void {
+fn localReport(
+    a: std.mem.Allocator,
+    io: std.Io,
+    boot: Boot,
+    image: Artifact,
+    result: Result,
+    legacy_pins: bool,
+) !void {
     const bytes = try read(a, io, boot.report, 65536);
     defer a.free(bytes);
     const doc = try c.Document.parse(a, bytes, .{ .bytes = 65536 });
@@ -394,10 +415,11 @@ fn localReport(a: std.mem.Allocator, io: std.Io, boot: Boot, image: Artifact, re
     defer a.free(request_bytes);
     const request = try c.Document.parse(a, request_bytes, .{ .bytes = 65536 });
     defer request.deinit();
+    const request_version = try c.integer(u8, try field(request.value(), "schema_version"));
     const config = try field(request.value(), "config");
     const source = try field(config, "source");
     const mode = @intFromEnum(boot.mode);
-    if (try c.integer(u8, try field(request.value(), "schema_version")) != 1 or
+    if ((request_version != 2 and !(request_version == 1 and legacy_pins)) or
         !eq(try string(config, "expect"), marker) or
         try c.integer(i32, try field(config, "expect_main_return")) != 0 or
         try c.integer(u8, try field(config, "cpus")) != 1 or
@@ -409,6 +431,31 @@ fn localReport(a: std.mem.Allocator, io: std.Io, boot: Boot, image: Artifact, re
     if (legacy != .bool or legacy.bool != (mode % 2 == 1)) return error.WrongLocalMode;
     const pins = try field(request.value(), "pins");
     if (pins != .array or pins.array.items.len != 4) return error.WrongLocalReport;
+    const pin_member_count: usize = if (request_version == 1) 2 else 13;
+    for (pins.array.items) |candidate| {
+        if (candidate != .object or candidate.object.count() != pin_member_count)
+            return error.WrongLocalReport;
+        if (request_version == 2) {
+            const mode_value = try c.integer(u16, try field(candidate, "mode"));
+            if (try c.integer(u64, try field(candidate, "inode")) == 0 or
+                try c.integer(u32, try field(candidate, "nlink")) == 0 or
+                mode_value & 0o170000 != 0o100000 or mode_value & 0o022 != 0 or
+                try c.integer(u32, try field(candidate, "mtime_nanoseconds")) >= std.time.ns_per_s or
+                try c.integer(u32, try field(candidate, "ctime_nanoseconds")) >= std.time.ns_per_s)
+                return error.WrongLocalReport;
+            _ = try c.integer(u32, try field(candidate, "device_major"));
+            _ = try c.integer(u32, try field(candidate, "device_minor"));
+            _ = try c.integer(u32, try field(candidate, "uid"));
+            _ = try c.integer(u32, try field(candidate, "gid"));
+            _ = try c.integer(u64, try field(candidate, "size"));
+            _ = try c.integer(i64, try field(candidate, "mtime_seconds"));
+            _ = try c.integer(i64, try field(candidate, "ctime_seconds"));
+        }
+        const candidate_hash = try field(candidate, "sha256");
+        if (candidate_hash != .array or candidate_hash.array.items.len != 32)
+            return error.WrongLocalReport;
+        for (candidate_hash.array.items) |byte| _ = try c.integer(u8, byte);
+    }
     const pin = pins.array.items[0];
     if (try c.integer(u64, try field(pin, "size")) != image.size) return error.WrongImage;
     const hash = try field(pin, "sha256");
@@ -423,6 +470,13 @@ fn localReport(a: std.mem.Allocator, io: std.Io, boot: Boot, image: Artifact, re
     if (!eq(try string(observation, "scope"), "local_native_compute_only") or
         !eq(try string(observation, "request_sha256"), boot.request.sha256) or
         !eq(try string(observation, "report_sha256"), boot.report.sha256)) return error.WrongLocalReport;
+    if (request_version == 2) {
+        const request_pins = try std.json.Stringify.valueAlloc(a, pins, .{});
+        defer a.free(request_pins);
+        const observed_pins = try std.json.Stringify.valueAlloc(a, try field(observation, "input_pins"), .{});
+        defer a.free(observed_pins);
+        if (!eq(request_pins, observed_pins)) return error.WrongLocalReport;
+    }
     const encoded = try std.json.Stringify.valueAlloc(a, try field(observation, "compute"), .{});
     defer a.free(encoded);
     const checked = try parse(Result, a, encoded);

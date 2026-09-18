@@ -82,6 +82,24 @@ tool input. Python bytecode is disabled. The same physical record is required
 around each build/boot consumer and at inspection/handoff, so a create/delete
 transient cannot be hidden by a finally clean Git status.
 
+`build-start.json` now carries
+`uk.wamr.consumer-input-custody` version 2. It inventories each selected host
+tool and dynamic runtime object plus the bounded Zig, LLVM, system executable,
+Python-standard-library and authenticated Bison data trees. Every record binds device/inode,
+type/mode, uid/gid, link count, size, nanosecond mtime/ctime and content
+identity, with deduplicated absolute directory-component identities. The
+pinned tree scanner refuses on the first excess entry before sorting and
+separately bounds all unique regular-file bytes hashed through symlinks.
+pinned WAMR checkout is consumed only while creating a fixed-revision Git
+archive through retained repository and Git descriptors; all later WAMR build
+steps read the create-only archived object. Top-level build tools execute
+through retained no-follow descriptors, while indirect tool/data and Miz-tree
+lookups are physically revalidated immediately before and after each consumer
+and fully rehashed at final inspection and export. Consumer subprocesses use a
+closed environment derived only from recorded input parents and adapter-owned
+cache/configuration paths; ambient loader, shell-startup, Python, Make and Zig
+injection variables are not inherited.
+
 Records also bind the Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
 actual tools, wasm/cwasm/compiler/library bytes, solved configuration,
 entire EFI/debug ELF/bootinfo, native package producer, QEMU and OVMF,
@@ -122,6 +140,13 @@ policy allows at most 131,072 entries, 8 GiB total regular-file/link bytes,
 parsing. Failure diagnostics use a separately terminated-and-drained 1-MiB Git
 status capture, retain at most 128 ignored paths, and refuse immediately on the
 129th repository-root entry before sorting the bounded collection.
+The subprocess collector gives termination, kill and post-kill/post-leader
+pipe draining separate absolute one-second budgets. Escaped `setsid()`
+descendants therefore cannot keep a captured pipe open indefinitely; the
+collector closes the pipe at its absolute drain deadline and always reaps the
+leader while preserving the original overflow, timeout or command-failure
+lane. Git runs with system/global configuration, hooks, credential helpers,
+replacement objects, terminal prompts and pagers disabled where applicable.
 Build commands use `-j2`; the workflow has a 60-minute ceiling. Each build
 command has a fixed deadline and an 8-MiB log limit (one extra byte detects
 overflow). The native packaging worker retains its 120-second deadline and
@@ -254,3 +279,12 @@ members to a fresh private directory, rebuilds local artifact references (not
 original requests), and uses the production native checker before publishing
 a usable `bundle.json`. Its plan remains `authority=not_admitted`; new final
 artifact-bound human approval is required.
+
+The expensive production-boundary module
+`tests/source_custody_production_limits.py` is intentionally excluded from
+default discovery and runs explicitly in protected CI. Its single PID-scoped
+`/d` fixture combines 131,072-entry and 8-GiB sparse-file exact/excess checks,
+constructs real exact/first-excess 8-MiB Git ignored inventories, and covers
+the 1,024-byte path, 64-component and 128-root diagnostic boundaries. It uses
+sparse allocation, emits no large payloads, and removes only its exact fixture
+directory.

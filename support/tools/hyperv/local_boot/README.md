@@ -40,7 +40,11 @@ be empty except for the core's stable `.writer.lock`. It is **consumed once**;
 repeated use refuses instead of overwriting evidence or retrying QEMU. Inputs
 must be outside it. A durable, create-only `request.json` precedes the leaf
 process, whose separate create-only `launched` record prevents another exec.
-These are local execution records, not an authority or completion receipt.
+The production request is exact canonical schema 2. Each of its four pins
+binds the retained descriptor's device major/minor, inode, full type/mode,
+uid, gid, link count, size, nanosecond-precision mtime and ctime, and SHA-256.
+Schema 1's former size/SHA-only pin shape is not accepted. These are local
+execution records, not an authority or completion receipt.
 
 Options preserve the legacy names:
 
@@ -108,8 +112,11 @@ regular files, safe descriptor-relative ancestor walks, no symlink following,
 and no group/world writes. Owner-readable 0644 firmware/images and 0755 QEMU
 are supported. Source, firmware templates and QEMU are hashed in bounded
 32-KiB reads, pinned before launch, revalidated by the leaf, and checked in
-full afterward, including inode/device, length and modification metadata.
-Path replacement, growth, truncation, or changed bytes cannot pass.
+full afterward. The checks cover device/inode, full type/mode, uid/gid, link
+count, length, nanosecond mtime/ctime, and content. Path replacement,
+metadata-only change, hardlink-count change, growth, truncation, or changed
+bytes cannot pass. Existing public-artifact hardlinks remain permitted and
+their exact link count is pinned; symlink paths remain refused.
 
 The raw disk, fixed VHD, or QCOW2 is **never copied, staged, linked, reseeded,
 or writable**. QEMU receives a separately inherited duplicate of the retained

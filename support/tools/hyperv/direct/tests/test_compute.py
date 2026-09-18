@@ -700,12 +700,17 @@ class Compute(unittest.TestCase):
         app = self.root / "app"
         for path in (runtime, root, app, app / "build", app / "build/artifacts",
                      root / "evidence", root / "tools", root / "tools/bin",
-                     runtime / "bin", runtime / "firmware"):
+                     root / "tools/consumer-tree", runtime / "bin",
+                     runtime / "bin/share", runtime / "firmware"):
             path.mkdir(mode=0o700)
         shutil.copyfile(REPO / "support/apps/wamr-aot/check-log.py", app / "check-log.py")
         shutil.copyfile(package_tool, root / "tools/bin/wamr-ci-package")
         (root / "tools/bin/wamr-ci-package").chmod(0o700)
         ci = handoff.ci
+        handoff_parent = self.root / "outputs"
+        handoff_parent.mkdir(mode=0o700)
+        for mode in ci.MODES:
+            (root / ("boot-" + mode)).mkdir(mode=0o700)
         data = bytearray(512)
         data[:2] = b"MZ"
         struct.pack_into("<I", data, 0x3c, 0x80)
@@ -742,10 +747,24 @@ class Compute(unittest.TestCase):
                    for name in (ci.EFI, ci.EFI + ".dbg", ci.EFI + ".bootinfo")})
         write(app / "build/image-identity.json", image_identity)
         build = dict(source=source, runtime=runtime_identity, image=image_identity)
+        source_archive = root / "tools/wamr-source.tar"
+        write(source_archive, b"synthetic source archive\n")
+        consumer_files = {
+            f"tool:{name}": source_archive for name in ci.HOST_TOOLS
+        }
+        for name in ("bash", "head", "timeout"):
+            consumer_files[f"tool:{name}"] = Path(ci.tool(name))
+        consumer_files["wamr-source-archive"] = source_archive
+        consumer_inputs = ci.record_input_paths(
+            consumer_files,
+            {name: root / "tools/consumer-tree"
+             for name in (
+                 "bison", "python-stdlib", "system-bin", "zig", "llvm")})
         producer = dict(
             source=source,
             source_custody=source_custody(),
             dependencies=dependency_custody(source),
+            consumer_inputs=consumer_inputs,
             fixture_only=True,
         )
         write(root / "evidence/build.json", build)
@@ -754,9 +773,9 @@ class Compute(unittest.TestCase):
             package_tool=root / "tools/bin/wamr-ci-package",
             local_boot_tool=root / "tools/bin/uk-hyperv-local-boot",
             qemu=runtime / "bin/qemu-system-x86_64",
-            ovmf_code=runtime / "firmware/code.fd", ovmf_vars=runtime / "firmware/vars.fd")
-        write(root / "evidence/boot-inputs.json",
-              {key: ci.digest(path) for key, path in tools.items()})
+            ovmf_code=runtime / "firmware/code.fd",
+            ovmf_vars=runtime / "firmware/vars.fd",
+            efi=efi)
         packaged = subprocess.run([tools["package_tool"], "package", efi, root / "package"],
                                   capture_output=True, timeout=150)
         self.assertEqual(packaged.returncode, 0, packaged.stderr)
@@ -767,6 +786,9 @@ class Compute(unittest.TestCase):
             image={key: package["image"][key] for key in (
                 "schema_version", "miz_revision", "efi", "raw", "vhd",
                 "footer_sha256", "packaging")}))
+        boot_inputs = ci.record_input_paths(
+            tools, {"qemu-data": runtime / "bin/share"})
+        write(root / "evidence/boot-inputs.json", boot_inputs)
         observation = dict(result(), **{
             key + "_sha256": files[name] for key, name in (
                 ("wasm", "tiny.wasm"), ("cwasm", "tiny.cwasm"), ("runtime", "libwamr-aot.a"))})
@@ -774,23 +796,27 @@ class Compute(unittest.TestCase):
             for i, mode in enumerate(ci.MODES):
                 config = ci.config_for(runtime, root, i)
                 work = Path(config["work_dir"])
-                work.mkdir(mode=0o700)
                 raw = (b"Using legacy xAPIC MMIO\n" if i % 2 else b"") + serial(i, observation)
                 write(work / "hyperv-efi-boot.log", raw)
                 write(work / "launched", b"")
-                paths = [config["source"]["path"],
-                         config["ovmf_code"], config["ovmf_vars"], config["qemu"]]
+                source_record, unused = ci.physical_file_record(
+                    Path(config["source"]["path"]))
+                del unused
+                pins = [ci.pin_from_record(source_record)] + [
+                    ci.pin_from_record(boot_inputs["files"][name])
+                    for name in ("ovmf_code", "ovmf_vars", "qemu")
+                ]
                 write(work / "request.json", dict(
-                    schema_version=1, supervisor_pid=12345, config=config,
-                    pins=[dict(size=Path(path).stat().st_size,
-                               sha256=list(bytes.fromhex(ci.digest(Path(path))))) for path in paths]))
+                    schema_version=2, supervisor_pid=12345, config=config,
+                    pins=pins))
                 write(work / "report.json", dict(
                     schema_version=1, scope="public_local_qemu_only", acceptance="not_established",
                     passed=True, consumed=True, cleanup_complete=True, input_unchanged=True,
                     serial_valid=True, serial_limit_reached=False, serial_bytes=len(raw),
                     serial_sha256=digest(raw), termination={"exited": 0},
                     failures=dict(primary=None, cleanup=None, recording=None)))
-                write(root / "evidence" / (mode + "-compute.json"), ci.check_boot(config, runtime_identity))
+                write(root / "evidence" / (mode + "-compute.json"),
+                      ci.check_boot(config, runtime_identity, boot_inputs))
             for stage in public_bundle.STAGES:
                 write(root / "evidence" / ("command-" + stage + ".json"), dict(
                     scope="command_diagnostic_not_acceptance", stage=stage,
@@ -802,12 +828,22 @@ class Compute(unittest.TestCase):
                 benchmark="not_measured", workload="tiny", modes=list(ci.MODES),
                 records={p.name: ci.digest(p) for p in sorted((root / "evidence").glob("*.json"))}))
             original = (root / "evidence/result.json").read_bytes()
+
+            def mocked_producer_inputs(actual_runtime, expected_consumer=None,
+                                       content=True):
+                self.assertEqual(actual_runtime, runtime)
+                self.assertEqual(expected_consumer, consumer_inputs)
+                self.assertTrue(content)
+                return producer
+
             with mock.patch.object(ci, "check_build", return_value=build), \
-                    mock.patch.object(ci, "producer_inputs", return_value=producer):
+                    mock.patch.object(
+                        ci, "producer_inputs", autospec=True,
+                        side_effect=mocked_producer_inputs):
                 with mock.patch.object(ci, "require_build_custody"):
-                    handoff.export(runtime, self.root / "handoff")
+                    handoff.export(runtime, handoff_parent / "handoff")
         self.assertEqual((root / "evidence/result.json").read_bytes(), original)
-        bundle_path = self.root / "handoff/bundle.json"
+        bundle_path = handoff_parent / "handoff/bundle.json"
         bundle = read(bundle_path)
         self.assertEqual(bundle["authority"], "not_admitted")
         self.assertEqual(len(bundle["boots"]), 4)
@@ -1114,12 +1150,45 @@ class Compute(unittest.TestCase):
             return target, copied
 
         def rewrite_stage(
-                target, copied, start, build=None, image_identity=None, identity=None):
+                target, copied, start, build=None, image_identity=None,
+                identity=None, legacy_v1=False):
             start_raw = public_bundle.encoded(start)
             for path in (target / "artifacts/build_start",
                          target / "evidence/build-start.json"):
                 write(path, start_raw)
             changed_records = {"build-start.json": digest(start_raw)}
+            if legacy_v1:
+                current_inputs = read(target / "artifacts/boot_inputs")
+                legacy_inputs = {
+                    name: current_inputs["files"][name]["sha256"]
+                    for name in (
+                        "package_tool", "local_boot_tool", "qemu",
+                        "ovmf_code", "ovmf_vars")
+                }
+                inputs_raw = public_bundle.encoded(legacy_inputs)
+                for path in (target / "artifacts/boot_inputs",
+                             target / "evidence/boot-inputs.json"):
+                    write(path, inputs_raw)
+                changed_records["boot-inputs.json"] = digest(inputs_raw)
+                for mode in handoff.ci.MODES:
+                    slot = target / "boots" / mode
+                    request_path = slot / "request"
+                    request = read(request_path)
+                    request["schema_version"] = 1
+                    request["pins"] = [
+                        {"size": pin["size"], "sha256": pin["sha256"]}
+                        for pin in request["pins"]
+                    ]
+                    write(request_path, public_bundle.encoded(request))
+                    compute = read(slot / "compute")
+                    compute.pop("input_pins")
+                    compute["request_sha256"] = handoff.ci.digest(request_path)
+                    compute_raw = public_bundle.encoded(compute)
+                    write(slot / "compute", compute_raw)
+                    write(target / "evidence" / (mode + "-compute.json"),
+                          compute_raw)
+                    changed_records[mode + "-compute.json"] = digest(
+                        compute_raw)
             if build is not None:
                 build_raw = public_bundle.encoded(build)
                 for path in (target / "artifacts/build",
@@ -1139,6 +1208,10 @@ class Compute(unittest.TestCase):
                     ("local_result", local_result_path)):
                 by_name[name].update(
                     size=path.stat().st_size, sha256=handoff.ci.digest(path))
+            if legacy_v1:
+                path = target / "artifacts/boot_inputs"
+                by_name["boot_inputs"].update(
+                    size=path.stat().st_size, sha256=handoff.ci.digest(path))
             if build is not None:
                 path = target / "artifacts/build"
                 by_name["build"].update(
@@ -1153,6 +1226,14 @@ class Compute(unittest.TestCase):
                 path = target / "evidence" / name
                 evidence[name].update(
                     size=path.stat().st_size, sha256=handoff.ci.digest(path))
+            if legacy_v1:
+                boots = {boot["mode"]: boot for boot in copied["boots"]}
+                for mode in handoff.ci.MODES:
+                    for name in ("request", "compute"):
+                        path = target / "boots" / mode / name
+                        boots[mode][name].update(
+                            size=path.stat().st_size,
+                            sha256=handoff.ci.digest(path))
             write(target / "bundle.json", public_bundle.encoded(copied))
 
         legacy_sources = (
@@ -1196,14 +1277,18 @@ class Compute(unittest.TestCase):
             old_build["image"] = old_image_identity
             rewrite_stage(
                 old_stage, old_bundle, old_start, build=old_build,
-                image_identity=old_image_identity, identity=old_source)
+                image_identity=old_image_identity, identity=old_source,
+                legacy_v1=True)
             old_archive = self.root / f"old-v1-{index}.zip"
-            public_bundle.pack(
+            delivered.pack(
                 handoff, old_stage, old_archive, old_source, VALIDATOR)
+            public_bundle.verify_archive(
+                handoff, old_archive, old_source, None)
+            public_bundle.publication_records(
+                handoff, old_stage, old_source)
             old_output = self.root / f"old-v1-imported-{index}"
-            public_bundle.import_bundle(
-                handoff, old_archive, old_output, old_source,
-                None, VALIDATOR)
+            delivered.import_bundle(
+                handoff, old_archive, old_output, old_source, VALIDATOR)
             self.assertNotIn(
                 "dependencies",
                 read(old_output / "evidence/build-start.json"),
@@ -1233,7 +1318,7 @@ class Compute(unittest.TestCase):
             unrelated_stage, unrelated_bundle, unrelated_start,
             build=unrelated_build,
             image_identity=unrelated_image_identity,
-            identity=unrelated_source)
+            identity=unrelated_source, legacy_v1=True)
         with self.assertRaises(ValueError):
             public_bundle.pack(
                 handoff, unrelated_stage, self.root / "unrelated-v1.zip",

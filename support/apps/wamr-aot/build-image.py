@@ -39,7 +39,52 @@ def bison_data():
     return str(path)
 
 
+def git_invocation(*args):
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+        and key not in ("LD_AUDIT", "LD_LIBRARY_PATH", "LD_PRELOAD")
+    }
+    environment.update({
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "PAGER": "cat",
+    })
+    return ([
+        tool("git"), "--no-pager",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "credential.helper=",
+        "-c", "core.pager=cat",
+        *args,
+    ], environment)
+
+
+def git_output(limit, *args):
+    command, environment = git_invocation(*args)
+    value = subprocess.check_output(
+        command, cwd=REPO, env=environment, timeout=60)
+    if len(value) > limit:
+        raise ValueError("bounded Git output exceeded")
+    return value
+
+
+def require_clean_git():
+    command, environment = git_invocation(
+        "diff", "--quiet", "--no-ext-diff", "HEAD", "--")
+    completed = subprocess.run(
+        command, cwd=REPO, env=environment, timeout=60,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, check=False)
+    if completed.returncode != 0:
+        raise ValueError("dirty image source")
+
+
 def record(command):
+    require_clean_git()
     output = ROOT / "build"
     names = ("wamr_hyperv-x86_64-efi", "wamr_hyperv-x86_64-efi.dbg",
              "wamr_hyperv-x86_64-efi.bootinfo")
@@ -47,10 +92,10 @@ def record(command):
         "schema_version": 1,
         "command": command,
         "scope": "native-build-only-not-boot-or-hardware-qualification",
-        "unikraft_revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
-        "unikraft_diff_sha256": hashlib.sha256(subprocess.check_output(
-            ["git", "diff", "HEAD", "--binary"], cwd=REPO)).hexdigest(),
+        "unikraft_revision": git_output(
+            65,
+            "rev-parse", "HEAD").decode().strip(),
+        "unikraft_diff_sha256": hashlib.sha256(b"").hexdigest(),
         "application_sources": {
             p.name: sha(p) for p in sorted(ROOT.iterdir()) if p.is_file()
             and not p.name.startswith(".")
@@ -110,6 +155,8 @@ def main():
         "-Dcompiler-targeted=true", f"-Dhost-cc={zig} cc",
         f"-Dhost-cxx={zig} c++", "-Dhost-cflags=-fno-sanitize=null",
         f"-Dmake-arg=AR={zig} ar",
+        f"-Dmake-arg=YACC={tool('bison')}",
+        f"-Dmake-arg=LEX={tool('flex')}",
         "-Dmake-arg=KCONFIG_OVERWRITECONFIG=1",
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",

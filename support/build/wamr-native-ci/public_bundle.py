@@ -7,10 +7,8 @@ import json
 import os
 from pathlib import Path
 import re
-import selectors
 import stat
 import subprocess
-import time
 import zipfile
 
 MAX_TOTAL = 512 * 1024 * 1024
@@ -83,48 +81,16 @@ def metadata_sha256(value):
 
 
 def git_output(ci, limit, *args):
-    environment = dict(os.environ)
-    for name in tuple(environment):
-        if name.startswith("GIT_") or name in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
-            environment.pop(name)
-    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
-    process = None
-    selector = None
     try:
-        process = subprocess.Popen(
-            [ci.tool("git"), "--no-pager", *args],
-            cwd=ci.REPO, env=environment, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL)
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
-        deadline = time.monotonic() + 60
-        output = bytearray()
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(process.args, 60)
-            if not selector.select(remaining):
-                raise subprocess.TimeoutExpired(process.args, 60)
-            chunk = os.read(
-                process.stdout.fileno(),
-                min(65536, limit + 1 - len(output)))
-            if not chunk:
-                break
-            output.extend(chunk)
-            require(len(output) <= limit)
-        require(process.wait(timeout=max(
-            0.001, deadline - time.monotonic())) == 0)
-    except (OSError, subprocess.SubprocessError) as error:
+        return ci.bounded_subprocess_output(
+            ci.git_command(*args), ci.REPO, limit, 60,
+            "public-source bundle refused",
+            "public-source bundle refused",
+            "public-source bundle refused",
+            env=ci.git_environment(),
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         raise ValueError("public-source bundle refused") from error
-    finally:
-        if selector is not None:
-            selector.close()
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
-        if process is not None and process.stdout is not None:
-            process.stdout.close()
-    return bytes(output)
 
 
 def trusted_source_manifests(ci, expected):
@@ -191,6 +157,65 @@ def source_custody_record(ci, value):
     bounded_integer(value["bytes"], 1, ci.SOURCE_MAX_BYTES)
     digest_string(value["content_sha256"])
     digest_string(value["physical_sha256"])
+    return value
+
+
+def consumer_input_record(ci, value):
+    require(set(value) == {
+        "schema", "version", "files", "trees", "directories",
+        "aggregate_sha256",
+    } and value["schema"] == "uk.wamr.consumer-input-custody"
+      and type(value["version"]) is int and value["version"] == 2)
+    files = value["files"]
+    require(type(files) is dict and 1 <= len(files) <= 256)
+    for name, record in files.items():
+        require(type(name) is str and 0 < len(name.encode("utf-8")) <= 4096
+                and set(record) == {"path", "metadata", "sha256"}
+                and type(record["path"]) is str
+                and record["path"].startswith("/")
+                and len(record["path"].encode("utf-8")) <= 4096)
+        metadata = physical_metadata(
+            record["metadata"], "file",
+            stat.S_IMODE(record["metadata"][2]))
+        require(metadata[5] > 0 and metadata[6] > 0
+                and not metadata[2] & 0o022)
+        digest_string(record["sha256"])
+    trees = value["trees"]
+    require(type(trees) is dict and 1 <= len(trees) <= 16)
+    for name, record in trees.items():
+        require(type(name) is str and re.fullmatch(r"[a-z0-9-]{1,64}", name)
+                and set(record) == {
+                    "path", "files", "directories", "symlinks", "bytes",
+                    "content_sha256", "physical_sha256",
+                }
+                and type(record["path"]) is str
+                and record["path"].startswith("/")
+                and len(record["path"].encode("utf-8")) <= 4096)
+        file_count = bounded_integer(
+            record["files"], 0, ci.INPUT_TREE_MAX_ENTRIES)
+        directory_count = bounded_integer(
+            record["directories"], 1, ci.INPUT_TREE_MAX_ENTRIES)
+        symlink_count = bounded_integer(
+            record["symlinks"], 0, ci.INPUT_TREE_MAX_ENTRIES)
+        require(file_count + directory_count + symlink_count
+                <= ci.INPUT_TREE_MAX_ENTRIES)
+        bounded_integer(record["bytes"], 0, ci.INPUT_TREE_MAX_BYTES)
+        digest_string(record["content_sha256"])
+        digest_string(record["physical_sha256"])
+    directories = value["directories"]
+    require(type(directories) is dict and 1 <= len(directories) <= 512)
+    for path, metadata in directories.items():
+        require(type(path) is str and path.startswith("/")
+                and len(path.encode("utf-8")) <= 4096)
+        physical_metadata(
+            metadata, "directory", stat.S_IMODE(metadata[2]))
+        require(not metadata[2] & 0o022)
+    digest_string(value["aggregate_sha256"])
+    unsigned = dict(value)
+    del unsigned["aggregate_sha256"]
+    require(value["aggregate_sha256"] == hashlib.sha256(json.dumps(
+        unsigned, sort_keys=True,
+        separators=(",", ":")).encode("ascii")).hexdigest())
     return value
 
 
@@ -389,13 +414,12 @@ def ci_context(handoff):
             and os.environ.get("GITHUB_WORKFLOW_REF", "").startswith(
                 "cataggar/unikraft/.github/workflows/wamr-native-compute.yaml@"))
     source = ci.source()
-    sdk = ci.REPO / ".d/wamr-source"
-    def git(*args):
-        return subprocess.check_output(["git", "-C", str(sdk), *args], timeout=60).decode().strip()
-    require(git("rev-parse", "HEAD") == ci.REVISION
-            and not git("status", "--porcelain", "--untracked-files=normal")
-            and git("remote", "get-url", "origin") in (
-                "https://github.com/cataggar/wamr", "https://github.com/cataggar/wamr.git"))
+    runtime = ci.REPO / ".d/wamr-native-runtime"
+    start = ci.document(runtime / "compute/evidence/build-start.json")
+    consumer_input_record(ci, start["consumer_inputs"])
+    ci.consumer_input_state(
+        runtime, content=True, expected=start["consumer_inputs"])
+    require("wamr-source-archive" in start["consumer_inputs"]["files"])
     return context(dict(repository="cataggar/unikraft", run_id=os.environ["GITHUB_RUN_ID"],
                         run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                         source_revision=source["revision"], source_tree=source["tree"],
@@ -490,10 +514,18 @@ def native(handoff, validator, bundle):
     # private captures and allowlisted failure flags are never archive members.
     for name in ("private", "evidence"):
         (bundle.parent / name).mkdir(mode=0o700, exist_ok=True)
+    start = handoff.ci.document(bundle.parent / "evidence/build-start.json")
+    validator_input = handoff.ci.record_input_paths(
+        {"validator": validator}, {}, content=True)
+    input_records = handoff.ci.consumer_file_records(start["consumer_inputs"])
+    input_records.update(handoff.ci.consumer_file_records(validator_input))
     output = handoff.ci.run(bundle.parent, "native-revalidation",
-                            [validator, "handoff", bundle], 600, 4096)
+                            [validator, "handoff", bundle], 600, 4096,
+                            input_records=input_records)
     require(handoff.ci.read(output, 4096)
             == b"Compute handoff revalidated; authority=not_admitted.\n")
+    handoff.ci.record_input_paths(
+        {}, {}, content=True, expected=validator_input)
 
 
 def publication_records(handoff, stage, source):
@@ -510,12 +542,39 @@ def publication_records(handoff, stage, source):
     require(build["source"] == expected_source)
     start = ci.document(stage / "evidence/build-start.json")
     require(start["source"] == expected_source)
+    legacy = (
+        source["source_revision"], source["source_tree"]
+    ) in LEGACY_V1_SOURCES
     if "dependencies" not in start:
-        require((source["source_revision"], source["source_tree"])
-                in LEGACY_V1_SOURCES and "source_custody" not in start)
+        require(legacy and "source_custody" not in start
+                and "consumer_inputs" not in start)
     else:
         source_custody_record(ci, start["source_custody"])
         dependency_record(ci, start["dependencies"], source)
+        if "consumer_inputs" not in start:
+            require(legacy)
+        else:
+            consumer_input_record(ci, start["consumer_inputs"])
+            require(
+                {f"tool:{name}" for name in ci.HOST_TOOLS}
+                | {"wamr-source-archive"}
+                <= set(start["consumer_inputs"]["files"])
+                and {"bison", "python-stdlib", "system-bin", "zig", "llvm"}
+                <= set(start["consumer_inputs"]["trees"]))
+    boot_inputs = ci.document(stage / "evidence/boot-inputs.json")
+    if boot_inputs.get("schema") == "uk.wamr.consumer-input-custody":
+        consumer_input_record(ci, boot_inputs)
+        require(
+            {"package_tool", "local_boot_tool", "qemu",
+             "ovmf_code", "ovmf_vars", "efi"} <= set(boot_inputs["files"])
+            and "qemu-data" in boot_inputs["trees"])
+    else:
+        require(legacy and set(boot_inputs) == {
+            "package_tool", "local_boot_tool", "qemu",
+            "ovmf_code", "ovmf_vars",
+        })
+        for value in boot_inputs.values():
+            digest_string(value)
     for name in sorted(EVIDENCE):
         item = ci.document(stage / "evidence" / name)
         if name.startswith("command-"):
@@ -530,9 +589,44 @@ def publication_records(handoff, stage, source):
                     and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]))
     for mode in ci.MODES:
         request = ci.document(stage / "boots" / mode / "request")
-        require(set(request) == {"schema_version", "supervisor_pid", "config", "pins"}
-                and type(request["supervisor_pid"]) is int
-                and 0 < request["supervisor_pid"] <= 0x7fffffff)
+        require(set(request) == {
+            "schema_version", "supervisor_pid", "config", "pins",
+        } and type(request["supervisor_pid"]) is int
+          and 0 < request["supervisor_pid"] <= 0x7fffffff)
+        if request["schema_version"] == 1:
+            require(legacy)
+            for pin in request["pins"]:
+                require(set(pin) == {"size", "sha256"})
+                bounded_integer(pin["size"], 1, 256 * 1024 * 1024 + 512)
+                require(type(pin["sha256"]) is list and len(pin["sha256"]) == 32
+                        and all(type(item) is int and 0 <= item <= 255
+                                for item in pin["sha256"]))
+        else:
+            require(request["schema_version"] == 2
+                    and len(request["pins"]) == 4)
+            for pin in request["pins"]:
+                require(set(pin) == {
+                    "device_major", "device_minor", "inode", "mode",
+                    "uid", "gid", "nlink", "size",
+                    "mtime_seconds", "mtime_nanoseconds",
+                    "ctime_seconds", "ctime_nanoseconds", "sha256",
+                })
+                for key in (
+                        "device_major", "device_minor", "inode", "mode",
+                        "uid", "gid", "nlink", "size",
+                        "mtime_nanoseconds", "ctime_nanoseconds"):
+                    bounded_integer(pin[key], 0, (1 << 64) - 1)
+                require(pin["inode"] > 0 and pin["nlink"] > 0
+                        and stat.S_ISREG(pin["mode"])
+                        and not pin["mode"] & 0o022
+                        and pin["mtime_nanoseconds"] < 1_000_000_000
+                        and pin["ctime_nanoseconds"] < 1_000_000_000
+                        and type(pin["mtime_seconds"]) is int
+                        and type(pin["ctime_seconds"]) is int
+                        and type(pin["sha256"]) is list
+                        and len(pin["sha256"]) == 32
+                        and all(type(item) is int and 0 <= item <= 255
+                                for item in pin["sha256"]))
         cfg = request["config"]
         require(set(cfg) == set(ci.config_for(Path("/unused"), Path("/unused/compute"), 0)))
         # Exact original request bytes are retained. Their paths must only name
@@ -545,6 +639,32 @@ def publication_records(handoff, stage, source):
         require(workspace.is_absolute() and ".." not in workspace.parts
                 and workspace.name == "unikraft")
         require(cfg == ci.config_for(runtime, runtime / "compute", ci.MODES.index(mode)))
+        if request["schema_version"] == 2:
+            for index, name in enumerate(("ovmf_code", "ovmf_vars", "qemu"), 1):
+                require(name in boot_inputs["files"])
+                record = boot_inputs["files"][name]
+                metadata = record["metadata"]
+                seconds_m, nanoseconds_m = divmod(
+                    metadata[7], 1_000_000_000)
+                seconds_c, nanoseconds_c = divmod(
+                    metadata[8], 1_000_000_000)
+                require(request["pins"][index] == {
+                    "device_major": os.major(metadata[0]),
+                    "device_minor": os.minor(metadata[0]),
+                    "inode": metadata[1],
+                    "mode": metadata[2],
+                    "uid": metadata[3],
+                    "gid": metadata[4],
+                    "nlink": metadata[5],
+                    "size": metadata[6],
+                    "mtime_seconds": seconds_m,
+                    "mtime_nanoseconds": nanoseconds_m,
+                    "ctime_seconds": seconds_c,
+                    "ctime_nanoseconds": nanoseconds_c,
+                    "sha256": list(bytes.fromhex(record["sha256"])),
+                })
+            compute = ci.document(stage / "boots" / mode / "compute")
+            require(compute["input_pins"] == request["pins"])
 
 
 def pack(handoff, stage, archive, source, validator):
@@ -697,13 +817,17 @@ def publish_ci(handoff):
     require(handoff.ci.read(runtime / "evidence/runtime-cleanup.txt", 128)
             == b"primary=0 cleanup=0\n")
     output.mkdir(mode=0o700)
+    start = handoff.ci.document(
+        runtime / "compute/evidence/build-start.json")
     handoff.ci.run(runtime / "compute", "public-validator-build", [
         handoff.ci.tool("zig"), "build", "--build-file",
         handoff.ci.REPO / "support/tools/hyperv/direct/build.zig",
         "--cache-dir", runtime / "compute/cache",
         "--global-cache-dir", runtime / "compute/global-cache",
         "--prefix", runtime / "compute/public-tools",
-        "-Doptimize=ReleaseSafe", "-j2", "install"], 600)
+        "-Doptimize=ReleaseSafe", "-j2", "install"], 600,
+        input_records=handoff.ci.consumer_file_records(
+            start["consumer_inputs"]))
     handoff.export(runtime, stage)
     validator = runtime / "compute/public-tools/bin/uk-wamr-direct-validate"
     archive = output / "tiny-aot-public-source.zip"
