@@ -1391,6 +1391,34 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                     self.assertRaisesRegex(ci.Refusal, "dependency custody changed"):
                 ci.run_custodied(runtime, expected, compute, "adapter", ["fixture"])
 
+    def test_run_custodied_revalidates_extra_inputs_as_boot_roles(self):
+        expected = {"consumer_inputs": {"schema": "consumer"}}
+        boot_inputs = {"schema": "boot"}
+        boot_paths = {"qemu": self.root / "qemu"}
+        with mock.patch.object(ci, "require_build_custody"), \
+                mock.patch.object(ci, "require_boot_inputs") as verify_boot, \
+                mock.patch.object(
+                    ci, "consumer_file_records", return_value={}), \
+                mock.patch.object(ci, "run", return_value=self.root / "log"):
+            self.assertEqual(
+                ci.run_custodied(
+                    self.root, expected, self.root, "boot", ["fixture"],
+                    extra_inputs=boot_inputs, extra_input_paths=boot_paths),
+                self.root / "log",
+            )
+        self.assertEqual(
+            verify_boot.call_args_list,
+            [
+                mock.call(self.root, boot_paths, boot_inputs),
+                mock.call(self.root, boot_paths, boot_inputs),
+            ],
+        )
+        with self.assertRaisesRegex(
+                ci.Refusal, "incomplete extra input custody"):
+            ci.run_custodied(
+                self.root, expected, self.root, "boot", ["fixture"],
+                extra_inputs=boot_inputs)
+
     def test_source_custody_detects_ignored_create_delete_metadata(self):
         repository = self.root / "repository"
         repository.mkdir(mode=0o700)

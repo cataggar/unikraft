@@ -2613,6 +2613,11 @@ def require_consumer_inputs(runtime, expected, content=False):
         runtime, content=content, expected=expected)
 
 
+def require_boot_inputs(runtime, paths, expected, content=False):
+    boot_input_state(
+        runtime, paths, content=content, expected=expected)
+
+
 def verify_package_hashes(runtime, root, packages, expected_inputs):
     work = root / "dependency-hash-work"
     cache = root / "dependency-hash-cache"
@@ -2724,17 +2729,19 @@ def require_dependency_custody(root, expected):
 
 
 def run_custodied(runtime, expected, root, stage, args, seconds=600,
-                  limit=8 * MIB, extra_inputs=None):
+                  limit=8 * MIB, extra_inputs=None, extra_input_paths=None):
+    require((extra_inputs is None) == (extra_input_paths is None),
+            "incomplete extra input custody")
     require_build_custody(runtime, expected)
     if extra_inputs is not None:
-        require_consumer_inputs(runtime, extra_inputs)
+        require_boot_inputs(runtime, extra_input_paths, extra_inputs)
     records = consumer_file_records(expected["consumer_inputs"])
     if extra_inputs is not None:
         records.update(consumer_file_records(extra_inputs))
     output = run(
         root, stage, args, seconds, limit, input_records=records)
     if extra_inputs is not None:
-        require_consumer_inputs(runtime, extra_inputs)
+        require_boot_inputs(runtime, extra_input_paths, extra_inputs)
     require_build_custody(runtime, expected)
     return output
 
@@ -3126,7 +3133,7 @@ def boot(runtime):
     output = run_custodied(
         runtime, initial, root, "package",
         [paths["package_tool"], "package", efi, package_output],
-        150, 64 * 1024, extra_inputs=inputs)
+        150, 64 * 1024, extra_inputs=inputs, extra_input_paths=paths)
     FAILURE_STAGE = "boot-package-result"
     package = document(output)
     require(package["image"]["efi"]["sha256"] == digest(efi)
@@ -3147,7 +3154,7 @@ def boot(runtime):
         run_custodied(
             runtime, initial, root, mode,
             boot_args(paths["local_boot_tool"], config), 90, 64 * 1024,
-            extra_inputs=inputs)
+            extra_inputs=inputs, extra_input_paths=paths)
         FAILURE_STAGE = mode + "-result"
         result = check_boot(config, identity, inputs)
         expected = package["image"]["raw" if index < 2 else "vhd"]["sha256"]
@@ -3158,7 +3165,7 @@ def boot(runtime):
     output = run_custodied(
         runtime, initial, root, "inspect",
         [paths["package_tool"], "inspect", efi, root / "package"],
-        150, 64 * 1024, extra_inputs=inputs)
+        150, 64 * 1024, extra_inputs=inputs, extra_input_paths=paths)
     require(document(output) == package, "physical package reload changed")
     verify_inputs(content=True)
     FAILURE_STAGE = "boot-final-custody"
