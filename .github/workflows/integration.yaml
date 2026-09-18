@@ -1448,6 +1448,7 @@ jobs:
             "-Dhost-cxx=zig c++"
             "-Dhost-cflags=-fno-sanitize=null"
             "-Dmake-arg=AR=zig ar"
+            "-Dmake-arg=ZIG=zig"
             "-Dmake-arg=NM=llvm-nm"
             "-Dmake-arg=OBJCOPY=llvm-objcopy"
             "-Dmake-arg=OBJDUMP=llvm-objdump"

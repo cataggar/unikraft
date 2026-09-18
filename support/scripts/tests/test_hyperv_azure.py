@@ -2623,6 +2623,16 @@ class HypervWorkflowTest(unittest.TestCase):
                     f"/native-local-boot/{mode}/{artifact}", retained
                 )
 
+    def test_native_hyperv_images_bind_the_zig_make_tool(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        step = workflow.split(
+            "    - name: Solve and build native Hyper-V acceptance and SMP images\n",
+            1,
+        )[1].split("\n    - name:", 1)[0]
+        self.assertIn('"-Dmake-arg=ZIG=zig"', step)
+
     def test_wamr_and_local_boot_packages_restore_outside_source(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/integration.yaml"
