@@ -13,6 +13,24 @@ fn unitConfig() boot.config.Config {
     return .{ .source = .{ .kind = .image, .path = "/synthetic/image" }, .ovmf_code = "/synthetic/code", .ovmf_vars = "/synthetic/vars", .qemu = "/synthetic/qemu", .work_dir = "/synthetic/work", .expect = "Hello world!" };
 }
 
+fn unitPin(seed: u8, size: u64, mode: u16) boot.files.Pin {
+    return .{
+        .device_major = 8,
+        .device_minor = seed,
+        .inode = 1000 + @as(u64, seed),
+        .mode = mode,
+        .uid = 1000,
+        .gid = 100,
+        .nlink = 1,
+        .size = size,
+        .mtime_seconds = 1_700_000_000 + @as(i64, seed),
+        .mtime_nanoseconds = 100 + @as(u32, seed),
+        .ctime_seconds = 1_700_000_100 + @as(i64, seed),
+        .ctime_nanoseconds = 200 + @as(u32, seed),
+        .sha256 = [_]u8{seed} ** 32,
+    };
+}
+
 test "legacy application and each required milestone including terminal" {
     const config = unitConfig();
     try boot.serial.validate(a, fixture_log, config);
@@ -193,10 +211,10 @@ test "canonical request serializes and validates the typed qcow2 source tag" {
         .supervisor_pid = 123,
         .config = config,
         .pins = .{
-            .{ .size = 64 * 1024, .sha256 = [_]u8{1} ** 32 },
-            .{ .size = 4096, .sha256 = [_]u8{2} ** 32 },
-            .{ .size = 4096, .sha256 = [_]u8{3} ** 32 },
-            .{ .size = 4096, .sha256 = [_]u8{4} ** 32 },
+            unitPin(1, 64 * 1024, 0o100644),
+            unitPin(2, 4096, 0o100644),
+            unitPin(3, 4096, 0o100644),
+            unitPin(4, 4096, 0o100755),
         },
     };
     try request.validate();
@@ -205,15 +223,53 @@ test "canonical request serializes and validates the typed qcow2 source tag" {
     var document = try core.contracts.Document.parse(a, encoded, .{ .bytes = boot.config.max_record });
     defer document.deinit();
     try document.requireCanonical(a, encoded);
+    try t.expect(std.mem.indexOf(u8, encoded, "\"schema_version\":2") != null);
     try t.expect(std.mem.indexOf(u8, encoded, "\"source\":{\"kind\":\"qcow2\",\"path\":\"/synthetic/disk.qcow2\"}") != null);
+    for ([_][]const u8{
+        "\"device_major\":", "\"device_minor\":", "\"inode\":",         "\"mode\":",              "\"uid\":",           "\"gid\":",
+        "\"nlink\":",        "\"size\":",         "\"mtime_seconds\":", "\"mtime_nanoseconds\":", "\"ctime_seconds\":", "\"ctime_nanoseconds\":",
+        "\"sha256\":",
+    }) |field| try t.expect(std.mem.indexOf(u8, encoded, field) != null);
     const parsed = try std.json.parseFromSlice(boot.runner.Request, a, encoded, .{ .ignore_unknown_fields = false });
     defer parsed.deinit();
     try parsed.value.validate();
+    try t.expectEqual(@as(u8, 2), parsed.value.schema_version);
+    try t.expectEqual(request.pins, parsed.value.pins);
     try t.expectEqual(boot.config.SourceKind.qcow2, parsed.value.config.source.kind);
     try t.expectEqualStrings(config.source.path, parsed.value.config.source.path);
     const roundtrip = try boot.config.encode(a, parsed.value);
     defer a.free(roundtrip);
     try t.expectEqualStrings(encoded, roundtrip);
+
+    var wrong_version = parsed.value;
+    wrong_version.schema_version = 1;
+    try t.expectError(error.InvalidRequest, wrong_version.validate());
+    var invalid_metadata = parsed.value;
+    invalid_metadata.pins[0].mtime_nanoseconds = std.time.ns_per_s;
+    try t.expectError(error.InvalidRequest, invalid_metadata.validate());
+
+    const LegacyPin = struct { size: u64, sha256: [32]u8 };
+    const LegacyRequest = struct {
+        schema_version: u8 = 1,
+        supervisor_pid: u32,
+        config: boot.config.Config,
+        pins: [4]LegacyPin,
+    };
+    const legacy = try boot.config.encode(a, LegacyRequest{
+        .supervisor_pid = 123,
+        .config = config,
+        .pins = .{
+            .{ .size = 64 * 1024, .sha256 = [_]u8{1} ** 32 },
+            .{ .size = 4096, .sha256 = [_]u8{2} ** 32 },
+            .{ .size = 4096, .sha256 = [_]u8{3} ** 32 },
+            .{ .size = 4096, .sha256 = [_]u8{4} ** 32 },
+        },
+    });
+    defer a.free(legacy);
+    if (std.json.parseFromSlice(boot.runner.Request, a, legacy, .{ .ignore_unknown_fields = false })) |accepted| {
+        defer accepted.deinit();
+        return error.AcceptedLegacyRequest;
+    } else |_| {}
 }
 
 const Fixture = struct {
@@ -1137,6 +1193,90 @@ test "artifact snapshots reject shrinking growing replacement empty and over-lim
     }
 }
 
+test "v2 pins distinguish identical-byte inode replacement while retained descriptor keeps the original object" {
+    const f = try Fixture.init(0, true);
+    defer f.deinit();
+    const original = try boot.files.Set.open(io, f.config);
+    defer original.close(io);
+    const retained_pin = original.items[0].pin;
+    var bytes: [2048]u8 = undefined;
+    try t.expectEqual(bytes.len, try original.items[0].file.readPositionalAll(io, &bytes, 0));
+
+    try f.directory.dir.writeFile(io, .{
+        .sub_path = "replacement.raw",
+        .data = &bytes,
+        .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) },
+    });
+    try t.expectEqual(.SUCCESS, linux.errno(linux.renameat(
+        f.directory.dir.handle,
+        "replacement.raw",
+        f.directory.dir.handle,
+        "public,source.raw",
+    )));
+
+    const replacement = try boot.files.Set.open(io, f.config);
+    defer replacement.close(io);
+    const replacement_pin = replacement.items[0].pin;
+    try t.expectEqual(retained_pin.sha256, replacement_pin.sha256);
+    try t.expectEqual(retained_pin.size, replacement_pin.size);
+    try t.expect(retained_pin.inode != replacement_pin.inode);
+    try t.expect(!std.meta.eql(retained_pin, replacement_pin));
+
+    const retained_now = try boot.files.snapshot(original.items[0].file);
+    try t.expectEqual(retained_pin.device_major, retained_now.dev_major);
+    try t.expectEqual(retained_pin.device_minor, retained_now.dev_minor);
+    try t.expectEqual(retained_pin.inode, retained_now.ino);
+    var retained_bytes: [2048]u8 = undefined;
+    try t.expectEqual(retained_bytes.len, try original.items[0].file.readPositionalAll(io, &retained_bytes, 0));
+    try t.expectEqualSlices(u8, &bytes, &retained_bytes);
+    try t.expectError(error.ArtifactChanged, original.verify(io, f.config));
+}
+
+test "v2 pins reject metadata-only and link-count changes while preserving public hardlink policy" {
+    {
+        const f = try Fixture.init(0, true);
+        defer f.deinit();
+        const original = try boot.files.Set.open(io, f.config);
+        defer original.close(io);
+        const before = original.items[0].pin;
+        const source = try f.directory.dir.openFile(io, "public,source.raw", .{ .mode = .read_write });
+        defer source.close(io);
+        try source.setPermissions(io, .fromMode((before.mode & 0o777) ^ 0o100));
+        const changed = try boot.files.Set.open(io, f.config);
+        defer changed.close(io);
+        try t.expectEqual(before.sha256, changed.items[0].pin.sha256);
+        try t.expectEqual(before.inode, changed.items[0].pin.inode);
+        try t.expect(before.mode != changed.items[0].pin.mode);
+        try t.expectError(error.ArtifactChanged, original.verify(io, f.config));
+    }
+    {
+        const f = try Fixture.init(0, true);
+        defer f.deinit();
+        const original = try boot.files.Set.open(io, f.config);
+        defer original.close(io);
+        try t.expectEqual(@as(u32, 1), original.items[0].pin.nlink);
+        try t.expectEqual(.SUCCESS, linux.errno(linux.linkat(
+            f.directory.dir.handle,
+            "public,source.raw",
+            f.directory.dir.handle,
+            "hard.raw",
+            0,
+        )));
+        try t.expectError(error.ArtifactChanged, original.verify(io, f.config));
+
+        var hardlink_config = f.config;
+        hardlink_config.source.path = try std.fs.path.join(f.arena.allocator(), &.{ f.path, "hard.raw" });
+        const hardlinked = try boot.files.Set.open(io, hardlink_config);
+        defer hardlinked.close(io);
+        try t.expectEqual(@as(u32, 2), hardlinked.items[0].pin.nlink);
+
+        try f.directory.dir.symLink(io, "public,source.raw", "linked.raw", .{});
+        var symlink_config = f.config;
+        symlink_config.source.path = try std.fs.path.join(f.arena.allocator(), &.{ f.path, "linked.raw" });
+        try t.expectError(error.UnsafeFile, boot.files.Set.open(io, symlink_config));
+    }
+}
+
 test "typed child records reject unknown duplicate incomplete malformed and rebound inputs" {
     for ([_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 }) |mode| {
         const f = try Fixture.init(0, true);
@@ -1155,8 +1295,8 @@ test "typed child records reject unknown duplicate incomplete malformed and rebo
         if (mode == 6) request.config.cpus = 9;
         const encoded = try boot.config.encode(alloc, request);
         const record = switch (mode) {
-            0 => try std.mem.replaceOwned(u8, alloc, encoded, "\"schema_version\":1", "\"schema_version\":1,\"argv\":[]"),
-            1 => try std.mem.replaceOwned(u8, alloc, encoded, "\"schema_version\":1", "\"schema_version\":1,\"schema_version\":1"),
+            0 => try std.mem.replaceOwned(u8, alloc, encoded, "\"schema_version\":2", "\"schema_version\":2,\"argv\":[]"),
+            1 => try std.mem.replaceOwned(u8, alloc, encoded, "\"schema_version\":2", "\"schema_version\":2,\"schema_version\":2"),
             2 => try std.mem.replaceOwned(u8, alloc, encoded, "\"cpus\":1,", ""),
             3 => encoded[0 .. encoded.len - 3],
             7 => try std.mem.replaceOwned(u8, alloc, encoded, "\"timeout_ms\":3000", "\"timeout_ms\":3000.0"),

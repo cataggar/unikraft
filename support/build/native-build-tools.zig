@@ -2,7 +2,12 @@
 
 const std = @import("std");
 
-pub fn metadataTool(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step.Compile {
+pub fn metadataTool(
+    b: *std.Build,
+    root: std.Build.LazyPath,
+    bison: []const u8,
+    flex: []const u8,
+) *std.Build.Step.Compile {
     const tool = b.addExecutable(.{
         .name = "unikraft-native-config-metadata",
         .root_module = b.createModule(.{
@@ -13,7 +18,7 @@ pub fn metadataTool(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step.Com
         }),
     });
     const flags = c_flags ++ [_][]const u8{"-DUK_KCONFIG_METADATA=1"};
-    addKconfigSources(b, root, tool.root_module, flags);
+    addKconfigSources(b, root, tool.root_module, flags, bison, flex);
     tool.root_module.addCSourceFile(.{
         .file = root.path(b, "support/build/native-kconfig-bridge.c"),
         .flags = flags,
@@ -21,7 +26,12 @@ pub fn metadataTool(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step.Com
     return tool;
 }
 
-pub fn legacyConfigFixture(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step.Compile {
+pub fn legacyConfigFixture(
+    b: *std.Build,
+    root: std.Build.LazyPath,
+    bison: []const u8,
+    flex: []const u8,
+) *std.Build.Step.Compile {
     const tool = b.addExecutable(.{
         .name = "unikraft-legacy-kconfig-fixture",
         .root_module = b.createModule(.{
@@ -30,7 +40,7 @@ pub fn legacyConfigFixture(b: *std.Build, root: std.Build.LazyPath) *std.Build.S
             .link_libc = true,
         }),
     });
-    addKconfigSources(b, root, tool.root_module, c_flags);
+    addKconfigSources(b, root, tool.root_module, c_flags, bison, flex);
     tool.root_module.addCSourceFile(.{
         .file = root.path(b, "support/kconfig/conf.c"),
         .flags = c_flags,
@@ -48,12 +58,14 @@ fn addKconfigSources(
     root: std.Build.LazyPath,
     module: *std.Build.Module,
     flags: []const []const u8,
+    bison: []const u8,
+    flex: []const u8,
 ) void {
-    const parser = b.addSystemCommand(&.{ "bison", "--debug", "--defines" });
+    const parser = b.addSystemCommand(&.{ bison, "--debug", "--defines" });
     parser.addArg("-o");
     const parser_c = parser.addOutputFileArg("parser.tab.c");
     parser.addFileArg(root.path(b, "support/kconfig/parser.y"));
-    const lexer = b.addSystemCommand(&.{"flex"});
+    const lexer = b.addSystemCommand(&.{flex});
     lexer.addArg("-o");
     const lexer_c = lexer.addOutputFileArg("lexer.lex.c");
     lexer.addFileArg(root.path(b, "support/kconfig/lexer.l"));

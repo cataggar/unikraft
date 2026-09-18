@@ -783,6 +783,7 @@ jobs:
       with:
         submodules: recursive
         persist-credentials: false
+        fetch-depth: 0
 
     - name: Restore independent fixture tools
       uses: ./.github/actions/hyperv-fixture-setup
@@ -917,14 +918,18 @@ jobs:
         # Do not move this independent dependency restoration before collection.
         # WAMR uses the same isolated fake backend, never an authenticated CLI.
         export PYTHONDONTWRITEBYTECODE=1
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/local_boot/build.zig \
+          support/tools/hyperv/local_boot/build.zig.zon "${root}/restore/"
+        zig build --build-file "${root}/restore/build.zig" --fetch=all -j2 \
+          --cache-dir "${root}/restore-cache" --global-cache-dir "${root}/global"
         zig build --build-file support/build/wamr-native-ci/build.zig -j2 \
+          --system "${root}/restore/zig-pkg" \
           --cache-dir "${root}/compute-cache" --global-cache-dir "${root}/global" \
           --prefix "${root}/compute-tools" -Doptimize=ReleaseSafe test install
         WAMR_DIRECT_TOOLS="${root}/tools/bin" \
         WAMR_CI_PACKAGE="${root}/compute-tools/bin/wamr-ci-package" \
           python3 -m unittest discover -s support/tools/hyperv/direct/tests -v
-        # Generated package sources are not part of the guarded source closure.
-        mv support/build/wamr-native-ci/zig-pkg "${root}/compute-zig-pkg"
 
     - name: Retain bounded runtime fixture evidence
       if: always()
@@ -1364,10 +1369,16 @@ jobs:
         awk -f support/tools/hyperv/preparation/ci-objcopy-version.awk \
           "${root}/fixture-objcopy-version.txt"
         sha256sum -- "${objcopy}" > "${root}/fixture-objcopy-sha256.txt"
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/local_boot/build.zig \
+          support/tools/hyperv/local_boot/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
         for mode in Debug ReleaseSafe; do
           mkdir -p "${root}/${mode}/fixtures"
           ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
             zig build --build-file support/tools/hyperv/local_boot/build.zig \
+              --system "${root}/restore/zig-pkg" \
               --cache-dir "${root}/${mode}/zig-local-cache" \
               --prefix "${root}/${mode}/out" \
               -Dtest-root="${root}/${mode}/fixtures" \
@@ -1437,6 +1448,7 @@ jobs:
             "-Dhost-cxx=zig c++"
             "-Dhost-cflags=-fno-sanitize=null"
             "-Dmake-arg=AR=zig ar"
+            "-Dmake-arg=ZIG=zig"
             "-Dmake-arg=NM=llvm-nm"
             "-Dmake-arg=OBJCOPY=llvm-objcopy"
             "-Dmake-arg=OBJDUMP=llvm-objdump"

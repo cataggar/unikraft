@@ -16,6 +16,14 @@ fn parse(args: []const []const u8) !Args {
     return .{ .command = command, .efi = args[2], .state = args[3] };
 }
 
+fn openEmptyState(io: std.Io, path: []const u8) !image.core.private_files.Directory {
+    const root = try image.core.private_files.Directory.open(io, path);
+    errdefer root.close(io);
+    var entries = root.dir.iterate();
+    if (try entries.next(io) != null) return error.StateAlreadyUsed;
+    return root;
+}
+
 pub fn main(init: std.process.Init) void {
     execute(init) catch {
         // No paths, guest bytes, environment, or raw operating-system errors.
@@ -35,7 +43,7 @@ fn execute(init: std.process.Init) !void {
     const efi = try f.record(a, io, input.efi, c.max_efi, false);
     const producer = try f.record(a, io, self, c.max_tool, true);
     const root = if (input.command == .package)
-        try f.create(io, input.state)
+        try openEmptyState(io, input.state)
     else
         try image.core.private_files.Directory.open(io, input.state);
     defer root.close(io);

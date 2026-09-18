@@ -50,7 +50,9 @@ def main():
             fake_strip,
             """#!/usr/bin/env python3
 import pathlib, shutil, sys
-shutil.copyfile(sys.argv[sys.argv.index("-o") - 1], sys.argv[sys.argv.index("-o") + 1])
+if "--strip-all" not in sys.argv or "-s" in sys.argv:
+    raise SystemExit(2)
+shutil.copyfile(sys.argv[-2], sys.argv[-1])
 """,
         )
         write_executable(
@@ -119,7 +121,8 @@ print(" LOAD 0x001000 0x0000000040201000 0x0000000040201000 0x1000 0x2000 RW  0x
         x86_bootinfo = root / "x86 with boot info.elf"
         x86_final = root / "x86 multiboot image.elf"
         x86_debug.write_bytes(elf64(62))
-        invoke(runner, "strip", "--tool", strip_cmd, x86_debug, x86_image)
+        invoke(runner, "strip", "--objcopy-interface", "--tool", strip_cmd,
+               x86_debug, x86_image)
         invoke(
             runner,
             "bootinfo",
@@ -169,7 +172,8 @@ print(" LOAD 0x001000 0x0000000040201000 0x0000000040201000 0x1000 0x2000 RW  0x
         assert relocation_blob[:4] == (0x0BADB0B0).to_bytes(4, "little")
         assert relocation_blob not in efi_debug.read_bytes()
         assert efi_relocated.read_bytes().endswith(relocation_blob)
-        invoke(runner, "strip", "--tool", strip_cmd, efi_relocated, efi_stripped)
+        invoke(runner, "strip", "--objcopy-interface", "--tool", strip_cmd,
+               efi_relocated, efi_stripped)
         assert efi_stripped.read_bytes().endswith(relocation_blob)
         invoke(
             runner,
@@ -213,7 +217,8 @@ print(" LOAD 0x001000 0x0000000040201000 0x0000000040201000 0x1000 0x2000 RW  0x
         arm_binary = root / "arm raw image.bin"
         arm_final = root / "arm Linux Image"
         arm_debug.write_bytes(elf64(183))
-        invoke(runner, "strip", "--tool", strip_cmd, arm_debug, arm_image)
+        invoke(runner, "strip", "--objcopy-interface", "--tool", strip_cmd,
+               arm_debug, arm_image)
         invoke(
             runner,
             "bootinfo",

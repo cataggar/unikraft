@@ -14,7 +14,7 @@ VMBUS_ZIG_GLOBAL_CACHE := $(LIBVMBUS_BUILD)/zig-global-cache
 $(VMBUS_PROTOCOL_OBJ): $(LIBVMBUS_BASE)/vmbus_protocol.zig $(LIBVMBUS_BASE)/Makefile.uk
 	$(call build_cmd,ZIG,libvmbus,$(notdir $@),\
 		mkdir -p $(VMBUS_ZIG_CACHE) $(VMBUS_ZIG_GLOBAL_CACHE) && \
-		zig build-obj -target x86_64-freestanding-none -OReleaseFast \
+		$(ZIG) build-obj -target x86_64-freestanding-none -OReleaseFast \
 			-mcpu=baseline+soft_float-x87-mmx-sse-sse2-avx-avx2 \
 			-fPIC -fsingle-threaded -mno-red-zone \
 			-fno-stack-check -fno-stack-protector -fno-unwind-tables \
@@ -30,7 +30,7 @@ VMBUS_CHANNEL_OBJ := $(LIBVMBUS_BUILD)/vmbus_channel_core.o
 $(VMBUS_CHANNEL_OBJ): $(LIBVMBUS_BASE)/vmbus_channel.zig
 	$(call build_cmd,ZIG,libvmbus,$(notdir $@),\
 		mkdir -p $(VMBUS_ZIG_CACHE) $(VMBUS_ZIG_GLOBAL_CACHE) && \
-		zig build-obj -target x86_64-freestanding-none -OReleaseFast \
+		$(ZIG) build-obj -target x86_64-freestanding-none -OReleaseFast \
 			-fPIC -fsingle-threaded -mno-red-zone \
 			-fno-stack-check -fno-stack-protector -fno-unwind-tables \
 			--cache-dir $(VMBUS_ZIG_CACHE) \

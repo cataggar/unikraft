@@ -18,6 +18,7 @@ spec.loader.exec_module(ci)
 NAMES = ("efi", "debug_elf", "bootinfo", "raw", "vhd", "runtime", "compiler",
          "wasm", "cwasm", "config", "runtime_identity", "image_identity",
          "local_result", "package", "build", "build_start", "boot_inputs")
+FAILURE_STAGE = "handoff"
 
 
 def private(path):
@@ -59,8 +60,9 @@ def export(runtime, output):
     private(output.parent)
     root = runtime / "compute"
     records = result_records(root)
-    before = ci.producer_inputs(runtime)
-    ci.require(before == ci.document(root / "evidence/build-start.json"),
+    expected = ci.document(root / "evidence/build-start.json")
+    before = ci.producer_inputs(runtime, expected["consumer_inputs"])
+    ci.require(before == expected,
                "producer inputs changed")
     build = ci.check_build()
     ci.require(build == ci.document(root / "evidence/build.json"), "build changed")
@@ -69,20 +71,24 @@ def export(runtime, output):
              "local_boot_tool": root / "tools/bin/uk-hyperv-local-boot",
              "qemu": runtime / "bin/qemu-system-x86_64",
              "ovmf_code": runtime / "firmware/code.fd",
-             "ovmf_vars": runtime / "firmware/vars.fd"}
-    ci.require(inputs == {key: ci.digest(path) for key, path in tools.items()},
-               "boot tools changed")
+             "ovmf_vars": runtime / "firmware/vars.fd",
+             "efi": ci.APP / "build" / ci.EFI}
+    ci.boot_input_state(runtime, tools, expected=inputs)
     for i, mode in enumerate(ci.MODES):
-        checked = ci.check_boot(ci.config_for(runtime, root, i), build["runtime"])
+        checked = ci.check_boot(
+            ci.config_for(runtime, root, i), build["runtime"], inputs)
         ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
                    "physical local result changed")
+    ci.require_build_custody(runtime, before)
     output.mkdir(mode=0o700)
     for name in ("private", "evidence", "artifacts", "boots"):
         (output / name).mkdir(mode=0o700)
+    input_records = ci.consumer_file_records(expected["consumer_inputs"])
+    input_records.update(ci.consumer_file_records(inputs))
     inspected = ci.document(ci.run(
         output, "handoff-inspect",
         [tools["package_tool"], "inspect", ci.APP / "build" / ci.EFI, root / "package"],
-        150, 64 * 1024))
+        150, 64 * 1024, input_records=input_records))
     packaged = ci.document(root / "evidence/package.json")
     ci.require(inspected["producer_sha256"] == packaged["producer_sha256"]
                and all(inspected["image"][key] == value
@@ -126,9 +132,10 @@ def export(runtime, output):
     evidence = [retain(root / "evidence" / name, output / "evidence" / name)
                 for name in sorted(records)]
     ci.require(result_records(root) == records and ci.check_build() == build
-               and ci.producer_inputs(runtime) == before
-               and inputs == {key: ci.digest(path) for key, path in tools.items()},
+               and ci.producer_inputs(
+                   runtime, expected["consumer_inputs"]) == before,
                "inputs changed during handoff")
+    ci.boot_input_state(runtime, tools, content=True, expected=inputs)
     by_name = dict(zip(NAMES, artifacts))
     bundle = {
         "schema": "uk.wamr.local-image-handoff", "version": 1,
@@ -176,6 +183,7 @@ def plan(bundle_path, output):
 
 
 def main():
+    global FAILURE_STAGE
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     exp = sub.add_parser("export")
@@ -185,11 +193,19 @@ def main():
     pln.add_argument("--bundle", type=Path, required=True)
     pln.add_argument("--output", type=Path, required=True)
     sub.add_parser("public-source-bundle", help="Explicit fixed public-repository tiny CI publication only")
+    verify = sub.add_parser("verify-public-source-bundle")
+    verify.add_argument("--archive", type=Path, required=True)
+    verify.add_argument("--expected-source", required=True)
+    verify.add_argument("--expected-tree", required=True)
+    verify.add_argument("--expected-archive-sha256", required=True)
+    verify.add_argument("--run-id", required=True)
+    verify.add_argument("--run-attempt", required=True)
     imp = sub.add_parser("import-public-source-bundle")
     imp.add_argument("--archive", type=Path, required=True)
     imp.add_argument("--output", type=Path, required=True)
     imp.add_argument("--expected-source", required=True)
     imp.add_argument("--expected-tree", required=True)
+    imp.add_argument("--expected-archive-sha256")
     imp.add_argument("--run-id", required=True)
     imp.add_argument("--run-attempt", required=True)
     imp.add_argument("--validator", type=Path, required=True)
@@ -201,13 +217,33 @@ def main():
         plan(args.bundle, args.output)
     else:
         import public_bundle
+
         if args.command == "public-source-bundle":
-            public_bundle.publish_ci(sys.modules[__name__])
+            FAILURE_STAGE = "public-entry"
+            unused_archive, archive_sha256, source_tree = (
+                public_bundle.publish_ci(sys.modules[__name__]))
+            del unused_archive
+            print("Public source archive SHA-256: " + archive_sha256)
+            print("Public source tree: " + source_tree)
         else:
+            FAILURE_STAGE = (
+                "public-verify"
+                if args.command == "verify-public-source-bundle"
+                else "public-import")
             expected = dict(repository="cataggar/unikraft", run_id=args.run_id,
                             run_attempt=args.run_attempt, source_revision=args.expected_source,
                             source_tree=args.expected_tree, wamr_revision=ci.REVISION)
-            public_bundle.import_bundle(sys.modules[__name__], args.archive, args.output, expected, args.validator)
+            if args.command == "verify-public-source-bundle":
+                unused_bundle, archive_sha256 = (
+                    public_bundle.verify_archive_with_digest(
+                        sys.modules[__name__], args.archive, expected,
+                        args.expected_archive_sha256))
+                del unused_bundle
+                print("Public source archive SHA-256: " + archive_sha256)
+            else:
+                public_bundle.import_bundle(
+                    sys.modules[__name__], args.archive, args.output, expected,
+                    args.expected_archive_sha256, args.validator)
     print("Compute handoff/plan prepared; authority=not_admitted. No Azure operations.")
 
 
@@ -215,5 +251,6 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile):
-        print("Compute handoff refused; original local records are unchanged.", file=sys.stderr)
+        print("Compute handoff refused at " + FAILURE_STAGE
+              + "; original local records are unchanged.", file=sys.stderr)
         sys.exit(1)

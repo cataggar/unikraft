@@ -2,6 +2,8 @@
 set -euo pipefail
 umask 077
 unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT QEMU_MODULE_DIR
+failure_stage=invocation
+trap 'status=$?; echo "Native runtime wrapper refused: ${failure_stage}" >&2; exit "${status}"' ERR
 
 if [[ ( $# != 1 && $# != 2 && $# != 4 ) || "${1:-}" != /* ||
       "${GITHUB_ACTIONS:-}" != true || "$(id -u)" -eq 0 ]]; then
@@ -28,8 +30,6 @@ else
   driver_args=(boot "${root}" "${root}/bin/qemu-system-x86_64")
 fi
 source="${root}/runtime/libfdt.so.1"
-target=/usr/lib/x86_64-linux-gnu/libfdt.so.1
-ownership="${root}/evidence/runtime-created.txt"
 expected=66c111808e61c7f6be6715b4b03d0fe75beb5bc5b3a8809608d58d99a6bc9828
 kvm_identity=
 runtime_started="$(date --iso-8601=seconds)"
@@ -44,7 +44,7 @@ done
 
 cleanup() {
   primary=$?
-  trap - EXIT HUP INT TERM
+  trap - ERR EXIT HUP INT TERM
   cleanup_status=0
   if [[ -n "${kvm_identity}" ]]; then
     if [[ -c /dev/kvm && ! -L /dev/kvm ]] &&
@@ -68,18 +68,6 @@ cleanup() {
         }
     fi
   fi
-  if [[ -f "${ownership}" ]]; then
-    identity="$(< "${ownership}")"
-    if [[ -f "${target}" && ! -L "${target}" ]] &&
-       [[ "$(stat -c '%d:%i:%u:%g' "${target}")" = "${identity}" ]] &&
-       [[ "$(stat -c %h "${target}")" = 1 ]]; then
-      sudo rm -- "${target}" || cleanup_status=$?
-      if [[ -e "${target}" || -L "${target}" ]]; then cleanup_status=1; fi
-    else
-      echo "Managed runtime identity changed; refusing unrelated cleanup." >&2
-      cleanup_status=1
-    fi
-  fi
   printf 'primary=%s cleanup=%s\n' "${primary}" "${cleanup_status}" \
     > "${root}/evidence/runtime-cleanup.txt" || cleanup_status=1
   if [[ "${primary}" -ne 0 ]]; then exit "${primary}"; fi
@@ -90,6 +78,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+failure_stage=kvm-device
 test -c /dev/kvm
 test ! -L /dev/kvm
 test "$(stat -c %u /dev/kvm)" = 0
@@ -102,6 +91,7 @@ grep -Eq '^group::rw-$' "${root}/evidence/kvm-before.acl"
 if grep -Eq '^mask::' "${root}/evidence/kvm-before.acl"; then
   grep -Eq '^mask::rw-$' "${root}/evidence/kvm-before.acl"
 fi
+failure_stage=credentials
 runner_uid="$(id -u)"
 runner_gid="$(id -g)"
 test "$(id -ru)" = "${runner_uid}"
@@ -121,35 +111,16 @@ done
 sha256sum /usr/bin/setpriv /usr/bin/env /usr/bin/bash /etc/group \
   > "${root}/evidence/credential-inputs.sha256"
 
-if [[ -e "${target}" || -L "${target}" ]]; then
-  test -f "${target}"
-  test ! -L "${target}"
-  test "$(stat -c '%u:%g:%h' "${target}")" = 0:0:1
-  [[ "$(stat -c %a "${target}")" = 444 || "$(stat -c %a "${target}")" = 644 ]]
-  test "$(sha256sum "${target}" | cut -d ' ' -f 1)" = "${expected}"
-else
-  # Root opens the exact new file exclusively; record its identity before writing.
-  sudo bash -c '
-    set -euo pipefail
-    set -C
-    umask 077
-    exec 8> "$2"
-    chmod 644 "$2"
-    exec 9> /usr/lib/x86_64-linux-gnu/libfdt.so.1
-    stat -Lc "%d:%i:%u:%g" /proc/self/fd/9 >&8
-    cat -- "$1" >&9
-    chmod 444 /usr/lib/x86_64-linux-gnu/libfdt.so.1
-    sync -f /usr/lib/x86_64-linux-gnu/libfdt.so.1
-  ' _ "${source}" "${ownership}"
-fi
-test "$(sha256sum "${target}" | cut -d ' ' -f 1)" = "${expected}"
-stat -c '%d:%i:%u:%g:%a:%h:%s' "${target}" > "${root}/evidence/managed-libfdt.txt"
+failure_stage=libfdt
+bash .github/scripts/hyperv-native-libfdt-prepare.sh "${root}"
 
+failure_stage=qemu-probe
 bash .github/scripts/hyperv-qemu-candidate.sh \
   "${root}/bin/qemu-system-x86_64" "${root}/bin/qemu-img" "${root}/evidence/managed-probe"
 getfacl --omit-header --no-effective --numeric /dev/kvm > "${root}/evidence/kvm-before-boots.acl"
 # Only this ordinary-user process tree receives the existing device group.
 # No persistent membership, ACL, device mode or udev rule is changed.
+failure_stage=guest-launch
 sudo /usr/bin/setpriv --reuid="${runner_uid}" --regid="${runner_gid}" --groups="${guest_groups}" \
   --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
   /usr/bin/env -i "HOME=${HOME}" "PATH=${PATH}" LC_ALL=C \
@@ -163,6 +134,10 @@ sudo /usr/bin/setpriv --reuid="${runner_uid}" --regid="${runner_gid}" --groups="
     set -euo pipefail
     set -C
     umask 077
+    refuse() {
+      echo "Restricted native guest refused: $1" >&2
+      exit 2
+    }
     awk "/^(Uid|Gid|Groups|CapInh|CapPrm|CapEff|CapBnd|CapAmb|NoNewPrivs):/" \
       "/proc/$$/status" > "$4/evidence/guest-credentials.txt"
     awk -v uid="$1" -v gid="$2" "
@@ -178,18 +153,20 @@ sudo /usr/bin/setpriv --reuid="${runner_uid}" --regid="${runner_gid}" --groups="
       }
       /^NoNewPrivs:/ { if (NF != 2 || \$2 != 1) exit 1; restricted++ }
       END { if (identities != 2 || capabilities != 5 || restricted != 1) exit 1 }
-    " "$4/evidence/guest-credentials.txt"
+    " "$4/evidence/guest-credentials.txt" || refuse credentials
     actual_groups="$(awk "/^Groups:/ { for (i=2; i<=NF; i++) print \$i }" \
       "$4/evidence/guest-credentials.txt" | sort -nu | tr "\n" ,)"
-    test "${actual_groups%,}" = "$3"
-    test "$(stat -c "%d:%i:%u:%g:%t:%T" /dev/kvm)" = "$6"
-    test -r /dev/kvm
-    test -w /dev/kvm
+    test "${actual_groups%,}" = "$3" || refuse groups
+    test "$(stat -c "%d:%i:%u:%g:%t:%T" /dev/kvm)" = "$6" ||
+      refuse kvm-identity
+    test -r /dev/kvm || refuse kvm-read
+    test -w /dev/kvm || refuse kvm-write
     driver="$5"
     shift 6
     exec /usr/bin/bash "$driver" "$@"
   ' _ "${runner_uid}" "${runner_gid}" "${guest_groups}" "${root}" \
   "${driver}" "${kvm_identity}" "${driver_args[@]}"
+failure_stage=post-guest
 id > "${root}/evidence/kvm-caller-after.txt"
 cmp "${root}/evidence/kvm-caller.txt" "${root}/evidence/kvm-caller-after.txt"
 sha256sum -c "${root}/evidence/managed-probe/executables.sha256" \

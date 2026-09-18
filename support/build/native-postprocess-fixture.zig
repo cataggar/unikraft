@@ -52,8 +52,10 @@ pub fn main(init: std.process.Init) !void {
     try equalFile(allocator, io, paths[7], relocated.bytes);
 
     const removed = [_][]const u8{ ".dynamic", ".gnu.hash", ".hash", ".dynsym", ".dynstr", ".rela.dyn" };
+    const strip_objcopy = std.mem.eql(u8, strip, objcopy);
     var strip_args: std.ArrayList([]const u8) = .empty;
     try strip_args.appendSlice(allocator, &.{ native, "strip", "--tool", strip });
+    if (strip_objcopy) try strip_args.append(allocator, "--objcopy-interface");
     for (removed) |name| try strip_args.appendSlice(allocator, &.{ "--remove-section", name });
     try strip_args.appendSlice(allocator, &.{ paths[2], paths[3] });
     try runner.run(io, strip_args.items);
@@ -63,9 +65,13 @@ pub fn main(init: std.process.Init) !void {
     for (removed) |name| try std.testing.expectError(error.MissingSection, stripped.section(name));
     try std.testing.expectEqualSlices(u8, expected_relocations, try stripped.sectionData(try stripped.section(".uk_reloc")));
     strip_args.clearRetainingCapacity();
-    try strip_args.append(allocator, "-s");
+    try strip_args.append(allocator, "--strip-all");
     for (removed) |name| try strip_args.appendSlice(allocator, &.{ "-R", name });
-    try strip_args.appendSlice(allocator, &.{ paths[2], "-o", paths[7] });
+    if (strip_objcopy) {
+        try strip_args.appendSlice(allocator, &.{ paths[2], paths[7] });
+    } else {
+        try strip_args.appendSlice(allocator, &.{ "-o", paths[7], paths[2] });
+    }
     try tool(io, allocator, strip, strip_args.items);
     try equalFile(allocator, io, paths[7], stripped.bytes);
 

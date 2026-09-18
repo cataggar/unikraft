@@ -278,9 +278,11 @@ zig build --build-file support/tools/hyperv/public_image/build.zig \
   --system "$S/restore/zig-pkg" --prefix "$S/outputs/release" \
   -Dtest-root="$S/fixtures" -Doptimize=ReleaseSafe -j2 test install --summary all
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
+  --system "$S/restore/zig-pkg" \
   --prefix "$S/outputs/local-debug" -Dtest-root="$S/fixtures" \
   -j2 test install --summary all
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
+  --system "$S/restore/zig-pkg" \
   --prefix "$S/outputs/local-release" -Dtest-root="$S/fixtures" \
   -Doptimize=ReleaseSafe -j2 test install --summary all
 ```

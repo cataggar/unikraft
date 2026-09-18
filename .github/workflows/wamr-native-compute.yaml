@@ -14,6 +14,15 @@ jobs:
   wamr-native-compute:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      inner-zip-sha256: ${{ steps.public_binding.outputs.inner_zip_sha256 }}
+      container-digest: ${{ steps.public_binding.outputs.container_digest }}
+      artifact-id: ${{ steps.public_binding.outputs.artifact_id }}
+      artifact-url: ${{ steps.public_binding.outputs.artifact_url }}
+      run-id: ${{ steps.public_binding.outputs.run_id }}
+      run-attempt: ${{ steps.public_binding.outputs.run_attempt }}
+      source-sha: ${{ steps.public_binding.outputs.source_sha }}
+      source-tree: ${{ steps.public_binding.outputs.source_tree }}
     defaults:
       run:
         shell: bash
@@ -34,6 +43,8 @@ jobs:
           set -euo pipefail
           test "$(uname -m)" = x86_64
           test -c /dev/kvm
+          sudo install -d -o root -g root -m 755 /d
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci
           export PATH="/usr/bin:/bin:${PATH}"
           if ! (
             for name in bash make bison yacc flex lex m4 python3 getfacl; do
@@ -50,6 +61,13 @@ jobs:
           fi
           mkdir -p .d
 
+      - name: Exercise the production source-custody limits explicitly
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          export PYTHONDONTWRITEBYTECODE=1
+          python3 support/build/wamr-native-ci/tests/source_custody_production_limits.py
+
       - name: Set up the existing verified native downloader
         uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
         with:
@@ -58,12 +76,12 @@ jobs:
 
       - name: Acquire the existing pinned VPC-capable native QEMU runtime
         run: |
-          bash .github/scripts/hyperv-native-qemu-acquire.sh "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          bash .github/scripts/hyperv-native-qemu-acquire.sh /d/wamr-ci/wamr-native-runtime
 
       - name: Reuse authenticated private Bison data for the native Make contract
         run: |
           export PATH="/usr/bin:/bin:${PATH}"
-          bash .github/scripts/hyperv-native-bison-acquire.sh "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          bash .github/scripts/hyperv-native-bison-acquire.sh /d/wamr-ci/wamr-native-runtime
 
       - name: Install the existing pinned Zig compiler
         uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
@@ -76,23 +94,43 @@ jobs:
         with:
           ghr-version: v0.8.0
           tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
-          dest: ${{ github.workspace }}/.d/wamr-native-runtime/llvm
+          dest: /d/wamr-ci/wamr-native-runtime/llvm
           extract: 'true'
           strip-components: '1'
           cache: 'false'
+
+      - name: Establish the exact QEMU dynamic runtime before custody
+        run: |
+          bash .github/scripts/hyperv-native-libfdt-prepare.sh /d/wamr-ci/wamr-native-runtime
 
       - name: Build the distinct tiny AOT image through the existing safety graph
         timeout-minutes: 45
         run: |
           set -euo pipefail
           umask 077
-          root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          root=/d/wamr-ci/wamr-native-runtime
+          zig_source="$(dirname "$(readlink -f "$(command -v zig)")")"
+          zig_dir=/d/wamr-ci/wamr-native-tools/zig-0.16.0
+          test ! -e "${zig_dir}"
+          mkdir -p -m 700 "${zig_dir}"
+          cp -a -- "${zig_source}/." "${zig_dir}/"
+          chmod -R u=rwX,go= "${zig_dir}"
           mkdir -m 700 "${root}/firmware"
           cp --no-preserve=mode,ownership \
             "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
           cp --no-preserve=mode,ownership \
             "$(readlink -f /usr/share/OVMF/OVMF_VARS_4M.fd)" "${root}/firmware/vars.fd"
-          zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
+          for name in llvm-readelf llvm-strip; do
+            alias="${root}/llvm/bin/${name}"
+            target="$(readlink -f "${alias}")"
+            test -f "${target}"
+            temporary="${alias}.materialized"
+            test ! -e "${temporary}"
+            cp --no-preserve=mode,ownership -- "${target}" "${temporary}"
+            chmod 500 "${temporary}"
+            rm -- "${alias}"
+            mv -- "${temporary}" "${alias}"
+          done
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           echo "${zig_dir}" >> "${GITHUB_PATH}"
           echo "${root}/llvm/bin" >> "${GITHUB_PATH}"
@@ -106,47 +144,268 @@ jobs:
           QUALIFICATION_SOURCE_JOB: wamr-native-compute
         run: |
           set -euo pipefail
-          root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          root=/d/wamr-ci/wamr-native-runtime
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
 
       - name: Retain the expressly authorized public-source tiny image bundle
+        id: public_bundle
         timeout-minutes: 15
         env:
           GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.private == false && 'public' || 'private' }}
+          WAMR_CI_RUNTIME: /d/wamr-ci/wamr-native-runtime
         run: |
           set -euo pipefail
           umask 077
-          root="${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+          root=/d/wamr-ci/wamr-native-runtime
           export TMPDIR="${root}/compute/scratch"
           export PYTHONDONTWRITEBYTECODE=1
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
-          python3 support/build/wamr-native-ci/handoff.py public-source-bundle
+          result="$(python3 support/build/wamr-native-ci/handoff.py public-source-bundle)"
+          printf '%s\n' "${result}"
+          archive_sha256="$(
+            printf '%s\n' "${result}" |
+              sed -n 's/^Public source archive SHA-256: //p'
+          )"
+          if [[ ! "${archive_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid public-source archive digest" >&2
+            exit 1
+          fi
+          source_tree="$(
+            printf '%s\n' "${result}" |
+              sed -n 's/^Public source tree: //p'
+          )"
+          if [[ ! "${source_tree}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid public-source tree" >&2
+            exit 1
+          fi
+          staging="${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip"
+          upload_dir=/d/wamr-public-source-upload
+          upload_file="${upload_dir}/tiny-aot-public-source.zip"
+          test ! -e "${upload_dir}"
+          sudo install -d -o root -g "$(id -g)" -m 0550 "${upload_dir}"
+          sudo python3 - "${staging}" "${upload_file}" \
+            "${archive_sha256}" "$(id -g)" <<'PY'
+          import hashlib
+          import os
+          import stat
+          import sys
+
+          source, destination, expected, group = sys.argv[1:]
+          read_flags = os.O_RDONLY
+          read_flags |= getattr(os, "O_CLOEXEC", 0)
+          read_flags |= getattr(os, "O_NOFOLLOW", 0)
+          source_fd = os.open(source, read_flags)
+          destination_fd = -1
+          try:
+              source_info = os.fstat(source_fd)
+              if (
+                  not stat.S_ISREG(source_info.st_mode)
+                  or source_info.st_nlink != 1
+                  or not 0 < source_info.st_size <= 512 * 1024 * 1024
+              ):
+                  raise SystemExit("unsafe verified upload source")
+              source_identity = tuple(
+                  getattr(source_info, name) for name in (
+                      "st_dev", "st_ino", "st_mode", "st_uid", "st_gid",
+                      "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns"))
+              write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+              write_flags |= getattr(os, "O_CLOEXEC", 0)
+              write_flags |= getattr(os, "O_NOFOLLOW", 0)
+              destination_fd = os.open(destination, write_flags, 0o440)
+              digest = hashlib.sha256()
+              total = 0
+              while True:
+                  chunk = os.read(source_fd, 65536)
+                  if not chunk:
+                      break
+                  digest.update(chunk)
+                  total += len(chunk)
+                  offset = 0
+                  while offset < len(chunk):
+                      written = os.write(destination_fd, chunk[offset:])
+                      if written <= 0:
+                          raise SystemExit("verified upload copy failed")
+                      offset += written
+              final_source = os.fstat(source_fd)
+              final_identity = tuple(
+                  getattr(final_source, name) for name in (
+                      "st_dev", "st_ino", "st_mode", "st_uid", "st_gid",
+                      "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns"))
+              if (
+                  total != source_info.st_size
+                  or digest.hexdigest() != expected
+                  or final_identity != source_identity
+              ):
+                  raise SystemExit("verified upload copy changed")
+              os.fchown(destination_fd, 0, int(group))
+              os.fchmod(destination_fd, 0o440)
+              os.fsync(destination_fd)
+          finally:
+              if destination_fd >= 0:
+                  os.close(destination_fd)
+              os.close(source_fd)
+          PY
+          verified="$(
+            python3 support/build/wamr-native-ci/handoff.py \
+              verify-public-source-bundle \
+              --archive "${upload_file}" \
+              --expected-source "${GITHUB_SHA}" \
+              --expected-tree "${source_tree}" \
+              --expected-archive-sha256 "${archive_sha256}" \
+              --run-id "${GITHUB_RUN_ID}" \
+              --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          )"
+          test "$(
+            printf '%s\n' "${verified}" |
+              sed -n 's/^Public source archive SHA-256: //p'
+          )" = "${archive_sha256}"
+          {
+            echo "inner_zip_sha256=${archive_sha256}"
+            echo "upload_file=${upload_file}"
+            echo "source_tree=${source_tree}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Remove only the managed QEMU dynamic runtime
+        if: always()
+        run: |
+          bash .github/scripts/hyperv-native-libfdt-cleanup.sh /d/wamr-ci/wamr-native-runtime
 
       - name: Publish only the standalone verified public-source image archive
+        id: public_upload
         uses: actions/upload-artifact@v4
         with:
           name: wamr-public-source-tiny-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
-          path: ${{ github.workspace }}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip
+          path: ${{ steps.public_bundle.outputs.upload_file }}
           include-hidden-files: true
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
 
+      - name: Reserve the exact-artifact redownload destination
+        id: public_redownload
+        run: |
+          set -euo pipefail
+          destination=/d/wamr-ci/wamr-public-source-redownload
+          python3 - "${destination}" <<'PY'
+          import os
+          import stat
+          import sys
+
+          destination = sys.argv[1]
+          os.mkdir(destination, 0o700)
+          info = os.lstat(destination)
+          if (
+              not stat.S_ISDIR(info.st_mode)
+              or info.st_uid != os.getuid()
+              or stat.S_IMODE(info.st_mode) != 0o700
+          ):
+              raise SystemExit("private exact-artifact destination required")
+          PY
+          echo "destination=${destination}" >> "${GITHUB_OUTPUT}"
+
+      - name: Redownload only the uploaded public-source artifact ID
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.public_upload.outputs.artifact-id }}
+          path: ${{ steps.public_redownload.outputs.destination }}
+          merge-multiple: true
+
+      - name: Bind and publish the redownloaded inner public-source ZIP
+        id: public_binding
+        env:
+          INNER_ZIP_SHA256: ${{ steps.public_bundle.outputs.inner_zip_sha256 }}
+          CONTAINER_DIGEST: ${{ steps.public_upload.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.public_upload.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.public_upload.outputs.artifact-url }}
+          REDOWNLOAD_DIR: ${{ steps.public_redownload.outputs.destination }}
+          SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          export PYTHONDONTWRITEBYTECODE=1
+          archive="${REDOWNLOAD_DIR}/tiny-aot-public-source.zip"
+          python3 - "${REDOWNLOAD_DIR}" <<'PY'
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          root = Path(sys.argv[1])
+          flags = os.O_RDONLY | os.O_DIRECTORY
+          flags |= getattr(os, "O_CLOEXEC", 0)
+          flags |= getattr(os, "O_NOFOLLOW", 0)
+          handle = os.open(root, flags)
+          try:
+              with os.scandir(handle) as entries:
+                  found = []
+                  for entry in entries:
+                      if found:
+                          raise SystemExit(
+                              "unexpected exact-artifact download members")
+                      found.append(entry)
+              if len(found) != 1 or found[0].name != "tiny-aot-public-source.zip":
+                  raise SystemExit("unexpected exact-artifact download members")
+              info = os.stat(
+                  found[0].name, dir_fd=handle, follow_symlinks=False)
+              if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                  raise SystemExit("downloaded inner ZIP is not one regular file")
+          finally:
+              os.close(handle)
+          PY
+          verified="$(
+            python3 support/build/wamr-native-ci/handoff.py \
+              verify-public-source-bundle \
+              --archive "${archive}" \
+              --expected-source "${GITHUB_SHA}" \
+              --expected-tree "${SOURCE_TREE}" \
+              --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
+              --run-id "${GITHUB_RUN_ID}" \
+              --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          )"
+          downloaded_sha256="$(
+            printf '%s\n' "${verified}" |
+              sed -n 's/^Public source archive SHA-256: //p'
+          )"
+          test "${downloaded_sha256}" = "${INNER_ZIP_SHA256}"
+          [[ "${ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${CONTAINER_DIGEST}" =~ ^[0-9a-f]{64}$ ]]
+          test -n "${ARTIFACT_URL}"
+          {
+            echo "inner_zip_sha256=${INNER_ZIP_SHA256}"
+            echo "container_digest=${CONTAINER_DIGEST}"
+            echo "artifact_id=${ARTIFACT_ID}"
+            echo "artifact_url=${ARTIFACT_URL}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "source_sha=${GITHUB_SHA}"
+            echo "source_tree=${SOURCE_TREE}"
+          } >> "${GITHUB_OUTPUT}"
+          {
+            echo '## Exact WAMR public-source image'
+            echo
+            echo "Inner ZIP SHA-256: \`${INNER_ZIP_SHA256}\`"
+            echo "Artifact container digest: \`${CONTAINER_DIGEST}\`"
+            echo "Artifact ID: \`${ARTIFACT_ID}\`"
+            echo "Artifact URL: ${ARTIFACT_URL}"
+            echo
+            echo "Source: \`${GITHUB_SHA}/${SOURCE_TREE}\`"
+            echo "Run: \`${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}:wamr-native-compute\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Retain redacted diagnostics separately from the public-source image bundle
         if: always()
         run: |
           python3 support/build/wamr-native-ci/run.py diagnostics \
-            --runtime "${GITHUB_WORKSPACE}/.d/wamr-native-runtime"
+            --runtime /d/wamr-ci/wamr-native-runtime
 
       - name: Publish bounded local-only records
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: wamr-native-compute-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/.d/wamr-native-runtime/compute/evidence/*.json
+          path: /d/wamr-ci/wamr-native-runtime/compute/evidence/*.json
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7

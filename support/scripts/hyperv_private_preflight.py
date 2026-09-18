@@ -158,10 +158,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "0fd7569a0a1fbe556e4091cbe1d23130ced356cd10815ebfbf4900ee63bf01c7"
+            "ae536a119f4f16c7090623549fecbbbce588f451f01e93bbc0fb8a85275f5a3f"
         ),
-        "size": 1859862,
-        "files": 225,
+        "size": 2099254,
+        "files": 226,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -391,13 +391,13 @@ GUARDED_PRODUCER_FILES = {
         "31ad9392835d740c86f36c8801dc1d0973ee33c2a40ef6f758ecb8f65cc58d5f"
     ),
     "Makefile": (
-        "c790738ac50a85be2e7def288a32890a1c2703b9a148ffb2dd633d200305d562"
+        "6dd447ae720971d034a15960511cceaa05e109f7b239529d9568185c62f6e6e0"
     ),
     "Makefile.uk": (
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "527d0c45da210a12164ac0d7b47729609d124362f9208bb85d7190892448d624"
+        "9ab8fc9f7f031b98f47c6175fb59e304e8da01c18f5a1be9a2be78f65d36c3d9"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -469,7 +469,7 @@ GUARDED_PRODUCER_FILES = {
         "dd39b9cec861bdf4771fba05c0b477aea37e2b2f1d40d843f31d3c1df011ee3a"
     ),
     "support/build/native-build-tools.zig": (
-        "7d04586443a85ae6712673b7b47f7ac67622bfc656fe930c9c16082f1362132d"
+        "d6ae0548d15f54eecbfe333490b648165047e1a63e72a61aafea62aec2b8aeab"
     ),
     "support/build/native-config-metadata.py": (
         "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
@@ -493,7 +493,7 @@ GUARDED_PRODUCER_FILES = {
         "c1c75f1364efe3a84da48f5fb399030822901262d0e6c728529e89341e72b63d"
     ),
     "support/build/native-make-environment.zig": (
-        "7db2a3cefd9576efa62e66453d3ff59dabfdc5ae8ae391f1f8cc08f5362eec51"
+        "8ce57b5cff098a11ba95d4453c919c23a6639146daa94fd687f5f0399638860b"
     ),
     "support/build/native-target-object.zig": (
         "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
@@ -586,7 +586,7 @@ GUARDED_PRODUCER_FILES = {
         "5a7e349ed5300c3fe0603740dfb34320e72de1ca3bffcab35e6fa9a728a9162c"
     ),
     "drivers/hyperv/netvsc/Makefile.uk": (
-        "4d3f452f93db4bf3f7f48618a6b5e4eb60e42808e258616d4170d7a1a9c6f636"
+        "452014b4e98da4bece34f18bc59b4fdbda46abf6a15627611580912fb31a81c4"
     ),
     "drivers/hyperv/netvsc/exportsyms.uk": (
         "664a748b4fabfa6a175994cfa828054b2d8626fd2efbe1227ba43a962b9a8571"
@@ -601,7 +601,7 @@ GUARDED_PRODUCER_FILES = {
         "4ee6997ebb98a63bf8cc39ac219e447c5bcec0b783140d2802ba19238711b12c"
     ),
     "drivers/hyperv/storvsc/Makefile.uk": (
-        "9ea0883afdb3e08df3110347df9a3917dbd602a151a302b6d3bceea02ec6b905"
+        "29cfdd7a324e52cc4ada63321311b34b6f119190c0afef38b55543165fba8dba"
     ),
     "drivers/hyperv/storvsc/exportsyms.uk": (
         "96d418ad387c2fa392afc96dfc8b1eb77cc20a0bcdb8a88fbd44038a5fdfa5de"
@@ -622,7 +622,7 @@ GUARDED_PRODUCER_FILES = {
         "05a880a38a10e130510fafbfa786f080d3da1413feb84ca7fc2a068c04a4d069"
     ),
     "drivers/hyperv/vmbus/Makefile.uk": (
-        "7622b3998629db41f2e1c8f8538872cf3efc64fff16e5832d0fb053ba2437a57"
+        "c25184fea66e2de8612bb39a49d3daeb13da68617a03cef066303583ba655763"
     ),
     "drivers/hyperv/vmbus/exportsyms.uk": (
         "f26fc7b7de9220cb994e4a81722bfa44e900c9ed84eefab480db9deedaf3a9bb"
@@ -655,7 +655,7 @@ GUARDED_PRODUCER_FILES = {
         "c5fe6226a426333e2119845366cac6c712b4258d8c7ead82980d7ac57c7c0505"
     ),
     "plat/hyperv/Makefile.uk": (
-        "672e146edc8058fce245a05e475564a89e634b2e41394625236a17167d7a08a4"
+        "5d88fbd2aa40331b421a76817533e3a00b3c2692dcb04acac05a562869418acb"
     ),
     "plat/hyperv/hyperv_runtime.zig": (
         "901a9caf76b33fa9990acdc061139553862caf394d1c78039cb71008262ec076"
@@ -676,16 +676,16 @@ GUARDED_PRODUCER_FILES = {
         "82e672e9659bfb4851d574c0c1ce4a48b55c415e9ffc6bc36eda57dde9e7764b"
     ),
     "support/build/native-image-graph.zig": (
-        "58b744a6b02de3e3a8fccce2626346e5cd1ddb87ba5a90c1080135bdb1147e4e"
+        "6465bc8c33deba57d3ae86edbc97a0f78f3b0cfea1669896855ad3c0a7b3c2c9"
     ),
     "support/build/native-postprocess-runner.py": (
-        "6f68d5dbe410fb7391b7a68e9e98ba3455210a83754c47989f5d31149c7fa094"
+        "3379115753b149a6f16675cb3d5f315c25bfb49bf702720cdc882470434ef0f1"
     ),
     "support/build/native-postprocess-runner.zig": (
-        "fedf2fc2a2d8297c3852453f79cf5b02ddb67caad61ba2de92d4de98a7d69dcc"
+        "3077b7aa0af7ed5be4ce2506da7d1941f595622b6a70f7af4d3b8ac77821e766"
     ),
     "support/build/native-postprocess.zig": (
-        "943fd3dbd2c3328e34696ae4240c8f7f36a3f573ffc31e4c2a02c493ceea89ec"
+        "294ffe3767a69e7cb60aecf4a8417924e27eb69996562afe954f7efdc6b57381"
     ),
     "support/scripts/elf_tools.py": (
         "0aad63e7830a814a5c29a7330925f64e8c844cf28700aa959002a629d5019820"

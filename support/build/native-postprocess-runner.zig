@@ -30,6 +30,7 @@ const Options = struct {
     arch: ?[]const u8 = null,
     search_root: ?[]const u8 = null,
     names: bool = false,
+    objcopy_interface: bool = false,
     remove: std.ArrayList([]const u8) = .empty,
     positional: std.ArrayList([]const u8) = .empty,
 
@@ -57,6 +58,11 @@ const Options = struct {
             if (std.mem.eql(u8, arg, "--names")) {
                 if (result.names) return error.InvalidArguments;
                 result.names = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--objcopy-interface")) {
+                if (result.objcopy_interface) return error.InvalidArguments;
+                result.objcopy_interface = true;
                 continue;
             }
             index += 1;
@@ -103,6 +109,7 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
         (options.arch != null) != boot or
         (options.search_root != null) != database or
         (options.names and !boot) or
+        (options.objcopy_interface and !strip) or
         (options.remove.items.len != 0 and !strip)) return error.InvalidArguments;
     if (boot and !std.mem.eql(u8, options.arch.?, "x86_64") and
         !std.mem.eql(u8, options.arch.?, "arm64")) return error.InvalidArguments;
@@ -129,11 +136,15 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
         defer freeCommand(allocator, tool);
         try command.appendSlice(allocator, tool);
         if (strip) {
-            try command.append(allocator, "-s");
+            try command.append(allocator, "--strip-all");
             for (options.remove.items) |section| {
                 try command.appendSlice(allocator, &.{ "-R", section });
             }
-            try command.appendSlice(allocator, &.{ paths[0], "-o", files.path(0) });
+            if (options.objcopy_interface) {
+                try command.appendSlice(allocator, &.{ paths[0], files.path(0) });
+            } else {
+                try command.appendSlice(allocator, &.{ "-o", files.path(0), paths[0] });
+            }
         } else {
             try command.appendSlice(allocator, &.{ "-O", "binary", paths[0], files.path(0) });
         }

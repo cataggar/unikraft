@@ -2549,6 +2549,8 @@ class HypervWorkflowTest(unittest.TestCase):
                     header,
                 )
                 self.assertIn("        persist-credentials: false\n", job)
+                if lane == "runtime":
+                    self.assertIn("        fetch-depth: 0\n", job)
                 self.assertIn("uses: ./.github/actions/hyperv-fixture-setup", job)
                 for forbidden in ("    if:", "    needs:", "    strategy:",
                                   "id-token:", "environment:"):
@@ -2594,6 +2596,9 @@ class HypervWorkflowTest(unittest.TestCase):
             "ci-objcopy-version.awk",
             'sha256sum -- "${objcopy}"',
             'sha256sum --check "${root}/fixture-objcopy-sha256.txt"',
+            "support/tools/hyperv/local_boot/build.zig.zon",
+            '--build-file "${root}/restore/build.zig" --fetch=all',
+            '--system "${root}/restore/zig-pkg"',
             "for mode in Debug ReleaseSafe; do",
             '-Dstrip-fixture-debug=true "-Dfixture-objcopy=${objcopy}"',
             '"-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json"',
@@ -2617,6 +2622,195 @@ class HypervWorkflowTest(unittest.TestCase):
                 self.assertIn(
                     f"/native-local-boot/{mode}/{artifact}", retained
                 )
+
+    def test_native_hyperv_images_bind_the_zig_make_tool(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        step = workflow.split(
+            "    - name: Solve and build native Hyper-V acceptance and SMP images\n",
+            1,
+        )[1].split("\n    - name:", 1)[0]
+        self.assertIn('"-Dmake-arg=ZIG=zig"', step)
+
+    def test_wamr_and_local_boot_packages_restore_outside_source(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        self.assertNotIn(
+            "mv support/build/wamr-native-ci/zig-pkg", workflow
+        )
+        for build_file in (
+            "support/build/wamr-native-ci/build.zig",
+            "support/tools/hyperv/local_boot/build.zig",
+        ):
+            step = workflow.split(
+                f"zig build --build-file {build_file}", 1
+            )[1].split("\n\n", 1)[0]
+            self.assertIn('--system "${root}/restore/zig-pkg"', step)
+        self.assertGreaterEqual(
+            workflow.count(
+                'zig build --build-file "${root}/restore/build.zig" '
+                "--fetch=all"
+            ),
+            2,
+        )
+        local_boot_readme = (
+            SUPPORT / "tools/hyperv/local_boot/README.md"
+        ).read_text()
+        self.assertIn('"$SCRATCH/global-cache/tmp"', local_boot_readme)
+        self.assertNotIn(
+            '"$SCRATCH"/{home,tmp,cache,global-cache,restore,fixtures,outputs}',
+            local_boot_readme,
+        )
+        native = (
+            SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
+        ).read_text()
+        for required in (
+            "for name in llvm-readelf llvm-strip; do",
+            'target="$(readlink -f "${alias}")"',
+            'temporary="${alias}.materialized"',
+            'cp --no-preserve=mode,ownership -- "${target}" "${temporary}"',
+            'chmod 500 "${temporary}"',
+            'rm -- "${alias}"',
+            'mv -- "${temporary}" "${alias}"',
+        ):
+            self.assertIn(required, native)
+        bison_acquire = (
+            SUPPORT.parent
+            / ".github/scripts/hyperv-native-bison-acquire.sh"
+        ).read_text()
+        self.assertIn(
+            'rm -rf -- "${root}/apt-lists" "${root}/apt-cache"',
+            bison_acquire,
+        )
+        runtime = (
+            SUPPORT.parent
+            / ".github/scripts/hyperv-qemu-candidate-runtime.sh"
+        ).read_text()
+        for required in (
+            "Restricted native guest refused: $1",
+            "refuse credentials",
+            "refuse groups",
+            "refuse kvm-identity",
+            "Native runtime wrapper refused: ${failure_stage}",
+            "failure_stage=kvm-device",
+            "failure_stage=credentials",
+            "failure_stage=libfdt",
+            "failure_stage=qemu-probe",
+            "failure_stage=guest-launch",
+            "failure_stage=post-guest",
+        ):
+            self.assertIn(required, runtime)
+        libfdt_prepare = (
+            SUPPORT.parent
+            / ".github/scripts/hyperv-native-libfdt-prepare.sh"
+        ).read_text()
+        for required in (
+            'chmod 600 "$2"',
+            'chown --no-dereference "$3:$4" "$2"',
+            '\' _ "${source}" "${ownership}" "${runner_uid}" "${runner_gid}"',
+            '"${runner_uid}:${runner_gid}:600:1"',
+            "refuse ownership-identity",
+            "refuse managed-record-identity",
+        ):
+            self.assertIn(required, libfdt_prepare)
+        libfdt_cleanup = (
+            SUPPORT.parent
+            / ".github/scripts/hyperv-native-libfdt-cleanup.sh"
+        ).read_text()
+        for required in (
+            'test "$(stat -c \'%d:%i:%u:%g\' "${target}")" = "${identity}"',
+            'sudo rm -- "${target}"',
+            "managed=1 cleanup=0",
+        ):
+            self.assertIn(required, libfdt_cleanup)
+        driver = (
+            SUPPORT.parent / ".github/scripts/wamr-native-ci.sh"
+        ).read_text()
+        for refusal in (
+            "invocation", "qualification-source", "repository-identity",
+            "source-revision", "architecture", "kvm-read", "kvm-write",
+        ):
+            self.assertIn(f"refuse {refusal}", driver)
+
+    def test_wamr_public_bundle_binds_exact_redownloaded_artifact(self):
+        repository = SUPPORT.parent
+        workflow = (
+            repository / ".github/workflows/wamr-native-compute.yaml"
+        ).read_text()
+        publication = workflow.split(
+            "Retain the expressly authorized public-source tiny image bundle",
+            1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn(
+            "Public source archive SHA-256:",
+            publication,
+        )
+        self.assertIn("verify-public-source-bundle", publication)
+        self.assertIn("os.O_WRONLY | os.O_CREAT | os.O_EXCL", publication)
+        self.assertIn("os.fchown(destination_fd, 0, int(group))", publication)
+        self.assertIn("os.fchmod(destination_fd, 0o440)", publication)
+        self.assertNotIn("sha256sum", publication)
+        self.assertNotIn("GITHUB_STEP_SUMMARY", publication)
+        upload = workflow.split(
+            "Publish only the standalone verified public-source image archive",
+            1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn("id: public_upload", upload)
+        self.assertIn("actions/upload-artifact@v4", upload)
+        self.assertIn(
+            "path: ${{ steps.public_bundle.outputs.upload_file }}", upload)
+        download = workflow.split(
+            "Redownload only the uploaded public-source artifact ID", 1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn("actions/download-artifact@v4", download)
+        self.assertIn(
+            "artifact-ids: ${{ steps.public_upload.outputs.artifact-id }}",
+            download,
+        )
+        reserve = workflow.split(
+            "Reserve the exact-artifact redownload destination", 1,
+        )[1].split("- name:", 1)[0]
+        self.assertIn("os.mkdir(destination, 0o700)", reserve)
+        self.assertIn("stat.S_IMODE(info.st_mode) != 0o700", reserve)
+        binding = workflow.split(
+            "Bind and publish the redownloaded inner public-source ZIP", 1,
+        )[1].split("- name:", 1)[0]
+        for required in (
+                "unexpected exact-artifact download members",
+                "downloaded inner ZIP is not one regular file",
+                "verify-public-source-bundle",
+                'test "${downloaded_sha256}" = "${INNER_ZIP_SHA256}"',
+                "Artifact container digest:",
+                "Artifact ID:",
+                "Artifact URL:",
+                "GITHUB_STEP_SUMMARY",
+                "GITHUB_OUTPUT"):
+            self.assertIn(required, binding)
+        self.assertNotIn("id-token:", workflow)
+        self.assertLess(
+            workflow.index("actions/download-artifact@v4"),
+            workflow.index("GITHUB_STEP_SUMMARY"),
+        )
+        handoff = (
+            repository / "support/build/wamr-native-ci/handoff.py"
+        ).read_text()
+        self.assertIn(
+            'imp.add_argument("--expected-archive-sha256")',
+            handoff,
+        )
+        self.assertIn(
+            'verify.add_argument("--expected-archive-sha256", required=True)',
+            handoff,
+        )
+        operator = (
+            repository / "support/azure/WAMR-DIRECT-COMPUTE.md"
+        ).read_text()
+        self.assertIn(
+            '--expected-archive-sha256 "$ARCHIVE_SHA256"',
+            operator,
+        )
 
     def test_producer_dependency_guard_is_failure_aware_and_cancelable(self):
         workflow = (

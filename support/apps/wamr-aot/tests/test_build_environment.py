@@ -2,6 +2,7 @@
 import importlib.util
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -43,3 +44,48 @@ class NativeMakeEnvironment(unittest.TestCase):
                     with self.assertRaises((ValueError, FileNotFoundError)):
                         build_image.bison_data()
                     command.assert_not_called()
+
+    def test_outer_zig_caches_stay_below_the_precreated_build_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repository"
+            root = repository / "support/apps/wamr-aot"
+            root.mkdir(parents=True)
+            (root / ".config").write_bytes(b"CONFIG_FIXTURE=y\n")
+            with mock.patch.object(build_image, "ROOT", root), \
+                    mock.patch.object(build_image, "REPO", repository), \
+                    mock.patch.object(build_image, "bison_data",
+                                      return_value="/tools/bison-data"), \
+                    mock.patch.object(build_image, "tool",
+                                      side_effect=lambda name: "/tools/" + name), \
+                    mock.patch.object(build_image.subprocess, "run") as command, \
+                    mock.patch.object(sys, "argv",
+                                      ["build-image.py", "olddefconfig"]):
+                build_image.main()
+
+            args = command.call_args.args[0]
+            state = root / "build/native-environment"
+            self.assertEqual(
+                args[args.index("--cache-dir") + 1],
+                str(state / "zig_local_cache"),
+            )
+            self.assertEqual(
+                args[args.index("--global-cache-dir") + 1],
+                str(state / "zig_global_cache"),
+            )
+            self.assertEqual(command.call_args.kwargs["cwd"], repository)
+            self.assertEqual(
+                command.call_args.kwargs["env"]["TMPDIR"],
+                str(state / "tmp"),
+            )
+            for argument in (
+                    "-Dbison-command=/tools/bison",
+                    "-Dflex-command=/tools/flex",
+                    "-Dmake-arg=CP=/tools/cp -f",
+                    "-Dmake-arg=MKDIR=/tools/mkdir",
+                    "-Dmake-arg=PYTHON=/tools/python3",
+                    "-Dmake-arg=READLINK=/tools/readlink",
+                    "-Dmake-arg=HOSTOSENV=Linux",
+                    "-Dmake-arg=WGET_VERSION=unavailable",
+                    "-Dmake-arg=WGET=false",
+                    "-Dmake-arg=ZIG=/tools/zig"):
+                self.assertIn(argument, args)

@@ -98,6 +98,16 @@ pub fn build(b: *std.Build) void {
     };
     const root = root_result.path;
     const app_option = b.option([]const u8, "app", "Application directory (Make A=)");
+    const bison_command = b.option(
+        []const u8,
+        "bison-command",
+        "Bison executable (default: bison)",
+    ) orelse "bison";
+    const flex_command = b.option(
+        []const u8,
+        "flex-command",
+        "Flex executable (default: flex)",
+    ) orelse "flex";
     if (app_option) |value| {
         if (firstUnsafePathByte(value, false)) |byte| {
             addFailedTargets(b, b.fmt(
@@ -219,7 +229,7 @@ pub fn build(b: *std.Build) void {
         return;
     }
 
-    const native_graph = registerNativeGraph(b, context);
+    const native_graph = registerNativeGraph(b, context, options);
     if (native_graph) |registered| {
         std.debug.assert(registered.graph.selectedPlatform().name.len != 0);
     }
@@ -242,7 +252,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const config_input = std.Build.LazyPath{ .cwd_relative = context.config };
-    const metadata_tool = native_build_tools.metadataTool(b, b.path("."));
+    const metadata_tool = native_build_tools.metadataTool(b, b.path("."), bison_command, flex_command);
     const metadata_path = std.fs.path.join(
         b.allocator,
         &.{ context.output, "native-config", "metadata.tsv" },
@@ -1699,7 +1709,7 @@ pub fn build(b: *std.Build) void {
     run_build_tools_integration.addArg(root);
     run_build_tools_integration.addFileInput(b.path("Config.uk"));
     run_build_tools_integration.addFileInput(b.path("support/build/config-submenu.sh"));
-    run_build_tools_integration.addArtifactArg(native_build_tools.legacyConfigFixture(b, b.path(".")));
+    run_build_tools_integration.addArtifactArg(native_build_tools.legacyConfigFixture(b, b.path("."), bison_command, flex_command));
     build_tools_tests.dependOn(&run_build_tools_integration.step);
     test_step.dependOn(build_tools_tests);
     const integration_output = resolvePath(
@@ -1948,6 +1958,7 @@ pub fn build(b: *std.Build) void {
 fn registerNativeGraph(
     b: *std.Build,
     context: build_context.Context,
+    options: MakeOptions,
 ) ?*native_image_graph.RegisteredGraph {
     const step = b.step(
         "native-link-graph",
@@ -2025,6 +2036,13 @@ fn registerNativeGraph(
             .config = context.config,
         },
         .profile = profile,
+        .tools = .{
+            .compiler = forwardedCommand(options.forwarded, "ZIG"),
+            .nm = forwardedCommand(options.forwarded, "NM"),
+            .objcopy = forwardedCommand(options.forwarded, "OBJCOPY"),
+            .objdump = forwardedCommand(options.forwarded, "OBJDUMP"),
+            .strip = forwardedCommand(options.forwarded, "STRIP"),
+        },
         .enable_ukblkdev = enable_ukblkdev,
         .enable_storvsc = enable_storvsc,
         .enable_uklibparam = enable_uklibparam,
@@ -2090,6 +2108,7 @@ fn registerNativePipeline(
         ).step);
         return step;
     };
+    const copy_command = forwardedCommand(options.forwarded, "CP") orelse "cp";
 
     const config = loadNativeConfig(b, context.config) catch |err| {
         step.dependOn(&b.addFail(b.fmt(
@@ -2167,6 +2186,8 @@ fn registerNativePipeline(
             b,
             step,
             registered,
+            options,
+            copy_command,
             config,
             lto_result.stage_name,
             lto_result.output,
@@ -2215,6 +2236,8 @@ fn registerNativePipeline(
         b,
         step,
         registered,
+        options,
+        copy_command,
         config,
         linked[0].stage_name,
         linked[0].output,
@@ -2226,6 +2249,8 @@ fn finishNativeImages(
     b: *std.Build,
     step: *std.Build.Step,
     registered: *native_image_graph.RegisteredGraph,
+    options: MakeOptions,
+    copy_command: []const u8,
     config: *const NativeConfig,
     stage_name: []const u8,
     link_output: std.Build.LazyPath,
@@ -2273,7 +2298,7 @@ fn finishNativeImages(
                 "llvm-objdump",
         });
         irq_check.setCwd(.{ .cwd_relative = b.build_root.path.? });
-        const gate = b.addSystemCommand(&.{"cp"});
+        const gate = b.addSystemCommand(&.{copy_command});
         gate.step.dependOn(&check.step);
         gate.step.dependOn(&irq_check.step);
         if (nativeConfigEnabled(config, "CONFIG_LIBSTORVSC") or
@@ -2332,15 +2357,15 @@ fn finishNativeImages(
         post_plan,
         &.{validated_link_output},
         .{
-            .python_executable = "python3",
-            .strip = registered.graph.toolchain.binutils.strip.command,
+            .python_executable = forwardedCommand(options.forwarded, "PYTHON") orelse "python3",
+            .strip = registered.graph.toolchain.binutils.objcopy.command,
             .objcopy = registered.graph.toolchain.binutils.objcopy.command,
             .objdump = if (registered.graph.toolchain.binutils.objdump) |tool|
                 tool.command
             else
                 null,
             .nm = registered.graph.toolchain.binutils.nm.command,
-            .readelf = "llvm-readelf",
+            .readelf = forwardedCommand(options.forwarded, "READELF") orelse "llvm-readelf",
         },
         .{
             .native_runner = if (std.mem.eql(u8, registered.graph.selectedPlatform().name, "hyperv"))
@@ -2378,6 +2403,7 @@ fn finishNativeImages(
     addPublishedOutput(
         b,
         step,
+        copy_command,
         post.publicationPath(linked_logical_path, validated_link_output),
         linked_logical_path,
     );
@@ -2391,7 +2417,7 @@ fn finishNativeImages(
             }
         }
         if (!superseded) {
-            addPublishedOutput(b, step, output.path, output.logical_path);
+            addPublishedOutput(b, step, copy_command, output.path, output.logical_path);
         }
     }
     return step;
@@ -2539,10 +2565,11 @@ fn finalStageOutput(
 fn addPublishedOutput(
     b: *std.Build,
     parent: *std.Build.Step,
+    copy_command: []const u8,
     source: std.Build.LazyPath,
     destination: []const u8,
 ) void {
-    const copy = b.addSystemCommand(&.{"cp"});
+    const copy = b.addSystemCommand(&.{copy_command});
     copy.setName(b.fmt("publish native output {s}", .{std.fs.path.basename(destination)}));
     copy.addFileArg(source);
     copy.addArg(destination);
@@ -3107,6 +3134,22 @@ fn validateForwardedAssignment(assignment: []const u8) error{InvalidAssignment}!
     if (firstUnsafeCommandByte(assignment[separator + 1 ..]) != null) return error.InvalidAssignment;
 }
 
+fn forwardedCommand(
+    assignments: []const []const u8,
+    name: []const u8,
+) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    for (assignments) |assignment| {
+        const separator = std.mem.indexOfScalar(u8, assignment, '=') orelse
+            continue;
+        if (!std.mem.eql(u8, assignment[0..separator], name)) continue;
+        const value = assignment[separator + 1 ..];
+        const end = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
+        if (end != 0) result = value[0..end];
+    }
+    return result;
+}
+
 fn isMakeNameStart(character: u8) bool {
     return std.ascii.isAlphabetic(character) or character == '_';
 }
@@ -3120,6 +3163,13 @@ fn isAllowedAssignment(name: []const u8) bool {
         "ARCH",
         "LLVM_TARGET_ARCH",
         "AR",
+        "CP",
+        "MKDIR",
+        "PYTHON",
+        "READLINK",
+        "ZIG",
+        "YACC",
+        "LEX",
         "RANLIB",
         "NM",
         "READELF",
@@ -3135,6 +3185,10 @@ fn isAllowedAssignment(name: []const u8) bool {
         "HOSTNM",
         "HOSTOBJCOPY",
         "HOSTRANLIB",
+        "HOSTOSENV",
+        "KCONFIG_OVERWRITECONFIG",
+        "WGET",
+        "WGET_VERSION",
         "UK_ASFLAGS",
         "UK_CFLAGS",
         "UK_CXXFLAGS",
@@ -3150,7 +3204,7 @@ fn isAllowedAssignment(name: []const u8) bool {
 test "native Make environment keeps ordinary forwarding restrictions" {
     _ = native_make_environment;
     for ([_][]const u8{
-        "UMASK=0077", "SHELL=/native/bash", "CONFIG_SHELL=/native/bash",
+        "UMASK=0077",         "SHELL=/native/bash",  "CONFIG_SHELL=/native/bash",
         "HOME=/private/home", "TMPDIR=/private/tmp", "LD_PRELOAD=/native/library",
     }) |assignment| {
         try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment(assignment));
@@ -3672,6 +3726,17 @@ test "path lists resolve from the repository root" {
 
 test "forwarded Make assignments require allowlisted names" {
     try validateForwardedAssignment("AR=zig ar");
+    try validateForwardedAssignment("CP=/native/bin/cp -f");
+    try validateForwardedAssignment("MKDIR=/native/bin/mkdir");
+    try validateForwardedAssignment("PYTHON=/native/bin/python3");
+    try validateForwardedAssignment("READLINK=/native/bin/readlink");
+    try validateForwardedAssignment("HOSTOSENV=Linux");
+    try validateForwardedAssignment("WGET_VERSION=unavailable");
+    try validateForwardedAssignment("WGET=false");
+    try validateForwardedAssignment("ZIG=/native/bin/zig");
+    try validateForwardedAssignment("YACC=/native/bin/bison");
+    try validateForwardedAssignment("LEX=/native/bin/flex");
+    try validateForwardedAssignment("KCONFIG_OVERWRITECONFIG=1");
     try validateForwardedAssignment("UK_CFLAGS=-std=gnu17");
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("not-an-assignment"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("-j=8"));
@@ -3686,6 +3751,18 @@ test "forwarded Make assignments require allowlisted names" {
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("AR=zig ar;true"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_CFLAGS=$(shell true)"));
     try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_LDFLAGS=-Wl,*"));
+}
+
+test "forwarded native commands select exact executables" {
+    const assignments = [_][]const u8{
+        "CP=/proc/100/fd/3 -f",
+        "ZIG=/proc/100/fd/4",
+        "NM=/proc/100/fd/5",
+    };
+    try std.testing.expectEqualStrings("/proc/100/fd/3", forwardedCommand(&assignments, "CP").?);
+    try std.testing.expectEqualStrings("/proc/100/fd/4", forwardedCommand(&assignments, "ZIG").?);
+    try std.testing.expectEqualStrings("/proc/100/fd/5", forwardedCommand(&assignments, "NM").?);
+    try std.testing.expect(forwardedCommand(&assignments, "STRIP") == null);
 }
 
 fn testingMakeOptions() MakeOptions {

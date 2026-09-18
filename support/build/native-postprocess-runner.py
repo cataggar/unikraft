@@ -25,6 +25,7 @@ def main():
 
     strip = subparsers.add_parser("strip")
     strip.add_argument("--tool", required=True)
+    strip.add_argument("--objcopy-interface", action="store_true")
     strip.add_argument("--remove-section", action="append", default=[])
     strip.add_argument("input")
     strip.add_argument("output")
@@ -105,7 +106,12 @@ def main():
         )
     elif args.action == "strip":
         remove = [item for section in args.remove_section for item in ("-R", section)]
-        run([*command(args.tool), "-s", *remove, args.input, "-o", args.output])
+        tool = [*command(args.tool), "--strip-all", *remove]
+        if args.objcopy_interface:
+            tool.extend((args.input, args.output))
+        else:
+            tool.extend(("-o", args.output, args.input))
+        run(tool)
     elif args.action == "bootinfo":
         env = os.environ.copy()
         env["OBJDUMP"] = args.objdump

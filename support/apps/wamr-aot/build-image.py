@@ -14,6 +14,22 @@ REPO = ROOT.parents[2]
 
 
 def tool(name):
+    selected = os.environ.get(
+        "WAMR_CI_TOOL_" + name.upper().replace("-", "_"))
+    if selected is not None:
+        path = Path(selected)
+        retained = (
+            len(path.parts) == 5
+            and path.parts[:2] == ("/", "proc")
+            and (path.parts[2] == "self" or path.parts[2].isdigit())
+            and path.parts[3] == "fd"
+            and path.name.isdigit()
+        )
+        if (not path.is_absolute() or (not retained
+                and path.resolve(strict=True) != path)
+                or not path.is_file() or not os.access(path, os.X_OK)):
+            raise RuntimeError(f"invalid recorded build tool: {name}")
+        return str(path)
     path = shutil.which(name)
     if not path:
         raise RuntimeError(f"required build tool unavailable: {name}")
@@ -39,7 +55,52 @@ def bison_data():
     return str(path)
 
 
+def git_invocation(*args):
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+        and key not in ("LD_AUDIT", "LD_LIBRARY_PATH", "LD_PRELOAD")
+    }
+    environment.update({
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "PAGER": "cat",
+    })
+    return ([
+        tool("git"), "--no-pager",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "credential.helper=",
+        "-c", "core.pager=cat",
+        *args,
+    ], environment)
+
+
+def git_output(limit, *args):
+    command, environment = git_invocation(*args)
+    value = subprocess.check_output(
+        command, cwd=REPO, env=environment, timeout=60)
+    if len(value) > limit:
+        raise ValueError("bounded Git output exceeded")
+    return value
+
+
+def require_clean_git():
+    command, environment = git_invocation(
+        "diff", "--quiet", "--no-ext-diff", "HEAD", "--")
+    completed = subprocess.run(
+        command, cwd=REPO, env=environment, timeout=60,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, check=False)
+    if completed.returncode != 0:
+        raise ValueError("dirty image source")
+
+
 def record(command):
+    require_clean_git()
     output = ROOT / "build"
     names = ("wamr_hyperv-x86_64-efi", "wamr_hyperv-x86_64-efi.dbg",
              "wamr_hyperv-x86_64-efi.bootinfo")
@@ -47,10 +108,10 @@ def record(command):
         "schema_version": 1,
         "command": command,
         "scope": "native-build-only-not-boot-or-hardware-qualification",
-        "unikraft_revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
-        "unikraft_diff_sha256": hashlib.sha256(subprocess.check_output(
-            ["git", "diff", "HEAD", "--binary"], cwd=REPO)).hexdigest(),
+        "unikraft_revision": git_output(
+            65,
+            "rev-parse", "HEAD").decode().strip(),
+        "unikraft_diff_sha256": hashlib.sha256(b"").hexdigest(),
         "application_sources": {
             p.name: sha(p) for p in sorted(ROOT.iterdir()) if p.is_file()
             and not p.name.startswith(".")
@@ -101,12 +162,28 @@ def main():
     zig = tool("zig")
     command = [
         zig, "build", args.step, "-j2",
+        "--cache-dir", contract["zig_local_cache"],
+        "--global-cache-dir", contract["zig_global_cache"],
         f"-Dapp={ROOT}", f"-Dnative-make-environment={environment}",
+        f"-Dconfig={ROOT / 'build/.config'}",
         f"-Dmake-command={tool('make')}",
+        f"-Dbison-command={tool('bison')}",
+        f"-Dflex-command={tool('flex')}",
         f"-Dcompiler={zig} cc -target x86_64-freestanding-none",
         "-Dcompiler-targeted=true", f"-Dhost-cc={zig} cc",
         f"-Dhost-cxx={zig} c++", "-Dhost-cflags=-fno-sanitize=null",
         f"-Dmake-arg=AR={zig} ar",
+        f"-Dmake-arg=CP={tool('cp')} -f",
+        f"-Dmake-arg=MKDIR={tool('mkdir')}",
+        f"-Dmake-arg=PYTHON={tool('python3')}",
+        f"-Dmake-arg=READLINK={tool('readlink')}",
+        "-Dmake-arg=HOSTOSENV=Linux",
+        "-Dmake-arg=WGET_VERSION=unavailable",
+        "-Dmake-arg=WGET=false",
+        f"-Dmake-arg=ZIG={zig}",
+        f"-Dmake-arg=YACC={tool('bison')}",
+        f"-Dmake-arg=LEX={tool('flex')}",
+        "-Dmake-arg=KCONFIG_OVERWRITECONFIG=1",
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
     ]

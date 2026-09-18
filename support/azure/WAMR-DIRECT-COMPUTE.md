@@ -56,10 +56,17 @@ umask 077
 mkdir -p .d/wamr-direct/scratch .d/wamr-direct/tests
 export TMPDIR="$PWD/.d/wamr-direct/scratch"
 export PYTHONDONTWRITEBYTECODE=1
+mkdir -p .d/wamr-direct/restore
+cp support/tools/hyperv/local_boot/build.zig \
+  support/tools/hyperv/local_boot/build.zig.zon .d/wamr-direct/restore/
+zig build --build-file .d/wamr-direct/restore/build.zig --fetch=all \
+  --cache-dir "$PWD/.d/wamr-direct/restore-cache" \
+  --global-cache-dir "$PWD/.d/wamr-direct/global-cache" -j2
 zig build --build-file support/tools/hyperv/direct/build.zig \
   --cache-dir "$PWD/.d/wamr-direct/cache" \
   --prefix "$PWD/.d/wamr-direct/tools" -j2 install compute-fixture-tools
 zig build --build-file support/build/wamr-native-ci/build.zig \
+  --system "$PWD/.d/wamr-direct/restore/zig-pkg" \
   --cache-dir "$PWD/.d/wamr-direct/package-cache" \
   --prefix "$PWD/.d/wamr-direct/package-tools" \
   -Doptimize=ReleaseSafe -j2 test install
@@ -138,19 +145,51 @@ Select a successful **current-source** native CI run and independently verify
 its run attempt, tested source commit/tree and four local outcomes. On PRs,
 `SOURCE_SHA`/`SOURCE_TREE` identify the tested synthetic merge commit/tree, not
 silently the branch head. Retain that distinction in the final approval.
-Download only the named artifact; no old metadata-only artifact supplies the
+Retain `ARTIFACT_ID`, `ARTIFACT_URL` and the inner-ZIP `ARCHIVE_SHA256` only
+from the successful job output/summary published after the workflow
+redownloaded that exact artifact ID and matched its inner ZIP digest. The
+separately labelled Actions container digest is not the inner digest and is
+not an import substitute. Never derive the expected inner digest from a later
+downloaded ZIP. Ensure the exact reviewed `SOURCE_SHA` commit object is
+available in this repository and verify that it resolves to `SOURCE_TREE`.
+Download the exact artifact ID; no old metadata-only artifact supplies the
 required bytes. The following commands are offline/GitHub-only, not Azure:
 
 ```sh
 umask 077
 mkdir -p .d/wamr-download
-gh run download "$RUN_ID" --repo cataggar/unikraft \
-  --name "wamr-public-source-tiny-${RUN_ID}-${RUN_ATTEMPT}-${SOURCE_SHA}" \
-  --dir "$PWD/.d/wamr-download"
+gh api -H "Accept: application/vnd.github+json" \
+  "/repos/cataggar/unikraft/actions/artifacts/${ARTIFACT_ID}/zip" \
+  > "$PWD/.d/wamr-download/artifact-container.zip"
+python3 - "$PWD/.d/wamr-download/artifact-container.zip" \
+  "$PWD/.d/wamr-download/tiny-aot-public-source.zip" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import sys
+import zipfile
+
+container, output = map(Path, sys.argv[1:])
+with zipfile.ZipFile(container) as zipped:
+    entries = zipped.infolist()
+    if (
+        len(entries) != 1
+        or entries[0].filename != "tiny-aot-public-source.zip"
+        or entries[0].is_dir()
+        or not 0 < entries[0].file_size <= 512 * 1024 * 1024
+    ):
+        raise SystemExit("unexpected exact-artifact members")
+    with zipped.open(entries[0]) as source, output.open("xb") as target:
+        os.fchmod(target.fileno(), 0o600)
+        shutil.copyfileobj(source, target, 65536)
+        target.flush()
+        os.fsync(target.fileno())
+PY
 python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
   --archive "$PWD/.d/wamr-download/tiny-aot-public-source.zip" \
   --output "$PRIVATE_PARENT/FRESH-imported-image" \
   --expected-source "$SOURCE_SHA" --expected-tree "$SOURCE_TREE" \
+  --expected-archive-sha256 "$ARCHIVE_SHA256" \
   --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
   --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate"
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" handoff \

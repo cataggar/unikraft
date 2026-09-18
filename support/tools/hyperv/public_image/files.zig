@@ -47,7 +47,11 @@ pub fn copy(io: std.Io, source: c.File, to: p.Directory, name: []const u8) !void
     defer file.close(io);
     const before = try p.snapshot(file);
     if (before.size != source.size) return error.ArtifactChanged;
-    try c.boot.files.copy(io, .{ .file = file, .before = before, .pin = .{ .size = source.size, .sha256 = try c.sha(source.sha256) } }, to.dir, name);
+    try c.boot.files.copy(io, .{
+        .file = file,
+        .before = before,
+        .pin = try c.boot.files.Pin.init(before, try c.sha(source.sha256)),
+    }, to.dir, name);
 }
 pub fn create(io: std.Io, filename: []const u8) !p.Directory {
     const parent = try p.FileParent.open(io, filename, .artifact);

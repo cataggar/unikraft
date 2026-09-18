@@ -14,7 +14,7 @@ STORVSC_ZIG_GLOBAL_CACHE := $(LIBSTORVSC_BUILD)/zig-global-cache
 $(STORVSC_CORE_OBJ): $(LIBSTORVSC_BASE)/storvsc_core.zig
 	$(call build_cmd,ZIG,libstorvsc,$(notdir $@),\
 		mkdir -p $(STORVSC_ZIG_CACHE) $(STORVSC_ZIG_GLOBAL_CACHE) && \
-		zig build-obj -target x86_64-freestanding-none -OReleaseFast \
+		$(ZIG) build-obj -target x86_64-freestanding-none -OReleaseFast \
 			-fPIC -fsingle-threaded -mno-red-zone \
 			-fno-stack-check -fno-stack-protector -fno-unwind-tables \
 			--cache-dir $(STORVSC_ZIG_CACHE) \
