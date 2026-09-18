@@ -504,6 +504,13 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         (root / "private/dependency-hash-000.log").unlink()
 
         def wrong(*args, **kwargs):
+            work = root / "dependency-hash-work"
+            self.assertEqual(kwargs["cwd"], work)
+            self.assertEqual((work / "build.zig").read_bytes(),
+                             (root / "dependencies/build.zig").read_bytes())
+            self.assertEqual((work / "build.zig.zon").read_bytes(),
+                             (root / "dependencies/build.zig.zon").read_bytes())
+            self.assertTrue((work / "zig-pkg").is_dir())
             output = root / "private/dependency-hash-000.log"
             self.put(output, b"miz-0.2.0-wrong\n")
             return output, {}
@@ -511,6 +518,29 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         with mock.patch.object(ci, "execute", side_effect=wrong), \
                 self.assertRaisesRegex(ci.Refusal, "content hash mismatch"):
             ci.verify_package_hashes(root, packages)
+
+    def test_zig_hash_recomputation_never_creates_a_repository_package_root(self):
+        root, packages, _ = self.dependency_fixture()
+        shutil.copyfile(ci.LOCAL_BOOT / "build.zig",
+                        root / "dependencies/build.zig")
+        shutil.copyfile(ci.LOCAL_BOOT / "build.zig.zon",
+                        root / "dependencies/build.zig.zon")
+        self.put(packages / ci.MIZ_PACKAGE_HASH / "build.zig.zon", b""".{
+    .name = .fixture,
+    .version = "0.0.0",
+    .fingerprint = 0x5e540eeabebe342,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{""},
+}
+""")
+        (root / "private/dependency-hash-000.log").unlink()
+        repository_packages = ci.REPO / "zig-pkg"
+        self.assertFalse(repository_packages.exists())
+        with self.assertRaisesRegex(ci.Refusal, "content hash mismatch"):
+            ci.verify_package_hashes(root, packages)
+        self.assertFalse(repository_packages.exists())
+        self.assertTrue((root / "dependency-hash-work/zig-pkg").is_dir())
 
     def test_create_exact_copy_never_follows_or_overwrites(self):
         directory = self.root / "copies"

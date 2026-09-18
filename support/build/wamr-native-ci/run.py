@@ -876,6 +876,16 @@ def verify_package_hashes(root, packages):
     cache = root / "dependency-hash-cache"
     work.mkdir(mode=0o700)
     cache.mkdir(mode=0o700)
+    expected = {}
+    copies = {}
+    for name in ("build.zig", "build.zig.zon"):
+        data = read(root / "dependencies" / name, MIB)
+        expected[name] = data
+        copies[name] = create_exact_copy(work / name, data)
+    (work / "zig-pkg").mkdir(mode=0o700)
+    work_state = restored_manifest_state(work, expected)
+    require(work_state["manifests"] == copies,
+            "dependency hash workspace manifest identity changed")
     names = package_roots(packages)
     for index, name in enumerate(names):
         try:
@@ -887,6 +897,8 @@ def verify_package_hashes(root, packages):
             raise Refusal("Zig package hash recomputation failed") from error
         require(read(output, 512) == (name + "\n").encode("ascii"),
                 "Zig package content hash mismatch")
+        require(restored_manifest_state(work, expected) == work_state,
+                "dependency hash workspace manifest identity changed")
 
 
 def restore_dependencies(root, expected_source):
