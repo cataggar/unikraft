@@ -375,6 +375,19 @@ class Evidence(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "bundle refused"):
             public_bundle.ci_runtime(runtime_owner)
 
+    def test_boot_output_slots_preserve_their_shared_parent(self):
+        runtime = self.root / "runtime"
+        compute = runtime / "compute"
+        compute.mkdir(parents=True, mode=0o700)
+        package, configs = ci.prepare_boot_output_slots(runtime, compute)
+        parent = ci.snapshot(compute.lstat())
+        (package / "artifact").write_bytes(b"package")
+        for config in configs:
+            (Path(config["work_dir"]) / "serial").write_bytes(b"boot")
+        self.assertEqual(ci.snapshot(compute.lstat()), parent)
+        with self.assertRaisesRegex(ci.Refusal, "boot output already exists"):
+            ci.prepare_boot_output_slots(runtime, compute)
+
     def test_physical_tree_bounds_enumeration_and_symlink_hash_work(self):
         entries = self.root / "bounded-tree"
         entries.mkdir(mode=0o700)

@@ -2756,6 +2756,17 @@ def config_for(runtime, root, index):
     }
 
 
+def prepare_boot_output_slots(runtime, root):
+    package = root / "package"
+    configs = [config_for(runtime, root, index) for index in range(len(MODES))]
+    slots = [package, *(Path(config["work_dir"]) for config in configs)]
+    require(all(not path.exists() and not path.is_symlink() for path in slots),
+            "boot output already exists")
+    for path in slots:
+        path.mkdir(mode=0o700)
+    return package, configs
+
+
 def boot_args(cli, config):
     source = config["source"]
     args = [str(cli), "--" + source["kind"].replace("_", "-"), source["path"]]
@@ -2994,10 +3005,7 @@ def boot(runtime):
     require(producer_inputs(runtime, consumer_inputs) == initial,
             "producer inputs changed")
     require(check_build() == document(root / "evidence/build.json"), "build identity changed")
-    package_output = root / "package"
-    require(not package_output.exists() and not package_output.is_symlink(),
-            "package output already exists")
-    package_output.mkdir(mode=0o700)
+    package_output, configs = prepare_boot_output_slots(runtime, root)
     efi = APP / "build" / EFI
     paths = {"package_tool": root / "tools/bin/wamr-ci-package",
              "local_boot_tool": root / "tools/bin/uk-hyperv-local-boot",
@@ -3030,8 +3038,7 @@ def boot(runtime):
     })
     identity = document(APP / "build/artifacts/identity.json")
     for index, mode in enumerate(MODES):
-        config = config_for(runtime, root, index)
-        Path(config["work_dir"]).mkdir(mode=0o700)
+        config = configs[index]
         run_custodied(
             runtime, initial, root, mode,
             boot_args(paths["local_boot_tool"], config), 90, 64 * 1024,

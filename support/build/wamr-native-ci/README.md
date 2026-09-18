@@ -169,9 +169,10 @@ overflow). The native packaging worker retains its 120-second deadline and
 independent two-second cleanup budget. Each native boot is limited to 60
 seconds with the existing independent cleanup budget; an outer 660-second
 compute ceiling also bounds the orchestration and post-exit hashing.
-The empty private package output directory is created before boot-input
-custody, and the native packager accepts it only while empty; this keeps the
-shared compute-directory identity stable without allowing package reuse.
+The empty private package output and four boot work directories are created
+before boot-input custody, and the native packager accepts its slot only while
+empty; later package and serial writes therefore keep the shared
+compute-directory identity stable without allowing package reuse.
 Each attempt is create-only, with no resume, overwrite or automatic retry.
 
 Raw build, runtime and bounded 4-MiB serial logs stay in private local slots.
