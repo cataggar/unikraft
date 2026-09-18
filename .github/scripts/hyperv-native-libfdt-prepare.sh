@@ -63,4 +63,14 @@ if [[ -f "${ownership}" ]]; then
 fi
 [[ "$(sha256sum "${target}" | cut -d ' ' -f 1)" = "${expected}" ]] ||
   refuse final-digest
-stat -c '%d:%i:%u:%g:%a:%h:%s' "${target}" > "${root}/evidence/managed-libfdt.txt"
+managed="${root}/evidence/managed-libfdt.txt"
+managed_identity="$(stat -c '%d:%i:%u:%g:%a:%h:%s' "${target}")"
+if [[ -e "${managed}" || -L "${managed}" ]]; then
+  [[ -f "${managed}" && ! -L "${managed}" ]] || refuse managed-record
+  [[ "$(stat -c '%u:%g:%a:%h' "${managed}")" = \
+    "${runner_uid}:${runner_gid}:600:1" ]] || refuse managed-record-metadata
+  [[ "$(< "${managed}")" = "${managed_identity}" ]] ||
+    refuse managed-record-identity
+else
+  printf '%s\n' "${managed_identity}" > "${managed}"
+fi
