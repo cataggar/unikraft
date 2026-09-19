@@ -18,6 +18,16 @@ spec.loader.exec_module(ci)
 NAMES = ("efi", "debug_elf", "bootinfo", "raw", "vhd", "runtime", "compiler",
          "wasm", "cwasm", "config", "runtime_identity", "image_identity",
          "local_result", "package", "build", "build_start", "boot_inputs")
+V2_NAMES = (
+    "efi", "debug_elf", "bootinfo", "raw", "qcow2", "vhd",
+    "runtime", "compiler", "wasm", "cwasm", "config",
+    "runtime_identity", "image_identity", "local_result", "package",
+    "build", "build_start", "boot_inputs",
+    "qcow2_finalization_intent", "qcow2_finalization",
+    "qcow2_acceptance", "fixed_vhd_derivation_intent",
+    "fixed_vhd_derivation_gate", "fixed_vhd_derivation",
+    "final_inspection", "cleanup",
+)
 FAILURE_STAGE = "handoff"
 
 
@@ -35,13 +45,16 @@ def artifact(path):
 
 def result_records(root):
     result = ci.document(root / "evidence/result.json")
-    ci.require(result["schema_version"] == 1 and result["passed"] is True
+    version = result["schema_version"]
+    modes = ci.MODES if version == 1 else ci.SIX_MODES
+    ci.require(version in (1, 2) and result["passed"] is True
+               and (version == 1 or result.get("profile") == ci.CURRENT_PROFILE)
                and result["scope"] == "local_native_compute_only"
                and result["hardware_acceptance"] == "not_established"
                and result["cloud_authority"] == "not_admitted"
                and result["benchmark"] == "not_measured"
                and result["workload"] == "tiny"
-               and result["modes"] == list(ci.MODES), "wrong local result")
+               and result["modes"] == list(modes), "wrong local result")
     records = result["records"]
     ci.require(8 <= len(records) <= 64 and "result.json" not in records,
                "invalid earlier record set")
@@ -50,7 +63,14 @@ def result_records(root):
                    and name not in (".json", "..json"), "invalid record name")
         ci.require(ci.digest(root / "evidence" / name) == expected, "local record changed")
     required = {"build.json", "build-start.json", "boot-inputs.json", "package.json"}
-    required.update(mode + "-compute.json" for mode in ci.MODES)
+    required.update(mode + "-compute.json" for mode in modes)
+    if version == 2:
+        required.update({
+            "qcow2-finalization-intent.json", "qcow2-finalization.json",
+            "qcow2-acceptance.json", "fixed-vhd-derivation-intent.json",
+            "fixed-vhd-derivation-gate.json",
+            "fixed-vhd-derivation.json", "final-inspection.json",
+        })
     ci.require(required <= records.keys(), "incomplete local records")
     return records
 
@@ -60,6 +80,10 @@ def export(runtime, output):
     private(output.parent)
     root = runtime / "compute"
     records = result_records(root)
+    result = ci.document(root / "evidence/result.json")
+    version = result["schema_version"]
+    modes = ci.MODES if version == 1 else ci.SIX_MODES
+    names = NAMES if version == 1 else V2_NAMES
     expected = ci.document(root / "evidence/build-start.json")
     legacy_supervision = "command_supervisor" not in expected
     if (not legacy_supervision
@@ -87,9 +111,9 @@ def export(runtime, output):
              "ovmf_vars": runtime / "firmware/vars.fd",
              "efi": ci.APP / "build" / ci.EFI}
     ci.boot_input_state(runtime, tools, expected=inputs)
-    for i, mode in enumerate(ci.MODES):
+    for i, mode in enumerate(modes):
         checked = ci.check_boot(
-            ci.config_for(runtime, root, i), build["runtime"], inputs)
+            ci.config_for(runtime, root, i, modes), build["runtime"], inputs)
         ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
                    "physical local result changed")
     ci.require_build_custody(runtime, before)
@@ -133,7 +157,9 @@ def export(runtime, output):
             }),
             "input:package_tool": ci.native_executable_identity(
                 inputs["files"]["package_tool"]),
-        })
+        }, profile=(
+            ci.CURRENT_PROFILE
+            if version == 2 else "tiny-aot-two-boot"))
     inspected = ci.document(inspected_output)
     packaged = ci.document(root / "evidence/package.json")
     ci.require(inspected["producer_sha256"] == packaged["producer_sha256"]
@@ -144,7 +170,7 @@ def export(runtime, output):
         ci.record_input_paths(
             {"command-supervisor": Path(ci.COMMAND_SUPERVISOR_PATH)}, {},
             expected=compatibility_supervisor)
-    paths = (
+    legacy_paths = (
         ci.APP / "build" / ci.EFI, ci.APP / "build" / (ci.EFI + ".dbg"),
         ci.APP / "build" / (ci.EFI + ".bootinfo"), root / "package/unikraft.raw",
         root / "package/unikraft.vhd", ci.APP / "build/artifacts/libwamr-aot.a",
@@ -154,6 +180,29 @@ def export(runtime, output):
         root / "evidence/result.json", root / "evidence/package.json",
         root / "evidence/build.json", root / "evidence/build-start.json",
         root / "evidence/boot-inputs.json")
+    current_paths = (
+        ci.APP / "build" / ci.EFI, ci.APP / "build" / (ci.EFI + ".dbg"),
+        ci.APP / "build" / (ci.EFI + ".bootinfo"),
+        root / "package/unikraft.raw", root / "package/unikraft.qcow2",
+        root / "package/unikraft-derived.vhd",
+        ci.APP / "build/artifacts/libwamr-aot.a",
+        ci.APP / "build/artifacts/wamrc", ci.APP / "build/artifacts/tiny.wasm",
+        ci.APP / "build/artifacts/tiny.cwasm", ci.APP / ".config",
+        ci.APP / "build/artifacts/identity.json",
+        ci.APP / "build/image-identity.json",
+        root / "evidence/result.json", root / "evidence/package.json",
+        root / "evidence/build.json", root / "evidence/build-start.json",
+        root / "evidence/boot-inputs.json",
+        root / "evidence/qcow2-finalization-intent.json",
+        root / "evidence/qcow2-finalization.json",
+        root / "evidence/qcow2-acceptance.json",
+        root / "evidence/fixed-vhd-derivation-intent.json",
+        root / "evidence/fixed-vhd-derivation-gate.json",
+        root / "evidence/fixed-vhd-derivation.json",
+        root / "evidence/final-inspection.json",
+        runtime / "evidence/runtime-cleanup.txt",
+    )
+    paths = legacy_paths if version == 1 else current_paths
 
     def retain(source, destination):
         original = artifact(source)
@@ -168,9 +217,12 @@ def export(runtime, output):
                    "handoff copy changed")
         return saved
 
-    artifacts = [retain(path, output / "artifacts" / name) for name, path in zip(NAMES, paths)]
+    artifacts = [
+        retain(path, output / "artifacts" / name)
+        for name, path in zip(names, paths)
+    ]
     boots = []
-    for mode in ci.MODES:
+    for mode in modes:
         slot = output / "boots" / mode
         slot.mkdir(mode=0o700)
         work = root / ("boot-" + mode)
@@ -186,7 +238,7 @@ def export(runtime, output):
                    runtime, expected["consumer_inputs"]) == before,
                "inputs changed during handoff")
     ci.boot_input_state(runtime, tools, content=True, expected=inputs)
-    by_name = dict(zip(NAMES, artifacts))
+    by_name = dict(zip(names, artifacts))
     bundle = {
         "schema": "uk.wamr.local-image-handoff", "version": 1,
         "authority": "not_admitted",
@@ -196,6 +248,40 @@ def export(runtime, output):
             for name in ("wasm", "cwasm", "runtime", "compiler", "config")}),
         "artifacts": artifacts, "boots": boots, "evidence": evidence,
     }
+    if version == 2:
+        run_id = os.environ.get("GITHUB_RUN_ID")
+        run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
+        ci.require(
+            os.environ.get("GITHUB_REPOSITORY") == "cataggar/unikraft"
+            and isinstance(run_id, str)
+            and isinstance(run_attempt, str)
+            and run_id.isdecimal() and int(run_id) > 0
+            and run_attempt.isdecimal() and int(run_attempt) > 0,
+            "exact CI run identity required")
+        bundle.update(
+            version=2,
+            profile=ci.CURRENT_PROFILE,
+            run={
+                "repository": "cataggar/unikraft",
+                "run_id": run_id,
+                "run_attempt": run_attempt,
+            },
+            lineage={
+                "raw_sha256": by_name["raw"]["sha256"],
+                "accepted_qcow2_sha256": by_name["qcow2"]["sha256"],
+                "derived_vhd_sha256": by_name["vhd"]["sha256"],
+                "qcow2_finalization_sha256":
+                    by_name["qcow2_finalization"]["sha256"],
+                "qcow2_acceptance_sha256":
+                    by_name["qcow2_acceptance"]["sha256"],
+                "fixed_vhd_derivation_sha256":
+                    by_name["fixed_vhd_derivation"]["sha256"],
+                "fixed_vhd_derivation_gate_sha256":
+                    by_name["fixed_vhd_derivation_gate"]["sha256"],
+                "final_inspection_sha256":
+                    by_name["final_inspection"]["sha256"],
+            },
+        )
     ci.save(output / "bundle.json", bundle)
     return bundle
 
@@ -205,14 +291,60 @@ def plan(bundle_path, output):
     private(output.parent)
     bundle = ci.document(bundle_path)
     ci.require(bundle["schema"] == "uk.wamr.local-image-handoff"
-               and bundle["version"] == 1 and bundle["authority"] == "not_admitted"
+               and bundle["version"] in (1, 2)
+               and bundle["authority"] == "not_admitted"
                and bundle["identity"]["wamr_revision"] == ci.REVISION,
                "not a compute handoff")
+    version = bundle["version"]
+    names = NAMES if version == 1 else V2_NAMES
+    modes = ci.MODES if version == 1 else ci.SIX_MODES
+    if version == 2:
+        ci.require(bundle["profile"] == ci.CURRENT_PROFILE
+                   and bundle["run"]["repository"] == "cataggar/unikraft"
+                   and bundle["run"]["run_id"].isdecimal()
+                   and bundle["run"]["run_attempt"].isdecimal(),
+                   "not a version-2 compute handoff")
     for item in bundle["artifacts"] + bundle["evidence"] + [
             boot[key] for boot in bundle["boots"] for key in ("serial", "request", "report", "compute")]:
         ci.require(artifact(Path(item["path"])) == item, "handoff bytes changed")
+    scope_bundle = artifact(bundle_path)
+    purpose = "tiny-aot-two-boot"
+    if version == 2:
+        transport_path = bundle_path.parent / "transport.json"
+        transport = ci.document(transport_path)
+        ci.require(
+            set(transport) == {
+                "schema", "version", "repository", "run_id", "run_attempt",
+                "source_revision", "source_tree", "inner_zip_sha256",
+                "artifact_id", "container_digest",
+            }
+            and transport["schema"] == "uk.wamr.public-source-transport"
+            and transport["version"] == 2
+            and transport["repository"] == bundle["run"]["repository"]
+            and transport["run_id"] == bundle["run"]["run_id"]
+            and transport["run_attempt"] == bundle["run"]["run_attempt"]
+            and transport["source_revision"] == bundle["source_revision"]
+            and transport["source_tree"] == bundle["source_tree"],
+            "untrusted version-2 transport")
+        admission_path = output.parent / (output.name + ".admission.json")
+        admission = {
+            "schema": "uk.wamr.direct-compute-admission",
+            "version": 2,
+            "profile": ci.CURRENT_PROFILE,
+            "authority": "not_admitted",
+            "source_revision": bundle["source_revision"],
+            "source_tree": bundle["source_tree"],
+            "run": bundle["run"],
+            "lineage": bundle["lineage"],
+            "public_bundle": artifact(bundle_path),
+            "transport": artifact(transport_path),
+        }
+        ci.save(admission_path, admission)
+        scope_bundle = artifact(admission_path)
+        purpose = ci.CURRENT_PROFILE
     value = {
-        "schema": "uk.wamr.direct-compute", "version": 1, "purpose": "tiny-aot-two-boot",
+        "schema": "uk.wamr.direct-compute", "version": version,
+        "purpose": purpose,
         "authority": "not_admitted",
         "approval": dict.fromkeys((
             "direct_specialized_gen2", "os_only_private", "two_boots_only",
@@ -224,9 +356,17 @@ def plan(bundle_path, output):
         "runtime_seconds": 3600, "cleanup_seconds": 1800,
         "operation_seconds": 600, "poll_seconds": 10,
         "source_revision": bundle["source_revision"], "source_tree": bundle["source_tree"],
-        "identity": bundle["identity"], "os_vhd": bundle["artifacts"][NAMES.index("vhd")],
-        "bundle": artifact(bundle_path),
+        "identity": bundle["identity"],
+        "os_vhd": bundle["artifacts"][names.index("vhd")],
+        "bundle": scope_bundle,
     }
+    if version == 2:
+        value.update(
+            subscription="00000000-0000-0000-0000-000000000001",
+            prefix="not-admitted-candidate",
+        )
+    ci.require([boot["mode"] for boot in bundle["boots"]] == list(modes),
+               "wrong compute handoff modes")
     value["approval"].update(approved_unix=0, expires_unix=0)
     ci.save(output, value)
     return value
@@ -260,6 +400,8 @@ def main():
     imp.add_argument("--run-attempt", required=True)
     imp.add_argument("--validator", type=Path, required=True)
     imp.add_argument("--supervisor", type=Path, required=True)
+    imp.add_argument("--artifact-id")
+    imp.add_argument("--container-digest")
     args = parser.parse_args()
     os.umask(0o077)
     if args.command == "export":
@@ -295,7 +437,8 @@ def main():
                 public_bundle.import_bundle(
                     sys.modules[__name__], args.archive, args.output, expected,
                     args.expected_archive_sha256, args.validator,
-                    args.supervisor)
+                    args.supervisor, args.artifact_id,
+                    args.container_digest)
     print("Compute handoff/plan prepared; authority=not_admitted. No Azure operations.")
 
 

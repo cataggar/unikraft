@@ -52,10 +52,12 @@ not change those semantics or spoof unavailable-storage markers:
   identity and allowed GPT relocation only. Failure supervision distinguishes
   refusal from partial publication and rolls owned outputs back before
   reporting refusal.
-* The existing installed `uk-hyperv-local-boot` runs four fresh one-CPU
-  attempts: raw/x2APIC, raw/masked-x2APIC, full VHD/x2APIC and full
-  VHD/masked-x2APIC. Each uses the **exact read-only package**, a genuine VPC
-  opening for VHD, private OVMF variables, no NIC and return **0**. Its
+* The existing installed `uk-hyperv-local-boot` runs six fresh one-CPU
+  attempts: raw, finalized standalone native-zstd/64-KiB QCOW2 and derived
+  fixed VHD, each with x2APIC and masked x2APIC. Derivation is admitted only
+  after both retained QCOW2 boots and all preceding custody are reopened and
+  accepted. Each uses the **exact read-only image**, a genuine QCOW2 or VPC
+  opening as appropriate, private OVMF variables, no NIC and return **0**. Its
   crash, ordered startup/terminal, exact-input, bounded serial and process
   cleanup checks remain mandatory.
 * The existing pinned-QEMU acquisition and managed libfdt/KVM runtime owner
@@ -141,16 +143,16 @@ values. The runtime map includes the supervisor ELF and its dynamic runtime;
 the ELF is also a normal version-2 consumer input. Current-custody checks,
 final handoff and public export recompute the same maps rather than trusting
 copied pins.
-The package, publication and four boot work directories are empty private
+The package, publication and six boot work directories are empty private
 slots created before that final custody baseline, so later outputs do not
 change a recorded supervisor/tool ancestor directory.
 
-The compute conversion primitives do not change those four legacy boots,
-stored preparation state, handoff, public bundle or Azure admission. In
-particular, fixed-VHD derivation takes an exact expected QCOW2 SHA-256 and
-capacity, not a JSON boot-success assertion. Six-mode sequencing, boot
-acceptance binding, bundle schemas and cloud evidence remain outside this
-primitive layer.
+The compute conversion primitives do not reinterpret the four legacy
+version-1 boots or stored preparation state. In particular, fixed-VHD
+derivation takes an exact expected QCOW2 SHA-256 and capacity, not a JSON
+boot-success assertion. The version-2 orchestrator invokes it only after the
+exact QCOW2 acceptance record is complete, then binds the two derived-VHD
+boots and final inspection without granting Azure authority.
 
 Bootstrap execution is an explicit call-site capability, not a global
 fallback. Its closed exact-stage allowlist is `dependency-restore`,
@@ -245,8 +247,8 @@ code-point sequences remain distinct paths and produce distinct digests.
 Records also bind the Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
 actual tools, wasm/cwasm/compiler/library bytes, solved configuration,
 entire EFI/debug ELF/bootinfo, native package producer, QEMU and OVMF,
-complete raw/VHD/footer, and each request/report/raw serial. Inputs are
-reverified after the four boots and physical package reload. The final result
+complete raw/QCOW2/VHD/footer lineage, and each request/report/raw serial.
+Inputs are reverified after the six boots and physical package reload. The final result
 hashes earlier records only, **not itself**. These are local build/compute
 observations, not authenticated source attestations or deployment receipts.
 
@@ -307,7 +309,7 @@ worker retains its 120-second deadline and
 independent two-second cleanup budget. Each native boot is limited to 60
 seconds with the existing independent cleanup budget; the Actions job deadline
 separately bounds orchestration and post-exit hashing without GNU `timeout`.
-The empty private package output and four boot work directories are created
+The empty private package output and six boot work directories are created
 before boot-input custody, and the native packager accepts its slot only while
 empty; later package and serial writes therefore keep the shared
 compute-directory identity stable without allowing package reuse. An empty
@@ -379,8 +381,9 @@ exact-QCOW2-to-fixed-VHD workers, reopen both artifacts, validate byte/content
 identity and exercise a hard-deadline refusal with rollback and typed
 supervision. The Python fixtures use the actual native packaging helper and pinned miz
 with a synthetic **nonbootable** PE, plus synthetic compute/log records.
-They check full raw/VHD/footer hashes, physical reload, mutation/partial-state/
-replay refusal, exact results, the four CLI configurations, standard
+They check full raw/QCOW2/VHD/footer hashes, physical reload,
+mutation/partial-state/replay refusal, exact results, the six CLI
+configurations, standard
 descendant cleanup, timeout/overflow/nonzero/exec failures, cleanup poison,
 canonical-result tamper, executable identity and the closed environment.
 These are not
@@ -393,7 +396,7 @@ establishes the first local tiny-compute observation.
 
 ## Private final-image handoff
 
-After a successful final-source build and all four boots, `handoff.py export`
+After a successful final-source build and all six boots, `handoff.py export`
 can retain and revalidate the **actual private bytes** before the runner is
 discarded. It uses the existing native physical package inspector, original
 request/report/compute checks, and complete earlier result hashes. Its bundle
@@ -437,7 +440,7 @@ primary/descendant/output/deadline/cleanup/poison observations and successful
 cleanup. The same record and custody are rechecked before export, after export
 and after archive reopen. A missing supervisor, changed consumer record,
 bootstrap substitution or stage relabel refuses publication.
-After all four genuine boots, while the complete runner files still exist,
+After all six genuine boots, while the complete runner files still exist,
 the workflow invokes the production private export and native handoff checker,
 then copies only its closed image/local-evidence allowlist into a standalone
 ZIP. Verification hashes and parses one retained no-follow archive descriptor;
@@ -448,11 +451,17 @@ ZIP before upload.
 Artifact name:
 `wamr-public-source-tiny-RUN_ID-RUN_ATTEMPT-SOURCE_SHA`.
 Its sole uploaded file is `tiny-aot-public-source.zip`, stored for seven days.
-It contains the 17 exact image/compiler/runtime/config/manifest artifacts,
-four original serial/request/report/compute sets, the original fixed 20 local
-JSON records, portable `bundle.json`, and `public-source.json` (55 regular
-files, at most 512 MiB total). Dependency custody is embedded in the existing
-`build-start.json`; it is not a 21st evidence member. The delivered source
+Current version 2 contains 26 exact image/compiler/runtime/config/manifest and
+lineage artifacts, six original serial/request/report/compute sets, 33 exact
+local JSON records, portable `bundle.json`, and `public-source.json` (85
+regular files). Its closed archive bound is 96 members, 512 MiB total and 64
+KiB per JSON record; the measured contract does not use globs or optional
+members. Exact artifact-ID redownload is followed by production import,
+transport binding and native non-authorizing candidate validation. Version 1
+is not reinterpreted: it remains exactly 17 artifacts, four boot sets, 20
+evidence records and 55 ZIP members for the old tiny profile. Dependency
+custody is embedded in the existing `build-start.json`; it is not a 21st
+version-1 evidence member. The delivered source
 `993e4d0d394c08202c0d0c57ea97450a19a4f394`, its reference PR head
 `34e5c88a165c4da878b3122b8b91716116d65d4b`, and retained run
 `35277215611` merge source `b5a8fdbee033349f7145fbc76aebfee29b2fa04f`

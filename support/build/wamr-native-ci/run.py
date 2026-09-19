@@ -32,9 +32,16 @@ REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 MARKER = "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
 LEGACY = "Using legacy xAPIC MMIO"
 MODES = ("raw-x2apic", "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic")
+SIX_MODES = (
+    "raw-x2apic", "raw-legacy-apic",
+    "qcow2-x2apic", "qcow2-legacy-apic",
+    "vpc-x2apic", "vpc-legacy-apic",
+)
+CURRENT_PROFILE = "qcow2-derived-vhd"
 PRODUCTION_COMMAND_STAGES = frozenset({
     "adapter", "local-boot-tool", "fixtures", "prepare", "config",
-    "native-image", "package", *MODES, "inspect",
+    "native-image", "package", *SIX_MODES, "finalize-qcow2",
+    "derive-fixed-vhd", "inspect",
     "public-validator-build", "handoff-inspect", "handoff-inspect-legacy",
     "supervisor-import-identity", "native-revalidation",
 })
@@ -2521,11 +2528,21 @@ def command_retained_names(kind):
     return sorted(names)
 
 
-def boot_command_argv(stage):
-    index = MODES.index(stage)
+def boot_command_argv(stage, profile=CURRENT_PROFILE):
+    modes = SIX_MODES if profile == CURRENT_PROFILE else MODES
+    index = modes.index(stage)
     legacy = bool(index % 2)
-    source_kind = "raw-disk" if index < 2 else "fixed-vhd"
-    source_name = "unikraft.raw" if index < 2 else "unikraft.vhd"
+    if profile == CURRENT_PROFILE:
+        source_kind, source_name = (
+            ("raw-disk", "unikraft.raw") if index < 2 else
+            ("qcow2", "unikraft.qcow2") if index < 4 else
+            ("fixed-vhd", "unikraft-derived.vhd")
+        )
+    else:
+        source_kind, source_name = (
+            ("raw-disk", "unikraft.raw") if index < 2 else
+            ("fixed-vhd", "unikraft.vhd")
+        )
     values = [
         command_path("input:local_boot_tool"),
         command_literal("--" + source_kind),
@@ -2562,7 +2579,7 @@ def boot_command_argv(stage):
     return values
 
 
-def production_command_contract(stage):
+def production_command_contract(stage, profile=CURRENT_PROFILE):
     handoff_image = (APP / "build" / EFI).relative_to(REPO).as_posix()
     contracts = {
         "adapter": {
@@ -2682,6 +2699,34 @@ def production_command_contract(stage):
                 command_path("work", "package"),
             ],
         },
+        "finalize-qcow2": {
+            "kind": "bound-tools", "seconds": 150,
+            "output_limit": 64 * 1024,
+            "command_executable": command_path("input:package_tool"),
+            "native_executable": command_path("input:package_tool"),
+            "interpreter": None,
+            "argv": [
+                command_path("input:package_tool"),
+                command_literal("finalize-qcow2"),
+                command_path(
+                    "work", "evidence/qcow2-finalization-intent.json"),
+                command_path("work", "package"),
+            ],
+        },
+        "derive-fixed-vhd": {
+            "kind": "bound-tools", "seconds": 150,
+            "output_limit": 64 * 1024,
+            "command_executable": command_path("input:package_tool"),
+            "native_executable": command_path("input:package_tool"),
+            "interpreter": None,
+            "argv": [
+                command_path("input:package_tool"),
+                command_literal("derive-fixed-vhd"),
+                command_path(
+                    "work", "evidence/fixed-vhd-derivation-intent.json"),
+                command_path("work", "package"),
+            ],
+        },
         "inspect": {
             "kind": "bound-tools", "seconds": 150,
             "output_limit": 64 * 1024,
@@ -2770,14 +2815,14 @@ def production_command_contract(stage):
             ],
         },
     }
-    for mode in MODES:
+    for mode in (SIX_MODES if profile == CURRENT_PROFILE else MODES):
         contracts[mode] = {
             "kind": "bound-tools", "seconds": 90,
             "output_limit": 64 * 1024,
             "command_executable": command_path("input:local_boot_tool"),
             "native_executable": command_path("input:local_boot_tool"),
             "interpreter": None,
-            "argv": boot_command_argv(mode),
+            "argv": boot_command_argv(mode, profile),
         }
     require(stage in contracts, "unknown production command stage")
     contract = contracts[stage]
@@ -2803,10 +2848,10 @@ def production_command_contract(stage):
 
 def validate_supervised_command_binding(
         value, stage, role_identities=None,
-        transport_context="producer_direct"):
+        transport_context="producer_direct", profile=CURRENT_PROFILE):
     require(transport_context in {"producer_direct", "trusted_inner_zip"},
             "invalid supervised command transport context")
-    contract = production_command_contract(stage)
+    contract = production_command_contract(stage, profile)
     require(isinstance(value, dict) and set(value) == {
         "scope", "stage", "exit_code", "bytes", "sha256", "sha256_scope",
         "over_limit", "known_error_markers", "supervisor",
@@ -4620,18 +4665,25 @@ def compute(raw, identity, legacy):
     return json.loads(compute_lines[0].split("=", 1)[1], object_pairs_hook=unique)
 
 
-def config_for(runtime, root, index):
+def config_for(runtime, root, index, modes=MODES):
+    mode = modes[index]
     legacy = bool(index % 2)
-    source_kind = "raw_disk" if index < 2 else "fixed_vhd"
+    source_kind, source_name = (
+        ("raw_disk", "unikraft.raw") if mode.startswith("raw-") else
+        ("qcow2", "unikraft.qcow2") if mode.startswith("qcow2-") else
+        ("fixed_vhd", (
+            "unikraft-derived.vhd"
+            if modes == SIX_MODES else "unikraft.vhd"))
+    )
     return {
         "source": {
             "kind": source_kind,
-            "path": str(root / "package" / ("unikraft.raw" if index < 2 else "unikraft.vhd")),
+            "path": str(root / "package" / source_name),
         },
         "ovmf_code": str(runtime / "firmware/code.fd"),
         "ovmf_vars": str(runtime / "firmware/vars.fd"),
         "qemu": str(runtime / "bin/qemu-system-x86_64"),
-        "work_dir": str(root / ("boot-" + MODES[index])),
+        "work_dir": str(root / ("boot-" + mode)),
         "expect": MARKER, "expect_main_return": 0,
         "required": [LEGACY] if legacy else [],
         "forbidden": list(FORBIDDEN) + ([] if legacy else [LEGACY]),
@@ -4642,7 +4694,10 @@ def config_for(runtime, root, index):
 def prepare_boot_output_slots(runtime, root):
     package = root / "package"
     publication = root / "public-source"
-    configs = [config_for(runtime, root, index) for index in range(len(MODES))]
+    configs = [
+        config_for(runtime, root, index, SIX_MODES)
+        for index in range(len(SIX_MODES))
+    ]
     slots = [
         package, publication,
         *(Path(config["work_dir"]) for config in configs),
@@ -4663,7 +4718,10 @@ def prepare_boot_output_slots(runtime, root):
 def precreate_boot_output_slots(runtime, root):
     package = root / "package"
     publication = root / "public-source"
-    configs = [config_for(runtime, root, index) for index in range(len(MODES))]
+    configs = [
+        config_for(runtime, root, index, SIX_MODES)
+        for index in range(len(SIX_MODES))
+    ]
     slots = [
         package, publication,
         *(Path(config["work_dir"]) for config in configs),
@@ -4906,6 +4964,115 @@ def build(runtime, wamr):
     save(root / "evidence/build.json", check_build())
 
 
+def image_artifact(path, virtual_bytes):
+    record, unused_directories = physical_file_record(path)
+    del unused_directories
+    info = path.stat()
+    allocated = (
+        {"state": "available", "bytes": info.st_blocks * 512}
+        if hasattr(info, "st_blocks") else
+        {"state": "unavailable", "bytes": None}
+    )
+    return {
+        "path": record["path"],
+        "sha256": record["sha256"],
+        "file_bytes": record["metadata"][6],
+        "allocated": allocated,
+        "virtual_bytes": virtual_bytes,
+        "metadata": record["metadata"],
+    }
+
+
+def require_qcow2_finalization(value, raw, efi, package_tool):
+    require(set(value) == {
+        "schema", "schema_version", "status", "source_sha256",
+        "source_bytes", "output", "identity", "profile", "limits",
+        "provenance",
+    } and value["schema"] == "uk.wamr.compute-qcow2-finalization"
+      and value["schema_version"] == 1 and value["status"] == "succeeded",
+      "invalid QCOW2 finalization")
+    require(value["source_sha256"] == raw["sha256"]
+            and value["source_bytes"] == raw["size"],
+            "wrong QCOW2 source")
+    output = value["output"]
+    require(set(output) == {
+        "sha256", "file_bytes", "allocated", "virtual_bytes",
+    } and output["virtual_bytes"] == raw["size"]
+      and 0 < output["file_bytes"] <= 66 * MIB,
+      "invalid QCOW2 output")
+    require(value["profile"] == {
+        "format": "qcow2", "version": 3, "cluster_bytes": 64 * 1024,
+        "compression": "zstd", "incompatible_features": 8,
+        "compatible_features": 0, "autoclear_features": 0,
+        "header_extensions": False, "extended_l2": False,
+        "encryption": False, "snapshots": 0, "backing_file": False,
+        "external_data_file": False, "standalone": True,
+    }, "wrong QCOW2 profile")
+    identity = value["identity"]
+    require(identity["workload_sha256"] == efi["sha256"]
+            and identity["workload_bytes"] == efi["size"],
+            "wrong QCOW2 workload")
+    provenance = value["provenance"]
+    require(provenance["parent_kind"] == "raw"
+            and provenance["parent_sha256"] == raw["sha256"]
+            and provenance["producer_sha256"] == package_tool["sha256"],
+            "wrong QCOW2 provenance")
+    return value
+
+
+def require_vhd_derivation(
+        value, accepted, package_tool, raw, source_identity):
+    require(set(value) == {
+        "schema", "schema_version", "status", "accepted_qcow2",
+        "accepted_qcow2_decoded_sha256", "accepted_qcow2_profile",
+        "source_identity", "output", "output_identity", "footer",
+        "relocation", "limits", "provenance",
+    } and value["schema"] == "uk.wamr.compute-fixed-vhd-derivation"
+      and value["schema_version"] == 1 and value["status"] == "succeeded",
+      "invalid fixed-VHD derivation")
+    source = value["accepted_qcow2"]
+    require(source["sha256"] == accepted["sha256"]
+            and source["file_bytes"] == accepted["file_bytes"]
+            and source["virtual_bytes"] == accepted["virtual_bytes"],
+            "wrong accepted QCOW2 input")
+    require(value["accepted_qcow2_decoded_sha256"] == raw["sha256"],
+            "wrong decoded QCOW2 identity")
+    require(value["accepted_qcow2_profile"] == {
+        "format": "qcow2", "version": 3, "cluster_bytes": 64 * 1024,
+        "compression": "zstd", "incompatible_features": 8,
+        "compatible_features": 0, "autoclear_features": 0,
+        "header_extensions": False, "extended_l2": False,
+        "encryption": False, "snapshots": 0, "backing_file": False,
+        "external_data_file": False, "standalone": True,
+    }, "wrong accepted QCOW2 profile")
+    output = value["output"]
+    require(output["file_bytes"] == 66 * MIB + 512
+            and output["virtual_bytes"] == 66 * MIB,
+            "wrong fixed-VHD geometry")
+    require(value["source_identity"] == source_identity
+            and value["output_identity"] == source_identity
+            and value["footer"]["creator"] == "miz "
+            and value["footer"]["timestamp"] == 0,
+            "wrong fixed-VHD identity")
+    require(value["relocation"] == {
+        "was_relocated": False,
+        "old_backup_lba": value["relocation"]["new_backup_lba"],
+        "new_backup_lba": value["relocation"]["new_backup_lba"],
+        "old_last_usable_lba":
+            value["relocation"]["new_last_usable_lba"],
+        "new_last_usable_lba":
+            value["relocation"]["new_last_usable_lba"],
+        "allowed_differences":
+            "protective-mbr,primary-gpt,relocated-backup-gpt,zero-padding",
+    }, "wrong fixed-VHD relocation")
+    provenance = value["provenance"]
+    require(provenance["parent_kind"] == "qcow2"
+            and provenance["parent_sha256"] == accepted["sha256"]
+            and provenance["producer_sha256"] == package_tool["sha256"],
+            "wrong fixed-VHD provenance")
+    return value
+
+
 def boot(runtime):
     global FAILURE_STAGE
     FAILURE_STAGE = "boot-platform"
@@ -4959,7 +5126,10 @@ def boot(runtime):
             "footer_sha256", "packaging")},
     })
     identity = document(APP / "build/artifacts/identity.json")
-    for index, mode in enumerate(MODES):
+
+    def run_mode(index):
+        global FAILURE_STAGE
+        mode = SIX_MODES[index]
         config = configs[index]
         FAILURE_STAGE = mode + "-command"
         run_custodied(
@@ -4968,10 +5138,165 @@ def boot(runtime):
             extra_inputs=inputs, extra_input_paths=paths)
         FAILURE_STAGE = mode + "-result"
         result = check_boot(config, identity, inputs)
-        expected = package["image"]["raw" if index < 2 else "vhd"]["sha256"]
+        expected = (
+            package["image"]["raw"]["sha256"] if index < 2 else
+            finalization["output"]["sha256"] if index < 4 else
+            derivation["output"]["sha256"]
+        )
         require(digest(Path(config["source"]["path"])) == expected,
                 "booted package changed")
         save(root / "evidence" / (mode + "-compute.json"), result)
+
+    finalization = None
+    derivation = None
+    for index in range(2):
+        run_mode(index)
+
+    raw = package["image"]["raw"]
+    efi_record = package["image"]["efi"]
+    limits = {
+        "max_input_bytes": 66 * MIB,
+        "max_output_bytes": 66 * MIB + 512,
+        "max_virtual_bytes": 66 * MIB,
+        "max_partition_array_bytes": MIB,
+        "max_metadata_bytes": 128 * 1024,
+        "max_metadata_work": 8194,
+        "max_work_bytes": 4 * 66 * MIB,
+        "max_memory_bytes": 512 * MIB,
+        "max_workload_bytes": 64 * MIB,
+    }
+    finalize_intent = {
+        "schema": "uk.wamr.compute-qcow2-finalization-intent",
+        "schema_version": 1,
+        "source_path": str(root / "package/unikraft.raw"),
+        "expected_source_sha256": raw["sha256"],
+        "expected_source_bytes": raw["size"],
+        "expected_virtual_bytes": raw["size"],
+        "expected_workload_sha256": efi_record["sha256"],
+        "expected_workload_bytes": efi_record["size"],
+        "timeout_ms": 120_000,
+        "limits": limits,
+    }
+    finalize_path = root / "evidence/qcow2-finalization-intent.json"
+    save(finalize_path, finalize_intent)
+    FAILURE_STAGE = "finalize-qcow2-command"
+    finalize_output = run_custodied(
+        runtime, initial, root, "finalize-qcow2",
+        [paths["package_tool"], "finalize-qcow2",
+         finalize_path, root / "package"],
+        150, 64 * 1024, extra_inputs=inputs, extra_input_paths=paths)
+    FAILURE_STAGE = "finalize-qcow2-result"
+    finalization = require_qcow2_finalization(
+        document(finalize_output), raw, efi_record,
+        inputs["files"]["package_tool"])
+    require(finalization == document(
+        root / "package/qcow2-finalization.json"),
+        "QCOW2 finalization record changed")
+    save(root / "evidence/qcow2-finalization.json", finalization)
+    qcow2_path = root / "package/unikraft.qcow2"
+    require(digest(qcow2_path) == finalization["output"]["sha256"]
+            and qcow2_path.stat().st_size
+            == finalization["output"]["file_bytes"],
+            "finalized QCOW2 bytes changed")
+
+    for index in range(2, 4):
+        run_mode(index)
+
+    FAILURE_STAGE = "qcow2-acceptance"
+    require(not (root / "package/unikraft-derived.vhd").exists()
+            and not (root / "package/fixed-vhd-derivation.json").exists(),
+            "VHD derivation preceded QCOW2 acceptance")
+    accepted_boots = {}
+    for index in range(4):
+        mode = SIX_MODES[index]
+        checked = check_boot(configs[index], identity, inputs)
+        require(checked == document(
+            root / "evidence" / (mode + "-compute.json")),
+            "pre-derivation boot evidence changed")
+        accepted_boots[mode] = {
+            "request_sha256": checked["request_sha256"],
+            "report_sha256": checked["report_sha256"],
+            "serial_sha256": checked["report"]["serial_sha256"],
+            "compute_sha256": digest(
+                root / "evidence" / (mode + "-compute.json")),
+        }
+    require_qcow2_finalization(
+        document(root / "evidence/qcow2-finalization.json"),
+        raw, efi_record, inputs["files"]["package_tool"])
+    accepted_qcow2 = image_artifact(
+        qcow2_path, finalization["output"]["virtual_bytes"])
+    require(accepted_qcow2["sha256"] == finalization["output"]["sha256"]
+            and accepted_qcow2["file_bytes"]
+            == finalization["output"]["file_bytes"],
+            "accepted QCOW2 identity changed")
+    acceptance = {
+        "schema": "uk.wamr.compute-qcow2-acceptance",
+        "schema_version": 1,
+        "profile": CURRENT_PROFILE,
+        "status": "accepted",
+        "source": initial["source"],
+        "accepted_qcow2": accepted_qcow2,
+        "finalization_sha256": digest(
+            root / "evidence/qcow2-finalization.json"),
+        "modes": list(SIX_MODES[:4]),
+        "boots": accepted_boots,
+        "build_sha256": digest(root / "evidence/build.json"),
+        "boot_inputs_sha256": digest(root / "evidence/boot-inputs.json"),
+    }
+    save(root / "evidence/qcow2-acceptance.json", acceptance)
+
+    derive_intent = {
+        "schema": "uk.wamr.compute-fixed-vhd-derivation-intent",
+        "schema_version": 1,
+        "source_path": str(qcow2_path),
+        "accepted_qcow2_sha256": accepted_qcow2["sha256"],
+        "expected_source_bytes": accepted_qcow2["file_bytes"],
+        "expected_capacity_bytes": accepted_qcow2["virtual_bytes"],
+        "timeout_ms": 120_000,
+        "limits": limits,
+    }
+    derive_path = root / "evidence/fixed-vhd-derivation-intent.json"
+    save(derive_path, derive_intent)
+    derivation_gate = {
+        "schema": "uk.wamr.compute-fixed-vhd-derivation-gate",
+        "schema_version": 1,
+        "profile": CURRENT_PROFILE,
+        "status": "accepted_qcow2_only",
+        "accepted_qcow2_sha256": accepted_qcow2["sha256"],
+        "qcow2_acceptance_sha256": digest(
+            root / "evidence/qcow2-acceptance.json"),
+        "derivation_intent_sha256": digest(derive_path),
+        "derived_output_absent": True,
+    }
+    save(root / "evidence/fixed-vhd-derivation-gate.json",
+         derivation_gate)
+    FAILURE_STAGE = "derive-fixed-vhd-command"
+    derive_output = run_custodied(
+        runtime, initial, root, "derive-fixed-vhd",
+        [paths["package_tool"], "derive-fixed-vhd",
+         derive_path, root / "package"],
+        150, 64 * 1024, extra_inputs=inputs, extra_input_paths=paths)
+    FAILURE_STAGE = "derive-fixed-vhd-result"
+    derivation = require_vhd_derivation(
+        document(derive_output), accepted_qcow2,
+        inputs["files"]["package_tool"], raw, finalization["identity"])
+    require(derivation == document(
+        root / "package/fixed-vhd-derivation.json"),
+        "fixed-VHD derivation record changed")
+    save(root / "evidence/fixed-vhd-derivation.json", derivation)
+    vhd_path = root / "package/unikraft-derived.vhd"
+    require(digest(vhd_path) == derivation["output"]["sha256"]
+            and vhd_path.stat().st_size == derivation["output"]["file_bytes"],
+            "derived fixed-VHD bytes changed")
+    with vhd_path.open("rb") as stream:
+        stream.seek(-512, os.SEEK_END)
+        require(hashlib.sha256(stream.read()).hexdigest()
+                == derivation["footer"]["sha256"],
+                "derived fixed-VHD footer changed")
+
+    for index in range(4, 6):
+        run_mode(index)
+
     FAILURE_STAGE = "boot-inspect-command"
     output = run_custodied(
         runtime, initial, root, "inspect",
@@ -4979,15 +5304,74 @@ def boot(runtime):
         150, 64 * 1024, extra_inputs=inputs, extra_input_paths=paths)
     require(document(output) == package, "physical package reload changed")
     verify_inputs(content=True)
+    FAILURE_STAGE = "boot-final-inspection"
+    all_boots = {}
+    for index, mode in enumerate(SIX_MODES):
+        checked = check_boot(configs[index], identity, inputs)
+        require(checked == document(
+            root / "evidence" / (mode + "-compute.json")),
+            "final boot evidence changed")
+        all_boots[mode] = {
+            "request_sha256": checked["request_sha256"],
+            "report_sha256": checked["report_sha256"],
+            "serial_sha256": checked["report"]["serial_sha256"],
+            "compute_sha256": digest(
+                root / "evidence" / (mode + "-compute.json")),
+        }
+    require(document(root / "evidence/qcow2-acceptance.json") == acceptance,
+            "QCOW2 acceptance changed")
+    require_qcow2_finalization(
+        document(root / "evidence/qcow2-finalization.json"),
+        raw, efi_record, inputs["files"]["package_tool"])
+    require_vhd_derivation(
+        document(root / "evidence/fixed-vhd-derivation.json"),
+        accepted_qcow2, inputs["files"]["package_tool"],
+        raw, finalization["identity"])
+    artifacts = {
+        "efi": image_artifact(efi, efi_record["size"]),
+        "raw": image_artifact(
+            root / "package/unikraft.raw", raw["size"]),
+        "qcow2": image_artifact(
+            qcow2_path, accepted_qcow2["virtual_bytes"]),
+        "vhd": image_artifact(
+            vhd_path, derivation["output"]["virtual_bytes"]),
+    }
+    require(artifacts["raw"]["sha256"] == raw["sha256"]
+            and artifacts["qcow2"]["sha256"] == accepted_qcow2["sha256"]
+            and artifacts["vhd"]["sha256"] == derivation["output"]["sha256"],
+            "final image chain changed")
+    final_inspection = {
+        "schema": "uk.wamr.compute-image-chain-inspection",
+        "schema_version": 1,
+        "profile": CURRENT_PROFILE,
+        "status": "complete",
+        "source": initial["source"],
+        "artifacts": artifacts,
+        "records": {
+            name: digest(root / "evidence" / name)
+            for name in (
+                "build-start.json", "build.json", "boot-inputs.json",
+                "package.json", "qcow2-finalization-intent.json",
+                "qcow2-finalization.json", "qcow2-acceptance.json",
+                "fixed-vhd-derivation-intent.json",
+                "fixed-vhd-derivation-gate.json",
+                "fixed-vhd-derivation.json")
+        },
+        "modes": list(SIX_MODES),
+        "boots": all_boots,
+    }
+    save(root / "evidence/final-inspection.json", final_inspection)
     FAILURE_STAGE = "boot-final-custody"
     require(producer_inputs(runtime, consumer_inputs) == initial,
             "producer inputs changed after boot")
     require(check_build() == document(root / "evidence/build.json"), "source or image changed")
     # No self hash: this final record binds earlier immutable observations only.
     save(root / "evidence/result.json", {
-        "schema_version": 1, "scope": "local_native_compute_only", "passed": True,
+        "schema_version": 2, "profile": CURRENT_PROFILE,
+        "scope": "local_native_compute_only", "passed": True,
         "hardware_acceptance": "not_established", "cloud_authority": "not_admitted",
-        "benchmark": "not_measured", "workload": "tiny", "modes": list(MODES),
+        "benchmark": "not_measured", "workload": "tiny",
+        "modes": list(SIX_MODES),
         "records": {p.name: digest(p) for p in sorted((root / "evidence").glob("*.json"))},
     })
 
@@ -4998,7 +5382,7 @@ def diagnostics(runtime):
     root.mkdir(mode=0o700, exist_ok=True)
     (root / "evidence").mkdir(mode=0o700, exist_ok=True)
     observations = {}
-    for mode in MODES:
+    for mode in SIX_MODES:
         entry = {"report": "unavailable", "serial": "unavailable"}
         work = root / ("boot-" + mode)
         try:

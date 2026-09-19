@@ -2814,16 +2814,28 @@ class HypervWorkflowTest(unittest.TestCase):
                 "unexpected exact-artifact download members",
                 "downloaded inner ZIP is not one regular file",
                 "verify-public-source-bundle",
+                "import-public-source-bundle",
+                '--artifact-id "${ARTIFACT_ID}"',
+                '--container-digest "${CONTAINER_DIGEST}"',
+                '"${validator}" candidate',
+                "tampered-supervisor",
+                "Invalid explicit supervisor was accepted",
                 'test "${downloaded_sha256}" = "${INNER_ZIP_SHA256}"',
                 "Artifact container digest:",
                 "Artifact ID:",
                 "Artifact URL:",
+                "Inner ZIP bytes:",
+                "inner_zip_bytes=",
                 "GITHUB_STEP_SUMMARY",
                 "GITHUB_OUTPUT"):
             self.assertIn(required, binding)
         self.assertNotIn("id-token:", workflow)
         self.assertLess(
             workflow.index("actions/download-artifact@v4"),
+            workflow.index("import-public-source-bundle"),
+        )
+        self.assertLess(
+            workflow.index("import-public-source-bundle"),
             workflow.index("GITHUB_STEP_SUMMARY"),
         )
         handoff = (

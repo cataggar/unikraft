@@ -2,11 +2,16 @@
 
 Refs cataggar/unikraft#156 and cataggar/unikraft#88. Neither acceptance issue is
 completed by this software or its synthetic tests. No Azure deployment is
-established here. Earlier native four-boot metadata is **not reusable disk
+established here. Earlier native boot metadata is **not reusable disk
 bytes**, an Azure receipt, or a grant to launch this controller.
 
 `uk-wamr-direct-compute` is a separate, purpose-specific executable. Its
-compile-time contract is `uk.wamr.direct-compute`, purpose `tiny-aot-two-boot`.
+closed contract dispatches legacy version 1 purpose `tiny-aot-two-boot` and
+current version 2 purpose/profile `qcow2-derived-vhd`. Version 1 remains the
+old four-mode raw/package-VHD contract; it cannot satisfy version 2. Version 2
+requires raw and finalized QCOW2 normal/masked-x2APIC boots, an acceptance
+gate, derivation from that exact accepted QCOW2, and derived fixed-VHD
+normal/masked-x2APIC boots.
 It reuses the native direct route's managed fixed-VHD upload, private process
 supervision, create-only custody, bounded deallocate/start lifecycle, owner and
 inventory checks, and independently confirmed cleanup. It does **not** relabel
@@ -113,8 +118,10 @@ On an appropriate private x86/KVM runner, use the existing credential-free
 [native compute lane](../build/wamr-native-ci/README.md) at the **clean,
 committed final source**, with the pinned SDK
 `a53205d77be3b880eb8f8b96679512ba58e2331a`, unchanged compiler profile and tiny
-configuration. Complete all four exact-image local boots (raw/VPC, each with
-x2APIC and masked x2APIC) and process cleanup. The WAMR build/boot adapter uses
+configuration. Complete all six exact-image local boots (raw/QCOW2/derived
+fixed VHD, each with x2APIC and masked x2APIC) and process cleanup. Derivation
+is forbidden until both retained QCOW2 boots and all preceding custody have
+been revalidated. The WAMR build/boot adapter uses
 the retained native command supervisor: ordinary owned children, `setsid`,
 double-fork and closed-capture descendants must be gone even after a successful
 leader, and any cleanup exhaustion/poison blocks handoff. This detects
@@ -127,7 +134,7 @@ Before that private runner discards the runtime, export to a fresh private
 directory. No earlier metadata-only Actions download can replace this step.
 
 ```sh
-# RUNTIME already contains a successful, complete native build and four boots.
+# RUNTIME already contains a successful, complete native build and six boots.
 python3 support/build/wamr-native-ci/handoff.py export \
   --runtime "$RUNTIME" --output "$PRIVATE_PARENT/FRESH-image-handoff"
 .d/wamr-direct/tools/bin/uk-wamr-direct-validate handoff \
@@ -141,18 +148,23 @@ python3 support/build/wamr-native-ci/handoff.py plan \
 record hashes, each original request/report/raw serial, and a real physical
 native package reload under the existing 150-second/64-KiB inspection bound.
 It retains complete EFI/debug ELF/bootinfo, solved config, compiler/runtime,
-wasm/cwasm, runtime/image identities, complete raw/fixed-VHD bytes, all earlier
-result records, and four original request/report/compute/raw serial sets.
+wasm/cwasm, runtime/image identities, complete raw/QCOW2/derived-fixed-VHD
+bytes, finalization/acceptance/derivation/final-inspection records, all earlier
+result records, and six original request/report/compute/raw serial sets.
 Copies are create-only and fully rehashed; original records are not rewritten.
 The resulting bundle binds source revision/tree, SDK, workload/profile inputs,
 hashes **and sizes**. The native read-only `handoff` command independently
-reopens/hashes the bundle, checks raw-prefix/footer relationships and validates
-all four bound native results. Failure leaves incomplete private state for
+reopens/hashes the bundle, checks raw-to-QCOW2-to-VHD lineage, the complete
+VHD raw prefix/footer/GPT/workload identity and all six bound native results.
+Failure leaves incomplete private state for
 inspection, never a successful bundle or resumable export.
 
 `plan` rehashes retained files and emits **`authority=not_admitted`**, all
-approval flags false, zero approval/expiry times, a fresh attempt UUID, and
-non-executable subscription/name placeholders. It neither calls Azure nor
+approval flags false, zero approval/expiry times and a fresh attempt UUID.
+For version 2 it also emits a syntactically valid non-authorizing candidate
+scope so the native `candidate` command can revalidate the admission wrapper;
+the controller still rejects it until a separate approval changes authority
+and approval fields. It neither calls Azure nor
 fabricates approval, guest measurements or cloud receipts. Local records
 remain `local_native_compute_only`, not Azure evidence. This is an operator
 review handoff, not an authenticated build/source attestation. Native
@@ -169,7 +181,7 @@ files, Azure/account data, command raw logs or arbitrary private images.
 ### Download, independently revalidate and plan a public-source CI image
 
 Select a successful **current-source** native CI run and independently verify
-its run attempt, tested source commit/tree and four local outcomes. On PRs,
+its run attempt, tested source commit/tree and six local outcomes. On PRs,
 `SOURCE_SHA`/`SOURCE_TREE` identify the tested synthetic merge commit/tree, not
 silently the branch head. Retain that distinction in the final approval.
 Retain `ARTIFACT_ID`, `ARTIFACT_URL` and the inner-ZIP `ARCHIVE_SHA256` only
@@ -219,12 +231,16 @@ python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
   --expected-archive-sha256 "$ARCHIVE_SHA256" \
   --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
   --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
-  --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor"
+  --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
+  --artifact-id "$ARTIFACT_ID" \
+  --container-digest "$CONTAINER_DIGEST"
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" handoff \
   "$PRIVATE_PARENT/FRESH-imported-image/bundle.json"
 python3 support/build/wamr-native-ci/handoff.py plan \
   --bundle "$PRIVATE_PARENT/FRESH-imported-image/bundle.json" \
   --output "$PRIVATE_PARENT/FRESH-unapproved-plan.json"
+"$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" candidate \
+  "$PRIVATE_PARENT/FRESH-unapproved-plan.json"
 ```
 
 The importer requires both locally reviewed native executables explicitly;
@@ -235,8 +251,15 @@ contents recorded by the
 accepted build, checks its canonical protocol/source-closure identity against
 the accepted source commit/tree, and only then uses it for native validator
 revalidation. The importer bounds and
-verifies every member and rejects extra files, symlinks, changed
+verifies every member and rejects extra files, duplicate or reordered entries,
+symlinks, changed
 source/image/serial/report/hash or failed local outcomes.
+Version 2 additionally binds the trusted inner ZIP digest, exact Actions
+artifact ID and separately reported container digest from the exact-ID
+redownload. It retains only the closed 85-member public-source set (26
+artifacts, 24 boot members, 33 evidence records and two manifests) under the
+96-member, 512-MiB and 64-KiB JSON bounds. Legacy version 1 remains exactly 55
+members with 20 evidence records.
 It also recomputes native-width supervisor invariants, canonical UTF-8 request
 and result bindings, empty-stream hashes, and the aggregate stream
 count/digest commitment. Nonempty command streams are intentionally absent
