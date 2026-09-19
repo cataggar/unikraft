@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Synthetic unit/physical packaging fixtures; never real guest boot evidence."""
+import ast
 import copy
 import contextlib
 import hashlib
@@ -26,6 +27,9 @@ SUPERVISOR_FIXTURE = os.environ.get("WAMR_CI_SUPERVISOR_FIXTURE")
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+if SUPERVISOR is not None:
+    ci.COMMAND_SUPERVISOR_PATH = str(
+        Path(SUPERVISOR).resolve(strict=True))
 bundle_spec = importlib.util.spec_from_file_location(
     "wamr_public_bundle", HERE / "public_bundle.py")
 public_bundle = importlib.util.module_from_spec(bundle_spec)
@@ -492,6 +496,335 @@ class Evidence(unittest.TestCase):
                 os.environ, {"WAMR_CI_RUNTIME": "/d/other-runtime"}), \
                 self.assertRaisesRegex(ValueError, "bundle refused"):
             public_bundle.ci_runtime(runtime_owner)
+
+    def test_public_start_revalidates_recorded_custody_before_binding(self):
+        runtime = self.root / "public-runtime"
+        consumer = {
+            "schema": "uk.wamr.consumer-input-custody",
+            "version": 2,
+            "files": {
+                **{
+                    "tool:" + name: {"path": "/trusted/" + name}
+                    for name in ci.HOST_TOOLS
+                },
+                "wamr-source-archive": {"path": "/trusted/wamr.tar"},
+                "command-supervisor": {"path": "/trusted/supervisor"},
+            },
+            "trees": {
+                name: {} for name in (
+                    "bison", "python-stdlib", "zig", "llvm")
+            },
+            "directories": {},
+            "aggregate_sha256": "f" * 64,
+        }
+        start = {
+            "source": {"revision": "1" * 40, "tree": "2" * 40},
+            "source_custody": {},
+            "tools": {name: "3" * 64 for name in ci.HOST_TOOLS},
+            "bison_data": {},
+            "dependencies": {},
+            "consumer_inputs": consumer,
+            "command_supervisor": {},
+        }
+        owner = type("Handoff", (), {"ci": ci})
+        events = []
+
+        def recorded(expected, content=False):
+            self.assertIs(expected, consumer)
+            self.assertTrue(content)
+            self.assertIsNone(ci.COMMAND_SUPERVISOR_PATH)
+            events.append("consumer")
+
+        def custody(actual_runtime, expected):
+            self.assertEqual(actual_runtime, runtime)
+            self.assertIs(expected, start)
+            if ci.COMMAND_SUPERVISOR_PATH is None:
+                self.assertEqual(
+                    ci.COMMAND_TOOL_PATHS,
+                    {"git": "/trusted/git"})
+                events.append("custody-before-bind")
+            else:
+                self.assertEqual(
+                    ci.COMMAND_SUPERVISOR_PATH,
+                    "/trusted/supervisor")
+                self.assertEqual(
+                    set(ci.COMMAND_TOOL_PATHS), set(ci.HOST_TOOLS))
+                events.append("custody-after-bind")
+            return expected
+
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
+        original_tools = dict(ci.COMMAND_TOOL_PATHS)
+        original_environment = dict(ci.COMMAND_ENVIRONMENT)
+        try:
+            ci.COMMAND_SUPERVISOR_PATH = None
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_ENVIRONMENT.clear()
+            with mock.patch.object(
+                    ci, "document", return_value=start), \
+                    mock.patch.object(
+                        public_bundle, "source_custody_record"), \
+                    mock.patch.object(
+                        public_bundle, "consumer_input_record"), \
+                    mock.patch.object(
+                        public_bundle, "command_supervisor_record"), \
+                    mock.patch.object(
+                        public_bundle, "dependency_record",
+                        side_effect=lambda *unused: events.append(
+                            "dependency")), \
+                    mock.patch.object(
+                        public_bundle, "require_consumer_tree_roles"), \
+                    mock.patch.object(
+                        public_bundle, "require_public_consumer_paths"), \
+                    mock.patch.object(
+                        ci, "require_recorded_consumer_inputs",
+                        side_effect=recorded), \
+                    mock.patch.object(
+                        ci, "require_recorded_build_custody",
+                        side_effect=custody):
+                self.assertIs(
+                    public_bundle.accepted_public_build_start(
+                        owner, runtime),
+                    start)
+            self.assertEqual(events, [
+                "consumer", "dependency", "custody-before-bind",
+                "custody-after-bind",
+            ])
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_TOOL_PATHS.update(original_tools)
+            ci.COMMAND_ENVIRONMENT.clear()
+            ci.COMMAND_ENVIRONMENT.update(original_environment)
+
+    def test_public_start_missing_or_tampered_consumer_inputs_never_bind(self):
+        runtime = self.root / "public-runtime-refusal"
+        base_files = {
+            **{
+                "tool:" + name: {"path": "/trusted/" + name}
+                for name in ci.HOST_TOOLS
+            },
+            "wamr-source-archive": {"path": "/trusted/wamr.tar"},
+            "command-supervisor": {"path": "/trusted/supervisor"},
+        }
+        consumer = {
+            "files": base_files,
+            "trees": {
+                name: {} for name in (
+                    "bison", "python-stdlib", "zig", "llvm")
+            },
+        }
+        start = {
+            "source": {"revision": "1" * 40, "tree": "2" * 40},
+            "source_custody": {}, "tools": {}, "bison_data": {},
+            "dependencies": {}, "consumer_inputs": consumer,
+            "command_supervisor": {},
+        }
+        owner = type("Handoff", (), {"ci": ci})
+        for case in ("missing", "tampered"):
+            candidate = copy.deepcopy(start)
+            if case == "missing":
+                del candidate["consumer_inputs"]["files"][
+                    "command-supervisor"]
+            with self.subTest(case=case), \
+                    mock.patch.object(
+                        ci, "document", return_value=candidate), \
+                    mock.patch.object(
+                        public_bundle, "source_custody_record"), \
+                    mock.patch.object(
+                        public_bundle, "consumer_input_record"), \
+                    mock.patch.object(
+                        public_bundle, "command_supervisor_record"), \
+                    mock.patch.object(
+                        public_bundle, "require_consumer_tree_roles"), \
+                    mock.patch.object(
+                        public_bundle, "require_public_consumer_paths"), \
+                    mock.patch.object(
+                        ci, "require_recorded_consumer_inputs",
+                        side_effect=(
+                            ci.Refusal("consumer input custody changed")
+                            if case == "tampered" else None)), \
+                    mock.patch.object(
+                        ci, "bind_command_tools") as bind, \
+                    self.assertRaises((ValueError, ci.Refusal)):
+                public_bundle.accepted_public_build_start(owner, runtime)
+            bind.assert_not_called()
+
+    def test_fresh_publication_binds_before_validator_and_rechecks_record(self):
+        repository = self.root / "fresh-publication"
+        (repository / ".d").mkdir(parents=True, mode=0o700)
+        runtime = self.root / "fresh-runtime"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        consumer = {
+            "files": {
+                **{
+                    "tool:" + name: {
+                        "path": "/trusted/" + name,
+                        "metadata": [1, 1, stat.S_IFREG | 0o500,
+                                     1, 1, 1, 1, 1, 1],
+                    }
+                    for name in ci.HOST_TOOLS
+                },
+                "command-supervisor": {
+                    "path": "/trusted/supervisor",
+                    "metadata": [1, 2, stat.S_IFREG | 0o500,
+                                 1, 1, 1, 1, 1, 1],
+                },
+            },
+        }
+        start = {"consumer_inputs": consumer}
+        source = {
+            "repository": "cataggar/unikraft",
+            "run_id": "123", "run_attempt": "1",
+            "source_revision": "1" * 40, "source_tree": "2" * 40,
+            "wamr_revision": ci.REVISION,
+        }
+        validator_record = {"fixture": "fully supervised"}
+        handoff = mock.Mock()
+        handoff.ci = ci
+        events = []
+
+        def accept(unused_handoff, actual_runtime):
+            self.assertEqual(actual_runtime, runtime)
+            self.assertIsNone(ci.COMMAND_SUPERVISOR_PATH)
+            ci.bind_command_tools(consumer)
+            events.append("bound")
+            return start
+
+        def execute(*unused, **kwargs):
+            self.assertEqual(
+                ci.COMMAND_SUPERVISOR_PATH, "/trusted/supervisor")
+            self.assertNotIn("allow_bootstrap", kwargs)
+            events.append("validator")
+            return self.root / "unused-validator.log", validator_record
+
+        def validate(*args):
+            self.assertIs(args[1], validator_record)
+            events.append("validated")
+            return validator_record
+
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
+        original_tools = dict(ci.COMMAND_TOOL_PATHS)
+        original_environment = dict(ci.COMMAND_ENVIRONMENT)
+        try:
+            ci.COMMAND_SUPERVISOR_PATH = None
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_ENVIRONMENT.clear()
+            with mock.patch.object(ci, "REPO", repository), \
+                    mock.patch.object(
+                        public_bundle, "ci_runtime",
+                        return_value=runtime), \
+                    mock.patch.object(
+                        public_bundle, "accepted_public_build_start",
+                        side_effect=accept), \
+                    mock.patch.object(
+                        public_bundle, "ci_context",
+                        return_value=source), \
+                    mock.patch.object(
+                        ci, "read", return_value=b"primary=0 cleanup=0\n"), \
+                    mock.patch.object(
+                        ci, "execute", side_effect=execute), \
+                    mock.patch.object(
+                        ci, "consumer_file_records", return_value={}), \
+                    mock.patch.object(
+                        ci, "native_executable_identity",
+                        side_effect=lambda record: {
+                            "path": record["path"]}), \
+                    mock.patch.object(
+                        ci, "document", return_value=validator_record), \
+                    mock.patch.object(
+                        ci, "require_recorded_build_custody"), \
+                    mock.patch.object(
+                        public_bundle, "supervised_command_record",
+                        side_effect=validate), \
+                    mock.patch.object(
+                        public_bundle, "pack",
+                        return_value="f" * 64), \
+                    mock.patch.object(public_bundle, "import_bundle"):
+                public_bundle.publish_ci(handoff)
+            self.assertEqual(events[:3], [
+                "bound", "validator", "validated"])
+            self.assertEqual(events.count("validated"), 3)
+            handoff.export.assert_called_once()
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_TOOL_PATHS.update(original_tools)
+            ci.COMMAND_ENVIRONMENT.clear()
+            ci.COMMAND_ENVIRONMENT.update(original_environment)
+
+    def test_publication_refuses_bootstrap_validator_record_before_export(self):
+        repository = self.root / "bootstrap-publication"
+        (repository / ".d").mkdir(parents=True, mode=0o700)
+        runtime = self.root / "bootstrap-runtime"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        consumer = {
+            "files": {
+                **{
+                    "tool:" + name: {
+                        "path": "/trusted/" + name,
+                        "metadata": [1, 1, stat.S_IFREG | 0o500,
+                                     1, 1, 1, 1, 1, 1],
+                    }
+                    for name in ci.HOST_TOOLS
+                },
+                "command-supervisor": {
+                    "path": "/trusted/supervisor",
+                    "metadata": [1, 2, stat.S_IFREG | 0o500,
+                                 1, 1, 1, 1, 1, 1],
+                },
+            },
+        }
+        start = {"consumer_inputs": consumer}
+        bootstrap = {
+            "scope": "command_diagnostic_not_acceptance",
+            "stage": "public-validator-build",
+            "exit_code": 0, "bytes": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "over_limit": False, "known_error_markers": [],
+            "supervisor": {
+                "schema": "uk.wamr.command-supervisor-result",
+                "version": 1, "bootstrap": True,
+            },
+        }
+        handoff = mock.Mock()
+        handoff.ci = ci
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
+        try:
+            ci.COMMAND_SUPERVISOR_PATH = None
+            with mock.patch.object(ci, "REPO", repository), \
+                    mock.patch.object(
+                        public_bundle, "ci_runtime",
+                        return_value=runtime), \
+                    mock.patch.object(
+                        public_bundle, "accepted_public_build_start",
+                        return_value=start), \
+                    mock.patch.object(
+                        public_bundle, "ci_context",
+                        return_value={
+                            "repository": "cataggar/unikraft",
+                            "run_id": "123", "run_attempt": "1",
+                            "source_revision": "1" * 40,
+                            "source_tree": "2" * 40,
+                            "wamr_revision": ci.REVISION,
+                        }), \
+                    mock.patch.object(
+                        ci, "read", return_value=b"primary=0 cleanup=0\n"), \
+                    mock.patch.object(
+                        ci, "execute",
+                        return_value=(self.root / "unused", bootstrap)), \
+                    mock.patch.object(
+                        ci, "consumer_file_records", return_value={}), \
+                    mock.patch.object(
+                        ci, "native_executable_identity",
+                        side_effect=lambda record: {
+                            "path": record["path"]}), \
+                    mock.patch.object(
+                        ci, "document", return_value=bootstrap), \
+                    self.assertRaises(ValueError):
+                public_bundle.publish_ci(handoff)
+            handoff.export.assert_not_called()
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
 
     def test_public_bundle_rejects_current_system_bin_tree(self):
         current = {"trees": {
@@ -1804,6 +2137,154 @@ source/generated/
         self.assertLess(time.monotonic() - started, 5)
         self.assertFalse(marker.exists())
 
+    def test_bootstrap_is_explicit_and_has_an_exact_closed_stage_allowlist(self):
+        original = ci.COMMAND_SUPERVISOR_PATH
+        ci.COMMAND_SUPERVISOR_PATH = None
+        try:
+            with mock.patch.dict(
+                    os.environ,
+                    {"WAMR_CI_SUPERVISOR": "/attacker/supervisor"},
+                    clear=False):
+                with self.assertRaisesRegex(
+                        ci.Refusal, "command supervisor is unavailable"):
+                    ci.execute(
+                        self.root, "public-validator-build",
+                        [PYTHON, "-c", "print('must not run')"])
+            output, record = ci.execute(
+                self.root, "dependency-restore",
+                [PYTHON, "-c", "print('bootstrap')"],
+                allow_bootstrap=True)
+            self.assertEqual(output.read_bytes(), b"bootstrap\n")
+            self.assertTrue(record["supervisor"]["bootstrap"])
+            for stage in (
+                    "dependency-restore-extra", "dependency-hash",
+                    "dependency-hash-128", "adapter", "package",
+                    "public-validator-build"):
+                with self.subTest(stage=stage), self.assertRaisesRegex(
+                        ci.Refusal, "bootstrap stage is not allowed"):
+                    ci.execute(
+                        self.root, stage, [PYTHON, "-c", "pass"],
+                        allow_bootstrap=True)
+            self.assertEqual(
+                ci.BOOTSTRAP_STAGES,
+                frozenset({
+                    "dependency-restore", "supervisor-build",
+                    *(f"dependency-hash-{index:03d}"
+                      for index in range(ci.PACKAGE_MAX_ROOTS)),
+                }),
+            )
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original
+
+    def test_only_dependency_and_supervisor_construction_request_bootstrap(self):
+        tree = ast.parse((HERE / "run.py").read_text())
+        observed = []
+
+        class Calls(ast.NodeVisitor):
+            def __init__(self):
+                self.functions = []
+
+            def visit_FunctionDef(self, node):
+                self.functions.append(node.name)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            def visit_Call(self, node):
+                if (isinstance(node.func, ast.Name)
+                        and node.func.id in {"execute", "run"}):
+                    enabled = [
+                        keyword for keyword in node.keywords
+                        if keyword.arg == "allow_bootstrap"
+                    ]
+                    if enabled:
+                        if (self.functions[-1] == "run"
+                                and len(enabled) == 1
+                                and isinstance(enabled[0].value, ast.Name)
+                                and enabled[0].value.id
+                                == "allow_bootstrap"):
+                            self.generic_visit(node)
+                            return
+                        self.assert_true(
+                            len(enabled) == 1
+                            and isinstance(enabled[0].value, ast.Constant)
+                            and enabled[0].value.value is True)
+                        observed.append((self.functions[-1], node.lineno))
+                self.generic_visit(node)
+
+            def assert_true(self, value):
+                if not value:
+                    raise AssertionError("nonliteral bootstrap capability")
+
+        Calls().visit(tree)
+        self.assertEqual(
+            [name for name, unused_line in observed],
+            [
+                "verify_package_hashes",
+                "restore_dependencies",
+                "build_command_supervisor",
+            ],
+        )
+        for relative in ("handoff.py", "public_bundle.py"):
+            self.assertNotIn(
+                "allow_bootstrap",
+                (HERE / relative).read_text(),
+            )
+
+    @unittest.skipIf(
+        not SUPERVISOR or not SUPERVISOR_FIXTURE,
+        "native command supervisor fixtures unavailable")
+    def test_public_validator_record_is_complete_supervised_and_tamper_closed(self):
+        original = ci.COMMAND_SUPERVISOR_PATH
+        supervisor = Path(SUPERVISOR).resolve(strict=True)
+        fixture = Path(SUPERVISOR_FIXTURE).resolve(strict=True)
+        ci.COMMAND_SUPERVISOR_PATH = str(supervisor)
+        try:
+            output, record = ci.execute(
+                self.root, "public-validator-build",
+                [fixture, "ordinary-child"], 10, 1024,
+                cwd=self.root)
+            pid = int(output.read_text().strip())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+            supervisor_record, unused = ci.physical_file_record(supervisor)
+            del unused
+            fixture_record, unused = ci.physical_file_record(fixture)
+            del unused
+            expected = ci.native_executable_identity(fixture_record)
+            allowed = [
+                ci.native_executable_identity(supervisor_record),
+                expected,
+            ]
+            public_bundle.supervised_command_record(
+                ci, record, "public-validator-build", 1024,
+                expected, allowed)
+            command = record["supervisor"]["result"]["command"]
+            self.assertGreaterEqual(command["descendants"]["observed"], 1)
+            self.assertGreaterEqual(
+                command["descendants"]["identity_validated"], 1)
+            self.assertEqual(command["cleanup"], "complete")
+            self.assertTrue(command["cleanup_complete"])
+            self.assertFalse(command["poisoned"])
+            self.assertFalse(record["supervisor"]["bootstrap"])
+            substituted = copy.deepcopy(record)
+            substituted["supervisor"] = {
+                "schema": "uk.wamr.command-supervisor-result",
+                "version": 1,
+                "bootstrap": True,
+            }
+            with self.assertRaises(ValueError):
+                public_bundle.supervised_command_record(
+                    ci, substituted, "public-validator-build", 1024,
+                    expected, allowed)
+            relabeled = copy.deepcopy(record)
+            relabeled["stage"] = "dependency-restore"
+            with self.assertRaises(ValueError):
+                public_bundle.supervised_command_record(
+                    ci, relabeled, "public-validator-build", 1024,
+                    expected, allowed)
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original
+
     def test_native_supervisor_cleans_all_ordinary_descendant_shapes(self):
         self.assertIsNotNone(SUPERVISOR)
         self.assertIsNotNone(SUPERVISOR_FIXTURE)
@@ -1822,14 +2303,15 @@ source/generated/
                 with self.subTest(mode=mode):
                     with self.assertRaises(ProcessLookupError):
                         os.kill(pid, 0)
-                    descendants = record["supervisor"]["descendants"]
+                    command = record["supervisor"]["result"]["command"]
+                    descendants = command["descendants"]
                     self.assertGreaterEqual(descendants["observed"], 1)
                     self.assertGreaterEqual(
                         descendants["identity_validated"], 1)
                     self.assertTrue(
-                        record["supervisor"]["cleanup_complete"])
+                        command["cleanup_complete"])
                     self.assertEqual(
-                        record["supervisor"]["cleanup"], "complete")
+                        command["cleanup"], "complete")
         finally:
             ci.COMMAND_SUPERVISOR_PATH = original
 
@@ -1858,9 +2340,11 @@ source/generated/
                 record = ci.document(
                     self.root / "evidence" / ("command-" + stage + ".json"))
                 self.assertEqual(
-                    record["supervisor"]["primary"]["kind"], primary)
+                    record["supervisor"]["result"]["command"]["primary"]["kind"],
+                    primary)
                 self.assertTrue(
-                    record["supervisor"]["cleanup_complete"])
+                    record["supervisor"]["result"]["command"][
+                        "cleanup_complete"])
             invalid = self.root / "not-elf"
             self.put(invalid, b"#!/bin/sh\nexit 0\n")
             invalid.chmod(0o700)
@@ -1871,7 +2355,8 @@ source/generated/
             record = ci.document(
                 self.root / "evidence/command-native-exec-failure.json")
             self.assertEqual(
-                record["supervisor"]["controller_error"], "exec_unsupported")
+                record["supervisor"]["result"]["controller_error"],
+                "exec_unsupported")
         finally:
             ci.COMMAND_SUPERVISOR_PATH = original
 

@@ -30,6 +30,9 @@ spec = importlib.util.spec_from_file_location(
     "wamr_handoff", REPO / "support/build/wamr-native-ci/handoff.py")
 handoff = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(handoff)
+if os.environ.get("WAMR_CI_SUPERVISOR"):
+    handoff.ci.COMMAND_SUPERVISOR_PATH = str(Path(
+        os.environ["WAMR_CI_SUPERVISOR"]).resolve(strict=True))
 public_spec = importlib.util.spec_from_file_location(
     "wamr_public_bundle", REPO / "support/build/wamr-native-ci/public_bundle.py")
 public_bundle = importlib.util.module_from_spec(public_spec)

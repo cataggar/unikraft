@@ -135,6 +135,15 @@ The package, publication and four boot work directories are empty private
 slots created before that final custody baseline, so later outputs do not
 change a recorded supervisor/tool ancestor directory.
 
+Bootstrap execution is an explicit call-site capability, not a global
+fallback. Its closed exact-stage allowlist is `dependency-restore`,
+`supervisor-build`, and `dependency-hash-000` through
+`dependency-hash-127` (the already bounded package-root maximum); there is no
+prefix or glob match. The adapter ignores `WAMR_CI_SUPERVISOR` when loading
+production orchestration. Every other build, packaging, boot, inspection,
+handoff, validator, import/export and publication command refuses while the
+custodied supervisor is unbound or unavailable.
+
 Every later trusted WAMR command is launched by that retained native ELF using
 the merged `Executable`, `CommandRequest` and `CommandResult` contract. The
 request supplies an explicit retained ELF, fixed argv, closed environment,
@@ -155,6 +164,11 @@ descendant observations, cleanup outcome and poison state. Timeout,
 cancellation, overflow, nonzero/signal, exec/identity failure or any unproven
 cleanup is a refusal; cleanup failure prevents publication even when the
 leader exited zero.
+Each supervised command record also binds hashes of the complete canonical
+request and result, exact executable and retained-interpreter identities,
+primary and cleanup deadlines, stream limits, separate stream
+status/size/digests, the combined bounded-output digest, termination and
+bounded event counts. Raw command output remains private.
 
 Records also bind the Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
 actual tools, wasm/cwasm/compiler/library bytes, solved configuration,
@@ -316,6 +330,20 @@ by exact recorded identity only after final handoff revalidation, so neither
 boot setup nor pre-export cleanup can mutate a recorded system-library
 directory. The publication command accepts only that literal CI runtime or
 the legacy in-worktree runtime.
+Because publication is a fresh Python handoff process, it first reopens
+`build-start.json`, validates its closed schema and directly rehashes every
+recorded consumer file/tree without selecting tools from ambient variables.
+It uses only the validated recorded Git executable for the source/dependency
+recheck, recomputes the exact source, dependency, Bison, consumer and guarded
+supervisor custody, and only then binds the full recorded tool set and the
+fixed-runtime supervisor. It repeats the full custody check after binding.
+The public validator build then runs through that retained supervisor; its
+`command-public-validator-build.json` must be the exact in-memory/on-disk
+canonical non-bootstrap record with the retained Zig identity, complete
+primary/descendant/output/deadline/cleanup/poison observations and successful
+cleanup. The same record and custody are rechecked before export, after export
+and after archive reopen. A missing supervisor, changed consumer record,
+bootstrap substitution or stage relabel refuses publication.
 After all four genuine boots, while the complete runner files still exist,
 the workflow invokes the production private export and native handoff checker,
 then copies only its closed image/local-evidence allowlist into a standalone

@@ -83,11 +83,16 @@ INPUT_TREE_MAX_ENTRIES = 100_000
 INPUT_TREE_MAX_BYTES = 2 * 1024 * MIB
 COMMAND_ENVIRONMENT = {}
 COMMAND_TOOL_PATHS = {}
-COMMAND_SUPERVISOR_PATH = os.environ.get("WAMR_CI_SUPERVISOR")
+COMMAND_SUPERVISOR_PATH = None
 COMMAND_SUPERVISOR_VERSION = "uk.wamr.command-supervisor/1 process-command/1"
 COMMAND_CLEANUP_SECONDS = 10
 COMMAND_STREAM_MAX = 4 * MIB
 COMMAND_RESULT_MAX = 12 * MIB
+BOOTSTRAP_STAGES = frozenset({
+    "dependency-restore",
+    "supervisor-build",
+    *(f"dependency-hash-{index:03d}" for index in range(PACKAGE_MAX_ROOTS)),
+})
 SUPERVISOR_SOURCE_FILES = (
     "support/build/wamr-native-ci/build.zig.zon",
     "support/build/wamr-native-ci/supervisor.build.zig",
@@ -2097,8 +2102,84 @@ def decoded_supervisor_result(
     return value, stdout, stderr
 
 
+def supervised_command_evidence(
+        request, native, stdout, stderr, expected_executable,
+        expected_retained):
+    def identities(values):
+        return [
+            {"identity": value["identity"], "name": value["name"]}
+            for value in values
+        ]
+
+    command = native["command"]
+    summarized = None
+    if command is not None:
+        summarized = {
+            "cancellation_observed": command["cancellation_observed"],
+            "cleanup": command["cleanup"],
+            "cleanup_complete": command["cleanup_complete"],
+            "cleanup_events": command["cleanup_events"],
+            "descendants": command["descendants"],
+            "executable": command["executable"],
+            "executable_stable": command["executable_stable"],
+            "poisoned": command["poisoned"],
+            "primary": command["primary"],
+            "primary_deadline_reached":
+                command["primary_deadline_reached"],
+            "primary_events": command["primary_events"],
+            "reap_events": command["reap_events"],
+            "retained_executables": identities(
+                command["retained_executables"]),
+            "stderr": {
+                "bytes": len(stderr),
+                "sha256": hashlib.sha256(stderr).hexdigest(),
+                "status": command["stderr_status"],
+            },
+            "stdout": {
+                "bytes": len(stdout),
+                "sha256": hashlib.sha256(stdout).hexdigest(),
+                "status": command["stdout_status"],
+            },
+            "output": {
+                "bytes": len(stdout) + len(stderr),
+                "sha256": hashlib.sha256(stdout + stderr).hexdigest(),
+            },
+            "termination": command["termination"],
+        }
+    return {
+        "schema": native["schema"],
+        "version": native["version"],
+        "bootstrap": False,
+        "request": {
+            "schema": request["schema"],
+            "version": request["version"],
+            "canonical_sha256": hashlib.sha256(
+                canonical_json(request)).hexdigest(),
+            "argv_sha256": hashlib.sha256(
+                canonical_json(request["argv"])).hexdigest(),
+            "environment_sha256": hashlib.sha256(
+                canonical_json(request["environment"])).hexdigest(),
+            "cwd_sha256": hashlib.sha256(
+                request["cwd"].encode("utf-8")).hexdigest(),
+            "executable": expected_executable,
+            "retained_executables": identities(expected_retained),
+            "primary_deadline_ns": request["primary_deadline_ns"],
+            "cleanup_deadline_ns": request["cleanup_deadline_ns"],
+            "stdout_limit": request["limits"]["stdout_bytes"],
+            "stderr_limit": request["limits"]["stderr_bytes"],
+        },
+        "result": {
+            "canonical_sha256": hashlib.sha256(
+                canonical_json(native)).hexdigest(),
+            "controller_error": native["controller_error"],
+            "command": summarized,
+        },
+    }
+
+
 def bootstrap_execute(root, stage, args, seconds, limit, cwd, evidence,
                       input_records):
+    require(stage in BOOTSTRAP_STAGES, "bootstrap stage is not allowed")
     output = root / "private" / (stage + ".log")
     executable = str(Path(args[0]).resolve(strict=True))
     records = input_records
@@ -2134,11 +2215,15 @@ def bootstrap_execute(root, stage, args, seconds, limit, cwd, evidence,
 
 
 def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
-            evidence=True, input_records=None):
+            evidence=True, input_records=None, allow_bootstrap=False):
     """Native fixed-deadline command; raw output stays private."""
-    require(type(limit) is int and limit >= 0 and seconds > 0,
+    require(type(limit) is int and limit >= 0 and seconds > 0
+            and type(allow_bootstrap) is bool,
             "invalid bounded command")
+    if allow_bootstrap:
+        require(stage in BOOTSTRAP_STAGES, "bootstrap stage is not allowed")
     if COMMAND_SUPERVISOR_PATH is None:
+        require(allow_bootstrap, "command supervisor is unavailable")
         return bootstrap_execute(
             root, stage, args, seconds, limit, cwd, evidence, input_records)
     output = root / "private" / (stage + ".log")
@@ -2217,10 +2302,10 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
         )
     require(result.returncode == 0 and not result.stderr,
             "native command supervisor failed")
+    expected_executable = native_executable_identity(
+        records[supervisor if launch_retained else executable])
     native, stdout, stderr = decoded_supervisor_result(
-        result.stdout, native_executable_identity(
-            records[supervisor if launch_retained else executable]),
-        expected_retained)
+        result.stdout, expected_executable, expected_retained)
     command = native["command"]
     combined = (stdout + stderr)[:limit + 1]
     with output.open("xb") as stream:
@@ -2240,27 +2325,9 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
         "sha256": digest(output) if size else hashlib.sha256(b"").hexdigest(),
         "over_limit": size > limit,
         "known_error_markers": markers,
-        "supervisor": {
-            "schema": native["schema"],
-            "version": native["version"],
-            "controller_error": native["controller_error"],
-            "primary": None if command is None else command["primary"],
-            "primary_deadline_reached": (
-                False if command is None
-                else command["primary_deadline_reached"]),
-            "stdout_status": (
-                "incomplete" if command is None else command["stdout_status"]),
-            "stderr_status": (
-                "incomplete" if command is None else command["stderr_status"]),
-            "descendants": (
-                None if command is None else command["descendants"]),
-            "cleanup": "not_required" if command is None else command["cleanup"],
-            "cleanup_complete": (
-                False if command is None else command["cleanup_complete"]),
-            "poisoned": True if command is None else command["poisoned"],
-            "executable_stable": (
-                False if command is None else command["executable_stable"]),
-        },
+        "supervisor": supervised_command_evidence(
+            request, native, stdout, stderr, expected_executable,
+            expected_retained),
     }
     if evidence:
         save(root / "evidence" / ("command-" + stage + ".json"), record)
@@ -2287,9 +2354,11 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
     return output, record
 
 
-def run(root, stage, args, seconds=600, limit=8 * MIB, input_records=None):
+def run(root, stage, args, seconds=600, limit=8 * MIB, input_records=None,
+        allow_bootstrap=False):
     output, _ = execute(
-        root, stage, args, seconds, limit, input_records=input_records)
+        root, stage, args, seconds, limit, input_records=input_records,
+        allow_bootstrap=allow_bootstrap)
     return output
 
 
@@ -3012,7 +3081,8 @@ def verify_package_hashes(runtime, root, packages, expected_inputs):
                 root, f"dependency-hash-{index:03d}",
                 [tool("zig"), "fetch", "--global-cache-dir", cache, packages / name],
                 300, 511, cwd=work, evidence=False,
-                input_records=consumer_file_records(expected_inputs))
+                input_records=consumer_file_records(expected_inputs),
+                allow_bootstrap=True)
             require_consumer_inputs(runtime, expected_inputs)
         except Refusal as error:
             raise Refusal("Zig package hash recomputation failed") from error
@@ -3046,7 +3116,8 @@ def restore_dependencies(runtime, root, expected_inputs):
             "--fetch=all", "--cache-dir", root / "cache",
             "--global-cache-dir", root / "global-cache", "-j2",
         ], 900, evidence=False,
-            input_records=consumer_file_records(expected_inputs))
+            input_records=consumer_file_records(expected_inputs),
+            allow_bootstrap=True)
         require_consumer_inputs(runtime, expected_inputs)
     except Refusal as error:
         raise Refusal("pinned dependency restore command failed") from error
@@ -3077,7 +3148,7 @@ def build_command_supervisor(runtime, root, packages, expected_inputs):
         tool("zig"), "build", "--build-file", HERE / "supervisor.build.zig",
         "--system", packages, "--prefix", root / "supervisor",
         "-Doptimize=ReleaseSafe", "-j2", "install",
-    ], 900, evidence=False, input_records=records)
+    ], 900, evidence=False, input_records=records, allow_bootstrap=True)
     require(command["known_error_markers"] == [],
             "command supervisor build reported an error")
     require_recorded_consumer_inputs(expected_inputs)
@@ -3127,6 +3198,34 @@ def require_build_custody(runtime, expected):
     require(command_supervisor_state(
         runtime, expected["consumer_inputs"]) == expected["command_supervisor"],
         "command supervisor custody changed")
+
+
+def require_recorded_build_custody(runtime, expected):
+    require(set(expected) == {
+        "source", "source_custody", "tools", "bison_data",
+        "dependencies", "consumer_inputs", "command_supervisor",
+    }, "invalid recorded build custody")
+    current_source = source()
+    require(source_identity(current_source) == expected["source"]
+            and current_source["custody"] == expected["source_custody"],
+            "immutable source custody changed")
+    require_dependency_custody(runtime / "compute", expected["dependencies"])
+    require_recorded_consumer_inputs(
+        expected["consumer_inputs"], content=True)
+    files = expected["consumer_inputs"]["files"]
+    require(set(expected["tools"]) == set(HOST_TOOLS),
+            "recorded tool roles changed")
+    for name in HOST_TOOLS:
+        record = files.get("tool:" + name)
+        require(isinstance(record, dict)
+                and expected["tools"][name] == record["sha256"],
+                "recorded tool custody changed")
+    require(bison_inputs(runtime / "bison") == expected["bison_data"],
+            "Bison input changed")
+    require(command_supervisor_state(
+        runtime, expected["consumer_inputs"]) == expected["command_supervisor"],
+        "command supervisor custody changed")
+    return expected
 
 
 def require_dependency_custody(root, expected):

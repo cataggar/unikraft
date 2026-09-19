@@ -158,6 +158,136 @@ def command_record(value, stage, limit):
     return value
 
 
+def executable_identity(value):
+    require(isinstance(value, dict) and set(value) == {
+        "content_sha256", "ctime_nanoseconds", "ctime_seconds",
+        "device_major", "device_minor", "inode", "mode",
+        "mtime_nanoseconds", "mtime_seconds", "size", "uid",
+    })
+    digest_string(value["content_sha256"])
+    for key in (
+            "ctime_nanoseconds", "device_major", "device_minor", "inode",
+            "mode", "mtime_nanoseconds", "size", "uid"):
+        bounded_integer(value[key], 0, (1 << 64) - 1)
+    require(value["inode"] > 0 and value["size"] > 0
+            and value["ctime_nanoseconds"] < 1_000_000_000
+            and value["mtime_nanoseconds"] < 1_000_000_000
+            and type(value["ctime_seconds"]) is int
+            and type(value["mtime_seconds"]) is int)
+    return value
+
+
+def retained_identity_records(value, allowed):
+    require(type(value) is list and len(value) <= 128)
+    names = []
+    for item in value:
+        require(isinstance(item, dict)
+                and set(item) == {"identity", "name"}
+                and type(item["name"]) is str
+                and re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", item["name"]))
+        executable_identity(item["identity"])
+        require(any(item["identity"] == expected for expected in allowed))
+        names.append(item["name"])
+    require(names == sorted(set(names)))
+    return value
+
+
+def supervised_command_record(
+        ci, value, stage, limit, expected_executable, allowed_identities,
+        required_retained=None):
+    require(set(value) == {
+        "scope", "stage", "exit_code", "bytes", "sha256",
+        "over_limit", "known_error_markers", "supervisor",
+    } and value["scope"] == "command_diagnostic_not_acceptance"
+      and value["stage"] == stage
+      and type(value["exit_code"]) is int and value["exit_code"] == 0
+      and value["over_limit"] is False
+      and value["known_error_markers"] == [])
+    bounded_integer(value["bytes"], 0, limit)
+    digest_string(value["sha256"])
+    supervisor = value["supervisor"]
+    require(isinstance(supervisor, dict) and set(supervisor) == {
+        "schema", "version", "bootstrap", "request", "result",
+    } and supervisor["schema"] == "uk.wamr.command-supervisor-result"
+      and supervisor["version"] == 1
+      and supervisor["bootstrap"] is False)
+    request = supervisor["request"]
+    require(isinstance(request, dict) and set(request) == {
+        "schema", "version", "canonical_sha256", "argv_sha256",
+        "environment_sha256", "cwd_sha256", "executable",
+        "retained_executables", "primary_deadline_ns",
+        "cleanup_deadline_ns", "stdout_limit", "stderr_limit",
+    } and request["schema"] == "uk.wamr.command-supervisor-request"
+      and request["version"] == 1)
+    for key in (
+            "canonical_sha256", "argv_sha256", "environment_sha256",
+            "cwd_sha256"):
+        digest_string(request[key])
+    executable_identity(request["executable"])
+    require(request["executable"] == expected_executable)
+    retained = retained_identity_records(
+        request["retained_executables"], allowed_identities)
+    if required_retained is not None:
+        by_name = {item["name"]: item["identity"] for item in retained}
+        for name, identity in required_retained.items():
+            require(by_name.get(name) == identity)
+    bounded_integer(request["primary_deadline_ns"], 1, (1 << 64) - 1)
+    bounded_integer(request["cleanup_deadline_ns"], 1, (1 << 64) - 1)
+    require(request["cleanup_deadline_ns"]
+            == request["primary_deadline_ns"]
+            + ci.COMMAND_CLEANUP_SECONDS * 1_000_000_000)
+    for key in ("stdout_limit", "stderr_limit"):
+        bounded_integer(request[key], 1, ci.COMMAND_STREAM_MAX)
+    result = supervisor["result"]
+    require(isinstance(result, dict) and set(result) == {
+        "canonical_sha256", "controller_error", "command",
+    })
+    digest_string(result["canonical_sha256"])
+    require(result["controller_error"] is None)
+    command = result["command"]
+    require(isinstance(command, dict) and set(command) == {
+        "cancellation_observed", "cleanup", "cleanup_complete",
+        "cleanup_events", "descendants", "executable",
+        "executable_stable", "output", "poisoned", "primary",
+        "primary_deadline_reached", "primary_events", "reap_events",
+        "retained_executables", "stderr", "stdout", "termination",
+    } and command["cancellation_observed"] is False
+      and command["cleanup"] == "complete"
+      and command["cleanup_complete"] is True
+      and command["executable_stable"] is True
+      and command["poisoned"] is False
+      and command["primary"] == {"code": 0, "kind": "exited"}
+      and command["primary_deadline_reached"] is False
+      and command["termination"] == {"code": 0, "kind": "exited"}
+      and command["executable"] == request["executable"]
+      and command["retained_executables"] == retained)
+    for key in ("cleanup_events", "primary_events", "reap_events"):
+        bounded_integer(command[key], 0, 10_000_000)
+    descendants = command["descendants"]
+    require(isinstance(descendants, dict) and set(descendants) == {
+        "adopted", "identity_validated", "limit_exceeded",
+        "observed", "untracked",
+    } and descendants["limit_exceeded"] is False
+      and descendants["untracked"] is False)
+    for key in ("adopted", "identity_validated", "observed"):
+        bounded_integer(descendants[key], 0, 256)
+    for name in ("stdout", "stderr"):
+        output = command[name]
+        require(isinstance(output, dict)
+                and set(output) == {"bytes", "sha256", "status"}
+                and output["status"] == "complete")
+        bounded_integer(output["bytes"], 0, request[name + "_limit"])
+        digest_string(output["sha256"])
+    output = command["output"]
+    require(isinstance(output, dict) and set(output) == {"bytes", "sha256"}
+            and output["bytes"]
+            == command["stdout"]["bytes"] + command["stderr"]["bytes"]
+            and output["bytes"] == value["bytes"]
+            and output["sha256"] == value["sha256"])
+    digest_string(output["sha256"])
+    return value
+
+
 def source_custody_record(ci, value):
     require(set(value) == {
         "schema", "version", "object_format", "files", "directories", "bytes",
@@ -470,7 +600,7 @@ def ci_runtime(ci):
     return selected
 
 
-def ci_context(handoff):
+def ci_context(handoff, start):
     ci = handoff.ci
     require(os.environ.get("GITHUB_ACTIONS") == "true"
             and os.environ.get("GITHUB_REPOSITORY") == "cataggar/unikraft"
@@ -481,18 +611,93 @@ def ci_context(handoff):
             and os.environ.get("GITHUB_WORKFLOW_REF", "").startswith(
                 "cataggar/unikraft/.github/workflows/wamr-native-compute.yaml@"))
     source = ci.source()
-    runtime = ci_runtime(ci)
-    start = ci.document(runtime / "compute/evidence/build-start.json")
-    consumer_input_record(ci, start["consumer_inputs"])
-    command_supervisor_record(start["command_supervisor"])
-    ci.consumer_input_state(
-        runtime, content=True, expected=start["consumer_inputs"])
-    require({"wamr-source-archive", "command-supervisor"}
-            <= set(start["consumer_inputs"]["files"]))
+    require(ci.source_identity(source) == start["source"]
+            and os.environ.get("GITHUB_SHA") == source["revision"])
     return context(dict(repository="cataggar/unikraft", run_id=os.environ["GITHUB_RUN_ID"],
                         run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                         source_revision=source["revision"], source_tree=source["tree"],
                         wamr_revision=ci.REVISION))
+
+
+def require_public_consumer_paths(ci, runtime, consumer_inputs):
+    files = consumer_inputs["files"]
+    required_files = (
+        {f"tool:{name}" for name in ci.HOST_TOOLS}
+        | {"wamr-source-archive", "command-supervisor"})
+    require(required_files <= set(files))
+    supervisor = (
+        runtime / "compute/supervisor/bin/wamr-ci-supervisor").resolve(
+            strict=True)
+    require(files["command-supervisor"]["path"] == str(supervisor)
+            and files["wamr-source-archive"]["path"]
+            == str((runtime / "custody/wamr-source.tar").resolve(
+                strict=True)))
+    runtime_paths = set()
+    for name in ci.HOST_TOOLS:
+        runtime_paths.update(ci.executable_runtime_paths(
+            Path(files["tool:" + name]["path"])))
+    runtime_paths.update(ci.executable_runtime_paths(supervisor))
+    expected_files = required_files | {
+        "runtime:" + str(path) for path in runtime_paths
+    }
+    require(set(files) == expected_files)
+    trees = consumer_inputs["trees"]
+    require(set(trees) == {"bison", "python-stdlib", "zig", "llvm"}
+            and trees["bison"]["path"]
+            == str((runtime / "bison").resolve(strict=True))
+            and trees["zig"]["path"]
+            == str(Path(files["tool:zig"]["path"]).parent)
+            and trees["llvm"]["path"]
+            == str((runtime / "llvm").resolve(strict=True))
+            and trees["python-stdlib"]["path"]
+            == str(Path(ci.sysconfig.get_paths()["stdlib"]).resolve(
+                strict=True)))
+    return consumer_inputs
+
+
+def accepted_public_build_start(handoff, runtime):
+    ci = handoff.ci
+    start = ci.document(runtime / "compute/evidence/build-start.json")
+    require(set(start) == {
+        "source", "source_custody", "tools", "bison_data",
+        "dependencies", "consumer_inputs", "command_supervisor",
+    } and set(start["source"]) == {"revision", "tree"})
+    digest_string(start["source"]["revision"], (40,))
+    digest_string(start["source"]["tree"], (40,))
+    source = {
+        "source_revision": start["source"]["revision"],
+        "source_tree": start["source"]["tree"],
+    }
+    source_custody_record(ci, start["source_custody"])
+    consumer_input_record(ci, start["consumer_inputs"])
+    command_supervisor_record(start["command_supervisor"])
+    files = start["consumer_inputs"]["files"]
+    required_files = (
+        {f"tool:{name}" for name in ci.HOST_TOOLS}
+        | {"wamr-source-archive", "command-supervisor"})
+    require(required_files <= set(files))
+    require_consumer_tree_roles(start["consumer_inputs"], False)
+    ci.require_recorded_consumer_inputs(
+        start["consumer_inputs"], content=True)
+    require_public_consumer_paths(ci, runtime, start["consumer_inputs"])
+
+    original_tools = dict(ci.COMMAND_TOOL_PATHS)
+    ci.COMMAND_TOOL_PATHS.clear()
+    ci.COMMAND_TOOL_PATHS["git"] = files["tool:git"]["path"]
+    try:
+        dependency_record(ci, start["dependencies"], source)
+        ci.require_recorded_build_custody(runtime, start)
+    finally:
+        ci.COMMAND_TOOL_PATHS.clear()
+        ci.COMMAND_TOOL_PATHS.update(original_tools)
+
+    ci.COMMAND_ENVIRONMENT.clear()
+    ci.COMMAND_TOOL_PATHS.clear()
+    ci.COMMAND_SUPERVISOR_PATH = None
+    ci.COMMAND_ENVIRONMENT.update(
+        ci.bind_command_tools(start["consumer_inputs"]))
+    ci.require_recorded_build_custody(runtime, start)
+    return start
 
 
 def members(handoff, bundle, root=None):
@@ -707,6 +912,44 @@ def publication_records(handoff, stage, source):
         })
         for value in boot_inputs.values():
             digest_string(value)
+    if not pre_supervisor:
+        consumer_files = start["consumer_inputs"]["files"]
+        allowed_identities = [
+            ci.native_executable_identity(record)
+            for record in consumer_files.values()
+            if record["metadata"][2] & 0o111
+        ]
+        allowed_identities.extend(
+            ci.native_executable_identity(record)
+            for record in boot_inputs["files"].values()
+            if record["metadata"][2] & 0o111
+        )
+        supervisor_identity = ci.native_executable_identity(
+            consumer_files["command-supervisor"])
+        zig_identity = ci.native_executable_identity(
+            consumer_files["tool:zig"])
+        python_identity = ci.native_executable_identity(
+            consumer_files["tool:python3"])
+        stage_identity = {
+            "adapter": supervisor_identity,
+            "local-boot-tool": supervisor_identity,
+            "fixtures": python_identity,
+            "prepare": python_identity,
+            "config": python_identity,
+            "native-image": python_identity,
+            "package": ci.native_executable_identity(
+                boot_inputs["files"]["package_tool"]),
+            "raw-x2apic": ci.native_executable_identity(
+                boot_inputs["files"]["local_boot_tool"]),
+            "raw-legacy-apic": ci.native_executable_identity(
+                boot_inputs["files"]["local_boot_tool"]),
+            "vpc-x2apic": ci.native_executable_identity(
+                boot_inputs["files"]["local_boot_tool"]),
+            "vpc-legacy-apic": ci.native_executable_identity(
+                boot_inputs["files"]["local_boot_tool"]),
+            "inspect": ci.native_executable_identity(
+                boot_inputs["files"]["package_tool"]),
+        }
     for name in sorted(EVIDENCE):
         item = ci.document(stage / "evidence" / name)
         if name.startswith("command-"):
@@ -725,34 +968,15 @@ def publication_records(handoff, stage, source):
                     and type(item["bytes"]) is int and 0 <= item["bytes"] <= 8 * 1024 * 1024
                     and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]))
             if not pre_supervisor:
-                supervisor = item["supervisor"]
-                require(set(supervisor) == {
-                    "schema", "version", "controller_error", "primary",
-                    "primary_deadline_reached", "stdout_status",
-                    "stderr_status", "descendants", "cleanup",
-                    "cleanup_complete", "poisoned", "executable_stable",
-                } and supervisor["schema"]
-                  == "uk.wamr.command-supervisor-result"
-                  and supervisor["version"] == 1
-                  and supervisor["controller_error"] is None
-                  and supervisor["primary"] == {"code": 0, "kind": "exited"}
-                  and supervisor["primary_deadline_reached"] is False
-                  and supervisor["stdout_status"] == "complete"
-                  and supervisor["stderr_status"] == "complete"
-                  and supervisor["cleanup"] == "complete"
-                  and supervisor["cleanup_complete"] is True
-                  and supervisor["poisoned"] is False
-                  and supervisor["executable_stable"] is True)
-                descendants = supervisor["descendants"]
-                require(set(descendants) == {
-                    "adopted", "identity_validated", "limit_exceeded",
-                    "observed", "untracked",
-                } and all(type(descendants[key]) is int
-                          and 0 <= descendants[key] <= 256
-                          for key in (
-                              "adopted", "identity_validated", "observed"))
-                  and descendants["limit_exceeded"] is False
-                  and descendants["untracked"] is False)
+                command_stage = name[len("command-"):-len(".json")]
+                retained = (
+                    {"WAMR_CI_LAUNCH_EXECUTABLE": zig_identity}
+                    if command_stage in {"adapter", "local-boot-tool"}
+                    else None)
+                supervised_command_record(
+                    ci, item, command_stage, 8 * 1024 * 1024,
+                    stage_identity[command_stage], allowed_identities,
+                    retained)
     for mode in ci.MODES:
         request = ci.document(stage / "boots" / mode / "request")
         require(set(request) == {
@@ -1003,8 +1227,10 @@ def import_bundle(
 def publish_ci(handoff):
     """Only the named public repository lane may select this fixed publication."""
     handoff.FAILURE_STAGE = "public-context"
-    source = ci_context(handoff)
     runtime = ci_runtime(handoff.ci)
+    handoff.result_records(runtime / "compute")
+    start = accepted_public_build_start(handoff, runtime)
+    source = ci_context(handoff, start)
     publication = runtime / "compute/public-source"
     stage = publication / "handoff"
     output = handoff.ci.REPO / ".d/wamr-public-source-bundle"
@@ -1014,10 +1240,9 @@ def publish_ci(handoff):
     require(handoff.ci.read(runtime / "evidence/runtime-cleanup.txt", 128)
             == b"primary=0 cleanup=0\n")
     output.mkdir(mode=0o700)
-    start = handoff.ci.document(
-        runtime / "compute/evidence/build-start.json")
     handoff.FAILURE_STAGE = "public-validator-build"
-    handoff.ci.run(runtime / "compute", "public-validator-build", [
+    unused_output, validator_record = handoff.ci.execute(
+        runtime / "compute", "public-validator-build", [
         handoff.ci.tool("zig"), "build", "--build-file",
         handoff.ci.REPO / "support/tools/hyperv/direct/build.zig",
         "--cache-dir", runtime / "compute/cache",
@@ -1026,8 +1251,34 @@ def publish_ci(handoff):
         "-Doptimize=ReleaseSafe", "-j2", "install"], 600,
         input_records=handoff.ci.consumer_file_records(
             start["consumer_inputs"]))
+    del unused_output
+    consumer_files = start["consumer_inputs"]["files"]
+    supervisor_identity = handoff.ci.native_executable_identity(
+        consumer_files["command-supervisor"])
+    zig_identity = handoff.ci.native_executable_identity(
+        consumer_files["tool:zig"])
+    allowed_identities = [
+        handoff.ci.native_executable_identity(record)
+        for record in consumer_files.values()
+        if record["metadata"][2] & 0o111
+    ]
+    validator_record_path = (
+        runtime / "compute/evidence/command-public-validator-build.json")
+
+    def require_validator_record():
+        recorded = handoff.ci.document(validator_record_path)
+        require(recorded == validator_record)
+        supervised_command_record(
+            handoff.ci, recorded, "public-validator-build",
+            8 * 1024 * 1024, supervisor_identity, allowed_identities,
+            {"WAMR_CI_LAUNCH_EXECUTABLE": zig_identity})
+        handoff.ci.require_recorded_build_custody(runtime, start)
+        require(ci_context(handoff, start) == source)
+
+    require_validator_record()
     handoff.FAILURE_STAGE = "public-export"
     handoff.export(runtime, stage)
+    require_validator_record()
     validator = publication / "tools/bin/uk-wamr-direct-validate"
     archive = output / "tiny-aot-public-source.zip"
     handoff.FAILURE_STAGE = "public-pack"
@@ -1038,5 +1289,5 @@ def publish_ci(handoff):
         handoff, archive, publication / "reopened",
         source, archive_sha256, validator)
     handoff.FAILURE_STAGE = "public-final-context"
-    require(ci_context(handoff) == source)
+    require_validator_record()
     return archive, archive_sha256, source["source_tree"]
