@@ -126,7 +126,7 @@ pub const Executable = struct {
         _ = try validateElfExecutable(file.handle, stat.size);
         const content_sha256 = try hashExecutable(file.handle, stat.size);
         const verified = try files.snapshot(file);
-        if (!std.meta.eql(stat, verified)) return error.ExecutableIdentityChanged;
+        if (!files.sameSnapshot(stat, verified)) return error.ExecutableIdentityChanged;
         return .{ .file = file, .identity = .fromStat(verified, content_sha256) };
     }
 
