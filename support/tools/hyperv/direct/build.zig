@@ -114,6 +114,8 @@ pub fn build(b: *std.Build) void {
         "../process_command_tests.zig",
         "../process_command_gate_tests.zig",
         "../process_command_gate_poison_tests.zig",
+        "../process_command_post_release_fault_tests.zig",
+        "../process_command_post_release_poison_tests.zig",
         "../process_private_tests.zig",
         "runtime_tests.zig",
         "../process_command_leader_track_fault_tests.zig",

@@ -91,6 +91,14 @@ fn emitPid(pid: linux.pid_t) !void {
     try emit(1, try std.fmt.bufPrint(&text, "{d}\n", .{pid}));
 }
 
+fn createMarker(io: std.Io, name: []const u8) !void {
+    const marker = try std.Io.Dir.cwd().createFile(io, name, .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    marker.close(io);
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.InvalidFixture;
@@ -129,14 +137,12 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(try std.fmt.parseInt(u8, args[4], 10));
     } else if (std.mem.eql(u8, mode, "gate-marker")) {
         if (args.len != 3) return error.InvalidFixture;
-        const marker = try std.Io.Dir.cwd().createFile(init.io, args[2], .{
-            .exclusive = true,
-            .permissions = .fromMode(0o600),
-        });
-        marker.close(init.io);
+        try createMarker(init.io, args[2]);
     } else if (std.mem.eql(u8, mode, "ordinary-child") or std.mem.eql(u8, mode, "setsid-child") or
         std.mem.eql(u8, mode, "closed-child") or std.mem.eql(u8, mode, "resistant-child"))
     {
+        if (args.len != 2 and args.len != 3) return error.InvalidFixture;
+        if (args.len == 3) try createMarker(init.io, args[2]);
         const style: ChildStyle = if (std.mem.eql(u8, mode, "ordinary-child"))
             .ordinary
         else if (std.mem.eql(u8, mode, "setsid-child"))
@@ -147,6 +153,8 @@ pub fn main(init: std.process.Init) !void {
             .resistant;
         try emitPid(try spawnChild(style));
     } else if (std.mem.eql(u8, mode, "double-fork")) {
+        if (args.len != 2 and args.len != 3) return error.InvalidFixture;
+        if (args.len == 3) try createMarker(init.io, args[2]);
         var ready: [2]linux.fd_t = undefined;
         if (linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
         defer _ = linux.close(ready[0]);

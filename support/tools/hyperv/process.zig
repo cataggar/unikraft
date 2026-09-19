@@ -475,6 +475,32 @@ pub const CommandClockTest = struct {
     leader_exit_observations: u32 = 0,
 };
 
+pub const CommandPostReleaseTestFault = enum {
+    monitor_clock,
+    monitor_cancelled,
+    monitor_event,
+    monitor_output,
+    monitor_io,
+    monitor_poll,
+    fallback_clock,
+    result_build,
+    cleanup_proof,
+    unwind,
+    unwind_cleanup_proof,
+};
+
+pub const CommandPostReleaseTestState = struct {
+    fault: CommandPostReleaseTestFault,
+    boundaries: u32 = 0,
+    fault_injections: u32 = 0,
+
+    fn inject(self: *CommandPostReleaseTestState, fault: CommandPostReleaseTestFault) bool {
+        if (self.fault != fault or self.fault_injections != 0) return false;
+        self.fault_injections = 1;
+        return true;
+    }
+};
+
 pub const CommandSignalTestState = struct {
     attempts: u32 = 0,
 };
@@ -525,8 +551,22 @@ pub const CommandTestOptions = struct {
     signal: ?*CommandSignalTestState = null,
     leader_track: ?*CommandLeaderTrackTest = null,
     gate: ?*CommandGateTestState = null,
+    post_release: ?*CommandPostReleaseTestState = null,
     pre_spawn: ?CommandPreSpawnTestFault = null,
 };
+
+const command_contract_source =
+    @embedFile("process-command-v1.json");
+const command_contract_expected =
+    "{\"complete_cleanup_events_min\":5,\"complete_primary_events_min\":1," ++
+    "\"pre_release_cleanup_events_min\":4}\n";
+comptime {
+    if (!std.mem.eql(u8, command_contract_source, command_contract_expected))
+        @compileError("process-command-v1.json does not match the native producer contract");
+}
+pub const command_complete_primary_events_min: u32 = 1;
+pub const command_complete_cleanup_events_min: u32 = 5;
+pub const command_pre_release_cleanup_events_min: u32 = 4;
 
 pub const CommandLimits = struct {
     stdout_bytes: usize = 64 * 1024,
@@ -629,6 +669,127 @@ pub const CommandResult = struct {
         std.crypto.secureZero(u8, self.storage);
         allocator.free(self.storage);
         self.* = undefined;
+    }
+};
+
+const CommandCleanupGuard = struct {
+    io: std.Io,
+    proc: linux.fd_t,
+    request: CommandRequest,
+    tracker: *OwnedTracker,
+    child: *Spawned,
+    capture: *Capture,
+    result: *CommandResult,
+    gate_test: ?*CommandGateTestState,
+    post_release_test: ?*CommandPostReleaseTestState,
+    gate_released: bool = false,
+    normal_cleanup_completed: bool = false,
+    handled: bool = false,
+
+    fn finishGated(
+        self: *CommandCleanupGuard,
+        candidate: ?*PidfdOwnership,
+        primary: CommandPrimary,
+        primary_observed_ns: u64,
+        unavailable_cleanup: CommandCleanup,
+    ) CommandResult {
+        const finished = finishGatedCommandFailure(
+            self.io,
+            self.proc,
+            self.request,
+            self.tracker,
+            self.child,
+            self.capture,
+            candidate,
+            primary,
+            primary_observed_ns,
+            unavailable_cleanup,
+            self.gate_test,
+            self.result,
+        );
+        self.handled = true;
+        return finished;
+    }
+
+    fn completeNormal(self: *CommandCleanupGuard) void {
+        self.normal_cleanup_completed = true;
+        self.handled = true;
+    }
+
+    fn completeFailed(self: *CommandCleanupGuard) void {
+        self.handled = true;
+    }
+
+    fn deinit(self: *CommandCleanupGuard) void {
+        if (self.handled or self.normal_cleanup_completed) return;
+        if (!self.gate_released) {
+            self.child.closeGate();
+            const descriptor = if (self.tracker.len == 1)
+                self.tracker.items[0].pidfd
+            else
+                commandPidfd(self.child.pid) catch {
+                    poisonUnpinnedGatedChild(
+                        self.child.pid,
+                        self.request,
+                        self.result,
+                    );
+                    self.result.cleanup_complete = false;
+                    poisoned.store(true, .release);
+                    return;
+                };
+            var recovered_descriptor: ?linux.fd_t = null;
+            if (self.tracker.len == 0) recovered_descriptor = descriptor;
+            defer if (recovered_descriptor) |owned| {
+                _ = linux.close(owned);
+            };
+            recoverGatedChild(
+                self.proc,
+                self.child.pid,
+                descriptor,
+                if (self.tracker.len == 1)
+                    self.tracker.items[0].start_ticks
+                else
+                    null,
+                self.request,
+                self.gate_test,
+                self.result,
+            ) catch {
+                poisonGatedChild(
+                    self.child.pid,
+                    descriptor,
+                    self.request,
+                    self.result,
+                );
+                self.result.cleanup_complete = false;
+                poisoned.store(true, .release);
+                return;
+            };
+            if (self.tracker.len == 1)
+                self.tracker.items[0].reaped = self.result.termination != null;
+            self.result.cleanup = .complete;
+            self.result.cleanup_complete = true;
+            return;
+        }
+        cleanupCommand(
+            self.io,
+            self.proc,
+            self.request,
+            self.tracker,
+            self.result,
+            self.post_release_test,
+        ) catch |err| {
+            self.result.cleanup_complete = false;
+            self.result.cleanup = commandCleanupFromError(err);
+            poisonCommand(
+                self.io,
+                self.proc,
+                self.request,
+                self.tracker,
+                self.result,
+            );
+            return;
+        };
+        self.normal_cleanup_completed = true;
     }
 };
 
@@ -825,43 +986,42 @@ fn runCommandImpl(
     defer _ = linux.close(child.stderr);
     defer _ = linux.close(child.control);
     defer child.closeGate();
+    var cleanup_guard: CommandCleanupGuard = .{
+        .io = io,
+        .proc = proc,
+        .request = request,
+        .tracker = &tracker,
+        .child = &child,
+        .capture = &capture,
+        .result = &result,
+        .gate_test = if (test_options) |options_value| options_value.gate else null,
+        .post_release_test = if (test_options) |options_value|
+            options_value.post_release
+        else
+            null,
+    };
+    defer cleanup_guard.deinit();
 
     if (test_options) |options_value| {
         if (options_value.leader_track_delay_ms != 0) {
             pause(@intCast(options_value.leader_track_delay_ms)) catch {
                 const failure_ns = now() catch observed_ns;
-                return finishGatedCommandFailure(
-                    io,
-                    proc,
-                    request,
-                    &tracker,
-                    &child,
-                    &capture,
+                return cleanup_guard.finishGated(
                     null,
                     .local_io,
                     failure_ns,
                     .local_io,
-                    options_value.gate,
-                    &result,
                 );
             };
         }
     }
     const leader_pidfd = commandPidfd(child.pid) catch {
         const failure_ns = now() catch observed_ns;
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             null,
             .local_io,
             failure_ns,
             .proc_unavailable,
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     };
     var leader_ownership = PidfdOwnership.init(leader_pidfd);
@@ -871,19 +1031,11 @@ fn runCommandImpl(
         .pidfd,
     )) {
         const failure_ns = now() catch observed_ns;
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             &leader_ownership,
             .local_io,
             failure_ns,
             .proc_unavailable,
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     }
     var leader_start_ticks: ?u64 = null;
@@ -898,13 +1050,7 @@ fn runCommandImpl(
         const primary_observed_ns = commandLeaderTrackFailureObserved(
             if (test_options) |options_value| options_value.leader_track else null,
         ) catch observed_ns;
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             &leader_ownership,
             classifyPreReleasePrimary(.local_io, options, primary_observed_ns),
             primary_observed_ns,
@@ -913,43 +1059,25 @@ fn runCommandImpl(
                 error.ProcessGone, error.ProcUnavailable => .proc_unavailable,
                 error.PollFailed, error.TrackerUnavailable => .local_io,
             },
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     };
 
     var pre_release_ns = primaryPreReleaseObservation(
         if (test_options) |options_value| options_value.gate else null,
     ) catch {
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             null,
             .local_io,
             observed_ns,
             .local_io,
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     };
     if (pre_release_ns >= request.primary_deadline.expires_ns or cancelled(options)) {
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             null,
             classifyPreReleasePrimary(.local_io, options, pre_release_ns),
             pre_release_ns,
             .local_io,
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     }
     awaitCommandGateReady(
@@ -974,13 +1102,7 @@ fn runCommandImpl(
             primaryPreReleaseObservation(
                 if (test_options) |options_value| options_value.gate else null,
             ) catch pre_release_ns;
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             null,
             classifyPreReleasePrimary(
                 if (err == error.Cancelled) .cancelled else .local_io,
@@ -989,42 +1111,24 @@ fn runCommandImpl(
             ),
             failure_ns,
             .local_io,
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     };
     pre_release_ns = primaryPreReleaseObservation(
         if (test_options) |options_value| options_value.gate else null,
     ) catch {
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             null,
             .local_io,
             pre_release_ns,
             .local_io,
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     };
     if (pre_release_ns >= request.primary_deadline.expires_ns or cancelled(options)) {
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             null,
             classifyPreReleasePrimary(.local_io, options, pre_release_ns),
             pre_release_ns,
             .local_io,
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     }
     if (commandGateInject(
@@ -1035,19 +1139,11 @@ fn runCommandImpl(
         .recovery_proof,
     )) {
         child.closeGate();
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             null,
             .local_io,
             pre_release_ns,
             .local_io,
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     }
     if (commandGateInject(
@@ -1065,21 +1161,14 @@ fn runCommandImpl(
         const failure_ns = primaryPreReleaseObservation(
             if (test_options) |options_value| options_value.gate else null,
         ) catch pre_release_ns;
-        return finishGatedCommandFailure(
-            io,
-            proc,
-            request,
-            &tracker,
-            &child,
-            &capture,
+        return cleanup_guard.finishGated(
             null,
             classifyPreReleasePrimary(.local_io, options, failure_ns),
             failure_ns,
             .local_io,
-            if (test_options) |options_value| options_value.gate else null,
-            &result,
         );
     };
+    cleanup_guard.gate_released = true;
     child.closeGate();
 
     var monitor_completed = true;
@@ -1091,6 +1180,7 @@ fn runCommandImpl(
         request.limits.primary_events,
         &result.primary_events,
         if (test_options) |options_value| options_value.clock else null,
+        cleanup_guard.post_release_test,
         &terminal_observed_ns,
     ) catch |err| {
         monitor_completed = false;
@@ -1121,7 +1211,14 @@ fn runCommandImpl(
         if (err == error.StdoutIo or err == error.StderrIo or err == error.PollFailed or err == error.WaitFailed)
             result.primary = .local_io;
     };
-    const primary_observed_ns = terminal_observed_ns orelse try now();
+    const primary_observed_ns = terminal_observed_ns orelse
+        commandPostReleaseFallbackTimestamp(cleanup_guard.post_release_test) catch blk: {
+        if (monitor_completed) {
+            monitor_completed = false;
+            result.primary = .local_io;
+        }
+        break :blk pre_release_ns;
+    };
     completePrimaryCommandTimingAt(&result, primary_observed_ns);
     if (result.primary_completed_ns >= request.primary_deadline.expires_ns) {
         monitor_completed = false;
@@ -1129,22 +1226,37 @@ fn runCommandImpl(
         result.primary_deadline_reached = true;
         result.cancellation_observed = false;
     }
+    commandPostReleaseResultBuild(cleanup_guard.post_release_test) catch {
+        monitor_completed = false;
+        result.primary = .local_io;
+        result.primary_deadline_reached = false;
+        result.cancellation_observed = false;
+    };
+    if (commandPostReleaseBoundaryIs(
+        cleanup_guard.post_release_test,
+        .unwind,
+    ) or commandPostReleaseBoundaryIs(
+        cleanup_guard.post_release_test,
+        .unwind_cleanup_proof,
+    )) return error.PostReleaseTestFailure;
 
-    cleanupCommand(io, proc, request, &tracker, &result) catch |err| {
+    cleanupCommand(
+        io,
+        proc,
+        request,
+        &tracker,
+        &result,
+        cleanup_guard.post_release_test,
+    ) catch |err| {
         result.cleanup_complete = false;
-        result.cleanup = switch (err) {
-            error.CleanupDeadline => .deadline,
-            error.EventLimit, error.ProcEntryLimit, error.ReapLimit => .event_limit,
-            error.DescendantUntracked => .descendant_untracked,
-            error.IdentityChanged => .identity_changed,
-            error.SignalFailed => .signal_failed,
-            error.ReapFailed => .reap_failed,
-            error.ProcUnavailable => .proc_unavailable,
-            error.ClockUnavailable, error.PollFailed => .local_io,
-            else => .local_io,
-        };
+        result.cleanup = commandCleanupFromError(err);
         poisonCommand(io, proc, request, &tracker, &result);
     };
+    if (result.cleanup_complete) {
+        cleanup_guard.completeNormal();
+    } else {
+        cleanup_guard.completeFailed();
+    }
     result.descendants = tracker.report;
 
     finishCommandCapture(&capture, child.stdout, child.stderr, &result);
@@ -1160,7 +1272,17 @@ fn runCommandImpl(
     };
     if (!result.executable_stable and primaryExitedZero(result.primary))
         result.primary = .executable_changed;
-    try completeCleanupCommandTiming(&result);
+    const completed_ns = now() catch {
+        if (monitor_completed) {
+            monitor_completed = false;
+            result.primary = .local_io;
+            result.primary_deadline_reached = false;
+            result.cancellation_observed = false;
+        }
+        result.completed_ns = result.primary_completed_ns;
+        return result;
+    };
+    result.completed_ns = @max(result.primary_completed_ns, completed_ns);
     return result;
 }
 
@@ -1569,6 +1691,7 @@ fn monitorCommand(
     event_limit: u32,
     events: *u32,
     clock: ?*CommandClockTest,
+    post_release_test: ?*CommandPostReleaseTestState,
     terminal_observed_ns: *?u64,
 ) !void {
     try nonblocking(child.stdout);
@@ -1597,6 +1720,12 @@ fn monitorCommand(
             error.DeadlineExceeded => return error.DeadlineExceeded,
             else => return error.StderrIo,
         };
+        try commandPostReleaseMonitorFault(
+            post_release_test,
+            capture,
+            event_limit,
+            events,
+        );
         if (!exec_confirmed) exec_confirmed = try execStatus(child.control);
         if (try exited(child.pid)) {
             const observed_ns = try commandLeaderExitObserved(clock);
@@ -1650,6 +1779,79 @@ fn commandLeaderTrackFailureObserved(fault: ?*CommandLeaderTrackTest) !u64 {
         return active.observed_ns;
     }
     return now();
+}
+
+fn commandPostReleaseMonitorFault(
+    test_state: ?*CommandPostReleaseTestState,
+    capture: *Capture,
+    event_limit: u32,
+    events: *u32,
+) !void {
+    const active = test_state orelse return;
+    if (capture.stdout_count == 0) return;
+    switch (active.fault) {
+        .monitor_clock => if (active.inject(.monitor_clock))
+            return error.ClockUnavailable,
+        .monitor_cancelled => if (active.inject(.monitor_cancelled))
+            return error.Cancelled,
+        .monitor_event => if (active.inject(.monitor_event)) {
+            events.* = event_limit;
+            return error.EventLimit;
+        },
+        .monitor_output => if (active.inject(.monitor_output)) {
+            capture.stdout_count = capture.output.len;
+            capture.state = .overflow;
+            return error.StdoutLimit;
+        },
+        .monitor_io => if (active.inject(.monitor_io)) {
+            capture.state = .io_failed;
+            return error.StdoutIo;
+        },
+        .monitor_poll => if (active.inject(.monitor_poll))
+            return error.PollFailed,
+        .fallback_clock, .result_build, .unwind, .unwind_cleanup_proof => {
+            if (active.boundaries == 0) {
+                active.boundaries = 1;
+                return error.PostReleaseBoundary;
+            }
+        },
+        .cleanup_proof => {},
+    }
+}
+
+fn commandPostReleaseFallbackTimestamp(
+    test_state: ?*CommandPostReleaseTestState,
+) !u64 {
+    if (test_state) |active| {
+        if (active.boundaries != 0 and active.inject(.fallback_clock))
+            return error.ClockUnavailable;
+    }
+    return now();
+}
+
+fn commandPostReleaseResultBuild(
+    test_state: ?*CommandPostReleaseTestState,
+) !void {
+    if (test_state) |active| {
+        if (active.boundaries != 0 and active.inject(.result_build))
+            return error.ResultBuildFailed;
+    }
+}
+
+fn commandPostReleaseBoundaryIs(
+    test_state: ?*CommandPostReleaseTestState,
+    fault: CommandPostReleaseTestFault,
+) bool {
+    const active = test_state orelse return false;
+    return active.fault == fault and active.boundaries != 0;
+}
+
+fn commandPostReleaseCleanupProof(
+    test_state: ?*CommandPostReleaseTestState,
+) bool {
+    const active = test_state orelse return false;
+    return active.inject(.cleanup_proof) or
+        active.inject(.unwind_cleanup_proof);
 }
 
 fn commandGateInject(test_state: ?*CommandGateTestState, fault: CommandGateTestFault) bool {
@@ -1918,12 +2120,27 @@ const OwnedTracker = struct {
 
 const CleanupSignal = enum { term, kill };
 
+fn commandCleanupFromError(err: anyerror) CommandCleanup {
+    return switch (err) {
+        error.CleanupDeadline => .deadline,
+        error.EventLimit, error.ProcEntryLimit, error.ReapLimit => .event_limit,
+        error.DescendantUntracked => .descendant_untracked,
+        error.IdentityChanged => .identity_changed,
+        error.SignalFailed => .signal_failed,
+        error.ReapFailed => .reap_failed,
+        error.ProcUnavailable => .proc_unavailable,
+        error.ClockUnavailable, error.PollFailed => .local_io,
+        else => .local_io,
+    };
+}
+
 fn cleanupCommand(
     io: std.Io,
     proc: linux.fd_t,
     request: CommandRequest,
     tracker: *OwnedTracker,
     result: *CommandResult,
+    post_release_test: ?*CommandPostReleaseTestState,
 ) !void {
     const started = try now();
     const grace_ns = try std.math.mul(u64, request.limits.term_grace_ms, std.time.ns_per_ms);
@@ -1957,6 +2174,8 @@ fn cleanupCommand(
         try pause(try request.cleanup_deadline.waitMilliseconds(5));
     }
     try reapCommand(request, tracker, result);
+    if (commandPostReleaseCleanupProof(post_release_test))
+        return error.ReapFailed;
     result.cleanup = .complete;
     result.cleanup_complete = true;
 }
@@ -2523,15 +2742,7 @@ fn finishGatedCommandFailure(
     ) catch |err| {
         poisonGatedChild(child.pid, descriptor, request, result);
         result.cleanup_complete = false;
-        result.cleanup = switch (err) {
-            error.CleanupDeadline => .deadline,
-            error.EventLimit, error.ReapLimit => .event_limit,
-            error.IdentityChanged => .identity_changed,
-            error.SignalFailed => .signal_failed,
-            error.ReapFailed => .reap_failed,
-            error.ProcUnavailable => .proc_unavailable,
-            error.ClockUnavailable, error.PollFailed => .local_io,
-        };
+        result.cleanup = commandCleanupFromError(err);
         poisoned.store(true, .release);
     };
     if (result.cleanup_complete) result.cleanup = .complete;
@@ -2540,12 +2751,7 @@ fn finishGatedCommandFailure(
     finishCommandCapture(capture, child.stdout, child.stderr, result);
     result.stdout = capture.output[0..capture.stdout_count];
     result.stderr = capture.stderr_output[0..capture.stderr_count];
-    const completed = now() catch blk: {
-        result.cleanup_complete = false;
-        result.cleanup = .local_io;
-        poisoned.store(true, .release);
-        break :blk result.primary_completed_ns;
-    };
+    const completed = now() catch result.primary_completed_ns;
     result.completed_ns = @max(result.primary_completed_ns, completed);
     if (result.cleanup_complete and result.completed_ns > request.cleanup_deadline.expires_ns) {
         result.cleanup_complete = false;

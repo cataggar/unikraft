@@ -181,10 +181,17 @@ identity, transfers the leader into the tracker, receives the child's ready
 token and sends exactly one release token. EOF, a malformed/short token or any
 tracking, clock, deadline, cancellation or release failure closes the gate,
 reaps the still-unexecuted leader through its pidfd and requires final ECHILD.
+As soon as the spawned leader exists, an unwind guard follows it through
+pidfd acquisition and tracker ownership and records whether the gate was
+released and whether normal tree cleanup completed. Any later error therefore
+recovers the gated leader before release or runs full tracked-tree cleanup
+after release; cleanup proof failure is retained as irreversible supervisor
+poison without replacing the primary command failure.
 A proved pre-release recovery is `cleanup=complete`, unpoisoned, with no
 primary-monitor events, empty complete streams, no descendants, two reap
-events (leader plus ECHILD) and at least three cleanup events. An unavailable
-identity, reap or ECHILD proof poisons the supervisor even if best-effort
+events (leader plus ECHILD) and at least four cleanup events. The minimum is
+shared by the native producer and adapter through `process-command-v1.json`.
+An unavailable identity, reap or ECHILD proof poisons the supervisor even if best-effort
 termination succeeds. Pre-spawn `not_required` results remain limited to
 timeout, cancellation, local spawn/snapshot I/O failure or unsupported
 snapshot creation. They have empty complete streams and hashes, no

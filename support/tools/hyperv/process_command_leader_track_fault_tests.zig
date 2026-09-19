@@ -45,7 +45,9 @@ fn runCase(offset: i2) !void {
     try testing.expectEqual(observed_ns, result.primary_completed_ns);
     try testing.expectEqual(.complete, result.cleanup);
     try testing.expect(result.cleanup_complete);
-    try testing.expect(result.cleanup_events >= 3);
+    try testing.expect(
+        result.cleanup_events >= process.command_pre_release_cleanup_events_min,
+    );
     try testing.expectEqual(@as(u16, 2), result.reap_events);
     try testing.expect(result.termination != null);
     try testing.expectEqual(@as(usize, 0), result.stdout.len);

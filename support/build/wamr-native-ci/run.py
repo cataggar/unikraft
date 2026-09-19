@@ -99,9 +99,22 @@ COMMAND_RESULT_MAX = 12 * MIB
 COMMAND_REQUEST_MAX = MIB
 COMMAND_STRING_MAX = 4096
 COMMAND_OUTPUT_COMMITMENT_DOMAIN = b"uk.wamr.command-output-v1\0"
-COMMAND_COMPLETE_PRIMARY_EVENTS_MIN = 1
-COMMAND_COMPLETE_CLEANUP_EVENTS_MIN = 5
-COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN = 3
+COMMAND_CONTRACT = json.loads(
+    (REPO / "support/tools/hyperv/process-command-v1.json").read_text(
+        encoding="utf-8"))
+if (set(COMMAND_CONTRACT) != {
+        "complete_cleanup_events_min",
+        "complete_primary_events_min",
+        "pre_release_cleanup_events_min",
+} or any(type(value) is not int or value < 1
+         for value in COMMAND_CONTRACT.values())):
+    raise RuntimeError("invalid process-command-v1 contract")
+COMMAND_COMPLETE_PRIMARY_EVENTS_MIN = (
+    COMMAND_CONTRACT["complete_primary_events_min"])
+COMMAND_COMPLETE_CLEANUP_EVENTS_MIN = (
+    COMMAND_CONTRACT["complete_cleanup_events_min"])
+COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN = (
+    COMMAND_CONTRACT["pre_release_cleanup_events_min"])
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 BOOTSTRAP_STAGES = frozenset({
     "dependency-restore",
@@ -117,6 +130,7 @@ SUPERVISOR_SOURCE_FILES = (
     "support/tools/hyperv/contracts.zig",
     "support/tools/hyperv/diagnostics.zig",
     "support/tools/hyperv/private_files.zig",
+    "support/tools/hyperv/process-command-v1.json",
     "support/tools/hyperv/process.zig",
     "support/tools/hyperv/sensitive.zig",
     "support/tools/hyperv/sha256.zig",

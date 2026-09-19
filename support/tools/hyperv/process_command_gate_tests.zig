@@ -51,11 +51,17 @@ fn expectCompletePreReleaseFailure(
     result: process.CommandResult,
     primary: std.meta.Tag(process.CommandPrimary),
 ) !void {
+    try testing.expectEqual(
+        @as(u32, 4),
+        process.command_pre_release_cleanup_events_min,
+    );
     try testing.expectEqual(primary, std.meta.activeTag(result.primary));
     try testing.expectEqual(.complete, result.cleanup);
     try testing.expect(result.cleanup_complete);
     try testing.expectEqual(@as(u32, 0), result.primary_events);
-    try testing.expect(result.cleanup_events >= 3);
+    try testing.expect(
+        result.cleanup_events >= process.command_pre_release_cleanup_events_min,
+    );
     try testing.expectEqual(@as(u16, 2), result.reap_events);
     try testing.expect(result.termination != null);
     try testing.expectEqual(process.CommandDescendants{}, result.descendants);
@@ -110,6 +116,65 @@ test "every parent gate phase fails before user code and reaps through ECHILD" {
         try testing.expectEqual(@as(u32, 1), gate.fault_injections);
         try expectMarkerMissing(fixture, marker);
         try support.noChildren();
+    }
+}
+
+test "ordinary setsid and double-fork fixtures cannot cross failed gates" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+
+    const Failure = enum { add_leader, identity, deadline, release };
+    for ([_][]const u8{ "ordinary-child", "setsid-child", "double-fork" }) |mode| {
+        for ([_]Failure{ .add_leader, .identity, .deadline, .release }) |failure| {
+            var marker_buffer: [96:0]u8 = undefined;
+            const marker = try std.fmt.bufPrintZ(
+                &marker_buffer,
+                "{s}-{s}-marker",
+                .{ mode, @tagName(failure) },
+            );
+            var command = try request(
+                executable,
+                &.{ path, mode, marker },
+                &environment,
+                fixture.directory.dir,
+            );
+            var gate: process.CommandGateTestState = .{
+                .fault = switch (failure) {
+                    .add_leader => .tracker,
+                    .identity => .identity,
+                    .deadline => .tracker,
+                    .release => .release_write,
+                },
+            };
+            var options: process.CommandTestOptions = .{};
+            if (failure == .deadline) {
+                command.primary_deadline = try process.Deadline.afterMilliseconds(200);
+                options.leader_track_delay_ms = 300;
+            } else {
+                options.gate = &gate;
+            }
+            var result = try process.runCommandTest(
+                allocator,
+                io,
+                command,
+                options,
+            );
+            defer result.deinit(allocator);
+            try expectCompletePreReleaseFailure(
+                result,
+                if (failure == .deadline) .timeout else .local_io,
+            );
+            if (failure != .deadline)
+                try testing.expectEqual(@as(u32, 1), gate.fault_injections);
+            try expectMarkerMissing(fixture, marker);
+            try support.noChildren();
+        }
     }
 }
 

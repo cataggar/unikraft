@@ -3258,6 +3258,7 @@ source/generated/
                 request_raw).hexdigest()
             return value, request
 
+        self.assertEqual(ci.COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN, 4)
         for offset in (-1, 0, 1):
             value, request = leader_tracking_fixture(offset)
             with self.subTest(leader_tracking_offset=offset):
