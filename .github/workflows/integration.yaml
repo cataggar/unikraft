@@ -927,8 +927,26 @@ jobs:
           --system "${root}/restore/zig-pkg" \
           --cache-dir "${root}/compute-cache" --global-cache-dir "${root}/global" \
           --prefix "${root}/compute-tools" -Doptimize=ReleaseSafe test install
+        supervisor_source_closure="$(
+          python3 - <<'PY'
+        import sys
+
+        sys.path.insert(0, "support/build/wamr-native-ci")
+        import run
+
+        print(run.supervisor_source_map()["content_closure_sha256"])
+        PY
+        )"
+        zig build \
+          --build-file support/build/wamr-native-ci/supervisor.build.zig -j2 \
+          --cache-dir "${root}/supervisor-cache" \
+          --global-cache-dir "${root}/global" \
+          --prefix "${root}/compute-supervisor" \
+          -Doptimize=ReleaseSafe \
+          -Dsource-closure-sha256="${supervisor_source_closure}"
         WAMR_DIRECT_TOOLS="${root}/tools/bin" \
         WAMR_CI_PACKAGE="${root}/compute-tools/bin/wamr-ci-package" \
+        WAMR_CI_SUPERVISOR="${root}/compute-supervisor/bin/wamr-ci-supervisor" \
           python3 -m unittest discover -s support/tools/hyperv/direct/tests -v
 
     - name: Retain bounded runtime fixture evidence

@@ -61,9 +61,19 @@ def export(runtime, output):
     root = runtime / "compute"
     records = result_records(root)
     expected = ci.document(root / "evidence/build-start.json")
-    if "command-supervisor" in expected["consumer_inputs"]["files"]:
+    legacy_supervision = "command_supervisor" not in expected
+    if (not legacy_supervision
+            and "command-supervisor" in expected["consumer_inputs"]["files"]):
         ci.COMMAND_ENVIRONMENT.update(ci.bind_command_tools(
             expected["consumer_inputs"]))
+    elif legacy_supervision:
+        ci.COMMAND_ENVIRONMENT.clear()
+        ci.COMMAND_TOOL_PATHS.clear()
+        if "command-supervisor" in expected["consumer_inputs"]["files"]:
+            supervisor_path = ci.bind_command_supervisor(
+                expected["consumer_inputs"])
+            ci.COMMAND_ENVIRONMENT[
+                "WAMR_CI_SUPERVISOR"] = supervisor_path
     before = ci.producer_inputs(runtime, expected["consumer_inputs"])
     ci.require(before == expected,
                "producer inputs changed")
@@ -97,10 +107,34 @@ def export(runtime, output):
                 {"command-supervisor": Path(supervisor_path)}, {})
             input_records.update(ci.consumer_file_records(
                 compatibility_supervisor))
-    inspected = ci.document(ci.run(
-        output, "handoff-inspect",
+    if legacy_supervision and ci.COMMAND_SUPERVISOR_PATH is not None:
+        ci.COMMAND_ENVIRONMENT[
+            "WAMR_CI_SUPERVISOR"] = ci.COMMAND_SUPERVISOR_PATH
+    inspect_stage = (
+        "handoff-inspect-legacy"
+        if legacy_supervision else "handoff-inspect")
+    inspected_output, inspected_command = ci.execute(
+        output, inspect_stage,
         [tools["package_tool"], "inspect", ci.APP / "build" / ci.EFI, root / "package"],
-        150, 64 * 1024, input_records=input_records))
+        150, 64 * 1024, input_records=input_records,
+        path_roles={
+            "input:package_tool": tools["package_tool"],
+            "compute": root,
+        })
+    ci.validate_supervised_command_binding(
+        inspected_command, inspect_stage, {
+            "command-supervisor": ci.native_executable_identity(
+                input_records[str(Path(
+                    ci.COMMAND_SUPERVISOR_PATH).resolve(strict=True))]),
+            **({} if legacy_supervision else {
+                "tool:" + name: ci.native_executable_identity(
+                    expected["consumer_inputs"]["files"]["tool:" + name])
+                for name in ci.HOST_TOOLS
+            }),
+            "input:package_tool": ci.native_executable_identity(
+                inputs["files"]["package_tool"]),
+        })
+    inspected = ci.document(inspected_output)
     packaged = ci.document(root / "evidence/package.json")
     ci.require(inspected["producer_sha256"] == packaged["producer_sha256"]
                and all(inspected["image"][key] == value
@@ -225,6 +259,7 @@ def main():
     imp.add_argument("--run-id", required=True)
     imp.add_argument("--run-attempt", required=True)
     imp.add_argument("--validator", type=Path, required=True)
+    imp.add_argument("--supervisor", type=Path, required=True)
     args = parser.parse_args()
     os.umask(0o077)
     if args.command == "export":
@@ -259,7 +294,8 @@ def main():
             else:
                 public_bundle.import_bundle(
                     sys.modules[__name__], args.archive, args.output, expected,
-                    args.expected_archive_sha256, args.validator)
+                    args.expected_archive_sha256, args.validator,
+                    args.supervisor)
     print("Compute handoff/plan prepared; authority=not_admitted. No Azure operations.")
 
 

@@ -165,10 +165,17 @@ cancellation, overflow, nonzero/signal, exec/identity failure or any unproven
 cleanup is a refusal; cleanup failure prevents publication even when the
 leader exited zero.
 Each supervised command record also binds hashes of the complete canonical
-request and result, exact executable and retained-interpreter identities,
-primary and cleanup deadlines, stream limits, separate stream
-status/size/digests, the combined bounded-output digest, termination and
-bounded event counts. Raw command output remains private.
+request and normalized native result, exact supervisor, command executable,
+native executable and interpreter identities, ordered argv, closed explicit
+environment, cwd, stage/schema versions, primary/cleanup deadlines and every
+supervisor limit. A closed per-stage contract fixes the executable roles,
+argv template, cwd role, environment allowlist, timeout, output limits and
+successful result expectations. Every digest is recomputed from the retained
+fields during creation, export, archive reopen and import; a syntactically
+valid supplied digest or cross-stage relabel is not accepted. Separate stream
+status/size/digests, the combined bounded-output digest, termination,
+descendant observations and bounded event counts remain bound. Raw command
+output remains private.
 
 Records also bind the Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
 actual tools, wasm/cwasm/compiler/library bytes, solved configuration,
@@ -268,11 +275,24 @@ cp support/tools/hyperv/local_boot/build.zig \
 zig build --build-file .d/wamr-ci-check/restore/build.zig --fetch=all \
   --cache-dir .d/wamr-ci-check/cache \
   --global-cache-dir .d/wamr-ci-check/global-cache -j2
+SUPERVISOR_SOURCE_SHA256="$(
+  PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+
+path = Path("support/build/wamr-native-ci/run.py").resolve()
+spec = importlib.util.spec_from_file_location("wamr_native_ci", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.supervisor_source_map()["content_closure_sha256"])
+PY
+)"
 zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
   --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
   --cache-dir .d/wamr-ci-check/cache \
   --global-cache-dir .d/wamr-ci-check/global-cache \
   --prefix "$PWD/.d/wamr-ci-check/supervisor" \
+  -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
   -Doptimize=ReleaseSafe -j2 install
 zig build --build-file support/build/wamr-native-ci/build.zig \
   --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
@@ -394,11 +414,14 @@ and source SHA. No attestation or OIDC permission is added.
 There are **no Azure credentials, subscription/VM identities, SAS, grants,
 approval files, campaign state, raw command logs or private diagnostics** in
 the allowlist. Public tiny local serial is expressly authorized here; it is
-not arbitrary private guest output. The portable manifests use relative
-member paths and no operator/account data. Original request bytes retain
-only the validated public CI checkout paths, so their original hashes and
-four local outcomes remain intact. Config/compiler/debug bytes may likewise
-contain public build paths; no paths are rewritten inside original evidence.
+not arbitrary private guest output. The portable manifests use relative member paths and no operator/account data.
+Supervised command requests replace absolute native paths with closed public
+roles (`source`, `runtime`, command work root, exact tool/input and supervisor
+roles) plus bounded repository-relative suffixes. The normalized fields are
+generated directly from the exact native request before execution evidence is
+published; unbound absolute paths refuse. Config/compiler/debug bytes may
+likewise contain public build paths; no paths are rewritten inside original
+non-command evidence.
 
 The ordinary metadata artifact is still published on failure. The public
 image upload is success-only; failed export, cleanup, revalidation or boot
@@ -415,6 +438,15 @@ The exact expected source commit and tree must also be available in the local
 Git object database. The importer resolves both dependency manifests from that
 tree and compares their blob OIDs, bytes and SHA256 values, then recomputes
 manifest, closure, root-metadata and Zig hash-verification summaries.
+Import also requires explicit `--validator` and `--supervisor` paths. It never
+uses ambient environment, `PATH` or sibling inference. The supervisor is
+opened no-follow, checked as the exact executable native ELF (x86-64 on the
+hosted runner) recorded in the
+accepted build, and its independently opened dynamic-runtime objects must have
+the same bounded content set. It is queried under its own supervision for its
+canonical protocol/source-closure identity and compared with the supervisor
+source blobs from the exact expected Git tree before it may launch native
+revalidation.
 
 Package-tree physical metadata and the recorded Zig executions are producer
 observations: their package bytes are intentionally not included in this tiny

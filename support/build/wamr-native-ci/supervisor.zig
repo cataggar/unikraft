@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
+const build_options = @import("build_options");
 const core = @import("hyperv_core");
 const contracts = core.contracts;
 const process = core.process;
@@ -129,6 +130,16 @@ fn run(init: std.process.Init) !void {
     if (args.len == 2 and std.mem.eql(u8, args[1], "--version")) {
         var writer = std.Io.File.stdout().writer(init.io, &.{});
         try writer.interface.writeAll(version_text);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--identity")) {
+        var writer = std.Io.File.stdout().writer(init.io, &.{});
+        try writer.interface.print(
+            "{{\"protocol\":\"uk.wamr.command-supervisor/1 process-command/1\"," ++
+                "\"schema\":\"uk.wamr.command-supervisor-identity\"," ++
+                "\"source_content_closure_sha256\":\"{s}\",\"version\":1}}\n",
+            .{build_options.source_closure_sha256},
+        );
         return;
     }
     if (args.len != 1) {

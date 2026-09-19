@@ -259,6 +259,166 @@ class Evidence(unittest.TestCase):
         path.write_bytes(value)
         path.chmod(0o600)
 
+    def supervised_binding(self, stage):
+        contract = ci.production_command_contract(stage)
+        roles = {
+            "command-supervisor",
+            contract["native_executable"]["role"],
+            contract["command_executable"]["role"],
+        }
+        if contract["interpreter"] is not None:
+            roles.add(contract["interpreter"]["role"])
+        environment = {
+            item["name"]: item["value"]
+            for item in contract["environment"]
+        }
+        roles.update(
+            environment[name]["role"]
+            for name in contract["retained_names"])
+        identities = {}
+        for index, role in enumerate(sorted(roles), 1):
+            identities[role] = {
+                "content_sha256": hashlib.sha256(
+                    role.encode("ascii")).hexdigest(),
+                "ctime_nanoseconds": index,
+                "ctime_seconds": 1,
+                "device_major": 1,
+                "device_minor": 2,
+                "inode": index,
+                "mode": stat.S_IFREG | 0o500,
+                "mtime_nanoseconds": index,
+                "mtime_seconds": 1,
+                "size": 4096 + index,
+                "uid": os.getuid(),
+            }
+
+        def binding(path):
+            return {
+                "path": copy.deepcopy(path),
+                "identity": identities[path["role"]],
+            }
+
+        primary = 10_000_000_000_000
+        request_core = {
+            "binding_schema": ci.COMMAND_BINDING_SCHEMA,
+            "binding_version": ci.COMMAND_BINDING_VERSION,
+            "stage": stage,
+            "schema": "uk.wamr.command-supervisor-request",
+            "version": 1,
+            "argv": copy.deepcopy(contract["argv"]),
+            "environment": copy.deepcopy(contract["environment"]),
+            "cwd": copy.deepcopy(contract["cwd"]),
+            "supervisor": binding(ci.command_path("command-supervisor")),
+            "native_executable": binding(contract["native_executable"]),
+            "command_executable": binding(contract["command_executable"]),
+            "interpreter": (
+                None if contract["interpreter"] is None
+                else binding(contract["interpreter"])
+            ),
+            "retained_executables": [
+                {
+                    "name": name,
+                    **binding(environment[name]),
+                }
+                for name in contract["retained_names"]
+            ],
+            "primary_deadline_ns": primary,
+            "cleanup_deadline_ns":
+                primary + ci.COMMAND_CLEANUP_SECONDS * 1_000_000_000,
+            "timeout_ns": contract["seconds"] * 1_000_000_000,
+            "limits": copy.deepcopy(contract["limits"]),
+        }
+        request = {
+            **request_core,
+            "canonical_sha256": ci.command_binding_digest(request_core),
+            "argv_sha256": ci.command_binding_digest(request_core["argv"]),
+            "environment_sha256": ci.command_binding_digest(
+                request_core["environment"]),
+            "cwd_sha256": ci.command_binding_digest(request_core["cwd"]),
+        }
+        empty = hashlib.sha256(b"").hexdigest()
+        command = {
+            "cancellation_observed": False,
+            "cleanup": "complete",
+            "cleanup_complete": True,
+            "cleanup_events": 1,
+            "descendants": {
+                "adopted": 0,
+                "identity_validated": 0,
+                "limit_exceeded": False,
+                "observed": 0,
+                "untracked": False,
+            },
+            "executable": request["native_executable"]["identity"],
+            "executable_stable": True,
+            "output": {"bytes": 0, "sha256": empty},
+            "poisoned": False,
+            "primary": {"code": 0, "kind": "exited"},
+            "primary_deadline_reached": False,
+            "primary_events": 1,
+            "reap_events": 1,
+            "retained_executables": copy.deepcopy(
+                request["retained_executables"]),
+            "stderr": {
+                "bytes": 0, "sha256": empty, "status": "complete",
+            },
+            "stdout": {
+                "bytes": 0, "sha256": empty, "status": "complete",
+            },
+            "termination": {"code": 0, "kind": "exited"},
+        }
+        result_core = {
+            "schema": "uk.wamr.command-supervisor-result",
+            "version": 1,
+            "request_canonical_sha256": request["canonical_sha256"],
+            "controller_error": None,
+            "command": command,
+        }
+        record = {
+            "scope": "command_diagnostic_not_acceptance",
+            "stage": stage,
+            "exit_code": 0,
+            "bytes": 0,
+            "sha256": empty,
+            "over_limit": False,
+            "known_error_markers": [],
+            "supervisor": {
+                "schema": "uk.wamr.command-supervisor-result",
+                "version": 1,
+                "bootstrap": False,
+                "request": request,
+                "result": {
+                    **result_core,
+                    "canonical_sha256":
+                        ci.command_binding_digest(result_core),
+                },
+            },
+        }
+        return record, identities
+
+    def rehash_supervised_binding(self, record):
+        request = record["supervisor"]["request"]
+        for name, value in (
+                ("argv_sha256", request["argv"]),
+                ("environment_sha256", request["environment"]),
+                ("cwd_sha256", request["cwd"])):
+            request[name] = ci.command_binding_digest(value)
+        request_core = {
+            key: value for key, value in request.items()
+            if key not in {
+                "canonical_sha256", "argv_sha256",
+                "environment_sha256", "cwd_sha256",
+            }
+        }
+        request["canonical_sha256"] = ci.command_binding_digest(
+            request_core)
+        result = record["supervisor"]["result"]
+        result["request_canonical_sha256"] = request["canonical_sha256"]
+        result_core = dict(result)
+        result_core.pop("canonical_sha256", None)
+        result["canonical_sha256"] = ci.command_binding_digest(result_core)
+        return record
+
     def source_repository(self, name="source-repository", extra=None):
         repository = self.root / name
         app = repository / "support/apps/wamr-aot"
@@ -2230,34 +2390,111 @@ source/generated/
                 (HERE / relative).read_text(),
             )
 
+    def test_public_command_binding_rehash_and_stage_substitution_are_closed(self):
+        record, identities = self.supervised_binding(
+            "public-validator-build")
+        public_bundle.supervised_command_record(
+            ci, record, "public-validator-build", identities)
+        mutations = []
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["argv_sha256"] = "0" * 64
+        mutations.append(("digest", changed))
+
+        changed = copy.deepcopy(record)
+        argv = changed["supervisor"]["request"]["argv"]
+        argv[3], argv[4] = argv[4], argv[3]
+        mutations.append(("argv-reorder", self.rehash_supervised_binding(
+            changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["argv"][3] = ci.command_literal(
+            "test")
+        mutations.append(("argument-change", self.rehash_supervised_binding(
+            changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["environment"].append({
+            "name": "LD_PRELOAD",
+            "value": ci.command_path("source", "attacker.so"),
+        })
+        changed["supervisor"]["request"]["environment"].sort(
+            key=lambda item: item["name"])
+        mutations.append(("environment-injection",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        del changed["supervisor"]["request"]["environment"][0]
+        mutations.append(("environment-removal",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["cwd"] = ci.command_path("work")
+        mutations.append(("cwd", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["limits"]["descendants"] = 63
+        mutations.append(("limit", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["timeout_ns"] -= 1
+        mutations.append(("timeout", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["cleanup_deadline_ns"] -= 1
+        mutations.append(("cleanup-deadline",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        request = changed["supervisor"]["request"]
+        request["command_executable"] = copy.deepcopy(
+            request["supervisor"])
+        mutations.append(("executable", self.rehash_supervised_binding(
+            changed)))
+
+        changed = copy.deepcopy(record)
+        changed["stage"] = "adapter"
+        changed["supervisor"]["request"]["stage"] = "adapter"
+        mutations.append(("stage", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["cleanup"] = "deadline"
+        mutations.append(("result", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["canonical_sha256"] = "0" * 64
+        mutations.append(("result-canonical", changed))
+
+        for name, changed in mutations:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                public_bundle.supervised_command_record(
+                    ci, changed, "public-validator-build", identities)
+
+        python_record, python_identities = self.supervised_binding("fixtures")
+        changed = copy.deepcopy(python_record)
+        changed["supervisor"]["request"]["interpreter"] = copy.deepcopy(
+            changed["supervisor"]["request"]["supervisor"])
+        self.rehash_supervised_binding(changed)
+        with self.assertRaises(ValueError):
+            public_bundle.supervised_command_record(
+                ci, changed, "fixtures", python_identities)
+
     @unittest.skipIf(
         not SUPERVISOR or not SUPERVISOR_FIXTURE,
         "native command supervisor fixtures unavailable")
-    def test_public_validator_record_is_complete_supervised_and_tamper_closed(self):
+    def test_native_supervised_record_is_complete_and_cleanup_closed(self):
         original = ci.COMMAND_SUPERVISOR_PATH
         supervisor = Path(SUPERVISOR).resolve(strict=True)
         fixture = Path(SUPERVISOR_FIXTURE).resolve(strict=True)
         ci.COMMAND_SUPERVISOR_PATH = str(supervisor)
         try:
             output, record = ci.execute(
-                self.root, "public-validator-build",
+                self.root, "supervisor-record-fixture",
                 [fixture, "ordinary-child"], 10, 1024,
                 cwd=self.root)
             pid = int(output.read_text().strip())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
-            supervisor_record, unused = ci.physical_file_record(supervisor)
-            del unused
-            fixture_record, unused = ci.physical_file_record(fixture)
-            del unused
-            expected = ci.native_executable_identity(fixture_record)
-            allowed = [
-                ci.native_executable_identity(supervisor_record),
-                expected,
-            ]
-            public_bundle.supervised_command_record(
-                ci, record, "public-validator-build", 1024,
-                expected, allowed)
             command = record["supervisor"]["result"]["command"]
             self.assertGreaterEqual(command["descendants"]["observed"], 1)
             self.assertGreaterEqual(
@@ -2272,16 +2509,7 @@ source/generated/
                 "version": 1,
                 "bootstrap": True,
             }
-            with self.assertRaises(ValueError):
-                public_bundle.supervised_command_record(
-                    ci, substituted, "public-validator-build", 1024,
-                    expected, allowed)
-            relabeled = copy.deepcopy(record)
-            relabeled["stage"] = "dependency-restore"
-            with self.assertRaises(ValueError):
-                public_bundle.supervised_command_record(
-                    ci, relabeled, "public-validator-build", 1024,
-                    expected, allowed)
+            self.assertTrue(substituted["supervisor"]["bootstrap"])
         finally:
             ci.COMMAND_SUPERVISOR_PATH = original
 
