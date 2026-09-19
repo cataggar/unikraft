@@ -17,8 +17,10 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
+import zipfile
 
 HERE = Path(__file__).resolve().parents[1]
 PYTHON = os.environ.get("WAMR_CI_PYTHON", sys.executable)
@@ -120,7 +122,7 @@ class Contract(unittest.TestCase):
         with self.assertRaises(ValueError):
             ci.compute(raw, self.identity, True)
 
-    def test_four_exact_disk_modes_never_hardware_return(self):
+    def test_legacy_four_exact_disk_modes_never_hardware_return(self):
         for index in range(4):
             config = ci.config_for(Path("/runtime"), Path("/runtime/compute"), index)
             args = ci.boot_args(Path("/native-local-boot"), config)
@@ -134,6 +136,33 @@ class Contract(unittest.TestCase):
             self.assertNotIn("--image", args)
             self.assertIn("60", args)
             self.assertIn(ci.MARKER, args)
+
+    def test_current_six_modes_bind_raw_qcow2_and_derived_vhd(self):
+        self.assertEqual(ci.SIX_MODES, (
+            "raw-x2apic", "raw-legacy-apic",
+            "qcow2-x2apic", "qcow2-legacy-apic",
+            "vpc-x2apic", "vpc-legacy-apic",
+        ))
+        expected = (
+            ("raw_disk", "--raw-disk"),
+            ("raw_disk", "--raw-disk"),
+            ("qcow2", "--qcow2"),
+            ("qcow2", "--qcow2"),
+            ("fixed_vhd", "--fixed-vhd"),
+            ("fixed_vhd", "--fixed-vhd"),
+        )
+        for index, (kind, flag) in enumerate(expected):
+            with self.subTest(mode=ci.SIX_MODES[index]):
+                config = ci.config_for(
+                    Path("/runtime"), Path("/runtime/compute"), index,
+                    ci.SIX_MODES)
+                args = ci.boot_args(Path("/native-local-boot"), config)
+                self.assertEqual(config["source"]["kind"], kind)
+                self.assertIn(flag, args)
+                self.assertEqual(
+                    "--disable-x2apic" in args, bool(index % 2))
+                self.assertEqual(config["expect_main_return"], 0)
+                self.assertEqual(config["cpus"], 1)
 
     def test_build_refuses_development_and_optional_images(self):
         identity = {
@@ -671,6 +700,149 @@ class Evidence(unittest.TestCase):
                 ci.boot_input_state(
                     inputs, {"qemu": boot}, content=False, expected=forged)
 
+    def test_v2_public_archive_is_closed_ordered_and_not_downgradable(self):
+        handoff = types.SimpleNamespace(
+            ci=ci,
+            V2_NAMES=(
+                "efi", "debug_elf", "bootinfo", "raw", "qcow2", "vhd",
+                "runtime", "compiler", "wasm", "cwasm", "config",
+                "runtime_identity", "image_identity", "local_result",
+                "package", "build", "build_start", "boot_inputs",
+                "qcow2_finalization_intent", "qcow2_finalization",
+                "qcow2_acceptance", "fixed_vhd_derivation_intent",
+                "fixed_vhd_derivation_gate", "fixed_vhd_derivation",
+                "final_inspection", "cleanup",
+            ),
+        )
+        sha256 = hashlib.sha256(b"x").hexdigest()
+        item = lambda path: {
+            "path": path, "size": 1, "sha256": sha256}
+        artifacts = [
+            item("artifacts/" + name) for name in handoff.V2_NAMES]
+        by_name = dict(zip(handoff.V2_NAMES, artifacts))
+        boots = [
+            {
+                "mode": mode,
+                **{
+                    key: item(f"boots/{mode}/{key}")
+                    for key in public_bundle.BOOT_KEYS
+                },
+            }
+            for mode in ci.SIX_MODES
+        ]
+        evidence = [
+            item("evidence/" + name)
+            for name in sorted(public_bundle.V2_EVIDENCE)
+        ]
+        bundle = {
+            "schema": "uk.wamr.local-image-handoff",
+            "version": 2,
+            "profile": ci.CURRENT_PROFILE,
+            "authority": "not_admitted",
+            "source_revision": "1" * 40,
+            "source_tree": "2" * 40,
+            "run": {
+                "repository": "cataggar/unikraft",
+                "run_id": "123",
+                "run_attempt": "1",
+            },
+            "identity": {
+                "wamr_revision": ci.REVISION,
+                **{
+                    name + "_sha256": sha256
+                    for name in (
+                        "wasm", "cwasm", "runtime", "compiler", "config")
+                },
+            },
+            "lineage": {
+                "raw_sha256": by_name["raw"]["sha256"],
+                "accepted_qcow2_sha256": by_name["qcow2"]["sha256"],
+                "derived_vhd_sha256": by_name["vhd"]["sha256"],
+                "qcow2_finalization_sha256":
+                    by_name["qcow2_finalization"]["sha256"],
+                "qcow2_acceptance_sha256":
+                    by_name["qcow2_acceptance"]["sha256"],
+                "fixed_vhd_derivation_gate_sha256":
+                    by_name["fixed_vhd_derivation_gate"]["sha256"],
+                "fixed_vhd_derivation_sha256":
+                    by_name["fixed_vhd_derivation"]["sha256"],
+                "final_inspection_sha256":
+                    by_name["final_inspection"]["sha256"],
+            },
+            "artifacts": artifacts,
+            "boots": boots,
+            "evidence": evidence,
+        }
+        selected = public_bundle.members(handoff, bundle)
+        self.assertEqual(len(public_bundle.EVIDENCE), 20)
+        self.assertEqual(len(public_bundle.V2_EVIDENCE), 33)
+        self.assertEqual(public_bundle.V1_ZIP_MEMBERS, 55)
+        self.assertEqual(public_bundle.V2_ZIP_MEMBERS, 85)
+        self.assertEqual(public_bundle.MAX_MEMBERS, 96)
+        self.assertEqual(len(selected) + 2, 85)
+
+        source = {
+            "repository": "cataggar/unikraft",
+            "run_id": "123", "run_attempt": "1",
+            "source_revision": bundle["source_revision"],
+            "source_tree": bundle["source_tree"],
+            "wamr_revision": ci.REVISION,
+        }
+        manifest = {
+            "schema": "uk.wamr.public-source-bundle",
+            "version": 2,
+            "profile": ci.CURRENT_PROFILE,
+            "authority": "not_admitted",
+            "source": source,
+            "members": {
+                name: {"size": value["size"], "sha256": value["sha256"]}
+                for name, value in selected.items()
+            },
+        }
+
+        def archive(path, names):
+            with zipfile.ZipFile(
+                    path, "w", compression=zipfile.ZIP_STORED,
+                    allowZip64=False) as output:
+                for name in names:
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFREG | 0o600) << 16
+                    raw = (
+                        public_bundle.encoded(bundle)
+                        if name == "bundle.json" else
+                        public_bundle.encoded(manifest)
+                        if name == "public-source.json" else b"x"
+                    )
+                    output.writestr(info, raw)
+            path.chmod(0o600)
+
+        correct = (
+            sorted(selected) + ["bundle.json", "public-source.json"])
+        good = self.root / "v2-good.zip"
+        archive(good, correct)
+        public_bundle.verify_archive(
+            handoff, good, source, ci.digest(good))
+        for name, names in (
+                ("duplicate", correct[:1] + correct),
+                ("unlisted", sorted(selected) + ["extra"]
+                 + ["bundle.json", "public-source.json"]),
+                ("reordered", list(reversed(sorted(selected)))
+                 + ["bundle.json", "public-source.json"])):
+            with self.subTest(name=name):
+                bad = self.root / f"v2-{name}.zip"
+                archive(bad, names)
+                with self.assertRaises(ValueError):
+                    public_bundle.verify_archive(
+                        handoff, bad, source, ci.digest(bad))
+        for key, value in (
+                ("version", 1),
+                ("profile", "tiny-aot-two-boot")):
+            downgraded = copy.deepcopy(bundle)
+            downgraded[key] = value
+            with self.subTest(downgrade=key), self.assertRaises(ValueError):
+                public_bundle.members(handoff, downgraded)
+
     def test_public_bundle_accepts_only_fixed_ci_runtime_roots(self):
         runtime_owner = type("RuntimeOwner", (), {"REPO": ci.REPO})
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -875,6 +1047,7 @@ class Evidence(unittest.TestCase):
         validator_record = {"fixture": "fully supervised"}
         handoff = mock.Mock()
         handoff.ci = ci
+        handoff.export.return_value = {"version": 2}
         events = []
 
         def accept(unused_handoff, actual_runtime):

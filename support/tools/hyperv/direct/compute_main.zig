@@ -21,11 +21,18 @@ fn run(init: std.process.Init) !void {
     if (args.len == 3 and std.mem.eql(u8, args[1], "handoff")) {
         var bytes = try core.private_files.readSensitiveAbsolute(init.io, a, args[2], 65536, null);
         defer bytes.deinit();
-        const bundle = try compute.parse(compute.Bundle, a, bytes.bytes());
-        defer bundle.deinit();
-        try compute.verifyBundle(a, init.io, bundle.value);
+        try compute.verifyHandoff(a, init.io, bytes.bytes());
         var writer = std.Io.File.stdout().writerStreaming(init.io, &.{});
         try writer.interface.writeAll("Compute handoff revalidated; authority=not_admitted.\n");
+        return;
+    }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "candidate")) {
+        const candidate = try compute.loadCandidateScope(a, init.io, args[2]);
+        defer candidate.deinit();
+        if (candidate.value.authority != .not_admitted) return error.InvalidScope;
+        try compute.inspect(a, init.io, candidate.value);
+        var writer = std.Io.File.stdout().writerStreaming(init.io, &.{});
+        try writer.interface.writeAll("Compute candidate revalidated; authority=not_admitted.\n");
         return;
     }
     const scope = try compute.loadScope(a, init.io, args[2]);

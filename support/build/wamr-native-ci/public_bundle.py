@@ -13,8 +13,10 @@ import subprocess
 import zipfile
 
 MAX_TOTAL = 512 * 1024 * 1024
-MAX_MEMBERS = 64
+MAX_MEMBERS = 96
 MAX_JSON = 65536
+V1_ZIP_MEMBERS = 55
+V2_ZIP_MEMBERS = 85
 LEGACY_V1_SOURCES = frozenset({
     ("993e4d0d394c08202c0d0c57ea97450a19a4f394",
      "54f8e118146c78c24e7c802657c6ec62b268a5de"),
@@ -40,6 +42,27 @@ EVIDENCE = frozenset(
     ["build-start.json", "build.json", "boot-inputs.json", "package.json"]
     + [f"command-{stage}.json" for stage in STAGES]
     + [f"{mode}-compute.json" for mode in STAGES[7:11]])
+V2_STAGES = (
+    "adapter", "local-boot-tool", "fixtures", "prepare", "config",
+    "native-image", "package",
+    "raw-x2apic", "raw-legacy-apic", "finalize-qcow2",
+    "qcow2-x2apic", "qcow2-legacy-apic", "derive-fixed-vhd",
+    "vpc-x2apic", "vpc-legacy-apic", "inspect",
+)
+V2_CHAIN_RECORDS = frozenset({
+    "qcow2-finalization-intent.json", "qcow2-finalization.json",
+    "qcow2-acceptance.json", "fixed-vhd-derivation-intent.json",
+    "fixed-vhd-derivation-gate.json", "fixed-vhd-derivation.json",
+    "final-inspection.json",
+})
+V2_EVIDENCE = frozenset(
+    ["build-start.json", "build.json", "boot-inputs.json", "package.json"]
+    + [f"command-{stage}.json" for stage in V2_STAGES]
+    + [f"{mode}-compute.json" for mode in (
+        "raw-x2apic", "raw-legacy-apic",
+        "qcow2-x2apic", "qcow2-legacy-apic",
+        "vpc-x2apic", "vpc-legacy-apic")]
+) | V2_CHAIN_RECORDS
 SENSITIVE = (
     b"-----BEGIN PRIVATE KEY", b"-----BEGIN RSA PRIVATE KEY",
     b"Authorization: Bearer ", b"AccountKey=", b"SharedAccessSignature=",
@@ -213,9 +236,10 @@ def executable_identity(value):
 
 
 def supervised_command_record(
-        ci, value, stage, role_identities, transport_context):
+        ci, value, stage, role_identities, transport_context,
+        profile="qcow2-derived-vhd"):
     ci.validate_supervised_command_binding(
-        value, stage, role_identities, transport_context)
+        value, stage, role_identities, transport_context, profile)
     request = value["supervisor"]["request"]
     bindings = [
         request["supervisor"],
@@ -678,6 +702,8 @@ def accepted_public_build_start(handoff, runtime):
 
 def members(handoff, bundle, root=None):
     """Closed positional schema; paths never select additional publication members."""
+    if bundle.get("version") == 2:
+        return members_v2(handoff, bundle, root)
     require(set(bundle) == {"schema", "version", "authority", "source_revision",
                            "source_tree", "identity", "artifacts", "boots", "evidence"})
     require(bundle["schema"] == "uk.wamr.local-image-handoff"
@@ -710,8 +736,93 @@ def members(handoff, bundle, root=None):
             add(f"boots/{mode}/{key}", boot[key], 4 * 1024 * 1024 if key == "serial" else MAX_JSON)
     for name, item in zip(sorted(EVIDENCE), bundle["evidence"]):
         add("evidence/" + name, item, MAX_JSON)
-    require(len(result) + 2 <= MAX_MEMBERS
+    require(len(result) + 2 == V1_ZIP_MEMBERS
+            and len(result) + 2 <= MAX_MEMBERS
             and sum(item["size"] for item in result.values()) <= MAX_TOTAL - 2 * MAX_JSON)
+    return result
+
+
+def members_v2(handoff, bundle, root=None):
+    require(set(bundle) == {
+        "schema", "version", "profile", "authority", "source_revision",
+        "source_tree", "run", "identity", "lineage", "artifacts", "boots",
+        "evidence",
+    })
+    require(bundle["schema"] == "uk.wamr.local-image-handoff"
+            and type(bundle["version"]) is int and bundle["version"] == 2
+            and bundle["profile"] == handoff.ci.CURRENT_PROFILE
+            and bundle["authority"] == "not_admitted")
+    require(set(bundle["run"]) == {
+        "repository", "run_id", "run_attempt",
+    } and bundle["run"]["repository"] == "cataggar/unikraft")
+    for key in ("run_id", "run_attempt"):
+        require(type(bundle["run"][key]) is str
+                and re.fullmatch(r"[1-9][0-9]{0,19}", bundle["run"][key]))
+    require(set(bundle["identity"]) == {
+        "wamr_revision", "wasm_sha256", "cwasm_sha256",
+        "runtime_sha256", "compiler_sha256", "config_sha256"})
+    for name, value in bundle["identity"].items():
+        require(type(value) is str and re.fullmatch(
+            r"[0-9a-f]{40}" if name == "wamr_revision" else r"[0-9a-f]{64}",
+            value))
+    require(set(bundle["lineage"]) == {
+        "raw_sha256", "accepted_qcow2_sha256", "derived_vhd_sha256",
+        "qcow2_finalization_sha256", "qcow2_acceptance_sha256",
+        "fixed_vhd_derivation_gate_sha256",
+        "fixed_vhd_derivation_sha256", "final_inspection_sha256",
+    })
+    for value in bundle["lineage"].values():
+        digest_string(value)
+    require(len(bundle["artifacts"]) == len(handoff.V2_NAMES)
+            and len(bundle["boots"]) == 6
+            and len(bundle["evidence"]) == len(V2_EVIDENCE))
+    result = {}
+
+    def add(name, item, maximum):
+        require(set(item) == {"path", "sha256", "size"}
+                and item["path"] == (str(root / name) if root else name)
+                and type(item["size"]) is int and 0 < item["size"] <= maximum
+                and type(item["sha256"]) is str
+                and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]))
+        require(name not in result)
+        result[name] = item
+
+    large = {
+        "efi", "debug_elf", "bootinfo", "raw", "qcow2", "vhd",
+        "runtime", "compiler", "wasm", "cwasm",
+    }
+    for name, item in zip(handoff.V2_NAMES, bundle["artifacts"]):
+        maximum = (
+            256 * 1024 * 1024 + 512 if name in large else
+            1024 * 1024 if name == "config" else MAX_JSON
+        )
+        add("artifacts/" + name, item, maximum)
+    for mode, boot in zip(handoff.ci.SIX_MODES, bundle["boots"]):
+        require(set(boot) == {"mode", *BOOT_KEYS} and boot["mode"] == mode)
+        for key in BOOT_KEYS:
+            add(
+                f"boots/{mode}/{key}", boot[key],
+                4 * 1024 * 1024 if key == "serial" else MAX_JSON)
+    for name, item in zip(sorted(V2_EVIDENCE), bundle["evidence"]):
+        add("evidence/" + name, item, MAX_JSON)
+    by_name = dict(zip(handoff.V2_NAMES, bundle["artifacts"]))
+    require(bundle["lineage"] == {
+        "raw_sha256": by_name["raw"]["sha256"],
+        "accepted_qcow2_sha256": by_name["qcow2"]["sha256"],
+        "derived_vhd_sha256": by_name["vhd"]["sha256"],
+        "qcow2_finalization_sha256":
+            by_name["qcow2_finalization"]["sha256"],
+        "qcow2_acceptance_sha256": by_name["qcow2_acceptance"]["sha256"],
+        "fixed_vhd_derivation_sha256":
+            by_name["fixed_vhd_derivation"]["sha256"],
+        "fixed_vhd_derivation_gate_sha256":
+            by_name["fixed_vhd_derivation_gate"]["sha256"],
+        "final_inspection_sha256": by_name["final_inspection"]["sha256"],
+    })
+    require(len(result) + 2 == V2_ZIP_MEMBERS
+            and len(result) + 2 <= MAX_MEMBERS
+            and sum(item["size"] for item in result.values())
+            <= MAX_TOTAL - 2 * MAX_JSON)
     return result
 
 
@@ -941,12 +1052,169 @@ def require_consumer_tree_roles(value, legacy):
     require("system-bin" not in roles or legacy)
 
 
-def publication_records(handoff, stage, source, transport_context):
+def publication_lineage_v2(handoff, stage, bundle):
+    ci = handoff.ci
+    by_name = dict(zip(handoff.V2_NAMES, bundle["artifacts"]))
+    package = ci.document(stage / "evidence/package.json")
+    boot_inputs = ci.document(stage / "evidence/boot-inputs.json")
+    package_tool = boot_inputs["files"]["package_tool"]
+    finalization = ci.document(stage / "evidence/qcow2-finalization.json")
+    ci.require_qcow2_finalization(
+        finalization, package["image"]["raw"], package["image"]["efi"],
+        package_tool)
+    require(finalization == ci.document(
+        stage / "artifacts/qcow2_finalization"))
+    require(finalization["output"]["sha256"] == by_name["qcow2"]["sha256"]
+            and finalization["output"]["file_bytes"]
+            == by_name["qcow2"]["size"])
+    finalize_intent = ci.document(
+        stage / "evidence/qcow2-finalization-intent.json")
+    require(finalize_intent == ci.document(
+        stage / "artifacts/qcow2_finalization_intent")
+            and finalize_intent["expected_source_sha256"]
+            == by_name["raw"]["sha256"]
+            and finalize_intent["expected_source_bytes"]
+            == by_name["raw"]["size"])
+
+    acceptance = ci.document(stage / "evidence/qcow2-acceptance.json")
+    require(set(acceptance) == {
+        "schema", "schema_version", "profile", "status", "source",
+        "accepted_qcow2", "finalization_sha256", "modes", "boots",
+        "build_sha256", "boot_inputs_sha256",
+    } and acceptance["schema"] == "uk.wamr.compute-qcow2-acceptance"
+      and acceptance["schema_version"] == 1
+      and acceptance["profile"] == ci.CURRENT_PROFILE
+      and acceptance["status"] == "accepted"
+      and acceptance["source"] == {
+          "revision": bundle["source_revision"],
+          "tree": bundle["source_tree"],
+      }
+      and acceptance["modes"] == list(ci.SIX_MODES[:4])
+      and set(acceptance["boots"]) == set(ci.SIX_MODES[:4])
+      and acceptance["finalization_sha256"]
+      == by_name["qcow2_finalization"]["sha256"]
+      and acceptance["accepted_qcow2"]["sha256"]
+      == by_name["qcow2"]["sha256"]
+      and acceptance["accepted_qcow2"]["file_bytes"]
+      == by_name["qcow2"]["size"]
+      and acceptance["build_sha256"] == by_name["build"]["sha256"]
+      and acceptance["boot_inputs_sha256"]
+      == by_name["boot_inputs"]["sha256"])
+    require(acceptance == ci.document(stage / "artifacts/qcow2_acceptance"))
+    boots = {boot["mode"]: boot for boot in bundle["boots"]}
+    for mode in ci.SIX_MODES[:4]:
+        observed = acceptance["boots"][mode]
+        require(set(observed) == {
+            "request_sha256", "report_sha256", "serial_sha256",
+            "compute_sha256",
+        } and observed["request_sha256"] == boots[mode]["request"]["sha256"]
+          and observed["report_sha256"] == boots[mode]["report"]["sha256"]
+          and observed["serial_sha256"] == boots[mode]["serial"]["sha256"]
+          and observed["compute_sha256"] == boots[mode]["compute"]["sha256"])
+
+    derive_intent = ci.document(
+        stage / "evidence/fixed-vhd-derivation-intent.json")
+    require(derive_intent == ci.document(
+        stage / "artifacts/fixed_vhd_derivation_intent")
+            and derive_intent["accepted_qcow2_sha256"]
+            == by_name["qcow2"]["sha256"]
+            and derive_intent["expected_source_bytes"]
+            == by_name["qcow2"]["size"])
+    gate = ci.document(
+        stage / "evidence/fixed-vhd-derivation-gate.json")
+    require(set(gate) == {
+        "schema", "schema_version", "profile", "status",
+        "accepted_qcow2_sha256", "qcow2_acceptance_sha256",
+        "derivation_intent_sha256", "derived_output_absent",
+    } and gate["schema"] == "uk.wamr.compute-fixed-vhd-derivation-gate"
+      and gate["schema_version"] == 1
+      and gate["profile"] == ci.CURRENT_PROFILE
+      and gate["status"] == "accepted_qcow2_only"
+      and gate["accepted_qcow2_sha256"] == by_name["qcow2"]["sha256"]
+      and gate["qcow2_acceptance_sha256"]
+      == by_name["qcow2_acceptance"]["sha256"]
+      and gate["derivation_intent_sha256"]
+      == by_name["fixed_vhd_derivation_intent"]["sha256"]
+      and gate["derived_output_absent"] is True)
+    require(gate == ci.document(
+        stage / "artifacts/fixed_vhd_derivation_gate"))
+
+    derivation = ci.document(
+        stage / "evidence/fixed-vhd-derivation.json")
+    ci.require_vhd_derivation(
+        derivation, acceptance["accepted_qcow2"], package_tool,
+        package["image"]["raw"], finalization["identity"])
+    require(derivation == ci.document(
+        stage / "artifacts/fixed_vhd_derivation")
+            and derivation["output"]["sha256"] == by_name["vhd"]["sha256"]
+            and derivation["output"]["file_bytes"] == by_name["vhd"]["size"])
+
+    inspection = ci.document(stage / "evidence/final-inspection.json")
+    require(set(inspection) == {
+        "schema", "schema_version", "profile", "status", "source",
+        "artifacts", "records", "modes", "boots",
+    } and inspection["schema"] == "uk.wamr.compute-image-chain-inspection"
+      and inspection["schema_version"] == 1
+      and inspection["profile"] == ci.CURRENT_PROFILE
+      and inspection["status"] == "complete"
+      and inspection["source"] == acceptance["source"]
+      and inspection["modes"] == list(ci.SIX_MODES)
+      and set(inspection["boots"]) == set(ci.SIX_MODES)
+      and set(inspection["artifacts"]) == {"efi", "raw", "qcow2", "vhd"})
+    for name in ("efi", "raw", "qcow2", "vhd"):
+        require(inspection["artifacts"][name]["sha256"]
+                == by_name[name]["sha256"]
+                and inspection["artifacts"][name]["file_bytes"]
+                == by_name[name]["size"])
+    for mode in ci.SIX_MODES:
+        observed = inspection["boots"][mode]
+        require(observed["request_sha256"] == boots[mode]["request"]["sha256"]
+                and observed["report_sha256"]
+                == boots[mode]["report"]["sha256"]
+                and observed["serial_sha256"]
+                == boots[mode]["serial"]["sha256"]
+                and observed["compute_sha256"]
+                == boots[mode]["compute"]["sha256"])
+    record_roles = {
+        "build-start.json": "build_start",
+        "build.json": "build",
+        "boot-inputs.json": "boot_inputs",
+        "package.json": "package",
+        "qcow2-finalization-intent.json": "qcow2_finalization_intent",
+        "qcow2-finalization.json": "qcow2_finalization",
+        "qcow2-acceptance.json": "qcow2_acceptance",
+        "fixed-vhd-derivation-intent.json":
+            "fixed_vhd_derivation_intent",
+        "fixed-vhd-derivation-gate.json": "fixed_vhd_derivation_gate",
+        "fixed-vhd-derivation.json": "fixed_vhd_derivation",
+    }
+    require(set(inspection["records"]) == set(record_roles))
+    for filename, role in record_roles.items():
+        require(inspection["records"][filename] == by_name[role]["sha256"])
+    require(inspection == ci.document(stage / "artifacts/final_inspection")
+            and ci.read(stage / "artifacts/cleanup", 128)
+            == b"primary=0 cleanup=0\n")
+
+
+def publication_records(
+        handoff, stage, source, transport_context,
+        bundle_name="bundle.json"):
     """The uploaded originals must be the successful fixed public lane records."""
     ci = handoff.ci
+    bundle = ci.document(stage / bundle_name)
+    version = bundle["version"]
+    evidence_names = EVIDENCE if version == 1 else V2_EVIDENCE
+    modes = ci.MODES if version == 1 else ci.SIX_MODES
+    profile = (
+        "tiny-aot-two-boot"
+        if version == 1 else ci.CURRENT_PROFILE)
     value = ci.document(stage / "artifacts/local_result")
-    require(set(value["records"]) == EVIDENCE
-            and value["passed"] is True and value["cloud_authority"] == "not_admitted")
+    require(set(value["records"]) == evidence_names
+            and value["schema_version"] == version
+            and value["passed"] is True
+            and value["cloud_authority"] == "not_admitted"
+            and value["modes"] == list(modes)
+            and (version == 1 or value["profile"] == ci.CURRENT_PROFILE))
     build = ci.document(stage / "artifacts/build")
     expected_source = {
         "revision": source["source_revision"],
@@ -955,10 +1223,10 @@ def publication_records(handoff, stage, source, transport_context):
     require(build["source"] == expected_source)
     start = ci.document(stage / "evidence/build-start.json")
     require(start["source"] == expected_source)
-    legacy = (
+    legacy = version == 1 and (
         source["source_revision"], source["source_tree"]
     ) in LEGACY_V1_SOURCES
-    pre_supervisor = pre_supervisor_source(source)
+    pre_supervisor = version == 1 and pre_supervisor_source(source)
     if "dependencies" not in start:
         require(legacy and "source_custody" not in start
                 and "consumer_inputs" not in start)
@@ -1009,7 +1277,7 @@ def publication_records(handoff, stage, source, transport_context):
             "input:local_boot_tool": ci.native_executable_identity(
                 boot_inputs["files"]["local_boot_tool"]),
         }
-    for name in sorted(EVIDENCE):
+    for name in sorted(evidence_names):
         item = ci.document(stage / "evidence" / name)
         if name.startswith("command-"):
             expected_fields = {
@@ -1030,8 +1298,11 @@ def publication_records(handoff, stage, source, transport_context):
                 command_stage = name[len("command-"):-len(".json")]
                 supervised_command_record(
                     ci, item, command_stage, role_identities,
-                    transport_context)
-    for mode in ci.MODES:
+                    transport_context, profile=profile)
+    by_name = dict(zip(
+        handoff.NAMES if version == 1 else handoff.V2_NAMES,
+        bundle["artifacts"]))
+    for mode in modes:
         request = ci.document(stage / "boots" / mode / "request")
         require(set(request) == {
             "schema_version", "supervisor_pid", "config", "pins",
@@ -1082,7 +1353,8 @@ def publication_records(handoff, stage, source, transport_context):
             ci.REPO / ".d/wamr-native-runtime",
             Path("/d/wamr-ci/wamr-native-runtime"),
         ))
-        require(cfg == ci.config_for(runtime, runtime / "compute", ci.MODES.index(mode)))
+        require(cfg == ci.config_for(
+            runtime, runtime / "compute", modes.index(mode), modes))
         if request["schema_version"] == 2:
             for index, name in enumerate(("ovmf_code", "ovmf_vars", "qemu"), 1):
                 require(name in boot_inputs["files"])
@@ -1109,6 +1381,18 @@ def publication_records(handoff, stage, source, transport_context):
                 })
             compute = ci.document(stage / "boots" / mode / "compute")
             require(compute["input_pins"] == request["pins"])
+        require(request["pins"][0]["size"]
+                == by_name[
+                    "raw" if mode.startswith("raw-") else
+                    "qcow2" if mode.startswith("qcow2-") else
+                    "vhd"]["size"])
+        require(bytes(request["pins"][0]["sha256"]).hex()
+                == by_name[
+                    "raw" if mode.startswith("raw-") else
+                    "qcow2" if mode.startswith("qcow2-") else
+                    "vhd"]["sha256"])
+    if version == 2:
+        publication_lineage_v2(handoff, stage, bundle)
 
 
 def pack(handoff, stage, archive, source, validator, supervisor):
@@ -1120,6 +1404,12 @@ def pack(handoff, stage, archive, source, validator, supervisor):
     require(bundle["source_revision"] == source["source_revision"]
             and bundle["source_tree"] == source["source_tree"]
             and bundle["identity"]["wamr_revision"] == source["wamr_revision"])
+    if bundle["version"] == 2:
+        require(bundle["run"] == {
+            "repository": source["repository"],
+            "run_id": source["run_id"],
+            "run_attempt": source["run_attempt"],
+        })
     handoff.FAILURE_STAGE = "public-pack-members"
     original = members(handoff, bundle, stage)
     handoff.FAILURE_STAGE = "public-pack-records"
@@ -1142,10 +1432,13 @@ def pack(handoff, stage, archive, source, validator, supervisor):
     for item in members(handoff, portable, stage).values():
         item["path"] = Path(item["path"]).relative_to(stage).as_posix()
     selected = members(handoff, portable)
-    manifest = dict(schema="uk.wamr.public-source-bundle", version=1,
-                    authority="not_admitted", source=source,
-                    members={name: {key: item[key] for key in ("size", "sha256")}
-                             for name, item in selected.items()})
+    manifest = dict(
+        schema="uk.wamr.public-source-bundle", version=bundle["version"],
+        authority="not_admitted", source=source,
+        members={name: {key: item[key] for key in ("size", "sha256")}
+                 for name, item in selected.items()})
+    if bundle["version"] == 2:
+        manifest["profile"] = handoff.ci.CURRENT_PROFILE
     bundle_bytes, manifest_bytes = encoded(portable), encoded(manifest)
     require(len(bundle_bytes) <= MAX_JSON and len(manifest_bytes) <= MAX_JSON)
     handoff.FAILURE_STAGE = "public-pack-zip"
@@ -1207,10 +1500,18 @@ def verify_archive_descriptor(handoff, handle, expected,
         bundle = decode(bundle_raw)
         manifest = decode(manifest_raw)
         selected = members(handoff, bundle)
-        require(names == set(selected) | {"bundle.json", "public-source.json"})
-        require(set(manifest) == {"schema", "version", "authority", "source", "members"}
+        expected_order = (
+            sorted(selected) + ["bundle.json", "public-source.json"])
+        require([info.filename for info in entries] == expected_order
+                and names == set(selected) | {"bundle.json", "public-source.json"})
+        manifest_fields = {
+            "schema", "version", "authority", "source", "members"}
+        if bundle["version"] == 2:
+            manifest_fields.add("profile")
+        require(set(manifest) == manifest_fields
                 and manifest["schema"] == "uk.wamr.public-source-bundle"
-                and type(manifest["version"]) is int and manifest["version"] == 1
+                and type(manifest["version"]) is int
+                and manifest["version"] == bundle["version"]
                 and manifest["authority"] == "not_admitted"
                 and context(manifest["source"]) == expected
                 and bundle["source_revision"] == expected["source_revision"]
@@ -1219,6 +1520,13 @@ def verify_archive_descriptor(handoff, handle, expected,
                 and manifest["members"] == {
                     name: {key: item[key] for key in ("size", "sha256")}
                     for name, item in selected.items()})
+        if bundle["version"] == 2:
+            require(manifest["profile"] == handoff.ci.CURRENT_PROFILE
+                    and bundle["run"] == {
+                        "repository": expected["repository"],
+                        "run_id": expected["run_id"],
+                        "run_attempt": expected["run_attempt"],
+                    })
         for name, item in selected.items():
             require(zipped.getinfo(name).file_size == item["size"])
             with zipped.open(name) as stream:
@@ -1251,7 +1559,7 @@ def verify_archive(handoff, archive, expected, expected_archive_sha256):
 
 def import_bundle(
         handoff, archive, output, expected, expected_archive_sha256,
-        validator, supervisor):
+        validator, supervisor, artifact_id=None, container_digest=None):
     handoff.private(output.parent)
     with retained_archive(
             handoff, archive, expected_archive_sha256) as (
@@ -1279,8 +1587,30 @@ def import_bundle(
                 )
     for item in members(handoff, bundle).values():
         item["path"] = str(output / item["path"])
-    publication_records(handoff, output, expected, "trusted_inner_zip")
+    if bundle["version"] == 2:
+        require(expected_archive_sha256 is not None
+                and type(artifact_id) is str
+                and re.fullmatch(r"[1-9][0-9]{0,19}", artifact_id)
+                and type(container_digest) is str)
+        digest_string(container_digest)
+        handoff.ci.save(output / "transport.json", {
+            "schema": "uk.wamr.public-source-transport",
+            "version": 2,
+            "repository": expected["repository"],
+            "run_id": expected["run_id"],
+            "run_attempt": expected["run_attempt"],
+            "source_revision": expected["source_revision"],
+            "source_tree": expected["source_tree"],
+            "inner_zip_sha256": expected_archive_sha256,
+            "artifact_id": artifact_id,
+            "container_digest": container_digest,
+        })
+    else:
+        require(artifact_id is None and container_digest is None)
     handoff.ci.save(output / "candidate-bundle.json", bundle)
+    publication_records(
+        handoff, output, expected, "trusted_inner_zip",
+        "candidate-bundle.json")
     native(
         handoff, validator, supervisor,
         output / "candidate-bundle.json", expected)
@@ -1341,7 +1671,7 @@ def publish_ci(handoff):
 
     require_validator_record()
     handoff.FAILURE_STAGE = "public-export"
-    handoff.export(runtime, stage)
+    exported = handoff.export(runtime, stage)
     require_validator_record()
     validator = publication / "tools/bin/uk-wamr-direct-validate"
     supervisor = Path(handoff.ci.COMMAND_SUPERVISOR_PATH)
@@ -1349,11 +1679,13 @@ def publish_ci(handoff):
     handoff.FAILURE_STAGE = "public-pack"
     archive_sha256 = pack(
         handoff, stage, archive, source, validator, supervisor)
-    # Re-extract and run the actual production checker on the exported archive.
-    handoff.FAILURE_STAGE = "public-reopen"
-    import_bundle(
-        handoff, archive, publication / "reopened",
-        source, archive_sha256, validator, supervisor)
+    # V2 production import is intentionally deferred until the exact uploaded
+    # artifact ID has been redownloaded and its container digest is available.
+    if exported["version"] == 1:
+        handoff.FAILURE_STAGE = "public-reopen"
+        import_bundle(
+            handoff, archive, publication / "reopened",
+            source, archive_sha256, validator, supervisor)
     handoff.FAILURE_STAGE = "public-final-context"
     require_validator_record()
     return archive, archive_sha256, source["source_tree"]

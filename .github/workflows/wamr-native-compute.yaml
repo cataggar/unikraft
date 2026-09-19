@@ -16,6 +16,7 @@ jobs:
     timeout-minutes: 60
     outputs:
       inner-zip-sha256: ${{ steps.public_binding.outputs.inner_zip_sha256 }}
+      inner-zip-bytes: ${{ steps.public_binding.outputs.inner_zip_bytes }}
       container-digest: ${{ steps.public_binding.outputs.container_digest }}
       artifact-id: ${{ steps.public_binding.outputs.artifact_id }}
       artifact-url: ${{ steps.public_binding.outputs.artifact_url }}
@@ -137,7 +138,7 @@ jobs:
           python3 support/build/wamr-native-ci/run.py build --runtime "${root}" \
             --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
 
-      - name: Boot the exact raw and full fixed VHD under both APIC configurations
+      - name: Run raw QCOW2 and derived fixed VHD under both APIC configurations
         timeout-minutes: 15
         env:
           QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
@@ -262,78 +263,6 @@ jobs:
             printf '%s\n' "${verified}" |
               sed -n 's/^Public source archive SHA-256: //p'
           )" = "${archive_sha256}"
-          cli_parent="${root}/compute/public-source/fresh-cli"
-          mkdir -m 700 "${cli_parent}"
-          validator="${root}/compute/public-source/tools/bin/uk-wamr-direct-validate"
-          supervisor="${root}/compute/supervisor/bin/wamr-ci-supervisor"
-          python3 support/build/wamr-native-ci/handoff.py \
-            import-public-source-bundle \
-            --archive "${upload_file}" \
-            --output "${cli_parent}/success" \
-            --expected-source "${GITHUB_SHA}" \
-            --expected-tree "${source_tree}" \
-            --expected-archive-sha256 "${archive_sha256}" \
-            --run-id "${GITHUB_RUN_ID}" \
-            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-            --validator "${validator}" \
-            --supervisor "${supervisor}"
-          if WAMR_CI_SUPERVISOR="${supervisor}" \
-            python3 support/build/wamr-native-ci/handoff.py \
-              import-public-source-bundle \
-              --archive "${upload_file}" \
-              --output "${cli_parent}/ambient-refused" \
-              --expected-source "${GITHUB_SHA}" \
-              --expected-tree "${source_tree}" \
-              --expected-archive-sha256 "${archive_sha256}" \
-              --run-id "${GITHUB_RUN_ID}" \
-              --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-              --validator "${validator}" \
-              >"${cli_parent}/ambient.stdout" \
-              2>"${cli_parent}/ambient.stderr"; then
-            echo "Ambient supervisor fallback was accepted" >&2
-            exit 1
-          fi
-          cp -- "${supervisor}" "${cli_parent}/tampered-supervisor"
-          python3 - "${cli_parent}/tampered-supervisor" <<'PY'
-          import os
-          import sys
-
-          path = sys.argv[1]
-          flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-          flags |= getattr(os, "O_NOFOLLOW", 0)
-          handle = os.open(path, flags)
-          try:
-              original = os.pread(handle, 1, 4096)
-              if len(original) != 1:
-                  raise SystemExit("supervisor tamper fixture unavailable")
-              os.pwrite(handle, bytes([original[0] ^ 1]), 4096)
-              os.fsync(handle)
-          finally:
-              os.close(handle)
-          PY
-          chmod 500 "${cli_parent}/tampered-supervisor"
-          for case in tampered wrong-tool; do
-            candidate="${cli_parent}/tampered-supervisor"
-            if [[ "${case}" == wrong-tool ]]; then
-              candidate="${validator}"
-            fi
-            if python3 support/build/wamr-native-ci/handoff.py \
-              import-public-source-bundle \
-              --archive "${upload_file}" \
-              --output "${cli_parent}/${case}-refused" \
-              --expected-source "${GITHUB_SHA}" \
-              --expected-tree "${source_tree}" \
-              --expected-archive-sha256 "${archive_sha256}" \
-              --run-id "${GITHUB_RUN_ID}" \
-              --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-              --validator "${validator}" \
-              --supervisor "${candidate}" \
-              >"${cli_parent}/${case}.stdout" \
-              2>"${cli_parent}/${case}.stderr"; then
-              echo "Invalid explicit supervisor was accepted: ${case}" >&2
-              exit 1
-            fi
-          done
           {
             echo "inner_zip_sha256=${archive_sha256}"
             echo "upload_file=${upload_file}"
@@ -441,11 +370,98 @@ jobs:
               sed -n 's/^Public source archive SHA-256: //p'
           )"
           test "${downloaded_sha256}" = "${INNER_ZIP_SHA256}"
+          inner_zip_bytes="$(stat -c '%s' -- "${archive}")"
+          [[ "${inner_zip_bytes}" =~ ^[1-9][0-9]*$ ]]
+          test "${inner_zip_bytes}" -le $((512 * 1024 * 1024))
           [[ "${ARTIFACT_ID}" =~ ^[1-9][0-9]*$ ]]
           [[ "${CONTAINER_DIGEST}" =~ ^[0-9a-f]{64}$ ]]
           test -n "${ARTIFACT_URL}"
+          root=/d/wamr-ci/wamr-native-runtime
+          import_root="${root}/compute/public-source/exact-redownload"
+          mkdir -m 700 "${import_root}"
+          validator="${root}/compute/public-source/tools/bin/uk-wamr-direct-validate"
+          supervisor="${root}/compute/supervisor/bin/wamr-ci-supervisor"
+          python3 support/build/wamr-native-ci/handoff.py \
+            import-public-source-bundle \
+            --archive "${archive}" \
+            --output "${import_root}/success" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${SOURCE_TREE}" \
+            --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --validator "${validator}" \
+            --supervisor "${supervisor}" \
+            --artifact-id "${ARTIFACT_ID}" \
+            --container-digest "${CONTAINER_DIGEST}"
+          python3 support/build/wamr-native-ci/handoff.py plan \
+            --bundle "${import_root}/success/bundle.json" \
+            --output "${import_root}/candidate-scope.json"
+          "${validator}" candidate "${import_root}/candidate-scope.json"
+          if WAMR_CI_SUPERVISOR="${supervisor}" \
+            python3 support/build/wamr-native-ci/handoff.py \
+              import-public-source-bundle \
+              --archive "${archive}" \
+              --output "${import_root}/ambient-refused" \
+              --expected-source "${GITHUB_SHA}" \
+              --expected-tree "${SOURCE_TREE}" \
+              --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
+              --run-id "${GITHUB_RUN_ID}" \
+              --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+              --validator "${validator}" \
+              --artifact-id "${ARTIFACT_ID}" \
+              --container-digest "${CONTAINER_DIGEST}" \
+              >"${import_root}/ambient.stdout" \
+              2>"${import_root}/ambient.stderr"; then
+            echo "Ambient supervisor fallback was accepted" >&2
+            exit 1
+          fi
+          cp -- "${supervisor}" "${import_root}/tampered-supervisor"
+          python3 - "${import_root}/tampered-supervisor" <<'PY'
+          import os
+          import sys
+
+          path = sys.argv[1]
+          flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+          flags |= getattr(os, "O_NOFOLLOW", 0)
+          handle = os.open(path, flags)
+          try:
+              original = os.pread(handle, 1, 4096)
+              if len(original) != 1:
+                  raise SystemExit("supervisor tamper fixture unavailable")
+              os.pwrite(handle, bytes([original[0] ^ 1]), 4096)
+              os.fsync(handle)
+          finally:
+              os.close(handle)
+          PY
+          chmod 500 "${import_root}/tampered-supervisor"
+          for case in tampered wrong-tool; do
+            candidate="${import_root}/tampered-supervisor"
+            if [[ "${case}" == wrong-tool ]]; then
+              candidate="${validator}"
+            fi
+            if python3 support/build/wamr-native-ci/handoff.py \
+              import-public-source-bundle \
+              --archive "${archive}" \
+              --output "${import_root}/${case}-refused" \
+              --expected-source "${GITHUB_SHA}" \
+              --expected-tree "${SOURCE_TREE}" \
+              --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
+              --run-id "${GITHUB_RUN_ID}" \
+              --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+              --validator "${validator}" \
+              --supervisor "${candidate}" \
+              --artifact-id "${ARTIFACT_ID}" \
+              --container-digest "${CONTAINER_DIGEST}" \
+              >"${import_root}/${case}.stdout" \
+              2>"${import_root}/${case}.stderr"; then
+              echo "Invalid explicit supervisor was accepted: ${case}" >&2
+              exit 1
+            fi
+          done
           {
             echo "inner_zip_sha256=${INNER_ZIP_SHA256}"
+            echo "inner_zip_bytes=${inner_zip_bytes}"
             echo "container_digest=${CONTAINER_DIGEST}"
             echo "artifact_id=${ARTIFACT_ID}"
             echo "artifact_url=${ARTIFACT_URL}"
@@ -458,12 +474,43 @@ jobs:
             echo '## Exact WAMR public-source image'
             echo
             echo "Inner ZIP SHA-256: \`${INNER_ZIP_SHA256}\`"
+            echo "Inner ZIP bytes: \`${inner_zip_bytes}\`"
             echo "Artifact container digest: \`${CONTAINER_DIGEST}\`"
             echo "Artifact ID: \`${ARTIFACT_ID}\`"
             echo "Artifact URL: ${ARTIFACT_URL}"
             echo
             echo "Source: \`${GITHUB_SHA}/${SOURCE_TREE}\`"
             echo "Run: \`${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}:wamr-native-compute\`"
+            python3 - "${archive}" <<'PY'
+          import json
+          import sys
+          import zipfile
+
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              bundle = json.loads(archive.read("bundle.json"))
+              artifacts = dict(zip(
+                  ("efi", "debug_elf", "bootinfo", "raw", "qcow2", "vhd"),
+                  bundle["artifacts"][:6],
+              ))
+              finalization = json.loads(
+                  archive.read("evidence/qcow2-finalization.json"))
+              derivation = json.loads(
+                  archive.read("evidence/fixed-vhd-derivation.json"))
+          print()
+          print("Artifact bytes:")
+          for name in ("efi", "raw", "qcow2", "vhd"):
+              print(f"- {name}: file_bytes={artifacts[name]['size']} sha256={artifacts[name]['sha256']}")
+          print(
+              "- qcow2: "
+              f"allocated={finalization['output']['allocated']} "
+              f"virtual_bytes={finalization['output']['virtual_bytes']} "
+              "cluster_bytes=65536 compression=zstd standalone=true")
+          print(
+              "- vhd: "
+              f"allocated={derivation['output']['allocated']} "
+              f"virtual_bytes={derivation['output']['virtual_bytes']} "
+              f"footer_sha256={derivation['footer']['sha256']}")
+          PY
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Retain redacted diagnostics separately from the public-source image bundle

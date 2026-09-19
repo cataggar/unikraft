@@ -663,7 +663,12 @@ class Compute(unittest.TestCase):
         bundle = dict(
             schema="uk.wamr.local-image-handoff", version=1, authority="not_admitted",
             source_revision="a" * 40, source_tree="b" * 40, identity=identity(),
-            artifacts=[item] * len(handoff.NAMES), evidence=[], boots=[])
+            artifacts=[item] * len(handoff.NAMES), evidence=[],
+            boots=[
+                dict(mode=mode, serial=item, request=item,
+                     report=item, compute=item)
+                for mode in handoff.ci.MODES
+            ])
         bundle_path = self.root / "bundle.json"
         write(bundle_path, bundle)
         output = self.root / "plan.json"
