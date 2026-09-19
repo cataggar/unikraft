@@ -24,6 +24,14 @@ LEGACY_V1_SOURCES = frozenset({
     ("b5a8fdbee033349f7145fbc76aebfee29b2fa04f",
      "54f8e118146c78c24e7c802657c6ec62b268a5de"),
 })
+PRE_SUPERVISOR_SOURCES = frozenset({
+    ("0711a0b6bf2285a4ba6ab6dd3bd4088478d665e1",
+     "3d9def2872f41248b518a850a48a5c462e158890"),
+    ("c9c00535399354063486957611bf6e09c8ae4592",
+     "02827e49c25d06eba21bb2157833fc135811eedb"),
+    ("3c6d5d98dc5736d86e97884184b26be39c3f11d5",
+     "feb57a66615a6083378c7261e1e53c37730e0650"),
+})
 BOOT_KEYS = ("serial", "request", "report", "compute")
 STAGES = ("adapter", "local-boot-tool", "fixtures", "prepare", "config",
           "native-image", "package", "raw-x2apic", "raw-legacy-apic",
@@ -45,6 +53,11 @@ SENSITIVE = (
 def require(ok):
     if not ok:
         raise ValueError("public-source bundle refused")
+
+
+def pre_supervisor_source(source):
+    identity = (source["source_revision"], source["source_tree"])
+    return identity in LEGACY_V1_SOURCES or identity in PRE_SUPERVISOR_SOURCES
 
 
 def bind(hasher, value):
@@ -217,6 +230,52 @@ def consumer_input_record(ci, value):
     require(value["aggregate_sha256"] == hashlib.sha256(json.dumps(
         unsigned, sort_keys=True,
         separators=(",", ":")).encode("ascii")).hexdigest())
+    return value
+
+
+def guarded_map_record(value, domain):
+    require(set(value) == {
+        "count", "bytes", "content_closure_sha256",
+        "physical_closure_sha256", "records",
+    } and type(value["records"]) is dict
+      and value["count"] == len(value["records"]))
+    bounded_integer(value["count"], 1, 256)
+    bounded_integer(value["bytes"], 1, 512 * 1024 * 1024)
+    digest_string(value["content_closure_sha256"])
+    digest_string(value["physical_closure_sha256"])
+    content = hashlib.sha256((domain + "-content\0").encode("ascii"))
+    physical = hashlib.sha256((domain + "-physical\0").encode("ascii"))
+    total = 0
+    for name in sorted(value["records"]):
+        record = value["records"][name]
+        require(type(name) is str and name
+                and set(record) == {"bytes", "sha256", "metadata"})
+        size = bounded_integer(record["bytes"], 1, 256 * 1024 * 1024)
+        physical_metadata(
+            record["metadata"], "file",
+            stat.S_IMODE(record["metadata"][2]), size)
+        digest_string(record["sha256"])
+        total += size
+        bind(content, [name, size, record["sha256"]])
+        bind(physical, [name, record["metadata"]])
+    require(total == value["bytes"]
+            and content.hexdigest() == value["content_closure_sha256"]
+            and physical.hexdigest() == value["physical_closure_sha256"])
+    return value
+
+
+def command_supervisor_record(value):
+    require(set(value) == {
+        "schema", "version", "protocol", "source_map", "runtime_map",
+    } and value["schema"] == "uk.wamr.command-supervisor"
+      and type(value["version"]) is int and value["version"] == 1
+      and value["protocol"]
+      == "uk.wamr.command-supervisor/1 process-command/1")
+    guarded_map_record(
+        value["source_map"], "uk.wamr.command-supervisor-source-v1")
+    guarded_map_record(
+        value["runtime_map"], "uk.wamr.command-supervisor-runtime-v1")
+    require("executable" in value["runtime_map"]["records"])
     return value
 
 
@@ -425,9 +484,11 @@ def ci_context(handoff):
     runtime = ci_runtime(ci)
     start = ci.document(runtime / "compute/evidence/build-start.json")
     consumer_input_record(ci, start["consumer_inputs"])
+    command_supervisor_record(start["command_supervisor"])
     ci.consumer_input_state(
         runtime, content=True, expected=start["consumer_inputs"])
-    require("wamr-source-archive" in start["consumer_inputs"]["files"])
+    require({"wamr-source-archive", "command-supervisor"}
+            <= set(start["consumer_inputs"]["files"]))
     return context(dict(repository="cataggar/unikraft", run_id=os.environ["GITHUB_RUN_ID"],
                         run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                         source_revision=source["revision"], source_tree=source["tree"],
@@ -565,6 +626,15 @@ def native(handoff, validator, bundle):
         {"validator": validator}, {}, content=True)
     input_records = handoff.ci.consumer_file_records(start["consumer_inputs"])
     input_records.update(handoff.ci.consumer_file_records(validator_input))
+    supervisor_input = None
+    if handoff.ci.COMMAND_SUPERVISOR_PATH is not None:
+        supervisor = Path(
+            handoff.ci.COMMAND_SUPERVISOR_PATH).resolve(strict=True)
+        if str(supervisor) not in input_records:
+            supervisor_input = handoff.ci.record_input_paths(
+                {"command-supervisor": supervisor}, {}, content=True)
+            input_records.update(handoff.ci.consumer_file_records(
+                supervisor_input))
     output = handoff.ci.run(bundle.parent, "native-revalidation",
                             [validator, "handoff", bundle], 600, 4096,
                             input_records=input_records)
@@ -572,6 +642,10 @@ def native(handoff, validator, bundle):
             == b"Compute handoff revalidated; authority=not_admitted.\n")
     handoff.ci.record_input_paths(
         {"validator": validator}, {}, content=True, expected=validator_input)
+    if supervisor_input is not None:
+        handoff.ci.record_input_paths(
+            {"command-supervisor": supervisor}, {}, content=True,
+            expected=supervisor_input)
 
 
 def require_consumer_tree_roles(value, legacy):
@@ -597,6 +671,7 @@ def publication_records(handoff, stage, source):
     legacy = (
         source["source_revision"], source["source_tree"]
     ) in LEGACY_V1_SOURCES
+    pre_supervisor = pre_supervisor_source(source)
     if "dependencies" not in start:
         require(legacy and "source_custody" not in start
                 and "consumer_inputs" not in start)
@@ -607,11 +682,17 @@ def publication_records(handoff, stage, source):
             require(legacy)
         else:
             consumer_input_record(ci, start["consumer_inputs"])
-            require(
+            required_files = (
                 {f"tool:{name}" for name in ci.HOST_TOOLS}
-                | {"wamr-source-archive"}
-                <= set(start["consumer_inputs"]["files"]))
+                | {"wamr-source-archive"})
+            if not pre_supervisor:
+                required_files.add("command-supervisor")
+            require(required_files <= set(start["consumer_inputs"]["files"]))
             require_consumer_tree_roles(start["consumer_inputs"], legacy)
+            if "command_supervisor" in start:
+                command_supervisor_record(start["command_supervisor"])
+            else:
+                require(pre_supervisor)
     boot_inputs = ci.document(stage / "evidence/boot-inputs.json")
     if boot_inputs.get("schema") == "uk.wamr.consumer-input-custody":
         consumer_input_record(ci, boot_inputs)
@@ -629,8 +710,13 @@ def publication_records(handoff, stage, source):
     for name in sorted(EVIDENCE):
         item = ci.document(stage / "evidence" / name)
         if name.startswith("command-"):
-            require(set(item) == {"scope", "stage", "exit_code", "bytes", "sha256",
-                                  "over_limit", "known_error_markers"}
+            expected_fields = {
+                "scope", "stage", "exit_code", "bytes", "sha256",
+                "over_limit", "known_error_markers",
+            }
+            if not pre_supervisor:
+                expected_fields.add("supervisor")
+            require(set(item) == expected_fields
                     and item["scope"] == "command_diagnostic_not_acceptance"
                     and item["stage"] + ".json" == name[len("command-"):]
                     and type(item["exit_code"]) is int and item["exit_code"] == 0
@@ -638,6 +724,35 @@ def publication_records(handoff, stage, source):
                     and item["known_error_markers"] == []
                     and type(item["bytes"]) is int and 0 <= item["bytes"] <= 8 * 1024 * 1024
                     and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]))
+            if not pre_supervisor:
+                supervisor = item["supervisor"]
+                require(set(supervisor) == {
+                    "schema", "version", "controller_error", "primary",
+                    "primary_deadline_reached", "stdout_status",
+                    "stderr_status", "descendants", "cleanup",
+                    "cleanup_complete", "poisoned", "executable_stable",
+                } and supervisor["schema"]
+                  == "uk.wamr.command-supervisor-result"
+                  and supervisor["version"] == 1
+                  and supervisor["controller_error"] is None
+                  and supervisor["primary"] == {"code": 0, "kind": "exited"}
+                  and supervisor["primary_deadline_reached"] is False
+                  and supervisor["stdout_status"] == "complete"
+                  and supervisor["stderr_status"] == "complete"
+                  and supervisor["cleanup"] == "complete"
+                  and supervisor["cleanup_complete"] is True
+                  and supervisor["poisoned"] is False
+                  and supervisor["executable_stable"] is True)
+                descendants = supervisor["descendants"]
+                require(set(descendants) == {
+                    "adopted", "identity_validated", "limit_exceeded",
+                    "observed", "untracked",
+                } and all(type(descendants[key]) is int
+                          and 0 <= descendants[key] <= 256
+                          for key in (
+                              "adopted", "identity_validated", "observed"))
+                  and descendants["limit_exceeded"] is False
+                  and descendants["untracked"] is False)
     for mode in ci.MODES:
         request = ci.document(stage / "boots" / mode / "request")
         require(set(request) == {

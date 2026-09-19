@@ -39,9 +39,17 @@ fn execute(init: std.process.Init) !void {
     if (args.len == 2 and std.mem.eql(u8, args[1], "--package-worker"))
         return image.worker.execute(init);
     const input = try parse(args);
-    const self = try std.Io.Dir.cwd().realPathFileAlloc(io, "/proc/self/exe", a);
+    const inherited_path = init.environ_map.get("WAMR_CI_EXECUTABLE_PATH");
+    const inherited_executable = init.environ_map.get("WAMR_CI_RETAINED_EXECUTABLE");
+    const retained_self = inherited_path != null and inherited_executable != null and
+        std.mem.eql(u8, args[0], inherited_path.?);
+    const self_path = if (retained_self)
+        inherited_path.?
+    else
+        try std.Io.Dir.cwd().realPathFileAlloc(io, "/proc/self/exe", a);
+    const self_executable = if (retained_self) inherited_executable.? else self_path;
     const efi = try f.record(a, io, input.efi, c.max_efi, false);
-    const producer = try f.record(a, io, self, c.max_tool, true);
+    const producer = try f.record(a, io, self_path, c.max_tool, true);
     const root = if (input.command == .package)
         try openEmptyState(io, input.state)
     else
@@ -63,8 +71,13 @@ fn execute(init: std.process.Init) !void {
         var environment: std.process.Environ.Map = .init(a);
         defer environment.deinit();
         try environment.put("TMPDIR", input.state);
+        try environment.put("WAMR_CI_EXECUTABLE_PATH", self_path);
+        try environment.put(
+            "WAMR_CI_RETAINED_EXECUTABLE",
+            self_executable,
+        );
         var result = try image.core.process.run(a, io, .{
-            .argv = &.{ self, "--package-worker" },
+            .argv = &.{ self_executable, "--package-worker" },
             .environment = &environment,
             .cwd = root.dir,
             .deadline = try image.core.process.Deadline.afterMilliseconds(c.package_timeout_ms),

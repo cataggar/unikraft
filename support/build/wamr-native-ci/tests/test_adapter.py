@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import stat
 import struct
 import subprocess
@@ -22,6 +21,8 @@ from unittest import mock
 HERE = Path(__file__).resolve().parents[1]
 PYTHON = os.environ.get("WAMR_CI_PYTHON", sys.executable)
 GIT = os.environ.get("WAMR_CI_GIT", "git")
+SUPERVISOR = os.environ.get("WAMR_CI_SUPERVISOR")
+SUPERVISOR_FIXTURE = os.environ.get("WAMR_CI_SUPERVISOR_FIXTURE")
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
@@ -214,6 +215,30 @@ class PhysicalPackage(unittest.TestCase):
         self.state.mkdir(mode=0o700)
         (self.state / "unexpected").write_bytes(b"x")
         self.call("package", success=False)
+
+    @unittest.skipIf(not SUPERVISOR, "native command supervisor unavailable")
+    def test_supervised_python_does_not_rebind_nested_package_identity(self):
+        controller = self.root / "controller"
+        (controller / "private").mkdir(parents=True, mode=0o700)
+        (controller / "evidence").mkdir(mode=0o700)
+        self.state.mkdir(mode=0o700)
+        script = (
+            "import subprocess,sys\n"
+            "result=subprocess.run(sys.argv[1:],stdout=subprocess.PIPE,"
+            "stderr=subprocess.PIPE)\n"
+            "sys.stdout.buffer.write(result.stdout)\n"
+            "sys.stderr.buffer.write(result.stderr)\n"
+            "raise SystemExit(result.returncode)\n"
+        )
+        output, unused_record = ci.execute(
+            controller, "nested-package",
+            [PYTHON, "-c", script, self.cli, "package",
+             self.efi, self.state],
+            seconds=150, limit=ci.MIB, evidence=False)
+        del unused_record
+        report = json.loads(output.read_bytes())
+        self.assertEqual(report["image"]["efi"]["sha256"], ci.digest(self.efi))
+        self.assertEqual(self.call("inspect"), report)
 
 
 class Evidence(unittest.TestCase):
@@ -478,10 +503,37 @@ class Evidence(unittest.TestCase):
             public_bundle.require_consumer_tree_roles(current, False)
         public_bundle.require_consumer_tree_roles(current, True)
 
+    def test_public_supervisor_maps_recompute_closures_and_legacy_is_compatible(self):
+        artifact = self.root / "supervisor-map-artifact"
+        self.put(artifact, b"guarded map")
+        record, unused_directories = ci.physical_file_record(artifact)
+        del unused_directories
+        entry = {
+            "bytes": record["metadata"][6],
+            "sha256": record["sha256"],
+            "metadata": record["metadata"],
+        }
+        for suffix in ("source", "runtime"):
+            domain = f"uk.wamr.command-supervisor-{suffix}-v1"
+            guarded = ci.guarded_record_map(domain, {"fixture": entry})
+            self.assertEqual(
+                public_bundle.guarded_map_record(guarded, domain), guarded)
+            tampered = copy.deepcopy(guarded)
+            tampered["content_closure_sha256"] = "0" * 64
+            with self.assertRaises(ValueError):
+                public_bundle.guarded_map_record(tampered, domain)
+        for revision, tree in (
+                public_bundle.LEGACY_V1_SOURCES
+                | public_bundle.PRE_SUPERVISOR_SOURCES):
+            self.assertTrue(public_bundle.pre_supervisor_source({
+                "source_revision": revision, "source_tree": tree,
+            }))
+
     def test_boot_output_slots_preserve_their_shared_parent(self):
         runtime = self.root / "runtime"
         compute = runtime / "compute"
         compute.mkdir(parents=True, mode=0o700)
+        ci.precreate_boot_output_slots(runtime, compute)
         package, configs = ci.prepare_boot_output_slots(runtime, compute)
         parent = ci.snapshot(compute.lstat())
         (package / "artifact").write_bytes(b"package")
@@ -596,8 +648,8 @@ class Evidence(unittest.TestCase):
         root = self.root / "retained-indirect"
         (root / "private").mkdir(parents=True, mode=0o700)
         executable = root / "tool"
-        original = b"#!/bin/sh\nprintf original\n"
-        replacement = b"#!/bin/sh\nprintf replacement\n"
+        original = Path(SUPERVISOR_FIXTURE).read_bytes()
+        replacement = Path("/usr/bin/false").resolve(strict=True).read_bytes()
         self.put(executable, original)
         executable.chmod(0o700)
         ready = root / "ready"
@@ -606,16 +658,17 @@ class Evidence(unittest.TestCase):
             "import os,pathlib,subprocess,time\n"
             f"pathlib.Path({str(ready)!r}).touch()\n"
             "time.sleep(0.2)\n"
-            "value=subprocess.check_output([os.environ['WAMR_CI_TOOL_GIT']])\n"
-            f"pathlib.Path({str(consumed)!r}).touch()\n"
+            "try:\n"
+            " value=subprocess.check_output([os.environ['WAMR_CI_TOOL_GIT'],"
+            "'bytes','8','0','0'])\n"
+            "finally:\n"
+            f" pathlib.Path({str(consumed)!r}).touch()\n"
             "time.sleep(0.2)\n"
             "print(value.decode(),end='')\n"
         )
         records = {}
         for path in {
-                Path(ci.tool("timeout")).resolve(strict=True),
-                Path(ci.tool("bash")).resolve(strict=True),
-                Path(ci.tool("head")).resolve(strict=True),
+                Path(ci.COMMAND_SUPERVISOR_PATH).resolve(strict=True),
                 Path(PYTHON).resolve(strict=True),
                 executable}:
             record, unused_directories = ci.physical_file_record(path)
@@ -648,7 +701,7 @@ class Evidence(unittest.TestCase):
         finally:
             attacker.join(timeout=2)
         self.assertFalse(attacker.is_alive())
-        self.assertEqual(output.read_bytes(), b"original")
+        self.assertEqual(output.read_bytes(), b"oooooooo")
         self.assertEqual(executable.read_bytes(), original)
 
     def test_boot_revalidation_does_not_need_inherited_build_environment(self):
@@ -668,6 +721,9 @@ class Evidence(unittest.TestCase):
                 mock.patch.object(
                     ci, "consumer_input_state",
                     return_value={"schema": "fixture"}), \
+                mock.patch.object(
+                    ci, "command_supervisor_state",
+                    return_value={"schema": "fixture"}), \
                 mock.patch.object(ci, "dependency_custody",
                                   return_value={"fixture": True}):
             self.assertEqual(ci.producer_inputs(self.root)["bison_data"], expected)
@@ -678,6 +734,8 @@ class Evidence(unittest.TestCase):
             "files": {
                 "tool:" + name: {"path": "/trusted/" + name}
                 for name in ci.HOST_TOOLS
+            } | {
+                "command-supervisor": {"path": "/trusted/supervisor"},
             },
         }
         initial = {"consumer_inputs": consumer}
@@ -697,6 +755,7 @@ class Evidence(unittest.TestCase):
 
         with mock.patch.dict(ci.COMMAND_TOOL_PATHS, {}, clear=True), \
                 mock.patch.dict(ci.COMMAND_ENVIRONMENT, {}, clear=True), \
+                mock.patch.object(ci, "COMMAND_SUPERVISOR_PATH", None), \
                 mock.patch.dict(os.environ, {}, clear=False), \
                 mock.patch.object(ci.platform, "machine", return_value="x86_64"), \
                 mock.patch.object(Path, "is_char_device", return_value=True), \
@@ -746,18 +805,40 @@ class Evidence(unittest.TestCase):
                     )
                 }
                 for name in ci.HOST_TOOLS
+            } | {
+                "command-supervisor": {"path": "/selected/supervisor"},
             }
         }
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
         original_tools = dict(ci.COMMAND_TOOL_PATHS)
         try:
             environment = ci.bind_command_tools(tools)
             self.assertEqual(environment["PATH"], "/usr/bin:/bin")
             self.assertEqual(environment["WAMR_CI_GIT"], "/selected/git")
             self.assertEqual(
+                environment["WAMR_CI_SUPERVISOR"],
+                "/selected/supervisor")
+            self.assertEqual(
                 environment["WAMR_CI_TOOL_DASH"], "/system/dash")
         finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
             ci.COMMAND_TOOL_PATHS.clear()
             ci.COMMAND_TOOL_PATHS.update(original_tools)
+
+    def test_recorded_consumer_revalidation_allows_only_new_roles(self):
+        inputs = self.root / "recorded-consumer-inputs"
+        inputs.mkdir(mode=0o700)
+        tool = inputs / "tool"
+        self.put(tool, b"stable")
+        added_root = inputs / "new-role-root"
+        added_root.mkdir(mode=0o700)
+        expected = ci.record_input_paths({"tool": tool}, {})
+        added = added_root / "new-role"
+        self.put(added, b"new")
+        ci.require_recorded_consumer_inputs(expected)
+        self.put(tool, b"changed")
+        with self.assertRaises(ci.Refusal):
+            ci.require_recorded_consumer_inputs(expected)
 
     def test_compute_dynamic_validator_never_writes_bytecode(self):
         app = self.root / "validator-app"
@@ -818,15 +899,23 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             "files": {
                 f"tool:{name}": {"path": f"/tools/{name}"}
                 for name in ci.HOST_TOOLS
+            } | {
+                "command-supervisor": {"path": "/tools/supervisor"},
             },
         }
 
-        def restore(runtime_value, root, expected, expected_inputs):
+        def restore(runtime_value, root, expected_inputs):
             events.append("restore")
             self.assertEqual(runtime_value, runtime)
-            self.assertEqual(expected, source)
             self.assertEqual(expected_inputs, consumer)
             return packages
+
+        def supervisor(runtime_value, root, package_tree, expected_inputs):
+            events.append("supervisor")
+            self.assertEqual(runtime_value, runtime)
+            self.assertEqual(package_tree, packages)
+            self.assertEqual(expected_inputs, consumer)
+            return Path("/tools/supervisor")
 
         def inputs(root, expected_consumer=None, content=True):
             events.append("custody")
@@ -837,15 +926,24 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 "source_custody": source["custody"],
                 "dependencies": {},
                 "consumer_inputs": consumer,
+                "command_supervisor": {"schema": "fixture"},
             }
 
         def command(runtime, expected, root, stage, args, *unused):
             if stage == "config":
                 self.assertEqual(os.environ["KCONFIG_OVERWRITECONFIG"], "1")
                 self.assertEqual(os.environ["M4"], "/tools/m4")
+                self.assertEqual(os.environ["ZIG_LIB_DIR"], "/tools/lib")
             commands.append((stage, list(map(str, args))))
             return root / "private" / (stage + ".log")
 
+        def execute_direct(root, stage, args, *unused, **unused_keywords):
+            self.assertEqual(stage, "zig-version")
+            path = root / "private/zig-version.log"
+            path.write_bytes(b"0.16.0\n")
+            return path, {}
+
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
         original_tools = dict(ci.COMMAND_TOOL_PATHS)
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(
@@ -861,8 +959,10 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 ("source", {"return_value": source}),
                 ("source_metadata", {"return_value": []}),
                 ("restore_dependencies", {"side_effect": restore}),
+                ("build_command_supervisor", {"side_effect": supervisor}),
                 ("producer_inputs", {"side_effect": inputs}),
                 ("run_custodied", {"side_effect": command}),
+                ("execute", {"side_effect": execute_direct}),
                 ("require_no_config_backup", {}),
                 ("retain_solved_config", {}),
                 ("solved_config", {"return_value": "f" * 64}),
@@ -886,8 +986,9 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             ci.build(runtime, self.root)
         ci.COMMAND_TOOL_PATHS.clear()
         ci.COMMAND_TOOL_PATHS.update(original_tools)
+        ci.COMMAND_SUPERVISOR_PATH = original_supervisor
 
-        self.assertEqual(events[:2], ["restore", "custody"])
+        self.assertEqual(events[:3], ["restore", "supervisor", "custody"])
         selected = dict(commands)
         for stage in ("adapter", "local-boot-tool"):
             self.assertIn("--system", selected[stage])
@@ -905,19 +1006,16 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         with mock.patch.object(ci, "LOCAL_BOOT", missing), \
                 mock.patch.object(
                     ci, "tracked_manifest",
-                    side_effect=ci.Refusal("pinned dependency manifest unavailable")), \
-                mock.patch.object(ci, "require_source"):
+                    side_effect=ci.Refusal("pinned dependency manifest unavailable")):
             with self.assertRaisesRegex(
                     ci.Refusal, "pinned dependency manifest unavailable"):
                 ci.restore_dependencies(
-                    missing_root.parent, missing_root,
-                    {"source": "fixture"}, {"schema": "fixture"})
+                    missing_root.parent, missing_root, {"schema": "fixture"})
         root = self.root / "restore"
         root.mkdir(mode=0o700)
         for name in ("private", "evidence", "cache", "global-cache"):
             (root / name).mkdir(mode=0o700)
-        with mock.patch.object(ci, "require_source"), \
-                mock.patch.object(ci, "require_consumer_inputs"), \
+        with mock.patch.object(ci, "require_consumer_inputs"), \
                 mock.patch.object(ci, "consumer_file_records",
                                   return_value={}), \
                 mock.patch.object(ci, "execute", return_value=(
@@ -926,8 +1024,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             with self.assertRaisesRegex(
                     ci.Refusal, "private pinned dependency restore required"):
                 ci.restore_dependencies(
-                    root.parent, root, {"source": "fixture"},
-                    {"schema": "fixture"})
+                    root.parent, root, {"schema": "fixture"})
 
     def test_dependency_paths_refuse_outside_or_missing_repository_without_leak(self):
         manifests = {
@@ -965,7 +1062,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 for operation in (
                         lambda: ci.restore_dependencies(
                             restore_root.parent, restore_root,
-                            {"source": "unused"}, {"schema": "fixture"}),
+                            {"schema": "fixture"}),
                         lambda: ci.dependency_custody(custody_root),
                 ):
                     with self.assertRaises(ci.Refusal) as refusal:
@@ -1292,8 +1389,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 "known_error_markers": [],
             }
 
-        with mock.patch.object(ci, "require_source"), \
-                mock.patch.object(ci, "require_consumer_inputs"), \
+        with mock.patch.object(ci, "require_consumer_inputs"), \
                 mock.patch.object(ci, "consumer_file_records",
                                   return_value={}), \
                 mock.patch.object(ci, "tracked_manifest", side_effect=manifest_record), \
@@ -1301,8 +1397,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 self.assertRaisesRegex(
                     ci.Refusal, "copied dependency manifest identity changed"):
             ci.restore_dependencies(
-                root.parent, root, {"source": "fixture"},
-                {"schema": "fixture"})
+                root.parent, root, {"schema": "fixture"})
         self.assertEqual(
             (root / "dependencies/build.zig").read_bytes(),
             manifests["build.zig"],
@@ -1364,11 +1459,15 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 "source_custody": source_record["custody"],
                 "dependencies": dependency,
                 "consumer_inputs": {"schema": "fixture"},
+                "command_supervisor": {"schema": "fixture"},
             }
             target = packages / ci.MIZ_PACKAGE_HASH / "source.zig"
             self.put(target, b"changed before build\n")
             with mock.patch.object(ci, "source", return_value=source_record), \
                     mock.patch.object(ci, "require_consumer_inputs"), \
+                    mock.patch.object(
+                        ci, "command_supervisor_state",
+                        return_value={"schema": "fixture"}), \
                     mock.patch.object(ci, "consumer_file_records",
                                       return_value={}), \
                     mock.patch.object(ci, "run") as command, \
@@ -1385,6 +1484,9 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
 
             with mock.patch.object(ci, "source", return_value=source_record), \
                     mock.patch.object(ci, "require_consumer_inputs"), \
+                    mock.patch.object(
+                        ci, "command_supervisor_state",
+                        return_value={"schema": "fixture"}), \
                     mock.patch.object(ci, "consumer_file_records",
                                       return_value={}), \
                     mock.patch.object(ci, "run", side_effect=mutate), \
@@ -1702,46 +1804,150 @@ source/generated/
         self.assertLess(time.monotonic() - started, 5)
         self.assertFalse(marker.exists())
 
-    def test_bounded_subprocess_refuses_escaped_descendant_pipe_writer(self):
-        pid_file = self.root / "escaped-descendant.pid"
-        script = (
-            "import os,time\n"
-            f"pid_file={str(pid_file)!r}\n"
-            "pid=os.fork()\n"
-            "if pid:\n"
-            "  raise SystemExit(7)\n"
-            "os.setsid()\n"
-            "with open(pid_file,'w') as stream:\n"
-            "  stream.write(str(os.getpid()))\n"
-            "  stream.flush()\n"
-            "os.write(1,b'held-open\\n')\n"
-            "time.sleep(30)\n"
-        )
-        started = time.monotonic()
-        escaped = None
+    def test_native_supervisor_cleans_all_ordinary_descendant_shapes(self):
+        self.assertIsNotNone(SUPERVISOR)
+        self.assertIsNotNone(SUPERVISOR_FIXTURE)
+        original = ci.COMMAND_SUPERVISOR_PATH
+        ci.COMMAND_SUPERVISOR_PATH = str(
+            Path(SUPERVISOR).resolve(strict=True))
         try:
-            with self.assertRaisesRegex(ci.Refusal, "escaped fixture failed"):
-                ci.bounded_subprocess_output(
-                    [PYTHON, "-c", script], self.root, 1024, 10,
-                    "escaped fixture overflow", "escaped fixture timeout",
-                    "escaped fixture failed",
-                )
-            self.assertLess(
-                time.monotonic() - started,
-                ci.SUBPROCESS_DRAIN_GRACE + 2,
-            )
-            for _ in range(100):
-                if pid_file.exists():
-                    escaped = int(pid_file.read_text())
-                    break
-                time.sleep(0.01)
-            self.assertIsNotNone(escaped)
+            for mode in (
+                    "ordinary-child", "setsid-child", "double-fork",
+                    "closed-child"):
+                output, record = ci.execute(
+                    self.root, "descendant-" + mode,
+                    [SUPERVISOR_FIXTURE, mode], 10, 1024,
+                    cwd=self.root, evidence=False)
+                pid = int(output.read_text().strip())
+                with self.subTest(mode=mode):
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+                    descendants = record["supervisor"]["descendants"]
+                    self.assertGreaterEqual(descendants["observed"], 1)
+                    self.assertGreaterEqual(
+                        descendants["identity_validated"], 1)
+                    self.assertTrue(
+                        record["supervisor"]["cleanup_complete"])
+                    self.assertEqual(
+                        record["supervisor"]["cleanup"], "complete")
         finally:
-            if escaped is not None:
-                try:
-                    os.kill(escaped, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            ci.COMMAND_SUPERVISOR_PATH = original
+
+    def test_native_supervisor_maps_primary_and_controller_failures(self):
+        self.assertIsNotNone(SUPERVISOR)
+        self.assertIsNotNone(SUPERVISOR_FIXTURE)
+        original = ci.COMMAND_SUPERVISOR_PATH
+        ci.COMMAND_SUPERVISOR_PATH = str(
+            Path(SUPERVISOR).resolve(strict=True))
+        cases = (
+            ("native-timeout", [SUPERVISOR_FIXTURE, "partial"], 0.05, 1024,
+             "timeout"),
+            ("native-overflow",
+             [SUPERVISOR_FIXTURE, "bytes", "4096", "0", "0"],
+             10, 32, "output_overflow"),
+            ("native-nonzero",
+             [SUPERVISOR_FIXTURE, "bytes", "0", "0", "7"],
+             10, 1024, "exited"),
+        )
+        try:
+            for stage, args, seconds, limit, primary in cases:
+                with self.subTest(stage=stage), self.assertRaises(ci.Refusal):
+                    ci.execute(
+                        self.root, stage, args, seconds, limit,
+                        cwd=self.root)
+                record = ci.document(
+                    self.root / "evidence" / ("command-" + stage + ".json"))
+                self.assertEqual(
+                    record["supervisor"]["primary"]["kind"], primary)
+                self.assertTrue(
+                    record["supervisor"]["cleanup_complete"])
+            invalid = self.root / "not-elf"
+            self.put(invalid, b"#!/bin/sh\nexit 0\n")
+            invalid.chmod(0o700)
+            with self.assertRaisesRegex(ci.Refusal, "exec failed"):
+                ci.execute(
+                    self.root, "native-exec-failure", [invalid],
+                    10, 1024, cwd=self.root)
+            record = ci.document(
+                self.root / "evidence/command-native-exec-failure.json")
+            self.assertEqual(
+                record["supervisor"]["controller_error"], "exec_unsupported")
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original
+
+    def test_native_supervisor_poison_result_tamper_identity_and_environment(self):
+        self.assertIsNotNone(SUPERVISOR)
+        self.assertIsNotNone(SUPERVISOR_FIXTURE)
+        supervisor = Path(SUPERVISOR).resolve(strict=True)
+        fixture = Path(SUPERVISOR_FIXTURE).resolve(strict=True)
+        fixture_record, unused_directories = ci.physical_file_record(fixture)
+        del unused_directories
+        expected = ci.native_executable_identity(fixture_record)
+
+        def invoke(argv, environment=(), limits=None):
+            now = time.monotonic_ns()
+            request = {
+                "argv": [str(fixture), *argv],
+                "cleanup_deadline_ns": now + 5_000_000_000,
+                "cwd": str(self.root),
+                "environment": [
+                    {"name": name, "value": value}
+                    for name, value in sorted(environment)
+                ],
+                "executable": str(fixture),
+                "limits": limits or {
+                    "cleanup_events": 1_000_000,
+                    "descendants": 64,
+                    "primary_events": 1_000_000,
+                    "proc_entries_per_scan": 262_144,
+                    "reap_events": 512,
+                    "stderr_bytes": 4096,
+                    "stdout_bytes": 4096,
+                    "term_grace_ms": 1000,
+                },
+                "primary_deadline_ns": now + 3_000_000_000,
+                "retained_executables": [],
+                "schema": "uk.wamr.command-supervisor-request",
+                "version": 1,
+            }
+            result = subprocess.run(
+                [supervisor], input=ci.canonical_json(request),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={}, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, b"")
+            return result.stdout
+
+        raw = invoke(["environment"], (("LC_ALL", "C"),))
+        decoded, stdout, stderr = ci.decoded_supervisor_result(raw, expected)
+        self.assertEqual(stdout, b"environment-ok\n")
+        self.assertEqual(stderr, b"")
+        self.assertEqual(decoded["command"]["retained_executables"], [])
+        with self.assertRaisesRegex(ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(raw + b" ", expected)
+        changed = json.loads(raw)
+        changed["command"]["executable"]["content_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(ci.canonical_json(changed), expected)
+
+        limits = {
+            "cleanup_events": 32,
+            "descendants": 64,
+            "primary_events": 1_000_000,
+            "proc_entries_per_scan": 16,
+            "reap_events": 512,
+            "stderr_bytes": 4096,
+            "stdout_bytes": 4096,
+            "term_grace_ms": 1000,
+        }
+        poisoned_raw = invoke(["many-immediate", "32"], limits=limits)
+        poisoned, unused_stdout, unused_stderr = (
+            ci.decoded_supervisor_result(poisoned_raw, expected))
+        del unused_stdout, unused_stderr
+        command = poisoned["command"]
+        self.assertFalse(command["cleanup_complete"])
+        self.assertTrue(command["poisoned"])
+        self.assertNotEqual(command["cleanup"], "complete")
 
     def test_execute_drops_ambient_loader_shell_python_and_make_injection(self):
         root = self.root / "closed-command-environment"

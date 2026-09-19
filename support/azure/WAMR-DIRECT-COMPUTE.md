@@ -93,7 +93,13 @@ On an appropriate private x86/KVM runner, use the existing credential-free
 committed final source**, with the pinned SDK
 `a53205d77be3b880eb8f8b96679512ba58e2331a`, unchanged compiler profile and tiny
 configuration. Complete all four exact-image local boots (raw/VPC, each with
-x2APIC and masked x2APIC) and process cleanup. Do not run privilege-sensitive
+x2APIC and masked x2APIC) and process cleanup. The WAMR build/boot adapter uses
+the retained native command supervisor: ordinary owned children, `setsid`,
+double-fork and closed-capture descendants must be gone even after a successful
+leader, and any cleanup exhaustion/poison blocks handoff. This detects
+accidental or persistent input mutation at the guarded before/after
+boundaries; it is not isolation from a hostile same-UID process or PID
+namespace. Do not run privilege-sensitive
 runner setup on a shared development host.
 
 Before that private runner discards the runtime, export to a fresh private

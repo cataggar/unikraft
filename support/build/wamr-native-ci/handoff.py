@@ -61,6 +61,9 @@ def export(runtime, output):
     root = runtime / "compute"
     records = result_records(root)
     expected = ci.document(root / "evidence/build-start.json")
+    if "command-supervisor" in expected["consumer_inputs"]["files"]:
+        ci.COMMAND_ENVIRONMENT.update(ci.bind_command_tools(
+            expected["consumer_inputs"]))
     before = ci.producer_inputs(runtime, expected["consumer_inputs"])
     ci.require(before == expected,
                "producer inputs changed")
@@ -85,6 +88,15 @@ def export(runtime, output):
         (output / name).mkdir(mode=0o700)
     input_records = ci.consumer_file_records(expected["consumer_inputs"])
     input_records.update(ci.consumer_file_records(inputs))
+    compatibility_supervisor = None
+    if ci.COMMAND_SUPERVISOR_PATH is not None:
+        supervisor_path = str(Path(
+            ci.COMMAND_SUPERVISOR_PATH).resolve(strict=True))
+        if supervisor_path not in input_records:
+            compatibility_supervisor = ci.record_input_paths(
+                {"command-supervisor": Path(supervisor_path)}, {})
+            input_records.update(ci.consumer_file_records(
+                compatibility_supervisor))
     inspected = ci.document(ci.run(
         output, "handoff-inspect",
         [tools["package_tool"], "inspect", ci.APP / "build" / ci.EFI, root / "package"],
@@ -94,6 +106,10 @@ def export(runtime, output):
                and all(inspected["image"][key] == value
                        for key, value in packaged["image"].items()),
                "physical package changed")
+    if compatibility_supervisor is not None:
+        ci.record_input_paths(
+            {"command-supervisor": Path(ci.COMMAND_SUPERVISOR_PATH)}, {},
+            expected=compatibility_supervisor)
     paths = (
         ci.APP / "build" / ci.EFI, ci.APP / "build" / (ci.EFI + ".dbg"),
         ci.APP / "build" / (ci.EFI + ".bootinfo"), root / "package/unikraft.raw",

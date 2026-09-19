@@ -24,7 +24,8 @@ pub fn execute(init: std.process.Init) !void {
     } else |err| if (err != error.WouldBlock) return err;
     var buffer: [4096]u8 = undefined;
     if (!std.mem.eql(u8, job.state_dir, buffer[0..try root.dir.realPath(io, &buffer)])) return error.WrongWorkspace;
-    const self = try std.Io.Dir.cwd().realPathFileAlloc(io, "/proc/self/exe", a);
+    const self = init.environ_map.get("WAMR_CI_EXECUTABLE_PATH") orelse
+        try std.Io.Dir.cwd().realPathFileAlloc(io, "/proc/self/exe", a);
     if (!std.mem.eql(u8, self, job.producer.path)) return error.InvalidProducer;
     try f.verify(a, io, job.producer, c.max_tool, true);
     const marker = try root.dir.createFile(io, "package-launched", .{ .exclusive = true, .permissions = .fromMode(0o600) });

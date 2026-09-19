@@ -53,7 +53,13 @@ fn execute(init: std.process.Init) !u8 {
     }
     const config = try boot.config.parse(a, args[1..]);
     try boot.core.process.initialize();
-    const self = try std.Io.Dir.cwd().realPathFileAlloc(init.io, "/proc/self/exe", a);
+    const inherited_path = init.environ_map.get("WAMR_CI_EXECUTABLE_PATH");
+    const inherited_executable = init.environ_map.get("WAMR_CI_RETAINED_EXECUTABLE");
+    const self = if (inherited_path != null and inherited_executable != null and
+        std.mem.eql(u8, args[0], inherited_path.?))
+        inherited_executable.?
+    else
+        try std.Io.Dir.cwd().realPathFileAlloc(init.io, "/proc/self/exe", a);
     const report = try boot.runner.run(a, init.io, config, .{ .self_executable = self });
     try emit(init, report);
     return if (report.succeeded()) 0 else 1;

@@ -736,8 +736,8 @@ class Compute(unittest.TestCase):
                                 files=files)
         write(app / "build/artifacts/identity.json", runtime_identity)
         source = dict(
-            revision=ci.git("rev-parse", "HEAD"),
-            tree=ci.git("rev-parse", "HEAD^{tree}"),
+            revision="3c6d5d98dc5736d86e97884184b26be39c3f11d5",
+            tree="feb57a66615a6083378c7261e1e53c37730e0650",
         )
         image_identity = dict(
             unikraft_revision=source["revision"],

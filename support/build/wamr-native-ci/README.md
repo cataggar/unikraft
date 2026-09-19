@@ -120,6 +120,42 @@ inspection and export. Consumer subprocesses use adapter-owned
 cache/configuration paths; ambient loader, shell-startup, Python, Make and Zig
 injection variables are not inherited.
 
+Before the clean source baseline is taken, the adapter restores the exact
+out-of-tree dependency tree and builds the internal
+`wamr-ci-supervisor` from `supervisor.build.zig`. The bootstrap inputs and the
+supervisor's exact tracked source closure are checked before and after that
+build. `build-start.json` then embeds `uk.wamr.command-supervisor` version 1:
+the fixed protocol version plus independently recomputed source and runtime
+maps, each with actual file/byte counts and content/physical closure SHA256
+values. The runtime map includes the supervisor ELF and its dynamic runtime;
+the ELF is also a normal version-2 consumer input. Current-custody checks,
+final handoff and public export recompute the same maps rather than trusting
+copied pins.
+The package, publication and four boot work directories are empty private
+slots created before that final custody baseline, so later outputs do not
+change a recorded supervisor/tool ancestor directory.
+
+Every later trusted WAMR command is launched by that retained native ELF using
+the merged `Executable`, `CommandRequest` and `CommandResult` contract. The
+request supplies an explicit retained ELF, fixed argv, closed environment,
+cwd, one absolute primary deadline, a separately fixed cleanup deadline and
+bounded output/result limits. Direct scripts name the retained Python or Bash
+ELF explicitly; there is no shebang or ambient interpreter selection.
+Recorded indirect executable variables are replaced inside the supervisor by
+paths to its retained descriptors. The reviewed self-reexecuting package and
+local-boot tools ignore inherited retained-self values unless the original
+path binds their current `argv[0]`. The exact recorded Zig installation tree
+supplies `ZIG_LIB_DIR`; direct Zig commands also bind a separately opened
+retained executable descriptor. A private supervisor launcher mode replaces
+its own sealed snapshot with that descriptor before Zig starts, so Zig can
+find its standard library and re-execute its integrated linker without an
+ambient path. Canonical native results bind the supervisor launcher identity
+and the retained Zig identity and report primary outcome, stream status,
+descendant observations, cleanup outcome and poison state. Timeout,
+cancellation, overflow, nonzero/signal, exec/identity failure or any unproven
+cleanup is a refusal; cleanup failure prevents publication even when the
+leader exited zero.
+
 Records also bind the Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
 actual tools, wasm/cwasm/compiler/library bytes, solved configuration,
 entire EFI/debug ELF/bootinfo, native package producer, QEMU and OVMF,
@@ -133,9 +169,11 @@ observations, not authenticated source attestations or deployment receipts.
 Writable build, package, firmware and boot slots are under the protected
 CI job's private `/d/wamr-native-runtime` (or the local in-worktree runtime)
 or the app's ignored `build/`. Zig's
-source-pinned dependency restoration first establishes clean physical source
-custody, then copies the exact Git-identified local-boot manifests create-only
-into `compute/dependencies`. Before Zig runs it binds each copy's exact
+source-pinned dependency restoration copies the exact Git-identified
+local-boot manifests create-only into `compute/dependencies` before the clean
+source baseline. Descriptor/Git-object checks bind those actual manifest
+inputs, and the later full source baseline must still be clean and exact.
+Before Zig runs it binds each copy's exact
 device/inode/type, ownership, links, size, mtime and ctime plus the parent
 directory metadata, and requires the same identities immediately afterward.
 It also byte-compares the copies, parses the one exact Miz
@@ -164,22 +202,25 @@ policy allows at most 131,072 entries, 8 GiB total regular-file/link bytes,
 parsing. Failure diagnostics use a separately terminated-and-drained 1-MiB Git
 status capture, retain at most 128 ignored paths, and refuse immediately on the
 129th repository-root entry before sorting the bounded collection.
-The subprocess collector gives termination, kill and post-kill/post-leader
-pipe draining separate absolute one-second budgets. An escaped `setsid()`
-descendant cannot keep this collector waiting indefinitely because the pipe is
-closed at the absolute drain deadline, but standard descendant supervision is
-still a prerequisite for closing the escaped-process lifetime gap. That
-separate prerequisite remains pending; this lane does not add a
-success-shaped production exception or manual cleanup contract. Git runs with
+The production command path uses the standard native subreaper/pidfd
+supervisor. It discovers and reaps ordinary owned descendants after leader
+success, including `setsid`, double-fork and closed-capture descendants.
+Cleanup has its own absolute deadline and bounded scan/signal/reap budgets;
+exhaustion or uncertain ownership poisons the one-shot supervisor result and
+cannot become success. This is cleanup for cooperative or accidentally
+detached owned descendants, not a hostile same-UID or PID-namespace ownership
+claim. Git bootstrap/custody probes run with
 system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
 applicable.
 Build commands use `-j2`; the workflow has a 60-minute ceiling. Each build
-command has a fixed deadline and an 8-MiB log limit (one extra byte detects
-overflow). The native packaging worker retains its 120-second deadline and
+command has an absolute deadline, 4-MiB limits per native stream and an
+8-MiB combined private-log limit (one extra byte detects overflow), followed
+by an independent ten-second supervisor cleanup deadline. The native packaging
+worker retains its 120-second deadline and
 independent two-second cleanup budget. Each native boot is limited to 60
-seconds with the existing independent cleanup budget; an outer 660-second
-compute ceiling also bounds the orchestration and post-exit hashing.
+seconds with the existing independent cleanup budget; the Actions job deadline
+separately bounds orchestration and post-exit hashing without GNU `timeout`.
 The empty private package output and four boot work directories are created
 before boot-input custody, and the native packager accepts its slot only while
 empty; later package and serial writes therefore keep the shared
@@ -213,20 +254,32 @@ cp support/tools/hyperv/local_boot/build.zig \
 zig build --build-file .d/wamr-ci-check/restore/build.zig --fetch=all \
   --cache-dir .d/wamr-ci-check/cache \
   --global-cache-dir .d/wamr-ci-check/global-cache -j2
+zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
+  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
+  --cache-dir .d/wamr-ci-check/cache \
+  --global-cache-dir .d/wamr-ci-check/global-cache \
+  --prefix "$PWD/.d/wamr-ci-check/supervisor" \
+  -Doptimize=ReleaseSafe -j2 install
 zig build --build-file support/build/wamr-native-ci/build.zig \
   --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
   --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
   -Doptimize=ReleaseSafe -j2 test install
 WAMR_CI_PACKAGE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-package" \
+WAMR_CI_SUPERVISOR="$PWD/.d/wamr-ci-check/supervisor/bin/wamr-ci-supervisor" \
+WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fixture" \
   python3 -m unittest discover -s support/build/wamr-native-ci/tests -v
 ```
 
 The Python fixtures use the actual native packaging helper and pinned miz
 with a synthetic **nonbootable** PE, plus synthetic compute/log records.
 They check full raw/VHD/footer hashes, physical reload, mutation/partial-state/
-replay refusal, exact results and the four CLI configurations. These are not
+replay refusal, exact results, the four CLI configurations, standard
+descendant cleanup, timeout/overflow/nonzero/exec failures, cleanup poison,
+canonical-result tamper, executable identity and the closed environment.
+These are not
 guest execution evidence. `WAMR_CI_PACKAGE` selects only that test executable;
-production orchestration has no fixture, executable-override or skip switch.
+the supervisor fixture is likewise test-only. Production orchestration has no
+fixture, executable-override or skip switch.
 ARM development can run these fixtures, but cannot qualify the guest.
 Only a successful real x86 PR run of the corrected, committed native base
 establishes the first local tiny-compute observation.
@@ -289,6 +342,13 @@ contract and may omit the new external-digest input; any archive containing a
 current custody claim requires it. Member names, modes/types, individual
 sizes, complete SHA256/EOF, source/run bindings and successful receipts are
 checked.
+The exact pre-supervisor merged sources
+`0711a0b6bf2285a4ba6ab6dd3bd4088478d665e1`,
+`c9c00535399354063486957611bf6e09c8ae4592` and
+`3c6d5d98dc5736d86e97884184b26be39c3f11d5`, with their literal recorded
+trees, remain compatible with the same fixed 20-evidence/55-file archive
+shape without a command-supervisor record. Any other current source must carry
+the native supervisor result fields and guarded producer maps.
 Symlinks/hardlinks, duplicate/extra/absolute/traversal members, compression,
 oversize inputs and known credential/account/approval patterns are refused.
 
