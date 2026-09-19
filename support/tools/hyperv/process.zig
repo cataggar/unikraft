@@ -354,6 +354,19 @@ fn createExecutableSnapshot(executable: Executable, gate: ?*CommandSnapshotGate)
     return descriptor;
 }
 
+fn createCommandExecutableSnapshot(
+    executable: Executable,
+    gate: ?*CommandSnapshotGate,
+    fault: ?CommandPreSpawnTestFault,
+) !linux.fd_t {
+    if (fault) |active| switch (active) {
+        .snapshot_unsupported => return error.ExecutableSnapshotUnsupported,
+        .snapshot_local_io => return error.ExecutableSnapshotUnavailable,
+        .spawn_local_io => {},
+    };
+    return createExecutableSnapshot(executable, gate);
+}
+
 pub const ExecutableSnapshotTest = struct {
     pub fn create(executable: Executable) !linux.fd_t {
         if (!builtin.is_test) @compileError("executable snapshot evidence is test-only");
@@ -455,10 +468,30 @@ pub const CommandPidfdTestState = struct {
     }
 };
 
+pub const CommandClockTest = struct {
+    monitor_check_ns: u64,
+    leader_exit_ns: u64,
+    monitor_checks: u32 = 0,
+    leader_exit_observations: u32 = 0,
+};
+
+pub const CommandSignalTestState = struct {
+    attempts: u32 = 0,
+};
+
+pub const CommandPreSpawnTestFault = enum {
+    snapshot_unsupported,
+    snapshot_local_io,
+    spawn_local_io,
+};
+
 pub const CommandTestOptions = struct {
     snapshot_gate: ?*CommandSnapshotGate = null,
     leader_track_delay_ms: u32 = 0,
     pidfd: ?*CommandPidfdTestState = null,
+    clock: ?*CommandClockTest = null,
+    signal: ?*CommandSignalTestState = null,
+    pre_spawn: ?CommandPreSpawnTestFault = null,
 };
 
 pub const CommandLimits = struct {
@@ -689,58 +722,65 @@ fn runCommandImpl(
         .stderr_output = result.storage[request.limits.stdout_bytes..],
         .stderr_limit = request.limits.stderr_bytes,
     };
-    if (try request.primary_deadline.expired()) {
-        result.primary = .timeout;
-        result.primary_deadline_reached = true;
-        result.stdout_status = .complete;
-        result.stderr_status = .complete;
-        try completeAllCommandTiming(&result);
-        return result;
-    }
-    if (cancelled(options)) {
-        result.primary = .cancelled;
-        result.cancellation_observed = true;
-        result.stdout_status = .complete;
-        result.stderr_status = .complete;
-        try completeAllCommandTiming(&result);
-        return result;
-    }
+    var observed_ns = try now();
+    if (observed_ns >= request.primary_deadline.expires_ns)
+        return completePreSpawnCommand(&result, .timeout, observed_ns);
+    if (cancelled(options))
+        return completePreSpawnCommand(&result, .cancelled, observed_ns);
 
-    const snapshot = try createExecutableSnapshot(
+    const snapshot = createCommandExecutableSnapshot(
         request.executable,
         if (test_options) |options_value| options_value.snapshot_gate else null,
-    );
+        if (test_options) |options_value| options_value.pre_spawn else null,
+    ) catch |err| switch (err) {
+        error.ExecutableSnapshotUnsupported => {
+            observed_ns = try now();
+            return completePreSpawnCommand(
+                &result,
+                if (observed_ns >= request.primary_deadline.expires_ns)
+                    .timeout
+                else
+                    .snapshot_unsupported,
+                observed_ns,
+            );
+        },
+        error.ExecutableSnapshotUnavailable, error.ExecutableSnapshotInvalid => {
+            observed_ns = try now();
+            return completePreSpawnCommand(
+                &result,
+                if (observed_ns >= request.primary_deadline.expires_ns) .timeout else .local_io,
+                observed_ns,
+            );
+        },
+        else => return err,
+    };
     defer _ = linux.close(snapshot);
-    if (try request.primary_deadline.expired()) {
-        result.primary = .timeout;
-        result.primary_deadline_reached = true;
-        result.stdout_status = .complete;
-        result.stderr_status = .complete;
-        try completeAllCommandTiming(&result);
-        return result;
-    }
-    if (cancelled(options)) {
-        result.primary = .cancelled;
-        result.cancellation_observed = true;
-        result.stdout_status = .complete;
-        result.stderr_status = .complete;
-        try completeAllCommandTiming(&result);
-        return result;
-    }
+    observed_ns = try now();
+    if (observed_ns >= request.primary_deadline.expires_ns)
+        return completePreSpawnCommand(&result, .timeout, observed_ns);
+    if (cancelled(options))
+        return completePreSpawnCommand(&result, .cancelled, observed_ns);
 
     var tracker = try OwnedTracker.init(
         allocator,
         request.limits.descendants,
         if (test_options) |options_value| options_value.pidfd else null,
+        if (test_options) |options_value| options_value.signal else null,
     );
     defer tracker.deinit(allocator);
-    var child = spawnOwned(allocator, options, null, snapshot) catch |err| {
+    var child = spawnCommandOwned(
+        allocator,
+        options,
+        snapshot,
+        if (test_options) |options_value| options_value.pre_spawn else null,
+    ) catch |err| {
         if (err != error.SpawnFailed) return err;
-        result.primary = .local_io;
-        result.stdout_status = .complete;
-        result.stderr_status = .complete;
-        try completeAllCommandTiming(&result);
-        return result;
+        observed_ns = try now();
+        return completePreSpawnCommand(
+            &result,
+            if (observed_ns >= request.primary_deadline.expires_ns) .timeout else .local_io,
+            observed_ns,
+        );
     };
     defer _ = linux.close(child.stdout);
     defer _ = linux.close(child.stderr);
@@ -764,7 +804,16 @@ fn runCommandImpl(
     };
 
     var monitor_completed = true;
-    monitorCommand(&child, options, &capture, request.limits.primary_events, &result.primary_events) catch |err| {
+    var terminal_observed_ns: ?u64 = null;
+    monitorCommand(
+        &child,
+        options,
+        &capture,
+        request.limits.primary_events,
+        &result.primary_events,
+        if (test_options) |options_value| options_value.clock else null,
+        &terminal_observed_ns,
+    ) catch |err| {
         monitor_completed = false;
         switch (err) {
             error.DeadlineExceeded => {
@@ -793,7 +842,14 @@ fn runCommandImpl(
         if (err == error.StdoutIo or err == error.StderrIo or err == error.PollFailed or err == error.WaitFailed)
             result.primary = .local_io;
     };
-    try completePrimaryCommandTiming(&result);
+    const primary_observed_ns = terminal_observed_ns orelse try now();
+    completePrimaryCommandTimingAt(&result, primary_observed_ns);
+    if (result.primary_completed_ns >= request.primary_deadline.expires_ns) {
+        monitor_completed = false;
+        result.primary = .timeout;
+        result.primary_deadline_reached = true;
+        result.cancellation_observed = false;
+    }
 
     cleanupCommand(io, proc, request, &tracker, &result) catch |err| {
         result.cleanup_complete = false;
@@ -829,9 +885,27 @@ fn runCommandImpl(
     return result;
 }
 
-fn completePrimaryCommandTiming(result: *CommandResult) !void {
-    const timestamp = try now();
+fn completePreSpawnCommand(
+    result: *CommandResult,
+    primary: CommandPrimary,
+    observed_ns: u64,
+) CommandResult {
+    result.primary = primary;
+    result.primary_deadline_reached = primary == .timeout;
+    result.cancellation_observed = primary == .cancelled;
+    result.stdout_status = .complete;
+    result.stderr_status = .complete;
+    completePrimaryCommandTimingAt(result, observed_ns);
+    result.completed_ns = result.primary_completed_ns;
+    return result.*;
+}
+
+fn completePrimaryCommandTimingAt(result: *CommandResult, timestamp: u64) void {
     result.primary_completed_ns = @max(result.started_ns, timestamp);
+}
+
+fn completePrimaryCommandTiming(result: *CommandResult) !void {
+    completePrimaryCommandTimingAt(result, try now());
 }
 
 fn completeCleanupCommandTiming(result: *CommandResult) !void {
@@ -1215,6 +1289,8 @@ fn monitorCommand(
     capture: *Capture,
     event_limit: u32,
     events: *u32,
+    clock: ?*CommandClockTest,
+    terminal_observed_ns: *?u64,
 ) !void {
     try nonblocking(child.stdout);
     try nonblocking(child.stderr);
@@ -1223,7 +1299,11 @@ fn monitorCommand(
     while (true) {
         try takeCommandEvent(event_limit, events);
         if (cancelled(options)) return error.Cancelled;
-        if (try options.deadline.expired()) return error.DeadlineExceeded;
+        const deadline_observed_ns = try commandMonitorTimestamp(clock);
+        if (deadline_observed_ns >= options.deadline.expires_ns) {
+            terminal_observed_ns.* = deadline_observed_ns;
+            return error.DeadlineExceeded;
+        }
         if (!capture.stdout_eof) capture.drain(child.stdout, false, options) catch |err| switch (err) {
             error.OutputLimit => return error.StdoutLimit,
             error.CaptureFailed => return error.StdoutIo,
@@ -1240,19 +1320,21 @@ fn monitorCommand(
         };
         if (!exec_confirmed) exec_confirmed = try execStatus(child.control);
         if (try exited(child.pid)) {
+            const observed_ns = try commandLeaderExitObserved(clock);
+            terminal_observed_ns.* = observed_ns;
+            // Deadline.expired uses the same inclusive boundary: a terminal
+            // observation exactly at the absolute deadline is a timeout.
+            if (observed_ns >= options.deadline.expires_ns)
+                return error.DeadlineExceeded;
             if (!exec_confirmed and !try execStatus(child.control)) return error.SpawnFailed;
-            if (!capture.stdout_eof) capture.drain(child.stdout, false, options) catch |err| switch (err) {
+            if (!capture.stdout_eof) capture.drainFinal(child.stdout, false) catch |err| switch (err) {
                 error.OutputLimit => return error.StdoutLimit,
                 error.CaptureFailed => return error.StdoutIo,
-                error.Cancelled => return error.Cancelled,
-                error.DeadlineExceeded => return error.DeadlineExceeded,
                 else => return error.StdoutIo,
             };
-            if (!capture.stderr_eof) capture.drain(child.stderr, true, options) catch |err| switch (err) {
+            if (!capture.stderr_eof) capture.drainFinal(child.stderr, true) catch |err| switch (err) {
                 error.OutputLimit => return error.StderrLimit,
                 error.CaptureFailed => return error.StderrIo,
-                error.Cancelled => return error.Cancelled,
-                error.DeadlineExceeded => return error.DeadlineExceeded,
                 else => return error.StderrIo,
             };
             return;
@@ -1266,6 +1348,21 @@ fn monitorCommand(
             else => return error.PollFailed,
         }
     }
+}
+
+fn commandMonitorTimestamp(clock: ?*CommandClockTest) !u64 {
+    return if (clock) |active| timestamp: {
+        active.monitor_checks += 1;
+        break :timestamp active.monitor_check_ns;
+    } else try now();
+}
+
+fn commandLeaderExitObserved(clock: ?*CommandClockTest) !u64 {
+    if (clock) |active| {
+        active.leader_exit_observations += 1;
+        return active.leader_exit_ns;
+    }
+    return now();
 }
 
 fn takeCommandEvent(limit: u32, events: *u32) !void {
@@ -1403,16 +1500,19 @@ const OwnedTracker = struct {
     descendant_limit: u16,
     report: CommandDescendants = .{},
     pidfd_test: ?*CommandPidfdTestState,
+    signal_test: ?*CommandSignalTestState,
 
     fn init(
         allocator: std.mem.Allocator,
         descendant_limit: u16,
         pidfd_test: ?*CommandPidfdTestState,
+        signal_test: ?*CommandSignalTestState,
     ) !OwnedTracker {
         return .{
             .items = try allocator.alloc(OwnedProcess, @as(usize, descendant_limit) + 2),
             .descendant_limit = descendant_limit,
             .pidfd_test = pidfd_test,
+            .signal_test = signal_test,
         };
     }
 
@@ -1584,7 +1684,13 @@ fn scanOwned(
                 try signalTemporary(descriptor, phase, &ownership);
             } else {
                 ownership.transfer();
-                try signalOwned(request, &tracker.items[tracker.len - 1], result, phase);
+                try signalOwned(
+                    request,
+                    &tracker.items[tracker.len - 1],
+                    result,
+                    phase,
+                    tracker.signal_test,
+                );
             }
             discovered_pass = true;
             discovered_any = true;
@@ -1599,7 +1705,8 @@ fn signalTracked(
     result: *CommandResult,
     phase: CleanupSignal,
 ) !void {
-    for (tracker.items[0..tracker.len]) |*item| try signalOwned(request, item, result, phase);
+    for (tracker.items[0..tracker.len]) |*item|
+        try signalOwned(request, item, result, phase, tracker.signal_test);
 }
 
 fn signalOwned(
@@ -1607,6 +1714,7 @@ fn signalOwned(
     item: *OwnedProcess,
     result: *CommandResult,
     phase: CleanupSignal,
+    signal_test: ?*CommandSignalTestState,
 ) !void {
     const already = if (phase == .term) item.term_sent else item.kill_sent;
     if (already) return;
@@ -1615,6 +1723,7 @@ fn signalOwned(
         if (phase == .term) item.term_sent = true else item.kill_sent = true;
         return;
     }
+    if (signal_test) |state| state.attempts += 1;
     const signal: linux.SIG = if (phase == .term) .TERM else .KILL;
     switch (linux.errno(linux.pidfd_send_signal(item.pidfd, signal, null, 0))) {
         .SUCCESS, .SRCH => {},
@@ -2088,6 +2197,16 @@ const Spawned = struct {
     stderr: linux.fd_t,
     control: linux.fd_t,
 };
+
+fn spawnCommandOwned(
+    allocator: std.mem.Allocator,
+    options: Options,
+    executable: linux.fd_t,
+    fault: ?CommandPreSpawnTestFault,
+) !Spawned {
+    if (fault == .spawn_local_io) return error.SpawnFailed;
+    return spawnOwned(allocator, options, null, executable);
+}
 
 // Zig 0.16 Threaded.spawn loses PID and pipe ownership on exec failure. Keep the
 // fork/exec handshake here so both spawn errors and pre-exec stalls are supervised.

@@ -2450,9 +2450,9 @@ source/generated/
         boundary_request = boundary["supervisor"]["request"]
         boundary_timing = boundary_command["timing"]
         boundary_timing["primary_completed_ns"] = (
-            boundary_request["primary_deadline_ns"])
+            boundary_request["primary_deadline_ns"] - 1)
         boundary_timing["completed_ns"] = (
-            boundary_request["primary_deadline_ns"] + 1)
+            boundary_request["primary_deadline_ns"])
         boundary_timing["primary_elapsed_ns"] = (
             boundary_timing["primary_completed_ns"]
             - boundary_timing["started_ns"])
@@ -2580,6 +2580,20 @@ source/generated/
         changed = copy.deepcopy(record)
         request = changed["supervisor"]["request"]
         command = changed["supervisor"]["result"]["command"]
+        timing = command["timing"]
+        timing["primary_completed_ns"] = request["primary_deadline_ns"]
+        timing["completed_ns"] = request["primary_deadline_ns"] + 1
+        timing["primary_elapsed_ns"] = (
+            timing["primary_completed_ns"] - timing["started_ns"])
+        timing["cleanup_elapsed_ns"] = 1
+        timing["total_elapsed_ns"] = (
+            timing["completed_ns"] - timing["started_ns"])
+        mutations.append(("success-at-deadline",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        request = changed["supervisor"]["request"]
+        command = changed["supervisor"]["result"]["command"]
         command["primary"] = {"code": None, "kind": "timeout"}
         command["primary_deadline_reached"] = True
         command["termination"] = {"code": 15, "kind": "signal"}
@@ -2660,6 +2674,135 @@ source/generated/
             public_bundle.supervised_command_record(
                 ci, changed, "fixtures", python_identities,
                 "trusted_inner_zip")
+
+    def test_public_pre_spawn_state_vectors_are_exact_and_rehashed(self):
+        record, identities = self.supervised_binding(
+            "public-validator-build")
+
+        def fixture(kind):
+            value = copy.deepcopy(record)
+            request = value["supervisor"]["request"]
+            command = value["supervisor"]["result"]["command"]
+            timing = command["timing"]
+            observed = (request["primary_deadline_ns"]
+                        if kind == "timeout"
+                        else timing["started_ns"] + 1)
+            command.update({
+                "cancellation_observed": kind == "cancelled",
+                "cleanup": "not_required",
+                "cleanup_complete": True,
+                "cleanup_events": 0,
+                "descendants": {
+                    "adopted": 0,
+                    "identity_validated": 0,
+                    "limit_exceeded": False,
+                    "observed": 0,
+                    "untracked": False,
+                },
+                "executable_stable": True,
+                "poisoned": False,
+                "primary": {"code": None, "kind": kind},
+                "primary_deadline_reached": kind == "timeout",
+                "primary_events": 0,
+                "reap_events": 0,
+                "termination": {"code": None, "kind": None},
+            })
+            timing.update({
+                "cleanup_elapsed_ns": 0,
+                "completed_ns": observed,
+                "primary_completed_ns": observed,
+                "primary_elapsed_ns": observed - timing["started_ns"],
+                "total_elapsed_ns": observed - timing["started_ns"],
+            })
+            return self.rehash_supervised_binding(value)
+
+        def validate(value):
+            request = value["supervisor"]["request"]
+            command = value["supervisor"]["result"]["command"]
+            return ci.validate_supervisor_state(
+                command, request["limits"], command["timing"], {
+                    "stdout": command["stdout"],
+                    "stderr": command["stderr"],
+                }, request["primary_deadline_ns"],
+                "invalid supervised command binding")
+
+        for kind in (
+                "timeout", "cancelled", "local_io",
+                "snapshot_unsupported"):
+            with self.subTest(valid=kind):
+                validate(fixture(kind))
+
+        valid = fixture("local_io")
+        mutations = []
+
+        changed = copy.deepcopy(valid)
+        command = changed["supervisor"]["result"]["command"]
+        data = b"x"
+        command["stdout"] = {
+            "bytes": len(data),
+            "digest_scope": ci.command_digest_scope(len(data)),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "status": "complete",
+        }
+        command["output"] = {
+            "bytes": len(data),
+            "combined_sha256": hashlib.sha256(data).hexdigest(),
+            "commitment_sha256": ci.command_output_commitment(
+                len(data), command["stdout"]["sha256"],
+                0, ci.EMPTY_SHA256),
+            "digest_scope": ci.command_digest_scope(len(data)),
+        }
+        changed["bytes"] = len(data)
+        changed["sha256"] = command["output"]["combined_sha256"]
+        changed["sha256_scope"] = command["output"]["digest_scope"]
+        mutations.append(("output", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        changed["supervisor"]["result"]["command"]["stdout"][
+            "status"] = "overflow"
+        mutations.append(("overflow", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        changed["supervisor"]["result"]["command"]["termination"] = {
+            "code": 0, "kind": "exited",
+        }
+        mutations.append((
+            "termination", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        command = changed["supervisor"]["result"]["command"]
+        command["primary"] = {"code": 0, "kind": "exited"}
+        command["termination"] = {"code": 0, "kind": "exited"}
+        mutations.append((
+            "primary", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        changed["supervisor"]["result"]["command"][
+            "executable_stable"] = False
+        mutations.append((
+            "executable", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        changed["supervisor"]["result"]["command"]["stdout"][
+            "sha256"] = "0" * 64
+        mutations.append((
+            "empty-hash", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        command = changed["supervisor"]["result"]["command"]
+        command["timing"]["completed_ns"] += 1
+        command["timing"]["cleanup_elapsed_ns"] = 1
+        command["timing"]["total_elapsed_ns"] += 1
+        mutations.append((
+            "cleanup-time", self.rehash_supervised_binding(changed)))
+
+        for name, changed in mutations:
+            with self.subTest(name=name), self.assertRaises(ci.Refusal):
+                validate(changed)
+            with self.subTest(public=name), self.assertRaises(ValueError):
+                public_bundle.supervised_command_record(
+                    ci, changed, "public-validator-build", identities,
+                    "trusted_inner_zip")
 
     def test_valid_hosted_command_invariant_vectors(self):
         vectors = (
@@ -3027,9 +3170,134 @@ source/generated/
         early, unused_stdout, unused_stderr = ci.decoded_supervisor_result(
             early_raw, early_request, expected)
         del unused_stdout, unused_stderr
-        self.assertEqual(early["command"]["cleanup"], "not_required")
-        self.assertEqual(early["command"]["primary_events"], 0)
-        self.assertEqual(early["command"]["cleanup_events"], 0)
+        early_command = early["command"]
+        self.assertEqual(early_command["cleanup"], "not_required")
+        self.assertEqual(early_command["primary_events"], 0)
+        self.assertEqual(early_command["cleanup_events"], 0)
+        self.assertEqual(early_command["reap_events"], 0)
+        self.assertEqual(early_command["stdout_bytes"], 0)
+        self.assertEqual(early_command["stderr_bytes"], 0)
+        self.assertEqual(early_command["stdout_status"], "complete")
+        self.assertEqual(early_command["stderr_status"], "complete")
+        self.assertEqual(early_command["stdout_sha256"], ci.EMPTY_SHA256)
+        self.assertEqual(early_command["stderr_sha256"], ci.EMPTY_SHA256)
+        self.assertEqual(
+            early_command["output_sha256"],
+            ci.command_output_commitment(
+                0, ci.EMPTY_SHA256, 0, ci.EMPTY_SHA256))
+        self.assertEqual(
+            early_command["termination"], {"code": None, "kind": None})
+        self.assertTrue(early_command["executable_stable"])
+        self.assertEqual(
+            early_command["primary_completed_ns"],
+            early_command["completed_ns"])
+
+        def pre_spawn_fixture(kind):
+            value = copy.deepcopy(early)
+            request = copy.deepcopy(early_request)
+            command = value["command"]
+            started = command["started_ns"]
+            request["primary_deadline_ns"] = started + 1000
+            request["cleanup_deadline_ns"] = started + 2000
+            if kind == "timeout":
+                observed = request["primary_deadline_ns"]
+            else:
+                observed = started + 1
+            command.update({
+                "cancellation_observed": kind == "cancelled",
+                "completed_ns": observed,
+                "primary": {"code": None, "kind": kind},
+                "primary_completed_ns": observed,
+                "primary_deadline_reached": kind == "timeout",
+            })
+            request_raw = ci.validate_supervisor_request(request)
+            value["request_bytes"] = len(request_raw)
+            value["request_sha256"] = hashlib.sha256(
+                request_raw).hexdigest()
+            return value, request
+
+        for kind in (
+                "timeout", "cancelled", "local_io",
+                "snapshot_unsupported"):
+            value, request = pre_spawn_fixture(kind)
+            with self.subTest(valid_pre_spawn=kind):
+                ci.decoded_supervisor_result(
+                    ci.canonical_json(value), request, expected)
+
+        exact_negatives = []
+        valid, valid_request = pre_spawn_fixture("local_io")
+
+        changed = copy.deepcopy(valid)
+        command = changed["command"]
+        raw_stdout = b"x"
+        command["stdout_base64"] = base64.b64encode(
+            raw_stdout).decode("ascii")
+        command["stdout_bytes"] = len(raw_stdout)
+        command["stdout_sha256"] = hashlib.sha256(raw_stdout).hexdigest()
+        command["output_sha256"] = ci.command_output_commitment(
+            len(raw_stdout), command["stdout_sha256"],
+            0, ci.EMPTY_SHA256)
+        exact_negatives.append(("not-required-output", changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["stdout_status"] = "overflow"
+        exact_negatives.append(("not-required-overflow", changed))
+
+        for kind, code in (
+                ("exited", 0), ("signal", 15), ("unknown", 0)):
+            changed = copy.deepcopy(valid)
+            changed["command"]["primary"] = {
+                "code": code, "kind": kind,
+            }
+            changed["command"]["termination"] = {
+                "code": code, "kind": kind,
+            }
+            exact_negatives.append(("not-required-" + kind, changed))
+
+        for kind in (
+                "output_overflow", "exec_failed", "event_limit",
+                "executable_changed"):
+            changed = copy.deepcopy(valid)
+            changed["command"]["primary"] = {
+                "code": None, "kind": kind,
+            }
+            if kind == "event_limit":
+                changed["command"]["primary_events"] = (
+                    valid_request["limits"]["primary_events"])
+            if kind == "executable_changed":
+                changed["command"]["executable_stable"] = False
+                changed["command"]["termination"] = {
+                    "code": 0, "kind": "exited",
+                }
+            exact_negatives.append(("not-required-" + kind, changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["termination"] = {
+            "code": 0, "kind": "exited",
+        }
+        exact_negatives.append(("not-required-termination", changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["executable_stable"] = False
+        exact_negatives.append(("not-required-mutated-executable", changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["stdout_sha256"] = "0" * 64
+        changed["command"]["output_sha256"] = ci.command_output_commitment(
+            0, "0" * 64, 0, ci.EMPTY_SHA256)
+        exact_negatives.append(("not-required-empty-hash", changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["completed_ns"] += 1
+        exact_negatives.append(("not-required-cleanup-time", changed))
+
+        for name, changed in exact_negatives:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    ci.Refusal, "invalid native command result"):
+                ci.decoded_supervisor_result(
+                    ci.canonical_json(changed),
+                    valid_request, expected)
+
         for name, fields in (
                 ("zero-events", {
                     "primary_events": 0,

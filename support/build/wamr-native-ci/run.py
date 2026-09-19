@@ -2283,7 +2283,11 @@ def validate_supervisor_state(
     for name in ("stdout", "stderr"):
         stream = streams[name]
         size = native_u64(stream["bytes"], reason)
-        require(stream["status"] in {
+        require(isinstance(stream, dict)
+                and set(stream) >= {"bytes", "sha256", "status"}
+                and native_digest(stream["sha256"], reason)
+                == stream["sha256"]
+                and stream["status"] in {
             "complete", "overflow", "io_failed", "incomplete",
         }
                 and size <= limits[name + "_bytes"]
@@ -2295,8 +2299,10 @@ def validate_supervisor_state(
         timing["primary_completed_ns"], reason)
     completed = native_u64(timing["completed_ns"], reason)
     require(started <= primary_completed <= completed
-            and (primary["kind"] != "timeout"
-                 or primary_completed >= primary_deadline_ns),
+            and ((primary["kind"] == "timeout"
+                  and primary_completed >= primary_deadline_ns)
+                 or (primary["kind"] != "timeout"
+                     and primary_completed < primary_deadline_ns)),
             reason)
     if command["cleanup"] == "complete":
         require(command["primary_events"]
@@ -2310,6 +2316,19 @@ def validate_supervisor_state(
         require(command["primary_events"] == 0
                 and command["cleanup_events"] == 0
                 and command["reap_events"] == 0
+                and command["executable_stable"] is True
+                and primary["kind"] in {
+                    "timeout", "cancelled", "local_io",
+                    "snapshot_unsupported",
+                }
+                and termination == {"code": None, "kind": None}
+                and completed == primary_completed
+                and streams["stdout"]["bytes"] == 0
+                and streams["stdout"]["sha256"] == EMPTY_SHA256
+                and streams["stdout"]["status"] == "complete"
+                and streams["stderr"]["bytes"] == 0
+                and streams["stderr"]["sha256"] == EMPTY_SHA256
+                and streams["stderr"]["status"] == "complete"
                 and descendants == {
                     "adopted": 0,
                     "identity_validated": 0,
@@ -3015,7 +3034,7 @@ def validate_supervised_command_binding(
             and timing["total_elapsed_ns"]
             == timing["completed_ns"] - timing["started_ns"]
             and timing["primary_completed_ns"]
-            <= request["primary_deadline_ns"]
+            < request["primary_deadline_ns"]
             and timing["completed_ns"] <= request["cleanup_deadline_ns"],
             "invalid supervised command binding")
     descendants = command["descendants"]
@@ -3171,10 +3190,12 @@ def decoded_supervisor_result(
             }, {
                 "stdout": {
                     "bytes": len(stdout),
+                    "sha256": stdout_sha256,
                     "status": command["stdout_status"],
                 },
                 "stderr": {
                     "bytes": len(stderr),
+                    "sha256": stderr_sha256,
                     "status": command["stderr_status"],
                 },
             }, request["primary_deadline_ns"], reason))
@@ -3188,7 +3209,7 @@ def decoded_supervisor_result(
             and (command["cleanup"] != "complete"
                  or completed <= request["cleanup_deadline_ns"])
             and (primary != {"code": 0, "kind": "exited"}
-                 or primary_completed <= request["primary_deadline_ns"]),
+                 or primary_completed < request["primary_deadline_ns"]),
             reason)
     return value, stdout, stderr
 
