@@ -416,9 +416,49 @@ pub const CommandSnapshotGate = struct {
     continue_copy: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
+pub const CommandPidfdTestFault = enum {
+    second_parent_verification,
+    temporary_signal,
+};
+
+pub const CommandPidfdTestState = struct {
+    fault: CommandPidfdTestFault,
+    candidate_opens: u32 = 0,
+    candidate_closes: u32 = 0,
+    candidate_transfers: u32 = 0,
+    fault_injections: u32 = 0,
+    fault_candidate: ?u32 = null,
+    fault_candidate_closes: u32 = 0,
+    fault_candidate_transfers: u32 = 0,
+
+    fn openCandidate(self: *CommandPidfdTestState) u32 {
+        const candidate = self.candidate_opens;
+        self.candidate_opens += 1;
+        return candidate;
+    }
+
+    fn inject(self: *CommandPidfdTestState, fault: CommandPidfdTestFault, candidate: u32) bool {
+        if (self.fault != fault or self.fault_injections != 0) return false;
+        self.fault_injections = 1;
+        self.fault_candidate = candidate;
+        return true;
+    }
+
+    fn closeCandidate(self: *CommandPidfdTestState, candidate: u32) void {
+        self.candidate_closes += 1;
+        if (self.fault_candidate == candidate) self.fault_candidate_closes += 1;
+    }
+
+    fn transferCandidate(self: *CommandPidfdTestState, candidate: u32) void {
+        self.candidate_transfers += 1;
+        if (self.fault_candidate == candidate) self.fault_candidate_transfers += 1;
+    }
+};
+
 pub const CommandTestOptions = struct {
     snapshot_gate: ?*CommandSnapshotGate = null,
     leader_track_delay_ms: u32 = 0,
+    pidfd: ?*CommandPidfdTestState = null,
 };
 
 pub const CommandLimits = struct {
@@ -677,7 +717,11 @@ fn runCommandImpl(
         return result;
     }
 
-    var tracker = try OwnedTracker.init(allocator, request.limits.descendants);
+    var tracker = try OwnedTracker.init(
+        allocator,
+        request.limits.descendants,
+        if (test_options) |options_value| options_value.pidfd else null,
+    );
     defer tracker.deinit(allocator);
     var child = spawnOwned(allocator, options, null, snapshot) catch |err| {
         if (err != error.SpawnFailed) return err;
@@ -1285,16 +1329,59 @@ const OwnedProcess = struct {
     reaped: bool = false,
 };
 
+const PidfdOwnership = struct {
+    descriptor: linux.fd_t,
+    test_state: ?*CommandPidfdTestState = null,
+    candidate: ?u32 = null,
+    owned: bool = true,
+
+    fn init(descriptor: linux.fd_t) PidfdOwnership {
+        return .{ .descriptor = descriptor };
+    }
+
+    fn initCandidate(descriptor: linux.fd_t, test_state: ?*CommandPidfdTestState) PidfdOwnership {
+        return .{
+            .descriptor = descriptor,
+            .test_state = test_state,
+            .candidate = if (test_state) |state| state.openCandidate() else null,
+        };
+    }
+
+    fn deinit(self: *PidfdOwnership) void {
+        if (!self.owned) return;
+        self.owned = false;
+        _ = linux.close(self.descriptor);
+        if (self.test_state) |state| state.closeCandidate(self.candidate.?);
+    }
+
+    fn transfer(self: *PidfdOwnership) void {
+        std.debug.assert(self.owned);
+        self.owned = false;
+        if (self.test_state) |state| state.transferCandidate(self.candidate.?);
+    }
+
+    fn inject(self: *const PidfdOwnership, fault: CommandPidfdTestFault) bool {
+        const state = self.test_state orelse return false;
+        return state.inject(fault, self.candidate.?);
+    }
+};
+
 const OwnedTracker = struct {
     items: []OwnedProcess,
     len: usize = 0,
     descendant_limit: u16,
     report: CommandDescendants = .{},
+    pidfd_test: ?*CommandPidfdTestState,
 
-    fn init(allocator: std.mem.Allocator, descendant_limit: u16) !OwnedTracker {
+    fn init(
+        allocator: std.mem.Allocator,
+        descendant_limit: u16,
+        pidfd_test: ?*CommandPidfdTestState,
+    ) !OwnedTracker {
         return .{
             .items = try allocator.alloc(OwnedProcess, @as(usize, descendant_limit) + 2),
             .descendant_limit = descendant_limit,
+            .pidfd_test = pidfd_test,
         };
     }
 
@@ -1309,12 +1396,14 @@ const OwnedTracker = struct {
         if (observed.pid != pid or observed.parent != linux.getpid() or observed.start_ticks == 0)
             return error.IdentityChanged;
         const descriptor = try commandPidfd(pid);
-        errdefer _ = linux.close(descriptor);
+        var ownership = PidfdOwnership.init(descriptor);
+        defer ownership.deinit();
         const identity = (try verifiedOwnedIdentity(proc, observed.pid, observed.start_ticks, descriptor)) orelse
             return error.IdentityChanged;
         if (identity.parent != linux.getpid()) return error.IdentityChanged;
         self.items[0] = .{ .pid = pid, .start_ticks = identity.start_ticks, .pidfd = descriptor };
         self.len = 1;
+        ownership.transfer();
     }
 
     fn findPid(self: *const OwnedTracker, pid: linux.pid_t) ?usize {
@@ -1322,7 +1411,15 @@ const OwnedTracker = struct {
         return null;
     }
 
-    fn ownsLiveParent(self: *const OwnedTracker, proc: linux.fd_t, parent: linux.pid_t) !bool {
+    fn ownsLiveParent(
+        self: *const OwnedTracker,
+        proc: linux.fd_t,
+        parent: linux.pid_t,
+        candidate: ?*const PidfdOwnership,
+    ) !bool {
+        if (candidate) |ownership| {
+            if (ownership.inject(.second_parent_verification)) return error.IdentityChanged;
+        }
         if (parent == linux.getpid()) return true;
         const index = self.findPid(parent) orelse return false;
         return (try verifiedLiveIdentity(
@@ -1438,27 +1535,24 @@ fn scanOwned(
                 error.ProcessGone => continue,
                 else => return error.ProcUnavailable,
             };
-            if (!try tracker.ownsLiveParent(proc, observed.parent)) continue;
+            if (!try tracker.ownsLiveParent(proc, observed.parent, null)) continue;
             const descriptor = commandPidfd(pid) catch |err| switch (err) {
                 error.ProcessGone => continue,
                 else => return error.PidfdUnavailable,
             };
-            const verified = verifiedOwnedIdentity(proc, observed.pid, observed.start_ticks, descriptor) catch |err| {
-                _ = linux.close(descriptor);
-                return err;
-            };
-            const identity = verified orelse {
-                _ = linux.close(descriptor);
-                continue;
-            };
-            if (!try tracker.ownsLiveParent(proc, identity.parent)) {
-                _ = linux.close(descriptor);
-                continue;
-            }
+            var ownership = PidfdOwnership.initCandidate(descriptor, tracker.pidfd_test);
+            defer ownership.deinit();
+            const identity = (try verifiedOwnedIdentity(
+                proc,
+                observed.pid,
+                observed.start_ticks,
+                descriptor,
+            )) orelse continue;
+            if (!try tracker.ownsLiveParent(proc, identity.parent, &ownership)) continue;
             if (!tracker.addDescendant(identity, descriptor)) {
-                try signalTemporary(descriptor, phase);
-                _ = linux.close(descriptor);
+                try signalTemporary(descriptor, phase, &ownership);
             } else {
+                ownership.transfer();
                 try signalOwned(request, &tracker.items[tracker.len - 1], result, phase);
             }
             discovered_pass = true;
@@ -1498,7 +1592,12 @@ fn signalOwned(
     if (phase == .term) item.term_sent = true else item.kill_sent = true;
 }
 
-fn signalTemporary(descriptor: linux.fd_t, phase: CleanupSignal) !void {
+fn signalTemporary(
+    descriptor: linux.fd_t,
+    phase: CleanupSignal,
+    ownership: *const PidfdOwnership,
+) !void {
+    if (ownership.inject(.temporary_signal)) return error.SignalFailed;
     if (try pidfdExited(descriptor)) return;
     const signal: linux.SIG = if (phase == .term) .TERM else .KILL;
     switch (linux.errno(linux.pidfd_send_signal(descriptor, signal, null, 0))) {

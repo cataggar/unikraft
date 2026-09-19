@@ -115,6 +115,8 @@ pub fn build(b: *std.Build) void {
         "../process_private_tests.zig",
         "runtime_tests.zig",
         "../process_command_poison_tests.zig",
+        "../process_command_parent_fault_tests.zig",
+        "../process_command_signal_fault_tests.zig",
         "../process_private_poison_tests.zig",
         "../process_private_completion_poison_tests.zig",
     }) |source| {
