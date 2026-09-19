@@ -28,7 +28,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "public_image", .module = image }},
     });
-    b.installArtifact(b.addExecutable(.{ .name = "wamr-ci-package", .root_module = root }));
+    const cli = b.addExecutable(.{ .name = "wamr-ci-package", .root_module = root });
+    b.installArtifact(cli);
     const tests = b.addTest(.{ .root_module = root });
-    b.step("test", "Test the compute packaging adapter command boundary").dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Test the compute packaging adapter command boundary");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const options = b.addOptions();
+    options.addOptionPath("cli", cli.getEmittedBin());
+    options.addOption(
+        ?[]const u8,
+        "test_root",
+        b.option([]const u8, "test-root", "Existing absolute private compute fixture directory"),
+    );
+    const pipeline_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pipeline_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "public_image", .module = image }},
+    }) });
+    pipeline_tests.root_module.addOptions("test_options", options);
+    test_step.dependOn(&b.addRunArtifact(pipeline_tests).step);
 }
