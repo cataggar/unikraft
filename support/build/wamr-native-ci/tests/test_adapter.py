@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Synthetic unit/physical packaging fixtures; never real guest boot evidence."""
 import ast
+import base64
 import copy
 import contextlib
 import hashlib
@@ -348,7 +349,7 @@ class Evidence(unittest.TestCase):
             "cancellation_observed": False,
             "cleanup": "complete",
             "cleanup_complete": True,
-            "cleanup_events": 1,
+            "cleanup_events": ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN,
             "descendants": {
                 "adopted": 0,
                 "identity_validated": 0,
@@ -367,7 +368,7 @@ class Evidence(unittest.TestCase):
             "poisoned": False,
             "primary": {"code": 0, "kind": "exited"},
             "primary_deadline_reached": False,
-            "primary_events": 1,
+            "primary_events": ci.COMMAND_COMPLETE_PRIMARY_EVENTS_MIN,
             "reap_events": 2,
             "retained_executables": copy.deepcopy(
                 request["retained_executables"]),
@@ -2444,6 +2445,24 @@ source/generated/
         public_bundle.supervised_command_record(
             ci, record, "public-validator-build", identities,
             "trusted_inner_zip")
+        boundary = copy.deepcopy(record)
+        boundary_command = boundary["supervisor"]["result"]["command"]
+        boundary_request = boundary["supervisor"]["request"]
+        boundary_timing = boundary_command["timing"]
+        boundary_timing["primary_completed_ns"] = (
+            boundary_request["primary_deadline_ns"])
+        boundary_timing["completed_ns"] = (
+            boundary_request["primary_deadline_ns"] + 1)
+        boundary_timing["primary_elapsed_ns"] = (
+            boundary_timing["primary_completed_ns"]
+            - boundary_timing["started_ns"])
+        boundary_timing["cleanup_elapsed_ns"] = 1
+        boundary_timing["total_elapsed_ns"] = (
+            boundary_timing["completed_ns"]
+            - boundary_timing["started_ns"])
+        public_bundle.supervised_command_record(
+            ci, self.rehash_supervised_binding(boundary),
+            "public-validator-build", identities, "trusted_inner_zip")
         mutations = []
 
         changed = copy.deepcopy(record)
@@ -2528,6 +2547,17 @@ source/generated/
                           self.rehash_supervised_binding(changed)))
 
         changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["primary_events"] = 0
+        mutations.append(("zero-primary-events",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["cleanup_events"] = (
+            ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN - 1)
+        mutations.append(("short-cleanup-events",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
         changed["supervisor"]["result"]["command"]["stdout"]["sha256"] = (
             "0" * 64)
         mutations.append(("empty-stream-digest",
@@ -2546,6 +2576,58 @@ source/generated/
                     "started_ns"] - 1)
         mutations.append(("timing-reset",
                           self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        request = changed["supervisor"]["request"]
+        command = changed["supervisor"]["result"]["command"]
+        command["primary"] = {"code": None, "kind": "timeout"}
+        command["primary_deadline_reached"] = True
+        command["termination"] = {"code": 15, "kind": "signal"}
+        timing = command["timing"]
+        timing["primary_completed_ns"] = request["primary_deadline_ns"] - 1
+        timing["completed_ns"] = timing["primary_completed_ns"]
+        timing["primary_elapsed_ns"] = (
+            timing["primary_completed_ns"] - timing["started_ns"])
+        timing["cleanup_elapsed_ns"] = 0
+        timing["total_elapsed_ns"] = (
+            timing["completed_ns"] - timing["started_ns"])
+        mutations.append(("timeout-before-deadline",
+                          self.rehash_supervised_binding(changed)))
+
+        for stream_name, marker in (("stdout", b"o"), ("stderr", b"e")):
+            changed = copy.deepcopy(record)
+            request = changed["supervisor"]["request"]
+            command = changed["supervisor"]["result"]["command"]
+            command["primary"] = {
+                "code": None, "kind": "output_overflow",
+            }
+            size = request["limits"][stream_name + "_bytes"] - 1
+            data = marker * size
+            command[stream_name] = {
+                "bytes": size,
+                "digest_scope": ci.command_digest_scope(size),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "status": "overflow",
+            }
+            stdout = data if stream_name == "stdout" else b""
+            stderr = data if stream_name == "stderr" else b""
+            command["output"] = {
+                "bytes": len(stdout) + len(stderr),
+                "combined_sha256":
+                    hashlib.sha256(stdout + stderr).hexdigest(),
+                "commitment_sha256": ci.command_output_commitment(
+                    len(stdout), hashlib.sha256(stdout).hexdigest(),
+                    len(stderr), hashlib.sha256(stderr).hexdigest()),
+                "digest_scope":
+                    ci.command_digest_scope(len(stdout) + len(stderr)),
+            }
+            changed["bytes"] = command["output"]["bytes"]
+            changed["sha256"] = command["output"]["combined_sha256"]
+            changed["sha256_scope"] = command["output"]["digest_scope"]
+            mutations.append((
+                stream_name + "-overflow-before-fill",
+                self.rehash_supervised_binding(changed),
+            ))
 
         changed = copy.deepcopy(record)
         changed["supervisor"]["result"]["command"][
@@ -2881,6 +2963,165 @@ source/generated/
         self.assertFalse(command["cleanup_complete"])
         self.assertTrue(command["poisoned"])
         self.assertNotEqual(command["cleanup"], "complete")
+
+    @unittest.skipIf(
+        not SUPERVISOR or not SUPERVISOR_FIXTURE,
+        "native command supervisor fixtures unavailable")
+    def test_native_supervisor_state_machine_boundaries_and_rehashed_mutations(self):
+        supervisor = Path(SUPERVISOR).resolve(strict=True)
+        fixture = Path(SUPERVISOR_FIXTURE).resolve(strict=True)
+        fixture_record, unused_directories = ci.physical_file_record(fixture)
+        del unused_directories
+        expected = ci.native_executable_identity(fixture_record)
+
+        def invoke(argv, primary_ms=3000, stream_limit=32):
+            now = time.monotonic_ns()
+            request = {
+                "argv": [str(fixture), *argv],
+                "cleanup_deadline_ns": now + 5_000_000_000,
+                "cwd": str(self.root),
+                "environment": [],
+                "executable": str(fixture),
+                "limits": {
+                    "cleanup_events": 1_000_000,
+                    "descendants": 64,
+                    "primary_events": 1_000_000,
+                    "proc_entries_per_scan": 262_144,
+                    "reap_events": 512,
+                    "stderr_bytes": stream_limit,
+                    "stdout_bytes": stream_limit,
+                    "term_grace_ms": 1000,
+                },
+                "primary_deadline_ns": now + primary_ms * 1_000_000,
+                "retained_executables": [],
+                "schema": "uk.wamr.command-supervisor-request",
+                "version": 1,
+            }
+            result = subprocess.run(
+                [supervisor], input=ci.canonical_json(request),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={}, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, b"")
+            return result.stdout, request
+
+        fast_raw, fast_request = invoke(["bytes", "0", "0", "0"])
+        fast, unused_stdout, unused_stderr = ci.decoded_supervisor_result(
+            fast_raw, fast_request, expected)
+        del unused_stdout, unused_stderr
+        self.assertGreaterEqual(
+            fast["command"]["primary_events"],
+            ci.COMMAND_COMPLETE_PRIMARY_EVENTS_MIN)
+        self.assertGreaterEqual(
+            fast["command"]["cleanup_events"],
+            ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN)
+        boundary = copy.deepcopy(fast)
+        boundary["command"]["primary_events"] = (
+            ci.COMMAND_COMPLETE_PRIMARY_EVENTS_MIN)
+        boundary["command"]["cleanup_events"] = (
+            ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN)
+        ci.decoded_supervisor_result(
+            ci.canonical_json(boundary), fast_request, expected)
+        early_raw, early_request = invoke(
+            ["bytes", "0", "0", "0"], primary_ms=-1)
+        early, unused_stdout, unused_stderr = ci.decoded_supervisor_result(
+            early_raw, early_request, expected)
+        del unused_stdout, unused_stderr
+        self.assertEqual(early["command"]["cleanup"], "not_required")
+        self.assertEqual(early["command"]["primary_events"], 0)
+        self.assertEqual(early["command"]["cleanup_events"], 0)
+        for name, fields in (
+                ("zero-events", {
+                    "primary_events": 0,
+                    "cleanup_events": 0,
+                }),
+                ("short-cleanup", {
+                    "cleanup_events":
+                        ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN - 1,
+                })):
+            changed = copy.deepcopy(fast)
+            changed["command"].update(fields)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    ci.Refusal, "invalid native command result"):
+                ci.decoded_supervisor_result(
+                    ci.canonical_json(changed), fast_request, expected)
+
+        timeout_raw, timeout_request = invoke(
+            ["partial"], primary_ms=50, stream_limit=128)
+        timeout, unused_stdout, unused_stderr = (
+            ci.decoded_supervisor_result(
+                timeout_raw, timeout_request, expected))
+        del unused_stdout, unused_stderr
+        self.assertEqual(
+            timeout["command"]["primary"],
+            {"code": None, "kind": "timeout"})
+        self.assertGreaterEqual(
+            timeout["command"]["primary_completed_ns"],
+            timeout_request["primary_deadline_ns"])
+        equality = copy.deepcopy(timeout)
+        equality["command"]["primary_completed_ns"] = (
+            timeout_request["primary_deadline_ns"])
+        ci.decoded_supervisor_result(
+            ci.canonical_json(equality), timeout_request, expected)
+        before = copy.deepcopy(equality)
+        before["command"]["primary_completed_ns"] -= 1
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(
+                ci.canonical_json(before), timeout_request, expected)
+
+        def truncate_stream(value, stream_name):
+            command = value["command"]
+            raw = base64.b64decode(
+                command[stream_name + "_base64"], validate=True)[:-1]
+            command[stream_name + "_base64"] = (
+                base64.b64encode(raw).decode("ascii"))
+            command[stream_name + "_bytes"] = len(raw)
+            command[stream_name + "_sha256"] = (
+                hashlib.sha256(raw).hexdigest())
+            stdout = base64.b64decode(
+                command["stdout_base64"], validate=True)
+            stderr = base64.b64decode(
+                command["stderr_base64"], validate=True)
+            command["output_sha256"] = ci.command_output_commitment(
+                len(stdout), hashlib.sha256(stdout).hexdigest(),
+                len(stderr), hashlib.sha256(stderr).hexdigest())
+
+        overflow_cases = (
+            ("stdout", ["bytes", "33", "5", "0"], "stdout"),
+            ("stderr", ["bytes", "5", "33", "0"], "stderr"),
+            ("combined", ["bytes", "33", "33", "0"], "stderr"),
+        )
+        for name, argv, mutated_stream in overflow_cases:
+            raw, request = invoke(argv)
+            decoded, stdout, stderr = ci.decoded_supervisor_result(
+                raw, request, expected)
+            command = decoded["command"]
+            with self.subTest(name=name):
+                self.assertEqual(
+                    command["primary"],
+                    {"code": None, "kind": "output_overflow"})
+                for stream_name, captured in (
+                        ("stdout", stdout), ("stderr", stderr)):
+                    if command[stream_name + "_status"] == "overflow":
+                        self.assertEqual(
+                            len(captured),
+                            request["limits"][stream_name + "_bytes"])
+                if name == "stdout":
+                    self.assertLess(
+                        len(stderr), request["limits"]["stderr_bytes"])
+                elif name == "stderr":
+                    self.assertLess(
+                        len(stdout), request["limits"]["stdout_bytes"])
+                else:
+                    self.assertEqual(command["stdout_status"], "overflow")
+                    self.assertEqual(command["stderr_status"], "overflow")
+                changed = copy.deepcopy(decoded)
+                truncate_stream(changed, mutated_stream)
+                with self.assertRaisesRegex(
+                        ci.Refusal, "invalid native command result"):
+                    ci.decoded_supervisor_result(
+                        ci.canonical_json(changed), request, expected)
 
     @unittest.skipIf(
         not SUPERVISOR or not SUPERVISOR_FIXTURE,

@@ -99,6 +99,8 @@ COMMAND_RESULT_MAX = 12 * MIB
 COMMAND_REQUEST_MAX = MIB
 COMMAND_STRING_MAX = 4096
 COMMAND_OUTPUT_COMMITMENT_DOMAIN = b"uk.wamr.command-output-v1\0"
+COMMAND_COMPLETE_PRIMARY_EVENTS_MIN = 1
+COMMAND_COMPLETE_CLEANUP_EVENTS_MIN = 5
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 BOOTSTRAP_STAGES = frozenset({
     "dependency-restore",
@@ -2198,6 +2200,126 @@ def command_output_commitment(
     return value.hexdigest()
 
 
+def validate_supervisor_outcome(command, limits, reason):
+    primary = command["primary"]
+    termination = command["termination"]
+    require(isinstance(primary, dict)
+            and set(primary) == {"code", "kind"}
+            and primary["kind"] in {
+                "exited", "signal", "unknown", "timeout", "cancelled",
+                "output_overflow", "exec_failed", "snapshot_unsupported",
+                "event_limit", "local_io", "executable_changed",
+            }
+            and isinstance(termination, dict)
+            and set(termination) == {"code", "kind"}
+            and (termination["kind"] is None
+                 or termination["kind"] in {
+                     "exited", "signal", "stopped", "unknown",
+                 }),
+            reason)
+    if primary["kind"] == "exited":
+        native_u8(primary["code"], reason)
+    elif primary["kind"] == "signal":
+        native_integer(primary["code"], 1, 64, reason)
+    elif primary["kind"] == "unknown":
+        native_u32(primary["code"], reason)
+    else:
+        require(primary["code"] is None, reason)
+    if termination["kind"] == "exited":
+        native_u8(termination["code"], reason)
+    elif termination["kind"] in {"signal", "stopped"}:
+        native_integer(termination["code"], 1, 64, reason)
+    elif termination["kind"] == "unknown":
+        native_u32(termination["code"], reason)
+    else:
+        require(termination["code"] is None, reason)
+    if primary["kind"] in {"exited", "signal", "unknown"}:
+        require(termination == primary, reason)
+    require(command["primary_deadline_reached"]
+            is (primary["kind"] == "timeout")
+            and command["cancellation_observed"]
+            is (primary["kind"] == "cancelled")
+            and (primary["kind"] != "event_limit"
+                 or command["primary_events"] == limits["primary_events"])
+            and (primary["kind"] != "executable_changed"
+                 or not command["executable_stable"]
+                 and termination == {"code": 0, "kind": "exited"})
+            and (command["executable_stable"]
+                 or primary != {"code": 0, "kind": "exited"}),
+            reason)
+    return primary, termination
+
+
+def validate_supervisor_state(
+        command, limits, timing, streams, primary_deadline_ns, reason):
+    native_u32(command["primary_events"], reason)
+    native_u32(command["cleanup_events"], reason)
+    native_u16(command["reap_events"], reason)
+    require(command["primary_events"] <= limits["primary_events"]
+            and command["cleanup_events"] <= limits["cleanup_events"]
+            and command["reap_events"] <= limits["reap_events"], reason)
+    descendants = command["descendants"]
+    require(isinstance(descendants, dict)
+            and set(descendants) == {
+                "adopted", "identity_validated", "limit_exceeded",
+                "observed", "untracked",
+            }
+            and type(descendants["limit_exceeded"]) is bool
+            and type(descendants["untracked"]) is bool,
+            reason)
+    for name in ("adopted", "identity_validated", "observed"):
+        native_u16(descendants[name], reason)
+    require(descendants["adopted"] <= descendants["observed"]
+            and descendants["identity_validated"] == descendants["observed"]
+            and descendants["observed"] <= limits["descendants"] + 1
+            and descendants["limit_exceeded"]
+            is (descendants["observed"] > limits["descendants"])
+            and (not descendants["untracked"]
+                 or descendants["limit_exceeded"]
+                 and descendants["observed"] == limits["descendants"] + 1),
+            reason)
+    primary, termination = validate_supervisor_outcome(
+        command, limits, reason)
+    for name in ("stdout", "stderr"):
+        stream = streams[name]
+        size = native_u64(stream["bytes"], reason)
+        require(stream["status"] in {
+            "complete", "overflow", "io_failed", "incomplete",
+        }
+                and size <= limits[name + "_bytes"]
+                and (stream["status"] != "overflow"
+                     or size == limits[name + "_bytes"]),
+                reason)
+    started = native_u64(timing["started_ns"], reason)
+    primary_completed = native_u64(
+        timing["primary_completed_ns"], reason)
+    completed = native_u64(timing["completed_ns"], reason)
+    require(started <= primary_completed <= completed
+            and (primary["kind"] != "timeout"
+                 or primary_completed >= primary_deadline_ns),
+            reason)
+    if command["cleanup"] == "complete":
+        require(command["primary_events"]
+                >= COMMAND_COMPLETE_PRIMARY_EVENTS_MIN
+                and command["cleanup_events"]
+                >= COMMAND_COMPLETE_CLEANUP_EVENTS_MIN
+                and command["reap_events"] == descendants["observed"] + 2
+                and termination["kind"] is not None,
+                reason)
+    elif command["cleanup"] == "not_required":
+        require(command["primary_events"] == 0
+                and command["cleanup_events"] == 0
+                and command["reap_events"] == 0
+                and descendants == {
+                    "adopted": 0,
+                    "identity_validated": 0,
+                    "limit_exceeded": False,
+                    "observed": 0,
+                    "untracked": False,
+                }, reason)
+    return primary, termination, started, primary_completed, completed
+
+
 def command_digest_scope(size):
     return ("reproducible_empty"
             if size == 0 else "transport_authenticated_observation")
@@ -2820,51 +2942,29 @@ def validate_supervised_command_binding(
         "executable_stable", "output", "poisoned", "primary",
         "primary_deadline_reached", "primary_events", "reap_events",
         "retained_executables", "stderr", "stdout", "timing", "termination",
-    } and command["cancellation_observed"] is False
-      and command["cleanup"] == "complete"
-      and command["cleanup_complete"] is True
-      and command["executable_stable"] is True
-      and command["poisoned"] is False
-      and command["primary"] == {"code": 0, "kind": "exited"}
-      and command["primary_deadline_reached"] is False
-      and command["termination"] == {"code": 0, "kind": "exited"}
+    } and command["cleanup"] in {
+        "complete", "not_required", "deadline", "event_limit",
+        "descendant_untracked", "identity_changed", "signal_failed",
+        "reap_failed", "proc_unavailable", "local_io",
+    }
+      and type(command["cleanup_complete"]) is bool
+      and type(command["poisoned"]) is bool
+      and command["poisoned"] is (not command["cleanup_complete"])
+      and command["cleanup_complete"]
+      is (command["cleanup"] in {"complete", "not_required"})
+      and type(command["executable_stable"]) is bool
+      and type(command["primary_deadline_reached"]) is bool
+      and type(command["cancellation_observed"]) is bool
       and command["executable"]
       == request["native_executable"]["identity"]
       and command["retained_executables"] == retained,
       "invalid supervised command binding")
-    native_u32(command["cleanup_events"],
-               "invalid supervised command binding")
-    native_u32(command["primary_events"],
-               "invalid supervised command binding")
-    native_u16(command["reap_events"],
-               "invalid supervised command binding")
-    require(command["cleanup_events"] <= request["limits"]["cleanup_events"]
-            and command["primary_events"] <= request["limits"]["primary_events"]
-            and command["reap_events"] <= request["limits"]["reap_events"],
-            "invalid supervised command binding")
-    descendants = command["descendants"]
-    require(isinstance(descendants, dict) and set(descendants) == {
-        "adopted", "identity_validated", "limit_exceeded",
-        "observed", "untracked",
-    } and descendants["limit_exceeded"] is False
-      and descendants["untracked"] is False
-      and descendants["identity_validated"] == descendants["observed"]
-      and descendants["adopted"] <= descendants["observed"]
-      and descendants["observed"] <= request["limits"]["descendants"]
-      and command["reap_events"] == descendants["observed"] + 2,
-      "invalid supervised command binding")
-    for key in ("adopted", "identity_validated", "observed"):
-        native_u16(descendants[key], "invalid supervised command binding")
     for name in ("stdout", "stderr"):
         output = command[name]
         require(isinstance(output, dict)
                 and set(output) == {
                     "bytes", "digest_scope", "sha256", "status",
                 }
-                and output["status"] == "complete"
-                and native_u64(
-                    output["bytes"], "invalid supervised command binding")
-                <= request["limits"][name + "_bytes"]
                 and output["digest_scope"]
                 == command_digest_scope(output["bytes"])
                 and native_digest(
@@ -2900,6 +3000,12 @@ def validate_supervised_command_binding(
     }, "invalid supervised command binding")
     for name in timing:
         native_u64(timing[name], "invalid supervised command binding")
+    validate_supervisor_state(
+        command, request["limits"], timing, {
+            "stdout": command["stdout"],
+            "stderr": command["stderr"],
+        }, request["primary_deadline_ns"],
+        "invalid supervised command binding")
     require(request["issued_ns"] <= timing["started_ns"]
             <= timing["primary_completed_ns"] <= timing["completed_ns"]
             and timing["primary_elapsed_ns"]
@@ -2911,6 +3017,21 @@ def validate_supervised_command_binding(
             and timing["primary_completed_ns"]
             <= request["primary_deadline_ns"]
             and timing["completed_ns"] <= request["cleanup_deadline_ns"],
+            "invalid supervised command binding")
+    descendants = command["descendants"]
+    require(command["cancellation_observed"] is False
+            and command["cleanup"] == "complete"
+            and command["cleanup_complete"] is True
+            and command["executable_stable"] is True
+            and command["poisoned"] is False
+            and command["primary"] == {"code": 0, "kind": "exited"}
+            and command["primary_deadline_reached"] is False
+            and command["termination"] == {"code": 0, "kind": "exited"}
+            and command["stdout"]["status"] == "complete"
+            and command["stderr"]["status"] == "complete"
+            and descendants["limit_exceeded"] is False
+            and descendants["untracked"] is False
+            and descendants["observed"] <= request["limits"]["descendants"],
             "invalid supervised command binding")
     if value["bytes"] != 0:
         require(transport_context in {
@@ -3009,12 +3130,6 @@ def decoded_supervisor_result(
             reason)
     validate_native_executable_identity(command["executable"], reason)
     limits = request["limits"]
-    native_u32(command["primary_events"], reason)
-    native_u32(command["cleanup_events"], reason)
-    native_u16(command["reap_events"], reason)
-    require(command["primary_events"] <= limits["primary_events"]
-            and command["cleanup_events"] <= limits["cleanup_events"]
-            and command["reap_events"] <= limits["reap_events"], reason)
     require(isinstance(command["retained_executables"], list)
             and command["retained_executables"] == list(expected_retained),
             "invalid retained executable identity")
@@ -3026,72 +3141,6 @@ def decoded_supervisor_result(
         native_string(
             item["path"], COMMAND_STRING_MAX, reason, allow_empty=False)
         validate_native_executable_identity(item["identity"], reason)
-    descendants = command["descendants"]
-    require(isinstance(descendants, dict)
-            and set(descendants) == {
-                "adopted", "identity_validated", "limit_exceeded",
-                "observed", "untracked",
-            }
-            and type(descendants["limit_exceeded"]) is bool
-            and type(descendants["untracked"]) is bool,
-            reason)
-    for name in ("adopted", "identity_validated", "observed"):
-        native_u16(descendants[name], reason)
-    require(descendants["adopted"] <= descendants["observed"]
-            and descendants["identity_validated"] == descendants["observed"]
-            and descendants["observed"] <= limits["descendants"] + 1
-            and descendants["limit_exceeded"]
-            is (descendants["observed"] > limits["descendants"])
-            and (not descendants["untracked"]
-                 or descendants["limit_exceeded"]
-                 and descendants["observed"] == limits["descendants"] + 1),
-            reason)
-    primary = command["primary"]
-    termination = command["termination"]
-    require(isinstance(primary, dict)
-            and set(primary) == {"code", "kind"}
-            and primary["kind"] in {
-                "exited", "signal", "unknown", "timeout", "cancelled",
-                "output_overflow", "exec_failed", "snapshot_unsupported",
-                "event_limit", "local_io", "executable_changed",
-            }
-            and isinstance(termination, dict)
-            and set(termination) == {"code", "kind"}
-            and (termination["kind"] is None
-                 or termination["kind"] in {
-                     "exited", "signal", "stopped", "unknown",
-                 }),
-            reason)
-    if primary["kind"] == "exited":
-        native_u8(primary["code"], reason)
-    elif primary["kind"] == "signal":
-        native_integer(primary["code"], 1, 64, reason)
-    elif primary["kind"] == "unknown":
-        native_u32(primary["code"], reason)
-    else:
-        require(primary["code"] is None, reason)
-    if termination["kind"] == "exited":
-        native_u8(termination["code"], reason)
-    elif termination["kind"] in {"signal", "stopped"}:
-        native_integer(termination["code"], 1, 64, reason)
-    elif termination["kind"] == "unknown":
-        native_u32(termination["code"], reason)
-    else:
-        require(termination["code"] is None, reason)
-    if primary["kind"] in {"exited", "signal", "unknown"}:
-        require(termination == primary, reason)
-    require(command["primary_deadline_reached"]
-            is (primary["kind"] == "timeout")
-            and command["cancellation_observed"]
-            is (primary["kind"] == "cancelled")
-            and (primary["kind"] != "event_limit"
-                 or command["primary_events"] == limits["primary_events"])
-            and (primary["kind"] != "executable_changed"
-                 or not command["executable_stable"]
-                 and termination == {"code": 0, "kind": "exited"})
-            and (command["executable_stable"]
-                 or primary != {"code": 0, "kind": "exited"}),
-            reason)
     try:
         stdout = base64.b64decode(
             command["stdout_base64"], validate=True)
@@ -3111,16 +3160,29 @@ def decoded_supervisor_result(
             == stderr_sha256
             and native_digest(command["output_sha256"], reason)
             == command_output_commitment(
-                len(stdout), stdout_sha256, len(stderr), stderr_sha256)
-            and (primary["kind"] != "output_overflow"
-                 or "overflow" in {
-                     command["stdout_status"], command["stderr_status"],
-                 }),
+                len(stdout), stdout_sha256, len(stderr), stderr_sha256),
             reason)
-    started = native_u64(command["started_ns"], reason)
-    primary_completed = native_u64(command["primary_completed_ns"], reason)
-    completed = native_u64(command["completed_ns"], reason)
-    require(started <= primary_completed <= completed
+    primary, unused_termination, started, primary_completed, completed = (
+        validate_supervisor_state(
+            command, limits, {
+                "started_ns": command["started_ns"],
+                "primary_completed_ns": command["primary_completed_ns"],
+                "completed_ns": command["completed_ns"],
+            }, {
+                "stdout": {
+                    "bytes": len(stdout),
+                    "status": command["stdout_status"],
+                },
+                "stderr": {
+                    "bytes": len(stderr),
+                    "status": command["stderr_status"],
+                },
+            }, request["primary_deadline_ns"], reason))
+    del unused_termination
+    require((primary["kind"] != "output_overflow"
+             or "overflow" in {
+                 command["stdout_status"], command["stderr_status"],
+             })
             and (command["primary_deadline_reached"]
                  or started < request["primary_deadline_ns"])
             and (command["cleanup"] != "complete"
@@ -3128,19 +3190,6 @@ def decoded_supervisor_result(
             and (primary != {"code": 0, "kind": "exited"}
                  or primary_completed <= request["primary_deadline_ns"]),
             reason)
-    if command["cleanup"] == "complete":
-        require(command["reap_events"] == descendants["observed"] + 2
-                and termination["kind"] is not None, reason)
-    elif command["cleanup"] == "not_required":
-        require(command["cleanup_events"] == 0
-                and command["reap_events"] == 0
-                and descendants == {
-                    "adopted": 0,
-                    "identity_validated": 0,
-                    "limit_exceeded": False,
-                    "observed": 0,
-                    "untracked": False,
-                }, reason)
     return value, stdout, stderr
 
 

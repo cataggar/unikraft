@@ -164,7 +164,14 @@ descendant observations, cleanup outcome, poison state, and monotonic
 start/primary-completion/final-completion times. Those timestamps are
 u64 values ordered against the one original primary deadline and the later
 cleanup deadline; elapsed values are differences of those absolute samples,
-so cleanup cannot reset the clock. Timeout,
+so cleanup cannot reset the clock. A timeout completion is at or after the
+absolute primary deadline (equality remains valid), while successful primary
+completion may equal but not exceed it. An overflow stream contains exactly
+its configured capture limit; the other stream may be shorter, including when
+both streams were eligible to overflow. A complete spawned-command cleanup
+has at least one primary-monitor event and the five cleanup events guaranteed
+by the TERM/KILL/final-exit state-machine path; pre-spawn `not_required`
+results retain zero event counts. Timeout,
 cancellation, overflow, nonzero/signal, exec/identity failure or any unproven
 cleanup is a refusal; cleanup failure prevents publication even when the
 leader exited zero.
