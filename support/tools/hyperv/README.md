@@ -448,6 +448,94 @@ never success. Parent-death signaling alone does not replace independent
 whole-tree cleanup after a supervisor crash. Native controller/parent/host
 state machines must implement that higher-level recovery protocol.
 
+`runCommand(allocator, io, CommandRequest)` is a separate opt-in internal
+contract for controllers that need ordinary Linux detached-child cleanup.
+It does not change `run` or `runPrivate`, and there is no user-facing command
+wrapper. `CommandRequest` borrows an `Executable` opened with
+`Executable.open`; the retained descriptor, physical identity and full-content
+SHA-256 select the source object without reopening its pathname.
+`Executable.open` accepts only regular, non-set-ID, executable native 64-bit
+little-endian ELF `ET_EXEC`/`ET_DYN` images no larger than 256 MiB, with bounded
+program headers, valid segment alignment and an executable entry point. It
+rejects shebang scripts, executable text, truncated/malformed ELF, and foreign
+architectures with `error.UnsupportedExecutableFormat` before spawn.
+
+Before every command launch, the supervisor revalidates the retained source,
+copies it only through descriptor reads into a newly created anonymous
+executable memfd, compares the complete source hash and physical identity
+before and after the copy, validates the copied ELF, and applies the Linux
+write/grow/shrink/seal seals. `execveat(AT_EMPTY_PATH)` receives only that
+sealed snapshot descriptor. Source pathname replacement or removal therefore
+does not redirect execution, and post-seal writes fail. A validated ELF
+`PT_INTERP` remains supported, including dynamically linked WAMR tools; no
+script pathname is reopened and no ambient shell/interpreter is selected.
+The caller owns the retained source descriptor until `Executable.close`; the
+supervisor closes every per-run snapshot on every return path. The request also
+supplies explicit argv, environment and cwd, one absolute primary `Deadline`,
+one independent absolute cleanup `Deadline`, optional cancellation, and fixed
+limits. Source identity is checked again after cleanup to preserve the explicit
+persistent/accidental input-custody signal even though execution is isolated
+from later source-file writes.
+
+The command mode requires an authority-free Linux 5.11-or-newer host with
+procfs, child-subreaper support, pidfds, `pidfd_send_signal`, executable memfds
+and file seals. On kernels that define `MFD_EXEC` it is requested explicitly;
+Linux 5.11-era kernels use the original executable-memfd behavior. A host
+policy or LSM that denies executable memfds produces the explicit
+`ExecutableSnapshotUnsupported`/`snapshot_unsupported` outcome; there is no
+fallback to mutable pathname execution. It requires a dedicated process with
+no pre-existing children. During cleanup it scans bounded procfs records,
+traces parentage from the unreaped leader or the subreaper, validates
+`/proc/PID/stat` start ticks around `pidfd_open`, and keeps the leader and
+discovered ancestors unreaped until all live descendants have been signalled.
+This includes ordinary children that call `setsid()` and ordinary double-fork
+descendants adopted by the subreaper. Every exact live pidfd receives TERM and,
+if it remains live after the one fixed grace interval, KILL. Matching unreaped
+zombies remain owned and count against descendant/reap limits, but are never
+signalled. A candidate whose numeric parent matches a tracked entry is not
+opened or signalled until that parent's retained pidfd is still live and
+`/proc` still reports the recorded PID/start identity; the proof is repeated
+after the candidate itself is pinned and verified. An exited/reaped parent
+therefore causes a rescan for subreaper adoption instead of admitting a
+recycled PID, while contradictory live identity evidence poisons cleanup. Only
+after a final stable discovery pass reports no live owned process does the
+supervisor reap each tracked child and consume one final bounded `ECHILD`
+observation. Escaped writers cannot extend the primary deadline: pipes are
+nonblocking, bounded, finally drained after proven cleanup, and always closed.
+
+Primary and cleanup time do not accumulate or restart per output event,
+descendant, signal or reap. Defaults are 64 KiB per output stream, 64
+descendants plus one bounded first-excess observation, one million primary and
+cleanup events, 262,144 proc entries per scan, 512 reap events, and one 100 ms
+TERM grace. Hard maxima are 4 MiB per stream, 256 requested descendants, ten
+million events, one million proc entries per scan, 1,024 reap events, 128 argv
+items/256 KiB argv, 256 environment entries/256 KiB environment, and a 4,095
+byte executable path. `reap_events` must be at least `descendants + 3`: one
+event each for the leader, every requested descendant, the retained first
+excess sentinel, and the terminal `ECHILD` observation.
+
+`CommandResult` owns zeroized bounded stdout/stderr storage and reports the
+leader's primary outcome, termination, deadline/cancellation observations,
+per-stream completion/overflow/I/O status, executable stability, descendant
+count/adoption/identity validation and first-excess state, fixed event/reap
+counts, plus an independent `CommandCleanup`. A first excess is reported and
+cleaned when it is the only excess, but makes `succeeded()` false. Untracked
+additional descendants, identity ambiguity, signal/reap/proc failures, or
+cleanup-deadline exhaustion make cleanup incomplete and irreversibly poison
+the supervisor. No later call can turn that uncertainty into success.
+
+This mode cleans cooperative or accidentally detached descendants owned by the
+subreaper. The sealed executable snapshot narrows only executable-object
+selection. It does not protect arbitrary input/data trees and does not make
+this a security boundary against a malicious concurrent same-UID process or a
+compromised child. It does not add PID, user or mount namespaces, capabilities,
+privileged admission, Azure credentials/authority, or crash recovery.
+Credential changes, a descendant installing a nearer subreaper,
+kernel-uninterruptible tasks, procfs/pidfd denial, and other unsupported kernel
+escape mechanisms can make proof impossible; the result is explicit cleanup
+failure and poison, not a custody claim. Use the separate operator guard only
+where its namespace custody contract is explicitly required.
+
 ## Native operator process custody
 
 The separate [operator guard](operator_guard/README.md) provides kernel-backed

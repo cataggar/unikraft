@@ -111,8 +111,10 @@ pub fn build(b: *std.Build) void {
     foundation.dependOn(&compile.step);
     const runtime_tests = b.step("test-runtime", "Run private process and direct runtime fixtures");
     inline for (.{
+        "../process_command_tests.zig",
         "../process_private_tests.zig",
         "runtime_tests.zig",
+        "../process_command_poison_tests.zig",
         "../process_private_poison_tests.zig",
         "../process_private_completion_poison_tests.zig",
     }) |source| {

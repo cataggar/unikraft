@@ -35,6 +35,62 @@ fn ignoreTerm() !void {
     if (linux.errno(linux.sigaction(.TERM, &action, null)) != .SUCCESS) return error.SignalSetup;
 }
 
+const ChildStyle = enum { ordinary, session, closed, resistant };
+
+fn childLoop(style: ChildStyle, ready: linux.fd_t) noreturn {
+    if (style == .session or style == .resistant) {
+        if (linux.errno(linux.setsid()) != .SUCCESS) linux.exit_group(126);
+    }
+    if (style == .closed) {
+        _ = linux.close(1);
+        _ = linux.close(2);
+    }
+    if (style == .resistant) ignoreTerm() catch linux.exit_group(126);
+    const marker = [_]u8{1};
+    if (linux.write(ready, &marker, marker.len) != marker.len) linux.exit_group(126);
+    _ = linux.close(ready);
+    while (true) {
+        var fds: [0]linux.pollfd = .{};
+        _ = linux.poll(&fds, 0, 1000);
+    }
+}
+
+fn spawnChild(style: ChildStyle) !linux.pid_t {
+    var ready: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+    defer _ = linux.close(ready[0]);
+    const child = linux.fork();
+    if (linux.errno(child) != .SUCCESS) {
+        _ = linux.close(ready[1]);
+        return error.ForkFailed;
+    }
+    if (child == 0) {
+        _ = linux.close(ready[0]);
+        childLoop(style, ready[1]);
+    }
+    _ = linux.close(ready[1]);
+    var marker: [1]u8 = undefined;
+    while (true) {
+        const amount = linux.read(ready[0], &marker, marker.len);
+        if (linux.errno(amount) == .INTR) continue;
+        if (amount != marker.len or marker[0] != 1) return error.FixtureHandshake;
+        break;
+    }
+    return @intCast(child);
+}
+
+fn spawnImmediateChild() !linux.pid_t {
+    const child = linux.fork();
+    if (linux.errno(child) != .SUCCESS) return error.ForkFailed;
+    if (child == 0) linux.exit_group(0);
+    return @intCast(child);
+}
+
+fn emitPid(pid: linux.pid_t) !void {
+    var text: [32]u8 = undefined;
+    try emit(1, try std.fmt.bufPrint(&text, "{d}\n", .{pid}));
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.InvalidFixture;
@@ -71,6 +127,81 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         std.process.exit(try std.fmt.parseInt(u8, args[4], 10));
+    } else if (std.mem.eql(u8, mode, "ordinary-child") or std.mem.eql(u8, mode, "setsid-child") or
+        std.mem.eql(u8, mode, "closed-child") or std.mem.eql(u8, mode, "resistant-child"))
+    {
+        const style: ChildStyle = if (std.mem.eql(u8, mode, "ordinary-child"))
+            .ordinary
+        else if (std.mem.eql(u8, mode, "setsid-child"))
+            .session
+        else if (std.mem.eql(u8, mode, "closed-child"))
+            .closed
+        else
+            .resistant;
+        try emitPid(try spawnChild(style));
+    } else if (std.mem.eql(u8, mode, "double-fork")) {
+        var ready: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&ready, .{ .CLOEXEC = true })) != .SUCCESS) return error.PipeFailed;
+        defer _ = linux.close(ready[0]);
+        const intermediate = linux.fork();
+        if (linux.errno(intermediate) != .SUCCESS) {
+            _ = linux.close(ready[1]);
+            return error.ForkFailed;
+        }
+        if (intermediate == 0) {
+            _ = linux.close(ready[0]);
+            const grandchild = linux.fork();
+            if (linux.errno(grandchild) != .SUCCESS) linux.exit_group(126);
+            if (grandchild == 0) {
+                if (linux.errno(linux.setsid()) != .SUCCESS) linux.exit_group(126);
+                const pid: linux.pid_t = linux.getpid();
+                if (linux.write(ready[1], @ptrCast(&pid), @sizeOf(linux.pid_t)) != @sizeOf(linux.pid_t))
+                    linux.exit_group(126);
+                _ = linux.close(ready[1]);
+                while (true) {
+                    var fds: [0]linux.pollfd = .{};
+                    _ = linux.poll(&fds, 0, 1000);
+                }
+            }
+            _ = linux.close(ready[1]);
+            linux.exit_group(0);
+        }
+        _ = linux.close(ready[1]);
+        var pid: linux.pid_t = 0;
+        while (true) {
+            const amount = linux.read(ready[0], @ptrCast(&pid), @sizeOf(linux.pid_t));
+            if (linux.errno(amount) == .INTR) continue;
+            if (amount != @sizeOf(linux.pid_t) or pid <= 1) return error.FixtureHandshake;
+            break;
+        }
+        var status: u32 = 0;
+        while (linux.errno(linux.waitpid(@intCast(intermediate), &status, 0)) == .INTR) {}
+        if (!linux.W.IFEXITED(status) or linux.W.EXITSTATUS(status) != 0) return error.FixtureHandshake;
+        try emitPid(pid);
+    } else if (std.mem.eql(u8, mode, "many-children") or
+        std.mem.eql(u8, mode, "many-resistant") or
+        std.mem.eql(u8, mode, "many-immediate"))
+    {
+        if (args.len != 3) return error.InvalidFixture;
+        const count = try std.fmt.parseInt(usize, args[2], 10);
+        if (count == 0 or count > 32) return error.InvalidFixture;
+        for (0..count) |index| {
+            if (std.mem.eql(u8, mode, "many-immediate")) {
+                try emitPid(try spawnImmediateChild());
+            } else {
+                try emitPid(try spawnChild(if (std.mem.eql(u8, mode, "many-resistant"))
+                    .resistant
+                else if (index % 2 == 0)
+                    .ordinary
+                else
+                    .session));
+            }
+        }
+    } else if (std.mem.eql(u8, mode, "drip")) {
+        while (true) {
+            try emit(1, "x");
+            sleep(20);
+        }
     } else if (std.mem.eql(u8, mode, "partial") or std.mem.eql(u8, mode, "ignore-term")) {
         if (std.mem.eql(u8, mode, "ignore-term")) try ignoreTerm();
         try emit(1, "private-stdout?sig=synthetic-secret\n");
