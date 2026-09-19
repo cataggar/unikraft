@@ -280,14 +280,14 @@ test "executable contract accepts native and dynamically linked ELF binaries" {
     native.close(io);
     try testing.expectEqual(.BADF, linux.errno(linux.fcntl(native_descriptor, linux.F.GETFD, 0)));
 
-    const dynamic_path = try std.Io.Dir.cwd().realPathFileAlloc(io, "/usr/bin/true", allocator);
+    const dynamic_path = try std.Io.Dir.cwd().realPathFileAlloc(io, "/usr/bin/git", allocator);
     defer allocator.free(dynamic_path);
     var dynamic = try process.Executable.open(io, dynamic_path);
     defer dynamic.close(io);
     try testing.expect(try process.ExecutableFormatTest.usesInterpreter(dynamic));
     var result = try process.runCommand(allocator, io, try request(
         dynamic,
-        &.{dynamic_path},
+        &.{ dynamic_path, "--version" },
         &environment,
         fixture.directory.dir,
     ));
