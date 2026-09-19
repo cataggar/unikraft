@@ -1538,6 +1538,8 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 selected[stage][selected[stage].index("--system") + 1],
                 str(packages),
             )
+        self.assertIn("test-unit", selected["adapter"])
+        self.assertNotIn("test", selected["adapter"])
         self.assertFalse((ci.LOCAL_BOOT / "zig-pkg").exists())
         self.assertFalse((ci.HERE / "zig-pkg").exists())
 
