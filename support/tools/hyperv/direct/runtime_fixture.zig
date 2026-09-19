@@ -127,6 +127,13 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         std.process.exit(try std.fmt.parseInt(u8, args[4], 10));
+    } else if (std.mem.eql(u8, mode, "gate-marker")) {
+        if (args.len != 3) return error.InvalidFixture;
+        const marker = try std.Io.Dir.cwd().createFile(init.io, args[2], .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        });
+        marker.close(init.io);
     } else if (std.mem.eql(u8, mode, "ordinary-child") or std.mem.eql(u8, mode, "setsid-child") or
         std.mem.eql(u8, mode, "closed-child") or std.mem.eql(u8, mode, "resistant-child"))
     {

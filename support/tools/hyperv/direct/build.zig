@@ -112,6 +112,8 @@ pub fn build(b: *std.Build) void {
     const runtime_tests = b.step("test-runtime", "Run private process and direct runtime fixtures");
     inline for (.{
         "../process_command_tests.zig",
+        "../process_command_gate_tests.zig",
+        "../process_command_gate_poison_tests.zig",
         "../process_private_tests.zig",
         "runtime_tests.zig",
         "../process_command_leader_track_fault_tests.zig",

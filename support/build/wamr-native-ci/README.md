@@ -173,11 +173,23 @@ produce late success. An overflow stream contains exactly
 its configured capture limit; the other stream may be shorter, including when
 both streams were eligible to overflow. A complete spawned-command cleanup
 has at least one primary-monitor event and the five cleanup events guaranteed
-by the TERM/KILL/final-exit state-machine path; pre-spawn `not_required`
-results are limited to timeout, cancellation, local spawn/snapshot I/O failure
-or unsupported snapshot creation. They have empty complete streams and hashes,
-no termination, descendants or events, identical primary/final completion,
-and the unchanged executable identity. Timeout,
+by the TERM/KILL/final-exit state-machine path. Before `execveat`, a
+close-on-exec sequenced socket gate holds the forked child after its raw
+PDEATHSIG, process-group, cwd, stdio and descriptor setup. The parent retains
+the original deadline while it opens and validates the child's pidfd/start
+identity, transfers the leader into the tracker, receives the child's ready
+token and sends exactly one release token. EOF, a malformed/short token or any
+tracking, clock, deadline, cancellation or release failure closes the gate,
+reaps the still-unexecuted leader through its pidfd and requires final ECHILD.
+A proved pre-release recovery is `cleanup=complete`, unpoisoned, with no
+primary-monitor events, empty complete streams, no descendants, two reap
+events (leader plus ECHILD) and at least three cleanup events. An unavailable
+identity, reap or ECHILD proof poisons the supervisor even if best-effort
+termination succeeds. Pre-spawn `not_required` results remain limited to
+timeout, cancellation, local spawn/snapshot I/O failure or unsupported
+snapshot creation. They have empty complete streams and hashes, no
+termination, descendants or events, identical primary/final completion, and
+the unchanged executable identity. Timeout,
 cancellation, overflow, nonzero/signal, exec/identity failure or any unproven
 cleanup is a refusal; cleanup failure prevents publication even when the
 leader exited zero.

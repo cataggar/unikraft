@@ -26,7 +26,7 @@ fn runCase(offset: i2) !void {
     };
     const command: process.CommandRequest = .{
         .executable = executable,
-        .argv = &.{ path, "partial" },
+        .argv = &.{ path, "gate-marker", "leader-track-marker" },
         .environment = &environment,
         .cwd = fixture.directory.dir,
         .primary_deadline = .{ .expires_ns = primary_deadline_ns },
@@ -43,17 +43,15 @@ fn runCase(offset: i2) !void {
     try testing.expectEqual(@as(u32, 1), leader_track.fault_injections);
     try testing.expectEqual(@as(u32, 1), leader_track.timestamp_observations);
     try testing.expectEqual(observed_ns, result.primary_completed_ns);
-    try testing.expectEqual(.identity_changed, result.cleanup);
-    try testing.expect(!result.cleanup_complete);
-    try testing.expectEqual(@as(u16, 1), result.reap_events);
-    try testing.expectEqual(
-        std.process.Child.Term{ .signal = .KILL },
-        result.termination.?,
-    );
+    try testing.expectEqual(.complete, result.cleanup);
+    try testing.expect(result.cleanup_complete);
+    try testing.expect(result.cleanup_events >= 3);
+    try testing.expectEqual(@as(u16, 2), result.reap_events);
+    try testing.expect(result.termination != null);
     try testing.expectEqual(@as(usize, 0), result.stdout.len);
     try testing.expectEqual(@as(usize, 0), result.stderr.len);
-    try testing.expectEqual(.incomplete, result.stdout_status);
-    try testing.expectEqual(.incomplete, result.stderr_status);
+    try testing.expectEqual(.complete, result.stdout_status);
+    try testing.expectEqual(.complete, result.stderr_status);
     if (offset < 0) {
         try testing.expectEqual(.local_io, result.primary);
         try testing.expect(!result.primary_deadline_reached);
@@ -63,10 +61,24 @@ fn runCase(offset: i2) !void {
     }
     try testing.expect(result.completed_ns >= result.primary_completed_ns);
     try support.noChildren();
-    try testing.expectError(
-        error.UnresolvedCleanup,
-        process.runCommand(allocator, io, command),
-    );
+    const marker = linux.openat(fixture.directory.dir.handle, "leader-track-marker", .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    try testing.expectEqual(.NOENT, linux.errno(marker));
+
+    var followup = try process.runCommand(allocator, io, .{
+        .executable = executable,
+        .argv = &.{ path, "bytes", "0", "0", "0" },
+        .environment = &environment,
+        .cwd = fixture.directory.dir,
+        .primary_deadline = .{ .expires_ns = std.math.maxInt(u64) },
+        .cleanup_deadline = .{ .expires_ns = std.math.maxInt(u64) },
+    });
+    defer followup.deinit(allocator);
+    try testing.expect(followup.succeeded());
+    try support.noChildren();
 }
 
 fn failChild(err: anyerror) noreturn {

@@ -101,6 +101,7 @@ COMMAND_STRING_MAX = 4096
 COMMAND_OUTPUT_COMMITMENT_DOMAIN = b"uk.wamr.command-output-v1\0"
 COMMAND_COMPLETE_PRIMARY_EVENTS_MIN = 1
 COMMAND_COMPLETE_CLEANUP_EVENTS_MIN = 5
+COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN = 3
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 BOOTSTRAP_STAGES = frozenset({
     "dependency-restore",
@@ -2305,13 +2306,37 @@ def validate_supervisor_state(
                      and primary_completed < primary_deadline_ns)),
             reason)
     if command["cleanup"] == "complete":
-        require(command["primary_events"]
-                >= COMMAND_COMPLETE_PRIMARY_EVENTS_MIN
-                and command["cleanup_events"]
-                >= COMMAND_COMPLETE_CLEANUP_EVENTS_MIN
-                and command["reap_events"] == descendants["observed"] + 2
-                and termination["kind"] is not None,
-                reason)
+        if command["primary_events"] == 0:
+            require(command["cleanup_events"]
+                    >= COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN
+                    and command["reap_events"] == 2
+                    and termination["kind"] is not None
+                    and command["executable_stable"] is True
+                    and primary["kind"] in {
+                        "timeout", "cancelled", "local_io",
+                    }
+                    and streams["stdout"]["bytes"] == 0
+                    and streams["stdout"]["sha256"] == EMPTY_SHA256
+                    and streams["stdout"]["status"] == "complete"
+                    and streams["stderr"]["bytes"] == 0
+                    and streams["stderr"]["sha256"] == EMPTY_SHA256
+                    and streams["stderr"]["status"] == "complete"
+                    and descendants == {
+                        "adopted": 0,
+                        "identity_validated": 0,
+                        "limit_exceeded": False,
+                        "observed": 0,
+                        "untracked": False,
+                    }, reason)
+        else:
+            require(command["primary_events"]
+                    >= COMMAND_COMPLETE_PRIMARY_EVENTS_MIN
+                    and command["cleanup_events"]
+                    >= COMMAND_COMPLETE_CLEANUP_EVENTS_MIN
+                    and command["reap_events"]
+                    == descendants["observed"] + 2
+                    and termination["kind"] is not None,
+                    reason)
     elif command["cleanup"] == "not_required":
         require(command["primary_events"] == 0
                 and command["cleanup_events"] == 0

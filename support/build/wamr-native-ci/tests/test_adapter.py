@@ -3234,11 +3234,12 @@ source/generated/
             observed = request["primary_deadline_ns"] + offset
             command.update({
                 "cancellation_observed": False,
-                "cleanup": "identity_changed",
-                "cleanup_complete": False,
-                "cleanup_events": 0,
+                "cleanup": "complete",
+                "cleanup_complete": True,
+                "cleanup_events":
+                    ci.COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN,
                 "completed_ns": observed + 1,
-                "poisoned": True,
+                "poisoned": False,
                 "primary": {
                     "code": None,
                     "kind": "local_io" if offset < 0 else "timeout",
@@ -3246,9 +3247,9 @@ source/generated/
                 "primary_completed_ns": observed,
                 "primary_deadline_reached": offset >= 0,
                 "primary_events": 0,
-                "reap_events": 1,
-                "stderr_status": "incomplete",
-                "stdout_status": "incomplete",
+                "reap_events": 2,
+                "stderr_status": "complete",
+                "stdout_status": "complete",
                 "termination": {"code": 9, "kind": "signal"},
             })
             request_raw = ci.validate_supervisor_request(request)
@@ -3265,10 +3266,10 @@ source/generated/
                 command = decoded["command"]
                 self.assertEqual(stdout, b"")
                 self.assertEqual(stderr, b"")
-                self.assertEqual(command["cleanup"], "identity_changed")
-                self.assertFalse(command["cleanup_complete"])
-                self.assertTrue(command["poisoned"])
-                self.assertEqual(command["reap_events"], 1)
+                self.assertEqual(command["cleanup"], "complete")
+                self.assertTrue(command["cleanup_complete"])
+                self.assertFalse(command["poisoned"])
+                self.assertEqual(command["reap_events"], 2)
                 self.assertEqual(
                     command["termination"],
                     {"code": 9, "kind": "signal"})
@@ -3298,6 +3299,16 @@ source/generated/
                 ci.Refusal, "invalid native command result"):
             ci.decoded_supervisor_result(
                 ci.canonical_json(before), before_request, expected)
+
+        incomplete_gate, incomplete_gate_request = (
+            leader_tracking_fixture(-1))
+        incomplete_gate["command"]["cleanup_events"] = (
+            ci.COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN - 1)
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(
+                ci.canonical_json(incomplete_gate),
+                incomplete_gate_request, expected)
 
         exact_negatives = []
         valid, valid_request = pre_spawn_fixture("local_io")

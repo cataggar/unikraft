@@ -721,7 +721,7 @@ test "pidfd liveness and proc start identity agree across exit and reap" {
     try support.noChildren();
 }
 
-test "command cleanup owns ordinary setsid double-fork and closed-fd descendants" {
+test "released command owns immediate ordinary setsid double-fork and closed-fd descendants" {
     var executable = try openExecutable();
     defer executable.close(io);
     const path = try support.executable();
@@ -733,7 +733,12 @@ test "command cleanup owns ordinary setsid double-fork and closed-fd descendants
         defer fixture.deinit();
         var command = try request(executable, &.{ path, mode }, &environment, fixture.directory.dir);
         command.limits.term_grace_ms = 50;
-        var result = try process.runCommand(allocator, io, command);
+        var result = try process.runCommandTest(
+            allocator,
+            io,
+            command,
+            .{ .leader_track_delay_ms = 20 },
+        );
         defer result.deinit(allocator);
         try testing.expect(result.succeeded());
         try testing.expectEqual(@as(u16, 1), result.descendants.observed);

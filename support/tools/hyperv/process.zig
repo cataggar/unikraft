@@ -485,6 +485,32 @@ pub const CommandLeaderTrackTest = struct {
     timestamp_observations: u32 = 0,
 };
 
+pub const CommandGateTestFault = enum {
+    pidfd,
+    procfs,
+    identity,
+    tracker,
+    clock,
+    ready_eof,
+    ready_bad,
+    release_write,
+    parent_close,
+    parent_crash,
+    release_bad,
+    recovery_proof,
+};
+
+pub const CommandGateTestState = struct {
+    fault: CommandGateTestFault,
+    fault_injections: u32 = 0,
+
+    fn inject(self: *CommandGateTestState, fault: CommandGateTestFault) bool {
+        if (self.fault != fault or self.fault_injections != 0) return false;
+        self.fault_injections = 1;
+        return true;
+    }
+};
+
 pub const CommandPreSpawnTestFault = enum {
     snapshot_unsupported,
     snapshot_local_io,
@@ -498,6 +524,7 @@ pub const CommandTestOptions = struct {
     clock: ?*CommandClockTest = null,
     signal: ?*CommandSignalTestState = null,
     leader_track: ?*CommandLeaderTrackTest = null,
+    gate: ?*CommandGateTestState = null,
     pre_spawn: ?CommandPreSpawnTestFault = null,
 };
 
@@ -515,7 +542,9 @@ pub const CommandLimits = struct {
 
 /// Internal trusted-command contract. This is deliberately not a general CLI:
 /// argv, environment, cwd, executable descriptor and both absolute deadlines
-/// are supplied by the owning controller.
+/// are supplied by the owning controller. After fork, the child remains behind
+/// a close-on-exec sequenced-socket gate until its pidfd/start identity belongs
+/// to the tracker; the original primary deadline continues across that gate.
 pub const CommandRequest = struct {
     executable: Executable,
     argv: []const []const u8,
@@ -677,7 +706,9 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
 /// Supervise one trusted Linux command and all ordinary descendants in a
 /// dedicated subreaper process. Descendants are identified by procfs
 /// parentage/start time, pinned with pidfds, signalled exactly, and fully
-/// reaped. Cleanup failure irreversibly poisons this process.
+/// reaped. A pre-release failure can remain unpoisoned only after the gated
+/// leader is pidfd-reaped and final ECHILD proves that user code never created
+/// an owned tree. Cleanup failure irreversibly poisons this process.
 pub fn runCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -780,6 +811,7 @@ fn runCommandImpl(
         options,
         snapshot,
         if (test_options) |options_value| options_value.pre_spawn else null,
+        if (test_options) |options_value| options_value.gate else null,
     ) catch |err| {
         if (err != error.SpawnFailed) return err;
         observed_ns = try now();
@@ -792,34 +824,263 @@ fn runCommandImpl(
     defer _ = linux.close(child.stdout);
     defer _ = linux.close(child.stderr);
     defer _ = linux.close(child.control);
+    defer child.closeGate();
 
     if (test_options) |options_value| {
-        if (options_value.leader_track_delay_ms != 0)
-            try pause(@intCast(options_value.leader_track_delay_ms));
+        if (options_value.leader_track_delay_ms != 0) {
+            pause(@intCast(options_value.leader_track_delay_ms)) catch {
+                const failure_ns = now() catch observed_ns;
+                return finishGatedCommandFailure(
+                    io,
+                    proc,
+                    request,
+                    &tracker,
+                    &child,
+                    &capture,
+                    null,
+                    .local_io,
+                    failure_ns,
+                    .local_io,
+                    options_value.gate,
+                    &result,
+                );
+            };
+        }
     }
+    const leader_pidfd = commandPidfd(child.pid) catch {
+        const failure_ns = now() catch observed_ns;
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            null,
+            .local_io,
+            failure_ns,
+            .proc_unavailable,
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
+        );
+    };
+    var leader_ownership = PidfdOwnership.init(leader_pidfd);
+    defer leader_ownership.deinit();
+    if (commandGateInject(
+        if (test_options) |options_value| options_value.gate else null,
+        .pidfd,
+    )) {
+        const failure_ns = now() catch observed_ns;
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            &leader_ownership,
+            .local_io,
+            failure_ns,
+            .proc_unavailable,
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
+        );
+    }
+    var leader_start_ticks: ?u64 = null;
     tracker.addLeader(
         proc,
         child.pid,
+        &leader_ownership,
+        &leader_start_ticks,
         if (test_options) |options_value| options_value.leader_track else null,
+        if (test_options) |options_value| options_value.gate else null,
     ) catch |err| {
-        result.cleanup_complete = false;
-        result.cleanup = switch (err) {
-            error.IdentityChanged => .identity_changed,
-            error.ProcessGone, error.ProcUnavailable, error.PidfdUnavailable => .proc_unavailable,
-            error.PollFailed => .local_io,
-        };
-        const primary_observed_ns = try commandLeaderTrackFailureObserved(
+        const primary_observed_ns = commandLeaderTrackFailureObserved(
             if (test_options) |options_value| options_value.leader_track else null,
+        ) catch observed_ns;
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            &leader_ownership,
+            classifyPreReleasePrimary(.local_io, options, primary_observed_ns),
+            primary_observed_ns,
+            switch (err) {
+                error.IdentityChanged => .identity_changed,
+                error.ProcessGone, error.ProcUnavailable => .proc_unavailable,
+                error.PollFailed, error.TrackerUnavailable => .local_io,
+            },
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
         );
-        completePrimaryCommandTimingAt(&result, primary_observed_ns);
-        if (result.primary_completed_ns >= request.primary_deadline.expires_ns) {
-            result.primary = .timeout;
-            result.primary_deadline_reached = true;
-        }
-        poisonAndRecoverLeader(proc, child.pid, request.cleanup_deadline, &result);
-        try completeCleanupCommandTiming(&result);
-        return result;
     };
+
+    var pre_release_ns = primaryPreReleaseObservation(
+        if (test_options) |options_value| options_value.gate else null,
+    ) catch {
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            null,
+            .local_io,
+            observed_ns,
+            .local_io,
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
+        );
+    };
+    if (pre_release_ns >= request.primary_deadline.expires_ns or cancelled(options)) {
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            null,
+            classifyPreReleasePrimary(.local_io, options, pre_release_ns),
+            pre_release_ns,
+            .local_io,
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
+        );
+    }
+    awaitCommandGateReady(
+        child.gate.?,
+        options,
+        if (test_options) |options_value| options_value.gate else null,
+        &pre_release_ns,
+    ) catch |err| {
+        if (err == error.GateEof)
+            _ = commandGateInject(
+                if (test_options) |options_value| options_value.gate else null,
+                .ready_eof,
+            );
+        if (err == error.GateProtocol)
+            _ = commandGateInject(
+                if (test_options) |options_value| options_value.gate else null,
+                .ready_bad,
+            );
+        const failure_ns = if (err == error.DeadlineExceeded or err == error.Cancelled)
+            pre_release_ns
+        else
+            primaryPreReleaseObservation(
+                if (test_options) |options_value| options_value.gate else null,
+            ) catch pre_release_ns;
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            null,
+            classifyPreReleasePrimary(
+                if (err == error.Cancelled) .cancelled else .local_io,
+                options,
+                failure_ns,
+            ),
+            failure_ns,
+            .local_io,
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
+        );
+    };
+    pre_release_ns = primaryPreReleaseObservation(
+        if (test_options) |options_value| options_value.gate else null,
+    ) catch {
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            null,
+            .local_io,
+            pre_release_ns,
+            .local_io,
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
+        );
+    };
+    if (pre_release_ns >= request.primary_deadline.expires_ns or cancelled(options)) {
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            null,
+            classifyPreReleasePrimary(.local_io, options, pre_release_ns),
+            pre_release_ns,
+            .local_io,
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
+        );
+    }
+    if (commandGateInject(
+        if (test_options) |options_value| options_value.gate else null,
+        .parent_close,
+    ) or commandGateFaultIs(
+        if (test_options) |options_value| options_value.gate else null,
+        .recovery_proof,
+    )) {
+        child.closeGate();
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            null,
+            .local_io,
+            pre_release_ns,
+            .local_io,
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
+        );
+    }
+    if (commandGateInject(
+        if (test_options) |options_value| options_value.gate else null,
+        .parent_crash,
+    )) linux.exit_group(123);
+    releaseCommandGate(
+        child.gate.?,
+        if (test_options) |options_value| options_value.gate else null,
+    ) catch {
+        _ = commandGateInject(
+            if (test_options) |options_value| options_value.gate else null,
+            .release_write,
+        );
+        const failure_ns = primaryPreReleaseObservation(
+            if (test_options) |options_value| options_value.gate else null,
+        ) catch pre_release_ns;
+        return finishGatedCommandFailure(
+            io,
+            proc,
+            request,
+            &tracker,
+            &child,
+            &capture,
+            null,
+            classifyPreReleasePrimary(.local_io, options, failure_ns),
+            failure_ns,
+            .local_io,
+            if (test_options) |options_value| options_value.gate else null,
+            &result,
+        );
+    };
+    child.closeGate();
 
     var monitor_completed = true;
     var terminal_observed_ns: ?u64 = null;
@@ -878,7 +1139,7 @@ fn runCommandImpl(
             error.IdentityChanged => .identity_changed,
             error.SignalFailed => .signal_failed,
             error.ReapFailed => .reap_failed,
-            error.ProcUnavailable, error.PidfdUnavailable => .proc_unavailable,
+            error.ProcUnavailable => .proc_unavailable,
             error.ClockUnavailable, error.PollFailed => .local_io,
             else => .local_io,
         };
@@ -1124,7 +1385,7 @@ fn supervise(allocator: std.mem.Allocator, options: Options, capture: *Capture, 
         result.failures.primary = .{ .stage = .process_spawn, .category = .cancelled };
         return result;
     }
-    var child = spawnOwned(allocator, options, policy.fault, null) catch {
+    var child = spawnOwned(allocator, options, policy.fault, null, null) catch {
         result.failures.primary = .{ .stage = .process_spawn, .category = .spawn_failed };
         return result;
     };
@@ -1391,6 +1652,31 @@ fn commandLeaderTrackFailureObserved(fault: ?*CommandLeaderTrackTest) !u64 {
     return now();
 }
 
+fn commandGateInject(test_state: ?*CommandGateTestState, fault: CommandGateTestFault) bool {
+    const active = test_state orelse return false;
+    return active.inject(fault);
+}
+
+fn commandGateFaultIs(test_state: ?*CommandGateTestState, fault: CommandGateTestFault) bool {
+    const active = test_state orelse return false;
+    return active.fault == fault and active.fault_injections == 0;
+}
+
+fn primaryPreReleaseObservation(test_state: ?*CommandGateTestState) !u64 {
+    if (commandGateInject(test_state, .clock)) return error.ClockUnavailable;
+    return now();
+}
+
+fn classifyPreReleasePrimary(
+    fallback: CommandPrimary,
+    options: Options,
+    observed_ns: u64,
+) CommandPrimary {
+    if (observed_ns >= options.deadline.expires_ns) return .timeout;
+    if (cancelled(options)) return .cancelled;
+    return fallback;
+}
+
 fn takeCommandEvent(limit: u32, events: *u32) !void {
     if (events.* >= limit) return error.EventLimit;
     events.* += 1;
@@ -1485,6 +1771,7 @@ const OwnedProcess = struct {
 
 const PidfdOwnership = struct {
     descriptor: linux.fd_t,
+    start_ticks: ?u64 = null,
     test_state: ?*CommandPidfdTestState = null,
     candidate: ?u32 = null,
     owned: bool = true,
@@ -1552,22 +1839,36 @@ const OwnedTracker = struct {
         self: *OwnedTracker,
         proc: linux.fd_t,
         pid: linux.pid_t,
+        ownership: *PidfdOwnership,
+        start_ticks: *?u64,
         fault: ?*CommandLeaderTrackTest,
+        gate_test: ?*CommandGateTestState,
     ) !void {
+        if (commandGateInject(gate_test, .procfs)) return error.ProcUnavailable;
+        const observed = try readProcStat(proc, pid);
+        start_ticks.* = observed.start_ticks;
+        ownership.start_ticks = observed.start_ticks;
+        if (observed.pid != pid or observed.parent != linux.getpid() or observed.start_ticks == 0)
+            return error.IdentityChanged;
+        if (commandGateInject(gate_test, .identity)) return error.IdentityChanged;
+        const identity = (try verifiedOwnedIdentity(
+            proc,
+            observed.pid,
+            observed.start_ticks,
+            ownership.descriptor,
+        )) orelse
+            return error.IdentityChanged;
+        if (identity.parent != linux.getpid()) return error.IdentityChanged;
         if (fault) |active| {
             active.fault_injections += 1;
             return error.IdentityChanged;
         }
-        const observed = try readProcStat(proc, pid);
-        if (observed.pid != pid or observed.parent != linux.getpid() or observed.start_ticks == 0)
-            return error.IdentityChanged;
-        const descriptor = try commandPidfd(pid);
-        var ownership = PidfdOwnership.init(descriptor);
-        defer ownership.deinit();
-        const identity = (try verifiedOwnedIdentity(proc, observed.pid, observed.start_ticks, descriptor)) orelse
-            return error.IdentityChanged;
-        if (identity.parent != linux.getpid()) return error.IdentityChanged;
-        self.items[0] = .{ .pid = pid, .start_ticks = identity.start_ticks, .pidfd = descriptor };
+        if (commandGateInject(gate_test, .tracker)) return error.TrackerUnavailable;
+        self.items[0] = .{
+            .pid = pid,
+            .start_ticks = identity.start_ticks,
+            .pidfd = ownership.descriptor,
+        };
         self.len = 1;
         ownership.transfer();
     }
@@ -2163,32 +2464,226 @@ fn poisonCommand(
     poisoned.store(true, .release);
 }
 
-fn poisonAndRecoverLeader(proc: linux.fd_t, pid: linux.pid_t, deadline: Deadline, result: *CommandResult) void {
-    const observed = readProcStat(proc, pid) catch null;
-    if (observed) |identity| {
-        if (identity.pid == pid and identity.parent == linux.getpid() and identity.start_ticks != 0) {
-            if (commandPidfd(pid)) |descriptor| {
-                defer _ = linux.close(descriptor);
-                if (verifiedLiveIdentity(proc, pid, identity.start_ticks, descriptor) catch null) |verified| {
-                    if (verified.parent == linux.getpid())
-                        _ = linux.pidfd_send_signal(descriptor, .KILL, null, 0);
-                }
-            } else |_| {}
+fn finishGatedCommandFailure(
+    io: std.Io,
+    proc: linux.fd_t,
+    request: CommandRequest,
+    tracker: *OwnedTracker,
+    child: *Spawned,
+    capture: *Capture,
+    candidate: ?*PidfdOwnership,
+    primary: CommandPrimary,
+    primary_observed_ns: u64,
+    unavailable_cleanup: CommandCleanup,
+    gate_test: ?*CommandGateTestState,
+    result: *CommandResult,
+) CommandResult {
+    _ = io;
+    child.closeGate();
+    result.primary = primary;
+    result.primary_deadline_reached = primary == .timeout;
+    result.cancellation_observed = primary == .cancelled;
+    completePrimaryCommandTimingAt(result, primary_observed_ns);
+
+    const descriptor = if (tracker.len == 1)
+        tracker.items[0].pidfd
+    else if (candidate) |ownership|
+        ownership.descriptor
+    else
+        commandPidfd(child.pid) catch {
+            poisonUnpinnedGatedChild(child.pid, request, result);
+            result.cleanup_complete = false;
+            result.cleanup = unavailable_cleanup;
+            finishCommandCapture(capture, child.stdout, child.stderr, result);
+            result.stdout = capture.output[0..capture.stdout_count];
+            result.stderr = capture.stderr_output[0..capture.stderr_count];
+            result.completed_ns = result.primary_completed_ns;
+            poisoned.store(true, .release);
+            return result.*;
+        };
+    var recovered_descriptor: ?linux.fd_t = null;
+    if (tracker.len == 0 and candidate == null) recovered_descriptor = descriptor;
+    defer if (recovered_descriptor) |owned| {
+        _ = linux.close(owned);
+    };
+
+    recoverGatedChild(
+        proc,
+        child.pid,
+        descriptor,
+        if (tracker.len == 1)
+            tracker.items[0].start_ticks
+        else if (candidate) |ownership|
+            ownership.start_ticks
+        else
+            null,
+        request,
+        gate_test,
+        result,
+    ) catch |err| {
+        poisonGatedChild(child.pid, descriptor, request, result);
+        result.cleanup_complete = false;
+        result.cleanup = switch (err) {
+            error.CleanupDeadline => .deadline,
+            error.EventLimit, error.ReapLimit => .event_limit,
+            error.IdentityChanged => .identity_changed,
+            error.SignalFailed => .signal_failed,
+            error.ReapFailed => .reap_failed,
+            error.ProcUnavailable => .proc_unavailable,
+            error.ClockUnavailable, error.PollFailed => .local_io,
+        };
+        poisoned.store(true, .release);
+    };
+    if (result.cleanup_complete) result.cleanup = .complete;
+    if (tracker.len == 1) tracker.items[0].reaped = result.termination != null;
+    result.descendants = tracker.report;
+    finishCommandCapture(capture, child.stdout, child.stderr, result);
+    result.stdout = capture.output[0..capture.stdout_count];
+    result.stderr = capture.stderr_output[0..capture.stderr_count];
+    const completed = now() catch blk: {
+        result.cleanup_complete = false;
+        result.cleanup = .local_io;
+        poisoned.store(true, .release);
+        break :blk result.primary_completed_ns;
+    };
+    result.completed_ns = @max(result.primary_completed_ns, completed);
+    if (result.cleanup_complete and result.completed_ns > request.cleanup_deadline.expires_ns) {
+        result.cleanup_complete = false;
+        result.cleanup = .deadline;
+        poisoned.store(true, .release);
+    }
+    return result.*;
+}
+
+fn recoverGatedChild(
+    proc: linux.fd_t,
+    pid: linux.pid_t,
+    descriptor: linux.fd_t,
+    start_ticks: ?u64,
+    request: CommandRequest,
+    gate_test: ?*CommandGateTestState,
+    result: *CommandResult,
+) !void {
+    try takeCleanupEvent(request, result);
+    if (start_ticks) |expected| {
+        if (try verifiedOwnedIdentity(proc, pid, expected, descriptor)) |identity| {
+            if (identity.parent != linux.getpid()) return error.IdentityChanged;
         }
     }
-    var attempts: u16 = 0;
-    while (attempts < 1024 and !(deadline.expired() catch true)) : (attempts += 1) {
-        var status: u32 = 0;
-        const child = linux.waitpid(pid, &status, linux.W.NOHANG);
-        if (linux.errno(child) == .SUCCESS and child != 0) {
-            result.reap_events += 1;
-            result.termination = terminationFromStatus(status);
+    var exited_child_gate = false;
+    var attempts: u8 = 0;
+    while (attempts < 10) : (attempts += 1) {
+        try takeCleanupEvent(request, result);
+        if (try pidfdExited(descriptor)) {
+            exited_child_gate = true;
             break;
         }
-        if (linux.errno(child) == .CHILD) break;
-        pause(deadline.waitMilliseconds(2) catch 0) catch break;
+        try pause(1);
     }
-    poisoned.store(true, .release);
+    if (!exited_child_gate) {
+        try takeCleanupEvent(request, result);
+        switch (linux.errno(linux.pidfd_send_signal(descriptor, .KILL, null, 0))) {
+            .SUCCESS, .SRCH => {},
+            else => return error.SignalFailed,
+        }
+    }
+    while (true) {
+        try takeCleanupEvent(request, result);
+        var status: u32 = 0;
+        const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(waited)) {
+            .SUCCESS => {
+                if (waited == 0) {
+                    try pause(1);
+                    continue;
+                }
+                if (result.reap_events >= request.limits.reap_events) return error.ReapLimit;
+                result.reap_events += 1;
+                result.termination = terminationFromStatus(status);
+                break;
+            },
+            .INTR => continue,
+            else => return error.ReapFailed,
+        }
+    }
+    try takeCleanupEvent(request, result);
+    if (!try pidfdExited(descriptor)) return error.ReapFailed;
+    if (commandGateInject(gate_test, .recovery_proof)) return error.ReapFailed;
+    var info = std.mem.zeroes(linux.siginfo_t);
+    while (true) switch (linux.errno(linux.waitid(
+        .ALL,
+        0,
+        &info,
+        linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT,
+        null,
+    ))) {
+        .CHILD => {
+            if (result.reap_events >= request.limits.reap_events) return error.ReapLimit;
+            result.reap_events += 1;
+            result.cleanup_complete = true;
+            return;
+        },
+        .INTR => continue,
+        else => return error.ReapFailed,
+    };
+}
+
+fn poisonGatedChild(
+    pid: linux.pid_t,
+    descriptor: linux.fd_t,
+    request: CommandRequest,
+    result: *CommandResult,
+) void {
+    _ = linux.pidfd_send_signal(descriptor, .KILL, null, 0);
+    var attempts: u16 = 0;
+    while (attempts < request.limits.reap_events) : (attempts += 1) {
+        var status: u32 = 0;
+        const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(waited)) {
+            .SUCCESS => {
+                if (waited == 0) {
+                    pause(1) catch {};
+                    continue;
+                }
+                if (result.termination == null) {
+                    result.termination = terminationFromStatus(status);
+                    if (result.reap_events < request.limits.reap_events)
+                        result.reap_events += 1;
+                }
+                break;
+            },
+            .INTR => continue,
+            .CHILD => break,
+            else => break,
+        }
+    }
+}
+
+fn poisonUnpinnedGatedChild(
+    pid: linux.pid_t,
+    request: CommandRequest,
+    result: *CommandResult,
+) void {
+    _ = linux.kill(pid, .KILL);
+    var attempts: u16 = 0;
+    while (attempts < request.limits.reap_events) : (attempts += 1) {
+        var status: u32 = 0;
+        const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(waited)) {
+            .SUCCESS => {
+                if (waited == 0) {
+                    pause(1) catch {};
+                    continue;
+                }
+                result.termination = terminationFromStatus(status);
+                if (result.reap_events < request.limits.reap_events)
+                    result.reap_events += 1;
+                return;
+            },
+            .INTR => continue,
+            else => return,
+        }
+    }
 }
 
 fn signalGroup(pid: linux.pid_t, signal: linux.SIG) !void {
@@ -2232,6 +2727,14 @@ const Spawned = struct {
     stdout: linux.fd_t,
     stderr: linux.fd_t,
     control: linux.fd_t,
+    gate: ?linux.fd_t = null,
+
+    fn closeGate(self: *Spawned) void {
+        if (self.gate) |descriptor| {
+            _ = linux.close(descriptor);
+            self.gate = null;
+        }
+    }
 };
 
 fn spawnCommandOwned(
@@ -2239,9 +2742,16 @@ fn spawnCommandOwned(
     options: Options,
     executable: linux.fd_t,
     fault: ?CommandPreSpawnTestFault,
+    gate_test: ?*CommandGateTestState,
 ) !Spawned {
     if (fault == .spawn_local_io) return error.SpawnFailed;
-    return spawnOwned(allocator, options, null, executable);
+    return spawnOwned(
+        allocator,
+        options,
+        null,
+        executable,
+        if (gate_test) |active| active.fault else null,
+    );
 }
 
 // Zig 0.16 Threaded.spawn loses PID and pipe ownership on exec failure. Keep the
@@ -2251,6 +2761,7 @@ fn spawnOwned(
     options: Options,
     fault: ?PrivateTestFault,
     executable: ?linux.fd_t,
+    gate_fault: ?CommandGateTestFault,
 ) !Spawned {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2266,6 +2777,8 @@ fn spawnOwned(
     errdefer closePipe(stderr);
     const control = try makePipe();
     errdefer closePipe(control);
+    const gate = if (executable != null) try makeGatePair() else null;
+    errdefer if (gate) |pair| closePipe(pair);
     const opened = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, 0);
     if (linux.errno(opened) != .SUCCESS) return error.SpawnFailed;
     const null_fd = try aboveStdio(@intCast(opened));
@@ -2276,6 +2789,10 @@ fn spawnOwned(
     if (linux.errno(forked) != .SUCCESS) return error.SpawnFailed;
     if (forked == 0) {
         // No allocation, std.Io, libc, or locks are permitted between fork and exec.
+        _ = linux.close(stdout[0]);
+        _ = linux.close(stderr[0]);
+        _ = linux.close(control[0]);
+        if (gate) |pair| _ = linux.close(pair[0]);
         if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS or
             linux.getppid() != parent_pid) childFailure(control[1], 1);
         if (fault == .pre_exec_stall) {
@@ -2294,6 +2811,7 @@ fn spawnOwned(
         // are shifted by one. Preserve only stdio at exec, including private locks.
         if (linux.errno(linux.close_range(3, std.math.maxInt(linux.fd_t), @bitCast(@as(u32, 1 << 2)))) != .SUCCESS)
             childFailure(control[1], 1);
+        if (gate) |pair| childCommandGate(pair[1], control[1], gate_fault);
         if (executable) |descriptor| {
             const executed = linux.execveat(descriptor, "", argv.ptr, environment.slice.ptr, .{
                 .EMPTY_PATH = true,
@@ -2314,13 +2832,139 @@ fn spawnOwned(
     _ = linux.close(stdout[1]);
     _ = linux.close(stderr[1]);
     _ = linux.close(control[1]);
-    return .{ .pid = @intCast(forked), .stdout = stdout[0], .stderr = stderr[0], .control = control[0] };
+    if (gate) |pair| _ = linux.close(pair[1]);
+    return .{
+        .pid = @intCast(forked),
+        .stdout = stdout[0],
+        .stderr = stderr[0],
+        .control = control[0],
+        .gate = if (gate) |pair| pair[0] else null,
+    };
 }
 
 fn childFailure(fd: linux.fd_t, code: u8) noreturn {
     const marker = [_]u8{code};
     _ = linux.write(fd, &marker, marker.len);
     linux.exit_group(126);
+}
+
+const command_gate_ready: u8 = 0xa5;
+const command_gate_release: u8 = 0x5a;
+
+fn childCommandGate(
+    descriptor: linux.fd_t,
+    control: linux.fd_t,
+    fault: ?CommandGateTestFault,
+) void {
+    if (fault == .ready_eof) {
+        _ = linux.close(descriptor);
+        childFailure(control, 3);
+    }
+    if (fault == .ready_bad) {
+        const invalid = [_]u8{ command_gate_ready, command_gate_ready };
+        _ = linux.sendto(descriptor, &invalid, invalid.len, linux.MSG.NOSIGNAL, null, 0);
+        _ = linux.close(descriptor);
+        childFailure(control, 3);
+    }
+    const ready = [_]u8{command_gate_ready};
+    while (true) {
+        const sent = linux.sendto(descriptor, &ready, ready.len, linux.MSG.NOSIGNAL, null, 0);
+        switch (linux.errno(sent)) {
+            .SUCCESS => {
+                if (sent != ready.len) childFailure(control, 3);
+                break;
+            },
+            .INTR => continue,
+            else => childFailure(control, 3),
+        }
+    }
+    if (fault == .release_write) {
+        _ = linux.close(descriptor);
+        childFailure(control, 3);
+    }
+    var release: [1]u8 = undefined;
+    while (true) {
+        const received = linux.recvfrom(descriptor, &release, release.len, 0, null, null);
+        switch (linux.errno(received)) {
+            .SUCCESS => {
+                if (received != release.len or release[0] != command_gate_release) {
+                    _ = linux.close(descriptor);
+                    childFailure(control, 3);
+                }
+                break;
+            },
+            .INTR => continue,
+            else => {
+                _ = linux.close(descriptor);
+                childFailure(control, 3);
+            },
+        }
+    }
+    _ = linux.close(descriptor);
+}
+
+fn awaitCommandGateReady(
+    descriptor: linux.fd_t,
+    options: Options,
+    gate_test: ?*CommandGateTestState,
+    observed_ns: *u64,
+) !void {
+    while (true) {
+        observed_ns.* = try primaryPreReleaseObservation(gate_test);
+        if (observed_ns.* >= options.deadline.expires_ns) return error.DeadlineExceeded;
+        if (cancelled(options)) return error.Cancelled;
+        const remaining_ns = options.deadline.expires_ns - observed_ns.*;
+        const wait_ms: i32 = @intCast(@min(
+            @as(u64, 10),
+            @max(@as(u64, 1), (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms),
+        ));
+        var pollfds = [_]linux.pollfd{.{
+            .fd = descriptor,
+            .events = linux.POLL.IN,
+            .revents = 0,
+        }};
+        switch (linux.errno(linux.poll(&pollfds, pollfds.len, wait_ms))) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.PollFailed,
+        }
+        if (pollfds[0].revents & linux.POLL.NVAL != 0) return error.GateReadFailed;
+        if (pollfds[0].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) == 0)
+            continue;
+        var ready: [2]u8 = undefined;
+        const received = linux.recvfrom(descriptor, &ready, ready.len, 0, null, null);
+        switch (linux.errno(received)) {
+            .SUCCESS => {
+                if (received == 0) return error.GateEof;
+                if (received != 1 or ready[0] != command_gate_ready)
+                    return error.GateProtocol;
+                return;
+            },
+            .INTR => continue,
+            else => return error.GateReadFailed,
+        }
+    }
+}
+
+fn releaseCommandGate(
+    descriptor: linux.fd_t,
+    gate_test: ?*CommandGateTestState,
+) !void {
+    const marker = [_]u8{if (commandGateInject(gate_test, .release_bad))
+        command_gate_release ^ 0xff
+    else
+        command_gate_release};
+    while (true) {
+        const sent = linux.sendto(descriptor, &marker, marker.len, linux.MSG.NOSIGNAL, null, 0);
+        switch (linux.errno(sent)) {
+            .SUCCESS => {
+                if (sent != marker.len) return error.GateWriteFailed;
+                return;
+            },
+            .INTR => continue,
+            else => return error.GateWriteFailed,
+        }
+    }
 }
 
 fn execStatus(fd: linux.fd_t) !bool {
@@ -2350,6 +2994,25 @@ fn makePipe() ![2]linux.fd_t {
         return error.SpawnFailed;
     };
     return pipe;
+}
+
+fn makeGatePair() ![2]linux.fd_t {
+    var pair: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC,
+        0,
+        &pair,
+    )) != .SUCCESS) return error.SpawnFailed;
+    pair[0] = aboveStdio(pair[0]) catch {
+        _ = linux.close(pair[1]);
+        return error.SpawnFailed;
+    };
+    pair[1] = aboveStdio(pair[1]) catch {
+        _ = linux.close(pair[0]);
+        return error.SpawnFailed;
+    };
+    return pair;
 }
 
 fn aboveStdio(fd: linux.fd_t) !linux.fd_t {
