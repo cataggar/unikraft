@@ -70,8 +70,27 @@ zig build --build-file support/build/wamr-native-ci/build.zig \
   --cache-dir "$PWD/.d/wamr-direct/package-cache" \
   --prefix "$PWD/.d/wamr-direct/package-tools" \
   -Doptimize=ReleaseSafe -j2 test install
+SUPERVISOR_SOURCE_SHA256="$(
+  python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+
+path = Path("support/build/wamr-native-ci/run.py").resolve()
+spec = importlib.util.spec_from_file_location("wamr_native_ci", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.supervisor_source_map()["content_closure_sha256"])
+PY
+)"
+zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
+  --system "$PWD/.d/wamr-direct/restore/zig-pkg" \
+  --cache-dir "$PWD/.d/wamr-direct/supervisor-cache" \
+  --prefix "$PWD/.d/wamr-direct/supervisor" \
+  -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
+  -Doptimize=ReleaseSafe -j2 install
 WAMR_DIRECT_TOOLS="$PWD/.d/wamr-direct/tools/bin" \
 WAMR_CI_PACKAGE="$PWD/.d/wamr-direct/package-tools/bin/wamr-ci-package" \
+WAMR_CI_SUPERVISOR="$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
   python3 -m unittest discover -s support/tools/hyperv/direct/tests -v
 ```
 
@@ -93,7 +112,13 @@ On an appropriate private x86/KVM runner, use the existing credential-free
 committed final source**, with the pinned SDK
 `a53205d77be3b880eb8f8b96679512ba58e2331a`, unchanged compiler profile and tiny
 configuration. Complete all four exact-image local boots (raw/VPC, each with
-x2APIC and masked x2APIC) and process cleanup. Do not run privilege-sensitive
+x2APIC and masked x2APIC) and process cleanup. The WAMR build/boot adapter uses
+the retained native command supervisor: ordinary owned children, `setsid`,
+double-fork and closed-capture descendants must be gone even after a successful
+leader, and any cleanup exhaustion/poison blocks handoff. This detects
+accidental or persistent input mutation at the guarded before/after
+boundaries; it is not isolation from a hostile same-UID process or PID
+namespace. Do not run privilege-sensitive
 runner setup on a shared development host.
 
 Before that private runner discards the runtime, export to a fresh private
@@ -191,7 +216,8 @@ python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
   --expected-source "$SOURCE_SHA" --expected-tree "$SOURCE_TREE" \
   --expected-archive-sha256 "$ARCHIVE_SHA256" \
   --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
-  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate"
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
+  --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor"
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" handoff \
   "$PRIVATE_PARENT/FRESH-imported-image/bundle.json"
 python3 support/build/wamr-native-ci/handoff.py plan \
@@ -199,8 +225,22 @@ python3 support/build/wamr-native-ci/handoff.py plan \
   --output "$PRIVATE_PARENT/FRESH-unapproved-plan.json"
 ```
 
-The importer bounds and verifies every member and rejects extra files,
-symlinks, changed source/image/serial/report/hash or failed local outcomes.
+The importer requires both locally reviewed native executables explicitly;
+there is no `PATH`, environment or sibling-file fallback for either one. It
+opens the supervisor no-follow, binds its physical/content identity, requires
+the exact native ELF bytes (x86-64 on the hosted runner) and dynamic-runtime
+contents recorded by the
+accepted build, checks its canonical protocol/source-closure identity against
+the accepted source commit/tree, and only then uses it for native validator
+revalidation. The importer bounds and
+verifies every member and rejects extra files, symlinks, changed
+source/image/serial/report/hash or failed local outcomes.
+It also recomputes native-width supervisor invariants, canonical UTF-8 request
+and result bindings, empty-stream hashes, and the aggregate stream
+count/digest commitment. Nonempty command streams are intentionally absent
+from the public archive, so their labelled digests are accepted only as
+observations authenticated by the independently selected current inner-ZIP
+digest above; they are not claimed to be independently reproducible.
 It preserves original bytes and request hashes, changes only the handoff's
 local file references, and invokes native production revalidation. An
 incomplete import never publishes the final operator `bundle.json`.

@@ -240,6 +240,72 @@ fn request(
     };
 }
 
+fn expectExactPreSpawn(
+    result: process.CommandResult,
+    primary: std.meta.Tag(process.CommandPrimary),
+) !void {
+    try testing.expectEqual(primary, std.meta.activeTag(result.primary));
+    try testing.expectEqual(.not_required, result.cleanup);
+    try testing.expect(result.cleanup_complete);
+    try testing.expect(result.executable_stable);
+    try testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try testing.expectEqual(@as(usize, 0), result.stderr.len);
+    try testing.expectEqual(.complete, result.stdout_status);
+    try testing.expectEqual(.complete, result.stderr_status);
+    try testing.expectEqual(@as(?std.process.Child.Term, null), result.termination);
+    try testing.expectEqual(@as(u32, 0), result.primary_events);
+    try testing.expectEqual(@as(u32, 0), result.cleanup_events);
+    try testing.expectEqual(@as(u16, 0), result.reap_events);
+    try testing.expectEqual(process.CommandDescendants{}, result.descendants);
+    try testing.expectEqual(result.primary_completed_ns, result.completed_ns);
+    try testing.expect(result.started_ns <= result.primary_completed_ns);
+    try testing.expectEqual(primary == .timeout, result.primary_deadline_reached);
+    try testing.expectEqual(primary == .cancelled, result.cancellation_observed);
+}
+
+test "command pre-spawn results have one exact not-required shape" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const cases = [_]struct {
+        primary: std.meta.Tag(process.CommandPrimary),
+        expired: bool = false,
+        cancelled: bool = false,
+        fault: ?process.CommandPreSpawnTestFault = null,
+    }{
+        .{ .primary = .timeout, .expired = true },
+        .{ .primary = .cancelled, .cancelled = true },
+        .{ .primary = .snapshot_unsupported, .fault = .snapshot_unsupported },
+        .{ .primary = .local_io, .fault = .snapshot_local_io },
+        .{ .primary = .local_io, .fault = .spawn_local_io },
+    };
+    for (cases) |case| {
+        var cancellation = std.atomic.Value(bool).init(case.cancelled);
+        var command = try request(
+            executable,
+            &.{ path, "bytes", "0", "0", "0" },
+            &environment,
+            fixture.directory.dir,
+        );
+        if (case.expired) command.primary_deadline = .{ .expires_ns = 1 };
+        command.cancel = if (case.cancelled) &cancellation else null;
+        var result = try process.runCommandTest(
+            allocator,
+            io,
+            command,
+            .{ .pre_spawn = case.fault },
+        );
+        defer result.deinit(allocator);
+        try expectExactPreSpawn(result, case.primary);
+        try support.noChildren();
+    }
+}
+
 test "command contract captures successful bounded stdout and stderr" {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
@@ -655,7 +721,7 @@ test "pidfd liveness and proc start identity agree across exit and reap" {
     try support.noChildren();
 }
 
-test "command cleanup owns ordinary setsid double-fork and closed-fd descendants" {
+test "released command owns immediate ordinary setsid double-fork and closed-fd descendants" {
     var executable = try openExecutable();
     defer executable.close(io);
     const path = try support.executable();
@@ -667,7 +733,12 @@ test "command cleanup owns ordinary setsid double-fork and closed-fd descendants
         defer fixture.deinit();
         var command = try request(executable, &.{ path, mode }, &environment, fixture.directory.dir);
         command.limits.term_grace_ms = 50;
-        var result = try process.runCommand(allocator, io, command);
+        var result = try process.runCommandTest(
+            allocator,
+            io,
+            command,
+            .{ .leader_track_delay_ms = 20 },
+        );
         defer result.deinit(allocator);
         try testing.expect(result.succeeded());
         try testing.expectEqual(@as(u16, 1), result.descendants.observed);
@@ -702,6 +773,72 @@ test "forced fast leader exit retains zombie identity and does not poison" {
     try testing.expect(result.succeeded());
     try testing.expectEqual(@as(u16, 2), result.reap_events);
     try support.noChildren();
+}
+
+test "leader exit observation uses the inclusive absolute deadline boundary" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    for ([_]i2{ -1, 0, 1 }) |offset| {
+        var command = try request(
+            executable,
+            &.{ path, "bytes", "0", "0", "0" },
+            &environment,
+            fixture.directory.dir,
+        );
+        const current = try process.monotonicNanoseconds();
+        command.primary_deadline = .{ .expires_ns = current + 10 * std.time.ns_per_s };
+        command.cleanup_deadline = .{ .expires_ns = current + 20 * std.time.ns_per_s };
+        const observed = if (offset < 0)
+            command.primary_deadline.expires_ns - 1
+        else
+            command.primary_deadline.expires_ns + @as(u64, @intCast(offset));
+        var clock: process.CommandClockTest = .{
+            .monitor_check_ns = command.primary_deadline.expires_ns - 1,
+            .leader_exit_ns = observed,
+        };
+        var signals: process.CommandSignalTestState = .{};
+        var result = try process.runCommandTest(
+            allocator,
+            io,
+            command,
+            .{ .clock = &clock, .signal = &signals },
+        );
+        defer result.deinit(allocator);
+        try testing.expect(clock.monitor_checks >= 1);
+        try testing.expectEqual(@as(u32, 1), clock.leader_exit_observations);
+        try testing.expectEqual(observed, result.primary_completed_ns);
+        try testing.expectEqual(.complete, result.cleanup);
+        try testing.expect(result.cleanup_complete);
+        try testing.expectEqual(@as(u32, 0), signals.attempts);
+        try testing.expectEqual(
+            std.process.Child.Term{ .exited = 0 },
+            result.termination.?,
+        );
+        if (offset < 0) {
+            try testing.expectEqual(
+                process.CommandPrimary{ .exited = 0 },
+                result.primary,
+            );
+            try testing.expect(!result.primary_deadline_reached);
+            try testing.expect(result.succeeded());
+        } else {
+            try testing.expectEqual(.timeout, result.primary);
+            try testing.expect(result.primary_deadline_reached);
+            try testing.expect(!result.succeeded());
+        }
+        try testing.expect(result.completed_ns >= result.primary_completed_ns);
+        try testing.expectEqual(
+            result.descendants.observed + 2,
+            result.reap_events,
+        );
+        try support.noChildren();
+    }
 }
 
 test "TERM-resistant descendants receive one grace then KILL" {

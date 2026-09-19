@@ -6,6 +6,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse
+import base64
 import contextlib
 import hashlib
 import importlib.util
@@ -31,6 +32,12 @@ REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 MARKER = "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
 LEGACY = "Using legacy xAPIC MMIO"
 MODES = ("raw-x2apic", "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic")
+PRODUCTION_COMMAND_STAGES = frozenset({
+    "adapter", "local-boot-tool", "fixtures", "prepare", "config",
+    "native-image", "package", *MODES, "inspect",
+    "public-validator-build", "handoff-inspect", "handoff-inspect-legacy",
+    "supervisor-import-identity", "native-revalidation",
+})
 FORBIDDEN = ("HYPERV_ACCEPTANCE", "UK_HYPERV_IO_READY",
              "UK_HYPERV_NETWORK_APP_READY", "UK_HYPERV_PLATFORM_READY",
              "WAMR_NATIVE_WASI=", "WAMR_NATIVE_AOT_FAIL")
@@ -71,7 +78,7 @@ SOURCE_OUTPUT_FILE_ROLES = ("support/apps/wamr-aot/.config",)
 SOURCE_OUTPUT_PREEXISTING_DESCENDANT_ROLES = (".d",)
 INDIRECT_HOST_TOOLS = ("dash", "cp", "env", "mkdir", "readlink", "uname")
 HOST_TOOLS = (
-    "git", "python3", "bash", "head", "timeout", *INDIRECT_HOST_TOOLS,
+    "git", "python3", "bash", *INDIRECT_HOST_TOOLS,
     "zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
     "llvm-readelf", "llvm-strip", "bison", "flex", "m4",
 )
@@ -82,6 +89,53 @@ INPUT_TREE_MAX_ENTRIES = 100_000
 INPUT_TREE_MAX_BYTES = 2 * 1024 * MIB
 COMMAND_ENVIRONMENT = {}
 COMMAND_TOOL_PATHS = {}
+COMMAND_SUPERVISOR_PATH = None
+COMMAND_SUPERVISOR_VERSION = "uk.wamr.command-supervisor/1 process-command/1"
+COMMAND_BINDING_SCHEMA = "uk.wamr.supervised-command-binding"
+COMMAND_BINDING_VERSION = 1
+COMMAND_CLEANUP_SECONDS = 10
+COMMAND_STREAM_MAX = 4 * MIB
+COMMAND_RESULT_MAX = 12 * MIB
+COMMAND_REQUEST_MAX = MIB
+COMMAND_STRING_MAX = 4096
+COMMAND_OUTPUT_COMMITMENT_DOMAIN = b"uk.wamr.command-output-v1\0"
+COMMAND_CONTRACT = json.loads(
+    (REPO / "support/tools/hyperv/process-command-v1.json").read_text(
+        encoding="utf-8"))
+if (set(COMMAND_CONTRACT) != {
+        "complete_cleanup_events_min",
+        "complete_primary_events_min",
+        "pre_release_cleanup_events_min",
+} or any(type(value) is not int or value < 1
+         for value in COMMAND_CONTRACT.values())):
+    raise RuntimeError("invalid process-command-v1 contract")
+COMMAND_COMPLETE_PRIMARY_EVENTS_MIN = (
+    COMMAND_CONTRACT["complete_primary_events_min"])
+COMMAND_COMPLETE_CLEANUP_EVENTS_MIN = (
+    COMMAND_CONTRACT["complete_cleanup_events_min"])
+COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN = (
+    COMMAND_CONTRACT["pre_release_cleanup_events_min"])
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+BOOTSTRAP_STAGES = frozenset({
+    "dependency-restore",
+    "supervisor-build",
+    *(f"dependency-hash-{index:03d}" for index in range(PACKAGE_MAX_ROOTS)),
+})
+SUPERVISOR_SOURCE_FILES = (
+    "support/build/wamr-native-ci/build.zig.zon",
+    "support/build/wamr-native-ci/run.py",
+    "support/build/wamr-native-ci/supervisor.build.zig",
+    "support/build/wamr-native-ci/supervisor.zig",
+    "support/tools/hyperv/core.zig",
+    "support/tools/hyperv/contracts.zig",
+    "support/tools/hyperv/diagnostics.zig",
+    "support/tools/hyperv/private_files.zig",
+    "support/tools/hyperv/process-command-v1.json",
+    "support/tools/hyperv/process.zig",
+    "support/tools/hyperv/sensitive.zig",
+    "support/tools/hyperv/sha256.zig",
+    "support/tools/hyperv/sha256_clear_upper.S",
+)
 FAILURE_STAGE = "startup"
 ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 COMMAND_ERROR_MARKERS = (
@@ -133,6 +187,43 @@ def snapshot(info):
         "st_size", "st_mtime_ns", "st_ctime_ns"))
 
 
+def validate_json_domain(value):
+    if value is None or type(value) is bool:
+        return
+    if type(value) is int:
+        require(-(1 << 63) <= value <= (1 << 64) - 1,
+                "JSON integer is outside native range")
+        return
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise Refusal("JSON string is not valid Unicode") from error
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            validate_json_domain(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            require(isinstance(key, str), "JSON object key is not a string")
+            validate_json_domain(key)
+            validate_json_domain(item)
+        return
+    raise Refusal("unsupported JSON value")
+
+
+def compact_json(value, newline=False):
+    validate_json_domain(value)
+    try:
+        text = json.dumps(
+            value, ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":"))
+        return (text + ("\n" if newline else "")).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise Refusal("invalid JSON value") from error
+
+
 def open_flags(directory=False):
     flags = os.O_RDONLY
     if directory:
@@ -145,7 +236,7 @@ def open_flags(directory=False):
 
 
 def bind(hasher, value):
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    raw = compact_json(value)
     hasher.update(len(raw).to_bytes(8, "big"))
     hasher.update(raw)
 
@@ -218,9 +309,8 @@ def digest(path, limit=256 * MIB + 512):
 
 
 def save(path, value):
-    with path.open("x", encoding="ascii") as stream:
-        json.dump(value, stream, sort_keys=True, separators=(",", ":"))
-        stream.write("\n")
+    with path.open("xb") as stream:
+        stream.write(compact_json(value, newline=True))
     path.chmod(0o600)
 
 
@@ -982,8 +1072,7 @@ def merge_directory_records(target, values):
 
 
 def record_digest(value):
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
-    return hashlib.sha256(raw).hexdigest()
+    return hashlib.sha256(compact_json(value)).hexdigest()
 
 
 def input_directory_custody_reason(kind, name):
@@ -1137,6 +1226,12 @@ def discover_consumer_input_paths(runtime):
         **{f"tool:{name}": path for name, path in tool_paths.items()},
         **{f"runtime:{path}": path for path in sorted(runtime_paths)},
     }
+    supervisor = runtime / "compute/supervisor/bin/wamr-ci-supervisor"
+    if supervisor.is_file() and not supervisor.is_symlink():
+        supervisor = supervisor.resolve(strict=True)
+        file_paths["command-supervisor"] = supervisor
+        for path in executable_runtime_paths(supervisor):
+            file_paths[f"runtime:{path}"] = path
     tree_paths = {
         "bison": runtime / "bison",
         "python-stdlib": Path(sysconfig.get_paths()["stdlib"]).resolve(strict=True),
@@ -1207,15 +1302,30 @@ def bind_command_tools(value):
         selected[name] = str(path)
     COMMAND_TOOL_PATHS.clear()
     COMMAND_TOOL_PATHS.update(selected)
+    supervisor_path = bind_command_supervisor(value)
     environment = {
         "PATH": "/usr/bin:/bin",
         "WAMR_CI_GIT": selected["git"],
+        "WAMR_CI_SUPERVISOR": supervisor_path,
     }
     for name, path in selected.items():
         environment[
             "WAMR_CI_TOOL_" + name.upper().replace("-", "_")
         ] = path
     return environment
+
+
+def bind_command_supervisor(value):
+    global COMMAND_SUPERVISOR_PATH
+    require(isinstance(value, dict)
+            and isinstance(value.get("files"), dict),
+            "invalid command supervisor input")
+    supervisor = value["files"].get("command-supervisor")
+    require(isinstance(supervisor, dict)
+            and Path(supervisor["path"]).is_absolute(),
+            "missing command supervisor input")
+    COMMAND_SUPERVISOR_PATH = supervisor["path"]
+    return COMMAND_SUPERVISOR_PATH
 
 
 def normalized_repository_relative(value, reason, trailing_slash=False):
@@ -1759,15 +1869,88 @@ def source_identity(value):
     return {"revision": value["revision"], "tree": value["tree"]}
 
 
+def guarded_record_map(domain, records):
+    content = hashlib.sha256((domain + "-content\0").encode("ascii"))
+    physical = hashlib.sha256((domain + "-physical\0").encode("ascii"))
+    total = 0
+    for name in sorted(records):
+        record = records[name]
+        total += record["bytes"]
+        bind(content, [name, record["bytes"], record["sha256"]])
+        bind(physical, [name, record["metadata"]])
+    return {
+        "count": len(records),
+        "bytes": total,
+        "content_closure_sha256": content.hexdigest(),
+        "physical_closure_sha256": physical.hexdigest(),
+        "records": records,
+    }
+
+
+def supervisor_source_map():
+    records = {}
+    for relative in SUPERVISOR_SOURCE_FILES:
+        record, unused_data = tracked_manifest(relative)
+        del unused_data
+        records[relative] = {
+            "bytes": record["bytes"],
+            "sha256": record["sha256"],
+            "metadata": record["metadata"],
+        }
+    return guarded_record_map("uk.wamr.command-supervisor-source-v1", records)
+
+
+def supervisor_runtime_map(runtime, consumer_inputs):
+    path = (Path(runtime)
+            / "compute/supervisor/bin/wamr-ci-supervisor").resolve(strict=True)
+    files = consumer_inputs["files"]
+    executable = files.get("command-supervisor")
+    require(isinstance(executable, dict)
+            and executable["path"] == str(path),
+            "missing command supervisor input")
+    records = {
+        "executable": {
+            "bytes": executable["metadata"][6],
+            "sha256": executable["sha256"],
+            "metadata": executable["metadata"],
+        },
+    }
+    for runtime_path in sorted(executable_runtime_paths(path)):
+        role = "runtime:" + str(runtime_path)
+        record = files.get(role)
+        require(isinstance(record, dict), "missing command supervisor runtime")
+        records[role] = {
+            "bytes": record["metadata"][6],
+            "sha256": record["sha256"],
+            "metadata": record["metadata"],
+        }
+    return guarded_record_map("uk.wamr.command-supervisor-runtime-v1", records)
+
+
+def command_supervisor_state(runtime, consumer_inputs):
+    return {
+        "schema": "uk.wamr.command-supervisor",
+        "version": 1,
+        "protocol": COMMAND_SUPERVISOR_VERSION,
+        "source_map": supervisor_source_map(),
+        "runtime_map": supervisor_runtime_map(runtime, consumer_inputs),
+    }
+
+
 def producer_inputs(runtime, expected_consumer=None, content=True):
     current_source = source()
-    return {"source": source_identity(current_source),
-            "source_custody": current_source["custody"],
-            "tools": {name: digest(Path(tool(name))) for name in HOST_TOOLS},
-            "bison_data": bison_inputs(runtime / "bison"),
-            "dependencies": dependency_custody(runtime / "compute"),
-            "consumer_inputs": consumer_input_state(
-                runtime, content=content, expected=expected_consumer)}
+    consumer_inputs = consumer_input_state(
+        runtime, content=content, expected=expected_consumer)
+    return {
+        "source": source_identity(current_source),
+        "source_custody": current_source["custody"],
+        "tools": {name: digest(Path(tool(name))) for name in HOST_TOOLS},
+        "bison_data": bison_inputs(runtime / "bison"),
+        "dependencies": dependency_custody(runtime / "compute"),
+        "consumer_inputs": consumer_inputs,
+        "command_supervisor": command_supervisor_state(
+            runtime, consumer_inputs),
+    }
 
 
 def bison_inputs(root):
@@ -1791,7 +1974,7 @@ def bison_inputs(root):
         files[path.relative_to(root).as_posix()] = {
             "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
     require(files, "empty Bison data")
-    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("ascii")
+    encoded = compact_json(files)
     return {"files": len(files), "bytes": total,
             "sha256": hashlib.sha256(encoded).hexdigest()}
 
@@ -1860,79 +2043,1578 @@ def is_retained_process_path(path):
     return re.fullmatch(r"/proc/(?:self|[0-9]+)/fd/[0-9]+", path) is not None
 
 
-def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
-            evidence=True, input_records=None):
-    """Fixed timeout/head ceiling; raw output stays private, never in Actions stdout."""
-    output = root / "private" / (stage + ".log")
-    timeout = tool("timeout")
-    shell = tool("bash")
-    head = tool("head")
-    executable = str(Path(args[0]))
-    indirect = tuple(dict.fromkeys(
-        path for path in COMMAND_TOOL_PATHS.values()
-        if not is_retained_process_path(path)
-    ))
-    executables = (timeout, shell, head, executable, *indirect)
-    to_open = tuple(
-        path for path in executables if not is_retained_process_path(path))
-    context = (
-        retained_executables(to_open, input_records)
-        if input_records is not None
-        else contextlib.nullcontext(({}, ()))
-    )
-    with context as (retained, pass_fds), output.open("xb") as stream:
-        def retained_tool_path(path):
-            if is_retained_process_path(path):
-                return path
-            require(path in retained, "unbound retained tool input")
-            return retained_process_path(retained[path])
+def canonical_json(value):
+    return compact_json(value, newline=True)
 
-        retained_environment = {}
-        if "git" in COMMAND_TOOL_PATHS:
-            retained_environment["WAMR_CI_GIT"] = retained_tool_path(
-                COMMAND_TOOL_PATHS["git"])
-        retained_environment.update({
-            "WAMR_CI_TOOL_" + name.upper().replace("-", "_"):
-                retained_tool_path(path)
-            for name, path in COMMAND_TOOL_PATHS.items()
+
+def native_integer(value, minimum, maximum, reason):
+    require(type(value) is int and minimum <= value <= maximum, reason)
+    return value
+
+
+def native_u8(value, reason):
+    return native_integer(value, 0, (1 << 8) - 1, reason)
+
+
+def native_u16(value, reason):
+    return native_integer(value, 0, (1 << 16) - 1, reason)
+
+
+def native_u32(value, reason):
+    return native_integer(value, 0, (1 << 32) - 1, reason)
+
+
+def native_u64(value, reason):
+    return native_integer(value, 0, (1 << 64) - 1, reason)
+
+
+def native_i64(value, reason):
+    return native_integer(value, -(1 << 63), (1 << 63) - 1, reason)
+
+
+def native_string(value, maximum, reason, allow_empty=True):
+    require(isinstance(value, str), reason)
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise Refusal(reason) from error
+    require((allow_empty or raw) and len(raw) <= maximum, reason)
+    return raw
+
+
+def native_digest(value, reason):
+    require(isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{64}", value), reason)
+    return value
+
+
+def validate_native_executable_identity(value, reason):
+    require(isinstance(value, dict) and set(value) == {
+        "content_sha256", "ctime_nanoseconds", "ctime_seconds",
+        "device_major", "device_minor", "inode", "mode",
+        "mtime_nanoseconds", "mtime_seconds", "size", "uid",
+    }, reason)
+    native_digest(value["content_sha256"], reason)
+    native_u32(value["ctime_nanoseconds"], reason)
+    native_i64(value["ctime_seconds"], reason)
+    native_u32(value["device_major"], reason)
+    native_u32(value["device_minor"], reason)
+    native_u64(value["inode"], reason)
+    native_u16(value["mode"], reason)
+    native_u32(value["mtime_nanoseconds"], reason)
+    native_i64(value["mtime_seconds"], reason)
+    native_u64(value["size"], reason)
+    native_u32(value["uid"], reason)
+    require(value["inode"] > 0 and value["size"] > 0
+            and value["ctime_nanoseconds"] < 1_000_000_000
+            and value["mtime_nanoseconds"] < 1_000_000_000,
+            reason)
+    return value
+
+
+def validate_supervisor_limits(value, reason):
+    require(isinstance(value, dict) and set(value) == {
+        "cleanup_events", "descendants", "primary_events",
+        "proc_entries_per_scan", "reap_events", "stderr_bytes",
+        "stdout_bytes", "term_grace_ms",
+    }, reason)
+    native_u64(value["stdout_bytes"], reason)
+    native_u64(value["stderr_bytes"], reason)
+    native_u16(value["descendants"], reason)
+    native_u32(value["primary_events"], reason)
+    native_u32(value["cleanup_events"], reason)
+    native_u32(value["proc_entries_per_scan"], reason)
+    native_u16(value["reap_events"], reason)
+    native_u32(value["term_grace_ms"], reason)
+    require(1 <= value["stdout_bytes"] <= COMMAND_STREAM_MAX
+            and 1 <= value["stderr_bytes"] <= COMMAND_STREAM_MAX
+            and 1 <= value["descendants"] <= 256
+            and 16 <= value["primary_events"] <= 10_000_000
+            and 32 <= value["cleanup_events"] <= 10_000_000
+            and 16 <= value["proc_entries_per_scan"] <= 1_000_000
+            and value["descendants"] + 3 <= value["reap_events"] <= 1024
+            and 1 <= value["term_grace_ms"] <= 10_000,
+            reason)
+    return value
+
+
+def validate_supervisor_request(value):
+    reason = "invalid native command request"
+    require(isinstance(value, dict) and set(value) == {
+        "argv", "cleanup_deadline_ns", "cwd", "environment",
+        "executable", "limits", "primary_deadline_ns",
+        "retained_executables", "schema", "version",
+    } and value["schema"] == "uk.wamr.command-supervisor-request"
+      and native_u8(value["version"], reason) == 1,
+      reason)
+    executable = native_string(
+        value["executable"], COMMAND_STRING_MAX, reason, allow_empty=False)
+    cwd = native_string(
+        value["cwd"], COMMAND_STRING_MAX, reason, allow_empty=False)
+    require(executable.startswith(b"/") and cwd.startswith(b"/"), reason)
+    argv = value["argv"]
+    require(isinstance(argv, list) and 1 <= len(argv) <= 4096, reason)
+    for argument in argv:
+        raw = native_string(argument, COMMAND_STRING_MAX, reason)
+        require(b"\0" not in raw, reason)
+    require(argv[0] == value["executable"], reason)
+    environment = value["environment"]
+    require(isinstance(environment, list) and len(environment) <= 512, reason)
+    previous = None
+    by_name = {}
+    for entry in environment:
+        require(isinstance(entry, dict)
+                and set(entry) == {"name", "value"}, reason)
+        name = native_string(
+            entry["name"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        raw_value = native_string(entry["value"], COMMAND_STRING_MAX, reason)
+        require(b"=" not in name and b"\0" not in name
+                and b"\0" not in raw_value
+                and entry["name"] not in {
+                    "WAMR_CI_RETAINED_EXECUTABLE",
+                    "WAMR_CI_EXECUTABLE_PATH",
+                }
+                and (previous is None or previous < name), reason)
+        previous = name
+        by_name[entry["name"]] = entry["value"]
+    retained = value["retained_executables"]
+    require(isinstance(retained, list) and len(retained) <= 128, reason)
+    previous = None
+    for entry in retained:
+        require(isinstance(entry, dict)
+                and set(entry) == {"name", "path"}, reason)
+        name = native_string(
+            entry["name"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        path = native_string(
+            entry["path"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        require(b"=" not in name and b"\0" not in name
+                and path.startswith(b"/") and b"\0" not in path
+                and (previous is None or previous < name)
+                and by_name.get(entry["name"]) == entry["path"], reason)
+        previous = name
+    primary = native_u64(value["primary_deadline_ns"], reason)
+    cleanup = native_u64(value["cleanup_deadline_ns"], reason)
+    require(primary > 0 and cleanup > primary, reason)
+    validate_supervisor_limits(value["limits"], reason)
+    raw = canonical_json(value)
+    require(len(raw) <= COMMAND_REQUEST_MAX, reason)
+    return raw
+
+
+def command_output_commitment(
+        stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256):
+    native_u64(stdout_bytes, "invalid native command output")
+    native_u64(stderr_bytes, "invalid native command output")
+    native_digest(stdout_sha256, "invalid native command output")
+    native_digest(stderr_sha256, "invalid native command output")
+    value = hashlib.sha256(COMMAND_OUTPUT_COMMITMENT_DOMAIN)
+    value.update(stdout_bytes.to_bytes(8, "big"))
+    value.update(bytes.fromhex(stdout_sha256))
+    value.update(stderr_bytes.to_bytes(8, "big"))
+    value.update(bytes.fromhex(stderr_sha256))
+    return value.hexdigest()
+
+
+def validate_supervisor_outcome(command, limits, reason):
+    primary = command["primary"]
+    termination = command["termination"]
+    require(isinstance(primary, dict)
+            and set(primary) == {"code", "kind"}
+            and primary["kind"] in {
+                "exited", "signal", "unknown", "timeout", "cancelled",
+                "output_overflow", "exec_failed", "snapshot_unsupported",
+                "event_limit", "local_io", "executable_changed",
+            }
+            and isinstance(termination, dict)
+            and set(termination) == {"code", "kind"}
+            and (termination["kind"] is None
+                 or termination["kind"] in {
+                     "exited", "signal", "stopped", "unknown",
+                 }),
+            reason)
+    if primary["kind"] == "exited":
+        native_u8(primary["code"], reason)
+    elif primary["kind"] == "signal":
+        native_integer(primary["code"], 1, 64, reason)
+    elif primary["kind"] == "unknown":
+        native_u32(primary["code"], reason)
+    else:
+        require(primary["code"] is None, reason)
+    if termination["kind"] == "exited":
+        native_u8(termination["code"], reason)
+    elif termination["kind"] in {"signal", "stopped"}:
+        native_integer(termination["code"], 1, 64, reason)
+    elif termination["kind"] == "unknown":
+        native_u32(termination["code"], reason)
+    else:
+        require(termination["code"] is None, reason)
+    if primary["kind"] in {"exited", "signal", "unknown"}:
+        require(termination == primary, reason)
+    require(command["primary_deadline_reached"]
+            is (primary["kind"] == "timeout")
+            and command["cancellation_observed"]
+            is (primary["kind"] == "cancelled")
+            and (primary["kind"] != "event_limit"
+                 or command["primary_events"] == limits["primary_events"])
+            and (primary["kind"] != "executable_changed"
+                 or not command["executable_stable"]
+                 and termination == {"code": 0, "kind": "exited"})
+            and (command["executable_stable"]
+                 or primary != {"code": 0, "kind": "exited"}),
+            reason)
+    return primary, termination
+
+
+def validate_supervisor_state(
+        command, limits, timing, streams, primary_deadline_ns, reason):
+    native_u32(command["primary_events"], reason)
+    native_u32(command["cleanup_events"], reason)
+    native_u16(command["reap_events"], reason)
+    require(command["primary_events"] <= limits["primary_events"]
+            and command["cleanup_events"] <= limits["cleanup_events"]
+            and command["reap_events"] <= limits["reap_events"], reason)
+    descendants = command["descendants"]
+    require(isinstance(descendants, dict)
+            and set(descendants) == {
+                "adopted", "identity_validated", "limit_exceeded",
+                "observed", "untracked",
+            }
+            and type(descendants["limit_exceeded"]) is bool
+            and type(descendants["untracked"]) is bool,
+            reason)
+    for name in ("adopted", "identity_validated", "observed"):
+        native_u16(descendants[name], reason)
+    require(descendants["adopted"] <= descendants["observed"]
+            and descendants["identity_validated"] == descendants["observed"]
+            and descendants["observed"] <= limits["descendants"] + 1
+            and descendants["limit_exceeded"]
+            is (descendants["observed"] > limits["descendants"])
+            and (not descendants["untracked"]
+                 or descendants["limit_exceeded"]
+                 and descendants["observed"] == limits["descendants"] + 1),
+            reason)
+    primary, termination = validate_supervisor_outcome(
+        command, limits, reason)
+    for name in ("stdout", "stderr"):
+        stream = streams[name]
+        size = native_u64(stream["bytes"], reason)
+        require(isinstance(stream, dict)
+                and set(stream) >= {"bytes", "sha256", "status"}
+                and native_digest(stream["sha256"], reason)
+                == stream["sha256"]
+                and stream["status"] in {
+            "complete", "overflow", "io_failed", "incomplete",
+        }
+                and size <= limits[name + "_bytes"]
+                and (stream["status"] != "overflow"
+                     or size == limits[name + "_bytes"]),
+                reason)
+    started = native_u64(timing["started_ns"], reason)
+    primary_completed = native_u64(
+        timing["primary_completed_ns"], reason)
+    completed = native_u64(timing["completed_ns"], reason)
+    require(started <= primary_completed <= completed
+            and ((primary["kind"] == "timeout"
+                  and primary_completed >= primary_deadline_ns)
+                 or (primary["kind"] != "timeout"
+                     and primary_completed < primary_deadline_ns)),
+            reason)
+    if command["cleanup"] == "complete":
+        if command["primary_events"] == 0:
+            require(command["cleanup_events"]
+                    >= COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN
+                    and command["reap_events"] == 2
+                    and termination["kind"] is not None
+                    and command["executable_stable"] is True
+                    and primary["kind"] in {
+                        "timeout", "cancelled", "local_io",
+                    }
+                    and streams["stdout"]["bytes"] == 0
+                    and streams["stdout"]["sha256"] == EMPTY_SHA256
+                    and streams["stdout"]["status"] == "complete"
+                    and streams["stderr"]["bytes"] == 0
+                    and streams["stderr"]["sha256"] == EMPTY_SHA256
+                    and streams["stderr"]["status"] == "complete"
+                    and descendants == {
+                        "adopted": 0,
+                        "identity_validated": 0,
+                        "limit_exceeded": False,
+                        "observed": 0,
+                        "untracked": False,
+                    }, reason)
+        else:
+            require(command["primary_events"]
+                    >= COMMAND_COMPLETE_PRIMARY_EVENTS_MIN
+                    and command["cleanup_events"]
+                    >= COMMAND_COMPLETE_CLEANUP_EVENTS_MIN
+                    and command["reap_events"]
+                    == descendants["observed"] + 2
+                    and termination["kind"] is not None,
+                    reason)
+    elif command["cleanup"] == "not_required":
+        require(command["primary_events"] == 0
+                and command["cleanup_events"] == 0
+                and command["reap_events"] == 0
+                and command["executable_stable"] is True
+                and primary["kind"] in {
+                    "timeout", "cancelled", "local_io",
+                    "snapshot_unsupported",
+                }
+                and termination == {"code": None, "kind": None}
+                and completed == primary_completed
+                and streams["stdout"]["bytes"] == 0
+                and streams["stdout"]["sha256"] == EMPTY_SHA256
+                and streams["stdout"]["status"] == "complete"
+                and streams["stderr"]["bytes"] == 0
+                and streams["stderr"]["sha256"] == EMPTY_SHA256
+                and streams["stderr"]["status"] == "complete"
+                and descendants == {
+                    "adopted": 0,
+                    "identity_validated": 0,
+                    "limit_exceeded": False,
+                    "observed": 0,
+                    "untracked": False,
+                }, reason)
+    return primary, termination, started, primary_completed, completed
+
+
+def command_digest_scope(size):
+    return ("reproducible_empty"
+            if size == 0 else "transport_authenticated_observation")
+
+
+def command_literal(value):
+    require(isinstance(value, str)
+            and len(value.encode("utf-8")) <= 4096,
+            "invalid public command literal")
+    return {"kind": "literal", "value": value}
+
+
+def command_path(role, relative=""):
+    require(isinstance(role, str)
+            and re.fullmatch(r"[a-z0-9][a-z0-9_:-]{0,127}", role)
+            and isinstance(relative, str)
+            and len(relative.encode("utf-8")) <= 4096,
+            "invalid public command path")
+    if relative:
+        normalized_repository_relative(
+            relative, "invalid public command path")
+    return {"kind": "path", "role": role, "relative": relative}
+
+
+def command_path_roots(root, path_roles=None):
+    roots = {
+        "source": (REPO, True),
+        "work": (Path(root), True),
+        "runtime": (Path(root).parent, True),
+    }
+    if COMMAND_SUPERVISOR_PATH is not None:
+        roots["command-supervisor"] = (
+            Path(COMMAND_SUPERVISOR_PATH), False)
+    for name, path in COMMAND_TOOL_PATHS.items():
+        roots["tool:" + name] = (Path(path), False)
+    if "zig" in COMMAND_TOOL_PATHS:
+        roots["tool-tree:zig"] = (
+            Path(COMMAND_TOOL_PATHS["zig"]).parent, True)
+    if path_roles is not None:
+        for role, path in path_roles.items():
+            require(isinstance(role, str) and Path(path).is_absolute(),
+                    "invalid command path role")
+            roots[role] = (Path(path), role in {"compute"})
+    result = []
+    for role, (path, descendants) in roots.items():
+        canonical_path = path.resolve(strict=True)
+        result.append((role, canonical_path, descendants))
+    result.sort(key=lambda item: (
+        not item[2], len(item[1].parts)), reverse=True)
+    return result
+
+
+def normalized_command_value(value, roots, strict=True):
+    value = str(value)
+    if not strict:
+        return {
+            "kind": "private",
+            "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        }
+    if value == "/usr/bin:/bin" or not Path(value).is_absolute():
+        return command_literal(value)
+    path = Path(value)
+    for role, root, descendants in roots:
+        if path == root:
+            return command_path(role)
+        if descendants:
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            return command_path(role, relative)
+    raise Refusal("unbound public command path")
+
+
+def command_binding_digest(value):
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def command_environment_contract(kind):
+    environment = {
+        "HOME": command_path("work", "private"),
+        "LANG": command_literal("C"),
+        "LC_ALL": command_literal("C"),
+        "PATH": command_literal("/usr/bin:/bin"),
+        "PYTHONDONTWRITEBYTECODE": command_literal("1"),
+        "TMPDIR": command_path(
+            "work", "scratch" if kind.startswith("build-") else "private"),
+        "WAMR_CI_SUPERVISOR": command_path("command-supervisor"),
+    }
+    if kind != "supervisor-only":
+        environment["WAMR_CI_GIT"] = command_path("tool:git")
+        for name in HOST_TOOLS:
+            environment[
+                "WAMR_CI_TOOL_" + name.upper().replace("-", "_")
+            ] = command_path("tool:" + name)
+    if kind.startswith("build-"):
+        environment.update({
+            "BISON_PKGDATADIR": command_path("runtime", "bison"),
+            "KCONFIG_CONFIG": command_path(
+                "source", "support/apps/wamr-aot/build/.config"),
+            "KCONFIG_OVERWRITECONFIG": command_literal("1"),
+            "M4": command_path("tool:m4"),
+            "MAKEFLAGS": command_literal("-j2"),
+            "ZIG_GLOBAL_CACHE_DIR": command_path(
+                "work", "global-cache"),
+            "ZIG_LIB_DIR": command_path("tool-tree:zig", "lib"),
+            "ZIG_LOCAL_CACHE_DIR": command_path("work", "cache"),
         })
-        environment = command_environment(root, input_records, {
-            "WAMR_CI_CAPTURE_LIMIT": str(limit + 1),
-            "WAMR_CI_HEAD": retained.get(head, head),
-            **retained_environment,
+    if kind == "build-fixtures":
+        environment.update({
+            "WAMR_CI_PACKAGE": command_path(
+                "work", "tools/bin/wamr-ci-package"),
+            "WAMR_CI_PYTHON": command_path("tool:python3"),
+            "WAMR_CI_SUPERVISOR_FIXTURE": command_path(
+                "work", "tools/bin/wamr-ci-supervisor-fixture"),
         })
-        command = [
-            retained.get(timeout, timeout),
-            "--signal=TERM", "--kill-after=5s", str(seconds),
-            retained.get(shell, shell),
-            "--noprofile", "--norc", "-o", "pipefail", "-c",
-            '"$@" 2>&1 | "$WAMR_CI_HEAD" -c "$WAMR_CI_CAPTURE_LIMIT"',
-            "_", retained.get(executable, executable), *map(str, args[1:]),
-        ]
-        result = subprocess.run(
-            command, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT,
-            env=environment,
-            pass_fds=pass_fds, check=False,
+    if kind in {"build-base", "public-validator"}:
+        environment["WAMR_CI_LAUNCH_EXECUTABLE"] = command_path("tool:zig")
+    return [
+        {"name": name, "value": value}
+        for name, value in sorted(environment.items())
+    ]
+
+
+def command_retained_names(kind):
+    names = {
+        "WAMR_CI_SUPERVISOR",
+    }
+    if kind != "supervisor-only":
+        names.add("WAMR_CI_GIT")
+        names.update(
+            "WAMR_CI_TOOL_" + name.upper().replace("-", "_")
+            for name in HOST_TOOLS
         )
-    size = output.stat().st_size
-    markers = (command_error_markers(read(output, limit + 1))
-               if size <= limit + 1 else None)
+    if kind.startswith("build-"):
+        names.add("M4")
+    if kind == "build-fixtures":
+        names.add("WAMR_CI_PYTHON")
+    if kind in {"build-base", "public-validator"}:
+        names.add("WAMR_CI_LAUNCH_EXECUTABLE")
+    return sorted(names)
+
+
+def boot_command_argv(stage):
+    index = MODES.index(stage)
+    legacy = bool(index % 2)
+    source_kind = "raw-disk" if index < 2 else "fixed-vhd"
+    source_name = "unikraft.raw" if index < 2 else "unikraft.vhd"
+    values = [
+        command_path("input:local_boot_tool"),
+        command_literal("--" + source_kind),
+        command_path("work", "package/" + source_name),
+        command_literal("--qemu"),
+        command_path("input:qemu"),
+        command_literal("--ovmf-code"),
+        command_path("input:ovmf_code"),
+        command_literal("--ovmf-vars"),
+        command_path("input:ovmf_vars"),
+        command_literal("--work-dir"),
+        command_path("work", "boot-" + stage),
+        command_literal("--expect"),
+        command_literal(MARKER),
+        command_literal("--expect-main-return"),
+        command_literal("0"),
+        command_literal("--cpus"),
+        command_literal("1"),
+        command_literal("--timeout"),
+        command_literal("60"),
+    ]
+    if legacy:
+        values.append(command_literal("--disable-x2apic"))
+    if legacy:
+        values.extend([
+            command_literal("--require-marker"),
+            command_literal(LEGACY),
+        ])
+    for marker in list(FORBIDDEN) + ([] if legacy else [LEGACY]):
+        values.extend([
+            command_literal("--forbid-marker"),
+            command_literal(marker),
+        ])
+    return values
+
+
+def production_command_contract(stage):
+    handoff_image = (APP / "build" / EFI).relative_to(REPO).as_posix()
+    contracts = {
+        "adapter": {
+            "kind": "build-base", "seconds": 900,
+            "output_limit": 8 * MIB,
+            "command_executable": command_path("tool:zig"),
+            "native_executable": command_path("command-supervisor"),
+            "interpreter": None,
+            "argv": [
+                command_path("command-supervisor"),
+                command_literal("--launch-retained"),
+                command_path("tool:zig"),
+                command_literal("build"),
+                command_literal("--build-file"),
+                command_path(
+                    "source", "support/build/wamr-native-ci/build.zig"),
+                command_literal("--system"),
+                command_path("work", "dependencies/zig-pkg"),
+                command_literal("--prefix"),
+                command_path("work", "tools"),
+                command_literal("-Doptimize=ReleaseSafe"),
+                command_literal("-j2"),
+                command_literal("test"),
+                command_literal("install"),
+            ],
+        },
+        "local-boot-tool": {
+            "kind": "build-base", "seconds": 900,
+            "output_limit": 8 * MIB,
+            "command_executable": command_path("tool:zig"),
+            "native_executable": command_path("command-supervisor"),
+            "interpreter": None,
+            "argv": [
+                command_path("command-supervisor"),
+                command_literal("--launch-retained"),
+                command_path("tool:zig"),
+                command_literal("build"),
+                command_literal("--build-file"),
+                command_path(
+                    "source", "support/tools/hyperv/local_boot/build.zig"),
+                command_literal("--system"),
+                command_path("work", "dependencies/zig-pkg"),
+                command_literal("--prefix"),
+                command_path("work", "tools"),
+                command_literal("-Doptimize=ReleaseSafe"),
+                command_literal("-j2"),
+                command_literal("install"),
+            ],
+        },
+        "fixtures": {
+            "kind": "build-fixtures", "seconds": 600,
+            "output_limit": 8 * MIB,
+            "command_executable": command_path("tool:python3"),
+            "native_executable": command_path("tool:python3"),
+            "interpreter": command_path("tool:python3"),
+            "argv": [
+                command_path("tool:python3"),
+                command_literal("-m"),
+                command_literal("unittest"),
+                command_literal("discover"),
+                command_literal("-s"),
+                command_path(
+                    "source", "support/build/wamr-native-ci/tests"),
+                command_literal("-v"),
+            ],
+        },
+        "prepare": {
+            "kind": "build-fixtures", "seconds": 1800,
+            "output_limit": 8 * MIB,
+            "command_executable": command_path("tool:python3"),
+            "native_executable": command_path("tool:python3"),
+            "interpreter": command_path("tool:python3"),
+            "argv": [
+                command_path("tool:python3"),
+                command_path("source", "support/apps/wamr-aot/prepare.py"),
+                command_literal("prepare"),
+                command_literal("--source-archive"),
+                command_path("runtime", "custody/wamr-source.tar"),
+            ],
+        },
+        "config": {
+            "kind": "build-fixtures", "seconds": 600,
+            "output_limit": 8 * MIB,
+            "command_executable": command_path("tool:python3"),
+            "native_executable": command_path("tool:python3"),
+            "interpreter": command_path("tool:python3"),
+            "argv": [
+                command_path("tool:python3"),
+                command_path(
+                    "source", "support/apps/wamr-aot/build-image.py"),
+                command_literal("olddefconfig"),
+            ],
+        },
+        "native-image": {
+            "kind": "build-fixtures", "seconds": 1800,
+            "output_limit": 8 * MIB,
+            "command_executable": command_path("tool:python3"),
+            "native_executable": command_path("tool:python3"),
+            "interpreter": command_path("tool:python3"),
+            "argv": [
+                command_path("tool:python3"),
+                command_path(
+                    "source", "support/apps/wamr-aot/build-image.py"),
+                command_literal("native-images"),
+            ],
+        },
+        "package": {
+            "kind": "bound-tools", "seconds": 150,
+            "output_limit": 64 * 1024,
+            "command_executable": command_path("input:package_tool"),
+            "native_executable": command_path("input:package_tool"),
+            "interpreter": None,
+            "argv": [
+                command_path("input:package_tool"),
+                command_literal("package"),
+                command_path("input:efi"),
+                command_path("work", "package"),
+            ],
+        },
+        "inspect": {
+            "kind": "bound-tools", "seconds": 150,
+            "output_limit": 64 * 1024,
+            "command_executable": command_path("input:package_tool"),
+            "native_executable": command_path("input:package_tool"),
+            "interpreter": None,
+            "argv": [
+                command_path("input:package_tool"),
+                command_literal("inspect"),
+                command_path("input:efi"),
+                command_path("work", "package"),
+            ],
+        },
+        "public-validator-build": {
+            "kind": "public-validator", "seconds": 600,
+            "output_limit": 8 * MIB,
+            "command_executable": command_path("tool:zig"),
+            "native_executable": command_path("command-supervisor"),
+            "interpreter": None,
+            "argv": [
+                command_path("command-supervisor"),
+                command_literal("--launch-retained"),
+                command_path("tool:zig"),
+                command_literal("build"),
+                command_literal("--build-file"),
+                command_path(
+                    "source", "support/tools/hyperv/direct/build.zig"),
+                command_literal("--cache-dir"),
+                command_path("work", "cache"),
+                command_literal("--global-cache-dir"),
+                command_path("work", "global-cache"),
+                command_literal("--prefix"),
+                command_path("work", "public-source/tools"),
+                command_literal("-Doptimize=ReleaseSafe"),
+                command_literal("-j2"),
+                command_literal("install"),
+            ],
+        },
+        "handoff-inspect": {
+            "kind": "bound-tools", "seconds": 150,
+            "output_limit": 64 * 1024,
+            "command_executable": command_path("input:package_tool"),
+            "native_executable": command_path("input:package_tool"),
+            "interpreter": None,
+            "argv": [
+                command_path("input:package_tool"),
+                command_literal("inspect"),
+                command_path("source", handoff_image),
+                command_path("compute", "package"),
+            ],
+        },
+        "handoff-inspect-legacy": {
+            "kind": "supervisor-only", "seconds": 150,
+            "output_limit": 64 * 1024,
+            "command_executable": command_path("input:package_tool"),
+            "native_executable": command_path("input:package_tool"),
+            "interpreter": None,
+            "argv": [
+                command_path("input:package_tool"),
+                command_literal("inspect"),
+                command_path("source", handoff_image),
+                command_path("compute", "package"),
+            ],
+        },
+        "supervisor-import-identity": {
+            "kind": "supervisor-only", "seconds": 30,
+            "output_limit": 1024,
+            "command_executable": command_path("command-supervisor"),
+            "native_executable": command_path("command-supervisor"),
+            "interpreter": None,
+            "argv": [
+                command_path("command-supervisor"),
+                command_literal("--identity"),
+            ],
+        },
+        "native-revalidation": {
+            "kind": "supervisor-only", "seconds": 600,
+            "output_limit": 4096,
+            "command_executable": command_path("input:validator"),
+            "native_executable": command_path("input:validator"),
+            "interpreter": None,
+            "argv": [
+                command_path("input:validator"),
+                command_literal("handoff"),
+                command_path("input:bundle"),
+            ],
+        },
+    }
+    for mode in MODES:
+        contracts[mode] = {
+            "kind": "bound-tools", "seconds": 90,
+            "output_limit": 64 * 1024,
+            "command_executable": command_path("input:local_boot_tool"),
+            "native_executable": command_path("input:local_boot_tool"),
+            "interpreter": None,
+            "argv": boot_command_argv(mode),
+        }
+    require(stage in contracts, "unknown production command stage")
+    contract = contracts[stage]
+    return {
+        **contract,
+        "environment": command_environment_contract(contract["kind"]),
+        "retained_names": command_retained_names(contract["kind"]),
+        "cwd": command_path("source"),
+        "limits": {
+            "cleanup_events": 1_000_000,
+            "descendants": 64,
+            "primary_events": 1_000_000,
+            "proc_entries_per_scan": 262_144,
+            "reap_events": 512,
+            "stderr_bytes": max(
+                1, min(contract["output_limit"] + 1, COMMAND_STREAM_MAX)),
+            "stdout_bytes": max(
+                1, min(contract["output_limit"] + 1, COMMAND_STREAM_MAX)),
+            "term_grace_ms": 1000,
+        },
+    }
+
+
+def validate_supervised_command_binding(
+        value, stage, role_identities=None,
+        transport_context="producer_direct"):
+    require(transport_context in {"producer_direct", "trusted_inner_zip"},
+            "invalid supervised command transport context")
+    contract = production_command_contract(stage)
+    require(isinstance(value, dict) and set(value) == {
+        "scope", "stage", "exit_code", "bytes", "sha256", "sha256_scope",
+        "over_limit", "known_error_markers", "supervisor",
+    } and value["scope"] == "command_diagnostic_not_acceptance"
+      and value["stage"] == stage
+      and native_u8(value["exit_code"],
+                    "invalid supervised command binding") == 0
+      and native_u64(value["bytes"],
+                     "invalid supervised command binding")
+      <= contract["output_limit"]
+      and native_digest(value["sha256"],
+                        "invalid supervised command binding")
+      == value["sha256"]
+      and value["sha256_scope"] == command_digest_scope(value["bytes"])
+      and value["over_limit"] is False
+      and value["known_error_markers"] == [],
+      "invalid supervised command binding")
+    supervisor = value["supervisor"]
+    require(isinstance(supervisor, dict) and set(supervisor) == {
+        "schema", "version", "bootstrap", "request", "result",
+    } and supervisor["schema"] == "uk.wamr.command-supervisor-result"
+      and native_u8(
+          supervisor["version"], "invalid supervised command binding") == 1
+      and supervisor["bootstrap"] is False,
+      "invalid supervised command binding")
+    request = supervisor["request"]
+    digest_fields = {
+        "canonical_sha256", "argv_sha256",
+        "environment_sha256", "cwd_sha256",
+    }
+    require(isinstance(request, dict)
+            and set(request) == {
+                "schema", "version", "binding_schema", "binding_version",
+                "stage", "argv", "environment", "cwd", "supervisor",
+                "native_executable", "command_executable", "interpreter",
+                "retained_executables", "issued_ns", "primary_deadline_ns",
+                "cleanup_deadline_ns", "timeout_ns", "limits",
+                *digest_fields,
+            }
+            and request["schema"] == "uk.wamr.command-supervisor-request"
+            and native_u8(
+                request["version"], "invalid supervised command binding") == 1
+            and request["binding_schema"] == COMMAND_BINDING_SCHEMA
+            and native_u8(
+                request["binding_version"],
+                "invalid supervised command binding")
+            == COMMAND_BINDING_VERSION
+            and request["stage"] == stage
+            and request["argv"] == contract["argv"]
+            and request["environment"] == contract["environment"]
+            and request["cwd"] == contract["cwd"]
+            and request["native_executable"]["path"]
+            == contract["native_executable"]
+            and request["command_executable"]["path"]
+            == contract["command_executable"]
+            and (
+                request["interpreter"] is None
+                if contract["interpreter"] is None
+                else request["interpreter"]["path"]
+                == contract["interpreter"])
+            and request["timeout_ns"]
+            == contract["seconds"] * 1_000_000_000
+            and request["limits"] == contract["limits"]
+            and validate_supervisor_limits(
+                request["limits"], "invalid supervised command binding")
+            == request["limits"],
+            "invalid supervised command binding")
+    for key in digest_fields:
+        require(isinstance(request[key], str)
+                and re.fullmatch(r"[0-9a-f]{64}", request[key]),
+                "invalid supervised command binding")
+    core = {
+        key: item for key, item in request.items()
+        if key not in digest_fields
+    }
+    require(request["canonical_sha256"] == command_binding_digest(core)
+            and request["argv_sha256"]
+            == command_binding_digest(request["argv"])
+            and request["environment_sha256"]
+            == command_binding_digest(request["environment"])
+            and request["cwd_sha256"]
+            == command_binding_digest(request["cwd"]),
+            "invalid supervised command binding")
+    for binding in (
+            request["supervisor"], request["native_executable"],
+            request["command_executable"]):
+        require(isinstance(binding, dict)
+                and set(binding) == {"path", "identity"},
+                "invalid supervised command binding")
+        validate_native_executable_identity(
+            binding["identity"], "invalid supervised command binding")
+    if request["interpreter"] is not None:
+        require(isinstance(request["interpreter"], dict)
+                and set(request["interpreter"]) == {"path", "identity"},
+                "invalid supervised command binding")
+        validate_native_executable_identity(
+            request["interpreter"]["identity"],
+            "invalid supervised command binding")
+    require(request["supervisor"]["path"]
+            == command_path("command-supervisor")
+            and native_u64(
+                request["issued_ns"],
+                "invalid supervised command binding") == request["issued_ns"]
+            and native_u64(
+                request["timeout_ns"],
+                "invalid supervised command binding") == request["timeout_ns"]
+            and native_u64(
+                request["primary_deadline_ns"],
+                "invalid supervised command binding")
+            == request["primary_deadline_ns"]
+            and native_u64(
+                request["cleanup_deadline_ns"],
+                "invalid supervised command binding")
+            == request["cleanup_deadline_ns"]
+            and request["primary_deadline_ns"]
+            == request["issued_ns"] + request["timeout_ns"]
+            and request["cleanup_deadline_ns"]
+            == request["primary_deadline_ns"]
+            + COMMAND_CLEANUP_SECONDS * 1_000_000_000,
+            "invalid supervised command binding")
+    retained = request["retained_executables"]
+    require(isinstance(retained, list)
+            and [item["name"] for item in retained]
+            == contract["retained_names"],
+            "invalid supervised command binding")
+    environment = {
+        item["name"]: item["value"] for item in request["environment"]
+    }
+    for item in retained:
+        require(isinstance(item, dict)
+                and set(item) == {"name", "path", "identity"}
+                and item["path"] == environment.get(item["name"]),
+                "invalid supervised command binding")
+        native_string(
+            item["name"], COMMAND_STRING_MAX,
+            "invalid supervised command binding", allow_empty=False)
+        validate_native_executable_identity(
+            item["identity"], "invalid supervised command binding")
+    if role_identities is not None:
+        for binding in (
+                request["supervisor"], request["native_executable"],
+                request["command_executable"],
+                *(()
+                  if request["interpreter"] is None
+                  else (request["interpreter"],)),
+                *retained):
+            path = binding["path"]
+            require(path["kind"] == "path"
+                    and role_identities.get(path["role"])
+                    == binding["identity"],
+                    "invalid supervised command identity")
+    result = supervisor["result"]
+    require(isinstance(result, dict) and set(result) == {
+        "canonical_sha256", "schema", "version",
+        "request_canonical_sha256", "controller_error",
+        "native_request", "native_result", "command",
+    } and result["schema"] == "uk.wamr.command-supervisor-result"
+      and native_u8(
+          result["version"], "invalid supervised command binding") == 1
+      and result["request_canonical_sha256"]
+      == request["canonical_sha256"]
+      and result["controller_error"] is None
+      and isinstance(result["canonical_sha256"], str)
+      and re.fullmatch(r"[0-9a-f]{64}", result["canonical_sha256"]),
+      "invalid supervised command binding")
+    for name, maximum in (
+            ("native_request", COMMAND_REQUEST_MAX),
+            ("native_result", COMMAND_RESULT_MAX)):
+        transport = result[name]
+        require(isinstance(transport, dict) and set(transport) == {
+            "bytes", "digest_scope", "sha256",
+        } and native_u64(
+            transport["bytes"], "invalid supervised command binding")
+          <= maximum
+          and transport["bytes"] > 0
+          and transport["digest_scope"]
+          == "direct_producer_or_trusted_inner_zip"
+          and native_digest(
+              transport["sha256"], "invalid supervised command binding")
+          == transport["sha256"],
+          "invalid supervised command binding")
+    result_core = dict(result)
+    del result_core["canonical_sha256"]
+    require(result["canonical_sha256"]
+            == command_binding_digest(result_core),
+            "invalid supervised command binding")
+    command = result["command"]
+    require(isinstance(command, dict) and set(command) == {
+        "cancellation_observed", "cleanup", "cleanup_complete",
+        "cleanup_events", "descendants", "executable",
+        "executable_stable", "output", "poisoned", "primary",
+        "primary_deadline_reached", "primary_events", "reap_events",
+        "retained_executables", "stderr", "stdout", "timing", "termination",
+    } and command["cleanup"] in {
+        "complete", "not_required", "deadline", "event_limit",
+        "descendant_untracked", "identity_changed", "signal_failed",
+        "reap_failed", "proc_unavailable", "local_io",
+    }
+      and type(command["cleanup_complete"]) is bool
+      and type(command["poisoned"]) is bool
+      and command["poisoned"] is (not command["cleanup_complete"])
+      and command["cleanup_complete"]
+      is (command["cleanup"] in {"complete", "not_required"})
+      and type(command["executable_stable"]) is bool
+      and type(command["primary_deadline_reached"]) is bool
+      and type(command["cancellation_observed"]) is bool
+      and command["executable"]
+      == request["native_executable"]["identity"]
+      and command["retained_executables"] == retained,
+      "invalid supervised command binding")
+    for name in ("stdout", "stderr"):
+        output = command[name]
+        require(isinstance(output, dict)
+                and set(output) == {
+                    "bytes", "digest_scope", "sha256", "status",
+                }
+                and output["digest_scope"]
+                == command_digest_scope(output["bytes"])
+                and native_digest(
+                    output["sha256"], "invalid supervised command binding")
+                == output["sha256"]
+                and (output["bytes"] != 0
+                     or output["sha256"] == EMPTY_SHA256),
+                "invalid supervised command binding")
+    output = command["output"]
+    require(isinstance(output, dict) and set(output) == {
+        "bytes", "combined_sha256", "commitment_sha256", "digest_scope",
+    }
+            and output["bytes"]
+            == command["stdout"]["bytes"] + command["stderr"]["bytes"]
+            and output["bytes"] == value["bytes"]
+            and output["combined_sha256"] == value["sha256"]
+            and output["digest_scope"] == value["sha256_scope"]
+            and native_digest(
+                output["combined_sha256"],
+                "invalid supervised command binding")
+            == output["combined_sha256"]
+            and output["commitment_sha256"]
+            == command_output_commitment(
+                command["stdout"]["bytes"], command["stdout"]["sha256"],
+                command["stderr"]["bytes"], command["stderr"]["sha256"])
+            and (output["bytes"] != 0
+                 or output["combined_sha256"] == EMPTY_SHA256),
+            "invalid supervised command binding")
+    timing = command["timing"]
+    require(isinstance(timing, dict) and set(timing) == {
+        "cleanup_elapsed_ns", "completed_ns", "primary_completed_ns",
+        "primary_elapsed_ns", "started_ns", "total_elapsed_ns",
+    }, "invalid supervised command binding")
+    for name in timing:
+        native_u64(timing[name], "invalid supervised command binding")
+    validate_supervisor_state(
+        command, request["limits"], timing, {
+            "stdout": command["stdout"],
+            "stderr": command["stderr"],
+        }, request["primary_deadline_ns"],
+        "invalid supervised command binding")
+    require(request["issued_ns"] <= timing["started_ns"]
+            <= timing["primary_completed_ns"] <= timing["completed_ns"]
+            and timing["primary_elapsed_ns"]
+            == timing["primary_completed_ns"] - timing["started_ns"]
+            and timing["cleanup_elapsed_ns"]
+            == timing["completed_ns"] - timing["primary_completed_ns"]
+            and timing["total_elapsed_ns"]
+            == timing["completed_ns"] - timing["started_ns"]
+            and timing["primary_completed_ns"]
+            < request["primary_deadline_ns"]
+            and timing["completed_ns"] <= request["cleanup_deadline_ns"],
+            "invalid supervised command binding")
+    descendants = command["descendants"]
+    require(command["cancellation_observed"] is False
+            and command["cleanup"] == "complete"
+            and command["cleanup_complete"] is True
+            and command["executable_stable"] is True
+            and command["poisoned"] is False
+            and command["primary"] == {"code": 0, "kind": "exited"}
+            and command["primary_deadline_reached"] is False
+            and command["termination"] == {"code": 0, "kind": "exited"}
+            and command["stdout"]["status"] == "complete"
+            and command["stderr"]["status"] == "complete"
+            and descendants["limit_exceeded"] is False
+            and descendants["untracked"] is False
+            and descendants["observed"] <= request["limits"]["descendants"],
+            "invalid supervised command binding")
+    if value["bytes"] != 0:
+        require(transport_context in {
+            "producer_direct", "trusted_inner_zip",
+        }, "invalid supervised command transport context")
+    return value
+
+
+def native_executable_identity(record):
+    metadata = record["metadata"]
+    mtime_seconds, mtime_nanoseconds = divmod(metadata[7], 1_000_000_000)
+    ctime_seconds, ctime_nanoseconds = divmod(metadata[8], 1_000_000_000)
+    return {
+        "content_sha256": record["sha256"],
+        "ctime_nanoseconds": ctime_nanoseconds,
+        "ctime_seconds": ctime_seconds,
+        "device_major": os.major(metadata[0]),
+        "device_minor": os.minor(metadata[0]),
+        "inode": metadata[1],
+        "mode": metadata[2],
+        "mtime_nanoseconds": mtime_nanoseconds,
+        "mtime_seconds": mtime_seconds,
+        "size": metadata[6],
+        "uid": metadata[3],
+    }
+
+
+def decoded_supervisor_result(
+        raw, request, expected_executable, expected_retained=()):
+    request_raw = validate_supervisor_request(request)
+    require(0 < len(raw) <= COMMAND_RESULT_MAX,
+            "native command result exceeded")
+    try:
+        value = json.loads(raw, object_pairs_hook=unique)
+    except (UnicodeDecodeError, json.JSONDecodeError, Refusal) as error:
+        raise Refusal("invalid native command result") from error
+    try:
+        canonical = canonical_json(value)
+    except Refusal as error:
+        raise Refusal("invalid native command result") from error
+    reason = "invalid native command result"
+    require(raw == canonical and isinstance(value, dict)
+            and set(value) == {
+                "command", "controller_error", "request_bytes",
+                "request_sha256", "schema", "version",
+            }
+            and value["schema"] == "uk.wamr.command-supervisor-result"
+            and native_u8(value["version"], reason) == 1
+            and native_u64(value["request_bytes"], reason) == len(request_raw)
+            and native_digest(value["request_sha256"], reason)
+            == hashlib.sha256(request_raw).hexdigest()
+            and (value["controller_error"] is None
+                 or value["controller_error"] in {
+                     "cwd_unavailable", "exec_changed", "exec_invalid",
+                     "exec_unavailable", "exec_unsupported",
+                     "invalid_invocation", "invalid_request", "local_io",
+                     "noncanonical_request", "supervisor_unavailable",
+                 }),
+            reason)
+    if value["controller_error"] is not None:
+        require(value["command"] is None, reason)
+        return value, b"", b""
+    command = value["command"]
+    require(isinstance(command, dict)
+            and set(command) == {
+                "cancellation_observed", "cleanup", "cleanup_complete",
+                "cleanup_events", "completed_ns", "descendants", "executable",
+                "executable_stable", "output_sha256", "poisoned", "primary",
+                "primary_completed_ns",
+                "primary_deadline_reached", "primary_events", "reap_events",
+                "retained_executables", "started_ns",
+                "stderr_base64", "stderr_bytes", "stderr_sha256",
+                "stderr_status", "stdout_base64", "stdout_bytes",
+                "stdout_sha256", "stdout_status", "termination",
+            }
+            and command["cleanup"] in {
+                "complete", "not_required", "deadline", "event_limit",
+                "descendant_untracked", "identity_changed", "signal_failed",
+                "reap_failed", "proc_unavailable", "local_io",
+            }
+            and type(command["cleanup_complete"]) is bool
+            and type(command["poisoned"]) is bool
+            and command["poisoned"] is (not command["cleanup_complete"])
+            and command["cleanup_complete"]
+            is (command["cleanup"] in {"complete", "not_required"})
+            and type(command["executable_stable"]) is bool
+            and type(command["primary_deadline_reached"]) is bool
+            and type(command["cancellation_observed"]) is bool
+            and command["stdout_status"] in {
+                "complete", "overflow", "io_failed", "incomplete",
+            }
+            and command["stderr_status"] in {
+                "complete", "overflow", "io_failed", "incomplete",
+            }
+            and command["executable"] == expected_executable,
+            reason)
+    validate_native_executable_identity(command["executable"], reason)
+    limits = request["limits"]
+    require(isinstance(command["retained_executables"], list)
+            and command["retained_executables"] == list(expected_retained),
+            "invalid retained executable identity")
+    for item in command["retained_executables"]:
+        require(isinstance(item, dict)
+                and set(item) == {"identity", "name", "path"}, reason)
+        native_string(
+            item["name"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        native_string(
+            item["path"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        validate_native_executable_identity(item["identity"], reason)
+    try:
+        stdout = base64.b64decode(
+            command["stdout_base64"], validate=True)
+        stderr = base64.b64decode(
+            command["stderr_base64"], validate=True)
+    except (TypeError, ValueError) as error:
+        raise Refusal(reason) from error
+    stdout_sha256 = hashlib.sha256(stdout).hexdigest()
+    stderr_sha256 = hashlib.sha256(stderr).hexdigest()
+    require(len(stdout) <= limits["stdout_bytes"]
+            and len(stderr) <= limits["stderr_bytes"]
+            and native_u64(command["stdout_bytes"], reason) == len(stdout)
+            and native_u64(command["stderr_bytes"], reason) == len(stderr)
+            and native_digest(command["stdout_sha256"], reason)
+            == stdout_sha256
+            and native_digest(command["stderr_sha256"], reason)
+            == stderr_sha256
+            and native_digest(command["output_sha256"], reason)
+            == command_output_commitment(
+                len(stdout), stdout_sha256, len(stderr), stderr_sha256),
+            reason)
+    primary, unused_termination, started, primary_completed, completed = (
+        validate_supervisor_state(
+            command, limits, {
+                "started_ns": command["started_ns"],
+                "primary_completed_ns": command["primary_completed_ns"],
+                "completed_ns": command["completed_ns"],
+            }, {
+                "stdout": {
+                    "bytes": len(stdout),
+                    "sha256": stdout_sha256,
+                    "status": command["stdout_status"],
+                },
+                "stderr": {
+                    "bytes": len(stderr),
+                    "sha256": stderr_sha256,
+                    "status": command["stderr_status"],
+                },
+            }, request["primary_deadline_ns"], reason))
+    del unused_termination
+    require((primary["kind"] != "output_overflow"
+             or "overflow" in {
+                 command["stdout_status"], command["stderr_status"],
+             })
+            and (command["primary_deadline_reached"]
+                 or started < request["primary_deadline_ns"])
+            and (command["cleanup"] != "complete"
+                 or completed <= request["cleanup_deadline_ns"])
+            and (primary != {"code": 0, "kind": "exited"}
+                 or primary_completed < request["primary_deadline_ns"]),
+            reason)
+    return value, stdout, stderr
+
+
+def supervised_command_evidence(
+        stage, request, request_raw, native, native_raw, stdout, stderr,
+        supervisor_identity,
+        native_executable, command_executable, interpreter,
+        expected_retained, roots, issued_ns, timeout_ns):
+    strict = stage in PRODUCTION_COMMAND_STAGES
+
+    def identities(values):
+        return [
+            {
+                "identity": value["identity"],
+                "name": value["name"],
+                "path": normalized_command_value(
+                    value["path"], roots, strict),
+            }
+            for value in values
+        ]
+
+    command = native["command"]
+    summarized = None
+    if command is not None:
+        summarized = {
+            "cancellation_observed": command["cancellation_observed"],
+            "cleanup": command["cleanup"],
+            "cleanup_complete": command["cleanup_complete"],
+            "cleanup_events": command["cleanup_events"],
+            "descendants": command["descendants"],
+            "executable": command["executable"],
+            "executable_stable": command["executable_stable"],
+            "poisoned": command["poisoned"],
+            "primary": command["primary"],
+            "primary_deadline_reached":
+                command["primary_deadline_reached"],
+            "primary_events": command["primary_events"],
+            "reap_events": command["reap_events"],
+            "retained_executables": identities(
+                command["retained_executables"]),
+            "stderr": {
+                "bytes": len(stderr),
+                "digest_scope": command_digest_scope(len(stderr)),
+                "sha256": command["stderr_sha256"],
+                "status": command["stderr_status"],
+            },
+            "stdout": {
+                "bytes": len(stdout),
+                "digest_scope": command_digest_scope(len(stdout)),
+                "sha256": command["stdout_sha256"],
+                "status": command["stdout_status"],
+            },
+            "output": {
+                "bytes": len(stdout) + len(stderr),
+                "commitment_sha256": command["output_sha256"],
+                "combined_sha256": hashlib.sha256(stdout + stderr).hexdigest(),
+                "digest_scope": command_digest_scope(
+                    len(stdout) + len(stderr)),
+            },
+            "timing": {
+                "cleanup_elapsed_ns":
+                    command["completed_ns"]
+                    - command["primary_completed_ns"],
+                "completed_ns": command["completed_ns"],
+                "primary_completed_ns": command["primary_completed_ns"],
+                "primary_elapsed_ns":
+                    command["primary_completed_ns"] - command["started_ns"],
+                "started_ns": command["started_ns"],
+                "total_elapsed_ns":
+                    command["completed_ns"] - command["started_ns"],
+            },
+            "termination": command["termination"],
+        }
+    request_core = {
+        "binding_schema": COMMAND_BINDING_SCHEMA,
+        "binding_version": COMMAND_BINDING_VERSION,
+        "stage": stage,
+        "schema": request["schema"],
+        "version": request["version"],
+        "argv": [
+            normalized_command_value(value, roots, strict)
+            for value in request["argv"]
+        ],
+        "environment": [
+            {
+                "name": item["name"],
+                "value": normalized_command_value(
+                    item["value"], roots, strict),
+            }
+            for item in request["environment"]
+        ],
+        "cwd": normalized_command_value(request["cwd"], roots, strict),
+        "supervisor": {
+            "path": command_path("command-supervisor"),
+            "identity": supervisor_identity,
+        },
+        "native_executable": {
+            "path": normalized_command_value(
+                request["executable"], roots, strict),
+            "identity": native_executable,
+        },
+        "command_executable": {
+            "path": normalized_command_value(
+                command_executable["path"], roots, strict),
+            "identity": command_executable["identity"],
+        },
+        "interpreter": (
+            None if interpreter is None else {
+                "path": normalized_command_value(
+                    interpreter["path"], roots, strict),
+                "identity": interpreter["identity"],
+            }
+        ),
+        "retained_executables": [
+            {
+                "identity": value["identity"],
+                "name": value["name"],
+                "path": normalized_command_value(
+                    value["path"], roots, strict),
+            }
+            for value in expected_retained
+        ],
+        "issued_ns": issued_ns,
+        "primary_deadline_ns": request["primary_deadline_ns"],
+        "cleanup_deadline_ns": request["cleanup_deadline_ns"],
+        "timeout_ns": timeout_ns,
+        "limits": request["limits"],
+    }
+    public_request = {
+        **request_core,
+        "canonical_sha256": command_binding_digest(request_core),
+        "argv_sha256": command_binding_digest(request_core["argv"]),
+        "environment_sha256": command_binding_digest(
+            request_core["environment"]),
+        "cwd_sha256": command_binding_digest(request_core["cwd"]),
+    }
+    result_core = {
+        "schema": native["schema"],
+        "version": native["version"],
+        "request_canonical_sha256": public_request["canonical_sha256"],
+        "controller_error": native["controller_error"],
+        "native_request": {
+            "bytes": len(request_raw),
+            "digest_scope": "direct_producer_or_trusted_inner_zip",
+            "sha256": native["request_sha256"],
+        },
+        "native_result": {
+            "bytes": len(native_raw),
+            "digest_scope": "direct_producer_or_trusted_inner_zip",
+            "sha256": hashlib.sha256(native_raw).hexdigest(),
+        },
+        "command": summarized,
+    }
+    return {
+        "schema": native["schema"],
+        "version": native["version"],
+        "bootstrap": False,
+        "request": public_request,
+        "result": {
+            **result_core,
+            "canonical_sha256": command_binding_digest(result_core),
+        },
+    }
+
+
+def bootstrap_execute(root, stage, args, seconds, limit, cwd, evidence,
+                      input_records):
+    require(stage in BOOTSTRAP_STAGES, "bootstrap stage is not allowed")
+    output = root / "private" / (stage + ".log")
+    executable = str(Path(args[0]).resolve(strict=True))
+    records = input_records
+    if records is None:
+        record, unused_directories = physical_file_record(executable)
+        del unused_directories
+        records = {record["path"]: record}
+    with retained_executables((executable,), records) as (retained, pass_fds):
+        raw = bounded_subprocess_output(
+            [retained[executable], *map(str, args[1:])],
+            cwd, limit + 1, seconds,
+            "bootstrap command output exceeded",
+            "bootstrap command timed out",
+            "bootstrap command failed",
+            env=command_environment(root, input_records),
+            pass_fds=pass_fds,
+        )
+    with output.open("xb") as stream:
+        stream.write(raw)
     record = {
         "scope": "command_diagnostic_not_acceptance", "stage": stage,
-        "exit_code": result.returncode, "bytes": size,
-        "sha256": digest(output) if size else hashlib.sha256(b"").hexdigest(),
-        "over_limit": size > limit,
-        "known_error_markers": markers,
+        "exit_code": 0, "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "sha256_scope": command_digest_scope(len(raw)),
+        "over_limit": False, "known_error_markers": command_error_markers(raw),
+        "supervisor": {
+            "schema": "uk.wamr.command-supervisor-result",
+            "version": 1, "bootstrap": True,
+        },
     }
     if evidence:
         save(root / "evidence" / ("command-" + stage + ".json"), record)
-    require(result.returncode == 0 and size <= limit, "bounded command failed")
     return output, record
 
 
-def run(root, stage, args, seconds=600, limit=8 * MIB, input_records=None):
+def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
+            evidence=True, input_records=None, allow_bootstrap=False,
+            path_roles=None):
+    """Native fixed-deadline command; raw output stays private."""
+    require(type(limit) is int and limit >= 0 and seconds > 0
+            and type(allow_bootstrap) is bool,
+            "invalid bounded command")
+    if allow_bootstrap:
+        require(stage in BOOTSTRAP_STAGES, "bootstrap stage is not allowed")
+    if COMMAND_SUPERVISOR_PATH is None:
+        require(allow_bootstrap, "command supervisor is unavailable")
+        return bootstrap_execute(
+            root, stage, args, seconds, limit, cwd, evidence, input_records)
+    output = root / "private" / (stage + ".log")
+    supervisor = str(Path(COMMAND_SUPERVISOR_PATH).resolve(strict=True))
+    executable = str(Path(args[0]).resolve(strict=True))
+    records = input_records
+    if records is None:
+        records = {}
+        for path in (supervisor, executable):
+            file_record, unused_directories = physical_file_record(path)
+            del unused_directories
+            records[file_record["path"]] = file_record
+    require(supervisor in records, "unbound command supervisor input")
+    require(executable in records, "unbound executable input")
+    roots = command_path_roots(root, path_roles)
+    supervisor_identity = native_executable_identity(records[supervisor])
+    command_executable = {
+        "path": executable,
+        "identity": native_executable_identity(records[executable]),
+    }
+    interpreter = (
+        command_executable
+        if executable == COMMAND_TOOL_PATHS.get("python3")
+        else None
+    )
+    selected_environment = {
+        "WAMR_CI_TOOL_" + name.upper().replace("-", "_"): path
+        for name, path in COMMAND_TOOL_PATHS.items()
+    }
+    if "git" in COMMAND_TOOL_PATHS:
+        selected_environment["WAMR_CI_GIT"] = COMMAND_TOOL_PATHS["git"]
+    launch_retained = executable == COMMAND_TOOL_PATHS.get("zig")
+    if launch_retained:
+        selected_environment["WAMR_CI_LAUNCH_EXECUTABLE"] = executable
+    environment = command_environment(
+        root, input_records, selected_environment)
+    retained_environment = []
+    expected_retained = []
+    for name, value in sorted(environment.items()):
+        record = records.get(value)
+        if record is None or not record["metadata"][2] & 0o111:
+            continue
+        retained_environment.append({"name": name, "path": value})
+        expected_retained.append({
+            "identity": native_executable_identity(record),
+            "name": name,
+            "path": value,
+        })
+    now = time.monotonic_ns()
+    primary_deadline = now + int(seconds * 1_000_000_000)
+    cleanup_deadline = primary_deadline + COMMAND_CLEANUP_SECONDS * 1_000_000_000
+    stream_limit = max(1, min(limit + 1, COMMAND_STREAM_MAX))
+    request = {
+        "argv": (
+            [supervisor, "--launch-retained", executable, *map(str, args[1:])]
+            if launch_retained
+            else [executable, *map(str, args[1:])]
+        ),
+        "cleanup_deadline_ns": cleanup_deadline,
+        "cwd": str(Path(cwd).resolve(strict=True)),
+        "environment": [
+            {"name": name, "value": value}
+            for name, value in sorted(environment.items())
+        ],
+        "executable": supervisor if launch_retained else executable,
+        "limits": {
+            "cleanup_events": 1_000_000,
+            "descendants": 64,
+            "primary_events": 1_000_000,
+            "proc_entries_per_scan": 262_144,
+            "reap_events": 512,
+            "stderr_bytes": stream_limit,
+            "stdout_bytes": stream_limit,
+            "term_grace_ms": 1000,
+        },
+        "primary_deadline_ns": primary_deadline,
+        "retained_executables": retained_environment,
+        "schema": "uk.wamr.command-supervisor-request",
+        "version": 1,
+    }
+    request_raw = validate_supervisor_request(request)
+    with retained_executables(
+            (supervisor,), records) as (retained, pass_fds):
+        result = subprocess.run(
+            [retained[supervisor]], input=request_raw,
+            cwd="/", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={}, pass_fds=pass_fds, check=False,
+        )
+    require(result.returncode == 0 and not result.stderr,
+            "native command supervisor failed")
+    expected_executable = native_executable_identity(
+        records[supervisor if launch_retained else executable])
+    native, stdout, stderr = decoded_supervisor_result(
+        result.stdout, request, expected_executable, expected_retained)
+    command = native["command"]
+    combined = (stdout + stderr)[:limit + 1]
+    with output.open("xb") as stream:
+        stream.write(combined)
+    size = len(combined)
+    markers = (command_error_markers(read(output, limit + 1))
+               if size <= limit + 1 else None)
+    exit_code = (
+        command["primary"]["code"]
+        if command is not None
+        and command["primary"]["kind"] == "exited"
+        else -1
+    )
+    record = {
+        "scope": "command_diagnostic_not_acceptance", "stage": stage,
+        "exit_code": exit_code, "bytes": size,
+        "sha256": digest(output) if size else EMPTY_SHA256,
+        "sha256_scope": command_digest_scope(size),
+        "over_limit": size > limit,
+        "known_error_markers": markers,
+        "supervisor": supervised_command_evidence(
+            stage, request, request_raw, native, result.stdout, stdout, stderr,
+            supervisor_identity,
+            expected_executable, command_executable, interpreter,
+            expected_retained, roots, now,
+            int(seconds * 1_000_000_000)),
+    }
+    if evidence:
+        save(root / "evidence" / ("command-" + stage + ".json"), record)
+    require(command is not None, "trusted command exec failed")
+    require(command["cleanup_complete"]
+            and command["cleanup"] == "complete"
+            and not command["poisoned"]
+            and not command["descendants"]["limit_exceeded"]
+            and not command["descendants"]["untracked"],
+            "trusted command cleanup failed")
+    require(command["executable_stable"], "trusted command executable changed")
+    require(command["stdout_status"] == "complete"
+            and command["stderr_status"] == "complete"
+            and size <= limit,
+            "trusted command output exceeded")
+    primary = command["primary"]
+    require(primary["kind"] != "timeout", "trusted command timed out")
+    require(primary["kind"] != "cancelled", "trusted command cancelled")
+    require(primary["kind"] not in {
+        "exec_failed", "snapshot_unsupported", "executable_changed",
+    }, "trusted command exec failed")
+    require(primary["kind"] == "exited" and primary["code"] == 0,
+            "trusted command failed")
+    return output, record
+
+
+def run(root, stage, args, seconds=600, limit=8 * MIB, input_records=None,
+        allow_bootstrap=False, path_roles=None):
     output, _ = execute(
-        root, stage, args, seconds, limit, input_records=input_records)
+        root, stage, args, seconds, limit, input_records=input_records,
+        allow_bootstrap=allow_bootstrap, path_roles=path_roles)
     return output
 
 
@@ -2183,7 +3865,7 @@ def tracked_manifest(relative, repository=None):
         "git_oid": oid,
         "metadata": list(snapshot(info)),
         "metadata_sha256": hashlib.sha256(
-            json.dumps(snapshot(info), separators=(",", ":")).encode("ascii")).hexdigest(),
+            compact_json(snapshot(info))).hexdigest(),
     }, data
 
 
@@ -2583,8 +4265,8 @@ def dependency_custody(root):
             "closure_sha256": closure.hexdigest(),
             "physical_sha256": physical.hexdigest(),
             "root_metadata": list(root_info),
-            "root_metadata_sha256": hashlib.sha256(json.dumps(
-                root_info, separators=(",", ":")).encode("ascii")).hexdigest(),
+            "root_metadata_sha256": hashlib.sha256(
+                compact_json(root_info)).hexdigest(),
             "manifests": {
                 "count": manifest_count,
                 "bytes": manifest_bytes,
@@ -2593,9 +4275,8 @@ def dependency_custody(root):
             "hash_verification": {
                 "algorithm": "zig-0.16.0-fetch-path",
                 "count": len(hash_records),
-                "sha256": hashlib.sha256(json.dumps(
-                    hash_records, sort_keys=True,
-                    separators=(",", ":")).encode("ascii")).hexdigest(),
+                "sha256": hashlib.sha256(
+                    compact_json(hash_records)).hexdigest(),
             },
             "records": records,
         },
@@ -2611,6 +4292,20 @@ def dependency_custody(root):
 def require_consumer_inputs(runtime, expected, content=False):
     consumer_input_state(
         runtime, content=content, expected=expected)
+
+
+def require_recorded_consumer_inputs(expected, content=False):
+    record_input_paths(
+        {
+            name: Path(record["path"])
+            for name, record in expected["files"].items()
+        },
+        {
+            name: Path(record["path"])
+            for name, record in expected["trees"].items()
+        },
+        content=content, expected=expected,
+    )
 
 
 def require_boot_inputs(runtime, paths, expected, content=False):
@@ -2641,7 +4336,8 @@ def verify_package_hashes(runtime, root, packages, expected_inputs):
                 root, f"dependency-hash-{index:03d}",
                 [tool("zig"), "fetch", "--global-cache-dir", cache, packages / name],
                 300, 511, cwd=work, evidence=False,
-                input_records=consumer_file_records(expected_inputs))
+                input_records=consumer_file_records(expected_inputs),
+                allow_bootstrap=True)
             require_consumer_inputs(runtime, expected_inputs)
         except Refusal as error:
             raise Refusal("Zig package hash recomputation failed") from error
@@ -2651,11 +4347,10 @@ def verify_package_hashes(runtime, root, packages, expected_inputs):
                 "dependency hash workspace manifest identity changed")
 
 
-def restore_dependencies(runtime, root, expected_source, expected_inputs):
+def restore_dependencies(runtime, root, expected_inputs):
     manifest_sources = dependency_manifest_sources()
     restore = root / "dependencies"
     restore.mkdir(mode=0o700)
-    require_source(expected_source)
     source_manifests = {}
     manifest_data = {}
     copied_manifests = {}
@@ -2669,7 +4364,6 @@ def restore_dependencies(runtime, root, expected_source, expected_inputs):
     restored = restored_manifest_state(restore, manifest_data)
     require(restored["manifests"] == copied_manifests,
             "copied dependency manifest identity changed")
-    require_source(expected_source)
     try:
         require_consumer_inputs(runtime, expected_inputs)
         _, command = execute(root, "dependency-restore", [
@@ -2677,7 +4371,8 @@ def restore_dependencies(runtime, root, expected_source, expected_inputs):
             "--fetch=all", "--cache-dir", root / "cache",
             "--global-cache-dir", root / "global-cache", "-j2",
         ], 900, evidence=False,
-            input_records=consumer_file_records(expected_inputs))
+            input_records=consumer_file_records(expected_inputs),
+            allow_bootstrap=True)
         require_consumer_inputs(runtime, expected_inputs)
     except Refusal as error:
         raise Refusal("pinned dependency restore command failed") from error
@@ -2696,8 +4391,42 @@ def restore_dependencies(runtime, root, expected_source, expected_inputs):
         for name, record in source_manifests.items()
     } and custody["restore_directory"] == restored["directory"],
             "copied dependency manifest identity changed")
-    require_source(expected_source)
     return packages
+
+
+def build_command_supervisor(runtime, root, packages, expected_inputs):
+    global COMMAND_SUPERVISOR_PATH
+    source_map = supervisor_source_map()
+    records = consumer_file_records(expected_inputs)
+    require_consumer_inputs(runtime, expected_inputs)
+    _, command = execute(root, "supervisor-build", [
+        tool("zig"), "build", "--build-file", HERE / "supervisor.build.zig",
+        "--system", packages, "--prefix", root / "supervisor",
+        "-Dsource-closure-sha256=" + source_map["content_closure_sha256"],
+        "-Doptimize=ReleaseSafe", "-j2", "install",
+    ], 900, evidence=False, input_records=records, allow_bootstrap=True)
+    require(command["known_error_markers"] == [],
+            "command supervisor build reported an error")
+    require_recorded_consumer_inputs(expected_inputs)
+    require(supervisor_source_map() == source_map,
+            "command supervisor source changed")
+    supervisor = (root / "supervisor/bin/wamr-ci-supervisor").resolve(
+        strict=True)
+    supervisor_record, unused_directories = physical_file_record(supervisor)
+    del unused_directories
+    COMMAND_SUPERVISOR_PATH = str(supervisor)
+    output, unused_record = execute(
+        root, "supervisor-version", [supervisor, "--version"],
+        30, 127, cwd=REPO, evidence=False,
+        input_records={supervisor_record["path"]: supervisor_record})
+    del unused_record
+    require(read(output, 128)
+            == (COMMAND_SUPERVISOR_VERSION + "\n").encode("ascii"),
+            "wrong command supervisor version")
+    require_recorded_consumer_inputs(expected_inputs)
+    require(supervisor_source_map() == source_map,
+            "command supervisor source changed")
+    return supervisor
 
 
 def require_build_custody(runtime, expected):
@@ -2722,6 +4451,37 @@ def require_build_custody(runtime, expected):
     require(source_matches, "immutable source custody changed")
     require_dependency_custody(runtime / "compute", expected["dependencies"])
     require_consumer_inputs(runtime, expected["consumer_inputs"])
+    require(command_supervisor_state(
+        runtime, expected["consumer_inputs"]) == expected["command_supervisor"],
+        "command supervisor custody changed")
+
+
+def require_recorded_build_custody(runtime, expected):
+    require(set(expected) == {
+        "source", "source_custody", "tools", "bison_data",
+        "dependencies", "consumer_inputs", "command_supervisor",
+    }, "invalid recorded build custody")
+    current_source = source()
+    require(source_identity(current_source) == expected["source"]
+            and current_source["custody"] == expected["source_custody"],
+            "immutable source custody changed")
+    require_dependency_custody(runtime / "compute", expected["dependencies"])
+    require_recorded_consumer_inputs(
+        expected["consumer_inputs"], content=True)
+    files = expected["consumer_inputs"]["files"]
+    require(set(expected["tools"]) == set(HOST_TOOLS),
+            "recorded tool roles changed")
+    for name in HOST_TOOLS:
+        record = files.get("tool:" + name)
+        require(isinstance(record, dict)
+                and expected["tools"][name] == record["sha256"],
+                "recorded tool custody changed")
+    require(bison_inputs(runtime / "bison") == expected["bison_data"],
+            "Bison input changed")
+    require(command_supervisor_state(
+        runtime, expected["consumer_inputs"]) == expected["command_supervisor"],
+        "command supervisor custody changed")
+    return expected
 
 
 def require_dependency_custody(root, expected):
@@ -2738,8 +4498,35 @@ def run_custodied(runtime, expected, root, stage, args, seconds=600,
     records = consumer_file_records(expected["consumer_inputs"])
     if extra_inputs is not None:
         records.update(consumer_file_records(extra_inputs))
+    path_roles = None
+    if extra_input_paths is not None:
+        path_roles = {
+            "input:" + name: path
+            for name, path in extra_input_paths.items()
+        }
     output = run(
-        root, stage, args, seconds, limit, input_records=records)
+        root, stage, args, seconds, limit, input_records=records,
+        path_roles=path_roles)
+    record_path = root / "evidence" / ("command-" + stage + ".json")
+    if stage in PRODUCTION_COMMAND_STAGES and record_path.is_file():
+        role_identities = {
+            "command-supervisor": native_executable_identity(
+                expected["consumer_inputs"]["files"]["command-supervisor"]),
+            **{
+                "tool:" + name: native_executable_identity(
+                    expected["consumer_inputs"]["files"]["tool:" + name])
+                for name in HOST_TOOLS
+            },
+        }
+        if extra_inputs is not None:
+            role_identities.update({
+                "input:" + name: native_executable_identity(
+                    extra_inputs["files"][name])
+                for name in extra_input_paths
+                if extra_inputs["files"][name]["metadata"][2] & 0o111
+            })
+        validate_supervised_command_binding(
+            document(record_path), stage, role_identities)
     if extra_inputs is not None:
         require_boot_inputs(runtime, extra_input_paths, extra_inputs)
     require_build_custody(runtime, expected)
@@ -2860,11 +4647,32 @@ def prepare_boot_output_slots(runtime, root):
         package, publication,
         *(Path(config["work_dir"]) for config in configs),
     ]
+    for path in slots:
+        require(canonical(path), "boot output slot unavailable")
+        info = path.lstat()
+        require(stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700
+                and not bounded_scandir(
+                    path, 1, "boot output already exists",
+                    "boot output slot unavailable"),
+                "boot output already exists")
+    return package, configs
+
+
+def precreate_boot_output_slots(runtime, root):
+    package = root / "package"
+    publication = root / "public-source"
+    configs = [config_for(runtime, root, index) for index in range(len(MODES))]
+    slots = [
+        package, publication,
+        *(Path(config["work_dir"]) for config in configs),
+    ]
     require(all(not path.exists() and not path.is_symlink() for path in slots),
             "boot output already exists")
     for path in slots:
         path.mkdir(mode=0o700)
-    return package, configs
+    prepare_boot_output_slots(runtime, root)
 
 
 def boot_args(cli, config):
@@ -3011,11 +4819,13 @@ def solved_config():
 
 
 def build(runtime, wamr):
+    global COMMAND_SUPERVISOR_PATH
     root = runtime / "compute"
     root.mkdir(mode=0o700)
     for name in ("private", "evidence", "scratch", "cache", "global-cache",
-                 "global-cache/tmp", "fixtures"):
+                 "global-cache/tmp", "fixtures", "supervisor", "tools"):
         (root / name).mkdir(mode=0o700)
+    precreate_boot_output_slots(runtime, root)
     prepare_source_outputs()
     bison_data = os.environ.get("BISON_PKGDATADIR")
     require(bison_data == str(runtime / "bison"),
@@ -3030,10 +4840,15 @@ def build(runtime, wamr):
         "MAKEFLAGS": "-j2",
         "TMPDIR": str(root / "scratch"),
         "ZIG_GLOBAL_CACHE_DIR": str(root / "global-cache"),
+        "ZIG_LIB_DIR": str(Path(tool("zig")).parent / "lib"),
         "ZIG_LOCAL_CACHE_DIR": str(root / "cache"),
     })
     os.environ.update(COMMAND_ENVIRONMENT)
+    COMMAND_SUPERVISOR_PATH = None
     source_archive = seal_wamr_source(runtime, wamr)
+    bootstrap_inputs = consumer_input_state(runtime)
+    packages = restore_dependencies(runtime, root, bootstrap_inputs)
+    build_command_supervisor(runtime, root, packages, bootstrap_inputs)
     consumer_inputs = consumer_input_state(runtime)
     COMMAND_ENVIRONMENT.update(bind_command_tools(consumer_inputs))
     os.environ.update(COMMAND_ENVIRONMENT)
@@ -3043,8 +4858,6 @@ def build(runtime, wamr):
         "version": 1,
         "records": source_metadata(),
     })
-    packages = restore_dependencies(
-        runtime, root, initial_source, consumer_inputs)
     initial = producer_inputs(runtime, consumer_inputs)
     require(initial["source"] == source_identity(initial_source)
             and initial["source_custody"] == initial_source["custody"],
@@ -3052,15 +4865,11 @@ def build(runtime, wamr):
     save(root / "evidence/build-start.json", initial)
     zig = tool("zig")
     consumer_records = consumer_file_records(consumer_inputs)
-    with retained_executables(
-            (zig,), consumer_records) as (
-                retained, pass_fds):
-        version = bounded_subprocess_output(
-            [retained[zig], "version"], REPO, 64, 30,
-            "Zig version output too large", "Zig version check timed out",
-            "Zig version check failed",
-            env=command_environment(root, consumer_records),
-            pass_fds=pass_fds)
+    version_path, unused_record = execute(
+        root, "zig-version", [zig, "version"], 30, 64,
+        evidence=False, input_records=consumer_records)
+    del unused_record
+    version = read(version_path, 65)
     require(version.strip() == b"0.16.0", "Zig 0.16.0 required")
     run_custodied(runtime, initial, root, "adapter", [
         tool("zig"), "build", "--build-file", HERE / "build.zig",
@@ -3073,6 +4882,8 @@ def build(runtime, wamr):
     COMMAND_ENVIRONMENT.update({
         "WAMR_CI_PACKAGE": str(root / "tools/bin/wamr-ci-package"),
         "WAMR_CI_PYTHON": tool("python3"),
+        "WAMR_CI_SUPERVISOR_FIXTURE":
+            str(root / "tools/bin/wamr-ci-supervisor-fixture"),
     })
     os.environ.update(COMMAND_ENVIRONMENT)
     run_custodied(runtime, initial, root, "fixtures", [

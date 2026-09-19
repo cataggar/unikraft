@@ -120,6 +120,111 @@ inspection and export. Consumer subprocesses use adapter-owned
 cache/configuration paths; ambient loader, shell-startup, Python, Make and Zig
 injection variables are not inherited.
 
+Before the clean source baseline is taken, the adapter restores the exact
+out-of-tree dependency tree and builds the internal
+`wamr-ci-supervisor` from `supervisor.build.zig`. The bootstrap inputs and the
+supervisor's exact tracked source closure are checked before and after that
+build. `build-start.json` then embeds `uk.wamr.command-supervisor` version 1:
+the fixed protocol version plus independently recomputed source and runtime
+maps, each with actual file/byte counts and content/physical closure SHA256
+values. The runtime map includes the supervisor ELF and its dynamic runtime;
+the ELF is also a normal version-2 consumer input. Current-custody checks,
+final handoff and public export recompute the same maps rather than trusting
+copied pins.
+The package, publication and four boot work directories are empty private
+slots created before that final custody baseline, so later outputs do not
+change a recorded supervisor/tool ancestor directory.
+
+Bootstrap execution is an explicit call-site capability, not a global
+fallback. Its closed exact-stage allowlist is `dependency-restore`,
+`supervisor-build`, and `dependency-hash-000` through
+`dependency-hash-127` (the already bounded package-root maximum); there is no
+prefix or glob match. The adapter ignores `WAMR_CI_SUPERVISOR` when loading
+production orchestration. Every other build, packaging, boot, inspection,
+handoff, validator, import/export and publication command refuses while the
+custodied supervisor is unbound or unavailable.
+
+Every later trusted WAMR command is launched by that retained native ELF using
+the merged `Executable`, `CommandRequest` and `CommandResult` contract. The
+request supplies an explicit retained ELF, fixed argv, closed environment,
+cwd, one absolute primary deadline, a separately fixed cleanup deadline and
+bounded output/result limits. Direct scripts name the retained Python or Bash
+ELF explicitly; there is no shebang or ambient interpreter selection.
+Recorded indirect executable variables are replaced inside the supervisor by
+paths to its retained descriptors. The reviewed self-reexecuting package and
+local-boot tools ignore inherited retained-self values unless the original
+path binds their current `argv[0]`. The exact recorded Zig installation tree
+supplies `ZIG_LIB_DIR`; direct Zig commands also bind a separately opened
+retained executable descriptor. A private supervisor launcher mode replaces
+its own sealed snapshot with that descriptor before Zig starts, so Zig can
+find its standard library and re-execute its integrated linker without an
+ambient path. Canonical native results bind the supervisor launcher identity
+and the retained Zig identity and report primary outcome, stream status,
+descendant observations, cleanup outcome, poison state, and monotonic
+start/primary-completion/final-completion times. Those timestamps are
+u64 values ordered against the one original primary deadline and the later
+cleanup deadline; elapsed values are differences of those absolute samples,
+so cleanup cannot reset the clock. A timeout completion is at or after the
+absolute primary deadline (equality is timeout), while every non-timeout
+primary completion is strictly before it. Leader exit recognition samples
+that boundary once and uses the same observation for primary completion, so
+preemption between the preceding deadline check and exit observation cannot
+produce late success. An overflow stream contains exactly
+its configured capture limit; the other stream may be shorter, including when
+both streams were eligible to overflow. A complete spawned-command cleanup
+has at least one primary-monitor event and the five cleanup events guaranteed
+by the TERM/KILL/final-exit state-machine path. Before `execveat`, a
+close-on-exec sequenced socket gate holds the forked child after its raw
+PDEATHSIG, process-group, cwd, stdio and descriptor setup. The parent retains
+the original deadline while it opens and validates the child's pidfd/start
+identity, transfers the leader into the tracker, receives the child's ready
+token and sends exactly one release token. EOF, a malformed/short token or any
+tracking, clock, deadline, cancellation or release failure closes the gate,
+reaps the still-unexecuted leader through its pidfd and requires final ECHILD.
+As soon as the spawned leader exists, an unwind guard follows it through
+pidfd acquisition and tracker ownership and records whether the gate was
+released and whether normal tree cleanup completed. Any later error therefore
+recovers the gated leader before release or runs full tracked-tree cleanup
+after release; cleanup proof failure is retained as irreversible supervisor
+poison without replacing the primary command failure.
+A proved pre-release recovery is `cleanup=complete`, unpoisoned, with no
+primary-monitor events, empty complete streams, no descendants, two reap
+events (leader plus ECHILD) and at least four cleanup events. The minimum is
+shared by the native producer and adapter through `process-command-v1.json`.
+An unavailable identity, reap or ECHILD proof poisons the supervisor even if best-effort
+termination succeeds. Pre-spawn `not_required` results remain limited to
+timeout, cancellation, local spawn/snapshot I/O failure or unsupported
+snapshot creation. They have empty complete streams and hashes, no
+termination, descendants or events, identical primary/final completion, and
+the unchanged executable identity. Timeout,
+cancellation, overflow, nonzero/signal, exec/identity failure or any unproven
+cleanup is a refusal; cleanup failure prevents publication even when the
+leader exited zero.
+Each supervised command record also binds hashes of the complete canonical
+request, the canonical raw native request/result transports, and the
+normalized native result, exact supervisor, command executable,
+native executable and interpreter identities, ordered argv, closed explicit
+environment, cwd, stage/schema versions, primary/cleanup deadlines and every
+supervisor limit. A closed per-stage contract fixes the executable roles,
+argv template, cwd role, environment allowlist, timeout, output limits and
+successful result expectations. Every digest is recomputed from the retained
+fields during creation, export, archive reopen and import; a syntactically
+valid supplied digest or cross-stage relabel is not accepted. Separate stream
+status/size/digests, a domain-separated aggregate commitment over both stream
+byte counts and digests, the direct combined-output observation, termination,
+descendant relationships and native-width event/reap counts remain bound.
+SHA256(empty) is recomputed for empty streams. Nonempty raw command output
+remains private, so its stream and combined digests are explicitly labelled
+transport-authenticated observations rather than independently reproducible
+claims.
+
+Supervisor JSON is compact canonical UTF-8 with byte-sorted keys, exact
+separators and one final LF. Python emits literal UTF-8 (`ensure_ascii=False`)
+and hashes/sends those same bytes; escaped input is parsed but is not
+canonical. Strings must be valid Unicode scalar sequences and native path
+limits count UTF-8 bytes. Filesystem paths are not normalized: NFC and NFD
+code-point sequences remain distinct paths and produce distinct digests.
+
 Records also bind the Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
 actual tools, wasm/cwasm/compiler/library bytes, solved configuration,
 entire EFI/debug ELF/bootinfo, native package producer, QEMU and OVMF,
@@ -133,9 +238,11 @@ observations, not authenticated source attestations or deployment receipts.
 Writable build, package, firmware and boot slots are under the protected
 CI job's private `/d/wamr-native-runtime` (or the local in-worktree runtime)
 or the app's ignored `build/`. Zig's
-source-pinned dependency restoration first establishes clean physical source
-custody, then copies the exact Git-identified local-boot manifests create-only
-into `compute/dependencies`. Before Zig runs it binds each copy's exact
+source-pinned dependency restoration copies the exact Git-identified
+local-boot manifests create-only into `compute/dependencies` before the clean
+source baseline. Descriptor/Git-object checks bind those actual manifest
+inputs, and the later full source baseline must still be clean and exact.
+Before Zig runs it binds each copy's exact
 device/inode/type, ownership, links, size, mtime and ctime plus the parent
 directory metadata, and requires the same identities immediately afterward.
 It also byte-compares the copies, parses the one exact Miz
@@ -164,22 +271,25 @@ policy allows at most 131,072 entries, 8 GiB total regular-file/link bytes,
 parsing. Failure diagnostics use a separately terminated-and-drained 1-MiB Git
 status capture, retain at most 128 ignored paths, and refuse immediately on the
 129th repository-root entry before sorting the bounded collection.
-The subprocess collector gives termination, kill and post-kill/post-leader
-pipe draining separate absolute one-second budgets. An escaped `setsid()`
-descendant cannot keep this collector waiting indefinitely because the pipe is
-closed at the absolute drain deadline, but standard descendant supervision is
-still a prerequisite for closing the escaped-process lifetime gap. That
-separate prerequisite remains pending; this lane does not add a
-success-shaped production exception or manual cleanup contract. Git runs with
+The production command path uses the standard native subreaper/pidfd
+supervisor. It discovers and reaps ordinary owned descendants after leader
+success, including `setsid`, double-fork and closed-capture descendants.
+Cleanup has its own absolute deadline and bounded scan/signal/reap budgets;
+exhaustion or uncertain ownership poisons the one-shot supervisor result and
+cannot become success. This is cleanup for cooperative or accidentally
+detached owned descendants, not a hostile same-UID or PID-namespace ownership
+claim. Git bootstrap/custody probes run with
 system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
 applicable.
 Build commands use `-j2`; the workflow has a 60-minute ceiling. Each build
-command has a fixed deadline and an 8-MiB log limit (one extra byte detects
-overflow). The native packaging worker retains its 120-second deadline and
+command has an absolute deadline, 4-MiB limits per native stream and an
+8-MiB combined private-log limit (one extra byte detects overflow), followed
+by an independent ten-second supervisor cleanup deadline. The native packaging
+worker retains its 120-second deadline and
 independent two-second cleanup budget. Each native boot is limited to 60
-seconds with the existing independent cleanup budget; an outer 660-second
-compute ceiling also bounds the orchestration and post-exit hashing.
+seconds with the existing independent cleanup budget; the Actions job deadline
+separately bounds orchestration and post-exit hashing without GNU `timeout`.
 The empty private package output and four boot work directories are created
 before boot-input custody, and the native packager accepts its slot only while
 empty; later package and serial writes therefore keep the shared
@@ -213,20 +323,45 @@ cp support/tools/hyperv/local_boot/build.zig \
 zig build --build-file .d/wamr-ci-check/restore/build.zig --fetch=all \
   --cache-dir .d/wamr-ci-check/cache \
   --global-cache-dir .d/wamr-ci-check/global-cache -j2
+SUPERVISOR_SOURCE_SHA256="$(
+  PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+
+path = Path("support/build/wamr-native-ci/run.py").resolve()
+spec = importlib.util.spec_from_file_location("wamr_native_ci", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.supervisor_source_map()["content_closure_sha256"])
+PY
+)"
+zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
+  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
+  --cache-dir .d/wamr-ci-check/cache \
+  --global-cache-dir .d/wamr-ci-check/global-cache \
+  --prefix "$PWD/.d/wamr-ci-check/supervisor" \
+  -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
+  -Doptimize=ReleaseSafe -j2 install
 zig build --build-file support/build/wamr-native-ci/build.zig \
   --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
   --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
   -Doptimize=ReleaseSafe -j2 test install
 WAMR_CI_PACKAGE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-package" \
+WAMR_CI_SUPERVISOR="$PWD/.d/wamr-ci-check/supervisor/bin/wamr-ci-supervisor" \
+WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fixture" \
   python3 -m unittest discover -s support/build/wamr-native-ci/tests -v
 ```
 
 The Python fixtures use the actual native packaging helper and pinned miz
 with a synthetic **nonbootable** PE, plus synthetic compute/log records.
 They check full raw/VHD/footer hashes, physical reload, mutation/partial-state/
-replay refusal, exact results and the four CLI configurations. These are not
+replay refusal, exact results, the four CLI configurations, standard
+descendant cleanup, timeout/overflow/nonzero/exec failures, cleanup poison,
+canonical-result tamper, executable identity and the closed environment.
+These are not
 guest execution evidence. `WAMR_CI_PACKAGE` selects only that test executable;
-production orchestration has no fixture, executable-override or skip switch.
+the supervisor fixture is likewise test-only. Production orchestration has no
+fixture, executable-override or skip switch.
 ARM development can run these fixtures, but cannot qualify the guest.
 Only a successful real x86 PR run of the corrected, committed native base
 establishes the first local tiny-compute observation.
@@ -263,6 +398,20 @@ by exact recorded identity only after final handoff revalidation, so neither
 boot setup nor pre-export cleanup can mutate a recorded system-library
 directory. The publication command accepts only that literal CI runtime or
 the legacy in-worktree runtime.
+Because publication is a fresh Python handoff process, it first reopens
+`build-start.json`, validates its closed schema and directly rehashes every
+recorded consumer file/tree without selecting tools from ambient variables.
+It uses only the validated recorded Git executable for the source/dependency
+recheck, recomputes the exact source, dependency, Bison, consumer and guarded
+supervisor custody, and only then binds the full recorded tool set and the
+fixed-runtime supervisor. It repeats the full custody check after binding.
+The public validator build then runs through that retained supervisor; its
+`command-public-validator-build.json` must be the exact in-memory/on-disk
+canonical non-bootstrap record with the retained Zig identity, complete
+primary/descendant/output/deadline/cleanup/poison observations and successful
+cleanup. The same record and custody are rechecked before export, after export
+and after archive reopen. A missing supervisor, changed consumer record,
+bootstrap substitution or stage relabel refuses publication.
 After all four genuine boots, while the complete runner files still exist,
 the workflow invokes the production private export and native handoff checker,
 then copies only its closed image/local-evidence allowlist into a standalone
@@ -289,6 +438,13 @@ contract and may omit the new external-digest input; any archive containing a
 current custody claim requires it. Member names, modes/types, individual
 sizes, complete SHA256/EOF, source/run bindings and successful receipts are
 checked.
+The exact pre-supervisor merged sources
+`0711a0b6bf2285a4ba6ab6dd3bd4088478d665e1`,
+`c9c00535399354063486957611bf6e09c8ae4592` and
+`3c6d5d98dc5736d86e97884184b26be39c3f11d5`, with their literal recorded
+trees, remain compatible with the same fixed 20-evidence/55-file archive
+shape without a command-supervisor record. Any other current source must carry
+the native supervisor result fields and guarded producer maps.
 Symlinks/hardlinks, duplicate/extra/absolute/traversal members, compression,
 oversize inputs and known credential/account/approval patterns are refused.
 
@@ -306,11 +462,14 @@ and source SHA. No attestation or OIDC permission is added.
 There are **no Azure credentials, subscription/VM identities, SAS, grants,
 approval files, campaign state, raw command logs or private diagnostics** in
 the allowlist. Public tiny local serial is expressly authorized here; it is
-not arbitrary private guest output. The portable manifests use relative
-member paths and no operator/account data. Original request bytes retain
-only the validated public CI checkout paths, so their original hashes and
-four local outcomes remain intact. Config/compiler/debug bytes may likewise
-contain public build paths; no paths are rewritten inside original evidence.
+not arbitrary private guest output. The portable manifests use relative member paths and no operator/account data.
+Supervised command requests replace absolute native paths with closed public
+roles (`source`, `runtime`, command work root, exact tool/input and supervisor
+roles) plus bounded repository-relative suffixes. The normalized fields are
+generated directly from the exact native request before execution evidence is
+published; unbound absolute paths refuse. Config/compiler/debug bytes may
+likewise contain public build paths; no paths are rewritten inside original
+non-command evidence.
 
 The ordinary metadata artifact is still published on failure. The public
 image upload is success-only; failed export, cleanup, revalidation or boot
@@ -327,13 +486,28 @@ The exact expected source commit and tree must also be available in the local
 Git object database. The importer resolves both dependency manifests from that
 tree and compares their blob OIDs, bytes and SHA256 values, then recomputes
 manifest, closure, root-metadata and Zig hash-verification summaries.
+Import also requires explicit `--validator` and `--supervisor` paths. It never
+uses ambient environment, `PATH` or sibling inference. The supervisor is
+opened no-follow, checked as the exact executable native ELF (x86-64 on the
+hosted runner) recorded in the
+accepted build, and its independently opened dynamic-runtime objects must have
+the same bounded content set. It is queried under its own supervision for its
+canonical protocol/source-closure identity and compared with the supervisor
+source blobs from the exact expected Git tree before it may launch native
+revalidation.
 
 Package-tree physical metadata and the recorded Zig executions are producer
 observations: their package bytes are intentionally not included in this tiny
 archive, so import does not pretend to re-run those observations. They are
 authenticated to the selected successful run only by the independently
-trusted complete-archive SHA256. Missing archive trust is a refusal, never a
-best-effort downgrade. The importer then safely copies only bounded regular
+trusted complete-archive SHA256. The same rule applies to nonempty supervised
+stdout/stderr observations: production validates them against the direct
+native result before creating the record, but the raw streams are deliberately
+not public members. Import recomputes empty-stream hashes and aggregate
+count/digest commitments, validates all native-width and cross-field
+invariants, and accepts nonempty stream digests only in the independently
+selected current inner-ZIP digest context. Missing archive trust is a refusal,
+never a best-effort downgrade. The importer then safely copies only bounded regular
 members to a fresh private directory, rebuilds local artifact references (not
 original requests), and uses the production native checker before publishing
 a usable `bundle.json`. Its plan remains `authority=not_admitted`; new final

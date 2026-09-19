@@ -262,6 +262,78 @@ jobs:
             printf '%s\n' "${verified}" |
               sed -n 's/^Public source archive SHA-256: //p'
           )" = "${archive_sha256}"
+          cli_parent="${root}/compute/public-source/fresh-cli"
+          mkdir -m 700 "${cli_parent}"
+          validator="${root}/compute/public-source/tools/bin/uk-wamr-direct-validate"
+          supervisor="${root}/compute/supervisor/bin/wamr-ci-supervisor"
+          python3 support/build/wamr-native-ci/handoff.py \
+            import-public-source-bundle \
+            --archive "${upload_file}" \
+            --output "${cli_parent}/success" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${source_tree}" \
+            --expected-archive-sha256 "${archive_sha256}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --validator "${validator}" \
+            --supervisor "${supervisor}"
+          if WAMR_CI_SUPERVISOR="${supervisor}" \
+            python3 support/build/wamr-native-ci/handoff.py \
+              import-public-source-bundle \
+              --archive "${upload_file}" \
+              --output "${cli_parent}/ambient-refused" \
+              --expected-source "${GITHUB_SHA}" \
+              --expected-tree "${source_tree}" \
+              --expected-archive-sha256 "${archive_sha256}" \
+              --run-id "${GITHUB_RUN_ID}" \
+              --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+              --validator "${validator}" \
+              >"${cli_parent}/ambient.stdout" \
+              2>"${cli_parent}/ambient.stderr"; then
+            echo "Ambient supervisor fallback was accepted" >&2
+            exit 1
+          fi
+          cp -- "${supervisor}" "${cli_parent}/tampered-supervisor"
+          python3 - "${cli_parent}/tampered-supervisor" <<'PY'
+          import os
+          import sys
+
+          path = sys.argv[1]
+          flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+          flags |= getattr(os, "O_NOFOLLOW", 0)
+          handle = os.open(path, flags)
+          try:
+              original = os.pread(handle, 1, 4096)
+              if len(original) != 1:
+                  raise SystemExit("supervisor tamper fixture unavailable")
+              os.pwrite(handle, bytes([original[0] ^ 1]), 4096)
+              os.fsync(handle)
+          finally:
+              os.close(handle)
+          PY
+          chmod 500 "${cli_parent}/tampered-supervisor"
+          for case in tampered wrong-tool; do
+            candidate="${cli_parent}/tampered-supervisor"
+            if [[ "${case}" == wrong-tool ]]; then
+              candidate="${validator}"
+            fi
+            if python3 support/build/wamr-native-ci/handoff.py \
+              import-public-source-bundle \
+              --archive "${upload_file}" \
+              --output "${cli_parent}/${case}-refused" \
+              --expected-source "${GITHUB_SHA}" \
+              --expected-tree "${source_tree}" \
+              --expected-archive-sha256 "${archive_sha256}" \
+              --run-id "${GITHUB_RUN_ID}" \
+              --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+              --validator "${validator}" \
+              --supervisor "${candidate}" \
+              >"${cli_parent}/${case}.stdout" \
+              2>"${cli_parent}/${case}.stderr"; then
+              echo "Invalid explicit supervisor was accepted: ${case}" >&2
+              exit 1
+            fi
+          done
           {
             echo "inner_zip_sha256=${archive_sha256}"
             echo "upload_file=${upload_file}"

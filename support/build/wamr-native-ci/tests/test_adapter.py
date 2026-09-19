@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Synthetic unit/physical packaging fixtures; never real guest boot evidence."""
+import ast
+import base64
 import copy
 import contextlib
 import hashlib
@@ -8,7 +10,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import stat
 import struct
 import subprocess
@@ -22,9 +23,14 @@ from unittest import mock
 HERE = Path(__file__).resolve().parents[1]
 PYTHON = os.environ.get("WAMR_CI_PYTHON", sys.executable)
 GIT = os.environ.get("WAMR_CI_GIT", "git")
+SUPERVISOR = os.environ.get("WAMR_CI_SUPERVISOR")
+SUPERVISOR_FIXTURE = os.environ.get("WAMR_CI_SUPERVISOR_FIXTURE")
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+if SUPERVISOR is not None:
+    ci.COMMAND_SUPERVISOR_PATH = str(
+        Path(SUPERVISOR).resolve(strict=True))
 bundle_spec = importlib.util.spec_from_file_location(
     "wamr_public_bundle", HERE / "public_bundle.py")
 public_bundle = importlib.util.module_from_spec(bundle_spec)
@@ -215,6 +221,30 @@ class PhysicalPackage(unittest.TestCase):
         (self.state / "unexpected").write_bytes(b"x")
         self.call("package", success=False)
 
+    @unittest.skipIf(not SUPERVISOR, "native command supervisor unavailable")
+    def test_supervised_python_does_not_rebind_nested_package_identity(self):
+        controller = self.root / "controller"
+        (controller / "private").mkdir(parents=True, mode=0o700)
+        (controller / "evidence").mkdir(mode=0o700)
+        self.state.mkdir(mode=0o700)
+        script = (
+            "import subprocess,sys\n"
+            "result=subprocess.run(sys.argv[1:],stdout=subprocess.PIPE,"
+            "stderr=subprocess.PIPE)\n"
+            "sys.stdout.buffer.write(result.stdout)\n"
+            "sys.stderr.buffer.write(result.stderr)\n"
+            "raise SystemExit(result.returncode)\n"
+        )
+        output, unused_record = ci.execute(
+            controller, "nested-package",
+            [PYTHON, "-c", script, self.cli, "package",
+             self.efi, self.state],
+            seconds=150, limit=ci.MIB, evidence=False)
+        del unused_record
+        report = json.loads(output.read_bytes())
+        self.assertEqual(report["image"]["efi"]["sha256"], ci.digest(self.efi))
+        self.assertEqual(self.call("inspect"), report)
+
 
 class Evidence(unittest.TestCase):
     def setUp(self):
@@ -229,6 +259,199 @@ class Evidence(unittest.TestCase):
     def put(self, path, value):
         path.write_bytes(value)
         path.chmod(0o600)
+
+    def supervised_binding(self, stage):
+        contract = ci.production_command_contract(stage)
+        roles = {
+            "command-supervisor",
+            contract["native_executable"]["role"],
+            contract["command_executable"]["role"],
+        }
+        if contract["interpreter"] is not None:
+            roles.add(contract["interpreter"]["role"])
+        environment = {
+            item["name"]: item["value"]
+            for item in contract["environment"]
+        }
+        roles.update(
+            environment[name]["role"]
+            for name in contract["retained_names"])
+        identities = {}
+        for index, role in enumerate(sorted(roles), 1):
+            identities[role] = {
+                "content_sha256": hashlib.sha256(
+                    role.encode("ascii")).hexdigest(),
+                "ctime_nanoseconds": index,
+                "ctime_seconds": 1,
+                "device_major": 1,
+                "device_minor": 2,
+                "inode": index,
+                "mode": stat.S_IFREG | 0o500,
+                "mtime_nanoseconds": index,
+                "mtime_seconds": 1,
+                "size": 4096 + index,
+                "uid": os.getuid(),
+            }
+
+        def binding(path):
+            return {
+                "path": copy.deepcopy(path),
+                "identity": identities[path["role"]],
+            }
+
+        primary = 10_000_000_000_000
+        issued = primary - contract["seconds"] * 1_000_000_000
+        request_core = {
+            "binding_schema": ci.COMMAND_BINDING_SCHEMA,
+            "binding_version": ci.COMMAND_BINDING_VERSION,
+            "stage": stage,
+            "schema": "uk.wamr.command-supervisor-request",
+            "version": 1,
+            "argv": copy.deepcopy(contract["argv"]),
+            "environment": copy.deepcopy(contract["environment"]),
+            "cwd": copy.deepcopy(contract["cwd"]),
+            "supervisor": binding(ci.command_path("command-supervisor")),
+            "native_executable": binding(contract["native_executable"]),
+            "command_executable": binding(contract["command_executable"]),
+            "interpreter": (
+                None if contract["interpreter"] is None
+                else binding(contract["interpreter"])
+            ),
+            "retained_executables": [
+                {
+                    "name": name,
+                    **binding(environment[name]),
+                }
+                for name in contract["retained_names"]
+            ],
+            "issued_ns": issued,
+            "primary_deadline_ns": primary,
+            "cleanup_deadline_ns":
+                primary + ci.COMMAND_CLEANUP_SECONDS * 1_000_000_000,
+            "timeout_ns": contract["seconds"] * 1_000_000_000,
+            "limits": copy.deepcopy(contract["limits"]),
+        }
+        request = {
+            **request_core,
+            "canonical_sha256": ci.command_binding_digest(request_core),
+            "argv_sha256": ci.command_binding_digest(request_core["argv"]),
+            "environment_sha256": ci.command_binding_digest(
+                request_core["environment"]),
+            "cwd_sha256": ci.command_binding_digest(request_core["cwd"]),
+        }
+        empty = hashlib.sha256(b"").hexdigest()
+        output_commitment = ci.command_output_commitment(
+            0, empty, 0, empty)
+        started = issued + 1
+        primary_completed = started + 2
+        completed = primary_completed + 3
+        command = {
+            "cancellation_observed": False,
+            "cleanup": "complete",
+            "cleanup_complete": True,
+            "cleanup_events": ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN,
+            "descendants": {
+                "adopted": 0,
+                "identity_validated": 0,
+                "limit_exceeded": False,
+                "observed": 0,
+                "untracked": False,
+            },
+            "executable": request["native_executable"]["identity"],
+            "executable_stable": True,
+            "output": {
+                "bytes": 0,
+                "combined_sha256": empty,
+                "commitment_sha256": output_commitment,
+                "digest_scope": "reproducible_empty",
+            },
+            "poisoned": False,
+            "primary": {"code": 0, "kind": "exited"},
+            "primary_deadline_reached": False,
+            "primary_events": ci.COMMAND_COMPLETE_PRIMARY_EVENTS_MIN,
+            "reap_events": 2,
+            "retained_executables": copy.deepcopy(
+                request["retained_executables"]),
+            "stderr": {
+                "bytes": 0, "digest_scope": "reproducible_empty",
+                "sha256": empty, "status": "complete",
+            },
+            "stdout": {
+                "bytes": 0, "digest_scope": "reproducible_empty",
+                "sha256": empty, "status": "complete",
+            },
+            "timing": {
+                "cleanup_elapsed_ns": completed - primary_completed,
+                "completed_ns": completed,
+                "primary_completed_ns": primary_completed,
+                "primary_elapsed_ns": primary_completed - started,
+                "started_ns": started,
+                "total_elapsed_ns": completed - started,
+            },
+            "termination": {"code": 0, "kind": "exited"},
+        }
+        result_core = {
+            "schema": "uk.wamr.command-supervisor-result",
+            "version": 1,
+            "request_canonical_sha256": request["canonical_sha256"],
+            "controller_error": None,
+            "native_request": {
+                "bytes": 128,
+                "digest_scope": "direct_producer_or_trusted_inner_zip",
+                "sha256": hashlib.sha256(b"native-request").hexdigest(),
+            },
+            "native_result": {
+                "bytes": 256,
+                "digest_scope": "direct_producer_or_trusted_inner_zip",
+                "sha256": hashlib.sha256(b"native-result").hexdigest(),
+            },
+            "command": command,
+        }
+        record = {
+            "scope": "command_diagnostic_not_acceptance",
+            "stage": stage,
+            "exit_code": 0,
+            "bytes": 0,
+            "sha256": empty,
+            "sha256_scope": "reproducible_empty",
+            "over_limit": False,
+            "known_error_markers": [],
+            "supervisor": {
+                "schema": "uk.wamr.command-supervisor-result",
+                "version": 1,
+                "bootstrap": False,
+                "request": request,
+                "result": {
+                    **result_core,
+                    "canonical_sha256":
+                        ci.command_binding_digest(result_core),
+                },
+            },
+        }
+        return record, identities
+
+    def rehash_supervised_binding(self, record):
+        request = record["supervisor"]["request"]
+        for name, value in (
+                ("argv_sha256", request["argv"]),
+                ("environment_sha256", request["environment"]),
+                ("cwd_sha256", request["cwd"])):
+            request[name] = ci.command_binding_digest(value)
+        request_core = {
+            key: value for key, value in request.items()
+            if key not in {
+                "canonical_sha256", "argv_sha256",
+                "environment_sha256", "cwd_sha256",
+            }
+        }
+        request["canonical_sha256"] = ci.command_binding_digest(
+            request_core)
+        result = record["supervisor"]["result"]
+        result["request_canonical_sha256"] = request["canonical_sha256"]
+        result_core = dict(result)
+        result_core.pop("canonical_sha256", None)
+        result["canonical_sha256"] = ci.command_binding_digest(result_core)
+        return record
 
     def source_repository(self, name="source-repository", extra=None):
         repository = self.root / name
@@ -468,6 +691,335 @@ class Evidence(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "bundle refused"):
             public_bundle.ci_runtime(runtime_owner)
 
+    def test_public_start_revalidates_recorded_custody_before_binding(self):
+        runtime = self.root / "public-runtime"
+        consumer = {
+            "schema": "uk.wamr.consumer-input-custody",
+            "version": 2,
+            "files": {
+                **{
+                    "tool:" + name: {"path": "/trusted/" + name}
+                    for name in ci.HOST_TOOLS
+                },
+                "wamr-source-archive": {"path": "/trusted/wamr.tar"},
+                "command-supervisor": {"path": "/trusted/supervisor"},
+            },
+            "trees": {
+                name: {} for name in (
+                    "bison", "python-stdlib", "zig", "llvm")
+            },
+            "directories": {},
+            "aggregate_sha256": "f" * 64,
+        }
+        start = {
+            "source": {"revision": "1" * 40, "tree": "2" * 40},
+            "source_custody": {},
+            "tools": {name: "3" * 64 for name in ci.HOST_TOOLS},
+            "bison_data": {},
+            "dependencies": {},
+            "consumer_inputs": consumer,
+            "command_supervisor": {},
+        }
+        owner = type("Handoff", (), {"ci": ci})
+        events = []
+
+        def recorded(expected, content=False):
+            self.assertIs(expected, consumer)
+            self.assertTrue(content)
+            self.assertIsNone(ci.COMMAND_SUPERVISOR_PATH)
+            events.append("consumer")
+
+        def custody(actual_runtime, expected):
+            self.assertEqual(actual_runtime, runtime)
+            self.assertIs(expected, start)
+            if ci.COMMAND_SUPERVISOR_PATH is None:
+                self.assertEqual(
+                    ci.COMMAND_TOOL_PATHS,
+                    {"git": "/trusted/git"})
+                events.append("custody-before-bind")
+            else:
+                self.assertEqual(
+                    ci.COMMAND_SUPERVISOR_PATH,
+                    "/trusted/supervisor")
+                self.assertEqual(
+                    set(ci.COMMAND_TOOL_PATHS), set(ci.HOST_TOOLS))
+                events.append("custody-after-bind")
+            return expected
+
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
+        original_tools = dict(ci.COMMAND_TOOL_PATHS)
+        original_environment = dict(ci.COMMAND_ENVIRONMENT)
+        try:
+            ci.COMMAND_SUPERVISOR_PATH = None
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_ENVIRONMENT.clear()
+            with mock.patch.object(
+                    ci, "document", return_value=start), \
+                    mock.patch.object(
+                        public_bundle, "source_custody_record"), \
+                    mock.patch.object(
+                        public_bundle, "consumer_input_record"), \
+                    mock.patch.object(
+                        public_bundle, "command_supervisor_record"), \
+                    mock.patch.object(
+                        public_bundle, "dependency_record",
+                        side_effect=lambda *unused: events.append(
+                            "dependency")), \
+                    mock.patch.object(
+                        public_bundle, "require_consumer_tree_roles"), \
+                    mock.patch.object(
+                        public_bundle, "require_public_consumer_paths"), \
+                    mock.patch.object(
+                        ci, "require_recorded_consumer_inputs",
+                        side_effect=recorded), \
+                    mock.patch.object(
+                        ci, "require_recorded_build_custody",
+                        side_effect=custody):
+                self.assertIs(
+                    public_bundle.accepted_public_build_start(
+                        owner, runtime),
+                    start)
+            self.assertEqual(events, [
+                "consumer", "dependency", "custody-before-bind",
+                "custody-after-bind",
+            ])
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_TOOL_PATHS.update(original_tools)
+            ci.COMMAND_ENVIRONMENT.clear()
+            ci.COMMAND_ENVIRONMENT.update(original_environment)
+
+    def test_public_start_missing_or_tampered_consumer_inputs_never_bind(self):
+        runtime = self.root / "public-runtime-refusal"
+        base_files = {
+            **{
+                "tool:" + name: {"path": "/trusted/" + name}
+                for name in ci.HOST_TOOLS
+            },
+            "wamr-source-archive": {"path": "/trusted/wamr.tar"},
+            "command-supervisor": {"path": "/trusted/supervisor"},
+        }
+        consumer = {
+            "files": base_files,
+            "trees": {
+                name: {} for name in (
+                    "bison", "python-stdlib", "zig", "llvm")
+            },
+        }
+        start = {
+            "source": {"revision": "1" * 40, "tree": "2" * 40},
+            "source_custody": {}, "tools": {}, "bison_data": {},
+            "dependencies": {}, "consumer_inputs": consumer,
+            "command_supervisor": {},
+        }
+        owner = type("Handoff", (), {"ci": ci})
+        for case in ("missing", "tampered"):
+            candidate = copy.deepcopy(start)
+            if case == "missing":
+                del candidate["consumer_inputs"]["files"][
+                    "command-supervisor"]
+            with self.subTest(case=case), \
+                    mock.patch.object(
+                        ci, "document", return_value=candidate), \
+                    mock.patch.object(
+                        public_bundle, "source_custody_record"), \
+                    mock.patch.object(
+                        public_bundle, "consumer_input_record"), \
+                    mock.patch.object(
+                        public_bundle, "command_supervisor_record"), \
+                    mock.patch.object(
+                        public_bundle, "require_consumer_tree_roles"), \
+                    mock.patch.object(
+                        public_bundle, "require_public_consumer_paths"), \
+                    mock.patch.object(
+                        ci, "require_recorded_consumer_inputs",
+                        side_effect=(
+                            ci.Refusal("consumer input custody changed")
+                            if case == "tampered" else None)), \
+                    mock.patch.object(
+                        ci, "bind_command_tools") as bind, \
+                    self.assertRaises((ValueError, ci.Refusal)):
+                public_bundle.accepted_public_build_start(owner, runtime)
+            bind.assert_not_called()
+
+    def test_fresh_publication_binds_before_validator_and_rechecks_record(self):
+        repository = self.root / "fresh-publication"
+        (repository / ".d").mkdir(parents=True, mode=0o700)
+        runtime = self.root / "fresh-runtime"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        consumer = {
+            "files": {
+                **{
+                    "tool:" + name: {
+                        "path": "/trusted/" + name,
+                        "metadata": [1, 1, stat.S_IFREG | 0o500,
+                                     1, 1, 1, 1, 1, 1],
+                    }
+                    for name in ci.HOST_TOOLS
+                },
+                "command-supervisor": {
+                    "path": "/trusted/supervisor",
+                    "metadata": [1, 2, stat.S_IFREG | 0o500,
+                                 1, 1, 1, 1, 1, 1],
+                },
+            },
+        }
+        start = {"consumer_inputs": consumer}
+        source = {
+            "repository": "cataggar/unikraft",
+            "run_id": "123", "run_attempt": "1",
+            "source_revision": "1" * 40, "source_tree": "2" * 40,
+            "wamr_revision": ci.REVISION,
+        }
+        validator_record = {"fixture": "fully supervised"}
+        handoff = mock.Mock()
+        handoff.ci = ci
+        events = []
+
+        def accept(unused_handoff, actual_runtime):
+            self.assertEqual(actual_runtime, runtime)
+            self.assertIsNone(ci.COMMAND_SUPERVISOR_PATH)
+            ci.bind_command_tools(consumer)
+            events.append("bound")
+            return start
+
+        def execute(*unused, **kwargs):
+            self.assertEqual(
+                ci.COMMAND_SUPERVISOR_PATH, "/trusted/supervisor")
+            self.assertNotIn("allow_bootstrap", kwargs)
+            events.append("validator")
+            return self.root / "unused-validator.log", validator_record
+
+        def validate(*args):
+            self.assertIs(args[1], validator_record)
+            events.append("validated")
+            return validator_record
+
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
+        original_tools = dict(ci.COMMAND_TOOL_PATHS)
+        original_environment = dict(ci.COMMAND_ENVIRONMENT)
+        try:
+            ci.COMMAND_SUPERVISOR_PATH = None
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_ENVIRONMENT.clear()
+            with mock.patch.object(ci, "REPO", repository), \
+                    mock.patch.object(
+                        public_bundle, "ci_runtime",
+                        return_value=runtime), \
+                    mock.patch.object(
+                        public_bundle, "accepted_public_build_start",
+                        side_effect=accept), \
+                    mock.patch.object(
+                        public_bundle, "ci_context",
+                        return_value=source), \
+                    mock.patch.object(
+                        ci, "read", return_value=b"primary=0 cleanup=0\n"), \
+                    mock.patch.object(
+                        ci, "execute", side_effect=execute), \
+                    mock.patch.object(
+                        ci, "consumer_file_records", return_value={}), \
+                    mock.patch.object(
+                        ci, "native_executable_identity",
+                        side_effect=lambda record: {
+                            "path": record["path"]}), \
+                    mock.patch.object(
+                        ci, "document", return_value=validator_record), \
+                    mock.patch.object(
+                        ci, "require_recorded_build_custody"), \
+                    mock.patch.object(
+                        public_bundle, "supervised_command_record",
+                        side_effect=validate), \
+                    mock.patch.object(
+                        public_bundle, "pack",
+                        return_value="f" * 64), \
+                    mock.patch.object(public_bundle, "import_bundle"):
+                public_bundle.publish_ci(handoff)
+            self.assertEqual(events[:3], [
+                "bound", "validator", "validated"])
+            self.assertEqual(events.count("validated"), 3)
+            handoff.export.assert_called_once()
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_TOOL_PATHS.update(original_tools)
+            ci.COMMAND_ENVIRONMENT.clear()
+            ci.COMMAND_ENVIRONMENT.update(original_environment)
+
+    def test_publication_refuses_bootstrap_validator_record_before_export(self):
+        repository = self.root / "bootstrap-publication"
+        (repository / ".d").mkdir(parents=True, mode=0o700)
+        runtime = self.root / "bootstrap-runtime"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        consumer = {
+            "files": {
+                **{
+                    "tool:" + name: {
+                        "path": "/trusted/" + name,
+                        "metadata": [1, 1, stat.S_IFREG | 0o500,
+                                     1, 1, 1, 1, 1, 1],
+                    }
+                    for name in ci.HOST_TOOLS
+                },
+                "command-supervisor": {
+                    "path": "/trusted/supervisor",
+                    "metadata": [1, 2, stat.S_IFREG | 0o500,
+                                 1, 1, 1, 1, 1, 1],
+                },
+            },
+        }
+        start = {"consumer_inputs": consumer}
+        bootstrap = {
+            "scope": "command_diagnostic_not_acceptance",
+            "stage": "public-validator-build",
+            "exit_code": 0, "bytes": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "over_limit": False, "known_error_markers": [],
+            "supervisor": {
+                "schema": "uk.wamr.command-supervisor-result",
+                "version": 1, "bootstrap": True,
+            },
+        }
+        handoff = mock.Mock()
+        handoff.ci = ci
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
+        try:
+            ci.COMMAND_SUPERVISOR_PATH = None
+            with mock.patch.object(ci, "REPO", repository), \
+                    mock.patch.object(
+                        public_bundle, "ci_runtime",
+                        return_value=runtime), \
+                    mock.patch.object(
+                        public_bundle, "accepted_public_build_start",
+                        return_value=start), \
+                    mock.patch.object(
+                        public_bundle, "ci_context",
+                        return_value={
+                            "repository": "cataggar/unikraft",
+                            "run_id": "123", "run_attempt": "1",
+                            "source_revision": "1" * 40,
+                            "source_tree": "2" * 40,
+                            "wamr_revision": ci.REVISION,
+                        }), \
+                    mock.patch.object(
+                        ci, "read", return_value=b"primary=0 cleanup=0\n"), \
+                    mock.patch.object(
+                        ci, "execute",
+                        return_value=(self.root / "unused", bootstrap)), \
+                    mock.patch.object(
+                        ci, "consumer_file_records", return_value={}), \
+                    mock.patch.object(
+                        ci, "native_executable_identity",
+                        side_effect=lambda record: {
+                            "path": record["path"]}), \
+                    mock.patch.object(
+                        ci, "document", return_value=bootstrap), \
+                    self.assertRaises(ValueError):
+                public_bundle.publish_ci(handoff)
+            handoff.export.assert_not_called()
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
+
     def test_public_bundle_rejects_current_system_bin_tree(self):
         current = {"trees": {
             "bison": {}, "python-stdlib": {}, "zig": {}, "llvm": {},
@@ -478,10 +1030,52 @@ class Evidence(unittest.TestCase):
             public_bundle.require_consumer_tree_roles(current, False)
         public_bundle.require_consumer_tree_roles(current, True)
 
+    def test_current_public_import_requires_independent_inner_zip_digest(self):
+        expected = {
+            "repository": "cataggar/unikraft",
+            "run_id": "35422844896",
+            "run_attempt": "1",
+            "source_revision": "1" * 40,
+            "source_tree": "2" * 40,
+            "wamr_revision": ci.REVISION,
+        }
+        handoff = mock.Mock()
+        handoff.ci = ci
+        with self.assertRaisesRegex(ValueError, "bundle refused"):
+            public_bundle.verify_archive_descriptor(
+                handoff, -1, expected, None)
+
+    def test_public_supervisor_maps_recompute_closures_and_legacy_is_compatible(self):
+        artifact = self.root / "supervisor-map-artifact"
+        self.put(artifact, b"guarded map")
+        record, unused_directories = ci.physical_file_record(artifact)
+        del unused_directories
+        entry = {
+            "bytes": record["metadata"][6],
+            "sha256": record["sha256"],
+            "metadata": record["metadata"],
+        }
+        for suffix in ("source", "runtime"):
+            domain = f"uk.wamr.command-supervisor-{suffix}-v1"
+            guarded = ci.guarded_record_map(domain, {"fixture": entry})
+            self.assertEqual(
+                public_bundle.guarded_map_record(guarded, domain), guarded)
+            tampered = copy.deepcopy(guarded)
+            tampered["content_closure_sha256"] = "0" * 64
+            with self.assertRaises(ValueError):
+                public_bundle.guarded_map_record(tampered, domain)
+        for revision, tree in (
+                public_bundle.LEGACY_V1_SOURCES
+                | public_bundle.PRE_SUPERVISOR_SOURCES):
+            self.assertTrue(public_bundle.pre_supervisor_source({
+                "source_revision": revision, "source_tree": tree,
+            }))
+
     def test_boot_output_slots_preserve_their_shared_parent(self):
         runtime = self.root / "runtime"
         compute = runtime / "compute"
         compute.mkdir(parents=True, mode=0o700)
+        ci.precreate_boot_output_slots(runtime, compute)
         package, configs = ci.prepare_boot_output_slots(runtime, compute)
         parent = ci.snapshot(compute.lstat())
         (package / "artifact").write_bytes(b"package")
@@ -596,8 +1190,8 @@ class Evidence(unittest.TestCase):
         root = self.root / "retained-indirect"
         (root / "private").mkdir(parents=True, mode=0o700)
         executable = root / "tool"
-        original = b"#!/bin/sh\nprintf original\n"
-        replacement = b"#!/bin/sh\nprintf replacement\n"
+        original = Path(SUPERVISOR_FIXTURE).read_bytes()
+        replacement = Path("/usr/bin/false").resolve(strict=True).read_bytes()
         self.put(executable, original)
         executable.chmod(0o700)
         ready = root / "ready"
@@ -606,16 +1200,17 @@ class Evidence(unittest.TestCase):
             "import os,pathlib,subprocess,time\n"
             f"pathlib.Path({str(ready)!r}).touch()\n"
             "time.sleep(0.2)\n"
-            "value=subprocess.check_output([os.environ['WAMR_CI_TOOL_GIT']])\n"
-            f"pathlib.Path({str(consumed)!r}).touch()\n"
+            "try:\n"
+            " value=subprocess.check_output([os.environ['WAMR_CI_TOOL_GIT'],"
+            "'bytes','8','0','0'])\n"
+            "finally:\n"
+            f" pathlib.Path({str(consumed)!r}).touch()\n"
             "time.sleep(0.2)\n"
             "print(value.decode(),end='')\n"
         )
         records = {}
         for path in {
-                Path(ci.tool("timeout")).resolve(strict=True),
-                Path(ci.tool("bash")).resolve(strict=True),
-                Path(ci.tool("head")).resolve(strict=True),
+                Path(ci.COMMAND_SUPERVISOR_PATH).resolve(strict=True),
                 Path(PYTHON).resolve(strict=True),
                 executable}:
             record, unused_directories = ci.physical_file_record(path)
@@ -648,7 +1243,7 @@ class Evidence(unittest.TestCase):
         finally:
             attacker.join(timeout=2)
         self.assertFalse(attacker.is_alive())
-        self.assertEqual(output.read_bytes(), b"original")
+        self.assertEqual(output.read_bytes(), b"oooooooo")
         self.assertEqual(executable.read_bytes(), original)
 
     def test_boot_revalidation_does_not_need_inherited_build_environment(self):
@@ -668,6 +1263,9 @@ class Evidence(unittest.TestCase):
                 mock.patch.object(
                     ci, "consumer_input_state",
                     return_value={"schema": "fixture"}), \
+                mock.patch.object(
+                    ci, "command_supervisor_state",
+                    return_value={"schema": "fixture"}), \
                 mock.patch.object(ci, "dependency_custody",
                                   return_value={"fixture": True}):
             self.assertEqual(ci.producer_inputs(self.root)["bison_data"], expected)
@@ -678,6 +1276,8 @@ class Evidence(unittest.TestCase):
             "files": {
                 "tool:" + name: {"path": "/trusted/" + name}
                 for name in ci.HOST_TOOLS
+            } | {
+                "command-supervisor": {"path": "/trusted/supervisor"},
             },
         }
         initial = {"consumer_inputs": consumer}
@@ -697,6 +1297,7 @@ class Evidence(unittest.TestCase):
 
         with mock.patch.dict(ci.COMMAND_TOOL_PATHS, {}, clear=True), \
                 mock.patch.dict(ci.COMMAND_ENVIRONMENT, {}, clear=True), \
+                mock.patch.object(ci, "COMMAND_SUPERVISOR_PATH", None), \
                 mock.patch.dict(os.environ, {}, clear=False), \
                 mock.patch.object(ci.platform, "machine", return_value="x86_64"), \
                 mock.patch.object(Path, "is_char_device", return_value=True), \
@@ -746,18 +1347,40 @@ class Evidence(unittest.TestCase):
                     )
                 }
                 for name in ci.HOST_TOOLS
+            } | {
+                "command-supervisor": {"path": "/selected/supervisor"},
             }
         }
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
         original_tools = dict(ci.COMMAND_TOOL_PATHS)
         try:
             environment = ci.bind_command_tools(tools)
             self.assertEqual(environment["PATH"], "/usr/bin:/bin")
             self.assertEqual(environment["WAMR_CI_GIT"], "/selected/git")
             self.assertEqual(
+                environment["WAMR_CI_SUPERVISOR"],
+                "/selected/supervisor")
+            self.assertEqual(
                 environment["WAMR_CI_TOOL_DASH"], "/system/dash")
         finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
             ci.COMMAND_TOOL_PATHS.clear()
             ci.COMMAND_TOOL_PATHS.update(original_tools)
+
+    def test_recorded_consumer_revalidation_allows_only_new_roles(self):
+        inputs = self.root / "recorded-consumer-inputs"
+        inputs.mkdir(mode=0o700)
+        tool = inputs / "tool"
+        self.put(tool, b"stable")
+        added_root = inputs / "new-role-root"
+        added_root.mkdir(mode=0o700)
+        expected = ci.record_input_paths({"tool": tool}, {})
+        added = added_root / "new-role"
+        self.put(added, b"new")
+        ci.require_recorded_consumer_inputs(expected)
+        self.put(tool, b"changed")
+        with self.assertRaises(ci.Refusal):
+            ci.require_recorded_consumer_inputs(expected)
 
     def test_compute_dynamic_validator_never_writes_bytecode(self):
         app = self.root / "validator-app"
@@ -818,15 +1441,23 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             "files": {
                 f"tool:{name}": {"path": f"/tools/{name}"}
                 for name in ci.HOST_TOOLS
+            } | {
+                "command-supervisor": {"path": "/tools/supervisor"},
             },
         }
 
-        def restore(runtime_value, root, expected, expected_inputs):
+        def restore(runtime_value, root, expected_inputs):
             events.append("restore")
             self.assertEqual(runtime_value, runtime)
-            self.assertEqual(expected, source)
             self.assertEqual(expected_inputs, consumer)
             return packages
+
+        def supervisor(runtime_value, root, package_tree, expected_inputs):
+            events.append("supervisor")
+            self.assertEqual(runtime_value, runtime)
+            self.assertEqual(package_tree, packages)
+            self.assertEqual(expected_inputs, consumer)
+            return Path("/tools/supervisor")
 
         def inputs(root, expected_consumer=None, content=True):
             events.append("custody")
@@ -837,15 +1468,24 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 "source_custody": source["custody"],
                 "dependencies": {},
                 "consumer_inputs": consumer,
+                "command_supervisor": {"schema": "fixture"},
             }
 
         def command(runtime, expected, root, stage, args, *unused):
             if stage == "config":
                 self.assertEqual(os.environ["KCONFIG_OVERWRITECONFIG"], "1")
                 self.assertEqual(os.environ["M4"], "/tools/m4")
+                self.assertEqual(os.environ["ZIG_LIB_DIR"], "/tools/lib")
             commands.append((stage, list(map(str, args))))
             return root / "private" / (stage + ".log")
 
+        def execute_direct(root, stage, args, *unused, **unused_keywords):
+            self.assertEqual(stage, "zig-version")
+            path = root / "private/zig-version.log"
+            path.write_bytes(b"0.16.0\n")
+            return path, {}
+
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
         original_tools = dict(ci.COMMAND_TOOL_PATHS)
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(
@@ -861,8 +1501,10 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 ("source", {"return_value": source}),
                 ("source_metadata", {"return_value": []}),
                 ("restore_dependencies", {"side_effect": restore}),
+                ("build_command_supervisor", {"side_effect": supervisor}),
                 ("producer_inputs", {"side_effect": inputs}),
                 ("run_custodied", {"side_effect": command}),
+                ("execute", {"side_effect": execute_direct}),
                 ("require_no_config_backup", {}),
                 ("retain_solved_config", {}),
                 ("solved_config", {"return_value": "f" * 64}),
@@ -886,8 +1528,9 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             ci.build(runtime, self.root)
         ci.COMMAND_TOOL_PATHS.clear()
         ci.COMMAND_TOOL_PATHS.update(original_tools)
+        ci.COMMAND_SUPERVISOR_PATH = original_supervisor
 
-        self.assertEqual(events[:2], ["restore", "custody"])
+        self.assertEqual(events[:3], ["restore", "supervisor", "custody"])
         selected = dict(commands)
         for stage in ("adapter", "local-boot-tool"):
             self.assertIn("--system", selected[stage])
@@ -905,19 +1548,16 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         with mock.patch.object(ci, "LOCAL_BOOT", missing), \
                 mock.patch.object(
                     ci, "tracked_manifest",
-                    side_effect=ci.Refusal("pinned dependency manifest unavailable")), \
-                mock.patch.object(ci, "require_source"):
+                    side_effect=ci.Refusal("pinned dependency manifest unavailable")):
             with self.assertRaisesRegex(
                     ci.Refusal, "pinned dependency manifest unavailable"):
                 ci.restore_dependencies(
-                    missing_root.parent, missing_root,
-                    {"source": "fixture"}, {"schema": "fixture"})
+                    missing_root.parent, missing_root, {"schema": "fixture"})
         root = self.root / "restore"
         root.mkdir(mode=0o700)
         for name in ("private", "evidence", "cache", "global-cache"):
             (root / name).mkdir(mode=0o700)
-        with mock.patch.object(ci, "require_source"), \
-                mock.patch.object(ci, "require_consumer_inputs"), \
+        with mock.patch.object(ci, "require_consumer_inputs"), \
                 mock.patch.object(ci, "consumer_file_records",
                                   return_value={}), \
                 mock.patch.object(ci, "execute", return_value=(
@@ -926,8 +1566,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             with self.assertRaisesRegex(
                     ci.Refusal, "private pinned dependency restore required"):
                 ci.restore_dependencies(
-                    root.parent, root, {"source": "fixture"},
-                    {"schema": "fixture"})
+                    root.parent, root, {"schema": "fixture"})
 
     def test_dependency_paths_refuse_outside_or_missing_repository_without_leak(self):
         manifests = {
@@ -965,7 +1604,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 for operation in (
                         lambda: ci.restore_dependencies(
                             restore_root.parent, restore_root,
-                            {"source": "unused"}, {"schema": "fixture"}),
+                            {"schema": "fixture"}),
                         lambda: ci.dependency_custody(custody_root),
                 ):
                     with self.assertRaises(ci.Refusal) as refusal:
@@ -1292,8 +1931,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 "known_error_markers": [],
             }
 
-        with mock.patch.object(ci, "require_source"), \
-                mock.patch.object(ci, "require_consumer_inputs"), \
+        with mock.patch.object(ci, "require_consumer_inputs"), \
                 mock.patch.object(ci, "consumer_file_records",
                                   return_value={}), \
                 mock.patch.object(ci, "tracked_manifest", side_effect=manifest_record), \
@@ -1301,8 +1939,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 self.assertRaisesRegex(
                     ci.Refusal, "copied dependency manifest identity changed"):
             ci.restore_dependencies(
-                root.parent, root, {"source": "fixture"},
-                {"schema": "fixture"})
+                root.parent, root, {"schema": "fixture"})
         self.assertEqual(
             (root / "dependencies/build.zig").read_bytes(),
             manifests["build.zig"],
@@ -1364,11 +2001,15 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 "source_custody": source_record["custody"],
                 "dependencies": dependency,
                 "consumer_inputs": {"schema": "fixture"},
+                "command_supervisor": {"schema": "fixture"},
             }
             target = packages / ci.MIZ_PACKAGE_HASH / "source.zig"
             self.put(target, b"changed before build\n")
             with mock.patch.object(ci, "source", return_value=source_record), \
                     mock.patch.object(ci, "require_consumer_inputs"), \
+                    mock.patch.object(
+                        ci, "command_supervisor_state",
+                        return_value={"schema": "fixture"}), \
                     mock.patch.object(ci, "consumer_file_records",
                                       return_value={}), \
                     mock.patch.object(ci, "run") as command, \
@@ -1385,6 +2026,9 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
 
             with mock.patch.object(ci, "source", return_value=source_record), \
                     mock.patch.object(ci, "require_consumer_inputs"), \
+                    mock.patch.object(
+                        ci, "command_supervisor_state",
+                        return_value={"schema": "fixture"}), \
                     mock.patch.object(ci, "consumer_file_records",
                                       return_value={}), \
                     mock.patch.object(ci, "run", side_effect=mutate), \
@@ -1702,46 +2346,1355 @@ source/generated/
         self.assertLess(time.monotonic() - started, 5)
         self.assertFalse(marker.exists())
 
-    def test_bounded_subprocess_refuses_escaped_descendant_pipe_writer(self):
-        pid_file = self.root / "escaped-descendant.pid"
-        script = (
-            "import os,time\n"
-            f"pid_file={str(pid_file)!r}\n"
-            "pid=os.fork()\n"
-            "if pid:\n"
-            "  raise SystemExit(7)\n"
-            "os.setsid()\n"
-            "with open(pid_file,'w') as stream:\n"
-            "  stream.write(str(os.getpid()))\n"
-            "  stream.flush()\n"
-            "os.write(1,b'held-open\\n')\n"
-            "time.sleep(30)\n"
-        )
-        started = time.monotonic()
-        escaped = None
+    def test_bootstrap_is_explicit_and_has_an_exact_closed_stage_allowlist(self):
+        original = ci.COMMAND_SUPERVISOR_PATH
+        ci.COMMAND_SUPERVISOR_PATH = None
         try:
-            with self.assertRaisesRegex(ci.Refusal, "escaped fixture failed"):
-                ci.bounded_subprocess_output(
-                    [PYTHON, "-c", script], self.root, 1024, 10,
-                    "escaped fixture overflow", "escaped fixture timeout",
-                    "escaped fixture failed",
-                )
-            self.assertLess(
-                time.monotonic() - started,
-                ci.SUBPROCESS_DRAIN_GRACE + 2,
+            with mock.patch.dict(
+                    os.environ,
+                    {"WAMR_CI_SUPERVISOR": "/attacker/supervisor"},
+                    clear=False):
+                with self.assertRaisesRegex(
+                        ci.Refusal, "command supervisor is unavailable"):
+                    ci.execute(
+                        self.root, "public-validator-build",
+                        [PYTHON, "-c", "print('must not run')"])
+            output, record = ci.execute(
+                self.root, "dependency-restore",
+                [PYTHON, "-c", "print('bootstrap')"],
+                allow_bootstrap=True)
+            self.assertEqual(output.read_bytes(), b"bootstrap\n")
+            self.assertTrue(record["supervisor"]["bootstrap"])
+            for stage in (
+                    "dependency-restore-extra", "dependency-hash",
+                    "dependency-hash-128", "adapter", "package",
+                    "public-validator-build"):
+                with self.subTest(stage=stage), self.assertRaisesRegex(
+                        ci.Refusal, "bootstrap stage is not allowed"):
+                    ci.execute(
+                        self.root, stage, [PYTHON, "-c", "pass"],
+                        allow_bootstrap=True)
+            self.assertEqual(
+                ci.BOOTSTRAP_STAGES,
+                frozenset({
+                    "dependency-restore", "supervisor-build",
+                    *(f"dependency-hash-{index:03d}"
+                      for index in range(ci.PACKAGE_MAX_ROOTS)),
+                }),
             )
-            for _ in range(100):
-                if pid_file.exists():
-                    escaped = int(pid_file.read_text())
-                    break
-                time.sleep(0.01)
-            self.assertIsNotNone(escaped)
         finally:
-            if escaped is not None:
-                try:
-                    os.kill(escaped, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            ci.COMMAND_SUPERVISOR_PATH = original
+
+    def test_only_dependency_and_supervisor_construction_request_bootstrap(self):
+        tree = ast.parse((HERE / "run.py").read_text())
+        observed = []
+
+        class Calls(ast.NodeVisitor):
+            def __init__(self):
+                self.functions = []
+
+            def visit_FunctionDef(self, node):
+                self.functions.append(node.name)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            def visit_Call(self, node):
+                if (isinstance(node.func, ast.Name)
+                        and node.func.id in {"execute", "run"}):
+                    enabled = [
+                        keyword for keyword in node.keywords
+                        if keyword.arg == "allow_bootstrap"
+                    ]
+                    if enabled:
+                        if (self.functions[-1] == "run"
+                                and len(enabled) == 1
+                                and isinstance(enabled[0].value, ast.Name)
+                                and enabled[0].value.id
+                                == "allow_bootstrap"):
+                            self.generic_visit(node)
+                            return
+                        self.assert_true(
+                            len(enabled) == 1
+                            and isinstance(enabled[0].value, ast.Constant)
+                            and enabled[0].value.value is True)
+                        observed.append((self.functions[-1], node.lineno))
+                self.generic_visit(node)
+
+            def assert_true(self, value):
+                if not value:
+                    raise AssertionError("nonliteral bootstrap capability")
+
+        Calls().visit(tree)
+        self.assertEqual(
+            [name for name, unused_line in observed],
+            [
+                "verify_package_hashes",
+                "restore_dependencies",
+                "build_command_supervisor",
+            ],
+        )
+        for relative in ("handoff.py", "public_bundle.py"):
+            self.assertNotIn(
+                "allow_bootstrap",
+                (HERE / relative).read_text(),
+            )
+
+    def test_public_command_binding_rehash_and_stage_substitution_are_closed(self):
+        record, identities = self.supervised_binding(
+            "public-validator-build")
+        public_bundle.supervised_command_record(
+            ci, record, "public-validator-build", identities,
+            "trusted_inner_zip")
+        boundary = copy.deepcopy(record)
+        boundary_command = boundary["supervisor"]["result"]["command"]
+        boundary_request = boundary["supervisor"]["request"]
+        boundary_timing = boundary_command["timing"]
+        boundary_timing["primary_completed_ns"] = (
+            boundary_request["primary_deadline_ns"] - 1)
+        boundary_timing["completed_ns"] = (
+            boundary_request["primary_deadline_ns"])
+        boundary_timing["primary_elapsed_ns"] = (
+            boundary_timing["primary_completed_ns"]
+            - boundary_timing["started_ns"])
+        boundary_timing["cleanup_elapsed_ns"] = 1
+        boundary_timing["total_elapsed_ns"] = (
+            boundary_timing["completed_ns"]
+            - boundary_timing["started_ns"])
+        public_bundle.supervised_command_record(
+            ci, self.rehash_supervised_binding(boundary),
+            "public-validator-build", identities, "trusted_inner_zip")
+        mutations = []
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["argv_sha256"] = "0" * 64
+        mutations.append(("digest", changed))
+
+        changed = copy.deepcopy(record)
+        argv = changed["supervisor"]["request"]["argv"]
+        argv[3], argv[4] = argv[4], argv[3]
+        mutations.append(("argv-reorder", self.rehash_supervised_binding(
+            changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["argv"][3] = ci.command_literal(
+            "test")
+        mutations.append(("argument-change", self.rehash_supervised_binding(
+            changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["environment"].append({
+            "name": "LD_PRELOAD",
+            "value": ci.command_path("source", "attacker.so"),
+        })
+        changed["supervisor"]["request"]["environment"].sort(
+            key=lambda item: item["name"])
+        mutations.append(("environment-injection",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        del changed["supervisor"]["request"]["environment"][0]
+        mutations.append(("environment-removal",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["cwd"] = ci.command_path("work")
+        mutations.append(("cwd", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["limits"]["descendants"] = 63
+        mutations.append(("limit", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["timeout_ns"] -= 1
+        mutations.append(("timeout", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["cleanup_deadline_ns"] -= 1
+        mutations.append(("cleanup-deadline",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        request = changed["supervisor"]["request"]
+        request["command_executable"] = copy.deepcopy(
+            request["supervisor"])
+        mutations.append(("executable", self.rehash_supervised_binding(
+            changed)))
+
+        changed = copy.deepcopy(record)
+        changed["stage"] = "adapter"
+        changed["supervisor"]["request"]["stage"] = "adapter"
+        mutations.append(("stage", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["cleanup"] = "deadline"
+        mutations.append(("result", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["descendants"][
+            "identity_validated"] = 1
+        mutations.append(("descendant-summary",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["reap_events"] = 1
+        mutations.append(("reap-count",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["primary_events"] = (
+            changed["supervisor"]["request"]["limits"]["primary_events"] + 1)
+        mutations.append(("primary-count",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["primary_events"] = 0
+        mutations.append(("zero-primary-events",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["cleanup_events"] = (
+            ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN - 1)
+        mutations.append(("short-cleanup-events",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["stdout"]["sha256"] = (
+            "0" * 64)
+        mutations.append(("empty-stream-digest",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["output"][
+            "commitment_sha256"] = "0" * 64
+        mutations.append(("aggregate-output",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["timing"][
+            "primary_completed_ns"] = (
+                changed["supervisor"]["result"]["command"]["timing"][
+                    "started_ns"] - 1)
+        mutations.append(("timing-reset",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        request = changed["supervisor"]["request"]
+        command = changed["supervisor"]["result"]["command"]
+        timing = command["timing"]
+        timing["primary_completed_ns"] = request["primary_deadline_ns"]
+        timing["completed_ns"] = request["primary_deadline_ns"] + 1
+        timing["primary_elapsed_ns"] = (
+            timing["primary_completed_ns"] - timing["started_ns"])
+        timing["cleanup_elapsed_ns"] = 1
+        timing["total_elapsed_ns"] = (
+            timing["completed_ns"] - timing["started_ns"])
+        mutations.append(("success-at-deadline",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        request = changed["supervisor"]["request"]
+        command = changed["supervisor"]["result"]["command"]
+        command["primary"] = {"code": None, "kind": "timeout"}
+        command["primary_deadline_reached"] = True
+        command["termination"] = {"code": 15, "kind": "signal"}
+        timing = command["timing"]
+        timing["primary_completed_ns"] = request["primary_deadline_ns"] - 1
+        timing["completed_ns"] = timing["primary_completed_ns"]
+        timing["primary_elapsed_ns"] = (
+            timing["primary_completed_ns"] - timing["started_ns"])
+        timing["cleanup_elapsed_ns"] = 0
+        timing["total_elapsed_ns"] = (
+            timing["completed_ns"] - timing["started_ns"])
+        mutations.append(("timeout-before-deadline",
+                          self.rehash_supervised_binding(changed)))
+
+        for stream_name, marker in (("stdout", b"o"), ("stderr", b"e")):
+            changed = copy.deepcopy(record)
+            request = changed["supervisor"]["request"]
+            command = changed["supervisor"]["result"]["command"]
+            command["primary"] = {
+                "code": None, "kind": "output_overflow",
+            }
+            size = request["limits"][stream_name + "_bytes"] - 1
+            data = marker * size
+            command[stream_name] = {
+                "bytes": size,
+                "digest_scope": ci.command_digest_scope(size),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "status": "overflow",
+            }
+            stdout = data if stream_name == "stdout" else b""
+            stderr = data if stream_name == "stderr" else b""
+            command["output"] = {
+                "bytes": len(stdout) + len(stderr),
+                "combined_sha256":
+                    hashlib.sha256(stdout + stderr).hexdigest(),
+                "commitment_sha256": ci.command_output_commitment(
+                    len(stdout), hashlib.sha256(stdout).hexdigest(),
+                    len(stderr), hashlib.sha256(stderr).hexdigest()),
+                "digest_scope":
+                    ci.command_digest_scope(len(stdout) + len(stderr)),
+            }
+            changed["bytes"] = command["output"]["bytes"]
+            changed["sha256"] = command["output"]["combined_sha256"]
+            changed["sha256_scope"] = command["output"]["digest_scope"]
+            mutations.append((
+                stream_name + "-overflow-before-fill",
+                self.rehash_supervised_binding(changed),
+            ))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"][
+            "cancellation_observed"] = True
+        mutations.append(("incoherent-outcome",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["canonical_sha256"] = "0" * 64
+        mutations.append(("result-canonical", changed))
+
+        for name, changed in mutations:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                public_bundle.supervised_command_record(
+                    ci, changed, "public-validator-build", identities,
+                    "trusted_inner_zip")
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["issued_ns"] = 10 ** 100
+        with self.assertRaisesRegex(
+                (ci.Refusal, ValueError), "native range"):
+            self.rehash_supervised_binding(changed)
+
+        python_record, python_identities = self.supervised_binding("fixtures")
+        changed = copy.deepcopy(python_record)
+        changed["supervisor"]["request"]["interpreter"] = copy.deepcopy(
+            changed["supervisor"]["request"]["supervisor"])
+        self.rehash_supervised_binding(changed)
+        with self.assertRaises(ValueError):
+            public_bundle.supervised_command_record(
+                ci, changed, "fixtures", python_identities,
+                "trusted_inner_zip")
+
+    def test_public_pre_spawn_state_vectors_are_exact_and_rehashed(self):
+        record, identities = self.supervised_binding(
+            "public-validator-build")
+
+        def fixture(kind):
+            value = copy.deepcopy(record)
+            request = value["supervisor"]["request"]
+            command = value["supervisor"]["result"]["command"]
+            timing = command["timing"]
+            observed = (request["primary_deadline_ns"]
+                        if kind == "timeout"
+                        else timing["started_ns"] + 1)
+            command.update({
+                "cancellation_observed": kind == "cancelled",
+                "cleanup": "not_required",
+                "cleanup_complete": True,
+                "cleanup_events": 0,
+                "descendants": {
+                    "adopted": 0,
+                    "identity_validated": 0,
+                    "limit_exceeded": False,
+                    "observed": 0,
+                    "untracked": False,
+                },
+                "executable_stable": True,
+                "poisoned": False,
+                "primary": {"code": None, "kind": kind},
+                "primary_deadline_reached": kind == "timeout",
+                "primary_events": 0,
+                "reap_events": 0,
+                "termination": {"code": None, "kind": None},
+            })
+            timing.update({
+                "cleanup_elapsed_ns": 0,
+                "completed_ns": observed,
+                "primary_completed_ns": observed,
+                "primary_elapsed_ns": observed - timing["started_ns"],
+                "total_elapsed_ns": observed - timing["started_ns"],
+            })
+            return self.rehash_supervised_binding(value)
+
+        def validate(value):
+            request = value["supervisor"]["request"]
+            command = value["supervisor"]["result"]["command"]
+            return ci.validate_supervisor_state(
+                command, request["limits"], command["timing"], {
+                    "stdout": command["stdout"],
+                    "stderr": command["stderr"],
+                }, request["primary_deadline_ns"],
+                "invalid supervised command binding")
+
+        for kind in (
+                "timeout", "cancelled", "local_io",
+                "snapshot_unsupported"):
+            with self.subTest(valid=kind):
+                validate(fixture(kind))
+
+        valid = fixture("local_io")
+        mutations = []
+
+        changed = copy.deepcopy(valid)
+        command = changed["supervisor"]["result"]["command"]
+        data = b"x"
+        command["stdout"] = {
+            "bytes": len(data),
+            "digest_scope": ci.command_digest_scope(len(data)),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "status": "complete",
+        }
+        command["output"] = {
+            "bytes": len(data),
+            "combined_sha256": hashlib.sha256(data).hexdigest(),
+            "commitment_sha256": ci.command_output_commitment(
+                len(data), command["stdout"]["sha256"],
+                0, ci.EMPTY_SHA256),
+            "digest_scope": ci.command_digest_scope(len(data)),
+        }
+        changed["bytes"] = len(data)
+        changed["sha256"] = command["output"]["combined_sha256"]
+        changed["sha256_scope"] = command["output"]["digest_scope"]
+        mutations.append(("output", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        changed["supervisor"]["result"]["command"]["stdout"][
+            "status"] = "overflow"
+        mutations.append(("overflow", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        changed["supervisor"]["result"]["command"]["termination"] = {
+            "code": 0, "kind": "exited",
+        }
+        mutations.append((
+            "termination", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        command = changed["supervisor"]["result"]["command"]
+        command["primary"] = {"code": 0, "kind": "exited"}
+        command["termination"] = {"code": 0, "kind": "exited"}
+        mutations.append((
+            "primary", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        changed["supervisor"]["result"]["command"][
+            "executable_stable"] = False
+        mutations.append((
+            "executable", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        changed["supervisor"]["result"]["command"]["stdout"][
+            "sha256"] = "0" * 64
+        mutations.append((
+            "empty-hash", self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(valid)
+        command = changed["supervisor"]["result"]["command"]
+        command["timing"]["completed_ns"] += 1
+        command["timing"]["cleanup_elapsed_ns"] = 1
+        command["timing"]["total_elapsed_ns"] += 1
+        mutations.append((
+            "cleanup-time", self.rehash_supervised_binding(changed)))
+
+        for name, changed in mutations:
+            with self.subTest(name=name), self.assertRaises(ci.Refusal):
+                validate(changed)
+            with self.subTest(public=name), self.assertRaises(ValueError):
+                public_bundle.supervised_command_record(
+                    ci, changed, "public-validator-build", identities,
+                    "trusted_inner_zip")
+
+    def test_valid_hosted_command_invariant_vectors(self):
+        vectors = (
+            {
+                "stage": "public-validator-build",
+                "primary_events": 5929, "cleanup_events": 873,
+                "descendants": 0, "bytes": 0,
+                "stdout_bytes": 0, "stdout_sha256": ci.EMPTY_SHA256,
+                "stderr_bytes": 0, "stderr_sha256": ci.EMPTY_SHA256,
+                "combined_sha256": ci.EMPTY_SHA256,
+            },
+            {
+                "stage": "fixtures",
+                "primary_events": 1043, "cleanup_events": 1280,
+                "descendants": 12, "bytes": 11444,
+                "stdout_bytes": 0, "stdout_sha256": ci.EMPTY_SHA256,
+                "stderr_bytes": 11444,
+                "stderr_sha256":
+                    "78ba6ee6302bfc3ded0d6842a07e90323d38f471b5da084077aa76c7240436c0",
+                "combined_sha256":
+                    "78ba6ee6302bfc3ded0d6842a07e90323d38f471b5da084077aa76c7240436c0",
+            },
+            {
+                "stage": "raw-x2apic",
+                "primary_events": 236, "cleanup_events": 889,
+                "descendants": 0, "bytes": 401,
+                "stdout_bytes": 401,
+                "stdout_sha256":
+                    "56fbb15c01cbe0566c52146dafc7974bcde5993ce33ad2b76f49d98d685b7d8e",
+                "stderr_bytes": 0, "stderr_sha256": ci.EMPTY_SHA256,
+                "combined_sha256":
+                    "56fbb15c01cbe0566c52146dafc7974bcde5993ce33ad2b76f49d98d685b7d8e",
+            },
+        )
+        for vector in vectors:
+            with self.subTest(stage=vector["stage"]):
+                record, identities = self.supervised_binding(vector["stage"])
+                command = record["supervisor"]["result"]["command"]
+                command["primary_events"] = vector["primary_events"]
+                command["cleanup_events"] = vector["cleanup_events"]
+                command["descendants"].update({
+                    "adopted": vector["descendants"],
+                    "identity_validated": vector["descendants"],
+                    "observed": vector["descendants"],
+                })
+                command["reap_events"] = vector["descendants"] + 2
+                for name in ("stdout", "stderr"):
+                    size = vector[name + "_bytes"]
+                    command[name] = {
+                        "bytes": size,
+                        "digest_scope": ci.command_digest_scope(size),
+                        "sha256": vector[name + "_sha256"],
+                        "status": "complete",
+                    }
+                command["output"] = {
+                    "bytes": vector["bytes"],
+                    "combined_sha256": vector["combined_sha256"],
+                    "commitment_sha256": ci.command_output_commitment(
+                        vector["stdout_bytes"], vector["stdout_sha256"],
+                        vector["stderr_bytes"], vector["stderr_sha256"]),
+                    "digest_scope":
+                        ci.command_digest_scope(vector["bytes"]),
+                }
+                record["bytes"] = vector["bytes"]
+                record["sha256"] = vector["combined_sha256"]
+                record["sha256_scope"] = ci.command_digest_scope(
+                    vector["bytes"])
+                self.rehash_supervised_binding(record)
+                public_bundle.supervised_command_record(
+                    ci, record, vector["stage"], identities,
+                    "trusted_inner_zip")
+
+    @unittest.skipIf(
+        not SUPERVISOR or not SUPERVISOR_FIXTURE,
+        "native command supervisor fixtures unavailable")
+    def test_native_supervised_record_is_complete_and_cleanup_closed(self):
+        original = ci.COMMAND_SUPERVISOR_PATH
+        supervisor = Path(SUPERVISOR).resolve(strict=True)
+        fixture = Path(SUPERVISOR_FIXTURE).resolve(strict=True)
+        ci.COMMAND_SUPERVISOR_PATH = str(supervisor)
+        try:
+            output, record = ci.execute(
+                self.root, "supervisor-record-fixture",
+                [fixture, "ordinary-child"], 10, 1024,
+                cwd=self.root)
+            pid = int(output.read_text().strip())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+            command = record["supervisor"]["result"]["command"]
+            self.assertGreaterEqual(command["descendants"]["observed"], 1)
+            self.assertGreaterEqual(
+                command["descendants"]["identity_validated"], 1)
+            self.assertEqual(command["cleanup"], "complete")
+            self.assertTrue(command["cleanup_complete"])
+            self.assertFalse(command["poisoned"])
+            self.assertFalse(record["supervisor"]["bootstrap"])
+            substituted = copy.deepcopy(record)
+            substituted["supervisor"] = {
+                "schema": "uk.wamr.command-supervisor-result",
+                "version": 1,
+                "bootstrap": True,
+            }
+            self.assertTrue(substituted["supervisor"]["bootstrap"])
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original
+
+    def test_native_supervisor_cleans_all_ordinary_descendant_shapes(self):
+        self.assertIsNotNone(SUPERVISOR)
+        self.assertIsNotNone(SUPERVISOR_FIXTURE)
+        original = ci.COMMAND_SUPERVISOR_PATH
+        ci.COMMAND_SUPERVISOR_PATH = str(
+            Path(SUPERVISOR).resolve(strict=True))
+        try:
+            for mode in (
+                    "ordinary-child", "setsid-child", "double-fork",
+                    "closed-child"):
+                output, record = ci.execute(
+                    self.root, "descendant-" + mode,
+                    [SUPERVISOR_FIXTURE, mode], 10, 1024,
+                    cwd=self.root, evidence=False)
+                pid = int(output.read_text().strip())
+                with self.subTest(mode=mode):
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+                    command = record["supervisor"]["result"]["command"]
+                    descendants = command["descendants"]
+                    self.assertGreaterEqual(descendants["observed"], 1)
+                    self.assertGreaterEqual(
+                        descendants["identity_validated"], 1)
+                    self.assertTrue(
+                        command["cleanup_complete"])
+                    self.assertEqual(
+                        command["cleanup"], "complete")
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original
+
+    def test_native_supervisor_maps_primary_and_controller_failures(self):
+        self.assertIsNotNone(SUPERVISOR)
+        self.assertIsNotNone(SUPERVISOR_FIXTURE)
+        original = ci.COMMAND_SUPERVISOR_PATH
+        ci.COMMAND_SUPERVISOR_PATH = str(
+            Path(SUPERVISOR).resolve(strict=True))
+        cases = (
+            ("native-timeout", [SUPERVISOR_FIXTURE, "partial"], 0.05, 1024,
+             "timeout"),
+            ("native-overflow",
+             [SUPERVISOR_FIXTURE, "bytes", "4096", "0", "0"],
+             10, 32, "output_overflow"),
+            ("native-nonzero",
+             [SUPERVISOR_FIXTURE, "bytes", "0", "0", "7"],
+             10, 1024, "exited"),
+        )
+        try:
+            for stage, args, seconds, limit, primary in cases:
+                with self.subTest(stage=stage), self.assertRaises(ci.Refusal):
+                    ci.execute(
+                        self.root, stage, args, seconds, limit,
+                        cwd=self.root)
+                record = ci.document(
+                    self.root / "evidence" / ("command-" + stage + ".json"))
+                self.assertEqual(
+                    record["supervisor"]["result"]["command"]["primary"]["kind"],
+                    primary)
+                self.assertTrue(
+                    record["supervisor"]["result"]["command"][
+                        "cleanup_complete"])
+            invalid = self.root / "not-elf"
+            self.put(invalid, b"#!/bin/sh\nexit 0\n")
+            invalid.chmod(0o700)
+            with self.assertRaisesRegex(ci.Refusal, "exec failed"):
+                ci.execute(
+                    self.root, "native-exec-failure", [invalid],
+                    10, 1024, cwd=self.root)
+            record = ci.document(
+                self.root / "evidence/command-native-exec-failure.json")
+            self.assertEqual(
+                record["supervisor"]["result"]["controller_error"],
+                "exec_unsupported")
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original
+
+    def test_native_supervisor_poison_result_tamper_identity_and_environment(self):
+        self.assertIsNotNone(SUPERVISOR)
+        self.assertIsNotNone(SUPERVISOR_FIXTURE)
+        supervisor = Path(SUPERVISOR).resolve(strict=True)
+        fixture = Path(SUPERVISOR_FIXTURE).resolve(strict=True)
+        fixture_record, unused_directories = ci.physical_file_record(fixture)
+        del unused_directories
+        expected = ci.native_executable_identity(fixture_record)
+
+        def invoke(argv, environment=(), limits=None):
+            now = time.monotonic_ns()
+            request = {
+                "argv": [str(fixture), *argv],
+                "cleanup_deadline_ns": now + 5_000_000_000,
+                "cwd": str(self.root),
+                "environment": [
+                    {"name": name, "value": value}
+                    for name, value in sorted(environment)
+                ],
+                "executable": str(fixture),
+                "limits": limits or {
+                    "cleanup_events": 1_000_000,
+                    "descendants": 64,
+                    "primary_events": 1_000_000,
+                    "proc_entries_per_scan": 262_144,
+                    "reap_events": 512,
+                    "stderr_bytes": 4096,
+                    "stdout_bytes": 4096,
+                    "term_grace_ms": 1000,
+                },
+                "primary_deadline_ns": now + 3_000_000_000,
+                "retained_executables": [],
+                "schema": "uk.wamr.command-supervisor-request",
+                "version": 1,
+            }
+            result = subprocess.run(
+                [supervisor], input=ci.canonical_json(request),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={}, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, b"")
+            return result.stdout, request
+
+        raw, request = invoke(["environment"], (("LC_ALL", "C"),))
+        decoded, stdout, stderr = ci.decoded_supervisor_result(
+            raw, request, expected)
+        self.assertEqual(stdout, b"environment-ok\n")
+        self.assertEqual(stderr, b"")
+        self.assertEqual(decoded["command"]["retained_executables"], [])
+        with self.assertRaisesRegex(ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(raw + b" ", request, expected)
+        changed = json.loads(raw)
+        changed["command"]["executable"]["content_sha256"] = "0" * 64
+        with self.assertRaisesRegex(ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(
+                ci.canonical_json(changed), request, expected)
+        mutations = []
+
+        changed = json.loads(raw)
+        changed["command"]["descendants"]["identity_validated"] = 1
+        mutations.append(("descendants", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["stderr_sha256"] = "0" * 64
+        mutations.append(("zero-byte-hash", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["output_sha256"] = "0" * 64
+        mutations.append(("aggregate", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["primary_events"] = (
+            request["limits"]["primary_events"] + 1)
+        mutations.append(("count", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["primary_completed_ns"] = (
+            changed["command"]["started_ns"] - 1)
+        mutations.append(("deadline-order", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["termination"] = {
+            "code": 15, "kind": "signal",
+        }
+        mutations.append(("outcome", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["primary"] = {"code": 256, "kind": "exited"}
+        changed["command"]["termination"] = {"code": 256, "kind": "exited"}
+        mutations.append(("exit-domain", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["primary"] = {"code": 0, "kind": "signal"}
+        changed["command"]["termination"] = {"code": 0, "kind": "signal"}
+        mutations.append(("signal-domain", changed))
+
+        for name, changed in mutations:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    ci.Refusal, "invalid native command result"):
+                ci.decoded_supervisor_result(
+                    ci.canonical_json(changed), request, expected)
+
+        limits = {
+            "cleanup_events": 32,
+            "descendants": 64,
+            "primary_events": 1_000_000,
+            "proc_entries_per_scan": 16,
+            "reap_events": 512,
+            "stderr_bytes": 4096,
+            "stdout_bytes": 4096,
+            "term_grace_ms": 1000,
+        }
+        poisoned_raw, poisoned_request = invoke(
+            ["many-immediate", "32"], limits=limits)
+        poisoned, unused_stdout, unused_stderr = (
+            ci.decoded_supervisor_result(
+                poisoned_raw, poisoned_request, expected))
+        del unused_stdout, unused_stderr
+        command = poisoned["command"]
+        self.assertFalse(command["cleanup_complete"])
+        self.assertTrue(command["poisoned"])
+        self.assertNotEqual(command["cleanup"], "complete")
+
+    @unittest.skipIf(
+        not SUPERVISOR or not SUPERVISOR_FIXTURE,
+        "native command supervisor fixtures unavailable")
+    def test_native_supervisor_state_machine_boundaries_and_rehashed_mutations(self):
+        supervisor = Path(SUPERVISOR).resolve(strict=True)
+        fixture = Path(SUPERVISOR_FIXTURE).resolve(strict=True)
+        fixture_record, unused_directories = ci.physical_file_record(fixture)
+        del unused_directories
+        expected = ci.native_executable_identity(fixture_record)
+
+        def invoke(argv, primary_ms=3000, stream_limit=32):
+            now = time.monotonic_ns()
+            request = {
+                "argv": [str(fixture), *argv],
+                "cleanup_deadline_ns": now + 5_000_000_000,
+                "cwd": str(self.root),
+                "environment": [],
+                "executable": str(fixture),
+                "limits": {
+                    "cleanup_events": 1_000_000,
+                    "descendants": 64,
+                    "primary_events": 1_000_000,
+                    "proc_entries_per_scan": 262_144,
+                    "reap_events": 512,
+                    "stderr_bytes": stream_limit,
+                    "stdout_bytes": stream_limit,
+                    "term_grace_ms": 1000,
+                },
+                "primary_deadline_ns": now + primary_ms * 1_000_000,
+                "retained_executables": [],
+                "schema": "uk.wamr.command-supervisor-request",
+                "version": 1,
+            }
+            result = subprocess.run(
+                [supervisor], input=ci.canonical_json(request),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={}, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, b"")
+            return result.stdout, request
+
+        fast_raw, fast_request = invoke(["bytes", "0", "0", "0"])
+        fast, unused_stdout, unused_stderr = ci.decoded_supervisor_result(
+            fast_raw, fast_request, expected)
+        del unused_stdout, unused_stderr
+        self.assertGreaterEqual(
+            fast["command"]["primary_events"],
+            ci.COMMAND_COMPLETE_PRIMARY_EVENTS_MIN)
+        self.assertGreaterEqual(
+            fast["command"]["cleanup_events"],
+            ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN)
+        boundary = copy.deepcopy(fast)
+        boundary["command"]["primary_events"] = (
+            ci.COMMAND_COMPLETE_PRIMARY_EVENTS_MIN)
+        boundary["command"]["cleanup_events"] = (
+            ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN)
+        ci.decoded_supervisor_result(
+            ci.canonical_json(boundary), fast_request, expected)
+        early_raw, early_request = invoke(
+            ["bytes", "0", "0", "0"], primary_ms=-1)
+        early, unused_stdout, unused_stderr = ci.decoded_supervisor_result(
+            early_raw, early_request, expected)
+        del unused_stdout, unused_stderr
+        early_command = early["command"]
+        self.assertEqual(early_command["cleanup"], "not_required")
+        self.assertEqual(early_command["primary_events"], 0)
+        self.assertEqual(early_command["cleanup_events"], 0)
+        self.assertEqual(early_command["reap_events"], 0)
+        self.assertEqual(early_command["stdout_bytes"], 0)
+        self.assertEqual(early_command["stderr_bytes"], 0)
+        self.assertEqual(early_command["stdout_status"], "complete")
+        self.assertEqual(early_command["stderr_status"], "complete")
+        self.assertEqual(early_command["stdout_sha256"], ci.EMPTY_SHA256)
+        self.assertEqual(early_command["stderr_sha256"], ci.EMPTY_SHA256)
+        self.assertEqual(
+            early_command["output_sha256"],
+            ci.command_output_commitment(
+                0, ci.EMPTY_SHA256, 0, ci.EMPTY_SHA256))
+        self.assertEqual(
+            early_command["termination"], {"code": None, "kind": None})
+        self.assertTrue(early_command["executable_stable"])
+        self.assertEqual(
+            early_command["primary_completed_ns"],
+            early_command["completed_ns"])
+
+        def pre_spawn_fixture(kind):
+            value = copy.deepcopy(early)
+            request = copy.deepcopy(early_request)
+            command = value["command"]
+            started = command["started_ns"]
+            request["primary_deadline_ns"] = started + 1000
+            request["cleanup_deadline_ns"] = started + 2000
+            if kind == "timeout":
+                observed = request["primary_deadline_ns"]
+            else:
+                observed = started + 1
+            command.update({
+                "cancellation_observed": kind == "cancelled",
+                "completed_ns": observed,
+                "primary": {"code": None, "kind": kind},
+                "primary_completed_ns": observed,
+                "primary_deadline_reached": kind == "timeout",
+            })
+            request_raw = ci.validate_supervisor_request(request)
+            value["request_bytes"] = len(request_raw)
+            value["request_sha256"] = hashlib.sha256(
+                request_raw).hexdigest()
+            return value, request
+
+        for kind in (
+                "timeout", "cancelled", "local_io",
+                "snapshot_unsupported"):
+            value, request = pre_spawn_fixture(kind)
+            with self.subTest(valid_pre_spawn=kind):
+                ci.decoded_supervisor_result(
+                    ci.canonical_json(value), request, expected)
+
+        def leader_tracking_fixture(offset):
+            value = copy.deepcopy(early)
+            request = copy.deepcopy(early_request)
+            command = value["command"]
+            started = command["started_ns"]
+            request["primary_deadline_ns"] = started + 1000
+            request["cleanup_deadline_ns"] = started + 2000
+            observed = request["primary_deadline_ns"] + offset
+            command.update({
+                "cancellation_observed": False,
+                "cleanup": "complete",
+                "cleanup_complete": True,
+                "cleanup_events":
+                    ci.COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN,
+                "completed_ns": observed + 1,
+                "poisoned": False,
+                "primary": {
+                    "code": None,
+                    "kind": "local_io" if offset < 0 else "timeout",
+                },
+                "primary_completed_ns": observed,
+                "primary_deadline_reached": offset >= 0,
+                "primary_events": 0,
+                "reap_events": 2,
+                "stderr_status": "complete",
+                "stdout_status": "complete",
+                "termination": {"code": 9, "kind": "signal"},
+            })
+            request_raw = ci.validate_supervisor_request(request)
+            value["request_bytes"] = len(request_raw)
+            value["request_sha256"] = hashlib.sha256(
+                request_raw).hexdigest()
+            return value, request
+
+        self.assertEqual(ci.COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN, 4)
+        for offset in (-1, 0, 1):
+            value, request = leader_tracking_fixture(offset)
+            with self.subTest(leader_tracking_offset=offset):
+                decoded, stdout, stderr = ci.decoded_supervisor_result(
+                    ci.canonical_json(value), request, expected)
+                command = decoded["command"]
+                self.assertEqual(stdout, b"")
+                self.assertEqual(stderr, b"")
+                self.assertEqual(command["cleanup"], "complete")
+                self.assertTrue(command["cleanup_complete"])
+                self.assertFalse(command["poisoned"])
+                self.assertEqual(command["reap_events"], 2)
+                self.assertEqual(
+                    command["termination"],
+                    {"code": 9, "kind": "signal"})
+                self.assertEqual(
+                    command["primary"]["kind"],
+                    "local_io" if offset < 0 else "timeout")
+                self.assertEqual(
+                    command["primary_completed_ns"],
+                    request["primary_deadline_ns"] + offset)
+
+        equality, equality_request = leader_tracking_fixture(0)
+        equality["command"]["primary"] = {
+            "code": None, "kind": "local_io",
+        }
+        equality["command"]["primary_deadline_reached"] = False
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(
+                ci.canonical_json(equality), equality_request, expected)
+
+        before, before_request = leader_tracking_fixture(-1)
+        before["command"]["primary"] = {
+            "code": None, "kind": "timeout",
+        }
+        before["command"]["primary_deadline_reached"] = True
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(
+                ci.canonical_json(before), before_request, expected)
+
+        incomplete_gate, incomplete_gate_request = (
+            leader_tracking_fixture(-1))
+        incomplete_gate["command"]["cleanup_events"] = (
+            ci.COMMAND_PRE_RELEASE_CLEANUP_EVENTS_MIN - 1)
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(
+                ci.canonical_json(incomplete_gate),
+                incomplete_gate_request, expected)
+
+        exact_negatives = []
+        valid, valid_request = pre_spawn_fixture("local_io")
+
+        changed = copy.deepcopy(valid)
+        command = changed["command"]
+        raw_stdout = b"x"
+        command["stdout_base64"] = base64.b64encode(
+            raw_stdout).decode("ascii")
+        command["stdout_bytes"] = len(raw_stdout)
+        command["stdout_sha256"] = hashlib.sha256(raw_stdout).hexdigest()
+        command["output_sha256"] = ci.command_output_commitment(
+            len(raw_stdout), command["stdout_sha256"],
+            0, ci.EMPTY_SHA256)
+        exact_negatives.append(("not-required-output", changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["stdout_status"] = "overflow"
+        exact_negatives.append(("not-required-overflow", changed))
+
+        for kind, code in (
+                ("exited", 0), ("signal", 15), ("unknown", 0)):
+            changed = copy.deepcopy(valid)
+            changed["command"]["primary"] = {
+                "code": code, "kind": kind,
+            }
+            changed["command"]["termination"] = {
+                "code": code, "kind": kind,
+            }
+            exact_negatives.append(("not-required-" + kind, changed))
+
+        for kind in (
+                "output_overflow", "exec_failed", "event_limit",
+                "executable_changed"):
+            changed = copy.deepcopy(valid)
+            changed["command"]["primary"] = {
+                "code": None, "kind": kind,
+            }
+            if kind == "event_limit":
+                changed["command"]["primary_events"] = (
+                    valid_request["limits"]["primary_events"])
+            if kind == "executable_changed":
+                changed["command"]["executable_stable"] = False
+                changed["command"]["termination"] = {
+                    "code": 0, "kind": "exited",
+                }
+            exact_negatives.append(("not-required-" + kind, changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["termination"] = {
+            "code": 0, "kind": "exited",
+        }
+        exact_negatives.append(("not-required-termination", changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["executable_stable"] = False
+        exact_negatives.append(("not-required-mutated-executable", changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["stdout_sha256"] = "0" * 64
+        changed["command"]["output_sha256"] = ci.command_output_commitment(
+            0, "0" * 64, 0, ci.EMPTY_SHA256)
+        exact_negatives.append(("not-required-empty-hash", changed))
+
+        changed = copy.deepcopy(valid)
+        changed["command"]["completed_ns"] += 1
+        exact_negatives.append(("not-required-cleanup-time", changed))
+
+        for name, changed in exact_negatives:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    ci.Refusal, "invalid native command result"):
+                ci.decoded_supervisor_result(
+                    ci.canonical_json(changed),
+                    valid_request, expected)
+
+        for name, fields in (
+                ("zero-events", {
+                    "primary_events": 0,
+                    "cleanup_events": 0,
+                }),
+                ("short-cleanup", {
+                    "cleanup_events":
+                        ci.COMMAND_COMPLETE_CLEANUP_EVENTS_MIN - 1,
+                })):
+            changed = copy.deepcopy(fast)
+            changed["command"].update(fields)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    ci.Refusal, "invalid native command result"):
+                ci.decoded_supervisor_result(
+                    ci.canonical_json(changed), fast_request, expected)
+
+        timeout_raw, timeout_request = invoke(
+            ["partial"], primary_ms=50, stream_limit=128)
+        timeout, unused_stdout, unused_stderr = (
+            ci.decoded_supervisor_result(
+                timeout_raw, timeout_request, expected))
+        del unused_stdout, unused_stderr
+        self.assertEqual(
+            timeout["command"]["primary"],
+            {"code": None, "kind": "timeout"})
+        self.assertGreaterEqual(
+            timeout["command"]["primary_completed_ns"],
+            timeout_request["primary_deadline_ns"])
+        equality = copy.deepcopy(timeout)
+        equality["command"]["primary_completed_ns"] = (
+            timeout_request["primary_deadline_ns"])
+        ci.decoded_supervisor_result(
+            ci.canonical_json(equality), timeout_request, expected)
+        before = copy.deepcopy(equality)
+        before["command"]["primary_completed_ns"] -= 1
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(
+                ci.canonical_json(before), timeout_request, expected)
+
+        def truncate_stream(value, stream_name):
+            command = value["command"]
+            raw = base64.b64decode(
+                command[stream_name + "_base64"], validate=True)[:-1]
+            command[stream_name + "_base64"] = (
+                base64.b64encode(raw).decode("ascii"))
+            command[stream_name + "_bytes"] = len(raw)
+            command[stream_name + "_sha256"] = (
+                hashlib.sha256(raw).hexdigest())
+            stdout = base64.b64decode(
+                command["stdout_base64"], validate=True)
+            stderr = base64.b64decode(
+                command["stderr_base64"], validate=True)
+            command["output_sha256"] = ci.command_output_commitment(
+                len(stdout), hashlib.sha256(stdout).hexdigest(),
+                len(stderr), hashlib.sha256(stderr).hexdigest())
+
+        overflow_cases = (
+            ("stdout", ["bytes", "33", "5", "0"], "stdout"),
+            ("stderr", ["bytes", "5", "33", "0"], "stderr"),
+            ("combined", ["bytes", "33", "33", "0"], "stderr"),
+        )
+        for name, argv, mutated_stream in overflow_cases:
+            raw, request = invoke(argv)
+            decoded, stdout, stderr = ci.decoded_supervisor_result(
+                raw, request, expected)
+            command = decoded["command"]
+            with self.subTest(name=name):
+                self.assertEqual(
+                    command["primary"],
+                    {"code": None, "kind": "output_overflow"})
+                for stream_name, captured in (
+                        ("stdout", stdout), ("stderr", stderr)):
+                    if command[stream_name + "_status"] == "overflow":
+                        self.assertEqual(
+                            len(captured),
+                            request["limits"][stream_name + "_bytes"])
+                if name == "stdout":
+                    self.assertLess(
+                        len(stderr), request["limits"]["stderr_bytes"])
+                elif name == "stderr":
+                    self.assertLess(
+                        len(stdout), request["limits"]["stdout_bytes"])
+                else:
+                    self.assertEqual(command["stdout_status"], "overflow")
+                    self.assertEqual(command["stderr_status"], "overflow")
+                changed = copy.deepcopy(decoded)
+                truncate_stream(changed, mutated_stream)
+                with self.assertRaisesRegex(
+                        ci.Refusal, "invalid native command result"):
+                    ci.decoded_supervisor_result(
+                        ci.canonical_json(changed), request, expected)
+
+    @unittest.skipIf(
+        not SUPERVISOR or not SUPERVISOR_FIXTURE,
+        "native command supervisor fixtures unavailable")
+    def test_python_native_canonical_unicode_vectors_and_byte_limits(self):
+        supervisor = Path(SUPERVISOR).resolve(strict=True)
+        fixture = Path(SUPERVISOR_FIXTURE).resolve(strict=True)
+        fixture_record, unused_directories = ci.physical_file_record(fixture)
+        del unused_directories
+        expected = ci.native_executable_identity(fixture_record)
+        nfc = self.root / "unicode-\u00e9-\U0001f600"
+        nfd = self.root / "unicode-e\u0301-\U0001f600"
+        nfc.mkdir(mode=0o700)
+        nfd.mkdir(mode=0o700)
+
+        def request(cwd, marker):
+            now = time.monotonic_ns()
+            return {
+                "argv": [
+                    str(fixture), "environment",
+                    "\u03bb-" + marker, "\U0001f600",
+                ],
+                "cleanup_deadline_ns": now + 5_000_000_000,
+                "cwd": str(cwd),
+                "environment": [
+                    {"name": "LC_ALL", "value": "C"},
+                    {"name": "UNICODE_\u00c4",
+                     "value": "BMP-\u03bb-NONBMP-\U0001f600-" + marker},
+                ],
+                "executable": str(fixture),
+                "limits": {
+                    "cleanup_events": 1_000_000,
+                    "descendants": 64,
+                    "primary_events": 1_000_000,
+                    "proc_entries_per_scan": 262_144,
+                    "reap_events": 512,
+                    "stderr_bytes": 4096,
+                    "stdout_bytes": 4096,
+                    "term_grace_ms": 1000,
+                },
+                "primary_deadline_ns": now + 3_000_000_000,
+                "retained_executables": [],
+                "schema": "uk.wamr.command-supervisor-request",
+                "version": 1,
+            }
+
+        def invoke(value, raw=None):
+            encoded = ci.validate_supervisor_request(value) if raw is None else raw
+            result = subprocess.run(
+                [supervisor], input=encoded, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env={}, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, b"")
+            return result.stdout, encoded
+
+        nfc_request = request(nfc, "\u00e9")
+        nfd_request = request(nfd, "e\u0301")
+        nfc_raw = ci.validate_supervisor_request(nfc_request)
+        nfd_raw = ci.validate_supervisor_request(nfd_request)
+        self.assertIn("\u00e9".encode(), nfc_raw)
+        self.assertIn("e\u0301".encode(), nfd_raw)
+        self.assertNotEqual(nfc_raw, nfd_raw)
+        self.assertNotEqual(
+            hashlib.sha256(nfc_raw).hexdigest(),
+            hashlib.sha256(nfd_raw).hexdigest())
+
+        for name, value in (("nfc", nfc_request), ("nfd", nfd_request)):
+            with self.subTest(vector=name):
+                raw, request_raw = invoke(value)
+                decoded, stdout, stderr = ci.decoded_supervisor_result(
+                    raw, value, expected)
+                self.assertEqual(stdout, b"environment-ok\n")
+                self.assertEqual(stderr, b"")
+                self.assertEqual(
+                    decoded["request_sha256"],
+                    hashlib.sha256(request_raw).hexdigest())
+
+        escaped = (
+            json.dumps(
+                nfc_request, ensure_ascii=True, sort_keys=True,
+                separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        self.assertNotEqual(escaped, nfc_raw)
+        escaped_result, unused = invoke(nfc_request, escaped)
+        del unused
+        escaped_value = json.loads(escaped_result)
+        self.assertEqual(escaped_value["controller_error"],
+                         "noncanonical_request")
+        self.assertIsNone(escaped_value["request_sha256"])
+
+        invalid_surrogate = copy.deepcopy(nfc_request)
+        invalid_surrogate["argv"].append("\ud800")
+        with self.assertRaisesRegex(ci.Refusal, "valid Unicode"):
+            ci.canonical_json(invalid_surrogate)
+        surrogate_raw = (
+            json.dumps(
+                invalid_surrogate, ensure_ascii=True, sort_keys=True,
+                separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        surrogate_result, unused = invoke(nfc_request, surrogate_raw)
+        del unused
+        self.assertEqual(
+            json.loads(surrogate_result)["controller_error"],
+            "invalid_request")
+        non_utf8_result, unused = invoke(nfc_request, b"\xff\n")
+        del unused
+        self.assertEqual(
+            json.loads(non_utf8_result)["controller_error"],
+            "invalid_request")
+
+        boundary = copy.deepcopy(nfc_request)
+        boundary["cwd"] = "/" + "\u00e9" * 2047 + "a"
+        self.assertEqual(
+            len(boundary["cwd"].encode("utf-8")), ci.COMMAND_STRING_MAX)
+        boundary_result, unused = invoke(boundary)
+        del unused
+        self.assertEqual(
+            json.loads(boundary_result)["controller_error"],
+            "cwd_unavailable")
+        excess = copy.deepcopy(boundary)
+        excess["cwd"] += "a"
+        self.assertEqual(
+            len(excess["cwd"].encode("utf-8")),
+            ci.COMMAND_STRING_MAX + 1)
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command request"):
+            ci.validate_supervisor_request(excess)
+        excess_result, unused = invoke(
+            nfc_request, ci.canonical_json(excess))
+        del unused
+        self.assertEqual(
+            json.loads(excess_result)["controller_error"],
+            "invalid_request")
+
+    def test_native_schema_integer_boundaries_refuse_first_excess(self):
+        identity = {
+            "content_sha256": "0" * 64,
+            "ctime_nanoseconds": 999_999_999,
+            "ctime_seconds": -(1 << 63),
+            "device_major": (1 << 32) - 1,
+            "device_minor": (1 << 32) - 1,
+            "inode": (1 << 64) - 1,
+            "mode": (1 << 16) - 1,
+            "mtime_nanoseconds": 999_999_999,
+            "mtime_seconds": (1 << 63) - 1,
+            "size": (1 << 64) - 1,
+            "uid": (1 << 32) - 1,
+        }
+        self.assertEqual(
+            ci.validate_native_executable_identity(
+                identity, "invalid identity"),
+            identity)
+        for field, value in (
+                ("ctime_nanoseconds", 1 << 32),
+                ("ctime_seconds", 1 << 63),
+                ("device_major", 1 << 32),
+                ("inode", 1 << 64),
+                ("mode", 1 << 16),
+                ("uid", 1 << 32)):
+            changed = copy.deepcopy(identity)
+            changed[field] = value
+            with self.subTest(field=field), self.assertRaises(ci.Refusal):
+                ci.validate_native_executable_identity(
+                    changed, "invalid identity")
+        with self.assertRaisesRegex(ci.Refusal, "native range"):
+            ci.canonical_json({"huge": 10 ** 100})
+        maximum_limits = {
+            "cleanup_events": 10_000_000,
+            "descendants": 256,
+            "primary_events": 10_000_000,
+            "proc_entries_per_scan": 1_000_000,
+            "reap_events": 1024,
+            "stderr_bytes": ci.COMMAND_STREAM_MAX,
+            "stdout_bytes": ci.COMMAND_STREAM_MAX,
+            "term_grace_ms": 10_000,
+        }
+        self.assertEqual(
+            ci.validate_supervisor_limits(maximum_limits, "invalid limits"),
+            maximum_limits)
+        for field, value in (
+                ("cleanup_events", 10_000_001),
+                ("descendants", 257),
+                ("primary_events", 10_000_001),
+                ("proc_entries_per_scan", 1_000_001),
+                ("reap_events", 1025),
+                ("stderr_bytes", ci.COMMAND_STREAM_MAX + 1),
+                ("stdout_bytes", ci.COMMAND_STREAM_MAX + 1),
+                ("term_grace_ms", 10_001)):
+            changed = copy.deepcopy(maximum_limits)
+            changed[field] = value
+            with self.subTest(limit=field), self.assertRaises(ci.Refusal):
+                ci.validate_supervisor_limits(changed, "invalid limits")
+        minimum_limits = {
+            "cleanup_events": 32,
+            "descendants": 1,
+            "primary_events": 16,
+            "proc_entries_per_scan": 16,
+            "reap_events": 4,
+            "stderr_bytes": 1,
+            "stdout_bytes": 1,
+            "term_grace_ms": 1,
+        }
+        self.assertEqual(
+            ci.validate_supervisor_limits(minimum_limits, "invalid limits"),
+            minimum_limits)
+        for field, value in (
+                ("cleanup_events", 31),
+                ("descendants", 0),
+                ("primary_events", 15),
+                ("proc_entries_per_scan", 15),
+                ("reap_events", 3),
+                ("stderr_bytes", 0),
+                ("stdout_bytes", 0),
+                ("term_grace_ms", 0)):
+            changed = copy.deepcopy(minimum_limits)
+            changed[field] = value
+            with self.subTest(minimum=field), self.assertRaises(ci.Refusal):
+                ci.validate_supervisor_limits(changed, "invalid limits")
 
     def test_execute_drops_ambient_loader_shell_python_and_make_injection(self):
         root = self.root / "closed-command-environment"

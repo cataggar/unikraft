@@ -23,6 +23,8 @@ TOOLS = Path(os.environ["WAMR_DIRECT_TOOLS"]).resolve(strict=True)
 VALIDATOR = TOOLS / "uk-wamr-direct-validate"
 FAKE = TOOLS / "wamr-direct-fixture-cli"
 CONTROLLER = TOOLS / "wamr-direct-controller-fixture"
+SUPERVISOR = Path(
+    os.environ["WAMR_CI_SUPERVISOR"]).resolve(strict=True)
 SDK = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 OWNER = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"
 SUBSCRIPTION = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"
@@ -30,6 +32,7 @@ spec = importlib.util.spec_from_file_location(
     "wamr_handoff", REPO / "support/build/wamr-native-ci/handoff.py")
 handoff = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(handoff)
+handoff.ci.COMMAND_SUPERVISOR_PATH = str(SUPERVISOR)
 public_spec = importlib.util.spec_from_file_location(
     "wamr_public_bundle", REPO / "support/build/wamr-native-ci/public_bundle.py")
 public_bundle = importlib.util.module_from_spec(public_spec)
@@ -736,8 +739,8 @@ class Compute(unittest.TestCase):
                                 files=files)
         write(app / "build/artifacts/identity.json", runtime_identity)
         source = dict(
-            revision=ci.git("rev-parse", "HEAD"),
-            tree=ci.git("rev-parse", "HEAD^{tree}"),
+            revision="3c6d5d98dc5736d86e97884184b26be39c3f11d5",
+            tree="feb57a66615a6083378c7261e1e53c37730e0650",
         )
         image_identity = dict(
             unikraft_revision=source["revision"],
@@ -755,6 +758,7 @@ class Compute(unittest.TestCase):
         for name in ("bash", "head", "timeout"):
             consumer_files[f"tool:{name}"] = Path(ci.tool(name))
         consumer_files["wamr-source-archive"] = source_archive
+        consumer_files["command-supervisor"] = SUPERVISOR
         consumer_inputs = ci.record_input_paths(
             consumer_files,
             {name: root / "tools/consumer-tree"
@@ -887,15 +891,17 @@ class Compute(unittest.TestCase):
         for name in ("subscription.json", "sas.txt", "credentials", "extra"):
             write(stage / name, b"must never be published")
             with self.subTest(member=name), self.assertRaises(ValueError):
-                public_bundle.pack(handoff, stage, archive, source, VALIDATOR)
+                public_bundle.pack(
+                    handoff, stage, archive, source, VALIDATOR, SUPERVISOR)
             (stage / name).unlink()
             self.assertFalse(archive.exists())
         (stage / "unexpected-link").symlink_to(stage / "artifacts/raw")
         with self.assertRaises(ValueError):
-            public_bundle.pack(handoff, stage, archive, source, VALIDATOR)
+            public_bundle.pack(
+                handoff, stage, archive, source, VALIDATOR, SUPERVISOR)
         (stage / "unexpected-link").unlink()
         archive_sha256 = public_bundle.pack(
-            handoff, stage, archive, source, VALIDATOR)
+            handoff, stage, archive, source, VALIDATOR, SUPERVISOR)
         portable = public_bundle.verify_archive(
             handoff, archive, source, archive_sha256)
         with self.assertRaises(ValueError):
@@ -928,7 +934,8 @@ class Compute(unittest.TestCase):
             delivered.publication_records(handoff, stage, source)
         output = self.root / "imported"
         imported = public_bundle.import_bundle(
-            handoff, archive, output, source, archive_sha256, VALIDATOR)
+            handoff, archive, output, source, archive_sha256,
+            VALIDATOR, SUPERVISOR)
         self.assertEqual(imported["authority"], "not_admitted")
         self.assertEqual((output / "artifacts/vhd").read_bytes(), (stage / "artifacts/vhd").read_bytes())
         self.assertEqual(handoff.plan(output / "bundle.json", self.root / "public-plan.json")["authority"],
@@ -1002,7 +1009,8 @@ class Compute(unittest.TestCase):
         with self.assertRaises(ValueError):
             public_bundle.import_bundle(
                 handoff, bad, failed, source,
-                handoff.ci.digest(bad, public_bundle.MAX_TOTAL), VALIDATOR)
+                handoff.ci.digest(bad, public_bundle.MAX_TOTAL),
+                VALIDATOR, SUPERVISOR)
         self.assertFalse((failed / "bundle.json").exists())
 
         def rewritten_archive(label, mutate):
@@ -1072,7 +1080,7 @@ class Compute(unittest.TestCase):
                     handoff, changed_archive, changed_output, source,
                     handoff.ci.digest(
                         changed_archive, public_bundle.MAX_TOTAL),
-                    VALIDATOR)
+                    VALIDATOR, SUPERVISOR)
             self.assertFalse((changed_output / "bundle.json").exists())
 
         def mutate_git_oid(start):
@@ -1104,7 +1112,7 @@ class Compute(unittest.TestCase):
             with self.subTest(custody=label), self.assertRaises(ValueError):
                 public_bundle.import_bundle(
                     handoff, changed_archive, changed_output, source,
-                    changed_sha256, VALIDATOR)
+                    changed_sha256, VALIDATOR, SUPERVISOR)
             self.assertFalse((changed_output / "bundle.json").exists())
             with self.subTest(external=label), self.assertRaises(ValueError):
                 public_bundle.verify_archive(
@@ -1144,7 +1152,9 @@ class Compute(unittest.TestCase):
         def copied_stage(name):
             target = self.root / name
             shutil.copytree(stage, target)
-            (target / "private/native-revalidation.log").unlink()
+            for command in (
+                    "native-revalidation", "supervisor-import-identity"):
+                (target / "private" / (command + ".log")).unlink()
             (target / "evidence/command-native-revalidation.json").unlink()
             copied = read(target / "bundle.json")
             for item in copied["artifacts"] + copied["evidence"] + [
@@ -1287,15 +1297,42 @@ class Compute(unittest.TestCase):
                 image_identity=old_image_identity, identity=old_source,
                 legacy_v1=True)
             old_archive = self.root / f"old-v1-{index}.zip"
-            delivered.pack(
-                handoff, old_stage, old_archive, old_source, VALIDATOR)
-            public_bundle.verify_archive(
-                handoff, old_archive, old_source, None)
-            public_bundle.publication_records(
-                handoff, old_stage, old_source)
-            old_output = self.root / f"old-v1-imported-{index}"
-            delivered.import_bundle(
-                handoff, old_archive, old_output, old_source, VALIDATOR)
+            current_inspect = (
+                old_stage / "evidence/command-handoff-inspect-legacy.json",
+                old_stage / "private/handoff-inspect-legacy.log",
+            )
+            delivered_inspect = (
+                old_stage / "evidence/command-handoff-inspect.json",
+                old_stage / "private/handoff-inspect.log",
+            )
+            for current, historical in zip(
+                    current_inspect, delivered_inspect):
+                current.rename(historical)
+            def supervised_legacy_native(
+                    legacy_handoff, validator, legacy_bundle):
+                return public_bundle.native(
+                    legacy_handoff, validator, SUPERVISOR,
+                    legacy_bundle, old_source)
+
+            with mock.patch.object(
+                    delivered, "native",
+                    side_effect=supervised_legacy_native):
+                try:
+                    delivered.pack(
+                        handoff, old_stage, old_archive,
+                        old_source, VALIDATOR)
+                finally:
+                    for current, historical in zip(
+                            current_inspect, delivered_inspect):
+                        historical.rename(current)
+                public_bundle.verify_archive(
+                    handoff, old_archive, old_source, None)
+                public_bundle.publication_records(
+                    handoff, old_stage, old_source, "producer_direct")
+                old_output = self.root / f"old-v1-imported-{index}"
+                delivered.import_bundle(
+                    handoff, old_archive, old_output,
+                    old_source, VALIDATOR)
             self.assertNotIn(
                 "dependencies",
                 read(old_output / "evidence/build-start.json"),
@@ -1329,7 +1366,7 @@ class Compute(unittest.TestCase):
         with self.assertRaises(ValueError):
             public_bundle.pack(
                 handoff, unrelated_stage, self.root / "unrelated-v1.zip",
-                unrelated_source, VALIDATOR)
+                unrelated_source, VALIDATOR, SUPERVISOR)
 
     def public_archive_descriptor_races(
             self, archive, source, archive_sha256):
@@ -1384,7 +1421,8 @@ class Compute(unittest.TestCase):
                 side_effect=swapped_before_extract), \
                 self.assertRaises(ValueError):
             public_bundle.import_bundle(
-                handoff, archive, output, source, archive_sha256, VALIDATOR)
+                handoff, archive, output, source, archive_sha256,
+                VALIDATOR, SUPERVISOR)
         self.assertFalse((output / "bundle.json").exists())
 
         @contextlib.contextmanager

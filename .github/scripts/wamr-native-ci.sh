@@ -18,7 +18,6 @@ revision="$(git rev-parse HEAD)" || refuse source-revision
 [[ "$(uname -m)" == x86_64 ]] || refuse architecture
 [[ -r /dev/kvm ]] || refuse kvm-read
 [[ -w /dev/kvm ]] || refuse kvm-write
-# Reuse the credential-restricted runtime owner and the native leaf supervisors.
-# The extra ceiling bounds parent-side package hashing/inspection as well.
-exec timeout --signal=TERM --kill-after=10s 660s \
-  python3 support/build/wamr-native-ci/run.py boot --runtime "$1"
+# The job deadline bounds orchestration; every trusted leaf command has its own
+# absolute primary and cleanup deadlines in the native supervisor.
+exec python3 support/build/wamr-native-ci/run.py boot --runtime "$1"
