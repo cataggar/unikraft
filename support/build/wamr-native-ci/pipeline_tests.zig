@@ -29,7 +29,7 @@ const Fixture = struct {
     cli: []const u8,
 
     fn init() !Fixture {
-        const root_path = options.test_root orelse return error.SkipZigTest;
+        const root_path = options.test_root orelse return error.MissingTestRoot;
         const arena = try a.create(std.heap.ArenaAllocator);
         errdefer a.destroy(arena);
         arena.* = .init(a);
@@ -189,6 +189,81 @@ test "deadline refusal removes partial compute outputs and retains typed supervi
     try t.expect(std.mem.indexOf(
         u8,
         try state.read(io, alloc, "qcow2-supervision.json", c.max_record, null),
+        "\"outcome\":\"refused\"",
+    ) != null);
+
+    const vhd_fixture = try Fixture.init();
+    defer vhd_fixture.deinit();
+    const vhd_alloc = vhd_fixture.arena.allocator();
+    const vhd_state = try image.core.private_files.Directory.open(io, vhd_fixture.state_path);
+    defer vhd_state.close(io);
+    const vhd_efi_path = try image.files.path(vhd_alloc, vhd_fixture.path, "workload.efi");
+    const vhd_efi = try image.files.record(vhd_alloc, io, vhd_efi_path, c.max_efi, false);
+    const vhd_packaged = try image.package.build(vhd_alloc, io, vhd_state, vhd_efi);
+    try image.files.cleanupStage(io, vhd_state, "package-stage");
+    const vhd_raw_path = try image.files.path(vhd_alloc, vhd_fixture.state_path, "unikraft.raw");
+    const finalize_intent: image.compute_artifacts.FinalizeIntent = .{
+        .source_path = vhd_raw_path,
+        .expected_source_sha256 = vhd_packaged.raw.sha256,
+        .expected_source_bytes = vhd_packaged.raw.size,
+        .expected_virtual_bytes = vhd_packaged.raw.size,
+        .expected_workload_sha256 = vhd_efi.sha256,
+        .expected_workload_bytes = vhd_efi.size,
+        .timeout_ms = 120_000,
+        .limits = limits,
+    };
+    const finalize_path = try image.files.path(vhd_alloc, vhd_fixture.path, "vhd-finalize.json");
+    try writeIntent(
+        vhd_fixture.directory,
+        "vhd-finalize.json",
+        try c.encode(vhd_alloc, finalize_intent),
+    );
+    const finalized_result = try run(vhd_fixture, &.{
+        vhd_fixture.cli,
+        "finalize-qcow2",
+        finalize_path,
+        vhd_fixture.state_path,
+    });
+    defer vhd_alloc.free(finalized_result.stdout);
+    defer vhd_alloc.free(finalized_result.stderr);
+    try t.expectEqual(std.process.Child.Term{ .exited = 0 }, finalized_result.term);
+    const finalized = try image.compute_artifacts.readFinalizationRecord(
+        vhd_alloc,
+        finalized_result.stdout,
+    );
+    const qcow2_path = try image.files.path(
+        vhd_alloc,
+        vhd_fixture.state_path,
+        image.compute_artifacts.qcow2_name,
+    );
+    const derive_intent: image.compute_artifacts.DeriveIntent = .{
+        .source_path = qcow2_path,
+        .accepted_qcow2_sha256 = finalized.output.sha256,
+        .expected_source_bytes = finalized.output.file_bytes,
+        .expected_capacity_bytes = finalized.output.virtual_bytes,
+        .timeout_ms = 1,
+        .limits = limits,
+    };
+    const derive_path = try image.files.path(vhd_alloc, vhd_fixture.path, "deadline-vhd.json");
+    try writeIntent(
+        vhd_fixture.directory,
+        "deadline-vhd.json",
+        try c.encode(vhd_alloc, derive_intent),
+    );
+    const derived_result = try run(vhd_fixture, &.{
+        vhd_fixture.cli,
+        "derive-fixed-vhd",
+        derive_path,
+        vhd_fixture.state_path,
+    });
+    defer vhd_alloc.free(derived_result.stdout);
+    defer vhd_alloc.free(derived_result.stderr);
+    try t.expectEqual(std.process.Child.Term{ .exited = 1 }, derived_result.term);
+    try expectMissing(vhd_state, image.compute_artifacts.vhd_name);
+    try expectMissing(vhd_state, image.compute_artifacts.vhd_record_name);
+    try t.expect(std.mem.indexOf(
+        u8,
+        try vhd_state.read(io, vhd_alloc, "vhd-supervision.json", c.max_record, null),
         "\"outcome\":\"refused\"",
     ) != null);
 }

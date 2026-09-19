@@ -370,6 +370,10 @@ WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fix
   python3 -m unittest discover -s support/build/wamr-native-ci/tests -v
 ```
 
+`test` is the protected aggregate and requires `-Dtest-root`; `test-pipeline`
+runs only the real conversion fixtures with the same requirement.
+`test-unit` is the explicit fixture-free command-boundary target.
+
 The Zig fixtures additionally run real raw-to-native-zstd-QCOW2 and
 exact-QCOW2-to-fixed-VHD workers, reopen both artifacts, validate byte/content
 identity and exercise a hard-deadline refusal with rollback and typed

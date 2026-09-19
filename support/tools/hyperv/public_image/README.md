@@ -60,7 +60,8 @@ worker entry points.
 The exported `compute_artifacts` module is a separate compute-only surface; it
 does not add branches or optional fields to `prepare`, stored `State`, matrix,
 export, or import. It wraps the pinned Miz
-`artifact_pipeline.finalizeQcow2` and `azure.deriveFixedVhd` calls with:
+native compressed-QCOW2 writer and fixed-VHD `Image.createFile`/`copyAll`/
+`gpt.relocateBackup` primitives with:
 
 - exact path, size, SHA-256 and physical-identity pins for the retained source;
 - caller-bounded physical, virtual, metadata, partition-array, byte-work,
@@ -69,10 +70,19 @@ export, or import. It wraps the pinned Miz
   the bounded reader, including complete decoded-raw hashing;
 - verified primary/backup GPT, exact partition and EFI workload identities;
 - complete fixed-VHD footer, creator, checksum, timestamp, geometry and
-  allocation reporting, plus byte-level restriction of relocation differences
-  to the protective MBR and GPT relocation ranges;
-- create-only paired artifact/record publication with explicit
-  `succeeded`/`refused`/`partial` worker supervision.
+  allocation reporting, plus an exact byte-for-byte reconstruction of pinned
+  Miz's relocation: only the protective-entry end CHS/count, explicit GPT
+  locations/CRCs and relocated backup metadata may change; bootstrap code,
+  disk signature, reserved bytes, partition arrays and header padding remain
+  bound;
+- parent-created, create-only stage/output/record reservations retained by
+  physical identity before worker launch. Workers refuse substituted slots,
+  and failure cleanup removes only names that still identify this attempt's
+  objects, leaving collisions and replacements untouched;
+- parent-side reopening of the retained output after worker exit, followed by
+  bounded recomputation and structural equality of every canonical QCOW2/VHD
+  record field (including host allocation) before `succeeded` admission, with
+  explicit `refused`/`partial` supervision otherwise.
 
 `finalize-qcow2` and `derive-fixed-vhd` are available only through the WAMR
 compute adapter's private supervised worker contract. The derivation intent
@@ -276,11 +286,13 @@ ledger or establishes live authority.
 - `package.build`/`observe`, `network.fromConfig`/`serial`, and
   `engine.bootConfig` expose the focused native primitives. Only trusted
   orchestration should invoke them; no production fixture switch exists.
-- `compute_artifacts.finalizeQcow2` and
-  `compute_artifacts.deriveFixedVhd` consume descriptor-pinned typed inputs and
-  publish canonical lineage records. `readFinalizationRecord` and
-  `readDerivationRecord` enforce canonical complete records and reject changed
-  parent, tool, profile, allocation, identity, footer or relocation fields.
+- `compute_artifacts.reserveAttempt` must create and retain the typed
+  stage/output/record ownership before `finalizeQcow2` or `deriveFixedVhd`.
+  `verifyFinalizedQcow2`/`verifyDerivedFixedVhd` reopen those exact identities
+  and recompute canonical lineage before admission. `readFinalizationRecord`
+  and `readDerivationRecord` enforce canonical complete records and reject
+  changed parent, tool, profile, allocation, identity, footer or relocation
+  fields.
 
 ## Focused offline fixtures
 

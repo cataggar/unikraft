@@ -12,6 +12,326 @@ pub const vhd_record_name = "fixed-vhd-derivation.json";
 pub const qcow2_stage_name = "qcow2-finalization-stage";
 pub const vhd_stage_name = "fixed-vhd-derivation-stage";
 pub const Outcome = enum { succeeded, refused, partial };
+pub const AttemptKind = enum { qcow2, vhd };
+
+const AttemptNames = struct {
+    stage: []const u8,
+    output: []const u8,
+    record: []const u8,
+};
+
+fn attemptNames(kind: AttemptKind) AttemptNames {
+    return switch (kind) {
+        .qcow2 => .{
+            .stage = qcow2_stage_name,
+            .output = qcow2_name,
+            .record = qcow2_record_name,
+        },
+        .vhd => .{
+            .stage = vhd_stage_name,
+            .output = vhd_name,
+            .record = vhd_record_name,
+        },
+    };
+}
+
+pub const OwnedIdentity = struct {
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+    mode: u16,
+    uid: u32,
+    nlink: u32,
+
+    fn fromSnapshot(value: p.Snapshot) OwnedIdentity {
+        return .{
+            .device_major = value.dev_major,
+            .device_minor = value.dev_minor,
+            .inode = value.ino,
+            .mode = value.mode,
+            .uid = value.uid,
+            .nlink = value.nlink,
+        };
+    }
+
+    fn validate(self: OwnedIdentity, directory: bool) !void {
+        const expected_type: u16 = if (directory) 0o040000 else 0o100000;
+        const expected_permissions: u16 = if (directory) 0o700 else 0o600;
+        if (self.inode == 0 or self.uid != linux.geteuid() or
+            (if (directory) self.nlink < 2 else self.nlink != 1) or
+            self.mode & 0o170000 != expected_type or self.mode & 0o7777 != expected_permissions)
+        {
+            return error.InvalidAttemptOwnership;
+        }
+    }
+
+    fn matches(self: OwnedIdentity, value: p.Snapshot) bool {
+        return self.device_major == value.dev_major and
+            self.device_minor == value.dev_minor and
+            self.inode == value.ino and self.mode == value.mode and
+            self.uid == value.uid and self.nlink == value.nlink;
+    }
+};
+
+pub const AttemptEvidence = struct {
+    schema: []const u8 = "uk.wamr.compute-attempt-ownership",
+    schema_version: u8 = 1,
+    kind: AttemptKind,
+    stage: OwnedIdentity,
+    output: OwnedIdentity,
+    record: OwnedIdentity,
+
+    pub fn validate(self: AttemptEvidence, expected_kind: AttemptKind) !void {
+        if (!std.mem.eql(u8, self.schema, "uk.wamr.compute-attempt-ownership") or
+            self.schema_version != 1 or self.kind != expected_kind)
+        {
+            return error.InvalidAttemptOwnership;
+        }
+        try self.stage.validate(true);
+        try self.output.validate(false);
+        try self.record.validate(false);
+    }
+};
+
+pub const CleanupResult = struct {
+    stage_complete: bool,
+    output_complete: bool,
+    record_complete: bool,
+
+    pub fn rollbackComplete(self: CleanupResult) bool {
+        return self.stage_complete and self.output_complete and self.record_complete;
+    }
+};
+
+pub const ReservedAttempt = struct {
+    evidence: AttemptEvidence,
+    stage: std.Io.Dir,
+    output: std.Io.File,
+    record: std.Io.File,
+
+    pub fn close(self: *ReservedAttempt, io: std.Io) void {
+        self.record.close(io);
+        self.output.close(io);
+        self.stage.close(io);
+        self.* = undefined;
+    }
+
+    pub fn cleanupStage(self: *ReservedAttempt, io: std.Io, root: p.Directory) bool {
+        removeOwnedStage(io, root, self) catch return false;
+        return true;
+    }
+
+    pub fn rollback(self: *ReservedAttempt, io: std.Io, root: p.Directory) CleanupResult {
+        const names = attemptNames(self.evidence.kind);
+        var stage_complete = true;
+        removeOwnedStage(io, root, self) catch {
+            stage_complete = false;
+        };
+        var output_complete = true;
+        removeOwnedFile(
+            io,
+            root,
+            names.output,
+            self.output,
+            self.evidence.output,
+        ) catch {
+            output_complete = false;
+        };
+        var record_complete = true;
+        removeOwnedFile(
+            io,
+            root,
+            names.record,
+            self.record,
+            self.evidence.record,
+        ) catch {
+            record_complete = false;
+        };
+        f.sync(io, root.dir) catch return .{
+            .stage_complete = stage_complete,
+            .output_complete = false,
+            .record_complete = false,
+        };
+        return .{
+            .stage_complete = stage_complete,
+            .output_complete = output_complete,
+            .record_complete = record_complete,
+        };
+    }
+
+    pub fn published(self: *ReservedAttempt, io: std.Io, root: p.Directory) !void {
+        const names = attemptNames(self.evidence.kind);
+        const output = try openRetainedFile(
+            io,
+            root,
+            names.output,
+            self.output,
+            self.evidence.output,
+            false,
+        );
+        defer output.close(io);
+        const record = try openRetainedFile(
+            io,
+            root,
+            names.record,
+            self.record,
+            self.evidence.record,
+            false,
+        );
+        defer record.close(io);
+        if ((try p.snapshot(output)).size == 0 or (try p.snapshot(record)).size == 0)
+            return error.IncompletePublication;
+    }
+};
+
+pub fn reserveAttempt(io: std.Io, root: p.Directory, kind: AttemptKind) !ReservedAttempt {
+    const names = attemptNames(kind);
+    try root.dir.createDir(io, names.stage, .fromMode(0o700));
+    const stage = root.dir.openDir(io, names.stage, .{
+        .follow_symlinks = false,
+        .iterate = true,
+    }) catch return error.AttemptOwnershipChanged;
+    const stage_identity = OwnedIdentity.fromSnapshot(directorySnapshot(stage) catch |err| {
+        stage.close(io);
+        return err;
+    });
+
+    const output = root.dir.createFile(io, names.output, .{
+        .read = true,
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    }) catch |err| {
+        removeOwnedDirectory(
+            io,
+            root,
+            names.stage,
+            stage,
+            stage_identity,
+        ) catch {
+            stage.close(io);
+            return error.AttemptCleanupFailed;
+        };
+        stage.close(io);
+        return err;
+    };
+    const output_identity = OwnedIdentity.fromSnapshot(p.snapshot(output) catch |err| {
+        output.close(io);
+        removeOwnedDirectory(
+            io,
+            root,
+            names.stage,
+            stage,
+            stage_identity,
+        ) catch {
+            stage.close(io);
+            return error.AttemptCleanupFailed;
+        };
+        stage.close(io);
+        return err;
+    });
+
+    const record = root.dir.createFile(io, names.record, .{
+        .read = true,
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    }) catch |err| {
+        removeOwnedFile(
+            io,
+            root,
+            names.output,
+            output,
+            output_identity,
+        ) catch {
+            output.close(io);
+            stage.close(io);
+            return error.AttemptCleanupFailed;
+        };
+        output.close(io);
+        removeOwnedDirectory(
+            io,
+            root,
+            names.stage,
+            stage,
+            stage_identity,
+        ) catch {
+            stage.close(io);
+            return error.AttemptCleanupFailed;
+        };
+        stage.close(io);
+        return err;
+    };
+    const record_identity = OwnedIdentity.fromSnapshot(p.snapshot(record) catch |err| {
+        record.close(io);
+        removeOwnedFile(
+            io,
+            root,
+            names.output,
+            output,
+            output_identity,
+        ) catch {
+            output.close(io);
+            stage.close(io);
+            return error.AttemptCleanupFailed;
+        };
+        output.close(io);
+        removeOwnedDirectory(
+            io,
+            root,
+            names.stage,
+            stage,
+            stage_identity,
+        ) catch {
+            stage.close(io);
+            return error.AttemptCleanupFailed;
+        };
+        stage.close(io);
+        return err;
+    });
+
+    const evidence: AttemptEvidence = .{
+        .kind = kind,
+        .stage = stage_identity,
+        .output = output_identity,
+        .record = record_identity,
+    };
+    var attempt: ReservedAttempt = .{
+        .evidence = evidence,
+        .stage = stage,
+        .output = output,
+        .record = record,
+    };
+    evidence.validate(kind) catch |err| {
+        const cleanup = attempt.rollback(io, root);
+        attempt.close(io);
+        if (!cleanup.rollbackComplete()) return error.AttemptCleanupFailed;
+        return err;
+    };
+    f.sync(io, stage) catch |err| {
+        const cleanup = attempt.rollback(io, root);
+        attempt.close(io);
+        if (!cleanup.rollbackComplete()) return error.AttemptCleanupFailed;
+        return err;
+    };
+    output.sync(io) catch |err| {
+        const cleanup = attempt.rollback(io, root);
+        attempt.close(io);
+        if (!cleanup.rollbackComplete()) return error.AttemptCleanupFailed;
+        return err;
+    };
+    record.sync(io) catch |err| {
+        const cleanup = attempt.rollback(io, root);
+        attempt.close(io);
+        if (!cleanup.rollbackComplete()) return error.AttemptCleanupFailed;
+        return err;
+    };
+    f.sync(io, root.dir) catch |err| {
+        const cleanup = attempt.rollback(io, root);
+        attempt.close(io);
+        if (!cleanup.rollbackComplete()) return error.AttemptCleanupFailed;
+        return err;
+    };
+    return attempt;
+}
 
 const cluster_size: u64 = 64 * 1024;
 const cluster_bits: u32 = 16;
@@ -500,10 +820,111 @@ pub const DeriveOptions = struct {
     config_sha256: c.Hash,
 };
 
+const WorkerAttempt = struct {
+    evidence: AttemptEvidence,
+    stage: std.Io.Dir,
+    output: std.Io.File,
+    record: std.Io.File,
+
+    fn open(
+        io: std.Io,
+        root: p.Directory,
+        expected_kind: AttemptKind,
+        evidence: AttemptEvidence,
+    ) !WorkerAttempt {
+        try evidence.validate(expected_kind);
+        const names = attemptNames(expected_kind);
+        const stage = try root.dir.openDir(io, names.stage, .{
+            .follow_symlinks = false,
+            .iterate = true,
+        });
+        errdefer stage.close(io);
+        const stage_snapshot = try directorySnapshot(stage);
+        if (!evidence.stage.matches(stage_snapshot)) return error.AttemptOwnershipChanged;
+        var entries = stage.iterate();
+        if (try entries.next(io) != null) return error.AttemptOwnershipChanged;
+
+        const output = try openEvidenceFile(io, root, names.output, evidence.output, true);
+        errdefer output.close(io);
+        const record = try openEvidenceFile(io, root, names.record, evidence.record, true);
+        errdefer record.close(io);
+        return .{
+            .evidence = evidence,
+            .stage = stage,
+            .output = output,
+            .record = record,
+        };
+    }
+
+    fn close(self: *WorkerAttempt, io: std.Io) void {
+        self.record.close(io);
+        self.output.close(io);
+        self.stage.close(io);
+        self.* = undefined;
+    }
+
+    fn openOutput(self: WorkerAttempt, io: std.Io, root: p.Directory) !std.Io.File {
+        return openRetainedFile(
+            io,
+            root,
+            attemptNames(self.evidence.kind).output,
+            self.output,
+            self.evidence.output,
+            false,
+        );
+    }
+
+    fn writeRecord(
+        self: WorkerAttempt,
+        a: std.mem.Allocator,
+        io: std.Io,
+        root: p.Directory,
+        value: anytype,
+    ) !void {
+        const names = attemptNames(self.evidence.kind);
+        const named = try openRetainedFile(
+            io,
+            root,
+            names.record,
+            self.record,
+            self.evidence.record,
+            true,
+        );
+        defer named.close(io);
+        const encoded = try c.encode(a, value);
+        defer a.free(encoded);
+        try self.record.setLength(io, 0);
+        try self.record.writePositionalAll(io, encoded, 0);
+        try self.record.setLength(io, encoded.len);
+        try self.record.sync(io);
+        try f.sync(io, root.dir);
+        const current = try openRetainedFile(
+            io,
+            root,
+            names.record,
+            self.record,
+            self.evidence.record,
+            false,
+        );
+        current.close(io);
+    }
+};
+
+pub const VerifiedFinalization = struct {
+    bytes: []const u8,
+    record: FinalizationRecord,
+};
+
+pub const VerifiedDerivation = struct {
+    bytes: []const u8,
+    record: DerivationRecord,
+};
+
 pub fn finalizeQcow2(
     a: std.mem.Allocator,
     io: std.Io,
     root: p.Directory,
+    attempt_evidence: AttemptEvidence,
     options: FinalizeOptions,
 ) !FinalizationRecord {
     try options.source.validate(options.limits.max_input_bytes);
@@ -516,10 +937,146 @@ pub fn finalizeQcow2(
     {
         return error.InvalidGeometry;
     }
-    try ensureAbsent(io, root, qcow2_name);
-    try ensureAbsent(io, root, qcow2_record_name);
-    try createStage(io, root, qcow2_stage_name);
+    var attempt = try WorkerAttempt.open(io, root, .qcow2, attempt_evidence);
+    defer attempt.close(io);
+    const retained = try RetainedArtifact.open(io, options.source, options.limits.max_input_bytes);
+    defer retained.close(io);
+    try attempt.output.setLength(io, 0);
+    var source_context = miz.qcow2.RawSourceContext{
+        .file = retained.file,
+        .readable_len = options.source.artifact.size,
+    };
+    const written = try miz.qcow2.writeStandaloneCompressed(
+        a,
+        io,
+        attempt.output,
+        options.expected_virtual_bytes,
+        source_context.reader(),
+        .{ .cluster_bits = cluster_bits },
+    );
+    if (written.version != 3 or written.cluster_bits != cluster_bits or
+        written.compression_type != 1)
+    {
+        return error.InvalidFinalization;
+    }
+    const generated = try p.snapshot(attempt.output);
+    if (generated.size == 0 or generated.size > options.limits.max_output_bytes)
+        return error.InvalidFinalization;
+    try attempt.output.sync(io);
+    try f.sync(io, root.dir);
+    try retained.verify(io);
+    const output = try attempt.openOutput(io, root);
+    const record = try buildFinalizationRecord(a, io, output, options);
+    try attempt.writeRecord(a, io, root, record);
+    return record;
+}
 
+pub fn deriveFixedVhd(
+    a: std.mem.Allocator,
+    io: std.Io,
+    root: p.Directory,
+    attempt_evidence: AttemptEvidence,
+    options: DeriveOptions,
+) !DerivationRecord {
+    try options.source.validate(options.limits.max_input_bytes);
+    try options.producer.validate(c.max_tool);
+    try f.verify(a, io, options.producer, c.max_tool, true);
+    try options.limits.validate(options.source.artifact.size, options.expected_capacity_bytes);
+    const target_capacity = try alignedCapacity(options.expected_capacity_bytes);
+    if (target_capacity + miz.vhd.footer_size > options.limits.max_output_bytes)
+        return error.InvalidOutputLimit;
+    var attempt = try WorkerAttempt.open(io, root, .vhd, attempt_evidence);
+    defer attempt.close(io);
+    const retained = try RetainedArtifact.open(io, options.source, options.limits.max_input_bytes);
+    defer retained.close(io);
+    var source_image = try openPinnedQcow2(io, retained, options.limits, options.expected_capacity_bytes);
+    defer source_image.close(io);
+    const expected_unique_id = uniqueId(options.source.pin.sha256, options.expected_capacity_bytes);
+    var source_gpt = try miz.gpt.readVerifiedGpt(
+        source_image,
+        io,
+        a,
+        options.limits.max_partition_array_bytes,
+    );
+    defer source_gpt.deinit(a);
+    const writer = try attempt.openOutput(io, root);
+    var output_image = try miz.Image.createFile(io, writer, .vhd, target_capacity, .{
+        .vhd_subformat = .fixed,
+        .unique_id = expected_unique_id,
+        .timestamp_unix = 0,
+    });
+    var output_open = true;
+    defer if (output_open) output_image.close(io);
+    _ = try miz.copyAll(io, source_image, &output_image, a);
+    _ = try miz.gpt.relocateBackup(&output_image, io, a, source_gpt);
+    const generated_check = try output_image.check(io);
+    if (!generated_check.ok) return error.InvalidDerivation;
+    try output_image.file.sync(io);
+    output_image.close(io);
+    output_open = false;
+    try f.sync(io, root.dir);
+    try retained.verify(io);
+    const output = try attempt.openOutput(io, root);
+    const record = try buildDerivationRecord(a, io, output, options);
+    try attempt.writeRecord(a, io, root, record);
+    return record;
+}
+
+pub fn verifyFinalizedQcow2(
+    a: std.mem.Allocator,
+    io: std.Io,
+    root: p.Directory,
+    attempt: *ReservedAttempt,
+    options: FinalizeOptions,
+) !VerifiedFinalization {
+    if (attempt.evidence.kind != .qcow2) return error.InvalidAttemptOwnership;
+    const bytes = try readRetainedRecord(a, io, root, attempt, c.max_record);
+    const expected = try readFinalizationRecord(a, bytes);
+    const output = try openRetainedFile(
+        io,
+        root,
+        qcow2_name,
+        attempt.output,
+        attempt.evidence.output,
+        false,
+    );
+    const actual = try buildFinalizationRecord(a, io, output, options);
+    try f.same(a, expected, actual);
+    return .{ .bytes = bytes, .record = expected };
+}
+
+pub fn verifyDerivedFixedVhd(
+    a: std.mem.Allocator,
+    io: std.Io,
+    root: p.Directory,
+    attempt: *ReservedAttempt,
+    options: DeriveOptions,
+) !VerifiedDerivation {
+    if (attempt.evidence.kind != .vhd) return error.InvalidAttemptOwnership;
+    const bytes = try readRetainedRecord(a, io, root, attempt, c.max_record);
+    const expected = try readDerivationRecord(a, bytes);
+    const output = try openRetainedFile(
+        io,
+        root,
+        vhd_name,
+        attempt.output,
+        attempt.evidence.output,
+        false,
+    );
+    const actual = try buildDerivationRecord(a, io, output, options);
+    try f.same(a, expected, actual);
+    return .{ .bytes = bytes, .record = expected };
+}
+
+fn buildFinalizationRecord(
+    a: std.mem.Allocator,
+    io: std.Io,
+    output_file: std.Io.File,
+    options: FinalizeOptions,
+) !FinalizationRecord {
+    try options.source.validate(options.limits.max_input_bytes);
+    try options.producer.validate(c.max_tool);
+    try options.limits.validate(options.source.artifact.size, options.expected_virtual_bytes);
     const retained = try RetainedArtifact.open(io, options.source, options.limits.max_input_bytes);
     defer retained.close(io);
     var work = WorkBudget{ .remaining = options.limits.max_work_bytes };
@@ -535,54 +1092,29 @@ pub fn finalizeQcow2(
     {
         return error.WorkloadMismatch;
     }
-
-    const stage = try root.dir.openDir(io, qcow2_stage_name, .{ .follow_symlinks = false, .iterate = true });
-    defer stage.close(io);
-    const output_path = try stagePath(a, io, stage, "miz-output.qcow2");
-    const finalized = try miz.artifact_pipeline.finalizeQcow2(a, io, .{
-        .input_path = options.source.artifact.path,
-        .expected_input_sha256 = options.source.pin.sha256,
-        .max_input_size = options.limits.max_input_bytes,
-        .source_format = .raw,
-        .expected_virtual_size = options.expected_virtual_bytes,
-        .max_virtual_size = options.limits.max_virtual_bytes,
-        .output_path = output_path,
-        .max_output_size = options.limits.max_output_bytes,
-        .qemu_img_path = "",
-        .compression = .zstd,
-        .cluster_size = cluster_size,
-    });
-    if (finalized.virtual_size != options.expected_virtual_bytes or
-        finalized.cluster_size != cluster_size or finalized.compression != .zstd)
-    {
-        return error.InvalidFinalization;
-    }
-    try retained.verify(io);
-
-    var output_image = try openBoundedQcow2(io, stage, "miz-output.qcow2", options.limits, options.expected_virtual_bytes);
+    var output_image = try openBoundedQcow2File(
+        io,
+        output_file,
+        options.limits,
+        options.expected_virtual_bytes,
+        options.limits.max_output_bytes,
+    );
     defer output_image.close(io);
     const output_snapshot = try c.boot.files.snapshot(output_image.file);
     const output_digest = try c.boot.files.digest(io, output_image.file, output_snapshot);
-    if (!std.mem.eql(u8, &output_digest, &finalized.artifact.sha256) or
-        output_snapshot.size != finalized.artifact.size)
-    {
-        return error.InvalidFinalization;
-    }
     const decoded = try hashImage(io, output_image, &work);
     if (!std.mem.eql(u8, &decoded, &options.source.pin.sha256)) return error.PayloadMismatch;
     const output_identity = try inspectDisk(a, io, &output_image, options.limits, &work);
     try sameIdentity(a, source_identity, output_identity);
-    const host_allocation = try allocation(output_snapshot);
-    const output_artifact: Artifact = .{
-        .sha256 = try c.hex(a, output_digest),
-        .file_bytes = output_snapshot.size,
-        .allocated = host_allocation,
-        .virtual_bytes = output_image.virtual_size,
-    };
     const record: FinalizationRecord = .{
         .source_sha256 = options.source.artifact.sha256,
         .source_bytes = options.source.artifact.size,
-        .output = output_artifact,
+        .output = .{
+            .sha256 = try c.hex(a, output_digest),
+            .file_bytes = output_snapshot.size,
+            .allocated = try allocation(output_snapshot),
+            .virtual_bytes = output_image.virtual_size,
+        },
         .identity = output_identity,
         .limits = options.limits,
         .provenance = .{
@@ -597,27 +1129,18 @@ pub fn finalizeQcow2(
     try retained.verify(io);
     try f.verify(a, io, options.producer, c.max_tool, true);
     try verifyOpenArtifact(io, output_image.file, output_snapshot, output_digest);
-    try publish(a, io, root, stage, "miz-output.qcow2", qcow2_name, qcow2_record_name, record);
     return record;
 }
 
-pub fn deriveFixedVhd(
+fn buildDerivationRecord(
     a: std.mem.Allocator,
     io: std.Io,
-    root: p.Directory,
+    output_file: std.Io.File,
     options: DeriveOptions,
 ) !DerivationRecord {
     try options.source.validate(options.limits.max_input_bytes);
     try options.producer.validate(c.max_tool);
-    try f.verify(a, io, options.producer, c.max_tool, true);
     try options.limits.validate(options.source.artifact.size, options.expected_capacity_bytes);
-    const target_capacity = try alignedCapacity(options.expected_capacity_bytes);
-    if (target_capacity + miz.vhd.footer_size > options.limits.max_output_bytes)
-        return error.InvalidOutputLimit;
-    try ensureAbsent(io, root, vhd_name);
-    try ensureAbsent(io, root, vhd_record_name);
-    try createStage(io, root, vhd_stage_name);
-
     const retained = try RetainedArtifact.open(io, options.source, options.limits.max_input_bytes);
     defer retained.close(io);
     var work = WorkBudget{ .remaining = options.limits.max_work_bytes };
@@ -633,36 +1156,9 @@ pub fn deriveFixedVhd(
         .virtual_bytes = source_image.virtual_size,
     };
 
-    const stage = try root.dir.openDir(io, vhd_stage_name, .{ .follow_symlinks = false, .iterate = true });
-    defer stage.close(io);
-    const output_path = try stagePath(a, io, stage, "miz-output.vhd");
-    const expected_unique_id = uniqueId(options.source.pin.sha256, options.expected_capacity_bytes);
-    const derived = try miz.azure.deriveFixedVhd(a, io, .{
-        .input_path = options.source.artifact.path,
-        .expected_input_sha256 = options.source.pin.sha256,
-        .max_input_size = options.limits.max_input_bytes,
-        .expected_virtual_size = options.expected_capacity_bytes,
-        .max_virtual_size = options.limits.max_virtual_bytes,
-        .output_path = output_path,
-        .max_output_size = options.limits.max_output_bytes,
-        .max_partition_array_bytes = options.limits.max_partition_array_bytes,
-        .unique_id = expected_unique_id,
-        .timestamp_unix = 0,
-    });
-    if (derived.source_virtual_size != options.expected_capacity_bytes or
-        derived.virtual_size != target_capacity)
-    {
-        return error.InvalidDerivation;
-    }
-    try retained.verify(io);
-
-    const output_file = try stage.openFile(io, "miz-output.vhd", .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-    });
     var output_image = try miz.Image.openFile(io, output_file);
     defer output_image.close(io);
+    const target_capacity = try alignedCapacity(options.expected_capacity_bytes);
     const output_info = try output_image.info(io);
     if (output_info.format != .vhd or output_info.subformat != .fixed or
         output_info.virtual_size != target_capacity or
@@ -672,17 +1168,20 @@ pub fn deriveFixedVhd(
     }
     const check = try output_image.check(io);
     if (!check.ok) return error.InvalidFixedVhd;
+    const expected_unique_id = uniqueId(options.source.pin.sha256, options.expected_capacity_bytes);
     const footer_report = try inspectFooter(a, io, output_image.file, target_capacity, expected_unique_id);
     const output_identity = try inspectDisk(a, io, &output_image, options.limits, &work);
     try sameIdentity(a, source_identity, output_identity);
-    try validateAllowedDifferences(a, io, source_image, output_image, options.limits, derived.relocation, &work);
+    const relocation = try validateAllowedDifferences(
+        a,
+        io,
+        source_image,
+        output_image,
+        options.limits,
+        &work,
+    );
     const output_snapshot = try c.boot.files.snapshot(output_image.file);
     const output_digest = try c.boot.files.digest(io, output_image.file, output_snapshot);
-    if (!std.mem.eql(u8, &output_digest, &derived.artifact.sha256) or
-        output_snapshot.size != derived.artifact.size)
-    {
-        return error.InvalidDerivation;
-    }
     const record: DerivationRecord = .{
         .accepted_qcow2 = source_artifact,
         .accepted_qcow2_decoded_sha256 = try c.hex(a, source_decoded),
@@ -696,11 +1195,11 @@ pub fn deriveFixedVhd(
         .output_identity = output_identity,
         .footer = footer_report,
         .relocation = .{
-            .was_relocated = derived.relocation.was_relocated,
-            .old_backup_lba = derived.relocation.old_backup_lba,
-            .new_backup_lba = derived.relocation.new_backup_lba,
-            .old_last_usable_lba = derived.relocation.old_last_usable_lba,
-            .new_last_usable_lba = derived.relocation.new_last_usable_lba,
+            .was_relocated = relocation.was_relocated,
+            .old_backup_lba = relocation.old_backup_lba,
+            .new_backup_lba = relocation.new_backup_lba,
+            .old_last_usable_lba = relocation.old_last_usable_lba,
+            .new_last_usable_lba = relocation.new_last_usable_lba,
         },
         .limits = options.limits,
         .provenance = .{
@@ -715,7 +1214,6 @@ pub fn deriveFixedVhd(
     try retained.verify(io);
     try f.verify(a, io, options.producer, c.max_tool, true);
     try verifyOpenArtifact(io, output_image.file, output_snapshot, output_digest);
-    try publish(a, io, root, stage, "miz-output.vhd", vhd_name, vhd_record_name, record);
     return record;
 }
 
@@ -768,24 +1266,19 @@ fn qcow2Limits(limits: Limits, max_file_bytes: u64) !miz.Qcow2StandaloneOpenLimi
     };
 }
 
-fn openBoundedQcow2(
+fn openBoundedQcow2File(
     io: std.Io,
-    dir: std.Io.Dir,
-    name: []const u8,
+    file: std.Io.File,
     limits: Limits,
     expected_virtual: u64,
+    max_file_bytes: u64,
 ) !miz.Image {
-    const file = try dir.openFile(io, name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-    });
     var transferred = false;
     defer if (!transferred) file.close(io);
     var image = try miz.Image.openStandaloneQcow2FileWithLimits(
         io,
         file,
-        try qcow2Limits(limits, limits.max_output_bytes),
+        try qcow2Limits(limits, max_file_bytes),
     );
     transferred = true;
     errdefer image.close(io);
@@ -1059,24 +1552,16 @@ fn inspectFooter(
     };
 }
 
-const Range = struct {
-    start: u64,
-    end: u64,
-
-    fn contains(self: Range, offset: u64) bool {
-        return offset >= self.start and offset < self.end;
-    }
-};
-
 fn validateAllowedDifferences(
     a: std.mem.Allocator,
     io: std.Io,
     source: miz.Image,
     output: miz.Image,
     limits: Limits,
-    relocation: miz.gpt.RelocationResult,
     work: *WorkBudget,
-) !void {
+) !miz.gpt.RelocationResult {
+    if (output.virtual_size < source.virtual_size)
+        return error.InvalidRelocation;
     var source_gpt = try miz.gpt.readVerifiedGpt(source, io, a, limits.max_partition_array_bytes);
     defer source_gpt.deinit(a);
     var output_gpt = try miz.gpt.readVerifiedGpt(output, io, a, limits.max_partition_array_bytes);
@@ -1095,152 +1580,312 @@ fn validateAllowedDifferences(
             return error.PartitionChanged;
         }
     }
-    if (relocation.was_relocated != (output.virtual_size != source.virtual_size) or
-        relocation.old_backup_lba != source_gpt.primary_header.backup_lba or
-        relocation.new_backup_lba != output_gpt.primary_header.backup_lba)
+
+    const array_bytes: u64 = @intCast(source_gpt.partition_array.len);
+    const array_sectors = std.math.divCeil(u64, array_bytes, sector_size) catch
+        return error.InvalidRelocation;
+    const new_backup_lba = output.virtual_size / sector_size - 1;
+    if (new_backup_lba < source_gpt.primary_header.backup_lba or
+        new_backup_lba <= array_sectors)
     {
         return error.InvalidRelocation;
     }
-    var allowed: [4]Range = undefined;
-    var allowed_len: usize = 0;
-    if (relocation.was_relocated) {
-        const source_array_bytes: u64 = @intCast(source_gpt.partition_array.len);
-        const source_array_sectors = std.math.divCeil(u64, source_array_bytes, sector_size) catch
-            return error.InvalidRelocation;
-        allowed[0] = .{ .start = 0, .end = sector_size };
-        allowed[1] = .{ .start = sector_size, .end = 2 * sector_size };
-        allowed[2] = try backupGptRange(relocation.old_backup_lba, source_array_sectors);
-        allowed[3] = try backupGptRange(relocation.new_backup_lba, source_array_sectors);
-        allowed_len = allowed.len;
+    const new_backup_array_lba = new_backup_lba - array_sectors;
+    if (new_backup_array_lba == 0) return error.InvalidRelocation;
+    const new_last_usable_lba = new_backup_array_lba - 1;
+    const relocation: miz.gpt.RelocationResult = .{
+        .was_relocated = output.virtual_size != source.virtual_size,
+        .old_backup_lba = source_gpt.primary_header.backup_lba,
+        .new_backup_lba = new_backup_lba,
+        .old_last_usable_lba = source_gpt.primary_header.last_usable_lba,
+        .new_last_usable_lba = if (output.virtual_size == source.virtual_size)
+            source_gpt.primary_header.last_usable_lba
+        else
+            new_last_usable_lba,
+    };
+    if (relocation.was_relocated and
+        new_last_usable_lba < source_gpt.primary_header.last_usable_lba)
+    {
+        return error.InvalidRelocation;
     }
-    try work.charge(source.virtual_size);
-    var source_buffer: [64 * 1024]u8 = undefined;
+
+    var expected_mbr = source_gpt.protective_mbr_sector;
+    var expected_primary = source_gpt.primary_header_sector;
+    var expected_backup = source_gpt.backup_header_sector;
+    if (relocation.was_relocated) {
+        std.mem.writeInt(u64, expected_primary[32..40], new_backup_lba, .little);
+        std.mem.writeInt(u64, expected_primary[48..56], new_last_usable_lba, .little);
+        updateGptHeaderChecksum(&expected_primary);
+
+        std.mem.writeInt(u64, expected_backup[24..32], new_backup_lba, .little);
+        std.mem.writeInt(
+            u64,
+            expected_backup[32..40],
+            source_gpt.primary_header.current_lba,
+            .little,
+        );
+        std.mem.writeInt(u64, expected_backup[48..56], new_last_usable_lba, .little);
+        std.mem.writeInt(u64, expected_backup[72..80], new_backup_array_lba, .little);
+        updateGptHeaderChecksum(&expected_backup);
+
+        const entry_offset = miz.mbr.partition_table_offset +
+            @as(usize, source_gpt.protective_entry_index) * miz.mbr.entry_size;
+        const sector_count: u32 = @intCast(@min(
+            new_backup_lba,
+            std.math.maxInt(u32),
+        ));
+        const end_chs = miz.mbr.chsForLba(sector_count);
+        @memcpy(expected_mbr[entry_offset + 5 .. entry_offset + 8], &end_chs);
+        std.mem.writeInt(
+            u32,
+            expected_mbr[entry_offset + 12 ..][0..4],
+            sector_count,
+            .little,
+        );
+    }
+
+    if (!std.mem.eql(u8, &output_gpt.protective_mbr_sector, &expected_mbr) or
+        !std.mem.eql(u8, &output_gpt.primary_header_sector, &expected_primary) or
+        !std.mem.eql(u8, &output_gpt.backup_header_sector, &expected_backup) or
+        output_gpt.primary_header.backup_lba != new_backup_lba or
+        output_gpt.primary_header.last_usable_lba != relocation.new_last_usable_lba or
+        output_gpt.backup_header.partition_entry_lba != new_backup_array_lba)
+    {
+        return error.InvalidRelocation;
+    }
+
+    try work.charge(output.virtual_size);
+    var expected_buffer: [64 * 1024]u8 = undefined;
     var output_buffer: [64 * 1024]u8 = undefined;
     var offset: u64 = 0;
-    while (offset < source.virtual_size) {
-        const count: usize = @intCast(@min(source_buffer.len, source.virtual_size - offset));
-        if (try source.pread(io, source_buffer[0..count], offset) != count or
-            try output.pread(io, output_buffer[0..count], offset) != count)
-        {
+    while (offset < output.virtual_size) {
+        const count: usize = @intCast(@min(expected_buffer.len, output.virtual_size - offset));
+        @memset(expected_buffer[0..count], 0);
+        if (offset < source.virtual_size) {
+            const source_count: usize = @intCast(@min(
+                @as(u64, count),
+                source.virtual_size - offset,
+            ));
+            if (try source.pread(io, expected_buffer[0..source_count], offset) != source_count)
+                return error.InvalidImage;
+        }
+        overlayExpected(expected_buffer[0..count], offset, 0, &expected_mbr);
+        overlayExpected(expected_buffer[0..count], offset, sector_size, &expected_primary);
+        overlayExpected(
+            expected_buffer[0..count],
+            offset,
+            std.math.mul(u64, new_backup_array_lba, sector_size) catch
+                return error.InvalidRelocation,
+            source_gpt.partition_array,
+        );
+        overlayExpected(
+            expected_buffer[0..count],
+            offset,
+            std.math.mul(u64, new_backup_lba, sector_size) catch
+                return error.InvalidRelocation,
+            &expected_backup,
+        );
+        if (try output.pread(io, output_buffer[0..count], offset) != count)
             return error.InvalidImage;
-        }
-        for (source_buffer[0..count], output_buffer[0..count], 0..) |before, after, index| {
-            if (before == after) continue;
-            const absolute = offset + index;
-            var accepted = false;
-            for (allowed[0..allowed_len]) |range| {
-                if (range.contains(absolute)) {
-                    accepted = true;
-                    break;
-                }
-            }
-            if (!accepted) return error.UnexpectedPayloadDifference;
-        }
+        if (!std.mem.eql(u8, expected_buffer[0..count], output_buffer[0..count]))
+            return error.UnexpectedPayloadDifference;
         offset += count;
     }
-    if (output.virtual_size > source.virtual_size) {
-        try work.charge(output.virtual_size - source.virtual_size);
-        offset = source.virtual_size;
-        while (offset < output.virtual_size) {
-            const count: usize = @intCast(@min(output_buffer.len, output.virtual_size - offset));
-            if (try output.pread(io, output_buffer[0..count], offset) != count)
-                return error.InvalidImage;
-            for (output_buffer[0..count], 0..) |byte, index| {
-                if (byte == 0) continue;
-                const absolute = offset + index;
-                var accepted = false;
-                for (allowed[0..allowed_len]) |range| {
-                    if (range.contains(absolute)) {
-                        accepted = true;
-                        break;
-                    }
-                }
-                if (!accepted) return error.UnexpectedPayloadDifference;
-            }
-            offset += count;
-        }
-    }
+    return relocation;
 }
 
-fn backupGptRange(backup_lba: u64, array_sectors: u64) !Range {
-    const first_lba = std.math.sub(u64, backup_lba, array_sectors) catch
-        return error.InvalidRelocation;
-    const after_lba = std.math.add(u64, backup_lba, 1) catch
-        return error.InvalidRelocation;
-    return .{
-        .start = std.math.mul(u64, first_lba, sector_size) catch
-            return error.InvalidRelocation,
-        .end = std.math.mul(u64, after_lba, sector_size) catch
-            return error.InvalidRelocation,
-    };
+fn overlayExpected(
+    destination: []u8,
+    destination_offset: u64,
+    source_offset: u64,
+    source: []const u8,
+) void {
+    const destination_end = destination_offset + @as(u64, @intCast(destination.len));
+    const source_end = source_offset + @as(u64, @intCast(source.len));
+    const start = @max(destination_offset, source_offset);
+    const end = @min(destination_end, source_end);
+    if (start >= end) return;
+    const destination_start: usize = @intCast(start - destination_offset);
+    const source_start: usize = @intCast(start - source_offset);
+    const length: usize = @intCast(end - start);
+    @memcpy(
+        destination[destination_start .. destination_start + length],
+        source[source_start .. source_start + length],
+    );
 }
 
-fn ensureAbsent(io: std.Io, root: p.Directory, name: []const u8) !void {
-    const existing = root.dir.openFile(io, name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    existing.close(io);
-    return error.PathAlreadyExists;
+fn updateGptHeaderChecksum(sector: *[sector_size]u8) void {
+    sector[16..20].* = .{ 0, 0, 0, 0 };
+    const header_bytes: usize = @intCast(std.mem.readInt(u32, sector[12..16], .little));
+    std.mem.writeInt(
+        u32,
+        sector[16..20],
+        std.hash.crc.Crc32.hash(sector[0..header_bytes]),
+        .little,
+    );
 }
 
-fn createStage(io: std.Io, root: p.Directory, name: []const u8) !void {
-    try root.dir.createDir(io, name, .fromMode(0o700));
-    try f.sync(io, root.dir);
+fn directorySnapshot(directory: std.Io.Dir) !p.Snapshot {
+    return p.snapshot(.{
+        .handle = directory.handle,
+        .flags = .{ .nonblocking = false },
+    });
 }
 
-fn stagePath(a: std.mem.Allocator, io: std.Io, stage: std.Io.Dir, name: []const u8) ![]const u8 {
-    var buffer: [4096]u8 = undefined;
-    const path = buffer[0..try stage.realPath(io, &buffer)];
-    return f.path(a, path, name);
-}
-
-fn publish(
-    a: std.mem.Allocator,
+fn openEvidenceFile(
     io: std.Io,
     root: p.Directory,
-    stage: std.Io.Dir,
-    staged_output: []const u8,
-    output_name: []const u8,
-    record_name: []const u8,
-    record: anytype,
-) !void {
-    const encoded = try c.encode(a, record);
-    const record_file = try stage.createFile(io, "result.json", .{
-        .exclusive = true,
-        .permissions = .fromMode(0o600),
-    });
-    defer record_file.close(io);
-    try record_file.writePositionalAll(io, encoded, 0);
-    try record_file.sync(io);
-    const output = try stage.openFile(io, staged_output, .{
+    name: []const u8,
+    evidence: OwnedIdentity,
+    require_empty: bool,
+) !std.Io.File {
+    const file = try root.dir.openFile(io, name, .{
         .mode = .read_write,
         .allow_directory = false,
         .follow_symlinks = false,
     });
-    defer output.close(io);
-    try output.setPermissions(io, .fromMode(0o600));
-    try output.sync(io);
-    try f.sync(io, stage);
-    try stage.renamePreserve(staged_output, root.dir, output_name, io);
-    var output_visible = true;
-    var record_visible = false;
-    var complete = false;
-    errdefer if (!complete) {
-        if (record_visible) root.dir.deleteFile(io, record_name) catch {};
-        if (output_visible) root.dir.deleteFile(io, output_name) catch {};
-        f.sync(io, root.dir) catch {};
+    errdefer file.close(io);
+    const snapshot = try p.snapshot(file);
+    if (!evidence.matches(snapshot) or (require_empty and snapshot.size != 0))
+        return error.AttemptOwnershipChanged;
+    return file;
+}
+
+fn openRetainedFile(
+    io: std.Io,
+    root: p.Directory,
+    name: []const u8,
+    retained: std.Io.File,
+    evidence: OwnedIdentity,
+    require_empty: bool,
+) !std.Io.File {
+    const named = try openEvidenceFile(io, root, name, evidence, require_empty);
+    errdefer named.close(io);
+    const retained_snapshot = try p.snapshot(retained);
+    const named_snapshot = try p.snapshot(named);
+    if (!p.sameSnapshot(retained_snapshot, named_snapshot))
+        return error.AttemptOwnershipChanged;
+    return named;
+}
+
+fn removeOwnedFile(
+    io: std.Io,
+    root: p.Directory,
+    name: []const u8,
+    retained: std.Io.File,
+    evidence: OwnedIdentity,
+) !void {
+    const named = openRetainedFile(io, root, name, retained, evidence, false) catch |err| switch (err) {
+        error.FileNotFound => {
+            const snapshot = try p.snapshot(retained);
+            if (snapshot.dev_major == evidence.device_major and
+                snapshot.dev_minor == evidence.device_minor and
+                snapshot.ino == evidence.inode and snapshot.nlink == 0)
+            {
+                return;
+            }
+            return error.AttemptOwnershipChanged;
+        },
+        else => return err,
     };
-    try stage.renamePreserve("result.json", root.dir, record_name, io);
-    record_visible = true;
-    try f.sync(io, stage);
+    defer named.close(io);
+    try root.dir.deleteFile(io, name);
+    const after = try p.snapshot(retained);
+    if (after.dev_major != evidence.device_major or
+        after.dev_minor != evidence.device_minor or after.ino != evidence.inode or
+        after.nlink != 0)
+    {
+        return error.AttemptCleanupFailed;
+    }
+}
+
+fn removeOwnedStage(
+    io: std.Io,
+    root: p.Directory,
+    attempt: *ReservedAttempt,
+) !void {
+    const names = attemptNames(attempt.evidence.kind);
+    return removeOwnedDirectory(
+        io,
+        root,
+        names.stage,
+        attempt.stage,
+        attempt.evidence.stage,
+    );
+}
+
+fn removeOwnedDirectory(
+    io: std.Io,
+    root: p.Directory,
+    name: []const u8,
+    retained: std.Io.Dir,
+    evidence: OwnedIdentity,
+) !void {
+    const named = root.dir.openDir(io, name, .{
+        .follow_symlinks = false,
+        .iterate = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            const snapshot = try directorySnapshot(retained);
+            if (snapshot.dev_major == evidence.device_major and
+                snapshot.dev_minor == evidence.device_minor and
+                snapshot.ino == evidence.inode and snapshot.nlink == 0)
+            {
+                return;
+            }
+            return error.AttemptOwnershipChanged;
+        },
+        else => return err,
+    };
+    defer named.close(io);
+    const retained_snapshot = try directorySnapshot(retained);
+    const named_snapshot = try directorySnapshot(named);
+    if (!evidence.matches(named_snapshot) or
+        !p.sameSnapshot(retained_snapshot, named_snapshot))
+    {
+        return error.AttemptOwnershipChanged;
+    }
+    var entries = named.iterate();
+    if (try entries.next(io) != null) return error.InvalidStage;
+    try root.dir.deleteDir(io, name);
+    const after = try directorySnapshot(retained);
+    if (after.dev_major != evidence.device_major or
+        after.dev_minor != evidence.device_minor or after.ino != evidence.inode or
+        after.nlink != 0)
+    {
+        return error.AttemptCleanupFailed;
+    }
     try f.sync(io, root.dir);
-    complete = true;
-    output_visible = false;
+}
+
+fn readRetainedRecord(
+    a: std.mem.Allocator,
+    io: std.Io,
+    root: p.Directory,
+    attempt: *ReservedAttempt,
+    maximum: usize,
+) ![]u8 {
+    const names = attemptNames(attempt.evidence.kind);
+    const named = try openRetainedFile(
+        io,
+        root,
+        names.record,
+        attempt.record,
+        attempt.evidence.record,
+        false,
+    );
+    defer named.close(io);
+    const before = try p.snapshot(attempt.record);
+    if (before.size == 0 or before.size > maximum) return error.InvalidRecord;
+    const bytes = try a.alloc(u8, @intCast(before.size));
+    errdefer a.free(bytes);
+    if (try attempt.record.readPositionalAll(io, bytes, 0) != bytes.len or
+        !p.sameSnapshot(before, try p.snapshot(attempt.record)) or
+        !p.sameSnapshot(before, try p.snapshot(named)))
+    {
+        return error.ArtifactChanged;
+    }
+    return bytes;
 }
 
 pub fn configHash(bytes: []const u8) c.Hash {

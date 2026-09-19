@@ -5,9 +5,10 @@ const compute = @import("compute_artifacts.zig");
 const linux = std.os.linux;
 pub const Job = struct { schema_version: u8 = 1, supervisor_pid: u32, state_dir: []const u8, efi: c.File, producer: c.File };
 pub const Qcow2Job = struct {
-    schema_version: u8 = 1,
+    schema_version: u8 = 2,
     supervisor_pid: u32,
     state_dir: []const u8,
+    attempt: compute.AttemptEvidence,
     source: compute.PinnedArtifact,
     producer: c.File,
     expected_virtual_bytes: u64,
@@ -17,9 +18,10 @@ pub const Qcow2Job = struct {
     config_sha256: []const u8,
 };
 pub const VhdJob = struct {
-    schema_version: u8 = 1,
+    schema_version: u8 = 2,
     supervisor_pid: u32,
     state_dir: []const u8,
+    attempt: compute.AttemptEvidence,
     source: compute.PinnedArtifact,
     producer: c.File,
     expected_capacity_bytes: u64,
@@ -74,13 +76,14 @@ pub fn executeQcow2(init: std.process.Init) !void {
     defer root.directory.close(io);
     const job = try c.read(Qcow2Job, a, root.job);
     try validateCommon(init, root.directory, job.schema_version, job.supervisor_pid, job.state_dir, job.producer);
+    try job.attempt.validate(.qcow2);
     try job.source.validate(job.limits.max_input_bytes);
     _ = try c.sha(job.expected_workload_sha256);
     _ = try c.sha(job.config_sha256);
     try compute.verifyPinned(io, job.source, job.limits.max_input_bytes);
     try launchMarker(io, root.directory, "qcow2-launched");
     try compute.applyWorkerLimits(job.limits);
-    _ = try compute.finalizeQcow2(a, io, root.directory, .{
+    _ = try compute.finalizeQcow2(a, io, root.directory, job.attempt, .{
         .source = job.source,
         .expected_virtual_bytes = job.expected_virtual_bytes,
         .expected_workload_sha256 = try c.sha(job.expected_workload_sha256),
@@ -98,12 +101,13 @@ pub fn executeVhd(init: std.process.Init) !void {
     defer root.directory.close(io);
     const job = try c.read(VhdJob, a, root.job);
     try validateCommon(init, root.directory, job.schema_version, job.supervisor_pid, job.state_dir, job.producer);
+    try job.attempt.validate(.vhd);
     try job.source.validate(job.limits.max_input_bytes);
     _ = try c.sha(job.config_sha256);
     try compute.verifyPinned(io, job.source, job.limits.max_input_bytes);
     try launchMarker(io, root.directory, "vhd-launched");
     try compute.applyWorkerLimits(job.limits);
-    _ = try compute.deriveFixedVhd(a, io, root.directory, .{
+    _ = try compute.deriveFixedVhd(a, io, root.directory, job.attempt, .{
         .source = job.source,
         .expected_capacity_bytes = job.expected_capacity_bytes,
         .limits = job.limits,
@@ -136,7 +140,7 @@ fn validateCommon(
 ) !void {
     const io = init.io;
     var death: c_int = 0;
-    if (schema_version != 1 or supervisor_pid != linux.getppid() or
+    if (schema_version != 2 or supervisor_pid != linux.getppid() or
         linux.getpgid(0) != linux.getpid() or
         linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_PDEATHSIG), @intFromPtr(&death), 0, 0, 0)) != .SUCCESS or
         death != @intFromEnum(linux.SIG.KILL)) return error.InvalidSupervisor;
