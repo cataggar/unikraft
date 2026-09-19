@@ -2663,6 +2663,39 @@ class HypervWorkflowTest(unittest.TestCase):
             '"$SCRATCH"/{home,tmp,cache,global-cache,restore,fixtures,outputs}',
             local_boot_readme,
         )
+
+    def test_wamr_compute_pipeline_uses_required_private_fixture_root(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        step = workflow.split(
+            "    - name: Exercise WAMR compute only after persistence source custody ends\n",
+            1,
+        )[1].split("\n    - name:", 1)[0]
+        for required in (
+            'compute_fixture_root="${root}/compute-fixtures"',
+            'mkdir -m 0700 "${compute_fixture_root}"',
+            'compute_fixture_root="$(readlink -f "${compute_fixture_root}")"',
+            'test "$(stat -c \'%a\' -- "${compute_fixture_root}")" = 700',
+            '-Dtest-root="${compute_fixture_root}"',
+            "-Doptimize=ReleaseSafe test install",
+        ):
+            self.assertIn(required, step)
+        for forbidden in ("|| true", "continue-on-error:", "-Dtest-filter="):
+            self.assertNotIn(forbidden, step)
+
+        build = (
+            SUPPORT / "build/wamr-native-ci/build.zig"
+        ).read_text()
+        pipeline = (
+            SUPPORT / "build/wamr-native-ci/pipeline_tests.zig"
+        ).read_text()
+        self.assertIn('b.step("test-unit"', build)
+        self.assertIn('b.step("test-pipeline"', build)
+        self.assertIn('b.step("test", "Run unit and required private compute pipeline fixtures")', build)
+        self.assertIn("error.MissingTestRoot", pipeline)
+        self.assertNotIn("error.SkipZigTest", pipeline)
+
         native = (
             SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
         ).read_text()

@@ -42,6 +42,16 @@ not change those semantics or spoof unavailable-storage markers:
   agree on the complete raw prefix; the existing fixed-VHD validator checks
   EFI bytes, ESP, geometry and footer. `inspect` physically reopens and
   rehashes them, checks the supervised worker records and refuses partial state.
+  Its additive compute-only `finalize-qcow2` and `derive-fixed-vhd` operations
+  accept canonical typed intents, retain exact source identity, and run native
+  Miz conversion in dedicated bounded workers. They publish create-only
+  `unikraft.qcow2`/`qcow2-finalization.json` and
+  `unikraft-derived.vhd`/`fixed-vhd-derivation.json` pairs. The QCOW2 record
+  binds decoded raw/GPT/ESP/workload identity and native-zstd/64-KiB settings;
+  the VHD record binds the exact QCOW2 digest, complete footer, partition
+  identity and allowed GPT relocation only. Failure supervision distinguishes
+  refusal from partial publication and rolls owned outputs back before
+  reporting refusal.
 * The existing installed `uk-hyperv-local-boot` runs four fresh one-CPU
   attempts: raw/x2APIC, raw/masked-x2APIC, full VHD/x2APIC and full
   VHD/masked-x2APIC. Each uses the **exact read-only package**, a genuine VPC
@@ -134,6 +144,13 @@ copied pins.
 The package, publication and four boot work directories are empty private
 slots created before that final custody baseline, so later outputs do not
 change a recorded supervisor/tool ancestor directory.
+
+The compute conversion primitives do not change those four legacy boots,
+stored preparation state, handoff, public bundle or Azure admission. In
+particular, fixed-VHD derivation takes an exact expected QCOW2 SHA-256 and
+capacity, not a JSON boot-success assertion. Six-mode sequencing, boot
+acceptance binding, bundle schemas and cloud evidence remain outside this
+primitive layer.
 
 Bootstrap execution is an explicit call-site capability, not a global
 fallback. Its closed exact-stage allowlist is `dependency-restore`,
@@ -345,6 +362,7 @@ zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
 zig build --build-file support/build/wamr-native-ci/build.zig \
   --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
   --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
+  -Dtest-root="$PWD/.d/wamr-ci-check/fixtures" \
   -Doptimize=ReleaseSafe -j2 test install
 WAMR_CI_PACKAGE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-package" \
 WAMR_CI_SUPERVISOR="$PWD/.d/wamr-ci-check/supervisor/bin/wamr-ci-supervisor" \
@@ -352,7 +370,14 @@ WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fix
   python3 -m unittest discover -s support/build/wamr-native-ci/tests -v
 ```
 
-The Python fixtures use the actual native packaging helper and pinned miz
+`test` is the protected aggregate and requires `-Dtest-root`; `test-pipeline`
+runs only the real conversion fixtures with the same requirement.
+`test-unit` is the explicit fixture-free command-boundary target.
+
+The Zig fixtures additionally run real raw-to-native-zstd-QCOW2 and
+exact-QCOW2-to-fixed-VHD workers, reopen both artifacts, validate byte/content
+identity and exercise a hard-deadline refusal with rollback and typed
+supervision. The Python fixtures use the actual native packaging helper and pinned miz
 with a synthetic **nonbootable** PE, plus synthetic compute/log records.
 They check full raw/VHD/footer hashes, physical reload, mutation/partial-state/
 replay refusal, exact results, the four CLI configurations, standard

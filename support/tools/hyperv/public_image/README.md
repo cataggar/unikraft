@@ -57,6 +57,41 @@ dispatch require a canonical private typed job, the actual parent PID/group
 and parent-death signal, and the parent-held writer lock. They are not general
 worker entry points.
 
+The exported `compute_artifacts` module is a separate compute-only surface; it
+does not add branches or optional fields to `prepare`, stored `State`, matrix,
+export, or import. It wraps the pinned Miz
+native compressed-QCOW2 writer and fixed-VHD `Image.createFile`/`copyAll`/
+`gpt.relocateBackup` primitives with:
+
+- exact path, size, SHA-256 and physical-identity pins for the retained source;
+- caller-bounded physical, virtual, metadata, partition-array, byte-work,
+  workload and worker-memory limits;
+- native zstd, version-3, standalone 64-KiB-cluster QCOW2 validation through
+  the bounded reader, including complete decoded-raw hashing;
+- verified primary/backup GPT, exact partition and EFI workload identities;
+- complete fixed-VHD footer, creator, checksum, timestamp, geometry and
+  allocation reporting, plus an exact byte-for-byte reconstruction of pinned
+  Miz's relocation: only the protective-entry end CHS/count, explicit GPT
+  locations/CRCs and relocated backup metadata may change; bootstrap code,
+  disk signature, reserved bytes, partition arrays and header padding remain
+  bound;
+- parent-created, create-only stage/output/record reservations retained by
+  physical identity before worker launch. Workers refuse substituted slots,
+  and failure cleanup removes only names that still identify this attempt's
+  objects, leaving collisions and replacements untouched;
+- parent-side reopening of the retained output after worker exit, followed by
+  bounded recomputation and structural equality of every canonical QCOW2/VHD
+  record field (including host allocation) before `succeeded` admission, with
+  explicit `refused`/`partial` supervision otherwise.
+
+`finalize-qcow2` and `derive-fixed-vhd` are available only through the WAMR
+compute adapter's private supervised worker contract. The derivation intent
+contains the exact accepted QCOW2 digest and capacity; it does not accept a
+caller assertion such as `passed: true`. These primitives do not perform a
+boot, admit acceptance evidence, export a bundle, authorize Azure, or consume
+approval, attempt, ledger or cloud state. Those sequencing and evidence
+contracts remain future orchestration work.
+
 Successful export stdout is **only the lowercase 64-character SHA256 of the
 exact manifest bytes plus LF**, suitable for checked shell capture. Prepare
 and matrix commands emit bounded canonical JSON. Failures contain only
@@ -231,9 +266,9 @@ ledger or establishes live authority.
 
 ## Module API
 
-`root.zig` exports `contracts`, `files`, `network`, `package`, `engine`,
-`worker`, `manifest`, `importer`, `import_contracts`, `boot` and `core`.
-Use an arena per bounded command.
+`root.zig` exports `contracts`, `files`, `network`, `package`,
+`compute_artifacts`, `engine`, `worker`, `manifest`, `importer`,
+`import_contracts`, `boot` and `core`. Use an arena per bounded command.
 
 - `engine.prepare(a, io, contracts.Input, Options)!State`: requires dedicated
   `core.process.initialize()`; `Options` contains the actual producer path
@@ -251,6 +286,13 @@ Use an arena per bounded command.
 - `package.build`/`observe`, `network.fromConfig`/`serial`, and
   `engine.bootConfig` expose the focused native primitives. Only trusted
   orchestration should invoke them; no production fixture switch exists.
+- `compute_artifacts.reserveAttempt` must create and retain the typed
+  stage/output/record ownership before `finalizeQcow2` or `deriveFixedVhd`.
+  `verifyFinalizedQcow2`/`verifyDerivedFixedVhd` reopen those exact identities
+  and recompute canonical lineage before admission. `readFinalizationRecord`
+  and `readDerivationRecord` enforce canonical complete records and reject
+  changed parent, tool, profile, allocation, identity, footer or relocation
+  fields.
 
 ## Focused offline fixtures
 

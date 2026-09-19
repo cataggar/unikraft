@@ -4,6 +4,7 @@ const c = image.contracts;
 const t = std.testing;
 const a = t.allocator;
 const io = t.io;
+const linux = std.os.linux;
 const options = @import("test_options");
 const serial_fixture = @import("fixture.zig");
 const config_text = "CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION=y\n" ++
@@ -85,6 +86,598 @@ const Fixture = struct {
         return image.core.private_files.Directory.open(io, self.input.state_dir);
     }
 };
+
+fn finalizeDirect(
+    alloc: std.mem.Allocator,
+    root: image.core.private_files.Directory,
+    options_value: image.compute_artifacts.FinalizeOptions,
+) !image.compute_artifacts.FinalizationRecord {
+    var attempt = try image.compute_artifacts.reserveAttempt(io, root, .qcow2);
+    defer attempt.close(io);
+    const record = image.compute_artifacts.finalizeQcow2(
+        alloc,
+        io,
+        root,
+        attempt.evidence,
+        options_value,
+    ) catch |err| {
+        _ = attempt.rollback(io, root);
+        return err;
+    };
+    _ = try image.compute_artifacts.verifyFinalizedQcow2(
+        alloc,
+        io,
+        root,
+        &attempt,
+        options_value,
+    );
+    if (!attempt.cleanupStage(io, root)) return error.AttemptCleanupFailed;
+    return record;
+}
+
+fn deriveDirect(
+    alloc: std.mem.Allocator,
+    root: image.core.private_files.Directory,
+    options_value: image.compute_artifacts.DeriveOptions,
+) !image.compute_artifacts.DerivationRecord {
+    var attempt = try image.compute_artifacts.reserveAttempt(io, root, .vhd);
+    defer attempt.close(io);
+    const record = image.compute_artifacts.deriveFixedVhd(
+        alloc,
+        io,
+        root,
+        attempt.evidence,
+        options_value,
+    ) catch |err| {
+        _ = attempt.rollback(io, root);
+        return err;
+    };
+    _ = try image.compute_artifacts.verifyDerivedFixedVhd(
+        alloc,
+        io,
+        root,
+        &attempt,
+        options_value,
+    );
+    if (!attempt.cleanupStage(io, root)) return error.AttemptCleanupFailed;
+    return record;
+}
+
+fn expectMissingName(directory: image.core.private_files.Directory, name: []const u8) !void {
+    if (directory.dir.statFile(io, name, .{ .follow_symlinks = false })) |_| {
+        return error.UnexpectedOutput;
+    } else |err| if (err != error.FileNotFound) return err;
+}
+
+fn rewritePrivateFile(
+    directory: image.core.private_files.Directory,
+    name: []const u8,
+    bytes: []const u8,
+) !void {
+    const file = try directory.dir.openFile(io, name, .{
+        .mode = .read_write,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    try file.setLength(io, 0);
+    try file.writePositionalAll(io, bytes, 0);
+    try file.setLength(io, bytes.len);
+    try file.sync(io);
+    try image.files.sync(io, directory.dir);
+}
+
+fn openFdCount() !usize {
+    const directory = try std.Io.Dir.openDirAbsolute(io, "/proc/self/fd", .{
+        .iterate = true,
+    });
+    defer directory.close(io);
+    var entries = directory.iterate();
+    var count: usize = 0;
+    while (try entries.next(io) != null) count += 1;
+    return count;
+}
+
+const DescriptorProbe = struct {
+    const Mode = enum { observe, cancel_adoption };
+
+    table: std.Io.VTable = io.vtable.*,
+    output_name: []const u8,
+    target_open_index: usize,
+    mode: Mode = .observe,
+    output_opens: usize = 0,
+    target: ?linux.fd_t = null,
+    target_closes: usize = 0,
+    failures: usize = 0,
+    threadlocal var active: ?*DescriptorProbe = null;
+
+    fn install(self: *DescriptorProbe) std.Io {
+        std.debug.assert(active == null);
+        active = self;
+        self.table.dirOpenFile = openFile;
+        self.table.fileReadPositional = readPositional;
+        self.table.fileClose = close;
+        return .{ .userdata = io.userdata, .vtable = &self.table };
+    }
+
+    fn deinit(_: *DescriptorProbe) void {
+        active = null;
+    }
+
+    fn openFile(
+        userdata: ?*anyopaque,
+        directory: std.Io.Dir,
+        sub_path: []const u8,
+        open_options: std.Io.Dir.OpenFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        const file = try io.vtable.dirOpenFile(userdata, directory, sub_path, open_options);
+        const self = active.?;
+        if (std.mem.eql(u8, sub_path, self.output_name)) {
+            self.output_opens += 1;
+            if (self.output_opens == self.target_open_index) self.target = file.handle;
+        }
+        return file;
+    }
+
+    fn readPositional(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        data: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        const self = active.?;
+        if (self.target != null and file.handle == self.target.? and
+            self.mode == .cancel_adoption and self.failures == 0)
+        {
+            self.failures += 1;
+            return error.Canceled;
+        }
+        return io.vtable.fileReadPositional(userdata, file, data, offset);
+    }
+
+    fn close(userdata: ?*anyopaque, files: []const std.Io.File) void {
+        const self = active.?;
+        if (self.target) |target| {
+            for (files) |file| {
+                if (file.handle == target) self.target_closes += 1;
+            }
+        }
+        io.vtable.fileClose(userdata, files);
+    }
+};
+
+const OomAfterTarget = struct {
+    backing: std.mem.Allocator,
+    probe: *DescriptorProbe,
+    induced: bool = false,
+
+    fn allocator(self: *OomAfterTarget) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(
+        context: *anyopaque,
+        length: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *OomAfterTarget = @ptrCast(@alignCast(context));
+        if (self.probe.target != null and !self.induced) {
+            self.induced = true;
+            return null;
+        }
+        return self.backing.rawAlloc(length, alignment, return_address);
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_length: usize,
+        return_address: usize,
+    ) bool {
+        const self: *OomAfterTarget = @ptrCast(@alignCast(context));
+        return self.backing.rawResize(memory, alignment, new_length, return_address);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_length: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *OomAfterTarget = @ptrCast(@alignCast(context));
+        return self.backing.rawRemap(memory, alignment, new_length, return_address);
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *OomAfterTarget = @ptrCast(@alignCast(context));
+        self.backing.rawFree(memory, alignment, return_address);
+    }
+};
+
+fn expectProbeClosed(probe: DescriptorProbe, expected_opens: usize) !void {
+    try t.expectEqual(expected_opens, probe.output_opens);
+    try t.expectEqual(@as(usize, 1), probe.target_closes);
+    try t.expectEqual(
+        .BADF,
+        linux.errno(linux.fcntl(probe.target.?, linux.F.GETFD, 0)),
+    );
+}
+
+fn expectCallerOpen(file: std.Io.File) !void {
+    try t.expectEqual(.SUCCESS, linux.errno(linux.fcntl(file.handle, linux.F.GETFD, 0)));
+    try t.expect((try file.stat(io)).size != 0);
+}
+
+fn expectFinalizationInjected(
+    alloc: std.mem.Allocator,
+    root: image.core.private_files.Directory,
+    attempt: *image.compute_artifacts.ReservedAttempt,
+    options_value: image.compute_artifacts.FinalizeOptions,
+    point: image.compute_artifacts.descriptor_testing.FaultPoint,
+) !void {
+    const before = try openFdCount();
+    {
+        var probe: DescriptorProbe = .{
+            .output_name = image.compute_artifacts.qcow2_name,
+            .target_open_index = 1,
+        };
+        const fault_io = probe.install();
+        defer probe.deinit();
+        image.compute_artifacts.descriptor_testing.install(point);
+        defer image.compute_artifacts.descriptor_testing.clear();
+        try t.expectError(
+            error.InjectedDescriptorFault,
+            image.compute_artifacts.verifyFinalizedQcow2(
+                alloc,
+                fault_io,
+                root,
+                attempt,
+                options_value,
+            ),
+        );
+        try t.expectEqual(@as(usize, 1), image.compute_artifacts.descriptor_testing.hits());
+        try expectProbeClosed(probe, 1);
+    }
+    try t.expectEqual(before, try openFdCount());
+}
+
+fn expectDerivationInjected(
+    alloc: std.mem.Allocator,
+    root: image.core.private_files.Directory,
+    attempt: *image.compute_artifacts.ReservedAttempt,
+    options_value: image.compute_artifacts.DeriveOptions,
+    point: image.compute_artifacts.descriptor_testing.FaultPoint,
+) !void {
+    const before = try openFdCount();
+    {
+        var probe: DescriptorProbe = .{
+            .output_name = image.compute_artifacts.vhd_name,
+            .target_open_index = 1,
+        };
+        const fault_io = probe.install();
+        defer probe.deinit();
+        image.compute_artifacts.descriptor_testing.install(point);
+        defer image.compute_artifacts.descriptor_testing.clear();
+        try t.expectError(
+            error.InjectedDescriptorFault,
+            image.compute_artifacts.verifyDerivedFixedVhd(
+                alloc,
+                fault_io,
+                root,
+                attempt,
+                options_value,
+            ),
+        );
+        try t.expectEqual(@as(usize, 1), image.compute_artifacts.descriptor_testing.hits());
+        try expectProbeClosed(probe, 1);
+    }
+    try t.expectEqual(before, try openFdCount());
+}
+
+test "compute attempts reserve every publication slot and clean only retained identities" {
+    const fixture = try Fixture.init(0, false);
+    defer fixture.deinit();
+    const alloc = fixture.arena.allocator();
+    const cases = [_]struct {
+        kind: image.compute_artifacts.AttemptKind,
+        stage: []const u8,
+        output: []const u8,
+        record: []const u8,
+    }{
+        .{
+            .kind = .qcow2,
+            .stage = image.compute_artifacts.qcow2_stage_name,
+            .output = image.compute_artifacts.qcow2_name,
+            .record = image.compute_artifacts.qcow2_record_name,
+        },
+        .{
+            .kind = .vhd,
+            .stage = image.compute_artifacts.vhd_stage_name,
+            .output = image.compute_artifacts.vhd_name,
+            .record = image.compute_artifacts.vhd_record_name,
+        },
+    };
+    for (cases, 0..) |case, case_index| {
+        for ([_]enum { stage, output, record }{ .stage, .output, .record }, 0..) |target, target_index| {
+            const state_path = try image.files.path(
+                alloc,
+                fixture.path,
+                try std.fmt.allocPrint(alloc, "collision-{d}-{d}", .{ case_index, target_index }),
+            );
+            const state = try image.files.create(io, state_path);
+            defer state.close(io);
+            switch (target) {
+                .stage => {
+                    try state.dir.createDir(io, case.stage, .fromMode(0o700));
+                    const collision = try state.dir.openDir(io, case.stage, .{
+                        .follow_symlinks = false,
+                    });
+                    defer collision.close(io);
+                    try collision.writeFile(io, .{
+                        .sub_path = "sentinel",
+                        .data = "stage collision",
+                        .flags = .{
+                            .exclusive = true,
+                            .permissions = .fromMode(0o600),
+                        },
+                    });
+                },
+                .output, .record => {
+                    const name = if (target == .output) case.output else case.record;
+                    try state.dir.writeFile(io, .{
+                        .sub_path = name,
+                        .data = "publication collision",
+                        .flags = .{
+                            .exclusive = true,
+                            .permissions = .fromMode(0o600),
+                        },
+                    });
+                },
+            }
+            try t.expectError(
+                error.PathAlreadyExists,
+                image.compute_artifacts.reserveAttempt(io, state, case.kind),
+            );
+            switch (target) {
+                .stage => {
+                    const collision = try state.dir.openDir(io, case.stage, .{
+                        .follow_symlinks = false,
+                    });
+                    defer collision.close(io);
+                    try t.expectEqualStrings(
+                        "stage collision",
+                        try (image.core.private_files.Directory{ .dir = collision }).read(
+                            io,
+                            alloc,
+                            "sentinel",
+                            64,
+                            null,
+                        ),
+                    );
+                },
+                .output, .record => {
+                    const name = if (target == .output) case.output else case.record;
+                    try t.expectEqualStrings(
+                        "publication collision",
+                        try state.read(io, alloc, name, 64, null),
+                    );
+                },
+            }
+        }
+    }
+
+    const retry_path = try image.files.path(alloc, fixture.path, "crash-retry");
+    const retry_state = try image.files.create(io, retry_path);
+    defer retry_state.close(io);
+    var abandoned = try image.compute_artifacts.reserveAttempt(io, retry_state, .qcow2);
+    abandoned.close(io);
+    try t.expectError(
+        error.PathAlreadyExists,
+        image.compute_artifacts.reserveAttempt(io, retry_state, .qcow2),
+    );
+    try t.expectEqual(@as(u64, 0), (try retry_state.dir.statFile(
+        io,
+        image.compute_artifacts.qcow2_name,
+        .{ .follow_symlinks = false },
+    )).size);
+
+    const replacement_path = try image.files.path(alloc, fixture.path, "replacement");
+    const replacement_state = try image.files.create(io, replacement_path);
+    defer replacement_state.close(io);
+    var replaced = try image.compute_artifacts.reserveAttempt(io, replacement_state, .vhd);
+    defer replaced.close(io);
+    try replacement_state.dir.rename(
+        image.compute_artifacts.vhd_name,
+        replacement_state.dir,
+        "owned-output",
+        io,
+    );
+    try replacement_state.dir.writeFile(io, .{
+        .sub_path = image.compute_artifacts.vhd_name,
+        .data = "replacement output",
+        .flags = .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        },
+    });
+    const replacement_cleanup = replaced.rollback(io, replacement_state);
+    try t.expect(!replacement_cleanup.output_complete);
+    try t.expectEqualStrings(
+        "replacement output",
+        try replacement_state.read(io, alloc, image.compute_artifacts.vhd_name, 64, null),
+    );
+    try expectMissingName(replacement_state, image.compute_artifacts.vhd_record_name);
+
+    const moved_path = try image.files.path(alloc, fixture.path, "moved-reservation");
+    const moved_state = try image.files.create(io, moved_path);
+    defer moved_state.close(io);
+    var moved = try image.compute_artifacts.reserveAttempt(io, moved_state, .vhd);
+    defer moved.close(io);
+    try moved_state.dir.rename(
+        image.compute_artifacts.vhd_record_name,
+        moved_state.dir,
+        "moved-record",
+        io,
+    );
+    const moved_cleanup = moved.rollback(io, moved_state);
+    try t.expect(!moved_cleanup.record_complete);
+    try t.expect(moved_cleanup.stage_complete and moved_cleanup.output_complete);
+    try t.expectEqual(@as(u64, 0), (try moved_state.dir.statFile(
+        io,
+        "moved-record",
+        .{ .follow_symlinks = false },
+    )).size);
+
+    const record_replacement_path = try image.files.path(
+        alloc,
+        fixture.path,
+        "record-replacement",
+    );
+    const record_replacement_state = try image.files.create(io, record_replacement_path);
+    defer record_replacement_state.close(io);
+    var record_replaced = try image.compute_artifacts.reserveAttempt(
+        io,
+        record_replacement_state,
+        .qcow2,
+    );
+    defer record_replaced.close(io);
+    try record_replacement_state.dir.rename(
+        image.compute_artifacts.qcow2_record_name,
+        record_replacement_state.dir,
+        "owned-record",
+        io,
+    );
+    try record_replacement_state.dir.writeFile(io, .{
+        .sub_path = image.compute_artifacts.qcow2_record_name,
+        .data = "replacement record",
+        .flags = .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        },
+    });
+    const record_replacement_cleanup = record_replaced.rollback(
+        io,
+        record_replacement_state,
+    );
+    try t.expect(!record_replacement_cleanup.record_complete);
+    try t.expectEqualStrings(
+        "replacement record",
+        try record_replacement_state.read(
+            io,
+            alloc,
+            image.compute_artifacts.qcow2_record_name,
+            64,
+            null,
+        ),
+    );
+    try expectMissingName(record_replacement_state, image.compute_artifacts.qcow2_name);
+
+    const stage_replacement_path = try image.files.path(
+        alloc,
+        fixture.path,
+        "stage-replacement",
+    );
+    const stage_replacement_state = try image.files.create(io, stage_replacement_path);
+    defer stage_replacement_state.close(io);
+    var stage_replaced = try image.compute_artifacts.reserveAttempt(
+        io,
+        stage_replacement_state,
+        .vhd,
+    );
+    defer stage_replaced.close(io);
+    try stage_replacement_state.dir.rename(
+        image.compute_artifacts.vhd_stage_name,
+        stage_replacement_state.dir,
+        "owned-stage",
+        io,
+    );
+    try stage_replacement_state.dir.createDir(
+        io,
+        image.compute_artifacts.vhd_stage_name,
+        .fromMode(0o700),
+    );
+    const replacement_stage = try stage_replacement_state.dir.openDir(
+        io,
+        image.compute_artifacts.vhd_stage_name,
+        .{ .follow_symlinks = false },
+    );
+    defer replacement_stage.close(io);
+    try replacement_stage.writeFile(io, .{
+        .sub_path = "sentinel",
+        .data = "replacement stage",
+        .flags = .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        },
+    });
+    const stage_replacement_cleanup = stage_replaced.rollback(
+        io,
+        stage_replacement_state,
+    );
+    try t.expect(!stage_replacement_cleanup.stage_complete);
+    try t.expect(stage_replacement_cleanup.output_complete);
+    try t.expect(stage_replacement_cleanup.record_complete);
+    try t.expectEqualStrings(
+        "replacement stage",
+        try (image.core.private_files.Directory{ .dir = replacement_stage }).read(
+            io,
+            alloc,
+            "sentinel",
+            64,
+            null,
+        ),
+    );
+
+    const cleanup_path = try image.files.path(alloc, fixture.path, "cleanup-failure");
+    const cleanup_state = try image.files.create(io, cleanup_path);
+    defer cleanup_state.close(io);
+    var blocked = try image.compute_artifacts.reserveAttempt(io, cleanup_state, .qcow2);
+    defer blocked.close(io);
+    try blocked.stage.writeFile(io, .{
+        .sub_path = "unexpected",
+        .data = "retained failure evidence",
+        .flags = .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        },
+    });
+    const blocked_cleanup = blocked.rollback(io, cleanup_state);
+    try t.expect(!blocked_cleanup.stage_complete);
+    try t.expect(blocked_cleanup.output_complete and blocked_cleanup.record_complete);
+    const retained_stage = try cleanup_state.dir.openDir(
+        io,
+        image.compute_artifacts.qcow2_stage_name,
+        .{ .follow_symlinks = false },
+    );
+    defer retained_stage.close(io);
+    try t.expectEqualStrings(
+        "retained failure evidence",
+        try (image.core.private_files.Directory{ .dir = retained_stage }).read(
+            io,
+            alloc,
+            "unexpected",
+            64,
+            null,
+        ),
+    );
+}
+
 test "native miz creates exact raw GPT fixed VHD genuine four-mode wire and durable exact export" {
     const f = try Fixture.init(16, false);
     defer f.deinit();
@@ -148,6 +741,1215 @@ test "direct native package structurally validates synthetic PE raw and fixed VH
     const report = try image.package.build(alloc, io, root, input);
     try t.expectEqual(@as(u64, c.vhd_bytes), report.vhd.size);
     try image.files.cleanupStage(io, root, "package-stage");
+}
+test "compute-only raw to native zstd QCOW2 to digest-bound fixed VHD" {
+    const fixture = try Fixture.init(0, false);
+    defer fixture.deinit();
+    const alloc = fixture.arena.allocator();
+    const root = try image.files.create(io, fixture.input.state_dir);
+    defer root.close(io);
+    const efi_input = try image.files.record(alloc, io, fixture.input.efi, c.max_efi, false);
+    const packaged = try image.package.build(alloc, io, root, efi_input);
+    try image.files.cleanupStage(io, root, "package-stage");
+    const producer = try image.files.record(alloc, io, fixture.cli, c.max_tool, true);
+    const limits: image.compute_artifacts.Limits = .{
+        .max_input_bytes = c.raw_bytes,
+        .max_output_bytes = c.vhd_bytes,
+        .max_virtual_bytes = c.raw_bytes,
+        .max_partition_array_bytes = 1024 * 1024,
+        .max_metadata_bytes = 128 * 1024,
+        .max_metadata_work = 8194,
+        .max_work_bytes = 4 * c.raw_bytes,
+        .max_memory_bytes = 512 * 1024 * 1024,
+    };
+    const raw_path = try image.files.path(alloc, fixture.input.state_dir, "unikraft.raw");
+    const raw = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        raw_path,
+        packaged.raw.size,
+        packaged.raw.sha256,
+        limits.max_input_bytes,
+    );
+    const finalize_options: image.compute_artifacts.FinalizeOptions = .{
+        .source = raw,
+        .expected_virtual_bytes = packaged.raw.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("native compute finalization fixture"),
+    };
+    const refusal_path = try image.files.path(alloc, fixture.path, "worker-refusal");
+    const refusal_state = try image.files.create(io, refusal_path);
+    defer refusal_state.close(io);
+    var refused_attempt = try image.compute_artifacts.reserveAttempt(io, refusal_state, .qcow2);
+    defer refused_attempt.close(io);
+    try refusal_state.dir.rename(
+        image.compute_artifacts.qcow2_name,
+        refusal_state.dir,
+        "owned-output",
+        io,
+    );
+    try refusal_state.dir.writeFile(io, .{
+        .sub_path = image.compute_artifacts.qcow2_name,
+        .data = "substituted reservation",
+        .flags = .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        },
+    });
+    try t.expectError(
+        error.AttemptOwnershipChanged,
+        image.compute_artifacts.finalizeQcow2(
+            alloc,
+            io,
+            refusal_state,
+            refused_attempt.evidence,
+            finalize_options,
+        ),
+    );
+    const refusal_cleanup = refused_attempt.rollback(io, refusal_state);
+    try t.expect(!refusal_cleanup.output_complete);
+    try t.expectEqualStrings(
+        "substituted reservation",
+        try refusal_state.read(io, alloc, image.compute_artifacts.qcow2_name, 64, null),
+    );
+
+    const finalized = try finalizeDirect(alloc, root, finalize_options);
+    try t.expectEqual(@as(u64, c.raw_bytes), finalized.output.virtual_bytes);
+    try t.expect(finalized.output.file_bytes < finalized.output.virtual_bytes);
+    try t.expectEqualStrings(packaged.raw.sha256, finalized.source_sha256);
+    try t.expectEqualStrings(efi_input.sha256, finalized.identity.workload_sha256);
+    const stored_finalization = try image.compute_artifacts.readFinalizationRecord(
+        alloc,
+        try root.read(io, alloc, image.compute_artifacts.qcow2_record_name, c.max_record, null),
+    );
+    try image.files.same(alloc, finalized, stored_finalization);
+
+    const verification_path = try image.files.path(alloc, fixture.path, "parent-verification");
+    const verification_state = try image.files.create(io, verification_path);
+    defer verification_state.close(io);
+    var verification_attempt = try image.compute_artifacts.reserveAttempt(io, verification_state, .qcow2);
+    defer verification_attempt.close(io);
+    _ = try image.compute_artifacts.finalizeQcow2(
+        alloc,
+        io,
+        verification_state,
+        verification_attempt.evidence,
+        finalize_options,
+    );
+    const original_record = try verification_state.read(
+        io,
+        alloc,
+        image.compute_artifacts.qcow2_record_name,
+        c.max_record,
+        null,
+    );
+    const canonical = try image.compute_artifacts.readFinalizationRecord(alloc, original_record);
+    var mutations = [_]image.compute_artifacts.FinalizationRecord{
+        canonical,
+        canonical,
+        canonical,
+        canonical,
+    };
+    mutations[0].output.allocated = .{ .state = .unavailable, .bytes = null };
+    mutations[1].identity.workload_sha256 = "0" ** 64;
+    mutations[2].provenance.config_sha256 = "0" ** 64;
+    mutations[3].output.sha256 = "0" ** 64;
+    for (mutations) |mutation| {
+        try rewritePrivateFile(
+            verification_state,
+            image.compute_artifacts.qcow2_record_name,
+            try c.encode(alloc, mutation),
+        );
+        if (image.compute_artifacts.verifyFinalizedQcow2(
+            alloc,
+            io,
+            verification_state,
+            &verification_attempt,
+            finalize_options,
+        )) |_| return error.AcceptedTamperedFinalization else |_| {}
+    }
+    try rewritePrivateFile(
+        verification_state,
+        image.compute_artifacts.qcow2_record_name,
+        original_record,
+    );
+    const verification_output = try verification_state.dir.openFile(
+        io,
+        image.compute_artifacts.qcow2_name,
+        .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .follow_symlinks = false,
+        },
+    );
+    var original_header_byte: [1]u8 = undefined;
+    _ = try verification_output.readPositionalAll(io, &original_header_byte, 105);
+    try verification_output.writePositionalAll(io, &.{original_header_byte[0] ^ 1}, 105);
+    try verification_output.sync(io);
+    const changed_snapshot = try image.boot.files.snapshot(verification_output);
+    var coherently_rehashed = canonical;
+    coherently_rehashed.output.sha256 = try c.hex(
+        alloc,
+        try image.boot.files.digest(io, verification_output, changed_snapshot),
+    );
+    verification_output.close(io);
+    try rewritePrivateFile(
+        verification_state,
+        image.compute_artifacts.qcow2_record_name,
+        try c.encode(alloc, coherently_rehashed),
+    );
+    if (image.compute_artifacts.verifyFinalizedQcow2(
+        alloc,
+        io,
+        verification_state,
+        &verification_attempt,
+        finalize_options,
+    )) |_| return error.AcceptedRehashedQcow2Tamper else |_| {}
+    try rewritePrivateFile(
+        verification_state,
+        image.compute_artifacts.qcow2_record_name,
+        original_record,
+    );
+    const restore_output = try verification_state.dir.openFile(
+        io,
+        image.compute_artifacts.qcow2_name,
+        .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .follow_symlinks = false,
+        },
+    );
+    try restore_output.writePositionalAll(io, &original_header_byte, 105);
+    try restore_output.sync(io);
+    restore_output.close(io);
+    try verification_state.dir.rename(
+        image.compute_artifacts.qcow2_name,
+        verification_state.dir,
+        "retained-qcow2",
+        io,
+    );
+    const retained_qcow2_path = try image.files.path(
+        alloc,
+        verification_path,
+        "retained-qcow2",
+    );
+    const retained_qcow2 = try image.files.record(
+        alloc,
+        io,
+        retained_qcow2_path,
+        limits.max_output_bytes,
+        false,
+    );
+    try image.files.copy(
+        io,
+        retained_qcow2,
+        verification_state,
+        image.compute_artifacts.qcow2_name,
+    );
+    try t.expectError(
+        error.AttemptOwnershipChanged,
+        image.compute_artifacts.verifyFinalizedQcow2(
+            alloc,
+            io,
+            verification_state,
+            &verification_attempt,
+            finalize_options,
+        ),
+    );
+
+    const qcow2_path = try image.files.path(alloc, fixture.input.state_dir, image.compute_artifacts.qcow2_name);
+    const qcow2 = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        qcow2_path,
+        finalized.output.file_bytes,
+        finalized.output.sha256,
+        limits.max_input_bytes,
+    );
+    const derive_options: image.compute_artifacts.DeriveOptions = .{
+        .source = qcow2,
+        .expected_capacity_bytes = finalized.output.virtual_bytes,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("native compute fixed vhd fixture"),
+    };
+    const vhd_refusal_path = try image.files.path(alloc, fixture.path, "vhd-worker-refusal");
+    const vhd_refusal_state = try image.files.create(io, vhd_refusal_path);
+    defer vhd_refusal_state.close(io);
+    var vhd_refused_attempt = try image.compute_artifacts.reserveAttempt(
+        io,
+        vhd_refusal_state,
+        .vhd,
+    );
+    defer vhd_refused_attempt.close(io);
+    try vhd_refusal_state.dir.rename(
+        image.compute_artifacts.vhd_name,
+        vhd_refusal_state.dir,
+        "owned-output",
+        io,
+    );
+    try vhd_refusal_state.dir.writeFile(io, .{
+        .sub_path = image.compute_artifacts.vhd_name,
+        .data = "substituted reservation",
+        .flags = .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        },
+    });
+    try t.expectError(
+        error.AttemptOwnershipChanged,
+        image.compute_artifacts.deriveFixedVhd(
+            alloc,
+            io,
+            vhd_refusal_state,
+            vhd_refused_attempt.evidence,
+            derive_options,
+        ),
+    );
+    const vhd_refusal_cleanup = vhd_refused_attempt.rollback(io, vhd_refusal_state);
+    try t.expect(!vhd_refusal_cleanup.output_complete);
+    try t.expectEqualStrings(
+        "substituted reservation",
+        try vhd_refusal_state.read(
+            io,
+            alloc,
+            image.compute_artifacts.vhd_name,
+            64,
+            null,
+        ),
+    );
+
+    const derived = try deriveDirect(alloc, root, derive_options);
+    try t.expectEqualStrings(finalized.output.sha256, derived.accepted_qcow2.sha256);
+    try t.expectEqualStrings(finalized.source_sha256, derived.accepted_qcow2_decoded_sha256);
+    try t.expectEqual(@as(u64, c.vhd_bytes), derived.output.file_bytes);
+    try t.expect(!derived.relocation.was_relocated);
+    try image.files.same(alloc, finalized.identity, derived.output_identity);
+    const stored_derivation = try image.compute_artifacts.readDerivationRecord(
+        alloc,
+        try root.read(io, alloc, image.compute_artifacts.vhd_record_name, c.max_record, null),
+    );
+    try image.files.same(alloc, derived, stored_derivation);
+    var bad_derivation = derived;
+    bad_derivation.footer.checksum +%= 1;
+    try t.expectError(
+        error.InvalidFooter,
+        image.compute_artifacts.readDerivationRecord(
+            alloc,
+            try c.encode(alloc, bad_derivation),
+        ),
+    );
+    bad_derivation = derived;
+    bad_derivation.output_identity.workload_sha256 = "0" ** 64;
+    try t.expectError(
+        error.InvalidRecord,
+        image.compute_artifacts.readDerivationRecord(
+            alloc,
+            try c.encode(alloc, bad_derivation),
+        ),
+    );
+
+    var wrong: [64]u8 = undefined;
+    @memcpy(&wrong, finalized.output.sha256);
+    wrong[0] = if (wrong[0] == '0') '1' else '0';
+    try t.expectError(
+        error.ArtifactChanged,
+        image.compute_artifacts.bindExpected(
+            alloc,
+            io,
+            qcow2_path,
+            finalized.output.file_bytes,
+            &wrong,
+            limits.max_input_bytes,
+        ),
+    );
+    try t.expectError(
+        error.PathAlreadyExists,
+        finalizeDirect(alloc, root, .{
+            .source = raw,
+            .expected_virtual_bytes = packaged.raw.size,
+            .expected_workload_sha256 = try c.sha(efi_input.sha256),
+            .expected_workload_bytes = efi_input.size,
+            .limits = limits,
+            .producer = producer,
+            .config_sha256 = c.hash("collision"),
+        }),
+    );
+    const tampered = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        try root.read(io, alloc, image.compute_artifacts.qcow2_record_name, c.max_record, null),
+        "\"status\":\"succeeded\"",
+        "\"status\":\"refused\"",
+    );
+    try t.expectError(
+        error.InvalidRecord,
+        image.compute_artifacts.readFinalizationRecord(alloc, tampered),
+    );
+}
+test "compute record builders close every adopted output descriptor exactly once" {
+    const fixture = try Fixture.init(0, false);
+    defer fixture.deinit();
+    const alloc = fixture.arena.allocator();
+    const package_root = try image.files.create(io, fixture.input.state_dir);
+    defer package_root.close(io);
+    const efi_input = try image.files.record(alloc, io, fixture.input.efi, c.max_efi, false);
+    const packaged = try image.package.build(alloc, io, package_root, efi_input);
+    try image.files.cleanupStage(io, package_root, "package-stage");
+    const producer = try image.files.record(alloc, io, fixture.cli, c.max_tool, true);
+    const limits: image.compute_artifacts.Limits = .{
+        .max_input_bytes = c.raw_bytes,
+        .max_output_bytes = c.vhd_bytes,
+        .max_virtual_bytes = c.raw_bytes,
+        .max_partition_array_bytes = 1024 * 1024,
+        .max_metadata_bytes = 128 * 1024,
+        .max_metadata_work = 8194,
+        .max_work_bytes = 4 * c.raw_bytes,
+        .max_memory_bytes = 512 * 1024 * 1024,
+    };
+    const raw_path = try image.files.path(alloc, fixture.input.state_dir, "unikraft.raw");
+    const raw = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        raw_path,
+        packaged.raw.size,
+        packaged.raw.sha256,
+        limits.max_input_bytes,
+    );
+    const finalize_options: image.compute_artifacts.FinalizeOptions = .{
+        .source = raw,
+        .expected_virtual_bytes = packaged.raw.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("descriptor finalization fixture"),
+    };
+
+    const qcow_state_path = try image.files.path(alloc, fixture.path, "descriptor-qcow2");
+    const qcow_state = try image.files.create(io, qcow_state_path);
+    defer qcow_state.close(io);
+    var qcow_attempt = try image.compute_artifacts.reserveAttempt(io, qcow_state, .qcow2);
+    defer qcow_attempt.close(io);
+    const finalized = try image.compute_artifacts.finalizeQcow2(
+        alloc,
+        io,
+        qcow_state,
+        qcow_attempt.evidence,
+        finalize_options,
+    );
+    const qcow_path = try image.files.path(
+        alloc,
+        qcow_state_path,
+        image.compute_artifacts.qcow2_name,
+    );
+    const qcow = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        qcow_path,
+        finalized.output.file_bytes,
+        finalized.output.sha256,
+        limits.max_input_bytes,
+    );
+    const derive_options: image.compute_artifacts.DeriveOptions = .{
+        .source = qcow,
+        .expected_capacity_bytes = finalized.output.virtual_bytes,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("descriptor derivation fixture"),
+    };
+    const vhd_state_path = try image.files.path(alloc, fixture.path, "descriptor-vhd");
+    const vhd_state = try image.files.create(io, vhd_state_path);
+    defer vhd_state.close(io);
+    var vhd_attempt = try image.compute_artifacts.reserveAttempt(io, vhd_state, .vhd);
+    defer vhd_attempt.close(io);
+    const derived = try image.compute_artifacts.deriveFixedVhd(
+        alloc,
+        io,
+        vhd_state,
+        vhd_attempt.evidence,
+        derive_options,
+    );
+
+    const retained_raw = try std.Io.Dir.openFileAbsolute(io, raw_path, .{
+        .mode = .read_only,
+    });
+    defer retained_raw.close(io);
+    const retained_qcow = try std.Io.Dir.openFileAbsolute(io, qcow_path, .{
+        .mode = .read_only,
+    });
+    defer retained_qcow.close(io);
+
+    for (0..8) |_| {
+        try expectFinalizationInjected(
+            alloc,
+            qcow_state,
+            &qcow_attempt,
+            finalize_options,
+            .after_source_validation,
+        );
+        try expectDerivationInjected(
+            alloc,
+            vhd_state,
+            &vhd_attempt,
+            derive_options,
+            .after_source_validation,
+        );
+        try expectCallerOpen(retained_raw);
+        try expectCallerOpen(retained_qcow);
+    }
+    for ([_]image.compute_artifacts.descriptor_testing.FaultPoint{
+        .after_source_inspection,
+        .after_transfer,
+        .after_hashing,
+        .after_output_inspection,
+        .after_allocation,
+    }) |point| {
+        try expectFinalizationInjected(
+            alloc,
+            qcow_state,
+            &qcow_attempt,
+            finalize_options,
+            point,
+        );
+        try expectDerivationInjected(
+            alloc,
+            vhd_state,
+            &vhd_attempt,
+            derive_options,
+            point,
+        );
+        try expectCallerOpen(retained_raw);
+        try expectCallerOpen(retained_qcow);
+    }
+
+    for ([_]struct {
+        root: image.core.private_files.Directory,
+        attempt: *image.compute_artifacts.ReservedAttempt,
+        output_name: []const u8,
+        qcow2: bool,
+    }{
+        .{
+            .root = qcow_state,
+            .attempt = &qcow_attempt,
+            .output_name = image.compute_artifacts.qcow2_name,
+            .qcow2 = true,
+        },
+        .{
+            .root = vhd_state,
+            .attempt = &vhd_attempt,
+            .output_name = image.compute_artifacts.vhd_name,
+            .qcow2 = false,
+        },
+    }) |case| {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = case.output_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            if (case.qcow2) {
+                _ = try image.compute_artifacts.verifyFinalizedQcow2(
+                    alloc,
+                    probe_io,
+                    case.root,
+                    case.attempt,
+                    finalize_options,
+                );
+            } else {
+                _ = try image.compute_artifacts.verifyDerivedFixedVhd(
+                    alloc,
+                    probe_io,
+                    case.root,
+                    case.attempt,
+                    derive_options,
+                );
+            }
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+
+    {
+        var invalid = finalize_options;
+        invalid.limits.max_workload_bytes = 0;
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.qcow2_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(
+                error.InvalidWorkloadLimit,
+                image.compute_artifacts.verifyFinalizedQcow2(
+                    alloc,
+                    probe_io,
+                    qcow_state,
+                    &qcow_attempt,
+                    invalid,
+                ),
+            );
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+    {
+        var invalid = derive_options;
+        invalid.limits.max_memory_bytes = 0;
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.vhd_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(
+                error.InvalidMemoryLimit,
+                image.compute_artifacts.verifyDerivedFixedVhd(
+                    alloc,
+                    probe_io,
+                    vhd_state,
+                    &vhd_attempt,
+                    invalid,
+                ),
+            );
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+
+    for ([_]struct {
+        root: image.core.private_files.Directory,
+        attempt: *image.compute_artifacts.ReservedAttempt,
+        output_name: []const u8,
+        qcow2: bool,
+    }{
+        .{
+            .root = qcow_state,
+            .attempt = &qcow_attempt,
+            .output_name = image.compute_artifacts.qcow2_name,
+            .qcow2 = true,
+        },
+        .{
+            .root = vhd_state,
+            .attempt = &vhd_attempt,
+            .output_name = image.compute_artifacts.vhd_name,
+            .qcow2 = false,
+        },
+    }) |case| {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = case.output_name,
+                .target_open_index = 1,
+                .mode = .cancel_adoption,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            if (case.qcow2) {
+                try t.expectError(
+                    error.Canceled,
+                    image.compute_artifacts.verifyFinalizedQcow2(
+                        alloc,
+                        probe_io,
+                        case.root,
+                        case.attempt,
+                        finalize_options,
+                    ),
+                );
+            } else {
+                try t.expectError(
+                    error.Canceled,
+                    image.compute_artifacts.verifyDerivedFixedVhd(
+                        alloc,
+                        probe_io,
+                        case.root,
+                        case.attempt,
+                        derive_options,
+                    ),
+                );
+            }
+            try t.expectEqual(@as(usize, 1), probe.failures);
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+
+    {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.qcow2_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            var oom: OomAfterTarget = .{ .backing = alloc, .probe = &probe };
+            try t.expectError(
+                error.OutOfMemory,
+                image.compute_artifacts.verifyFinalizedQcow2(
+                    oom.allocator(),
+                    probe_io,
+                    qcow_state,
+                    &qcow_attempt,
+                    finalize_options,
+                ),
+            );
+            try t.expect(oom.induced);
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+    {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.vhd_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            var oom: OomAfterTarget = .{ .backing = alloc, .probe = &probe };
+            try t.expectError(
+                error.OutOfMemory,
+                image.compute_artifacts.verifyDerivedFixedVhd(
+                    oom.allocator(),
+                    probe_io,
+                    vhd_state,
+                    &vhd_attempt,
+                    derive_options,
+                ),
+            );
+            try t.expect(oom.induced);
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+
+    {
+        var original: [1]u8 = undefined;
+        _ = try qcow_attempt.output.readPositionalAll(io, &original, 0);
+        try qcow_attempt.output.writePositionalAll(io, &.{original[0] ^ 1}, 0);
+        try qcow_attempt.output.sync(io);
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.qcow2_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            if (image.compute_artifacts.verifyFinalizedQcow2(
+                alloc,
+                probe_io,
+                qcow_state,
+                &qcow_attempt,
+                finalize_options,
+            )) |_| return error.AcceptedMalformedQcow2 else |_| {}
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+        try qcow_attempt.output.writePositionalAll(io, &original, 0);
+        try qcow_attempt.output.sync(io);
+    }
+    const restored_qcow = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        qcow_path,
+        finalized.output.file_bytes,
+        finalized.output.sha256,
+        limits.max_input_bytes,
+    );
+    var worker_derive_options = derive_options;
+    worker_derive_options.source = restored_qcow;
+    {
+        var original: [1]u8 = undefined;
+        _ = try vhd_attempt.output.readPositionalAll(io, &original, derived.output.virtual_bytes);
+        try vhd_attempt.output.writePositionalAll(
+            io,
+            &.{original[0] ^ 1},
+            derived.output.virtual_bytes,
+        );
+        try vhd_attempt.output.sync(io);
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.vhd_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            if (image.compute_artifacts.verifyDerivedFixedVhd(
+                alloc,
+                probe_io,
+                vhd_state,
+                &vhd_attempt,
+                derive_options,
+            )) |_| return error.AcceptedMalformedVhd else |_| {}
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+        try vhd_attempt.output.writePositionalAll(
+            io,
+            &original,
+            derived.output.virtual_bytes,
+        );
+        try vhd_attempt.output.sync(io);
+    }
+
+    const worker_qcow_path = try image.files.path(alloc, fixture.path, "worker-qcow-fault");
+    const worker_qcow = try image.files.create(io, worker_qcow_path);
+    defer worker_qcow.close(io);
+    var worker_qcow_attempt = try image.compute_artifacts.reserveAttempt(
+        io,
+        worker_qcow,
+        .qcow2,
+    );
+    defer worker_qcow_attempt.close(io);
+    {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.qcow2_name,
+                .target_open_index = 2,
+                .mode = .cancel_adoption,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(
+                error.Canceled,
+                image.compute_artifacts.finalizeQcow2(
+                    alloc,
+                    probe_io,
+                    worker_qcow,
+                    worker_qcow_attempt.evidence,
+                    finalize_options,
+                ),
+            );
+            try t.expectEqual(@as(usize, 1), probe.failures);
+            try expectProbeClosed(probe, 2);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+    try t.expect(worker_qcow_attempt.rollback(io, worker_qcow).rollbackComplete());
+
+    const worker_vhd_path = try image.files.path(alloc, fixture.path, "worker-vhd-fault");
+    const worker_vhd = try image.files.create(io, worker_vhd_path);
+    defer worker_vhd.close(io);
+    var worker_vhd_attempt = try image.compute_artifacts.reserveAttempt(io, worker_vhd, .vhd);
+    defer worker_vhd_attempt.close(io);
+    {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.vhd_name,
+                .target_open_index = 3,
+                .mode = .cancel_adoption,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(
+                error.Canceled,
+                image.compute_artifacts.deriveFixedVhd(
+                    alloc,
+                    probe_io,
+                    worker_vhd,
+                    worker_vhd_attempt.evidence,
+                    worker_derive_options,
+                ),
+            );
+            try t.expectEqual(@as(usize, 1), probe.failures);
+            try expectProbeClosed(probe, 3);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+    try t.expect(worker_vhd_attempt.rollback(io, worker_vhd).rollbackComplete());
+    try expectCallerOpen(retained_raw);
+    try expectCallerOpen(retained_qcow);
+}
+test "fixed VHD derivation permits only documented GPT relocation deltas" {
+    const fixture = try Fixture.init(0, false);
+    defer fixture.deinit();
+    const alloc = fixture.arena.allocator();
+    const root = try image.files.create(io, fixture.input.state_dir);
+    defer root.close(io);
+    const efi_input = try image.files.record(alloc, io, fixture.input.efi, c.max_efi, false);
+    _ = try image.package.build(alloc, io, root, efi_input);
+    try image.files.cleanupStage(io, root, "package-stage");
+    const raw_path = try image.files.path(alloc, fixture.input.state_dir, "unikraft.raw");
+    var raw_image = try image.boot.miz.Image.openPathReadOnly(io, raw_path);
+    defer raw_image.close(io);
+    var raw_gpt = try image.boot.miz.gpt.readVerifiedGpt(
+        raw_image,
+        io,
+        alloc,
+        1024 * 1024,
+    );
+    defer raw_gpt.deinit(alloc);
+
+    const source_capacity = c.raw_bytes + 512;
+    const expanded_path = try image.files.path(alloc, fixture.input.state_dir, "expanded.qcow2");
+    var expanded = try image.boot.miz.Image.create(
+        io,
+        expanded_path,
+        .qcow2,
+        source_capacity,
+        .{},
+    );
+    _ = try image.boot.miz.copyAll(io, raw_image, &expanded, alloc);
+    const source_relocation = try image.boot.miz.gpt.relocateBackup(
+        &expanded,
+        io,
+        alloc,
+        raw_gpt,
+    );
+    try t.expect(source_relocation.was_relocated);
+    expanded.close(io);
+
+    const expanded_file = try image.files.record(
+        alloc,
+        io,
+        expanded_path,
+        68 * c.mib,
+        false,
+    );
+    const accepted_path = try image.files.path(alloc, fixture.input.state_dir, "accepted-relocated.qcow2");
+    const accepted = try image.boot.miz.artifact_pipeline.finalizeQcow2(alloc, io, .{
+        .input_path = expanded_path,
+        .expected_input_sha256 = try c.sha(expanded_file.sha256),
+        .max_input_size = 68 * c.mib,
+        .source_format = .qcow2,
+        .expected_virtual_size = source_capacity,
+        .max_virtual_size = 68 * c.mib,
+        .output_path = accepted_path,
+        .max_output_size = 68 * c.mib,
+        .compression = .zstd,
+        .cluster_size = 64 * 1024,
+    });
+    const producer = try image.files.record(alloc, io, fixture.cli, c.max_tool, true);
+    const limits: image.compute_artifacts.Limits = .{
+        .max_input_bytes = 68 * c.mib,
+        .max_output_bytes = 68 * c.mib,
+        .max_virtual_bytes = 68 * c.mib,
+        .max_partition_array_bytes = 1024 * 1024,
+        .max_metadata_bytes = 128 * 1024,
+        .max_metadata_work = 8194,
+        .max_work_bytes = 4 * source_capacity,
+        .max_memory_bytes = 512 * 1024 * 1024,
+    };
+    const pinned = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        accepted_path,
+        accepted.artifact.size,
+        try c.hex(alloc, accepted.artifact.sha256),
+        limits.max_input_bytes,
+    );
+    const derive_options: image.compute_artifacts.DeriveOptions = .{
+        .source = pinned,
+        .expected_capacity_bytes = source_capacity,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("relocation fixture"),
+    };
+    var attempt = try image.compute_artifacts.reserveAttempt(io, root, .vhd);
+    defer attempt.close(io);
+    const derived = try image.compute_artifacts.deriveFixedVhd(
+        alloc,
+        io,
+        root,
+        attempt.evidence,
+        derive_options,
+    );
+    _ = try image.compute_artifacts.verifyDerivedFixedVhd(
+        alloc,
+        io,
+        root,
+        &attempt,
+        derive_options,
+    );
+    try t.expect(attempt.cleanupStage(io, root));
+    try t.expect(derived.relocation.was_relocated);
+    try t.expectEqual(@as(u64, 67 * c.mib), derived.output.virtual_bytes);
+    try t.expectEqualStrings(
+        derived.source_identity.partition_contents_sha256,
+        derived.output_identity.partition_contents_sha256,
+    );
+    try t.expectEqualStrings(
+        "protective-mbr,primary-gpt,relocated-backup-gpt,zero-padding",
+        derived.relocation.allowed_differences,
+    );
+    const original_record = try root.read(
+        io,
+        alloc,
+        image.compute_artifacts.vhd_record_name,
+        c.max_record,
+        null,
+    );
+    const canonical = try image.compute_artifacts.readDerivationRecord(alloc, original_record);
+    var record_mutations = [_]image.compute_artifacts.DerivationRecord{
+        canonical,
+        canonical,
+        canonical,
+        canonical,
+        canonical,
+    };
+    record_mutations[0].accepted_qcow2_decoded_sha256 = "0" ** 64;
+    record_mutations[1].accepted_qcow2.allocated = .{ .state = .unavailable, .bytes = null };
+    record_mutations[2].source_identity.workload_sha256 = "0" ** 64;
+    record_mutations[2].output_identity.workload_sha256 = "0" ** 64;
+    record_mutations[3].output.allocated = .{ .state = .unavailable, .bytes = null };
+    record_mutations[4].provenance.config_sha256 = "0" ** 64;
+    for (record_mutations) |mutation| {
+        try rewritePrivateFile(
+            root,
+            image.compute_artifacts.vhd_record_name,
+            try c.encode(alloc, mutation),
+        );
+        if (image.compute_artifacts.verifyDerivedFixedVhd(
+            alloc,
+            io,
+            root,
+            &attempt,
+            derive_options,
+        )) |_| return error.AcceptedTamperedDerivation else |_| {}
+    }
+    try rewritePrivateFile(root, image.compute_artifacts.vhd_record_name, original_record);
+
+    const old_backup_offset = derived.relocation.old_backup_lba * 512;
+    const mutation_offsets = [_]u64{
+        0,
+        0x1b8,
+        0x1bc,
+        2 * 512 + 48,
+        512 + image.boot.miz.gpt.header_size,
+        old_backup_offset + 100,
+        derived.output.virtual_bytes + 85,
+    };
+    {
+        const output = try root.dir.openFile(io, image.compute_artifacts.vhd_name, .{
+            .mode = .read_write,
+            .allow_directory = false,
+            .follow_symlinks = false,
+        });
+        defer output.close(io);
+        for (mutation_offsets) |mutation_offset| {
+            var original: [1]u8 = undefined;
+            if (try output.readPositionalAll(io, &original, mutation_offset) != 1)
+                return error.InvalidFixture;
+            try output.writePositionalAll(io, &.{original[0] ^ 1}, mutation_offset);
+            try output.sync(io);
+            const changed_snapshot = try image.boot.files.snapshot(output);
+            var rehashed = canonical;
+            rehashed.output.sha256 = try c.hex(
+                alloc,
+                try image.boot.files.digest(io, output, changed_snapshot),
+            );
+            try rewritePrivateFile(
+                root,
+                image.compute_artifacts.vhd_record_name,
+                try c.encode(alloc, rehashed),
+            );
+            if (image.compute_artifacts.verifyDerivedFixedVhd(
+                alloc,
+                io,
+                root,
+                &attempt,
+                derive_options,
+            )) |_| return error.AcceptedRehashedVhdTamper else |_| {}
+            try output.writePositionalAll(io, &original, mutation_offset);
+            try output.sync(io);
+            try rewritePrivateFile(root, image.compute_artifacts.vhd_record_name, original_record);
+        }
+    }
+    try root.dir.rename(
+        image.compute_artifacts.vhd_name,
+        root.dir,
+        "retained-vhd",
+        io,
+    );
+    const retained_vhd_path = try image.files.path(
+        alloc,
+        fixture.input.state_dir,
+        "retained-vhd",
+    );
+    const retained_vhd = try image.files.record(
+        alloc,
+        io,
+        retained_vhd_path,
+        limits.max_output_bytes,
+        false,
+    );
+    try image.files.copy(io, retained_vhd, root, image.compute_artifacts.vhd_name);
+    try t.expectError(
+        error.AttemptOwnershipChanged,
+        image.compute_artifacts.verifyDerivedFixedVhd(
+            alloc,
+            io,
+            root,
+            &attempt,
+            derive_options,
+        ),
+    );
+}
+test "compute primitives refuse changed custody malformed identity and unsupported QCOW2" {
+    const fixture = try Fixture.init(0, false);
+    defer fixture.deinit();
+    const alloc = fixture.arena.allocator();
+    const package_root = try image.files.create(io, fixture.input.state_dir);
+    defer package_root.close(io);
+    const efi_input = try image.files.record(alloc, io, fixture.input.efi, c.max_efi, false);
+    const packaged = try image.package.build(alloc, io, package_root, efi_input);
+    try image.files.cleanupStage(io, package_root, "package-stage");
+    const producer = try image.files.record(alloc, io, fixture.cli, c.max_tool, true);
+    const limits: image.compute_artifacts.Limits = .{
+        .max_input_bytes = c.raw_bytes,
+        .max_output_bytes = c.vhd_bytes,
+        .max_virtual_bytes = c.raw_bytes,
+        .max_partition_array_bytes = 1024 * 1024,
+        .max_metadata_bytes = 128 * 1024,
+        .max_metadata_work = 8194,
+        .max_work_bytes = 4 * c.raw_bytes,
+        .max_memory_bytes = 512 * 1024 * 1024,
+    };
+    const raw_path = try image.files.path(alloc, fixture.input.state_dir, "unikraft.raw");
+    try t.expectError(
+        error.ArtifactChanged,
+        image.compute_artifacts.bindExpected(
+            alloc,
+            io,
+            raw_path,
+            packaged.raw.size - 512,
+            packaged.raw.sha256,
+            limits.max_input_bytes,
+        ),
+    );
+
+    try image.files.copy(io, packaged.raw, fixture.dir, "substituted.raw");
+    const substituted_path = try image.files.path(alloc, fixture.path, "substituted.raw");
+    const substituted = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        substituted_path,
+        packaged.raw.size,
+        packaged.raw.sha256,
+        limits.max_input_bytes,
+    );
+    try fixture.dir.dir.rename("substituted.raw", fixture.dir.dir, "substituted.old", io);
+    const old_path = try image.files.path(alloc, fixture.path, "substituted.old");
+    const old_record = try image.files.record(alloc, io, old_path, c.raw_bytes, false);
+    try image.files.copy(io, old_record, fixture.dir, "substituted.raw");
+    try t.expectError(
+        error.ArtifactChanged,
+        image.compute_artifacts.verifyPinned(io, substituted, limits.max_input_bytes),
+    );
+
+    try image.files.copy(io, packaged.raw, fixture.dir, "malformed.raw");
+    const malformed_file = try fixture.dir.dir.openFile(io, "malformed.raw", .{ .mode = .read_write });
+    try malformed_file.writePositionalAll(io, "NOT GPT!", 512);
+    malformed_file.close(io);
+    const malformed_path = try image.files.path(alloc, fixture.path, "malformed.raw");
+    const malformed_record = try image.files.record(alloc, io, malformed_path, c.raw_bytes, false);
+    const malformed = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        malformed_path,
+        malformed_record.size,
+        malformed_record.sha256,
+        limits.max_input_bytes,
+    );
+    const malformed_state_path = try image.files.path(alloc, fixture.path, "malformed-state");
+    const malformed_state = try image.files.create(io, malformed_state_path);
+    defer malformed_state.close(io);
+    if (finalizeDirect(alloc, malformed_state, .{
+        .source = malformed,
+        .expected_virtual_bytes = malformed_record.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("malformed"),
+    })) |_| return error.AcceptedMalformedDisk else |_| {}
+    const symlink_state_path = try image.files.path(alloc, fixture.path, "symlink-state");
+    const symlink_state = try image.files.create(io, symlink_state_path);
+    defer symlink_state.close(io);
+    try symlink_state.dir.symLink(io, "/does/not/exist", image.compute_artifacts.qcow2_name, .{});
+    const raw = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        raw_path,
+        packaged.raw.size,
+        packaged.raw.sha256,
+        limits.max_input_bytes,
+    );
+    if (finalizeDirect(alloc, symlink_state, .{
+        .source = raw,
+        .expected_virtual_bytes = packaged.raw.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("symlink"),
+    })) |_| return error.AcceptedOutputSymlink else |_| {}
+
+    const good_state_path = try image.files.path(alloc, fixture.path, "good-state");
+    const good_state = try image.files.create(io, good_state_path);
+    defer good_state.close(io);
+    const finalized = try finalizeDirect(alloc, good_state, .{
+        .source = raw,
+        .expected_virtual_bytes = packaged.raw.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("good"),
+    });
+    const good_qcow_path = try image.files.path(alloc, good_state_path, image.compute_artifacts.qcow2_name);
+    const good_qcow = try image.files.record(
+        alloc,
+        io,
+        good_qcow_path,
+        limits.max_input_bytes,
+        false,
+    );
+    try image.files.copy(io, good_qcow, fixture.dir, "unsupported.qcow2");
+    const unsupported_file = try fixture.dir.dir.openFile(io, "unsupported.qcow2", .{ .mode = .read_write });
+    try unsupported_file.writePositionalAll(io, &[_]u8{0}, 104);
+    unsupported_file.close(io);
+    const unsupported_path = try image.files.path(alloc, fixture.path, "unsupported.qcow2");
+    const unsupported_record = try image.files.record(
+        alloc,
+        io,
+        unsupported_path,
+        limits.max_input_bytes,
+        false,
+    );
+    const unsupported = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        unsupported_path,
+        unsupported_record.size,
+        unsupported_record.sha256,
+        limits.max_input_bytes,
+    );
+    const derive_state_path = try image.files.path(alloc, fixture.path, "unsupported-state");
+    const derive_state = try image.files.create(io, derive_state_path);
+    defer derive_state.close(io);
+    if (deriveDirect(alloc, derive_state, .{
+        .source = unsupported,
+        .expected_capacity_bytes = finalized.output.virtual_bytes,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("unsupported"),
+    })) |_| return error.AcceptedUnsupportedQcow2 else |_| {}
 }
 test "native input and private evidence permissions and malformed PE refuse" {
     const f = try Fixture.init(0, false);

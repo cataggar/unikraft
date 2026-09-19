@@ -919,6 +919,10 @@ jobs:
         # WAMR uses the same isolated fake backend, never an authenticated CLI.
         export PYTHONDONTWRITEBYTECODE=1
         mkdir -p "${root}/restore"
+        compute_fixture_root="${root}/compute-fixtures"
+        mkdir -m 0700 "${compute_fixture_root}"
+        compute_fixture_root="$(readlink -f "${compute_fixture_root}")"
+        test "$(stat -c '%a' -- "${compute_fixture_root}")" = 700
         cp support/tools/hyperv/local_boot/build.zig \
           support/tools/hyperv/local_boot/build.zig.zon "${root}/restore/"
         zig build --build-file "${root}/restore/build.zig" --fetch=all -j2 \
@@ -926,7 +930,9 @@ jobs:
         zig build --build-file support/build/wamr-native-ci/build.zig -j2 \
           --system "${root}/restore/zig-pkg" \
           --cache-dir "${root}/compute-cache" --global-cache-dir "${root}/global" \
-          --prefix "${root}/compute-tools" -Doptimize=ReleaseSafe test install
+          --prefix "${root}/compute-tools" \
+          -Dtest-root="${compute_fixture_root}" \
+          -Doptimize=ReleaseSafe test install
         supervisor_source_closure="$(
           python3 - <<'PY'
         import sys

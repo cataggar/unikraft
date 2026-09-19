@@ -54,6 +54,7 @@ provision. Keep caches and private state in ignored `.d/`.
 ```sh
 umask 077
 mkdir -p .d/wamr-direct/scratch .d/wamr-direct/tests
+mkdir -m 0700 .d/wamr-direct/package-fixtures
 export TMPDIR="$PWD/.d/wamr-direct/scratch"
 export PYTHONDONTWRITEBYTECODE=1
 mkdir -p .d/wamr-direct/restore
@@ -69,6 +70,7 @@ zig build --build-file support/build/wamr-native-ci/build.zig \
   --system "$PWD/.d/wamr-direct/restore/zig-pkg" \
   --cache-dir "$PWD/.d/wamr-direct/package-cache" \
   --prefix "$PWD/.d/wamr-direct/package-tools" \
+  -Dtest-root="$PWD/.d/wamr-direct/package-fixtures" \
   -Doptimize=ReleaseSafe -j2 test install
 SUPERVISOR_SOURCE_SHA256="$(
   python3 - <<'PY'

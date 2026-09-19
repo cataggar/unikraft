@@ -2585,7 +2585,7 @@ def production_command_contract(stage):
                 command_path("work", "tools"),
                 command_literal("-Doptimize=ReleaseSafe"),
                 command_literal("-j2"),
-                command_literal("test"),
+                command_literal("test-unit"),
                 command_literal("install"),
             ],
         },
@@ -4874,7 +4874,7 @@ def build(runtime, wamr):
     run_custodied(runtime, initial, root, "adapter", [
         tool("zig"), "build", "--build-file", HERE / "build.zig",
         "--system", packages, "--prefix", root / "tools",
-        "-Doptimize=ReleaseSafe", "-j2", "test", "install"], 900)
+        "-Doptimize=ReleaseSafe", "-j2", "test-unit", "install"], 900)
     run_custodied(runtime, initial, root, "local-boot-tool", [
         tool("zig"), "build", "--build-file", LOCAL_BOOT / "build.zig",
         "--system", packages, "--prefix", root / "tools",
