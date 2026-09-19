@@ -79,6 +79,13 @@ fn spawnChild(style: ChildStyle) !linux.pid_t {
     return @intCast(child);
 }
 
+fn spawnImmediateChild() !linux.pid_t {
+    const child = linux.fork();
+    if (linux.errno(child) != .SUCCESS) return error.ForkFailed;
+    if (child == 0) linux.exit_group(0);
+    return @intCast(child);
+}
+
 fn emitPid(pid: linux.pid_t) !void {
     var text: [32]u8 = undefined;
     try emit(1, try std.fmt.bufPrint(&text, "{d}\n", .{pid}));
@@ -171,17 +178,24 @@ pub fn main(init: std.process.Init) !void {
         while (linux.errno(linux.waitpid(@intCast(intermediate), &status, 0)) == .INTR) {}
         if (!linux.W.IFEXITED(status) or linux.W.EXITSTATUS(status) != 0) return error.FixtureHandshake;
         try emitPid(pid);
-    } else if (std.mem.eql(u8, mode, "many-children") or std.mem.eql(u8, mode, "many-resistant")) {
+    } else if (std.mem.eql(u8, mode, "many-children") or
+        std.mem.eql(u8, mode, "many-resistant") or
+        std.mem.eql(u8, mode, "many-immediate"))
+    {
         if (args.len != 3) return error.InvalidFixture;
         const count = try std.fmt.parseInt(usize, args[2], 10);
         if (count == 0 or count > 32) return error.InvalidFixture;
         for (0..count) |index| {
-            try emitPid(try spawnChild(if (std.mem.eql(u8, mode, "many-resistant"))
-                .resistant
-            else if (index % 2 == 0)
-                .ordinary
-            else
-                .session));
+            if (std.mem.eql(u8, mode, "many-immediate")) {
+                try emitPid(try spawnImmediateChild());
+            } else {
+                try emitPid(try spawnChild(if (std.mem.eql(u8, mode, "many-resistant"))
+                    .resistant
+                else if (index % 2 == 0)
+                    .ordinary
+                else
+                    .session));
+            }
         }
     } else if (std.mem.eql(u8, mode, "drip")) {
         while (true) {

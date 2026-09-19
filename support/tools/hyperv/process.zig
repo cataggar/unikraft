@@ -3,6 +3,11 @@ const builtin = @import("builtin");
 const linux = std.os.linux;
 const diagnostics = @import("diagnostics.zig");
 const files = @import("private_files.zig");
+const Sha256 = @import("sha256.zig").Sha256;
+
+const max_executable_bytes = 256 * 1024 * 1024;
+const executable_snapshot_seals = 1 | 2 | 4 | 8;
+const mfd_exec = 0x10;
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("Hyper-V process supervision currently requires Linux");
@@ -73,8 +78,9 @@ pub const ExecutableIdentity = struct {
     mtime_nanoseconds: u32,
     ctime_seconds: i64,
     ctime_nanoseconds: u32,
+    content_sha256: [Sha256.digest_length]u8,
 
-    fn fromStat(stat: files.Snapshot) ExecutableIdentity {
+    fn fromStat(stat: files.Snapshot, content_sha256: [Sha256.digest_length]u8) ExecutableIdentity {
         return .{
             .device_major = stat.dev_major,
             .device_minor = stat.dev_minor,
@@ -86,6 +92,7 @@ pub const ExecutableIdentity = struct {
             .mtime_nanoseconds = stat.mtime.nsec,
             .ctime_seconds = stat.ctime.sec,
             .ctime_nanoseconds = stat.ctime.nsec,
+            .content_sha256 = content_sha256,
         };
     }
 };
@@ -115,10 +122,12 @@ pub const Executable = struct {
         const stat = try files.snapshot(file);
         if (stat.mode & linux.S.IFMT != linux.S.IFREG or stat.mode & 0o111 == 0 or stat.mode & 0o6000 != 0)
             return error.InvalidExecutable;
+        if (stat.size > max_executable_bytes) return error.UnsupportedExecutableFormat;
         _ = try validateElfExecutable(file.handle, stat.size);
+        const content_sha256 = try hashExecutable(file.handle, stat.size);
         const verified = try files.snapshot(file);
         if (!std.meta.eql(stat, verified)) return error.ExecutableIdentityChanged;
-        return .{ .file = file, .identity = .fromStat(verified) };
+        return .{ .file = file, .identity = .fromStat(verified, content_sha256) };
     }
 
     pub fn close(self: Executable, io: std.Io) void {
@@ -170,6 +179,10 @@ fn validateElfExecutable(descriptor: linux.fd_t, size: u64) !bool {
         const virtual_address = readLittle64(program[16..24]);
         const file_size = readLittle64(program[32..40]);
         const memory_size = readLittle64(program[40..48]);
+        const alignment = readLittle64(program[48..56]);
+        if (alignment > 1 and
+            (alignment & (alignment - 1) != 0 or virtual_address % alignment != file_offset % alignment))
+            return error.UnsupportedExecutableFormat;
         if (!fileRange(size, file_offset, file_size)) return error.UnsupportedExecutableFormat;
         if (program_type == 1) {
             if (file_size > memory_size) return error.UnsupportedExecutableFormat;
@@ -192,6 +205,166 @@ fn validateElfExecutable(descriptor: linux.fd_t, size: u64) !bool {
     if (!executable_entry) return error.UnsupportedExecutableFormat;
     return interpreter_seen;
 }
+
+fn hashExecutable(descriptor: linux.fd_t, size: u64) ![Sha256.digest_length]u8 {
+    var hash = Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buffer);
+    var offset: u64 = 0;
+    while (offset < size) {
+        const amount: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
+        try preadExecutable(descriptor, buffer[0..amount], offset);
+        hash.update(buffer[0..amount]);
+        offset = try std.math.add(u64, offset, @as(u64, @intCast(amount)));
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn sameExecutablePhysical(identity: ExecutableIdentity, stat: files.Snapshot) bool {
+    return identity.device_major == stat.dev_major and identity.device_minor == stat.dev_minor and
+        identity.inode == stat.ino and identity.size == stat.size and identity.mode == stat.mode and
+        identity.uid == stat.uid and identity.mtime_seconds == stat.mtime.sec and
+        identity.mtime_nanoseconds == stat.mtime.nsec;
+}
+
+fn verifyExecutableSource(executable: Executable) !void {
+    const before = files.snapshot(executable.file) catch return error.ExecutableUnavailable;
+    if (!sameExecutablePhysical(executable.identity, before)) return error.ExecutableIdentityChanged;
+    const content_sha256 = hashExecutable(executable.file.handle, before.size) catch
+        return error.ExecutableIdentityChanged;
+    const after = files.snapshot(executable.file) catch return error.ExecutableUnavailable;
+    if (!files.sameSnapshot(before, after) or !sameExecutablePhysical(executable.identity, after) or
+        !std.crypto.timing_safe.eql(
+            [Sha256.digest_length]u8,
+            executable.identity.content_sha256,
+            content_sha256,
+        ))
+        return error.ExecutableIdentityChanged;
+}
+
+fn createExecutableMemfd() !linux.fd_t {
+    var opened = linux.memfd_create(
+        "hyperv-command-executable",
+        linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING | mfd_exec,
+    );
+    if (linux.errno(opened) == .INVAL)
+        opened = linux.memfd_create(
+            "hyperv-command-executable",
+            linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING,
+        );
+    if (linux.errno(opened) != .SUCCESS) return error.ExecutableSnapshotUnsupported;
+    var descriptor: linux.fd_t = @intCast(opened);
+    if (descriptor <= 2) {
+        const duplicate = linux.fcntl(descriptor, linux.F.DUPFD_CLOEXEC, 3);
+        _ = linux.close(descriptor);
+        if (linux.errno(duplicate) != .SUCCESS) return error.ExecutableSnapshotUnavailable;
+        descriptor = @intCast(duplicate);
+    }
+    return descriptor;
+}
+
+fn writeExecutableSnapshot(
+    source: linux.fd_t,
+    destination: linux.fd_t,
+    size: u64,
+    gate: ?*CommandSnapshotGate,
+) ![Sha256.digest_length]u8 {
+    var hash = Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buffer);
+    var offset: u64 = 0;
+    var gate_released = false;
+    while (offset < size) {
+        const amount: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
+        try preadExecutable(source, buffer[0..amount], offset);
+        hash.update(buffer[0..amount]);
+        var written: usize = 0;
+        while (written < amount) {
+            const position = std.math.add(u64, offset, written) catch
+                return error.ExecutableSnapshotUnavailable;
+            const result = linux.pwrite(
+                destination,
+                buffer[written..amount].ptr,
+                amount - written,
+                @intCast(position),
+            );
+            switch (linux.errno(result)) {
+                .SUCCESS => {
+                    if (result == 0) return error.ExecutableSnapshotUnavailable;
+                    written += result;
+                },
+                .INTR => continue,
+                else => return error.ExecutableSnapshotUnavailable,
+            }
+        }
+        offset = std.math.add(u64, offset, @as(u64, @intCast(amount))) catch
+            return error.ExecutableSnapshotUnavailable;
+        if (!gate_released and gate != null and offset < size) {
+            const active = gate.?;
+            active.started.store(true, .release);
+            while (!active.continue_copy.load(.acquire)) try pause(1);
+            gate_released = true;
+        }
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+fn createExecutableSnapshot(executable: Executable, gate: ?*CommandSnapshotGate) !linux.fd_t {
+    try verifyExecutableSource(executable);
+    const descriptor = try createExecutableMemfd();
+    errdefer _ = linux.close(descriptor);
+    if (linux.errno(linux.fchmod(descriptor, 0o500)) != .SUCCESS)
+        return error.ExecutableSnapshotUnavailable;
+    const content_sha256 = writeExecutableSnapshot(
+        executable.file.handle,
+        descriptor,
+        executable.identity.size,
+        gate,
+    ) catch |err| switch (err) {
+        error.UnsupportedExecutableFormat, error.ExecutableUnavailable => return error.ExecutableIdentityChanged,
+        else => return err,
+    };
+    if (!std.crypto.timing_safe.eql(
+        [Sha256.digest_length]u8,
+        executable.identity.content_sha256,
+        content_sha256,
+    ))
+        return error.ExecutableIdentityChanged;
+    try verifyExecutableSource(executable);
+    _ = validateElfExecutable(descriptor, executable.identity.size) catch
+        return error.ExecutableSnapshotInvalid;
+    const stat = files.snapshot(.{ .handle = descriptor, .flags = .{ .nonblocking = false } }) catch
+        return error.ExecutableSnapshotUnavailable;
+    if (stat.mode & linux.S.IFMT != linux.S.IFREG or stat.mode & 0o7777 != 0o500 or
+        stat.size != executable.identity.size or stat.nlink != 0)
+        return error.ExecutableSnapshotInvalid;
+    const sealed = linux.fcntl(descriptor, linux.F.ADD_SEALS, executable_snapshot_seals);
+    if (linux.errno(sealed) != .SUCCESS or
+        linux.fcntl(descriptor, linux.F.GET_SEALS, 0) != executable_snapshot_seals)
+        return error.ExecutableSnapshotUnsupported;
+    switch (linux.errno(linux.faccessat(descriptor, "", linux.X_OK, linux.AT.EMPTY_PATH))) {
+        .SUCCESS => {},
+        .ACCES, .PERM, .NOSYS => return error.ExecutableSnapshotUnsupported,
+        else => return error.ExecutableSnapshotUnavailable,
+    }
+    return descriptor;
+}
+
+pub const ExecutableSnapshotTest = struct {
+    pub fn create(executable: Executable) !linux.fd_t {
+        if (!builtin.is_test) @compileError("executable snapshot evidence is test-only");
+        return createExecutableSnapshot(executable, null);
+    }
+
+    pub fn contentSha256(descriptor: linux.fd_t, size: u64) ![Sha256.digest_length]u8 {
+        if (!builtin.is_test) @compileError("executable snapshot evidence is test-only");
+        return hashExecutable(descriptor, size);
+    }
+};
 
 fn preadExecutable(descriptor: linux.fd_t, bytes: []u8, offset: u64) !void {
     var read: usize = 0;
@@ -238,6 +411,16 @@ pub const ExecutableFormatTest = struct {
     }
 };
 
+pub const CommandSnapshotGate = struct {
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    continue_copy: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+pub const CommandTestOptions = struct {
+    snapshot_gate: ?*CommandSnapshotGate = null,
+    leader_track_delay_ms: u32 = 0,
+};
+
 pub const CommandLimits = struct {
     stdout_bytes: usize = 64 * 1024,
     stderr_bytes: usize = 64 * 1024,
@@ -272,6 +455,7 @@ pub const CommandPrimary = union(enum) {
     cancelled,
     output_overflow,
     exec_failed,
+    snapshot_unsupported,
     event_limit,
     local_io,
     executable_changed,
@@ -416,6 +600,25 @@ pub fn runCommand(
     io: std.Io,
     request: CommandRequest,
 ) !CommandResult {
+    return runCommandImpl(allocator, io, request, null);
+}
+
+pub fn runCommandTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: CommandRequest,
+    test_options: CommandTestOptions,
+) !CommandResult {
+    if (!builtin.is_test) @compileError("command supervision faults are test-only");
+    return runCommandImpl(allocator, io, request, test_options);
+}
+
+fn runCommandImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    request: CommandRequest,
+    test_options: ?CommandTestOptions,
+) !CommandResult {
     const options = commandOptions(request);
     try validateOptions(options, 4 * 1024 * 1024);
     try validateCommandLimits(request.limits);
@@ -425,9 +628,6 @@ pub fn runCommand(
     const proc = try openCommandProc();
     defer _ = linux.close(proc);
     try requirePidfds();
-    const before = try files.snapshot(request.executable.file);
-    if (!std.meta.eql(request.executable.identity, ExecutableIdentity.fromStat(before)))
-        return error.ExecutableIdentityChanged;
 
     const total = try std.math.add(usize, request.limits.stdout_bytes, request.limits.stderr_bytes);
     var result: CommandResult = .{
@@ -457,9 +657,29 @@ pub fn runCommand(
         return result;
     }
 
+    const snapshot = try createExecutableSnapshot(
+        request.executable,
+        if (test_options) |options_value| options_value.snapshot_gate else null,
+    );
+    defer _ = linux.close(snapshot);
+    if (try request.primary_deadline.expired()) {
+        result.primary = .timeout;
+        result.primary_deadline_reached = true;
+        result.stdout_status = .complete;
+        result.stderr_status = .complete;
+        return result;
+    }
+    if (cancelled(options)) {
+        result.primary = .cancelled;
+        result.cancellation_observed = true;
+        result.stdout_status = .complete;
+        result.stderr_status = .complete;
+        return result;
+    }
+
     var tracker = try OwnedTracker.init(allocator, request.limits.descendants);
     defer tracker.deinit(allocator);
-    var child = spawnOwned(allocator, options, null, request.executable.file.handle) catch |err| {
+    var child = spawnOwned(allocator, options, null, snapshot) catch |err| {
         if (err != error.SpawnFailed) return err;
         result.primary = .local_io;
         result.stdout_status = .complete;
@@ -470,6 +690,10 @@ pub fn runCommand(
     defer _ = linux.close(child.stderr);
     defer _ = linux.close(child.control);
 
+    if (test_options) |options_value| {
+        if (options_value.leader_track_delay_ms != 0)
+            try pause(@intCast(options_value.leader_track_delay_ms));
+    }
     tracker.addLeader(proc, child.pid) catch |err| {
         result.cleanup_complete = false;
         result.cleanup = switch (err) {
@@ -502,6 +726,7 @@ pub fn runCommand(
                 result.stderr_status = .overflow;
             },
             error.SpawnFailed => result.primary = .exec_failed,
+            error.ExecutableSnapshotUnsupported => result.primary = .snapshot_unsupported,
             error.EventLimit => result.primary = .event_limit,
             error.StdoutIo => result.stdout_status = .io_failed,
             error.StderrIo => result.stderr_status = .io_failed,
@@ -536,11 +761,9 @@ pub fn runCommand(
         (result.stdout_status == .overflow or result.stderr_status == .overflow))
         result.primary = .output_overflow;
 
-    const after: ?files.Snapshot = files.snapshot(request.executable.file) catch null;
-    result.executable_stable = if (after) |stat|
-        std.meta.eql(request.executable.identity, ExecutableIdentity.fromStat(stat))
-    else
-        false;
+    verifyExecutableSource(request.executable) catch {
+        result.executable_stable = false;
+    };
     if (!result.executable_stable and primaryExitedZero(result.primary))
         result.primary = .executable_changed;
     return result;
@@ -1059,6 +1282,7 @@ const OwnedProcess = struct {
     pidfd: linux.fd_t,
     term_sent: bool = false,
     kill_sent: bool = false,
+    reaped: bool = false,
 };
 
 const OwnedTracker = struct {
@@ -1086,7 +1310,7 @@ const OwnedTracker = struct {
             return error.IdentityChanged;
         const descriptor = try commandPidfd(pid);
         errdefer _ = linux.close(descriptor);
-        const identity = (try verifiedLiveIdentity(proc, observed.pid, observed.start_ticks, descriptor)) orelse
+        const identity = (try verifiedOwnedIdentity(proc, observed.pid, observed.start_ticks, descriptor)) orelse
             return error.IdentityChanged;
         if (identity.parent != linux.getpid()) return error.IdentityChanged;
         self.items[0] = .{ .pid = pid, .start_ticks = identity.start_ticks, .pidfd = descriptor };
@@ -1202,7 +1426,7 @@ fn scanOwned(
             const pid = std.fmt.parseInt(linux.pid_t, entry.name, 10) catch continue;
             if (pid <= 1 or pid == linux.getpid()) continue;
             if (tracker.findPid(pid)) |index| {
-                _ = try verifiedLiveIdentity(
+                _ = try verifiedOwnedIdentity(
                     proc,
                     tracker.items[index].pid,
                     tracker.items[index].start_ticks,
@@ -1219,7 +1443,7 @@ fn scanOwned(
                 error.ProcessGone => continue,
                 else => return error.PidfdUnavailable,
             };
-            const verified = verifiedLiveIdentity(proc, observed.pid, observed.start_ticks, descriptor) catch |err| {
+            const verified = verifiedOwnedIdentity(proc, observed.pid, observed.start_ticks, descriptor) catch |err| {
                 _ = linux.close(descriptor);
                 return err;
             };
@@ -1275,6 +1499,7 @@ fn signalOwned(
 }
 
 fn signalTemporary(descriptor: linux.fd_t, phase: CleanupSignal) !void {
+    if (try pidfdExited(descriptor)) return;
     const signal: linux.SIG = if (phase == .term) .TERM else .KILL;
     switch (linux.errno(linux.pidfd_send_signal(descriptor, signal, null, 0))) {
         .SUCCESS, .SRCH => {},
@@ -1341,8 +1566,52 @@ fn verifiedLiveIdentity(
     };
 }
 
+const OwnedIdentityAction = enum { retain, gone, poison };
+
+fn ownedIdentityAction(
+    expected_pid: linux.pid_t,
+    expected_start_ticks: u64,
+    exited_before: bool,
+    current: ?ProcStat,
+    exited_after: bool,
+) OwnedIdentityAction {
+    if (current) |observed| {
+        if (observed.pid != expected_pid or expected_start_ticks == 0 or
+            observed.start_ticks != expected_start_ticks) return .poison;
+        return .retain;
+    }
+    if (exited_before or exited_after) return .gone;
+    return .poison;
+}
+
+fn verifiedOwnedIdentity(
+    proc: linux.fd_t,
+    expected_pid: linux.pid_t,
+    expected_start_ticks: u64,
+    descriptor: linux.fd_t,
+) !?ProcStat {
+    const exited_before = try pidfdExited(descriptor);
+    const current: ?ProcStat = readProcStat(proc, expected_pid) catch |err| switch (err) {
+        error.ProcessGone => null,
+        else => return error.ProcUnavailable,
+    };
+    const exited_after = try pidfdExited(descriptor);
+    return switch (ownedIdentityAction(
+        expected_pid,
+        expected_start_ticks,
+        exited_before,
+        current,
+        exited_after,
+    )) {
+        .retain => current.?,
+        .gone => null,
+        .poison => error.IdentityChanged,
+    };
+}
+
 pub const CommandIdentityTest = struct {
     pub const Action = enum { open_candidate, rescan_without_open, poison };
+    pub const OwnedAction = enum { retain, gone, poison };
 
     pub fn parentAction(
         expected_pid: linux.pid_t,
@@ -1371,6 +1640,33 @@ pub const CommandIdentityTest = struct {
         };
     }
 
+    pub fn ownedAction(
+        expected_pid: linux.pid_t,
+        expected_start_ticks: u64,
+        exited_before: bool,
+        observed_pid: ?linux.pid_t,
+        observed_start_ticks: u64,
+        exited_after: bool,
+    ) OwnedAction {
+        if (!builtin.is_test) @compileError("command identity evidence is test-only");
+        const current: ?ProcStat = if (observed_pid) |pid| .{
+            .pid = pid,
+            .parent = 0,
+            .start_ticks = observed_start_ticks,
+        } else null;
+        return switch (ownedIdentityAction(
+            expected_pid,
+            expected_start_ticks,
+            exited_before,
+            current,
+            exited_after,
+        )) {
+            .retain => .retain,
+            .gone => .gone,
+            .poison => .poison,
+        };
+    }
+
     pub fn startTicks(pid: linux.pid_t) !u64 {
         if (!builtin.is_test) @compileError("command identity evidence is test-only");
         const proc = try openCommandProc();
@@ -1384,31 +1680,49 @@ pub const CommandIdentityTest = struct {
         defer _ = linux.close(proc);
         return (try verifiedLiveIdentity(proc, pid, start_ticks, descriptor)) != null;
     }
+
+    pub fn identityOwned(pid: linux.pid_t, start_ticks: u64, descriptor: linux.fd_t) !bool {
+        if (!builtin.is_test) @compileError("command identity evidence is test-only");
+        const proc = try openCommandProc();
+        defer _ = linux.close(proc);
+        return (try verifiedOwnedIdentity(proc, pid, start_ticks, descriptor)) != null;
+    }
 };
 
 fn reapCommand(request: CommandRequest, tracker: *OwnedTracker, result: *CommandResult) !void {
+    var remaining = tracker.len;
     while (true) {
-        if (result.reap_events >= request.limits.reap_events) return error.ReapLimit;
-        result.reap_events += 1;
         var status: u32 = 0;
         const child = linux.waitpid(-1, &status, linux.W.NOHANG);
         switch (linux.errno(child)) {
             .SUCCESS => {
-                if (child != 0) {
-                    const pid: linux.pid_t = @intCast(child);
-                    if (pid == tracker.items[0].pid) result.termination = terminationFromStatus(status);
+                if (child == 0) {
+                    if (try request.cleanup_deadline.expired()) return error.CleanupDeadline;
+                    try pause(try request.cleanup_deadline.waitMilliseconds(2));
                     continue;
                 }
+                if (result.reap_events >= request.limits.reap_events) return error.ReapLimit;
+                result.reap_events += 1;
+                const pid: linux.pid_t = @intCast(child);
+                const index = tracker.findPid(pid) orelse return error.ReapFailed;
+                if (tracker.items[index].reaped) return error.ReapFailed;
+                tracker.items[index].reaped = true;
+                remaining -= 1;
+                if (index == 0) result.termination = terminationFromStatus(status);
+                continue;
             },
             .CHILD => {
-                if (result.termination == null) return error.ReapFailed;
+                if (result.reap_events >= request.limits.reap_events) return error.ReapLimit;
+                result.reap_events += 1;
+                if (remaining != 0 or result.termination == null) return error.ReapFailed;
                 return;
             },
-            .INTR => continue,
+            .INTR => {
+                if (try request.cleanup_deadline.expired()) return error.CleanupDeadline;
+                continue;
+            },
             else => return error.ReapFailed,
         }
-        if (try request.cleanup_deadline.expired()) return error.CleanupDeadline;
-        try pause(try request.cleanup_deadline.waitMilliseconds(2));
     }
 }
 
@@ -1678,32 +1992,36 @@ fn spawnOwned(
     if (forked == 0) {
         // No allocation, std.Io, libc, or locks are permitted between fork and exec.
         if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS or
-            linux.getppid() != parent_pid) childFailure(control[1]);
+            linux.getppid() != parent_pid) childFailure(control[1], 1);
         if (fault == .pre_exec_stall) {
             while (true) {
                 var fds: [0]linux.pollfd = .{};
                 _ = linux.poll(&fds, 0, 1000);
             }
         }
-        if (linux.errno(linux.setpgid(0, 0)) != .SUCCESS) childFailure(control[1]);
+        if (linux.errno(linux.setpgid(0, 0)) != .SUCCESS) childFailure(control[1], 1);
         if (options.cwd.handle != linux.AT.FDCWD and linux.errno(linux.fchdir(options.cwd.handle)) != .SUCCESS)
-            childFailure(control[1]);
+            childFailure(control[1], 1);
         if (linux.errno(linux.dup3(null_fd, 0, 0)) != .SUCCESS or
             linux.errno(linux.dup3(stdout[1], 1, 0)) != .SUCCESS or
-            linux.errno(linux.dup3(stderr[1], 2, 0)) != .SUCCESS) childFailure(control[1]);
+            linux.errno(linux.dup3(stderr[1], 2, 0)) != .SUCCESS) childFailure(control[1], 1);
         // Linux UAPI CLOSE_RANGE_CLOEXEC is bit 2; Zig 0.16's packed flag labels
         // are shifted by one. Preserve only stdio at exec, including private locks.
         if (linux.errno(linux.close_range(3, std.math.maxInt(linux.fd_t), @bitCast(@as(u32, 1 << 2)))) != .SUCCESS)
-            childFailure(control[1]);
+            childFailure(control[1], 1);
         if (executable) |descriptor| {
-            _ = linux.execveat(descriptor, "", argv.ptr, environment.slice.ptr, .{
+            const executed = linux.execveat(descriptor, "", argv.ptr, environment.slice.ptr, .{
                 .EMPTY_PATH = true,
                 .SYMLINK_NOFOLLOW = true,
             });
+            switch (linux.errno(executed)) {
+                .ACCES, .PERM => childFailure(control[1], 2),
+                else => childFailure(control[1], 1),
+            }
         } else {
             _ = linux.execve(argv[0].?, argv.ptr, environment.slice.ptr);
         }
-        childFailure(control[1]);
+        childFailure(control[1], 1);
     }
     // Establish the group from both sides of fork, before a deadline can race
     // the child into creating descendants between the group and leader signals.
@@ -1714,8 +2032,8 @@ fn spawnOwned(
     return .{ .pid = @intCast(forked), .stdout = stdout[0], .stderr = stderr[0], .control = control[0] };
 }
 
-fn childFailure(fd: linux.fd_t) noreturn {
-    const marker = [_]u8{1};
+fn childFailure(fd: linux.fd_t, code: u8) noreturn {
+    const marker = [_]u8{code};
     _ = linux.write(fd, &marker, marker.len);
     linux.exit_group(126);
 }
@@ -1724,7 +2042,12 @@ fn execStatus(fd: linux.fd_t) !bool {
     var byte: [1]u8 = undefined;
     const count = linux.read(fd, &byte, byte.len);
     return switch (linux.errno(count)) {
-        .SUCCESS => if (count == 0) true else error.SpawnFailed,
+        .SUCCESS => if (count == 0)
+            true
+        else if (byte[0] == 2)
+            error.ExecutableSnapshotUnsupported
+        else
+            error.SpawnFailed,
         .AGAIN, .INTR => false,
         else => error.SpawnFailed,
     };
