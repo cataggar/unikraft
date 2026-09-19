@@ -4,6 +4,7 @@ const f = @import("files.zig");
 const p = c.core.private_files;
 const miz = c.boot.miz;
 const linux = std.os.linux;
+const builtin = @import("builtin");
 
 pub const qcow2_name = "unikraft.qcow2";
 pub const qcow2_record_name = "qcow2-finalization.json";
@@ -350,6 +351,73 @@ const workload_path = miz.efi_application_image.fallback_x86_64;
 const config_domain = "uk.wamr.compute-image-config-v1\x00";
 const partition_domain = "uk.wamr.compute-partitions-v1\x00";
 const unique_id_domain = "uk.wamr.compute-vhd-unique-id-v1\x00";
+
+const ScopedFile = struct {
+    file: ?std.Io.File,
+    io: std.Io,
+
+    fn init(io: std.Io, file: std.Io.File) ScopedFile {
+        return .{ .file = file, .io = io };
+    }
+
+    fn borrow(self: ScopedFile) std.Io.File {
+        return self.file.?;
+    }
+
+    fn transfer(self: *ScopedFile) std.Io.File {
+        const file = self.file.?;
+        self.file = null;
+        return file;
+    }
+
+    fn close(self: *ScopedFile) void {
+        if (self.file) |file| file.close(self.io);
+        self.file = null;
+    }
+};
+
+const DescriptorFaultPoint = enum {
+    after_source_validation,
+    after_source_inspection,
+    after_transfer,
+    after_hashing,
+    after_output_inspection,
+    after_allocation,
+};
+
+const DescriptorFaultState = struct {
+    point: DescriptorFaultPoint,
+    hits: usize = 0,
+};
+
+threadlocal var descriptor_fault: ?DescriptorFaultState = null;
+
+fn injectDescriptorFault(point: DescriptorFaultPoint) !void {
+    if (!builtin.is_test) return;
+    if (descriptor_fault) |*fault| {
+        if (fault.point == point) {
+            fault.hits += 1;
+            return error.InjectedDescriptorFault;
+        }
+    }
+}
+
+pub const descriptor_testing = if (builtin.is_test) struct {
+    pub const FaultPoint = DescriptorFaultPoint;
+
+    pub fn install(point: FaultPoint) void {
+        std.debug.assert(descriptor_fault == null);
+        descriptor_fault = .{ .point = point };
+    }
+
+    pub fn hits() usize {
+        return descriptor_fault.?.hits;
+    }
+
+    pub fn clear() void {
+        descriptor_fault = null;
+    }
+} else struct {};
 
 pub const Limits = struct {
     max_input_bytes: u64,
@@ -999,8 +1067,11 @@ pub fn deriveFixedVhd(
         options.limits.max_partition_array_bytes,
     );
     defer source_gpt.deinit(a);
-    const writer = try attempt.openOutput(io, root);
-    var output_image = try miz.Image.createFile(io, writer, .vhd, target_capacity, .{
+    var writer = ScopedFile.init(io, try attempt.openOutput(io, root));
+    defer writer.close();
+    // createFile closes the transferred descriptor on both initialization
+    // failure and Image.close after success.
+    var output_image = try miz.Image.createFile(io, writer.transfer(), .vhd, target_capacity, .{
         .vhd_subformat = .fixed,
         .unique_id = expected_unique_id,
         .timestamp_unix = 0,
@@ -1074,9 +1145,12 @@ fn buildFinalizationRecord(
     output_file: std.Io.File,
     options: FinalizeOptions,
 ) !FinalizationRecord {
+    var output_owner = ScopedFile.init(io, output_file);
+    defer output_owner.close();
     try options.source.validate(options.limits.max_input_bytes);
     try options.producer.validate(c.max_tool);
     try options.limits.validate(options.source.artifact.size, options.expected_virtual_bytes);
+    try injectDescriptorFault(.after_source_validation);
     const retained = try RetainedArtifact.open(io, options.source, options.limits.max_input_bytes);
     defer retained.close(io);
     var work = WorkBudget{ .remaining = options.limits.max_work_bytes };
@@ -1092,27 +1166,33 @@ fn buildFinalizationRecord(
     {
         return error.WorkloadMismatch;
     }
+    try injectDescriptorFault(.after_source_inspection);
     var output_image = try openBoundedQcow2File(
         io,
-        output_file,
+        output_owner.transfer(),
         options.limits,
         options.expected_virtual_bytes,
         options.limits.max_output_bytes,
     );
     defer output_image.close(io);
+    try injectDescriptorFault(.after_transfer);
     const output_snapshot = try c.boot.files.snapshot(output_image.file);
     const output_digest = try c.boot.files.digest(io, output_image.file, output_snapshot);
     const decoded = try hashImage(io, output_image, &work);
+    try injectDescriptorFault(.after_hashing);
     if (!std.mem.eql(u8, &decoded, &options.source.pin.sha256)) return error.PayloadMismatch;
     const output_identity = try inspectDisk(a, io, &output_image, options.limits, &work);
+    try injectDescriptorFault(.after_output_inspection);
     try sameIdentity(a, source_identity, output_identity);
+    const output_allocation = try allocation(output_snapshot);
+    try injectDescriptorFault(.after_allocation);
     const record: FinalizationRecord = .{
         .source_sha256 = options.source.artifact.sha256,
         .source_bytes = options.source.artifact.size,
         .output = .{
             .sha256 = try c.hex(a, output_digest),
             .file_bytes = output_snapshot.size,
-            .allocated = try allocation(output_snapshot),
+            .allocated = output_allocation,
             .virtual_bytes = output_image.virtual_size,
         },
         .identity = output_identity,
@@ -1138,9 +1218,12 @@ fn buildDerivationRecord(
     output_file: std.Io.File,
     options: DeriveOptions,
 ) !DerivationRecord {
+    var output_owner = ScopedFile.init(io, output_file);
+    defer output_owner.close();
     try options.source.validate(options.limits.max_input_bytes);
     try options.producer.validate(c.max_tool);
     try options.limits.validate(options.source.artifact.size, options.expected_capacity_bytes);
+    try injectDescriptorFault(.after_source_validation);
     const retained = try RetainedArtifact.open(io, options.source, options.limits.max_input_bytes);
     defer retained.close(io);
     var work = WorkBudget{ .remaining = options.limits.max_work_bytes };
@@ -1155,9 +1238,11 @@ fn buildDerivationRecord(
         .allocated = try allocation(source_snapshot),
         .virtual_bytes = source_image.virtual_size,
     };
+    try injectDescriptorFault(.after_source_inspection);
 
-    var output_image = try miz.Image.openFile(io, output_file);
+    var output_image = try openImageFile(io, output_owner.transfer());
     defer output_image.close(io);
+    try injectDescriptorFault(.after_transfer);
     const target_capacity = try alignedCapacity(options.expected_capacity_bytes);
     const output_info = try output_image.info(io);
     if (output_info.format != .vhd or output_info.subformat != .fixed or
@@ -1171,6 +1256,7 @@ fn buildDerivationRecord(
     const expected_unique_id = uniqueId(options.source.pin.sha256, options.expected_capacity_bytes);
     const footer_report = try inspectFooter(a, io, output_image.file, target_capacity, expected_unique_id);
     const output_identity = try inspectDisk(a, io, &output_image, options.limits, &work);
+    try injectDescriptorFault(.after_output_inspection);
     try sameIdentity(a, source_identity, output_identity);
     const relocation = try validateAllowedDifferences(
         a,
@@ -1182,6 +1268,9 @@ fn buildDerivationRecord(
     );
     const output_snapshot = try c.boot.files.snapshot(output_image.file);
     const output_digest = try c.boot.files.digest(io, output_image.file, output_snapshot);
+    try injectDescriptorFault(.after_hashing);
+    const output_allocation = try allocation(output_snapshot);
+    try injectDescriptorFault(.after_allocation);
     const record: DerivationRecord = .{
         .accepted_qcow2 = source_artifact,
         .accepted_qcow2_decoded_sha256 = try c.hex(a, source_decoded),
@@ -1189,7 +1278,7 @@ fn buildDerivationRecord(
         .output = .{
             .sha256 = try c.hex(a, output_digest),
             .file_bytes = output_snapshot.size,
-            .allocated = try allocation(output_snapshot),
+            .allocated = output_allocation,
             .virtual_bytes = output_image.virtual_size,
         },
         .output_identity = output_identity,
@@ -1273,16 +1362,24 @@ fn openBoundedQcow2File(
     expected_virtual: u64,
     max_file_bytes: u64,
 ) !miz.Image {
-    var transferred = false;
-    defer if (!transferred) file.close(io);
+    var owner = ScopedFile.init(io, file);
+    defer owner.close();
     var image = try miz.Image.openStandaloneQcow2FileWithLimits(
         io,
-        file,
+        owner.borrow(),
         try qcow2Limits(limits, max_file_bytes),
     );
-    transferred = true;
+    _ = owner.transfer();
     errdefer image.close(io);
     try validateQcow2ProfileWithIo(io, image, expected_virtual);
+    return image;
+}
+
+fn openImageFile(io: std.Io, file: std.Io.File) !miz.Image {
+    var owner = ScopedFile.init(io, file);
+    defer owner.close();
+    const image = try miz.Image.openFile(io, owner.borrow());
+    _ = owner.transfer();
     return image;
 }
 
@@ -1292,16 +1389,19 @@ fn openPinnedQcow2(
     limits: Limits,
     expected_virtual: u64,
 ) !miz.Image {
-    const file = try p.openAbsolute(io, retained.pinned.artifact.path, .artifact);
-    var transferred = false;
-    defer if (!transferred) file.close(io);
-    if (!retained.pinned.pin.matches(try c.boot.files.snapshot(file))) return error.ArtifactChanged;
+    var owner = ScopedFile.init(
+        io,
+        try p.openAbsolute(io, retained.pinned.artifact.path, .artifact),
+    );
+    defer owner.close();
+    if (!retained.pinned.pin.matches(try c.boot.files.snapshot(owner.borrow())))
+        return error.ArtifactChanged;
     var image = try miz.Image.openStandaloneQcow2FileWithLimits(
         io,
-        file,
+        owner.borrow(),
         try qcow2Limits(limits, limits.max_input_bytes),
     );
-    transferred = true;
+    _ = owner.transfer();
     errdefer image.close(io);
     try validateQcow2ProfileWithIo(io, image, expected_virtual);
     return image;

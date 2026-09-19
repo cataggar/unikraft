@@ -4,6 +4,7 @@ const c = image.contracts;
 const t = std.testing;
 const a = t.allocator;
 const io = t.io;
+const linux = std.os.linux;
 const options = @import("test_options");
 const serial_fixture = @import("fixture.zig");
 const config_text = "CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION=y\n" ++
@@ -164,6 +165,229 @@ fn rewritePrivateFile(
     try file.setLength(io, bytes.len);
     try file.sync(io);
     try image.files.sync(io, directory.dir);
+}
+
+fn openFdCount() !usize {
+    const directory = try std.Io.Dir.openDirAbsolute(io, "/proc/self/fd", .{
+        .iterate = true,
+    });
+    defer directory.close(io);
+    var entries = directory.iterate();
+    var count: usize = 0;
+    while (try entries.next(io) != null) count += 1;
+    return count;
+}
+
+const DescriptorProbe = struct {
+    const Mode = enum { observe, cancel_adoption };
+
+    table: std.Io.VTable = io.vtable.*,
+    output_name: []const u8,
+    target_open_index: usize,
+    mode: Mode = .observe,
+    output_opens: usize = 0,
+    target: ?linux.fd_t = null,
+    target_closes: usize = 0,
+    failures: usize = 0,
+    threadlocal var active: ?*DescriptorProbe = null;
+
+    fn install(self: *DescriptorProbe) std.Io {
+        std.debug.assert(active == null);
+        active = self;
+        self.table.dirOpenFile = openFile;
+        self.table.fileReadPositional = readPositional;
+        self.table.fileClose = close;
+        return .{ .userdata = io.userdata, .vtable = &self.table };
+    }
+
+    fn deinit(_: *DescriptorProbe) void {
+        active = null;
+    }
+
+    fn openFile(
+        userdata: ?*anyopaque,
+        directory: std.Io.Dir,
+        sub_path: []const u8,
+        open_options: std.Io.Dir.OpenFileOptions,
+    ) std.Io.File.OpenError!std.Io.File {
+        const file = try io.vtable.dirOpenFile(userdata, directory, sub_path, open_options);
+        const self = active.?;
+        if (std.mem.eql(u8, sub_path, self.output_name)) {
+            self.output_opens += 1;
+            if (self.output_opens == self.target_open_index) self.target = file.handle;
+        }
+        return file;
+    }
+
+    fn readPositional(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        data: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        const self = active.?;
+        if (self.target != null and file.handle == self.target.? and
+            self.mode == .cancel_adoption and self.failures == 0)
+        {
+            self.failures += 1;
+            return error.Canceled;
+        }
+        return io.vtable.fileReadPositional(userdata, file, data, offset);
+    }
+
+    fn close(userdata: ?*anyopaque, files: []const std.Io.File) void {
+        const self = active.?;
+        if (self.target) |target| {
+            for (files) |file| {
+                if (file.handle == target) self.target_closes += 1;
+            }
+        }
+        io.vtable.fileClose(userdata, files);
+    }
+};
+
+const OomAfterTarget = struct {
+    backing: std.mem.Allocator,
+    probe: *DescriptorProbe,
+    induced: bool = false,
+
+    fn allocator(self: *OomAfterTarget) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(
+        context: *anyopaque,
+        length: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *OomAfterTarget = @ptrCast(@alignCast(context));
+        if (self.probe.target != null and !self.induced) {
+            self.induced = true;
+            return null;
+        }
+        return self.backing.rawAlloc(length, alignment, return_address);
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_length: usize,
+        return_address: usize,
+    ) bool {
+        const self: *OomAfterTarget = @ptrCast(@alignCast(context));
+        return self.backing.rawResize(memory, alignment, new_length, return_address);
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_length: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *OomAfterTarget = @ptrCast(@alignCast(context));
+        return self.backing.rawRemap(memory, alignment, new_length, return_address);
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *OomAfterTarget = @ptrCast(@alignCast(context));
+        self.backing.rawFree(memory, alignment, return_address);
+    }
+};
+
+fn expectProbeClosed(probe: DescriptorProbe, expected_opens: usize) !void {
+    try t.expectEqual(expected_opens, probe.output_opens);
+    try t.expectEqual(@as(usize, 1), probe.target_closes);
+    try t.expectEqual(
+        .BADF,
+        linux.errno(linux.fcntl(probe.target.?, linux.F.GETFD, 0)),
+    );
+}
+
+fn expectCallerOpen(file: std.Io.File) !void {
+    try t.expectEqual(.SUCCESS, linux.errno(linux.fcntl(file.handle, linux.F.GETFD, 0)));
+    try t.expect((try file.stat(io)).size != 0);
+}
+
+fn expectFinalizationInjected(
+    alloc: std.mem.Allocator,
+    root: image.core.private_files.Directory,
+    attempt: *image.compute_artifacts.ReservedAttempt,
+    options_value: image.compute_artifacts.FinalizeOptions,
+    point: image.compute_artifacts.descriptor_testing.FaultPoint,
+) !void {
+    const before = try openFdCount();
+    {
+        var probe: DescriptorProbe = .{
+            .output_name = image.compute_artifacts.qcow2_name,
+            .target_open_index = 1,
+        };
+        const fault_io = probe.install();
+        defer probe.deinit();
+        image.compute_artifacts.descriptor_testing.install(point);
+        defer image.compute_artifacts.descriptor_testing.clear();
+        try t.expectError(
+            error.InjectedDescriptorFault,
+            image.compute_artifacts.verifyFinalizedQcow2(
+                alloc,
+                fault_io,
+                root,
+                attempt,
+                options_value,
+            ),
+        );
+        try t.expectEqual(@as(usize, 1), image.compute_artifacts.descriptor_testing.hits());
+        try expectProbeClosed(probe, 1);
+    }
+    try t.expectEqual(before, try openFdCount());
+}
+
+fn expectDerivationInjected(
+    alloc: std.mem.Allocator,
+    root: image.core.private_files.Directory,
+    attempt: *image.compute_artifacts.ReservedAttempt,
+    options_value: image.compute_artifacts.DeriveOptions,
+    point: image.compute_artifacts.descriptor_testing.FaultPoint,
+) !void {
+    const before = try openFdCount();
+    {
+        var probe: DescriptorProbe = .{
+            .output_name = image.compute_artifacts.vhd_name,
+            .target_open_index = 1,
+        };
+        const fault_io = probe.install();
+        defer probe.deinit();
+        image.compute_artifacts.descriptor_testing.install(point);
+        defer image.compute_artifacts.descriptor_testing.clear();
+        try t.expectError(
+            error.InjectedDescriptorFault,
+            image.compute_artifacts.verifyDerivedFixedVhd(
+                alloc,
+                fault_io,
+                root,
+                attempt,
+                options_value,
+            ),
+        );
+        try t.expectEqual(@as(usize, 1), image.compute_artifacts.descriptor_testing.hits());
+        try expectProbeClosed(probe, 1);
+    }
+    try t.expectEqual(before, try openFdCount());
 }
 
 test "compute attempts reserve every publication slot and clean only retained identities" {
@@ -865,6 +1089,491 @@ test "compute-only raw to native zstd QCOW2 to digest-bound fixed VHD" {
         error.InvalidRecord,
         image.compute_artifacts.readFinalizationRecord(alloc, tampered),
     );
+}
+test "compute record builders close every adopted output descriptor exactly once" {
+    const fixture = try Fixture.init(0, false);
+    defer fixture.deinit();
+    const alloc = fixture.arena.allocator();
+    const package_root = try image.files.create(io, fixture.input.state_dir);
+    defer package_root.close(io);
+    const efi_input = try image.files.record(alloc, io, fixture.input.efi, c.max_efi, false);
+    const packaged = try image.package.build(alloc, io, package_root, efi_input);
+    try image.files.cleanupStage(io, package_root, "package-stage");
+    const producer = try image.files.record(alloc, io, fixture.cli, c.max_tool, true);
+    const limits: image.compute_artifacts.Limits = .{
+        .max_input_bytes = c.raw_bytes,
+        .max_output_bytes = c.vhd_bytes,
+        .max_virtual_bytes = c.raw_bytes,
+        .max_partition_array_bytes = 1024 * 1024,
+        .max_metadata_bytes = 128 * 1024,
+        .max_metadata_work = 8194,
+        .max_work_bytes = 4 * c.raw_bytes,
+        .max_memory_bytes = 512 * 1024 * 1024,
+    };
+    const raw_path = try image.files.path(alloc, fixture.input.state_dir, "unikraft.raw");
+    const raw = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        raw_path,
+        packaged.raw.size,
+        packaged.raw.sha256,
+        limits.max_input_bytes,
+    );
+    const finalize_options: image.compute_artifacts.FinalizeOptions = .{
+        .source = raw,
+        .expected_virtual_bytes = packaged.raw.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("descriptor finalization fixture"),
+    };
+
+    const qcow_state_path = try image.files.path(alloc, fixture.path, "descriptor-qcow2");
+    const qcow_state = try image.files.create(io, qcow_state_path);
+    defer qcow_state.close(io);
+    var qcow_attempt = try image.compute_artifacts.reserveAttempt(io, qcow_state, .qcow2);
+    defer qcow_attempt.close(io);
+    const finalized = try image.compute_artifacts.finalizeQcow2(
+        alloc,
+        io,
+        qcow_state,
+        qcow_attempt.evidence,
+        finalize_options,
+    );
+    const qcow_path = try image.files.path(
+        alloc,
+        qcow_state_path,
+        image.compute_artifacts.qcow2_name,
+    );
+    const qcow = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        qcow_path,
+        finalized.output.file_bytes,
+        finalized.output.sha256,
+        limits.max_input_bytes,
+    );
+    const derive_options: image.compute_artifacts.DeriveOptions = .{
+        .source = qcow,
+        .expected_capacity_bytes = finalized.output.virtual_bytes,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("descriptor derivation fixture"),
+    };
+    const vhd_state_path = try image.files.path(alloc, fixture.path, "descriptor-vhd");
+    const vhd_state = try image.files.create(io, vhd_state_path);
+    defer vhd_state.close(io);
+    var vhd_attempt = try image.compute_artifacts.reserveAttempt(io, vhd_state, .vhd);
+    defer vhd_attempt.close(io);
+    const derived = try image.compute_artifacts.deriveFixedVhd(
+        alloc,
+        io,
+        vhd_state,
+        vhd_attempt.evidence,
+        derive_options,
+    );
+
+    const retained_raw = try std.Io.Dir.openFileAbsolute(io, raw_path, .{
+        .mode = .read_only,
+    });
+    defer retained_raw.close(io);
+    const retained_qcow = try std.Io.Dir.openFileAbsolute(io, qcow_path, .{
+        .mode = .read_only,
+    });
+    defer retained_qcow.close(io);
+
+    for (0..8) |_| {
+        try expectFinalizationInjected(
+            alloc,
+            qcow_state,
+            &qcow_attempt,
+            finalize_options,
+            .after_source_validation,
+        );
+        try expectDerivationInjected(
+            alloc,
+            vhd_state,
+            &vhd_attempt,
+            derive_options,
+            .after_source_validation,
+        );
+        try expectCallerOpen(retained_raw);
+        try expectCallerOpen(retained_qcow);
+    }
+    for ([_]image.compute_artifacts.descriptor_testing.FaultPoint{
+        .after_source_inspection,
+        .after_transfer,
+        .after_hashing,
+        .after_output_inspection,
+        .after_allocation,
+    }) |point| {
+        try expectFinalizationInjected(
+            alloc,
+            qcow_state,
+            &qcow_attempt,
+            finalize_options,
+            point,
+        );
+        try expectDerivationInjected(
+            alloc,
+            vhd_state,
+            &vhd_attempt,
+            derive_options,
+            point,
+        );
+        try expectCallerOpen(retained_raw);
+        try expectCallerOpen(retained_qcow);
+    }
+
+    for ([_]struct {
+        root: image.core.private_files.Directory,
+        attempt: *image.compute_artifacts.ReservedAttempt,
+        output_name: []const u8,
+        qcow2: bool,
+    }{
+        .{
+            .root = qcow_state,
+            .attempt = &qcow_attempt,
+            .output_name = image.compute_artifacts.qcow2_name,
+            .qcow2 = true,
+        },
+        .{
+            .root = vhd_state,
+            .attempt = &vhd_attempt,
+            .output_name = image.compute_artifacts.vhd_name,
+            .qcow2 = false,
+        },
+    }) |case| {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = case.output_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            if (case.qcow2) {
+                _ = try image.compute_artifacts.verifyFinalizedQcow2(
+                    alloc,
+                    probe_io,
+                    case.root,
+                    case.attempt,
+                    finalize_options,
+                );
+            } else {
+                _ = try image.compute_artifacts.verifyDerivedFixedVhd(
+                    alloc,
+                    probe_io,
+                    case.root,
+                    case.attempt,
+                    derive_options,
+                );
+            }
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+
+    {
+        var invalid = finalize_options;
+        invalid.limits.max_workload_bytes = 0;
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.qcow2_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(
+                error.InvalidWorkloadLimit,
+                image.compute_artifacts.verifyFinalizedQcow2(
+                    alloc,
+                    probe_io,
+                    qcow_state,
+                    &qcow_attempt,
+                    invalid,
+                ),
+            );
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+    {
+        var invalid = derive_options;
+        invalid.limits.max_memory_bytes = 0;
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.vhd_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(
+                error.InvalidMemoryLimit,
+                image.compute_artifacts.verifyDerivedFixedVhd(
+                    alloc,
+                    probe_io,
+                    vhd_state,
+                    &vhd_attempt,
+                    invalid,
+                ),
+            );
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+
+    for ([_]struct {
+        root: image.core.private_files.Directory,
+        attempt: *image.compute_artifacts.ReservedAttempt,
+        output_name: []const u8,
+        qcow2: bool,
+    }{
+        .{
+            .root = qcow_state,
+            .attempt = &qcow_attempt,
+            .output_name = image.compute_artifacts.qcow2_name,
+            .qcow2 = true,
+        },
+        .{
+            .root = vhd_state,
+            .attempt = &vhd_attempt,
+            .output_name = image.compute_artifacts.vhd_name,
+            .qcow2 = false,
+        },
+    }) |case| {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = case.output_name,
+                .target_open_index = 1,
+                .mode = .cancel_adoption,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            if (case.qcow2) {
+                try t.expectError(
+                    error.Canceled,
+                    image.compute_artifacts.verifyFinalizedQcow2(
+                        alloc,
+                        probe_io,
+                        case.root,
+                        case.attempt,
+                        finalize_options,
+                    ),
+                );
+            } else {
+                try t.expectError(
+                    error.Canceled,
+                    image.compute_artifacts.verifyDerivedFixedVhd(
+                        alloc,
+                        probe_io,
+                        case.root,
+                        case.attempt,
+                        derive_options,
+                    ),
+                );
+            }
+            try t.expectEqual(@as(usize, 1), probe.failures);
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+
+    {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.qcow2_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            var oom: OomAfterTarget = .{ .backing = alloc, .probe = &probe };
+            try t.expectError(
+                error.OutOfMemory,
+                image.compute_artifacts.verifyFinalizedQcow2(
+                    oom.allocator(),
+                    probe_io,
+                    qcow_state,
+                    &qcow_attempt,
+                    finalize_options,
+                ),
+            );
+            try t.expect(oom.induced);
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+    {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.vhd_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            var oom: OomAfterTarget = .{ .backing = alloc, .probe = &probe };
+            try t.expectError(
+                error.OutOfMemory,
+                image.compute_artifacts.verifyDerivedFixedVhd(
+                    oom.allocator(),
+                    probe_io,
+                    vhd_state,
+                    &vhd_attempt,
+                    derive_options,
+                ),
+            );
+            try t.expect(oom.induced);
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+
+    {
+        var original: [1]u8 = undefined;
+        _ = try qcow_attempt.output.readPositionalAll(io, &original, 0);
+        try qcow_attempt.output.writePositionalAll(io, &.{original[0] ^ 1}, 0);
+        try qcow_attempt.output.sync(io);
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.qcow2_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            if (image.compute_artifacts.verifyFinalizedQcow2(
+                alloc,
+                probe_io,
+                qcow_state,
+                &qcow_attempt,
+                finalize_options,
+            )) |_| return error.AcceptedMalformedQcow2 else |_| {}
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+        try qcow_attempt.output.writePositionalAll(io, &original, 0);
+        try qcow_attempt.output.sync(io);
+    }
+    const restored_qcow = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        qcow_path,
+        finalized.output.file_bytes,
+        finalized.output.sha256,
+        limits.max_input_bytes,
+    );
+    var worker_derive_options = derive_options;
+    worker_derive_options.source = restored_qcow;
+    {
+        var original: [1]u8 = undefined;
+        _ = try vhd_attempt.output.readPositionalAll(io, &original, derived.output.virtual_bytes);
+        try vhd_attempt.output.writePositionalAll(
+            io,
+            &.{original[0] ^ 1},
+            derived.output.virtual_bytes,
+        );
+        try vhd_attempt.output.sync(io);
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.vhd_name,
+                .target_open_index = 1,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            if (image.compute_artifacts.verifyDerivedFixedVhd(
+                alloc,
+                probe_io,
+                vhd_state,
+                &vhd_attempt,
+                derive_options,
+            )) |_| return error.AcceptedMalformedVhd else |_| {}
+            try expectProbeClosed(probe, 1);
+        }
+        try t.expectEqual(before, try openFdCount());
+        try vhd_attempt.output.writePositionalAll(
+            io,
+            &original,
+            derived.output.virtual_bytes,
+        );
+        try vhd_attempt.output.sync(io);
+    }
+
+    const worker_qcow_path = try image.files.path(alloc, fixture.path, "worker-qcow-fault");
+    const worker_qcow = try image.files.create(io, worker_qcow_path);
+    defer worker_qcow.close(io);
+    var worker_qcow_attempt = try image.compute_artifacts.reserveAttempt(
+        io,
+        worker_qcow,
+        .qcow2,
+    );
+    defer worker_qcow_attempt.close(io);
+    {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.qcow2_name,
+                .target_open_index = 2,
+                .mode = .cancel_adoption,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(
+                error.Canceled,
+                image.compute_artifacts.finalizeQcow2(
+                    alloc,
+                    probe_io,
+                    worker_qcow,
+                    worker_qcow_attempt.evidence,
+                    finalize_options,
+                ),
+            );
+            try t.expectEqual(@as(usize, 1), probe.failures);
+            try expectProbeClosed(probe, 2);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+    try t.expect(worker_qcow_attempt.rollback(io, worker_qcow).rollbackComplete());
+
+    const worker_vhd_path = try image.files.path(alloc, fixture.path, "worker-vhd-fault");
+    const worker_vhd = try image.files.create(io, worker_vhd_path);
+    defer worker_vhd.close(io);
+    var worker_vhd_attempt = try image.compute_artifacts.reserveAttempt(io, worker_vhd, .vhd);
+    defer worker_vhd_attempt.close(io);
+    {
+        const before = try openFdCount();
+        {
+            var probe: DescriptorProbe = .{
+                .output_name = image.compute_artifacts.vhd_name,
+                .target_open_index = 3,
+                .mode = .cancel_adoption,
+            };
+            const probe_io = probe.install();
+            defer probe.deinit();
+            try t.expectError(
+                error.Canceled,
+                image.compute_artifacts.deriveFixedVhd(
+                    alloc,
+                    probe_io,
+                    worker_vhd,
+                    worker_vhd_attempt.evidence,
+                    worker_derive_options,
+                ),
+            );
+            try t.expectEqual(@as(usize, 1), probe.failures);
+            try expectProbeClosed(probe, 3);
+        }
+        try t.expectEqual(before, try openFdCount());
+    }
+    try t.expect(worker_vhd_attempt.rollback(io, worker_vhd).rollbackComplete());
+    try expectCallerOpen(retained_raw);
+    try expectCallerOpen(retained_qcow);
 }
 test "fixed VHD derivation permits only documented GPT relocation deltas" {
     const fixture = try Fixture.init(0, false);
