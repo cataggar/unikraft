@@ -479,6 +479,12 @@ pub const CommandSignalTestState = struct {
     attempts: u32 = 0,
 };
 
+pub const CommandLeaderTrackTest = struct {
+    observed_ns: u64,
+    fault_injections: u32 = 0,
+    timestamp_observations: u32 = 0,
+};
+
 pub const CommandPreSpawnTestFault = enum {
     snapshot_unsupported,
     snapshot_local_io,
@@ -491,6 +497,7 @@ pub const CommandTestOptions = struct {
     pidfd: ?*CommandPidfdTestState = null,
     clock: ?*CommandClockTest = null,
     signal: ?*CommandSignalTestState = null,
+    leader_track: ?*CommandLeaderTrackTest = null,
     pre_spawn: ?CommandPreSpawnTestFault = null,
 };
 
@@ -790,14 +797,25 @@ fn runCommandImpl(
         if (options_value.leader_track_delay_ms != 0)
             try pause(@intCast(options_value.leader_track_delay_ms));
     }
-    tracker.addLeader(proc, child.pid) catch |err| {
+    tracker.addLeader(
+        proc,
+        child.pid,
+        if (test_options) |options_value| options_value.leader_track else null,
+    ) catch |err| {
         result.cleanup_complete = false;
         result.cleanup = switch (err) {
             error.IdentityChanged => .identity_changed,
             error.ProcessGone, error.ProcUnavailable, error.PidfdUnavailable => .proc_unavailable,
             error.PollFailed => .local_io,
         };
-        try completePrimaryCommandTiming(&result);
+        const primary_observed_ns = try commandLeaderTrackFailureObserved(
+            if (test_options) |options_value| options_value.leader_track else null,
+        );
+        completePrimaryCommandTimingAt(&result, primary_observed_ns);
+        if (result.primary_completed_ns >= request.primary_deadline.expires_ns) {
+            result.primary = .timeout;
+            result.primary_deadline_reached = true;
+        }
         poisonAndRecoverLeader(proc, child.pid, request.cleanup_deadline, &result);
         try completeCleanupCommandTiming(&result);
         return result;
@@ -1365,6 +1383,14 @@ fn commandLeaderExitObserved(clock: ?*CommandClockTest) !u64 {
     return now();
 }
 
+fn commandLeaderTrackFailureObserved(fault: ?*CommandLeaderTrackTest) !u64 {
+    if (fault) |active| {
+        active.timestamp_observations += 1;
+        return active.observed_ns;
+    }
+    return now();
+}
+
 fn takeCommandEvent(limit: u32, events: *u32) !void {
     if (events.* >= limit) return error.EventLimit;
     events.* += 1;
@@ -1522,7 +1548,16 @@ const OwnedTracker = struct {
         self.* = undefined;
     }
 
-    fn addLeader(self: *OwnedTracker, proc: linux.fd_t, pid: linux.pid_t) !void {
+    fn addLeader(
+        self: *OwnedTracker,
+        proc: linux.fd_t,
+        pid: linux.pid_t,
+        fault: ?*CommandLeaderTrackTest,
+    ) !void {
+        if (fault) |active| {
+            active.fault_injections += 1;
+            return error.IdentityChanged;
+        }
         const observed = try readProcStat(proc, pid);
         if (observed.pid != pid or observed.parent != linux.getpid() or observed.start_ticks == 0)
             return error.IdentityChanged;
@@ -2146,6 +2181,7 @@ fn poisonAndRecoverLeader(proc: linux.fd_t, pid: linux.pid_t, deadline: Deadline
         var status: u32 = 0;
         const child = linux.waitpid(pid, &status, linux.W.NOHANG);
         if (linux.errno(child) == .SUCCESS and child != 0) {
+            result.reap_events += 1;
             result.termination = terminationFromStatus(status);
             break;
         }

@@ -3224,6 +3224,81 @@ source/generated/
                 ci.decoded_supervisor_result(
                     ci.canonical_json(value), request, expected)
 
+        def leader_tracking_fixture(offset):
+            value = copy.deepcopy(early)
+            request = copy.deepcopy(early_request)
+            command = value["command"]
+            started = command["started_ns"]
+            request["primary_deadline_ns"] = started + 1000
+            request["cleanup_deadline_ns"] = started + 2000
+            observed = request["primary_deadline_ns"] + offset
+            command.update({
+                "cancellation_observed": False,
+                "cleanup": "identity_changed",
+                "cleanup_complete": False,
+                "cleanup_events": 0,
+                "completed_ns": observed + 1,
+                "poisoned": True,
+                "primary": {
+                    "code": None,
+                    "kind": "local_io" if offset < 0 else "timeout",
+                },
+                "primary_completed_ns": observed,
+                "primary_deadline_reached": offset >= 0,
+                "primary_events": 0,
+                "reap_events": 1,
+                "stderr_status": "incomplete",
+                "stdout_status": "incomplete",
+                "termination": {"code": 9, "kind": "signal"},
+            })
+            request_raw = ci.validate_supervisor_request(request)
+            value["request_bytes"] = len(request_raw)
+            value["request_sha256"] = hashlib.sha256(
+                request_raw).hexdigest()
+            return value, request
+
+        for offset in (-1, 0, 1):
+            value, request = leader_tracking_fixture(offset)
+            with self.subTest(leader_tracking_offset=offset):
+                decoded, stdout, stderr = ci.decoded_supervisor_result(
+                    ci.canonical_json(value), request, expected)
+                command = decoded["command"]
+                self.assertEqual(stdout, b"")
+                self.assertEqual(stderr, b"")
+                self.assertEqual(command["cleanup"], "identity_changed")
+                self.assertFalse(command["cleanup_complete"])
+                self.assertTrue(command["poisoned"])
+                self.assertEqual(command["reap_events"], 1)
+                self.assertEqual(
+                    command["termination"],
+                    {"code": 9, "kind": "signal"})
+                self.assertEqual(
+                    command["primary"]["kind"],
+                    "local_io" if offset < 0 else "timeout")
+                self.assertEqual(
+                    command["primary_completed_ns"],
+                    request["primary_deadline_ns"] + offset)
+
+        equality, equality_request = leader_tracking_fixture(0)
+        equality["command"]["primary"] = {
+            "code": None, "kind": "local_io",
+        }
+        equality["command"]["primary_deadline_reached"] = False
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(
+                ci.canonical_json(equality), equality_request, expected)
+
+        before, before_request = leader_tracking_fixture(-1)
+        before["command"]["primary"] = {
+            "code": None, "kind": "timeout",
+        }
+        before["command"]["primary_deadline_reached"] = True
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command result"):
+            ci.decoded_supervisor_result(
+                ci.canonical_json(before), before_request, expected)
+
         exact_negatives = []
         valid, valid_request = pre_spawn_fixture("local_io")
 
