@@ -299,6 +299,7 @@ class Evidence(unittest.TestCase):
             }
 
         primary = 10_000_000_000_000
+        issued = primary - contract["seconds"] * 1_000_000_000
         request_core = {
             "binding_schema": ci.COMMAND_BINDING_SCHEMA,
             "binding_version": ci.COMMAND_BINDING_VERSION,
@@ -322,6 +323,7 @@ class Evidence(unittest.TestCase):
                 }
                 for name in contract["retained_names"]
             ],
+            "issued_ns": issued,
             "primary_deadline_ns": primary,
             "cleanup_deadline_ns":
                 primary + ci.COMMAND_CLEANUP_SECONDS * 1_000_000_000,
@@ -337,6 +339,11 @@ class Evidence(unittest.TestCase):
             "cwd_sha256": ci.command_binding_digest(request_core["cwd"]),
         }
         empty = hashlib.sha256(b"").hexdigest()
+        output_commitment = ci.command_output_commitment(
+            0, empty, 0, empty)
+        started = issued + 1
+        primary_completed = started + 2
+        completed = primary_completed + 3
         command = {
             "cancellation_observed": False,
             "cleanup": "complete",
@@ -351,19 +358,34 @@ class Evidence(unittest.TestCase):
             },
             "executable": request["native_executable"]["identity"],
             "executable_stable": True,
-            "output": {"bytes": 0, "sha256": empty},
+            "output": {
+                "bytes": 0,
+                "combined_sha256": empty,
+                "commitment_sha256": output_commitment,
+                "digest_scope": "reproducible_empty",
+            },
             "poisoned": False,
             "primary": {"code": 0, "kind": "exited"},
             "primary_deadline_reached": False,
             "primary_events": 1,
-            "reap_events": 1,
+            "reap_events": 2,
             "retained_executables": copy.deepcopy(
                 request["retained_executables"]),
             "stderr": {
-                "bytes": 0, "sha256": empty, "status": "complete",
+                "bytes": 0, "digest_scope": "reproducible_empty",
+                "sha256": empty, "status": "complete",
             },
             "stdout": {
-                "bytes": 0, "sha256": empty, "status": "complete",
+                "bytes": 0, "digest_scope": "reproducible_empty",
+                "sha256": empty, "status": "complete",
+            },
+            "timing": {
+                "cleanup_elapsed_ns": completed - primary_completed,
+                "completed_ns": completed,
+                "primary_completed_ns": primary_completed,
+                "primary_elapsed_ns": primary_completed - started,
+                "started_ns": started,
+                "total_elapsed_ns": completed - started,
             },
             "termination": {"code": 0, "kind": "exited"},
         }
@@ -372,6 +394,16 @@ class Evidence(unittest.TestCase):
             "version": 1,
             "request_canonical_sha256": request["canonical_sha256"],
             "controller_error": None,
+            "native_request": {
+                "bytes": 128,
+                "digest_scope": "direct_producer_or_trusted_inner_zip",
+                "sha256": hashlib.sha256(b"native-request").hexdigest(),
+            },
+            "native_result": {
+                "bytes": 256,
+                "digest_scope": "direct_producer_or_trusted_inner_zip",
+                "sha256": hashlib.sha256(b"native-result").hexdigest(),
+            },
             "command": command,
         }
         record = {
@@ -380,6 +412,7 @@ class Evidence(unittest.TestCase):
             "exit_code": 0,
             "bytes": 0,
             "sha256": empty,
+            "sha256_scope": "reproducible_empty",
             "over_limit": False,
             "known_error_markers": [],
             "supervisor": {
@@ -995,6 +1028,21 @@ class Evidence(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bundle refused"):
             public_bundle.require_consumer_tree_roles(current, False)
         public_bundle.require_consumer_tree_roles(current, True)
+
+    def test_current_public_import_requires_independent_inner_zip_digest(self):
+        expected = {
+            "repository": "cataggar/unikraft",
+            "run_id": "35422844896",
+            "run_attempt": "1",
+            "source_revision": "1" * 40,
+            "source_tree": "2" * 40,
+            "wamr_revision": ci.REVISION,
+        }
+        handoff = mock.Mock()
+        handoff.ci = ci
+        with self.assertRaisesRegex(ValueError, "bundle refused"):
+            public_bundle.verify_archive_descriptor(
+                handoff, -1, expected, None)
 
     def test_public_supervisor_maps_recompute_closures_and_legacy_is_compatible(self):
         artifact = self.root / "supervisor-map-artifact"
@@ -2394,7 +2442,8 @@ source/generated/
         record, identities = self.supervised_binding(
             "public-validator-build")
         public_bundle.supervised_command_record(
-            ci, record, "public-validator-build", identities)
+            ci, record, "public-validator-build", identities,
+            "trusted_inner_zip")
         mutations = []
 
         changed = copy.deepcopy(record)
@@ -2462,13 +2511,63 @@ source/generated/
         mutations.append(("result", self.rehash_supervised_binding(changed)))
 
         changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["descendants"][
+            "identity_validated"] = 1
+        mutations.append(("descendant-summary",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["reap_events"] = 1
+        mutations.append(("reap-count",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["primary_events"] = (
+            changed["supervisor"]["request"]["limits"]["primary_events"] + 1)
+        mutations.append(("primary-count",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["stdout"]["sha256"] = (
+            "0" * 64)
+        mutations.append(("empty-stream-digest",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["output"][
+            "commitment_sha256"] = "0" * 64
+        mutations.append(("aggregate-output",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"]["timing"][
+            "primary_completed_ns"] = (
+                changed["supervisor"]["result"]["command"]["timing"][
+                    "started_ns"] - 1)
+        mutations.append(("timing-reset",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["result"]["command"][
+            "cancellation_observed"] = True
+        mutations.append(("incoherent-outcome",
+                          self.rehash_supervised_binding(changed)))
+
+        changed = copy.deepcopy(record)
         changed["supervisor"]["result"]["canonical_sha256"] = "0" * 64
         mutations.append(("result-canonical", changed))
 
         for name, changed in mutations:
             with self.subTest(name=name), self.assertRaises(ValueError):
                 public_bundle.supervised_command_record(
-                    ci, changed, "public-validator-build", identities)
+                    ci, changed, "public-validator-build", identities,
+                    "trusted_inner_zip")
+
+        changed = copy.deepcopy(record)
+        changed["supervisor"]["request"]["issued_ns"] = 10 ** 100
+        with self.assertRaisesRegex(
+                (ci.Refusal, ValueError), "native range"):
+            self.rehash_supervised_binding(changed)
 
         python_record, python_identities = self.supervised_binding("fixtures")
         changed = copy.deepcopy(python_record)
@@ -2477,7 +2576,79 @@ source/generated/
         self.rehash_supervised_binding(changed)
         with self.assertRaises(ValueError):
             public_bundle.supervised_command_record(
-                ci, changed, "fixtures", python_identities)
+                ci, changed, "fixtures", python_identities,
+                "trusted_inner_zip")
+
+    def test_valid_hosted_command_invariant_vectors(self):
+        vectors = (
+            {
+                "stage": "public-validator-build",
+                "primary_events": 5929, "cleanup_events": 873,
+                "descendants": 0, "bytes": 0,
+                "stdout_bytes": 0, "stdout_sha256": ci.EMPTY_SHA256,
+                "stderr_bytes": 0, "stderr_sha256": ci.EMPTY_SHA256,
+                "combined_sha256": ci.EMPTY_SHA256,
+            },
+            {
+                "stage": "fixtures",
+                "primary_events": 1043, "cleanup_events": 1280,
+                "descendants": 12, "bytes": 11444,
+                "stdout_bytes": 0, "stdout_sha256": ci.EMPTY_SHA256,
+                "stderr_bytes": 11444,
+                "stderr_sha256":
+                    "78ba6ee6302bfc3ded0d6842a07e90323d38f471b5da084077aa76c7240436c0",
+                "combined_sha256":
+                    "78ba6ee6302bfc3ded0d6842a07e90323d38f471b5da084077aa76c7240436c0",
+            },
+            {
+                "stage": "raw-x2apic",
+                "primary_events": 236, "cleanup_events": 889,
+                "descendants": 0, "bytes": 401,
+                "stdout_bytes": 401,
+                "stdout_sha256":
+                    "56fbb15c01cbe0566c52146dafc7974bcde5993ce33ad2b76f49d98d685b7d8e",
+                "stderr_bytes": 0, "stderr_sha256": ci.EMPTY_SHA256,
+                "combined_sha256":
+                    "56fbb15c01cbe0566c52146dafc7974bcde5993ce33ad2b76f49d98d685b7d8e",
+            },
+        )
+        for vector in vectors:
+            with self.subTest(stage=vector["stage"]):
+                record, identities = self.supervised_binding(vector["stage"])
+                command = record["supervisor"]["result"]["command"]
+                command["primary_events"] = vector["primary_events"]
+                command["cleanup_events"] = vector["cleanup_events"]
+                command["descendants"].update({
+                    "adopted": vector["descendants"],
+                    "identity_validated": vector["descendants"],
+                    "observed": vector["descendants"],
+                })
+                command["reap_events"] = vector["descendants"] + 2
+                for name in ("stdout", "stderr"):
+                    size = vector[name + "_bytes"]
+                    command[name] = {
+                        "bytes": size,
+                        "digest_scope": ci.command_digest_scope(size),
+                        "sha256": vector[name + "_sha256"],
+                        "status": "complete",
+                    }
+                command["output"] = {
+                    "bytes": vector["bytes"],
+                    "combined_sha256": vector["combined_sha256"],
+                    "commitment_sha256": ci.command_output_commitment(
+                        vector["stdout_bytes"], vector["stdout_sha256"],
+                        vector["stderr_bytes"], vector["stderr_sha256"]),
+                    "digest_scope":
+                        ci.command_digest_scope(vector["bytes"]),
+                }
+                record["bytes"] = vector["bytes"]
+                record["sha256"] = vector["combined_sha256"]
+                record["sha256_scope"] = ci.command_digest_scope(
+                    vector["bytes"])
+                self.rehash_supervised_binding(record)
+                public_bundle.supervised_command_record(
+                    ci, record, vector["stage"], identities,
+                    "trusted_inner_zip")
 
     @unittest.skipIf(
         not SUPERVISOR or not SUPERVISOR_FIXTURE,
@@ -2629,19 +2800,66 @@ source/generated/
                 env={}, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, b"")
-            return result.stdout
+            return result.stdout, request
 
-        raw = invoke(["environment"], (("LC_ALL", "C"),))
-        decoded, stdout, stderr = ci.decoded_supervisor_result(raw, expected)
+        raw, request = invoke(["environment"], (("LC_ALL", "C"),))
+        decoded, stdout, stderr = ci.decoded_supervisor_result(
+            raw, request, expected)
         self.assertEqual(stdout, b"environment-ok\n")
         self.assertEqual(stderr, b"")
         self.assertEqual(decoded["command"]["retained_executables"], [])
         with self.assertRaisesRegex(ci.Refusal, "invalid native command result"):
-            ci.decoded_supervisor_result(raw + b" ", expected)
+            ci.decoded_supervisor_result(raw + b" ", request, expected)
         changed = json.loads(raw)
         changed["command"]["executable"]["content_sha256"] = "0" * 64
         with self.assertRaisesRegex(ci.Refusal, "invalid native command result"):
-            ci.decoded_supervisor_result(ci.canonical_json(changed), expected)
+            ci.decoded_supervisor_result(
+                ci.canonical_json(changed), request, expected)
+        mutations = []
+
+        changed = json.loads(raw)
+        changed["command"]["descendants"]["identity_validated"] = 1
+        mutations.append(("descendants", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["stderr_sha256"] = "0" * 64
+        mutations.append(("zero-byte-hash", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["output_sha256"] = "0" * 64
+        mutations.append(("aggregate", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["primary_events"] = (
+            request["limits"]["primary_events"] + 1)
+        mutations.append(("count", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["primary_completed_ns"] = (
+            changed["command"]["started_ns"] - 1)
+        mutations.append(("deadline-order", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["termination"] = {
+            "code": 15, "kind": "signal",
+        }
+        mutations.append(("outcome", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["primary"] = {"code": 256, "kind": "exited"}
+        changed["command"]["termination"] = {"code": 256, "kind": "exited"}
+        mutations.append(("exit-domain", changed))
+
+        changed = json.loads(raw)
+        changed["command"]["primary"] = {"code": 0, "kind": "signal"}
+        changed["command"]["termination"] = {"code": 0, "kind": "signal"}
+        mutations.append(("signal-domain", changed))
+
+        for name, changed in mutations:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    ci.Refusal, "invalid native command result"):
+                ci.decoded_supervisor_result(
+                    ci.canonical_json(changed), request, expected)
 
         limits = {
             "cleanup_events": 32,
@@ -2653,14 +2871,234 @@ source/generated/
             "stdout_bytes": 4096,
             "term_grace_ms": 1000,
         }
-        poisoned_raw = invoke(["many-immediate", "32"], limits=limits)
+        poisoned_raw, poisoned_request = invoke(
+            ["many-immediate", "32"], limits=limits)
         poisoned, unused_stdout, unused_stderr = (
-            ci.decoded_supervisor_result(poisoned_raw, expected))
+            ci.decoded_supervisor_result(
+                poisoned_raw, poisoned_request, expected))
         del unused_stdout, unused_stderr
         command = poisoned["command"]
         self.assertFalse(command["cleanup_complete"])
         self.assertTrue(command["poisoned"])
         self.assertNotEqual(command["cleanup"], "complete")
+
+    @unittest.skipIf(
+        not SUPERVISOR or not SUPERVISOR_FIXTURE,
+        "native command supervisor fixtures unavailable")
+    def test_python_native_canonical_unicode_vectors_and_byte_limits(self):
+        supervisor = Path(SUPERVISOR).resolve(strict=True)
+        fixture = Path(SUPERVISOR_FIXTURE).resolve(strict=True)
+        fixture_record, unused_directories = ci.physical_file_record(fixture)
+        del unused_directories
+        expected = ci.native_executable_identity(fixture_record)
+        nfc = self.root / "unicode-\u00e9-\U0001f600"
+        nfd = self.root / "unicode-e\u0301-\U0001f600"
+        nfc.mkdir(mode=0o700)
+        nfd.mkdir(mode=0o700)
+
+        def request(cwd, marker):
+            now = time.monotonic_ns()
+            return {
+                "argv": [
+                    str(fixture), "environment",
+                    "\u03bb-" + marker, "\U0001f600",
+                ],
+                "cleanup_deadline_ns": now + 5_000_000_000,
+                "cwd": str(cwd),
+                "environment": [
+                    {"name": "LC_ALL", "value": "C"},
+                    {"name": "UNICODE_\u00c4",
+                     "value": "BMP-\u03bb-NONBMP-\U0001f600-" + marker},
+                ],
+                "executable": str(fixture),
+                "limits": {
+                    "cleanup_events": 1_000_000,
+                    "descendants": 64,
+                    "primary_events": 1_000_000,
+                    "proc_entries_per_scan": 262_144,
+                    "reap_events": 512,
+                    "stderr_bytes": 4096,
+                    "stdout_bytes": 4096,
+                    "term_grace_ms": 1000,
+                },
+                "primary_deadline_ns": now + 3_000_000_000,
+                "retained_executables": [],
+                "schema": "uk.wamr.command-supervisor-request",
+                "version": 1,
+            }
+
+        def invoke(value, raw=None):
+            encoded = ci.validate_supervisor_request(value) if raw is None else raw
+            result = subprocess.run(
+                [supervisor], input=encoded, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env={}, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, b"")
+            return result.stdout, encoded
+
+        nfc_request = request(nfc, "\u00e9")
+        nfd_request = request(nfd, "e\u0301")
+        nfc_raw = ci.validate_supervisor_request(nfc_request)
+        nfd_raw = ci.validate_supervisor_request(nfd_request)
+        self.assertIn("\u00e9".encode(), nfc_raw)
+        self.assertIn("e\u0301".encode(), nfd_raw)
+        self.assertNotEqual(nfc_raw, nfd_raw)
+        self.assertNotEqual(
+            hashlib.sha256(nfc_raw).hexdigest(),
+            hashlib.sha256(nfd_raw).hexdigest())
+
+        for name, value in (("nfc", nfc_request), ("nfd", nfd_request)):
+            with self.subTest(vector=name):
+                raw, request_raw = invoke(value)
+                decoded, stdout, stderr = ci.decoded_supervisor_result(
+                    raw, value, expected)
+                self.assertEqual(stdout, b"environment-ok\n")
+                self.assertEqual(stderr, b"")
+                self.assertEqual(
+                    decoded["request_sha256"],
+                    hashlib.sha256(request_raw).hexdigest())
+
+        escaped = (
+            json.dumps(
+                nfc_request, ensure_ascii=True, sort_keys=True,
+                separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        self.assertNotEqual(escaped, nfc_raw)
+        escaped_result, unused = invoke(nfc_request, escaped)
+        del unused
+        escaped_value = json.loads(escaped_result)
+        self.assertEqual(escaped_value["controller_error"],
+                         "noncanonical_request")
+        self.assertIsNone(escaped_value["request_sha256"])
+
+        invalid_surrogate = copy.deepcopy(nfc_request)
+        invalid_surrogate["argv"].append("\ud800")
+        with self.assertRaisesRegex(ci.Refusal, "valid Unicode"):
+            ci.canonical_json(invalid_surrogate)
+        surrogate_raw = (
+            json.dumps(
+                invalid_surrogate, ensure_ascii=True, sort_keys=True,
+                separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        surrogate_result, unused = invoke(nfc_request, surrogate_raw)
+        del unused
+        self.assertEqual(
+            json.loads(surrogate_result)["controller_error"],
+            "invalid_request")
+        non_utf8_result, unused = invoke(nfc_request, b"\xff\n")
+        del unused
+        self.assertEqual(
+            json.loads(non_utf8_result)["controller_error"],
+            "invalid_request")
+
+        boundary = copy.deepcopy(nfc_request)
+        boundary["cwd"] = "/" + "\u00e9" * 2047 + "a"
+        self.assertEqual(
+            len(boundary["cwd"].encode("utf-8")), ci.COMMAND_STRING_MAX)
+        boundary_result, unused = invoke(boundary)
+        del unused
+        self.assertEqual(
+            json.loads(boundary_result)["controller_error"],
+            "cwd_unavailable")
+        excess = copy.deepcopy(boundary)
+        excess["cwd"] += "a"
+        self.assertEqual(
+            len(excess["cwd"].encode("utf-8")),
+            ci.COMMAND_STRING_MAX + 1)
+        with self.assertRaisesRegex(
+                ci.Refusal, "invalid native command request"):
+            ci.validate_supervisor_request(excess)
+        excess_result, unused = invoke(
+            nfc_request, ci.canonical_json(excess))
+        del unused
+        self.assertEqual(
+            json.loads(excess_result)["controller_error"],
+            "invalid_request")
+
+    def test_native_schema_integer_boundaries_refuse_first_excess(self):
+        identity = {
+            "content_sha256": "0" * 64,
+            "ctime_nanoseconds": 999_999_999,
+            "ctime_seconds": -(1 << 63),
+            "device_major": (1 << 32) - 1,
+            "device_minor": (1 << 32) - 1,
+            "inode": (1 << 64) - 1,
+            "mode": (1 << 16) - 1,
+            "mtime_nanoseconds": 999_999_999,
+            "mtime_seconds": (1 << 63) - 1,
+            "size": (1 << 64) - 1,
+            "uid": (1 << 32) - 1,
+        }
+        self.assertEqual(
+            ci.validate_native_executable_identity(
+                identity, "invalid identity"),
+            identity)
+        for field, value in (
+                ("ctime_nanoseconds", 1 << 32),
+                ("ctime_seconds", 1 << 63),
+                ("device_major", 1 << 32),
+                ("inode", 1 << 64),
+                ("mode", 1 << 16),
+                ("uid", 1 << 32)):
+            changed = copy.deepcopy(identity)
+            changed[field] = value
+            with self.subTest(field=field), self.assertRaises(ci.Refusal):
+                ci.validate_native_executable_identity(
+                    changed, "invalid identity")
+        with self.assertRaisesRegex(ci.Refusal, "native range"):
+            ci.canonical_json({"huge": 10 ** 100})
+        maximum_limits = {
+            "cleanup_events": 10_000_000,
+            "descendants": 256,
+            "primary_events": 10_000_000,
+            "proc_entries_per_scan": 1_000_000,
+            "reap_events": 1024,
+            "stderr_bytes": ci.COMMAND_STREAM_MAX,
+            "stdout_bytes": ci.COMMAND_STREAM_MAX,
+            "term_grace_ms": 10_000,
+        }
+        self.assertEqual(
+            ci.validate_supervisor_limits(maximum_limits, "invalid limits"),
+            maximum_limits)
+        for field, value in (
+                ("cleanup_events", 10_000_001),
+                ("descendants", 257),
+                ("primary_events", 10_000_001),
+                ("proc_entries_per_scan", 1_000_001),
+                ("reap_events", 1025),
+                ("stderr_bytes", ci.COMMAND_STREAM_MAX + 1),
+                ("stdout_bytes", ci.COMMAND_STREAM_MAX + 1),
+                ("term_grace_ms", 10_001)):
+            changed = copy.deepcopy(maximum_limits)
+            changed[field] = value
+            with self.subTest(limit=field), self.assertRaises(ci.Refusal):
+                ci.validate_supervisor_limits(changed, "invalid limits")
+        minimum_limits = {
+            "cleanup_events": 32,
+            "descendants": 1,
+            "primary_events": 16,
+            "proc_entries_per_scan": 16,
+            "reap_events": 4,
+            "stderr_bytes": 1,
+            "stdout_bytes": 1,
+            "term_grace_ms": 1,
+        }
+        self.assertEqual(
+            ci.validate_supervisor_limits(minimum_limits, "invalid limits"),
+            minimum_limits)
+        for field, value in (
+                ("cleanup_events", 31),
+                ("descendants", 0),
+                ("primary_events", 15),
+                ("proc_entries_per_scan", 15),
+                ("reap_events", 3),
+                ("stderr_bytes", 0),
+                ("stdout_bytes", 0),
+                ("term_grace_ms", 0)):
+            changed = copy.deepcopy(minimum_limits)
+            changed[field] = value
+            with self.subTest(minimum=field), self.assertRaises(ci.Refusal):
+                ci.validate_supervisor_limits(changed, "invalid limits")
 
     def test_execute_drops_ambient_loader_shell_python_and_make_injection(self):
         root = self.root / "closed-command-environment"

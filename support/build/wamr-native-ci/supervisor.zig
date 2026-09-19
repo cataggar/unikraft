@@ -10,9 +10,11 @@ const version = 1;
 const version_text = "uk.wamr.command-supervisor/1 process-command/1\n";
 const max_request_bytes = 1024 * 1024;
 const max_capture_bytes = 4 * 1024 * 1024;
+const max_string_bytes = 4096;
 const retained_executable_environment = "WAMR_CI_RETAINED_EXECUTABLE";
 const executable_path_environment = "WAMR_CI_EXECUTABLE_PATH";
 const launch_executable_environment = "WAMR_CI_LAUNCH_EXECUTABLE";
+const output_commitment_domain = "uk.wamr.command-output-v1\x00";
 
 const Environment = struct {
     name: []const u8,
@@ -91,18 +93,26 @@ const Command = struct {
     cleanup: []const u8,
     cleanup_complete: bool,
     cleanup_events: u32,
+    completed_ns: u64,
     descendants: Descendants,
     executable: ExecutableIdentity,
     executable_stable: bool,
+    output_sha256: []const u8,
     poisoned: bool,
     primary: Primary,
+    primary_completed_ns: u64,
     primary_deadline_reached: bool,
     primary_events: u32,
     reap_events: u16,
     retained_executables: []const RetainedIdentity,
+    started_ns: u64,
     stderr_base64: []const u8,
+    stderr_bytes: u64,
+    stderr_sha256: []const u8,
     stderr_status: []const u8,
     stdout_base64: []const u8,
+    stdout_bytes: u64,
+    stdout_sha256: []const u8,
     stdout_status: []const u8,
     termination: Termination,
 };
@@ -110,6 +120,8 @@ const Command = struct {
 const Envelope = struct {
     command: ?Command = null,
     controller_error: ?[]const u8 = null,
+    request_bytes: ?u64 = null,
+    request_sha256: ?[]const u8 = null,
     schema: []const u8 = schema,
     version: u8 = version,
 };
@@ -159,7 +171,7 @@ fn run(init: std.process.Init) !void {
     var document = contracts.Document.parse(allocator, raw, .{
         .bytes = max_request_bytes,
         .depth = 12,
-        .string_bytes = 128 * 1024,
+        .string_bytes = max_string_bytes,
         .items = 4096,
         .tokens = 16384,
     }) catch {
@@ -189,26 +201,26 @@ fn run(init: std.process.Init) !void {
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
     for (request.environment) |entry| environment.put(entry.name, entry.value) catch {
-        try emit(init, .{ .controller_error = "local_io" });
+        try emitBound(init, raw, .{ .controller_error = "local_io" });
         return;
     };
     const retained = allocator.alloc(process.Executable, request.retained_executables.len) catch {
-        try emit(init, .{ .controller_error = "local_io" });
+        try emitBound(init, raw, .{ .controller_error = "local_io" });
         return;
     };
     var retained_count: usize = 0;
     defer for (retained[0..retained_count]) |opened| opened.close(init.io);
     for (request.retained_executables, 0..) |entry, index| {
         const original = environment.get(entry.name) orelse {
-            try emit(init, .{ .controller_error = "invalid_request" });
+            try emitBound(init, raw, .{ .controller_error = "invalid_request" });
             return;
         };
         if (!std.mem.eql(u8, original, entry.path)) {
-            try emit(init, .{ .controller_error = "invalid_request" });
+            try emitBound(init, raw, .{ .controller_error = "invalid_request" });
             return;
         }
         retained[index] = process.Executable.open(init.io, entry.path) catch |err| {
-            try emit(init, .{ .controller_error = executableError(err) });
+            try emitBound(init, raw, .{ .controller_error = executableError(err) });
             return;
         };
         retained_count += 1;
@@ -217,23 +229,23 @@ fn run(init: std.process.Init) !void {
             "/proc/{d}/fd/{d}",
             .{ std.os.linux.getpid(), retained[index].file.handle },
         ) catch {
-            try emit(init, .{ .controller_error = "local_io" });
+            try emitBound(init, raw, .{ .controller_error = "local_io" });
             return;
         };
         environment.put(entry.name, retained_path) catch {
-            try emit(init, .{ .controller_error = "local_io" });
+            try emitBound(init, raw, .{ .controller_error = "local_io" });
             return;
         };
     }
     var cwd = std.Io.Dir.cwd().openDir(init.io, request.cwd, .{
         .follow_symlinks = false,
     }) catch {
-        try emit(init, .{ .controller_error = "cwd_unavailable" });
+        try emitBound(init, raw, .{ .controller_error = "cwd_unavailable" });
         return;
     };
     defer cwd.close(init.io);
     var executable = process.Executable.open(init.io, request.executable) catch |err| {
-        try emit(init, .{ .controller_error = executableError(err) });
+        try emitBound(init, raw, .{ .controller_error = executableError(err) });
         return;
     };
     defer executable.close(init.io);
@@ -242,25 +254,25 @@ fn run(init: std.process.Init) !void {
         "/proc/{d}/fd/{d}",
         .{ std.os.linux.getpid(), executable.file.handle },
     ) catch {
-        try emit(init, .{ .controller_error = "local_io" });
+        try emitBound(init, raw, .{ .controller_error = "local_io" });
         return;
     };
     environment.put(
         retained_executable_environment,
         executable_path,
     ) catch {
-        try emit(init, .{ .controller_error = "local_io" });
+        try emitBound(init, raw, .{ .controller_error = "local_io" });
         return;
     };
     environment.put(
         executable_path_environment,
         request.executable,
     ) catch {
-        try emit(init, .{ .controller_error = "local_io" });
+        try emitBound(init, raw, .{ .controller_error = "local_io" });
         return;
     };
     process.initialize() catch {
-        try emit(init, .{ .controller_error = "supervisor_unavailable" });
+        try emitBound(init, raw, .{ .controller_error = "supervisor_unavailable" });
         return;
     };
     var result = process.runCommand(allocator, init.io, .{
@@ -281,7 +293,7 @@ fn run(init: std.process.Init) !void {
             .term_grace_ms = request.limits.term_grace_ms,
         },
     }) catch {
-        try emit(init, .{ .controller_error = "supervisor_unavailable" });
+        try emitBound(init, raw, .{ .controller_error = "supervisor_unavailable" });
         return;
     };
     defer result.deinit(allocator);
@@ -290,6 +302,16 @@ fn run(init: std.process.Init) !void {
     _ = std.base64.standard.Encoder.encode(stdout_encoded, result.stdout);
     const stderr_encoded = try allocator.alloc(u8, base64Size(result.stderr.len));
     _ = std.base64.standard.Encoder.encode(stderr_encoded, result.stderr);
+    const stdout_digest = sha256Digest(result.stdout);
+    const stdout_sha256 = std.fmt.bytesToHex(stdout_digest, .lower);
+    const stderr_digest = sha256Digest(result.stderr);
+    const stderr_sha256 = std.fmt.bytesToHex(stderr_digest, .lower);
+    const output_sha256 = std.fmt.bytesToHex(outputCommitment(
+        result.stdout.len,
+        stdout_digest,
+        result.stderr.len,
+        stderr_digest,
+    ), .lower);
     const content_sha256 = std.fmt.bytesToHex(result.executable.content_sha256, .lower);
     const retained_result = try allocator.alloc(
         RetainedIdentity,
@@ -306,11 +328,12 @@ fn run(init: std.process.Init) !void {
             .path = entry.path,
         };
     }
-    try emit(init, .{ .command = .{
+    try emitBound(init, raw, .{ .command = .{
         .cancellation_observed = result.cancellation_observed,
         .cleanup = @tagName(result.cleanup),
         .cleanup_complete = result.cleanup_complete,
         .cleanup_events = result.cleanup_events,
+        .completed_ns = result.completed_ns,
         .descendants = .{
             .adopted = result.descendants.adopted,
             .identity_validated = result.descendants.identity_validated,
@@ -320,15 +343,22 @@ fn run(init: std.process.Init) !void {
         },
         .executable = executableIdentity(result.executable, &content_sha256),
         .executable_stable = result.executable_stable,
+        .output_sha256 = &output_sha256,
         .poisoned = !result.cleanup_complete,
         .primary = primary(result.primary),
+        .primary_completed_ns = result.primary_completed_ns,
         .primary_deadline_reached = result.primary_deadline_reached,
         .primary_events = result.primary_events,
         .reap_events = result.reap_events,
         .retained_executables = retained_result,
+        .started_ns = result.started_ns,
         .stderr_base64 = stderr_encoded,
+        .stderr_bytes = @intCast(result.stderr.len),
+        .stderr_sha256 = &stderr_sha256,
         .stderr_status = @tagName(result.stderr_status),
         .stdout_base64 = stdout_encoded,
+        .stdout_bytes = @intCast(result.stdout.len),
+        .stdout_sha256 = &stdout_sha256,
         .stdout_status = @tagName(result.stdout_status),
         .termination = termination(result.termination),
     } });
@@ -396,25 +426,38 @@ fn launchRetained(
 fn validateRequest(request: Request) !void {
     if (!std.mem.eql(u8, request.schema, "uk.wamr.command-supervisor-request") or
         request.version != version or request.executable.len == 0 or
+        request.executable.len > max_string_bytes or
         request.executable[0] != '/' or request.cwd.len == 0 or request.cwd[0] != '/' or
+        request.cwd.len > max_string_bytes or
         request.argv.len == 0 or request.argv.len > 4096 or
         !std.mem.eql(u8, request.argv[0], request.executable) or
         request.environment.len > 512 or
         request.retained_executables.len > 128 or
         request.primary_deadline_ns == 0 or
         request.cleanup_deadline_ns <= request.primary_deadline_ns or
+        request.limits.stdout_bytes == 0 or
         request.limits.stdout_bytes > max_capture_bytes or
+        request.limits.stderr_bytes == 0 or
         request.limits.stderr_bytes > max_capture_bytes or
         request.limits.descendants == 0 or request.limits.descendants > 256 or
-        request.limits.primary_events == 0 or request.limits.cleanup_events == 0 or
-        request.limits.proc_entries_per_scan == 0 or request.limits.reap_events == 0 or
+        request.limits.primary_events < 16 or request.limits.primary_events > 10_000_000 or
+        request.limits.cleanup_events < 32 or request.limits.cleanup_events > 10_000_000 or
+        request.limits.proc_entries_per_scan < 16 or
+        request.limits.proc_entries_per_scan > 1_000_000 or
+        request.limits.reap_events < request.limits.descendants + 3 or
+        request.limits.reap_events > 1024 or
         request.limits.term_grace_ms == 0 or request.limits.term_grace_ms > 10_000)
         return error.InvalidRequest;
-    for (request.argv) |argument| if (std.mem.indexOfScalar(u8, argument, 0) != null)
-        return error.InvalidRequest;
+    for (request.argv) |argument| {
+        if (argument.len > max_string_bytes or
+            std.mem.indexOfScalar(u8, argument, 0) != null)
+            return error.InvalidRequest;
+    }
     var previous: ?[]const u8 = null;
     for (request.environment) |entry| {
-        if (entry.name.len == 0 or std.mem.indexOfScalar(u8, entry.name, '=') != null or
+        if (entry.name.len == 0 or entry.name.len > max_string_bytes or
+            entry.value.len > max_string_bytes or
+            std.mem.indexOfScalar(u8, entry.name, '=') != null or
             std.mem.indexOfScalar(u8, entry.name, 0) != null or
             std.mem.indexOfScalar(u8, entry.value, 0) != null or
             std.mem.eql(u8, entry.name, retained_executable_environment) or
@@ -426,13 +469,26 @@ fn validateRequest(request: Request) !void {
     }
     previous = null;
     for (request.retained_executables) |entry| {
-        if (entry.name.len == 0 or entry.path.len == 0 or entry.path[0] != '/' or
+        if (entry.name.len == 0 or entry.name.len > max_string_bytes or
+            entry.path.len == 0 or entry.path.len > max_string_bytes or
+            entry.path[0] != '/' or
             std.mem.indexOfAny(u8, entry.name, "=\x00") != null or
             std.mem.indexOfScalar(u8, entry.path, 0) != null)
             return error.InvalidRequest;
         if (previous) |name| if (std.mem.order(u8, name, entry.name) != .lt)
             return error.InvalidRequest;
         previous = entry.name;
+    }
+    for (request.retained_executables) |entry| {
+        var found = false;
+        for (request.environment) |environment| {
+            if (!std.mem.eql(u8, entry.name, environment.name)) continue;
+            if (!std.mem.eql(u8, entry.path, environment.value))
+                return error.InvalidRequest;
+            found = true;
+            break;
+        }
+        if (!found) return error.InvalidRequest;
     }
 }
 
@@ -485,6 +541,40 @@ fn termination(value: ?std.process.Child.Term) Termination {
 
 fn base64Size(length: usize) usize {
     return ((length + 2) / 3) * 4;
+}
+
+fn sha256Digest(value: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var result: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(value, &result, .{});
+    return result;
+}
+
+fn outputCommitment(
+    stdout_bytes: usize,
+    stdout_sha256: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    stderr_bytes: usize,
+    stderr_sha256: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(output_commitment_domain);
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, @intCast(stdout_bytes), .big);
+    hash.update(&encoded);
+    hash.update(&stdout_sha256);
+    std.mem.writeInt(u64, &encoded, @intCast(stderr_bytes), .big);
+    hash.update(&encoded);
+    hash.update(&stderr_sha256);
+    var result: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hash.final(&result);
+    return result;
+}
+
+fn emitBound(init: std.process.Init, raw: []const u8, envelope: Envelope) !void {
+    const request_sha256 = std.fmt.bytesToHex(sha256Digest(raw), .lower);
+    var bound = envelope;
+    bound.request_bytes = @intCast(raw.len);
+    bound.request_sha256 = &request_sha256;
+    try emit(init, bound);
 }
 
 fn emit(init: std.process.Init, envelope: Envelope) !void {

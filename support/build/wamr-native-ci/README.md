@@ -160,12 +160,17 @@ its own sealed snapshot with that descriptor before Zig starts, so Zig can
 find its standard library and re-execute its integrated linker without an
 ambient path. Canonical native results bind the supervisor launcher identity
 and the retained Zig identity and report primary outcome, stream status,
-descendant observations, cleanup outcome and poison state. Timeout,
+descendant observations, cleanup outcome, poison state, and monotonic
+start/primary-completion/final-completion times. Those timestamps are
+u64 values ordered against the one original primary deadline and the later
+cleanup deadline; elapsed values are differences of those absolute samples,
+so cleanup cannot reset the clock. Timeout,
 cancellation, overflow, nonzero/signal, exec/identity failure or any unproven
 cleanup is a refusal; cleanup failure prevents publication even when the
 leader exited zero.
 Each supervised command record also binds hashes of the complete canonical
-request and normalized native result, exact supervisor, command executable,
+request, the canonical raw native request/result transports, and the
+normalized native result, exact supervisor, command executable,
 native executable and interpreter identities, ordered argv, closed explicit
 environment, cwd, stage/schema versions, primary/cleanup deadlines and every
 supervisor limit. A closed per-stage contract fixes the executable roles,
@@ -173,9 +178,20 @@ argv template, cwd role, environment allowlist, timeout, output limits and
 successful result expectations. Every digest is recomputed from the retained
 fields during creation, export, archive reopen and import; a syntactically
 valid supplied digest or cross-stage relabel is not accepted. Separate stream
-status/size/digests, the combined bounded-output digest, termination,
-descendant observations and bounded event counts remain bound. Raw command
-output remains private.
+status/size/digests, a domain-separated aggregate commitment over both stream
+byte counts and digests, the direct combined-output observation, termination,
+descendant relationships and native-width event/reap counts remain bound.
+SHA256(empty) is recomputed for empty streams. Nonempty raw command output
+remains private, so its stream and combined digests are explicitly labelled
+transport-authenticated observations rather than independently reproducible
+claims.
+
+Supervisor JSON is compact canonical UTF-8 with byte-sorted keys, exact
+separators and one final LF. Python emits literal UTF-8 (`ensure_ascii=False`)
+and hashes/sends those same bytes; escaped input is parsed but is not
+canonical. Strings must be valid Unicode scalar sequences and native path
+limits count UTF-8 bytes. Filesystem paths are not normalized: NFC and NFD
+code-point sequences remain distinct paths and produce distinct digests.
 
 Records also bind the Unikraft revision/tree, app-source hashes, pinned WAMR/compiler options,
 actual tools, wasm/cwasm/compiler/library bytes, solved configuration,
@@ -452,8 +468,14 @@ Package-tree physical metadata and the recorded Zig executions are producer
 observations: their package bytes are intentionally not included in this tiny
 archive, so import does not pretend to re-run those observations. They are
 authenticated to the selected successful run only by the independently
-trusted complete-archive SHA256. Missing archive trust is a refusal, never a
-best-effort downgrade. The importer then safely copies only bounded regular
+trusted complete-archive SHA256. The same rule applies to nonempty supervised
+stdout/stderr observations: production validates them against the direct
+native result before creating the record, but the raw streams are deliberately
+not public members. Import recomputes empty-stream hashes and aggregate
+count/digest commitments, validates all native-width and cross-field
+invariants, and accepts nonempty stream digests only in the independently
+selected current inner-ZIP digest context. Missing archive trust is a refusal,
+never a best-effort downgrade. The importer then safely copies only bounded regular
 members to a fresh private directory, rebuilds local artifact references (not
 original requests), and uses the production native checker before publishing
 a usable `bundle.json`. Its plan remains `authority=not_admitted`; new final

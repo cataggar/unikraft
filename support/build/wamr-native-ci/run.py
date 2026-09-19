@@ -96,6 +96,10 @@ COMMAND_BINDING_VERSION = 1
 COMMAND_CLEANUP_SECONDS = 10
 COMMAND_STREAM_MAX = 4 * MIB
 COMMAND_RESULT_MAX = 12 * MIB
+COMMAND_REQUEST_MAX = MIB
+COMMAND_STRING_MAX = 4096
+COMMAND_OUTPUT_COMMITMENT_DOMAIN = b"uk.wamr.command-output-v1\0"
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 BOOTSTRAP_STAGES = frozenset({
     "dependency-restore",
     "supervisor-build",
@@ -166,6 +170,43 @@ def snapshot(info):
         "st_size", "st_mtime_ns", "st_ctime_ns"))
 
 
+def validate_json_domain(value):
+    if value is None or type(value) is bool:
+        return
+    if type(value) is int:
+        require(-(1 << 63) <= value <= (1 << 64) - 1,
+                "JSON integer is outside native range")
+        return
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise Refusal("JSON string is not valid Unicode") from error
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            validate_json_domain(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            require(isinstance(key, str), "JSON object key is not a string")
+            validate_json_domain(key)
+            validate_json_domain(item)
+        return
+    raise Refusal("unsupported JSON value")
+
+
+def compact_json(value, newline=False):
+    validate_json_domain(value)
+    try:
+        text = json.dumps(
+            value, ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":"))
+        return (text + ("\n" if newline else "")).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise Refusal("invalid JSON value") from error
+
+
 def open_flags(directory=False):
     flags = os.O_RDONLY
     if directory:
@@ -178,7 +219,7 @@ def open_flags(directory=False):
 
 
 def bind(hasher, value):
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    raw = compact_json(value)
     hasher.update(len(raw).to_bytes(8, "big"))
     hasher.update(raw)
 
@@ -251,9 +292,8 @@ def digest(path, limit=256 * MIB + 512):
 
 
 def save(path, value):
-    with path.open("x", encoding="ascii") as stream:
-        json.dump(value, stream, sort_keys=True, separators=(",", ":"))
-        stream.write("\n")
+    with path.open("xb") as stream:
+        stream.write(compact_json(value, newline=True))
     path.chmod(0o600)
 
 
@@ -1015,8 +1055,7 @@ def merge_directory_records(target, values):
 
 
 def record_digest(value):
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
-    return hashlib.sha256(raw).hexdigest()
+    return hashlib.sha256(compact_json(value)).hexdigest()
 
 
 def input_directory_custody_reason(kind, name):
@@ -1918,7 +1957,7 @@ def bison_inputs(root):
         files[path.relative_to(root).as_posix()] = {
             "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
     require(files, "empty Bison data")
-    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("ascii")
+    encoded = compact_json(files)
     return {"files": len(files), "bytes": total,
             "sha256": hashlib.sha256(encoded).hexdigest()}
 
@@ -1988,8 +2027,180 @@ def is_retained_process_path(path):
 
 
 def canonical_json(value):
-    return (json.dumps(
-        value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+    return compact_json(value, newline=True)
+
+
+def native_integer(value, minimum, maximum, reason):
+    require(type(value) is int and minimum <= value <= maximum, reason)
+    return value
+
+
+def native_u8(value, reason):
+    return native_integer(value, 0, (1 << 8) - 1, reason)
+
+
+def native_u16(value, reason):
+    return native_integer(value, 0, (1 << 16) - 1, reason)
+
+
+def native_u32(value, reason):
+    return native_integer(value, 0, (1 << 32) - 1, reason)
+
+
+def native_u64(value, reason):
+    return native_integer(value, 0, (1 << 64) - 1, reason)
+
+
+def native_i64(value, reason):
+    return native_integer(value, -(1 << 63), (1 << 63) - 1, reason)
+
+
+def native_string(value, maximum, reason, allow_empty=True):
+    require(isinstance(value, str), reason)
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise Refusal(reason) from error
+    require((allow_empty or raw) and len(raw) <= maximum, reason)
+    return raw
+
+
+def native_digest(value, reason):
+    require(isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{64}", value), reason)
+    return value
+
+
+def validate_native_executable_identity(value, reason):
+    require(isinstance(value, dict) and set(value) == {
+        "content_sha256", "ctime_nanoseconds", "ctime_seconds",
+        "device_major", "device_minor", "inode", "mode",
+        "mtime_nanoseconds", "mtime_seconds", "size", "uid",
+    }, reason)
+    native_digest(value["content_sha256"], reason)
+    native_u32(value["ctime_nanoseconds"], reason)
+    native_i64(value["ctime_seconds"], reason)
+    native_u32(value["device_major"], reason)
+    native_u32(value["device_minor"], reason)
+    native_u64(value["inode"], reason)
+    native_u16(value["mode"], reason)
+    native_u32(value["mtime_nanoseconds"], reason)
+    native_i64(value["mtime_seconds"], reason)
+    native_u64(value["size"], reason)
+    native_u32(value["uid"], reason)
+    require(value["inode"] > 0 and value["size"] > 0
+            and value["ctime_nanoseconds"] < 1_000_000_000
+            and value["mtime_nanoseconds"] < 1_000_000_000,
+            reason)
+    return value
+
+
+def validate_supervisor_limits(value, reason):
+    require(isinstance(value, dict) and set(value) == {
+        "cleanup_events", "descendants", "primary_events",
+        "proc_entries_per_scan", "reap_events", "stderr_bytes",
+        "stdout_bytes", "term_grace_ms",
+    }, reason)
+    native_u64(value["stdout_bytes"], reason)
+    native_u64(value["stderr_bytes"], reason)
+    native_u16(value["descendants"], reason)
+    native_u32(value["primary_events"], reason)
+    native_u32(value["cleanup_events"], reason)
+    native_u32(value["proc_entries_per_scan"], reason)
+    native_u16(value["reap_events"], reason)
+    native_u32(value["term_grace_ms"], reason)
+    require(1 <= value["stdout_bytes"] <= COMMAND_STREAM_MAX
+            and 1 <= value["stderr_bytes"] <= COMMAND_STREAM_MAX
+            and 1 <= value["descendants"] <= 256
+            and 16 <= value["primary_events"] <= 10_000_000
+            and 32 <= value["cleanup_events"] <= 10_000_000
+            and 16 <= value["proc_entries_per_scan"] <= 1_000_000
+            and value["descendants"] + 3 <= value["reap_events"] <= 1024
+            and 1 <= value["term_grace_ms"] <= 10_000,
+            reason)
+    return value
+
+
+def validate_supervisor_request(value):
+    reason = "invalid native command request"
+    require(isinstance(value, dict) and set(value) == {
+        "argv", "cleanup_deadline_ns", "cwd", "environment",
+        "executable", "limits", "primary_deadline_ns",
+        "retained_executables", "schema", "version",
+    } and value["schema"] == "uk.wamr.command-supervisor-request"
+      and native_u8(value["version"], reason) == 1,
+      reason)
+    executable = native_string(
+        value["executable"], COMMAND_STRING_MAX, reason, allow_empty=False)
+    cwd = native_string(
+        value["cwd"], COMMAND_STRING_MAX, reason, allow_empty=False)
+    require(executable.startswith(b"/") and cwd.startswith(b"/"), reason)
+    argv = value["argv"]
+    require(isinstance(argv, list) and 1 <= len(argv) <= 4096, reason)
+    for argument in argv:
+        raw = native_string(argument, COMMAND_STRING_MAX, reason)
+        require(b"\0" not in raw, reason)
+    require(argv[0] == value["executable"], reason)
+    environment = value["environment"]
+    require(isinstance(environment, list) and len(environment) <= 512, reason)
+    previous = None
+    by_name = {}
+    for entry in environment:
+        require(isinstance(entry, dict)
+                and set(entry) == {"name", "value"}, reason)
+        name = native_string(
+            entry["name"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        raw_value = native_string(entry["value"], COMMAND_STRING_MAX, reason)
+        require(b"=" not in name and b"\0" not in name
+                and b"\0" not in raw_value
+                and entry["name"] not in {
+                    "WAMR_CI_RETAINED_EXECUTABLE",
+                    "WAMR_CI_EXECUTABLE_PATH",
+                }
+                and (previous is None or previous < name), reason)
+        previous = name
+        by_name[entry["name"]] = entry["value"]
+    retained = value["retained_executables"]
+    require(isinstance(retained, list) and len(retained) <= 128, reason)
+    previous = None
+    for entry in retained:
+        require(isinstance(entry, dict)
+                and set(entry) == {"name", "path"}, reason)
+        name = native_string(
+            entry["name"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        path = native_string(
+            entry["path"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        require(b"=" not in name and b"\0" not in name
+                and path.startswith(b"/") and b"\0" not in path
+                and (previous is None or previous < name)
+                and by_name.get(entry["name"]) == entry["path"], reason)
+        previous = name
+    primary = native_u64(value["primary_deadline_ns"], reason)
+    cleanup = native_u64(value["cleanup_deadline_ns"], reason)
+    require(primary > 0 and cleanup > primary, reason)
+    validate_supervisor_limits(value["limits"], reason)
+    raw = canonical_json(value)
+    require(len(raw) <= COMMAND_REQUEST_MAX, reason)
+    return raw
+
+
+def command_output_commitment(
+        stdout_bytes, stdout_sha256, stderr_bytes, stderr_sha256):
+    native_u64(stdout_bytes, "invalid native command output")
+    native_u64(stderr_bytes, "invalid native command output")
+    native_digest(stdout_sha256, "invalid native command output")
+    native_digest(stderr_sha256, "invalid native command output")
+    value = hashlib.sha256(COMMAND_OUTPUT_COMMITMENT_DOMAIN)
+    value.update(stdout_bytes.to_bytes(8, "big"))
+    value.update(bytes.fromhex(stdout_sha256))
+    value.update(stderr_bytes.to_bytes(8, "big"))
+    value.update(bytes.fromhex(stderr_sha256))
+    return value.hexdigest()
+
+
+def command_digest_scope(size):
+    return ("reproducible_empty"
+            if size == 0 else "transport_authenticated_observation")
 
 
 def command_literal(value):
@@ -2411,18 +2622,25 @@ def production_command_contract(stage):
 
 
 def validate_supervised_command_binding(
-        value, stage, role_identities=None):
+        value, stage, role_identities=None,
+        transport_context="producer_direct"):
+    require(transport_context in {"producer_direct", "trusted_inner_zip"},
+            "invalid supervised command transport context")
     contract = production_command_contract(stage)
     require(isinstance(value, dict) and set(value) == {
-        "scope", "stage", "exit_code", "bytes", "sha256",
+        "scope", "stage", "exit_code", "bytes", "sha256", "sha256_scope",
         "over_limit", "known_error_markers", "supervisor",
     } and value["scope"] == "command_diagnostic_not_acceptance"
       and value["stage"] == stage
-      and type(value["exit_code"]) is int and value["exit_code"] == 0
-      and type(value["bytes"]) is int
-      and 0 <= value["bytes"] <= contract["output_limit"]
-      and isinstance(value["sha256"], str)
-      and re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
+      and native_u8(value["exit_code"],
+                    "invalid supervised command binding") == 0
+      and native_u64(value["bytes"],
+                     "invalid supervised command binding")
+      <= contract["output_limit"]
+      and native_digest(value["sha256"],
+                        "invalid supervised command binding")
+      == value["sha256"]
+      and value["sha256_scope"] == command_digest_scope(value["bytes"])
       and value["over_limit"] is False
       and value["known_error_markers"] == [],
       "invalid supervised command binding")
@@ -2430,7 +2648,8 @@ def validate_supervised_command_binding(
     require(isinstance(supervisor, dict) and set(supervisor) == {
         "schema", "version", "bootstrap", "request", "result",
     } and supervisor["schema"] == "uk.wamr.command-supervisor-result"
-      and supervisor["version"] == 1
+      and native_u8(
+          supervisor["version"], "invalid supervised command binding") == 1
       and supervisor["bootstrap"] is False,
       "invalid supervised command binding")
     request = supervisor["request"]
@@ -2443,14 +2662,18 @@ def validate_supervised_command_binding(
                 "schema", "version", "binding_schema", "binding_version",
                 "stage", "argv", "environment", "cwd", "supervisor",
                 "native_executable", "command_executable", "interpreter",
-                "retained_executables", "primary_deadline_ns",
+                "retained_executables", "issued_ns", "primary_deadline_ns",
                 "cleanup_deadline_ns", "timeout_ns", "limits",
                 *digest_fields,
             }
             and request["schema"] == "uk.wamr.command-supervisor-request"
-            and request["version"] == 1
+            and native_u8(
+                request["version"], "invalid supervised command binding") == 1
             and request["binding_schema"] == COMMAND_BINDING_SCHEMA
-            and request["binding_version"] == COMMAND_BINDING_VERSION
+            and native_u8(
+                request["binding_version"],
+                "invalid supervised command binding")
+            == COMMAND_BINDING_VERSION
             and request["stage"] == stage
             and request["argv"] == contract["argv"]
             and request["environment"] == contract["environment"]
@@ -2466,7 +2689,10 @@ def validate_supervised_command_binding(
                 == contract["interpreter"])
             and request["timeout_ns"]
             == contract["seconds"] * 1_000_000_000
-            and request["limits"] == contract["limits"],
+            and request["limits"] == contract["limits"]
+            and validate_supervisor_limits(
+                request["limits"], "invalid supervised command binding")
+            == request["limits"],
             "invalid supervised command binding")
     for key in digest_fields:
         require(isinstance(request[key], str)
@@ -2490,19 +2716,33 @@ def validate_supervised_command_binding(
         require(isinstance(binding, dict)
                 and set(binding) == {"path", "identity"},
                 "invalid supervised command binding")
-        native_identity = binding["identity"]
-        require(isinstance(native_identity, dict)
-                and isinstance(native_identity.get("content_sha256"), str),
-                "invalid supervised command binding")
+        validate_native_executable_identity(
+            binding["identity"], "invalid supervised command binding")
     if request["interpreter"] is not None:
         require(isinstance(request["interpreter"], dict)
                 and set(request["interpreter"]) == {"path", "identity"},
                 "invalid supervised command binding")
+        validate_native_executable_identity(
+            request["interpreter"]["identity"],
+            "invalid supervised command binding")
     require(request["supervisor"]["path"]
             == command_path("command-supervisor")
-            and type(request["primary_deadline_ns"]) is int
-            and type(request["cleanup_deadline_ns"]) is int
-            and request["primary_deadline_ns"] > request["timeout_ns"]
+            and native_u64(
+                request["issued_ns"],
+                "invalid supervised command binding") == request["issued_ns"]
+            and native_u64(
+                request["timeout_ns"],
+                "invalid supervised command binding") == request["timeout_ns"]
+            and native_u64(
+                request["primary_deadline_ns"],
+                "invalid supervised command binding")
+            == request["primary_deadline_ns"]
+            and native_u64(
+                request["cleanup_deadline_ns"],
+                "invalid supervised command binding")
+            == request["cleanup_deadline_ns"]
+            and request["primary_deadline_ns"]
+            == request["issued_ns"] + request["timeout_ns"]
             and request["cleanup_deadline_ns"]
             == request["primary_deadline_ns"]
             + COMMAND_CLEANUP_SECONDS * 1_000_000_000,
@@ -2520,6 +2760,11 @@ def validate_supervised_command_binding(
                 and set(item) == {"name", "path", "identity"}
                 and item["path"] == environment.get(item["name"]),
                 "invalid supervised command binding")
+        native_string(
+            item["name"], COMMAND_STRING_MAX,
+            "invalid supervised command binding", allow_empty=False)
+        validate_native_executable_identity(
+            item["identity"], "invalid supervised command binding")
     if role_identities is not None:
         for binding in (
                 request["supervisor"], request["native_executable"],
@@ -2536,15 +2781,33 @@ def validate_supervised_command_binding(
     result = supervisor["result"]
     require(isinstance(result, dict) and set(result) == {
         "canonical_sha256", "schema", "version",
-        "request_canonical_sha256", "controller_error", "command",
+        "request_canonical_sha256", "controller_error",
+        "native_request", "native_result", "command",
     } and result["schema"] == "uk.wamr.command-supervisor-result"
-      and result["version"] == 1
+      and native_u8(
+          result["version"], "invalid supervised command binding") == 1
       and result["request_canonical_sha256"]
       == request["canonical_sha256"]
       and result["controller_error"] is None
       and isinstance(result["canonical_sha256"], str)
       and re.fullmatch(r"[0-9a-f]{64}", result["canonical_sha256"]),
       "invalid supervised command binding")
+    for name, maximum in (
+            ("native_request", COMMAND_REQUEST_MAX),
+            ("native_result", COMMAND_RESULT_MAX)):
+        transport = result[name]
+        require(isinstance(transport, dict) and set(transport) == {
+            "bytes", "digest_scope", "sha256",
+        } and native_u64(
+            transport["bytes"], "invalid supervised command binding")
+          <= maximum
+          and transport["bytes"] > 0
+          and transport["digest_scope"]
+          == "direct_producer_or_trusted_inner_zip"
+          and native_digest(
+              transport["sha256"], "invalid supervised command binding")
+          == transport["sha256"],
+          "invalid supervised command binding")
     result_core = dict(result)
     del result_core["canonical_sha256"]
     require(result["canonical_sha256"]
@@ -2556,7 +2819,7 @@ def validate_supervised_command_binding(
         "cleanup_events", "descendants", "executable",
         "executable_stable", "output", "poisoned", "primary",
         "primary_deadline_reached", "primary_events", "reap_events",
-        "retained_executables", "stderr", "stdout", "termination",
+        "retained_executables", "stderr", "stdout", "timing", "termination",
     } and command["cancellation_observed"] is False
       and command["cleanup"] == "complete"
       and command["cleanup_complete"] is True
@@ -2569,37 +2832,90 @@ def validate_supervised_command_binding(
       == request["native_executable"]["identity"]
       and command["retained_executables"] == retained,
       "invalid supervised command binding")
-    for key in ("cleanup_events", "primary_events", "reap_events"):
-        require(type(command[key]) is int and 0 <= command[key] <= 10_000_000,
-                "invalid supervised command binding")
+    native_u32(command["cleanup_events"],
+               "invalid supervised command binding")
+    native_u32(command["primary_events"],
+               "invalid supervised command binding")
+    native_u16(command["reap_events"],
+               "invalid supervised command binding")
+    require(command["cleanup_events"] <= request["limits"]["cleanup_events"]
+            and command["primary_events"] <= request["limits"]["primary_events"]
+            and command["reap_events"] <= request["limits"]["reap_events"],
+            "invalid supervised command binding")
     descendants = command["descendants"]
     require(isinstance(descendants, dict) and set(descendants) == {
         "adopted", "identity_validated", "limit_exceeded",
         "observed", "untracked",
     } and descendants["limit_exceeded"] is False
-      and descendants["untracked"] is False,
+      and descendants["untracked"] is False
+      and descendants["identity_validated"] == descendants["observed"]
+      and descendants["adopted"] <= descendants["observed"]
+      and descendants["observed"] <= request["limits"]["descendants"]
+      and command["reap_events"] == descendants["observed"] + 2,
       "invalid supervised command binding")
     for key in ("adopted", "identity_validated", "observed"):
-        require(type(descendants[key]) is int and 0 <= descendants[key] <= 256,
-                "invalid supervised command binding")
+        native_u16(descendants[key], "invalid supervised command binding")
     for name in ("stdout", "stderr"):
         output = command[name]
         require(isinstance(output, dict)
-                and set(output) == {"bytes", "sha256", "status"}
+                and set(output) == {
+                    "bytes", "digest_scope", "sha256", "status",
+                }
                 and output["status"] == "complete"
-                and type(output["bytes"]) is int
-                and 0 <= output["bytes"]
+                and native_u64(
+                    output["bytes"], "invalid supervised command binding")
                 <= request["limits"][name + "_bytes"]
-                and isinstance(output["sha256"], str)
-                and re.fullmatch(r"[0-9a-f]{64}", output["sha256"]),
+                and output["digest_scope"]
+                == command_digest_scope(output["bytes"])
+                and native_digest(
+                    output["sha256"], "invalid supervised command binding")
+                == output["sha256"]
+                and (output["bytes"] != 0
+                     or output["sha256"] == EMPTY_SHA256),
                 "invalid supervised command binding")
     output = command["output"]
-    require(isinstance(output, dict) and set(output) == {"bytes", "sha256"}
+    require(isinstance(output, dict) and set(output) == {
+        "bytes", "combined_sha256", "commitment_sha256", "digest_scope",
+    }
             and output["bytes"]
             == command["stdout"]["bytes"] + command["stderr"]["bytes"]
             and output["bytes"] == value["bytes"]
-            and output["sha256"] == value["sha256"],
+            and output["combined_sha256"] == value["sha256"]
+            and output["digest_scope"] == value["sha256_scope"]
+            and native_digest(
+                output["combined_sha256"],
+                "invalid supervised command binding")
+            == output["combined_sha256"]
+            and output["commitment_sha256"]
+            == command_output_commitment(
+                command["stdout"]["bytes"], command["stdout"]["sha256"],
+                command["stderr"]["bytes"], command["stderr"]["sha256"])
+            and (output["bytes"] != 0
+                 or output["combined_sha256"] == EMPTY_SHA256),
             "invalid supervised command binding")
+    timing = command["timing"]
+    require(isinstance(timing, dict) and set(timing) == {
+        "cleanup_elapsed_ns", "completed_ns", "primary_completed_ns",
+        "primary_elapsed_ns", "started_ns", "total_elapsed_ns",
+    }, "invalid supervised command binding")
+    for name in timing:
+        native_u64(timing[name], "invalid supervised command binding")
+    require(request["issued_ns"] <= timing["started_ns"]
+            <= timing["primary_completed_ns"] <= timing["completed_ns"]
+            and timing["primary_elapsed_ns"]
+            == timing["primary_completed_ns"] - timing["started_ns"]
+            and timing["cleanup_elapsed_ns"]
+            == timing["completed_ns"] - timing["primary_completed_ns"]
+            and timing["total_elapsed_ns"]
+            == timing["completed_ns"] - timing["started_ns"]
+            and timing["primary_completed_ns"]
+            <= request["primary_deadline_ns"]
+            and timing["completed_ns"] <= request["cleanup_deadline_ns"],
+            "invalid supervised command binding")
+    if value["bytes"] != 0:
+        require(transport_context in {
+            "producer_direct", "trusted_inner_zip",
+        }, "invalid supervised command transport context")
     return value
 
 
@@ -2623,20 +2939,29 @@ def native_executable_identity(record):
 
 
 def decoded_supervisor_result(
-        raw, expected_executable, expected_retained=()):
+        raw, request, expected_executable, expected_retained=()):
+    request_raw = validate_supervisor_request(request)
     require(0 < len(raw) <= COMMAND_RESULT_MAX,
             "native command result exceeded")
     try:
         value = json.loads(raw, object_pairs_hook=unique)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, Refusal) as error:
         raise Refusal("invalid native command result") from error
-    require(raw == canonical_json(value)
-            and isinstance(value, dict)
+    try:
+        canonical = canonical_json(value)
+    except Refusal as error:
+        raise Refusal("invalid native command result") from error
+    reason = "invalid native command result"
+    require(raw == canonical and isinstance(value, dict)
             and set(value) == {
-                "command", "controller_error", "schema", "version",
+                "command", "controller_error", "request_bytes",
+                "request_sha256", "schema", "version",
             }
             and value["schema"] == "uk.wamr.command-supervisor-result"
-            and value["version"] == 1
+            and native_u8(value["version"], reason) == 1
+            and native_u64(value["request_bytes"], reason) == len(request_raw)
+            and native_digest(value["request_sha256"], reason)
+            == hashlib.sha256(request_raw).hexdigest()
             and (value["controller_error"] is None
                  or value["controller_error"] in {
                      "cwd_unavailable", "exec_changed", "exec_invalid",
@@ -2644,20 +2969,22 @@ def decoded_supervisor_result(
                      "invalid_invocation", "invalid_request", "local_io",
                      "noncanonical_request", "supervisor_unavailable",
                  }),
-            "invalid native command result")
+            reason)
     if value["controller_error"] is not None:
-        require(value["command"] is None, "invalid native command result")
+        require(value["command"] is None, reason)
         return value, b"", b""
     command = value["command"]
     require(isinstance(command, dict)
             and set(command) == {
                 "cancellation_observed", "cleanup", "cleanup_complete",
-                "cleanup_events", "descendants", "executable",
-                "executable_stable", "poisoned", "primary",
+                "cleanup_events", "completed_ns", "descendants", "executable",
+                "executable_stable", "output_sha256", "poisoned", "primary",
+                "primary_completed_ns",
                 "primary_deadline_reached", "primary_events", "reap_events",
-                "retained_executables",
-                "stderr_base64", "stderr_status", "stdout_base64",
-                "stdout_status", "termination",
+                "retained_executables", "started_ns",
+                "stderr_base64", "stderr_bytes", "stderr_sha256",
+                "stderr_status", "stdout_base64", "stdout_bytes",
+                "stdout_sha256", "stdout_status", "termination",
             }
             and command["cleanup"] in {
                 "complete", "not_required", "deadline", "event_limit",
@@ -2667,6 +2994,8 @@ def decoded_supervisor_result(
             and type(command["cleanup_complete"]) is bool
             and type(command["poisoned"]) is bool
             and command["poisoned"] is (not command["cleanup_complete"])
+            and command["cleanup_complete"]
+            is (command["cleanup"] in {"complete", "not_required"})
             and type(command["executable_stable"]) is bool
             and type(command["primary_deadline_reached"]) is bool
             and type(command["cancellation_observed"]) is bool
@@ -2676,25 +3005,47 @@ def decoded_supervisor_result(
             and command["stderr_status"] in {
                 "complete", "overflow", "io_failed", "incomplete",
             }
-            and all(type(command[name]) is int and 0 <= command[name] <= 10_000_000
-                    for name in (
-                        "primary_events", "cleanup_events", "reap_events"))
             and command["executable"] == expected_executable,
-            "invalid native command result")
-    require(command["retained_executables"] == list(expected_retained),
+            reason)
+    validate_native_executable_identity(command["executable"], reason)
+    limits = request["limits"]
+    native_u32(command["primary_events"], reason)
+    native_u32(command["cleanup_events"], reason)
+    native_u16(command["reap_events"], reason)
+    require(command["primary_events"] <= limits["primary_events"]
+            and command["cleanup_events"] <= limits["cleanup_events"]
+            and command["reap_events"] <= limits["reap_events"], reason)
+    require(isinstance(command["retained_executables"], list)
+            and command["retained_executables"] == list(expected_retained),
             "invalid retained executable identity")
+    for item in command["retained_executables"]:
+        require(isinstance(item, dict)
+                and set(item) == {"identity", "name", "path"}, reason)
+        native_string(
+            item["name"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        native_string(
+            item["path"], COMMAND_STRING_MAX, reason, allow_empty=False)
+        validate_native_executable_identity(item["identity"], reason)
     descendants = command["descendants"]
     require(isinstance(descendants, dict)
             and set(descendants) == {
                 "adopted", "identity_validated", "limit_exceeded",
                 "observed", "untracked",
             }
-            and all(type(descendants[name]) is int
-                    and 0 <= descendants[name] <= 256
-                    for name in ("adopted", "identity_validated", "observed"))
             and type(descendants["limit_exceeded"]) is bool
             and type(descendants["untracked"]) is bool,
-            "invalid native command result")
+            reason)
+    for name in ("adopted", "identity_validated", "observed"):
+        native_u16(descendants[name], reason)
+    require(descendants["adopted"] <= descendants["observed"]
+            and descendants["identity_validated"] == descendants["observed"]
+            and descendants["observed"] <= limits["descendants"] + 1
+            and descendants["limit_exceeded"]
+            is (descendants["observed"] > limits["descendants"])
+            and (not descendants["untracked"]
+                 or descendants["limit_exceeded"]
+                 and descendants["observed"] == limits["descendants"] + 1),
+            reason)
     primary = command["primary"]
     termination = command["termination"]
     require(isinstance(primary, dict)
@@ -2704,36 +3055,100 @@ def decoded_supervisor_result(
                 "output_overflow", "exec_failed", "snapshot_unsupported",
                 "event_limit", "local_io", "executable_changed",
             }
-            and (primary["code"] is None
-                 or type(primary["code"]) is int
-                 and 0 <= primary["code"] <= 0xffffffff)
             and isinstance(termination, dict)
             and set(termination) == {"code", "kind"}
             and (termination["kind"] is None
                  or termination["kind"] in {
                      "exited", "signal", "stopped", "unknown",
-                 })
-            and (termination["code"] is None
-                 or type(termination["code"]) is int
-                 and 0 <= termination["code"] <= 0xffffffff),
-            "invalid native command result")
+                 }),
+            reason)
+    if primary["kind"] == "exited":
+        native_u8(primary["code"], reason)
+    elif primary["kind"] == "signal":
+        native_integer(primary["code"], 1, 64, reason)
+    elif primary["kind"] == "unknown":
+        native_u32(primary["code"], reason)
+    else:
+        require(primary["code"] is None, reason)
+    if termination["kind"] == "exited":
+        native_u8(termination["code"], reason)
+    elif termination["kind"] in {"signal", "stopped"}:
+        native_integer(termination["code"], 1, 64, reason)
+    elif termination["kind"] == "unknown":
+        native_u32(termination["code"], reason)
+    else:
+        require(termination["code"] is None, reason)
+    if primary["kind"] in {"exited", "signal", "unknown"}:
+        require(termination == primary, reason)
+    require(command["primary_deadline_reached"]
+            is (primary["kind"] == "timeout")
+            and command["cancellation_observed"]
+            is (primary["kind"] == "cancelled")
+            and (primary["kind"] != "event_limit"
+                 or command["primary_events"] == limits["primary_events"])
+            and (primary["kind"] != "executable_changed"
+                 or not command["executable_stable"]
+                 and termination == {"code": 0, "kind": "exited"})
+            and (command["executable_stable"]
+                 or primary != {"code": 0, "kind": "exited"}),
+            reason)
     try:
         stdout = base64.b64decode(
             command["stdout_base64"], validate=True)
         stderr = base64.b64decode(
             command["stderr_base64"], validate=True)
     except (TypeError, ValueError) as error:
-        raise Refusal("invalid native command result") from error
-    require(len(stdout) <= COMMAND_STREAM_MAX
-            and len(stderr) <= COMMAND_STREAM_MAX,
-            "invalid native command result")
+        raise Refusal(reason) from error
+    stdout_sha256 = hashlib.sha256(stdout).hexdigest()
+    stderr_sha256 = hashlib.sha256(stderr).hexdigest()
+    require(len(stdout) <= limits["stdout_bytes"]
+            and len(stderr) <= limits["stderr_bytes"]
+            and native_u64(command["stdout_bytes"], reason) == len(stdout)
+            and native_u64(command["stderr_bytes"], reason) == len(stderr)
+            and native_digest(command["stdout_sha256"], reason)
+            == stdout_sha256
+            and native_digest(command["stderr_sha256"], reason)
+            == stderr_sha256
+            and native_digest(command["output_sha256"], reason)
+            == command_output_commitment(
+                len(stdout), stdout_sha256, len(stderr), stderr_sha256)
+            and (primary["kind"] != "output_overflow"
+                 or "overflow" in {
+                     command["stdout_status"], command["stderr_status"],
+                 }),
+            reason)
+    started = native_u64(command["started_ns"], reason)
+    primary_completed = native_u64(command["primary_completed_ns"], reason)
+    completed = native_u64(command["completed_ns"], reason)
+    require(started <= primary_completed <= completed
+            and (command["primary_deadline_reached"]
+                 or started < request["primary_deadline_ns"])
+            and (command["cleanup"] != "complete"
+                 or completed <= request["cleanup_deadline_ns"])
+            and (primary != {"code": 0, "kind": "exited"}
+                 or primary_completed <= request["primary_deadline_ns"]),
+            reason)
+    if command["cleanup"] == "complete":
+        require(command["reap_events"] == descendants["observed"] + 2
+                and termination["kind"] is not None, reason)
+    elif command["cleanup"] == "not_required":
+        require(command["cleanup_events"] == 0
+                and command["reap_events"] == 0
+                and descendants == {
+                    "adopted": 0,
+                    "identity_validated": 0,
+                    "limit_exceeded": False,
+                    "observed": 0,
+                    "untracked": False,
+                }, reason)
     return value, stdout, stderr
 
 
 def supervised_command_evidence(
-        stage, request, native, stdout, stderr, supervisor_identity,
+        stage, request, request_raw, native, native_raw, stdout, stderr,
+        supervisor_identity,
         native_executable, command_executable, interpreter,
-        expected_retained, roots, timeout_ns):
+        expected_retained, roots, issued_ns, timeout_ns):
     strict = stage in PRODUCTION_COMMAND_STAGES
 
     def identities(values):
@@ -2768,17 +3183,34 @@ def supervised_command_evidence(
                 command["retained_executables"]),
             "stderr": {
                 "bytes": len(stderr),
-                "sha256": hashlib.sha256(stderr).hexdigest(),
+                "digest_scope": command_digest_scope(len(stderr)),
+                "sha256": command["stderr_sha256"],
                 "status": command["stderr_status"],
             },
             "stdout": {
                 "bytes": len(stdout),
-                "sha256": hashlib.sha256(stdout).hexdigest(),
+                "digest_scope": command_digest_scope(len(stdout)),
+                "sha256": command["stdout_sha256"],
                 "status": command["stdout_status"],
             },
             "output": {
                 "bytes": len(stdout) + len(stderr),
-                "sha256": hashlib.sha256(stdout + stderr).hexdigest(),
+                "commitment_sha256": command["output_sha256"],
+                "combined_sha256": hashlib.sha256(stdout + stderr).hexdigest(),
+                "digest_scope": command_digest_scope(
+                    len(stdout) + len(stderr)),
+            },
+            "timing": {
+                "cleanup_elapsed_ns":
+                    command["completed_ns"]
+                    - command["primary_completed_ns"],
+                "completed_ns": command["completed_ns"],
+                "primary_completed_ns": command["primary_completed_ns"],
+                "primary_elapsed_ns":
+                    command["primary_completed_ns"] - command["started_ns"],
+                "started_ns": command["started_ns"],
+                "total_elapsed_ns":
+                    command["completed_ns"] - command["started_ns"],
             },
             "termination": command["termination"],
         }
@@ -2831,6 +3263,7 @@ def supervised_command_evidence(
             }
             for value in expected_retained
         ],
+        "issued_ns": issued_ns,
         "primary_deadline_ns": request["primary_deadline_ns"],
         "cleanup_deadline_ns": request["cleanup_deadline_ns"],
         "timeout_ns": timeout_ns,
@@ -2849,6 +3282,16 @@ def supervised_command_evidence(
         "version": native["version"],
         "request_canonical_sha256": public_request["canonical_sha256"],
         "controller_error": native["controller_error"],
+        "native_request": {
+            "bytes": len(request_raw),
+            "digest_scope": "direct_producer_or_trusted_inner_zip",
+            "sha256": native["request_sha256"],
+        },
+        "native_result": {
+            "bytes": len(native_raw),
+            "digest_scope": "direct_producer_or_trusted_inner_zip",
+            "sha256": hashlib.sha256(native_raw).hexdigest(),
+        },
         "command": summarized,
     }
     return {
@@ -2889,6 +3332,7 @@ def bootstrap_execute(root, stage, args, seconds, limit, cwd, evidence,
         "scope": "command_diagnostic_not_acceptance", "stage": stage,
         "exit_code": 0, "bytes": len(raw),
         "sha256": hashlib.sha256(raw).hexdigest(),
+        "sha256_scope": command_digest_scope(len(raw)),
         "over_limit": False, "known_error_markers": command_error_markers(raw),
         "supervisor": {
             "schema": "uk.wamr.command-supervisor-result",
@@ -2991,10 +3435,11 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
         "schema": "uk.wamr.command-supervisor-request",
         "version": 1,
     }
+    request_raw = validate_supervisor_request(request)
     with retained_executables(
             (supervisor,), records) as (retained, pass_fds):
         result = subprocess.run(
-            [retained[supervisor]], input=canonical_json(request),
+            [retained[supervisor]], input=request_raw,
             cwd="/", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env={}, pass_fds=pass_fds, check=False,
         )
@@ -3003,7 +3448,7 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
     expected_executable = native_executable_identity(
         records[supervisor if launch_retained else executable])
     native, stdout, stderr = decoded_supervisor_result(
-        result.stdout, expected_executable, expected_retained)
+        result.stdout, request, expected_executable, expected_retained)
     command = native["command"]
     combined = (stdout + stderr)[:limit + 1]
     with output.open("xb") as stream:
@@ -3020,13 +3465,16 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
     record = {
         "scope": "command_diagnostic_not_acceptance", "stage": stage,
         "exit_code": exit_code, "bytes": size,
-        "sha256": digest(output) if size else hashlib.sha256(b"").hexdigest(),
+        "sha256": digest(output) if size else EMPTY_SHA256,
+        "sha256_scope": command_digest_scope(size),
         "over_limit": size > limit,
         "known_error_markers": markers,
         "supervisor": supervised_command_evidence(
-            stage, request, native, stdout, stderr, supervisor_identity,
+            stage, request, request_raw, native, result.stdout, stdout, stderr,
+            supervisor_identity,
             expected_executable, command_executable, interpreter,
-            expected_retained, roots, int(seconds * 1_000_000_000)),
+            expected_retained, roots, now,
+            int(seconds * 1_000_000_000)),
     }
     if evidence:
         save(root / "evidence" / ("command-" + stage + ".json"), record)
@@ -3308,7 +3756,7 @@ def tracked_manifest(relative, repository=None):
         "git_oid": oid,
         "metadata": list(snapshot(info)),
         "metadata_sha256": hashlib.sha256(
-            json.dumps(snapshot(info), separators=(",", ":")).encode("ascii")).hexdigest(),
+            compact_json(snapshot(info))).hexdigest(),
     }, data
 
 
@@ -3708,8 +4156,8 @@ def dependency_custody(root):
             "closure_sha256": closure.hexdigest(),
             "physical_sha256": physical.hexdigest(),
             "root_metadata": list(root_info),
-            "root_metadata_sha256": hashlib.sha256(json.dumps(
-                root_info, separators=(",", ":")).encode("ascii")).hexdigest(),
+            "root_metadata_sha256": hashlib.sha256(
+                compact_json(root_info)).hexdigest(),
             "manifests": {
                 "count": manifest_count,
                 "bytes": manifest_bytes,
@@ -3718,9 +4166,8 @@ def dependency_custody(root):
             "hash_verification": {
                 "algorithm": "zig-0.16.0-fetch-path",
                 "count": len(hash_records),
-                "sha256": hashlib.sha256(json.dumps(
-                    hash_records, sort_keys=True,
-                    separators=(",", ":")).encode("ascii")).hexdigest(),
+                "sha256": hashlib.sha256(
+                    compact_json(hash_records)).hexdigest(),
             },
             "records": records,
         },

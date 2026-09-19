@@ -61,7 +61,7 @@ def pre_supervisor_source(source):
 
 
 def bind(hasher, value):
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    raw = encoded(value, newline=False)
     hasher.update(len(raw).to_bytes(8, "big"))
     hasher.update(raw)
 
@@ -90,8 +90,7 @@ def physical_metadata(value, kind, permissions, size=None):
 
 
 def metadata_sha256(value):
-    return hashlib.sha256(json.dumps(
-        value, separators=(",", ":")).encode("ascii")).hexdigest()
+    return hashlib.sha256(encoded(value, newline=False)).hexdigest()
 
 
 def git_output(ci, limit, *args):
@@ -199,21 +198,24 @@ def executable_identity(value):
         "mtime_nanoseconds", "mtime_seconds", "size", "uid",
     })
     digest_string(value["content_sha256"])
-    for key in (
-            "ctime_nanoseconds", "device_major", "device_minor", "inode",
-            "mode", "mtime_nanoseconds", "size", "uid"):
+    for key in ("ctime_nanoseconds", "device_major", "device_minor",
+                "mtime_nanoseconds", "uid"):
+        bounded_integer(value[key], 0, (1 << 32) - 1)
+    bounded_integer(value["mode"], 0, (1 << 16) - 1)
+    for key in ("inode", "size"):
         bounded_integer(value[key], 0, (1 << 64) - 1)
+    for key in ("ctime_seconds", "mtime_seconds"):
+        bounded_integer(value[key], -(1 << 63), (1 << 63) - 1)
     require(value["inode"] > 0 and value["size"] > 0
             and value["ctime_nanoseconds"] < 1_000_000_000
-            and value["mtime_nanoseconds"] < 1_000_000_000
-            and type(value["ctime_seconds"]) is int
-            and type(value["mtime_seconds"]) is int)
+            and value["mtime_nanoseconds"] < 1_000_000_000)
     return value
 
 
-def supervised_command_record(ci, value, stage, role_identities):
+def supervised_command_record(
+        ci, value, stage, role_identities, transport_context):
     ci.validate_supervised_command_binding(
-        value, stage, role_identities)
+        value, stage, role_identities, transport_context)
     request = value["supervisor"]["request"]
     bindings = [
         request["supervisor"],
@@ -297,9 +299,8 @@ def consumer_input_record(ci, value):
     digest_string(value["aggregate_sha256"])
     unsigned = dict(value)
     del unsigned["aggregate_sha256"]
-    require(value["aggregate_sha256"] == hashlib.sha256(json.dumps(
-        unsigned, sort_keys=True,
-        separators=(",", ":")).encode("ascii")).hexdigest())
+    require(value["aggregate_sha256"]
+            == hashlib.sha256(encoded(unsigned, newline=False)).hexdigest())
     return value
 
 
@@ -492,9 +493,9 @@ def dependency_record(ci, value, expected):
         "package_hash": name,
         "sha256": hashlib.sha256((name + "\n").encode("ascii")).hexdigest(),
     } for name in names]
-    require(hash_verification["sha256"] == hashlib.sha256(json.dumps(
-        hash_records, sort_keys=True,
-        separators=(",", ":")).encode("ascii")).hexdigest())
+    require(hash_verification["sha256"]
+            == hashlib.sha256(
+                encoded(hash_records, newline=False)).hexdigest())
     closure = hashlib.sha256(b"uk.wamr.package-closure-v1\0")
     physical = hashlib.sha256(b"uk.wamr.package-physical-closure-v1\0")
     for record in records:
@@ -506,8 +507,38 @@ def dependency_record(ci, value, expected):
     return value
 
 
-def encoded(value):
-    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+def json_domain(value):
+    if value is None or type(value) is bool:
+        return
+    if type(value) is int:
+        require(-(1 << 63) <= value <= (1 << 64) - 1)
+        return
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("public-source bundle refused") from error
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            json_domain(item)
+        return
+    require(isinstance(value, dict))
+    for key, item in value.items():
+        require(isinstance(key, str))
+        json_domain(key)
+        json_domain(item)
+
+
+def encoded(value, newline=True):
+    json_domain(value)
+    try:
+        text = json.dumps(
+            value, ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":"))
+        return (text + ("\n" if newline else "")).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise ValueError("public-source bundle refused") from error
 
 
 def decode(raw):
@@ -518,7 +549,12 @@ def decode(raw):
             require(key not in result)
             result[key] = value
         return result
-    return json.loads(raw, object_pairs_hook=unique)
+    try:
+        value = json.loads(raw, object_pairs_hook=unique)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("public-source bundle refused") from error
+    require(raw == encoded(value))
+    return value
 
 
 def context(value):
@@ -859,7 +895,8 @@ def native(handoff, validator, supervisor, bundle, expected):
             supervisor_input["files"]["command-supervisor"])
         supervised_command_record(
             handoff.ci, identity_command, "supervisor-import-identity",
-            {"command-supervisor": supervisor_role_identity})
+            {"command-supervisor": supervisor_role_identity},
+            "producer_direct")
         require(handoff.ci.read(identity_output, 1024)
                 == handoff.ci.canonical_json(
                     supervisor_identity_document))
@@ -878,7 +915,7 @@ def native(handoff, validator, supervisor, bundle, expected):
         }
         supervised_command_record(
             handoff.ci, command, "native-revalidation",
-            role_identities)
+            role_identities, "producer_direct")
         require(handoff.ci.read(output, 4096)
                 == b"Compute handoff revalidated; authority=not_admitted.\n")
         handoff.ci.record_input_paths(
@@ -904,7 +941,7 @@ def require_consumer_tree_roles(value, legacy):
     require("system-bin" not in roles or legacy)
 
 
-def publication_records(handoff, stage, source):
+def publication_records(handoff, stage, source, transport_context):
     """The uploaded originals must be the successful fixed public lane records."""
     ci = handoff.ci
     value = ci.document(stage / "artifacts/local_result")
@@ -980,7 +1017,7 @@ def publication_records(handoff, stage, source):
                 "over_limit", "known_error_markers",
             }
             if not pre_supervisor:
-                expected_fields.add("supervisor")
+                expected_fields.update({"sha256_scope", "supervisor"})
             require(set(item) == expected_fields
                     and item["scope"] == "command_diagnostic_not_acceptance"
                     and item["stage"] + ".json" == name[len("command-"):]
@@ -992,7 +1029,8 @@ def publication_records(handoff, stage, source):
             if not pre_supervisor:
                 command_stage = name[len("command-"):-len(".json")]
                 supervised_command_record(
-                    ci, item, command_stage, role_identities)
+                    ci, item, command_stage, role_identities,
+                    transport_context)
     for mode in ci.MODES:
         request = ci.document(stage / "boots" / mode / "request")
         require(set(request) == {
@@ -1085,7 +1123,7 @@ def pack(handoff, stage, archive, source, validator, supervisor):
     handoff.FAILURE_STAGE = "public-pack-members"
     original = members(handoff, bundle, stage)
     handoff.FAILURE_STAGE = "public-pack-records"
-    publication_records(handoff, stage, source)
+    publication_records(handoff, stage, source, "producer_direct")
     # The private handoff's known inspection captures exist but are never copied.
     handoff.FAILURE_STAGE = "public-pack-tree"
     inspect_tree(stage, set(original) | {
@@ -1241,7 +1279,7 @@ def import_bundle(
                 )
     for item in members(handoff, bundle).values():
         item["path"] = str(output / item["path"])
-    publication_records(handoff, output, expected)
+    publication_records(handoff, output, expected, "trusted_inner_zip")
     handoff.ci.save(output / "candidate-bundle.json", bundle)
     native(
         handoff, validator, supervisor,
@@ -1297,7 +1335,7 @@ def publish_ci(handoff):
         require(recorded == validator_record)
         supervised_command_record(
             handoff.ci, recorded, "public-validator-build",
-            role_identities)
+            role_identities, "producer_direct")
         handoff.ci.require_recorded_build_custody(runtime, start)
         require(ci_context(handoff, start) == source)
 

@@ -528,6 +528,9 @@ pub const CommandResult = struct {
     storage: []u8,
     stdout: []const u8 = &.{},
     stderr: []const u8 = &.{},
+    started_ns: u64,
+    primary_completed_ns: u64,
+    completed_ns: u64,
     executable: ExecutableIdentity,
     executable_stable: bool = true,
     primary: CommandPrimary,
@@ -669,9 +672,13 @@ fn runCommandImpl(
     defer _ = linux.close(proc);
     try requirePidfds();
 
+    const started_ns = try now();
     const total = try std.math.add(usize, request.limits.stdout_bytes, request.limits.stderr_bytes);
     var result: CommandResult = .{
         .storage = try allocator.alloc(u8, total),
+        .started_ns = started_ns,
+        .primary_completed_ns = started_ns,
+        .completed_ns = started_ns,
         .executable = request.executable.identity,
         .primary = .local_io,
     };
@@ -687,6 +694,7 @@ fn runCommandImpl(
         result.primary_deadline_reached = true;
         result.stdout_status = .complete;
         result.stderr_status = .complete;
+        try completeAllCommandTiming(&result);
         return result;
     }
     if (cancelled(options)) {
@@ -694,6 +702,7 @@ fn runCommandImpl(
         result.cancellation_observed = true;
         result.stdout_status = .complete;
         result.stderr_status = .complete;
+        try completeAllCommandTiming(&result);
         return result;
     }
 
@@ -707,6 +716,7 @@ fn runCommandImpl(
         result.primary_deadline_reached = true;
         result.stdout_status = .complete;
         result.stderr_status = .complete;
+        try completeAllCommandTiming(&result);
         return result;
     }
     if (cancelled(options)) {
@@ -714,6 +724,7 @@ fn runCommandImpl(
         result.cancellation_observed = true;
         result.stdout_status = .complete;
         result.stderr_status = .complete;
+        try completeAllCommandTiming(&result);
         return result;
     }
 
@@ -728,6 +739,7 @@ fn runCommandImpl(
         result.primary = .local_io;
         result.stdout_status = .complete;
         result.stderr_status = .complete;
+        try completeAllCommandTiming(&result);
         return result;
     };
     defer _ = linux.close(child.stdout);
@@ -745,7 +757,9 @@ fn runCommandImpl(
             error.ProcessGone, error.ProcUnavailable, error.PidfdUnavailable => .proc_unavailable,
             error.PollFailed => .local_io,
         };
+        try completePrimaryCommandTiming(&result);
         poisonAndRecoverLeader(proc, child.pid, request.cleanup_deadline, &result);
+        try completeCleanupCommandTiming(&result);
         return result;
     };
 
@@ -779,6 +793,7 @@ fn runCommandImpl(
         if (err == error.StdoutIo or err == error.StderrIo or err == error.PollFailed or err == error.WaitFailed)
             result.primary = .local_io;
     };
+    try completePrimaryCommandTiming(&result);
 
     cleanupCommand(io, proc, request, &tracker, &result) catch |err| {
         result.cleanup_complete = false;
@@ -810,7 +825,23 @@ fn runCommandImpl(
     };
     if (!result.executable_stable and primaryExitedZero(result.primary))
         result.primary = .executable_changed;
+    try completeCleanupCommandTiming(&result);
     return result;
+}
+
+fn completePrimaryCommandTiming(result: *CommandResult) !void {
+    const timestamp = try now();
+    result.primary_completed_ns = @max(result.started_ns, timestamp);
+}
+
+fn completeCleanupCommandTiming(result: *CommandResult) !void {
+    const timestamp = try now();
+    result.completed_ns = @max(result.primary_completed_ns, timestamp);
+}
+
+fn completeAllCommandTiming(result: *CommandResult) !void {
+    try completePrimaryCommandTiming(result);
+    try completeCleanupCommandTiming(result);
 }
 
 /// Opt-in private raw capture. Borrows a live writer guard and never hands file

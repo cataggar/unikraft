@@ -235,6 +235,12 @@ the accepted source commit/tree, and only then uses it for native validator
 revalidation. The importer bounds and
 verifies every member and rejects extra files, symlinks, changed
 source/image/serial/report/hash or failed local outcomes.
+It also recomputes native-width supervisor invariants, canonical UTF-8 request
+and result bindings, empty-stream hashes, and the aggregate stream
+count/digest commitment. Nonempty command streams are intentionally absent
+from the public archive, so their labelled digests are accepted only as
+observations authenticated by the independently selected current inner-ZIP
+digest above; they are not claimed to be independently reproducible.
 It preserves original bytes and request hashes, changes only the handoff's
 local file references, and invokes native production revalidation. An
 incomplete import never publishes the final operator `bundle.json`.
