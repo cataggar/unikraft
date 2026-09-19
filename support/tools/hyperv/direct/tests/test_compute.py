@@ -1328,7 +1328,7 @@ class Compute(unittest.TestCase):
                 public_bundle.verify_archive(
                     handoff, old_archive, old_source, None)
                 public_bundle.publication_records(
-                    handoff, old_stage, old_source)
+                    handoff, old_stage, old_source, "producer_direct")
                 old_output = self.root / f"old-v1-imported-{index}"
                 delivered.import_bundle(
                     handoff, old_archive, old_output,
