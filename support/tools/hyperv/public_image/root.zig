@@ -4,6 +4,7 @@ pub const contracts = @import("contracts.zig");
 pub const files = @import("files.zig");
 pub const network = @import("network.zig");
 pub const package = @import("package.zig");
+pub const compute_artifacts = @import("compute_artifacts.zig");
 pub const engine = @import("engine.zig");
 pub const manifest = @import("manifest.zig");
 pub const worker = @import("worker.zig");

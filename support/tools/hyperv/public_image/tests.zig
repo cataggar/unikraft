@@ -149,6 +149,395 @@ test "direct native package structurally validates synthetic PE raw and fixed VH
     try t.expectEqual(@as(u64, c.vhd_bytes), report.vhd.size);
     try image.files.cleanupStage(io, root, "package-stage");
 }
+test "compute-only raw to native zstd QCOW2 to digest-bound fixed VHD" {
+    const fixture = try Fixture.init(0, false);
+    defer fixture.deinit();
+    const alloc = fixture.arena.allocator();
+    const root = try image.files.create(io, fixture.input.state_dir);
+    defer root.close(io);
+    const efi_input = try image.files.record(alloc, io, fixture.input.efi, c.max_efi, false);
+    const packaged = try image.package.build(alloc, io, root, efi_input);
+    try image.files.cleanupStage(io, root, "package-stage");
+    const producer = try image.files.record(alloc, io, fixture.cli, c.max_tool, true);
+    const limits: image.compute_artifacts.Limits = .{
+        .max_input_bytes = c.raw_bytes,
+        .max_output_bytes = c.vhd_bytes,
+        .max_virtual_bytes = c.raw_bytes,
+        .max_partition_array_bytes = 1024 * 1024,
+        .max_metadata_bytes = 128 * 1024,
+        .max_metadata_work = 8194,
+        .max_work_bytes = 4 * c.raw_bytes,
+        .max_memory_bytes = 512 * 1024 * 1024,
+    };
+    const raw_path = try image.files.path(alloc, fixture.input.state_dir, "unikraft.raw");
+    const raw = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        raw_path,
+        packaged.raw.size,
+        packaged.raw.sha256,
+        limits.max_input_bytes,
+    );
+    const finalized = try image.compute_artifacts.finalizeQcow2(alloc, io, root, .{
+        .source = raw,
+        .expected_virtual_bytes = packaged.raw.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("native compute finalization fixture"),
+    });
+    try t.expectEqual(@as(u64, c.raw_bytes), finalized.output.virtual_bytes);
+    try t.expect(finalized.output.file_bytes < finalized.output.virtual_bytes);
+    try t.expectEqualStrings(packaged.raw.sha256, finalized.source_sha256);
+    try t.expectEqualStrings(efi_input.sha256, finalized.identity.workload_sha256);
+    const stored_finalization = try image.compute_artifacts.readFinalizationRecord(
+        alloc,
+        try root.read(io, alloc, image.compute_artifacts.qcow2_record_name, c.max_record, null),
+    );
+    try image.files.same(alloc, finalized, stored_finalization);
+
+    const qcow2_path = try image.files.path(alloc, fixture.input.state_dir, image.compute_artifacts.qcow2_name);
+    const qcow2 = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        qcow2_path,
+        finalized.output.file_bytes,
+        finalized.output.sha256,
+        limits.max_input_bytes,
+    );
+    const derived = try image.compute_artifacts.deriveFixedVhd(alloc, io, root, .{
+        .source = qcow2,
+        .expected_capacity_bytes = finalized.output.virtual_bytes,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("native compute fixed vhd fixture"),
+    });
+    try t.expectEqualStrings(finalized.output.sha256, derived.accepted_qcow2.sha256);
+    try t.expectEqualStrings(finalized.source_sha256, derived.accepted_qcow2_decoded_sha256);
+    try t.expectEqual(@as(u64, c.vhd_bytes), derived.output.file_bytes);
+    try t.expect(!derived.relocation.was_relocated);
+    try image.files.same(alloc, finalized.identity, derived.output_identity);
+    const stored_derivation = try image.compute_artifacts.readDerivationRecord(
+        alloc,
+        try root.read(io, alloc, image.compute_artifacts.vhd_record_name, c.max_record, null),
+    );
+    try image.files.same(alloc, derived, stored_derivation);
+    var bad_derivation = derived;
+    bad_derivation.footer.checksum +%= 1;
+    try t.expectError(
+        error.InvalidFooter,
+        image.compute_artifacts.readDerivationRecord(
+            alloc,
+            try c.encode(alloc, bad_derivation),
+        ),
+    );
+    bad_derivation = derived;
+    bad_derivation.output_identity.workload_sha256 = "0" ** 64;
+    try t.expectError(
+        error.InvalidRecord,
+        image.compute_artifacts.readDerivationRecord(
+            alloc,
+            try c.encode(alloc, bad_derivation),
+        ),
+    );
+
+    var wrong: [64]u8 = undefined;
+    @memcpy(&wrong, finalized.output.sha256);
+    wrong[0] = if (wrong[0] == '0') '1' else '0';
+    try t.expectError(
+        error.ArtifactChanged,
+        image.compute_artifacts.bindExpected(
+            alloc,
+            io,
+            qcow2_path,
+            finalized.output.file_bytes,
+            &wrong,
+            limits.max_input_bytes,
+        ),
+    );
+    try t.expectError(
+        error.PathAlreadyExists,
+        image.compute_artifacts.finalizeQcow2(alloc, io, root, .{
+            .source = raw,
+            .expected_virtual_bytes = packaged.raw.size,
+            .expected_workload_sha256 = try c.sha(efi_input.sha256),
+            .expected_workload_bytes = efi_input.size,
+            .limits = limits,
+            .producer = producer,
+            .config_sha256 = c.hash("collision"),
+        }),
+    );
+    const tampered = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        try root.read(io, alloc, image.compute_artifacts.qcow2_record_name, c.max_record, null),
+        "\"status\":\"succeeded\"",
+        "\"status\":\"refused\"",
+    );
+    try t.expectError(
+        error.InvalidRecord,
+        image.compute_artifacts.readFinalizationRecord(alloc, tampered),
+    );
+}
+test "fixed VHD derivation permits only documented GPT relocation deltas" {
+    const fixture = try Fixture.init(0, false);
+    defer fixture.deinit();
+    const alloc = fixture.arena.allocator();
+    const root = try image.files.create(io, fixture.input.state_dir);
+    defer root.close(io);
+    const efi_input = try image.files.record(alloc, io, fixture.input.efi, c.max_efi, false);
+    _ = try image.package.build(alloc, io, root, efi_input);
+    try image.files.cleanupStage(io, root, "package-stage");
+    const raw_path = try image.files.path(alloc, fixture.input.state_dir, "unikraft.raw");
+    var raw_image = try image.boot.miz.Image.openPathReadOnly(io, raw_path);
+    defer raw_image.close(io);
+    var raw_gpt = try image.boot.miz.gpt.readVerifiedGpt(
+        raw_image,
+        io,
+        alloc,
+        1024 * 1024,
+    );
+    defer raw_gpt.deinit(alloc);
+
+    const source_capacity = c.raw_bytes + 512;
+    const expanded_path = try image.files.path(alloc, fixture.input.state_dir, "expanded.qcow2");
+    var expanded = try image.boot.miz.Image.create(
+        io,
+        expanded_path,
+        .qcow2,
+        source_capacity,
+        .{},
+    );
+    _ = try image.boot.miz.copyAll(io, raw_image, &expanded, alloc);
+    const source_relocation = try image.boot.miz.gpt.relocateBackup(
+        &expanded,
+        io,
+        alloc,
+        raw_gpt,
+    );
+    try t.expect(source_relocation.was_relocated);
+    expanded.close(io);
+
+    const expanded_file = try image.files.record(
+        alloc,
+        io,
+        expanded_path,
+        68 * c.mib,
+        false,
+    );
+    const accepted_path = try image.files.path(alloc, fixture.input.state_dir, "accepted-relocated.qcow2");
+    const accepted = try image.boot.miz.artifact_pipeline.finalizeQcow2(alloc, io, .{
+        .input_path = expanded_path,
+        .expected_input_sha256 = try c.sha(expanded_file.sha256),
+        .max_input_size = 68 * c.mib,
+        .source_format = .qcow2,
+        .expected_virtual_size = source_capacity,
+        .max_virtual_size = 68 * c.mib,
+        .output_path = accepted_path,
+        .max_output_size = 68 * c.mib,
+        .compression = .zstd,
+        .cluster_size = 64 * 1024,
+    });
+    const producer = try image.files.record(alloc, io, fixture.cli, c.max_tool, true);
+    const limits: image.compute_artifacts.Limits = .{
+        .max_input_bytes = 68 * c.mib,
+        .max_output_bytes = 68 * c.mib,
+        .max_virtual_bytes = 68 * c.mib,
+        .max_partition_array_bytes = 1024 * 1024,
+        .max_metadata_bytes = 128 * 1024,
+        .max_metadata_work = 8194,
+        .max_work_bytes = 4 * source_capacity,
+        .max_memory_bytes = 512 * 1024 * 1024,
+    };
+    const pinned = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        accepted_path,
+        accepted.artifact.size,
+        try c.hex(alloc, accepted.artifact.sha256),
+        limits.max_input_bytes,
+    );
+    const derived = try image.compute_artifacts.deriveFixedVhd(alloc, io, root, .{
+        .source = pinned,
+        .expected_capacity_bytes = source_capacity,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("relocation fixture"),
+    });
+    try t.expect(derived.relocation.was_relocated);
+    try t.expectEqual(@as(u64, 67 * c.mib), derived.output.virtual_bytes);
+    try t.expectEqualStrings(
+        derived.source_identity.partition_contents_sha256,
+        derived.output_identity.partition_contents_sha256,
+    );
+    try t.expectEqualStrings(
+        "protective-mbr,primary-gpt,relocated-backup-gpt,zero-padding",
+        derived.relocation.allowed_differences,
+    );
+}
+test "compute primitives refuse changed custody malformed identity and unsupported QCOW2" {
+    const fixture = try Fixture.init(0, false);
+    defer fixture.deinit();
+    const alloc = fixture.arena.allocator();
+    const package_root = try image.files.create(io, fixture.input.state_dir);
+    defer package_root.close(io);
+    const efi_input = try image.files.record(alloc, io, fixture.input.efi, c.max_efi, false);
+    const packaged = try image.package.build(alloc, io, package_root, efi_input);
+    try image.files.cleanupStage(io, package_root, "package-stage");
+    const producer = try image.files.record(alloc, io, fixture.cli, c.max_tool, true);
+    const limits: image.compute_artifacts.Limits = .{
+        .max_input_bytes = c.raw_bytes,
+        .max_output_bytes = c.vhd_bytes,
+        .max_virtual_bytes = c.raw_bytes,
+        .max_partition_array_bytes = 1024 * 1024,
+        .max_metadata_bytes = 128 * 1024,
+        .max_metadata_work = 8194,
+        .max_work_bytes = 4 * c.raw_bytes,
+        .max_memory_bytes = 512 * 1024 * 1024,
+    };
+    const raw_path = try image.files.path(alloc, fixture.input.state_dir, "unikraft.raw");
+    try t.expectError(
+        error.ArtifactChanged,
+        image.compute_artifacts.bindExpected(
+            alloc,
+            io,
+            raw_path,
+            packaged.raw.size - 512,
+            packaged.raw.sha256,
+            limits.max_input_bytes,
+        ),
+    );
+
+    try image.files.copy(io, packaged.raw, fixture.dir, "substituted.raw");
+    const substituted_path = try image.files.path(alloc, fixture.path, "substituted.raw");
+    const substituted = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        substituted_path,
+        packaged.raw.size,
+        packaged.raw.sha256,
+        limits.max_input_bytes,
+    );
+    try fixture.dir.dir.rename("substituted.raw", fixture.dir.dir, "substituted.old", io);
+    const old_path = try image.files.path(alloc, fixture.path, "substituted.old");
+    const old_record = try image.files.record(alloc, io, old_path, c.raw_bytes, false);
+    try image.files.copy(io, old_record, fixture.dir, "substituted.raw");
+    try t.expectError(
+        error.ArtifactChanged,
+        image.compute_artifacts.verifyPinned(io, substituted, limits.max_input_bytes),
+    );
+
+    try image.files.copy(io, packaged.raw, fixture.dir, "malformed.raw");
+    const malformed_file = try fixture.dir.dir.openFile(io, "malformed.raw", .{ .mode = .read_write });
+    try malformed_file.writePositionalAll(io, "NOT GPT!", 512);
+    malformed_file.close(io);
+    const malformed_path = try image.files.path(alloc, fixture.path, "malformed.raw");
+    const malformed_record = try image.files.record(alloc, io, malformed_path, c.raw_bytes, false);
+    const malformed = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        malformed_path,
+        malformed_record.size,
+        malformed_record.sha256,
+        limits.max_input_bytes,
+    );
+    const malformed_state_path = try image.files.path(alloc, fixture.path, "malformed-state");
+    const malformed_state = try image.files.create(io, malformed_state_path);
+    defer malformed_state.close(io);
+    if (image.compute_artifacts.finalizeQcow2(alloc, io, malformed_state, .{
+        .source = malformed,
+        .expected_virtual_bytes = malformed_record.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("malformed"),
+    })) |_| return error.AcceptedMalformedDisk else |_| {}
+    try image.files.cleanupStage(
+        io,
+        malformed_state,
+        image.compute_artifacts.qcow2_stage_name,
+    );
+
+    const symlink_state_path = try image.files.path(alloc, fixture.path, "symlink-state");
+    const symlink_state = try image.files.create(io, symlink_state_path);
+    defer symlink_state.close(io);
+    try symlink_state.dir.symLink(io, "/does/not/exist", image.compute_artifacts.qcow2_name, .{});
+    const raw = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        raw_path,
+        packaged.raw.size,
+        packaged.raw.sha256,
+        limits.max_input_bytes,
+    );
+    if (image.compute_artifacts.finalizeQcow2(alloc, io, symlink_state, .{
+        .source = raw,
+        .expected_virtual_bytes = packaged.raw.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("symlink"),
+    })) |_| return error.AcceptedOutputSymlink else |_| {}
+
+    const good_state_path = try image.files.path(alloc, fixture.path, "good-state");
+    const good_state = try image.files.create(io, good_state_path);
+    defer good_state.close(io);
+    const finalized = try image.compute_artifacts.finalizeQcow2(alloc, io, good_state, .{
+        .source = raw,
+        .expected_virtual_bytes = packaged.raw.size,
+        .expected_workload_sha256 = try c.sha(efi_input.sha256),
+        .expected_workload_bytes = efi_input.size,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("good"),
+    });
+    const good_qcow_path = try image.files.path(alloc, good_state_path, image.compute_artifacts.qcow2_name);
+    const good_qcow = try image.files.record(
+        alloc,
+        io,
+        good_qcow_path,
+        limits.max_input_bytes,
+        false,
+    );
+    try image.files.copy(io, good_qcow, fixture.dir, "unsupported.qcow2");
+    const unsupported_file = try fixture.dir.dir.openFile(io, "unsupported.qcow2", .{ .mode = .read_write });
+    try unsupported_file.writePositionalAll(io, &[_]u8{0}, 104);
+    unsupported_file.close(io);
+    const unsupported_path = try image.files.path(alloc, fixture.path, "unsupported.qcow2");
+    const unsupported_record = try image.files.record(
+        alloc,
+        io,
+        unsupported_path,
+        limits.max_input_bytes,
+        false,
+    );
+    const unsupported = try image.compute_artifacts.bindExpected(
+        alloc,
+        io,
+        unsupported_path,
+        unsupported_record.size,
+        unsupported_record.sha256,
+        limits.max_input_bytes,
+    );
+    const derive_state_path = try image.files.path(alloc, fixture.path, "unsupported-state");
+    const derive_state = try image.files.create(io, derive_state_path);
+    defer derive_state.close(io);
+    if (image.compute_artifacts.deriveFixedVhd(alloc, io, derive_state, .{
+        .source = unsupported,
+        .expected_capacity_bytes = finalized.output.virtual_bytes,
+        .limits = limits,
+        .producer = producer,
+        .config_sha256 = c.hash("unsupported"),
+    })) |_| return error.AcceptedUnsupportedQcow2 else |_| {}
+    try image.files.cleanupStage(
+        io,
+        derive_state,
+        image.compute_artifacts.vhd_stage_name,
+    );
+}
 test "native input and private evidence permissions and malformed PE refuse" {
     const f = try Fixture.init(0, false);
     defer f.deinit();
