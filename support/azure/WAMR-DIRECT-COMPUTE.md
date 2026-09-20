@@ -309,10 +309,13 @@ interpreter; do not pass a shell wrapper that selects Python through
 `AZ_PYTHON`. It copies the bootstrap, Python ELF, complete standard library,
 every repeated Azure package import root and any repeated fixed `--data-root`
 into a private Python home. It discovers the interpreter/native-extension
-ELF dependencies, copies the exact dynamic loader and DSOs into the private
-home, and records them as fixed loader artifacts; an operator may add a
-reviewed dependency with `--native-dependency`. No package download, restore
-or import-root discovery occurs after preparation.
+ELF dependencies, rejects embedded RPATH/RUNPATH, audit/filter dependencies
+and slash-bearing `DT_NEEDED` entries, and copies the exact dynamic loader and
+every DSO under each requested `DT_NEEDED` name into the private home. A loader `--list`
+probe must resolve every interpreter dependency below that copied directory.
+The files and names are recorded as fixed loader artifacts; an operator may
+add a reviewed dependency with `--native-dependency`. No package download,
+restore or import-root discovery occurs after preparation.
 
 The resulting `uk.wamr.azure-cli-runtime-closure` version 1 manifest records
 canonical roles and paths, file/directory counts, bytes, maximum depth,
@@ -516,8 +519,11 @@ parses those exact bytes, and binds their metadata and SHA-256. It copies only
 those retained bytes into the create-only attempt scope, reopens and rehashes
 the copy, revalidates the original retained identity, rehashes the plan and
 authorization, checks expiry, finite cost and repository policy, validates
-the exact candidate and tool bindings, and performs a read-only ledger
-eligibility check. It then
+the exact candidate, runtime and tool bindings, seals the runtime, and only
+then performs the first read-only ledger eligibility check. Runtime
+verification, namespace setup, copying, read-only remounting, loader
+isolation or capability-drop failure therefore reaches neither ledger access
+nor backend invocation. It then
 checks bundle/input custody and bounded clean-environment CLI startup before
 consuming attempt/source-tree/image reservations and before the first Azure
 resource call. Malformed, missing, stale, denied, wrong-plan, wrong-attempt or
@@ -525,21 +531,29 @@ wrong-cost authorization reaches neither ledger mutation nor backend
 invocation. Reservations are retained on later failure. A fresh attempt
 directory is mandatory; neither resume nor an automatic retry exists.
 
-Every executable and parent component is canonical, no-follow, retained and
-owned by the effective UID or trusted root; group/world-writable, set-ID,
-non-regular, hard-linked or replaced files refuse. Native ELF uploader, validator and supervisor execution uses retained sealed
+Every executable and parent component is canonical, no-follow and retained;
+group/world-writable, set-ID, non-regular, hard-linked or replaced files
+refuse. Execution tools must be owned by the invoking UID. The user-namespace
+view accepts an unmapped owner only for the exact filesystem root, never for
+an artifact or another path component. Native ELF uploader, validator and supervisor execution uses retained sealed
 descriptor snapshots with `execveat`. Before admission the controller
 re-execs in a private user/mount namespace, copies the authenticated Azure
 runtime to bounded tmpfs, remounts it read-only, and drops namespace
-capabilities. Azure calls execute the retained copied loader with only copied
-DSOs; Python, bootstrap, modules, data and native extensions are addressed
-below the retained root as `/proc/self/fd/N/...`. Neither the original Azure
-script/interpreter pathname, `AZ_PYTHON`, loader cache nor an ambient library
-path is execution authority. The child uses `-s -S -B -P`, no ambient/user
+capabilities. The re-exec marker is accepted only with exact one-ID UID/GID
+kernel maps, disabled setgroups and private root-mount propagation. Azure
+calls use `--inhibit-cache --inhibit-rpath ''`, execute the retained copied
+loader with only copied DSOs, and mask host loader directories in the private
+mount namespace. Python, bootstrap, modules, data and native extensions are
+addressed below the retained root as `/proc/self/fd/N/...`. Neither the
+original Azure script/interpreter pathname, `AZ_PYTHON`, loader cache,
+RPATH/RUNPATH nor an ambient/default library path is execution authority. The
+child uses `-s -S -B -P`, no ambient/user
 site or `PYTHONPATH`, no startup/bytecode hooks, no loader injection and no
 post-custody package restore. Both the original closure and immutable
 execution copy are rehashed immediately before and after every Azure
-consumer, including cleanup and the final absence observation.
+consumer, including cleanup and the final absence observation. Retained
+descriptors also revalidate every approved original-source ancestor at each
+boundary.
 Before Boot2 it revalidates inputs, original Boot1 bytes, VM/disk identities,
 deallocation, scope/expiry and durable start admission. `azure_cumulative`
 allows only the exact Boot1 prefix excluding terminal NUL padding to be

@@ -1302,7 +1302,7 @@ pub fn verifyPlan(
     const plan = try canonicalParsed(Plan, a, plan_bytes.bytes());
     defer plan.deinit();
     try plan.value.validate();
-    try verifyPlanBindings(a, io, plan.value);
+    try verifyPlanBindings(a, io, plan.value, true);
     var digest: [32]u8 = undefined;
     core.Sha256.hash(plan_bytes.bytes(), &digest, .{});
     const digest_hex = std.fmt.bytesToHex(digest, .lower);
@@ -1326,7 +1326,7 @@ pub fn verifyAuthorization(
     const plan = try canonicalParsed(Plan, a, plan_bytes.bytes());
     defer plan.deinit();
     try plan.value.validate();
-    try verifyPlanBindings(a, io, plan.value);
+    try verifyPlanBindings(a, io, plan.value, true);
     var digest: [32]u8 = undefined;
     core.Sha256.hash(plan_bytes.bytes(), &digest, .{});
     const digest_hex = std.fmt.bytesToHex(digest, .lower);
@@ -1348,7 +1348,13 @@ pub fn verifyAuthorization(
 pub fn verifyAdmission(a: std.mem.Allocator, io: std.Io, path: []const u8, require_current: bool) !void {
     const admission = try loadScope(a, io, path);
     defer admission.deinit();
-    try verifyAdmissionBindings(a, io, admission.value, require_current);
+    try verifyAdmissionBindings(
+        a,
+        io,
+        admission.value,
+        require_current,
+        true,
+    );
 }
 
 pub fn verifyAzureRuntime(
@@ -1429,7 +1435,7 @@ pub fn preAdmission(
     const admission = try canonicalParsed(Admission, a, bytes.bytes());
     errdefer admission.deinit();
     try admission.value.validate();
-    try verifyAdmissionBindings(a, io, admission.value, true);
+    try verifyAdmissionBindings(a, io, admission.value, true, false);
     if (!eq(admission.value.ledger_path, ledger_path) or
         !eq(admission.value.tools.azure.path, azure) or
         !eq(admission.value.tools.uploader.path, uploader) or
@@ -1451,7 +1457,13 @@ pub fn preAdmission(
     return result;
 }
 
-fn verifyAdmissionBindings(a: std.mem.Allocator, io: std.Io, admission: Admission, require_current: bool) !void {
+fn verifyAdmissionBindings(
+    a: std.mem.Allocator,
+    io: std.Io,
+    admission: Admission,
+    require_current: bool,
+    ledger_access: bool,
+) !void {
     try admission.validate();
     const plan_bytes = try readPrivate(a, io, admission.plan, 65536);
     defer a.free(plan_bytes);
@@ -1459,7 +1471,7 @@ fn verifyAdmissionBindings(a: std.mem.Allocator, io: std.Io, admission: Admissio
     defer plan.deinit();
     try plan.value.validate();
     if (!sameAdmissionPlan(admission, plan.value)) return error.WrongPlan;
-    try verifyPlanBindings(a, io, plan.value);
+    try verifyPlanBindings(a, io, plan.value, ledger_access);
 
     const authorization_bytes = try readPrivate(a, io, admission.authorization, 65536);
     defer a.free(authorization_bytes);
@@ -1483,11 +1495,24 @@ fn verifyAdmissionBindings(a: std.mem.Allocator, io: std.Io, admission: Admissio
     }
 }
 
-fn verifyPlanBindings(a: std.mem.Allocator, io: std.Io, plan: Plan) !void {
+fn verifyPlanBindings(
+    a: std.mem.Allocator,
+    io: std.Io,
+    plan: Plan,
+    ledger_access: bool,
+) !void {
     try plan.validate();
-    const ledger = try ledgerProposal(a, io, plan.ledger_path, plan.campaign_id, plan.ledger.ledger_id);
-    if (!sameLedgerProposal(ledger, plan.ledger))
-        return error.WrongLedgerIdentity;
+    if (ledger_access) {
+        const ledger = try ledgerProposal(
+            a,
+            io,
+            plan.ledger_path,
+            plan.campaign_id,
+            plan.ledger.ledger_id,
+        );
+        if (!sameLedgerProposal(ledger, plan.ledger))
+            return error.WrongLedgerIdentity;
+    }
     const candidate_bytes = try readPrivate(a, io, plan.candidate, 65536);
     defer a.free(candidate_bytes);
     const candidate = try parse(CandidateScope, a, candidate_bytes);

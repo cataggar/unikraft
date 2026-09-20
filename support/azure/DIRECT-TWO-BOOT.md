@@ -243,12 +243,16 @@ mandatory in plan, authorization, admission, preflight and execution. WAMR
 re-execs itself in a private user/mount namespace before admission, copies the
 already authenticated closure to a bounded tmpfs mounted over the approved
 root, remounts it read-only, and drops namespace capabilities. It invokes the
-retained loader with only the copied DSO directory, then runs Python with
-`-s -S -B -P`; the interpreter, bootstrap, modules, data and extensions are
-addressed below the retained root as `/proc/self/fd/N/...`. It does not use
-`AZ_PYTHON`, the original bootstrap pathname or an ambient loader as execution
-authority. The original root remains retained and rehashed, so later source
-drift still refuses even though it cannot alter executed bytes.
+retained loader with RPATH and the loader cache inhibited, masks host library
+directories in that private namespace, and resolves only the copied
+`DT_NEEDED` names before running Python with `-s -S -B -P`; the interpreter,
+bootstrap, modules, data and extensions are addressed below the retained root
+as `/proc/self/fd/N/...`. Kernel UID/GID maps, disabled setgroups and private
+mount propagation authenticate the internal re-exec marker. It does not use
+`AZ_PYTHON`, the original bootstrap pathname or an ambient/default loader as
+execution authority. The original root and every approved parent remain
+retained and revalidated, so later source or parent drift still refuses even
+though it cannot alter executed bytes.
 
 Run this local-only command before obtaining a future live approval:
 

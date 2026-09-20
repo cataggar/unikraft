@@ -347,7 +347,7 @@ pub const Runtime = struct {
         }
         if (lane == .primary and self.cancellation.flag().load(.acquire)) return error.Cancelled;
         const closure_launch = role == .azure and self.azure_runtime != null;
-        const maximum_arguments: usize = if (closure_launch) 117 else 127;
+        const maximum_arguments: usize = if (closure_launch) 115 else 127;
         if (arguments.len > maximum_arguments)
             return error.InvalidArguments;
         if (closure_launch) try azureCommand(arguments);
@@ -370,27 +370,29 @@ pub const Runtime = struct {
             );
             argv[0] = closure.dynamic_loader.path;
             argv[1] = "--inhibit-cache";
-            argv[2] = "--library-path";
-            argv[3] = try std.fmt.bufPrint(
+            argv[2] = "--inhibit-rpath";
+            argv[3] = "";
+            argv[4] = "--library-path";
+            argv[5] = try std.fmt.bufPrint(
                 &loader_path,
                 "{s}/loader",
                 .{root},
             );
-            argv[4] = try std.fmt.bufPrint(
+            argv[6] = try std.fmt.bufPrint(
                 &interpreter_path,
                 "{s}/bin/python",
                 .{root},
             );
-            argv[5] = "-s";
-            argv[6] = "-S";
-            argv[7] = "-B";
-            argv[8] = "-P";
-            argv[9] = try std.fmt.bufPrint(
+            argv[7] = "-s";
+            argv[8] = "-S";
+            argv[9] = "-B";
+            argv[10] = "-P";
+            argv[11] = try std.fmt.bufPrint(
                 &launcher_path,
                 "{s}/bootstrap/azure-cli",
                 .{root},
             );
-            argument_offset = 10;
+            argument_offset = 12;
         } else {
             argv[0] = self.programs.path(role);
         }

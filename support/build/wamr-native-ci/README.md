@@ -416,8 +416,11 @@ binds exact launcher/interpreter/manifest artifacts, all module/data/native
 files, the copied dynamic loader and DSOs, the exact controller command set,
 parent and physical metadata, counts/bytes/depth, fixed limits and the isolated
 `-s -S -B -P` policy. It rejects links, special files, unsafe modes/parents and
-Python startup hooks. All allowed Azure command modules are probed
-authority-free before publication, and traversal limits apply before copying.
+Python startup hooks. ELF preparation preserves every `DT_NEEDED` lookup name,
+rejects slash-bearing dependencies, RPATH/RUNPATH and audit/filter dependency
+tags, and requires a loader listing to resolve entirely below the copied DSO
+directory. All allowed Azure command modules are probed authority-free before
+publication, and traversal limits apply before copying.
 The plan also binds a
 campaign UUID, unique
 ledger UUID, retained directory identity, bounded legacy pre-state digest,
@@ -435,11 +438,15 @@ that exact scope, rehashes the copy, and rechecks tool parents, mode, link,
 inode and content before attempt/backend work. Retained native ELF tools run through descriptor snapshots. Before admission
 the controller re-execs in a private user/mount namespace, copies the
 authenticated runtime to bounded tmpfs, remounts it read-only, and drops its
-namespace capabilities. Azure calls execute the retained copied loader with
-only copied DSOs; Python and the bootstrap/modules/data are addressed below a
-retained `/proc/self/fd/N` root. The original source closure and the immutable
-execution copy are rehashed before and after every Azure consumer and final
-cleanup/absence observation.
+namespace capabilities. Exact kernel UID/GID maps, disabled setgroups and
+private mount propagation authenticate the re-exec boundary. Azure calls
+inhibit the loader cache and RPATH, execute the retained copied loader with
+only copied DSOs, and cannot fall back to masked host library directories;
+Python and the bootstrap/modules/data are addressed below a retained
+`/proc/self/fd/N` root. The original source closure, every approved parent and
+the immutable execution copy are revalidated before and after every Azure
+consumer and final cleanup/absence observation. Runtime sealing completes
+before the first campaign-ledger access.
 
 See [WAMR direct compute](../../azure/WAMR-DIRECT-COMPUTE.md) for the private
 export, independent native revalidation, explicit authorization recording,

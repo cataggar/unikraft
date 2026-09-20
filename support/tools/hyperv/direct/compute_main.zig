@@ -7,6 +7,7 @@ pub const wamr_direct_compute = true;
 pub fn main(init: std.process.Init) void {
     _ = std.os.linux.syscall1(.umask, 0o077);
     core.private_files.enterUserNamespaceFromEnvironment(
+        init.io,
         init.environ_map,
     ) catch std.process.exit(1);
     run(init) catch |err| {
