@@ -240,8 +240,15 @@ operator must run `prepare-azure-runtime` with the reviewed Python bootstrap,
 explicit Python ELF, complete standard library and every Azure package import
 root. The prepared interpreter/bootstrap paths and `azure-runtime.json` are
 mandatory in plan, authorization, admission, preflight and execution. WAMR
-executes the retained interpreter with `-s -S -B -P` and passes the retained
-bootstrap through `/proc/self/fd/N`; it does not use `AZ_PYTHON` as authority.
+re-execs itself in a private user/mount namespace before admission, copies the
+already authenticated closure to a bounded tmpfs mounted over the approved
+root, remounts it read-only, and drops namespace capabilities. It invokes the
+retained loader with only the copied DSO directory, then runs Python with
+`-s -S -B -P`; the interpreter, bootstrap, modules, data and extensions are
+addressed below the retained root as `/proc/self/fd/N/...`. It does not use
+`AZ_PYTHON`, the original bootstrap pathname or an ambient loader as execution
+authority. The original root remains retained and rehashed, so later source
+drift still refuses even though it cannot alter executed bytes.
 
 Run this local-only command before obtaining a future live approval:
 

@@ -309,20 +309,26 @@ interpreter; do not pass a shell wrapper that selects Python through
 `AZ_PYTHON`. It copies the bootstrap, Python ELF, complete standard library,
 every repeated Azure package import root and any repeated fixed `--data-root`
 into a private Python home. It discovers the interpreter/native-extension
-ELF dependencies and records them as fixed loader artifacts; an operator may
-add a reviewed dependency with `--native-dependency`. No package download,
-restore or import-root discovery occurs after preparation.
+ELF dependencies, copies the exact dynamic loader and DSOs into the private
+home, and records them as fixed loader artifacts; an operator may add a
+reviewed dependency with `--native-dependency`. No package download, restore
+or import-root discovery occurs after preparation.
 
 The resulting `uk.wamr.azure-cli-runtime-closure` version 1 manifest records
 canonical roles and paths, file/directory counts, bytes, maximum depth,
-content and physical-metadata digests, parent identities, exact
-launcher/interpreter/manifest artifacts and loader dependencies. Current
+content and physical-metadata digests, parent identities, exact launcher,
+interpreter, dynamic-loader and manifest artifacts, the loader dependencies,
+and the closed Azure command set. Current
 limits are 16,384 files, 4,096 directories, 2 GiB total, depth 32, 256 MiB
 per file, 256 loader files and a 32-MiB manifest. Symlinks, special files,
 hard links, set-ID or group/world-writable files and parents, startup `.pth`,
-`sitecustomize.py` and `usercustomize.py` are refused. Preparation runs one
-isolated `az version`, then revalidates the complete closure. Any later
-path/content/mode/identity change invalidates planning or approval.
+`sitecustomize.py` and `usercustomize.py` are refused. Source traversal applies
+the limits before copying or accumulating an unbounded inventory. Preparation
+runs isolated probes for `az version` and every group, disk, deployment, VM,
+boot-diagnostics and resource command the controller can issue, then
+revalidates the complete closure. A missing lazy command module therefore
+refuses before planning. Any later path/content/mode/identity change
+invalidates planning or approval.
 The prepared empty extension directory is also part of the closure;
 `AZURE_EXTENSION_DIR` is fixed to it and dynamic extension installation is
 disabled, so operator config cannot import or restore extension code outside
@@ -521,19 +527,19 @@ directory is mandatory; neither resume nor an automatic retry exists.
 
 Every executable and parent component is canonical, no-follow, retained and
 owned by the effective UID or trusted root; group/world-writable, set-ID,
-non-regular, hard-linked or replaced files refuse. Native ELF uploader,
-validator, supervisor and interpreter execution uses retained sealed
-descriptor snapshots with `execveat`. Azure calls execute only the retained
-Python ELF descriptor. The retained bootstrap descriptor is deliberately
-inherited and named to Python as `/proc/self/fd/N`; neither the Azure script
-pathname nor `AZ_PYTHON` is execution authority. The child uses closure
-`PYTHONHOME` with `-s -S -B -P`, no ambient/user site or `PYTHONPATH`, no
-startup/bytecode hooks, no loader injection and no post-custody package
-restore. The complete module/data/native-loader closure is rehashed
-immediately before and after every Azure consumer, including cleanup and the
-final absence observation. This detects persistent drift at each boundary;
-it does not claim continuous isolation from a hostile same-UID actor between
-those checks.
+non-regular, hard-linked or replaced files refuse. Native ELF uploader, validator and supervisor execution uses retained sealed
+descriptor snapshots with `execveat`. Before admission the controller
+re-execs in a private user/mount namespace, copies the authenticated Azure
+runtime to bounded tmpfs, remounts it read-only, and drops namespace
+capabilities. Azure calls execute the retained copied loader with only copied
+DSOs; Python, bootstrap, modules, data and native extensions are addressed
+below the retained root as `/proc/self/fd/N/...`. Neither the original Azure
+script/interpreter pathname, `AZ_PYTHON`, loader cache nor an ambient library
+path is execution authority. The child uses `-s -S -B -P`, no ambient/user
+site or `PYTHONPATH`, no startup/bytecode hooks, no loader injection and no
+post-custody package restore. Both the original closure and immutable
+execution copy are rehashed immediately before and after every Azure
+consumer, including cleanup and the final absence observation.
 Before Boot2 it revalidates inputs, original Boot1 bytes, VM/disk identities,
 deallocation, scope/expiry and durable start admission. `azure_cumulative`
 allows only the exact Boot1 prefix excluding terminal NUL padding to be

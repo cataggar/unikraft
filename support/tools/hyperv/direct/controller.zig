@@ -13,6 +13,7 @@ const files = core.private_files;
 const Role = observations.Role;
 const Lane = runtime.Lane;
 const launcher = @import("launcher.zig");
+const azure_runtime = @import("azure_runtime.zig");
 
 pub const Inputs = struct {
     scope: []const u8,
@@ -140,6 +141,8 @@ pub const Native = struct {
 /// The installed entry point instantiates Native only. Offline hooks live in a
 /// separate, non-installed executable, never in a CLI/config/environment mode.
 pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, inputs: Inputs) !u8 {
+    if (comptime profile.authorization)
+        try azure_runtime.ensureNamespace(init);
     const a = init.arena.allocator();
     const AdmissionPin = if (profile.authorization) direct.PinnedAdmission else void;
     const Ledger = if (profile.authorization) custody.CampaignLedger else void;
@@ -151,6 +154,8 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
     defer if (comptime profile.authorization) {
         if (campaign_ledger) |value| value.close(init.io);
     };
+    var sealed_runtime: ?azure_runtime.Sealed = null;
+    defer if (sealed_runtime) |value| value.close(init.io);
     if (comptime profile.authorization) {
         admitted = try direct.preAdmission(
             a,
@@ -163,6 +168,11 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
             inputs.programs.supervisor.?,
             inputs.programs.azure_python.?,
             inputs.programs.azure_runtime.?,
+        );
+        sealed_runtime = try azure_runtime.seal(
+            init.gpa,
+            init.io,
+            admitted.?.value().azure_runtime,
         );
         campaign_ledger = try custody.checkEligibility(init.gpa, init.io, admitted.?.value(), inputs.ledger);
     }
@@ -179,6 +189,10 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
         &environment,
         inputs.programs.azure_python,
         runtime_closure,
+        if (comptime profile.authorization)
+            if (sealed_runtime) |*value| value else null
+        else
+            null,
     );
     defer if (interpreter) |value| value.close(init.io);
     const tools: [3]custody.Reference = .{
@@ -259,6 +273,10 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
             .interpreter = interpreter,
             .tool_references = &tools,
             .azure_runtime = runtime_closure,
+            .azure_custody = if (comptime profile.authorization)
+                if (sealed_runtime) |*value| value else null
+            else
+                null,
         },
     };
     defer controller.closeReferences();
