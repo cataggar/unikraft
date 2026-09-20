@@ -117,26 +117,36 @@ pub const Environment = struct {
         try result.azure.put("PYTHONNOUSERSITE", "1");
         try result.azure.put("PYTHONSAFEPATH", "1");
         try result.native.put("LC_ALL", "C");
-        try result.native.put(
-            core.private_files.namespace_marker,
-            core.private_files.namespace_child,
-        );
-        inline for (.{
-            core.private_files.namespace_uid,
-            core.private_files.namespace_gid,
-        }) |key| {
-            if (operator.get(key)) |value|
-                try result.native.put(key, value);
+        if (operator.get(core.private_files.namespace_marker)) |marker| {
+            if (!std.mem.eql(
+                u8,
+                marker,
+                core.private_files.namespace_controller,
+            )) return error.InvalidUserNamespace;
+            try result.native.put(
+                core.private_files.namespace_marker,
+                core.private_files.namespace_child,
+            );
+            inline for (.{
+                core.private_files.namespace_uid,
+                core.private_files.namespace_gid,
+            }) |key| {
+                try result.native.put(
+                    key,
+                    operator.get(key) orelse
+                        return error.InvalidUserNamespace,
+                );
+            }
+            var parent_buffer: [32]u8 = undefined;
+            try result.native.put(
+                core.private_files.namespace_parent,
+                try std.fmt.bufPrint(
+                    &parent_buffer,
+                    "{d}",
+                    .{std.os.linux.getpid()},
+                ),
+            );
         }
-        var parent_buffer: [32]u8 = undefined;
-        try result.native.put(
-            core.private_files.namespace_parent,
-            try std.fmt.bufPrint(
-                &parent_buffer,
-                "{d}",
-                .{std.os.linux.getpid()},
-            ),
-        );
         return result;
     }
 

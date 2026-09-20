@@ -71,7 +71,10 @@ fn verifyControllerNamespace(
             "/proc/{d}/uid_map",
             .{parent},
         ),
-    ) catch return error.InvalidNamespaceParentMap;
+    ) catch |err| switch (err) {
+        error.IdMapMismatch => return error.InvalidNamespaceParentMap,
+        else => return error.InvalidNamespaceParentMapUnavailable,
+    };
     verifyParentInitialIdMap(
         io,
         try std.fmt.bufPrint(
@@ -79,7 +82,10 @@ fn verifyControllerNamespace(
             "/proc/{d}/gid_map",
             .{parent},
         ),
-    ) catch return error.InvalidNamespaceParentMap;
+    ) catch |err| switch (err) {
+        error.IdMapMismatch => return error.InvalidNamespaceParentMap,
+        else => return error.InvalidNamespaceParentMapUnavailable,
+    };
     return verifyNamespace(io, host_uid, host_gid);
 }
 
@@ -101,7 +107,10 @@ fn verifyChildNamespace(
             .{parent},
         ),
         host_uid,
-    ) catch return error.InvalidNamespaceParentMap;
+    ) catch |err| switch (err) {
+        error.IdMapMismatch => return error.InvalidNamespaceParentMap,
+        else => return error.InvalidNamespaceParentMapUnavailable,
+    };
     verifyIdMap(
         io,
         try std.fmt.bufPrint(
@@ -110,7 +119,10 @@ fn verifyChildNamespace(
             .{parent},
         ),
         host_gid,
-    ) catch return error.InvalidNamespaceParentMap;
+    ) catch |err| switch (err) {
+        error.IdMapMismatch => return error.InvalidNamespaceParentMap,
+        else => return error.InvalidNamespaceParentMapUnavailable,
+    };
     var parent_status: [64]u8 = undefined;
     try verifyRestrictedProcess(
         io,
@@ -186,18 +198,28 @@ fn verifyRestrictedProcess(io: std.Io, path: []const u8) !void {
     var status_buffer: [16 * 1024]u8 = undefined;
     const status = try readKernelFile(io, path, &status_buffer);
     var zero_capabilities = false;
+    var zero_permitted = false;
+    var zero_inheritable = false;
+    var zero_ambient = false;
     var no_new_privileges = false;
     var untraced = false;
     var lines = std.mem.splitScalar(u8, status, '\n');
     while (lines.next()) |line| {
         if (std.mem.eql(u8, line, "CapEff:\t0000000000000000"))
             zero_capabilities = true;
+        if (std.mem.eql(u8, line, "CapPrm:\t0000000000000000"))
+            zero_permitted = true;
+        if (std.mem.eql(u8, line, "CapInh:\t0000000000000000"))
+            zero_inheritable = true;
+        if (std.mem.eql(u8, line, "CapAmb:\t0000000000000000"))
+            zero_ambient = true;
         if (std.mem.eql(u8, line, "NoNewPrivs:\t1"))
             no_new_privileges = true;
         if (std.mem.eql(u8, line, "TracerPid:\t0"))
             untraced = true;
     }
-    if (!zero_capabilities or !no_new_privileges or !untraced)
+    if (!zero_capabilities or !zero_permitted or !zero_inheritable or
+        !zero_ambient or !no_new_privileges or !untraced)
         return error.InvalidNamespaceProcessAuthority;
 }
 
@@ -242,7 +264,7 @@ fn verifyFullIdMap(
     );
     if (inside != 0 or outside != outside_expected or
         count != std.math.maxInt(u32) or fields.next() != null)
-        return error.InvalidUserNamespace;
+        return error.IdMapMismatch;
 }
 
 fn verifyIdMap(io: std.Io, path: []const u8, host_id: u32) !void {
@@ -266,7 +288,7 @@ fn verifyIdMap(io: std.Io, path: []const u8, host_id: u32) !void {
     );
     if (inside != 0 or outside != host_id or count != 1 or
         fields.next() != null)
-        return error.InvalidUserNamespace;
+        return error.IdMapMismatch;
 }
 
 fn readKernelId(io: std.Io, path: []const u8) !u32 {
