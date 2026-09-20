@@ -7,6 +7,7 @@ const core = @import("hyperv_core");
 const profile = @import("profile.zig");
 const direct = profile.contract;
 const files = core.private_files;
+const process = core.process;
 const linux = std.os.linux;
 
 pub const Scope = direct.Scope;
@@ -179,6 +180,9 @@ pub const Reference = struct {
     policy: files.FilePolicy,
     metadata: files.Snapshot,
     executable: bool = false,
+    retained: ?files.RetainedFile = null,
+    content_sha256: ?Digest = null,
+    native: ?process.Executable = null,
 
     pub fn artifact(io: std.Io, item: Artifact, policy: files.FilePolicy) !Reference {
         const reference = try open(io, item.path, policy, false);
@@ -191,6 +195,25 @@ pub const Reference = struct {
     }
 
     fn open(io: std.Io, path: []const u8, policy: files.FilePolicy, executable: bool) !Reference {
+        if (executable) {
+            var retained = try files.RetainedFile.open(io, path, .tool);
+            errdefer retained.close(io);
+            const metadata = retained.file_snapshot;
+            const digest = try hashReferenceFile(io, retained.file, metadata);
+            const native = process.Executable.fromFile(io, retained.file) catch |err| switch (err) {
+                error.UnsupportedExecutableFormat => null,
+                else => return err,
+            };
+            return .{
+                .path = path,
+                .policy = .tool,
+                .metadata = metadata,
+                .executable = true,
+                .retained = retained,
+                .content_sha256 = digest,
+                .native = native,
+            };
+        }
         const file = try files.openAbsolute(io, path, policy);
         defer file.close(io);
         const metadata = try files.snapshot(file);
@@ -199,10 +222,52 @@ pub const Reference = struct {
     }
 
     pub fn verify(self: Reference, io: std.Io) !void {
+        if (self.retained) |retained| {
+            retained.verify(io) catch return error.ReferenceChanged;
+            const current = try files.snapshot(retained.file);
+            if (!files.sameSnapshot(self.metadata, current))
+                return error.ReferenceChanged;
+            const digest = try hashReferenceFile(io, retained.file, current);
+            if (!std.crypto.timing_safe.eql(
+                Digest,
+                self.content_sha256 orelse return error.ReferenceChanged,
+                digest,
+            )) return error.ReferenceChanged;
+            return;
+        }
         const current = try open(io, self.path, self.policy, self.executable);
         if (!files.sameSnapshot(self.metadata, current.metadata)) return error.ReferenceChanged;
     }
+
+    pub fn close(self: Reference, io: std.Io) void {
+        if (self.native) |native| native.close(io);
+        if (self.retained) |value| {
+            var retained = value;
+            retained.close(io);
+        }
+    }
 };
+
+fn hashReferenceFile(
+    io: std.Io,
+    file: std.Io.File,
+    expected: files.Snapshot,
+) !Digest {
+    var hash = core.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < expected.size) {
+        const amount: usize = @intCast(@min(@as(u64, buffer.len), expected.size - offset));
+        if (try file.readPositionalAll(io, buffer[0..amount], offset) != amount)
+            return error.ReferenceChanged;
+        hash.update(buffer[0..amount]);
+        offset += amount;
+    }
+    if (try file.readPositionalAll(io, buffer[0..1], expected.size) != 0 or
+        !files.sameSnapshot(expected, try files.snapshot(file)))
+        return error.ReferenceChanged;
+    return hash.finalResult();
+}
 
 pub const References = struct {
     artifacts: [profile.artifacts.len]Reference,
@@ -228,25 +293,212 @@ pub const References = struct {
         for (self.tools) |reference| try reference.verify(io);
         if (self.interpreter) |reference| try reference.verify(io);
     }
+
+    pub fn close(self: References, io: std.Io) void {
+        for (self.tools) |reference| reference.close(io);
+        if (self.interpreter) |reference| reference.close(io);
+    }
 };
 
-pub fn checkEligibility(io: std.Io, scope: Scope, ledger_path: []const u8) !void {
+pub const CampaignLedger = struct {
+    io: std.Io,
+    directory: files.Directory,
+    root: files.Snapshot,
+    marker_pin: ?FileSnapshot = null,
+
+    pub fn close(self: CampaignLedger, io: std.Io) void {
+        self.directory.close(io);
+    }
+
+    fn verifyDirectory(self: CampaignLedger, binding: direct.LedgerBinding) !void {
+        const current = try files.snapshot(.{
+            .handle = self.directory.dir.handle,
+            .flags = .{ .nonblocking = false },
+        });
+        if (self.root.dev_major != current.dev_major or
+            self.root.dev_minor != current.dev_minor or
+            self.root.ino != current.ino or
+            self.root.mode != current.mode or
+            self.root.uid != current.uid or
+            binding.directory.device_major != current.dev_major or
+            binding.directory.device_minor != current.dev_minor or
+            binding.directory.inode != current.ino or
+            binding.directory.uid != current.uid or
+            binding.directory.mode != current.mode & 0o7777)
+            return error.LedgerIdentityChanged;
+        try validatePrivateDirectory(self.directory.dir);
+    }
+
+    fn expectedMarker(
+        binding: direct.LedgerBinding,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        return direct.ledgerMarkerBytes(
+            allocator,
+            binding.campaign_id,
+            binding.ledger_id,
+            binding.initial_state_sha256,
+        );
+    }
+
+    fn inspectMarker(
+        self: CampaignLedger,
+        allocator: std.mem.Allocator,
+        binding: direct.LedgerBinding,
+    ) !FileSnapshot {
+        const expected = try expectedMarker(binding, allocator);
+        defer allocator.free(expected);
+        var bytes = try self.directory.readSensitive(self.io, allocator, direct.ledger_marker_name, 65536, null);
+        defer bytes.deinit();
+        if (!std.mem.eql(u8, bytes.bytes(), expected))
+            return error.InvalidLedgerIdentity;
+        const pin = try hashPrivate(self.io, self.directory, direct.ledger_marker_name, 65536, null);
+        const expected_sha = try core.contracts.parseSha256(binding.marker_sha256);
+        if (!std.crypto.timing_safe.eql(Digest, pin.sha256, expected_sha))
+            return error.InvalidLedgerIdentity;
+        return pin;
+    }
+
+    pub fn verifyIdentity(
+        self: CampaignLedger,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        binding: direct.LedgerBinding,
+    ) !void {
+        _ = io;
+        try self.verifyDirectory(binding);
+        try verifyLedgerSentinel(self.io, self.directory);
+        const expected = self.marker_pin orelse return error.LedgerIdentityMissing;
+        const current = try self.inspectMarker(allocator, binding);
+        if (!FileSnapshot.equal(expected, current))
+            return error.LedgerIdentityChanged;
+    }
+
+    pub fn verifyEligibility(
+        self: *CampaignLedger,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        scope: Scope,
+    ) !void {
+        try self.verifyDirectory(scope.ledger);
+        if (self.marker_pin) |_| {
+            try self.verifyIdentity(allocator, io, scope.ledger);
+        } else {
+            const current = self.inspectMarker(allocator, scope.ledger) catch |err| switch (err) {
+                error.FileNotFound => {
+                    if (!scope.ledger.initialization_required)
+                        return error.LedgerIdentityMissing;
+                    try requireLedgerSentinelAbsent(io, self.directory);
+                    const state = try direct.ledgerStateDigest(allocator, io, self.directory);
+                    if (!std.mem.eql(u8, &state, scope.ledger.initial_state_sha256))
+                        return error.LegacyLedgerChanged;
+                    try checkClaims(io, self.directory.dir, scope);
+                    return;
+                },
+                else => return err,
+            };
+            if (scope.ledger.initialization_required) {
+                verifyLedgerSentinel(io, self.directory) catch |err| {
+                    if (err != error.LedgerSentinelMissing) return err;
+                };
+            } else try verifyLedgerSentinel(io, self.directory);
+            self.marker_pin = current;
+        }
+        try checkClaims(io, self.directory.dir, scope);
+    }
+
+    pub fn initialize(
+        self: *CampaignLedger,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        scope: Scope,
+    ) !void {
+        try self.verifyDirectory(scope.ledger);
+        try checkClaims(io, self.directory.dir, scope);
+        if (self.marker_pin) |expected| {
+            const current = try self.inspectMarker(allocator, scope.ledger);
+            if (!FileSnapshot.equal(expected, current))
+                return error.LedgerIdentityChanged;
+            ensureLedgerSentinel(io, self.directory, scope.ledger.initialization_required) catch |err| {
+                return err;
+            };
+            return;
+        }
+        if (!scope.ledger.initialization_required)
+            return error.LedgerIdentityMissing;
+        try requireLedgerSentinelAbsent(io, self.directory);
+        const state = try direct.ledgerStateDigest(allocator, io, self.directory);
+        if (!std.mem.eql(u8, &state, scope.ledger.initial_state_sha256))
+            return error.LegacyLedgerChanged;
+        const marker_bytes = try expectedMarker(scope.ledger, allocator);
+        defer allocator.free(marker_bytes);
+        createLedgerMarker(io, self.directory, marker_bytes) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+        try ensureLedgerSentinel(io, self.directory, true);
+        self.marker_pin = try self.inspectMarker(allocator, scope.ledger);
+        try self.verifyDirectory(scope.ledger);
+        try checkClaims(io, self.directory.dir, scope);
+    }
+};
+
+pub fn checkEligibility(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scope: Scope,
+    ledger_path: []const u8,
+) !CampaignLedger {
+    if (!profile.authorization)
+        @compileError("campaign ledger identity is authorization-only");
     const ledger = files.Directory.open(io, ledger_path) catch |err| switch (err) {
         error.FileNotFound => return error.CampaignLedgerMissing,
         else => return err,
     };
-    defer ledger.close(io);
-    try validatePrivateDirectory(ledger.dir);
+    errdefer ledger.close(io);
+    try scope.ledger.validate(scope.campaign_id);
+    if (!std.mem.eql(u8, scope.ledger_path, ledger_path))
+        return error.WrongAdmissionInput;
+    const root = try files.snapshot(.{
+        .handle = ledger.dir.handle,
+        .flags = .{ .nonblocking = false },
+    });
+    var result: CampaignLedger = .{
+        .io = io,
+        .directory = ledger,
+        .root = root,
+    };
+    try result.verifyDirectory(scope.ledger);
+    result.marker_pin = result.inspectMarker(allocator, scope.ledger) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (result.marker_pin == null) {
+        if (!scope.ledger.initialization_required)
+            return error.LedgerIdentityMissing;
+        try requireLedgerSentinelAbsent(io, ledger);
+        const state = try direct.ledgerStateDigest(allocator, io, ledger);
+        if (!std.mem.eql(u8, &state, scope.ledger.initial_state_sha256))
+            return error.LegacyLedgerChanged;
+    } else if (scope.ledger.initialization_required) {
+        verifyLedgerSentinel(io, ledger) catch |err| {
+            if (err != error.LedgerSentinelMissing) return err;
+        };
+    } else try verifyLedgerSentinel(io, ledger);
+    try checkClaims(io, ledger.dir, scope);
+    return result;
+}
+
+fn checkClaims(io: std.Io, directory: std.Io.Dir, scope: Scope) !void {
     var buffer: [128]u8 = undefined;
     const attempt_name = try std.fmt.bufPrint(&buffer, "attempt-{s}", .{scope.attempt_id});
-    try requireAbsentDirectory(io, ledger.dir, attempt_name);
+    try requireAbsentDirectory(io, directory, attempt_name);
     const identity_name = if (profile.compute)
         try std.fmt.bufPrint(&buffer, "compute-{s}", .{scope.source_tree})
     else
         try std.fmt.bufPrint(&buffer, "{s}-{s}", .{ scope.run_id, scope.disk_id });
-    try requireAbsentDirectory(io, ledger.dir, identity_name);
+    try requireAbsentDirectory(io, directory, identity_name);
     const digest_name = try std.fmt.bufPrint(&buffer, "sha256-{s}", .{if (profile.compute) scope.os_vhd.sha256 else scope.seed_vhd.sha256});
-    try requireAbsentDirectory(io, ledger.dir, digest_name);
+    try requireAbsentDirectory(io, directory, digest_name);
 }
 
 fn requireAbsentDirectory(io: std.Io, directory: std.Io.Dir, name: []const u8) !void {
@@ -256,6 +508,50 @@ fn requireAbsentDirectory(io: std.Io, directory: std.Io.Dir, name: []const u8) !
     };
     found.close(io);
     return error.PathAlreadyExists;
+}
+
+fn verifyLedgerSentinel(io: std.Io, ledger: files.Directory) !void {
+    const sentinel = ledger.dir.openDir(
+        io,
+        direct.ledger_sentinel_name,
+        .{ .follow_symlinks = false, .iterate = true },
+    ) catch |err| switch (err) {
+        error.FileNotFound => return error.LedgerSentinelMissing,
+        else => return err,
+    };
+    defer sentinel.close(io);
+    try validatePrivateDirectory(sentinel);
+    var iterator = sentinel.iterate();
+    if (try iterator.next(io) != null) return error.InvalidLedgerIdentity;
+}
+
+fn requireLedgerSentinelAbsent(io: std.Io, ledger: files.Directory) !void {
+    verifyLedgerSentinel(io, ledger) catch |err| switch (err) {
+        error.LedgerSentinelMissing => return,
+        else => return err,
+    };
+    return error.LedgerIdentityMissing;
+}
+
+fn ensureLedgerSentinel(
+    io: std.Io,
+    ledger: files.Directory,
+    authorized: bool,
+) !void {
+    verifyLedgerSentinel(io, ledger) catch |err| switch (err) {
+        error.LedgerSentinelMissing => {
+            if (!authorized) return err;
+            const sentinel = createDirectory(io, ledger.dir, direct.ledger_sentinel_name, false);
+            if (sentinel) |directory| {
+                directory.close(io);
+            } else |create_error| {
+                if (create_error != error.PathAlreadyExists)
+                    return create_error;
+            }
+            return verifyLedgerSentinel(io, ledger);
+        },
+        else => return err,
+    };
 }
 
 pub const FileSnapshot = struct {
@@ -316,7 +612,7 @@ pub const Store = struct {
     io: std.Io,
     directory: files.Directory,
     writer: files.Locked,
-    ledger: files.Directory,
+    ledger: if (profile.authorization) CampaignLedger else files.Directory,
     scope: std.json.Parsed(Scope),
     scope_bytes: core.sensitive.Buffer,
     scope_pin: FileSnapshot,
@@ -346,6 +642,74 @@ pub const Store = struct {
     pub fn createFault(allocator: std.mem.Allocator, io: std.Io, source_scope: []const u8, fresh_attempt: []const u8, existing_ledger: []const u8, fault: TestFault) !Store {
         if (!builtin.is_test) @compileError("Fault injection is only available to native tests");
         return createImpl(allocator, io, source_scope, fresh_attempt, existing_ledger, fault);
+    }
+
+    pub fn createAuthorized(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        admission: *direct.PinnedAdmission,
+        fresh_attempt: []const u8,
+        campaign_ledger: CampaignLedger,
+    ) !Store {
+        if (!profile.authorization)
+            @compileError("pinned authorization is unavailable in legacy profiles");
+        var ledger = campaign_ledger;
+        errdefer ledger.close(io);
+        try admission.verify(io);
+        try ledger.verifyEligibility(allocator, io, admission.value());
+        try admission.verify(io);
+        const parent = try files.FileParent.open(io, fresh_attempt, .artifact);
+        defer parent.close(io);
+        const directory = try createDirectory(io, parent.directory, parent.name, false);
+        errdefer directory.close(io);
+        var writer = try directory.lock(io);
+        errdefer writer.close(io);
+        try admission.verify(io);
+        try ledger.verifyEligibility(allocator, io, admission.value());
+        var bytes: core.sensitive.Buffer = .{
+            .allocator = allocator,
+            .storage = try allocator.alloc(u8, admission.bytes.bytes().len + 1),
+            .length = admission.bytes.bytes().len,
+        };
+        errdefer bytes.deinit();
+        @memcpy(bytes.storage[0..bytes.length], admission.bytes.bytes());
+        const scope = try direct.parse(Scope, allocator, bytes.bytes());
+        errdefer scope.deinit();
+        try scope.value.validate();
+        const copied = try writer.createImmutable(io, "scope.json", bytes.bytes());
+        try requireDurable(copied);
+        const pin = try hashPrivate(io, directory, "scope.json", 65536, null);
+        if (!std.crypto.timing_safe.eql(Digest, pin.sha256, admission.digest))
+            return error.HashMismatch;
+        try admission.verify(io);
+        try ledger.verifyEligibility(allocator, io, scope.value);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .directory = directory,
+            .writer = writer,
+            .ledger = ledger,
+            .scope = scope,
+            .scope_bytes = bytes,
+            .scope_pin = pin,
+        };
+    }
+
+    pub fn verifyLedgerEligibility(self: *Store) !void {
+        if (!profile.authorization)
+            @compileError("campaign ledger identity is authorization-only");
+        if (self.consumed) {
+            try self.ledger.verifyIdentity(self.allocator, self.io, self.scope.value.ledger);
+        } else {
+            try self.ledger.verifyEligibility(self.allocator, self.io, self.scope.value);
+        }
+    }
+
+    pub fn initializeLedger(self: *Store) !void {
+        if (!profile.authorization)
+            @compileError("campaign ledger identity is authorization-only");
+        try self.ledger.initialize(self.allocator, self.io, self.scope.value);
+        try self.ledger.verifyIdentity(self.allocator, self.io, self.scope.value.ledger);
     }
 
     fn createImpl(allocator: std.mem.Allocator, io: std.Io, source_scope: []const u8, fresh_attempt: []const u8, existing_ledger: []const u8, fault: ?TestFault) !Store {
@@ -465,30 +829,38 @@ pub const Store = struct {
     }
 
     fn reserveSeed(self: *Store) !void {
-        try validatePrivateDirectory(self.ledger.dir);
-        var ledger_writer = try self.ledger.lock(self.io);
+        if (profile.authorization)
+            try self.ledger.verifyIdentity(self.allocator, self.io, self.scope.value.ledger);
+        const ledger_directory = if (profile.authorization)
+            self.ledger.directory
+        else
+            self.ledger;
+        try validatePrivateDirectory(ledger_directory.dir);
+        var ledger_writer = try ledger_directory.lock(self.io);
         defer ledger_writer.close(self.io);
         const s = self.scope.value;
         var buffer: [128]u8 = undefined;
         const attempt_name = try std.fmt.bufPrint(&buffer, "attempt-{s}", .{s.attempt_id});
-        const attempt = try createDirectory(self.io, self.ledger.dir, attempt_name, self.take(.directory_sync));
+        const attempt = try createDirectory(self.io, ledger_directory.dir, attempt_name, self.take(.directory_sync));
         attempt.close(self.io);
         if (self.take(.after_first_reservation)) return error.Injected;
         const identity_name = if (profile.compute)
             try std.fmt.bufPrint(&buffer, "compute-{s}", .{s.source_tree})
         else
             try std.fmt.bufPrint(&buffer, "{s}-{s}", .{ s.run_id, s.disk_id });
-        const identity = try createDirectory(self.io, self.ledger.dir, identity_name, false);
+        const identity = try createDirectory(self.io, ledger_directory.dir, identity_name, false);
         defer identity.close(self.io);
         if (self.take(.after_identity_reservation)) return error.Injected;
         const digest_name = try std.fmt.bufPrint(&buffer, "sha256-{s}", .{if (profile.compute) s.os_vhd.sha256 else s.seed_vhd.sha256});
-        const digest = try createDirectory(self.io, self.ledger.dir, digest_name, false);
+        const digest = try createDirectory(self.io, ledger_directory.dir, digest_name, false);
         digest.close(self.io);
         var identity_writer = try identity.lock(self.io);
         defer identity_writer.close(self.io);
         try requireDurable(try self.immutable(&identity_writer, "consumed.json", self.scope_bytes.bytes()));
         if (self.take(.ledger_sync)) return error.Injected;
-        try syncDirectory(self.io, self.ledger.dir);
+        try syncDirectory(self.io, ledger_directory.dir);
+        if (profile.authorization)
+            try self.ledger.verifyIdentity(self.allocator, self.io, self.scope.value.ledger);
     }
 
     /// Gate primary effects, in addition to the caller's approval/budget gates.
@@ -958,6 +1330,11 @@ pub const Store = struct {
             result.recording_error = error.AlreadyFinished;
             return result;
         }
+        if (profile.authorization) {
+            self.ledger.verifyIdentity(self.allocator, self.io, self.scope.value.ledger) catch |err| {
+                self.recordingFailed(err);
+            };
+        }
         self.removeCapabilities() catch |err| {
             result.cleanup_error = err;
             outcome.cleanup_exit = 1;
@@ -1009,6 +1386,16 @@ pub const Store = struct {
             result.recording_error = err;
             return result;
         };
+        if (profile.authorization) {
+            self.ledger.verifyIdentity(self.allocator, self.io, self.scope.value.ledger) catch |err| {
+                result.recording_error = err;
+                result.exit_code = if (outcome.primary_exit != 0)
+                    outcome.primary_exit
+                else
+                    1;
+                return result;
+            };
+        }
         requireDurable(result.recording) catch |err| {
             result.recording_error = err;
             return result;
@@ -1110,6 +1497,34 @@ fn createDirectory(io: std.Io, parent: std.Io.Dir, name: []const u8, fail_sync: 
     try syncDirectory(io, child.dir);
     try syncDirectory(io, parent);
     return child;
+}
+
+fn createLedgerMarker(
+    io: std.Io,
+    directory: files.Directory,
+    contents: []const u8,
+) !void {
+    var atomic = try directory.dir.createFileAtomic(
+        io,
+        direct.ledger_marker_name,
+        .{ .permissions = .fromMode(0o600), .replace = false },
+    );
+    defer {
+        if (atomic.file_exists) {
+            const scratch = std.fmt.hex(atomic.file_basename_hex);
+            atomic.dir.deleteFile(io, &scratch) catch {};
+            atomic.file_exists = false;
+        }
+        atomic.deinit(io);
+    }
+    try atomic.file.writePositionalAll(io, contents, 0);
+    try atomic.file.sync(io);
+    try atomic.link(io);
+    atomic.file_exists = false;
+    try syncDirectory(io, atomic.dir);
+    const marker_file = try directory.openFile(io, direct.ledger_marker_name);
+    defer marker_file.close(io);
+    try validatePrivate(marker_file, false);
 }
 
 fn validateCaptureIndex(boot: u8, poll: u8) !void {

@@ -104,8 +104,9 @@ pub const Directory = struct {
     }
 };
 
-pub const FilePolicy = enum { private, artifact };
+pub const FilePolicy = enum { private, artifact, tool };
 pub const Snapshot = linux.Statx;
+pub const retained_path_components = 64;
 
 pub fn snapshot(file: std.Io.File) !Snapshot {
     var result: Snapshot = undefined;
@@ -129,12 +130,160 @@ pub fn sameSnapshot(a: Snapshot, b: Snapshot) bool {
         a.ctime.sec == b.ctime.sec and a.ctime.nsec == b.ctime.nsec;
 }
 
+fn sameDirectoryIdentity(a: Snapshot, b: Snapshot) bool {
+    return a.dev_major == b.dev_major and a.dev_minor == b.dev_minor and
+        a.ino == b.ino and a.mode == b.mode and a.uid == b.uid;
+}
+
 pub fn absoluteFilePath(path: []const u8) !void {
     if (path.len < 2 or path.len > 4095 or path[0] != '/' or path[path.len - 1] == '/')
         return error.UnsafePath;
     var parts = std.mem.splitScalar(u8, path[1..], '/');
     while (parts.next()) |part| try basename(part);
 }
+
+pub const RetainedFile = struct {
+    path: []const u8,
+    policy: FilePolicy,
+    directories: [retained_path_components]std.Io.Dir,
+    directory_snapshots: [retained_path_components]Snapshot,
+    directory_count: usize,
+    file: std.Io.File,
+    file_snapshot: Snapshot,
+
+    pub fn open(io: std.Io, path: []const u8, policy: FilePolicy) !RetainedFile {
+        try absoluteFilePath(path);
+        var result: RetainedFile = undefined;
+        result.path = path;
+        result.policy = policy;
+        result.directory_count = 0;
+        var current = try std.Io.Dir.openDirAbsolute(io, "/", .{
+            .follow_symlinks = false,
+            .iterate = true,
+        });
+        errdefer {
+            if (result.directory_count == 0) current.close(io);
+            var index: usize = 0;
+            while (index < result.directory_count) : (index += 1)
+                result.directories[index].close(io);
+        }
+        try validateDirectory(io, current, false);
+        result.directories[0] = current;
+        result.directory_snapshots[0] = try snapshot(.{
+            .handle = current.handle,
+            .flags = .{ .nonblocking = false },
+        });
+        result.directory_count = 1;
+        const parent_path = std.fs.path.dirname(path).?;
+        if (parent_path.len > 1) {
+            var parts = std.mem.splitScalar(u8, parent_path[1..], '/');
+            while (parts.next()) |part| {
+                try basename(part);
+                if (result.directory_count >= retained_path_components)
+                    return error.UnsafePath;
+                const next = try current.openDir(io, part, .{
+                    .follow_symlinks = false,
+                    .iterate = true,
+                });
+                validateDirectory(io, next, false) catch |err| {
+                    next.close(io);
+                    return err;
+                };
+                current = next;
+                result.directories[result.directory_count] = next;
+                result.directory_snapshots[result.directory_count] = snapshot(.{
+                    .handle = next.handle,
+                    .flags = .{ .nonblocking = false },
+                }) catch |err| {
+                    next.close(io);
+                    return err;
+                };
+                result.directory_count += 1;
+            }
+        }
+        try validateDirectory(
+            io,
+            result.directories[result.directory_count - 1],
+            policy == .private,
+        );
+        result.file = try openFilePolicy(
+            io,
+            result.directories[result.directory_count - 1],
+            std.fs.path.basename(path),
+            policy,
+        );
+        errdefer result.file.close(io);
+        result.file_snapshot = try snapshot(result.file);
+        return result;
+    }
+
+    pub fn close(self: *RetainedFile, io: std.Io) void {
+        self.file.close(io);
+        var index = self.directory_count;
+        while (index > 0) {
+            index -= 1;
+            self.directories[index].close(io);
+        }
+        self.* = undefined;
+    }
+
+    pub fn verify(self: RetainedFile, io: std.Io) !void {
+        if (!sameSnapshot(self.file_snapshot, try snapshot(self.file)))
+            return error.FileChanged;
+        for (0..self.directory_count) |index| {
+            try validateDirectory(
+                io,
+                self.directories[index],
+                self.policy == .private and index + 1 == self.directory_count,
+            );
+            if (!sameDirectoryIdentity(
+                self.directory_snapshots[index],
+                try snapshot(.{
+                    .handle = self.directories[index].handle,
+                    .flags = .{ .nonblocking = false },
+                }),
+            )) return error.FileChanged;
+        }
+        var current = try std.Io.Dir.openDirAbsolute(io, "/", .{
+            .follow_symlinks = false,
+            .iterate = true,
+        });
+        defer current.close(io);
+        if (!sameDirectoryIdentity(
+            self.directory_snapshots[0],
+            try snapshot(.{
+                .handle = current.handle,
+                .flags = .{ .nonblocking = false },
+            }),
+        )) return error.FileChanged;
+        const parent_path = std.fs.path.dirname(self.path).?;
+        var index: usize = 1;
+        if (parent_path.len > 1) {
+            var parts = std.mem.splitScalar(u8, parent_path[1..], '/');
+            while (parts.next()) |part| {
+                const next = try current.openDir(io, part, .{
+                    .follow_symlinks = false,
+                    .iterate = true,
+                });
+                current.close(io);
+                current = next;
+                if (index >= self.directory_count or !sameDirectoryIdentity(
+                    self.directory_snapshots[index],
+                    try snapshot(.{
+                        .handle = current.handle,
+                        .flags = .{ .nonblocking = false },
+                    }),
+                )) return error.FileChanged;
+                index += 1;
+            }
+        }
+        if (index != self.directory_count) return error.FileChanged;
+        const named = try openFilePolicy(io, current, std.fs.path.basename(self.path), self.policy);
+        defer named.close(io);
+        if (!sameSnapshot(self.file_snapshot, try snapshot(named)))
+            return error.FileChanged;
+    }
+};
 
 /// Shared descriptor walk; artifact policy intentionally does not require a
 /// private file mode, current-user ownership or a single hard link.
@@ -181,6 +330,35 @@ pub fn readSensitiveAbsolute(io: std.Io, allocator: std.mem.Allocator, path: []c
     return (Directory{ .dir = parent.directory }).readSensitive(io, allocator, parent.name, maximum, expected);
 }
 
+pub fn readSensitiveFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    maximum: usize,
+    policy: FilePolicy,
+) !sensitive.Buffer {
+    if (maximum == 0 or maximum > 64 * 1024 * 1024)
+        return error.InvalidLimit;
+    switch (policy) {
+        .private => try validateFile(io, file),
+        .artifact => if ((try file.stat(io)).kind != .file)
+            return error.UnsafeFile,
+        .tool => try validateToolFile(file),
+    }
+    const before = try snapshot(file);
+    if (before.size > maximum) return error.FileTooLarge;
+    var result: sensitive.Buffer = .{
+        .allocator = allocator,
+        .storage = try allocator.alloc(u8, @as(usize, @intCast(before.size)) + 1),
+        .length = @intCast(before.size),
+    };
+    errdefer result.deinit();
+    if (try file.readPositionalAll(io, result.storage, 0) != before.size or
+        !sameSnapshot(before, try snapshot(file)))
+        return error.FileChanged;
+    return result;
+}
+
 pub fn openDirectory(io: std.Io, path: []const u8, policy: FilePolicy) !std.Io.Dir {
     if (!std.fs.path.isAbsolute(path) or path.len == 0 or path.len > 4095 or
         (path.len > 1 and path[path.len - 1] == '/')) return error.UnsafePath;
@@ -213,9 +391,12 @@ fn openFilePolicy(io: std.Io, dir: std.Io.Dir, name: []const u8, policy: FilePol
     });
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
     errdefer file.close(io);
-    if (policy == .private) {
-        try validateFile(io, file);
-    } else if ((try file.stat(io)).kind != .file) return error.UnsafeFile;
+    switch (policy) {
+        .private => try validateFile(io, file),
+        .artifact => if ((try file.stat(io)).kind != .file)
+            return error.UnsafeFile,
+        .tool => try validateToolFile(file),
+    }
     return file;
 }
 
@@ -347,6 +528,16 @@ fn validateFileWithLinks(io: std.Io, file: std.Io.File, allow_unlinked: bool) !v
     if (stat.kind != .file or stat.permissions.toMode() & 0o7777 != 0o600 or
         (stat.nlink != 1 and !(allow_unlinked and stat.nlink == 0)) or
         try owner(file.handle) != linux.geteuid()) return error.UnsafeFile;
+}
+
+fn validateToolFile(file: std.Io.File) !void {
+    const value = try snapshot(file);
+    if (value.mode & linux.S.IFMT != linux.S.IFREG or
+        (value.uid != 0 and value.uid != linux.geteuid()) or
+        value.mode & 0o111 == 0 or value.mode & 0o6022 != 0 or
+        value.nlink != 1 or value.size == 0 or
+        value.size > 64 * 1024 * 1024)
+        return error.UnsafeFile;
 }
 
 // File.Stat deliberately omits ownership; request only the missing Linux metadata.

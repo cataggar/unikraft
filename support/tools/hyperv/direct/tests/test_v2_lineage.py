@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -73,16 +74,16 @@ class LineageV2(unittest.TestCase):
         return path
 
     def prepare_contract(self, maximum=100_000_000, decision="approved",
-                         tools=None):
+                         tools=None, stem="", ledger=None):
         self.write_transport()
-        ledger = self.root / "ledger"
+        ledger = ledger or self.root / (stem + "ledger")
         ledger.mkdir(mode=0o700)
         paths = {
-            "plan": self.root / "execution-plan.json",
-            "template": self.root / "approval-template.json",
-            "candidate": self.root / "candidate.json",
-            "authorization": self.root / "authorization.json",
-            "admission": self.root / "admission.json",
+            "plan": self.root / (stem + "execution-plan.json"),
+            "template": self.root / (stem + "approval-template.json"),
+            "candidate": self.root / (stem + "candidate.json"),
+            "authorization": self.root / (stem + "authorization.json"),
+            "admission": self.root / (stem + "admission.json"),
         }
         tools = tools or dict(
             azure=VALIDATOR, uploader=VALIDATOR, validator=VALIDATOR,
@@ -231,7 +232,7 @@ class LineageV2(unittest.TestCase):
             paths["plan"].read_bytes(),
             (json.dumps(plan, sort_keys=True, separators=(",", ":"))
              + "\n").encode())
-        self.assertEqual(plan["version"], 1)
+        self.assertEqual(plan["version"], 2)
         self.assertEqual(plan["authority"], "not_admitted")
         self.assertEqual(plan["cost"], {
             "unit": "micro_usd",
@@ -252,6 +253,8 @@ class LineageV2(unittest.TestCase):
         self.assertEqual(plan["resources"]["maximum_parallelism"], 1)
         self.assertEqual(plan["retry_count"], 0)
         self.assertFalse(any(plan["substitution"].values()))
+        self.assertEqual(plan["ledger"]["campaign_id"], plan["campaign_id"])
+        self.assertTrue(plan["ledger"]["initialization_required"])
         public = public_bundle.members(
             handoff, fixture.read(self.root / "bundle.json"), self.root)
         self.assertEqual(len(public) + 2, 85)
@@ -320,6 +323,19 @@ class LineageV2(unittest.TestCase):
             "poll-time": lambda value: value.update(poll_seconds=9),
             "attempt": lambda value: value.update(
                 attempt_id="dddddddd-dddd-4ddd-addd-dddddddddddd"),
+            "ledger-campaign": lambda value: value["ledger"].update(
+                campaign_id="dddddddd-dddd-4ddd-addd-dddddddddddd"),
+            "ledger-id": lambda value: value["ledger"].update(
+                ledger_id="dddddddd-dddd-4ddd-addd-dddddddddddd"),
+            "ledger-directory": lambda value: value["ledger"][
+                "directory"].update(
+                    inode=value["ledger"]["directory"]["inode"] + 1),
+            "ledger-initialization": lambda value: value["ledger"].update(
+                initialization_required=False),
+            "ledger-pre-state": lambda value: value["ledger"].update(
+                initial_state_sha256="e" * 64),
+            "ledger-marker": lambda value: value["ledger"].update(
+                marker_sha256="e" * 64),
             "source": lambda value: value.update(source_tree="e" * 40),
             "run-attempt": lambda value: value["run"].update(
                 run_attempt="2"),
@@ -479,6 +495,7 @@ class LineageV2(unittest.TestCase):
                 paths["plan"], denied, self.root / "denied-admission.json",
                 **tools)
         self.assertFalse((self.root / "denied-admission.json").exists())
+        self.assertEqual(list((self.root / "ledger").iterdir()), [])
 
     def test_legacy_candidate_cannot_act_as_authorization(self):
         self.write_transport()
@@ -565,8 +582,104 @@ class LineageV2(unittest.TestCase):
             "raise SystemExit(29)\n")
         backend.chmod(0o700)
         return calls, dict(
-            azure=backend, uploader=backend, validator=VALIDATOR,
-            supervisor=SUPERVISOR, az_python=backend)
+            azure=backend, uploader=VALIDATOR, validator=VALIDATOR,
+            supervisor=SUPERVISOR, az_python=VALIDATOR)
+
+    def blocking_backend_tools(self):
+        calls = self.root / "blocking-backend-calls"
+        ready = self.root / "blocking-backend-ready"
+        release = self.root / "blocking-backend-release"
+        backend = self.root / "blocking-azure-fixture"
+        backend.write_text(
+            "#!/usr/bin/python3\n"
+            "import json, pathlib, sys\n"
+            f"calls = pathlib.Path({str(calls)!r})\n"
+            "with calls.open('ab') as stream:\n"
+            "    stream.write((' '.join(sys.argv[1:]) + '\\n').encode())\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == 'version':\n"
+            "    print(json.dumps({'azure-cli':'2.75.0',"
+            "'azure-cli-core':'2.75.0','azure-cli-telemetry':'1.1.0',"
+            "'extensions':{}}))\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(29)\n")
+        backend.chmod(0o700)
+        return calls, ready, release, dict(
+            azure=backend, uploader=VALIDATOR, validator=VALIDATOR,
+            supervisor=SUPERVISOR, az_python=VALIDATOR)
+
+    def controller_command(self, paths, tools, attempt, ledger=None):
+        return [
+            TOOLS / "uk-wamr-direct-compute", paths["admission"], attempt,
+            ledger or self.root / "ledger", tools["azure"],
+            tools["uploader"], tools["validator"], tools["supervisor"],
+            "--az-python", tools["az_python"],
+        ]
+
+    def wait_for(self, path, process, timeout=30):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists():
+                return
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(
+                    f"controller exited before phase gate: "
+                    f"{process.returncode} {stdout!r} {stderr!r}")
+            time.sleep(0.01)
+        process.kill()
+        process.wait()
+        self.fail("controller phase gate timed out")
+
+    def release_gate(self, path):
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, b"release\n")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def run_blocked_controller(self, paths, tools, attempt, ready, release,
+                               mutate, ledger=None):
+        ready.unlink(missing_ok=True)
+        release.unlink(missing_ok=True)
+        command = self.controller_command(
+            paths, tools, attempt, ledger)
+        command[0] = (
+            TOOLS / "wamr-direct-authorization-controller-fixture")
+        process = subprocess.Popen(
+            command,
+            env={
+                "HOME": str(self.root),
+                "UK_WAMR_AUTHORIZATION_GATE_READY": str(ready),
+                "UK_WAMR_AUTHORIZATION_GATE_RELEASE": str(release),
+            },
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.wait_for(ready, process)
+        mutate()
+        self.release_gate(release)
+        stdout, stderr = process.communicate(timeout=60)
+        return process.returncode, stdout, stderr
+
+    def ledger_claims(self, ledger=None):
+        ledger = ledger or self.root / "ledger"
+        return {
+            path.name for path in ledger.iterdir()
+            if path.name.startswith(("attempt-", "compute-", "sha256-"))
+        }
+
+    def marker_value(self, plan):
+        ledger = plan["ledger"]
+        return {
+            "schema": "uk.wamr.azure-campaign-ledger-identity",
+            "version": 1,
+            "purpose": "qcow2-derived-vhd-two-boot",
+            "campaign_id": ledger["campaign_id"],
+            "ledger_id": ledger["ledger_id"],
+            "state": "initialized",
+            "migration": "authorized_legacy_state",
+            "initial_state_sha256": ledger["initial_state_sha256"],
+        }
 
     def test_controller_consumes_exactly_once_only_after_complete_admission(self):
         calls, tools = self.backend_tools()
@@ -586,6 +699,8 @@ class LineageV2(unittest.TestCase):
         }
         plan = fixture.read(paths["plan"])
         self.assertEqual(ledger_names, {
+            "ledger-identity.json",
+            "ledger-identity.initialized",
             "attempt-" + plan["attempt_id"],
             "compute-" + plan["source_tree"],
             "sha256-" + plan["os_vhd"]["sha256"],
@@ -601,6 +716,307 @@ class LineageV2(unittest.TestCase):
         self.assertNotEqual(retried.returncode, 0)
         self.assertFalse((self.root / "retry-attempt").exists())
         self.assertEqual(calls.read_bytes(), before)
+
+    def test_pinned_admission_scope_marker_and_tool_swaps_refuse_before_claim(self):
+        calls, ready, release, tools = self.blocking_backend_tools()
+        paths, _ = self.prepare_contract(tools=tools)
+        backend = tools["azure"]
+        original_backend = backend.read_bytes()
+        original_mode = stat.S_IMODE(backend.stat().st_mode)
+        marker = self.root / "ledger/ledger-identity.json"
+
+        def execute(name, mutate, restore):
+            with self.subTest(name=name):
+                attempt = self.root / (name + "-attempt")
+                try:
+                    status, _, _ = self.run_blocked_controller(
+                        paths, tools, attempt, ready, release, mutate)
+                finally:
+                    restore()
+                self.assertNotEqual(status, 0)
+                self.assertEqual(self.ledger_claims(), set())
+                self.assertEqual(list((self.root / "ledger").iterdir()), [])
+                self.assertFalse(calls.exists())
+
+        execute(
+            "admission-inode-swap",
+            lambda: (
+                paths["admission"].rename(
+                    paths["admission"].with_suffix(".retained")),
+                paths["admission"].write_bytes(
+                    paths["admission"].with_suffix(".retained").read_bytes()),
+                paths["admission"].chmod(0o600),
+            ),
+            lambda: (
+                paths["admission"].unlink(missing_ok=True),
+                paths["admission"].with_suffix(".retained").rename(
+                    paths["admission"]),
+            ),
+        )
+        execute(
+            "admission-path-removed",
+            lambda: paths["admission"].rename(
+                paths["admission"].with_suffix(".retained")),
+            lambda: paths["admission"].with_suffix(".retained").rename(
+                paths["admission"]),
+        )
+        execute(
+            "stored-scope-tamper",
+            lambda: (self.root / "stored-scope-tamper-attempt/scope.json")
+            .write_bytes(b"{}\n"),
+            lambda: None,
+        )
+        execute(
+            "tool-group-writable",
+            lambda: backend.chmod(0o720),
+            lambda: backend.chmod(original_mode),
+        )
+        execute(
+            "tool-world-writable",
+            lambda: backend.chmod(0o702),
+            lambda: backend.chmod(original_mode),
+        )
+        link = backend.with_name("blocking-azure-hardlink")
+        execute(
+            "tool-hardlink",
+            lambda: os.link(backend, link),
+            lambda: link.unlink(missing_ok=True),
+        )
+        execute(
+            "tool-content-change",
+            lambda: backend.write_bytes(original_backend + b"\n"),
+            lambda: (
+                backend.write_bytes(original_backend),
+                backend.chmod(original_mode),
+            ),
+        )
+        execute(
+            "tool-same-content-inode",
+            lambda: (
+                backend.rename(backend.with_suffix(".retained")),
+                backend.write_bytes(original_backend),
+                backend.chmod(original_mode),
+            ),
+            lambda: (
+                backend.unlink(missing_ok=True),
+                backend.with_suffix(".retained").rename(backend),
+            ),
+        )
+        execute(
+            "tool-symlink",
+            lambda: (
+                backend.rename(backend.with_suffix(".retained")),
+                backend.symlink_to(backend.with_suffix(".retained")),
+            ),
+            lambda: (
+                backend.unlink(missing_ok=True),
+                backend.with_suffix(".retained").rename(backend),
+            ),
+        )
+        execute(
+            "tool-path-removed",
+            lambda: backend.rename(backend.with_suffix(".retained")),
+            lambda: backend.with_suffix(".retained").rename(backend),
+        )
+        parent_mode = stat.S_IMODE(backend.parent.stat().st_mode)
+        execute(
+            "tool-parent-group-writable",
+            lambda: backend.parent.chmod(0o770),
+            lambda: backend.parent.chmod(parent_mode),
+        )
+        execute(
+            "tool-parent-world-writable",
+            lambda: backend.parent.chmod(0o777),
+            lambda: backend.parent.chmod(parent_mode),
+        )
+        execute(
+            "marker-concurrent-replacement",
+            lambda: (
+                marker.write_bytes(b"{}\n"),
+                marker.chmod(0o600),
+            ),
+            lambda: marker.unlink(missing_ok=True),
+        )
+
+    def test_ledger_identity_migration_replacements_and_retained_directory(self):
+        calls, ready, release, tools = self.blocking_backend_tools()
+        paths, _ = self.prepare_contract(tools=tools)
+        plan = fixture.read(paths["plan"])
+        ledger = self.root / "ledger"
+
+        stale_paths, _ = self.prepare_contract(
+            tools=tools, stem="stale-")
+        stale_ledger = self.root / "stale-ledger"
+        stale = stale_ledger / "stale"
+        stale.write_text("changed\n")
+        stale.chmod(0o600)
+        stale_attempt = self.root / "stale-ledger-attempt"
+        stale_run = subprocess.run(
+            self.controller_command(
+                stale_paths, tools, stale_attempt, ledger=stale_ledger),
+            env={"HOME": str(self.root)}, capture_output=True, timeout=30)
+        self.assertNotEqual(stale_run.returncode, 0)
+        self.assertFalse(stale_attempt.exists())
+        self.assertFalse(
+            (stale_ledger / "ledger-identity.json").exists())
+        self.assertFalse(calls.exists())
+
+        replacement_paths, _ = self.prepare_contract(
+            tools=tools, stem="replacement-")
+        replacement_ledger = self.root / "replacement-ledger"
+        retained_empty = self.root / "planned-ledger"
+        replacement_ledger.rename(retained_empty)
+        replacement_ledger.mkdir(mode=0o700)
+        replacement_attempt = self.root / "replacement-ledger-attempt"
+        replacement = subprocess.run(
+            self.controller_command(
+                replacement_paths, tools, replacement_attempt,
+                ledger=replacement_ledger),
+            env={"HOME": str(self.root)}, capture_output=True, timeout=30)
+        self.assertNotEqual(replacement.returncode, 0)
+        self.assertFalse(replacement_attempt.exists())
+        self.assertEqual(list(replacement_ledger.iterdir()), [])
+
+        wrong_paths, _ = self.prepare_contract(
+            tools=tools, stem="wrong-")
+        wrong_ledger = self.root / "wrong-ledger"
+        wrong_plan = fixture.read(wrong_paths["plan"])
+        wrong_marker = self.marker_value(wrong_plan)
+        wrong_marker["campaign_id"] = (
+            "dddddddd-dddd-4ddd-addd-dddddddddddd")
+        fixture.write(
+            wrong_ledger / "ledger-identity.json", wrong_marker)
+        wrong = subprocess.run(
+            self.controller_command(
+                wrong_paths, tools, self.root / "wrong-marker-attempt",
+                ledger=wrong_ledger),
+            env={"HOME": str(self.root)}, capture_output=True, timeout=30)
+        self.assertNotEqual(wrong.returncode, 0)
+        self.assertFalse((self.root / "wrong-marker-attempt").exists())
+
+        wrong_id_paths, _ = self.prepare_contract(
+            tools=tools, stem="wrong-id-")
+        wrong_id_ledger = self.root / "wrong-id-ledger"
+        wrong_id_marker = self.marker_value(
+            fixture.read(wrong_id_paths["plan"]))
+        wrong_id_marker["ledger_id"] = (
+            "dddddddd-dddd-4ddd-addd-dddddddddddd")
+        fixture.write(
+            wrong_id_ledger / "ledger-identity.json", wrong_id_marker)
+        wrong_id = subprocess.run(
+            self.controller_command(
+                wrong_id_paths, tools,
+                self.root / "wrong-ledger-id-attempt",
+                ledger=wrong_id_ledger),
+            env={"HOME": str(self.root)}, capture_output=True, timeout=30)
+        self.assertNotEqual(wrong_id.returncode, 0)
+        self.assertFalse(
+            (self.root / "wrong-ledger-id-attempt").exists())
+
+        marker_attempt = self.root / "concurrent-marker-attempt"
+
+        def concurrent_marker():
+            fixture.write(
+                ledger / "ledger-identity.json",
+                self.marker_value(plan))
+            (ledger / "ledger-identity.initialized").mkdir(mode=0o700)
+            paths["admission"].chmod(0o400)
+
+        status, _, _ = self.run_blocked_controller(
+            paths, tools, marker_attempt, ready, release,
+            concurrent_marker)
+        paths["admission"].chmod(0o600)
+        self.assertNotEqual(status, 0)
+        self.assertTrue(marker_attempt.is_dir())
+        self.assertEqual(self.ledger_claims(), set())
+        self.assertEqual(
+            hashlib.sha256(
+                (ledger / "ledger-identity.json").read_bytes()).hexdigest(),
+            plan["ledger"]["marker_sha256"])
+
+        ready.unlink(missing_ok=True)
+        release.unlink(missing_ok=True)
+        retained = self.root / "retained-ledger"
+        retained_attempt = self.root / "retained-directory-attempt"
+        retained_command = self.controller_command(
+            paths, tools, retained_attempt)
+        retained_command[0] = (
+            TOOLS / "wamr-direct-authorization-controller-fixture")
+        process = subprocess.Popen(
+            retained_command,
+            env={
+                "HOME": str(self.root),
+                "UK_WAMR_AUTHORIZATION_GATE_READY": str(ready),
+                "UK_WAMR_AUTHORIZATION_GATE_RELEASE": str(release),
+            },
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.wait_for(ready, process)
+        ledger.rename(retained)
+        ledger.mkdir(mode=0o700)
+        self.release_gate(release)
+        retained_stdout, retained_stderr = process.communicate(timeout=60)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(list(ledger.iterdir()), [])
+        self.assertEqual(
+            len(self.ledger_claims(retained)), 3,
+            (retained_stdout, retained_stderr,
+             (retained_attempt / "driver.stderr").read_text(),
+             {
+                 path.name: path.read_text()
+                 for path in retained_attempt.glob("*.stderr")
+             }))
+        self.assertTrue(
+            calls.exists(),
+            (retained_stdout, retained_stderr,
+             (retained_attempt / "driver.stderr").read_text(),
+             sorted(path.name for path in retained_attempt.iterdir())))
+
+        future = {
+            name: self.root / ("future-" + name + ".json")
+            for name in (
+                "plan", "template", "candidate", "authorization",
+                "admission")
+        }
+        handoff.plan(
+            self.root / "bundle.json", future["plan"], future["template"],
+            future["candidate"], campaign_id=plan["campaign_id"],
+            ledger=retained,
+            subscription="bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb",
+            prefix="future-authorized-fixture",
+            maximum_authorized_cost_microusd=10_000_000,
+            azure=tools["azure"], uploader=tools["uploader"],
+            validator=tools["validator"], supervisor=tools["supervisor"],
+            az_python=tools["az_python"],
+            attempt_id="dddddddd-dddd-4ddd-addd-dddddddddddd",
+            created_unix=int(time.time()))
+        future_plan = fixture.read(future["plan"])
+        self.assertFalse(
+            future_plan["ledger"]["initialization_required"])
+        self.assertEqual(
+            future_plan["ledger"]["ledger_id"],
+            plan["ledger"]["ledger_id"])
+        now = int(time.time())
+        handoff.record_authorization(
+            future["plan"], future["template"], future["authorization"],
+            decision="approved", approver="fixture-operator",
+            reference="cataggar/unikraft#170-future",
+            recorded_unix=now - 1, expires_unix=now + 600, **tools)
+        handoff.admission(
+            future["plan"], future["authorization"],
+            future["admission"], **tools)
+        (retained / "ledger-identity.json").unlink()
+        calls_before = calls.read_bytes()
+        missing_attempt = self.root / "missing-initialized-marker-attempt"
+        missing = subprocess.run(
+            self.controller_command(
+                future, tools, missing_attempt, ledger=retained),
+            env={"HOME": str(self.root)}, capture_output=True, timeout=30)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertFalse(missing_attempt.exists())
+        self.assertFalse((retained / "ledger-identity.json").exists())
+        self.assertTrue(
+            (retained / "ledger-identity.initialized").is_dir())
+        self.assertEqual(calls.read_bytes(), calls_before)
 
     def test_malformed_authorization_has_zero_ledger_backend_and_attempt_calls(self):
         calls, tools = self.backend_tools()

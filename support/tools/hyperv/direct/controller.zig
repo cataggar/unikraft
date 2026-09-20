@@ -138,9 +138,16 @@ pub const Native = struct {
 /// separate, non-installed executable, never in a CLI/config/environment mode.
 pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, inputs: Inputs) !u8 {
     const a = init.arena.allocator();
-    const Admission = if (profile.authorization) direct.Admission else void;
-    var admitted: ?std.json.Parsed(Admission) = null;
-    defer if (admitted) |*value| value.deinit();
+    const AdmissionPin = if (profile.authorization) direct.PinnedAdmission else void;
+    const Ledger = if (profile.authorization) custody.CampaignLedger else void;
+    var admitted: ?AdmissionPin = null;
+    defer if (comptime profile.authorization) {
+        if (admitted) |*value| value.deinit(init.io);
+    };
+    var campaign_ledger: ?Ledger = null;
+    defer if (comptime profile.authorization) {
+        if (campaign_ledger) |value| value.close(init.io);
+    };
     if (comptime profile.authorization) {
         admitted = try direct.preAdmission(
             a,
@@ -153,24 +160,32 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
             inputs.programs.supervisor.?,
             inputs.programs.azure_python.?,
         );
-        try custody.checkEligibility(init.io, admitted.?.value, inputs.ledger);
+        campaign_ledger = try custody.checkEligibility(init.gpa, init.io, admitted.?.value(), inputs.ledger);
     }
     var cancellation = try process.SignalCancellation.install();
     defer cancellation.deinit();
     var environment = try hooks.environment(a, init.environ_map);
     defer environment.deinit();
     const interpreter = try launcher.selectInterpreter(init.io, &environment, inputs.programs.azure_python);
+    defer if (interpreter) |value| value.close(init.io);
     const tools: [3]custody.Reference = .{
         try custody.Reference.tool(init.io, inputs.programs.azure),
         try custody.Reference.tool(init.io, inputs.programs.uploader),
         try custody.Reference.tool(init.io, inputs.programs.validator),
     };
+    defer for (tools) |value| value.close(init.io);
     const supervisor = if (inputs.programs.supervisor) |path|
         try custody.Reference.tool(init.io, path)
     else
         null;
+    defer if (supervisor) |value| value.close(init.io);
     if (comptime profile.authorization) {
-        const scope = admitted.?.value;
+        if (tools[1].native == null or tools[2].native == null or
+            supervisor.?.native == null or interpreter.?.native == null)
+            return error.NativeToolRequired;
+    }
+    if (comptime profile.authorization) {
+        const scope = admitted.?.value();
         inline for (.{ "azure", "uploader", "validator" }, 0..) |name, index| {
             try direct.inspectArtifact(init.io, @field(scope.tools, name));
             try tools[index].verify(init.io);
@@ -180,10 +195,31 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
         try direct.inspectArtifact(init.io, scope.tools.az_python);
         try interpreter.?.verify(init.io);
     }
-    const source = try files.openAbsolute(init.io, inputs.scope, .private);
-    defer source.close(init.io);
-    const source_pin: custody.Reference = .{ .path = inputs.scope, .policy = .private, .metadata = try files.snapshot(source) };
-    var store = try custody.Store.create(init.gpa, init.io, inputs.scope, inputs.attempt, inputs.ledger);
+    var source_file: ?std.Io.File = null;
+    defer if (source_file) |file| file.close(init.io);
+    const Source = if (profile.authorization) *direct.PinnedAdmission else custody.Reference;
+    const source_pin: Source = if (comptime profile.authorization)
+        &admitted.?
+    else source: {
+        const source = try files.openAbsolute(init.io, inputs.scope, .private);
+        source_file = source;
+        break :source .{
+            .path = inputs.scope,
+            .policy = .private,
+            .metadata = try files.snapshot(source),
+        };
+    };
+    if (comptime profile.authorization) {
+        try admitted.?.verify(init.io);
+        for (tools) |tool| try tool.verify(init.io);
+        try supervisor.?.verify(init.io);
+        try interpreter.?.verify(init.io);
+    }
+    var store = if (comptime profile.authorization) store: {
+        const ledger = campaign_ledger.?;
+        campaign_ledger = null;
+        break :store try custody.Store.createAuthorized(init.gpa, init.io, &admitted.?, inputs.attempt, ledger);
+    } else try custody.Store.create(init.gpa, init.io, inputs.scope, inputs.attempt, inputs.ledger);
     defer store.close();
     try source_pin.verify(init.io);
     var budgets = runtime.Budgets.start(store.scope.value) catch return 1;
@@ -208,8 +244,12 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
             .budgets = &budgets,
             .cancellation = &cancellation,
             .interpreter = interpreter,
+            .tool_references = &tools,
         },
     };
+    defer controller.closeReferences();
+    if (comptime @hasDecl(Hooks, "beforeStartup"))
+        try hooks.beforeStartup(init.io);
     try controller.runtime.initialize();
     controller.primary() catch |err| {
         if (controller.primary_exit == 0) controller.primary_exit = errorExit(err, &cancellation);
@@ -254,7 +294,7 @@ fn Controller(comptime Hooks: type) type {
         hooks: Hooks,
         store: *custody.Store,
         expected: observations.Expectations,
-        source: custody.Reference,
+        source: if (profile.authorization) *direct.PinnedAdmission else custody.Reference,
         runtime: runtime.Runtime,
         references: ?Hooks.References = null,
         tools: ?[3]custody.Reference = null,
@@ -307,13 +347,25 @@ fn Controller(comptime Hooks: type) type {
             try self.store.event(phase);
         }
 
+        fn closeReferences(self: *Self) void {
+            if (self.references) |references| {
+                if (comptime @hasDecl(Hooks.References, "close"))
+                    references.close(self.io);
+                self.references = null;
+            }
+        }
+
         fn stopped(self: *Self) !void {
             if (self.runtime.cancellation.flag().load(.acquire)) return error.Cancelled;
         }
 
         fn verifyTools(self: *Self) !void {
             try local.verifyDirectory(self.io, self.store.directory, self.inputs.attempt);
-            try local.verifyDirectory(self.io, self.store.ledger, self.inputs.ledger);
+            if (comptime profile.authorization) {
+                try self.store.verifyLedgerEligibility();
+            } else {
+                try local.verifyDirectory(self.io, self.store.ledger, self.inputs.ledger);
+            }
             try local.verifyLock(self.io, &self.store.writer);
             if (self.tools) |tools| {
                 for (tools) |tool| try tool.verify(self.io);
@@ -398,7 +450,12 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn validate(self: *Self, lane: Lane, label: []const u8, verb: enum { scope, inputs, json, serial }, extra: []const []const u8) !u8 {
-            const command = if (profile.legacy_fixture and verb == .scope) "legacy-scope" else @tagName(verb);
+            const command = if (profile.authorization and verb == .scope)
+                "stored-scope"
+            else if (profile.legacy_fixture and verb == .scope)
+                "legacy-scope"
+            else
+                @tagName(verb);
             const args = try std.mem.concat(self.a, []const u8, &.{ &.{ command, try self.path("scope.json") }, extra });
             return self.callWithPolicy(lane, .validator, if (verb == .serial) .serial_parser else .required, label, args, "stdout");
         }
@@ -477,15 +534,28 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn primary(self: *Self) !void {
+            const validation_scope = if (comptime profile.authorization)
+                try self.fmt("{s}/scope.json", .{self.inputs.attempt})
+            else
+                self.inputs.scope;
             try self.required(try self.call(.primary, .validator, "source-scope-check", &.{
-                if (comptime profile.legacy_fixture) "legacy-scope" else "scope",
-                self.inputs.scope,
+                if (comptime profile.authorization)
+                    "stored-scope"
+                else if (comptime profile.legacy_fixture)
+                    "legacy-scope"
+                else
+                    "scope",
+                validation_scope,
             }, "stdout"));
-            try self.required(try self.call(.primary, .validator, "ledger-check", &.{
-                if (comptime profile.legacy_fixture) "legacy-ledger" else "ledger",
-                self.inputs.scope,
-                self.inputs.ledger,
-            }, "stdout"));
+            if (comptime profile.authorization) {
+                try self.store.verifyLedgerEligibility();
+            } else {
+                try self.required(try self.call(.primary, .validator, "ledger-check", &.{
+                    if (comptime profile.legacy_fixture) "legacy-ledger" else "ledger",
+                    validation_scope,
+                    self.inputs.ledger,
+                }, "stdout"));
+            }
             try self.required(try self.validate(.primary, "scope-check", .scope, &.{}));
             try self.event(.@"local-admission");
             self.references = try self.hooks.references(self.io, self.expected.scope, self.inputs.programs);
@@ -507,6 +577,10 @@ fn Controller(comptime Hooks: type) type {
                 return err;
             };
             try self.verifyPrimary();
+            if (comptime profile.authorization) {
+                try self.store.initializeLedger();
+                try self.verifyPrimary();
+            }
             _ = try self.runtime.budgets.call(.primary, .azure);
             try self.store.consume();
             try self.event(if (profile.compute) .@"attempt-consumed" else .@"seed-consumed");

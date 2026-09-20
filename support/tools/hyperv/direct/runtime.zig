@@ -218,6 +218,7 @@ pub const Runtime = struct {
     budgets: *Budgets,
     cancellation: *const process.SignalCancellation,
     interpreter: ?custody.Reference = null,
+    tool_references: ?*const [3]custody.Reference = null,
 
     pub fn verifyInterpreter(self: Runtime) !void {
         if (self.programs.azure_python) |path| {
@@ -233,6 +234,8 @@ pub const Runtime = struct {
     pub fn initialize(self: Runtime) !void {
         try self.programs.validate();
         try self.verifyInterpreter();
+        if (self.tool_references) |references|
+            for (references) |reference| try reference.verify(self.io);
         try process.initialize();
     }
 
@@ -296,7 +299,12 @@ pub const Runtime = struct {
             if (job.kind != .pages or job.cleanup_ms != transfer_cleanup_ms or job.timeout_ms < 1000 or
                 job.timeout_ms > budget.worker_timeout_ms.?) return error.InsufficientTransferBudget;
         }
-        return process.runPrivate(self.allocator, self.io, lock, stdout_name, stderr_name, .{
+        const reference = if (self.tool_references) |references|
+            references[@intFromEnum(role)]
+        else
+            null;
+        if (reference) |value| try value.verify(self.io);
+        const result = try process.runPrivate(self.allocator, self.io, lock, stdout_name, stderr_name, .{
             .process = .{
                 .argv = argv[0 .. arguments.len + 1],
                 .environment = if (role == .azure) &self.environment.azure else &self.environment.native,
@@ -307,10 +315,14 @@ pub const Runtime = struct {
                 .stderr_limit = if (version_only) 4096 else output_limit,
                 .cancel = if (lane == .primary) self.cancellation.flag() else null,
             },
+            .executable = if (reference) |value| value.native else null,
             .term_grace_ms = if (role == .uploader) transfer_reserve_ms else term_grace_ms,
             .cleanup_deadline = budget.cleanup_deadline,
             .nested_supervisor = role == .uploader,
         });
+        if (reference) |value| try value.verify(self.io);
+        try self.verifyInterpreter();
+        return result;
     }
 };
 

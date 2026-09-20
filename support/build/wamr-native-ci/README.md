@@ -403,11 +403,27 @@ request/report/compute checks, and complete earlier result hashes. Its bundle
 and `handoff.py candidate` output remain `authority=not_admitted`; they do not
 promote this lane's local result to cloud acceptance. For an imported
 version-2 public-source bundle, `handoff.py plan` now creates the separate
-canonical private `uk.wamr.azure-execution-plan` version 1 and pending
+canonical private `uk.wamr.azure-execution-plan` version 2 and pending
 approval template. The plan remains unapproved and requires explicit
 validator, supervisor, Azure CLI, transfer and interpreter paths plus a
-finite integer micro-USD maximum. Metadata-only Actions artifacts cannot be
-used in place of missing raw/VHD/EFI/log bytes.
+finite integer micro-USD maximum. It also binds a campaign UUID, unique
+ledger UUID, retained directory identity, bounded legacy pre-state digest,
+expected marker digest and an explicit `initialization_required` decision.
+Planning never mutates the ledger. A legacy marker is created durably only
+after the exact version-2 authorization/admission, local CLI startup and final
+tool/scope recheck, and before claims; later plans bind that existing identity
+and cannot reinitialize a missing or replaced marker. `--ledger-id` can make the proposed first
+identity explicit; otherwise planning generates a fresh UUID. Metadata-only
+Actions artifacts cannot be used in place of missing raw/VHD/EFI/log bytes.
+
+Admission and every explicit tool path use canonical descriptor-relative
+no-follow custody. The controller retains the admission bytes, stores only
+that exact scope, rehashes the copy, and rechecks tool parents, mode, link,
+inode and content before attempt/backend work. Retained native ELF tools run
+through descriptor snapshots; the Azure script/module and retained explicit
+interpreter are revalidated around every call. Script/module-root custody
+targets accidental persistent on-disk drift, not a privileged actor capable
+of changing module bytes only during a child invocation.
 
 See [WAMR direct compute](../../azure/WAMR-DIRECT-COMPUTE.md) for the private
 export, independent native revalidation, explicit authorization recording,
