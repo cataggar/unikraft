@@ -20,6 +20,15 @@ pub fn main(init: std.process.Init) void {
 fn execute(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     if (arguments.len == 2 and
+        std.mem.eql(u8, arguments[1], "--child-marker-controller"))
+    {
+        azure_runtime.ensureNamespace(init) catch |err| switch (err) {
+            error.AzureRuntimeNamespaceMarkerInvalid => return,
+            else => return err,
+        };
+        return error.ChildMarkerAcceptedByController;
+    }
+    if (arguments.len == 2 and
         std.mem.eql(u8, arguments[1], "--forged-marker"))
     {
         if (init.environ_map.get(core.private_files.namespace_marker) != null) {
@@ -149,7 +158,8 @@ fn execMarked(uid: u32, gid: u32) noreturn {
         "--forged-marker",
     };
     const environment = [_:null]?[*:0]const u8{
-        core.private_files.namespace_marker ++ "=1",
+        core.private_files.namespace_marker ++ "=" ++
+            core.private_files.namespace_controller,
         uid_entry.ptr,
         gid_entry.ptr,
         parent_entry.ptr,
