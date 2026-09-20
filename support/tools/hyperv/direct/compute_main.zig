@@ -35,6 +35,8 @@ fn run(init: std.process.Init) !void {
         try writer.interface.writeAll("Compute candidate revalidated; authority=not_admitted.\n");
         return;
     }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "azure-runtime"))
+        return compute.verifyAzureRuntime(a, init.io, args[2]);
     if (args.len == 3 and std.mem.eql(u8, args[1], "legacy-scope")) {
         const candidate = try compute.loadCandidateScope(a, init.io, args[2]);
         defer candidate.deinit();

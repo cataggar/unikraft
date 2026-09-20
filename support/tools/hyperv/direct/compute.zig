@@ -4,6 +4,7 @@ const std = @import("std");
 const core = @import("hyperv_core");
 const base = @import("main.zig");
 const serial = @import("local_serial");
+const azure_runtime = @import("azure_runtime.zig");
 const c = core.contracts;
 const files = core.private_files;
 pub const Artifact = base.Artifact;
@@ -276,6 +277,26 @@ pub const ApprovalLimits = struct {
     retry_count: u8,
 };
 
+pub const AzureRuntimeApproval = struct {
+    schema: []const u8,
+    version: u8,
+    canonicalization: []const u8,
+    document_sha256: []const u8,
+    python_version: []const u8,
+    manifest: azure_runtime.Artifact,
+    launcher: azure_runtime.Artifact,
+    interpreter: azure_runtime.Artifact,
+    content_sha256: []const u8,
+    metadata_sha256: []const u8,
+    parents_sha256: []const u8,
+    root: []const u8,
+    extensions: []const u8,
+    limits: azure_runtime.Limits,
+    observed: azure_runtime.Observed,
+    loader_dependencies: []azure_runtime.Artifact,
+    isolation: azure_runtime.Isolation,
+};
+
 pub const Plan = struct {
     schema: []const u8,
     version: u8,
@@ -320,6 +341,8 @@ pub const Plan = struct {
     cleanup: CleanupPolicy,
     cost: Cost,
     tools: Tools,
+    azure_runtime_document: Artifact,
+    azure_runtime: azure_runtime.Contract,
 
     pub fn validate(self: Plan) !void {
         if (!eq(self.schema, "uk.wamr.azure-execution-plan") or self.version != 2 or
@@ -363,6 +386,8 @@ pub const Plan = struct {
             self.cleanup,
             self.cost,
             self.tools,
+            self.azure_runtime_document,
+            self.azure_runtime,
         );
     }
 
@@ -374,6 +399,28 @@ pub const Plan = struct {
             .maximum_parallelism = self.resources.maximum_parallelism,
             .boot_count = self.resources.boot_count,
             .retry_count = self.retry_count,
+        };
+    }
+
+    pub fn runtimeBinding(self: Plan) AzureRuntimeApproval {
+        return .{
+            .schema = self.azure_runtime.schema,
+            .version = self.azure_runtime.version,
+            .canonicalization = self.azure_runtime.canonicalization,
+            .document_sha256 = self.azure_runtime_document.sha256,
+            .python_version = self.azure_runtime.python_version,
+            .manifest = self.azure_runtime.manifest,
+            .launcher = self.azure_runtime.launcher,
+            .interpreter = self.azure_runtime.interpreter,
+            .content_sha256 = self.azure_runtime.content_sha256,
+            .metadata_sha256 = self.azure_runtime.metadata_sha256,
+            .parents_sha256 = self.azure_runtime.parents_sha256,
+            .root = self.azure_runtime.root,
+            .extensions = self.azure_runtime.extensions,
+            .limits = self.azure_runtime.limits,
+            .observed = self.azure_runtime.observed,
+            .loader_dependencies = self.azure_runtime.loader_dependencies,
+            .isolation = self.azure_runtime.isolation,
         };
     }
 };
@@ -391,6 +438,7 @@ pub const ApprovalTemplate = struct {
     estimated_cost_upper_bound_microusd: u64,
     maximum_authorized_cost_microusd: u64,
     limits: ApprovalLimits,
+    azure_runtime: AzureRuntimeApproval,
 
     pub fn validate(self: ApprovalTemplate, plan: Plan, plan_sha256: []const u8) !void {
         if (!eq(self.schema, "uk.wamr.azure-execution-approval-template") or
@@ -403,7 +451,8 @@ pub const ApprovalTemplate = struct {
             !eq(self.candidate_sha256, plan.candidate.sha256) or
             self.estimated_cost_upper_bound_microusd != plan.cost.estimated_upper_bound or
             self.maximum_authorized_cost_microusd != plan.cost.maximum_authorized or
-            !std.meta.eql(self.limits, plan.limits()))
+            !std.meta.eql(self.limits, plan.limits()) or
+            !sameRuntimeApproval(self.azure_runtime, plan.runtimeBinding()))
             return error.InvalidApprovalTemplate;
     }
 };
@@ -421,6 +470,7 @@ pub const Authorization = struct {
     estimated_cost_upper_bound_microusd: u64,
     maximum_authorized_cost_microusd: u64,
     limits: ApprovalLimits,
+    azure_runtime: AzureRuntimeApproval,
     approver: []const u8,
     reference: []const u8,
     recorded_unix: u64,
@@ -436,7 +486,8 @@ pub const Authorization = struct {
             !eq(self.candidate_sha256, plan.candidate.sha256) or
             self.estimated_cost_upper_bound_microusd != plan.cost.estimated_upper_bound or
             self.maximum_authorized_cost_microusd != plan.cost.maximum_authorized or
-            !std.meta.eql(self.limits, plan.limits()))
+            !std.meta.eql(self.limits, plan.limits()) or
+            !sameRuntimeApproval(self.azure_runtime, plan.runtimeBinding()))
             return error.InvalidAuthorization;
         try boundedAuthorityText(self.approver, 1, 128);
         try boundedAuthorityText(self.reference, 1, 256);
@@ -498,6 +549,8 @@ pub const Admission = struct {
     cleanup: CleanupPolicy,
     cost: Cost,
     tools: Tools,
+    azure_runtime_document: Artifact,
+    azure_runtime: azure_runtime.Contract,
     approval: struct {
         approver: []const u8,
         reference: []const u8,
@@ -550,6 +603,8 @@ pub const Admission = struct {
             self.cleanup,
             self.cost,
             self.tools,
+            self.azure_runtime_document,
+            self.azure_runtime,
         );
         try boundedAuthorityText(self.approval.approver, 1, 128);
         try boundedAuthorityText(self.approval.reference, 1, 256);
@@ -1292,6 +1347,16 @@ pub fn verifyAdmission(a: std.mem.Allocator, io: std.Io, path: []const u8, requi
     try verifyAdmissionBindings(a, io, admission.value, require_current);
 }
 
+pub fn verifyAzureRuntime(
+    a: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !void {
+    var runtime = try azure_runtime.load(a, io, path);
+    defer runtime.deinit();
+    try azure_runtime.verify(a, io, runtime.value.value);
+}
+
 pub fn inspectAdmission(a: std.mem.Allocator, io: std.Io, admission: Admission) !void {
     const candidate_bytes = try readPrivate(a, io, admission.candidate, 65536);
     defer a.free(candidate_bytes);
@@ -1350,6 +1415,7 @@ pub fn preAdmission(
     validator: []const u8,
     supervisor: []const u8,
     az_python: []const u8,
+    runtime_document: []const u8,
 ) !PinnedAdmission {
     if (legacy_fixture) @compileError("production authorization is unavailable in legacy fixtures");
     var retained = try files.RetainedFile.open(io, path, .private);
@@ -1365,7 +1431,8 @@ pub fn preAdmission(
         !eq(admission.value.tools.uploader.path, uploader) or
         !eq(admission.value.tools.validator.path, validator) or
         !eq(admission.value.tools.supervisor.path, supervisor) or
-        !eq(admission.value.tools.az_python.path, az_python))
+        !eq(admission.value.tools.az_python.path, az_python) or
+        !eq(admission.value.azure_runtime_document.path, runtime_document))
         return error.WrongAdmissionInput;
     var digest: [32]u8 = undefined;
     core.Sha256.hash(bytes.bytes(), &digest, .{});
@@ -1476,6 +1543,24 @@ fn verifyPlanBindings(a: std.mem.Allocator, io: std.Io, plan: Plan) !void {
         !eq(transport.value.inner_zip_sha256, plan.inner_zip_sha256) or
         !eq(transport.value.container_digest, plan.container_digest))
         return error.WrongTransport;
+
+    const runtime_bytes = try readPrivate(
+        a,
+        io,
+        plan.azure_runtime_document,
+        64 * 1024,
+    );
+    defer a.free(runtime_bytes);
+    const runtime_document = try canonicalParsed(
+        azure_runtime.Contract,
+        a,
+        runtime_bytes,
+    );
+    defer runtime_document.deinit();
+    try runtime_document.value.validate();
+    if (!azure_runtime.equal(runtime_document.value, plan.azure_runtime))
+        return error.WrongAzureRuntime;
+    try azure_runtime.verify(a, io, plan.azure_runtime);
 
     inline for (std.meta.fields(Tools)) |member| try inspectTool(io, @field(plan.tools, member.name));
 }
@@ -2378,6 +2463,39 @@ fn sameTools(a: Tools, b: Tools) bool {
         if (!same(@field(a, member.name), @field(b, member.name))) return false;
     return true;
 }
+fn sameAzureArtifact(a: Artifact, b: azure_runtime.Artifact) bool {
+    return eq(a.path, b.path) and a.size == b.size and eq(a.sha256, b.sha256);
+}
+fn sameRuntimeApproval(a: AzureRuntimeApproval, b: AzureRuntimeApproval) bool {
+    if (!eq(a.schema, b.schema) or
+        a.version != b.version or
+        !eq(a.canonicalization, b.canonicalization) or
+        !eq(a.document_sha256, b.document_sha256) or
+        !eq(a.python_version, b.python_version) or
+        !azureRuntimeArtifactEqual(a.manifest, b.manifest) or
+        !azureRuntimeArtifactEqual(a.launcher, b.launcher) or
+        !azureRuntimeArtifactEqual(a.interpreter, b.interpreter) or
+        !eq(a.content_sha256, b.content_sha256) or
+        !eq(a.metadata_sha256, b.metadata_sha256) or
+        !eq(a.parents_sha256, b.parents_sha256) or
+        !eq(a.root, b.root) or
+        !eq(a.extensions, b.extensions) or
+        !std.meta.eql(a.limits, b.limits) or
+        !std.meta.eql(a.observed, b.observed) or
+        !std.meta.eql(a.isolation, b.isolation) or
+        a.loader_dependencies.len != b.loader_dependencies.len)
+        return false;
+    for (a.loader_dependencies, b.loader_dependencies) |left, right|
+        if (!azureRuntimeArtifactEqual(left, right)) return false;
+    return true;
+}
+
+fn azureRuntimeArtifactEqual(
+    a: azure_runtime.Artifact,
+    b: azure_runtime.Artifact,
+) bool {
+    return eq(a.path, b.path) and a.size == b.size and eq(a.sha256, b.sha256);
+}
 fn sameLedger(a: LedgerBinding, b: LedgerBinding) bool {
     return eq(a.schema, b.schema) and a.version == b.version and
         a.purpose == b.purpose and
@@ -2428,7 +2546,9 @@ fn sameAdmissionPlan(admission: Admission, plan: Plan) bool {
         std.meta.eql(admission.substitution, plan.substitution) and
         std.meta.eql(admission.cleanup, plan.cleanup) and
         std.meta.eql(admission.cost, plan.cost) and
-        sameTools(admission.tools, plan.tools);
+        sameTools(admission.tools, plan.tools) and
+        same(admission.azure_runtime_document, plan.azure_runtime_document) and
+        azure_runtime.equal(admission.azure_runtime, plan.azure_runtime);
 }
 
 fn commonPlan(
@@ -2467,6 +2587,8 @@ fn commonPlan(
     cleanup: CleanupPolicy,
     cost: Cost,
     tools: Tools,
+    runtime_document: Artifact,
+    runtime_closure: azure_runtime.Contract,
 ) !void {
     try uuid(attempt_id);
     try uuid(campaign_id);
@@ -2536,6 +2658,11 @@ fn commonPlan(
         if (item.size == 0 or item.size > 64 * 1024 * 1024)
             return error.InvalidTool;
     }
+    try artifact(runtime_document);
+    try runtime_closure.validate();
+    if (!sameAzureArtifact(tools.azure, runtime_closure.launcher) or
+        !sameAzureArtifact(tools.az_python, runtime_closure.interpreter))
+        return error.InvalidAzureRuntime;
 }
 
 pub fn recomputeCost(resources: Resources, runtime_seconds: u32, cleanup_seconds: u32) !u64 {

@@ -236,6 +236,22 @@ python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
   --container-digest "$CONTAINER_DIGEST"
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" handoff \
   "$PRIVATE_PARENT/FRESH-imported-image/bundle.json"
+
+# Before planning, materialize the reviewed Python/Azure import environment.
+# REVIEWED_AZURE_IMPORT_ROOT is an import root (for example a reviewed,
+# reduced site-packages tree), not a package directory whose basename is
+# needed for import. Repeat --package-root for every distinct import root.
+python3 support/build/wamr-native-ci/handoff.py prepare-azure-runtime \
+  --output "$PRIVATE_PARENT/FRESH-azure-runtime" \
+  --azure "$REVIEWED_PYTHON_AZURE_BOOTSTRAP" \
+  --az-python "$REVIEWED_CANONICAL_PYTHON_SOURCE" \
+  --stdlib "$REVIEWED_PYTHON_STDLIB_ROOT" \
+  --package-root "$REVIEWED_AZURE_IMPORT_ROOT" \
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate"
+REVIEWED_CANONICAL_AZ="$PRIVATE_PARENT/FRESH-azure-runtime/runtime/bootstrap/azure-cli"
+REVIEWED_CANONICAL_PYTHON="$PRIVATE_PARENT/FRESH-azure-runtime/runtime/bin/python"
+REVIEWED_AZURE_RUNTIME="$PRIVATE_PARENT/FRESH-azure-runtime/azure-runtime.json"
+
 mkdir -m 700 "$PRIVATE_PARENT/ORIGINAL-campaign-ledger"
 PROPOSED_LEDGER_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 python3 support/build/wamr-native-ci/handoff.py plan \
@@ -253,7 +269,8 @@ python3 support/build/wamr-native-ci/handoff.py plan \
   --uploader "$EXPLICIT_UK_HYPERV_TRANSFER_CLI" \
   --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
   --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
-  --az-python "$REVIEWED_CANONICAL_PYTHON"
+  --az-python "$REVIEWED_CANONICAL_PYTHON" \
+  --azure-runtime "$REVIEWED_AZURE_RUNTIME"
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" plan \
   "$PRIVATE_PARENT/FRESH-execution-plan.json" \
   "$PRIVATE_PARENT/FRESH-approval-template.json"
@@ -285,6 +302,31 @@ digest above; they are not claimed to be independently reproducible.
 It preserves original bytes and request hashes, changes only the handoff's
 local file references, and invokes native production revalidation. An
 incomplete import never publishes the final operator `bundle.json`.
+
+`prepare-azure-runtime` is create-only and authority-free. Its `--azure`
+input must be a reviewed Python bootstrap that can be run by the explicit
+interpreter; do not pass a shell wrapper that selects Python through
+`AZ_PYTHON`. It copies the bootstrap, Python ELF, complete standard library,
+every repeated Azure package import root and any repeated fixed `--data-root`
+into a private Python home. It discovers the interpreter/native-extension
+ELF dependencies and records them as fixed loader artifacts; an operator may
+add a reviewed dependency with `--native-dependency`. No package download,
+restore or import-root discovery occurs after preparation.
+
+The resulting `uk.wamr.azure-cli-runtime-closure` version 1 manifest records
+canonical roles and paths, file/directory counts, bytes, maximum depth,
+content and physical-metadata digests, parent identities, exact
+launcher/interpreter/manifest artifacts and loader dependencies. Current
+limits are 16,384 files, 4,096 directories, 2 GiB total, depth 32, 256 MiB
+per file, 256 loader files and a 32-MiB manifest. Symlinks, special files,
+hard links, set-ID or group/world-writable files and parents, startup `.pth`,
+`sitecustomize.py` and `usercustomize.py` are refused. Preparation runs one
+isolated `az version`, then revalidates the complete closure. Any later
+path/content/mode/identity change invalidates planning or approval.
+The prepared empty extension directory is also part of the closure;
+`AZURE_EXTENSION_DIR` is fixed to it and dynamic extension installation is
+disabled, so operator config cannot import or restore extension code outside
+the reviewed runtime.
 
 ## Versioned finite-cost authorization
 
@@ -348,7 +390,8 @@ python3 support/build/wamr-native-ci/handoff.py record-authorization \
   --uploader "$EXPLICIT_UK_HYPERV_TRANSFER_CLI" \
   --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
   --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
-  --az-python "$REVIEWED_CANONICAL_PYTHON"
+  --az-python "$REVIEWED_CANONICAL_PYTHON" \
+  --azure-runtime "$REVIEWED_AZURE_RUNTIME"
 python3 support/build/wamr-native-ci/handoff.py admit \
   --plan "$PRIVATE_PARENT/FRESH-execution-plan.json" \
   --authorization "$PRIVATE_PARENT/FRESH-authorization.json" \
@@ -357,13 +400,19 @@ python3 support/build/wamr-native-ci/handoff.py admit \
   --uploader "$EXPLICIT_UK_HYPERV_TRANSFER_CLI" \
   --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
   --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
-  --az-python "$REVIEWED_CANONICAL_PYTHON"
+  --az-python "$REVIEWED_CANONICAL_PYTHON" \
+  --azure-runtime "$REVIEWED_AZURE_RUNTIME"
 ```
 
 `uk.wamr.azure-execution-authorization` version 2 binds the exact plan SHA-256,
 attempt, campaign and ledger UUIDs, ledger-initialization decision, candidate
 digest, estimated and maximum micro-USD values, resource and time limits,
-decision, bounded approver/reference and a maximum one-hour window.
+decision, bounded approver/reference and a maximum one-hour window. Its
+mandatory runtime binding includes the closure schema/version,
+canonicalization, Python version, document/content/metadata/parent digests,
+exact launcher/interpreter/manifest artifacts, limits, observed totals,
+loader dependency artifacts and isolation policy; there is no optional module
+field or best-effort fallback.
 `uk.wamr.azure-execution-admission` version 2 is published only after
 the native validator reopens the plan, authorization, candidate, tools and
 image lineage and finds every binding equal. Unknown fields, duplicate keys,
@@ -389,7 +438,8 @@ umask 077
 mkdir -m 700 "$PRIVATE_PARENT/FRESH-cli-startup"
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-compute" preflight \
   "$PRIVATE_PARENT/FRESH-cli-startup" "$REVIEWED_CANONICAL_AZ" \
-  --az-python "$REVIEWED_CANONICAL_PYTHON"
+  --az-python "$REVIEWED_CANONICAL_PYTHON" \
+  --azure-runtime "$REVIEWED_AZURE_RUNTIME"
 ```
 
 The explicit interpreter is required by the finite-cost route. Use reviewed
@@ -450,7 +500,8 @@ to execute now**) is:
 uk-wamr-direct-compute PRIVATE_ADMISSION_JSON FRESH_ATTEMPT_DIR CAMPAIGN_LEDGER \
   EXPLICIT_AZ_EXECUTABLE EXPLICIT_UK_HYPERV_TRANSFER_CLI \
   EXPLICIT_UK_WAMR_DIRECT_VALIDATE EXPLICIT_WAMR_CI_SUPERVISOR \
-  --az-python EXPLICIT_CANONICAL_INTERPRETER
+    --az-python EXPLICIT_CLOSURE_INTERPRETER \
+    --azure-runtime EXPLICIT_AZURE_RUNTIME_CLOSURE_JSON
 ```
 
 Before creating the attempt directory, the production entry point
@@ -472,14 +523,17 @@ Every executable and parent component is canonical, no-follow, retained and
 owned by the effective UID or trusted root; group/world-writable, set-ID,
 non-regular, hard-linked or replaced files refuse. Native ELF uploader,
 validator, supervisor and interpreter execution uses retained sealed
-descriptor snapshots with `execveat`. The Azure launcher script/module path
-and explicit retained ELF interpreter are content/physical-identity checked
-immediately before and after every call. No tool pathname is reopened as
-native execution authority after admission. Script/module custody deliberately
-uses an accidental on-disk-drift model: retained parent/module-root and script
-identities plus the script content digest must remain stable around the child.
-It does not claim to defeat a privileged actor that can replace module bytes
-only while that child is running.
+descriptor snapshots with `execveat`. Azure calls execute only the retained
+Python ELF descriptor. The retained bootstrap descriptor is deliberately
+inherited and named to Python as `/proc/self/fd/N`; neither the Azure script
+pathname nor `AZ_PYTHON` is execution authority. The child uses closure
+`PYTHONHOME` with `-s -S -B -P`, no ambient/user site or `PYTHONPATH`, no
+startup/bytecode hooks, no loader injection and no post-custody package
+restore. The complete module/data/native-loader closure is rehashed
+immediately before and after every Azure consumer, including cleanup and the
+final absence observation. This detects persistent drift at each boundary;
+it does not claim continuous isolation from a hostile same-UID actor between
+those checks.
 Before Boot2 it revalidates inputs, original Boot1 bytes, VM/disk identities,
 deallocation, scope/expiry and durable start admission. `azure_cumulative`
 allows only the exact Boot1 prefix excluding terminal NUL padding to be

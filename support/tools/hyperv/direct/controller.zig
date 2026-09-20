@@ -23,7 +23,9 @@ pub const Inputs = struct {
     pub fn parse(args: []const []const u8) !Inputs {
         const fixed: usize = if (profile.authorization) 7 else 6;
         if (comptime profile.authorization) {
-            if (args.len != 9 or !std.mem.eql(u8, args[7], "--az-python"))
+            if (args.len != 11 or
+                !std.mem.eql(u8, args[7], "--az-python") or
+                !std.mem.eql(u8, args[9], "--azure-runtime"))
                 return error.InvalidArguments;
         } else if (args.len != 6 and args.len != 8) {
             return error.InvalidArguments;
@@ -44,6 +46,7 @@ pub const Inputs = struct {
                 .validator = args[5],
                 .supervisor = if (profile.authorization) args[6] else null,
                 .azure_python = if (profile.authorization) args[8] else if (args.len == 8) args[7] else null,
+                .azure_runtime = if (profile.authorization) args[10] else null,
             },
         };
         try result.programs.validate();
@@ -159,6 +162,7 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
             inputs.programs.validator,
             inputs.programs.supervisor.?,
             inputs.programs.azure_python.?,
+            inputs.programs.azure_runtime.?,
         );
         campaign_ledger = try custody.checkEligibility(init.gpa, init.io, admitted.?.value(), inputs.ledger);
     }
@@ -166,7 +170,16 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
     defer cancellation.deinit();
     var environment = try hooks.environment(a, init.environ_map);
     defer environment.deinit();
-    const interpreter = try launcher.selectInterpreter(init.io, &environment, inputs.programs.azure_python);
+    const runtime_closure = if (comptime profile.authorization)
+        admitted.?.value().azure_runtime
+    else
+        null;
+    const interpreter = try launcher.selectInterpreter(
+        init.io,
+        &environment,
+        inputs.programs.azure_python,
+        runtime_closure,
+    );
     defer if (interpreter) |value| value.close(init.io);
     const tools: [3]custody.Reference = .{
         try custody.Reference.tool(init.io, inputs.programs.azure),
@@ -245,6 +258,7 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
             .cancellation = &cancellation,
             .interpreter = interpreter,
             .tool_references = &tools,
+            .azure_runtime = runtime_closure,
         },
     };
     defer controller.closeReferences();

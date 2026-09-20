@@ -98,7 +98,7 @@ test "explicit selected operator environment excludes ambient secrets paths and 
     try source.put("SAS", "?sig=never-inherit");
     try source.put("PATH", "/never/discover");
     try source.put("PYTHONPATH", "/never/discover");
-    inline for (.{ "AZ_PYTHON", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD", "LD_LIBRARY_PATH" }) |key|
+    inline for (.{ "AZ_PYTHON", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "LD_PRELOAD", "LD_LIBRARY_PATH" }) |key|
         try source.put(key, "/never/inherit");
     try source.put("LC_ALL", "other");
     try source.put("AZURE_CORE_COLLECT_TELEMETRY", "1");
@@ -108,7 +108,7 @@ test "explicit selected operator environment excludes ambient secrets paths and 
     try testing.expectEqualStrings("C", environment.azure.get("LC_ALL").?);
     try testing.expectEqualStrings("0", environment.azure.get("AZURE_CORE_COLLECT_TELEMETRY").?);
     try testing.expectEqualStrings("1", environment.azure.get("PYTHONDONTWRITEBYTECODE").?);
-    for ([_][]const u8{ "PRIVATE_SECRET", "SAS", "PATH", "PYTHONPATH", "AZ_PYTHON", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD", "LD_LIBRARY_PATH" }) |key|
+    for ([_][]const u8{ "PRIVATE_SECRET", "SAS", "PATH", "PYTHONPATH", "AZ_PYTHON", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "LD_PRELOAD", "LD_LIBRARY_PATH" }) |key|
         try testing.expect(environment.azure.get(key) == null);
     try testing.expect(environment.native.get("HOME") == null);
     try source.put("HTTPS_PROXY", "https://proxy.invalid?sig=secret");
@@ -128,11 +128,11 @@ test "local version executes self contained and explicitly pinned interpreter un
         var operator = std.process.Environ.Map.init(allocator);
         defer operator.deinit();
         try operator.put("HOME", support.options.test_root.?);
-        inline for (.{ "AZ_PYTHON", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "PRIVATE_SECRET" }) |key|
+        inline for (.{ "AZ_PYTHON", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH", "PRIVATE_SECRET" }) |key|
             try operator.put(key, "/never/inherit");
         var environment = try runtime.Environment.init(allocator, &operator);
         defer environment.deinit();
-        const interpreter = try launcher.selectInterpreter(io, &environment, if (python) executable else null);
+        const interpreter = try launcher.selectInterpreter(io, &environment, if (python) executable else null, null);
         var cancellation = try core.process.SignalCancellation.install();
         defer cancellation.deinit();
         var scope = timingScope();
@@ -174,7 +174,7 @@ test "pinned interpreter changed in place or replaced refuses before child creat
         try operator.put("HOME", support.options.test_root.?);
         var environment = try runtime.Environment.init(allocator, &operator);
         defer environment.deinit();
-        const interpreter = try launcher.selectInterpreter(io, &environment, path);
+        const interpreter = try launcher.selectInterpreter(io, &environment, path, null);
         if (replace) try fixture.directory.dir.deleteFile(io, "python");
         file = try fixture.directory.dir.createFile(io, "python", .{ .permissions = .fromMode(0o700) });
         try file.writePositionalAll(io, if (replace) "synthetic interpreter" else "changed interpreter", 0);

@@ -5,14 +5,31 @@ const core = @import("hyperv_core");
 const custody = @import("custody.zig");
 const runtime = @import("runtime.zig");
 const local = @import("controller_io.zig");
+const azure_runtime = @import("azure_runtime.zig");
 
-pub fn selectInterpreter(io: std.Io, environment: *runtime.Environment, path: ?[]const u8) !?custody.Reference {
+pub fn selectInterpreter(
+    io: std.Io,
+    environment: *runtime.Environment,
+    path: ?[]const u8,
+    closure: ?azure_runtime.Contract,
+) !?custody.Reference {
     if (path) |value| {
         const reference = try custody.Reference.tool(io, value);
         if (reference.metadata.mode & 0o022 != 0) return error.UnsafeInterpreter;
-        try environment.azure.put("AZ_PYTHON", value);
+        if (closure) |runtime_closure| {
+            try environment.azure.put("PYTHONHOME", runtime_closure.root);
+            try environment.azure.put(
+                "AZURE_EXTENSION_DIR",
+                runtime_closure.extensions,
+            );
+            try environment.azure.put(
+                "AZURE_EXTENSION_USE_DYNAMIC_INSTALL",
+                "no",
+            );
+        }
         return reference;
     }
+    if (closure != null) return error.InterpreterNotSelected;
     return null;
 }
 
@@ -119,13 +136,29 @@ pub fn check(adapter: runtime.Runtime, writer: *core.private_files.Locked, azure
 }
 
 pub fn standalone(init: std.process.Init, args: []const []const u8) !u8 {
-    if (args.len != 2 and args.len != 4) return error.InvalidArguments;
+    if (args.len != 2 and args.len != 4 and args.len != 6)
+        return error.InvalidArguments;
     if (args.len == 4 and !std.mem.eql(u8, args[2], "--az-python")) return error.InvalidArguments;
+    if (args.len == 6 and
+        (!std.mem.eql(u8, args[2], "--az-python") or
+            !std.mem.eql(u8, args[4], "--azure-runtime")))
+        return error.InvalidArguments;
+    var closure = if (args.len == 6)
+        try azure_runtime.load(init.gpa, init.io, args[5])
+    else
+        null;
+    defer if (closure) |*value| value.deinit();
+    if (closure) |value| try azure_runtime.verify(
+        init.gpa,
+        init.io,
+        value.value.value,
+    );
     const programs: runtime.Programs = .{
         .azure = args[1],
         .uploader = args[1],
         .validator = args[1],
-        .azure_python = if (args.len == 4) args[3] else null,
+        .azure_python = if (args.len >= 4) args[3] else null,
+        .azure_runtime = if (args.len == 6) args[5] else null,
     };
     try programs.validate();
     const directory = try core.private_files.Directory.open(init.io, args[0]);
@@ -134,8 +167,16 @@ pub fn standalone(init: std.process.Init, args: []const []const u8) !u8 {
     defer writer.close(init.io);
     var environment = try runtime.Environment.init(init.gpa, init.environ_map);
     defer environment.deinit();
-    const interpreter = try selectInterpreter(init.io, &environment, programs.azure_python);
+    const interpreter = try selectInterpreter(
+        init.io,
+        &environment,
+        programs.azure_python,
+        if (closure) |value| value.value.value else null,
+    );
+    defer if (interpreter) |value| value.close(init.io);
     const azure = try custody.Reference.tool(init.io, programs.azure);
+    defer azure.close(init.io);
+    const tool_references: [3]custody.Reference = .{ azure, azure, azure };
     var cancellation = try core.process.SignalCancellation.install();
     defer cancellation.deinit();
     var budgets: runtime.Budgets = .{
@@ -152,6 +193,8 @@ pub fn standalone(init: std.process.Init, args: []const []const u8) !u8 {
         .budgets = &budgets,
         .cancellation = &cancellation,
         .interpreter = interpreter,
+        .tool_references = &tool_references,
+        .azure_runtime = if (closure) |value| value.value.value else null,
     };
     try adapter.initialize();
     try local.verifyDirectory(init.io, directory, args[0]);

@@ -7,6 +7,7 @@ const validator = @import("profile.zig").contract;
 const transfer_job = @import("transfer_job");
 const process = core.process;
 const custody = @import("custody.zig");
+const azure_runtime = @import("azure_runtime.zig");
 
 pub const Role = enum { azure, uploader, validator };
 pub const Lane = enum { primary, cleanup, diagnostic };
@@ -48,6 +49,7 @@ pub const Programs = struct {
     validator: []const u8,
     supervisor: ?[]const u8 = null,
     azure_python: ?[]const u8 = null,
+    azure_runtime: ?[]const u8 = null,
 
     pub fn validate(self: Programs) !void {
         inline for (.{ "azure", "uploader", "validator" }) |field| {
@@ -59,6 +61,10 @@ pub const Programs = struct {
             try publicArgument(path_value);
         }
         if (self.supervisor) |path_value| {
+            try core.private_files.absoluteFilePath(path_value);
+            try publicArgument(path_value);
+        }
+        if (self.azure_runtime) |path_value| {
             try core.private_files.absoluteFilePath(path_value);
             try publicArgument(path_value);
         }
@@ -108,6 +114,8 @@ pub const Environment = struct {
         try result.azure.put("LC_ALL", "C");
         try result.azure.put("AZURE_CORE_COLLECT_TELEMETRY", "0");
         try result.azure.put("PYTHONDONTWRITEBYTECODE", "1");
+        try result.azure.put("PYTHONNOUSERSITE", "1");
+        try result.azure.put("PYTHONSAFEPATH", "1");
         try result.native.put("LC_ALL", "C");
         return result;
     }
@@ -219,15 +227,48 @@ pub const Runtime = struct {
     cancellation: *const process.SignalCancellation,
     interpreter: ?custody.Reference = null,
     tool_references: ?*const [3]custody.Reference = null,
+    azure_runtime: ?azure_runtime.Contract = null,
 
     pub fn verifyInterpreter(self: Runtime) !void {
         if (self.programs.azure_python) |path| {
             const reference = self.interpreter orelse return error.InterpreterNotPinned;
-            if (!std.mem.eql(u8, path, reference.path) or
-                !std.mem.eql(u8, path, self.environment.azure.get("AZ_PYTHON") orelse return error.InterpreterNotSelected))
+            if (!std.mem.eql(u8, path, reference.path))
                 return error.InterpreterChanged;
             try reference.verify(self.io);
-        } else if (self.interpreter != null or self.environment.azure.get("AZ_PYTHON") != null)
+        } else if (self.interpreter != null)
+            return error.UnexpectedInterpreter;
+        if (self.azure_runtime) |closure| {
+            if (self.programs.azure_runtime == null or
+                !std.mem.eql(
+                    u8,
+                    closure.interpreter.path,
+                    self.programs.azure_python orelse
+                        return error.InterpreterNotSelected,
+                ) or
+                !std.mem.eql(u8, closure.launcher.path, self.programs.azure) or
+                !std.mem.eql(
+                    u8,
+                    closure.root,
+                    self.environment.azure.get("PYTHONHOME") orelse
+                        return error.InterpreterNotSelected,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    closure.extensions,
+                    self.environment.azure.get("AZURE_EXTENSION_DIR") orelse
+                        return error.InterpreterNotSelected,
+                ) or
+                !std.mem.eql(
+                    u8,
+                    "no",
+                    self.environment.azure.get(
+                        "AZURE_EXTENSION_USE_DYNAMIC_INSTALL",
+                    ) orelse return error.InterpreterNotSelected,
+                ))
+                return error.InterpreterChanged;
+            try azure_runtime.verify(self.allocator, self.io, closure);
+        } else if (self.programs.azure_runtime != null or
+            self.environment.azure.get("PYTHONHOME") != null)
             return error.UnexpectedInterpreter;
     }
 
@@ -281,10 +322,35 @@ pub const Runtime = struct {
             budget.cleanup_deadline.expires_ns = @min(budget.cleanup_deadline.expires_ns, budget.deadline.expires_ns + (term_grace_ms + reap_ms) * std.time.ns_per_ms);
         }
         if (lane == .primary and self.cancellation.flag().load(.acquire)) return error.Cancelled;
-        if (arguments.len > 127) return error.InvalidArguments;
+        const closure_launch = role == .azure and self.azure_runtime != null;
+        const maximum_arguments: usize = if (closure_launch) 122 else 127;
+        if (arguments.len > maximum_arguments)
+            return error.InvalidArguments;
         var argv: [128][]const u8 = undefined;
-        argv[0] = self.programs.path(role);
-        for (arguments, 1..) |argument, i| {
+        var argument_offset: usize = 1;
+        var launcher_path: [64]u8 = undefined;
+        if (closure_launch) {
+            const interpreter = self.interpreter orelse
+                return error.InterpreterNotPinned;
+            const references = self.tool_references orelse
+                return error.AzureRuntimeNotPinned;
+            const launcher = references[@intFromEnum(Role.azure)].retained orelse
+                return error.AzureRuntimeNotPinned;
+            argv[0] = interpreter.path;
+            argv[1] = "-s";
+            argv[2] = "-S";
+            argv[3] = "-B";
+            argv[4] = "-P";
+            argv[5] = try std.fmt.bufPrint(
+                &launcher_path,
+                "/proc/self/fd/{d}",
+                .{launcher.file.handle},
+            );
+            argument_offset = 6;
+        } else {
+            argv[0] = self.programs.path(role);
+        }
+        for (arguments, argument_offset..) |argument, i| {
             try publicArgument(argument);
             argv[i] = argument;
         }
@@ -304,9 +370,19 @@ pub const Runtime = struct {
         else
             null;
         if (reference) |value| try value.verify(self.io);
-        const result = try process.runPrivate(self.allocator, self.io, lock, stdout_name, stderr_name, .{
+        const executable = if (closure_launch)
+            (self.interpreter orelse return error.InterpreterNotPinned).native
+        else if (reference) |value|
+            value.native
+        else
+            null;
+        const inherited_descriptor = if (closure_launch)
+            (reference.?.retained orelse return error.AzureRuntimeNotPinned).file.handle
+        else
+            null;
+        const result = process.runPrivate(self.allocator, self.io, lock, stdout_name, stderr_name, .{
             .process = .{
-                .argv = argv[0 .. arguments.len + 1],
+                .argv = argv[0 .. arguments.len + argument_offset],
                 .environment = if (role == .azure) &self.environment.azure else &self.environment.native,
                 .cwd = lock.directory.dir,
                 .deadline = budget.deadline,
@@ -314,12 +390,17 @@ pub const Runtime = struct {
                 .stdout_limit = if (version_only) 4096 else output_limit,
                 .stderr_limit = if (version_only) 4096 else output_limit,
                 .cancel = if (lane == .primary) self.cancellation.flag() else null,
+                .inherited_descriptor = inherited_descriptor,
             },
-            .executable = if (reference) |value| value.native else null,
+            .executable = executable,
             .term_grace_ms = if (role == .uploader) transfer_reserve_ms else term_grace_ms,
             .cleanup_deadline = budget.cleanup_deadline,
             .nested_supervisor = role == .uploader,
-        });
+        }) catch |err| {
+            if (reference) |value| try value.verify(self.io);
+            try self.verifyInterpreter();
+            return err;
+        };
         if (reference) |value| try value.verify(self.io);
         try self.verifyInterpreter();
         return result;

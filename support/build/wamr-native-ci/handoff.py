@@ -39,6 +39,13 @@ REPOSITORY_MAXIMUM_COST_MICROUSD = 100_000_000
 ESTIMATED_COST_UPPER_BOUND_MICROUSD = 9_500_000
 FIXED_VHD_BYTES = 66 * 1024 * 1024 + 512
 FIXED_VHD_CAPACITY_BYTES = FIXED_VHD_BYTES - 512
+AZURE_RUNTIME_MAX_FILES = 16_384
+AZURE_RUNTIME_MAX_DIRECTORIES = 4_096
+AZURE_RUNTIME_MAX_BYTES = 2 * 1024 * 1024 * 1024
+AZURE_RUNTIME_MAX_DEPTH = 32
+AZURE_RUNTIME_MAX_FILE_BYTES = 256 * 1024 * 1024
+AZURE_RUNTIME_MAX_LOADER_FILES = 256
+AZURE_RUNTIME_MAX_MANIFEST_BYTES = 32 * 1024 * 1024
 
 
 def private(path):
@@ -51,6 +58,487 @@ def private(path):
 
 def artifact(path):
     return {"path": str(path), "size": path.stat().st_size, "sha256": ci.digest(path)}
+
+
+def _canonical_absolute(path, reason):
+    path = Path(path)
+    raw = str(path)
+    ci.require(path.is_absolute() and os.path.normpath(raw) == raw
+               and "//" not in raw and all(
+                   part not in ("", ".", "..") for part in path.parts[1:]),
+               reason)
+    return path
+
+
+def _physical(info):
+    mtime = divmod(info.st_mtime_ns, 1_000_000_000)
+    ctime = divmod(info.st_ctime_ns, 1_000_000_000)
+    return (
+        os.major(info.st_dev), os.minor(info.st_dev), info.st_ino,
+        info.st_mode, info.st_uid, info.st_gid, info.st_nlink, info.st_size,
+        mtime[0], mtime[1], ctime[0], ctime[1],
+    )
+
+
+def _metadata_line(tag, path, info):
+    return (
+        f"{tag}\t{path}\t"
+        + "\t".join(map(str, _physical(info))) + "\n"
+    ).encode()
+
+
+def _parent_line(path, info):
+    return (
+        f"P\t{path}\t{os.major(info.st_dev)}\t{os.minor(info.st_dev)}\t"
+        f"{info.st_ino}\t{info.st_mode}\t{info.st_uid}\t{info.st_gid}\n"
+    ).encode()
+
+
+def _safe_source_tree(path):
+    path = _canonical_absolute(path, "canonical Azure runtime source required")
+    ci.require(path.resolve(strict=True) == path, "Azure runtime source symlink forbidden")
+    for current, names, files in os.walk(path, topdown=True, followlinks=False):
+        current = Path(current)
+        info = current.lstat()
+        ci.require(stat.S_ISDIR(info.st_mode)
+                   and info.st_uid in (0, os.geteuid())
+                   and not info.st_mode & 0o022,
+                   "unsafe Azure runtime source directory")
+        for name in sorted(names + files):
+            child = current / name
+            child_info = child.lstat()
+            ci.require(not stat.S_ISLNK(child_info.st_mode),
+                       "Azure runtime source symlink forbidden")
+            if stat.S_ISDIR(child_info.st_mode):
+                ci.require(child_info.st_uid in (0, os.geteuid())
+                           and not child_info.st_mode & 0o022,
+                           "unsafe Azure runtime source directory")
+            else:
+                ci.require(stat.S_ISREG(child_info.st_mode)
+                           and child_info.st_uid in (0, os.geteuid())
+                           and not child_info.st_mode & 0o7022
+                           and child_info.st_nlink == 1
+                           and 0 < child_info.st_size
+                           <= AZURE_RUNTIME_MAX_FILE_BYTES,
+                           "unsafe Azure runtime source file")
+                ci.require(
+                    child.suffix != ".pth"
+                    and child.name not in ("sitecustomize.py", "usercustomize.py"),
+                    "Python startup hook forbidden")
+    return path
+
+
+def _copy_runtime_file(source, destination, executable=None):
+    source = _canonical_absolute(source, "canonical Azure runtime file required")
+    info = source.lstat()
+    ci.require(source.resolve(strict=True) == source
+               and stat.S_ISREG(info.st_mode)
+               and info.st_uid in (0, os.geteuid())
+               and not info.st_mode & 0o7022
+               and info.st_nlink == 1
+               and 0 < info.st_size <= AZURE_RUNTIME_MAX_FILE_BYTES,
+               "unsafe Azure runtime file")
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(source, flags)
+    try:
+        before = os.fstat(descriptor)
+        ci.require(
+            _physical(before) == _physical(info),
+            "Azure runtime source changed")
+        with os.fdopen(os.dup(descriptor), "rb") as incoming, \
+                destination.open("xb") as outgoing:
+            os.fchmod(outgoing.fileno(), 0o600)
+            shutil.copyfileobj(incoming, outgoing, 64 * 1024)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        ci.require(
+            _physical(os.fstat(descriptor)) == _physical(before),
+            "Azure runtime source changed")
+        reopened = os.open(source, flags)
+        try:
+            ci.require(
+                _physical(os.fstat(reopened)) == _physical(before),
+                "Azure runtime source changed")
+        finally:
+            os.close(reopened)
+    except OSError as error:
+        raise ci.Refusal("Azure runtime source changed") from error
+    finally:
+        os.close(descriptor)
+    mode = bool(before.st_mode & 0o111) if executable is None else executable
+    destination.chmod(0o500 if mode else 0o400)
+
+
+def _copy_runtime_tree(source, destination, merge=False):
+    source = _safe_source_tree(source)
+    destination.mkdir(mode=0o700, parents=True, exist_ok=merge)
+    for current, names, file_names in os.walk(
+            source, topdown=True, followlinks=False):
+        current = Path(current)
+        relative = current.relative_to(source)
+        target = destination / relative
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for name in sorted(names):
+            child = target / name
+            ci.require(not child.exists(), "Azure runtime tree collision")
+            child.mkdir(mode=0o700)
+        for name in sorted(file_names):
+            child = target / name
+            ci.require(not child.exists(), "Azure runtime tree collision")
+            _copy_runtime_file(current / name, child)
+
+
+def _elf_dependencies(paths):
+    ldd = Path("/usr/bin/ldd")
+    ci.require(ldd.is_file(), "explicit dynamic loader inspection required")
+    dependencies = set()
+    for path in sorted(map(Path, paths)):
+        with path.open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                continue
+        completed = subprocess.run(
+            [str(ldd), str(path)], env={"LC_ALL": "C"},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=60, check=False)
+        ci.require(completed.returncode == 0
+                   and len(completed.stdout) <= 1024 * 1024,
+                   "dynamic loader dependency inspection failed")
+        for raw in completed.stdout.decode("utf-8", "strict").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("linux-vdso."):
+                continue
+            candidate = None
+            if " => " in line:
+                value = line.split(" => ", 1)[1].split(" (", 1)[0]
+                ci.require(value != "not found",
+                           "unresolved native Azure runtime dependency")
+                if value.startswith("/"):
+                    candidate = value
+            elif line.startswith("/"):
+                candidate = line.split(" (", 1)[0]
+            if candidate is not None:
+                resolved = Path(candidate).resolve(strict=True)
+                info = resolved.lstat()
+                ci.require(stat.S_ISREG(info.st_mode)
+                           and info.st_uid in (0, os.geteuid())
+                           and not info.st_mode & 0o7022
+                           and info.st_nlink == 1
+                           and 0 < info.st_size
+                           <= AZURE_RUNTIME_MAX_FILE_BYTES,
+                           "unsafe native Azure runtime dependency")
+                dependencies.add(resolved)
+    ci.require(len(dependencies) <= AZURE_RUNTIME_MAX_LOADER_FILES,
+               "Azure runtime loader dependency limit exceeded")
+    return sorted(dependencies, key=str)
+
+
+def _parent_records(paths):
+    parents = {Path("/")}
+    for path in paths:
+        parent = Path(path).parent
+        while True:
+            parents.add(parent)
+            if parent == Path("/"):
+                break
+            parent = parent.parent
+    result = []
+    for parent in sorted(parents, key=str):
+        ci.require(parent.resolve(strict=True) == parent,
+                   "Azure runtime parent symlink forbidden")
+        info = parent.lstat()
+        ci.require(stat.S_ISDIR(info.st_mode)
+                   and info.st_uid in (0, os.geteuid())
+                   and not info.st_mode & 0o022,
+                   "unsafe Azure runtime parent")
+        result.append((str(parent), info))
+    return result
+
+
+def _runtime_role(relative, launcher, interpreter):
+    path = relative.as_posix()
+    if path == launcher:
+        return "launcher"
+    if path == interpreter:
+        return "interpreter"
+    if ".so" in relative.name:
+        return "native-extension"
+    if path.startswith("lib/"):
+        return "python-module"
+    if path.startswith("share/"):
+        return "fixed-data"
+    return "runtime"
+
+
+def _scan_azure_runtime(root, launcher, interpreter, dependencies):
+    root = Path(root)
+    records = []
+    file_count = 0
+    directory_count = 0
+    total_bytes = 0
+    observed_depth = 0
+    for current, names, file_names in os.walk(
+            root, topdown=True, followlinks=False):
+        current = Path(current)
+        relative_dir = current.relative_to(root)
+        depth = 0 if relative_dir == Path(".") else len(relative_dir.parts)
+        observed_depth = max(observed_depth, depth)
+        directory_count += 1
+        info = current.lstat()
+        ci.require(stat.S_ISDIR(info.st_mode)
+                   and info.st_uid == os.geteuid()
+                   and not info.st_mode & 0o022,
+                   "unsafe prepared Azure runtime directory")
+        relative = Path(".") if relative_dir == Path(".") else relative_dir
+        records.append(("D", relative.as_posix(), info, None))
+        for name in sorted(names + file_names):
+            child = current / name
+            child_info = child.lstat()
+            ci.require(not stat.S_ISLNK(child_info.st_mode),
+                       "prepared Azure runtime symlink forbidden")
+            if stat.S_ISREG(child_info.st_mode):
+                ci.require(child_info.st_uid == os.geteuid()
+                           and not child_info.st_mode & 0o7022
+                           and child_info.st_nlink == 1
+                           and 0 < child_info.st_size
+                           <= AZURE_RUNTIME_MAX_FILE_BYTES,
+                           "unsafe prepared Azure runtime file")
+                file_count += 1
+                total_bytes += child_info.st_size
+                relative = child.relative_to(root).as_posix()
+                records.append(
+                    ("F", relative, child_info, ci.digest(child)))
+    records.sort(key=lambda item: item[1].encode())
+    ci.require(file_count <= AZURE_RUNTIME_MAX_FILES
+               and directory_count <= AZURE_RUNTIME_MAX_DIRECTORIES
+               and total_bytes <= AZURE_RUNTIME_MAX_BYTES
+               and observed_depth <= AZURE_RUNTIME_MAX_DEPTH,
+               "Azure runtime closure limit exceeded")
+
+    content = hashlib.sha256()
+    metadata = hashlib.sha256()
+    manifest = [b"UK-WAMR-AZURE-RUNTIME-CLOSURE\t1\n"]
+    for kind, relative, info, digest in records:
+        content.update(
+            f"C\t{kind}\t{relative}\t{info.st_size}\t"
+            f"{digest or '-'}\n".encode())
+        metadata.update(_metadata_line("M", relative, info))
+        role = _runtime_role(
+            Path(relative),
+            Path(launcher).relative_to(root).as_posix(),
+            Path(interpreter).relative_to(root).as_posix())
+        manifest.append((
+            f"{kind}\t{role}\t{relative}\t"
+            + "\t".join(map(str, _physical(info)))
+            + f"\t{digest or '-'}\n"
+        ).encode())
+    loader_artifacts = []
+    for dependency in dependencies:
+        info = dependency.lstat()
+        digest = ci.digest(dependency)
+        content.update(
+            f"C\tL\t{dependency}\t{info.st_size}\t{digest}\n".encode())
+        metadata.update(_metadata_line("L", str(dependency), info))
+        manifest.append((
+            f"L\tloader-dependency\t{dependency}\t"
+            + "\t".join(map(str, _physical(info)))
+            + f"\t{digest}\n"
+        ).encode())
+        loader_artifacts.append(artifact(dependency))
+
+    parent_hash = hashlib.sha256()
+    for path, info in _parent_records([root, *dependencies]):
+        line = _parent_line(path, info)
+        parent_hash.update(line)
+        manifest.append(line)
+    return {
+        "records": manifest,
+        "loader_dependencies": loader_artifacts,
+        "observed": {
+            "files": file_count,
+            "directories": directory_count,
+            "bytes": total_bytes,
+            "depth": observed_depth,
+            "loader_files": len(loader_artifacts),
+        },
+        "content": content,
+        "metadata": metadata,
+        "parents_sha256": parent_hash.hexdigest(),
+    }
+
+
+def prepare_azure_runtime(output, azure, az_python, stdlib, *,
+                          package_roots=(), data_roots=(),
+                          native_dependencies=(), validator):
+    output = Path(output)
+    private(output.parent)
+    ci.require(not output.exists(), "fresh Azure runtime output required")
+    azure = _canonical_absolute(azure, "canonical Azure launcher required")
+    az_python = _canonical_absolute(
+        az_python, "canonical Azure interpreter required")
+    executable_artifact(azure)
+    executable_artifact(az_python)
+    stdlib = _safe_source_tree(stdlib)
+    python_version = stdlib.name.removeprefix("python")
+    ci.require(stdlib.name.startswith("python")
+               and 3 <= len(stdlib.name) <= 16
+               and len(python_version.split(".")) == 2
+               and all(part.isdigit() and 1 <= len(part) <= 3
+                       for part in python_version.split(".")),
+               "canonical Python stdlib root required")
+
+    output.mkdir(mode=0o700)
+    runtime = output / "runtime"
+    runtime.mkdir(mode=0o700)
+    extensions = runtime / "extensions"
+    extensions.mkdir(mode=0o700)
+    launcher = runtime / "bootstrap/azure-cli"
+    interpreter = runtime / "bin/python"
+    _copy_runtime_file(azure, launcher, executable=True)
+    _copy_runtime_file(az_python, interpreter, executable=True)
+    library = runtime / "lib" / stdlib.name
+    _copy_runtime_tree(stdlib, library)
+    for package_root in package_roots:
+        _copy_runtime_tree(package_root, library, merge=True)
+    for index, data_root in enumerate(data_roots):
+        source = _safe_source_tree(data_root)
+        _copy_runtime_tree(
+            source, runtime / "share" / f"{index:03d}-{source.name}")
+
+    for current, names, file_names in os.walk(
+            runtime, topdown=False, followlinks=False):
+        for name in file_names:
+            path = Path(current) / name
+            mode = 0o500 if path.stat().st_mode & 0o111 else 0o400
+            path.chmod(mode)
+        for name in names:
+            (Path(current) / name).chmod(0o500)
+        Path(current).chmod(0o500)
+
+    manifest = output / "azure-runtime.manifest"
+    record = output / "azure-runtime.json"
+    config = output / "startup-config"
+    config.mkdir(mode=0o700)
+    for path in (manifest, record):
+        with path.open("xb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    native_files = [
+        path for path in runtime.rglob("*")
+        if path.is_file() and (
+            path == interpreter or ".so" in path.name)
+    ]
+    dependencies = set(_elf_dependencies(native_files))
+    for dependency in native_dependencies:
+        dependency = _canonical_absolute(
+            dependency, "canonical native dependency required")
+        ci.require(
+            dependency.resolve(strict=True) == dependency,
+            "native dependency symlink forbidden")
+        info = dependency.lstat()
+        ci.require(
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid in (0, os.geteuid())
+            and not info.st_mode & 0o7022
+            and info.st_nlink == 1
+            and 0 < info.st_size <= AZURE_RUNTIME_MAX_FILE_BYTES,
+            "unsafe native Azure runtime dependency")
+        dependencies.add(dependency)
+    dependencies = sorted(dependencies, key=str)
+    ci.require(len(dependencies) <= AZURE_RUNTIME_MAX_LOADER_FILES,
+               "Azure runtime loader dependency limit exceeded")
+    scan = _scan_azure_runtime(
+        runtime, launcher, interpreter, dependencies)
+
+    with manifest.open("r+b") as stream:
+        stream.truncate(0)
+        for manifest_record in scan["records"]:
+            stream.write(manifest_record)
+        stream.flush()
+        os.fsync(stream.fileno())
+    ci.require(manifest.stat().st_size <= AZURE_RUNTIME_MAX_MANIFEST_BYTES,
+               "Azure runtime manifest limit exceeded")
+    manifest_info = manifest.lstat()
+    manifest_digest = ci.digest(manifest)
+    scan["content"].update(
+        f"C\tA\t{manifest}\t{manifest_info.st_size}\t"
+        f"{manifest_digest}\n".encode())
+    scan["metadata"].update(_metadata_line("A", str(manifest), manifest_info))
+    value = {
+        "schema": "uk.wamr.azure-cli-runtime-closure",
+        "version": 1,
+        "canonicalization": CANONICALIZATION,
+        "root": str(runtime),
+        "python_version": python_version,
+        "extensions": str(extensions),
+        "launcher": executable_artifact(launcher),
+        "interpreter": executable_artifact(interpreter),
+        "manifest": artifact(manifest),
+        "limits": {
+            "files": AZURE_RUNTIME_MAX_FILES,
+            "directories": AZURE_RUNTIME_MAX_DIRECTORIES,
+            "bytes": AZURE_RUNTIME_MAX_BYTES,
+            "depth": AZURE_RUNTIME_MAX_DEPTH,
+            "file_bytes": AZURE_RUNTIME_MAX_FILE_BYTES,
+            "loader_files": AZURE_RUNTIME_MAX_LOADER_FILES,
+        },
+        "observed": scan["observed"],
+        "content_sha256": scan["content"].hexdigest(),
+        "metadata_sha256": scan["metadata"].hexdigest(),
+        "parents_sha256": scan["parents_sha256"],
+        "loader_dependencies": scan["loader_dependencies"],
+        "isolation": {
+            "python_home": "closure_root",
+            "module_layout": "flat_python_home_v1",
+            "extensions": "closure_empty",
+            "dynamic_extension_install": "disabled",
+            "user_site": "disabled",
+            "site_import": "disabled",
+            "bytecode_writes": "disabled",
+            "path_environment": "forbidden",
+            "startup_hooks": "forbidden",
+            "loader_environment": "forbidden",
+            "package_restore": "forbidden_after_custody",
+        },
+    }
+    raw_record = ci.compact_json(value, newline=True)
+    with record.open("r+b") as stream:
+        stream.truncate(0)
+        stream.write(raw_record)
+        stream.flush()
+        os.fsync(stream.fileno())
+    native_validate(validator, "azure-runtime", record)
+    completed = subprocess.run(
+        [
+            str(interpreter), "-s", "-S", "-B", "-P",
+            str(launcher), "version", "--output", "json",
+            "--only-show-errors",
+        ],
+        env={
+            "HOME": str(output),
+            "AZURE_CONFIG_DIR": str(config),
+            "LC_ALL": "C",
+            "AZURE_CORE_COLLECT_TELEMETRY": "0",
+            "AZURE_EXTENSION_DIR": str(extensions),
+            "AZURE_EXTENSION_USE_DYNAMIC_INSTALL": "no",
+            "PYTHONHOME": str(runtime),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONSAFEPATH": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, timeout=30, check=False,
+    )
+    ci.require(completed.returncode == 0
+               and 0 < len(completed.stdout) <= 4096
+               and len(completed.stderr) == 0,
+               "prepared Azure runtime startup failed")
+    native_validate(validator, "azure-runtime", record)
+    return value
 
 
 def result_records(root):
@@ -532,8 +1020,19 @@ def native_json(validator, *arguments):
     return value
 
 
-def exact_tool_bindings(azure, uploader, validator, supervisor, az_python):
-    return {
+def exact_tool_bindings(azure, uploader, validator, supervisor, az_python,
+                        azure_runtime):
+    runtime_path = Path(azure_runtime)
+    private(runtime_path.parent)
+    runtime = canonical_document(runtime_path)
+    ci.require(
+        runtime["schema"] == "uk.wamr.azure-cli-runtime-closure"
+        and runtime["version"] == 1
+        and runtime["launcher"]["path"] == str(azure)
+        and runtime["interpreter"]["path"] == str(az_python),
+        "explicit Azure runtime closure mismatch")
+    native_validate(validator, "azure-runtime", runtime_path)
+    return ({
         name: executable_artifact(Path(path))
         for name, path in (
             ("azure", azure),
@@ -542,15 +1041,43 @@ def exact_tool_bindings(azure, uploader, validator, supervisor, az_python):
             ("supervisor", supervisor),
             ("az_python", az_python),
         )
-    }
+    }, artifact(runtime_path), runtime)
 
 
 def require_tool_bindings(plan_value, azure, uploader, validator, supervisor,
-                          az_python):
-    actual = exact_tool_bindings(
-        azure, uploader, validator, supervisor, az_python)
-    ci.require(actual == plan_value["tools"], "approved tool binding changed")
-    return actual
+                          az_python, azure_runtime):
+    actual, document, runtime = exact_tool_bindings(
+        azure, uploader, validator, supervisor, az_python, azure_runtime)
+    ci.require(
+        actual == plan_value["tools"]
+        and document == plan_value["azure_runtime_document"]
+        and runtime == plan_value["azure_runtime"],
+        "approved tool/runtime binding changed")
+    return actual, document, runtime
+
+
+def runtime_approval_binding(plan_value):
+    runtime = plan_value["azure_runtime"]
+    return {
+        "schema": runtime["schema"],
+        "version": runtime["version"],
+        "canonicalization": runtime["canonicalization"],
+        "document_sha256":
+            plan_value["azure_runtime_document"]["sha256"],
+        "python_version": runtime["python_version"],
+        "manifest": runtime["manifest"],
+        "launcher": runtime["launcher"],
+        "interpreter": runtime["interpreter"],
+        "content_sha256": runtime["content_sha256"],
+        "metadata_sha256": runtime["metadata_sha256"],
+        "parents_sha256": runtime["parents_sha256"],
+        "root": runtime["root"],
+        "extensions": runtime["extensions"],
+        "limits": runtime["limits"],
+        "observed": runtime["observed"],
+        "loader_dependencies": runtime["loader_dependencies"],
+        "isolation": runtime["isolation"],
+    }
 
 
 def approval_limits(plan_value):
@@ -568,7 +1095,7 @@ def approval_limits(plan_value):
 def plan(bundle_path, output, approval_template, candidate_output, *,
          campaign_id, ledger, subscription, prefix,
          maximum_authorized_cost_microusd, azure, uploader, validator,
-         supervisor, az_python, attempt_id=None, ledger_id=None,
+         supervisor, az_python, azure_runtime, attempt_id=None, ledger_id=None,
          created_unix=None):
     private(bundle_path.parent)
     private(output.parent)
@@ -599,6 +1126,8 @@ def plan(bundle_path, output, approval_template, candidate_output, *,
     created_unix = int(time.time()) if created_unix is None else created_unix
     ci.require(type(created_unix) is int and created_unix > 0,
                "invalid plan creation time")
+    tools, runtime_document, runtime_closure = exact_tool_bindings(
+        azure, uploader, validator, supervisor, az_python, azure_runtime)
     candidate = candidate_plan(
         bundle_path, candidate_output, attempt_id=attempt_id,
         subscription=subscription, prefix=prefix)
@@ -615,8 +1144,6 @@ def plan(bundle_path, output, approval_template, candidate_output, *,
     ci.require(len(names) == len(V2_NAMES)
                and by_name["vhd"] == candidate["os_vhd"],
                "candidate image binding changed")
-    tools = exact_tool_bindings(
-        azure, uploader, validator, supervisor, az_python)
     ledger_binding = native_json(
         validator, "ledger-proposal", ledger, campaign_id, ledger_id)
     ci.require(
@@ -694,6 +1221,8 @@ def plan(bundle_path, output, approval_template, candidate_output, *,
                 REPOSITORY_MAXIMUM_COST_MICROUSD,
         },
         "tools": tools,
+        "azure_runtime_document": runtime_document,
+        "azure_runtime": runtime_closure,
     }
     ci.require(value["vhd_bytes"] == FIXED_VHD_BYTES,
                "wrong fixed VHD byte length")
@@ -715,6 +1244,7 @@ def plan(bundle_path, output, approval_template, candidate_output, *,
         "maximum_authorized_cost_microusd":
             maximum_authorized_cost_microusd,
         "limits": approval_limits(value),
+        "azure_runtime": runtime_approval_binding(value),
     }
     ci.save(approval_template, template)
     native_validate(validator, "plan", output, approval_template)
@@ -742,14 +1272,16 @@ def publish_validated(output, value, validator, command):
 
 def record_authorization(plan_path, template_path, output, *, decision,
                          approver, reference, recorded_unix, expires_unix,
-                         azure, uploader, validator, supervisor, az_python):
+                         azure, uploader, validator, supervisor, az_python,
+                         azure_runtime):
     private(plan_path.parent)
     private(template_path.parent)
     private(output.parent)
     plan_value = canonical_document(plan_path)
     template = canonical_document(template_path)
     require_tool_bindings(
-        plan_value, azure, uploader, validator, supervisor, az_python)
+        plan_value, azure, uploader, validator, supervisor, az_python,
+        azure_runtime)
     native_validate(validator, "plan", plan_path, template_path)
     ci.require(template["plan_sha256"] == ci.digest(plan_path, 64 * 1024)
                and template["attempt_id"] == plan_value["attempt_id"]
@@ -760,6 +1292,8 @@ def record_authorization(plan_path, template_path, output, *, decision,
                == plan_value["ledger"]["initialization_required"]
                and template["candidate_sha256"]
                == plan_value["candidate"]["sha256"]
+               and template["azure_runtime"]
+               == runtime_approval_binding(plan_value)
                and template["decision"] == "pending",
                "approval template does not bind exact plan")
     ci.require(decision in ("approved", "denied"),
@@ -791,6 +1325,7 @@ def record_authorization(plan_path, template_path, output, *, decision,
         "maximum_authorized_cost_microusd":
             template["maximum_authorized_cost_microusd"],
         "limits": template["limits"],
+        "azure_runtime": template["azure_runtime"],
         "approver": approver,
         "reference": reference,
         "recorded_unix": recorded_unix,
@@ -803,14 +1338,15 @@ def record_authorization(plan_path, template_path, output, *, decision,
 
 
 def admission(plan_path, authorization_path, output, *, azure, uploader,
-              validator, supervisor, az_python):
+              validator, supervisor, az_python, azure_runtime):
     private(plan_path.parent)
     private(authorization_path.parent)
     private(output.parent)
     plan_value = canonical_document(plan_path)
     authorization = canonical_document(authorization_path)
     require_tool_bindings(
-        plan_value, azure, uploader, validator, supervisor, az_python)
+        plan_value, azure, uploader, validator, supervisor, az_python,
+        azure_runtime)
     native_validate(
         validator, "authorization", plan_path, authorization_path)
     ci.require(authorization["decision"] == "approved",
@@ -843,6 +1379,23 @@ def main():
     exp = sub.add_parser("export")
     exp.add_argument("--runtime", type=Path, required=True)
     exp.add_argument("--output", type=Path, required=True)
+    prepare_runtime = sub.add_parser(
+        "prepare-azure-runtime",
+        help="Build a private create-only Azure CLI Python/module closure")
+    prepare_runtime.add_argument("--output", type=Path, required=True)
+    prepare_runtime.add_argument("--azure", type=Path, required=True)
+    prepare_runtime.add_argument("--az-python", type=Path, required=True)
+    prepare_runtime.add_argument("--stdlib", type=Path, required=True)
+    prepare_runtime.add_argument(
+        "--package-root", type=Path, action="append", required=True,
+        help=("Reviewed Python import root; repeat for every Azure CLI "
+              "package root"))
+    prepare_runtime.add_argument(
+        "--data-root", type=Path, action="append", default=[])
+    prepare_runtime.add_argument(
+        "--native-dependency", type=Path, action="append", default=[])
+    prepare_runtime.add_argument(
+        "--validator", type=Path, required=True)
     candidate = sub.add_parser(
         "candidate", help="Legacy non-authorizing candidate generation")
     candidate.add_argument("--bundle", type=Path, required=True)
@@ -867,7 +1420,7 @@ def main():
               "a fresh UUID and is ignored for an initialized ledger"))
     pln.add_argument("--created-unix", type=int)
     for tool_name in ("azure", "uploader", "validator",
-                      "supervisor", "az-python"):
+                      "supervisor", "az-python", "azure-runtime"):
         pln.add_argument("--" + tool_name, type=Path, required=True)
     authorize = sub.add_parser("record-authorization")
     authorize.add_argument("--plan", type=Path, required=True)
@@ -880,14 +1433,14 @@ def main():
     authorize.add_argument("--recorded-unix", type=int, required=True)
     authorize.add_argument("--expires-unix", type=int, required=True)
     for tool_name in ("azure", "uploader", "validator",
-                      "supervisor", "az-python"):
+                      "supervisor", "az-python", "azure-runtime"):
         authorize.add_argument("--" + tool_name, type=Path, required=True)
     admit = sub.add_parser("admit")
     admit.add_argument("--plan", type=Path, required=True)
     admit.add_argument("--authorization", type=Path, required=True)
     admit.add_argument("--output", type=Path, required=True)
     for tool_name in ("azure", "uploader", "validator",
-                      "supervisor", "az-python"):
+                      "supervisor", "az-python", "azure-runtime"):
         admit.add_argument("--" + tool_name, type=Path, required=True)
     sub.add_parser("public-source-bundle", help="Explicit fixed public-repository tiny CI publication only")
     verify = sub.add_parser("verify-public-source-bundle")
@@ -913,6 +1466,13 @@ def main():
     os.umask(0o077)
     if args.command == "export":
         export(args.runtime, args.output)
+    elif args.command == "prepare-azure-runtime":
+        prepare_azure_runtime(
+            args.output, args.azure, args.az_python, args.stdlib,
+            package_roots=args.package_root,
+            data_roots=args.data_root,
+            native_dependencies=args.native_dependency,
+            validator=args.validator)
     elif args.command == "candidate":
         candidate_plan(args.bundle, args.output)
     elif args.command == "plan":
@@ -925,7 +1485,8 @@ def main():
                 args.maximum_authorized_cost_microusd,
             azure=args.azure, uploader=args.uploader,
             validator=args.validator, supervisor=args.supervisor,
-            az_python=args.az_python, attempt_id=args.attempt_id,
+            az_python=args.az_python, azure_runtime=args.azure_runtime,
+            attempt_id=args.attempt_id,
             ledger_id=args.ledger_id,
             created_unix=args.created_unix)
     elif args.command == "record-authorization":
@@ -935,13 +1496,15 @@ def main():
             reference=args.reference, recorded_unix=args.recorded_unix,
             expires_unix=args.expires_unix, azure=args.azure,
             uploader=args.uploader, validator=args.validator,
-            supervisor=args.supervisor, az_python=args.az_python)
+            supervisor=args.supervisor, az_python=args.az_python,
+            azure_runtime=args.azure_runtime)
     elif args.command == "admit":
         admission(
             args.plan, args.authorization, args.output,
             azure=args.azure, uploader=args.uploader,
             validator=args.validator, supervisor=args.supervisor,
-            az_python=args.az_python)
+            az_python=args.az_python,
+            azure_runtime=args.azure_runtime)
     else:
         import public_bundle
 

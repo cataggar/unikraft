@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import time
 import unittest
 import uuid
@@ -35,11 +36,93 @@ PACKAGE = Path(os.environ["WAMR_CI_PACKAGE"]).resolve(strict=True)
 SUPERVISOR = Path(os.environ["WAMR_CI_SUPERVISOR"]).resolve(strict=True)
 
 
+def remove_sealed_tree(path):
+    if not path.exists():
+        return
+    for current, directories, _ in os.walk(path):
+        Path(current).chmod(0o700)
+        for name in directories:
+            (Path(current) / name).chmod(0o700)
+    shutil.rmtree(path)
+
+
 class LineageV2(unittest.TestCase):
     def setUp(self):
         self.root = REPO / ".d" / ("v2-lineage-" + uuid.uuid4().hex)
         fixture.build(self.root, PACKAGE)
-        self.addCleanup(shutil.rmtree, self.root)
+        self.addCleanup(remove_sealed_tree, self.root)
+        self.azure_runtime_tools = None
+
+    def runtime_tools(self, stem=""):
+        if not stem and self.azure_runtime_tools is not None:
+            return self.azure_runtime_tools
+        prefix = stem + "-" if stem else ""
+        source = self.root / (prefix + "azure-launcher-source")
+        source.write_text(
+            "#!/usr/bin/python3\n"
+            "import os, sys\n"
+            "for key in ('AZ_PYTHON', 'PYTHONPATH', 'PYTHONSTARTUP',"
+            " 'PYTHONUSERBASE', 'LD_PRELOAD', 'LD_LIBRARY_PATH'):\n"
+            " if key in os.environ: raise SystemExit(31)\n"
+            "if os.environ.get('PYTHONDONTWRITEBYTECODE') != '1':"
+            " raise SystemExit(32)\n"
+            "extension_dir = os.environ.get('AZURE_EXTENSION_DIR', '')\n"
+            "if (os.environ.get('AZURE_EXTENSION_USE_DYNAMIC_INSTALL') != 'no'"
+            " or not os.path.isdir(extension_dir)"
+            " or os.listdir(extension_dir)):\n"
+            " raise SystemExit(34)\n"
+            "if os.path.exists(os.path.join(os.environ['HOME'],"
+            " 'expect-descriptor')) and not __file__.startswith("
+            "'/proc/self/fd/'):\n"
+            " raise SystemExit(33)\n"
+            "if len(sys.argv) > 1 and sys.argv[1] == 'version':\n"
+            " print('{\"azure-cli\":\"2.75.0\","
+            "\"azure-cli-core\":\"2.75.0\","
+            "\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}')\n"
+            " raise SystemExit(0)\n"
+            "path = os.path.join(os.environ['HOME'], 'backend-calls')\n"
+            "fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)\n"
+            "try:\n"
+            " os.write(fd, (' '.join(sys.argv[1:]) + '\\n').encode())\n"
+            "finally:\n"
+            " os.close(fd)\n"
+            "if sys.argv[1:3] == ['group', 'exists']:\n"
+            " print('false')\n"
+            " raise SystemExit(0)\n"
+            "raise SystemExit(29)\n")
+        source.chmod(0o700)
+        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        stdlib = self.root / (prefix + "stdlib-source") / version
+        stdlib.mkdir(parents=True, mode=0o700)
+        shutil.copytree(
+            Path(sysconfig.get_path("stdlib")) / "encodings",
+            stdlib / "encodings")
+        native = stdlib / "native-fixture.so"
+        native_source = next(iter(sorted(
+            Path(sysconfig.get_config_var("DESTSHARED")).glob("*.so"))))
+        shutil.copyfile(native_source, native)
+        native.chmod(0o600)
+        loader_fixture = self.root / (prefix + "loader-fixture.so")
+        shutil.copyfile(native_source, loader_fixture)
+        loader_fixture.chmod(0o500)
+        output = self.root / (prefix + "azure-runtime")
+        handoff.prepare_azure_runtime(
+            output, source, Path(sys.executable).resolve(strict=True), stdlib,
+            native_dependencies=(loader_fixture,),
+            validator=VALIDATOR)
+        (self.root / "expect-descriptor").write_text("required\n")
+        closure = fixture.read(output / "azure-runtime.json")
+        result = dict(
+            azure=Path(closure["launcher"]["path"]),
+            uploader=VALIDATOR,
+            validator=VALIDATOR,
+            supervisor=SUPERVISOR,
+            az_python=Path(closure["interpreter"]["path"]),
+            azure_runtime=output / "azure-runtime.json",
+        )
+        if not stem:
+            self.azure_runtime_tools = result
+        return result
 
     def validate(self, command="handoff", path=None, status=0):
         path = path or self.root / "bundle.json"
@@ -85,9 +168,7 @@ class LineageV2(unittest.TestCase):
             "authorization": self.root / (stem + "authorization.json"),
             "admission": self.root / (stem + "admission.json"),
         }
-        tools = tools or dict(
-            azure=VALIDATOR, uploader=VALIDATOR, validator=VALIDATOR,
-            supervisor=SUPERVISOR, az_python=VALIDATOR)
+        tools = tools or self.runtime_tools()
         handoff.plan(
             self.root / "bundle.json", paths["plan"], paths["template"],
             paths["candidate"],
@@ -352,6 +433,12 @@ class LineageV2(unittest.TestCase):
             "artifact-id": lambda value: value.update(artifact_id="54321"),
             "tool-hash": lambda value: value["tools"]["azure"].update(
                 sha256="e" * 64),
+            "runtime-content": lambda value: value[
+                "azure_runtime"].update(content_sha256="e" * 64),
+            "runtime-root": lambda value: value[
+                "azure_runtime"].update(root="/unapproved/runtime"),
+            "runtime-document": lambda value: value[
+                "azure_runtime_document"].update(sha256="e" * 64),
             "unknown": lambda value: value.update(unexpected=True),
         }
         for name, change in changes.items():
@@ -401,6 +488,8 @@ class LineageV2(unittest.TestCase):
                 maximum_authorized_cost_microusd=99_999_999),
             "wrong-limits": lambda value: value["limits"].update(
                 boot_count=1),
+            "wrong-runtime": lambda value: value[
+                "azure_runtime"].update(content_sha256="e" * 64),
             "wrong-approver": lambda value: value.update(approver=""),
             "wrong-reference": lambda value: value.update(reference="x" * 257),
             "missing-reference": lambda value: value.pop("reference"),
@@ -448,19 +537,25 @@ class LineageV2(unittest.TestCase):
         self.assertNotEqual(noncanonical.returncode, 0)
         paths["authorization"].write_bytes(original)
         original_template = paths["template"].read_bytes()
-        template = json.loads(original_template)
-        template["unexpected"] = True
-        fixture.write(paths["template"], template)
-        with self.assertRaises(ValueError):
-            handoff.record_authorization(
-                paths["plan"], paths["template"],
-                self.root / "unknown-template-authorization.json",
-                decision="approved", approver="fixture-operator",
-                reference="cataggar/unikraft#170-template",
-                recorded_unix=int(time.time()) - 1,
-                expires_unix=int(time.time()) + 600, **tools)
-        self.assertFalse(
-            (self.root / "unknown-template-authorization.json").exists())
+        for name, change in {
+                "unknown": lambda value: value.update(unexpected=True),
+                "wrong-runtime": lambda value: value[
+                    "azure_runtime"].update(content_sha256="e" * 64),
+        }.items():
+            with self.subTest(template=name):
+                template = json.loads(original_template)
+                change(template)
+                fixture.write(paths["template"], template)
+                output = self.root / (
+                    name + "-template-authorization.json")
+                with self.assertRaises(ValueError):
+                    handoff.record_authorization(
+                        paths["plan"], paths["template"], output,
+                        decision="approved", approver="fixture-operator",
+                        reference="cataggar/unikraft#170-template",
+                        recorded_unix=int(time.time()) - 1,
+                        expires_unix=int(time.time()) + 600, **tools)
+                self.assertFalse(output.exists())
         paths["template"].write_bytes(original_template)
         original_plan = paths["plan"].read_bytes()
         for name, change in {
@@ -506,6 +601,28 @@ class LineageV2(unittest.TestCase):
             env={}, capture_output=True, timeout=90)
         self.assertNotEqual(completed.returncode, 0)
 
+    def test_wrong_runtime_closure_in_admission_refuses(self):
+        paths, _ = self.prepare_contract()
+        original = paths["admission"].read_bytes()
+        changes = {
+            "content": lambda value: value["azure_runtime"].update(
+                content_sha256="e" * 64),
+            "metadata": lambda value: value["azure_runtime"].update(
+                metadata_sha256="e" * 64),
+            "document": lambda value: value[
+                "azure_runtime_document"].update(sha256="e" * 64),
+            "launcher": lambda value: value["azure_runtime"][
+                "launcher"].update(sha256="e" * 64),
+            "interpreter": lambda value: value["azure_runtime"][
+                "interpreter"].update(sha256="e" * 64),
+        }
+        for name, mutate in changes.items():
+            with self.subTest(name=name):
+                admission = json.loads(original)
+                mutate(admission)
+                fixture.write(paths["admission"], admission)
+                self.validate("admission", paths["admission"], status=1)
+
     def test_fresh_subprocess_cli_requires_explicit_bound_tools(self):
         self.write_transport()
         ledger = self.root / "cli-ledger"
@@ -516,12 +633,14 @@ class LineageV2(unittest.TestCase):
                 "plan", "template", "candidate", "authorization",
                 "admission")
         }
+        tools = self.runtime_tools()
         tool_args = [
-            "--azure", VALIDATOR,
-            "--uploader", VALIDATOR,
-            "--validator", VALIDATOR,
-            "--supervisor", SUPERVISOR,
-            "--az-python", VALIDATOR,
+            "--azure", tools["azure"],
+            "--uploader", tools["uploader"],
+            "--validator", tools["validator"],
+            "--supervisor", tools["supervisor"],
+            "--az-python", tools["az_python"],
+            "--azure-runtime", tools["azure_runtime"],
         ]
         commands = [[
             "plan",
@@ -567,45 +686,13 @@ class LineageV2(unittest.TestCase):
 
     def backend_tools(self):
         calls = self.root / "backend-calls"
-        backend = self.root / "explicit-azure-fixture"
-        backend.write_text(
-            "#!/usr/bin/python3\n"
-            "import json, pathlib, sys\n"
-            f"calls = pathlib.Path({str(calls)!r})\n"
-            "if len(sys.argv) > 1 and sys.argv[1] == 'version':\n"
-            "    print(json.dumps({'azure-cli':'2.75.0',"
-            "'azure-cli-core':'2.75.0','azure-cli-telemetry':'1.1.0',"
-            "'extensions':{}}))\n"
-            "    raise SystemExit(0)\n"
-            "with calls.open('ab') as stream:\n"
-            "    stream.write((' '.join(sys.argv[1:]) + '\\n').encode())\n"
-            "raise SystemExit(29)\n")
-        backend.chmod(0o700)
-        return calls, dict(
-            azure=backend, uploader=VALIDATOR, validator=VALIDATOR,
-            supervisor=SUPERVISOR, az_python=VALIDATOR)
+        return calls, self.runtime_tools()
 
     def blocking_backend_tools(self):
-        calls = self.root / "blocking-backend-calls"
+        calls = self.root / "backend-calls"
         ready = self.root / "blocking-backend-ready"
         release = self.root / "blocking-backend-release"
-        backend = self.root / "blocking-azure-fixture"
-        backend.write_text(
-            "#!/usr/bin/python3\n"
-            "import json, pathlib, sys\n"
-            f"calls = pathlib.Path({str(calls)!r})\n"
-            "with calls.open('ab') as stream:\n"
-            "    stream.write((' '.join(sys.argv[1:]) + '\\n').encode())\n"
-            "if len(sys.argv) > 1 and sys.argv[1] == 'version':\n"
-            "    print(json.dumps({'azure-cli':'2.75.0',"
-            "'azure-cli-core':'2.75.0','azure-cli-telemetry':'1.1.0',"
-            "'extensions':{}}))\n"
-            "    raise SystemExit(0)\n"
-            "raise SystemExit(29)\n")
-        backend.chmod(0o700)
-        return calls, ready, release, dict(
-            azure=backend, uploader=VALIDATOR, validator=VALIDATOR,
-            supervisor=SUPERVISOR, az_python=VALIDATOR)
+        return calls, ready, release, self.runtime_tools()
 
     def controller_command(self, paths, tools, attempt, ledger=None):
         return [
@@ -613,6 +700,7 @@ class LineageV2(unittest.TestCase):
             ledger or self.root / "ledger", tools["azure"],
             tools["uploader"], tools["validator"], tools["supervisor"],
             "--az-python", tools["az_python"],
+            "--azure-runtime", tools["azure_runtime"],
         ]
 
     def wait_for(self, path, process, timeout=30):
@@ -690,6 +778,7 @@ class LineageV2(unittest.TestCase):
             attempt, self.root / "ledger", tools["azure"],
             tools["uploader"], tools["validator"], tools["supervisor"],
             "--az-python", tools["az_python"],
+            "--azure-runtime", tools["azure_runtime"],
         ], env={"HOME": str(self.root)}, capture_output=True, timeout=90)
         self.assertNotEqual(completed.returncode, 0)
         self.assertTrue(attempt.is_dir())
@@ -712,6 +801,7 @@ class LineageV2(unittest.TestCase):
             self.root / "retry-attempt", self.root / "ledger",
             tools["azure"], tools["uploader"], tools["validator"],
             tools["supervisor"], "--az-python", tools["az_python"],
+            "--azure-runtime", tools["azure_runtime"],
         ], env={"HOME": str(self.root)}, capture_output=True, timeout=30)
         self.assertNotEqual(retried.returncode, 0)
         self.assertFalse((self.root / "retry-attempt").exists())
@@ -720,9 +810,6 @@ class LineageV2(unittest.TestCase):
     def test_pinned_admission_scope_marker_and_tool_swaps_refuse_before_claim(self):
         calls, ready, release, tools = self.blocking_backend_tools()
         paths, _ = self.prepare_contract(tools=tools)
-        backend = tools["azure"]
-        original_backend = backend.read_bytes()
-        original_mode = stat.S_IMODE(backend.stat().st_mode)
         marker = self.root / "ledger/ledger-identity.json"
 
         def execute(name, mutate, restore):
@@ -767,69 +854,6 @@ class LineageV2(unittest.TestCase):
             lambda: None,
         )
         execute(
-            "tool-group-writable",
-            lambda: backend.chmod(0o720),
-            lambda: backend.chmod(original_mode),
-        )
-        execute(
-            "tool-world-writable",
-            lambda: backend.chmod(0o702),
-            lambda: backend.chmod(original_mode),
-        )
-        link = backend.with_name("blocking-azure-hardlink")
-        execute(
-            "tool-hardlink",
-            lambda: os.link(backend, link),
-            lambda: link.unlink(missing_ok=True),
-        )
-        execute(
-            "tool-content-change",
-            lambda: backend.write_bytes(original_backend + b"\n"),
-            lambda: (
-                backend.write_bytes(original_backend),
-                backend.chmod(original_mode),
-            ),
-        )
-        execute(
-            "tool-same-content-inode",
-            lambda: (
-                backend.rename(backend.with_suffix(".retained")),
-                backend.write_bytes(original_backend),
-                backend.chmod(original_mode),
-            ),
-            lambda: (
-                backend.unlink(missing_ok=True),
-                backend.with_suffix(".retained").rename(backend),
-            ),
-        )
-        execute(
-            "tool-symlink",
-            lambda: (
-                backend.rename(backend.with_suffix(".retained")),
-                backend.symlink_to(backend.with_suffix(".retained")),
-            ),
-            lambda: (
-                backend.unlink(missing_ok=True),
-                backend.with_suffix(".retained").rename(backend),
-            ),
-        )
-        execute(
-            "tool-path-removed",
-            lambda: backend.rename(backend.with_suffix(".retained")),
-            lambda: backend.with_suffix(".retained").rename(backend),
-        )
-        parent_mode = stat.S_IMODE(backend.parent.stat().st_mode)
-        execute(
-            "tool-parent-group-writable",
-            lambda: backend.parent.chmod(0o770),
-            lambda: backend.parent.chmod(parent_mode),
-        )
-        execute(
-            "tool-parent-world-writable",
-            lambda: backend.parent.chmod(0o777),
-            lambda: backend.parent.chmod(parent_mode),
-        )
-        execute(
             "marker-concurrent-replacement",
             lambda: (
                 marker.write_bytes(b"{}\n"),
@@ -837,6 +861,145 @@ class LineageV2(unittest.TestCase):
             ),
             lambda: marker.unlink(missing_ok=True),
         )
+
+    def test_azure_runtime_tamper_after_admission_refuses_before_claim(self):
+        def make_writable(path):
+            path.parent.chmod(0o700)
+            path.chmod(0o700 if path.is_dir() else 0o600)
+
+        def replace_same_content(path):
+            original = path.read_bytes()
+            mode = stat.S_IMODE(path.stat().st_mode)
+            path.parent.chmod(0o700)
+            path.rename(path.with_name(path.name + ".retained"))
+            path.write_bytes(original)
+            path.chmod(mode)
+
+        cases = {
+            "launcher-same-content-inode": lambda value: replace_same_content(
+                value["launcher"]),
+            "interpreter-same-content-inode": lambda value: replace_same_content(
+                value["interpreter"]),
+            "launcher-path-removed": lambda value: (
+                value["launcher"].parent.chmod(0o700),
+                value["launcher"].rename(
+                    value["launcher"].with_name("azure-cli.removed")),
+            ),
+            "launcher-mode": lambda value: value["launcher"].chmod(0o700),
+            "runtime-parent-mode": lambda value: value["root"].parent.chmod(
+                0o770),
+            "module-content": lambda value: (
+                make_writable(value["module"]),
+                value["module"].write_bytes(
+                    value["module"].read_bytes() + b"\n# changed\n"),
+            ),
+            "module-directory-mode": lambda value: value[
+                "module"].parent.chmod(0o700),
+            "module-added": lambda value: (
+                value["module"].parent.chmod(0o700),
+                value["module"].with_name("injected.py").write_text(
+                    "raise RuntimeError('unapproved')\n"),
+            ),
+            "extension-added": lambda value: (
+                value["extensions"].chmod(0o700),
+                (value["extensions"] / "unapproved.py").write_text(
+                    "raise RuntimeError('unapproved extension')\n"),
+            ),
+            "module-removed": lambda value: (
+                value["module"].parent.chmod(0o700),
+                value["module"].rename(
+                    value["module"].with_name("__init__.py.removed")),
+            ),
+            "module-symlink": lambda value: (
+                value["module"].parent.chmod(0o700),
+                value["module"].rename(
+                    value["module"].with_name("__init__.py.retained")),
+                value["module"].symlink_to("__init__.py.retained"),
+            ),
+            "module-hardlink": lambda value: (
+                value["module"].parent.chmod(0o700),
+                os.link(
+                    value["module"],
+                    value["module"].with_name("__init__.py.link")),
+            ),
+            "native-extension": lambda value: (
+                make_writable(value["native"]),
+                value["native"].write_bytes(b"changed native extension\n"),
+            ),
+            "loader-dependency": lambda value: (
+                value["loader"].chmod(0o700),
+                value["loader"].write_bytes(b"changed loader dependency\n"),
+            ),
+            "manifest-same-content-inode": lambda value: replace_same_content(
+                value["manifest"]),
+        }
+        for index, (name, mutate) in enumerate(cases.items()):
+            with self.subTest(name=name):
+                stem = f"runtime-{index}"
+                tools = self.runtime_tools(stem)
+                paths, _ = self.prepare_contract(
+                    tools=tools, stem=stem + "-")
+                closure = fixture.read(tools["azure_runtime"])
+                python_root = (
+                    Path(closure["root"]) / "lib"
+                    / ("python" + closure["python_version"]))
+                values = {
+                    "root": Path(closure["root"]),
+                    "launcher": Path(closure["launcher"]["path"]),
+                    "interpreter": Path(closure["interpreter"]["path"]),
+                    "manifest": Path(closure["manifest"]["path"]),
+                    "extensions": Path(closure["extensions"]),
+                    "module": python_root / "encodings/__init__.py",
+                    "native": python_root / "native-fixture.so",
+                    "loader": next(
+                        Path(item["path"])
+                        for item in closure["loader_dependencies"]
+                        if Path(item["path"]).name.endswith(
+                            "loader-fixture.so")),
+                }
+                calls = self.root / "backend-calls"
+                ready = self.root / "blocking-backend-ready"
+                release = self.root / "blocking-backend-release"
+                status, _, _ = self.run_blocked_controller(
+                    paths,
+                    tools,
+                    self.root / (stem + "-attempt"),
+                    ready,
+                    release,
+                    lambda: mutate(values),
+                    ledger=self.root / (stem + "-ledger"),
+                )
+                self.assertNotEqual(status, 0)
+                self.assertEqual(
+                    self.ledger_claims(self.root / (stem + "-ledger")),
+                    set())
+                self.assertEqual(
+                    list((self.root / (stem + "-ledger")).iterdir()), [])
+                self.assertFalse(calls.exists())
+
+    def test_azure_runtime_tamper_precedes_attempt_ledger_and_backend(self):
+        tools = self.runtime_tools("preadmission-runtime")
+        ledger = self.root / "preadmission-ledger"
+        paths, _ = self.prepare_contract(
+            tools=tools, stem="preadmission-", ledger=ledger)
+        closure = fixture.read(tools["azure_runtime"])
+        module = (
+            Path(closure["root"]) / "lib"
+            / ("python" + closure["python_version"])
+            / "encodings/__init__.py")
+        module.parent.chmod(0o700)
+        module.chmod(0o600)
+        module.write_bytes(module.read_bytes() + b"\n# pre-admission tamper\n")
+        attempt = self.root / "preadmission-attempt"
+        completed = subprocess.run(
+            self.controller_command(paths, tools, attempt, ledger=ledger),
+            env={"HOME": str(self.root)},
+            capture_output=True,
+            timeout=30)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(attempt.exists())
+        self.assertEqual(list(ledger.iterdir()), [])
+        self.assertFalse((self.root / "backend-calls").exists())
 
     def test_ledger_identity_migration_replacements_and_retained_directory(self):
         calls, ready, release, tools = self.blocking_backend_tools()
@@ -987,6 +1150,7 @@ class LineageV2(unittest.TestCase):
             azure=tools["azure"], uploader=tools["uploader"],
             validator=tools["validator"], supervisor=tools["supervisor"],
             az_python=tools["az_python"],
+            azure_runtime=tools["azure_runtime"],
             attempt_id="dddddddd-dddd-4ddd-addd-dddddddddddd",
             created_unix=int(time.time()))
         future_plan = fixture.read(future["plan"])
@@ -1054,6 +1218,7 @@ class LineageV2(unittest.TestCase):
                     tools["uploader"], tools["validator"],
                     tools["supervisor"], "--az-python",
                     tools["az_python"],
+                    "--azure-runtime", tools["azure_runtime"],
                 ], env={
                     "HOME": str(self.root),
                     "AZ_PYTHON": "/ambient/refused",
@@ -1076,6 +1241,7 @@ class LineageV2(unittest.TestCase):
             missing_attempt, self.root / "ledger", tools["azure"],
             tools["uploader"], tools["validator"], tools["supervisor"],
             "--az-python", tools["az_python"],
+            "--azure-runtime", tools["azure_runtime"],
         ], env={"HOME": str(self.root)}, capture_output=True, timeout=30)
         self.assertNotEqual(completed.returncode, 0)
         self.assertFalse(missing_attempt.exists())

@@ -214,11 +214,12 @@ It never removes those records. An incomplete reservation remains consumed.
 
 ### Local CLI startup before consumption
 
-An offline/tarball Azure CLI launcher can require `AZ_PYTHON` even though a
-self-contained CLI does not. The controller deliberately **does not inherit**
-ambient `AZ_PYTHON`, `PATH`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`,
-`LD_PRELOAD` or `LD_LIBRARY_PATH`. Do not work around this by changing system
-installations, exporting language hooks or wrapping the controller.
+An offline/tarball Azure CLI launcher can require an explicit Python even
+though a self-contained CLI does not. The controller deliberately **does not
+inherit** ambient `AZ_PYTHON`, `PATH`, `PYTHONPATH`, `PYTHONHOME`,
+`PYTHONSTARTUP`, `PYTHONUSERBASE`, `LD_PRELOAD` or `LD_LIBRARY_PATH`. Do not
+work around this by changing system installations, exporting language hooks
+or wrapping the controller.
 
 Select the reviewed CLI and, only if needed, its interpreter with explicit
 canonical absolute paths. The CLI and interpreter must be regular executable
@@ -228,12 +229,19 @@ but must review it rather than blindly copying ambient `AZ_PYTHON`. The
 interpreter must not be group/world writable. Its inode/device, size, mode,
 owner, link count and modification/change timestamps are pinned through the
 existing executable custody mechanism, rechecked after successful startup and
-before/after lifecycle child operations. The selected interpreter is supplied
-as `AZ_PYTHON` **only to the Azure child**, never to the native validator or
-uploader. The reviewed tarball launcher still establishes its own bundled
-Python package path; no ambient Python hook is restored. The controller sets
-the fixed `PYTHONDONTWRITEBYTECODE=1` to avoid writing into the selected tool
-installation, independently of any operator value.
+before/after lifecycle child operations. The legacy platform-only route supplies its selected interpreter as
+`AZ_PYTHON` only to the Azure child. That pathname-based package arrangement
+does **not** satisfy the finite-cost WAMR authorization route.
+
+`uk-wamr-direct-compute` instead requires the create-only
+`uk.wamr.azure-cli-runtime-closure` described in
+[WAMR-DIRECT-COMPUTE.md](WAMR-DIRECT-COMPUTE.md). Before planning, its
+operator must run `prepare-azure-runtime` with the reviewed Python bootstrap,
+explicit Python ELF, complete standard library and every Azure package import
+root. The prepared interpreter/bootstrap paths and `azure-runtime.json` are
+mandatory in plan, authorization, admission, preflight and execution. WAMR
+executes the retained interpreter with `-s -S -B -P` and passes the retained
+bootstrap through `/proc/self/fd/N`; it does not use `AZ_PYTHON` as authority.
 
 Run this local-only command before obtaining a future live approval:
 
@@ -245,8 +253,16 @@ AZURE_CONFIG_DIR="$REVIEWED_OPERATOR_AZURE_CONFIG" \
   "$DIRECT_TOOLS/uk-hyperv-direct-two-boot" preflight \
   "$PRIVATE_PARENT/FRESH-cli-startup" "$REVIEWED_CANONICAL_AZ" \
   --az-python "$REVIEWED_CANONICAL_PYTHON"
-# Omit the final flag/value for a self-contained CLI.
-# uk-wamr-direct-compute has the identical preflight interface.
+# Omit the final flag/value for a self-contained platform-only CLI.
+
+# The WAMR finite-cost route has no optional module/interpreter form:
+"$DIRECT_TOOLS/uk-wamr-direct-compute" preflight \
+  "$PRIVATE_PARENT/FRESH-wamr-cli-startup" \
+  "$PRIVATE_PARENT/FRESH-azure-runtime/runtime/bootstrap/azure-cli" \
+  --az-python \
+  "$PRIVATE_PARENT/FRESH-azure-runtime/runtime/bin/python" \
+  --azure-runtime \
+  "$PRIVATE_PARENT/FRESH-azure-runtime/azure-runtime.json"
 ```
 
 `preflight` accepts no scope, subscription, attempt or ledger argument. It runs
