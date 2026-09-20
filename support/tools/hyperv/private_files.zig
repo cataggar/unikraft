@@ -10,6 +10,9 @@ pub const namespace_marker = "WAMR_AZURE_RUNTIME_NAMESPACE";
 pub const namespace_uid = "WAMR_AZURE_RUNTIME_HOST_UID";
 pub const namespace_gid = "WAMR_AZURE_RUNTIME_HOST_GID";
 pub const namespace_parent = "WAMR_AZURE_RUNTIME_PARENT_PID";
+pub const namespace_controller = "controller";
+pub const namespace_child = "child";
+const NamespaceOverflow = struct { uid: u32, gid: u32 };
 
 pub fn enterUserNamespace(uid: u32, gid: u32) void {
     namespace_host_uid.store(uid, .release);
@@ -22,8 +25,7 @@ pub fn enterUserNamespaceFromEnvironment(
     environment: *const std.process.Environ.Map,
 ) !void {
     const marker = environment.get(namespace_marker) orelse return;
-    if (!std.mem.eql(u8, marker, "1") or linux.geteuid() != 0 or
-        linux.getegid() != 0)
+    if (linux.geteuid() != 0 or linux.getegid() != 0)
         return error.InvalidUserNamespace;
     const uid = try std.fmt.parseInt(
         u32,
@@ -41,18 +43,23 @@ pub fn enterUserNamespaceFromEnvironment(
             return error.InvalidUserNamespace,
         10,
     );
-    const overflow = try verifyNamespace(io, uid, gid, parent);
+    const overflow = if (std.mem.eql(u8, marker, namespace_controller))
+        try verifyControllerNamespace(io, uid, gid, parent)
+    else if (std.mem.eql(u8, marker, namespace_child))
+        try verifyChildNamespace(io, uid, gid, parent)
+    else
+        return error.InvalidUserNamespace;
     namespace_overflow_uid.store(overflow.uid, .release);
     namespace_overflow_gid.store(overflow.gid, .release);
     enterUserNamespace(uid, gid);
 }
 
-fn verifyNamespace(
+fn verifyControllerNamespace(
     io: std.Io,
     host_uid: u32,
     host_gid: u32,
     parent: linux.pid_t,
-) !struct { uid: u32, gid: u32 } {
+) !NamespaceOverflow {
     if (parent <= 1 or linux.getppid() != parent)
         return error.InvalidNamespaceParent;
     var parent_uid_map: [64]u8 = undefined;
@@ -73,6 +80,55 @@ fn verifyNamespace(
             .{parent},
         ),
     ) catch return error.InvalidNamespaceParentMap;
+    return verifyNamespace(io, host_uid, host_gid);
+}
+
+fn verifyChildNamespace(
+    io: std.Io,
+    host_uid: u32,
+    host_gid: u32,
+    parent: linux.pid_t,
+) !NamespaceOverflow {
+    if (parent <= 1 or linux.getppid() != parent)
+        return error.InvalidNamespaceParent;
+    var parent_uid_map: [64]u8 = undefined;
+    var parent_gid_map: [64]u8 = undefined;
+    verifyIdMap(
+        io,
+        try std.fmt.bufPrint(
+            &parent_uid_map,
+            "/proc/{d}/uid_map",
+            .{parent},
+        ),
+        host_uid,
+    ) catch return error.InvalidNamespaceParentMap;
+    verifyIdMap(
+        io,
+        try std.fmt.bufPrint(
+            &parent_gid_map,
+            "/proc/{d}/gid_map",
+            .{parent},
+        ),
+        host_gid,
+    ) catch return error.InvalidNamespaceParentMap;
+    var parent_status: [64]u8 = undefined;
+    try verifyRestrictedProcess(
+        io,
+        try std.fmt.bufPrint(
+            &parent_status,
+            "/proc/{d}/status",
+            .{parent},
+        ),
+    );
+    try verifyRestrictedProcess(io, "/proc/self/status");
+    return verifyNamespace(io, host_uid, host_gid);
+}
+
+fn verifyNamespace(
+    io: std.Io,
+    host_uid: u32,
+    host_gid: u32,
+) !NamespaceOverflow {
     try verifyIdMap(io, "/proc/self/uid_map", host_uid);
     try verifyIdMap(io, "/proc/self/gid_map", host_gid);
     var groups_buffer: [32]u8 = undefined;
@@ -124,6 +180,25 @@ fn verifyNamespace(
     if (overflow_uid == 0 or overflow_gid == 0)
         return error.InvalidUserNamespace;
     return .{ .uid = overflow_uid, .gid = overflow_gid };
+}
+
+fn verifyRestrictedProcess(io: std.Io, path: []const u8) !void {
+    var status_buffer: [16 * 1024]u8 = undefined;
+    const status = try readKernelFile(io, path, &status_buffer);
+    var zero_capabilities = false;
+    var no_new_privileges = false;
+    var untraced = false;
+    var lines = std.mem.splitScalar(u8, status, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, "CapEff:\t0000000000000000"))
+            zero_capabilities = true;
+        if (std.mem.eql(u8, line, "NoNewPrivs:\t1"))
+            no_new_privileges = true;
+        if (std.mem.eql(u8, line, "TracerPid:\t0"))
+            untraced = true;
+    }
+    if (!zero_capabilities or !no_new_privileges or !untraced)
+        return error.InvalidNamespaceProcessAuthority;
 }
 
 pub fn verifyInitialNamespace(io: std.Io) !void {

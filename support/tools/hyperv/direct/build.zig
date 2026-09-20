@@ -126,6 +126,13 @@ pub fn build(b: *std.Build) void {
     const system_preload = b.addRunArtifact(overflow_owner_fixture);
     system_preload.addArg("--system-preload");
     runtime_tests.dependOn(&system_preload.step);
+    const child_marker_controller = b.addRunArtifact(overflow_owner_fixture);
+    child_marker_controller.addArg("--child-marker-controller");
+    child_marker_controller.setEnvironmentVariable(
+        "WAMR_AZURE_RUNTIME_NAMESPACE",
+        "child",
+    );
+    runtime_tests.dependOn(&child_marker_controller.step);
     inline for (.{
         "../process_command_tests.zig",
         "../process_command_gate_tests.zig",

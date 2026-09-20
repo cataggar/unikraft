@@ -180,7 +180,9 @@ pub const Parsed = struct {
 };
 
 pub fn ensureNamespace(init: std.process.Init) !void {
-    if (init.environ_map.get(files.namespace_marker) != null) {
+    if (init.environ_map.get(files.namespace_marker)) |marker| {
+        if (!std.mem.eql(u8, marker, files.namespace_controller))
+            return error.AzureRuntimeNamespaceMarkerInvalid;
         files.enterUserNamespaceFromEnvironment(init.io, init.environ_map) catch
             return error.AzureRuntimeNamespaceMarkerInvalid;
         return;
@@ -206,7 +208,7 @@ pub fn ensureNamespace(init: std.process.Init) !void {
         if (std.mem.eql(u8, entry.key_ptr.*, files.namespace_parent)) continue;
         try environment.put(entry.key_ptr.*, entry.value_ptr.*);
     }
-    try environment.put(files.namespace_marker, "1");
+    try environment.put(files.namespace_marker, files.namespace_controller);
     const uid = linux.geteuid();
     const gid = linux.getegid();
     var uid_value_buffer: [32]u8 = undefined;
