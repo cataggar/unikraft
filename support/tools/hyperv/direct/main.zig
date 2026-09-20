@@ -324,7 +324,7 @@ pub fn serialSecond(raw: []const u8, mode: SerialMode, input: evidence.EvidenceI
 }
 
 pub fn main(init: std.process.Init) void {
-    files.enterUserNamespaceFromEnvironment(init.environ_map) catch
+    files.enterUserNamespaceFromEnvironment(init.io, init.environ_map) catch
         std.process.exit(1);
     run(init) catch |err| {
         // No raw serial, paths, ARM response, or credential may reach diagnostics.

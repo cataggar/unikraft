@@ -15,6 +15,7 @@ pub fn enterUserNamespace(uid: u32, gid: u32) void {
 }
 
 pub fn enterUserNamespaceFromEnvironment(
+    io: std.Io,
     environment: *const std.process.Environ.Map,
 ) !void {
     const marker = environment.get(namespace_marker) orelse return;
@@ -31,24 +32,107 @@ pub fn enterUserNamespaceFromEnvironment(
         environment.get(namespace_gid) orelse return error.InvalidUserNamespace,
         10,
     );
+    try verifyNamespace(io, uid, gid);
     enterUserNamespace(uid, gid);
+}
+
+fn verifyNamespace(io: std.Io, host_uid: u32, host_gid: u32) !void {
+    try verifyIdMap(io, "/proc/self/uid_map", host_uid);
+    try verifyIdMap(io, "/proc/self/gid_map", host_gid);
+    var groups_buffer: [32]u8 = undefined;
+    if (!std.mem.eql(
+        u8,
+        std.mem.trim(
+            u8,
+            try readKernelFile(io, "/proc/self/setgroups", &groups_buffer),
+            " \t\r\n",
+        ),
+        "deny",
+    )) return error.InvalidUserNamespace;
+    var mount_buffer: [64 * 1024]u8 = undefined;
+    const mountinfo = try readKernelFile(
+        io,
+        "/proc/self/mountinfo",
+        &mount_buffer,
+    );
+    var root_found = false;
+    var lines = std.mem.splitScalar(u8, mountinfo, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.tokenizeScalar(u8, line, ' ');
+        var index: usize = 0;
+        var root = false;
+        var private = true;
+        while (fields.next()) |field| : (index += 1) {
+            if (index == 4) root = std.mem.eql(u8, field, "/");
+            if (std.mem.startsWith(u8, field, "shared:") or
+                std.mem.startsWith(u8, field, "master:") or
+                std.mem.startsWith(u8, field, "propagate_from:"))
+                private = false;
+            if (std.mem.eql(u8, field, "-")) break;
+        }
+        if (root) {
+            if (root_found or !private) return error.InvalidUserNamespace;
+            root_found = true;
+        }
+    }
+    if (!root_found) return error.InvalidUserNamespace;
+}
+
+fn verifyIdMap(io: std.Io, path: []const u8, host_id: u32) !void {
+    var buffer: [128]u8 = undefined;
+    const bytes = try readKernelFile(io, path, &buffer);
+    var fields = std.mem.tokenizeAny(u8, bytes, " \t\r\n");
+    const inside = try std.fmt.parseInt(
+        u32,
+        fields.next() orelse return error.InvalidUserNamespace,
+        10,
+    );
+    const outside = try std.fmt.parseInt(
+        u32,
+        fields.next() orelse return error.InvalidUserNamespace,
+        10,
+    );
+    const count = try std.fmt.parseInt(
+        u32,
+        fields.next() orelse return error.InvalidUserNamespace,
+        10,
+    );
+    if (inside != 0 or outside != host_id or count != 1 or
+        fields.next() != null)
+        return error.InvalidUserNamespace;
+}
+
+fn readKernelFile(
+    io: std.Io,
+    path: []const u8,
+    buffer: []u8,
+) ![]const u8 {
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    const count = try file.readPositionalAll(io, buffer, 0);
+    if (count == buffer.len) return error.InvalidUserNamespace;
+    return buffer[0..count];
 }
 
 pub fn hostUid(id: u32) u32 {
     if (!user_namespace_active.load(.acquire)) return id;
     if (id == 0) return namespace_host_uid.load(.acquire);
-    return if (id == 65534) 0 else id;
+    return id;
 }
 
 pub fn hostGid(id: u32) u32 {
     if (!user_namespace_active.load(.acquire)) return id;
     if (id == 0) return namespace_host_gid.load(.acquire);
-    return if (id == 65534) 0 else id;
+    return id;
 }
 
 fn trustedArtifactOwner(uid: u32) bool {
-    return uid == 0 or uid == linux.geteuid() or
-        hostUid(uid) == 0;
+    return uid == 0 or
+        (!user_namespace_active.load(.acquire) and uid == linux.geteuid());
 }
 const contracts = @import("contracts.zig");
 const diagnostics = @import("diagnostics.zig");
@@ -70,7 +154,7 @@ pub const Directory = struct {
     pub fn openWorkerCwd(io: std.Io) !Directory {
         const dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .follow_symlinks = false, .iterate = true });
         errdefer dir.close(io);
-        try validateDirectory(io, dir, true);
+        try validateDirectory(io, dir, true, false);
         return .{ .dir = dir };
     }
 
@@ -216,7 +300,7 @@ pub const RetainedFile = struct {
             while (index < result.directory_count) : (index += 1)
                 result.directories[index].close(io);
         }
-        try validateDirectory(io, current, false);
+        try validateDirectory(io, current, false, true);
         result.directories[0] = current;
         result.directory_snapshots[0] = try snapshot(.{
             .handle = current.handle,
@@ -234,7 +318,7 @@ pub const RetainedFile = struct {
                     .follow_symlinks = false,
                     .iterate = true,
                 });
-                validateDirectory(io, next, false) catch |err| {
+                validateDirectory(io, next, false, false) catch |err| {
                     next.close(io);
                     return err;
                 };
@@ -254,6 +338,7 @@ pub const RetainedFile = struct {
             io,
             result.directories[result.directory_count - 1],
             policy == .private,
+            false,
         );
         result.file = try openFilePolicy(
             io,
@@ -284,6 +369,7 @@ pub const RetainedFile = struct {
                 io,
                 self.directories[index],
                 self.policy == .private and index + 1 == self.directory_count,
+                index == 0,
             );
             if (!sameDirectoryIdentity(
                 self.directory_snapshots[index],
@@ -413,17 +499,19 @@ pub fn openDirectory(io: std.Io, path: []const u8, policy: FilePolicy) !std.Io.D
         (path.len > 1 and path[path.len - 1] == '/')) return error.UnsafePath;
     var current = try std.Io.Dir.openDirAbsolute(io, "/", .{ .follow_symlinks = false, .iterate = true });
     errdefer current.close(io);
+    var root = true;
     if (path.len > 1) {
         var parts = std.mem.splitScalar(u8, path[1..], '/');
         while (parts.next()) |part| {
             try basename(part);
-            try validateDirectory(io, current, false);
+            try validateDirectory(io, current, false, root);
             const next = try current.openDir(io, part, .{ .follow_symlinks = false, .iterate = true });
             current.close(io);
             current = next;
+            root = false;
         }
     }
-    try validateDirectory(io, current, policy == .private);
+    try validateDirectory(io, current, policy == .private, root);
     return current;
 }
 
@@ -488,7 +576,7 @@ pub const Locked = struct {
         if (self.file == null) return error.LockNotHeld;
         try basename(name);
         if (name[0] == '.' or contents.len > 4 * 1024 * 1024) return error.InvalidState;
-        try validateDirectory(io, self.directory.dir, true);
+        try validateDirectory(io, self.directory.dir, true, false);
         const existing = self.directory.openFile(io, name) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
@@ -558,14 +646,21 @@ pub fn basename(name: []const u8) !void {
         return error.UnsafePath;
 }
 
-fn validateDirectory(io: std.Io, dir: std.Io.Dir, private: bool) !void {
+fn validateDirectory(
+    io: std.Io,
+    dir: std.Io.Dir,
+    private: bool,
+    trusted_root: bool,
+) !void {
     const stat = try dir.stat(io);
     const uid = try owner(dir.handle);
     const mode = stat.permissions.toMode() & 0o7777;
     if (stat.kind != .directory) return error.UnsafeFile;
     if (private) {
         if (uid != linux.geteuid() or mode != 0o700) return error.UnsafeFile;
-    } else if (!trustedArtifactOwner(uid) or mode & 0o022 != 0) return error.UnsafeFile;
+    } else if ((!trustedArtifactOwner(uid) and
+        !(trusted_root and user_namespace_active.load(.acquire))) or
+        mode & 0o022 != 0) return error.UnsafeFile;
 }
 
 fn validateFile(io: std.Io, file: std.Io.File) !void {

@@ -286,6 +286,12 @@ class Compute(unittest.TestCase):
             "  pass\n"
             " else:\n"
             "  raise SystemExit(36)\n"
+            " try:\n"
+            "  host_libraries = os.listdir('/lib')\n"
+            " except OSError:\n"
+            "  host_libraries = []\n"
+            " if host_libraries:\n"
+            "  raise SystemExit(37)\n"
             "control = os.path.join(os.environ['HOME'], 'cli-version-control')\n"
             "try:\n"
             " fd = os.open(control, os.O_RDONLY)\n"
@@ -316,6 +322,12 @@ class Compute(unittest.TestCase):
             stdlib, validator=VALIDATOR)
         (self.root / "expect-descriptor").write_text("required\n")
         value = read(output / "azure-runtime.json")
+        self.assertEqual(
+            value["isolation"]["host_loader_fallback"], "forbidden")
+        self.assertLessEqual(
+            set(handoff._elf_dynamic(value["interpreter"]["path"])),
+            {Path(item["path"]).name
+             for item in value["loader_dependencies"]})
         self.prepared_azure_runtime = (
             Path(value["launcher"]["path"]),
             Path(value["interpreter"]["path"]),
@@ -627,6 +639,29 @@ class Compute(unittest.TestCase):
                     ".writer.lock", "cli-version.stdout", "cli-version.stderr", "cli-version.process.json"})
         self.assertFalse((self.root / "attempt").exists())
         self.assertFalse((self.root / "ledger").exists())
+
+    def test_namespace_marker_cannot_bypass_namespace_creation(self):
+        azure, interpreter, closure = self.azure_runtime()
+        capture = self.root / "forged-namespace-marker"
+        capture.mkdir(mode=0o700)
+        completed = subprocess.run(
+            [
+                TOOLS / "uk-wamr-direct-compute", "preflight",
+                capture, azure, "--az-python", interpreter,
+                "--azure-runtime", closure,
+            ],
+            env={
+                "HOME": str(self.root),
+                "WAMR_AZURE_RUNTIME_NAMESPACE": "1",
+                "WAMR_AZURE_RUNTIME_HOST_UID": str(os.geteuid()),
+                "WAMR_AZURE_RUNTIME_HOST_GID": str(os.getegid()),
+            },
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"AzureRuntimeNamespaceMarkerInvalid", completed.stderr)
+        self.assertEqual(set(capture.iterdir()), set())
 
     def test_standalone_preserves_child_and_recording_failures(self):
         azure, interpreter, closure = self.azure_runtime()

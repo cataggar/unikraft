@@ -86,6 +86,12 @@ class LineageV2(unittest.TestCase):
             "  pass\n"
             " else:\n"
             "  raise SystemExit(36)\n"
+            " try:\n"
+            "  host_libraries = os.listdir('/lib')\n"
+            " except OSError:\n"
+            "  host_libraries = []\n"
+            " if host_libraries:\n"
+            "  raise SystemExit(37)\n"
             "if len(sys.argv) > 1 and sys.argv[1] == 'version':\n"
             " print('{\"azure-cli\":\"2.75.0\","
             "\"azure-cli-core\":\"2.75.0\","
@@ -125,6 +131,12 @@ class LineageV2(unittest.TestCase):
             validator=VALIDATOR)
         (self.root / "expect-descriptor").write_text("required\n")
         closure = fixture.read(output / "azure-runtime.json")
+        self.assertEqual(
+            closure["isolation"]["host_loader_fallback"], "forbidden")
+        self.assertLessEqual(
+            set(handoff._elf_dynamic(closure["interpreter"]["path"])),
+            {Path(item["path"]).name
+             for item in closure["loader_dependencies"]})
         result = dict(
             azure=Path(closure["launcher"]["path"]),
             uploader=VALIDATOR,
@@ -901,6 +913,8 @@ class LineageV2(unittest.TestCase):
             "launcher-mode": lambda value: value["launcher"].chmod(0o700),
             "runtime-parent-mode": lambda value: value["root"].parent.chmod(
                 0o770),
+            "runtime-ancestor-safe-mode": lambda value: value[
+                "root"].parent.parent.chmod(0o750),
             "module-content": lambda value: (
                 make_writable(value["module"]),
                 value["module"].write_bytes(
@@ -973,15 +987,21 @@ class LineageV2(unittest.TestCase):
                 calls = self.root / "backend-calls"
                 ready = self.root / "blocking-backend-ready"
                 release = self.root / "blocking-backend-release"
-                status, _, _ = self.run_blocked_controller(
-                    paths,
-                    tools,
-                    self.root / (stem + "-attempt"),
-                    ready,
-                    release,
-                    lambda: mutate(values),
-                    ledger=self.root / (stem + "-ledger"),
-                )
+                shared_parent = values["root"].parent.parent
+                shared_parent_mode = stat.S_IMODE(
+                    shared_parent.stat().st_mode)
+                try:
+                    status, _, _ = self.run_blocked_controller(
+                        paths,
+                        tools,
+                        self.root / (stem + "-attempt"),
+                        ready,
+                        release,
+                        lambda: mutate(values),
+                        ledger=self.root / (stem + "-ledger"),
+                    )
+                finally:
+                    shared_parent.chmod(shared_parent_mode)
                 self.assertNotEqual(status, 0)
                 self.assertEqual(
                     self.ledger_claims(self.root / (stem + "-ledger")),
@@ -1003,6 +1023,7 @@ class LineageV2(unittest.TestCase):
         module.parent.chmod(0o700)
         module.chmod(0o600)
         module.write_bytes(module.read_bytes() + b"\n# pre-admission tamper\n")
+        ledger.rmdir()
         attempt = self.root / "preadmission-attempt"
         completed = subprocess.run(
             self.controller_command(paths, tools, attempt, ledger=ledger),
@@ -1010,8 +1031,9 @@ class LineageV2(unittest.TestCase):
             capture_output=True,
             timeout=30)
         self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"AzureRuntimeChanged", completed.stderr)
         self.assertFalse(attempt.exists())
-        self.assertEqual(list(ledger.iterdir()), [])
+        self.assertFalse(ledger.exists())
         self.assertFalse((self.root / "backend-calls").exists())
 
     def test_ledger_identity_migration_replacements_and_retained_directory(self):

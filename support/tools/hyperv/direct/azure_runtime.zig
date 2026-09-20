@@ -12,6 +12,7 @@ pub const max_depth: u8 = 32;
 pub const max_file_bytes: u64 = 256 * 1024 * 1024;
 pub const max_loader_files: u16 = 256;
 pub const max_manifest_bytes: u64 = 32 * 1024 * 1024;
+const max_parent_directories: usize = max_depth + 2;
 
 pub const Artifact = struct {
     path: []const u8,
@@ -47,6 +48,7 @@ pub const Isolation = struct {
     path_environment: enum { forbidden },
     startup_hooks: enum { forbidden },
     loader_environment: enum { retained_readonly_root },
+    host_loader_fallback: enum { forbidden },
     package_restore: enum { forbidden_after_custody },
 };
 
@@ -96,6 +98,7 @@ pub const Contract = struct {
             !pythonVersion(self.python_version))
             return error.InvalidAzureRuntime;
         try files.absoluteFilePath(self.root);
+        if (pathDepth(self.root) > max_depth) return error.InvalidAzureRuntime;
         try files.absoluteFilePath(self.extensions);
         try artifact(self.launcher);
         try artifact(self.interpreter);
@@ -159,6 +162,7 @@ pub const Contract = struct {
             self.isolation.path_environment != .forbidden or
             self.isolation.startup_hooks != .forbidden or
             self.isolation.loader_environment != .retained_readonly_root or
+            self.isolation.host_loader_fallback != .forbidden or
             self.isolation.package_restore != .forbidden_after_custody)
             return error.InvalidAzureRuntime;
     }
@@ -177,7 +181,7 @@ pub const Parsed = struct {
 
 pub fn ensureNamespace(init: std.process.Init) !void {
     if (init.environ_map.get(files.namespace_marker) != null) {
-        files.enterUserNamespaceFromEnvironment(init.environ_map) catch
+        files.enterUserNamespaceFromEnvironment(init.io, init.environ_map) catch
             return error.AzureRuntimeNamespaceMarkerInvalid;
         return;
     }
@@ -358,9 +362,16 @@ pub fn verify(
         return error.AzureRuntimeChanged;
 }
 
+const ParentCustody = struct {
+    directory: std.Io.Dir,
+    snapshot: files.Snapshot,
+};
+
 pub const Sealed = struct {
     source: std.Io.Dir,
     source_snapshot: files.Snapshot,
+    parents: [max_parent_directories]ParentCustody,
+    parent_count: usize,
     root: std.Io.Dir,
     root_snapshot: files.Snapshot,
     loader: core.process.Executable,
@@ -368,6 +379,8 @@ pub const Sealed = struct {
     pub fn close(self: Sealed, io: std.Io) void {
         self.loader.close(io);
         self.root.close(io);
+        for (self.parents[0..self.parent_count]) |parent|
+            parent.directory.close(io);
         self.source.close(io);
     }
 
@@ -382,6 +395,11 @@ pub const Sealed = struct {
             .flags = .{ .nonblocking = false },
         }))) return error.AzureRuntimeChanged;
         try verifyRoot(allocator, io, self.source, contract, true);
+        for (self.parents[0..self.parent_count]) |parent|
+            if (!files.sameSnapshot(parent.snapshot, try files.snapshot(.{
+                .handle = parent.directory.handle,
+                .flags = .{ .nonblocking = false },
+            }))) return error.AzureRuntimeChanged;
         if (!files.sameSnapshot(self.root_snapshot, try files.snapshot(.{
             .handle = self.root.handle,
             .flags = .{ .nonblocking = false },
@@ -405,11 +423,16 @@ pub fn seal(
     });
     verifyRoot(allocator, io, source, contract, true) catch
         return error.AzureRuntimeSealSourceContent;
-    const parent_result = parentDigest(allocator, io, contract) catch
+    var parents: [max_parent_directories]ParentCustody = undefined;
+    const parent_count = retainParents(
+        allocator,
+        io,
+        contract,
+        &parents,
+    ) catch
         return error.AzureRuntimeSealParents;
-    const parent_hex = std.fmt.bytesToHex(parent_result, .lower);
-    if (!std.mem.eql(u8, &parent_hex, contract.parents_sha256))
-        return error.AzureRuntimeChanged;
+    errdefer for (parents[0..parent_count]) |parent|
+        parent.directory.close(io);
 
     const root_path = try allocator.dupeZ(u8, contract.root);
     defer allocator.free(root_path);
@@ -458,6 +481,8 @@ pub fn seal(
         return error.AzureRuntimeSealDestinationContent;
     readonlyMount(destination.handle) catch
         return error.AzureRuntimeMountReadonlyUnavailable;
+    maskHostLoaderDirectories() catch
+        return error.AzureRuntimeLoaderIsolationUnavailable;
     try dropNamespaceAuthority();
 
     const loader_relative = contract.dynamic_loader.path[contract.root.len + 1 ..];
@@ -475,6 +500,8 @@ pub fn seal(
     const result: Sealed = .{
         .source = source,
         .source_snapshot = source_snapshot,
+        .parents = parents,
+        .parent_count = parent_count,
         .root = destination,
         .root_snapshot = root_snapshot,
         .loader = loader,
@@ -651,6 +678,31 @@ fn readonlyMount(descriptor: linux.fd_t) !void {
         @intFromPtr(&attributes),
         @sizeOf(MountAttributes),
     )) != .SUCCESS) return error.AzureRuntimeMountUnavailable;
+}
+
+fn maskHostLoaderDirectories() !void {
+    inline for (.{
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/local/lib",
+        "/usr/local/lib64",
+    }) |path| {
+        const result = linux.mount(
+            "tmpfs",
+            path,
+            "tmpfs",
+            linux.MS.RDONLY | linux.MS.NOSUID | linux.MS.NODEV |
+                linux.MS.NOEXEC,
+            @intFromPtr("mode=000,size=4096,nr_inodes=1"),
+        );
+        switch (linux.errno(result)) {
+            .SUCCESS => {},
+            .NOENT, .NOTDIR => {},
+            else => return error.AzureRuntimeMountUnavailable,
+        }
+    }
 }
 
 fn dropNamespaceAuthority() !void {
@@ -1005,11 +1057,60 @@ fn parentDigest(
             .handle = directory.handle,
             .flags = .{ .nonblocking = false },
         });
-        try validateDirectory(observed);
+        try validateParentDirectory(path, observed);
         hashParent(&hash, path, observed);
         previous = path;
     }
     return hash.finalResult();
+}
+
+fn retainParents(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    contract: Contract,
+    retained: *[max_parent_directories]ParentCustody,
+) !usize {
+    var paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    try addParents(allocator, &paths, contract.root);
+    for (contract.loader_dependencies) |dependency|
+        try addParents(allocator, &paths, dependency.path);
+    std.mem.sort([]u8, paths.items, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    var count: usize = 0;
+    errdefer for (retained[0..count]) |parent|
+        parent.directory.close(io);
+    var hash = core.Sha256.init(.{});
+    var previous: ?[]const u8 = null;
+    for (paths.items) |path| {
+        if (previous != null and std.mem.eql(u8, previous.?, path)) continue;
+        if (count >= retained.len) return error.AzureRuntimeLimit;
+        const directory = try openDirectoryAbsolute(io, path);
+        errdefer directory.close(io);
+        const observed = try files.snapshot(.{
+            .handle = directory.handle,
+            .flags = .{ .nonblocking = false },
+        });
+        try validateParentDirectory(path, observed);
+        hashParent(&hash, path, observed);
+        retained[count] = .{
+            .directory = directory,
+            .snapshot = observed,
+        };
+        count += 1;
+        previous = path;
+    }
+    const digest = std.fmt.bytesToHex(hash.finalResult(), .lower);
+    if (!std.mem.eql(u8, &digest, contract.parents_sha256))
+        return error.AzureRuntimeChanged;
+    return count;
 }
 
 fn hashParent(
@@ -1027,11 +1128,21 @@ fn hashParent(
             value.dev_minor,
             value.ino,
             value.mode,
-            files.hostUid(value.uid),
-            files.hostGid(value.gid),
+            if (std.mem.eql(u8, path, "/")) 0 else files.hostUid(value.uid),
+            if (std.mem.eql(u8, path, "/")) 0 else files.hostGid(value.gid),
         },
     ) catch unreachable;
     hash.update(line);
+}
+
+fn validateParentDirectory(path: []const u8, value: files.Snapshot) !void {
+    if (std.mem.eql(u8, path, "/")) {
+        if (value.mode & linux.S.IFMT != linux.S.IFDIR or
+            value.mode & 0o022 != 0)
+            return error.UnsafeAzureRuntime;
+        return;
+    }
+    try validateDirectory(value);
 }
 
 fn addParents(
@@ -1083,8 +1194,7 @@ fn inspectArtifactIdentity(
 
 fn validateDirectory(value: files.Snapshot) !void {
     if (value.mode & linux.S.IFMT != linux.S.IFDIR or
-        (value.uid != 0 and value.uid != linux.geteuid() and
-            value.uid != 65534) or
+        value.uid != 0 and value.uid != linux.geteuid() or
         value.mode & 0o022 != 0)
         return error.UnsafeAzureRuntime;
 }
@@ -1130,6 +1240,13 @@ fn exactManifest(root: []const u8, path: []const u8) bool {
     return path.len == parent.len + name.len and
         std.mem.startsWith(u8, path, parent) and
         std.mem.eql(u8, path[parent.len..], name);
+}
+
+fn pathDepth(path: []const u8) usize {
+    var depth: usize = 0;
+    var parts = std.mem.splitScalar(u8, path[1..], '/');
+    while (parts.next()) |_| depth += 1;
+    return depth;
 }
 
 fn loaderChild(root: []const u8, path: []const u8) bool {

@@ -301,48 +301,187 @@ def _copy_runtime_tree(source, destination, budget, merge=False):
         os.close(root_descriptor)
 
 
-def _elf_dependencies(paths):
+def _elf_dynamic(path):
+    path = Path(path)
+    info = path.stat()
+    with path.open("rb") as stream:
+        header = stream.read(64)
+        ci.require(
+            len(header) == 64 and header[:6] == b"\x7fELF\x02\x01",
+            "explicit ELF dynamic metadata required")
+        program_offset = struct.unpack_from("<Q", header, 32)[0]
+        program_size, program_count = struct.unpack_from("<HH", header, 54)
+        ci.require(
+            program_size == 56 and 0 < program_count <= 1024
+            and program_offset <= info.st_size
+            and program_count * program_size
+            <= info.st_size - program_offset,
+            "explicit ELF dynamic metadata required")
+        loads = []
+        dynamic = None
+        for index in range(program_count):
+            stream.seek(program_offset + index * program_size)
+            program = stream.read(program_size)
+            ci.require(
+                len(program) == program_size,
+                "explicit ELF dynamic metadata required")
+            kind = struct.unpack_from("<I", program)[0]
+            offset, virtual = struct.unpack_from("<QQ", program, 8)
+            file_size = struct.unpack_from("<Q", program, 32)[0]
+            ci.require(
+                offset <= info.st_size
+                and file_size <= info.st_size - offset,
+                "explicit ELF dynamic metadata required")
+            if kind == 1:
+                loads.append((virtual, file_size, offset))
+            elif kind == 2:
+                ci.require(dynamic is None and file_size % 16 == 0,
+                           "explicit ELF dynamic metadata required")
+                dynamic = (offset, file_size)
+        if dynamic is None:
+            return ()
+        ci.require(dynamic[1] // 16 <= 4096,
+                   "ELF dynamic metadata limit exceeded")
+        stream.seek(dynamic[0])
+        entries = []
+        for _ in range(dynamic[1] // 16):
+            raw = stream.read(16)
+            ci.require(
+                len(raw) == 16,
+                "explicit ELF dynamic metadata required")
+            tag, value = struct.unpack("<qQ", raw)
+            if tag == 0:
+                break
+            entries.append((tag, value))
+        else:
+            raise ci.Refusal("unterminated ELF dynamic metadata")
+        string_addresses = [value for tag, value in entries if tag == 5]
+        string_sizes = [value for tag, value in entries if tag == 10]
+        ci.require(len(string_addresses) == 1 and len(string_sizes) == 1
+                   and 0 < string_sizes[0] <= 16 * 1024 * 1024,
+                   "explicit ELF dynamic string table required")
+        string_offset = None
+        for virtual, size, offset in loads:
+            if virtual <= string_addresses[0] < virtual + size:
+                string_offset = offset + string_addresses[0] - virtual
+                break
+        ci.require(
+            string_offset is not None
+            and string_offset <= info.st_size
+            and string_sizes[0] <= info.st_size - string_offset,
+            "explicit ELF dynamic string table required")
+        stream.seek(string_offset)
+        strings = stream.read(string_sizes[0])
+        ci.require(
+            len(strings) == string_sizes[0],
+            "explicit ELF dynamic string table required")
+
+    def dynamic_string(offset):
+        ci.require(offset < len(strings),
+                   "invalid ELF dynamic string")
+        end = strings.find(b"\0", offset)
+        ci.require(end >= 0, "invalid ELF dynamic string")
+        return strings[offset:end].decode("utf-8", "strict")
+
+    ci.require(
+        not any(
+            tag in (15, 29, 0x6FFFFEFB, 0x6FFFFEFC,
+                    0x7FFFFFFD, 0x7FFFFFFF)
+            for tag, _ in entries
+        ),
+        "ELF alternate dependency lookup forbidden")
+    needed = []
+    for tag, value in entries:
+        if tag != 1:
+            continue
+        name = dynamic_string(value)
+        ci.require(
+            name == Path(name).name and name not in ("", ".", "..")
+            and "/" not in name and "\\" not in name
+            and len(name.encode("utf-8")) <= 255,
+            "unsafe ELF dependency name")
+        ci.require(name not in needed, "duplicate ELF dependency name")
+        needed.append(name)
+    return tuple(needed)
+
+
+def _ldd_dependencies(path):
     ldd = Path("/usr/bin/ldd")
     ci.require(ldd.is_file(), "explicit dynamic loader inspection required")
-    dependencies = set()
-    for path in sorted(map(Path, paths)):
+    completed = subprocess.run(
+        [str(ldd), str(path)], env={"LC_ALL": "C"},
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, timeout=60, check=False)
+    ci.require(completed.returncode == 0
+               and len(completed.stdout) <= 1024 * 1024,
+               "dynamic loader dependency inspection failed")
+    result = {}
+    for raw in completed.stdout.decode("utf-8", "strict").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("linux-vdso."):
+            continue
+        name = None
+        candidate = None
+        if " => " in line:
+            name, value = line.split(" => ", 1)
+            name = name.strip()
+            value = value.split(" (", 1)[0]
+            ci.require(value != "not found",
+                       "unresolved native Azure runtime dependency")
+            if value.startswith("/"):
+                candidate = value
+        elif line.startswith("/"):
+            candidate = line.split(" (", 1)[0]
+            name = Path(candidate).name
+        if candidate is None:
+            continue
+        resolved = Path(candidate).resolve(strict=True)
+        info = resolved.lstat()
+        ci.require(stat.S_ISREG(info.st_mode)
+                   and info.st_uid in (0, os.geteuid())
+                   and not info.st_mode & 0o7022
+                   and info.st_nlink == 1
+                   and 0 < info.st_size
+                   <= AZURE_RUNTIME_MAX_FILE_BYTES,
+                   "unsafe native Azure runtime dependency")
+        prior = result.get(name)
+        ci.require(prior is None or prior == resolved,
+                   "ambiguous native Azure runtime dependency")
+        result[name] = resolved
+    return result
+
+
+def _elf_dependencies(paths):
+    dependencies = {}
+    pending = list(sorted(map(Path, paths)))
+    inspected = set()
+    while pending:
+        path = _canonical_absolute(
+            pending.pop(), "canonical ELF dependency required")
+        if path in inspected:
+            continue
+        inspected.add(path)
         with path.open("rb") as stream:
             if stream.read(4) != b"\x7fELF":
                 continue
-        completed = subprocess.run(
-            [str(ldd), str(path)], env={"LC_ALL": "C"},
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=60, check=False)
-        ci.require(completed.returncode == 0
-                   and len(completed.stdout) <= 1024 * 1024,
-                   "dynamic loader dependency inspection failed")
-        for raw in completed.stdout.decode("utf-8", "strict").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("linux-vdso."):
-                continue
-            candidate = None
-            if " => " in line:
-                value = line.split(" => ", 1)[1].split(" (", 1)[0]
-                ci.require(value != "not found",
-                           "unresolved native Azure runtime dependency")
-                if value.startswith("/"):
-                    candidate = value
-            elif line.startswith("/"):
-                candidate = line.split(" (", 1)[0]
-            if candidate is not None:
-                resolved = Path(candidate).resolve(strict=True)
-                info = resolved.lstat()
-                ci.require(stat.S_ISREG(info.st_mode)
-                           and info.st_uid in (0, os.geteuid())
-                           and not info.st_mode & 0o7022
-                           and info.st_nlink == 1
-                           and 0 < info.st_size
-                           <= AZURE_RUNTIME_MAX_FILE_BYTES,
-                           "unsafe native Azure runtime dependency")
-                dependencies.add(resolved)
-    ci.require(len(dependencies) <= AZURE_RUNTIME_MAX_LOADER_FILES,
-               "Azure runtime loader dependency limit exceeded")
-    return sorted(dependencies, key=str)
+        needed = _elf_dynamic(path)
+        available = _ldd_dependencies(path)
+        for name in needed:
+            dependency = available.get(name)
+            ci.require(dependency is not None,
+                       "unresolved direct ELF dependency")
+            prior = dependencies.get(name)
+            ci.require(
+                prior is None or ci.digest(prior) == ci.digest(dependency),
+                "ELF dependency name collision")
+            dependencies[name] = dependency
+            if dependency not in inspected:
+                pending.append(dependency)
+        ci.require(
+            len(dependencies) <= AZURE_RUNTIME_MAX_LOADER_FILES
+            and len(pending) <= AZURE_RUNTIME_MAX_LOADER_FILES,
+            "Azure runtime loader dependency limit exceeded")
+    return dependencies
 
 
 def _elf_interpreter(path):
@@ -605,30 +744,31 @@ def prepare_azure_runtime(output, azure, az_python, stdlib, *,
             "unsafe native Azure runtime dependency")
         explicit_native.append(dependency)
     dynamic_loader_source = _elf_interpreter(az_python)
-    dependency_sources = set(_elf_dependencies(
-        [*native_files, *explicit_native]))
-    dependency_sources.update(explicit_native)
-    dependency_sources.add(dynamic_loader_source)
-    dependency_sources = sorted(dependency_sources, key=str)
+    dependency_sources = _elf_dependencies(
+        [*native_files, *explicit_native])
+    for dependency in explicit_native:
+        prior = dependency_sources.get(dependency.name)
+        ci.require(
+            prior is None or ci.digest(prior) == ci.digest(dependency),
+            "Azure runtime loader basename collision")
+        dependency_sources[dependency.name] = dependency
+    prior = dependency_sources.get(dynamic_loader_source.name)
+    ci.require(
+        prior is None or ci.digest(prior) == ci.digest(dynamic_loader_source),
+        "Azure runtime loader basename collision")
+    dependency_sources[dynamic_loader_source.name] = dynamic_loader_source
     ci.require(len(dependency_sources) <= AZURE_RUNTIME_MAX_LOADER_FILES,
                "Azure runtime loader dependency limit exceeded")
     loader_directory = runtime / "loader"
     loader_directory.mkdir(mode=0o700)
     dependencies = []
-    loader_names = {}
-    for dependency in dependency_sources:
-        destination = loader_directory / dependency.name
-        prior = loader_names.get(dependency.name)
-        ci.require(
-            prior is None or ci.digest(prior) == ci.digest(dependency),
-            "Azure runtime loader basename collision")
-        if prior is None:
-            _copy_runtime_file(
-                dependency, destination,
-                executable=dependency == dynamic_loader_source,
-                budget=budget)
-            loader_names[dependency.name] = dependency
-            dependencies.append(destination)
+    for name, dependency in sorted(dependency_sources.items()):
+        destination = loader_directory / name
+        _copy_runtime_file(
+            dependency, destination,
+            executable=dependency == dynamic_loader_source,
+            budget=budget)
+        dependencies.append(destination)
     dependencies.sort(key=str)
     dynamic_loader = loader_directory / dynamic_loader_source.name
 
@@ -695,6 +835,7 @@ def prepare_azure_runtime(output, azure, az_python, stdlib, *,
             "path_environment": "forbidden",
             "startup_hooks": "forbidden",
             "loader_environment": "retained_readonly_root",
+            "host_loader_fallback": "forbidden",
             "package_restore": "forbidden_after_custody",
         },
     }
@@ -717,10 +858,32 @@ def prepare_azure_runtime(output, azure, az_python, stdlib, *,
         "PYTHONSAFEPATH": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
+    loader_listing = ci.bounded_subprocess_output(
+        [
+            str(dynamic_loader), "--inhibit-cache", "--inhibit-rpath", "",
+            "--library-path", str(loader_directory), "--list",
+            str(interpreter),
+        ],
+        output, 1024 * 1024, 30,
+        "prepared Azure runtime loader listing overflow",
+        "prepared Azure runtime loader listing timeout",
+        "prepared Azure runtime loader closure unavailable",
+        env=probe_environment)
+    for raw in loader_listing.decode("utf-8", "strict").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("linux-vdso."):
+            continue
+        value = (
+            line.split(" => ", 1)[1].split(" (", 1)[0]
+            if " => " in line else line.split(" (", 1)[0]
+        )
+        ci.require(
+            value.startswith(str(loader_directory) + os.sep),
+            "prepared Azure runtime loader escaped closure")
     for command in AZURE_RUNTIME_COMMANDS:
         arguments = [
-            str(dynamic_loader), "--inhibit-cache", "--library-path",
-            str(loader_directory), str(interpreter),
+            str(dynamic_loader), "--inhibit-cache", "--inhibit-rpath", "",
+            "--library-path", str(loader_directory), str(interpreter),
             "-s", "-S", "-B", "-P", str(launcher), *command,
         ]
         if command == ("version",):
