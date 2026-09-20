@@ -478,7 +478,7 @@ fn run(init: std.process.Init) !void {
         try f.expect(args.len == 1 and fake.is("process-output-overflow"));
         return seams.Overflow.emit(c);
     }
-    if (one(args[0], &.{ "scope", "ledger", "json", "serial", "inputs" })) {
+    if (one(args[0], &.{ "scope", "candidate", "legacy-scope", "ledger", "legacy-ledger", "json", "serial", "inputs" })) {
         try f.expect(args.len >= 2);
         for (args[1..]) |path| try c.confined(path);
         if (eq(args[0], "inputs")) {

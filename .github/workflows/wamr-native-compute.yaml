@@ -394,7 +394,7 @@ jobs:
             --supervisor "${supervisor}" \
             --artifact-id "${ARTIFACT_ID}" \
             --container-digest "${CONTAINER_DIGEST}"
-          python3 support/build/wamr-native-ci/handoff.py plan \
+          python3 support/build/wamr-native-ci/handoff.py candidate \
             --bundle "${import_root}/success/bundle.json" \
             --output "${import_root}/candidate-scope.json"
           "${validator}" candidate "${import_root}/candidate-scope.json"

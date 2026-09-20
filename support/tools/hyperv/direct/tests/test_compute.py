@@ -318,7 +318,8 @@ class Compute(unittest.TestCase):
         write(self.scope_path, changed)
         self.validate("scope", status=1)
         write(self.scope_path, self.scope)
-        self.validate("scope")
+        self.validate("legacy-scope")
+        self.validate("scope", status=1)
         other = subprocess.run([TOOLS / "uk-hyperv-direct-validate", "scope", self.scope_path],
                                env={"HOME": str(self.root)}, capture_output=True, timeout=30)
         self.assertNotEqual(other.returncode, 0)
@@ -463,7 +464,7 @@ class Compute(unittest.TestCase):
         self.assertNotIn(b"private synthetic", completed.stderr + completed.stdout)
 
     def test_missing_campaign_ledger_has_preadmission_diagnostic(self):
-        for name in ("uk-wamr-direct-compute", "uk-hyperv-direct-two-boot"):
+        for name in ("uk-hyperv-direct-two-boot",):
             completed = subprocess.run(
                 [TOOLS / name, self.scope_path, self.root / "attempt", self.root / "missing-ledger",
                  FAKE, FAKE, FAKE], env={"HOME": str(self.root)},
@@ -520,7 +521,11 @@ class Compute(unittest.TestCase):
                 del env["LD_LIBRARY_PATH"]
                 env["HOME"] = str(self.root)
                 completed = subprocess.run(args, env=env, capture_output=True, timeout=10)
-                self.assertEqual(completed.returncode, 0, completed.stderr)
+                expected = python or name == "uk-hyperv-direct-two-boot"
+                self.assertEqual(completed.returncode == 0, expected, completed.stderr)
+                if not expected:
+                    self.assertEqual(set(capture.iterdir()), set())
+                    continue
                 self.assertIn(b"authority=not_admitted", completed.stdout)
                 self.assertEqual(completed.stderr, b"")
                 self.assertEqual(set(p.name for p in capture.iterdir()), {
@@ -536,7 +541,8 @@ class Compute(unittest.TestCase):
         capture.mkdir(mode=0o700)
         write(capture / "cli-version.process.json", b"existing immutable record")
         completed = subprocess.run(
-            [TOOLS / "uk-wamr-direct-compute", "preflight", capture, fixture],
+            [TOOLS / "uk-wamr-direct-compute", "preflight", capture, fixture,
+             "--az-python", fixture],
             env={"HOME": str(self.root)}, capture_output=True, timeout=10)
         self.assertEqual(completed.returncode, 29)
         status = json.loads(completed.stderr)
@@ -561,7 +567,7 @@ class Compute(unittest.TestCase):
                                        capture_output=True, timeout=10)
             self.assertEqual(completed.returncode == 0, explicit, completed.stderr)
             if not explicit:
-                self.assertEqual(json.loads(completed.stderr)["reason"], "CliStartupFailed")
+                self.assertIn(b"reason=InvalidArguments", completed.stderr)
         self.assertFalse((self.root / "attempt").exists())
         self.assertFalse((self.root / "ledger").exists())
 
@@ -672,7 +678,7 @@ class Compute(unittest.TestCase):
         bundle_path = self.root / "bundle.json"
         write(bundle_path, bundle)
         output = self.root / "plan.json"
-        value = handoff.plan(bundle_path, output)
+        value = handoff.candidate_plan(bundle_path, output)
         self.assertEqual(value["authority"], "not_admitted")
         self.assertFalse(value["approval"]["fresh_final_approval"])
         self.assertEqual(value["approval"]["expires_unix"], 0)
@@ -680,7 +686,7 @@ class Compute(unittest.TestCase):
         self.validate("scope", status=1)
         write(path, b"changed")
         with self.assertRaises(ValueError):
-            handoff.plan(bundle_path, self.root / "changed-plan.json")
+            handoff.candidate_plan(bundle_path, self.root / "changed-plan.json")
 
     def test_sealed_topology(self):
         template = read(REPO / "support/azure/wamr-direct-compute.json")
@@ -884,7 +890,7 @@ class Compute(unittest.TestCase):
             stream.write(b"\x07")
         self.validate("inputs", status=1)
         with self.assertRaises(ValueError):
-            handoff.plan(bundle_path, self.root / "mutated-plan.json")
+            handoff.candidate_plan(bundle_path, self.root / "mutated-plan.json")
 
     def public_archive_checks(self, bundle_path):
         stage = bundle_path.parent
@@ -943,7 +949,7 @@ class Compute(unittest.TestCase):
             VALIDATOR, SUPERVISOR)
         self.assertEqual(imported["authority"], "not_admitted")
         self.assertEqual((output / "artifacts/vhd").read_bytes(), (stage / "artifacts/vhd").read_bytes())
-        self.assertEqual(handoff.plan(output / "bundle.json", self.root / "public-plan.json")["authority"],
+        self.assertEqual(handoff.candidate_plan(output / "bundle.json", self.root / "public-plan.json")["authority"],
                          "not_admitted")
         for key in ("source_revision", "source_tree", "wamr_revision", "run_id", "run_attempt"):
             wrong = dict(source, **{key: "2" if key.startswith("run_") else "c" * 40})
