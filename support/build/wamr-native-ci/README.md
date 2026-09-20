@@ -439,14 +439,15 @@ inode and content before attempt/backend work. Retained native ELF tools run thr
 the controller re-execs in a private user/mount namespace, copies the
 authenticated runtime to bounded tmpfs, remounts it read-only, and drops its
 namespace capabilities. Exact kernel UID/GID maps, disabled setgroups and
-private mount propagation authenticate the re-exec boundary. Azure calls
-inhibit the loader cache and RPATH, execute the retained copied loader with
-only copied DSOs, and cannot fall back to masked host library directories;
-Python and the bootstrap/modules/data are addressed below a retained
-`/proc/self/fd/N` root. The original source closure, every approved parent and
-the immutable execution copy are revalidated before and after every Azure
-consumer and final cleanup/absence observation. Runtime sealing completes
-before the first campaign-ledger access.
+private mount propagation plus an exact initial-namespace parent relationship
+authenticate the re-exec boundary. Azure calls inhibit the loader cache and
+RPATH, execute the retained copied loader with only copied DSOs, refuse a
+system `ld.so.preload`, and cannot fall back to masked host library
+directories; Python and the bootstrap/modules/data are addressed below a
+retained `/proc/self/fd/N` root. The original source closure, every approved
+parent and the immutable execution copy are revalidated before and after
+every Azure consumer and final cleanup/absence observation. Runtime sealing
+completes before the first campaign-ledger access.
 
 See [WAMR direct compute](../../azure/WAMR-DIRECT-COMPUTE.md) for the private
 export, independent native revalidation, explicit authorization recording,

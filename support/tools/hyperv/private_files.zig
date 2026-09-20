@@ -9,6 +9,7 @@ var namespace_overflow_gid = std.atomic.Value(u32).init(std.math.maxInt(u32));
 pub const namespace_marker = "WAMR_AZURE_RUNTIME_NAMESPACE";
 pub const namespace_uid = "WAMR_AZURE_RUNTIME_HOST_UID";
 pub const namespace_gid = "WAMR_AZURE_RUNTIME_HOST_GID";
+pub const namespace_parent = "WAMR_AZURE_RUNTIME_PARENT_PID";
 
 pub fn enterUserNamespace(uid: u32, gid: u32) void {
     namespace_host_uid.store(uid, .release);
@@ -34,7 +35,13 @@ pub fn enterUserNamespaceFromEnvironment(
         environment.get(namespace_gid) orelse return error.InvalidUserNamespace,
         10,
     );
-    const overflow = try verifyNamespace(io, uid, gid);
+    const parent = try std.fmt.parseInt(
+        linux.pid_t,
+        environment.get(namespace_parent) orelse
+            return error.InvalidUserNamespace,
+        10,
+    );
+    const overflow = try verifyNamespace(io, uid, gid, parent);
     namespace_overflow_uid.store(overflow.uid, .release);
     namespace_overflow_gid.store(overflow.gid, .release);
     enterUserNamespace(uid, gid);
@@ -44,7 +51,28 @@ fn verifyNamespace(
     io: std.Io,
     host_uid: u32,
     host_gid: u32,
+    parent: linux.pid_t,
 ) !struct { uid: u32, gid: u32 } {
+    if (parent <= 1 or linux.getppid() != parent)
+        return error.InvalidNamespaceParent;
+    var parent_uid_map: [64]u8 = undefined;
+    var parent_gid_map: [64]u8 = undefined;
+    verifyParentInitialIdMap(
+        io,
+        try std.fmt.bufPrint(
+            &parent_uid_map,
+            "/proc/{d}/uid_map",
+            .{parent},
+        ),
+    ) catch return error.InvalidNamespaceParentMap;
+    verifyParentInitialIdMap(
+        io,
+        try std.fmt.bufPrint(
+            &parent_gid_map,
+            "/proc/{d}/gid_map",
+            .{parent},
+        ),
+    ) catch return error.InvalidNamespaceParentMap;
     try verifyIdMap(io, "/proc/self/uid_map", host_uid);
     try verifyIdMap(io, "/proc/self/gid_map", host_gid);
     var groups_buffer: [32]u8 = undefined;
@@ -96,6 +124,50 @@ fn verifyNamespace(
     if (overflow_uid == 0 or overflow_gid == 0)
         return error.InvalidUserNamespace;
     return .{ .uid = overflow_uid, .gid = overflow_gid };
+}
+
+pub fn verifyInitialNamespace(io: std.Io) !void {
+    try verifyInitialIdMap(io, "/proc/self/uid_map");
+    try verifyInitialIdMap(io, "/proc/self/gid_map");
+}
+
+fn verifyInitialIdMap(io: std.Io, path: []const u8) !void {
+    try verifyFullIdMap(io, path, 0);
+}
+
+fn verifyParentInitialIdMap(io: std.Io, path: []const u8) !void {
+    try verifyFullIdMap(io, path, std.math.maxInt(u32));
+}
+
+fn verifyFullIdMap(
+    io: std.Io,
+    path: []const u8,
+    outside_expected: u32,
+) !void {
+    var buffer: [128]u8 = undefined;
+    var fields = std.mem.tokenizeAny(
+        u8,
+        try readKernelFile(io, path, &buffer),
+        " \t\r\n",
+    );
+    const inside = try std.fmt.parseInt(
+        u64,
+        fields.next() orelse return error.InvalidUserNamespace,
+        10,
+    );
+    const outside = try std.fmt.parseInt(
+        u64,
+        fields.next() orelse return error.InvalidUserNamespace,
+        10,
+    );
+    const count = try std.fmt.parseInt(
+        u64,
+        fields.next() orelse return error.InvalidUserNamespace,
+        10,
+    );
+    if (inside != 0 or outside != outside_expected or
+        count != std.math.maxInt(u32) or fields.next() != null)
+        return error.InvalidUserNamespace;
 }
 
 fn verifyIdMap(io: std.Io, path: []const u8, host_id: u32) !void {

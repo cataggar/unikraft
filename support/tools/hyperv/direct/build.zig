@@ -120,6 +120,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     runtime_tests.dependOn(&b.addRunArtifact(overflow_owner_fixture).step);
+    const forged_namespace = b.addRunArtifact(overflow_owner_fixture);
+    forged_namespace.addArg("--forged-marker");
+    runtime_tests.dependOn(&forged_namespace.step);
+    const system_preload = b.addRunArtifact(overflow_owner_fixture);
+    system_preload.addArg("--system-preload");
+    runtime_tests.dependOn(&system_preload.step);
     inline for (.{
         "../process_command_tests.zig",
         "../process_command_gate_tests.zig",
