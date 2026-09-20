@@ -53,8 +53,14 @@ fn execute(init: std.process.Init) !void {
     var artifact = try files.RetainedFile.open(init.io, path, .artifact);
     defer artifact.close(init.io);
     try artifact.verify(init.io);
-    if (!files.isNamespaceOverflowUid(artifact.file_snapshot.uid))
+    const snapshot = artifact.file_snapshot;
+    if (!files.isNamespaceOverflowUid(snapshot.uid))
         return error.ExpectedOverflowOwner;
+    if (snapshot.mode & linux.S.IFMT != linux.S.IFREG or
+        snapshot.mode & 0o111 == 0 or snapshot.mode & 0o6022 != 0 or
+        snapshot.nlink != 1 or snapshot.size == 0 or
+        snapshot.size > 64 * 1024 * 1024)
+        return error.InvalidOverflowToolFixture;
 
     if (files.RetainedFile.open(init.io, path, .tool)) |value| {
         var tool = value;

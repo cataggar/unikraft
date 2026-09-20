@@ -252,12 +252,12 @@ as `/proc/self/fd/N/...`. Kernel UID/GID maps, disabled setgroups and private
 mount propagation plus the exact initial-namespace parent relationship
 authenticate the internal controller re-exec marker. A separate
 native-validator child marker requires the same maps and an untraced,
-zero-capability `no_new_privs` process and parent; the controller rejects that
-child marker. It does not use
-`AZ_PYTHON`, the original bootstrap pathname or an ambient/default loader as
-execution authority. The original root and every approved parent remain
-retained and revalidated, so later source or parent drift still refuses even
-though it cannot alter executed bytes.
+`no_new_privs` process and parent with zero effective, permitted, inheritable
+and ambient capability sets; the controller rejects that child marker. It
+does not use `AZ_PYTHON`, the original bootstrap pathname or an
+ambient/default loader as execution authority. The original root and every
+approved parent remain retained and revalidated, so later source or parent
+drift still refuses even though it cannot alter executed bytes.
 
 Run this local-only command before obtaining a future live approval:
 

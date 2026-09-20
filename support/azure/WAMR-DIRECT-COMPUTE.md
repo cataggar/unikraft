@@ -547,8 +547,8 @@ re-exec marker is accepted only from its exact live parent with exact one-ID
 UID/GID kernel maps, disabled setgroups, private root-mount propagation and a
 parent still in the initial user namespace. That controller marker cannot be
 replaced by the separate native-validator child marker, which requires the
-same exact maps plus an untraced, zero-capability `no_new_privs` process and
-parent. Azure calls use
+same exact maps plus an untraced `no_new_privs` process and parent with zero
+effective, permitted, inheritable and ambient capability sets. Azure calls use
 `--inhibit-cache --inhibit-rpath ''`, execute the retained copied loader with
 only copied DSOs, refuse any system `ld.so.preload`, and mask host loader
 directories in the private mount namespace. Python, bootstrap, modules, data

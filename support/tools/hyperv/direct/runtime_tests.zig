@@ -111,8 +111,52 @@ test "explicit selected operator environment excludes ambient secrets paths and 
     for ([_][]const u8{ "PRIVATE_SECRET", "SAS", "PATH", "PYTHONPATH", "AZ_PYTHON", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE", "LD_PRELOAD", "LD_LIBRARY_PATH" }) |key|
         try testing.expect(environment.azure.get(key) == null);
     try testing.expect(environment.native.get("HOME") == null);
+    try testing.expect(
+        environment.native.get(core.private_files.namespace_marker) == null,
+    );
     try source.put("HTTPS_PROXY", "https://proxy.invalid?sig=secret");
     try testing.expectError(error.SecretArgument, runtime.Environment.init(allocator, &source));
+}
+
+test "native namespace state is inherited only from authenticated controller" {
+    var source = std.process.Environ.Map.init(allocator);
+    defer source.deinit();
+    try source.put("HOME", support.options.test_root.?);
+    try source.put(
+        core.private_files.namespace_marker,
+        core.private_files.namespace_controller,
+    );
+    try source.put(core.private_files.namespace_uid, "1000");
+    try source.put(core.private_files.namespace_gid, "1001");
+    var environment = try runtime.Environment.init(allocator, &source);
+    defer environment.deinit();
+    try testing.expectEqualStrings(
+        core.private_files.namespace_child,
+        environment.native.get(core.private_files.namespace_marker).?,
+    );
+    try testing.expectEqualStrings(
+        "1000",
+        environment.native.get(core.private_files.namespace_uid).?,
+    );
+    try testing.expectEqualStrings(
+        "1001",
+        environment.native.get(core.private_files.namespace_gid).?,
+    );
+    try testing.expect(
+        environment.native.get(core.private_files.namespace_parent) != null,
+    );
+    var incomplete = std.process.Environ.Map.init(allocator);
+    defer incomplete.deinit();
+    try incomplete.put("HOME", support.options.test_root.?);
+    try incomplete.put(
+        core.private_files.namespace_marker,
+        core.private_files.namespace_controller,
+    );
+    try incomplete.put(core.private_files.namespace_gid, "1001");
+    try testing.expectError(
+        error.InvalidUserNamespace,
+        runtime.Environment.init(allocator, &incomplete),
+    );
 }
 
 test "local version executes self contained and explicitly pinned interpreter under clean environment" {

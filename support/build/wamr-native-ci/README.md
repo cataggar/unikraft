@@ -442,15 +442,15 @@ namespace capabilities. Exact kernel UID/GID maps, disabled setgroups and
 private mount propagation plus an exact initial-namespace parent relationship
 authenticate the controller re-exec boundary. Its marker is distinct from
 the native-validator child marker, which requires the same maps and an
-untraced, zero-capability `no_new_privs` process and parent. Azure calls
-inhibit the loader cache and RPATH, execute the retained copied loader with
-only copied DSOs, refuse a system `ld.so.preload`, and cannot fall back to
-masked host library directories; Python and the bootstrap/modules/data are
-addressed below a retained `/proc/self/fd/N` root. The original source
-closure, every approved parent and the immutable execution copy are
-revalidated before and after every Azure consumer and final cleanup/absence
-observation. Runtime sealing completes before the first campaign-ledger
-access.
+untraced `no_new_privs` process and parent with zero effective, permitted,
+inheritable and ambient capability sets. Azure calls inhibit the loader cache
+and RPATH, execute the retained copied loader with only copied DSOs, refuse a
+system `ld.so.preload`, and cannot fall back to masked host library
+directories; Python and the bootstrap/modules/data are addressed below a
+retained `/proc/self/fd/N` root. The original source closure, every approved
+parent and the immutable execution copy are revalidated before and after
+every Azure consumer and final cleanup/absence observation. Runtime sealing
+completes before the first campaign-ledger access.
 
 See [WAMR direct compute](../../azure/WAMR-DIRECT-COMPUTE.md) for the private
 export, independent native revalidation, explicit authorization recording,
