@@ -950,6 +950,18 @@ jobs:
           --prefix "${root}/compute-supervisor" \
           -Doptimize=ReleaseSafe \
           -Dsource-closure-sha256="${supervisor_source_closure}"
+        userns_restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        if test -e "${userns_restriction}" &&
+            test "$(cat "${userns_restriction}")" != 0; then
+          userns_restriction_original="$(cat "${userns_restriction}")"
+          restore_userns_restriction() {
+            sudo sysctl -q -w \
+              "kernel.apparmor_restrict_unprivileged_userns=${userns_restriction_original}"
+          }
+          trap restore_userns_restriction EXIT
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          test "$(cat "${userns_restriction}")" = 0
+        fi
         WAMR_DIRECT_TOOLS="${root}/tools/bin" \
         WAMR_CI_PACKAGE="${root}/compute-tools/bin/wamr-ci-package" \
         WAMR_CI_SUPERVISOR="${root}/compute-supervisor/bin/wamr-ci-supervisor" \
