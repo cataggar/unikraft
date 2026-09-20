@@ -160,6 +160,88 @@ test "native namespace state is inherited only from authenticated controller" {
     );
 }
 
+const namespace_stages = [_]azure_runtime.NamespaceStage{
+    .user_namespace,
+    .setgroups_control,
+    .uid_map,
+    .gid_map,
+    .mapped_identity,
+    .mount_namespace,
+    .reexec,
+};
+
+fn namespaceReport(bytes: []const u8) !azure_runtime.NamespaceReport {
+    var pipe: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS)
+        return error.ReportPipeUnavailable;
+    defer _ = linux.close(pipe[0]);
+    const written = if (bytes.len == 0)
+        0
+    else
+        linux.write(pipe[1], bytes.ptr, bytes.len);
+    _ = linux.close(pipe[1]);
+    if (written != bytes.len) return error.ReportWriteFailed;
+    return azure_runtime.readNamespaceReport(pipe[0]);
+}
+
+test "namespace refusal names the step the host denied" {
+    comptime {
+        const fields = @typeInfo(azure_runtime.NamespaceStage).@"enum".fields;
+        if (fields.len != namespace_stages.len)
+            @compileError("every namespace stage needs a refusal regression");
+    }
+    for (namespace_stages, 0..) |stage, index| {
+        // Zero is reserved: it cannot be told apart from an unwritten report.
+        try testing.expect(@intFromEnum(stage) != 0);
+        try testing.expectEqual(
+            stage,
+            azure_runtime.NamespaceStage.fromCode(@intFromEnum(stage)).?,
+        );
+        for (namespace_stages[index + 1 ..]) |other| {
+            try testing.expect(@intFromEnum(stage) != @intFromEnum(other));
+            try testing.expect(!std.mem.eql(
+                u8,
+                @errorName(stage.refusal()),
+                @errorName(other.refusal()),
+            ));
+        }
+    }
+    try testing.expect(azure_runtime.NamespaceStage.fromCode(0) == null);
+    try testing.expect(azure_runtime.NamespaceStage.fromCode(200) == null);
+    // Only steps the host policy governs may blame that policy.
+    try testing.expect(azure_runtime.NamespaceStage.uid_map.hostGoverned());
+    try testing.expect(!azure_runtime.NamespaceStage.reexec.hostGoverned());
+    // Operators and CI logs match on these names; keep them stable.
+    try testing.expectEqualStrings(
+        "AzureRuntimeNamespaceUidMapDenied",
+        @errorName(azure_runtime.NamespaceStage.uid_map.refusal()),
+    );
+    try testing.expectEqualStrings(
+        "AzureRuntimeNamespaceReexecDenied",
+        @errorName(azure_runtime.NamespaceStage.reexec.refusal()),
+    );
+}
+
+test "namespace report separates a re-exec from a refused step" {
+    switch (try namespaceReport(&.{})) {
+        .reexecuted => {},
+        else => return error.ExpectedReexecutedReport,
+    }
+    for (namespace_stages) |stage| {
+        switch (try namespaceReport(&.{@intFromEnum(stage)})) {
+            .refused => |refused| try testing.expectEqual(stage, refused),
+            else => return error.ExpectedRefusedReport,
+        }
+    }
+    for ([_]u8{ 0, 8, 200, 255 }) |code| {
+        try testing.expect(azure_runtime.NamespaceStage.fromCode(code) == null);
+        switch (try namespaceReport(&.{code})) {
+            .lost => {},
+            else => return error.ExpectedLostReport,
+        }
+    }
+}
+
 test "system loader preload path must remain absent" {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
