@@ -1,4 +1,5 @@
 const std = @import("std");
+const azure_runtime = @import("azure_runtime.zig");
 const runtime = @import("runtime.zig");
 const validator = @import("main.zig");
 const core = @import("hyperv_core");
@@ -157,6 +158,36 @@ test "native namespace state is inherited only from authenticated controller" {
         error.InvalidUserNamespace,
         runtime.Environment.init(allocator, &incomplete),
     );
+}
+
+test "system loader preload path must remain absent" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    const present = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}/ld.so.preload",
+        .{ support.options.test_root.?, fixture.name },
+        0,
+    );
+    defer allocator.free(present);
+    const missing = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}/missing.preload",
+        .{ support.options.test_root.?, fixture.name },
+        0,
+    );
+    defer allocator.free(missing);
+    var file = try fixture.directory.dir.createFile(
+        io,
+        "ld.so.preload",
+        .{ .permissions = .fromMode(0o600) },
+    );
+    file.close(io);
+    try testing.expectError(
+        error.SystemLoaderPreloadPresent,
+        azure_runtime.Test.rejectLoaderPreload(present),
+    );
+    try azure_runtime.Test.rejectLoaderPreload(missing);
 }
 
 test "local version executes self contained and explicitly pinned interpreter under clean environment" {

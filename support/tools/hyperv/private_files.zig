@@ -242,9 +242,16 @@ fn verifyFullIdMap(
     outside_expected: u32,
 ) !void {
     var buffer: [128]u8 = undefined;
+    try verifyFullIdMapBytes(
+        try readKernelFile(io, path, &buffer),
+        outside_expected,
+    );
+}
+
+fn verifyFullIdMapBytes(bytes: []const u8, outside_expected: u32) !void {
     var fields = std.mem.tokenizeAny(
         u8,
-        try readKernelFile(io, path, &buffer),
+        bytes,
         " \t\r\n",
     );
     const inside = try std.fmt.parseInt(
@@ -265,6 +272,24 @@ fn verifyFullIdMap(
     if (inside != 0 or outside != outside_expected or
         count != std.math.maxInt(u32) or fields.next() != null)
         return error.IdMapMismatch;
+}
+
+test "namespace parent map distinguishes initial and nested namespaces" {
+    try verifyFullIdMapBytes(
+        "0 4294967295 4294967295\n",
+        std.math.maxInt(u32),
+    );
+    try std.testing.expectError(
+        error.IdMapMismatch,
+        verifyFullIdMapBytes("0 0 1\n", std.math.maxInt(u32)),
+    );
+    try std.testing.expectError(
+        error.IdMapMismatch,
+        verifyFullIdMapBytes(
+            "0 4294967295 1\n",
+            std.math.maxInt(u32),
+        ),
+    );
 }
 
 fn verifyIdMap(io: std.Io, path: []const u8, host_id: u32) !void {

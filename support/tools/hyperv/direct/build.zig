@@ -110,29 +110,6 @@ pub fn build(b: *std.Build) void {
     b.step("check-foundation", "Compile production direct foundation interfaces without running them").dependOn(&compile.step);
     foundation.dependOn(&compile.step);
     const runtime_tests = b.step("test-runtime", "Run private process and direct runtime fixtures");
-    const overflow_owner_fixture = b.addExecutable(.{
-        .name = "hyperv-direct-overflow-owner-fixture",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("overflow_owner_fixture.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "hyperv_core", .module = core }},
-        }),
-    });
-    runtime_tests.dependOn(&b.addRunArtifact(overflow_owner_fixture).step);
-    const forged_namespace = b.addRunArtifact(overflow_owner_fixture);
-    forged_namespace.addArg("--forged-marker");
-    runtime_tests.dependOn(&forged_namespace.step);
-    const system_preload = b.addRunArtifact(overflow_owner_fixture);
-    system_preload.addArg("--system-preload");
-    runtime_tests.dependOn(&system_preload.step);
-    const child_marker_controller = b.addRunArtifact(overflow_owner_fixture);
-    child_marker_controller.addArg("--child-marker-controller");
-    child_marker_controller.setEnvironmentVariable(
-        "WAMR_AZURE_RUNTIME_NAMESPACE",
-        "child",
-    );
-    runtime_tests.dependOn(&child_marker_controller.step);
     inline for (.{
         "../process_command_tests.zig",
         "../process_command_gate_tests.zig",
