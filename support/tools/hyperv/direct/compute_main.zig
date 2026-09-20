@@ -44,10 +44,24 @@ fn run(init: std.process.Init) !void {
         return compute.verifyPlan(a, init.io, args[2], args[3]);
     if (args.len == 4 and std.mem.eql(u8, args[1], "authorization"))
         return compute.verifyAuthorization(a, init.io, args[2], args[3], true);
+    if (args.len == 5 and std.mem.eql(u8, args[1], "ledger-proposal")) {
+        const proposal = try compute.ledgerProposal(a, init.io, args[2], args[3], args[4]);
+        const bytes = try compute.ledgerBindingBytes(a, proposal);
+        var writer = std.Io.File.stdout().writerStreaming(init.io, &.{});
+        try writer.interface.writeAll(bytes);
+        return;
+    }
     if (args.len == 3 and std.mem.eql(u8, args[1], "admission"))
         return compute.verifyAdmission(a, init.io, args[2], true);
     if (args.len == 3 and std.mem.eql(u8, args[1], "scope")) {
         return compute.verifyAdmission(a, init.io, args[2], true);
+    }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "stored-scope")) {
+        const scope = try compute.loadScope(a, init.io, args[2]);
+        defer scope.deinit();
+        const now = std.Io.Clock.real.now(init.io).toSeconds();
+        if (now < 0) return error.InvalidClock;
+        return scope.value.current(@intCast(now));
     }
     if (args.len == 4 and std.mem.eql(u8, args[1], "ledger")) {
         const scope = try compute.loadScope(a, init.io, args[2]);

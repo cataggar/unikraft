@@ -210,6 +210,63 @@ pub const Tools = struct {
     az_python: Artifact,
 };
 
+pub const DirectoryIdentity = struct {
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+    uid: u32,
+    mode: u16,
+};
+
+pub const LedgerBinding = struct {
+    schema: []const u8,
+    version: u8,
+    purpose: ExecutionPurpose,
+    campaign_id: []const u8,
+    ledger_id: []const u8,
+    directory: DirectoryIdentity,
+    initialization_required: bool,
+    initial_state_sha256: []const u8,
+    marker_sha256: []const u8,
+
+    pub fn validate(self: LedgerBinding, campaign_id: []const u8) !void {
+        if (!eq(self.schema, "uk.wamr.azure-campaign-ledger-binding") or
+            self.version != 1 or
+            self.purpose != .@"qcow2-derived-vhd-two-boot" or
+            !eq(self.campaign_id, campaign_id) or
+            self.directory.uid != std.os.linux.geteuid() or
+            self.directory.mode != 0o700)
+            return error.InvalidLedgerIdentity;
+        try uuid(self.campaign_id);
+        try uuid(self.ledger_id);
+        _ = try c.parseSha256(self.initial_state_sha256);
+        _ = try c.parseSha256(self.marker_sha256);
+    }
+};
+
+pub const LedgerMarker = struct {
+    schema: []const u8 = "uk.wamr.azure-campaign-ledger-identity",
+    version: u8 = 1,
+    purpose: ExecutionPurpose = .@"qcow2-derived-vhd-two-boot",
+    campaign_id: []const u8,
+    ledger_id: []const u8,
+    state: enum { initialized } = .initialized,
+    migration: enum { authorized_legacy_state } = .authorized_legacy_state,
+    initial_state_sha256: []const u8,
+
+    pub fn validate(self: LedgerMarker) !void {
+        if (!eq(self.schema, "uk.wamr.azure-campaign-ledger-identity") or
+            self.version != 1 or
+            self.purpose != .@"qcow2-derived-vhd-two-boot" or
+            self.state != .initialized or
+            self.migration != .authorized_legacy_state)
+            return error.InvalidLedgerIdentity;
+        try uuid(self.campaign_id);
+        try uuid(self.ledger_id);
+        _ = try c.parseSha256(self.initial_state_sha256);
+    }
+};
+
 pub const ApprovalLimits = struct {
     runtime_seconds: u32,
     cleanup_seconds: u32,
@@ -231,6 +288,7 @@ pub const Plan = struct {
     campaign_id: []const u8,
     campaign_profile: ExecutionProfile,
     ledger_path: []const u8,
+    ledger: LedgerBinding,
     subscription: []const u8,
     location: []const u8,
     prefix: []const u8,
@@ -264,7 +322,7 @@ pub const Plan = struct {
     tools: Tools,
 
     pub fn validate(self: Plan) !void {
-        if (!eq(self.schema, "uk.wamr.azure-execution-plan") or self.version != 1 or
+        if (!eq(self.schema, "uk.wamr.azure-execution-plan") or self.version != 2 or
             self.purpose != .@"qcow2-derived-vhd-two-boot" or
             self.profile != .@"qcow2-derived-vhd" or self.authority != .not_admitted or
             !eq(self.canonicalization, canonicalization) or self.created_unix == 0)
@@ -273,6 +331,7 @@ pub const Plan = struct {
             self.attempt_id,
             self.campaign_id,
             self.ledger_path,
+            self.ledger,
             self.subscription,
             self.location,
             self.prefix,
@@ -325,6 +384,9 @@ pub const ApprovalTemplate = struct {
     decision: enum { pending },
     plan_sha256: []const u8,
     attempt_id: []const u8,
+    campaign_id: []const u8,
+    ledger_id: []const u8,
+    ledger_initialization_required: bool,
     candidate_sha256: []const u8,
     estimated_cost_upper_bound_microusd: u64,
     maximum_authorized_cost_microusd: u64,
@@ -332,9 +394,12 @@ pub const ApprovalTemplate = struct {
 
     pub fn validate(self: ApprovalTemplate, plan: Plan, plan_sha256: []const u8) !void {
         if (!eq(self.schema, "uk.wamr.azure-execution-approval-template") or
-            self.version != 1 or self.decision != .pending or
+            self.version != 2 or self.decision != .pending or
             !eq(self.plan_sha256, plan_sha256) or
             !eq(self.attempt_id, plan.attempt_id) or
+            !eq(self.campaign_id, plan.campaign_id) or
+            !eq(self.ledger_id, plan.ledger.ledger_id) or
+            self.ledger_initialization_required != plan.ledger.initialization_required or
             !eq(self.candidate_sha256, plan.candidate.sha256) or
             self.estimated_cost_upper_bound_microusd != plan.cost.estimated_upper_bound or
             self.maximum_authorized_cost_microusd != plan.cost.maximum_authorized or
@@ -349,6 +414,9 @@ pub const Authorization = struct {
     decision: enum { approved, denied },
     plan_sha256: []const u8,
     attempt_id: []const u8,
+    campaign_id: []const u8,
+    ledger_id: []const u8,
+    ledger_initialization_required: bool,
     candidate_sha256: []const u8,
     estimated_cost_upper_bound_microusd: u64,
     maximum_authorized_cost_microusd: u64,
@@ -360,8 +428,11 @@ pub const Authorization = struct {
 
     pub fn validate(self: Authorization, plan: Plan, plan_sha256: []const u8) !void {
         if (!eq(self.schema, "uk.wamr.azure-execution-authorization") or
-            self.version != 1 or !eq(self.plan_sha256, plan_sha256) or
+            self.version != 2 or !eq(self.plan_sha256, plan_sha256) or
             !eq(self.attempt_id, plan.attempt_id) or
+            !eq(self.campaign_id, plan.campaign_id) or
+            !eq(self.ledger_id, plan.ledger.ledger_id) or
+            self.ledger_initialization_required != plan.ledger.initialization_required or
             !eq(self.candidate_sha256, plan.candidate.sha256) or
             self.estimated_cost_upper_bound_microusd != plan.cost.estimated_upper_bound or
             self.maximum_authorized_cost_microusd != plan.cost.maximum_authorized or
@@ -395,6 +466,7 @@ pub const Admission = struct {
     campaign_id: []const u8,
     campaign_profile: ExecutionProfile,
     ledger_path: []const u8,
+    ledger: LedgerBinding,
     subscription: []const u8,
     location: []const u8,
     prefix: []const u8,
@@ -435,7 +507,7 @@ pub const Admission = struct {
 
     pub fn validate(self: Admission) !void {
         if (!eq(self.schema, "uk.wamr.azure-execution-admission") or
-            self.version != 1 or self.authority != .approved or
+            self.version != 2 or self.authority != .approved or
             self.purpose != .@"qcow2-derived-vhd-two-boot" or
             self.profile != .@"qcow2-derived-vhd" or
             !eq(self.canonicalization, canonicalization) or self.created_unix == 0)
@@ -446,6 +518,7 @@ pub const Admission = struct {
             self.attempt_id,
             self.campaign_id,
             self.ledger_path,
+            self.ledger,
             self.subscription,
             self.location,
             self.prefix,
@@ -850,6 +923,315 @@ fn canonicalParsed(comptime T: type, a: std.mem.Allocator, bytes: []const u8) !s
     return parse(T, a, bytes);
 }
 
+pub const ledger_marker_name = "ledger-identity.json";
+pub const ledger_sentinel_name = "ledger-identity.initialized";
+const ledger_entry_limit = 4096;
+const ledger_bytes_limit = 4 * 1024 * 1024;
+
+const LedgerEntry = struct {
+    path: []const u8,
+    kind: enum { directory, file },
+    metadata: files.Snapshot,
+    sha256: [32]u8 = [_]u8{0} ** 32,
+};
+
+fn validateLedgerDirectorySnapshot(value: files.Snapshot) !void {
+    if (value.mode & std.os.linux.S.IFMT != std.os.linux.S.IFDIR or
+        value.uid != std.os.linux.geteuid() or
+        value.mode & 0o7777 != 0o700)
+        return error.UnsafeLedger;
+}
+
+fn validateLedgerFileSnapshot(value: files.Snapshot) !void {
+    if (value.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG or
+        value.uid != std.os.linux.geteuid() or
+        value.mode & 0o7777 != 0o600 or value.nlink != 1)
+        return error.UnsafeLedger;
+}
+
+fn hashLedgerFile(io: std.Io, file: std.Io.File, size: u64) ![32]u8 {
+    var hash = core.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < size) {
+        const amount: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
+        if (try file.readPositionalAll(io, buffer[0..amount], offset) != amount)
+            return error.LedgerChanged;
+        hash.update(buffer[0..amount]);
+        offset += amount;
+    }
+    if (try file.readPositionalAll(io, buffer[0..1], size) != 0)
+        return error.LedgerChanged;
+    return hash.finalResult();
+}
+
+fn collectLedgerState(
+    a: std.mem.Allocator,
+    io: std.Io,
+    directory: std.Io.Dir,
+    prefix_path: []const u8,
+    entries: *std.ArrayList(LedgerEntry),
+    total_bytes: *u64,
+    depth: usize,
+) !void {
+    if (depth > 16) return error.LedgerTooLarge;
+    const before = try files.snapshot(.{ .handle = directory.handle, .flags = .{ .nonblocking = false } });
+    try validateLedgerDirectorySnapshot(before);
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entries.items.len >= ledger_entry_limit) return error.LedgerTooLarge;
+        try files.basename(entry.name);
+        if (depth == 0 and eq(entry.name, ledger_marker_name))
+            return error.LedgerMarkerExists;
+        const path = if (prefix_path.len == 0)
+            try a.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix_path, entry.name });
+        const path_file = try directory.openFile(io, entry.name, .{
+            .path_only = true,
+            .follow_symlinks = false,
+        });
+        defer path_file.close(io);
+        const metadata = try files.snapshot(path_file);
+        switch (metadata.mode & std.os.linux.S.IFMT) {
+            std.os.linux.S.IFDIR => {
+                try validateLedgerDirectorySnapshot(metadata);
+                const child = try directory.openDir(io, entry.name, .{
+                    .follow_symlinks = false,
+                    .iterate = true,
+                });
+                defer child.close(io);
+                if (!files.sameSnapshot(metadata, try files.snapshot(.{
+                    .handle = child.handle,
+                    .flags = .{ .nonblocking = false },
+                }))) return error.LedgerChanged;
+                try entries.append(a, .{
+                    .path = path,
+                    .kind = .directory,
+                    .metadata = metadata,
+                });
+                try collectLedgerState(a, io, child, path, entries, total_bytes, depth + 1);
+            },
+            std.os.linux.S.IFREG => {
+                try validateLedgerFileSnapshot(metadata);
+                total_bytes.* = try std.math.add(u64, total_bytes.*, metadata.size);
+                if (total_bytes.* > ledger_bytes_limit) return error.LedgerTooLarge;
+                const file = try (files.Directory{ .dir = directory }).openFile(io, entry.name);
+                defer file.close(io);
+                const opened = try files.snapshot(file);
+                if (!files.sameSnapshot(metadata, opened)) return error.LedgerChanged;
+                const digest = try hashLedgerFile(io, file, metadata.size);
+                if (!files.sameSnapshot(metadata, try files.snapshot(file)))
+                    return error.LedgerChanged;
+                try entries.append(a, .{
+                    .path = path,
+                    .kind = .file,
+                    .metadata = metadata,
+                    .sha256 = digest,
+                });
+            },
+            else => return error.UnsafeLedger,
+        }
+    }
+    if (!files.sameSnapshot(before, try files.snapshot(.{
+        .handle = directory.handle,
+        .flags = .{ .nonblocking = false },
+    }))) return error.LedgerChanged;
+}
+
+fn hashLedgerMetadata(hash: *core.Sha256, value: files.Snapshot) void {
+    var bytes: [54]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], value.dev_major, .big);
+    std.mem.writeInt(u32, bytes[4..8], value.dev_minor, .big);
+    std.mem.writeInt(u64, bytes[8..16], value.ino, .big);
+    std.mem.writeInt(u64, bytes[16..24], value.size, .big);
+    std.mem.writeInt(u16, bytes[24..26], value.mode, .big);
+    std.mem.writeInt(u32, bytes[26..30], value.uid, .big);
+    std.mem.writeInt(u32, bytes[30..34], value.nlink, .big);
+    std.mem.writeInt(i64, bytes[34..42], value.mtime.sec, .big);
+    std.mem.writeInt(u32, bytes[42..46], value.mtime.nsec, .big);
+    std.mem.writeInt(i64, bytes[46..54], value.ctime.sec, .big);
+    hash.update(&bytes);
+    var ctime_nsec: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ctime_nsec, value.ctime.nsec, .big);
+    hash.update(&ctime_nsec);
+}
+
+pub fn ledgerStateDigest(a: std.mem.Allocator, io: std.Io, directory: files.Directory) ![64]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const root = try files.snapshot(.{
+        .handle = directory.dir.handle,
+        .flags = .{ .nonblocking = false },
+    });
+    try validateLedgerDirectorySnapshot(root);
+    var entries: std.ArrayList(LedgerEntry) = .empty;
+    var total_bytes: u64 = 0;
+    try collectLedgerState(scratch, io, directory.dir, "", &entries, &total_bytes, 0);
+    std.mem.sort(LedgerEntry, entries.items, {}, struct {
+        fn less(_: void, left: LedgerEntry, right: LedgerEntry) bool {
+            return std.mem.lessThan(u8, left.path, right.path);
+        }
+    }.less);
+    var hash = core.Sha256.init(.{});
+    hash.update("wamr-azure-ledger-prestate-v1\x00");
+    hashLedgerMetadata(&hash, root);
+    for (entries.items) |entry| {
+        hash.update(if (entry.kind == .directory) "D" else "F");
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, @intCast(entry.path.len), .big);
+        hash.update(&length);
+        hash.update(entry.path);
+        hashLedgerMetadata(&hash, entry.metadata);
+        if (entry.kind == .file) hash.update(&entry.sha256);
+    }
+    const after = try files.snapshot(.{
+        .handle = directory.dir.handle,
+        .flags = .{ .nonblocking = false },
+    });
+    if (!files.sameSnapshot(root, after)) return error.LedgerChanged;
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+
+pub fn ledgerMarkerBytes(
+    a: std.mem.Allocator,
+    campaign_id: []const u8,
+    ledger_id: []const u8,
+    initial_state_sha256: []const u8,
+) ![]u8 {
+    try uuid(campaign_id);
+    try uuid(ledger_id);
+    _ = try c.parseSha256(initial_state_sha256);
+    return std.fmt.allocPrint(
+        a,
+        "{{\"campaign_id\":\"{s}\",\"initial_state_sha256\":\"{s}\",\"ledger_id\":\"{s}\",\"migration\":\"authorized_legacy_state\",\"purpose\":\"qcow2-derived-vhd-two-boot\",\"schema\":\"uk.wamr.azure-campaign-ledger-identity\",\"state\":\"initialized\",\"version\":1}}\n",
+        .{ campaign_id, initial_state_sha256, ledger_id },
+    );
+}
+
+fn directoryIdentity(value: files.Snapshot) DirectoryIdentity {
+    return .{
+        .device_major = value.dev_major,
+        .device_minor = value.dev_minor,
+        .inode = value.ino,
+        .uid = value.uid,
+        .mode = value.mode & 0o7777,
+    };
+}
+
+fn hashHex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    core.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+pub fn ledgerProposal(
+    a: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    campaign_id: []const u8,
+    proposed_ledger_id: []const u8,
+) !LedgerBinding {
+    try uuid(campaign_id);
+    try uuid(proposed_ledger_id);
+    const directory = try files.Directory.open(io, path);
+    defer directory.close(io);
+    const root = try files.snapshot(.{
+        .handle = directory.dir.handle,
+        .flags = .{ .nonblocking = false },
+    });
+    try validateLedgerDirectorySnapshot(root);
+    var marker_bytes = directory.readSensitive(io, a, ledger_marker_name, 65536, null) catch |err| switch (err) {
+        error.FileNotFound => {
+            const sentinel = directory.dir.openDir(io, ledger_sentinel_name, .{ .follow_symlinks = false }) catch |sentinel_error| switch (sentinel_error) {
+                error.FileNotFound => null,
+                else => return sentinel_error,
+            };
+            if (sentinel) |found| {
+                found.close(io);
+                return error.LedgerIdentityMissing;
+            }
+            const initial = try ledgerStateDigest(a, io, directory);
+            const marker_data = try ledgerMarkerBytes(a, campaign_id, proposed_ledger_id, &initial);
+            defer a.free(marker_data);
+            const marker_sha = hashHex(marker_data);
+            return .{
+                .schema = "uk.wamr.azure-campaign-ledger-binding",
+                .version = 1,
+                .purpose = .@"qcow2-derived-vhd-two-boot",
+                .campaign_id = campaign_id,
+                .ledger_id = proposed_ledger_id,
+                .directory = directoryIdentity(root),
+                .initialization_required = true,
+                .initial_state_sha256 = try a.dupe(u8, &initial),
+                .marker_sha256 = try a.dupe(u8, &marker_sha),
+            };
+        },
+        else => return err,
+    };
+    defer marker_bytes.deinit();
+    const sentinel = try directory.dir.openDir(
+        io,
+        ledger_sentinel_name,
+        .{ .follow_symlinks = false, .iterate = true },
+    );
+    defer sentinel.close(io);
+    const sentinel_snapshot = try files.snapshot(.{
+        .handle = sentinel.handle,
+        .flags = .{ .nonblocking = false },
+    });
+    try validateLedgerDirectorySnapshot(sentinel_snapshot);
+    var sentinel_entries = sentinel.iterate();
+    if (try sentinel_entries.next(io) != null)
+        return error.InvalidLedgerIdentity;
+    const parsed_marker = try canonicalParsed(LedgerMarker, a, marker_bytes.bytes());
+    defer parsed_marker.deinit();
+    try parsed_marker.value.validate();
+    if (!eq(parsed_marker.value.campaign_id, campaign_id))
+        return error.WrongLedgerCampaign;
+    const expected = try ledgerMarkerBytes(
+        a,
+        parsed_marker.value.campaign_id,
+        parsed_marker.value.ledger_id,
+        parsed_marker.value.initial_state_sha256,
+    );
+    defer a.free(expected);
+    if (!eq(expected, marker_bytes.bytes())) return error.InvalidLedgerIdentity;
+    const marker_sha = hashHex(marker_bytes.bytes());
+    return .{
+        .schema = "uk.wamr.azure-campaign-ledger-binding",
+        .version = 1,
+        .purpose = .@"qcow2-derived-vhd-two-boot",
+        .campaign_id = campaign_id,
+        .ledger_id = try a.dupe(u8, parsed_marker.value.ledger_id),
+        .directory = directoryIdentity(root),
+        .initialization_required = false,
+        .initial_state_sha256 = try a.dupe(u8, parsed_marker.value.initial_state_sha256),
+        .marker_sha256 = try a.dupe(u8, &marker_sha),
+    };
+}
+
+pub fn ledgerBindingBytes(a: std.mem.Allocator, binding: LedgerBinding) ![]u8 {
+    try binding.validate(binding.campaign_id);
+    return std.fmt.allocPrint(
+        a,
+        "{{\"campaign_id\":\"{s}\",\"directory\":{{\"device_major\":{d},\"device_minor\":{d},\"inode\":{d},\"mode\":{d},\"uid\":{d}}},\"initial_state_sha256\":\"{s}\",\"initialization_required\":{s},\"ledger_id\":\"{s}\",\"marker_sha256\":\"{s}\",\"purpose\":\"qcow2-derived-vhd-two-boot\",\"schema\":\"uk.wamr.azure-campaign-ledger-binding\",\"version\":1}}\n",
+        .{
+            binding.campaign_id,
+            binding.directory.device_major,
+            binding.directory.device_minor,
+            binding.directory.inode,
+            binding.directory.mode,
+            binding.directory.uid,
+            binding.initial_state_sha256,
+            if (binding.initialization_required) "true" else "false",
+            binding.ledger_id,
+            binding.marker_sha256,
+        },
+    );
+}
+
 pub fn verifyPlan(
     a: std.mem.Allocator,
     io: std.Io,
@@ -919,6 +1301,45 @@ pub fn inspectAdmission(a: std.mem.Allocator, io: std.Io, admission: Admission) 
     try inspect(a, io, candidate.value);
 }
 
+pub const PinnedAdmission = struct {
+    path: []const u8,
+    custody: files.RetainedFile,
+    bytes: core.sensitive.Buffer,
+    parsed: std.json.Parsed(Admission),
+    digest: [32]u8,
+
+    pub fn deinit(self: *PinnedAdmission, io: std.Io) void {
+        self.parsed.deinit();
+        self.bytes.deinit();
+        self.custody.close(io);
+        self.* = undefined;
+    }
+
+    pub fn value(self: *const PinnedAdmission) Admission {
+        return self.parsed.value;
+    }
+
+    pub fn verify(self: PinnedAdmission, io: std.Io) !void {
+        try self.custody.verify(io);
+        const before = try files.snapshot(self.custody.file);
+        if (before.size != self.bytes.bytes().len) return error.AdmissionChanged;
+        var hash = core.Sha256.init(.{});
+        var buffer: [65536]u8 = undefined;
+        var offset: u64 = 0;
+        while (offset < before.size) {
+            const amount: usize = @intCast(@min(@as(u64, buffer.len), before.size - offset));
+            if (try self.custody.file.readPositionalAll(io, buffer[0..amount], offset) != amount)
+                return error.AdmissionChanged;
+            hash.update(buffer[0..amount]);
+            offset += amount;
+        }
+        if (try self.custody.file.readPositionalAll(io, buffer[0..1], before.size) != 0 or
+            !files.sameSnapshot(before, try files.snapshot(self.custody.file)) or
+            !std.crypto.timing_safe.eql([32]u8, hash.finalResult(), self.digest))
+            return error.AdmissionChanged;
+    }
+};
+
 pub fn preAdmission(
     a: std.mem.Allocator,
     io: std.Io,
@@ -929,10 +1350,15 @@ pub fn preAdmission(
     validator: []const u8,
     supervisor: []const u8,
     az_python: []const u8,
-) !std.json.Parsed(Admission) {
+) !PinnedAdmission {
     if (legacy_fixture) @compileError("production authorization is unavailable in legacy fixtures");
-    const admission = try loadScope(a, io, path);
+    var retained = try files.RetainedFile.open(io, path, .private);
+    errdefer retained.close(io);
+    var bytes = try files.readSensitiveFile(io, a, retained.file, 65536, .private);
+    errdefer bytes.deinit();
+    const admission = try canonicalParsed(Admission, a, bytes.bytes());
     errdefer admission.deinit();
+    try admission.value.validate();
     try verifyAdmissionBindings(a, io, admission.value, true);
     if (!eq(admission.value.ledger_path, ledger_path) or
         !eq(admission.value.tools.azure.path, azure) or
@@ -941,7 +1367,17 @@ pub fn preAdmission(
         !eq(admission.value.tools.supervisor.path, supervisor) or
         !eq(admission.value.tools.az_python.path, az_python))
         return error.WrongAdmissionInput;
-    return admission;
+    var digest: [32]u8 = undefined;
+    core.Sha256.hash(bytes.bytes(), &digest, .{});
+    var result: PinnedAdmission = .{
+        .path = path,
+        .custody = retained,
+        .bytes = bytes,
+        .parsed = admission,
+        .digest = digest,
+    };
+    try result.verify(io);
+    return result;
 }
 
 fn verifyAdmissionBindings(a: std.mem.Allocator, io: std.Io, admission: Admission, require_current: bool) !void {
@@ -978,6 +1414,9 @@ fn verifyAdmissionBindings(a: std.mem.Allocator, io: std.Io, admission: Admissio
 
 fn verifyPlanBindings(a: std.mem.Allocator, io: std.Io, plan: Plan) !void {
     try plan.validate();
+    const ledger = try ledgerProposal(a, io, plan.ledger_path, plan.campaign_id, plan.ledger.ledger_id);
+    if (!sameLedgerProposal(ledger, plan.ledger))
+        return error.WrongLedgerIdentity;
     const candidate_bytes = try readPrivate(a, io, plan.candidate, 65536);
     defer a.free(candidate_bytes);
     const candidate = try parse(CandidateScope, a, candidate_bytes);
@@ -1042,10 +1481,26 @@ fn verifyPlanBindings(a: std.mem.Allocator, io: std.Io, plan: Plan) !void {
 }
 
 fn inspectTool(io: std.Io, item: Artifact) !void {
-    try inspectArtifact(io, item);
-    const file = try files.openAbsolute(io, item.path, .artifact);
-    defer file.close(io);
-    if ((try files.snapshot(file)).mode & 0o111 == 0) return error.NotExecutable;
+    try artifact(item);
+    var retained = try files.RetainedFile.open(io, item.path, .tool);
+    defer retained.close(io);
+    const before = retained.file_snapshot;
+    if (before.size != item.size) return error.ArtifactChanged;
+    var hash = core.Sha256.init(.{});
+    var buffer: [65536]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < item.size) {
+        const amount: usize = @intCast(@min(@as(u64, buffer.len), item.size - offset));
+        if (try retained.file.readPositionalAll(io, buffer[0..amount], offset) != amount)
+            return error.ArtifactChanged;
+        hash.update(buffer[0..amount]);
+        offset += amount;
+    }
+    if (try retained.file.readPositionalAll(io, buffer[0..1], item.size) != 0 or
+        !files.sameSnapshot(before, try files.snapshot(retained.file)) or
+        !std.mem.eql(u8, &hash.finalResult(), &try c.parseSha256(item.sha256)))
+        return error.ArtifactChanged;
+    try retained.verify(io);
 }
 
 pub fn verifyHandoff(a: std.mem.Allocator, io: std.Io, bytes: []const u8) !void {
@@ -1902,10 +2357,36 @@ fn sameLineage(a: Lineage, b: Lineage) bool {
         if (!eq(@field(a, member.name), @field(b, member.name))) return false;
     return true;
 }
+
+fn sameLedgerProposal(actual: LedgerBinding, planned: LedgerBinding) bool {
+    return eq(actual.schema, planned.schema) and
+        actual.version == planned.version and
+        actual.purpose == planned.purpose and
+        eq(actual.campaign_id, planned.campaign_id) and
+        eq(actual.ledger_id, planned.ledger_id) and
+        std.meta.eql(actual.directory, planned.directory) and
+        (actual.initialization_required ==
+            planned.initialization_required or
+            (planned.initialization_required and
+                !actual.initialization_required)) and
+        eq(actual.initial_state_sha256, planned.initial_state_sha256) and
+        eq(actual.marker_sha256, planned.marker_sha256);
+}
+
 fn sameTools(a: Tools, b: Tools) bool {
     inline for (std.meta.fields(Tools)) |member|
         if (!same(@field(a, member.name), @field(b, member.name))) return false;
     return true;
+}
+fn sameLedger(a: LedgerBinding, b: LedgerBinding) bool {
+    return eq(a.schema, b.schema) and a.version == b.version and
+        a.purpose == b.purpose and
+        eq(a.campaign_id, b.campaign_id) and
+        eq(a.ledger_id, b.ledger_id) and
+        std.meta.eql(a.directory, b.directory) and
+        a.initialization_required == b.initialization_required and
+        eq(a.initial_state_sha256, b.initial_state_sha256) and
+        eq(a.marker_sha256, b.marker_sha256);
 }
 fn sameAdmissionPlan(admission: Admission, plan: Plan) bool {
     return admission.purpose == plan.purpose and
@@ -1916,6 +2397,7 @@ fn sameAdmissionPlan(admission: Admission, plan: Plan) bool {
         eq(admission.campaign_id, plan.campaign_id) and
         admission.campaign_profile == plan.campaign_profile and
         eq(admission.ledger_path, plan.ledger_path) and
+        sameLedger(admission.ledger, plan.ledger) and
         eq(admission.subscription, plan.subscription) and
         eq(admission.location, plan.location) and
         eq(admission.prefix, plan.prefix) and
@@ -1953,6 +2435,7 @@ fn commonPlan(
     attempt_id: []const u8,
     campaign_id: []const u8,
     ledger_path: []const u8,
+    ledger: LedgerBinding,
     subscription: []const u8,
     location: []const u8,
     resource_prefix: []const u8,
@@ -1988,6 +2471,7 @@ fn commonPlan(
     try uuid(attempt_id);
     try uuid(campaign_id);
     try files.absoluteFilePath(ledger_path);
+    try ledger.validate(campaign_id);
     try uuid(subscription);
     if (!eq(location, "northeurope") or !eq(vm_size, "Standard_D2s_v5"))
         return error.InvalidTopology;

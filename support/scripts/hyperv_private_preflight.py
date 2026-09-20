@@ -158,9 +158,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "6bcfd1dde638ca1043a1cec656418b64a65e9d7155ea54fdb8d947994943013f"
+            "e14f3b8a40e288c07e5ae84be75df15fdd7a59e5cabc837c90af14256b47f96b"
         ),
-        "size": 2412818,
+        "size": 2420149,
         "files": 229,
     },
     "support/kconfig": {
@@ -532,13 +532,13 @@ GUARDED_PRODUCER_FILES = {
         "39db3cd37dffe39608220e267b627010c6b0aabcfd0a436b98fe9556f5d92516"
     ),
     "support/tools/hyperv/private_files.zig": (
-        "7d9b493c241aced6da467cafaa12464214df86eb7bf7a5903723ea7e5f40516a"
+        "fb38fb41656409b7b6fce2347c5ba41c534f476fb26a85c1e0bb705a9c9506f0"
     ),
     "support/tools/hyperv/process-command-v1.json": (
         "ee1e038f6538beecac8a09d4d52a6c601a9ca1f503fd70a3753bd8d2e3ac904b"
     ),
     "support/tools/hyperv/process.zig": (
-        "870a52c832faa96a218e0f9f6bf25cdbb34debb9db521d219f228b850bb7d9d2"
+        "335fab93447909ea223f60550293351c1ddd49b4d04c9af38c1fe32b28b43adc"
     ),
     "support/tools/hyperv/sensitive.zig": (
         "e5845b7623116f3ef6e6e062463f39c2f3840bec5d36c75ccf413643dfae1eca"

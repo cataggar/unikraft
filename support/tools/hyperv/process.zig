@@ -118,9 +118,37 @@ pub const Executable = struct {
         if (linux.errno(opened) != .SUCCESS) return error.ExecutableUnavailable;
         const handle = aboveStdio(@intCast(opened)) catch return error.ExecutableUnavailable;
         const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        return fromOwnedFile(io, file);
+    }
+
+    pub fn fromFile(io: std.Io, source: std.Io.File) !Executable {
+        const duplicated = linux.fcntl(source.handle, linux.F.DUPFD_CLOEXEC, 3);
+        if (linux.errno(duplicated) != .SUCCESS)
+            return error.ExecutableUnavailable;
+        const file: std.Io.File = .{
+            .handle = @intCast(duplicated),
+            .flags = .{ .nonblocking = false },
+        };
+        const source_snapshot = files.snapshot(source) catch |err| {
+            file.close(io);
+            return err;
+        };
+        const duplicate_snapshot = files.snapshot(file) catch |err| {
+            file.close(io);
+            return err;
+        };
+        if (!files.sameSnapshot(source_snapshot, duplicate_snapshot)) {
+            file.close(io);
+            return error.ExecutableIdentityChanged;
+        }
+        return fromOwnedFile(io, file);
+    }
+
+    fn fromOwnedFile(io: std.Io, file: std.Io.File) !Executable {
         errdefer file.close(io);
         const stat = try files.snapshot(file);
-        if (stat.mode & linux.S.IFMT != linux.S.IFREG or stat.mode & 0o111 == 0 or stat.mode & 0o6000 != 0)
+        if (stat.mode & linux.S.IFMT != linux.S.IFREG or
+            stat.mode & 0o111 == 0 or stat.mode & 0o6000 != 0)
             return error.InvalidExecutable;
         if (stat.size > max_executable_bytes) return error.UnsupportedExecutableFormat;
         _ = try validateElfExecutable(file.handle, stat.size);
@@ -798,6 +826,8 @@ pub const CaptureState = enum { complete, partial, overflow, io_failed, durabili
 pub const PrivateOptions = struct {
     /// cleanup_ms must cover the TERM grace and a separate reaping reserve.
     process: Options,
+    /// When supplied, execute only the retained ELF snapshot through execveat.
+    executable: ?Executable = null,
     term_grace_ms: u32 = 2000,
     /// An optional outer cleanup bound; never extends process.cleanup_ms.
     cleanup_deadline: ?Deadline = null,
@@ -851,7 +881,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, options: Options) !Result {
     @memset(result.storage, 0);
     errdefer result.deinit(allocator);
     var capture: Capture = .{ .output = result.storage, .stderr_limit = options.stderr_limit };
-    const execution = try supervise(allocator, options, &capture, .{});
+    const execution = try supervise(allocator, options, &capture, .{}, null);
     result.termination = execution.termination;
     result.failures = execution.failures;
     result.cleanup_complete = execution.cleanup_complete;
@@ -1391,6 +1421,13 @@ fn runPrivateImpl(
         .private = .{ .stdout = stdout, .stderr = stderr, .limit = options.process.stdout_limit },
         .fault = fault,
     };
+    const executable = if (options.executable) |value|
+        try createExecutableSnapshot(value, null)
+    else
+        null;
+    defer if (executable) |descriptor| {
+        _ = linux.close(descriptor);
+    };
     const execution = try supervise(allocator, options.process, &capture, .{
         .term_grace_ms = options.term_grace_ms,
         .deadline = options.cleanup_deadline,
@@ -1398,7 +1435,7 @@ fn runPrivateImpl(
         .nested_supervisor = options.nested_supervisor,
         .reap_reserve_ms = @min(1000, options.process.cleanup_ms - options.term_grace_ms),
         .fault = fault,
-    });
+    }, executable);
     // Preserve partial output, including failed execution, but never label it
     // complete merely because the bytes and their directory entry are durable.
     stdout.sync(io) catch {
@@ -1497,7 +1534,13 @@ const CleanupPolicy = struct {
 
 const Completion = enum { unfinished, closed_command };
 
-fn supervise(allocator: std.mem.Allocator, options: Options, capture: *Capture, policy: CleanupPolicy) !Execution {
+fn supervise(
+    allocator: std.mem.Allocator,
+    options: Options,
+    capture: *Capture,
+    policy: CleanupPolicy,
+    executable: ?linux.fd_t,
+) !Execution {
     var result: Execution = .{};
     if (try options.deadline.expired()) {
         result.failures.primary = .{ .stage = .process_spawn, .category = .timeout };
@@ -1507,7 +1550,7 @@ fn supervise(allocator: std.mem.Allocator, options: Options, capture: *Capture, 
         result.failures.primary = .{ .stage = .process_spawn, .category = .cancelled };
         return result;
     }
-    var child = spawnOwned(allocator, options, policy.fault, null, null) catch {
+    var child = spawnOwned(allocator, options, policy.fault, executable, false, null) catch {
         result.failures.primary = .{ .stage = .process_spawn, .category = .spawn_failed };
         return result;
     };
@@ -2956,6 +2999,7 @@ fn spawnCommandOwned(
         options,
         null,
         executable,
+        true,
         if (gate_test) |active| active.fault else null,
     );
 }
@@ -2967,6 +3011,7 @@ fn spawnOwned(
     options: Options,
     fault: ?PrivateTestFault,
     executable: ?linux.fd_t,
+    command_gate: bool,
     gate_fault: ?CommandGateTestFault,
 ) !Spawned {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -2983,7 +3028,7 @@ fn spawnOwned(
     errdefer closePipe(stderr);
     const control = try makePipe();
     errdefer closePipe(control);
-    const gate = if (executable != null) try makeGatePair() else null;
+    const gate = if (command_gate) try makeGatePair() else null;
     errdefer if (gate) |pair| closePipe(pair);
     const opened = linux.openat(linux.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, 0);
     if (linux.errno(opened) != .SUCCESS) return error.SpawnFailed;

@@ -159,6 +159,7 @@ pub fn build(b: *std.Build) void {
     inline for (.{
         .{ "wamr-direct-fixture-cli", "compute_fixture_cli.zig" },
         .{ "wamr-direct-controller-fixture", "compute_controller_fixture.zig" },
+        .{ "wamr-direct-authorization-controller-fixture", "compute_authorization_controller_fixture.zig" },
     }) |entry| {
         const tool = b.addExecutable(.{
             .name = entry[0],

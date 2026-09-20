@@ -14,7 +14,7 @@ and finalized QCOW2 normal/masked-x2APIC boots, an acceptance gate, derivation
 from that exact accepted QCOW2, and derived fixed-VHD normal/masked-x2APIC
 boots. Neither evidence version is executable authority. The installed
 `uk-wamr-direct-compute` live entry point accepts only
-`uk.wamr.azure-execution-admission` version 1, which digest-binds the separate
+`uk.wamr.azure-execution-admission` version 2, which digest-binds the separate
 plan and authorization records described below.
 It reuses the native direct route's managed fixed-VHD upload, private process
 supervision, create-only custody, bounded deallocate/start lifecycle, owner and
@@ -237,6 +237,7 @@ python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" handoff \
   "$PRIVATE_PARENT/FRESH-imported-image/bundle.json"
 mkdir -m 700 "$PRIVATE_PARENT/ORIGINAL-campaign-ledger"
+PROPOSED_LEDGER_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 python3 support/build/wamr-native-ci/handoff.py plan \
   --bundle "$PRIVATE_PARENT/FRESH-imported-image/bundle.json" \
   --candidate-output "$PRIVATE_PARENT/FRESH-candidate.json" \
@@ -244,6 +245,7 @@ python3 support/build/wamr-native-ci/handoff.py plan \
   --approval-template "$PRIVATE_PARENT/FRESH-approval-template.json" \
   --campaign-id "$CAMPAIGN_UUID" \
   --ledger "$PRIVATE_PARENT/ORIGINAL-campaign-ledger" \
+  --ledger-id "$PROPOSED_LEDGER_UUID" \
   --subscription "$SUBSCRIPTION_UUID" \
   --prefix "$FRESH_EXACT_PREFIX" \
   --maximum-authorized-cost-microusd "$REQUESTED_MAXIMUM_MICROUSD" \
@@ -287,10 +289,10 @@ incomplete import never publishes the final operator `bundle.json`.
 ## Versioned finite-cost authorization
 
 The private unapproved plan is
-`uk.wamr.azure-execution-plan` version 1. Native canonical JSON is compact
+`uk.wamr.azure-execution-plan` version 2. Native canonical JSON is compact
 UTF-8 with byte-sorted keys and one final LF; its SHA-256 is calculated over
 those complete bytes and is deliberately not stored inside the plan itself.
-The separate `uk.wamr.azure-execution-approval-template` version 1 carries
+The separate `uk.wamr.azure-execution-approval-template` version 2 carries
 that external digest. Regenerating or changing the plan therefore changes the
 digest and invalidates every earlier template and authorization.
 
@@ -299,7 +301,11 @@ The plan binds the exact version-2 imported candidate, public admission,
 source commit/tree, raw-to-QCOW2-to-derived-VHD lineage, QCOW2 and VHD
 digests, VHD file length (69,206,528 bytes) and virtual capacity
 (69,206,016 bytes), WAMR identities, execution attempt UUID, campaign UUID,
-campaign profile and exact original ledger path. It also binds the exact
+campaign profile and a versioned campaign-ledger identity. That identity
+includes the campaign UUID, unique ledger UUID, canonical directory physical
+identity, purpose, whether one authorized initialization is required, the
+bounded digest of the legacy pre-state and the exact expected marker digest.
+The displayed ledger path is not authority. It also binds the exact
 subscription and fresh prefix, North Europe `Standard_D2s_v5` Generation 2
 topology, one `StandardSSD_LRS` OS disk, no data disk or public IP, private
 no-default-outbound networking, one VM, two boots and maximum parallelism one.
@@ -354,10 +360,11 @@ python3 support/build/wamr-native-ci/handoff.py admit \
   --az-python "$REVIEWED_CANONICAL_PYTHON"
 ```
 
-`uk.wamr.azure-execution-authorization` version 1 binds the exact plan SHA-256,
-attempt, candidate digest, estimated and maximum micro-USD values, resource
-and time limits, decision, bounded approver/reference and a maximum one-hour
-window. `uk.wamr.azure-execution-admission` version 1 is published only after
+`uk.wamr.azure-execution-authorization` version 2 binds the exact plan SHA-256,
+attempt, campaign and ledger UUIDs, ledger-initialization decision, candidate
+digest, estimated and maximum micro-USD values, resource and time limits,
+decision, bounded approver/reference and a maximum one-hour window.
+`uk.wamr.azure-execution-admission` version 2 is published only after
 the native validator reopens the plan, authorization, candidate, tools and
 image lineage and finds every binding equal. Unknown fields, duplicate keys,
 noncanonical bytes, denial, future/expired time, a different plan/attempt,
@@ -393,10 +400,31 @@ local `az version`;
 passing does not authenticate an account, inspect resources, consume an attempt
 or authorize Azure use. Raw output and tool identities remain private.
 
-Create the reviewed persistent campaign ledger once, mode 0700, before its
-first invocation; for an existing campaign use the original ledger unchanged.
+Create the reviewed persistent campaign ledger once, mode 0700, before
+planning; for an existing campaign use the original ledger unchanged.
 Do not confuse this existing ledger with the required **nonexistent** attempt
 directory. A missing ledger is a pre-admission refusal with a sanitized reason.
+Planning is authority-free and never creates or changes the identity marker.
+For a legacy ledger without a marker, the plan exposes
+`ledger.initialization_required=true`, the proposed ledger UUID and the exact
+bounded legacy pre-state digest. Explicit authorization approves that one
+initialization as well as the attempt. After complete admission, candidate
+and tool validation, execution atomically creates
+`ledger-identity.json` and the create-once
+`ledger-identity.initialized` sentinel before creating any claim. Both are
+fsynced, private and bound to the campaign, ledger UUID, purpose and initial
+state. Initialization occurs only after the bounded local CLI startup and a
+final admission/scope/tool recheck. Marker initialization is an authorized
+durable transition: it may remain if a later claim or backend operation
+fails, but it does not itself consume a claim.
+
+All later plans expose `initialization_required=false` and the established
+ledger UUID. A missing/replaced marker, a marker for another campaign or
+ledger, a stale legacy pre-state, or a remaining sentinel without its marker
+refuses; an initialized ledger is never silently reinitialized. Execution
+opens the ledger once and retains that directory descriptor through identity
+validation, eligibility, claim creation and outcome recording, so replacing
+the pathname cannot substitute another ledger.
 
 The initial explicitly approved tiny attempt failed before resource creation
 because the selected tarball CLI needed an interpreter that the restricted
@@ -426,15 +454,32 @@ uk-wamr-direct-compute PRIVATE_ADMISSION_JSON FRESH_ATTEMPT_DIR CAMPAIGN_LEDGER 
 ```
 
 Before creating the attempt directory, the production entry point
-canonical-decodes the admission, rehashes its plan and authorization, checks
-expiry, finite cost and repository policy, validates the exact candidate and
-tool bindings, and performs a read-only ledger eligibility check. It then
+opens the admission once through canonical no-follow custody, retains and
+parses those exact bytes, and binds their metadata and SHA-256. It copies only
+those retained bytes into the create-only attempt scope, reopens and rehashes
+the copy, revalidates the original retained identity, rehashes the plan and
+authorization, checks expiry, finite cost and repository policy, validates
+the exact candidate and tool bindings, and performs a read-only ledger
+eligibility check. It then
 checks bundle/input custody and bounded clean-environment CLI startup before
 consuming attempt/source-tree/image reservations and before the first Azure
 resource call. Malformed, missing, stale, denied, wrong-plan, wrong-attempt or
 wrong-cost authorization reaches neither ledger mutation nor backend
 invocation. Reservations are retained on later failure. A fresh attempt
 directory is mandatory; neither resume nor an automatic retry exists.
+
+Every executable and parent component is canonical, no-follow, retained and
+owned by the effective UID or trusted root; group/world-writable, set-ID,
+non-regular, hard-linked or replaced files refuse. Native ELF uploader,
+validator, supervisor and interpreter execution uses retained sealed
+descriptor snapshots with `execveat`. The Azure launcher script/module path
+and explicit retained ELF interpreter are content/physical-identity checked
+immediately before and after every call. No tool pathname is reopened as
+native execution authority after admission. Script/module custody deliberately
+uses an accidental on-disk-drift model: retained parent/module-root and script
+identities plus the script content digest must remain stable around the child.
+It does not claim to defeat a privileged actor that can replace module bytes
+only while that child is running.
 Before Boot2 it revalidates inputs, original Boot1 bytes, VM/disk identities,
 deallocation, scope/expiry and durable start admission. `azure_cumulative`
 allows only the exact Boot1 prefix excluding terminal NUL padding to be

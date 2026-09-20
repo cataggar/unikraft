@@ -661,15 +661,25 @@ test "input and tool references retain the artifact versus private policy distin
     try t.expectEqual(.SUCCESS, linux.errno(linux.linkat(fixture.directory.dir.handle, "artifact", fixture.directory.dir.handle, "artifact-hard", 0)));
     const item: custody.Artifact = .{ .path = path, .size = 7, .sha256 = "a" ** 64 };
     const artifact = try custody.Reference.artifact(io, item, .artifact);
-    const tool = try custody.Reference.tool(io, path);
+    try t.expectError(error.UnsafeFile, custody.Reference.tool(io, path));
+    try write(fixture.directory, "tool", "fixture");
+    const tool_path = try fixture.join("tool");
+    defer a.free(tool_path);
+    const tool_file = try fixture.directory.openFile(io, "tool");
+    defer tool_file.close(io);
+    try tool_file.setPermissions(io, .fromMode(0o755));
+    const tool = try custody.Reference.tool(io, tool_path);
+    defer tool.close(io);
     try artifact.verify(io);
     try tool.verify(io);
     try t.expectError(error.UnsafeFile, custody.Reference.artifact(io, item, .private));
     try write(fixture.directory, "artifact", "changed");
     try t.expectError(error.ReferenceChanged, artifact.verify(io));
+    try tool.verify(io);
+    try write(fixture.directory, "tool", "changed");
     try t.expectError(error.ReferenceChanged, tool.verify(io));
-    try file.setPermissions(io, .fromMode(0o644));
-    try t.expectError(error.NotExecutable, custody.Reference.tool(io, path));
+    try tool_file.setPermissions(io, .fromMode(0o644));
+    try t.expectError(error.UnsafeFile, custody.Reference.tool(io, tool_path));
 }
 
 fn capabilities(store: *custody.Store) !void {

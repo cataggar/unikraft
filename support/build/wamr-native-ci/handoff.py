@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Private exact-image handoff, finite-cost authorization records; no Azure."""
 import argparse
+import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -393,14 +395,105 @@ def canonical_document(path):
 
 def executable_artifact(path):
     path = Path(path)
-    ci.require(path.is_absolute() and path.resolve(strict=True) == path,
-               "explicit nonsymlink executable required")
-    info = path.stat()
-    ci.require(stat.S_ISREG(info.st_mode)
-               and info.st_mode & 0o111 and not info.st_mode & 0o022
-               and 0 < info.st_size <= 64 * 1024 * 1024,
-               "unsafe explicit executable")
-    return artifact(path)
+    raw = str(path)
+    ci.require(path.is_absolute() and os.path.normpath(raw) == raw
+               and "//" not in raw and all(
+                   part not in ("", ".", "..") for part in path.parts[1:]),
+               "canonical explicit executable required")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+        file_flags |= os.O_CLOEXEC
+    descriptors = []
+    directory_identities = []
+    directory_identity = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid)
+    file_identity = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+        value.st_nlink, value.st_size, value.st_mtime_ns,
+        value.st_ctime_ns)
+    try:
+        current = os.open("/", directory_flags)
+        descriptors.append(current)
+        info = os.fstat(current)
+        ci.require(
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid in (0, os.geteuid())
+            and not info.st_mode & 0o022,
+            "unsafe executable parent")
+        directory_identities.append(directory_identity(info))
+        for part in path.parts[1:-1]:
+            current = os.open(part, directory_flags, dir_fd=current)
+            descriptors.append(current)
+            info = os.fstat(current)
+            ci.require(
+                stat.S_ISDIR(info.st_mode)
+                and info.st_uid in (0, os.geteuid())
+                and not info.st_mode & 0o022,
+                "unsafe executable parent")
+            directory_identities.append(directory_identity(info))
+        descriptor = os.open(path.name, file_flags, dir_fd=current)
+        descriptors.append(descriptor)
+        before = os.fstat(descriptor)
+        ci.require(
+            stat.S_ISREG(before.st_mode)
+            and before.st_uid in (0, os.geteuid())
+            and before.st_mode & 0o111
+            and not before.st_mode & 0o6022
+            and before.st_nlink == 1
+            and 0 < before.st_size <= 64 * 1024 * 1024,
+            "unsafe explicit executable")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < before.st_size:
+            chunk = os.pread(
+                descriptor, min(64 * 1024, before.st_size - offset),
+                offset)
+            ci.require(chunk, "explicit executable changed")
+            digest.update(chunk)
+            offset += len(chunk)
+        after = os.fstat(descriptor)
+        ci.require(file_identity(before) == file_identity(after),
+                   "explicit executable changed")
+        for parent, expected in zip(
+                descriptors[:-1], directory_identities, strict=True):
+            ci.require(
+                directory_identity(os.fstat(parent)) == expected,
+                "unsafe executable parent")
+        reopened = []
+        try:
+            check = os.open("/", directory_flags)
+            reopened.append(check)
+            ci.require(
+                directory_identity(os.fstat(check))
+                == directory_identities[0],
+                "unsafe executable parent")
+            for index, part in enumerate(path.parts[1:-1], start=1):
+                check = os.open(part, directory_flags, dir_fd=check)
+                reopened.append(check)
+                ci.require(
+                    directory_identity(os.fstat(check))
+                    == directory_identities[index],
+                    "unsafe executable parent")
+            named = os.open(path.name, file_flags, dir_fd=check)
+            reopened.append(named)
+            ci.require(
+                file_identity(os.fstat(named)) == file_identity(before),
+                "explicit executable changed")
+        finally:
+            for reopened_descriptor in reversed(reopened):
+                os.close(reopened_descriptor)
+        return {
+            "path": raw,
+            "size": before.st_size,
+            "sha256": digest.hexdigest(),
+        }
+    except OSError as error:
+        raise ci.Refusal("unsafe explicit executable") from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def native_validate(validator, *arguments):
@@ -413,6 +506,30 @@ def native_validate(validator, *arguments):
         check=False,
     )
     ci.require(completed.returncode == 0, "native authorization validation failed")
+
+
+def native_json(validator, *arguments):
+    validator = Path(validator)
+    executable_artifact(validator)
+    completed = subprocess.run(
+        [str(validator), *map(str, arguments)],
+        env={"LC_ALL": "C"}, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300,
+        check=False,
+    )
+    ci.require(completed.returncode == 0
+               and 0 < len(completed.stdout) <= 64 * 1024,
+               "native authorization inspection failed")
+    try:
+        value = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ci.Refusal("native authorization inspection failed") from error
+    ci.require(
+        completed.stdout
+        == (json.dumps(value, sort_keys=True, separators=(",", ":"))
+            + "\n").encode(),
+        "canonical native authorization inspection required")
+    return value
 
 
 def exact_tool_bindings(azure, uploader, validator, supervisor, az_python):
@@ -451,7 +568,8 @@ def approval_limits(plan_value):
 def plan(bundle_path, output, approval_template, candidate_output, *,
          campaign_id, ledger, subscription, prefix,
          maximum_authorized_cost_microusd, azure, uploader, validator,
-         supervisor, az_python, attempt_id=None, created_unix=None):
+         supervisor, az_python, attempt_id=None, ledger_id=None,
+         created_unix=None):
     private(bundle_path.parent)
     private(output.parent)
     private(approval_template.parent)
@@ -465,6 +583,8 @@ def plan(bundle_path, output, approval_template, candidate_output, *,
         campaign_id = str(uuid.UUID(campaign_id))
         attempt_id = str(uuid.uuid4() if attempt_id is None
                          else uuid.UUID(attempt_id))
+        ledger_id = str(uuid.uuid4() if ledger_id is None
+                        else uuid.UUID(ledger_id))
         subscription = str(uuid.UUID(subscription))
     except (ValueError, AttributeError) as error:
         raise ci.Refusal("canonical plan UUID required") from error
@@ -497,6 +617,12 @@ def plan(bundle_path, output, approval_template, candidate_output, *,
                "candidate image binding changed")
     tools = exact_tool_bindings(
         azure, uploader, validator, supervisor, az_python)
+    ledger_binding = native_json(
+        validator, "ledger-proposal", ledger, campaign_id, ledger_id)
+    ci.require(
+        ledger_binding["campaign_id"] == campaign_id
+        and ledger_binding["ledger_id"],
+        "wrong campaign ledger proposal")
     resources = {
         "vm_count": 1,
         "os_disk_count": 1,
@@ -511,7 +637,7 @@ def plan(bundle_path, output, approval_template, candidate_output, *,
     }
     value = {
         "schema": "uk.wamr.azure-execution-plan",
-        "version": 1,
+        "version": 2,
         "purpose": "qcow2-derived-vhd-two-boot",
         "profile": ci.CURRENT_PROFILE,
         "authority": "not_admitted",
@@ -521,6 +647,7 @@ def plan(bundle_path, output, approval_template, candidate_output, *,
         "campaign_id": campaign_id,
         "campaign_profile": ci.CURRENT_PROFILE,
         "ledger_path": str(ledger),
+        "ledger": ledger_binding,
         "subscription": subscription,
         "location": candidate["location"],
         "prefix": prefix,
@@ -574,10 +701,14 @@ def plan(bundle_path, output, approval_template, candidate_output, *,
     plan_sha256 = ci.digest(output, 64 * 1024)
     template = {
         "schema": "uk.wamr.azure-execution-approval-template",
-        "version": 1,
+        "version": 2,
         "decision": "pending",
         "plan_sha256": plan_sha256,
         "attempt_id": attempt_id,
+        "campaign_id": campaign_id,
+        "ledger_id": ledger_binding["ledger_id"],
+        "ledger_initialization_required":
+            ledger_binding["initialization_required"],
         "candidate_sha256": value["candidate"]["sha256"],
         "estimated_cost_upper_bound_microusd":
             ESTIMATED_COST_UPPER_BOUND_MICROUSD,
@@ -622,6 +753,11 @@ def record_authorization(plan_path, template_path, output, *, decision,
     native_validate(validator, "plan", plan_path, template_path)
     ci.require(template["plan_sha256"] == ci.digest(plan_path, 64 * 1024)
                and template["attempt_id"] == plan_value["attempt_id"]
+               and template["campaign_id"] == plan_value["campaign_id"]
+               and template["ledger_id"]
+               == plan_value["ledger"]["ledger_id"]
+               and template["ledger_initialization_required"]
+               == plan_value["ledger"]["initialization_required"]
                and template["candidate_sha256"]
                == plan_value["candidate"]["sha256"]
                and template["decision"] == "pending",
@@ -641,10 +777,14 @@ def record_authorization(plan_path, template_path, output, *, decision,
                "bounded approval window required")
     authorization = {
         "schema": "uk.wamr.azure-execution-authorization",
-        "version": 1,
+        "version": 2,
         "decision": decision,
         "plan_sha256": template["plan_sha256"],
         "attempt_id": template["attempt_id"],
+        "campaign_id": template["campaign_id"],
+        "ledger_id": template["ledger_id"],
+        "ledger_initialization_required":
+            template["ledger_initialization_required"],
         "candidate_sha256": template["candidate_sha256"],
         "estimated_cost_upper_bound_microusd":
             template["estimated_cost_upper_bound_microusd"],
@@ -681,7 +821,7 @@ def admission(plan_path, authorization_path, output, *, azure, uploader,
     }
     value.update({
         "schema": "uk.wamr.azure-execution-admission",
-        "version": 1,
+        "version": 2,
         "authority": "approved",
         "plan": artifact(plan_path),
         "authorization": artifact(authorization_path),
@@ -713,12 +853,18 @@ def main():
     pln.add_argument("--approval-template", type=Path, required=True)
     pln.add_argument("--candidate-output", type=Path, required=True)
     pln.add_argument("--campaign-id", required=True)
-    pln.add_argument("--ledger", type=Path, required=True)
+    pln.add_argument(
+        "--ledger", type=Path, required=True,
+        help="Existing private 0700 campaign ledger; planning never mutates it")
     pln.add_argument("--subscription", required=True)
     pln.add_argument("--prefix", required=True)
     pln.add_argument("--maximum-authorized-cost-microusd",
                      type=int, required=True)
     pln.add_argument("--attempt-id")
+    pln.add_argument(
+        "--ledger-id",
+        help=("Proposed UUID for an uninitialized legacy ledger; defaults to "
+              "a fresh UUID and is ignored for an initialized ledger"))
     pln.add_argument("--created-unix", type=int)
     for tool_name in ("azure", "uploader", "validator",
                       "supervisor", "az-python"):
@@ -780,6 +926,7 @@ def main():
             azure=args.azure, uploader=args.uploader,
             validator=args.validator, supervisor=args.supervisor,
             az_python=args.az_python, attempt_id=args.attempt_id,
+            ledger_id=args.ledger_id,
             created_unix=args.created_unix)
     elif args.command == "record-authorization":
         record_authorization(
