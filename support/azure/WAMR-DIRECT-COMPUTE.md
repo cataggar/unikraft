@@ -534,8 +534,10 @@ directory is mandatory; neither resume nor an automatic retry exists.
 Every executable and parent component is canonical, no-follow and retained;
 group/world-writable, set-ID, non-regular, hard-linked or replaced files
 refuse. Execution tools must be owned by the invoking UID. The user-namespace
-view accepts an unmapped owner only for the exact filesystem root, never for
-an artifact or another path component. Native ELF uploader, validator and supervisor execution uses retained sealed
+view accepts the kernel overflow owner only for safe-mode directory ancestors,
+never for a final execution tool. Runtime ancestors additionally must
+reproduce the authorization's aggregate host-identity digest, so an
+other-user ancestor cannot be reinterpreted as host root. Native ELF uploader, validator and supervisor execution uses retained sealed
 descriptor snapshots with `execveat`. Before admission the controller
 re-execs in a private user/mount namespace, copies the authenticated Azure
 runtime to bounded tmpfs, remounts it read-only, and drops namespace

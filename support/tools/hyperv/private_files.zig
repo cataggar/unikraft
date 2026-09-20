@@ -4,6 +4,8 @@ const linux = std.os.linux;
 var user_namespace_active = std.atomic.Value(bool).init(false);
 var namespace_host_uid = std.atomic.Value(u32).init(0);
 var namespace_host_gid = std.atomic.Value(u32).init(0);
+var namespace_overflow_uid = std.atomic.Value(u32).init(std.math.maxInt(u32));
+var namespace_overflow_gid = std.atomic.Value(u32).init(std.math.maxInt(u32));
 pub const namespace_marker = "WAMR_AZURE_RUNTIME_NAMESPACE";
 pub const namespace_uid = "WAMR_AZURE_RUNTIME_HOST_UID";
 pub const namespace_gid = "WAMR_AZURE_RUNTIME_HOST_GID";
@@ -32,11 +34,17 @@ pub fn enterUserNamespaceFromEnvironment(
         environment.get(namespace_gid) orelse return error.InvalidUserNamespace,
         10,
     );
-    try verifyNamespace(io, uid, gid);
+    const overflow = try verifyNamespace(io, uid, gid);
+    namespace_overflow_uid.store(overflow.uid, .release);
+    namespace_overflow_gid.store(overflow.gid, .release);
     enterUserNamespace(uid, gid);
 }
 
-fn verifyNamespace(io: std.Io, host_uid: u32, host_gid: u32) !void {
+fn verifyNamespace(
+    io: std.Io,
+    host_uid: u32,
+    host_gid: u32,
+) !struct { uid: u32, gid: u32 } {
     try verifyIdMap(io, "/proc/self/uid_map", host_uid);
     try verifyIdMap(io, "/proc/self/gid_map", host_gid);
     var groups_buffer: [32]u8 = undefined;
@@ -77,6 +85,17 @@ fn verifyNamespace(io: std.Io, host_uid: u32, host_gid: u32) !void {
         }
     }
     if (!root_found) return error.InvalidUserNamespace;
+    const overflow_uid = try readKernelId(
+        io,
+        "/proc/sys/kernel/overflowuid",
+    );
+    const overflow_gid = try readKernelId(
+        io,
+        "/proc/sys/kernel/overflowgid",
+    );
+    if (overflow_uid == 0 or overflow_gid == 0)
+        return error.InvalidUserNamespace;
+    return .{ .uid = overflow_uid, .gid = overflow_gid };
 }
 
 fn verifyIdMap(io: std.Io, path: []const u8, host_id: u32) !void {
@@ -101,6 +120,19 @@ fn verifyIdMap(io: std.Io, path: []const u8, host_id: u32) !void {
     if (inside != 0 or outside != host_id or count != 1 or
         fields.next() != null)
         return error.InvalidUserNamespace;
+}
+
+fn readKernelId(io: std.Io, path: []const u8) !u32 {
+    var buffer: [32]u8 = undefined;
+    return std.fmt.parseInt(
+        u32,
+        std.mem.trim(
+            u8,
+            try readKernelFile(io, path, &buffer),
+            " \t\r\n",
+        ),
+        10,
+    );
 }
 
 fn readKernelFile(
@@ -130,10 +162,52 @@ pub fn hostGid(id: u32) u32 {
     return id;
 }
 
+pub fn isNamespaceOverflowUid(id: u32) bool {
+    return user_namespace_active.load(.acquire) and
+        id == namespace_overflow_uid.load(.acquire);
+}
+
+pub fn isNamespaceOverflowGid(id: u32) bool {
+    return user_namespace_active.load(.acquire) and
+        id == namespace_overflow_gid.load(.acquire);
+}
+
 fn trustedArtifactOwner(uid: u32) bool {
     return uid == 0 or
         (!user_namespace_active.load(.acquire) and uid == linux.geteuid());
 }
+
+fn trustedDirectoryOwner(uid: u32) bool {
+    return trustedArtifactOwner(uid) or isNamespaceOverflowUid(uid);
+}
+
+test "namespace overflow ownership is limited to directory traversal" {
+    const active = user_namespace_active.load(.acquire);
+    const host_uid = namespace_host_uid.load(.acquire);
+    const host_gid = namespace_host_gid.load(.acquire);
+    const overflow_uid = namespace_overflow_uid.load(.acquire);
+    const overflow_gid = namespace_overflow_gid.load(.acquire);
+    defer {
+        namespace_host_uid.store(host_uid, .release);
+        namespace_host_gid.store(host_gid, .release);
+        namespace_overflow_uid.store(overflow_uid, .release);
+        namespace_overflow_gid.store(overflow_gid, .release);
+        user_namespace_active.store(active, .release);
+    }
+
+    namespace_host_uid.store(1234, .release);
+    namespace_host_gid.store(1235, .release);
+    namespace_overflow_uid.store(65534, .release);
+    namespace_overflow_gid.store(65534, .release);
+    user_namespace_active.store(true, .release);
+
+    try std.testing.expect(trustedDirectoryOwner(65534));
+    try std.testing.expect(!trustedArtifactOwner(65534));
+    try std.testing.expect(!trustedDirectoryOwner(65533));
+    try std.testing.expectEqual(@as(u32, 65534), hostUid(65534));
+    try std.testing.expectEqual(@as(u32, 1234), hostUid(0));
+}
+
 const contracts = @import("contracts.zig");
 const diagnostics = @import("diagnostics.zig");
 const sensitive = @import("sensitive.zig");
@@ -658,7 +732,7 @@ fn validateDirectory(
     if (stat.kind != .directory) return error.UnsafeFile;
     if (private) {
         if (uid != linux.geteuid() or mode != 0o700) return error.UnsafeFile;
-    } else if ((!trustedArtifactOwner(uid) and
+    } else if ((!trustedDirectoryOwner(uid) and
         !(trusted_root and user_namespace_active.load(.acquire))) or
         mode & 0o022 != 0) return error.UnsafeFile;
 }

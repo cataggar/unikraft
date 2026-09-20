@@ -1125,6 +1125,10 @@ fn hashParent(
     value: files.Snapshot,
 ) void {
     var buffer: [8192]u8 = undefined;
+    const uid = if (std.mem.eql(u8, path, "/") or
+        files.isNamespaceOverflowUid(value.uid)) 0 else files.hostUid(value.uid);
+    const gid = if (std.mem.eql(u8, path, "/") or
+        files.isNamespaceOverflowGid(value.gid)) 0 else files.hostGid(value.gid);
     const line = std.fmt.bufPrint(
         &buffer,
         "P\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n",
@@ -1134,8 +1138,8 @@ fn hashParent(
             value.dev_minor,
             value.ino,
             value.mode,
-            if (std.mem.eql(u8, path, "/")) 0 else files.hostUid(value.uid),
-            if (std.mem.eql(u8, path, "/")) 0 else files.hostGid(value.gid),
+            uid,
+            gid,
         },
     ) catch unreachable;
     hash.update(line);
@@ -1143,6 +1147,12 @@ fn hashParent(
 
 fn validateParentDirectory(path: []const u8, value: files.Snapshot) !void {
     if (std.mem.eql(u8, path, "/")) {
+        if (value.mode & linux.S.IFMT != linux.S.IFDIR or
+            value.mode & 0o022 != 0)
+            return error.UnsafeAzureRuntime;
+        return;
+    }
+    if (files.isNamespaceOverflowUid(value.uid)) {
         if (value.mode & linux.S.IFMT != linux.S.IFDIR or
             value.mode & 0o022 != 0)
             return error.UnsafeAzureRuntime;

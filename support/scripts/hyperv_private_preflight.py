@@ -532,7 +532,7 @@ GUARDED_PRODUCER_FILES = {
         "39db3cd37dffe39608220e267b627010c6b0aabcfd0a436b98fe9556f5d92516"
     ),
     "support/tools/hyperv/private_files.zig": (
-        "31b0c36a228af6297b44646b6101d7ea6b07d4712fddc66213a902945c576a92"
+        "f4aea15e0bda19851e8ec7d868e31729f6d66ecfdb49b8c1df0680b67c9ec7bc"
     ),
     "support/tools/hyperv/process-command-v1.json": (
         "ee1e038f6538beecac8a09d4d52a6c601a9ca1f503fd70a3753bd8d2e3ac904b"
