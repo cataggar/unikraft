@@ -132,7 +132,7 @@ test "local version executes self contained and explicitly pinned interpreter un
             try operator.put(key, "/never/inherit");
         var environment = try runtime.Environment.init(allocator, &operator);
         defer environment.deinit();
-        const interpreter = try launcher.selectInterpreter(io, &environment, if (python) executable else null, null);
+        const interpreter = try launcher.selectInterpreter(io, &environment, if (python) executable else null, null, null);
         var cancellation = try core.process.SignalCancellation.install();
         defer cancellation.deinit();
         var scope = timingScope();
@@ -174,7 +174,7 @@ test "pinned interpreter changed in place or replaced refuses before child creat
         try operator.put("HOME", support.options.test_root.?);
         var environment = try runtime.Environment.init(allocator, &operator);
         defer environment.deinit();
-        const interpreter = try launcher.selectInterpreter(io, &environment, path, null);
+        const interpreter = try launcher.selectInterpreter(io, &environment, path, null, null);
         if (replace) try fixture.directory.dir.deleteFile(io, "python");
         file = try fixture.directory.dir.createFile(io, "python", .{ .permissions = .fromMode(0o700) });
         try file.writePositionalAll(io, if (replace) "synthetic interpreter" else "changed interpreter", 0);

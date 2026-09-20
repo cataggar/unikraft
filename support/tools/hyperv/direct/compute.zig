@@ -235,7 +235,7 @@ pub const LedgerBinding = struct {
             self.version != 1 or
             self.purpose != .@"qcow2-derived-vhd-two-boot" or
             !eq(self.campaign_id, campaign_id) or
-            self.directory.uid != std.os.linux.geteuid() or
+            self.directory.uid != files.hostUid(std.os.linux.geteuid()) or
             self.directory.mode != 0o700)
             return error.InvalidLedgerIdentity;
         try uuid(self.campaign_id);
@@ -286,6 +286,7 @@ pub const AzureRuntimeApproval = struct {
     manifest: azure_runtime.Artifact,
     launcher: azure_runtime.Artifact,
     interpreter: azure_runtime.Artifact,
+    dynamic_loader: azure_runtime.Artifact,
     content_sha256: []const u8,
     metadata_sha256: []const u8,
     parents_sha256: []const u8,
@@ -294,6 +295,7 @@ pub const AzureRuntimeApproval = struct {
     limits: azure_runtime.Limits,
     observed: azure_runtime.Observed,
     loader_dependencies: []azure_runtime.Artifact,
+    commands: []const []const []const u8,
     isolation: azure_runtime.Isolation,
 };
 
@@ -412,6 +414,7 @@ pub const Plan = struct {
             .manifest = self.azure_runtime.manifest,
             .launcher = self.azure_runtime.launcher,
             .interpreter = self.azure_runtime.interpreter,
+            .dynamic_loader = self.azure_runtime.dynamic_loader,
             .content_sha256 = self.azure_runtime.content_sha256,
             .metadata_sha256 = self.azure_runtime.metadata_sha256,
             .parents_sha256 = self.azure_runtime.parents_sha256,
@@ -420,6 +423,7 @@ pub const Plan = struct {
             .limits = self.azure_runtime.limits,
             .observed = self.azure_runtime.observed,
             .loader_dependencies = self.azure_runtime.loader_dependencies,
+            .commands = self.azure_runtime.commands,
             .isolation = self.azure_runtime.isolation,
         };
     }
@@ -1101,7 +1105,7 @@ fn hashLedgerMetadata(hash: *core.Sha256, value: files.Snapshot) void {
     std.mem.writeInt(u64, bytes[8..16], value.ino, .big);
     std.mem.writeInt(u64, bytes[16..24], value.size, .big);
     std.mem.writeInt(u16, bytes[24..26], value.mode, .big);
-    std.mem.writeInt(u32, bytes[26..30], value.uid, .big);
+    std.mem.writeInt(u32, bytes[26..30], files.hostUid(value.uid), .big);
     std.mem.writeInt(u32, bytes[30..34], value.nlink, .big);
     std.mem.writeInt(i64, bytes[34..42], value.mtime.sec, .big);
     std.mem.writeInt(u32, bytes[42..46], value.mtime.nsec, .big);
@@ -1170,7 +1174,7 @@ fn directoryIdentity(value: files.Snapshot) DirectoryIdentity {
         .device_major = value.dev_major,
         .device_minor = value.dev_minor,
         .inode = value.ino,
-        .uid = value.uid,
+        .uid = files.hostUid(value.uid),
         .mode = value.mode & 0o7777,
     };
 }
@@ -2475,6 +2479,7 @@ fn sameRuntimeApproval(a: AzureRuntimeApproval, b: AzureRuntimeApproval) bool {
         !azureRuntimeArtifactEqual(a.manifest, b.manifest) or
         !azureRuntimeArtifactEqual(a.launcher, b.launcher) or
         !azureRuntimeArtifactEqual(a.interpreter, b.interpreter) or
+        !azureRuntimeArtifactEqual(a.dynamic_loader, b.dynamic_loader) or
         !eq(a.content_sha256, b.content_sha256) or
         !eq(a.metadata_sha256, b.metadata_sha256) or
         !eq(a.parents_sha256, b.parents_sha256) or
@@ -2483,10 +2488,16 @@ fn sameRuntimeApproval(a: AzureRuntimeApproval, b: AzureRuntimeApproval) bool {
         !std.meta.eql(a.limits, b.limits) or
         !std.meta.eql(a.observed, b.observed) or
         !std.meta.eql(a.isolation, b.isolation) or
-        a.loader_dependencies.len != b.loader_dependencies.len)
+        a.loader_dependencies.len != b.loader_dependencies.len or
+        a.commands.len != b.commands.len)
         return false;
     for (a.loader_dependencies, b.loader_dependencies) |left, right|
         if (!azureRuntimeArtifactEqual(left, right)) return false;
+    for (a.commands, b.commands) |left, right| {
+        if (left.len != right.len) return false;
+        for (left, right) |left_part, right_part|
+            if (!eq(left_part, right_part)) return false;
+    }
     return true;
 }
 

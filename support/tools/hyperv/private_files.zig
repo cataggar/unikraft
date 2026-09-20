@@ -1,6 +1,55 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+var user_namespace_active = std.atomic.Value(bool).init(false);
+var namespace_host_uid = std.atomic.Value(u32).init(0);
+var namespace_host_gid = std.atomic.Value(u32).init(0);
+pub const namespace_marker = "WAMR_AZURE_RUNTIME_NAMESPACE";
+pub const namespace_uid = "WAMR_AZURE_RUNTIME_HOST_UID";
+pub const namespace_gid = "WAMR_AZURE_RUNTIME_HOST_GID";
+
+pub fn enterUserNamespace(uid: u32, gid: u32) void {
+    namespace_host_uid.store(uid, .release);
+    namespace_host_gid.store(gid, .release);
+    user_namespace_active.store(true, .release);
+}
+
+pub fn enterUserNamespaceFromEnvironment(
+    environment: *const std.process.Environ.Map,
+) !void {
+    const marker = environment.get(namespace_marker) orelse return;
+    if (!std.mem.eql(u8, marker, "1") or linux.geteuid() != 0 or
+        linux.getegid() != 0)
+        return error.InvalidUserNamespace;
+    const uid = try std.fmt.parseInt(
+        u32,
+        environment.get(namespace_uid) orelse return error.InvalidUserNamespace,
+        10,
+    );
+    const gid = try std.fmt.parseInt(
+        u32,
+        environment.get(namespace_gid) orelse return error.InvalidUserNamespace,
+        10,
+    );
+    enterUserNamespace(uid, gid);
+}
+
+pub fn hostUid(id: u32) u32 {
+    if (!user_namespace_active.load(.acquire)) return id;
+    if (id == 0) return namespace_host_uid.load(.acquire);
+    return if (id == 65534) 0 else id;
+}
+
+pub fn hostGid(id: u32) u32 {
+    if (!user_namespace_active.load(.acquire)) return id;
+    if (id == 0) return namespace_host_gid.load(.acquire);
+    return if (id == 65534) 0 else id;
+}
+
+fn trustedArtifactOwner(uid: u32) bool {
+    return uid == 0 or uid == linux.geteuid() or
+        hostUid(uid) == 0;
+}
 const contracts = @import("contracts.zig");
 const diagnostics = @import("diagnostics.zig");
 const sensitive = @import("sensitive.zig");
@@ -516,7 +565,7 @@ fn validateDirectory(io: std.Io, dir: std.Io.Dir, private: bool) !void {
     if (stat.kind != .directory) return error.UnsafeFile;
     if (private) {
         if (uid != linux.geteuid() or mode != 0o700) return error.UnsafeFile;
-    } else if ((uid != 0 and uid != linux.geteuid()) or mode & 0o022 != 0) return error.UnsafeFile;
+    } else if (!trustedArtifactOwner(uid) or mode & 0o022 != 0) return error.UnsafeFile;
 }
 
 fn validateFile(io: std.Io, file: std.Io.File) !void {
@@ -533,7 +582,7 @@ fn validateFileWithLinks(io: std.Io, file: std.Io.File, allow_unlinked: bool) !v
 fn validateToolFile(file: std.Io.File) !void {
     const value = try snapshot(file);
     if (value.mode & linux.S.IFMT != linux.S.IFREG or
-        (value.uid != 0 and value.uid != linux.geteuid()) or
+        !trustedArtifactOwner(value.uid) or
         value.mode & 0o111 == 0 or value.mode & 0o6022 != 0 or
         value.nlink != 1 or value.size == 0 or
         value.size > 64 * 1024 * 1024)

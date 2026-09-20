@@ -117,6 +117,14 @@ pub const Environment = struct {
         try result.azure.put("PYTHONNOUSERSITE", "1");
         try result.azure.put("PYTHONSAFEPATH", "1");
         try result.native.put("LC_ALL", "C");
+        inline for (.{
+            core.private_files.namespace_marker,
+            core.private_files.namespace_uid,
+            core.private_files.namespace_gid,
+        }) |key| {
+            if (operator.get(key)) |value|
+                try result.native.put(key, value);
+        }
         return result;
     }
 
@@ -228,6 +236,7 @@ pub const Runtime = struct {
     interpreter: ?custody.Reference = null,
     tool_references: ?*const [3]custody.Reference = null,
     azure_runtime: ?azure_runtime.Contract = null,
+    azure_custody: ?*const azure_runtime.Sealed = null,
 
     pub fn verifyInterpreter(self: Runtime) !void {
         if (self.programs.azure_python) |path| {
@@ -238,6 +247,20 @@ pub const Runtime = struct {
         } else if (self.interpreter != null)
             return error.UnexpectedInterpreter;
         if (self.azure_runtime) |closure| {
+            const runtime_custody = self.azure_custody orelse
+                return error.AzureRuntimeNotPinned;
+            var root_buffer: [64]u8 = undefined;
+            const root = try std.fmt.bufPrint(
+                &root_buffer,
+                "/proc/self/fd/{d}",
+                .{runtime_custody.root.handle},
+            );
+            var extensions_buffer: [80]u8 = undefined;
+            const extensions = try std.fmt.bufPrint(
+                &extensions_buffer,
+                "{s}/extensions",
+                .{root},
+            );
             if (self.programs.azure_runtime == null or
                 !std.mem.eql(
                     u8,
@@ -248,13 +271,13 @@ pub const Runtime = struct {
                 !std.mem.eql(u8, closure.launcher.path, self.programs.azure) or
                 !std.mem.eql(
                     u8,
-                    closure.root,
+                    root,
                     self.environment.azure.get("PYTHONHOME") orelse
                         return error.InterpreterNotSelected,
                 ) or
                 !std.mem.eql(
                     u8,
-                    closure.extensions,
+                    extensions,
                     self.environment.azure.get("AZURE_EXTENSION_DIR") orelse
                         return error.InterpreterNotSelected,
                 ) or
@@ -266,9 +289,10 @@ pub const Runtime = struct {
                     ) orelse return error.InterpreterNotSelected,
                 ))
                 return error.InterpreterChanged;
-            try azure_runtime.verify(self.allocator, self.io, closure);
+            try runtime_custody.verify(self.allocator, self.io, closure);
         } else if (self.programs.azure_runtime != null or
-            self.environment.azure.get("PYTHONHOME") != null)
+            self.environment.azure.get("PYTHONHOME") != null or
+            self.azure_custody != null)
             return error.UnexpectedInterpreter;
     }
 
@@ -323,30 +347,50 @@ pub const Runtime = struct {
         }
         if (lane == .primary and self.cancellation.flag().load(.acquire)) return error.Cancelled;
         const closure_launch = role == .azure and self.azure_runtime != null;
-        const maximum_arguments: usize = if (closure_launch) 122 else 127;
+        const maximum_arguments: usize = if (closure_launch) 117 else 127;
         if (arguments.len > maximum_arguments)
             return error.InvalidArguments;
+        if (closure_launch) try azureCommand(arguments);
         var argv: [128][]const u8 = undefined;
         var argument_offset: usize = 1;
-        var launcher_path: [64]u8 = undefined;
+        var root_path: [64]u8 = undefined;
+        var loader_path: [80]u8 = undefined;
+        var interpreter_path: [80]u8 = undefined;
+        var launcher_path: [96]u8 = undefined;
         if (closure_launch) {
-            const interpreter = self.interpreter orelse
-                return error.InterpreterNotPinned;
-            const references = self.tool_references orelse
+            _ = self.interpreter orelse return error.InterpreterNotPinned;
+            const closure = self.azure_runtime orelse
                 return error.AzureRuntimeNotPinned;
-            const launcher = references[@intFromEnum(Role.azure)].retained orelse
+            const retained = self.azure_custody orelse
                 return error.AzureRuntimeNotPinned;
-            argv[0] = interpreter.path;
-            argv[1] = "-s";
-            argv[2] = "-S";
-            argv[3] = "-B";
-            argv[4] = "-P";
-            argv[5] = try std.fmt.bufPrint(
-                &launcher_path,
+            const root = try std.fmt.bufPrint(
+                &root_path,
                 "/proc/self/fd/{d}",
-                .{launcher.file.handle},
+                .{retained.root.handle},
             );
-            argument_offset = 6;
+            argv[0] = closure.dynamic_loader.path;
+            argv[1] = "--inhibit-cache";
+            argv[2] = "--library-path";
+            argv[3] = try std.fmt.bufPrint(
+                &loader_path,
+                "{s}/loader",
+                .{root},
+            );
+            argv[4] = try std.fmt.bufPrint(
+                &interpreter_path,
+                "{s}/bin/python",
+                .{root},
+            );
+            argv[5] = "-s";
+            argv[6] = "-S";
+            argv[7] = "-B";
+            argv[8] = "-P";
+            argv[9] = try std.fmt.bufPrint(
+                &launcher_path,
+                "{s}/bootstrap/azure-cli",
+                .{root},
+            );
+            argument_offset = 10;
         } else {
             argv[0] = self.programs.path(role);
         }
@@ -371,13 +415,15 @@ pub const Runtime = struct {
             null;
         if (reference) |value| try value.verify(self.io);
         const executable = if (closure_launch)
-            (self.interpreter orelse return error.InterpreterNotPinned).native
+            (self.azure_custody orelse
+                return error.AzureRuntimeNotPinned).loader
         else if (reference) |value|
             value.native
         else
             null;
         const inherited_descriptor = if (closure_launch)
-            (reference.?.retained orelse return error.AzureRuntimeNotPinned).file.handle
+            (self.azure_custody orelse
+                return error.AzureRuntimeNotPinned).root.handle
         else
             null;
         const result = process.runPrivate(self.allocator, self.io, lock, stdout_name, stderr_name, .{
@@ -411,6 +457,21 @@ fn publicArgument(value: []const u8) !void {
     if (value.len > 64 * 1024 or std.mem.indexOfAny(u8, value, "?\x00&") != null or
         std.ascii.indexOfIgnoreCase(value, "sig=") != null or
         std.ascii.indexOfIgnoreCase(value, "sas-token") != null) return error.SecretArgument;
+}
+
+fn azureCommand(arguments: []const []const u8) !void {
+    for (azure_runtime.commands) |command| {
+        if (arguments.len < command.len) continue;
+        var matches = true;
+        for (arguments[0..command.len], command) |actual, expected| {
+            if (!std.mem.eql(u8, actual, expected)) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return;
+    }
+    return error.AzureCommandNotApproved;
 }
 
 fn unixSeconds() !u64 {

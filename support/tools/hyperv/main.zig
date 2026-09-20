@@ -9,6 +9,9 @@ fn safeLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), compti
 }
 
 pub fn main(init: std.process.Init) void {
+    @import("hyperv").private_files.enterUserNamespaceFromEnvironment(
+        init.environ_map,
+    ) catch std.process.exit(1);
     inspect(init) catch |err| {
         var failures: core.diagnostics.Failures = .{};
         failures.primary = .{

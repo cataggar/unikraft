@@ -12,15 +12,29 @@ pub fn selectInterpreter(
     environment: *runtime.Environment,
     path: ?[]const u8,
     closure: ?azure_runtime.Contract,
+    sealed: ?*const azure_runtime.Sealed,
 ) !?custody.Reference {
     if (path) |value| {
         const reference = try custody.Reference.tool(io, value);
         if (reference.metadata.mode & 0o022 != 0) return error.UnsafeInterpreter;
-        if (closure) |runtime_closure| {
-            try environment.azure.put("PYTHONHOME", runtime_closure.root);
+        if (closure != null) {
+            const runtime_sealed = sealed orelse
+                return error.AzureRuntimeNotPinned;
+            var home_buffer: [64]u8 = undefined;
+            const home = try std.fmt.bufPrint(
+                &home_buffer,
+                "/proc/self/fd/{d}",
+                .{runtime_sealed.root.handle},
+            );
+            try environment.azure.put("PYTHONHOME", home);
+            var extensions_buffer: [80]u8 = undefined;
             try environment.azure.put(
                 "AZURE_EXTENSION_DIR",
-                runtime_closure.extensions,
+                try std.fmt.bufPrint(
+                    &extensions_buffer,
+                    "{s}/extensions",
+                    .{home},
+                ),
             );
             try environment.azure.put(
                 "AZURE_EXTENSION_USE_DYNAMIC_INSTALL",
@@ -29,7 +43,7 @@ pub fn selectInterpreter(
         }
         return reference;
     }
-    if (closure != null) return error.InterpreterNotSelected;
+    if (closure != null or sealed != null) return error.InterpreterNotSelected;
     return null;
 }
 
@@ -136,6 +150,7 @@ pub fn check(adapter: runtime.Runtime, writer: *core.private_files.Locked, azure
 }
 
 pub fn standalone(init: std.process.Init, args: []const []const u8) !u8 {
+    try azure_runtime.ensureNamespace(init);
     if (args.len != 2 and args.len != 4 and args.len != 6)
         return error.InvalidArguments;
     if (args.len == 4 and !std.mem.eql(u8, args[2], "--az-python")) return error.InvalidArguments;
@@ -148,11 +163,11 @@ pub fn standalone(init: std.process.Init, args: []const []const u8) !u8 {
     else
         null;
     defer if (closure) |*value| value.deinit();
-    if (closure) |value| try azure_runtime.verify(
-        init.gpa,
-        init.io,
-        value.value.value,
-    );
+    var sealed = if (closure) |value|
+        try azure_runtime.seal(init.gpa, init.io, value.value.value)
+    else
+        null;
+    defer if (sealed) |value| value.close(init.io);
     const programs: runtime.Programs = .{
         .azure = args[1],
         .uploader = args[1],
@@ -172,6 +187,7 @@ pub fn standalone(init: std.process.Init, args: []const []const u8) !u8 {
         &environment,
         programs.azure_python,
         if (closure) |value| value.value.value else null,
+        if (sealed) |*value| value else null,
     );
     defer if (interpreter) |value| value.close(init.io);
     const azure = try custody.Reference.tool(init.io, programs.azure);
@@ -195,6 +211,7 @@ pub fn standalone(init: std.process.Init, args: []const []const u8) !u8 {
         .interpreter = interpreter,
         .tool_references = &tool_references,
         .azure_runtime = if (closure) |value| value.value.value else null,
+        .azure_custody = if (sealed) |*value| value else null,
     };
     try adapter.initialize();
     try local.verifyDirectory(init.io, directory, args[0]);

@@ -323,7 +323,7 @@ pub const CampaignLedger = struct {
             binding.directory.device_major != current.dev_major or
             binding.directory.device_minor != current.dev_minor or
             binding.directory.inode != current.ino or
-            binding.directory.uid != current.uid or
+            binding.directory.uid != files.hostUid(current.uid) or
             binding.directory.mode != current.mode & 0o7777)
             return error.LedgerIdentityChanged;
         try validatePrivateDirectory(self.directory.dir);
