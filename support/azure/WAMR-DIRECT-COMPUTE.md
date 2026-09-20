@@ -542,7 +542,12 @@ validator and supervisor execution uses retained sealed descriptor snapshots
 with `execveat`. Before admission the controller
 re-execs in a private user/mount namespace, copies the authenticated Azure
 runtime to bounded tmpfs, remounts it read-only, and drops namespace
-capabilities. The initial process must have full host UID/GID maps. The
+capabilities. The initial process must have full host UID/GID maps. A host that
+withholds that namespace is named rather than silent: the re-exec child reports
+the denied step — `unshare`, setgroups, UID map, GID map, mapped identity, mount
+propagation or re-exec — to its parent over a close-on-exec pipe, and the parent
+refuses with that step and with
+`kernel.apparmor_restrict_unprivileged_userns` when that policy withheld it. The
 re-exec marker is accepted only from its exact live parent with exact one-ID
 UID/GID kernel maps, supplementary GIDs restricted to mapped-primary or kernel
 overflow IDs, disabled setgroups, private root-mount propagation and a parent

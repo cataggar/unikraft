@@ -788,6 +788,26 @@ jobs:
     - name: Restore independent fixture tools
       uses: ./.github/actions/hyperv-fixture-setup
 
+    # The direct controller re-executes itself into an unprivileged user
+    # namespace. Prove the runner still grants one now, in seconds, instead of
+    # discovering the denial an hour later inside the offline suite.
+    - name: Confirm the runner grants unprivileged user namespaces
+      run: |
+        set -euo pipefail
+        userns_restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        if test -e "${userns_restriction}" &&
+            test "$(cat "${userns_restriction}")" != 0; then
+          userns_restriction_original="$(cat "${userns_restriction}")"
+          restore_userns_restriction() {
+            sudo sysctl -q -w \
+              "kernel.apparmor_restrict_unprivileged_userns=${userns_restriction_original}"
+          }
+          trap restore_userns_restriction EXIT
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          test "$(cat "${userns_restriction}")" = 0
+        fi
+        unshare --user --map-root-user --mount true
+
     - name: Run native Hyper-V operator custody fixtures
       run: |
         bash support/tools/hyperv/operator_guard/ci-fixtures.sh
@@ -962,6 +982,7 @@ jobs:
           sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
           test "$(cat "${userns_restriction}")" = 0
         fi
+        unshare --user --map-root-user --mount true
         WAMR_DIRECT_TOOLS="${root}/tools/bin" \
         WAMR_CI_PACKAGE="${root}/compute-tools/bin/wamr-ci-package" \
         WAMR_CI_SUPERVISOR="${root}/compute-supervisor/bin/wamr-ci-supervisor" \

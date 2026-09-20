@@ -247,42 +247,192 @@ pub fn ensureNamespace(init: std.process.Init) !void {
         .{ 0, gid },
     );
 
-    const forked = linux.fork();
-    if (linux.errno(forked) != .SUCCESS)
-        return error.AzureRuntimeNamespaceUnavailable;
-    if (forked == 0) {
-        childNamespace(uid_map, gid_map) catch linux.exit_group(126);
-        _ = linux.execve("/proc/self/exe", argv.ptr, block.slice.ptr);
-        linux.exit_group(126);
+    var report: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.pipe2(&report, .{ .CLOEXEC = true })) != .SUCCESS)
+        return error.AzureRuntimeNamespaceReportUnavailable;
+    // A report descriptor overlapping stdio would be closed by the child's own
+    // exec, discarding the very diagnostic the pipe exists to carry.
+    if (report[0] < 3 or report[1] < 3) {
+        _ = linux.close(report[0]);
+        _ = linux.close(report[1]);
+        return error.AzureRuntimeNamespaceReportUnavailable;
     }
+
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) {
+        _ = linux.close(report[0]);
+        _ = linux.close(report[1]);
+        return error.AzureRuntimeNamespaceForkFailed;
+    }
+    if (forked == 0) {
+        _ = linux.close(report[0]);
+        if (childNamespace(uid_map, gid_map)) |stage| childRefusal(report[1], stage);
+        _ = linux.execve("/proc/self/exe", argv.ptr, block.slice.ptr);
+        childRefusal(report[1], .reexec);
+    }
+    _ = linux.close(report[1]);
+    const observed = readNamespaceReport(report[0]);
+    _ = linux.close(report[0]);
+    const status = try waitNamespaceChild(@intCast(forked));
+    switch (observed) {
+        .reexecuted => std.process.exit(status),
+        .refused => |stage| {
+            reportHostRestriction(init.io, stage);
+            return stage.refusal();
+        },
+        .lost => return error.AzureRuntimeNamespaceReportLost,
+    }
+}
+
+/// Every step the forked controller performs before re-executing inside its
+/// own user namespace. A hardened host denies exactly one of them, so the
+/// child names the step instead of exiting without any diagnostic at all.
+pub const NamespaceStage = enum(u8) {
+    user_namespace = 1,
+    setgroups_control = 2,
+    uid_map = 3,
+    gid_map = 4,
+    mapped_identity = 5,
+    mount_namespace = 6,
+    reexec = 7,
+
+    /// Whether the host's unprivileged user namespace policy governs the step.
+    pub fn hostGoverned(self: NamespaceStage) bool {
+        return switch (self) {
+            .user_namespace,
+            .setgroups_control,
+            .uid_map,
+            .gid_map,
+            .mapped_identity,
+            => true,
+            .mount_namespace, .reexec => false,
+        };
+    }
+
+    pub fn refusal(self: NamespaceStage) NamespaceRefusal {
+        return switch (self) {
+            .user_namespace => error.AzureRuntimeNamespaceUserDenied,
+            .setgroups_control => error.AzureRuntimeNamespaceSetgroupsDenied,
+            .uid_map => error.AzureRuntimeNamespaceUidMapDenied,
+            .gid_map => error.AzureRuntimeNamespaceGidMapDenied,
+            .mapped_identity => error.AzureRuntimeNamespaceIdentityDenied,
+            .mount_namespace => error.AzureRuntimeNamespaceMountDenied,
+            .reexec => error.AzureRuntimeNamespaceReexecDenied,
+        };
+    }
+
+    pub fn fromCode(code: u8) ?NamespaceStage {
+        inline for (@typeInfo(NamespaceStage).@"enum".fields) |field|
+            if (field.value == code) return @field(NamespaceStage, field.name);
+        return null;
+    }
+};
+
+pub const NamespaceRefusal = error{
+    AzureRuntimeNamespaceUserDenied,
+    AzureRuntimeNamespaceSetgroupsDenied,
+    AzureRuntimeNamespaceUidMapDenied,
+    AzureRuntimeNamespaceGidMapDenied,
+    AzureRuntimeNamespaceIdentityDenied,
+    AzureRuntimeNamespaceMountDenied,
+    AzureRuntimeNamespaceReexecDenied,
+};
+
+/// What the close-on-exec report pipe observed for the forked controller.
+pub const NamespaceReport = union(enum) {
+    /// The write end closed without a code: the child reached its re-exec.
+    reexecuted,
+    refused: NamespaceStage,
+    /// The report was unreadable or carried a code no stage claims.
+    lost,
+};
+
+pub fn readNamespaceReport(descriptor: linux.fd_t) NamespaceReport {
+    var byte: [1]u8 = undefined;
     while (true) {
-        var status: u32 = 0;
-        const waited = linux.waitpid(@intCast(forked), &status, 0);
-        switch (linux.errno(waited)) {
+        const count = linux.read(descriptor, &byte, byte.len);
+        switch (linux.errno(count)) {
             .SUCCESS => {
-                if (linux.W.IFEXITED(status))
-                    std.process.exit(linux.W.EXITSTATUS(status));
-                if (linux.W.IFSIGNALED(status))
-                    std.process.exit(@intCast(@min(
-                        255,
-                        128 + @intFromEnum(linux.W.TERMSIG(status)),
-                    )));
-                std.process.exit(1);
+                if (count == 0) return .reexecuted;
+                return if (NamespaceStage.fromCode(byte[0])) |stage|
+                    .{ .refused = stage }
+                else
+                    .lost;
             },
             .INTR => continue,
-            else => return error.AzureRuntimeNamespaceUnavailable,
+            else => return .lost,
         }
     }
 }
 
-fn childNamespace(uid_map: []const u8, gid_map: []const u8) !void {
+fn childRefusal(descriptor: linux.fd_t, stage: NamespaceStage) noreturn {
+    const marker = [_]u8{@intFromEnum(stage)};
+    _ = linux.write(descriptor, &marker, marker.len);
+    linux.exit_group(126);
+}
+
+fn waitNamespaceChild(pid: linux.pid_t) !u8 {
+    while (true) {
+        var status: u32 = 0;
+        const waited = linux.waitpid(pid, &status, 0);
+        switch (linux.errno(waited)) {
+            .SUCCESS => {
+                if (linux.W.IFEXITED(status)) return linux.W.EXITSTATUS(status);
+                if (linux.W.IFSIGNALED(status)) return @intCast(@min(
+                    255,
+                    128 + @intFromEnum(linux.W.TERMSIG(status)),
+                ));
+                return 1;
+            },
+            .INTR => continue,
+            else => return error.AzureRuntimeNamespaceWaitFailed,
+        }
+    }
+}
+
+pub const userns_restriction_path =
+    "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+
+/// The refused stage alone cannot distinguish a broken host from a deliberately
+/// hardened one, so name the policy that withheld the namespace.
+fn reportHostRestriction(io: std.Io, stage: NamespaceStage) void {
+    if (!stage.hostGoverned()) return;
+    var buffer: [16]u8 = undefined;
+    const restriction = hostUserNamespaceRestriction(&buffer) orelse return;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
+    stderr.interface.print(
+        "azure runtime namespace withheld by host policy: {s}={s}\n",
+        .{ userns_restriction_path, restriction },
+    ) catch {};
+}
+
+/// The host's unprivileged user namespace restriction, when it both exposes one
+/// and has it enabled. Only decimal values are reported, never raw file bytes.
+fn hostUserNamespaceRestriction(buffer: []u8) ?[]const u8 {
+    const opened = linux.openat(linux.AT.FDCWD, userns_restriction_path, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    if (linux.errno(opened) != .SUCCESS) return null;
+    const descriptor: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(descriptor);
+    const count = linux.read(descriptor, buffer.ptr, buffer.len);
+    if (linux.errno(count) != .SUCCESS) return null;
+    const value = std.mem.trim(u8, buffer[0..count], " \t\r\n");
+    if (value.len == 0 or std.mem.eql(u8, value, "0")) return null;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return null;
+    return value;
+}
+
+fn childNamespace(uid_map: []const u8, gid_map: []const u8) ?NamespaceStage {
     if (linux.errno(linux.unshare(linux.CLONE.NEWUSER)) != .SUCCESS)
-        return error.AzureRuntimeNamespaceUnavailable;
-    try writeMap("/proc/self/setgroups", "deny\n");
-    try writeMap("/proc/self/uid_map", uid_map);
-    try writeMap("/proc/self/gid_map", gid_map);
+        return .user_namespace;
+    writeMap("/proc/self/setgroups", "deny\n") catch return .setgroups_control;
+    writeMap("/proc/self/uid_map", uid_map) catch return .uid_map;
+    writeMap("/proc/self/gid_map", gid_map) catch return .gid_map;
     if (linux.geteuid() != 0 or linux.getegid() != 0)
-        return error.AzureRuntimeNamespaceUnavailable;
+        return .mapped_identity;
     if (linux.errno(linux.unshare(linux.CLONE.NEWNS)) != .SUCCESS or
         linux.errno(linux.mount(
             null,
@@ -291,7 +441,8 @@ fn childNamespace(uid_map: []const u8, gid_map: []const u8) !void {
             linux.MS.REC | linux.MS.PRIVATE,
             0,
         )) != .SUCCESS)
-        return error.AzureRuntimeNamespaceUnavailable;
+        return .mount_namespace;
+    return null;
 }
 
 pub fn load(
