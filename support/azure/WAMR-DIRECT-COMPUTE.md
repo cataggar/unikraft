@@ -544,8 +544,9 @@ re-execs in a private user/mount namespace, copies the authenticated Azure
 runtime to bounded tmpfs, remounts it read-only, and drops namespace
 capabilities. The initial process must have full host UID/GID maps. The
 re-exec marker is accepted only from its exact live parent with exact one-ID
-UID/GID kernel maps, disabled setgroups, private root-mount propagation and a
-parent still in the initial user namespace. That controller marker cannot be
+UID/GID kernel maps, supplementary GIDs restricted to mapped-primary or kernel
+overflow IDs, disabled setgroups, private root-mount propagation and a parent
+still in the initial user namespace. That controller marker cannot be
 replaced by the separate native-validator child marker, which requires the
 same exact maps plus an untraced `no_new_privs` process and parent with zero
 effective, permitted, inheritable and ambient capability sets. Azure calls use

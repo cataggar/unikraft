@@ -191,6 +191,13 @@ fn verifyNamespace(
     );
     if (overflow_uid == 0 or overflow_gid == 0)
         return error.InvalidUserNamespace;
+    var groups: [64]linux.gid_t = undefined;
+    const group_count = linux.getgroups(groups.len, &groups);
+    if (linux.errno(group_count) != .SUCCESS)
+        return error.InvalidUserNamespace;
+    for (groups[0..group_count]) |group|
+        if (group != 0 and group != overflow_gid)
+            return error.InvalidUserNamespace;
     return .{ .uid = overflow_uid, .gid = overflow_gid };
 }
 

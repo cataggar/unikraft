@@ -276,13 +276,6 @@ pub fn ensureNamespace(init: std.process.Init) !void {
 }
 
 fn childNamespace(uid_map: []const u8, gid_map: []const u8) !void {
-    var groups: [64]linux.gid_t = undefined;
-    const count = linux.getgroups(groups.len, &groups);
-    if (linux.errno(count) != .SUCCESS)
-        return error.AzureRuntimeNamespaceUnavailable;
-    const gid = linux.getegid();
-    for (groups[0..count]) |group|
-        if (group != gid) return error.AzureRuntimeNamespaceUnavailable;
     if (linux.errno(linux.unshare(linux.CLONE.NEWUSER)) != .SUCCESS)
         return error.AzureRuntimeNamespaceUnavailable;
     try writeMap("/proc/self/setgroups", "deny\n");
