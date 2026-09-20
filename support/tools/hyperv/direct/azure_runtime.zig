@@ -396,7 +396,7 @@ pub const Sealed = struct {
         }))) return error.AzureRuntimeChanged;
         try verifyRoot(allocator, io, self.source, contract, true);
         for (self.parents[0..self.parent_count]) |parent|
-            if (!files.sameSnapshot(parent.snapshot, try files.snapshot(.{
+            if (!sameParentIdentity(parent.snapshot, try files.snapshot(.{
                 .handle = parent.directory.handle,
                 .flags = .{ .nonblocking = false },
             }))) return error.AzureRuntimeChanged;
@@ -844,6 +844,12 @@ const Counts = struct {
     bytes: u64 = 0,
     depth: u8 = 0,
 };
+
+fn sameParentIdentity(a: files.Snapshot, b: files.Snapshot) bool {
+    return a.dev_major == b.dev_major and a.dev_minor == b.dev_minor and
+        a.ino == b.ino and a.mode == b.mode and
+        a.uid == b.uid and a.gid == b.gid;
+}
 
 const Entry = struct {
     path: []u8,
