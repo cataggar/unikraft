@@ -537,16 +537,20 @@ refuse. Execution tools must be owned by the invoking UID. The user-namespace
 view accepts the kernel overflow owner only for safe-mode directory ancestors,
 never for a final execution tool. Runtime ancestors additionally must
 reproduce the authorization's aggregate host-identity digest, so an
-other-user ancestor cannot be reinterpreted as host root. Native ELF uploader, validator and supervisor execution uses retained sealed
-descriptor snapshots with `execveat`. Before admission the controller
+other-user ancestor cannot be reinterpreted as host root. Native ELF uploader,
+validator and supervisor execution uses retained sealed descriptor snapshots
+with `execveat`. Before admission the controller
 re-execs in a private user/mount namespace, copies the authenticated Azure
 runtime to bounded tmpfs, remounts it read-only, and drops namespace
-capabilities. The re-exec marker is accepted only with exact one-ID UID/GID
-kernel maps, disabled setgroups and private root-mount propagation. Azure
-calls use `--inhibit-cache --inhibit-rpath ''`, execute the retained copied
-loader with only copied DSOs, and mask host loader directories in the private
-mount namespace. Python, bootstrap, modules, data and native extensions are
-addressed below the retained root as `/proc/self/fd/N/...`. Neither the
+capabilities. The initial process must have full host UID/GID maps. The
+re-exec marker is accepted only from its exact live parent with exact one-ID
+UID/GID kernel maps, disabled setgroups, private root-mount propagation and a
+parent still in the initial user namespace. Azure calls use
+`--inhibit-cache --inhibit-rpath ''`, execute the retained copied loader with
+only copied DSOs, refuse any system `ld.so.preload`, and mask host loader
+directories in the private mount namespace. Python, bootstrap, modules, data
+and native extensions are addressed below the retained root as
+`/proc/self/fd/N/...`. Neither the
 original Azure script/interpreter pathname, `AZ_PYTHON`, loader cache,
 RPATH/RUNPATH nor an ambient/default library path is execution authority. The
 child uses `-s -S -B -P`, no ambient/user

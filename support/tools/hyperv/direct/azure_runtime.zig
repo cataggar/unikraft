@@ -185,6 +185,8 @@ pub fn ensureNamespace(init: std.process.Init) !void {
             return error.AzureRuntimeNamespaceMarkerInvalid;
         return;
     }
+    files.verifyInitialNamespace(init.io) catch
+        return error.AzureRuntimeNamespaceUnavailable;
     const allocator = init.arena.allocator();
     const arguments = try init.minimal.args.toSlice(allocator);
     const argv = try allocator.allocSentinel(
@@ -201,6 +203,7 @@ pub fn ensureNamespace(init: std.process.Init) !void {
         if (std.mem.eql(u8, entry.key_ptr.*, files.namespace_marker)) continue;
         if (std.mem.eql(u8, entry.key_ptr.*, files.namespace_uid)) continue;
         if (std.mem.eql(u8, entry.key_ptr.*, files.namespace_gid)) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, files.namespace_parent)) continue;
         try environment.put(entry.key_ptr.*, entry.value_ptr.*);
     }
     try environment.put(files.namespace_marker, "1");
@@ -215,6 +218,15 @@ pub fn ensureNamespace(init: std.process.Init) !void {
     try environment.put(
         files.namespace_gid,
         try std.fmt.bufPrint(&gid_value_buffer, "{d}", .{gid}),
+    );
+    var parent_value_buffer: [32]u8 = undefined;
+    try environment.put(
+        files.namespace_parent,
+        try std.fmt.bufPrint(
+            &parent_value_buffer,
+            "{d}",
+            .{linux.getpid()},
+        ),
     );
     const block = try environment.createPosixBlock(
         allocator,
@@ -481,6 +493,8 @@ pub fn seal(
         return error.AzureRuntimeSealDestinationContent;
     readonlyMount(destination.handle) catch
         return error.AzureRuntimeMountReadonlyUnavailable;
+    rejectSystemLoaderPreload() catch
+        return error.AzureRuntimeLoaderIsolationUnavailable;
     maskHostLoaderDirectories() catch
         return error.AzureRuntimeLoaderIsolationUnavailable;
     try dropNamespaceAuthority();
@@ -704,6 +718,28 @@ fn maskHostLoaderDirectories() !void {
         }
     }
 }
+
+fn rejectSystemLoaderPreload() !void {
+    const opened = linux.openat(linux.AT.FDCWD, "/etc/ld.so.preload", .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    switch (linux.errno(opened)) {
+        .NOENT => return,
+        .SUCCESS => {
+            _ = linux.close(@intCast(opened));
+            return error.SystemLoaderPreloadPresent;
+        },
+        else => return error.SystemLoaderPreloadUnavailable,
+    }
+}
+
+pub const Test = struct {
+    pub fn rejectLoaderPreload() !void {
+        try rejectSystemLoaderPreload();
+    }
+};
 
 fn dropNamespaceAuthority() !void {
     if (linux.errno(linux.prctl(
