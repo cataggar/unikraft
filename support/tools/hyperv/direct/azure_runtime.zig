@@ -722,7 +722,11 @@ fn maskHostLoaderDirectories() !void {
 }
 
 fn rejectSystemLoaderPreload() !void {
-    const opened = linux.openat(linux.AT.FDCWD, "/etc/ld.so.preload", .{
+    try rejectLoaderPreloadPath("/etc/ld.so.preload");
+}
+
+fn rejectLoaderPreloadPath(path: [*:0]const u8) !void {
+    const opened = linux.openat(linux.AT.FDCWD, path, .{
         .ACCMODE = .RDONLY,
         .CLOEXEC = true,
         .NOFOLLOW = true,
@@ -738,8 +742,8 @@ fn rejectSystemLoaderPreload() !void {
 }
 
 pub const Test = struct {
-    pub fn rejectLoaderPreload() !void {
-        try rejectSystemLoaderPreload();
+    pub fn rejectLoaderPreload(path: [*:0]const u8) !void {
+        try rejectLoaderPreloadPath(path);
     }
 };
 
