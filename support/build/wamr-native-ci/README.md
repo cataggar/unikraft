@@ -438,8 +438,9 @@ that exact scope, rehashes the copy, and rechecks tool parents, mode, link,
 inode and content before attempt/backend work. Retained native ELF tools run through descriptor snapshots. Before admission
 the controller re-execs in a private user/mount namespace, copies the
 authenticated runtime to bounded tmpfs, remounts it read-only, and drops its
-namespace capabilities. Exact kernel UID/GID maps, disabled setgroups and
-private mount propagation plus an exact initial-namespace parent relationship
+namespace capabilities. Exact kernel UID/GID maps, supplementary GIDs
+restricted to mapped-primary or kernel overflow IDs, disabled setgroups,
+private mount propagation and an exact initial-namespace parent relationship
 authenticate the controller re-exec boundary. Its marker is distinct from
 the native-validator child marker, which requires the same maps and an
 untraced `no_new_privs` process and parent with zero effective, permitted,
