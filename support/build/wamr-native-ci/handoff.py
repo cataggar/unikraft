@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""Private exact-image handoff and non-authorizing plan; never invokes Azure."""
+"""Private exact-image handoff, finite-cost authorization records; no Azure."""
 import argparse
 import importlib.util
 import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import sys
+import time
 import uuid
 import zipfile
 
@@ -29,6 +31,12 @@ V2_NAMES = (
     "final_inspection", "cleanup",
 )
 FAILURE_STAGE = "handoff"
+CANONICALIZATION = "utf8-byte-sorted-keys-compact-lf-v1"
+COST_POLICY = "northeurope-standard-d2s-v5-conservative-2026-09-v1"
+REPOSITORY_MAXIMUM_COST_MICROUSD = 100_000_000
+ESTIMATED_COST_UPPER_BOUND_MICROUSD = 9_500_000
+FIXED_VHD_BYTES = 66 * 1024 * 1024 + 512
+FIXED_VHD_CAPACITY_BYTES = FIXED_VHD_BYTES - 512
 
 
 def private(path):
@@ -286,7 +294,8 @@ def export(runtime, output):
     return bundle
 
 
-def plan(bundle_path, output):
+def candidate_plan(bundle_path, output, *, attempt_id=None,
+                   subscription=None, prefix=None):
     private(bundle_path.parent)
     private(output.parent)
     bundle = ci.document(bundle_path)
@@ -350,7 +359,8 @@ def plan(bundle_path, output):
             "direct_specialized_gen2", "os_only_private", "two_boots_only",
             "cleanup_owned_group", "exact_image_and_local_bundle_reviewed",
             "fresh_final_approval"), False),
-        "attempt_id": str(uuid.uuid4()), "subscription": "FINAL-APPROVED-SUBSCRIPTION-UUID",
+        "attempt_id": str(uuid.uuid4()) if attempt_id is None else attempt_id,
+        "subscription": "FINAL-APPROVED-SUBSCRIPTION-UUID",
         "location": "northeurope", "prefix": "FINAL-APPROVED-FRESH-NAME",
         "vm_size": "Standard_D2s_v5", "serial_mode": "azure_cumulative",
         "runtime_seconds": 3600, "cleanup_seconds": 1800,
@@ -362,13 +372,327 @@ def plan(bundle_path, output):
     }
     if version == 2:
         value.update(
-            subscription="00000000-0000-0000-0000-000000000001",
-            prefix="not-admitted-candidate",
+            subscription=(
+                "00000000-0000-0000-0000-000000000001"
+                if subscription is None else subscription),
+            prefix="not-admitted-candidate" if prefix is None else prefix,
         )
     ci.require([boot["mode"] for boot in bundle["boots"]] == list(modes),
                "wrong compute handoff modes")
     value["approval"].update(approved_unix=0, expires_unix=0)
     ci.save(output, value)
+    return value
+
+
+def canonical_document(path):
+    value = ci.document(path)
+    ci.require(ci.read(path, 64 * 1024) == ci.compact_json(value, newline=True),
+               "canonical private JSON required")
+    return value
+
+
+def executable_artifact(path):
+    path = Path(path)
+    ci.require(path.is_absolute() and path.resolve(strict=True) == path,
+               "explicit nonsymlink executable required")
+    info = path.stat()
+    ci.require(stat.S_ISREG(info.st_mode)
+               and info.st_mode & 0o111 and not info.st_mode & 0o022
+               and 0 < info.st_size <= 64 * 1024 * 1024,
+               "unsafe explicit executable")
+    return artifact(path)
+
+
+def native_validate(validator, *arguments):
+    validator = Path(validator)
+    executable_artifact(validator)
+    completed = subprocess.run(
+        [str(validator), *map(str, arguments)],
+        env={"LC_ALL": "C"}, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300,
+        check=False,
+    )
+    ci.require(completed.returncode == 0, "native authorization validation failed")
+
+
+def exact_tool_bindings(azure, uploader, validator, supervisor, az_python):
+    return {
+        name: executable_artifact(Path(path))
+        for name, path in (
+            ("azure", azure),
+            ("uploader", uploader),
+            ("validator", validator),
+            ("supervisor", supervisor),
+            ("az_python", az_python),
+        )
+    }
+
+
+def require_tool_bindings(plan_value, azure, uploader, validator, supervisor,
+                          az_python):
+    actual = exact_tool_bindings(
+        azure, uploader, validator, supervisor, az_python)
+    ci.require(actual == plan_value["tools"], "approved tool binding changed")
+    return actual
+
+
+def approval_limits(plan_value):
+    return {
+        "runtime_seconds": plan_value["runtime_seconds"],
+        "cleanup_seconds": plan_value["cleanup_seconds"],
+        "operation_seconds": plan_value["operation_seconds"],
+        "maximum_parallelism":
+            plan_value["resources"]["maximum_parallelism"],
+        "boot_count": plan_value["resources"]["boot_count"],
+        "retry_count": plan_value["retry_count"],
+    }
+
+
+def plan(bundle_path, output, approval_template, candidate_output, *,
+         campaign_id, ledger, subscription, prefix,
+         maximum_authorized_cost_microusd, azure, uploader, validator,
+         supervisor, az_python, attempt_id=None, created_unix=None):
+    private(bundle_path.parent)
+    private(output.parent)
+    private(approval_template.parent)
+    private(candidate_output.parent)
+    private(ledger)
+    ci.require(all(not path.exists() for path in (
+        output, approval_template, candidate_output,
+        candidate_output.parent / (candidate_output.name + ".admission.json"),
+    )), "fresh plan outputs required")
+    try:
+        campaign_id = str(uuid.UUID(campaign_id))
+        attempt_id = str(uuid.uuid4() if attempt_id is None
+                         else uuid.UUID(attempt_id))
+        subscription = str(uuid.UUID(subscription))
+    except (ValueError, AttributeError) as error:
+        raise ci.Refusal("canonical plan UUID required") from error
+    ci.require(type(maximum_authorized_cost_microusd) is int
+               and ESTIMATED_COST_UPPER_BOUND_MICROUSD
+               <= maximum_authorized_cost_microusd
+               <= REPOSITORY_MAXIMUM_COST_MICROUSD,
+               "finite micro-USD authorization maximum required")
+    ci.require(type(prefix) is str and 6 <= len(prefix) <= 32
+               and all(char.islower() or char.isdigit() or char == "-"
+                       for char in prefix), "invalid exact resource prefix")
+    created_unix = int(time.time()) if created_unix is None else created_unix
+    ci.require(type(created_unix) is int and created_unix > 0,
+               "invalid plan creation time")
+    candidate = candidate_plan(
+        bundle_path, candidate_output, attempt_id=attempt_id,
+        subscription=subscription, prefix=prefix)
+    native_validate(validator, "candidate", candidate_output)
+    ci.require(candidate["version"] == 2
+               and candidate["purpose"] == ci.CURRENT_PROFILE
+               and candidate["authority"] == "not_admitted",
+               "strict Azure plan requires imported version-2 candidate")
+    imported = canonical_document(Path(candidate["bundle"]["path"]))
+    public_bundle = canonical_document(Path(imported["public_bundle"]["path"]))
+    transport = canonical_document(Path(imported["transport"]["path"]))
+    names = [item["path"] for item in public_bundle["artifacts"]]
+    by_name = dict(zip(V2_NAMES, public_bundle["artifacts"]))
+    ci.require(len(names) == len(V2_NAMES)
+               and by_name["vhd"] == candidate["os_vhd"],
+               "candidate image binding changed")
+    tools = exact_tool_bindings(
+        azure, uploader, validator, supervisor, az_python)
+    resources = {
+        "vm_count": 1,
+        "os_disk_count": 1,
+        "data_disk_count": 0,
+        "public_ip_count": 0,
+        "boot_count": 2,
+        "maximum_parallelism": 1,
+        "generation": 2,
+        "os_disk_sku": "StandardSSD_LRS",
+        "os_disk_capacity_bytes": FIXED_VHD_CAPACITY_BYTES,
+        "network": "private_no_default_outbound",
+    }
+    value = {
+        "schema": "uk.wamr.azure-execution-plan",
+        "version": 1,
+        "purpose": "qcow2-derived-vhd-two-boot",
+        "profile": ci.CURRENT_PROFILE,
+        "authority": "not_admitted",
+        "canonicalization": CANONICALIZATION,
+        "created_unix": created_unix,
+        "attempt_id": attempt_id,
+        "campaign_id": campaign_id,
+        "campaign_profile": ci.CURRENT_PROFILE,
+        "ledger_path": str(ledger),
+        "subscription": subscription,
+        "location": candidate["location"],
+        "prefix": prefix,
+        "vm_size": candidate["vm_size"],
+        "serial_mode": "azure_cumulative",
+        "runtime_seconds": 3600,
+        "cleanup_seconds": 1800,
+        "operation_seconds": 600,
+        "poll_seconds": 10,
+        "source_revision": candidate["source_revision"],
+        "source_tree": candidate["source_tree"],
+        "run": public_bundle["run"],
+        "identity": candidate["identity"],
+        "lineage": public_bundle["lineage"],
+        "candidate": artifact(candidate_output),
+        "bundle": candidate["bundle"],
+        "public_bundle": imported["public_bundle"],
+        "transport": imported["transport"],
+        "qcow2": by_name["qcow2"],
+        "os_vhd": by_name["vhd"],
+        "vhd_bytes": by_name["vhd"]["size"],
+        "vhd_capacity_bytes": FIXED_VHD_CAPACITY_BYTES,
+        "artifact_id": transport["artifact_id"],
+        "inner_zip_sha256": transport["inner_zip_sha256"],
+        "container_digest": transport["container_digest"],
+        "resources": resources,
+        "retry_count": 0,
+        "substitution": {
+            "source": False, "image": False,
+            "topology": False, "workload": False,
+        },
+        "cleanup": {
+            "exact_owned_resources_only": True,
+            "delete_owned_resource_group": True,
+            "independent_absence_observation": True,
+            "replacement_resources": False,
+        },
+        "cost": {
+            "unit": "micro_usd",
+            "policy": COST_POLICY,
+            "estimated_upper_bound": ESTIMATED_COST_UPPER_BOUND_MICROUSD,
+            "maximum_authorized": maximum_authorized_cost_microusd,
+            "repository_policy_maximum":
+                REPOSITORY_MAXIMUM_COST_MICROUSD,
+        },
+        "tools": tools,
+    }
+    ci.require(value["vhd_bytes"] == FIXED_VHD_BYTES,
+               "wrong fixed VHD byte length")
+    ci.save(output, value)
+    plan_sha256 = ci.digest(output, 64 * 1024)
+    template = {
+        "schema": "uk.wamr.azure-execution-approval-template",
+        "version": 1,
+        "decision": "pending",
+        "plan_sha256": plan_sha256,
+        "attempt_id": attempt_id,
+        "candidate_sha256": value["candidate"]["sha256"],
+        "estimated_cost_upper_bound_microusd":
+            ESTIMATED_COST_UPPER_BOUND_MICROUSD,
+        "maximum_authorized_cost_microusd":
+            maximum_authorized_cost_microusd,
+        "limits": approval_limits(value),
+    }
+    ci.save(approval_template, template)
+    native_validate(validator, "plan", output, approval_template)
+    return value, template
+
+
+def publish_validated(output, value, validator, command):
+    ci.require(not output.exists(), "fresh private output required")
+    partial = output.parent / (
+        output.name + ".partial-" + uuid.uuid4().hex)
+    try:
+        ci.save(partial, value)
+        native_validate(validator, *command, partial)
+        os.link(partial, output, follow_symlinks=False)
+        partial.unlink()
+        directory = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if partial.exists():
+            partial.unlink()
+
+
+def record_authorization(plan_path, template_path, output, *, decision,
+                         approver, reference, recorded_unix, expires_unix,
+                         azure, uploader, validator, supervisor, az_python):
+    private(plan_path.parent)
+    private(template_path.parent)
+    private(output.parent)
+    plan_value = canonical_document(plan_path)
+    template = canonical_document(template_path)
+    require_tool_bindings(
+        plan_value, azure, uploader, validator, supervisor, az_python)
+    native_validate(validator, "plan", plan_path, template_path)
+    ci.require(template["plan_sha256"] == ci.digest(plan_path, 64 * 1024)
+               and template["attempt_id"] == plan_value["attempt_id"]
+               and template["candidate_sha256"]
+               == plan_value["candidate"]["sha256"]
+               and template["decision"] == "pending",
+               "approval template does not bind exact plan")
+    ci.require(decision in ("approved", "denied"),
+               "explicit approved or denied decision required")
+    ci.require(type(approver) is str and 1 <= len(approver.encode()) <= 128
+               and type(reference) is str
+               and 1 <= len(reference.encode()) <= 256
+               and all(0x20 <= ord(char) != 0x7f
+                       for char in approver + reference),
+               "bounded authority fields required")
+    ci.require(type(recorded_unix) is int and type(expires_unix) is int
+               and recorded_unix > 0
+               and recorded_unix < expires_unix
+               and expires_unix - recorded_unix <= 3600,
+               "bounded approval window required")
+    authorization = {
+        "schema": "uk.wamr.azure-execution-authorization",
+        "version": 1,
+        "decision": decision,
+        "plan_sha256": template["plan_sha256"],
+        "attempt_id": template["attempt_id"],
+        "candidate_sha256": template["candidate_sha256"],
+        "estimated_cost_upper_bound_microusd":
+            template["estimated_cost_upper_bound_microusd"],
+        "maximum_authorized_cost_microusd":
+            template["maximum_authorized_cost_microusd"],
+        "limits": template["limits"],
+        "approver": approver,
+        "reference": reference,
+        "recorded_unix": recorded_unix,
+        "expires_unix": expires_unix,
+    }
+    publish_validated(
+        output, authorization, validator,
+        ("authorization", plan_path))
+    return authorization
+
+
+def admission(plan_path, authorization_path, output, *, azure, uploader,
+              validator, supervisor, az_python):
+    private(plan_path.parent)
+    private(authorization_path.parent)
+    private(output.parent)
+    plan_value = canonical_document(plan_path)
+    authorization = canonical_document(authorization_path)
+    require_tool_bindings(
+        plan_value, azure, uploader, validator, supervisor, az_python)
+    native_validate(
+        validator, "authorization", plan_path, authorization_path)
+    ci.require(authorization["decision"] == "approved",
+               "denied decision cannot produce admission")
+    value = {
+        key: item for key, item in plan_value.items()
+        if key not in ("schema", "version", "authority")
+    }
+    value.update({
+        "schema": "uk.wamr.azure-execution-admission",
+        "version": 1,
+        "authority": "approved",
+        "plan": artifact(plan_path),
+        "authorization": artifact(authorization_path),
+        "approval": {
+            "approver": authorization["approver"],
+            "reference": authorization["reference"],
+            "approved_unix": authorization["recorded_unix"],
+            "expires_unix": authorization["expires_unix"],
+        },
+    })
+    publish_validated(output, value, validator, ("admission",))
     return value
 
 
@@ -379,9 +703,46 @@ def main():
     exp = sub.add_parser("export")
     exp.add_argument("--runtime", type=Path, required=True)
     exp.add_argument("--output", type=Path, required=True)
+    candidate = sub.add_parser(
+        "candidate", help="Legacy non-authorizing candidate generation")
+    candidate.add_argument("--bundle", type=Path, required=True)
+    candidate.add_argument("--output", type=Path, required=True)
     pln = sub.add_parser("plan")
     pln.add_argument("--bundle", type=Path, required=True)
     pln.add_argument("--output", type=Path, required=True)
+    pln.add_argument("--approval-template", type=Path, required=True)
+    pln.add_argument("--candidate-output", type=Path, required=True)
+    pln.add_argument("--campaign-id", required=True)
+    pln.add_argument("--ledger", type=Path, required=True)
+    pln.add_argument("--subscription", required=True)
+    pln.add_argument("--prefix", required=True)
+    pln.add_argument("--maximum-authorized-cost-microusd",
+                     type=int, required=True)
+    pln.add_argument("--attempt-id")
+    pln.add_argument("--created-unix", type=int)
+    for tool_name in ("azure", "uploader", "validator",
+                      "supervisor", "az-python"):
+        pln.add_argument("--" + tool_name, type=Path, required=True)
+    authorize = sub.add_parser("record-authorization")
+    authorize.add_argument("--plan", type=Path, required=True)
+    authorize.add_argument("--template", type=Path, required=True)
+    authorize.add_argument("--output", type=Path, required=True)
+    authorize.add_argument("--decision", choices=("approved", "denied"),
+                           required=True)
+    authorize.add_argument("--approver", required=True)
+    authorize.add_argument("--reference", required=True)
+    authorize.add_argument("--recorded-unix", type=int, required=True)
+    authorize.add_argument("--expires-unix", type=int, required=True)
+    for tool_name in ("azure", "uploader", "validator",
+                      "supervisor", "az-python"):
+        authorize.add_argument("--" + tool_name, type=Path, required=True)
+    admit = sub.add_parser("admit")
+    admit.add_argument("--plan", type=Path, required=True)
+    admit.add_argument("--authorization", type=Path, required=True)
+    admit.add_argument("--output", type=Path, required=True)
+    for tool_name in ("azure", "uploader", "validator",
+                      "supervisor", "az-python"):
+        admit.add_argument("--" + tool_name, type=Path, required=True)
     sub.add_parser("public-source-bundle", help="Explicit fixed public-repository tiny CI publication only")
     verify = sub.add_parser("verify-public-source-bundle")
     verify.add_argument("--archive", type=Path, required=True)
@@ -406,8 +767,34 @@ def main():
     os.umask(0o077)
     if args.command == "export":
         export(args.runtime, args.output)
+    elif args.command == "candidate":
+        candidate_plan(args.bundle, args.output)
     elif args.command == "plan":
-        plan(args.bundle, args.output)
+        plan(
+            args.bundle, args.output, args.approval_template,
+            args.candidate_output, campaign_id=args.campaign_id,
+            ledger=args.ledger, subscription=args.subscription,
+            prefix=args.prefix,
+            maximum_authorized_cost_microusd=
+                args.maximum_authorized_cost_microusd,
+            azure=args.azure, uploader=args.uploader,
+            validator=args.validator, supervisor=args.supervisor,
+            az_python=args.az_python, attempt_id=args.attempt_id,
+            created_unix=args.created_unix)
+    elif args.command == "record-authorization":
+        record_authorization(
+            args.plan, args.template, args.output,
+            decision=args.decision, approver=args.approver,
+            reference=args.reference, recorded_unix=args.recorded_unix,
+            expires_unix=args.expires_unix, azure=args.azure,
+            uploader=args.uploader, validator=args.validator,
+            supervisor=args.supervisor, az_python=args.az_python)
+    elif args.command == "admit":
+        admission(
+            args.plan, args.authorization, args.output,
+            azure=args.azure, uploader=args.uploader,
+            validator=args.validator, supervisor=args.supervisor,
+            az_python=args.az_python)
     else:
         import public_bundle
 
@@ -439,7 +826,7 @@ def main():
                     args.expected_archive_sha256, args.validator,
                     args.supervisor, args.artifact_id,
                     args.container_digest)
-    print("Compute handoff/plan prepared; authority=not_admitted. No Azure operations.")
+    print("Compute private contract prepared; no Azure operations.")
 
 
 if __name__ == "__main__":

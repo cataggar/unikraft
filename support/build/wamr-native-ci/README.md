@@ -400,14 +400,19 @@ After a successful final-source build and all six boots, `handoff.py export`
 can retain and revalidate the **actual private bytes** before the runner is
 discarded. It uses the existing native physical package inspector, original
 request/report/compute checks, and complete earlier result hashes. Its bundle
-and `handoff.py plan` output remain `authority=not_admitted`; they do not
-promote this lane's local result to cloud acceptance. Metadata-only Actions
-artifacts cannot be used in place of missing raw/VHD/EFI/log bytes.
+and `handoff.py candidate` output remain `authority=not_admitted`; they do not
+promote this lane's local result to cloud acceptance. For an imported
+version-2 public-source bundle, `handoff.py plan` now creates the separate
+canonical private `uk.wamr.azure-execution-plan` version 1 and pending
+approval template. The plan remains unapproved and requires explicit
+validator, supervisor, Azure CLI, transfer and interpreter paths plus a
+finite integer micro-USD maximum. Metadata-only Actions artifacts cannot be
+used in place of missing raw/VHD/EFI/log bytes.
 
 See [WAMR direct compute](../../azure/WAMR-DIRECT-COMPUTE.md) for the private
-export, independent native revalidation, offline plan and separate final
-image-specific approval boundary. The default private export/plan remains
-unchanged. No cloud execution is added.
+export, independent native revalidation, explicit authorization recording,
+native admission and final image-specific approval boundary. No cloud
+execution is added by generation or validation.
 
 ## Expressly authorized public-source image bundle
 

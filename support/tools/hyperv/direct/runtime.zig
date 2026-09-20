@@ -46,6 +46,7 @@ pub const Programs = struct {
     azure: []const u8,
     uploader: []const u8,
     validator: []const u8,
+    supervisor: ?[]const u8 = null,
     azure_python: ?[]const u8 = null,
 
     pub fn validate(self: Programs) !void {
@@ -54,6 +55,10 @@ pub const Programs = struct {
             try publicArgument(@field(self, field));
         }
         if (self.azure_python) |path_value| {
+            try core.private_files.absoluteFilePath(path_value);
+            try publicArgument(path_value);
+        }
+        if (self.supervisor) |path_value| {
             try core.private_files.absoluteFilePath(path_value);
             try publicArgument(path_value);
         }

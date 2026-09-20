@@ -1,17 +1,21 @@
 # WAMR tiny-AOT direct compute: software prerequisite, not permission to run
 
-Refs cataggar/unikraft#156 and cataggar/unikraft#88. Neither acceptance issue is
-completed by this software or its synthetic tests. No Azure deployment is
-established here. Earlier native boot metadata is **not reusable disk
-bytes**, an Azure receipt, or a grant to launch this controller.
+Refs cataggar/unikraft#170, cataggar/unikraft#177, cataggar/unikraft#156,
+cataggar/unikraft#88 and cataggar/wamr#1060. None of this software or its
+synthetic tests establishes an Azure deployment. Earlier native boot metadata
+is **not reusable disk bytes**, an Azure receipt, or a grant to launch this
+controller.
 
-`uk-wamr-direct-compute` is a separate, purpose-specific executable. Its
-closed contract dispatches legacy version 1 purpose `tiny-aot-two-boot` and
-current version 2 purpose/profile `qcow2-derived-vhd`. Version 1 remains the
-old four-mode raw/package-VHD contract; it cannot satisfy version 2. Version 2
-requires raw and finalized QCOW2 normal/masked-x2APIC boots, an acceptance
-gate, derivation from that exact accepted QCOW2, and derived fixed-VHD
-normal/masked-x2APIC boots.
+`uk-wamr-direct-validate` keeps explicit evidence dispatch for legacy bundle
+version 1 purpose `tiny-aot-two-boot` and current bundle/candidate version 2
+profile `qcow2-derived-vhd`. Version 1 remains the old four-mode
+raw/package-VHD contract; it cannot satisfy version 2. Version 2 requires raw
+and finalized QCOW2 normal/masked-x2APIC boots, an acceptance gate, derivation
+from that exact accepted QCOW2, and derived fixed-VHD normal/masked-x2APIC
+boots. Neither evidence version is executable authority. The installed
+`uk-wamr-direct-compute` live entry point accepts only
+`uk.wamr.azure-execution-admission` version 1, which digest-binds the separate
+plan and authorization records described below.
 It reuses the native direct route's managed fixed-VHD upload, private process
 supervision, create-only custody, bounded deallocate/start lifecycle, owner and
 inventory checks, and independently confirmed cleanup. It does **not** relabel
@@ -139,9 +143,9 @@ python3 support/build/wamr-native-ci/handoff.py export \
   --runtime "$RUNTIME" --output "$PRIVATE_PARENT/FRESH-image-handoff"
 .d/wamr-direct/tools/bin/uk-wamr-direct-validate handoff \
   "$PRIVATE_PARENT/FRESH-image-handoff/bundle.json"
-python3 support/build/wamr-native-ci/handoff.py plan \
+python3 support/build/wamr-native-ci/handoff.py candidate \
   --bundle "$PRIVATE_PARENT/FRESH-image-handoff/bundle.json" \
-  --output "$PRIVATE_PARENT/FRESH-unapproved-plan.json"
+  --output "$PRIVATE_PARENT/FRESH-non-authorizing-candidate.json"
 ```
 
 `export` rechecks the actual source/build/tool inputs, all original result
@@ -159,17 +163,13 @@ VHD raw prefix/footer/GPT/workload identity and all six bound native results.
 Failure leaves incomplete private state for
 inspection, never a successful bundle or resumable export.
 
-`plan` rehashes retained files and emits **`authority=not_admitted`**, all
-approval flags false, zero approval/expiry times and a fresh attempt UUID.
-For version 2 it also emits a syntactically valid non-authorizing candidate
-scope so the native `candidate` command can revalidate the admission wrapper;
-the controller still rejects it until a separate approval changes authority
-and approval fields. It neither calls Azure nor
-fabricates approval, guest measurements or cloud receipts. Local records
-remain `local_native_compute_only`, not Azure evidence. This is an operator
-review handoff, not an authenticated build/source attestation. Native
-verification checks the recorded relationships; the human must review the
-actual final build provenance and local execution before granting cloud use.
+`candidate` preserves the legacy version-dispatched, non-authorizing scope
+used to inspect bundle versions 1 and 2. It emits
+**`authority=not_admitted`** and cannot be passed to the production controller
+as an Azure authorization. Version 1/tiny scopes, version 2 public bundles,
+transport records and local evidence remain evidence only; none is inferred
+to be approval. The finite-cost plan described below is a separate canonical
+private schema.
 
 Keep operator handoffs and all Azure attempt/campaign data private (0700
 directories/0600 files). Private `export` never opts into publication. The
@@ -236,11 +236,25 @@ python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
   --container-digest "$CONTAINER_DIGEST"
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" handoff \
   "$PRIVATE_PARENT/FRESH-imported-image/bundle.json"
+mkdir -m 700 "$PRIVATE_PARENT/ORIGINAL-campaign-ledger"
 python3 support/build/wamr-native-ci/handoff.py plan \
   --bundle "$PRIVATE_PARENT/FRESH-imported-image/bundle.json" \
-  --output "$PRIVATE_PARENT/FRESH-unapproved-plan.json"
-"$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" candidate \
-  "$PRIVATE_PARENT/FRESH-unapproved-plan.json"
+  --candidate-output "$PRIVATE_PARENT/FRESH-candidate.json" \
+  --output "$PRIVATE_PARENT/FRESH-execution-plan.json" \
+  --approval-template "$PRIVATE_PARENT/FRESH-approval-template.json" \
+  --campaign-id "$CAMPAIGN_UUID" \
+  --ledger "$PRIVATE_PARENT/ORIGINAL-campaign-ledger" \
+  --subscription "$SUBSCRIPTION_UUID" \
+  --prefix "$FRESH_EXACT_PREFIX" \
+  --maximum-authorized-cost-microusd "$REQUESTED_MAXIMUM_MICROUSD" \
+  --azure "$REVIEWED_CANONICAL_AZ" \
+  --uploader "$EXPLICIT_UK_HYPERV_TRANSFER_CLI" \
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
+  --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
+  --az-python "$REVIEWED_CANONICAL_PYTHON"
+"$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" plan \
+  "$PRIVATE_PARENT/FRESH-execution-plan.json" \
+  "$PRIVATE_PARENT/FRESH-approval-template.json"
 ```
 
 The importer requires both locally reviewed native executables explicitly;
@@ -270,6 +284,95 @@ It preserves original bytes and request hashes, changes only the handoff's
 local file references, and invokes native production revalidation. An
 incomplete import never publishes the final operator `bundle.json`.
 
+## Versioned finite-cost authorization
+
+The private unapproved plan is
+`uk.wamr.azure-execution-plan` version 1. Native canonical JSON is compact
+UTF-8 with byte-sorted keys and one final LF; its SHA-256 is calculated over
+those complete bytes and is deliberately not stored inside the plan itself.
+The separate `uk.wamr.azure-execution-approval-template` version 1 carries
+that external digest. Regenerating or changing the plan therefore changes the
+digest and invalidates every earlier template and authorization.
+
+The plan binds the exact version-2 imported candidate, public admission,
+85-member public bundle, transport, Actions run/attempt and artifact ID,
+source commit/tree, raw-to-QCOW2-to-derived-VHD lineage, QCOW2 and VHD
+digests, VHD file length (69,206,528 bytes) and virtual capacity
+(69,206,016 bytes), WAMR identities, execution attempt UUID, campaign UUID,
+campaign profile and exact original ledger path. It also binds the exact
+subscription and fresh prefix, North Europe `Standard_D2s_v5` Generation 2
+topology, one `StandardSSD_LRS` OS disk, no data disk or public IP, private
+no-default-outbound networking, one VM, two boots and maximum parallelism one.
+Retries and source/image/topology/workload substitution are zero/false.
+Cleanup is restricted to the exact owned group and requires a separate
+absence observation; replacement resources are forbidden.
+
+All money is an unsigned integer count of **micro-USD**. There are no floats,
+NaN/infinity spellings, zero or unbounded sentinels. Policy
+`northeurope-standard-d2s-v5-conservative-2026-09-v1` computes:
+
+```text
+5,000,000 + ceil((runtime_seconds + cleanup_seconds) / 3600)
+            * (2,000,000 * VM count + 250,000 * OS-disk count)
+```
+
+For the fixed 3,600-second execution and 1,800-second cleanup bounds this is
+9,500,000 micro-USD. The repository maximum is 100,000,000 micro-USD. The
+requested authorization maximum must be at least the recomputed estimate and
+at most the repository maximum; neither side is silently clamped.
+
+After an operator has obtained a **fresh explicit decision for the exact plan
+digest**, record it through the private command. A chat or user response is
+not parsed or inferred by this software. The operator deliberately transfers
+that decision into the record:
+
+```sh
+APPROVED_UNIX="$(date +%s)"
+EXPIRES_UNIX="$((APPROVED_UNIX + 3600))"
+python3 support/build/wamr-native-ci/handoff.py record-authorization \
+  --plan "$PRIVATE_PARENT/FRESH-execution-plan.json" \
+  --template "$PRIVATE_PARENT/FRESH-approval-template.json" \
+  --output "$PRIVATE_PARENT/FRESH-authorization.json" \
+  --decision approved \
+  --approver "$BOUNDED_OPERATOR_ID" \
+  --reference "$BOUNDED_APPROVAL_REFERENCE" \
+  --recorded-unix "$APPROVED_UNIX" \
+  --expires-unix "$EXPIRES_UNIX" \
+  --azure "$REVIEWED_CANONICAL_AZ" \
+  --uploader "$EXPLICIT_UK_HYPERV_TRANSFER_CLI" \
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
+  --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
+  --az-python "$REVIEWED_CANONICAL_PYTHON"
+python3 support/build/wamr-native-ci/handoff.py admit \
+  --plan "$PRIVATE_PARENT/FRESH-execution-plan.json" \
+  --authorization "$PRIVATE_PARENT/FRESH-authorization.json" \
+  --output "$PRIVATE_PARENT/FRESH-admission.json" \
+  --azure "$REVIEWED_CANONICAL_AZ" \
+  --uploader "$EXPLICIT_UK_HYPERV_TRANSFER_CLI" \
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
+  --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
+  --az-python "$REVIEWED_CANONICAL_PYTHON"
+```
+
+`uk.wamr.azure-execution-authorization` version 1 binds the exact plan SHA-256,
+attempt, candidate digest, estimated and maximum micro-USD values, resource
+and time limits, decision, bounded approver/reference and a maximum one-hour
+window. `uk.wamr.azure-execution-admission` version 1 is published only after
+the native validator reopens the plan, authorization, candidate, tools and
+image lineage and finds every binding equal. Unknown fields, duplicate keys,
+noncanonical bytes, denial, future/expired time, a different plan/attempt,
+changed cost or limit, or any regenerated digest refuse admission.
+
+This is not a cryptographic identity or signature protocol. Trust comes from
+the operator's explicit command invocation, reviewed local executable paths
+and private 0700/0600 file custody. If stronger authenticated multi-party
+approval is required, it must be supplied outside this contract and named in
+the bounded reference.
+
+Plan, template, authorization, admission and candidate are private operator
+records. They are not members of the fixed 85-member public bundle, its
+allowlist or redownload summary.
+
 ## Final approval, run and cleanup boundary
 
 Before seeking approval, use the shared [local CLI startup preflight](DIRECT-TWO-BOOT.md#local-cli-startup-before-consumption):
@@ -282,11 +385,11 @@ mkdir -m 700 "$PRIVATE_PARENT/FRESH-cli-startup"
   --az-python "$REVIEWED_CANONICAL_PYTHON"
 ```
 
-The final option is required only for a reviewed launcher needing `AZ_PYTHON`;
-omit it for a self-contained CLI. Use reviewed canonical executable paths,
-not a symlinked version alias or an unchecked ambient variable. The interpreter
-is explicitly pinned/rechecked, while arbitrary Python settings and loader
-hooks remain excluded. The only child command is bounded local `az version`;
+The explicit interpreter is required by the finite-cost route. Use reviewed
+canonical executable paths, not a symlinked version alias or unchecked ambient
+variables. The interpreter is pinned/rechecked, while arbitrary Python
+settings and loader hooks remain excluded. The only child command is bounded
+local `az version`;
 passing does not authenticate an account, inspect resources, consume an attempt
 or authorize Azure use. Raw output and tool identities remain private.
 
@@ -312,34 +415,26 @@ one attempt, execution at most 3600 seconds and independent cleanup at most
 1800 seconds; individual calls retain the direct route's maximum 600 seconds.
 It implements no campaign batching or automatic retries.
 
-After reviewing the **concrete final bundle** and exact subscription, fresh
-resource names, region/SKU and cleanup plan, a human must separately approve a
-private scope copied from the plan:
-
-* Set `authority` to `final_image_approved`, retain the exact source,
-  identity, `os_vhd` and `bundle` artifacts, and approve every named boolean
-  in `approval`, including `fresh_final_approval`.
-* Set `approved_unix` to the actual approval time and `expires_unix` to a
-  future deadline no more than 3600 seconds later. Future-dated, expired and
-  oversized windows are refused. No approval is supplied by this PR.
-* Replace the subscription/name placeholders with explicitly approved values.
-  Choose one persistent private campaign ledger and one nonexistent attempt
-  directory. Do not select another ledger to defeat consumption.
-
 The only live interface (shown for later approved use, **not an instruction
 to execute now**) is:
 
 ```text
-uk-wamr-direct-compute APPROVED_SCOPE_JSON FRESH_ATTEMPT_DIR CAMPAIGN_LEDGER \
+uk-wamr-direct-compute PRIVATE_ADMISSION_JSON FRESH_ATTEMPT_DIR CAMPAIGN_LEDGER \
   EXPLICIT_AZ_EXECUTABLE EXPLICIT_UK_HYPERV_TRANSFER_CLI \
-  EXPLICIT_UK_WAMR_DIRECT_VALIDATE [--az-python EXPLICIT_CANONICAL_INTERPRETER]
+  EXPLICIT_UK_WAMR_DIRECT_VALIDATE EXPLICIT_WAMR_CI_SUPERVISOR \
+  --az-python EXPLICIT_CANONICAL_INTERPRETER
 ```
 
-The engine checks source scope custody, approval, bundle, exact inputs and
-bounded clean-environment CLI startup
-before consuming attempt/source-tree/image reservations in that ledger and
-before the first Azure call. Reservations are retained on failure. A fresh
-attempt directory is mandatory; neither resume nor an automatic retry exists.
+Before creating the attempt directory, the production entry point
+canonical-decodes the admission, rehashes its plan and authorization, checks
+expiry, finite cost and repository policy, validates the exact candidate and
+tool bindings, and performs a read-only ledger eligibility check. It then
+checks bundle/input custody and bounded clean-environment CLI startup before
+consuming attempt/source-tree/image reservations and before the first Azure
+resource call. Malformed, missing, stale, denied, wrong-plan, wrong-attempt or
+wrong-cost authorization reaches neither ledger mutation nor backend
+invocation. Reservations are retained on later failure. A fresh attempt
+directory is mandatory; neither resume nor an automatic retry exists.
 Before Boot2 it revalidates inputs, original Boot1 bytes, VM/disk identities,
 deallocation, scope/expiry and durable start admission. `azure_cumulative`
 allows only the exact Boot1 prefix excluding terminal NUL padding to be

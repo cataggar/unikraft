@@ -21,9 +21,16 @@ pub const Inputs = struct {
     programs: runtime.Programs,
 
     pub fn parse(args: []const []const u8) !Inputs {
-        if (args.len != 6 and args.len != 8) return error.InvalidArguments;
-        if (args.len == 8 and !std.mem.eql(u8, args[6], "--az-python")) return error.InvalidArguments;
-        for (args[0..6]) |arg| {
+        const fixed: usize = if (profile.authorization) 7 else 6;
+        if (comptime profile.authorization) {
+            if (args.len != 9 or !std.mem.eql(u8, args[7], "--az-python"))
+                return error.InvalidArguments;
+        } else if (args.len != 6 and args.len != 8) {
+            return error.InvalidArguments;
+        } else if (args.len == 8 and !std.mem.eql(u8, args[6], "--az-python")) {
+            return error.InvalidArguments;
+        }
+        for (args[0..fixed]) |arg| {
             try files.absoluteFilePath(arg);
             if (std.mem.indexOfAny(u8, arg, "\r\n") != null) return error.InvalidArguments;
         }
@@ -31,7 +38,13 @@ pub const Inputs = struct {
             .scope = args[0],
             .attempt = args[1],
             .ledger = args[2],
-            .programs = .{ .azure = args[3], .uploader = args[4], .validator = args[5], .azure_python = if (args.len == 8) args[7] else null },
+            .programs = .{
+                .azure = args[3],
+                .uploader = args[4],
+                .validator = args[5],
+                .supervisor = if (profile.authorization) args[6] else null,
+                .azure_python = if (profile.authorization) args[8] else if (args.len == 8) args[7] else null,
+            },
         };
         try result.programs.validate();
         return result;
@@ -125,6 +138,23 @@ pub const Native = struct {
 /// separate, non-installed executable, never in a CLI/config/environment mode.
 pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, inputs: Inputs) !u8 {
     const a = init.arena.allocator();
+    const Admission = if (profile.authorization) direct.Admission else void;
+    var admitted: ?std.json.Parsed(Admission) = null;
+    defer if (admitted) |*value| value.deinit();
+    if (comptime profile.authorization) {
+        admitted = try direct.preAdmission(
+            a,
+            init.io,
+            inputs.scope,
+            inputs.ledger,
+            inputs.programs.azure,
+            inputs.programs.uploader,
+            inputs.programs.validator,
+            inputs.programs.supervisor.?,
+            inputs.programs.azure_python.?,
+        );
+        try custody.checkEligibility(init.io, admitted.?.value, inputs.ledger);
+    }
     var cancellation = try process.SignalCancellation.install();
     defer cancellation.deinit();
     var environment = try hooks.environment(a, init.environ_map);
@@ -135,6 +165,21 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
         try custody.Reference.tool(init.io, inputs.programs.uploader),
         try custody.Reference.tool(init.io, inputs.programs.validator),
     };
+    const supervisor = if (inputs.programs.supervisor) |path|
+        try custody.Reference.tool(init.io, path)
+    else
+        null;
+    if (comptime profile.authorization) {
+        const scope = admitted.?.value;
+        inline for (.{ "azure", "uploader", "validator" }, 0..) |name, index| {
+            try direct.inspectArtifact(init.io, @field(scope.tools, name));
+            try tools[index].verify(init.io);
+        }
+        try direct.inspectArtifact(init.io, scope.tools.supervisor);
+        try supervisor.?.verify(init.io);
+        try direct.inspectArtifact(init.io, scope.tools.az_python);
+        try interpreter.?.verify(init.io);
+    }
     const source = try files.openAbsolute(init.io, inputs.scope, .private);
     defer source.close(init.io);
     const source_pin: custody.Reference = .{ .path = inputs.scope, .policy = .private, .metadata = try files.snapshot(source) };
@@ -154,6 +199,7 @@ pub fn execute(comptime Hooks: type, hooks: Hooks, init: std.process.Init, input
         .expected = expected,
         .source = source_pin,
         .tools = tools,
+        .supervisor = supervisor,
         .runtime = .{
             .allocator = init.gpa,
             .io = init.io,
@@ -212,6 +258,7 @@ fn Controller(comptime Hooks: type) type {
         runtime: runtime.Runtime,
         references: ?Hooks.References = null,
         tools: ?[3]custody.Reference = null,
+        supervisor: ?custody.Reference = null,
         primary_exit: u8 = 0,
         cleanup_exit: u8 = 0,
         final_input_exit: ?u8 = null,
@@ -271,6 +318,7 @@ fn Controller(comptime Hooks: type) type {
             if (self.tools) |tools| {
                 for (tools) |tool| try tool.verify(self.io);
             } else return error.MissingToolReferences;
+            if (self.supervisor) |tool| try tool.verify(self.io);
             try self.runtime.verifyInterpreter();
         }
 
@@ -350,7 +398,8 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn validate(self: *Self, lane: Lane, label: []const u8, verb: enum { scope, inputs, json, serial }, extra: []const []const u8) !u8 {
-            const args = try std.mem.concat(self.a, []const u8, &.{ &.{ @tagName(verb), try self.path("scope.json") }, extra });
+            const command = if (profile.legacy_fixture and verb == .scope) "legacy-scope" else @tagName(verb);
+            const args = try std.mem.concat(self.a, []const u8, &.{ &.{ command, try self.path("scope.json") }, extra });
             return self.callWithPolicy(lane, .validator, if (verb == .serial) .serial_parser else .required, label, args, "stdout");
         }
 
@@ -428,8 +477,15 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn primary(self: *Self) !void {
-            try self.required(try self.call(.primary, .validator, "source-scope-check", &.{ "scope", self.inputs.scope }, "stdout"));
-            try self.required(try self.call(.primary, .validator, "ledger-check", &.{ "ledger", self.inputs.scope, self.inputs.ledger }, "stdout"));
+            try self.required(try self.call(.primary, .validator, "source-scope-check", &.{
+                if (comptime profile.legacy_fixture) "legacy-scope" else "scope",
+                self.inputs.scope,
+            }, "stdout"));
+            try self.required(try self.call(.primary, .validator, "ledger-check", &.{
+                if (comptime profile.legacy_fixture) "legacy-ledger" else "ledger",
+                self.inputs.scope,
+                self.inputs.ledger,
+            }, "stdout"));
             try self.required(try self.validate(.primary, "scope-check", .scope, &.{}));
             try self.event(.@"local-admission");
             self.references = try self.hooks.references(self.io, self.expected.scope, self.inputs.programs);

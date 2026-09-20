@@ -20,6 +20,8 @@ pub fn main(init: std.process.Init) void {
 fn run(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len > 1 and std.mem.eql(u8, args[1], "preflight")) {
+        if (args.len != 6 or !std.mem.eql(u8, args[4], "--az-python"))
+            return error.InvalidArguments;
         std.process.exit(try @import("launcher.zig").standalone(init, args[2..]));
     }
     return controller.execute(controller.Native, .{}, init, try controller.Inputs.parse(args[1..]));

@@ -75,7 +75,7 @@ pub const Identity = struct {
     compiler_sha256: []const u8,
     config_sha256: []const u8,
 };
-pub const Scope = struct {
+pub const CandidateScope = struct {
     schema: []const u8,
     version: u8,
     purpose: enum { @"tiny-aot-two-boot", @"qcow2-derived-vhd" },
@@ -106,7 +106,7 @@ pub const Scope = struct {
     os_vhd: Artifact,
     bundle: Artifact,
 
-    pub fn validate(self: Scope) !void {
+    pub fn validate(self: CandidateScope) !void {
         try self.validateCandidate();
         if (self.authority != .final_image_approved) return error.NotAuthorized;
         inline for (.{ "direct_specialized_gen2", "os_only_private", "cleanup_owned_group", "exact_image_and_local_bundle_reviewed", "fresh_final_approval" }) |name|
@@ -115,7 +115,7 @@ pub const Scope = struct {
             return error.NotAuthorized;
     }
 
-    pub fn validateCandidate(self: Scope) !void {
+    pub fn validateCandidate(self: CandidateScope) !void {
         if (!eq(self.schema, "uk.wamr.direct-compute") or
             (self.version == 1 and self.purpose != .@"tiny-aot-two-boot") or
             (self.version == 2 and self.purpose != .@"qcow2-derived-vhd") or
@@ -149,11 +149,352 @@ pub const Scope = struct {
         if (self.os_vhd.size != 66 * 1024 * 1024 + 512 or self.bundle.size > 65536) return error.InvalidArtifact;
     }
 
-    pub fn current(self: Scope, now: u64) !void {
+    pub fn current(self: CandidateScope, now: u64) !void {
         try self.validate();
         if (now < self.approval.approved_unix or now >= self.approval.expires_unix) return error.ApprovalExpired;
     }
 };
+
+pub const canonicalization = "utf8-byte-sorted-keys-compact-lf-v1";
+pub const cost_policy = "northeurope-standard-d2s-v5-conservative-2026-09-v1";
+pub const repository_maximum_cost_microusd: u64 = 100_000_000;
+pub const estimated_cost_upper_bound_microusd: u64 = 9_500_000;
+const vm_hour_microusd: u64 = 2_000_000;
+const os_disk_hour_microusd: u64 = 250_000;
+const fixed_overhead_microusd: u64 = 5_000_000;
+const fixed_vhd_bytes: u64 = 66 * 1024 * 1024 + 512;
+const fixed_vhd_capacity_bytes: u64 = fixed_vhd_bytes - 512;
+pub const ExecutionPurpose = enum { @"qcow2-derived-vhd-two-boot" };
+pub const ExecutionProfile = enum { @"qcow2-derived-vhd" };
+
+pub const Resources = struct {
+    vm_count: u8,
+    os_disk_count: u8,
+    data_disk_count: u8,
+    public_ip_count: u8,
+    boot_count: u8,
+    maximum_parallelism: u8,
+    generation: u8,
+    os_disk_sku: enum { StandardSSD_LRS },
+    os_disk_capacity_bytes: u64,
+    network: enum { private_no_default_outbound },
+};
+
+pub const Substitution = struct {
+    source: bool,
+    image: bool,
+    topology: bool,
+    workload: bool,
+};
+
+pub const CleanupPolicy = struct {
+    exact_owned_resources_only: bool,
+    delete_owned_resource_group: bool,
+    independent_absence_observation: bool,
+    replacement_resources: bool,
+};
+
+pub const Cost = struct {
+    unit: enum { micro_usd },
+    policy: enum { @"northeurope-standard-d2s-v5-conservative-2026-09-v1" },
+    estimated_upper_bound: u64,
+    maximum_authorized: u64,
+    repository_policy_maximum: u64,
+};
+
+pub const Tools = struct {
+    azure: Artifact,
+    uploader: Artifact,
+    validator: Artifact,
+    supervisor: Artifact,
+    az_python: Artifact,
+};
+
+pub const ApprovalLimits = struct {
+    runtime_seconds: u32,
+    cleanup_seconds: u32,
+    operation_seconds: u32,
+    maximum_parallelism: u8,
+    boot_count: u8,
+    retry_count: u8,
+};
+
+pub const Plan = struct {
+    schema: []const u8,
+    version: u8,
+    purpose: ExecutionPurpose,
+    profile: ExecutionProfile,
+    authority: enum { not_admitted },
+    canonicalization: []const u8,
+    created_unix: u64,
+    attempt_id: []const u8,
+    campaign_id: []const u8,
+    campaign_profile: ExecutionProfile,
+    ledger_path: []const u8,
+    subscription: []const u8,
+    location: []const u8,
+    prefix: []const u8,
+    vm_size: []const u8,
+    serial_mode: SerialMode,
+    runtime_seconds: u32,
+    cleanup_seconds: u32,
+    operation_seconds: u32,
+    poll_seconds: u32,
+    source_revision: []const u8,
+    source_tree: []const u8,
+    run: RunIdentity,
+    identity: Identity,
+    lineage: Lineage,
+    candidate: Artifact,
+    bundle: Artifact,
+    public_bundle: Artifact,
+    transport: Artifact,
+    qcow2: Artifact,
+    os_vhd: Artifact,
+    vhd_bytes: u64,
+    vhd_capacity_bytes: u64,
+    artifact_id: []const u8,
+    inner_zip_sha256: []const u8,
+    container_digest: []const u8,
+    resources: Resources,
+    retry_count: u8,
+    substitution: Substitution,
+    cleanup: CleanupPolicy,
+    cost: Cost,
+    tools: Tools,
+
+    pub fn validate(self: Plan) !void {
+        if (!eq(self.schema, "uk.wamr.azure-execution-plan") or self.version != 1 or
+            self.purpose != .@"qcow2-derived-vhd-two-boot" or
+            self.profile != .@"qcow2-derived-vhd" or self.authority != .not_admitted or
+            !eq(self.canonicalization, canonicalization) or self.created_unix == 0)
+            return error.InvalidPlan;
+        try commonPlan(
+            self.attempt_id,
+            self.campaign_id,
+            self.ledger_path,
+            self.subscription,
+            self.location,
+            self.prefix,
+            self.vm_size,
+            self.serial_mode,
+            self.runtime_seconds,
+            self.cleanup_seconds,
+            self.operation_seconds,
+            self.poll_seconds,
+            self.source_revision,
+            self.source_tree,
+            self.run,
+            self.identity,
+            self.lineage,
+            self.candidate,
+            self.bundle,
+            self.public_bundle,
+            self.transport,
+            self.qcow2,
+            self.os_vhd,
+            self.vhd_bytes,
+            self.vhd_capacity_bytes,
+            self.artifact_id,
+            self.inner_zip_sha256,
+            self.container_digest,
+            self.resources,
+            self.retry_count,
+            self.substitution,
+            self.cleanup,
+            self.cost,
+            self.tools,
+        );
+    }
+
+    pub fn limits(self: Plan) ApprovalLimits {
+        return .{
+            .runtime_seconds = self.runtime_seconds,
+            .cleanup_seconds = self.cleanup_seconds,
+            .operation_seconds = self.operation_seconds,
+            .maximum_parallelism = self.resources.maximum_parallelism,
+            .boot_count = self.resources.boot_count,
+            .retry_count = self.retry_count,
+        };
+    }
+};
+
+pub const ApprovalTemplate = struct {
+    schema: []const u8,
+    version: u8,
+    decision: enum { pending },
+    plan_sha256: []const u8,
+    attempt_id: []const u8,
+    candidate_sha256: []const u8,
+    estimated_cost_upper_bound_microusd: u64,
+    maximum_authorized_cost_microusd: u64,
+    limits: ApprovalLimits,
+
+    pub fn validate(self: ApprovalTemplate, plan: Plan, plan_sha256: []const u8) !void {
+        if (!eq(self.schema, "uk.wamr.azure-execution-approval-template") or
+            self.version != 1 or self.decision != .pending or
+            !eq(self.plan_sha256, plan_sha256) or
+            !eq(self.attempt_id, plan.attempt_id) or
+            !eq(self.candidate_sha256, plan.candidate.sha256) or
+            self.estimated_cost_upper_bound_microusd != plan.cost.estimated_upper_bound or
+            self.maximum_authorized_cost_microusd != plan.cost.maximum_authorized or
+            !std.meta.eql(self.limits, plan.limits()))
+            return error.InvalidApprovalTemplate;
+    }
+};
+
+pub const Authorization = struct {
+    schema: []const u8,
+    version: u8,
+    decision: enum { approved, denied },
+    plan_sha256: []const u8,
+    attempt_id: []const u8,
+    candidate_sha256: []const u8,
+    estimated_cost_upper_bound_microusd: u64,
+    maximum_authorized_cost_microusd: u64,
+    limits: ApprovalLimits,
+    approver: []const u8,
+    reference: []const u8,
+    recorded_unix: u64,
+    expires_unix: u64,
+
+    pub fn validate(self: Authorization, plan: Plan, plan_sha256: []const u8) !void {
+        if (!eq(self.schema, "uk.wamr.azure-execution-authorization") or
+            self.version != 1 or !eq(self.plan_sha256, plan_sha256) or
+            !eq(self.attempt_id, plan.attempt_id) or
+            !eq(self.candidate_sha256, plan.candidate.sha256) or
+            self.estimated_cost_upper_bound_microusd != plan.cost.estimated_upper_bound or
+            self.maximum_authorized_cost_microusd != plan.cost.maximum_authorized or
+            !std.meta.eql(self.limits, plan.limits()))
+            return error.InvalidAuthorization;
+        try boundedAuthorityText(self.approver, 1, 128);
+        try boundedAuthorityText(self.reference, 1, 256);
+        if (self.recorded_unix == 0 or self.expires_unix <= self.recorded_unix or
+            self.expires_unix - self.recorded_unix > 3600)
+            return error.InvalidApprovalWindow;
+    }
+
+    pub fn current(self: Authorization, now: u64) !void {
+        if (self.decision != .approved) return error.NotAuthorized;
+        if (now < self.recorded_unix or now >= self.expires_unix)
+            return error.ApprovalExpired;
+    }
+};
+
+pub const Admission = struct {
+    schema: []const u8,
+    version: u8,
+    authority: enum { approved },
+    plan: Artifact,
+    authorization: Artifact,
+    purpose: ExecutionPurpose,
+    profile: ExecutionProfile,
+    canonicalization: []const u8,
+    created_unix: u64,
+    attempt_id: []const u8,
+    campaign_id: []const u8,
+    campaign_profile: ExecutionProfile,
+    ledger_path: []const u8,
+    subscription: []const u8,
+    location: []const u8,
+    prefix: []const u8,
+    vm_size: []const u8,
+    serial_mode: SerialMode,
+    runtime_seconds: u32,
+    cleanup_seconds: u32,
+    operation_seconds: u32,
+    poll_seconds: u32,
+    source_revision: []const u8,
+    source_tree: []const u8,
+    run: RunIdentity,
+    identity: Identity,
+    lineage: Lineage,
+    candidate: Artifact,
+    bundle: Artifact,
+    public_bundle: Artifact,
+    transport: Artifact,
+    qcow2: Artifact,
+    os_vhd: Artifact,
+    vhd_bytes: u64,
+    vhd_capacity_bytes: u64,
+    artifact_id: []const u8,
+    inner_zip_sha256: []const u8,
+    container_digest: []const u8,
+    resources: Resources,
+    retry_count: u8,
+    substitution: Substitution,
+    cleanup: CleanupPolicy,
+    cost: Cost,
+    tools: Tools,
+    approval: struct {
+        approver: []const u8,
+        reference: []const u8,
+        approved_unix: u64,
+        expires_unix: u64,
+    },
+
+    pub fn validate(self: Admission) !void {
+        if (!eq(self.schema, "uk.wamr.azure-execution-admission") or
+            self.version != 1 or self.authority != .approved or
+            self.purpose != .@"qcow2-derived-vhd-two-boot" or
+            self.profile != .@"qcow2-derived-vhd" or
+            !eq(self.canonicalization, canonicalization) or self.created_unix == 0)
+            return error.InvalidAdmission;
+        try artifact(self.plan);
+        try artifact(self.authorization);
+        try commonPlan(
+            self.attempt_id,
+            self.campaign_id,
+            self.ledger_path,
+            self.subscription,
+            self.location,
+            self.prefix,
+            self.vm_size,
+            self.serial_mode,
+            self.runtime_seconds,
+            self.cleanup_seconds,
+            self.operation_seconds,
+            self.poll_seconds,
+            self.source_revision,
+            self.source_tree,
+            self.run,
+            self.identity,
+            self.lineage,
+            self.candidate,
+            self.bundle,
+            self.public_bundle,
+            self.transport,
+            self.qcow2,
+            self.os_vhd,
+            self.vhd_bytes,
+            self.vhd_capacity_bytes,
+            self.artifact_id,
+            self.inner_zip_sha256,
+            self.container_digest,
+            self.resources,
+            self.retry_count,
+            self.substitution,
+            self.cleanup,
+            self.cost,
+            self.tools,
+        );
+        try boundedAuthorityText(self.approval.approver, 1, 128);
+        try boundedAuthorityText(self.approval.reference, 1, 256);
+        if (self.approval.approved_unix == 0 or
+            self.approval.expires_unix <= self.approval.approved_unix or
+            self.approval.expires_unix - self.approval.approved_unix > 3600)
+            return error.InvalidApprovalWindow;
+    }
+
+    pub fn current(self: Admission, now: u64) !void {
+        try self.validate();
+        if (now < self.approval.approved_unix or now >= self.approval.expires_unix)
+            return error.ApprovalExpired;
+    }
+};
+
+const legacy_fixture = @hasDecl(@import("root"), "wamr_legacy_compute_fixture");
+pub const Scope = if (legacy_fixture) CandidateScope else Admission;
 
 pub const Boot = struct {
     mode: enum { @"raw-x2apic", @"raw-legacy-apic", @"vpc-x2apic", @"vpc-legacy-apic" },
@@ -346,16 +687,21 @@ pub fn secondBytes(raw: []const u8, first: []const u8, mode: SerialMode) ![]cons
 pub fn loadScope(a: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(Scope) {
     var bytes = try files.readSensitiveAbsolute(io, a, path, 65536, null);
     defer bytes.deinit();
+    if (!legacy_fixture) {
+        const document = try c.SensitiveDocument.parse(a, bytes.bytes(), .{ .bytes = 65536, .items = 4096 });
+        defer document.deinit();
+        try document.requireCanonical(bytes.bytes());
+    }
     const scope = try parse(Scope, a, bytes.bytes());
     errdefer scope.deinit();
     try scope.value.validate();
     return scope;
 }
 
-pub fn loadCandidateScope(a: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(Scope) {
+pub fn loadCandidateScope(a: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(CandidateScope) {
     var bytes = try files.readSensitiveAbsolute(io, a, path, 65536, null);
     defer bytes.deinit();
-    const scope = try parse(Scope, a, bytes.bytes());
+    const scope = try parse(CandidateScope, a, bytes.bytes());
     errdefer scope.deinit();
     try scope.value.validateCandidate();
     return scope;
@@ -380,12 +726,13 @@ pub fn inspectArtifact(io: std.Io, item: Artifact) !void {
     if (!std.mem.eql(u8, &hash.finalResult(), &try c.parseSha256(item.sha256))) return error.HashMismatch;
 }
 
-fn read(a: std.mem.Allocator, io: std.Io, item: Artifact, limit: usize) ![]u8 {
+fn readPolicy(a: std.mem.Allocator, io: std.Io, item: Artifact, limit: usize, policy: files.FilePolicy) ![]u8 {
     if (item.size > limit) return error.FileTooLarge;
-    try inspectArtifact(io, item);
-    const file = try files.openAbsolute(io, item.path, .artifact);
+    try artifact(item);
+    const file = try files.openAbsolute(io, item.path, policy);
     defer file.close(io);
     const before = try files.snapshot(file);
+    if (before.size != item.size) return error.ArtifactChanged;
     const bytes = try a.alloc(u8, @intCast(item.size));
     errdefer a.free(bytes);
     if (try file.readPositionalAll(io, bytes, 0) != bytes.len or !files.sameSnapshot(before, try files.snapshot(file))) return error.ArtifactChanged;
@@ -395,7 +742,15 @@ fn read(a: std.mem.Allocator, io: std.Io, item: Artifact, limit: usize) ![]u8 {
     return bytes;
 }
 
-pub fn inspect(a: std.mem.Allocator, io: std.Io, scope: Scope) !void {
+fn read(a: std.mem.Allocator, io: std.Io, item: Artifact, limit: usize) ![]u8 {
+    return readPolicy(a, io, item, limit, .artifact);
+}
+
+fn readPrivate(a: std.mem.Allocator, io: std.Io, item: Artifact, limit: usize) ![]u8 {
+    return readPolicy(a, io, item, limit, .private);
+}
+
+pub fn inspect(a: std.mem.Allocator, io: std.Io, scope: CandidateScope) !void {
     if (scope.version == 2) return inspectV2(a, io, scope);
     const bytes = try read(a, io, scope.bundle, 65536);
     defer a.free(bytes);
@@ -413,7 +768,7 @@ pub fn inspect(a: std.mem.Allocator, io: std.Io, scope: Scope) !void {
     try verifyBundle(a, io, bundle);
 }
 
-const Admission = struct {
+const ImportedAdmission = struct {
     schema: []const u8,
     version: u8,
     profile: enum { @"qcow2-derived-vhd" },
@@ -439,10 +794,10 @@ const Transport = struct {
     container_digest: []const u8,
 };
 
-fn inspectV2(a: std.mem.Allocator, io: std.Io, scope: Scope) !void {
+fn inspectV2(a: std.mem.Allocator, io: std.Io, scope: CandidateScope) !void {
     const admission_bytes = try read(a, io, scope.bundle, 65536);
     defer a.free(admission_bytes);
-    const admission_parsed = try parse(Admission, a, admission_bytes);
+    const admission_parsed = try parse(ImportedAdmission, a, admission_bytes);
     defer admission_parsed.deinit();
     const admission = admission_parsed.value;
     if (!eq(admission.schema, "uk.wamr.direct-compute-admission") or
@@ -486,6 +841,211 @@ fn inspectV2(a: std.mem.Allocator, io: std.Io, scope: Scope) !void {
         return error.InvalidIdentity;
     for (transport.artifact_id) |byte|
         if (!std.ascii.isDigit(byte)) return error.InvalidIdentity;
+}
+
+fn canonicalParsed(comptime T: type, a: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(T) {
+    const document = try c.SensitiveDocument.parse(a, bytes, .{ .bytes = 65536, .items = 4096 });
+    defer document.deinit();
+    try document.requireCanonical(bytes);
+    return parse(T, a, bytes);
+}
+
+pub fn verifyPlan(
+    a: std.mem.Allocator,
+    io: std.Io,
+    plan_path: []const u8,
+    template_path: []const u8,
+) !void {
+    var plan_bytes = try files.readSensitiveAbsolute(io, a, plan_path, 65536, null);
+    defer plan_bytes.deinit();
+    const plan = try canonicalParsed(Plan, a, plan_bytes.bytes());
+    defer plan.deinit();
+    try plan.value.validate();
+    try verifyPlanBindings(a, io, plan.value);
+    var digest: [32]u8 = undefined;
+    core.Sha256.hash(plan_bytes.bytes(), &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+
+    var template_bytes = try files.readSensitiveAbsolute(io, a, template_path, 65536, null);
+    defer template_bytes.deinit();
+    const template = try canonicalParsed(ApprovalTemplate, a, template_bytes.bytes());
+    defer template.deinit();
+    try template.value.validate(plan.value, &digest_hex);
+}
+
+pub fn verifyAuthorization(
+    a: std.mem.Allocator,
+    io: std.Io,
+    plan_path: []const u8,
+    authorization_path: []const u8,
+    require_current: bool,
+) !void {
+    var plan_bytes = try files.readSensitiveAbsolute(io, a, plan_path, 65536, null);
+    defer plan_bytes.deinit();
+    const plan = try canonicalParsed(Plan, a, plan_bytes.bytes());
+    defer plan.deinit();
+    try plan.value.validate();
+    try verifyPlanBindings(a, io, plan.value);
+    var digest: [32]u8 = undefined;
+    core.Sha256.hash(plan_bytes.bytes(), &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+
+    var authorization_bytes = try files.readSensitiveAbsolute(io, a, authorization_path, 65536, null);
+    defer authorization_bytes.deinit();
+    const authorization = try canonicalParsed(Authorization, a, authorization_bytes.bytes());
+    defer authorization.deinit();
+    try authorization.value.validate(plan.value, &digest_hex);
+    if (require_current) {
+        const now = std.Io.Clock.real.now(io).toSeconds();
+        if (now < 0) return error.InvalidClock;
+        if (@as(u64, @intCast(now)) < authorization.value.recorded_unix or
+            @as(u64, @intCast(now)) >= authorization.value.expires_unix)
+            return error.ApprovalExpired;
+    }
+}
+
+pub fn verifyAdmission(a: std.mem.Allocator, io: std.Io, path: []const u8, require_current: bool) !void {
+    const admission = try loadScope(a, io, path);
+    defer admission.deinit();
+    try verifyAdmissionBindings(a, io, admission.value, require_current);
+}
+
+pub fn inspectAdmission(a: std.mem.Allocator, io: std.Io, admission: Admission) !void {
+    const candidate_bytes = try readPrivate(a, io, admission.candidate, 65536);
+    defer a.free(candidate_bytes);
+    const candidate = try parse(CandidateScope, a, candidate_bytes);
+    defer candidate.deinit();
+    try candidate.value.validateCandidate();
+    try inspect(a, io, candidate.value);
+}
+
+pub fn preAdmission(
+    a: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    ledger_path: []const u8,
+    azure: []const u8,
+    uploader: []const u8,
+    validator: []const u8,
+    supervisor: []const u8,
+    az_python: []const u8,
+) !std.json.Parsed(Admission) {
+    if (legacy_fixture) @compileError("production authorization is unavailable in legacy fixtures");
+    const admission = try loadScope(a, io, path);
+    errdefer admission.deinit();
+    try verifyAdmissionBindings(a, io, admission.value, true);
+    if (!eq(admission.value.ledger_path, ledger_path) or
+        !eq(admission.value.tools.azure.path, azure) or
+        !eq(admission.value.tools.uploader.path, uploader) or
+        !eq(admission.value.tools.validator.path, validator) or
+        !eq(admission.value.tools.supervisor.path, supervisor) or
+        !eq(admission.value.tools.az_python.path, az_python))
+        return error.WrongAdmissionInput;
+    return admission;
+}
+
+fn verifyAdmissionBindings(a: std.mem.Allocator, io: std.Io, admission: Admission, require_current: bool) !void {
+    try admission.validate();
+    const plan_bytes = try readPrivate(a, io, admission.plan, 65536);
+    defer a.free(plan_bytes);
+    const plan = try canonicalParsed(Plan, a, plan_bytes);
+    defer plan.deinit();
+    try plan.value.validate();
+    if (!sameAdmissionPlan(admission, plan.value)) return error.WrongPlan;
+    try verifyPlanBindings(a, io, plan.value);
+
+    const authorization_bytes = try readPrivate(a, io, admission.authorization, 65536);
+    defer a.free(authorization_bytes);
+    const authorization = try canonicalParsed(Authorization, a, authorization_bytes);
+    defer authorization.deinit();
+    var digest: [32]u8 = undefined;
+    core.Sha256.hash(plan_bytes, &digest, .{});
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    try authorization.value.validate(plan.value, &digest_hex);
+    if (authorization.value.decision != .approved or
+        !eq(admission.approval.approver, authorization.value.approver) or
+        !eq(admission.approval.reference, authorization.value.reference) or
+        admission.approval.approved_unix != authorization.value.recorded_unix or
+        admission.approval.expires_unix != authorization.value.expires_unix)
+        return error.WrongAuthorization;
+    if (require_current) {
+        const now = std.Io.Clock.real.now(io).toSeconds();
+        if (now < 0) return error.InvalidClock;
+        try authorization.value.current(@intCast(now));
+        try admission.current(@intCast(now));
+    }
+}
+
+fn verifyPlanBindings(a: std.mem.Allocator, io: std.Io, plan: Plan) !void {
+    try plan.validate();
+    const candidate_bytes = try readPrivate(a, io, plan.candidate, 65536);
+    defer a.free(candidate_bytes);
+    const candidate = try parse(CandidateScope, a, candidate_bytes);
+    defer candidate.deinit();
+    try candidate.value.validateCandidate();
+    if (candidate.value.version != 2 or candidate.value.purpose != .@"qcow2-derived-vhd" or
+        candidate.value.authority != .not_admitted or
+        !eq(candidate.value.attempt_id, plan.attempt_id) or
+        !eq(candidate.value.subscription, plan.subscription) or
+        !eq(candidate.value.location, plan.location) or
+        !eq(candidate.value.prefix, plan.prefix) or
+        !eq(candidate.value.vm_size, plan.vm_size) or
+        candidate.value.serial_mode != plan.serial_mode or
+        candidate.value.runtime_seconds != plan.runtime_seconds or
+        candidate.value.cleanup_seconds != plan.cleanup_seconds or
+        candidate.value.operation_seconds != plan.operation_seconds or
+        candidate.value.poll_seconds != plan.poll_seconds or
+        !eq(candidate.value.source_revision, plan.source_revision) or
+        !eq(candidate.value.source_tree, plan.source_tree) or
+        !sameIdentity(candidate.value.identity, plan.identity) or
+        !same(candidate.value.os_vhd, plan.os_vhd) or
+        !same(candidate.value.bundle, plan.bundle))
+        return error.WrongCandidate;
+    try inspect(a, io, candidate.value);
+
+    const admission_bytes = try read(a, io, plan.bundle, 65536);
+    defer a.free(admission_bytes);
+    const public_admission = try parse(ImportedAdmission, a, admission_bytes);
+    defer public_admission.deinit();
+    const imported = public_admission.value;
+    if (!eq(imported.schema, "uk.wamr.direct-compute-admission") or
+        imported.version != 2 or imported.profile != .@"qcow2-derived-vhd" or
+        imported.authority != .not_admitted or
+        !eq(imported.source_revision, plan.source_revision) or
+        !eq(imported.source_tree, plan.source_tree) or
+        !sameRun(imported.run, plan.run) or
+        !sameLineage(imported.lineage, plan.lineage) or
+        !same(imported.public_bundle, plan.public_bundle) or
+        !same(imported.transport, plan.transport))
+        return error.WrongCandidate;
+
+    const bundle_bytes = try read(a, io, plan.public_bundle, 65536);
+    defer a.free(bundle_bytes);
+    const bundle = try parse(BundleV2, a, bundle_bytes);
+    defer bundle.deinit();
+    if (!same(bundle.value.get("qcow2"), plan.qcow2) or
+        !same(bundle.value.get("vhd"), plan.os_vhd) or
+        !sameRun(bundle.value.run, plan.run) or
+        !sameLineage(bundle.value.lineage, plan.lineage))
+        return error.WrongImage;
+
+    const transport_bytes = try read(a, io, plan.transport, 65536);
+    defer a.free(transport_bytes);
+    const transport = try parse(Transport, a, transport_bytes);
+    defer transport.deinit();
+    if (!eq(transport.value.artifact_id, plan.artifact_id) or
+        !eq(transport.value.inner_zip_sha256, plan.inner_zip_sha256) or
+        !eq(transport.value.container_digest, plan.container_digest))
+        return error.WrongTransport;
+
+    inline for (std.meta.fields(Tools)) |member| try inspectTool(io, @field(plan.tools, member.name));
+}
+
+fn inspectTool(io: std.Io, item: Artifact) !void {
+    try inspectArtifact(io, item);
+    const file = try files.openAbsolute(io, item.path, .artifact);
+    defer file.close(io);
+    if ((try files.snapshot(file)).mode & 0o111 == 0) return error.NotExecutable;
 }
 
 pub fn verifyHandoff(a: std.mem.Allocator, io: std.Io, bytes: []const u8) !void {
@@ -1328,6 +1888,11 @@ fn eq(a: []const u8, b: []const u8) bool {
 fn same(a: Artifact, b: Artifact) bool {
     return a.size == b.size and eq(a.sha256, b.sha256) and eq(a.path, b.path);
 }
+fn sameIdentity(a: Identity, b: Identity) bool {
+    inline for (std.meta.fields(Identity)) |member|
+        if (!eq(@field(a, member.name), @field(b, member.name))) return false;
+    return true;
+}
 fn sameRun(a: RunIdentity, b: RunIdentity) bool {
     return eq(a.repository, b.repository) and
         eq(a.run_id, b.run_id) and eq(a.run_attempt, b.run_attempt);
@@ -1336,6 +1901,172 @@ fn sameLineage(a: Lineage, b: Lineage) bool {
     inline for (std.meta.fields(Lineage)) |member|
         if (!eq(@field(a, member.name), @field(b, member.name))) return false;
     return true;
+}
+fn sameTools(a: Tools, b: Tools) bool {
+    inline for (std.meta.fields(Tools)) |member|
+        if (!same(@field(a, member.name), @field(b, member.name))) return false;
+    return true;
+}
+fn sameAdmissionPlan(admission: Admission, plan: Plan) bool {
+    return admission.purpose == plan.purpose and
+        admission.profile == plan.profile and
+        eq(admission.canonicalization, plan.canonicalization) and
+        admission.created_unix == plan.created_unix and
+        eq(admission.attempt_id, plan.attempt_id) and
+        eq(admission.campaign_id, plan.campaign_id) and
+        admission.campaign_profile == plan.campaign_profile and
+        eq(admission.ledger_path, plan.ledger_path) and
+        eq(admission.subscription, plan.subscription) and
+        eq(admission.location, plan.location) and
+        eq(admission.prefix, plan.prefix) and
+        eq(admission.vm_size, plan.vm_size) and
+        admission.serial_mode == plan.serial_mode and
+        admission.runtime_seconds == plan.runtime_seconds and
+        admission.cleanup_seconds == plan.cleanup_seconds and
+        admission.operation_seconds == plan.operation_seconds and
+        admission.poll_seconds == plan.poll_seconds and
+        eq(admission.source_revision, plan.source_revision) and
+        eq(admission.source_tree, plan.source_tree) and
+        sameRun(admission.run, plan.run) and
+        sameIdentity(admission.identity, plan.identity) and
+        sameLineage(admission.lineage, plan.lineage) and
+        same(admission.candidate, plan.candidate) and
+        same(admission.bundle, plan.bundle) and
+        same(admission.public_bundle, plan.public_bundle) and
+        same(admission.transport, plan.transport) and
+        same(admission.qcow2, plan.qcow2) and
+        same(admission.os_vhd, plan.os_vhd) and
+        admission.vhd_bytes == plan.vhd_bytes and
+        admission.vhd_capacity_bytes == plan.vhd_capacity_bytes and
+        eq(admission.artifact_id, plan.artifact_id) and
+        eq(admission.inner_zip_sha256, plan.inner_zip_sha256) and
+        eq(admission.container_digest, plan.container_digest) and
+        std.meta.eql(admission.resources, plan.resources) and
+        admission.retry_count == plan.retry_count and
+        std.meta.eql(admission.substitution, plan.substitution) and
+        std.meta.eql(admission.cleanup, plan.cleanup) and
+        std.meta.eql(admission.cost, plan.cost) and
+        sameTools(admission.tools, plan.tools);
+}
+
+fn commonPlan(
+    attempt_id: []const u8,
+    campaign_id: []const u8,
+    ledger_path: []const u8,
+    subscription: []const u8,
+    location: []const u8,
+    resource_prefix: []const u8,
+    vm_size: []const u8,
+    serial_mode: SerialMode,
+    runtime_seconds: u32,
+    cleanup_seconds: u32,
+    operation_seconds: u32,
+    poll_seconds: u32,
+    source_revision: []const u8,
+    source_tree: []const u8,
+    run: RunIdentity,
+    identity: Identity,
+    lineage: Lineage,
+    candidate: Artifact,
+    bundle: Artifact,
+    public_bundle: Artifact,
+    transport: Artifact,
+    qcow2: Artifact,
+    os_vhd: Artifact,
+    vhd_bytes: u64,
+    vhd_capacity_bytes: u64,
+    artifact_id: []const u8,
+    inner_zip_sha256: []const u8,
+    container_digest: []const u8,
+    resources: Resources,
+    retry_count: u8,
+    substitution: Substitution,
+    cleanup: CleanupPolicy,
+    cost: Cost,
+    tools: Tools,
+) !void {
+    try uuid(attempt_id);
+    try uuid(campaign_id);
+    try files.absoluteFilePath(ledger_path);
+    try uuid(subscription);
+    if (!eq(location, "northeurope") or !eq(vm_size, "Standard_D2s_v5"))
+        return error.InvalidTopology;
+    if (resource_prefix.len < 6 or resource_prefix.len > 32) return error.InvalidPrefix;
+    for (resource_prefix) |byte|
+        if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and byte != '-')
+            return error.InvalidPrefix;
+    if (serial_mode != .azure_cumulative or
+        runtime_seconds < 60 or runtime_seconds > 3600 or
+        cleanup_seconds < 60 or cleanup_seconds > 1800 or
+        operation_seconds < 10 or operation_seconds > 600 or
+        poll_seconds < 1 or poll_seconds > 30)
+        return error.InvalidBudget;
+    try hex(source_revision, 40);
+    try hex(source_tree, 40);
+    if (!eq(run.repository, "cataggar/unikraft")) return error.InvalidIdentity;
+    try decimal(run.run_id);
+    try decimal(run.run_attempt);
+    if (!eq(identity.wamr_revision, sdk)) return error.WrongSdk;
+    inline for (std.meta.fields(Identity)) |member| {
+        if (comptime !eq(member.name, "wamr_revision")) {
+            _ = try c.parseSha256(@field(identity, member.name));
+        }
+    }
+    inline for (std.meta.fields(Lineage)) |member| {
+        _ = try c.parseSha256(@field(lineage, member.name));
+    }
+    inline for (.{ candidate, bundle, public_bundle, transport, qcow2, os_vhd }) |item| {
+        try artifact(item);
+    }
+    if (vhd_bytes != os_vhd.size or vhd_bytes != fixed_vhd_bytes or
+        vhd_capacity_bytes != fixed_vhd_capacity_bytes or
+        resources.vm_count != 1 or resources.os_disk_count != 1 or
+        resources.data_disk_count != 0 or resources.public_ip_count != 0 or
+        resources.boot_count != 2 or resources.maximum_parallelism != 1 or
+        resources.generation != 2 or resources.os_disk_sku != .StandardSSD_LRS or
+        resources.os_disk_capacity_bytes != fixed_vhd_capacity_bytes or
+        resources.network != .private_no_default_outbound)
+        return error.InvalidTopology;
+    if (retry_count != 0 or substitution.source or substitution.image or
+        substitution.topology or substitution.workload)
+        return error.SubstitutionForbidden;
+    if (!cleanup.exact_owned_resources_only or !cleanup.delete_owned_resource_group or
+        !cleanup.independent_absence_observation or cleanup.replacement_resources)
+        return error.InvalidCleanupPolicy;
+    if (artifact_id.len == 0 or artifact_id.len > 20 or artifact_id[0] == '0')
+        return error.InvalidIdentity;
+    for (artifact_id) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidIdentity;
+    try hex(inner_zip_sha256, 64);
+    try hex(container_digest, 64);
+    if (cost.unit != .micro_usd or
+        !eq(@tagName(cost.policy), cost_policy) or
+        cost.estimated_upper_bound != try recomputeCost(resources, runtime_seconds, cleanup_seconds) or
+        cost.estimated_upper_bound == 0 or cost.maximum_authorized == 0 or
+        cost.maximum_authorized < cost.estimated_upper_bound or
+        cost.repository_policy_maximum != repository_maximum_cost_microusd or
+        cost.maximum_authorized > cost.repository_policy_maximum)
+        return error.InvalidCostAuthorization;
+    inline for (std.meta.fields(Tools)) |member| {
+        const item = @field(tools, member.name);
+        try artifact(item);
+        if (item.size == 0 or item.size > 64 * 1024 * 1024)
+            return error.InvalidTool;
+    }
+}
+
+pub fn recomputeCost(resources: Resources, runtime_seconds: u32, cleanup_seconds: u32) !u64 {
+    const total_seconds = try std.math.add(u64, runtime_seconds, cleanup_seconds);
+    const hours = (try std.math.add(u64, total_seconds, 3599)) / 3600;
+    const vm = try std.math.mul(u64, resources.vm_count, vm_hour_microusd);
+    const disk = try std.math.mul(u64, resources.os_disk_count, os_disk_hour_microusd);
+    const hourly = try std.math.add(u64, vm, disk);
+    return std.math.add(u64, fixed_overhead_microusd, try std.math.mul(u64, hours, hourly));
+}
+
+fn boundedAuthorityText(value: []const u8, minimum: usize, maximum: usize) !void {
+    if (value.len < minimum or value.len > maximum) return error.InvalidAuthorityField;
+    for (value) |byte|
+        if (byte < 0x20 or byte == 0x7f) return error.InvalidAuthorityField;
 }
 fn artifact(item: Artifact) !void {
     try files.absoluteFilePath(item.path);

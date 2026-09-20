@@ -211,8 +211,12 @@ pub const References = struct {
 
     pub fn capture(io: std.Io, scope: Scope, az: []const u8, uploader: []const u8, validator: []const u8) !References {
         var artifacts: [profile.artifacts.len]Reference = undefined;
-        inline for (profile.artifacts, 0..) |name, i|
-            artifacts[i] = try Reference.artifact(io, @field(scope, name), if (comptime std.mem.startsWith(u8, name, "seed_")) .private else .artifact);
+        inline for (profile.artifacts, 0..) |name, i| {
+            const policy: files.FilePolicy = if (comptime std.mem.startsWith(u8, name, "seed_") or
+                std.mem.eql(u8, name, "plan") or std.mem.eql(u8, name, "authorization") or
+                std.mem.eql(u8, name, "candidate")) .private else .artifact;
+            artifacts[i] = try Reference.artifact(io, @field(scope, name), policy);
+        }
         return .{
             .artifacts = artifacts,
             .tools = .{ try Reference.tool(io, az), try Reference.tool(io, uploader), try Reference.tool(io, validator) },
@@ -225,6 +229,34 @@ pub const References = struct {
         if (self.interpreter) |reference| try reference.verify(io);
     }
 };
+
+pub fn checkEligibility(io: std.Io, scope: Scope, ledger_path: []const u8) !void {
+    const ledger = files.Directory.open(io, ledger_path) catch |err| switch (err) {
+        error.FileNotFound => return error.CampaignLedgerMissing,
+        else => return err,
+    };
+    defer ledger.close(io);
+    try validatePrivateDirectory(ledger.dir);
+    var buffer: [128]u8 = undefined;
+    const attempt_name = try std.fmt.bufPrint(&buffer, "attempt-{s}", .{scope.attempt_id});
+    try requireAbsentDirectory(io, ledger.dir, attempt_name);
+    const identity_name = if (profile.compute)
+        try std.fmt.bufPrint(&buffer, "compute-{s}", .{scope.source_tree})
+    else
+        try std.fmt.bufPrint(&buffer, "{s}-{s}", .{ scope.run_id, scope.disk_id });
+    try requireAbsentDirectory(io, ledger.dir, identity_name);
+    const digest_name = try std.fmt.bufPrint(&buffer, "sha256-{s}", .{if (profile.compute) scope.os_vhd.sha256 else scope.seed_vhd.sha256});
+    try requireAbsentDirectory(io, ledger.dir, digest_name);
+}
+
+fn requireAbsentDirectory(io: std.Io, directory: std.Io.Dir, name: []const u8) !void {
+    const found = directory.openDir(io, name, .{ .follow_symlinks = false, .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    found.close(io);
+    return error.PathAlreadyExists;
+}
 
 pub const FileSnapshot = struct {
     metadata: files.Snapshot,
