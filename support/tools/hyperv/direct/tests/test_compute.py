@@ -11,6 +11,8 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
+import sysconfig
 import time
 import types
 import unittest
@@ -42,6 +44,16 @@ public_spec.loader.exec_module(public_bundle)
 def write(path, value):
     path.write_bytes(value if isinstance(value, bytes) else json.dumps(value).encode())
     path.chmod(0o600)
+
+
+def remove_sealed_tree(path):
+    if not path.exists():
+        return
+    for current, directories, _ in os.walk(path):
+        Path(current).chmod(0o700)
+        for name in directories:
+            (Path(current) / name).chmod(0o700)
+    shutil.rmtree(path)
 
 
 def read(path):
@@ -223,7 +235,8 @@ class Compute(unittest.TestCase):
                 self.assertEqual(stream.read(4), b"\x7fELF")
         self.root = REPO / ".d" / ("compute-fixture-" + uuid.uuid4().hex)
         self.root.mkdir(mode=0o700)
-        self.addCleanup(shutil.rmtree, self.root)
+        self.addCleanup(remove_sealed_tree, self.root)
+        self.prepared_azure_runtime = None
         now = int(time.time())
         self.scope = dict(
             schema="uk.wamr.direct-compute", version=1, purpose="tiny-aot-two-boot",
@@ -240,6 +253,64 @@ class Compute(unittest.TestCase):
             bundle=dict(path=str(self.root / "bundle.json"), size=1, sha256="a" * 64))
         self.scope_path = self.root / "scope.json"
         write(self.scope_path, self.scope)
+
+    def azure_runtime(self):
+        if self.prepared_azure_runtime is not None:
+            return self.prepared_azure_runtime
+        launcher = self.root / "preflight-azure-source"
+        launcher.write_text(
+            "#!/usr/bin/python3\n"
+            "import os, sys\n"
+            "for key in ('AZ_PYTHON', 'PYTHONPATH', 'PYTHONSTARTUP',"
+            " 'PYTHONUSERBASE', 'LD_PRELOAD', 'LD_LIBRARY_PATH'):\n"
+            " if key in os.environ: raise SystemExit(31)\n"
+            "if os.environ.get('PYTHONDONTWRITEBYTECODE') != '1':"
+            " raise SystemExit(32)\n"
+            "extension_dir = os.environ.get('AZURE_EXTENSION_DIR', '')\n"
+            "if (os.environ.get('AZURE_EXTENSION_USE_DYNAMIC_INSTALL') != 'no'"
+            " or not os.path.isdir(extension_dir)"
+            " or os.listdir(extension_dir)):\n"
+            " raise SystemExit(34)\n"
+            "if os.path.exists(os.path.join(os.environ['HOME'],"
+            " 'expect-descriptor')) and not __file__.startswith("
+            "'/proc/self/fd/'):\n"
+            " raise SystemExit(33)\n"
+            "control = os.path.join(os.environ['HOME'], 'cli-version-control')\n"
+            "try:\n"
+            " fd = os.open(control, os.O_RDONLY)\n"
+            " try:\n"
+            "  value = os.read(fd, 64)\n"
+            " finally:\n"
+            "  os.close(fd)\n"
+            "except FileNotFoundError:\n"
+            " value = b''\n"
+            "if value == b'fail':\n"
+            " raise SystemExit(29)\n"
+            "if value == b'malformed':\n"
+            " print('{')\n"
+            " raise SystemExit(0)\n"
+            "print('{\"azure-cli\":\"2.75.0\","
+            "\"azure-cli-core\":\"2.75.0\","
+            "\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}')\n")
+        launcher.chmod(0o700)
+        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        stdlib = self.root / "preflight-stdlib" / version
+        stdlib.mkdir(parents=True, mode=0o700)
+        shutil.copytree(
+            Path(sysconfig.get_path("stdlib")) / "encodings",
+            stdlib / "encodings")
+        output = self.root / "preflight-azure-runtime"
+        handoff.prepare_azure_runtime(
+            output, launcher, Path(sys.executable).resolve(strict=True),
+            stdlib, validator=VALIDATOR)
+        (self.root / "expect-descriptor").write_text("required\n")
+        value = read(output / "azure-runtime.json")
+        self.prepared_azure_runtime = (
+            Path(value["launcher"]["path"]),
+            Path(value["interpreter"]["path"]),
+            output / "azure-runtime.json",
+        )
+        return self.prepared_azure_runtime
 
     def validate(self, command, *args, status=0):
         completed = subprocess.run(
@@ -504,24 +575,37 @@ class Compute(unittest.TestCase):
 
     def test_production_standalone_preflight_never_needs_attempt_or_ledger(self):
         fixture = TOOLS / "hyperv-direct-runtime-fixture"
+        azure, interpreter, closure = self.azure_runtime()
         with fixture.open("rb") as stream:
             self.assertEqual(stream.read(4), b"\x7fELF")
         for name in ("uk-wamr-direct-compute", "uk-hyperv-direct-two-boot"):
             for python in (False, True):
                 capture = self.root / (name + str(python))
                 capture.mkdir(mode=0o700)
-                args = [TOOLS / name, "preflight", capture, fixture]
-                if python:
-                    args += ["--az-python", fixture]
-                env = dict.fromkeys(("AZ_PYTHON", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
-                                     "LD_PRELOAD", "LD_LIBRARY_PATH", "PATH"), "/never/inherit")
+                if name == "uk-wamr-direct-compute":
+                    args = [
+                        TOOLS / name, "preflight", capture, azure,
+                        "--az-python", interpreter,
+                        "--azure-runtime", closure,
+                    ]
+                else:
+                    args = [TOOLS / name, "preflight", capture, fixture]
+                    if python:
+                        args += ["--az-python", fixture]
+                env = dict.fromkeys((
+                    "AZ_PYTHON", "PYTHONPATH", "PYTHONHOME",
+                    "PYTHONSTARTUP", "PYTHONUSERBASE", "LD_PRELOAD",
+                    "LD_LIBRARY_PATH", "PATH"), "/never/inherit")
                 # Loader hooks cannot be supplied to the controller executable
                 # itself; native Environment tests cover their removal directly.
                 del env["LD_PRELOAD"]
                 del env["LD_LIBRARY_PATH"]
                 env["HOME"] = str(self.root)
                 completed = subprocess.run(args, env=env, capture_output=True, timeout=10)
-                expected = python or name == "uk-hyperv-direct-two-boot"
+                expected = (
+                    name == "uk-wamr-direct-compute"
+                    or python
+                    or name == "uk-hyperv-direct-two-boot")
                 self.assertEqual(completed.returncode == 0, expected, completed.stderr)
                 if not expected:
                     self.assertEqual(set(capture.iterdir()), set())
@@ -534,15 +618,14 @@ class Compute(unittest.TestCase):
         self.assertFalse((self.root / "ledger").exists())
 
     def test_standalone_preserves_child_and_recording_failures(self):
-        fixture = self.root / "cli-version-exit29"
-        shutil.copyfile(TOOLS / "hyperv-direct-runtime-fixture", fixture)
-        fixture.chmod(0o700)
+        azure, interpreter, closure = self.azure_runtime()
+        write(self.root / "cli-version-control", b"fail")
         capture = self.root / "preflight-capture"
         capture.mkdir(mode=0o700)
         write(capture / "cli-version.process.json", b"existing immutable record")
         completed = subprocess.run(
-            [TOOLS / "uk-wamr-direct-compute", "preflight", capture, fixture,
-             "--az-python", fixture],
+            [TOOLS / "uk-wamr-direct-compute", "preflight", capture, azure,
+             "--az-python", interpreter, "--azure-runtime", closure],
             env={"HOME": str(self.root)}, capture_output=True, timeout=10)
         self.assertEqual(completed.returncode, 29)
         status = json.loads(completed.stderr)
@@ -554,15 +637,17 @@ class Compute(unittest.TestCase):
         self.assertEqual((capture / "cli-version.process.json").read_bytes(), b"existing immutable record")
 
     def test_required_interpreter_is_not_recovered_from_ambient_variable(self):
+        azure, interpreter, closure = self.azure_runtime()
         fixture = self.root / "requires-python"
-        shutil.copyfile(TOOLS / "hyperv-direct-runtime-fixture", fixture)
-        fixture.chmod(0o700)
         for explicit in (False, True):
             capture = self.root / ("required-python" + str(explicit))
             capture.mkdir(mode=0o700)
-            args = [TOOLS / "uk-wamr-direct-compute", "preflight", capture, fixture]
+            args = [TOOLS / "uk-wamr-direct-compute", "preflight", capture, azure]
             if explicit:
-                args += ["--az-python", TOOLS / "hyperv-direct-runtime-fixture"]
+                args += [
+                    "--az-python", interpreter,
+                    "--azure-runtime", closure,
+                ]
             completed = subprocess.run(args, env={"HOME": str(self.root), "AZ_PYTHON": str(fixture)},
                                        capture_output=True, timeout=10)
             self.assertEqual(completed.returncode == 0, explicit, completed.stderr)
@@ -570,6 +655,54 @@ class Compute(unittest.TestCase):
                 self.assertIn(b"reason=InvalidArguments", completed.stderr)
         self.assertFalse((self.root / "attempt").exists())
         self.assertFalse((self.root / "ledger").exists())
+
+    def test_runtime_preparation_rejects_hooks_links_and_limit_overflow(self):
+        self.azure_runtime()
+        launcher = self.root / "preflight-azure-source"
+        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        source = self.root / "preflight-stdlib" / version
+
+        def prepare(name, mutate, patches=()):
+            stdlib = self.root / (name + "-stdlib") / version
+            shutil.copytree(source, stdlib)
+            mutate(stdlib)
+            output = self.root / (name + "-runtime")
+            with contextlib.ExitStack() as stack:
+                for field, value in patches:
+                    stack.enter_context(
+                        mock.patch.object(handoff, field, value))
+                with self.assertRaises(handoff.ci.Refusal):
+                    handoff.prepare_azure_runtime(
+                        output,
+                        launcher,
+                        Path(sys.executable).resolve(strict=True),
+                        stdlib,
+                        validator=VALIDATOR)
+
+        for name in (
+                "startup.pth", "sitecustomize.py", "usercustomize.py"):
+            with self.subTest(name=name):
+                prepare(
+                    name.replace(".", "-"),
+                    lambda stdlib, name=name: (
+                        stdlib / "encodings" / name).write_text(
+                            "raise RuntimeError('unapproved startup hook')\n"))
+        prepare(
+            "source-symlink",
+            lambda stdlib: (
+                stdlib / "encodings" / "linked.py").symlink_to(
+                    "__init__.py"))
+
+        def hardlink(stdlib):
+            os.link(
+                stdlib / "encodings/__init__.py",
+                stdlib / "encodings/linked.py")
+
+        prepare("source-hardlink", hardlink)
+        prepare(
+            "file-limit",
+            lambda _: None,
+            (("AZURE_RUNTIME_MAX_FILES", 1),))
 
     def test_cumulative_identical_boot_output_requires_two_real_frames(self):
         self.scope["serial_mode"] = "azure_cumulative"
@@ -586,7 +719,7 @@ class Compute(unittest.TestCase):
 
     def test_cumulative_cached_first_only_expires_without_boot2_evidence(self):
         self.scope["serial_mode"] = "azure_cumulative"
-        self.scope["approval"]["expires_unix"] = int(time.time()) + 5
+        self.scope["approval"]["expires_unix"] = int(time.time()) + 15
         write(self.scope_path, self.scope)
         deterministic = serial()
         completed, outcome, *_ = self.lifecycle(

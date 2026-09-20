@@ -41,6 +41,8 @@ pub const Options = struct {
     stdout_limit: usize = 64 * 1024,
     stderr_limit: usize = 64 * 1024,
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// One already retained read-only descriptor deliberately survives exec.
+    inherited_descriptor: ?linux.fd_t = null,
 };
 
 pub const Result = struct {
@@ -1470,6 +1472,8 @@ fn validateOptions(options: Options, maximum: usize) !void {
         options.stdout_limit > maximum or options.stderr_limit > maximum or
         options.cleanup_ms < 100 or options.cleanup_ms > 30 * 60 * 1000)
         return error.InvalidOptions;
+    if (options.inherited_descriptor) |descriptor|
+        if (descriptor <= 2) return error.InvalidOptions;
     var argument_bytes: usize = 0;
     for (options.argv) |arg| {
         if (arg.len > 64 * 1024 or std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidOptions;
@@ -3062,6 +3066,9 @@ fn spawnOwned(
         // are shifted by one. Preserve only stdio at exec, including private locks.
         if (linux.errno(linux.close_range(3, std.math.maxInt(linux.fd_t), @bitCast(@as(u32, 1 << 2)))) != .SUCCESS)
             childFailure(control[1], 1);
+        if (options.inherited_descriptor) |descriptor|
+            if (linux.errno(linux.fcntl(descriptor, linux.F.SETFD, 0)) != .SUCCESS)
+                childFailure(control[1], 1);
         if (gate) |pair| childCommandGate(pair[1], control[1], gate_fault);
         if (executable) |descriptor| {
             const executed = linux.execveat(descriptor, "", argv.ptr, environment.slice.ptr, .{

@@ -405,8 +405,18 @@ promote this lane's local result to cloud acceptance. For an imported
 version-2 public-source bundle, `handoff.py plan` now creates the separate
 canonical private `uk.wamr.azure-execution-plan` version 2 and pending
 approval template. The plan remains unapproved and requires explicit
-validator, supervisor, Azure CLI, transfer and interpreter paths plus a
-finite integer micro-USD maximum. It also binds a campaign UUID, unique
+validator, supervisor, transfer and prepared Azure runtime paths plus a
+finite integer micro-USD maximum. Before plan generation,
+`handoff.py prepare-azure-runtime` must create a fresh private closure from a
+reviewed Python bootstrap, explicit Python ELF, standard-library tree and at
+least one repeated `--package-root` import root. Optional repeated data roots
+and explicit native dependencies are copied/bound during that authority-free
+preparation; there is no package restore after custody. The closure document
+binds exact launcher/interpreter/manifest artifacts, all module/data/native
+files, loader dependencies, parent and physical metadata, counts/bytes/depth,
+fixed limits and the isolated `-s -S -B -P` policy. It rejects links, special
+files, unsafe modes/parents and Python startup hooks. The plan also binds a
+campaign UUID, unique
 ledger UUID, retained directory identity, bounded legacy pre-state digest,
 expected marker digest and an explicit `initialization_required` decision.
 Planning never mutates the ledger. A legacy marker is created durably only
@@ -420,10 +430,11 @@ Admission and every explicit tool path use canonical descriptor-relative
 no-follow custody. The controller retains the admission bytes, stores only
 that exact scope, rehashes the copy, and rechecks tool parents, mode, link,
 inode and content before attempt/backend work. Retained native ELF tools run
-through descriptor snapshots; the Azure script/module and retained explicit
-interpreter are revalidated around every call. Script/module-root custody
-targets accidental persistent on-disk drift, not a privileged actor capable
-of changing module bytes only during a child invocation.
+through descriptor snapshots. Azure calls execute only the retained Python
+ELF through `execveat`, with the retained bootstrap inherited as
+`/proc/self/fd/N`. The entire approved runtime closure is rehashed before and
+after every Azure consumer and final cleanup/absence observation. This targets
+persistent drift at each boundary, not hostile same-UID continuous isolation.
 
 See [WAMR direct compute](../../azure/WAMR-DIRECT-COMPUTE.md) for the private
 export, independent native revalidation, explicit authorization recording,
