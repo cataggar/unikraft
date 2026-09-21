@@ -111,14 +111,6 @@ jobs:
           echo "Runner CPU model: ${model:-unknown}"
           echo "Zig native CPU: ${zig_cpu}"
           echo "Off-runner reproduction requires -Dcpu=${zig_cpu}"
-          {
-            echo "### Native build CPU"
-            echo
-            echo "- Runner CPU model: \`${model:-unknown}\`"
-            echo "- Zig native CPU: \`${zig_cpu}\`"
-            echo "- Reproduce these native bytes off-runner with" \
-              "\`-Dcpu=${zig_cpu}\`"
-          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Acquire the existing native LLVM distribution
         uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
