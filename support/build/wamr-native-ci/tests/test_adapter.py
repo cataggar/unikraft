@@ -3643,12 +3643,19 @@ source/generated/
                 ci.decoded_supervisor_result(
                     ci.canonical_json(changed), fast_request, expected)
 
-        timeout_raw, timeout_request = invoke(
-            ["partial"], primary_ms=50, stream_limit=128)
-        timeout, unused_stdout, unused_stderr = (
+        # This case needs a released child, not a deadline exhausted while
+        # hashing its executable on a CPU without hardware SHA acceleration.
+        timeout_raw, timeout_request = invoke(["partial"], stream_limit=128)
+        timeout, timeout_stdout, timeout_stderr = (
             ci.decoded_supervisor_result(
                 timeout_raw, timeout_request, expected))
-        del unused_stdout, unused_stderr
+        self.assertEqual(
+            timeout_stdout, b"private-stdout?sig=synthetic-secret\n")
+        self.assertEqual(
+            timeout_stderr, b"private-stderr?sig=synthetic-secret\n")
+        self.assertEqual(timeout["command"]["cleanup"], "complete")
+        self.assertTrue(timeout["command"]["cleanup_complete"])
+        self.assertEqual(timeout["command"]["termination"]["kind"], "signal")
         self.assertEqual(
             timeout["command"]["primary"],
             {"code": None, "kind": "timeout"})
