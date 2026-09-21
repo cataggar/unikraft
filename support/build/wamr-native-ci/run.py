@@ -38,6 +38,9 @@ SIX_MODES = (
     "vpc-x2apic", "vpc-legacy-apic",
 )
 CURRENT_PROFILE = "qcow2-derived-vhd"
+RECORDED_EXECUTABLE_TARGET = (
+    "-Dtarget=x86_64-linux-gnu", "-Dcpu=x86_64_v2",
+)
 PRODUCTION_COMMAND_STAGES = frozenset({
     "adapter", "local-boot-tool", "fixtures", "prepare", "config",
     "native-image", "package", *SIX_MODES, "finalize-qcow2",
@@ -2760,6 +2763,8 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
                 command_path("work", "global-cache"),
                 command_literal("--prefix"),
                 command_path("work", "public-source/tools"),
+                *(command_literal(value)
+                  for value in RECORDED_EXECUTABLE_TARGET),
                 command_literal("-Doptimize=ReleaseSafe"),
                 command_literal("-j2"),
                 command_literal("install"),
@@ -4448,6 +4453,7 @@ def build_command_supervisor(runtime, root, packages, expected_inputs):
         tool("zig"), "build", "--build-file", HERE / "supervisor.build.zig",
         "--system", packages, "--prefix", root / "supervisor",
         "-Dsource-closure-sha256=" + source_map["content_closure_sha256"],
+        *RECORDED_EXECUTABLE_TARGET,
         "-Doptimize=ReleaseSafe", "-j2", "install",
     ], 900, evidence=False, input_records=records, allow_bootstrap=True)
     require(command["known_error_markers"] == [],

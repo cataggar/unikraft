@@ -2614,6 +2614,73 @@ source/generated/
                 (HERE / relative).read_text(),
             )
 
+    def test_supervisor_build_pins_portable_target(self):
+        target = ("-Dtarget=x86_64-linux-gnu", "-Dcpu=x86_64_v2")
+        self.assertEqual(ci.RECORDED_EXECUTABLE_TARGET, target)
+        with mock.patch.object(
+                ci, "supervisor_source_map",
+                return_value={"content_closure_sha256": "1" * 64}), \
+                mock.patch.object(ci, "consumer_file_records"), \
+                mock.patch.object(ci, "require_consumer_inputs"), \
+                mock.patch.object(ci, "tool", return_value="/tools/zig"), \
+                mock.patch.object(
+                    ci, "execute", side_effect=RuntimeError("build captured")) as execute:
+            with self.assertRaisesRegex(RuntimeError, "build captured"):
+                ci.build_command_supervisor(
+                    self.root, self.root, self.root / "packages", {})
+        args = execute.call_args.args[2]
+        self.assertEqual(
+            [arg for arg in args if str(arg).startswith(("-Dtarget=", "-Dcpu="))],
+            list(target),
+        )
+        self.assertIn("-Doptimize=ReleaseSafe", args)
+
+    def test_public_validator_build_and_contract_pin_portable_target(self):
+        target = ("-Dtarget=x86_64-linux-gnu", "-Dcpu=x86_64_v2")
+        runtime = self.root / "runtime"
+        (self.root / ".d").mkdir(mode=0o700)
+        handoff = types.SimpleNamespace(
+            ci=ci, result_records=mock.Mock(), private=mock.Mock())
+        with mock.patch.object(ci, "REPO", self.root), \
+                mock.patch.object(ci, "tool", return_value="/tools/zig"), \
+                mock.patch.object(ci, "consumer_file_records"), \
+                mock.patch.object(
+                    ci, "read", return_value=b"primary=0 cleanup=0\n"), \
+                mock.patch.object(public_bundle, "ci_runtime", return_value=runtime), \
+                mock.patch.object(
+                    public_bundle, "accepted_public_build_start",
+                    return_value={"consumer_inputs": {}}), \
+                mock.patch.object(public_bundle, "ci_context"), \
+                mock.patch.object(
+                    ci, "execute", side_effect=RuntimeError("build captured")) as execute:
+            with self.assertRaisesRegex(RuntimeError, "build captured"):
+                public_bundle.publish_ci(handoff)
+        args = execute.call_args.args[2]
+        self.assertEqual(
+            [arg for arg in args if str(arg).startswith(("-Dtarget=", "-Dcpu="))],
+            list(target),
+        )
+        self.assertIn("-Doptimize=ReleaseSafe", args)
+        record, identities = self.supervised_binding("public-validator-build")
+        argv = record["supervisor"]["request"]["argv"]
+        for flag in target:
+            self.assertIn(ci.command_literal(flag), argv)
+            for replacement in ("-Dcpu=native", "-Dcpu=x86_64_v3",
+                                "-Dtarget=aarch64-linux-gnu", None):
+                with self.subTest(flag=flag, replacement=replacement):
+                    changed = copy.deepcopy(record)
+                    changed_argv = changed["supervisor"]["request"]["argv"]
+                    index = changed_argv.index(ci.command_literal(flag))
+                    if replacement is None:
+                        changed_argv.pop(index)
+                    else:
+                        changed_argv[index] = ci.command_literal(replacement)
+                    self.rehash_supervised_binding(changed)
+                    with self.assertRaises(ValueError):
+                        public_bundle.supervised_command_record(
+                            ci, changed, "public-validator-build", identities,
+                            "trusted_inner_zip")
+
     def test_public_command_binding_rehash_and_stage_substitution_are_closed(self):
         record, identities = self.supervised_binding(
             "public-validator-build")

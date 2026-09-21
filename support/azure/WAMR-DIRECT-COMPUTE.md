@@ -105,15 +105,19 @@ WAMR_CI_SUPERVISOR="$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
   python3 -m unittest discover -s support/tools/hyperv/direct/tests -v
 ```
 
-The supervisor the importer later accepts is the one the native compute lane
-built **natively on its runner**, so its exact bytes depend on that runner's
-CPU. The build above targets the local machine and reproduces those bytes only
-on an identical host. To rebuild the accepted executable elsewhere, read the
-`Zig native CPU` line the selected `wamr-native-compute` run logs and add its
-value as `-Dcpu=` together with `-Dtarget=x86_64-linux-gnu`. Importing,
-planning, admitting and running still require an x86-64 operator host, because
-those steps execute the recorded x86-64 validator and supervisor rather than
-merely comparing their bytes.
+The commands above build host-native tools for offline fixtures, including
+aarch64. For production, the native compute lane explicitly builds the recorded
+supervisor and public validator with
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2`, independent of the runner CPU.
+Use those same flags when rebuilding them from the selected source with the
+pinned Zig compiler, source-closure digest and `ReleaseSafe` optimization.
+The workflow logs both the runner's native CPU and the recorded executable
+target. Older runs without this pin still require their logged native CPU
+as `-Dcpu=` to reproduce the accepted bytes; the pin does not change existing
+bundles. Importing, planning, admitting and running require an x86-64 operator
+host supporting the selected baseline, because those steps execute the
+recorded supervisor and local validator rather than merely comparing bytes.
+`x86_64_v2` does not imply support for every historical x86-64 CPU.
 
 Only `compute-fixture-tools` installs the **non-production** fixture
 controller/backend. They reuse the existing native fake CLI and its confined
