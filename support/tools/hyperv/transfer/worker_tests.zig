@@ -725,6 +725,61 @@ test "installed CLI exposes supervised transfers and refuses unsupervised worker
     try noChildren();
 }
 
+test "sealed production CLI reexecutes its worker without a pathname or network request" {
+    for ([_]core.transfer.job.Kind{ .blob, .pages }) |kind| {
+        const fixture = try Fixture.init("pass", kind, 512, false, 5000);
+        defer fixture.deinit();
+        try fixture.put("source", &([_]u8{0} ** 512));
+        try fixture.directory.dir.createDir(io, "capture", .fromMode(0o700));
+        const capture_dir: core.private_files.Directory = .{
+            .dir = try fixture.directory.dir.openDir(io, "capture", .{
+                .follow_symlinks = false,
+                .iterate = true,
+            }),
+        };
+        defer capture_dir.close(io);
+        var lock = try capture_dir.lock(io);
+        defer lock.close(io);
+        const path = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+        defer allocator.free(path);
+        const executable = try core.process.Executable.open(io, path);
+        defer executable.close(io);
+        var environment = std.process.Environ.Map.init(allocator);
+        defer environment.deinit();
+        try core.process.initialize();
+        const child = try core.process.runPrivate(allocator, io, &lock, "stdout.json", "stderr", .{
+            .process = .{
+                .argv = &.{ "/not/a/reusable/executable", "transfer", fixture.path, "job.json" },
+                .cwd = fixture.directory.dir,
+                .environment = &environment,
+                .deadline = try core.process.Deadline.afterMilliseconds(10000),
+                .cleanup_ms = 3000,
+                .stdout_limit = protocol.maximum_result,
+                .stderr_limit = 4096,
+            },
+            .executable = executable,
+            .term_grace_ms = 1000,
+            .nested_supervisor = true,
+        });
+        try testing.expect(child.execution.cleanup_complete);
+        try testing.expectEqual(@as(u8, 1), child.execution.termination.?.exited);
+        const intent = try protocol.Intent.load(allocator, io, fixture.directory);
+        var captured = try capture_dir.readSensitive(io, allocator, "stdout.json", protocol.maximum_result, null);
+        defer captured.deinit();
+        const report = try protocol.Report.parse(allocator, captured.bytes(), intent);
+        try testing.expectEqual(.finished, report.phase);
+        try testing.expect(report.delivery_complete);
+        try testing.expectEqual(true, report.process_cleanup_complete.?);
+        try testing.expectEqual(.not_started, report.side_effect);
+        try testing.expectEqual(@as(u64, 0), report.progress.?.requests_attempted);
+        try testing.expectEqual(.input_hash, report.outcome.?.diagnostic.stage);
+        try testing.expectEqual(.input_changed, report.outcome.?.diagnostic.category);
+        try safeReport(report);
+        _ = try fixture.directory.dir.statFile(io, core.transfer.job.started_name, .{});
+        try noChildren();
+    }
+}
+
 test "invalid private jobs and unsafe SAS modes fail before child execution" {
     for ([_][2][]const u8{
         .{ "\"schema_version\":1", "\"schema_version\":2" },
