@@ -90,6 +90,36 @@ jobs:
           ghr-version: v0.8.0
           tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
+      - name: Record the native CPU that binds this runner's build bytes
+        run: |
+          set -euo pipefail
+          model="$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo \
+            | head -n 1)"
+          probe="${RUNNER_TEMP}/native-cpu-probe.zig"
+          printf '%s\n' \
+            'const std = @import("std");' \
+            'const builtin = @import("builtin");' \
+            'pub fn main() void {' \
+            '    std.debug.print("{s}\n", .{builtin.cpu.model.name});' \
+            '}' > "${probe}"
+          zig_cpu="$(zig run "${probe}" 2>&1 | grep -oE '^[a-z0-9_]+$' | tail -n 1)"
+          rm -f "${probe}"
+          if [[ ! "${zig_cpu}" =~ ^[a-z0-9_]{2,32}$ ]]; then
+            echo "Could not resolve the Zig native CPU" >&2
+            exit 1
+          fi
+          echo "Runner CPU model: ${model:-unknown}"
+          echo "Zig native CPU: ${zig_cpu}"
+          echo "Off-runner reproduction requires -Dcpu=${zig_cpu}"
+          {
+            echo "### Native build CPU"
+            echo
+            echo "- Runner CPU model: \`${model:-unknown}\`"
+            echo "- Zig native CPU: \`${zig_cpu}\`"
+            echo "- Reproduce these native bytes off-runner with" \
+              "\`-Dcpu=${zig_cpu}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Acquire the existing native LLVM distribution
         uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
         with:
