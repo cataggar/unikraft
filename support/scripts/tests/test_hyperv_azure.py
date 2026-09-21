@@ -2767,6 +2767,69 @@ class HypervWorkflowTest(unittest.TestCase):
         ):
             self.assertIn(f"refuse {refusal}", driver)
 
+    def test_wamr_cpu_report_preserves_source_without_bytecode_environment(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
+        ).read_text()
+        step = workflow.split(
+            "      - name: Record the runner CPU and portable executable target\n",
+            1,
+        )[1].split("\n      - ", 1)[0]
+        lines = step.split("        run: |\n", 1)[1].splitlines()
+        self.assertTrue(all(not line or line.startswith(" " * 10)
+                            for line in lines))
+        script = "\n".join(line[10:] for line in lines)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = root / "source"
+            for relative in (
+                "support/build/wamr-native-ci/run.py",
+                "support/tools/hyperv/process-command-v1.json",
+            ):
+                target = repository / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(SUPPORT.parent / relative, target)
+            before = {
+                str(path.relative_to(repository)): path.read_bytes()
+                for path in repository.rglob("*") if path.is_file()
+            }
+            tools = root / "tools"
+            tools.mkdir()
+            zig = tools / "zig"
+            zig.write_text(
+                '#!/bin/sh\n'
+                'test "$1" = run && test -f "$2" || exit 1\n'
+                'printf "%s\\n" fixture_cpu\n'
+            )
+            zig.chmod(0o700)
+            (tools / "python3").symlink_to(sys.executable)
+            runner = root / "runner"
+            runner.mkdir()
+            environment = dict(os.environ)
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
+            environment["RUNNER_TEMP"] = str(runner)
+            result = subprocess.run(
+                ["bash", "-c", script], cwd=repository, env=environment,
+                text=True, capture_output=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Zig native CPU: fixture_cpu\n", result.stdout)
+            self.assertIn(
+                "Recorded supervisor/validator target: "
+                "-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2\n",
+                result.stdout,
+            )
+            self.assertEqual(
+                sorted(str(path.relative_to(repository))
+                       for path in repository.rglob("*") if path.is_file()),
+                sorted(before),
+            )
+            for relative, contents in before.items():
+                self.assertEqual((repository / relative).read_bytes(), contents)
+            self.assertEqual(list(runner.iterdir()), [])
+
     def test_wamr_public_bundle_binds_exact_redownloaded_artifact(self):
         repository = SUPPORT.parent
         workflow = (

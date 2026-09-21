@@ -114,7 +114,10 @@ pinned Zig compiler, source-closure digest and `ReleaseSafe` optimization.
 Release validator builds strip path-dependent debug data, matching the
 supervisor's stripped build; Debug validator builds retain it for diagnostics.
 The workflow logs both the runner's native CPU and the recorded executable
-target. Older runs without this pin still require their logged native CPU
+target. That source import disables Python bytecode at interpreter startup:
+setting it inside the imported module is too late to prevent a first
+`__pycache__` write, which source custody correctly refuses.
+Older runs without this pin still require their logged native CPU
 as `-Dcpu=` to reproduce the accepted bytes; the pin does not change existing
 bundles. Importing, planning, admitting and running require an x86-64 operator
 host supporting the selected baseline, because those steps execute the
