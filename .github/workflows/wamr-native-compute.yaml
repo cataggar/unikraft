@@ -90,7 +90,7 @@ jobs:
           ghr-version: v0.8.0
           tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Record the native CPU that binds this runner's build bytes
+      - name: Record the runner CPU and portable executable target
         run: |
           set -euo pipefail
           model="$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo \
@@ -110,7 +110,17 @@ jobs:
           fi
           echo "Runner CPU model: ${model:-unknown}"
           echo "Zig native CPU: ${zig_cpu}"
-          echo "Off-runner reproduction requires -Dcpu=${zig_cpu}"
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+
+          path = Path("support/build/wamr-native-ci/run.py").resolve()
+          spec = importlib.util.spec_from_file_location("wamr_native_ci", path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          print("Recorded supervisor/validator target:",
+                " ".join(module.RECORDED_EXECUTABLE_TARGET))
+          PY
 
       - name: Acquire the existing native LLVM distribution
         uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495

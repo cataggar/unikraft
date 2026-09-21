@@ -136,7 +136,15 @@ Before the clean source baseline is taken, the adapter restores the exact
 out-of-tree dependency tree and builds the internal
 `wamr-ci-supervisor` from `supervisor.build.zig`. The bootstrap inputs and the
 supervisor's exact tracked source closure are checked before and after that
-build. `build-start.json` then embeds `uk.wamr.command-supervisor` version 1:
+build. The production supervisor and public validator use the fixed
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` target with `ReleaseSafe`, not the
+runner's native microarchitecture. The validator's supervised command contract
+binds these exact flags; the supervisor's source closure binds the bootstrap
+selection. Rebuilding the same sources with the pinned Zig compiler and those
+flags therefore does not require the original runner CPU. Executing the tools
+still requires an x86-64 host with v2 support. Native offline fixture builds
+below remain host-native, including on aarch64.
+`build-start.json` then embeds `uk.wamr.command-supervisor` version 1:
 the fixed protocol version plus independently recomputed source and runtime
 maps, each with actual file/byte counts and content/physical closure SHA256
 values. The runtime map includes the supervisor ELF and its dynamic runtime;

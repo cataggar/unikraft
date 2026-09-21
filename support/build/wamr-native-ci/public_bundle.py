@@ -1643,6 +1643,7 @@ def publish_ci(handoff):
         "--cache-dir", runtime / "compute/cache",
         "--global-cache-dir", runtime / "compute/global-cache",
         "--prefix", publication / "tools",
+        *handoff.ci.RECORDED_EXECUTABLE_TARGET,
         "-Doptimize=ReleaseSafe", "-j2", "install"], 600,
         input_records=handoff.ci.consumer_file_records(
             start["consumer_inputs"]))
