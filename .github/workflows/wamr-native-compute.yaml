@@ -110,7 +110,7 @@ jobs:
           fi
           echo "Runner CPU model: ${model:-unknown}"
           echo "Zig native CPU: ${zig_cpu}"
-          python3 - <<'PY'
+          python3 -B - <<'PY'
           import importlib.util
           from pathlib import Path
 
