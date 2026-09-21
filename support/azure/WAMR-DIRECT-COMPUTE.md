@@ -109,8 +109,8 @@ The supervisor the importer later accepts is the one the native compute lane
 built **natively on its runner**, so its exact bytes depend on that runner's
 CPU. The build above targets the local machine and reproduces those bytes only
 on an identical host. To rebuild the accepted executable elsewhere, read the
-`Native build CPU` summary the selected `wamr-native-compute` run publishes and
-add its `-Dcpu=` value together with `-Dtarget=x86_64-linux-gnu`. Importing,
+`Zig native CPU` line the selected `wamr-native-compute` run logs and add its
+value as `-Dcpu=` together with `-Dtarget=x86_64-linux-gnu`. Importing,
 planning, admitting and running still require an x86-64 operator host, because
 those steps execute the recorded x86-64 validator and supervisor rather than
 merely comparing their bytes.
