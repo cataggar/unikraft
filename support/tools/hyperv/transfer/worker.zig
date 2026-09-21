@@ -100,8 +100,9 @@ fn executeChecked(allocator: std.mem.Allocator, io: std.Io, name: []const u8, ru
 }
 
 pub const SuperviseOptions = struct {
-    /// The production CLI passes its kernel-resolved executable path. Embedders
-    /// must bind this native executable to their reviewed source/binary receipt.
+    /// The production CLI uses the kernel's /proc/self/exe reference so a sealed
+    /// image needs no reusable pathname. Embedders must bind their native worker
+    /// executable to the reviewed source/binary receipt.
     executable: []const u8,
     cancel: ?*const std.atomic.Value(bool) = null,
 };
@@ -177,6 +178,7 @@ fn superviseChecked(allocator: std.mem.Allocator, io: std.Io, root: []const u8, 
     }
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
+    try core.private_files.inheritChildNamespace(&environment);
     var child = try core.process.run(allocator, io, .{
         .argv = &.{ options.executable, "__transfer-worker", name },
         .environment = &environment,

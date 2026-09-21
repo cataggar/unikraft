@@ -143,9 +143,13 @@ test "native namespace state is inherited only from authenticated controller" {
         "1001",
         environment.native.get(core.private_files.namespace_gid).?,
     );
-    try testing.expect(
-        environment.native.get(core.private_files.namespace_parent) != null,
-    );
+    try testing.expectEqual(std.os.linux.getpid(), try std.fmt.parseInt(
+        std.os.linux.pid_t,
+        environment.native.get(core.private_files.namespace_parent).?,
+        10,
+    ));
+    try testing.expectEqual(@as(usize, 5), environment.native.count());
+    try testing.expect(environment.azure.get(core.private_files.namespace_marker) == null);
     var incomplete = std.process.Environ.Map.init(allocator);
     defer incomplete.deinit();
     try incomplete.put("HOME", support.options.test_root.?);
@@ -158,6 +162,13 @@ test "native namespace state is inherited only from authenticated controller" {
         error.InvalidUserNamespace,
         runtime.Environment.init(allocator, &incomplete),
     );
+    try source.put(core.private_files.namespace_uid, "not-a-uid");
+    try testing.expectError(error.InvalidCharacter, runtime.Environment.init(allocator, &source));
+    try source.put(core.private_files.namespace_uid, "4294967296");
+    try testing.expectError(error.Overflow, runtime.Environment.init(allocator, &source));
+    try source.put(core.private_files.namespace_uid, "1000");
+    try source.put(core.private_files.namespace_marker, core.private_files.namespace_child);
+    try testing.expectError(error.InvalidUserNamespace, runtime.Environment.init(allocator, &source));
 }
 
 const namespace_stages = [_]azure_runtime.NamespaceStage{

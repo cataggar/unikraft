@@ -165,10 +165,13 @@ streaming/hash logic, not a second UID/nofollow implementation.
 `worker.supervise(allocator, io, absolute_private_directory, job_basename,
 Options{ executable, cancel? }) -> Report` is the library parent entry.
 The installed `uk-hyperv transfer PRIVATE_DIRECTORY JOB_BASENAME` calls it
-using its own absolute executable. An embedding parent must select a reviewed,
-fingerprinted native executable, not an arbitrary command. The worker's
-`executeNative` runs real Core HTTP; `execute` permits explicit library injection
-for native fixtures, never selection through production job data or environment.
+using the kernel's `/proc/self/exe` reference directly, without resolving that
+link or trusting `argv[0]`. This also works when the CLI runs from a sealed
+anonymous executable with no reusable pathname. An embedding parent must select
+a reviewed, fingerprinted native executable, not an arbitrary command. The
+worker's `executeNative` runs real Core HTTP; `execute` permits explicit library
+injection for native fixtures, never selection through production job data or
+environment.
 
 Job JSON has exactly these fields (up to 8192 bytes, strict bounded JSON):
 
@@ -189,7 +192,12 @@ Intent binds job/request/SAS hashes, exact operation plan, parent PID, monotonic
 deadline and a fresh 256-bit nonsecret attempt nonce. Outputs bind that nonce
 as well as the job hash, so identical job descriptors cannot accept an older
 attempt's report. The parent releases the lock before starting the child with
-an empty environment, `/dev/null` stdin and validated cwd. Its argv is only
+an empty environment outside a validated user namespace, `/dev/null` stdin and
+validated cwd. Inside that namespace it passes only the four namespace identity
+fields, rebinding the parent PID to the immediate supervisor. The worker
+independently verifies its parent, kernel ID maps, zero capabilities and
+no-new-privileges state; no ambient credentials, paths or loader hooks are
+inherited. Its argv is only
 `ABSOLUTE_EXECUTABLE __transfer-worker JOB_BASENAME`.
 
 The child checks intent, parent PID, deadline and every input binding, then
@@ -292,6 +300,10 @@ These fixtures verify the local subsystem, not TLS/cloud acceptance or the
 whole Python-free controller workflow. The enclosing build's `test-worker`
 selector additionally exercises real native child supervision, blocked calls,
 partial effects, malformed/stale/flooded output, strict jobs/reports, metadata,
-private input substitution, recording/cleanup failure and redaction. The parent
-still owns workflow integration, credential approval/lifetime, grant revocation,
-producer pins, CI wiring and all cloud gates.
+private input substitution, recording/cleanup failure and redaction. Both upload
+modes exercise the real production CLI from a sealed executable with an unusable
+`argv[0]`, requiring a completed worker report for a deliberate input hash mismatch
+and zero HTTP requests. Shared core fixtures cover the closed namespace identity
+handoff and immediate-parent binding. The parent still owns workflow integration,
+credential approval/lifetime, grant revocation, producer pins, CI wiring and all
+cloud gates.

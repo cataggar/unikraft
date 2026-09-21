@@ -123,28 +123,12 @@ pub const Environment = struct {
                 marker,
                 core.private_files.namespace_controller,
             )) return error.InvalidUserNamespace;
-            try result.native.put(
-                core.private_files.namespace_marker,
-                core.private_files.namespace_child,
-            );
-            inline for (.{
-                core.private_files.namespace_uid,
-                core.private_files.namespace_gid,
-            }) |key| {
-                try result.native.put(
-                    key,
-                    operator.get(key) orelse
-                        return error.InvalidUserNamespace,
-                );
-            }
-            var parent_buffer: [32]u8 = undefined;
-            try result.native.put(
-                core.private_files.namespace_parent,
-                try std.fmt.bufPrint(
-                    &parent_buffer,
-                    "{d}",
-                    .{std.os.linux.getpid()},
-                ),
+            try core.private_files.childNamespaceEnvironment(
+                &result.native,
+                try std.fmt.parseInt(u32, operator.get(core.private_files.namespace_uid) orelse
+                    return error.InvalidUserNamespace, 10),
+                try std.fmt.parseInt(u32, operator.get(core.private_files.namespace_gid) orelse
+                    return error.InvalidUserNamespace, 10),
             );
         }
         return result;

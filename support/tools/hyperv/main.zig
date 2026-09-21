@@ -46,10 +46,9 @@ fn inspect(init: std.process.Init) !void {
         var cancellation = try core.process.SignalCancellation.install();
         defer cancellation.deinit();
         var wiping: core.sensitive.Allocator = .{ .backing = std.heap.page_allocator };
-        const executable = try std.process.executablePathAlloc(init.io, wiping.allocator());
-        defer wiping.allocator().free(executable);
         const report = core.transfer.worker.supervise(wiping.allocator(), init.io, args[2], args[3], .{
-            .executable = executable,
+            // Resolving this link loses the executable name for sealed memfds.
+            .executable = "/proc/self/exe",
             .cancel = cancellation.flag(),
         });
         var buffer: [core.transfer.worker.protocol.maximum_result]u8 = undefined;

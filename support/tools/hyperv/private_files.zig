@@ -20,6 +20,29 @@ pub fn enterUserNamespace(uid: u32, gid: u32) void {
     user_namespace_active.store(true, .release);
 }
 
+/// Emit only namespace identity; the child must still authenticate it against
+/// its actual parent, kernel ID maps, capabilities and no-new-privileges state.
+pub fn childNamespaceEnvironment(
+    environment: *std.process.Environ.Map,
+    uid: u32,
+    gid: u32,
+) !void {
+    var buffer: [32]u8 = undefined;
+    try environment.put(namespace_marker, namespace_child);
+    try environment.put(namespace_uid, try std.fmt.bufPrint(&buffer, "{d}", .{uid}));
+    try environment.put(namespace_gid, try std.fmt.bufPrint(&buffer, "{d}", .{gid}));
+    try environment.put(namespace_parent, try std.fmt.bufPrint(&buffer, "{d}", .{linux.getpid()}));
+}
+
+pub fn inheritChildNamespace(environment: *std.process.Environ.Map) !void {
+    if (!user_namespace_active.load(.acquire)) return;
+    try childNamespaceEnvironment(
+        environment,
+        namespace_host_uid.load(.acquire),
+        namespace_host_gid.load(.acquire),
+    );
+}
+
 pub fn enterUserNamespaceFromEnvironment(
     io: std.Io,
     environment: *const std.process.Environ.Map,
@@ -407,6 +430,36 @@ test "namespace overflow ownership is limited to directory traversal" {
     try std.testing.expect(!trustedDirectoryOwner(65533));
     try std.testing.expectEqual(@as(u32, 65534), hostUid(65534));
     try std.testing.expectEqual(@as(u32, 1234), hostUid(0));
+}
+
+test "nested children receive only active namespace identity and their immediate parent" {
+    const active = user_namespace_active.load(.acquire);
+    const uid = namespace_host_uid.load(.acquire);
+    const gid = namespace_host_gid.load(.acquire);
+    defer {
+        namespace_host_uid.store(uid, .release);
+        namespace_host_gid.store(gid, .release);
+        user_namespace_active.store(active, .release);
+    }
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    namespace_host_uid.store(1234, .release);
+    namespace_host_gid.store(1235, .release);
+    user_namespace_active.store(false, .release);
+    try inheritChildNamespace(&environment);
+    try std.testing.expectEqual(@as(usize, 0), environment.count());
+
+    user_namespace_active.store(true, .release);
+    try inheritChildNamespace(&environment);
+    try std.testing.expectEqual(@as(usize, 4), environment.count());
+    try std.testing.expectEqualStrings(namespace_child, environment.get(namespace_marker).?);
+    try std.testing.expectEqualStrings("1234", environment.get(namespace_uid).?);
+    try std.testing.expectEqualStrings("1235", environment.get(namespace_gid).?);
+    try std.testing.expectEqual(linux.getpid(), try std.fmt.parseInt(
+        linux.pid_t,
+        environment.get(namespace_parent).?,
+        10,
+    ));
 }
 
 const contracts = @import("contracts.zig");
