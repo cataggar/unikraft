@@ -146,7 +146,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(controller);
     const compute_validator = b.addExecutable(.{
         .name = "uk-wamr-direct-validate",
-        .root_module = b.createModule(.{ .root_source_file = b.path("compute_main.zig"), .target = target, .optimize = optimize, .imports = &imports }),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("compute_main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = optimize != .Debug,
+            .imports = &imports,
+        }),
     });
     b.installArtifact(compute_validator);
     const compute_controller = b.addExecutable(.{
