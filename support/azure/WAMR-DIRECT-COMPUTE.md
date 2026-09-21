@@ -111,6 +111,8 @@ supervisor and public validator with
 `-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2`, independent of the runner CPU.
 Use those same flags when rebuilding them from the selected source with the
 pinned Zig compiler, source-closure digest and `ReleaseSafe` optimization.
+Release validator builds strip path-dependent debug data, matching the
+supervisor's stripped build; Debug validator builds retain it for diagnostics.
 The workflow logs both the runner's native CPU and the recorded executable
 target. Older runs without this pin still require their logged native CPU
 as `-Dcpu=` to reproduce the accepted bytes; the pin does not change existing
