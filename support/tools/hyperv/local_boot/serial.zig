@@ -127,8 +127,9 @@ fn checkOptionalCharacters(text: []const u8) !void {
     }
 }
 
-// Unicode 16 General_Category=Cn, pinned to the retained Python reference's
-// isprintable() domain. Each sorted interval is two fixed-width hex scalars.
+// Unicode 16 General_Category=Cn; reject Unicode 16-only additions below to
+// match Python 3.12/Unicode 15 isprintable() used by the production reference.
+// Each sorted interval is two fixed-width hex scalars.
 const unassigned =
     "00037800037900038000038300038b00038b00038d00038d0003a20003a200053000053000055700055800058b00058c0005900005900005c80005cf" ++
     "0005eb0005ee0005f50005ff00070e00070e00074b00074c0007b20007bf0007fb0007fc00082e00082f00083f00083f00085c00085d00085f00085f" ++
@@ -205,14 +206,30 @@ const unassigned =
     "02cea202ceaf02ebe102ebef02ee5e02f7ff02fa1e02ffff03134b03134f0323b00e00000e00020e001f0e00800e00ff0e01f00effff0ffffe0fffff" ++
     "10fffe10ffff";
 
+// Printable in Unicode 16 but unassigned in Unicode 15. Derived from
+// UnicodeData.txt 15.0.0 (SHA-256 806e9aed65037197f1ec85e12be6e8cd870fc5608b4de0fffd990f689f376a73).
+// All 5,812 code points are covered by these 50 intervals.
+const assigned_in_16 =
+    "000897000897001b4e001b4f001b7f001b7f001c89001c8a002427002429002ffc002fff0031e40031e50031ef0031ef" ++
+    "00a7cb00a7cd00a7da00a7dc0105c00105f3010d40010d65010d69010d85010d8e010d8f010ec2010ec4010efc010efc" ++
+    "01138001138901138b01138b01138e01138e0113900113b50113b70113c00113c20113c20113c50113c50113c70113ca" ++
+    "0113cc0113d50113d70113d80113e10113e20116d00116e3011bc0011be1011bf0011bf9011f5a011f5a0134600143fa" ++
+    "016100016139016d40016d79018cff018cff01cc0001ccf901cd0001ceb301e5d001e5fa01e5ff01e5ff01f8b201f8bb" ++
+    "01f8c001f8c101fa8901fa8901fa8f01fa8f01fabe01fabe01fac601fac601fadc01fadc01fadf01fadf01fae901fae9" ++
+    "01fbcb01fbef02ebf002ee5d";
+
 fn unassignedCodepoint(cp: u21) bool {
     if (cp < 0x378) return false;
+    return inRanges(cp, &unassigned_ranges) or inRanges(cp, &new_in_16_ranges);
+}
+
+fn inRanges(cp: u21, ranges: []const [2]u21) bool {
     var lo: usize = 0;
-    var hi: usize = unassigned_ranges.len;
+    var hi: usize = ranges.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const first = unassigned_ranges[mid][0];
-        const last = unassigned_ranges[mid][1];
+        const first = ranges[mid][0];
+        const last = ranges[mid][1];
         if (cp < first) {
             hi = mid;
         } else if (cp > last) {
@@ -222,18 +239,24 @@ fn unassignedCodepoint(cp: u21) bool {
     return false;
 }
 
-const unassigned_ranges = blk: {
+const unassigned_ranges = parseRanges(unassigned);
+const new_in_16_ranges = parseRanges(assigned_in_16);
+
+fn parseRanges(comptime text: []const u8) [text.len / 12][2]u21 {
     @setEvalBranchQuota(200_000);
-    var ranges: [unassigned.len / 12][2]u21 = undefined;
+    if (text.len % 12 != 0) @compileError("invalid Unicode interval table");
+    var ranges: [text.len / 12][2]u21 = undefined;
     for (&ranges, 0..) |*entry, i| {
-        const text = unassigned[i * 12 ..][0..12];
+        const pair = text[i * 12 ..][0..12];
         entry.* = .{
-            std.fmt.parseInt(u21, text[0..6], 16) catch unreachable,
-            std.fmt.parseInt(u21, text[6..12], 16) catch unreachable,
+            std.fmt.parseInt(u21, pair[0..6], 16) catch unreachable,
+            std.fmt.parseInt(u21, pair[6..12], 16) catch unreachable,
         };
+        if (entry.*[0] > entry.*[1] or (i != 0 and entry.*[0] <= ranges[i - 1][1]))
+            @compileError("overlapping or unordered Unicode intervals");
     }
-    break :blk ranges;
-};
+    return ranges;
+}
 
 // Terminal-only grammar from ukprint/console.c and snprintf.c. Other local
 // assertions remain bounded substring markers, not host admission policies.

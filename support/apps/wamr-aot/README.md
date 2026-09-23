@@ -358,7 +358,11 @@ zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=Rele
 The differential step compares bounded console normalization with the
 unchanged `run.py` reference and canonical base64 with the retained
 `check-log.py` contract; it does not install a production CLI or invoke
-guest execution.
+guest execution. Optional Unicode printability is pinned to Python 3.12's
+Unicode 15 domain, not the host Python version: the native and differential
+tests include golden Unicode 16-only rejection ranges from UnicodeData 15.0
+and printable Unicode 15 boundary cases. Python 3.14 uses those goldens
+instead of admitting its broader Unicode 16 character set.
 
 ```sh
 zig build --build-file support/apps/wamr-aot/build.zig test-unit test-integration

@@ -65,6 +65,32 @@ test "raw UTF-8 and CSI grammar refuse malformed bytes before they can be hidden
     try t.expectEqual(@as(usize, 8193), exact.len);
 }
 
+test "optional pins Unicode 15 printable boundary without changing tiny or local boot" {
+    for ([_][]const u8{
+        "\u{0897}\n",  "\u{1b4e}\n",  "\u{1b4f}\n",
+        "\u{10d40}\n", "\u{10d65}\n", "\u{11380}\n",
+        "\u{13460}\n", "\u{143fa}\n", "\u{1cc00}\n",
+        "\u{1ccf9}\n", "\u{1cd00}\n", "\u{1ceb3}\n",
+        "\u{1fabe}\n", "\u{1fae9}\n", "\u{2ebf0}\n",
+        "\u{2ee5d}\n",
+    }) |new_in_16| {
+        try t.expectError(error.InvalidSerial, normalized(new_in_16, .optional));
+        for ([_]validator.serial.Normalization{ .tiny, .local_boot }) |mode| {
+            const unchanged = try normalized(new_in_16, mode);
+            defer a.free(unchanged);
+            try t.expectEqualStrings(new_in_16, unchanged);
+        }
+    }
+    for ([_][]const u8{
+        "\u{00e9}\n",  "\u{1b7e}\n",  "\u{1f600}\n",
+        "\u{1f8b1}\n", "\u{1fabd}\n", "\u{1fabf}\n",
+    }) |printable_in_15| {
+        const accepted = try normalized(printable_in_15, .optional);
+        defer a.free(accepted);
+        try t.expectEqualStrings(printable_in_15, accepted);
+    }
+}
+
 test "mode-specific raw bounds and deterministic one-byte mutation refusals" {
     try t.expectError(error.SerialLimit, normalized("", .local_boot));
     try t.expectError(error.SerialLimit, normalized("x\n" ** (2 * 1024 * 1024), .tiny));
