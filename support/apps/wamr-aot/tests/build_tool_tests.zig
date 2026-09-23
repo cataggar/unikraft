@@ -208,6 +208,33 @@ test "private file helpers set explicit modes and reject hard-linked state" {
         &std.fmt.bytesToHex(expected_digest, .lower),
         &digest,
     );
+    try build_tool.files.writePrivateCreate(io, temporary.dir, "replace.json", "old\n");
+    try build_tool.files.writePrivateAtomicReplace(
+        io,
+        temporary.dir,
+        "replace.json",
+        "new\n",
+    );
+    const replaced = try temporary.dir.readFileAlloc(
+        io,
+        "replace.json",
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(replaced);
+    try testing.expectEqualStrings("new\n", replaced);
+    const replace_file = try temporary.dir.openFile(io, "replace.json", .{});
+    try replace_file.setPermissions(io, .fromMode(0o644));
+    replace_file.close(io);
+    try testing.expectError(
+        error.UnsafeFile,
+        build_tool.files.writePrivateAtomicReplace(
+            io,
+            temporary.dir,
+            "replace.json",
+            "refused\n",
+        ),
+    );
     const name = try allocator.dupeZ(u8, "record.json");
     defer allocator.free(name);
     if (linux.errno(linux.linkat(

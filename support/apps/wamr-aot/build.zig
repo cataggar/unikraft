@@ -70,10 +70,19 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const image_fixture = b.addExecutable(.{
+        .name = "wamr-aot-build-image-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/build_tool_image_fixture.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
     const options = b.addOptions();
     options.addOptionPath("cli", executable.getEmittedBin());
     options.addOptionPath("process_fixture", process_fixture.getEmittedBin());
     options.addOptionPath("prepare_fixture", prepare_fixture.getEmittedBin());
+    options.addOptionPath("image_fixture", image_fixture.getEmittedBin());
     options.addOption(
         []const u8,
         "zig_lib_dir",
@@ -134,9 +143,17 @@ pub fn build(b: *std.Build) void {
     differential_run.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     const differential_step = b.step(
         "test-differential",
-        "Compare native prepare and verify with the Python reference",
+        "Compare native prepare, verify, and image commands with Python",
     );
     differential_step.dependOn(&differential_run.step);
+    const image_differential_run = b.addSystemCommand(&.{"python3"});
+    image_differential_run.addFileArg(b.path("tests/test_image_differential.py"));
+    image_differential_run.addFileArg(executable.getEmittedBin());
+    image_differential_run.addFileArg(image_fixture.getEmittedBin());
+    image_differential_run.addArg(b.cache_root.path orelse "zig-cache");
+    image_differential_run.setCwd(.{ .cwd_relative = b.build_root.path.? });
+    image_differential_run.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    differential_step.dependOn(&image_differential_run.step);
     const all = b.step("test", "Run native WAMR build foundation tests");
     all.dependOn(unit_step);
     all.dependOn(integration_step);

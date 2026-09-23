@@ -149,6 +149,58 @@ pub fn writePrivateAtomicCreate(
         return error.UnsafeFile;
 }
 
+pub fn writePrivateAtomicReplace(
+    io: std.Io,
+    directory: std.Io.Dir,
+    name: []const u8,
+    contents: []const u8,
+) !void {
+    try core.private_files.basename(name);
+    try validateOwnedDirectory(directory);
+    if (directory.openFile(io, name, .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    })) |existing| {
+        defer existing.close(io);
+        const metadata = try preparation_files.metadata(existing);
+        if (metadata.mode & linux.S.IFMT != linux.S.IFREG or
+            metadata.mode & 0o7777 != 0o600 or
+            metadata.uid != linux.geteuid() or metadata.links != 1)
+            return error.UnsafeFile;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    var atomic = try directory.createFileAtomic(io, name, .{
+        .permissions = .fromMode(0o600),
+        .replace = true,
+    });
+    var active = true;
+    defer if (active) atomic.deinit(io);
+    try atomic.file.setPermissions(io, .fromMode(0o600));
+    try atomic.file.writePositionalAll(io, contents, 0);
+    try atomic.file.setLength(io, contents.len);
+    try atomic.file.sync(io);
+    try atomic.replace(io);
+    atomic.deinit(io);
+    active = false;
+    const directory_file: std.Io.File = .{
+        .handle = directory.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    try directory_file.sync(io);
+    const published = try directory.openFile(io, name, .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    });
+    defer published.close(io);
+    const metadata = try preparation_files.metadata(published);
+    if (metadata.mode & linux.S.IFMT != linux.S.IFREG or
+        metadata.mode & 0o7777 != 0o600 or metadata.uid != linux.geteuid() or
+        metadata.links != 1 or metadata.size != contents.len)
+        return error.UnsafeFile;
+}
+
 pub fn hashStableFile(
     io: std.Io,
     file: std.Io.File,
