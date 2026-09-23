@@ -342,6 +342,24 @@ or OVMF: its native boot attempt was refused, not counted as a passing run.
 
 ## Focused developer checks
 
+The first native validator foundation exposes optioned serial normalization
+without changing local-boot normalization, no-follow bounded raw input and
+SHA-256 snapshots, and a bounded canonical base64 decoder. It does **not**
+yet install a validator CLI or change any production check; the Python
+validators above remain the reference until their later native cutover.
+Run its synthetic unit/file-race fixtures without building or booting an
+image:
+
+```sh
+zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test
+zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test-differential
+```
+
+The differential step compares bounded console normalization with the
+unchanged `run.py` reference and canonical base64 with the retained
+`check-log.py` contract; it does not install a production CLI or invoke
+guest execution.
+
 ```sh
 zig build --build-file support/apps/wamr-aot/build.zig test-unit test-integration
 zig test build.zig --test-filter 'native WAMR'
