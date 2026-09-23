@@ -205,6 +205,251 @@ test "prepare failures retain private diagnostics without a success identity" {
     }
 }
 
+test "native image commands preserve config plans identities and failed publication" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.image_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const repository = try imageRepository(&temporary, "image");
+    defer allocator.free(repository);
+    try temporary.dir.createDir(io, "bison-data", .fromMode(0o700));
+    const bison_data = try temporary.dir.realPathFileAlloc(
+        io,
+        "bison-data",
+        allocator,
+    );
+    defer allocator.free(bison_data);
+    const log = try temporary.dir.createFile(io, "image.log", .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    log.close(io);
+    const log_path = try temporary.dir.realPathFileAlloc(io, "image.log", allocator);
+    defer allocator.free(log_path);
+    var environment = try imageEnvironment(fixture, bison_data, log_path);
+    defer environment.deinit();
+
+    const configured = try runCli(
+        cli,
+        &.{ cli, "olddefconfig", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(configured.stdout);
+    defer allocator.free(configured.stderr);
+    if (configured.term != .exited or configured.term.exited != 0)
+        std.debug.print(
+            "olddefconfig failed term={any}\nstdout={s}\nstderr={s}\n",
+            .{ configured.term, configured.stdout, configured.stderr },
+        );
+    try expectExit(configured.term, 0);
+    try testing.expectEqualStrings("", configured.stdout);
+    try testing.expectEqualStrings("", configured.stderr);
+    const expected_config =
+        "CONFIG_FIXTURE=y\n\n" ++
+        "CONFIG_STACK_SIZE_PAGE_ORDER=8\n" ++
+        "CONFIG_APPWAMRAOT_JIT_BOOT_MODE=0\n";
+    inline for (.{
+        "support/apps/wamr-aot/.config",
+        "support/apps/wamr-aot/build/.config",
+    }) |relative| {
+        const path = try std.fs.path.join(allocator, &.{ repository, relative });
+        defer allocator.free(path);
+        const contents = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(1024 * 1024),
+        );
+        defer allocator.free(contents);
+        try testing.expectEqualStrings(expected_config, contents);
+    }
+
+    const built = try runCli(
+        cli,
+        &.{ cli, "native-images", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(built.stdout);
+    defer allocator.free(built.stderr);
+    if (built.term != .exited or built.term.exited != 0)
+        std.debug.print(
+            "native-images failed term={any}\nstdout={s}\nstderr={s}\n",
+            .{ built.term, built.stdout, built.stderr },
+        );
+    try expectExit(built.term, 0);
+    try testing.expectEqualStrings("", built.stdout);
+    try testing.expectEqualStrings("", built.stderr);
+    const identity_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/build/image-identity.json" },
+    );
+    defer allocator.free(identity_path);
+    const identity = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        identity_path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer allocator.free(identity);
+    try build_tool.image.validateIdentityBytes(allocator, identity);
+    var document = try build_tool.json.parse(allocator, identity, .{
+        .bytes = 4 * 1024 * 1024,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer document.deinit();
+    const fields = document.value().object;
+    try testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef01234567",
+        fields.get("unikraft_revision").?.string,
+    );
+    const command = fields.get("command").?.array;
+    try testing.expect(command.items.len > 2);
+    var found_bridge = false;
+    for (command.items) |argument| {
+        if (std.mem.startsWith(
+            u8,
+            argument.string,
+            "-Dwamr-aot-tool=",
+        )) found_bridge = true;
+    }
+    try testing.expect(found_bridge);
+    const identity_file = try std.Io.Dir.openFileAbsolute(io, identity_path, .{});
+    defer identity_file.close(io);
+    try testing.expectEqual(
+        @as(u16, 0o600),
+        (try identity_file.stat(io)).permissions.toMode() & 0o7777,
+    );
+
+    try environment.put("WAMR_IMAGE_FIXTURE_FAIL", "native-images");
+    const failed = try runCli(
+        cli,
+        &.{ cli, "native-images", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(failed.stdout);
+    defer allocator.free(failed.stderr);
+    try expectExit(failed.term, 2);
+    try testing.expectEqualStrings(
+        "wamr_aot_build_failed category=command_failed\n",
+        failed.stderr,
+    );
+    const after_failure = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        identity_path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer allocator.free(after_failure);
+    try testing.expectEqualSlices(u8, identity, after_failure);
+
+    _ = environment.swapRemove("WAMR_IMAGE_FIXTURE_FAIL");
+    try environment.put("WAMR_IMAGE_FIXTURE_DIRTY", "1");
+    const dirty = try runCli(
+        cli,
+        &.{ cli, "native-images", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(dirty.stdout);
+    defer allocator.free(dirty.stderr);
+    try expectExit(dirty.term, 2);
+    try testing.expectEqualStrings(
+        "wamr_aot_build_failed category=unsupported_input\n",
+        dirty.stderr,
+    );
+    const after_dirty = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        identity_path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer allocator.free(after_dirty);
+    try testing.expectEqualSlices(u8, identity, after_dirty);
+}
+
+test "native image commands reject config runtime and application mutation" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.image_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    try temporary.dir.createDir(io, "bison-data", .fromMode(0o700));
+    const bison_data = try temporary.dir.realPathFileAlloc(
+        io,
+        "bison-data",
+        allocator,
+    );
+    defer allocator.free(bison_data);
+
+    inline for (.{ "config", "runtime", "application" }) |mutation| {
+        const repository = try imageRepository(&temporary, mutation);
+        defer allocator.free(repository);
+        const log_name = try std.fmt.allocPrint(
+            allocator,
+            "{s}.log",
+            .{mutation},
+        );
+        defer allocator.free(log_name);
+        const log = try temporary.dir.createFile(io, log_name, .{
+            .exclusive = true,
+            .permissions = .fromMode(0o600),
+        });
+        log.close(io);
+        const log_path = try temporary.dir.realPathFileAlloc(
+            io,
+            log_name,
+            allocator,
+        );
+        defer allocator.free(log_path);
+        var environment = try imageEnvironment(fixture, bison_data, log_path);
+        defer environment.deinit();
+        const configured = try runCli(
+            cli,
+            &.{ cli, "olddefconfig", "--repository", repository },
+            &environment,
+        );
+        defer allocator.free(configured.stdout);
+        defer allocator.free(configured.stderr);
+        try expectExit(configured.term, 0);
+        try environment.put("WAMR_IMAGE_FIXTURE_MUTATE", mutation);
+        const built = try runCli(
+            cli,
+            &.{ cli, "native-images", "--repository", repository },
+            &environment,
+        );
+        defer allocator.free(built.stdout);
+        defer allocator.free(built.stderr);
+        try expectExit(built.term, 2);
+        try testing.expectEqualStrings(
+            "wamr_aot_build_failed category=unsupported_input\n",
+            built.stderr,
+        );
+        try testing.expect(std.mem.indexOf(u8, built.stderr, repository) == null);
+        const identity_path = try std.fs.path.join(
+            allocator,
+            &.{ repository, "support/apps/wamr-aot/build/image-identity.json" },
+        );
+        defer allocator.free(identity_path);
+        try testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.openFileAbsolute(io, identity_path, .{}),
+        );
+    }
+}
+
 test "tool selection preserves override PATH and retained-fd precedence" {
     const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
         io,
@@ -556,6 +801,114 @@ fn fixtureRepository(temporary: *testing.TmpDir, name: []const u8) ![:0]u8 {
         "wasi.zig",
     }) |file| try copyFixtureSource(temporary.dir, relative, file);
     return temporary.dir.realPathFileAlloc(io, name, allocator);
+}
+
+fn imageRepository(temporary: *testing.TmpDir, name: []const u8) ![:0]u8 {
+    const relative = try std.fmt.allocPrint(
+        allocator,
+        "{s}/support/apps/wamr-aot",
+        .{name},
+    );
+    defer allocator.free(relative);
+    try temporary.dir.createDirPath(io, relative);
+    var components = std.mem.splitScalar(u8, relative, '/');
+    var current = try temporary.dir.openDir(io, ".", .{ .iterate = true });
+    defer current.close(io);
+    while (components.next()) |component| {
+        const next = try current.openDir(io, component, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        try next.setPermissions(io, .fromMode(0o700));
+        current.close(io);
+        current = next;
+    }
+    inline for (.{ "build-tool-image.zig", "build-image.py" }) |file|
+        try copyFixtureSource(temporary.dir, relative, file);
+    const defconfig = try std.fs.path.join(
+        allocator,
+        &.{ relative, "defconfig" },
+    );
+    defer allocator.free(defconfig);
+    const defconfig_file = try temporary.dir.createFile(io, defconfig, .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer defconfig_file.close(io);
+    try defconfig_file.writePositionalAll(io, "CONFIG_FIXTURE=y\n", 0);
+    try defconfig_file.setPermissions(io, .fromMode(0o600));
+    const artifacts = try std.fs.path.join(
+        allocator,
+        &.{ relative, "build/artifacts" },
+    );
+    defer allocator.free(artifacts);
+    try temporary.dir.createDirPath(io, artifacts);
+    var private_components = std.mem.splitScalar(u8, artifacts, '/');
+    var private_current = try temporary.dir.openDir(io, ".", .{ .iterate = true });
+    defer private_current.close(io);
+    while (private_components.next()) |component| {
+        const next = try private_current.openDir(io, component, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        });
+        try next.setPermissions(io, .fromMode(0o700));
+        private_current.close(io);
+        private_current = next;
+    }
+    const identity = try std.fs.path.join(
+        allocator,
+        &.{ artifacts, "identity.json" },
+    );
+    defer allocator.free(identity);
+    const identity_file = try temporary.dir.createFile(io, identity, .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer identity_file.close(io);
+    try identity_file.writePositionalAll(
+        io,
+        "{\n  \"jit_mode\": null,\n  \"variant\": \"snapshot\"\n}\n",
+        0,
+    );
+    try identity_file.setPermissions(io, .fromMode(0o600));
+    return temporary.dir.realPathFileAlloc(io, name, allocator);
+}
+
+fn imageEnvironment(
+    fixture: []const u8,
+    bison_data: []const u8,
+    log_path: []const u8,
+) !std.process.Environ.Map {
+    var environment = std.process.Environ.Map.init(allocator);
+    errdefer environment.deinit();
+    inline for (.{
+        "ZIG",
+        "MAKE",
+        "LLVM_NM",
+        "LLVM_OBJCOPY",
+        "LLVM_OBJDUMP",
+        "LLVM_READELF",
+        "LLVM_STRIP",
+        "BISON",
+        "FLEX",
+        "M4",
+        "BASH",
+        "CP",
+        "MKDIR",
+        "PYTHON3",
+        "READLINK",
+        "GIT",
+    }) |name| {
+        try environment.put("WAMR_CI_TOOL_" ++ name, fixture);
+    }
+    try environment.put("PATH", "/usr/bin:/bin");
+    try environment.put("WAMR_IMAGE_FIXTURE_BISON_DATA", bison_data);
+    try environment.put("WAMR_IMAGE_FIXTURE_LOG", log_path);
+    try environment.put(
+        "WAMR_IMAGE_FIXTURE_REVISION",
+        "0123456789abcdef0123456789abcdef01234567",
+    );
+    return environment;
 }
 
 fn copyFixtureSource(

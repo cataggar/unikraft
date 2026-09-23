@@ -19,12 +19,29 @@ fn run(init: std.process.Init) !void {
     }
     const parsed = try build_tool.parseArguments(arguments[1..]);
     try build_tool.process.initialize();
-    try build_tool.prepare.execute(
-        init.gpa,
-        init.io,
-        init.environ_map,
-        parsed,
-    );
+    switch (parsed.command) {
+        .prepare, .verify => try build_tool.prepare.execute(
+            init.gpa,
+            init.io,
+            init.environ_map,
+            parsed,
+        ),
+        .olddefconfig, .native_images => {
+            const executable = try std.Io.Dir.cwd().realPathFileAlloc(
+                init.io,
+                "/proc/self/exe",
+                init.gpa,
+            );
+            defer init.gpa.free(executable);
+            try build_tool.image.execute(
+                init.gpa,
+                init.io,
+                init.environ_map,
+                executable,
+                parsed,
+            );
+        },
+    }
 }
 
 fn category(err: anyerror) []const u8 {
@@ -55,7 +72,13 @@ fn category(err: anyerror) []const u8 {
         error.TinyAotCommandFailed,
         error.CoremarkCommandFailed,
         error.CoremarkNofpCommandFailed,
+        error.BisonDataCommandFailed,
+        error.RootBuildCommandFailed,
+        error.GitCleanCommandFailed,
         => "command_failed",
+        error.DirtyImageSource,
+        error.ImageInputChanged,
+        => "unsupported_input",
         else => "local_failure",
     };
 }

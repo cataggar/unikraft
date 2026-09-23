@@ -22,6 +22,46 @@ comptime {
     }
 }
 
+fn validateWamrAotTool(b: *std.Build, value: []const u8) ?[]const u8 {
+    if (!std.fs.path.isAbsolute(value)) {
+        return "-Dwamr-aot-tool must be an absolute canonical executable path";
+    }
+    const canonical = facade_paths.canonicalizeNearestExisting(
+        b.allocator,
+        b.graph.io,
+        value,
+    ) catch |err| {
+        return b.fmt(
+            "unable to validate -Dwamr-aot-tool '{s}': {s}",
+            .{ value, @errorName(err) },
+        );
+    };
+    defer b.allocator.free(canonical.path);
+    if (!canonical.exists or !std.mem.eql(u8, canonical.path, value)) {
+        return b.fmt(
+            "-Dwamr-aot-tool must name an existing canonical executable: '{s}'",
+            .{value},
+        );
+    }
+    const stat = std.Io.Dir.cwd().statFile(
+        b.graph.io,
+        value,
+        .{ .follow_symlinks = false },
+    ) catch |err| {
+        return b.fmt(
+            "unable to inspect -Dwamr-aot-tool '{s}': {s}",
+            .{ value, @errorName(err) },
+        );
+    };
+    if (stat.kind != .file or stat.permissions.toMode() & 0o111 == 0) {
+        return b.fmt(
+            "-Dwamr-aot-tool must name an executable regular file: '{s}'",
+            .{value},
+        );
+    }
+    return null;
+}
+
 const Verbosity = enum {
     @"0",
     @"1",
@@ -39,6 +79,7 @@ const MakeOptions = struct {
     output: []const u8,
     config: ?[]const u8,
     image_name: ?[]const u8,
+    wamr_aot_tool: ?[]const u8,
     external_libraries: ?[]const u8,
     external_platforms: ?[]const u8,
     exclusions: ?[]const u8,
@@ -132,6 +173,11 @@ pub fn build(b: *std.Build) void {
     }
     const config_option = b.option([]const u8, "config", "Configuration file (Make C=)");
     const image_name_option = b.option([]const u8, "image-name", "Image/application name override (Make N=)");
+    const wamr_aot_tool_option = b.option(
+        []const u8,
+        "wamr-aot-tool",
+        "Canonical native WAMR build executable (Make APPWAMRAOT_TOOL=)",
+    );
     const external_library_options = b.option(
         []const []const u8,
         "external-lib",
@@ -187,6 +233,7 @@ pub fn build(b: *std.Build) void {
         .output = output,
         .config = if (config_option != null) context.config else null,
         .image_name = image_name_option,
+        .wamr_aot_tool = wamr_aot_tool_option,
         .external_libraries = joinPathList(b.allocator, context.external_libraries),
         .external_platforms = joinPathList(b.allocator, context.external_platforms),
         .exclusions = joinPathList(b.allocator, context.exclusions),
@@ -206,6 +253,9 @@ pub fn build(b: *std.Build) void {
 
     if (validation_message == null) {
         validation_message = validatePaths(b, root, options, output_result);
+    }
+    if (validation_message == null and wamr_aot_tool_option != null) {
+        validation_message = validateWamrAotTool(b, wamr_aot_tool_option.?);
     }
 
     var invalid_assignment: ?[]const u8 = null;
@@ -2868,6 +2918,7 @@ fn findUnsafeValue(options: MakeOptions) ?UnsafeValue {
         .{ .name = "L", .value = options.external_libraries, .allow_colon = true },
         .{ .name = "P", .value = options.external_platforms, .allow_colon = true },
         .{ .name = "E", .value = options.exclusions, .allow_colon = true },
+        .{ .name = "APPWAMRAOT_TOOL", .value = options.wamr_aot_tool, .allow_colon = false },
     };
     for (paths) |path| {
         const value = path.value orelse continue;
@@ -3073,6 +3124,12 @@ fn makeArguments(
     appendAssignment(allocator, &argv, "O", options.output);
     appendOptionalAssignment(allocator, &argv, "C", options.config);
     appendOptionalAssignment(allocator, &argv, "N", options.image_name);
+    appendOptionalAssignment(
+        allocator,
+        &argv,
+        "APPWAMRAOT_TOOL",
+        options.wamr_aot_tool,
+    );
     appendOptionalAssignment(allocator, &argv, "L", options.external_libraries);
     appendOptionalAssignment(allocator, &argv, "P", options.external_platforms);
     appendOptionalAssignment(allocator, &argv, "E", options.exclusions);
@@ -3218,6 +3275,7 @@ test "Make assignments remain single arguments" {
         .output = "/workspace/output",
         .config = "/workspace/configs/test",
         .image_name = "hello",
+        .wamr_aot_tool = "/workspace/bin/uk-wamr-aot-build",
         .external_libraries = "/workspace/lib-one:/workspace/lib-two",
         .external_platforms = null,
         .exclusions = null,
@@ -3247,6 +3305,7 @@ test "Make assignments remain single arguments" {
         "O=/workspace/output",
         "C=/workspace/configs/test",
         "N=hello",
+        "APPWAMRAOT_TOOL=/workspace/bin/uk-wamr-aot-build",
         "L=/workspace/lib-one:/workspace/lib-two",
         "V=2",
         "COMPILER=zig cc -target x86_64-freestanding-none",
@@ -3772,6 +3831,7 @@ fn testingMakeOptions() MakeOptions {
         .output = "/workspace/apps/hello/build",
         .config = "/workspace/apps/hello/.config",
         .image_name = null,
+        .wamr_aot_tool = null,
         .external_libraries = "/workspace/libs",
         .external_platforms = "/workspace/platforms",
         .exclusions = "/workspace/excluded",
