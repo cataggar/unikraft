@@ -438,6 +438,21 @@ test "native image commands reject config runtime and application mutation" {
             "wamr_aot_build_failed category=unsupported_input\n",
             built.stderr,
         );
+        if (std.mem.eql(u8, mutation, "config")) {
+            const guard_path = try std.fs.path.join(
+                allocator,
+                &.{ repository, "support/apps/wamr-aot/build/native-environment/failure-image-guard.txt" },
+            );
+            defer allocator.free(guard_path);
+            const guard = try std.Io.Dir.cwd().readFileAlloc(
+                io,
+                guard_path,
+                allocator,
+                .limited(96),
+            );
+            defer allocator.free(guard);
+            try testing.expectEqualStrings("config-after-root-changed-bytes", guard);
+        }
         try testing.expect(std.mem.indexOf(u8, built.stderr, repository) == null);
         const identity_path = try std.fs.path.join(
             allocator,

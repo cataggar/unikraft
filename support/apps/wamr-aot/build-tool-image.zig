@@ -456,6 +456,29 @@ fn imageInputChanged(io: std.Io, state: std.Io.Dir, guard: []const u8) anyerror 
     return error.ImageInputChanged;
 }
 
+fn configInputChanged(
+    io: std.Io,
+    state: std.Io.Dir,
+    path: []const u8,
+    before: [64]u8,
+    after_identity: bool,
+) anyerror {
+    var current = contract.files.RetainedFile.open(io, path, .private) catch
+        return imageInputChanged(io, state, "config-unavailable");
+    defer current.close(io);
+    const observed = digestRetained(io, current) catch
+        return imageInputChanged(io, state, "config-unstable");
+    const same = std.mem.eql(u8, &before, &observed);
+    return imageInputChanged(
+        io,
+        state,
+        if (after_identity)
+            (if (same) "config-after-identity-same-bytes" else "config-after-identity-changed-bytes")
+        else
+            (if (same) "config-after-root-same-bytes" else "config-after-root-changed-bytes"),
+    );
+}
+
 const NamedDigest = struct {
     name: []u8,
     sha256: [64]u8,
@@ -629,12 +652,14 @@ fn executeOpen(
 
     var config_input: ?contract.files.RetainedFile = null;
     defer if (config_input) |*file| file.close(io);
+    var config_before_hash: ?[64]u8 = null;
     var runtime_input: ?contract.files.RetainedFile = null;
     defer if (runtime_input) |*file| file.close(io);
     var application_before: ?[]NamedDigest = null;
     defer if (application_before) |records| freeNamedDigests(allocator, records);
     if (command == .native_images) {
         config_input = try contract.files.RetainedFile.open(io, config_path, .private);
+        config_before_hash = try digestRetained(io, config_input.?);
         const runtime_path = try std.fs.path.join(
             a,
             &.{ build_path, "artifacts", "identity.json" },
@@ -697,7 +722,13 @@ fn executeOpen(
     }
 
     config_input.?.verify(io) catch
-        return imageInputChanged(io, state, "config-after-root");
+        return configInputChanged(
+            io,
+            state,
+            config_path,
+            config_before_hash.?,
+            false,
+        );
     runtime_input.?.verify(io) catch
         return imageInputChanged(io, state, "runtime-after-root");
     const application_after = try applicationIdentities(
@@ -798,7 +829,13 @@ fn executeOpen(
     );
     try published.verify(io);
     config_input.?.verify(io) catch
-        return imageInputChanged(io, state, "config-after-identity");
+        return configInputChanged(
+            io,
+            state,
+            config_path,
+            config_before_hash.?,
+            true,
+        );
     runtime_input.?.verify(io) catch
         return imageInputChanged(io, state, "runtime-after-identity");
     const final_applications = try applicationIdentities(
