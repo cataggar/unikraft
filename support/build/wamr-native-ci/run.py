@@ -5486,6 +5486,14 @@ def diagnostics(runtime):
             "exit_code": command["exit_code"],
             "native_error_name_sha256": hashlib.sha256(error_name).hexdigest(),
         }
+        try:
+            role = read(private / "failure-tool-role.txt", 96)
+            require(re.fullmatch(rb"[a-z][a-z0-9-]{0,79}", role),
+                    "invalid native tool role")
+            build_failures["config"]["tool_role_sha256"] = (
+                hashlib.sha256(role).hexdigest())
+        except (OSError, Refusal):
+            pass
         private /= "diagnostics"
         info = private.lstat()
         require(stat.S_ISDIR(info.st_mode)

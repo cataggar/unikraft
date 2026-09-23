@@ -331,36 +331,37 @@ const SelectedTools = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         environment: *const std.process.Environ.Map,
+        state: std.Io.Dir,
     ) !SelectedTools {
-        var zig = try contract.process.resolveTool(allocator, io, environment, "zig");
+        var zig = try resolveSelectedTool(allocator, io, environment, state, "zig");
         errdefer zig.close(allocator, io);
-        var make = try contract.process.resolveTool(allocator, io, environment, "make");
+        var make = try resolveSelectedTool(allocator, io, environment, state, "make");
         errdefer make.close(allocator, io);
-        var llvm_nm = try contract.process.resolveTool(allocator, io, environment, "llvm-nm");
+        var llvm_nm = try resolveSelectedTool(allocator, io, environment, state, "llvm-nm");
         errdefer llvm_nm.close(allocator, io);
-        var llvm_objcopy = try contract.process.resolveTool(allocator, io, environment, "llvm-objcopy");
+        var llvm_objcopy = try resolveSelectedTool(allocator, io, environment, state, "llvm-objcopy");
         errdefer llvm_objcopy.close(allocator, io);
-        var llvm_objdump = try contract.process.resolveTool(allocator, io, environment, "llvm-objdump");
+        var llvm_objdump = try resolveSelectedTool(allocator, io, environment, state, "llvm-objdump");
         errdefer llvm_objdump.close(allocator, io);
-        var llvm_readelf = try contract.process.resolveTool(allocator, io, environment, "llvm-readelf");
+        var llvm_readelf = try resolveSelectedTool(allocator, io, environment, state, "llvm-readelf");
         errdefer llvm_readelf.close(allocator, io);
-        var llvm_strip = try contract.process.resolveTool(allocator, io, environment, "llvm-strip");
+        var llvm_strip = try resolveSelectedTool(allocator, io, environment, state, "llvm-strip");
         errdefer llvm_strip.close(allocator, io);
-        var bison = try contract.process.resolveTool(allocator, io, environment, "bison");
+        var bison = try resolveSelectedTool(allocator, io, environment, state, "bison");
         errdefer bison.close(allocator, io);
-        var flex = try contract.process.resolveTool(allocator, io, environment, "flex");
+        var flex = try resolveSelectedTool(allocator, io, environment, state, "flex");
         errdefer flex.close(allocator, io);
-        var m4 = try contract.process.resolveTool(allocator, io, environment, "m4");
+        var m4 = try resolveSelectedTool(allocator, io, environment, state, "m4");
         errdefer m4.close(allocator, io);
-        var bash = try contract.process.resolveTool(allocator, io, environment, "bash");
+        var bash = try resolveSelectedTool(allocator, io, environment, state, "bash");
         errdefer bash.close(allocator, io);
-        var cp = try contract.process.resolveTool(allocator, io, environment, "cp");
+        var cp = try resolveSelectedTool(allocator, io, environment, state, "cp");
         errdefer cp.close(allocator, io);
-        var mkdir = try contract.process.resolveTool(allocator, io, environment, "mkdir");
+        var mkdir = try resolveSelectedTool(allocator, io, environment, state, "mkdir");
         errdefer mkdir.close(allocator, io);
-        var python3 = try contract.process.resolveTool(allocator, io, environment, "python3");
+        var python3 = try resolveSelectedTool(allocator, io, environment, state, "python3");
         errdefer python3.close(allocator, io);
-        var readlink = try contract.process.resolveTool(allocator, io, environment, "readlink");
+        var readlink = try resolveSelectedTool(allocator, io, environment, state, "readlink");
         errdefer readlink.close(allocator, io);
         return .{
             .zig = zig,
@@ -427,6 +428,24 @@ const SelectedTools = struct {
     }
 };
 
+fn resolveSelectedTool(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    state: std.Io.Dir,
+    name: []const u8,
+) !contract.process.Tool {
+    return contract.process.resolveTool(allocator, io, environment, name) catch |err| {
+        contract.files.writePrivateAtomicReplace(
+            io,
+            state,
+            "failure-tool-role.txt",
+            name,
+        ) catch {};
+        return err;
+    };
+}
+
 const NamedDigest = struct {
     name: []u8,
     sha256: [64]u8,
@@ -483,14 +502,19 @@ fn executeOpen(
         ),
         .diagnostics = &diagnostics,
     };
-    var tools = try SelectedTools.resolve(allocator, io, inherited);
+    var tools = try SelectedTools.resolve(allocator, io, inherited, state);
     defer tools.close(allocator, io);
-    var self_tool = try contract.process.openTool(
+    var self_tool = contract.process.openTool(
         allocator,
         io,
         "wamr-aot-tool",
         executable_path,
-    );
+    ) catch |err| {
+        contract.files.writePrivateAtomicReplace(
+            io, state, "failure-tool-role.txt", "wamr-aot-tool",
+        ) catch {};
+        return err;
+    };
     defer self_tool.close(allocator, io);
 
     const private_paths = try createEnvironmentDirectories(
@@ -594,16 +618,21 @@ fn executeOpen(
     );
     defer root_result.deinit(allocator);
 
-    var tools_after = try SelectedTools.resolve(allocator, io, inherited);
+    var tools_after = try SelectedTools.resolve(allocator, io, inherited, state);
     defer tools_after.close(allocator, io);
     if (!SelectedTools.same(&tools, &tools_after))
         return error.ImageInputChanged;
-    var self_after = try contract.process.openTool(
+    var self_after = contract.process.openTool(
         allocator,
         io,
         "wamr-aot-tool",
         executable_path,
-    );
+    ) catch |err| {
+        contract.files.writePrivateAtomicReplace(
+            io, state, "failure-tool-role.txt", "wamr-aot-tool",
+        ) catch {};
+        return err;
+    };
     defer self_after.close(allocator, io);
     if (!std.meta.eql(
         self_tool.executable.identity,
@@ -733,7 +762,7 @@ fn executeOpen(
     defer freeNamedDigests(allocator, final_images);
     if (!sameNamedDigests(file_identities, final_images))
         return error.ImageInputChanged;
-    var final_tools = try SelectedTools.resolve(allocator, io, inherited);
+    var final_tools = try SelectedTools.resolve(allocator, io, inherited, state);
     defer final_tools.close(allocator, io);
     if (!SelectedTools.same(&tools, &final_tools))
         return error.ImageInputChanged;

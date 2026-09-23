@@ -4380,6 +4380,7 @@ source/generated/
             directory.chmod(0o700)
         self.put(backend.parent.parent / "failure-error-name.txt",
                  b"InvalidToolOverride")
+        self.put(backend.parent.parent / "failure-tool-role.txt", b"make")
         ci.save(backend / "000-root-olddefconfig.json", {
             "stage": "root-olddefconfig",
             "primary": {"exited": 1},
@@ -4397,6 +4398,7 @@ source/generated/
         raw = (root / "evidence/diagnostics.json").read_bytes()
         self.assertNotIn(b"PRIVATE_SYNTHETIC_STATE", raw)
         self.assertNotIn(b"InvalidToolOverride", raw)
+        self.assertNotIn(b'"make"', raw)
         self.assertNotIn(str(self.root).encode(), raw)
         self.assertIn(
             b"test_adapter.Evidence.test_safe_name", raw)
@@ -4404,6 +4406,7 @@ source/generated/
             "exit_code": 2, "backend_exit_code": 1,
             "native_error_name_sha256":
                 hashlib.sha256(b"InvalidToolOverride").hexdigest(),
+            "tool_role_sha256": hashlib.sha256(b"make").hexdigest(),
             "known_error_markers": ["InvalidNativeMakePath"],
         })
         self.assertFalse((root / "evidence/result.json").exists())

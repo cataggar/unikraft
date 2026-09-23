@@ -450,7 +450,7 @@ test "native image commands reject config runtime and application mutation" {
     }
 }
 
-test "native config failures retain only a private compiled error name" {
+test "native config tool failures retain only private compiled error and role" {
     const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
     defer allocator.free(cli);
     const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
@@ -462,7 +462,7 @@ test "native config failures retain only a private compiled error name" {
     var temporary = testing.tmpDir(.{ .iterate = true });
     defer temporary.cleanup();
     try temporary.dir.setPermissions(io, .fromMode(0o700));
-    const repository = try imageRepository(&temporary, "invalid-bison");
+    const repository = try imageRepository(&temporary, "invalid-tool");
     defer allocator.free(repository);
     const log_path = try std.fs.path.join(
         allocator,
@@ -475,7 +475,7 @@ test "native config failures retain only a private compiled error name" {
         log_path,
     );
     defer environment.deinit();
-    try environment.put("BISON_PKGDATADIR", "relative/bison-data-does-not-exist");
+    try environment.put("WAMR_CI_TOOL_MAKE", "relative/make-does-not-exist");
     const result = try runCli(
         cli,
         &.{ cli, "olddefconfig", "--repository", repository },
@@ -500,7 +500,20 @@ test "native config failures retain only a private compiled error name" {
         .limited(96),
     );
     defer allocator.free(error_name);
-    try testing.expectEqualStrings("InvalidBisonData", error_name);
+    try testing.expectEqualStrings("InvalidToolOverride", error_name);
+    const role_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/build/native-environment/failure-tool-role.txt" },
+    );
+    defer allocator.free(role_path);
+    const role = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        role_path,
+        allocator,
+        .limited(96),
+    );
+    defer allocator.free(role);
+    try testing.expectEqualStrings("make", role);
 }
 
 test "tool selection preserves override PATH and retained-fd precedence" {

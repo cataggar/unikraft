@@ -340,6 +340,9 @@ observed in bounded output, not copied error messages or a diagnosis. A null
 marker list means the capture exceeded the scan bound. A failed/missing boot
 never creates `result.json`. Evidence collection
 is diagnostic only and cannot turn failure into success.
+Native config failures additionally report SHA-256 digests of the compiled
+error name and, if a tool was rejected, its selected role; neither value's
+source text nor child output is included in the metadata artifact.
 
 ## Focused checks
 
