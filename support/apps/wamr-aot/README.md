@@ -86,10 +86,11 @@ directory. The existing native Make environment guard still validates it;
 an invalid override never falls back to ambient data. Hosted CI reuses the
 authenticated package-data acquisition rather than writable `/usr/share`.
 For supervised config and image builds, `WAMR_CI_EXECUTABLE_PATH` names the
-supervisor's physical installed executable. The producer checks its identity
-against the running `/proc/self/exe` image before passing the path to the
-root build; an ambient path naming another executable is refused. Direct
-invocations continue to resolve their own executable.
+supervisor's physical installed executable. The producer binds its physical
+identity to the supervisor's retained descriptor and its bytes to the
+running `/proc/self/exe` snapshot before passing the path to the root build;
+an ambient path naming another executable is refused. Direct invocations
+continue to resolve and physically verify their own executable.
 
 ## Memory ownership and failure paths
 

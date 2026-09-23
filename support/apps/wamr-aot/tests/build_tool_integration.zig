@@ -480,6 +480,98 @@ test "native config refuses a supplied executable that differs from the running 
         "wamr_aot_build_failed category=unsupported_input\n",
         result.stderr,
     );
+    var wrong = try build_tool.process.openTool(
+        allocator,
+        io,
+        "wrong-image",
+        fixture,
+    );
+    defer wrong.close(allocator, io);
+    const retained_path = try std.fmt.allocPrint(
+        allocator,
+        "/proc/{d}/fd/{d}",
+        .{ linux.getpid(), wrong.executable.file.handle },
+    );
+    defer allocator.free(retained_path);
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", cli);
+    try environment.put("WAMR_CI_RETAINED_EXECUTABLE", retained_path);
+    const wrong_retained = try runCli(
+        cli,
+        &.{ cli, "olddefconfig", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(wrong_retained.stdout);
+    defer allocator.free(wrong_retained.stderr);
+    try expectExit(wrong_retained.term, 2);
+    try testing.expectEqualStrings(
+        "wamr_aot_build_failed category=unsupported_input\n",
+        wrong_retained.stderr,
+    );
+}
+
+test "native config binds a supervisor snapshot to its retained physical executable" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.image_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const repository = try imageRepository(&temporary, "supervised-snapshot");
+    defer allocator.free(repository);
+    try temporary.dir.createDir(io, "bison-data", .fromMode(0o700));
+    const bison_data = try temporary.dir.realPathFileAlloc(
+        io,
+        "bison-data",
+        allocator,
+    );
+    defer allocator.free(bison_data);
+    const log = try temporary.dir.createFile(io, "snapshot.log", .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    log.close(io);
+    const log_path = try temporary.dir.realPathFileAlloc(
+        io,
+        "snapshot.log",
+        allocator,
+    );
+    defer allocator.free(log_path);
+    var environment = try imageEnvironment(fixture, bison_data, log_path);
+    defer environment.deinit();
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", cli);
+    var tool = try build_tool.process.openTool(
+        allocator,
+        io,
+        "wamr-aot-build",
+        cli,
+    );
+    defer tool.close(allocator, io);
+    const retained_path = try std.fmt.allocPrint(
+        allocator,
+        "/proc/{d}/fd/{d}",
+        .{ linux.getpid(), tool.executable.file.handle },
+    );
+    defer allocator.free(retained_path);
+    try environment.put("WAMR_CI_RETAINED_EXECUTABLE", retained_path);
+    try build_tool.process.initialize();
+    var result = try build_tool.process.run(allocator, io, tool, .{
+        .argv = &.{ cli, "olddefconfig", "--repository", repository },
+        .environment = &environment,
+        .cwd = temporary.dir,
+        .primary_deadline = try build_tool.process.Deadline.afterMilliseconds(60000),
+        .cleanup_deadline = try build_tool.process.Deadline.afterMilliseconds(90000),
+        .stdout_bytes = 1024,
+        .stderr_bytes = 1024,
+    });
+    defer result.deinit(allocator);
+    try build_tool.process.requireSuccess(result);
+    try testing.expectEqualStrings("", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
 }
 
 test "native config tool failures retain only private compiled error and role" {

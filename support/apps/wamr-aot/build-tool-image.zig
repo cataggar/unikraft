@@ -526,8 +526,30 @@ fn executeOpen(
     defer running_file.close(io);
     var running = try core.process.Executable.fromFile(io, running_file);
     defer running.close(io);
-    if (!std.meta.eql(self_tool.executable.identity, running.identity))
+    // The supervisor executes a private byte-for-byte snapshot with a different inode.
+    if (self_tool.executable.identity.size != running.identity.size or
+        !std.mem.eql(
+            u8,
+            &self_tool.executable.identity.content_sha256,
+            &running.identity.content_sha256,
+        ))
         return error.ImageInputChanged;
+    if (inherited.get("WAMR_CI_RETAINED_EXECUTABLE")) |retained_path| {
+        if (!contract.process.retainedDescriptorPath(retained_path))
+            return error.ImageInputChanged;
+        const retained_file = std.Io.Dir.openFileAbsolute(io, retained_path, .{
+            .mode = .read_only,
+            .follow_symlinks = true,
+        }) catch return error.ImageInputChanged;
+        defer retained_file.close(io);
+        var retained = core.process.Executable.fromFile(io, retained_file) catch
+            return error.ImageInputChanged;
+        defer retained.close(io);
+        if (!std.meta.eql(self_tool.executable.identity, retained.identity))
+            return error.ImageInputChanged;
+    } else if (!std.meta.eql(self_tool.executable.identity, running.identity)) {
+        return error.ImageInputChanged;
+    }
 
     const private_paths = try createEnvironmentDirectories(
         a,
