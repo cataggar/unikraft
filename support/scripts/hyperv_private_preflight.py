@@ -158,10 +158,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "84688382307db55cefe3b1cbee5839455c312120d8f9835415772121ca1d50ad"
+            "950412d37ffa297a253353c9ec8fe1da564b3227b8f7bd81763447cd1cad8c04"
         ),
-        "size": 2465406,
-        "files": 229,
+        "size": 2466822,
+        "files": 230,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -298,6 +298,7 @@ GUARDED_BUILD_CONTROL_FILES = (
     "support/build/native-kconfig-bridge.c",
     "support/build/native-library-link.zig",
     "support/build/native-lto.zig",
+    "support/build/native-make-environment-contract.zig",
     "support/build/native-make-environment.zig",
     "support/build/native-postprocess-runner.py",
     "support/build/native-postprocess-runner.zig",
@@ -492,8 +493,11 @@ GUARDED_PRODUCER_FILES = {
     "support/build/native-lto.zig": (
         "c1c75f1364efe3a84da48f5fb399030822901262d0e6c728529e89341e72b63d"
     ),
+    "support/build/native-make-environment-contract.zig": (
+        "b1eb05c19383d5b3da64c5820b60d41a14334dc0f0dda56b14b2435d24e508d7"
+    ),
     "support/build/native-make-environment.zig": (
-        "8ce57b5cff098a11ba95d4453c919c23a6639146daa94fd687f5f0399638860b"
+        "2c9d31594401b9d7a095e4620d13dd375a7163b9df168284113dce41eb084caa"
     ),
     "support/build/native-target-object.zig": (
         "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"

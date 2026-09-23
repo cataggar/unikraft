@@ -1,0 +1,8 @@
+.{
+    .name = .unikraft_wamr_aot_build,
+    .version = "0.1.0",
+    .fingerprint = 0x7b7774e54b738cff,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{""},
+}
