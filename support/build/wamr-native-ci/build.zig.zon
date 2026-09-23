@@ -5,6 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .public_image = .{ .path = "../../tools/hyperv/public_image" },
+        .wamr_aot_build = .{ .path = "../../apps/wamr-aot" },
     },
     .paths = .{""},
 }

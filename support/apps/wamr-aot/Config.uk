@@ -17,7 +17,7 @@ config APPWAMRAOT_JIT_BOOT_MODE
 	range 0 2
 	default 0
 	help
-	  Set by the image wrapper from prepare.py --variant jit --jit-mode.
+	  Set by uk-wamr-aot-build for prepare --variant jit --jit-mode.
 	  The value must match the independently generated artifact header.
 	  It selects a fixed correctness-only preset when firmware provides no
 	  application arguments. It cannot enable a compiler in an AOT image.

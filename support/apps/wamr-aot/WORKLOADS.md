@@ -13,7 +13,7 @@ Prepare **one variant in each fresh application worktree**. As with the original
 wrapper, preparation refuses existing source/artifact directories rather than
 silently replacing previously identified inputs.
 
-| `prepare.py --variant` | Boot application arguments | Actual linked consumer |
+| `uk-wamr-aot-build prepare --variant` | Boot application arguments | Actual linked consumer |
 | --- | --- | --- |
 | `tiny` (default) | unchanged | Original compiler-free tiny check; optional original CoreMarks |
 | `snapshot` | none or `correctness` | `wamr-aot.benchmark` / `.runner`, one root |
@@ -43,10 +43,16 @@ PIC, final-link-owned compiler-runtime sampler APIs. This supported source pin
 is not qualified image or deployment lineage:
 
 ```sh
-python3 support/apps/wamr-aot/prepare.py prepare \
+umask 077
+tool_root="$PWD/support/apps/wamr-aot/build/tool"
+test ! -e "$tool_root"
+zig build --build-file support/apps/wamr-aot/build.zig \
+  --prefix "$tool_root" -Doptimize=ReleaseSafe install
+tool="$tool_root/bin/uk-wamr-aot-build"
+"$tool" prepare --repository "$PWD" \
   --source /path/to/local/wamr --variant snapshot
-python3 support/apps/wamr-aot/build-image.py olddefconfig
-python3 support/apps/wamr-aot/build-image.py native-images
+"$tool" olddefconfig --repository "$PWD"
+"$tool" native-images --repository "$PWD"
 ```
 
 Repeat in fresh worktrees with `sample-aot`, `jit --jit-mode fast` and
