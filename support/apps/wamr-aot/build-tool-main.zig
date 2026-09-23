@@ -14,11 +14,17 @@ fn run(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     if (arguments.len == 2 and std.mem.eql(u8, arguments[1], "--version")) {
         var stdout = std.Io.File.stdout().writer(init.io, &.{});
-        try stdout.interface.writeAll("uk-wamr-aot-build foundation/1\n");
+        try stdout.interface.writeAll("uk-wamr-aot-build prepare-verify/1\n");
         return;
     }
-    _ = try build_tool.parseArguments(arguments[1..]);
-    return error.FoundationCommandUnavailable;
+    const parsed = try build_tool.parseArguments(arguments[1..]);
+    try build_tool.process.initialize();
+    try build_tool.prepare.execute(
+        init.gpa,
+        init.io,
+        init.environ_map,
+        parsed,
+    );
 }
 
 fn category(err: anyerror) []const u8 {
@@ -31,6 +37,25 @@ fn category(err: anyerror) []const u8 {
         error.UnsafePath,
         => "invalid_invocation",
         error.FoundationCommandUnavailable => "foundation_only",
+        error.UnsupportedProducerIdentity,
+        error.UnsupportedZigVersion,
+        error.SourceRevisionUnavailable,
+        => "unsupported_input",
+        error.ZigVersionCommandFailed,
+        error.GitRevisionCommandFailed,
+        error.GitArchiveCommandFailed,
+        error.RuntimeBuildCommandFailed,
+        error.CompilerBuildCommandFailed,
+        error.SnapshotComputeCommandFailed,
+        error.SnapshotMemoryCommandFailed,
+        error.MatchedWasmCommandFailed,
+        error.MatchedAotCommandFailed,
+        error.WorkloadBuildCommandFailed,
+        error.TinyWasmCommandFailed,
+        error.TinyAotCommandFailed,
+        error.CoremarkCommandFailed,
+        error.CoremarkNofpCommandFailed,
+        => "command_failed",
         else => "local_failure",
     };
 }

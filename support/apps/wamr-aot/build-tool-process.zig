@@ -36,12 +36,31 @@ pub fn resolveTool(
     return searchPath(allocator, io, environment.get("PATH"), name);
 }
 
+pub fn openTool(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    name: []const u8,
+    path: []const u8,
+) !Tool {
+    try toolName(name);
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidToolOverride;
+    const canonical = paths.canonicalizeNearestExisting(allocator, io, path) catch
+        return error.InvalidToolOverride;
+    defer allocator.free(canonical.path);
+    if (!canonical.exists or !std.mem.eql(u8, path, canonical.path))
+        return error.InvalidToolOverride;
+    return openCanonical(allocator, io, name, canonical.path);
+}
+
 pub const RunOptions = struct {
     argv: []const []const u8,
+    allow_named_argv0: bool = false,
     environment: *const std.process.Environ.Map,
     cwd: std.Io.Dir,
     primary_deadline: Deadline,
     cleanup_deadline: Deadline,
+    stdout_file: ?std.Io.File = null,
+    snapshot_executable: bool = true,
     stdout_bytes: usize = maximum_diagnostic_bytes,
     stderr_bytes: usize = maximum_diagnostic_bytes,
 };
@@ -60,10 +79,13 @@ pub fn run(
     return core.process.runCommand(allocator, io, .{
         .executable = tool.executable,
         .argv = options.argv,
+        .allow_named_argv0 = options.allow_named_argv0,
         .environment = options.environment,
         .cwd = options.cwd,
         .primary_deadline = options.primary_deadline,
         .cleanup_deadline = options.cleanup_deadline,
+        .stdout_file = options.stdout_file,
+        .snapshot_executable = options.snapshot_executable,
         .limits = .{
             .stdout_bytes = options.stdout_bytes,
             .stderr_bytes = options.stderr_bytes,

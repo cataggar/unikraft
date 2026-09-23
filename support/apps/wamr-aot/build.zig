@@ -62,9 +62,23 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const prepare_fixture = b.addExecutable(.{
+        .name = "wamr-aot-build-prepare-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/build_tool_prepare_fixture.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
     const options = b.addOptions();
     options.addOptionPath("cli", executable.getEmittedBin());
     options.addOptionPath("process_fixture", process_fixture.getEmittedBin());
+    options.addOptionPath("prepare_fixture", prepare_fixture.getEmittedBin());
+    options.addOption(
+        []const u8,
+        "zig_lib_dir",
+        b.graph.zig_lib_directory.path.?,
+    );
     options.addOption(
         []const u8,
         "repository_root",
@@ -110,8 +124,19 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("test-integration", "Run native WAMR build executable and supervisor fixtures");
     integration_step.dependOn(&integration_run.step);
 
-    const differential_step = b.step("test-differential", "Run frozen Python-compatibility helper goldens");
-    differential_step.dependOn(&unit_run.step);
+    const differential_run = b.addSystemCommand(&.{"python3"});
+    differential_run.addFileArg(b.path("tests/test_prepare_differential.py"));
+    differential_run.addFileArg(executable.getEmittedBin());
+    differential_run.addFileArg(prepare_fixture.getEmittedBin());
+    differential_run.addArg(b.graph.zig_lib_directory.path.?);
+    differential_run.addArg(b.cache_root.path orelse "zig-cache");
+    differential_run.setCwd(.{ .cwd_relative = b.build_root.path.? });
+    differential_run.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
+    const differential_step = b.step(
+        "test-differential",
+        "Compare native prepare and verify with the Python reference",
+    );
+    differential_step.dependOn(&differential_run.step);
     const all = b.step("test", "Run native WAMR build foundation tests");
     all.dependOn(unit_step);
     all.dependOn(integration_step);
