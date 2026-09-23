@@ -446,6 +446,16 @@ fn resolveSelectedTool(
     };
 }
 
+fn imageInputChanged(io: std.Io, state: std.Io.Dir, guard: []const u8) anyerror {
+    contract.files.writePrivateAtomicReplace(
+        io,
+        state,
+        "failure-image-guard.txt",
+        guard,
+    ) catch {};
+    return error.ImageInputChanged;
+}
+
 const NamedDigest = struct {
     name: []u8,
     sha256: [64]u8,
@@ -533,22 +543,22 @@ fn executeOpen(
             &self_tool.executable.identity.content_sha256,
             &running.identity.content_sha256,
         ))
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "running-bytes");
     if (inherited.get("WAMR_CI_RETAINED_EXECUTABLE")) |retained_path| {
         if (!contract.process.retainedDescriptorPath(retained_path))
-            return error.ImageInputChanged;
+            return imageInputChanged(io, state, "retained-path");
         const retained_file = std.Io.Dir.openFileAbsolute(io, retained_path, .{
             .mode = .read_only,
             .follow_symlinks = true,
-        }) catch return error.ImageInputChanged;
+        }) catch return imageInputChanged(io, state, "retained-open");
         defer retained_file.close(io);
         var retained = core.process.Executable.fromFile(io, retained_file) catch
-            return error.ImageInputChanged;
+            return imageInputChanged(io, state, "retained-validation");
         defer retained.close(io);
         if (!std.meta.eql(self_tool.executable.identity, retained.identity))
-            return error.ImageInputChanged;
+            return imageInputChanged(io, state, "retained-identity");
     } else if (!std.meta.eql(self_tool.executable.identity, running.identity)) {
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "direct-identity");
     }
 
     const private_paths = try createEnvironmentDirectories(
@@ -655,7 +665,7 @@ fn executeOpen(
     var tools_after = try SelectedTools.resolve(allocator, io, inherited, state);
     defer tools_after.close(allocator, io);
     if (!SelectedTools.same(&tools, &tools_after))
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "tools-after-root");
     var self_after = contract.process.openTool(
         allocator,
         io,
@@ -674,7 +684,7 @@ fn executeOpen(
     if (!std.meta.eql(
         self_tool.executable.identity,
         self_after.executable.identity,
-    )) return error.ImageInputChanged;
+    )) return imageInputChanged(io, state, "self-after-root");
 
     if (command == .olddefconfig) {
         var solved = try contract.files.RetainedFile.open(io, config_path, .private);
@@ -686,8 +696,10 @@ fn executeOpen(
         return;
     }
 
-    config_input.?.verify(io) catch return error.ImageInputChanged;
-    runtime_input.?.verify(io) catch return error.ImageInputChanged;
+    config_input.?.verify(io) catch
+        return imageInputChanged(io, state, "config-after-root");
+    runtime_input.?.verify(io) catch
+        return imageInputChanged(io, state, "runtime-after-root");
     const application_after = try applicationIdentities(
         allocator,
         io,
@@ -695,7 +707,7 @@ fn executeOpen(
     );
     defer freeNamedDigests(allocator, application_after);
     if (!sameNamedDigests(application_before.?, application_after))
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "application-after-root");
 
     var git = try contract.process.resolveTool(allocator, io, inherited, "git");
     defer git.close(allocator, io);
@@ -785,8 +797,10 @@ fn executeOpen(
         runtime_inputs_sha256,
     );
     try published.verify(io);
-    config_input.?.verify(io) catch return error.ImageInputChanged;
-    runtime_input.?.verify(io) catch return error.ImageInputChanged;
+    config_input.?.verify(io) catch
+        return imageInputChanged(io, state, "config-after-identity");
+    runtime_input.?.verify(io) catch
+        return imageInputChanged(io, state, "runtime-after-identity");
     const final_applications = try applicationIdentities(
         allocator,
         io,
@@ -794,15 +808,15 @@ fn executeOpen(
     );
     defer freeNamedDigests(allocator, final_applications);
     if (!sameNamedDigests(application_after, final_applications))
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "application-after-identity");
     const final_images = try imageIdentities(allocator, io, build_path);
     defer freeNamedDigests(allocator, final_images);
     if (!sameNamedDigests(file_identities, final_images))
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "images-after-identity");
     var final_tools = try SelectedTools.resolve(allocator, io, inherited, state);
     defer final_tools.close(allocator, io);
     if (!SelectedTools.same(&tools, &final_tools))
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "tools-after-identity");
     var final_self = try contract.process.openTool(
         allocator,
         io,
@@ -813,7 +827,7 @@ fn executeOpen(
     if (!std.meta.eql(
         self_tool.executable.identity,
         final_self.executable.identity,
-    )) return error.ImageInputChanged;
+    )) return imageInputChanged(io, state, "self-after-identity");
 }
 
 const EnvironmentPaths = struct {

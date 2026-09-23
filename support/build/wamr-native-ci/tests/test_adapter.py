@@ -4444,15 +4444,19 @@ source/generated/
         state.mkdir(parents=True, mode=0o700)
         (app / "build").chmod(0o700)
         self.put(state / "failure-error-name.txt", b"ImageInputChanged")
+        self.put(state / "failure-image-guard.txt", b"config-after-root")
         with mock.patch.object(ci, "APP", app):
             ci.diagnostics(runtime)
         raw = (root / "evidence/diagnostics.json").read_bytes()
         self.assertNotIn(b"ImageInputChanged", raw)
+        self.assertNotIn(b"config-after-root", raw)
         self.assertNotIn(str(self.root).encode(), raw)
         self.assertEqual(json.loads(raw)["build_failures"]["native-image"], {
             "exit_code": 2,
             "native_error_name_sha256":
                 hashlib.sha256(b"ImageInputChanged").hexdigest(),
+            "image_guard_sha256":
+                hashlib.sha256(b"config-after-root").hexdigest(),
         })
 
     def test_command_markers_are_closed_diagnostics_not_external_text(self):

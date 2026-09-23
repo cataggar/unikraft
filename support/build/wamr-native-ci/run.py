@@ -5546,6 +5546,14 @@ def diagnostics(runtime):
             "native_error_name_sha256": hashlib.sha256(error_name).hexdigest(),
         }
         try:
+            guard = read(private / "failure-image-guard.txt", 96)
+            require(re.fullmatch(rb"[a-z][a-z0-9-]{0,79}", guard),
+                    "invalid native image guard")
+            build_failures["native-image"]["image_guard_sha256"] = (
+                hashlib.sha256(guard).hexdigest())
+        except (OSError, Refusal):
+            pass
+        try:
             role = read(private / "failure-tool-role.txt", 96)
             require(re.fullmatch(rb"[a-z][a-z0-9-]{0,79}", role),
                     "invalid native tool role")

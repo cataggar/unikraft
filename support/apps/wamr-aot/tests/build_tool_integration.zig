@@ -507,6 +507,19 @@ test "native config refuses a supplied executable that differs from the running 
         "wamr_aot_build_failed category=unsupported_input\n",
         wrong_retained.stderr,
     );
+    const guard_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/build/native-environment/failure-image-guard.txt" },
+    );
+    defer allocator.free(guard_path);
+    const guard = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        guard_path,
+        allocator,
+        .limited(96),
+    );
+    defer allocator.free(guard);
+    try testing.expectEqualStrings("retained-identity", guard);
 }
 
 test "native config binds a supervisor snapshot to its retained physical executable" {

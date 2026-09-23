@@ -342,7 +342,8 @@ never creates `result.json`. Evidence collection
 is diagnostic only and cannot turn failure into success.
 Native config and image failures additionally report SHA-256 digests of
 the compiled error name and, if a tool was rejected, its selected role.
-Neither value's source text nor child output is included in the metadata
+An image-input refusal may also report a digest of the fixed guard stage.
+No source text from these fields or child output is included in the metadata
 artifact.
 
 ## Focused checks
