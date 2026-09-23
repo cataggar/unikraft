@@ -5521,6 +5521,40 @@ def diagnostics(runtime):
         })
     except (OSError, ValueError, KeyError, TypeError, Refusal):
         pass
+    try:
+        command = document(root / "evidence/command-native-image.json")
+        require(type(command["exit_code"]) is int
+                and command["exit_code"] != 0, "invalid diagnostic")
+        private = APP / "build"
+        for component in ("native-environment",):
+            info = private.lstat()
+            require(stat.S_ISDIR(info.st_mode)
+                    and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o700,
+                    "invalid diagnostic directory")
+            private /= component
+        info = private.lstat()
+        require(stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700,
+                "invalid diagnostic directory")
+        error_name = read(private / "failure-error-name.txt", 96)
+        require(re.fullmatch(rb"[A-Z][A-Za-z0-9]{0,79}", error_name),
+                "invalid native error name")
+        build_failures["native-image"] = {
+            "exit_code": command["exit_code"],
+            "native_error_name_sha256": hashlib.sha256(error_name).hexdigest(),
+        }
+        try:
+            role = read(private / "failure-tool-role.txt", 96)
+            require(re.fullmatch(rb"[a-z][a-z0-9-]{0,79}", role),
+                    "invalid native tool role")
+            build_failures["native-image"]["tool_role_sha256"] = (
+                hashlib.sha256(role).hexdigest())
+        except (OSError, Refusal):
+            pass
+    except (OSError, ValueError, KeyError, TypeError, Refusal):
+        pass
     save(root / "evidence/diagnostics.json", {
         "scope": "diagnostics_not_acceptance",
         "redaction": "no_raw_serial_paths_environment_or_account_state",

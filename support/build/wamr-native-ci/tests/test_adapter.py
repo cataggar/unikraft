@@ -4433,6 +4433,28 @@ source/generated/
                 hashlib.sha256(b"InvalidBisonData").hexdigest(),
         })
 
+    def test_native_image_failure_digest_without_private_text(self):
+        runtime = self.root
+        root = runtime / "compute"
+        root.mkdir(mode=0o700)
+        (root / "evidence").mkdir(mode=0o700)
+        ci.save(root / "evidence/command-native-image.json", {"exit_code": 2})
+        app = self.root / "synthetic-app"
+        state = app / "build/native-environment"
+        state.mkdir(parents=True, mode=0o700)
+        (app / "build").chmod(0o700)
+        self.put(state / "failure-error-name.txt", b"ImageInputChanged")
+        with mock.patch.object(ci, "APP", app):
+            ci.diagnostics(runtime)
+        raw = (root / "evidence/diagnostics.json").read_bytes()
+        self.assertNotIn(b"ImageInputChanged", raw)
+        self.assertNotIn(str(self.root).encode(), raw)
+        self.assertEqual(json.loads(raw)["build_failures"]["native-image"], {
+            "exit_code": 2,
+            "native_error_name_sha256":
+                hashlib.sha256(b"ImageInputChanged").hexdigest(),
+        })
+
     def test_command_markers_are_closed_diagnostics_not_external_text(self):
         raw = (b"\xff\0error: UnsafeFile\nerror: InvalidNativeMakePath\n"
                b"error: PRIVATE_SYNTHETIC_STATE\nUnsafeFileSuffix\n"
