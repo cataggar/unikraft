@@ -38,6 +38,8 @@ SIX_MODES = (
     "vpc-x2apic", "vpc-legacy-apic",
 )
 CURRENT_PROFILE = "qcow2-derived-vhd"
+WAMR_AOT_BUILD_ROLE = "native:wamr-aot-build"
+WAMR_AOT_BUILD_RELATIVE = "compute/tools/bin/uk-wamr-aot-build"
 RECORDED_EXECUTABLE_TARGET = (
     "-Dtarget=x86_64-linux-gnu", "-Dcpu=x86_64_v2",
 )
@@ -1226,7 +1228,7 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None,
     return result
 
 
-def discover_consumer_input_paths(runtime):
+def discover_consumer_input_paths(runtime, expected=None):
     runtime = Path(runtime)
     tool_paths = {name: Path(tool(name)) for name in HOST_TOOLS}
     runtime_paths = set()
@@ -1253,6 +1255,19 @@ def discover_consumer_input_paths(runtime):
     archive = runtime / "custody/wamr-source.tar"
     if archive.is_file() and not archive.is_symlink():
         file_paths["wamr-source-archive"] = archive
+    wamr_aot_build = runtime / WAMR_AOT_BUILD_RELATIVE
+    expected_native = (
+        expected is not None
+        and WAMR_AOT_BUILD_ROLE in expected.get("files", {})
+    )
+    if expected_native or (
+            expected is None
+            and (wamr_aot_build.exists() or wamr_aot_build.is_symlink())):
+        require(wamr_aot_build.is_file() and not wamr_aot_build.is_symlink(),
+                "installed native WAMR build executable unavailable")
+        file_paths[WAMR_AOT_BUILD_ROLE] = wamr_aot_build
+        for path in executable_runtime_paths(wamr_aot_build):
+            file_paths[f"runtime:{path}"] = path
     return (
         canonical_input_paths(
             file_paths, "invalid consumer input file discovery"),
@@ -1262,7 +1277,7 @@ def discover_consumer_input_paths(runtime):
 
 
 def consumer_input_state(runtime, content=True, expected=None):
-    file_paths, tree_paths = discover_consumer_input_paths(runtime)
+    file_paths, tree_paths = discover_consumer_input_paths(runtime, expected)
     return record_input_paths(
         file_paths, tree_paths, content=content, expected=expected)
 
@@ -2650,43 +2665,44 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
             ],
         },
         "prepare": {
-            "kind": "build-fixtures", "seconds": 1800,
+            "kind": "build-native", "seconds": 1800,
             "output_limit": 8 * MIB,
-            "command_executable": command_path("tool:python3"),
-            "native_executable": command_path("tool:python3"),
-            "interpreter": command_path("tool:python3"),
+            "command_executable": command_path(WAMR_AOT_BUILD_ROLE),
+            "native_executable": command_path(WAMR_AOT_BUILD_ROLE),
+            "interpreter": None,
             "argv": [
-                command_path("tool:python3"),
-                command_path("source", "support/apps/wamr-aot/prepare.py"),
+                command_path(WAMR_AOT_BUILD_ROLE),
                 command_literal("prepare"),
+                command_literal("--repository"),
+                command_path("source"),
                 command_literal("--source-archive"),
                 command_path("runtime", "custody/wamr-source.tar"),
             ],
         },
         "config": {
-            "kind": "build-fixtures", "seconds": 600,
+            "kind": "build-native", "seconds": 600,
             "output_limit": 8 * MIB,
-            "command_executable": command_path("tool:python3"),
-            "native_executable": command_path("tool:python3"),
-            "interpreter": command_path("tool:python3"),
+            "command_executable": command_path(WAMR_AOT_BUILD_ROLE),
+            "native_executable": command_path(WAMR_AOT_BUILD_ROLE),
+            "interpreter": None,
             "argv": [
-                command_path("tool:python3"),
-                command_path(
-                    "source", "support/apps/wamr-aot/build-image.py"),
+                command_path(WAMR_AOT_BUILD_ROLE),
                 command_literal("olddefconfig"),
+                command_literal("--repository"),
+                command_path("source"),
             ],
         },
         "native-image": {
-            "kind": "build-fixtures", "seconds": 1800,
+            "kind": "build-native", "seconds": 1800,
             "output_limit": 8 * MIB,
-            "command_executable": command_path("tool:python3"),
-            "native_executable": command_path("tool:python3"),
-            "interpreter": command_path("tool:python3"),
+            "command_executable": command_path(WAMR_AOT_BUILD_ROLE),
+            "native_executable": command_path(WAMR_AOT_BUILD_ROLE),
+            "interpreter": None,
             "argv": [
-                command_path("tool:python3"),
-                command_path(
-                    "source", "support/apps/wamr-aot/build-image.py"),
+                command_path(WAMR_AOT_BUILD_ROLE),
                 command_literal("native-images"),
+                command_literal("--repository"),
+                command_path("source"),
             ],
         },
         "package": {
@@ -4549,15 +4565,20 @@ def run_custodied(runtime, expected, root, stage, args, seconds=600,
     records = consumer_file_records(expected["consumer_inputs"])
     if extra_inputs is not None:
         records.update(consumer_file_records(extra_inputs))
-    path_roles = None
+    path_roles = {
+        role: Path(record["path"])
+        for role, record
+        in expected["consumer_inputs"].get("files", {}).items()
+        if role.startswith("native:")
+    }
     if extra_input_paths is not None:
-        path_roles = {
+        path_roles.update({
             "input:" + name: path
             for name, path in extra_input_paths.items()
-        }
+        })
     output = run(
         root, stage, args, seconds, limit, input_records=records,
-        path_roles=path_roles)
+        path_roles=path_roles or None)
     record_path = root / "evidence" / ("command-" + stage + ".json")
     if stage in PRODUCTION_COMMAND_STAGES and record_path.is_file():
         role_identities = {
@@ -4567,6 +4588,12 @@ def run_custodied(runtime, expected, root, stage, args, seconds=600,
                 "tool:" + name: native_executable_identity(
                     expected["consumer_inputs"]["files"]["tool:" + name])
                 for name in HOST_TOOLS
+            },
+            **{
+                role: native_executable_identity(record)
+                for role, record
+                in expected["consumer_inputs"].get("files", {}).items()
+                if role.startswith("native:")
             },
         }
         if extra_inputs is not None:
@@ -4913,8 +4940,8 @@ def build(runtime, wamr):
     bootstrap_inputs = consumer_input_state(runtime)
     packages = restore_dependencies(runtime, root, bootstrap_inputs)
     build_command_supervisor(runtime, root, packages, bootstrap_inputs)
-    consumer_inputs = consumer_input_state(runtime)
-    COMMAND_ENVIRONMENT.update(bind_command_tools(consumer_inputs))
+    bootstrap_consumer_inputs = consumer_input_state(runtime)
+    COMMAND_ENVIRONMENT.update(bind_command_tools(bootstrap_consumer_inputs))
     os.environ.update(COMMAND_ENVIRONMENT)
     initial_source = source()
     save(root / "private/source-metadata.json", {
@@ -4922,27 +4949,34 @@ def build(runtime, wamr):
         "version": 1,
         "records": source_metadata(),
     })
-    initial = producer_inputs(runtime, consumer_inputs)
-    require(initial["source"] == source_identity(initial_source)
-            and initial["source_custody"] == initial_source["custody"],
+    bootstrap = producer_inputs(runtime, bootstrap_consumer_inputs)
+    require(bootstrap["source"] == source_identity(initial_source)
+            and bootstrap["source_custody"] == initial_source["custody"],
             "source changed during dependency restoration")
-    save(root / "evidence/build-start.json", initial)
     zig = tool("zig")
-    consumer_records = consumer_file_records(consumer_inputs)
+    consumer_records = consumer_file_records(bootstrap_consumer_inputs)
     version_path, unused_record = execute(
         root, "zig-version", [zig, "version"], 30, 64,
         evidence=False, input_records=consumer_records)
     del unused_record
     version = read(version_path, 65)
     require(version.strip() == b"0.16.0", "Zig 0.16.0 required")
-    run_custodied(runtime, initial, root, "adapter", [
+    run_custodied(runtime, bootstrap, root, "adapter", [
         tool("zig"), "build", "--build-file", HERE / "build.zig",
         "--system", packages, "--prefix", root / "tools",
         "-Doptimize=ReleaseSafe", "-j2", "test-unit", "install"], 900)
-    run_custodied(runtime, initial, root, "local-boot-tool", [
+    run_custodied(runtime, bootstrap, root, "local-boot-tool", [
         tool("zig"), "build", "--build-file", LOCAL_BOOT / "build.zig",
         "--system", packages, "--prefix", root / "tools",
         "-Doptimize=ReleaseSafe", "-j2", "install"], 900)
+    consumer_inputs = consumer_input_state(runtime)
+    COMMAND_ENVIRONMENT.update(bind_command_tools(consumer_inputs))
+    os.environ.update(COMMAND_ENVIRONMENT)
+    initial = producer_inputs(runtime, consumer_inputs)
+    require(initial["source"] == source_identity(initial_source)
+            and initial["source_custody"] == initial_source["custody"],
+            "source changed during native tool installation")
+    save(root / "evidence/build-start.json", initial)
     COMMAND_ENVIRONMENT.update({
         "WAMR_CI_PACKAGE": str(root / "tools/bin/wamr-ci-package"),
         "WAMR_CI_PYTHON": tool("python3"),
@@ -4952,18 +4986,19 @@ def build(runtime, wamr):
     os.environ.update(COMMAND_ENVIRONMENT)
     run_custodied(runtime, initial, root, "fixtures", [
         sys.executable, "-m", "unittest", "discover", "-s", HERE / "tests", "-v"])
+    wamr_aot_build = root / "tools/bin/uk-wamr-aot-build"
     run_custodied(runtime, initial, root, "prepare", [
-        sys.executable, APP / "prepare.py", "prepare",
+        wamr_aot_build, "prepare", "--repository", REPO,
         "--source-archive", source_archive], 1800)
     run_custodied(runtime, initial, root, "config", [
-        sys.executable, APP / "build-image.py", "olddefconfig"])
+        wamr_aot_build, "olddefconfig", "--repository", REPO])
     require_no_config_backup()
     retain_solved_config()
     solved_config()
     require_build_custody(runtime, initial)
     # This target includes the unchanged final ELF IRQ/constructor/SMP proofs.
     run_custodied(runtime, initial, root, "native-image", [
-        sys.executable, APP / "build-image.py", "native-images"], 1800)
+        wamr_aot_build, "native-images", "--repository", REPO], 1800)
     solved_config()
     require(producer_inputs(runtime, consumer_inputs) == initial,
             "source or producer tool changed during build")

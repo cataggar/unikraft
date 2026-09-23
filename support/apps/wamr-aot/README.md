@@ -20,12 +20,18 @@ Use Zig **0.16.0**, Python 3, Make, Bison/Flex (including their usual
 Unikraft checkout:
 
 ```sh
-python3 support/apps/wamr-aot/prepare.py prepare --source /path/to/wamr
-python3 support/apps/wamr-aot/build-image.py olddefconfig
-python3 support/apps/wamr-aot/build-image.py native-images
+umask 077
+tool_root="$PWD/support/apps/wamr-aot/build/tool"
+test ! -e "$tool_root"
+zig build --build-file support/apps/wamr-aot/build.zig \
+  --prefix "$tool_root" -Doptimize=ReleaseSafe install
+tool="$tool_root/bin/uk-wamr-aot-build"
+"$tool" prepare --repository "$PWD" --source /path/to/wamr
+"$tool" olddefconfig --repository "$PWD"
+"$tool" native-images --repository "$PWD"
 ```
 
-`prepare.py` exports exactly WAMR
+`uk-wamr-aot-build prepare` exports exactly WAMR
 `a53205d77be3b880eb8f8b96679512ba58e2331a` from the local Git object
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
@@ -34,6 +40,9 @@ then the integration archive. The tiny wasm is genuinely generated from
 `fixture.zig` and compiled with `--target=x86_64
 --profile=unikraft-x86_64`. Hosted artifacts are not renamed or relabelled.
 Only trusted output of this pinned producer is admissible.
+The retained Python producers remain for differential and legacy test fixtures
+until the final removal PR; production Make, local commands and CI have no
+Python fallback.
 
 The same merged SDK supplies the single-root CoreMark bridge and optional
 workloads in [WORKLOADS.md](WORKLOADS.md). This source pin does not establish

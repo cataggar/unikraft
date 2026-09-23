@@ -10,7 +10,11 @@ APPWAMRAOT_CINCLUDES-y += -I$(APPWAMRAOT_BASE)/build/artifacts
 APPWAMRAOT_CINCLUDES-y += -I$(UK_PLAT_BASE)/hyperv/include
 APPWAMRAOT_OBJS-y += $(APPWAMRAOT_BASE)/build/artifacts/libwamr-aot.a
 
+ifeq ($(strip $(APPWAMRAOT_TOOL)),)
+$(error APPWAMRAOT_TOOL must name the installed native WAMR build executable)
+endif
+
 .PHONY: wamr_aot_verify
 UK_PREPARE-y += wamr_aot_verify
 wamr_aot_verify:
-	@python3 $(APPWAMRAOT_BASE)/prepare.py verify
+	@"$(APPWAMRAOT_TOOL)" verify --repository "$(CONFIG_UK_BASE)"

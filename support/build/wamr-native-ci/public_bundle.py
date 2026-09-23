@@ -623,12 +623,20 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
     files = consumer_inputs["files"]
     required_files = (
         {f"tool:{name}" for name in ci.HOST_TOOLS}
-        | {"wamr-source-archive", "command-supervisor"})
+        | {
+            "wamr-source-archive",
+            "command-supervisor",
+            ci.WAMR_AOT_BUILD_ROLE,
+        })
     require(required_files <= set(files))
     supervisor = (
         runtime / "compute/supervisor/bin/wamr-ci-supervisor").resolve(
             strict=True)
+    wamr_aot_build = (
+        runtime / ci.WAMR_AOT_BUILD_RELATIVE).resolve(strict=True)
     require(files["command-supervisor"]["path"] == str(supervisor)
+            and files[ci.WAMR_AOT_BUILD_ROLE]["path"]
+            == str(wamr_aot_build)
             and files["wamr-source-archive"]["path"]
             == str((runtime / "custody/wamr-source.tar").resolve(
                 strict=True)))
@@ -637,6 +645,7 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
         runtime_paths.update(ci.executable_runtime_paths(
             Path(files["tool:" + name]["path"])))
     runtime_paths.update(ci.executable_runtime_paths(supervisor))
+    runtime_paths.update(ci.executable_runtime_paths(wamr_aot_build))
     expected_files = required_files | {
         "runtime:" + str(path) for path in runtime_paths
     }

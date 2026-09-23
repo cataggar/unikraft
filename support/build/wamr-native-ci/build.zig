@@ -22,6 +22,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(supervisor_fixture);
 
     const image = b.dependency("public_image", .{ .target = target, .optimize = optimize }).module("hyperv_public_image");
+    const wamr_aot_build = b.dependency("wamr_aot_build", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(wamr_aot_build.artifact("uk-wamr-aot-build"));
     const root = b.createModule(.{
         .root_source_file = b.path("package.zig"),
         .target = target,

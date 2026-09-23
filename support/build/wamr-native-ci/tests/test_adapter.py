@@ -179,6 +179,97 @@ class Contract(unittest.TestCase):
                     self.assertRaisesRegex(ci.Refusal, "not the pinned tiny producer"):
                 ci.check_build()
 
+    def test_production_build_stages_bind_only_the_native_wamr_controller(self):
+        executable = ci.command_path(ci.WAMR_AOT_BUILD_ROLE)
+        expected = {
+            "prepare": [
+                executable,
+                ci.command_literal("prepare"),
+                ci.command_literal("--repository"),
+                ci.command_path("source"),
+                ci.command_literal("--source-archive"),
+                ci.command_path("runtime", "custody/wamr-source.tar"),
+            ],
+            "config": [
+                executable,
+                ci.command_literal("olddefconfig"),
+                ci.command_literal("--repository"),
+                ci.command_path("source"),
+            ],
+            "native-image": [
+                executable,
+                ci.command_literal("native-images"),
+                ci.command_literal("--repository"),
+                ci.command_path("source"),
+            ],
+        }
+        for stage, argv in expected.items():
+            with self.subTest(stage=stage):
+                contract = ci.production_command_contract(stage)
+                self.assertEqual(contract["kind"], "build-native")
+                self.assertEqual(contract["command_executable"], executable)
+                self.assertEqual(contract["native_executable"], executable)
+                self.assertIsNone(contract["interpreter"])
+                self.assertEqual(contract["argv"], argv)
+                environment = {
+                    item["name"] for item in contract["environment"]
+                }
+                self.assertNotIn("WAMR_CI_PYTHON", environment)
+                self.assertNotIn("WAMR_CI_PYTHON",
+                                 contract["retained_names"])
+
+    def test_python_controller_files_are_differential_oracles_only(self):
+        production = (
+            ci.APP / "Makefile",
+            ci.APP / "Makefile.uk",
+            ci.APP / "README.md",
+            ci.APP / "WORKLOADS.md",
+            ci.APP / "Config.uk",
+            ci.HERE / "run.py",
+            ci.HERE / "README.md",
+            ci.REPO / ".github/workflows/wamr-native-compute.yaml",
+        )
+        for path in production:
+            with self.subTest(path=path):
+                text = path.read_text()
+                self.assertNotIn("prepare.py", text)
+                self.assertNotIn("build-image.py", text)
+        self.assertIn(
+            "prepare.py",
+            (ci.APP / "tests/test_prepare_differential.py").read_text(),
+        )
+        self.assertIn(
+            "build-image.py",
+            (ci.APP / "tests/test_image_differential.py").read_text(),
+        )
+        makefile = (ci.APP / "Makefile").read_text()
+        makefile_uk = (ci.APP / "Makefile.uk").read_text()
+        self.assertIn(
+            "APPWAMRAOT_TOOL ?= "
+            "$(CURDIR)/build/tool/bin/uk-wamr-aot-build",
+            makefile,
+        )
+        self.assertIn(
+            '"$(APPWAMRAOT_TOOL)" verify --repository "$(CONFIG_UK_BASE)"',
+            makefile_uk,
+        )
+        self.assertNotIn("command -v", makefile + makefile_uk)
+
+    def test_adapter_installs_the_app_owned_native_wamr_artifact(self):
+        manifest = (ci.HERE / "build.zig.zon").read_text()
+        build = (ci.HERE / "build.zig").read_text()
+        self.assertIn(
+            '.wamr_aot_build = .{ .path = "../../apps/wamr-aot" }',
+            manifest,
+        )
+        self.assertEqual(
+            build.count('b.dependency("wamr_aot_build"'), 1)
+        self.assertEqual(
+            build.count(
+                'wamr_aot_build.artifact("uk-wamr-aot-build")'),
+            1,
+        )
+
 
 class PhysicalPackage(unittest.TestCase):
     """Run the actual native adapter + pinned miz on a nonbootable synthetic PE."""
@@ -1540,6 +1631,61 @@ class Evidence(unittest.TestCase):
             ci.COMMAND_TOOL_PATHS.clear()
             ci.COMMAND_TOOL_PATHS.update(original_tools)
 
+    def test_native_wamr_role_enters_only_the_final_consumer_baseline(self):
+        runtime = self.root / "native-role"
+        executable = runtime / ci.WAMR_AOT_BUILD_RELATIVE
+        executable.parent.mkdir(parents=True, mode=0o700)
+
+        def canonical(paths, unused_reason):
+            return dict(paths)
+
+        patches = (
+            mock.patch.object(
+                ci, "tool", side_effect=lambda name: f"/tools/{name}"),
+            mock.patch.object(
+                ci, "executable_runtime_paths", return_value=set()),
+            mock.patch.object(
+                ci, "canonical_input_paths", side_effect=canonical),
+        )
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            files, unused_trees = ci.discover_consumer_input_paths(runtime)
+            self.assertNotIn(ci.WAMR_AOT_BUILD_ROLE, files)
+
+            self.put(executable, b"native executable")
+            executable.chmod(0o700)
+            files, unused_trees = ci.discover_consumer_input_paths(runtime)
+            self.assertEqual(
+                files[ci.WAMR_AOT_BUILD_ROLE], executable)
+
+            files, unused_trees = ci.discover_consumer_input_paths(
+                runtime, {"files": {}})
+            self.assertNotIn(ci.WAMR_AOT_BUILD_ROLE, files)
+
+            files, unused_trees = ci.discover_consumer_input_paths(
+                runtime, {"files": {ci.WAMR_AOT_BUILD_ROLE: {}}})
+            self.assertEqual(
+                files[ci.WAMR_AOT_BUILD_ROLE], executable)
+
+            sealed = ci.record_input_paths(
+                {ci.WAMR_AOT_BUILD_ROLE: executable}, {})
+            executable.write_bytes(b"changed executable")
+            with self.assertRaises(ci.Refusal):
+                ci.record_input_paths(
+                    {ci.WAMR_AOT_BUILD_ROLE: executable}, {},
+                    expected=sealed)
+
+            executable.unlink()
+            executable.symlink_to("/does/not/exist")
+            with self.assertRaisesRegex(
+                    ci.Refusal,
+                    "installed native WAMR build executable unavailable"):
+                ci.discover_consumer_input_paths(
+                    runtime,
+                    {"files": {ci.WAMR_AOT_BUILD_ROLE: {}}},
+                )
+
     def test_recorded_consumer_revalidation_allows_only_new_roles(self):
         inputs = self.root / "recorded-consumer-inputs"
         inputs.mkdir(mode=0o700)
@@ -1609,7 +1755,7 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
         commands = []
 
         source = {"revision": "1" * 40, "tree": "2" * 40, "custody": {}}
-        consumer = {
+        bootstrap_consumer = {
             "schema": "fixture",
             "files": {
                 f"tool:{name}": {"path": f"/tools/{name}"}
@@ -1618,29 +1764,35 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 "command-supervisor": {"path": "/tools/supervisor"},
             },
         }
+        consumer = copy.deepcopy(bootstrap_consumer)
+        consumer["files"][ci.WAMR_AOT_BUILD_ROLE] = {
+            "path": str(
+                runtime / "compute/tools/bin/uk-wamr-aot-build"),
+        }
 
         def restore(runtime_value, root, expected_inputs):
             events.append("restore")
             self.assertEqual(runtime_value, runtime)
-            self.assertEqual(expected_inputs, consumer)
+            self.assertEqual(expected_inputs, bootstrap_consumer)
             return packages
 
         def supervisor(runtime_value, root, package_tree, expected_inputs):
             events.append("supervisor")
             self.assertEqual(runtime_value, runtime)
             self.assertEqual(package_tree, packages)
-            self.assertEqual(expected_inputs, consumer)
+            self.assertEqual(expected_inputs, bootstrap_consumer)
             return Path("/tools/supervisor")
 
         def inputs(root, expected_consumer=None, content=True):
             events.append("custody")
-            self.assertEqual(expected_consumer, consumer)
+            self.assertIn(
+                expected_consumer, (bootstrap_consumer, consumer))
             self.assertTrue(content)
             return {
                 "source": ci.source_identity(source),
                 "source_custody": source["custody"],
                 "dependencies": {},
-                "consumer_inputs": consumer,
+                "consumer_inputs": expected_consumer,
                 "command_supervisor": {"schema": "fixture"},
             }
 
@@ -1670,7 +1822,13 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
                 ("prepare_source_outputs", {}),
                 ("seal_wamr_source", {
                     "return_value": runtime / "custody/wamr-source.tar"}),
-                ("consumer_input_state", {"return_value": consumer}),
+                ("consumer_input_state", {
+                    "side_effect": [
+                        bootstrap_consumer,
+                        bootstrap_consumer,
+                        consumer,
+                    ],
+                }),
                 ("source", {"return_value": source}),
                 ("source_metadata", {"return_value": []}),
                 ("restore_dependencies", {"side_effect": restore}),
@@ -1713,6 +1871,30 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             )
         self.assertIn("test-unit", selected["adapter"])
         self.assertNotIn("test", selected["adapter"])
+        wamr_aot_build = str(
+            runtime / "compute/tools/bin/uk-wamr-aot-build")
+        self.assertEqual(selected["prepare"], [
+            wamr_aot_build,
+            "prepare",
+            "--repository",
+            str(ci.REPO),
+            "--source-archive",
+            str(runtime / "custody/wamr-source.tar"),
+        ])
+        self.assertEqual(selected["config"], [
+            wamr_aot_build,
+            "olddefconfig",
+            "--repository",
+            str(ci.REPO),
+        ])
+        self.assertEqual(selected["native-image"], [
+            wamr_aot_build,
+            "native-images",
+            "--repository",
+            str(ci.REPO),
+        ])
+        for stage in ("prepare", "config", "native-image"):
+            self.assertNotIn(sys.executable, selected[stage])
         self.assertFalse((ci.LOCAL_BOOT / "zig-pkg").exists())
         self.assertFalse((ci.HERE / "zig-pkg").exists())
 
@@ -2680,6 +2862,38 @@ source/generated/
                         public_bundle.supervised_command_record(
                             ci, changed, "public-validator-build", identities,
                             "trusted_inner_zip")
+
+    def test_native_wamr_command_binding_refuses_rehashed_tamper(self):
+        for stage in ("prepare", "config", "native-image"):
+            with self.subTest(stage=stage):
+                record, identities = self.supervised_binding(stage)
+                ci.validate_supervised_command_binding(
+                    record, stage, identities)
+
+                tampered = copy.deepcopy(record)
+                tampered["supervisor"]["request"]["argv"][0] = (
+                    ci.command_path("tool:python3"))
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        self.rehash_supervised_binding(tampered),
+                        stage, identities)
+
+                tampered = copy.deepcopy(record)
+                tampered["supervisor"]["request"]["interpreter"] = (
+                    copy.deepcopy(
+                        tampered["supervisor"]["request"][
+                            "native_executable"]))
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        self.rehash_supervised_binding(tampered),
+                        stage, identities)
+
+                changed_identities = copy.deepcopy(identities)
+                changed_identities[ci.WAMR_AOT_BUILD_ROLE][
+                    "content_sha256"] = "0" * 64
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        record, stage, changed_identities)
 
     def test_public_command_binding_rehash_and_stage_substitution_are_closed(self):
         record, identities = self.supervised_binding(
@@ -3978,14 +4192,20 @@ source/generated/
             ci.source_root_inventory(repository)
 
     def test_precreated_output_roots_keep_source_parent_metadata_exact(self):
-        self.assertIn(
-            '"-Dmake-arg=KCONFIG_OVERWRITECONFIG=1"',
-            (ci.APP / "build-image.py").read_text(),
-        )
-        self.assertIn(
-            'f"-Dconfig={ROOT / \'build/.config\'}"',
-            (ci.APP / "build-image.py").read_text(),
-        )
+        for stage, subcommand in (
+                ("config", "olddefconfig"),
+                ("native-image", "native-images")):
+            contract = ci.production_command_contract(stage)
+            self.assertEqual(
+                contract["argv"],
+                [
+                    ci.command_path(ci.WAMR_AOT_BUILD_ROLE),
+                    ci.command_literal(subcommand),
+                    ci.command_literal("--repository"),
+                    ci.command_path("source"),
+                ],
+            )
+            self.assertIsNone(contract["interpreter"])
         repository = self.root / "repository"
         app = repository / "support/apps/wamr-aot"
         app.mkdir(parents=True, mode=0o700)

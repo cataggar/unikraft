@@ -136,7 +136,7 @@ jobs:
         run: |
           bash .github/scripts/hyperv-native-libfdt-prepare.sh /d/wamr-ci/wamr-native-runtime
 
-      - name: Build the distinct tiny AOT image through the existing safety graph
+      - name: Build the tiny AOT image with the installed native producer and safety graph
         timeout-minutes: 45
         run: |
           set -euo pipefail

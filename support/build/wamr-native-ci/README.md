@@ -9,7 +9,7 @@ All existing required contexts, default images and safety gates stay
 unchanged. This does not complete #88's guarded Azure authority or image handoff.
 
 The job builds the distinct `hyperv-x86_64-efi-wamr` target using the
-app-owned `prepare.py` and `build-image.py`, pinned WAMR
+adapter-installed app-owned `uk-wamr-aot-build` executable, pinned WAMR
 `a53205d77be3b880eb8f8b96679512ba58e2331a`, Zig 0.16.0, the existing LLVM
 distribution and the native final-image graph. Its constructor/returning-IRQ,
 SMP, relocation and EFI checks are not replaced, mocked or disabled.
@@ -177,6 +177,10 @@ request supplies an explicit retained ELF, fixed argv, closed environment,
 cwd, one absolute primary deadline, a separately fixed cleanup deadline and
 bounded output/result limits. Direct scripts name the retained Python or Bash
 ELF explicitly; there is no shebang or ambient interpreter selection.
+The prepare, configuration and native-image stages instead bind the installed
+`native:wamr-aot-build` role as both command and native executable, with no
+interpreter. The retained Python producers are differential and legacy test fixtures only;
+there is no production fallback, PATH lookup or sibling executable discovery.
 Recorded indirect executable variables are replaced inside the supervisor by
 paths to its retained descriptors. The reviewed self-reexecuting package and
 local-boot tools ignore inherited retained-self values unless the original
