@@ -4369,18 +4369,38 @@ source/generated/
         ci.save(root / "evidence/command-fixtures.json", {
             "exit_code": 1,
         })
+        ci.save(root / "evidence/command-config.json", {
+            "exit_code": 2,
+        })
+        app = self.root / "synthetic-app"
+        backend = app / "build/native-environment/diagnostics/image-42"
+        backend.mkdir(parents=True, mode=0o700)
+        for directory in (app / "build", app / "build/native-environment",
+                          backend.parent):
+            directory.chmod(0o700)
+        ci.save(backend / "000-root-olddefconfig.json", {
+            "stage": "root-olddefconfig",
+            "primary": {"exited": 1},
+        })
+        self.put(backend / "000-root-olddefconfig.stderr",
+                 b"error: InvalidNativeMakePath\nPRIVATE_SYNTHETIC_STATE\n")
         ci.save(work / "report.json", {
             "passed": False, "cleanup_complete": True, "input_unchanged": True,
             "serial_valid": False, "serial_limit_reached": False,
             "failures": {"primary": {"arbitrary": "PRIVATE_SYNTHETIC_STATE"},
                          "cleanup": None, "recording": None},
         })
-        ci.diagnostics(runtime)
+        with mock.patch.object(ci, "APP", app):
+            ci.diagnostics(runtime)
         raw = (root / "evidence/diagnostics.json").read_bytes()
         self.assertNotIn(b"PRIVATE_SYNTHETIC_STATE", raw)
         self.assertNotIn(str(self.root).encode(), raw)
         self.assertIn(
             b"test_adapter.Evidence.test_safe_name", raw)
+        self.assertEqual(json.loads(raw)["build_failures"]["config"], {
+            "exit_code": 2, "backend_exit_code": 1,
+            "known_error_markers": ["InvalidNativeMakePath"],
+        })
         self.assertFalse((root / "evidence/result.json").exists())
 
     def test_command_markers_are_closed_diagnostics_not_external_text(self):

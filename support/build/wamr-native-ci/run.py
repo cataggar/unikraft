@@ -5462,6 +5462,45 @@ def diagnostics(runtime):
             }
     except (OSError, ValueError, KeyError, TypeError, Refusal):
         pass
+    try:
+        command = document(root / "evidence/command-config.json")
+        require(type(command["exit_code"]) is int
+                and command["exit_code"] != 0, "invalid diagnostic")
+        private = APP / "build"
+        for component in ("native-environment", "diagnostics"):
+            info = private.lstat()
+            require(stat.S_ISDIR(info.st_mode)
+                    and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o700,
+                    "invalid diagnostic directory")
+            private /= component
+        info = private.lstat()
+        require(stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700,
+                "invalid diagnostic directory")
+        entries = list(private.iterdir())
+        require(len(entries) == 1
+                and re.fullmatch(r"image-[0-9]+(?:-[0-9]+)?", entries[0].name),
+                "invalid diagnostic directory")
+        info = entries[0].lstat()
+        require(stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700,
+                "invalid diagnostic directory")
+        backend = document(entries[0] / "000-root-olddefconfig.json")
+        code = backend["primary"]["exited"]
+        require(backend["stage"] == "root-olddefconfig"
+                and type(code) is int and 0 <= code <= 255,
+                "invalid diagnostic")
+        output = read(entries[0] / "000-root-olddefconfig.stderr", 64 * 1024)
+        build_failures["config"] = {
+            "exit_code": command["exit_code"],
+            "backend_exit_code": code,
+            "known_error_markers": command_error_markers(output),
+        }
+    except (OSError, ValueError, KeyError, TypeError, Refusal):
+        pass
     save(root / "evidence/diagnostics.json", {
         "scope": "diagnostics_not_acceptance",
         "redaction": "no_raw_serial_paths_environment_or_account_state",
