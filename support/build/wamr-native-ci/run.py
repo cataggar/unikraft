@@ -4977,15 +4977,22 @@ def build(runtime, wamr):
             and initial["source_custody"] == initial_source["custody"],
             "source changed during native tool installation")
     save(root / "evidence/build-start.json", initial)
-    COMMAND_ENVIRONMENT.update({
+    fixture_environment = {
         "WAMR_CI_PACKAGE": str(root / "tools/bin/wamr-ci-package"),
         "WAMR_CI_PYTHON": tool("python3"),
         "WAMR_CI_SUPERVISOR_FIXTURE":
             str(root / "tools/bin/wamr-ci-supervisor-fixture"),
-    })
+    }
+    COMMAND_ENVIRONMENT.update(fixture_environment)
     os.environ.update(COMMAND_ENVIRONMENT)
-    run_custodied(runtime, initial, root, "fixtures", [
-        sys.executable, "-m", "unittest", "discover", "-s", HERE / "tests", "-v"])
+    try:
+        run_custodied(runtime, initial, root, "fixtures", [
+            sys.executable, "-m", "unittest", "discover",
+            "-s", HERE / "tests", "-v"])
+    finally:
+        for name in fixture_environment:
+            COMMAND_ENVIRONMENT.pop(name, None)
+            os.environ.pop(name, None)
     wamr_aot_build = root / "tools/bin/uk-wamr-aot-build"
     run_custodied(runtime, initial, root, "prepare", [
         wamr_aot_build, "prepare", "--repository", REPO,

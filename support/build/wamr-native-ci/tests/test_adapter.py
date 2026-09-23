@@ -1797,6 +1797,19 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             }
 
         def command(runtime, expected, root, stage, args, *unused):
+            fixture_only = (
+                "WAMR_CI_PACKAGE",
+                "WAMR_CI_PYTHON",
+                "WAMR_CI_SUPERVISOR_FIXTURE",
+            )
+            if stage == "fixtures":
+                for name in fixture_only:
+                    self.assertIn(name, ci.COMMAND_ENVIRONMENT)
+                    self.assertIn(name, os.environ)
+            if stage in ("prepare", "config", "native-image"):
+                for name in fixture_only:
+                    self.assertNotIn(name, ci.COMMAND_ENVIRONMENT)
+                    self.assertNotIn(name, os.environ)
             if stage == "config":
                 self.assertEqual(os.environ["KCONFIG_OVERWRITECONFIG"], "1")
                 self.assertEqual(os.environ["M4"], "/tools/m4")
