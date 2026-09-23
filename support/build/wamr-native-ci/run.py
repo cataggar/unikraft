@@ -5467,13 +5467,26 @@ def diagnostics(runtime):
         require(type(command["exit_code"]) is int
                 and command["exit_code"] != 0, "invalid diagnostic")
         private = APP / "build"
-        for component in ("native-environment", "diagnostics"):
+        for component in ("native-environment",):
             info = private.lstat()
             require(stat.S_ISDIR(info.st_mode)
                     and info.st_uid == os.getuid()
                     and stat.S_IMODE(info.st_mode) == 0o700,
                     "invalid diagnostic directory")
             private /= component
+        info = private.lstat()
+        require(stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700,
+                "invalid diagnostic directory")
+        error_name = read(private / "failure-error-name.txt", 96)
+        require(re.fullmatch(rb"[A-Z][A-Za-z0-9]{0,79}", error_name),
+                "invalid native error name")
+        build_failures["config"] = {
+            "exit_code": command["exit_code"],
+            "native_error_name_sha256": hashlib.sha256(error_name).hexdigest(),
+        }
+        private /= "diagnostics"
         info = private.lstat()
         require(stat.S_ISDIR(info.st_mode)
                 and info.st_uid == os.getuid()
@@ -5494,11 +5507,10 @@ def diagnostics(runtime):
                 and type(code) is int and 0 <= code <= 255,
                 "invalid diagnostic")
         output = read(entries[0] / "000-root-olddefconfig.stderr", 64 * 1024)
-        build_failures["config"] = {
-            "exit_code": command["exit_code"],
+        build_failures["config"].update({
             "backend_exit_code": code,
             "known_error_markers": command_error_markers(output),
-        }
+        })
     except (OSError, ValueError, KeyError, TypeError, Refusal):
         pass
     save(root / "evidence/diagnostics.json", {

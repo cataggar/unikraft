@@ -4378,6 +4378,8 @@ source/generated/
         for directory in (app / "build", app / "build/native-environment",
                           backend.parent):
             directory.chmod(0o700)
+        self.put(backend.parent.parent / "failure-error-name.txt",
+                 b"InvalidToolOverride")
         ci.save(backend / "000-root-olddefconfig.json", {
             "stage": "root-olddefconfig",
             "primary": {"exited": 1},
@@ -4394,14 +4396,39 @@ source/generated/
             ci.diagnostics(runtime)
         raw = (root / "evidence/diagnostics.json").read_bytes()
         self.assertNotIn(b"PRIVATE_SYNTHETIC_STATE", raw)
+        self.assertNotIn(b"InvalidToolOverride", raw)
         self.assertNotIn(str(self.root).encode(), raw)
         self.assertIn(
             b"test_adapter.Evidence.test_safe_name", raw)
         self.assertEqual(json.loads(raw)["build_failures"]["config"], {
             "exit_code": 2, "backend_exit_code": 1,
+            "native_error_name_sha256":
+                hashlib.sha256(b"InvalidToolOverride").hexdigest(),
             "known_error_markers": ["InvalidNativeMakePath"],
         })
         self.assertFalse((root / "evidence/result.json").exists())
+
+    def test_native_config_failure_digest_without_child_launch(self):
+        runtime = self.root
+        root = runtime / "compute"
+        root.mkdir(mode=0o700)
+        (root / "evidence").mkdir(mode=0o700)
+        ci.save(root / "evidence/command-config.json", {"exit_code": 2})
+        app = self.root / "synthetic-app"
+        state = app / "build/native-environment"
+        state.mkdir(parents=True, mode=0o700)
+        (app / "build").chmod(0o700)
+        (state / "diagnostics").mkdir(mode=0o700)
+        self.put(state / "failure-error-name.txt", b"InvalidBisonData")
+        with mock.patch.object(ci, "APP", app):
+            ci.diagnostics(runtime)
+        raw = (root / "evidence/diagnostics.json").read_bytes()
+        self.assertNotIn(b"InvalidBisonData", raw)
+        self.assertEqual(json.loads(raw)["build_failures"]["config"], {
+            "exit_code": 2,
+            "native_error_name_sha256":
+                hashlib.sha256(b"InvalidBisonData").hexdigest(),
+        })
 
     def test_command_markers_are_closed_diagnostics_not_external_text(self):
         raw = (b"\xff\0error: UnsafeFile\nerror: InvalidNativeMakePath\n"

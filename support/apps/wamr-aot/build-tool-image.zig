@@ -53,14 +53,36 @@ pub fn execute(
         arguments.repository,
     );
     defer repository.close(allocator, io);
-    try executeOpen(
+    executeOpen(
         allocator,
         io,
         inherited,
         executable_path,
         repository,
         arguments.command,
-    );
+    ) catch |err| {
+        if (contract.files.ensurePrivateDirectory(
+            io,
+            repository.app.dir,
+            "build",
+        )) |build| {
+            defer build.close(io);
+            if (contract.files.ensurePrivateDirectory(
+                io,
+                build,
+                "native-environment",
+            )) |state| {
+                defer state.close(io);
+                contract.files.writePrivateAtomicReplace(
+                    io,
+                    state,
+                    "failure-error-name.txt",
+                    @errorName(err),
+                ) catch {};
+            } else |_| {}
+        } else |_| {}
+        return err;
+    };
 }
 
 const Stage = enum {

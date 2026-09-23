@@ -450,6 +450,59 @@ test "native image commands reject config runtime and application mutation" {
     }
 }
 
+test "native config failures retain only a private compiled error name" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.image_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const repository = try imageRepository(&temporary, "invalid-bison");
+    defer allocator.free(repository);
+    const log_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "image.log" },
+    );
+    defer allocator.free(log_path);
+    var environment = try imageEnvironment(
+        fixture,
+        "relative/bison-data-does-not-exist",
+        log_path,
+    );
+    defer environment.deinit();
+    try environment.put("BISON_PKGDATADIR", "relative/bison-data-does-not-exist");
+    const result = try runCli(
+        cli,
+        &.{ cli, "olddefconfig", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try expectExit(result.term, 2);
+    try testing.expectEqualStrings(
+        "wamr_aot_build_failed category=local_failure\n",
+        result.stderr,
+    );
+    const error_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/build/native-environment/failure-error-name.txt" },
+    );
+    defer allocator.free(error_path);
+    const error_name = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        error_path,
+        allocator,
+        .limited(96),
+    );
+    defer allocator.free(error_name);
+    try testing.expectEqualStrings("InvalidBisonData", error_name);
+}
+
 test "tool selection preserves override PATH and retained-fd precedence" {
     const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
         io,
