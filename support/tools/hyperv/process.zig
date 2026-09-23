@@ -34,6 +34,9 @@ pub const Deadline = struct {
 
 pub const Options = struct {
     argv: []const []const u8,
+    /// Descriptor execution normally requires an absolute diagnostic argv[0].
+    /// Trusted compatibility callers may retain a basename used by the child.
+    allow_named_argv0: bool = false,
     environment: *const std.process.Environ.Map,
     cwd: std.Io.Dir,
     deadline: Deadline,
@@ -43,6 +46,8 @@ pub const Options = struct {
     cancel: ?*const std.atomic.Value(bool) = null,
     /// One already retained read-only descriptor deliberately survives exec.
     inherited_descriptor: ?linux.fd_t = null,
+    /// An already retained output file receives stdout instead of the capture pipe.
+    stdout_file: ?std.Io.File = null,
 };
 
 pub const Result = struct {
@@ -618,11 +623,15 @@ pub const CommandLimits = struct {
 pub const CommandRequest = struct {
     executable: Executable,
     argv: []const []const u8,
+    allow_named_argv0: bool = false,
     environment: *const std.process.Environ.Map,
     cwd: std.Io.Dir,
     primary_deadline: Deadline,
     cleanup_deadline: Deadline,
     cancel: ?*const std.atomic.Value(bool) = null,
+    stdout_file: ?std.Io.File = null,
+    /// Some self-locating tools require the retained source inode rather than a memfd snapshot.
+    snapshot_executable: bool = true,
     limits: CommandLimits = .{},
 };
 
@@ -927,7 +936,7 @@ fn runCommandImpl(
     test_options: ?CommandTestOptions,
 ) !CommandResult {
     const options = commandOptions(request);
-    try validateOptions(options, 4 * 1024 * 1024);
+    try validateOptions(options, 8 * 1024 * 1024);
     try validateCommandLimits(request.limits);
     try enter();
     defer busy.store(false, .release);
@@ -959,33 +968,43 @@ fn runCommandImpl(
     if (cancelled(options))
         return completePreSpawnCommand(&result, .cancelled, observed_ns);
 
-    const snapshot = createCommandExecutableSnapshot(
-        request.executable,
-        if (test_options) |options_value| options_value.snapshot_gate else null,
-        if (test_options) |options_value| options_value.pre_spawn else null,
-    ) catch |err| switch (err) {
-        error.ExecutableSnapshotUnsupported => {
+    const snapshot = if (request.snapshot_executable)
+        createCommandExecutableSnapshot(
+            request.executable,
+            if (test_options) |options_value| options_value.snapshot_gate else null,
+            if (test_options) |options_value| options_value.pre_spawn else null,
+        ) catch |err| switch (err) {
+            error.ExecutableSnapshotUnsupported => {
+                observed_ns = try now();
+                return completePreSpawnCommand(
+                    &result,
+                    if (observed_ns >= request.primary_deadline.expires_ns)
+                        .timeout
+                    else
+                        .snapshot_unsupported,
+                    observed_ns,
+                );
+            },
+            error.ExecutableSnapshotUnavailable, error.ExecutableSnapshotInvalid => {
+                observed_ns = try now();
+                return completePreSpawnCommand(
+                    &result,
+                    if (observed_ns >= request.primary_deadline.expires_ns) .timeout else .local_io,
+                    observed_ns,
+                );
+            },
+            else => return err,
+        }
+    else direct: {
+        verifyExecutableSource(request.executable) catch {
             observed_ns = try now();
-            return completePreSpawnCommand(
-                &result,
-                if (observed_ns >= request.primary_deadline.expires_ns)
-                    .timeout
-                else
-                    .snapshot_unsupported,
-                observed_ns,
-            );
-        },
-        error.ExecutableSnapshotUnavailable, error.ExecutableSnapshotInvalid => {
-            observed_ns = try now();
-            return completePreSpawnCommand(
-                &result,
-                if (observed_ns >= request.primary_deadline.expires_ns) .timeout else .local_io,
-                observed_ns,
-            );
-        },
-        else => return err,
+            return completePreSpawnCommand(&result, .executable_changed, observed_ns);
+        };
+        break :direct request.executable.file.handle;
     };
-    defer _ = linux.close(snapshot);
+    defer {
+        if (request.snapshot_executable) _ = linux.close(snapshot);
+    }
     observed_ns = try now();
     if (observed_ns >= request.primary_deadline.expires_ns)
         return completePreSpawnCommand(&result, .timeout, observed_ns);
@@ -1468,10 +1487,16 @@ fn runPrivateImpl(
 }
 
 fn validateOptions(options: Options, maximum: usize) !void {
-    if (options.argv.len == 0 or options.argv.len > 128 or !std.fs.path.isAbsolute(options.argv[0]) or
+    if (options.argv.len == 0 or options.argv.len > 128 or
+        (!std.fs.path.isAbsolute(options.argv[0]) and !options.allow_named_argv0) or
         options.stdout_limit > maximum or options.stderr_limit > maximum or
         options.cleanup_ms < 100 or options.cleanup_ms > 30 * 60 * 1000)
         return error.InvalidOptions;
+    if (options.allow_named_argv0 and !std.fs.path.isAbsolute(options.argv[0])) {
+        if (options.argv[0].len == 0 or options.argv[0][0] == '.' or
+            std.mem.indexOfScalar(u8, options.argv[0], '/') != null)
+            return error.InvalidOptions;
+    }
     if (options.inherited_descriptor) |descriptor|
         if (descriptor <= 2) return error.InvalidOptions;
     var argument_bytes: usize = 0;
@@ -1496,6 +1521,7 @@ fn validateOptions(options: Options, maximum: usize) !void {
 fn commandOptions(request: CommandRequest) Options {
     return .{
         .argv = request.argv,
+        .allow_named_argv0 = request.allow_named_argv0,
         .environment = request.environment,
         .cwd = request.cwd,
         .deadline = request.primary_deadline,
@@ -1503,12 +1529,13 @@ fn commandOptions(request: CommandRequest) Options {
         .stdout_limit = request.limits.stdout_bytes,
         .stderr_limit = request.limits.stderr_bytes,
         .cancel = request.cancel,
+        .stdout_file = request.stdout_file,
     };
 }
 
 fn validateCommandLimits(limits: CommandLimits) !void {
     if (limits.stdout_bytes == 0 or limits.stderr_bytes == 0 or
-        limits.stdout_bytes > 4 * 1024 * 1024 or limits.stderr_bytes > 4 * 1024 * 1024 or
+        limits.stdout_bytes > 8 * 1024 * 1024 or limits.stderr_bytes > 8 * 1024 * 1024 or
         limits.descendants == 0 or limits.descendants > 256 or
         limits.primary_events < 16 or limits.primary_events > 10_000_000 or
         limits.cleanup_events < 32 or limits.cleanup_events > 10_000_000 or
@@ -3059,8 +3086,9 @@ fn spawnOwned(
         if (linux.errno(linux.setpgid(0, 0)) != .SUCCESS) childFailure(control[1], 1);
         if (options.cwd.handle != linux.AT.FDCWD and linux.errno(linux.fchdir(options.cwd.handle)) != .SUCCESS)
             childFailure(control[1], 1);
+        const stdout_descriptor = if (options.stdout_file) |file| file.handle else stdout[1];
         if (linux.errno(linux.dup3(null_fd, 0, 0)) != .SUCCESS or
-            linux.errno(linux.dup3(stdout[1], 1, 0)) != .SUCCESS or
+            linux.errno(linux.dup3(stdout_descriptor, 1, 0)) != .SUCCESS or
             linux.errno(linux.dup3(stderr[1], 2, 0)) != .SUCCESS) childFailure(control[1], 1);
         // Linux UAPI CLOSE_RANGE_CLOEXEC is bit 2; Zig 0.16's packed flag labels
         // are shifted by one. Preserve only stdio at exec, including private locks.

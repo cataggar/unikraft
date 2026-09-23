@@ -67,6 +67,27 @@ pub fn createPrivateDirectory(
     return directory;
 }
 
+pub fn ensurePrivateDirectory(
+    io: std.Io,
+    parent: std.Io.Dir,
+    name: []const u8,
+) !std.Io.Dir {
+    return createPrivateDirectory(io, parent, name) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            try core.private_files.basename(name);
+            const directory = try parent.openDir(io, name, .{
+                .follow_symlinks = false,
+                .iterate = true,
+            });
+            errdefer directory.close(io);
+            try directory.setPermissions(io, .fromMode(0o700));
+            try validateOwnedDirectory(directory);
+            return directory;
+        },
+        else => return err,
+    };
+}
+
 pub fn writePrivateCreate(
     io: std.Io,
     directory: std.Io.Dir,
@@ -87,6 +108,44 @@ pub fn writePrivateCreate(
     if (metadata.mode & linux.S.IFMT != linux.S.IFREG or
         metadata.mode & 0o7777 != 0o600 or metadata.uid != linux.geteuid() or
         metadata.links != 1)
+        return error.UnsafeFile;
+}
+
+pub fn writePrivateAtomicCreate(
+    io: std.Io,
+    directory: std.Io.Dir,
+    name: []const u8,
+    contents: []const u8,
+) !void {
+    try core.private_files.basename(name);
+    try validateOwnedDirectory(directory);
+    var atomic = try directory.createFileAtomic(io, name, .{
+        .permissions = .fromMode(0o600),
+        .replace = false,
+    });
+    var active = true;
+    defer if (active) atomic.deinit(io);
+    try atomic.file.setPermissions(io, .fromMode(0o600));
+    try atomic.file.writePositionalAll(io, contents, 0);
+    try atomic.file.setLength(io, contents.len);
+    try atomic.file.sync(io);
+    try atomic.link(io);
+    atomic.deinit(io);
+    active = false;
+    const directory_file: std.Io.File = .{
+        .handle = directory.handle,
+        .flags = .{ .nonblocking = false },
+    };
+    try directory_file.sync(io);
+    const published = try directory.openFile(io, name, .{
+        .mode = .read_only,
+        .follow_symlinks = false,
+    });
+    defer published.close(io);
+    const metadata = try preparation_files.metadata(published);
+    if (metadata.mode & linux.S.IFMT != linux.S.IFREG or
+        metadata.mode & 0o7777 != 0o600 or metadata.uid != linux.geteuid() or
+        metadata.links != 1 or metadata.size != contents.len)
         return error.UnsafeFile;
 }
 
