@@ -511,11 +511,23 @@ fn executeOpen(
         executable_path,
     ) catch |err| {
         contract.files.writePrivateAtomicReplace(
-            io, state, "failure-tool-role.txt", "wamr-aot-tool",
+            io,
+            state,
+            "failure-tool-role.txt",
+            "wamr-aot-tool",
         ) catch {};
         return err;
     };
     defer self_tool.close(allocator, io);
+    const running_file = try std.Io.Dir.openFileAbsolute(io, "/proc/self/exe", .{
+        .mode = .read_only,
+        .follow_symlinks = true,
+    });
+    defer running_file.close(io);
+    var running = try core.process.Executable.fromFile(io, running_file);
+    defer running.close(io);
+    if (!std.meta.eql(self_tool.executable.identity, running.identity))
+        return error.ImageInputChanged;
 
     const private_paths = try createEnvironmentDirectories(
         a,
@@ -629,7 +641,10 @@ fn executeOpen(
         executable_path,
     ) catch |err| {
         contract.files.writePrivateAtomicReplace(
-            io, state, "failure-tool-role.txt", "wamr-aot-tool",
+            io,
+            state,
+            "failure-tool-role.txt",
+            "wamr-aot-tool",
         ) catch {};
         return err;
     };

@@ -27,11 +27,14 @@ fn run(init: std.process.Init) !void {
             parsed,
         ),
         .olddefconfig, .native_images => {
-            const executable = try std.Io.Dir.cwd().realPathFileAlloc(
-                init.io,
-                "/proc/self/exe",
-                init.gpa,
-            );
+            const executable: [:0]u8 = if (init.environ_map.get("WAMR_CI_EXECUTABLE_PATH")) |path|
+                try init.gpa.dupeZ(u8, path)
+            else
+                try std.Io.Dir.cwd().realPathFileAlloc(
+                    init.io,
+                    "/proc/self/exe",
+                    init.gpa,
+                );
             defer init.gpa.free(executable);
             try build_tool.image.execute(
                 init.gpa,

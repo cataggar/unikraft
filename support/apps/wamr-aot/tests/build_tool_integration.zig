@@ -235,6 +235,7 @@ test "native image commands preserve config plans identities and failed publicat
     defer allocator.free(log_path);
     var environment = try imageEnvironment(fixture, bison_data, log_path);
     defer environment.deinit();
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", cli);
 
     const configured = try runCli(
         cli,
@@ -448,6 +449,37 @@ test "native image commands reject config runtime and application mutation" {
             std.Io.Dir.openFileAbsolute(io, identity_path, .{}),
         );
     }
+}
+
+test "native config refuses a supplied executable that differs from the running image" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.image_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const repository = try imageRepository(&temporary, "wrong-executable");
+    defer allocator.free(repository);
+    var environment = try imageEnvironment(fixture, ".", "/dev/null");
+    defer environment.deinit();
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", fixture);
+    const result = try runCli(
+        cli,
+        &.{ cli, "olddefconfig", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try expectExit(result.term, 2);
+    try testing.expectEqualStrings(
+        "wamr_aot_build_failed category=unsupported_input\n",
+        result.stderr,
+    );
 }
 
 test "native config tool failures retain only private compiled error and role" {
