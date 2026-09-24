@@ -4,6 +4,7 @@ const std = @import("std");
 const core = @import("hyperv_core");
 const base = @import("main.zig");
 const serial = @import("local_serial");
+const log_validator = @import("wamr_log_validator");
 const azure_runtime = @import("azure_runtime.zig");
 const c = core.contracts;
 const files = core.private_files;
@@ -11,12 +12,7 @@ pub const Artifact = base.Artifact;
 pub const SerialMode = base.SerialMode;
 pub const parse = base.parse;
 pub const sdk = "a53205d77be3b880eb8f8b96679512ba58e2331a";
-pub const marker = "WAMR_NATIVE_AOT_OK answer=42 teardown=0";
-pub const prefix = "WAMR_NATIVE_COMPUTE=";
-pub const forbidden = [_][]const u8{
-    "HYPERV_ACCEPTANCE",        "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
-    "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_WASI=",  "WAMR_NATIVE_AOT_FAIL",
-};
+pub const marker = log_validator.tiny.marker;
 pub const artifact_names = .{
     "efi",   "debug_elf",   "bootinfo",    "raw",              "vhd",            "runtime",      "compiler",
     "wasm",  "cwasm",       "config",      "runtime_identity", "image_identity", "local_result", "package",
@@ -712,35 +708,7 @@ fn legacyLocalPins(source_revision: []const u8, source_tree: []const u8) bool {
         eq(source_tree, "54f8e118146c78c24e7c802657c6ec62b268a5de");
 }
 
-pub const Result = struct {
-    version: u8,
-    workload: enum { tiny },
-    wamr_revision: []const u8,
-    wasm_sha256: []const u8,
-    cwasm_sha256: []const u8,
-    runtime_sha256: []const u8,
-    platform_status: i32,
-    checks: u32,
-    answer: i32,
-    terminal: u32,
-    detail: u32,
-    reserved_bytes: u64,
-    frame_bytes: u64,
-    accessible_bytes: u64,
-    allocation_bytes: u64,
-    system_page_table_bytes: u64,
-    error_name: []const u8,
-
-    pub fn validate(self: Result, identity: Identity) !void {
-        if (self.version != 1 or self.platform_status != 0 or self.checks != 2 or self.answer != 42 or
-            self.terminal != 1 or self.detail != 2 or self.reserved_bytes != 0 or self.frame_bytes != 0 or
-            self.accessible_bytes != 0 or self.allocation_bytes != 0 or self.error_name.len != 0 or
-            self.system_page_table_bytes == 0 or self.system_page_table_bytes > 256 * 1024 * 1024 or
-            self.system_page_table_bytes % 4096 != 0) return error.ComputeFailed;
-        inline for (.{ "wamr_revision", "wasm_sha256", "cwasm_sha256", "runtime_sha256" }) |name|
-            if (!eq(@field(self, name), @field(identity, name))) return error.WrongComputeIdentity;
-    }
-};
+pub const Result = log_validator.tiny.Result;
 
 pub const CaptureRecord = struct {
     schema: []const u8 = "uk.wamr.direct-serial-capture",
@@ -765,48 +733,13 @@ pub const CaptureRecord = struct {
 };
 
 pub fn checkSerial(a: std.mem.Allocator, raw: []const u8, identity: Identity) !Result {
-    if (raw.len == 0) return error.EvidenceIncomplete;
-    if (raw.len >= 4 * 1024 * 1024) return error.SerialLimit;
-    const text = try serial.normalize(a, raw);
-    defer a.free(text);
-    for (forbidden ++ .{ "Unikraft Crash", "Assertion failure", "Exception Type" }) |bad|
-        if (std.mem.indexOf(u8, text, bad) != null) return error.ForbiddenMarker;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    var record: ?Result = null;
-    var complete = false;
-    var returned = false;
-    var starts: u8 = 0;
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
-        if (std.mem.indexOf(u8, line, "Calling main(") != null) {
-            if (starts != 0 or record != null) return error.DuplicateStart;
-            starts += 1;
-        }
-        if (std.mem.indexOf(u8, line, prefix) != null) {
-            if (record != null or starts != 1 or complete or returned or !std.mem.startsWith(u8, line, prefix))
-                return error.InvalidComputeRecord;
-            const parsed = try parse(Result, a, line[prefix.len..]);
-            defer parsed.deinit();
-            try parsed.value.validate(identity);
-            // All strings in a validated result equal the scope's stable pins.
-            var result = parsed.value;
-            inline for (.{ "wamr_revision", "wasm_sha256", "cwasm_sha256", "runtime_sha256" }) |name|
-                @field(result, name) = @field(identity, name);
-            result.error_name = "";
-            record = result;
-        }
-        if (std.mem.indexOf(u8, line, marker) != null) {
-            if (!eq(line, marker) or complete or record == null or returned) return error.InvalidCompletion;
-            complete = true;
-        }
-        if (std.mem.indexOf(u8, line, "main returned") != null) {
-            if (!complete or returned) return error.InvalidMainReturn;
-            returned = true;
-        }
-    }
-    if (!returned) return error.EvidenceIncomplete;
-    try serial.validateEnvelope(a, raw, marker, 0, &.{}, &forbidden);
-    return record orelse error.EvidenceIncomplete;
+    return log_validator.tiny.checkSerial(a, raw, .{
+        .wamr_revision = identity.wamr_revision,
+        .minimal_wasi = false,
+        .tiny_wasm = identity.wasm_sha256,
+        .tiny_cwasm = identity.cwasm_sha256,
+        .runtime = identity.runtime_sha256,
+    }, .{ .scope = .direct });
 }
 
 pub fn secondBytes(raw: []const u8, first: []const u8, mode: SerialMode) ![]const u8 {

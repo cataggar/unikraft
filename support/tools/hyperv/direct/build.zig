@@ -20,16 +20,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "hyperv_core", .module = core }},
     });
+    const local_serial = b.createModule(.{
+        .root_source_file = b.path("../local_boot/serial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+    });
+    const wamr_validator = b.createModule(.{
+        .root_source_file = b.path("../../../apps/wamr-aot/validator/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "local_boot_serial", .module = local_serial },
+        },
+    });
     const imports = [_]std.Build.Module.Import{
         .{ .name = "hyperv_core", .module = core },
         .{ .name = "preparation", .module = preparation },
         .{ .name = "evidence", .module = persistence },
-        .{ .name = "local_serial", .module = b.createModule(.{
-            .root_source_file = b.path("../local_boot/serial.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "hyperv_core", .module = core }},
-        }) },
+        .{ .name = "local_serial", .module = local_serial },
+        .{ .name = "wamr_log_validator", .module = wamr_validator },
     };
     const validator = b.addExecutable(.{
         .name = "uk-hyperv-direct-validate",

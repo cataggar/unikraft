@@ -6,6 +6,10 @@ const t = std.testing;
 const a = t.allocator;
 const io = t.io;
 
+test {
+    _ = @import("tiny_tests.zig");
+}
+
 fn normalized(raw: []const u8, mode: validator.serial.Normalization) ![]u8 {
     return validator.serial.normalizeWithOptions(a, raw, mode);
 }
