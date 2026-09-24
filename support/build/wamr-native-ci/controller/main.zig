@@ -22,8 +22,25 @@ pub fn main(init: std.process.Init) void {
     }
     const runtime = controller.layout.runtime(init.io, command.runtime.?) catch refused(init.io);
     defer runtime.close(init.io);
-    // Preparation only: never publish success for an unimplemented stage.
-    refused(init.io);
+    if (command.action != .build) refused(init.io);
+    const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+    const compute = std.fs.path.join(allocator, &.{ command.runtime.?, "compute" }) catch refused(init.io);
+    var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+    defer signal.deinit();
+    var context: controller.build_pipeline.Context = .{
+        .allocator = allocator,
+        .io = init.io,
+        .environ = init.minimal.environ,
+        .runtime = command.runtime.?,
+        .repository = repository,
+        .wamr = command.wamr_source.?,
+        .compute = compute,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+    };
+    _ = controller.build_pipeline.run(&context) catch failed(init.io, context.failed_stage);
 }
 
 fn usage(io: std.Io) noreturn {
@@ -39,5 +56,14 @@ fn usage(io: std.Io) noreturn {
 fn refused(io: std.Io) noreturn {
     var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
     stderr.interface.writeAll("WAMR_CI_REFUSED: controller stage unavailable\n") catch {};
+    std.process.exit(1);
+}
+
+fn failed(io: std.Io, stage: []const u8) noreturn {
+    var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
+    stderr.interface.print(
+        "WAMR_CI_FAILED_STAGE: {s}; bounded private logs retained.\n",
+        .{stage},
+    ) catch {};
     std.process.exit(1);
 }
