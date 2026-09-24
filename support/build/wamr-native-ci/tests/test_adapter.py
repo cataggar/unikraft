@@ -2995,6 +2995,24 @@ source/generated/
                     ci.validate_supervised_command_binding(
                         record, stage, changed_identities)
 
+    def test_fixture_environment_uses_the_installed_validator_role(self):
+        validator = self.root / "tools/bin/uk-wamr-log-validate"
+        validator.parent.mkdir(parents=True, mode=0o700)
+        self.put(validator, b"installed native log validator")
+        validator.chmod(0o700)
+        contract = ci.production_command_contract("fixtures")
+        expected = next(
+            entry["value"] for entry in contract["environment"]
+            if entry["name"] == "WAMR_CI_LOG_VALIDATE"
+        )
+        roots = ci.command_path_roots(
+            self.root, {ci.WAMR_LOG_VALIDATOR_ROLE: validator})
+        observed = ci.normalized_command_value(
+            str(validator), roots, strict=True)
+        self.assertEqual(expected, observed)
+        self.assertEqual(expected, ci.command_path(ci.WAMR_LOG_VALIDATOR_ROLE))
+        self.assertIn("WAMR_CI_LOG_VALIDATE", contract["retained_names"])
+
     def test_real_supervised_validator_matches_both_closed_apic_contracts(self):
         self.assertIsNotNone(SUPERVISOR)
         self.assertIsNotNone(LOG_VALIDATE)

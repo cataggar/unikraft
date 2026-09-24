@@ -2533,7 +2533,7 @@ def command_environment_contract(kind):
             "WAMR_CI_SUPERVISOR_FIXTURE": command_path(
                 "work", "tools/bin/wamr-ci-supervisor-fixture"),
             "WAMR_CI_LOG_VALIDATE": command_path(
-                "work", "tools/bin/uk-wamr-log-validate"),
+                WAMR_LOG_VALIDATOR_ROLE),
         })
     if kind in {"build-base", "public-validator"}:
         environment["WAMR_CI_LAUNCH_EXECUTABLE"] = command_path("tool:zig")
