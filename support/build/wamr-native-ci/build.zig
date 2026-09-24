@@ -1,8 +1,12 @@
 const std = @import("std");
+const controller_target = @import("controller/target.zig");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const requested_target = b.standardTargetOptionsQueryOnly(.{});
+    const target = b.resolveTargetQuery(requested_target);
     const optimize = b.standardOptimizeOption(.{});
+    const portable_query = controller_target.portableQuery();
+    const portable_target = b.resolveTargetQuery(portable_query);
     const core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = target,
@@ -57,6 +61,117 @@ pub fn build(b: *std.Build) void {
     });
     const cli = b.addExecutable(.{ .name = "wamr-ci-package", .root_module = root });
     b.installArtifact(cli);
+    const portable_core = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/core.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+    });
+    portable_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+    const source_closure_module = b.createModule(.{
+        .root_source_file = b.path("../../controller_source_closure.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+    });
+    const controller_module = b.addModule("wamr_controller", .{
+        .root_source_file = b.path("controller/root.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = portable_core },
+            .{ .name = "controller_source_closure", .module = source_closure_module },
+        },
+    });
+    const controller_cli = b.addExecutable(.{
+        .name = "uk-wamr-native-ci",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/portable_main.zig"),
+            .target = portable_target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "wamr_controller", .module = controller_module }},
+        }),
+    });
+    b.installArtifact(controller_cli);
+    const controller_runtime = b.option(
+        []const u8,
+        "controller-runtime",
+        "Existing absolute owner-only runtime directory for create-only controller install",
+    ) orelse "";
+    const controller_options = b.addOptions();
+    controller_options.addOption([]const u8, "repository_root", std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
+        @panic("cannot resolve source root"));
+    controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
+    const host_core = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/core.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        host_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+    const host_closure = b.createModule(.{
+        .root_source_file = b.path("../../controller_source_closure.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const host_controller = b.createModule(.{
+        .root_source_file = b.path("controller/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = host_core },
+            .{ .name = "controller_source_closure", .module = host_closure },
+        },
+    });
+    const host_cli = b.addExecutable(.{
+        .name = "uk-wamr-native-ci-host-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "wamr_controller", .module = host_controller }},
+        }),
+    });
+    const host_cli_run = b.addRunArtifact(host_cli);
+    if (b.args) |args| host_cli_run.addArgs(args);
+    b.step("run-controller-fixture", "Run host controller CLI for bounded CLI fixtures")
+        .dependOn(&host_cli_run.step);
+    const installer = b.addExecutable(.{
+        .name = "uk-wamr-native-ci-install",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/install.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = host_core },
+                .{ .name = "wamr_controller", .module = host_controller },
+            },
+        }),
+    });
+    const install_run = b.addRunArtifact(installer);
+    install_run.addArg(controller_runtime);
+    install_run.addArg(b.graph.cache.cwd);
+    install_run.addFileArg(controller_cli.getEmittedBin());
+    const install_step = b.step("install-controller", "Create-only portable controller install in the private runtime");
+    if (controller_target.permitsInstall(requested_target, optimize))
+        install_step.dependOn(&install_run.step)
+    else
+        install_step.dependOn(&b.addFail(
+            "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe",
+        ).step);
+    const controller_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    controller_tests.root_module.addOptions("test_options", controller_options);
+    const controller_run = b.addRunArtifact(controller_tests);
+    b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures")
+        .dependOn(&controller_run.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
@@ -85,4 +200,5 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit and required private compute pipeline fixtures");
     test_step.dependOn(&unit_tests.step);
     test_step.dependOn(&pipeline_run.step);
+    test_step.dependOn(&controller_run.step);
 }
