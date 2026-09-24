@@ -252,6 +252,7 @@ test "native image commands preserve config plans identities and failed publicat
     try expectExit(configured.term, 0);
     try testing.expectEqualStrings("", configured.stdout);
     try testing.expectEqualStrings("", configured.stderr);
+    try environment.put("WAMR_IMAGE_FIXTURE_REWRITE_CONFIG", "1");
     const expected_config =
         "CONFIG_FIXTURE=y\n\n" ++
         "CONFIG_STACK_SIZE_PAGE_ORDER=8\n" ++
@@ -425,6 +426,8 @@ test "native image commands reject config runtime and application mutation" {
         defer allocator.free(configured.stdout);
         defer allocator.free(configured.stderr);
         try expectExit(configured.term, 0);
+        if (std.mem.eql(u8, mutation, "config"))
+            try environment.put("WAMR_IMAGE_FIXTURE_REWRITE_CONFIG", "1");
         try environment.put("WAMR_IMAGE_FIXTURE_MUTATE", mutation);
         const built = try runCli(
             cli,

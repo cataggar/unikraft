@@ -68,6 +68,16 @@ fn run(init: std.process.Init) !void {
             const path = try std.fs.path.join(allocator, &.{ app, "build", output.name });
             try writeFile(init.io, path, output.contents, 0o600, true);
         }
+        if (init.environ_map.get("WAMR_IMAGE_FIXTURE_REWRITE_CONFIG")) |value| {
+            if (!std.mem.eql(u8, value, "1")) return error.InvalidArguments;
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(
+                init.io,
+                config,
+                allocator,
+                .limited(1024 * 1024),
+            );
+            try writeFile(init.io, config, bytes, 0o600, true);
+        }
         if (init.environ_map.get("WAMR_IMAGE_FIXTURE_MUTATE")) |mutation| {
             const path = if (std.mem.eql(u8, mutation, "config"))
                 config

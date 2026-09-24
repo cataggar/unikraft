@@ -461,7 +461,6 @@ fn configInputChanged(
     state: std.Io.Dir,
     path: []const u8,
     before: [64]u8,
-    after_identity: bool,
 ) anyerror {
     var current = contract.files.RetainedFile.open(io, path, .private) catch
         return imageInputChanged(io, state, "config-unavailable");
@@ -469,14 +468,31 @@ fn configInputChanged(
     const observed = digestRetained(io, current) catch
         return imageInputChanged(io, state, "config-unstable");
     const same = std.mem.eql(u8, &before, &observed);
-    return imageInputChanged(
-        io,
-        state,
-        if (after_identity)
-            (if (same) "config-after-identity-same-bytes" else "config-after-identity-changed-bytes")
-        else
-            (if (same) "config-after-root-same-bytes" else "config-after-root-changed-bytes"),
-    );
+    return imageInputChanged(io, state, if (same)
+        "config-after-identity-same-bytes"
+    else
+        "config-after-identity-changed-bytes");
+}
+
+fn rebindConfigAfterRoot(
+    io: std.Io,
+    state: std.Io.Dir,
+    path: []const u8,
+    previous: contract.files.RetainedFile,
+    before: [64]u8,
+) !contract.files.RetainedFile {
+    var current = contract.files.RetainedFile.open(io, path, .private) catch
+        return imageInputChanged(io, state, "config-unavailable");
+    errdefer current.close(io);
+    const observed = digestRetained(io, current) catch
+        return imageInputChanged(io, state, "config-unstable");
+    if (!std.mem.eql(u8, &before, &observed))
+        return imageInputChanged(io, state, "config-after-root-changed-bytes");
+    if (current.file_snapshot.mode != previous.file_snapshot.mode or
+        current.file_snapshot.uid != previous.file_snapshot.uid or
+        current.file_snapshot.size != previous.file_snapshot.size)
+        return imageInputChanged(io, state, "config-after-root-changed-metadata");
+    return current;
 }
 
 const NamedDigest = struct {
@@ -721,14 +737,17 @@ fn executeOpen(
         return;
     }
 
-    config_input.?.verify(io) catch
-        return configInputChanged(
+    config_input.?.verify(io) catch {
+        const rebound = try rebindConfigAfterRoot(
             io,
             state,
             config_path,
+            config_input.?,
             config_before_hash.?,
-            false,
         );
+        config_input.?.close(io);
+        config_input = rebound;
+    };
     runtime_input.?.verify(io) catch
         return imageInputChanged(io, state, "runtime-after-root");
     const application_after = try applicationIdentities(
@@ -834,7 +853,6 @@ fn executeOpen(
             state,
             config_path,
             config_before_hash.?,
-            true,
         );
     runtime_input.?.verify(io) catch
         return imageInputChanged(io, state, "runtime-after-identity");
