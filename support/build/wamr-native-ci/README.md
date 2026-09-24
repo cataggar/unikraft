@@ -182,17 +182,22 @@ The prepare, configuration and native-image stages instead bind the installed
 interpreter. The old Python producers and their differential tests have been removed.
 The adapter also installs the app-owned `uk-wamr-log-validate` from the
 shared validator source, records its physical executable identity as
-`native:wamr-log-validate`, and revalidates the consumer input. Prepared
+`native:wamr-log-validate`, and revalidates the consumer input. Dispatched
 `log-validator-x2apic`/`log-validator-legacy` supervisor contracts pin
 the exact `tiny --log ... --identity ... --legacy-apic forbidden|required
 --output json-v1` argv, empty environment, executable identity, timeout
 and output bound. The same strict stage policy normalizes and validates the
 actual supervised request: fixture runs prove both APIC modes with an empty
 child environment, exact JSON output and fail-closed wrong-APIC refusal.
-These stages are **not dispatched**: `run.py.compute()`
-still calls the retained Python checker until the separate #188 cutover.
+Every successful tiny boot is checked through one of these stages (including
+physical revalidation), with the raw serial count/SHA-256 checked against
+the unchanged boot report before and after invocation. The exact JSON-v1
+`compute` object retains the existing evidence shape; the executable and
+identity/log inputs are reopened and checked for changes. The supervised
+diagnostic stays private; it is not extra public acceptance evidence.
 Adapter and direct native CLI fixtures exercise synthetic records only;
-the CLI result cannot replace boot/image or acceptance evidence.
+the CLI result cannot replace boot/image or acceptance evidence. The
+Python log validators and fallback paths have been removed.
 There is no production fallback, PATH lookup or sibling executable discovery.
 The adapter supplies a fresh private application output root and a sealed
 `--source-archive` for `prepare`; `verify` is enforced by Make with the

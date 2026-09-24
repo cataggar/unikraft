@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
 """Private synthetic CLI fixtures; no boot, cloud, or benchmark evidence."""
+import base64
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -11,16 +11,60 @@ import tempfile
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
-APP = HERE.parent
 REPO = HERE.parents[3]
 MODES = ("snapshot", "aot", "fast", "full")
+COREMARK = b"""\
+2K performance run parameters for coremark.
+CoreMark Size    : 666
+Total ticks      : 1
+Total time (secs): 0.001000
+Iterations/Sec   : 100000.000000
+ERROR! Must execute for at least 10 secs for a valid result!
+Iterations       : 100
+Compiler version : synthetic fixture, not execution evidence
+Compiler flags   : synthetic
+Memory location  : STACK
+seedcrc          : 0xe9f5
+[0]crclist       : 0xe714
+[0]crcmatrix     : 0x1fd7
+[0]crcstate      : 0x8e3a
+[0]crcfinal      : 0x988c
+Errors detected
+"""
 
 
-def load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def tiny_fixture(wasi=False):
+    identity = {
+        "wamr_revision": "f" * 40, "minimal_wasi": wasi,
+        "files": {"tiny.wasm": "0" * 64, "tiny.cwasm": "1" * 64,
+                  "libwamr-aot.a": "2" * 64},
+    }
+    compute = {
+        "version": 1, "workload": "tiny", "wamr_revision": "f" * 40,
+        "wasm_sha256": "0" * 64, "cwasm_sha256": "1" * 64,
+        "runtime_sha256": "2" * 64, "platform_status": 0, "checks": 2,
+        "answer": 42, "terminal": 1, "detail": 2, "reserved_bytes": 0,
+        "frame_bytes": 0, "accessible_bytes": 0, "allocation_bytes": 0,
+        "error_name": "", "system_page_table_bytes": 4096,
+    }
+    records = []
+    if wasi:
+        for name in ("coremark", "coremark-nofp"):
+            identity["files"][name + ".wasm"] = "3" * 64
+            identity["files"][name + ".cwasm"] = "4" * 64
+            records.append(("WAMR_NATIVE_WASI", {
+                "version": 1, "correctness_only": True, "workload": name,
+                "wasm_sha256": "3" * 64, "cwasm_sha256": "4" * 64,
+                "terminal": 2, "detail": 0, "crc_ok": True,
+                "output_error": 0, "pending_stdout": 0, "pending_stderr": 0,
+                "unsupported_clock": 0, "realtime_supported": True,
+                "stdout_base64": base64.b64encode(COREMARK).decode(),
+                "stderr_base64": "",
+            }))
+    records.append(("WAMR_NATIVE_COMPUTE", compute))
+    return identity, compute, b"".join(
+        name.encode() + b"=" + json.dumps(record).encode() + b"\n"
+        for name, record in records)
 
 
 def invoke(binary, *args):
@@ -34,6 +78,8 @@ def put(path, raw):
 
 
 def accepted(binary, command, raw, identity, mode, compute=None):
+    before_identity = identity.read_bytes()
+    before_log = Path(command[command.index("--log") + 1]).read_bytes()
     result = invoke(binary, *command, "--output", "json-v1")
     assert result.returncode == 0 and not result.stderr, (mode, result.stderr)
     assert result.stdout.endswith(b"\n") and result.stdout.count(b"\n") == 1
@@ -46,8 +92,8 @@ def accepted(binary, command, raw, identity, mode, compute=None):
     if compute is not None:
         expected["compute"] = compute
     assert observed == expected, (mode, observed, expected)
-    assert identity.read_bytes()
-    assert raw == Path(command[command.index("--log") + 1]).read_bytes()
+    assert identity.read_bytes() == before_identity
+    assert before_log == raw == Path(command[command.index("--log") + 1]).read_bytes()
     return observed
 
 
@@ -69,39 +115,24 @@ def usage(binary, *args):
     assert b"/" not in result.stderr and len(result.stderr) < 400
 
 
-def main(binary, differential=False):
-    tests = load("cli_compute_cases", APP / "tests/test_compute.py")
-    case = tests.ComputeContract()
-    case.setUp()
+def main(binary):
+    identity_data, expected, records = tiny_fixture()
     boot = ("Hyper-V Hv#1 hypercall page enabled\nHyper-V SynIC:\n"
             "Powered by\nCalling main(0, 0)\n")
-    end = "\n[    1.000001] Info: [libukboot] main returned 0\n"
-    raw = (boot + case.log() + end).encode()
-    reference = load("cli_tiny_reference", APP / "check-log.py") if differential else None
-    optional_reference = (
-        load("cli_optional_reference", APP / "check-workload-log.py")
-        if differential else None
-    )
-    oracle = load("cli_optional_oracle", HERE / "optional_reference_test.py") if differential else None
+    end = "[    1.000001] Info: [libukboot] main returned 0\n"
+    raw = boot.encode() + records + b"WAMR_NATIVE_AOT_OK answer=42 teardown=0\n" + end.encode()
     scratch = REPO / ".d" / "validator-cli-fixtures"
     scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(dir=scratch, prefix="private-") as location:
         root = Path(location)
         log, identity = root / "serial.bin", root / "identity.json"
         put(log, raw)
-        put(identity, json.dumps(case.identity).encode())
+        put(identity, json.dumps(identity_data).encode())
         tiny = ("tiny", "--log", str(log), "--identity", str(identity))
-        expected = case.result
         accepted(binary, tiny, raw, identity, "tiny", expected)
         human = invoke(binary, *tiny)
         assert human.returncode == 0 and human.stderr == b""
         assert human.stdout == b"Compute records match; no hardware or benchmark qualification.\n"
-        if differential:
-            text = raw.decode()
-            reference.validate(text, case.identity)
-            assert expected == json.loads(next(
-                line.split("=", 1)[1] for line in text.splitlines()
-                if line.startswith("WAMR_NATIVE_COMPUTE=")))
         framed = raw.replace(b"\n", b"\x1b[0m\r\n\x00")
         put(log, framed)
         accepted(binary, tiny, framed, identity, "tiny", expected)
@@ -116,50 +147,49 @@ def main(binary, differential=False):
             (b'"answer": 42', b'"answer": 41'),
             (b'"system_page_table_bytes": 4096', b'"system_page_table_bytes": 3'),
             (b"WAMR_NATIVE_AOT_OK answer=42 teardown=0", b"WAMR_NATIVE_AOT_FAIL"),
+            (b'"version": 1', b'"version": true'),
+            (b'"version": 1', b'"version": 1, "version": 1'),
+            (b'WAMR_NATIVE_COMPUTE=', b'echo WAMR_NATIVE_COMPUTE='),
+            (b'WAMR_NATIVE_AOT_OK answer=42 teardown=0\n', b''),
         ):
             assert before in raw
             bad = raw.replace(before, after, 1)
             put(log, bad)
             refused(binary, tiny)
-            if differential:
-                try:
-                    reference.validate(bad.decode(), case.identity)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError("Python reference accepted a corrupt tiny fixture")
+        for bad in (
+            raw + b"WAMR_NATIVE_AOT_OK answer=42 teardown=0\n",
+            raw + records,
+            raw.replace(b"Calling main(0, 0)\n", b""),
+            raw + b"HYPERV_ACCEPTANCE NETWORK_APP_FINAL PASS\n",
+            raw + b"WAMR_NATIVE_WASI={}\n",
+            raw + b"\x1b[0\x00m\n",
+        ):
+            put(log, bad)
+            refused(binary, tiny)
         put(log, raw)
         bad_identity = identity.read_bytes().replace(b'"minimal_wasi": false',
                                                      b'"minimal_wasi": true', 1)
         put(identity, bad_identity)
         refused(binary, tiny)
-        put(identity, json.dumps(case.identity).encode())
+        put(identity, json.dumps(identity_data).encode())
 
-        full = tests.ComputeContract()
-        full.setUp()
-        wasi = full.wasi_fixture()
-        coremark_raw = (boot + full.log(wasi) + end).encode()
+        full_identity, _, full_records = tiny_fixture(wasi=True)
+        coremark_raw = (boot.encode() + full_records
+                        + b"WAMR_NATIVE_AOT_OK answer=42 teardown=0\n" + end.encode())
         put(log, coremark_raw)
-        put(identity, json.dumps(full.identity).encode())
-        accepted(binary, tiny, coremark_raw, identity, "tiny", full.result)
-        if differential:
-            reference.validate(coremark_raw.decode(), full.identity)
+        put(identity, json.dumps(full_identity).encode())
+        accepted(binary, tiny, coremark_raw, identity, "tiny", expected)
         for before, after in (
             (b'"crc_ok": true', b'"crc_ok": false'),
             (b'"realtime_supported": true', b'"realtime_supported": false'),
             (b'"stdout_base64": "', b'"stdout_base64": "@@'),
+            (b'"output_error": 0', b'"output_error": 1'),
+            (b'"terminal": 2', b'"terminal": 1'),
         ):
             changed = coremark_raw.replace(before, after, 1)
             assert changed != coremark_raw
             put(log, changed)
             refused(binary, tiny)
-            if differential:
-                try:
-                    reference.validate(changed.decode(), full.identity)
-                except ValueError:
-                    pass
-                else:
-                    raise AssertionError("Python reference accepted a corrupt CoreMark fixture")
 
         for mode in MODES:
             original = (HERE / "optional-fixtures" / f"{mode}.log").read_bytes()
@@ -173,47 +203,27 @@ def main(binary, differential=False):
             put(log, framed)
             accepted(binary, command, framed, identity, mode)
             put(log, original)
-            if differential:
-                sample = oracle.pinned_sdk()
-                sampler = sample.validate_sample if sample else (lambda record, *_: record)
-                observed = optional_reference.validate(
-                    original, json.loads(source), mode, sampler)
-                assert observed == {
-                    "bytes": len(original),
-                    "sha256": hashlib.sha256(original).hexdigest(),
-                }
             if mode == "aot":
                 assert json.loads(source)["jit_mode"] is None
                 missing_mode = json.loads(source)
                 del missing_mode["jit_mode"]
                 put(identity, json.dumps(missing_mode).encode())
                 refused(binary, command, "record")
-                if differential:
-                    try:
-                        optional_reference.validate(original, missing_mode, mode, sampler)
-                    except KeyError:
-                        pass
-                    else:
-                        raise AssertionError("Python reference accepted missing AOT jit_mode")
                 put(identity, source)
             corrupt = original.replace(b'"correctness_only": true',
                                        b'"correctness_only": false', 1)
             assert corrupt != original
             put(log, corrupt)
             refused(binary, command)
-            if differential:
-                try:
-                    optional_reference.validate(
-                        corrupt, json.loads(source), mode, sampler)
-                except (ValueError, KeyError, TypeError):
-                    pass
-                else:
-                    raise AssertionError("Python reference accepted a corrupt workload fixture")
+            for bad in (original + original, original + b"WAMR_BENCH_RESULT={}\n",
+                        original + b"\xff\n", original + b"Unikraft Crash\n"):
+                put(log, bad)
+                refused(binary, command)
             put(log, original[:-1])
             refused(binary, command)
 
         put(log, raw)
-        put(identity, json.dumps(case.identity).encode())
+        put(identity, json.dumps(identity_data).encode())
         for arguments in (
             (), ("other",), ("tiny", "--log", str(log)),
             tiny + ("--log", str(log)),
@@ -241,15 +251,14 @@ def main(binary, differential=False):
         identity.unlink()
         put(identity, b'{"minimal_wasi":false,"minimal_wasi":false}')
         refused(binary, tiny)
-        put(identity, json.dumps(case.identity).encode())
+        put(identity, json.dumps(identity_data).encode())
         put(log, b"x" * (4 * 1024 * 1024))
         refused(binary, tiny, "input-bound")
         assert log.read_bytes() == b"x" * (4 * 1024 * 1024)
-    print("installed native validator CLI: tiny, four workload modes, refusal and raw hash fixtures" +
-          ("; Python differential" if differential else ""))
+    print("installed native validator CLI: tiny, four workload modes, refusal and raw hash fixtures")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] != "--differential"):
-        raise SystemExit("usage: cli_test.py BINARY [--differential]")
-    main(Path(sys.argv[1]).resolve(strict=True), len(sys.argv) == 3)
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: cli_test.py BINARY")
+    main(Path(sys.argv[1]).resolve(strict=True))

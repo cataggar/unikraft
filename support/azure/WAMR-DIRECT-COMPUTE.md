@@ -30,9 +30,11 @@ For private local correctness comparison it accepts `tiny --log L
 Its identity input is the prepared **app** identity, not a direct
 admission/candidate scope; `--output json-v1` binds the raw serial byte
 count/SHA-256 and checked compute record. The direct serial route remains
-scope-bound and stricter (it forbids WASI/CoreMark). Neither direct controller
-nor CI production caller changes dispatch in this preparatory phase. No
-image boot, cloud permission or admission is implied by these local fixtures.
+scope-bound and stricter (it forbids WASI/CoreMark). The production tiny CI
+adapter invokes the installed native CLI through its closed supervisor;
+the direct controller continues to use the shared parser in-process, not
+another Python parser. Neither correctness-only route adds a CoreMark image
+profile, image boot, cloud permission, benchmark or admission.
 
 ## Fixed topology and claim
 

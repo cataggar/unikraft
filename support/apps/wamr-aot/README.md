@@ -320,19 +320,7 @@ For an initial EFI-only local check, use the existing native
 [`uk-hyperv-local-boot`](../../tools/hyperv/local_boot/README.md) with that
 exact EFI, one CPU, real canonical QEMU/OVMF inputs and the same marker.
 After the boot tool's crash/termination/exact-input checks pass, validate
-the private serial record:
-
-```sh
-python3 support/apps/wamr-aot/check-log.py \
-  --log /private/attempt/hyperv-efi-boot.log \
-  --identity support/apps/wamr-aot/build/artifacts/identity.json
-```
-
-This checks runtime/workload identities, exact 42 result, trap detail,
-teardown accounting and optional original CRC output. It is an additional
-compute check, **not a replacement for exact-image boot validation**.
-The installed native CLI is available for local comparison (the existing
-Python caller still owns production validation until the separate cutover):
+the private serial record with the installed native validator:
 
 ```sh
 zig build --build-file support/apps/wamr-aot/validator.build.zig \
@@ -342,6 +330,13 @@ zig build --build-file support/apps/wamr-aot/validator.build.zig \
   --identity support/apps/wamr-aot/build/artifacts/identity.json \
   --legacy-apic forbidden --output json-v1
 ```
+
+This checks runtime/workload identities, exact 42 result, trap detail,
+teardown accounting and optional original CRC output. It is an additional
+correctness-only compute check, **not a replacement for exact-image boot
+validation**. The production tiny adapter invokes this installed executable
+through its closed, identity-bound native command supervisor; there is no
+Python validator fallback and no CoreMark production image profile.
 
 Use `--legacy-apic required` for a legacy xAPIC boot; omit it for the
 standalone developer check. `--output json-v1` emits exactly one compact
@@ -375,33 +370,24 @@ limits, memory growth and teardown. Required-subset guest records retain
 extension fields; the sampler and fixed nested objects retain exact fields.
 The app, CI adapter and direct build install the **same shared** native CLI
 source. The CI adapter records it as `native:wamr-log-validate` in the
-consumer-tool custody; prepared tiny supervision binds its executable
-identity, closed environment, exact APIC argv and bounded output. Neither
-the CI Python compute caller nor the direct controller has switched to this
-CLI: `check-log.py` and `check-workload-log.py` remain callable references
-until the later cutover, never native fallbacks. Run synthetic
-unit/property/fault, C oracle, native CLI integration and Python differential
-fixtures without building or booting an image:
+consumer-tool custody and dispatches it for every production tiny boot with
+the exact APIC argv, an empty environment, bounded output and supervised
+executable identity. Its result must retain the raw serial count/SHA-256 and
+the unchanged compute evidence object; changed inputs/tools refuse. The direct
+controller already calls the shared parser in-process for its stricter
+tiny-only serial scope. Run synthetic unit/property/fault, C oracle and native
+CLI integration fixtures without building or booting an image:
 
 ```sh
 zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test
-zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test-differential
 ```
 
-The differential step also compares typed tiny results, raw byte counts/hashes
-and normalized record sequences against the retained Python end-to-end
-compute path; independent C `coremark.h` and Python output parsers check
-CoreMark bytes. Optional differentials compare the exact normalized record
-sequence and original bytes/hash with the retained workload checker; they also
-invoke `validate_sample` at the pinned SDK revision when that checkout is
-available (`WAMR_PINNED_SDK` may select it). The upstream local-boot
-terminal/crash check is represented by native envelope tests, not by calling
-`run.py.compute()` alone. Optional
-Unicode printability is pinned to Python 3.12's
-Unicode 15 domain, not the host Python version: the native and differential
-tests include golden Unicode 16-only rejection ranges from UnicodeData 15.0
-and printable Unicode 15 boundary cases. Python 3.14 uses those goldens
-instead of admitting its broader Unicode 16 character set.
+The native golden and property cases cover the former parser mutation matrices;
+the retained independent C `coremark.h` oracle checks actual CoreMark bytes.
+The local-boot terminal/crash check is represented by native envelope tests.
+Optional Unicode printability is pinned to Python 3.12's Unicode 15 domain,
+not the host Python version: native goldens include Unicode 16-only rejection
+ranges and printable Unicode 15 boundary cases.
 
 ```sh
 zig build --build-file support/apps/wamr-aot/build.zig test-unit test-integration
@@ -409,12 +395,11 @@ zig test build.zig --test-filter 'native WAMR'
 zig test support/build/native-image-graph.zig
 zig build test-hyperv-image-proofs test-native-compiler-options -j2
 zig build test-hyperv-clock -j2
-python3 -B -m unittest discover -s support/apps/wamr-aot/tests -v
 ```
 
 The app's native tests own producer golden bytes/modes, image command plans,
-refusals and supervision faults; the remaining Python app tests exercise
-only serial parsers pending #188. The compute controller/boot/handoff Python
+refusals and supervision faults; the former parser-only Python tests have
+been replaced by native golden/property and CLI fixtures. The compute controller/boot/handoff Python
 surface belongs to later #186/#187/#189 migrations, not a producer fallback.
 
 After preparation, run the hosted WASI bridge clock tests with the pinned

@@ -9,7 +9,6 @@ import argparse
 import base64
 import contextlib
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -156,7 +155,6 @@ SUPERVISOR_SOURCE_FILES = (
     "support/tools/hyperv/sha256_clear_upper.S",
 )
 FAILURE_STAGE = "startup"
-ANSI_ESCAPE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 COMMAND_ERROR_MARKERS = (
     "AccessDenied", "BrokenPipe", "FileNotFound", "FileTooBig", "InputOutput",
     "InvalidEnumTag", "InvalidNativeMakeEnvironment", "InvalidNativeMakePath",
@@ -2863,8 +2861,6 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
             "interpreter": None,
             "argv": boot_command_argv(mode, profile),
         }
-    # Prepared for the native caller cutover; these stages are not dispatched
-    # by the current Python compute path or PRODUCTION_COMMAND_STAGES.
     for validator_stage, legacy in LOG_VALIDATOR_STAGES.items():
         contracts[validator_stage] = {
             "kind": "validator-only", "seconds": 30,
@@ -4699,40 +4695,92 @@ def check_build():
             "runtime": identity, "image": image}
 
 
-def normalize_serial(raw):
-    # Match local_boot/serial.zig; evidence identities remain over the raw bytes.
-    require(0 < len(raw) < 4 * MIB, "serial bound")
-    raw.decode("utf-8")
-    normalized = ANSI_ESCAPE.sub(b"", raw).replace(b"\0", b"")
-    require(all(byte >= 0x20 or byte in b"\n\r\t" for byte in normalized),
-            "invalid serial control")
-    require(all(len(line) <= 8192 for line in normalized.split(b"\n")),
-            "serial line bound")
-    return normalized.decode("utf-8").replace("\r\n", "\n")
-
-
-def compute(raw, identity, legacy):
-    text = normalize_serial(raw)
-    lines = text.split("\n")
-    require(lines.count(MARKER) == 1 and text.count(MARKER) == 1,
-            "completion must be one exact line")
-    require(text.count(LEGACY) == int(legacy), "wrong APIC observation")
-    require(not any(marker in text for marker in FORBIDDEN), "unexpected acceptance")
-    compute_lines = [line for line in lines if "WAMR_NATIVE_COMPUTE=" in line]
-    require(len(compute_lines) == 1 and compute_lines[0].startswith("WAMR_NATIVE_COMPUTE="),
-            "one anchored compute record required")
-    start = text.index("Calling main(")
-    record = text.index(compute_lines[0])
-    done = text.index(MARKER)
-    terminal = text.index("main returned")
-    require(start < record < done < terminal, "compute envelope order")
-    spec = importlib.util.spec_from_file_location("wamr_app_log", APP / "check-log.py")
-    checker = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(checker)
-    # The app-owned validator supplies independent exact answer/growth/trap and
-    # native selftest/accounting expectations; the CLI already checked terminal/crash.
-    checker.validate(text, identity)
-    return json.loads(compute_lines[0].split("=", 1)[1], object_pairs_hook=unique)
+def native_compute(work, identity_path, identity, raw, legacy, consumer_inputs):
+    require(consumer_inputs is not None, "native validator custody required")
+    root = work.parent
+    require_recorded_consumer_inputs(consumer_inputs, content=True)
+    files = consumer_inputs["files"]
+    executable_record = files.get(WAMR_LOG_VALIDATOR_ROLE)
+    require(isinstance(executable_record, dict), "installed native validator required")
+    executable = Path(executable_record["path"])
+    require(executable == root / "tools/bin/uk-wamr-log-validate",
+            "wrong installed native validator")
+    require(identity == document(identity_path), "runtime identity changed")
+    log = work / "hyperv-efi-boot.log"
+    serial_record, unused = physical_file_record(log)
+    del unused
+    identity_record, unused = physical_file_record(identity_path)
+    del unused
+    records = consumer_file_records(consumer_inputs)
+    records.update({
+        serial_record["path"]: serial_record,
+        identity_record["path"]: identity_record,
+    })
+    stage = "log-validator-legacy" if legacy else "log-validator-x2apic"
+    contract = production_command_contract(stage)
+    private = root / "private" / "log-validation"
+    private.mkdir(mode=0o700, exist_ok=True)
+    info = private.lstat()
+    require(canonical(private) and stat.S_ISDIR(info.st_mode)
+            and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700,
+            "unsafe native validator output directory")
+    for index in range(16):
+        invocation = private / f"{work.name}-{index:02d}"
+        try:
+            invocation.mkdir(mode=0o700)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise Refusal("native validator invocation bound")
+    for name in ("private", "evidence"):
+        (invocation / name).mkdir(mode=0o700)
+    output, record = execute(
+        invocation, stage,
+        [executable, "tiny", "--log", log, "--identity", identity_path,
+         "--legacy-apic", LOG_VALIDATOR_STAGES[stage], "--output", "json-v1"],
+        seconds=contract["seconds"], limit=contract["output_limit"],
+        input_records=records,
+        path_roles={
+            WAMR_LOG_VALIDATOR_ROLE: executable,
+            "input:serial": log,
+            "input:identity": identity_path,
+        })
+    validate_supervised_command_binding(
+        record, stage, {
+            "command-supervisor": native_executable_identity(
+                files["command-supervisor"]),
+            WAMR_LOG_VALIDATOR_ROLE: native_executable_identity(
+                executable_record),
+        })
+    response = read(output, contract["output_limit"] + 1)
+    require(record["sha256"] == hashlib.sha256(response).hexdigest()
+            and record["bytes"] == len(response)
+            and response.endswith(b"\n") and response.count(b"\n") == 1,
+            "native validator output changed")
+    observed = json.loads(response, object_pairs_hook=unique)
+    require(isinstance(observed, dict), "invalid native validator result")
+    require(set(observed) == {
+        "schema", "schema_version", "mode", "raw_serial_bytes",
+        "raw_serial_sha256", "compute",
+    } and observed["schema"] == "uk.wamr.log-validation"
+      and type(observed["schema_version"]) is int
+      and observed["schema_version"] == 1
+      and observed["mode"] == "tiny"
+      and type(observed["raw_serial_bytes"]) is int
+      and observed["raw_serial_bytes"] == len(raw)
+      and observed["raw_serial_sha256"] == hashlib.sha256(raw).hexdigest()
+      and isinstance(observed["compute"], dict),
+      "native validator result changed")
+    require(consumer_input_state(root.parent, expected=consumer_inputs)
+            == consumer_inputs, "native validator tool changed")
+    require(serial_record == physical_file_record(log)[0]
+            and identity_record == physical_file_record(identity_path)[0]
+            and identity == document(identity_path)
+            and raw == read(log, 4 * MIB),
+            "native validator input changed")
+    return observed["compute"]
 
 
 def config_for(runtime, root, index, modes=MODES):
@@ -4839,7 +4887,8 @@ def pin_from_record(record):
     }
 
 
-def check_boot(config, identity, boot_inputs=None):
+def check_boot(config, identity, boot_inputs=None, *,
+               consumer_inputs=None, identity_path=None):
     work = Path(config["work_dir"])
     request = document(work / "request.json")
     require(request["schema_version"] == 2 and request["config"] == config,
@@ -4875,11 +4924,15 @@ def check_boot(config, identity, boot_inputs=None):
     require(report["serial_bytes"] == len(raw)
             and report["serial_sha256"] == hashlib.sha256(raw).hexdigest(),
             "serial binding changed")
+    if identity_path is None:
+        identity_path = APP / "build/artifacts/identity.json"
     return {"scope": "local_native_compute_only", "report": report,
             "input_pins": request["pins"],
             "request_sha256": digest(work / "request.json"),
             "report_sha256": digest(work / "report.json"),
-            "compute": compute(raw, identity, config["disable_x2apic"])}
+            "compute": native_compute(
+                work, identity_path, identity, raw, config["disable_x2apic"],
+                consumer_inputs)}
 
 
 def prepare_source_outputs():
@@ -5223,7 +5276,8 @@ def boot(runtime):
             boot_args(paths["local_boot_tool"], config), 90, 64 * 1024,
             extra_inputs=inputs, extra_input_paths=paths)
         FAILURE_STAGE = mode + "-result"
-        result = check_boot(config, identity, inputs)
+        result = check_boot(
+            config, identity, inputs, consumer_inputs=initial["consumer_inputs"])
         expected = (
             package["image"]["raw"]["sha256"] if index < 2 else
             finalization["output"]["sha256"] if index < 4 else
@@ -5295,7 +5349,9 @@ def boot(runtime):
     accepted_boots = {}
     for index in range(4):
         mode = SIX_MODES[index]
-        checked = check_boot(configs[index], identity, inputs)
+        checked = check_boot(
+            configs[index], identity, inputs,
+            consumer_inputs=initial["consumer_inputs"])
         require(checked == document(
             root / "evidence" / (mode + "-compute.json")),
             "pre-derivation boot evidence changed")
@@ -5393,7 +5449,9 @@ def boot(runtime):
     FAILURE_STAGE = "boot-final-inspection"
     all_boots = {}
     for index, mode in enumerate(SIX_MODES):
-        checked = check_boot(configs[index], identity, inputs)
+        checked = check_boot(
+            configs[index], identity, inputs,
+            consumer_inputs=initial["consumer_inputs"])
         require(checked == document(
             root / "evidence" / (mode + "-compute.json")),
             "final boot evidence changed")
