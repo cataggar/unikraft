@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
     const controller_options = b.addOptions();
     controller_options.addOption([]const u8, "repository_root", std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
         @panic("cannot resolve source root"));
-    controller_options.addOption([]const u8, "zig_executable", b.findProgram(&.{"zig"}, &.{}) catch @panic("controller target fixtures require Zig"));
+    controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = b.graph.host,
