@@ -186,7 +186,10 @@ shared validator source, records its physical executable identity as
 `log-validator-x2apic`/`log-validator-legacy` supervisor contracts pin
 the exact `tiny --log ... --identity ... --legacy-apic forbidden|required
 --output json-v1` argv, empty environment, executable identity, timeout
-and output bound. These stages are **not dispatched**: `run.py.compute()`
+and output bound. The same strict stage policy normalizes and validates the
+actual supervised request: fixture runs prove both APIC modes with an empty
+child environment, exact JSON output and fail-closed wrong-APIC refusal.
+These stages are **not dispatched**: `run.py.compute()`
 still calls the retained Python checker until the separate #188 cutover.
 Adapter and direct native CLI fixtures exercise synthetic records only;
 the CLI result cannot replace boot/image or acceptance evidence.
@@ -409,6 +412,7 @@ zig build --build-file support/build/wamr-native-ci/build.zig \
   -Dtest-root="$PWD/.d/wamr-ci-check/fixtures" \
   -Doptimize=ReleaseSafe -j2 test install
 WAMR_CI_PACKAGE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-package" \
+WAMR_CI_LOG_VALIDATE="$PWD/.d/wamr-ci-check/out/bin/uk-wamr-log-validate" \
 WAMR_CI_SUPERVISOR="$PWD/.d/wamr-ci-check/supervisor/bin/wamr-ci-supervisor" \
 WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fixture" \
   python3 -m unittest discover -s support/build/wamr-native-ci/tests -v
