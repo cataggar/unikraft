@@ -210,8 +210,18 @@ pub fn build(b: *std.Build) void {
     });
     controller_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
     const controller_run = b.addRunArtifact(controller_tests);
+    const install_target_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/install_target_tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    install_target_tests.root_module.addOptions("test_options", controller_options);
+    const install_target_run = b.addRunArtifact(install_target_tests);
+    install_target_run.step.dependOn(&controller_run.step);
     b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures")
-        .dependOn(&controller_run.step);
+        .dependOn(&install_target_run.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
