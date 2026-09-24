@@ -88,6 +88,8 @@ pub fn build(b: *std.Build) void {
         "zig_lib_dir",
         b.graph.zig_lib_directory.path.?,
     );
+    options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch
+        @panic("native Git archive fixture requires Git"));
     options.addOption(
         []const u8,
         "repository_root",
@@ -113,9 +115,18 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    unit_tests.root_module.link_libc = true;
+    unit_tests.root_module.addCSourceFile(.{
+        .file = b.path("tests/workload-mode.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
     unit_tests.root_module.addOptions("test_options", options);
     const unit_run = b.addRunArtifact(unit_tests);
-    unit_run.setCwd(.{ .cwd_relative = b.cache_root.path orelse "zig-cache" });
+    const test_cwd = if (std.mem.eql(u8, b.build_root.path.?, "."))
+        "."
+    else
+        b.pathFromRoot("../../..");
+    unit_run.setCwd(.{ .cwd_relative = test_cwd });
     const unit_step = b.step("test-unit", "Run native WAMR build helper unit and fault fixtures");
     unit_step.dependOn(&unit_run.step);
 
@@ -129,32 +140,11 @@ pub fn build(b: *std.Build) void {
     });
     integration_tests.root_module.addOptions("test_options", options);
     const integration_run = b.addRunArtifact(integration_tests);
-    integration_run.setCwd(.{ .cwd_relative = b.cache_root.path orelse "zig-cache" });
+    integration_run.setCwd(.{ .cwd_relative = test_cwd });
     const integration_step = b.step("test-integration", "Run native WAMR build executable and supervisor fixtures");
     integration_step.dependOn(&integration_run.step);
 
-    const differential_run = b.addSystemCommand(&.{"python3"});
-    differential_run.addFileArg(b.path("tests/test_prepare_differential.py"));
-    differential_run.addFileArg(executable.getEmittedBin());
-    differential_run.addFileArg(prepare_fixture.getEmittedBin());
-    differential_run.addArg(b.graph.zig_lib_directory.path.?);
-    differential_run.addArg(b.cache_root.path orelse "zig-cache");
-    differential_run.setCwd(.{ .cwd_relative = b.build_root.path.? });
-    differential_run.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
-    const differential_step = b.step(
-        "test-differential",
-        "Compare native prepare, verify, and image commands with Python",
-    );
-    differential_step.dependOn(&differential_run.step);
-    const image_differential_run = b.addSystemCommand(&.{"python3"});
-    image_differential_run.addFileArg(b.path("tests/test_image_differential.py"));
-    image_differential_run.addFileArg(executable.getEmittedBin());
-    image_differential_run.addFileArg(image_fixture.getEmittedBin());
-    image_differential_run.addArg(b.cache_root.path orelse "zig-cache");
-    image_differential_run.setCwd(.{ .cwd_relative = b.build_root.path.? });
-    image_differential_run.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
-    differential_step.dependOn(&image_differential_run.step);
-    const all = b.step("test", "Run native WAMR build foundation tests");
+    const all = b.step("test", "Run native WAMR producer golden, fault, and integration tests");
     all.dependOn(unit_step);
     all.dependOn(integration_step);
 }

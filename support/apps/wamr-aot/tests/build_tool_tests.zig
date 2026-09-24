@@ -8,6 +8,49 @@ const build_tool = @import("wamr_aot_build");
 const allocator = testing.allocator;
 const io = testing.io;
 
+extern fn check_mode(c_uint, c_uint, c_int, [*c][*c]u8, *c_uint) c_int;
+
+test "native workload mode keeps fixed JIT presets and compiler-free refusals" {
+    inline for (.{ .{ 1, "correctness-fast" }, .{ 2, "correctness-full" } }) |case| {
+        try checkMode(2, case[0], &.{"wamr"}, case[0]);
+        try checkMode(2, case[0], &.{ "wamr", case[1] }, case[0]);
+    }
+    inline for (.{ 0, 3 }) |configured|
+        try checkMode(2, configured, &.{"wamr"}, null);
+    inline for (.{
+        .{ 1, "correctness-full" }, .{ 2, "correctness-fast" },
+        .{ 1, "measurement" },      .{ 2, "correctness" },
+        .{ 1, "fast" },
+    }) |case| try checkMode(2, case[0], &.{ "wamr", case[1] }, null);
+    try checkMode(2, 1, &.{ "wamr", "correctness-fast", "extra" }, null);
+    try checkMode(2, 1, &.{}, null);
+    try checkMode(4, 0, &.{"wamr"}, null);
+    inline for (.{ 1, 3 }) |variant| {
+        try checkMode(variant, 0, &.{"wamr"}, 0);
+        try checkMode(variant, 0, &.{ "wamr", "correctness" }, 0);
+        try checkMode(variant, 1, &.{"wamr"}, null);
+        try checkMode(variant, 0, &.{ "wamr", "correctness-fast" }, null);
+    }
+}
+
+fn checkMode(
+    variant: c_uint,
+    configured: c_uint,
+    arguments: []const [*:0]const u8,
+    expected: ?c_uint,
+) !void {
+    var mode: c_uint = 99;
+    const status = check_mode(
+        variant,
+        configured,
+        @intCast(arguments.len),
+        @ptrCast(@constCast(arguments.ptr)),
+        &mode,
+    );
+    try testing.expectEqual(expected != null, status == 0);
+    try testing.expectEqual(expected orelse 99, mode);
+}
+
 test "CLI grammar retains the four commands and exact option combinations" {
     const prepare = try build_tool.parseArguments(&.{
         "prepare",

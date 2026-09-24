@@ -15,9 +15,11 @@ compiler-free image; all current application modes produce **no benchmark score*
 
 ## Build the actual EFI image
 
-Use Zig **0.16.0**, Python 3, Make, Bison/Flex (including their usual
-`yacc`/`lex` names), M4, Bash, and LLVM binary tools on PATH. From the
-Unikraft checkout:
+Use Zig **0.16.0**, Make, Bison/Flex (including their usual `yacc`/`lex`
+names), M4, Bash, LLVM binary tools, and Python 3 for the still-native
+Make graph and separate log validators. Python does **not** prepare or
+verify artifacts, solve the config, or build the native image. From a
+clean Unikraft checkout with a fresh application output root:
 
 ```sh
 umask 077
@@ -27,6 +29,7 @@ zig build --build-file support/apps/wamr-aot/build.zig \
   --prefix "$tool_root" -Doptimize=ReleaseSafe install
 tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" prepare --repository "$PWD" --source /path/to/wamr
+"$tool" verify --repository "$PWD"
 "$tool" olddefconfig --repository "$PWD"
 "$tool" native-images --repository "$PWD"
 ```
@@ -39,10 +42,14 @@ It builds that revision's host `wamrc`, its freestanding library audit,
 then the integration archive. The tiny wasm is genuinely generated from
 `fixture.zig` and compiled with `--target=x86_64
 --profile=unikraft-x86_64`. Hosted artifacts are not renamed or relabelled.
-Only trusted output of this pinned producer is admissible.
-The retained Python producers remain for differential and legacy test fixtures
-until the final removal PR; production Make, local commands and CI have no
-Python fallback.
+Only trusted output of this pinned producer is admissible. The adapter installs
+the **same app-owned executable**, binds its physical ELF identity as the
+`native:wamr-aot-build` role for all three production stages, and never selects
+an interpreter or a Python producer fallback. `Makefile.uk` calls this tool's
+`verify` through `APPWAMRAOT_TOOL`; direct Make users must install it first.
+All four commands require `--repository` with the canonical absolute checkout
+path. For supervised CI, `prepare` takes the sealed `--source-archive` instead
+of `--source`; it is incompatible with `--development-revision`.
 
 The same merged SDK supplies the single-root CoreMark bridge and optional
 workloads in [WORKLOADS.md](WORKLOADS.md). This source pin does not establish
@@ -71,15 +78,25 @@ the kernel VAS; the application verifies both its VAS/page-table identity
 and hardware CR3 before use. Admission requires one CPU; five-level paging
 and storage/network-probe configurations are refused.
 
-`build/artifacts/identity.json` retains source/tool/wasm/cwasm/library
-identities and exact options. Make verifies the generated artifacts before
-compiling. `build/image-identity.json` records the entire final EFI and debug
-ELF, solved config, application source hashes, Unikraft revision/diff, input
-manifest and tool hashes. Rebuild after committing for a clean revision
-identity. These are **build records, not deployment or hardware receipts**.
-Keep `build/` private. Re-preparation deliberately refuses existing artifact
-or source-export directories; use a fresh worktree or remove only those two
-generated directories after retaining needed evidence.
+`build/source-files.json` holds the sorted compact source-file byte-count/hash
+map, with one final LF. `build/artifacts/identity.json` is pretty schema 1 and
+retains source/tool/wasm/cwasm/library identities, exact command arrays and
+options. Its `prepare_source_sha256` hashes tracked `build-tool-prepare.zig`.
+Make verifies the generated artifacts before compiling.
+`build/image-identity.json` is pretty schema 1 and binds complete EFI, debug
+ELF and bootinfo bytes, solved config, application/build-tool source hashes,
+clean Unikraft revision/diff, input manifest and tool hashes; its mode is
+`0600`. Rebuild after committing for a clean revision identity. These are
+**build records, not deployment or hardware receipts**.
+Keep `build/` private: output/cache directories are `0700`, private config,
+JSON and diagnostics are `0600`, and the host compiler is executable/private
+`0700`. Preparation is create-only for `build/artifacts`,
+`build/wamr-source` and `build/workload-consumer`; a collision or partial
+failure refuses rather than overwriting evidence. Use a fresh worktree for
+another preparation. Config/image state can be reused but an existing
+`.config` is not silently rewritten. A failed/changed tool, source or child
+refuses with a bounded diagnostic, retains private failure records and does
+not publish a new success identity.
 
 `BISON_PKGDATADIR` can explicitly select a private, absolute Bison data
 directory. The existing native Make environment guard still validates it;
@@ -326,12 +343,18 @@ or OVMF: its native boot attempt was refused, not counted as a passing run.
 ## Focused developer checks
 
 ```sh
+zig build --build-file support/apps/wamr-aot/build.zig test-unit test-integration
 zig test build.zig --test-filter 'native WAMR'
 zig test support/build/native-image-graph.zig
 zig build test-hyperv-image-proofs test-native-compiler-options -j2
 zig build test-hyperv-clock -j2
-python3 -m unittest discover -s support/apps/wamr-aot/tests -v
+python3 -B -m unittest discover -s support/apps/wamr-aot/tests -v
 ```
+
+The app's native tests own producer golden bytes/modes, image command plans,
+refusals and supervision faults; the remaining Python app tests exercise
+only serial parsers pending #188. The compute controller/boot/handoff Python
+surface belongs to later #186/#187/#189 migrations, not a producer fallback.
 
 After preparation, run the hosted WASI bridge clock tests with the pinned
 source export (on an ARM host, append `--test-cmd /path/to/qemu-x86_64
