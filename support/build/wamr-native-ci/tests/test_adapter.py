@@ -70,59 +70,6 @@ class Contract(unittest.TestCase):
             "main returned 0", "",
         ])).encode()
 
-    def test_exact_result_both_apics(self):
-        for legacy in (False, True):
-            self.assertEqual(ci.compute(self.log(legacy), self.identity, legacy), self.result)
-
-    def test_console_nul_and_ansi_framing(self):
-        for legacy in (False, True):
-            raw = self.log(legacy).replace(
-                b"Calling main(0, 0)\n",
-                b"\x1b[1mCalling main(0, 0)\x1b[0m\r\n\0")
-            raw = raw.replace(ci.MARKER.encode(),
-                              b"\x1b[32m" + ci.MARKER.encode() + b"\x1b[0m\0")
-            self.assertEqual(ci.compute(raw, self.identity, legacy), self.result)
-
-    def test_normalization_keeps_native_serial_refusals(self):
-        raw = self.log()
-        malformed = [raw + suffix for suffix in
-                     (b"\x1b", b"\x1b[", b"\x1b[0\0m", b"\x07", b"\xc2\0\xa3")]
-        malformed.append(b"x" * 8193 + b"\n" + raw)
-        for value in malformed:
-            with self.subTest(raw=value), self.assertRaises(ValueError):
-                ci.compute(value, self.identity, False)
-
-    def test_wrong_result_trap_growth_selftest_accounting_and_identity(self):
-        for key, value in (("answer", 43), ("checks", 1), ("terminal", 0),
-                           ("detail", 0), ("frame_bytes", 4096),
-                           ("platform_status", -1), ("version", True),
-                           ("runtime_sha256", "9" * 64)):
-            original = copy.deepcopy(self.result)
-            self.result[key] = value
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                ci.compute(self.log(), self.identity, False)
-            self.result = original
-
-    def test_exact_completion_not_substring_or_request_echo(self):
-        raw = self.log()
-        marker = ci.MARKER.encode()
-        cases = [
-            raw.replace(marker, b"echo " + marker),
-            raw.replace(marker, marker + b" suffix"),
-            raw + marker + b"\n",
-            marker + b"\n" + raw.replace(marker + b"\n", b""),
-            raw.replace(marker + b"\n", b"") + marker + b"\n",
-            raw.replace(b"WAMR_NATIVE_COMPUTE=", b"request WAMR_NATIVE_COMPUTE="),
-            raw + b"HYPERV_ACCEPTANCE NETWORK_APP_FINAL PASS\n",
-            raw + ci.LEGACY.encode(),
-            raw.replace(b'"version": 1', b'"version": 1, "version": 1'),
-        ]
-        for malformed in cases:
-            with self.subTest(raw=malformed), self.assertRaises(ValueError):
-                ci.compute(malformed, self.identity, False)
-        with self.assertRaises(ValueError):
-            ci.compute(raw, self.identity, True)
-
     def test_legacy_four_exact_disk_modes_never_hardware_return(self):
         for index in range(4):
             config = ci.config_for(Path("/runtime"), Path("/runtime/compute"), index)
@@ -386,10 +333,39 @@ class Evidence(unittest.TestCase):
             (self.root / name).mkdir(mode=0o700)
         self.contract = Contract()
         self.contract.setUp()
+        validator = mock.patch.object(
+            ci, "native_compute", side_effect=self.fixture_native_compute)
+        validator.start()
+        self.fixture_validator = validator
+        self.addCleanup(validator.stop)
 
     def put(self, path, value):
         path.write_bytes(value)
         path.chmod(0o600)
+
+    def fixture_native_compute(self, work, identity_path, identity, raw,
+                               legacy, consumer_inputs):
+        self.assertIsNotNone(LOG_VALIDATE)
+        self.assertEqual(ci.document(identity_path), identity)
+        self.assertEqual((work / "hyperv-efi-boot.log").read_bytes(), raw)
+        self.assertIsNotNone(consumer_inputs)
+        result = subprocess.run(
+            [LOG_VALIDATE, "tiny", "--log", str(work / "hyperv-efi-boot.log"),
+             "--identity", str(identity_path), "--legacy-apic",
+             "required" if legacy else "forbidden", "--output", "json-v1"],
+            capture_output=True, env={}, timeout=15)
+        if result.returncode:
+            raise ci.Refusal("native validator refused synthetic boot")
+        observed = json.loads(result.stdout, object_pairs_hook=ci.unique)
+        self.assertEqual(observed["raw_serial_bytes"], len(raw))
+        self.assertEqual(observed["raw_serial_sha256"],
+                         hashlib.sha256(raw).hexdigest())
+        return observed["compute"]
+
+    def check_fixture_boot(self, config, identity):
+        return ci.check_boot(
+            config, identity, consumer_inputs={"files": {}},
+            identity_path=self.root / "private/identity.json")
 
     def supervised_binding(self, stage):
         contract = ci.production_command_contract(stage)
@@ -1855,40 +1831,6 @@ class Evidence(unittest.TestCase):
         with self.assertRaises(ci.Refusal):
             ci.require_recorded_consumer_inputs(expected)
 
-    def test_compute_dynamic_validator_never_writes_bytecode(self):
-        app = self.root / "validator-app"
-        app.mkdir(mode=0o700)
-        checker = app / "check-log.py"
-        self.put(checker, b"def validate(text, identity):\n    return None\n")
-        log = self.root / "serial.log"
-        self.put(log, self.contract.log())
-        before = {
-            path: ci.snapshot(path.lstat())
-            for path in (app, checker)
-        }
-        script = """
-import os
-from pathlib import Path
-import sys
-assert "PYTHONDONTWRITEBYTECODE" not in os.environ
-assert sys.dont_write_bytecode is False
-path = Path(sys.argv[1])
-scope = {"__file__": str(path), "__name__": "wamr_ci_fixture"}
-exec(compile(path.read_bytes(), str(path), "exec"), scope)
-assert sys.dont_write_bytecode is True
-scope["APP"] = Path(sys.argv[2])
-scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
-"""
-        completed = subprocess.run(
-            [PYTHON, "-c", script, str(HERE / "run.py"), str(app), str(log)],
-            env={}, capture_output=True, timeout=30)
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(list(app.iterdir()), [checker])
-        self.assertEqual(
-            {path: ci.snapshot(path.lstat()) for path in (app, checker)},
-            before,
-        )
-
     def test_build_refuses_an_unbound_bison_environment(self):
         for index, override in enumerate((None, str(self.root / "different"))):
             runtime = self.root / ("build-" + str(index))
@@ -3241,6 +3183,44 @@ source/generated/
                         b"WAMR_LOG_VALIDATION_REFUSED category=transcript reason=invalid\n")
         finally:
             ci.COMMAND_SUPERVISOR_PATH = original_supervisor
+
+    def test_native_result_requires_exact_raw_and_output_commitment(self):
+        raw = self.contract.log()
+        output = self.root / "private/validator.json"
+        payload = {
+            "schema": "uk.wamr.log-validation", "schema_version": 1,
+            "mode": "tiny", "raw_serial_bytes": len(raw),
+            "raw_serial_sha256": hashlib.sha256(raw).hexdigest(),
+            "compute": self.contract.result,
+        }
+        self.put(output, json.dumps(payload).encode() + b"\n")
+        record = {"bytes": output.stat().st_size, "sha256": ci.digest(output)}
+        self.assertEqual(ci.native_result(output, record, raw, 8192),
+                         self.contract.result)
+        for change in (
+            {"raw_serial_bytes": len(raw) - 1},
+            {"raw_serial_sha256": "0" * 64},
+            {"schema_version": True},
+            {"compute": None},
+            {"mode": "snapshot"},
+        ):
+            self.put(output, json.dumps(dict(payload, **change)).encode() + b"\n")
+            changed = {"bytes": output.stat().st_size,
+                       "sha256": ci.digest(output)}
+            with self.subTest(change=change), self.assertRaises(ci.Refusal):
+                ci.native_result(output, changed, raw, 8192)
+        self.put(output, json.dumps(payload).encode() + b"\n")
+        self.put(output, output.read_bytes().replace(b'"answer": 42',
+                                                      b'"answer": 41'))
+        with self.assertRaisesRegex(ci.Refusal, "output changed"):
+            ci.native_result(output, record, raw, 8192)
+
+    def test_check_boot_requires_native_validator_custody(self):
+        config = self.synthetic_boot()
+        self.fixture_validator.stop()
+        with self.assertRaisesRegex(ci.Refusal, "validator custody"):
+            ci.check_boot(config, self.contract.identity,
+                          identity_path=self.root / "private/identity.json")
 
     def test_publication_binds_installed_log_validator_role(self):
         record, identities = self.supervised_binding("log-validator-x2apic")
@@ -4693,6 +4673,8 @@ source/generated/
 
     def synthetic_boot(self, raw=None):
         config = ci.config_for(self.root, self.root, 0)
+        self.put(self.root / "private/identity.json",
+                 json.dumps(self.contract.identity).encode())
         for name in ("package/unikraft.raw", "firmware/code.fd",
                      "firmware/vars.fd", "bin/qemu-system-x86_64"):
             self.put(self.root / name, b"explicitly synthetic, never native boot evidence")
@@ -4723,11 +4705,12 @@ source/generated/
         return config
 
     def test_console_normalization_preserves_raw_hash_binding(self):
-        raw = self.contract.log().replace(b"\n", b"\x1b[0m\0\r\n\0")
+        original = self.contract.log()
+        raw = original.replace(b"\n", b"\x1b[0m\0\r\n\0")
         config = self.synthetic_boot(raw)
-        observed = ci.check_boot(config, self.contract.identity)
+        observed = self.check_fixture_boot(config, self.contract.identity)
         raw_hash = hashlib.sha256(raw).hexdigest()
-        normalized_hash = hashlib.sha256(ci.normalize_serial(raw).encode()).hexdigest()
+        normalized_hash = hashlib.sha256(original).hexdigest()
         self.assertNotEqual(raw_hash, normalized_hash)
         self.assertEqual(observed["report"]["serial_sha256"], raw_hash)
         self.assertEqual(observed["compute"], self.contract.result)
@@ -4736,25 +4719,25 @@ source/generated/
         report["serial_sha256"] = normalized_hash
         self.put(report_path, json.dumps(report).encode())
         with self.assertRaises(ValueError):
-            ci.check_boot(config, self.contract.identity)
+            self.check_fixture_boot(config, self.contract.identity)
 
     def test_physical_request_log_and_report_bindings(self):
         config = self.synthetic_boot()
         identity = self.contract.identity
-        observed = ci.check_boot(config, identity)
+        observed = self.check_fixture_boot(config, identity)
         self.assertEqual(observed["compute"], self.contract.result)
         changed = dict(config, disable_x2apic=True)
         with self.assertRaises(ValueError):
-            ci.check_boot(changed, identity)
+            self.check_fixture_boot(changed, identity)
         work = Path(config["work_dir"])
         original = (work / "hyperv-efi-boot.log").read_bytes()
         self.put(work / "hyperv-efi-boot.log", original + b"changed")
         with self.assertRaises(ValueError):
-            ci.check_boot(config, identity)
+            self.check_fixture_boot(config, identity)
         self.put(work / "hyperv-efi-boot.log", original)
         self.put(Path(config["source"]["path"]), b"different package")
         with self.assertRaises(ValueError):
-            ci.check_boot(config, identity)
+            self.check_fixture_boot(config, identity)
 
     def test_failed_native_report_never_becomes_compute_result(self):
         config = self.synthetic_boot()
@@ -4765,7 +4748,7 @@ source/generated/
             report = dict(saved, **{key: value})
             self.put(report_path, json.dumps(report).encode())
             with self.subTest(key=key), self.assertRaises(ValueError):
-                ci.check_boot(config, self.contract.identity)
+                self.check_fixture_boot(config, self.contract.identity)
 
     def test_bounded_failure_capture_and_timeout(self):
         for stage, source, seconds, limit in (

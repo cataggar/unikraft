@@ -892,13 +892,15 @@ class Compute(unittest.TestCase):
         root = runtime / "compute"
         app = self.root / "app"
         for path in (root, app, app / "build", app / "build/artifacts",
-                     root / "evidence", root / "tools", root / "tools/bin",
+                     root / "evidence", root / "private", root / "tools", root / "tools/bin",
                      root / "tools/consumer-tree", root / "package", runtime / "bin",
                      runtime / "bin/share", runtime / "firmware"):
             path.mkdir(mode=0o700)
-        shutil.copyfile(REPO / "support/apps/wamr-aot/check-log.py", app / "check-log.py")
         shutil.copyfile(package_tool, root / "tools/bin/wamr-ci-package")
         (root / "tools/bin/wamr-ci-package").chmod(0o700)
+        shutil.copyfile(TOOLS / "uk-wamr-log-validate",
+                        root / "tools/bin/uk-wamr-log-validate")
+        (root / "tools/bin/uk-wamr-log-validate").chmod(0o700)
         ci = handoff.ci
         handoff_parent = self.root / "outputs"
         handoff_parent.mkdir(mode=0o700)
@@ -949,6 +951,8 @@ class Compute(unittest.TestCase):
             consumer_files[f"tool:{name}"] = Path(ci.tool(name))
         consumer_files["wamr-source-archive"] = source_archive
         consumer_files["command-supervisor"] = SUPERVISOR
+        consumer_files[ci.WAMR_LOG_VALIDATOR_ROLE] = (
+            root / "tools/bin/uk-wamr-log-validate")
         consumer_inputs = ci.record_input_paths(
             consumer_files,
             {name: root / "tools/consumer-tree"
@@ -985,7 +989,9 @@ class Compute(unittest.TestCase):
         observation = dict(result(), **{
             key + "_sha256": files[name] for key, name in (
                 ("wasm", "tiny.wasm"), ("cwasm", "tiny.cwasm"), ("runtime", "libwamr-aot.a"))})
-        with mock.patch.object(ci, "APP", app):
+        with mock.patch.object(ci, "APP", app), \
+                mock.patch.object(
+                    ci, "consumer_input_state", return_value=consumer_inputs):
             for i, mode in enumerate(ci.MODES):
                 config = ci.config_for(runtime, root, i)
                 work = Path(config["work_dir"])
@@ -1009,7 +1015,9 @@ class Compute(unittest.TestCase):
                     serial_sha256=digest(raw), termination={"exited": 0},
                     failures=dict(primary=None, cleanup=None, recording=None)))
                 write(root / "evidence" / (mode + "-compute.json"),
-                      ci.check_boot(config, runtime_identity, boot_inputs))
+                      ci.check_boot(
+                          config, runtime_identity, boot_inputs,
+                          consumer_inputs=consumer_inputs))
             for stage in public_bundle.STAGES:
                 write(root / "evidence" / ("command-" + stage + ".json"), dict(
                     scope="command_diagnostic_not_acceptance", stage=stage,

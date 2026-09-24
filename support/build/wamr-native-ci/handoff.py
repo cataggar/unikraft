@@ -970,7 +970,8 @@ def export(runtime, output):
     ci.boot_input_state(runtime, tools, expected=inputs)
     for i, mode in enumerate(modes):
         checked = ci.check_boot(
-            ci.config_for(runtime, root, i, modes), build["runtime"], inputs)
+            ci.config_for(runtime, root, i, modes), build["runtime"], inputs,
+            consumer_inputs=expected["consumer_inputs"])
         ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
                    "physical local result changed")
     ci.require_build_custody(runtime, before)
