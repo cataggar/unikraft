@@ -297,6 +297,10 @@ test "frozen custody limits, component-bound roles and first excess" {
     var bytes: usize = l.ignored_bytes - 1;
     try l.addBounded(&bytes, 1, l.ignored_bytes);
     try std.testing.expectError(error.LimitExceeded, l.addBounded(&bytes, 1, l.ignored_bytes));
+    var hashed: usize = 0;
+    for (0..4) |_| try l.addBounded(&hashed, l.input_file, l.input_bytes);
+    try std.testing.expectEqual(l.input_bytes, hashed);
+    try std.testing.expectError(error.LimitExceeded, l.addBounded(&hashed, l.input_file, l.input_bytes));
     var entries: usize = l.ignored_entries - 1;
     try l.addBounded(&entries, 1, l.ignored_entries);
     try std.testing.expectError(error.LimitExceeded, l.addBounded(&entries, 1, l.ignored_entries));
@@ -336,6 +340,38 @@ fn fixtureGit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []con
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) return error.FixtureGitFailed;
+}
+
+fn pythonCustody(allocator: std.mem.Allocator, mode: []const u8, path: []const u8, hash_limit: usize) ![]u8 {
+    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    defer allocator.free(run_py);
+    const limit = try std.fmt.allocPrint(allocator, "{d}", .{hash_limit});
+    defer allocator.free(limit);
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{
+            "python3", "-B", "-c",
+            "import importlib.util,sys,pathlib\n" ++
+                "s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n" ++
+                "m.INPUT_TREE_MAX_BYTES=int(sys.argv[4])\n" ++
+                "try:\n" ++
+                " r=m.physical_tree_record(pathlib.Path(sys.argv[3]))[0] if sys.argv[2]=='tree' else m.source(pathlib.Path(sys.argv[3]))\n" ++
+                " print('ACCEPTED:'+(r['content_sha256'] if sys.argv[2]=='tree' else 'source'))\n" ++
+                "except m.Refusal as error:\n" ++
+                " print('REFUSED:'+str(error))\n",
+            run_py,    mode, path,
+            limit,
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("Python custody oracle failed: {s}\n", .{result.stderr});
+        allocator.free(result.stdout);
+        return error.PythonOracleFailed;
+    }
+    return result.stdout;
 }
 
 test "native clean Git custody, stable physical identities and pinned archive refusal" {
@@ -483,6 +519,20 @@ test "native clean Git custody, stable physical identities and pinned archive re
         allocator.free(roots);
     }
     try std.testing.expect(roots.len >= 6);
+    try initial_output.symLink(io, "b", "a", .{});
+    try initial_output.symLink(io, "a", "b", .{});
+    try std.testing.expectError(error.IgnoredLinkEscapesRole, controller.source_custody.source(allocator, io, path, options.git_executable));
+    const loop_oracle = try pythonCustody(allocator, "source", path, controller.custody_limits.input_bytes);
+    defer allocator.free(loop_oracle);
+    try std.testing.expect(std.mem.startsWith(u8, loop_oracle, "REFUSED:"));
+    try initial_output.deleteFile(io, "a");
+    try initial_output.deleteFile(io, "b");
+    const contained = try controller.source_custody.source(allocator, io, path, options.git_executable);
+    defer {
+        allocator.free(contained.revision);
+        allocator.free(contained.tree);
+        allocator.free(contained.custody.object_format);
+    }
     try output_root.symLink(io, "../../escape", "bad-link", .{});
     try std.testing.expectError(error.IgnoredLinkEscapesRole, controller.source_custody.source(allocator, io, path, options.git_executable));
     try output_root.deleteFile(io, "bad-link");
@@ -504,6 +554,95 @@ test "native clean Git custody, stable physical identities and pinned archive re
     allocator.free(exact_roots);
     try writeFixtureFile(io, repo, "inventory-overflow", "");
     try std.testing.expectError(error.LimitExceeded, controller.source_custody.rootInventory(allocator, io, path));
+}
+
+test "input tree deduplicates bounded symlink hash work against Python" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const input = controller.input_custody;
+    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    defer allocator.free(base_path);
+    const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
+    defer base.close(io);
+    const name = try std.fmt.allocPrint(allocator, "input-link-limits-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(name);
+    try base.createDir(io, name, .fromMode(0o700));
+    defer base.deleteTree(io, name) catch @panic("input link fixture cleanup failed");
+    const fixture_dir = try base.openDir(io, name, .{ .iterate = true });
+    defer fixture_dir.close(io);
+    const fixture_path = try std.fs.path.join(allocator, &.{ base_path, name });
+    defer allocator.free(fixture_path);
+    try fixture_dir.createDir(io, "hash", .fromMode(0o700));
+    const hash_dir = try fixture_dir.openDir(io, "hash", .{ .iterate = true });
+    defer hash_dir.close(io);
+    const hash_path = try std.fs.path.join(allocator, &.{ fixture_path, "hash" });
+    defer allocator.free(hash_path);
+    const binding: input.Binding = .{ .role = "test", .path = hash_path };
+    for ("abcde") |character| {
+        const target = [_]u8{character};
+        try writeFixtureFile(io, fixture_dir, &target, "12345678");
+    }
+    for ("abcd") |character| {
+        const link = [_]u8{character};
+        const target = [_]u8{ '.', '.', '/', character };
+        try hash_dir.symLink(io, &target, &link, .{});
+    }
+    const boundary = try input.Fixture.treeWithHashLimit(allocator, io, binding, 32);
+    try std.testing.expectEqual(@as(usize, 4), boundary.symlinks);
+    try std.testing.expectEqual(@as(usize, 16), boundary.bytes);
+    const boundary_oracle = try pythonCustody(allocator, "tree", hash_path, 32);
+    defer allocator.free(boundary_oracle);
+    const digest = try std.fmt.allocPrint(allocator, "ACCEPTED:{s}\n", .{&boundary.content_sha256});
+    defer allocator.free(digest);
+    try std.testing.expectEqualStrings(digest, boundary_oracle);
+    try hash_dir.symLink(io, "../a", "duplicate", .{});
+    _ = try input.Fixture.treeWithHashLimit(allocator, io, binding, 32);
+    const duplicate_oracle = try pythonCustody(allocator, "tree", hash_path, 32);
+    defer allocator.free(duplicate_oracle);
+    try std.testing.expect(std.mem.startsWith(u8, duplicate_oracle, "ACCEPTED:"));
+    try hash_dir.symLink(io, "../e", "extra", .{});
+    try std.testing.expectError(error.LimitExceeded, input.Fixture.treeWithHashLimit(allocator, io, binding, 32));
+    const excess_oracle = try pythonCustody(allocator, "tree", hash_path, 32);
+    defer allocator.free(excess_oracle);
+    try std.testing.expectEqualStrings("REFUSED:physical input tree hash limit exceeded\n", excess_oracle);
+}
+
+test "missing input symlink target respects Python's absolute 64-component boundary" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const input = controller.input_custody;
+    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    defer allocator.free(base_path);
+    const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
+    defer base.close(io);
+    const name = try std.fmt.allocPrint(allocator, "input-missing-depth-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(name);
+    try base.createDir(io, name, .fromMode(0o700));
+    defer base.deleteTree(io, name) catch @panic("input depth fixture cleanup failed");
+    const fixture_dir = try base.openDir(io, name, .{ .iterate = true });
+    defer fixture_dir.close(io);
+    const path = try std.fs.path.join(allocator, &.{ base_path, name });
+    defer allocator.free(path);
+    const binding: input.Binding = .{ .role = "test", .path = path };
+    var target: std.ArrayList(u8) = .empty;
+    defer target.deinit(allocator);
+    const first = try std.fmt.allocPrint(allocator, "/usr/unikraft-custody-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(first);
+    try target.appendSlice(allocator, first);
+    for (0..62) |_| try target.appendSlice(allocator, "/x");
+    try fixture_dir.symLink(io, target.items, "missing", .{});
+    const exact = try input.tree(allocator, io, binding);
+    try std.testing.expectEqual(@as(usize, 1), exact.symlinks);
+    const exact_oracle = try pythonCustody(allocator, "tree", path, controller.custody_limits.input_bytes);
+    defer allocator.free(exact_oracle);
+    try std.testing.expect(std.mem.startsWith(u8, exact_oracle, "ACCEPTED:"));
+    try fixture_dir.deleteFile(io, "missing");
+    try target.appendSlice(allocator, "/x");
+    try fixture_dir.symLink(io, target.items, "missing", .{});
+    try std.testing.expectError(error.UnsafeInputLink, input.tree(allocator, io, binding));
+    const excess_oracle = try pythonCustody(allocator, "tree", path, controller.custody_limits.input_bytes);
+    defer allocator.free(excess_oracle);
+    try std.testing.expect(std.mem.startsWith(u8, excess_oracle, "REFUSED:unsafe physical input tree symlink:"));
 }
 
 test "native Bison production entry and sparse byte boundaries" {

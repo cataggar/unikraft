@@ -1615,6 +1615,10 @@ def ignored_source_state(repository=REPO):
                         "ignored source symlink changed")
                 reason = ignored_symlink_escape_reason(child_relative)
                 try:
+                    try:
+                        path.resolve(strict=True)
+                    except FileNotFoundError:
+                        pass
                     target = path.resolve(strict=False)
                 except (OSError, RuntimeError, ValueError) as error:
                     raise Refusal(reason) from error

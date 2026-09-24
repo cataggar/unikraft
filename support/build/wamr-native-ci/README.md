@@ -134,6 +134,7 @@ are created by the adapter before custody. Every custody check uses normalized
 repository-relative path components, not string prefixes, to reject all
 ignored entries outside those exact roots, including sibling names. It then
 walks every allowed root without following links and rejects escaping links,
+symlink cycles (including where non-strict Python resolution permits them),
 hard-linked or nonregular files, unsafe root/directory ownership or modes, path
 or depth excess, and changes during inspection. Regular-file modes remain
 physical metadata and are separately enforced for every consumed dependency or
@@ -165,7 +166,8 @@ pinned tree scanner refuses on the first excess entry before sorting and
 separately bounds all unique regular-file bytes hashed through symlinks.
 Dangling input-tree links are accepted only when their retained deepest
 existing target ancestor is root-owned and cannot be modified by the build
-principal; the missing suffix and ancestor identity are part of the record.
+principal and their absolute resolved target has at most 64 components; the
+missing suffix and ancestor identity are part of the record.
 The pinned WAMR checkout is consumed only while creating a fixed-revision Git
 archive through retained repository and Git descriptors; all later WAMR build
 steps use the create-only archived object by its recorded pathname. Top-level
