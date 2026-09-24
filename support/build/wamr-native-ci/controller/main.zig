@@ -22,7 +22,6 @@ pub fn main(init: std.process.Init) void {
     }
     const runtime = controller.layout.runtime(init.io, command.runtime.?) catch refused(init.io);
     defer runtime.close(init.io);
-    if (command.action != .build) refused(init.io);
     const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
     const compute = std.fs.path.join(allocator, &.{ command.runtime.?, "compute" }) catch refused(init.io);
     var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
@@ -33,14 +32,31 @@ pub fn main(init: std.process.Init) void {
         .environ = init.minimal.environ,
         .runtime = command.runtime.?,
         .repository = repository,
-        .wamr = command.wamr_source.?,
+        .wamr = command.wamr_source orelse "",
         .compute = compute,
         .git = undefined,
         .tools = undefined,
         .roots = undefined,
         .signal = &signal,
     };
-    _ = controller.build_pipeline.run(&context) catch failed(init.io, context.failed_stage);
+    switch (command.action) {
+        .build => _ = controller.build_pipeline.run(&context) catch failed(init.io, context.failed_stage),
+        .boot => {
+            var boot_context: controller.boot_pipeline.Context = .{
+                .build_context = &context,
+                .pinned = std.StringHashMap(controller.custody_files.File).init(allocator),
+            };
+            _ = controller.boot_pipeline.run(&boot_context) catch failed(init.io, context.failed_stage);
+        },
+        .diagnostics => {
+            var boot_context: controller.boot_pipeline.Context = .{
+                .build_context = &context,
+                .pinned = std.StringHashMap(controller.custody_files.File).init(allocator),
+            };
+            controller.boot_pipeline.diagnostics(&boot_context) catch failed(init.io, "diagnostics");
+        },
+        .describe => unreachable,
+    }
 }
 
 fn usage(io: std.Io) noreturn {

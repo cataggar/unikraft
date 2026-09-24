@@ -17,6 +17,8 @@ pub const Outcome = struct {
     poisoned: bool,
     primary: process.CommandPrimary,
     bytes: usize,
+    stdout: []const u8 = &.{},
+    stderr_bytes: usize = 0,
 };
 
 pub const Request = struct {
@@ -28,6 +30,8 @@ pub const Request = struct {
     test_seconds: ?u32 = null,
     test_output_limit: ?usize = null,
     test_replacement: ?[]const u8 = null,
+    capture_stdout: bool = false,
+    private_record: bool = false,
 };
 
 fn json(allocator: Allocator, value: anytype) !Value {
@@ -158,7 +162,7 @@ fn commitment(stdout: []const u8, stderr: []const u8) [64]u8 {
     return std.fmt.bytesToHex(state.finalResult(), .lower);
 }
 
-fn markers(allocator: Allocator, bytes: []const u8) !Value {
+pub fn markers(allocator: Allocator, bytes: []const u8) !Value {
     const allowlist = [_][]const u8{
         "AccessDenied",              "BrokenPipe",                   "FileNotFound",          "FileTooBig",                        "InputOutput",
         "InvalidEnumTag",            "InvalidNativeMakeEnvironment", "InvalidNativeMakePath", "InvalidPath",                       "MissingField",
@@ -483,15 +487,20 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
         },
     });
     const record_name = try std.fmt.allocPrint(a, "command-{s}.json", .{@tagName(request.stage)});
+    if (plan.isValidator(request.stage) != request.private_record)
+        return error.InvalidCommandRecordLocation;
     try create(io, request.evidence_dir, record_name, try canonical(a, command_record));
     const accepted = result.succeeded() and stable and combined.len <= selected.output_limit and
         known_markers.array.items.len == 0 and
+        (!plan.isValidator(request.stage) or result.stderr.len == 0) and
         (request.cancel == null or !request.cancel.?.load(.acquire));
     return .{
         .accepted = accepted,
         .poisoned = !result.cleanup_complete or !stable,
         .primary = result.primary,
         .bytes = capped.len,
+        .stdout = if (request.capture_stdout) try allocator.dupe(u8, result.stdout) else &.{},
+        .stderr_bytes = result.stderr.len,
     };
 }
 

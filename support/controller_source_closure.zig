@@ -9,6 +9,7 @@ pub const Entry = struct {
 pub const entries = [_]Entry{
     .{ .name = "support/build/wamr-native-ci/build.zig", .content = @embedFile("build/wamr-native-ci/build.zig") },
     .{ .name = "support/build/wamr-native-ci/build.zig.zon", .content = @embedFile("build/wamr-native-ci/build.zig.zon") },
+    .{ .name = "support/build/wamr-native-ci/controller/boot_pipeline.zig", .content = @embedFile("build/wamr-native-ci/controller/boot_pipeline.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/build_pipeline.zig", .content = @embedFile("build/wamr-native-ci/controller/build_pipeline.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/cli.zig", .content = @embedFile("build/wamr-native-ci/controller/cli.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/command_adapter.zig", .content = @embedFile("build/wamr-native-ci/controller/command_adapter.zig") },

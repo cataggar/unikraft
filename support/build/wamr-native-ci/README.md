@@ -1,5 +1,37 @@
 # Credential-free tiny native WAMR PR gate
 
+## Native package and boot chain (unpublished caller)
+
+The installed controller now implements `boot --runtime ABS` as a closed,
+local-only `tiny_exact_v2` chain. It first refuses hosts without readable and
+writable x86 KVM (never TCG or a successful skip), reopens the accepted build,
+source, dependency and executable custody, binds the QEMU/OVMF/EFI/package/
+local-boot/validator runtime inputs in `boot-inputs.json`, and checks that all
+precreated package, publication and six boot slots are empty. It runs the
+existing native Miz package tool and local-boot CLI in this order:
+
+```
+package → raw x2APIC → raw legacy → QCOW2 intent/finalize
+→ QCOW2 x2APIC → QCOW2 legacy → QCOW2 acceptance
+→ prove derived VHD absent → VHD intent/gate/derive
+→ VPC x2APIC → VPC legacy → inspect → final inspection → result
+```
+
+Each boot checks its closed one-CPU/60-second guest request, four physical
+input pins, report, raw serial byte count and SHA-256. The #188 installed
+`uk-wamr-log-validate tiny` validates guest semantics independently after
+each local boot; its supervised 30-second invocation has an empty environment,
+64-KiB stdout and 4-KiB stderr caps. Its owner-only per-boot command record
+remains private, as do raw logs and validator output. A failure retains prior
+evidence and the failed command, never publishes that mode's compute record,
+and prevents every subsequent transition. Public success contains exactly
+the v2 six-mode record set, `final-inspection.json`, then `result.json` last
+without self-hashing. Historical four-mode v1 is read-only; there is no
+caller-selected downgrade. `diagnostics --runtime ABS` emits allowlisted
+redacted observations only, never acceptance. `run.py` remains the
+authoritative production caller and differential reference until the later
+parity/bridge/cutover PRs; workflows, wrappers and authority are unchanged.
+
 ## Native controller preparation (unpublished build path)
 
 `zig build --build-file support/build/wamr-native-ci/build.zig test-controller`
@@ -59,9 +91,9 @@ supervised-command output.
 `python3 -m unittest support/build/wamr-native-ci/tests/source_custody_production_limits.py`
 remains the independent full-size source-boundary oracle until cutover.
 
-`build --runtime ABS --wamr-source ABS` is available only through the installed
-native controller; `boot --runtime ABS` and `diagnostics --runtime ABS` still
-**refuse**. Production workflow callers continue using the Python controller;
+`build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
+`diagnostics --runtime ABS` are available only through the installed
+native controller. Production workflow callers continue using the Python controller;
 there is no fallback, boot cutover, or change in acceptance authority before
 the later parity and cutover PRs. The closed
 `tiny_exact_v2` production type has six ordered raw/QCOW2/VPC modes;

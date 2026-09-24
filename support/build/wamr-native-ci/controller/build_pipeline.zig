@@ -358,7 +358,7 @@ pub fn bootstrap(state: DependenciesRestored) !BootstrapInputsBound {
     return next(state, BootstrapInputsBound);
 }
 
-fn requireSource(context: *Context) !void {
+pub fn requireSource(context: *Context) !void {
     try cancelled(context);
     const actual = try custody.source(context.allocator, context.io, context.repository, context.git);
     try cancelled(context);
@@ -424,7 +424,7 @@ pub fn requireBuildEvidence(context: *Context) !void {
     }
 }
 
-fn requireConsumer(context: *Context) !void {
+pub fn requireConsumer(context: *Context) !void {
     try cancelled(context);
     const observed = context.consumer orelse return error.UnboundInputs;
     try inputs.requireProduction(context.allocator, context.io, .{
@@ -695,6 +695,11 @@ pub fn nativeImage(state: ConfigSolved) !NativeImageBuilt {
 pub fn acceptBuild(state: NativeImageBuilt) !BuildAccepted {
     const context = state.context;
     context.failed_stage = "build";
+    try publishBuild(context, try buildValue(context));
+    return .{ .context = context };
+}
+
+pub fn buildValue(context: *Context) !std.json.Value {
     try cancelled(context);
     try requireBuildEvidence(context);
     try requireSource(context);
@@ -769,12 +774,84 @@ pub fn acceptBuild(state: NativeImageBuilt) !BuildAccepted {
         "CONFIG_LIBSTORVSC=y",          "CONFIG_LIBNETVSC=y",
         "CONFIG_LIBLWIP=y",
     }) |setting| if (countLine(solved, setting) != 0) return error.InvalidConfig;
-    try publishBuild(context, .{
+    return typedValue(a, .{
         .source = .{ .revision = context.source.?.revision, .tree = context.source.?.tree },
         .runtime = try rawValue(a, app_identity),
         .image = try rawValue(a, image),
     });
-    return .{ .context = context };
+}
+
+/// Reconstruct the frozen build state from its actual source, dependency,
+/// executable and image inputs; boot never republishes build evidence.
+pub fn loadAccepted(context: *Context) !void {
+    const a = context.allocator;
+    const io = context.io;
+    try cancelled(context);
+    const expected = try read(context, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true);
+    const document = try core.contracts.Document.parse(a, expected, .{ .bytes = records.max_record_bytes, .items = 4096, .tokens = 65536, .depth = 32 });
+    defer document.deinit();
+    try document.requireCanonical(a, expected);
+    const original = try core.contracts.exactFields(document.value(), &.{
+        "source", "source_custody", "tools", "bison_data", "dependencies", "consumer_inputs", "command_supervisor",
+    });
+    const consumer = original.get("consumer_inputs").?;
+    if (consumer != .object) return error.InvalidInputCustody;
+    const selected = consumer.object.get("files") orelse return error.InvalidInputCustody;
+    if (selected != .object) return error.InvalidInputCustody;
+    for (inputs.host_tools, 0..) |name, index| {
+        const role = try std.fmt.allocPrint(a, "tool:{s}", .{name});
+        const record = selected.object.get(role) orelse return error.MissingTool;
+        if (record != .object) return error.InvalidInputCustody;
+        context.tools[index] = try a.dupe(u8, try core.contracts.string(record.object.get("path") orelse return error.MissingTool));
+    }
+    context.git = context.tools[0];
+    const own = try join(context, &.{ context.runtime, "controller/bin/uk-wamr-native-ci" });
+    if (!std.mem.eql(u8, own, try std.process.executablePathAlloc(io, a)))
+        return error.UnboundController;
+    context.roots = .{
+        .runtime = context.runtime, .source_root = context.repository, .work = context.compute,
+        .zig = context.tools[9], .producer = try subpath(context, "tools/bin/uk-wamr-aot-build"),
+        .fixture_runner = try subpath(context, "tools/bin/wamr-native-ci-fixtures"),
+        .supervisor = own, .package_tool = try subpath(context, "tools/bin/wamr-ci-package"),
+        .validator = try subpath(context, "tools/bin/uk-wamr-log-validate"),
+        .supervisor_fixture = try subpath(context, "tools/bin/wamr-ci-supervisor-fixture"),
+        .tools = context.tools,
+    };
+    try custody.verifyPhysical(io, a, context.repository);
+    context.source = try custody.source(a, io, context.repository, context.git);
+    context.dependency = try dependencies.capture(a, io, context.repository, context.git, context.compute);
+    context.consumer = try inputs.captureProduction(a, io, .{
+        .runtime = context.runtime, .tools = context.tools,
+        .python_stdlib = try pythonStdlib(context),
+    });
+    const reproduced = try typedValue(a, try buildStart(context));
+    const encoded = try std.json.Stringify.valueAlloc(a, reproduced, .{});
+    const canonical = try records.canonicalAlloc(a, encoded);
+    if (!std.mem.eql(u8, expected, canonical)) return error.BuildStartChanged;
+    context.build_start_record = try physical.readFile(io, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true);
+    for ([_]plan.Stage{ .adapter, .@"local-boot-tool", .fixtures, .prepare, .config, .@"native-image" }) |stage| {
+        const name = try std.fmt.allocPrint(a, "evidence/command-{s}.json", .{@tagName(stage)});
+        const path = try subpath(context, name);
+        const raw = try read(context, path, records.max_record_bytes, true);
+        const command = try core.contracts.Document.parse(a, raw, .{ .bytes = records.max_record_bytes });
+        defer command.deinit();
+        try command.requireCanonical(a, raw);
+        if (command.value() != .object) return error.InvalidCommand;
+        const object = command.value().object;
+        if (!std.mem.eql(u8, try core.contracts.string(object.get("stage") orelse return error.InvalidCommand), @tagName(stage)) or
+            try core.contracts.integer(i32, object.get("exit_code") orelse return error.InvalidCommand) != 0)
+            return error.BuildStageRefused;
+        context.command_records[@intFromEnum(stage)] = try physical.readFile(io, path, limits.tracked_file, true);
+    }
+    try revalidateAccepted(context);
+}
+
+pub fn revalidateAccepted(context: *Context) !void {
+    const actual = try read(context, try subpath(context, "evidence/build.json"), limits.tracked_file, true);
+    const value = try buildValue(context);
+    const encoded = try std.json.Stringify.valueAlloc(context.allocator, value, .{});
+    if (!std.mem.eql(u8, actual, try records.canonicalAlloc(context.allocator, encoded)))
+        return error.BuildChanged;
 }
 
 pub fn publishBuild(context: *Context, value: anytype) !void {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 pub const cli = @import("cli.zig");
 pub const build_pipeline = @import("build_pipeline.zig");
+pub const boot_pipeline = @import("boot_pipeline.zig");
 pub const command_adapter = @import("command_adapter.zig");
 pub const command_plan = @import("command_plan.zig");
 pub const custody_files = @import("custody_files.zig");
