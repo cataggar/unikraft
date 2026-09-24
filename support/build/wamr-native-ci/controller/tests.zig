@@ -256,8 +256,555 @@ test "embedded tracked source closure and physical/no-follow checks" {
         try std.testing.expectError(error.SourceChanged, source.verifyContent(entry, ""));
         if (index > 0) try std.testing.expect(std.mem.lessThan(u8, source.closure[index - 1].name, entry.name));
     }
+
     const closure_hash = source.contentClosure();
     try std.testing.expect(!std.mem.eql(u8, &closure_hash, &([_]u8{0} ** 32)));
     try source.verifyPhysical(std.testing.io, std.testing.allocator, options.repository_root);
     try std.testing.expectError(error.FileNotFound, source.verifyPhysical(std.testing.io, std.testing.allocator, "/d/does-not-exist-controller"));
+}
+
+test "frozen custody limits, component-bound roles and first excess" {
+    const l = controller.custody_limits;
+    try std.testing.expectEqual(@as(usize, 40_000), l.tracked_entries);
+    try std.testing.expectEqual(@as(usize, 131_072), l.ignored_entries);
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), l.ignored_bytes);
+    try std.testing.expectEqual(@as(usize, 512), l.bison_entries);
+    try std.testing.expectEqual(@as(usize, 128), l.dependency_roots);
+    try std.testing.expectEqualStrings("a53205d77be3b880eb8f8b96679512ba58e2331a", l.wamr_revision);
+    for (l.roles, 0..) |role, index|
+        try std.testing.expectEqual(index, try l.outputRole(role));
+    try std.testing.expectEqual(@as(usize, 0), try l.outputRole(".d/private/file"));
+    try std.testing.expectError(error.IgnoredOutsideOutput, l.outputRole(".d-neighbor/file"));
+    try std.testing.expectError(error.UnsafePath, l.outputRole(".d/../other"));
+    try std.testing.expectError(error.UnsafePath, l.outputRole(".d//file"));
+    try std.testing.expectError(error.UnsafePath, l.outputRole(".d/\xff"));
+    var exact: [1025]u8 = undefined;
+    @memcpy(exact[0..2], ".d");
+    var offset: usize = 2;
+    for (0..62) |_| {
+        exact[offset] = '/';
+        @memset(exact[offset + 1 .. offset + 16], 'x');
+        offset += 16;
+    }
+    exact[offset] = '/';
+    @memset(exact[offset + 1 .. 1025], 'x');
+    try l.relative(exact[0..1024], l.ignored_path, l.ignored_depth);
+    try std.testing.expectError(error.UnsafePath, l.relative(&exact, l.ignored_path, l.ignored_depth));
+    var too_deep: [130]u8 = undefined;
+    @memcpy(too_deep[0..2], ".d");
+    for (0..64) |i| @memcpy(too_deep[2 + i * 2 ..][0..2], "/x");
+    try std.testing.expectError(error.LimitExceeded, l.relative(&too_deep, l.ignored_path, l.ignored_depth));
+    var bytes: usize = l.ignored_bytes - 1;
+    try l.addBounded(&bytes, 1, l.ignored_bytes);
+    try std.testing.expectError(error.LimitExceeded, l.addBounded(&bytes, 1, l.ignored_bytes));
+    var entries: usize = l.ignored_entries - 1;
+    try l.addBounded(&entries, 1, l.ignored_entries);
+    try std.testing.expectError(error.LimitExceeded, l.addBounded(&entries, 1, l.ignored_entries));
+    try l.packageName("miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx");
+    try std.testing.expectError(error.UnsafePackageName, l.packageName("../outside"));
+}
+
+test "physical custody snapshot has Python-compatible device and ns" {
+    const l = controller.custody_files;
+    const source = try std.fs.path.join(std.testing.allocator, &.{ options.repository_root, "support/controller_source_closure.zig" });
+    defer std.testing.allocator.free(source);
+    const before = try l.readFile(std.testing.io, source, 1024 * 1024, false);
+    const after = try l.readFile(std.testing.io, source, 1024 * 1024, false);
+    try std.testing.expectEqualDeep(before, after);
+    try std.testing.expect(before.bytes > 0);
+    const missing = try std.fmt.allocPrint(std.testing.allocator, "{s}.gone", .{source});
+    defer std.testing.allocator.free(missing);
+    try std.testing.expectError(error.FileNotFound, l.readFile(std.testing.io, missing, 1024 * 1024, false));
+}
+
+fn writeFixtureFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    const file = try dir.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+}
+
+fn fixtureGit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !void {
+    const result = std.process.run(allocator, std.testing.io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch |err| {
+        std.debug.print("Git fixture spawn failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return error.FixtureGitFailed;
+}
+
+test "native clean Git custody, stable physical identities and pinned archive refusal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    defer allocator.free(base_path);
+    const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
+    defer base.close(io);
+    const name = try std.fmt.allocPrint(allocator, "custody-fixture-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(name);
+    try base.createDir(io, name, .fromMode(0o700));
+    defer base.deleteTree(io, name) catch @panic("controller custody fixture cleanup failed");
+    const repo = try base.openDir(io, name, .{ .iterate = true });
+    defer repo.close(io);
+    const path = try std.fs.path.join(allocator, &.{ base_path, name });
+    defer allocator.free(path);
+    try writeFixtureFile(io, repo, ".gitignore", "/.d/\n/.zig-cache/\n/support/apps/wamr-aot/.config\n/support/apps/wamr-aot/build/\n");
+    try writeFixtureFile(io, repo, "tracked", "clean content\n");
+    try repo.symLink(io, "tracked", "link", .{});
+    try repo.createDir(io, "support", .fromMode(0o700));
+    const support = try repo.openDir(io, "support", .{ .iterate = true });
+    defer support.close(io);
+    try support.createDir(io, "apps", .fromMode(0o700));
+    const apps = try support.openDir(io, "apps", .{ .iterate = true });
+    defer apps.close(io);
+    try apps.createDir(io, "wamr-aot", .fromMode(0o700));
+    const app = try apps.openDir(io, "wamr-aot", .{ .iterate = true });
+    defer app.close(io);
+    try writeFixtureFile(io, app, "defconfig", "CONFIG_FIXTURE=y\n");
+    try fixtureGit(allocator, path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(allocator, path, &.{ options.git_executable, "add", ".gitignore", "tracked", "link", "support/apps/wamr-aot/defconfig" });
+    try fixtureGit(allocator, path, &.{
+        options.git_executable, "-c",  "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit",               "-qm", "custody fixture",
+    });
+    const version = try controller.source_custody.gitOutput(allocator, io, path, options.git_executable, &.{"version"}, 128, null);
+    defer allocator.free(version);
+    const exact_version = try controller.source_custody.gitOutput(allocator, io, path, options.git_executable, &.{"version"}, version.len, null);
+    defer allocator.free(exact_version);
+    try std.testing.expectEqualStrings(version, exact_version);
+    try std.testing.expectError(error.GitRefused, controller.source_custody.gitOutput(
+        allocator,
+        io,
+        path,
+        options.git_executable,
+        &.{"version"},
+        version.len - 1,
+        null,
+    ));
+    try repo.createDir(io, ".d", .fromMode(0o700));
+    const initial_output = try repo.openDir(io, ".d", .{ .iterate = true });
+    defer initial_output.close(io);
+    try initial_output.symLink(io, "../tracked", "safe-link", .{});
+    try repo.createDir(io, ".zig-cache", .fromMode(0o700));
+    try app.createDir(io, "build", .fromMode(0o700));
+    try writeFixtureFile(io, app, ".config", "CONFIG_FIXTURE=y\n");
+    const captured = try controller.source_custody.source(allocator, io, path, options.git_executable);
+    defer {
+        allocator.free(captured.revision);
+        allocator.free(captured.tree);
+        allocator.free(captured.custody.object_format);
+    }
+    try std.testing.expectEqual(@as(usize, 4), captured.custody.files);
+    const unchanged = try controller.source_custody.source(allocator, io, path, options.git_executable);
+    defer {
+        allocator.free(unchanged.revision);
+        allocator.free(unchanged.tree);
+        allocator.free(unchanged.custody.object_format);
+    }
+    try std.testing.expectEqualDeep(captured.custody, unchanged.custody);
+    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    defer allocator.free(run_py);
+    const python = try std.process.run(allocator, io, .{
+        .argv = &.{
+            "python3",                                                                                                                                                                                                                                                      "-B",   "-c",
+            "import importlib.util,sys; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); v=m.source(sys.argv[2]); print(v['custody']['content_sha256']); print(v['custody']['physical_sha256'])", run_py, path,
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(python.stdout);
+    defer allocator.free(python.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, python.term);
+    var lines = std.mem.splitScalar(u8, python.stdout, '\n');
+    try std.testing.expectEqualStrings(&captured.custody.content_sha256, lines.next().?);
+    try std.testing.expectEqualStrings(&captured.custody.physical_sha256, lines.next().?);
+    try std.testing.expectError(error.UnpinnedSource, controller.source_custody.sealWamr(allocator, io, path, path, options.git_executable));
+    const output_root = try repo.openDir(io, ".d", .{ .iterate = true });
+    defer output_root.close(io);
+    try output_root.createDir(io, "runtime", .fromMode(0o700));
+    const runtime_dir = try output_root.openDir(io, "runtime", .{ .iterate = true });
+    defer runtime_dir.close(io);
+    try runtime_dir.createDir(io, "custody", .fromMode(0o700));
+    const runtime_path = try std.fs.path.join(allocator, &.{ path, ".d/runtime" });
+    defer allocator.free(runtime_path);
+    try output_root.createDir(io, "runtime-limited", .fromMode(0o700));
+    const limited_dir = try output_root.openDir(io, "runtime-limited", .{ .iterate = true });
+    defer limited_dir.close(io);
+    try limited_dir.createDir(io, "custody", .fromMode(0o700));
+    const limited_path = try std.fs.path.join(allocator, &.{ path, ".d/runtime-limited" });
+    defer allocator.free(limited_path);
+    try std.testing.expectError(error.GitRefused, controller.source_custody.Fixture.sealLimited(
+        allocator,
+        io,
+        path,
+        limited_path,
+        options.git_executable,
+        captured.revision,
+        1024,
+    ));
+    const limited_archive = try std.fs.path.join(allocator, &.{ limited_path, "custody/wamr-source.tar" });
+    defer allocator.free(limited_archive);
+    try std.testing.expect((try controller.custody_files.readFile(io, limited_archive, 1024, true)).bytes <= 1024);
+    const sealed = try controller.source_custody.Fixture.seal(allocator, io, path, runtime_path, options.git_executable, captured.revision);
+    const oracle_archive = try std.process.run(allocator, io, .{
+        .argv = &.{ options.git_executable, "archive", "--format=tar", captured.revision },
+        .cwd = .{ .path = path },
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(oracle_archive.stdout);
+    defer allocator.free(oracle_archive.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle_archive.term);
+    try std.testing.expectEqual(oracle_archive.stdout.len, sealed.bytes);
+    try std.testing.expectEqualDeep(controller.records.fileIdentity(oracle_archive.stdout), try core.contracts.parseSha256(&sealed.sha256));
+    try std.testing.expectError(error.PathAlreadyExists, controller.source_custody.Fixture.seal(
+        allocator,
+        io,
+        path,
+        runtime_path,
+        options.git_executable,
+        captured.revision,
+    ));
+    var baseline = try controller.source_custody.sourceMetadata(allocator, io, path, options.git_executable);
+    defer baseline.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, captured.custody.files + captured.custody.directories), baseline.records.len);
+    var diagnostic = try controller.source_custody.ignoredDiagnostic(allocator, io, path, options.git_executable);
+    defer diagnostic.deinit(allocator);
+    try std.testing.expect(!diagnostic.truncated);
+    const roots = try controller.source_custody.rootInventory(allocator, io, path);
+    defer {
+        for (roots) |entry| allocator.free(entry.name);
+        allocator.free(roots);
+    }
+    try std.testing.expect(roots.len >= 6);
+    try output_root.symLink(io, "../../escape", "bad-link", .{});
+    try std.testing.expectError(error.IgnoredLinkEscapesRole, controller.source_custody.source(allocator, io, path, options.git_executable));
+    try output_root.deleteFile(io, "bad-link");
+    try app.deleteFile(io, ".config");
+    try app.symLink(io, "defconfig", ".config", .{});
+    try std.testing.expectError(error.UnsafeIgnoredEntry, controller.source_custody.source(allocator, io, path, options.git_executable));
+    try app.deleteFile(io, ".config");
+    try writeFixtureFile(io, app, ".config", "CONFIG_FIXTURE=y\n");
+    try writeFixtureFile(io, repo, "unexpected", "not ignored");
+    try std.testing.expectError(error.DirtySource, controller.source_custody.source(allocator, io, path, options.git_executable));
+    for (roots.len + 1..controller.custody_limits.diagnostic_root) |index| {
+        const entry = try std.fmt.allocPrint(allocator, "inventory-{d:0>3}", .{index});
+        defer allocator.free(entry);
+        try writeFixtureFile(io, repo, entry, "");
+    }
+    const exact_roots = try controller.source_custody.rootInventory(allocator, io, path);
+    try std.testing.expectEqual(controller.custody_limits.diagnostic_root, exact_roots.len);
+    for (exact_roots) |entry| allocator.free(entry.name);
+    allocator.free(exact_roots);
+    try writeFixtureFile(io, repo, "inventory-overflow", "");
+    try std.testing.expectError(error.LimitExceeded, controller.source_custody.rootInventory(allocator, io, path));
+}
+
+test "native Bison production entry and sparse byte boundaries" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    defer allocator.free(base_path);
+    const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
+    defer base.close(io);
+    const name = try std.fmt.allocPrint(allocator, "bison-limits-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(name);
+    try base.createDir(io, name, .fromMode(0o700));
+    defer base.deleteTree(io, name) catch @panic("Bison limit fixture cleanup failed");
+    const directory = try base.openDir(io, name, .{ .iterate = true });
+    defer directory.close(io);
+    const path = try std.fs.path.join(allocator, &.{ base_path, name });
+    defer allocator.free(path);
+    for (0..controller.custody_limits.bison_entries) |index| {
+        const entry = try std.fmt.allocPrint(allocator, "entry-{d:0>3}", .{index});
+        defer allocator.free(entry);
+        try writeFixtureFile(io, directory, entry, "");
+    }
+    const exact = try controller.input_custody.bison(allocator, io, path);
+    try std.testing.expectEqual(controller.custody_limits.bison_entries, exact.files);
+    try std.testing.expectEqual(@as(usize, 0), exact.bytes);
+    try writeFixtureFile(io, directory, "entry-overflow", "");
+    try std.testing.expectError(error.LimitExceeded, controller.input_custody.bison(allocator, io, path));
+    for (0..controller.custody_limits.bison_entries) |index| {
+        const entry = try std.fmt.allocPrint(allocator, "entry-{d:0>3}", .{index});
+        defer allocator.free(entry);
+        try directory.deleteFile(io, entry);
+    }
+    try directory.deleteFile(io, "entry-overflow");
+    const sparse = try directory.createFile(io, "sparse", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer sparse.close(io);
+    try sparse.writePositionalAll(io, "X", controller.custody_limits.bison_bytes - 1);
+    const boundary = try controller.input_custody.bison(allocator, io, path);
+    try std.testing.expectEqual(controller.custody_limits.bison_bytes, boundary.bytes);
+    try writeFixtureFile(io, directory, "overflow", "X");
+    try std.testing.expectError(error.UnsafeBisonInput, controller.input_custody.bison(allocator, io, path));
+}
+
+test "Bison and consumer v2 custody bind bytes, roles, ancestors and replacement" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    defer allocator.free(base_path);
+    const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
+    defer base.close(io);
+    const name = try std.fmt.allocPrint(allocator, "input-fixture-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(name);
+    try base.createDir(io, name, .fromMode(0o700));
+    defer base.deleteTree(io, name) catch @panic("input fixture cleanup failed");
+    const fixture_path = try std.fs.path.join(allocator, &.{ base_path, name });
+    defer allocator.free(fixture_path);
+    const fixture_dir = try base.openDir(io, name, .{ .iterate = true });
+    defer fixture_dir.close(io);
+    try fixture_dir.createDir(io, "bison", .fromMode(0o700));
+    const bison_dir = try fixture_dir.openDir(io, "bison", .{ .iterate = true });
+    defer bison_dir.close(io);
+    const bison_path = try std.fs.path.join(allocator, &.{ fixture_path, "bison" });
+    defer allocator.free(bison_path);
+    try std.testing.expectError(error.EmptyBisonData, controller.input_custody.bison(allocator, io, bison_path));
+    try writeFixtureFile(io, bison_dir, "grammar", "table");
+    const bison = try controller.input_custody.bison(allocator, io, bison_path);
+    try std.testing.expectEqual(@as(usize, 1), bison.files);
+    try std.testing.expectEqual(@as(usize, 5), bison.bytes);
+    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    defer allocator.free(run_py);
+    const python = try std.process.run(allocator, io, .{
+        .argv = &.{
+            "python3",                                                                                                                                                                                                                  "-B",   "-c",
+            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.bison_inputs(pathlib.Path(sys.argv[2]))['sha256'])", run_py, bison_path,
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(python.stdout);
+    defer allocator.free(python.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, python.term);
+    try std.testing.expectEqualStrings(&bison.sha256, std.mem.trimEnd(u8, python.stdout, "\n"));
+    try bison_dir.symLink(io, "grammar", "alias", .{});
+    const missing_target = try std.fmt.allocPrint(allocator, "/usr/lib/unikraft-custody-{d}/missing", .{std.os.linux.getpid()});
+    defer allocator.free(missing_target);
+    try bison_dir.symLink(io, missing_target, "root-owned-dangling", .{});
+    try std.testing.expectError(error.UnsafeBisonInput, controller.input_custody.bison(allocator, io, bison_path));
+    const path = try std.fs.path.join(allocator, &.{ bison_path, "grammar" });
+    defer allocator.free(path);
+    const file_binding = [_]controller.input_custody.Binding{.{ .role = "tool:bison", .path = path }};
+    const tree_binding = [_]controller.input_custody.Binding{.{ .role = "bison", .path = bison_path }};
+    var expected = try controller.input_custody.capture(allocator, io, &file_binding, &tree_binding);
+    defer expected.deinit(allocator);
+    const canonical = try expected.canonical(allocator);
+    defer allocator.free(canonical);
+    const document = try core.contracts.Document.parse(allocator, canonical, .{});
+    defer document.deinit();
+    const record = document.value().object;
+    try std.testing.expectEqualStrings("uk.wamr.consumer-input-custody", (try core.contracts.string(record.get("schema").?)));
+    try std.testing.expect(record.get("files").?.object.contains("tool:bison"));
+    try std.testing.expect(record.get("trees").?.object.contains("bison"));
+    try std.testing.expect(record.get("directories").?.object.contains(bison_path));
+    const oracle = try std.process.run(allocator, io, .{
+        .argv = &.{
+            "python3",                                                                                                                                                                                                                                                                                                                                                                                       "-B",   "-c",
+            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.record_input_paths({'tool:bison':pathlib.Path(sys.argv[2])},{'bison':pathlib.Path(sys.argv[3])}); print(r['aggregate_sha256']); print(r['trees']['bison']['content_sha256']); print(r['trees']['bison']['physical_sha256'])", run_py, path,
+            bison_path,
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(oracle.stdout);
+    defer allocator.free(oracle.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
+    var oracle_lines = std.mem.splitScalar(u8, oracle.stdout, '\n');
+    try std.testing.expectEqualStrings(&expected.aggregate_sha256, oracle_lines.next().?);
+    try std.testing.expectEqualStrings(&expected.trees[0].content_sha256, oracle_lines.next().?);
+    try std.testing.expectEqualStrings(&expected.trees[0].physical_sha256, oracle_lines.next().?);
+    try controller.input_custody.requireSame(allocator, io, expected, &file_binding, &tree_binding);
+    try std.testing.expectError(error.InvalidInputCustody, controller.input_custody.requireSame(allocator, io, expected, &.{}, &tree_binding));
+    try bison_dir.symLink(io, "missing/descendant", "mutable-dangling", .{});
+    try std.testing.expectError(error.UnsafeInputLink, controller.input_custody.tree(allocator, io, tree_binding[0]));
+    try bison_dir.deleteFile(io, "mutable-dangling");
+    const replacement = try std.fs.path.join(allocator, &.{ fixture_path, "replacement" });
+    defer allocator.free(replacement);
+    try writeFixtureFile(io, fixture_dir, "replacement", "table");
+    const renamed = [_]controller.input_custody.Binding{.{ .role = "tool:bison", .path = replacement }};
+    try std.testing.expectError(error.InputChanged, controller.input_custody.requireSame(allocator, io, expected, &renamed, &tree_binding));
+    try std.testing.expectError(error.DuplicateInputRole, controller.input_custody.capture(allocator, io, &.{ file_binding[0], file_binding[0] }, &tree_binding));
+    try std.testing.expectError(error.DuplicateInputAlias, controller.input_custody.capture(allocator, io, &.{
+        file_binding[0], .{ .role = "tool:alias", .path = path },
+    }, &tree_binding));
+    const changed = try bison_dir.openFile(io, "grammar", .{ .mode = .read_write });
+    defer changed.close(io);
+    try changed.writePositionalAll(io, "TABLE", 0);
+    try std.testing.expectError(error.InputChanged, controller.input_custody.requireSame(allocator, io, expected, &file_binding, &tree_binding));
+}
+
+test "dependency custody parses pinned native ZON, tracked manifests and bounded packages" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const dependency = controller.dependency_custody;
+    const manifest = try std.fs.path.join(allocator, &.{ options.repository_root, "support/tools/hyperv/local_boot/build.zig.zon" });
+    defer allocator.free(manifest);
+    var manifest_file = try core.private_files.RetainedFile.open(io, manifest, .artifact);
+    defer manifest_file.close(io);
+    var manifest_data = try core.private_files.readSensitiveFile(io, allocator, manifest_file.file, 1024 * 1024, .artifact);
+    defer manifest_data.deinit();
+    try dependency.pinnedManifest(allocator, manifest_data.bytes());
+    const mutated = try std.mem.replaceOwned(u8, allocator, manifest_data.bytes(), "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx", "miz-0.2.0-invalid");
+    defer allocator.free(mutated);
+    try std.testing.expectError(error.UnpinnedDependency, dependency.pinnedManifest(allocator, mutated));
+    const sources = try dependency.sourceManifests(allocator, io, options.repository_root, options.git_executable);
+    defer for (sources) |item| item.deinit(allocator);
+    try std.testing.expectEqualStrings(dependency.manifest_paths[0], sources[0].path);
+    try std.testing.expectEqualStrings(dependency.manifest_paths[1], sources[1].path);
+
+    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    defer allocator.free(base_path);
+    const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
+    defer base.close(io);
+    const name = try std.fmt.allocPrint(allocator, "dependency-fixture-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(name);
+    try base.createDir(io, name, .fromMode(0o700));
+    defer base.deleteTree(io, name) catch @panic("dependency fixture cleanup failed");
+    const fixture_dir = try base.openDir(io, name, .{ .iterate = true });
+    defer fixture_dir.close(io);
+    const compute_path = try std.fs.path.join(allocator, &.{ base_path, name });
+    defer allocator.free(compute_path);
+    try fixture_dir.createDir(io, "dependencies", .fromMode(0o700));
+    const restore_dir = try fixture_dir.openDir(io, "dependencies", .{ .iterate = true });
+    defer restore_dir.close(io);
+    try writeFixtureFile(io, restore_dir, "build.zig", sources[0].content);
+    try writeFixtureFile(io, restore_dir, "build.zig.zon", sources[1].content);
+    try fixture_dir.createDir(io, "private", .fromMode(0o700));
+    const private_dir = try fixture_dir.openDir(io, "private", .{ .iterate = true });
+    defer private_dir.close(io);
+    try writeFixtureFile(io, private_dir, "dependency-restore.log", "restored\n");
+    const hash_line = try std.fmt.allocPrint(allocator, "{s}\n", .{controller.custody_limits.miz_package_hash});
+    defer allocator.free(hash_line);
+    try writeFixtureFile(io, private_dir, "dependency-hash-000.log", hash_line);
+    try restore_dir.createDir(io, "zig-pkg", .fromMode(0o700));
+    const packages = try restore_dir.openDir(io, "zig-pkg", .{ .iterate = true });
+    defer packages.close(io);
+    const packages_path = try std.fs.path.join(allocator, &.{ compute_path, "dependencies", "zig-pkg" });
+    defer allocator.free(packages_path);
+    try std.testing.expectError(error.EmptyPackages, dependency.packageSet(allocator, io, packages_path));
+    try packages.createDir(io, controller.custody_limits.miz_package_hash, .fromMode(0o700));
+    const miz = try packages.openDir(io, controller.custody_limits.miz_package_hash, .{ .iterate = true });
+    defer miz.close(io);
+    try writeFixtureFile(io, miz, "main.zig", "pub fn main() void {}\n");
+    var captured = try dependency.packageSet(allocator, io, packages_path);
+    defer captured.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), captured.roots);
+    try std.testing.expectEqual(@as(usize, 1), captured.files);
+    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    defer allocator.free(run_py);
+    const oracle = try std.process.run(allocator, io, .{
+        .argv = &.{
+            "python3",                                                                                                                                                                                                                                                                                                                "-B",   "-c",
+            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); p=pathlib.Path(sys.argv[2]); r=m.directory_inventory(p,m.MIZ_PACKAGE_HASH,m.package_tree_state(p)); print(r['tree_sha256']); print(r['physical_sha256'])", run_py, packages_path,
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(oracle.stdout);
+    defer allocator.free(oracle.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
+    var oracle_lines = std.mem.splitScalar(u8, oracle.stdout, '\n');
+    try std.testing.expectEqualStrings(&captured.packages[0].tree_sha256, oracle_lines.next().?);
+    try std.testing.expectEqualStrings(&captured.packages[0].physical_sha256, oracle_lines.next().?);
+    try dependency.requireSame(allocator, io, packages_path, captured);
+    var record = try dependency.capture(allocator, io, options.repository_root, options.git_executable, compute_path);
+    defer record.deinit(allocator);
+    const native_json = try record.canonical(allocator);
+    defer allocator.free(native_json);
+    const python_record = try std.process.run(allocator, io, .{
+        .argv = &.{
+            "python3",                                                                                                                                                                                                                                                "-B",   "-c",
+            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.canonical_json(m.dependency_custody(pathlib.Path(sys.argv[2]))).decode(),end='')", run_py, compute_path,
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(python_record.stdout);
+    defer allocator.free(python_record.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, python_record.term);
+    try std.testing.expectEqualStrings(python_record.stdout, native_json);
+    try dependency.requireDocument(allocator, io, options.repository_root, options.git_executable, compute_path, record);
+    try std.testing.expectError(error.PackageHashMismatch, dependency.verifyZigPackageHashes(
+        allocator,
+        io,
+        options.repository_root,
+        options.git_executable,
+        compute_path,
+        options.zig_executable,
+        record,
+    ));
+    try writeFixtureFile(io, miz, "injected", "tampered\n");
+    try std.testing.expectError(error.DependencyChanged, dependency.requireSame(allocator, io, packages_path, captured));
+    try std.testing.expectError(error.DependencyChanged, dependency.requireDocument(allocator, io, options.repository_root, options.git_executable, compute_path, record));
+}
+
+test "native ELF runtime closure matches Python dynamic-loader inventory" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const python_path = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/python3", allocator);
+    defer allocator.free(python_path);
+    const actual = try controller.input_custody.executableRuntimePaths(allocator, io, python_path);
+    defer {
+        for (actual) |path| allocator.free(path);
+        allocator.free(actual);
+    }
+
+    try std.testing.expect(actual.len > 0);
+    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    defer allocator.free(run_py);
+    const oracle = try std.process.run(allocator, io, .{
+        .argv = &.{
+            "python3",                                                                                                                                                                                                                                                 "-B",   "-c",
+            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print('\\n'.join(sorted(map(str,m.executable_runtime_paths(pathlib.Path(sys.argv[2]))))))", run_py, python_path,
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    defer allocator.free(oracle.stdout);
+    defer allocator.free(oracle.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
+    var lines = std.mem.splitScalar(u8, oracle.stdout, '\n');
+    for (actual) |path| try std.testing.expectEqualStrings(path, lines.next().?);
+    try std.testing.expectEqualStrings("", lines.next().?);
+    const invalid: controller.input_custody.ProductionPaths = .{
+        .runtime = "/",
+        .tools = .{""} ** controller.input_custody.host_tools.len,
+        .python_stdlib = "/",
+    };
+    try std.testing.expectError(error.UnsafePath, controller.input_custody.captureProduction(allocator, io, invalid));
+}
+
+test "source custody diagnostics cap changes at 64 without losing total" {
+    const allocator = std.testing.allocator;
+    const source = controller.source_custody;
+    const before = try allocator.alloc(source.MetadataEntry, 65);
+    defer allocator.free(before);
+    const after = try allocator.alloc(source.MetadataEntry, 65);
+    defer allocator.free(after);
+    for (before, after, 0..) |*old, *new, i| {
+        const name = try std.fmt.allocPrint(allocator, "tracked-{d:0>3}", .{i});
+        old.* = .{ .kind = "file", .path = name, .metadata = .{0} ** 9 };
+        new.* = .{ .kind = "file", .path = name, .metadata = .{1} ** 9 };
+    }
+    defer for (before) |item| allocator.free(item.path);
+    var changes = try source.metadataChanges(allocator, before, after);
+    defer changes.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 65), changes.changed_records);
+    try std.testing.expectEqual(@as(usize, 64), changes.changed.len);
+    try std.testing.expect(changes.truncated);
+    try std.testing.expectEqualStrings("tracked-000", changes.changed[0].path);
+    try std.testing.expectEqualStrings("tracked-063", changes.changed[63].path);
 }
