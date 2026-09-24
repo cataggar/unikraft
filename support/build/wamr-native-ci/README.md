@@ -179,8 +179,23 @@ bounded output/result limits. Direct scripts name the retained Python or Bash
 ELF explicitly; there is no shebang or ambient interpreter selection.
 The prepare, configuration and native-image stages instead bind the installed
 `native:wamr-aot-build` role as both command and native executable, with no
-interpreter. The retained Python producers are differential and legacy test fixtures only;
-there is no production fallback, PATH lookup or sibling executable discovery.
+interpreter. The old Python producers and their differential tests have been removed.
+There is no production fallback, PATH lookup or sibling executable discovery.
+The adapter supplies a fresh private application output root and a sealed
+`--source-archive` for `prepare`; `verify` is enforced by Make with the
+installed `APPWAMRAOT_TOOL`. The native `olddefconfig` retains the solved
+`build/.config`, and `native-images` publishes schema-1
+`build/image-identity.json` only after a complete clean-source image build.
+The schema-1 artifact identity, exact source-file manifest, image hashes,
+command arrays and permission contract remain unchanged except that
+`prepare_source_sha256` now identifies tracked `build-tool-prepare.zig`.
+Private state directories are `0700`, identity/config/diagnostic files
+are `0600`, and any failed or partial build is a refusal, never a boot,
+cloud, or workload-acceptance result. The installed native producer's
+golden/fault/integration tests are `zig build --build-file
+support/apps/wamr-aot/build.zig test-unit test-integration`; serial
+validation and controller/boot/handoff Python belong to subsequent
+#188/#186/#187/#189 cutovers, not to this producer.
 Recorded indirect executable variables are replaced inside the supervisor by
 paths to its retained descriptors. The reviewed self-reexecuting package and
 local-boot tools ignore inherited retained-self values unless the original

@@ -218,7 +218,7 @@ class Contract(unittest.TestCase):
                 self.assertNotIn("WAMR_CI_PYTHON",
                                  contract["retained_names"])
 
-    def test_python_controller_files_are_differential_oracles_only(self):
+    def test_native_producer_has_no_python_controller_fallback(self):
         production = (
             ci.APP / "Makefile",
             ci.APP / "Makefile.uk",
@@ -234,13 +234,17 @@ class Contract(unittest.TestCase):
                 text = path.read_text()
                 self.assertNotIn("prepare.py", text)
                 self.assertNotIn("build-image.py", text)
+        self.assertFalse((ci.APP / "prepare.py").exists())
+        self.assertFalse((ci.APP / "build-image.py").exists())
+        self.assertFalse((ci.APP / "tests/test_prepare_differential.py").exists())
+        self.assertFalse((ci.APP / "tests/test_image_differential.py").exists())
         self.assertIn(
-            "prepare.py",
-            (ci.APP / "tests/test_prepare_differential.py").read_text(),
+            f'pub const revision = "{ci.REVISION}";',
+            (ci.APP / "build-tool-contract.zig").read_text(),
         )
         self.assertIn(
-            "build-image.py",
-            (ci.APP / "tests/test_image_differential.py").read_text(),
+            f"ref: {ci.REVISION}",
+            (ci.REPO / ".github/workflows/wamr-native-compute.yaml").read_text(),
         )
         makefile = (ci.APP / "Makefile").read_text()
         makefile_uk = (ci.APP / "Makefile.uk").read_text()

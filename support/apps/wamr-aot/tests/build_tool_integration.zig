@@ -101,6 +101,10 @@ test "native prepare and verify cover every variant with create-only output" {
         });
         defer document.deinit();
         const fields = document.value().object;
+        try testing.expect(std.mem.startsWith(u8, identity, "{\n"));
+        try testing.expect(std.mem.endsWith(u8, identity, "\n}\n"));
+        try testing.expectEqualStrings("1", fields.get("schema_version").?.number_string);
+        try testing.expectEqualStrings(build_tool.revision, fields.get("wamr_revision").?.string);
         try testing.expectEqualStrings(
             case.variant,
             fields.get("variant").?.string,
@@ -110,6 +114,45 @@ test "native prepare and verify cover every variant with create-only output" {
         else
             try testing.expect(fields.get("jit_mode").? == .null);
         try testing.expectEqual(case.coremark, fields.get("minimal_wasi").?.bool);
+        const files = fields.get("files").?.object;
+        try testing.expectEqualStrings(
+            "5e43618eda26c083b511b9570d347123affd2b1a14bfc22be766e95c1c8153f8",
+            files.get("tiny.wasm").?.string,
+        );
+        try testing.expectEqualStrings(
+            "64af337c6a3ad81ac353b47602b535340d605da1eb6d3fac48125685df659225",
+            files.get("tiny.cwasm").?.string,
+        );
+        const library = if (case.coremark)
+            "fixture-library variant=tiny coremark=true\n"
+        else
+            try std.fmt.allocPrint(
+                allocator,
+                "fixture-library variant={s} coremark=false\n",
+                .{case.variant},
+            );
+        defer if (!case.coremark) allocator.free(library);
+        const library_path = try std.fs.path.join(
+            allocator,
+            &.{ repository, "support/apps/wamr-aot/build/artifacts/libwamr-aot.a" },
+        );
+        defer allocator.free(library_path);
+        try expectGoldenFile(library_path, library, 0o600);
+        const wasm_path = try std.fs.path.join(
+            allocator,
+            &.{ repository, "support/apps/wamr-aot/build/artifacts/tiny.wasm" },
+        );
+        defer allocator.free(wasm_path);
+        try expectGoldenFile(wasm_path, "fixture-tiny-wasm", 0o700);
+        const cwasm_path = try std.fs.path.join(
+            allocator,
+            &.{ repository, "support/apps/wamr-aot/build/artifacts/tiny.cwasm" },
+        );
+        defer allocator.free(cwasm_path);
+        try expectGoldenFile(cwasm_path, "fixture-cwasm:fixture-tiny-wasm", 0o600);
+        const identity_file = try std.Io.Dir.openFileAbsolute(io, identity_path, .{});
+        defer identity_file.close(io);
+        try testing.expectEqual(@as(u16, 0o600), (try identity_file.stat(io)).permissions.toMode() & 0o7777);
         const verified = try runCli(
             cli,
             &.{ cli, "verify", "--repository", repository },
@@ -203,6 +246,93 @@ test "prepare failures retain private diagnostics without a success identity" {
         var iterator = diagnostics.iterate();
         try testing.expect((try iterator.next(io)) != null);
     }
+}
+
+test "development checkout selection is explicit and cannot masquerade as supported lineage" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, options.prepare_fixture, allocator);
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const archive = try sourceArchive(&temporary);
+    defer allocator.free(archive);
+    const base = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(base);
+    const checkout = try std.fs.path.join(allocator, &.{ base, "checkout" });
+    defer allocator.free(checkout);
+    _ = try build_tool.files.extractGitArchive(allocator, io, archive, checkout, .{});
+    var git_environment = std.process.Environ.Map.init(allocator);
+    defer git_environment.deinit();
+    try git_environment.put("PATH", "/usr/bin:/bin");
+    try git_environment.put("GIT_AUTHOR_NAME", "Fixture");
+    try git_environment.put("GIT_AUTHOR_EMAIL", "fixture@example.invalid");
+    try git_environment.put("GIT_COMMITTER_NAME", "Fixture");
+    try git_environment.put("GIT_COMMITTER_EMAIL", "fixture@example.invalid");
+    for ([_][]const []const u8{
+        &.{ "git", "init", "--quiet" },
+        &.{ "git", "add", "." },
+        &.{ "git", "commit", "--quiet", "-m", "fixture" },
+    }) |arguments| {
+        const result = try std.process.run(allocator, io, .{
+            .argv = arguments,
+            .cwd = .{ .path = checkout },
+            .environ_map = &git_environment,
+            .stdout_limit = .limited(1024),
+            .stderr_limit = .limited(4096),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try expectExit(result.term, 0);
+    }
+    const head = try std.process.run(allocator, io, .{
+        .argv = &.{ "git", "rev-parse", "HEAD" },
+        .cwd = .{ .path = checkout },
+        .environ_map = &git_environment,
+        .stdout_limit = .limited(128),
+        .stderr_limit = .limited(1024),
+    });
+    defer allocator.free(head.stdout);
+    defer allocator.free(head.stderr);
+    try expectExit(head.term, 0);
+    const revision = std.mem.trim(u8, head.stdout, "\r\n");
+    try testing.expectEqual(@as(usize, 40), revision.len);
+
+    const repository = try fixtureRepository(&temporary, "development");
+    defer allocator.free(repository);
+    var environment = try fixtureEnvironment(fixture);
+    defer environment.deinit();
+    const git_path = try std.Io.Dir.cwd().realPathFileAlloc(io, options.git_executable, allocator);
+    defer allocator.free(git_path);
+    try environment.put("WAMR_CI_TOOL_GIT", git_path);
+    const prepared = try runCli(
+        cli,
+        &.{ cli, "prepare", "--repository", repository, "--source", checkout, "--development-revision", revision },
+        &environment,
+    );
+    defer allocator.free(prepared.stdout);
+    defer allocator.free(prepared.stderr);
+    if (prepared.term != .exited or prepared.term.exited != 0)
+        std.debug.print("development prepare term={any} stderr={s}\n", .{ prepared.term, prepared.stderr });
+    try expectExit(prepared.term, 0);
+    const identity_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/build/artifacts/identity.json" },
+    );
+    defer allocator.free(identity_path);
+    const identity = try std.Io.Dir.cwd().readFileAlloc(io, identity_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(identity);
+    var document = try build_tool.json.parse(allocator, identity, .{ .bytes = 1024 * 1024 });
+    defer document.deinit();
+    const fields = document.value().object;
+    try testing.expectEqualStrings(revision, fields.get("wamr_revision").?.string);
+    try testing.expectEqualStrings(build_tool.development_scope, fields.get("scope").?.string);
+    try testing.expect(fields.get("development_only").?.bool);
+    const verified = try runCli(cli, &.{ cli, "verify", "--repository", repository }, &environment);
+    defer allocator.free(verified.stdout);
+    defer allocator.free(verified.stderr);
+    try expectExit(verified.term, 0);
 }
 
 test "native image commands preserve config plans identities and failed publication" {
@@ -308,6 +438,23 @@ test "native image commands preserve config plans identities and failed publicat
     });
     defer document.deinit();
     const fields = document.value().object;
+    try testing.expect(std.mem.startsWith(u8, identity, "{\n"));
+    try testing.expect(std.mem.endsWith(u8, identity, "\n}\n"));
+    try testing.expectEqualStrings("1", fields.get("schema_version").?.number_string);
+    const image_files = fields.get("files").?.object;
+    inline for (.{
+        .{ "wamr_hyperv-x86_64-efi", "fixture-efi\n", "17c858bee604bc476724bfdc9246bcf461a14e8f45f9b557fff2134d8cf62128" },
+        .{ "wamr_hyperv-x86_64-efi.dbg", "fixture-debug-elf\n", "cbfce9471d38cfd632471afcab99720ed27933c60d5ee5a33ac722c4f196aa98" },
+        .{ "wamr_hyperv-x86_64-efi.bootinfo", "fixture-bootinfo\n", "540bd9e9ccf99a4de8b0d3eecc3aa56e5aa3d6247097bb3819bcd53c24068225" },
+    }) |golden| {
+        try testing.expectEqualStrings(golden[2], image_files.get(golden[0]).?.string);
+        const path = try std.fs.path.join(
+            allocator,
+            &.{ repository, "support/apps/wamr-aot/build", golden[0] },
+        );
+        defer allocator.free(path);
+        try expectGoldenFile(path, golden[1], 0o600);
+    }
     try testing.expectEqualStrings(
         "0123456789abcdef0123456789abcdef01234567",
         fields.get("unikraft_revision").?.string,
@@ -323,6 +470,31 @@ test "native image commands preserve config plans identities and failed publicat
         )) found_bridge = true;
     }
     try testing.expect(found_bridge);
+    const root_state = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/build/native-environment" },
+    );
+    defer allocator.free(root_state);
+    const log_bytes = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(log_bytes);
+    try testing.expect(std.mem.indexOf(u8, log_bytes, "--print-datadir") != null);
+    const root_argv = try std.fmt.allocPrint(
+        allocator,
+        "{s}\tbuild\tnative-images\t-j2\t--cache-dir\t{s}/zig_local_cache\t--global-cache-dir\t{s}/zig_global_cache",
+        .{ fixture, root_state, root_state },
+    );
+    defer allocator.free(root_argv);
+    try testing.expect(std.mem.indexOf(u8, log_bytes, root_argv) != null);
+    try testing.expect(std.mem.indexOf(u8, log_bytes, "-Dnative-profile=hyperv-x86_64-efi-wamr") != null);
+    const root_line_start = std.mem.lastIndexOf(u8, log_bytes, root_argv).?;
+    const root_line = log_bytes[0..root_line_start];
+    const root_line_start_index = if (std.mem.lastIndexOfScalar(u8, root_line, '\n')) |index| index + 1 else 0;
+    var root_fields = std.mem.splitScalar(u8, root_line[root_line_start_index..], '\t');
+    try testing.expectEqualStrings(repository, root_fields.next().?);
+    const expected_tmp = try std.fmt.allocPrint(allocator, "{s}/tmp", .{root_state});
+    defer allocator.free(expected_tmp);
+    try testing.expectEqualStrings(expected_tmp, root_fields.next().?);
+    inline for (0..5) |_| try testing.expectEqualStrings("", root_fields.next().?);
     const identity_file = try std.Io.Dir.openFileAbsolute(io, identity_path, .{});
     defer identity_file.close(io);
     try testing.expectEqual(
@@ -669,6 +841,80 @@ test "native config tool failures retain only private compiled error and role" {
     );
     defer allocator.free(role);
     try testing.expectEqualStrings("make", role);
+}
+
+test "native Bison override, default query, and invalid-override refusals" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.image_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    try temporary.dir.createDir(io, "bison-data", .fromMode(0o700));
+    const bison_data = try temporary.dir.realPathFileAlloc(io, "bison-data", allocator);
+    defer allocator.free(bison_data);
+    const bison_file = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(bison_file);
+    const file_override = try std.fs.path.join(allocator, &.{ bison_file, "not-a-directory" });
+    defer allocator.free(file_override);
+    try writeAbsolute(file_override, "file", 0o600);
+    const missing_override = try std.fs.path.join(allocator, &.{ bison_file, "absent-bison-data" });
+    defer allocator.free(missing_override);
+
+    for ([_]struct { name: []const u8, override: ?[]const u8, query: bool, success: bool }{
+        .{ .name = "explicit", .override = bison_data, .query = false, .success = true },
+        .{ .name = "default", .override = null, .query = true, .success = true },
+        .{ .name = "empty", .override = "", .query = false, .success = false },
+        .{ .name = "relative", .override = "relative", .query = false, .success = false },
+        .{ .name = "file", .override = file_override, .query = false, .success = false },
+        .{ .name = "missing", .override = missing_override, .query = false, .success = false },
+    }) |case| {
+        const repository = try imageRepository(&temporary, case.name);
+        defer allocator.free(repository);
+        const log_path = try std.fs.path.join(allocator, &.{ repository, "image.log" });
+        defer allocator.free(log_path);
+        try writeAbsolute(log_path, "", 0o600);
+        var environment = try imageEnvironment(fixture, bison_data, log_path);
+        defer environment.deinit();
+        try environment.put("WAMR_CI_EXECUTABLE_PATH", cli);
+        if (case.override) |value| try environment.put("BISON_PKGDATADIR", value);
+        const result = try runCli(
+            cli,
+            &.{ cli, "olddefconfig", "--repository", repository },
+            &environment,
+        );
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try expectExit(result.term, if (case.success) 0 else 2);
+        const log_bytes = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            log_path,
+            allocator,
+            .limited(1024 * 1024),
+        );
+        defer allocator.free(log_bytes);
+        try testing.expectEqual(case.query, std.mem.indexOf(u8, log_bytes, "--print-datadir") != null);
+        const config_path = try std.fs.path.join(
+            allocator,
+            &.{ repository, "support/apps/wamr-aot/build/.config" },
+        );
+        defer allocator.free(config_path);
+        if (case.success) {
+            try expectGoldenFile(
+                config_path,
+                "CONFIG_FIXTURE=y\n\nCONFIG_STACK_SIZE_PAGE_ORDER=8\nCONFIG_APPWAMRAOT_JIT_BOOT_MODE=0\n",
+                0o600,
+            );
+        } else {
+            try testing.expectEqualStrings("", log_bytes);
+            try testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(io, config_path, .{}));
+        }
+    }
 }
 
 test "tool selection preserves override PATH and retained-fd precedence" {
@@ -1044,8 +1290,7 @@ fn imageRepository(temporary: *testing.TmpDir, name: []const u8) ![:0]u8 {
         current.close(io);
         current = next;
     }
-    inline for (.{ "build-tool-image.zig", "build-image.py" }) |file|
-        try copyFixtureSource(temporary.dir, relative, file);
+    try copyFixtureSource(temporary.dir, relative, "build-tool-image.zig");
     const defconfig = try std.fs.path.join(
         allocator,
         &.{ relative, "defconfig" },
@@ -1335,6 +1580,15 @@ fn writeAbsolute(path: []const u8, contents: []const u8, mode: u16) !void {
     try file.setLength(io, contents.len);
     try file.setPermissions(io, .fromMode(mode));
     try file.sync(io);
+}
+
+fn expectGoldenFile(path: []const u8, expected: []const u8, mode: u16) !void {
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    try testing.expectEqual(mode, (try file.stat(io)).permissions.toMode() & 0o7777);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+    defer allocator.free(bytes);
+    try testing.expectEqualStrings(expected, bytes);
 }
 
 fn sourceArchive(temporary: *testing.TmpDir) ![:0]u8 {

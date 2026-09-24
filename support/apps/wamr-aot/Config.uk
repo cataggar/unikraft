@@ -10,6 +10,8 @@ menuconfig APPWAMRAOT
 	  Run trusted, source-pinned precompiled code and native memory checks.
 	  The default has no guest filesystem, network, or compiler. Optional
 	  workloads remain correctness-only, without benchmark acceptance.
+	  Install the app-owned uk-wamr-aot-build ELF before building: Make
+	  requires its native verify gate and has no Python producer fallback.
 
 config APPWAMRAOT_JIT_BOOT_MODE
 	int "Prepared JIT correctness preset (0=none, 1=fast, 2=full)"
