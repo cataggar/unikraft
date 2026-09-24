@@ -91,6 +91,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(controller_cli);
+    const native_fixtures = b.addExecutable(.{
+        .name = "wamr-native-ci-fixtures",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/fixture_runner.zig"),
+            .target = portable_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = controller_module },
+                .{ .name = "hyperv_core", .module = portable_core },
+            },
+        }),
+    });
+    b.installArtifact(native_fixtures);
     const controller_runtime = b.option(
         []const u8,
         "controller-runtime",
@@ -101,6 +114,10 @@ pub fn build(b: *std.Build) void {
         @panic("cannot resolve source root"));
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     controller_options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch @panic("Git required for controller custody tests"));
+    controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for differential command tests"));
+    controller_options.addOption([]const u8, "fixture_root", std.fs.path.resolve(b.allocator, &.{
+        b.graph.cache.cwd, b.cache_root.path orelse ".",
+    }) catch @panic("cannot resolve private controller test root"));
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = b.graph.host,
@@ -170,6 +187,28 @@ pub fn build(b: *std.Build) void {
         }),
     });
     controller_tests.root_module.addOptions("test_options", controller_options);
+    const fixture_host = b.addExecutable(.{
+        .name = "wamr-native-ci-fixtures-host-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/fixture_runner.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    controller_options.addOptionPath("fixture_runner", fixture_host.getEmittedBin());
+    const command_fixture = b.addExecutable(.{
+        .name = "wamr-ci-controller-test-command",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/test_command.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    controller_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
     const controller_run = b.addRunArtifact(controller_tests);
     b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures")
         .dependOn(&controller_run.step);
@@ -177,6 +216,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
     unit_step.dependOn(&unit_tests.step);
+    unit_step.dependOn(&controller_run.step);
     const cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
     cli_tests.addFileArg(b.path("../../apps/wamr-aot/validator/cli_test.py"));
     cli_tests.addFileArg(log_cli.getEmittedBin());

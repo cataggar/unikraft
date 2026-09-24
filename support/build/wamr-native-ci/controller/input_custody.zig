@@ -199,10 +199,13 @@ pub fn captureProduction(allocator: std.mem.Allocator, io: std.Io, paths: Produc
         try collectRuntime(allocator, io, path, &file_bindings);
     }
     const static_roles = [_]struct { role: []const u8, relative: []const u8 }{
-        .{ .role = "command-supervisor", .relative = "compute/supervisor/bin/wamr-ci-supervisor" },
+        .{ .role = "command-supervisor", .relative = "controller/bin/uk-wamr-native-ci" },
         .{ .role = "wamr-source-archive", .relative = "custody/wamr-source.tar" },
         .{ .role = "native:wamr-aot-build", .relative = "compute/tools/bin/uk-wamr-aot-build" },
         .{ .role = "native:wamr-log-validate", .relative = "compute/tools/bin/uk-wamr-log-validate" },
+        .{ .role = "native:wamr-native-ci-fixtures", .relative = "compute/tools/bin/wamr-native-ci-fixtures" },
+        .{ .role = "native:wamr-ci-package", .relative = "compute/tools/bin/wamr-ci-package" },
+        .{ .role = "native:wamr-ci-supervisor-fixture", .relative = "compute/tools/bin/wamr-ci-supervisor-fixture" },
     };
     for (static_roles) |item| {
         const path = try std.fs.path.join(allocator, &.{ paths.runtime, item.relative });

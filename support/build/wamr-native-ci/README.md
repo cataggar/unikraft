@@ -1,6 +1,6 @@
 # Credential-free tiny native WAMR PR gate
 
-## Native controller foundation (preparation only)
+## Native controller preparation (unpublished build path)
 
 `zig build --build-file support/build/wamr-native-ci/build.zig test-controller`
 runs the native controller foundation's CLI/profile, canonical-record,
@@ -29,16 +29,32 @@ tracked entries/2 GiB (256 MiB per file), 131,072 ignored entries/8 GiB
 512 Bison entries/8 MiB, and 128 dependency roots/16,384 entries/256 MiB.
 Custody checks bind content hashes and stable physical metadata before and
 after use; only the four fixed output roles may be ignored. Bounded diagnostics
-and refusal never grant acceptance. `test-controller` exercises native custody,
-production boundaries, tamper/refusal and `run.py` differential fixtures;
+and refusal never grant acceptance. The build path now supervises a closed
+adapter/local-boot/fixtures/prepare/config/native-image sequence directly
+through the shared Hyper-V process supervisor. It freezes installed native
+producer/validator/fixture identities in `build-start.json`, checks the pinned
+tiny artifacts and image before publishing `build.json`, and retains bounded
+private command logs and create-only public command records. The local-boot
+installer has its own precreated `compute/local-boot-tools` slot so it cannot
+mutate the already frozen `compute/tools/bin` consumer-input directory.
+`test-controller` exercises native custody, build-command failures, production
+boundaries, tamper/refusal, and `run.py` differential record fixtures. The
+installed fixture stage itself supervises bounded native success, nonzero,
+partial-output, signal, overflow, timeout, and cancellation children; its
+create-only private report binds the observed output hashes and cleanup states,
+and the build gate verifies every required result. Each stream is capped at
+4 MiB; the independent native-result transport permits up to 12 MiB so the
+full allowed 8 MiB combined output is encoded without truncation. The
+`test-unit` adapter build target also runs `test-controller` in its isolated
+Zig cache, rather than silently omitting native controller fault fixtures;
 `python3 -m unittest support/build/wamr-native-ci/tests/source_custody_production_limits.py`
 remains the independent full-size source-boundary oracle until cutover.
 
-`build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
-`diagnostics --runtime ABS` reserve their final grammar but deliberately
-**refuse** during the custody phase. They neither run Python nor publish
-acceptance. Production callers continue to use the existing controller until
-the later supervised build/boot and differential cutover PRs. The closed
+`build --runtime ABS --wamr-source ABS` is available only through the installed
+native controller; `boot --runtime ABS` and `diagnostics --runtime ABS` still
+**refuse**. Production workflow callers continue using the Python controller;
+there is no fallback, boot cutover, or change in acceptance authority before
+the later parity and cutover PRs. The closed
 `tiny_exact_v2` production type has six ordered raw/QCOW2/VPC modes;
 the four-mode v1 type is read-only compatibility. No caller-selectable profile,
 CoreMark mode, Azure entry, or alternate validator is installed.
@@ -473,7 +489,8 @@ WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fix
 
 `test` is the protected aggregate and requires `-Dtest-root`; `test-pipeline`
 runs only the real conversion fixtures with the same requirement.
-`test-unit` is the explicit fixture-free command-boundary target.
+`test-unit` runs the package command boundary and native controller/fault
+fixtures; it does not run the real package conversion pipeline.
 
 The Zig fixtures additionally run real raw-to-native-zstd-QCOW2 and
 exact-QCOW2-to-fixed-VHD workers, reopen both artifacts, validate byte/content
