@@ -499,6 +499,9 @@ It uses only the validated recorded Git executable for the source/dependency
 recheck, recomputes the exact source, dependency, Bison, consumer and guarded
 supervisor custody, and only then binds the full recorded tool set and the
 fixed-runtime supervisor. It repeats the full custody check after binding.
+Public bundle validation also binds the native `prepare`, `config` and
+`native-image` command records to the installed producer's recorded consumer
+identity; a missing or substituted producer role refuses those records.
 The public validator build then runs through that retained supervisor; its
 `command-public-validator-build.json` must be the exact in-memory/on-disk
 canonical non-bootstrap record with the retained Zig identity, complete

@@ -2908,6 +2908,57 @@ source/generated/
                     ci.validate_supervised_command_binding(
                         record, stage, changed_identities)
 
+    def test_publication_binds_native_producer_to_consumer_custody(self):
+        def input_record(identity):
+            return {
+                "metadata": [
+                    os.makedev(
+                        identity["device_major"], identity["device_minor"]),
+                    identity["inode"], identity["mode"], identity["uid"],
+                    os.getgid(), 1, identity["size"],
+                    identity["mtime_seconds"] * 1_000_000_000
+                    + identity["mtime_nanoseconds"],
+                    identity["ctime_seconds"] * 1_000_000_000
+                    + identity["ctime_nanoseconds"],
+                ],
+                "sha256": identity["content_sha256"],
+            }
+
+        for stage in ("adapter", "prepare", "config", "native-image"):
+            with self.subTest(stage=stage):
+                record, identities = self.supervised_binding(stage)
+                consumer_files = {
+                    role: input_record(identity)
+                    for role, identity in identities.items()
+                }
+                boot_files = {
+                    role: input_record(identities["command-supervisor"])
+                    for role in ("package_tool", "local_boot_tool")
+                }
+                roles = public_bundle.publication_role_identities(
+                    ci, consumer_files, boot_files)
+                public_bundle.supervised_command_record(
+                    ci, record, stage, roles, "producer_direct")
+
+                without_native = dict(consumer_files)
+                without_native.pop(ci.WAMR_AOT_BUILD_ROLE, None)
+                legacy_roles = public_bundle.publication_role_identities(
+                    ci, without_native, boot_files)
+                if stage == "adapter":
+                    public_bundle.supervised_command_record(
+                        ci, record, stage, legacy_roles, "producer_direct")
+                else:
+                    with self.assertRaises(ci.Refusal):
+                        public_bundle.supervised_command_record(
+                            ci, record, stage, legacy_roles, "producer_direct")
+                    altered = copy.deepcopy(consumer_files)
+                    altered[ci.WAMR_AOT_BUILD_ROLE]["sha256"] = "0" * 64
+                    altered_roles = public_bundle.publication_role_identities(
+                        ci, altered, boot_files)
+                    with self.assertRaises(ci.Refusal):
+                        public_bundle.supervised_command_record(
+                            ci, record, stage, altered_roles, "producer_direct")
+
     def test_public_command_binding_rehash_and_stage_substitution_are_closed(self):
         record, identities = self.supervised_binding(
             "public-validator-build")
