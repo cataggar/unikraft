@@ -21,8 +21,9 @@ The native custody library now exposes clean Git tracked-object/physical
 source and ignored-output checks, fixed-revision create-only WAMR archive
 sealing, Bison and consumer-input-v2 file/tree/ELF-runtime custody, and pinned
 Miz dependency-v1 custody. It reuses the Hyper-V no-follow private-file and
-supervised-command primitives; file-backed archive stdout is capped in the
-child before execution and checked again after sealing. Limits include 40,000
+supervised-command primitives; archive stdout first enters a sealed,
+non-growing sparse memfd, then is copied in bounded chunks to the private
+create-only file and reopened for verification. Limits include 40,000
 tracked entries/2 GiB (256 MiB per file), 131,072 ignored entries/8 GiB
 (512 MiB per file, 8 MiB Git inventory), 100,000 input-tree entries/2 GiB,
 512 Bison entries/8 MiB, and 128 dependency roots/16,384 entries/256 MiB.

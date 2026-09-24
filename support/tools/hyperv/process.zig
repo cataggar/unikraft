@@ -48,8 +48,6 @@ pub const Options = struct {
     inherited_descriptor: ?linux.fd_t = null,
     /// An already retained output file receives stdout instead of the capture pipe.
     stdout_file: ?std.Io.File = null,
-    /// Hard cap on file-backed stdout, enforced in the child before exec.
-    stdout_file_limit: ?u64 = null,
 };
 
 pub const Result = struct {
@@ -632,7 +630,6 @@ pub const CommandRequest = struct {
     cleanup_deadline: Deadline,
     cancel: ?*const std.atomic.Value(bool) = null,
     stdout_file: ?std.Io.File = null,
-    stdout_file_limit: ?u64 = null,
     /// Some self-locating tools require the retained source inode rather than a memfd snapshot.
     snapshot_executable: bool = true,
     limits: CommandLimits = .{},
@@ -1493,7 +1490,6 @@ fn validateOptions(options: Options, maximum: usize) !void {
     if (options.argv.len == 0 or options.argv.len > 128 or
         (!std.fs.path.isAbsolute(options.argv[0]) and !options.allow_named_argv0) or
         options.stdout_limit > maximum or options.stderr_limit > maximum or
-        (options.stdout_file_limit != null and (options.stdout_file == null or options.stdout_file_limit.? == 0)) or
         options.cleanup_ms < 100 or options.cleanup_ms > 30 * 60 * 1000)
         return error.InvalidOptions;
     if (options.allow_named_argv0 and !std.fs.path.isAbsolute(options.argv[0])) {
@@ -1534,7 +1530,6 @@ fn commandOptions(request: CommandRequest) Options {
         .stderr_limit = request.limits.stderr_bytes,
         .cancel = request.cancel,
         .stdout_file = request.stdout_file,
-        .stdout_file_limit = request.stdout_file_limit,
     };
 }
 
@@ -3091,14 +3086,6 @@ fn spawnOwned(
         if (linux.errno(linux.setpgid(0, 0)) != .SUCCESS) childFailure(control[1], 1);
         if (options.cwd.handle != linux.AT.FDCWD and linux.errno(linux.fchdir(options.cwd.handle)) != .SUCCESS)
             childFailure(control[1], 1);
-        if (options.stdout_file_limit) |maximum| {
-            var previous: linux.rlimit = undefined;
-            if (linux.errno(linux.getrlimit(.FSIZE, &previous)) != .SUCCESS)
-                childFailure(control[1], 1);
-            const limited: linux.rlimit = .{ .cur = @min(previous.cur, maximum), .max = previous.max };
-            if (linux.errno(linux.setrlimit(.FSIZE, &limited)) != .SUCCESS)
-                childFailure(control[1], 1);
-        }
         const stdout_descriptor = if (options.stdout_file) |file| file.handle else stdout[1];
         if (linux.errno(linux.dup3(null_fd, 0, 0)) != .SUCCESS or
             linux.errno(linux.dup3(stdout_descriptor, 1, 0)) != .SUCCESS or

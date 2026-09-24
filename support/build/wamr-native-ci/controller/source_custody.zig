@@ -4,6 +4,7 @@ const core = @import("hyperv_core");
 const Sha256 = core.Sha256;
 const files = core.private_files;
 const process = core.process;
+const linux = std.os.linux;
 const limits = @import("custody_limits.zig");
 const physical = @import("custody_files.zig");
 const inputs = @import("controller_source_closure");
@@ -85,6 +86,8 @@ pub fn gitOutput(
     limit: usize,
     output: ?std.Io.File,
 ) ![]u8 {
+    if (output != null and (limit == 0 or limit > limits.tracked_file))
+        return error.InvalidGitBound;
     try process.initialize();
     const cwd = try files.openDirectory(io, repository, .artifact);
     defer cwd.close(io);
@@ -109,6 +112,21 @@ pub fn gitOutput(
     argv[0] = git_executable;
     @memcpy(argv[1..][0..git_prefix.len], &git_prefix);
     @memcpy(argv[1 + git_prefix.len ..], args);
+    const bounded_fd: ?linux.fd_t = if (output != null) block: {
+        const created = linux.memfd_create("wamr-source-archive", linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING);
+        if (linux.errno(created) != .SUCCESS) return error.ArchiveBoundUnavailable;
+        const fd: linux.fd_t = @intCast(created);
+        if (fd <= 2 or linux.errno(linux.ftruncate(fd, @intCast(limit))) != .SUCCESS or
+            linux.errno(linux.fcntl(fd, linux.F.ADD_SEALS, 4)) != .SUCCESS)
+        {
+            _ = linux.close(fd);
+            return error.ArchiveBoundUnavailable;
+        }
+        break :block fd;
+    } else null;
+    defer {
+        if (bounded_fd) |fd| _ = linux.close(fd);
+    }
     const primary = try process.Deadline.afterMilliseconds(60_000);
     const cleanup: process.Deadline = .{ .expires_ns = try std.math.add(u64, primary.expires_ns, 10 * std.time.ns_per_s) };
     var result = try process.runCommand(allocator, io, .{
@@ -118,13 +136,27 @@ pub fn gitOutput(
         .cwd = cwd,
         .primary_deadline = primary,
         .cleanup_deadline = cleanup,
-        .stdout_file = output,
-        .stdout_file_limit = if (output != null) limit else null,
+        .stdout_file = if (bounded_fd) |fd| std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } } else null,
         .snapshot_executable = false,
         .limits = .{ .stdout_bytes = if (output != null) 1024 else @max(1, @min(limit, 8 * limits.mib)), .stderr_bytes = 4096 },
     });
     defer result.deinit(allocator);
     if (!result.succeeded() or result.stderr.len != 0 or result.stdout.len > limit) return error.GitRefused;
+    if (bounded_fd) |fd| {
+        const length = linux.lseek(fd, 0, 1);
+        if (linux.errno(length) != .SUCCESS or length == 0 or length > limit)
+            return error.GitRefused;
+        const bounded: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < length) {
+            const size = @min(buffer.len, length - offset);
+            if (try bounded.readPositionalAll(io, buffer[0..size], offset) != size)
+                return error.GitRefused;
+            try output.?.writePositionalAll(io, buffer[0..size], offset);
+            offset += size;
+        }
+    }
     const after = try files.openDirectory(io, repository, .artifact);
     defer after.close(io);
     if (!files.sameSnapshot(before, try files.snapshot(.{ .handle = after.handle, .flags = .{ .nonblocking = false } })))
