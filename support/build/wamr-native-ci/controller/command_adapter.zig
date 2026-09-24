@@ -10,6 +10,7 @@ const records = @import("records.zig");
 
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
+pub const transport_result_max_bytes = 12 * 1024 * 1024;
 
 pub const Outcome = struct {
     accepted: bool,
@@ -87,6 +88,21 @@ fn identified(allocator: Allocator, role: []const u8, executable: process.Execut
 fn canonical(allocator: Allocator, value: Value) ![]u8 {
     const raw = try std.json.Stringify.valueAlloc(allocator, value, .{});
     return records.canonicalAlloc(allocator, raw);
+}
+
+/// The native result contains base64 for both independent 4 MiB streams;
+/// public evidence still uses the ordinary 4 MiB record encoder.
+pub fn canonicalTransport(allocator: Allocator, value: Value) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+    try core.contracts.writeCanonical(allocator, value, &writer.writer);
+    try writer.writer.writeByte('\n');
+    const encoded = try writer.toOwnedSlice();
+    if (encoded.len > transport_result_max_bytes) {
+        allocator.free(encoded);
+        return error.CommandResultTooLarge;
+    }
+    return encoded;
 }
 
 fn hash(allocator: Allocator, value: Value) !Value {
@@ -333,6 +349,10 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
     const stdout_hash = try bytesDigest(a, result.stdout);
     const stderr_hash = try bytesDigest(a, result.stderr);
     const output_sha = commitment(result.stdout, result.stderr);
+    if (result.stdout.len > 4 * 1024 * 1024 or result.stderr.len > 4 * 1024 * 1024 or
+        std.base64.standard.Encoder.calcSize(result.stdout.len) +
+            std.base64.standard.Encoder.calcSize(result.stderr.len) >= transport_result_max_bytes)
+        return error.CommandResultTooLarge;
     const native_command = try json(a, .{
         .started_ns = result.started_ns,
         .primary_completed_ns = result.primary_completed_ns,
@@ -369,8 +389,7 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
         .controller_error = @as(?[]const u8, null),
         .command = native_command,
     });
-    const result_bytes = try canonical(a, native_result);
-    if (result_bytes.len > 12 * 1024 * 1024) return error.CommandResultTooLarge;
+    const result_bytes = try canonicalTransport(a, native_result);
     const public_request = try json(a, .{
         .schema = "uk.wamr.command-supervisor-request",
         .version = 1,

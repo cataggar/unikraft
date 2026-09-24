@@ -2,11 +2,16 @@
 const std = @import("std");
 const core = @import("hyperv_core");
 const controller = @import("wamr_controller");
+const process = core.process;
 
 pub fn main(init: std.process.Init) void {
     _ = std.os.linux.syscall1(.umask, 0o077);
     const allocator = init.arena.allocator();
     const args = init.minimal.args.toSlice(allocator) catch fail();
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--fixture-child")) {
+        @import("test_command.zig").runScenario(init.io, args[2]);
+        return;
+    }
     if (args.len != 3 or !std.mem.eql(u8, args[1], "--fixture-root"))
         fail();
     run(allocator, init.io, args[2]) catch fail();
@@ -37,14 +42,63 @@ fn run(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !void {
     }
     const encoded = try controller.records.canonicalAlloc(allocator, "{\"b\":2,\"a\":1}");
     if (!std.mem.eql(u8, encoded, "{\"a\":1,\"b\":2}\n")) return error.InvalidEncoder;
-    const record = try std.json.Stringify.valueAlloc(allocator, .{
-        .schema = "uk.wamr.native-ci-fixtures",
-        .schema_version = 1,
-        .production_modes = modes.len,
-        .build_stages = std.enums.values(controller.command_plan.Stage).len,
-        .status = "passed",
-    }, .{});
-    const bytes = try controller.records.canonicalAlloc(allocator, record);
+    try process.initialize();
+    var cancellation = try process.SignalCancellation.install();
+    defer cancellation.deinit();
+    const self_path = try std.process.executablePathAlloc(io, allocator);
+    var executable = try process.Executable.open(io, self_path);
+    defer executable.close(io);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var reports: [std.enums.values(controller.fixture_contract.Scenario).len]controller.fixture_contract.Observation = undefined;
+    for (std.enums.values(controller.fixture_contract.Scenario), 0..) |scenario, index| {
+        if (cancellation.flag().load(.acquire)) return error.Cancelled;
+        const duration: u64 = if (scenario == .timeout) 250 else 4000;
+        const primary = try process.Deadline.afterMilliseconds(duration);
+        const stop = std.atomic.Value(bool).init(scenario == .cancelled);
+        var result = try process.runCommand(allocator, io, .{
+            .executable = executable,
+            .argv = &.{ self_path, "--fixture-child", if (scenario == .cancelled) "timeout" else @tagName(scenario) },
+            .environment = &environment,
+            .cwd = directory.dir,
+            .primary_deadline = primary,
+            .cleanup_deadline = .{ .expires_ns = try std.math.add(u64, primary.expires_ns, 10 * std.time.ns_per_s) },
+            .cancel = if (scenario == .cancelled) &stop else cancellation.flag(),
+            .snapshot_executable = false,
+            .limits = .{
+                .stdout_bytes = if (scenario == .overflow) 33 else 4096,
+                .stderr_bytes = 4096,
+                .term_grace_ms = 100,
+            },
+        });
+        defer result.deinit(allocator);
+        var after = try process.Executable.open(io, self_path);
+        defer after.close(io);
+        if (!std.meta.eql(executable.identity, after.identity) or
+            !result.executable_stable or !result.cleanup_complete or
+            result.descendants.untracked or result.descendants.limit_exceeded)
+            return error.FixtureCleanupFailed;
+        const stdout_sha = std.fmt.bytesToHex(controller.records.fileIdentity(result.stdout), .lower);
+        const stderr_sha = std.fmt.bytesToHex(controller.records.fileIdentity(result.stderr), .lower);
+        reports[index] = .{
+            .name = @tagName(scenario),
+            .primary = @tagName(result.primary),
+            .exit_code = switch (result.primary) {
+                .exited => |code| @as(i32, code),
+                else => -1,
+            },
+            .stdout_bytes = result.stdout.len,
+            .stdout_sha256 = try allocator.dupe(u8, &stdout_sha),
+            .stderr_bytes = result.stderr.len,
+            .stderr_sha256 = try allocator.dupe(u8, &stderr_sha),
+            .cleanup_complete = result.cleanup_complete,
+            .executable_stable = result.executable_stable,
+        };
+    }
+    if (cancellation.flag().load(.acquire)) return error.Cancelled;
+    const bytes = try controller.fixture_contract.encode(allocator, &reports);
+    try controller.fixture_contract.verify(allocator, bytes);
+    if (cancellation.flag().load(.acquire)) return error.Cancelled;
     const output = try directory.dir.createFile(io, "native-scenarios.json", .{
         .exclusive = true,
         .read = true,

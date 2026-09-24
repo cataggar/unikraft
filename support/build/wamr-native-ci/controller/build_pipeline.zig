@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("hyperv_core");
 const files = core.private_files;
 const process = core.process;
@@ -11,6 +12,7 @@ const physical = @import("custody_files.zig");
 const inputs = @import("input_custody.zig");
 const dependencies = @import("dependency_custody.zig");
 const records = @import("records.zig");
+const fixture_contract = @import("fixture_contract.zig");
 const profile = @import("profile.zig");
 const limits = @import("custody_limits.zig");
 
@@ -34,6 +36,8 @@ pub const Context = struct {
     consumer: ?inputs.Production = null,
     command_records: [std.meta.fields(plan.Stage).len]?physical.File = .{null} ** std.meta.fields(plan.Stage).len,
     build_start_record: ?physical.File = null,
+    fixture_report: ?physical.File = null,
+    test_before_publication: ?*const fn (*Context) void = null,
     failed_stage: []const u8 = "startup",
 };
 
@@ -95,10 +99,17 @@ fn read(context: *Context, path: []const u8, max: usize, private: bool) ![]const
 }
 
 fn evidence(context: *Context, name: []const u8, value: anytype) !void {
+    try cancelled(context);
     const raw = try std.json.Stringify.valueAlloc(context.allocator, value, .{});
+    defer context.allocator.free(raw);
     const encoded = try records.canonicalAlloc(context.allocator, raw);
-    const evidence_dir = try contextDir(context, "evidence");
+    defer context.allocator.free(encoded);
+    const evidence_path = try subpath(context, "evidence");
+    defer context.allocator.free(evidence_path);
+    const evidence_dir = try files.openDirectory(context.io, evidence_path, .private);
     defer evidence_dir.close(context.io);
+    if (builtin.is_test) if (context.test_before_publication) |fault| fault(context);
+    try cancelled(context);
     try create(context.io, evidence_dir, name, encoded);
 }
 
@@ -348,7 +359,9 @@ pub fn bootstrap(state: DependenciesRestored) !BootstrapInputsBound {
 }
 
 fn requireSource(context: *Context) !void {
+    try cancelled(context);
     const actual = try custody.source(context.allocator, context.io, context.repository, context.git);
+    try cancelled(context);
     const before = context.source.?;
     if (!std.mem.eql(u8, actual.revision, before.revision) or
         !std.mem.eql(u8, actual.tree, before.tree) or
@@ -386,6 +399,7 @@ fn runStage(state: anytype, selected: plan.Stage, check_consumer: bool) !void {
 
 pub fn requireBuildEvidence(context: *Context) !void {
     for (std.enums.values(plan.Stage), context.command_records) |stage, expected| {
+        try cancelled(context);
         const recorded = expected orelse continue;
         const relative = try std.fmt.allocPrint(context.allocator, "evidence/command-{s}.json", .{@tagName(stage)});
         defer context.allocator.free(relative);
@@ -395,20 +409,30 @@ pub fn requireBuildEvidence(context: *Context) !void {
         if (!std.meta.eql(current, recorded)) return error.CommandEvidenceChanged;
     }
     if (context.build_start_record) |recorded| {
+        try cancelled(context);
         const path = try subpath(context, "evidence/build-start.json");
         defer context.allocator.free(path);
         const current = try physical.readFile(context.io, path, limits.tracked_file, true);
         if (!std.meta.eql(current, recorded)) return error.BuildStartChanged;
     }
+    if (context.fixture_report) |recorded| {
+        try cancelled(context);
+        const path = try subpath(context, "fixtures/native-scenarios.json");
+        defer context.allocator.free(path);
+        const current = try physical.readFile(context.io, path, 8192, true);
+        if (!std.meta.eql(current, recorded)) return error.FixtureChanged;
+    }
 }
 
 fn requireConsumer(context: *Context) !void {
+    try cancelled(context);
     const observed = context.consumer orelse return error.UnboundInputs;
     try inputs.requireProduction(context.allocator, context.io, .{
         .runtime = context.runtime,
         .tools = context.tools,
         .python_stdlib = try pythonStdlib(context),
     }, observed.custody);
+    try cancelled(context);
 }
 
 fn pythonStdlib(context: *Context) ![]const u8 {
@@ -575,15 +599,10 @@ pub fn testFixtures(state: LocalBootBuilt) !NativeFixturesPassed {
     try runStage(state, .fixtures, true);
     const context = state.context;
     const path = try subpath(context, "fixtures/native-scenarios.json");
-    const output = try read(context, path, 4096, true);
-    const expected = try records.canonicalAlloc(context.allocator, try std.json.Stringify.valueAlloc(context.allocator, .{
-        .schema = "uk.wamr.native-ci-fixtures",
-        .schema_version = 1,
-        .production_modes = 6,
-        .build_stages = 6,
-        .status = "passed",
-    }, .{}));
-    if (!std.mem.eql(u8, output, expected)) return error.FixtureChanged;
+    const output = try read(context, path, 8192, true);
+    try fixture_contract.verify(context.allocator, output);
+    context.fixture_report = try physical.readFile(context.io, path, 8192, true);
+    try requireBuildEvidence(context);
     return next(state, NativeFixturesPassed);
 }
 
@@ -594,6 +613,7 @@ pub fn prepare(state: NativeFixturesPassed) !ProducerPrepared {
 }
 
 fn verifyRuntimeIdentity(context: *Context) !void {
+    try cancelled(context);
     const a = context.allocator;
     const artifact_dir = try join(context, &.{ context.repository, "support/apps/wamr-aot/build/artifacts" });
     const raw = try read(context, try join(context, &.{ artifact_dir, "identity.json" }), limits.mib, false);
@@ -602,6 +622,7 @@ fn verifyRuntimeIdentity(context: *Context) !void {
     try admitPreparedIdentity(parsed.value());
     const artifacts = parsed.value().object.get("files").?.object;
     for ([_][]const u8{ "embedded.c", "identity.h", "libwamr-aot.a", "tiny.cwasm", "tiny.wasm", "wamr_aot.h", "wamrc" }) |name| {
+        try cancelled(context);
         const digest = try core.contracts.parseSha256(try core.contracts.string(artifacts.get(name).?));
         const file = try physical.readFile(context.io, try join(context, &.{ artifact_dir, name }), limits.tracked_file, false);
         if (!std.meta.eql(digest, try core.contracts.parseSha256(&file.sha256))) return error.ArtifactChanged;
@@ -679,6 +700,7 @@ pub fn acceptBuild(state: NativeImageBuilt) !BuildAccepted {
     try requireSource(context);
     try requireConsumer(context);
     try dependencies.requireDocument(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?);
+    try cancelled(context);
     try verifyRuntimeIdentity(context);
     const a = context.allocator;
     const app = try join(context, &.{ context.repository, "support/apps/wamr-aot" });
@@ -705,6 +727,7 @@ pub fn acceptBuild(state: NativeImageBuilt) !BuildAccepted {
     if (image_files != .object or image_files.object.count() != 3) return error.InvalidImage;
     const efi = "wamr_hyperv-x86_64-efi";
     for ([_][]const u8{ efi, efi ++ ".dbg", efi ++ ".bootinfo" }) |name| {
+        try cancelled(context);
         const digest = try core.contracts.parseSha256(try core.contracts.string(image_files.object.get(name) orelse return error.InvalidImage));
         const file = try physical.readFile(context.io, try join(context, &.{ app, "build", name }), limits.tracked_file, false);
         if (!std.meta.eql(digest, try core.contracts.parseSha256(&file.sha256))) return error.ImageChanged;
@@ -716,6 +739,7 @@ pub fn acceptBuild(state: NativeImageBuilt) !BuildAccepted {
     var iterator = app_dir.iterate();
     var count: usize = 0;
     while (try iterator.next(context.io)) |entry| {
+        try cancelled(context);
         if (entry.name[0] == '.' or entry.kind == .directory) continue;
         const path = try join(context, &.{ app, entry.name });
         const expected = try core.contracts.parseSha256(try core.contracts.string(app_sources.object.get(entry.name) orelse return error.AppSourceChanged));
@@ -727,6 +751,7 @@ pub fn acceptBuild(state: NativeImageBuilt) !BuildAccepted {
     const image_tools = value.get("tools") orelse return error.InvalidImage;
     if (image_tools != .object or image_tools.object.count() != 9) return error.InvalidImage;
     for ([_][]const u8{ "zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump", "llvm-readelf", "llvm-strip", "bison", "flex" }) |name| {
+        try cancelled(context);
         const selected = try core.contracts.parseSha256(try core.contracts.string(image_tools.object.get(name) orelse return error.ImageToolsChanged));
         for (inputs.host_tools, context.tools) |known, path| {
             if (!std.mem.eql(u8, name, known)) continue;
@@ -744,12 +769,17 @@ pub fn acceptBuild(state: NativeImageBuilt) !BuildAccepted {
         "CONFIG_LIBSTORVSC=y",          "CONFIG_LIBNETVSC=y",
         "CONFIG_LIBLWIP=y",
     }) |setting| if (countLine(solved, setting) != 0) return error.InvalidConfig;
-    try evidence(context, "build.json", .{
+    try publishBuild(context, .{
         .source = .{ .revision = context.source.?.revision, .tree = context.source.?.tree },
         .runtime = try rawValue(a, app_identity),
         .image = try rawValue(a, image),
     });
     return .{ .context = context };
+}
+
+pub fn publishBuild(context: *Context, value: anytype) !void {
+    try cancelled(context);
+    try evidence(context, "build.json", value);
 }
 
 fn countLine(bytes: []const u8, target: []const u8) usize {

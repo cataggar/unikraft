@@ -115,6 +115,9 @@ pub fn build(b: *std.Build) void {
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     controller_options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch @panic("Git required for controller custody tests"));
     controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for differential command tests"));
+    controller_options.addOption([]const u8, "fixture_root", std.fs.path.resolve(b.allocator, &.{
+        b.graph.cache.cwd, b.cache_root.path orelse ".",
+    }) catch @panic("cannot resolve private controller test root"));
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = b.graph.host,
@@ -213,6 +216,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
     unit_step.dependOn(&unit_tests.step);
+    unit_step.dependOn(&controller_run.step);
     const cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
     cli_tests.addFileArg(b.path("../../apps/wamr-aot/validator/cli_test.py"));
     cli_tests.addFileArg(log_cli.getEmittedBin());

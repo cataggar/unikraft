@@ -38,7 +38,15 @@ private command logs and create-only public command records. The local-boot
 installer has its own precreated `compute/local-boot-tools` slot so it cannot
 mutate the already frozen `compute/tools/bin` consumer-input directory.
 `test-controller` exercises native custody, build-command failures, production
-boundaries, tamper/refusal, and `run.py` differential record fixtures;
+boundaries, tamper/refusal, and `run.py` differential record fixtures. The
+installed fixture stage itself supervises bounded native success, nonzero,
+partial-output, signal, overflow, timeout, and cancellation children; its
+create-only private report binds the observed output hashes and cleanup states,
+and the build gate verifies every required result. Each stream is capped at
+4 MiB; the independent native-result transport permits up to 12 MiB so the
+full allowed 8 MiB combined output is encoded without truncation. The
+`test-unit` adapter build target also runs `test-controller` in its isolated
+Zig cache, rather than silently omitting native controller fault fixtures;
 `python3 -m unittest support/build/wamr-native-ci/tests/source_custody_production_limits.py`
 remains the independent full-size source-boundary oracle until cutover.
 
@@ -481,7 +489,8 @@ WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fix
 
 `test` is the protected aggregate and requires `-Dtest-root`; `test-pipeline`
 runs only the real conversion fixtures with the same requirement.
-`test-unit` is the explicit fixture-free command-boundary target.
+`test-unit` runs the package command boundary and native controller/fault
+fixtures; it does not run the real package conversion pipeline.
 
 The Zig fixtures additionally run real raw-to-native-zstd-QCOW2 and
 exact-QCOW2-to-fixed-VHD workers, reopen both artifacts, validate byte/content

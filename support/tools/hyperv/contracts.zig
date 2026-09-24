@@ -139,7 +139,7 @@ fn checkItems(value: std.json.Value, maximum: usize) anyerror!void {
     }
 }
 
-fn writeCanonical(allocator: std.mem.Allocator, value: std.json.Value, writer: *std.Io.Writer) anyerror!void {
+pub fn writeCanonical(allocator: std.mem.Allocator, value: std.json.Value, writer: *std.Io.Writer) anyerror!void {
     switch (value) {
         .object => |object| {
             const keys = try allocator.dupe([]const u8, object.keys());

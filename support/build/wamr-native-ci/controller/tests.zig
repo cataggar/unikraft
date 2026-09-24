@@ -46,6 +46,49 @@ test "build command table has closed roles, order, deadlines and native executab
     }).get("tool:sh"));
 }
 
+test "transport encoder preserves full 3 MiB and 8 MiB streams and refuses true excess" {
+    const a = std.testing.allocator;
+    const sizes = [_]struct { stdout: usize, stderr: usize }{
+        .{ .stdout = 3 * 1024 * 1024, .stderr = 0 },
+        .{ .stdout = 4 * 1024 * 1024, .stderr = 4 * 1024 * 1024 },
+    };
+    for (sizes) |selected| {
+        const out = try a.alloc(u8, selected.stdout);
+        defer a.free(out);
+        @memset(out, 'A');
+        const err = try a.alloc(u8, selected.stderr);
+        defer a.free(err);
+        @memset(err, 'B');
+        const out64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(out.len));
+        defer a.free(out64);
+        _ = std.base64.standard.Encoder.encode(out64, out);
+        const err64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(err.len));
+        defer a.free(err64);
+        _ = std.base64.standard.Encoder.encode(err64, err);
+        var value = std.json.Value{ .object = .empty };
+        defer value.object.deinit(a);
+        try value.object.put(a, "stdout_base64", .{ .string = out64 });
+        try value.object.put(a, "stderr_base64", .{ .string = err64 });
+        const encoded = try controller.command_adapter.canonicalTransport(a, value);
+        defer a.free(encoded);
+        try std.testing.expect(encoded.len > controller.records.max_record_bytes);
+        try std.testing.expect(encoded.len < controller.command_adapter.transport_result_max_bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{
+            .max_value_len = controller.command_adapter.transport_result_max_bytes,
+        });
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(out64, parsed.value.object.get("stdout_base64").?.string);
+        try std.testing.expectEqualStrings(err64, parsed.value.object.get("stderr_base64").?.string);
+    }
+    const excess = try a.alloc(u8, controller.command_adapter.transport_result_max_bytes);
+    defer a.free(excess);
+    @memset(excess, 'A');
+    var value = std.json.Value{ .object = .empty };
+    defer value.object.deinit(a);
+    try value.object.put(a, "stdout_base64", .{ .string = excess });
+    try std.testing.expectError(error.CommandResultTooLarge, controller.command_adapter.canonicalTransport(a, value));
+}
+
 test "native tiny build identity admissions match Python build refusal boundary" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -106,7 +149,7 @@ test "native tiny build identity admissions match Python build refusal boundary"
 fn directSharedSupervisorFixtures() !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const cache = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    const cache = try a.dupe(u8, options.fixture_root);
     defer a.free(cache);
     const parent = try std.Io.Dir.openDirAbsolute(io, cache, .{ .iterate = true });
     defer parent.close(io);
@@ -138,6 +181,8 @@ fn directSharedSupervisorFixtures() !void {
         .{ .name = "overflow", .accepted = false, .kind = "output_overflow", .limit = 32 },
         .{ .name = "timeout", .accepted = false, .kind = "timeout", .seconds = 1 },
         .{ .name = "cancelled", .accepted = false, .kind = "cancelled", .cancelled = true },
+        .{ .name = "large-3m", .accepted = true, .kind = "exited", .limit = 8 * 1024 * 1024 },
+        .{ .name = "large-8m", .accepted = true, .kind = "exited", .limit = 8 * 1024 * 1024 },
     };
     for (scenarios) |scenario| {
         try fixture_dir.createDir(io, scenario.name, .fromMode(0o700));
@@ -184,7 +229,7 @@ fn directSharedSupervisorFixtures() !void {
         defer private_log.close(io);
         const log_path = try std.fs.path.join(a, &.{ work, "private/fixtures.log" });
         defer a.free(log_path);
-        const log_stat = try controller.custody_files.readFile(io, log_path, 1024, true);
+        const log_stat = try controller.custody_files.readFile(io, log_path, scenario.limit + 1, true);
         try std.testing.expect(log_stat.bytes <= scenario.limit + 1);
         const public_file = try evidence.openFile(io, "command-fixtures.json", .{ .follow_symlinks = false });
         defer public_file.close(io);
@@ -244,6 +289,8 @@ fn directSharedSupervisorFixtures() !void {
             .test_output_limit = scenario.limit,
         }));
         if (std.mem.eql(u8, scenario.name, "ok")) {
+            var cancellation = try controller.build_pipeline.installCancellation();
+            defer cancellation.deinit();
             var context: controller.build_pipeline.Context = .{
                 .allocator = a,
                 .io = io,
@@ -255,7 +302,7 @@ fn directSharedSupervisorFixtures() !void {
                 .git = undefined,
                 .tools = undefined,
                 .roots = undefined,
-                .signal = undefined,
+                .signal = &cancellation,
             };
             context.command_records[@intFromEnum(controller.command_plan.Stage.fixtures)] =
                 try controller.custody_files.readFile(io, record_path, 1024 * 1024, true);
@@ -644,7 +691,7 @@ fn pythonCustody(allocator: std.mem.Allocator, mode: []const u8, path: []const u
 test "native clean Git custody, stable physical identities and pinned archive refusal" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    const base_path = try allocator.dupe(u8, options.fixture_root);
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
@@ -915,7 +962,7 @@ test "missing input symlink target respects Python's absolute 64-component bound
 test "native Bison production entry and sparse byte boundaries" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    const base_path = try allocator.dupe(u8, options.fixture_root);
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
@@ -955,7 +1002,7 @@ test "native Bison production entry and sparse byte boundaries" {
 test "Bison and consumer v2 custody bind bytes, roles, ancestors and replacement" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    const base_path = try allocator.dupe(u8, options.fixture_root);
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
@@ -1068,7 +1115,7 @@ test "dependency custody parses pinned native ZON, tracked manifests and bounded
     try std.testing.expectEqualStrings(dependency.manifest_paths[0], sources[0].path);
     try std.testing.expectEqualStrings(dependency.manifest_paths[1], sources[1].path);
 
-    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    const base_path = try allocator.dupe(u8, options.fixture_root);
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
@@ -1219,10 +1266,53 @@ test "direct shared supervisor retains bounded native success and failure eviden
     try directSharedSupervisorFixtures();
 }
 
+test "late cancellation refuses final build publication after record preparation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "late-build-cancellation-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("late cancellation fixture cleanup failed");
+    const work = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(work);
+    const slot = try parent.openDir(io, name, .{ .iterate = true });
+    defer slot.close(io);
+    try slot.createDir(io, "evidence", .fromMode(0o700));
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var context: controller.build_pipeline.Context = .{
+        .allocator = a,
+        .io = io,
+        .environ = undefined,
+        .runtime = work,
+        .repository = options.repository_root,
+        .wamr = work,
+        .compute = work,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+    };
+    const accepted = .{ .source = "prepared", .runtime = "checked", .image = "checked" };
+    context.test_before_publication = struct {
+        fn cancel(before: *controller.build_pipeline.Context) void {
+            @constCast(before.signal.flag()).store(true, .release);
+        }
+    }.cancel;
+    try std.testing.expectError(error.Cancelled, controller.build_pipeline.publishBuild(&context, accepted));
+    try std.testing.expect(signal.flag().load(.acquire));
+    const evidence = try slot.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    var iterator = evidence.iterate();
+    try std.testing.expect(try iterator.next(io) == null);
+}
+
 test "installed native fixture runner is private, create-only and rejects replay" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const cache = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    const cache = try a.dupe(u8, options.fixture_root);
     defer a.free(cache);
     const parent = try std.Io.Dir.openDirAbsolute(io, cache, .{ .iterate = true });
     defer parent.close(io);
@@ -1232,11 +1322,16 @@ test "installed native fixture runner is private, create-only and rejects replay
     defer parent.deleteTree(io, name) catch @panic("native runner fixture cleanup failed");
     const root = try std.fs.path.join(a, &.{ cache, name });
     defer a.free(root);
+    const work_dir = try parent.openDir(io, name, .{ .iterate = true });
+    defer work_dir.close(io);
+    try work_dir.createDir(io, "fixtures", .fromMode(0o700));
+    const fixture_path = try std.fs.path.join(a, &.{ root, "fixtures" });
+    defer a.free(fixture_path);
     const runner = try std.fs.path.resolve(a, &.{ options.repository_root, options.fixture_runner });
     defer a.free(runner);
     for ([_]bool{ true, false }) |success| {
         const result = try std.process.run(a, io, .{
-            .argv = &.{ runner, "--fixture-root", root },
+            .argv = &.{ runner, "--fixture-root", fixture_path },
             .cwd = .{ .path = options.repository_root },
             .stdout_limit = .limited(4096),
             .stderr_limit = .limited(4096),
@@ -1246,16 +1341,58 @@ test "installed native fixture runner is private, create-only and rejects replay
         try std.testing.expectEqual(std.process.Child.Term{ .exited = if (success) 0 else 1 }, result.term);
         try std.testing.expectEqual(@as(usize, 0), result.stdout.len + result.stderr.len);
     }
-    const output_path = try std.fs.path.join(a, &.{ root, "native-scenarios.json" });
+    const output_path = try std.fs.path.join(a, &.{ fixture_path, "native-scenarios.json" });
     defer a.free(output_path);
-    const output = try controller.custody_files.readFile(io, output_path, 4096, true);
-    try std.testing.expect(output.bytes > 50);
+    const output = try controller.custody_files.readFile(io, output_path, 8192, true);
+    try std.testing.expect(output.bytes > 500);
+    const published = try std.Io.Dir.openFileAbsolute(io, output_path, .{
+        .follow_symlinks = false,
+    });
+    defer published.close(io);
+    const raw = try a.alloc(u8, @intCast(output.bytes));
+    defer a.free(raw);
+    try std.testing.expectEqual(raw.len, try published.readPositionalAll(io, raw, 0));
+    try controller.fixture_contract.verify(a, raw);
+    const changed = try std.mem.replaceOwned(u8, a, raw, "\"status\":\"passed\"", "\"status\":\"failed\"");
+    defer a.free(changed);
+    try std.testing.expectError(error.FixtureChanged, controller.fixture_contract.verify(a, changed));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), raw, .{ .allocate = .alloc_always });
+    parsed.object.getPtr("scenarios").?.array.items.len -= 1;
+    const skipped = try std.json.Stringify.valueAlloc(a, parsed, .{});
+    defer a.free(skipped);
+    try std.testing.expectError(error.FixtureChanged, controller.fixture_contract.verify(a, skipped));
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var context: controller.build_pipeline.Context = .{
+        .allocator = a,
+        .io = io,
+        .environ = undefined,
+        .runtime = root,
+        .repository = options.repository_root,
+        .wamr = root,
+        .compute = root,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+        .fixture_report = output,
+    };
+    try controller.build_pipeline.requireBuildEvidence(&context);
+    const tamper = try std.Io.Dir.openFileAbsolute(io, output_path, .{
+        .mode = .read_write,
+        .follow_symlinks = false,
+    });
+    defer tamper.close(io);
+    try tamper.writePositionalAll(io, " ", 0);
+    try std.testing.expectError(error.FixtureChanged, controller.build_pipeline.requireBuildEvidence(&context));
 }
 
 test "native command refuses changed executable after use and retains failed record" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const cache = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    const cache = try a.dupe(u8, options.fixture_root);
     defer a.free(cache);
     const parent = try std.Io.Dir.openDirAbsolute(io, cache, .{ .iterate = true });
     defer parent.close(io);
