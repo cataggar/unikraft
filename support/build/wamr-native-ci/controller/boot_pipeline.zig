@@ -71,6 +71,25 @@ pub const Context = struct {
         }
     }
 
+    fn requireExactEvidence(self: *Context) !void {
+        const directory = try files.openDirectory(self.io(), try self.path("evidence"), .private);
+        defer directory.close(self.io());
+        try self.requireExactEvidenceIn(directory);
+    }
+
+    fn requireExactEvidenceIn(self: *Context, directory: std.Io.Dir) !void {
+        var iterator = directory.iterate();
+        var count: usize = 0;
+        while (try iterator.next(self.io())) |entry| {
+            try self.cancelled();
+            if (!self.pinned.contains(entry.name) or count >= self.pinned.count())
+                return error.UnexpectedEvidence;
+            count += 1;
+        }
+        if (count != self.pinned.count()) return error.MissingEvidence;
+        try self.checkPins();
+    }
+
     fn hash(self: *Context, name: []const u8) ![]const u8 {
         const file = self.pinned.get(name) orelse return error.MissingEvidence;
         return self.allocator().dupe(u8, &file.sha256);
@@ -83,6 +102,7 @@ pub const Context = struct {
         const encoded = try records.canonicalAlloc(self.allocator(), raw);
         const directory = try files.openDirectory(self.io(), try self.path("evidence"), .private);
         defer directory.close(self.io());
+        if (std.mem.eql(u8, name, "result.json")) try self.requireExactEvidenceIn(directory);
         const file = try directory.createFile(self.io(), name, .{
             .exclusive = true, .read = true, .permissions = .fromMode(0o600),
         });
@@ -339,7 +359,11 @@ fn packageImage(ctx: *Context) !Value {
 
 pub fn package(state: BootInputsBound) !PackageCreated {
     const ctx = state.context;
-    const observed = try runStage(ctx, .package, false);
+    try recordPackage(ctx, try runStage(ctx, .package, false));
+    return advance(state, PackageCreated);
+}
+
+fn recordPackage(ctx: *Context, observed: Value) !void {
     try sameText(try field(observed, "scope"), "public_local_compute_packaging_only");
     try sameText(try field(observed, "acceptance"), "not_established");
     const image = try field(observed, "image");
@@ -365,7 +389,6 @@ pub fn package(state: BootInputsBound) !PackageCreated {
     try selected.object.put(ctx.allocator(), "image", image_out);
     ctx.package = observed;
     try ctx.publish("package.json", selected);
-    return advance(state, PackageCreated);
 }
 
 pub fn parseValidator(a: std.mem.Allocator, raw: []const u8, expected_bytes: u64, expected_sha256: []const u8) !Value {
@@ -497,6 +520,18 @@ fn summary(ctx: *Context, index: usize, checked: CheckedBoot) !Value {
     });
 }
 
+fn requireModeImage(ctx: *Context, index: usize) !void {
+    const mode = profile.production_modes[index];
+    const expected = if (index < 2)
+        try field(try packageImage(ctx), "raw")
+    else if (index < 4)
+        try field(ctx.finalization orelse return error.MissingFinalization, "output")
+    else
+        try field(ctx.derivation orelse return error.MissingDerivation, "output");
+    _ = try matchFile(ctx, try ctx.path(try std.fmt.allocPrint(ctx.allocator(), "package/{s}", .{plan.bootImage(mode)})),
+        expected, 66 * mib + 512, true);
+}
+
 fn verifyMode(ctx: *Context, index: usize) !Value {
     const mode = profile.production_modes[index];
     const checked = try checkBoot(ctx, index);
@@ -508,15 +543,24 @@ fn verifyMode(ctx: *Context, index: usize) !Value {
     try sameText(try field(evidence, "request_sha256"), checked.request_sha256);
     try sameText(try field(evidence, "report_sha256"), checked.report_sha256);
     if (try field(evidence, "compute") != .object) return error.InvalidComputeEvidence;
-    const expected = if (index < 2)
-        try field(try packageImage(ctx), "raw")
-    else if (index < 4)
-        try field(ctx.finalization orelse return error.MissingFinalization, "output")
-    else
-        try field(ctx.derivation orelse return error.MissingDerivation, "output");
-    _ = try matchFile(ctx, try ctx.path(try std.fmt.allocPrint(ctx.allocator(), "package/{s}", .{plan.bootImage(mode)})),
-        expected, 66 * mib + 512, true);
+    try requireModeImage(ctx, index);
     return summary(ctx, index, checked);
+}
+
+fn publishCheckedMode(ctx: *Context, index: usize, checked: CheckedBoot, compute: Value) !void {
+    const evidence = try typed(ctx.allocator(), .{
+        .scope = "local_native_compute_only", .report = checked.report,
+        .input_pins = checked.pins, .request_sha256 = checked.request_sha256,
+        .report_sha256 = checked.report_sha256, .compute = compute,
+    });
+    try publishMode(ctx, index, evidence);
+    ctx.boots[index] = try verifyMode(ctx, index);
+}
+
+fn publishMode(ctx: *Context, index: usize, evidence: Value) !void {
+    try requireModeImage(ctx, index);
+    const name = try std.fmt.allocPrint(ctx.allocator(), "{s}-compute.json", .{@tagName(profile.production_modes[index])});
+    try ctx.publish(name, evidence);
 }
 
 fn runMode(ctx: *Context, index: usize) !void {
@@ -547,14 +591,7 @@ fn runMode(ctx: *Context, index: usize) !void {
         !std.meta.eql(identity_pin, try physical.readFile(ctx.io(), identity, mib, false)))
         return error.ValidatorInputChanged;
     const checked = try checkBoot(ctx, index);
-    const evidence = try typed(a, .{
-        .scope = "local_native_compute_only", .report = checked.report,
-        .input_pins = checked.pins, .request_sha256 = checked.request_sha256,
-        .report_sha256 = checked.report_sha256, .compute = compute,
-    });
-    const name = try std.fmt.allocPrint(a, "{s}-compute.json", .{@tagName(mode)});
-    try ctx.publish(name, evidence);
-    ctx.boots[index] = try verifyMode(ctx, index);
+    try publishCheckedMode(ctx, index, checked, compute);
 }
 
 pub fn rawX2(state: PackageCreated) !RawX2Validated {
@@ -587,6 +624,11 @@ pub fn qcow2Intent(state: RawLegacyValidated) !Qcow2IntentPublished {
     const ctx = state.context;
     ctx.build_context.failed_stage = "qcow2-finalization-intent";
     try ctx.base();
+    try publishQcow2Intent(ctx);
+    return advance(state, Qcow2IntentPublished);
+}
+
+fn publishQcow2Intent(ctx: *Context) !void {
     const image = try packageImage(ctx);
     const raw = try field(image, "raw");
     const efi = try field(image, "efi");
@@ -602,7 +644,6 @@ pub fn qcow2Intent(state: RawLegacyValidated) !Qcow2IntentPublished {
         .expected_workload_bytes = try number(u64, try field(efi, "size")),
         .timeout_ms = 120_000, .limits = compute_limits,
     });
-    return advance(state, Qcow2IntentPublished);
 }
 
 fn packageProducer(ctx: *Context) ![]const u8 {
@@ -653,12 +694,15 @@ fn checkFinalize(ctx: *Context, value: Value) !void {
 
 pub fn finalize(state: Qcow2IntentPublished) !Qcow2Finalized {
     const ctx = state.context;
-    const observed = try runStage(ctx, .@"finalize-qcow2", false);
+    try recordFinalization(ctx, try runStage(ctx, .@"finalize-qcow2", false));
+    return advance(state, Qcow2Finalized);
+}
+
+fn recordFinalization(ctx: *Context, observed: Value) !void {
     try checkFinalize(ctx, observed);
     try sameJson(ctx.allocator(), observed, try ctx.readValue(try ctx.path("package/qcow2-finalization.json"), 64 * 1024, true));
     ctx.finalization = observed;
     try ctx.publish("qcow2-finalization.json", observed);
-    return advance(state, Qcow2Finalized);
 }
 
 pub fn qcow2X2(state: Qcow2Finalized) !Qcow2X2Validated {
@@ -673,8 +717,9 @@ pub fn qcow2Legacy(state: Qcow2X2Validated) !Qcow2LegacyValidated {
 fn collectedBoots(ctx: *Context, count: usize) !Value {
     var object = Value{ .object = .empty };
     for (profile.production_modes[0..count], 0..) |mode, i| {
+        const prior = ctx.boots[i] orelse return error.MissingBoot;
         const checked = try verifyMode(ctx, i);
-        if (ctx.boots[i]) |prior| try sameJson(ctx.allocator(), checked, prior) else return error.MissingBoot;
+        try sameJson(ctx.allocator(), checked, prior);
         try object.object.put(ctx.allocator(), @tagName(mode), checked);
     }
     return object;
@@ -698,6 +743,11 @@ pub fn acceptQcow2(state: Qcow2LegacyValidated) !Qcow2Accepted {
     const ctx = state.context;
     ctx.build_context.failed_stage = "qcow2-acceptance";
     try ctx.base();
+    try publishQcow2Acceptance(ctx);
+    return advance(state, Qcow2Accepted);
+}
+
+fn publishQcow2Acceptance(ctx: *Context) !void {
     try noDerived(ctx);
     try checkFinalize(ctx, ctx.finalization.?);
     const output = try field(ctx.finalization.?, "output");
@@ -721,7 +771,6 @@ pub fn acceptQcow2(state: Qcow2LegacyValidated) !Qcow2Accepted {
         .boot_inputs_sha256 = try ctx.hash("boot-inputs.json"),
     });
     ctx.acceptance = try ctx.readEvidence("qcow2-acceptance.json");
-    return advance(state, Qcow2Accepted);
 }
 
 pub fn proveAbsence(state: Qcow2Accepted) !DerivedVhdAbsenceProved {
@@ -733,6 +782,11 @@ pub fn proveAbsence(state: Qcow2Accepted) !DerivedVhdAbsenceProved {
 pub fn vhdIntent(state: DerivedVhdAbsenceProved) !VhdIntentPublished {
     const ctx = state.context;
     try ctx.base();
+    try publishVhdIntent(ctx);
+    return advance(state, VhdIntentPublished);
+}
+
+fn publishVhdIntent(ctx: *Context) !void {
     try noDerived(ctx);
     const accepted = try field(ctx.acceptance.?, "accepted_qcow2");
     try ctx.publish("fixed-vhd-derivation-intent.json", .{
@@ -744,12 +798,16 @@ pub fn vhdIntent(state: DerivedVhdAbsenceProved) !VhdIntentPublished {
         .expected_capacity_bytes = try number(u64, try field(accepted, "virtual_bytes")),
         .timeout_ms = 120_000, .limits = compute_limits,
     });
-    return advance(state, VhdIntentPublished);
 }
 
 pub fn vhdGate(state: VhdIntentPublished) !VhdGatePublished {
     const ctx = state.context;
     try ctx.base();
+    try publishVhdGate(ctx);
+    return advance(state, VhdGatePublished);
+}
+
+fn publishVhdGate(ctx: *Context) !void {
     try noDerived(ctx);
     try ctx.publish("fixed-vhd-derivation-gate.json", .{
         .schema = "uk.wamr.compute-fixed-vhd-derivation-gate",
@@ -760,7 +818,6 @@ pub fn vhdGate(state: VhdIntentPublished) !VhdGatePublished {
         .derivation_intent_sha256 = try ctx.hash("fixed-vhd-derivation-intent.json"),
         .derived_output_absent = true,
     });
-    return advance(state, VhdGatePublished);
 }
 
 fn checkDerivation(ctx: *Context, value: Value) !void {
@@ -821,12 +878,15 @@ fn checkDerivation(ctx: *Context, value: Value) !void {
 
 pub fn derive(state: VhdGatePublished) !VhdDerived {
     const ctx = state.context;
-    const observed = try runStage(ctx, .@"derive-fixed-vhd", false);
+    try recordDerivation(ctx, try runStage(ctx, .@"derive-fixed-vhd", false));
+    return advance(state, VhdDerived);
+}
+
+fn recordDerivation(ctx: *Context, observed: Value) !void {
     try checkDerivation(ctx, observed);
     try sameJson(ctx.allocator(), observed, try ctx.readValue(try ctx.path("package/fixed-vhd-derivation.json"), 64 * 1024, true));
     ctx.derivation = observed;
     try ctx.publish("fixed-vhd-derivation.json", observed);
-    return advance(state, VhdDerived);
 }
 
 pub fn vpcX2(state: VhdDerived) !VpcX2Validated {
@@ -849,6 +909,11 @@ pub fn finalInspection(state: PackageInspected) !FinalInspectionPublished {
     const ctx = state.context;
     ctx.build_context.failed_stage = "boot-final-inspection";
     try ctx.base();
+    try ctx.publish("final-inspection.json", try inspectArtifacts(ctx));
+    return advance(state, FinalInspectionPublished);
+}
+
+fn inspectArtifacts(ctx: *Context) !Value {
     try checkFinalize(ctx, try ctx.readEvidence("qcow2-finalization.json"));
     try checkDerivation(ctx, try ctx.readEvidence("fixed-vhd-derivation.json"));
     try sameJson(ctx.allocator(), ctx.acceptance.?, try ctx.readEvidence("qcow2-acceptance.json"));
@@ -883,19 +948,24 @@ pub fn finalInspection(state: PackageInspected) !FinalInspectionPublished {
     const source = ctx.build_context.source.?;
     var modes: [profile.production_modes.len][]const u8 = undefined;
     for (profile.production_modes, &modes) |mode, *entry| entry.* = @tagName(mode);
-    try ctx.publish("final-inspection.json", .{
+    return typed(ctx.allocator(), .{
         .schema = "uk.wamr.compute-image-chain-inspection", .schema_version = @as(u8, 1),
         .profile = "qcow2-derived-vhd", .status = "complete",
         .source = .{ .revision = source.revision, .tree = source.tree },
         .artifacts = artifacts, .records = pin_map, .modes = modes, .boots = boots,
     });
-    return advance(state, FinalInspectionPublished);
 }
 
 pub fn result(state: FinalInspectionPublished) !ResultPublished {
     const ctx = state.context;
     ctx.build_context.failed_stage = "boot-final-custody";
     try ctx.base();
+    try sameJson(ctx.allocator(), try ctx.readEvidence("final-inspection.json"), try inspectArtifacts(ctx));
+    return publishAcceptedResult(ctx);
+}
+
+fn publishAcceptedResult(ctx: *Context) !ResultPublished {
+    try ctx.requireExactEvidence();
     var map = Value{ .object = .empty };
     var iterator = ctx.pinned.iterator();
     while (iterator.next()) |record|
@@ -912,8 +982,79 @@ pub fn result(state: FinalInspectionPublished) !ResultPublished {
     });
     _ = try records.readResult(accepted);
     try ctx.publish("result.json", accepted);
-    return advance(state, ResultPublished);
+    return .{ .context = ctx };
 }
+
+pub const testing = if (builtin.is_test) struct {
+    pub fn publish(ctx: *Context, name: []const u8, value: Value) !void {
+        return ctx.publish(name, value);
+    }
+
+    pub fn recordPackageResult(ctx: *Context, value: Value) !void {
+        return recordPackage(ctx, value);
+    }
+
+    pub fn config(ctx: *Context, index: usize) !Value {
+        return modeConfig(ctx, profile.production_modes[index]);
+    }
+
+    pub fn pin(ctx: *Context, path_name: []const u8) !Value {
+        return pinFor(ctx, path_name);
+    }
+
+    pub fn recordBoot(ctx: *Context, index: usize, compute: Value) !void {
+        return publishCheckedMode(ctx, index, try checkBoot(ctx, index), compute);
+    }
+
+    pub fn qcow2Intent(ctx: *Context) !void {
+        return publishQcow2Intent(ctx);
+    }
+
+    pub fn qcow2Finalization(ctx: *Context, value: Value) !void {
+        return recordFinalization(ctx, value);
+    }
+
+    pub fn qcow2Acceptance(ctx: *Context) !void {
+        return publishQcow2Acceptance(ctx);
+    }
+
+    pub fn vhdIntent(ctx: *Context) !void {
+        return publishVhdIntent(ctx);
+    }
+
+    pub fn vhdGate(ctx: *Context) !void {
+        return publishVhdGate(ctx);
+    }
+
+    pub fn vhdDerivation(ctx: *Context, value: Value) !void {
+        return recordDerivation(ctx, value);
+    }
+
+    pub fn inspect(ctx: *Context) !void {
+        return ctx.publish("final-inspection.json", try inspectArtifacts(ctx));
+    }
+
+    pub fn resultAfterInspection(ctx: *Context) !ResultPublished {
+        try sameJson(ctx.allocator(), try ctx.readEvidence("final-inspection.json"), try inspectArtifacts(ctx));
+        return publishAcceptedResult(ctx);
+    }
+
+    pub fn checkExactEvidence(ctx: *Context) !void {
+        return ctx.requireExactEvidence();
+    }
+
+    pub fn publishResult(ctx: *Context) !ResultPublished {
+        return publishAcceptedResult(ctx);
+    }
+
+    pub fn publishCompute(ctx: *Context, index: usize, evidence: Value) !void {
+        return publishMode(ctx, index, evidence);
+    }
+
+    pub fn checkModeImage(ctx: *Context, index: usize) !void {
+        return requireModeImage(ctx, index);
+    }
+} else struct {};
 
 pub fn run(context: *Context) !ResultPublished {
     const bound = try bindInputs(try admit(context));

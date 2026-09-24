@@ -236,16 +236,34 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&cli_tests.step);
     const options = b.addOptions();
     options.addOptionPath("cli", cli.getEmittedBin());
+    options.addOptionPath("validator_cli", log_cli.getEmittedBin());
     options.addOption(
         ?[]const u8,
         "test_root",
         b.option([]const u8, "test-root", "Existing absolute private compute fixture directory"),
     );
+    const proof_closure = b.createModule(.{
+        .root_source_file = b.path("../../controller_source_closure.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const proof_controller = b.createModule(.{
+        .root_source_file = b.path("controller/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = image.import_table.get("hyperv_core").? },
+            .{ .name = "controller_source_closure", .module = proof_closure },
+        },
+    });
     const pipeline_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pipeline_tests.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "public_image", .module = image }},
+        .imports = &.{
+            .{ .name = "public_image", .module = image },
+            .{ .name = "wamr_controller", .module = proof_controller },
+        },
     }) });
     pipeline_tests.root_module.addOptions("test_options", options);
     const pipeline_run = b.addRunArtifact(pipeline_tests);

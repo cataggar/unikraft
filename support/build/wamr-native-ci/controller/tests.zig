@@ -233,6 +233,109 @@ test "native diagnostics retain only bounded allowlisted observations and never 
     try std.testing.expectError(error.FileNotFound, evidence.openFile(io, "result.json", .{}));
 }
 
+test "result refuses unpinned evidence files and directories before publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "result-evidence-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("result evidence fixture cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "evidence", .fromMode(0o700));
+    const evidence = try root.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    try writeFixtureFile(io, evidence, "build.json", "{}\n");
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var base: controller.build_pipeline.Context = .{
+        .allocator = arena.allocator(), .io = io, .environ = undefined, .runtime = path,
+        .repository = options.repository_root, .wamr = "", .compute = path,
+        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+    };
+    var ctx: controller.boot_pipeline.Context = .{
+        .build_context = &base,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(arena.allocator()),
+    };
+    defer ctx.pinned.deinit();
+    const build_path = try std.fs.path.join(a, &.{ path, "evidence", "build.json" });
+    defer a.free(build_path);
+    try ctx.pinned.put("build.json", try controller.custody_files.readFile(io, build_path, 4096, true));
+    try controller.boot_pipeline.testing.checkExactEvidence(&ctx);
+
+    try writeFixtureFile(io, evidence, "unlisted.json", "{}\n");
+    try std.testing.expectError(error.UnexpectedEvidence, controller.boot_pipeline.testing.publishResult(&ctx));
+    try std.testing.expectError(error.FileNotFound, evidence.openFile(io, "result.json", .{}));
+    try evidence.deleteFile(io, "unlisted.json");
+    try evidence.createDir(io, "unlisted", .fromMode(0o700));
+    try std.testing.expectError(error.UnexpectedEvidence, controller.boot_pipeline.testing.publishResult(&ctx));
+    try std.testing.expectError(error.FileNotFound, evidence.openFile(io, "result.json", .{}));
+    try evidence.deleteDir(io, "unlisted");
+    try controller.boot_pipeline.testing.checkExactEvidence(&ctx);
+}
+
+test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "compute-image-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("compute image fixture cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "package", .fromMode(0o700));
+    try root.createDir(io, "evidence", .fromMode(0o700));
+    const package_dir = try root.openDir(io, "package", .{ .iterate = true });
+    defer package_dir.close(io);
+    const evidence_dir = try root.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence_dir.close(io);
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var base: controller.build_pipeline.Context = .{
+        .allocator = arena.allocator(), .io = io, .environ = undefined, .runtime = path,
+        .repository = options.repository_root, .wamr = "", .compute = path,
+        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+    };
+    var ctx: controller.boot_pipeline.Context = .{
+        .build_context = &base,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(arena.allocator()),
+    };
+    defer ctx.pinned.deinit();
+    const source = "original-image";
+    const hash = std.fmt.bytesToHex(controller.records.fileIdentity(source), .lower);
+    ctx.package = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        try std.fmt.allocPrint(arena.allocator(), "{{\"image\":{{\"raw\":{{\"sha256\":\"{s}\"}}}}}}", .{&hash}), .{});
+    const output = try std.fmt.allocPrint(arena.allocator(), "{{\"output\":{{\"sha256\":\"{s}\"}}}}", .{&hash});
+    ctx.finalization = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
+    ctx.derivation = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
+    for ([_]usize{ 0, 2, 4 }, [_][]const u8{
+        "unikraft.raw", "unikraft.qcow2", "unikraft-derived.vhd",
+    }, [_][]const u8{
+        "raw-x2apic-compute.json", "qcow2-x2apic-compute.json", "vpc-x2apic-compute.json",
+    }) |index, filename, record_name| {
+        try writeFixtureFile(io, package_dir, filename, source);
+        try controller.boot_pipeline.testing.checkModeImage(&ctx, index);
+        const image = try package_dir.openFile(io, filename, .{ .mode = .read_write, .follow_symlinks = false });
+        try image.writePositionalAll(io, "changed--image", 0);
+        image.close(io);
+        try std.testing.expectError(error.ArtifactChanged,
+            controller.boot_pipeline.testing.publishCompute(&ctx, index, .null));
+        try std.testing.expectError(error.FileNotFound, evidence_dir.openFile(io, record_name, .{}));
+    }
+}
+
 test "transport encoder preserves full 3 MiB and 8 MiB streams and refuses true excess" {
     const a = std.testing.allocator;
     const sizes = [_]struct { stdout: usize, stderr: usize }{

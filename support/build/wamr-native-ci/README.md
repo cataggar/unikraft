@@ -529,14 +529,32 @@ WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fix
 ```
 
 `test` is the protected aggregate and requires `-Dtest-root`; `test-pipeline`
-runs only the real conversion fixtures with the same requirement.
+runs the real conversion fixtures and two independently isolated private
+six-mode synthetic boot-proof fixtures with the same requirement.
 `test-unit` runs the package command boundary and native controller/fault
 fixtures; it does not run the real package conversion pipeline.
 
 The Zig fixtures additionally run real raw-to-native-zstd-QCOW2 and
 exact-QCOW2-to-fixed-VHD workers, reopen both artifacts, validate byte/content
 identity and exercise a hard-deadline refusal with rollback and typed
-supervision. The Python fixtures use the actual native packaging helper and pinned miz
+supervision. The six-mode fixture invokes the actual package and validator
+CLIs, uses the production boot report/image checks and acceptance gates over
+those real package bytes, then reopens all six reports and the final physical
+image chain. Only the native validator invocation uses the supervised adapter
+in these fixtures, with an empty request environment and private record. The
+16 public `command-*.json` records are explicitly synthetic fixture-only
+inputs, not attestations of supervised build/boot commands. One fixture
+publishes and parses a canonical `result.json` only after final inspection,
+checks all 33 earlier record hashes against physical file bytes, asserts no
+result self-hash, and checks exact physical directory membership.
+The other fixture independently mutates the last serial and the derived VHD
+after final inspection, requiring both to refuse before `result.json`.
+Both fixtures' local-boot request/report/serial inputs are expressly synthetic:
+they do not launch QEMU, prove KVM, or run the full build/source custody.
+An actual native six-guest success gate requires a separate fresh x86/KVM CI worktree
+and runtime with the pinned tools, archive, QEMU and firmware; the existing
+production Python job remains authoritative until its scheduled cutover.
+The Python fixtures use the actual native packaging helper and pinned miz
 with a synthetic **nonbootable** PE, plus synthetic compute/log records.
 They check full raw/QCOW2/VHD/footer hashes, physical reload,
 mutation/partial-state/replay refusal, exact results, the six CLI
