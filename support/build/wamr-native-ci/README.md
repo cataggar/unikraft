@@ -46,7 +46,11 @@ and the build gate verifies every required result. Each stream is capped at
 4 MiB; the independent native-result transport permits up to 12 MiB so the
 full allowed 8 MiB combined output is encoded without truncation. The
 `test-unit` adapter build target also runs `test-controller` in its isolated
-Zig cache, rather than silently omitting native controller fault fixtures;
+Zig cache, rather than silently omitting native controller fault fixtures.
+The protected x86 job exercises `test-controller` first in a separate clean
+worktree, keeping its test dependencies and cache outside the production
+source checkout; this reports fixture failures without exposing private
+supervised-command output.
 `python3 -m unittest support/build/wamr-native-ci/tests/source_custody_production_limits.py`
 remains the independent full-size source-boundary oracle until cutover.
 
