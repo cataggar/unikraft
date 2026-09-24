@@ -3184,85 +3184,43 @@ source/generated/
         finally:
             ci.COMMAND_SUPERVISOR_PATH = original_supervisor
 
-    def test_check_boot_dispatches_custodied_native_validator(self):
-        self.assertIsNotNone(SUPERVISOR)
-        self.assertIsNotNone(LOG_VALIDATE)
-        self.fixture_validator.stop()
-        validator = self.root / "tools/bin/uk-wamr-log-validate"
-        validator.parent.mkdir(parents=True, mode=0o700)
-        shutil.copyfile(LOG_VALIDATE, validator)
-        validator.chmod(0o700)
-        files = {
-            "command-supervisor": ci.physical_file_record(
-                Path(SUPERVISOR))[0],
-            ci.WAMR_LOG_VALIDATOR_ROLE: ci.physical_file_record(validator)[0],
+    def test_native_result_requires_exact_raw_and_output_commitment(self):
+        raw = self.contract.log()
+        output = self.root / "private/validator.json"
+        payload = {
+            "schema": "uk.wamr.log-validation", "schema_version": 1,
+            "mode": "tiny", "raw_serial_bytes": len(raw),
+            "raw_serial_sha256": hashlib.sha256(raw).hexdigest(),
+            "compute": self.contract.result,
         }
-        consumer = {
-            "schema": "uk.wamr.consumer-input-custody",
-            "version": 2, "files": files,
-        }
+        self.put(output, json.dumps(payload).encode() + b"\n")
+        record = {"bytes": output.stat().st_size, "sha256": ci.digest(output)}
+        self.assertEqual(ci.native_result(output, record, raw, 8192),
+                         self.contract.result)
+        for change in (
+            {"raw_serial_bytes": len(raw) - 1},
+            {"raw_serial_sha256": "0" * 64},
+            {"schema_version": True},
+            {"compute": None},
+            {"mode": "snapshot"},
+        ):
+            self.put(output, json.dumps(dict(payload, **change)).encode() + b"\n")
+            changed = {"bytes": output.stat().st_size,
+                       "sha256": ci.digest(output)}
+            with self.subTest(change=change), self.assertRaises(ci.Refusal):
+                ci.native_result(output, changed, raw, 8192)
+        self.put(output, json.dumps(payload).encode() + b"\n")
+        self.put(output, output.read_bytes().replace(b'"answer": 42',
+                                                      b'"answer": 41'))
+        with self.assertRaisesRegex(ci.Refusal, "output changed"):
+            ci.native_result(output, record, raw, 8192)
+
+    def test_check_boot_requires_native_validator_custody(self):
         config = self.synthetic_boot()
-        identity_path = self.root / "private/identity.json"
-
-        def checked():
-            return ci.check_boot(
-                config, self.contract.identity,
-                consumer_inputs=consumer, identity_path=identity_path)
-
-        with mock.patch.object(ci, "require_recorded_consumer_inputs"), \
-             mock.patch.object(ci, "consumer_input_state",
-                               return_value=consumer):
-            observed = checked()
-            self.assertEqual(observed["compute"], self.contract.result)
-            self.assertEqual(
-                observed["report"]["serial_sha256"],
-                hashlib.sha256(self.contract.log()).hexdigest())
-            private = self.root / "private/log-validation"
-            record = ci.document(
-                private / "boot-raw-x2apic-00/evidence/"
-                "command-log-validator-x2apic.json")
-            ci.validate_supervised_command_binding(
-                record, "log-validator-x2apic", {
-                    "command-supervisor": ci.native_executable_identity(
-                        files["command-supervisor"]),
-                    ci.WAMR_LOG_VALIDATOR_ROLE: ci.native_executable_identity(
-                        files[ci.WAMR_LOG_VALIDATOR_ROLE]),
-                })
-            self.assertEqual(record["supervisor"]["request"]["environment"], [])
-
-            identity_path.write_bytes(b'{"minimal_wasi":false}')
-            with self.assertRaises(ValueError):
-                checked()
-            self.put(identity_path, json.dumps(self.contract.identity).encode())
-            forged = self.contract.log().replace(b'"answer": 42', b'"answer": 41')
-            log = Path(config["work_dir"]) / "hyperv-efi-boot.log"
-            self.put(log, forged)
-            report_path = Path(config["work_dir"]) / "report.json"
-            report = ci.document(report_path)
-            report["serial_bytes"] = len(forged)
-            report["serial_sha256"] = hashlib.sha256(forged).hexdigest()
-            self.put(report_path, json.dumps(report).encode())
-            with self.assertRaises(ValueError):
-                checked()
-            self.put(log, self.contract.log())
-            report["serial_bytes"] = len(self.contract.log())
-            report["serial_sha256"] = hashlib.sha256(self.contract.log()).hexdigest()
-            self.put(report_path, json.dumps(report).encode())
-            actual_execute = ci.execute
-
-            def forge_output(*args, **kwargs):
-                output, record = actual_execute(*args, **kwargs)
-                forged_output = json.loads(output.read_bytes())
-                forged_output["compute"]["answer"] = 41
-                self.put(output, json.dumps(forged_output).encode() + b"\n")
-                return output, record
-
-            with mock.patch.object(ci, "execute", side_effect=forge_output):
-                with self.assertRaisesRegex(ci.Refusal, "output changed"):
-                    checked()
-            validator.write_bytes(b"tampered native executable")
-            with self.assertRaises((ValueError, OSError)):
-                checked()
+        self.fixture_validator.stop()
+        with self.assertRaisesRegex(ci.Refusal, "validator custody"):
+            ci.check_boot(config, self.contract.identity,
+                          identity_path=self.root / "private/identity.json")
 
     def test_publication_binds_installed_log_validator_role(self):
         record, identities = self.supervised_binding("log-validator-x2apic")

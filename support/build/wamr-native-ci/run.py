@@ -4695,6 +4695,29 @@ def check_build():
             "runtime": identity, "image": image}
 
 
+def native_result(output, record, raw, limit):
+    response = read(output, limit + 1)
+    require(record["sha256"] == hashlib.sha256(response).hexdigest()
+            and record["bytes"] == len(response)
+            and response.endswith(b"\n") and response.count(b"\n") == 1,
+            "native validator output changed")
+    observed = json.loads(response, object_pairs_hook=unique)
+    require(isinstance(observed, dict), "invalid native validator result")
+    require(set(observed) == {
+        "schema", "schema_version", "mode", "raw_serial_bytes",
+        "raw_serial_sha256", "compute",
+    } and observed["schema"] == "uk.wamr.log-validation"
+      and type(observed["schema_version"]) is int
+      and observed["schema_version"] == 1
+      and observed["mode"] == "tiny"
+      and type(observed["raw_serial_bytes"]) is int
+      and observed["raw_serial_bytes"] == len(raw)
+      and observed["raw_serial_sha256"] == hashlib.sha256(raw).hexdigest()
+      and isinstance(observed["compute"], dict),
+      "native validator result changed")
+    return observed["compute"]
+
+
 def native_compute(work, identity_path, identity, raw, legacy, consumer_inputs):
     require(consumer_inputs is not None, "native validator custody required")
     root = work.parent
@@ -4754,25 +4777,7 @@ def native_compute(work, identity_path, identity, raw, legacy, consumer_inputs):
             WAMR_LOG_VALIDATOR_ROLE: native_executable_identity(
                 executable_record),
         })
-    response = read(output, contract["output_limit"] + 1)
-    require(record["sha256"] == hashlib.sha256(response).hexdigest()
-            and record["bytes"] == len(response)
-            and response.endswith(b"\n") and response.count(b"\n") == 1,
-            "native validator output changed")
-    observed = json.loads(response, object_pairs_hook=unique)
-    require(isinstance(observed, dict), "invalid native validator result")
-    require(set(observed) == {
-        "schema", "schema_version", "mode", "raw_serial_bytes",
-        "raw_serial_sha256", "compute",
-    } and observed["schema"] == "uk.wamr.log-validation"
-      and type(observed["schema_version"]) is int
-      and observed["schema_version"] == 1
-      and observed["mode"] == "tiny"
-      and type(observed["raw_serial_bytes"]) is int
-      and observed["raw_serial_bytes"] == len(raw)
-      and observed["raw_serial_sha256"] == hashlib.sha256(raw).hexdigest()
-      and isinstance(observed["compute"], dict),
-      "native validator result changed")
+    compute = native_result(output, record, raw, contract["output_limit"])
     require(consumer_input_state(root.parent, expected=consumer_inputs)
             == consumer_inputs, "native validator tool changed")
     require(serial_record == physical_file_record(log)[0]
@@ -4780,7 +4785,7 @@ def native_compute(work, identity_path, identity, raw, legacy, consumer_inputs):
             and identity == document(identity_path)
             and raw == read(log, 4 * MIB),
             "native validator input changed")
-    return observed["compute"]
+    return compute
 
 
 def config_for(runtime, root, index, modes=MODES):
