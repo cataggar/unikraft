@@ -1,0 +1,1272 @@
+# SPDX-License-Identifier: BSD-3-Clause
+"""Unpublished Python/native differential oracle; synthetic fixtures are not KVM evidence.
+
+Local: python3 tests/test_differential_parity.py local
+Protected x86: python3 tests/test_differential_parity.py full --help
+The full runner needs TWO unused, clean Git worktrees, real pinned WAMR, a
+pre-acquired runtime template, and an independently built portable controller.
+It never substitutes a fixture for a missing production dependency.
+"""
+import argparse
+import copy
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import unittest
+
+
+HERE = Path(__file__).resolve().parent
+PROJECT = HERE.parents[3]
+CONTROLLER = HERE.parent
+FIXTURES = HERE / "fixtures" / "differential"
+MODES = (
+    "raw-x2apic", "raw-legacy-apic", "qcow2-x2apic", "qcow2-legacy-apic",
+    "vpc-x2apic", "vpc-legacy-apic",
+)
+BUILD = (
+    "command-adapter.json", "command-local-boot-tool.json",
+    "build-start.json", "command-fixtures.json", "command-prepare.json",
+    "command-config.json", "command-native-image.json", "build.json",
+)
+BOOT = (
+    "boot-inputs.json", "command-package.json", "package.json",
+    "command-raw-x2apic.json", "raw-x2apic-compute.json",
+    "command-raw-legacy-apic.json", "raw-legacy-apic-compute.json",
+    "qcow2-finalization-intent.json", "command-finalize-qcow2.json",
+    "qcow2-finalization.json", "command-qcow2-x2apic.json",
+    "qcow2-x2apic-compute.json", "command-qcow2-legacy-apic.json",
+    "qcow2-legacy-apic-compute.json", "qcow2-acceptance.json",
+    "fixed-vhd-derivation-intent.json", "fixed-vhd-derivation-gate.json",
+    "command-derive-fixed-vhd.json", "fixed-vhd-derivation.json",
+    "command-vpc-x2apic.json", "vpc-x2apic-compute.json",
+    "command-vpc-legacy-apic.json", "vpc-legacy-apic-compute.json",
+    "command-inspect.json", "final-inspection.json", "result.json",
+)
+ORDER = BUILD + BOOT
+HEX = re.compile(r"[0-9a-f]{64}\Z")
+MAX_RECORD = 4 * 1024 * 1024
+FROZEN_HOST_TOOLS = (
+    "git", "python3", "bash", "dash", "cp", "env", "mkdir", "readlink",
+    "uname", "zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
+    "llvm-readelf", "llvm-strip", "bison", "flex", "m4",
+)
+
+
+class ParityError(AssertionError):
+    pass
+
+
+def check(condition, reason):
+    if not condition:
+        raise ParityError(reason)
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def oracle(repository=PROJECT):
+    source = repository / "support/build/wamr-native-ci/run.py"
+    spec = importlib.util.spec_from_file_location("wamr_ci_differential", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def private(path, *, empty=False):
+    check(path.is_absolute() and path.resolve(strict=True) == path,
+          "absolute canonical private path required")
+    info = path.lstat()
+    check(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+          and stat.S_IMODE(info.st_mode) == 0o700, "owner-only 0700 root required")
+    if empty:
+        check(not any(path.iterdir()), "fresh empty root required")
+    return path
+
+
+def fresh(parent, name):
+    private(parent)
+    child = parent / name
+    check(not child.exists() and not child.is_symlink(), "prior output refused")
+    child.mkdir(mode=0o700)
+    return private(child, empty=True)
+
+
+def fixture_parent():
+    selected = os.environ.get("TMPDIR")
+    if selected:
+        candidate = Path(selected)
+        if (candidate.is_absolute() and candidate.name in ("scratch", "private")
+                and "compute" in candidate.parts and candidate.exists()
+                and candidate.parts[:2] != ("/", "tmp")
+                and candidate.parts[:3] != ("/", "var", "tmp")):
+            return private(candidate)
+    scratch = PROJECT / ".d"
+    if not scratch.exists():
+        scratch.mkdir(mode=0o700)
+    return private(scratch)
+
+
+def checked_file(path, limit=MAX_RECORD):
+    before = path.lstat()
+    check(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+          and stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1
+          and before.st_size <= limit, "unsafe evidence file")
+    with path.open("rb") as stream:
+        raw = stream.read(limit + 1)
+    after = path.lstat()
+    stable = lambda info: (
+        info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+        info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    check(len(raw) == before.st_size and stable(after) == stable(before),
+          "evidence file changed")
+    return raw
+
+
+def parsed(raw, reference):
+    check(len(raw) <= MAX_RECORD, "oversized record")
+    value = json.loads(raw, object_pairs_hook=reference.unique,
+                       parse_constant=lambda token: (_ for _ in ()).throw(
+                           ParityError("nonfinite JSON constant")))
+    check(raw == reference.compact_json(value, newline=True),
+          "noncanonical record bytes")
+    return value
+
+
+def category(result):
+    stderr = result.stderr.decode("utf-8", "replace")
+    if result.returncode == 0:
+        return "success"
+    if result.returncode == 2 and ("usage:" in stderr or "error:" in stderr):
+        return "usage"
+    if "WAMR_CI_REFUSED:" in stderr:
+        return "refused"
+    match = re.search(r"WAMR_CI_FAILED_STAGE: ([a-z0-9-]+);", stderr)
+    if match:
+        return "failed_stage:" + match.group(1)
+    return "unclassified_failure"
+
+
+def run(argv, repository, environment=None, seconds=1900):
+    try:
+        return subprocess.run(argv, cwd=repository, env=environment,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=seconds, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ParityError("controller exceeded outer timeout") from exc
+
+
+def command(argv, repository, environment=None, seconds=1900):
+    result = run(argv, repository, environment, seconds)
+    check(len(result.stdout) <= 1024 * 1024 and len(result.stderr) <= 1024 * 1024,
+          "unbounded diagnostic stream")
+    return result
+
+
+def identity(path):
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+
+def phase_snapshot(runtime, reference):
+    compute = runtime / "compute"
+    if not compute.exists():
+        return {"order": (), "records": {}, "retained": {}, "artifacts": {}}
+    evidence = compute / "evidence"
+    records = {}
+    publications = []
+    if evidence.exists():
+        private(evidence)
+        for path in evidence.iterdir():
+            check(path.name in ORDER or path.name == "diagnostics.json",
+                  "unlisted evidence: " + path.name)
+            raw = checked_file(path)
+            records[path.name] = (raw, parsed(raw, reference))
+            publications.append((path.stat().st_mtime_ns, path.name))
+    publications.sort()
+    check(all(left[0] != right[0] for left, right in
+              zip(publications, publications[1:])),
+          "ambiguous evidence publication order")
+    ordered = tuple(name for _, name in publications)
+    check(tuple(sorted(ordered, key=lambda name: ORDER.index(name)
+                      if name in ORDER else len(ORDER))) == ordered,
+          "evidence phase order changed")
+    if "result.json" in records:
+        result = records["result.json"][1]
+        check(ordered[-1] == "result.json"
+              and result.get("records", {}).keys()
+              == records.keys() - {"result.json"},
+              "result not last or unexpected evidence membership")
+        for name, digest in result["records"].items():
+            check(digest == sha(records[name][0]), "result evidence hash changed")
+    for name, (_, record) in records.items():
+        if not name.startswith("command-"):
+            continue
+        stage = name[len("command-"):-len(".json")]
+        log = checked_file(compute / "private" / (stage + ".log"), 8 * 1024 * 1024)
+        check(record["scope"] == "command_diagnostic_not_acceptance"
+              and record["stage"] == stage and record["bytes"] == len(log)
+              and record["sha256"] == sha(log)
+              and record["known_error_markers"] == reference.command_error_markers(log)
+              and record["sha256_scope"] == reference.command_digest_scope(len(log)),
+              "command log binding changed: " + name)
+        supervisor = record["supervisor"]
+        request, result = supervisor["request"], supervisor["result"]
+        digest_fields = ("canonical_sha256", "argv_sha256",
+                         "environment_sha256", "cwd_sha256")
+        request_core = {key: value for key, value in request.items()
+                        if key not in digest_fields}
+        for field, payload in (
+                ("canonical_sha256", request_core),
+                ("argv_sha256", request["argv"]),
+                ("environment_sha256", request["environment"]),
+                ("cwd_sha256", request["cwd"])):
+            check(request[field] == reference.command_binding_digest(payload),
+                  "command request hash changed: " + name)
+        result_core = {key: value for key, value in result.items()
+                       if key != "canonical_sha256"}
+        check(result["canonical_sha256"] == reference.command_binding_digest(result_core)
+              and result["request_canonical_sha256"] == request["canonical_sha256"],
+              "command result hash changed: " + name)
+        output = result["command"]["output"]
+        stdout, stderr = result["command"]["stdout"], result["command"]["stderr"]
+        check(output["bytes"] == stdout["bytes"] + stderr["bytes"]
+              and output["commitment_sha256"] == reference.command_output_commitment(
+                  stdout["bytes"], stdout["sha256"],
+                  stderr["bytes"], stderr["sha256"]),
+              "command output commitment changed: " + name)
+        if not record["over_limit"]:
+            check(output["combined_sha256"] == sha(log),
+                  "command output bytes changed: " + name)
+        check(result["command"]["cleanup_complete"]
+              and not result["command"]["poisoned"],
+              "incomplete command cleanup: " + name)
+        event = result["command"]
+        minima = reference.COMMAND_CONTRACT
+        if event["cleanup"] == "not_required":
+            check(event["primary_events"] == event["cleanup_events"] ==
+                  event["reap_events"] == event["descendants"]["observed"] == 0,
+                  "unexpected no-child cleanup events: " + name)
+        else:
+            check(event["cleanup"] == "complete",
+                  "incomplete command cleanup: " + name)
+            if event["primary_events"] == 0:
+                minimum_cleanup = minima["pre_release_cleanup_events_min"]
+            else:
+                check(event["primary_events"] >= minima["complete_primary_events_min"],
+                      "too few primary events: " + name)
+                minimum_cleanup = minima["complete_cleanup_events_min"]
+            check(event["cleanup_events"] >= minimum_cleanup
+                  and event["reap_events"] == event["descendants"]["observed"] + 2,
+                  "incomplete command events: " + name)
+        timing = result["command"]["timing"]
+        started, primary, completed = (
+            timing["started_ns"], timing["primary_completed_ns"],
+            timing["completed_ns"])
+        deadline = request["primary_deadline_ns"]
+        check(request["primary_deadline_ns"] == request["issued_ns"] +
+              request["timeout_ns"]
+              and request["cleanup_deadline_ns"] == deadline +
+              reference.COMMAND_CLEANUP_SECONDS * 1_000_000_000
+              and started <= primary <= completed
+              and (primary >= deadline) == (
+                  result["command"]["primary"]["kind"] == "timeout")
+              and timing["primary_elapsed_ns"] == primary - started
+              and timing["cleanup_elapsed_ns"] == completed - primary
+              and timing["total_elapsed_ns"] == completed - started,
+              "command deadline relationship changed: " + name)
+    retained = {}
+    for slot in ("private", "fixtures", "package", "public-source",
+                 *(f"boot-{mode}" for mode in MODES)):
+        directory = compute / slot
+        if not directory.exists():
+            continue
+        private(directory)
+        for path in directory.rglob("*"):
+            check(len(retained) < 10000, "retained output entry limit exceeded")
+            info = path.lstat()
+            check(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode),
+                  "retained output is not an ordinary file or directory")
+            relative = path.relative_to(compute).as_posix()
+            retained[relative] = (
+                "directory" if stat.S_ISDIR(info.st_mode) else "file",
+                stat.S_IMODE(info.st_mode),
+                None if stat.S_ISDIR(info.st_mode) else info.st_size,
+            )
+    artifacts = {}
+    for label, path in {
+        "config": reference.APP / ".config",
+        "efi": reference.APP / "build" / reference.EFI,
+        "raw": compute / "package/unikraft.raw",
+        "qcow2": compute / "package/unikraft.qcow2",
+        "vhd": compute / "package/unikraft-derived.vhd",
+    }.items():
+        if path.exists():
+            check(path.is_file() and not path.is_symlink(), "unsafe artifact")
+            artifacts[label] = (path.stat().st_size, identity(path),
+                                stat.S_IMODE(path.stat().st_mode))
+    return {"order": ordered, "records": records, "retained": retained,
+            "artifacts": artifacts}
+
+
+class Normalizer:
+    """Normalize only documented physical metadata and path roots, not content."""
+
+    def __init__(self, roots):
+        self.roots = tuple(str(p) for p in roots)
+        self.seen = {}
+
+    def token(self, kind, value):
+        check(type(value) is int, "nondeterministic field not an integer")
+        names = self.seen.setdefault(kind, {})
+        if value not in names:
+            names[value] = f"<{kind}:{len(names)}>"
+        return names[value]
+
+    def normalize(self, value, key="", path=()):
+        if isinstance(value, dict):
+            normalized = {name: self.normalize(item, name, (*path, name)) for name, item
+                    in sorted(value.items())}
+            if "device_major" in value and "device_minor" in value:
+                check(type(value["device_major"]) is int and
+                      type(value["device_minor"]) is int, "invalid device identity")
+                normalized["device_major"] = self.token(
+                    "device", os.makedev(value["device_major"], value["device_minor"]))
+                normalized["device_minor"] = "<device-minor-component>"
+            for prefix in ("mtime", "ctime"):
+                seconds, nanos = prefix + "_seconds", prefix + "_nanoseconds"
+                if seconds in value and nanos in value:
+                    check(type(value[seconds]) is int and type(value[nanos]) is int
+                          and 0 <= value[nanos] < 1_000_000_000,
+                          "invalid physical timestamp")
+                    normalized[seconds] = self.token(
+                        prefix, value[seconds] * 1_000_000_000 + value[nanos])
+                    normalized[nanos] = "<nanoseconds-component>"
+            if "physical_closure_sha256" in value and key in (
+                    "source_map", "runtime_map"):
+                domain = "uk.wamr.command-supervisor-" + (
+                    "source" if key == "source_map" else "runtime") + "-v1"
+                expected = oracle().guarded_record_map(domain, value["records"])
+                check(expected == value, "invalid physical closure recipe")
+                normalized["physical_closure_sha256"] = "<verified-physical-closure>"
+            return normalized
+        if isinstance(value, list):
+            if key == "metadata" and len(value) == 9 and all(
+                    type(item) is int for item in value):
+                return [
+                    self.token("device", value[0]),
+                    self.token("inode", value[1]),
+                    *value[2:7],
+                    self.token("mtime", value[7]),
+                    self.token("ctime", value[8]),
+                ]
+            return [self.normalize(item, key, path) for item in value]
+        if key in ("issued_ns", "started_ns", "primary_completed_ns",
+                   "completed_ns", "primary_deadline_ns", "cleanup_deadline_ns"
+                   ) and ("timing" in path or "request" in path):
+            return self.token("monotonic-ns", value)
+        if key in ("primary_elapsed_ns", "cleanup_elapsed_ns", "total_elapsed_ns"
+                   ) and "timing" in path:
+            check(type(value) is int and value >= 0, "invalid elapsed time")
+            return "<elapsed-positive>" if value else "<elapsed-zero>"
+        if key in ("primary_events", "cleanup_events") and "command" in path:
+            check(type(value) is int and value >= 0, "invalid event count")
+            return "<event-positive>" if value else "<event-zero>"
+        if key in ("pid", "parent_pid") and "command" in path:
+            return self.token("pid", value)
+        for field in ("inode", "device_major", "device_minor",
+                      "mtime_seconds", "mtime_nanoseconds",
+                      "ctime_seconds", "ctime_nanoseconds"):
+            if key == field:
+                return self.token(field, value)
+        if isinstance(value, str) and key not in (
+                "argv", "environment", "value", "relative", "stage",
+                "mode", "profile", "schema", "sha256", "content_sha256"):
+            for index, prefix in sorted(enumerate(self.roots),
+                                        key=lambda entry: len(entry[1]),
+                                        reverse=True):
+                if value == prefix or value.startswith(prefix + "/"):
+                    return f"<root:{index}>" + value[len(prefix):]
+        return value
+
+
+def native_fixture_contract(reference):
+    check(tuple(reference.HOST_TOOLS) == FROZEN_HOST_TOOLS,
+          "fixtures native reviewed host-tool set changed")
+    path = reference.command_path
+    literal = reference.command_literal
+    environment = {
+        "HOME": path("work", "private"),
+        "LANG": literal("C"),
+        "LC_ALL": literal("C"),
+        "PATH": literal("/usr/bin:/bin"),
+        "PYTHONDONTWRITEBYTECODE": literal("1"),
+        "TMPDIR": path("work", "scratch"),
+        "WAMR_CI_GIT": path("tool:git"),
+        "WAMR_CI_SUPERVISOR": path("command-supervisor"),
+        "BISON_PKGDATADIR": path("runtime", "bison"),
+        "KCONFIG_CONFIG": path("source", "support/apps/wamr-aot/build/.config"),
+        "KCONFIG_OVERWRITECONFIG": literal("1"),
+        "M4": path("tool:m4"),
+        "MAKEFLAGS": literal("-j2"),
+        "ZIG_GLOBAL_CACHE_DIR": path("work", "global-cache"),
+        "ZIG_LIB_DIR": path("tool-tree:zig", "lib"),
+        "ZIG_LOCAL_CACHE_DIR": path("work", "cache"),
+        "WAMR_CI_PACKAGE": path("work", "tools/bin/wamr-ci-package"),
+        "WAMR_CI_PYTHON": path("tool:python3"),
+        "WAMR_CI_LOG_VALIDATE": path("native:wamr-log-validate"),
+        "WAMR_CI_SUPERVISOR_FIXTURE":
+            path("work", "tools/bin/wamr-ci-supervisor-fixture"),
+    }
+    for name in FROZEN_HOST_TOOLS:
+        environment["WAMR_CI_TOOL_" + name.upper().replace("-", "_")] = (
+            path("tool:" + name))
+    retained = {
+        "M4", "WAMR_CI_GIT", "WAMR_CI_SUPERVISOR", "WAMR_CI_PYTHON",
+        "WAMR_CI_LOG_VALIDATE",
+        *("WAMR_CI_TOOL_" + name.upper().replace("-", "_")
+          for name in FROZEN_HOST_TOOLS),
+    }
+    executable = path("native:wamr-native-ci-fixtures")
+    return {
+        "kind": "build-fixtures",
+        "seconds": 600,
+        "output_limit": 8 * 1024 * 1024,
+        "command_executable": executable,
+        "native_executable": executable,
+        "interpreter": None,
+        "argv": [
+            executable, literal("--fixture-root"), path("work", "fixtures"),
+        ],
+        "environment": [
+            {"name": name, "value": environment[name]}
+            for name in sorted(environment)
+        ],
+        "retained_names": sorted(retained),
+        "cwd": path("source"),
+        "limits": {
+            "cleanup_events": 1_000_000,
+            "descendants": 64,
+            "primary_events": 1_000_000,
+            "proc_entries_per_scan": 262_144,
+            "reap_events": 512,
+            "stderr_bytes": 4 * 1024 * 1024,
+            "stdout_bytes": 4 * 1024 * 1024,
+            "term_grace_ms": 1000,
+        },
+    }
+
+
+def fixture_stage(record, log, side, reference, seen=None):
+    check(side in ("python", "native"), "unknown fixtures-stage side")
+    contract = (reference.production_command_contract("fixtures")
+                if side == "python" else native_fixture_contract(reference))
+    check(record["scope"] == "command_diagnostic_not_acceptance"
+          and record["stage"] == "fixtures", "fixtures stage/scope changed")
+    check(record["exit_code"] == 0 and record["over_limit"] is False
+          and record["known_error_markers"] == [],
+          "fixtures stage outcome changed")
+    check(record["bytes"] == len(log) and record["sha256"] == sha(log)
+          and record["sha256_scope"] == reference.command_digest_scope(len(log)),
+          "fixtures private log hash/size changed")
+    request = record["supervisor"]["request"]
+    for field in ("argv", "environment", "cwd"):
+        check(request[field] == contract[field],
+              f"fixtures {side} {field} changed")
+    for field in ("command_executable", "native_executable"):
+        check(request[field]["path"] == contract[field],
+              f"fixtures {side} {field} role changed")
+    check((request["interpreter"] is None if contract["interpreter"] is None
+           else request["interpreter"]["path"] == contract["interpreter"]),
+          f"fixtures {side} interpreter changed")
+    check(request["stage"] == "fixtures"
+          and request["supervisor"]["path"] == reference.command_path(
+              "command-supervisor")
+          and request["timeout_ns"] == contract["seconds"] * 1_000_000_000
+          and request["limits"] == contract["limits"],
+          f"fixtures {side} stage/deadline/limits changed")
+    check([item["name"] for item in request["retained_executables"]]
+          == contract["retained_names"],
+          f"fixtures {side} retained executable roles changed")
+    command_result = record["supervisor"]["result"]["command"]
+    stdout, stderr = command_result["stdout"], command_result["stderr"]
+    check(command_result["output"]["commitment_sha256"] ==
+          reference.command_output_commitment(
+              stdout["bytes"], stdout["sha256"],
+              stderr["bytes"], stderr["sha256"]),
+          f"fixtures {side} output commitment changed")
+    check(command_result["output"]["bytes"] == len(log)
+          and command_result["output"]["combined_sha256"] == sha(log)
+          and command_result["cleanup"] == "complete"
+          and command_result["cleanup_complete"] is True
+          and command_result["poisoned"] is False,
+          f"fixtures {side} output/cleanup changed")
+    role_identities = None
+    if seen is not None:
+        runtime = seen["roots"][0]
+        baseline = seen["files"]["records"]["build-start.json"][1]
+        pinned = baseline["consumer_inputs"]["files"]
+        roles = (
+            request["supervisor"], request["native_executable"],
+            request["command_executable"],
+            *(() if request["interpreter"] is None else (request["interpreter"],)),
+            *request["retained_executables"],
+        )
+        role_identities = {}
+        for binding in roles:
+            role = binding["path"]["role"]
+            check(role in pinned, f"fixtures {side} missing pinned role: {role}")
+            captured = pinned[role]
+            physical, _ = reference.physical_file_record(Path(captured["path"]))
+            check(physical == captured
+                  and binding["identity"] ==
+                  reference.native_executable_identity(captured),
+                  f"fixtures {side} executable identity changed: {role}")
+            role_identities[role] = binding["identity"]
+        supervisor_path = (runtime / "compute/supervisor/bin/wamr-ci-supervisor"
+                           if side == "python" else
+                           runtime / "controller/bin/uk-wamr-native-ci")
+        check(pinned["command-supervisor"]["path"] == str(supervisor_path),
+              f"fixtures {side} supervisor location changed")
+        if side == "native":
+            check(pinned["native:wamr-native-ci-fixtures"]["path"] ==
+                  str(runtime / "compute/tools/bin/wamr-native-ci-fixtures"),
+                  "fixtures native executable location changed")
+    try:
+        if side == "python":
+            reference.validate_supervised_command_binding(
+                record, "fixtures", role_identities)
+        else:
+            original = reference.production_command_contract
+            reference.production_command_contract = (
+                lambda stage, profile=reference.CURRENT_PROFILE:
+                contract if stage == "fixtures" else original(stage, profile))
+            try:
+                reference.validate_supervised_command_binding(
+                    record, "fixtures", role_identities)
+            finally:
+                reference.production_command_contract = original
+    except reference.Refusal as error:
+        raise ParityError(
+            f"fixtures {side} supervised binding refused: {error}") from error
+    return {
+        "scope": record["scope"],
+        "stage": record["stage"],
+        "exit_code": record["exit_code"],
+        "over_limit": record["over_limit"],
+        "known_error_markers": record["known_error_markers"],
+        "primary": command_result["primary"],
+        "termination": command_result["termination"],
+        "cleanup": command_result["cleanup"],
+        "cleanup_complete": command_result["cleanup_complete"],
+        "poisoned": command_result["poisoned"],
+        "stdout_status": stdout["status"],
+        "stderr_status": stderr["status"],
+        "primary_deadline_reached": command_result["primary_deadline_reached"],
+        "cancellation_observed": command_result["cancellation_observed"],
+    }
+
+
+def compare_observations(left, right, fixtures_stage_compat=False):
+    failures = []
+    for key in ("returncode",):
+        if getattr(left["exit"], key) != getattr(right["exit"], key):
+            failures.append(key)
+    if category(left["exit"]) != category(right["exit"]):
+        failures.append("refusal_category")
+    compatible_fixture = (
+        fixtures_stage_compat
+        and "command-fixtures.json" in left["files"]["records"]
+        and "command-fixtures.json" in right["files"]["records"]
+    )
+    for key in ("order", "retained", "artifacts"):
+        left_value, right_value = left["files"][key], right["files"][key]
+        if key == "retained" and compatible_fixture:
+            def verified_log_slot(side):
+                entries = dict(side["files"]["retained"])
+                name = "private/fixtures.log"
+                check(name in entries and entries[name][:2] == ("file", 0o600)
+                      and entries[name][2] == len(side["files"]["fixtures_log"]),
+                      "fixtures private log slot changed")
+                entries[name] = ("file", 0o600, "<verified-fixtures-log-size>")
+                return entries
+            left_value, right_value = verified_log_slot(left), verified_log_slot(right)
+        if left_value != right_value:
+            failures.append(key)
+    l_records, r_records = left["files"]["records"], right["files"]["records"]
+    if l_records.keys() != r_records.keys():
+        failures.append("evidence_membership")
+    left_normalizer, right_normalizer = Normalizer(left["roots"]), Normalizer(right["roots"])
+    for name in (record for record in ORDER if record in l_records and record in r_records):
+        if name == "command-fixtures.json" and compatible_fixture:
+            python = fixture_stage(
+                l_records[name][1], left["files"]["fixtures_log"], "python",
+                left["reference"], left)
+            native = fixture_stage(
+                r_records[name][1], right["files"]["fixtures_log"], "native",
+                right["reference"], right)
+            for field in python:
+                if python[field] != native[field]:
+                    failures.append("fixture_outcome:" + field)
+            continue
+        a, b = l_records[name], r_records[name]
+        a_value, b_value = a[1], b[1]
+        if name == "result.json":
+            a_value = dict(a_value, records={record: "<verified-file-sha256>"
+                                             for record in a_value["records"]})
+            b_value = dict(b_value, records={record: "<verified-file-sha256>"
+                                             for record in b_value["records"]})
+        if left_normalizer.normalize(a_value) != right_normalizer.normalize(b_value):
+            failures.append("record_content:" + name)
+        if a[0] != b[0] and a[1] == b[1]:
+            failures.append("record_bytes:" + name)
+    return failures
+
+
+def observed(result, runtime, repository):
+    reference = oracle(repository)
+    files = phase_snapshot(runtime, reference)
+    if "command-fixtures.json" in files["records"]:
+        files["fixtures_log"] = checked_file(
+            runtime / "compute/private/fixtures.log", 8 * 1024 * 1024)
+    return {"exit": result, "files": files, "roots": (runtime, repository),
+            "reference": reference}
+
+
+def compare_pair(python, native, py_runtime, native_runtime, py_repo, native_repo,
+                 fixtures_stage_compat=False):
+    failures = compare_observations(
+        observed(python, py_runtime, py_repo),
+        observed(native, native_runtime, native_repo), fixtures_stage_compat)
+    return failures
+
+
+DECLARED_INVALID_CLI = frozenset({
+    "relative-runtime", "duplicate-runtime", "boot-with-build-source",
+})
+STRICT_CLI = {
+    "no-kvm": ((1, "refused"), (1, "refused")),
+    "unknown-profile": ((2, "usage"), (2, "usage")),
+    "unknown-command": ((2, "usage"), (2, "usage")),
+}
+
+
+def cli_vector_failures(label, python, native):
+    check(label in DECLARED_INVALID_CLI or label in STRICT_CLI,
+          "unknown CLI compatibility vector")
+    observed_pair = (
+        (python["exit"].returncode, category(python["exit"])),
+        (native["exit"].returncode, category(native["exit"])),
+    )
+    expected = (
+        ((1, "refused"), (2, "usage"))
+        if label in DECLARED_INVALID_CLI else STRICT_CLI[label]
+    )
+    failures = compare_observations(python, native)
+    if observed_pair != expected:
+        failures.append("wrong_cli_exit_or_category")
+    if any(side["files"]["order"] or side["files"]["records"]
+           for side in (python, native)):
+        failures.append("cli_published_evidence")
+    if label in DECLARED_INVALID_CLI and observed_pair == expected:
+        check("returncode" in failures and "refusal_category" in failures,
+              "declared CLI incompatibility was not observed")
+        failures = [failure for failure in failures
+                    if failure not in ("returncode", "refusal_category")]
+    return failures
+
+
+def no_kvm(host_command, root=PROJECT):
+    check(platform.machine() != "x86_64" or not (
+          Path("/dev/kvm").is_char_device()
+          and os.access("/dev/kvm", os.R_OK | os.W_OK)),
+          "local no-KVM vector requires a host without accessible x86 KVM")
+    scratch = fixture_parent()
+    parent = fresh(scratch, f"differential-no-kvm-{os.getpid()}")
+    try:
+        python_root, native_root = (fresh(parent, name)
+                                    for name in ("python", "native"))
+        prefix = fresh(parent, "host-cli")
+        built = command([*host_command, "--prefix", str(prefix),
+                         "-Doptimize=ReleaseSafe", "install"], root, seconds=180)
+        check(built.returncode == 0, "native host-fixture build failed: " +
+              built.stderr.decode("utf-8", "replace")[:1000])
+        native_cli = prefix / "bin/uk-wamr-native-ci-host-differential"
+        check(native_cli.is_file() and os.access(native_cli, os.X_OK),
+              "missing native host-fixture CLI")
+        vectors = (
+            ("no-kvm", ("boot", "--runtime", "{runtime}")),
+            ("unknown-profile", ("boot", "--runtime", "{runtime}",
+                                 "--profile", "coremark")),
+            ("unknown-command", ("azure", "--runtime", "{runtime}")),
+            ("relative-runtime", ("boot", "--runtime", "relative")),
+            ("duplicate-runtime", ("boot", "--runtime", "{runtime}",
+                                   "--runtime", "{runtime}")),
+            ("boot-with-build-source", ("boot", "--runtime", "{runtime}",
+                                        "--wamr-source", "{runtime}")),
+        )
+        failures, categories = {}, {}
+        for label, argv in vectors:
+            py_args = [argument.replace("{runtime}", str(python_root))
+                       for argument in argv]
+            native_args = [argument.replace("{runtime}", str(native_root))
+                           for argument in argv]
+            py = command([sys.executable, "-B", str(CONTROLLER / "run.py"),
+                          *py_args], root, seconds=90)
+            native = command([str(native_cli), *native_args], root, seconds=120)
+            categories[label] = (category(py), category(native))
+            py_seen = observed(py, python_root, root)
+            native_seen = observed(native, native_root, root)
+            mismatches = cli_vector_failures(label, py_seen, native_seen)
+            if (python_root / "compute").exists() or (native_root / "compute").exists():
+                mismatches.append("cli_created_compute_output")
+            if mismatches:
+                failures[label] = mismatches
+        return failures, categories
+    finally:
+        shutil.rmtree(parent)
+
+
+def checked_repository(path):
+    check(path.is_absolute() and path.resolve(strict=True) == path,
+          "canonical worktree required")
+    git = lambda *args: command(["git", "-C", str(path), *args],
+                                 path, seconds=30)
+    head = git("rev-parse", "HEAD")
+    tree = git("rev-parse", "HEAD^{tree}")
+    dirty = git("status", "--porcelain=v1", "--untracked-files=all")
+    check(head.returncode == tree.returncode == dirty.returncode == 0
+          and not dirty.stdout, "fresh clean Git worktree required")
+    for relative in (".zig-cache", "support/apps/wamr-aot/.config",
+                     "support/apps/wamr-aot/build"):
+        check(not (path / relative).exists(), "prior source output refused")
+    if (path / ".d").exists():
+        private(path / ".d", empty=True)
+    return head.stdout.strip(), tree.stdout.strip()
+
+
+def copy_input_tree(template, destination):
+    private(template)
+    for name in ("bin", "firmware", "bison", "llvm"):
+        source = template / name
+        check(source.is_dir() and not source.is_symlink(),
+              "missing real runtime input: " + name)
+        shutil.copytree(source, destination / name, symlinks=True)
+    required = (
+        "bin/qemu-system-x86_64", "firmware/code.fd", "firmware/vars.fd",
+    )
+    for name in required:
+        check((destination / name).is_file(), "missing pinned runtime input: " + name)
+
+
+def manifest(root):
+    entries = {}
+    for base in ("bin", "firmware", "bison", "llvm"):
+        for path in sorted((root / base).rglob("*")):
+            name = path.relative_to(root).as_posix()
+            info = path.lstat()
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISLNK(info.st_mode):
+                target = os.readlink(path)
+                check(not Path(target).is_absolute()
+                      and path.resolve(strict=True).is_relative_to(root),
+                      "runtime template symlink escapes its private root")
+                entries[name] = ("symlink", target)
+            elif stat.S_ISREG(info.st_mode):
+                entries[name] = ("file", mode, info.st_size, identity(path))
+            elif stat.S_ISDIR(info.st_mode):
+                entries[name] = ("directory", mode)
+            else:
+                raise ParityError("unsafe runtime template input")
+            check(len(entries) <= 100000, "runtime input entry limit exceeded")
+    return entries
+
+
+def full(args):
+    check(platform.machine() == "x86_64"
+          and Path("/dev/kvm").is_char_device()
+          and os.access("/dev/kvm", os.R_OK | os.W_OK),
+          "full chain requires real accessible x86 KVM; no successful skip")
+    parent = private(args.root, empty=True)
+    py_repo, native_repo = args.python_repository, args.native_repository
+    check(py_repo != native_repo and py_repo != PROJECT and native_repo != PROJECT,
+          "two separate protected fresh worktrees required")
+    check(not any(parent == path or parent.is_relative_to(path)
+                  for path in (py_repo, native_repo, args.runtime_template,
+                               args.wamr_source)),
+          "differential root must be outside all input trees")
+    check(checked_repository(py_repo) == checked_repository(native_repo),
+          "source revision/tree mismatch")
+    check(args.wamr_source.is_absolute()
+          and args.wamr_source.resolve(strict=True) == args.wamr_source,
+          "canonical pinned WAMR checkout required")
+    rev = command(["git", "-C", str(args.wamr_source), "rev-parse", "HEAD"],
+                  args.wamr_source, seconds=30)
+    check(rev.returncode == 0 and
+          rev.stdout.strip().decode("ascii") == oracle(py_repo).REVISION,
+          "real pinned WAMR checkout required")
+    check(args.controller.is_file() and not args.controller.is_symlink(),
+          "missing prebuilt portable controller")
+    check(args.case in {"success", "build-start-tamper", "missing-build",
+                        "occupied-boot-slot", "prior-build-output"},
+          "unknown differential case")
+    py_runtime = fresh(parent, "python")
+    native_runtime = fresh(parent, "native")
+    for runtime in (py_runtime, native_runtime):
+        copy_input_tree(args.runtime_template, runtime)
+    check(manifest(py_runtime) == manifest(native_runtime),
+          "different pinned runtime input bytes or modes")
+    controller_parent = native_runtime / "controller"
+    controller_parent.mkdir(mode=0o700)
+    installed = controller_parent / "bin"
+    installed.mkdir(mode=0o700)
+    controller = installed / "uk-wamr-native-ci"
+    shutil.copyfile(args.controller, controller)
+    controller.chmod(0o700)
+    check(identity(controller) == identity(args.controller),
+          "installed native controller bytes changed")
+    described = command([str(controller), "describe", "--output", "json-v1"],
+                        native_repo, seconds=60)
+    check(described.returncode == 0, "portable controller describe unavailable")
+    description = json.loads(described.stdout)
+    check(described.stdout == oracle(py_repo).compact_json(description, newline=True)
+          and description["schema"] == "uk.wamr.native-ci-describe"
+          and description["schema_version"] == 1
+          and description["recorded_executable_target"] ==
+          list(oracle(py_repo).RECORDED_EXECUTABLE_TARGET)
+          and HEX.fullmatch(description["source_closure_sha256"]),
+          "wrong portable controller target/closure")
+    check(command(["zig", "version"], py_repo, seconds=15).stdout.strip()
+          == b"0.16.0", "pinned Zig 0.16.0 required")
+    for name in oracle(py_repo).HOST_TOOLS:
+        check(shutil.which(name) is not None, "missing production tool: " + name)
+    check(not os.environ.get("BISON_PKGDATADIR"),
+          "ambiguous inherited Bison binding")
+    path = os.environ.get("PATH", "")
+    check(path and all(component.startswith("/") for component in path.split(":")),
+          "absolute closed tool search path required")
+    env = {"PATH": path, "LANG": "C", "LC_ALL": "C",
+           "PYTHONDONTWRITEBYTECODE": "1"}
+    executions = {}
+    for label, repo, runtime, executable in (
+            ("python", py_repo, py_runtime, [sys.executable, "-B",
+                                              str(py_repo / "support/build/wamr-native-ci/run.py")]),
+            ("native", native_repo, native_runtime, [str(controller)])):
+        environment = dict(env, BISON_PKGDATADIR=str(runtime / "bison"))
+        executions[label] = (repo, runtime, executable, environment)
+    if args.case == "prior-build-output":
+        for _, runtime, _, _ in executions.values():
+            (runtime / "compute").mkdir(mode=0o700)
+    results = {}
+    for label, (repo, runtime, executable, environment) in executions.items():
+        results[label] = command([*executable, "build", "--runtime", str(runtime),
+                                  "--wamr-source", str(args.wamr_source)],
+                                 repo, environment, seconds=7200)
+    py, native = (results[name] for name in ("python", "native"))
+    failures = ["build:" + name for name in compare_pair(
+        py, native, py_runtime, native_runtime, py_repo, native_repo,
+        fixtures_stage_compat=True)]
+    if args.case != "prior-build-output":
+        check(py.returncode == native.returncode == 0,
+              "build did not reach accepted state; " + ", ".join(failures))
+        for repo, runtime, _, _ in executions.values():
+            compute = runtime / "compute"
+            if args.case == "build-start-tamper":
+                record = compute / "evidence/build-start.json"
+                reference = oracle(repo)
+                data = parsed(checked_file(record), reference)
+                check(data["source"]["revision"] != "0" * 40,
+                      "tamper was a no-op")
+                data["source"]["revision"] = "0" * 40
+                record.write_bytes(reference.compact_json(data, newline=True))
+            elif args.case == "missing-build":
+                (compute / "evidence/build.json").unlink()
+            elif args.case == "occupied-boot-slot":
+                path = compute / "boot-raw-x2apic/prior"
+                path.write_bytes(b"prior")
+                path.chmod(0o600)
+        results = {}
+        for label, (repo, runtime, executable, environment) in executions.items():
+            results[label] = command([*executable, "boot", "--runtime", str(runtime)],
+                                     repo, environment, seconds=3600)
+        py, native = (results[name] for name in ("python", "native"))
+        failures.extend("boot:" + name for name in compare_pair(
+            py, native, py_runtime, native_runtime, py_repo, native_repo,
+            fixtures_stage_compat=True))
+        check((py.returncode == native.returncode == 0) == (args.case == "success"),
+              "unexpected full-chain outcome; " + ", ".join(failures))
+        if args.case == "success":
+            for runtime in (py_runtime, native_runtime):
+                check((runtime / "compute/evidence/result.json").is_file(),
+                      "missing real KVM acceptance record")
+        else:
+            for runtime in (py_runtime, native_runtime):
+                check(not (runtime / "compute/evidence/result.json").exists(),
+                      "refusal published acceptance")
+    check(not failures, "differential mismatches: " + ", ".join(failures))
+
+
+class DeterministicContracts(unittest.TestCase):
+    def test_fixtures_stage_side_specific_exact_contract_and_tamper(self):
+        reference = oracle()
+        empty = sha(b"")
+
+        def synthetic(side, log):
+            contract = (reference.production_command_contract("fixtures")
+                        if side == "python" else native_fixture_contract(reference))
+            executable = {
+                "content_sha256": sha(b"synthetic-fixture-only"),
+                "ctime_nanoseconds": 0, "ctime_seconds": 1,
+                "device_major": 0, "device_minor": 1, "inode": 12,
+                "mode": stat.S_IFREG | 0o500, "mtime_nanoseconds": 0,
+                "mtime_seconds": 1, "size": 22, "uid": os.getuid(),
+            }
+            def identified(binding):
+                return {"path": binding, "identity": executable}
+            env = {entry["name"]: entry["value"]
+                   for entry in contract["environment"]}
+            retained = [
+                {"name": name, "path": env[name], "identity": executable}
+                for name in contract["retained_names"]
+            ]
+            issued = 1_000_000_000
+            request = {
+                "schema": "uk.wamr.command-supervisor-request",
+                "version": 1,
+                "binding_schema": "uk.wamr.supervised-command-binding",
+                "binding_version": 1,
+                "stage": "fixtures",
+                "argv": contract["argv"],
+                "environment": contract["environment"],
+                "cwd": contract["cwd"],
+                "supervisor": identified(reference.command_path(
+                    "command-supervisor")),
+                "native_executable": identified(contract["native_executable"]),
+                "command_executable": identified(contract["command_executable"]),
+                "interpreter": (None if contract["interpreter"] is None
+                                else identified(contract["interpreter"])),
+                "retained_executables": retained,
+                "issued_ns": issued,
+                "primary_deadline_ns": issued + 600 * 1_000_000_000,
+                "cleanup_deadline_ns": issued + 610 * 1_000_000_000,
+                "timeout_ns": 600 * 1_000_000_000,
+                "limits": contract["limits"],
+            }
+            for key, payload in (
+                    ("canonical_sha256", request),
+                    ("argv_sha256", request["argv"]),
+                    ("environment_sha256", request["environment"]),
+                    ("cwd_sha256", request["cwd"])):
+                request[key] = reference.command_binding_digest(payload)
+            started = issued + 1000
+            primary = started + 2_000_000
+            completed = primary + 1_000_000
+            stdout = {
+                "bytes": len(log), "sha256": sha(log), "status": "complete",
+                "digest_scope": reference.command_digest_scope(len(log)),
+            }
+            stderr = {
+                "bytes": 0, "sha256": empty, "status": "complete",
+                "digest_scope": reference.command_digest_scope(0),
+            }
+            summary = {
+                "cancellation_observed": False,
+                "cleanup": "complete", "cleanup_complete": True,
+                "cleanup_events": 5,
+                "descendants": {
+                    "adopted": 0, "identity_validated": 0, "limit_exceeded": False,
+                    "observed": 0, "untracked": False,
+                },
+                "executable": executable, "executable_stable": True,
+                "output": {
+                    "bytes": len(log), "combined_sha256": sha(log),
+                    "commitment_sha256": reference.command_output_commitment(
+                        len(log), sha(log), 0, empty),
+                    "digest_scope": reference.command_digest_scope(len(log)),
+                },
+                "poisoned": False, "primary": {"code": 0, "kind": "exited"},
+                "primary_deadline_reached": False, "primary_events": 1,
+                "reap_events": 2, "retained_executables": retained,
+                "stderr": stderr, "stdout": stdout,
+                "timing": {
+                    "started_ns": started, "primary_completed_ns": primary,
+                    "completed_ns": completed,
+                    "primary_elapsed_ns": primary - started,
+                    "cleanup_elapsed_ns": completed - primary,
+                    "total_elapsed_ns": completed - started,
+                },
+                "termination": {"code": 0, "kind": "exited"},
+            }
+            result = {
+                "schema": "uk.wamr.command-supervisor-result",
+                "version": 1, "request_canonical_sha256":
+                    request["canonical_sha256"], "controller_error": None,
+                "native_request": {
+                    "bytes": 128, "sha256": sha(b"request"),
+                    "digest_scope": "direct_producer_or_trusted_inner_zip",
+                },
+                "native_result": {
+                    "bytes": 128, "sha256": sha(b"result"),
+                    "digest_scope": "direct_producer_or_trusted_inner_zip",
+                },
+                "command": summary,
+            }
+            result["canonical_sha256"] = reference.command_binding_digest(result)
+            return {
+                "scope": "command_diagnostic_not_acceptance", "stage": "fixtures",
+                "exit_code": 0, "bytes": len(log), "sha256": sha(log),
+                "sha256_scope": reference.command_digest_scope(len(log)),
+                "over_limit": False, "known_error_markers": [],
+                "supervisor": {
+                    "schema": "uk.wamr.command-supervisor-result",
+                    "version": 1, "bootstrap": False,
+                    "request": request, "result": result,
+                },
+            }
+
+        python_log = b"synthetic-python-fixture-ok\n"
+        native_log = b"synthetic-native-fixture-ok\n"
+        python = synthetic("python", python_log)
+        native = synthetic("native", native_log)
+        self.assertNotEqual(python["supervisor"]["request"]["argv"],
+                            native["supervisor"]["request"]["argv"])
+        self.assertNotEqual(python["sha256"], native["sha256"])
+        self.assertEqual(fixture_stage(
+            python, python_log, "python", reference), fixture_stage(
+                native, native_log, "native", reference))
+        for side, record, log in (
+                ("python", python, python_log), ("native", native, native_log)):
+            for change, key in (
+                    ("argv", "argv"),
+                    ("environment", "environment"),
+                    ("commitment", "output commitment"),
+                    ("log", "private log")):
+                with self.subTest(side=side, change=change):
+                    altered = copy.deepcopy(record)
+                    if change == "argv":
+                        altered["supervisor"]["request"]["argv"][1] = (
+                            reference.command_literal("--altered"))
+                    elif change == "environment":
+                        altered["supervisor"]["request"]["environment"][0]["value"] = (
+                            reference.command_literal("altered"))
+                    elif change == "commitment":
+                        altered["supervisor"]["result"]["command"]["output"][
+                            "commitment_sha256"] = "0" * 64
+                    if change in ("argv", "environment", "commitment"):
+                        request = altered["supervisor"]["request"]
+                        if change in ("argv", "environment"):
+                            request[change + "_sha256"] = (
+                                reference.command_binding_digest(request[change]))
+                            request["canonical_sha256"] = (
+                                reference.command_binding_digest({
+                                    name: value for name, value in request.items()
+                                    if name not in (
+                                        "canonical_sha256", "argv_sha256",
+                                        "environment_sha256", "cwd_sha256")
+                                }))
+                        result = altered["supervisor"]["result"]
+                        result["request_canonical_sha256"] = (
+                            request["canonical_sha256"])
+                        result["canonical_sha256"] = (
+                            reference.command_binding_digest({
+                                name: value for name, value in result.items()
+                                if name != "canonical_sha256"
+                            }))
+                    with self.assertRaisesRegex(ParityError, key):
+                        fixture_stage(
+                            altered, log + b"tampered" if change == "log" else log,
+                            side, reference)
+
+    def test_v1_read_only_and_v2_acceptance_parser_fixtures(self):
+        reference = oracle()
+        for version in (1, 2):
+            with self.subTest(version=version):
+                raw = (FIXTURES / f"accepted-v{version}.json").read_bytes()
+                result = parsed(raw, reference)
+                self.assertEqual(result["schema_version"], version)
+                self.assertEqual(result["modes"], list(
+                    reference.MODES if version == 1 else reference.SIX_MODES))
+                self.assertEqual(len(result["records"]), 8 if version == 1 else 33)
+                self.assertNotIn("result.json", result["records"])
+                self.assertEqual(set(result["records"]), set(
+                    ("build-start.json", "build.json", "boot-inputs.json",
+                     "package.json", *(mode + "-compute.json"
+                                       for mode in result["modes"]))
+                    if version == 1 else set(ORDER) - {"result.json"}))
+                self.assertEqual(set(result["records"].values()), {sha(b"{}\n")})
+
+    def test_python_v1_v2_reader_rehashes_synthetic_parser_fixtures(self):
+        spec = importlib.util.spec_from_file_location(
+            "wamr_handoff_fixture_reader", CONTROLLER / "handoff.py")
+        handoff = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(handoff)
+        scratch = fixture_parent()
+        parent = fresh(scratch, f"synthetic-result-parser-{os.getpid()}")
+        try:
+            for version in (1, 2):
+                root = fresh(parent, f"v{version}")
+                evidence = fresh(root, "evidence")
+                raw = (FIXTURES / f"accepted-v{version}.json").read_bytes()
+                value = parsed(raw, handoff.ci)
+                for name in value["records"]:
+                    file = evidence / name
+                    file.write_bytes(b"{}\n")
+                    file.chmod(0o600)
+                (evidence / "result.json").write_bytes(raw)
+                (evidence / "result.json").chmod(0o600)
+                self.assertEqual(handoff.result_records(root), value["records"])
+                changed = evidence / "build.json"
+                changed.write_bytes(b'{"tampered":true}\n')
+                with self.assertRaises(handoff.ci.Refusal):
+                    handoff.result_records(root)
+        finally:
+            shutil.rmtree(parent)
+
+    def test_normalization_preserves_metadata_equivalence_not_content(self):
+        roots = (Path("/private/python"), Path("/checkout/python"))
+        a = Normalizer(roots)
+        first = a.normalize({"path": "/private/python/compute/evidence/x",
+                             "metadata": [4, 11, 33188, 1000, 1000, 1, 2, 20, 30],
+                             "hash": "a" * 64})
+        second = a.normalize({"path": "/private/python/compute/evidence/y",
+                              "metadata": [4, 11, 33188, 1000, 1000, 1, 2, 20, 30],
+                              "hash": "a" * 64})
+        self.assertEqual(first["metadata"], second["metadata"])
+        b = Normalizer((Path("/private/native"), Path("/checkout/native")))
+        native = b.normalize({"path": "/private/native/compute/evidence/x",
+                              "metadata": [7, 92, 33188, 1000, 1000, 1, 2, 52, 66],
+                              "hash": "b" * 64})
+        self.assertEqual(first["metadata"], native["metadata"])
+        self.assertNotEqual(first["hash"], native["hash"])
+        self.assertNotEqual(first["path"], second["path"])
+        self.assertEqual(first["path"], native["path"])
+        bridged = b.normalize({
+            "device_major": os.major(7), "device_minor": os.minor(7),
+            "inode": 92, "mtime_seconds": 0, "mtime_nanoseconds": 52,
+            "ctime_seconds": 0, "ctime_nanoseconds": 66,
+        })
+        self.assertEqual(bridged["device_major"], native["metadata"][0])
+        self.assertEqual(bridged["inode"], native["metadata"][1])
+        self.assertEqual(bridged["mtime_seconds"], native["metadata"][7])
+        self.assertEqual(bridged["ctime_seconds"], native["metadata"][8])
+
+    def test_no_kvm_exit_category_mismatch_is_not_a_success(self):
+        class Exit:
+            def __init__(self, returncode, stderr):
+                self.returncode, self.stderr = returncode, stderr
+        python = {"exit": Exit(1, b"WAMR_CI_REFUSED: x86 KVM required\n"),
+                  "files": {"order": (), "records": {}, "retained": {}, "artifacts": {}},
+                  "roots": (Path("/python"),)}
+        native = {"exit": Exit(1, b"WAMR_CI_FAILED_STAGE: boot-platform; logs retained.\n"),
+                  "files": python["files"], "roots": (Path("/native"),)}
+        self.assertEqual(compare_observations(python, native), ["refusal_category"])
+
+    def test_only_three_invalid_cli_vectors_have_exact_declared_exits(self):
+        class Exit:
+            def __init__(self, code, stderr):
+                self.returncode, self.stderr = code, stderr
+
+        def seen(code, stderr, name):
+            return {
+                "exit": Exit(code, stderr),
+                "files": {"order": (), "records": {}, "retained": {},
+                          "artifacts": {}},
+                "roots": (Path("/private/" + name),),
+            }
+
+        refused = seen(1, b"WAMR_CI_REFUSED: private runtime root required\n",
+                       "python")
+        usage = seen(2, b"usage: uk-wamr-native-ci boot --runtime ABS\n",
+                     "native")
+        for label in DECLARED_INVALID_CLI:
+            with self.subTest(label=label):
+                self.assertEqual(cli_vector_failures(label, refused, usage), [])
+                self.assertIn("wrong_cli_exit_or_category", cli_vector_failures(
+                    label, refused, seen(
+                        1, b"WAMR_CI_FAILED_STAGE: startup; logs retained.\n",
+                        "native")))
+                with_record = dict(usage, files={
+                    **usage["files"], "records": {"result.json": (b"{}\n", {})},
+                    "order": ("result.json",),
+                })
+                self.assertIn("cli_published_evidence",
+                              cli_vector_failures(label, refused, with_record))
+        self.assertIn("wrong_cli_exit_or_category",
+                      cli_vector_failures("no-kvm", refused, usage))
+        self.assertEqual(cli_vector_failures(
+            "no-kvm", refused, seen(
+                1, b"WAMR_CI_REFUSED: x86 KVM required\n", "native")), [])
+        self.assertEqual(cli_vector_failures(
+            "unknown-command", usage, usage), [])
+        self.assertEqual(cli_vector_failures(
+            "unknown-profile", usage, usage), [])
+        with self.assertRaisesRegex(ParityError, "unknown CLI compatibility"):
+            cli_vector_failures("different-vector", refused, usage)
+
+    def test_differential_record_hash_mutation_is_not_a_success(self):
+        class Exit:
+            returncode = 0
+            stderr = b""
+        files = {"order": ("build-start.json",), "retained": {},
+                 "artifacts": {}, "records": {
+                     "build-start.json": (b'{"a":1}\n', {"a": 1})}}
+        left = {"exit": Exit(), "files": files, "roots": (Path("/left"),)}
+        changed = dict(files, records={"build-start.json":
+                       (b'{"a":2}\n', {"a": 2})})
+        right = {"exit": Exit(), "files": changed, "roots": (Path("/right"),)}
+        self.assertEqual(compare_observations(left, right),
+                         ["record_content:build-start.json"])
+
+    def test_record_mutation_and_publication_order_are_not_normalized(self):
+        source = Normalizer((Path("/private/a"),))
+        self.assertNotEqual(source.normalize({"stage": "prepare", "sha256": "a" * 64}),
+                            source.normalize({"stage": "config", "sha256": "a" * 64}))
+        self.assertNotEqual(source.normalize({"stage": "prepare", "sha256": "a" * 64}),
+                            source.normalize({"stage": "prepare", "sha256": "b" * 64}))
+        self.assertEqual(len(ORDER), len(set(ORDER)))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("local", help="run real Python and host-fixture Zig no-KVM CLIs")
+    full_parser = sub.add_parser("full", help="real x86/KVM differential, no skips")
+    full_parser.add_argument("--case", choices=(
+        "success", "build-start-tamper", "missing-build",
+        "occupied-boot-slot", "prior-build-output"), default="success")
+    for name in ("root", "python-repository", "native-repository",
+                 "runtime-template", "wamr-source", "controller"):
+        full_parser.add_argument("--" + name, type=Path, required=True)
+    args = parser.parse_args()
+    if args.action == "full":
+        full(args)
+    else:
+        zig = shutil.which("zig")
+        check(zig is not None, "Zig 0.16.0 required")
+        failures, categories = no_kvm([
+            zig, "build", "--build-file",
+            str(HERE / "differential.build.zig"),
+        ])
+        print(json.dumps({"categories": categories, "mismatches": failures},
+                         sort_keys=True))
+        check(not failures, "local differential mismatches: " +
+              ", ".join(failures))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ParityError as exc:
+        print("DIFFERENTIAL_REFUSED: " + str(exc), file=sys.stderr)
+        raise SystemExit(1) from None

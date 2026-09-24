@@ -569,6 +569,28 @@ ARM development can run these fixtures, but cannot qualify the guest.
 Only a successful real x86 PR run of the corrected, committed native base
 establishes the first local tiny-compute observation.
 
+## Differential parity preparation
+
+`test-controller` now includes native source-custody production limits and
+frozen v1/v2 result-parser goldens. `test-controller-limits` and
+`test-differential-records` run those suites separately. The matching Python
+parser fixtures run with
+`python3 -B -m unittest test_differential_parity.DeterministicContracts`
+from the tests directory. These goldens contain synthetic records, not guest
+boot evidence.
+
+On a host without accessible x86 KVM,
+`python3 -B support/build/wamr-native-ci/tests/test_differential_parity.py local`
+compares actual Python and native controller CLI refusals in separate private
+roots. Its three documented legacy-CLI exceptions require exact refusal
+versus closed-grammar usage outcomes; they do not make a failed controller
+run successful. The `full` action requires separate clean worktrees, real
+pinned tools and WAMR source, an owner-only runtime template and portable
+controller, and accessible x86 KVM. It remains a diagnostic until every
+deliberate command-binding difference is checked against both production
+contracts and the full success/fault matrix passes; it is not a guest-boot
+release gate or an Azure invocation.
+
 ## Private final-image handoff
 
 After a successful final-source build and all six boots, `handoff.py export`

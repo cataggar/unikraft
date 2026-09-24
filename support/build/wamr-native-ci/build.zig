@@ -223,8 +223,39 @@ pub fn build(b: *std.Build) void {
     install_target_tests.root_module.addOptions("test_options", controller_options);
     const install_target_run = b.addRunArtifact(install_target_tests);
     install_target_run.step.dependOn(&controller_run.step);
-    b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures")
-        .dependOn(&install_target_run.step);
+    const controller_step = b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures");
+    controller_step.dependOn(&install_target_run.step);
+    const source_limits_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/source_custody_limits_tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = host_core },
+                .{ .name = "controller_source_closure", .module = host_closure },
+            },
+        }),
+    });
+    source_limits_tests.root_module.addOptions("test_options", controller_options);
+    const source_limits_run = b.addRunArtifact(source_limits_tests);
+    b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
+        .dependOn(&source_limits_run.step);
+    controller_step.dependOn(&source_limits_run.step);
+    const record_goldens = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/differential_records.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    const record_goldens_run = b.addRunArtifact(record_goldens);
+    b.step("test-differential-records", "Run frozen v1/v2 native record goldens")
+        .dependOn(&record_goldens_run.step);
+    controller_step.dependOn(&record_goldens_run.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
@@ -273,4 +304,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&unit_tests.step);
     test_step.dependOn(&pipeline_run.step);
     test_step.dependOn(&controller_run.step);
+    test_step.dependOn(&source_limits_run.step);
+    test_step.dependOn(&record_goldens_run.step);
 }

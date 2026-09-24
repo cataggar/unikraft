@@ -46,7 +46,10 @@ pub fn main(init: std.process.Init) void {
                 .build_context = &context,
                 .pinned = std.StringHashMap(controller.custody_files.File).init(allocator),
             };
-            _ = controller.boot_pipeline.run(&boot_context) catch failed(init.io, context.failed_stage);
+            _ = controller.boot_pipeline.run(&boot_context) catch |err| {
+                if (err == error.KvmUnavailable) refusedWithMessage(init.io, "x86 KVM unavailable");
+                failed(init.io, context.failed_stage);
+            };
         },
         .diagnostics => {
             var boot_context: controller.boot_pipeline.Context = .{
@@ -70,8 +73,12 @@ fn usage(io: std.Io) noreturn {
 }
 
 fn refused(io: std.Io) noreturn {
+    refusedWithMessage(io, "controller stage unavailable");
+}
+
+fn refusedWithMessage(io: std.Io, message: []const u8) noreturn {
     var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
-    stderr.interface.writeAll("WAMR_CI_REFUSED: controller stage unavailable\n") catch {};
+    stderr.interface.print("WAMR_CI_REFUSED: {s}\n", .{message}) catch {};
     std.process.exit(1);
 }
 
