@@ -102,13 +102,10 @@ fn run(allocator: std.mem.Allocator, io: std.Io, command: Command) !void {
 
 fn category(err: anyerror) []const u8 {
     return switch (err) {
-        error.UnsafePath, error.UnsafeFile, error.InputUnavailable,
-        error.IncompleteMetadata, error.FileChanged => "input-snapshot",
+        error.UnsafePath, error.UnsafeFile, error.InputUnavailable, error.IncompleteMetadata, error.FileChanged => "input-snapshot",
         error.InputLimit, error.SerialLimit, error.SerialLineLimit => "input-bound",
         error.InvalidSerial, error.TruncatedSerial => "serial-framing",
-        error.EvidenceIncomplete, error.ForbiddenMarker, error.LegacyApicMismatch,
-        error.InvalidCompletion, error.InvalidMainReturn, error.IncompleteTranscript,
-        error.TranscriptNoise, error.UnanchoredRecord => "transcript",
+        error.EvidenceIncomplete, error.ForbiddenMarker, error.LegacyApicMismatch, error.InvalidCompletion, error.InvalidMainReturn, error.IncompleteTranscript, error.TranscriptNoise, error.UnanchoredRecord => "transcript",
         else => "record",
     };
 }
