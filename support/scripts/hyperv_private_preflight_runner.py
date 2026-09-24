@@ -73,10 +73,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "f8a50599e1faa21085d8711cddf0b23d63e0f6a54f4450b4971d68e50a369837"
+            "5c888fc11271e06474ef4aae5750d3737b033636791a50750b2e65572eaea51e"
         ),
-        "size": 2723897,
-        "files": 245,
+        "size": 2847772,
+        "files": 252,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -350,7 +350,7 @@ GUARDED_PRODUCER_FILES = {
         "5ba4f753fd4a0537564009a47298f242d10a1b831fe6fda00b5172023de8db77"
     ),
     "support/tools/hyperv/contracts.zig": (
-        "57e37d089f7de3fba56a8415e9451b359cac33b63b816ef5a17639c6d1f8d6e1"
+        "a51fe40c42a660ca1218275f88c9ddf5d45bebb41f1c7893de8408cec592a1ce"
     ),
     "support/tools/hyperv/core.zig": (
         "6ea44534c393fad97245488701c74b911cc639f7cbf24275a09a55f8b9b15092"
