@@ -39,7 +39,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("../../../apps/wamr-aot/validator/main.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "wamr_log_validator", .module = wamr_validator }},
+        .imports = &.{
+            .{ .name = "wamr_log_validator", .module = wamr_validator },
+            .{ .name = "hyperv_core", .module = core },
+        },
     }) });
     b.installArtifact(log_cli);
     const imports = [_]std.Build.Module.Import{

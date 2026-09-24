@@ -30,7 +30,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("validator/main.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "wamr_log_validator", .module = validator }},
+        .imports = &.{
+            .{ .name = "wamr_log_validator", .module = validator },
+            .{ .name = "hyperv_core", .module = core },
+        },
     }) });
     b.installArtifact(cli);
     const tests = b.addTest(.{ .root_module = b.createModule(.{

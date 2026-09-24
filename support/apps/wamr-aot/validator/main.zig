@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
 const validator = @import("wamr_log_validator");
+const contracts = @import("hyperv_core").contracts;
 
 const usage = "usage: uk-wamr-log-validate tiny --log L --identity I [--legacy-apic required|forbidden] [--output json-v1]\n" ++
     "       uk-wamr-log-validate workload --mode snapshot|aot|fast|full --log L --identity I [--output json-v1]\n";
@@ -96,8 +97,16 @@ fn run(allocator: std.mem.Allocator, io: std.Io, command: Command) !void {
             .raw_serial_sha256 = hash[0..],
         }, .{}),
     };
-    try stdout.interface.writeAll(bytes);
-    try stdout.interface.writeByte('\n');
+    if (command.request == .tiny) {
+        const document = try contracts.Document.parse(allocator, bytes, .{
+            .bytes = 64 * 1024, .depth = 32, .items = 4096, .tokens = 65536,
+        });
+        defer document.deinit();
+        try stdout.interface.writeAll(try document.canonicalAlloc(allocator));
+    } else {
+        try stdout.interface.writeAll(bytes);
+        try stdout.interface.writeByte('\n');
+    }
 }
 
 fn category(err: anyerror) []const u8 {

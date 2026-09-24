@@ -90,7 +90,7 @@ jobs:
           ghr-version: v0.8.0
           tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Exercise native controller fault fixtures in an isolated x86 worktree
+      - name: Exercise native controller and package-boot fixtures in an isolated x86 worktree
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -100,9 +100,14 @@ jobs:
           cleanup() { git worktree remove --force -- "${source_root}"; }
           trap cleanup EXIT
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-fixture-cache"
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-pipeline-root"
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
             -Doptimize=ReleaseSafe -j2 test-controller
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+            zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+            -Doptimize=ReleaseSafe -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
+            -j2 test-pipeline
 
       - name: Record the runner CPU and portable executable target
         run: |

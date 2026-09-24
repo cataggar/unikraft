@@ -46,6 +46,296 @@ test "build command table has closed roles, order, deadlines and native executab
     }).get("tool:sh"));
 }
 
+test "six boot modes bind exact image, APIC flags, validator and command budgets" {
+    const a = std.testing.allocator;
+    const plan = controller.command_plan;
+    const profile = controller.profile;
+    for (profile.production_modes, 0..) |mode, index| {
+        const stage = plan.modeStage(mode);
+        const selected = plan.spec(stage);
+        try std.testing.expectEqual(stage, selected.stage);
+        try std.testing.expectEqual(@as(u32, 90), selected.seconds);
+        try std.testing.expectEqual(@as(usize, 64 * 1024), selected.output_limit);
+        try std.testing.expectEqualStrings("input:local_boot_tool", selected.executable);
+        try std.testing.expectEqualStrings("input:local_boot_tool", selected.argv[0].path.role);
+        const image_path = try std.fmt.allocPrint(a, "package/{s}", .{plan.bootImage(mode)});
+        defer a.free(image_path);
+        const slot_path = try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)});
+        defer a.free(slot_path);
+        try std.testing.expectEqualStrings(image_path, selected.argv[2].path.relative);
+        try std.testing.expectEqualStrings(slot_path, selected.argv[10].path.relative);
+        try std.testing.expectEqual(index % 2 == 1, mode.legacyApic());
+        var required = false;
+        var disabled = false;
+        var forbidden_legacy = false;
+        for (selected.argv, 0..) |entry, at| {
+            if (entry != .literal) continue;
+            if (std.mem.eql(u8, entry.literal, "--disable-x2apic")) disabled = true;
+            if (std.mem.eql(u8, entry.literal, "--require-marker")) required = true;
+            if (std.mem.eql(u8, entry.literal, "--forbid-marker") and at + 1 < selected.argv.len and
+                selected.argv[at + 1] == .literal and std.mem.eql(u8, selected.argv[at + 1].literal, "Using legacy xAPIC MMIO"))
+                forbidden_legacy = true;
+        }
+        try std.testing.expectEqual(mode.legacyApic(), disabled);
+        try std.testing.expectEqual(mode.legacyApic(), required);
+        try std.testing.expectEqual(!mode.legacyApic(), forbidden_legacy);
+        const env = try plan.environment(a, stage);
+        defer plan.freeEnvironment(a, env);
+        try std.testing.expect(env.len > 20);
+    }
+    for ([_]plan.Stage{ .package, .@"finalize-qcow2", .@"derive-fixed-vhd", .inspect }) |stage| {
+        const selected = plan.spec(stage);
+        try std.testing.expectEqual(@as(u32, 150), selected.seconds);
+        try std.testing.expectEqualStrings("input:package_tool", selected.argv[0].path.role);
+    }
+    for ([_]plan.Stage{ .@"log-validator-x2apic", .@"log-validator-legacy" }) |stage| {
+        const selected = plan.spec(stage);
+        try std.testing.expectEqual(@as(u32, 30), selected.seconds);
+        try std.testing.expectEqual(@as(usize, 64 * 1024), plan.limits(selected).stdout_bytes);
+        try std.testing.expectEqual(@as(usize, 4 * 1024), plan.limits(selected).stderr_bytes);
+        try std.testing.expectEqualStrings("native:wamr-log-validate", selected.argv[0].path.role);
+        try std.testing.expectEqualStrings("tiny", selected.argv[1].literal);
+        try std.testing.expectEqualStrings("input:serial", selected.argv[3].path.role);
+        try std.testing.expectEqualStrings("input:identity", selected.argv[5].path.role);
+        try std.testing.expectEqualStrings(if (stage == .@"log-validator-legacy") "required" else "forbidden", selected.argv[7].literal);
+        const env = try plan.environment(a, stage);
+        defer plan.freeEnvironment(a, env);
+        try std.testing.expectEqual(@as(usize, 0), env.len);
+    }
+    try std.testing.expectError(error.KvmUnavailable, controller.boot_pipeline.admitHost(.aarch64, std.os.linux.S.IFCHR, true));
+    try std.testing.expectError(error.KvmUnavailable, controller.boot_pipeline.admitHost(.x86_64, std.os.linux.S.IFREG, true));
+    try std.testing.expectError(error.KvmUnavailable, controller.boot_pipeline.admitHost(.x86_64, std.os.linux.S.IFCHR, false));
+    try controller.boot_pipeline.admitHost(.x86_64, std.os.linux.S.IFCHR, true);
+}
+
+test "exact bounded validator JSON and Python tiny differential faults" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const raw_hash = std.fmt.bytesToHex(controller.records.fileIdentity("abc"), .lower);
+    const valid = try std.fmt.allocPrint(a,
+        "{{\"compute\":{{\"answer\":42}},\"mode\":\"tiny\",\"raw_serial_bytes\":3,\"raw_serial_sha256\":\"{s}\",\"schema\":\"uk.wamr.log-validation\",\"schema_version\":1}}\n",
+        .{&raw_hash},
+    );
+    defer a.free(valid);
+    const reference = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    defer a.free(reference);
+    const oracle =
+        \\import importlib.util,sys,hashlib
+        \\s=importlib.util.spec_from_file_location("ci",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        \\data=bytes.fromhex(sys.argv[2]); m.read=lambda path, limit: data
+        \\try:
+        \\ m.native_result("private",{"sha256":hashlib.sha256(data).hexdigest(),"bytes":len(data)},b"abc",65536)
+        \\ print("accepted")
+        \\except (m.Refusal,ValueError,KeyError,TypeError): print("refused")
+    ;
+    const Mutate = struct { from: []const u8, to: []const u8 };
+    const cases = [_]Mutate{
+        .{ .from = "", .to = "" },
+        .{ .from = "\"schema_version\":1", .to = "\"schema_version\":2" },
+        .{ .from = "\"schema_version\":1", .to = "\"schema_version\":true" },
+        .{ .from = "\"raw_serial_bytes\":3", .to = "\"raw_serial_bytes\":4" },
+        .{ .from = "\"raw_serial_bytes\":3", .to = "\"raw_serial_bytes\":true" },
+        .{ .from = "\"compute\":{\"answer\":42}", .to = "\"compute\":[]" },
+        .{ .from = "\"mode\":\"tiny\"", .to = "\"mode\":\"coremark\"" },
+        .{ .from = "\"schema\":\"uk.wamr.log-validation\"", .to = "\"schema\":\"other\"" },
+        .{ .from = "\"schema_version\":1", .to = "\"schema_version\":1,\"extra\":true" },
+        .{ .from = "\"schema_version\":1", .to = "\"schema_version\":1,\"schema_version\":1" },
+        .{ .from = "}\n", .to = "}" },
+    };
+    for (cases, 0..) |mutation, index| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const bytes = if (index == 0) valid else try std.mem.replaceOwned(u8, a, valid, mutation.from, mutation.to);
+        defer if (index != 0) a.free(bytes);
+        const native = if (controller.boot_pipeline.parseValidator(arena.allocator(), bytes, 3, &raw_hash)) |_| true else |_| false;
+        const hex = try a.alloc(u8, bytes.len * 2);
+        defer a.free(hex);
+        const digits = "0123456789abcdef";
+        for (bytes, 0..) |byte, at| {
+            hex[at * 2] = digits[byte >> 4];
+            hex[at * 2 + 1] = digits[byte & 15];
+        }
+        const result = try std.process.run(a, io, .{
+            .argv = &.{ options.python_executable, "-B", "-c", oracle, reference, hex },
+            .cwd = .{ .path = options.repository_root },
+            .stdout_limit = .limited(64), .stderr_limit = .limited(4096),
+        });
+        defer a.free(result.stdout);
+        defer a.free(result.stderr);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+        try std.testing.expectEqualStrings(if (native) "accepted\n" else "refused\n", result.stdout);
+    }
+}
+
+test "native diagnostics retain only bounded allowlisted observations and never acceptance" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "boot-diagnostics-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("diagnostics fixture cleanup failed");
+    const runtime = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(runtime);
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "compute", .fromMode(0o700));
+    const compute = try root.openDir(io, "compute", .{ .iterate = true });
+    defer compute.close(io);
+    for ([_][]const u8{ "evidence", "private", "boot-raw-x2apic" }) |entry|
+        try compute.createDir(io, entry, .fromMode(0o700));
+    const evidence = try compute.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    const private = try compute.openDir(io, "private", .{ .iterate = true });
+    defer private.close(io);
+    const boot = try compute.openDir(io, "boot-raw-x2apic", .{ .iterate = true });
+    defer boot.close(io);
+    const secret = "PRIVATE_SYNTHETIC_SERIAL_AND_PATH";
+    try writeFixtureFile(io, boot, "hyperv-efi-boot.log", secret);
+    const report = try controller.records.canonicalAlloc(a,
+        \\{"passed":false,"cleanup_complete":true,"input_unchanged":true,"serial_valid":false,"serial_limit_reached":false,"failures":{"primary":{"payload":"PRIVATE_SYNTHETIC_SERIAL_AND_PATH"},"cleanup":null,"recording":null}}
+    );
+    defer a.free(report);
+    try writeFixtureFile(io, boot, "report.json", report);
+    try writeFixtureFile(io, evidence, "command-fixtures.json", "{\"exit_code\":1}\n");
+    try writeFixtureFile(io, private, "fixtures.log",
+        "test_safe_name (test_adapter.Evidence.test_safe_name) ... ERROR\nPRIVATE_SYNTHETIC_SERIAL_AND_PATH\n");
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const compute_path = try std.fs.path.join(a, &.{ runtime, "compute" });
+    defer a.free(compute_path);
+    var base: controller.build_pipeline.Context = .{
+        .allocator = scratch.allocator(), .io = io, .environ = undefined, .runtime = runtime,
+        .repository = options.repository_root, .wamr = "",
+        .compute = compute_path, .git = undefined, .tools = undefined,
+        .roots = undefined, .signal = &signal,
+    };
+    var ctx: controller.boot_pipeline.Context = .{
+        .build_context = &base, .pinned = std.StringHashMap(controller.custody_files.File).init(scratch.allocator()),
+    };
+    defer ctx.pinned.deinit();
+    try controller.boot_pipeline.diagnostics(&ctx);
+    const output_file = try evidence.openFile(io, "diagnostics.json", .{ .follow_symlinks = false });
+    defer output_file.close(io);
+    const output_size: usize = @intCast((try core.private_files.snapshot(output_file)).size);
+    try std.testing.expect(output_size < 16 * 1024);
+    const output = try a.alloc(u8, output_size);
+    defer a.free(output);
+    try std.testing.expectEqual(output_size, try output_file.readPositionalAll(io, output, 0));
+    try std.testing.expect(std.mem.indexOf(u8, output, secret) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, runtime) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "test_adapter.Evidence.test_safe_name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "diagnostics_not_acceptance") != null);
+    try std.testing.expectError(error.PathAlreadyExists, controller.boot_pipeline.diagnostics(&ctx));
+    try std.testing.expectError(error.FileNotFound, evidence.openFile(io, "result.json", .{}));
+}
+
+test "result refuses unpinned evidence files and directories before publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "result-evidence-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("result evidence fixture cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "evidence", .fromMode(0o700));
+    const evidence = try root.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    try writeFixtureFile(io, evidence, "build.json", "{}\n");
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var base: controller.build_pipeline.Context = .{
+        .allocator = arena.allocator(), .io = io, .environ = undefined, .runtime = path,
+        .repository = options.repository_root, .wamr = "", .compute = path,
+        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+    };
+    var ctx: controller.boot_pipeline.Context = .{
+        .build_context = &base,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(arena.allocator()),
+    };
+    defer ctx.pinned.deinit();
+    const build_path = try std.fs.path.join(a, &.{ path, "evidence", "build.json" });
+    defer a.free(build_path);
+    try ctx.pinned.put("build.json", try controller.custody_files.readFile(io, build_path, 4096, true));
+    try controller.boot_pipeline.testing.checkExactEvidence(&ctx);
+
+    try writeFixtureFile(io, evidence, "unlisted.json", "{}\n");
+    try std.testing.expectError(error.UnexpectedEvidence, controller.boot_pipeline.testing.publishResult(&ctx));
+    try std.testing.expectError(error.FileNotFound, evidence.openFile(io, "result.json", .{}));
+    try evidence.deleteFile(io, "unlisted.json");
+    try evidence.createDir(io, "unlisted", .fromMode(0o700));
+    try std.testing.expectError(error.UnexpectedEvidence, controller.boot_pipeline.testing.publishResult(&ctx));
+    try std.testing.expectError(error.FileNotFound, evidence.openFile(io, "result.json", .{}));
+    try evidence.deleteDir(io, "unlisted");
+    try controller.boot_pipeline.testing.checkExactEvidence(&ctx);
+}
+
+test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "compute-image-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("compute image fixture cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "package", .fromMode(0o700));
+    try root.createDir(io, "evidence", .fromMode(0o700));
+    const package_dir = try root.openDir(io, "package", .{ .iterate = true });
+    defer package_dir.close(io);
+    const evidence_dir = try root.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence_dir.close(io);
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var base: controller.build_pipeline.Context = .{
+        .allocator = arena.allocator(), .io = io, .environ = undefined, .runtime = path,
+        .repository = options.repository_root, .wamr = "", .compute = path,
+        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+    };
+    var ctx: controller.boot_pipeline.Context = .{
+        .build_context = &base,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(arena.allocator()),
+    };
+    defer ctx.pinned.deinit();
+    const source = "original-image";
+    const hash = std.fmt.bytesToHex(controller.records.fileIdentity(source), .lower);
+    ctx.package = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        try std.fmt.allocPrint(arena.allocator(), "{{\"image\":{{\"raw\":{{\"sha256\":\"{s}\"}}}}}}", .{&hash}), .{});
+    const output = try std.fmt.allocPrint(arena.allocator(), "{{\"output\":{{\"sha256\":\"{s}\"}}}}", .{&hash});
+    ctx.finalization = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
+    ctx.derivation = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
+    for ([_]usize{ 0, 2, 4 }, [_][]const u8{
+        "unikraft.raw", "unikraft.qcow2", "unikraft-derived.vhd",
+    }, [_][]const u8{
+        "raw-x2apic-compute.json", "qcow2-x2apic-compute.json", "vpc-x2apic-compute.json",
+    }) |index, filename, record_name| {
+        try writeFixtureFile(io, package_dir, filename, source);
+        try controller.boot_pipeline.testing.checkModeImage(&ctx, index);
+        const image = try package_dir.openFile(io, filename, .{ .mode = .read_write, .follow_symlinks = false });
+        try image.writePositionalAll(io, "changed--image", 0);
+        image.close(io);
+        try std.testing.expectError(error.ArtifactChanged,
+            controller.boot_pipeline.testing.publishCompute(&ctx, index, .null));
+        try std.testing.expectError(error.FileNotFound, evidence_dir.openFile(io, record_name, .{}));
+    }
+}
+
 test "transport encoder preserves full 3 MiB and 8 MiB streams and refuses true excess" {
     const a = std.testing.allocator;
     const sizes = [_]struct { stdout: usize, stderr: usize }{
