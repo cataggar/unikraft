@@ -1117,6 +1117,113 @@ class Evidence(unittest.TestCase):
                 public_bundle.accepted_public_build_start(owner, runtime)
             bind.assert_not_called()
 
+    def test_public_context_binds_installed_log_validator_or_refuses(self):
+        runtime = self.root / "public-validator-runtime"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        for directory in ("bison", "llvm"):
+            (runtime / directory).mkdir(mode=0o700)
+        files = {
+            "tool:" + name: {"path": "/trusted/" + name}
+            for name in ci.HOST_TOOLS
+        }
+        for role, relative in (
+                ("command-supervisor",
+                 "compute/supervisor/bin/wamr-ci-supervisor"),
+                (ci.WAMR_AOT_BUILD_ROLE, ci.WAMR_AOT_BUILD_RELATIVE),
+                (ci.WAMR_LOG_VALIDATOR_ROLE, ci.WAMR_LOG_VALIDATOR_RELATIVE),
+                ("wamr-source-archive", "custody/wamr-source.tar")):
+            path = runtime / relative
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.put(path, b"fixture executable or archive")
+            files[role] = {"path": str(path)}
+        consumer = {
+            "files": files,
+            "trees": {
+                "bison": {"path": str(runtime / "bison")},
+                "llvm": {"path": str(runtime / "llvm")},
+                "zig": {"path": "/trusted"},
+                "python-stdlib": {
+                    "path": str(Path(ci.sysconfig.get_paths()["stdlib"])
+                                .resolve(strict=True)),
+                },
+            },
+        }
+        start = {
+            "source": {"revision": "1" * 40, "tree": "2" * 40},
+            "source_custody": {}, "tools": {}, "bison_data": {},
+            "dependencies": {}, "consumer_inputs": consumer,
+            "command_supervisor": {},
+        }
+        owner = types.SimpleNamespace(
+            ci=ci, result_records=mock.Mock(), FAILURE_STAGE="handoff")
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
+        original_tools = dict(ci.COMMAND_TOOL_PATHS)
+        original_environment = dict(ci.COMMAND_ENVIRONMENT)
+        try:
+            for case in ("present", "missing", "wrong-path", "extra-role"):
+                candidate = copy.deepcopy(start)
+                if case == "missing":
+                    del candidate["consumer_inputs"]["files"][
+                        ci.WAMR_LOG_VALIDATOR_ROLE]
+                elif case == "wrong-path":
+                    candidate["consumer_inputs"]["files"][
+                        ci.WAMR_LOG_VALIDATOR_ROLE]["path"] = "/trusted/other"
+                elif case == "extra-role":
+                    candidate["consumer_inputs"]["files"][
+                        "native:unapproved"] = {"path": "/trusted/other"}
+                ci.COMMAND_SUPERVISOR_PATH = None
+                ci.COMMAND_TOOL_PATHS.clear()
+                ci.COMMAND_ENVIRONMENT.clear()
+                with self.subTest(case=case), \
+                        mock.patch.object(
+                            public_bundle, "ci_runtime",
+                            return_value=runtime), \
+                        mock.patch.object(
+                            ci, "document", return_value=candidate), \
+                        mock.patch.object(
+                            public_bundle, "source_custody_record"), \
+                        mock.patch.object(
+                            public_bundle, "consumer_input_record"), \
+                        mock.patch.object(
+                            public_bundle, "command_supervisor_record"), \
+                        mock.patch.object(
+                            ci, "require_recorded_consumer_inputs"), \
+                        mock.patch.object(
+                            ci, "executable_runtime_paths",
+                            return_value=set()), \
+                        mock.patch.object(
+                            public_bundle, "dependency_record"), \
+                        mock.patch.object(
+                            ci, "require_recorded_build_custody"), \
+                        mock.patch.object(
+                            ci, "bind_command_tools", return_value={}) as bind, \
+                        mock.patch.object(
+                            public_bundle, "ci_context",
+                            side_effect=RuntimeError("past public context")
+                        ) as context:
+                    if case == "present":
+                        with self.assertRaisesRegex(
+                                RuntimeError, "past public context"):
+                            public_bundle.publish_ci(owner)
+                        owner.result_records.assert_called_with(
+                            runtime / "compute")
+                        context.assert_called_once_with(owner, candidate)
+                        bind.assert_called_once_with(consumer)
+                        self.assertEqual(owner.FAILURE_STAGE, "public-context")
+                    else:
+                        failure = (
+                            ci.Refusal if case == "missing" else ValueError)
+                        with self.assertRaises(failure):
+                            public_bundle.publish_ci(owner)
+                        bind.assert_not_called()
+                        context.assert_not_called()
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_TOOL_PATHS.update(original_tools)
+            ci.COMMAND_ENVIRONMENT.clear()
+            ci.COMMAND_ENVIRONMENT.update(original_environment)
+
     def test_fresh_publication_binds_before_validator_and_rechecks_record(self):
         repository = self.root / "fresh-publication"
         (repository / ".d").mkdir(parents=True, mode=0o700)

@@ -635,9 +635,9 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
     wamr_aot_build = (
         runtime / ci.WAMR_AOT_BUILD_RELATIVE).resolve(strict=True)
     validator_path = runtime / ci.WAMR_LOG_VALIDATOR_RELATIVE
-    require(ci.WAMR_LOG_VALIDATOR_ROLE in files or
-            not (validator_path.exists() or validator_path.is_symlink()),
-            "installed log validator missing from consumer custody")
+    ci.require(ci.WAMR_LOG_VALIDATOR_ROLE in files or
+               not (validator_path.exists() or validator_path.is_symlink()),
+               "installed log validator missing from consumer custody")
     log_validator = (
         validator_path.resolve(strict=True)
         if ci.WAMR_LOG_VALIDATOR_ROLE in files else None)

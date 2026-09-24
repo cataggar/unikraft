@@ -528,6 +528,9 @@ It uses only the validated recorded Git executable for the source/dependency
 recheck, recomputes the exact source, dependency, Bison, consumer and guarded
 supervisor custody, and only then binds the full recorded tool set and the
 fixed-runtime supervisor. It repeats the full custody check after binding.
+If the native log validator is installed, the preflight requires its recorded
+role, exact runtime path and executable dependency closure; a missing or
+misbound role refuses publication before tools are bound.
 Public bundle validation also binds the native `prepare`, `config` and
 `native-image` command records to the installed producer's recorded consumer
 identity; a missing or substituted producer role refuses those records.
