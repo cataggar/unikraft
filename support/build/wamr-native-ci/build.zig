@@ -100,6 +100,7 @@ pub fn build(b: *std.Build) void {
     controller_options.addOption([]const u8, "repository_root", std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
         @panic("cannot resolve source root"));
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
+    controller_options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch @panic("Git required for controller custody tests"));
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = b.graph.host,

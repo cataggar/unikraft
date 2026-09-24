@@ -15,13 +15,27 @@ of the other package artifacts; `install-controller` additionally requires
 the explicit GNU/v2 and `ReleaseSafe` flags and refuses musl, v3, or an
 unspecified target before creating a slot. `describe --output json-v1`
 reports that fixed target and the embedded source-content closure without
-accessing a runtime or granting boot authority. The Git/physical source and
-pinned revision admission is a separate follow-up; this foundation does not
-claim it.
+accessing a runtime or granting boot authority.
+
+The native custody library now exposes clean Git tracked-object/physical
+source and ignored-output checks, fixed-revision create-only WAMR archive
+sealing, Bison and consumer-input-v2 file/tree/ELF-runtime custody, and pinned
+Miz dependency-v1 custody. It reuses the Hyper-V no-follow private-file and
+supervised-command primitives; file-backed archive stdout is capped in the
+child before execution and checked again after sealing. Limits include 40,000
+tracked entries/2 GiB (256 MiB per file), 131,072 ignored entries/8 GiB
+(512 MiB per file, 8 MiB Git inventory), 100,000 input-tree entries/2 GiB,
+512 Bison entries/8 MiB, and 128 dependency roots/16,384 entries/256 MiB.
+Custody checks bind content hashes and stable physical metadata before and
+after use; only the four fixed output roles may be ignored. Bounded diagnostics
+and refusal never grant acceptance. `test-controller` exercises native custody,
+production boundaries, tamper/refusal and `run.py` differential fixtures;
+`python3 -m unittest support/build/wamr-native-ci/tests/source_custody_production_limits.py`
+remains the independent full-size source-boundary oracle until cutover.
 
 `build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
 `diagnostics --runtime ABS` reserve their final grammar but deliberately
-**refuse** in this foundation PR. They neither run Python nor publish
+**refuse** during the custody phase. They neither run Python nor publish
 acceptance. Production callers continue to use the existing controller until
 the later supervised build/boot and differential cutover PRs. The closed
 `tiny_exact_v2` production type has six ordered raw/QCOW2/VPC modes;
