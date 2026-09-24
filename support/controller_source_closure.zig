@@ -20,6 +20,7 @@ pub const entries = [_]Entry{
     .{ .name = "support/build/wamr-native-ci/controller/fixture_runner.zig", .content = @embedFile("build/wamr-native-ci/controller/fixture_runner.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/input_custody.zig", .content = @embedFile("build/wamr-native-ci/controller/input_custody.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/install.zig", .content = @embedFile("build/wamr-native-ci/controller/install.zig") },
+    .{ .name = "support/build/wamr-native-ci/controller/install_target_tests.zig", .content = @embedFile("build/wamr-native-ci/controller/install_target_tests.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/layout.zig", .content = @embedFile("build/wamr-native-ci/controller/layout.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/main.zig", .content = @embedFile("build/wamr-native-ci/controller/main.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/portable_main.zig", .content = @embedFile("build/wamr-native-ci/controller/portable_main.zig") },

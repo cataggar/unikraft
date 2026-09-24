@@ -45,10 +45,13 @@ create-only private report binds the observed output hashes and cleanup states,
 and the build gate verifies every required result. Each stream is capped at
 4 MiB; the independent native-result transport permits up to 12 MiB so the
 full allowed 8 MiB combined output is encoded without truncation. The
-`test-unit` adapter build target also runs `test-controller` in its isolated
-Zig cache, rather than silently omitting native controller fault fixtures.
-Custody link and depth fixtures use that selected cache even when production
-sets `ZIG_LOCAL_CACHE_DIR` outside the source checkout.
+`test-unit` also runs the controller custody and command fault fixtures in
+its isolated Zig cache. `test-controller` additionally checks invalid
+installer build flags, which can restore `zig-pkg` in the source tree; that
+test runs in a separate clean worktree in the protected gate, never during
+the supervised production adapter build. Custody link and depth fixtures use
+the selected cache even when production sets `ZIG_LOCAL_CACHE_DIR` outside
+the checkout.
 The protected x86 job exercises `test-controller` first in a separate clean
 worktree, keeping its test dependencies and cache outside the production
 source checkout; this reports fixture failures without exposing private
