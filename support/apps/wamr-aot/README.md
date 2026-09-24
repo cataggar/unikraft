@@ -342,23 +342,29 @@ or OVMF: its native boot attempt was refused, not counted as a passing run.
 
 ## Focused developer checks
 
-The first native validator foundation exposes optioned serial normalization
-without changing local-boot normalization, no-follow bounded raw input and
-SHA-256 snapshots, and a bounded canonical base64 decoder. It does **not**
-yet install a validator CLI or change any production check; the Python
-validators above remain the reference until their later native cutover.
-Run its synthetic unit/file-race fixtures without building or booting an
-image:
+The app-owned native validator reuses optioned local-boot serial normalization,
+no-follow bounded raw input/SHA-256 snapshots, canonical bounded base64 and
+the bounded Hyper-V JSON contracts. Its shared tiny/CoreMark parser checks
+exact record identity, boot order, return-0, zero accounting and independent
+CoreMark stdout (including literal `[0]crclist`, `[0]crcmatrix`, `[0]crcstate`
+and `[0]crcfinal` keys), stderr, realtime support and termination. Direct
+validation calls this same core in its stricter tiny-only scope: it still
+refuses WASI/CoreMark. There is **no installed validator CLI or production
+caller cutover** yet; `check-log.py` remains the differential reference, not
+a native fallback. Run synthetic unit/property/fault, C oracle and Python
+differential fixtures without building or booting an image:
 
 ```sh
 zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test
 zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test-differential
 ```
 
-The differential step compares bounded console normalization with the
-unchanged `run.py` reference and canonical base64 with the retained
-`check-log.py` contract; it does not install a production CLI or invoke
-guest execution. Optional Unicode printability is pinned to Python 3.12's
+The differential step also compares typed tiny results, raw byte counts/hashes
+and normalized record sequences against the retained Python end-to-end
+compute path; independent C `coremark.h` and Python output parsers check
+CoreMark bytes. The upstream local-boot terminal/crash check is represented
+by native envelope tests, not by calling `run.py.compute()` alone. Optional
+Unicode printability is pinned to Python 3.12's
 Unicode 15 domain, not the host Python version: the native and differential
 tests include golden Unicode 16-only rejection ranges from UnicodeData 15.0
 and printable Unicode 15 boundary cases. Python 3.14 uses those goldens

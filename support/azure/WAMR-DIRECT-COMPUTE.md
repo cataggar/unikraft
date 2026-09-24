@@ -49,6 +49,10 @@ The exact completion line and native startup/return-0 envelope are mandatory.
 Hardware, persistence, WASI/CoreMark and failure markers are forbidden.
 Malformed, duplicate, unanchored, negative, noisy or reordered compute records
 fail. Missing terminal evidence is incomplete, never successful.
+The direct validator imports the app-owned native tiny parser in-process, with
+its direct-only WASI prohibition; no second direct record parser or Python
+fallback is used. App-owned CoreMark correctness validation does not widen
+this direct scope or authorize a boot, clock, or benchmark claim.
 
 No hardware authority, Azure benchmark, CoreMark, JIT, snapshot execution or
 optional workload qualification follows from a successful tiny result.

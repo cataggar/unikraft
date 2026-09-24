@@ -35,6 +35,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hyperv_core", .module = core },
         },
     }) });
+    tests.root_module.addCSourceFile(.{
+        .file = b.path("tests/coremark-output.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    tests.root_module.link_libc = true;
     const native_tests = b.addRunArtifact(tests);
     const production = b.addExecutable(.{ .name = "wamr-validator-compile-only", .root_module = b.createModule(.{
         .root_source_file = b.path("validator/production_compile.zig"),
@@ -57,4 +62,17 @@ pub fn build(b: *std.Build) void {
     const reference_tests = b.step("test-differential", "Compare normalization and base64 against retained Python references");
     reference_tests.dependOn(test_step);
     reference_tests.dependOn(&differential.step);
+    const tiny_fixture = b.addExecutable(.{ .name = "wamr-tiny-reference-fixture", .root_module = b.createModule(.{
+        .root_source_file = b.path("validator/tiny_reference_fixture.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wamr_log_validator", .module = validator },
+            .{ .name = "hyperv_core", .module = core },
+        },
+    }) });
+    const tiny_differential = b.addSystemCommand(&.{ "python3", "-B" });
+    tiny_differential.addFileArg(b.path("validator/tiny_reference_test.py"));
+    tiny_differential.addFileArg(tiny_fixture.getEmittedBin());
+    reference_tests.dependOn(&tiny_differential.step);
 }
