@@ -40,6 +40,8 @@ SIX_MODES = (
 CURRENT_PROFILE = "qcow2-derived-vhd"
 WAMR_AOT_BUILD_ROLE = "native:wamr-aot-build"
 WAMR_AOT_BUILD_RELATIVE = "compute/tools/bin/uk-wamr-aot-build"
+WAMR_LOG_VALIDATOR_ROLE = "native:wamr-log-validate"
+WAMR_LOG_VALIDATOR_RELATIVE = "compute/tools/bin/uk-wamr-log-validate"
 RECORDED_EXECUTABLE_TARGET = (
     "-Dtarget=x86_64-linux-gnu", "-Dcpu=x86_64_v2",
 )
@@ -1255,19 +1257,21 @@ def discover_consumer_input_paths(runtime, expected=None):
     archive = runtime / "custody/wamr-source.tar"
     if archive.is_file() and not archive.is_symlink():
         file_paths["wamr-source-archive"] = archive
-    wamr_aot_build = runtime / WAMR_AOT_BUILD_RELATIVE
-    expected_native = (
-        expected is not None
-        and WAMR_AOT_BUILD_ROLE in expected.get("files", {})
-    )
-    if expected_native or (
-            expected is None
-            and (wamr_aot_build.exists() or wamr_aot_build.is_symlink())):
-        require(wamr_aot_build.is_file() and not wamr_aot_build.is_symlink(),
-                "installed native WAMR build executable unavailable")
-        file_paths[WAMR_AOT_BUILD_ROLE] = wamr_aot_build
-        for path in executable_runtime_paths(wamr_aot_build):
-            file_paths[f"runtime:{path}"] = path
+    for role, relative, label in (
+            (WAMR_AOT_BUILD_ROLE, WAMR_AOT_BUILD_RELATIVE, "build"),
+            (WAMR_LOG_VALIDATOR_ROLE, WAMR_LOG_VALIDATOR_RELATIVE, "log validator")):
+        executable = runtime / relative
+        expected_native = (
+            expected is not None and role in expected.get("files", {})
+        )
+        if expected_native or (
+                expected is None
+                and (executable.exists() or executable.is_symlink())):
+            require(executable.is_file() and not executable.is_symlink(),
+                    f"installed native WAMR {label} executable unavailable")
+            file_paths[role] = executable
+            for path in executable_runtime_paths(executable):
+                file_paths[f"runtime:{path}"] = path
     return (
         canonical_input_paths(
             file_paths, "invalid consumer input file discovery"),
@@ -2845,12 +2849,34 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
             "interpreter": None,
             "argv": boot_command_argv(mode, profile),
         }
+    # Prepared for the native caller cutover; these stages are not dispatched
+    # by the current Python compute path or PRODUCTION_COMMAND_STAGES.
+    for suffix, legacy in (("x2apic", "forbidden"), ("legacy", "required")):
+        contracts["log-validator-" + suffix] = {
+            "kind": "validator-only", "seconds": 30,
+            "output_limit": 8192,
+            "command_executable": command_path(WAMR_LOG_VALIDATOR_ROLE),
+            "native_executable": command_path(WAMR_LOG_VALIDATOR_ROLE),
+            "interpreter": None,
+            "argv": [
+                command_path(WAMR_LOG_VALIDATOR_ROLE),
+                command_literal("tiny"),
+                command_literal("--log"), command_path("input:serial"),
+                command_literal("--identity"), command_path("input:identity"),
+                command_literal("--legacy-apic"), command_literal(legacy),
+                command_literal("--output"), command_literal("json-v1"),
+            ],
+        }
     require(stage in contracts, "unknown production command stage")
     contract = contracts[stage]
     return {
         **contract,
-        "environment": command_environment_contract(contract["kind"]),
-        "retained_names": command_retained_names(contract["kind"]),
+        "environment": (
+            [] if contract["kind"] == "validator-only"
+            else command_environment_contract(contract["kind"])),
+        "retained_names": (
+            [] if contract["kind"] == "validator-only"
+            else command_retained_names(contract["kind"])),
         "cwd": command_path("source"),
         "limits": {
             "cleanup_events": 1_000_000,

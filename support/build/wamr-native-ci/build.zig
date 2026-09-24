@@ -10,6 +10,28 @@ pub fn build(b: *std.Build) void {
     });
     if (target.result.cpu.arch == .x86_64)
         core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+    const serial = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+    });
+    const log_validator = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "local_boot_serial", .module = serial },
+        },
+    });
+    const log_cli = b.addExecutable(.{ .name = "uk-wamr-log-validate", .root_module = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wamr_log_validator", .module = log_validator }},
+    }) });
+    b.installArtifact(log_cli);
     const supervisor_fixture = b.addExecutable(.{
         .name = "wamr-ci-supervisor-fixture",
         .root_module = b.createModule(.{
@@ -39,6 +61,10 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
     unit_step.dependOn(&unit_tests.step);
+    const cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
+    cli_tests.addFileArg(b.path("../../apps/wamr-aot/validator/cli_test.py"));
+    cli_tests.addFileArg(log_cli.getEmittedBin());
+    unit_step.dependOn(&cli_tests.step);
     const options = b.addOptions();
     options.addOptionPath("cli", cli.getEmittedBin());
     options.addOption(

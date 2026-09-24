@@ -180,6 +180,16 @@ ELF explicitly; there is no shebang or ambient interpreter selection.
 The prepare, configuration and native-image stages instead bind the installed
 `native:wamr-aot-build` role as both command and native executable, with no
 interpreter. The old Python producers and their differential tests have been removed.
+The adapter also installs the app-owned `uk-wamr-log-validate` from the
+shared validator source, records its physical executable identity as
+`native:wamr-log-validate`, and revalidates the consumer input. Prepared
+`log-validator-x2apic`/`log-validator-legacy` supervisor contracts pin
+the exact `tiny --log ... --identity ... --legacy-apic forbidden|required
+--output json-v1` argv, empty environment, executable identity, timeout
+and output bound. These stages are **not dispatched**: `run.py.compute()`
+still calls the retained Python checker until the separate #188 cutover.
+Adapter and direct native CLI fixtures exercise synthetic records only;
+the CLI result cannot replace boot/image or acceptance evidence.
 There is no production fallback, PATH lookup or sibling executable discovery.
 The adapter supplies a fresh private application output root and a sealed
 `--source-archive` for `prepare`; `verify` is enforced by Make with the

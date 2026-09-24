@@ -26,6 +26,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "local_boot_serial", .module = serial },
         },
     });
+    const cli = b.addExecutable(.{ .name = "uk-wamr-log-validate", .root_module = b.createModule(.{
+        .root_source_file = b.path("validator/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wamr_log_validator", .module = validator }},
+    }) });
+    b.installArtifact(cli);
     const tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("validator/tests.zig"),
         .target = target,
@@ -50,6 +57,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run native WAMR validator primitive tests");
     test_step.dependOn(&native_tests.step);
     test_step.dependOn(&production.step);
+    const cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
+    cli_tests.addFileArg(b.path("validator/cli_test.py"));
+    cli_tests.addFileArg(cli.getEmittedBin());
+    test_step.dependOn(&cli_tests.step);
     const fixture = b.addExecutable(.{ .name = "wamr-normalization-reference-fixture", .root_module = b.createModule(.{
         .root_source_file = b.path("validator/reference_fixture.zig"),
         .target = b.graph.host,
@@ -62,6 +73,11 @@ pub fn build(b: *std.Build) void {
     const reference_tests = b.step("test-differential", "Compare normalization and base64 against retained Python references");
     reference_tests.dependOn(test_step);
     reference_tests.dependOn(&differential.step);
+    const cli_differential = b.addSystemCommand(&.{ "python3", "-B" });
+    cli_differential.addFileArg(b.path("validator/cli_test.py"));
+    cli_differential.addFileArg(cli.getEmittedBin());
+    cli_differential.addArg("--differential");
+    reference_tests.dependOn(&cli_differential.step);
     const tiny_fixture = b.addExecutable(.{ .name = "wamr-tiny-reference-fixture", .root_module = b.createModule(.{
         .root_source_file = b.path("validator/tiny_reference_fixture.zig"),
         .target = b.graph.host,

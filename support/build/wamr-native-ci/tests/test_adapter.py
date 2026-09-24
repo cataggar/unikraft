@@ -273,6 +273,12 @@ class Contract(unittest.TestCase):
                 'wamr_aot_build.artifact("uk-wamr-aot-build")'),
             1,
         )
+        self.assertIn(
+            '.root_source_file = b.path("../../apps/wamr-aot/validator/main.zig")',
+            build,
+        )
+        self.assertIn('b.installArtifact(log_cli)', build)
+        self.assertNotIn('uk-wamr-log-validate', ci.PRODUCTION_COMMAND_STAGES)
 
 
 class PhysicalPackage(unittest.TestCase):
@@ -1690,6 +1696,42 @@ class Evidence(unittest.TestCase):
                     {"files": {ci.WAMR_AOT_BUILD_ROLE: {}}},
                 )
 
+    def test_installed_log_validator_role_is_custodied_without_caller_cutover(self):
+        runtime = self.root / "log-validator-role"
+        executable = runtime / ci.WAMR_LOG_VALIDATOR_RELATIVE
+        executable.parent.mkdir(parents=True, mode=0o700)
+        with mock.patch.object(
+                ci, "tool", side_effect=lambda name: f"/tools/{name}"), \
+                mock.patch.object(
+                    ci, "executable_runtime_paths", return_value=set()), \
+                mock.patch.object(
+                    ci, "canonical_input_paths",
+                    side_effect=lambda paths, unused_reason: dict(paths)):
+            files, unused = ci.discover_consumer_input_paths(runtime)
+            self.assertNotIn(ci.WAMR_LOG_VALIDATOR_ROLE, files)
+            self.put(executable, b"installed native log validator")
+            executable.chmod(0o700)
+            files, unused = ci.discover_consumer_input_paths(runtime)
+            self.assertEqual(files[ci.WAMR_LOG_VALIDATOR_ROLE], executable)
+            files, unused = ci.discover_consumer_input_paths(
+                runtime, {"files": {}})
+            self.assertNotIn(ci.WAMR_LOG_VALIDATOR_ROLE, files)
+            files, unused = ci.discover_consumer_input_paths(
+                runtime, {"files": {ci.WAMR_LOG_VALIDATOR_ROLE: {}}})
+            self.assertEqual(files[ci.WAMR_LOG_VALIDATOR_ROLE], executable)
+            baseline = ci.record_input_paths(
+                {ci.WAMR_LOG_VALIDATOR_ROLE: executable}, {})
+            executable.write_bytes(b"tampered native log validator")
+            with self.assertRaises(ci.Refusal):
+                ci.record_input_paths(
+                    {ci.WAMR_LOG_VALIDATOR_ROLE: executable}, {},
+                    expected=baseline)
+            executable.unlink()
+            executable.symlink_to("/does/not/exist")
+            with self.assertRaises(ci.Refusal):
+                ci.discover_consumer_input_paths(
+                    runtime, {"files": {ci.WAMR_LOG_VALIDATOR_ROLE: {}}})
+
     def test_recorded_consumer_revalidation_allows_only_new_roles(self):
         inputs = self.root / "recorded-consumer-inputs"
         inputs.mkdir(mode=0o700)
@@ -2911,6 +2953,87 @@ source/generated/
                 with self.assertRaises(ci.Refusal):
                     ci.validate_supervised_command_binding(
                         record, stage, changed_identities)
+
+    def test_prepared_validator_supervision_is_closed_and_identity_bound(self):
+        for stage, legacy in (("log-validator-x2apic", "forbidden"),
+                              ("log-validator-legacy", "required")):
+            with self.subTest(stage=stage):
+                self.assertNotIn(stage, ci.PRODUCTION_COMMAND_STAGES)
+                contract = ci.production_command_contract(stage)
+                self.assertEqual(contract["environment"], [])
+                self.assertEqual(contract["retained_names"], [])
+                self.assertIsNone(contract["interpreter"])
+                self.assertEqual(contract["argv"][-4:], [
+                    ci.command_literal("--legacy-apic"),
+                    ci.command_literal(legacy),
+                    ci.command_literal("--output"),
+                    ci.command_literal("json-v1"),
+                ])
+                record, identities = self.supervised_binding(stage)
+                ci.validate_supervised_command_binding(
+                    record, stage, identities)
+                changed = copy.deepcopy(record)
+                changed["supervisor"]["request"]["argv"][-3] = (
+                    ci.command_literal("forbidden" if legacy == "required"
+                                       else "required"))
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        self.rehash_supervised_binding(changed),
+                        stage, identities)
+                changed = copy.deepcopy(record)
+                changed["supervisor"]["request"]["argv"][0] = (
+                    ci.command_path("tool:python3"))
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        self.rehash_supervised_binding(changed),
+                        stage, identities)
+                changed_identities = copy.deepcopy(identities)
+                changed_identities[ci.WAMR_LOG_VALIDATOR_ROLE][
+                    "content_sha256"] = "0" * 64
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        record, stage, changed_identities)
+
+    def test_publication_binds_installed_log_validator_role(self):
+        record, identities = self.supervised_binding("log-validator-x2apic")
+
+        def input_record(identity):
+            return {
+                "metadata": [
+                    os.makedev(
+                        identity["device_major"], identity["device_minor"]),
+                    identity["inode"], identity["mode"], identity["uid"],
+                    os.getgid(), 1, identity["size"],
+                    identity["mtime_seconds"] * 1_000_000_000
+                    + identity["mtime_nanoseconds"],
+                    identity["ctime_seconds"] * 1_000_000_000
+                    + identity["ctime_nanoseconds"],
+                ],
+                "sha256": identity["content_sha256"],
+            }
+
+        consumer = {
+            role: input_record(identity)
+            for role, identity in identities.items()
+            if role in {"command-supervisor", ci.WAMR_LOG_VALIDATOR_ROLE}
+        }
+        for name in ci.HOST_TOOLS:
+            consumer["tool:" + name] = input_record(
+                identities["command-supervisor"])
+        boot = {
+            name: input_record(identities["command-supervisor"])
+            for name in ("package_tool", "local_boot_tool")
+        }
+        roles = public_bundle.publication_role_identities(
+            ci, consumer, boot)
+        ci.validate_supervised_command_binding(
+            record, "log-validator-x2apic", roles)
+        consumer[ci.WAMR_LOG_VALIDATOR_ROLE]["sha256"] = "0" * 64
+        roles = public_bundle.publication_role_identities(
+            ci, consumer, boot)
+        with self.assertRaises(ci.Refusal):
+            ci.validate_supervised_command_binding(
+                record, "log-validator-x2apic", roles)
 
     def test_publication_binds_native_producer_to_consumer_custody(self):
         def input_record(identity):
