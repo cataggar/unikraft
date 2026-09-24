@@ -8,6 +8,7 @@ const io = t.io;
 
 test {
     _ = @import("tiny_tests.zig");
+    _ = @import("optional_tests.zig");
 }
 
 fn normalized(raw: []const u8, mode: validator.serial.Normalization) ![]u8 {

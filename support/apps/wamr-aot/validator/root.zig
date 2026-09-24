@@ -5,3 +5,5 @@ pub const serial = @import("local_boot_serial");
 pub const records = @import("records.zig");
 pub const tiny = @import("tiny.zig");
 pub const coremark = @import("coremark.zig");
+pub const optional = @import("optional.zig");
+pub const sampler = @import("sampler.zig");
