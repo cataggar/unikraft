@@ -151,6 +151,7 @@ jobs:
           bash .github/scripts/hyperv-native-libfdt-prepare.sh /d/wamr-ci/wamr-native-runtime
 
       - name: Build the tiny AOT image with the installed native producer and safety graph
+        id: private_build
         timeout-minutes: 45
         run: |
           set -euo pipefail
@@ -183,6 +184,26 @@ jobs:
           echo "${root}/llvm/bin" >> "${GITHUB_PATH}"
           python3 support/build/wamr-native-ci/run.py build --runtime "${root}" \
             --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
+
+      - name: Diagnose failed adapter with public fixtures in an isolated x86 worktree
+        if: ${{ failure() && steps.private_build.outcome == 'failure' }}
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          packages=/d/wamr-ci/wamr-native-runtime/compute/dependencies/zig-pkg
+          test -d "${packages}"
+          source_root="${RUNNER_TEMP}/wamr-adapter-fixtures"
+          test ! -e "${source_root}"
+          git worktree add --detach "${source_root}" HEAD
+          cleanup() { git worktree remove --force -- "${source_root}"; }
+          trap cleanup EXIT
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-adapter-fixture-cache" \
+            "${RUNNER_TEMP}/wamr-adapter-fixture-tools"
+          zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+            --system "${packages}" \
+            --cache-dir "${RUNNER_TEMP}/wamr-adapter-fixture-cache" \
+            --prefix "${RUNNER_TEMP}/wamr-adapter-fixture-tools" \
+            -Doptimize=ReleaseSafe -j2 test-unit install
 
       - name: Run raw QCOW2 and derived fixed VHD under both APIC configurations
         timeout-minutes: 15
