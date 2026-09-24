@@ -235,6 +235,7 @@ test "native image commands preserve config plans identities and failed publicat
     defer allocator.free(log_path);
     var environment = try imageEnvironment(fixture, bison_data, log_path);
     defer environment.deinit();
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", cli);
 
     const configured = try runCli(
         cli,
@@ -251,6 +252,7 @@ test "native image commands preserve config plans identities and failed publicat
     try expectExit(configured.term, 0);
     try testing.expectEqualStrings("", configured.stdout);
     try testing.expectEqualStrings("", configured.stderr);
+    try environment.put("WAMR_IMAGE_FIXTURE_REWRITE_CONFIG", "1");
     const expected_config =
         "CONFIG_FIXTURE=y\n\n" ++
         "CONFIG_STACK_SIZE_PAGE_ORDER=8\n" ++
@@ -424,6 +426,8 @@ test "native image commands reject config runtime and application mutation" {
         defer allocator.free(configured.stdout);
         defer allocator.free(configured.stderr);
         try expectExit(configured.term, 0);
+        if (std.mem.eql(u8, mutation, "config"))
+            try environment.put("WAMR_IMAGE_FIXTURE_REWRITE_CONFIG", "1");
         try environment.put("WAMR_IMAGE_FIXTURE_MUTATE", mutation);
         const built = try runCli(
             cli,
@@ -437,6 +441,21 @@ test "native image commands reject config runtime and application mutation" {
             "wamr_aot_build_failed category=unsupported_input\n",
             built.stderr,
         );
+        if (std.mem.eql(u8, mutation, "config")) {
+            const guard_path = try std.fs.path.join(
+                allocator,
+                &.{ repository, "support/apps/wamr-aot/build/native-environment/failure-image-guard.txt" },
+            );
+            defer allocator.free(guard_path);
+            const guard = try std.Io.Dir.cwd().readFileAlloc(
+                io,
+                guard_path,
+                allocator,
+                .limited(96),
+            );
+            defer allocator.free(guard);
+            try testing.expectEqualStrings("config-after-root-changed-bytes", guard);
+        }
         try testing.expect(std.mem.indexOf(u8, built.stderr, repository) == null);
         const identity_path = try std.fs.path.join(
             allocator,
@@ -448,6 +467,208 @@ test "native image commands reject config runtime and application mutation" {
             std.Io.Dir.openFileAbsolute(io, identity_path, .{}),
         );
     }
+}
+
+test "native config refuses a supplied executable that differs from the running image" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.image_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const repository = try imageRepository(&temporary, "wrong-executable");
+    defer allocator.free(repository);
+    var environment = try imageEnvironment(fixture, ".", "/dev/null");
+    defer environment.deinit();
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", fixture);
+    const result = try runCli(
+        cli,
+        &.{ cli, "olddefconfig", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try expectExit(result.term, 2);
+    try testing.expectEqualStrings(
+        "wamr_aot_build_failed category=unsupported_input\n",
+        result.stderr,
+    );
+    var wrong = try build_tool.process.openTool(
+        allocator,
+        io,
+        "wrong-image",
+        fixture,
+    );
+    defer wrong.close(allocator, io);
+    const retained_path = try std.fmt.allocPrint(
+        allocator,
+        "/proc/{d}/fd/{d}",
+        .{ linux.getpid(), wrong.executable.file.handle },
+    );
+    defer allocator.free(retained_path);
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", cli);
+    try environment.put("WAMR_CI_RETAINED_EXECUTABLE", retained_path);
+    const wrong_retained = try runCli(
+        cli,
+        &.{ cli, "olddefconfig", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(wrong_retained.stdout);
+    defer allocator.free(wrong_retained.stderr);
+    try expectExit(wrong_retained.term, 2);
+    try testing.expectEqualStrings(
+        "wamr_aot_build_failed category=unsupported_input\n",
+        wrong_retained.stderr,
+    );
+    const guard_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/build/native-environment/failure-image-guard.txt" },
+    );
+    defer allocator.free(guard_path);
+    const guard = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        guard_path,
+        allocator,
+        .limited(96),
+    );
+    defer allocator.free(guard);
+    try testing.expectEqualStrings("retained-identity", guard);
+}
+
+test "native config binds a supervisor snapshot to its retained physical executable" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.image_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const repository = try imageRepository(&temporary, "supervised-snapshot");
+    defer allocator.free(repository);
+    try temporary.dir.createDir(io, "bison-data", .fromMode(0o700));
+    const bison_data = try temporary.dir.realPathFileAlloc(
+        io,
+        "bison-data",
+        allocator,
+    );
+    defer allocator.free(bison_data);
+    const log = try temporary.dir.createFile(io, "snapshot.log", .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    log.close(io);
+    const log_path = try temporary.dir.realPathFileAlloc(
+        io,
+        "snapshot.log",
+        allocator,
+    );
+    defer allocator.free(log_path);
+    var environment = try imageEnvironment(fixture, bison_data, log_path);
+    defer environment.deinit();
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", cli);
+    var tool = try build_tool.process.openTool(
+        allocator,
+        io,
+        "wamr-aot-build",
+        cli,
+    );
+    defer tool.close(allocator, io);
+    const retained_path = try std.fmt.allocPrint(
+        allocator,
+        "/proc/{d}/fd/{d}",
+        .{ linux.getpid(), tool.executable.file.handle },
+    );
+    defer allocator.free(retained_path);
+    try environment.put("WAMR_CI_RETAINED_EXECUTABLE", retained_path);
+    try build_tool.process.initialize();
+    var result = try build_tool.process.run(allocator, io, tool, .{
+        .argv = &.{ cli, "olddefconfig", "--repository", repository },
+        .environment = &environment,
+        .cwd = temporary.dir,
+        .primary_deadline = try build_tool.process.Deadline.afterMilliseconds(60000),
+        .cleanup_deadline = try build_tool.process.Deadline.afterMilliseconds(90000),
+        .stdout_bytes = 1024,
+        .stderr_bytes = 1024,
+    });
+    defer result.deinit(allocator);
+    try build_tool.process.requireSuccess(result);
+    try testing.expectEqualStrings("", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+}
+
+test "native config tool failures retain only private compiled error and role" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.image_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const repository = try imageRepository(&temporary, "invalid-tool");
+    defer allocator.free(repository);
+    const log_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "image.log" },
+    );
+    defer allocator.free(log_path);
+    var environment = try imageEnvironment(
+        fixture,
+        "relative/bison-data-does-not-exist",
+        log_path,
+    );
+    defer environment.deinit();
+    try environment.put("WAMR_CI_TOOL_MAKE", "relative/make-does-not-exist");
+    const result = try runCli(
+        cli,
+        &.{ cli, "olddefconfig", "--repository", repository },
+        &environment,
+    );
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try expectExit(result.term, 2);
+    try testing.expectEqualStrings(
+        "wamr_aot_build_failed category=local_failure\n",
+        result.stderr,
+    );
+    const error_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/build/native-environment/failure-error-name.txt" },
+    );
+    defer allocator.free(error_path);
+    const error_name = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        error_path,
+        allocator,
+        .limited(96),
+    );
+    defer allocator.free(error_name);
+    try testing.expectEqualStrings("InvalidToolOverride", error_name);
+    const role_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/build/native-environment/failure-tool-role.txt" },
+    );
+    defer allocator.free(role_path);
+    const role = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        role_path,
+        allocator,
+        .limited(96),
+    );
+    defer allocator.free(role);
+    try testing.expectEqualStrings("make", role);
 }
 
 test "tool selection preserves override PATH and retained-fd precedence" {

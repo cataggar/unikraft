@@ -1797,6 +1797,19 @@ scope["compute"](Path(sys.argv[3]).read_bytes(), {}, False)
             }
 
         def command(runtime, expected, root, stage, args, *unused):
+            fixture_only = (
+                "WAMR_CI_PACKAGE",
+                "WAMR_CI_PYTHON",
+                "WAMR_CI_SUPERVISOR_FIXTURE",
+            )
+            if stage == "fixtures":
+                for name in fixture_only:
+                    self.assertIn(name, ci.COMMAND_ENVIRONMENT)
+                    self.assertIn(name, os.environ)
+            if stage in ("prepare", "config", "native-image"):
+                for name in fixture_only:
+                    self.assertNotIn(name, ci.COMMAND_ENVIRONMENT)
+                    self.assertNotIn(name, os.environ)
             if stage == "config":
                 self.assertEqual(os.environ["KCONFIG_OVERWRITECONFIG"], "1")
                 self.assertEqual(os.environ["M4"], "/tools/m4")
@@ -2894,6 +2907,57 @@ source/generated/
                 with self.assertRaises(ci.Refusal):
                     ci.validate_supervised_command_binding(
                         record, stage, changed_identities)
+
+    def test_publication_binds_native_producer_to_consumer_custody(self):
+        def input_record(identity):
+            return {
+                "metadata": [
+                    os.makedev(
+                        identity["device_major"], identity["device_minor"]),
+                    identity["inode"], identity["mode"], identity["uid"],
+                    os.getgid(), 1, identity["size"],
+                    identity["mtime_seconds"] * 1_000_000_000
+                    + identity["mtime_nanoseconds"],
+                    identity["ctime_seconds"] * 1_000_000_000
+                    + identity["ctime_nanoseconds"],
+                ],
+                "sha256": identity["content_sha256"],
+            }
+
+        for stage in ("adapter", "prepare", "config", "native-image"):
+            with self.subTest(stage=stage):
+                record, identities = self.supervised_binding(stage)
+                consumer_files = {
+                    role: input_record(identity)
+                    for role, identity in identities.items()
+                }
+                boot_files = {
+                    role: input_record(identities["command-supervisor"])
+                    for role in ("package_tool", "local_boot_tool")
+                }
+                roles = public_bundle.publication_role_identities(
+                    ci, consumer_files, boot_files)
+                public_bundle.supervised_command_record(
+                    ci, record, stage, roles, "producer_direct")
+
+                without_native = dict(consumer_files)
+                without_native.pop(ci.WAMR_AOT_BUILD_ROLE, None)
+                legacy_roles = public_bundle.publication_role_identities(
+                    ci, without_native, boot_files)
+                if stage == "adapter":
+                    public_bundle.supervised_command_record(
+                        ci, record, stage, legacy_roles, "producer_direct")
+                else:
+                    with self.assertRaises(ci.Refusal):
+                        public_bundle.supervised_command_record(
+                            ci, record, stage, legacy_roles, "producer_direct")
+                    altered = copy.deepcopy(consumer_files)
+                    altered[ci.WAMR_AOT_BUILD_ROLE]["sha256"] = "0" * 64
+                    altered_roles = public_bundle.publication_role_identities(
+                        ci, altered, boot_files)
+                    with self.assertRaises(ci.Refusal):
+                        public_bundle.supervised_command_record(
+                            ci, record, stage, altered_roles, "producer_direct")
 
     def test_public_command_binding_rehash_and_stage_substitution_are_closed(self):
         record, identities = self.supervised_binding(
@@ -4356,19 +4420,95 @@ source/generated/
         ci.save(root / "evidence/command-fixtures.json", {
             "exit_code": 1,
         })
+        ci.save(root / "evidence/command-config.json", {
+            "exit_code": 2,
+        })
+        app = self.root / "synthetic-app"
+        backend = app / "build/native-environment/diagnostics/image-42"
+        backend.mkdir(parents=True, mode=0o700)
+        for directory in (app / "build", app / "build/native-environment",
+                          backend.parent):
+            directory.chmod(0o700)
+        self.put(backend.parent.parent / "failure-error-name.txt",
+                 b"InvalidToolOverride")
+        self.put(backend.parent.parent / "failure-tool-role.txt", b"make")
+        ci.save(backend / "000-root-olddefconfig.json", {
+            "stage": "root-olddefconfig",
+            "primary": {"exited": 1},
+        })
+        self.put(backend / "000-root-olddefconfig.stderr",
+                 b"error: InvalidNativeMakePath\nPRIVATE_SYNTHETIC_STATE\n")
         ci.save(work / "report.json", {
             "passed": False, "cleanup_complete": True, "input_unchanged": True,
             "serial_valid": False, "serial_limit_reached": False,
             "failures": {"primary": {"arbitrary": "PRIVATE_SYNTHETIC_STATE"},
                          "cleanup": None, "recording": None},
         })
-        ci.diagnostics(runtime)
+        with mock.patch.object(ci, "APP", app):
+            ci.diagnostics(runtime)
         raw = (root / "evidence/diagnostics.json").read_bytes()
         self.assertNotIn(b"PRIVATE_SYNTHETIC_STATE", raw)
+        self.assertNotIn(b"InvalidToolOverride", raw)
+        self.assertNotIn(b'"make"', raw)
         self.assertNotIn(str(self.root).encode(), raw)
         self.assertIn(
             b"test_adapter.Evidence.test_safe_name", raw)
+        self.assertEqual(json.loads(raw)["build_failures"]["config"], {
+            "exit_code": 2, "backend_exit_code": 1,
+            "native_error_name_sha256":
+                hashlib.sha256(b"InvalidToolOverride").hexdigest(),
+            "tool_role_sha256": hashlib.sha256(b"make").hexdigest(),
+            "known_error_markers": ["InvalidNativeMakePath"],
+        })
         self.assertFalse((root / "evidence/result.json").exists())
+
+    def test_native_config_failure_digest_without_child_launch(self):
+        runtime = self.root
+        root = runtime / "compute"
+        root.mkdir(mode=0o700)
+        (root / "evidence").mkdir(mode=0o700)
+        ci.save(root / "evidence/command-config.json", {"exit_code": 2})
+        app = self.root / "synthetic-app"
+        state = app / "build/native-environment"
+        state.mkdir(parents=True, mode=0o700)
+        (app / "build").chmod(0o700)
+        (state / "diagnostics").mkdir(mode=0o700)
+        self.put(state / "failure-error-name.txt", b"InvalidBisonData")
+        with mock.patch.object(ci, "APP", app):
+            ci.diagnostics(runtime)
+        raw = (root / "evidence/diagnostics.json").read_bytes()
+        self.assertNotIn(b"InvalidBisonData", raw)
+        self.assertEqual(json.loads(raw)["build_failures"]["config"], {
+            "exit_code": 2,
+            "native_error_name_sha256":
+                hashlib.sha256(b"InvalidBisonData").hexdigest(),
+        })
+
+    def test_native_image_failure_digest_without_private_text(self):
+        runtime = self.root
+        root = runtime / "compute"
+        root.mkdir(mode=0o700)
+        (root / "evidence").mkdir(mode=0o700)
+        ci.save(root / "evidence/command-native-image.json", {"exit_code": 2})
+        app = self.root / "synthetic-app"
+        state = app / "build/native-environment"
+        state.mkdir(parents=True, mode=0o700)
+        (app / "build").chmod(0o700)
+        self.put(state / "failure-error-name.txt", b"ImageInputChanged")
+        self.put(state / "failure-image-guard.txt", b"config-after-root")
+        with mock.patch.object(ci, "APP", app):
+            ci.diagnostics(runtime)
+        raw = (root / "evidence/diagnostics.json").read_bytes()
+        self.assertNotIn(b"ImageInputChanged", raw)
+        self.assertNotIn(b"config-after-root", raw)
+        self.assertNotIn(str(self.root).encode(), raw)
+        self.assertEqual(json.loads(raw)["build_failures"]["native-image"], {
+            "exit_code": 2,
+            "native_error_name_sha256":
+                hashlib.sha256(b"ImageInputChanged").hexdigest(),
+            "image_guard_sha256":
+                hashlib.sha256(b"config-after-root").hexdigest(),
+        })
 
     def test_command_markers_are_closed_diagnostics_not_external_text(self):
         raw = (b"\xff\0error: UnsafeFile\nerror: InvalidNativeMakePath\n"

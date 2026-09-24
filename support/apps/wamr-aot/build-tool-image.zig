@@ -53,14 +53,36 @@ pub fn execute(
         arguments.repository,
     );
     defer repository.close(allocator, io);
-    try executeOpen(
+    executeOpen(
         allocator,
         io,
         inherited,
         executable_path,
         repository,
         arguments.command,
-    );
+    ) catch |err| {
+        if (contract.files.ensurePrivateDirectory(
+            io,
+            repository.app.dir,
+            "build",
+        )) |build| {
+            defer build.close(io);
+            if (contract.files.ensurePrivateDirectory(
+                io,
+                build,
+                "native-environment",
+            )) |state| {
+                defer state.close(io);
+                contract.files.writePrivateAtomicReplace(
+                    io,
+                    state,
+                    "failure-error-name.txt",
+                    @errorName(err),
+                ) catch {};
+            } else |_| {}
+        } else |_| {}
+        return err;
+    };
 }
 
 const Stage = enum {
@@ -309,36 +331,37 @@ const SelectedTools = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         environment: *const std.process.Environ.Map,
+        state: std.Io.Dir,
     ) !SelectedTools {
-        var zig = try contract.process.resolveTool(allocator, io, environment, "zig");
+        var zig = try resolveSelectedTool(allocator, io, environment, state, "zig");
         errdefer zig.close(allocator, io);
-        var make = try contract.process.resolveTool(allocator, io, environment, "make");
+        var make = try resolveSelectedTool(allocator, io, environment, state, "make");
         errdefer make.close(allocator, io);
-        var llvm_nm = try contract.process.resolveTool(allocator, io, environment, "llvm-nm");
+        var llvm_nm = try resolveSelectedTool(allocator, io, environment, state, "llvm-nm");
         errdefer llvm_nm.close(allocator, io);
-        var llvm_objcopy = try contract.process.resolveTool(allocator, io, environment, "llvm-objcopy");
+        var llvm_objcopy = try resolveSelectedTool(allocator, io, environment, state, "llvm-objcopy");
         errdefer llvm_objcopy.close(allocator, io);
-        var llvm_objdump = try contract.process.resolveTool(allocator, io, environment, "llvm-objdump");
+        var llvm_objdump = try resolveSelectedTool(allocator, io, environment, state, "llvm-objdump");
         errdefer llvm_objdump.close(allocator, io);
-        var llvm_readelf = try contract.process.resolveTool(allocator, io, environment, "llvm-readelf");
+        var llvm_readelf = try resolveSelectedTool(allocator, io, environment, state, "llvm-readelf");
         errdefer llvm_readelf.close(allocator, io);
-        var llvm_strip = try contract.process.resolveTool(allocator, io, environment, "llvm-strip");
+        var llvm_strip = try resolveSelectedTool(allocator, io, environment, state, "llvm-strip");
         errdefer llvm_strip.close(allocator, io);
-        var bison = try contract.process.resolveTool(allocator, io, environment, "bison");
+        var bison = try resolveSelectedTool(allocator, io, environment, state, "bison");
         errdefer bison.close(allocator, io);
-        var flex = try contract.process.resolveTool(allocator, io, environment, "flex");
+        var flex = try resolveSelectedTool(allocator, io, environment, state, "flex");
         errdefer flex.close(allocator, io);
-        var m4 = try contract.process.resolveTool(allocator, io, environment, "m4");
+        var m4 = try resolveSelectedTool(allocator, io, environment, state, "m4");
         errdefer m4.close(allocator, io);
-        var bash = try contract.process.resolveTool(allocator, io, environment, "bash");
+        var bash = try resolveSelectedTool(allocator, io, environment, state, "bash");
         errdefer bash.close(allocator, io);
-        var cp = try contract.process.resolveTool(allocator, io, environment, "cp");
+        var cp = try resolveSelectedTool(allocator, io, environment, state, "cp");
         errdefer cp.close(allocator, io);
-        var mkdir = try contract.process.resolveTool(allocator, io, environment, "mkdir");
+        var mkdir = try resolveSelectedTool(allocator, io, environment, state, "mkdir");
         errdefer mkdir.close(allocator, io);
-        var python3 = try contract.process.resolveTool(allocator, io, environment, "python3");
+        var python3 = try resolveSelectedTool(allocator, io, environment, state, "python3");
         errdefer python3.close(allocator, io);
-        var readlink = try contract.process.resolveTool(allocator, io, environment, "readlink");
+        var readlink = try resolveSelectedTool(allocator, io, environment, state, "readlink");
         errdefer readlink.close(allocator, io);
         return .{
             .zig = zig,
@@ -405,6 +428,73 @@ const SelectedTools = struct {
     }
 };
 
+fn resolveSelectedTool(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environment: *const std.process.Environ.Map,
+    state: std.Io.Dir,
+    name: []const u8,
+) !contract.process.Tool {
+    return contract.process.resolveTool(allocator, io, environment, name) catch |err| {
+        contract.files.writePrivateAtomicReplace(
+            io,
+            state,
+            "failure-tool-role.txt",
+            name,
+        ) catch {};
+        return err;
+    };
+}
+
+fn imageInputChanged(io: std.Io, state: std.Io.Dir, guard: []const u8) anyerror {
+    contract.files.writePrivateAtomicReplace(
+        io,
+        state,
+        "failure-image-guard.txt",
+        guard,
+    ) catch {};
+    return error.ImageInputChanged;
+}
+
+fn configInputChanged(
+    io: std.Io,
+    state: std.Io.Dir,
+    path: []const u8,
+    before: [64]u8,
+) anyerror {
+    var current = contract.files.RetainedFile.open(io, path, .private) catch
+        return imageInputChanged(io, state, "config-unavailable");
+    defer current.close(io);
+    const observed = digestRetained(io, current) catch
+        return imageInputChanged(io, state, "config-unstable");
+    const same = std.mem.eql(u8, &before, &observed);
+    return imageInputChanged(io, state, if (same)
+        "config-after-identity-same-bytes"
+    else
+        "config-after-identity-changed-bytes");
+}
+
+fn rebindConfigAfterRoot(
+    io: std.Io,
+    state: std.Io.Dir,
+    path: []const u8,
+    previous: contract.files.RetainedFile,
+    before: [64]u8,
+) !contract.files.RetainedFile {
+    var current = contract.files.RetainedFile.open(io, path, .private) catch
+        return imageInputChanged(io, state, "config-unavailable");
+    errdefer current.close(io);
+    const observed = digestRetained(io, current) catch
+        return imageInputChanged(io, state, "config-unstable");
+    if (!std.mem.eql(u8, &before, &observed))
+        return imageInputChanged(io, state, "config-after-root-changed-bytes");
+    if (current.file_snapshot.mode != previous.file_snapshot.mode or
+        current.file_snapshot.uid != previous.file_snapshot.uid or
+        current.file_snapshot.size != previous.file_snapshot.size)
+        return imageInputChanged(io, state, "config-after-root-changed-metadata");
+    return current;
+}
+
 const NamedDigest = struct {
     name: []u8,
     sha256: [64]u8,
@@ -461,15 +551,54 @@ fn executeOpen(
         ),
         .diagnostics = &diagnostics,
     };
-    var tools = try SelectedTools.resolve(allocator, io, inherited);
+    var tools = try SelectedTools.resolve(allocator, io, inherited, state);
     defer tools.close(allocator, io);
-    var self_tool = try contract.process.openTool(
+    var self_tool = contract.process.openTool(
         allocator,
         io,
         "wamr-aot-tool",
         executable_path,
-    );
+    ) catch |err| {
+        contract.files.writePrivateAtomicReplace(
+            io,
+            state,
+            "failure-tool-role.txt",
+            "wamr-aot-tool",
+        ) catch {};
+        return err;
+    };
     defer self_tool.close(allocator, io);
+    const running_file = try std.Io.Dir.openFileAbsolute(io, "/proc/self/exe", .{
+        .mode = .read_only,
+        .follow_symlinks = true,
+    });
+    defer running_file.close(io);
+    var running = try core.process.Executable.fromFile(io, running_file);
+    defer running.close(io);
+    // The supervisor executes a private byte-for-byte snapshot with a different inode.
+    if (self_tool.executable.identity.size != running.identity.size or
+        !std.mem.eql(
+            u8,
+            &self_tool.executable.identity.content_sha256,
+            &running.identity.content_sha256,
+        ))
+        return imageInputChanged(io, state, "running-bytes");
+    if (inherited.get("WAMR_CI_RETAINED_EXECUTABLE")) |retained_path| {
+        if (!contract.process.retainedDescriptorPath(retained_path))
+            return imageInputChanged(io, state, "retained-path");
+        const retained_file = std.Io.Dir.openFileAbsolute(io, retained_path, .{
+            .mode = .read_only,
+            .follow_symlinks = true,
+        }) catch return imageInputChanged(io, state, "retained-open");
+        defer retained_file.close(io);
+        var retained = core.process.Executable.fromFile(io, retained_file) catch
+            return imageInputChanged(io, state, "retained-validation");
+        defer retained.close(io);
+        if (!std.meta.eql(self_tool.executable.identity, retained.identity))
+            return imageInputChanged(io, state, "retained-identity");
+    } else if (!std.meta.eql(self_tool.executable.identity, running.identity)) {
+        return imageInputChanged(io, state, "direct-identity");
+    }
 
     const private_paths = try createEnvironmentDirectories(
         a,
@@ -539,12 +668,14 @@ fn executeOpen(
 
     var config_input: ?contract.files.RetainedFile = null;
     defer if (config_input) |*file| file.close(io);
+    var config_before_hash: ?[64]u8 = null;
     var runtime_input: ?contract.files.RetainedFile = null;
     defer if (runtime_input) |*file| file.close(io);
     var application_before: ?[]NamedDigest = null;
     defer if (application_before) |records| freeNamedDigests(allocator, records);
     if (command == .native_images) {
         config_input = try contract.files.RetainedFile.open(io, config_path, .private);
+        config_before_hash = try digestRetained(io, config_input.?);
         const runtime_path = try std.fs.path.join(
             a,
             &.{ build_path, "artifacts", "identity.json" },
@@ -572,21 +703,29 @@ fn executeOpen(
     );
     defer root_result.deinit(allocator);
 
-    var tools_after = try SelectedTools.resolve(allocator, io, inherited);
+    var tools_after = try SelectedTools.resolve(allocator, io, inherited, state);
     defer tools_after.close(allocator, io);
     if (!SelectedTools.same(&tools, &tools_after))
-        return error.ImageInputChanged;
-    var self_after = try contract.process.openTool(
+        return imageInputChanged(io, state, "tools-after-root");
+    var self_after = contract.process.openTool(
         allocator,
         io,
         "wamr-aot-tool",
         executable_path,
-    );
+    ) catch |err| {
+        contract.files.writePrivateAtomicReplace(
+            io,
+            state,
+            "failure-tool-role.txt",
+            "wamr-aot-tool",
+        ) catch {};
+        return err;
+    };
     defer self_after.close(allocator, io);
     if (!std.meta.eql(
         self_tool.executable.identity,
         self_after.executable.identity,
-    )) return error.ImageInputChanged;
+    )) return imageInputChanged(io, state, "self-after-root");
 
     if (command == .olddefconfig) {
         var solved = try contract.files.RetainedFile.open(io, config_path, .private);
@@ -598,8 +737,19 @@ fn executeOpen(
         return;
     }
 
-    config_input.?.verify(io) catch return error.ImageInputChanged;
-    runtime_input.?.verify(io) catch return error.ImageInputChanged;
+    config_input.?.verify(io) catch {
+        const rebound = try rebindConfigAfterRoot(
+            io,
+            state,
+            config_path,
+            config_input.?,
+            config_before_hash.?,
+        );
+        config_input.?.close(io);
+        config_input = rebound;
+    };
+    runtime_input.?.verify(io) catch
+        return imageInputChanged(io, state, "runtime-after-root");
     const application_after = try applicationIdentities(
         allocator,
         io,
@@ -607,7 +757,7 @@ fn executeOpen(
     );
     defer freeNamedDigests(allocator, application_after);
     if (!sameNamedDigests(application_before.?, application_after))
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "application-after-root");
 
     var git = try contract.process.resolveTool(allocator, io, inherited, "git");
     defer git.close(allocator, io);
@@ -697,8 +847,15 @@ fn executeOpen(
         runtime_inputs_sha256,
     );
     try published.verify(io);
-    config_input.?.verify(io) catch return error.ImageInputChanged;
-    runtime_input.?.verify(io) catch return error.ImageInputChanged;
+    config_input.?.verify(io) catch
+        return configInputChanged(
+            io,
+            state,
+            config_path,
+            config_before_hash.?,
+        );
+    runtime_input.?.verify(io) catch
+        return imageInputChanged(io, state, "runtime-after-identity");
     const final_applications = try applicationIdentities(
         allocator,
         io,
@@ -706,15 +863,15 @@ fn executeOpen(
     );
     defer freeNamedDigests(allocator, final_applications);
     if (!sameNamedDigests(application_after, final_applications))
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "application-after-identity");
     const final_images = try imageIdentities(allocator, io, build_path);
     defer freeNamedDigests(allocator, final_images);
     if (!sameNamedDigests(file_identities, final_images))
-        return error.ImageInputChanged;
-    var final_tools = try SelectedTools.resolve(allocator, io, inherited);
+        return imageInputChanged(io, state, "images-after-identity");
+    var final_tools = try SelectedTools.resolve(allocator, io, inherited, state);
     defer final_tools.close(allocator, io);
     if (!SelectedTools.same(&tools, &final_tools))
-        return error.ImageInputChanged;
+        return imageInputChanged(io, state, "tools-after-identity");
     var final_self = try contract.process.openTool(
         allocator,
         io,
@@ -725,7 +882,7 @@ fn executeOpen(
     if (!std.meta.eql(
         self_tool.executable.identity,
         final_self.executable.identity,
-    )) return error.ImageInputChanged;
+    )) return imageInputChanged(io, state, "self-after-identity");
 }
 
 const EnvironmentPaths = struct {

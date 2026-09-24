@@ -1205,6 +1205,26 @@ def publication_lineage_v2(handoff, stage, bundle):
             == b"primary=0 cleanup=0\n")
 
 
+def publication_role_identities(ci, consumer_files, boot_files):
+    identities = {
+        "command-supervisor": ci.native_executable_identity(
+            consumer_files["command-supervisor"]),
+        **{
+            "tool:" + name: ci.native_executable_identity(
+                consumer_files["tool:" + name])
+            for name in ci.HOST_TOOLS
+        },
+        "input:package_tool": ci.native_executable_identity(
+            boot_files["package_tool"]),
+        "input:local_boot_tool": ci.native_executable_identity(
+            boot_files["local_boot_tool"]),
+    }
+    if ci.WAMR_AOT_BUILD_ROLE in consumer_files:
+        identities[ci.WAMR_AOT_BUILD_ROLE] = ci.native_executable_identity(
+            consumer_files[ci.WAMR_AOT_BUILD_ROLE])
+    return identities
+
+
 def publication_records(
         handoff, stage, source, transport_context,
         bundle_name="bundle.json"):
@@ -1273,19 +1293,8 @@ def publication_records(
             digest_string(value)
     if not pre_supervisor:
         consumer_files = start["consumer_inputs"]["files"]
-        role_identities = {
-            "command-supervisor": ci.native_executable_identity(
-                consumer_files["command-supervisor"]),
-            **{
-                "tool:" + name: ci.native_executable_identity(
-                    consumer_files["tool:" + name])
-                for name in ci.HOST_TOOLS
-            },
-            "input:package_tool": ci.native_executable_identity(
-                boot_inputs["files"]["package_tool"]),
-            "input:local_boot_tool": ci.native_executable_identity(
-                boot_inputs["files"]["local_boot_tool"]),
-        }
+        role_identities = publication_role_identities(
+            ci, consumer_files, boot_inputs["files"])
     for name in sorted(evidence_names):
         item = ci.document(stage / "evidence" / name)
         if name.startswith("command-"):

@@ -4977,15 +4977,22 @@ def build(runtime, wamr):
             and initial["source_custody"] == initial_source["custody"],
             "source changed during native tool installation")
     save(root / "evidence/build-start.json", initial)
-    COMMAND_ENVIRONMENT.update({
+    fixture_environment = {
         "WAMR_CI_PACKAGE": str(root / "tools/bin/wamr-ci-package"),
         "WAMR_CI_PYTHON": tool("python3"),
         "WAMR_CI_SUPERVISOR_FIXTURE":
             str(root / "tools/bin/wamr-ci-supervisor-fixture"),
-    })
+    }
+    COMMAND_ENVIRONMENT.update(fixture_environment)
     os.environ.update(COMMAND_ENVIRONMENT)
-    run_custodied(runtime, initial, root, "fixtures", [
-        sys.executable, "-m", "unittest", "discover", "-s", HERE / "tests", "-v"])
+    try:
+        run_custodied(runtime, initial, root, "fixtures", [
+            sys.executable, "-m", "unittest", "discover",
+            "-s", HERE / "tests", "-v"])
+    finally:
+        for name in fixture_environment:
+            COMMAND_ENVIRONMENT.pop(name, None)
+            os.environ.pop(name, None)
     wamr_aot_build = root / "tools/bin/uk-wamr-aot-build"
     run_custodied(runtime, initial, root, "prepare", [
         wamr_aot_build, "prepare", "--repository", REPO,
@@ -5453,6 +5460,107 @@ def diagnostics(runtime):
                 "tests": unittest_failure_markers(
                     read(root / "private/fixtures.log", 64 * 1024)),
             }
+    except (OSError, ValueError, KeyError, TypeError, Refusal):
+        pass
+    try:
+        command = document(root / "evidence/command-config.json")
+        require(type(command["exit_code"]) is int
+                and command["exit_code"] != 0, "invalid diagnostic")
+        private = APP / "build"
+        for component in ("native-environment",):
+            info = private.lstat()
+            require(stat.S_ISDIR(info.st_mode)
+                    and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o700,
+                    "invalid diagnostic directory")
+            private /= component
+        info = private.lstat()
+        require(stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700,
+                "invalid diagnostic directory")
+        error_name = read(private / "failure-error-name.txt", 96)
+        require(re.fullmatch(rb"[A-Z][A-Za-z0-9]{0,79}", error_name),
+                "invalid native error name")
+        build_failures["config"] = {
+            "exit_code": command["exit_code"],
+            "native_error_name_sha256": hashlib.sha256(error_name).hexdigest(),
+        }
+        try:
+            role = read(private / "failure-tool-role.txt", 96)
+            require(re.fullmatch(rb"[a-z][a-z0-9-]{0,79}", role),
+                    "invalid native tool role")
+            build_failures["config"]["tool_role_sha256"] = (
+                hashlib.sha256(role).hexdigest())
+        except (OSError, Refusal):
+            pass
+        private /= "diagnostics"
+        info = private.lstat()
+        require(stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700,
+                "invalid diagnostic directory")
+        entries = list(private.iterdir())
+        require(len(entries) == 1
+                and re.fullmatch(r"image-[0-9]+(?:-[0-9]+)?", entries[0].name),
+                "invalid diagnostic directory")
+        info = entries[0].lstat()
+        require(stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700,
+                "invalid diagnostic directory")
+        backend = document(entries[0] / "000-root-olddefconfig.json")
+        code = backend["primary"]["exited"]
+        require(backend["stage"] == "root-olddefconfig"
+                and type(code) is int and 0 <= code <= 255,
+                "invalid diagnostic")
+        output = read(entries[0] / "000-root-olddefconfig.stderr", 64 * 1024)
+        build_failures["config"].update({
+            "backend_exit_code": code,
+            "known_error_markers": command_error_markers(output),
+        })
+    except (OSError, ValueError, KeyError, TypeError, Refusal):
+        pass
+    try:
+        command = document(root / "evidence/command-native-image.json")
+        require(type(command["exit_code"]) is int
+                and command["exit_code"] != 0, "invalid diagnostic")
+        private = APP / "build"
+        for component in ("native-environment",):
+            info = private.lstat()
+            require(stat.S_ISDIR(info.st_mode)
+                    and info.st_uid == os.getuid()
+                    and stat.S_IMODE(info.st_mode) == 0o700,
+                    "invalid diagnostic directory")
+            private /= component
+        info = private.lstat()
+        require(stat.S_ISDIR(info.st_mode)
+                and info.st_uid == os.getuid()
+                and stat.S_IMODE(info.st_mode) == 0o700,
+                "invalid diagnostic directory")
+        error_name = read(private / "failure-error-name.txt", 96)
+        require(re.fullmatch(rb"[A-Z][A-Za-z0-9]{0,79}", error_name),
+                "invalid native error name")
+        build_failures["native-image"] = {
+            "exit_code": command["exit_code"],
+            "native_error_name_sha256": hashlib.sha256(error_name).hexdigest(),
+        }
+        try:
+            guard = read(private / "failure-image-guard.txt", 96)
+            require(re.fullmatch(rb"[a-z][a-z0-9-]{0,79}", guard),
+                    "invalid native image guard")
+            build_failures["native-image"]["image_guard_sha256"] = (
+                hashlib.sha256(guard).hexdigest())
+        except (OSError, Refusal):
+            pass
+        try:
+            role = read(private / "failure-tool-role.txt", 96)
+            require(re.fullmatch(rb"[a-z][a-z0-9-]{0,79}", role),
+                    "invalid native tool role")
+            build_failures["native-image"]["tool_role_sha256"] = (
+                hashlib.sha256(role).hexdigest())
+        except (OSError, Refusal):
+            pass
     except (OSError, ValueError, KeyError, TypeError, Refusal):
         pass
     save(root / "evidence/diagnostics.json", {

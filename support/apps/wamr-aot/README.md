@@ -85,6 +85,17 @@ generated directories after retaining needed evidence.
 directory. The existing native Make environment guard still validates it;
 an invalid override never falls back to ambient data. Hosted CI reuses the
 authenticated package-data acquisition rather than writable `/usr/share`.
+For supervised config and image builds, `WAMR_CI_EXECUTABLE_PATH` names the
+supervisor's physical installed executable. The producer binds its physical
+identity to the supervisor's retained descriptor and its bytes to the
+running `/proc/self/exe` snapshot before passing the path to the root build;
+an ambient path naming another executable is refused. Direct invocations
+continue to resolve and physically verify their own executable.
+After the trusted root `native-images` command, a metadata-only rewrite of
+`build/.config` is accepted only if its private-file policy, ownership, mode,
+size and solved bytes still match the retained pre-build config. The rebound
+file remains strictly bound through identity publication; changed bytes and
+subsequent rewrites are refused.
 
 ## Memory ownership and failure paths
 
