@@ -250,7 +250,13 @@ fn inspectOutput(
         const length = try link.readLink(io, "", &buffer);
         if (length != before.size) return error.IgnoredChanged;
         try limits.addBounded(&state.bytes, length, limits.ignored_bytes);
-        const target = try std.fs.path.resolve(allocator, &.{ parent_path, buffer[0..length] });
+        const target = if (std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator)) |actual| block: {
+            defer allocator.free(actual);
+            break :block try allocator.dupe(u8, actual);
+        } else |err| switch (err) {
+            error.FileNotFound => try std.fs.path.resolve(allocator, &.{ parent_path, buffer[0..length] }),
+            else => return error.IgnoredLinkEscapesRole,
+        };
         defer allocator.free(target);
         const role_root = try std.fs.path.join(allocator, &.{ repo, role });
         defer allocator.free(role_root);

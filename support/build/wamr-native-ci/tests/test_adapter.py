@@ -1508,6 +1508,18 @@ class Evidence(unittest.TestCase):
         record, unused_directories = ci.physical_tree_record(dangling)
         del unused_directories
         self.assertEqual(record["symlinks"], 1)
+        depth_64 = (
+            Path("/usr") / f"wamr-ci-missing-depth-{os.getpid()}"
+            / Path(*(["x"] * 62))
+        )
+        self.assertEqual(len(depth_64.parts) - 1, 64)
+        (dangling / "deep").symlink_to(depth_64)
+        self.assertEqual(ci.physical_tree_record(dangling)[0]["symlinks"], 2)
+        (dangling / "deep").unlink()
+        (dangling / "deep").symlink_to(depth_64 / "x")
+        with self.assertRaisesRegex(
+                ci.Refusal, "unsafe physical input tree symlink"):
+            ci.physical_tree_record(dangling)
 
     def test_physical_tree_mutable_dangling_symlink_custody(self):
         dangling = self.root / "dangling-symlink-tree"
@@ -2646,6 +2658,12 @@ source/generated/
         (repository / ".d/tool-link").symlink_to("future-tool")
         ci.source(repository)
         (repository / ".d/tool-link").unlink()
+        (repository / ".d/a").symlink_to("b")
+        (repository / ".d/b").symlink_to("a")
+        with self.assertRaisesRegex(ci.Refusal, "symlink escapes repository"):
+            ci.source(repository)
+        (repository / ".d/a").unlink()
+        (repository / ".d/b").unlink()
         outside = self.root / "ignored-unsafe-outside"
         self.put(outside, b"outside\n")
         (repository / ".d/tool-link").symlink_to(

@@ -397,9 +397,35 @@ const TreeCounter = struct {
     directories: usize = 0,
     symlinks: usize = 0,
     bytes: usize = 0,
+    hash_work: usize = 0,
+    hash_limit: usize = limits.input_bytes,
+    identities: std.AutoHashMap([9]i128, [64]u8),
     content: Sha256,
     physical_hash: Sha256,
 };
+
+fn treeFile(io: std.Io, path: []const u8, state: *TreeCounter) !physical.File {
+    var retained = try files.RetainedFile.open(io, path, .artifact);
+    defer retained.close(io);
+    const before = retained.file_snapshot;
+    if (before.mode & linux.S.IFMT != linux.S.IFREG or
+        (before.uid == 0 and before.nlink == 0) or
+        (before.uid != 0 and before.nlink != 1) or
+        (before.uid != linux.geteuid() and before.uid != 0) or
+        before.mode & 0o022 != 0 or before.size > limits.input_file)
+        return error.UnsafeFile;
+    const metadata = physical.metadata(before);
+    if (state.identities.get(metadata)) |sha256| {
+        try retained.verify(io);
+        return .{ .bytes = before.size, .sha256 = sha256, .metadata = metadata };
+    }
+    try limits.addBounded(&state.hash_work, @intCast(before.size), state.hash_limit);
+    const identity = try physical.readFile(io, path, limits.input_file, false);
+    if (!std.meta.eql(identity.metadata, metadata)) return error.InputChanged;
+    try retained.verify(io);
+    try state.identities.put(metadata, identity.sha256);
+    return identity;
+}
 
 fn componentMap(allocator: std.mem.Allocator, io: std.Io, target: []const u8, is_directory: bool) !std.json.ObjectMap {
     var ancestors: std.ArrayList(DirectoryRecord) = .empty;
@@ -439,7 +465,9 @@ fn bindMissingTarget(
 ) !void {
     const target = try std.fs.path.resolve(allocator, &.{ directory, raw_target });
     defer allocator.free(target);
-    if (target.len > limits.ignored_path) return error.UnsafeInputLink;
+    if (target.len > limits.ignored_path or target.len < 2 or target[0] != '/')
+        return error.UnsafeInputLink;
+    limits.relative(target[1..], limits.ignored_path, limits.ignored_depth) catch return error.UnsafeInputLink;
     var missing: std.ArrayList([]const u8) = .empty;
     defer missing.deinit(allocator);
     var probe: []const u8 = target;
@@ -510,7 +538,7 @@ fn treeWalk(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: 
             if (info.size > limits.input_file) return error.LimitExceeded;
             const absolute = try std.fs.path.join(allocator, &.{ root, relative });
             defer allocator.free(absolute);
-            const identity = try physical.readFile(io, absolute, limits.input_file, false);
+            const identity = try treeFile(io, absolute, state);
             if (!std.meta.eql(identity.metadata, physical.metadata(info))) return error.InputChanged;
             try limits.addBounded(&state.bytes, @intCast(info.size), limits.input_bytes);
             try physical.bind(allocator, &state.content, .{ "file", relative, info.size, identity.sha256 });
@@ -540,7 +568,7 @@ fn treeWalk(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: 
                         (actual.len > root.len and std.mem.startsWith(u8, actual, root) and actual[root.len] == '/')))
                     return error.UnsafeInputLink;
                 var target_file: ?physical.File = null;
-                if (!directory_target) target_file = try physical.readFile(io, actual, limits.input_file, false);
+                if (!directory_target) target_file = try treeFile(io, actual, state);
                 const target_metadata = if (directory_target)
                     physical.metadata(try physical.directory(io, actual, false))
                 else
@@ -572,11 +600,15 @@ fn treeWalk(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: 
     if (!files.sameSnapshot(before, try physical.directory(io, path, false))) return error.InputChanged;
 }
 
-pub fn tree(allocator: std.mem.Allocator, io: std.Io, binding: Binding) !TreeRecord {
+fn treeBounded(allocator: std.mem.Allocator, io: std.Io, binding: Binding, hash_limit: usize) !TreeRecord {
+    if (hash_limit > limits.input_bytes) return error.LimitExceeded;
     var state: TreeCounter = .{
+        .hash_limit = hash_limit,
+        .identities = std.AutoHashMap([9]i128, [64]u8).init(allocator),
         .content = Sha256.init(.{}),
         .physical_hash = Sha256.init(.{}),
     };
+    defer state.identities.deinit();
     state.content.update("uk.wamr.consumer-input-tree-content-v2\x00");
     state.physical_hash.update("uk.wamr.consumer-input-tree-physical-v2\x00");
     try treeWalk(allocator, io, binding.path, "", &state);
@@ -591,6 +623,16 @@ pub fn tree(allocator: std.mem.Allocator, io: std.Io, binding: Binding) !TreeRec
         .physical_sha256 = physical.hex(&state.physical_hash),
     };
 }
+
+pub fn tree(allocator: std.mem.Allocator, io: std.Io, binding: Binding) !TreeRecord {
+    return treeBounded(allocator, io, binding, limits.input_bytes);
+}
+
+pub const Fixture = struct {
+    pub fn treeWithHashLimit(allocator: std.mem.Allocator, io: std.Io, binding: Binding, hash_limit: usize) !TreeRecord {
+        return treeBounded(allocator, io, binding, hash_limit);
+    }
+};
 
 fn addAncestors(allocator: std.mem.Allocator, io: std.Io, path: []const u8, result: *std.ArrayList(DirectoryRecord)) !void {
     var current: ?[]const u8 = path;
