@@ -47,6 +47,8 @@ and the build gate verifies every required result. Each stream is capped at
 full allowed 8 MiB combined output is encoded without truncation. The
 `test-unit` adapter build target also runs `test-controller` in its isolated
 Zig cache, rather than silently omitting native controller fault fixtures.
+Custody link and depth fixtures use that selected cache even when production
+sets `ZIG_LOCAL_CACHE_DIR` outside the source checkout.
 The protected x86 job exercises `test-controller` first in a separate clean
 worktree, keeping its test dependencies and cache outside the production
 source checkout; this reports fixture failures without exposing private

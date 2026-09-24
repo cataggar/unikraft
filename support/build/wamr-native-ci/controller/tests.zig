@@ -874,7 +874,7 @@ test "input tree deduplicates bounded symlink hash work against Python" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const input = controller.input_custody;
-    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    const base_path = try allocator.dupe(u8, options.fixture_root);
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
@@ -925,7 +925,7 @@ test "missing input symlink target respects Python's absolute 64-component bound
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const input = controller.input_custody;
-    const base_path = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/.zig-cache" });
+    const base_path = try allocator.dupe(u8, options.fixture_root);
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
