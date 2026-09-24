@@ -35,6 +35,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "local_boot_serial", .module = local_serial },
         },
     });
+    const log_cli = b.addExecutable(.{ .name = "uk-wamr-log-validate", .root_module = b.createModule(.{
+        .root_source_file = b.path("../../../apps/wamr-aot/validator/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wamr_log_validator", .module = wamr_validator }},
+    }) });
+    b.installArtifact(log_cli);
     const imports = [_]std.Build.Module.Import{
         .{ .name = "hyperv_core", .module = core },
         .{ .name = "preparation", .module = preparation },
@@ -51,7 +58,12 @@ pub fn build(b: *std.Build) void {
         .name = "hyperv-direct-validation-fixtures",
         .root_module = b.createModule(.{ .root_source_file = b.path("fixtures.zig"), .target = target, .optimize = optimize, .imports = &imports }),
     });
-    b.step("test", "Run native read-only direct validation fixtures (no cloud or disks)").dependOn(&b.addRunArtifact(fixtures).step);
+    const test_step = b.step("test", "Run native read-only direct validation fixtures (no cloud or disks)");
+    test_step.dependOn(&b.addRunArtifact(fixtures).step);
+    const log_cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
+    log_cli_tests.addFileArg(b.path("../../../apps/wamr-aot/validator/cli_test.py"));
+    log_cli_tests.addFileArg(log_cli.getEmittedBin());
+    test_step.dependOn(&log_cli_tests.step);
 
     const fixture_tools = b.step("fixture-tools", "Install isolated native lifecycle fixture tools (no controller)");
     const fake = b.addExecutable(.{

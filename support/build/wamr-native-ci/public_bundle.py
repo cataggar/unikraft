@@ -634,9 +634,18 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
             strict=True)
     wamr_aot_build = (
         runtime / ci.WAMR_AOT_BUILD_RELATIVE).resolve(strict=True)
+    validator_path = runtime / ci.WAMR_LOG_VALIDATOR_RELATIVE
+    require(ci.WAMR_LOG_VALIDATOR_ROLE in files or
+            not (validator_path.exists() or validator_path.is_symlink()),
+            "installed log validator missing from consumer custody")
+    log_validator = (
+        validator_path.resolve(strict=True)
+        if ci.WAMR_LOG_VALIDATOR_ROLE in files else None)
     require(files["command-supervisor"]["path"] == str(supervisor)
             and files[ci.WAMR_AOT_BUILD_ROLE]["path"]
             == str(wamr_aot_build)
+            and (log_validator is None or
+                 files[ci.WAMR_LOG_VALIDATOR_ROLE]["path"] == str(log_validator))
             and files["wamr-source-archive"]["path"]
             == str((runtime / "custody/wamr-source.tar").resolve(
                 strict=True)))
@@ -646,6 +655,9 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
             Path(files["tool:" + name]["path"])))
     runtime_paths.update(ci.executable_runtime_paths(supervisor))
     runtime_paths.update(ci.executable_runtime_paths(wamr_aot_build))
+    if log_validator is not None:
+        runtime_paths.update(ci.executable_runtime_paths(log_validator))
+        required_files.add(ci.WAMR_LOG_VALIDATOR_ROLE)
     expected_files = required_files | {
         "runtime:" + str(path) for path in runtime_paths
     }
@@ -1222,6 +1234,9 @@ def publication_role_identities(ci, consumer_files, boot_files):
     if ci.WAMR_AOT_BUILD_ROLE in consumer_files:
         identities[ci.WAMR_AOT_BUILD_ROLE] = ci.native_executable_identity(
             consumer_files[ci.WAMR_AOT_BUILD_ROLE])
+    if ci.WAMR_LOG_VALIDATOR_ROLE in consumer_files:
+        identities[ci.WAMR_LOG_VALIDATOR_ROLE] = ci.native_executable_identity(
+            consumer_files[ci.WAMR_LOG_VALIDATOR_ROLE])
     return identities
 
 

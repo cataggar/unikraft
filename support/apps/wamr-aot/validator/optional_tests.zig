@@ -44,6 +44,25 @@ test "snapshot and all three pinned sampler modes preserve raw hashes and normal
     }
 }
 
+test "sampler identity requires explicit jit_mode null for AOT, without changing snapshot" {
+    const aot_source = cases[1][2];
+    try t.expect(std.mem.indexOf(u8, aot_source, "\"jit_mode\": null") != null);
+    var aot = try validator.records.OptionalIdentity.parse(a, aot_source);
+    try t.expect(aot.jit_mode == null);
+    aot.deinit();
+    _ = try check(.aot, cases[1][1], aot_source);
+
+    const missing = try mutate(aot_source, ", \"jit_mode\": null", "");
+    defer a.free(missing);
+    try t.expectError(error.MissingField, validator.records.OptionalIdentity.parse(a, missing));
+    try refuse(.aot, cases[1][1], missing);
+
+    var snapshot = try validator.records.OptionalIdentity.parse(a, cases[0][2]);
+    defer snapshot.deinit();
+    try t.expect(snapshot.jit_mode == null);
+    _ = try check(.snapshot, cases[0][1], cases[0][2]);
+}
+
 test "optional lifecycle, strict sampler keys, integer types and identity refuse mutations" {
     inline for (cases) |fixture| {
         const mode, const raw, const source = fixture;

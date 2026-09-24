@@ -147,6 +147,15 @@ def main(binary):
         for accepted in (raw, cases.console_frame(raw), b"\n" + raw, raw + b"trailing console\n"):
             compare(binary, mode, accepted, identity, sdk, True)
             count += 1
+        if mode == "aot":
+            assert "jit_mode" in identity and identity["jit_mode"] is None
+            compare(binary, mode, raw, {**identity, "jit_mode": None}, sdk, True)
+            count += 1
+        if mode != "snapshot":
+            missing_jit_mode = dict(identity)
+            del missing_jit_mode["jit_mode"]
+            compare(binary, mode, raw, missing_jit_mode, sdk, False)
+            count += 1
         fields = [
             (b'"correctness_only": true', b'"correctness_only": false'),
             (b'"clock": {"method": "hyperv-reference-monotonic"',

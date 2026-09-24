@@ -40,6 +40,8 @@ SIX_MODES = (
 CURRENT_PROFILE = "qcow2-derived-vhd"
 WAMR_AOT_BUILD_ROLE = "native:wamr-aot-build"
 WAMR_AOT_BUILD_RELATIVE = "compute/tools/bin/uk-wamr-aot-build"
+WAMR_LOG_VALIDATOR_ROLE = "native:wamr-log-validate"
+WAMR_LOG_VALIDATOR_RELATIVE = "compute/tools/bin/uk-wamr-log-validate"
 RECORDED_EXECUTABLE_TARGET = (
     "-Dtarget=x86_64-linux-gnu", "-Dcpu=x86_64_v2",
 )
@@ -50,6 +52,11 @@ PRODUCTION_COMMAND_STAGES = frozenset({
     "public-validator-build", "handoff-inspect", "handoff-inspect-legacy",
     "supervisor-import-identity", "native-revalidation",
 })
+LOG_VALIDATOR_STAGES = {
+    "log-validator-x2apic": "forbidden",
+    "log-validator-legacy": "required",
+}
+STRICT_SUPERVISED_STAGES = PRODUCTION_COMMAND_STAGES.union(LOG_VALIDATOR_STAGES)
 FORBIDDEN = ("HYPERV_ACCEPTANCE", "UK_HYPERV_IO_READY",
              "UK_HYPERV_NETWORK_APP_READY", "UK_HYPERV_PLATFORM_READY",
              "WAMR_NATIVE_WASI=", "WAMR_NATIVE_AOT_FAIL")
@@ -492,8 +499,11 @@ def git_command(*args):
     return [tool("git"), *git_arguments(*args)]
 
 
-def command_environment(root, input_records=None, extra=None):
+def command_environment(root, input_records=None, extra=None, *, stage=None):
     del input_records
+    if stage in LOG_VALIDATOR_STAGES:
+        require(not extra, "validator environment must be empty")
+        return {}
     environment = {
         "HOME": str(Path(root) / "private"),
         "LANG": "C",
@@ -1255,19 +1265,21 @@ def discover_consumer_input_paths(runtime, expected=None):
     archive = runtime / "custody/wamr-source.tar"
     if archive.is_file() and not archive.is_symlink():
         file_paths["wamr-source-archive"] = archive
-    wamr_aot_build = runtime / WAMR_AOT_BUILD_RELATIVE
-    expected_native = (
-        expected is not None
-        and WAMR_AOT_BUILD_ROLE in expected.get("files", {})
-    )
-    if expected_native or (
-            expected is None
-            and (wamr_aot_build.exists() or wamr_aot_build.is_symlink())):
-        require(wamr_aot_build.is_file() and not wamr_aot_build.is_symlink(),
-                "installed native WAMR build executable unavailable")
-        file_paths[WAMR_AOT_BUILD_ROLE] = wamr_aot_build
-        for path in executable_runtime_paths(wamr_aot_build):
-            file_paths[f"runtime:{path}"] = path
+    for role, relative, label in (
+            (WAMR_AOT_BUILD_ROLE, WAMR_AOT_BUILD_RELATIVE, "build"),
+            (WAMR_LOG_VALIDATOR_ROLE, WAMR_LOG_VALIDATOR_RELATIVE, "log validator")):
+        executable = runtime / relative
+        expected_native = (
+            expected is not None and role in expected.get("files", {})
+        )
+        if expected_native or (
+                expected is None
+                and (executable.exists() or executable.is_symlink())):
+            require(executable.is_file() and not executable.is_symlink(),
+                    f"installed native WAMR {label} executable unavailable")
+            file_paths[role] = executable
+            for path in executable_runtime_paths(executable):
+                file_paths[f"runtime:{path}"] = path
     return (
         canonical_input_paths(
             file_paths, "invalid consumer input file discovery"),
@@ -2482,6 +2494,8 @@ def command_binding_digest(value):
 
 
 def command_environment_contract(kind):
+    if kind == "validator-only":
+        return []
     environment = {
         "HOME": command_path("work", "private"),
         "LANG": command_literal("C"),
@@ -2518,6 +2532,8 @@ def command_environment_contract(kind):
             "WAMR_CI_PYTHON": command_path("tool:python3"),
             "WAMR_CI_SUPERVISOR_FIXTURE": command_path(
                 "work", "tools/bin/wamr-ci-supervisor-fixture"),
+            "WAMR_CI_LOG_VALIDATE": command_path(
+                WAMR_LOG_VALIDATOR_ROLE),
         })
     if kind in {"build-base", "public-validator"}:
         environment["WAMR_CI_LAUNCH_EXECUTABLE"] = command_path("tool:zig")
@@ -2528,6 +2544,8 @@ def command_environment_contract(kind):
 
 
 def command_retained_names(kind):
+    if kind == "validator-only":
+        return []
     names = {
         "WAMR_CI_SUPERVISOR",
     }
@@ -2540,7 +2558,7 @@ def command_retained_names(kind):
     if kind.startswith("build-"):
         names.add("M4")
     if kind == "build-fixtures":
-        names.add("WAMR_CI_PYTHON")
+        names.update(("WAMR_CI_PYTHON", "WAMR_CI_LOG_VALIDATE"))
     if kind in {"build-base", "public-validator"}:
         names.add("WAMR_CI_LAUNCH_EXECUTABLE")
     return sorted(names)
@@ -2844,6 +2862,24 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
             "native_executable": command_path("input:local_boot_tool"),
             "interpreter": None,
             "argv": boot_command_argv(mode, profile),
+        }
+    # Prepared for the native caller cutover; these stages are not dispatched
+    # by the current Python compute path or PRODUCTION_COMMAND_STAGES.
+    for validator_stage, legacy in LOG_VALIDATOR_STAGES.items():
+        contracts[validator_stage] = {
+            "kind": "validator-only", "seconds": 30,
+            "output_limit": 8192,
+            "command_executable": command_path(WAMR_LOG_VALIDATOR_ROLE),
+            "native_executable": command_path(WAMR_LOG_VALIDATOR_ROLE),
+            "interpreter": None,
+            "argv": [
+                command_path(WAMR_LOG_VALIDATOR_ROLE),
+                command_literal("tiny"),
+                command_literal("--log"), command_path("input:serial"),
+                command_literal("--identity"), command_path("input:identity"),
+                command_literal("--legacy-apic"), command_literal(legacy),
+                command_literal("--output"), command_literal("json-v1"),
+            ],
         }
     require(stage in contracts, "unknown production command stage")
     contract = contracts[stage]
@@ -3324,7 +3360,7 @@ def supervised_command_evidence(
         supervisor_identity,
         native_executable, command_executable, interpreter,
         expected_retained, roots, issued_ns, timeout_ns):
-    strict = stage in PRODUCTION_COMMAND_STAGES
+    strict = stage in STRICT_SUPERVISED_STAGES
 
     def identities(values):
         return [
@@ -3555,17 +3591,18 @@ def execute(root, stage, args, seconds=600, limit=8 * MIB, cwd=REPO,
         if executable == COMMAND_TOOL_PATHS.get("python3")
         else None
     )
-    selected_environment = {
-        "WAMR_CI_TOOL_" + name.upper().replace("-", "_"): path
-        for name, path in COMMAND_TOOL_PATHS.items()
-    }
-    if "git" in COMMAND_TOOL_PATHS:
+    selected_environment = (
+        {} if stage in LOG_VALIDATOR_STAGES else {
+            "WAMR_CI_TOOL_" + name.upper().replace("-", "_"): path
+            for name, path in COMMAND_TOOL_PATHS.items()
+        })
+    if stage not in LOG_VALIDATOR_STAGES and "git" in COMMAND_TOOL_PATHS:
         selected_environment["WAMR_CI_GIT"] = COMMAND_TOOL_PATHS["git"]
     launch_retained = executable == COMMAND_TOOL_PATHS.get("zig")
     if launch_retained:
         selected_environment["WAMR_CI_LAUNCH_EXECUTABLE"] = executable
     environment = command_environment(
-        root, input_records, selected_environment)
+        root, input_records, selected_environment, stage=stage)
     retained_environment = []
     expected_retained = []
     for name, value in sorted(environment.items()):
@@ -4580,7 +4617,7 @@ def run_custodied(runtime, expected, root, stage, args, seconds=600,
         root, stage, args, seconds, limit, input_records=records,
         path_roles=path_roles or None)
     record_path = root / "evidence" / ("command-" + stage + ".json")
-    if stage in PRODUCTION_COMMAND_STAGES and record_path.is_file():
+    if stage in STRICT_SUPERVISED_STAGES and record_path.is_file():
         role_identities = {
             "command-supervisor": native_executable_identity(
                 expected["consumer_inputs"]["files"]["command-supervisor"]),
@@ -4980,6 +5017,7 @@ def build(runtime, wamr):
     fixture_environment = {
         "WAMR_CI_PACKAGE": str(root / "tools/bin/wamr-ci-package"),
         "WAMR_CI_PYTHON": tool("python3"),
+        "WAMR_CI_LOG_VALIDATE": str(root / "tools/bin/uk-wamr-log-validate"),
         "WAMR_CI_SUPERVISOR_FIXTURE":
             str(root / "tools/bin/wamr-ci-supervisor-fixture"),
     }

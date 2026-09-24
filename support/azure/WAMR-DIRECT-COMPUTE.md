@@ -23,6 +23,17 @@ the persistence scope, synthesize a seed, call a Python cloud controller, use
 the nested platform-only preflight, or accept caller-supplied ARM templates.
 The existing persistence and platform-only contracts remain closed.
 
+The direct build also installs app-owned `uk-wamr-log-validate` from the same
+shared native parser used in-process by `uk-wamr-direct-validate serial`.
+For private local correctness comparison it accepts `tiny --log L
+--identity I [--legacy-apic required|forbidden] [--output json-v1]`.
+Its identity input is the prepared **app** identity, not a direct
+admission/candidate scope; `--output json-v1` binds the raw serial byte
+count/SHA-256 and checked compute record. The direct serial route remains
+scope-bound and stricter (it forbids WASI/CoreMark). Neither direct controller
+nor CI production caller changes dispatch in this preparatory phase. No
+image boot, cloud permission or admission is implied by these local fixtures.
+
 ## Fixed topology and claim
 
 The embedded `wamr-direct-compute.json` admits one specialized x64 Generation 2

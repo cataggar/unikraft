@@ -331,6 +331,25 @@ python3 support/apps/wamr-aot/check-log.py \
 This checks runtime/workload identities, exact 42 result, trap detail,
 teardown accounting and optional original CRC output. It is an additional
 compute check, **not a replacement for exact-image boot validation**.
+The installed native CLI is available for local comparison (the existing
+Python caller still owns production validation until the separate cutover):
+
+```sh
+zig build --build-file support/apps/wamr-aot/validator.build.zig \
+  --prefix "$PWD/.d/wamr-validator" -Doptimize=ReleaseSafe install
+"$PWD/.d/wamr-validator/bin/uk-wamr-log-validate" tiny \
+  --log /private/attempt/hyperv-efi-boot.log \
+  --identity support/apps/wamr-aot/build/artifacts/identity.json \
+  --legacy-apic forbidden --output json-v1
+```
+
+Use `--legacy-apic required` for a legacy xAPIC boot; omit it for the
+standalone developer check. `--output json-v1` emits exactly one compact
+`uk.wamr.log-validation` version-1 object and LF, with `mode=tiny`, the
+**raw** capture byte count/SHA-256 and the checked `compute` object. The
+CLI does not infer a path, select a workload override or run a Python
+fallback. Validation failure returns 1 with empty stdout and one bounded,
+path-free stderr line; CLI usage returns 2.
 
 No Azure provisioning, cloud dispatch, hardware acceptance, networking,
 storage, performance, or resource-cleanup claim is made by this work.
@@ -354,10 +373,15 @@ ordered snapshot/setup/reset/invocation and matched AOT/fast/full transcripts,
 including the source-pinned sampler's exact keys, identity, request hash,
 limits, memory growth and teardown. Required-subset guest records retain
 extension fields; the sampler and fixed nested objects retain exact fields.
-There is **no installed validator CLI or production caller cutover** yet;
-`check-log.py` and `check-workload-log.py` remain differential references,
-not native fallbacks. Run synthetic unit/property/fault, C oracle and Python
-differential fixtures without building or booting an image:
+The app, CI adapter and direct build install the **same shared** native CLI
+source. The CI adapter records it as `native:wamr-log-validate` in the
+consumer-tool custody; prepared tiny supervision binds its executable
+identity, closed environment, exact APIC argv and bounded output. Neither
+the CI Python compute caller nor the direct controller has switched to this
+CLI: `check-log.py` and `check-workload-log.py` remain callable references
+until the later cutover, never native fallbacks. Run synthetic
+unit/property/fault, C oracle, native CLI integration and Python differential
+fixtures without building or booting an image:
 
 ```sh
 zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test

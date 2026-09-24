@@ -75,7 +75,7 @@ pub const OptionalIdentity = struct {
             .null => null,
             .string => |mode| mode,
             else => return error.InvalidMode,
-        } else null;
+        } else if (std.mem.eql(u8, variant, "snapshot")) null else return error.MissingField;
         _ = try sha(files, "libwamr-aot.a");
         _ = try sha(files, "wamrc");
         if (std.mem.eql(u8, variant, "snapshot")) {
