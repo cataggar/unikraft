@@ -349,9 +349,14 @@ exact record identity, boot order, return-0, zero accounting and independent
 CoreMark stdout (including literal `[0]crclist`, `[0]crcmatrix`, `[0]crcstate`
 and `[0]crcfinal` keys), stderr, realtime support and termination. Direct
 validation calls this same core in its stricter tiny-only scope: it still
-refuses WASI/CoreMark. There is **no installed validator CLI or production
-caller cutover** yet; `check-log.py` remains the differential reference, not
-a native fallback. Run synthetic unit/property/fault, C oracle and Python
+refuses WASI/CoreMark. The optional-mode library also validates complete,
+ordered snapshot/setup/reset/invocation and matched AOT/fast/full transcripts,
+including the source-pinned sampler's exact keys, identity, request hash,
+limits, memory growth and teardown. Required-subset guest records retain
+extension fields; the sampler and fixed nested objects retain exact fields.
+There is **no installed validator CLI or production caller cutover** yet;
+`check-log.py` and `check-workload-log.py` remain differential references,
+not native fallbacks. Run synthetic unit/property/fault, C oracle and Python
 differential fixtures without building or booting an image:
 
 ```sh
@@ -362,8 +367,12 @@ zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=Rele
 The differential step also compares typed tiny results, raw byte counts/hashes
 and normalized record sequences against the retained Python end-to-end
 compute path; independent C `coremark.h` and Python output parsers check
-CoreMark bytes. The upstream local-boot terminal/crash check is represented
-by native envelope tests, not by calling `run.py.compute()` alone. Optional
+CoreMark bytes. Optional differentials compare the exact normalized record
+sequence and original bytes/hash with the retained workload checker; they also
+invoke `validate_sample` at the pinned SDK revision when that checkout is
+available (`WAMR_PINNED_SDK` may select it). The upstream local-boot
+terminal/crash check is represented by native envelope tests, not by calling
+`run.py.compute()` alone. Optional
 Unicode printability is pinned to Python 3.12's
 Unicode 15 domain, not the host Python version: the native and differential
 tests include golden Unicode 16-only rejection ranges from UnicodeData 15.0

@@ -75,4 +75,14 @@ pub fn build(b: *std.Build) void {
     tiny_differential.addFileArg(b.path("validator/tiny_reference_test.py"));
     tiny_differential.addFileArg(tiny_fixture.getEmittedBin());
     reference_tests.dependOn(&tiny_differential.step);
+    const optional_fixture = b.addExecutable(.{ .name = "wamr-optional-reference-fixture", .root_module = b.createModule(.{
+        .root_source_file = b.path("validator/optional_reference_fixture.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "wamr_log_validator", .module = validator }},
+    }) });
+    const optional_differential = b.addSystemCommand(&.{ "python3", "-B" });
+    optional_differential.addFileArg(b.path("validator/optional_reference_test.py"));
+    optional_differential.addFileArg(optional_fixture.getEmittedBin());
+    reference_tests.dependOn(&optional_differential.step);
 }

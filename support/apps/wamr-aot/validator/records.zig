@@ -50,6 +50,61 @@ pub const PreparedIdentity = struct {
     }
 };
 
+pub const OptionalIdentity = struct {
+    document: c.Document,
+    variant: []const u8,
+    revision: []const u8,
+    source_tree: []const u8,
+    files: std.json.ObjectMap,
+    jit_mode: ?[]const u8,
+
+    pub fn parse(allocator: std.mem.Allocator, source: []const u8) !OptionalIdentity {
+        var document = try c.Document.parse(allocator, source, .{
+            .bytes = 64 * 1024,
+            .string_bytes = 8192,
+            .items = 4096,
+        });
+        errdefer document.deinit();
+        const fields = try object(document.value());
+        const files = try object(try get(fields, "files"));
+        const variant = try c.string(try get(fields, "variant"));
+        const revision = try c.string(try get(fields, "wamr_revision"));
+        const source_tree = try c.string(try get(fields, "source_tree_sha256"));
+        _ = try c.parseSha256(source_tree);
+        const jit_mode: ?[]const u8 = if (fields.get("jit_mode")) |value| switch (value) {
+            .null => null,
+            .string => |mode| mode,
+            else => return error.InvalidMode,
+        } else null;
+        _ = try sha(files, "libwamr-aot.a");
+        _ = try sha(files, "wamrc");
+        if (std.mem.eql(u8, variant, "snapshot")) {
+            inline for (.{ "compute.wasm", "compute.cwasm", "memory.wasm", "memory.cwasm" }) |name|
+                _ = try sha(files, name);
+        } else {
+            _ = try sha(files, "matched.wasm");
+            if (std.mem.eql(u8, variant, "sample-aot")) _ = try sha(files, "matched.cwasm");
+        }
+        return .{
+            .document = document,
+            .variant = variant,
+            .revision = revision,
+            .source_tree = source_tree,
+            .files = files,
+            .jit_mode = jit_mode,
+        };
+    }
+
+    pub fn deinit(self: *OptionalIdentity) void {
+        self.document.deinit();
+        self.* = undefined;
+    }
+
+    pub fn file(self: OptionalIdentity, name: []const u8) ![]const u8 {
+        return sha(self.files, name);
+    }
+};
+
 pub fn parseDocument(allocator: std.mem.Allocator, source: []const u8) !c.Document {
     return c.Document.parse(allocator, source, .{
         .bytes = 16 * 1024,
