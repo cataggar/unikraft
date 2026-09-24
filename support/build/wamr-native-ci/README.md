@@ -1,5 +1,29 @@
 # Credential-free tiny native WAMR PR gate
 
+## Native controller foundation (preparation only)
+
+`zig build --build-file support/build/wamr-native-ci/build.zig test-controller`
+runs the native controller foundation's CLI/profile, canonical-record,
+source-closure and refusal fixtures. Build the portable executable with
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe`. To place
+only that executable in an existing canonical, owner-only `0700` runtime,
+invoke `install-controller` with `-Dcontroller-runtime=/absolute/runtime`.
+Installation creates `controller/bin/uk-wamr-native-ci` (private `0700` path
+and ELF) and refuses any preexisting slot; it does not install over a prior
+controller. `describe --output json-v1` reports the fixed executable target
+and embedded source-content closure without accessing a runtime or granting
+boot authority. The Git/physical source and pinned revision admission is a
+separate follow-up; this foundation does not claim it.
+
+`build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
+`diagnostics --runtime ABS` reserve their final grammar but deliberately
+**refuse** in this foundation PR. They neither run Python nor publish
+acceptance. Production callers continue to use the existing controller until
+the later supervised build/boot and differential cutover PRs. The closed
+`tiny_exact_v2` production type has six ordered raw/QCOW2/VPC modes;
+the four-mode v1 type is read-only compatibility. No caller-selectable profile,
+CoreMark mode, Azure entry, or alternate validator is installed.
+
 Refs #156. `wamr-native-compute.yaml` is an **additive ordinary
 `pull_request` job**, including the native integration's stacked base.
 It has only `contents: read`, a GitHub-hosted Ubuntu 24.04 x86 runner, no
