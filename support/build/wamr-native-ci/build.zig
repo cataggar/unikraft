@@ -1,8 +1,12 @@
 const std = @import("std");
+const controller_target = @import("controller/target.zig");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const requested_target = b.standardTargetOptionsQueryOnly(.{});
+    const target = b.resolveTargetQuery(requested_target);
     const optimize = b.standardOptimizeOption(.{});
+    const portable_query = controller_target.portableQuery();
+    const portable_target = b.resolveTargetQuery(portable_query);
     const core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = target,
@@ -57,25 +61,31 @@ pub fn build(b: *std.Build) void {
     });
     const cli = b.addExecutable(.{ .name = "wamr-ci-package", .root_module = root });
     b.installArtifact(cli);
+    const portable_core = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/core.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+    });
+    portable_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
     const source_closure_module = b.createModule(.{
         .root_source_file = b.path("../../controller_source_closure.zig"),
-        .target = target,
+        .target = portable_target,
         .optimize = optimize,
     });
     const controller_module = b.addModule("wamr_controller", .{
         .root_source_file = b.path("controller/root.zig"),
-        .target = target,
+        .target = portable_target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "hyperv_core", .module = portable_core },
             .{ .name = "controller_source_closure", .module = source_closure_module },
         },
     });
     const controller_cli = b.addExecutable(.{
         .name = "uk-wamr-native-ci",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("controller/main.zig"),
-            .target = target,
+            .root_source_file = b.path("controller/portable_main.zig"),
+            .target = portable_target,
             .optimize = optimize,
             .imports = &.{.{ .name = "wamr_controller", .module = controller_module }},
         }),
@@ -89,6 +99,7 @@ pub fn build(b: *std.Build) void {
     const controller_options = b.addOptions();
     controller_options.addOption([]const u8, "repository_root", std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
         @panic("cannot resolve source root"));
+    controller_options.addOption([]const u8, "zig_executable", b.findProgram(&.{"zig"}, &.{}) catch @panic("controller target fixtures require Zig"));
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = b.graph.host,
@@ -139,8 +150,13 @@ pub fn build(b: *std.Build) void {
     install_run.addArg(controller_runtime);
     install_run.addArg(b.graph.cache.cwd);
     install_run.addFileArg(controller_cli.getEmittedBin());
-    b.step("install-controller", "Create-only portable controller install in the private runtime")
-        .dependOn(&install_run.step);
+    const install_step = b.step("install-controller", "Create-only portable controller install in the private runtime");
+    if (controller_target.permitsInstall(requested_target, optimize))
+        install_step.dependOn(&install_run.step)
+    else
+        install_step.dependOn(&b.addFail(
+            "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe",
+        ).step);
     const controller_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/tests.zig"),

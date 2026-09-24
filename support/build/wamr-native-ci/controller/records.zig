@@ -19,6 +19,20 @@ const public_stages = [_][]const u8{
     "adapter",      "local-boot-tool", "fixtures", "prepare", "config",
     "native-image", "package",         "inspect",
 };
+const required_v2_commands = [_][]const u8{
+    "command-adapter.json",
+    "command-local-boot-tool.json",
+    "command-fixtures.json",
+    "command-prepare.json",
+    "command-config.json",
+    "command-native-image.json",
+    "command-package.json",
+    "command-finalize-qcow2.json",
+    "command-derive-fixed-vhd.json",
+    "command-inspect.json",
+};
+const v2_record_count = required_common.len + required_v2.len +
+    2 * profile.production_modes.len + required_v2_commands.len;
 
 pub const Result = struct {
     set: profile.CompatibleRecordSet,
@@ -122,6 +136,16 @@ pub fn readResult(value: std.json.Value) !Result {
         for (required_v2) |name| {
             if (!records.contains(name)) return error.MissingRecord;
         };
+    if (set == .tiny_v2_qcow2_derived_vhd) {
+        for (required_v2_commands) |name|
+            if (!records.contains(name)) return error.MissingRecord;
+        for (expected_modes) |mode| {
+            var buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&buf, "command-{s}.json", .{@tagName(mode)});
+            if (!records.contains(name)) return error.MissingRecord;
+        }
+        if (records.count() != v2_record_count) return error.InvalidRecords;
+    }
     return .{ .set = set, .records = records };
 }
 

@@ -24,6 +24,53 @@ test "closed production profile and historical read-only mode order" {
         try std.testing.expectEqual(i % 2 == 1, mode.legacyApic());
 }
 
+test "portable target installer refuses musl, v3 and incomplete overrides" {
+    const target = controller.target;
+    const correct = target.portableQuery();
+    try std.testing.expect(target.permitsInstall(correct, .ReleaseSafe));
+    try std.testing.expect(!target.permitsInstall(correct, .Debug));
+    try std.testing.expect(!target.permitsInstall(.{}, .ReleaseSafe));
+    for ([_]struct { triple: []const u8, cpu: ?[]const u8 }{
+        .{ .triple = "x86_64-linux-musl", .cpu = "x86_64_v2" },
+        .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v3" },
+        .{ .triple = "x86_64-linux-gnu", .cpu = null },
+    }) |bad| {
+        const query = try std.Target.Query.parse(.{
+            .arch_os_abi = bad.triple,
+            .cpu_features = bad.cpu,
+        });
+        try std.testing.expect(!target.permitsInstall(query, .ReleaseSafe));
+    }
+}
+
+test "install-controller rejects incompatible build flags without creating output" {
+    const allocator = std.testing.allocator;
+    const runtime = try std.fs.path.join(allocator, &.{ options.repository_root, ".d/controller-invalid-target" });
+    defer allocator.free(runtime);
+    const runtime_flag = try std.fmt.allocPrint(allocator, "-Dcontroller-runtime={s}", .{runtime});
+    defer allocator.free(runtime_flag);
+    for ([_]struct { triple: []const u8, cpu: []const u8 }{
+        .{ .triple = "-Dtarget=x86_64-linux-musl", .cpu = "-Dcpu=x86_64_v2" },
+        .{ .triple = "-Dtarget=x86_64-linux-gnu", .cpu = "-Dcpu=x86_64_v3" },
+    }) |bad| {
+        const result = try std.process.run(allocator, std.testing.io, .{
+            .argv = &.{
+                options.zig_executable,                   "build",                  "--build-file",
+                "support/build/wamr-native-ci/build.zig", "install-controller",     bad.triple,
+                bad.cpu,                                  "-Doptimize=ReleaseSafe", runtime_flag,
+            },
+            .cwd = .{ .path = options.repository_root },
+            .stdout_limit = .limited(32 * 1024),
+            .stderr_limit = .limited(32 * 1024),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2") != null);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, runtime, .{}));
+    }
+}
+
 test "CLI accepts only closed arguments and no caller-selected profile" {
     const cli = controller.cli;
     const build = try cli.parse(&.{ "uk-wamr-native-ci", "build", "--wamr-source", "/wamr", "--runtime", "/runtime" });
@@ -62,7 +109,7 @@ test "canonical bytes and domain-separated file versus record identity" {
     try std.testing.expectError(error.DuplicateField, controller.records.identity(allocator, "{\"a\":1,\"a\":2}"));
 }
 
-fn fixture(allocator: std.mem.Allocator, v2: bool) ![]u8 {
+fn fixture(allocator: std.mem.Allocator, v2: bool, commands: bool) ![]u8 {
     var writer = std.Io.Writer.Allocating.init(allocator);
     defer writer.deinit();
     const w = &writer.writer;
@@ -76,6 +123,7 @@ fn fixture(allocator: std.mem.Allocator, v2: bool) ![]u8 {
         .tiny_v2_qcow2_derived_vhd
     else
         .tiny_v1_legacy;
+    const digest = std.fmt.bytesToHex(controller.records.fileIdentity("{}\n"), .lower);
     for (controller.profile.modes(set), 0..) |mode, i| {
         if (i != 0) try w.writeByte(',');
         try w.print("\"{s}\"", .{@tagName(mode)});
@@ -85,15 +133,23 @@ fn fixture(allocator: std.mem.Allocator, v2: bool) ![]u8 {
     for ([_][]const u8{ "build-start.json", "build.json", "boot-inputs.json", "package.json" }) |name| {
         if (!first) try w.writeByte(',');
         first = false;
-        try w.print("\"{s}\":\"{s}\"", .{ name, "0" ** 64 });
+        try w.print("\"{s}\":\"{s}\"", .{ name, &digest });
     }
     for (controller.profile.modes(set)) |mode|
-        try w.print(",\"{s}-compute.json\":\"{s}\"", .{ @tagName(mode), "0" ** 64 });
+        try w.print(",\"{s}-compute.json\":\"{s}\"", .{ @tagName(mode), &digest });
     if (v2) for ([_][]const u8{
         "qcow2-finalization-intent.json",   "qcow2-finalization.json",        "qcow2-acceptance.json",
         "fixed-vhd-derivation-intent.json", "fixed-vhd-derivation-gate.json", "fixed-vhd-derivation.json",
         "final-inspection.json",
-    }) |name| try w.print(",\"{s}\":\"{s}\"", .{ name, "0" ** 64 });
+    }) |name| try w.print(",\"{s}\":\"{s}\"", .{ name, &digest });
+    if (commands) {
+        for ([_][]const u8{
+            "adapter",      "local-boot-tool", "fixtures",       "prepare",          "config",
+            "native-image", "package",         "finalize-qcow2", "derive-fixed-vhd", "inspect",
+        }) |stage| try w.print(",\"command-{s}.json\":\"{s}\"", .{ stage, &digest });
+        for (controller.profile.modes(set)) |mode|
+            try w.print(",\"command-{s}.json\":\"{s}\"", .{ @tagName(mode), &digest });
+    }
     try w.writeAll("}}");
     return writer.toOwnedSlice();
 }
@@ -101,18 +157,21 @@ fn fixture(allocator: std.mem.Allocator, v2: bool) ![]u8 {
 test "v1 and v2 frozen result evidence sets reject rehashed fields" {
     const allocator = std.testing.allocator;
     for ([_]bool{ false, true }) |v2| {
-        const raw = try fixture(allocator, v2);
+        const raw = try fixture(allocator, v2, v2);
         defer allocator.free(raw);
         try std.testing.expectError(error.NonCanonical, controller.records.parseCanonicalResult(allocator, raw));
         const canonical = try controller.records.canonicalAlloc(allocator, raw);
         defer allocator.free(canonical);
         var accepted = try controller.records.parseCanonicalResult(allocator, canonical);
         defer accepted.deinit();
+        try std.testing.expectEqual(@as(usize, if (v2) 33 else 8), accepted.value.records.count());
+        for (accepted.value.records.keys()) |name|
+            try controller.records.verifyRecord(accepted.value, name, "{}\n");
         const document = try core.contracts.Document.parse(allocator, raw, .{});
         defer document.deinit();
         const result = try controller.records.readResult(document.value());
         try std.testing.expectEqual(if (v2) controller.profile.CompatibleRecordSet.tiny_v2_qcow2_derived_vhd else controller.profile.CompatibleRecordSet.tiny_v1_legacy, result.set);
-        try std.testing.expectError(error.RecordChanged, controller.records.verifyRecord(result, "build.json", "{}\n"));
+        try std.testing.expectError(error.RecordChanged, controller.records.verifyRecord(result, "build.json", "{\"tampered\":true}\n"));
         try std.testing.expectError(error.MissingRecord, controller.records.verifyRecord(result, "result.json", "{}\n"));
         const changed = try std.mem.replaceOwned(u8, allocator, raw, "\"cloud_authority\":\"not_admitted\"", "\"cloud_authority\":\"admitted\"");
         defer allocator.free(changed);
@@ -147,6 +206,46 @@ test "v1 and v2 frozen result evidence sets reject rehashed fields" {
             try std.testing.expectError(error.UnsupportedRecordSet, controller.records.readResult(downgraded.value()));
         }
     }
+}
+
+test "v2 results bind every supervised stage; v1 remains read-only compatible" {
+    const allocator = std.testing.allocator;
+    const bare_v1 = try fixture(allocator, false, false);
+    defer allocator.free(bare_v1);
+    const legacy = try core.contracts.Document.parse(allocator, bare_v1, .{});
+    defer legacy.deinit();
+    try std.testing.expectEqual(controller.profile.CompatibleRecordSet.tiny_v1_legacy, (try controller.records.readResult(legacy.value())).set);
+
+    const bare_v2 = try fixture(allocator, true, false);
+    defer allocator.free(bare_v2);
+    const incomplete = try core.contracts.Document.parse(allocator, bare_v2, .{});
+    defer incomplete.deinit();
+    try std.testing.expectError(error.MissingRecord, controller.records.readResult(incomplete.value()));
+
+    const complete = try fixture(allocator, true, true);
+    defer allocator.free(complete);
+    const digest = std.fmt.bytesToHex(controller.records.fileIdentity("{}\n"), .lower);
+    for ([_][]const u8{
+        "adapter",      "local-boot-tool",   "fixtures",         "prepare",         "config",     "native-image",
+        "package",      "finalize-qcow2",    "derive-fixed-vhd", "inspect",         "raw-x2apic", "raw-legacy-apic",
+        "qcow2-x2apic", "qcow2-legacy-apic", "vpc-x2apic",       "vpc-legacy-apic",
+    }) |stage| {
+        const removed = try std.fmt.allocPrint(allocator, ",\"command-{s}.json\":\"{s}\"", .{ stage, &digest });
+        defer allocator.free(removed);
+        const missing = try std.mem.replaceOwned(u8, allocator, complete, removed, "");
+        defer allocator.free(missing);
+        const parsed = try core.contracts.Document.parse(allocator, missing, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.MissingRecord, controller.records.readResult(parsed.value()));
+    }
+    const altered = try std.fmt.allocPrint(allocator, "\"command-adapter.json\":\"{s}\"", .{&digest});
+    defer allocator.free(altered);
+    const changed = try std.mem.replaceOwned(u8, allocator, complete, altered, "\"command-adapter.json\":\"0000000000000000000000000000000000000000000000000000000000000000\"");
+    defer allocator.free(changed);
+    const forged = try core.contracts.Document.parse(allocator, changed, .{});
+    defer forged.deinit();
+    const result = try controller.records.readResult(forged.value());
+    try std.testing.expectError(error.RecordChanged, controller.records.verifyRecord(result, "command-adapter.json", "{}\n"));
 }
 
 test "embedded tracked source closure and physical/no-follow checks" {
