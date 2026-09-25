@@ -213,6 +213,10 @@ pub fn build(b: *std.Build) void {
     });
     controller_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
     const controller_run = b.addRunArtifact(controller_tests);
+    const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
+    controller_direct.addFileArg(controller_tests.getEmittedBin());
+    b.step("test-controller-direct", "Run host controller tests with direct failure output")
+        .dependOn(&controller_direct.step);
     const install_target_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/install_target_tests.zig"),
@@ -253,6 +257,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     fault_parity_tests.root_module.addOptions("test_options", controller_options);
+    controller_run.step.dependOn(&fault_parity_tests.step);
     const fault_parity_run = b.addRunArtifact(fault_parity_tests);
     fault_parity_run.step.dependOn(&controller_run.step);
     b.step("test-controller-fault-parity", "Run native physical custody parity faults")

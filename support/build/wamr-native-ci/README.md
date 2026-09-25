@@ -88,7 +88,8 @@ the checkout.
 The protected x86 job exercises `test-controller` first in a separate clean
 worktree, keeping its test dependencies and cache outside the production
 source checkout; this reports fixture failures without exposing private
-supervised-command output.
+supervised-command output. On failure it runs the host test binary directly
+for diagnostic errors while keeping the original gate failed.
 `python3 -m unittest support/build/wamr-native-ci/tests/source_custody_production_limits.py`
 remains the independent full-size source-boundary oracle until cutover.
 

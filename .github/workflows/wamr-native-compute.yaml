@@ -101,9 +101,18 @@ jobs:
           trap cleanup EXIT
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-fixture-cache"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-pipeline-root"
-          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+          if ! ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
-            -Doptimize=ReleaseSafe -j2 test-controller
+            -Doptimize=ReleaseSafe -j2 test-controller; then
+            if ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+              zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+              -Doptimize=ReleaseSafe -j1 test-controller-direct; then
+              echo "Direct controller diagnostic passed after the gate failed" >&2
+            else
+              echo "Direct controller diagnostic also failed" >&2
+            fi
+            exit 1
+          fi
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
             -Doptimize=ReleaseSafe -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
