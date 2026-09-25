@@ -50,8 +50,8 @@ pub const WamrArchiveSealed = struct { context: *Context, runtime: files.Directo
 pub const DependenciesRestored = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const BootstrapInputsBound = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const AdapterBuilt = struct { context: *Context, runtime: files.Directory, work: files.Directory };
-pub const InputsBaselined = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const LocalBootBuilt = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const InputsBaselined = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const NativeFixturesPassed = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const ProducerPrepared = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const ConfigSolved = struct { context: *Context, runtime: files.Directory, work: files.Directory };
@@ -476,7 +476,7 @@ pub fn buildAdapter(state: BootstrapInputsBound) !AdapterBuilt {
     return next(state, AdapterBuilt);
 }
 
-pub fn baseline(state: AdapterBuilt) !InputsBaselined {
+pub fn baseline(state: LocalBootBuilt) !InputsBaselined {
     const context = state.context;
     context.failed_stage = "build-start";
     try requireBuildEvidence(context);
@@ -597,12 +597,12 @@ fn supervisorRuntimeMap(context: *Context) !Map {
     return guardedMap(context, "uk.wamr.command-supervisor-runtime-v1", entries.items);
 }
 
-pub fn buildLocalBoot(state: InputsBaselined) !LocalBootBuilt {
-    try runStage(state, .@"local-boot-tool", true);
+pub fn buildLocalBoot(state: AdapterBuilt) !LocalBootBuilt {
+    try runStage(state, .@"local-boot-tool", false);
     return next(state, LocalBootBuilt);
 }
 
-pub fn testFixtures(state: LocalBootBuilt) !NativeFixturesPassed {
+pub fn testFixtures(state: InputsBaselined) !NativeFixturesPassed {
     try runStage(state, .fixtures, true);
     const context = state.context;
     const path = try subpath(context, "fixtures/native-scenarios.json");
@@ -881,7 +881,7 @@ pub fn run(context: *Context) !BuildAccepted {
     var reserved = try reserve(bound);
     defer reserved.work.close(context.io);
     return acceptBuild(try nativeImage(try solveConfig(try prepare(try testFixtures(
-        try buildLocalBoot(try baseline(try buildAdapter(try bootstrap(
+        try baseline(try buildLocalBoot(try buildAdapter(try bootstrap(
             try restore(try sealSource(try captureSource(reserved))),
         )))),
     )))));

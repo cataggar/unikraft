@@ -70,6 +70,8 @@ tiny artifacts and image before publishing `build.json`, and retains bounded
 private command logs and create-only public command records. The local-boot
 installer has its own precreated `compute/local-boot-tools` slot so it cannot
 mutate the already frozen `compute/tools/bin` consumer-input directory.
+Both installer command records precede `build-start.json`, which baselines
+the post-installation consumer inputs in the same order as the Python controller.
 `test-controller` exercises native custody, build-command failures, production
 boundaries, tamper/refusal, and `run.py` differential record fixtures. The
 installed fixture stage itself supervises bounded native success, nonzero,
