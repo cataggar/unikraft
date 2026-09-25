@@ -517,6 +517,9 @@ def native_fixture_contract(reference):
     }
 
 
+SHARED_BUILD_STAGES = ("prepare", "config", "native-image")
+
+
 def native_build_command_contract(reference, stage):
     check(stage in ("adapter", "local-boot-tool"),
           "unknown native build command stage")
@@ -564,14 +567,19 @@ def native_build_command_contract(reference, stage):
     }
 
 
+def reviewed_build_command_contract(reference, side, stage):
+    if side == "python" or stage in SHARED_BUILD_STAGES:
+        return reference.production_command_contract(stage)
+    if stage == "fixtures":
+        return native_fixture_contract(reference)
+    return native_build_command_contract(reference, stage)
+
+
 def checked_stage(record, log, side, reference, stage, seen=None):
     check(side in ("python", "native")
-          and stage in ("adapter", "local-boot-tool", "fixtures"),
+          and stage in REVIEWED_BUILD_COMMANDS,
           "unknown supervised build-stage side")
-    contract = (reference.production_command_contract(stage)
-                if side == "python" else
-                native_fixture_contract(reference) if stage == "fixtures" else
-                native_build_command_contract(reference, stage))
+    contract = reviewed_build_command_contract(reference, side, stage)
     label = f"{stage} {side}"
     check(record["scope"] == "command_diagnostic_not_acceptance"
           and record["stage"] == stage, f"{label} stage/scope changed")
@@ -1061,7 +1069,9 @@ def compare_qcow2_acceptance(left, right):
     ]
 
 
-REVIEWED_BUILD_COMMANDS = ("adapter", "local-boot-tool", "fixtures")
+REVIEWED_BUILD_COMMANDS = (
+    "adapter", "local-boot-tool", "fixtures", *SHARED_BUILD_STAGES,
+)
 
 
 def compare_observations(left, right, reviewed_build_compat=False):
@@ -1723,11 +1733,7 @@ class DeterministicContracts(unittest.TestCase):
         empty = sha(b"")
 
         def synthetic(side, log, stage="fixtures"):
-            contract = (
-                reference.production_command_contract(stage)
-                if side == "python" else native_fixture_contract(reference)
-                if stage == "fixtures" else
-                native_build_command_contract(reference, stage))
+            contract = reviewed_build_command_contract(reference, side, stage)
             executable = {
                 "content_sha256": sha(b"synthetic-fixture-only"),
                 "ctime_nanoseconds": 0, "ctime_seconds": 1,
@@ -1891,12 +1897,18 @@ class DeterministicContracts(unittest.TestCase):
                         fixture_stage(
                             altered, log + b"tampered" if change == "log" else log,
                             side, reference)
-        for stage in ("adapter", "local-boot-tool"):
+        for stage in ("adapter", "local-boot-tool", *SHARED_BUILD_STAGES):
             python = synthetic("python", b"synthetic-python-build-ok\n", stage)
             native = synthetic("native", b"synthetic-native-build-ok\n", stage)
             with self.subTest(stage=stage):
-                self.assertNotEqual(python["supervisor"]["request"]["argv"],
-                                    native["supervisor"]["request"]["argv"])
+                if stage in ("adapter", "local-boot-tool"):
+                    self.assertNotEqual(
+                        python["supervisor"]["request"]["argv"],
+                        native["supervisor"]["request"]["argv"])
+                else:
+                    self.assertEqual(
+                        python["supervisor"]["request"]["argv"],
+                        native["supervisor"]["request"]["argv"])
                 self.assertEqual(checked_stage(
                     python, b"synthetic-python-build-ok\n", "python",
                     reference, stage), checked_stage(

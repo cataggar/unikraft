@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("../../apps/wamr-aot/validator/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize != .Debug,
         .imports = &.{
             .{ .name = "wamr_log_validator", .module = log_validator },
             .{ .name = "hyperv_core", .module = core },
@@ -60,6 +61,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("package.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize != .Debug,
         .imports = &.{.{ .name = "public_image", .module = image }},
     });
     const cli = b.addExecutable(.{ .name = "wamr-ci-package", .root_module = root });
