@@ -377,7 +377,9 @@ pub fn bootstrap(state: DependenciesRestored) !BootstrapInputsBound {
 
 pub fn requireSource(context: *Context) !void {
     try cancelled(context);
-    const actual = try custody.source(context.allocator, context.io, context.repository, context.git);
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const actual = try custody.source(scratch.allocator(), context.io, context.repository, context.git);
     try cancelled(context);
     const before = context.source.?;
     if (!before.same(actual)) return error.SourceChanged;

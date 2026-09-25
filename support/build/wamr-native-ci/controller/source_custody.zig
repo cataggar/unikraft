@@ -196,7 +196,12 @@ pub fn requireGitOutcome(result: process.CommandResult, limit: usize) !void {
             .exec_failed => return error.GitExecFailed,
             .snapshot_unsupported => return error.GitSnapshotUnsupported,
             .event_limit => return error.GitEventLimit,
-            .local_io => return error.GitLocalIo,
+            .local_io => {
+                if (result.stdout_status == .io_failed) return error.GitStdoutIo;
+                if (result.stderr_status == .io_failed) return error.GitStderrIo;
+                if (result.primary_events == 0) return error.GitStartupIo;
+                return error.GitMonitorIo;
+            },
             .executable_changed => return error.GitExecutableChanged,
             .unknown => return error.GitUnknownTermination,
         }

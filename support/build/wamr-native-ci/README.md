@@ -469,8 +469,10 @@ exhaustion or uncertain ownership poisons the one-shot supervisor result and
 cannot become success. This is cleanup for cooperative or accidentally
 detached owned descendants, not a hostile same-UID or PID-namespace ownership
 claim. Git bootstrap/custody probes have a 120-second primary deadline and report
-distinct static primary, cleanup, stream, output-overflow, and stderr refusal
-categories; raw Git output stays private. They run with
+distinct static startup/monitor I/O, cleanup, stream, output-overflow, and stderr refusal
+categories; raw Git output stays private. Repeated source-custody rechecks
+release their per-call scratch rather than retaining whole-tree file bytes
+in the controller's lifetime arena. They run with
 system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
 applicable.

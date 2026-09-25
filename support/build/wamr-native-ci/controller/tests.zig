@@ -1049,6 +1049,25 @@ test "native clean Git custody, stable physical identities and pinned archive re
         allocator.free(captured.custody.object_format);
     }
     try std.testing.expectEqual(@as(usize, 4), captured.custody.files);
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var empty: [0]u8 = .{};
+    var no_growth = std.heap.FixedBufferAllocator.init(&empty);
+    var context: controller.build_pipeline.Context = .{
+        .allocator = no_growth.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = path,
+        .wamr = "",
+        .compute = path,
+        .git = options.git_executable,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+        .source = captured,
+    };
+    for (0..3) |_| try controller.build_pipeline.requireSource(&context);
     const unchanged = try controller.source_custody.source(allocator, io, path, options.git_executable);
     defer {
         allocator.free(unchanged.revision);

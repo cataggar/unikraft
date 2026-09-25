@@ -36,7 +36,15 @@ test "Git custody remains bounded and reports static supervised failure classes"
     result.primary = .{ .exited = 1 };
     try std.testing.expectError(error.GitExited, source.requireGitOutcome(result, 2));
     result.primary = .local_io;
-    try std.testing.expectError(error.GitLocalIo, source.requireGitOutcome(result, 2));
+    try std.testing.expectError(error.GitStartupIo, source.requireGitOutcome(result, 2));
+    result.primary_events = 1;
+    try std.testing.expectError(error.GitMonitorIo, source.requireGitOutcome(result, 2));
+    result.stdout_status = .io_failed;
+    try std.testing.expectError(error.GitStdoutIo, source.requireGitOutcome(result, 2));
+    result.stdout_status = .incomplete;
+    result.stderr_status = .io_failed;
+    try std.testing.expectError(error.GitStderrIo, source.requireGitOutcome(result, 2));
+    result.stderr_status = .incomplete;
     result.primary = .event_limit;
     try std.testing.expectError(error.GitEventLimit, source.requireGitOutcome(result, 2));
     result.primary = .{ .exited = 0 };
